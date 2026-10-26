@@ -23,6 +23,12 @@
 
 import { sha256 } from '../crypto/provider';
 import type { IStorageBackend, IStoredRecoveryFrame } from '../storage/types';
+import {
+	firstStoredSequenceAfter,
+	storedFrameAt,
+	storedFrameHeaderAt,
+	storedFrameSpan
+} from './frame-reads';
 import type { GuardianState } from './guardian-wire';
 import {
 	genesisLogHead,
@@ -324,6 +330,68 @@ function recordAsFrame(record: IGuardianRecord): IStoredRecoveryFrame {
 }
 
 /**
+ * The frames one replication pass sends: everything stored above the
+ * watermark through `tip`, the newest frame when the pass began. Frames
+ * appended during the pass wait for the next one.
+ */
+interface IReplicationBacklog {
+	first: bigint;
+	tip: bigint;
+	/** The frame at `sequence` within [first, tip], or null when none is held. */
+	frameAt(sequence: bigint): IStoredRecoveryFrame | null;
+	/** Every frame of the backlog, when the backend was read up front. */
+	loaded?: ReadonlyMap<bigint, IStoredRecoveryFrame>;
+}
+
+/**
+ * The backlog above `after`, or null when nothing is stored there. With
+ * `deferred`, a backend with point reads serves each frame when a stream
+ * reaches it, so a pass holds one pipeline window per guardian however far
+ * behind the set is, and a frame compacted mid-pass ends the stream at that
+ * frame. Otherwise the backlog is read once up front: a backend without
+ * point reads would turn each into a range load.
+ */
+function openBacklog(
+	storage: IStorageBackend,
+	after: bigint,
+	deferred: boolean
+): IReplicationBacklog | null {
+	if (deferred && storage.loadRecoveryFrame && storage.recoveryFrameStats) {
+		const span = storage.recoveryFrameStats();
+		if (!span || BigInt(span.maxSequence) <= after) return null;
+		const min = BigInt(span.minSequence);
+		const first = after < min ? min : after + 1n;
+		const tip = BigInt(span.maxSequence);
+		return {
+			first,
+			tip,
+			frameAt: (sequence) =>
+				sequence < first || sequence > tip
+					? null
+					: storedFrameAt(storage, sequence)
+		};
+	}
+	const frames = (storage.loadRecoveryFrames?.(Number(after)) ?? []).filter(
+		(frame) => BigInt(frame.sequence) > after
+	);
+	if (frames.length === 0) return null;
+	const loaded = new Map(
+		frames.map((frame) => [BigInt(frame.sequence), frame])
+	);
+	return {
+		first: BigInt(frames[0].sequence),
+		tip: BigInt(frames[frames.length - 1].sequence),
+		frameAt: (sequence) => loaded.get(sequence) ?? null,
+		loaded
+	};
+}
+
+/** How many sequences a backlog spans. */
+function backlogLength(backlog: IReplicationBacklog): number {
+	return Number(backlog.tip - backlog.first + 1n);
+}
+
+/**
  * What one guardian's stream achieved: the highest sequence it PROVED it
  * holds, and the highest it merely reported. Only the proven one counts
  * toward a quorum; the reported one exists to re-anchor the stream after an
@@ -603,11 +671,18 @@ export class GuardianReplicator {
 
 	private chainOrigin(): { firstSequence: bigint; previousHash: Buffer } {
 		const storage = this.config.storage;
-		const frames = storage.loadRecoveryFrames?.() ?? [];
-		if (frames.length === 0) {
+		const span = storedFrameSpan(storage);
+		if (!span) {
 			return { firstSequence: 1n, previousHash: Buffer.alloc(32) };
 		}
-		const base = frames[0];
+		const base = storedFrameHeaderAt(storage, BigInt(span.minSequence));
+		// A genesis origin here would register a chain this journal cannot
+		// continue.
+		if (!base) {
+			throw new Error(
+				`the frame store reports frames from ${span.minSequence} but holds none there`
+			);
+		}
 		return {
 			firstSequence: BigInt(base.sequence),
 			previousHash: Buffer.from(base.previousFrameHash)
@@ -1009,11 +1084,7 @@ export class GuardianReplicator {
 		// guardian keeps whole. The frame it names must decrypt to a snapshot
 		// whose own page count ends the group, at a frame the journal holds
 		// (it never compacts its newest group).
-		const stored =
-			storage.loadRecoveryFrames?.(Number(group.sequence) - 1) ?? [];
-		const frameAt = (sequence: bigint): IStoredRecoveryFrame | undefined =>
-			stored.find((frame) => BigInt(frame.sequence) === sequence);
-		const snapshot = frameAt(group.sequence);
+		const snapshot = storedFrameAt(storage, group.sequence);
 		const pages = snapshot
 			? readSnapshotPageCount(snapshot, keys.masterKey, keys.nodeId)
 			: null;
@@ -1022,7 +1093,9 @@ export class GuardianReplicator {
 			group.sequence + BigInt(pages) !== group.groupEnd ||
 			!group.endHash ||
 			!snapshot?.frameHash.equals(group.frameHash) ||
-			!frameAt(group.groupEnd)?.frameHash.equals(group.endHash)
+			!storedFrameHeaderAt(storage, group.groupEnd)?.frameHash.equals(
+				group.endHash
+			)
 		) {
 			return false;
 		}
@@ -1097,9 +1170,9 @@ export class GuardianReplicator {
 		let top = low;
 		let anchor = resolveWatermarkAnchor(storage, top);
 		if (!anchor) {
-			const first = storage.loadRecoveryFrames?.(Number(low))[0];
-			if (first) {
-				top = BigInt(first.sequence) - 1n;
+			const first = firstStoredSequenceAfter(storage, low);
+			if (first != null) {
+				top = first - 1n;
 				anchor = resolveWatermarkAnchor(storage, top);
 			}
 		}
@@ -1433,7 +1506,7 @@ export class GuardianReplicator {
 	private provenHead(
 		receipt: IGuardianReceipt | undefined,
 		lease: IWriterLeaseKeys,
-		framesBySequence: Map<bigint, IStoredRecoveryFrame>,
+		framesBySequence: ReadonlyMap<bigint, IStoredRecoveryFrame> | undefined,
 		expectedGuardianId: Buffer,
 		tip: bigint
 	): { head: bigint; conflictAt: bigint | null } | null {
@@ -1463,16 +1536,16 @@ export class GuardianReplicator {
 		if (head === 0n) return { head, conflictAt: null };
 		// EVERY positive head must bind to OUR history before it counts
 		// toward a quorum: the receipt's signed hash is compared against the
-		// frame this pass loaded, or, when the head sits below the loaded
-		// window or was legitimately compacted, against the same anchor the
-		// watermark trusts (the stored row, or the retained base snapshot's
-		// previousFrameHash). A head that resolves to NOTHING is not
-		// evidence; a head that resolves to a DIFFERENT hash is a receipt
-		// for a foreign history and must never raise our watermark, however
-		// valid its signature is. Without this, a compacted position let a
-		// foreign receipt through unchecked, and raiseWatermark would then
-		// launder it by re-binding the height to OUR local hash.
-		const ours = framesBySequence.get(head);
+		// frame the caller already holds, or, when it holds none at that
+		// position, against the same anchor the watermark trusts (the stored
+		// row, or the retained base snapshot's previousFrameHash). A head
+		// that resolves to NOTHING is not evidence; a head that resolves to a
+		// DIFFERENT hash is a receipt for a foreign history and must never
+		// raise our watermark, however valid its signature is. Without this,
+		// a compacted position let a foreign receipt through unchecked, and
+		// raiseWatermark would then launder it by re-binding the height to
+		// OUR local hash.
+		const ours = framesBySequence?.get(head);
 		const expected =
 			ours?.frameHash ?? resolveWatermarkAnchor(this.config.storage, head);
 		if (expected == null) return null;
@@ -1497,10 +1570,8 @@ export class GuardianReplicator {
 	 */
 	private async streamToGuardian(
 		entry: IBoundGuardianClient,
-		frames: IStoredRecoveryFrame[],
+		backlog: IReplicationBacklog,
 		lease: IWriterLeaseKeys,
-		framesBySequence: Map<bigint, IStoredRecoveryFrame>,
-		tip: bigint,
 		retainFloor: IGuardianRetainFloor | undefined
 	): Promise<IGuardianStreamResult> {
 		const result: IGuardianStreamResult = {
@@ -1514,11 +1585,11 @@ export class GuardianReplicator {
 			requests: 0
 		};
 		let window = this.pipelineWindow;
-		let cursor = 0;
+		let cursor = backlog.first;
 		let lastReported: bigint | null = null;
 		// Strictly bounded: every round either advances the cursor or narrows
 		// the window, and a round that does neither twice stops the stream.
-		const maxRounds = frames.length + this.pipelineWindow + 1;
+		const maxRounds = backlogLength(backlog) + this.pipelineWindow + 1;
 		const noteTooLarge = (frame: IStoredRecoveryFrame): void => {
 			const sequence = BigInt(frame.sequence);
 			if (result.tooLargeAt == null || sequence < result.tooLargeAt) {
@@ -1526,8 +1597,17 @@ export class GuardianReplicator {
 			}
 		};
 
-		for (let round = 0; round < maxRounds && cursor < frames.length; round++) {
-			const batch = frames.slice(cursor, cursor + window);
+		for (let round = 0; round < maxRounds && cursor <= backlog.tip; round++) {
+			const batch: IStoredRecoveryFrame[] = [];
+			for (let sequence = cursor; batch.length < window; sequence++) {
+				const frame = backlog.frameAt(sequence);
+				if (!frame) break;
+				batch.push(frame);
+			}
+			// The store no longer holds the next frame (compacted since the
+			// pass began, or lost). The guardian refuses anything that skips
+			// it, so the stream ends here.
+			if (batch.length === 0) return result;
 			result.requests += batch.length;
 			const responses = await Promise.all(
 				batch.map(async (frame) => {
@@ -1575,9 +1655,9 @@ export class GuardianReplicator {
 				const proven = this.provenHead(
 					response.receipt,
 					lease,
-					framesBySequence,
+					backlog.loaded,
 					entry.expectedGuardianId,
-					tip
+					backlog.tip
 				);
 				if (proven?.conflictAt != null) {
 					result.conflictAt = proven.conflictAt;
@@ -1608,17 +1688,12 @@ export class GuardianReplicator {
 
 			if (result.sawSupersession) return result;
 			if (reported == null) return result;
-			if (reported < BigInt(frames[0].sequence) - 1n) {
+			if (reported < backlog.first - 1n) {
 				result.behindAt = reported;
 				return result;
 			}
-			const next = frames.findIndex(
-				(frame) => BigInt(frame.sequence) > (reported as bigint)
-			);
-			if (next < 0) {
-				cursor = frames.length;
-				break;
-			}
+			if (reported >= backlog.tip) break;
+			const next = reported + 1n;
 			if (next <= cursor) {
 				if (window === 1 && lastReported === reported) return result;
 				window = 1;
@@ -1705,12 +1780,17 @@ export class GuardianReplicator {
 	private async runReplicationPass(
 		lease: IWriterLeaseKeys
 	): Promise<IReplicationResult> {
-		const storage = this.config.storage;
 		const from = this.replicatedThrough();
-		const frames = (storage.loadRecoveryFrames?.(Number(from)) ?? []).filter(
-			(frame) => BigInt(frame.sequence) > from
+		// The journal's retention floor follows the main watermark only, so a
+		// prefixed replicator (a rotation's backfill) can see its backlog
+		// pruned mid-pass once the main set moves on. It holds the whole
+		// backlog from the start instead.
+		const backlog = openBacklog(
+			this.config.storage,
+			from,
+			this.config.metaKeyPrefix === undefined
 		);
-		if (frames.length === 0) {
+		if (!backlog) {
 			await this.readMissingLimits();
 			return {
 				outcome: 'replicated',
@@ -1723,31 +1803,20 @@ export class GuardianReplicator {
 		// counted toward a quorum, and must not be able to fence us either.
 		await this.ensureBindings();
 
-		const framesBySequence = new Map<bigint, IStoredRecoveryFrame>();
-		for (const frame of frames) {
-			framesBySequence.set(BigInt(frame.sequence), frame);
-		}
-		const tip = BigInt(frames[frames.length - 1].sequence);
+		const tip = backlog.tip;
 		const streamTo = async (
 			entry: IBoundGuardianClient,
 			retainFloor: IGuardianRetainFloor | undefined
 		): Promise<IGuardianStreamResult> => {
 			const stream = (): Promise<IGuardianStreamResult> =>
-				this.streamToGuardian(
-					entry,
-					frames,
-					lease,
-					framesBySequence,
-					tip,
-					retainFloor
-				);
+				this.streamToGuardian(entry, backlog, lease, retainFloor);
 			const result = await stream();
 			return result.behindAt != null &&
 				(await this.catchUp(
 					entry,
 					result.behindAt,
-					BigInt(frames[0].sequence) - 1n,
-					frames.length + this.pipelineWindow
+					backlog.first - 1n,
+					backlogLength(backlog) + this.pipelineWindow
 				))
 				? stream()
 				: result;
@@ -1867,7 +1936,7 @@ export class GuardianReplicator {
 			await Promise.all(
 				this.config.guardians.map(async (entry, index) => {
 					const held = streams[index].provenThrough;
-					const frame = held == null ? undefined : framesBySequence.get(held);
+					const frame = held == null ? null : backlog.frameAt(held);
 					if (!frame) return;
 					await entry.client
 						.putState(this.signRecord(frame, lease), completed)
@@ -1889,7 +1958,7 @@ export class GuardianReplicator {
 			});
 			return {
 				outcome: 'replicated',
-				attempted: frames.length,
+				attempted: backlogLength(backlog),
 				durable,
 				replicatedThrough
 			};
@@ -1904,7 +1973,7 @@ export class GuardianReplicator {
 		});
 		return {
 			outcome: 'under-replicated',
-			attempted: frames.length,
+			attempted: backlogLength(backlog),
 			durable,
 			replicatedThrough
 		};
