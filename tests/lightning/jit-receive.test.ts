@@ -1162,6 +1162,10 @@ describe('JIT opening fee', function () {
 			.map((f) => f.part.forwardAmountMsat)
 			.sort((a, b) => Number(a - b));
 		expect(amounts).to.deep.equal([1_000_000n, 2_000_000n - 103_000n]);
+		const fees = h.forwarded
+			.map((f) => f.part.skimmedFeeMsat ?? 0n)
+			.sort((a, b) => Number(a - b));
+		expect(fees).to.deep.equal([0n, 103_000n]);
 	});
 
 	it('fails every part, and drops none, when the fee exceeds the largest part', async function () {

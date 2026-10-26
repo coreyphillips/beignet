@@ -439,6 +439,39 @@ describe('BOLT 2 Channel Messages', function () {
 			expect(encoded.length).to.equal(1450);
 		});
 
+		it('encodes the agreed skim fee as an eight-byte type 65537 TLV', function () {
+			const msg = { ...makeUpdateAddHtlc(), skimmedFeeMsat: 120000n };
+			const encoded = encodeUpdateAddHtlcMessage(msg);
+			expect(encoded.subarray(1450).toString('hex')).to.equal(
+				'fe0001000108000000000001d4c0'
+			);
+			expect(decodeUpdateAddHtlcMessage(encoded).skimmedFeeMsat).to.equal(
+				120000n
+			);
+		});
+
+		it('orders the skim fee after a blinding point and preserves u64 values', function () {
+			for (const skimmedFeeMsat of [0n, 0xffffffffffffffffn]) {
+				const msg = {
+					...makeUpdateAddHtlc(),
+					blindingPoint: Buffer.alloc(33, 2),
+					skimmedFeeMsat
+				};
+				expect(
+					decodeUpdateAddHtlcMessage(encodeUpdateAddHtlcMessage(msg))
+				).to.deep.equal(msg);
+			}
+		});
+
+		it('rejects a skim fee with a non-u64 wire length', function () {
+			const raw = encodeUpdateAddHtlcMessage(makeUpdateAddHtlc());
+			expect(() =>
+				decodeUpdateAddHtlcMessage(
+					Buffer.concat([raw, Buffer.from('fe000100010101', 'hex')])
+				)
+			).to.throw('must be 8 bytes');
+		});
+
 		it('should handle id=0', function () {
 			const msg = makeUpdateAddHtlc();
 			msg.id = 0n;

@@ -110,14 +110,15 @@ function makeUpdate(
 	scid: Buffer,
 	signer: Buffer,
 	other: Buffer,
-	feeBaseMsat = 1000
+	feeBaseMsat = 1000,
+	messageFlags = 1
 ): Buffer {
 	const msg: IChannelUpdateMessage = {
 		signature: Buffer.alloc(64),
 		chainHash: REGTEST_CHAIN_HASH,
 		shortChannelId: scid,
 		timestamp: Math.floor(Date.now() / 1000),
-		messageFlags: 1,
+		messageFlags,
 		channelFlags:
 			Buffer.compare(getPublicKey(signer), getPublicKey(other)) < 0 ? 0 : 1,
 		cltvExpiryDelta: 80,
@@ -323,6 +324,57 @@ describe('Own-channel gossip checks (issue #1677)', function () {
 			cm.hasChannelWithPeer(getPublicKey(peerKey).toString('hex'))
 		).to.equal(true);
 		expect(cm.hasChannelWithPeer(pendingHex)).to.equal(false);
+		node.destroy();
+	});
+
+	it("holds a channel peer's unknown private updates without scanning the channel list", async function () {
+		const node = makeNode(validPriv());
+		const cm = node.getChannelManager();
+		for (let i = 0; i < 499; i++) {
+			addChannel(
+				cm,
+				getPublicKey(validPriv()).toString('hex'),
+				crypto.randomBytes(8)
+			);
+		}
+		// feed() delivers from this peer.
+		const peer = 'aa'.repeat(33);
+		addChannel(cm, peer);
+
+		const spy = spyOnChannelReads(cm);
+		const getChannelsByPeer = cm.getChannelsByPeer;
+		let byPeerScans = 0;
+		cm.getChannelsByPeer = function (
+			this: ChannelManager,
+			pubkey: string
+		): Channel[] {
+			byPeerScans++;
+			return getChannelsByPeer.call(this, pubkey);
+		};
+		try {
+			for (let i = 0; i < 100; i++) {
+				feed(
+					node,
+					MessageType.CHANNEL_UPDATE,
+					makeUpdate(crypto.randomBytes(8), validPriv(), validPriv(), 1000, 3)
+				);
+			}
+			await node.flushGossip();
+		} finally {
+			spy.restore();
+			cm.getChannelsByPeer = getChannelsByPeer;
+		}
+
+		expect(byPeerScans).to.equal(0);
+		expect(spy.listChannels).to.equal(0);
+		expect(spy.getFullState).to.equal(500);
+		const held = (
+			node as unknown as {
+				earlyPeerUpdates: Map<string, Map<string, Buffer>>;
+			}
+		).earlyPeerUpdates;
+		// One slot for the peer's one channel.
+		expect(held.get(peer)?.size).to.equal(1);
 		node.destroy();
 	});
 });

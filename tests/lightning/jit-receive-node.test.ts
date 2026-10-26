@@ -48,6 +48,14 @@ import {
 } from '../../src/lightning/liquidity/jit-receive';
 import { ROUTING_INFO_LENGTH } from '../../src/lightning/onion/types';
 import { encodeShortChannelId } from '../../src/lightning/gossip/types';
+import { decodeUpdateAddHtlcMessage } from '../../src/lightning/message/channel-update';
+import { decodeChannelReestablishMessage } from '../../src/lightning/message/channel-reestablish';
+import { ChannelActionType } from '../../src/lightning/channel/channel-actions';
+import { MessageType } from '../../src/lightning/message/types';
+import {
+	serializeChannelState,
+	deserializeChannelState
+} from '../../src/lightning/storage/serialization';
 
 function makeBasepoints(seed: Buffer): IChannelBasepoints {
 	const keys: Buffer[] = [];
@@ -414,6 +422,96 @@ describe('JIT receive on LightningNode (issue #594)', function () {
 		expect(alice.listChannels()).to.have.length(1);
 		expect(forwards).to.have.length(1);
 		expect(forwards[0]).to.equal(2_000_000n);
+	});
+
+	it('skim mode: the persisted add replays the exact withheld fee after restoration', async function () {
+		const storage = new SqliteStorage(':memory:');
+		storage.open();
+		const pair = nodePair({
+			storage,
+			jitReceive: { enabled: true, fundingBufferSats: 10_000n, flatFeeSat: 50n }
+		});
+		open.push({
+			...pair,
+			destroy: () => {
+				pair.destroy();
+				storage.close();
+			}
+		});
+		const { alice } = pair;
+		const ack = registerIntent(pair, { acceptsSkimmedFee: true });
+		const fees: bigint[] = [];
+		alice
+			.getChannelManager()
+			.on(
+				'message:outbound',
+				(_peer: string, type: number, payload: Buffer) => {
+					if (type !== MessageType.UPDATE_ADD_HTLC) return;
+					const message = decodeUpdateAddHtlcMessage(payload);
+					expect(message.amountMsat).to.equal(1_950_000n);
+					expect(message.skimmedFeeMsat).to.equal(50_000n);
+					const saved = storage.loadChannel(message.channelId.toString('hex'));
+					expect(saved, 'channel persisted before the add leaves').to.exist;
+					const updates = saved!.state.pendingLocalUpdates;
+					expect(
+						updates.some(
+							(update) =>
+								update.type === MessageType.UPDATE_ADD_HTLC &&
+								update.payload.equals(payload)
+						)
+					).to.equal(true);
+					const restored = new Channel(saved!.state);
+					const peer = new Channel(
+						deserializeChannelState(
+							serializeChannelState(
+								pair.bob
+									.getChannelManager()
+									.getChannel(message.channelId)!
+									.getFullState()
+							)
+						)
+					);
+					restored.markForReestablish();
+					peer.markForReestablish();
+					const reestablish = peer
+						.createReestablish()
+						.find(
+							(action) =>
+								action.type === ChannelActionType.SEND_MESSAGE &&
+								action.messageType === MessageType.CHANNEL_REESTABLISH
+						);
+					if (reestablish?.type !== ChannelActionType.SEND_MESSAGE) {
+						throw new Error('peer did not create channel_reestablish');
+					}
+					const replay = restored
+						.handleReestablish(
+							decodeChannelReestablishMessage(reestablish.payload)
+						)
+						.find(
+							(action) =>
+								action.type === ChannelActionType.SEND_MESSAGE &&
+								action.messageType === MessageType.UPDATE_ADD_HTLC
+						);
+					if (replay?.type !== ChannelActionType.SEND_MESSAGE) {
+						throw new Error('restored channel did not replay update_add_htlc');
+					}
+					expect(replay.replay).to.equal(true);
+					expect(replay.payload.equals(payload)).to.equal(true);
+					expect(
+						decodeUpdateAddHtlcMessage(replay.payload).skimmedFeeMsat
+					).to.equal(50_000n);
+					fees.push(message.skimmedFeeMsat!);
+				}
+			);
+		const forwarded = new Promise<void>((resolve, reject) => {
+			alice.once('jit:forwarded', () => resolve());
+			alice.once('jit:failed', (event: { reason: string }) =>
+				reject(new Error(event.reason))
+			);
+		});
+		driveForward(alice, ack.interceptScid);
+		await forwarded;
+		expect(fees).to.deep.equal([50_000n]);
 	});
 
 	it('hop mode: an inbound HTLC that did not carry the fee is failed, and nothing is funded', async function () {
