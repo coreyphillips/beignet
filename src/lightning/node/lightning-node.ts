@@ -1298,6 +1298,17 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		string,
 		{ announcement: Buffer; update: Buffer }
 	> = new Map();
+	/** Last timestamp signed into a direct channel_update, per channel. */
+	private directUpdateTimestamps = new Map<string, number>();
+	/**
+	 * Per channel peer, its newest private update naming an SCID we have not
+	 * assigned yet. Without an alias, each side takes the real SCID from its
+	 * own chain view, so the peer's update can arrive first.
+	 */
+	private earlyPeerUpdates = new Map<
+		string,
+		{ scidHex: string; payload: Buffer }
+	>();
 	/** Periodic timer that refreshes + re-broadcasts our gossip so the node stays in the public graph. */
 	private _gossipRefreshTimer?: ReturnType<typeof setInterval>;
 	// MPP: pending multi-part payments awaiting all parts (keyed by paymentHash hex)
@@ -5018,6 +5029,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		this.channelManager.on(
 			'channel:scid-assigned',
 			(channelId: Buffer, scid: Buffer) => {
+				this.adoptEarlyPeerUpdate(channelId, scid);
 				const channel = this.channelManager.getChannel(channelId);
 				if (!channel || !this.shouldAcceptRealScid(channel.getFullState())) {
 					return;
@@ -5203,6 +5215,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 
 		this.channelManager.on('channel:closed', (channelId: Buffer) => {
 			this._ownChannelGossip.delete(channelId.toString('hex'));
+			this.directUpdateTimestamps.delete(channelId.toString('hex'));
 			this.persistChannel(channelId);
 			// A cooperative close records its signed tx just before the manager
 			// emits broadcast:tx; register the txid so the watcher's
@@ -13203,6 +13216,15 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		}
 	}
 
+	/** Take the peer's held private update once we assign the SCID it names. */
+	private adoptEarlyPeerUpdate(channelId: Buffer, scid: Buffer): void {
+		const peer = this.channelManager.getPeerForChannel(channelId);
+		const held = peer ? this.earlyPeerUpdates.get(peer) : undefined;
+		if (!peer || !held || held.scidHex !== scid.toString('hex')) return;
+		this.earlyPeerUpdates.delete(peer);
+		this.adoptPeerChannelPolicyNow(held.payload);
+	}
+
 	/**
 	 * Push the (new) effective policy out as a channel_update. Announced
 	 * channels: rewrite the cached update, re-add to our graph, and broadcast
@@ -13281,13 +13303,21 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				policy.htlcMaximumMsat > capacityMsat
 					? capacityMsat
 					: policy.htlcMaximumMsat;
+			// The peer keeps only a strictly newer update, and readiness plus a
+			// policy change made from its listener land in the same second.
+			const hex = channelId.toString('hex');
+			const timestamp = Math.max(
+				Math.floor(Date.now() / 1000),
+				(this.directUpdateTimestamps.get(hex) ?? 0) + 1
+			);
+			this.directUpdateTimestamps.set(hex, timestamp);
 			const payload = encodeChannelUpdateMessage({
 				signature: Buffer.alloc(64), // placeholder, signed below
 				// Match the chain scope the receiver enforces (acceptableChainHashes),
 				// defaulting to OUR network's hash — never mainnet (S-7.M1).
 				chainHash: this.acceptableChainHashes[0] ?? this.chainHash(),
 				shortChannelId: scid,
-				timestamp: Math.floor(Date.now() / 1000),
+				timestamp,
 				// bit 0: htlc_maximum_msat present; bit 1: dont_forward — this
 				// update is for an UNANNOUNCED channel, so a peer relaying it would
 				// leak private-channel existence and policy (BOLT 7).
@@ -16513,15 +16543,13 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				// right now, and its volume is bounded by our channel count,
 				// so it keeps the synchronous path. Decode here is cheap; the
 				// expensive signature check stays behind the graph's gates.
-				let ours = false;
+				let msg: IChannelUpdateMessage;
 				try {
-					ours = this.channelUpdateTargetsOurChannel(
-						decodeChannelUpdateMessage(payload)
-					);
+					msg = decodeChannelUpdateMessage(payload);
 				} catch {
 					return; // malformed gossip — same silent drop as the handler's
 				}
-				if (ours) {
+				if (this.channelUpdateTargetsOurChannel(msg)) {
 					// While the stored map is restored in slices, the peer's
 					// policy is taken at once, since a private channel's route
 					// hints and blinded paths read it from the channel state;
@@ -16534,6 +16562,15 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 					}
 					this.handleChannelUpdate(payload);
 					break;
+				}
+				if (
+					(msg.messageFlags & 0x02) !== 0 &&
+					this.channelManager.hasChannelWithPeer(pubkey)
+				) {
+					this.earlyPeerUpdates.set(pubkey, {
+						scidHex: msg.shortChannelId.toString('hex'),
+						payload
+					});
 				}
 				this.enqueueBroadcastGossip(pubkey, type, payload);
 				break;

@@ -12,6 +12,7 @@
 
 import { expect } from 'chai';
 import crypto from 'crypto';
+import sinon from 'sinon';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
@@ -783,6 +784,132 @@ describe('Channel Routing Policy (M3)', function () {
 					'public channels retain their gossip lifecycle'
 				).to.have.length(1);
 			} finally {
+				bob.destroy();
+				carol.destroy();
+			}
+		});
+
+		for (const firstSide of ['provider', 'client'] as const) {
+			it(`exchanges private policy when the ${firstSide} assigns the real SCID first`, function () {
+				const bob = new LightningNode({
+					...makeNodeConfig(2),
+					forwardingFeeBaseMsat: 7777
+				});
+				bob.on('node:error', () => {});
+				const carol = new LightningNode({
+					...makeNodeConfig(3),
+					forwardingFeeBaseMsat: 4444
+				});
+				carol.on('node:error', () => {});
+				// Queued so each side's assignment can be drained before the
+				// other's, and both channel_ready aliases stripped so neither side
+				// can address the other before the real SCID.
+				const queue: Array<() => void> = [];
+				const drain = (): void => {
+					while (queue.length > 0) queue.shift()!();
+				};
+				for (const [from, to] of [
+					[bob, carol],
+					[carol, bob]
+				]) {
+					from.on('message:outbound', (peer, type, payload) => {
+						if (peer !== to.getNodeId()) return;
+						if (type === MessageType.CHANNEL_READY) {
+							const ready = decodeChannelReadyMessage(payload);
+							delete ready.shortChannelId;
+							payload = encodeChannelReadyMessage(ready);
+						}
+						queue.push(() =>
+							to.handlePeerMessage(from.getNodeId(), type, payload)
+						);
+					});
+				}
+				try {
+					const pending = carol.openChannel(bob.getNodeId(), 1_000_000n);
+					drain();
+					const channelId = carol.createFunding(
+						pending,
+						crypto.randomBytes(32),
+						0,
+						crypto.randomBytes(64)
+					)!;
+					drain();
+					const bobState = writableState(
+						bob.getChannelManager().getChannel(channelId)!
+					);
+					const carolState = writableState(
+						carol.getChannelManager().getChannel(channelId)!
+					);
+					bobState.announceChannel = false;
+					carolState.announceChannel = false;
+					carol.handleFundingConfirmed(channelId);
+					bob.handleFundingConfirmed(channelId);
+					drain();
+					expect(bobState.remoteScidAlias).to.equal(null);
+					expect(carolState.remoteScidAlias).to.equal(null);
+
+					const order = firstSide === 'provider' ? [bob, carol] : [carol, bob];
+					for (const node of order) {
+						node
+							.getChannelManager()
+							.triggerAnnouncementDepth(
+								channelId,
+								810,
+								2,
+								Buffer.from(node.getNodeId(), 'hex'),
+								() => {
+									throw new Error(
+										'private channel must not sign an announcement'
+									);
+								}
+							);
+						drain();
+					}
+					expect(carolState.remoteForwardingPolicy?.feeBaseMsat).to.equal(7777);
+					expect(bobState.remoteForwardingPolicy?.feeBaseMsat).to.equal(4444);
+				} finally {
+					bob.destroy();
+					carol.destroy();
+				}
+			});
+		}
+
+		it('a policy set from the channel:ready listener replaces the ready update', function () {
+			const clock = sinon.useFakeTimers({
+				now: Date.now(),
+				toFake: ['Date']
+			});
+			const bob = createNode(2);
+			const carol = createNode(3);
+			connectNodes(bob, carol);
+			try {
+				bob.on('channel:ready', ({ channelId }) => {
+					bob.setChannelPolicy(channelId, { feeBaseMsat: 7777 });
+				});
+				const pending = carol.openChannel(bob.getNodeId(), 1_000_000n);
+				const channelId = carol.createFunding(
+					pending,
+					crypto.randomBytes(32),
+					0,
+					crypto.randomBytes(64)
+				)!;
+				const bobState = writableState(
+					bob.getChannelManager().getChannel(channelId)!
+				);
+				const carolState = writableState(
+					carol.getChannelManager().getChannel(channelId)!
+				);
+				const alias = crypto.randomBytes(8);
+				bobState.announceChannel = false;
+				carolState.announceChannel = false;
+				bobState.remoteScidAlias = alias;
+				carolState.scidAlias = alias;
+				carol.handleFundingConfirmed(channelId);
+				bob.handleFundingConfirmed(channelId);
+
+				expect(carolState.remoteForwardingPolicy?.feeBaseMsat).to.equal(7777);
+			} finally {
+				clock.restore();
 				bob.destroy();
 				carol.destroy();
 			}
