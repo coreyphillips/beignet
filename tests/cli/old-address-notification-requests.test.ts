@@ -3,6 +3,9 @@
  * the gap limit listed the UTXOs at that address index, discarded the answer,
  * and then ran the wallet refresh, which listed them again.
  *
+ * Also issue #1882: a listing whose entry for that address failed was saved
+ * as if the address held nothing, which dropped it from later scans too.
+ *
  * Fully OFFLINE: the client helpers are stubbed with a counting fake server.
  */
 
@@ -139,6 +142,8 @@ describe('old address notification requests (#1859)', function () {
 	/** Holds the next UTXO listing until releaseListing is called. */
 	let holdNextListing: boolean;
 	let releaseListing: (() => void) | undefined;
+	/** Script hashes the UTXO listing answers with an error entry. */
+	let failListing: Set<string>;
 
 	const statusOf = (scriptHash: string): string | null => {
 		const entries = history.get(scriptHash) ?? [];
@@ -161,6 +166,7 @@ describe('old address notification requests (#1859)', function () {
 		listings = [];
 		holdNextListing = false;
 		releaseListing = undefined;
+		failListing = new Set();
 		let peer: { host: string; port: number; protocol: EProtocol } | undefined;
 		sinon.stub(electrumHelpers, 'getConnectedPeer').callsFake(() => peer);
 		sinon.stub(electrumHelpers, 'start').callsFake(async () => {
@@ -235,11 +241,19 @@ describe('old address notification requests (#1859)', function () {
 				}
 				return {
 					error: false,
-					data: batch.map((a) => ({
-						data: a,
-						param: a.scriptHash,
-						result: unspent.get(a.scriptHash) ?? []
-					}))
+					data: batch.map((a) =>
+						failListing.has(a.scriptHash)
+							? {
+									data: a,
+									param: a.scriptHash,
+									error: { code: -32603, message: 'Server busy.' }
+							  }
+							: {
+									data: a,
+									param: a.scriptHash,
+									result: unspent.get(a.scriptHash) ?? []
+							  }
+					)
 				};
 			});
 		sinon
@@ -499,5 +513,47 @@ describe('old address notification requests (#1859)', function () {
 		expect(listings.length, 'one UTXO listing').to.equal(1);
 		expect(oldListed()).to.equal(1);
 		expect(wallet.data.balance).to.equal(300_000);
+	});
+
+	it('keeps an old coin whose listing entry failed (#1882)', async function () {
+		failListing.add(old.scriptHash);
+		listings = [];
+
+		await notifyOld();
+		await settled();
+
+		expect(oldListed(), 'the failed listing named it').to.equal(1);
+		expect(utxoIds()).to.deep.equal([`${FUNDING}:6`]);
+		expect(wallet.data.balance).to.equal(100_000);
+		expect(wallet.refreshFailed, 'the next block owes a refresh').to.equal(
+			true
+		);
+
+		failListing.clear();
+		listings = [];
+		const refreshed = await wallet.refreshWallet();
+		if (refreshed.isErr()) throw refreshed.error;
+
+		expect(oldListed(), 'a normal refresh still lists it').to.equal(1);
+		expect(utxoIds()).to.deep.equal([`${FUNDING}:6`]);
+		expect(wallet.data.balance).to.equal(100_000);
+	});
+
+	it('lists an old address again on the block after its entry failed (#1882)', async function () {
+		failListing.add(old.scriptHash);
+		await notifyOld();
+		await settled();
+		failListing.clear();
+		payOldAgain();
+		listings = [];
+		if (!headerHandler) throw new Error('No header handler was wired.');
+
+		await headerHandler([{ height: 101, hex: headerAt(101) }]);
+		await settled();
+
+		expect(oldListed()).to.equal(1);
+		expect(utxoIds()).to.deep.equal([`${REUSE}:0`, `${FUNDING}:6`].sort());
+		expect(wallet.data.balance).to.equal(300_000);
+		expect(wallet.refreshFailed).to.equal(false);
 	});
 });

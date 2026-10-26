@@ -3432,10 +3432,11 @@ export class Wallet {
 	 * @returns {Promise<Result<IGetUtxosResponse>>} The pair the scan applied
 	 * to memory, or, when a newer scan already landed, memory's pair as it
 	 * stands, applied and written by that scan instead. Err, with nothing
-	 * applied, when the wallet switched networks while the query was out, or
-	 * when Electrum did not return the tip or the transaction of a coin young
-	 * enough to be an immature coinbase. A write that storage refuses is
-	 * logged, not returned: the scan itself succeeded.
+	 * applied, when the wallet switched networks while the query was out, when
+	 * Electrum failed any address the scan listed, or when it did not return
+	 * the tip or the transaction of a coin young enough to be an immature
+	 * coinbase. A write that storage refuses is logged, not returned: the scan
+	 * itself succeeded.
 	 */
 	public async refreshUtxos({
 		scanningStrategy = EScanningStrategy.gapLimit,
