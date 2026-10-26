@@ -29926,7 +29926,13 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		const channels = this.channelManager.listChannels();
 		for (const channel of channels) {
 			const state = channel.getFullState();
-			const effectiveState = state.preReestablishState ?? state.state;
+			// Nothing clears preReestablishState when a marked channel closes,
+			// so reading through it on any other state would find a restored
+			// row's force close still live and close it again every block.
+			const effectiveState =
+				state.state === ChannelState.AWAITING_REESTABLISH
+					? state.preReestablishState ?? state.state
+					: state.state;
 			// ERRORED is admitted for the on-chain claim backstop below: a failed
 			// channel is exactly the one whose peer cannot be trusted to resolve an
 			// HTLC we hold the preimage for, so disarming the backstop there is
@@ -29947,7 +29953,22 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			const splicing =
 				effectiveState === ChannelState.SPLICING &&
 				!mustNotBroadcastCommitment(state);
-			if (effectiveState !== ChannelState.NORMAL && !errored && !splicing)
+			// SHUTTING_DOWN is admitted to the claim arm (issue #1298): a shutdown
+			// cannot finish while an HTLC is on our commitment, so a silent peer
+			// parks it there. The stuck-channel timer is no substitute. It counts
+			// from the first block it sees the state and lives in memory, so a
+			// late shutdown or a restart puts its close past the expiry.
+			// NEGOTIATING_CLOSING needs no arm: closingBlockedBy keeps a channel
+			// with live HTLCs or kept removals out of it.
+			const shuttingDown =
+				effectiveState === ChannelState.SHUTTING_DOWN &&
+				!mustNotBroadcastCommitment(state);
+			if (
+				effectiveState !== ChannelState.NORMAL &&
+				!errored &&
+				!splicing &&
+				!shuttingDown
+			)
 				continue;
 
 			// An inbound HTLC we fulfilled stays inside the claim backstop for
@@ -30085,6 +30106,9 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				// HTLC we cannot claim costs us nothing to leave: the upstream
 				// refunds itself via its HTLC-timeout once the commitment confirms.
 				if (errored) continue;
+				// Only the claim above covers SHUTTING_DOWN (issue #1298). The
+				// off-chain fail and the forward close below still skip it.
+				if (shuttingDown) continue;
 				// A splice carries updates only once both tx_signatures are in and
 				// the channel is ECDSA; before that the fail cannot leave, and the
 				// upstream's own timeout path covers the HTLC as above.

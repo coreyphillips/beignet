@@ -1655,32 +1655,145 @@ describe('Received windows, adversarial round 2', function () {
 			r.destroy();
 		});
 
-		it('pins the SHUTTING_DOWN gap (issue #1298): the claim arm does not scan it, and the stuck-channel timer closes 7 blocks before expiry instead of 18', function () {
-			// Tracked in issue #1298, and present on master before any of
-			// this: a live fulfilled HTLC in SHUTTING_DOWN is
-			// skipped the same way. The only close left is the stuck-channel
-			// timer, which starts at the first block seen in the state, lives
-			// in memory, and fires 11 blocks later.
-			const w = simpleWindow(3700, 'fulfill');
-			const expiry = expiryOf(w);
-			const seen = watch(w);
-			blocks(w, seen, expiry - 25, expiry - 19);
-			expect(seen.attempts).to.have.length(0);
-			// The peer goes silent from here on.
-			w.gate.queue.alice = [];
-			const res = w.bob
-				.getChannelManager()
-				.initiateShutdown(w.channelId, DESTINATION);
-			expect(res.ok, res.error).to.equal(true);
-			blocks(w, seen, expiry - 18, expiry + 5);
+		function expectClaimClose(
+			seen: IWatch,
+			expiry: number,
+			signed: bitcoin.Transaction
+		): void {
 			expect(seen.attempts).to.have.length(1);
 			expect(seen.attempts[0]).to.deep.include({
-				height: expiry - 7,
+				height: expiry - 18,
 				ok: true
 			});
-			expect(seen.codes).to.deep.equal(['STUCK_CHANNEL_FORCE_CLOSED']);
-			expect(seen.broadcasts).to.include(w.signed.getId());
-			w.destroy();
+			expect(seen.codes).to.deep.equal(['HTLC_CLAIM_FORCE_CLOSE']);
+			expect(seen.broadcasts).to.include(signed.getId());
+		}
+
+		/** Restarts Bob from his row, with the peer gone. */
+		function restartBob(r: IRig, dbPath: string): IRig {
+			r.bob.destroy();
+			r.alice.getChannelManager().handlePeerDisconnected(r.bob.getNodeId());
+			r.alice.removeAllListeners('message:outbound');
+			const disk = new SqliteStorage(dbPath);
+			disk.open();
+			return { ...r, bob: createNode(TAG, r.bobSeedId, disk) };
+		}
+
+		it('a row restored from disk is closed once, not again every block', function () {
+			// The restored channel waits in AWAITING_REESTABLISH, and nothing
+			// clears preReestablishState when it is force closed from there.
+			const dbPath = tempDb('r2-restored-claim');
+			const disk = new SqliteStorage(dbPath);
+			disk.open();
+			const w = simpleWindow(3800, 'fulfill', {}, disk);
+			const expiry = expiryOf(w);
+			const r2 = restartBob(w, dbPath);
+			const st = fullState(r2.bob, w.channelId);
+			expect(st.state).to.equal(ChannelState.AWAITING_REESTABLISH);
+			expect(st.preReestablishState).to.equal(ChannelState.NORMAL);
+			const seen = watch(r2);
+			blocks(r2, seen, expiry - 19, expiry + 5);
+			expectClaimClose(seen, expiry, w.signed);
+			expect(fullState(r2.bob, w.channelId).state).to.equal(
+				ChannelState.FORCE_CLOSED
+			);
+			r2.bob.destroy();
+			w.alice.destroy();
+		});
+
+		describe('in SHUTTING_DOWN with a silent peer (issue #1298)', function () {
+			// The stuck-channel timer is no backstop for these: it fires 11
+			// blocks after the first block it sees the state, 7 before expiry
+			// here, and a restart starts it over.
+
+			function shutDown(r: IRig): void {
+				// The peer goes silent from here on.
+				r.gate.queue.alice = [];
+				const res = r.bob
+					.getChannelManager()
+					.initiateShutdown(r.channelId, DESTINATION);
+				expect(res.ok, res.error).to.equal(true);
+				expect(fullState(r.bob, r.channelId).state).to.equal(
+					ChannelState.SHUTTING_DOWN
+				);
+			}
+
+			it('a kept fulfilled removal closes at the claim buffer', function () {
+				const w = simpleWindow(3700, 'fulfill');
+				const expiry = expiryOf(w);
+				const seen = watch(w);
+				blocks(w, seen, expiry - 25, expiry - 19);
+				expect(seen.attempts).to.have.length(0);
+				shutDown(w);
+				blocks(w, seen, expiry - 18, expiry + 5);
+				expectClaimClose(seen, expiry, w.signed);
+				expect(fullState(w.bob, w.channelId).closeReason).to.equal(
+					'HTLC_CLAIM_FORCE_CLOSE'
+				);
+				w.destroy();
+			});
+
+			it('a live fulfilled HTLC the peer never acked closes at the claim buffer', function () {
+				const r = rig(3760);
+				const h = park(r.alice, r.bob, 50_000_000n, 'live');
+				const signed = rebuild(fullState(r.bob, r.channelId)).result.tx;
+				stopAliceCommitmentSigned(r);
+				r.gate.drop.alice.add(MessageType.REVOKE_AND_ACK);
+				expect(r.bob.settleHeldHtlc(h.hash, h.preimage)).to.equal(true);
+				const st = fullState(r.bob, r.channelId);
+				expect(received(st).map((e) => e.state)).to.deep.equal([
+					HtlcState.FULFILLED
+				]);
+				expect(st.signedLocalRemovals ?? []).to.have.length(0);
+				const expiry = received(st)[0].cltvExpiry;
+				const seen = watch(r);
+				blocks(r, seen, expiry - 25, expiry - 19);
+				expect(seen.attempts).to.have.length(0);
+				shutDown(r);
+				blocks(r, seen, expiry - 18, expiry + 5);
+				expectClaimClose(seen, expiry, signed);
+				r.destroy();
+			});
+
+			it('a removal fulfilled after the shutdown closes at the claim buffer across a restart', function () {
+				const dbPath = tempDb('r2-shutdown');
+				const disk = new SqliteStorage(dbPath);
+				disk.open();
+				const r = rig(3780, {}, 1_000_000n, disk);
+				const h = park(r.alice, r.bob, 50_000_000n, 'shutdown');
+				// Both shutdowns are exchanged while the HTLC is parked. A local
+				// shutdown is not written on its own; the fulfill's round writes
+				// it to the row.
+				const res = r.bob
+					.getChannelManager()
+					.initiateShutdown(r.channelId, DESTINATION);
+				expect(res.ok, res.error).to.equal(true);
+				const signed = rebuild(fullState(r.bob, r.channelId)).result.tx;
+				stopAliceCommitmentSigned(r);
+				expect(r.bob.settleHeldHtlc(h.hash, h.preimage)).to.equal(true);
+				const row = disk.loadChannel(r.channelId.toString('hex'))!.state;
+				expect(row.state).to.equal(ChannelState.SHUTTING_DOWN);
+				expect(
+					(row.signedLocalRemovals ?? []).map((e) => e.state)
+				).to.deep.equal([HtlcState.FULFILLED]);
+				const expiry = row.signedLocalRemovals![0].cltvExpiry;
+				// The peer goes silent from here on.
+				r.gate.queue.alice = [];
+				const before = watch(r);
+				// Long enough to arm the stuck-channel timer, short of firing it.
+				blocks(r, before, expiry - 25, expiry - 20);
+				expect(before.attempts).to.have.length(0);
+
+				const r2 = restartBob(r, dbPath);
+				const st = fullState(r2.bob, r.channelId);
+				expect(st.state).to.equal(ChannelState.AWAITING_REESTABLISH);
+				expect(st.preReestablishState).to.equal(ChannelState.SHUTTING_DOWN);
+				const seen = watch(r2);
+				blocks(r2, seen, expiry - 19, expiry + 5);
+				expectClaimClose(seen, expiry, signed);
+				r2.bob.destroy();
+				r.alice.destroy();
+			});
 		});
 	});
 });
