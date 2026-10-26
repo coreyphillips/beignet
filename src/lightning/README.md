@@ -256,15 +256,15 @@ Generated from `node/types.ts` by `npm run docs:tables`; edit the doc comments t
 | `asyncReceiveService?` | `IAsyncReceiveServiceConfig` | Async receive service, LSP role (issue #709). Absent or `enabled: false` (the default): this node parks NO hold_htlc forward, advertises no ASYNC_RECEIVE_SERVICE bit and answers no registration; the marker is treated as an unknown odd TLV. Enabled: channel peers may register (signed grant with the ceilings and fee schedule below) and only holds under an active registration are admitted, within the limits. |
 | `ffor?` | `object` | The FFOR roles this node plays for its peers. |
 | `ffor.settle?` | `IFforSettlePolicy` | Whether this node answers ff_init as a settlement peer, and on what terms (issue #729). Absent answers on any terms (the library default); a daemon passes `enabled: false` unless its operator opted in. |
-| `ffor.concurrent?` | `object` | FFOR concurrent receive (docs/specs/CONCURRENT-RECEIVE.md). Enabled by default when option_ff_receive and option_quiesce are present. Explicit true requires both dependencies. Explicit false clears bits 562/563 and refuses peers requiring the feature. Epochs still select their profile explicitly. To refuse only new concurrent books, set `ffor.settle.allowConcurrent: false` and retain this advertisement for existing books. The feature assignment remains experimental. |
-| `ffor.concurrent.enabled` | `boolean` | Advertise concurrent receive, feature bits 562/563. |
+| `ffor.concurrent?` | `object` | FFOR concurrent receive (docs/specs/CONCURRENT-RECEIVE.md). Enabled by default when option_ff_receive and option_quiesce are present. Explicit true requires both dependencies. Explicit false clears bits 442/443 and refuses peers requiring the feature. Epochs still select their profile explicitly. To refuse only new concurrent books, set `ffor.settle.allowConcurrent: false` and retain this advertisement for existing books. The feature assignment remains experimental. |
+| `ffor.concurrent.enabled` | `boolean` | Advertise concurrent receive, feature bits 442/443. |
 | `ffor.witness?` | `IFforWitnessConfig` | FFOR D-R receipt witness (spec section 9.6): store a receiver-encrypted record of every delegated preimage this node relays, before propagating the fulfil, and serve it to the receiver on return. Disabled by default. |
 | `ffor.issuer?` | `IFforIssuerConfig` | FFOR BOLT 12 issuer (spec section 9.7): answer invoice_requests for offers a receiver delegated to this node, one fixed-amount slot per invoice. Needs `ffor.witness` (the issuer is co-hosted with the first witness, whose mailbox holds the book). Disabled by default. |
 | `fforWitness?` | `IFforWitnessConfig` | **Deprecated.** Use `ffor.witness`. |
 | `fforIssuer?` | `IFforIssuerConfig` | **Deprecated.** Use `ffor.issuer`. |
 | `fforSettle?` | `IFforSettlePolicy` | **Deprecated.** Use `ffor.settle`. |
 | `fforConcurrent?` | `object` | **Deprecated.** Use `ffor.concurrent`. |
-| `fforConcurrent.enabled` | `boolean` | Advertise concurrent receive, feature bits 562/563. |
+| `fforConcurrent.enabled` | `boolean` | Advertise concurrent receive, feature bits 442/443. |
 | `maxReconnectDelay?` | `number` | Max reconnect delay in ms |
 | `maxInboundPeers?` | `number` | Inbound peer connections (default 125). Once this many are up, only peers holding a channel with this node are admitted. |
 | `resourceConfig?` | `IResourceConfig` | Resource management config |
@@ -875,7 +875,7 @@ the `hold_htlc` marker can command:
   already owes from before the service was turned off is still driven to its
   terminal state on redispatch.
 - **Capability negotiation.** A serving node sets
-  `Feature.ASYNC_RECEIVE_SERVICE` (bit 260; the odd bit 261 is advertised) in
+  `Feature.ASYNC_RECEIVE_SERVICE` (bit 444; the odd bit 445 is advertised) in
   its `init` and `node_announcement` features, only while the service is
   enabled. A receiver asks for a grant only from a peer that positively
   advertises the bit (read from the peer's `init` through the peer manager,

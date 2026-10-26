@@ -26,15 +26,15 @@ export const FF_SYNC_REPLY_TYPE = 55077;
 /** channel_reestablish TLV carrying the epoch state (section 11.1). */
 export const FF_REESTABLISH_TLV_TYPE = 55001n;
 
-/** Feature bits 560/561, option_ff_receive (section 5). */
-export const FF_RECEIVE_FEATURE_BIT = 560;
+/** Feature bits 440/441, option_ff_receive (section 5). */
+export const FF_RECEIVE_FEATURE_BIT = 440;
 
 /**
- * Feature bits 562/563, option_ff_concurrent (docs/specs/CONCURRENT-RECEIVE.md
+ * Feature bits 442/443, option_ff_concurrent (docs/specs/CONCURRENT-RECEIVE.md
  * section 1.1): the concurrent receive extension, a proposed experimental
  * assignment.
  */
-export const FF_CONCURRENT_FEATURE_BIT = 562;
+export const FF_CONCURRENT_FEATURE_BIT = 442;
 
 /**
  * The one concurrent_version this implementation selects (ff_init and

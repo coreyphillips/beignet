@@ -44,11 +44,15 @@ and bLIP allocation. Their appearance here does not establish a deployed allocat
 
 | Surface | Proposed assignment | Meaning |
 |---|---|---|
-| `init` feature pair | 562/563, `option_ff_concurrent` | Requires `option_ff_receive` 560/561; advertise support in peer `init` |
+| `init` feature pair | 442/443, `option_ff_concurrent` | Requires `option_ff_receive` 440/441; advertise support in peer `init` |
 | `ff_init` TLV | 17, `concurrent_version` | Exactly two bytes, `00 01` |
 | `ff_accept` TLV | 17, `concurrent_version` | Exact echo of the requested value |
 | R to S message | 55075, `ff_sync` | Signed nonterminal settlement fetch |
 | S to R message | 55077, `ff_sync_reply` | Signed cumulative settlement snapshot |
+
+Earlier drafts used 562/563 for the concurrent pair and 560/561 for the base
+pair. eclair assigns those bits to `funding_fee_credit` and `on_the_fly_funding`,
+so they were moved.
 
 Normal BOLT feature-bit rules apply. Each peer MUST have advertised either bit of
 the concurrent pair and either bit of the base pair before concurrent negotiation.

@@ -91,10 +91,15 @@ export enum Feature {
 	 * bit pending a spec assignment.
 	 */
 	OPTION_WILL_FUND = 112,
+	// beignet's own experimental bits sit in the 440-445 block. None may share
+	// a bit with another implementation or the bLIP-2 registry: a peer that
+	// reads our bit as its own feature sends messages we do not know, and we
+	// disconnect (560-563 collided with eclair's on-the-fly funding, #1886).
+	// The foreign table is in tests/lightning/feature-bit-collisions.test.ts.
 	/**
 	 * Async receive service (beignet, issue #709): this node runs the opt-in
 	 * LSP service that parks `hold_htlc` forwards for registered offline
-	 * receivers. Experimental custom-range bit; the ODD bit (261) is what a
+	 * receivers. Experimental custom-range bit; the ODD bit (445) is what a
 	 * serving node advertises in init and node_announcement, and it is set
 	 * only while the service is enabled. A receiver never marks a blinded
 	 * path hold_htlc for a peer that does not advertise it: a peer without
@@ -103,19 +108,19 @@ export enum Feature {
 	 * the advertisement; the signed registration grant (issue #709) is the
 	 * actual capability.
 	 */
-	ASYNC_RECEIVE_SERVICE = 260,
+	ASYNC_RECEIVE_SERVICE = 444,
 	/**
 	 * FFOR: Fast-Forward Offline Receive (docs/specs/ffor-offline-receive.md
-	 * section 5), bits 560/561, provisional in the experimental range.
+	 * section 5), bits 440/441, provisional in the experimental range.
 	 */
-	OPTION_FF_RECEIVE = 560,
+	OPTION_FF_RECEIVE = 440,
 	/**
 	 * FFOR concurrent receive (docs/specs/CONCURRENT-RECEIVE.md section 1.1),
-	 * bits 562/563, a proposed experimental assignment. Requires
+	 * bits 442/443, a proposed experimental assignment. Requires
 	 * option_ff_receive and option_quiesce. Advertised by default when both
 	 * dependencies are present; fforConcurrent.enabled can disable it.
 	 */
-	OPTION_FF_CONCURRENT = 562
+	OPTION_FF_CONCURRENT = 442
 }
 
 /**

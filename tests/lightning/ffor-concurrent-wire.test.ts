@@ -6,7 +6,7 @@
  * `00 01`. The TLV is absent in both messages of a baseline epoch, whose
  * bytes are the ones a build without the extension produced. A duplicated
  * TLV, a noncanonical BigSize or a length other than two is malformed.
- * Feature pair 562/563 is defined and off by default.
+ * Feature pair 442/443 is defined and off by default.
  */
 
 import { expect } from 'chai';
@@ -52,14 +52,14 @@ function signed(type: number, unsigned: Buffer, key: Buffer): Buffer {
 }
 
 describe('FFOR concurrent receive: wire (CONCURRENT-RECEIVE.md 1.1)', () => {
-	describe('feature pair 562/563', () => {
-		it('is bit 562, with 563 the optional bit', () => {
-			expect(Feature.OPTION_FF_CONCURRENT).to.equal(562);
-			expect(FF_CONCURRENT_FEATURE_BIT).to.equal(562);
+	describe('feature pair 442/443', () => {
+		it('is bit 442, with 443 the optional bit', () => {
+			expect(Feature.OPTION_FF_CONCURRENT).to.equal(442);
+			expect(FF_CONCURRENT_FEATURE_BIT).to.equal(442);
 			const flags = FeatureFlags.empty();
 			flags.setOptional(Feature.OPTION_FF_CONCURRENT);
-			expect(flags.hasBit(563)).to.equal(true);
-			expect(flags.hasBit(562)).to.equal(false);
+			expect(flags.hasBit(443)).to.equal(true);
+			expect(flags.hasBit(442)).to.equal(false);
 			expect(flags.hasFeature(Feature.OPTION_FF_CONCURRENT)).to.equal(true);
 		});
 
@@ -81,7 +81,7 @@ describe('FFOR concurrent receive: wire (CONCURRENT-RECEIVE.md 1.1)', () => {
 			const optedOut = LightningNode.defaultFeatures();
 			optedOut.clearBit(Feature.OPTION_FF_CONCURRENT + 1);
 			expect(hasUnsupportedRequiredFeatures(optedOut, remote)).to.deep.equal([
-				562
+				442
 			]);
 		});
 	});

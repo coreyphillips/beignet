@@ -2948,7 +2948,7 @@ namespace features
 enum features.Feature
 member features.Feature.ANCHOR_OUTPUTS = 20
 member features.Feature.ANCHOR_ZERO_FEE_HTLC = 22
-member features.Feature.ASYNC_RECEIVE_SERVICE = 260
+member features.Feature.ASYNC_RECEIVE_SERVICE = 444
 member features.Feature.BASIC_MPP = 16
 member features.Feature.CHANNEL_TYPE = 44
 member features.Feature.DATA_LOSS_PROTECT = 0
@@ -2958,8 +2958,8 @@ member features.Feature.GOSSIP_QUERIES_EX = 10
 member features.Feature.KEYSEND = 54
 member features.Feature.LARGE_CHANNELS = 18
 member features.Feature.ONION_MESSAGES = 38
-member features.Feature.OPTION_FF_CONCURRENT = 562
-member features.Feature.OPTION_FF_RECEIVE = 560
+member features.Feature.OPTION_FF_CONCURRENT = 442
+member features.Feature.OPTION_FF_RECEIVE = 440
 member features.Feature.OPTION_TAPROOT = 180
 member features.Feature.OPTION_WILL_FUND = 112
 member features.Feature.OPTION_ZERO_RESERVE = 64
@@ -3005,7 +3005,7 @@ const ffor.FF_ACTIVATION_TIMEOUT_MS = 60000
 const ffor.FF_BLINDED_HOPS_N = 8
 const ffor.FF_CLOSE_ACK_TYPE = 55053
 const ffor.FF_CLOSE_TYPE = 55051
-const ffor.FF_CONCURRENT_FEATURE_BIT = 562
+const ffor.FF_CONCURRENT_FEATURE_BIT = 442
 const ffor.FF_CONCURRENT_RESERVED_VERSION = 2
 const ffor.FF_CONCURRENT_VERSION = 1
 const ffor.FF_EPOCH_START_TOLERANCE_BLOCKS = 6
@@ -3025,7 +3025,7 @@ const ffor.FF_ISSUER_STATUS_TAG = "ffor/issuer/status"
 const ffor.FF_ISSUER_STATUS_TYPE = 55071
 const ffor.FF_MAX_K = 483
 const ffor.FF_PROFILE_FIXED_AMOUNT = 1
-const ffor.FF_RECEIVE_FEATURE_BIT = 560
+const ffor.FF_RECEIVE_FEATURE_BIT = 440
 const ffor.FF_RECONCILE_MARGIN_BLOCKS = 1008
 const ffor.FF_REESTABLISH_TLV_LEN: number
 const ffor.FF_REESTABLISH_TLV_TYPE = 55001n

@@ -1539,31 +1539,31 @@ describe('FFOR concurrent receive, adversarial: a baseline epoch is the same wha
 describe('FFOR concurrent receive, adversarial: feature bit hygiene', function () {
 	this.timeout(60_000);
 
-	const requires562 = (): FeatureFlags => {
+	const requires442 = (): FeatureFlags => {
 		const f = LightningNode.defaultFeatures();
 		f.setCompulsory(Feature.OPTION_FF_CONCURRENT);
 		return f;
 	};
 
-	it('option off: neither bit is advertised, and a peer requiring 562 is disconnected', () => {
+	it('option off: neither bit is advertised, and a peer requiring 442 is disconnected', () => {
 		const node = new LightningNode(
 			makeNodeConfig(9101, undefined, { fforConcurrent: { enabled: false } })
 		);
 		const local = node.getLocalFeatures();
-		expect(local.hasBit(562) || local.hasBit(563)).to.equal(false);
-		expect(implementedFeatures().hasBit(562)).to.equal(false);
-		expect(implementedFeatures().hasBit(563)).to.equal(true);
-		expect(LightningNode.defaultFeatures().hasBit(563)).to.equal(true);
-		expect(hasUnsupportedRequiredFeatures(local, requires562())).to.deep.equal([
-			562
+		expect(local.hasBit(442) || local.hasBit(443)).to.equal(false);
+		expect(implementedFeatures().hasBit(442)).to.equal(false);
+		expect(implementedFeatures().hasBit(443)).to.equal(true);
+		expect(LightningNode.defaultFeatures().hasBit(443)).to.equal(true);
+		expect(hasUnsupportedRequiredFeatures(local, requires442())).to.deep.equal([
+			442
 		]);
-		// A peer merely offering it (563) is not disconnected, and selects nothing.
+		// A peer merely offering it (443) is not disconnected, and selects nothing.
 		const offers = LightningNode.defaultFeatures();
 		offers.setOptional(Feature.OPTION_FF_CONCURRENT);
 		expect(hasUnsupportedRequiredFeatures(local, offers)).to.deep.equal([]);
 	});
 
-	it('option off: a caller-supplied set carrying 562 and 563 is stripped of both, so the requiring peer is still disconnected', () => {
+	it('option off: a caller-supplied set carrying 442 and 443 is stripped of both, so the requiring peer is still disconnected', () => {
 		const supplied = LightningNode.defaultFeatures();
 		supplied.setCompulsory(Feature.OPTION_FF_CONCURRENT);
 		supplied.setOptional(Feature.OPTION_FF_CONCURRENT);
@@ -1574,22 +1574,22 @@ describe('FFOR concurrent receive, adversarial: feature bit hygiene', function (
 			})
 		);
 		const local = node.getLocalFeatures();
-		expect(local.hasBit(562) || local.hasBit(563)).to.equal(false);
-		expect(hasUnsupportedRequiredFeatures(local, requires562())).to.deep.equal([
-			562
+		expect(local.hasBit(442) || local.hasBit(443)).to.equal(false);
+		expect(hasUnsupportedRequiredFeatures(local, requires442())).to.deep.equal([
+			442
 		]);
 	});
 
-	it('option on: a peer requiring 562 is accepted', () => {
+	it('option on: a peer requiring 442 is accepted', () => {
 		const node = new LightningNode(
 			makeNodeConfig(9103, undefined, { fforConcurrent: { enabled: true } })
 		);
 		const local = node.getLocalFeatures();
-		expect(local.hasBit(563)).to.equal(true);
-		expect(local.hasBit(562), 'never compulsory by our own doing').to.equal(
+		expect(local.hasBit(443)).to.equal(true);
+		expect(local.hasBit(442), 'never compulsory by our own doing').to.equal(
 			false
 		);
-		expect(hasUnsupportedRequiredFeatures(local, requires562())).to.deep.equal(
+		expect(hasUnsupportedRequiredFeatures(local, requires442())).to.deep.equal(
 			[]
 		);
 	});
@@ -1611,11 +1611,11 @@ describe('FFOR concurrent receive, adversarial: feature bit hygiene', function (
 		expect(w.s.getFforEpoch(w.srHex)?.concurrentVersion ?? 0).to.equal(0);
 	});
 
-	// The review observed that with the option on, bit 563 also rode in
+	// The review observed that with the option on, bit 443 also rode in
 	// node_announcement, because the node reuses its init set there.
 	// docs/specs/CONCURRENT-RECEIVE.md section 1.1 names the init context only,
 	// so the announcement now leaves it out.
-	it('with the option on, bit 563 is advertised in init and left out of node_announcement, whose features are those of a node with the option off', () => {
+	it('with the option on, bit 443 is advertised in init and left out of node_announcement, whose features are those of a node with the option off', () => {
 		const announce = (node: LightningNode): Buffer => {
 			const payload = (
 				node as unknown as { buildNodeAnnouncement(t: number): Buffer | null }
@@ -1634,16 +1634,16 @@ describe('FFOR concurrent receive, adversarial: feature bit hygiene', function (
 		const on = new LightningNode(
 			makeNodeConfig(9105, undefined, { fforConcurrent: { enabled: true } })
 		);
-		expect(on.getLocalFeatures().hasBit(563), 'in init').to.equal(true);
+		expect(on.getLocalFeatures().hasBit(443), 'in init').to.equal(true);
 		const announced = FeatureFlags.fromBuffer(announce(on));
-		expect(announced.hasBit(563)).to.equal(false);
-		expect(announced.hasBit(562)).to.equal(false);
+		expect(announced.hasBit(443)).to.equal(false);
+		expect(announced.hasBit(442)).to.equal(false);
 		// Everything else the node advertises is still announced, the base
 		// capability included.
 		expect(announced.hasFeature(Feature.OPTION_FF_RECEIVE)).to.equal(true);
 		expect(announce(on).equals(announce(off))).to.equal(true);
 		// And the init set itself is not touched by building an announcement.
-		expect(on.getLocalFeatures().hasBit(563)).to.equal(true);
+		expect(on.getLocalFeatures().hasBit(443)).to.equal(true);
 		// With the option off the announcement is the init set, byte for byte.
 		expect(announce(off).equals(off.getLocalFeatures().toBuffer())).to.equal(
 			true

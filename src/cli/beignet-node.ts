@@ -730,7 +730,7 @@ export interface BeignetNodeOptions
 		/** Smallest proportional fee accepted, in ppm. */
 		feePpm?: number;
 	};
-	/** Advertise FFOR concurrent receive, feature bits 562/563 (default true). */
+	/** Advertise FFOR concurrent receive, feature bits 442/443 (default true). */
 	fforConcurrent?: boolean;
 	/** Accept new concurrent-profile settlements when fforSettle is on (default true). */
 	fforSettleConcurrent?: boolean;
