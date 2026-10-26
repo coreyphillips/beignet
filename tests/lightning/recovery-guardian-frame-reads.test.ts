@@ -15,9 +15,11 @@ import {
 	CRASH_V1_PROFILE,
 	GuardianClient,
 	GuardianReplicator,
+	GuardianRotation,
 	GuardianVerbName,
 	IBoundGuardianClient,
 	IGuardianRecord,
+	IParsedGuardian,
 	IWriterLeaseKeys,
 	JOURNAL_META_KEYS,
 	META_LAST_SNAPSHOT_GROUP,
@@ -53,6 +55,19 @@ const SET_ID = computeGuardianSetId({
 	guardianIds: GUARDIAN_IDS
 });
 const CONTEXT = { guardianSetId: SET_ID, members: GUARDIAN_IDS };
+const OUTGOING = { secrets: GUARDIAN_SECRETS, context: CONTEXT };
+const INCOMING_SECRETS = [4, 5, 6].map((i) => sha(`frame-reads-guardian-${i}`));
+const INCOMING_IDS = INCOMING_SECRETS.map((s) => xOnlyFromSecret(s));
+const INCOMING = {
+	secrets: INCOMING_SECRETS,
+	context: {
+		guardianSetId: computeGuardianSetId({
+			...CRASH_V1_PROFILE,
+			guardianIds: INCOMING_IDS
+		}),
+		members: INCOMING_IDS
+	}
+};
 const NODE_SECRET = sha('frame-reads-node-secret');
 const ROOT = deriveRecoveryRoot(NODE_SECRET);
 const NODE_ID = getPublicKey(NODE_SECRET);
@@ -75,19 +90,22 @@ interface IGuardianUnderTest {
  */
 function guardianAt(
 	index: number,
-	onPut?: (sequence: bigint) => void,
-	down?: () => boolean
+	onPut?: (sequence: bigint) => void | Promise<void>,
+	down?: () => boolean,
+	set = OUTGOING
 ): IGuardianUnderTest {
 	const guardian = new ReferenceGuardian({
 		path: ':memory:',
-		guardianSecret: GUARDIAN_SECRETS[index],
-		members: GUARDIAN_IDS,
+		guardianSecret: set.secrets[index],
+		members: set.context.members,
 		clock
 	});
 	const sent: bigint[] = [];
 	const client = new GuardianClient({
-		url: `http://guardian-${index}.example`,
-		guardianSetId: SET_ID,
+		url: `http://guardian-${set.context.members[index].toString(
+			'hex'
+		)}.example`,
+		guardianSetId: set.context.guardianSetId,
 		transport: async (url, init): Promise<{ status: number; body: Buffer }> => {
 			if (init.method === 'GET') {
 				return { status: 200, body: encodeGuardianInfo(guardian) };
@@ -98,14 +116,14 @@ function guardianAt(
 				if (down?.()) throw new Error('guardian unreachable');
 				const sequence = decodePutStateRequest(body).record.sequence;
 				sent.push(sequence);
-				onPut?.(sequence);
+				await onPut?.(sequence);
 			}
 			return { status: 200, body: dispatchGuardianVerb(guardian, verb, body) };
 		}
 	});
 	return {
 		guardian,
-		bound: { client, expectedGuardianId: GUARDIAN_IDS[index] },
+		bound: { client, expectedGuardianId: set.context.members[index] },
 		sent
 	};
 }
@@ -459,6 +477,77 @@ describe('Guardian replication reads frames by sequence (issue #1862)', () => {
 		for (const entry of guardians) {
 			const head = await entry.bound.client.getHead(ROOT.recoveryId);
 			expect(head.state!.logHead.sequence).to.equal(2n);
+		}
+		storage.close();
+	});
+
+	it('backfills an incoming set whose frames the outgoing watermark lets compaction prune mid-pass', async function (): Promise<void> {
+		this.timeout(60_000);
+		// Retention follows the outgoing set's watermark only, as on a node.
+		let outgoingRep: GuardianReplicator | null = null;
+		const { storage, journal, manager } = journaled(29, {
+			snapshotIntervalFrames: 4,
+			retainFrom: (): bigint =>
+				outgoingRep ? outgoingRep.replicatedThrough() + 1n : 1n
+		});
+		const outgoing = guardianSet();
+		outgoingRep = replicatorFor(storage, outgoing);
+		const lease = await registered(outgoingRep);
+		const tip = BigInt(storage.recoveryFrameStats()!.maxSequence);
+		expect(
+			(await outgoingRep.replicatePending(lease)).replicatedThrough
+		).to.equal(tip);
+		expect(storage.recoveryFrameStats()!.minSequence).to.equal(1);
+
+		// Once the incoming set holds its first window, the journal moves on,
+		// the outgoing set receipts it, and compaction prunes to the newest
+		// snapshot, taking frames the incoming pass has not sent yet.
+		let compacted = false;
+		const incoming = [0, 1, 2].map((index) =>
+			guardianAt(
+				index,
+				async (sequence) => {
+					if (compacted || sequence !== 8n) return;
+					compacted = true;
+					for (let i = 29; i < 32; i++) commitPreimage(manager, i);
+					await outgoingRep!.replicatePending(lease);
+					journal.compact();
+				},
+				undefined,
+				INCOMING
+			)
+		);
+		const setOf = (entries: IGuardianUnderTest[]): IParsedGuardian[] =>
+			entries.map((entry) => ({
+				guardianId: entry.bound.expectedGuardianId,
+				url: entry.bound.client.url
+			}));
+		const result = await new GuardianRotation({
+			storage,
+			recoveryRoot: ROOT,
+			lease,
+			outgoing: {
+				guardians: setOf(outgoing),
+				bound: outgoing.map((entry) => entry.bound),
+				context: CONTEXT
+			},
+			incoming: {
+				guardians: setOf(incoming),
+				bound: incoming.map((entry) => entry.bound),
+				context: INCOMING.context
+			},
+			required: CRASH_V1_PROFILE.required,
+			clock,
+			journalKeys: JOURNAL_KEYS
+		}).rotate();
+		expect(compacted).to.equal(true);
+		// Everything below the incoming pass's tip was pruned under it.
+		expect(storage.recoveryFrameStats()!.minSequence).to.equal(Number(tip));
+		const journalTip = BigInt(storage.recoveryFrameStats()!.maxSequence);
+		expect(result.replicator.replicatedThrough()).to.equal(journalTip);
+		for (const entry of incoming) {
+			const head = await entry.bound.client.getHead(ROOT.recoveryId);
+			expect(head.state!.logHead.sequence).to.equal(journalTip);
 		}
 		storage.close();
 	});

@@ -344,18 +344,19 @@ interface IReplicationBacklog {
 }
 
 /**
- * The backlog above `after`, or null when nothing is stored there. A backend
- * with point reads serves each frame when a stream reaches it, so a pass
- * holds one pipeline window per guardian however far behind the set is, and
- * a frame compacted mid-pass ends the stream at that frame. A backend
- * without them is read once up front, because each point read there would
- * itself be a range load.
+ * The backlog above `after`, or null when nothing is stored there. With
+ * `deferred`, a backend with point reads serves each frame when a stream
+ * reaches it, so a pass holds one pipeline window per guardian however far
+ * behind the set is, and a frame compacted mid-pass ends the stream at that
+ * frame. Otherwise the backlog is read once up front: a backend without
+ * point reads would turn each into a range load.
  */
 function openBacklog(
 	storage: IStorageBackend,
-	after: bigint
+	after: bigint,
+	deferred: boolean
 ): IReplicationBacklog | null {
-	if (storage.loadRecoveryFrame && storage.recoveryFrameStats) {
+	if (deferred && storage.loadRecoveryFrame && storage.recoveryFrameStats) {
 		const span = storage.recoveryFrameStats();
 		if (!span || BigInt(span.maxSequence) <= after) return null;
 		const min = BigInt(span.minSequence);
@@ -1780,7 +1781,15 @@ export class GuardianReplicator {
 		lease: IWriterLeaseKeys
 	): Promise<IReplicationResult> {
 		const from = this.replicatedThrough();
-		const backlog = openBacklog(this.config.storage, from);
+		// The journal's retention floor follows the main watermark only, so a
+		// prefixed replicator (a rotation's backfill) can see its backlog
+		// pruned mid-pass once the main set moves on. It holds the whole
+		// backlog from the start instead.
+		const backlog = openBacklog(
+			this.config.storage,
+			from,
+			this.config.metaKeyPrefix === undefined
+		);
 		if (!backlog) {
 			await this.readMissingLimits();
 			return {
