@@ -81,4 +81,19 @@ describe('Channel list: the state before a reestablish (issue #1899)', () => {
 		);
 		expect(listed(channelId)).to.not.have.property('preReestablishState');
 	});
+
+	// A close while wrapped leaves the stored preReestablishState behind: the
+	// list reports it only while the channel is still waiting to reestablish.
+	it('drops the earlier state once a wrapped channel closes', async () => {
+		const channelId = await openReadyChannel(alice, bob);
+		await disconnect(alice, bob, cut);
+		const destination = Buffer.concat([
+			Buffer.from([0x00, 0x14]),
+			crypto.randomBytes(20)
+		]);
+		expect(alice.forceCloseChannel(channelId, destination).ok).to.equal(true);
+		const closed = listed(channelId);
+		expect(closed.state).to.not.equal(ChannelState.AWAITING_REESTABLISH);
+		expect(closed).to.not.have.property('preReestablishState');
+	});
 });
