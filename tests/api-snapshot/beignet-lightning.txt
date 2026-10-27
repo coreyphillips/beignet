@@ -2223,6 +2223,7 @@ const directFunding.DF_MAX_OFFER_SESSIONS = 512
 const directFunding.DF_MAX_PAYMENT_RECORDS = 512
 const directFunding.DF_MAX_PREVOUTS = 16
 const directFunding.DF_MAX_RAW_TX_BYTES = 20000
+const directFunding.DF_MAX_RECEIVED_RECORDS = 512
 const directFunding.DF_MAX_REQUEST_ATTEMPTS = 3
 const directFunding.DF_MAX_REQUEST_TTL_MS: number
 const directFunding.DF_MAX_TRANSPORTS = 8
@@ -2241,6 +2242,8 @@ const directFunding.DF_PAYMENT_RETENTION_MS: number
 const directFunding.DF_POST_WITNESS_STATES: ReadonlySet<directFunding.DfPaymentStatus>
 const directFunding.DF_PROBE_POISON_SCRIPT: Buffer
 const directFunding.DF_RECEIPT_TIMEOUT_MS = 45000
+const directFunding.DF_RECEIVED_RETENTION_MS: number
+const directFunding.DF_RECEIVED_STORAGE_KEY = "df:received"
 const directFunding.DF_RECEIVER_SWEEP_INTERVAL_MS = 30000
 const directFunding.DF_RELAY_DEFAULTS: { maxFramesPerSecond: number; burstMultiplier: number; maxFrameBytes: number; }
 const directFunding.DF_RELAY_MAX_FRAME_BYTES = 32768
@@ -2329,6 +2332,7 @@ method directFunding.DfOnionLaneFactory.open(descriptor: directFunding.DfTranspo
 get directFunding.DfOnionLaneFactory.openLaneCount(): number
 readonly property directFunding.DfOnionLaneFactory.type = directFunding.DfTransportType.ONION_MESSAGE
 type directFunding.DfPaymentStatus = 'CREATED' | 'OFFERED' | 'SIGNED_PENDING' | 'MEMPOOL_SEEN' | 'CONFIRMED' | 'ABORTED' | 'FAILED'
+type directFunding.DfReceivedStatus = 'PAID' | 'REVERTED'
 class directFunding.DfRelayForwarder
 constructor directFunding.DfRelayForwarder(peers: directFunding.IDfPeerMessaging, config?: directFunding.IDfRelayServerConfig, log?: directFunding.DfTransportLog)
 method directFunding.DfRelayForwarder.forgetPeer(peerPubkeyHex: string): void
@@ -2421,10 +2425,13 @@ method directFunding.DirectFundingRequestStore.laneKeysForFrame(frame: directFun
 method directFunding.DirectFundingRequestStore.lapsedFundings(): Array<{ receiptHash: string; offerIdHex: string; funding: directFunding.IDfAttemptFunding; }>
 method directFunding.DirectFundingRequestStore.list(): directFunding.IDfRequestRecord[]
 method directFunding.DirectFundingRequestStore.markAttemptFunding(receiptHashHex: string, offerIdHex: string, funding: directFunding.IDfAttemptFunding, expiresAt: number): boolean
-method directFunding.DirectFundingRequestStore.markReceiptRevealed(receiptHashHex: string, paidBy?: { offerIdHex: string; fundingTxidHex: string; }): void
+method directFunding.DirectFundingRequestStore.markReceiptRevealed(receiptHashHex: string, paidBy?: { offerIdHex: string; fundingTxidHex: string; amountSat?: string; }): void
+method directFunding.DirectFundingRequestStore.markReceivedReverted(fundingTxidHex: string): number
 method directFunding.DirectFundingRequestStore.mint(opts?: { ttlMs?: number; amountSat?: bigint; }): directFunding.IDfRequestRecord
 method directFunding.DirectFundingRequestStore.paidOffer(receiptHashHex: string): { offerIdHex: string; fundingTxidHex: string; } | null
 method directFunding.DirectFundingRequestStore.receiptPreimage(receiptHashHex: string): string | null
+method directFunding.DirectFundingRequestStore.received(): directFunding.IDfReceivedRecord[]
+method directFunding.DirectFundingRequestStore.receivedFor(receiptHashHex: string): directFunding.IDfReceivedRecord | null
 method directFunding.DirectFundingRequestStore.restore(): number
 method directFunding.DirectFundingRequestStore.size(): number
 method directFunding.DirectFundingRequestStore.start(): void
@@ -2442,6 +2449,7 @@ method directFunding.DirectFundingSender.send(encodedRequest: string, opts?: dir
 method directFunding.DirectFundingSender.start(): void
 method directFunding.DirectFundingSender.stop(): void
 interface directFunding.IDfAttemptFunding
+property directFunding.IDfAttemptFunding.amountSat?: string
 property directFunding.IDfAttemptFunding.channelId: string
 property directFunding.IDfAttemptFunding.contentHash: string
 property directFunding.IDfAttemptFunding.fundingTxid?: string
@@ -2658,6 +2666,17 @@ property directFunding.IDfReceipt.fundingTxid: Buffer
 property directFunding.IDfReceipt.offerId: Buffer
 property directFunding.IDfReceipt.preimage: Buffer
 property directFunding.IDfReceipt.rawTx?: Buffer
+interface directFunding.IDfReceivedRecord
+property directFunding.IDfReceivedRecord.amountSat?: string
+property directFunding.IDfReceivedRecord.channelId?: string
+property directFunding.IDfReceivedRecord.fundingTxid: string
+property directFunding.IDfReceivedRecord.offerId: string
+property directFunding.IDfReceivedRecord.paidAt: number
+property directFunding.IDfReceivedRecord.receiptHash: string
+property directFunding.IDfReceivedRecord.requestId: string
+property directFunding.IDfReceivedRecord.splice?: boolean
+property directFunding.IDfReceivedRecord.status: directFunding.DfReceivedStatus
+property directFunding.IDfReceivedRecord.updatedAt: number
 interface directFunding.IDfReceiverConfig
 property directFunding.IDfReceiverConfig.allowSplice?: boolean
 property directFunding.IDfReceiverConfig.allowUnpairedSplice?: boolean

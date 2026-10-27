@@ -514,6 +514,10 @@ export class DirectFundingReceiver extends TypedEmitter<DirectFundingReceiverEve
 			});
 			this.emit('offer:failed', { offerId: held.offerIdHex, reason });
 		}
+		// A funding whose receipt already went out is no longer held above, and
+		// its request still reads paid. Its received record is what says it was
+		// not (issue #1893).
+		this.deps.requests.markReceivedReverted(e.spliceTxid);
 	}
 
 	stop(): void {
@@ -1668,7 +1672,10 @@ export class DirectFundingReceiver extends TypedEmitter<DirectFundingReceiverEve
 				// record in the same batch that releases our tx_signatures, and a
 				// txid recorded afterwards would be lost by exactly the crash it
 				// exists for (issue #658).
-				fundingTxid: final.fundingTxidDisplay.toString('hex')
+				fundingTxid: final.fundingTxidDisplay.toString('hex'),
+				// What the received record of a funding finished on a recovery
+				// path reports, the offer being gone with this session (issue #1893).
+				amountSat: ctx.offer.amountSat.toString()
 			},
 			session.expiresAt
 		);
@@ -2475,7 +2482,8 @@ export class DirectFundingReceiver extends TypedEmitter<DirectFundingReceiverEve
 		try {
 			this.deps.requests.markReceiptRevealed(ctx.session.receiptHashHex, {
 				offerIdHex: ctx.session.offerIdHex,
-				fundingTxidHex: final.fundingTxidDisplay.toString('hex')
+				fundingTxidHex: final.fundingTxidDisplay.toString('hex'),
+				amountSat: ctx.offer.amountSat.toString()
 			});
 		} catch (err) {
 			// Only the write failed; the in-memory tombstone stands. Withholding

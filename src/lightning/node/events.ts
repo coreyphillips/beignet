@@ -206,7 +206,7 @@ export interface LightningNodeEvents
 		inputIndex: number;
 		height: number;
 	}) => void;
-	/** A conflicted splice was unwound by agreement: both sides verified the conflict on their own chain view and returned to the pre-splice funding, which both still hold valid commitments for. The channel is NORMAL on the old outpoint, its watch re-armed; a `spliceInAndWait` on that splice rejects, and a direct-funding request behind it is failed (`direct-funding:offer:failed`, "the payer spent the offered coin elsewhere"). */
+	/** A conflicted splice was unwound by agreement: both sides verified the conflict on their own chain view and returned to the pre-splice funding, which both still hold valid commitments for. The channel is NORMAL on the old outpoint, its watch re-armed; a `spliceInAndWait` on that splice rejects, and a direct-funding request behind it is failed (`direct-funding:offer:failed`, "the payer spent the offered coin elsewhere"), or, when its receipt already went out, its received record is marked REVERTED. */
 	'splice:reverted': (data: {
 		channelId: Buffer;
 		spliceTxid: string;

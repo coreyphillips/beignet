@@ -425,6 +425,22 @@ export function getOpenApiSpec(): Record<string, unknown> {
 					}
 				}
 			},
+			'/direct-funding/received': {
+				get: {
+					summary:
+						"List the payments received against this node's direct-funding requests, newest first. receiptHash is the paymentHash /direct-funding/request returned. A direct-funding payment settles no invoice and pays no address, so this is how a client tells its request was paid. Kept for 30 days after the request itself expires, at most 512. REVERTED means the splice the payment went into was undone because the payer spent the coin elsewhere. Readonly scope",
+					tags: ['DirectFunding'],
+					responses: {
+						'200': {
+							description: 'Payments received',
+							content: jsonContent({
+								type: 'array',
+								items: { $ref: '#/components/schemas/DirectFundingReceived' }
+							})
+						}
+					}
+				}
+			},
 			'/direct-funding/request': {
 				post: {
 					summary:
@@ -5924,6 +5940,39 @@ export function getOpenApiSpec(): Record<string, unknown> {
 							description:
 								'Smallest offer served, never below the 5000 sat protocol floor'
 						}
+					}
+				},
+				DirectFundingReceived: {
+					type: 'object',
+					properties: {
+						receiptHash: {
+							type: 'string',
+							description:
+								'The paymentHash the request was minted with, and the first field of its envelope'
+						},
+						requestId: { type: 'string' },
+						offerId: { type: 'string' },
+						fundingTxid: {
+							type: 'string',
+							description:
+								'The splice or open transaction the payment went into'
+						},
+						channelId: { type: 'string' },
+						splice: {
+							type: 'boolean',
+							description:
+								'A splice into an existing channel rather than a new open'
+						},
+						amountSat: {
+							type: 'string',
+							description: 'Decimal satoshis the payment funded'
+						},
+						status: { type: 'string', enum: ['PAID', 'REVERTED'] },
+						paidAt: {
+							type: 'integer',
+							description: 'When the receipt was revealed, ms since epoch'
+						},
+						updatedAt: { type: 'integer' }
 					}
 				},
 				DirectFundingPrepareResult: {

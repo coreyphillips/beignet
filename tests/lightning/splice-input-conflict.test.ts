@@ -2456,4 +2456,57 @@ describe('Direct-funding receiver on a reverted splice (issue #760)', function (
 		expect(node.requests.isTombstoned(record.receiptHash)).to.equal(false);
 		engine.stop();
 	});
+
+	it('marks a payment whose receipt already went out REVERTED (issue #1893)', async () => {
+		const node = new FakeDfNode();
+		node.spliceChannel = crypto.randomBytes(32);
+		node.trustedPayers.add(LSP_PUBKEY);
+		const record = node.mintRequest();
+		const coin = makeCoin();
+		node.publish(coin);
+		const offer = buildOffer(record, coin);
+		const payer = new FakePayerLane(record, 'lane', LSP_PUBKEY);
+		const engine = new DirectFundingReceiver(node, {
+			allowSplice: true,
+			negotiationTimeoutMs: 5_000,
+			sweepIntervalMs: 60_000
+		});
+		engine.start();
+		engine.handleFrame(payer.offerFrame(offer));
+		await flush();
+		const { channelId, tx } = node.completeSpliceNegotiation(
+			coin,
+			offer,
+			40_000n
+		);
+		await flush();
+		engine.handleFrame(
+			payer.witnessFrame(offer.offerId, [Buffer.alloc(64, 3)])
+		);
+		await flush();
+		expect(node.requests.isTombstoned(record.receiptHash)).to.equal(true);
+		expect(node.requests.receivedFor(record.receiptHash)?.status).to.equal(
+			'PAID'
+		);
+
+		node.fireSpliceReverted({
+			channelId,
+			spliceTxid: crypto.randomBytes(32).toString('hex'),
+			conflictTxid: 'ab'.repeat(32)
+		});
+		expect(node.requests.receivedFor(record.receiptHash)?.status).to.equal(
+			'PAID'
+		);
+
+		node.fireSpliceReverted({
+			channelId,
+			spliceTxid: tx.getId(),
+			conflictTxid: 'ab'.repeat(32)
+		});
+		expect(node.requests.receivedFor(record.receiptHash)).to.include({
+			fundingTxid: tx.getId(),
+			status: 'REVERTED'
+		});
+		engine.stop();
+	});
 });

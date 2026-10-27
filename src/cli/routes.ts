@@ -214,6 +214,8 @@ const ROUTE_TABLE = [
 	{ method: 'POST', path: '/direct-funding/request', scopes: ['invoice'] },
 	// Policy readback, no secrets in it.
 	{ method: 'GET', path: '/direct-funding/config', scopes: ['readonly'] },
+	// Payments received against our requests: amounts and txids, no secrets.
+	{ method: 'GET', path: '/direct-funding/received', scopes: ['readonly'] },
 	{ method: 'POST', path: '/invoice/create-hold', scopes: ['invoice'] },
 	{ method: 'POST', path: '/invoice/settle-hold', scopes: ['invoice'] },
 	{ method: 'POST', path: '/invoice/cancel-hold', scopes: ['invoice'] },
