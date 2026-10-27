@@ -2768,7 +2768,7 @@ property directFunding.IDfRequestRecord.attempts?: number
 property directFunding.IDfRequestRecord.encryptionPrivateKeyHex: string
 property directFunding.IDfRequestRecord.expiresAt: number
 property directFunding.IDfRequestRecord.onionPathSecretHex: string
-property directFunding.IDfRequestRecord.paidBy?: { offerIdHex: string; fundingTxidHex: string; }
+property directFunding.IDfRequestRecord.paidBy?: { offerIdHex: string; fundingTxidHex: string; channelIdHex?: string; splice?: boolean; amountSat?: string; }
 property directFunding.IDfRequestRecord.preimageHex: string
 property directFunding.IDfRequestRecord.receiptHash: string
 property directFunding.IDfRequestRecord.requestId: string

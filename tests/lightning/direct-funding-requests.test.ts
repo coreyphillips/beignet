@@ -752,6 +752,51 @@ describe('Direct funding: outstanding requests', () => {
 			});
 		});
 
+		it('keeps the channel and amount on the tombstone for a restart before the retry', () => {
+			// The tombstone clears the mark that held them, so a received record
+			// that never landed is rebuilt from what the tombstone kept.
+			const h = harness();
+			const record = h.store.mint();
+			failReceivedWrites(h);
+			expect(errorCode(() => pay(h, record, { amountSat: '60000' }))).to.equal(
+				DirectFundingErrorCode.NOT_PERSISTED
+			);
+			const restarted = harness({}, { wallet: h.wallet, clock: h.clock });
+			restarted.store.restore();
+			expect(restarted.store.receivedFor(record.receiptHash)).to.include({
+				channelId: funding.channelId,
+				splice: true,
+				amountSat: '60000'
+			});
+			expect(restarted.store.paidOffer(record.receiptHash)).to.deep.equal({
+				offerIdHex: OFFER_A,
+				fundingTxidHex: FUNDING_TXID
+			});
+		});
+
+		it('holds back from the sweep only a paid request whose record is unsaved', () => {
+			const h = harness({ requestTtlMs: HOUR });
+			const saved = h.store.mint();
+			pay(h, saved);
+			const disk = failReceivedWrites(h);
+			const unsaved = h.store.mint();
+			expect(errorCode(() => pay(h, unsaved))).to.equal(
+				DirectFundingErrorCode.NOT_PERSISTED
+			);
+			h.clock.now += 2 * HOUR;
+			const stored = (): string[] =>
+				(
+					JSON.parse(
+						h.wallet.get(DF_REQUESTS_STORAGE_KEY)!
+					) as IDfRequestRecord[]
+				).map((r) => r.receiptHash);
+			expect(h.store.sweep()).to.equal(1);
+			expect(stored()).to.deep.equal([unsaved.receiptHash]);
+			disk.heal();
+			expect(h.store.sweep()).to.equal(1);
+			expect(stored()).to.deep.equal([]);
+		});
+
 		it('keeps an expired paid request on restore until its backfilled record lands', () => {
 			const h = harness({ requestTtlMs: HOUR });
 			const record = h.store.mint({ amountSat: 60_000n });
@@ -828,18 +873,12 @@ describe('Direct funding: outstanding requests', () => {
 			expect(restarted.store.received()).to.deep.equal([good]);
 
 			// Corrupt rows run from nothing, and the paid request still held gives
-			// its record back, as much of it as a tombstone keeps: an open-amount
-			// request's funding went with the mark the receipt cleared.
+			// its record back whole: the tombstone keeps the channel and amount
+			// the mark it cleared held.
 			h.wallet.set(DF_RECEIVED_STORAGE_KEY, '{not json');
 			const corrupt = harness({}, { wallet: h.wallet, clock: h.clock });
 			corrupt.store.restore();
-			const { channelId, splice, amountSat, ...kept } = good;
-			expect([channelId, splice, amountSat]).to.deep.equal([
-				funding.channelId,
-				true,
-				'60000'
-			]);
-			expect(corrupt.store.received()).to.deep.equal([kept]);
+			expect(corrupt.store.received()).to.deep.equal([good]);
 		});
 
 		it('lets a record past retention go on the sweep and on restore, with no new payment', () => {

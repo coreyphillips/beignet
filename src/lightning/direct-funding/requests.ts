@@ -98,10 +98,15 @@ export class DirectFundingRequestStore {
 	private receivedByHash = new Map<string, IDfReceivedRecord>();
 	/**
 	 * The received set changed and the write did not land. Every later write
-	 * retries it, and until one does a paid request is not swept: its tombstone
-	 * is then the only stored trace of the payment.
+	 * retries it.
 	 */
 	private receivedUnsaved = false;
+	/**
+	 * Receipt hashes whose received record has not reached storage. Until it
+	 * does, the paid request is not swept: its tombstone is then the only
+	 * stored trace of the payment.
+	 */
+	private unsavedReceipts = new Set<string>();
 	private sweepTimer: NodeJS.Timeout | null = null;
 	private readonly ttlMs: number;
 	private readonly maxOutstanding: number;
@@ -160,15 +165,18 @@ export class DirectFundingRequestStore {
 			// The strip comes FIRST: a row whose only claim on life is a marker
 			// that did not come back intact has no funding to answer for.
 			if (stripMalformedAttempt(entry)) stripped = true;
-			if (this.receive(entry)) this.receivedUnsaved = true;
+			this.receive(entry);
 			entries.push(entry);
 		}
 		// Before anything is dropped below: an expired paid request goes only
 		// once its payment's record is stored.
-		const unsaved = this.receivedUnsaved && !this.persistReceived();
+		if (this.receivedUnsaved) this.persistReceived();
 		const now = this.now();
 		for (const entry of entries) {
-			if (!answersFor(entry, now) && !(unsaved && entry.paidBy)) {
+			if (
+				!answersFor(entry, now) &&
+				!this.unsavedReceipts.has(entry.receiptHash)
+			) {
 				dropped++;
 				continue;
 			}
@@ -206,12 +214,15 @@ export class DirectFundingRequestStore {
 		// Received records past retention go here too, so a node that takes no
 		// new payment still lets them go.
 		if (this.pruneReceived()) this.receivedUnsaved = true;
-		const unsaved = this.receivedUnsaved && !this.persistReceived();
+		if (this.receivedUnsaved) this.persistReceived();
 		let dropped = 0;
 		for (const record of [...this.byHash.values()]) {
 			// A paid request is its payment's only stored trace until the
 			// received record lands.
-			if (!answersFor(record, now) && !(unsaved && record.paidBy)) {
+			if (
+				!answersFor(record, now) &&
+				!this.unsavedReceipts.has(record.receiptHash)
+			) {
 				this.unindex(record);
 				dropped++;
 			}
@@ -340,15 +351,28 @@ export class DirectFundingRequestStore {
 		// request is refused, so anything overwriting this would be answering a
 		// replay with someone else's funding.
 		if (paidBy && !record.paidBy) {
+			// Before the mark is cleared below: the funding it holds is where the
+			// channel and, on a recovery path, the amount come from.
+			const funding = paidFunding(
+				record,
+				paidBy.offerIdHex,
+				paidBy.fundingTxidHex
+			);
+			const amount = [paidBy.amountSat, funding?.amountSat].find(
+				isPositiveDecimal
+			);
 			record.paidBy = {
 				offerIdHex: paidBy.offerIdHex,
-				fundingTxidHex: paidBy.fundingTxidHex
+				fundingTxidHex: paidBy.fundingTxidHex,
+				...(funding
+					? { channelIdHex: funding.channelId, splice: funding.splice }
+					: {}),
+				...(amount !== undefined ? { amountSat: amount } : {})
 			};
 		}
-		// Before the mark is cleared below: the funding it holds is where the
-		// channel and, on a recovery path, the amount come from. Written whenever
-		// there is one, not only when it is new, so a caller's retry lands it.
-		if (this.receive(record, paidBy?.amountSat)) this.receivedUnsaved = true;
+		this.receive(record);
+		// Written whenever there is one, not only when it is new, so a caller's
+		// retry lands it.
 		const kept =
 			!this.receivedByHash.has(record.receiptHash) || this.persistReceived();
 		// A funding that completed past its request's own expiry leaves a
@@ -389,7 +413,10 @@ export class DirectFundingRequestStore {
 	paidOffer(
 		receiptHashHex: string
 	): { offerIdHex: string; fundingTxidHex: string } | null {
-		return this.byReceiptHash(receiptHashHex)?.paidBy ?? null;
+		const paid = this.byReceiptHash(receiptHashHex)?.paidBy;
+		return paid
+			? { offerIdHex: paid.offerIdHex, fundingTxidHex: paid.fundingTxidHex }
+			: null;
 	}
 
 	// ─────────────── Received payments ───────────────
@@ -719,50 +746,57 @@ export class DirectFundingRequestStore {
 
 	/**
 	 * Add the received record for a paid request, once: the first payment's
-	 * stands, as its receipt does. Reports whether it added one.
+	 * stands, as its receipt does. Reports whether it added one, which is then
+	 * unsaved until a write lands it.
 	 *
-	 * The channel comes from the funding the paying offer's mark holds, when it
-	 * still holds one; a mark held by any other offer describes another
-	 * funding. The amount is the caller's, then that funding's, then the one
-	 * the request fixed.
+	 * The channel and the amount come from what the tombstone kept, then from
+	 * the funding the paying offer's mark holds, when it still holds one (a
+	 * mark held by any other offer describes another funding). The amount
+	 * falls back to the one the request fixed.
 	 */
-	private receive(record: IDfRequestRecord, amountSat?: string): boolean {
+	private receive(record: IDfRequestRecord): boolean {
 		const paid = record.paidBy;
 		if (!paid || this.receivedByHash.has(record.receiptHash)) return false;
-		const active = record.activeAttempt;
-		const funding =
-			active?.offerIdHex === paid.offerIdHex &&
-			(active.funding?.fundingTxid === undefined ||
-				active.funding.fundingTxid === paid.fundingTxidHex)
-				? active.funding
-				: undefined;
-		const amount = [amountSat, funding?.amountSat, record.amountSat].find(
-			isPositiveDecimal
-		);
 		// Dated from the payment, so a record backfilled from an old tombstone
 		// is held to the same window as one written at the time.
 		const paidAt = record.revealedAt ?? this.now();
 		if (this.now() - paidAt > DF_RECEIVED_RETENTION_MS) return false;
+		const funding = paidFunding(record, paid.offerIdHex, paid.fundingTxidHex);
+		const kept =
+			typeof paid.channelIdHex === 'string' &&
+			isHex(paid.channelIdHex, 32) &&
+			typeof paid.splice === 'boolean'
+				? { channelId: paid.channelIdHex, splice: paid.splice }
+				: undefined;
+		const channel =
+			kept ??
+			(funding
+				? { channelId: funding.channelId, splice: funding.splice }
+				: undefined);
+		const amount = [paid.amountSat, funding?.amountSat, record.amountSat].find(
+			isPositiveDecimal
+		);
 		this.evictReceived();
 		this.receivedByHash.set(record.receiptHash, {
 			receiptHash: record.receiptHash,
 			requestId: record.requestId,
 			offerId: paid.offerIdHex,
 			fundingTxid: paid.fundingTxidHex,
-			...(funding
-				? { channelId: funding.channelId, splice: funding.splice }
-				: {}),
+			...(channel ?? {}),
 			...(amount !== undefined ? { amountSat: amount } : {}),
 			status: 'PAID',
 			paidAt,
 			updatedAt: paidAt
 		});
+		this.receivedUnsaved = true;
+		this.unsavedReceipts.add(record.receiptHash);
 		return true;
 	}
 
 	private restoreReceived(): void {
 		this.receivedByHash.clear();
 		this.receivedUnsaved = false;
+		this.unsavedReceipts.clear();
 		const raw = this.deps.storage?.loadWalletData(DF_RECEIVED_STORAGE_KEY);
 		if (!raw) return;
 		let parsed: unknown;
@@ -828,6 +862,7 @@ export class DirectFundingRequestStore {
 			}
 		}
 		this.receivedUnsaved = !landed;
+		if (landed) this.unsavedReceipts.clear();
 		return landed;
 	}
 }
@@ -932,6 +967,23 @@ function isWellFormedFunding(funding: unknown): boolean {
  * A received record is only shown if it came back whole. An amount that did
  * not is dropped with the row rather than shown as some other figure.
  */
+/**
+ * The funding the paying offer's mark still holds, if it holds one for that
+ * funding. A mark held by any other offer describes another funding.
+ */
+function paidFunding(
+	record: IDfRequestRecord,
+	offerIdHex: string,
+	fundingTxidHex: string
+): IDfAttemptFunding | undefined {
+	const active = record.activeAttempt;
+	if (active?.offerIdHex !== offerIdHex || !active.funding) return undefined;
+	const txid = active.funding.fundingTxid;
+	return txid === undefined || txid === fundingTxidHex
+		? active.funding
+		: undefined;
+}
+
 function isWellFormedReceived(entry: unknown): entry is IDfReceivedRecord {
 	const r = entry as IDfReceivedRecord | null;
 	return (

@@ -904,7 +904,7 @@ export class DirectFundingReceiver extends TypedEmitter<DirectFundingReceiverEve
 		} catch (err) {
 			this.log(DF_LOG_OFFER_FAILED, {
 				offerId: held.offerIdHex,
-				error: `receipt tombstone not persisted: ${errorText(err)}`
+				error: `receipt not persisted: ${errorText(err)}`
 			});
 		}
 		const complete = final.tx.ins.every((i) => i.witness.length > 0);
@@ -1926,7 +1926,7 @@ export class DirectFundingReceiver extends TypedEmitter<DirectFundingReceiverEve
 		} catch (err) {
 			this.log(DF_LOG_OFFER_FAILED, {
 				offerId: offerIdHex,
-				error: `receipt tombstone not persisted: ${errorText(err)}`
+				error: `receipt not persisted: ${errorText(err)}`
 			});
 		}
 		const receipt = encodeDfReceipt({
@@ -2513,7 +2513,7 @@ export class DirectFundingReceiver extends TypedEmitter<DirectFundingReceiverEve
 			// the two failures by a distance.
 			this.log(DF_LOG_OFFER_FAILED, {
 				offerId: ctx.session.offerIdHex,
-				error: `receipt tombstone not persisted: ${errorText(err)}`
+				error: `receipt not persisted: ${errorText(err)}`
 			});
 		}
 		// The complete transaction, when every witness is in: no chain round

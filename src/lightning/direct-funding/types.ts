@@ -347,8 +347,19 @@ export interface IDfRequestRecord {
 	 * after a successful exchange can still replay the receipt: the session
 	 * that recorded it lives in memory only, and without this the payer whose
 	 * receipt frame was lost gets a bare "already paid" and no proof of it.
+	 *
+	 * The channel, whether it was a splice, and the amount ride along for the
+	 * received record (issue #1893): the same write clears the funding mark
+	 * that held them, and a received record that did not reach storage is
+	 * rebuilt from this on restore.
 	 */
-	paidBy?: { offerIdHex: string; fundingTxidHex: string };
+	paidBy?: {
+		offerIdHex: string;
+		fundingTxidHex: string;
+		channelIdHex?: string;
+		splice?: boolean;
+		amountSat?: string;
+	};
 	/** Offers this request has spent a funding session on, over its whole life. */
 	attempts?: number;
 	/**
