@@ -58,6 +58,7 @@ export function daemonOptions(
 		eagerGossipVerify: config.eagerGossipVerify,
 		autoReconnect: config.autoReconnect,
 		logLevel: config.logLevel,
+		wireTrace: config.wireTrace,
 		recoveryMode: config.recoveryMode,
 		recoveryGuardians: config.recoveryGuardians,
 		recoveryProfile: config.recoveryProfile,

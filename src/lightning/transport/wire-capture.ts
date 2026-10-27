@@ -57,6 +57,11 @@ function resolveCapturePath(): string | null {
 	return capturePath;
 }
 
+/** False for the gossip and ping/pong types a capture or trace leaves out. */
+export function isTraceableWireType(type: number): boolean {
+	return !SKIPPED_TYPES.has(type);
+}
+
 export function isWireCaptureEnabled(): boolean {
 	return resolveCapturePath() !== null;
 }

@@ -891,6 +891,10 @@ export interface BeignetConfig extends IrohDaemonConfig, ElectrumTlsConfig {
 	 *  'silent'). When set, the daemon prints leveled diagnostics to stderr;
 	 *  unset keeps the daemon silent (status quo). */
 	logLevel?: TLogLevel;
+	/** Log every non-gossip wire message (type and length, no payloads) at
+	 *  info: true for every peer, or a list of peer pubkeys. Env
+	 *  BEIGNET_WIRE_TRACE: '1'/'true', or comma-separated pubkeys. */
+	wireTrace?: boolean | string[];
 	/** Recovery Protocol mode (docs/RECOVERY-PROTOCOL.md section 8):
 	 *  'off' | 'peer-storage' | 'async-remote' | 'quorum'. Exact values only;
 	 *  anything else is ignored and the default (off) rules. Env:

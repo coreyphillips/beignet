@@ -287,6 +287,23 @@ export interface IPeerInfo {
 	iroh?: IIrohDiagnostics;
 }
 
+/** What peer:disconnect knows about the connection that ended. */
+export interface IPeerDisconnectInfo {
+	/** 'remote' when the peer (or the network) closed the socket. */
+	initiator: 'local' | 'remote';
+	/** Transport or protocol reason, when there was one (e.g. 'read ECONNRESET', 'Pong timeout'). */
+	reason?: string;
+	direction: 'inbound' | 'outbound';
+	/** How long the connection was registered, in ms. */
+	uptimeMs?: number;
+}
+
+/** A registered connection's direction and the time it was registered. */
+export interface IPeerConnectionInfo {
+	direction: 'inbound' | 'outbound';
+	connectedAt: number;
+}
+
 export interface IPeerDialOptions {
 	/**
 	 * Replaces the default bound on each establishment step (socket connect,
@@ -306,6 +323,14 @@ export interface IPeerDialOptions {
 }
 
 type MessageHandler = (pubkey: string, type: number, payload: Buffer) => void;
+
+/** See PeerManager.setWireObserver. */
+export type WireObserver = (
+	dir: 'in' | 'out',
+	pubkey: string,
+	type: number,
+	length: number
+) => void;
 
 /** Why a peer operation was refused. */
 export enum PeerErrorCode {
@@ -434,6 +459,10 @@ export class PeerManager extends EventEmitter {
 	private laneGate: IPeerLaneGate | null = null;
 	private inboundPeerCount = 0;
 	private inboundPeerSet: Set<string> = new Set();
+	/** When each registered connection was registered (Date.now()). */
+	private connectedAt = new Map<string, number>();
+	/** The last error a connection reported, the likely reason it closes. */
+	private lastPeerError = new WeakMap<Peer, string>();
 	/** The inboundAddressKey of each established inbound peer that has one. */
 	private inboundAddressKeys = new Map<string, string>();
 	private irohConfig?: IIrohConfig;
@@ -822,7 +851,11 @@ export class PeerManager extends EventEmitter {
 			// peer:disconnect is emitted before our peer:connect below, mirroring
 			// the inbound replacement path: channels mark AWAITING_REESTABLISH
 			// first, then the connect handler re-drives channel_reestablish.
-			this.removeRegisteredPeer(pubkey, raceWinner);
+			this.removeRegisteredPeer(
+				pubkey,
+				raceWinner,
+				'replaced by a newer connection'
+			);
 			// The removal emitted peer:disconnect SYNCHRONOUSLY. An observer
 			// may have destroyed or frozen the manager: the candidate is no
 			// longer pending and not yet registered, so that teardown cannot
@@ -848,6 +881,7 @@ export class PeerManager extends EventEmitter {
 			}
 		}
 		this.peers.set(pubkey, peer);
+		this.connectedAt.set(pubkey, Date.now());
 		// A newer overlapping dial may have stored its own attempt meanwhile;
 		// the registered connection's address is the one listPeers() reports
 		// and the peer:connect handlers persist, so re-assert it.
@@ -935,18 +969,60 @@ export class PeerManager extends EventEmitter {
 	 * 'close' fires on a later tick and must never act on a pubkey whose
 	 * registration has already moved on.
 	 */
-	private removeRegisteredPeer(pubkey: string, peer: Peer): void {
+	private removeRegisteredPeer(
+		pubkey: string,
+		peer: Peer,
+		reason?: string
+	): void {
 		if (this.peers.get(pubkey) !== peer) return;
 		peer.removeAllListeners();
 		peer.disconnect();
 		this.peers.delete(pubkey);
 		this.clearStabilityTimer(pubkey);
+		const info = this.takeDisconnectInfo(
+			pubkey,
+			peer,
+			'local',
+			reason ?? this.lastPeerError.get(peer)
+		);
 		if (this.inboundPeerSet.delete(pubkey)) {
 			this.inboundPeerCount--;
 			this.inboundAddressKeys.delete(pubkey);
 		}
-		captureWireEvent('close', pubkey);
-		this.emitPeerDisconnect(pubkey);
+		captureWireEvent('close', pubkey, info.reason);
+		this.emitPeerDisconnect(pubkey, info);
+	}
+
+	/** Build peer:disconnect's info and forget the connection's start time.
+	 *  Must run before the inbound bookkeeping is cleared. */
+	private takeDisconnectInfo(
+		pubkey: string,
+		peer: Peer,
+		initiator: 'local' | 'remote',
+		reason: string | undefined
+	): IPeerDisconnectInfo {
+		const connectedAt = this.connectedAt.get(pubkey);
+		this.connectedAt.delete(pubkey);
+		this.lastPeerError.delete(peer);
+		return {
+			initiator,
+			...(reason ? { reason } : {}),
+			direction: this.inboundPeerSet.has(pubkey) ? 'inbound' : 'outbound',
+			...(connectedAt !== undefined
+				? { uptimeMs: Date.now() - connectedAt }
+				: {})
+		};
+	}
+
+	/** Direction and registration time of the peer's live connection. */
+	getConnectionInfo(pubkey: string): IPeerConnectionInfo | undefined {
+		pubkey = normalizeHexPubkey(pubkey);
+		const connectedAt = this.connectedAt.get(pubkey);
+		if (!this.peers.has(pubkey) || connectedAt === undefined) return undefined;
+		return {
+			direction: this.inboundPeerSet.has(pubkey) ? 'inbound' : 'outbound',
+			connectedAt
+		};
 	}
 
 	/**
@@ -962,10 +1038,12 @@ export class PeerManager extends EventEmitter {
 	 * cleanup handlers legitimately call disconnectPeer(), which would
 	 * cancel the very replacement or reconnect this containment protects.
 	 */
-	private emitPeerDisconnect(pubkey: string): void {
+	private emitPeerDisconnect(pubkey: string, info: IPeerDisconnectInfo): void {
 		for (const listener of this.rawListeners('peer:disconnect')) {
 			try {
-				(listener as (pubkey: string) => void)(pubkey);
+				(
+					listener as (pubkey: string, info: IPeerDisconnectInfo) => void
+				)(pubkey, info);
 			} catch (err) {
 				captureWireEvent(
 					'disconnect_observer_failed',
@@ -1028,7 +1106,7 @@ export class PeerManager extends EventEmitter {
 
 		const peer = this.peers.get(pubkey);
 		if (peer) {
-			this.removeRegisteredPeer(pubkey, peer);
+			this.removeRegisteredPeer(pubkey, peer, 'disconnect requested');
 		}
 	}
 
@@ -1233,6 +1311,31 @@ export class PeerManager extends EventEmitter {
 	private inboundGate: ((pubkey: string, type: number) => boolean) | null =
 		null;
 
+	/**
+	 * Observe every message of a registered connection, both directions,
+	 * by type and length. Runs before the inbound gate and after the
+	 * outbound gate; ping/pong live inside Peer and never reach it.
+	 */
+	setWireObserver(observer: WireObserver | null): void {
+		this.wireObserver = observer;
+	}
+
+	private wireObserver: WireObserver | null = null;
+
+	private observeWire(
+		dir: 'in' | 'out',
+		pubkey: string,
+		type: number,
+		length: number
+	): void {
+		if (!this.wireObserver) return;
+		try {
+			this.wireObserver(dir, pubkey, type, length);
+		} catch {
+			// A diagnostic hook must never cost a message.
+		}
+	}
+
 	private registerLanePeer(pubkey: string, peer: Peer): void {
 		// A key already registered as an ORDINARY peer never gets a lane
 		// twin: lane sessions use fresh keys, so a collision is a peer
@@ -1318,6 +1421,7 @@ export class PeerManager extends EventEmitter {
 			);
 		}
 		captureWireMessage('out', pubkey, type, payload);
+		this.observeWire('out', pubkey, type, payload.length);
 		peer.sendMessage(type, payload);
 	}
 
@@ -1825,7 +1929,11 @@ export class PeerManager extends EventEmitter {
 					// AWAITING_REESTABLISH first and the connect handler then
 					// re-drives channel_reestablish over the new connection.
 					const replaceGeneration = this.cancelGenerations.get(pubkey) ?? 0;
-					this.removeRegisteredPeer(pubkey, existing);
+					this.removeRegisteredPeer(
+						pubkey,
+						existing,
+						'replaced by a newer connection'
+					);
 					// The removal emitted peer:disconnect SYNCHRONOUSLY. An
 					// observer may have destroyed or frozen the manager: the
 					// fresh inbound is no longer pending and not yet
@@ -1850,6 +1958,7 @@ export class PeerManager extends EventEmitter {
 
 				this.setupPeerListeners(pubkey, peer);
 				this.peers.set(pubkey, peer);
+				this.connectedAt.set(pubkey, Date.now());
 				// Track inbound peer count
 				this.inboundPeerCount++;
 				this.inboundPeerSet.add(pubkey);
@@ -1926,22 +2035,30 @@ export class PeerManager extends EventEmitter {
 	private setupPeerListeners(pubkey: string, peer: Peer): void {
 		peer.on('message', (type: number, payload: Buffer) => {
 			captureWireMessage('in', pubkey, type, payload);
+			this.observeWire('in', pubkey, type, payload.length);
 			this.dispatchPeerMessage(pubkey, type, payload);
 		});
 
 		peer.on('error', (err: Error) => {
+			this.lastPeerError.set(peer, err.message);
 			captureWireEvent('error', pubkey, err.message);
 			this.emit('peer:error', pubkey, err);
 		});
 
-		peer.on('close', () => {
+		peer.on('close', (_hadError: boolean, closedLocally?: boolean) => {
 			// Only the currently registered instance may tear down the peer's
 			// bookkeeping. A connection that lost a cross-dial race (or was
 			// replaced by a fresh inbound) closes later; keying the map by
 			// pubkey alone would let that stale close delete the live
 			// replacement's entry and emit a spurious peer:disconnect.
 			if (this.peers.get(pubkey) !== peer) return;
-			captureWireEvent('close', pubkey);
+			const info = this.takeDisconnectInfo(
+				pubkey,
+				peer,
+				closedLocally ? 'local' : 'remote',
+				this.lastPeerError.get(peer)
+			);
+			captureWireEvent('close', pubkey, info.reason);
 			this.peers.delete(pubkey);
 			// A short-lived connection: don't let it reset the backoff.
 			this.clearStabilityTimer(pubkey);
@@ -1956,7 +2073,7 @@ export class PeerManager extends EventEmitter {
 			// good, and a timer scheduled after that would adopt the
 			// post-cancellation generation and dial anyway.
 			const closeGeneration = this.cancelGenerations.get(pubkey) ?? 0;
-			this.emitPeerDisconnect(pubkey);
+			this.emitPeerDisconnect(pubkey, info);
 
 			if (
 				this.autoReconnect &&
