@@ -5418,6 +5418,11 @@ export function getOpenApiSpec(): Record<string, unknown> {
 								'ANNOUNCEMENT_READY'
 							]
 						},
+						preReestablishState: {
+							type: 'string',
+							description:
+								'The state the channel was in when a disconnect, or a restart, put it in AWAITING_REESTABLISH; present exactly while it is there, so a client can tell a channel still opening from one already open while the peer is away (issue #1899)'
+						},
 						localBalanceSats: { type: 'integer' },
 						maxSendableSats: {
 							type: 'integer',

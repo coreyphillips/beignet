@@ -366,6 +366,40 @@ describe('Channel listing wire fields (GET /channels JSON)', () => {
 		expect(empty).to.not.have.property('previousFundingTxids');
 	});
 
+	// Issue #1899: a wallet tells a disconnected opening from a disconnected
+	// open channel by the state the disconnect wrapped.
+	it('toChannelInfo passes preReestablishState through, and only where the node layer gives it', () => {
+		const call = (ch: Record<string, unknown>): Record<string, unknown> =>
+			(BeignetNode.prototype as any).toChannelInfo.call(
+				{
+					node: {
+						getFforEpoch: () => undefined,
+						getChannelManager: () => ({ getPeerForChannel: () => 'peerpk' }),
+						peerSupportsSplicing: () => null
+					}
+				},
+				ch
+			);
+		const base = {
+			channelId: Buffer.alloc(32, 6),
+			peerPubkey: 'peerpk',
+			state: 'AWAITING_REESTABLISH',
+			localBalanceMsat: 1_000_000n,
+			remoteBalanceMsat: 0n,
+			fundingSatoshis: 1_000n,
+			channelType: null
+		};
+		const away = call({
+			...base,
+			preReestablishState: 'AWAITING_FUNDING_CONFIRMED'
+		});
+		expect(away.state).to.equal('AWAITING_REESTABLISH');
+		expect(away.preReestablishState).to.equal('AWAITING_FUNDING_CONFIRMED');
+		expect(call({ ...base, state: 'NORMAL' })).to.not.have.property(
+			'preReestablishState'
+		);
+	});
+
 	// The dashboard hides its splice buttons on `false` alone, so the
 	// distinction between false and absent is load-bearing: absent means the
 	// peer is disconnected and support is unknowable, and hiding on unknown

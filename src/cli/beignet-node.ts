@@ -9514,6 +9514,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 		channelId: Buffer;
 		peerPubkey: string;
 		state: string;
+		preReestablishState?: string;
 		localBalanceMsat: bigint;
 		spendableOutboundMsat?: bigint;
 		remoteBalanceMsat: bigint;
@@ -9573,6 +9574,8 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 			capacitySats: Number(ch.fundingSatoshis),
 			isAnchor: isAnchorChannel(ch.channelType ?? null)
 		};
+		if (ch.preReestablishState)
+			info.preReestablishState = ch.preReestablishState as CS;
 		// What the connected peer's init negotiated, read rather than guessed:
 		// a client deciding whether to offer splice controls has no other way
 		// to know, and reconstructing feature bits client-side is exactly the

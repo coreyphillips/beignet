@@ -1118,6 +1118,13 @@ export interface IChannelInfo {
 	channelId: Buffer;
 	peerPubkey: string;
 	state: ChannelState;
+	/**
+	 * The state the channel was in when a disconnect, or a restart, put it in
+	 * AWAITING_REESTABLISH; present exactly while it is there. A consumer
+	 * tells a channel still opening from one already open by it while the
+	 * peer is away, as the node's own balance does (issue #1899).
+	 */
+	preReestablishState?: ChannelState;
 	localBalanceMsat: bigint;
 	/** Balance-based debit ceiling for one new outbound HTLC, including
 	 * commitment costs and buffers. Zero while new HTLCs are unavailable.

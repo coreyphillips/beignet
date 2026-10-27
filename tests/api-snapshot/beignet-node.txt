@@ -665,6 +665,7 @@ property ChannelInfo.peerPubkey: string
 property ChannelInfo.peerSupportsSplicing?: boolean
 property ChannelInfo.pendingSpliceLocalBalanceSats?: number
 property ChannelInfo.pendingSpliceTxid?: TxidHex
+property ChannelInfo.preReestablishState?: ChannelStateString
 property ChannelInfo.previousFundingTxids?: TxidHex[]
 property ChannelInfo.reestablishRecencyUnproven?: boolean
 property ChannelInfo.reestablishSecretMissing?: boolean

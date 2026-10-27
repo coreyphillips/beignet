@@ -165,6 +165,13 @@ export interface ChannelInfo {
 	channelId: ChannelIdHex;
 	peerPubkey: string;
 	state: ChannelStateString;
+	/**
+	 * The state the channel was in when a disconnect, or a restart, put it in
+	 * AWAITING_REESTABLISH; present exactly while it is there. It tells a
+	 * channel still opening from one already open while the peer is away
+	 * (issue #1899).
+	 */
+	preReestablishState?: ChannelStateString;
 	localBalanceSats: number;
 	/** Balance-based debit ceiling for one new outbound HTLC, floored to
 	 * sats, before routing fees and route HTLC limits. Zero when unavailable.
