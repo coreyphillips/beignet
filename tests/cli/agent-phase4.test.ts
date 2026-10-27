@@ -371,14 +371,14 @@ describe('Structured Logging', () => {
 		expect(entry.data?.channelId).to.equal('deadbeef');
 	});
 
-	it('peer events log at debug level', () => {
+	it('peer events log at info level', () => {
 		const entry: LogEntry = {
-			level: 'debug',
+			level: 'info',
 			message: 'Peer connected',
-			data: { pubkey: '02abc' },
+			data: { pubkey: '02abc', direction: 'outbound' },
 			timestamp: Date.now()
 		};
-		expect(entry.level).to.equal('debug');
+		expect(entry.level).to.equal('info');
 	});
 
 	it('BeignetNodeOptions onError callback type', () => {

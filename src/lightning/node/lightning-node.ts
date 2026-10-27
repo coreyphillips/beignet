@@ -97,10 +97,13 @@ import {
 } from '../channel/types';
 import type {
 	IPeerDialOptions,
+	IPeerDisconnectInfo,
 	IPeerInfo,
-	Socks5ProxyScope
+	Socks5ProxyScope,
+	WireObserver
 } from '../transport/peer-manager';
 import { PeerManager, PeerDialCancelledError } from '../transport/peer-manager';
+import { isTraceableWireType } from '../transport/wire-capture';
 import type { IPeerTransportOptions } from '../transport/duplex-transport';
 import { parseWebSocketUrl } from '../transport/websocket';
 import { NetworkGraph } from '../gossip/network-graph';
@@ -2592,6 +2595,9 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				);
 				return false;
 			});
+			this.peerManager.setWireObserver(
+				this.buildWireObserver(config.wireTrace)
+			);
 			this.registerGossipHandlers();
 			this.registerOnionMessageHandler();
 			this.registerPeerStorageHandlers();
@@ -6284,7 +6290,10 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			}
 			return;
 		}
-		this.channelManager.handlePeerDisconnected(peerPubkey);
+		this.channelManager.handlePeerDisconnected(peerPubkey, {
+			initiator: 'local',
+			reason: 'disconnect requested'
+		});
 		this.dropGossipSync(peerPubkey);
 		this.notifyPeerDisconnectRequestObservers(peerPubkey);
 	}
@@ -7442,15 +7451,18 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			// failed bring-up and cost a healthy connection its teardown.
 			this.notifyPeerConnectObservers(pubkey);
 		});
-		this.peerManager.on('peer:disconnect', (pubkey: string) => {
-			this.guardianHost?.sessionClosed(pubkey);
-			this.channelManager.handlePeerDisconnected(pubkey);
-			this.dropGossipSync(pubkey);
-			this.rateLimiter.removePeer(pubkey);
-			this.swapProvider?.forgetPeer(pubkey);
-			this.submarineSwapProvider?.forgetPeer(pubkey);
-			this.notifyPeerDisconnectObservers(pubkey);
-		});
+		this.peerManager.on(
+			'peer:disconnect',
+			(pubkey: string, info?: IPeerDisconnectInfo) => {
+				this.guardianHost?.sessionClosed(pubkey);
+				this.channelManager.handlePeerDisconnected(pubkey, info);
+				this.dropGossipSync(pubkey);
+				this.rateLimiter.removePeer(pubkey);
+				this.swapProvider?.forgetPeer(pubkey);
+				this.submarineSwapProvider?.forgetPeer(pubkey);
+				this.notifyPeerDisconnectObservers(pubkey, info);
+			}
+		);
 		this.peerManager.on('peer:error', (pubkey: string, err: Error) => {
 			this.emit('peer:error', pubkey, err);
 		});
@@ -7489,10 +7501,92 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	 * later observer whose job is cancellation (disconnectPeer) would
 	 * silently depend on listener order.
 	 */
-	private notifyPeerDisconnectObservers(pubkey: string): void {
+	/** Messages that mark a channel open's progress, logged at debug. */
+	private static readonly OPEN_PROGRESS_TYPES: ReadonlySet<number> = new Set([
+		MessageType.OPEN_CHANNEL,
+		MessageType.ACCEPT_CHANNEL,
+		MessageType.FUNDING_CREATED,
+		MessageType.FUNDING_SIGNED,
+		MessageType.OPEN_CHANNEL2,
+		MessageType.ACCEPT_CHANNEL2,
+		MessageType.TX_ADD_INPUT,
+		MessageType.TX_ADD_OUTPUT,
+		MessageType.TX_REMOVE_INPUT,
+		MessageType.TX_REMOVE_OUTPUT,
+		MessageType.TX_COMPLETE,
+		MessageType.TX_SIGNATURES,
+		MessageType.TX_INIT_RBF,
+		MessageType.TX_ACK_RBF,
+		MessageType.TX_ABORT,
+		MessageType.CHANNEL_READY
+	]);
+
+	/**
+	 * A failed open's log should show how far it got. The open's own
+	 * messages are logged at debug for every peer. With wireTrace, every
+	 * non-gossip message to and from the chosen peers is logged at info.
+	 * commitment_signed is in the trace only: on a live channel it is
+	 * per-payment traffic.
+	 */
+	private buildWireObserver(
+		wireTrace: boolean | readonly string[]
+	): WireObserver {
+		const traceAll = wireTrace === true;
+		const traced = new Set(
+			Array.isArray(wireTrace) ? wireTrace.map((p) => p.toLowerCase()) : []
+		);
+		return (dir, pubkey, type, length) => {
+			const trace =
+				(traceAll || traced.has(pubkey)) && isTraceableWireType(type);
+			if (!trace && !LightningNode.OPEN_PROGRESS_TYPES.has(type)) return;
+			const name = (MessageType[type] ?? `unknown_${type}`).toLowerCase();
+			const label = `${dir === 'in' ? 'received' : 'sent'} ${name}`;
+			const entry = { peer: pubkey, type, length };
+			if (trace) this.logger.info(`wire: ${label}`, entry);
+			else this.logger.debug(`Channel open: ${label}`, entry);
+		};
+	}
+
+	/**
+	 * Logged at info so a failed open can be read against it: the peer,
+	 * the amount, and how long the connection had been up. Runs after the
+	 * open is under way, so a throwing logger must not fail it.
+	 */
+	private logOpenStarted(
+		peerPubkey: string,
+		fundingSatoshis: bigint,
+		temporaryChannelId: Buffer,
+		dualFunded: boolean
+	): void {
+		try {
+			const connection = this.peerManager?.getConnectionInfo(peerPubkey);
+			this.logger.info('Opening channel', {
+				peer: peerPubkey,
+				fundingSatoshis: fundingSatoshis.toString(),
+				dualFunded,
+				temporaryChannelId: temporaryChannelId.toString('hex'),
+				...(connection
+					? {
+							direction: connection.direction,
+							connectedForMs: Date.now() - connection.connectedAt
+					  }
+					: {})
+			});
+		} catch {
+			// Diagnostics only.
+		}
+	}
+
+	private notifyPeerDisconnectObservers(
+		pubkey: string,
+		info?: IPeerDisconnectInfo
+	): void {
 		for (const listener of this.rawListeners('peer:disconnect')) {
 			try {
-				(listener as (pubkey: string) => void)(pubkey);
+				(listener as (pubkey: string, info?: IPeerDisconnectInfo) => void)(
+					pubkey,
+					info
+				);
 			} catch (err) {
 				try {
 					this.emitStructuredLog('peer', 'disconnect_observer_failed', {
@@ -12103,6 +12197,12 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			fundingSatoshis,
 			pushMsat,
 			(temporaryChannelId) => {
+				this.logOpenStarted(
+					peerPubkey,
+					fundingSatoshis,
+					temporaryChannelId,
+					false
+				);
 				const tempId = temporaryChannelId.toString('hex');
 				if (satsPerVbyte !== undefined) {
 					// An open that is accepted, or that fails, takes its entry with
@@ -12350,10 +12450,21 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				: undefined
 		};
 
-		return this.channelManager.createDualFundedChannel(peerPubkey, dualParams, {
-			trusted: params.trusted,
-			contribution: params.contribution
-		});
+		const channel = this.channelManager.createDualFundedChannel(
+			peerPubkey,
+			dualParams,
+			{
+				trusted: params.trusted,
+				contribution: params.contribution
+			}
+		);
+		this.logOpenStarted(
+			peerPubkey,
+			params.fundingSatoshis,
+			channel.getTemporaryChannelId(),
+			true
+		);
+		return channel;
 	}
 
 	createFunding(

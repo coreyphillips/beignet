@@ -10,6 +10,7 @@ import type { IBolt12Invoice, IOffer } from '../offer/types';
 import type { IOnionMessagePayload } from '../onion-message/types';
 import type { GuardianState } from '../recovery/guardian-wire';
 import type { ISwapEvent } from '../swaps/engine-common';
+import type { IPeerDisconnectInfo } from '../transport/peer-manager';
 import type {
 	IGraphRestoreStats,
 	IHoldCancelledEvent,
@@ -261,8 +262,8 @@ export interface LightningNodeEvents
 	) => void;
 	/** Peer connected (networking mode). */
 	'peer:connect': (pubkey: string) => void;
-	/** Peer disconnected (networking mode). */
-	'peer:disconnect': (pubkey: string) => void;
+	/** Peer disconnected (networking mode). `info` says who closed the connection and why, when known. */
+	'peer:disconnect': (pubkey: string, info?: IPeerDisconnectInfo) => void;
 	/** The node needs this peer's connection severed but holds no socket for it (event-transport mode, or an unconnected peer): the host must close its transport. The protocol side (channels marked for reestablish) is already applied; reconnect and reestablish as usual. */
 	'peer:disconnect-requested': (pubkey: string) => void;
 	/** Peer error (networking mode). */

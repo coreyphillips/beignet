@@ -92,7 +92,8 @@ export interface IPeerOptions {
 export interface IPeerEvents {
 	connect: () => void;
 	message: (type: number, payload: Buffer) => void;
-	close: (hadError: boolean) => void;
+	/** `closedLocally` is true when disconnect() ended the connection. */
+	close: (hadError: boolean, closedLocally: boolean) => void;
 	error: (err: Error) => void;
 	init: (remoteInit: IInitMessage) => void;
 }
@@ -545,7 +546,7 @@ export class Peer extends EventEmitter {
 			// (which bumps heldLifecycleId) began meanwhile.
 			const lifecycle = this.heldLifecycleId;
 			queueMicrotask(() => {
-				if (this.heldLifecycleId === lifecycle) this.emit('close', false);
+				if (this.heldLifecycleId === lifecycle) this.emit('close', false, true);
 			});
 		}
 	}
@@ -735,10 +736,12 @@ export class Peer extends EventEmitter {
 			this.processReadBuffer();
 		});
 
+		// disconnect() strips this listener before destroying the socket, so
+		// a close seen here was not ours.
 		this.socket.on('close', (hadError) => {
 			this.state = 'disconnected';
 			this.stopPingTimer();
-			this.emit('close', hadError);
+			this.emit('close', hadError, false);
 		});
 
 		this.socket.on('error', (err) => {

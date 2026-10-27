@@ -2449,8 +2449,21 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 
 	/**
 	 * Handle peer disconnection: mark all channels with this peer as AWAITING_REESTABLISH.
+	 * `cause` (who closed, and the transport's reason) goes into the error
+	 * an open that dies here reports.
 	 */
-	handlePeerDisconnected(peerPubkey: string): void {
+	handlePeerDisconnected(
+		peerPubkey: string,
+		cause?: { initiator: 'local' | 'remote'; reason?: string }
+	): void {
+		const openDiedOnDisconnect = (state: ChannelState): string => {
+			const base = `Peer disconnected during channel open (state: ${state})`;
+			if (!cause) return base;
+			const side = cause.initiator === 'remote' ? 'peer' : 'us';
+			return cause.reason
+				? `${base}: closed by ${side}: ${cause.reason}`
+				: `${base}: closed by ${side}`;
+		};
 		// A parked reestablish (issue #462) describes a connection that is now
 		// gone, so its timer is retired. The entry stays with its ORIGINAL
 		// deadline: the peer that reconnects and re-sends gets what is left of
@@ -2494,7 +2507,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 				this.emit(
 					'error',
 					channel.getChannelId() ?? channel.getTemporaryChannelId(),
-					'Peer disconnected during channel open (state: SENT_FUNDING_CREATED)'
+					openDiedOnDisconnect(ChannelState.SENT_FUNDING_CREATED)
 				);
 				this.releaseRefusedV1FundingPledges(channel);
 				continue;
@@ -2593,7 +2606,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			this.emit(
 				'error',
 				channel.getTemporaryChannelId(),
-				`Peer disconnected during channel open (state: ${state})`
+				openDiedOnDisconnect(state)
 			);
 			// A live record-less v2 negotiation died with its peer: nothing
 			// was ever signed, so its funding pledges release at once
@@ -8873,6 +8886,16 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			this.findChannelByChannelIdInTemp(msg.channelId) ||
 			this.findTempChannel(msg.channelId);
 		if (!channel) return;
+		// The peer's reason is often the only account of why an open or
+		// splice ended, so it is surfaced the way a warning is. Contained: an
+		// observer that throws must not stop the abort being handled.
+		if (msg.data.length > 0) {
+			this.emitContained(
+				'error',
+				msg.channelId,
+				`Remote tx_abort: ${getErrorText(msg)}`
+			);
+		}
 
 		const actions = channel.handleTxAbort();
 		const progress = newDispatchProgress();

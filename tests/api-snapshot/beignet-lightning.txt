@@ -68,6 +68,7 @@ property IResolvedNodeDefaults.resourceConfig: Readonly<Required<node.IResourceC
 property IResolvedNodeDefaults.socks5ProxyScope: transport.Socks5ProxyScope
 property IResolvedNodeDefaults.swaps?: Readonly<node.ISwapNodeConfig & { exposure: swaps.ISwapExposurePolicy; confirmations: swaps.ISwapConfirmationPolicy; }>
 property IResolvedNodeDefaults.watchtowers: string[]
+property IResolvedNodeDefaults.wireTrace: boolean | readonly string[]
 property IResolvedNodeDefaults.zeroReserve: Readonly<IZeroReserveConfig & Required<Pick<IZeroReserveConfig, 'role' | 'advertise'>>>
 unexported interface IResult
 method IResult.isErr(): boolean
@@ -1297,7 +1298,7 @@ method channel.ChannelManager.handleMessage(peerPubkey: string, type: number, pa
 method channel.ChannelManager.handleNewBlock(blockHeight: number): chain.ChainAction[]
 method channel.ChannelManager.handleOutputSpent(txid: string, outputIndex: number, spendingTx: bitcoinjs-lib#Transaction, blockHeight: number): chain.ChainAction[]
 method channel.ChannelManager.handleOutputUnspent(txid: string, outputIndex: number): chain.ChainAction[]
-method channel.ChannelManager.handlePeerDisconnected(peerPubkey: string): void
+method channel.ChannelManager.handlePeerDisconnected(peerPubkey: string, cause?: { initiator: 'local' | 'remote'; reason?: string; }): void
 method channel.ChannelManager.handlePeerReconnected(peerPubkey: string): void
 method channel.ChannelManager.hasChannelWithPeer(pubkey: string): boolean
 method channel.ChannelManager.heldUnknownChannelReestablish(): Array<{ peer: string; channelId: string; expiresAt: number; }>
@@ -5299,6 +5300,7 @@ property node.INodeConfig.swaps?: node.ISwapNodeConfig
 property node.INodeConfig.sweepDestinationScript?: Buffer
 property node.INodeConfig.watchtowers?: string[]
 property node.INodeConfig.webSocketImpl?: transport.WebSocketConstructor
+property node.INodeConfig.wireTrace?: boolean | string[]
 property node.INodeConfig.zeroReserve?: IZeroReserveConfig
 interface node.INodeInfo
 property node.INodeInfo.alias?: string
@@ -5769,7 +5771,7 @@ property node.LightningNodeEvents.'payment:preimage': (event: node.IPaymentPreim
 property node.LightningNodeEvents.'payment:received': (payment: node.IPaymentInfo) => void
 property node.LightningNodeEvents.'payment:sent': (payment: node.IPaymentInfo) => void
 property node.LightningNodeEvents.'peer:connect': (pubkey: string) => void
-property node.LightningNodeEvents.'peer:disconnect': (pubkey: string) => void
+property node.LightningNodeEvents.'peer:disconnect': (pubkey: string, info?: transport.IPeerDisconnectInfo) => void
 property node.LightningNodeEvents.'peer:disconnect-requested': (pubkey: string) => void
 property node.LightningNodeEvents.'peer:error': (pubkey: string, error: Error) => void
 property node.LightningNodeEvents.'peer_storage:retrieved': (peerPubkey: string, blob: Buffer) => void
@@ -8732,11 +8734,19 @@ property transport.IParsedPeerUri.host: string
 property transport.IParsedPeerUri.port: number
 property transport.IParsedPeerUri.pubkey: string
 property transport.IParsedPeerUri.transport?: transport.IPeerTransportOptions
+interface transport.IPeerConnectionInfo
+property transport.IPeerConnectionInfo.connectedAt: number
+property transport.IPeerConnectionInfo.direction: 'inbound' | 'outbound'
 interface transport.IPeerDialOptions
 property transport.IPeerDialOptions.reconnect?: boolean
 property transport.IPeerDialOptions.timeoutMs?: number
+interface transport.IPeerDisconnectInfo
+property transport.IPeerDisconnectInfo.direction: 'inbound' | 'outbound'
+property transport.IPeerDisconnectInfo.initiator: 'local' | 'remote'
+property transport.IPeerDisconnectInfo.reason?: string
+property transport.IPeerDisconnectInfo.uptimeMs?: number
 interface transport.IPeerEvents
-property transport.IPeerEvents.close: (hadError: boolean) => void
+property transport.IPeerEvents.close: (hadError: boolean, closedLocally: boolean) => void
 property transport.IPeerEvents.connect: () => void
 property transport.IPeerEvents.error: (err: Error) => void
 property transport.IPeerEvents.init: (remoteInit: message.IInitMessage) => void
@@ -8871,6 +8881,7 @@ method transport.PeerManager.destroy(): void
 method transport.PeerManager.disconnectPeer(pubkey: string): void
 method transport.PeerManager.freezeConnections(): void
 method transport.PeerManager.getAnnouncedAddresses(pubkey: string): Array<{ host: string; port: number; }>
+method transport.PeerManager.getConnectionInfo(pubkey: string): transport.IPeerConnectionInfo | undefined
 method transport.PeerManager.getIrohConnectionString(): string | undefined
 method transport.PeerManager.getPeer(pubkey: string): transport.Peer | undefined
 method transport.PeerManager.getPeerAddress(pubkey: string): { host: string; port: number; transport?: transport.IPeerTransportOptions; } | undefined
@@ -8892,6 +8903,7 @@ method transport.PeerManager.setConnectionGate(gate: (() => boolean) | null): vo
 method transport.PeerManager.setInboundGate(gate: ((pubkey: string, type: number) => boolean) | null): void
 method transport.PeerManager.setLaneGate(gate: transport.IPeerLaneGate | null): void
 method transport.PeerManager.setOutboundGate(gate: ((pubkey: string, type: number) => boolean) | null): void
+method transport.PeerManager.setWireObserver(observer: transport.WireObserver | null): void
 method transport.PeerManager.stopListening(): void
 type transport.Socks5ProxyScope = 'all' | 'onion'
 class transport.TransportCipher
@@ -8934,6 +8946,7 @@ method transport.WebSocketTransport.setKeepAlive(): this
 method transport.WebSocketTransport.setTimeout(timeout: number, callback?: () => void): this
 get transport.WebSocketTransport.writableLength(): number
 method transport.WebSocketTransport.write(data: Uint8Array | string, cb?: (err?: Error) => void): boolean
+type transport.WireObserver = (dir: 'in' | 'out', pubkey: string, type: number, length: number) => void
 const transport.WsCloseCode: { readonly NORMAL: 1000; readonly GOING_AWAY: 1001; readonly PROTOCOL_ERROR: 1002; readonly UNSUPPORTED_DATA: 1003; readonly MESSAGE_TOO_BIG: 1009; readonly INTERNAL_ERROR: 1011; }
 class transport.WsFrameParser
 constructor transport.WsFrameParser(opts?: { maxPayloadBytes?: number; requireMasked?: boolean; })

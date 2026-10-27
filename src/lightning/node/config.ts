@@ -117,6 +117,7 @@ interface IResolvedNodeDefaults {
 	largeChannels: boolean;
 	peerStorageEnabled: boolean;
 	logger: ILogger;
+	wireTrace: boolean | readonly string[];
 	maxPaymentRetries: number;
 	maxTotalInFlightHtlcs: number;
 	reestablishTimeoutBlocks: number;
@@ -302,6 +303,7 @@ export function resolveNodeConfig(
 		largeChannels: input.largeChannels ?? true,
 		peerStorageEnabled: input.peerStorageEnabled ?? true,
 		logger: input.logger ?? noopLogger,
+		wireTrace: input.wireTrace ?? false,
 		maxPaymentRetries: input.maxPaymentRetries ?? 3,
 		maxTotalInFlightHtlcs: input.maxTotalInFlightHtlcs ?? 1000,
 		reestablishTimeoutBlocks: input.reestablishTimeoutBlocks ?? 2016,

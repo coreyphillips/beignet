@@ -318,6 +318,7 @@ Generated from `node/types.ts` by `npm run docs:tables`; edit the doc comments t
 | `peerStorageEnabled?` | `boolean` | BOLT 1 peer storage (option_provide_storage, default true): store the latest peer_storage blob per channel/trusted peer and return it on reconnect, and push our own blob (set via distributePeerStorage) to capable peers. When false the feature bit is not advertised and both directions are disabled. |
 | `feeEstimator?` | `IFeeEstimator` | Fee estimator for dynamic fee rates |
 | `logger?` | `ILogger` | Leveled diagnostic logger (debug/info/warn/error). Defaults to a no-op logger (the node is silent today), so injecting one only adds output. Every structured action log entry is mirrored to logger.debug as "category:action" alongside the persisted action log. |
+| `wireTrace?` | `boolean \| string[]` | Log every non-gossip wire message (direction, type name, length; no payloads) at logger.info: true for every peer, or a list of peer pubkeys. Off by default. Ping and pong are never traced. |
 | `maxPaymentRetries?` | `number` | Maximum payment retries (default 3) |
 | `maxTotalInFlightHtlcs?` | `number` | Global HTLC limit across all channels (default 1000) |
 | `quiescenceTimeoutMs?` | `number` | BOLT 2 quiescence watchdog window in ms (default 60_000): "MUST disconnect after 60 seconds of quiescence if the HTLCs are pending". Injectable so tests can shrink it. |
@@ -1323,7 +1324,7 @@ const result = await node.recoverFromStaticChannelBackup(scb.channels);
 | `block:processed` | `(height: number)` | The per-block work for this height has run. |
 | `message:outbound` | `(peerPubkey: string, type: number, payload: Buffer)` | Message to send to a peer (event-transport mode). |
 | `peer:connect` | `(pubkey: string)` | Peer connected (networking mode). |
-| `peer:disconnect` | `(pubkey: string)` | Peer disconnected (networking mode). |
+| `peer:disconnect` | `(pubkey: string, info?: IPeerDisconnectInfo)` | Peer disconnected (networking mode). `info` says who closed the connection and why, when known. |
 | `peer:disconnect-requested` | `(pubkey: string)` | The node needs this peer's connection severed but holds no socket for it (event-transport mode, or an unconnected peer): the host must close its transport. The protocol side (channels marked for reestablish) is already applied; reconnect and reestablish as usual. |
 | `peer:error` | `(pubkey: string, error: Error)` | Peer error (networking mode). |
 | `custom-message` | `(message: { peerPubkey: string; version: number; subtype: number; payload: Buffer })` | A beignet custom message (type 44069) arrived from a peer. |

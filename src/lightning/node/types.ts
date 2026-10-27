@@ -711,6 +711,12 @@ export interface INodeConfig {
 	 * "category:action" alongside the persisted action log.
 	 */
 	logger?: ILogger;
+	/**
+	 * Log every non-gossip wire message (direction, type name, length; no
+	 * payloads) at logger.info: true for every peer, or a list of peer
+	 * pubkeys. Off by default. Ping and pong are never traced.
+	 */
+	wireTrace?: boolean | string[];
 	/** Maximum payment retries (default 3) */
 	maxPaymentRetries?: number;
 	/** Global HTLC limit across all channels (default 1000) */

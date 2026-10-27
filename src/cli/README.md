@@ -132,6 +132,7 @@ await node.destroy();
 | `deferGraphRestore?` | `boolean` | Bring back the stored network map in time slices after create() returns, rather than inside it (default false). For a node that runs on an app's only JavaScript thread, as a phone wallet's does: a large map otherwise holds that thread for seconds as the wallet opens. Until it is back, payments, rebalances and channel suggestions wait for it, a synchronous route query (estimateRouteFee, probeRoute, queryRoute, quotePayAll) finishes it first, gossip that would write the graph and the boot RGS import wait for it, and getGraphInfo() says `restoring`. The waits are skipped while no restore runs, so a node that restores inline sees no change. getGraphRestoreStats() is null until then, and `graph:restored` reports it. |
 | `onError?` | `(error: { code: string; message: string; timestamp: number; channelId?: ChannelIdHex; txid?: TxidHex; retained?: boolean; channelErrorCode?: ChannelErrorCode }) => void` | Optional error callback — receives all node:error events instead of silently absorbing them |
 | `logLevel?` | `LogLevel` | Log level (default 'info'). Set to 'silent' to suppress. |
+| `wireTrace?` | `boolean \| string[]` | Forwarded to LightningNode's wireTrace: log non-gossip wire messages (type and length) at info, for every peer (true) or the listed pubkeys. |
 | `logger?` | `ILogger` | Leveled diagnostic logger. When set, every log entry that passes logLevel is forwarded to it (in addition to the 'log' event) and it is injected into the underlying Wallet and LightningNode. When unset, behavior is unchanged: BeignetNode only emits 'log' events and the wallet keeps its default console output. |
 | `electrumServers?` | `Array<{ host: string; port: number; tls?: boolean }>` | Multiple Electrum servers for failover redundancy |
 | `backupPath?` | `string` | Path for automated periodic backups (enables backup scheduling) |
@@ -2249,6 +2250,7 @@ Environment variables override the config file but are overridden by CLI flags.
 | `BEIGNET_HTLC_EVENTS` | `true` to relay per-HTLC events over SSE + webhooks |
 | `BEIGNET_EAGER_GOSSIP_VERIFY` | `true` to verify foreign gossip signatures at intake instead of lazily at serve time (default: lazy; exact `true`/`false`, anything else is ignored) |
 | `BEIGNET_LOG_LEVEL` | Daemon stderr log level: `debug`, `info`, `warn`, `error`, `silent` (default: silent) |
+| `BEIGNET_WIRE_TRACE` | Log every non-gossip wire message (direction, type, length; no payloads) at `info`: `1` for every peer, or comma-separated peer pubkeys (default: off) |
 | `BEIGNET_RECOVERY_MODE` | Recovery Protocol mode: `off`, `peer-storage`, `async-remote`, `quorum` (default: off; unknown values fall back to off) |
 | `BEIGNET_RECOVERY_GUARDIANS` | Guardian set for async-remote/quorum, comma-separated `<64-hex-x-only-pubkey>@<url>` where the URL is `http(s)://...` for an HTTP guardian or `bolt8://<66-hex node id>@host:port` for a guardian hosted by a beignet node (crash-v1: exactly three; malformed entries refuse startup) |
 | `BEIGNET_RECOVERY_PROFILE` | Recovery fault-model profile; `crash-v1` is the only accepted value and the default |

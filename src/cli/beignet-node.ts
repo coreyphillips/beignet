@@ -182,7 +182,10 @@ import {
 	isOnionV3Hostname,
 	parseBolt8GuardianUrl
 } from '../lightning/recovery';
-import type { Socks5ProxyScope } from '../lightning/transport/peer-manager';
+import type {
+	IPeerDisconnectInfo,
+	Socks5ProxyScope
+} from '../lightning/transport/peer-manager';
 import {
 	PeerError,
 	PeerErrorCode,
@@ -579,6 +582,9 @@ export interface BeignetNodeOptions
 	}) => void;
 	/** Log level (default 'info'). Set to 'silent' to suppress. */
 	logLevel?: LogLevel;
+	/** Forwarded to LightningNode's wireTrace: log non-gossip wire messages
+	 *  (type and length) at info, for every peer (true) or the listed pubkeys. */
+	wireTrace?: boolean | string[];
 	/**
 	 * Leveled diagnostic logger. When set, every log entry that passes
 	 * logLevel is forwarded to it (in addition to the 'log' event) and it is
@@ -3430,6 +3436,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 			chainBackend: electrumBackend,
 			feeEstimator: electrumBackend,
 			logger: this.logger,
+			wireTrace: opts.wireTrace,
 			sweepDestinationScript,
 			socks5Proxy,
 			socks5ProxyScope,
@@ -3940,8 +3947,22 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 		);
 
 		// Forward peer events
+		// Connects and disconnects are logged at info: a peer that evicts us
+		// (eclair's max-no-channels) and the auto reconnect after it are
+		// otherwise invisible at the level a daemon runs at.
 		this.node.on('peer:connect', (pubkey: string) => {
-			this.log('debug', 'Peer connected', { pubkey });
+			let direction: string | undefined;
+			try {
+				direction = this.node
+					.getPeerManager()
+					?.getConnectionInfo(pubkey)?.direction;
+			} catch {
+				// The log line must not cost the gossip sync below.
+			}
+			this.log('info', 'Peer connected', {
+				pubkey,
+				...(direction ? { direction } : {})
+			});
 			// Pull the gossip graph from the peer so we can route multi-hop payments
 			// to destinations beyond our direct channels. Without this the graph
 			// stays empty and only direct-peer payments work.
@@ -3972,10 +3993,25 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 			}
 			this.emit('peer:connect', { pubkey });
 		});
-		this.node.on('peer:disconnect', (pubkey: string) => {
-			this.log('debug', 'Peer disconnected', { pubkey });
-			this.emit('peer:disconnect', { pubkey });
-		});
+		this.node.on(
+			'peer:disconnect',
+			(pubkey: string, info?: IPeerDisconnectInfo) => {
+				this.log('info', 'Peer disconnected', {
+					pubkey,
+					...(info
+						? {
+								closedBy: info.initiator === 'remote' ? 'peer' : 'us',
+								...(info.reason ? { reason: info.reason } : {}),
+								direction: info.direction,
+								...(info.uptimeMs !== undefined
+									? { uptimeMs: info.uptimeMs }
+									: {})
+						  }
+						: {})
+				});
+				this.emit('peer:disconnect', { pubkey });
+			}
+		);
 		// The transport error that caused a disconnect (pong timeout, decrypt
 		// failure, socket reset, ...) is the only place the reason is known —
 		// surface it or disconnects are silent.

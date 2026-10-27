@@ -82,6 +82,7 @@ property BeignetConfig.torProxyOnionOnly?: boolean
 property BeignetConfig.waiveClientReserve?: boolean
 property BeignetConfig.watchtowers?: string[]
 property BeignetConfig.websocketPort?: number
+property BeignetConfig.wireTrace?: boolean | string[]
 class BeignetError extends CodedError<BeignetErrorCodeValue>
 constructor BeignetError(code: BeignetErrorCodeValue, message: string, failureCode?: number)
 property BeignetError.failureCode?: number
@@ -605,6 +606,7 @@ property BeignetNodeOptions.torProxyOnionOnly?: boolean
 property BeignetNodeOptions.waiveClientReserve?: boolean
 property BeignetNodeOptions.watchtowers?: string[]
 property BeignetNodeOptions.websocketPort?: number
+property BeignetNodeOptions.wireTrace?: boolean | string[]
 interface Bolt12InvoiceInfo
 property Bolt12InvoiceInfo.amountSats: number
 property Bolt12InvoiceInfo.createdAt: number

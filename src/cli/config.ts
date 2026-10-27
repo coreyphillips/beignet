@@ -28,6 +28,20 @@ function parseLogLevel(value?: string): TLogLevel | undefined {
 		: undefined;
 }
 
+/** '1'/'true' traces every peer, a comma list traces those pubkeys. */
+export function parseWireTrace(value?: string): boolean | string[] | undefined {
+	const trimmed = value?.trim();
+	if (!trimmed || trimmed === '0' || trimmed.toLowerCase() === 'false') {
+		return undefined;
+	}
+	if (trimmed === '1' || trimmed.toLowerCase() === 'true') return true;
+	const pubkeys = trimmed
+		.split(',')
+		.map((p) => p.trim().toLowerCase())
+		.filter((p) => p.length > 0);
+	return pubkeys.length > 0 ? pubkeys : undefined;
+}
+
 /**
  * Resolved on every call, never frozen at module load. These paths follow HOME,
  * and HOME is not a constant: the CLI tests redirect it per-test to keep their
@@ -598,6 +612,10 @@ export function resolveConfig(cliFlags: Partial<BeignetConfig>): BeignetConfig {
 			parseLogLevel(cliFlags.logLevel) ||
 			parseLogLevel(process.env.BEIGNET_LOG_LEVEL) ||
 			parseLogLevel(file.logLevel),
+		wireTrace:
+			cliFlags.wireTrace ??
+			parseWireTrace(process.env.BEIGNET_WIRE_TRACE) ??
+			file.wireTrace,
 		// Passed through raw: the daemon validates before booting a node, so a
 		// malformed guardian set or profile refuses startup with a precise
 		// message instead of silently changing the quorum arithmetic. Only the
