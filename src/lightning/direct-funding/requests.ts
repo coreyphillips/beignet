@@ -96,6 +96,12 @@ export class DirectFundingRequestStore {
 	private byPathSecret = new Map<string, string>();
 	/** Payments received, by receipt hash. Outlives the records above. */
 	private receivedByHash = new Map<string, IDfReceivedRecord>();
+	/**
+	 * The received set changed and the write did not land. Every later write
+	 * retries it, and until one does a paid request is not swept: its tombstone
+	 * is then the only stored trace of the payment.
+	 */
+	private receivedUnsaved = false;
 	private sweepTimer: NodeJS.Timeout | null = null;
 	private readonly ttlMs: number;
 	private readonly maxOutstanding: number;
@@ -135,22 +141,18 @@ export class DirectFundingRequestStore {
 		this.byPathSecret.clear();
 		this.restoreReceived();
 		const raw = this.deps.storage?.loadWalletData(DF_REQUESTS_STORAGE_KEY);
-		if (!raw) return 0;
-		let parsed: unknown;
+		let parsed: unknown = [];
 		try {
-			parsed = JSON.parse(raw);
+			parsed = raw ? JSON.parse(raw) : [];
 		} catch {
 			// Corrupt state runs from nothing rather than taking the node down;
 			// the outstanding envelopes are lost either way, and refusing to
 			// start would lose the wallet too.
-			return 0;
 		}
-		if (!Array.isArray(parsed)) return 0;
-		const now = this.now();
+		const entries: IDfRequestRecord[] = [];
 		let dropped = 0;
 		let stripped = false;
-		let received = false;
-		for (const entry of parsed as IDfRequestRecord[]) {
+		for (const entry of Array.isArray(parsed) ? parsed : []) {
 			if (!isWellFormedRecord(entry)) {
 				dropped++;
 				continue;
@@ -158,8 +160,15 @@ export class DirectFundingRequestStore {
 			// The strip comes FIRST: a row whose only claim on life is a marker
 			// that did not come back intact has no funding to answer for.
 			if (stripMalformedAttempt(entry)) stripped = true;
-			if (this.receive(entry)) received = true;
-			if (!answersFor(entry, now)) {
+			if (this.receive(entry)) this.receivedUnsaved = true;
+			entries.push(entry);
+		}
+		// Before anything is dropped below: an expired paid request goes only
+		// once its payment's record is stored.
+		const unsaved = this.receivedUnsaved && !this.persistReceived();
+		const now = this.now();
+		for (const entry of entries) {
+			if (!answersFor(entry, now) && !(unsaved && entry.paidBy)) {
 				dropped++;
 				continue;
 			}
@@ -168,7 +177,6 @@ export class DirectFundingRequestStore {
 		// Only rewrite when the set actually changed, so a restart with nothing
 		// to drop does not touch storage at all.
 		if (dropped > 0 || stripped) this.persist();
-		if (received) this.persistReceived();
 		return this.byHash.size;
 	}
 
@@ -195,9 +203,15 @@ export class DirectFundingRequestStore {
 	 */
 	sweep(): number {
 		const now = this.now();
+		// Received records past retention go here too, so a node that takes no
+		// new payment still lets them go.
+		if (this.pruneReceived()) this.receivedUnsaved = true;
+		const unsaved = this.receivedUnsaved && !this.persistReceived();
 		let dropped = 0;
 		for (const record of [...this.byHash.values()]) {
-			if (!answersFor(record, now)) {
+			// A paid request is its payment's only stored trace until the
+			// received record lands.
+			if (!answersFor(record, now) && !(unsaved && record.paidBy)) {
 				this.unindex(record);
 				dropped++;
 			}
@@ -310,7 +324,10 @@ export class DirectFundingRequestStore {
 	 * The same call writes the request's received record (issue #1893), and
 	 * throws NOT_PERSISTED when that write fails too: it is the only way a
 	 * client finds out the request was paid once the record above is swept.
-	 * `amountSat` is the paying offer's amount, when the caller still holds it.
+	 * It is written FIRST, because the tombstone clears the mark that holds the
+	 * channel and the amount, and a failed write is retried by every later one
+	 * while the paid request is kept from the sweep. `amountSat` is the paying
+	 * offer's amount, when the caller still holds it.
 	 */
 	markReceiptRevealed(
 		receiptHashHex: string,
@@ -329,8 +346,11 @@ export class DirectFundingRequestStore {
 			};
 		}
 		// Before the mark is cleared below: the funding it holds is where the
-		// channel and, on a recovery path, the amount come from.
-		this.receive(record, paidBy?.amountSat);
+		// channel and, on a recovery path, the amount come from. Written whenever
+		// there is one, not only when it is new, so a caller's retry lands it.
+		if (this.receive(record, paidBy?.amountSat)) this.receivedUnsaved = true;
+		const kept =
+			!this.receivedByHash.has(record.receiptHash) || this.persistReceived();
 		// A funding that completed past its request's own expiry leaves a
 		// tombstone the next sweep takes at once, and the payer has spent its coin
 		// by then: a receipt frame lost on the way could never be replayed. The row
@@ -342,10 +362,6 @@ export class DirectFundingRequestStore {
 		}
 		record.activeAttempt = undefined;
 		const tombstoned = this.persist();
-		// Written whenever there is one, not only when it is new, so a retry after
-		// a failed write lands it the way it lands the tombstone.
-		const kept =
-			!this.receivedByHash.has(record.receiptHash) || this.persistReceived();
 		if (!tombstoned) {
 			throw new DirectFundingError(
 				DirectFundingErrorCode.NOT_PERSISTED,
@@ -396,7 +412,9 @@ export class DirectFundingRequestStore {
 	 * its coin elsewhere and the channel is back on its old funding, so the
 	 * request was not paid after all, whatever its receipt says. The record
 	 * stays, REVERTED, so a client that showed the payment can take it back.
-	 * Returns how many it marked.
+	 * Returns how many it marked. A mark whose write fails is retried by the
+	 * next write, and the receiver checks again against the channel's own
+	 * memory of the revert when it starts.
 	 */
 	markReceivedReverted(fundingTxidHex: string): number {
 		const now = this.now();
@@ -408,7 +426,10 @@ export class DirectFundingRequestStore {
 			entry.updatedAt = now;
 			marked++;
 		}
-		if (marked > 0) this.persistReceived();
+		if (marked > 0) {
+			this.receivedUnsaved = true;
+			this.persistReceived();
+		}
 		return marked;
 	}
 
@@ -678,8 +699,12 @@ export class DirectFundingRequestStore {
 		this.byPathSecret.delete(record.onionPathSecretHex);
 	}
 
-	/** Write the whole set. Reports whether it landed. */
+	/**
+	 * Write the whole set. Reports whether it landed. A received set whose own
+	 * write failed is retried with it, since no caller retries that one.
+	 */
 	private persist(): boolean {
+		if (this.receivedUnsaved) this.persistReceived();
 		if (!this.deps.storage) return true;
 		try {
 			this.deps.storage.saveWalletData(
@@ -714,7 +739,10 @@ export class DirectFundingRequestStore {
 		const amount = [amountSat, funding?.amountSat, record.amountSat].find(
 			isPositiveDecimal
 		);
-		const now = this.now();
+		// Dated from the payment, so a record backfilled from an old tombstone
+		// is held to the same window as one written at the time.
+		const paidAt = record.revealedAt ?? this.now();
+		if (this.now() - paidAt > DF_RECEIVED_RETENTION_MS) return false;
 		this.evictReceived();
 		this.receivedByHash.set(record.receiptHash, {
 			receiptHash: record.receiptHash,
@@ -726,14 +754,15 @@ export class DirectFundingRequestStore {
 				: {}),
 			...(amount !== undefined ? { amountSat: amount } : {}),
 			status: 'PAID',
-			paidAt: record.revealedAt ?? now,
-			updatedAt: now
+			paidAt,
+			updatedAt: paidAt
 		});
 		return true;
 	}
 
 	private restoreReceived(): void {
 		this.receivedByHash.clear();
+		this.receivedUnsaved = false;
 		const raw = this.deps.storage?.loadWalletData(DF_RECEIVED_STORAGE_KEY);
 		if (!raw) return;
 		let parsed: unknown;
@@ -750,6 +779,23 @@ export class DirectFundingRequestStore {
 				this.receivedByHash.set(entry.receiptHash, entry);
 			}
 		}
+		if (this.pruneReceived()) this.receivedUnsaved = true;
+	}
+
+	/**
+	 * Drop records not paid or changed within the retention window. Reports
+	 * whether any went.
+	 */
+	private pruneReceived(): boolean {
+		const now = this.now();
+		let pruned = false;
+		for (const entry of [...this.receivedByHash.values()]) {
+			if (now - entry.updatedAt > DF_RECEIVED_RETENTION_MS) {
+				this.receivedByHash.delete(entry.receiptHash);
+				pruned = true;
+			}
+		}
+		return pruned;
 	}
 
 	/**
@@ -757,12 +803,7 @@ export class DirectFundingRequestStore {
 	 * ceiling, so the one about to be added fits.
 	 */
 	private evictReceived(): void {
-		const now = this.now();
-		for (const entry of [...this.receivedByHash.values()]) {
-			if (now - entry.updatedAt > DF_RECEIVED_RETENTION_MS) {
-				this.receivedByHash.delete(entry.receiptHash);
-			}
-		}
+		this.pruneReceived();
 		if (this.receivedByHash.size < DF_MAX_RECEIVED_RECORDS) return;
 		const oldest = [...this.receivedByHash.values()].sort(
 			(a, b) => a.updatedAt - b.updatedAt
@@ -775,16 +816,19 @@ export class DirectFundingRequestStore {
 
 	/** Write every received record. Reports whether it landed. */
 	private persistReceived(): boolean {
-		if (!this.deps.storage) return true;
-		try {
-			this.deps.storage.saveWalletData(
-				DF_RECEIVED_STORAGE_KEY,
-				JSON.stringify([...this.receivedByHash.values()])
-			);
-			return true;
-		} catch {
-			return false;
+		let landed = true;
+		if (this.deps.storage) {
+			try {
+				this.deps.storage.saveWalletData(
+					DF_RECEIVED_STORAGE_KEY,
+					JSON.stringify([...this.receivedByHash.values()])
+				);
+			} catch {
+				landed = false;
+			}
 		}
+		this.receivedUnsaved = !landed;
+		return landed;
 	}
 }
 

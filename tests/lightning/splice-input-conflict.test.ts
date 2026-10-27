@@ -2457,7 +2457,14 @@ describe('Direct-funding receiver on a reverted splice (issue #760)', function (
 		engine.stop();
 	});
 
-	it('marks a payment whose receipt already went out REVERTED (issue #1893)', async () => {
+	/** A splice-in paid in full: the receipt is out and the request reads paid. */
+	async function paidSplice(): Promise<{
+		node: FakeDfNode;
+		engine: DirectFundingReceiver;
+		record: ReturnType<FakeDfNode['mintRequest']>;
+		channelId: Buffer;
+		tx: bitcoin.Transaction;
+	}> {
 		const node = new FakeDfNode();
 		node.spliceChannel = crypto.randomBytes(32);
 		node.trustedPayers.add(LSP_PUBKEY);
@@ -2488,6 +2495,31 @@ describe('Direct-funding receiver on a reverted splice (issue #760)', function (
 		expect(node.requests.receivedFor(record.receiptHash)?.status).to.equal(
 			'PAID'
 		);
+		return { node, engine, record, channelId, tx };
+	}
+
+	it('marks a revert the receiver missed when it starts (issue #1893)', async () => {
+		// The event fires once: a mark that did not reach storage, or a revert
+		// from before the receiver was listening, is caught from the channel's
+		// own memory of it.
+		const { node, engine, record, channelId, tx } = await paidSplice();
+		engine.stop();
+		node.revertedSplices.add(`${channelId.toString('hex')}:${'cd'.repeat(32)}`);
+		engine.start();
+		expect(node.requests.receivedFor(record.receiptHash)?.status).to.equal(
+			'PAID'
+		);
+		engine.stop();
+		node.revertedSplices.add(`${channelId.toString('hex')}:${tx.getId()}`);
+		engine.start();
+		expect(node.requests.receivedFor(record.receiptHash)?.status).to.equal(
+			'REVERTED'
+		);
+		engine.stop();
+	});
+
+	it('marks a payment whose receipt already went out REVERTED (issue #1893)', async () => {
+		const { node, engine, record, channelId, tx } = await paidSplice();
 
 		node.fireSpliceReverted({
 			channelId,

@@ -2706,6 +2706,7 @@ method directFunding.IDfReceiverDeps.estimateFeeSatPerVbyte?(targetBlocks: numbe
 method directFunding.IDfReceiverDeps.fundingPubkeys(channelId: Buffer): { local: Buffer; remote: Buffer; } | null
 method directFunding.IDfReceiverDeps.getPendingSpliceTx(channelId: Buffer): directFunding.IDfPendingSpliceTx | null
 method directFunding.IDfReceiverDeps.getPendingV2FundingTx(channelId: Buffer): directFunding.IDfPendingV2FundingTx | null
+method directFunding.IDfReceiverDeps.hasRevertedSplice?(channelIdHex: string, spliceTxid: string): boolean
 method directFunding.IDfReceiverDeps.isTrustedPayer(peerHex: string): boolean
 method directFunding.IDfReceiverDeps.liquidityPeer(): string | null
 property directFunding.IDfReceiverDeps.log?: directFunding.DfTransportLog

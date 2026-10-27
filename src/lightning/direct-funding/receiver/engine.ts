@@ -362,6 +362,8 @@ export class DirectFundingReceiver extends TypedEmitter<DirectFundingReceiverEve
 				this.deps.onSpliceReverted((e) => this.failRevertedSpliceFunding(e))
 			);
 		}
+		// After the subscription, so no revert falls between the two.
+		this.markRevertedReceipts();
 		this.sweepTimer = setInterval(() => {
 			this.state.sweep(this.now());
 			this.retireLapsedFundings();
@@ -518,6 +520,25 @@ export class DirectFundingReceiver extends TypedEmitter<DirectFundingReceiverEve
 		// its request still reads paid. Its received record is what says it was
 		// not (issue #1893).
 		this.deps.requests.markReceivedReverted(e.spliceTxid);
+	}
+
+	/**
+	 * Mark the received payments whose splice the channel remembers reverting
+	 * (issue #1893): the event that marks one fires once, and a mark that did
+	 * not reach storage, or a revert from before this receiver was listening,
+	 * would otherwise read as paid for good. A record with no channel, one
+	 * backfilled from a tombstone, cannot be checked.
+	 */
+	private markRevertedReceipts(): void {
+		if (!this.deps.hasRevertedSplice) return;
+		for (const entry of this.deps.requests.received()) {
+			if (entry.status !== 'PAID' || !entry.splice || !entry.channelId) {
+				continue;
+			}
+			if (this.deps.hasRevertedSplice(entry.channelId, entry.fundingTxid)) {
+				this.deps.requests.markReceivedReverted(entry.fundingTxid);
+			}
+		}
 	}
 
 	stop(): void {

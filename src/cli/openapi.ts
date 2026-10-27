@@ -428,7 +428,7 @@ export function getOpenApiSpec(): Record<string, unknown> {
 			'/direct-funding/received': {
 				get: {
 					summary:
-						"List the payments received against this node's direct-funding requests, newest first. receiptHash is the paymentHash /direct-funding/request returned. A direct-funding payment settles no invoice and pays no address, so this is how a client tells its request was paid. Kept for 30 days after the request itself expires, at most 512. REVERTED means the splice the payment went into was undone because the payer spent the coin elsewhere. Readonly scope",
+						"List the payments received against this node's direct-funding requests, newest first. receiptHash is the paymentHash /direct-funding/request returned. A direct-funding payment settles no invoice and pays no address, so this is how a client tells its request was paid. Kept for 30 days from the payment (or its revert), at most 512, outliving the request itself. REVERTED means the splice the payment went into was undone because the payer spent the coin elsewhere. Readonly scope",
 					tags: ['DirectFunding'],
 					responses: {
 						'200': {

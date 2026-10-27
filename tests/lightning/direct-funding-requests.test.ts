@@ -713,29 +713,80 @@ describe('Direct funding: outstanding requests', () => {
 			expect(h.wallet.has(DF_RECEIVED_STORAGE_KEY)).to.equal(true);
 		});
 
-		it('reports a record that did not reach storage, and retries', () => {
-			const h = harness();
-			const record = h.store.mint();
+		/** Fail every write of the received set until the returned switch is flipped. */
+		function failReceivedWrites(h: IHarness): { heal: () => void } {
 			const save = h.deps.storage!.saveWalletData;
 			h.deps.storage!.saveWalletData = (key, value): void => {
 				if (key === DF_RECEIVED_STORAGE_KEY) throw new Error('disk is full');
 				save(key, value);
 			};
+			return {
+				heal: (): void => {
+					h.deps.storage!.saveWalletData = save;
+				}
+			};
+		}
+
+		it('reports a record that did not reach storage, and lands it with a later write', () => {
+			// No caller retries the reveal, and the tombstone it writes has already
+			// cleared the mark holding the channel and the amount.
+			const h = harness({ requestTtlMs: HOUR });
+			const record = h.store.mint();
+			const disk = failReceivedWrites(h);
 			expect(errorCode(() => pay(h, record, { amountSat: '60000' }))).to.equal(
 				DirectFundingErrorCode.NOT_PERSISTED
 			);
 			expect(h.wallet.has(DF_RECEIVED_STORAGE_KEY)).to.equal(false);
 
-			h.deps.storage!.saveWalletData = save;
-			h.store.markReceiptRevealed(record.receiptHash, {
-				offerIdHex: OFFER_A,
-				fundingTxidHex: FUNDING_TXID
+			// Expired, but its tombstone is the only stored trace of the payment.
+			h.clock.now += 2 * HOUR;
+			expect(h.store.sweep()).to.equal(0);
+			disk.heal();
+			expect(h.store.sweep(), 'the paid request goes once it has').to.equal(1);
+			const restarted = harness({}, { wallet: h.wallet, clock: h.clock });
+			restarted.store.restore();
+			expect(restarted.store.receivedFor(record.receiptHash)).to.include({
+				channelId: funding.channelId,
+				splice: true,
+				amountSat: '60000'
 			});
+		});
+
+		it('keeps an expired paid request on restore until its backfilled record lands', () => {
+			const h = harness({ requestTtlMs: HOUR });
+			const record = h.store.mint({ amountSat: 60_000n });
+			pay(h, record, { withFunding: false });
+			h.wallet.delete(DF_RECEIVED_STORAGE_KEY);
+			h.clock.now += 2 * HOUR;
+
+			const failing = harness({}, { wallet: h.wallet, clock: h.clock });
+			const disk = failReceivedWrites(failing);
+			failing.store.restore();
+			expect(failing.store.receivedFor(record.receiptHash)).to.not.equal(null);
+			expect(failing.store.sweep()).to.equal(0);
+			disk.heal();
+			expect(failing.store.sweep()).to.equal(1);
+
 			const restarted = harness({}, { wallet: h.wallet, clock: h.clock });
 			restarted.store.restore();
 			expect(
 				restarted.store.receivedFor(record.receiptHash)?.amountSat
 			).to.equal('60000');
+		});
+
+		it('lands a REVERTED mark whose write failed with the next write', () => {
+			const h = harness();
+			const record = h.store.mint();
+			pay(h, record);
+			const disk = failReceivedWrites(h);
+			expect(h.store.markReceivedReverted(FUNDING_TXID)).to.equal(1);
+			disk.heal();
+			h.store.mint();
+			const restarted = harness({}, { wallet: h.wallet, clock: h.clock });
+			restarted.store.restore();
+			expect(restarted.store.receivedFor(record.receiptHash)?.status).to.equal(
+				'REVERTED'
+			);
 		});
 
 		it('marks the payment a reverted splice carried, and keeps it marked', () => {
@@ -789,6 +840,26 @@ describe('Direct funding: outstanding requests', () => {
 				'60000'
 			]);
 			expect(corrupt.store.received()).to.deep.equal([kept]);
+		});
+
+		it('lets a record past retention go on the sweep and on restore, with no new payment', () => {
+			const h = harness();
+			const record = h.store.mint();
+			pay(h, record);
+			h.clock.now += DF_RECEIVED_RETENTION_MS + 1;
+			const restarted = harness({}, { wallet: h.wallet, clock: h.clock });
+			restarted.store.restore();
+			expect(restarted.store.received()).to.deep.equal([]);
+			expect(JSON.parse(h.wallet.get(DF_RECEIVED_STORAGE_KEY)!)).to.deep.equal(
+				[]
+			);
+
+			const running = harness();
+			const other = running.store.mint();
+			pay(running, other);
+			running.clock.now += DF_RECEIVED_RETENTION_MS + 1;
+			running.store.sweep();
+			expect(running.store.received()).to.deep.equal([]);
 		});
 
 		it('lets a record go after the retention window, and the oldest at the ceiling', () => {

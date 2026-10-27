@@ -822,7 +822,15 @@ export class FakeDfNode implements IDfReceiverDeps {
 		spliceTxid: string;
 		conflictTxid: string;
 	}): void {
+		this.revertedSplices.add(`${e.channelId.toString('hex')}:${e.spliceTxid}`);
 		for (const cb of [...this.spliceRevertedListeners]) cb(e);
+	}
+
+	/** `channelId:spliceTxid` of every splice the channels remember reverting. */
+	revertedSplices = new Set<string>();
+
+	hasRevertedSplice(channelIdHex: string, spliceTxid: string): boolean {
+		return this.revertedSplices.has(`${channelIdHex}:${spliceTxid}`);
 	}
 
 	// ─── driving the negotiation ───
