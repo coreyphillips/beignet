@@ -745,17 +745,20 @@ describe('WebhookManager delivery limits (issue #1865)', function () {
 		answer = (arrival): number | 'hold' =>
 			arrival.url === '/slow' ? 'hold' : 200;
 
+		const fast = (): number =>
+			arrivals.filter((arrival) => arrival.url === '/fast').length;
+		// Waits on the manager's own count (issue #1897): the server sees a
+		// request before its answer reaches the manager, which is when the
+		// delivery is counted and its bytes released.
 		for (let i = 0; i < 5; i++) manager.dispatch('payment:received', seq(i));
-		await until(
-			() => arrivals.filter((arrival) => arrival.url === '/fast').length === 5
-		);
+		await until(() => manager.deliveryStats().delivered === 5);
+		expect(fast()).to.equal(5);
 		// The slow backlog keeps its own bytes; the fast one's are released.
 		expect(manager.deliveryStats().queuedBytes).to.equal(size * 5);
 
 		for (let i = 5; i < 10; i++) manager.dispatch('payment:received', seq(i));
-		await until(
-			() => arrivals.filter((arrival) => arrival.url === '/fast').length === 10
-		);
+		await until(() => manager.deliveryStats().delivered === 10);
+		expect(fast()).to.equal(10);
 
 		expect(held).to.have.length(2);
 		expect(held.every((arrival) => arrival.url === '/slow')).to.equal(true);
