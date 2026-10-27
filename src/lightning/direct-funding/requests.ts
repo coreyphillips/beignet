@@ -964,10 +964,6 @@ function isWellFormedFunding(funding: unknown): boolean {
 }
 
 /**
- * A received record is only shown if it came back whole. An amount that did
- * not is dropped with the row rather than shown as some other figure.
- */
-/**
  * The funding the paying offer's mark still holds, if it holds one for that
  * funding. A mark held by any other offer describes another funding.
  */
@@ -984,6 +980,10 @@ function paidFunding(
 		: undefined;
 }
 
+/**
+ * A received record is only shown if it came back whole. An amount that did
+ * not is dropped with the row rather than shown as some other figure.
+ */
 function isWellFormedReceived(entry: unknown): entry is IDfReceivedRecord {
 	const r = entry as IDfReceivedRecord | null;
 	return (
