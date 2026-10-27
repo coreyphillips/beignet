@@ -168,7 +168,7 @@ services:
         -Declair.bitcoind.rpcuser=polaruser
         -Declair.bitcoind.rpcpassword=polarpass
         -Declair.bitcoind.wallet=default
-        -Declair.bitcoind.zmqblock=tcp://bitcoind:28334
+        -Declair.bitcoind.zmqblock=tcp://bitcoind:28336
         -Declair.bitcoind.zmqtx=tcp://bitcoind:28335
         -Declair.channel.min-public-funding-satoshis=20000
         -Declair.channel.min-private-funding-satoshis=20000
