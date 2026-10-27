@@ -12,6 +12,7 @@ import { expect } from 'chai';
 import crypto from 'crypto';
 import { LightningNode } from '../../src/lightning/node/lightning-node';
 import { ChannelState } from '../../src/lightning/channel/types';
+import { IChannelInfo } from '../../src/lightning/node/types';
 import {
 	ICut,
 	IWireGate,
@@ -39,7 +40,7 @@ describe('Channel list: the state before a reestablish (issue #1899)', () => {
 	});
 	afterEach(() => destroyAll(alice, bob));
 
-	const listed = (channelId: Buffer) =>
+	const listed = (channelId: Buffer): IChannelInfo =>
 		alice.listChannels().find((c) => c.channelId.equals(channelId))!;
 
 	it('names an opening a disconnect wrapped', async () => {
