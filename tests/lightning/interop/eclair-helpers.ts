@@ -6,9 +6,11 @@
  *
  * Re-exports everything from shared-helpers for convenience.
  *
- * NOTE: Eclair's ZMQ block notifications do not work reliably under
- * Docker on ARM Macs (amd64 image emulation). All sync helpers use
- * `docker restart eclair` to force chain-tip sync via RPC at startup.
+ * NOTE: the sync helpers restart Eclair to force a chain-tip sync via RPC.
+ * They date from when docker-compose.yml pointed Eclair's zmqblock at
+ * bitcoind's rawblock socket. Eclair subscribes to hashblock there, so it
+ * never saw a new block live. It now uses the hashblock socket and follows
+ * blocks as they are mined; the restarts are kept as a forced resync.
  */
 
 import http from 'http';
@@ -126,8 +128,8 @@ export async function createEclairClient(): Promise<EclairRestClient | null> {
 /**
  * Restart Eclair and wait for it to sync to bitcoind's chain tip.
  *
- * Eclair's ZMQ block notifications do not work reliably under Docker on ARM
- * Macs; restarting forces Eclair to sync via RPC at startup. This helper
+ * Restarting forces Eclair to sync via RPC at startup (see the NOTE at the
+ * top of this file). This helper
  * ALWAYS restarts, even when Eclair already reports the tip: callers use it
  * as a forced transport reset that re-runs Eclair's funding-confirmation
  * checks. Those checks only run when Eclair PROCESSES a block, so one
@@ -582,8 +584,9 @@ export async function setupBeignetFundedEclairChannel(
 		}
 	}
 
-	// Mine blocks to confirm the funding tx
-	await mineBlocks(6);
+	// Mine blocks to confirm the funding tx. Eclair asks for more than 6 as the
+	// non-funder (its accept_channel sends minimum_depth 8), so mine what it asked.
+	await mineBlocks(Math.max(6, fundedChannel.getFullState().minimumDepth));
 	await sleep(1000);
 
 	// Notify beignet of funding confirmation BEFORE restart
@@ -601,8 +604,9 @@ export async function setupBeignetFundedEclairChannel(
 	}
 	await sleep(3000);
 
-	// Wait for Eclair to see the active channel.
-	await waitForEclairChannels(eclair, 1, 30_000);
+	// Wait for Eclair to see THIS channel active; any NORMAL channel would also
+	// match one left by an earlier test.
+	await waitForEclairPeerChannelNormal(eclair, node.getNodeId(), 30_000);
 
 	// Wait for beignet channel to reach NORMAL
 	const normalDeadline = Date.now() + 30_000;
