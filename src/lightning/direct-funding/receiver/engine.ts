@@ -362,6 +362,8 @@ export class DirectFundingReceiver extends TypedEmitter<DirectFundingReceiverEve
 				this.deps.onSpliceReverted((e) => this.failRevertedSpliceFunding(e))
 			);
 		}
+		// After the subscription, so no revert falls between the two.
+		this.markRevertedReceipts();
 		this.sweepTimer = setInterval(() => {
 			this.state.sweep(this.now());
 			this.retireLapsedFundings();
@@ -513,6 +515,29 @@ export class DirectFundingReceiver extends TypedEmitter<DirectFundingReceiverEve
 				error: reason
 			});
 			this.emit('offer:failed', { offerId: held.offerIdHex, reason });
+		}
+		// A funding whose receipt already went out is no longer held above, and
+		// its request still reads paid. Its received record is what says it was
+		// not (issue #1893).
+		this.deps.requests.markReceivedReverted(e.spliceTxid);
+	}
+
+	/**
+	 * Mark the received payments whose splice the channel remembers reverting
+	 * (issue #1893): the event that marks one fires once, and a mark that did
+	 * not reach storage, or a revert from before this receiver was listening,
+	 * would otherwise read as paid for good. A record with no channel, one
+	 * backfilled from a tombstone, cannot be checked.
+	 */
+	private markRevertedReceipts(): void {
+		if (!this.deps.hasRevertedSplice) return;
+		for (const entry of this.deps.requests.received()) {
+			if (entry.status !== 'PAID' || !entry.splice || !entry.channelId) {
+				continue;
+			}
+			if (this.deps.hasRevertedSplice(entry.channelId, entry.fundingTxid)) {
+				this.deps.requests.markReceivedReverted(entry.fundingTxid);
+			}
 		}
 	}
 
@@ -879,7 +904,7 @@ export class DirectFundingReceiver extends TypedEmitter<DirectFundingReceiverEve
 		} catch (err) {
 			this.log(DF_LOG_OFFER_FAILED, {
 				offerId: held.offerIdHex,
-				error: `receipt tombstone not persisted: ${errorText(err)}`
+				error: `receipt not persisted: ${errorText(err)}`
 			});
 		}
 		const complete = final.tx.ins.every((i) => i.witness.length > 0);
@@ -1668,7 +1693,10 @@ export class DirectFundingReceiver extends TypedEmitter<DirectFundingReceiverEve
 				// record in the same batch that releases our tx_signatures, and a
 				// txid recorded afterwards would be lost by exactly the crash it
 				// exists for (issue #658).
-				fundingTxid: final.fundingTxidDisplay.toString('hex')
+				fundingTxid: final.fundingTxidDisplay.toString('hex'),
+				// What the received record of a funding finished on a recovery
+				// path reports, the offer being gone with this session (issue #1893).
+				amountSat: ctx.offer.amountSat.toString()
 			},
 			session.expiresAt
 		);
@@ -1898,7 +1926,7 @@ export class DirectFundingReceiver extends TypedEmitter<DirectFundingReceiverEve
 		} catch (err) {
 			this.log(DF_LOG_OFFER_FAILED, {
 				offerId: offerIdHex,
-				error: `receipt tombstone not persisted: ${errorText(err)}`
+				error: `receipt not persisted: ${errorText(err)}`
 			});
 		}
 		const receipt = encodeDfReceipt({
@@ -2475,7 +2503,8 @@ export class DirectFundingReceiver extends TypedEmitter<DirectFundingReceiverEve
 		try {
 			this.deps.requests.markReceiptRevealed(ctx.session.receiptHashHex, {
 				offerIdHex: ctx.session.offerIdHex,
-				fundingTxidHex: final.fundingTxidDisplay.toString('hex')
+				fundingTxidHex: final.fundingTxidDisplay.toString('hex'),
+				amountSat: ctx.offer.amountSat.toString()
 			});
 		} catch (err) {
 			// Only the write failed; the in-memory tombstone stands. Withholding
@@ -2484,7 +2513,7 @@ export class DirectFundingReceiver extends TypedEmitter<DirectFundingReceiverEve
 			// the two failures by a distance.
 			this.log(DF_LOG_OFFER_FAILED, {
 				offerId: ctx.session.offerIdHex,
-				error: `receipt tombstone not persisted: ${errorText(err)}`
+				error: `receipt not persisted: ${errorText(err)}`
 			});
 		}
 		// The complete transaction, when every witness is in: no chain round

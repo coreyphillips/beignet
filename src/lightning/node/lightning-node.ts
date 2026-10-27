@@ -28763,6 +28763,10 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 						this.removeListener('splice:reverted', cb);
 					};
 				},
+				hasRevertedSplice: (channelIdHex, spliceTxid): boolean =>
+					this.channelManager
+						.getChannel(Buffer.from(channelIdHex, 'hex'))
+						?.hasRevertedSplice(spliceTxid) ?? false,
 				log
 			},
 			{

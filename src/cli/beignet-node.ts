@@ -200,6 +200,7 @@ import { getPublicKey } from '../lightning/crypto/ecdh';
 import type {
 	IDfPaymentRecord,
 	IDfPrepareResult,
+	IDfReceivedRecord,
 	IDfSendResult
 } from '../lightning/direct-funding';
 import {
@@ -10343,6 +10344,17 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	/** Every direct-funding payment this device has a record of. */
 	listDirectFundingPayments(): IDfPaymentRecord[] {
 		return this.directFundingSender?.payments() ?? [];
+	}
+
+	/**
+	 * Every payment received against a request this node minted, newest first
+	 * (issue #1893). `receiptHash` is the `paymentHash` the request was minted
+	 * with. Kept after the request itself expires, so a client can still tell
+	 * its request was paid: a direct-funding payment settles no invoice and pays
+	 * no address, and REVERTED means the splice it went into was undone.
+	 */
+	listDirectFundingReceived(): IDfReceivedRecord[] {
+		return this.node.getDirectFundingRequests()?.received() ?? [];
 	}
 
 	/**

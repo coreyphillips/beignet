@@ -381,6 +381,7 @@ method BeignetNode.listAddressLabels(): Record<string, string>
 method BeignetNode.listBoostableTransactions(): BoostableTransactions
 method BeignetNode.listChannels(): ChannelInfo[]
 method BeignetNode.listDirectFundingPayments(): beignet/lightning#directFunding.IDfPaymentRecord[]
+method BeignetNode.listDirectFundingReceived(): beignet/lightning#directFunding.IDfReceivedRecord[]
 method BeignetNode.listForwards(filter?: ForwardsFilter): ForwardingEventInfo[]
 method BeignetNode.listHoldInvoices(): HoldInvoiceInfo[]
 method BeignetNode.listInvoices(): InvoiceInfo[]

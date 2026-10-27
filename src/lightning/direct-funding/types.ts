@@ -292,6 +292,14 @@ export interface IDfAttemptFunding {
 	 * field still restores.
 	 */
 	fundingTxid?: string;
+	/**
+	 * The amount the offer funds, as decimal satoshis. The request records an
+	 * amount only when it fixed one, and the offer that named any other is gone
+	 * with its session, so this is where the received record of a funding
+	 * finished on a recovery path takes its amount from (issue #1893). Optional
+	 * so a record written before this field still restores.
+	 */
+	amountSat?: string;
 }
 
 /**
@@ -339,8 +347,19 @@ export interface IDfRequestRecord {
 	 * after a successful exchange can still replay the receipt: the session
 	 * that recorded it lives in memory only, and without this the payer whose
 	 * receipt frame was lost gets a bare "already paid" and no proof of it.
+	 *
+	 * The channel, whether it was a splice, and the amount ride along for the
+	 * received record (issue #1893): the same write clears the funding mark
+	 * that held them, and a received record that did not reach storage is
+	 * rebuilt from this on restore.
 	 */
-	paidBy?: { offerIdHex: string; fundingTxidHex: string };
+	paidBy?: {
+		offerIdHex: string;
+		fundingTxidHex: string;
+		channelIdHex?: string;
+		splice?: boolean;
+		amountSat?: string;
+	};
 	/** Offers this request has spent a funding session on, over its whole life. */
 	attempts?: number;
 	/**
@@ -363,6 +382,46 @@ export interface IDfRequestRecord {
 	};
 	/** Reserved for the deferred rendezvous transport (#533), never minted. */
 	swarmSeedHex?: string;
+}
+
+/** PAID once the receipt is revealed; REVERTED when the splice it went into was. */
+export type DfReceivedStatus = 'PAID' | 'REVERTED';
+
+/**
+ * One payment this node received against a request it minted (issue #1893).
+ *
+ * Kept apart from the request record on purpose. That record holds secrets
+ * that must go when the request does, an hour after minting by default, and
+ * the tombstone in it was until now the only trace of the payment: a client
+ * asking whether its request was paid found nothing once the sweep had run,
+ * and a payment that pays neither an invoice nor an address cannot be found
+ * any other way. This holds no secret, so it can outlive the request.
+ */
+export interface IDfReceivedRecord {
+	/**
+	 * 32-byte hex: the request's receipt hash, which `createDirectFundingRequest`
+	 * returns as its `paymentHash` and the envelope carries first.
+	 */
+	receiptHash: string;
+	/** 16-byte hex. */
+	requestId: string;
+	/** 16-byte hex: the offer that paid it. */
+	offerId: string;
+	/** The funding transaction's txid, DISPLAY byte order hex. */
+	fundingTxid: string;
+	/** Absent only when the funding record did not survive to the receipt. */
+	channelId?: string;
+	/** A splice into an existing channel rather than a new v2 open. */
+	splice?: boolean;
+	/**
+	 * Decimal satoshis. Absent only for an open-amount request paid on a
+	 * recovery path from a funding record written before amounts were kept.
+	 */
+	amountSat?: string;
+	status: DfReceivedStatus;
+	/** When the receipt was revealed, milliseconds since epoch. */
+	paidAt: number;
+	updatedAt: number;
 }
 
 // ─────────────── Chain binding ───────────────

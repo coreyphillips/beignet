@@ -430,6 +430,14 @@ export interface IDfReceiverDeps {
 			conflictTxid: string;
 		}) => void
 	): () => void;
+	/**
+	 * Whether the channel remembers reverting this splice (display txid). What
+	 * a starting receiver checks its received payments against (issue #1893):
+	 * the event above fires once, so a mark that did not reach storage, or a
+	 * revert that landed before the subscription, would otherwise read as paid
+	 * for good. Optional.
+	 */
+	hasRevertedSplice?(channelIdHex: string, spliceTxid: string): boolean;
 	now?(): number;
 	/** Structured-log sink, the same one 4B's lanes take. */
 	log?: DfTransportLog;

@@ -2279,6 +2279,10 @@ async function bootDaemon(
 			);
 		},
 		'GET /direct-funding/config': () => success(node.getDirectFundingConfig()),
+		// What tells a client its request was paid: a direct-funding payment
+		// settles no invoice and pays no address (issue #1893).
+		'GET /direct-funding/received': () =>
+			success(node.listDirectFundingReceived()),
 		// Mint a payment request. The receipt preimage stays here; a payer whose
 		// funding carries the matching hash is answered with it after broadcast,
 		// which is a provable delivery receipt bound to this request.

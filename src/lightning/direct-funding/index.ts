@@ -76,6 +76,9 @@ export type {
 export {
 	DF_DEFAULT_MAX_OUTSTANDING,
 	DF_DEFAULT_SWEEP_INTERVAL_MS,
+	DF_MAX_RECEIVED_RECORDS,
+	DF_RECEIVED_RETENTION_MS,
+	DF_RECEIVED_STORAGE_KEY,
 	DF_REQUESTS_STORAGE_KEY,
 	DirectFundingRequestStore,
 	requestEncryptionPublicKey
@@ -111,11 +114,13 @@ export {
 	isUnknownTransport
 } from './types';
 export type {
+	DfReceivedStatus,
 	DfTransportDescriptor,
 	IDfAttemptFunding,
 	IDfBlindedHop,
 	IDfDirectPeerTransport,
 	IDfOnionTransport,
+	IDfReceivedRecord,
 	IDfRelayTransport,
 	IDfRequestEnvelope,
 	IDfRequestRecord,

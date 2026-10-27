@@ -2196,6 +2196,15 @@ describe('Direct funding receiver: a restart mid-funding (issue #635)', () => {
 				(): number => Date.now() + 5 * 60 * 1000
 			);
 			expect(third.requests.paidOffer(c.record.receiptHash)).to.not.equal(null);
+			// The offer went with the first life's session, so the amount and the
+			// channel come from the funding mark it left (issue #1893).
+			expect(third.requests.receivedFor(c.record.receiptHash)).to.include({
+				offerId: c.offer.offerId.toString('hex'),
+				channelId: c.channelId.toString('hex'),
+				splice: false,
+				amountSat: c.offer.amountSat.toString(),
+				status: 'PAID'
+			});
 			engine.stop();
 		});
 	});
@@ -3140,6 +3149,19 @@ describe('Direct funding receiver: routing and zero-conf (issue #612)', () => {
 		await flush();
 		expect(h.node.witnesses[0].kind).to.equal('splice');
 		expect(h.payer.bodiesOf(RECEIPT)).to.have.length(1);
+		// What tells a client the request was paid (issue #1893).
+		const received = h.node.requests.receivedFor(
+			h.payer.requestRecord.receiptHash
+		);
+		expect(received).to.include({
+			offerId: h.offer.offerId.toString('hex'),
+			splice: true,
+			amountSat: '50000',
+			status: 'PAID'
+		});
+		expect(received?.fundingTxid).to.equal(
+			decodeDfReceipt(h.payer.bodiesOf(RECEIPT)[0]).fundingTxid.toString('hex')
+		);
 	});
 
 	it('refuses to attest a splice whose new funding output lost the old capacity', async () => {

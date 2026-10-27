@@ -2146,6 +2146,8 @@ async function handleDirectFunding(): Promise<void> {
 		}
 		case 'config':
 			return outputResult(await httpRequest('GET', '/direct-funding/config'));
+		case 'received':
+			return outputResult(await httpRequest('GET', '/direct-funding/received'));
 		case 'request': {
 			// host/port are the operator's: they are signed into the request as the
 			// address a payer can reach this node on, and the daemon never guesses.
@@ -2206,7 +2208,7 @@ async function handleDirectFunding(): Promise<void> {
 				error: {
 					code: 'UNKNOWN_COMMAND',
 					message:
-						'Usage: beignet direct-funding [configure|config|request|prepare|send]'
+						'Usage: beignet direct-funding [configure|config|received|request|prepare|send]'
 				}
 			});
 			process.exitCode = 1;
@@ -3261,6 +3263,8 @@ Direct funding (a payer's on-chain payment IS this node's channel funding):
                                          MERGES: a field you do not name keeps
                                          its value
   direct-funding config                  Read the effective policy back
+  direct-funding received                List the payments received against
+                                         our requests
   direct-funding request [sats] [--host H] [--port P]
                                          Mint a payment request; the receipt
                                          preimage stays here. --host/--port are
