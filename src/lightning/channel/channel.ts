@@ -11154,15 +11154,30 @@ export class Channel {
 	 * window of a splice, moving only when completeSplice adopts it.
 	 *
 	 * Nothing else is guessed. A splice funding that locked and was retired
-	 * by a later splice, or the current funding of a closed channel, stays
-	 * unknown: a closed channel may have adopted its funding by force close,
-	 * which locks nothing. Rows that already carry the field are left alone.
+	 * by a later splice, the current funding of a closed channel, and the
+	 * open's funding of a row spliced before previousFundingTxids existed all
+	 * stay unknown: a closed channel may have adopted its funding by force
+	 * close, which locks nothing. Rows that already carry the field are left
+	 * alone.
 	 */
 	backfillLockedFundingTxids(): boolean {
 		const s = this._state;
 		if (s.lockedFundingTxids !== undefined) return false;
 		if (s.localChannelReady && s.remoteChannelReady) {
-			this._recordFundingLock(s.previousFundingTxids?.[0] ?? s.fundingTxid);
+			// The open's funding is the first one the channel ran on. A row
+			// spliced before previousFundingTxids existed (0.31) has no history
+			// to name it, and its fundingTxid may be a splice a force close
+			// adopted with no lock. Every adoption sets hasBeenSpliced (since
+			// #1020) and leaves spliceFundingTxid equal to fundingTxid, so a
+			// row showing either seeds nothing from this rule.
+			const adopted =
+				s.hasBeenSpliced === true ||
+				(!!s.spliceFundingTxid &&
+					!!s.fundingTxid &&
+					s.spliceFundingTxid.equals(s.fundingTxid));
+			this._recordFundingLock(
+				s.previousFundingTxids?.[0] ?? (adopted ? null : s.fundingTxid)
+			);
 		}
 		const st =
 			s.state === ChannelState.AWAITING_REESTABLISH

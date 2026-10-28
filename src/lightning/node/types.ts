@@ -1177,6 +1177,10 @@ export interface IChannelInfo {
 	 * so an earlier splice lock, or the last funding of a channel closed
 	 * before the upgrade, can be missing. Treat a txid that is not listed,
 	 * and an absent field, as "not known", not as "never locked".
+	 *
+	 * A lock is the channel_ready or splice_locked exchange. On a zero-conf
+	 * channel that comes before the funding confirms, so a listed txid is not
+	 * proof of confirmation.
 	 */
 	lockedFundingTxids?: string[];
 	/**

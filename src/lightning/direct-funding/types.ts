@@ -426,7 +426,14 @@ export interface IDfReceivedRecord {
 	 * #1899): the channel's lockedFundingTxids came to hold fundingTxid,
 	 * through channel_ready for an open or splice_locked for a splice, both
 	 * sent and received. Absent until then. Outlives the channel within this
-	 * record's retention, and stays on a record later marked REVERTED.
+	 * record's retention, and stays on a record later marked REVERTED. For a
+	 * funding that locked before this version, it is the first start that
+	 * recorded the lock, not the lock itself.
+	 *
+	 * A lock is the channel_ready or splice_locked exchange, which on a
+	 * zero-conf channel comes before the funding confirms, so lockedAt is not
+	 * proof of confirmation: a zero-conf open whose funding is double-spent is
+	 * voided, and its record keeps lockedAt.
 	 */
 	lockedAt?: number;
 	updatedAt: number;

@@ -512,6 +512,43 @@ describe('Locked fundings: persistence and the restore backfill (issue #1899)', 
 			expect(closed.locked).to.deep.equal([closed.fundingTxid.toString('hex')]);
 		});
 
+		it('seeds no open funding for a row spliced before previousFundingTxids existed', function () {
+			// Before 0.31 a splice left no history, so fundingTxid may be a
+			// splice a force close adopted with no lock. Every adoption leaves
+			// spliceFundingTxid equal to it, and since #1020 sets hasBeenSpliced.
+			const splice = crypto.randomBytes(32);
+			const preHistory = seeded((s) => {
+				s.state = ChannelState.FORCE_CLOSED;
+				s.fundingTxid = splice;
+				s.spliceFundingTxid = Buffer.from(splice);
+				delete s.hasBeenSpliced;
+			});
+			expect(preHistory.locked).to.equal(undefined);
+			const flagged = seeded((s) => {
+				s.state = ChannelState.FORCE_CLOSED;
+				s.fundingTxid = splice;
+				s.hasBeenSpliced = true;
+			});
+			expect(flagged.locked).to.equal(undefined);
+			// The same row while the channel is open: its current funding was
+			// adopted by completeSplice, so it locked, and only it is seeded.
+			const open = seeded((s) => {
+				s.fundingTxid = splice;
+				s.spliceFundingTxid = Buffer.from(splice);
+				s.hasBeenSpliced = true;
+			});
+			expect(open.locked).to.deep.equal([splice.toString('hex')]);
+			// A first splice still in flight leaves the open's funding as the
+			// current one, and it is seeded.
+			const inFlight = seeded((s) => {
+				s.state = ChannelState.FORCE_CLOSED;
+				s.spliceFundingTxid = crypto.randomBytes(32);
+			});
+			expect(inFlight.locked).to.deep.equal([
+				inFlight.fundingTxid.toString('hex')
+			]);
+		});
+
 		it('leaves a row that already carries the field alone', function () {
 			const other = crypto.randomBytes(32);
 			const { channel } = normalChannel();
@@ -739,6 +776,36 @@ describe('Locked fundings on the node (issue #1899)', function () {
 			);
 			expect(requests.receivedFor(other.receiptHash)).to.not.have.property(
 				'lockedAt'
+			);
+		});
+
+		it('a splice lock stamps lockedAt on the payment that funded the splice', async function () {
+			const alice = node(18999, { directFunding: {} });
+			const bob = node(19000);
+			const requests = alice.getDirectFundingRequests()!;
+			const { channelId } = fund(alice, bob);
+			alice.handleFundingConfirmed(channelId);
+			bob.handleFundingConfirmed(channelId);
+			await tick();
+			const splice = crypto.randomBytes(32);
+			const request = requests.mint();
+			requests.markReceiptRevealed(request.receiptHash, {
+				offerIdHex: OFFER,
+				fundingTxidHex: display(splice)
+			});
+			expect(requests.receivedFor(request.receiptHash)).to.not.have.property(
+				'lockedAt'
+			);
+			// What completeSplice leaves on the channel, then the event the node
+			// emits once it has persisted the step (internal byte order).
+			const state = writableState(alice.getRawChannel(channelId)!);
+			state.lockedFundingTxids = [
+				...(state.lockedFundingTxids ?? []),
+				Buffer.from(splice)
+			];
+			alice.emit('splice:complete', { channelId, fundingTxid: splice });
+			expect(requests.receivedFor(request.receiptHash)!.lockedAt).to.be.a(
+				'number'
 			);
 		});
 

@@ -5482,7 +5482,7 @@ export function getOpenApiSpec(): Record<string, unknown> {
 							type: 'array',
 							items: { type: 'string' },
 							description:
-								"Funding transaction ids this channel has locked, oldest first, display byte order: the open's funding once both channel_ready messages crossed, and each splice's funding once both splice_locked messages did. Kept through close, so it still answers after the channel closed or while its peer is away; a force close that adopts a confirmed splice locks nothing. Complete for locks recorded by this version: a channel written by an earlier one is seeded on load with what its stored state proves, so a txid not listed, or an absent field, means not known rather than never locked (issue #1899)"
+								"Funding transaction ids this channel has locked, oldest first, display byte order: the open's funding once both channel_ready messages crossed, and each splice's funding once both splice_locked messages did. Kept through close, so it still answers after the channel closed or while its peer is away; a force close that adopts a confirmed splice locks nothing. Complete for locks recorded by this version: a channel written by an earlier one is seeded on load with what its stored state proves, so a txid not listed, or an absent field, means not known rather than never locked. On a zero-conf channel a lock comes before the funding confirms, so a listed txid is not proof of confirmation (issue #1899)"
 						},
 						htlcUsable: {
 							type: 'boolean',
@@ -5986,7 +5986,7 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						lockedAt: {
 							type: 'integer',
 							description:
-								"When this node saw the funding lock, ms since epoch: the channel recorded fundingTxid as locked (channel_ready for an open, splice_locked for a splice, both sent and received). Absent until then; kept within the record's retention after the channel closes, and on a record later marked REVERTED (issue #1899)"
+								"When this node saw the funding lock, ms since epoch: the channel recorded fundingTxid as locked (channel_ready for an open, splice_locked for a splice, both sent and received). Absent until then; kept within the record's retention after the channel closes, and on a record later marked REVERTED. For a lock from before this version, the first start that recorded it. On a zero-conf channel a lock comes before the funding confirms, so this is not proof of confirmation (issue #1899)"
 						},
 						updatedAt: { type: 'integer' }
 					}

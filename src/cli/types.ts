@@ -213,7 +213,9 @@ export interface ChannelInfo {
 	 * #1899). Kept through close. Complete for the locks this version
 	 * recorded; a channel written by an earlier version is seeded on load
 	 * with what its stored state proves, so treat a txid that is not listed,
-	 * and an absent field, as "not known", not as "never locked".
+	 * and an absent field, as "not known", not as "never locked". On a
+	 * zero-conf channel a lock comes before the funding confirms, so a listed
+	 * txid is not proof of confirmation.
 	 */
 	lockedFundingTxids?: TxidHex[];
 	/** Whether the channel will accept a NEW HTLC (0.6.0+). */
