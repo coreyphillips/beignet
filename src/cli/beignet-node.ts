@@ -9536,6 +9536,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 		pendingSpliceLocalBalanceMsat?: bigint;
 		pendingSpliceTxid?: string;
 		previousFundingTxids?: string[];
+		lockedFundingTxids?: string[];
 		htlcUsable?: boolean;
 		restoreRecencyUnproven?: boolean;
 		reestablishRecencyUnproven?: boolean;
@@ -9614,6 +9615,10 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 			info.pendingSpliceTxid = ch.pendingSpliceTxid;
 		if (ch.previousFundingTxids && ch.previousFundingTxids.length > 0)
 			info.previousFundingTxids = [...ch.previousFundingTxids];
+		// What a wallet counts a funding as locked from once the channel has
+		// closed or its peer is away (issue #1899). Display order already.
+		if (ch.lockedFundingTxids && ch.lockedFundingTxids.length > 0)
+			info.lockedFundingTxids = [...ch.lockedFundingTxids];
 		// The dashboard's Send gating reads these off the wire; dropping them
 		// here re-parked every mid-splice channel in the UI while the daemon
 		// happily paid through the window.

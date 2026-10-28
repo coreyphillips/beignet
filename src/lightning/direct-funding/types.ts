@@ -421,6 +421,14 @@ export interface IDfReceivedRecord {
 	status: DfReceivedStatus;
 	/** When the receipt was revealed, milliseconds since epoch. */
 	paidAt: number;
+	/**
+	 * When this node saw the funding lock, milliseconds since epoch (issue
+	 * #1899): the channel's lockedFundingTxids came to hold fundingTxid,
+	 * through channel_ready for an open or splice_locked for a splice, both
+	 * sent and received. Absent until then. Outlives the channel within this
+	 * record's retention, and stays on a record later marked REVERTED.
+	 */
+	lockedAt?: number;
 	updatedAt: number;
 }
 

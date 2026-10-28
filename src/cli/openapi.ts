@@ -428,7 +428,7 @@ export function getOpenApiSpec(): Record<string, unknown> {
 			'/direct-funding/received': {
 				get: {
 					summary:
-						"List the payments received against this node's direct-funding requests, newest first. receiptHash is the paymentHash /direct-funding/request returned. A direct-funding payment settles no invoice and pays no address, so this is how a client tells its request was paid. Kept for 30 days from the payment (or its revert), at most 512, outliving the request itself. REVERTED means the splice the payment went into was undone because the payer spent the coin elsewhere. Readonly scope",
+						"List the payments received against this node's direct-funding requests, newest first. receiptHash is the paymentHash /direct-funding/request returned. A direct-funding payment settles no invoice and pays no address, so this is how a client tells its request was paid. Kept for 30 days from the payment (or its lock or revert), at most 512, outliving the request itself. REVERTED means the splice the payment went into was undone because the payer spent the coin elsewhere. Readonly scope",
 					tags: ['DirectFunding'],
 					responses: {
 						'200': {
@@ -5478,6 +5478,12 @@ export function getOpenApiSpec(): Record<string, unknown> {
 							description:
 								'Funding transaction ids this channel ran on before fundingTxid, oldest first, display byte order, one per adopted splice; absent on a channel that has never been spliced (issue #1060)'
 						},
+						lockedFundingTxids: {
+							type: 'array',
+							items: { type: 'string' },
+							description:
+								"Funding transaction ids this channel has locked, oldest first, display byte order: the open's funding once both channel_ready messages crossed, and each splice's funding once both splice_locked messages did. Kept through close, so it still answers after the channel closed or while its peer is away; a force close that adopts a confirmed splice locks nothing. Complete for locks recorded by this version: a channel written by an earlier one is seeded on load with what its stored state proves, so a txid not listed, or an absent field, means not known rather than never locked (issue #1899)"
+						},
 						htlcUsable: {
 							type: 'boolean',
 							description:
@@ -5976,6 +5982,11 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						paidAt: {
 							type: 'integer',
 							description: 'When the receipt was revealed, ms since epoch'
+						},
+						lockedAt: {
+							type: 'integer',
+							description:
+								"When this node saw the funding lock, ms since epoch: the channel recorded fundingTxid as locked (channel_ready for an open, splice_locked for a splice, both sent and received). Absent until then; kept within the record's retention after the channel closes, and on a record later marked REVERTED (issue #1899)"
 						},
 						updatedAt: { type: 'integer' }
 					}

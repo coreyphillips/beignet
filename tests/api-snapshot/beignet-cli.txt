@@ -689,6 +689,7 @@ property ChannelInfo.isPrivate?: boolean
 property ChannelInfo.localBalanceSats: number
 property ChannelInfo.localReserveSats?: number
 property ChannelInfo.localReserveWaived?: boolean
+property ChannelInfo.lockedFundingTxids?: TxidHex[]
 property ChannelInfo.maxSendableSats?: number
 property ChannelInfo.payThroughSplice?: boolean
 property ChannelInfo.peerPubkey: string

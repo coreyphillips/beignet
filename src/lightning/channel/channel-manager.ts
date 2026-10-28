@@ -2802,6 +2802,11 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			// constant, which above 1,000,000 sat is LESS than the peer
 			// requires of us. Raise it (issue #387).
 			channel.repairKeptChannelReserve();
+			// Rows written before lockedFundingTxids existed get what they prove
+			// (issue #1899). The method reads through a wrapped state, so the
+			// order against markForReestablish does not matter. Not persisted
+			// here: the next write of the row carries it.
+			channel.backfillLockedFundingTxids();
 
 			// Mark channels for reestablishment — after a restart the peer
 			// connection is lost, so we must complete channel_reestablish

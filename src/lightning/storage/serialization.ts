@@ -404,6 +404,11 @@ export interface ISerializedChannelState {
 	 * order hex (issue #1060). Absent on rows written before the field.
 	 */
 	previousFundingTxids?: string[];
+	/**
+	 * Funding txids this channel has locked, oldest first, internal byte order
+	 * hex (issue #1899). Absent on rows written before the field.
+	 */
+	lockedFundingTxids?: string[];
 	fundingOutputIndex: number;
 	minimumDepth: number;
 	localConfig: ISerializedChannelConfig;
@@ -961,6 +966,7 @@ export function serializeChannelState(
 		fundingUnaccounted: s.fundingUnaccounted,
 		hasBeenSpliced: s.hasBeenSpliced,
 		previousFundingTxids: s.previousFundingTxids?.map((t) => t.toString('hex')),
+		lockedFundingTxids: s.lockedFundingTxids?.map((t) => t.toString('hex')),
 		fundingOutputIndex: s.fundingOutputIndex,
 		minimumDepth: s.minimumDepth,
 		localConfig: serializeChannelConfig(s.localConfig),
@@ -1595,6 +1601,7 @@ export function deserializeChannelState(
 		previousFundingTxids: s.previousFundingTxids?.map((t) =>
 			Buffer.from(t, 'hex')
 		),
+		lockedFundingTxids: s.lockedFundingTxids?.map((t) => Buffer.from(t, 'hex')),
 		fundingOutputIndex: s.fundingOutputIndex,
 		minimumDepth: s.minimumDepth,
 		localConfig: deserializeChannelConfig(s.localConfig),

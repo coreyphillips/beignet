@@ -3568,6 +3568,117 @@ describe('Direct funding receiver: routing and zero-conf (issue #612)', () => {
 	});
 });
 
+describe('Direct funding receiver: the funding lock (issue #1899)', () => {
+	/** A paired payer's splice, negotiated up to the payer's witness. */
+	async function negotiatedSplice(): Promise<{
+		h: IHarness;
+		channelId: Buffer;
+		tx: bitcoin.Transaction;
+		receiptHash: string;
+	}> {
+		const h = harness(
+			{ allowSplice: true, negotiationTimeoutMs: 5_000 },
+			{ authenticatedPeer: 'payer-node-id' }
+		);
+		h.node.spliceChannel = crypto.randomBytes(32);
+		h.node.trustedPayers.add('payer-node-id');
+		await h.sendOffer();
+		const { channelId, tx } = h.node.completeSpliceNegotiation(
+			h.coin,
+			h.offer,
+			200_000n
+		);
+		await flush();
+		return {
+			h,
+			channelId,
+			tx,
+			receiptHash: h.payer.requestRecord.receiptHash
+		};
+	}
+
+	async function witness(h: IHarness): Promise<void> {
+		h.engine.handleFrame(
+			h.payer.witnessFrame(h.offer.offerId, [Buffer.alloc(64, 3)])
+		);
+		await flush();
+		expect(h.payer.bodiesOf(RECEIPT)).to.have.length(1);
+	}
+
+	it('stamps lockedAt on a record created after its funding locked', async () => {
+		// A zero-conf lock can land before the payer's witness: the node's lock
+		// event has fired by the time the record exists, and will not again.
+		const { h, channelId, tx, receiptHash } = await negotiatedSplice();
+		h.node.lockedFundings.add(`${channelId.toString('hex')}:${tx.getId()}`);
+		await witness(h);
+		const received = h.node.requests.receivedFor(receiptHash)!;
+		expect(received.status).to.equal('PAID');
+		expect(received.fundingTxid).to.equal(tx.getId());
+		expect(received.lockedAt).to.be.a('number');
+		expect(received.lockedAt).to.be.at.least(received.paidAt);
+		expect(received.updatedAt).to.equal(received.lockedAt);
+		h.engine.stop();
+	});
+
+	it('leaves lockedAt off a record whose funding has not locked', async () => {
+		const { h, channelId, receiptHash } = await negotiatedSplice();
+		// Another funding of the same channel locking says nothing about this one.
+		h.node.lockedFundings.add(
+			`${channelId.toString('hex')}:${'ab'.repeat(32)}`
+		);
+		await witness(h);
+		expect(h.node.requests.receivedFor(receiptHash)).to.not.have.property(
+			'lockedAt'
+		);
+		h.engine.stop();
+	});
+
+	it('marks a lock it missed when it starts', async () => {
+		const { h, channelId, tx, receiptHash } = await negotiatedSplice();
+		await witness(h);
+		h.engine.stop();
+		h.engine.start();
+		expect(h.node.requests.receivedFor(receiptHash)).to.not.have.property(
+			'lockedAt'
+		);
+		h.engine.stop();
+		h.node.lockedFundings.add(`${channelId.toString('hex')}:${tx.getId()}`);
+		h.engine.start();
+		const first = h.node.requests.receivedFor(receiptHash)!.lockedAt;
+		expect(first).to.be.a('number');
+		// Once: a later start leaves the stamp where it is.
+		h.engine.stop();
+		h.engine.start();
+		expect(h.node.requests.receivedFor(receiptHash)!.lockedAt).to.equal(first);
+		h.engine.stop();
+	});
+
+	it('does not mark a REVERTED record locked at start', async () => {
+		const { h, channelId, tx, receiptHash } = await negotiatedSplice();
+		await witness(h);
+		h.engine.stop();
+		h.node.requests.markReceivedReverted(tx.getId());
+		h.node.lockedFundings.add(`${channelId.toString('hex')}:${tx.getId()}`);
+		h.engine.start();
+		const received = h.node.requests.receivedFor(receiptHash)!;
+		expect(received.status).to.equal('REVERTED');
+		expect(received).to.not.have.property('lockedAt');
+		h.engine.stop();
+	});
+
+	it('leaves the record alone on a node that does not answer the lock query', async () => {
+		// The dep is optional on the public deps interface.
+		const { h, channelId, tx, receiptHash } = await negotiatedSplice();
+		h.node.lockedFundings.add(`${channelId.toString('hex')}:${tx.getId()}`);
+		(h.node as Partial<IDfReceiverDeps>).hasLockedFunding = undefined;
+		await witness(h);
+		expect(h.node.requests.receivedFor(receiptHash)).to.not.have.property(
+			'lockedAt'
+		);
+		h.engine.stop();
+	});
+});
+
 describe('Direct funding receiver: frames it will not open (issue #612)', () => {
 	it('is silent about a frame sealed to a request it did not mint', async () => {
 		const h = harness();

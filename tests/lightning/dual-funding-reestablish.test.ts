@@ -3892,6 +3892,33 @@ describe('Dual funding v2 reestablish (issues 288/289)', () => {
 		expect(h.acceptor.getFullState().v2InFlight ?? null).to.equal(null);
 	});
 
+	it('records the v2 funding as locked once channel_ready crossed both ways (issue #1899)', () => {
+		const h = driveToCommitmentExchange();
+		deliverCommitments(h);
+		completeExchange(h);
+		const funding = h.opener.getFullState().fundingTxid!.toString('hex');
+		const locked = (side: Channel): string[] | undefined =>
+			side.getFullState().lockedFundingTxids?.map((t) => t.toString('hex'));
+
+		const opReady = findPayload(
+			h.opener.fundingConfirmed(),
+			MessageType.CHANNEL_READY
+		)!;
+		expect(locked(h.opener), 'our channel_ready alone locks nothing').to.equal(
+			undefined
+		);
+		const acReady = findPayload(
+			h.acceptor.fundingConfirmed(),
+			MessageType.CHANNEL_READY
+		)!;
+		h.opener.handleChannelReady(decodeChannelReadyMessage(acReady));
+		h.acceptor.handleChannelReady(decodeChannelReadyMessage(opReady));
+		expect(h.opener.getState()).to.equal(ChannelState.NORMAL);
+		expect(h.acceptor.getState()).to.equal(ChannelState.NORMAL);
+		expect(locked(h.opener)).to.deep.equal([funding]);
+		expect(locked(h.acceptor)).to.deep.equal([funding]);
+	});
+
 	/**
 	 * Drive to the mirrored-loss shape: the acceptor released its
 	 * tx_signatures and the opener completed (fully signed, state
