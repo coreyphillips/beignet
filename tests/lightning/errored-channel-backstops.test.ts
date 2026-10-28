@@ -28,6 +28,7 @@ import {
 } from '../../src/lightning/channel/types';
 import { IChannelBasepoints } from '../../src/lightning/keys/derivation';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
+import { writableState } from './helpers/writable-state';
 
 // ─── Helpers (model: forward-onchain-resolution.test.ts) ───
 
@@ -371,6 +372,79 @@ describe('Issue #174: ERRORED channels keep their HTLC backstops', function () {
 			fx.alice.destroy();
 			fx.bob.destroy();
 		});
+	});
+});
+
+/**
+ * Issue #1901: nothing clears preReestablishState when a channel wrapped by a
+ * disconnect closes, so the offered-HTLC scan must read it only while the
+ * channel is still AWAITING_REESTABLISH. Otherwise a channel force closed
+ * while its peer was away reads as NORMAL: its payment fails before the
+ * chain decides, and the backstop closes it again on every block.
+ */
+describe("Issue #1901: the offered-HTLC scan ignores a closed channel's stale wrap", function () {
+	const GRACE = 6;
+
+	interface IWrappedFixture {
+		alice: LightningNode;
+		bob: LightningNode;
+		events: string[];
+		failed: string[];
+	}
+
+	/** Alice's ready channel to Bob in `state`, wrapping NORMAL, with offered-9 expiring at HEIGHT behind a payment. */
+	function wrapped(seedBase: number, state: ChannelState): IWrappedFixture {
+		const alice = createNode(seedBase);
+		const bob = createNode(seedBase + 1);
+		connectNodes(alice, bob);
+		const channelId = openReadyChannel(alice, bob);
+		(alice as any).currentBlockHeight = HEIGHT;
+		const events: string[] = [];
+		alice.on('node:error', (err: any) => events.push(err.code));
+		const failed: string[] = [];
+		(alice as any).failPayment = (hash: Buffer, reason?: string) =>
+			failed.push(`${hash.toString('hex')}: ${reason}`);
+
+		const htlc = addHtlc(alice, channelId, 'offered-9', {
+			id: 9n,
+			cltvExpiry: HEIGHT
+		});
+		(alice as any).htlcPaymentMap.set(
+			`${channelId.toString('hex')}:offered-9`,
+			htlc.paymentHash.toString('hex')
+		);
+		const st = writableState(
+			(alice as any).channelManager.getChannel(channelId)
+		);
+		st.state = state;
+		st.preReestablishState = ChannelState.NORMAL;
+		return { alice, bob, events, failed };
+	}
+
+	it('neither fails the payment nor closes again once the channel has force closed', () => {
+		const fx = wrapped(71, ChannelState.FORCE_CLOSED);
+
+		(fx.alice as any).scanExpiringOfferedHtlcs(HEIGHT);
+		(fx.alice as any).scanExpiringOfferedHtlcs(HEIGHT + GRACE);
+		(fx.alice as any).scanExpiringOfferedHtlcs(HEIGHT + GRACE + 1);
+
+		expect(fx.failed).to.deep.equal([]);
+		expect(fx.events).to.not.include('HTLC_EXPIRY_FORCE_CLOSE');
+		fx.alice.destroy();
+		fx.bob.destroy();
+	});
+
+	it('still reads through the wrap while the channel awaits reestablish', () => {
+		const fx = wrapped(73, ChannelState.AWAITING_REESTABLISH);
+
+		(fx.alice as any).scanExpiringOfferedHtlcs(HEIGHT);
+		expect(fx.failed).to.have.length(1);
+		expect(fx.events).to.not.include('HTLC_EXPIRY_FORCE_CLOSE');
+
+		(fx.alice as any).scanExpiringOfferedHtlcs(HEIGHT + GRACE);
+		expect(fx.events).to.include('HTLC_EXPIRY_FORCE_CLOSE');
+		fx.alice.destroy();
+		fx.bob.destroy();
 	});
 });
 
