@@ -570,6 +570,13 @@ describe('BeignetNode', () => {
 				initiator: 'local',
 				direction: 'inbound'
 			});
+			// A zero uptime is still a figure; an empty reason is none.
+			ln.emit('peer:disconnect', 'deadbeefpeer', {
+				initiator: 'remote',
+				reason: '',
+				direction: 'outbound',
+				uptimeMs: 0
+			});
 			ln.emit('peer:disconnect', 'deadbeefpeer');
 			expect(seen).to.deep.equal([
 				{
@@ -580,6 +587,12 @@ describe('BeignetNode', () => {
 					uptimeMs: 1234
 				},
 				{ pubkey: 'deadbeefpeer', closedBy: 'us', direction: 'inbound' },
+				{
+					pubkey: 'deadbeefpeer',
+					closedBy: 'peer',
+					direction: 'outbound',
+					uptimeMs: 0
+				},
 				{ pubkey: 'deadbeefpeer' }
 			]);
 		} finally {
