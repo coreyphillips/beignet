@@ -388,6 +388,7 @@ describe("Issue #1901: the offered-HTLC scan ignores a closed channel's stale wr
 	interface IWrappedFixture {
 		alice: LightningNode;
 		bob: LightningNode;
+		channelId: Buffer;
 		events: string[];
 		failed: string[];
 	}
@@ -418,7 +419,7 @@ describe("Issue #1901: the offered-HTLC scan ignores a closed channel's stale wr
 		);
 		st.state = state;
 		st.preReestablishState = ChannelState.NORMAL;
-		return { alice, bob, events, failed };
+		return { alice, bob, channelId, events, failed };
 	}
 
 	it('neither fails the payment nor closes again once the channel has force closed', () => {
@@ -434,7 +435,7 @@ describe("Issue #1901: the offered-HTLC scan ignores a closed channel's stale wr
 		fx.bob.destroy();
 	});
 
-	it('still reads through the wrap while the channel awaits reestablish', () => {
+	it('reads through the wrap while the channel awaits reestablish, then closes it once', () => {
 		const fx = wrapped(73, ChannelState.AWAITING_REESTABLISH);
 
 		(fx.alice as any).scanExpiringOfferedHtlcs(HEIGHT);
@@ -442,7 +443,18 @@ describe("Issue #1901: the offered-HTLC scan ignores a closed channel's stale wr
 		expect(fx.events).to.not.include('HTLC_EXPIRY_FORCE_CLOSE');
 
 		(fx.alice as any).scanExpiringOfferedHtlcs(HEIGHT + GRACE);
-		expect(fx.events).to.include('HTLC_EXPIRY_FORCE_CLOSE');
+		expect(fx.events).to.deep.equal(['HTLC_EXPIRY_FORCE_CLOSE']);
+		// The backstop's own close leaves the wrap behind it.
+		const st = (fx.alice as any).channelManager
+			.getChannel(fx.channelId)
+			.getFullState();
+		expect(st.state).to.equal(ChannelState.FORCE_CLOSED);
+		expect(st.preReestablishState).to.equal(ChannelState.NORMAL);
+
+		(fx.alice as any).scanExpiringOfferedHtlcs(HEIGHT + GRACE + 1);
+		(fx.alice as any).scanExpiringOfferedHtlcs(HEIGHT + GRACE + 2);
+		expect(fx.events).to.deep.equal(['HTLC_EXPIRY_FORCE_CLOSE']);
+		expect(fx.failed).to.have.length(2);
 		fx.alice.destroy();
 		fx.bob.destroy();
 	});
