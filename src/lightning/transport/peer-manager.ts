@@ -1041,9 +1041,10 @@ export class PeerManager extends EventEmitter {
 	private emitPeerDisconnect(pubkey: string, info: IPeerDisconnectInfo): void {
 		for (const listener of this.rawListeners('peer:disconnect')) {
 			try {
-				(
-					listener as (pubkey: string, info: IPeerDisconnectInfo) => void
-				)(pubkey, info);
+				(listener as (pubkey: string, info: IPeerDisconnectInfo) => void)(
+					pubkey,
+					info
+				);
 			} catch (err) {
 				captureWireEvent(
 					'disconnect_observer_failed',

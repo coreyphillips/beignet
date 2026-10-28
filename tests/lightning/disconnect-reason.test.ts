@@ -49,7 +49,9 @@ function openingManager(): {
 	};
 	const mgr = new ChannelManager(config);
 	const errors: string[] = [];
-	mgr.on('error', (_id: Buffer | null, message: string) => errors.push(message));
+	mgr.on('error', (_id: Buffer | null, message: string) =>
+		errors.push(message)
+	);
 	const params: IDualFundingParams = {
 		fundingSatoshis: 100_000n,
 		fundingFeeratePerkw: 1000,
@@ -158,7 +160,10 @@ describe('peer:disconnect cause (issue #1890)', () => {
 		port: number;
 		disconnects: Array<{ pubkey: string; info: IPeerDisconnectInfo }>;
 	}> {
-		pm = new PeerManager({ localPrivateKey: HOST_SECRET, autoReconnect: false });
+		pm = new PeerManager({
+			localPrivateKey: HOST_SECRET,
+			autoReconnect: false
+		});
 		pm.on('peer:error', () => undefined);
 		const disconnects: Array<{ pubkey: string; info: IPeerDisconnectInfo }> =
 			[];
