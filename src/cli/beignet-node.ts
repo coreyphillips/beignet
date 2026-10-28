@@ -3996,20 +3996,23 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 		this.node.on(
 			'peer:disconnect',
 			(pubkey: string, info?: IPeerDisconnectInfo) => {
-				this.log('info', 'Peer disconnected', {
-					pubkey,
-					...(info
-						? {
-								closedBy: info.initiator === 'remote' ? 'peer' : 'us',
-								...(info.reason ? { reason: info.reason } : {}),
-								direction: info.direction,
-								...(info.uptimeMs !== undefined
-									? { uptimeMs: info.uptimeMs }
-									: {})
-						  }
-						: {})
-				});
-				this.emit('peer:disconnect', { pubkey });
+				// Subscribers (SSE, webhooks, an embedding app's diagnostics)
+				// get the same cause the log line names.
+				const cause = info
+					? {
+							closedBy:
+								info.initiator === 'remote'
+									? ('peer' as const)
+									: ('us' as const),
+							...(info.reason ? { reason: info.reason } : {}),
+							direction: info.direction,
+							...(info.uptimeMs !== undefined
+								? { uptimeMs: info.uptimeMs }
+								: {})
+					  }
+					: {};
+				this.log('info', 'Peer disconnected', { pubkey, ...cause });
+				this.emit('peer:disconnect', { pubkey, ...cause });
 			}
 		);
 		// The transport error that caused a disconnect (pong timeout, decrypt
