@@ -9374,6 +9374,12 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 		if (!channel) return null;
 
 		const state = channel.getFullState();
+		// Nothing clears preReestablishState when a marked channel closes, so
+		// it names the earlier state only while the channel is still wrapped.
+		const wrappedState =
+			state.state === ChannelState.AWAITING_REESTABLISH
+				? state.preReestablishState
+				: null;
 		// Mid-negotiation v2 channels are keyed by temporary id in the peer map
 		// (see buildChannelInfo); fall back so diagnostics name the peer too.
 		const peerPubkey =
@@ -9426,12 +9432,12 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 			);
 		if (
 			state.state !== 'NORMAL' &&
-			state.preReestablishState !== 'NORMAL' &&
+			wrappedState !== 'NORMAL' &&
 			!acceptsNewThrough
 		) {
 			issues.push(
 				`NOT_NORMAL: Channel state is ${state.state} (pre-reestablish: ${
-					state.preReestablishState || 'none'
+					wrappedState || 'none'
 				}). Routing hints require a usable channel.`
 			);
 		}
@@ -9456,7 +9462,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 			channelId,
 			peerPubkey,
 			state: state.state,
-			preReestablishState: state.preReestablishState || null,
+			preReestablishState: wrappedState || null,
 			isPeerConnected,
 			announceChannel: state.announceChannel,
 			announcementSigsSent: state.announcementSigsSent || false,

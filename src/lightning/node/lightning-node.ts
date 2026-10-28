@@ -31803,7 +31803,14 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		const channels = this.channelManager.listChannels();
 		for (const channel of channels) {
 			const state = channel.getFullState();
-			const effectiveState = state.preReestablishState ?? state.state;
+			// Nothing clears preReestablishState when a marked channel closes,
+			// so reading through it on any other state would find a closed
+			// channel's HTLCs still live: it would fail their payments before
+			// the chain decides and close the channel again every block.
+			const effectiveState =
+				state.state === ChannelState.AWAITING_REESTABLISH
+					? state.preReestablishState ?? state.state
+					: state.state;
 			// ERRORED is admitted so the force-close backstop below still guards an
 			// offered HTLC on a failed channel: the value is OURS, and the
 			// downstream can claim it with the preimage whether or not the channel
