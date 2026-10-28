@@ -3954,9 +3954,8 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 		this.node.on('peer:connect', (pubkey: string) => {
 			let direction: string | undefined;
 			try {
-				direction = this.node
-					.getPeerManager()
-					?.getConnectionInfo(pubkey)?.direction;
+				direction = this.node.getPeerManager()?.getConnectionInfo(pubkey)
+					?.direction;
 			} catch {
 				// The log line must not cost the gossip sync below.
 			}
