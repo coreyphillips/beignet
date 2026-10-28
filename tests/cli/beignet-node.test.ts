@@ -546,6 +546,60 @@ describe('BeignetNode', () => {
 		}
 	});
 
+	it("carries a disconnect's cause on peer:disconnect when the transport knows it", async function () {
+		this.timeout(20_000);
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'beignet-disc-'));
+		const node = await BeignetNode.create({
+			network: 'regtest',
+			dataDir: dir,
+			logLevel: 'silent',
+			...OFFLINE_ELECTRUM
+		});
+		try {
+			const seen: Array<Parameters<BeignetNodeEvents['peer:disconnect']>[0]> =
+				[];
+			node.on('peer:disconnect', (data) => seen.push(data));
+			const ln = node.getNode();
+			ln.emit('peer:disconnect', 'deadbeefpeer', {
+				initiator: 'remote',
+				reason: 'read ECONNRESET',
+				direction: 'outbound',
+				uptimeMs: 1234
+			});
+			ln.emit('peer:disconnect', 'deadbeefpeer', {
+				initiator: 'local',
+				direction: 'inbound'
+			});
+			// A zero uptime is still a figure; an empty reason is none.
+			ln.emit('peer:disconnect', 'deadbeefpeer', {
+				initiator: 'remote',
+				reason: '',
+				direction: 'outbound',
+				uptimeMs: 0
+			});
+			ln.emit('peer:disconnect', 'deadbeefpeer');
+			expect(seen).to.deep.equal([
+				{
+					pubkey: 'deadbeefpeer',
+					closedBy: 'peer',
+					reason: 'read ECONNRESET',
+					direction: 'outbound',
+					uptimeMs: 1234
+				},
+				{ pubkey: 'deadbeefpeer', closedBy: 'us', direction: 'inbound' },
+				{
+					pubkey: 'deadbeefpeer',
+					closedBy: 'peer',
+					direction: 'outbound',
+					uptimeMs: 0
+				},
+				{ pubkey: 'deadbeefpeer' }
+			]);
+		} finally {
+			await node.destroy();
+		}
+	});
+
 	it('reports how the stored network map came back and how long building the node took', async function () {
 		this.timeout(20_000);
 		const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'beignet-graph-stats-'));

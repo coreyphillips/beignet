@@ -963,7 +963,7 @@ The table is generated from `BeignetNodeEvents` by `npm run docs:tables`. The SS
 | `htlc:fulfilled` | `(data: { channelId: ChannelIdHex; htlcId: string })` | `htlcEvents` | The peer fulfilled an HTLC this node offered: a part of its own payment or the outgoing leg of a forward. |
 | `htlc:failed` | `(data: { channelId: ChannelIdHex; htlcId: string })` | `htlcEvents` | The peer failed an HTLC this node offered: a part of its own payment or the outgoing leg of a forward. |
 | `peer:connect` | `(data: { pubkey: string })` | yes | A peer connected. |
-| `peer:disconnect` | `(data: { pubkey: string })` | yes | A peer disconnected. |
+| `peer:disconnect` | `(data: { pubkey: string; closedBy?: 'peer' \| 'us'; reason?: string; direction?: 'inbound' \| 'outbound'; uptimeMs?: number })` | yes | A peer disconnected. When the transport knows the cause, `closedBy` says which side closed the connection, `reason` gives the transport or protocol error behind it (for example 'read ECONNRESET' or 'Pong timeout'), `direction` says who dialed, and `uptimeMs` how long it was up. A disconnect with no known cause carries only `pubkey`. |
 | `peer:error` | `(data: { pubkey: string; message: string })` | no | A peer connection reported an error. |
 | `node:error` | `(data: { code: string; message: string; timestamp: number; channelId?: ChannelIdHex; txid?: TxidHex; retained?: boolean; channelErrorCode?: ChannelErrorCode })` | yes | An operational error (non-fatal), also passed to the onError option. `code` is a NodeErrorCode or one BeignetNode raises itself, such as ELECTRUM_FAILOVER_FAILED. |
 | `node:ready` | `()` | yes | The node is fully operational: peers reconnected and channels restored. |
