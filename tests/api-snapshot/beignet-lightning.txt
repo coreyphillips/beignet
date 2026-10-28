@@ -5059,6 +5059,7 @@ property node.IChannelInfo.payThroughSplice?: boolean
 property node.IChannelInfo.peerPubkey: string
 property node.IChannelInfo.pendingSpliceLocalBalanceMsat?: bigint
 property node.IChannelInfo.pendingSpliceTxid?: string
+property node.IChannelInfo.preReestablishState?: channel.ChannelState
 property node.IChannelInfo.previousFundingTxids?: string[]
 property node.IChannelInfo.reestablishRecencyUnproven?: boolean
 property node.IChannelInfo.reestablishSecretMissing?: boolean

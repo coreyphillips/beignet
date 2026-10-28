@@ -1105,6 +1105,7 @@ interface ChannelInfo {
   channelId: string;        // 32-byte hex
   peerPubkey: string;       // 33-byte compressed pubkey hex
   state: string;            // e.g. 'NORMAL', 'AWAITING_FUNDING_CONFIRMED'
+  preReestablishState?: string;  // the state a disconnect or restart left for AWAITING_REESTABLISH; present exactly while there (issue #1899)
   localBalanceSats: number;
   remoteBalanceSats: number;
   capacitySats: number;

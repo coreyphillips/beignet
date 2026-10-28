@@ -15611,6 +15611,14 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			fundingSatoshis: state.fundingSatoshis,
 			channelType: state.channelType
 		};
+		// What a disconnect wrapped (issue #1899): a client otherwise reads an
+		// opening and an open channel alike while the peer is away.
+		if (
+			state.state === ChannelState.AWAITING_REESTABLISH &&
+			state.preReestablishState
+		) {
+			info.preReestablishState = state.preReestablishState;
+		}
 		if (state.fundingTxid) {
 			info.fundingTxid = Buffer.from(state.fundingTxid)
 				.reverse()
