@@ -1164,6 +1164,26 @@ export interface IChannelInfo {
 	 */
 	previousFundingTxids?: string[];
 	/**
+	 * Funding txids this channel has locked, oldest first (display byte
+	 * order): the open's funding once both channel_ready messages crossed,
+	 * and each splice's funding once both splice_locked messages did (issue
+	 * #1899). Kept through close, so it still answers once the channel has
+	 * closed or while its peer is away. A force close that adopts a confirmed
+	 * splice locks nothing.
+	 *
+	 * Complete for the locks this version recorded. A channel written by an
+	 * earlier version is seeded on load with what its stored state proves
+	 * (the open's funding, and the current funding of a channel still open),
+	 * so an earlier splice lock, or the last funding of a channel closed
+	 * before the upgrade, can be missing. Treat a txid that is not listed,
+	 * and an absent field, as "not known", not as "never locked".
+	 *
+	 * A lock is the channel_ready or splice_locked exchange. On a zero-conf
+	 * channel that comes before the funding confirms, so a listed txid is not
+	 * proof of confirmation.
+	 */
+	lockedFundingTxids?: string[];
+	/**
 	 * Whether the channel will accept a NEW HTLC: it can carry traffic right
 	 * now (NORMAL, or ECDSA pending-lock mid-splice with pay-during-splice
 	 * active) AND its state is provably current.

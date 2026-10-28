@@ -962,6 +962,7 @@ method channel.Channel.adoptRemoteForwardingPolicy(policy: channel.IRemoteForwar
 property channel.Channel.announcementChainHash: Buffer
 method channel.Channel.applyForceClosePlan(plan: channel.IForceClosePlanReady): channel.ChannelAction[]
 method channel.Channel.applyPeerSpliceSignature(remoteSig: Buffer, peerWalletWitnesses?: Buffer[][]): bitcoinjs-lib#Transaction | null
+method channel.Channel.backfillLockedFundingTxids(): boolean
 method channel.Channel.beginClosingNegotiationIfReady(): boolean
 method channel.Channel.beginDualFundingContribution(): channel.ChannelAction[]
 method channel.Channel.beginFundingMissingClock(height: number): boolean
@@ -1099,6 +1100,7 @@ method channel.Channel.handleUpdateFailMalformedHtlc(msg: message.IUpdateFailMal
 method channel.Channel.handleUpdateFee(msg: message.IUpdateFeeMessage): channel.ChannelAction[]
 method channel.Channel.handleUpdateFulfillHtlc(msg: message.IUpdateFulfillHtlcMessage): channel.ChannelAction[]
 method channel.Channel.hasDualFundingContribution(): boolean
+method channel.Channel.hasLockedFunding(fundingTxidDisplayHex: string): boolean
 method channel.Channel.hasPendingSpliceConflictRequest(): boolean
 method channel.Channel.hasRecoveryCloseDisposition(): boolean
 method channel.Channel.hasRevertedSplice(spliceTxidDisplayHex: string): boolean
@@ -1661,6 +1663,7 @@ property channel.IChannelState.localNonce?: Uint8Array
 property channel.IChannelState.localPerCommitmentSeed: Buffer
 property channel.IChannelState.localReserveWaived?: boolean
 property channel.IChannelState.localShutdownScript: Buffer | null
+property channel.IChannelState.lockedFundingTxids?: Buffer[]
 property channel.IChannelState.minimumDepth: number
 property channel.IChannelState.needsCommitment?: boolean
 property channel.IChannelState.pendingFeerateCommitted?: boolean
@@ -2426,6 +2429,7 @@ method directFunding.DirectFundingRequestStore.lapsedFundings(): Array<{ receipt
 method directFunding.DirectFundingRequestStore.list(): directFunding.IDfRequestRecord[]
 method directFunding.DirectFundingRequestStore.markAttemptFunding(receiptHashHex: string, offerIdHex: string, funding: directFunding.IDfAttemptFunding, expiresAt: number): boolean
 method directFunding.DirectFundingRequestStore.markReceiptRevealed(receiptHashHex: string, paidBy?: { offerIdHex: string; fundingTxidHex: string; amountSat?: string; }): void
+method directFunding.DirectFundingRequestStore.markReceivedLocked(fundingTxidHex: string, at?: number): boolean
 method directFunding.DirectFundingRequestStore.markReceivedReverted(fundingTxidHex: string): number
 method directFunding.DirectFundingRequestStore.mint(opts?: { ttlMs?: number; amountSat?: bigint; }): directFunding.IDfRequestRecord
 method directFunding.DirectFundingRequestStore.paidOffer(receiptHashHex: string): { offerIdHex: string; fundingTxidHex: string; } | null
@@ -2670,6 +2674,7 @@ interface directFunding.IDfReceivedRecord
 property directFunding.IDfReceivedRecord.amountSat?: string
 property directFunding.IDfReceivedRecord.channelId?: string
 property directFunding.IDfReceivedRecord.fundingTxid: string
+property directFunding.IDfReceivedRecord.lockedAt?: number
 property directFunding.IDfReceivedRecord.offerId: string
 property directFunding.IDfReceivedRecord.paidAt: number
 property directFunding.IDfReceivedRecord.receiptHash: string
@@ -2706,6 +2711,7 @@ method directFunding.IDfReceiverDeps.estimateFeeSatPerVbyte?(targetBlocks: numbe
 method directFunding.IDfReceiverDeps.fundingPubkeys(channelId: Buffer): { local: Buffer; remote: Buffer; } | null
 method directFunding.IDfReceiverDeps.getPendingSpliceTx(channelId: Buffer): directFunding.IDfPendingSpliceTx | null
 method directFunding.IDfReceiverDeps.getPendingV2FundingTx(channelId: Buffer): directFunding.IDfPendingV2FundingTx | null
+method directFunding.IDfReceiverDeps.hasLockedFunding?(channelIdHex: string, fundingTxid: string): boolean
 method directFunding.IDfReceiverDeps.hasRevertedSplice?(channelIdHex: string, spliceTxid: string): boolean
 method directFunding.IDfReceiverDeps.isTrustedPayer(peerHex: string): boolean
 method directFunding.IDfReceiverDeps.liquidityPeer(): string | null
@@ -5055,6 +5061,7 @@ property node.IChannelInfo.isPrivate?: boolean
 property node.IChannelInfo.localBalanceMsat: bigint
 property node.IChannelInfo.localReserveMsat?: bigint
 property node.IChannelInfo.localReserveWaived?: boolean
+property node.IChannelInfo.lockedFundingTxids?: string[]
 property node.IChannelInfo.payThroughSplice?: boolean
 property node.IChannelInfo.peerPubkey: string
 property node.IChannelInfo.pendingSpliceLocalBalanceMsat?: bigint
@@ -7614,6 +7621,7 @@ property storage.ISerializedChannelState.localHtlcCounter: string
 property storage.ISerializedChannelState.localPerCommitmentSeed: string
 property storage.ISerializedChannelState.localReserveWaived?: boolean
 property storage.ISerializedChannelState.localShutdownScript: string | null
+property storage.ISerializedChannelState.lockedFundingTxids?: string[]
 property storage.ISerializedChannelState.minimumDepth: number
 property storage.ISerializedChannelState.needsCommitment?: boolean
 property storage.ISerializedChannelState.pendingFeerateCommitted?: boolean

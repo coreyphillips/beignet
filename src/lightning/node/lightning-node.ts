@@ -15649,6 +15649,14 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				Buffer.from(t).reverse().toString('hex')
 			);
 		}
+		// The fundings this channel has locked (issue #1899), whatever state it
+		// is in now: a closed channel, or one whose peer is away, still says
+		// its funding locked. Display order like fundingTxid.
+		if (state.lockedFundingTxids && state.lockedFundingTxids.length > 0) {
+			info.lockedFundingTxids = state.lockedFundingTxids.map((t) =>
+				Buffer.from(t).reverse().toString('hex')
+			);
+		}
 		info.htlcUsable = channel.acceptsNewHtlcs();
 		// The initial splice handshake is still NORMAL, but its quiescence
 		// gate already refuses outbound adds.
@@ -28775,6 +28783,12 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 					this.channelManager
 						.getChannel(Buffer.from(channelIdHex, 'hex'))
 						?.hasRevertedSplice(spliceTxid) ?? false,
+				// getRawChannel also finds a v2 open not yet promoted out of the
+				// temporary map, which a zero-conf open can still be when it locks.
+				hasLockedFunding: (channelIdHex, fundingTxid): boolean =>
+					this.getRawChannel(
+						Buffer.from(channelIdHex, 'hex')
+					)?.hasLockedFunding(fundingTxid) ?? false,
 				log
 			},
 			{
@@ -28804,6 +28818,23 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		receiver.on('offer:completed', (e) =>
 			this.emit('direct-funding:offer:completed', e)
 		);
+		// A funding lock stamps lockedAt on the payments it carried (issue
+		// #1899). Both events fire after the node has persisted the lock, and
+		// every funding the channel has recorded as locked is marked, not only
+		// the one the event names: the mark is idempotent, and a lock missed
+		// earlier is picked up too. The record holds display byte order; the
+		// channel's list, like the splice event's txid, is internal order.
+		const markLocked = (channelId: Buffer): void => {
+			const locked =
+				this.getRawChannel(channelId)?.getFullState().lockedFundingTxids;
+			for (const txid of locked ?? []) {
+				requests.markReceivedLocked(
+					Buffer.from(txid).reverse().toString('hex')
+				);
+			}
+		};
+		this.on('channel:ready', ({ channelId }) => markLocked(channelId));
+		this.on('splice:complete', ({ channelId }) => markLocked(channelId));
 		this.directFunding = {
 			requests,
 			registry,

@@ -400,6 +400,42 @@ describe('Channel listing wire fields (GET /channels JSON)', () => {
 		);
 	});
 
+	// Issue #1899: what a wallet counts a funding as locked from once the
+	// channel has closed or its peer is away.
+	it('toChannelInfo passes lockedFundingTxids through in display order, on a closed channel too', () => {
+		const call = (ch: Record<string, unknown>): Record<string, unknown> =>
+			(BeignetNode.prototype as any).toChannelInfo.call(
+				{
+					node: {
+						getFforEpoch: () => undefined,
+						getChannelManager: () => ({ getPeerForChannel: () => 'peerpk' }),
+						peerSupportsSplicing: () => null
+					}
+				},
+				ch
+			);
+		const base = {
+			channelId: Buffer.alloc(32, 7),
+			peerPubkey: 'peerpk',
+			state: 'FORCE_CLOSED',
+			localBalanceMsat: 1_000_000n,
+			remoteBalanceMsat: 0n,
+			fundingSatoshis: 1_000n,
+			channelType: null,
+			fundingTxid: 'cc'.repeat(32)
+		};
+		// Already display order from the node layer: passed through untouched.
+		const locked = ['aa'.repeat(32), 'cc'.repeat(32)];
+		const info = call({ ...base, lockedFundingTxids: locked });
+		expect(info.state).to.equal('FORCE_CLOSED');
+		expect(info.lockedFundingTxids).to.deep.equal(locked);
+		expect(info.lockedFundingTxids).to.not.equal(locked);
+		expect(call(base)).to.not.have.property('lockedFundingTxids');
+		expect(call({ ...base, lockedFundingTxids: [] })).to.not.have.property(
+			'lockedFundingTxids'
+		);
+	});
+
 	// The dashboard hides its splice buttons on `false` alone, so the
 	// distinction between false and absent is load-bearing: absent means the
 	// peer is disconnected and support is unknowable, and hiding on unknown

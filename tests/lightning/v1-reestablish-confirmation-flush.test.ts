@@ -503,3 +503,52 @@ describe('v1 reestablish confirmation flush (issue #420)', function () {
 		expect(opener.getFullState().fundingConfirmedLate).to.equal(true);
 	});
 });
+
+describe('The open lock record across reestablish (issue #1899)', function () {
+	const locked = (channel: Channel): string[] | undefined =>
+		channel.getFullState().lockedFundingTxids?.map((t) => t.toString('hex'));
+
+	it('the reestablish flush that completes the open records its funding once', function () {
+		const { opener, acceptor } = setupPendingChannels();
+		const acceptorReady = findSendAction(
+			acceptor.fundingConfirmed(),
+			MessageType.CHANNEL_READY
+		)!;
+		opener.handleChannelReady(decodeChannelReadyMessage(acceptorReady.payload));
+		wrapAndStamp(opener, acceptor);
+		expect(locked(opener)).to.equal(undefined);
+
+		opener.handleReestablish(reestablishOf(acceptor));
+		expect(opener.getState()).to.equal(ChannelState.NORMAL);
+		const funding = opener.getFullState().fundingTxid!.toString('hex');
+		expect(locked(opener)).to.deep.equal([funding]);
+
+		// Another cycle retransmits channel_ready; the record stays one entry.
+		opener.markForReestablish();
+		opener.handleReestablish(reestablishOf(acceptor));
+		opener.handleChannelReady(decodeChannelReadyMessage(acceptorReady.payload));
+		expect(locked(opener)).to.deep.equal([funding]);
+	});
+
+	it('zero-conf: the fast track records the funding, and a retransmitted channel_ready adds nothing', function () {
+		const { opener, acceptor } = setupZeroConfNormalChannels();
+		const funding = opener.getFullState().fundingTxid!.toString('hex');
+		expect(locked(opener)).to.deep.equal([funding]);
+		expect(locked(acceptor)).to.deep.equal([funding]);
+
+		opener.markForReestablish();
+		acceptor.markForReestablish();
+		const fromOpener = opener.handleReestablish(reestablishOf(acceptor));
+		const fromAcceptor = acceptor.handleReestablish(reestablishOf(opener));
+		for (const [from, to] of [
+			[fromOpener, acceptor],
+			[fromAcceptor, opener]
+		] as Array<[ChannelAction[], Channel]>) {
+			for (const ready of findSendActions(from, MessageType.CHANNEL_READY)) {
+				to.handleChannelReady(decodeChannelReadyMessage(ready.payload));
+			}
+		}
+		expect(locked(opener)).to.deep.equal([funding]);
+		expect(locked(acceptor)).to.deep.equal([funding]);
+	});
+});

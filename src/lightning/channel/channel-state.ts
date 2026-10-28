@@ -721,6 +721,19 @@ export interface IChannelState {
 	 */
 	previousFundingTxids?: Buffer[];
 	/**
+	 * Every funding txid this channel has locked, oldest first (internal byte
+	 * order), no duplicates (issue #1899): the open's funding once both
+	 * channel_ready messages have crossed, and each splice's funding once both
+	 * splice_locked messages have. A force close that adopts a confirmed
+	 * splice locks nothing and adds nothing. Kept through close, so a client
+	 * can still tell that a funding locked after the channel is gone or while
+	 * its peer is away. Persisted; absent on a channel that has locked
+	 * nothing yet, and on rows written before the field existed until the
+	 * restore backfill (Channel.backfillLockedFundingTxids) seeds what the row
+	 * proves.
+	 */
+	lockedFundingTxids?: Buffer[];
+	/**
 	 * Issue #764: the splice (txid in internal byte order) that the commitment
 	 * this FORCE_CLOSED channel broadcast spends, when the chain had that
 	 * splice but it had not reached its lock depth. The channel itself was NOT

@@ -68,7 +68,11 @@ import {
 	encodeDfSignRequest,
 	spliceAttestationMessage
 } from '../messages';
-import type { IDfAttemptFunding, IDfRequestRecord } from '../types';
+import type {
+	IDfAttemptFunding,
+	IDfReceivedRecord,
+	IDfRequestRecord
+} from '../types';
 import { DF_SIGNATURE_BYTES, DirectFundingError } from '../types';
 import type { DfTransportRegistry } from '../transport/registry';
 import type { IDfInboundFrame, IDfLaneSender } from '../transport/types';
@@ -364,6 +368,7 @@ export class DirectFundingReceiver extends TypedEmitter<DirectFundingReceiverEve
 		}
 		// After the subscription, so no revert falls between the two.
 		this.markRevertedReceipts();
+		this.markLockedReceipts();
 		this.sweepTimer = setInterval(() => {
 			this.state.sweep(this.now());
 			this.retireLapsedFundings();
@@ -538,6 +543,42 @@ export class DirectFundingReceiver extends TypedEmitter<DirectFundingReceiverEve
 			if (this.deps.hasRevertedSplice(entry.channelId, entry.fundingTxid)) {
 				this.deps.requests.markReceivedReverted(entry.fundingTxid);
 			}
+		}
+	}
+
+	/**
+	 * Set lockedAt on the received payments whose funding the channel has
+	 * recorded as locked (issue #1899). The node marks records on its lock
+	 * events, which fire once: a mark that did not reach storage, or a lock
+	 * from before this receiver was listening, would otherwise never be made.
+	 */
+	private markLockedReceipts(): void {
+		for (const entry of this.deps.requests.received()) {
+			this.markIfLocked(entry);
+		}
+	}
+
+	/**
+	 * The same check for the record a revealed receipt just created (issue
+	 * #1899). A zero-conf open or splice can lock before the payer's witness
+	 * is in, so the lock event has already fired by the time the record
+	 * exists and will not fire again.
+	 */
+	private markLockedReceipt(receiptHashHex: string): void {
+		const entry = this.deps.requests.receivedFor(receiptHashHex);
+		if (entry) this.markIfLocked(entry);
+	}
+
+	/**
+	 * A record with no channel, one backfilled from a tombstone, cannot be
+	 * checked here; the node's lock event still marks it by funding.
+	 */
+	private markIfLocked(entry: IDfReceivedRecord): void {
+		if (!this.deps.hasLockedFunding) return;
+		if (entry.status !== 'PAID' || entry.lockedAt !== undefined) return;
+		if (!entry.channelId) return;
+		if (this.deps.hasLockedFunding(entry.channelId, entry.fundingTxid)) {
+			this.deps.requests.markReceivedLocked(entry.fundingTxid);
 		}
 	}
 
@@ -907,6 +948,7 @@ export class DirectFundingReceiver extends TypedEmitter<DirectFundingReceiverEve
 				error: `receipt not persisted: ${errorText(err)}`
 			});
 		}
+		this.markLockedReceipt(held.receiptHash);
 		const complete = final.tx.ins.every((i) => i.witness.length > 0);
 		const receipt = encodeDfReceipt({
 			offerId,
@@ -1929,6 +1971,7 @@ export class DirectFundingReceiver extends TypedEmitter<DirectFundingReceiverEve
 				error: `receipt not persisted: ${errorText(err)}`
 			});
 		}
+		this.markLockedReceipt(record.receiptHash);
 		const receipt = encodeDfReceipt({
 			offerId,
 			preimage: Buffer.from(record.preimageHex, 'hex'),
@@ -2516,6 +2559,7 @@ export class DirectFundingReceiver extends TypedEmitter<DirectFundingReceiverEve
 				error: `receipt not persisted: ${errorText(err)}`
 			});
 		}
+		this.markLockedReceipt(ctx.session.receiptHashHex);
 		// The complete transaction, when every witness is in: no chain round
 		// trip, and a payer holding it can rebroadcast alone. Omitted while the
 		// channel counterparty's own tx_signatures are still outstanding.

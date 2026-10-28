@@ -461,6 +461,31 @@ export class DirectFundingRequestStore {
 	}
 
 	/**
+	 * Mark the payments a locked funding carried (issue #1899): `lockedAt` is
+	 * set, once, on every PAID record for that funding (display txid) that has
+	 * none, and `updatedAt` moves with it, so retention runs from the lock.
+	 * `at` defaults to now. Returns whether it marked any. A mark whose write
+	 * fails is retried by the next write, and the receiver checks again
+	 * against the channel's own record of its locks when it starts.
+	 */
+	markReceivedLocked(fundingTxidHex: string, at?: number): boolean {
+		const now = this.now();
+		let marked = false;
+		for (const entry of this.receivedByHash.values()) {
+			if (entry.fundingTxid !== fundingTxidHex) continue;
+			if (entry.status !== 'PAID' || entry.lockedAt !== undefined) continue;
+			entry.lockedAt = at ?? now;
+			entry.updatedAt = now;
+			marked = true;
+		}
+		if (marked) {
+			this.receivedUnsaved = true;
+			this.persistReceived();
+		}
+		return marked;
+	}
+
+	/**
 	 * Funding attempts this request has spent, and the offer holding its one
 	 * session right now. A LAPSED marker answers as none: the session it
 	 * belonged to did not survive whatever ended it, and a crash must not lock
@@ -997,6 +1022,7 @@ function isWellFormedReceived(entry: unknown): entry is IDfReceivedRecord {
 		(r.amountSat === undefined || isPositiveDecimal(r.amountSat)) &&
 		(r.status === 'PAID' || r.status === 'REVERTED') &&
 		Number.isFinite(r.paidAt) &&
+		(r.lockedAt === undefined || Number.isFinite(r.lockedAt)) &&
 		Number.isFinite(r.updatedAt)
 	);
 }

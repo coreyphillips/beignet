@@ -854,6 +854,128 @@ describe('Direct funding: outstanding requests', () => {
 			);
 		});
 
+		// Issue #1899: the lock outlives the channel within the record's
+		// retention, so a client still counts the payment as locked.
+		it('stamps lockedAt once on the payment a locked funding carried, and keeps it across a restart', () => {
+			const h = harness();
+			const record = h.store.mint();
+			pay(h, record);
+			const paidAt = h.clock.now;
+			expect(h.store.markReceivedLocked('22'.repeat(32))).to.equal(false);
+			expect(h.store.receivedFor(record.receiptHash)).to.not.have.property(
+				'lockedAt'
+			);
+
+			h.clock.now += 1_000;
+			const lockedAt = h.clock.now;
+			expect(h.store.markReceivedLocked(FUNDING_TXID)).to.equal(true);
+			expect(h.store.receivedFor(record.receiptHash)).to.include({
+				status: 'PAID',
+				paidAt,
+				lockedAt,
+				updatedAt: lockedAt
+			});
+			// Written at once, not only with the next change.
+			expect(JSON.parse(h.wallet.get(DF_RECEIVED_STORAGE_KEY)!)[0]).to.include({
+				lockedAt,
+				updatedAt: lockedAt
+			});
+
+			// Once: a later lock event changes nothing and writes nothing.
+			h.clock.now += 1_000;
+			const written = h.wallet.get(DF_RECEIVED_STORAGE_KEY);
+			expect(h.store.markReceivedLocked(FUNDING_TXID)).to.equal(false);
+			expect(h.store.receivedFor(record.receiptHash)).to.include({
+				lockedAt,
+				updatedAt: lockedAt
+			});
+			expect(h.wallet.get(DF_RECEIVED_STORAGE_KEY)).to.equal(written);
+
+			const restarted = harness({}, { wallet: h.wallet, clock: h.clock });
+			restarted.store.restore();
+			expect(restarted.store.receivedFor(record.receiptHash)).to.include({
+				lockedAt,
+				updatedAt: lockedAt
+			});
+		});
+
+		it('takes the lock time it is given, and moves retention to now', () => {
+			const h = harness();
+			const record = h.store.mint();
+			pay(h, record);
+			h.clock.now += 5_000;
+			expect(
+				h.store.markReceivedLocked(FUNDING_TXID, h.clock.now - 2_000)
+			).to.equal(true);
+			expect(h.store.receivedFor(record.receiptHash)).to.include({
+				lockedAt: h.clock.now - 2_000,
+				updatedAt: h.clock.now
+			});
+			// Retention runs from the lock, as it does from a revert.
+			h.clock.now += DF_RECEIVED_RETENTION_MS - 1;
+			h.store.sweep();
+			expect(h.store.receivedFor(record.receiptHash)).to.not.equal(null);
+		});
+
+		it('never stamps a REVERTED payment, and keeps the stamp on one reverted after its lock', () => {
+			const reverted = harness();
+			const first = reverted.store.mint();
+			pay(reverted, first);
+			reverted.store.markReceivedReverted(FUNDING_TXID);
+			expect(reverted.store.markReceivedLocked(FUNDING_TXID)).to.equal(false);
+			expect(
+				reverted.store.receivedFor(first.receiptHash)
+			).to.not.have.property('lockedAt');
+
+			const locked = harness();
+			const second = locked.store.mint();
+			pay(locked, second);
+			locked.store.markReceivedLocked(FUNDING_TXID);
+			const lockedAt = locked.clock.now;
+			locked.clock.now += 1_000;
+			locked.store.markReceivedReverted(FUNDING_TXID);
+			expect(locked.store.receivedFor(second.receiptHash)).to.include({
+				status: 'REVERTED',
+				lockedAt
+			});
+		});
+
+		it('lands a lock stamp whose write failed with the next write', () => {
+			const h = harness();
+			const record = h.store.mint();
+			pay(h, record);
+			const disk = failReceivedWrites(h);
+			expect(h.store.markReceivedLocked(FUNDING_TXID)).to.equal(true);
+			disk.heal();
+			h.store.mint();
+			const restarted = harness({}, { wallet: h.wallet, clock: h.clock });
+			restarted.store.restore();
+			expect(
+				restarted.store.receivedFor(record.receiptHash)?.lockedAt
+			).to.equal(h.clock.now);
+		});
+
+		it('restores a row with a lockedAt, and drops one whose lockedAt is not a number', () => {
+			const h = harness();
+			const record = h.store.mint();
+			pay(h, record);
+			const good = {
+				...JSON.parse(h.wallet.get(DF_RECEIVED_STORAGE_KEY)!)[0],
+				lockedAt: h.clock.now
+			};
+			h.wallet.set(
+				DF_RECEIVED_STORAGE_KEY,
+				JSON.stringify([
+					good,
+					{ ...good, receiptHash: '55'.repeat(32), lockedAt: '1700000000000' },
+					{ ...good, receiptHash: '66'.repeat(32), lockedAt: null }
+				])
+			);
+			const restarted = harness({}, { wallet: h.wallet, clock: h.clock });
+			restarted.store.restore();
+			expect(restarted.store.received()).to.deep.equal([good]);
+		});
+
 		it('drops a restored row that did not come back whole', () => {
 			const h = harness();
 			const record = h.store.mint();

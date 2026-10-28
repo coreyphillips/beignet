@@ -438,6 +438,15 @@ export interface IDfReceiverDeps {
 	 * for good. Optional.
 	 */
 	hasRevertedSplice?(channelIdHex: string, spliceTxid: string): boolean;
+	/**
+	 * Whether the channel has recorded a lock of this funding (display txid)
+	 * in its lockedFundingTxids (issue #1899). What a receiver checks a
+	 * received payment against when the record is created and when it starts:
+	 * a zero-conf lock can land before the receipt is revealed and the record
+	 * exists, and a mark that did not reach storage would otherwise never be
+	 * made. Optional; without it only the node's lock events set lockedAt.
+	 */
+	hasLockedFunding?(channelIdHex: string, fundingTxid: string): boolean;
 	now?(): number;
 	/** Structured-log sink, the same one 4B's lanes take. */
 	log?: DfTransportLog;

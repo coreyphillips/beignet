@@ -833,6 +833,16 @@ export class FakeDfNode implements IDfReceiverDeps {
 		return this.revertedSplices.has(`${channelIdHex}:${spliceTxid}`);
 	}
 
+	/**
+	 * `channelId:fundingTxid` (display order) of every funding the channels
+	 * have recorded as locked (issue #1899).
+	 */
+	lockedFundings = new Set<string>();
+
+	hasLockedFunding(channelIdHex: string, fundingTxid: string): boolean {
+		return this.lockedFundings.has(`${channelIdHex}:${fundingTxid}`);
+	}
+
 	// ─── driving the negotiation ───
 
 	/**

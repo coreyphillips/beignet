@@ -310,6 +310,42 @@ describe('Issue #357: splice confirmation re-drives a FORCE_CLOSED close', funct
 		fx.destroy();
 	});
 
+	// Issue #1899: a force close that adopts a confirmed splice moves the
+	// channel onto it, but no splice_locked ever crossed, so nothing locked.
+	it('the adoption records no lock of the splice; the open stays the only locked funding', async () => {
+		const fx = await setup(3576);
+		const channel = fx.alice.getChannelManager().getChannel(fx.channelId)!;
+		const open = Buffer.from(channel.getFullState().fundingTxid!);
+		expect(
+			channel.getFullState().lockedFundingTxids!.map((t) => t.toString('hex'))
+		).to.deep.equal([open.toString('hex')]);
+		fx.alice.forceCloseChannel(fx.channelId, destScript(fx.alice));
+		const { spliceTxid, displayHex } = graftSpliceRecord(
+			fx.alice,
+			fx.channelId
+		);
+
+		fx.alice
+			.getChainWatcher()!
+			.emit('funding:confirmed', fx.channelId, displayHex);
+		await tick();
+
+		const state = channel.getFullState();
+		expect(state.fundingTxid!.equals(spliceTxid), 'adopted').to.equal(true);
+		expect(channel.getState()).to.equal(ChannelState.FORCE_CLOSED);
+		expect(
+			state.lockedFundingTxids!.map((t) => t.toString('hex'))
+		).to.deep.equal([open.toString('hex')]);
+		expect(channel.hasLockedFunding(displayHex)).to.equal(false);
+		const listed = fx.alice
+			.listChannels()
+			.find((c) => c.channelId.equals(fx.channelId))!;
+		expect(listed.lockedFundingTxids).to.deep.equal([
+			Buffer.from(open).reverse().toString('hex')
+		]);
+		fx.destroy();
+	});
+
 	it('marks the record confirmed with no live session, so a manual rebroadcast can adopt too', async () => {
 		const fx = await setup(3581);
 		fx.alice.forceCloseChannel(fx.channelId, destScript(fx.alice));

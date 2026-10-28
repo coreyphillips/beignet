@@ -2997,6 +2997,12 @@ export class Channel {
 
 		if (this._state.remoteChannelReady) {
 			this._state.state = ChannelState.NORMAL;
+			// Both channel_ready messages have crossed: the open's funding is
+			// locked (issue #1899). Recorded here and in handleChannelReady,
+			// the only two places both flags become true, so every path to an
+			// open lock (depth, zero-conf, a v2 early ready, a reestablish
+			// flush) records it once, in the persist the transition gets.
+			this._recordFundingLock(this._state.fundingTxid);
 			// The peer's channel_ready means it holds the complete funding tx,
 			// so the v2 opening record has nothing left to resume or retransmit
 			// (the funding tx itself stays in pendingFundingTxHex until depth).
@@ -3037,6 +3043,20 @@ export class Channel {
 			this._state.remoteChannelReady ||
 			this._v2EarlyChannelReady !== null
 		);
+	}
+
+	/**
+	 * Append a funding this channel has locked to lockedFundingTxids (issue
+	 * #1899), once. A lock is retransmitted on every reconnect and a
+	 * restored row can be backfilled with the same funding, so a txid
+	 * already in the list is not added again. Callers persist through the
+	 * transition they record, never a write of their own.
+	 */
+	private _recordFundingLock(txid: Buffer | null | undefined): void {
+		if (!txid) return;
+		const locked = this._state.lockedFundingTxids ?? [];
+		if (locked.some((t) => t.equals(txid))) return;
+		this._state.lockedFundingTxids = [...locked, Buffer.from(txid)];
 	}
 
 	/**
@@ -3244,6 +3264,8 @@ export class Channel {
 
 		if (this._state.localChannelReady) {
 			this._state.state = ChannelState.NORMAL;
+			// The open's lock, as in fundingConfirmed (issue #1899).
+			this._recordFundingLock(this._state.fundingTxid);
 			// Mirror of fundingConfirmed: the peer's channel_ready means the v2
 			// opening record has nothing left to resume or retransmit, and no
 			// other attempt of this open can confirm any more.
@@ -11118,6 +11140,61 @@ export class Channel {
 	}
 
 	/**
+	 * Seed lockedFundingTxids on a row written before the field existed, from
+	 * what the row itself proves (issue #1899). Returns whether it seeded
+	 * anything; the next persist writes it, and until then every load seeds
+	 * the same list again.
+	 *
+	 * Two facts prove a lock. Both channel_ready flags set means the open
+	 * locked, and its funding is the first one the channel ran on. A channel
+	 * whose effective state is NORMAL, SPLICING, SHUTTING_DOWN or
+	 * NEGOTIATING_CLOSING got there through a lock of the funding it runs on
+	 * now: each of the last three is reached only through NORMAL, and
+	 * fundingTxid stays the old, locked funding for the whole pending-lock
+	 * window of a splice, moving only when completeSplice adopts it.
+	 *
+	 * Nothing else is guessed. A splice funding that locked and was retired
+	 * by a later splice, the current funding of a closed channel, and the
+	 * open's funding of a row spliced before previousFundingTxids existed all
+	 * stay unknown: a closed channel may have adopted its funding by force
+	 * close, which locks nothing. Rows that already carry the field are left
+	 * alone.
+	 */
+	backfillLockedFundingTxids(): boolean {
+		const s = this._state;
+		if (s.lockedFundingTxids !== undefined) return false;
+		if (s.localChannelReady && s.remoteChannelReady) {
+			// The open's funding is the first one the channel ran on. A row
+			// spliced before previousFundingTxids existed (0.31) has no history
+			// to name it, and its fundingTxid may be a splice a force close
+			// adopted with no lock. Every adoption sets hasBeenSpliced (since
+			// #1020) and leaves spliceFundingTxid equal to fundingTxid, so a
+			// row showing either seeds nothing from this rule.
+			const adopted =
+				s.hasBeenSpliced === true ||
+				(!!s.spliceFundingTxid &&
+					!!s.fundingTxid &&
+					s.spliceFundingTxid.equals(s.fundingTxid));
+			this._recordFundingLock(
+				s.previousFundingTxids?.[0] ?? (adopted ? null : s.fundingTxid)
+			);
+		}
+		const st =
+			s.state === ChannelState.AWAITING_REESTABLISH
+				? s.preReestablishState
+				: s.state;
+		if (
+			st === ChannelState.NORMAL ||
+			st === ChannelState.SPLICING ||
+			st === ChannelState.SHUTTING_DOWN ||
+			st === ChannelState.NEGOTIATING_CLOSING
+		) {
+			this._recordFundingLock(s.fundingTxid);
+		}
+		return s.lockedFundingTxids !== undefined;
+	}
+
+	/**
 	 * Refuse to resume a restored v2 open whose commitment #0 could never be
 	 * broadcast, on load. Returns whether it tore one down (issue #387).
 	 *
@@ -14218,6 +14295,18 @@ export class Channel {
 	}
 
 	/**
+	 * Whether this channel has recorded a lock of the named funding (display
+	 * txid) in lockedFundingTxids (issue #1899). False for a funding the record
+	 * does not know, which is not proof that it never locked.
+	 */
+	hasLockedFunding(fundingTxidDisplayHex: string): boolean {
+		const internal = Buffer.from(fundingTxidDisplayHex, 'hex').reverse();
+		return (this._state.lockedFundingTxids ?? []).some((t) =>
+			t.equals(internal)
+		);
+	}
+
+	/**
 	 * Record that an input of the in-flight splice was spent elsewhere and the
 	 * spend confirmed (issue #760). Only while the splice is in flight and the
 	 * chain has not taken it: a confirmed splice cannot have a confirmed
@@ -15758,6 +15847,13 @@ export class Channel {
 		const adopted = this._computeSpliceAdoption();
 		if (!adopted) return;
 		Object.assign(this._state, adopted);
+		// The splice's funding is locked (issue #1899). Both callers,
+		// handleSpliceLocked and sendSpliceLocked, get here only once
+		// splice_locked has crossed in both directions, and both persist the
+		// step. Recorded here rather than in _computeSpliceAdoption, which a
+		// force close also runs to adopt a confirmed splice no splice_locked
+		// ever locked. An adoption that moved no funding records nothing.
+		this._recordFundingLock(adopted.fundingTxid);
 		this._finishSpliceRuntime();
 	}
 
