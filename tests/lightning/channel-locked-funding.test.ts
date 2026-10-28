@@ -745,6 +745,74 @@ describe('Locked fundings on the node (issue #1899)', function () {
 	describe('the direct-funding received record', function () {
 		const OFFER = 'a1'.repeat(16);
 
+		/** A PAID receipt bound to `channelId` and its funding, as the receiver leaves one. */
+		function paidAgainst(
+			requests: NonNullable<
+				ReturnType<LightningNode['getDirectFundingRequests']>
+			>,
+			channelId: Buffer,
+			fundingTxid: Buffer
+		): string {
+			const request = requests.mint();
+			requests.beginAttempt(request.receiptHash, OFFER, Date.now() + 60_000);
+			requests.markAttemptFunding(
+				request.receiptHash,
+				OFFER,
+				{
+					outpoint: `${display(fundingTxid)}:0`,
+					channelId: channelId.toString('hex'),
+					splice: false,
+					contentHash: 'ef'.repeat(32),
+					payerEphemeralKey: `02${'ab'.repeat(32)}`,
+					fundingTxid: display(fundingTxid)
+				},
+				Date.now() + 60_000
+			);
+			requests.markReceiptRevealed(request.receiptHash, {
+				offerIdHex: OFFER,
+				fundingTxidHex: display(fundingTxid)
+			});
+			return request.receiptHash;
+		}
+
+		it('an open that locked and then lost its funding takes its payment back (issue #1909)', async function () {
+			// A zero-conf open locks before its funding confirms; a payer that
+			// double-spends the funding leaves the node to void the channel.
+			const alice = node(19001, { directFunding: {} });
+			const bob = node(19002);
+			const requests = alice.getDirectFundingRequests()!;
+			const { channelId, fundingTxid } = fund(alice, bob);
+			const receipt = paidAgainst(requests, channelId, fundingTxid);
+			alice.handleFundingConfirmed(channelId);
+			bob.handleFundingConfirmed(channelId);
+			await tick();
+			expect(requests.receivedFor(receipt)!.lockedAt).to.be.a('number');
+
+			const voided = (
+				alice as unknown as {
+					voidMissingFundingChannel(id: Buffer, txid: string): boolean;
+				}
+			).voidMissingFundingChannel(channelId, display(fundingTxid));
+			expect(voided).to.equal(true);
+			const record = requests.receivedFor(receipt)!;
+			expect(record.status).to.equal('REVERTED');
+			expect(record.lockedAt, 'the lock it saw stays on record').to.be.a(
+				'number'
+			);
+		});
+
+		it('any other void takes back the payments recorded against that channel only (issue #1909)', function () {
+			const alice = node(19003, { directFunding: {} });
+			const requests = alice.getDirectFundingRequests()!;
+			const voidedId = crypto.randomBytes(32);
+			const otherId = crypto.randomBytes(32);
+			const gone = paidAgainst(requests, voidedId, crypto.randomBytes(32));
+			const kept = paidAgainst(requests, otherId, crypto.randomBytes(32));
+			alice.emit('channel:voided', { channelId: voidedId });
+			expect(requests.receivedFor(gone)!.status).to.equal('REVERTED');
+			expect(requests.receivedFor(kept)!.status).to.equal('PAID');
+		});
+
 		it('a lock event stamps lockedAt on the payment its funding carried', async function () {
 			const alice = node(18995, { directFunding: {} });
 			const bob = node(18996);
