@@ -460,6 +460,35 @@ describe("Issue #1901: the offered-HTLC scan ignores a closed channel's stale wr
 	});
 });
 
+describe('An unbroadcastable v2 open that errors is voided with its retained funding tx', function () {
+	it('hands the void the funding txid in display order, so the retained tx is found and removed', () => {
+		const alice = createNode(81);
+		const bob = createNode(82);
+		connectNodes(alice, bob);
+		const channelId = openReadyChannel(alice, bob);
+		const chan = (alice as any).channelManager.getChannel(channelId);
+		const st = writableState(chan);
+		// The diverged-RBF terminal: a v2 attempt the peer can never
+		// broadcast, on a channel this process opened (not restored).
+		st.v2InFlight = {} as any;
+		chan.isV2AttemptBroadcastable = (): boolean => false;
+		expect(chan.markErrored()).to.equal(true);
+		// The retained funding tx is keyed by internal byte order.
+		const key = st.fundingTxid!.toString('hex');
+		const pending = (alice as any).pendingFundingTxs as Map<string, unknown>;
+		pending.set(key, { txHex: '00', phase: 'candidate' });
+
+		(alice as any).handleChannelErrored(channelId, 'test');
+
+		expect((alice as any).channelManager.getChannel(channelId)).to.not.be.ok;
+		expect(pending.has(key), 'the void retired the retained tx').to.equal(
+			false
+		);
+		alice.destroy();
+		bob.destroy();
+	});
+});
+
 /**
  * Issue #469: a channel restored from a Recovery Capsule carries a checkpoint
  * whose recency nothing has confirmed. Until a channel_reestablish does, this

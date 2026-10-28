@@ -7971,7 +7971,8 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	 * Void a channel whose funding tx vanished before confirming and cannot
 	 * (or can no longer) be rebroadcast: drop it from the manager, retire its
 	 * watch, its persisted state and any retained funding tx, and tell the
-	 * embedder via channel:voided.
+	 * embedder via channel:voided. `txid` is in display byte order; the
+	 * retained funding tx is keyed by the internal order it reverses to.
 	 */
 	private voidMissingFundingChannel(channelId: Buffer, txid: string): boolean {
 		const idHex = channelId.toString('hex');
@@ -29754,9 +29755,13 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			// keeps the pledges: a restart would restore the open and its
 			// inputs must still be reserved.
 			const pledges = channel.getReleasableV2PledgeOutpoints();
+			// Display byte order, as the funding-missing watch passes it:
+			// voidMissingFundingChannel reverses it into the internal-order
+			// key of the retained funding tx. Internal order here missed the
+			// key, so the void left this attempt's retained tx on disk.
 			const voided = this.voidMissingFundingChannel(
 				channelId,
-				state.fundingTxid.toString('hex')
+				Buffer.from(state.fundingTxid).reverse().toString('hex')
 			);
 			if (voided && pledges.length > 0) {
 				releaseInputPledgesBestEffort(this.fundingProvider, pledges);
