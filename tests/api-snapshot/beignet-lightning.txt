@@ -4486,6 +4486,21 @@ property liquidity.IPersistedHeldPart.inChannelIdHex: string
 property liquidity.IPersistedHeldPart.inHtlcId: string
 property liquidity.IPersistedHeldPart.incomingCltvExpiry: number
 property liquidity.IPersistedHeldPart.paymentHashHex: string
+interface liquidity.IPrimariesPolicy
+property liquidity.IPrimariesPolicy.fillThresholdSat: number | null
+property liquidity.IPrimariesPolicy.primaries: liquidity.IPrimary[]
+interface liquidity.IPrimariesStoreDeps
+property liquidity.IPrimariesStoreDeps.storage?: { saveWalletData(key: string, value: string): void; loadWalletData(key: string): string | null; }
+interface liquidity.IPrimary
+property liquidity.IPrimary.host?: string
+property liquidity.IPrimary.port?: number
+property liquidity.IPrimary.pubkey: string
+property liquidity.IPrimary.uri?: string
+interface liquidity.IPrimaryCandidate
+property liquidity.IPrimaryCandidate.balanceSat: number
+property liquidity.IPrimaryCandidate.belowThreshold: boolean
+property liquidity.IPrimaryCandidate.pubkey: string
+property liquidity.IPrimaryCandidate.rank: number
 const liquidity.JIT_INTERCEPT_SCID_BLOCK = 16777215
 class liquidity.JitReceiveError extends beignet#CodedError<liquidity.JitReceiveErrorCode>
 constructor liquidity.JitReceiveError(code: liquidity.JitReceiveErrorCode, message: string)
@@ -4522,6 +4537,26 @@ method liquidity.JitReceiveManager.scanExpiringHolds(): void
 method liquidity.JitReceiveManager.sweep(): void
 method liquidity.JitReceiveManager.tryHoldForSplice(outChannelId: Buffer, part: liquidity.IHeldJitPart): boolean
 method liquidity.JitReceiveManager.tryInterceptUnknownScid(scidHex: string, part: liquidity.IHeldJitPart): boolean
+const liquidity.MAX_PRIMARIES = 32
+const liquidity.PRIMARIES_STORAGE_KEY = "liquidity:primaries"
+class liquidity.PrimariesError extends beignet#CodedError<liquidity.PrimariesErrorCode>
+constructor liquidity.PrimariesError(code: liquidity.PrimariesErrorCode, message: string)
+enum liquidity.PrimariesErrorCode
+member liquidity.PrimariesErrorCode.DUPLICATE_PRIMARY = "DUPLICATE_PRIMARY"
+member liquidity.PrimariesErrorCode.INVALID_ORDER = "INVALID_ORDER"
+member liquidity.PrimariesErrorCode.INVALID_PRIMARY = "INVALID_PRIMARY"
+member liquidity.PrimariesErrorCode.INVALID_THRESHOLD = "INVALID_THRESHOLD"
+member liquidity.PrimariesErrorCode.PERSIST_FAILED = "PERSIST_FAILED"
+member liquidity.PrimariesErrorCode.TOO_MANY_PRIMARIES = "TOO_MANY_PRIMARIES"
+member liquidity.PrimariesErrorCode.UNKNOWN_PRIMARY = "UNKNOWN_PRIMARY"
+class liquidity.PrimariesStore
+constructor liquidity.PrimariesStore(deps: liquidity.IPrimariesStoreDeps)
+method liquidity.PrimariesStore.add(entry: unknown, rank?: number): liquidity.IPrimariesPolicy
+method liquidity.PrimariesStore.get(): liquidity.IPrimariesPolicy
+method liquidity.PrimariesStore.remove(pubkey: unknown): liquidity.IPrimariesPolicy
+method liquidity.PrimariesStore.reorder(pubkeys: unknown): liquidity.IPrimariesPolicy
+method liquidity.PrimariesStore.restore(): number
+method liquidity.PrimariesStore.setFillThreshold(value: unknown): liquidity.IPrimariesPolicy
 function liquidity.decodeJitAck(data: Buffer): liquidity.IJitReceiveAck
 function liquidity.decodeJitAuthorization(data: Buffer): liquidity.IJitReceiveAuthorization
 function liquidity.decodeJitQuote(data: Buffer): liquidity.IJitReceiveQuote
@@ -4532,6 +4567,9 @@ function liquidity.encodeJitQuote(q: liquidity.IJitReceiveQuote): Buffer
 function liquidity.encodeJitQuoteRequest(q: liquidity.IJitReceiveQuoteRequest): Buffer
 function liquidity.jitOpeningFeeMsat(totalMsat: bigint, quote: { flatFeeSat: bigint; feePpm: number; }): bigint
 function liquidity.mintInterceptScid(isTaken: (scidHex: string) => boolean, attempts?: number): Buffer | null
+function liquidity.normalizeFillThreshold(value: unknown): number | null
+function liquidity.normalizePrimary(entry: unknown): liquidity.IPrimary
+function liquidity.selectReceiveTargets(policy: Readonly<liquidity.IPrimariesPolicy>, balances: ReadonlyMap<string, number>): liquidity.IPrimaryCandidate[]
 namespace message
 const message.ALL_CHANNELS: Buffer
 const message.BEIGNET_CUSTOM_MAX_PAYLOAD: number

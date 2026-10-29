@@ -26,3 +26,19 @@ export type {
 	IPersistedHeldPart,
 	JitReceiveEvents
 } from './jit-receive';
+export {
+	MAX_PRIMARIES,
+	PRIMARIES_STORAGE_KEY,
+	PrimariesError,
+	PrimariesErrorCode,
+	PrimariesStore,
+	normalizeFillThreshold,
+	normalizePrimary,
+	selectReceiveTargets
+} from './primaries';
+export type {
+	IPrimariesPolicy,
+	IPrimariesStoreDeps,
+	IPrimary,
+	IPrimaryCandidate
+} from './primaries';
