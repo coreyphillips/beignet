@@ -1496,8 +1496,8 @@ npm run test:conformance
 # Interop tests against LND/CLN/Eclair (requires Docker)
 npm run test:interop
 
-# Lightning + CLI + interop
-npm run test:all
+# Lightning and CLI unit tests at once (builds first)
+npm test
 
 # A single module's tests
 npx mocha --exit -r ts-node/register 'tests/lightning/node.test.ts'

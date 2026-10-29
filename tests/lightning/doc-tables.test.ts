@@ -2,12 +2,13 @@
  * Issue #1687: the event and option tables in the READMEs are generated from
  * the typed maps and option interfaces, so they cannot drift from the code,
  * the Lightning README lists every namespace beignet/lightning exports, and
- * docs/README.md links every document in the repository.
+ * docs/README.md links every document in the repository. Whether each README
+ * table matches its interface is `npm run docs:check`, which docs.yml runs.
  */
 import { expect } from 'chai';
 import * as fs from 'fs';
 import * as path from 'path';
-import { DOC_TABLES, renderTable, withTable } from '../../scripts/doc-tables';
+import { DOC_TABLES, renderTable } from '../../scripts/doc-tables';
 import { getRelayedEvents } from '../../src/cli/daemon';
 
 const ROOT = path.join(__dirname, '../..');
@@ -37,16 +38,6 @@ function rows(table: string): string[][] {
 
 describe('Generated README tables (issue #1687)', function () {
 	this.timeout(60_000);
-
-	it('every README table matches its interface (npm run docs:tables)', () => {
-		for (const table of DOC_TABLES) {
-			const readme = read(table.readme);
-			expect(
-				withTable(readme, table, renderTable(table)),
-				`${table.readme} is stale: run npm run docs:tables`
-			).to.equal(readme);
-		}
-	});
 
 	it('every row has a description, so a new event or option needs a doc comment', () => {
 		for (const table of DOC_TABLES) {

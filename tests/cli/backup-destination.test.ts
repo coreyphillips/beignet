@@ -18,6 +18,7 @@ import { AddressInfo } from 'net';
 import { resolveBackupDestination } from '../../src/cli/backup-destination';
 import { backupMacPath } from '../../src/cli/backup-mac';
 import { IStartedDaemon, startDaemon } from '../../src/cli/daemon';
+import { assertDistCliFresh, DIST_CLI } from './helpers/dist-cli';
 
 const MNEMONIC =
 	'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about';
@@ -68,27 +69,17 @@ function header(file: string): string {
 
 const REPO = path.resolve(__dirname, '..', '..');
 
-/** Stdout of `beignet <args>` run from `cwd`: a full ts-node load of the CLI. */
+/** Stdout of `beignet <args>` run from `cwd`, a child of the built CLI. */
 function runCli(cwd: string, home: string, args: string[]): Promise<string> {
 	return new Promise<string>((resolve, reject) => {
-		const child = spawn(
-			process.execPath,
-			[
-				'-r',
-				require.resolve('ts-node/register'),
-				path.join(REPO, 'src', 'cli', 'cli.ts'),
-				...args
-			],
-			{
-				cwd,
-				env: {
-					...process.env,
-					HOME: home,
-					TS_NODE_PROJECT: path.join(REPO, 'tsconfig.json')
-				},
-				stdio: ['ignore', 'pipe', 'ignore']
-			}
-		);
+		const child = spawn(process.execPath, [DIST_CLI, ...args], {
+			cwd,
+			env: {
+				...process.env,
+				HOME: home
+			},
+			stdio: ['ignore', 'pipe', 'ignore']
+		});
 		let out = '';
 		child.stdout.on('data', (chunk: Buffer) => (out += chunk.toString()));
 		child.on('error', reject);
@@ -220,6 +211,9 @@ describe('Backup destination (issue #1230)', () => {
 		let port: number;
 		const origHome = process.env.HOME;
 
+		// For the `beignet backup` children below.
+		before(assertDistCliFresh);
+
 		before(async () => {
 			home = fs.realpathSync(
 				fs.mkdtempSync(path.join(os.tmpdir(), 'beignet-backup-route-'))
@@ -249,9 +243,10 @@ describe('Backup destination (issue #1230)', () => {
 		});
 
 		after(async () => {
-			await daemon.stop();
+			// Unset when assertDistCliFresh stopped the suite before the boot.
+			await daemon?.stop();
 			process.env.HOME = origHome;
-			fs.rmSync(home, { recursive: true, force: true });
+			if (home) fs.rmSync(home, { recursive: true, force: true });
 		});
 
 		it('refuses the symlinked live database, its sidecars and the config even with overwrite', async () => {

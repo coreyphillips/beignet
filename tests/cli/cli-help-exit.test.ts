@@ -11,18 +11,20 @@
 import { expect } from 'chai';
 import { spawn } from 'child_process';
 import * as path from 'path';
+import { assertDistCliFresh, DIST_CLI } from './helpers/dist-cli';
 
 describe('beignet --help', function () {
-	// ts-node has to load the CLI and everything it imports in the child.
+	// The child loads the built CLI and everything it imports.
 	this.timeout(120_000);
+
+	before(assertDistCliFresh);
 
 	it('prints the help text and exits', async function () {
 		const repoRoot = path.resolve(__dirname, '..', '..');
-		const child = spawn(
-			process.execPath,
-			['-r', 'ts-node/register', path.join('src', 'cli', 'cli.ts'), '--help'],
-			{ cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] }
-		);
+		const child = spawn(process.execPath, [DIST_CLI, '--help'], {
+			cwd: repoRoot,
+			stdio: ['ignore', 'pipe', 'pipe']
+		});
 
 		let stdout = '';
 		let stderr = '';

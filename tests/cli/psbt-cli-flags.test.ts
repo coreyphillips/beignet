@@ -3,6 +3,7 @@ import { spawn } from 'child_process';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
+import { assertDistCliFresh, DIST_CLI } from './helpers/dist-cli';
 
 const REPO_ROOT = path.resolve(__dirname, '..', '..');
 
@@ -38,14 +39,7 @@ http.request = (_options, callback) => {
 		const code = await new Promise<number | null>((resolve, reject) => {
 			const child = spawn(
 				process.execPath,
-				[
-					'-r',
-					preloadPath,
-					'-r',
-					'ts-node/register',
-					path.join('src', 'cli', 'cli.ts'),
-					...cliArgs
-				],
+				['-r', preloadPath, DIST_CLI, ...cliArgs],
 				{
 					cwd: REPO_ROOT,
 					env: {
@@ -70,6 +64,8 @@ http.request = (_options, callback) => {
 
 describe('CLI PSBT commands with trailing global flags', function () {
 	this.timeout(120_000);
+
+	before(assertDistCliFresh);
 
 	it('does not send an auth flag as the omitted build fee rate', async () => {
 		const body = await captureRequestBody([

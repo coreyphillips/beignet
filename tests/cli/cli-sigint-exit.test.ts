@@ -17,6 +17,7 @@ import * as net from 'net';
 import * as os from 'os';
 import * as path from 'path';
 import { Readable } from 'stream';
+import { assertDistCliFresh, DIST_CLI } from './helpers/dist-cli';
 
 const MNEMONIC =
 	'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about';
@@ -54,31 +55,29 @@ function spawnStart(
 	preloads: string[] = []
 ): ChildProcessByStdio<null, Readable, Readable> {
 	const repoRoot = path.resolve(__dirname, '..', '..');
-	const requires = ['ts-node/register', ...preloads].flatMap((m) => ['-r', m]);
-	return spawn(
-		process.execPath,
-		[...requires, path.join('src', 'cli', 'cli.ts'), 'start'],
-		{
-			cwd: repoRoot,
-			stdio: ['ignore', 'pipe', 'pipe'],
-			env: {
-				...process.env,
-				HOME: tmpDir,
-				BEIGNET_MNEMONIC: MNEMONIC,
-				BEIGNET_NETWORK: 'regtest',
-				BEIGNET_DATA_DIR: tmpDir,
-				BEIGNET_ELECTRUM_HOST: '127.0.0.1',
-				BEIGNET_ELECTRUM_PORT: '65529',
-				BEIGNET_ELECTRUM_TLS: 'false',
-				BEIGNET_DAEMON_PORT: String(daemonPort)
-			}
+	const requires = preloads.flatMap((m) => ['-r', m]);
+	return spawn(process.execPath, [...requires, DIST_CLI, 'start'], {
+		cwd: repoRoot,
+		stdio: ['ignore', 'pipe', 'pipe'],
+		env: {
+			...process.env,
+			HOME: tmpDir,
+			BEIGNET_MNEMONIC: MNEMONIC,
+			BEIGNET_NETWORK: 'regtest',
+			BEIGNET_DATA_DIR: tmpDir,
+			BEIGNET_ELECTRUM_HOST: '127.0.0.1',
+			BEIGNET_ELECTRUM_PORT: '65529',
+			BEIGNET_ELECTRUM_TLS: 'false',
+			BEIGNET_DAEMON_PORT: String(daemonPort)
 		}
-	);
+	});
 }
 
 describe('beignet start + SIGINT', function () {
-	// ts-node compiles the CLI in the child, then a full node boots.
+	// The child loads the built CLI, then a full node boots.
 	this.timeout(120_000);
+
+	before(assertDistCliFresh);
 
 	it('shuts down gracefully and exits 0', async function () {
 		const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'beignet-sigint-'));
