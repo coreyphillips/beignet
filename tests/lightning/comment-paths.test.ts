@@ -1,13 +1,13 @@
 /**
  * Issue #1688: a comment that cites a document or source file names one that
  * is in the repository, so a spec citation on a fund-critical invariant can
- * be followed. CI runs the same check as `npm run docs:paths`.
+ * be followed. The tree-wide check is `npm run docs:paths`, which docs.yml
+ * runs; these cases pin how a citation is found and resolved.
  */
 import { expect } from 'chai';
 import {
 	citationsIn,
 	commentsOf,
-	danglingCitations,
 	IRepositoryIndex,
 	resolves
 } from '../../scripts/comment-paths';
@@ -51,10 +51,6 @@ function dangling(comment: string, from = FROM): string[] {
 
 describe('Comment citations resolve (issue #1688)', function () {
 	this.timeout(60_000);
-
-	it('no comment in the repository cites a file that is not in it (npm run docs:paths)', () => {
-		expect(danglingCitations()).to.deep.equal([]);
-	});
 
 	it('a spec cited at a path that does not exist is dangling, even when a file of that name exists elsewhere', () => {
 		expect(

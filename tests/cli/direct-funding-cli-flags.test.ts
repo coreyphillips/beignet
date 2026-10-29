@@ -17,6 +17,7 @@ import * as os from 'os';
 import * as path from 'path';
 import { AddressInfo } from 'net';
 import { IStartedDaemon, startDaemon } from '../../src/cli/daemon';
+import { assertDistCliFresh, DIST_CLI } from './helpers/dist-cli';
 
 const MNEMONIC =
 	'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about';
@@ -31,15 +32,11 @@ interface ICliResult {
 
 function runCli(home: string, args: string[]): Promise<ICliResult> {
 	return new Promise((resolve, reject) => {
-		const child = spawn(
-			process.execPath,
-			['-r', 'ts-node/register', path.join('src', 'cli', 'cli.ts'), ...args],
-			{
-				cwd: REPO_ROOT,
-				env: { ...process.env, HOME: home },
-				stdio: ['ignore', 'pipe', 'pipe']
-			}
-		);
+		const child = spawn(process.execPath, [DIST_CLI, ...args], {
+			cwd: REPO_ROOT,
+			env: { ...process.env, HOME: home },
+			stdio: ['ignore', 'pipe', 'pipe']
+		});
 		let stdout = '';
 		child.stdout.on('data', (chunk: Buffer) => {
 			stdout += chunk.toString();
@@ -53,13 +50,15 @@ function runCli(home: string, args: string[]): Promise<ICliResult> {
 }
 
 describe('CLI direct funding with trailing local flags', function () {
-	// Each child loads the CLI through ts-node.
+	// Each child is a whole CLI process, spawned from the build.
 	this.timeout(120_000);
 
 	const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'beignet-df-cli-'));
 	const home = fs.mkdtempSync(path.join(os.tmpdir(), 'beignet-df-cli-home-'));
 	let daemon: IStartedDaemon;
 	let request: string;
+
+	before(assertDistCliFresh);
 
 	before(async () => {
 		daemon = await startDaemon({
@@ -84,7 +83,8 @@ describe('CLI direct funding with trailing local flags', function () {
 	});
 
 	after(async () => {
-		await daemon.stop();
+		// Unset when assertDistCliFresh stopped the suite before the boot.
+		await daemon?.stop();
 		fs.rmSync(dataDir, { recursive: true, force: true });
 		fs.rmSync(home, { recursive: true, force: true });
 	});
@@ -131,8 +131,8 @@ describe('CLI direct funding with trailing local flags', function () {
 	});
 
 	it('sends a receipt recovery with no amount when only the flag follows the request', async function () {
-		// Two CLI children in one cell, each a full ts-node load of the CLI, so
-		// twice the per-child budget (issue #947).
+		// Two CLI children in one cell, so twice the per-child budget (issue
+		// #947).
 		this.timeout(240_000);
 		// Issue #767 review: --recover-receipt is a boolean flag, so with the
 		// optional amount omitted it became pos[3], went out as amountSats: null,

@@ -9,6 +9,20 @@ on:
 permissions:
   contents: read
 
+# A new push to a pull request cancels that pull request's run in progress.
+# Every other event gets a group of its own (the run id), so master pushes
+# never wait on or cancel each other.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# c8 coverage summaries on master pushes and manual runs only. Coverage is
+# information, not a gate (.c8rc.json sets no threshold, and c8 exits with
+# mocha's code), so pull requests skip its cost. Used unquoted as a command
+# prefix, so it expands to nothing on a pull request.
+env:
+  C8: ${{ github.event_name != 'pull_request' && 'npx c8' || '' }}
+
 jobs:
   tests:
     name: Run unit tests
@@ -66,25 +80,17 @@ jobs:
       - name: Run network-switch test (isolated process)
         run: npx mocha --exit -r ts-node/register tests/electrum-switch-network.test.ts
 
-      # Also covered by the test:lightning glob below; a named step makes the
-      # conformance gate visible in CI output instead of incidental. It must
-      # run BEFORE test:lightning: a conformance failure inside that broader
-      # step would fail there first and skip a later named step.
+      # Also covered by the lightning shard jobs below; a named step makes the
+      # conformance gate visible in this job's output instead of incidental.
       - name: Run BOLT conformance vectors
         run: npm run test:conformance
 
-      # Parallel workers, one test file each, with ts-node in transpile-only mode
-      # (the "ts-node" key in tsconfig.json). Types are still gated: type-check.yml
-      # runs tsc over src AND tests on the same events, so the per-file
-      # LanguageService pass this step used to make was duplicated work.
-      # The eight in-process recovery kill matrices used to be covered here by
-      # falling inside the glob; they now run in the `chaos` job below, and the
-      # two file sets together are exactly the set this step used to cover.
-      # c8 adds a coverage summary of src to the end of the step. It is
-      # information, not a gate: .c8rc.json sets no threshold and c8 exits with
-      # mocha's code.
-      - name: Run lightning unit tests
-        run: npx c8 npm run test:lightning
+      # The rest of test:lightning runs in the `lightning` shard jobs, which
+      # need neither docker nor dist. The files left here need this job's
+      # bitcoind and Electrum; scripts/shard-tests.js lists them and runs them
+      # with the test:lightning flags.
+      - name: Run lightning tests that need the regtest stack
+        run: node scripts/shard-tests.js --regtest
 
       # test:sigkill and test:cli used to run here. They were 325s and 230s of a
       # 17m30s job that is the whole workflow's critical path, and neither needs
@@ -102,6 +108,43 @@ jobs:
       - name: Dump docker logs on failure
         if: failure()
         uses: jwalton/gh-docker-logs@2741064ab9d7af54b0b1ffb6076cf64c16f0220e # v2.2.2
+
+  # test:lightning, sharded. Mocha never splits a file across workers, so the
+  # slowest file is the floor of any one job. scripts/shard-tests.js fills the
+  # shards from scripts/test-durations.json and runs each with the
+  # test:lightning flags; --verify fails the job unless every test:lightning
+  # file is in exactly one shard or the regtest step above. The shard count is
+  # in both the matrix and SHARDS: change them together.
+  lightning:
+    name: Run lightning unit tests (${{ matrix.shard }} of 4)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
+    env:
+      SHARDS: 4
+
+    steps:
+      - name: Check out Git repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24.22.1
+          cache: 'npm'
+
+      - name: Install Node.js dependencies
+        run: npm ci
+
+      - name: Check every lightning file is in exactly one job
+        run: node scripts/shard-tests.js --shards $SHARDS --verify
+
+      - name: Run lightning unit tests
+        run: $C8 node scripts/shard-tests.js --shards $SHARDS --shard ${{ matrix.shard }}
 
   # Its own job rather than another step in `tests`: these eight in-process kill
   # matrices are the most expensive thing in the repo (~9 minutes for 30 tests,
@@ -191,6 +234,10 @@ jobs:
       - name: Install Node.js dependencies
         run: npm ci
 
-      # Under c8 for a coverage summary, as with the lightning step.
+      # The spawn tests run dist/cli/cli.js, and fail if it is missing or older
+      # than src.
+      - name: Build
+        run: npm run build
+
       - name: Run CLI unit tests
-        run: npx c8 npm run test:cli
+        run: $C8 npm run test:cli

@@ -8,11 +8,8 @@
  * how to send it. A config that already holds a token or named keys, or an
  * environment that supplies one, is left alone and nothing is printed.
  *
- * Spawns the real CLI with HOME redirected to a temporary directory, the way
- * tests/cli/secret-file-modes.test.ts does. The children run ts-node in
- * transpile-only mode: the CLI is type-checked by tsc:check already, and
- * type-checking its whole import graph again per spawn is what made a loaded
- * machine miss the deadline.
+ * Spawns the built CLI with HOME redirected to a temporary directory, the way
+ * tests/cli/secret-file-modes.test.ts does.
  */
 
 import { expect } from 'chai';
@@ -20,6 +17,7 @@ import { spawn } from 'child_process';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
+import { assertDistCliFresh, DIST_CLI } from './helpers/dist-cli';
 
 const MNEMONIC =
 	'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about';
@@ -42,21 +40,13 @@ function runInit(
 	return new Promise((resolve) => {
 		const child = spawn(
 			process.execPath,
-			[
-				'-r',
-				'ts-node/register',
-				path.join('src', 'cli', 'cli.ts'),
-				'init',
-				'--network',
-				'regtest'
-			],
+			[DIST_CLI, 'init', '--network', 'regtest'],
 			{
 				cwd: repoRoot,
 				env: {
 					...process.env,
 					...env,
-					HOME: home,
-					TS_NODE_TRANSPILE_ONLY: '1'
+					HOME: home
 				},
 				stdio: ['ignore', 'pipe', 'pipe']
 			}
@@ -92,13 +82,15 @@ function runInit(
 }
 
 describe('beignet init mints an API token (issue #1005)', function () {
-	// ts-node has to load the CLI and everything it imports in each child, and
-	// the first test spawns two.
+	// Each child loads the built CLI and everything it imports, and the first
+	// test spawns two.
 	this.timeout(2 * SPAWN_DEADLINE_MS + 30_000);
 	let home: string;
 	let configPath: string;
 	const readConfig = (): Record<string, unknown> =>
 		JSON.parse(fs.readFileSync(configPath, 'utf8')) as Record<string, unknown>;
+
+	before(assertDistCliFresh);
 
 	beforeEach(() => {
 		home = fs.mkdtempSync(path.join(os.tmpdir(), 'beignet-init-1005-'));

@@ -19,6 +19,7 @@ import * as os from 'os';
 import * as path from 'path';
 import { AddressInfo } from 'net';
 import { IStartedDaemon, startDaemon } from '../../src/cli/daemon';
+import { assertDistCliFresh, DIST_CLI } from './helpers/dist-cli';
 
 const MNEMONIC =
 	'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about';
@@ -32,15 +33,11 @@ function runCli(
 	args: string[]
 ): Promise<{ stdout: string; code: number | null }> {
 	return new Promise((resolve, reject) => {
-		const child = spawn(
-			process.execPath,
-			['-r', 'ts-node/register', path.join('src', 'cli', 'cli.ts'), ...args],
-			{
-				cwd: REPO_ROOT,
-				env: { ...process.env, HOME: home },
-				stdio: ['ignore', 'pipe', 'pipe']
-			}
-		);
+		const child = spawn(process.execPath, [DIST_CLI, ...args], {
+			cwd: REPO_ROOT,
+			env: { ...process.env, HOME: home },
+			stdio: ['ignore', 'pipe', 'pipe']
+		});
 		let stdout = '';
 		child.stdout.on('data', (chunk: Buffer) => {
 			stdout += chunk.toString();
@@ -59,7 +56,7 @@ interface ICliResult {
 }
 
 describe('CLI open-v2 lease flags', function () {
-	// Each child loads the CLI through ts-node.
+	// Each child is a whole CLI process, spawned from the build.
 	this.timeout(120_000);
 
 	const dataDir = fs.mkdtempSync(
@@ -67,6 +64,8 @@ describe('CLI open-v2 lease flags', function () {
 	);
 	const home = fs.mkdtempSync(path.join(os.tmpdir(), 'beignet-cli-home-'));
 	let daemon: IStartedDaemon;
+
+	before(assertDistCliFresh);
 
 	before(async () => {
 		daemon = await startDaemon({
@@ -90,7 +89,8 @@ describe('CLI open-v2 lease flags', function () {
 	});
 
 	after(async () => {
-		await daemon.stop();
+		// Unset when assertDistCliFresh stopped the suite before the boot.
+		await daemon?.stop();
 		fs.rmSync(dataDir, { recursive: true, force: true });
 		fs.rmSync(home, { recursive: true, force: true });
 	});

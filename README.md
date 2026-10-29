@@ -686,10 +686,11 @@ semicolon rule retained for JavaScript. Typed promise checks remain enabled for
 every TypeScript file.
 
 ```bash
-npm run test:local         # test:lightning + test:cli at once; no infrastructure needed
+npm test                   # same as test:local
+npm run test:local         # build, then test:lightning + test:cli at once; no infrastructure needed
 npm run coverage           # test:local under c8, with a coverage summary of src
 npm run test:lightning     # 9500+ Lightning unit tests (parallel), no infrastructure needed
-npm run test:cli           # 2200+ CLI + daemon unit tests (parallel), no infrastructure needed
+npm run test:cli           # 2400+ CLI + daemon unit tests (parallel), no infrastructure needed; run npm run build first
 npm run test:conformance   # 300+ official BOLT vector cases (subset of test:lightning)
 npm run test:chaos         # recovery kill matrices (parallel), split out of test:lightning
 npm run test:sigkill       # process-level SIGKILL chaos matrix (builds dist first)
@@ -698,10 +699,13 @@ npm run test:integration   # daemon/Electrum integration (needs an Electrum serv
 npm run test:interop       # 300+ cases vs LND/CLN/Eclair (needs Docker)
 npm run test:interop:ffor  # FFOR Variant D chain gates on regtest (needs only the bitcoind container)
 npm run test:interop:ffor-concurrent  # Concurrent receive process, durable boundary and current-chain qualification (bitcoind regtest)
-npm run test:all           # Lightning + CLI + interop (needs Docker + Electrum)
 ```
 
 Counts are floors, not snapshots, and this is the only place they are kept. Run the suites for exact numbers (`npx mocha --dry-run` with a suite's arguments counts without running).
+
+`test:cli` spawns the built `dist/cli/cli.js`, so its spawn tests fail with a
+message to run `npm run build` when `dist/` is missing or older than `src/`.
+`test:local` builds first.
 
 `test:local` is the fast inner loop. `test:lightning` and `test:cli` are
 independent processes and neither saturates the machine alone, so running them at
@@ -719,8 +723,8 @@ the same suite passes 30/30 on its own. Run it separately. See
 
 `npm run coverage` prints a line, branch and function summary for `src`, and
 writes per-file numbers to `coverage/coverage-summary.json` and per-line hits to
-`coverage/lcov.info`. CI prints a summary per suite at the end of its
-`test:lightning` and `test:cli` steps. The numbers are information, not a gate:
+`coverage/lcov.info`. On master pushes, CI prints a summary at the end of each
+lightning shard and of its `test:cli` step; pull request runs skip c8. The numbers are information, not a gate:
 no threshold is set, and nothing fails on a percentage. A file the run never
 loads counts as wholly uncovered. Two runs of the same tree can differ by a few
 covered lines, because tests with random keys reach different branches. c8 also
@@ -733,7 +737,6 @@ rather than on your change. Each script runs `npm run build` first:
 ```bash
 npm run test:wallet        # also test:transaction, test:electrum, test:storage,
                            # test:derivation, test:receive, test:boost
-npm test                   # everything: build, on-chain, Lightning, CLI, interop
 ```
 
 The on-chain files without a dedicated script (multisig, PSBT, watch-only,

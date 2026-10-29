@@ -1,5 +1,6 @@
 /**
- * Ordinary recovery regressions selected from the saved PR #1306 review.
+ * Shared harness for the reestablish-replay-order-review-*.test.ts files:
+ * ordinary recovery regressions selected from the saved PR #1306 review.
  *
  * Exercise honest traffic, connection cuts, persisted restarts, each
  * delivered prefix, splice batches, taproot, the FFOR hold and cooperative
@@ -22,29 +23,31 @@ import * as ecc from '@bitcoinerlab/secp256k1';
 import {
 	ChannelManager,
 	IChannelManagerConfig
-} from '../../src/lightning/channel/channel-manager';
-import { Channel } from '../../src/lightning/channel/channel';
+} from '../../../src/lightning/channel/channel-manager';
+import { Channel } from '../../../src/lightning/channel/channel';
 import {
 	ChannelState,
 	DEFAULT_CHANNEL_CONFIG,
 	isTaprootChannel,
 	receivedAddIrrevocablyCommitted
-} from '../../src/lightning/channel/types';
-import { ChannelActionType } from '../../src/lightning/channel/channel-actions';
-import { MessageType } from '../../src/lightning/message/types';
-import { FforState, IFforEpochRecord } from '../../src/lightning/ffor/types';
-import { IChannelBasepoints } from '../../src/lightning/keys/derivation';
-import { getPublicKey } from '../../src/lightning/crypto/ecdh';
+} from '../../../src/lightning/channel/types';
+import { ChannelActionType } from '../../../src/lightning/channel/channel-actions';
+import { MessageType } from '../../../src/lightning/message/types';
+import { IChannelBasepoints } from '../../../src/lightning/keys/derivation';
+import { getPublicKey } from '../../../src/lightning/crypto/ecdh';
 import {
 	serializeChannelState,
 	deserializeChannelState
-} from '../../src/lightning/storage/serialization';
-import { COMMIT_ALL, onPersist } from './helpers/channel-persistence';
+} from '../../../src/lightning/storage/serialization';
+import { COMMIT_ALL, onPersist } from './channel-persistence';
 
-const sha256 = (b: Buffer): Buffer =>
+export const sha256 = (b: Buffer): Buffer =>
 	crypto.createHash('sha256').update(b).digest();
 
-function makeConfig(name: string, taproot = false): IChannelManagerConfig {
+export function makeConfig(
+	name: string,
+	taproot = false
+): IChannelManagerConfig {
 	const seed = sha256(Buffer.from(`reest-adv-${name}`));
 	const k = (i: number): Buffer =>
 		sha256(Buffer.concat([seed, Buffer.from([i])]));
@@ -69,21 +72,21 @@ function makeConfig(name: string, taproot = false): IChannelManagerConfig {
 	};
 }
 
-const FUNDING_SATOSHIS = 1_000_000n;
-const CAPACITY_MSAT = FUNDING_SATOSHIS * 1000n;
+export const FUNDING_SATOSHIS = 1_000_000n;
+export const CAPACITY_MSAT = FUNDING_SATOSHIS * 1000n;
 /** What the setup payment moves to B so B can offer HTLCs of its own. */
-const B_FLOAT_MSAT = 300_000_000n;
+export const B_FLOAT_MSAT = 300_000_000n;
 
-type Side = 'A' | 'B';
-const other = (s: Side): Side => (s === 'A' ? 'B' : 'A');
-interface IQueued {
+export type Side = 'A' | 'B';
+export const other = (s: Side): Side => (s === 'A' ? 'B' : 'A');
+export interface IQueued {
 	from: string;
 	to: string;
 	type: number;
 	p: Buffer;
 }
 
-interface IWire {
+export interface IWire {
 	cutBefore: (type: MessageType, fromB?: boolean) => void;
 	/** Drop everything on the wire and everything sent from here on. */
 	cut: () => void;
@@ -117,7 +120,7 @@ interface IWire {
 	rows: Record<Side, string | null>;
 }
 
-interface IPair {
+export interface IPair {
 	tag: string;
 	A: () => ChannelManager;
 	B: () => ChannelManager;
@@ -133,7 +136,7 @@ interface IPair {
 	broadcasts: Record<Side, Buffer[]>;
 }
 
-function makePair(
+export function makePair(
 	tag: string,
 	taproot = false,
 	/** Dropped from the very first message, until the first reconnect. */
@@ -408,32 +411,36 @@ function makePair(
 	};
 }
 
-const ONION = Buffer.alloc(1366);
-const ADD = 'UPDATE_ADD_HTLC';
-const FULFILL = 'UPDATE_FULFILL_HTLC';
-const FAIL = 'UPDATE_FAIL_HTLC';
-const SIG = 'COMMITMENT_SIGNED';
-const RAA = 'REVOKE_AND_ACK';
+export const ONION = Buffer.alloc(1366);
+export const ADD = 'UPDATE_ADD_HTLC';
+export const FULFILL = 'UPDATE_FULFILL_HTLC';
+export const FAIL = 'UPDATE_FAIL_HTLC';
+export const SIG = 'COMMITMENT_SIGNED';
+export const RAA = 'REVOKE_AND_ACK';
 
-interface IPayment {
+export interface IPayment {
 	preimage: Buffer;
 	hash: Buffer;
 	amountMsat: bigint;
 }
 
-const mgr = (t: IPair, side: Side): ChannelManager =>
+export const mgr = (t: IPair, side: Side): ChannelManager =>
 	side === 'A' ? t.A() : t.B();
-const chanOf = (t: IPair, side: Side): Channel =>
+export const chanOf = (t: IPair, side: Side): Channel =>
 	side === 'A' ? t.aChannel() : t.bChannel();
 
-function offer(t: IPair, from: Side, amountMsat: bigint): IPayment {
+export function offer(t: IPair, from: Side, amountMsat: bigint): IPayment {
 	const preimage = t.nextPreimage();
 	const hash = sha256(preimage);
 	mgr(t, from).addHtlc(t.channelId, amountMsat, hash, 900, ONION);
 	return { preimage, hash, amountMsat };
 }
 
-function findReceivedId(t: IPair, receiver: Side, hash: Buffer): bigint | null {
+export function findReceivedId(
+	t: IPair,
+	receiver: Side,
+	hash: Buffer
+): bigint | null {
 	const entry = [...chanOf(t, receiver).getFullState().htlcs.entries()].find(
 		([key, h]) => key.startsWith('received-') && h.paymentHash.equals(hash)
 	);
@@ -441,7 +448,7 @@ function findReceivedId(t: IPair, receiver: Side, hash: Buffer): bigint | null {
 }
 
 /** The id of a received HTLC the node layer may settle (BOLT 2). */
-function findSettleableId(
+export function findSettleableId(
 	t: IPair,
 	receiver: Side,
 	hash: Buffer
@@ -455,13 +462,13 @@ function findSettleableId(
 	return entry ? entry[1].id : null;
 }
 
-function receivedId(t: IPair, receiver: Side, p: IPayment): bigint {
+export function receivedId(t: IPair, receiver: Side, p: IPayment): bigint {
 	const id = findReceivedId(t, receiver, p.hash);
 	expect(id, `${receiver} holds the HTLC`).to.not.equal(null);
 	return id!;
 }
 
-function settle(t: IPair, receiver: Side, p: IPayment): void {
+export function settle(t: IPair, receiver: Side, p: IPayment): void {
 	mgr(t, receiver).fulfillHtlc(
 		t.channelId,
 		receivedId(t, receiver, p),
@@ -469,7 +476,7 @@ function settle(t: IPair, receiver: Side, p: IPayment): void {
 	);
 }
 
-function makeFundedPair(tag: string, taproot = false): IPair {
+export function makeFundedPair(tag: string, taproot = false): IPair {
 	const t = makePair(tag, taproot);
 	const float = offer(t, 'A', B_FLOAT_MSAT);
 	settle(t, 'B', float);
@@ -479,7 +486,7 @@ function makeFundedPair(tag: string, taproot = false): IPair {
 	return t;
 }
 
-function queueOf(c: Channel): { types: string[]; signed: number } {
+export function queueOf(c: Channel): { types: string[]; signed: number } {
 	const s = c.getFullState();
 	return {
 		types: s.pendingLocalUpdates.map((u) => MessageType[u.type]),
@@ -487,7 +494,7 @@ function queueOf(c: Channel): { types: string[]; signed: number } {
 	};
 }
 
-function expectLevel(t: IPair): void {
+export function expectLevel(t: IPair): void {
 	expect(t.errors, t.errors.join('; ')).to.have.length(0);
 	const a = t.aChannel();
 	const b = t.bChannel();
@@ -517,7 +524,7 @@ function expectLevel(t: IPair): void {
 	expect(b.getBalances().localMsat).to.equal(a.getBalances().remoteMsat);
 }
 
-function expectStillUsable(t: IPair): void {
+export function expectStillUsable(t: IPair): void {
 	const aBefore = t.aChannel().getBalances().localMsat;
 	const bBefore = t.bChannel().getBalances().localMsat;
 	const ab = offer(t, 'A', 3_000_000n);
@@ -533,7 +540,7 @@ function expectStillUsable(t: IPair): void {
 
 // ─────────────────────────── flow driver ───────────────────────────
 
-function rngOf(seed: number): () => number {
+export function rngOf(seed: number): () => number {
 	let a = (seed * 0x9e3779b1 + 0x85ebca6b) >>> 0;
 	return (): number => {
 		a = (a + 0x6d2b79f5) >>> 0;
@@ -544,18 +551,18 @@ function rngOf(seed: number): () => number {
 	};
 }
 
-interface IFlowPayment extends IPayment {
+export interface IFlowPayment extends IPayment {
 	from: Side;
 	outcome: 'open' | 'fulfilled' | 'failed';
 }
-type ResolveKind = 'fulfil' | 'fail' | 'malformed';
+export type ResolveKind = 'fulfil' | 'fail' | 'malformed';
 
 /**
  * Traffic as an honest node layer drives it: a received HTLC is settled only
  * once it is irrevocably committed, a refused operation leaves no trace, and
  * finish() demands full convergence.
  */
-interface IDriver {
+export interface IDriver {
 	t: IPair;
 	payments: IFlowPayment[];
 	script: string[];
@@ -569,7 +576,7 @@ interface IDriver {
 	finish: () => void;
 }
 
-function makeDriver(pair: IPair, script: string[] = []): IDriver {
+export function makeDriver(pair: IPair, script: string[] = []): IDriver {
 	const payments: IFlowPayment[] = [];
 	const add = (side: Side, amountMsat: bigint): IFlowPayment | null => {
 		const preimage = pair.nextPreimage();
@@ -689,7 +696,7 @@ function makeDriver(pair: IPair, script: string[] = []): IDriver {
 }
 
 /** What a reconnect is about to face, read after both sides disconnected. */
-function classify(t: IPair): { retransmit: boolean; affected: boolean } {
+export function classify(t: IPair): { retransmit: boolean; affected: boolean } {
 	let retransmit = false;
 	let affected = false;
 	for (const side of ['A', 'B'] as Side[]) {
@@ -715,7 +722,7 @@ function classify(t: IPair): { retransmit: boolean; affected: boolean } {
 
 // ─────────────────────────── seeded flows ───────────────────────────
 
-interface IFlowResult {
+export interface IFlowResult {
 	seed: number;
 	failure: string | null;
 	/** Some reconnect had a side retransmit a signature with later updates. */
@@ -727,14 +734,14 @@ interface IFlowResult {
 	sent: string[];
 }
 
-interface IFlowOpts {
+export interface IFlowOpts {
 	taproot?: boolean;
 	/** Restart from the last persisted row instead of the live state. */
 	rowRestarts?: boolean;
 	fee?: boolean;
 }
 
-function runFlow(seed: number, opts: IFlowOpts = {}): IFlowResult {
+export function runFlow(seed: number, opts: IFlowOpts = {}): IFlowResult {
 	const rng = rngOf(seed);
 	const pick = (n: number): number => Math.floor(rng() * n);
 	const script: string[] = [];
@@ -847,20 +854,66 @@ function runFlow(seed: number, opts: IFlowOpts = {}): IFlowResult {
 	return result;
 }
 
-const DUMP = process.env.REPLAY_ORDER_DUMP;
-const dumped: Record<string, IFlowResult[]> = {};
-const prefixStats: Record<
-	string,
-	{ schedules: number; retransmits: number; affected: number; failures: number }
-> = {};
-const seedsOf = (name: string, fallback: number): number =>
+export interface IPrefixStats {
+	schedules: number;
+	retransmits: number;
+	affected: number;
+	failures: number;
+}
+
+export interface IDump {
+	dumped: Record<string, IFlowResult[]>;
+	prefixStats: Record<string, IPrefixStats>;
+}
+
+/**
+ * REPLAY_ORDER_DUMP=trace.json writes trace.<tag>.json, one per file: the
+ * files run in different workers, so one shared path would keep only the
+ * last file to finish.
+ */
+export const dumpPath = (base: string, tag: string): string =>
+	`${base.replace(/\.json$/, '')}.${tag}.json`;
+
+/** Call once at the top of a test file. */
+export function collectDump(tag: string): IDump {
+	const dump: IDump = { dumped: {}, prefixStats: {} };
+	after(function () {
+		const base = process.env.REPLAY_ORDER_DUMP;
+		if (base) {
+			fs.writeFileSync(
+				dumpPath(base, tag),
+				JSON.stringify({ ...dump.dumped, prefixStats: dump.prefixStats })
+			);
+		}
+	});
+	return dump;
+}
+
+export const seedsOf = (name: string, fallback: number): number =>
 	Number(process.env[name] ?? fallback);
 
-function runSeeds(
+/**
+ * Part `part` (1-based) of `parts` of the seeds `from` .. `from + total - 1`.
+ * The parts together cover every seed once, so REPLAY_ORDER_SEEDS still sets
+ * the total however many files share it.
+ */
+export function seedRange(
+	from: number,
+	total: number,
+	part: number,
+	parts: number
+): { from: number; count: number } {
+	const start = Math.floor((total * (part - 1)) / parts);
+	const end = Math.floor((total * part) / parts);
+	return { from: from + start, count: end - start };
+}
+
+export function runSeeds(
 	label: string,
 	from: number,
 	count: number,
-	opts: IFlowOpts
+	opts: IFlowOpts,
+	{ dumped }: IDump
 ): { failures: IFlowResult[]; affected: number; retransmits: number } {
 	const failures: IFlowResult[] = [];
 	let affected = 0;
@@ -875,7 +928,7 @@ function runSeeds(
 	return { failures, affected, retransmits };
 }
 
-const describeFailures = (failures: IFlowResult[]): string =>
+export const describeFailures = (failures: IFlowResult[]): string =>
 	failures
 		.slice(0, 6)
 		.map((f) => `seed ${f.seed}: ${f.failure}\n    ${f.script.join(' ')}`)
@@ -883,7 +936,7 @@ const describeFailures = (failures: IFlowResult[]): string =>
 
 // ─────────────────────── every delivered prefix ───────────────────────
 
-interface IShape {
+export interface IShape {
 	tag: string;
 	/** Committed before the round under test, with the wire delivering. */
 	setup: (d: IDriver) => void;
@@ -896,7 +949,7 @@ interface IShape {
  * next message from A" / "from B" up to `depth` steps that the wire allows,
  * the connection dying after it. Then one reconnect, and full convergence.
  */
-function everyPrefix(
+export function everyPrefix(
 	shape: IShape,
 	depth: number,
 	taproot = false
@@ -951,7 +1004,7 @@ function everyPrefix(
 	return { schedules, retransmits, affected, failures };
 }
 
-const SHAPES: IShape[] = [
+export const SHAPES: IShape[] = [
 	{
 		tag: 'add-add',
 		setup: (): void => undefined,
@@ -1035,9 +1088,33 @@ const SHAPES: IShape[] = [
 	}
 ];
 
+/**
+ * Section 2 is split across files by shape. Every shape must sit in exactly
+ * one file, or a shape added to SHAPES would run nowhere.
+ */
+const PREFIX_FILES: Record<string, string[]> = {
+	'prefix-1': ['add-add', 'fulfil-fulfil', 'fulfil-fail', 'malformed-add'],
+	'prefix-2': ['add-fulfil', 'fee-add', 'add-fee-add'],
+	'prefix-crossing': ['crossing']
+};
+
+export function shapesFor(file: string): IShape[] {
+	const placed = Object.values(PREFIX_FILES).flat();
+	const tags = SHAPES.map((s) => s.tag);
+	if (
+		placed.length !== tags.length ||
+		tags.some((tag) => !placed.includes(tag))
+	) {
+		throw new Error(
+			`PREFIX_FILES must place each of ${tags.join(', ')} exactly once`
+		);
+	}
+	return SHAPES.filter((s) => PREFIX_FILES[file].includes(s.tag));
+}
+
 // ─────────────────────────── splice helpers ───────────────────────────
 
-function makeSpliceInWallet(amountSats: bigint): {
+export function makeSpliceInWallet(amountSats: bigint): {
 	walletInput: {
 		prevTx: Buffer;
 		prevOutputIndex: number;
@@ -1090,7 +1167,7 @@ function makeSpliceInWallet(amountSats: bigint): {
 	};
 }
 
-function makePendingLockPair(tag: string): IPair {
+export function makePendingLockPair(tag: string): IPair {
 	const t = makeFundedPair(tag);
 	t.A().initiateQuiescence(t.channelId);
 	const wallet = makeSpliceInWallet(100_000n);
@@ -1102,470 +1179,6 @@ function makePendingLockPair(tag: string): IPair {
 	return t;
 }
 
-const BATCH = 'START_BATCH';
-const commitmentTraffic = (replay: string[]): string[] =>
+export const BATCH = 'START_BATCH';
+export const commitmentTraffic = (replay: string[]): string[] =>
 	replay.filter((m) => m !== 'TX_SIGNATURES' && m !== 'SPLICE_LOCKED');
-
-// ─────────────────────────────── tests ───────────────────────────────
-
-after(function () {
-	if (DUMP) {
-		fs.writeFileSync(DUMP, JSON.stringify({ ...dumped, prefixStats }));
-	}
-});
-
-describe('reestablish replay order: review recovery regressions', function () {
-	this.timeout(900_000);
-
-	if (process.env.REPLAY_ORDER_DEBUG) {
-		// REPLAY_ORDER_DEBUG=<seed> [REPLAY_ORDER_DEBUG_MODE=row|taproot]
-		// with --grep "debug one seed" prints one flow's script and outcome.
-		it('debug one seed', function () {
-			const mode = process.env.REPLAY_ORDER_DEBUG_MODE;
-			const r = runFlow(Number(process.env.REPLAY_ORDER_DEBUG), {
-				rowRestarts: mode === 'row',
-				taproot: mode === 'taproot',
-				...(mode === 'taproot' ? { fee: false } : {})
-			});
-			// eslint-disable-next-line no-console
-			console.log(r.failure, '\n', r.script.join(' '));
-		});
-	}
-
-	describe('1. seeded flows converge', function () {
-		it('random traffic, cuts, live restarts and partial replays', function () {
-			const n = seedsOf('REPLAY_ORDER_SEEDS', 120);
-			const r = runSeeds('live', 1, n, {});
-			// The flows must actually reach the code under review.
-			expect(
-				r.affected,
-				'flows with a later update behind a signature'
-			).to.be.greaterThan(n / 20);
-			expect(r.failures.length, describeFailures(r.failures)).to.equal(0);
-		});
-
-		it('the same with restarts from the last persisted row', function () {
-			const n = seedsOf('REPLAY_ORDER_SEEDS', 120);
-			const r = runSeeds('row', 10_001, n, { rowRestarts: true });
-			expect(r.failures.length, describeFailures(r.failures)).to.equal(0);
-		});
-
-		it('option_taproot', function () {
-			const n = seedsOf('REPLAY_ORDER_TAPROOT_SEEDS', 20);
-			const r = runSeeds('taproot', 20_001, n, { taproot: true, fee: false });
-			expect(r.failures.length, describeFailures(r.failures)).to.equal(0);
-		});
-	});
-
-	describe('2. every delivered prefix of a round, peer revoke_and_ack delivered or lost', function () {
-		for (const shape of SHAPES) {
-			it(`${shape.tag}: every schedule up to six deliveries converges`, function () {
-				const r = everyPrefix(shape, 6);
-				prefixStats[shape.tag] = {
-					schedules: r.schedules,
-					retransmits: r.retransmits,
-					affected: r.affected,
-					failures: r.failures.length
-				};
-				expect(r.schedules).to.be.greaterThan(3);
-				expect(
-					r.retransmits,
-					'schedules with a retransmitted signature'
-				).to.be.greaterThan(0);
-				expect(r.failures, r.failures.join('\n')).to.have.length(0);
-			});
-		}
-	});
-});
-
-describe('reestablish replay order: review targeted regressions', function () {
-	this.timeout(300_000);
-
-	describe('5. splice pending-lock batch', function () {
-		const lockAndCheck = (t: IPair): void => {
-			t.A().sendSpliceLocked(t.channelId);
-			t.B().sendSpliceLocked(t.channelId);
-			expectLevel(t);
-			expectStillUsable(t);
-		};
-
-		it('fulfil, batch, fulfil from the non-initiator, cached batch', function () {
-			const t = makePendingLockPair('splice-fulfils');
-			const h1 = offer(t, 'A', 4_000_000n);
-			const h2 = offer(t, 'A', 5_000_000n);
-			expect(t.errors, t.errors.join('; ')).to.have.length(0);
-			t.wire.cut();
-			settle(t, 'B', h1);
-			settle(t, 'B', h2);
-			expect(queueOf(t.bChannel())).to.deep.equal({
-				types: [FULFILL, FULFILL],
-				signed: 1
-			});
-			t.wire.reconnect();
-			expect(t.errors, t.errors.join('; ')).to.have.length(0);
-			expect(commitmentTraffic(t.wire.replay.B)).to.deep.equal([
-				FULFILL,
-				BATCH,
-				SIG,
-				SIG,
-				FULFILL
-			]);
-			expect(t.fulfilled.A).to.have.length(2);
-			lockAndCheck(t);
-		});
-
-		it('cached batch, both sides crossing: add, batch, add each way', function () {
-			const t = makePendingLockPair('splice-crossing');
-			t.wire.cut();
-			const a1 = offer(t, 'A', 1_000_000n);
-			const a2 = offer(t, 'A', 2_000_000n);
-			const b1 = offer(t, 'B', 1_500_000n);
-			const b2 = offer(t, 'B', 2_500_000n);
-			t.wire.reconnect();
-			expect(t.errors, t.errors.join('; ')).to.have.length(0);
-			expect(commitmentTraffic(t.wire.replay.A)).to.deep.equal([
-				ADD,
-				BATCH,
-				SIG,
-				SIG,
-				ADD
-			]);
-			expect(commitmentTraffic(t.wire.replay.B)).to.deep.equal([
-				ADD,
-				BATCH,
-				SIG,
-				SIG,
-				ADD
-			]);
-			settle(t, 'B', a1);
-			settle(t, 'B', a2);
-			settle(t, 'A', b1);
-			settle(t, 'A', b2);
-			expect(t.errors, t.errors.join('; ')).to.have.length(0);
-			lockAndCheck(t);
-		});
-
-		it('a rebuilt batch with nothing behind it converges (same on master)', function () {
-			const t = makePendingLockPair('splice-rebuilt-control');
-			t.wire.cut();
-			const only = offer(t, 'A', 1_000_000n);
-			t.wire.restartA();
-			t.wire.reconnect();
-			expect(t.errors, t.errors.join('; ')).to.have.length(0);
-			expect(commitmentTraffic(t.wire.replay.A)).to.deep.equal([
-				ADD,
-				BATCH,
-				SIG,
-				SIG
-			]);
-			settle(t, 'B', only);
-			expect(t.errors, t.errors.join('; ')).to.have.length(0);
-			lockAndCheck(t);
-		});
-	});
-
-	describe('6. option_taproot: every delivered prefix', function () {
-		for (const shape of SHAPES.filter((s) =>
-			['add-add', 'fulfil-fail'].includes(s.tag)
-		)) {
-			it(`${shape.tag}: every schedule up to five deliveries converges`, function () {
-				const r = everyPrefix(shape, 5, true);
-				prefixStats[`taproot-${shape.tag}`] = {
-					schedules: r.schedules,
-					retransmits: r.retransmits,
-					affected: r.affected,
-					failures: r.failures.length
-				};
-				expect(r.retransmits).to.be.greaterThan(0);
-				expect(r.failures, r.failures.join('\n')).to.have.length(0);
-			});
-		}
-	});
-
-	describe('7. FFOR drain (section 7.5.5 hold)', function () {
-		const TIP = 795_000;
-		const AMOUNTS = [994_000n, 546_250n, 49_749_000n];
-		const record = (c: Channel): IFforEpochRecord => {
-			const f = c.getFforEpoch();
-			expect(f, 'epoch record').to.not.equal(null);
-			return f!;
-		};
-
-		/** As the author's helper: R's drain cut in two, none of it delivered. */
-		const drainInTwoHalves = (tag: string): IPair => {
-			const t = makePair(tag);
-			t.A().handleNewBlock(TIP);
-			t.B().handleNewBlock(TIP);
-			const started = t.B().initiateFforEpoch(t.channelId, {
-				voucherAmountsMsat: AMOUNTS,
-				minPaymentMsat: 400_000n,
-				settlementDeadline: 798_992,
-				voucherExpiry: 800_000,
-				feeBaseMsat: 1000,
-				feeProportionalMillionths: 5000
-			});
-			expect(started.ok, started.error).to.equal(true);
-			expect(record(t.aChannel()).state).to.equal(FforState.ACTIVE);
-			expect(record(t.bChannel()).state).to.equal(FforState.ACTIVE);
-
-			const r = t.bChannel();
-			const vouchers = [...r.getFullState().htlcs.values()]
-				.filter((h) => h.fforVoucher === true)
-				.sort((x, y) => Number(x.id - y.id));
-			expect(vouchers).to.have.length(AMOUNTS.length);
-			const last = vouchers[vouchers.length - 1];
-			const failHtlc = r.failHtlc.bind(r);
-			let holdBack = true;
-			r.failHtlc = ((id: bigint, ...rest: unknown[]) =>
-				holdBack && id === last.id
-					? [
-							{
-								type: ChannelActionType.ERROR,
-								message: 'held back by the test'
-							}
-					  ]
-					: (failHtlc as (...a: unknown[]) => unknown)(
-							id,
-							...rest
-					  )) as typeof r.failHtlc;
-
-			t.wire.dropWhen(
-				(from, type) =>
-					from === 'B' &&
-					(type === MessageType.UPDATE_FULFILL_HTLC ||
-						type === MessageType.UPDATE_FAIL_HTLC ||
-						type === MessageType.COMMITMENT_SIGNED)
-			);
-			expect(t.B().closeFforEpoch(t.channelId).ok).to.equal(true);
-			expect(record(t.aChannel()).state).to.equal(FforState.DRAINING);
-			expect(record(r).state).to.equal(FforState.DRAINING);
-			expect(queueOf(r)).to.deep.equal({ types: [FAIL, FAIL], signed: 2 });
-
-			holdBack = false;
-			const preimage = record(t.aChannel()).preimages[AMOUNTS.length - 1];
-			expect(t.B().fforAddPreimage(t.channelId, preimage).ok).to.equal(true);
-			expect(queueOf(r)).to.deep.equal({
-				types: [FAIL, FAIL, FULFILL],
-				signed: 2
-			});
-			t.wire.cut();
-			return t;
-		};
-		const forgetClose = (t: IPair): void => {
-			const s = record(t.aChannel());
-			s.state = FforState.ACTIVE;
-			s.closeWire = null;
-			s.closeAckWire = null;
-			s.settledBitmap = null;
-			s.closeProcessed = false;
-		};
-		const expectDrained = (t: IPair): void => {
-			expect(t.errors, t.errors.join('; ')).to.have.length(0);
-			expect(record(t.aChannel()).state).to.equal(FforState.CLOSED);
-			expect(record(t.bChannel()).state).to.equal(FforState.CLOSED);
-			expect(t.aChannel().getFullState().htlcs.size).to.equal(0);
-			expect(t.bChannel().getFullState().htlcs.size).to.equal(0);
-			expect(t.bChannel().getBalances().localMsat).to.equal(
-				AMOUNTS[AMOUNTS.length - 1]
-			);
-			expectLevel(t);
-		};
-		const drainOf = (t: IPair): string[] =>
-			t.wire.delivered.filter((m) =>
-				[`B:${FAIL}`, `B:${FULFILL}`, `B:${SIG}`, `B:${RAA}`].includes(m)
-			);
-
-		it('held, the connection dies before ff_close_ack returns, held again: the release keeps the order', function () {
-			const t = drainInTwoHalves('ffor-hold-twice');
-			forgetClose(t);
-			// ff_close reaches S, whose ack is lost with the connection.
-			t.wire.reconnect({ manual: true });
-			expect(
-				t.wire.replay.B.filter((m) => [FAIL, FULFILL, SIG, RAA].includes(m))
-			).to.deep.equal([]);
-			while (t.wire.step('B'));
-			expect(t.wire.pendingTypes('A')).to.include('FF_CLOSE_ACK');
-			t.wire.cut();
-			t.wire.manual(false);
-			t.wire.reconnect();
-			expect(t.errors, t.errors.join('; ')).to.have.length(0);
-			expect(drainOf(t).slice(0, 4)).to.deep.equal([
-				`B:${FAIL}`,
-				`B:${FAIL}`,
-				`B:${SIG}`,
-				`B:${FULFILL}`
-			]);
-			expectDrained(t);
-		});
-
-		it('held after R restarts from its row: the release keeps the order', function () {
-			const t = drainInTwoHalves('ffor-hold-restart');
-			forgetClose(t);
-			t.wire.restartB();
-			t.wire.reconnect();
-			expect(t.errors, t.errors.join('; ')).to.have.length(0);
-			expect(
-				t.wire.replay.B.filter((m) => [FAIL, FULFILL, SIG, RAA].includes(m))
-			).to.deep.equal([]);
-			expect(drainOf(t).slice(0, 4)).to.deep.equal([
-				`B:${FAIL}`,
-				`B:${FAIL}`,
-				`B:${SIG}`,
-				`B:${FULFILL}`
-			]);
-			expectDrained(t);
-		});
-
-		it('in DRAINING nothing but the drain can enter the queue, so no update outside the held set can overtake a held signature', function () {
-			const t = drainInTwoHalves('ffor-queue-types');
-			const r = t.bChannel();
-			const before = queueOf(r).types.length;
-			expect(
-				r
-					.addHtlc(1_000_000n, sha256(t.nextPreimage()), 900, ONION)
-					.some((a) => a.type === ChannelActionType.ERROR)
-			).to.equal(true);
-			const voucher = [...r.getFullState().htlcs.values()].find(
-				(h) => h.fforVoucher === true
-			);
-			if (voucher) {
-				expect(
-					r
-						.failMalformedHtlc(voucher.id, sha256(ONION), 0xc005)
-						.some((a) => a.type === ChannelActionType.ERROR)
-				).to.equal(true);
-			}
-			expect(queueOf(r).types.length).to.equal(before);
-			expect(
-				queueOf(r).types.every((m) => m === FAIL || m === FULFILL)
-			).to.equal(true);
-		});
-	});
-
-	describe('10. the signature that follows the retransmitted one', function () {
-		it('covers exactly the later updates, and the peer revoke_and_ack for it empties the queue', function () {
-			const t = makeFundedPair('next-sig');
-			const inbound = offer(t, 'B', 2_000_000n);
-			expectLevel(t);
-			t.wire.cut();
-			const covered = offer(t, 'A', 1_000_000n);
-			const later = offer(t, 'A', 1_500_000n);
-			settle(t, 'A', inbound);
-			expect(queueOf(t.aChannel())).to.deep.equal({
-				types: [ADD, ADD, FULFILL],
-				signed: 1
-			});
-
-			t.wire.reconnect({ manual: true });
-			expect(t.wire.replay.A).to.deep.equal([ADD, SIG, ADD, FULFILL]);
-			for (let i = 0; i < 4; i++) expect(t.wire.step('A')).to.equal(true);
-			// Nothing more leaves A until the peer revokes.
-			expect(t.wire.pendingTypes('A')).to.deep.equal([]);
-			expect(t.aChannel().needsCommitment()).to.equal(true);
-			expect(t.wire.pendingTypes('B')).to.deep.equal([RAA, SIG]);
-			expect(t.wire.step('B')).to.equal(true);
-			// The covered add is acknowledged; the next signature is out and
-			// covers the two later updates, no more and no less.
-			expect(queueOf(t.aChannel())).to.deep.equal({
-				types: [ADD, FULFILL],
-				signed: 2
-			});
-			expect(t.wire.pendingTypes('A')).to.deep.equal([SIG]);
-			expect(t.aChannel().needsCommitment()).to.equal(false);
-			t.wire.manual(false);
-			expectLevel(t);
-			expect(t.fulfilled.B).to.have.length(1);
-			settle(t, 'B', covered);
-			settle(t, 'B', later);
-			expectLevel(t);
-			expect(t.fulfilled.A).to.have.length(2);
-			expectStillUsable(t);
-		});
-	});
-
-	describe('8. shutdown: removals in flight beside a shutdown', function () {
-		const B_SCRIPT = Buffer.concat([
-			Buffer.from([0x00, 0x14]),
-			sha256(Buffer.from('shutdown-script-b')).subarray(0, 20)
-		]);
-		const A_SCRIPT = Buffer.concat([
-			Buffer.from([0x00, 0x14]),
-			sha256(Buffer.from('shutdown-script-a')).subarray(0, 20)
-		]);
-		const shuttingDown = (
-			tag: string,
-			htlcs: number
-		): { t: IPair; hs: IPayment[] } => {
-			const t = makeFundedPair(tag);
-			const hs: IPayment[] = [];
-			for (let i = 0; i < htlcs; i++) {
-				hs.push(offer(t, 'A', BigInt(4_000_000 + i * 1_000_000)));
-			}
-			expectLevel(t);
-			expect(t.B().initiateShutdown(t.channelId, B_SCRIPT).ok).to.equal(true);
-			expect(t.aChannel().getState()).to.equal(ChannelState.SHUTTING_DOWN);
-			expect(t.bChannel().getState()).to.equal(ChannelState.SHUTTING_DOWN);
-			return { t, hs };
-		};
-		/**
-		 * No transaction either side broadcasts may leave an HTLC's value out
-		 * of every output. The closing fee here is under 200 sat; the HTLCs
-		 * are 4000 sat and more.
-		 */
-		const expectNothingBurned = (t: IPair): void => {
-			expect(t.errors, t.errors.join('; ')).to.have.length(0);
-			expect(t.broadcasts.A.length + t.broadcasts.B.length).to.be.greaterThan(
-				0
-			);
-			expect(t.aChannel().getFullState().htlcs.size).to.equal(0);
-			expect(t.bChannel().getFullState().htlcs.size).to.equal(0);
-			for (const raw of [...t.broadcasts.A, ...t.broadcasts.B]) {
-				const tx = bitcoin.Transaction.fromBuffer(raw);
-				const paid = tx.outs.reduce((sum, o) => sum + BigInt(o.value), 0n);
-				expect(
-					FUNDING_SATOSHIS - paid < 1_000n,
-					`a broadcast transaction pays out ${paid} of ${FUNDING_SATOSHIS} sat: ${
-						FUNDING_SATOSHIS - paid
-					} sat left to fees while ${
-						t.bChannel().getFullState().htlcs.size
-					} fulfilled HTLC(s) sit unresolved`
-				).to.equal(true);
-			}
-		};
-
-		it('a lost fulfil and covering signature finish before the retransmitted shutdown closes', function () {
-			const { t, hs } = shuttingDown('shutdown-covered', 1);
-			t.wire.cut();
-			settle(t, 'B', hs[0]);
-			t.wire.reconnect();
-			expect(t.wire.replay.B).to.deep.equal([FULFILL, SIG, 'SHUTDOWN']);
-			// A holds the preimage either way.
-			expect(t.fulfilled.A).to.have.length(1);
-			expectNothingBurned(t);
-		});
-
-		it('two lost fulfils with a signature between them finish before cooperative close', function () {
-			const { t, hs } = shuttingDown('shutdown-later', 2);
-			t.wire.cut();
-			settle(t, 'B', hs[0]);
-			settle(t, 'B', hs[1]);
-			t.wire.reconnect();
-			expectNothingBurned(t);
-		});
-
-		it('a shutdown crossing an in-flight fulfil preserves its value in cooperative close', function () {
-			const t = makeFundedPair('shutdown-live-race');
-			const h = offer(t, 'A', 4_000_000n);
-			expectLevel(t);
-			t.wire.manual(true);
-			settle(t, 'B', h);
-			expect(t.wire.pendingTypes('B')).to.deep.equal([FULFILL, SIG]);
-			expect(t.A().initiateShutdown(t.channelId, A_SCRIPT).ok).to.equal(true);
-			// A's shutdown reaches B while B's fulfil is still on the wire.
-			expect(t.wire.step('A')).to.equal(true);
-			t.wire.manual(false);
-			expect(t.fulfilled.A).to.have.length(1);
-			expectNothingBurned(t);
-		});
-	});
-});

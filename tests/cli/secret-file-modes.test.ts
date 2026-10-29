@@ -38,6 +38,7 @@ import {
 import { restoreDbFile } from '../../src/cli/restore';
 import { backupMacPath, writeBackupMac } from '../../src/cli/backup-mac';
 import { SqliteStorage } from '../../src/lightning/storage/sqlite-storage';
+import { assertDistCliFresh, DIST_CLI } from './helpers/dist-cli';
 
 const MNEMONIC =
 	'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about';
@@ -98,6 +99,9 @@ describe('secret file modes (issue #1004)', function () {
 		let tmpHome: string;
 		let beignetDir: string;
 		let configPath: string;
+
+		// For the `beignet init` child below.
+		before(assertDistCliFresh);
 
 		beforeEach(() => {
 			tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'beignet-modes-'));
@@ -184,7 +188,7 @@ describe('secret file modes (issue #1004)', function () {
 		});
 
 		it('beignet init writes a 0700 directory and a 0600 config from a 022 umask', async function () {
-			// ts-node has to load the CLI and everything it imports in the child.
+			// The child loads the built CLI and everything it imports.
 			this.timeout(120_000);
 			const repoRoot = path.resolve(__dirname, '..', '..');
 			// The child inherits this umask; the CLI has to restrict it itself.
@@ -195,14 +199,7 @@ describe('secret file modes (issue #1004)', function () {
 						(resolve) => {
 							const child = spawn(
 								process.execPath,
-								[
-									'-r',
-									'ts-node/register',
-									path.join('src', 'cli', 'cli.ts'),
-									'init',
-									'--network',
-									'regtest'
-								],
+								[DIST_CLI, 'init', '--network', 'regtest'],
 								{
 									cwd: repoRoot,
 									env: { ...process.env, HOME: tmpHome },

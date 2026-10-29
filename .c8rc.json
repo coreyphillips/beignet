@@ -1,6 +1,7 @@
 {
 	"all": true,
 	"include": ["src/**"],
+	"exclude-after-remap": true,
 	"reporter": ["text-summary", "json-summary", "lcovonly"],
 	"reports-dir": "coverage"
 }

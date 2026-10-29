@@ -2799,7 +2799,8 @@ tests/cli/
 ## Tests
 
 ```bash
-# Run CLI unit tests (no infrastructure needed)
+# Run CLI unit tests (no infrastructure needed; the spawn tests run dist/cli/cli.js)
+npm run build
 npm run test:cli
 
 # Run daemon/Electrum integration tests (requires Electrum server)
@@ -2808,8 +2809,8 @@ npm run test:integration
 # Run lightning unit tests
 npm run test:lightning
 
-# Run everything
-npm run test:all
+# Run lightning and CLI unit tests at once (builds first)
+npm test
 
 # Interop suites against the Docker nodes. LND_REST_PORT / LND_REST_HOST (and
 # LND_TAPROOT_REST_PORT / LND_TAPROOT_REST_HOST) move the endpoints; a suite
