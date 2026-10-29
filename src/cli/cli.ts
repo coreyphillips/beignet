@@ -2148,14 +2148,27 @@ async function handlePrimaries(): Promise<void> {
 					order: pos.slice(2)
 				})
 			);
-		case 'threshold':
-			if (!pos[2])
+		case 'threshold': {
+			const rawThreshold = pos[2];
+			if (!rawThreshold)
 				return usage('Usage: beignet primaries threshold <sats|none>');
+			const fillThresholdSat =
+				rawThreshold === 'none' ? null : Number(rawThreshold);
+			// JSON turns non-finite numbers into null, which would remove the cap.
+			if (
+				fillThresholdSat !== null &&
+				(rawThreshold.trim() === '' ||
+					!Number.isSafeInteger(fillThresholdSat) ||
+					fillThresholdSat < 0)
+			) {
+				return usage(
+					'Threshold must be a non-negative safe integer in sats, or none'
+				);
+			}
 			return outputResult(
-				await httpRequest('POST', '/primaries/threshold', {
-					fillThresholdSat: pos[2] === 'none' ? null : Number(pos[2])
-				})
+				await httpRequest('POST', '/primaries/threshold', { fillThresholdSat })
 			);
+		}
 		default:
 			output({
 				ok: false,
