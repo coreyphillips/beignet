@@ -1,5 +1,6 @@
 /**
- * PR #1306 review regressions, section 2, every delivered prefix (crossing).
+ * PR #1306 review regressions, section 2, every delivered prefix (crossing,
+ * part 1 of 2: nothing delivered, or A's message delivered first).
  * The suite is split by section and seed range so that no one mocha file
  * holds it; the harness is helpers/replay-order-review.ts.
  */
@@ -11,15 +12,15 @@ import {
 	shapesFor
 } from './helpers/replay-order-review';
 
-const { prefixStats } = collectDump('prefix-crossing');
+const { prefixStats } = collectDump('prefix-crossing-1');
 
 describe('reestablish replay order: review recovery regressions', function () {
 	this.timeout(900_000);
 
 	describe('2. every delivered prefix of a round, peer revoke_and_ack delivered or lost', function () {
 		for (const shape of shapesFor('prefix-crossing')) {
-			it(`${shape.tag}: every schedule up to six deliveries converges`, function () {
-				const r = everyPrefix(shape, 6);
+			it(`${shape.tag}: every schedule up to six deliveries converges (part 1 of 2)`, function () {
+				const r = everyPrefix(shape, 6, false, 'A');
 				prefixStats[shape.tag] = {
 					schedules: r.schedules,
 					retransmits: r.retransmits,

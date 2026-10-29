@@ -948,11 +948,17 @@ export interface IShape {
  * Runs the shape once per delivery schedule: every sequence of "deliver the
  * next message from A" / "from B" up to `depth` steps that the wire allows,
  * the connection dying after it. Then one reconnect, and full convergence.
+ *
+ * With `first`, only the schedules whose first delivery is from that side.
+ * The empty schedule goes with A, so the A and B runs together cover the
+ * search once. The B run still sets up the empty schedule to see what B has
+ * pending, but does not count or check it.
  */
 export function everyPrefix(
 	shape: IShape,
 	depth: number,
-	taproot = false
+	taproot = false,
+	first?: Side
 ): {
 	schedules: number;
 	retransmits: number;
@@ -963,10 +969,13 @@ export function everyPrefix(
 	let schedules = 0;
 	let retransmits = 0;
 	let affected = 0;
+	const owned = (schedule: string): boolean =>
+		first === undefined || (schedule[0] ?? 'A') === first;
 	const todo: string[] = [''];
 	while (todo.length > 0) {
 		const schedule = todo.shift()!;
-		schedules++;
+		const mine = owned(schedule);
+		if (mine) schedules++;
 		const t = makeFundedPair(
 			`prefix-${taproot ? 'tr-' : ''}${shape.tag}-${schedule || 'none'}`,
 			taproot
@@ -982,9 +991,12 @@ export function everyPrefix(
 				expect(t.wire.step(side as Side), 'schedule step').to.equal(true);
 			}
 			if (schedule.length < depth) {
-				if (t.wire.pending('A') > 0) todo.push(`${schedule}A`);
-				if (t.wire.pending('B') > 0) todo.push(`${schedule}B`);
+				for (const side of ['A', 'B'] as Side[]) {
+					const next = `${schedule}${side}`;
+					if (t.wire.pending(side) > 0 && owned(next)) todo.push(next);
+				}
 			}
+			if (!mine) continue;
 			t.wire.cut();
 			t.wire.disconnect();
 			const c = classify(t);
@@ -1090,7 +1102,8 @@ export const SHAPES: IShape[] = [
 
 /**
  * Section 2 is split across files by shape. Every shape must sit in exactly
- * one file, or a shape added to SHAPES would run nowhere.
+ * one group, or a shape added to SHAPES would run nowhere. The prefix-crossing
+ * group runs in two files, one per `first` side of everyPrefix.
  */
 const PREFIX_FILES: Record<string, string[]> = {
 	'prefix-1': ['add-add', 'fulfil-fulfil', 'fulfil-fail', 'malformed-add'],
