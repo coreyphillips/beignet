@@ -3,6 +3,7 @@ export * from './client';
 export * from './psbt';
 export * from './bitcoin-core';
 export { createPeerTransportRegistry } from './transports';
+export type { IDfPeerHolds } from './transports';
 export { DirectFundingSender } from '../lightning/direct-funding/sender/engine';
 export type { IDfSendOptions } from '../lightning/direct-funding/sender/engine';
 export type {

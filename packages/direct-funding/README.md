@@ -61,8 +61,9 @@ console.log(result.status, result.fundingTxid);
 await client.reconcile();
 console.log(client.payments());
 
-// At application shutdown, after payment/reconciliation calls have settled:
-await wallet.waitForIdle();
+// At application shutdown, after you stop starting payments and reconciliation.
+// This also waits for reservation releases a timed-out payment left running.
+await client.waitForIdle();
 registry.destroy();
 peers.close();
 storage.close();
@@ -94,13 +95,15 @@ Ownership is proved with a non-broadcastable transaction containing an artificia
 
 `NodePeerMessaging` provides authenticated outbound TCP/Noise connections, init, ping/pong and direct-funding custom messages. Its default random identity is a transport identity, never a spending key. Supply a dedicated stable identity if the receiver pairs or recognizes the payer across restarts. The connection count and connection deadlines are bounded, and `close()` stops connections and reconnect timers.
 
+Through `createPeerTransportRegistry`, each payment lane holds its receiver or relay connection with `holdPeer` from its dial until the lane closes. The connection reconnects if it drops during the exchange, and closes, freeing its slot, when the last lane using it closes. Receipt recovery dials again. A peer that is not connected is dialled at the address named last, so a receiver that moved is reached at its new address.
+
 `createPeerTransportRegistry(peers)` registers direct-peer and LSP relay lanes. You can instead supply another `IDfPeerMessaging` implementation or register a custom lane in `DfTransportRegistry`.
 
 The initial standalone package does not include an onion-message engine. The existing registry can use a request's introduction node as an LSP relay when that node supports the relay protocol and is connected to the receiver. This does not make every onion-only request reachable. A `.onion` hostname needs a SOCKS/Tor-capable `createSocket` callback; ordinary Node TCP does not resolve it. Receiver and liquidity-peer protocol support are still required.
 
 ## Payment lifecycle and storage
 
-Use exactly one SDK client and one reservation manager per wallet/storage scope. Storage must not be shared between networks or different wallets. `saveWalletData` must finish durably before returning and throw on failure. Promise-returning writes are rejected. `FileDirectFundingStorage` uses private files, atomic replacement and fsync, and refuses a second writer.
+Use exactly one SDK client and one reservation manager per wallet/storage scope. Storage must not be shared between networks or different wallets. `saveWalletData` must finish durably before returning and throw on failure. Promise-returning writes are rejected. `FileDirectFundingStorage` uses private files, atomic replacement and fsync, and refuses a second writer. On Windows, which cannot fsync a directory through Node, it fsyncs each file but not the directory after the rename.
 
 Payment state and the funding witness are persisted before the witness is emitted. The SDK refuses corrupt payment journals rather than silently starting with no history. Keep the storage directory through upgrades and restarts. Back up payment state and wallet reservation state together. This file store is plaintext; choose an encrypted host store or encrypted disk when required.
 

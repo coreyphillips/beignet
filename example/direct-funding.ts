@@ -36,13 +36,14 @@ export async function payWithBitcoinCore(
 	const peers = new NodePeerMessaging({ network: options.network });
 	const registry = createPeerTransportRegistry(peers);
 	let wallet: BitcoinCoreWalletAdapter | undefined;
+	let client: DirectFundingClient | undefined;
 	try {
 		wallet = await BitcoinCoreWalletAdapter.create({
 			rpc: options.rpc,
 			network: options.network,
 			storage
 		});
-		const client = new DirectFundingClient({
+		client = new DirectFundingClient({
 			wallet,
 			registry,
 			storage,
@@ -68,7 +69,9 @@ export async function payWithBitcoinCore(
 		// Keep this directory and call client.reconcile() on subsequent launches.
 		return result;
 	} finally {
-		await wallet?.waitForIdle();
+		// The client's drain includes reservation releases a timed-out payment
+		// can leave running, and then the wallet's own.
+		await (client ?? wallet)?.waitForIdle();
 		registry.destroy();
 		peers.close();
 		storage.close();

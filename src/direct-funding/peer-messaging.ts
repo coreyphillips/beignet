@@ -86,9 +86,11 @@ async function withDeadline(
  * init, ping/pong, and direct-funding custom messages using the existing Peer
  * transport. It does not accept channels, route payments, or run a node.
  *
- * A successful connection stays open and can reconnect during an exchange.
- * Initial failures do not start background retry loops. Call close when all
- * payments and receipt recovery operations have finished.
+ * A connection a payment lane holds (see holdPeer) stays open and reconnects
+ * if it drops, and closes when the last lane using it closes. A connection
+ * made without a hold stays until disconnectPeer or close. Initial failures do
+ * not start background retry loops. Call close when all payments and receipt
+ * recovery operations have finished.
  */
 export class NodePeerMessaging implements IDfPeerMessaging {
 	private readonly identityKey: Buffer;
@@ -98,6 +100,8 @@ export class NodePeerMessaging implements IDfPeerMessaging {
 	private readonly maxPeers: number;
 	private readonly reconnectDelayMs: number;
 	private readonly connections = new Map<string, IConnection>();
+	/** Live holds by peer id. A peer's connection is released when its count ends. */
+	private readonly holds = new Map<string, number>();
 	private readonly messages = new Set<(message: IDfCustomMessage) => void>();
 	private readonly connects = new Set<(peerNodeId: string) => void>();
 	private closed = false;
@@ -191,9 +195,52 @@ export class NodePeerMessaging implements IDfPeerMessaging {
 			clearTimeout(entry.timer);
 			entry.timer = undefined;
 		}
+		// A peer that is not connected is dialled, and redialled, at the address
+		// named last.
+		const moved = entry.host !== host || entry.port !== port;
+		entry.host = host;
+		entry.port = port;
+		if (entry.pending && moved) {
+			// The running dial went to the old address. Let it settle, then try
+			// again here, which dials the new address unless it connected.
+			const started = Date.now();
+			await withDeadline(
+				entry.pending.catch(() => undefined),
+				limit
+			);
+			const remaining = limit - (Date.now() - started);
+			if (remaining <= 0) {
+				throw new Error('direct-funding peer connection timed out');
+			}
+			return this.connectPeer(id, host, port, remaining, options);
+		}
 		// A shorter waiter does not cancel another caller's existing shared dial.
 		if (entry.pending) await withDeadline(entry.pending, limit);
 		else await this.beginDial(entry, limit);
+	}
+
+	/**
+	 * Keep this peer's connection, and its reconnects, until the returned
+	 * function is called. When the last hold on a peer ends, its connection
+	 * closes and its slot is freed. The registry from createPeerTransportRegistry
+	 * holds each lane's peer from its dial until the lane closes, so a
+	 * long-lived instance does not keep every receiver it has paid.
+	 */
+	holdPeer(peerNodeId: string): () => void {
+		const id = peerNodeId.toLowerCase();
+		this.holds.set(id, (this.holds.get(id) ?? 0) + 1);
+		let released = false;
+		return () => {
+			if (released) return;
+			released = true;
+			const count = (this.holds.get(id) ?? 1) - 1;
+			if (count > 0) {
+				this.holds.set(id, count);
+				return;
+			}
+			this.holds.delete(id);
+			this.disconnectPeer(id);
+		};
 	}
 
 	keepReconnecting(peerNodeId: string): void {
@@ -255,6 +302,7 @@ export class NodePeerMessaging implements IDfPeerMessaging {
 			entry.peer?.disconnect();
 		}
 		this.connections.clear();
+		this.holds.clear();
 		this.messages.clear();
 		this.connects.clear();
 		this.identityKey.fill(0);

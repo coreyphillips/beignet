@@ -221,6 +221,64 @@ describe('Direct-funding payer SDK', () => {
 		);
 	});
 
+	it('loads a signed payment whose wallet reported its coin txid in upper case', async () => {
+		const s = setup(true);
+		await s.client.pay(s.request.encoded);
+		const rows = s.client.payments();
+		rows[0].spentTxid = rows[0].spentTxid.toUpperCase();
+		s.storage.rows.set(DF_PAYMENTS_STORAGE_KEY, JSON.stringify(rows));
+		const restarted = new DirectFundingClient(s.options);
+		expect(restarted.payments()[0].status).to.equal('SIGNED_PENDING');
+	});
+
+	it('waits for the reservation release a timed-out payment leaves running', async () => {
+		const s = setup();
+		s.wallet.freezeDelayMs = 100;
+		const client = new DirectFundingClient({
+			...s.options,
+			config: { ...s.options.config, offerTimeoutMs: 30 }
+		});
+		await refuses(client.pay(s.request.encoded), 'in time');
+		expect(s.wallet.frozen.size).to.equal(1);
+		await client.waitForIdle();
+		expect(s.wallet.frozen.size).to.equal(0);
+		expect(client.payments()[0].freezeReleased).to.equal(true);
+	});
+
+	it('recovers a stranded reservation before refreshing, so the next payment can use the coin', async () => {
+		const s = setup();
+		s.wallet.freezeDelayMs = 100;
+		const unfreeze = s.wallet.unfreezeUtxo.bind(s.wallet);
+		let unfreezes = 0;
+		s.wallet.unfreezeUtxo = async (txidHex, vout): Promise<boolean> =>
+			++unfreezes === 1 ? false : unfreeze(txidHex, vout);
+		const timingOut = new DirectFundingClient({
+			...s.options,
+			config: { ...s.options.config, offerTimeoutMs: 30 }
+		});
+		await refuses(timingOut.pay(s.request.encoded), 'in time');
+		await timingOut.waitForIdle();
+		expect(s.wallet.frozen.size).to.equal(1);
+		// Like Core's, this wallet's view of spendable coins changes only on refresh.
+		const live = s.wallet.listSpendable.bind(s.wallet);
+		let view: ReturnType<typeof live> = [];
+		s.wallet.refresh = async (): Promise<void> => {
+			view = live();
+		};
+		s.wallet.listSpendable = (): ReturnType<typeof live> => view;
+		s.wallet.freezeDelayMs = 0;
+		const next = mintRequest({ amountSat: 100_000n });
+		const restarted = new DirectFundingClient({
+			...s.options,
+			registry: registryWith(
+				new ScriptedReceiverLane(next, acceptingReceiver(next))
+			)
+		});
+		const paid = await restarted.pay(next.encoded);
+		expect(paid.attested).to.equal(true);
+		expect(s.wallet.frozen.size).to.equal(1);
+	});
+
 	it('withholds the funding witness when durability fails', async () => {
 		const s = setup();
 		s.storage.failWhen = (value) => value.includes('SIGNED_PENDING');

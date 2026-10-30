@@ -177,11 +177,14 @@ function validateCommitment(row: IDfPaymentRecord): void {
 		);
 	}
 	const tx = Transaction.fromHex(row.negotiatedTx);
+	// The engine records the wallet adapter's txid as given, which may not be
+	// lowercase.
+	const spentTxid = row.spentTxid.toLowerCase();
 	if (
 		tx.getId() !== row.fundingTxid ||
 		tx.ins.filter(
 			(input) =>
-				Buffer.from(input.hash).reverse().toString('hex') === row.spentTxid &&
+				Buffer.from(input.hash).reverse().toString('hex') === spentTxid &&
 				input.index === row.spentVout
 		).length !== 1
 	) {
@@ -306,8 +309,9 @@ export class DirectFundingClient {
 		const run = Promise.resolve().then(async () => {
 			// Refresh errors cannot turn an already committed payment into a refusal.
 			if (!committed) {
-				await this.refreshWallet();
+				// Recover first, so the refresh sees the coins recovery unlocked.
 				await this.sender.recoverReservations();
+				await this.refreshWallet();
 			}
 			return this.sender.send(request.encoded, sendOptions);
 		});
@@ -319,12 +323,28 @@ export class DirectFundingClient {
 		return run;
 	}
 
-	/** Refresh chain facts and recover unused reservations. Schedule from the host app. */
+	/** Recover unused reservations and refresh chain facts. Schedule from the host app. */
 	async reconcile(): Promise<void> {
-		await this.refreshWallet();
 		await this.sender.recoverReservations();
+		await this.refreshWallet();
 		await this.sender.reconcile();
 		await this.options.wallet.waitForIdle?.();
+	}
+
+	/**
+	 * Wait for this client's payments, the reservation releases they started
+	 * and the wallet's queued writes to finish. Stop starting payments and
+	 * reconciliation first, and call this before closing storage: a timed-out
+	 * payment's release can still be running after its pay() settled.
+	 */
+	async waitForIdle(): Promise<void> {
+		do {
+			await Promise.allSettled(
+				[...this.inflight.values()].map((running) => running.promise)
+			);
+			await this.sender.waitForReleases();
+			await this.options.wallet.waitForIdle?.();
+		} while (this.inflight.size > 0);
 	}
 
 	/** Detached snapshots so application code cannot mutate the payment journal. */

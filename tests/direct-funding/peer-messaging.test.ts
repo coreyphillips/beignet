@@ -5,10 +5,14 @@ import {
 	NodePeerMessaging,
 	INodePeerMessagingOptions
 } from '../../src/direct-funding/peer-messaging';
+import { createPeerTransportRegistry } from '../../src/direct-funding/transports';
 import { Peer } from '../../src/lightning/transport/peer';
 import { IDuplexTransport } from '../../src/lightning/transport/duplex-transport';
 import { Network } from '../../src/lightning/invoice/types';
-import { chainHashForNetwork } from '../../src/lightning/direct-funding/types';
+import {
+	DfTransportType,
+	chainHashForNetwork
+} from '../../src/lightning/direct-funding/types';
 import { ecc } from '../../src/utils/ecc';
 import {
 	BEIGNET_CUSTOM_MESSAGE_TYPE,
@@ -84,6 +88,31 @@ describe('Standalone Node direct-funding peer messaging', () => {
 	const clients: NodePeerMessaging[] = [];
 	const remotes: Peer[] = [];
 
+	/** A socket whose far end is a Peer answering as `remoteKey`. */
+	function answering(
+		remoteKey: Buffer,
+		remotePeers: Peer[],
+		remoteNetwork = Network.REGTEST
+	): MemorySocket {
+		const outbound = new MemorySocket();
+		const inbound = new MemorySocket();
+		outbound.remote = inbound;
+		inbound.remote = outbound;
+		const peer = new Peer({
+			localPrivateKey: remoteKey,
+			remotePublicKey: Buffer.alloc(33),
+			host: 'memory',
+			port: 9735,
+			networks: [chainHashForNetwork(remoteNetwork)],
+			handshakeTimeout: 1_000
+		});
+		remotePeers.push(peer);
+		remotes.push(peer);
+		peer.on('error', () => undefined);
+		void peer.acceptInbound(inbound).catch(() => undefined);
+		return outbound;
+	}
+
 	function harness(
 		options: Partial<INodePeerMessagingOptions> = {},
 		remoteNetwork = Network.REGTEST
@@ -101,23 +130,8 @@ describe('Standalone Node direct-funding peer messaging', () => {
 			connectionTimeoutMs: 1_000,
 			reconnectDelayMs: 5,
 			createSocket: async (): Promise<IDuplexTransport> => {
-				const outbound = new MemorySocket();
-				const inbound = new MemorySocket();
-				outbound.remote = inbound;
-				inbound.remote = outbound;
-				const peer = new Peer({
-					localPrivateKey: remoteKey,
-					remotePublicKey: Buffer.alloc(33),
-					host: 'memory',
-					port: 9735,
-					networks: [chainHashForNetwork(remoteNetwork)],
-					handshakeTimeout: 1_000
-				});
-				remotePeers.push(peer);
-				remotes.push(peer);
+				const outbound = answering(remoteKey, remotePeers, remoteNetwork);
 				packets.push(outbound);
-				peer.on('error', () => undefined);
-				void peer.acceptInbound(inbound).catch(() => undefined);
 				return outbound;
 			},
 			...options
@@ -372,6 +386,82 @@ describe('Standalone Node direct-funding peer messaging', () => {
 		expect(client.isPeerConnected(remoteId)).to.equal(false);
 		await client.connectPeer(remoteId, 'memory', 9735);
 		expect(remotePeers).to.have.length(2);
+	});
+
+	it('keeps a held peer until its last hold ends, then closes it without redialling', async () => {
+		const { client, remoteId, remotePeers } = harness();
+		const first = client.holdPeer(remoteId);
+		const second = client.holdPeer(remoteId.toUpperCase());
+		await client.connectPeer(remoteId, 'memory', 9735);
+		first();
+		first();
+		expect(client.isPeerConnected(remoteId)).to.equal(true);
+		second();
+		expect(client.isPeerConnected(remoteId)).to.equal(false);
+		await new Promise((resolve) => setTimeout(resolve, 30));
+		expect(remotePeers).to.have.length(1);
+	});
+
+	it('frees a receiver slot when the payment lane using it closes', async () => {
+		const keys = new Map([
+			['receiver-a', randomBytes(32)],
+			['receiver-b', randomBytes(32)]
+		]);
+		const remotePeers: Peer[] = [];
+		const client = new NodePeerMessaging({
+			network: Network.REGTEST,
+			maxPeers: 1,
+			connectionTimeoutMs: 1_000,
+			reconnectDelayMs: 5,
+			createSocket: async (host): Promise<IDuplexTransport> =>
+				answering(keys.get(host)!, remotePeers)
+		});
+		clients.push(client);
+		const registry = createPeerTransportRegistry(client);
+		for (const [host, key] of keys) {
+			const receiver = pubkey(key);
+			const connectedDuringExchange = await registry.run(
+				[{ type: DfTransportType.DIRECT_PEER, host, port: 9735 }],
+				{
+					requestId: randomBytes(32),
+					receiverNodeId: Buffer.from(receiver, 'hex')
+				},
+				async () => client.isPeerConnected(receiver)
+			);
+			expect(connectedDuringExchange).to.equal(true);
+			expect(client.isPeerConnected(receiver)).to.equal(false);
+		}
+		// Neither receiver is redialled once its lane has closed.
+		await new Promise((resolve) => setTimeout(resolve, 30));
+		expect(remotePeers).to.have.length(2);
+		registry.destroy();
+	});
+
+	it('dials the address named last for a peer that is not connected', async () => {
+		const remoteKey = randomBytes(32);
+		const remoteId = pubkey(remoteKey);
+		const remotePeers: Peer[] = [];
+		const dialled: string[] = [];
+		let oldHostUp = true;
+		const client = new NodePeerMessaging({
+			network: Network.REGTEST,
+			connectionTimeoutMs: 1_000,
+			reconnectDelayMs: 5,
+			createSocket: async (host): Promise<IDuplexTransport> => {
+				dialled.push(host);
+				if (host === 'old-host' && !oldHostUp) throw new Error('unreachable');
+				return answering(remoteKey, remotePeers);
+			}
+		});
+		clients.push(client);
+		await client.connectPeer(remoteId, 'old-host', 9735);
+		oldHostUp = false;
+		remotePeers[0].disconnect();
+		// The reconnect loop has tried the old address and failed.
+		await waitFor(() => dialled.length >= 2);
+		await client.connectPeer(remoteId, 'new-host', 9735);
+		expect(client.isPeerConnected(remoteId)).to.equal(true);
+		expect(dialled[dialled.length - 1]).to.equal('new-host');
 	});
 
 	it('copies supplied identity material and rejects invalid configuration', async () => {

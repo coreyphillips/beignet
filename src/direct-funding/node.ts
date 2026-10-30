@@ -58,11 +58,15 @@ export class FileDirectFundingStorage implements DirectFundingStorage {
 				fs.closeSync(fd);
 			}
 			fs.renameSync(temporary, destination);
-			const dir = fs.openSync(this.directory, 'r');
-			try {
-				fs.fsyncSync(dir);
-			} finally {
-				fs.closeSync(dir);
+			// Windows cannot open or fsync a directory through Node, so there the
+			// rename is the last step.
+			if (process.platform !== 'win32') {
+				const dir = fs.openSync(this.directory, 'r');
+				try {
+					fs.fsyncSync(dir);
+				} finally {
+					fs.closeSync(dir);
+				}
 			}
 		} finally {
 			if (fs.existsSync(temporary)) fs.unlinkSync(temporary);

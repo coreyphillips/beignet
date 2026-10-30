@@ -58,6 +58,7 @@ method DirectFundingClient.inspect(input: string): IDirectFundingRequest
 method DirectFundingClient.pay(input: string, opts?: IDfSendOptions): Promise<IDfSendResult>
 method DirectFundingClient.payments(): IDfPaymentRecord[]
 method DirectFundingClient.reconcile(): Promise<void>
+method DirectFundingClient.waitForIdle(): Promise<void>
 class DirectFundingError extends beignet#CodedError<DirectFundingErrorCode>
 constructor DirectFundingError(code: DirectFundingErrorCode, message: string)
 enum DirectFundingErrorCode
@@ -89,6 +90,7 @@ method DirectFundingSender.recoverReservations(): Promise<void>
 method DirectFundingSender.send(encodedRequest: string, opts?: IDfSendOptions): Promise<IDfSendResult>
 method DirectFundingSender.start(): void
 method DirectFundingSender.stop(): void
+method DirectFundingSender.waitForReleases(): Promise<void>
 type DirectFundingStorage = NonNullable<beignet/lightning#directFunding.IDfPaymentStoreDeps['storage']>
 interface IBitcoinCoreWalletOptions
 property IBitcoinCoreWalletOptions.network?: Network
@@ -152,6 +154,8 @@ property IDfPaymentRecord.status: DfPaymentStatus
 property IDfPaymentRecord.updatedAt: number
 property IDfPaymentRecord.witness?: string[]
 property IDfPaymentRecord.witnessSent?: boolean
+interface IDfPeerHolds
+method IDfPeerHolds.holdPeer(peerNodeId: string): () => void
 interface IDfPeerMessaging
 method IDfPeerMessaging.connectPeer(peerPubkeyHex: string, host: string, port: number, timeoutMs?: number, options?: { reconnect?: boolean; }): Promise<void>
 method IDfPeerMessaging.isPeerConnected(peerPubkeyHex: string): boolean

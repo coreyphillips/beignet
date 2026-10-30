@@ -2453,6 +2453,7 @@ method directFunding.DirectFundingSender.recoverReservations(): Promise<void>
 method directFunding.DirectFundingSender.send(encodedRequest: string, opts?: directFunding.IDfSendOptions): Promise<directFunding.IDfSendResult>
 method directFunding.DirectFundingSender.start(): void
 method directFunding.DirectFundingSender.stop(): void
+method directFunding.DirectFundingSender.waitForReleases(): Promise<void>
 interface directFunding.IDfAttemptFunding
 property directFunding.IDfAttemptFunding.amountSat?: string
 property directFunding.IDfAttemptFunding.channelId: string

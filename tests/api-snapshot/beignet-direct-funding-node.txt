@@ -28,6 +28,7 @@ constructor NodePeerMessaging(options: INodePeerMessagingOptions)
 method NodePeerMessaging.close(): void
 method NodePeerMessaging.connectPeer(peerNodeId: string, host: string, port: number, timeoutMs?: number, options?: { reconnect?: boolean; }): Promise<void>
 method NodePeerMessaging.disconnectPeer(peerNodeId: string): void
+method NodePeerMessaging.holdPeer(peerNodeId: string): () => void
 method NodePeerMessaging.isPeerConnected(peerNodeId: string): boolean
 method NodePeerMessaging.keepReconnecting(peerNodeId: string): void
 method NodePeerMessaging.nodeIdHex(): string

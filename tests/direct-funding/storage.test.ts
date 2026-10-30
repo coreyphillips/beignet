@@ -55,6 +55,19 @@ describe('Direct-funding file storage', () => {
 			fs.readdirSync(directory).some((name) => name.endsWith('.tmp'))
 		).to.equal(false);
 	});
+	it('skips the directory fsync on Windows, where Node cannot open a directory', () => {
+		const platform = Object.getOwnPropertyDescriptor(process, 'platform')!;
+		Object.defineProperty(process, 'platform', { ...platform, value: 'win32' });
+		const open = sinon.spy(fs, 'openSync');
+		try {
+			storage.saveWalletData('key', 'value');
+		} finally {
+			Object.defineProperty(process, 'platform', platform);
+		}
+		expect(open.callCount).to.equal(1);
+		expect(String(open.firstCall.args[0])).to.match(/\.tmp$/);
+		expect(storage.loadWalletData('key')).to.equal('value');
+	});
 	it('hashes keys so storage identifiers cannot escape the directory', () => {
 		storage.saveWalletData('../elsewhere', 'value');
 		expect(storage.loadWalletData('../elsewhere')).to.equal('value');
