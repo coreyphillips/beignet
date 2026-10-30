@@ -102,3 +102,6 @@ docker/docker-compose.override.yml
 
 # Generated API reference (npm run docs:html, docs:markdown)
 api-docs/
+
+# spar config (spar init); its worktrees and state are in .git/info/exclude
+spar.toml
