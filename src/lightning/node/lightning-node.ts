@@ -1006,6 +1006,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	private channelManager: ChannelManager;
 	private graph: NetworkGraph;
 	private peerManager: PeerManager | null = null;
+	private readonly rawCustomMessageTypes = new Map<number, number>();
 	private payments: Map<string, IPaymentInfo> = new Map();
 	private prunedPayAllBudgets = new Map<string, IPayAllBudget>();
 	/**
@@ -2548,6 +2549,8 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 
 		if (config.enableNetworking) {
 			this.peerManager = new PeerManager({
+				isKnownCustomMessageType: (type): boolean =>
+					this.rawCustomMessageTypes.has(type),
 				localPrivateKey: config.nodePrivateKey,
 				localFeatures,
 				networks: config.chainHashes,
@@ -27657,6 +27660,38 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			});
 			return;
 		}
+		if (this.rawCustomMessageTypes.has(type)) {
+			if (!Buffer.isBuffer(payload) || payload.length > 65533) return;
+			if (validateHexPubkey(pubkey, 'peerPubkey')) return;
+			pubkey = normalizeHexPubkey(pubkey);
+			const snapshot = Buffer.from(payload);
+			// Isolate each subscriber, including once wrappers, so one protocol
+			// cannot corrupt another subscriber's bytes or interrupt delivery.
+			for (const listener of this.rawListeners('raw-custom-message')) {
+				try {
+					listener.call(this, {
+						peerPubkey: pubkey,
+						type,
+						payload: Buffer.from(snapshot)
+					});
+				} catch (err) {
+					try {
+						this.emitStructuredLog(
+							'peer',
+							'raw_custom_message_listener_failed',
+							{
+								pubkey,
+								type,
+								error: err instanceof Error ? err.message : String(err)
+							}
+						);
+					} catch {
+						// An observer must not disconnect an authenticated peer.
+					}
+				}
+			}
+			return;
+		}
 		// Route gossip messages (including query types 261-265)
 		if (
 			type === MessageType.CHANNEL_ANNOUNCEMENT ||
@@ -27745,6 +27780,72 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 
 		// Route channel messages to ChannelManager
 		this.channelManager.handleMessage(pubkey, type, payload);
+	}
+
+	/**
+	 * Register experimental wire types before connecting to peers that use them.
+	 * Registration accepts required even types only for these explicit handlers.
+	 * It neither advertises features nor enables a channel protocol. The host
+	 * owns protocol negotiation and must authenticate external-transport input.
+	 * Registrations are reference counted; the returned release is idempotent.
+	 */
+	registerRawCustomMessageTypes(types: readonly number[]): () => void {
+		const unique = [...new Set(types)];
+		for (const type of unique) {
+			if (
+				!Number.isInteger(type) ||
+				type < 32768 ||
+				type > 65535 ||
+				type === BEIGNET_CUSTOM_MESSAGE_TYPE ||
+				Object.values(MessageType).includes(type)
+			) {
+				throw new Error(
+					'Raw custom message type must be an unused uint16 >= 32768'
+				);
+			}
+		}
+		for (const type of unique) {
+			this.rawCustomMessageTypes.set(
+				type,
+				(this.rawCustomMessageTypes.get(type) ?? 0) + 1
+			);
+		}
+		let released = false;
+		return (): void => {
+			if (released) return;
+			released = true;
+			for (const type of unique) {
+				const count = this.rawCustomMessageTypes.get(type)! - 1;
+				if (count === 0) this.rawCustomMessageTypes.delete(type);
+				else this.rawCustomMessageTypes.set(type, count);
+			}
+		};
+	}
+
+	/** Send an explicitly registered wire type and exact payload over an authenticated peer connection. */
+	sendRawCustomMessage(
+		peerPubkeyHex: string,
+		type: number,
+		payload: Buffer
+	): void {
+		if (!this.rawCustomMessageTypes.has(type)) {
+			throw new Error('Raw custom message type is not registered');
+		}
+		if (!Buffer.isBuffer(payload) || payload.length > 65533) {
+			throw new Error(
+				'Raw custom message payload must be a Buffer of at most 65533 bytes'
+			);
+		}
+		const invalidPeer = validateHexPubkey(peerPubkeyHex, 'peerPubkey');
+		if (invalidPeer) throw new Error(invalidPeer);
+		if (!this.peerManager) {
+			throw new Error('Networking is not enabled on this node');
+		}
+		this.peerManager.sendToPeer(
+			normalizeHexPubkey(peerPubkeyHex),
+			type,
+			Buffer.from(payload)
+		);
 	}
 
 	/**
@@ -31207,6 +31308,14 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 
 	private registerCustomMessageHandler(): void {
 		if (!this.peerManager) return;
+		this.peerManager.on(
+			'message',
+			(pubkey: string, type: number, payload: Buffer) => {
+				if (this.rawCustomMessageTypes.has(type)) {
+					this.handlePeerMessage(pubkey, type, payload);
+				}
+			}
+		);
 		// Beignet-to-beignet custom traffic rides one odd type (issue #546);
 		// route it through handlePeerMessage so it sits behind the same
 		// startup-quarantine gate as every other inbound message (the

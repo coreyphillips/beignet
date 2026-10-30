@@ -268,6 +268,12 @@ export interface LightningNodeEvents
 	'peer:disconnect-requested': (pubkey: string) => void;
 	/** Peer error (networking mode). */
 	'peer:error': (pubkey: string, error: Error) => void;
+	/** A registered experimental wire message, without an envelope. Networking supplies the authenticated Noise peer identity; external transports must authenticate handlePeerMessage's peer argument. */
+	'raw-custom-message': (message: {
+		peerPubkey: string;
+		type: number;
+		payload: Buffer;
+	}) => void;
 	/** A beignet custom message (type 44069) arrived from a peer. */
 	'custom-message': (message: {
 		peerPubkey: string;

@@ -1327,6 +1327,7 @@ const result = await node.recoverFromStaticChannelBackup(scb.channels);
 | `peer:disconnect` | `(pubkey: string, info?: IPeerDisconnectInfo)` | Peer disconnected (networking mode). `info` says who closed the connection and why, when known. |
 | `peer:disconnect-requested` | `(pubkey: string)` | The node needs this peer's connection severed but holds no socket for it (event-transport mode, or an unconnected peer): the host must close its transport. The protocol side (channels marked for reestablish) is already applied; reconnect and reestablish as usual. |
 | `peer:error` | `(pubkey: string, error: Error)` | Peer error (networking mode). |
+| `raw-custom-message` | `(message: { peerPubkey: string; type: number; payload: Buffer })` | A registered experimental wire message, without an envelope. Networking supplies the authenticated Noise peer identity; external transports must authenticate handlePeerMessage's peer argument. |
 | `custom-message` | `(message: { peerPubkey: string; version: number; subtype: number; payload: Buffer })` | A beignet custom message (type 44069) arrived from a peer. |
 | `peer_storage:retrieved` | `(peerPubkey: string, blob: Buffer)` | A peer returned the blob it stores for this node (BOLT 1 peer storage), unpadded. |
 | `onion:received` | `(payload: IOnionMessagePayload)` | Onion message received (type 513). |
@@ -1388,6 +1389,34 @@ const result = await node.recoverFromStaticChannelBackup(scb.channels);
 | `ffor:issuer-issued` | `(data: { mailboxId: Buffer; k: number; payerId: Buffer })` | Issuer role: an invoice was issued against slot `k` to a payer. |
 | `ffor:issuer-retired` | `(data: { mailboxId: Buffer; reason: string })` | Issuer role: a delegated offer stopped issuing, with the reason. |
 <!-- events:LightningNodeEvents:end -->
+
+### Raw experimental peer messages
+
+Protocols with their own wire types can register those types and exchange exact
+payload bytes through the authenticated Noise connection:
+
+```ts
+const releaseTypes = node.registerRawCustomMessageTypes([32768, 32769]);
+node.on('raw-custom-message', ({ peerPubkey, type, payload }) => {
+  // Decode and validate the protocol message before acting on it.
+});
+node.sendRawCustomMessage(peerPubkey, 32768, encodedPayload);
+// Release this registration when the protocol integration is stopped.
+releaseTypes();
+```
+
+Register before connecting. Types must be unused integers from 32768 through
+65535; built-in Beignet types cannot be intercepted. Required even types are
+accepted only while registered. Registrations can overlap and each release
+function is idempotent. Payloads are limited to 65533 bytes, leaving two bytes
+for the BOLT 8 message type. Each subscriber receives its own payload copy.
+
+Sending requires a connected peer and preserves the existing recovery and lane
+gates. Network events identify the Noise-authenticated sender. Hosts that call
+`handlePeerMessage` through their own transport must authenticate that sender
+themselves. Registration does not negotiate or advertise protocol features and
+does not add asset-channel support. The host owns negotiation and protocol
+validation. The `sendCustomMessage` API below retains its envelope format.
 
 ### Beignet custom messages (type 44069)
 

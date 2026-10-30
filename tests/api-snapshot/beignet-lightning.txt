@@ -5697,6 +5697,7 @@ method node.LightningNode.recoverFallbackFunds(opts?: { feeRatePerVbyte?: number
 method node.LightningNode.recoverFromStaticChannelBackup(entries: backup.IScbChannelEntry[]): Promise<{ recovering: string[]; skipped: Array<{ channelId: string; reason: string; }>; }>
 method node.LightningNode.refreshRecoveryCapsule(): number
 method node.LightningNode.registerChannelScid(channelId: Buffer, scid: Buffer): void
+method node.LightningNode.registerRawCustomMessageTypes(types: readonly number[]): () => void
 method node.LightningNode.removeTrustedPeer(pubkeyHex: string): void
 method node.LightningNode.removeWatchtower(uri: string): void
 method node.LightningNode.requestAsyncReceiveGrant(lspNodeIdHex: string, options?: { scid?: Buffer; requestedHoldBlocks?: number; timeoutMs?: number; }): Promise<asyncPayments.IReceiverGrant>
@@ -5719,6 +5720,7 @@ method node.LightningNode.sendPayment(invoiceStr: string, excludedChannels?: Set
 method node.LightningNode.sendPaymentAsync(invoiceStr: string, timeoutMs?: number, maxFeeMsat?: bigint, amountMsat?: bigint, maxCltvExpiryHeight?: number): Promise<node.IPaymentInfo>
 method node.LightningNode.sendPaymentToRoute(route: { hops: Array<{ pubkey: Buffer; shortChannelId: Buffer; amountToForwardMsat: bigint; outgoingCltvValue: number; encryptedRecipientData?: Buffer; blindingPoint?: Buffer; }>; }, paymentHash: Buffer, finalCltvExpiry: number, paymentSecret?: Buffer, totalMsat?: bigint, metadata?: Record<string, string>, payAll?: node.IPayAllBudget): node.IPaymentInfo
 method node.LightningNode.sendPaymentWithOptions(invoiceStr: string, options?: node.ISendPaymentOptions): node.IPaymentInfo
+method node.LightningNode.sendRawCustomMessage(peerPubkeyHex: string, type: number, payload: Buffer): void
 method node.LightningNode.sendTxSignatures(channelId: Buffer, txid: Buffer, outputIndex: number, witnesses: Buffer[][]): { ok: boolean; error?: string; }
 method node.LightningNode.setChannelPolicy(channelId: Buffer | 'all', policy: node.IChannelPolicyUpdate): void
 method node.LightningNode.setDirectFundingPolicy(update: node.IDirectFundingPolicy): node.IDirectFundingPolicy
@@ -5806,6 +5808,7 @@ property node.LightningNodeEvents.'peer:disconnect-requested': (pubkey: string) 
 property node.LightningNodeEvents.'peer:error': (pubkey: string, error: Error) => void
 property node.LightningNodeEvents.'peer_storage:retrieved': (peerPubkey: string, blob: Buffer) => void
 property node.LightningNodeEvents.'preimage:learned': (paymentHash: Buffer, preimage: Buffer) => void
+property node.LightningNodeEvents.'raw-custom-message': (message: { peerPubkey: string; type: number; payload: Buffer; }) => void
 property node.LightningNodeEvents.'recovery:backfill-lost': (detail: string) => void
 property node.LightningNodeEvents.'recovery:durable': (through: bigint) => void
 property node.LightningNodeEvents.'recovery:fenced': (supersededBy: recovery.GuardianState | null | undefined) => void
@@ -8798,6 +8801,7 @@ property transport.IPeerManagerOptions.autoReconnect?: boolean
 property transport.IPeerManagerOptions.inboundHandshakeTimeoutMs?: number
 property transport.IPeerManagerOptions.iroh?: transport.IIrohConfig
 property transport.IPeerManagerOptions.isChannelPeer?: (pubkey: string) => boolean
+property transport.IPeerManagerOptions.isKnownCustomMessageType?: (type: number) => boolean
 property transport.IPeerManagerOptions.localFeatures?: features.FeatureFlags
 property transport.IPeerManagerOptions.localPrivateKey: Buffer
 property transport.IPeerManagerOptions.maxInboundPeers?: number
@@ -8817,6 +8821,7 @@ property transport.IPeerOptions.createSocket?: (host: string, port: number) => P
 property transport.IPeerOptions.handshakeTimeout?: number
 property transport.IPeerOptions.holdMessagesUntilRelease?: boolean
 property transport.IPeerOptions.host: string
+property transport.IPeerOptions.isKnownCustomMessageType?: (type: number) => boolean
 property transport.IPeerOptions.localFeatures?: features.FeatureFlags
 property transport.IPeerOptions.localPrivateKey: Buffer
 property transport.IPeerOptions.networks?: Buffer[]

@@ -62,6 +62,8 @@ export interface IPeerOptions {
 	port: number;
 	/** Local feature flags to advertise */
 	localFeatures?: FeatureFlags;
+	/** Explicitly supported experimental wire types, including required even types. */
+	isKnownCustomMessageType?: (type: number) => boolean;
 	/**
 	 * Hold post-init inbound messages until releaseHeldMessages() is
 	 * called. The post-handshake drain can surface coalesced traffic (an
@@ -113,6 +115,7 @@ export class Peer extends EventEmitter {
 
 	private localPrivateKey: Buffer;
 	private localFeatures: FeatureFlags;
+	private readonly isKnownCustomMessageType?: (type: number) => boolean;
 	private networks?: Buffer[];
 	private state: PeerState = 'disconnected';
 	/** Non-null while messages are held (see holdMessagesUntilRelease). */
@@ -179,6 +182,7 @@ export class Peer extends EventEmitter {
 
 	constructor(options: IPeerOptions) {
 		super();
+		this.isKnownCustomMessageType = options.isKnownCustomMessageType;
 		this.localPrivateKey = options.localPrivateKey;
 		this.remotePublicKey = options.remotePublicKey;
 		this.host = options.host;
@@ -855,7 +859,11 @@ export class Peer extends EventEmitter {
 		}
 
 		// BOLT 1: Unknown even (required) message types must trigger disconnect
-		const isKnown = Object.values(MessageType).includes(type);
+		const isKnown =
+			Object.values(MessageType).includes(type) ||
+			(type >= 32768 &&
+				type <= 65535 &&
+				this.isKnownCustomMessageType?.(type) === true);
 		if (!isKnown && isRequiredMessageType(type)) {
 			this.emit('error', new Error(`Unknown required message type ${type}`));
 			this.disconnect();
