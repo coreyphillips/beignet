@@ -1,0 +1,38 @@
+# The exported API of beignet/direct-funding/node. Regenerate with npm run api:snapshot; do not edit.
+class FileDirectFundingStorage implements beignet/direct-funding#DirectFundingStorage
+constructor FileDirectFundingStorage(directory: string)
+method FileDirectFundingStorage.close(): void
+method FileDirectFundingStorage.loadWalletData(key: string): string | null
+method FileDirectFundingStorage.saveWalletData(key: string, value: string): void
+interface IDuplexTransport extends EventEmitter
+method IDuplexTransport.destroy(error?: Error): this
+method IDuplexTransport.getIrohDiagnostics?(): beignet/lightning#transport.IIrohDiagnostics
+method IDuplexTransport.markEstablished?(): void
+readonly property IDuplexTransport.remoteAddress?: string
+readonly property IDuplexTransport.remotePort?: number
+method IDuplexTransport.setKeepAlive(enable?: boolean, initialDelay?: number): this
+method IDuplexTransport.setTimeout(timeout: number, callback?: () => void): this
+readonly property IDuplexTransport.transportType?: 'tcp' | 'ws' | 'iroh'
+readonly property IDuplexTransport.writableLength: number
+method IDuplexTransport.write(data: Uint8Array | string, cb?: (err?: Error | null) => void): boolean
+interface INodePeerMessagingOptions
+property INodePeerMessagingOptions.connectionTimeoutMs?: number
+property INodePeerMessagingOptions.createSocket?: TransportConnectFn
+property INodePeerMessagingOptions.identityKey?: Buffer
+property INodePeerMessagingOptions.maxPeers?: number
+property INodePeerMessagingOptions.network: beignet/lightning#invoice.Network
+method INodePeerMessagingOptions.onError?(error: Error, peerNodeId: string): void
+property INodePeerMessagingOptions.reconnectDelayMs?: number
+class NodePeerMessaging implements beignet/lightning#directFunding.IDfPeerMessaging
+constructor NodePeerMessaging(options: INodePeerMessagingOptions)
+method NodePeerMessaging.close(): void
+method NodePeerMessaging.connectPeer(peerNodeId: string, host: string, port: number, timeoutMs?: number, options?: { reconnect?: boolean; }): Promise<void>
+method NodePeerMessaging.disconnectPeer(peerNodeId: string): void
+method NodePeerMessaging.holdPeer(peerNodeId: string): () => void
+method NodePeerMessaging.isPeerConnected(peerNodeId: string): boolean
+method NodePeerMessaging.keepReconnecting(peerNodeId: string): void
+method NodePeerMessaging.nodeIdHex(): string
+method NodePeerMessaging.onCustomMessage(callback: (message: beignet/lightning#directFunding.IDfCustomMessage) => void): () => void
+method NodePeerMessaging.onPeerConnect(callback: (peerNodeId: string) => void): () => void
+method NodePeerMessaging.sendCustomMessage(peerNodeId: string, subtype: number, payload: Buffer): void
+type TransportConnectFn = (host: string, port: number) => Promise<IDuplexTransport>

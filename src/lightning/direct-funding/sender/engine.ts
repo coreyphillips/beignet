@@ -201,6 +201,8 @@ export class DirectFundingSender {
 	/** Keep an outpoint unavailable until an abandoned freeze has been released. */
 	private readonly freezeHolds = new Map<symbol, string>();
 	private readonly recoveringFreezes = new Map<string, Promise<boolean>>();
+	/** An ended exchange's reservation releases, which can outlive its send. */
+	private readonly releases = new Set<Promise<void>>();
 	/** Pending durable cleanup, with whether the wallet has already released. */
 	private readonly pendingReleases = new Map<string, boolean>();
 	private sweepTimer: NodeJS.Timeout | null = null;
@@ -237,6 +239,24 @@ export class DirectFundingSender {
 		if (!this.sweepTimer) return;
 		clearInterval(this.sweepTimer);
 		this.sweepTimer = null;
+	}
+
+	/** Recover abandoned reservations without starting a background timer. */
+	async recoverReservations(): Promise<void> {
+		this.releaseUnwitnessedFreezes();
+		await Promise.all(this.recoveringFreezes.values());
+	}
+
+	/**
+	 * Resolves once every reservation release this sender has started has
+	 * finished, including one still waiting on an acquisition that outlived its
+	 * exchange. A send can settle before its release does, so drain this, after
+	 * the sends, before closing the wallet's storage.
+	 */
+	async waitForReleases(): Promise<void> {
+		while (this.releases.size > 0 || this.recoveringFreezes.size > 0) {
+			await Promise.all([...this.releases, ...this.recoveringFreezes.values()]);
+		}
 	}
 
 	/** Sends running right now. The daemon's drain waits on these. */
@@ -1202,7 +1222,7 @@ export class DirectFundingSender {
 				// Cleanup belongs to the exchange, so a signer that never answers
 				// cannot hold the coin. Await acquisition before releasing: its RPC
 				// may still reserve the coin after the exchange has timed out.
-				releasing = freezing
+				const release: Promise<void> = freezing
 					.then(async (frozen) => {
 						const released =
 							!frozen ||
@@ -1220,7 +1240,12 @@ export class DirectFundingSender {
 						}
 					})
 					.catch(() => undefined)
-					.finally(() => this.freezeHolds.delete(freezeOwner));
+					.finally(() => {
+						this.freezeHolds.delete(freezeOwner);
+						this.releases.delete(release);
+					});
+				this.releases.add(release);
+				releasing = release;
 				return releasing;
 			};
 

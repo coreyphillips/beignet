@@ -1,0 +1,54 @@
+{
+	"name": "@beignet/direct-funding",
+	"version": "0.1.0",
+	"description": "A wallet-independent payer SDK for Bitcoin direct-funding requests.",
+	"license": "MIT",
+	"main": "./dist/direct-funding/index.js",
+	"types": "./dist/direct-funding/index.d.ts",
+	"exports": {
+		".": {
+			"types": "./dist/direct-funding/index.d.ts",
+			"default": "./dist/direct-funding/index.js"
+		},
+		"./node": {
+			"types": "./dist/direct-funding/node.d.ts",
+			"default": "./dist/direct-funding/node.js"
+		},
+		"./package.json": "./package.json"
+	},
+	"typesVersions": {
+		"*": {
+			"node": [
+				"./dist/direct-funding/node.d.ts"
+			]
+		}
+	},
+	"files": [
+		"dist/",
+		"README.md",
+		"LICENSE"
+	],
+	"scripts": {
+		"build": "ts-node ../../scripts/build-direct-funding.ts",
+		"prepack": "npm run build"
+	},
+	"engines": {
+		"node": "^22.23.4 || ^24.22.1 || >=26.12.1"
+	},
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/coreyphillips/beignet.git",
+		"directory": "packages/direct-funding"
+	},
+	"dependencies": {
+		"@bitcoinerlab/secp256k1": "1.0.5",
+		"@noble/hashes": "1.8.0",
+		"@noble/secp256k1": "1.7.2",
+		"@types/node": "22.20.5",
+		"bitcoinjs-lib": "6.1.4"
+	},
+	"devDependencies": {
+		"ts-node": "10.9.0",
+		"typescript": "4.9"
+	}
+}

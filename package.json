@@ -25,6 +25,8 @@
     "test:local": "npm run build && node scripts/run-suites.js",
     "coverage": "c8 npm run test:local",
     "test:api": "npx mocha --exit -r ts-node/register 'tests/api-snapshot/*.test.ts'",
+    "test:direct-funding": "mocha --exit --timeout 120000 -r ts-node/register 'tests/direct-funding/*.test.ts'",
+    "test:direct-funding:regtest": "ts-node scripts/regtest-live/direct-funding-sdk.ts --run",
     "example": "ts-node example",
     "beignet": "ts-node src/cli/cli.ts",
     "test:cli": "npx mocha --exit --parallel --timeout 20000 -r ts-node/register --ignore 'tests/cli/daemon-security.test.ts' --ignore 'tests/cli/daemon-integration.test.ts' 'tests/cli/**/*.test.ts'",
@@ -37,6 +39,7 @@
     "tsc:check": "tsc -p tsconfig.json --noEmit",
     "tsc:check:tests": "tsc -p tsconfig.test.json --noEmit",
     "build": "tsc",
+    "build:direct-funding": "ts-node scripts/build-direct-funding.ts",
     "prepublishOnly": "npm run build",
     "docs:tables": "ts-node scripts/doc-tables.ts",
     "docs:check": "ts-node scripts/doc-tables.ts --check",
@@ -74,6 +77,12 @@
       "daemon": [
         "dist/types/daemon.d.ts"
       ],
+      "direct-funding": [
+        "dist/types/direct-funding/index.d.ts"
+      ],
+      "direct-funding/node": [
+        "dist/types/direct-funding/node.d.ts"
+      ],
       "lightning/iroh-node": [
         "dist/types/lightning/transport/iroh-node.d.ts"
       ],
@@ -102,6 +111,14 @@
     "./daemon": {
       "types": "./dist/types/daemon.d.ts",
       "default": "./dist/daemon.js"
+    },
+    "./direct-funding": {
+      "types": "./dist/types/direct-funding/index.d.ts",
+      "default": "./dist/direct-funding/index.js"
+    },
+    "./direct-funding/node": {
+      "types": "./dist/types/direct-funding/node.d.ts",
+      "default": "./dist/direct-funding/node.js"
     },
     "./lightning/iroh-node": {
       "types": "./dist/types/lightning/transport/iroh-node.d.ts",
