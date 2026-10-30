@@ -1,3 +1,7 @@
+import {
+	copyCustomRecords,
+	type CustomRecords
+} from '../message/custom-records';
 /**
  * BOLT 8: Single peer connection.
  *
@@ -62,6 +66,7 @@ export interface IPeerOptions {
 	port: number;
 	/** Local feature flags to advertise */
 	localFeatures?: FeatureFlags;
+	initCustomRecords?: CustomRecords;
 	/** Explicitly supported experimental wire types, including required even types. */
 	isKnownCustomMessageType?: (type: number) => boolean;
 	/**
@@ -115,6 +120,7 @@ export class Peer extends EventEmitter {
 
 	private localPrivateKey: Buffer;
 	private localFeatures: FeatureFlags;
+	private readonly initCustomRecords?: CustomRecords;
 	private readonly isKnownCustomMessageType?: (type: number) => boolean;
 	private networks?: Buffer[];
 	private state: PeerState = 'disconnected';
@@ -189,6 +195,7 @@ export class Peer extends EventEmitter {
 		this.port = options.port;
 		this.localFeatures = options.localFeatures || FeatureFlags.empty();
 		this.networks = options.networks;
+		this.initCustomRecords = copyCustomRecords(options.initCustomRecords);
 		this.pingIntervalMs = options.pingInterval ?? DEFAULT_PING_INTERVAL_MS;
 		this.pongTimeoutMs = options.pongTimeout ?? DEFAULT_PONG_TIMEOUT_MS;
 		this.createSocketFn = options.createSocket;
@@ -664,7 +671,8 @@ export class Peer extends EventEmitter {
 		// Send our init message
 		const initPayload = encodeInitMessage({
 			features: this.localFeatures,
-			networks: this.networks
+			networks: this.networks,
+			customRecords: this.initCustomRecords
 		});
 		const initMsg = encodeMessage(MessageType.INIT, initPayload);
 		const encrypted = this.transport!.encryptPacket(initMsg);

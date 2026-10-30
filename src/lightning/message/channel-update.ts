@@ -31,7 +31,13 @@
  *   [4: feerate_per_kw]
  */
 
-import { decodeTlvStream, encodeTlvRecord } from './tlv';
+import type { CustomRecords } from './custom-records';
+import {
+	boundedLightningPayload,
+	customRecordEntries,
+	decodeWithCustomRecords
+} from './custom-records';
+import { encodeTlvStream } from './tlv';
 
 export interface IUpdateAddHtlcMessage {
 	channelId: Buffer;
@@ -48,6 +54,8 @@ export interface IUpdateAddHtlcMessage {
 	blindingPoint?: Buffer;
 	/** Agreed liquidity fee withheld from this HTLC, in millisatoshis. */
 	skimmedFeeMsat?: bigint;
+	/** Protocol metadata carried by the channel HTLC, separate from its onion. */
+	customRecords?: CustomRecords;
 }
 
 export interface IUpdateFulfillHtlcMessage {
@@ -118,22 +126,24 @@ export function encodeUpdateAddHtlcMessage(msg: IUpdateAddHtlcMessage): Buffer {
 
 	// Optional trailing blinding_point TLV (type 0, length 33). BOLT 1 allows
 	// trailing TLV extensions; legacy decoders ignore the extra bytes.
-	const parts = [buf];
+	const records = customRecordEntries(
+		msg.customRecords,
+		UPDATE_ADD_HTLC_TLV_TYPES
+	);
 	if (msg.blindingPoint) {
-		if (msg.blindingPoint.length !== 33) {
+		if (msg.blindingPoint.length !== 33)
 			throw new Error('blindingPoint must be 33 bytes');
-		}
-		parts.push(
-			encodeTlvRecord({ type: TLV_BLINDING_POINT, value: msg.blindingPoint })
-		);
+		records.push({ type: TLV_BLINDING_POINT, value: msg.blindingPoint });
 	}
-
 	if (msg.skimmedFeeMsat !== undefined) {
 		const value = Buffer.alloc(8);
 		value.writeBigUInt64BE(msg.skimmedFeeMsat);
-		parts.push(encodeTlvRecord({ type: TLV_SKIMMED_FEE_MSAT, value }));
+		records.push({ type: TLV_SKIMMED_FEE_MSAT, value });
 	}
-	return Buffer.concat(parts);
+	records.sort((a, b) => (a.type < b.type ? -1 : 1));
+	return boundedLightningPayload(
+		Buffer.concat([buf, encodeTlvStream(records)])
+	);
 }
 
 /**
@@ -173,8 +183,9 @@ export function decodeUpdateAddHtlcMessage(
 	// invalid_onion_blinding (BOLT 2).
 	let blindingPoint: Buffer | undefined;
 	let skimmedFeeMsat: bigint | undefined;
+	const customRecords = new Map<bigint, Buffer>();
 	if (offset < payload.length) {
-		const { records } = decodeTlvStream(
+		const records = decodeWithCustomRecords(
 			payload,
 			offset,
 			UPDATE_ADD_HTLC_TLV_TYPES
@@ -192,6 +203,8 @@ export function decodeUpdateAddHtlcMessage(
 					throw new Error('update_add_htlc: skimmed_fee_msat must be 8 bytes');
 				}
 				skimmedFeeMsat = record.value.readBigUInt64BE();
+			} else if (record.type >= 65536n) {
+				customRecords.set(record.type, Buffer.from(record.value));
 			}
 		}
 	}
@@ -208,6 +221,7 @@ export function decodeUpdateAddHtlcMessage(
 		result.blindingPoint = blindingPoint;
 	}
 	if (skimmedFeeMsat !== undefined) result.skimmedFeeMsat = skimmedFeeMsat;
+	if (customRecords.size) result.customRecords = customRecords;
 	return result;
 }
 

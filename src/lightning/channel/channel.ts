@@ -1,3 +1,11 @@
+import type { IChannelAuxiliaryProvider } from './auxiliary';
+import {
+	copyAuxiliaryCommitment,
+	requireAuxiliaryProvider,
+	validateAuxiliaryChannelType
+} from './auxiliary';
+import type { CustomRecords } from '../message/custom-records';
+import { copyCustomRecords } from '../message/custom-records';
 /**
  * BOLT 2: Channel state machine.
  *
@@ -192,6 +200,7 @@ import {
 	hasScidAliasChannelType,
 	isAnchorChannel,
 	isTaprootChannel,
+	isOverlayChannel,
 	receivedAddIrrevocablyCommitted,
 	scidAliasAnnounceRefusal,
 	validateV2ChannelType
@@ -1312,8 +1321,19 @@ export class Channel {
 		setScid: (field, scid): void => this._setScid(field, scid)
 	});
 
-	constructor(state: IChannelState, signer?: ISigner) {
+	constructor(
+		state: IChannelState,
+		signer?: ISigner,
+		auxiliaryProvider?: IChannelAuxiliaryProvider
+	) {
 		this._state = state;
+		if (auxiliaryProvider) state.auxiliaryProvider = auxiliaryProvider;
+		if (
+			state.auxiliaryState ||
+			state.fundingTaprootMerkleRoot ||
+			isOverlayChannel(state.channelType)
+		)
+			requireAuxiliaryProvider(state);
 		this._signer = signer || null;
 		const f = state.ffor;
 		this._fforActivateAckUnsent =
@@ -1635,7 +1655,10 @@ export class Channel {
 		// lnd v0.20). Non-taproot keeps static_remotekey (bit 12) +
 		// option_anchors_zero_fee_htlc_tx (bit 22) when requested.
 		const channelTypeFlags = FeatureFlags.empty();
-		if (preferTaproot) {
+		if (this._state.auxiliaryState) {
+			preferTaproot = true;
+			channelTypeFlags.setCompulsory(Feature.OPTION_TAPROOT_OVERLAY);
+		} else if (preferTaproot) {
 			channelTypeFlags.setCompulsory(Feature.OPTION_TAPROOT);
 		} else {
 			channelTypeFlags.setCompulsory(Feature.STATIC_REMOTE_KEY);
@@ -1928,6 +1951,17 @@ export class Channel {
 		if (!valid) {
 			return 'Invalid taproot partial signature';
 		}
+		if (this._state.auxiliaryState) {
+			const built = buildLocalCommitment(
+				this._state,
+				localPerCommitmentPoint,
+				commitmentNumber
+			);
+			this._state.auxiliaryState.localCommitments.set(
+				commitmentNumber,
+				copyAuxiliaryCommitment(built.auxiliary!)
+			);
+		}
 		this._state.remoteCommitmentSignature = theirPartial;
 		this._state.remoteSigningNonce = theirSigningNonce;
 		return null;
@@ -2008,6 +2042,11 @@ export class Channel {
 		// ChannelManager keys tempChannels by.
 		const refuse = (reason: string): ChannelAction[] =>
 			refuseWithWireError(this._state.temporaryChannelId, reason);
+		const auxiliaryError = validateAuxiliaryChannelType(
+			this._state,
+			msg.channelType
+		);
+		if (auxiliaryError) return refuse(auxiliaryError);
 
 		// Validate the acceptor's parameters against what WE proposed in
 		// open_channel BEFORE adopting them. Without this an adversarial acceptor
@@ -2417,6 +2456,11 @@ export class Channel {
 		// demands, having been sliced from the wire by decodeOpenChannelMessage.
 		const refuse = (reason: string): ChannelAction[] =>
 			refuseWithWireError(msg.temporaryChannelId, reason);
+		const auxiliaryError = validateAuxiliaryChannelType(
+			this._state,
+			msg.channelType
+		);
+		if (auxiliaryError) return refuse(auxiliaryError);
 
 		// Peer-supplied, so the bounds that only apply to a value we did not
 		// choose run too. ChannelManager.handleOpenChannel has already seeded
@@ -2484,7 +2528,7 @@ export class Channel {
 			// implied), so accept either an explicit static_remotekey or taproot.
 			if (
 				!proposedFlags.hasFeature(Feature.STATIC_REMOTE_KEY) &&
-				!proposedFlags.hasFeature(Feature.OPTION_TAPROOT)
+				!isTaprootChannel(msg.channelType)
 			) {
 				return refuse('Proposed channel type must include static_remotekey');
 			}
@@ -3598,13 +3642,57 @@ export class Channel {
 		return [];
 	}
 
+	private _recordAuxiliaryResolution(entry: IHtlcEntry): void {
+		const auxiliary = this._state.auxiliaryState;
+		if (!auxiliary || entry.auxiliaryAmount === undefined) return;
+		auxiliary.resolvedHtlcs ??= new Map();
+		auxiliary.resolvedHtlcs.set(`${entry.direction}:${entry.id}`, {
+			htlcId: entry.id,
+			direction: entry.direction,
+			paymentHash: Buffer.from(entry.paymentHash),
+			auxiliaryAmount: entry.auxiliaryAmount,
+			customRecords: copyCustomRecords(entry.customRecords),
+			outcome: entry.state === HtlcState.FULFILLED ? 'fulfilled' : 'failed'
+		});
+	}
+
+	private _prepareAuxiliaryHtlc(entry: IHtlcEntry): void {
+		if (!this._state.auxiliaryState && !this._state.fundingTaprootMerkleRoot)
+			return;
+		const provider = requireAuxiliaryProvider(this._state);
+		const dust =
+			this._state.localConfig.dustLimitSatoshis >
+			this._state.remoteConfig.dustLimitSatoshis
+				? this._state.localConfig.dustLimitSatoshis
+				: this._state.remoteConfig.dustLimitSatoshis;
+		if (entry.amountMsat / 1000n < dust)
+			throw new Error('Asset HTLC carrier is below the negotiated dust limit');
+		provider.validateHtlc(this._state, entry);
+		const amount = provider.getHtlcAmount(this._state, entry);
+		const balance =
+			entry.direction === HtlcDirection.OFFERED
+				? this._state.auxiliaryState!.localBalance
+				: this._state.auxiliaryState!.remoteBalance;
+		if (
+			typeof amount !== 'bigint' ||
+			amount <= 0n ||
+			amount > 0xffffffffffffffffn ||
+			amount > balance
+		)
+			throw new Error(
+				'Invalid asset HTLC amount or insufficient asset balance'
+			);
+		entry.auxiliaryAmount = amount;
+	}
+
 	addHtlc(
 		amountMsat: bigint,
 		paymentHash: Buffer,
 		cltvExpiry: number,
 		onionRoutingPacket: Buffer,
 		blindingPoint?: Buffer,
-		skimmedFeeMsat?: bigint
+		skimmedFeeMsat?: bigint,
+		customRecords?: CustomRecords
 	): ChannelAction[] {
 		if (
 			skimmedFeeMsat !== undefined &&
@@ -3614,9 +3702,10 @@ export class Channel {
 		}
 		const refusal = this.validateOutgoingHtlc(amountMsat, cltvExpiry);
 		if (refusal.length > 0) return refusal;
-		const htlcId = this._state.localHtlcCounter++;
+		const htlcId = this._state.localHtlcCounter;
 
 		const entry: IHtlcEntry = {
+			customRecords: copyCustomRecords(customRecords),
 			id: htlcId,
 			amountMsat,
 			paymentHash,
@@ -3633,13 +3722,9 @@ export class Channel {
 			...(blindingPoint ? { blindingPoint } : {})
 		};
 
-		this._state.htlcs.set(`offered-${htlcId}`, entry);
-
-		// Deduct from local balance provisionally
-		this._state.localBalanceMsat -= amountMsat;
-
 		const msg: IUpdateAddHtlcMessage = {
 			channelId: this._state.channelId!,
+			customRecords: copyCustomRecords(customRecords),
 			id: htlcId,
 			amountMsat,
 			paymentHash,
@@ -3648,11 +3733,19 @@ export class Channel {
 			...(blindingPoint ? { blindingPoint } : {})
 		};
 		if (skimmedFeeMsat !== undefined) msg.skimmedFeeMsat = skimmedFeeMsat;
+		const payload = encodeUpdateAddHtlcMessage(msg);
+		this._prepareAuxiliaryHtlc(entry);
+		this._state.localHtlcCounter++;
+		this._state.htlcs.set(`offered-${htlcId}`, entry);
+
+		// Deduct from local balance provisionally
+		this._state.localBalanceMsat -= amountMsat;
+		if (this._state.auxiliaryState)
+			this._state.auxiliaryState.localBalance -= entry.auxiliaryAmount!;
 
 		// We added an offered HTLC — we owe the remote a commitment_signed.
 		this._state.needsCommitment = true;
 
-		const payload = encodeUpdateAddHtlcMessage(msg);
 		// BOLT 2 reestablish: queue the raw update until the peer's
 		// revoke_and_ack acknowledges it — a reconnect must retransmit it.
 		this._queuePendingLocalUpdate(MessageType.UPDATE_ADD_HTLC, payload);
@@ -3732,7 +3825,13 @@ export class Channel {
 				existing.amountMsat === msg.amountMsat &&
 				existing.paymentHash.equals(msg.paymentHash) &&
 				existing.cltvExpiry === msg.cltvExpiry &&
-				existing.onionRoutingPacket.equals(msg.onionRoutingPacket)
+				existing.onionRoutingPacket.equals(msg.onionRoutingPacket) &&
+				(existing.customRecords?.size ?? 0) ===
+					(msg.customRecords?.size ?? 0) &&
+				[...(existing.customRecords ?? [])].every(
+					([type, value]) =>
+						msg.customRecords?.get(type)?.equals(value) === true
+				)
 			) {
 				return [];
 			}
@@ -4020,6 +4119,7 @@ export class Channel {
 			msg.cltvExpiry <= this._currentBlockHeight;
 
 		const entry: IHtlcEntry = {
+			customRecords: copyCustomRecords(msg.customRecords),
 			id: msg.id,
 			amountMsat: msg.amountMsat,
 			paymentHash: msg.paymentHash,
@@ -4046,6 +4146,14 @@ export class Channel {
 				? { addedWhileFundingUnaccounted: true }
 				: {})
 		};
+
+		try {
+			this._prepareAuxiliaryHtlc(entry);
+		} catch {
+			return this._failChannelWithWireError(
+				'Invalid asset HTLC metadata or balance'
+			);
+		}
 
 		// The reserve check above is measured against the reserve WE enforce,
 		// which on an asymmetric-dust channel can sit below our own dust limit.
@@ -4083,6 +4191,8 @@ export class Channel {
 
 		// Deduct from remote balance provisionally
 		this._state.remoteBalanceMsat -= msg.amountMsat;
+		if (this._state.auxiliaryState)
+			this._state.auxiliaryState.remoteBalance -= entry.auxiliaryAmount!;
 
 		// Note: HTLC_FORWARDED is NOT emitted here — per BOLT 2, HTLCs should
 		// only be processed after commitment_signed is verified and revoke_and_ack
@@ -4831,6 +4941,17 @@ export class Channel {
 				htlc.state === HtlcState.FAILED
 			) {
 				entries.push({
+					...(this._state.auxiliaryState
+						? {
+								id: htlc.id,
+								...(htlc.customRecords !== undefined
+									? { customRecords: copyCustomRecords(htlc.customRecords) }
+									: {}),
+								...(htlc.auxiliaryAmount !== undefined
+									? { auxiliaryAmount: htlc.auxiliaryAmount }
+									: {})
+						  }
+						: {}),
 					paymentHash: Buffer.from(htlc.paymentHash),
 					amountMsat: htlc.amountMsat,
 					cltvExpiry: htlc.cltvExpiry,
@@ -4983,7 +5104,38 @@ export class Channel {
 			}
 		}
 
+		let auxiliaryRecords: CustomRecords | undefined;
+		let auxiliaryCommitment:
+			| ReturnType<typeof buildRemoteCommitment>
+			| undefined;
+		if (this._state.auxiliaryState) {
+			if (!this._signer)
+				throw new Error('Asset commitment signing requires a signer');
+			const point =
+				this._state.remoteNextPerCommitmentPoint ??
+				this._state.remoteCurrentPerCommitmentPoint;
+			if (!point)
+				throw new Error(
+					'Asset commitment signing requires a peer commitment point'
+				);
+			const number = this._state.remoteCommitmentNumber + 1n;
+			auxiliaryCommitment = buildRemoteCommitment(this._state, point, number);
+			auxiliaryRecords = copyCustomRecords(
+				requireAuxiliaryProvider(this._state).signHtlcs(
+					{
+						state: this._state,
+						side: 'remote',
+						commitmentNumber: number,
+						perCommitmentPoint: point,
+						commitment: auxiliaryCommitment
+					},
+					this._signer
+				)
+			);
+		}
+
 		const msg: ICommitmentSignedMessage = {
+			customRecords: auxiliaryRecords,
 			channelId: this._state.channelId!,
 			signature: taproot ? Buffer.alloc(64) : signature,
 			htlcSignatures,
@@ -4993,6 +5145,14 @@ export class Channel {
 			// Batched commitments are routed by their funding_txid TLV.
 			msg.fundingTxid = Buffer.from(this._state.fundingTxid);
 		}
+
+		const encodedMessage = encodeCommitmentSignedMessage(msg);
+		this._state.lastSentAuxiliaryRecords = copyCustomRecords(auxiliaryRecords);
+		if (auxiliaryCommitment?.auxiliary)
+			this._state.auxiliaryState!.remoteCommitments.set(
+				this._state.remoteCommitmentNumber + 1n,
+				copyAuxiliaryCommitment(auxiliaryCommitment.auxiliary)
+			);
 
 		// Cache for retransmission on reestablish. For taproot we cache the
 		// 98-byte partial_signature_with_nonce that actually went on the wire so
@@ -5129,7 +5289,7 @@ export class Channel {
 				fundingTxid: Buffer.from(this._state.spliceInFlight.spliceTxid)
 			};
 			const startBatchBytes = encodeStartBatchMessage(startBatch);
-			const currentBytes = encodeCommitmentSignedMessage(msg);
+			const currentBytes = encodedMessage;
 			const spliceBytes = encodeCommitmentSignedMessage(spliceMsg);
 			// Cache the exact wire bytes so a disconnect straddling this batch can
 			// retransmit it verbatim on reestablish (the generic single-message
@@ -5153,7 +5313,7 @@ export class Channel {
 
 		return [
 			{ type: ChannelActionType.PERSIST_STATE },
-			sendMsg(MessageType.COMMITMENT_SIGNED, encodeCommitmentSignedMessage(msg))
+			sendMsg(MessageType.COMMITMENT_SIGNED, encodedMessage)
 		];
 	}
 
@@ -5348,6 +5508,34 @@ export class Channel {
 			if (trimmed) return this._failChannelWithWireError(trimmed);
 		}
 
+		if (this._state.auxiliaryState) {
+			const number = this._state.localCommitmentNumber + 1n;
+			const point = getPerCommitmentPoint(
+				this._state.localPerCommitmentSeed,
+				number
+			);
+			try {
+				const commitment = buildLocalCommitment(this._state, point, number);
+				if (
+					!requireAuxiliaryProvider(this._state).verifyHtlcs(
+						{
+							state: this._state,
+							side: 'local',
+							commitmentNumber: number,
+							perCommitmentPoint: point,
+							commitment
+						},
+						msg.customRecords ?? new Map()
+					)
+				)
+					return this._failChannelWithWireError('Invalid asset HTLC signature');
+			} catch {
+				return this._failChannelWithWireError(
+					'Invalid asset commitment metadata'
+				);
+			}
+		}
+
 		if (isTaprootChannel(this._state.channelType)) {
 			// Cannot verify -> must not adopt, the taproot twin of the ECDSA arm
 			// below. A plain ERROR, not a wire error: the missing pieces are a
@@ -5402,6 +5590,11 @@ export class Channel {
 				// peer-fault reason here.
 				return this._failChannelWithWireError(err);
 			}
+			const auxiliary = this._state.auxiliaryState?.localCommitments.get(
+				this._state.localCommitmentNumber + 1n
+			);
+			if (auxiliary)
+				auxiliary.peerSignatures = copyCustomRecords(msg.customRecords);
 			this._state.remoteHtlcSignatures = msg.htlcSignatures;
 		} else {
 			// Cannot verify -> must not adopt: the revoke_and_ack this handler
@@ -5854,21 +6047,35 @@ export class Channel {
 				if (entry.direction === HtlcDirection.RECEIVED) {
 					// We received and fulfilled: credit our balance
 					this._state.localBalanceMsat += entry.amountMsat;
+					if (this._state.auxiliaryState)
+						this._state.auxiliaryState.localBalance +=
+							entry.auxiliaryAmount ?? 0n;
 					this._retainSignedLocalRemoval(entry);
 				} else {
 					// We offered and remote fulfilled: credit remote balance
 					this._state.remoteBalanceMsat += entry.amountMsat;
+					if (this._state.auxiliaryState)
+						this._state.auxiliaryState.remoteBalance +=
+							entry.auxiliaryAmount ?? 0n;
 				}
+				this._recordAuxiliaryResolution(entry);
 				this._state.htlcs.delete(key);
 			} else if (entry.state === HtlcState.FAILED) {
 				if (entry.direction === HtlcDirection.RECEIVED) {
 					// We received but failed: refund remote balance
 					this._state.remoteBalanceMsat += entry.amountMsat;
+					if (this._state.auxiliaryState)
+						this._state.auxiliaryState.remoteBalance +=
+							entry.auxiliaryAmount ?? 0n;
 					this._retainSignedLocalRemoval(entry);
 				} else {
 					// We offered but it failed: refund our balance
 					this._state.localBalanceMsat += entry.amountMsat;
+					if (this._state.auxiliaryState)
+						this._state.auxiliaryState.localBalance +=
+							entry.auxiliaryAmount ?? 0n;
 				}
+				this._recordAuxiliaryResolution(entry);
 				this._state.htlcs.delete(key);
 			}
 		}
@@ -7607,7 +7814,9 @@ export class Channel {
 			try {
 				const { p2trOutput, outputKey } = createTaprootFundingScript(
 					view.localBasepoints.fundingPubkey,
-					remoteFundingPubkey
+					remoteFundingPubkey,
+					undefined,
+					view.fundingTaprootMerkleRoot
 				);
 				const sighash = taprootCommitmentSighash(
 					tx,
@@ -7619,7 +7828,8 @@ export class Channel {
 					view.localBasepoints.fundingPubkey,
 					remoteFundingPubkey,
 					taprootNonce,
-					view.remoteSigningNonce!
+					view.remoteSigningNonce!,
+					view.fundingTaprootMerkleRoot
 				);
 				if (
 					!verifyPartialCommitmentSig(
@@ -8091,6 +8301,32 @@ export class Channel {
 		return actions;
 	}
 
+	private _prepareAuxiliaryShutdown(destinationScript: Buffer): {
+		scriptPubkey: Buffer;
+		customRecords?: CustomRecords;
+	} {
+		if (!this._state.auxiliaryState) return { scriptPubkey: destinationScript };
+		const auxiliary = this._state.auxiliaryState;
+		if (auxiliary.localShutdownRecords && this._state.localShutdownScript)
+			return {
+				scriptPubkey: this._state.localShutdownScript,
+				customRecords: auxiliary.localShutdownRecords
+			};
+		if (!this._signer) throw new Error('Asset shutdown requires a signer');
+		const prepared = requireAuxiliaryProvider(this._state).prepareShutdown(
+			this._state,
+			destinationScript,
+			this._signer
+		);
+		if (!isValidShutdownScript(prepared.scriptPubkey, true, false))
+			throw new Error('Invalid asset shutdown script');
+		auxiliary.localShutdownRecords = copyCustomRecords(prepared.customRecords);
+		return {
+			scriptPubkey: Buffer.from(prepared.scriptPubkey),
+			customRecords: auxiliary.localShutdownRecords
+		};
+	}
+
 	private _initiateShutdown(scriptPubkey: Buffer): ChannelAction[] {
 		// option_simple_close allows re-sending shutdown to update the local
 		// script mid-negotiation (restarting the signing flow); legacy close
@@ -8116,6 +8352,9 @@ export class Channel {
 				}
 			];
 		}
+
+		const auxiliaryShutdown = this._prepareAuxiliaryShutdown(scriptPubkey);
+		scriptPubkey = auxiliaryShutdown.scriptPubkey;
 
 		// Guard against a misconfigured local close script — never broadcast a
 		// shutdown whose output we could not spend.
@@ -8145,6 +8384,7 @@ export class Channel {
 		}
 
 		const msg: IShutdownMessage = {
+			customRecords: auxiliaryShutdown.customRecords,
 			channelId: this._state.channelId!,
 			scriptPubkey
 		};
@@ -8154,7 +8394,12 @@ export class Channel {
 			msg.shutdownNonce = this._refreshOurClosingNonce();
 		}
 
-		return [sendMsg(MessageType.SHUTDOWN, encodeShutdownMessage(msg))];
+		return [
+			...(this._state.auxiliaryState
+				? [{ type: ChannelActionType.PERSIST_STATE } as ChannelAction]
+				: []),
+			sendMsg(MessageType.SHUTDOWN, encodeShutdownMessage(msg))
+		];
 	}
 
 	/**
@@ -8165,6 +8410,7 @@ export class Channel {
 	 */
 	buildShutdownRetransmit(): IShutdownMessage {
 		const msg: IShutdownMessage = {
+			customRecords: this._state.auxiliaryState?.localShutdownRecords,
 			channelId: this._state.channelId!,
 			scriptPubkey: this._state.localShutdownScript ?? Buffer.alloc(0)
 		};
@@ -8264,6 +8510,38 @@ export class Channel {
 			return this._failChannelWithWireError('Invalid shutdown scriptPubkey');
 		}
 
+		if (this._state.auxiliaryState) {
+			const records = copyCustomRecords(msg.customRecords) ?? new Map();
+			try {
+				if (
+					!requireAuxiliaryProvider(this._state).verifyShutdown(this._state, {
+						scriptPubkey: msg.scriptPubkey,
+						customRecords: records
+					})
+				)
+					return this._failChannelWithWireError(
+						'Invalid asset shutdown descriptor'
+					);
+			} catch {
+				return this._failChannelWithWireError(
+					'Invalid asset shutdown descriptor'
+				);
+			}
+			const previous = this._state.auxiliaryState.remoteShutdownRecords;
+			if (
+				previous &&
+				(previous.size !== records.size ||
+					[...previous].some(
+						([type, value]) => !records.get(type)?.equals(value)
+					) ||
+					!this._state.remoteShutdownScript?.equals(msg.scriptPubkey))
+			)
+				return this._failChannelWithWireError(
+					'Asset shutdown descriptor changed during negotiation'
+				);
+			this._state.auxiliaryState.remoteShutdownRecords = records;
+		}
+
 		// Accept shutdown in NEGOTIATING_CLOSING — peer retransmits after
 		// reestablish, or (simple close) updates its script mid-negotiation,
 		// which abandons our in-flight closing_complete round.
@@ -8296,6 +8574,10 @@ export class Channel {
 
 		// If we haven't sent shutdown yet, send our shutdown response
 		if (this._state.state === ChannelState.NORMAL) {
+			const prepared = this._prepareAuxiliaryShutdown(
+				localScript ?? this._state.localShutdownScript ?? Buffer.alloc(0)
+			);
+			localScript = prepared.scriptPubkey;
 			if (localScript) {
 				this._state.localShutdownScript = localScript;
 			}
@@ -8306,6 +8588,7 @@ export class Channel {
 			// Send shutdown response per BOLT 2 (only if we have a real script)
 			if (this._state.localShutdownScript.length > 0) {
 				const response: IShutdownMessage = {
+					customRecords: this._state.auxiliaryState?.localShutdownRecords,
 					channelId: this._state.channelId!,
 					scriptPubkey: this._state.localShutdownScript
 				};
@@ -8326,6 +8609,8 @@ export class Channel {
 			this._state.state = ChannelState.NEGOTIATING_CLOSING;
 		}
 
+		if (this._state.auxiliaryState)
+			actions.unshift({ type: ChannelActionType.PERSIST_STATE });
 		return actions;
 	}
 
@@ -9703,6 +9988,9 @@ export class Channel {
 				// arithmetic handleRevokeAndAck applies to a terminally failed
 				// offered HTLC.
 				this._state.localBalanceMsat += entry.amountMsat;
+				if (this._state.auxiliaryState)
+					this._state.auxiliaryState.localBalance +=
+						entry.auxiliaryAmount ?? 0n;
 			}
 			dropped.push({
 				htlcId: msg.id,
@@ -9951,6 +10239,9 @@ export class Channel {
 			) {
 				this._state.htlcs.delete(key);
 				this._state.remoteBalanceMsat += entry.amountMsat;
+				if (this._state.auxiliaryState)
+					this._state.auxiliaryState.remoteBalance +=
+						entry.auxiliaryAmount ?? 0n;
 				continue;
 			}
 			// A peer fulfill/fail of our offered HTLC never covered by the
@@ -11843,6 +12134,7 @@ export class Channel {
 					: this._state.lastSentCommitmentSigned
 			) {
 				const commitMsg: ICommitmentSignedMessage = {
+					customRecords: this._state.lastSentAuxiliaryRecords,
 					channelId: this._state.channelId!,
 					signature: taprootReest
 						? Buffer.alloc(64)
@@ -17642,7 +17934,9 @@ export class Channel {
 			if (taproot) {
 				fundingSpk = createTaprootFundingScript(
 					this._state.localBasepoints.fundingPubkey,
-					this._state.remoteBasepoints.fundingPubkey
+					this._state.remoteBasepoints.fundingPubkey,
+					undefined,
+					this._state.fundingTaprootMerkleRoot
 				).p2trOutput;
 			} else {
 				fundingSpk = createFundingScript(
@@ -18844,7 +19138,9 @@ export class Channel {
 		const script = isTaprootChannel(this._state.channelType)
 			? createTaprootFundingScript(
 					this._state.localBasepoints.fundingPubkey,
-					this._state.remoteBasepoints.fundingPubkey
+					this._state.remoteBasepoints.fundingPubkey,
+					undefined,
+					this._state.fundingTaprootMerkleRoot
 			  ).p2trOutput
 			: createFundingScript(
 					this._state.localBasepoints.fundingPubkey,

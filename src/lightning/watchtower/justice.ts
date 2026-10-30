@@ -91,6 +91,8 @@ export interface IJusticeContext {
 	 * commitments elsewhere in beignet).
 	 */
 	isTaproot?: boolean;
+	/** Standard tower kits cannot encode auxiliary asset commitment trees. */
+	hasAuxiliaryCommitments?: boolean;
 	/** Our static to_remote payment pubkey on the remote commitment. */
 	localPaymentPubkey?: Buffer;
 	/** Secret for localPaymentPubkey (signs the to_remote sweep). */
@@ -145,6 +147,11 @@ export function buildJusticeBackup(
 	ctx: IJusticeContext,
 	policy: ISessionPolicy
 ): IJusticeBackup {
+	if (ctx.hasAuxiliaryCommitments) {
+		throw new Error(
+			'watchtower: standard justice kits cannot represent asset commitment outputs; use native local recovery'
+		);
+	}
 	// BOLT: the user-supplied sweep script MUST be a standard witness program
 	// (P2WPKH=22 / P2WSH=34 here); an off-spec length makes LND's tower error
 	// at breach time, silently voiding protection. Checked up front, before any

@@ -1,3 +1,4 @@
+import type { HtlcDirection } from '../channel/types';
 /**
  * BOLT 5: Chain monitor types.
  *
@@ -39,6 +40,15 @@ export enum OutputType {
 
 /** A tracked on-chain output */
 export interface ITrackedOutput {
+	/** Durable asset transition and proof payload, recorded before broadcast. */
+	auxiliaryData?: Buffer;
+	/** Exact asset transition retained for every signed Bitcoin sweep attempt. */
+	auxiliarySweepAttempts?: Record<
+		string,
+		{ transaction: string; auxiliaryData: Buffer }
+	>;
+	auxiliaryHtlcDirection?: HtlcDirection;
+	auxiliaryCommitmentNumber?: bigint;
 	txid: string;
 	outputIndex: number;
 	amount: bigint;

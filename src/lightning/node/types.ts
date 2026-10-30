@@ -687,6 +687,8 @@ export interface INodeConfig {
 	 * mainnet balances yet.
 	 */
 	preferTaproot?: boolean;
+	/** Native asset channel implementation with durable funding admission. */
+	auxiliaryChannels?: import('../channel/auxiliary-funding').IAuxiliaryChannelConfig;
 	/**
 	 * Liquidity ads (bLIP-0051) SELLER policy: when set, an inbound
 	 * open_channel2 carrying request_funds is answered with a signed will_fund
@@ -1075,6 +1077,8 @@ export interface ICreateInvoiceOptions {
 	 * produce because the channel does not exist yet.
 	 */
 	extraRoutingHints?: IRoutingHintHop[][];
+	/** Emit only caller-supplied routing hints, such as a peer-bound asset RFQ alias. */
+	omitAutomaticRoutingHints?: boolean;
 	/**
 	 * JIT receive, wallet side (issue #595): the opening-fee QUOTE the LSP
 	 * returned in its ack. The final hop then accepts HTLCs short of their

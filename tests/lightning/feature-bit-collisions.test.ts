@@ -72,7 +72,8 @@ const FOREIGN_PAIRS: ReadonlyArray<{
 /** Foreign pairs beignet takes on purpose, for the same feature. */
 const SHARED_ON_PURPOSE = new Map<number, Feature>([
 	// LND's staging taproot bit, which is what LND actually advertises.
-	[180, Feature.OPTION_TAPROOT]
+	[180, Feature.OPTION_TAPROOT],
+	[2026, Feature.OPTION_TAPROOT_OVERLAY]
 ]);
 
 function foreignOwner(bit: number): string | null {
@@ -87,7 +88,9 @@ function collisions(bits: number[]): string[] {
 	for (const bit of bits) {
 		const owner = foreignOwner(bit);
 		if (!owner) continue;
-		if (SHARED_ON_PURPOSE.get(bit - (bit % 2)) !== undefined) continue;
+		const feature =
+			bit === 2025 ? Feature.OPTION_TAPROOT_OVERLAY : bit - (bit % 2);
+		if (SHARED_ON_PURPOSE.get(feature) !== undefined) continue;
 		out.push(`${bit}: ${owner}`);
 	}
 	return out;
@@ -154,6 +157,16 @@ describe('Feature bit collisions with other implementations (issue #1886)', () =
 		for (const [pair, feature] of SHARED_ON_PURPOSE) {
 			expect(feature, `pair ${pair}`).to.equal(pair);
 		}
+	});
+
+	it('shares the deployed overlay required bit and its nonadjacent optional partner', () => {
+		const flags = FeatureFlags.empty();
+		flags.setOptional(Feature.OPTION_TAPROOT_OVERLAY);
+		expect(flags.listSetBits()).to.deep.equal([2025]);
+		expect(collisions(flags.listSetBits())).to.deep.equal([]);
+		flags.setCompulsory(Feature.OPTION_TAPROOT_OVERLAY);
+		expect(flags.hasBit(2026)).to.equal(true);
+		expect(collisions(flags.listSetBits())).to.deep.equal([]);
 	});
 
 	it('the beignet block is 440-445', () => {

@@ -1,3 +1,7 @@
+import {
+	copyCustomRecords,
+	type CustomRecords
+} from '../message/custom-records';
 /**
  * Peer connection pool manager.
  *
@@ -210,6 +214,7 @@ export interface IPeerManagerOptions {
 	localPrivateKey: Buffer;
 	/** Local feature flags to advertise */
 	localFeatures?: FeatureFlags;
+	initCustomRecords?: CustomRecords;
 	/** Explicitly supported experimental wire types. Consulted on every message. */
 	isKnownCustomMessageType?: (type: number) => boolean;
 	/** Chain hashes to advertise */
@@ -379,6 +384,7 @@ export class PeerManager extends EventEmitter {
 	private localPrivateKey: Buffer;
 	private localPubkeyHex: string;
 	private localFeatures: FeatureFlags;
+	private readonly initCustomRecords?: CustomRecords;
 	private networks?: Buffer[];
 	private peers: Map<string, Peer> = new Map();
 	private peerAddresses: Map<
@@ -482,6 +488,7 @@ export class PeerManager extends EventEmitter {
 		this.localPubkeyHex = getPublicKey(options.localPrivateKey).toString('hex');
 		this.localFeatures = options.localFeatures || FeatureFlags.empty();
 		this.networks = options.networks;
+		this.initCustomRecords = copyCustomRecords(options.initCustomRecords);
 		this.autoReconnect = options.autoReconnect ?? false;
 		this.maxReconnectDelay =
 			options.maxReconnectDelay ?? DEFAULT_MAX_RECONNECT_DELAY_MS;
@@ -751,6 +758,7 @@ export class PeerManager extends EventEmitter {
 			port,
 			localFeatures: this.localFeatures,
 			networks: this.networks,
+			initCustomRecords: this.initCustomRecords,
 			createSocket,
 			...(timeoutMs !== undefined
 				? { connectTimeout: timeoutMs, handshakeTimeout: timeoutMs }
@@ -1828,6 +1836,7 @@ export class PeerManager extends EventEmitter {
 			port: socket.remotePort || 0,
 			localFeatures: this.localFeatures,
 			networks: this.networks,
+			initCustomRecords: this.initCustomRecords,
 			handshakeTimeout: this.inboundHandshakeTimeoutMs,
 			// Held until bring-up completes; see the outbound twin. For
 			// inbound this also closes the harder gap: the drain runs

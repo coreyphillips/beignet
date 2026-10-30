@@ -11,3 +11,7 @@ export * from './quiescence';
 export * from './splice';
 export * from './splice-weight';
 export * from './dual-funding';
+
+export * from './auxiliary';
+
+export * from './auxiliary-funding';

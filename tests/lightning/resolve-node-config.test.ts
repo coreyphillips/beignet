@@ -279,6 +279,7 @@ describe('LightningNode.fromMnemonic options', () => {
 		// A Record over every key, so a new INodeConfig option fails to
 		// compile here until it is listed.
 		const given: Record<keyof LightningNodeSeedOptions, unknown> = {
+			auxiliaryChannels: undefined,
 			zeroReserve: undefined,
 			network: undefined,
 			channelConfig: undefined,

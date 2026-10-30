@@ -21,6 +21,7 @@
  */
 
 import * as bitcoin from 'bitcoinjs-lib';
+import type { ITaprootAuxLeaf } from './commitment-taproot';
 import { tapleafHash as bip341TapleafHash } from 'bitcoinjs-lib/src/payments/bip341';
 import { ecc } from '../../utils/ecc';
 import {
@@ -81,7 +82,8 @@ export function buildTaprootHtlcSuccessTx(
 	revocationPubkey: Buffer,
 	localDelayedPubkey: Buffer,
 	toSelfDelay: number,
-	network: bitcoin.Network = bitcoin.networks.bitcoin
+	network: bitcoin.Network = bitcoin.networks.bitcoin,
+	auxiliaryLeaf?: ITaprootAuxLeaf
 ): bitcoin.Transaction {
 	return buildSecondLevel(
 		htlcTxid,
@@ -91,7 +93,8 @@ export function buildTaprootHtlcSuccessTx(
 		localDelayedPubkey,
 		toSelfDelay,
 		0,
-		network
+		network,
+		auxiliaryLeaf
 	);
 }
 
@@ -108,7 +111,8 @@ export function buildTaprootHtlcTimeoutTx(
 	revocationPubkey: Buffer,
 	localDelayedPubkey: Buffer,
 	toSelfDelay: number,
-	network: bitcoin.Network = bitcoin.networks.bitcoin
+	network: bitcoin.Network = bitcoin.networks.bitcoin,
+	auxiliaryLeaf?: ITaprootAuxLeaf
 ): bitcoin.Transaction {
 	return buildSecondLevel(
 		htlcTxid,
@@ -118,7 +122,8 @@ export function buildTaprootHtlcTimeoutTx(
 		localDelayedPubkey,
 		toSelfDelay,
 		cltvExpiry,
-		network
+		network,
+		auxiliaryLeaf
 	);
 }
 
@@ -130,7 +135,8 @@ function buildSecondLevel(
 	localDelayedPubkey: Buffer,
 	toSelfDelay: number,
 	nLockTime: number,
-	network: bitcoin.Network
+	network: bitcoin.Network,
+	auxiliaryLeaf?: ITaprootAuxLeaf
 ): bitcoin.Transaction {
 	const tx = new bitcoin.Transaction();
 	tx.version = 2;
@@ -147,7 +153,8 @@ function buildSecondLevel(
 		revocationPubkey,
 		localDelayedPubkey,
 		toSelfDelay,
-		network
+		network,
+		auxiliaryLeaf
 	);
 	// Zero-fee: the whole HTLC amount carries over (fee comes from CPFP/anchor).
 	tx.addOutput(out.output, Number(htlcAmount));

@@ -1,3 +1,4 @@
+import type { CustomRecords } from '../message/custom-records';
 /**
  * BOLT 2: Channel data types, enums, and configuration.
  */
@@ -17,18 +18,33 @@ export function isAnchorChannel(channelType: Buffer | null): boolean {
 	// 1-CSV, anchor outputs, zero-fee HTLC, CSV sweep sequence) must still fire.
 	return (
 		flags.hasFeature(Feature.ANCHOR_ZERO_FEE_HTLC) ||
-		flags.hasFeature(Feature.OPTION_TAPROOT)
+		flags.hasFeature(Feature.OPTION_TAPROOT) ||
+		flags.hasFeature(Feature.OPTION_TAPROOT_OVERLAY)
 	);
 }
 
 /**
  * Check whether a negotiated channel_type includes option_taproot (simple
- * taproot channels). Returns true if bit 80/81 (OPTION_TAPROOT) is set.
+ * taproot channels) or the deployed Taproot Asset overlay feature.
  */
 export function isTaprootChannel(channelType: Buffer | null): boolean {
 	if (!channelType || channelType.length === 0) return false;
-	return FeatureFlags.fromBuffer(channelType).hasFeature(
-		Feature.OPTION_TAPROOT
+	const flags = FeatureFlags.fromBuffer(channelType);
+	return (
+		flags.hasFeature(Feature.OPTION_TAPROOT) ||
+		flags.hasFeature(Feature.OPTION_TAPROOT_OVERLAY)
+	);
+}
+
+/** Whether a channel negotiates the deployed Taproot Asset overlay feature. */
+export function isOverlayChannel(
+	channelType: Buffer | null | undefined
+): boolean {
+	return (
+		!!channelType &&
+		FeatureFlags.fromBuffer(channelType).hasFeature(
+			Feature.OPTION_TAPROOT_OVERLAY
+		)
 	);
 }
 
@@ -84,7 +100,7 @@ export function validateV2ChannelType(
 		return 'channel_type must use a minimal encoding';
 	}
 	const flags = FeatureFlags.fromBuffer(channelType);
-	if (flags.hasFeature(Feature.OPTION_TAPROOT)) {
+	if (isTaprootChannel(channelType)) {
 		return 'channel_type option_taproot is not supported for dual-funded (v2) channels';
 	}
 	// Only the even (compulsory) bits of the known combinations may appear;
@@ -220,6 +236,9 @@ export enum HtlcState {
 }
 
 export interface IHtlcEntry {
+	/** Asset and other negotiated channel protocol metadata, retained until resolution. */
+	customRecords?: CustomRecords;
+	auxiliaryAmount?: bigint;
 	id: bigint;
 	amountMsat: bigint;
 	paymentHash: Buffer;
@@ -443,6 +462,9 @@ export function receivedAddIrrevocablyCommitted(entry: IHtlcEntry): boolean {
  * for a penalty sweep after the live HTLC has been settled and forgotten.
  */
 export interface IHtlcSnapshotEntry {
+	id?: bigint;
+	customRecords?: CustomRecords;
+	auxiliaryAmount?: bigint;
 	paymentHash: Buffer;
 	amountMsat: bigint;
 	cltvExpiry: number;
@@ -521,6 +543,8 @@ export const DEFAULT_CHANNEL_CONFIG: IChannelConfig = {
 
 /** Result type for ChannelManager operations that may fail. */
 export interface ChannelResult {
+	/** addHtlc refused before this request created any channel obligation. */
+	admissionRejected?: boolean;
 	ok: boolean;
 	actions: import('./channel-actions').ChannelAction[];
 	error?: string;

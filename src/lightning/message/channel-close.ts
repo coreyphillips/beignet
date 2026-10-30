@@ -1,3 +1,9 @@
+import type { CustomRecords } from './custom-records';
+import {
+	boundedLightningPayload,
+	customRecordEntries,
+	decodeWithCustomRecords
+} from './custom-records';
 /**
  * BOLT 2: `shutdown`, `closing_signed`, and option_simple_close
  * `closing_complete` / `closing_sig` message encoding/decoding.
@@ -32,6 +38,7 @@ import type { ITlvRecord } from './tlv';
 import { decodeTlvStream, encodeTlvStream } from './tlv';
 
 export interface IShutdownMessage {
+	customRecords?: CustomRecords;
 	channelId: Buffer;
 	scriptPubkey: Buffer;
 	/**
@@ -76,22 +83,28 @@ export function encodeShutdownMessage(msg: IShutdownMessage): Buffer {
 	offset += 2;
 	msg.scriptPubkey.copy(buf, offset);
 
-	if (msg.shutdownNonce === undefined) return buf;
-	if (msg.shutdownNonce.length !== SHUTDOWN_NONCE_LENGTH) {
+	const records = customRecordEntries(msg.customRecords);
+	if (
+		msg.shutdownNonce !== undefined &&
+		msg.shutdownNonce.length !== SHUTDOWN_NONCE_LENGTH
+	) {
 		throw new Error(
 			`shutdown_nonce must be ${SHUTDOWN_NONCE_LENGTH} bytes, got ${msg.shutdownNonce.length}`
 		);
 	}
-	const tlvs = encodeTlvStream([
-		{ type: SHUTDOWN_NONCE_TLV, value: msg.shutdownNonce }
-	]);
-	return Buffer.concat([buf, tlvs]);
+	if (msg.shutdownNonce)
+		records.push({ type: SHUTDOWN_NONCE_TLV, value: msg.shutdownNonce });
+	records.sort((a, b) => (a.type < b.type ? -1 : a.type > b.type ? 1 : 0));
+	return boundedLightningPayload(
+		Buffer.concat([buf, encodeTlvStream(records)])
+	);
 }
 
 /**
  * Decode a `shutdown` message payload.
  */
 export function decodeShutdownMessage(payload: Buffer): IShutdownMessage {
+	boundedLightningPayload(payload);
 	if (payload.length < SHUTDOWN_FIXED_LENGTH) {
 		throw new Error(
 			`shutdown too short: need ${SHUTDOWN_FIXED_LENGTH} bytes, got ${payload.length}`
@@ -115,7 +128,12 @@ export function decodeShutdownMessage(payload: Buffer): IShutdownMessage {
 	const msg: IShutdownMessage = { channelId, scriptPubkey };
 	if (offset < payload.length) {
 		// Unknown even TLV types are rejected; unknown odd types are ignored.
-		const { records } = decodeTlvStream(payload, offset, SHUTDOWN_TLV_TYPES);
+		const records = decodeWithCustomRecords(
+			payload,
+			offset,
+			SHUTDOWN_TLV_TYPES
+		);
+		const custom = new Map<bigint, Buffer>();
 		for (const r of records) {
 			if (r.type === SHUTDOWN_NONCE_TLV) {
 				if (r.value.length !== SHUTDOWN_NONCE_LENGTH) {
@@ -124,8 +142,9 @@ export function decodeShutdownMessage(payload: Buffer): IShutdownMessage {
 					);
 				}
 				msg.shutdownNonce = Buffer.from(r.value);
-			}
+			} else if (r.type >= 65536n) custom.set(r.type, Buffer.from(r.value));
 		}
+		if (custom.size) msg.customRecords = custom;
 	}
 	return msg;
 }

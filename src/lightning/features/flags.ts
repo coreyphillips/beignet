@@ -85,6 +85,8 @@ export enum Feature {
 	 * base=180, setOptional() advertises bit 181, matching LND exactly.
 	 */
 	OPTION_TAPROOT = 180,
+	/** Taproot Asset overlay. Its deployed optional partner is 2025. */
+	OPTION_TAPROOT_OVERLAY = 2026,
 	/**
 	 * Liquidity ads / option_will_fund (bLIP-0051): advertises that this node
 	 * leases inbound liquidity (rates carried in node_announcement). Experimental
@@ -216,7 +218,9 @@ export class FeatureFlags {
 	 * @param feature - Feature enum value (even bit position)
 	 */
 	setOptional(feature: Feature): void {
-		this.setBit(feature + 1);
+		this.setBit(
+			feature === Feature.OPTION_TAPROOT_OVERLAY ? 2025 : feature + 1
+		);
 	}
 
 	/**
@@ -225,7 +229,12 @@ export class FeatureFlags {
 	 * @returns True if either the even or odd bit is set
 	 */
 	hasFeature(feature: Feature): boolean {
-		return this.hasBit(feature) || this.hasBit(feature + 1);
+		return (
+			this.hasBit(feature) ||
+			this.hasBit(
+				feature === Feature.OPTION_TAPROOT_OVERLAY ? 2025 : feature + 1
+			)
+		);
 	}
 
 	/**
@@ -241,7 +250,9 @@ export class FeatureFlags {
 	 * @param feature - Feature enum value (even bit position)
 	 */
 	isOptional(feature: Feature): boolean {
-		return this.hasBit(feature + 1);
+		return this.hasBit(
+			feature === Feature.OPTION_TAPROOT_OVERLAY ? 2025 : feature + 1
+		);
 	}
 
 	/**
@@ -343,7 +354,8 @@ export function hasUnsupportedRequiredFeatures(
 			// Concurrent receive can be explicitly disabled. Preserve that
 			// choice even though the implementation understands the feature.
 			if (
-				bit === Feature.OPTION_FF_CONCURRENT &&
+				(bit === Feature.OPTION_FF_CONCURRENT ||
+					bit === Feature.OPTION_TAPROOT_OVERLAY) &&
 				!localFeatures.hasFeature(bit)
 			) {
 				unsupported.push(bit);
@@ -351,8 +363,7 @@ export function hasUnsupportedRequiredFeatures(
 			}
 			// We support this feature if we have either the even or odd bit set
 			if (
-				!localFeatures.hasBit(bit) &&
-				!localFeatures.hasBit(bit + 1) &&
+				!localFeatures.hasFeature(bit as Feature) &&
 				!implemented.hasBit(bit) &&
 				!implemented.hasBit(bit + 1)
 			) {

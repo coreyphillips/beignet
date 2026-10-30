@@ -17,7 +17,13 @@
 
 import { FeatureFlags } from '../features/flags';
 import type { ITlvRecord } from './tlv';
-import { decodeTlvStream, encodeTlvStream } from './tlv';
+import { encodeTlvStream } from './tlv';
+import {
+	customRecordEntries,
+	decodeWithCustomRecords,
+	boundedLightningPayload,
+	type CustomRecords
+} from './custom-records';
 
 /** Well-known TLV types in init message */
 const INIT_TLV_NETWORKS = 1n;
@@ -25,6 +31,7 @@ const INIT_TLV_TYPES = new Set<bigint>([INIT_TLV_NETWORKS]);
 
 export interface IInitMessage {
 	features: FeatureFlags;
+	customRecords?: CustomRecords;
 	/** Optional: chain hashes the node is interested in (32 bytes each) */
 	networks?: Buffer[];
 }
@@ -48,7 +55,10 @@ export function encodeInitMessage(msg: IInitMessage): Buffer {
 	const parts: Buffer[] = [gflen, flen, featureBuf];
 
 	// TLV records
-	const tlvRecords: ITlvRecord[] = [];
+	const tlvRecords: ITlvRecord[] = customRecordEntries(
+		msg.customRecords,
+		INIT_TLV_TYPES
+	);
 
 	if (msg.networks && msg.networks.length > 0) {
 		const networksBuf = Buffer.concat(msg.networks);
@@ -56,10 +66,16 @@ export function encodeInitMessage(msg: IInitMessage): Buffer {
 	}
 
 	if (tlvRecords.length > 0) {
-		parts.push(encodeTlvStream(tlvRecords));
+		parts.push(
+			encodeTlvStream(
+				tlvRecords.sort((left, right) =>
+					left.type < right.type ? -1 : left.type > right.type ? 1 : 0
+				)
+			)
+		);
 	}
 
-	return Buffer.concat(parts);
+	return boundedLightningPayload(Buffer.concat(parts));
 }
 
 /**
@@ -112,8 +128,11 @@ export function decodeInitMessage(payload: Buffer): IInitMessage {
 
 	// Parse TLV records if there's remaining data
 	if (offset < payload.length) {
-		const { records } = decodeTlvStream(payload, offset, INIT_TLV_TYPES);
+		const records = decodeWithCustomRecords(payload, offset, INIT_TLV_TYPES);
+		const custom = new Map<bigint, Buffer>();
 		for (const record of records) {
+			if (record.type >= 65536n)
+				custom.set(record.type, Buffer.from(record.value));
 			if (record.type === INIT_TLV_NETWORKS) {
 				const networks: Buffer[] = [];
 				for (let i = 0; i < record.value.length; i += 32) {
@@ -122,6 +141,7 @@ export function decodeInitMessage(payload: Buffer): IInitMessage {
 				result.networks = networks;
 			}
 		}
+		if (custom.size) result.customRecords = custom;
 	}
 
 	return result;

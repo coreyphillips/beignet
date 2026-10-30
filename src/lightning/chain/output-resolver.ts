@@ -73,6 +73,11 @@ import {
 } from '../keys/derivation';
 import { generateFromSeed, MAX_INDEX } from '../keys/shachain';
 import type { IChannelState } from '../channel/channel-state';
+import type {
+	IAuxiliarySweepInput,
+	IAuxiliarySweepSigningRequest
+} from '../channel/auxiliary';
+import type { ITaprootAuxLeaf } from '../script/commitment-taproot';
 import { leaseCsvBlocks } from '../channel/liquidity-ads';
 import type { IHtlcEntry } from '../channel/types';
 import {
@@ -89,6 +94,237 @@ import {
 } from '../channel/commitment-builder';
 
 const SIGHASH_ALL = bitcoin.Transaction.SIGHASH_ALL;
+
+function commitmentAuxiliaryLeaf(
+	state: IChannelState,
+	isOurs: boolean,
+	height: bigint | undefined,
+	outputIndex: number
+): ITaprootAuxLeaf | undefined {
+	if (!state.auxiliaryState) return undefined;
+	const view =
+		height === undefined
+			? undefined
+			: (isOurs
+					? state.auxiliaryState.localCommitments
+					: state.auxiliaryState.remoteCommitments
+			  ).get(height);
+	if (!view)
+		throw new Error(
+			'Missing persisted asset commitment required for output recovery'
+		);
+	return view.outputLeaves.get(outputIndex);
+}
+
+function auxiliaryLeafCandidates(
+	state: IChannelState,
+	isOurs: boolean,
+	height: bigint
+): (ITaprootAuxLeaf | undefined)[] {
+	const view = (
+		isOurs
+			? state.auxiliaryState?.localCommitments
+			: state.auxiliaryState?.remoteCommitments
+	)?.get(height);
+	return [undefined, ...(view?.outputLeaves.values() ?? [])];
+}
+
+function secondLevelAuxiliaryLeaf(
+	state: IChannelState,
+	isOurs: boolean,
+	height: bigint,
+	output: ITrackedOutput
+): ITaprootAuxLeaf | undefined {
+	if (!state.auxiliaryState) return undefined;
+	const view = (
+		isOurs
+			? state.auxiliaryState.localCommitments
+			: state.auxiliaryState.remoteCommitments
+	).get(height);
+	if (!view)
+		throw new Error(
+			'Missing persisted asset commitment required for second-level recovery'
+		);
+	const direction =
+		output.auxiliaryHtlcDirection ??
+		(output.outputType === OutputType.OFFERED_HTLC
+			? HtlcDirection.OFFERED
+			: HtlcDirection.RECEIVED);
+	return output.htlcId === undefined
+		? undefined
+		: view.secondLevelLeaves.get(`${direction}:${output.htlcId}`);
+}
+
+function htlcAuxiliaryLeaf(
+	state: IChannelState,
+	height: bigint,
+	direction: HtlcDirection,
+	id: bigint | undefined
+): ITaprootAuxLeaf | undefined {
+	if (!state.auxiliaryState) return undefined;
+	const view = state.auxiliaryState.remoteCommitments.get(height);
+	if (!view || id === undefined)
+		throw new Error('Missing persisted asset HTLC identity');
+	const index = view.htlcOutputIndexes?.get(`${direction}:${id}`);
+	if (index === undefined)
+		throw new Error('Missing persisted asset HTLC output index');
+	return view.outputLeaves.get(index);
+}
+
+function matchSecondLevelTree(
+	state: IChannelState,
+	isOurs: boolean,
+	height: bigint,
+	keys: ITaprootCommitKeys,
+	script: Buffer,
+	network: bitcoin.Network
+) {
+	const view = (
+		isOurs
+			? state.auxiliaryState?.localCommitments
+			: state.auxiliaryState?.remoteCommitments
+	)?.get(height);
+	if (state.auxiliaryState && !view)
+		throw new Error('Missing asset commitment for second-level recovery');
+	const candidates: [string | undefined, ITaprootAuxLeaf | undefined][] = [
+		[undefined, undefined],
+		...(view?.secondLevelLeaves.entries() ?? [])
+	];
+	for (const [key, leaf] of candidates) {
+		const tree = buildTaprootSecondLevelOutput(
+			keys.revocationPubkey,
+			keys.delayedPubkey,
+			keys.toSelfDelay,
+			network,
+			leaf
+		);
+		if (!tree.output.equals(script)) continue;
+		const [direction, id] = key?.split(':') ?? [];
+		return {
+			tree,
+			...(id !== undefined
+				? {
+						htlcId: BigInt(id),
+						auxiliaryHtlcDirection: direction as HtlcDirection
+				  }
+				: {})
+		};
+	}
+	return undefined;
+}
+
+interface IPrivateSweepInput
+	extends Omit<IAuxiliarySweepInput, 'transactionInputIndex' | 'publicKey'> {
+	output: ITrackedOutput;
+	privateKey: Buffer;
+}
+
+/** Prepare asset provenance before signing the Bitcoin transaction. */
+function prepareAuxiliarySweep(
+	state: IChannelState,
+	isOurs: boolean,
+	height: bigint | undefined,
+	tx: bitcoin.Transaction,
+	inputs: IPrivateSweepInput[],
+	destinationScript: Buffer
+): Buffer | undefined {
+	if (!state.auxiliaryState) return undefined;
+	if (height === undefined)
+		throw new Error('Asset sweep is missing its commitment height');
+	const carriesAssets = inputs.some((input) =>
+		input.kind.startsWith('second_level')
+			? !!secondLevelAuxiliaryLeaf(state, isOurs, height, input.output)
+			: !!commitmentAuxiliaryLeaf(
+					state,
+					isOurs,
+					height,
+					input.commitmentOutputIndex
+			  )
+	);
+	if (!carriesAssets) return undefined;
+	const provider = state.auxiliaryProvider;
+	if (!provider?.prepareSweep)
+		throw new Error(
+			'Asset sweep provider is required before spending asset outputs'
+		);
+	const descriptors: IAuxiliarySweepInput[] = inputs.map(
+		(input, transactionInputIndex) => {
+			const { privateKey, output, ...descriptor } = input;
+			return {
+				...descriptor,
+				transactionInputIndex,
+				publicKey: Buffer.from(ecc.pointFromScalar(privateKey, true)!),
+				htlcId: input.htlcId ?? output.htlcId,
+				paymentHash: input.paymentHash ?? output.paymentHash,
+				cltvExpiry: input.cltvExpiry ?? output.cltvExpiry,
+				direction:
+					input.direction ??
+					output.auxiliaryHtlcDirection ??
+					(output.outputType === OutputType.OFFERED_HTLC
+						? HtlcDirection.OFFERED
+						: output.outputType === OutputType.RECEIVED_HTLC
+						? HtlcDirection.RECEIVED
+						: undefined)
+			};
+		}
+	);
+	const sign = (request: IAuxiliarySweepSigningRequest): Buffer => {
+		const descriptor = descriptors[request.transactionInputIndex];
+		if (
+			!descriptor ||
+			!descriptor.publicKey.equals(request.publicKey) ||
+			request.sigHash.length !== 32
+		)
+			throw new Error(
+				'Asset sweep requested an unrelated signing key or invalid digest'
+			);
+		let privateKey = Buffer.from(
+			inputs[request.transactionInputIndex].privateKey
+		);
+		if (request.singleTweak) {
+			if (request.singleTweak.length !== 32)
+				throw new Error('Invalid asset sweep key tweak');
+			const tweaked = ecc.privateAdd(privateKey, request.singleTweak);
+			if (!tweaked) throw new Error('Asset sweep key tweak produced zero');
+			privateKey = Buffer.from(tweaked);
+		}
+		if (request.taprootMerkleRoot) {
+			if (request.taprootMerkleRoot.length !== 32)
+				throw new Error('Invalid asset sweep Taproot root');
+			privateKey = tweakTaprootKeyPathPrivkey(
+				privateKey,
+				request.taprootMerkleRoot
+			);
+		}
+		return signTaprootHtlcLeaf(request.sigHash, privateKey);
+	};
+	const result = provider.prepareSweep({
+		state,
+		side: isOurs ? 'local' : 'remote',
+		commitmentNumber: height,
+		transaction: tx.clone(),
+		inputs: descriptors,
+		destinationScript: Buffer.from(destinationScript),
+		sign
+	});
+	if (!result.customData.length || !result.outputScripts.size)
+		throw new Error('Asset sweep omitted durable provenance or asset output');
+	for (const [index, script] of result.outputScripts) {
+		if (
+			!Number.isInteger(index) ||
+			index < 0 ||
+			index >= tx.outs.length ||
+			script.length !== 34 ||
+			script[0] !== 0x51 ||
+			script[1] !== 32
+		)
+			throw new Error('Asset sweep returned an invalid Bitcoin output');
+		tx.outs[index].script = Buffer.from(script);
+	}
+	for (const input of inputs)
+		input.output.auxiliaryData = Buffer.from(result.customData);
+	return Buffer.from(result.customData);
+}
 const SIGHASH_ANCHOR =
 	bitcoin.Transaction.SIGHASH_SINGLE | bitcoin.Transaction.SIGHASH_ANYONECANPAY;
 
@@ -121,6 +357,7 @@ export interface IClassifiedCommitment {
  * A resolved output with its spend transaction and witness.
  */
 export interface IResolvedOutput {
+	auxiliaryData?: Buffer;
 	trackedOutput: ITrackedOutput;
 	spendTx?: bitcoin.Transaction;
 	witness?: Buffer[];
@@ -407,7 +644,11 @@ function candidateTheirPerCommitmentPoints(
  * derivation disambiguateCommitmentTx and classifyTheirCommitmentOutputs
  * apply (taproot-aware, lease CLTV when the peer is the lessor).
  */
-function theirToLocalSpksFor(state: IChannelState, point: Buffer): Buffer[] {
+function theirToLocalSpksFor(
+	state: IChannelState,
+	point: Buffer,
+	commitmentNumber: bigint
+): Buffer[] {
 	if (!state.remoteBasepoints) return [];
 	const theirRevocationPubkey = deriveRevocationPubkey(
 		state.localBasepoints.revocationBasepoint,
@@ -418,12 +659,16 @@ function theirToLocalSpksFor(state: IChannelState, point: Buffer): Buffer[] {
 		point
 	);
 	if (isTaprootChannel(state.channelType)) {
-		const spk = buildTaprootToLocalOutput(
-			theirRevocationPubkey,
-			theirDelayedPubkey,
-			state.localConfig.toSelfDelay
-		).output;
-		return spk ? [spk] : [];
+		return auxiliaryLeafCandidates(state, false, commitmentNumber).map(
+			(auxiliaryLeaf) =>
+				buildTaprootToLocalOutput(
+					theirRevocationPubkey,
+					theirDelayedPubkey,
+					state.localConfig.toSelfDelay,
+					undefined,
+					auxiliaryLeaf
+				).output
+		);
 	}
 	const spks: Buffer[] = [];
 	const csvVariants = state.isLessor
@@ -449,14 +694,15 @@ function theirToLocalSpksFor(state: IChannelState, point: Buffer): Buffer[] {
 function countTheirHtlcMatches(
 	tx: bitcoin.Transaction,
 	state: IChannelState,
-	point: Buffer
+	point: Buffer,
+	commitmentNumber: bigint
 ): number {
 	if (!state.remoteBasepoints) return 0;
 	const claimedKeys = new Set<string>();
 	let matches = 0;
 	if (isTaprootChannel(state.channelType)) {
 		const keys = deriveTaprootCommitKeys(state, point, false);
-		for (const out of tx.outs) {
+		for (const [outputIndex, out] of tx.outs.entries()) {
 			if (
 				matchTaprootHtlcOutput(
 					Buffer.from(out.script),
@@ -464,7 +710,8 @@ function countTheirHtlcMatches(
 					state,
 					keys,
 					false,
-					claimedKeys
+					claimedKeys,
+					commitmentAuxiliaryLeaf(state, false, commitmentNumber, outputIndex)
 				)
 			) {
 				matches++;
@@ -520,7 +767,7 @@ export function selectTheirPerCommitmentPoint(
 	const candidates = candidateTheirPerCommitmentPoints(state, commitmentNumber);
 	if (candidates.length <= 1) return candidates[0];
 	for (const point of candidates) {
-		const spks = theirToLocalSpksFor(state, point);
+		const spks = theirToLocalSpksFor(state, point, commitmentNumber);
 		for (const out of tx.outs) {
 			if (spks.some((spk) => Buffer.from(out.script).equals(spk))) {
 				return point;
@@ -530,7 +777,7 @@ export function selectTheirPerCommitmentPoint(
 	let bestHtlcPoint: Buffer | undefined;
 	let bestHtlcMatches = 0;
 	for (const point of candidates) {
-		const matches = countTheirHtlcMatches(tx, state, point);
+		const matches = countTheirHtlcMatches(tx, state, point, commitmentNumber);
 		if (matches > bestHtlcMatches) {
 			bestHtlcPoint = point;
 			bestHtlcMatches = matches;
@@ -598,12 +845,18 @@ function disambiguateCommitmentTx(
 	// (plus the plain post-expiry form) must be tried for the match.
 	const ourToLocalSpks: Buffer[] = [];
 	if (isTaprootChannel(state.channelType)) {
-		const out = buildTaprootToLocalOutput(
-			ourRevocationPubkey,
-			ourDelayedPubkey,
-			state.remoteConfig.toSelfDelay
-		).output;
-		if (out) ourToLocalSpks.push(out);
+		ourToLocalSpks.push(
+			...auxiliaryLeafCandidates(state, true, commitmentNumber).map(
+				(auxiliaryLeaf) =>
+					buildTaprootToLocalOutput(
+						ourRevocationPubkey,
+						ourDelayedPubkey,
+						state.remoteConfig.toSelfDelay,
+						undefined,
+						auxiliaryLeaf
+					).output
+			)
+		);
 	} else {
 		const csvVariants: (number | undefined)[] =
 			state.isLessor && state.leaseExpiry
@@ -677,7 +930,15 @@ function disambiguateCommitmentTx(
 					}
 			  }).output;
 		for (const out of tx.outs) {
-			if (theirToLocalSpk && Buffer.from(out.script).equals(theirToLocalSpk)) {
+			if (
+				isTaprootChannel(state.channelType)
+					? theirToLocalSpksFor(
+							state,
+							theirPerCommitmentPoint,
+							commitmentNumber
+					  ).some((spk) => Buffer.from(out.script).equals(spk))
+					: theirToLocalSpk && Buffer.from(out.script).equals(theirToLocalSpk)
+			) {
 				return CommitmentType.THEIR_CURRENT_COMMITMENT;
 			}
 		}
@@ -1479,6 +1740,15 @@ function matchHtlcOutput(
  * key-path spend (~58 vB) or a script-path spend (~70 vB); 75 covers both with
  * a little slack so the result clears min-relay rather than falling under it.
  */
+function auxiliarySweepVbytes(
+	state: IChannelState,
+	destinationScript: Buffer
+): number {
+	return state.auxiliaryState
+		? 8 + Math.max(0, 34 - destinationScript.length)
+		: 0;
+}
+
 const TAPROOT_PENALTY_BASE_VBYTES = 50;
 const TAPROOT_PENALTY_PER_INPUT_VBYTES = 75;
 const TAPROOT_PENALTY_OUTPUT_VBYTES = 43;
@@ -1577,7 +1847,8 @@ function matchTaprootHtlcOutput(
 	isOurs: boolean,
 	// Same one-to-one attribution as matchHtlcOutput: identical same-hash
 	// scripts must each claim a DISTINCT entry.
-	claimedKeys?: Set<string>
+	claimedKeys?: Set<string>,
+	auxiliaryLeaf?: ITaprootAuxLeaf
 ): IHtlcMatch | null {
 	for (const [entryKey, entry] of htlcMatchOrder(state, outAmount, isOurs)) {
 		if (claimedKeys?.has(entryKey)) {
@@ -1602,14 +1873,18 @@ function matchTaprootHtlcOutput(
 					keys.revocationPubkey,
 					keys.localHtlcPubkey,
 					keys.remoteHtlcPubkey,
-					entry.paymentHash
+					entry.paymentHash,
+					undefined,
+					auxiliaryLeaf
 			  )
 			: buildTaprootReceivedHtlcOutput(
 					keys.revocationPubkey,
 					keys.localHtlcPubkey,
 					keys.remoteHtlcPubkey,
 					entry.paymentHash,
-					entry.cltvExpiry
+					entry.cltvExpiry,
+					undefined,
+					auxiliaryLeaf
 			  );
 
 		if (outScript.equals(built.output)) {
@@ -1652,18 +1927,33 @@ function classifyTaprootCommitmentOutputs(
 	}
 
 	const keys = deriveTaprootCommitKeys(state, perCommitmentPoint, isOurs);
-	const toLocalSpk = buildTaprootToLocalOutput(
-		keys.revocationPubkey,
-		keys.delayedPubkey,
-		keys.toSelfDelay
-	).output;
-	const toRemoteSpk = buildTaprootToRemoteOutput(keys.paymentPubkey).output;
 
 	let htlcSigCounter = 0;
 	const claimedHtlcKeys = new Set<string>();
 	for (let i = 0; i < tx.outs.length; i++) {
 		const outScript = tx.outs[i].script;
+		const auxiliaryLeaf = commitmentAuxiliaryLeaf(
+			state,
+			isOurs,
+			commitmentNumber,
+			i
+		);
+		const toLocalSpk = buildTaprootToLocalOutput(
+			keys.revocationPubkey,
+			keys.delayedPubkey,
+			keys.toSelfDelay,
+			undefined,
+			auxiliaryLeaf
+		).output;
+		const toRemoteSpk = buildTaprootToRemoteOutput(
+			keys.paymentPubkey,
+			undefined,
+			auxiliaryLeaf
+		).output;
 		const base = {
+			...(state.auxiliaryState
+				? { auxiliaryCommitmentNumber: commitmentNumber }
+				: {}),
 			txid,
 			outputIndex: i,
 			amount: BigInt(tx.outs[i].value),
@@ -1685,7 +1975,8 @@ function classifyTaprootCommitmentOutputs(
 			state,
 			keys,
 			isOurs,
-			claimedHtlcKeys
+			claimedHtlcKeys,
+			auxiliaryLeaf
 		);
 		if (htlc) {
 			outputs.push({
@@ -1764,7 +2055,11 @@ export function resolveOurCommitmentOutputs(
 
 	for (const output of trackedOutputs) {
 		const feeSatoshis = BigInt(
-			Math.ceil(feeRatePerVbyte * estimateSweepVbytes(output.outputType))
+			Math.ceil(
+				feeRatePerVbyte *
+					(estimateSweepVbytes(output.outputType) +
+						auxiliarySweepVbytes(state, destinationScript))
+			)
 		);
 
 		if (output.outputType === OutputType.TO_LOCAL && output.witnessScript) {
@@ -1976,7 +2271,8 @@ export function resolveSecondLevelHtlcOutput(
 	destinationScript: Buffer,
 	feeRatePerVbyte: number,
 	delayedPaymentBasepointSecret: Buffer | undefined,
-	network: bitcoin.Network = bitcoin.networks.bitcoin
+	network: bitcoin.Network = bitcoin.networks.bitcoin,
+	previousAuxiliaryData?: Buffer
 ): IResolvedOutput | null {
 	if (!state.remoteBasepoints) return null;
 	const out = htlcTx.outs[0];
@@ -2004,16 +2300,23 @@ export function resolveSecondLevelHtlcOutput(
 		);
 		const keys = deriveTaprootCommitKeys(state, point, true);
 		const toSelfDelay = keys.toSelfDelay;
-		const sl = buildTaprootSecondLevelOutput(
-			keys.revocationPubkey,
-			keys.delayedPubkey,
-			toSelfDelay,
+		const match = matchSecondLevelTree(
+			state,
+			true,
+			commitmentNumber,
+			keys,
+			out.script,
 			network
 		);
-		if (!sl.output.equals(out.script)) return null;
+		if (!match) return null;
+		const sl = match.tree;
 		const amount = BigInt(out.value);
 		const feeSatoshis = BigInt(
-			Math.ceil(feeRatePerVbyte * estimateSweepVbytes(OutputType.TO_LOCAL))
+			Math.ceil(
+				feeRatePerVbyte *
+					(estimateSweepVbytes(OutputType.TO_LOCAL) +
+						auxiliarySweepVbytes(state, destinationScript))
+			)
 		);
 		const htlcTxid = htlcTx.getId();
 		const trackedOutput: ITrackedOutput = {
@@ -2026,7 +2329,16 @@ export function resolveSecondLevelHtlcOutput(
 			witnessScript: sl.output,
 			// Tag so a later rebuild reconstructs the second-level tree (revocation
 			// internal + single delay leaf), not the commitment to_local tree.
-			isSecondLevelHtlc: true
+			isSecondLevelHtlc: true,
+			secondLevelTxHex: state.auxiliaryState ? htlcTx.toHex() : undefined,
+			auxiliaryData: previousAuxiliaryData
+				? Buffer.from(previousAuxiliaryData)
+				: undefined,
+			htlcId: match.htlcId,
+			auxiliaryHtlcDirection: match.auxiliaryHtlcDirection,
+			auxiliaryCommitmentNumber: state.auxiliaryState
+				? commitmentNumber
+				: undefined
 		};
 		const sweepValue = sweepOutputValue(amount, feeSatoshis, destinationScript);
 		if (sweepValue === null) {
@@ -2043,6 +2355,26 @@ export function resolveSecondLevelHtlcOutput(
 			delayedBasepointSecret,
 			point,
 			state.localBasepoints.delayedPaymentBasepoint
+		);
+		prepareAuxiliarySweep(
+			state,
+			true,
+			commitmentNumber,
+			sweepTx,
+			[
+				{
+					output: trackedOutput,
+					commitmentOutputIndex: 0,
+					kind: 'second_level_delayed',
+					privateKey: delayedPrivkey,
+					leafScript: sl.delay.script,
+					leafVersion: sl.delay.leafVersion,
+					controlBlock: sl.delay.controlBlock,
+					sourceTransaction: htlcTx,
+					previousAuxiliaryData
+				}
+			],
+			destinationScript
 		);
 		const sighash = sweepTx.hashForWitnessV1(
 			0,
@@ -2087,7 +2419,11 @@ export function resolveSecondLevelHtlcOutput(
 
 	const amount = BigInt(out.value);
 	const feeSatoshis = BigInt(
-		Math.ceil(feeRatePerVbyte * estimateSweepVbytes(OutputType.TO_LOCAL))
+		Math.ceil(
+			feeRatePerVbyte *
+				(estimateSweepVbytes(OutputType.TO_LOCAL) +
+					auxiliarySweepVbytes(state, destinationScript))
+		)
 	);
 	const htlcTxid = htlcTx.getId();
 	const trackedOutput: ITrackedOutput = {
@@ -2185,15 +2521,28 @@ function resolveOurTaprootCommitmentOutputs(
 				? buildTaprootSecondLevelOutput(
 						keys.revocationPubkey,
 						keys.delayedPubkey,
-						toSelfDelay
+						toSelfDelay,
+						undefined,
+						secondLevelAuxiliaryLeaf(state, true, commitmentNumber, output)
 				  )
 				: buildTaprootToLocalOutput(
 						keys.revocationPubkey,
 						keys.delayedPubkey,
-						toSelfDelay
+						toSelfDelay,
+						undefined,
+						commitmentAuxiliaryLeaf(
+							state,
+							true,
+							commitmentNumber,
+							output.outputIndex
+						)
 				  );
 			const feeSatoshis = BigInt(
-				Math.ceil(feeRatePerVbyte * estimateSweepVbytes(output.outputType))
+				Math.ceil(
+					feeRatePerVbyte *
+						(estimateSweepVbytes(output.outputType) +
+							auxiliarySweepVbytes(state, destinationScript))
+				)
 			);
 			const sweepValue = sweepOutputValue(
 				output.amount,
@@ -2221,6 +2570,33 @@ function resolveOurTaprootCommitmentOutputs(
 				perCommitmentPoint,
 				state.localBasepoints.delayedPaymentBasepoint
 			);
+			prepareAuxiliarySweep(
+				state,
+				true,
+				commitmentNumber,
+				sweepTx,
+				[
+					{
+						output,
+						commitmentOutputIndex: output.outputIndex,
+						kind: output.isSecondLevelHtlc
+							? 'second_level_delayed'
+							: 'to_local_delayed',
+						privateKey: delayedPrivkey,
+						leafScript: toLocal.delay.script,
+						leafVersion: toLocal.delay.leafVersion,
+						controlBlock: toLocal.delay.controlBlock,
+						sourceTransaction:
+							output.isSecondLevelHtlc && output.secondLevelTxHex
+								? bitcoin.Transaction.fromHex(output.secondLevelTxHex)
+								: undefined,
+						previousAuxiliaryData: output.isSecondLevelHtlc
+							? output.auxiliaryData
+							: undefined
+					}
+				],
+				destinationScript
+			);
 			const sighash = sweepTx.hashForWitnessV1(
 				0,
 				[toLocal.output],
@@ -2243,7 +2619,14 @@ function resolveOurTaprootCommitmentOutputs(
 				keys.revocationPubkey,
 				keys.localHtlcPubkey,
 				keys.remoteHtlcPubkey,
-				output.paymentHash!
+				output.paymentHash!,
+				undefined,
+				commitmentAuxiliaryLeaf(
+					state,
+					true,
+					commitmentNumber,
+					output.outputIndex
+				)
 			);
 			const htlcTx = buildTaprootHtlcTimeoutTx(
 				output.txid,
@@ -2252,7 +2635,9 @@ function resolveOurTaprootCommitmentOutputs(
 				output.cltvExpiry || 0,
 				keys.revocationPubkey,
 				keys.delayedPubkey,
-				toSelfDelay
+				toSelfDelay,
+				undefined,
+				secondLevelAuxiliaryLeaf(state, true, commitmentNumber, output)
 			);
 			let witness: Buffer[] | undefined;
 			if (hasHtlcSig(output)) {
@@ -2260,6 +2645,24 @@ function resolveOurTaprootCommitmentOutputs(
 					htlcBasepointSecret!,
 					perCommitmentPoint,
 					state.localBasepoints.htlcBasepoint
+				);
+				prepareAuxiliarySweep(
+					state,
+					true,
+					commitmentNumber,
+					htlcTx,
+					[
+						{
+							output,
+							commitmentOutputIndex: output.outputIndex,
+							kind: 'htlc_second_level_timeout',
+							privateKey: localHtlcPrivkey,
+							leafScript: htlcOut.timeout.script,
+							leafVersion: htlcOut.timeout.leafVersion,
+							controlBlock: htlcOut.timeout.controlBlock
+						}
+					],
+					htlcTx.outs[0].script
 				);
 				const sighash = taprootHtlcLeafSighash(
 					htlcTx,
@@ -2298,7 +2701,14 @@ function resolveOurTaprootCommitmentOutputs(
 				keys.localHtlcPubkey,
 				keys.remoteHtlcPubkey,
 				output.paymentHash!,
-				output.cltvExpiry || 0
+				output.cltvExpiry || 0,
+				undefined,
+				commitmentAuxiliaryLeaf(
+					state,
+					true,
+					commitmentNumber,
+					output.outputIndex
+				)
 			);
 			const htlcTx = buildTaprootHtlcSuccessTx(
 				output.txid,
@@ -2306,7 +2716,9 @@ function resolveOurTaprootCommitmentOutputs(
 				output.amount,
 				keys.revocationPubkey,
 				keys.delayedPubkey,
-				toSelfDelay
+				toSelfDelay,
+				undefined,
+				secondLevelAuxiliaryLeaf(state, true, commitmentNumber, output)
 			);
 			let witness: Buffer[] | undefined;
 			if (hasHtlcSig(output)) {
@@ -2314,6 +2726,25 @@ function resolveOurTaprootCommitmentOutputs(
 					htlcBasepointSecret!,
 					perCommitmentPoint,
 					state.localBasepoints.htlcBasepoint
+				);
+				prepareAuxiliarySweep(
+					state,
+					true,
+					commitmentNumber,
+					htlcTx,
+					[
+						{
+							output,
+							commitmentOutputIndex: output.outputIndex,
+							kind: 'htlc_second_level_success',
+							privateKey: localHtlcPrivkey,
+							leafScript: htlcOut.success.script,
+							leafVersion: htlcOut.success.leafVersion,
+							controlBlock: htlcOut.success.controlBlock,
+							preimage
+						}
+					],
+					htlcTx.outs[0].script
 				);
 				const sighash = taprootHtlcLeafSighash(
 					htlcTx,
@@ -2401,7 +2832,11 @@ function resolveTheirCurrentTaprootCommitmentOutputs(
 		nSequence: number
 	): bitcoin.Transaction | null => {
 		const feeSatoshis = BigInt(
-			Math.ceil(feeRatePerVbyte * estimateSweepVbytes(output.outputType))
+			Math.ceil(
+				feeRatePerVbyte *
+					(estimateSweepVbytes(output.outputType) +
+						auxiliarySweepVbytes(state, destinationScript))
+			)
 		);
 		const sweepValue = sweepOutputValue(
 			output.amount,
@@ -2419,6 +2854,30 @@ function resolveTheirCurrentTaprootCommitmentOutputs(
 			nSequence
 		);
 		tx.addOutput(destinationScript, sweepValue);
+		prepareAuxiliarySweep(
+			state,
+			false,
+			output.auxiliaryCommitmentNumber,
+			tx,
+			[
+				{
+					output,
+					commitmentOutputIndex: output.outputIndex,
+					kind:
+						output.outputType === OutputType.TO_REMOTE
+							? 'to_remote'
+							: extraWitness.length
+							? 'htlc_success'
+							: 'htlc_timeout',
+					privateKey: privkey,
+					leafScript,
+					leafVersion,
+					controlBlock,
+					preimage: extraWitness[0]
+				}
+			],
+			destinationScript
+		);
 		const sighash = tx.hashForWitnessV1(
 			0,
 			[spk],
@@ -2438,7 +2897,14 @@ function resolveTheirCurrentTaprootCommitmentOutputs(
 			// secret in both cases - the monitor supplies the per-channel
 			// paymentBasepointSecret located by the SCB's channelKeyIndex).
 			const tr = buildTaprootToRemoteOutput(
-				state.localBasepoints.paymentBasepoint
+				state.localBasepoints.paymentBasepoint,
+				undefined,
+				commitmentAuxiliaryLeaf(
+					state,
+					false,
+					output.auxiliaryCommitmentNumber,
+					output.outputIndex
+				)
 			);
 			const tx = spendLeaf(
 				output,
@@ -2480,7 +2946,14 @@ function resolveTheirCurrentTaprootCommitmentOutputs(
 				keys.localHtlcPubkey,
 				keys.remoteHtlcPubkey,
 				output.paymentHash!,
-				output.cltvExpiry || 0
+				output.cltvExpiry || 0,
+				undefined,
+				commitmentAuxiliaryLeaf(
+					state,
+					false,
+					output.auxiliaryCommitmentNumber,
+					output.outputIndex
+				)
 			);
 			const tx = spendLeaf(
 				output,
@@ -2523,7 +2996,14 @@ function resolveTheirCurrentTaprootCommitmentOutputs(
 				keys.revocationPubkey,
 				keys.localHtlcPubkey,
 				keys.remoteHtlcPubkey,
-				output.paymentHash!
+				output.paymentHash!,
+				undefined,
+				commitmentAuxiliaryLeaf(
+					state,
+					false,
+					output.auxiliaryCommitmentNumber,
+					output.outputIndex
+				)
 			);
 			const tx = spendLeaf(
 				output,
@@ -2605,7 +3085,11 @@ export function resolveTheirCurrentCommitmentOutputs(
 		const feeSatoshis = BigInt(
 			Math.ceil(
 				feeRatePerVbyte *
-					estimateSweepVbytes(output.outputType, toRemoteLeaseCsv !== undefined)
+					(estimateSweepVbytes(
+						output.outputType,
+						toRemoteLeaseCsv !== undefined
+					) +
+						auxiliarySweepVbytes(state, destinationScript))
 			)
 		);
 
@@ -2858,6 +3342,7 @@ export const PENALTY_SPLIT_DEADLINE_BLOCKS = 18;
 export type ClaimedOutputIndices = ReadonlySet<number>;
 
 export interface IRevokedHtlcSnapshotOutput {
+	htlcId?: bigint;
 	outputType: OutputType.OFFERED_HTLC | OutputType.RECEIVED_HTLC;
 	paymentHash: Buffer;
 	cltvExpiry: number;
@@ -2922,7 +3407,13 @@ export function matchRevokedHtlcSnapshotOutputs(
 						taprootKeys.localHtlcPubkey,
 						taprootKeys.remoteHtlcPubkey,
 						entry.paymentHash,
-						network
+						network,
+						htlcAuxiliaryLeaf(
+							state,
+							commitmentNumber,
+							entry.direction,
+							entry.id
+						)
 				  ).output
 				: buildTaprootReceivedHtlcOutput(
 						taprootKeys.revocationPubkey,
@@ -2930,7 +3421,13 @@ export function matchRevokedHtlcSnapshotOutputs(
 						taprootKeys.remoteHtlcPubkey,
 						entry.paymentHash,
 						entry.cltvExpiry,
-						network
+						network,
+						htlcAuxiliaryLeaf(
+							state,
+							commitmentNumber,
+							entry.direction,
+							entry.id
+						)
 				  ).output;
 		} else {
 			witnessScript =
@@ -2968,6 +3465,7 @@ export function matchRevokedHtlcSnapshotOutputs(
 						? OutputType.OFFERED_HTLC
 						: OutputType.RECEIVED_HTLC,
 				paymentHash: entry.paymentHash,
+				htlcId: entry.id,
 				cltvExpiry: entry.cltvExpiry,
 				witnessScript
 			}
@@ -3100,10 +3598,11 @@ export function resolveRevokedCommitmentOutputs(
 			const feeSatoshis = BigInt(
 				Math.ceil(
 					feeRatePerVbyte *
-						estimateSweepVbytes(
+						(estimateSweepVbytes(
 							OutputType.TO_REMOTE,
 							toRemoteLeaseCsv !== undefined
-						)
+						) +
+							auxiliarySweepVbytes(state, destinationScript))
 				)
 			);
 			// Both builders below throw when the fee exceeds the output, and this
@@ -3377,7 +3876,8 @@ function resolveRevokedTaprootCommitmentOutputs(
 				keys.revocationPubkey,
 				keys.delayedPubkey,
 				keys.toSelfDelay,
-				network
+				network,
+				commitmentAuxiliaryLeaf(state, false, commitmentNumber, o.outputIndex)
 			);
 			penaltyIns.push({
 				output: o,
@@ -3399,7 +3899,13 @@ function resolveRevokedTaprootCommitmentOutputs(
 						keys.localHtlcPubkey,
 						keys.remoteHtlcPubkey,
 						o.paymentHash!,
-						network
+						network,
+						commitmentAuxiliaryLeaf(
+							state,
+							false,
+							commitmentNumber,
+							o.outputIndex
+						)
 				  )
 				: buildTaprootReceivedHtlcOutput(
 						keys.revocationPubkey,
@@ -3407,7 +3913,13 @@ function resolveRevokedTaprootCommitmentOutputs(
 						keys.remoteHtlcPubkey,
 						o.paymentHash!,
 						o.cltvExpiry || 0,
-						network
+						network,
+						commitmentAuxiliaryLeaf(
+							state,
+							false,
+							commitmentNumber,
+							o.outputIndex
+						)
 				  );
 			penaltyIns.push({
 				output: o,
@@ -3417,9 +3929,17 @@ function resolveRevokedTaprootCommitmentOutputs(
 			});
 		} else if (o.outputType === OutputType.TO_REMOTE) {
 			// Our balance — claim the 1-block-CSV to_remote leaf with our payment key.
-			const tr = buildTaprootToRemoteOutput(keys.paymentPubkey, network);
+			const tr = buildTaprootToRemoteOutput(
+				keys.paymentPubkey,
+				network,
+				commitmentAuxiliaryLeaf(state, false, commitmentNumber, o.outputIndex)
+			);
 			const feeSatoshis = BigInt(
-				Math.ceil(feeRatePerVbyte * estimateSweepVbytes(OutputType.TO_REMOTE))
+				Math.ceil(
+					feeRatePerVbyte *
+						(estimateSweepVbytes(OutputType.TO_REMOTE) +
+							auxiliarySweepVbytes(state, destinationScript))
+				)
 			);
 			const claimValue = sweepOutputValue(
 				o.amount,
@@ -3437,6 +3957,24 @@ function resolveRevokedTaprootCommitmentOutputs(
 				1 // 1-block CSV
 			);
 			claimTx.addOutput(destinationScript, claimValue);
+			prepareAuxiliarySweep(
+				state,
+				false,
+				commitmentNumber,
+				claimTx,
+				[
+					{
+						output: o,
+						commitmentOutputIndex: o.outputIndex,
+						kind: 'to_remote',
+						privateKey: paymentPrivkey,
+						leafScript: tr.spend.script,
+						leafVersion: tr.spend.leafVersion,
+						controlBlock: tr.spend.controlBlock
+					}
+				],
+				destinationScript
+			);
 			const sighash = claimTx.hashForWitnessV1(
 				0,
 				[tr.output],
@@ -3484,7 +4022,8 @@ function resolveRevokedTaprootCommitmentOutputs(
 						keys.localHtlcPubkey,
 						keys.remoteHtlcPubkey,
 						metadata.paymentHash,
-						network
+						network,
+						commitmentAuxiliaryLeaf(state, false, commitmentNumber, outputIndex)
 				  )
 				: buildTaprootReceivedHtlcOutput(
 						keys.revocationPubkey,
@@ -3492,7 +4031,8 @@ function resolveRevokedTaprootCommitmentOutputs(
 						keys.remoteHtlcPubkey,
 						metadata.paymentHash,
 						metadata.cltvExpiry,
-						network
+						network,
+						commitmentAuxiliaryLeaf(state, false, commitmentNumber, outputIndex)
 				  );
 			handled.add(outputIndex);
 			penaltyIns.push({
@@ -3504,6 +4044,10 @@ function resolveRevokedTaprootCommitmentOutputs(
 					status: OutputStatus.CONFIRMED,
 					confirmationHeight: 0,
 					paymentHash: metadata.paymentHash,
+					htlcId: metadata.htlcId,
+					auxiliaryCommitmentNumber: state.auxiliaryState
+						? commitmentNumber
+						: undefined,
 					cltvExpiry: metadata.cltvExpiry
 				},
 				spk: h.output,
@@ -3532,8 +4076,10 @@ function resolveRevokedTaprootCommitmentOutputs(
 		}
 		const estVbytes =
 			TAPROOT_PENALTY_BASE_VBYTES +
-			ins.length * TAPROOT_PENALTY_PER_INPUT_VBYTES +
-			TAPROOT_PENALTY_OUTPUT_VBYTES;
+			ins.length *
+				(TAPROOT_PENALTY_PER_INPUT_VBYTES + (state.auxiliaryState ? 8 : 0)) +
+			TAPROOT_PENALTY_OUTPUT_VBYTES +
+			(state.auxiliaryState ? Math.max(0, 34 - destinationScript.length) : 0);
 		const fee = BigInt(Math.ceil(feeRatePerVbyte * estVbytes));
 		const penaltyValue = sweepOutputValue(totalIn, fee, destinationScript);
 		if (penaltyValue === null) {
@@ -3548,6 +4094,22 @@ function resolveRevokedTaprootCommitmentOutputs(
 		}
 		penaltyTx.addOutput(destinationScript, penaltyValue);
 
+		prepareAuxiliarySweep(
+			state,
+			false,
+			commitmentNumber,
+			penaltyTx,
+			ins.map((pin) => ({
+				output: pin.output,
+				commitmentOutputIndex: pin.output.outputIndex,
+				kind: pin.merkleRoot ? 'htlc_revocation' : 'to_local_revocation',
+				privateKey: revocationPrivkey,
+				leafScript: pin.leafScript,
+				controlBlock: pin.controlBlock,
+				leafVersion: pin.leafScript ? TAPLEAF_VERSION : undefined
+			})),
+			destinationScript
+		);
 		const prevScripts = ins.map((p) => p.spk);
 		const values = ins.map((p) => p.value);
 
@@ -3654,7 +4216,11 @@ export function resolveRevokedSecondLevelOutput(
 		perCommitmentPoint
 	);
 	const feeSatoshis = BigInt(
-		Math.ceil(feeRatePerVbyte * estimateSweepVbytes(OutputType.TO_LOCAL))
+		Math.ceil(
+			feeRatePerVbyte *
+				(estimateSweepVbytes(OutputType.TO_LOCAL) +
+					auxiliarySweepVbytes(state, destinationScript))
+		)
 	);
 	const spendingTxid = spendingTx.getId();
 	const resolved: IResolvedOutput[] = [];
@@ -3667,16 +4233,20 @@ export function resolveRevokedSecondLevelOutput(
 	// No lease variant: leased taproot channels are rejected at negotiation.
 	if (isTaprootChannel(state.channelType)) {
 		const keys = deriveTaprootCommitKeys(state, perCommitmentPoint, false);
-		const sl = buildTaprootSecondLevelOutput(
-			keys.revocationPubkey,
-			keys.delayedPubkey,
-			keys.toSelfDelay,
-			network
-		);
-		const merkleRoot = tapleafHash(sl.delay.script, sl.delay.leafVersion);
+
 		for (let i = 0; i < spendingTx.outs.length; i++) {
 			const out = spendingTx.outs[i];
-			if (!sl.output.equals(out.script)) continue;
+			const match = matchSecondLevelTree(
+				state,
+				false,
+				commitmentNumber,
+				keys,
+				out.script,
+				network
+			);
+			if (!match) continue;
+			const sl = match.tree;
+			const merkleRoot = sl.merkleRoot;
 			const amount = BigInt(out.value);
 			const claimValue = sweepOutputValue(
 				amount,
@@ -3692,6 +4262,36 @@ export function resolveRevokedSecondLevelOutput(
 				0xfffffffd
 			);
 			claimTx.addOutput(destinationScript, claimValue);
+			const trackedOutput: ITrackedOutput = {
+				txid: spendingTxid,
+				outputIndex: i,
+				amount,
+				outputType: OutputType.TO_LOCAL,
+				status: OutputStatus.CONFIRMED,
+				confirmationHeight,
+				witnessScript: sl.output,
+				htlcId: match.htlcId,
+				auxiliaryHtlcDirection: match.auxiliaryHtlcDirection,
+				auxiliaryCommitmentNumber: state.auxiliaryState
+					? commitmentNumber
+					: undefined
+			};
+			prepareAuxiliarySweep(
+				state,
+				false,
+				commitmentNumber,
+				claimTx,
+				[
+					{
+						output: trackedOutput,
+						commitmentOutputIndex: i,
+						kind: 'second_level_revocation',
+						privateKey: revocationPrivkey,
+						sourceTransaction: spendingTx
+					}
+				],
+				destinationScript
+			);
 			const sighash = claimTx.hashForWitnessV1(
 				0,
 				[sl.output],
@@ -3702,15 +4302,7 @@ export function resolveRevokedSecondLevelOutput(
 			const witness = [signTaprootHtlcLeaf(sighash, tweaked)];
 			claimTx.setWitness(0, witness);
 			resolved.push({
-				trackedOutput: {
-					txid: spendingTxid,
-					outputIndex: i,
-					amount,
-					outputType: OutputType.TO_LOCAL,
-					status: OutputStatus.CONFIRMED,
-					confirmationHeight,
-					witnessScript: sl.output
-				},
+				trackedOutput,
 				spendTx: claimTx,
 				witness
 			});

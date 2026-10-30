@@ -136,6 +136,27 @@ export class ChainMonitor {
 		this._rebuildHeldSweeps();
 	}
 
+	/** Preserve the exact asset transition for each signed Bitcoin attempt. */
+	private _retainAuxiliarySweep(
+		output: ITrackedOutput,
+		transaction?: bitcoin.Transaction,
+		auxiliaryData?: Buffer
+	): void {
+		const data = auxiliaryData ?? output.auxiliaryData;
+		if (!data || (!transaction && !output.sweepTxHex)) return;
+		const tx = transaction ?? bitcoin.Transaction.fromHex(output.sweepTxHex!);
+		output.auxiliarySweepAttempts ??= {};
+		output.auxiliarySweepAttempts[tx.getId()] = {
+			transaction: tx.toHex(),
+			auxiliaryData: Buffer.from(data)
+		};
+	}
+
+	private _selectAuxiliarySweep(output: ITrackedOutput, txid: string): void {
+		const attempt = output.auxiliarySweepAttempts?.[txid];
+		if (attempt) output.auxiliaryData = Buffer.from(attempt.auxiliaryData);
+	}
+
 	/**
 	 * The per-commitment point for resolving a THEIR_CURRENT record: the
 	 * point pinned at classification time (issues #573/#574), falling back
@@ -231,6 +252,9 @@ export class ChainMonitor {
 				if (!r.witness) continue;
 				r.spendTx.setWitness(0, r.witness);
 				r.trackedOutput.sweepTxHex = r.spendTx.toBuffer().toString('hex');
+				if (r.auxiliaryData)
+					r.trackedOutput.auxiliaryData = Buffer.from(r.auxiliaryData);
+				this._retainAuxiliarySweep(r.trackedOutput);
 			}
 		} catch {
 			// Keep the existing held sweeps; they are still valid spends.
@@ -276,6 +300,17 @@ export class ChainMonitor {
 		monitor._state = saved.monitorState;
 		monitor._commitmentBroadcast = saved.commitmentBroadcast;
 		monitor._trackedOutputs = saved.trackedOutputs;
+		for (const output of monitor._trackedOutputs) {
+			// Older records carry one attempt; preserve it before a new fee build.
+			if (
+				!output.auxiliarySweepAttempts &&
+				(!output.resolutionTxid ||
+					(output.sweepTxHex &&
+						bitcoin.Transaction.fromHex(output.sweepTxHex).getId() ===
+							output.resolutionTxid))
+			)
+				monitor._retainAuxiliarySweep(output);
+		}
 		if (monitor._commitmentBroadcast) {
 			// Serialized state contains this list in two places. Rejoin the references
 			// so restored adoption and metadata repair persist consistently.
@@ -1165,6 +1200,7 @@ export class ChainMonitor {
 
 		output.status = OutputStatus.SPEND_CONFIRMED;
 		output.resolutionTxid = spendingTx.getId();
+		this._selectAuxiliarySweep(output, spendingTx.getId());
 		output.confirmationHeight = blockHeight;
 		// A spend we had not recorded is live evidence as much as a re-report of
 		// one we had, so it releases a parked finality clock (issue #576). A
@@ -1190,8 +1226,10 @@ export class ChainMonitor {
 			output.sweepTxHex
 		) {
 			let isOurSecondLevel = false;
+			let secondLevelTemplate: bitcoin.Transaction | undefined;
 			try {
 				const template = bitcoin.Transaction.fromHex(output.sweepTxHex);
+				secondLevelTemplate = template;
 				if (template.getId() === spendingTx.getId()) {
 					isOurSecondLevel = true;
 				} else {
@@ -1232,6 +1270,15 @@ export class ChainMonitor {
 				isOurSecondLevel = false;
 			}
 			if (isOurSecondLevel) {
+				// Wallet fee inputs change the transaction ID while preserving the
+				// pre-signed asset output and input witness verified above.
+				const payload =
+					output.auxiliarySweepAttempts?.[spendingTx.getId()]?.auxiliaryData ??
+					output.auxiliarySweepAttempts?.[secondLevelTemplate!.getId()]
+						?.auxiliaryData ??
+					output.auxiliaryData;
+				this._retainAuxiliarySweep(output, spendingTx, payload);
+				this._selectAuxiliarySweep(output, spendingTx.getId());
 				const already = this._trackedOutputs.some(
 					(o) => o.txid === spendingTx.getId() && o.outputIndex === 0
 				);
@@ -1244,7 +1291,8 @@ export class ChainMonitor {
 						this._destinationScript,
 						this._feeRatePerVbyte,
 						this._delayedPaymentBasepointSecret,
-						this._network
+						this._network,
+						output.auxiliaryData
 					);
 					if (r) {
 						this._trackedOutputs.push(r.trackedOutput);
@@ -1326,6 +1374,9 @@ export class ChainMonitor {
 					r.trackedOutput.broadcastHeight = blockHeight;
 					r.trackedOutput.originalFeeRate = this._feeRatePerVbyte;
 					r.trackedOutput.sweepTxHex = txBuf.toString('hex');
+					if (r.auxiliaryData)
+						r.trackedOutput.auxiliaryData = Buffer.from(r.auxiliaryData);
+					this._retainAuxiliarySweep(r.trackedOutput);
 					// Retain the cheater's second-level tx so a stalled claim can be
 					// re-resolved at a bumped feerate (rebuildSweep) rather than
 					// stranded at its initial rate until the to_self_delay matures.
@@ -1354,6 +1405,7 @@ export class ChainMonitor {
 		for (const spentTrackedOutput of spentTrackedOutputs) {
 			spentTrackedOutput.status = OutputStatus.SPEND_CONFIRMED;
 			spentTrackedOutput.resolutionTxid = spendingTx.getId();
+			this._selectAuxiliarySweep(spentTrackedOutput, spendingTx.getId());
 			spentTrackedOutput.confirmationHeight = blockHeight;
 			delete spentTrackedOutput.spendReverifyPending;
 		}
@@ -1609,6 +1661,7 @@ export class ChainMonitor {
 						candidate.resolutionTxid = undefined;
 						candidate.confirmationHeight = revokedBroadcast.blockHeight;
 						candidate.sweepTxHex = retainedHex;
+						this._selectAuxiliarySweep(candidate, retainedSweep.getId());
 						candidate.originalFeeRate = reorgedOutput.originalFeeRate;
 						candidate.currentFeeRate = reorgedOutput.currentFeeRate;
 						candidate.maturityHeight = undefined;
@@ -1822,6 +1875,9 @@ export class ChainMonitor {
 					r.trackedOutput.broadcastHeight = this._currentBlockHeight;
 					r.trackedOutput.originalFeeRate = this._feeRatePerVbyte;
 					r.trackedOutput.sweepTxHex = txBuf.toString('hex');
+					if (r.auxiliaryData)
+						r.trackedOutput.auxiliaryData = Buffer.from(r.auxiliaryData);
+					this._retainAuxiliarySweep(r.trackedOutput);
 				}
 			}
 		} else if (commitmentType === CommitmentType.THEIR_CURRENT_COMMITMENT) {
@@ -2274,6 +2330,7 @@ export class ChainMonitor {
 			trackedOutput: ITrackedOutput;
 			spendTx?: bitcoin.Transaction;
 			witness?: Buffer[];
+			auxiliaryData?: Buffer;
 		},
 		description: string
 	): void {
@@ -2291,6 +2348,10 @@ export class ChainMonitor {
 		);
 
 		r.trackedOutput.sweepTxHex = txBuf.toString('hex');
+
+		if (r.auxiliaryData)
+			r.trackedOutput.auxiliaryData = Buffer.from(r.auxiliaryData);
+		this._retainAuxiliarySweep(r.trackedOutput);
 		r.trackedOutput.originalFeeRate = this._feeRatePerVbyte;
 		r.trackedOutput.maturityHeight = maturityHeight;
 
@@ -2713,6 +2774,9 @@ export class ChainMonitor {
 				if (spentOutpoints.has(`${candidate.txid}:${candidate.outputIndex}`)) {
 					candidate.status = OutputStatus.SPEND_BROADCAST;
 					candidate.sweepTxHex = rebuiltHex;
+					if (match.auxiliaryData)
+						candidate.auxiliaryData = Buffer.from(match.auxiliaryData);
+					this._retainAuxiliarySweep(candidate);
 					candidate.currentFeeRate = feeRatePerVbyte;
 					candidate.broadcastHeight = this._currentBlockHeight;
 				}
@@ -2792,6 +2856,8 @@ export class ChainMonitor {
 				// OUTPUT_RESOLVED action on the next block.
 				candidate.status = OutputStatus.SPEND_CONFIRMED;
 				candidate.resolutionTxid = confirmedOldSweep.resolutionTxid;
+				if (candidate.resolutionTxid)
+					this._selectAuxiliarySweep(candidate, candidate.resolutionTxid);
 				candidate.confirmationHeight = confirmedOldSweep.confirmationHeight;
 			}
 			return [];
@@ -2856,6 +2922,11 @@ export class ChainMonitor {
 				) {
 					continue;
 				}
+				this._retainAuxiliarySweep(
+					entry.trackedOutput,
+					entry.spendTx,
+					entry.auxiliaryData
+				);
 				unique.set(entry.spendTx.getId(), entry.spendTx);
 			}
 			return [...unique.values()];
@@ -2978,6 +3049,8 @@ export class ChainMonitor {
 			if (replacement) {
 				candidate.status = OutputStatus.SPEND_BROADCAST;
 				candidate.sweepTxHex = replacement.toHex();
+				this._selectAuxiliarySweep(candidate, replacement.getId());
+				this._retainAuxiliarySweep(candidate);
 				candidate.originalFeeRate ??= appliedFeeRate;
 				candidate.currentFeeRate = appliedFeeRate;
 				candidate.broadcastHeight = this._currentBlockHeight;
@@ -3097,6 +3170,9 @@ export class ChainMonitor {
 			r.trackedOutput.broadcastHeight = this._currentBlockHeight;
 			r.trackedOutput.originalFeeRate = this._feeRatePerVbyte;
 			r.trackedOutput.sweepTxHex = txBuf.toString('hex');
+			if (r.auxiliaryData)
+				r.trackedOutput.auxiliaryData = Buffer.from(r.auxiliaryData);
+			this._retainAuxiliarySweep(r.trackedOutput);
 		}
 	}
 
@@ -3178,7 +3254,22 @@ export class ChainMonitor {
 			(o) =>
 				o.txid === candidate.txid && o.outputIndex === candidate.outputIndex
 		);
-		if (existing) return existing;
+		if (existing) {
+			if (candidate.auxiliaryData)
+				existing.auxiliaryData = Buffer.from(candidate.auxiliaryData);
+			if (candidate.auxiliarySweepAttempts)
+				existing.auxiliarySweepAttempts = {
+					...existing.auxiliarySweepAttempts,
+					...candidate.auxiliarySweepAttempts
+				};
+			if (candidate.auxiliaryHtlcDirection !== undefined)
+				existing.auxiliaryHtlcDirection = candidate.auxiliaryHtlcDirection;
+			if (candidate.auxiliaryCommitmentNumber !== undefined)
+				existing.auxiliaryCommitmentNumber =
+					candidate.auxiliaryCommitmentNumber;
+			if (candidate.htlcId !== undefined) existing.htlcId = candidate.htlcId;
+			return existing;
+		}
 		// A fee update can discover a snapshot output on a monitor restored from
 		// older state that already said it was fully resolved. The adopted output is
 		// unresolved, so block processing must resume immediately.

@@ -1,3 +1,7 @@
+import type {
+	IChannelAuxiliaryProvider,
+	IChannelAuxiliaryState
+} from './auxiliary';
 /**
  * BOLT 2: Channel state snapshot.
  *
@@ -283,6 +287,13 @@ export interface IChannelState {
 	state: ChannelState;
 
 	/** Funding */
+	/** Asset commitment root committed by the 2-of-2 Taproot funding key. */
+	fundingTaprootMerkleRoot?: Buffer;
+	/** Journaled together with the Bitcoin commitment/revocation state. */
+	auxiliaryState?: IChannelAuxiliaryState;
+	/** Runtime-only provider, reattached by ChannelManager after restore. */
+	auxiliaryProvider?: IChannelAuxiliaryProvider;
+	lastSentAuxiliaryRecords?: ReadonlyMap<bigint, Buffer>;
 	fundingSatoshis: bigint;
 	pushMsat: bigint;
 	fundingTxid: Buffer | null;

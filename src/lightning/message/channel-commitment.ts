@@ -22,6 +22,12 @@
  */
 
 import type { ITlvRecord } from './tlv';
+import type { CustomRecords } from './custom-records';
+import {
+	boundedLightningPayload,
+	customRecordEntries,
+	decodeWithCustomRecords
+} from './custom-records';
 import { encodeTlvStream, decodeTlvStream } from './tlv';
 
 export interface ICommitmentSignedMessage {
@@ -37,6 +43,8 @@ export interface ICommitmentSignedMessage {
 	 * is then all-zero). TLV type 2 (LND convention; pin at interop).
 	 */
 	partialSignatureWithNonce?: Buffer;
+	/** Auxiliary protocol signatures, preserved verbatim through recovery. */
+	customRecords?: CustomRecords;
 }
 
 const TLV_SPLICE_INFO = 1n;
@@ -86,7 +94,7 @@ export function encodeCommitmentSignedMessage(
 	}
 
 	// Append optional TLVs (splice funding_txid type 1; taproot partial sig type 2).
-	const records: ITlvRecord[] = [];
+	const records: ITlvRecord[] = customRecordEntries(msg.customRecords);
 	if (msg.fundingTxid) {
 		if (msg.fundingTxid.length !== 32) {
 			throw new Error(
@@ -109,10 +117,12 @@ export function encodeCommitmentSignedMessage(
 	if (records.length > 0) {
 		// TLV records must be in ascending type order.
 		records.sort((a, b) => (a.type < b.type ? -1 : 1));
-		return Buffer.concat([buf, encodeTlvStream(records)]);
+		return boundedLightningPayload(
+			Buffer.concat([buf, encodeTlvStream(records)])
+		);
 	}
 
-	return buf;
+	return boundedLightningPayload(buf);
 }
 
 /**
@@ -121,6 +131,7 @@ export function encodeCommitmentSignedMessage(
 export function decodeCommitmentSignedMessage(
 	payload: Buffer
 ): ICommitmentSignedMessage {
+	boundedLightningPayload(payload);
 	if (payload.length < COMMITMENT_SIGNED_FIXED_LENGTH) {
 		throw new Error(
 			`commitment_signed too short: need ${COMMITMENT_SIGNED_FIXED_LENGTH} bytes, got ${payload.length}`
@@ -152,8 +163,9 @@ export function decodeCommitmentSignedMessage(
 	// Parse optional TLVs: splice funding_txid (1), taproot partial sig (2).
 	let fundingTxid: Buffer | undefined;
 	let partialSignatureWithNonce: Buffer | undefined;
+	const customRecords = new Map<bigint, Buffer>();
 	if (offset < payload.length) {
-		const { records } = decodeTlvStream(
+		const records = decodeWithCustomRecords(
 			payload,
 			offset,
 			COMMITMENT_SIGNED_TLV_TYPES
@@ -166,6 +178,8 @@ export function decodeCommitmentSignedMessage(
 				record.value.length === 98
 			) {
 				partialSignatureWithNonce = Buffer.from(record.value);
+			} else if (record.type >= 65536n) {
+				customRecords.set(record.type, Buffer.from(record.value));
 			}
 		}
 	}
@@ -175,7 +189,8 @@ export function decodeCommitmentSignedMessage(
 		signature,
 		htlcSignatures,
 		fundingTxid,
-		partialSignatureWithNonce
+		partialSignatureWithNonce,
+		...(customRecords.size ? { customRecords } : {})
 	};
 }
 

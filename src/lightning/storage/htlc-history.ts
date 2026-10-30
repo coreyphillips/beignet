@@ -23,6 +23,7 @@ export interface ICompactHtlcHistory {
 }
 
 export function usesCompactHtlcHistory(state: IChannelState): boolean {
+	if (state.auxiliaryState) return false;
 	return (
 		state.compactHtlcHistory === true ||
 		isFforConcurrentVersion(state.ffor?.concurrentVersion)

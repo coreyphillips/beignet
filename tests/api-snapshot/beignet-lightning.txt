@@ -73,6 +73,22 @@ property IResolvedNodeDefaults.zeroReserve: Readonly<IZeroReserveConfig & Requir
 unexported interface IResult
 method IResult.isErr(): boolean
 method IResult.isOk(): boolean
+unexported interface ISerializedAuxiliaryCommitment
+property ISerializedAuxiliaryCommitment.customData: string
+property ISerializedAuxiliaryCommitment.htlcOutputIndexes?: [ string, number ][]
+property ISerializedAuxiliaryCommitment.outputLeaves: [ number, { script: string; leafVersion?: number; } ][]
+property ISerializedAuxiliaryCommitment.peerSignatures?: SerializedCustomRecords
+property ISerializedAuxiliaryCommitment.secondLevelLeaves: [ string, { script: string; leafVersion?: number; } ][]
+unexported interface ISerializedAuxiliaryState
+property ISerializedAuxiliaryState.channelData: string
+property ISerializedAuxiliaryState.closeTransactions?: [ string, string ][]
+property ISerializedAuxiliaryState.localBalance: string
+property ISerializedAuxiliaryState.localCommitments: [ string, ISerializedAuxiliaryCommitment ][]
+property ISerializedAuxiliaryState.localShutdownRecords?: SerializedCustomRecords
+property ISerializedAuxiliaryState.remoteBalance: string
+property ISerializedAuxiliaryState.remoteCommitments: [ string, ISerializedAuxiliaryCommitment ][]
+property ISerializedAuxiliaryState.remoteShutdownRecords?: SerializedCustomRecords
+property ISerializedAuxiliaryState.resolvedHtlcs?: [ string, { htlcId: string; direction: channel.HtlcDirection; paymentHash: string; auxiliaryAmount: string; customRecords?: SerializedCustomRecords; outcome: 'fulfilled' | 'failed'; } ][]
 unexported interface ISpliceUtxo
 property ISpliceUtxo.address: string
 property ISpliceUtxo.height: number
@@ -100,6 +116,7 @@ unexported type LedgerTransitionOutcome = 'applied' | 'stale' | 'missing' | 'sto
 unexported type MessageHandler = (pubkey: string, type: number, payload: Buffer) => void
 unexported type PeerState = 'disconnected' | 'connecting' | 'handshaking' | 'init' | 'ready' | 'closing'
 unexported type SeedDerivedNodeConfigKey = 'nodePrivateKey' | 'channelBasepoints' | 'perCommitmentSeed' | 'fundingPrivkey' | 'htlcBasepointSecret' | 'revocationBasepointSecret' | 'paymentBasepointSecret' | 'delayedPaymentBasepointSecret'
+unexported type SerializedCustomRecords = [ string, string ][]
 unexported type SubmarineSwapEventName = 'swap:created' | 'swap:funding-seen' | 'swap:funded' | 'swap:funding-lost' | 'swap:paying' | 'swap:payment-unresolved' | 'swap:preimage' | 'swap:claim-broadcast' | 'swap:claim-confirmed' | 'swap:payment-failed' | 'swap:exposed' | 'swap:cancelled' | 'swap:failed'
 unexported type SwapEventName = 'swap:created' | 'swap:held' | 'swap:funding' | 'swap:funded' | 'swap:claimed' | 'swap:settled' | 'swap:refund-broadcast' | 'swap:refunded' | 'swap:hold-cancelled' | 'swap:exposed' | 'swap:failed'
 unexported type SyncSnapshot = Pick<ffor.IFforSyncReplyMessage, 'numSlots' | 'settled' | 'preimages'>
@@ -679,6 +696,8 @@ property chain.IChainMonitorState.knownPreimages?: Record<string, string>
 property chain.IChainMonitorState.monitorState: chain.MonitorState
 property chain.IChainMonitorState.trackedOutputs: chain.ITrackedOutput[]
 interface chain.IChainWatcherChannelManager
+method chain.IChainWatcherChannelManager.getMonitor?(channelId: Buffer): Pick<chain.ChainMonitor, 'getFullState'> | undefined
+method chain.IChainWatcherChannelManager.getMonitors?(): ReadonlyMap<string, Pick<chain.ChainMonitor, 'getFullState'>>
 method chain.IChainWatcherChannelManager.handleFundingConfirmed(channelId: Buffer, confirmedTxidHex?: beignet/cli#TxidHex): void
 method chain.IChainWatcherChannelManager.handleFundingSpendAbsent(channelId: Buffer, scan?: chain.IFundingSpendScan, feeRatePerVbyte?: number): boolean
 method chain.IChainWatcherChannelManager.handleFundingSpent(channelId: Buffer, spendingTx: bitcoinjs-lib#Transaction, blockHeight: number, destinationScript: Buffer, feeRatePerVbyte?: number, revocationBasepointSecret?: Buffer, paymentPrivkey?: Buffer, network?: bitcoinjs-lib#Network, spentOutpoint?: { txid: string; outputIndex: number; }): void
@@ -686,8 +705,8 @@ method chain.IChainWatcherChannelManager.handleNewBlock(blockHeight: number): vo
 method chain.IChainWatcherChannelManager.handleOutputSpent(txid: string, outputIndex: number, spendingTx: bitcoinjs-lib#Transaction, blockHeight: number): void
 method chain.IChainWatcherChannelManager.handleOutputUnspent(txid: string, outputIndex: number): void
 method chain.IChainWatcherChannelManager.listChannels(): channel.Channel[]
-method chain.IChainWatcherChannelManager.off<K extends 'watch:funding' | 'broadcast:tx' | 'watch:output'>(event: K, listener: channel.ChannelManagerEvents[K]): void
-method chain.IChainWatcherChannelManager.on<K extends 'watch:funding' | 'broadcast:tx' | 'watch:output'>(event: K, listener: channel.ChannelManagerEvents[K]): void
+method chain.IChainWatcherChannelManager.off<K extends 'watch:funding' | 'broadcast:tx' | 'watch:output' | 'output:resolved'>(event: K, listener: channel.ChannelManagerEvents[K]): void
+method chain.IChainWatcherChannelManager.on<K extends 'watch:funding' | 'broadcast:tx' | 'watch:output' | 'output:resolved'>(event: K, listener: channel.ChannelManagerEvents[K]): void
 interface chain.IChainWatcherConfig
 property chain.IChainWatcherConfig.backend: chain.IChainBackend
 property chain.IChainWatcherConfig.channelManager: chain.IChainWatcherChannelManager
@@ -787,6 +806,7 @@ property chain.IRemoteHtlcPreimageClaimParams.inputSequence?: number
 property chain.IRemoteHtlcPreimageClaimParams.outputIndex: number
 property chain.IRemoteHtlcPreimageClaimParams.witnessScript: Buffer
 interface chain.IResolvedOutput
+property chain.IResolvedOutput.auxiliaryData?: Buffer
 property chain.IResolvedOutput.cltvExpiry?: number
 property chain.IResolvedOutput.csvDelay?: number
 property chain.IResolvedOutput.declinedAsUneconomic?: boolean
@@ -795,6 +815,7 @@ property chain.IResolvedOutput.trackedOutput: chain.ITrackedOutput
 property chain.IResolvedOutput.witness?: Buffer[]
 interface chain.IRevokedHtlcSnapshotOutput
 property chain.IRevokedHtlcSnapshotOutput.cltvExpiry: number
+property chain.IRevokedHtlcSnapshotOutput.htlcId?: bigint
 property chain.IRevokedHtlcSnapshotOutput.outputType: chain.OutputType.OFFERED_HTLC | chain.OutputType.RECEIVED_HTLC
 property chain.IRevokedHtlcSnapshotOutput.paymentHash: Buffer
 property chain.IRevokedHtlcSnapshotOutput.witnessScript?: Buffer
@@ -844,6 +865,10 @@ property chain.IToRemoteClaimParams.feeSatoshis: bigint
 property chain.IToRemoteClaimParams.outputIndex: number
 interface chain.ITrackedOutput
 property chain.ITrackedOutput.amount: bigint
+property chain.ITrackedOutput.auxiliaryCommitmentNumber?: bigint
+property chain.ITrackedOutput.auxiliaryData?: Buffer
+property chain.ITrackedOutput.auxiliaryHtlcDirection?: channel.HtlcDirection
+property chain.ITrackedOutput.auxiliarySweepAttempts?: Record<string, { transaction: string; auxiliaryData: Buffer; }>
 property chain.ITrackedOutput.broadcastHeight?: number
 property chain.ITrackedOutput.cltvExpiry?: number
 property chain.ITrackedOutput.confirmationHeight: number
@@ -935,7 +960,7 @@ function chain.minRelayFeeForWeight(weightUnits: number | bigint): bigint
 function chain.resolveOurCommitmentOutputs(state: channel.IChannelState, trackedOutputs: chain.ITrackedOutput[], commitmentNumber: bigint, destinationScript: Buffer, feeRatePerVbyte: number, knownPreimages: Map<string, Buffer>, delayedPaymentBasepointSecret?: Buffer, htlcBasepointSecret?: Buffer, remoteHtlcSignatures?: Buffer[]): chain.IResolvedOutput[]
 function chain.resolveRevokedCommitmentOutputs(state: channel.IChannelState, trackedOutputs: chain.ITrackedOutput[], commitmentNumber: bigint, revokedTx: bitcoinjs-lib#Transaction, destinationScript: Buffer, feeRatePerVbyte: number, revocationBasepointSecret: Buffer, paymentPrivkey: Buffer, network?: bitcoinjs-lib#Network, currentHeight?: number, claimedOutputIndices?: chain.ClaimedOutputIndices): chain.IResolvedOutput[]
 function chain.resolveRevokedSecondLevelOutput(state: channel.IChannelState, spendingTx: bitcoinjs-lib#Transaction, confirmationHeight: number, commitmentNumber: bigint, destinationScript: Buffer, feeRatePerVbyte: number, revocationBasepointSecret: Buffer, network?: bitcoinjs-lib#Network): chain.IResolvedOutput[]
-function chain.resolveSecondLevelHtlcOutput(state: channel.IChannelState, htlcTx: bitcoinjs-lib#Transaction, confirmationHeight: number, commitmentNumber: bigint, destinationScript: Buffer, feeRatePerVbyte: number, delayedPaymentBasepointSecret: Buffer | undefined, network?: bitcoinjs-lib#Network): chain.IResolvedOutput | null
+function chain.resolveSecondLevelHtlcOutput(state: channel.IChannelState, htlcTx: bitcoinjs-lib#Transaction, confirmationHeight: number, commitmentNumber: bigint, destinationScript: Buffer, feeRatePerVbyte: number, delayedPaymentBasepointSecret: Buffer | undefined, network?: bitcoinjs-lib#Network, previousAuxiliaryData?: Buffer): chain.IResolvedOutput | null
 function chain.resolveTheirCurrentCommitmentOutputs(state: channel.IChannelState, trackedOutputs: chain.ITrackedOutput[], destinationScript: Buffer, feeRatePerVbyte: number, knownPreimages: Map<string, Buffer>, paymentPrivkey: Buffer, htlcBasepointSecret?: Buffer, remotePerCommitmentPoint?: Buffer): chain.IResolvedOutput[]
 function chain.satPerKwToSatPerVbyte(satPerKw: number): number
 function chain.satPerVbyteToSatPerKw(satPerVbyte: number): number
@@ -943,11 +968,12 @@ function chain.selectTheirPerCommitmentPoint(tx: bitcoinjs-lib#Transaction, stat
 function chain.signP2wpkhInput(tx: bitcoinjs-lib#Transaction, inputIndex: number, pubkey: Buffer, value: number, privateKey: Buffer): Buffer
 function chain.signSweepInput(tx: bitcoinjs-lib#Transaction, inputIndex: number, witnessScript: Buffer, value: number, privateKey: Buffer, sighashType?: number): Buffer
 namespace channel
+type channel.AuxiliarySpendKind = 'to_local_delayed' | 'to_local_revocation' | 'to_remote' | 'htlc_timeout' | 'htlc_success' | 'htlc_second_level_timeout' | 'htlc_second_level_success' | 'htlc_revocation' | 'second_level_delayed' | 'second_level_revocation'
 const channel.BITCOIN_CHAIN_HASH: Buffer
 const channel.CHANNEL_INDEX_FLOOR_MAX: number
 const channel.CHANNEL_INDEX_FLOOR_STRIDE = 128
 class channel.Channel
-constructor channel.Channel(state: channel.IChannelState, signer?: keys.ISigner)
+constructor channel.Channel(state: channel.IChannelState, signer?: keys.ISigner, auxiliaryProvider?: channel.IChannelAuxiliaryProvider)
 static readonly property channel.Channel.MAX_DUST_HTLC_EXPOSURE_MSAT = 5000000n
 static readonly property channel.Channel.MAX_HTLC_CLTV_EXPIRY_DELTA = 5040
 method channel.Channel.abandonSpliceConflictRequest(): channel.ChannelAction[]
@@ -955,7 +981,7 @@ method channel.Channel.abortDualFunding(reason?: string): channel.ChannelAction[
 method channel.Channel.abortFforEpoch(reason?: ffor.FforAbortReason, text?: string): channel.ChannelAction[]
 method channel.Channel.abortSplice(reason?: string): channel.ChannelAction[]
 method channel.Channel.acceptsNewHtlcs(lookThroughReestablish?: boolean, reservationHint?: boolean): boolean
-method channel.Channel.addHtlc(amountMsat: bigint, paymentHash: Buffer, cltvExpiry: number, onionRoutingPacket: Buffer, blindingPoint?: Buffer, skimmedFeeMsat?: bigint): channel.ChannelAction[]
+method channel.Channel.addHtlc(amountMsat: bigint, paymentHash: Buffer, cltvExpiry: number, onionRoutingPacket: Buffer, blindingPoint?: Buffer, skimmedFeeMsat?: bigint, customRecords?: message.CustomRecords): channel.ChannelAction[]
 method channel.Channel.addTxInput(input: interactiveTx.IInteractiveTxInput): channel.ChannelAction[]
 method channel.Channel.addTxOutput(output: interactiveTx.IInteractiveTxOutput): channel.ChannelAction[]
 method channel.Channel.adoptRemoteForwardingPolicy(policy: channel.IRemoteForwardingPolicy): boolean
@@ -1255,7 +1281,7 @@ method channel.ChannelManager.abortDualFundedOpen(channelId: Buffer, reason?: st
 method channel.ChannelManager.abortFforEpoch(channelId: Buffer, reason?: ffor.FforAbortReason, text?: string): channel.ChannelResult
 method channel.ChannelManager.abortPendingOpen(channel: channel.Channel, reason: string): void
 method channel.ChannelManager.abortSplice(channelId: Buffer, reason?: string): channel.ChannelResult
-method channel.ChannelManager.addHtlc(channelId: Buffer, amountMsat: bigint, paymentHash: Buffer, cltvExpiry: number, onionRoutingPacket: Buffer, blindingPoint?: Buffer, skimmedFeeMsat?: bigint): channel.ChannelResult
+method channel.ChannelManager.addHtlc(channelId: Buffer, amountMsat: bigint, paymentHash: Buffer, cltvExpiry: number, onionRoutingPacket: Buffer, blindingPoint?: Buffer, skimmedFeeMsat?: bigint, customRecords?: message.CustomRecords, expectedHtlcId?: bigint): channel.ChannelResult
 method channel.ChannelManager.addTrustedPeer(pubkeyHex: string): void
 method channel.ChannelManager.armChannelIndexTipFloor(knownTipHeight?: number): void
 method channel.ChannelManager.attachToPeerManager(peerManager: transport.PeerManager): void
@@ -1320,7 +1346,7 @@ method channel.ChannelManager.markChannelRestoredFromDisk(channelId: Buffer): vo
 method channel.ChannelManager.newChannelRefusal(): string | null
 get channel.ChannelManager.nextChannelIndex(): number
 set channel.ChannelManager.nextChannelIndex(value: number)
-method channel.ChannelManager.openChannel(peerPubkey: string, fundingSatoshis: bigint, pushMsat?: bigint, beforeNegotiate?: (temporaryChannelId: Buffer) => void, opts?: { trusted?: boolean; }): channel.Channel
+method channel.ChannelManager.openChannel(peerPubkey: string, fundingSatoshis: bigint, pushMsat?: bigint, beforeNegotiate?: (temporaryChannelId: Buffer) => void, opts?: { trusted?: boolean; auxiliary?: channel.IAuxiliaryFundingDescriptor; }): channel.Channel
 method channel.ChannelManager.openZeroConfChannel(peerPubkey: string, fundingSatoshis: bigint, pushMsat?: bigint): channel.Channel | null
 method channel.ChannelManager.peerNegotiatedFforConcurrent(peerPubkey: string): boolean
 method channel.ChannelManager.proposeClosingFee(channelId: Buffer, signature: Buffer): channel.ChannelResult
@@ -1342,6 +1368,7 @@ method channel.ChannelManager.restoreMonitor(channelId: string, monitor: chain.C
 method channel.ChannelManager.revertConflictedSplice(channelId: Buffer): channel.ChannelResult
 method channel.ChannelManager.sendRecoveryCloseRequest(channelId: Buffer): boolean
 method channel.ChannelManager.sendSpliceLocked(channelId: Buffer): channel.ChannelResult
+method channel.ChannelManager.setAuxiliaryFundingData(peerPubkey: string, temporaryChannelId: Buffer, data: Buffer): void
 method channel.ChannelManager.setFforFundingClient(peer: string, enabled: boolean): void
 method channel.ChannelManager.setFforPeerFeatureSource(source: ((peerPubkey: string) => features.FeatureFlags | null) | null): void
 method channel.ChannelManager.setFforSettlePolicy(policy: ffor.IFforSettlePolicy | null): void
@@ -1418,6 +1445,7 @@ property channel.ChannelManagerEvents.'watchtower:backup': (channelId: Buffer, p
 property channel.ChannelManagerEvents.error: (channelId: Buffer | null, message: string, code?: channel.ChannelErrorCode) => void
 interface channel.ChannelResult
 property channel.ChannelResult.actions: channel.ChannelAction[]
+property channel.ChannelResult.admissionRejected?: boolean
 property channel.ChannelResult.code?: channel.ChannelErrorCode
 property channel.ChannelResult.error?: string
 property channel.ChannelResult.ok: boolean
@@ -1525,16 +1553,182 @@ property channel.IAnnouncementReadyAction.type: channel.ChannelActionType.ANNOUN
 interface channel.IAuthorizeFundingBroadcastAction
 property channel.IAuthorizeFundingBroadcastAction.fundingTxid: Buffer
 property channel.IAuthorizeFundingBroadcastAction.type: channel.ChannelActionType.AUTHORIZE_FUNDING_BROADCAST
+interface channel.IAuxiliaryChannelConfig
+method channel.IAuxiliaryChannelConfig.beforeAccept?(channel: channel.Channel, peerPubkey: string): Promise<void>
+method channel.IAuxiliaryChannelConfig.beforeFundingCreated?(channel: channel.Channel, peerPubkey: string): Promise<void>
+property channel.IAuxiliaryChannelConfig.initCustomRecords?: message.CustomRecords
+method channel.IAuxiliaryChannelConfig.onAccepted?(channel: channel.Channel, peerPubkey: string): void
+method channel.IAuxiliaryChannelConfig.onForwardAdmissionFailed?(context: channel.IAuxiliaryForwardPlacement & { customRecords?: message.CustomRecords; }): void
+method channel.IAuxiliaryChannelConfig.onHtlcResolved?(context: channel.IAuxiliaryHtlcResolution & { state: channel.IChannelState; peerPubkey: string; channelId: Buffer; }): void
+method channel.IAuxiliaryChannelConfig.prepareForwardHtlc?(context: channel.IAuxiliaryForwardPlacement): channel.IAuxiliaryPayment
+property channel.IAuxiliaryChannelConfig.provider: channel.IChannelAuxiliaryProvider
+method channel.IAuxiliaryChannelConfig.resolveForwardChannel?(context: channel.IAuxiliaryForwardContext): { channelId: Buffer; peerPubkey: string; } | undefined
+method channel.IAuxiliaryChannelConfig.resolveIncoming(peerPubkey: string, temporaryChannelId: Buffer): channel.IAuxiliaryFundingDescriptor | undefined
+method channel.IAuxiliaryChannelConfig.valueIncomingHtlc?(context: channel.IAuxiliaryIncomingHtlc): bigint
+interface channel.IAuxiliaryChannelInfo
+property channel.IAuxiliaryChannelInfo.channelData: Buffer
+property channel.IAuxiliaryChannelInfo.channelId: Buffer
+property channel.IAuxiliaryChannelInfo.dustLimitSatoshis: bigint
+property channel.IAuxiliaryChannelInfo.localAssetBalance: bigint
+property channel.IAuxiliaryChannelInfo.localBalanceMsat: bigint
+property channel.IAuxiliaryChannelInfo.nextLocalHtlcId: bigint
+property channel.IAuxiliaryChannelInfo.peerPubkey: string
+property channel.IAuxiliaryChannelInfo.remoteAssetBalance: bigint
+property channel.IAuxiliaryChannelInfo.remoteBalanceMsat: bigint
+property channel.IAuxiliaryChannelInfo.shortChannelId?: Buffer
+property channel.IAuxiliaryChannelInfo.state: channel.ChannelState
+property channel.IAuxiliaryChannelInfo.temporaryChannelId: Buffer
+interface channel.IAuxiliaryCloseContext
+property channel.IAuxiliaryCloseContext.feeSatoshis: bigint
+property channel.IAuxiliaryCloseContext.localOutputIndex?: number
+property channel.IAuxiliaryCloseContext.remoteOutputIndex?: number
+property channel.IAuxiliaryCloseContext.state: channel.IChannelState
+property channel.IAuxiliaryCloseContext.transaction: bitcoinjs-lib#Transaction
+interface channel.IAuxiliaryCloseResult
+property channel.IAuxiliaryCloseResult.customData: Buffer
+property channel.IAuxiliaryCloseResult.outputScripts: Map<number, Buffer>
+interface channel.IAuxiliaryCommitmentContext
+property channel.IAuxiliaryCommitmentContext.baseTransaction: bitcoinjs-lib#Transaction
+property channel.IAuxiliaryCommitmentContext.commitmentNumber: bigint
+property channel.IAuxiliaryCommitmentContext.htlcs: channel.IHtlcOutputWithMeta[]
+property channel.IAuxiliaryCommitmentContext.keys: channel.ICommitmentKeys
+property channel.IAuxiliaryCommitmentContext.localAssetBalance: bigint
+property channel.IAuxiliaryCommitmentContext.outputs: channel.IAuxiliaryOutput[]
+property channel.IAuxiliaryCommitmentContext.perCommitmentPoint: Buffer
+property channel.IAuxiliaryCommitmentContext.remoteAssetBalance: bigint
+property channel.IAuxiliaryCommitmentContext.side: 'local' | 'remote'
+property channel.IAuxiliaryCommitmentContext.signedLocal: boolean
+property channel.IAuxiliaryCommitmentContext.state: channel.IChannelState
+interface channel.IAuxiliaryCommitmentData
+property channel.IAuxiliaryCommitmentData.customData: Buffer
+property channel.IAuxiliaryCommitmentData.htlcOutputIndexes?: Map<string, number>
+property channel.IAuxiliaryCommitmentData.outputLeaves: Map<number, script.ITaprootAuxLeaf>
+property channel.IAuxiliaryCommitmentData.peerSignatures?: Map<bigint, Buffer>
+property channel.IAuxiliaryCommitmentData.secondLevelLeaves: Map<string, script.ITaprootAuxLeaf>
+interface channel.IAuxiliaryForwardContext
+property channel.IAuxiliaryForwardContext.amountToForwardMsat: bigint
+property channel.IAuxiliaryForwardContext.incomingChannelId: Buffer
+property channel.IAuxiliaryForwardContext.incomingHtlcId: bigint
+property channel.IAuxiliaryForwardContext.outgoingCltvExpiry: number
+property channel.IAuxiliaryForwardContext.paymentHash: Buffer
+property channel.IAuxiliaryForwardContext.shortChannelId: Buffer
+interface channel.IAuxiliaryForwardPlacement extends channel.IAuxiliaryForwardContext
+property channel.IAuxiliaryForwardPlacement.outgoingChannelId: Buffer
+property channel.IAuxiliaryForwardPlacement.outgoingHtlcId: bigint
+property channel.IAuxiliaryForwardPlacement.peerPubkey: string
+property channel.IAuxiliaryForwardPlacement.state: channel.IChannelState
+interface channel.IAuxiliaryFundingDescriptor
+property channel.IAuxiliaryFundingDescriptor.channelData: Buffer
+property channel.IAuxiliaryFundingDescriptor.fundingTaprootMerkleRoot: Buffer
+property channel.IAuxiliaryFundingDescriptor.localBalance: bigint
+property channel.IAuxiliaryFundingDescriptor.remoteBalance: bigint
+property channel.IAuxiliaryFundingDescriptor.temporaryChannelId: Buffer
+interface channel.IAuxiliaryHtlcResolution
+property channel.IAuxiliaryHtlcResolution.auxiliaryAmount: bigint
+property channel.IAuxiliaryHtlcResolution.customRecords?: message.CustomRecords
+property channel.IAuxiliaryHtlcResolution.direction: channel.HtlcDirection
+property channel.IAuxiliaryHtlcResolution.htlcId: bigint
+property channel.IAuxiliaryHtlcResolution.outcome: 'fulfilled' | 'failed'
+property channel.IAuxiliaryHtlcResolution.paymentHash: Buffer
+interface channel.IAuxiliaryIncomingHtlc
+property channel.IAuxiliaryIncomingHtlc.acceptedHtlcs: readonly { channelId: Buffer; htlcId: bigint; amountMsat: bigint; }[]
+property channel.IAuxiliaryIncomingHtlc.channelId: Buffer
+property channel.IAuxiliaryIncomingHtlc.customRecords: message.CustomRecords
+property channel.IAuxiliaryIncomingHtlc.hopPayload: onion.IHopPayload
+property channel.IAuxiliaryIncomingHtlc.htlcId: bigint
+property channel.IAuxiliaryIncomingHtlc.invoice?: node.IInvoiceInfo
+property channel.IAuxiliaryIncomingHtlc.isFinalHop: boolean
+property channel.IAuxiliaryIncomingHtlc.paymentHash: Buffer
+property channel.IAuxiliaryIncomingHtlc.peerPubkey: string
+property channel.IAuxiliaryIncomingHtlc.state: channel.IChannelState
+property channel.IAuxiliaryIncomingHtlc.wireAmountMsat: bigint
+interface channel.IAuxiliaryOutput
+property channel.IAuxiliaryOutput.bitcoinValue: bigint
+property channel.IAuxiliaryOutput.cltvExpiry?: number
+property channel.IAuxiliaryOutput.direction?: channel.HtlcDirection
+property channel.IAuxiliaryOutput.htlcId?: bigint
+property channel.IAuxiliaryOutput.internalKey: Buffer
+property channel.IAuxiliaryOutput.leaves: script.ITaprootAuxLeaf[]
+property channel.IAuxiliaryOutput.outputIndex: number
+property channel.IAuxiliaryOutput.role: 'to_local' | 'to_remote' | 'offered_htlc' | 'received_htlc' | 'anchor_local' | 'anchor_remote'
+property channel.IAuxiliaryOutput.script: Buffer
+interface channel.IAuxiliaryPayment
+property channel.IAuxiliaryPayment.channelId: Buffer
+property channel.IAuxiliaryPayment.customRecords: message.CustomRecords
+property channel.IAuxiliaryPayment.expectedHtlcId?: bigint
+property channel.IAuxiliaryPayment.wireAmountMsat: bigint
+interface channel.IAuxiliaryShutdown
+property channel.IAuxiliaryShutdown.customRecords: message.CustomRecords
+property channel.IAuxiliaryShutdown.scriptPubkey: Buffer
+interface channel.IAuxiliarySigningContext
+property channel.IAuxiliarySigningContext.commitment: channel.IBuiltCommitment
+property channel.IAuxiliarySigningContext.commitmentNumber: bigint
+property channel.IAuxiliarySigningContext.perCommitmentPoint: Buffer
+property channel.IAuxiliarySigningContext.side: 'local' | 'remote'
+property channel.IAuxiliarySigningContext.state: channel.IChannelState
+interface channel.IAuxiliarySweepContext
+property channel.IAuxiliarySweepContext.commitmentNumber: bigint
+property channel.IAuxiliarySweepContext.destinationScript: Buffer
+property channel.IAuxiliarySweepContext.inputs: channel.IAuxiliarySweepInput[]
+property channel.IAuxiliarySweepContext.side: 'local' | 'remote'
+method channel.IAuxiliarySweepContext.sign(request: channel.IAuxiliarySweepSigningRequest): Buffer
+property channel.IAuxiliarySweepContext.state: channel.IChannelState
+property channel.IAuxiliarySweepContext.transaction: bitcoinjs-lib#Transaction
+interface channel.IAuxiliarySweepInput
+property channel.IAuxiliarySweepInput.cltvExpiry?: number
+property channel.IAuxiliarySweepInput.commitmentOutputIndex: number
+property channel.IAuxiliarySweepInput.controlBlock?: Buffer
+property channel.IAuxiliarySweepInput.direction?: channel.HtlcDirection
+property channel.IAuxiliarySweepInput.htlcId?: bigint
+property channel.IAuxiliarySweepInput.kind: channel.AuxiliarySpendKind
+property channel.IAuxiliarySweepInput.leafScript?: Buffer
+property channel.IAuxiliarySweepInput.leafVersion?: number
+property channel.IAuxiliarySweepInput.paymentHash?: Buffer
+property channel.IAuxiliarySweepInput.preimage?: Buffer
+property channel.IAuxiliarySweepInput.previousAuxiliaryData?: Buffer
+property channel.IAuxiliarySweepInput.publicKey: Buffer
+property channel.IAuxiliarySweepInput.sourceTransaction?: bitcoinjs-lib#Transaction
+property channel.IAuxiliarySweepInput.transactionInputIndex: number
+interface channel.IAuxiliarySweepResult
+property channel.IAuxiliarySweepResult.customData: Buffer
+property channel.IAuxiliarySweepResult.outputScripts: ReadonlyMap<number, Buffer>
+interface channel.IAuxiliarySweepSigningRequest
+property channel.IAuxiliarySweepSigningRequest.publicKey: Buffer
+property channel.IAuxiliarySweepSigningRequest.sigHash: Buffer
+property channel.IAuxiliarySweepSigningRequest.singleTweak?: Buffer
+property channel.IAuxiliarySweepSigningRequest.taprootMerkleRoot?: Buffer
+property channel.IAuxiliarySweepSigningRequest.transactionInputIndex: number
 interface channel.IBroadcastTxAction
 property channel.IBroadcastTxAction.fundingCritical?: true
 property channel.IBroadcastTxAction.tx: Buffer
 property channel.IBroadcastTxAction.type: channel.ChannelActionType.BROADCAST_TX
 interface channel.IBuiltCommitment
+property channel.IBuiltCommitment.auxiliary?: channel.IAuxiliaryCommitmentData
 property channel.IBuiltCommitment.funderBalanceMsat: bigint
 property channel.IBuiltCommitment.fundingAmount: number
 property channel.IBuiltCommitment.fundingWitnessScript: Buffer
-property channel.IBuiltCommitment.htlcOutputs: (script.IHtlcOutput & { direction: channel.HtlcDirection; })[]
+property channel.IBuiltCommitment.htlcOutputs: channel.IHtlcOutputWithMeta[]
 property channel.IBuiltCommitment.result: script.ICommitmentTxResult
+interface channel.IChannelAuxiliaryProvider
+method channel.IChannelAuxiliaryProvider.buildClose(context: channel.IAuxiliaryCloseContext): channel.IAuxiliaryCloseResult
+method channel.IChannelAuxiliaryProvider.buildCommitment(context: channel.IAuxiliaryCommitmentContext): channel.IAuxiliaryCommitmentData
+method channel.IChannelAuxiliaryProvider.getHtlcAmount(state: channel.IChannelState, entry: channel.IHtlcEntry): bigint
+method channel.IChannelAuxiliaryProvider.prepareShutdown(state: channel.IChannelState, destinationScript: Buffer, signer: keys.ISigner): channel.IAuxiliaryShutdown
+method channel.IChannelAuxiliaryProvider.prepareSweep?(context: channel.IAuxiliarySweepContext): channel.IAuxiliarySweepResult
+method channel.IChannelAuxiliaryProvider.signHtlcs(context: channel.IAuxiliarySigningContext, signer: keys.ISigner): message.CustomRecords
+method channel.IChannelAuxiliaryProvider.validateHtlc(state: channel.IChannelState, entry: channel.IHtlcEntry): void
+method channel.IChannelAuxiliaryProvider.verifyHtlcs(context: channel.IAuxiliarySigningContext, customRecords: message.CustomRecords): boolean
+method channel.IChannelAuxiliaryProvider.verifyShutdown(state: channel.IChannelState, shutdown: channel.IAuxiliaryShutdown): boolean
+interface channel.IChannelAuxiliaryState
+property channel.IChannelAuxiliaryState.channelData: Buffer
+property channel.IChannelAuxiliaryState.closeTransactions?: Map<string, Buffer>
+property channel.IChannelAuxiliaryState.localBalance: bigint
+property channel.IChannelAuxiliaryState.localCommitments: Map<bigint, channel.IAuxiliaryCommitmentData>
+property channel.IChannelAuxiliaryState.localShutdownRecords?: Map<bigint, Buffer>
+property channel.IChannelAuxiliaryState.remoteBalance: bigint
+property channel.IChannelAuxiliaryState.remoteCommitments: Map<bigint, channel.IAuxiliaryCommitmentData>
+property channel.IChannelAuxiliaryState.remoteShutdownRecords?: Map<bigint, Buffer>
+property channel.IChannelAuxiliaryState.resolvedHtlcs?: Map<string, channel.IAuxiliaryHtlcResolution>
 interface channel.IChannelClosedAction
 property channel.IChannelClosedAction.channelId: Buffer
 property channel.IChannelClosedAction.type: channel.ChannelActionType.CHANNEL_CLOSED
@@ -1550,6 +1744,7 @@ interface channel.IChannelFullyResolvedAction
 property channel.IChannelFullyResolvedAction.channelId: Buffer
 property channel.IChannelFullyResolvedAction.type: channel.ChannelActionType.CHANNEL_FULLY_RESOLVED
 interface channel.IChannelManagerConfig
+property channel.IChannelManagerConfig.auxiliaryChannels?: channel.IAuxiliaryChannelConfig
 property channel.IChannelManagerConfig.chainHash?: Buffer
 property channel.IChannelManagerConfig.channelKeyDeriver?: (channelIndex: number) => channel.IPerChannelKeys
 property channel.IChannelManagerConfig.delayedPaymentBasepointSecret?: Buffer
@@ -1600,6 +1795,8 @@ interface channel.IChannelState
 property channel.IChannelState.announceChannel: boolean
 property channel.IChannelState.announcementSigsReceived: boolean
 property channel.IChannelState.announcementSigsSent: boolean
+property channel.IChannelState.auxiliaryProvider?: channel.IChannelAuxiliaryProvider
+property channel.IChannelState.auxiliaryState?: channel.IChannelAuxiliaryState
 property channel.IChannelState.awaitingClosingSig?: boolean
 property channel.IChannelState.awaitingLocalFeeCommitment?: boolean
 property channel.IChannelState.channelId: Buffer | null
@@ -1626,6 +1823,7 @@ property channel.IChannelState.fundingLocktime: number
 property channel.IChannelState.fundingMissingSinceHeight?: number
 property channel.IChannelState.fundingOutputIndex: number
 property channel.IChannelState.fundingSatoshis: bigint
+property channel.IChannelState.fundingTaprootMerkleRoot?: Buffer
 property channel.IChannelState.fundingTxIndex: number
 property channel.IChannelState.fundingTxid: Buffer | null
 property channel.IChannelState.fundingUnaccounted?: boolean
@@ -1636,6 +1834,7 @@ property channel.IChannelState.isLessor?: boolean
 property channel.IChannelState.lastCooperativeCloseTxHex?: string
 property channel.IChannelState.lastLocalClosingComplete?: { feeSatoshis: bigint; locktime: number; closerScript: Buffer; closeeScript: Buffer; sentVariants: number[]; } | null
 property channel.IChannelState.lastProposedClosingFeeSat: bigint | null
+property channel.IChannelState.lastSentAuxiliaryRecords?: ReadonlyMap<bigint, Buffer>
 property channel.IChannelState.lastSentCommitmentSigned: Buffer | null
 property channel.IChannelState.lastSentHtlcSignatures: Buffer[]
 property channel.IChannelState.lastSentPartialSignatureWithNonce: Buffer | null
@@ -1794,9 +1993,11 @@ property channel.IHtlcEntry.addRemotelyRevoked?: boolean
 property channel.IHtlcEntry.addedWhileFundingUnaccounted?: boolean
 property channel.IHtlcEntry.addedWhileRestoreUnproven?: boolean
 property channel.IHtlcEntry.amountMsat: bigint
+property channel.IHtlcEntry.auxiliaryAmount?: bigint
 property channel.IHtlcEntry.blindingPoint?: Buffer
 property channel.IHtlcEntry.cltvExpiry: number
 property channel.IHtlcEntry.commitCoverPending?: boolean
+property channel.IHtlcEntry.customRecords?: message.CustomRecords
 property channel.IHtlcEntry.direction: channel.HtlcDirection
 property channel.IHtlcEntry.dustExposureFailback?: boolean
 property channel.IHtlcEntry.expiredOnArrival?: boolean
@@ -1826,12 +2027,17 @@ property channel.IHtlcFulfilledAction.paymentPreimage: Buffer
 property channel.IHtlcFulfilledAction.type: channel.ChannelActionType.HTLC_FULFILLED
 interface channel.IHtlcOutputWithMeta extends script.IHtlcOutput
 property channel.IHtlcOutputWithMeta.amountMsat: bigint
+property channel.IHtlcOutputWithMeta.auxiliaryAmount?: bigint
+property channel.IHtlcOutputWithMeta.customRecords?: message.CustomRecords
 property channel.IHtlcOutputWithMeta.direction: channel.HtlcDirection
 property channel.IHtlcOutputWithMeta.htlcId: bigint
 interface channel.IHtlcSnapshotEntry
 property channel.IHtlcSnapshotEntry.amountMsat: bigint
+property channel.IHtlcSnapshotEntry.auxiliaryAmount?: bigint
 property channel.IHtlcSnapshotEntry.cltvExpiry: number
+property channel.IHtlcSnapshotEntry.customRecords?: message.CustomRecords
 property channel.IHtlcSnapshotEntry.direction: channel.HtlcDirection
+property channel.IHtlcSnapshotEntry.id?: bigint
 property channel.IHtlcSnapshotEntry.paymentHash: Buffer
 interface channel.IPerChannelKeys
 property channel.IPerChannelKeys.basepoints: keys.IChannelBasepoints
@@ -2087,9 +2293,11 @@ method channel.ZeroConfManager.setFforFundingClient(peer: string, enabled: boole
 method channel.ZeroConfManager.setJitClients(pubkeyHexes: Iterable<string>): void
 method channel.ZeroConfManager.shouldUseZeroConf(peerPubkeyHex: string, requestedZeroConf: boolean): boolean
 function channel.aggregateLocalCommitmentSig(state: channel.IChannelState, signer: keys.ISigner, ourPublicNonce: Uint8Array, theirPublicNonce: Buffer, theirPartialSig: Buffer, localPerCommitmentPoint: Buffer, commitmentNumber?: bigint): Buffer
+function channel.applyAuxiliaryFunding(state: channel.IChannelState, descriptor: channel.IAuxiliaryFundingDescriptor): void
 function channel.buildLocalCommitment(state: channel.IChannelState, perCommitmentPoint: Buffer, commitmentNumber?: bigint, signedLocal?: boolean): channel.IBuiltCommitment
 function channel.buildRemoteCommitment(state: channel.IChannelState, remotePerCommitmentPoint: Buffer, commitmentNumber?: bigint): channel.IBuiltCommitment
 function channel.calculateCommitmentFee(feeratePerKw: number, numUntrimmedHtlcs: number, isAnchor?: boolean, isTaproot?: boolean): bigint
+function channel.copyAuxiliaryCommitment(data: channel.IAuxiliaryCommitmentData): channel.IAuxiliaryCommitmentData
 function channel.createAcceptorChannel(params: { temporaryChannelId: Buffer; localConfig?: channel.IChannelConfig; localBasepoints: keys.IChannelBasepoints; localPerCommitmentSeed: Buffer; }): channel.Channel
 function channel.createAcceptorState(params: { temporaryChannelId: Buffer; fundingSatoshis: bigint; pushMsat: bigint; localConfig: channel.IChannelConfig; localBasepoints: keys.IChannelBasepoints; localPerCommitmentSeed: Buffer; remoteBasepoints: keys.IChannelBasepoints; remoteConfig: channel.IChannelConfig; }): channel.IChannelState
 function channel.createOpenerChannel(params: { fundingSatoshis: bigint; pushMsat?: bigint; localConfig?: channel.IChannelConfig; localBasepoints: keys.IChannelBasepoints; localPerCommitmentSeed: Buffer; }): channel.Channel
@@ -2101,7 +2309,7 @@ function channel.deriveV2TemporaryChannelId(openerRevocationBasepoint: Buffer): 
 function channel.dualFundingContributionWeight(inputCount: number, initiator: boolean): number
 function channel.dualFundingTopUpWeight(inputCount: number): number
 function channel.estimateSpliceTxWeight(opts: { walletInputCount: number; fundingScriptLen?: number; changeScriptLen?: number; destinationScriptLen?: number; }): number
-function channel.filterUntrimmedHtlcs<T extends { amount: bigint; direction: channel.HtlcDirection; }>(htlcOutputs: T[], dustLimitSat: bigint, feeratePerKw: number, isAnchor: boolean): T[]
+function channel.filterUntrimmedHtlcs<T extends { amount: bigint; direction: channel.HtlcDirection; auxiliaryAmount?: bigint; }>(htlcOutputs: T[], dustLimitSat: bigint, feeratePerKw: number, isAnchor: boolean): T[]
 function channel.funderCommitmentCostSats(feeratePerKw: number, numUntrimmedHtlcs: number, channelType: Buffer | null): bigint
 function channel.generateTemporaryChannelId(): Buffer
 function channel.getCommitmentFeeRate(state: channel.IChannelState, signedLocal?: boolean): number
@@ -2111,6 +2319,7 @@ function channel.getRemoteCommitmentFeeRate(state: channel.IChannelState): numbe
 function channel.getRemoteCommitmentLeaseBlockheight(state: channel.IChannelState): number | undefined
 function channel.hasScidAliasChannelType(channelType: Buffer | null): boolean
 function channel.isAnchorChannel(channelType: Buffer | null): boolean
+function channel.isOverlayChannel(channelType: Buffer | null | undefined): boolean
 function channel.isRecencyUnproven(state: { restoreRecencyUnproven?: boolean; reestablishRecencyUnproven?: boolean; reestablishSecretMissing?: boolean; }): boolean
 function channel.isTaprootChannel(channelType: Buffer | null): boolean
 function channel.isValidShutdownScript(script: Buffer, allowAnySegwit?: boolean, allowOpReturn?: boolean): boolean
@@ -2119,6 +2328,7 @@ function channel.outputWeight(scriptLen: number): number
 function channel.rbfFeerateFloor(previousFeeratePerkw: number): number
 function channel.receivedAddIrrevocablyCommitted(entry: channel.IHtlcEntry): boolean
 function channel.recencyHoldOrigin(state: { restoreRecencyUnproven?: boolean; reestablishRecencyUnproven?: boolean; reestablishSecretMissing?: boolean; }): channel.RecencyHoldOrigin | null
+function channel.requireAuxiliaryProvider(state: channel.IChannelState): channel.IChannelAuxiliaryProvider
 function channel.scidAliasAnnounceRefusal(channelType: Buffer | null | undefined, announceChannel: boolean): string | null
 function channel.signRemoteCommitment(state: channel.IChannelState, signer: keys.ISigner, remotePerCommitmentPoint: Buffer, commitmentNumber?: bigint): { signature: Buffer; htlcSignatures: Buffer[]; }
 function channel.signRemoteCommitmentPartial(state: channel.IChannelState, signer: keys.ISigner, ourPublicNonce: Uint8Array, theirPublicNonce: Buffer, remotePerCommitmentPoint: Buffer, commitmentNumber?: bigint): Buffer
@@ -2126,6 +2336,7 @@ function channel.signRemoteHtlcSignaturesTaproot(state: channel.IChannelState, s
 function channel.spliceFeeSats(weight: number, feeratePerKw: number): bigint
 function channel.txInputOutpoints(txHex: string): Array<{ txid: string; vout: number; }>
 function channel.validateAcceptChannelParams(open: channel.IProposedOpenParams, accept: message.IAcceptChannelMessage, waivers?: { localReserveWaived?: boolean; remoteReserveWaived?: boolean; }): string | null
+function channel.validateAuxiliaryChannelType(state: channel.IChannelState, channelType: Buffer | null | undefined): string | null
 function channel.validateChannelPoints(msg: Pick<message.IOpenChannelMessage, 'fundingPubkey' | 'revocationBasepoint' | 'paymentBasepoint' | 'delayedPaymentBasepoint' | 'htlcBasepoint' | 'firstPerCommitmentPoint'>): string | null
 function channel.validateOpenChannelParams(msg: message.IOpenChannelMessage, maxFundingSatoshis?: bigint, allowZeroReserve?: boolean): string | null
 function channel.validatePeerOpenChannelParams(msg: message.IOpenChannelMessage, maxFundingSatoshis?: bigint, allowZeroReserve?: boolean): string | null
@@ -2170,6 +2381,7 @@ function crypto.pointAdd(point1: Buffer, point2: Buffer): Buffer
 function crypto.pointMultiply(publicKey: Buffer, scalar: Buffer): Buffer
 function crypto.privateAdd(key1: Buffer, key2: Buffer): Buffer
 function crypto.privateMultiply(key: Buffer, tweak: Buffer): Buffer
+function crypto.randomBytes(size: number): Buffer
 function crypto.selfTestCryptoProvider(provider: crypto.ICryptoProvider): crypto.CryptoPrimitive[]
 function crypto.setCryptoProvider(provider: crypto.ICryptoProvider | null): void
 function crypto.sign(messageHash: Buffer, privateKey: Buffer): Buffer
@@ -2990,6 +3202,7 @@ member features.Feature.ONION_MESSAGES = 38
 member features.Feature.OPTION_FF_CONCURRENT = 442
 member features.Feature.OPTION_FF_RECEIVE = 440
 member features.Feature.OPTION_TAPROOT = 180
+member features.Feature.OPTION_TAPROOT_OVERLAY = 2026
 member features.Feature.OPTION_WILL_FUND = 112
 member features.Feature.OPTION_ZERO_RESERVE = 64
 member features.Feature.PAYMENT_SECRET = 14
@@ -4566,10 +4779,12 @@ member message.BeignetCustomSubtype.SWAP_STATUS = 53
 member message.BeignetCustomSubtype.SWAP_STATUS_REQUEST = 52
 member message.BeignetCustomSubtype.SWAP_SUBMARINE_CREATE = 54
 member message.BeignetCustomSubtype.SWAP_SUBMARINE_CREATE_ACK = 55
+const message.CUSTOM_RECORD_START = 65536n
 enum message.ClosingSigVariant
 member message.ClosingSigVariant.CLOSEE_OUTPUT_ONLY = 2
 member message.ClosingSigVariant.CLOSER_AND_CLOSEE = 3
 member message.ClosingSigVariant.CLOSER_OUTPUT_ONLY = 1
+type message.CustomRecords = ReadonlyMap<bigint, Buffer>
 interface message.IAcceptChannel2Message
 property message.IAcceptChannel2Message.channelId: Buffer
 property message.IAcceptChannel2Message.channelType?: Buffer
@@ -4642,6 +4857,7 @@ property message.IClosingSignedMessage.partialSignature?: Buffer
 property message.IClosingSignedMessage.signature: Buffer
 interface message.ICommitmentSignedMessage
 property message.ICommitmentSignedMessage.channelId: Buffer
+property message.ICommitmentSignedMessage.customRecords?: message.CustomRecords
 property message.ICommitmentSignedMessage.fundingTxid?: Buffer
 property message.ICommitmentSignedMessage.htlcSignatures: Buffer[]
 property message.ICommitmentSignedMessage.partialSignatureWithNonce?: Buffer
@@ -4667,6 +4883,7 @@ property message.IFundingSignedMessage.channelId: Buffer
 property message.IFundingSignedMessage.partialSignatureWithNonce?: Buffer
 property message.IFundingSignedMessage.signature: Buffer
 interface message.IInitMessage
+property message.IInitMessage.customRecords?: message.CustomRecords
 property message.IInitMessage.features: features.FeatureFlags
 property message.IInitMessage.networks?: Buffer[]
 interface message.IOpenChannel2Message
@@ -4731,6 +4948,7 @@ property message.IRevokeAndAckMessage.nextPerCommitmentPoint: Buffer
 property message.IRevokeAndAckMessage.perCommitmentSecret: Buffer
 interface message.IShutdownMessage
 property message.IShutdownMessage.channelId: Buffer
+property message.IShutdownMessage.customRecords?: message.CustomRecords
 property message.IShutdownMessage.scriptPubkey: Buffer
 property message.IShutdownMessage.shutdownNonce?: Buffer
 interface message.ISpliceAckMessage
@@ -4806,6 +5024,7 @@ property message.IUpdateAddHtlcMessage.amountMsat: bigint
 property message.IUpdateAddHtlcMessage.blindingPoint?: Buffer
 property message.IUpdateAddHtlcMessage.channelId: Buffer
 property message.IUpdateAddHtlcMessage.cltvExpiry: number
+property message.IUpdateAddHtlcMessage.customRecords?: message.CustomRecords
 property message.IUpdateAddHtlcMessage.id: bigint
 property message.IUpdateAddHtlcMessage.onionRoutingPacket: Buffer
 property message.IUpdateAddHtlcMessage.paymentHash: Buffer
@@ -4832,6 +5051,7 @@ property message.IUpdateFulfillHtlcMessage.paymentPreimage: Buffer
 interface message.IWillFund
 property message.IWillFund.leaseRates: gossip.ILeaseRates
 property message.IWillFund.signature: Buffer
+const message.MAX_LIGHTNING_PAYLOAD = 65533
 enum message.MessageType
 member message.MessageType.ACCEPT_CHANNEL = 33
 member message.MessageType.ACCEPT_CHANNEL2 = 65
@@ -4910,9 +5130,12 @@ const message.SPLICE_LOCK_DEPTH_ACCEPT_MAX = 6
 const message.SPLICE_LOCK_DEPTH_MAX = 2016
 const message.SPLICE_LOCK_DEPTH_TLV = 65537
 const message.TLV_DISABLE_CHANNEL_RESERVE = 4n
+function message.boundedLightningPayload(payload: Buffer): Buffer
 function message.canScopeWireError(channelId: Buffer): boolean
+function message.copyCustomRecords(records?: message.CustomRecords): Map<bigint, Buffer> | undefined
 function message.createConnectionError(message: string): message.IErrorMessage
 function message.createError(channelId: Buffer, message: string): message.IErrorMessage
+function message.customRecordEntries(records?: message.CustomRecords, reserved?: ReadonlySet<bigint>): message.ITlvRecord[]
 function message.decodeAcceptChannel2Message(payload: Buffer): message.IAcceptChannel2Message
 function message.decodeAcceptChannelMessage(payload: Buffer): message.IAcceptChannelMessage
 function message.decodeBigSize(data: Buffer, offset?: number): message.IBigSizeResult
@@ -4957,6 +5180,7 @@ function message.decodeUpdateFailHtlcMessage(payload: Buffer): message.IUpdateFa
 function message.decodeUpdateFailMalformedHtlcMessage(payload: Buffer): message.IUpdateFailMalformedHtlcMessage
 function message.decodeUpdateFeeMessage(payload: Buffer): message.IUpdateFeeMessage
 function message.decodeUpdateFulfillHtlcMessage(payload: Buffer): message.IUpdateFulfillHtlcMessage
+function message.decodeWithCustomRecords(payload: Buffer, offset: number, known: ReadonlySet<bigint>): message.ITlvRecord[]
 function message.encodeAcceptChannel2Message(msg: message.IAcceptChannel2Message): Buffer
 function message.encodeAcceptChannelMessage(msg: message.IAcceptChannelMessage): Buffer
 function message.encodeBigSize(value: bigint): Buffer
@@ -5115,6 +5339,7 @@ property node.ICreateInvoiceOptions.hold?: boolean
 property node.ICreateInvoiceOptions.includeCleartextHintsWithBlinded?: boolean
 property node.ICreateInvoiceOptions.jitFeeAllowance?: { flatFeeSat: number; feePpm: number; }
 property node.ICreateInvoiceOptions.minFinalCltvExpiry?: number
+property node.ICreateInvoiceOptions.omitAutomaticRoutingHints?: boolean
 property node.ICreateInvoiceOptions.paymentHash?: Buffer
 property node.ICreateInvoiceOptions.useBlindedPaths?: boolean
 interface node.ICreateInvoiceResult
@@ -5268,6 +5493,7 @@ property node.INodeConfig.autoReconnect?: boolean
 property node.INodeConfig.autoReleaseHeldForwards?: boolean
 property node.INodeConfig.autoTuneFees?: node.IAutoTuneFeesConfig
 property node.INodeConfig.autoUpdateChannelFees?: boolean
+property node.INodeConfig.auxiliaryChannels?: channel.IAuxiliaryChannelConfig
 property node.INodeConfig.chainBackend?: chain.IChainBackend
 property node.INodeConfig.chainHashes?: Buffer[]
 property node.INodeConfig.channelBasepoints: keys.IChannelBasepoints
@@ -5580,15 +5806,18 @@ method node.LightningNode.flushGossip(): Promise<void>
 method node.LightningNode.forceCloseChannel(channelId: Buffer, destinationScript: Buffer): { ok: boolean; error?: string; commitmentTxid?: string; }
 method node.LightningNode.forgetAsyncReceiveGrant(lspNodeIdHex: string): boolean
 static method node.LightningNode.fromMnemonic(mnemonic: string, options?: node.LightningNodeSeedOptions): node.LightningNode
+method node.LightningNode.fundAuxiliaryChannel(peerPubkey: string, temporaryChannelId: Buffer, txHex: string, outputIndex: number, channelData: Buffer): Buffer
 method node.LightningNode.getActionLog(options?: { category?: string; since?: number; limit?: number; }): node.IStructuredLog[]
 method node.LightningNode.getAsyncPaymentManager(): asyncPayments.AsyncPaymentManager
 method node.LightningNode.getAsyncReceiveService(): asyncPayments.AsyncReceiveService
 method node.LightningNode.getAsyncReceiveServiceMetrics(): asyncPayments.IAsyncReceiveServiceMetrics
+method node.LightningNode.getAuxiliaryChannelInfo(channelId: Buffer): channel.IAuxiliaryChannelInfo | undefined
 method node.LightningNode.getBalance(): node.ILightningBalance
 method node.LightningNode.getChainWatcher(): chain.ChainWatcher | null
 method node.LightningNode.getChannel(channelId: Buffer): node.IChannelInfo | undefined
 method node.LightningNode.getChannelHealth(channelId: Buffer): node.IChannelHealth | null
 method node.LightningNode.getChannelManager(): channel.ChannelManager
+method node.LightningNode.getChannelMonitorState(channelId: Buffer): chain.IChainMonitorState | undefined
 method node.LightningNode.getChannelPolicy(channelId: Buffer): node.IChannelPolicy | null
 method node.LightningNode.getChannelSuggestions(count?: number): advisor.IChannelSuggestion[]
 method node.LightningNode.getCurrentBlockHeight(): number
@@ -5621,6 +5850,7 @@ method node.LightningNode.getOnionMessageManager(): onionMessage.OnionMessageMan
 method node.LightningNode.getOutgoingHtlcs(paymentHash: Buffer): node.IOutgoingPaymentResolution
 method node.LightningNode.getPayment(paymentHash: Buffer): node.IPaymentInfo | undefined
 method node.LightningNode.getPaymentProof(paymentHash: Buffer): node.IPaymentProof | null
+method node.LightningNode.getPeerCustomRecords(peerPubkey: string): Map<bigint, Buffer>
 method node.LightningNode.getPeerManager(): transport.PeerManager | null
 method node.LightningNode.getPendingSpliceTx(channelId: Buffer): ReturnType<channel.Channel['getPendingSpliceTx']>
 method node.LightningNode.getPendingV2FundingTx(channelId: Buffer): ReturnType<channel.Channel['getPendingV2FundingTx']>
@@ -5670,6 +5900,7 @@ method node.LightningNode.listenWebSocket(port: number, host?: string): Promise<
 method node.LightningNode.loadRapidGossipSnapshot(data: Buffer): gossip.IRapidGossipResult
 method node.LightningNode.loadRapidGossipSnapshotAsync(data: Buffer, opts?: { cancelled?: () => boolean; onSlice?: (ms: number) => void; }): Promise<gossip.IRapidGossipResult>
 method node.LightningNode.mintDirectFundingRequest(opts: { host?: string; port?: number; amountSat?: bigint; ttlMs?: number; }): { record: directFunding.IDfRequestRecord; request: string; expiresAt: number; }
+method node.LightningNode.openAuxiliaryChannel(peerPubkey: string, fundingSatoshis: bigint, descriptor: channel.IAuxiliaryFundingDescriptor, pushMsat?: bigint): channel.Channel
 method node.LightningNode.openChannel(peerPubkey: string, fundingSatoshis: bigint, pushMsat?: bigint, satsPerVbyte?: number, fundMax?: boolean, trusted?: boolean): channel.Channel
 method node.LightningNode.openChannelV2(peerPubkey: string, params: { fundingSatoshis: bigint; fundingFeeratePerkw?: number; commitmentFeeratePerkw?: number; locktime?: number; requestFunds?: message.IRequestFunds; maxLeaseRates?: gossip.ILeaseRates; channelType?: Buffer; fundMax?: boolean; trusted?: boolean; fundingUtxos?: { utxos: Array<{ txid: string; vout: number; }>; allowTopUp?: boolean; }; contribution?: { inputs: channel.ISpliceWalletInput[]; changeScript: Buffer; }; }): channel.Channel
 method node.LightningNode.openZeroConfChannel(peerPubkey: string, fundingSatoshis: bigint, pushMsat?: bigint): channel.Channel
@@ -5686,6 +5917,7 @@ method node.LightningNode.provideV2ExternalWitness(channelId: Buffer, prevTxid: 
 method node.LightningNode.provisionFforIssuer(channelIdHex: string, issuerNodeIdHex: string, opts: { offer: offer.IOffer; witnessHops: ffor.IFforIssuerHop[]; issueUntil?: number; timeoutMs?: number; }): Promise<{ mailboxId: Buffer; blindedNodeIds: Buffer[]; }>
 method node.LightningNode.provisionFforWitness(channelIdHex: string, witnessNodeIdHex: string, opts?: { retentionUntil?: number; minReceipts?: number; timeoutMs?: number; }): Promise<{ mailboxId: Buffer; retentionUntil: number; }>
 method node.LightningNode.pruneCompletedPayments(): number
+method node.LightningNode.queryAuxiliaryRoute(channelId: Buffer, destination: Buffer, amountMsat: bigint, maxFirstHopMsat: bigint, finalCltvExpiry?: number, routingHints?: invoice.IRoutingHintHop[][]): gossip.IRoute | null
 method node.LightningNode.queryRoute(destination: Buffer, amountMsat: bigint, finalCltvExpiry?: number): gossip.IRoute | null
 method node.LightningNode.quoteDualFundingMaxOpen(satsPerVbyte: number): { feeratePerKw: number; fundingSatoshis: bigint; spendableSats: bigint; feeSats: bigint; inputCount: number; }
 method node.LightningNode.quotePayAll(invoiceStr: string, maxFeeMsat: bigint): node.IPayAllQuote
@@ -5718,10 +5950,11 @@ method node.LightningNode.sendOnionMessage(destination: Buffer, messageData: Map
 method node.LightningNode.sendPayAll(invoiceStr: string, debitMsat: bigint, maxFeeMsat: bigint, metadata?: Record<string, string>): node.IPaymentInfo
 method node.LightningNode.sendPayment(invoiceStr: string, excludedChannels?: Set<string>, maxFeeMsat?: bigint, amountMsat?: bigint, maxCltvExpiryHeight?: number, policyOverrides?: gossip.TPolicyOverrides, metadata?: Record<string, string>): node.IPaymentInfo
 method node.LightningNode.sendPaymentAsync(invoiceStr: string, timeoutMs?: number, maxFeeMsat?: bigint, amountMsat?: bigint, maxCltvExpiryHeight?: number): Promise<node.IPaymentInfo>
-method node.LightningNode.sendPaymentToRoute(route: { hops: Array<{ pubkey: Buffer; shortChannelId: Buffer; amountToForwardMsat: bigint; outgoingCltvValue: number; encryptedRecipientData?: Buffer; blindingPoint?: Buffer; }>; }, paymentHash: Buffer, finalCltvExpiry: number, paymentSecret?: Buffer, totalMsat?: bigint, metadata?: Record<string, string>, payAll?: node.IPayAllBudget): node.IPaymentInfo
+method node.LightningNode.sendPaymentToRoute(route: { hops: Array<{ pubkey: Buffer; shortChannelId: Buffer; amountToForwardMsat: bigint; outgoingCltvValue: number; encryptedRecipientData?: Buffer; blindingPoint?: Buffer; }>; }, paymentHash: Buffer, finalCltvExpiry: number, paymentSecret?: Buffer, totalMsat?: bigint, metadata?: Record<string, string>, payAll?: node.IPayAllBudget, assetPayment?: channel.IAuxiliaryPayment): node.IPaymentInfo
 method node.LightningNode.sendPaymentWithOptions(invoiceStr: string, options?: node.ISendPaymentOptions): node.IPaymentInfo
 method node.LightningNode.sendRawCustomMessage(peerPubkeyHex: string, type: number, payload: Buffer): void
 method node.LightningNode.sendTxSignatures(channelId: Buffer, txid: Buffer, outputIndex: number, witnesses: Buffer[][]): { ok: boolean; error?: string; }
+method node.LightningNode.setAuxiliaryFundingData(peerPubkey: string, temporaryChannelId: Buffer, channelData: Buffer): void
 method node.LightningNode.setChannelPolicy(channelId: Buffer | 'all', policy: node.IChannelPolicyUpdate): void
 method node.LightningNode.setDirectFundingPolicy(update: node.IDirectFundingPolicy): node.IDirectFundingPolicy
 method node.LightningNode.setPaymentMetadata(paymentHash: Buffer, metadata: Record<string, string>): void
@@ -7347,6 +7580,7 @@ const script.ANCHOR_TOTAL_COST: bigint
 const script.DUST_LIMIT_P2WPKH = 294
 const script.DUST_LIMIT_P2WSH = 546
 interface script.ICommitmentTxParams
+property script.ICommitmentTxParams.auxiliaryHtlcOrder?: boolean
 property script.ICommitmentTxParams.dustLimitSatoshis?: bigint
 property script.ICommitmentTxParams.feeRatePerKw?: bigint
 property script.ICommitmentTxParams.fundingAmount: bigint
@@ -7381,6 +7615,7 @@ property script.IFundingScript.witnessScript: Buffer
 interface script.IHtlcOutput
 property script.IHtlcOutput.amount: bigint
 property script.IHtlcOutput.cltvExpiry: number
+property script.IHtlcOutput.htlcId?: bigint
 property script.IHtlcOutput.paymentHash: Buffer
 property script.IHtlcOutput.script: Buffer
 property script.IHtlcOutput.taprootScript?: Buffer
@@ -7393,6 +7628,31 @@ property script.IPenaltyTxParams.revocationPrivkey: Buffer
 property script.IPenaltyTxParams.revokedTx: bitcoinjs-lib#Transaction
 property script.IPenaltyTxParams.toLocalWitnessScript?: Buffer
 property script.IPenaltyTxParams.witnessScripts: Map<number, Buffer>
+interface script.ITaprootAuxLeaf
+property script.ITaprootAuxLeaf.leafVersion?: number
+property script.ITaprootAuxLeaf.script: Buffer
+interface script.ITaprootCommitOutput
+property script.ITaprootCommitOutput.address: string
+property script.ITaprootCommitOutput.output: Buffer
+property script.ITaprootCommitOutput.outputKey: Buffer
+interface script.ITaprootFundingScript
+property script.ITaprootFundingScript.address: string
+property script.ITaprootFundingScript.internalKey: Buffer
+property script.ITaprootFundingScript.outputKey: Buffer
+property script.ITaprootFundingScript.p2trOutput: Buffer
+property script.ITaprootFundingScript.tweak: Buffer
+interface script.ITaprootHtlcOutput extends script.ITaprootCommitOutput
+property script.ITaprootHtlcOutput.internalKey: Buffer
+property script.ITaprootHtlcOutput.merkleRoot: Buffer
+property script.ITaprootHtlcOutput.success: script.ITaprootLeafSpend
+property script.ITaprootHtlcOutput.timeout: script.ITaprootLeafSpend
+interface script.ITaprootLeafSpend
+property script.ITaprootLeafSpend.controlBlock: Buffer
+property script.ITaprootLeafSpend.leafVersion: number
+property script.ITaprootLeafSpend.script: Buffer
+const script.TAPLEAF_VERSION = 192
+const script.TAPROOT_HTLC_SIGHASH_TYPE: number
+const script.TAPROOT_NUMS_KEY: Buffer
 function script.buildAnchorOutput(fundingPubkey: Buffer): { script: Buffer; witnessScript: Buffer; }
 function script.buildAnchorScript(fundingPubkey: Buffer): Buffer
 function script.buildCommitmentTx(params: script.ICommitmentTxParams): script.ICommitmentTxResult
@@ -7403,18 +7663,43 @@ function script.buildHtlcTimeoutTx(htlcTxid: string, htlcOutputIndex: number, ht
 function script.buildOfferedHtlcScript(revocationPubkey: Buffer, localHtlcPubkey: Buffer, remoteHtlcPubkey: Buffer, paymentHash: Buffer, useAnchors?: boolean): Buffer
 function script.buildPenaltyTx(params: script.IPenaltyTxParams): bitcoinjs-lib#Transaction
 function script.buildReceivedHtlcScript(revocationPubkey: Buffer, localHtlcPubkey: Buffer, remoteHtlcPubkey: Buffer, paymentHash: Buffer, cltvExpiry: number, useAnchors?: boolean): Buffer
+function script.buildTaprootAnchorLeaf(): Buffer
+function script.buildTaprootAnchorOutput(fundingPubkey: Buffer, network?: bitcoinjs-lib#Network): script.ITaprootCommitOutput & { internalKey: Buffer; merkleRoot: Buffer; anyone: script.ITaprootLeafSpend; }
+function script.buildTaprootHtlcSuccessTx(htlcTxid: string, htlcOutputIndex: number, htlcAmount: bigint, revocationPubkey: Buffer, localDelayedPubkey: Buffer, toSelfDelay: number, network?: bitcoinjs-lib#Network, auxiliaryLeaf?: script.ITaprootAuxLeaf): bitcoinjs-lib#Transaction
+function script.buildTaprootHtlcTimeoutTx(htlcTxid: string, htlcOutputIndex: number, htlcAmount: bigint, cltvExpiry: number, revocationPubkey: Buffer, localDelayedPubkey: Buffer, toSelfDelay: number, network?: bitcoinjs-lib#Network, auxiliaryLeaf?: script.ITaprootAuxLeaf): bitcoinjs-lib#Transaction
+function script.buildTaprootKeySpendWitness(schnorrSig: Buffer): Buffer[]
+function script.buildTaprootOfferedHtlcOutput(revocationPubkey: Buffer, localHtlcPubkey: Buffer, remoteHtlcPubkey: Buffer, paymentHash: Buffer, network?: bitcoinjs-lib#Network, auxiliaryLeaf?: script.ITaprootAuxLeaf): script.ITaprootHtlcOutput
+function script.buildTaprootOfferedHtlcSuccessLeaf(remoteHtlcPubkey: Buffer, paymentHash: Buffer): Buffer
+function script.buildTaprootOfferedHtlcTimeoutLeaf(localHtlcPubkey: Buffer, remoteHtlcPubkey: Buffer): Buffer
+function script.buildTaprootReceivedHtlcOutput(revocationPubkey: Buffer, localHtlcPubkey: Buffer, remoteHtlcPubkey: Buffer, paymentHash: Buffer, cltvExpiry: number, network?: bitcoinjs-lib#Network, auxiliaryLeaf?: script.ITaprootAuxLeaf): script.ITaprootHtlcOutput
+function script.buildTaprootReceivedHtlcSuccessLeaf(localHtlcPubkey: Buffer, remoteHtlcPubkey: Buffer, paymentHash: Buffer): Buffer
+function script.buildTaprootReceivedHtlcTimeoutLeaf(remoteHtlcPubkey: Buffer, cltvExpiry: number): Buffer
+function script.buildTaprootSecondLevelOutput(revocationPubkey: Buffer, localDelayedPubkey: Buffer, toSelfDelay: number, network?: bitcoinjs-lib#Network, auxiliaryLeaf?: script.ITaprootAuxLeaf): script.ITaprootCommitOutput & { merkleRoot: Buffer; delay: script.ITaprootLeafSpend; }
+function script.buildTaprootToLocalDelayScript(localDelayedPubkey: Buffer, toSelfDelay: number): Buffer
+function script.buildTaprootToLocalOutput(revocationPubkey: Buffer, localDelayedPubkey: Buffer, toSelfDelay: number, network?: bitcoinjs-lib#Network, auxiliaryLeaf?: script.ITaprootAuxLeaf): script.ITaprootCommitOutput & { delay: script.ITaprootLeafSpend; revoke: script.ITaprootLeafSpend; }
+function script.buildTaprootToLocalRevokeScript(revocationPubkey: Buffer, localDelayedPubkey: Buffer): Buffer
+function script.buildTaprootToRemoteOutput(remotePubkey: Buffer, network?: bitcoinjs-lib#Network, auxiliaryLeaf?: script.ITaprootAuxLeaf): script.ITaprootCommitOutput & { spend: script.ITaprootLeafSpend; }
+function script.buildTaprootToRemoteScript(remotePubkey: Buffer): Buffer
 function script.buildToLocalPenaltyWitness(signature: Buffer, witnessScript: Buffer): Buffer[]
 function script.buildToLocalScript(revocationPubkey: Buffer, localDelayedPubkey: Buffer, toSelfDelay: number, leaseCsv?: number): Buffer
 function script.buildToRemoteAnchorOutput(remotePubkey: Buffer, leaseCsv?: number): { script: Buffer; witnessScript: Buffer; }
 function script.buildToRemoteAnchorScript(remotePubkey: Buffer, leaseCsv?: number): Buffer
 function script.calculateObscuredCommitmentNumber(openPaymentBasepoint: Buffer, acceptPaymentBasepoint: Buffer, commitmentNumber: bigint): bigint
 function script.createFundingScript(localFundingPubkey: Buffer, remoteFundingPubkey: Buffer, network?: bitcoinjs-lib#Network): script.IFundingScript
+function script.createTaprootFundingScript(localFundingPubkey: Buffer, remoteFundingPubkey: Buffer, network?: bitcoinjs-lib#Network, merkleRoot?: Buffer): script.ITaprootFundingScript
 function script.csvFromToLocalScript(witnessScript: Buffer): number | undefined
 function script.estimatePenaltyTxFee(outputIndices: number[], witnessScripts: Map<number, Buffer>, feeRatePerVbyte: number, destinationScript?: Buffer): number
 function script.getFundingScriptHash(witnessScript: Buffer): Buffer
 function script.leaseCsvFromToRemoteScript(witnessScript: Buffer): number | undefined
 function script.signPenaltyInput(tx: bitcoinjs-lib#Transaction, inputIndex: number, witnessScript: Buffer, value: number, revocationPrivkey: Buffer): Buffer
+function script.signTaprootHtlcLeaf(sighash: Buffer, privkey: Buffer): Buffer
 function script.sortCommitmentOutputs(outputs: Array<{ script: Buffer; value: bigint; }>): Array<{ script: Buffer; value: bigint; }>
+function script.tapleafHash(leafScript: Buffer, version?: number): Buffer
+function script.taprootHtlcLeafSighash(tx: bitcoinjs-lib#Transaction, htlcOutputScript: Buffer, htlcAmountSat: number, leafScript: Buffer, leafVersion?: number): Buffer
+function script.taprootKeySpendSighash(tx: bitcoinjs-lib#Transaction, inputIndex: number, prevOutScripts: Buffer[], prevOutValues: number[], sighashType?: number): Buffer
+function script.toXOnly(pubkey: Buffer): Buffer
+function script.tweakTaprootKeyPathPrivkey(internalPrivkey: Buffer, merkleRoot: Buffer): Buffer
+function script.verifyTaprootHtlcLeaf(sighash: Buffer, xOnlyPubkey: Buffer, sig: Buffer): boolean
 namespace storage
 class storage.CorruptRecoveryRowError extends Error
 constructor storage.CorruptRecoveryRowError(message: string)
@@ -7566,6 +7851,7 @@ interface storage.ISerializedChannelState
 property storage.ISerializedChannelState.announceChannel: boolean
 property storage.ISerializedChannelState.announcementSigsReceived: boolean
 property storage.ISerializedChannelState.announcementSigsSent: boolean
+property storage.ISerializedChannelState.auxiliaryState?: ISerializedAuxiliaryState
 property storage.ISerializedChannelState.awaitingLocalFeeCommitment?: boolean
 property storage.ISerializedChannelState.channelId: string | null
 property storage.ISerializedChannelState.channelReserveVersion?: number
@@ -7590,6 +7876,7 @@ property storage.ISerializedChannelState.fundingLocktime?: number
 property storage.ISerializedChannelState.fundingMissingSinceHeight?: number
 property storage.ISerializedChannelState.fundingOutputIndex: number
 property storage.ISerializedChannelState.fundingSatoshis: string
+property storage.ISerializedChannelState.fundingTaprootMerkleRoot?: string
 property storage.ISerializedChannelState.fundingTxIndex: number
 property storage.ISerializedChannelState.fundingTxid: string | null
 property storage.ISerializedChannelState.fundingUnaccounted?: boolean
@@ -7604,6 +7891,7 @@ property storage.ISerializedChannelState.lastCloseLocktime?: number | null
 property storage.ISerializedChannelState.lastCloseSentVariants?: number[] | null
 property storage.ISerializedChannelState.lastCooperativeCloseTxHex?: string
 property storage.ISerializedChannelState.lastProposedClosingFeeSat: string | null
+property storage.ISerializedChannelState.lastSentAuxiliaryRecords?: SerializedCustomRecords
 property storage.ISerializedChannelState.lastSentCommitmentSigned: string | null
 property storage.ISerializedChannelState.lastSentHtlcSignatures: string[]
 property storage.ISerializedChannelState.lastSentPartialSignatureWithNonce: string | null
@@ -7743,9 +8031,11 @@ property storage.ISerializedHtlcEntry.addRemotelyRevoked?: boolean
 property storage.ISerializedHtlcEntry.addedWhileFundingUnaccounted?: boolean
 property storage.ISerializedHtlcEntry.addedWhileRestoreUnproven?: boolean
 property storage.ISerializedHtlcEntry.amountMsat: string
+property storage.ISerializedHtlcEntry.auxiliaryAmount?: string
 property storage.ISerializedHtlcEntry.blindingPoint?: string
 property storage.ISerializedHtlcEntry.cltvExpiry: number
 property storage.ISerializedHtlcEntry.commitCoverPending?: boolean
+property storage.ISerializedHtlcEntry.customRecords?: SerializedCustomRecords
 property storage.ISerializedHtlcEntry.direction: string
 property storage.ISerializedHtlcEntry.dustExposureFailback?: boolean
 property storage.ISerializedHtlcEntry.expiredOnArrival?: boolean
@@ -7762,7 +8052,7 @@ property storage.ISerializedHtlcEntry.removalRemoteCommitted?: boolean
 property storage.ISerializedHtlcEntry.state: string
 interface storage.ISerializedHtlcSnapshot
 property storage.ISerializedHtlcSnapshot.commitmentNumber: string
-property storage.ISerializedHtlcSnapshot.htlcs: Array<{ paymentHash: string; amountMsat: string; cltvExpiry: number; direction: string; }>
+property storage.ISerializedHtlcSnapshot.htlcs: Array<{ id?: string; auxiliaryAmount?: string; customRecords?: SerializedCustomRecords; paymentHash: string; amountMsat: string; cltvExpiry: number; direction: string; }>
 interface storage.ISerializedInvoiceInfo
 property storage.ISerializedInvoiceInfo.amountMsat?: string
 property storage.ISerializedInvoiceInfo.bolt11: string
@@ -8799,6 +9089,7 @@ property transport.IPeerLaneGate.allows: (type: number, payload: Buffer) => bool
 interface transport.IPeerManagerOptions
 property transport.IPeerManagerOptions.autoReconnect?: boolean
 property transport.IPeerManagerOptions.inboundHandshakeTimeoutMs?: number
+property transport.IPeerManagerOptions.initCustomRecords?: message.CustomRecords
 property transport.IPeerManagerOptions.iroh?: transport.IIrohConfig
 property transport.IPeerManagerOptions.isChannelPeer?: (pubkey: string) => boolean
 property transport.IPeerManagerOptions.isKnownCustomMessageType?: (type: number) => boolean
@@ -8821,6 +9112,7 @@ property transport.IPeerOptions.createSocket?: (host: string, port: number) => P
 property transport.IPeerOptions.handshakeTimeout?: number
 property transport.IPeerOptions.holdMessagesUntilRelease?: boolean
 property transport.IPeerOptions.host: string
+property transport.IPeerOptions.initCustomRecords?: message.CustomRecords
 property transport.IPeerOptions.isKnownCustomMessageType?: (type: number) => boolean
 property transport.IPeerOptions.localFeatures?: features.FeatureFlags
 property transport.IPeerOptions.localPrivateKey: Buffer
@@ -9087,6 +9379,7 @@ property watchtower.IJusticeBackup.revokedTxid: Buffer
 property watchtower.IJusticeBackup.sweptSats: bigint
 interface watchtower.IJusticeContext
 property watchtower.IJusticeContext.channelId: string
+property watchtower.IJusticeContext.hasAuxiliaryCommitments?: boolean
 property watchtower.IJusticeContext.isAnchor: boolean
 property watchtower.IJusticeContext.isLessor?: boolean
 property watchtower.IJusticeContext.isTaproot?: boolean

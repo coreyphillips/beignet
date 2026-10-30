@@ -18,7 +18,8 @@ import { createTaprootFundingScript } from '../script/funding-taproot';
 import { isTaprootChannel } from '../channel/types';
 import { decodeShortChannelId } from '../gossip/types';
 import type { IFundingSpendScan } from './types';
-import { IRREVOCABLE_DEPTH } from './types';
+import { IRREVOCABLE_DEPTH, OutputStatus } from './types';
+import type { ChainMonitor } from './chain-monitor';
 import { isDuplicateBroadcastRejection } from './broadcast-rejection';
 
 bitcoin.initEccLib(ecc);
@@ -330,15 +331,31 @@ function spliceInputWatchKey(
  * depend on the concrete manager. ChannelManager satisfies it.
  */
 export interface IChainWatcherChannelManager {
-	on<K extends 'watch:funding' | 'broadcast:tx' | 'watch:output'>(
+	on<
+		K extends
+			| 'watch:funding'
+			| 'broadcast:tx'
+			| 'watch:output'
+			| 'output:resolved'
+	>(
 		event: K,
 		listener: ChannelManagerEvents[K]
 	): void;
-	off<K extends 'watch:funding' | 'broadcast:tx' | 'watch:output'>(
+	off<
+		K extends
+			| 'watch:funding'
+			| 'broadcast:tx'
+			| 'watch:output'
+			| 'output:resolved'
+	>(
 		event: K,
 		listener: ChannelManagerEvents[K]
 	): void;
 	listChannels(): Channel[];
+	getMonitors?(): ReadonlyMap<string, Pick<ChainMonitor, 'getFullState'>>;
+	getMonitor?(
+		channelId: Buffer
+	): Pick<ChainMonitor, 'getFullState'> | undefined;
 	handleNewBlock(blockHeight: number): void;
 	handleFundingConfirmed(channelId: Buffer, confirmedTxidHex?: TxidHex): void;
 	handleFundingSpent(
@@ -636,6 +653,7 @@ interface IFailedBroadcast {
 	rawTx: Buffer;
 	txidHex: string;
 	retryCount: number;
+	retired?: boolean;
 }
 
 /** Maximum number of blocks to retry a failed broadcast before emitting permanent failure */
@@ -752,6 +770,7 @@ export class ChainWatcher extends EventEmitter {
 	private failedFundingWatches: IFailedFundingWatch[] = [];
 	private failedOutputWatches: IFailedOutputWatch[] = [];
 	private failedBroadcasts: IFailedBroadcast[] = [];
+	private activeBroadcasts = new Set<IFailedBroadcast>();
 	private currentBlockHeight = 0;
 	private started = false;
 	/**
@@ -986,6 +1005,7 @@ export class ChainWatcher extends EventEmitter {
 		this.failedFundingWatches.length = 0;
 		this.failedOutputWatches.length = 0;
 		this.failedBroadcasts.length = 0;
+		this.activeBroadcasts.clear();
 
 		// Detach from the ChannelManager, so a stopped watcher stops acting on
 		// channel events. It used to keep broadcasting after node.destroy().
@@ -1700,7 +1720,9 @@ export class ChainWatcher extends EventEmitter {
 		const fundingScript = isTaprootChannel(state.channelType)
 			? createTaprootFundingScript(
 					state.localBasepoints.fundingPubkey,
-					state.remoteBasepoints.fundingPubkey
+					state.remoteBasepoints.fundingPubkey,
+					undefined,
+					state.fundingTaprootMerkleRoot
 			  ).p2trOutput
 			: createFundingScript(
 					state.localBasepoints.fundingPubkey,
@@ -1736,10 +1758,6 @@ export class ChainWatcher extends EventEmitter {
 
 	private onBroadcastTx = (tx: Buffer): void => {
 		if (!Buffer.isBuffer(tx)) {
-			// A non-Buffer payload (e.g. a bitcoin.Transaction emitted by mistake)
-			// hex-encodes to "[object Object]" and cannot be broadcast; drop it
-			// loudly instead of letting the failure path below throw an unhandled
-			// rejection when it calls Transaction.fromBuffer on a non-Buffer.
 			this.emit(
 				'broadcast:failure',
 				new Error('broadcast:tx received a non-Buffer payload; dropped')
@@ -1747,43 +1765,128 @@ export class ChainWatcher extends EventEmitter {
 			return;
 		}
 		const generation = this.lifecycleGeneration;
-		this.broadcastTransaction(tx).catch((err) => {
-			// A rejection that lands after teardown must not repopulate the retry
-			// queue of a watcher that is no longer retrying anything.
-			if (!this.isCurrentGeneration(generation)) return;
-			// Guard the decode so a malformed payload is logged and dropped
-			// rather than throwing an unhandled rejection inside this catch
-			// handler (which would crash the process).
-			let txidHex: string | undefined;
-			try {
-				txidHex = bitcoin.Transaction.fromBuffer(tx).getId();
-			} catch {
-				// Not a decodable transaction; nothing to queue for retry.
-			}
-			// The network already has this exact transaction, mined or in the
-			// mempool: that is the success path. Queued, every retry would hear
-			// the same answer until the permanent failure (issue #921).
-			if (txidHex !== undefined && this.isDuplicateRejection(err)) {
-				this.emit('broadcast:success', txidHex);
+		let attempt: IFailedBroadcast | undefined;
+		try {
+			attempt = {
+				rawTx: Buffer.from(tx),
+				txidHex: bitcoin.Transaction.fromBuffer(tx).getId(),
+				retryCount: 0
+			};
+			this.activeBroadcasts.add(attempt);
+		} catch {
+			// Malformed data can be reported by the backend, but cannot be retried.
+		}
+		if (attempt) {
+			this.retireResolvedAttempt(attempt);
+			if (attempt.retired) {
+				this.activeBroadcasts.delete(attempt);
 				return;
 			}
-			// Queue for retry on next block, deduped by txid.
-			if (
-				txidHex !== undefined &&
-				!this.failedBroadcasts.some((fb) => fb.txidHex === txidHex)
-			) {
-				this.failedBroadcasts.push({
-					rawTx: Buffer.from(tx),
-					txidHex,
-					retryCount: 0
-				});
-			}
-			// The txid rides as a second argument (issue #1062) so the node
-			// can say which transaction, and whose channel, the failure is
-			// about. Undefined when the payload did not decode.
-			this.emit('broadcast:failure', err, txidHex);
-		});
+		}
+
+		this.broadcastTransaction(tx)
+			.catch((err) => {
+				if (!this.isCurrentGeneration(generation)) return;
+				if (attempt) this.retireResolvedAttempt(attempt);
+				if (attempt?.retired) return;
+				const txidHex = attempt?.txidHex;
+				if (txidHex !== undefined && this.isDuplicateRejection(err)) {
+					this.emit('broadcast:success', txidHex);
+					return;
+				}
+				if (
+					attempt &&
+					!this.failedBroadcasts.some((fb) => fb.txidHex === txidHex)
+				) {
+					this.failedBroadcasts.push(attempt);
+				}
+				this.emit('broadcast:failure', err, txidHex);
+			})
+			.finally(() => {
+				if (attempt) this.activeBroadcasts.delete(attempt);
+			});
 	};
+
+	/** Retire exact obsolete attempts only after the monitor has verified finality. */
+	private onOutputResolved = (
+		txid: string,
+		outputIndex: number,
+		channelId?: Buffer
+	): void => {
+		if (!this.started || !channelId) return;
+		const state = this.channelManager.getMonitor?.(channelId)?.getFullState?.();
+		const output = state?.trackedOutputs.find(
+			(item) => item.txid === txid && item.outputIndex === outputIndex
+		);
+		if (
+			!state ||
+			!output ||
+			output.status !== OutputStatus.IRREVOCABLY_RESOLVED ||
+			output.spendReverifyPending ||
+			!output.resolutionTxid ||
+			output.confirmationHeight <= 0 ||
+			state.currentBlockHeight - output.confirmationHeight < IRREVOCABLE_DEPTH
+		)
+			return;
+		const archive = output.auxiliarySweepAttempts;
+		const winner = archive?.[output.resolutionTxid];
+		if (!archive || !winner) return;
+		const matches = (rawHex: string, expectedId: string): boolean => {
+			try {
+				const transaction = bitcoin.Transaction.fromHex(rawHex);
+				return (
+					transaction.getId() === expectedId &&
+					transaction.ins.some(
+						(input) =>
+							input.index === outputIndex &&
+							Buffer.from(input.hash).reverse().toString('hex') === txid
+					)
+				);
+			} catch {
+				return false;
+			}
+		};
+		if (!matches(winner.transaction, output.resolutionTxid)) return;
+		for (const attempt of new Set([
+			...this.failedBroadcasts,
+			...this.activeBroadcasts
+		])) {
+			const retained = archive[attempt.txidHex];
+			if (
+				retained &&
+				retained.transaction === attempt.rawTx.toString('hex') &&
+				matches(retained.transaction, attempt.txidHex)
+			)
+				attempt.retired = true;
+		}
+		this.failedBroadcasts = this.failedBroadcasts.filter(
+			(attempt) => !attempt.retired
+		);
+	};
+
+	/** Re-read finality at every retry boundary, including delayed callbacks. */
+	private retireResolvedAttempt(attempt: IFailedBroadcast): void {
+		const alreadyActive = this.activeBroadcasts.has(attempt);
+		this.activeBroadcasts.add(attempt);
+		try {
+			for (const [
+				channelIdHex,
+				monitor
+			] of this.channelManager.getMonitors?.() ?? []) {
+				if (typeof monitor.getFullState !== 'function') continue;
+				for (const output of monitor.getFullState().trackedOutputs) {
+					if (output.auxiliarySweepAttempts?.[attempt.txidHex])
+						this.onOutputResolved(
+							output.txid,
+							output.outputIndex,
+							Buffer.from(channelIdHex, 'hex')
+						);
+				}
+			}
+		} finally {
+			if (!alreadyActive) this.activeBroadcasts.delete(attempt);
+		}
+	}
 
 	private onWatchOutput = (txid: string, outputIndex: number): void => {
 		this.emit('watch:output:requested', txid, outputIndex);
@@ -1799,12 +1902,14 @@ export class ChainWatcher extends EventEmitter {
 		this.channelManager.on('broadcast:tx', this.onBroadcastTx);
 		// Watch outputs (from chain monitor)
 		this.channelManager.on('watch:output', this.onWatchOutput);
+		this.channelManager.on('output:resolved', this.onOutputResolved);
 	}
 
 	private unwireChannelManagerEvents(): void {
 		this.channelManager.off('watch:funding', this.onWatchFunding);
 		this.channelManager.off('broadcast:tx', this.onBroadcastTx);
 		this.channelManager.off('watch:output', this.onWatchOutput);
+		this.channelManager.off('output:resolved', this.onOutputResolved);
 	}
 
 	private handleNewBlock(height: number): void {
@@ -1830,11 +1935,16 @@ export class ChainWatcher extends EventEmitter {
 		// Retry failed output watch subscriptions
 		this.retryFailedOutputSubscriptions(generation);
 
+		// Apply verified output finality before retrying an obsolete sweep.
+		this.channelManager.handleNewBlock(height);
+
 		// Retry failed broadcasts
 		if (this.failedBroadcasts.length > 0) {
 			const pendingBroadcasts = [...this.failedBroadcasts];
 			this.failedBroadcasts = [];
 			for (const fb of pendingBroadcasts) {
+				this.retireResolvedAttempt(fb);
+				if (fb.retired) continue;
 				fb.retryCount++;
 				if (fb.retryCount > MAX_BROADCAST_RETRIES) {
 					// The txid as a second argument (issue #1062): the node
@@ -1849,29 +1959,31 @@ export class ChainWatcher extends EventEmitter {
 					);
 					continue;
 				}
-				this.broadcastTransaction(fb.rawTx).catch((err) => {
-					// A rejection landing after teardown must not repopulate the
-					// queue stop() just cleared, or the next start retries it.
-					if (!this.isCurrentGeneration(generation)) return;
-					// Mined or in the mempool by now: done, as on a success.
-					if (this.isDuplicateRejection(err)) {
-						this.emit('broadcast:success', fb.txidHex);
-						return;
-					}
-					// Still failing — re-queue with dedup
-					if (
-						!this.failedBroadcasts.some(
-							(existing) => existing.txidHex === fb.txidHex
-						)
-					) {
-						this.failedBroadcasts.push(fb);
-					}
-				});
+				this.activeBroadcasts.add(fb);
+				this.broadcastTransaction(fb.rawTx)
+					.catch((err) => {
+						// A rejection landing after teardown must not repopulate the
+						// queue stop() just cleared, or the next start retries it.
+						if (!this.isCurrentGeneration(generation)) return;
+						this.retireResolvedAttempt(fb);
+						if (fb.retired) return;
+						// Mined or in the mempool by now: done, as on a success.
+						if (this.isDuplicateRejection(err)) {
+							this.emit('broadcast:success', fb.txidHex);
+							return;
+						}
+						// Still failing; requeue with deduplication
+						if (
+							!this.failedBroadcasts.some(
+								(existing) => existing.txidHex === fb.txidHex
+							)
+						) {
+							this.failedBroadcasts.push(fb);
+						}
+					})
+					.finally(() => this.activeBroadcasts.delete(fb));
 			}
 		}
-
-		// Advance all chain monitors
-		this.channelManager.handleNewBlock(height);
 
 		// Check all watched fundings for confirmation, announcement depth and
 		// the spend that closes the channel.

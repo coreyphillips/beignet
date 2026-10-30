@@ -1,3 +1,13 @@
+import {
+	serializeAuxiliaryState,
+	deserializeAuxiliaryState,
+	serializeCustomRecords,
+	deserializeCustomRecords
+} from './auxiliary-serialization';
+import type {
+	ISerializedAuxiliaryState,
+	SerializedCustomRecords
+} from './auxiliary-serialization';
 /**
  * Serialization helpers for Lightning state persistence.
  *
@@ -149,6 +159,8 @@ export function deserializeBasepoints(
 // ─── IHtlcEntry ───
 
 export interface ISerializedHtlcEntry {
+	customRecords?: SerializedCustomRecords;
+	auxiliaryAmount?: string;
 	key: string;
 	id: string;
 	amountMsat: string;
@@ -191,6 +203,9 @@ export interface ISerializedHtlcEntry {
 export interface ISerializedHtlcSnapshot {
 	commitmentNumber: string;
 	htlcs: Array<{
+		id?: string;
+		auxiliaryAmount?: string;
+		customRecords?: SerializedCustomRecords;
 		paymentHash: string;
 		amountMsat: string;
 		cltvExpiry: number;
@@ -202,6 +217,13 @@ export function serializeHtlcSnapshotEntries(
 	entries: IHtlcSnapshotEntry[]
 ): ISerializedHtlcSnapshot['htlcs'] {
 	return entries.map((e) => ({
+		...(e.id !== undefined ? { id: e.id.toString() } : {}),
+		...(e.auxiliaryAmount !== undefined
+			? { auxiliaryAmount: e.auxiliaryAmount.toString() }
+			: {}),
+		...(e.customRecords !== undefined
+			? { customRecords: serializeCustomRecords(e.customRecords) }
+			: {}),
 		paymentHash: e.paymentHash.toString('hex'),
 		amountMsat: bigintToStr(e.amountMsat),
 		cltvExpiry: e.cltvExpiry,
@@ -213,6 +235,13 @@ export function deserializeHtlcSnapshotEntries(
 	htlcs: ISerializedHtlcSnapshot['htlcs']
 ): IHtlcSnapshotEntry[] {
 	return htlcs.map((e) => ({
+		...(e.id !== undefined ? { id: BigInt(e.id) } : {}),
+		...(e.auxiliaryAmount !== undefined
+			? { auxiliaryAmount: BigInt(e.auxiliaryAmount) }
+			: {}),
+		...(e.customRecords !== undefined
+			? { customRecords: deserializeCustomRecords(e.customRecords) }
+			: {}),
 		paymentHash: Buffer.from(e.paymentHash, 'hex'),
 		amountMsat: strToBigint(e.amountMsat),
 		cltvExpiry: e.cltvExpiry,
@@ -226,6 +255,8 @@ export function serializeHtlcEntry(
 ): ISerializedHtlcEntry {
 	return {
 		key,
+		customRecords: serializeCustomRecords(e.customRecords),
+		auxiliaryAmount: e.auxiliaryAmount?.toString(),
 		id: bigintToStr(e.id),
 		amountMsat: bigintToStr(e.amountMsat),
 		paymentHash: e.paymentHash.toString('hex'),
@@ -290,6 +321,9 @@ export function deserializeHtlcEntry(s: ISerializedHtlcEntry): {
 	return {
 		key: s.key,
 		entry: {
+			customRecords: deserializeCustomRecords(s.customRecords),
+			auxiliaryAmount:
+				s.auxiliaryAmount !== undefined ? BigInt(s.auxiliaryAmount) : undefined,
 			id: strToBigint(s.id),
 			amountMsat: strToBigint(s.amountMsat),
 			paymentHash: Buffer.from(s.paymentHash, 'hex'),
@@ -382,6 +416,9 @@ export function deserializeShaChainStore(data: {
 // ─── IChannelState ───
 
 export interface ISerializedChannelState {
+	fundingTaprootMerkleRoot?: string;
+	auxiliaryState?: ISerializedAuxiliaryState;
+	lastSentAuxiliaryRecords?: SerializedCustomRecords;
 	channelId: string | null;
 	temporaryChannelId: string;
 	role: string;
@@ -958,6 +995,11 @@ export function serializeChannelState(
 		temporaryChannelId: s.temporaryChannelId.toString('hex'),
 		role: s.role,
 		state: s.state,
+		fundingTaprootMerkleRoot: s.fundingTaprootMerkleRoot?.toString('hex'),
+		auxiliaryState: serializeAuxiliaryState(s.auxiliaryState),
+		lastSentAuxiliaryRecords: serializeCustomRecords(
+			s.lastSentAuxiliaryRecords
+		),
 		fundingSatoshis: bigintToStr(s.fundingSatoshis),
 		pushMsat: bigintToStr(s.pushMsat),
 		fundingTxid: bufToHex(s.fundingTxid),
@@ -1591,6 +1633,13 @@ export function deserializeChannelState(
 		temporaryChannelId: Buffer.from(s.temporaryChannelId, 'hex'),
 		role: s.role as ChannelRole,
 		state: s.state as ChannelState,
+		fundingTaprootMerkleRoot: s.fundingTaprootMerkleRoot
+			? Buffer.from(s.fundingTaprootMerkleRoot, 'hex')
+			: undefined,
+		auxiliaryState: deserializeAuxiliaryState(s.auxiliaryState),
+		lastSentAuxiliaryRecords: deserializeCustomRecords(
+			s.lastSentAuxiliaryRecords
+		),
 		fundingSatoshis: strToBigint(s.fundingSatoshis),
 		pushMsat: strToBigint(s.pushMsat),
 		fundingTxid: hexToBuf(s.fundingTxid),

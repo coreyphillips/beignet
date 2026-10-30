@@ -1,3 +1,9 @@
+import { applyAuxiliaryClose } from './auxiliary-close';
+import {
+	applyAuxiliaryFunding,
+	type IAuxiliaryChannelConfig,
+	type IAuxiliaryFundingDescriptor
+} from './auxiliary-funding';
 /**
  * BOLT 2: Channel Manager.
  *
@@ -345,6 +351,7 @@ interface IBarrierQueue {
 }
 
 export interface IChannelManagerConfig {
+	auxiliaryChannels?: IAuxiliaryChannelConfig;
 	/**
 	 * Where each batch's PERSIST_STATE commits before the sends it authorizes
 	 * leave (Recovery Protocol 5.1). Required, and the constructor throws
@@ -1123,6 +1130,22 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		);
 		const refused = actions.some((a) => a.type === ChannelActionType.ERROR);
 		if (refused && !accepted) this._releaseUnusedChannelIndex(channelIndex);
+		if (
+			accepted &&
+			!refused &&
+			channel.getFullState().auxiliaryState &&
+			this.config.auxiliaryChannels?.beforeAccept
+		) {
+			this.gateAuxiliaryFunding(
+				peerPubkey,
+				channel,
+				'accept',
+				Buffer.alloc(0),
+				() => this.config.auxiliaryChannels!.beforeAccept!(channel, peerPubkey),
+				() => this.processActions(peerPubkey, channel, actions)
+			);
+			return;
+		}
 		this.processActions(peerPubkey, channel, actions);
 	}
 
@@ -1288,6 +1311,9 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 	 * Detach from the PeerManager.
 	 */
 	detachFromPeerManager(): void {
+		for (const timer of this.auxiliaryFundingTimers) clearTimeout(timer);
+		this.auxiliaryFundingTimers.clear();
+		this.auxiliaryFundingGates.clear();
 		this.peerManager = null;
 		for (const timer of this.quiescenceTimers.values()) {
 			clearTimeout(timer);
@@ -1407,7 +1433,11 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			chKeys.fundingPrivkey,
 			chKeys.htlcBasepointSecret
 		);
-		const channel = new Channel(state, signer);
+		const channel = new Channel(
+			state,
+			signer,
+			this.config.auxiliaryChannels?.provider
+		);
 		channel.setBlockHeight(this._currentBlockHeight);
 		if (this.config.chainHash) {
 			channel.announcementChainHash = this.config.chainHash;
@@ -1444,7 +1474,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		fundingSatoshis: bigint,
 		pushMsat?: bigint,
 		beforeNegotiate?: (temporaryChannelId: Buffer) => void,
-		opts?: { trusted?: boolean }
+		opts?: { trusted?: boolean; auxiliary?: IAuxiliaryFundingDescriptor }
 	): Channel {
 		peerPubkey = normalizeHexPubkey(peerPubkey);
 		// Verify peer is connected before creating channel state
@@ -1461,15 +1491,27 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			);
 		}
 
+		if (opts?.auxiliary && !this.config.auxiliaryChannels)
+			throw new Error('Asset channel provider is required');
+		if (
+			opts?.auxiliary &&
+			this.tempChannels.has(opts.auxiliary.temporaryChannelId.toString('hex'))
+		)
+			throw new Error('Temporary channel id is already in use');
+
 		const chKeys = this.deriveKeysForNewChannel();
 		const state = createOpenerState({
-			temporaryChannelId: randomBytes(32),
+			temporaryChannelId: opts?.auxiliary
+				? Buffer.from(opts.auxiliary.temporaryChannelId)
+				: randomBytes(32),
 			fundingSatoshis,
 			pushMsat: pushMsat || 0n,
 			localConfig: this.config.localConfig || DEFAULT_CHANNEL_CONFIG,
 			localBasepoints: chKeys.basepoints,
 			localPerCommitmentSeed: chKeys.perCommitmentSeed
 		});
+
+		if (opts?.auxiliary) applyAuxiliaryFunding(state, opts.auxiliary);
 
 		if (opts?.trusted) {
 			state.zeroConfEnabled = true;
@@ -1482,7 +1524,11 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			chKeys.fundingPrivkey,
 			chKeys.htlcBasepointSecret
 		);
-		const channel = new Channel(state, signer);
+		const channel = new Channel(
+			state,
+			signer,
+			this.config.auxiliaryChannels?.provider
+		);
 		channel.setBlockHeight(this._currentBlockHeight);
 		if (this.config.chainHash) {
 			channel.announcementChainHash = this.config.chainHash;
@@ -1506,7 +1552,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		const actions = channel.initiateOpen(
 			this.config.chainHash,
 			this.config.preferAnchors,
-			this.config.preferTaproot
+			this.config.preferTaproot || !!opts?.auxiliary
 		);
 		this.processActions(peerPubkey, channel, actions);
 
@@ -1570,6 +1616,34 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 				this.emitContained('channel:aborted', tempIdBuf, reason);
 			}
 		}
+	}
+
+	/** Bind the custom funding proof payload before signing any commitment. */
+	setAuxiliaryFundingData(
+		peerPubkey: string,
+		temporaryChannelId: Buffer,
+		data: Buffer
+	): void {
+		peerPubkey = normalizeHexPubkey(peerPubkey);
+		const channel = this.tempChannels.get(temporaryChannelId.toString('hex'));
+		if (!channel || this.findPeerForChannel(channel) !== peerPubkey)
+			throw new Error('Asset funding peer or channel mismatch');
+		const state = channel.getFullState();
+		if (
+			!state.auxiliaryState ||
+			state.fundingTxid ||
+			(state.state !== ChannelState.SENT_OPEN &&
+				state.state !== ChannelState.SENT_ACCEPT) ||
+			state.auxiliaryState.localCommitments.size ||
+			state.auxiliaryState.remoteCommitments.size
+		)
+			throw new Error('Asset funding data is already committed');
+		if (!data.length || data.length > 64 * 1024 * 1024)
+			throw new Error('Invalid asset funding data size');
+		state.auxiliaryState.channelData = Buffer.from(data);
+		this.processActions(peerPubkey, channel, [
+			{ type: ChannelActionType.PERSIST_STATE }
+		]);
 	}
 
 	/**
@@ -1755,30 +1829,57 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		cltvExpiry: number,
 		onionRoutingPacket: Buffer,
 		blindingPoint?: Buffer,
-		skimmedFeeMsat?: bigint
+		skimmedFeeMsat?: bigint,
+		customRecords?: import('../message/custom-records').CustomRecords,
+		expectedHtlcId?: bigint
 	): ChannelResult {
 		const idHex = channelId.toString('hex');
 		const channel = this.channels.get(idHex);
 		if (!channel) {
 			const error = `Channel not found: ${idHex}`;
 			this.emit('error', channelId, error);
-			return { ok: false, actions: [], error };
+			return { ok: false, actions: [], error, admissionRejected: true };
 		}
 		const peerPubkey = this.channelPeers.get(idHex);
 		if (!peerPubkey) {
 			const error = `Peer not found for channel: ${idHex}`;
 			this.emit('error', channelId, error);
-			return { ok: false, actions: [], error };
+			return { ok: false, actions: [], error, admissionRejected: true };
 		}
 
-		const actions = channel.addHtlc(
-			amountMsat,
-			paymentHash,
-			cltvExpiry,
-			onionRoutingPacket,
-			blindingPoint,
-			skimmedFeeMsat
-		);
+		const nextHtlcId = channel.getFullState().localHtlcCounter;
+		if (expectedHtlcId !== undefined && expectedHtlcId !== nextHtlcId)
+			return {
+				ok: false,
+				actions: [],
+				error: 'Asset HTLC circuit changed before admission',
+				admissionRejected: true
+			};
+		let actions: ChannelAction[];
+		try {
+			actions = channel.addHtlc(
+				amountMsat,
+				paymentHash,
+				cltvExpiry,
+				onionRoutingPacket,
+				blindingPoint,
+				skimmedFeeMsat,
+				customRecords
+			);
+		} catch (error) {
+			if (
+				(!channel.getFullState().auxiliaryState &&
+					customRecords === undefined) ||
+				channel.getFullState().localHtlcCounter !== nextHtlcId
+			)
+				throw error;
+			return {
+				ok: false,
+				admissionRejected: true,
+				actions: [],
+				error: error instanceof Error ? error.message : String(error)
+			};
+		}
 		this.processActions(peerPubkey, channel, actions);
 
 		// BOLT 2: after sending update_add_htlc we must send commitment_signed so
@@ -1788,7 +1889,10 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		if (channel.getChannelId()) {
 			this.autoSignAndSendCommitment(channel.getChannelId()!);
 		}
-		return this.resultFromActions(actions);
+		const result = this.resultFromActions(actions);
+		return !result.ok && channel.getFullState().localHtlcCounter === nextHtlcId
+			? { ...result, admissionRejected: true }
+			: result;
 	}
 
 	/**
@@ -2842,6 +2946,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			}
 			this.channels.set(channelId.toString('hex'), channel);
 			this.channelPeers.set(channelId.toString('hex'), peerPubkey);
+			this._notifyAuxiliaryResolutions(channel);
 			// After registering: the listener looks the channel up.
 			this._handOffRevokedCommitments(
 				channelId,
@@ -3985,7 +4090,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 					this.handleAcceptChannel(peerPubkey, payload);
 					break;
 				case MessageType.FUNDING_CREATED:
-					this.handleFundingCreated(peerPubkey, payload);
+					this.handleAssetFundingCreatedGate(peerPubkey, payload);
 					break;
 				case MessageType.FUNDING_SIGNED:
 					this.handleFundingSigned(peerPubkey, payload);
@@ -4257,7 +4362,16 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 				chKeys.fundingPrivkey,
 				chKeys.htlcBasepointSecret
 			);
-			channel = new Channel(state, signer);
+			const auxiliary = this.config.auxiliaryChannels?.resolveIncoming(
+				peerPubkey,
+				msg.temporaryChannelId
+			);
+			if (auxiliary) applyAuxiliaryFunding(state, auxiliary);
+			channel = new Channel(
+				state,
+				signer,
+				this.config.auxiliaryChannels?.provider
+			);
 			channel.setBlockHeight(this._currentBlockHeight);
 			if (this.config.chainHash) {
 				channel.announcementChainHash = this.config.chainHash;
@@ -4329,6 +4443,110 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		if (!hasError) {
 			this.emit('channel:accepted', channel, peerPubkey);
 		}
+	}
+
+	private readonly auxiliaryFundingGates = new Map<string, Buffer>();
+	private readonly auxiliaryFundingTimers = new Set<
+		ReturnType<typeof setTimeout>
+	>();
+	private gateAuxiliaryFunding(
+		peerPubkey: string,
+		channel: Channel,
+		stage: string,
+		payload: Buffer,
+		prepare: () => Promise<void>,
+		proceed: () => void
+	): void {
+		const id = channel.getTemporaryChannelId().toString('hex');
+		const key = `${peerPubkey}:${id}:${stage}`;
+		const prior = this.auxiliaryFundingGates.get(key);
+		if (prior) {
+			if (!prior.equals(payload))
+				this.abortPendingOpen(channel, 'Conflicting asset funding message');
+			return;
+		}
+		if (this.auxiliaryFundingGates.size >= 64) {
+			this.abortPendingOpen(
+				channel,
+				'Asset funding validation capacity exceeded'
+			);
+			return;
+		}
+		const copy = Buffer.from(payload);
+		this.auxiliaryFundingGates.set(key, copy);
+		let timeout: ReturnType<typeof setTimeout> | undefined;
+		const expired = new Promise<never>((_, reject) => {
+			timeout = setTimeout(
+				() => reject(new Error('Asset funding validation timed out')),
+				120000
+			);
+			this.auxiliaryFundingTimers.add(timeout);
+		});
+		void Promise.race([Promise.resolve().then(prepare), expired])
+			.then(() => {
+				if (
+					this.auxiliaryFundingGates.get(key) !== copy ||
+					this.tempChannels.get(id) !== channel ||
+					this.findPeerForChannel(channel) !== peerPubkey
+				)
+					return;
+				proceed();
+			})
+			.catch(() => {
+				if (
+					this.auxiliaryFundingGates.get(key) === copy &&
+					this.tempChannels.get(id) === channel &&
+					this.findPeerForChannel(channel) === peerPubkey
+				)
+					this.abortPendingOpen(channel, 'Asset funding validation failed');
+			})
+			.finally(() => {
+				if (timeout) {
+					clearTimeout(timeout);
+					this.auxiliaryFundingTimers.delete(timeout);
+				}
+				if (this.auxiliaryFundingGates.get(key) === copy)
+					this.auxiliaryFundingGates.delete(key);
+			});
+	}
+	private handleAssetFundingCreatedGate(
+		peerPubkey: string,
+		payload: Buffer
+	): void {
+		payload = Buffer.from(payload);
+		let decoded: ReturnType<typeof decodeFundingCreatedMessage>;
+		try {
+			decoded = decodeFundingCreatedMessage(payload);
+		} catch {
+			this.handleFundingCreated(peerPubkey, payload);
+			return;
+		}
+		const channel = this.tempChannels.get(
+			decoded.temporaryChannelId.toString('hex')
+		);
+		if (
+			!channel?.getFullState().auxiliaryState ||
+			!this.config.auxiliaryChannels?.beforeFundingCreated
+		) {
+			this.handleFundingCreated(peerPubkey, payload);
+			return;
+		}
+		if (this.findPeerForChannel(channel) !== peerPubkey) {
+			this.emit('error', null, 'Asset funding peer mismatch');
+			return;
+		}
+		this.gateAuxiliaryFunding(
+			peerPubkey,
+			channel,
+			'funding-created',
+			payload,
+			() =>
+				this.config.auxiliaryChannels!.beforeFundingCreated!(
+					channel,
+					peerPubkey
+				),
+			() => this.handleFundingCreated(peerPubkey, payload)
+		);
 	}
 
 	private handleFundingCreated(peerPubkey: string, payload: Buffer): void {
@@ -4989,7 +5207,10 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 						? msg.feeSatoshis
 						: 0n
 				);
-				if (channel.getFullState().externalClose) {
+				if (
+					channel.getFullState().externalClose ||
+					channel.getFullState().auxiliaryState
+				) {
 					actions.unshift(
 						{ type: ChannelActionType.PERSIST_STATE },
 						{ type: ChannelActionType.BROADCAST_TX, tx: closeTx }
@@ -5145,6 +5366,8 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			sequence: isTaprootChannel(state.channelType) ? 0xfffffffd : 0xffffffff
 		});
 
+		applyAuxiliaryClose(state, tx, feeSatoshis);
+
 		const { witnessScript } = createFundingScript(
 			state.localBasepoints.fundingPubkey,
 			state.remoteBasepoints!.fundingPubkey
@@ -5208,7 +5431,9 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		);
 		const { p2trOutput } = createTaprootFundingScript(
 			state.localBasepoints.fundingPubkey,
-			state.remoteBasepoints.fundingPubkey
+			state.remoteBasepoints.fundingPubkey,
+			undefined,
+			state.fundingTaprootMerkleRoot
 		);
 		const sighash = taprootCommitmentSighash(
 			tx,
@@ -5220,7 +5445,8 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			state.localBasepoints.fundingPubkey,
 			state.remoteBasepoints.fundingPubkey,
 			nonces.local,
-			nonces.remote
+			nonces.remote,
+			state.fundingTaprootMerkleRoot
 		);
 		const cache: ITaprootClosingCache = {
 			feeSatoshis,
@@ -5368,7 +5594,9 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 
 		const { p2trOutput, outputKey } = createTaprootFundingScript(
 			state.localBasepoints.fundingPubkey,
-			state.remoteBasepoints.fundingPubkey
+			state.remoteBasepoints.fundingPubkey,
+			undefined,
+			state.fundingTaprootMerkleRoot
 		);
 		const sighash = taprootCommitmentSighash(
 			cache.tx,
@@ -7584,7 +7812,11 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			chKeys.fundingPrivkey,
 			chKeys.htlcBasepointSecret
 		);
-		const channel = new Channel(state, signer);
+		const channel = new Channel(
+			state,
+			signer,
+			this.config.auxiliaryChannels?.provider
+		);
 		channel.setBlockHeight(this._currentBlockHeight);
 		if (this.config.chainHash) {
 			channel.announcementChainHash = this.config.chainHash;
@@ -7945,7 +8177,11 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 				chKeys.fundingPrivkey,
 				chKeys.htlcBasepointSecret
 			);
-			const channel = new Channel(state, signer);
+			const channel = new Channel(
+				state,
+				signer,
+				this.config.auxiliaryChannels?.provider
+			);
 			channel.setBlockHeight(this._currentBlockHeight);
 			if (this.config.chainHash) {
 				channel.announcementChainHash = this.config.chainHash;
@@ -9668,7 +9904,8 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		// Retain its candidate identity before any external-close signature
 		// leaves, including proposals and alternative simple-close variants.
 		if (
-			channel.getFullState().externalClose &&
+			(channel.getFullState().externalClose ||
+				channel.getFullState().auxiliaryState) &&
 			produced.some(
 				(action) =>
 					action.type === ChannelActionType.SEND_MESSAGE &&
@@ -10257,6 +10494,36 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 	 * explicit `committed: true` releases them, so an implementation that
 	 * answers nothing, or throws, has written nothing.
 	 */
+	private readonly _auxiliaryResolutionsInFlight = new Set<string>();
+
+	private _notifyAuxiliaryResolutions(channel: Channel): void {
+		const callback = this.config.auxiliaryChannels?.onHtlcResolved;
+		const state = channel.getFullState();
+		const channelId = channel.getChannelId();
+		const peerPubkey = channelId && this.getPeerForChannel(channelId);
+		const records = state.auxiliaryState?.resolvedHtlcs;
+		if (!callback || !channelId || !peerPubkey || !records) return;
+		for (const [key, resolution] of [...records]) {
+			const identity = `${channelId.toString('hex')}:${key}`;
+			if (this._auxiliaryResolutionsInFlight.has(identity)) continue;
+			this._auxiliaryResolutionsInFlight.add(identity);
+			try {
+				callback({ ...resolution, state, channelId, peerPubkey });
+				if (records.get(key) === resolution) records.delete(key);
+			} catch (error) {
+				this.emitContained(
+					'error',
+					channelId,
+					`Asset resolution callback failed: ${
+						error instanceof Error ? error.message : String(error)
+					}`
+				);
+			} finally {
+				this._auxiliaryResolutionsInFlight.delete(identity);
+			}
+		}
+	}
+
 	private _persistBatch(ctx: IDispatchContext): boolean {
 		const { channel, outbox } = ctx;
 		let result: IChannelPersistResult | undefined;
@@ -10318,6 +10585,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 				channel.getFforEpoch()?.state ?? null
 			);
 		}
+		if (result?.committed === true) this._notifyAuxiliaryResolutions(channel);
 		return true;
 	}
 
