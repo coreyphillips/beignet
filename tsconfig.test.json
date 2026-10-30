@@ -9,6 +9,8 @@
       "beignet": ["./src/index.ts"],
       "beignet/cli": ["./src/cli/index.ts"],
       "beignet/lightning": ["./src/lightning/index.ts"],
+      "beignet/direct-funding": ["./src/direct-funding/index.ts"],
+      "beignet/direct-funding/node": ["./src/direct-funding/node.ts"],
       "beignet/lightning/sqlite": ["./src/lightning/sqlite.ts"]
     }
   },

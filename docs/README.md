@@ -18,6 +18,7 @@ Every document in the repository, by what it is for. A test (`tests/lightning/do
 | [AI_AGENT_GUIDE.md](AI_AGENT_GUIDE.md) | Deploying and operating `BeignetNode` and the daemon: channel strategy, liquidity, monitoring, safety rails, retries, backup, mainnet checklist |
 | [AUTOMATIC-OFFLINE-RECEIVE.md](AUTOMATIC-OFFLINE-RECEIVE.md) | Wallet-side automatic offline receive over FFOR: provider configuration, the receive API, concurrent receive |
 | [PAY-ALL.md](PAY-ALL.md) | Single-part pay-all: paying an amountless BOLT 11 invoice under an approved debit and fee cap |
+| [packages/direct-funding/README.md](../packages/direct-funding/README.md) | Standalone payer SDK, Bitcoin Core and PSBT adapters, transport, storage and regtest qualification |
 | [ZERO-RESERVE.md](ZERO-RESERVE.md) | Zero-reserve home channels (`option_zero_reserve`): policy and configuration |
 
 ## Reference

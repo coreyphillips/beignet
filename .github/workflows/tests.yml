@@ -85,6 +85,9 @@ jobs:
       - name: Run BOLT conformance vectors
         run: npm run test:conformance
 
+      - name: Run direct-funding SDK and package tests
+        run: npm run test:direct-funding
+
       # The rest of test:lightning runs in the `lightning` shard jobs, which
       # need neither docker nor dist. The files left here need this job's
       # bitcoind and Electrum; scripts/shard-tests.js lists them and runs them

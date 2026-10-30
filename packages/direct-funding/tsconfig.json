@@ -1,0 +1,15 @@
+{
+	"extends": "../../tsconfig.json",
+	"compilerOptions": {
+		"rootDir": "../../src",
+		"outDir": "./dist",
+		"declarationDir": "./dist",
+		"sourceMap": false,
+		"noEmitOnError": true
+	},
+	"include": [
+		"../../src/direct-funding/index.ts",
+		"../../src/direct-funding/node.ts"
+	],
+	"exclude": ["./dist", "../../node_modules"]
+}

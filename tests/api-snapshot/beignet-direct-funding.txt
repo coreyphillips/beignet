@@ -1,0 +1,262 @@
+# The exported API of beignet/direct-funding. Regenerate with npm run api:snapshot; do not edit.
+type BitcoinCoreRpc = (method: string, params?: unknown[]) => Promise<unknown>
+class BitcoinCoreWalletAdapter implements IDfSenderWallet
+private constructor BitcoinCoreWalletAdapter()
+method BitcoinCoreWalletAdapter.blockHeight(): number
+method BitcoinCoreWalletAdapter.changeScript(): Promise<Buffer>
+method BitcoinCoreWalletAdapter.confirmedSpendOf(id: string, vout: number): string | null
+static method BitcoinCoreWalletAdapter.create(options: IBitcoinCoreWalletOptions): Promise<BitcoinCoreWalletAdapter>
+method BitcoinCoreWalletAdapter.findCoin(id: string, vout: number): IDfSenderCoin | null
+method BitcoinCoreWalletAdapter.freezeUtxo(id: string, vout: number): Promise<boolean>
+method BitcoinCoreWalletAdapter.getTransaction(id: string): Promise<Buffer>
+method BitcoinCoreWalletAdapter.listSpendable(): IDfSenderCoin[]
+readonly property BitcoinCoreWalletAdapter.network: Network
+method BitcoinCoreWalletAdapter.ownsOutpoint(id: string, vout: number): boolean
+method BitcoinCoreWalletAdapter.refresh(fundingTxids?: readonly string[]): Promise<void>
+method BitcoinCoreWalletAdapter.signerFor(coin: IDfSenderCoin): IDfCoinSigner | null
+method BitcoinCoreWalletAdapter.spentOnChain(coin: IDfSenderCoin): Promise<boolean>
+method BitcoinCoreWalletAdapter.txStatus(id: string): { known: boolean; confirmed: boolean; } | null
+method BitcoinCoreWalletAdapter.unfreezeUtxo(id: string, vout: number): Promise<boolean>
+method BitcoinCoreWalletAdapter.unresolvedReservations(): ReadonlyArray<{ txid: string; vout: number; }>
+method BitcoinCoreWalletAdapter.waitForIdle(): Promise<void>
+const DF_BIP21_PARAM = "bgnq"
+const DF_ENVELOPE_VERSION = 3
+class DfDirectPeerLaneFactory implements IDfLaneFactory
+constructor DfDirectPeerLaneFactory(peers: IDfPeerMessaging, log?: DfTransportLog)
+method DfDirectPeerLaneFactory.attachInbound(sink: beignet/lightning#directFunding.DfFrameHandler): () => void
+method DfDirectPeerLaneFactory.destroy(): void
+method DfDirectPeerLaneFactory.open(descriptor: DfTransportDescriptor, ctx: IDfOpenContext): Promise<IDfTransport | null>
+get DfDirectPeerLaneFactory.openLaneCount(): number
+readonly property DfDirectPeerLaneFactory.type = DfTransportType.DIRECT_PEER
+type DfPaymentStatus = 'CREATED' | 'OFFERED' | 'SIGNED_PENDING' | 'MEMPOOL_SEEN' | 'CONFIRMED' | 'ABORTED' | 'FAILED'
+class DfRelayLaneFactory implements IDfLaneFactory
+constructor DfRelayLaneFactory(peers: IDfPeerMessaging, log?: DfTransportLog)
+method DfRelayLaneFactory.attachInbound(sink: beignet/lightning#directFunding.DfFrameHandler): () => void
+method DfRelayLaneFactory.destroy(): void
+method DfRelayLaneFactory.open(descriptor: DfTransportDescriptor, ctx: IDfOpenContext): Promise<IDfTransport | null>
+get DfRelayLaneFactory.openLaneCount(): number
+readonly property DfRelayLaneFactory.type = DfTransportType.LSP_RELAY
+type DfTransportDescriptor = beignet/lightning#directFunding.IDfDirectPeerTransport | beignet/lightning#directFunding.IDfOnionTransport | beignet/lightning#directFunding.IDfRelayTransport | beignet/lightning#directFunding.IDfUnknownTransport
+type DfTransportLog = (action: string, data: Record<string, unknown>) => void
+class DfTransportRegistry
+constructor DfTransportRegistry(log?: DfTransportLog, peerView?: beignet/lightning#directFunding.IDfRegistryPeerView)
+method DfTransportRegistry.attachInbound(sink: beignet/lightning#directFunding.DfFrameHandler): Promise<() => void>
+method DfTransportRegistry.destroy(): void
+method DfTransportRegistry.enabledTypes(): number[]
+method DfTransportRegistry.isEnabled(type: number): boolean
+method DfTransportRegistry.register(registration: IDfLaneRegistration): void
+method DfTransportRegistry.run<T>(transports: readonly DfTransportDescriptor[], ctx: IDfOpenContext, exchange: (lane: IDfTransport) => Promise<T>): Promise<T>
+method DfTransportRegistry.warm(transports: readonly DfTransportDescriptor[], receiverNodeId: Buffer, timeoutMs?: number): beignet/lightning#directFunding.IDfWarmResult
+enum DfTransportType
+member DfTransportType.DIRECT_PEER = 1
+member DfTransportType.LSP_RELAY = 3
+member DfTransportType.ONION_MESSAGE = 2
+member DfTransportType.RENDEZVOUS = 4
+class DirectFundingClient
+constructor DirectFundingClient(options: IDirectFundingClientOptions)
+method DirectFundingClient.inspect(input: string): IDirectFundingRequest
+method DirectFundingClient.pay(input: string, opts?: IDfSendOptions): Promise<IDfSendResult>
+method DirectFundingClient.payments(): IDfPaymentRecord[]
+method DirectFundingClient.reconcile(): Promise<void>
+class DirectFundingError extends beignet#CodedError<DirectFundingErrorCode>
+constructor DirectFundingError(code: DirectFundingErrorCode, message: string)
+enum DirectFundingErrorCode
+member DirectFundingErrorCode.AMOUNT_MISMATCH = "AMOUNT_MISMATCH"
+member DirectFundingErrorCode.AMOUNT_REQUIRED = "AMOUNT_REQUIRED"
+member DirectFundingErrorCode.EXCHANGE_TIMEOUT = "EXCHANGE_TIMEOUT"
+member DirectFundingErrorCode.EXPIRED = "EXPIRED"
+member DirectFundingErrorCode.EXPIRY_TOO_DISTANT = "EXPIRY_TOO_DISTANT"
+member DirectFundingErrorCode.INVALID_SIGNATURE = "INVALID_SIGNATURE"
+member DirectFundingErrorCode.MALFORMED = "MALFORMED"
+member DirectFundingErrorCode.NOT_PERSISTED = "NOT_PERSISTED"
+member DirectFundingErrorCode.NO_SUITABLE_UTXO = "NO_SUITABLE_UTXO"
+member DirectFundingErrorCode.OFFER_DECLINED = "OFFER_DECLINED"
+member DirectFundingErrorCode.SIGN_REQUEST_REFUSED = "SIGN_REQUEST_REFUSED"
+member DirectFundingErrorCode.TOO_MANY_REQUESTS = "TOO_MANY_REQUESTS"
+member DirectFundingErrorCode.UNREACHABLE = "UNREACHABLE"
+member DirectFundingErrorCode.UNSUPPORTED_VERSION = "UNSUPPORTED_VERSION"
+member DirectFundingErrorCode.WRONG_CHAIN = "WRONG_CHAIN"
+member DirectFundingErrorCode.WRONG_SIGNER = "WRONG_SIGNER"
+class DirectFundingSender
+constructor DirectFundingSender(deps: beignet/lightning#directFunding.IDfSenderDeps, config?: IDfSenderConfig)
+method DirectFundingSender.inFlight(): number
+method DirectFundingSender.isReplay(encodedRequest: string): boolean
+method DirectFundingSender.payments(): IDfPaymentRecord[]
+method DirectFundingSender.prepare(encodedRequest: string, opts?: Pick<IDfSendOptions, 'now'>): beignet/lightning#directFunding.IDfPrepareResult
+method DirectFundingSender.quote(encodedRequest: string, opts?: IDfSendOptions): { amountSat: bigint; maxTotalFeeSat: bigint; }
+method DirectFundingSender.reconcile(): Promise<void>
+method DirectFundingSender.recoverReservations(): Promise<void>
+method DirectFundingSender.send(encodedRequest: string, opts?: IDfSendOptions): Promise<IDfSendResult>
+method DirectFundingSender.start(): void
+method DirectFundingSender.stop(): void
+type DirectFundingStorage = NonNullable<beignet/lightning#directFunding.IDfPaymentStoreDeps['storage']>
+interface IBitcoinCoreWalletOptions
+property IBitcoinCoreWalletOptions.network?: Network
+property IBitcoinCoreWalletOptions.rpc: BitcoinCoreRpc
+property IBitcoinCoreWalletOptions.storage: { loadWalletData(key: string): string | null; saveWalletData(key: string, value: string): void; }
+property IBitcoinCoreWalletOptions.storageKey?: string
+interface IDfCoinSigner
+property IDfCoinSigner.kind: 'p2wpkh' | 'p2tr'
+property IDfCoinSigner.ownershipPubkey: Buffer
+method IDfCoinSigner.signInput(tx: bitcoinjs-lib#Transaction, inputIndex: number, prevouts: { scripts: Buffer[]; values: bigint[]; }): Buffer[] | Promise<Buffer[]>
+method IDfCoinSigner.signOwnership(digest: Buffer): Buffer
+method IDfCoinSigner.signOwnershipMessage?(message: string): { pubkey: Buffer; signature: Buffer; } | Promise<{ pubkey: Buffer; signature: Buffer; }>
+method IDfCoinSigner.signOwnershipProbe?(tx: bitcoinjs-lib#Transaction, prevouts: { scripts: Buffer[]; values: bigint[]; }): { pubkey: Buffer; signature: Buffer; } | Promise<{ pubkey: Buffer; signature: Buffer; }>
+interface IDfInboundFrame
+property IDfInboundFrame.authenticatedPeer?: string
+property IDfInboundFrame.boundRequestId?: Buffer
+readonly property IDfInboundFrame.laneKey: string
+property IDfInboundFrame.payload: Buffer
+property IDfInboundFrame.relayAssertedFrom?: string
+property IDfInboundFrame.reply: beignet/lightning#directFunding.IDfLaneSender
+property IDfInboundFrame.subtype: number
+readonly property IDfInboundFrame.type: number
+interface IDfLaneFactory
+method IDfLaneFactory.attachInbound(sink: beignet/lightning#directFunding.DfFrameHandler): () => void
+method IDfLaneFactory.destroy?(): void
+method IDfLaneFactory.open(descriptor: DfTransportDescriptor, ctx: IDfOpenContext): Promise<IDfTransport | null>
+readonly property IDfLaneFactory.type: number
+interface IDfLaneRegistration
+property IDfLaneRegistration.enabled: boolean
+property IDfLaneRegistration.load: () => IDfLaneFactory | Promise<IDfLaneFactory>
+property IDfLaneRegistration.type: DfTransportType | number
+interface IDfOpenContext
+property IDfOpenContext.awaitReceiverConnection?: boolean
+property IDfOpenContext.deadline?: number
+property IDfOpenContext.failedDials?: Set<string>
+property IDfOpenContext.receiverNodeId: Buffer
+property IDfOpenContext.requestId: Buffer
+interface IDfPaymentRecord
+property IDfPaymentRecord.amountSat: string
+property IDfPaymentRecord.attestation?: { fundingOutputIndex: number; localFundingPubkey: string; remoteFundingPubkey: string; sharedInputIndex?: number; priorLocalFundingPubkey?: string; priorRemoteFundingPubkey?: string; signature: string; }
+property IDfPaymentRecord.broadcastTx?: string
+property IDfPaymentRecord.changeScript: string
+property IDfPaymentRecord.createdAt: number
+property IDfPaymentRecord.freezeReleased?: boolean
+property IDfPaymentRecord.frozen?: boolean
+property IDfPaymentRecord.fundingTxid?: string
+property IDfPaymentRecord.maxTotalFeeSat: string
+property IDfPaymentRecord.negotiatedTx?: string
+property IDfPaymentRecord.offerBody: string
+property IDfPaymentRecord.offerId: string
+property IDfPaymentRecord.reason?: string
+property IDfPaymentRecord.reasonCode?: DirectFundingErrorCode
+property IDfPaymentRecord.receiptHash: string
+property IDfPaymentRecord.receiptPreimage?: string
+property IDfPaymentRecord.receiverNodeId: string
+property IDfPaymentRecord.requestId: string
+property IDfPaymentRecord.spentTxid: string
+property IDfPaymentRecord.spentValueSat: string
+property IDfPaymentRecord.spentVout: number
+property IDfPaymentRecord.status: DfPaymentStatus
+property IDfPaymentRecord.updatedAt: number
+property IDfPaymentRecord.witness?: string[]
+property IDfPaymentRecord.witnessSent?: boolean
+interface IDfPeerMessaging
+method IDfPeerMessaging.connectPeer(peerPubkeyHex: string, host: string, port: number, timeoutMs?: number, options?: { reconnect?: boolean; }): Promise<void>
+method IDfPeerMessaging.isPeerConnected(peerPubkeyHex: string): boolean
+method IDfPeerMessaging.keepReconnecting?(peerPubkeyHex: string): void
+method IDfPeerMessaging.nodeIdHex(): string
+method IDfPeerMessaging.onCustomMessage(cb: (msg: beignet/lightning#directFunding.IDfCustomMessage) => void): () => void
+method IDfPeerMessaging.onPeerConnect?(cb: (peerPubkeyHex: string) => void): () => void
+method IDfPeerMessaging.sendCustomMessage(peerPubkeyHex: string, subtype: number, payload: Buffer): void
+interface IDfRequestEnvelope
+property IDfRequestEnvelope.amountSat?: bigint
+property IDfRequestEnvelope.chainHash: Buffer
+property IDfRequestEnvelope.encryptionKey: Buffer
+property IDfRequestEnvelope.expiresAt: number
+property IDfRequestEnvelope.receiptHash: Buffer
+property IDfRequestEnvelope.receiverNodeId: Buffer
+property IDfRequestEnvelope.requestId: Buffer
+property IDfRequestEnvelope.signature: Buffer
+property IDfRequestEnvelope.signedBytes: Buffer
+property IDfRequestEnvelope.transports: DfTransportDescriptor[]
+property IDfRequestEnvelope.version: number
+interface IDfSendOptions
+property IDfSendOptions.amountSat?: bigint
+property IDfSendOptions.maxTotalFeeSat?: bigint
+property IDfSendOptions.now?: number
+property IDfSendOptions.recoverReceipt?: boolean
+interface IDfSendResult
+property IDfSendResult.amountSat: number
+property IDfSendResult.attested: boolean
+property IDfSendResult.broadcastTxHex?: string
+property IDfSendResult.caveat?: string
+property IDfSendResult.fundingTxid?: string
+property IDfSendResult.offerId: string
+property IDfSendResult.rawTxHex?: string
+property IDfSendResult.receiptPreimageHex: string | null
+property IDfSendResult.spentTxid: string
+property IDfSendResult.spentVout: number
+property IDfSendResult.status: DfPaymentStatus
+interface IDfSenderCoin
+property IDfSenderCoin.height: number
+property IDfSenderCoin.script: Buffer
+property IDfSenderCoin.txidHex: string
+property IDfSenderCoin.valueSat: bigint
+property IDfSenderCoin.vout: number
+interface IDfSenderConfig
+property IDfSenderConfig.defaultMaxTotalFeeSat?: bigint
+property IDfSenderConfig.offerResendDelaysMs?: number[]
+property IDfSenderConfig.offerTimeoutMs?: number
+property IDfSenderConfig.receiptTimeoutMs?: number
+property IDfSenderConfig.sequence?: number
+property IDfSenderConfig.sweepIntervalMs?: number
+interface IDfSenderWallet
+method IDfSenderWallet.blockHeight(): number
+method IDfSenderWallet.changeScript(): Promise<Buffer>
+method IDfSenderWallet.confirmedSpendOf(txidHex: string, vout: number): string | null
+method IDfSenderWallet.findCoin(txidHex: string, vout: number): IDfSenderCoin | null
+method IDfSenderWallet.freezeUtxo(txidHex: string, vout: number): Promise<boolean>
+method IDfSenderWallet.getTransaction(txidHex: string): Promise<Buffer>
+method IDfSenderWallet.listSpendable(): IDfSenderCoin[]
+method IDfSenderWallet.ownsOutpoint(txidHex: string, vout: number): boolean
+method IDfSenderWallet.signerFor(coin: IDfSenderCoin): IDfCoinSigner | null
+method IDfSenderWallet.spentOnChain?(coin: IDfSenderCoin): Promise<boolean>
+method IDfSenderWallet.txStatus(txidHex: string): { known: boolean; confirmed: boolean; } | null
+method IDfSenderWallet.unfreezeUtxo(txidHex: string, vout: number): Promise<boolean>
+interface IDfTransport extends beignet/lightning#directFunding.IDfLaneSender
+method IDfTransport.close(): void
+method IDfTransport.framesExchanged(): number
+method IDfTransport.onMessage(cb: beignet/lightning#directFunding.DfFrameHandler): () => void
+interface IDfVerifyOptions
+property IDfVerifyOptions.allowExpired?: boolean
+property IDfVerifyOptions.expectedChainHash: Buffer
+property IDfVerifyOptions.maxTtlMs?: number
+property IDfVerifyOptions.now?: number
+interface IDirectFundingClientOptions
+property IDirectFundingClientOptions.config?: IDfSenderConfig
+property IDirectFundingClientOptions.log?: DfTransportLog
+property IDirectFundingClientOptions.network: Network
+property IDirectFundingClientOptions.registry: DfTransportRegistry
+property IDirectFundingClientOptions.storage: DirectFundingStorage
+property IDirectFundingClientOptions.wallet: IDirectFundingWallet
+interface IDirectFundingRequest
+property IDirectFundingRequest.encoded: string
+property IDirectFundingRequest.envelope: IDfRequestEnvelope
+property IDirectFundingRequest.uriAmountSat?: bigint
+interface IDirectFundingWallet extends IDfSenderWallet
+readonly property IDirectFundingWallet.network: Network
+method IDirectFundingWallet.refresh?(fundingTxids?: readonly string[]): Promise<void>
+method IDirectFundingWallet.waitForIdle?(): Promise<void>
+interface IPsbtCoinSignerOptions
+method IPsbtCoinSignerOptions.decoratePsbt?(psbt: bitcoinjs-lib#Psbt, context: IPsbtSigningContext): void | Promise<void>
+method IPsbtCoinSignerOptions.getTransaction(txidHex: string): Promise<Buffer>
+method IPsbtCoinSignerOptions.signPsbt(psbtBase64: string, context: IPsbtSigningContext): Promise<string>
+interface IPsbtSigningContext
+property IPsbtSigningContext.inputIndex: number
+property IPsbtSigningContext.purpose: 'ownership' | 'funding'
+enum Network
+member Network.MAINNET = "bc"
+member Network.REGTEST = "bcrt"
+member Network.SIGNET = "tbs"
+member Network.TESTNET = "tb"
+function bip21WithRequest(uri: string, encoded: string): string
+function chainHashForNetwork(network: Network): Buffer
+function createPeerTransportRegistry(peers: IDfPeerMessaging, log?: DfTransportLog): DfTransportRegistry
+function createPsbtCoinSigner(coin: IDfSenderCoin, options: IPsbtCoinSignerOptions): IDfCoinSigner
+function decodeAndVerifyRequestEnvelope(encoded: string, opts: IDfVerifyOptions): IDfRequestEnvelope
+function decodeRequestEnvelope(encoded: string): IDfRequestEnvelope
+function encodeRequestEnvelope(env: IDfRequestEnvelope): string
+function parseDirectFundingRequest(input: string): { encoded: string; uriAmountSat?: bigint; }
+function verifyRequestEnvelope(env: IDfRequestEnvelope, opts: IDfVerifyOptions): void

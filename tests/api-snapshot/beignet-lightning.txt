@@ -2449,6 +2449,7 @@ method directFunding.DirectFundingSender.payments(): directFunding.IDfPaymentRec
 method directFunding.DirectFundingSender.prepare(encodedRequest: string, opts?: Pick<directFunding.IDfSendOptions, 'now'>): directFunding.IDfPrepareResult
 method directFunding.DirectFundingSender.quote(encodedRequest: string, opts?: directFunding.IDfSendOptions): { amountSat: bigint; maxTotalFeeSat: bigint; }
 method directFunding.DirectFundingSender.reconcile(): Promise<void>
+method directFunding.DirectFundingSender.recoverReservations(): Promise<void>
 method directFunding.DirectFundingSender.send(encodedRequest: string, opts?: directFunding.IDfSendOptions): Promise<directFunding.IDfSendResult>
 method directFunding.DirectFundingSender.start(): void
 method directFunding.DirectFundingSender.stop(): void

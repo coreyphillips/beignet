@@ -239,6 +239,12 @@ export class DirectFundingSender {
 		this.sweepTimer = null;
 	}
 
+	/** Recover abandoned reservations without starting a background timer. */
+	async recoverReservations(): Promise<void> {
+		this.releaseUnwitnessedFreezes();
+		await Promise.all(this.recoveringFreezes.values());
+	}
+
 	/** Sends running right now. The daemon's drain waits on these. */
 	inFlight(): number {
 		return this.inflight.size;

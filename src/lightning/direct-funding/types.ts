@@ -25,7 +25,7 @@ import {
 	REGTEST_CHAIN_HASH,
 	SIGNET_CHAIN_HASH,
 	TESTNET_CHAIN_HASH
-} from '../channel/types';
+} from '../chain/hashes';
 
 // ─────────────── Sizes ───────────────
 

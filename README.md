@@ -37,6 +37,8 @@ console.log(wallet.getBalance());
 
 From here: [the on-chain wallet](#on-chain-wallet) for sending, PSBTs, multisig and watch-only, or [Lightning](#lightning) for channels and payments.
 
+For adding `bgnq` direct-funding payments to another wallet, see the [standalone TypeScript payer SDK](packages/direct-funding/README.md). It includes a PSBT signing adapter, Bitcoin Core integration, and a channel-free peer client.
+
 ## Try the examples
 
 The fastest way to understand the whole system is to run the two REPL examples against a live wallet and a live node. Both are checked-in TypeScript you can read and edit.
@@ -695,6 +697,8 @@ npm run test:conformance   # 300+ official BOLT vector cases (subset of test:lig
 npm run test:chaos         # recovery kill matrices (parallel), split out of test:lightning
 npm run test:sigkill       # process-level SIGKILL chaos matrix (builds dist first)
 npm run test:api           # exported API vs tests/api-snapshot (npm run api:snapshot regenerates it)
+npm run test:direct-funding # standalone payer SDK, wallet adapters and packaging
+npm run test:direct-funding:regtest # real Core wallets and funding transactions (needs Docker)
 npm run test:integration   # daemon/Electrum integration (needs an Electrum server)
 npm run test:interop       # 300+ cases vs LND/CLN/Eclair (needs Docker)
 npm run test:interop:ffor  # FFOR Variant D chain gates on regtest (needs only the bitcoind container)
