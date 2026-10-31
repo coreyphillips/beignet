@@ -1,3 +1,4 @@
+import { secondLevelRevocationKey } from './child-revocation';
 import type { ITaprootAuxLeaf } from '../script/commitment-taproot';
 import type { IAuxiliaryCommitmentData } from './auxiliary';
 import { copyAuxiliaryCommitment } from './auxiliary';
@@ -1482,13 +1483,20 @@ export function signRemoteHtlcSignaturesTaproot(
 			meta.cltvExpiry,
 			built.auxiliary?.outputLeaves.get(outputIndex)
 		);
+		const childKey = secondLevelRevocationKey(
+			state,
+			built.auxiliary,
+			keys.revocationPubkey,
+			meta.auxiliaryAmount,
+			built.result.tx
+		);
 		const htlcTx =
 			kind === 'received'
 				? buildTaprootHtlcSuccessTx(
 						commitTxid,
 						outputIndex,
 						meta.amount,
-						keys.revocationPubkey,
+						childKey,
 						keys.localDelayedPubkey,
 						state.localConfig.toSelfDelay,
 						undefined,
@@ -1501,7 +1509,7 @@ export function signRemoteHtlcSignaturesTaproot(
 						outputIndex,
 						meta.amount,
 						meta.cltvExpiry,
-						keys.revocationPubkey,
+						childKey,
 						keys.localDelayedPubkey,
 						state.localConfig.toSelfDelay,
 						undefined,
@@ -1576,13 +1584,20 @@ export function verifyRemoteHtlcSignaturesTaproot(
 			meta.cltvExpiry,
 			built.auxiliary?.outputLeaves.get(outputIndex)
 		);
+		const childKey = secondLevelRevocationKey(
+			state,
+			built.auxiliary,
+			keys.revocationPubkey,
+			meta.auxiliaryAmount,
+			built.result.tx
+		);
 		const htlcTx =
 			kind === 'received'
 				? buildTaprootHtlcSuccessTx(
 						commitTxid,
 						outputIndex,
 						meta.amount,
-						keys.revocationPubkey,
+						childKey,
 						keys.localDelayedPubkey,
 						state.remoteConfig.toSelfDelay,
 						undefined,
@@ -1595,7 +1610,7 @@ export function verifyRemoteHtlcSignaturesTaproot(
 						outputIndex,
 						meta.amount,
 						meta.cltvExpiry,
-						keys.revocationPubkey,
+						childKey,
 						keys.localDelayedPubkey,
 						state.remoteConfig.toSelfDelay,
 						undefined,

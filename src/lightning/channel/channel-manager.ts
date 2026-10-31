@@ -366,6 +366,10 @@ export interface IChannelManagerConfig {
 	persistence: IChannelPersistence;
 	/** Acknowledge the exact monitor snapshot saved by monitor:updated before an auxiliary sweep broadcasts. */
 	isMonitorPersisted?: (channelIdHex: string) => boolean;
+	/** Defer terminal asset fee selection only for an authenticated confirmed competing spend. */
+	hasAuxiliarySweepConflict?: (
+		check: import('../chain/auxiliary-fee-source').IAuxiliaryFeeSourceCheck
+	) => Promise<boolean>;
 	zeroReserve?: import('./zero-reserve').IZeroReserveConfig;
 	/** Durable book lookup supplied by the node's voucher custody index. */
 	fforVoucherLookup?: (paymentHash: string) => IFforVoucherArchive | undefined;
@@ -1580,7 +1584,8 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			this.config.chainHash,
 			this.config.preferAnchors,
 			this.config.preferTaproot || !!opts?.auxiliary,
-			fixedAssetOutputs
+			fixedAssetOutputs,
+			!!opts?.auxiliary && this.peerNegotiatedChildCustody(peerPubkey)
 		);
 		this.processActions(peerPubkey, channel, actions);
 
@@ -7856,6 +7861,24 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 				Feature.OPTION_ASSET_FIXED_HTLC_OUTPUTS
 			) === true;
 		const fixed = local && remote;
+		const child =
+			this.config.auxiliaryChannels?.allowRevokedChildCustody === true &&
+			this.config.localFeatures?.hasFeature(
+				Feature.OPTION_ASSET_CHILD_CUSTODY
+			) === true &&
+			remoteInit?.features.hasFeature(Feature.OPTION_ASSET_CHILD_CUSTODY) ===
+				true;
+		if (child && !this.config.auxiliaryChannels?.provider.prepareRevokedChild)
+			throw new Error(
+				'Child custody requires an asset recovery capsule provider'
+			);
+		if (
+			proposed &&
+			FeatureFlags.fromBuffer(proposed).hasFeature(
+				Feature.OPTION_ASSET_CHILD_CUSTODY
+			) !== child
+		)
+			throw new Error('Asset child custody mode was not mutually selected');
 		if (fixed) {
 			if (this.fundingProvider?.supportsFixedOutputFees?.() !== true)
 				throw new Error(
@@ -7877,6 +7900,19 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 				'New asset channels require fixed HTLC outputs or explicit peer compatibility'
 			);
 		return false;
+	}
+
+	private peerNegotiatedChildCustody(peerPubkey: string): boolean {
+		return (
+			this.config.auxiliaryChannels?.allowRevokedChildCustody === true &&
+			this.config.localFeatures?.hasFeature(
+				Feature.OPTION_ASSET_CHILD_CUSTODY
+			) === true &&
+			this.peerManager
+				?.getPeer(peerPubkey)
+				?.getRemoteInit()
+				?.features.hasFeature(Feature.OPTION_ASSET_CHILD_CUSTODY) === true
+		);
 	}
 
 	peerNegotiatedNativeFunding(peerPubkey: string): boolean {
@@ -7984,6 +8020,8 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 				typeFlags.setCompulsory(Feature.OPTION_TAPROOT_OVERLAY);
 				if (this.negotiateAssetHtlcOutputs(peerPubkey))
 					typeFlags.setCompulsory(Feature.OPTION_ASSET_FIXED_HTLC_OUTPUTS);
+				if (this.peerNegotiatedChildCustody(peerPubkey))
+					typeFlags.setCompulsory(Feature.OPTION_ASSET_CHILD_CUSTODY);
 			} else if (this.config.preferTaproot && nativeFunding)
 				typeFlags.setCompulsory(Feature.OPTION_TAPROOT);
 			else {
@@ -11887,20 +11925,44 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			action.kind === 'auxiliary-sweep-fee-attach' ||
 			!!action.finalizeHtlcFunding;
 
-		if (!fp?.selectFeeBumpInputs) {
-			this.emit(
-				'error',
-				channelId,
-				`anchor fee bump (${action.kind}) skipped: no funding provider${
-					auxiliaryClaim ? '' : '; broadcasting unbumped'
-				}`
-			);
-			if (!auxiliaryClaim) this.emit('broadcast:tx', action.tx);
-			return;
-		}
-
 		let monitorInstalled = false;
+		let preflightMonitor: ChainMonitor | undefined;
 		try {
+			if (
+				action.kind === 'auxiliary-sweep-fee-attach' &&
+				this.config.hasAuxiliarySweepConflict
+			) {
+				const monitor = this.monitors.get(channelId.toString('hex'));
+				const attachment = action.auxiliarySweep;
+				if (!monitor || !attachment)
+					throw new Error('Auxiliary sweep monitor or signer is unavailable');
+				preflightMonitor = monitor;
+				const spent = await this.config.hasAuxiliarySweepConflict({
+					transaction: Buffer.from(action.tx),
+					prevoutScripts: attachment.prevoutScripts.map((script) =>
+						Buffer.from(script)
+					),
+					prevoutValues: [...attachment.prevoutValues]
+				});
+				if (
+					spent ||
+					action.isCurrent?.() === false ||
+					this.monitors.get(channelId.toString('hex')) !== monitor
+				)
+					return;
+			}
+			if (!fp?.selectFeeBumpInputs) {
+				this.emit(
+					'error',
+					channelId,
+					`anchor fee bump (${action.kind}) skipped: no funding provider${
+						auxiliaryClaim ? '' : '; broadcasting unbumped'
+					}`
+				);
+				if (!auxiliaryClaim) this.emit('broadcast:tx', action.tx);
+				return;
+			}
+
 			if (action.kind === 'auxiliary-sweep-fee-attach') {
 				const channelIdHex = channelId.toString('hex');
 				const monitor = this.monitors.get(channelIdHex);
@@ -12164,7 +12226,13 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 				pending.lastAttemptFailed = false;
 			}
 		} catch (err) {
-			if (!monitorInstalled && action.isCurrent?.() === false) return;
+			if (
+				!monitorInstalled &&
+				(action.isCurrent?.() === false ||
+					(!!preflightMonitor &&
+						this.monitors.get(channelId.toString('hex')) !== preflightMonitor))
+			)
+				return;
 			if (
 				action.fixedHtlcOutputs &&
 				(err as { code?: string })?.code === 'FEE_PREPARATION_PENDING'

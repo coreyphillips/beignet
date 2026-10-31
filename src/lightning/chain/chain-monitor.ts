@@ -1291,9 +1291,24 @@ export class ChainMonitor {
 		// (issue #576). Without this the parked clock would never restart, because
 		// the watcher reports an unchanged spend to nobody and the output would sit
 		// SPEND_CONFIRMED forever.
+		// Older snapshots could record the first-level spend before a provider
+		// failed to reconstruct its revoked child. Re-run that follow-up until
+		// the child is tracked; an exact parent-spend replay must not strand it.
+		const missingRevokedChild =
+			this._commitmentBroadcast?.commitmentType ===
+				CommitmentType.THEIR_REVOKED_COMMITMENT &&
+			spentTrackedOutputs.some(
+				(candidate) =>
+					candidate.outputType === OutputType.OFFERED_HTLC ||
+					candidate.outputType === OutputType.RECEIVED_HTLC
+			) &&
+			!this._trackedOutputs.some(
+				(candidate) => candidate.txid === spendingTx.getId()
+			);
 		if (
 			output.status === OutputStatus.SPEND_CONFIRMED &&
-			output.resolutionTxid === spendingTx.getId()
+			output.resolutionTxid === spendingTx.getId() &&
+			!missingRevokedChild
 		) {
 			// One report proves every output already recorded against this
 			// transaction, not just the watched one: a batched penalty's other
@@ -1309,15 +1324,10 @@ export class ChainMonitor {
 			return [];
 		}
 
-		output.status = OutputStatus.SPEND_CONFIRMED;
-		output.resolutionTxid = spendingTx.getId();
+		// Select any exact retained payload needed by child reconstruction, but
+		// record completion only after every follow-up succeeds below. A failed
+		// provider callback must remain retryable after persistence and restart.
 		this._selectAuxiliarySweep(output, spendingTx.getId());
-		output.confirmationHeight = blockHeight;
-		// A spend we had not recorded is live evidence as much as a re-report of
-		// one we had, so it releases a parked finality clock (issue #576). A
-		// replacement spender arrives here, and so does the original spend once
-		// an eviction has cleared its resolution.
-		delete output.spendReverifyPending;
 
 		// Scan the whole spending tx for any preimages it reveals — not just the
 		// one matched output. A single counterparty tx can claim several HTLC

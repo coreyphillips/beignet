@@ -1,3 +1,4 @@
+import { resolveChildRevocationKey } from './child-revocation';
 import type { ICommitmentTxResult } from '../script/commitment';
 import {
 	buildTaprootToLocalOutput,
@@ -14,7 +15,12 @@ import type {
 } from './commitment-builder';
 import type { IAuxiliaryOutput, IAuxiliaryCommitmentData } from './auxiliary';
 import { copyAuxiliaryCommitment, requireAuxiliaryProvider } from './auxiliary';
-import { HtlcDirection, isTaprootChannel, isOverlayChannel } from './types';
+import {
+	HtlcDirection,
+	isTaprootChannel,
+	isOverlayChannel,
+	isRevokedChildCustodyChannel
+} from './types';
 
 export function applyAuxiliaryCommitment(
 	state: IChannelState,
@@ -129,6 +135,13 @@ export function applyAuxiliaryCommitment(
 	const prepared = copyAuxiliaryCommitment(
 		previous ??
 			provider.buildCommitment({
+				resolveSecondLevelRevocationKey: (transaction) =>
+					resolveChildRevocationKey(
+						state,
+						side,
+						perCommitmentPoint,
+						transaction
+					)?.publicKey,
 				state,
 				side,
 				commitmentNumber,
@@ -158,10 +171,16 @@ export function applyAuxiliaryCommitment(
 		throw new Error('Missing asset balance commitment leaf');
 	for (const output of outputs) {
 		if (output.htlcId === undefined) continue;
+		const meta = htlcs.find(
+			(item) =>
+				item.htlcId === output.htlcId && item.direction === output.direction
+		);
+		if (!meta?.auxiliaryAmount) continue;
 		const key = `${output.direction}:${output.htlcId}`;
 		if (
 			!prepared.outputLeaves.has(output.outputIndex) ||
-			!prepared.secondLevelLeaves.has(key)
+			(!prepared.secondLevelLeaves.has(key) &&
+				!isRevokedChildCustodyChannel(state.channelType))
 		)
 			throw new Error('Missing asset HTLC commitment leaf');
 	}
@@ -220,6 +239,41 @@ export function applyAuxiliaryCommitment(
 		}
 		// The auxiliary leaf changes the output key, never the pre-aux sort order.
 		result.tx.outs[index].script = script;
+	}
+
+	const child = resolveChildRevocationKey(
+		state,
+		side,
+		perCommitmentPoint,
+		result.tx
+	);
+	if (child) {
+		if (
+			prepared.secondLevelCommitmentTxid &&
+			prepared.secondLevelCommitmentTxid !== result.tx.getId()
+		)
+			throw new Error('Persisted child custody commitment changed');
+		if (
+			prepared.secondLevelRevocationKey &&
+			!prepared.secondLevelRevocationKey.equals(child.publicKey)
+		)
+			throw new Error('Persisted child custody key changed');
+		prepared.secondLevelRevocationKey = child.publicKey;
+		prepared.secondLevelRevocationBasepoint = child.basepoint;
+		prepared.secondLevelCommitmentTxid = result.tx.getId();
+	}
+	if (child) {
+		for (const output of outputs) {
+			const meta = htlcs.find(
+				(item) =>
+					item.htlcId === output.htlcId && item.direction === output.direction
+			);
+			if (
+				meta?.auxiliaryAmount &&
+				!prepared.secondLevelLeaves.has(`${meta.direction}:${meta.htlcId}`)
+			)
+				throw new Error('Missing scoped asset HTLC commitment leaf');
+		}
 	}
 	return prepared;
 }

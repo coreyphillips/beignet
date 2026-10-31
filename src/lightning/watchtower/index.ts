@@ -8,6 +8,7 @@ export * from './wtwire';
 export * from './blob';
 export * from './justice';
 export * from './auxiliary';
+export * from './auxiliary-child';
 export { TowerConnection, parseTowerUri } from './tower-connection';
 export {
 	WatchtowerClient,

@@ -1,3 +1,4 @@
+import { ecc } from '../../utils/ecc';
 import type { HtlcDirection } from '../channel/types';
 import type {
 	IAuxiliaryCommitmentData,
@@ -9,6 +10,9 @@ import type { ITaprootAuxLeaf } from '../script/commitment-taproot';
 
 export type SerializedCustomRecords = [string, string][];
 interface ISerializedAuxiliaryCommitment {
+	secondLevelRevocationKey?: string;
+	secondLevelRevocationBasepoint?: string;
+	secondLevelCommitmentTxid?: string;
 	customData: string;
 	outputLeaves: [number, { script: string; leafVersion?: number }][];
 	secondLevelLeaves: [string, { script: string; leafVersion?: number }][];
@@ -16,6 +20,7 @@ interface ISerializedAuxiliaryCommitment {
 	htlcOutputIndexes?: [string, number][];
 }
 export interface ISerializedAuxiliaryState {
+	childRevocationBasepoints?: [string, string][];
 	channelData: string;
 	resolvedHtlcs?: [
 		string,
@@ -110,6 +115,10 @@ export function serializeAuxiliaryState(
 		value: IAuxiliaryCommitmentData
 	): ISerializedAuxiliaryCommitment => ({
 		customData: value.customData.toString('hex'),
+		secondLevelRevocationKey: value.secondLevelRevocationKey?.toString('hex'),
+		secondLevelRevocationBasepoint:
+			value.secondLevelRevocationBasepoint?.toString('hex'),
+		secondLevelCommitmentTxid: value.secondLevelCommitmentTxid,
 		htlcOutputIndexes: value.htlcOutputIndexes
 			? [...value.htlcOutputIndexes]
 			: undefined,
@@ -125,6 +134,12 @@ export function serializeAuxiliaryState(
 	});
 	return {
 		channelData: state.channelData.toString('hex'),
+		childRevocationBasepoints:
+			state.childRevocationBasepoints &&
+			[...state.childRevocationBasepoints].map(([id, point]) => [
+				id,
+				point.toString('hex')
+			]),
 		resolvedHtlcs: state.resolvedHtlcs
 			? [...state.resolvedHtlcs].map(([key, value]) => [
 					key,
@@ -183,6 +198,17 @@ export function deserializeAuxiliaryState(
 		value: ISerializedAuxiliaryCommitment
 	): IAuxiliaryCommitmentData => ({
 		customData: bytes(value.customData),
+		secondLevelRevocationKey:
+			value.secondLevelRevocationKey !== undefined
+				? childPoint(value.secondLevelRevocationKey)
+				: undefined,
+		secondLevelRevocationBasepoint:
+			value.secondLevelRevocationBasepoint !== undefined
+				? childPoint(value.secondLevelRevocationBasepoint)
+				: undefined,
+		secondLevelCommitmentTxid:
+			value.secondLevelCommitmentTxid &&
+			childTxid(value.secondLevelCommitmentTxid),
 		htlcOutputIndexes: value.htlcOutputIndexes
 			? uniqueMap(
 					value.htlcOutputIndexes.map(([id, index]) => [
@@ -208,6 +234,14 @@ export function deserializeAuxiliaryState(
 		throw new Error('Serialized asset balances overflow');
 	return {
 		channelData: bytes(state.channelData),
+		childRevocationBasepoints:
+			state.childRevocationBasepoints &&
+			uniqueMap(
+				state.childRevocationBasepoints.map(([id, point]) => [
+					childTxid(id),
+					childPoint(point)
+				])
+			),
 		resolvedHtlcs: state.resolvedHtlcs
 			? uniqueMap(
 					state.resolvedHtlcs.map(([key, value]) => {
@@ -265,4 +299,16 @@ export function deserializeAuxiliaryState(
 			])
 		)
 	};
+}
+
+function childPoint(value: string): Buffer {
+	const point = bytes(value);
+	if (point.length !== 33 || !ecc.isPoint(point))
+		throw new Error('Malformed child custody point');
+	return point;
+}
+function childTxid(value: string): string {
+	if (!/^[0-9a-f]{64}$/.test(value))
+		throw new Error('Malformed child custody transaction');
+	return value;
 }

@@ -1,6 +1,10 @@
 # The exported API of beignet/lightning. Regenerate with npm run api:snapshot; do not edit.
 unexported type DeprecatedNodeConfigKey = 'forwardingEnabled' | 'forwardingCltvDelta' | 'forwardingFeeBaseMsat' | 'forwardingFeePropMillionths' | 'forwardingPolicyGraceMs' | 'fforSettle' | 'fforConcurrent' | 'fforWitness' | 'fforIssuer'
 unexported type EventMap<E> = { [K in keyof E]: (...args: any[]) => void; }
+unexported interface IAuxiliaryFeeSourceCheck
+property IAuxiliaryFeeSourceCheck.prevoutScripts: readonly Buffer[]
+property IAuxiliaryFeeSourceCheck.prevoutValues: readonly bigint[]
+property IAuxiliaryFeeSourceCheck.transaction: Buffer
 unexported interface ICompactHtlcHistory
 property ICompactHtlcHistory.entries: IHistoryEntry[]
 property ICompactHtlcHistory.snapshots: { commitmentNumber: string; prefix: number; remove: number; add: number[]; }[]
@@ -84,10 +88,14 @@ property ISerializedAuxiliaryCommitment.customData: string
 property ISerializedAuxiliaryCommitment.htlcOutputIndexes?: [ string, number ][]
 property ISerializedAuxiliaryCommitment.outputLeaves: [ number, { script: string; leafVersion?: number; } ][]
 property ISerializedAuxiliaryCommitment.peerSignatures?: SerializedCustomRecords
+property ISerializedAuxiliaryCommitment.secondLevelCommitmentTxid?: string
 property ISerializedAuxiliaryCommitment.secondLevelLeaves: [ string, { script: string; leafVersion?: number; } ][]
+property ISerializedAuxiliaryCommitment.secondLevelRevocationBasepoint?: string
+property ISerializedAuxiliaryCommitment.secondLevelRevocationKey?: string
 unexported interface ISerializedAuxiliaryState
 property ISerializedAuxiliaryState.acceptedClosingSigned?: string
 property ISerializedAuxiliaryState.channelData: string
+property ISerializedAuxiliaryState.childRevocationBasepoints?: [ string, string ][]
 property ISerializedAuxiliaryState.closeTransactions?: [ string, string ][]
 property ISerializedAuxiliaryState.localBalance: string
 property ISerializedAuxiliaryState.localCommitments: [ string, ISerializedAuxiliaryCommitment ][]
@@ -1031,6 +1039,7 @@ type channel.AuxiliarySpendKind = 'to_local_delayed' | 'to_local_revocation' | '
 const channel.BITCOIN_CHAIN_HASH: Buffer
 const channel.CHANNEL_INDEX_FLOOR_MAX: number
 const channel.CHANNEL_INDEX_FLOOR_STRIDE = 128
+const channel.CHILD_REVOCATION_RECORD = 65553n
 class channel.Channel
 constructor channel.Channel(state: channel.IChannelState, signer?: keys.ISigner, auxiliaryProvider?: channel.IChannelAuxiliaryProvider)
 static readonly property channel.Channel.MAX_DUST_HTLC_EXPOSURE_MSAT = 5000000n
@@ -1192,7 +1201,7 @@ method channel.Channel.hasPendingSpliceConflictRequest(): boolean
 method channel.Channel.hasRecoveryCloseDisposition(): boolean
 method channel.Channel.hasRevertedSplice(spliceTxidDisplayHex: string): boolean
 method channel.Channel.initiateFforEpoch(request: { assetTerms?: ffor.IFforAssetTerms; voucherAmountsMsat: bigint[]; minPaymentMsat: bigint; settlementDeadline: number; voucherExpiry: number; feeBaseMsat: number; feeProportionalMillionths: number; epochId?: Buffer; witnessPeers?: Buffer[]; hashChain?: boolean; concurrent?: boolean; concurrentVersion?: 1 | 2; }): channel.ChannelAction[]
-method channel.Channel.initiateOpen(chainHash?: Buffer, preferAnchors?: boolean, preferTaproot?: boolean, fixedAssetHtlcOutputs?: boolean): channel.ChannelAction[]
+method channel.Channel.initiateOpen(chainHash?: Buffer, preferAnchors?: boolean, preferTaproot?: boolean, fixedAssetHtlcOutputs?: boolean, revokedChildCustody?: boolean): channel.ChannelAction[]
 method channel.Channel.initiateOpenV2(params: channel.IDualFundingParams): channel.ChannelAction[]
 method channel.Channel.initiateQuiescence(): channel.ChannelAction[]
 method channel.Channel.initiateShutdown(scriptPubkey: Buffer, acceptStaleStateRisk?: boolean, externalDestination?: boolean): channel.ChannelAction[]
@@ -1621,6 +1630,7 @@ property channel.IAuthorizeFundingBroadcastAction.fundingTxid: Buffer
 property channel.IAuthorizeFundingBroadcastAction.type: channel.ChannelActionType.AUTHORIZE_FUNDING_BROADCAST
 interface channel.IAuxiliaryChannelConfig
 method channel.IAuxiliaryChannelConfig.allowLegacyHtlcSignatures?(peerPubkey: string): boolean
+property channel.IAuxiliaryChannelConfig.allowRevokedChildCustody?: boolean
 method channel.IAuxiliaryChannelConfig.beforeAccept?(channel: channel.Channel, peerPubkey: string): Promise<void>
 method channel.IAuxiliaryChannelConfig.beforeFundingCreated?(channel: channel.Channel, peerPubkey: string): Promise<void>
 property channel.IAuxiliaryChannelConfig.initCustomRecords?: message.CustomRecords
@@ -1670,6 +1680,7 @@ property channel.IAuxiliaryCommitmentContext.localAssetBalance: bigint
 property channel.IAuxiliaryCommitmentContext.outputs: channel.IAuxiliaryOutput[]
 property channel.IAuxiliaryCommitmentContext.perCommitmentPoint: Buffer
 property channel.IAuxiliaryCommitmentContext.remoteAssetBalance: bigint
+method channel.IAuxiliaryCommitmentContext.resolveSecondLevelRevocationKey?(transaction: bitcoinjs-lib#Transaction): Buffer | undefined
 property channel.IAuxiliaryCommitmentContext.side: 'local' | 'remote'
 property channel.IAuxiliaryCommitmentContext.signedLocal: boolean
 property channel.IAuxiliaryCommitmentContext.state: channel.IChannelState
@@ -1678,7 +1689,10 @@ property channel.IAuxiliaryCommitmentData.customData: Buffer
 property channel.IAuxiliaryCommitmentData.htlcOutputIndexes?: Map<string, number>
 property channel.IAuxiliaryCommitmentData.outputLeaves: Map<number, script.ITaprootAuxLeaf>
 property channel.IAuxiliaryCommitmentData.peerSignatures?: Map<bigint, Buffer>
+property channel.IAuxiliaryCommitmentData.secondLevelCommitmentTxid?: string
 property channel.IAuxiliaryCommitmentData.secondLevelLeaves: Map<string, script.ITaprootAuxLeaf>
+property channel.IAuxiliaryCommitmentData.secondLevelRevocationBasepoint?: Buffer
+property channel.IAuxiliaryCommitmentData.secondLevelRevocationKey?: Buffer
 interface channel.IAuxiliaryForwardContext
 property channel.IAuxiliaryForwardContext.amountToForwardMsat: bigint
 property channel.IAuxiliaryForwardContext.incomingChannelId: Buffer
@@ -1744,6 +1758,22 @@ property channel.IAuxiliaryPayment.channelId: Buffer
 property channel.IAuxiliaryPayment.customRecords: message.CustomRecords
 property channel.IAuxiliaryPayment.expectedHtlcId?: bigint
 property channel.IAuxiliaryPayment.wireAmountMsat: bigint
+interface channel.IAuxiliaryRevokedChildContext
+property channel.IAuxiliaryRevokedChildContext.childTemplate: bitcoinjs-lib#Transaction
+property channel.IAuxiliaryRevokedChildContext.cltvExpiry: number
+property channel.IAuxiliaryRevokedChildContext.commitmentData: Buffer
+property channel.IAuxiliaryRevokedChildContext.commitmentNumber: bigint
+property channel.IAuxiliaryRevokedChildContext.commitmentTransaction: bitcoinjs-lib#Transaction
+property channel.IAuxiliaryRevokedChildContext.direction: channel.HtlcDirection
+property channel.IAuxiliaryRevokedChildContext.firstLevelRevocationKey: Buffer
+property channel.IAuxiliaryRevokedChildContext.htlcControlBlock: Buffer
+property channel.IAuxiliaryRevokedChildContext.htlcId: bigint
+property channel.IAuxiliaryRevokedChildContext.htlcLeafScript: Buffer
+property channel.IAuxiliaryRevokedChildContext.paymentHash: Buffer
+property channel.IAuxiliaryRevokedChildContext.secondLevelRevocationKey: Buffer
+method channel.IAuxiliaryRevokedChildContext.sign(request: channel.IAuxiliarySweepSigningRequest): Buffer
+property channel.IAuxiliaryRevokedChildContext.sourceOutputIndex: number
+property channel.IAuxiliaryRevokedChildContext.state: channel.IChannelState
 interface channel.IAuxiliaryShutdown
 property channel.IAuxiliaryShutdown.customRecords: message.CustomRecords
 property channel.IAuxiliaryShutdown.scriptPubkey: Buffer
@@ -1757,6 +1787,7 @@ interface channel.IAuxiliarySweepContext
 property channel.IAuxiliarySweepContext.commitmentNumber: bigint
 property channel.IAuxiliarySweepContext.destinationScript: Buffer
 property channel.IAuxiliarySweepContext.inputs: channel.IAuxiliarySweepInput[]
+property channel.IAuxiliarySweepContext.secondLevelRevocationKey?: Buffer
 property channel.IAuxiliarySweepContext.side: 'local' | 'remote'
 method channel.IAuxiliarySweepContext.sign(request: channel.IAuxiliarySweepSigningRequest): Buffer
 property channel.IAuxiliarySweepContext.state: channel.IChannelState
@@ -1802,6 +1833,7 @@ method channel.IChannelAuxiliaryProvider.buildCommitment(context: channel.IAuxil
 property channel.IChannelAuxiliaryProvider.buildFunding?: channel.AuxiliaryFundingBuilder
 method channel.IChannelAuxiliaryProvider.extraCloseOutputScriptLengths?(state: Readonly<channel.IChannelState>): readonly number[]
 method channel.IChannelAuxiliaryProvider.getHtlcAmount(state: channel.IChannelState, entry: channel.IHtlcEntry): bigint
+method channel.IChannelAuxiliaryProvider.prepareRevokedChild?(context: channel.IAuxiliaryRevokedChildContext): Buffer
 method channel.IChannelAuxiliaryProvider.prepareShutdown(state: channel.IChannelState, destinationScript: Buffer, signer: keys.ISigner): channel.IAuxiliaryShutdown
 method channel.IChannelAuxiliaryProvider.prepareSweep?(context: channel.IAuxiliarySweepContext): channel.IAuxiliarySweepResult
 method channel.IChannelAuxiliaryProvider.signHtlcs(context: channel.IAuxiliarySigningContext, signer: keys.ISigner): message.CustomRecords
@@ -1812,6 +1844,7 @@ method channel.IChannelAuxiliaryProvider.verifyShutdown(state: channel.IChannelS
 interface channel.IChannelAuxiliaryState
 property channel.IChannelAuxiliaryState.acceptedClosingSigned?: Buffer
 property channel.IChannelAuxiliaryState.channelData: Buffer
+property channel.IChannelAuxiliaryState.childRevocationBasepoints?: Map<string, Buffer>
 property channel.IChannelAuxiliaryState.closeTransactions?: Map<string, Buffer>
 property channel.IChannelAuxiliaryState.localBalance: bigint
 property channel.IChannelAuxiliaryState.localCommitments: Map<bigint, channel.IAuxiliaryCommitmentData>
@@ -1842,6 +1875,7 @@ property channel.IChannelManagerConfig.delayedPaymentBasepointSecret?: Buffer
 property channel.IChannelManagerConfig.durabilityBarrier?: channel.IWireDurabilityBarrier
 property channel.IChannelManagerConfig.fforVoucherLookup?: (paymentHash: string) => ffor.IFforVoucherArchive | undefined
 property channel.IChannelManagerConfig.getClosingFeeratePerKw?: () => number | undefined
+property channel.IChannelManagerConfig.hasAuxiliarySweepConflict?: (check: IAuxiliaryFeeSourceCheck) => Promise<boolean>
 property channel.IChannelManagerConfig.hasResumableChannelRow?: (channelId: Buffer) => boolean
 property channel.IChannelManagerConfig.htlcBasepointSecret?: Buffer
 property channel.IChannelManagerConfig.isMonitorPersisted?: (channelIdHex: string) => boolean
@@ -2425,12 +2459,15 @@ method channel.ZeroConfManager.removeTrustedPeer(pubkeyHex: string): void
 method channel.ZeroConfManager.setFforFundingClient(peer: string, enabled: boolean): void
 method channel.ZeroConfManager.setJitClients(pubkeyHexes: Iterable<string>): void
 method channel.ZeroConfManager.shouldUseZeroConf(peerPubkeyHex: string, requestedZeroConf: boolean): boolean
+function channel.acceptChildRevocationRecord(state: channel.IChannelState, records?: message.CustomRecords, transaction?: bitcoinjs-lib#Transaction): void
+function channel.addChildRevocationRecord(state: channel.IChannelState, transaction: bitcoinjs-lib#Transaction, data: channel.IAuxiliaryCommitmentData | undefined, records?: message.CustomRecords): message.CustomRecords | undefined
 function channel.aggregateLocalCommitmentSig(state: channel.IChannelState, signer: keys.ISigner, ourPublicNonce: Uint8Array, theirPublicNonce: Buffer, theirPartialSig: Buffer, localPerCommitmentPoint: Buffer, commitmentNumber?: bigint): Buffer
 function channel.applyAuxiliaryFunding(state: channel.IChannelState, descriptor: channel.IAuxiliaryFundingDescriptor): void
 function channel.assetHtlcSighashType(channelType: Buffer | null | undefined): 0x81 | 0x83
 function channel.buildLocalCommitment(state: channel.IChannelState, perCommitmentPoint: Buffer, commitmentNumber?: bigint, signedLocal?: boolean): channel.IBuiltCommitment
 function channel.buildRemoteCommitment(state: channel.IChannelState, remotePerCommitmentPoint: Buffer, commitmentNumber?: bigint): channel.IBuiltCommitment
 function channel.calculateCommitmentFee(feeratePerKw: number, numUntrimmedHtlcs: number, isAnchor?: boolean, isTaproot?: boolean): bigint
+function channel.childRevocationBasepoint(seed: Buffer, transaction: bitcoinjs-lib#Transaction): Buffer
 function channel.copyAuxiliaryCommitment(data: channel.IAuxiliaryCommitmentData): channel.IAuxiliaryCommitmentData
 function channel.createAcceptorChannel(params: { temporaryChannelId: Buffer; localConfig?: channel.IChannelConfig; localBasepoints: keys.IChannelBasepoints; localPerCommitmentSeed: Buffer; }): channel.Channel
 function channel.createAcceptorState(params: { temporaryChannelId: Buffer; fundingSatoshis: bigint; pushMsat: bigint; localConfig: channel.IChannelConfig; localBasepoints: keys.IChannelBasepoints; localPerCommitmentSeed: Buffer; remoteBasepoints: keys.IChannelBasepoints; remoteConfig: channel.IChannelConfig; }): channel.IChannelState
@@ -2458,6 +2495,7 @@ function channel.isAnchorChannel(channelType: Buffer | null): boolean
 function channel.isFixedAssetHtlcChannel(channelType: Buffer | null | undefined): boolean
 function channel.isOverlayChannel(channelType: Buffer | null | undefined): boolean
 function channel.isRecencyUnproven(state: { restoreRecencyUnproven?: boolean; reestablishRecencyUnproven?: boolean; reestablishSecretMissing?: boolean; }): boolean
+function channel.isRevokedChildCustodyChannel(channelType: Buffer | null | undefined): boolean
 function channel.isTaprootChannel(channelType: Buffer | null): boolean
 function channel.isValidShutdownScript(script: Buffer, allowAnySegwit?: boolean, allowOpReturn?: boolean): boolean
 function channel.mustNotBroadcastCommitment(state: { dataLossDetected?: boolean; stateUncertain?: boolean; restoreRevokedRisk?: boolean; }): boolean
@@ -2466,8 +2504,11 @@ function channel.rbfFeerateFloor(previousFeeratePerkw: number): number
 function channel.receivedAddIrrevocablyCommitted(entry: channel.IHtlcEntry): boolean
 function channel.recencyHoldOrigin(state: { restoreRecencyUnproven?: boolean; reestablishRecencyUnproven?: boolean; reestablishSecretMissing?: boolean; }): channel.RecencyHoldOrigin | null
 function channel.requireAuxiliaryProvider(state: channel.IChannelState): channel.IChannelAuxiliaryProvider
+function channel.resolveChildRevocationKey(state: channel.IChannelState, side: 'local' | 'remote', perCommitmentPoint: Buffer, transaction: bitcoinjs-lib#Transaction): { basepoint: Buffer; publicKey: Buffer; } | undefined
 function channel.retainFundingEpoch(state: channel.IChannelState): void
+function channel.revokedChildPrivateKey(seed: Buffer, transaction: bitcoinjs-lib#Transaction | string, perCommitmentSecret: Buffer): Buffer
 function channel.scidAliasAnnounceRefusal(channelType: Buffer | null | undefined, announceChannel: boolean): string | null
+function channel.secondLevelRevocationKey(state: channel.IChannelState, data: channel.IAuxiliaryCommitmentData | undefined, fallback: Buffer, assetAmount: bigint | undefined, transaction?: bitcoinjs-lib#Transaction): Buffer
 function channel.selectFundingEpoch(state: channel.IChannelState, fundingTxid: Buffer, fundingOutputIndex: number): channel.IChannelState
 function channel.selectFundingEpochForTransaction(state: channel.IChannelState, transaction: { ins: readonly { hash: Buffer; index: number; }[]; }): channel.IChannelState
 function channel.serializeFundingEpoch(epoch: channel.IFundingEpoch): { channelType: string | undefined; fundingTxid: string; fundingOutputIndex: number; fundingSatoshis: string; localBalanceMsat: string; remoteBalanceMsat: string; localFundingPubkey: string; remoteFundingPubkey: string; fundingTaprootMerkleRoot: string | undefined; taprootNonceDomain: string | undefined; auxiliaryState: ISerializedAuxiliaryState | undefined; localCommitmentNumber: string | undefined; remoteCommitmentSignature: string | undefined; remoteSigningNonce: string | undefined; remoteHtlcSignatures: string[] | undefined; remoteCurrentPerCommitmentPoint: string | undefined; htlcs: storage.ISerializedHtlcEntry[] | undefined; signedLocalRemovals: storage.ISerializedHtlcEntry[] | undefined; commitmentFeeratePerkw: number | undefined; lastSignedCommitFeeratePerKw: number | undefined; }
@@ -3341,6 +3382,7 @@ member features.Feature.GOSSIP_QUERIES_EX = 10
 member features.Feature.KEYSEND = 54
 member features.Feature.LARGE_CHANNELS = 18
 member features.Feature.ONION_MESSAGES = 38
+member features.Feature.OPTION_ASSET_CHILD_CUSTODY = 452
 member features.Feature.OPTION_ASSET_FIXED_HTLC_OUTPUTS = 450
 member features.Feature.OPTION_FF_ASSET = 448
 member features.Feature.OPTION_FF_CONCURRENT = 442
@@ -9636,8 +9678,36 @@ member watchtower.CreateSessionCode.REJECT_BLOB_TYPE = 64
 member watchtower.CreateSessionCode.REJECT_MAX_UPDATES = 61
 member watchtower.CreateSessionCode.REJECT_REWARD_RATE = 62
 member watchtower.CreateSessionCode.REJECT_SWEEP_FEE_RATE = 63
+interface watchtower.IAuxiliaryChildRemedyContext
+property watchtower.IAuxiliaryChildRemedyContext.capsule: Buffer
+property watchtower.IAuxiliaryChildRemedyContext.childTransaction: bitcoinjs-lib#Transaction
+property watchtower.IAuxiliaryChildRemedyContext.secondLevelRevocationKey: Buffer
+method watchtower.IAuxiliaryChildRemedyContext.sign(request: channel.IAuxiliarySweepSigningRequest): Buffer
+property watchtower.IAuxiliaryChildRemedyContext.transaction: bitcoinjs-lib#Transaction
+interface watchtower.IAuxiliaryJusticeChild
+property watchtower.IAuxiliaryJusticeChild.auxiliaryLeaf: { script: string; leafVersion: number; }
+property watchtower.IAuxiliaryJusticeChild.capsule: string
+property watchtower.IAuxiliaryJusticeChild.childTemplate: string
+property watchtower.IAuxiliaryJusticeChild.cltvExpiry: number
+property watchtower.IAuxiliaryJusticeChild.delayedPubkey: string
+property watchtower.IAuxiliaryJusticeChild.direction: channel.HtlcDirection
+property watchtower.IAuxiliaryJusticeChild.htlcControlBlock: string
+property watchtower.IAuxiliaryJusticeChild.htlcId: string
+property watchtower.IAuxiliaryJusticeChild.htlcLeafScript: string
+property watchtower.IAuxiliaryJusticeChild.id: string
+property watchtower.IAuxiliaryJusticeChild.localHtlcPubkey: string
+property watchtower.IAuxiliaryJusticeChild.paymentHash: string
+property watchtower.IAuxiliaryJusticeChild.perCommitmentPoint: string
+property watchtower.IAuxiliaryJusticeChild.remoteHtlcPubkey: string
+property watchtower.IAuxiliaryJusticeChild.revocationBasepoint: string
+property watchtower.IAuxiliaryJusticeChild.revocationPrivateKey: string
+property watchtower.IAuxiliaryJusticeChild.revocationPubkey: string
+property watchtower.IAuxiliaryJusticeChild.sourceOutputIndex: number
+property watchtower.IAuxiliaryJusticeChild.toSelfDelay: number
+property watchtower.IAuxiliaryJusticeChild.version: 1
 interface watchtower.IAuxiliaryJusticePackage
 property watchtower.IAuxiliaryJusticePackage.channelId: string
+property watchtower.IAuxiliaryJusticePackage.childCustody?: watchtower.IAuxiliaryJusticeChild[]
 property watchtower.IAuxiliaryJusticePackage.commitmentData: string
 property watchtower.IAuxiliaryJusticePackage.commitmentNumber: string
 property watchtower.IAuxiliaryJusticePackage.revokedTransaction: string
@@ -9820,6 +9890,8 @@ member watchtower.WtMessageType.STATE_UPDATE_REPLY = 605
 function watchtower.blobTypeForChannel(isAnchor: boolean, isTaproot?: boolean): watchtower.BlobType
 function watchtower.breachHintFromTxid(txidInternal: Buffer): Buffer
 function watchtower.breachKeyFromTxid(txidInternal: Buffer): Buffer
+function watchtower.buildAuxiliaryChildRemedy(parent: bitcoinjs-lib#Transaction, authority: watchtower.IAuxiliaryJusticeChild, child: bitcoinjs-lib#Transaction, prevoutScripts: readonly Buffer[], prepare: (context: watchtower.IAuxiliaryChildRemedyContext) => channel.IAuxiliarySweepResult, prevoutValues?: readonly number[]): { transaction: string; auxiliaryData: string; csvDelay: 0; feeSponsorship: { type: 'all-anyonecanpay'; prevoutScript: string; prevoutValue: string; }; }
+function watchtower.buildAuxiliaryJusticeChildren(state: channel.IChannelState, parent: bitcoinjs-lib#Transaction, number: bigint, revocationBasepointSecret: Buffer): watchtower.IAuxiliaryJusticeChild[]
 function watchtower.buildAuxiliaryJusticePackage(options: { state: channel.IChannelState; revokedTransaction: Buffer; destinationScript: Buffer; feeRates: readonly number[]; revocationBasepointSecret: Buffer; paymentBasepointSecret: Buffer; network: bitcoinjs-lib#Network; revealedSecret?: Buffer; }): watchtower.IAuxiliaryJusticePackage
 function watchtower.buildJusticeBackup(ctx: watchtower.IJusticeContext, policy: watchtower.ISessionPolicy): watchtower.IJusticeBackup
 function watchtower.chainHashForNetwork(network: bitcoinjs-lib#Network): Buffer
@@ -9848,5 +9920,7 @@ function watchtower.encodeStateUpdateReply(msg: watchtower.IWtStateUpdateReply):
 function watchtower.encryptAuxiliaryJusticePackage(value: watchtower.IAuxiliaryJusticePackage): Buffer
 function watchtower.encryptJusticeKitV0(kit: watchtower.IJusticeKitV0, key: Buffer): Buffer
 function watchtower.encryptJusticeKitV1(kit: watchtower.IJusticeKitV1, key: Buffer): Buffer
+function watchtower.matchAuxiliaryJusticeChild(parent: bitcoinjs-lib#Transaction, authority: watchtower.IAuxiliaryJusticeChild, child: bitcoinjs-lib#Transaction, prevoutScripts: readonly Buffer[], prevoutValues?: readonly number[]): boolean
 function watchtower.parseTowerUri(uri: string): watchtower.ITowerAddress
+function watchtower.validateAuxiliaryJusticeChild(parent: bitcoinjs-lib#Transaction, value: watchtower.IAuxiliaryJusticeChild): void
 function watchtower.validateAuxiliaryJusticePackage(value: unknown): watchtower.IAuxiliaryJusticePackage

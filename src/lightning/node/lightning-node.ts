@@ -451,6 +451,7 @@ import {
 	computeScriptHash
 } from '../chain/chain-watcher';
 import { signP2wpkhInput } from '../chain/sweep';
+import { hasAuxiliaryFeeSourceConflict } from '../chain/auxiliary-fee-source';
 import { isDuplicateBroadcastRejection } from '../chain/broadcast-rejection';
 import type { ISweepUneconomicChainAction } from '../chain/types';
 import {
@@ -2147,6 +2148,22 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			localFeatures.clearBit(2026);
 		}
 		if (
+			config.auxiliaryChannels?.allowRevokedChildCustody === true &&
+			!config.auxiliaryChannels.provider.prepareRevokedChild
+		)
+			throw new Error(
+				'Child custody requires an asset recovery capsule provider'
+			);
+		if (
+			config.auxiliaryChannels?.allowRevokedChildCustody === true &&
+			localFeatures.hasFeature(Feature.OPTION_ASSET_FIXED_HTLC_OUTPUTS)
+		)
+			localFeatures.setOptional(Feature.OPTION_ASSET_CHILD_CUSTODY);
+		else {
+			localFeatures.clearBit(Feature.OPTION_ASSET_CHILD_CUSTODY);
+			localFeatures.clearBit(Feature.OPTION_ASSET_CHILD_CUSTODY + 1);
+		}
+		if (
 			config.auxiliaryChannels?.provider.validateFforAssetTerms &&
 			localFeatures.hasFeature(Feature.OPTION_FF_RECEIVE) &&
 			localFeatures.hasFeature(Feature.OPTION_FF_CONCURRENT)
@@ -2170,6 +2187,10 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				(!this.dirtyMonitors.has(id) &&
 					!this.monitorsAwaitingChannel.has(id) &&
 					!this.openTransitions.includes(id)),
+			hasAuxiliarySweepConflict: async (check): Promise<boolean> =>
+				this._chainBackend
+					? hasAuxiliaryFeeSourceConflict(this._chainBackend, check)
+					: false,
 			fforVoucherLookup:
 				this.storage && !this.storage.loadAllFforVouchers
 					? undefined
@@ -9708,7 +9729,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		}
 	}
 
-	/** Fully signed asset remedies. No signing secrets leave the native node. */
+	/** Fully signed remedies, with independently scoped child authority only in negotiated custody mode. */
 	buildAuxiliaryJusticePackage(
 		channelId: Buffer,
 		revokedTransaction: Buffer,
@@ -18444,7 +18465,13 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			description: options.description,
 			descriptionHash: options.descriptionHash,
 			paymentHash,
-			paymentSecret,
+			// Blinded receivers recover the secret from encrypted path_id. A
+			// public s tag makes other implementations attach payment_data,
+			// which is forbidden in a blinded final-hop payload.
+			paymentSecret:
+				!useBlinded || options.includeCleartextHintsWithBlinded
+					? paymentSecret
+					: undefined,
 			expiry: options.expiry ?? DEFAULT_EXPIRY,
 			minFinalCltvExpiry:
 				options.minFinalCltvExpiry ?? DEFAULT_MIN_FINAL_CLTV_EXPIRY,
@@ -18905,10 +18932,8 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			return payment;
 		}
 
-		// BOLT 11 payer MUSTs: fail the payment when the invoice requires a
-		// feature we do not understand (unknown even bit in the `9` field), and
-		// never pay a secretless invoice (payment_secret is compulsory; without
-		// it any forwarding node can probe or steal an amount-adjusted payment).
+		// Refuse unknown required invoice features. Plain payments require the
+		// public secret; blinded payments carry it in the encrypted path_id.
 		if (invoice.featureBits) {
 			for (const bit of invoice.featureBits.listSetBits()) {
 				if (bit % 2 === 0 && !PAYER_UNDERSTOOD_INVOICE_FEATURES.has(bit)) {
@@ -18919,7 +18944,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				}
 			}
 		}
-		if (!invoice.paymentSecret) {
+		if (!invoice.paymentSecret && !invoice.blindedPaths?.length) {
 			throw new LightningPaymentError(
 				LightningErrorCode.INVALID_INVOICE,
 				'Invoice has no payment secret (s field); refusing to pay'
@@ -19129,7 +19154,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		route: IRoute,
 		paymentHash: Buffer,
 		finalCltvExpiry: number,
-		paymentSecret: Buffer,
+		paymentSecret: Buffer | undefined,
 		paymentAmountMsat: bigint,
 		context: IPaymentRetryContext,
 		metadata?: Record<string, string>

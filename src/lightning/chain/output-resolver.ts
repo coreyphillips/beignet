@@ -1,4 +1,8 @@
 import {
+	secondLevelRevocationKey,
+	revokedChildPrivateKey
+} from '../channel/child-revocation';
+import {
 	selectFundingEpoch,
 	selectFundingEpochForTransaction
 } from '../channel/funding-state';
@@ -202,7 +206,12 @@ function matchSecondLevelTree(
 	];
 	for (const [key, leaf] of candidates) {
 		const tree = buildTaprootSecondLevelOutput(
-			keys.revocationPubkey,
+			secondLevelRevocationKey(
+				state,
+				view,
+				keys.revocationPubkey,
+				leaf ? 1n : 0n
+			),
 			keys.delayedPubkey,
 			keys.toSelfDelay,
 			network,
@@ -227,6 +236,7 @@ interface IPrivateSweepInput
 	extends Omit<IAuxiliarySweepInput, 'transactionInputIndex' | 'publicKey'> {
 	output: ITrackedOutput;
 	privateKey: Buffer;
+	additionalPrivateKeys?: Buffer[];
 }
 
 /** Prepare asset provenance before signing the Bitcoin transaction. */
@@ -259,7 +269,9 @@ function prepareAuxiliarySweep(
 		);
 	const descriptors: IAuxiliarySweepInput[] = inputs.map(
 		(input, transactionInputIndex) => {
-			const { privateKey, output, ...descriptor } = input;
+			const { privateKey, additionalPrivateKeys, output, ...descriptor } =
+				input;
+			void additionalPrivateKeys;
 			return {
 				...descriptor,
 				transactionInputIndex,
@@ -280,17 +292,17 @@ function prepareAuxiliarySweep(
 	);
 	const sign = (request: IAuxiliarySweepSigningRequest): Buffer => {
 		const descriptor = descriptors[request.transactionInputIndex];
-		if (
-			!descriptor ||
-			!descriptor.publicKey.equals(request.publicKey) ||
-			request.sigHash.length !== 32
-		)
+		const pin = inputs[request.transactionInputIndex];
+		const matchingKey =
+			pin &&
+			[pin.privateKey, ...(pin.additionalPrivateKeys ?? [])].find((key) =>
+				Buffer.from(ecc.pointFromScalar(key, true)!).equals(request.publicKey)
+			);
+		if (!descriptor || !matchingKey || request.sigHash.length !== 32)
 			throw new Error(
 				'Asset sweep requested an unrelated signing key or invalid digest'
 			);
-		let privateKey = Buffer.from(
-			inputs[request.transactionInputIndex].privateKey
-		);
+		let privateKey = Buffer.from(matchingKey);
 		if (request.singleTweak) {
 			if (request.singleTweak.length !== 32)
 				throw new Error('Invalid asset sweep key tweak');
@@ -309,6 +321,10 @@ function prepareAuxiliarySweep(
 		return signTaprootHtlcLeaf(request.sigHash, privateKey);
 	};
 	const result = provider.prepareSweep({
+		secondLevelRevocationKey: (isOurs
+			? state.auxiliaryState.localCommitments
+			: state.auxiliaryState.remoteCommitments
+		).get(height)?.secondLevelRevocationKey,
 		state,
 		side: isOurs ? 'local' : 'remote',
 		commitmentNumber: height,
@@ -2736,7 +2752,14 @@ function resolveOurTaprootCommitmentOutputs(
 			// the sweep is invalid (stranding the second-level funds on rebuild).
 			const toLocal = output.isSecondLevelHtlc
 				? buildTaprootSecondLevelOutput(
-						keys.revocationPubkey,
+						secondLevelRevocationKey(
+							state,
+							state.auxiliaryState?.localCommitments.get(commitmentNumber),
+							keys.revocationPubkey,
+							secondLevelAuxiliaryLeaf(state, true, commitmentNumber, output)
+								? 1n
+								: 0n
+						),
 						keys.delayedPubkey,
 						toSelfDelay,
 						undefined,
@@ -2880,7 +2903,14 @@ function resolveOurTaprootCommitmentOutputs(
 				output.outputIndex,
 				output.amount,
 				output.cltvExpiry || 0,
-				keys.revocationPubkey,
+				secondLevelRevocationKey(
+					state,
+					state.auxiliaryState?.localCommitments.get(commitmentNumber),
+					keys.revocationPubkey,
+					secondLevelAuxiliaryLeaf(state, true, commitmentNumber, output)
+						? 1n
+						: 0n
+				),
 				keys.delayedPubkey,
 				toSelfDelay,
 				undefined,
@@ -2962,7 +2992,14 @@ function resolveOurTaprootCommitmentOutputs(
 				output.txid,
 				output.outputIndex,
 				output.amount,
-				keys.revocationPubkey,
+				secondLevelRevocationKey(
+					state,
+					state.auxiliaryState?.localCommitments.get(commitmentNumber),
+					keys.revocationPubkey,
+					secondLevelAuxiliaryLeaf(state, true, commitmentNumber, output)
+						? 1n
+						: 0n
+				),
 				keys.delayedPubkey,
 				toSelfDelay,
 				undefined,
@@ -4707,6 +4744,34 @@ export function resolveRevokedSecondLevelOutput(
 				network
 			);
 			if (!match) continue;
+			let childPrivateKey = revocationPrivkey;
+			const childView =
+				state.auxiliaryState?.remoteCommitments.get(commitmentNumber);
+			if (match.htlcId !== undefined && childView?.secondLevelRevocationKey) {
+				const sourceIndex = childView.htlcOutputIndexes?.get(
+					`${match.auxiliaryHtlcDirection}:${match.htlcId}`
+				);
+				const source = spendingTx.ins.find(
+					(input) =>
+						Buffer.from(input.hash).reverse().toString('hex') ===
+							childView.secondLevelCommitmentTxid && input.index === sourceIndex
+				);
+				if (!source)
+					throw new Error(
+						'Revoked child does not spend its authenticated commitment'
+					);
+				childPrivateKey = revokedChildPrivateKey(
+					state.localPerCommitmentSeed,
+					childView.secondLevelCommitmentTxid!,
+					perCommitmentSecret
+				);
+				if (
+					!Buffer.from(ecc.pointFromScalar(childPrivateKey, true)!).equals(
+						childView.secondLevelRevocationKey
+					)
+				)
+					throw new Error('Revoked child custody key changed');
+			}
 			const sl = match.tree;
 			const merkleRoot = sl.merkleRoot;
 			const amount = BigInt(out.value);
@@ -4755,7 +4820,8 @@ export function resolveRevokedSecondLevelOutput(
 						output: trackedOutput,
 						commitmentOutputIndex: i,
 						kind: 'second_level_revocation',
-						privateKey: revocationPrivkey,
+						privateKey: childPrivateKey,
+						additionalPrivateKeys: [revocationPrivkey],
 						sourceTransaction: spendingTx
 					}
 				],
@@ -4767,7 +4833,7 @@ export function resolveRevokedSecondLevelOutput(
 				[Number(amount)],
 				bitcoin.Transaction.SIGHASH_DEFAULT
 			);
-			const tweaked = tweakTaprootKeyPathPrivkey(revocationPrivkey, merkleRoot);
+			const tweaked = tweakTaprootKeyPathPrivkey(childPrivateKey, merkleRoot);
 			const witness = [signTaprootHtlcLeaf(sighash, tweaked)];
 			claimTx.setWitness(0, witness);
 			resolved.push({
@@ -4781,7 +4847,8 @@ export function resolveRevokedSecondLevelOutput(
 									output: trackedOutput,
 									commitmentOutputIndex: i,
 									kind: 'second_level_revocation',
-									privateKey: revocationPrivkey,
+									privateKey: childPrivateKey,
+									additionalPrivateKeys: [revocationPrivkey],
 									sourceTransaction: spendingTx
 								}
 							],

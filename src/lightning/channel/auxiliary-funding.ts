@@ -77,6 +77,8 @@ export interface IAuxiliaryForwardPlacement extends IAuxiliaryForwardContext {
 }
 
 export interface IAuxiliaryChannelConfig {
+	/** Explicitly permit delegated Bitcoin and asset custody for independently scoped revoked HTLC children. */
+	allowRevokedChildCustody?: boolean;
 	/** Explicit new-channel compatibility for peers lacking native fixed-output HTLCs. */
 	allowLegacyHtlcSignatures?(peerPubkey: string): boolean;
 	resolveInteractiveFunding?(

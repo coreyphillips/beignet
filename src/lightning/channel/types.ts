@@ -60,6 +60,18 @@ export function isFixedAssetHtlcChannel(
 	);
 }
 
+/** Explicit optional custody for asset-bearing children of a revoked commitment. */
+export function isRevokedChildCustodyChannel(
+	channelType: Buffer | null | undefined
+): boolean {
+	return (
+		isFixedAssetHtlcChannel(channelType) &&
+		FeatureFlags.fromBuffer(channelType!).hasBit(
+			Feature.OPTION_ASSET_CHILD_CUSTODY
+		)
+	);
+}
+
 /** Bitcoin HTLC signature mode encoded implicitly by the negotiated channel type. */
 export function assetHtlcSighashType(
 	channelType: Buffer | null | undefined
@@ -142,8 +154,19 @@ export function validateV2ChannelType(
 		allowed.setCompulsory(Feature.OPTION_TAPROOT_OVERLAY);
 		if (isOverlayChannel(channelType))
 			allowed.setCompulsory(Feature.OPTION_ASSET_FIXED_HTLC_OUTPUTS);
+		if (isOverlayChannel(channelType))
+			allowed.setCompulsory(Feature.OPTION_ASSET_CHILD_CUSTODY);
 	}
 	const mask = allowed.toBuffer();
+	if (
+		flags.hasFeature(Feature.OPTION_ASSET_CHILD_CUSTODY) &&
+		(!isFixedAssetHtlcChannel(channelType) ||
+			(localFeatures &&
+				!localFeatures.hasFeature(Feature.OPTION_ASSET_CHILD_CUSTODY)) ||
+			(remoteFeatures &&
+				!remoteFeatures.hasFeature(Feature.OPTION_ASSET_CHILD_CUSTODY)))
+	)
+		return 'Asset child custody was not mutually negotiated';
 	if (flags.hasFeature(Feature.OPTION_ASSET_FIXED_HTLC_OUTPUTS)) {
 		if (!isOverlayChannel(channelType))
 			return 'Fixed HTLC outputs require an asset overlay channel';

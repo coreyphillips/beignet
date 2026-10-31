@@ -1,4 +1,8 @@
 import {
+	acceptChildRevocationRecord,
+	addChildRevocationRecord
+} from './child-revocation';
+import {
 	auxiliaryClosingWeight,
 	auxiliaryClosingRelayProfile
 } from './auxiliary-close';
@@ -1841,7 +1845,8 @@ export class Channel {
 		chainHash?: Buffer,
 		preferAnchors?: boolean,
 		preferTaproot?: boolean,
-		fixedAssetHtlcOutputs = false
+		fixedAssetHtlcOutputs = false,
+		revokedChildCustody = false
 	): ChannelAction[] {
 		if (this._state.state !== ChannelState.NONE) {
 			return [
@@ -1899,6 +1904,11 @@ export class Channel {
 			channelTypeFlags.setCompulsory(Feature.OPTION_TAPROOT_OVERLAY);
 			if (fixedAssetHtlcOutputs)
 				channelTypeFlags.setCompulsory(Feature.OPTION_ASSET_FIXED_HTLC_OUTPUTS);
+			if (revokedChildCustody) {
+				if (!fixedAssetHtlcOutputs)
+					throw new Error('Child custody requires fixed asset HTLC outputs');
+				channelTypeFlags.setCompulsory(Feature.OPTION_ASSET_CHILD_CUSTODY);
+			}
 		} else if (preferTaproot) {
 			channelTypeFlags.setCompulsory(Feature.OPTION_TAPROOT);
 		} else {
@@ -5400,6 +5410,13 @@ export class Channel {
 			);
 		}
 
+		if (auxiliaryCommitment)
+			auxiliaryRecords = addChildRevocationRecord(
+				this._state,
+				auxiliaryCommitment.result.tx,
+				auxiliaryCommitment.auxiliary,
+				auxiliaryRecords
+			);
 		const msg: ICommitmentSignedMessage = {
 			customRecords: auxiliaryRecords,
 			channelId: this._state.channelId!,
@@ -5760,6 +5777,14 @@ export class Channel {
 			];
 		}
 
+		try {
+			acceptChildRevocationRecord(this._state, msg.customRecords);
+		} catch {
+			return this._failChannelWithWireError(
+				'Invalid child custody authorization'
+			);
+		}
+
 		// Sign-time backstop of the funder-fee guards (issue #1020): never
 		// accept a signature over a commitment of ours whose fee has trimmed
 		// our to_local. Before either verifying arm, so no state is written
@@ -5784,6 +5809,11 @@ export class Channel {
 			);
 			try {
 				const commitment = buildLocalCommitment(this._state, point, number);
+				acceptChildRevocationRecord(
+					this._state,
+					msg.customRecords,
+					commitment.result.tx
+				);
 				if (
 					!requireAuxiliaryProvider(this._state).verifyHtlcs(
 						{
@@ -14518,6 +14548,12 @@ export class Channel {
 				copyAuxiliaryCommitment(built.auxiliary)
 			);
 		}
+		customRecords = addChildRevocationRecord(
+			view,
+			built.result.tx,
+			built.auxiliary,
+			customRecords
+		);
 		return {
 			customRecords,
 			partial: Buffer.from(round.ourCommitmentPartial),
@@ -14543,6 +14579,11 @@ export class Channel {
 				!round.remoteSigningNonce?.equals(partial.subarray(32)))
 		)
 			return false;
+		try {
+			acceptChildRevocationRecord(view, msg.customRecords);
+		} catch {
+			return false;
+		}
 		const point = getPerCommitmentPoint(view.localPerCommitmentSeed, height);
 		if (
 			!verifyRemoteCommitmentPartial(
@@ -14566,6 +14607,11 @@ export class Channel {
 			return false;
 		if (view.auxiliaryState) {
 			const built = buildLocalCommitment(view, point, height);
+			try {
+				acceptChildRevocationRecord(view, msg.customRecords, built.result.tx);
+			} catch {
+				return false;
+			}
 			if (
 				!built.auxiliary ||
 				!requireAuxiliaryProvider(view).verifyHtlcs(

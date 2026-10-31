@@ -38,6 +38,10 @@ export interface IAuxiliaryOutput {
 }
 
 export interface IAuxiliaryCommitmentContext {
+	/** Resolve against the completed first-level transaction; absent for unsigned local previews. */
+	resolveSecondLevelRevocationKey?(
+		transaction: bitcoin.Transaction
+	): Buffer | undefined;
 	state: IChannelState;
 	side: 'local' | 'remote';
 	commitmentNumber: bigint;
@@ -53,6 +57,9 @@ export interface IAuxiliaryCommitmentContext {
 }
 
 export interface IAuxiliaryCommitmentData {
+	secondLevelRevocationKey?: Buffer;
+	secondLevelRevocationBasepoint?: Buffer;
+	secondLevelCommitmentTxid?: string;
 	/** Complete opaque asset commitment/provenance data used to recover this view. */
 	customData: Buffer;
 	/** Keyed by the already sorted Bitcoin output index. */
@@ -74,6 +81,8 @@ export interface IAuxiliaryHtlcResolution {
 }
 
 export interface IChannelAuxiliaryState {
+	/** Source-bound peer public points received with commitment_signed. */
+	childRevocationBasepoints?: Map<string, Buffer>;
 	/** Opaque funding asset state. The provider owns its schema and validation. */
 	channelData: Buffer;
 	/** Durable terminal notifications retained until the host acknowledges them. */
@@ -142,6 +151,8 @@ export interface IAuxiliarySweepSigningRequest {
 }
 
 export interface IAuxiliarySweepContext {
+	/** Scoped child key differs from the original first-level revocation key. */
+	secondLevelRevocationKey?: Buffer;
 	state: IChannelState;
 	side: 'local' | 'remote';
 	commitmentNumber: bigint;
@@ -157,6 +168,24 @@ export interface IAuxiliarySweepResult {
 	outputScripts: ReadonlyMap<number, Buffer>;
 	/** Signed asset packets and provenance persisted with the Bitcoin sweep. */
 	customData: Buffer;
+}
+
+export interface IAuxiliaryRevokedChildContext {
+	state: IChannelState;
+	commitmentNumber: bigint;
+	commitmentTransaction: bitcoin.Transaction;
+	commitmentData: Buffer;
+	sourceOutputIndex: number;
+	htlcId: bigint;
+	direction: HtlcDirection;
+	paymentHash: Buffer;
+	cltvExpiry: number;
+	childTemplate: bitcoin.Transaction;
+	htlcLeafScript: Buffer;
+	htlcControlBlock: Buffer;
+	firstLevelRevocationKey: Buffer;
+	secondLevelRevocationKey: Buffer;
+	sign(request: IAuxiliarySweepSigningRequest): Buffer;
 }
 
 export interface IAuxiliaryCloseContext {
@@ -222,6 +251,8 @@ export interface IChannelAuxiliaryProvider {
 	buildClose(context: IAuxiliaryCloseContext): IAuxiliaryCloseResult;
 	/** Required before spending any output carrying an auxiliary asset leaf. */
 	prepareSweep?(context: IAuxiliarySweepContext): IAuxiliarySweepResult;
+	/** Pre-sign only the first-level virtual transition before delegating a revoked child. */
+	prepareRevokedChild?(context: IAuxiliaryRevokedChildContext): Buffer;
 }
 
 export function copyAuxiliaryCommitment(
@@ -233,6 +264,13 @@ export function copyAuxiliaryCommitment(
 	});
 	return {
 		customData: Buffer.from(data.customData),
+		secondLevelRevocationKey:
+			data.secondLevelRevocationKey &&
+			Buffer.from(data.secondLevelRevocationKey),
+		secondLevelRevocationBasepoint:
+			data.secondLevelRevocationBasepoint &&
+			Buffer.from(data.secondLevelRevocationBasepoint),
+		secondLevelCommitmentTxid: data.secondLevelCommitmentTxid,
 		htlcOutputIndexes: data.htlcOutputIndexes
 			? new Map(data.htlcOutputIndexes)
 			: undefined,
@@ -290,10 +328,16 @@ export function validateAuxiliaryChannelType(
 	const allowed = new Set<number>([
 		Feature.OPTION_TAPROOT_OVERLAY,
 		Feature.OPTION_ASSET_FIXED_HTLC_OUTPUTS,
+		Feature.OPTION_ASSET_CHILD_CUSTODY,
 		Feature.SCID_ALIAS,
 		Feature.ZERO_CONF
 	]);
 	const flags = FeatureFlags.fromBuffer(channelType);
+	if (
+		flags.hasFeature(Feature.OPTION_ASSET_CHILD_CUSTODY) &&
+		!flags.hasBit(Feature.OPTION_ASSET_FIXED_HTLC_OUTPUTS)
+	)
+		return 'Child custody requires fixed asset HTLC outputs';
 	if (
 		!flags.hasBit(Feature.OPTION_TAPROOT_OVERLAY) ||
 		flags.listSetBits().some((bit) => !allowed.has(bit))

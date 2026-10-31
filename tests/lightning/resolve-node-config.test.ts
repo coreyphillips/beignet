@@ -15,7 +15,7 @@ import type {
 import type { IChannelBasepoints } from '../../src/lightning/keys/derivation';
 import type { IChannelConfig } from '../../src/lightning/channel/types';
 import { Network } from '../../src/lightning/invoice/types';
-import { Feature } from '../../src/lightning/features/flags';
+import { Feature, FeatureFlags } from '../../src/lightning/features/flags';
 import type { IChannelAuxiliaryProvider } from '../../src/lightning/channel/auxiliary';
 import { noopLogger } from '../../src/logger';
 const sinon = require('sinon');
@@ -418,6 +418,44 @@ describe('LightningNode.fromMnemonic options', () => {
 				node.getLocalFeatures().hasFeature(Feature.OPTION_FF_ASSET)
 			).to.equal(enabled);
 		}
+	});
+
+	it('advertises revoked-child custody only with explicit authority and bounded fee capability', () => {
+		for (const enabled of [false, true])
+			for (const fees of [false, true]) {
+				const features = FeatureFlags.empty();
+				features.setOptional(Feature.OPTION_ASSET_CHILD_CUSTODY);
+				const node = LightningNode.fromMnemonic(MNEMONIC, {
+					localFeatures: features,
+					auxiliaryChannels: {
+						allowRevokedChildCustody: enabled,
+						provider: {
+							prepareRevokedChild: () => Buffer.from('capsule')
+						} as unknown as IChannelAuxiliaryProvider,
+						resolveIncoming: () => undefined
+					},
+					fundingProvider: {
+						supportsFixedOutputFees: () => fees,
+						buildFundingTransaction: async () => {
+							throw new Error('unused funding');
+						},
+						broadcastTransaction: async () => ''
+					}
+				});
+				nodes.push(node);
+				expect(
+					node.getLocalFeatures().hasFeature(Feature.OPTION_ASSET_CHILD_CUSTODY)
+				).equal(enabled && fees);
+			}
+		expect(() =>
+			LightningNode.fromMnemonic(MNEMONIC, {
+				auxiliaryChannels: {
+					allowRevokedChildCustody: true,
+					provider: {} as IChannelAuxiliaryProvider,
+					resolveIncoming: () => undefined
+				}
+			})
+		).to.throw('capsule provider');
 	});
 
 	it('applies the options it used to drop', () => {

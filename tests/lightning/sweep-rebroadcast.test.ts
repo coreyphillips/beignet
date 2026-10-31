@@ -404,7 +404,9 @@ describe('Sweep Re-broadcast', () => {
 
 		// Simulate the sweep being confirmed by calling handleOutputSpent
 		// This transitions the output to SPEND_CONFIRMED
-		const fakeTx = { getId: () => 'g'.repeat(64), ins: [] } as any;
+		const fakeTx = new bitcoin.Transaction();
+		fakeTx.addInput(Buffer.from('f'.repeat(64), 'hex').reverse(), 0);
+		fakeTx.addOutput(Buffer.alloc(22), 49000);
 		m.handleOutputSpent('f'.repeat(64), 0, fakeTx, 107);
 
 		// Now at block 112 (6 blocks after re-broadcast at 106), no re-broadcast

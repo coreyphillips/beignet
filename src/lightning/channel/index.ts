@@ -19,3 +19,5 @@ export * from './auxiliary-funding';
 export * from './funding-state';
 
 export * from './interactive-funding';
+
+export * from './child-revocation';

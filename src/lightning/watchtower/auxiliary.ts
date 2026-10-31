@@ -1,3 +1,8 @@
+import {
+	buildAuxiliaryJusticeChildren,
+	validateAuxiliaryJusticeChild,
+	type IAuxiliaryJusticeChild
+} from './auxiliary-child';
 import * as bitcoin from 'bitcoinjs-lib';
 import { randomBytes } from '../crypto/provider';
 import { ecc } from '../../utils/ecc';
@@ -25,6 +30,8 @@ export interface IAuxiliaryJusticePackage {
 	revokedTransaction: string;
 	commitmentNumber: string;
 	commitmentData: string;
+	/** Optional explicit custody authority for asset HTLC children of this revoked state. */
+	childCustody?: IAuxiliaryJusticeChild[];
 	sweeps: {
 		transaction: string;
 		auxiliaryData?: string;
@@ -217,10 +224,21 @@ export function validateAuxiliaryJusticePackage(
 			validateSponsorTemplate(tx, parent, sweep.feeSponsorship);
 		}
 	}
+	if (p.childCustody !== undefined) {
+		if (!Array.isArray(p.childCustody) || p.childCustody.length > 166)
+			throw new Error('Invalid child custody descriptor count');
+		const children = new Set<string>();
+		for (const child of p.childCustody) {
+			validateAuxiliaryJusticeChild(parent, child);
+			if (children.has(child.id))
+				throw new Error('Duplicate child custody descriptor');
+			children.add(child.id);
+		}
+	}
 	return p;
 }
 
-/** Construct aggregate and independent remedies without exporting signing keys. */
+/** Construct remedies and, only for negotiated custody, independently scoped child authority. */
 export function buildAuxiliaryJusticePackage(options: {
 	state: IChannelState;
 	revokedTransaction: Buffer;
@@ -378,12 +396,19 @@ export function buildAuxiliaryJusticePackage(options: {
 				`Asset justice output ${index} has no economical signed remedy`
 			);
 	}
+	const childCustody = buildAuxiliaryJusticeChildren(
+		state,
+		parent,
+		classified.commitmentNumber,
+		options.revocationBasepointSecret
+	);
 	return validateAuxiliaryJusticePackage({
 		version: 1,
 		channelId: state.channelId.toString('hex'),
 		revokedTransaction: parent.toHex(),
 		commitmentNumber: classified.commitmentNumber.toString(),
 		commitmentData: view.customData.toString('hex'),
+		...(childCustody.length ? { childCustody } : {}),
 		sweeps: [...sweeps.values()]
 	});
 }

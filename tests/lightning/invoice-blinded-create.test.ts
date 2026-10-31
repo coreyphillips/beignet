@@ -115,6 +115,8 @@ describe('createInvoice blinded paths (M1.2)', function () {
 		// ROUTE_BLINDING advertised; cleartext hints suppressed for privacy.
 		expect(inv.featureBits!.hasFeature(Feature.ROUTE_BLINDING)).to.be.true;
 		expect(inv.routingHints).to.be.undefined;
+		expect(inv.paymentSecret).to.be.undefined;
+		expect(res.paymentSecret).to.have.length(32);
 
 		node.destroy();
 	});
@@ -127,6 +129,7 @@ describe('createInvoice blinded paths (M1.2)', function () {
 			node.createInvoice({ description: 'plain', amountMsat: 100_000n }).bolt11
 		);
 		expect(inv.blindedPaths).to.be.undefined;
+		expect(inv.paymentSecret).to.have.length(32);
 		expect(inv.routingHints, 'cleartext hint present').to.have.length(1);
 
 		node.destroy();

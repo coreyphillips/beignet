@@ -1,3 +1,15 @@
+import { ChainMonitor } from '../../src/lightning/chain/chain-monitor';
+import { buildAuxiliaryJusticePackage } from '../../src/lightning/watchtower/auxiliary';
+import {
+	matchAuxiliaryJusticeChild,
+	buildAuxiliaryChildRemedy
+} from '../../src/lightning/watchtower/auxiliary-child';
+import {
+	childRevocationBasepoint,
+	acceptChildRevocationRecord,
+	CHILD_REVOCATION_RECORD
+} from '../../src/lightning/channel/child-revocation';
+import { isRevokedChildCustodyChannel } from '../../src/lightning/channel/types';
 import {
 	applyAuxiliaryClose,
 	auxiliaryClosingRelayProfile
@@ -43,7 +55,8 @@ import {
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
 import {
 	classifyOutputs,
-	resolveOurCommitmentOutputs
+	resolveOurCommitmentOutputs,
+	resolveRevokedSecondLevelOutput
 } from '../../src/lightning/chain/output-resolver';
 import { tapleafHash } from '../../src/lightning/script/htlc-taproot';
 import {
@@ -294,7 +307,7 @@ function config(
 	};
 }
 
-function pair(fixed = true) {
+function pair(fixed = true, custody = false) {
 	const descriptor = {
 		temporaryChannelId: hash('auxiliary-temporary'),
 		fundingTaprootMerkleRoot: hash('asset funding root'),
@@ -318,8 +331,15 @@ function pair(fixed = true) {
 		const features = FeatureFlags.empty();
 		features.setOptional(Feature.OPTION_TAPROOT_OVERLAY);
 		features.setOptional(Feature.OPTION_ASSET_FIXED_HTLC_OUTPUTS);
+		if (custody) features.setOptional(Feature.OPTION_ASSET_CHILD_CUSTODY);
 		for (const manager of [alice, bob]) {
 			manager['config'].localFeatures = features;
+			manager['config'].auxiliaryChannels!.allowRevokedChildCustody = custody;
+			if (custody)
+				manager['config'].auxiliaryChannels!.provider.prepareRevokedChild =
+					() => {
+						throw new Error('Unexpected custody capsule');
+					};
 			manager.setFundingProvider({
 				supportsFixedOutputFees: () => true,
 				buildFundingTransaction: async () => {
@@ -780,6 +800,453 @@ describe('native asset payment routing', function () {
 });
 
 describe('native auxiliary asset channel host', function () {
+	it('refuses custody downgrade and missing capsule capability without changing restored modes', () => {
+		const { alice, aliceChannel, aliceProvider, bobChannel } = pair(true, true);
+		const peer = bobChannel
+			.getFullState()
+			.localBasepoints.fundingPubkey.toString('hex');
+		const type = FeatureFlags.fromBuffer(
+			aliceChannel.getFullState().channelType!
+		);
+		type.clearBit(Feature.OPTION_ASSET_CHILD_CUSTODY);
+		expect(() =>
+			alice['negotiateAssetHtlcOutputs'](peer, type.toBuffer())
+		).to.throw('mutually selected');
+		delete aliceProvider.prepareRevokedChild;
+		expect(() => alice.getAuxiliaryHtlcMode(peer)).to.throw('capsule provider');
+		const restored = deserializeChannelState(
+			serializeChannelState(aliceChannel.getFullState())
+		);
+		expect(isRevokedChildCustodyChannel(restored.channelType)).equal(true);
+		const legacy = pair(true, false).aliceChannel.getFullState();
+		expect(isRevokedChildCustodyChannel(legacy.channelType)).equal(false);
+		expect(() =>
+			acceptChildRevocationRecord(
+				legacy,
+				new Map([[CHILD_REVOCATION_RECORD, Buffer.alloc(66)]])
+			)
+		).to.throw('Unnegotiated');
+	});
+	for (const offeredByAlice of [true, false])
+		it(`scopes explicit tower custody to a revoked ${
+			offeredByAlice ? 'timeout' : 'success'
+		} child and restores reordered fee variants`, () => {
+			const {
+				alice,
+				bob,
+				aliceChannel,
+				bobChannel,
+				aliceProvider,
+				bobProvider,
+				id,
+				errors
+			} = pair(true, true);
+			expect(
+				isRevokedChildCustodyChannel(aliceChannel.getFullState().channelType)
+			).equal(true);
+			const destination = bitcoin.payments.p2tr({
+				internalPubkey: getPublicKey(hash('custody destination')).subarray(1)
+			}).output!;
+			aliceProvider.prepareSweep = (context) => ({
+				outputScripts: new Map([[0, context.transaction.outs[0].script]]),
+				customData: Buffer.from('child parent transition')
+			});
+			bobProvider.prepareSweep = () => ({
+				outputScripts: new Map([[0, destination]]),
+				customData: Buffer.from('revoked asset transition')
+			});
+			bobProvider.prepareRevokedChild = (context) => {
+				const digest = hash('parent virtual digest');
+				expect(
+					ecc.verifySchnorr(
+						digest,
+						context.firstLevelRevocationKey.subarray(1),
+						context.sign({
+							transactionInputIndex: 0,
+							publicKey: context.firstLevelRevocationKey,
+							sigHash: digest
+						})
+					)
+				).equal(true);
+				expect(() =>
+					context.sign({
+						transactionInputIndex: 0,
+						publicKey: context.secondLevelRevocationKey,
+						sigHash: digest
+					})
+				).to.throw('unrelated');
+				return Buffer.from('signed parent virtual packet');
+			};
+			const preimage = hash('scoped child HTLC');
+			expect(
+				(offeredByAlice ? alice : bob).addHtlc(
+					id,
+					100_000_000n,
+					hash(preimage),
+					600000,
+					Buffer.alloc(1366),
+					undefined,
+					undefined,
+					amountRecord(75n)
+				).ok,
+				errors.join('; ')
+			).equal(true);
+			expect(errors).deep.equal([]);
+			const state = deserializeChannelState(
+				serializeChannelState(aliceChannel.getFullState())
+			);
+			const restored = new Channel(
+				state,
+				aliceChannel.getSigner() ?? undefined,
+				aliceProvider
+			);
+			const close = restored
+				.forceClose(restored.getSigner()!)
+				.find((action) => action.type === ChannelActionType.BROADCAST_TX);
+			if (close?.type !== ChannelActionType.BROADCAST_TX)
+				throw new Error('Missing commitment');
+			const parent = bitcoin.Transaction.fromBuffer(close.tx);
+			const metadata = state.auxiliaryState!.localCommitments.get(
+				state.localCommitmentNumber
+			)!;
+			expect(metadata.secondLevelCommitmentTxid).equal(parent.getId());
+			const tracked = classifyOutputs(
+				parent,
+				state,
+				CommitmentType.OUR_COMMITMENT,
+				state.localCommitmentNumber
+			);
+			const resolved = resolveOurCommitmentOutputs(
+				state,
+				tracked,
+				state.localCommitmentNumber,
+				destination,
+				1,
+				new Map([[hash(preimage).toString('hex'), preimage]]),
+				hash('auxiliary-test:1:3'),
+				hash('auxiliary-test:1:4'),
+				state.remoteHtlcSignatures
+			);
+			const output = resolved.find(
+				(item) =>
+					item.trackedOutput.outputType ===
+					(offeredByAlice ? OutputType.OFFERED_HTLC : OutputType.RECEIVED_HTLC)
+			)!;
+			const child = output.spendTx!;
+			child.setWitness(0, output.witness!);
+			expect(
+				(offeredByAlice ? bob : alice).fulfillHtlc(id, 0n, preimage).ok
+			).equal(true);
+			expect(errors).deep.equal([]);
+			const revokedState = deserializeChannelState(
+				serializeChannelState(bobChannel.getFullState())
+			);
+			revokedState.auxiliaryProvider = bobProvider;
+			const backup = buildAuxiliaryJusticePackage({
+				state: revokedState,
+				revokedTransaction: parent.toBuffer(),
+				destinationScript: destination,
+				feeRates: [1],
+				revocationBasepointSecret: hash('auxiliary-test:2:1'),
+				paymentBasepointSecret: hash('auxiliary-test:2:2'),
+				network: bitcoin.networks.regtest
+			});
+			expect(backup.childCustody).length(1);
+			const authority = backup.childCustody![0];
+			const reorderedDescriptor = Object.fromEntries(
+				Object.entries(authority).reverse()
+			) as typeof authority;
+			expect(
+				matchAuxiliaryJusticeChild(parent, reorderedDescriptor, child, [
+					parent.outs[authority.sourceOutputIndex].script
+				])
+			).equal(true);
+			expect(
+				matchAuxiliaryJusticeChild(parent, authority, child, [
+					parent.outs[authority.sourceOutputIndex].script
+				])
+			).equal(true);
+			const moved = child.clone();
+			moved.addInput(hash('external fee input'), 0, 0xfffffffd);
+			moved.ins.unshift(moved.ins.pop()!);
+			const feeScript = bitcoin.payments.p2wpkh({
+				pubkey: getPublicKey(hash('external fee key'))
+			}).output!;
+			const prevouts = [
+				feeScript,
+				parent.outs[authority.sourceOutputIndex].script
+			];
+			expect(
+				matchAuxiliaryJusticeChild(parent, authority, moved, prevouts)
+			).equal(true);
+			const ownerKey = derivePrivateKey(
+				hash('auxiliary-test:1:4'),
+				Buffer.from(authority.perCommitmentPoint, 'hex'),
+				getPublicKey(hash('auxiliary-test:1:4'))
+			);
+			const actualValues = [
+				5000,
+				parent.outs[authority.sourceOutputIndex].value
+			];
+			const ownerChanged = bitcoin.Transaction.fromBuffer(moved.toBuffer());
+			ownerChanged.ins[1].witness[1] = Buffer.from(
+				ecc.signSchnorr(
+					ownerChanged.hashForWitnessV1(
+						1,
+						prevouts,
+						actualValues,
+						0,
+						tapleafHash(Buffer.from(authority.htlcLeafScript, 'hex'))
+					),
+					ownerKey
+				)
+			);
+			expect(
+				matchAuxiliaryJusticeChild(parent, authority, ownerChanged, prevouts)
+			).equal(false);
+			expect(
+				matchAuxiliaryJusticeChild(
+					parent,
+					authority,
+					ownerChanged,
+					prevouts,
+					actualValues
+				)
+			).equal(true);
+			expect(
+				matchAuxiliaryJusticeChild(parent, authority, ownerChanged, prevouts, [
+					5001,
+					actualValues[1]
+				])
+			).equal(false);
+			const peerChanged = bitcoin.Transaction.fromBuffer(moved.toBuffer());
+			peerChanged.ins[1].witness[0][64] = 0x83;
+			expect(
+				matchAuxiliaryJusticeChild(
+					parent,
+					authority,
+					peerChanged,
+					prevouts,
+					actualValues
+				)
+			).equal(false);
+			const mutation = moved.clone();
+			mutation.outs[0].value--;
+			expect(
+				matchAuxiliaryJusticeChild(parent, authority, mutation, prevouts)
+			).equal(false);
+			expect(
+				matchAuxiliaryJusticeChild(parent, authority, moved, [
+					destination,
+					prevouts[1]
+				])
+			).equal(true);
+			const manyInputs = bitcoin.Transaction.fromBuffer(moved.toBuffer());
+			const manyScripts = [...prevouts];
+			for (let index = 2; index < 66; index++) {
+				manyInputs.addInput(hash(`arbitrary fee source:${index}`), 0);
+				manyScripts.push(
+					index % 2
+						? destination
+						: bitcoin.script.compile([bitcoin.opcodes.OP_TRUE])
+				);
+			}
+			expect(
+				matchAuxiliaryJusticeChild(parent, authority, manyInputs, manyScripts)
+			).equal(true);
+			const remedy = buildAuxiliaryChildRemedy(
+				parent,
+				JSON.parse(JSON.stringify(authority)),
+				moved,
+				prevouts,
+				(context) => {
+					expect(context.capsule.toString()).equal(
+						'signed parent virtual packet'
+					);
+					const digest = hash('child virtual digest');
+					expect(
+						ecc.verifySchnorr(
+							digest,
+							context.secondLevelRevocationKey.subarray(1),
+							context.sign({
+								transactionInputIndex: 0,
+								publicKey: context.secondLevelRevocationKey,
+								sigHash: digest
+							})
+						)
+					).equal(true);
+					return {
+						outputScripts: new Map([[0, destination]]),
+						customData: Buffer.from('final virtual packets')
+					};
+				}
+			);
+			// An owner may also spend its anchor from this same commitment before
+			// the HTLC input. Source authentication must include the output index.
+			const sameParentFee = bitcoin.Transaction.fromBuffer(moved.toBuffer());
+			const anchorIndex = parent.outs.findIndex(
+				(item, index) =>
+					index !== authority.sourceOutputIndex && item.value === 330
+			);
+			expect(anchorIndex).at.least(0);
+			sameParentFee.ins[0].hash = parent.getHash();
+			sameParentFee.ins[0].index = anchorIndex;
+			expect(
+				matchAuxiliaryJusticeChild(parent, authority, sameParentFee, [
+					parent.outs[anchorIndex].script,
+					prevouts[1]
+				])
+			).equal(true);
+			for (const observed of [moved, sameParentFee]) {
+				const online = resolveRevokedSecondLevelOutput(
+					revokedState,
+					observed,
+					100,
+					BigInt(backup.commitmentNumber),
+					destination,
+					1,
+					hash('auxiliary-test:2:1')
+				);
+				expect(online).length(1);
+				const onlineTx = online[0].spendTx!;
+				expect(
+					ecc.verifySchnorr(
+						onlineTx.hashForWitnessV1(
+							0,
+							[observed.outs[0].script],
+							[observed.outs[0].value],
+							0
+						),
+						observed.outs[0].script.subarray(2),
+						onlineTx.ins[0].witness[0]
+					)
+				).equal(true);
+			}
+			// A provider can be temporarily unavailable after the watcher has
+			// authenticated the parent spend. Neither the live attempt nor an old
+			// partially persisted snapshot may suppress its second-level follow-up.
+			const monitor = new ChainMonitor(
+				revokedState,
+				destination,
+				1,
+				hash('auxiliary-test:2:1'),
+				hash('auxiliary-test:2:2'),
+				bitcoin.networks.regtest
+			);
+			monitor.handleFundingSpent(parent, 90);
+			const prepare = bobProvider.prepareSweep;
+			bobProvider.prepareSweep = () => {
+				throw new Error('Child provider interrupted');
+			};
+			expect(() =>
+				monitor.handleOutputSpent(
+					parent.getId(),
+					authority.sourceOutputIndex,
+					sameParentFee,
+					100
+				)
+			).to.throw('Child provider interrupted');
+			const pendingSource = monitor
+				.getTrackedOutputs()
+				.find((item) => item.outputIndex === authority.sourceOutputIndex)!;
+			expect(pendingSource.resolutionTxid).equal(undefined);
+			expect(pendingSource.status).not.equal(OutputStatus.SPEND_CONFIRMED);
+			bobProvider.prepareSweep = prepare;
+			for (const legacyPartialSnapshot of [false, true]) {
+				const saved = deserializeChainMonitorState(
+					serializeChainMonitorState(monitor.getFullState())
+				);
+				if (legacyPartialSnapshot) {
+					const source = saved.trackedOutputs.find(
+						(item) => item.outputIndex === authority.sourceOutputIndex
+					)!;
+					source.status = OutputStatus.SPEND_CONFIRMED;
+					source.resolutionTxid = sameParentFee.getId();
+					source.resolutionTxHex = sameParentFee.toHex();
+					source.confirmationHeight = 100;
+				}
+				const resumed = ChainMonitor.restore(
+					saved,
+					revokedState,
+					destination,
+					1,
+					hash('auxiliary-test:2:1'),
+					hash('auxiliary-test:2:2'),
+					bitcoin.networks.regtest
+				);
+				expect(
+					resumed.handleOutputSpent(
+						parent.getId(),
+						authority.sourceOutputIndex,
+						sameParentFee,
+						100
+					).length
+				).greaterThan(0);
+				expect(
+					resumed
+						.getTrackedOutputs()
+						.filter(
+							(item) =>
+								item.txid === sameParentFee.getId() && item.outputIndex === 0
+						)
+				).length(1);
+				expect(
+					resumed.handleOutputSpent(
+						parent.getId(),
+						authority.sourceOutputIndex,
+						sameParentFee,
+						100
+					)
+				).deep.equal([]);
+			}
+			const transaction = bitcoin.Transaction.fromHex(remedy.transaction);
+			expect(
+				ecc.verifySchnorr(
+					transaction.hashForWitnessV1(
+						0,
+						[moved.outs[0].script],
+						[moved.outs[0].value],
+						0x81
+					),
+					moved.outs[0].script.subarray(2),
+					transaction.ins[0].witness[0].subarray(0, 64)
+				)
+			).equal(true);
+			const variant = parent.clone();
+			variant.outs[0].value--;
+			expect(
+				childRevocationBasepoint(
+					revokedState.localPerCommitmentSeed,
+					variant
+				).equals(Buffer.from(authority.revocationBasepoint, 'hex'))
+			).equal(false);
+			const rejected = deserializeChannelState(serializeChannelState(state));
+			expect(() => acceptChildRevocationRecord(rejected)).to.throw('Missing');
+			const originalRecord = Buffer.concat([
+				Buffer.from([1]),
+				Buffer.from(parent.getId(), 'hex'),
+				Buffer.from(authority.revocationBasepoint, 'hex')
+			]);
+			expect(() =>
+				acceptChildRevocationRecord(
+					rejected,
+					new Map([[CHILD_REVOCATION_RECORD, originalRecord]]),
+					variant
+				)
+			).to.throw('does not identify');
+			const corrupt = Buffer.concat([
+				Buffer.from([1]),
+				Buffer.from(parent.getId(), 'hex'),
+				getPublicKey(hash('wrong child point'))
+			]);
+			expect(() =>
+				acceptChildRevocationRecord(
+					rejected,
+					new Map([[CHILD_REVOCATION_RECORD, corrupt]])
+				)
+			).to.throw('changed');
+		});
+
 	it('negotiates fixed peer signatures and retains the exact historical channel mode', () => {
 		const { alice, bobChannel, aliceChannel } = pair();
 		const state = deserializeChannelState(

@@ -128,7 +128,9 @@ export enum Feature {
 	/** Signed asset custody terms for the Variant D voucher round. */
 	OPTION_FF_ASSET = 448,
 	/** Native asset HTLC signatures bind the complete second-level output set. */
-	OPTION_ASSET_FIXED_HTLC_OUTPUTS = 450
+	OPTION_ASSET_FIXED_HTLC_OUTPUTS = 450,
+	/** Optional scoped custody for revoked asset HTLC children. */
+	OPTION_ASSET_CHILD_CUSTODY = 452
 }
 
 /**
@@ -363,6 +365,7 @@ export function hasUnsupportedRequiredFeatures(
 				(bit === Feature.OPTION_FF_CONCURRENT ||
 					bit === Feature.OPTION_FF_ASSET ||
 					bit === Feature.OPTION_ASSET_FIXED_HTLC_OUTPUTS ||
+					bit === Feature.OPTION_ASSET_CHILD_CUSTODY ||
 					bit === Feature.OPTION_TAPROOT_OVERLAY) &&
 				!localFeatures.hasFeature(bit)
 			) {
