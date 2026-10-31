@@ -692,13 +692,14 @@ property chain.IAttachFeeInputsParams.feeratePerVbyte: number
 property chain.IAttachFeeInputsParams.htlcTx: bitcoinjs-lib#Transaction
 property chain.IAttachFeeInputsParams.htlcWitness: Buffer[]
 property chain.IAttachFeeInputsParams.previousFee?: bigint
+method chain.IAttachFeeInputsParams.signHtlcFunding?(transaction: Buffer): Buffer
 property chain.IAttachFeeInputsParams.walletInputs: channel.ISpliceWalletInput[]
 interface chain.IAuxiliarySweepFeeAttachment
 method chain.IAuxiliarySweepFeeAttachment.finalize(transaction: Buffer, auxiliaryData: Buffer, fee?: bigint): boolean
 property chain.IAuxiliarySweepFeeAttachment.previousFee?: bigint
 property chain.IAuxiliarySweepFeeAttachment.prevoutScripts: Buffer[]
 property chain.IAuxiliarySweepFeeAttachment.prevoutValues: bigint[]
-method chain.IAuxiliarySweepFeeAttachment.sign(transaction: Buffer, prevoutScripts: Buffer[], prevoutValues: bigint[], hashType?: 0 | 0x83): { transaction: Buffer; auxiliaryData: Buffer; }
+method chain.IAuxiliarySweepFeeAttachment.sign(transaction: Buffer, prevoutScripts: Buffer[], prevoutValues: bigint[], hashType?: 0 | 0x81): { transaction: Buffer; auxiliaryData: Buffer; }
 interface chain.IBroadcastTxChainAction
 property chain.IBroadcastTxChainAction.description: string
 property chain.IBroadcastTxChainAction.requiresMonitorPersistence?: boolean
@@ -802,6 +803,7 @@ property chain.IFeeBumpAndBroadcastChainAction.parentFeeSats?: bigint
 property chain.IFeeBumpAndBroadcastChainAction.parentVbytes?: number
 property chain.IFeeBumpAndBroadcastChainAction.previousFee?: bigint
 property chain.IFeeBumpAndBroadcastChainAction.previousFundedTransaction?: Buffer
+method chain.IFeeBumpAndBroadcastChainAction.signHtlcFunding?(transaction: Buffer): Buffer
 property chain.IFeeBumpAndBroadcastChainAction.taprootAnchorKeyRole?: 'delayed' | 'payment'
 property chain.IFeeBumpAndBroadcastChainAction.taprootAnchorMerkleRoot?: Buffer
 property chain.IFeeBumpAndBroadcastChainAction.taprootAnchorScript?: Buffer
@@ -9592,7 +9594,7 @@ property watchtower.IAuxiliaryJusticePackage.channelId: string
 property watchtower.IAuxiliaryJusticePackage.commitmentData: string
 property watchtower.IAuxiliaryJusticePackage.commitmentNumber: string
 property watchtower.IAuxiliaryJusticePackage.revokedTransaction: string
-property watchtower.IAuxiliaryJusticePackage.sweeps: { transaction: string; auxiliaryData?: string; csvDelay: number; feeSponsorship?: { type: 'single-anyonecanpay'; prevoutScript: string; prevoutValue: string; }; }[]
+property watchtower.IAuxiliaryJusticePackage.sweeps: { transaction: string; auxiliaryData?: string; csvDelay: number; feeSponsorship?: { type: 'all-anyonecanpay'; prevoutScript: string; prevoutValue: string; }; }[]
 property watchtower.IAuxiliaryJusticePackage.version: 1
 interface watchtower.IJusticeBackup
 property watchtower.IJusticeBackup.encryptedBlob: Buffer

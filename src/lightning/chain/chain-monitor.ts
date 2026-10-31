@@ -40,6 +40,13 @@ import {
 	selectTheirPerCommitmentPoint
 } from './output-resolver';
 import { csvFromToLocalScript } from '../script/commitment';
+import { tapleafHash, verifyTaprootHtlcLeaf } from '../script/htlc-taproot';
+import {
+	derivePrivateKey,
+	derivePublicKey,
+	perCommitmentPointFromSecret
+} from '../keys/derivation';
+import { generateFromSeed, MAX_INDEX } from '../keys/shachain';
 import type { IChannelState } from '../channel/channel-state';
 import { isAnchorChannel } from '../channel/types';
 
@@ -1299,7 +1306,21 @@ export class ChainMonitor {
 			let isOurSecondLevel = false;
 			let secondLevelTemplate: bitcoin.Transaction | undefined;
 			try {
-				const template = bitcoin.Transaction.fromHex(output.sweepTxHex);
+				let template = bitcoin.Transaction.fromHex(output.sweepTxHex);
+				if (output.auxiliaryData && template.getId() !== spendingTx.getId()) {
+					const retained = [
+						template,
+						...Object.values(output.auxiliarySweepAttempts ?? {})
+							.filter((attempt) => !!attempt.auxiliaryData)
+							.map((attempt) =>
+								bitcoin.Transaction.fromHex(attempt.transaction)
+							)
+					];
+					const bound = retained.find((candidate) =>
+						this._matchesAuxiliaryHtlcFunding(output, candidate, spendingTx)
+					);
+					if (bound) template = bound;
+				}
 				secondLevelTemplate = template;
 				if (template.getId() === spendingTx.getId()) {
 					isOurSecondLevel = true;
@@ -1323,6 +1344,9 @@ export class ChainMonitor {
 					const tOut = template.outs[0];
 					const sOut = spendingTx.outs[0];
 					isOurSecondLevel =
+						(output.auxiliaryData
+							? this._matchesAuxiliaryHtlcFunding(output, template, spendingTx)
+							: true) &&
 						!!tIn &&
 						!!sIn &&
 						Buffer.from(tIn.hash).equals(Buffer.from(sIn.hash)) &&
@@ -1348,6 +1372,21 @@ export class ChainMonitor {
 					output.auxiliarySweepAttempts?.[secondLevelTemplate!.getId()]
 						?.auxiliaryData ??
 					output.auxiliaryData;
+				if (
+					output.auxiliaryData &&
+					this._matchesAuxiliaryHtlcFunding(
+						output,
+						secondLevelTemplate!,
+						spendingTx
+					)
+				) {
+					const retainedFee =
+						output.auxiliarySweepAttempts?.[spendingTx.getId()]
+							?.auxiliarySweepFee;
+					output.sweepTxHex = spendingTx.toHex();
+					output.auxiliaryHtlcFeeFunded = true;
+					output.auxiliarySweepFee = retainedFee;
+				}
 				this._retainAuxiliarySweep(output, spendingTx, payload);
 				this._selectAuxiliarySweep(output, spendingTx.getId());
 				const already = this._trackedOutputs.some(
@@ -2086,13 +2125,198 @@ export class ChainMonitor {
 		};
 	}
 
-	/**
-	 * Build the chain action to broadcast a sweep transaction.
-	 *
-	 * Zero-fee second-level HTLC txs on anchor channels cannot pay their own fee,
-	 * so they are routed through FEE_BUMP_AND_BROADCAST to have a wallet fee input
-	 * attached before broadcast. Every other sweep broadcasts directly.
-	 */
+	/** Accept external fee inputs only when the authenticated HTLC witness binds every output. */
+	private _matchesAuxiliaryHtlcFunding(
+		output: ITrackedOutput,
+		template: bitcoin.Transaction,
+		transaction: bitcoin.Transaction
+	): boolean {
+		try {
+			const original = template.ins[0],
+				actual = transaction.ins[0];
+			if (
+				!original ||
+				!actual ||
+				!output.witnessScript ||
+				!this._commitmentBroadcast ||
+				(original.witness.length !== 4 && original.witness.length !== 5) ||
+				original.witness[0].length !== 65 ||
+				original.witness[0][64] !== 0x83 ||
+				original.witness[1].length !== 65 ||
+				original.witness[1][64] !== 0x81 ||
+				template.version !== transaction.version ||
+				template.locktime !== transaction.locktime ||
+				template.outs.length !== transaction.outs.length ||
+				template.outs.some(
+					(item, index) =>
+						item.value !== transaction.outs[index].value ||
+						!item.script.equals(transaction.outs[index].script)
+				) ||
+				Buffer.from(original.hash).reverse().toString('hex') !== output.txid ||
+				original.index !== output.outputIndex ||
+				!original.hash.equals(actual.hash) ||
+				original.index !== actual.index ||
+				original.sequence !== actual.sequence ||
+				!original.script.equals(actual.script) ||
+				original.witness.length !== actual.witness.length ||
+				original.witness.some(
+					(item, index) => !item.equals(actual.witness[index])
+				)
+			)
+				return false;
+			bitcoin.payments.p2tr({
+				output: output.witnessScript,
+				witness: actual.witness
+			});
+			const point = perCommitmentPointFromSecret(
+				generateFromSeed(
+					this._channelState.localPerCommitmentSeed,
+					MAX_INDEX - this._commitmentBroadcast.commitmentNumber
+				)
+			);
+			const publicKey = derivePublicKey(
+				this._channelState.localBasepoints.htlcBasepoint,
+				point
+			);
+			const digest = transaction.hashForWitnessV1(
+				0,
+				transaction.ins.map((_, index) =>
+					index === 0 ? output.witnessScript! : Buffer.alloc(0)
+				),
+				transaction.ins.map((_, index) =>
+					index === 0 ? Number(output.amount) : 0
+				),
+				0x81,
+				tapleafHash(
+					actual.witness[actual.witness.length - 2],
+					actual.witness[actual.witness.length - 1][0] & 0xfe
+				)
+			);
+			return verifyTaprootHtlcLeaf(
+				digest,
+				publicKey,
+				actual.witness[1].subarray(0, 64)
+			);
+		} catch {
+			return false;
+		}
+	}
+
+	/** Bind an asset HTLC spend to all final outputs using the broadcaster's key. */
+	private _auxiliaryHtlcOutputBinding(
+		output: ITrackedOutput,
+		base: bitcoin.Transaction
+	) {
+		const prevout = output.witnessScript;
+		const witness = base.ins[0]?.witness;
+		if (
+			!this._htlcBasepointSecret ||
+			!this._commitmentBroadcast ||
+			!prevout ||
+			prevout.length !== 34 ||
+			prevout[0] !== 0x51 ||
+			prevout[1] !== 32 ||
+			base.ins.length !== 1 ||
+			base.outs.length !== 1 ||
+			!witness ||
+			(witness.length !== 4 && witness.length !== 5) ||
+			witness[0].length !== 65 ||
+			witness[0][64] !== 0x83 ||
+			witness[1].length !== 65 ||
+			witness[1][64] !== 0x83 ||
+			Buffer.from(base.ins[0].hash).reverse().toString('hex') !== output.txid ||
+			base.ins[0].index !== output.outputIndex ||
+			BigInt(base.outs[0].value) !== output.amount
+		)
+			throw new Error(
+				'Asset HTLC output binding requires its original signed Taproot template'
+			);
+		bitcoin.payments.p2tr({ output: prevout, witness });
+		const leaf = tapleafHash(
+			witness[witness.length - 2],
+			witness[witness.length - 1][0] & 0xfe
+		);
+		const point = perCommitmentPointFromSecret(
+			generateFromSeed(
+				this._channelState.localPerCommitmentSeed,
+				MAX_INDEX - this._commitmentBroadcast.commitmentNumber
+			)
+		);
+		const secret = derivePrivateKey(
+			this._htlcBasepointSecret,
+			point,
+			this._channelState.localBasepoints.htlcBasepoint
+		);
+		const publicKey = Buffer.from(ecc.pointFromScalar(secret, true)!);
+		const digest = (transaction: bitcoin.Transaction, hashType: number) =>
+			transaction.hashForWitnessV1(
+				0,
+				transaction.ins.map((_, index) =>
+					index === 0 ? prevout : Buffer.alloc(0)
+				),
+				transaction.ins.map((_, index) =>
+					index === 0 ? Number(output.amount) : 0
+				),
+				hashType,
+				leaf
+			);
+		if (
+			!verifyTaprootHtlcLeaf(
+				digest(base, 0x83),
+				publicKey,
+				witness[1].subarray(0, 64)
+			)
+		)
+			throw new Error(
+				'Original asset HTLC signature does not match the broadcaster key'
+			);
+		const shape = (transaction: bitcoin.Transaction, bound: boolean): boolean =>
+			transaction.version === base.version &&
+			transaction.locktime === base.locktime &&
+			transaction.ins.length > 1 &&
+			transaction.outs.length >= 1 &&
+			transaction.outs.length <= 2 &&
+			transaction.ins[0].hash.equals(base.ins[0].hash) &&
+			transaction.ins[0].index === base.ins[0].index &&
+			transaction.ins[0].sequence === base.ins[0].sequence &&
+			transaction.ins[0].script.equals(base.ins[0].script) &&
+			transaction.outs[0].value === base.outs[0].value &&
+			transaction.outs[0].script.equals(base.outs[0].script) &&
+			(transaction.outs.length === 1 ||
+				(transaction.outs[1].script.length === 22 &&
+					transaction.outs[1].script[0] === 0 &&
+					transaction.outs[1].script[1] === 20)) &&
+			transaction.ins[0].witness.length === witness.length &&
+			witness.every((item, index) =>
+				bound && index === 1
+					? transaction.ins[0].witness[1].length === 65 &&
+					  transaction.ins[0].witness[1][64] === 0x81
+					: item.equals(transaction.ins[0].witness[index])
+			);
+		return {
+			sign: (raw: Buffer): Buffer => {
+				const transaction = bitcoin.Transaction.fromBuffer(raw);
+				if (!shape(transaction, false))
+					throw new Error(
+						'Asset HTLC fee attachment changed its authorized template'
+					);
+				transaction.ins[0].witness[1] = Buffer.concat([
+					Buffer.from(ecc.signSchnorr(digest(transaction, 0x81), secret)),
+					Buffer.from([0x81])
+				]);
+				return transaction.toBuffer();
+			},
+			verify: (transaction: bitcoin.Transaction): boolean =>
+				shape(transaction, true) &&
+				verifyTaprootHtlcLeaf(
+					digest(transaction, 0x81),
+					publicKey,
+					transaction.ins[0].witness[1].subarray(0, 64)
+				)
+		};
+	}
+
+	/** Route zero-fee asset claims through signing and durable fee attachment. */
 	private _broadcastSweepAction(
 		output: ITrackedOutput,
 		txBuf: Buffer,
@@ -2204,6 +2428,7 @@ export class ChainMonitor {
 			const base = bitcoin.Transaction.fromBuffer(txBuf),
 				expected = output.sweepTxHex,
 				generation = (this._auxiliaryFeeGenerations.get(output) ?? 0) + 1;
+			const outputBinding = this._auxiliaryHtlcOutputBinding(output, base);
 			if (output.auxiliaryData)
 				this._auxiliaryFeeGenerations.set(output, generation);
 			return {
@@ -2215,6 +2440,7 @@ export class ChainMonitor {
 				feeratePerVbyte: output.currentFeeRate || this._feeRatePerVbyte,
 				...(output.auxiliaryData
 					? {
+							signHtlcFunding: outputBinding.sign,
 							finalizeHtlcFunding: (raw: Buffer, fee?: bigint): boolean => {
 								if (
 									!this._trackedOutputs.includes(output) ||
@@ -2225,6 +2451,7 @@ export class ChainMonitor {
 								)
 									return false;
 								const funded = bitcoin.Transaction.fromBuffer(raw);
+								if (!outputBinding.verify(funded)) return false;
 								if (
 									funded.version !== base.version ||
 									funded.locktime !== base.locktime ||
@@ -2242,7 +2469,9 @@ export class ChainMonitor {
 											!input.script.equals(actual.script) ||
 											input.witness.length !== actual.witness.length ||
 											input.witness.some(
-												(item, i) => !item.equals(actual.witness[i])
+												(item, i) =>
+													!(index === 0 && i === 1) &&
+													!item.equals(actual.witness[i])
 											)
 										);
 									})

@@ -195,6 +195,44 @@ const HTLC_WITNESS: Buffer[] = [
 
 describe('anchor fee bumping', () => {
 	describe('attachFeeInputsToZeroFeeHtlcTx', () => {
+		for (const mutation of [
+			'output',
+			'peer_witness',
+			'wallet_output'
+		] as const) {
+			it(`refuses unauthorized ${mutation} changes during HTLC output binding`, () => {
+				const htlcTx = buildZeroFeeHtlcTx(50_000);
+				const walletInput = makeWalletInput(100_000, `binding-${mutation}`);
+				const originalSign = walletInput.signWitness;
+				let walletSignatures = 0;
+				walletInput.signWitness = (transaction, index, value) => {
+					walletSignatures++;
+					if (mutation === 'wallet_output') transaction.outs[0].value--;
+					return originalSign(transaction, index, value);
+				};
+				expect(() =>
+					attachFeeInputsToZeroFeeHtlcTx({
+						htlcTx,
+						htlcWitness: HTLC_WITNESS,
+						walletInputs: [walletInput],
+						changeScript: Buffer.alloc(22),
+						feeratePerVbyte: 1,
+						signHtlcFunding(raw) {
+							const transaction = bitcoin.Transaction.fromBuffer(raw);
+							transaction.ins[0].witness[1] = Buffer.concat([
+								Buffer.alloc(64, 1),
+								Buffer.from([0x81])
+							]);
+							if (mutation === 'output') transaction.outs[0].value--;
+							if (mutation === 'peer_witness')
+								transaction.ins[0].witness[0] = Buffer.from([1]);
+							return transaction.toBuffer();
+						}
+					})
+				).to.throw('funding transaction');
+				expect(walletSignatures).equal(mutation === 'wallet_output' ? 1 : 0);
+			});
+		}
 		it('appends a wallet input + change and pays the target fee', () => {
 			const htlcTx = buildZeroFeeHtlcTx(50_000);
 			const walletInput = makeWalletInput(100_000, 'attach-1');

@@ -356,7 +356,7 @@ function auxiliaryLeafFeeFunding(
 			const funded = bitcoin.Transaction.fromBuffer(raw);
 			if (
 				hashType !== bitcoin.Transaction.SIGHASH_DEFAULT &&
-				(hashType !== SIGHASH_ANCHOR ||
+				(hashType !== SIGHASH_SPONSOR ||
 					funded.ins.length !== 1 ||
 					funded.outs.length !== 1)
 			)
@@ -404,6 +404,8 @@ function auxiliaryLeafFeeFunding(
 
 const SIGHASH_ANCHOR =
 	bitcoin.Transaction.SIGHASH_SINGLE | bitcoin.Transaction.SIGHASH_ANYONECANPAY;
+const SIGHASH_SPONSOR =
+	bitcoin.Transaction.SIGHASH_ALL | bitcoin.Transaction.SIGHASH_ANYONECANPAY;
 
 /**
  * The exact fee a pre-signed second-level HTLC transaction commits to. The
@@ -4153,7 +4155,7 @@ function auxiliaryRevocationFeeFunding(
 			const funded = bitcoin.Transaction.fromBuffer(raw);
 			if (
 				hashType !== bitcoin.Transaction.SIGHASH_DEFAULT &&
-				(hashType !== SIGHASH_ANCHOR ||
+				(hashType !== SIGHASH_SPONSOR ||
 					funded.ins.length !== 1 ||
 					funded.outs.length !== 1)
 			)

@@ -262,8 +262,8 @@ export interface IBroadcastTxChainAction {
  * available it falls back to broadcasting `tx` as-is.
  *
  * - `htlc-fee-attach`: `tx` is a pre-signed zero-fee second-level HTLC tx. Its
- *   input-0 witness (SIGHASH_SINGLE|ANYONECANPAY) is preserved while wallet fee
- *   inputs + change are appended.
+ *   peer signature is preserved while wallet fee inputs and change are appended.
+ *   Asset claims replace the local signature with ALL|ANYONECANPAY first.
  * - `anchor-cpfp`: `tx` is the commitment tx; a child spending our local anchor
  *   (`anchorOutputIndex` / `anchorWitnessScript`) is built to bump the package.
  */
@@ -279,7 +279,7 @@ export interface IAuxiliarySweepFeeAttachment {
 		prevoutScripts: Buffer[],
 		prevoutValues: bigint[],
 		/** Restricted to a one-input/one-output template when sponsorship is requested. */
-		hashType?: 0 | 0x83
+		hashType?: 0 | 0x81
 	): { transaction: Buffer; auxiliaryData: Buffer };
 	/** Install the exact signed candidate. False means the monitor moved on. */
 	finalize(transaction: Buffer, auxiliaryData: Buffer, fee?: bigint): boolean;
@@ -287,6 +287,8 @@ export interface IAuxiliarySweepFeeAttachment {
 export interface IFeeBumpAndBroadcastChainAction {
 	type: ChainActionType.FEE_BUMP_AND_BROADCAST;
 	kind: 'htlc-fee-attach' | 'anchor-cpfp' | 'auxiliary-sweep-fee-attach';
+	/** Bind the broadcaster's HTLC signature to every final output before wallet signing. */
+	signHtlcFunding?(transaction: Buffer): Buffer;
 	/** Persist the exact sponsored HTLC parent before broadcast. */
 	finalizeHtlcFunding?(transaction: Buffer, fee?: bigint): boolean;
 	/** Highest paid fee among retained candidates conflicting with this action. */

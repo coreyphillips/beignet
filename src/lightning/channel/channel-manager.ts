@@ -807,6 +807,23 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		>
 	> = new Map();
 	private peerManager: PeerManager | null = null;
+	private readonly feeBumpQueues = new Map<
+		string,
+		{
+			running: boolean;
+			pending: Map<
+				string,
+				{
+					action: IFeeBumpAndBroadcastChainAction;
+					waiters: Array<{
+						resolve: () => void;
+						reject: (error: unknown) => void;
+					}>;
+				}
+			>;
+		}
+	>();
+
 	private monitors: Map<string, ChainMonitor> = new Map();
 	// Latest block height seen (for stamping when a force-close CPFP was broadcast).
 	private _currentBlockHeight = 0;
@@ -11706,7 +11723,67 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		if (release.length) await provider.releaseInputPledges?.(release);
 	}
 
-	private async _handleFeeBumpAndBroadcast(
+	/** Drain the latest fee attempt only after prior selection and cleanup finish. */
+	private _handleFeeBumpAndBroadcast(
+		channelId: Buffer,
+		action: IFeeBumpAndBroadcastChainAction
+	): Promise<void> {
+		const channelIdentity = Buffer.from(channelId);
+		const channelKey = channelIdentity.toString('hex');
+		let inputSet: string;
+		try {
+			inputSet = bitcoin.Transaction.fromBuffer(action.tx)
+				.ins.map(
+					(input) =>
+						`${Buffer.from(input.hash).reverse().toString('hex')}:${
+							input.index
+						}`
+				)
+				.sort()
+				.join(',');
+		} catch {
+			inputSet = action.tx.toString('hex');
+		}
+		const key = `${action.kind}:${inputSet}`;
+		let queue = this.feeBumpQueues.get(channelKey);
+		if (!queue) {
+			queue = { running: false, pending: new Map() };
+			this.feeBumpQueues.set(channelKey, queue);
+		}
+		const current = queue;
+		const completion = new Promise<void>((resolve, reject) => {
+			const pending = current.pending.get(key);
+			if (pending) {
+				pending.action = action;
+				pending.waiters.push({ resolve, reject });
+			} else
+				current.pending.set(key, { action, waiters: [{ resolve, reject }] });
+		});
+		if (!current.running) {
+			current.running = true;
+			void (async () => {
+				while (current.pending.size) {
+					const [nextKey, next] = current.pending.entries().next().value!;
+					current.pending.delete(nextKey);
+					try {
+						await this._executeFeeBumpAndBroadcast(
+							channelIdentity,
+							next.action
+						);
+						for (const waiter of next.waiters) waiter.resolve();
+					} catch (error) {
+						for (const waiter of next.waiters) waiter.reject(error);
+					}
+				}
+				current.running = false;
+				if (this.feeBumpQueues.get(channelKey) === current)
+					this.feeBumpQueues.delete(channelKey);
+			})();
+		}
+		return completion;
+	}
+
+	private async _executeFeeBumpAndBroadcast(
 		channelId: Buffer,
 		action: IFeeBumpAndBroadcastChainAction
 	): Promise<void> {
@@ -11836,6 +11913,10 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 					) {
 						throw new Error('Auxiliary HTLC fee change must be P2WPKH');
 					}
+					if (action.finalizeHtlcFunding && !action.signHtlcFunding)
+						throw new Error(
+							'Auxiliary HTLC output binding signer is unavailable'
+						);
 					const originalWitness = htlcWitness.map((item) => Buffer.from(item));
 					const { tx } = attachFeeInputsToZeroFeeHtlcTx({
 						htlcTx,
@@ -11843,7 +11924,8 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 						walletInputs: inputs,
 						changeScript,
 						feeratePerVbyte,
-						previousFee: action.previousFee
+						previousFee: action.previousFee,
+						signHtlcFunding: action.signHtlcFunding
 					});
 					const transaction = tx.toBuffer();
 					if (action.finalizeHtlcFunding) {
@@ -11851,8 +11933,11 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 							throw new Error('Auxiliary HTLC monitor is unavailable');
 						if (
 							tx.ins[0].witness.length !== originalWitness.length ||
-							originalWitness.some(
-								(item, index) => !item.equals(tx.ins[0].witness[index])
+							originalWitness.some((item, index) =>
+								index === 1
+									? tx.ins[0].witness[index].length !== 65 ||
+									  tx.ins[0].witness[index][64] !== 0x81
+									: !item.equals(tx.ins[0].witness[index])
 							)
 						)
 							throw new Error(

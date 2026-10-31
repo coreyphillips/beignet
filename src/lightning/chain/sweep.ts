@@ -545,8 +545,8 @@ export interface IAttachFeeInputsParams {
 	htlcTx: bitcoin.Transaction;
 	/**
 	 * The witness for the HTLC input (input 0), pre-signed by the counterparty
-	 * with SIGHASH_SINGLE|SIGHASH_ANYONECANPAY. Untouched here — appending inputs
-	 * and a change output does not invalidate it.
+	 * with SIGHASH_SINGLE|SIGHASH_ANYONECANPAY. The peer signature is preserved;
+	 * an asset binding callback replaces only the broadcaster's signature.
 	 */
 	htlcWitness: Buffer[];
 	/** Wallet fee inputs (P2WPKH) with their signWitness closures. */
@@ -557,17 +557,18 @@ export interface IAttachFeeInputsParams {
 	feeratePerVbyte: number;
 	/** Absolute fee of a candidate this transaction must replace. */
 	previousFee?: bigint;
+	/** Replace only the broadcaster's HTLC signature after all outputs are final. */
+	signHtlcFunding?(transaction: Buffer): Buffer;
 }
 
 /**
  * Attach wallet fee inputs (and a change output) to a zero-fee anchor
  * second-level HTLC transaction so it pays its own fee and can confirm.
  *
- * The HTLC input keeps its SIGHASH_SINGLE|ANYONECANPAY witness (which only
- * commits to input 0 and output 0); the appended wallet inputs are signed
- * SIGHASH_ALL over the finalised transaction. The result is a self-funding
- * single transaction — not a parent/child package — so it needs no package
- * relay. The HTLC tx's txid changes; callers must re-track the returned txid.
+ * The peer signature keeps SIGHASH_SINGLE|ANYONECANPAY. Asset HTLCs bind the
+ * broadcaster signature to all final outputs before wallet SIGHASH_ALL
+ * signatures are added. The resulting transaction pays its own fee without
+ * package relay. Callers must track its new transaction ID.
  */
 export function attachFeeInputsToZeroFeeHtlcTx(
 	params: IAttachFeeInputsParams
@@ -626,11 +627,39 @@ export function attachFeeInputsToZeroFeeHtlcTx(
 	// Below dust: fold the change into the fee (drop the change output).
 	const includeChange = change >= P2WPKH_DUST_LIMIT;
 
-	const tx = build(includeChange, includeChange ? change : 0n);
+	let tx = build(includeChange, includeChange ? change : 0n);
 	tx.setWitness(0, htlcWitness);
+	const unsignedId = tx.getId();
+	if (params.signHtlcFunding) {
+		if (htlcWitness.length < 2)
+			throw new Error('HTLC output binding requires a broadcaster signature');
+		const bound = bitcoin.Transaction.fromBuffer(
+			params.signHtlcFunding(tx.toBuffer())
+		);
+		if (
+			bound.getId() !== unsignedId ||
+			bound.ins[0].witness.length !== htlcWitness.length ||
+			htlcWitness.some((item, index) =>
+				index === 1
+					? bound.ins[0].witness[index].length !== 65 ||
+					  bound.ins[0].witness[index][64] !== 0x81
+					: !item.equals(bound.ins[0].witness[index])
+			) ||
+			bound.ins.slice(1).some((input) => input.witness.length !== 0)
+		)
+			throw new Error('HTLC output binding changed the funding transaction');
+		tx = bound;
+	}
+	const boundWitness = tx.ins[0].witness.map((item) => Buffer.from(item));
 	walletInputs.forEach((w, i) => {
 		tx.setWitness(1 + i, w.signWitness(tx, 1 + i, w.value));
 	});
+	if (
+		tx.getId() !== unsignedId ||
+		tx.ins[0].witness.length !== boundWitness.length ||
+		boundWitness.some((item, index) => !item.equals(tx.ins[0].witness[index]))
+	)
+		throw new Error('Wallet signer changed the HTLC funding transaction');
 
 	return { tx, txid: tx.getId() };
 }

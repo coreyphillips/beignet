@@ -29,9 +29,9 @@ export interface IAuxiliaryJusticePackage {
 		transaction: string;
 		auxiliaryData?: string;
 		csvDelay: number;
-		/** One fixed asset input/output; a tower appends wallet inputs and change. */
+		/** Fixed asset input/output; a tower may append fee inputs, never outputs. */
 		feeSponsorship?: {
-			type: 'single-anyonecanpay';
+			type: 'all-anyonecanpay';
 			prevoutScript: string;
 			prevoutValue: string;
 		};
@@ -48,7 +48,7 @@ const hex = (s: unknown, max: number): s is string =>
 	/^[0-9a-f]+$/.test(s);
 
 const SPONSOR_HASH_TYPE =
-	bitcoin.Transaction.SIGHASH_SINGLE | bitcoin.Transaction.SIGHASH_ANYONECANPAY;
+	bitcoin.Transaction.SIGHASH_ALL | bitcoin.Transaction.SIGHASH_ANYONECANPAY;
 
 /** Verify the exact immutable carrier and its BIP341 authorization. */
 function validateSponsorTemplate(
@@ -60,7 +60,7 @@ function validateSponsorTemplate(
 ): void {
 	const previous = parent.outs[tx.ins[0]?.index];
 	if (
-		metadata.type !== 'single-anyonecanpay' ||
+		metadata.type !== 'all-anyonecanpay' ||
 		tx.ins.length !== 1 ||
 		tx.outs.length !== 1 ||
 		!previous ||
@@ -83,7 +83,7 @@ function validateSponsorTemplate(
 		signature.length !== 65 ||
 		signature[64] !== SPONSOR_HASH_TYPE
 	)
-		throw new Error('Asset justice sponsorship requires SINGLE|ANYONECANPAY');
+		throw new Error('Asset justice sponsorship requires ALL|ANYONECANPAY');
 	let publicKey: Buffer;
 	let leafHash: Buffer | undefined;
 	if (witness.length === 1) {
@@ -344,20 +344,20 @@ export function buildAuxiliaryJusticePackage(options: {
 				let data = output.auxiliaryData ?? output.trackedOutput.auxiliaryData;
 				let feeSponsorship: IAuxiliaryJusticePackage['sweeps'][number]['feeSponsorship'];
 				if (output.auxiliaryFunding) {
-					// A shared output cannot be signed SINGLE by several inputs.
-					// Independent candidates below preserve every asset allocation.
+					// Sponsor templates expose one authenticated original input.
+					// Independent candidates preserve every asset allocation.
 					if (tx.ins.length !== 1 || tx.outs.length !== 1) continue;
 					const attachment = output.auxiliaryFunding;
 					const signed = attachment.sign(
 						tx.toBuffer(),
 						attachment.prevoutScripts,
 						attachment.prevoutValues,
-						SPONSOR_HASH_TYPE as 0x83
+						SPONSOR_HASH_TYPE as 0x81
 					);
 					tx = bitcoin.Transaction.fromBuffer(signed.transaction);
 					data = signed.auxiliaryData;
 					feeSponsorship = {
-						type: 'single-anyonecanpay',
+						type: 'all-anyonecanpay',
 						prevoutScript: attachment.prevoutScripts[0].toString('hex'),
 						prevoutValue: attachment.prevoutValues[0].toString()
 					};

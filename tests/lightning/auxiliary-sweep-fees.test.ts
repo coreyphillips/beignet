@@ -222,6 +222,117 @@ describe('Wallet funded auxiliary carrier sweeps', () => {
 		).to.throw('fee change must be P2WPKH');
 	});
 
+	it('drains only the newest waiting fee generation after stale one-coin cleanup', async () => {
+		const value = fixture(),
+			id = Buffer.alloc(32, 61),
+			events: string[] = [],
+			failures: string[] = [],
+			broadcasts: Buffer[] = [];
+		let frozen = false,
+			persisted = false,
+			selections = 0,
+			generation = 1,
+			releaseSelection!: () => void,
+			started!: () => void;
+		const selecting = new Promise<void>((resolve) => {
+				started = resolve;
+			}),
+			paused = new Promise<void>((resolve) => {
+				releaseSelection = resolve;
+			});
+		const manager = new ChannelManager({
+			localBasepoints: {
+				fundingPubkey: publicKey,
+				revocationBasepoint: publicKey,
+				paymentBasepoint: publicKey,
+				delayedPaymentBasepoint: publicKey,
+				htlcBasepoint: publicKey,
+				firstPerCommitmentPoint: publicKey
+			},
+			localPerCommitmentSeed: Buffer.alloc(32, 9),
+			localFundingPrivkey: secret,
+			persistence: COMMIT_ALL,
+			isMonitorPersisted: () => persisted
+		});
+		manager.on('error', (_channelId: Buffer | null, message: string) => {
+			failures.push(message);
+		});
+		manager.on('monitor:updated', () => {
+			persisted = true;
+		});
+		manager.on('broadcast:tx', (transaction: Buffer) => {
+			expect(persisted).equal(true);
+			broadcasts.push(transaction);
+		});
+		manager.setFundingProvider({
+			selectFeeBumpInputs: async () => {
+				expect(frozen).equal(
+					false,
+					'the prior attempt must finish cleanup before selection'
+				);
+				frozen = true;
+				selections++;
+				events.push(`select ${selections}`);
+				if (selections === 1) {
+					started();
+					await paused;
+				}
+				return { inputs: [value.walletInput], changeScript };
+			},
+			releaseInputPledges: async () => {
+				events.push('cleanup started');
+				await Promise.resolve();
+				frozen = false;
+				events.push('cleanup finished');
+			}
+		} as unknown as IFundingProvider);
+		const internal = manager as unknown as {
+			monitors: Map<string, ChainMonitor>;
+			_handleFeeBumpAndBroadcast(
+				channelId: Buffer,
+				action: IFeeBumpAndBroadcastChainAction
+			): Promise<void>;
+		};
+		internal.monitors.set(id.toString('hex'), {
+			getTrackedOutputs: () => []
+		} as unknown as ChainMonitor);
+		const action = (number: number): IFeeBumpAndBroadcastChainAction => ({
+			type: ChainActionType.FEE_BUMP_AND_BROADCAST,
+			kind: 'auxiliary-sweep-fee-attach',
+			tx: value.sweepTx.toBuffer(),
+			feeratePerVbyte: 2 + number,
+			description: 'queued fee claim',
+			auxiliarySweep: {
+				...value.attachment,
+				finalize: () => {
+					events.push(`finalize ${number}`);
+					return number === generation;
+				}
+			}
+		});
+		const first = internal._handleFeeBumpAndBroadcast(id, action(1));
+		await selecting;
+		generation = 2;
+		const middle = internal._handleFeeBumpAndBroadcast(id, action(2));
+		generation = 3;
+		const last = internal._handleFeeBumpAndBroadcast(id, action(3));
+		expect(selections).equal(1);
+		releaseSelection();
+		await Promise.all([first, middle, last]);
+		expect(events).deep.equal([
+			'select 1',
+			'finalize 1',
+			'cleanup started',
+			'cleanup finished',
+			'select 2',
+			'finalize 3'
+		]);
+		expect(selections).equal(2);
+		expect(broadcasts).length(1);
+		expect(failures).deep.equal([]);
+		expect(frozen).equal(true);
+	});
+
 	for (const kind of [
 		'auxiliary-sweep-fee-attach',
 		'htlc-fee-attach'
@@ -244,6 +355,10 @@ describe('Wallet funded auxiliary carrier sweeps', () => {
 						0x83
 					);
 					value.sweepTx.setWitness(0, [
+						Buffer.concat([
+							Buffer.from(ecc.signSchnorr(digest, secret)),
+							Buffer.from([0x83])
+						]),
 						Buffer.concat([
 							Buffer.from(ecc.signSchnorr(digest, secret)),
 							Buffer.from([0x83])
@@ -346,6 +461,20 @@ describe('Wallet funded auxiliary carrier sweeps', () => {
 					...(kind === 'htlc-fee-attach'
 						? {
 								previousFee: 2_500n,
+								signHtlcFunding: (raw: Buffer): Buffer => {
+									const funded = bitcoin.Transaction.fromBuffer(raw);
+									const digest = funded.hashForWitnessV1(
+										0,
+										[assetScript, changeScript],
+										[355, 20_000],
+										0x81
+									);
+									funded.ins[0].witness[1] = Buffer.concat([
+										Buffer.from(ecc.signSchnorr(digest, secret)),
+										Buffer.from([0x81])
+									]);
+									return funded.toBuffer();
+								},
 								finalizeHtlcFunding: (
 									transaction: Buffer,
 									fee?: bigint

@@ -567,19 +567,20 @@ describe('fee-sponsored asset penalties', () => {
 			});
 		expect(p.sweeps).length(2);
 		for (const sweep of p.sweeps) {
-			expect(sweep.feeSponsorship?.type).equal('single-anyonecanpay');
+			expect(sweep.feeSponsorship?.type).equal('all-anyonecanpay');
 			const base = bitcoin.Transaction.fromHex(sweep.transaction),
-				tx = funded(base.toBuffer()),
+				tx = bitcoin.Transaction.fromBuffer(base.toBuffer()),
 				previous = f.parent.outs[base.ins[0].index],
 				sig = tx.ins[0].witness[0],
 				leafScript = tx.ins[0].witness[1];
+			tx.addInput(Buffer.alloc(32, 0x44), 0);
 			expect(sig.length).equal(65);
-			expect(sig[64]).equal(0x83);
+			expect(sig[64]).equal(0x81);
 			const digest = tx.hashForWitnessV1(
 				0,
 				[previous.script, feeScript],
 				[previous.value, 10000],
-				0x83,
+				0x81,
 				leafScript ? tapleafHash(leafScript) : undefined
 			);
 			expect(
@@ -589,6 +590,20 @@ describe('fee-sponsored asset penalties', () => {
 					sig.subarray(0, 64)
 				)
 			).equal(true);
+			tx.addOutput(destination, 330);
+			expect(
+				ecc.verifySchnorr(
+					tx.hashForWitnessV1(
+						0,
+						[previous.script, feeScript],
+						[previous.value, 10000],
+						0x81,
+						leafScript ? tapleafHash(leafScript) : undefined
+					),
+					leafScript ? f.revocation.subarray(1) : previous.script.subarray(2),
+					sig.subarray(0, 64)
+				)
+			).equal(false);
 		}
 		const changed = structuredClone(p),
 			tx = bitcoin.Transaction.fromHex(changed.sweeps[0].transaction);
@@ -602,7 +617,7 @@ describe('fee-sponsored asset penalties', () => {
 		delete unsigned.sweeps[0].feeSponsorship;
 		expect(() => validateAuxiliaryJusticePackage(unsigned)).throw('value');
 	});
-	it('does not allow SINGLE sponsorship to authenticate a shared output', () => {
+	it('restricts pre-signed sponsorship to independent one-input remedies', () => {
 		const f = setup(),
 			[result] = resolveRevokedCommitmentOutputs(
 				f.state,
@@ -619,7 +634,7 @@ describe('fee-sponsored asset penalties', () => {
 				result.spendTx!.toBuffer(),
 				[f.local.output, f.htlc.output],
 				[355n, 355n],
-				0x83
+				0x81
 			)
 		).throw('single input');
 	});

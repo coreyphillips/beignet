@@ -14,6 +14,7 @@ import { FeatureFlags, Feature } from '../../src/lightning/features/flags';
 import { generateFromSeed, MAX_INDEX } from '../../src/lightning/keys/shachain';
 import {
 	derivePublicKey,
+	derivePrivateKey,
 	deriveRevocationPubkey,
 	perCommitmentPointFromSecret
 } from '../../src/lightning/keys/derivation';
@@ -365,139 +366,330 @@ describe('native auxiliary output recovery', () => {
 		).to.deep.equal(attempts);
 	});
 
-	it('retains the exact asset payload when wallet fee inputs change a confirmed HTLC child transaction ID', () => {
-		const { state, seen, keys } = setup(),
-			tree = buildTaprootSecondLevelOutput(
-				keys.revocation,
-				keys.delayed,
-				10,
-				undefined,
-				leaf
+	for (const offered of [false, true])
+		it(`binds every funded ${
+			offered ? 'timeout' : 'success'
+		} output and restores its exact asset payload`, () => {
+			const { state, seen, keys } = setup(),
+				tree = buildTaprootSecondLevelOutput(
+					keys.revocation,
+					keys.delayed,
+					10,
+					undefined,
+					leaf
+				);
+			const template = txFor(tree.output);
+			const point = perCommitmentPointFromSecret(
+				generateFromSeed(state.localPerCommitmentSeed, MAX_INDEX)
 			);
-		const template = txFor(tree.output);
-		template.setWitness(0, [Buffer.alloc(64, 19), Buffer.from([0x51])]);
-		const payload = Buffer.from('persisted pre-signed asset child');
-		const output = {
-			txid: Buffer.from(template.ins[0].hash).reverse().toString('hex'),
-			outputIndex: 0,
-			amount: 100000n,
-			outputType: OutputType.RECEIVED_HTLC,
-			status: OutputStatus.SPEND_BROADCAST,
-			confirmationHeight: 100,
-			sweepTxHex: template.toHex(),
-			auxiliaryData: payload
-		};
-		const monitor = ChainMonitor.restore(
-			{
-				monitorState: MonitorState.RESOLVING,
-				currentBlockHeight: 100,
-				trackedOutputs: [output],
-				commitmentBroadcast: {
-					commitmentType: CommitmentType.OUR_COMMITMENT,
-					commitmentNumber: 0n,
-					txid: output.txid,
-					blockHeight: 100,
-					trackedOutputs: [output]
-				}
-			},
-			state,
-			destination,
-			1,
-			priv(2),
-			priv(3),
-			undefined,
-			priv(4),
-			priv(5)
-		);
-		const funded = template.clone();
-		funded.addInput(Buffer.alloc(32, 77), 0);
-		funded.addOutput(destination, 1000);
-		const tracked = monitor.getTrackedOutputs()[0];
-		const dispatch = (transaction: bitcoin.Transaction) =>
-			(
-				monitor as unknown as {
+			const localKey = derivePrivateKey(
+				priv(5),
+				point,
+				state.localBasepoints.htlcBasepoint
+			);
+			const remoteKey = derivePrivateKey(
+				priv(14),
+				point,
+				state.remoteBasepoints!.htlcBasepoint
+			);
+			const preimage = Buffer.alloc(32, 19);
+			const paymentHash = bitcoin.crypto.sha256(preimage);
+			const htlcTree = offered
+				? buildTaprootOfferedHtlcOutput(
+						keys.revocation,
+						Buffer.from(ecc.pointFromScalar(localKey, true)!),
+						Buffer.from(ecc.pointFromScalar(remoteKey, true)!),
+						paymentHash,
+						undefined,
+						leaf
+				  )
+				: buildTaprootReceivedHtlcOutput(
+						keys.revocation,
+						Buffer.from(ecc.pointFromScalar(localKey, true)!),
+						Buffer.from(ecc.pointFromScalar(remoteKey, true)!),
+						paymentHash,
+						500,
+						undefined,
+						leaf
+				  );
+			const spendLeaf = offered ? htlcTree.timeout : htlcTree.success;
+			const digest = (transaction: bitcoin.Transaction, hashType: number) =>
+				transaction.hashForWitnessV1(
+					0,
+					transaction.ins.map((_, index) =>
+						index === 0 ? htlcTree.output : Buffer.alloc(0)
+					),
+					transaction.ins.map((_, index) => (index === 0 ? 100000 : 0)),
+					hashType,
+					tapleafHash(spendLeaf.script)
+				);
+			template.setWitness(0, [
+				Buffer.concat([
+					Buffer.from(ecc.signSchnorr(digest(template, 0x83), remoteKey)),
+					Buffer.from([0x83])
+				]),
+				Buffer.concat([
+					Buffer.from(ecc.signSchnorr(digest(template, 0x83), localKey)),
+					Buffer.from([0x83])
+				]),
+				...(offered ? [] : [preimage]),
+				spendLeaf.script,
+				spendLeaf.controlBlock
+			]);
+			const payload = Buffer.from('persisted pre-signed asset child');
+			const output = {
+				txid: Buffer.from(template.ins[0].hash).reverse().toString('hex'),
+				outputIndex: 0,
+				amount: 100000n,
+				witnessScript: htlcTree.output,
+				paymentHash,
+				outputType: offered
+					? OutputType.OFFERED_HTLC
+					: OutputType.RECEIVED_HTLC,
+				status: OutputStatus.SPEND_BROADCAST,
+				confirmationHeight: 100,
+				sweepTxHex: template.toHex(),
+				auxiliaryData: payload
+			};
+			const monitor = ChainMonitor.restore(
+				{
+					monitorState: MonitorState.RESOLVING,
+					currentBlockHeight: 100,
+					trackedOutputs: [output],
+					commitmentBroadcast: {
+						commitmentType: CommitmentType.OUR_COMMITMENT,
+						commitmentNumber: 0n,
+						txid: output.txid,
+						blockHeight: 100,
+						trackedOutputs: [output]
+					}
+				},
+				state,
+				destination,
+				1,
+				priv(2),
+				priv(3),
+				undefined,
+				priv(4),
+				priv(5)
+			);
+			let funded = template.clone();
+			funded.addInput(Buffer.alloc(32, 77), 0);
+			funded.addOutput(
+				bitcoin.payments.p2wpkh({ pubkey: pub(20) }).output!,
+				1000
+			);
+			const tracked = monitor.getTrackedOutputs()[0];
+			const dispatch = (transaction: bitcoin.Transaction) =>
+				(
+					monitor as unknown as {
+						_broadcastSweepAction(
+							output: typeof tracked,
+							tx: Buffer,
+							description: string
+						): import('../../src/lightning/chain/types').ChainAction;
+					}
+				)._broadcastSweepAction(
+					tracked,
+					transaction.toBuffer(),
+					'asset HTLC fee attachment'
+				);
+			const action = dispatch(template);
+			expect(action.type).equal(ChainActionType.FEE_BUMP_AND_BROADCAST);
+			if (action.type !== ChainActionType.FEE_BUMP_AND_BROADCAST)
+				throw new Error('Missing HTLC fee action');
+			expect(action.finalizeHtlcFunding).not.equal(undefined);
+			expect(action.signHtlcFunding).not.equal(undefined);
+			const corrupted = template.clone();
+			corrupted.ins[0].witness = corrupted.ins[0].witness.map((item) =>
+				Buffer.from(item)
+			);
+			corrupted.ins[0].witness[1][0] ^= 1;
+			expect(() => dispatch(corrupted)).to.throw(
+				'Original asset HTLC signature'
+			);
+			funded = bitcoin.Transaction.fromBuffer(
+				action.signHtlcFunding!(funded.toBuffer())
+			);
+			expect(funded.ins[0].witness[0]).deep.equal(template.ins[0].witness[0]);
+			expect(funded.ins[0].witness[1][64]).equal(0x81);
+			const verify = (
+				transaction: bitcoin.Transaction,
+				index: number,
+				key: Buffer,
+				hashType: number
+			) =>
+				ecc.verifySchnorr(
+					digest(transaction, hashType),
+					Buffer.from(ecc.pointFromScalar(key, true)!).subarray(1),
+					transaction.ins[0].witness[index].subarray(0, 64)
+				);
+			expect(verify(funded, 0, remoteKey, 0x83)).equal(true);
+			expect(verify(funded, 1, localKey, 0x81)).equal(true);
+			const reordered = funded.clone();
+			[reordered.ins[0], reordered.ins[1]] = [
+				reordered.ins[1],
+				reordered.ins[0]
+			];
+			const reorderedDigest = (hashType: number) =>
+				reordered.hashForWitnessV1(
+					1,
+					[Buffer.alloc(0), htlcTree.output],
+					[0, 100000],
+					hashType,
+					tapleafHash(spendLeaf.script)
+				);
+			expect(
+				ecc.verifySchnorr(
+					reorderedDigest(0x81),
+					Buffer.from(ecc.pointFromScalar(localKey, true)!).subarray(1),
+					reordered.ins[1].witness[1].subarray(0, 64)
+				)
+			).equal(true);
+			expect(
+				ecc.verifySchnorr(
+					reorderedDigest(0x83),
+					Buffer.from(ecc.pointFromScalar(remoteKey, true)!).subarray(1),
+					reordered.ins[1].witness[0].subarray(0, 64)
+				)
+			).equal(false);
+			const wrongSignature = funded.clone();
+			wrongSignature.ins[0].witness = wrongSignature.ins[0].witness.map(
+				(item) => Buffer.from(item)
+			);
+			wrongSignature.ins[0].witness[1][0] ^= 1;
+			expect(action.finalizeHtlcFunding!(wrongSignature.toBuffer())).equal(
+				false
+			);
+			const stripped = funded.clone();
+			stripped.ins.splice(1);
+			expect(verify(stripped, 1, localKey, 0x81)).equal(true);
+			stripped.addOutput(destination, 330);
+			expect(verify(stripped, 0, remoteKey, 0x83)).equal(true);
+			expect(verify(stripped, 1, localKey, 0x81)).equal(false);
+			expect(action.finalizeHtlcFunding!(stripped.toBuffer())).equal(false);
+			const invalid = funded.clone();
+			invalid.outs[0].value--;
+			expect(action.finalizeHtlcFunding!(invalid.toBuffer())).equal(false);
+			expect(action.finalizeHtlcFunding!(funded.toBuffer(), 4000n)).equal(true);
+			expect(dispatch(funded).type).equal(ChainActionType.BROADCAST_TX);
+			expect(tracked.auxiliarySweepFee).equal(4000n);
+			expect(
+				tracked.auxiliarySweepAttempts![funded.getId()].auxiliarySweepFee
+			).equal(4000n);
+			expect(action.finalizeHtlcFunding!(funded.toBuffer())).equal(false);
+			expect(
+				monitor.getFullState().trackedOutputs[0].auxiliaryHtlcFeeFunded
+			).equal(true);
+			const pending = deserializeChainMonitorState(
+				serializeChainMonitorState(monitor.getFullState())
+			);
+			pending.trackedOutputs[0].auxiliaryHtlcFeeFunded = false;
+			pending.trackedOutputs[0].sweepTxHex = template.toHex();
+			const replacing = ChainMonitor.restore(
+				pending,
+				state,
+				destination,
+				2,
+				priv(2),
+				priv(3),
+				undefined,
+				priv(4),
+				priv(5)
+			);
+			const replacement = (
+				replacing as unknown as {
 					_broadcastSweepAction(
 						output: typeof tracked,
-						tx: Buffer,
+						transaction: Buffer,
 						description: string
 					): import('../../src/lightning/chain/types').ChainAction;
 				}
 			)._broadcastSweepAction(
-				tracked,
-				transaction.toBuffer(),
-				'asset HTLC fee attachment'
+				replacing.getTrackedOutputs()[0],
+				template.toBuffer(),
+				'replacement'
 			);
-		const action = dispatch(template);
-		expect(action.type).equal(ChainActionType.FEE_BUMP_AND_BROADCAST);
-		if (action.type !== ChainActionType.FEE_BUMP_AND_BROADCAST)
-			throw new Error('Missing HTLC fee action');
-		expect(action.finalizeHtlcFunding).not.equal(undefined);
-		const invalid = funded.clone();
-		invalid.outs[0].value--;
-		expect(action.finalizeHtlcFunding!(invalid.toBuffer())).equal(false);
-		expect(action.finalizeHtlcFunding!(funded.toBuffer(), 4000n)).equal(true);
-		expect(dispatch(funded).type).equal(ChainActionType.BROADCAST_TX);
-		expect(tracked.auxiliarySweepFee).equal(4000n);
-		expect(
-			tracked.auxiliarySweepAttempts![funded.getId()].auxiliarySweepFee
-		).equal(4000n);
-		expect(action.finalizeHtlcFunding!(funded.toBuffer())).equal(false);
-		expect(
-			monitor.getFullState().trackedOutputs[0].auxiliaryHtlcFeeFunded
-		).equal(true);
-		const pending = deserializeChainMonitorState(
-			serializeChainMonitorState(monitor.getFullState())
-		);
-		pending.trackedOutputs[0].auxiliaryHtlcFeeFunded = false;
-		pending.trackedOutputs[0].sweepTxHex = template.toHex();
-		const replacing = ChainMonitor.restore(
-			pending,
-			state,
-			destination,
-			2,
-			priv(2),
-			priv(3),
-			undefined,
-			priv(4),
-			priv(5)
-		);
-		const replacement = (
-			replacing as unknown as {
-				_broadcastSweepAction(
-					output: typeof tracked,
-					transaction: Buffer,
-					description: string
-				): import('../../src/lightning/chain/types').ChainAction;
-			}
-		)._broadcastSweepAction(
-			replacing.getTrackedOutputs()[0],
-			template.toBuffer(),
-			'replacement'
-		);
-		if (replacement.type !== ChainActionType.FEE_BUMP_AND_BROADCAST)
-			throw new Error('Missing replacement context');
-		expect(replacement.conflictingCandidateTxids).include(funded.getId());
-		expect(replacement.previousFundedTransaction).deep.equal(funded.toBuffer());
-		expect(replacement.previousFee).equal(4000n);
-		monitor.handleOutputSpent(output.txid, 0, funded, 101);
-		const restored = deserializeChainMonitorState(
-			serializeChainMonitorState(monitor.getFullState())
-		);
-		expect(
-			restored.trackedOutputs[0].auxiliarySweepAttempts![funded.getId()]
-				.transaction
-		).to.equal(funded.toHex());
-		expect(
-			restored.trackedOutputs[0].auxiliarySweepAttempts![funded.getId()]
-				.auxiliaryData
-		).to.deep.equal(payload);
-		expect(
-			restored.trackedOutputs.some(
-				(item) => item.txid === funded.getId() && item.isSecondLevelHtlc
-			)
-		).to.equal(true);
-		expect(seen[0].inputs[0].previousAuxiliaryData).to.deep.equal(payload);
-	});
+			if (replacement.type !== ChainActionType.FEE_BUMP_AND_BROADCAST)
+				throw new Error('Missing replacement context');
+			expect(replacement.conflictingCandidateTxids).include(funded.getId());
+			expect(replacement.previousFundedTransaction).deep.equal(
+				funded.toBuffer()
+			);
+			expect(replacement.previousFee).equal(4000n);
+			let bumped = template.clone();
+			bumped.addInput(Buffer.alloc(32, 78), 0);
+			bumped.addOutput(funded.outs[1].script, 500);
+			bumped = bitcoin.Transaction.fromBuffer(
+				replacement.signHtlcFunding!(bumped.toBuffer())
+			);
+			expect(verify(bumped, 1, localKey, 0x81)).equal(true);
+			expect(replacement.finalizeHtlcFunding!(bumped.toBuffer(), 4500n)).equal(
+				true
+			);
+			// A third party can replace only external fee inputs without knowing our key.
+			const external = funded.clone();
+			external.ins[1].hash = Buffer.alloc(32, 79);
+			expect(verify(external, 1, localKey, 0x81)).equal(true);
+			const altered = external.clone();
+			altered.addOutput(destination, 330);
+			const rejected = ChainMonitor.restore(
+				deserializeChainMonitorState(
+					serializeChainMonitorState(replacing.getFullState())
+				),
+				state,
+				destination,
+				2,
+				priv(2),
+				priv(3),
+				undefined,
+				priv(4),
+				priv(5)
+			);
+			rejected.handleOutputSpent(output.txid, 0, altered, 101);
+			expect(
+				rejected.getTrackedOutputs()[0].auxiliarySweepAttempts![altered.getId()]
+			).equal(undefined);
+			expect(
+				rejected.getTrackedOutputs().some((item) => item.isSecondLevelHtlc)
+			).equal(false);
+			const resumed = ChainMonitor.restore(
+				deserializeChainMonitorState(
+					serializeChainMonitorState(replacing.getFullState())
+				),
+				state,
+				destination,
+				2,
+				priv(2),
+				priv(3),
+				undefined,
+				priv(4),
+				priv(5)
+			);
+			resumed.handleOutputSpent(output.txid, 0, external, 101);
+			const restored = deserializeChainMonitorState(
+				serializeChainMonitorState(resumed.getFullState())
+			);
+			expect(
+				restored.trackedOutputs[0].auxiliarySweepAttempts![external.getId()]
+					.transaction
+			).to.equal(external.toHex());
+			expect(restored.trackedOutputs[0].sweepTxHex).equal(external.toHex());
+			expect(
+				restored.trackedOutputs[0].auxiliarySweepAttempts![external.getId()]
+					.auxiliaryHtlcFeeFunded
+			).equal(true);
+			expect(
+				restored.trackedOutputs[0].auxiliarySweepAttempts![external.getId()]
+					.auxiliaryData
+			).to.deep.equal(payload);
+			expect(
+				restored.trackedOutputs.some(
+					(item) => item.txid === external.getId() && item.isSecondLevelHtlc
+				)
+			).to.equal(true);
+			expect(seen[0].inputs[0].previousAuxiliaryData).to.deep.equal(payload);
+		});
 
 	it('refuses asset-burning fallback and unrelated signing requests', () => {
 		const { state, keys } = setup();

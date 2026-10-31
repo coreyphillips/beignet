@@ -1791,7 +1791,7 @@ export class ChainWatcher extends EventEmitter {
 				this.activeBroadcasts.delete(attempt);
 				return;
 			}
-			if (this.hasConfirmedConflictingSweep(attempt)) {
+			if (this.shouldPauseSweepBroadcast(attempt)) {
 				this.queueFailedBroadcast(attempt);
 				this.activeBroadcasts.delete(attempt);
 				return;
@@ -1804,7 +1804,7 @@ export class ChainWatcher extends EventEmitter {
 						if (!this.isCurrentGeneration(generation)) return;
 						this.retireResolvedAttempt(attempt!);
 						if (attempt!.retired) return;
-						if (this.hasConfirmedConflictingSweep(attempt!)) {
+						if (this.shouldPauseSweepBroadcast(attempt!)) {
 							this.queueFailedBroadcast(attempt!);
 							return;
 						}
@@ -1817,7 +1817,7 @@ export class ChainWatcher extends EventEmitter {
 				if (!this.isCurrentGeneration(generation)) return;
 				if (attempt) this.retireResolvedAttempt(attempt);
 				if (attempt?.retired) return;
-				if (attempt && this.hasConfirmedConflictingSweep(attempt)) {
+				if (attempt && this.shouldPauseSweepBroadcast(attempt)) {
 					this.queueFailedBroadcast(attempt);
 					return;
 				}
@@ -1923,6 +1923,80 @@ export class ChainWatcher extends EventEmitter {
 			)
 		)
 			this.failedBroadcasts.push(attempt);
+	}
+
+	/** Keep observing older remedies without bidding against a newer signed one. */
+	private shouldPauseSweepBroadcast(attempt: IFailedBroadcast): boolean {
+		if (this.hasConfirmedConflictingSweep(attempt)) return true;
+		for (const monitor of this.channelManager.getMonitors?.().values() ?? []) {
+			if (typeof monitor.getFullState !== 'function') continue;
+			const outputs = monitor.getFullState().trackedOutputs;
+			const values = new Map(
+				outputs.map((output) => [
+					`${output.txid}:${output.outputIndex}`,
+					output.amount
+				])
+			);
+			for (const output of outputs) {
+				const archived = output.auxiliarySweepAttempts?.[attempt.txidHex];
+				if (
+					!archived ||
+					archived.transaction !== attempt.rawTx.toString('hex') ||
+					!output.sweepTxHex ||
+					output.sweepTxHex === archived.transaction
+				)
+					continue;
+				try {
+					const original = bitcoin.Transaction.fromBuffer(attempt.rawTx);
+					const preferred = bitcoin.Transaction.fromHex(output.sweepTxHex);
+					const saved = output.auxiliarySweepAttempts?.[preferred.getId()];
+					if (
+						saved?.transaction !== output.sweepTxHex ||
+						preferred.ins.some(
+							(input) => !input.witness.length && !input.script.length
+						)
+					)
+						continue;
+					const source = `${output.txid}:${output.outputIndex}`;
+					const spends = (tx: bitcoin.Transaction): boolean =>
+						tx.ins.some(
+							(input) =>
+								`${Buffer.from(input.hash).reverse().toString('hex')}:${
+									input.index
+								}` === source
+						);
+					if (!spends(original) || !spends(preferred)) continue;
+					const fee = (
+						tx: bitcoin.Transaction,
+						recorded?: bigint
+					): bigint | undefined => {
+						if (recorded !== undefined)
+							return recorded >= 0n ? recorded : undefined;
+						let total = 0n;
+						for (const input of tx.ins) {
+							const amount = values.get(
+								`${Buffer.from(input.hash).reverse().toString('hex')}:${
+									input.index
+								}`
+							);
+							if (amount === undefined) return undefined;
+							total += amount;
+						}
+						const paid =
+							total -
+							tx.outs.reduce((sum, entry) => sum + BigInt(entry.value), 0n);
+						return paid >= 0n ? paid : undefined;
+					};
+					const oldFee = fee(original, archived.auxiliarySweepFee);
+					const newFee = fee(preferred, saved.auxiliarySweepFee);
+					if (oldFee !== undefined && newFee !== undefined && newFee > oldFee)
+						return true;
+				} catch {
+					// Incomplete or malformed evidence cannot suppress a valid claim.
+				}
+			}
+		}
+		return false;
 	}
 
 	/** A verified competing confirmation pauses retries until finality or reorg. */
@@ -2116,7 +2190,7 @@ export class ChainWatcher extends EventEmitter {
 			for (const fb of pendingBroadcasts) {
 				this.retireResolvedAttempt(fb);
 				if (fb.retired) continue;
-				if (this.hasConfirmedConflictingSweep(fb)) {
+				if (this.shouldPauseSweepBroadcast(fb)) {
 					this.queueFailedBroadcast(fb);
 					continue;
 				}
@@ -2142,7 +2216,7 @@ export class ChainWatcher extends EventEmitter {
 						if (!this.isCurrentGeneration(generation)) return;
 						this.retireResolvedAttempt(fb);
 						if (fb.retired) return;
-						if (this.hasConfirmedConflictingSweep(fb)) {
+						if (this.shouldPauseSweepBroadcast(fb)) {
 							fb.retryCount = Math.max(0, fb.retryCount - 1);
 							this.queueFailedBroadcast(fb);
 							return;

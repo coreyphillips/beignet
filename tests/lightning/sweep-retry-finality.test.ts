@@ -170,6 +170,58 @@ const fixture = async (twoInputs = false) => {
 };
 
 describe('Confirmed asset sweep retry retirement', () => {
+	it('parks an older fee candidate until the monitor restores it as the active claim', async () => {
+		const env = await fixture();
+		try {
+			env.winner.setWitness(0, [Buffer.alloc(64, 1)]);
+			env.obsolete.setWitness(0, [Buffer.alloc(64, 2)]);
+			const output = env.output();
+			output.sweepTxHex = env.obsolete.toHex();
+			output.auxiliarySweepAttempts![env.winner.getId()].transaction =
+				env.winner.toHex();
+			output.auxiliarySweepAttempts![env.obsolete.getId()].transaction =
+				env.obsolete.toHex();
+			env.backend.broadcastTransaction = async (raw) => {
+				const txid = bitcoin.Transaction.fromHex(raw).getId();
+				env.sent.push(txid);
+				return txid;
+			};
+			env.send(env.winner);
+			await settle();
+			expect(env.sent).to.have.length(0);
+			env.send(env.obsolete);
+			await settle();
+			expect(env.sent).to.deep.equal([env.obsolete.getId()]);
+			env.block(101);
+			await settle();
+			expect(env.sent).to.deep.equal([env.obsolete.getId()]);
+			output.sweepTxHex = env.winner.toHex();
+			env.block(102);
+			await settle();
+			expect(env.sent).to.include(env.winner.getId());
+			expect(output.auxiliarySweepAttempts![env.obsolete.getId()]).not.to.equal(
+				undefined
+			);
+			expect(env.failures).to.have.length(0);
+		} finally {
+			env.watcher.stop();
+		}
+	});
+
+	it('does not let an unsigned replacement suppress an older signed claim', async () => {
+		const env = await fixture();
+		try {
+			env.winner.setWitness(0, [Buffer.alloc(64, 1)]);
+			env.output().auxiliarySweepAttempts![env.winner.getId()].transaction =
+				env.winner.toHex();
+			env.send(env.winner);
+			await settle();
+			expect(env.sent).to.include(env.winner.getId());
+		} finally {
+			env.watcher.stop();
+		}
+	});
+
 	it('retires a conflicting queued attempt at irrevocable depth without a permanent failure', async () => {
 		const env = await fixture();
 		try {
