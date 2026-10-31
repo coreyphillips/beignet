@@ -2279,6 +2279,53 @@ async function bootDaemon(
 			);
 		},
 		'GET /direct-funding/config': () => success(node.getDirectFundingConfig()),
+		// ── Ranked receive primaries (issue #1922) ──
+		//
+		// Every write answers with the whole list, balances and receive target
+		// included, the same shape GET /primaries reads.
+		'GET /primaries': () => success(node.listPrimaries()),
+		'POST /primaries/add': (body) => {
+			const {
+				pubkey,
+				host: primaryHost,
+				port: primaryPort,
+				uri,
+				rank
+			} = body as {
+				pubkey?: string;
+				host?: string;
+				port?: number;
+				uri?: string;
+				rank?: number;
+			};
+			return success(
+				node.addPrimary({
+					pubkey: pubkey as string,
+					...(primaryHost !== undefined ? { host: primaryHost } : {}),
+					...(primaryPort !== undefined ? { port: primaryPort } : {}),
+					...(uri !== undefined ? { uri } : {}),
+					...(rank !== undefined ? { rank } : {})
+				})
+			);
+		},
+		'POST /primaries/remove': (body) =>
+			success(
+				node.removePrimary((body as { pubkey?: string }).pubkey as string)
+			),
+		'POST /primaries/reorder': (body) =>
+			success(
+				node.reorderPrimaries((body as { order?: string[] }).order as string[])
+			),
+		'POST /primaries/threshold': (body) => {
+			const { fillThresholdSat } = body as { fillThresholdSat?: number | null };
+			if (fillThresholdSat === undefined) {
+				throw new BeignetError(
+					'INVALID_PARAMS',
+					'fillThresholdSat is required (null for no cap)'
+				);
+			}
+			return success(node.setPrimariesFillThreshold(fillThresholdSat));
+		},
 		// What tells a client its request was paid: a direct-funding payment
 		// settles no invoice and pays no address (issue #1893).
 		'GET /direct-funding/received': () =>

@@ -541,6 +541,36 @@ export interface DirectFundingConfigInfo {
 	minAmountSat: number;
 }
 
+/** One ranked receive primary as `listPrimaries` reports it (issue #1922). */
+export interface PrimaryInfo {
+	pubkey: string;
+	/** 1 is the highest rank. */
+	rank: number;
+	host: string | null;
+	port: number | null;
+	/** A `pubkey@address` peer URI, for ws://, wss:// and iroh: primaries. */
+	uri: string | null;
+	/** The fill threshold that applies to this primary; null means no cap. */
+	thresholdSat: number | null;
+	/** Our local balance summed over our usable channels with it. */
+	balanceSat: number;
+	/** How many of those channels there are; 0 means none yet. */
+	channelCount: number;
+	belowThreshold: boolean;
+	/** Whether a receive with no peer named would pick this primary. */
+	isReceiveTarget: boolean;
+	/** 1-based position in the order a receive tries the primaries. */
+	selectionOrder: number;
+}
+
+export interface PrimariesInfo {
+	fillThresholdSat: number | null;
+	/** Rank order. */
+	primaries: PrimaryInfo[];
+	/** The current receive target's pubkey, or null with no primaries. */
+	receiveTarget: string | null;
+}
+
 export interface HoldInvoiceInfo {
 	paymentHash: PaymentHashHex;
 	bolt11: string;

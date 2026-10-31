@@ -366,6 +366,8 @@ async function main(): Promise<void> {
 			return handleQueue();
 		case 'direct-funding':
 			return handleDirectFunding();
+		case 'primaries':
+			return handlePrimaries();
 		case 'l402':
 			return handleL402();
 		case 'auth':
@@ -2099,6 +2101,87 @@ async function handleQueue(): Promise<void> {
 	}
 }
 
+/** Ranked receive primaries and the fill threshold (issue #1922). */
+async function handlePrimaries(): Promise<void> {
+	const sub = filteredArgs[1];
+	const pos = positionalArgs(new Set(['--host', '--port', '--uri', '--rank']));
+	// Number(), not parseInt: "1.5" and "10k" must reach the daemon as the
+	// invalid values they are rather than as a truncated number.
+	const numberFlag = (name: string): number | undefined => {
+		const raw = parseFlag(name);
+		return raw === undefined ? undefined : Number(raw);
+	};
+	const usage = (message: string): void => {
+		output({ ok: false, error: { code: 'INVALID_PARAMS', message } });
+		process.exitCode = 1;
+	};
+	switch (sub) {
+		case undefined:
+		case 'list':
+			return outputResult(await httpRequest('GET', '/primaries'));
+		case 'add':
+			if (!pos[2]) {
+				return usage(
+					'Usage: beignet primaries add <pubkey> [--host H --port P | --uri U] [--rank N]'
+				);
+			}
+			return outputResult(
+				await httpRequest('POST', '/primaries/add', {
+					pubkey: pos[2],
+					host: parseFlag('--host'),
+					port: numberFlag('--port'),
+					uri: parseFlag('--uri'),
+					rank: numberFlag('--rank')
+				})
+			);
+		case 'remove':
+			if (!pos[2]) return usage('Usage: beignet primaries remove <pubkey>');
+			return outputResult(
+				await httpRequest('POST', '/primaries/remove', { pubkey: pos[2] })
+			);
+		case 'reorder':
+			if (pos.length < 3) {
+				return usage('Usage: beignet primaries reorder <pubkey> [pubkey...]');
+			}
+			return outputResult(
+				await httpRequest('POST', '/primaries/reorder', {
+					order: pos.slice(2)
+				})
+			);
+		case 'threshold': {
+			const rawThreshold = pos[2];
+			if (!rawThreshold)
+				return usage('Usage: beignet primaries threshold <sats|none>');
+			const fillThresholdSat =
+				rawThreshold === 'none' ? null : Number(rawThreshold);
+			// JSON turns non-finite numbers into null, which would remove the cap.
+			if (
+				fillThresholdSat !== null &&
+				(rawThreshold.trim() === '' ||
+					!Number.isSafeInteger(fillThresholdSat) ||
+					fillThresholdSat < 0)
+			) {
+				return usage(
+					'Threshold must be a non-negative safe integer in sats, or none'
+				);
+			}
+			return outputResult(
+				await httpRequest('POST', '/primaries/threshold', { fillThresholdSat })
+			);
+		}
+		default:
+			output({
+				ok: false,
+				error: {
+					code: 'UNKNOWN_COMMAND',
+					message:
+						'Usage: beignet primaries [list|add|remove|reorder|threshold]'
+				}
+			});
+			process.exitCode = 1;
+	}
+}
+
 /**
  * Third-party direct funding (issue #613): a payer's ordinary on-chain payment
  * becomes this node's channel funding.
@@ -3254,6 +3337,17 @@ BOLT 12 Offers:
   offer list                             List local offers
   offer decode <offer>                   Decode a BOLT 12 offer string
   offer pay <offer> [amountSats] [--max-fee <sats>]  Pay a BOLT 12 offer
+
+Receive primaries (ranked peers receives are steered to):
+  primaries [list]                       Rank, balance and receive target of
+                                         each primary, and the fill threshold
+  primaries add <pubkey> [--host H --port P | --uri U] [--rank N]
+                                         Add a primary, last unless --rank
+  primaries remove <pubkey>              Drop a primary
+  primaries reorder <pubkey> [pubkey...] Re-rank: name every primary once,
+                                         highest rank first
+  primaries threshold <sats|none>        Sats a primary is filled to before
+                                         receives move to the next one
 
 Direct funding (a payer's on-chain payment IS this node's channel funding):
   direct-funding configure [--lsp <pubkey>] [--lsp-host H] [--lsp-port P]
