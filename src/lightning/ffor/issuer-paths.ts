@@ -13,11 +13,13 @@ import type {
 import { constructBlindedPath } from '../onion/blinded-path';
 import type { IBlindedPayInfo } from '../offer/types';
 import type { IFforIssuerHop } from './issuer-messages';
+import { DEFAULT_MIN_FINAL_CLTV_EXPIRY } from '../invoice/types';
 
 /**
  * Fold relay terms upstream-first into one blinded_payinfo, the way the
  * node's own path builder does for its intro extension: the upstream hop's
- * fee applies on top of the downstream amount, fees included.
+ * fee applies on top of the downstream amount, fees included. The CLTV
+ * aggregate also includes the recipient's final delay.
  */
 export function aggregateBlindedPayInfo(
 	relayHops: IFforIssuerHop[]
@@ -28,7 +30,7 @@ export function aggregateBlindedPayInfo(
 	const last = relayHops[relayHops.length - 1];
 	let base = last.feeBaseMsat;
 	let prop = last.feeProportionalMillionths;
-	let cltv = last.cltvExpiryDelta;
+	let cltv = last.cltvExpiryDelta + DEFAULT_MIN_FINAL_CLTV_EXPIRY;
 	let min = last.htlcMinimumMsat;
 	let max = last.htlcMaximumMsat;
 	for (let i = relayHops.length - 2; i >= 0; i--) {
@@ -68,8 +70,7 @@ export function buildIssuerPaymentPath(
 ): IBlindedPaymentPath {
 	if (hops.length < 2) throw new Error('template needs a relay hop and R');
 	const relays = hops.slice(0, -1);
-	const hopData: IBlindedHopData[] = relays.map((h, i) => ({
-		nextNodeId: hops[i + 1].nodeId,
+	const hopData: IBlindedHopData[] = relays.map((h) => ({
 		shortChannelId: h.shortChannelId,
 		paymentRelay: {
 			cltvExpiryDelta: h.cltvExpiryDelta,

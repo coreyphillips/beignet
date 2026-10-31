@@ -610,13 +610,14 @@ export function payPart(
 	paymentHash: Buffer,
 	paymentSecret: Buffer,
 	partMsat: bigint,
-	totalMsat: bigint
+	totalMsat: bigint,
+	additionalCltv = 0
 ): void {
 	const inv = decodeInvoice(bolt11);
 	const blinded = inv.blindedPaths![0];
 	// eslint-disable-next-line @typescript-eslint/no-explicit-any
 	const a = alice as any;
-	const finalCltvExpiry = a.paddedFinalCltvExpiry() as number;
+	const finalCltvExpiry = additionalCltv;
 	const route = findRouteToBlindedPath(
 		alice.getGraph(),
 		Buffer.from(alice.getNodeId(), 'hex'),

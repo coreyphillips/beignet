@@ -80,7 +80,28 @@ export interface IAuxiliaryHtlcResolution {
 	outcome: 'fulfilled' | 'failed';
 }
 
+/** Optional peer-specific compatibility using standard BOLT 2 CSV fields. */
+export interface IAuxiliaryOpeningCsvPolicy {
+	mode: 'symmetric';
+	/** Defaults to configured toSelfDelay and cannot reduce that protection. */
+	minimumDelay?: number;
+	/** Maximum mirrored peer delay, at most 2016 blocks. Defaults to 2016. */
+	maximumDelay?: number;
+	/** Outgoing request, within the bounds. Defaults to minimumDelay. */
+	preferredDelay?: number;
+}
+
+/** Effective opening policy, retained across restart and later funding epochs. */
+export interface IAuxiliaryOpeningCsvState {
+	mode: 'symmetric';
+	minimumDelay: number;
+	maximumDelay: number;
+	localDelay: number;
+}
+
 export interface IChannelAuxiliaryState {
+	/** Chosen before open/accept; absent on existing unrestricted channels. */
+	openingCsvPolicy?: IAuxiliaryOpeningCsvState;
 	/** Source-bound peer public points received with commitment_signed. */
 	childRevocationBasepoints?: Map<string, Buffer>;
 	/** Opaque funding asset state. The provider owns its schema and validation. */

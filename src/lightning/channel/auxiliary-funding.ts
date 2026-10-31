@@ -1,3 +1,4 @@
+import { copyAuxiliaryOpeningCsvPolicy } from './auxiliary-csv';
 import {
 	MAX_AUXILIARY_HTLCS_PER_PARTY,
 	AUXILIARY_CHANNEL_DUST_LIMIT
@@ -77,6 +78,10 @@ export interface IAuxiliaryForwardPlacement extends IAuxiliaryForwardContext {
 }
 
 export interface IAuxiliaryChannelConfig {
+	/** Standard-wire CSV compatibility for new channels only. Does not authorize legacy signatures. */
+	openingCsvPolicy?(
+		peerPubkey: string
+	): import('./auxiliary').IAuxiliaryOpeningCsvPolicy | undefined;
 	/** Explicitly permit delegated Bitcoin and asset custody for independently scoped revoked HTLC children. */
 	allowRevokedChildCustody?: boolean;
 	/** Explicit new-channel compatibility for peers lacking native fixed-output HTLCs. */
@@ -177,6 +182,13 @@ export function applyAuxiliaryFunding(
 		descriptor.fundingTaprootMerkleRoot
 	);
 	state.auxiliaryState = {
+		...(state.auxiliaryState?.openingCsvPolicy
+			? {
+					openingCsvPolicy: copyAuxiliaryOpeningCsvPolicy(
+						state.auxiliaryState.openingCsvPolicy
+					)
+			  }
+			: {}),
 		channelData: Buffer.from(descriptor.channelData),
 		localBalance: descriptor.localBalance,
 		remoteBalance: descriptor.remoteBalance,

@@ -47,6 +47,7 @@ import { constructBlindedPath } from '../onion/blinded-path';
 import type { OnionMessageManager } from '../onion-message/manager';
 import { getPublicKey } from '../crypto/ecdh';
 import { BITCOIN_CHAIN_HASH } from '../channel/types';
+import { DEFAULT_MIN_FINAL_CLTV_EXPIRY } from '../invoice/types';
 
 /** TLV type for BOLT 12 invoice request in onion messages */
 export const TLV_INVOICE_REQUEST = 64;
@@ -1046,7 +1047,7 @@ export class OfferManager extends EventEmitter {
 				{
 					feeBaseMsat: 0,
 					feeProportionalMillionths: 0,
-					cltvExpiryDelta: 18,
+					cltvExpiryDelta: DEFAULT_MIN_FINAL_CLTV_EXPIRY,
 					htlcMinimumMsat: 1n,
 					htlcMaximumMsat: 21_000_000n * 100_000_000n * 1000n
 				}

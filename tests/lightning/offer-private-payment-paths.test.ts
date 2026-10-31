@@ -172,7 +172,7 @@ describe('Offer invoices via private payment paths (issue #544)', function () {
 			).to.equal(true);
 			// The CLN-style shape: zero-fee self path, unchanged.
 			expect(invoice.blindedPayInfo![0].feeBaseMsat).to.equal(0);
-			expect(invoice.blindedPayInfo![0].cltvExpiryDelta).to.equal(18);
+			expect(invoice.blindedPayInfo![0].cltvExpiryDelta).to.equal(40);
 		} finally {
 			destroyParties(parties);
 		}

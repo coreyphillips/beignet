@@ -1,3 +1,7 @@
+import {
+	createAuxiliaryOpeningCsvPolicy,
+	auxiliaryCsvPolicyError
+} from './auxiliary-csv';
 import type { INativeInteractiveFundingSetup } from './interactive-funding';
 import { applyAuxiliaryClose } from './auxiliary-close';
 import {
@@ -1530,6 +1534,13 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		)
 			throw new Error('Temporary channel id is already in use');
 
+		const baseConfig = this.config.localConfig || DEFAULT_CHANNEL_CONFIG;
+		const csvPolicy = opts?.auxiliary
+			? createAuxiliaryOpeningCsvPolicy(
+					this.config.auxiliaryChannels?.openingCsvPolicy?.(peerPubkey),
+					baseConfig.toSelfDelay
+			  )
+			: undefined;
 		const chKeys = this.deriveKeysForNewChannel();
 		const state = createOpenerState({
 			temporaryChannelId: opts?.auxiliary
@@ -1537,12 +1548,17 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 				: randomBytes(32),
 			fundingSatoshis,
 			pushMsat: pushMsat || 0n,
-			localConfig: this.config.localConfig || DEFAULT_CHANNEL_CONFIG,
+			localConfig: csvPolicy
+				? { ...baseConfig, toSelfDelay: csvPolicy.localDelay }
+				: baseConfig,
 			localBasepoints: chKeys.basepoints,
 			localPerCommitmentSeed: chKeys.perCommitmentSeed
 		});
 
-		if (opts?.auxiliary) applyAuxiliaryFunding(state, opts.auxiliary);
+		if (opts?.auxiliary) {
+			applyAuxiliaryFunding(state, opts.auxiliary);
+			if (csvPolicy) state.auxiliaryState!.openingCsvPolicy = csvPolicy;
+		}
 
 		if (opts?.trusted) {
 			state.zeroConfEnabled = true;
@@ -1691,6 +1707,17 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 	): Buffer | null {
 		const peerPubkey = this.findPeerForChannel(channel);
 		if (!peerPubkey) return null;
+		const csvState = channel.getFullState();
+		const csvError = auxiliaryCsvPolicyError(
+			csvState.auxiliaryState?.openingCsvPolicy,
+			csvState.localConfig.toSelfDelay,
+			csvState.remoteConfig.toSelfDelay
+		);
+		if (csvError) {
+			this.abortPendingOpen(channel, csvError);
+			return null;
+		}
+
 		const proposedChannelId = deriveChannelId(fundingTxid, fundingOutputIndex);
 		if (
 			!this.channelIdAvailableForLifecycle(
@@ -4334,9 +4361,16 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			return;
 		}
 		const tempId = msg.temporaryChannelId.toString('hex');
+		const baseConfig = this.config.localConfig || DEFAULT_CHANNEL_CONFIG;
+		let csvPolicy: ReturnType<typeof createAuxiliaryOpeningCsvPolicy>;
 		if (isOverlayChannel(msg.channelType)) {
 			try {
 				this.negotiateAssetHtlcOutputs(peerPubkey, msg.channelType);
+				csvPolicy = createAuxiliaryOpeningCsvPolicy(
+					this.config.auxiliaryChannels?.openingCsvPolicy?.(peerPubkey),
+					baseConfig.toSelfDelay,
+					msg.toSelfDelay
+				);
 			} catch (error) {
 				this.refuseInboundOpen(
 					peerPubkey,
@@ -4380,7 +4414,9 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 				temporaryChannelId: msg.temporaryChannelId,
 				fundingSatoshis: msg.fundingSatoshis,
 				pushMsat: msg.pushMsat,
-				localConfig: this.config.localConfig || DEFAULT_CHANNEL_CONFIG,
+				localConfig: csvPolicy
+					? { ...baseConfig, toSelfDelay: csvPolicy.localDelay }
+					: baseConfig,
 				localBasepoints: chKeys.basepoints,
 				localPerCommitmentSeed: chKeys.perCommitmentSeed,
 				remoteBasepoints: {
@@ -4411,7 +4447,10 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 				peerPubkey,
 				msg.temporaryChannelId
 			);
-			if (auxiliary) applyAuxiliaryFunding(state, auxiliary);
+			if (auxiliary) {
+				applyAuxiliaryFunding(state, auxiliary);
+				if (csvPolicy) state.auxiliaryState!.openingCsvPolicy = csvPolicy;
+			}
 			channel = new Channel(
 				state,
 				signer,
@@ -7837,7 +7876,12 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 				PeerErrorCode.NOT_CONNECTED,
 				`Not connected to peer ${peerPubkey}`
 			);
-		return this.negotiateAssetHtlcOutputs(peerPubkey) ? 'fixed' : 'legacy';
+		const fixed = this.negotiateAssetHtlcOutputs(peerPubkey);
+		createAuxiliaryOpeningCsvPolicy(
+			this.config.auxiliaryChannels.openingCsvPolicy?.(peerPubkey),
+			(this.config.localConfig || DEFAULT_CHANNEL_CONFIG).toSelfDelay
+		);
+		return fixed ? 'fixed' : 'legacy';
 	}
 
 	private negotiateAssetHtlcOutputs(
@@ -8071,12 +8115,21 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		// openChannelV2 arrives here rather than through openChannel, so the
 		// guard has to be on both, or half the opens escape it.
 		this._assertNamespaceCanRecordANewChannel();
+		const baseConfig = this.config.localConfig || DEFAULT_CHANNEL_CONFIG;
+		const csvPolicy = opts?.interactiveFunding
+			? createAuxiliaryOpeningCsvPolicy(
+					this.config.auxiliaryChannels?.openingCsvPolicy?.(peerPubkey),
+					baseConfig.toSelfDelay
+			  )
+			: undefined;
 		const chKeys = this.deriveKeysForNewChannel();
 		const state = createOpenerState({
 			temporaryChannelId: randomBytes(32),
 			fundingSatoshis: params.fundingSatoshis,
 			pushMsat: 0n,
-			localConfig: this.config.localConfig || DEFAULT_CHANNEL_CONFIG,
+			localConfig: csvPolicy
+				? { ...baseConfig, toSelfDelay: csvPolicy.localDelay }
+				: baseConfig,
 			localBasepoints: chKeys.basepoints,
 			localPerCommitmentSeed: chKeys.perCommitmentSeed
 		});
@@ -8104,6 +8157,8 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 				opts.interactiveFunding,
 				params.fundingFeeratePerkw
 			);
+		if (csvPolicy && state.auxiliaryState)
+			state.auxiliaryState.openingCsvPolicy = csvPolicy;
 		channel.setBlockHeight(this._currentBlockHeight);
 		if (this.config.chainHash) {
 			channel.announcementChainHash = this.config.chainHash;
@@ -8128,6 +8183,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 
 		const alignedParams: IDualFundingParams = {
 			...params,
+			toSelfDelay: csvPolicy?.localDelay ?? params.toSelfDelay,
 			chainHash: params.chainHash ?? this.config.chainHash,
 			channelType,
 			channelFlags,
@@ -8297,6 +8353,25 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			);
 			return;
 		}
+		const baseConfig = this.config.localConfig || DEFAULT_CHANNEL_CONFIG;
+		let csvPolicy: ReturnType<typeof createAuxiliaryOpeningCsvPolicy>;
+		if (isOverlayChannel(msg.channelType)) {
+			try {
+				this.negotiateAssetHtlcOutputs(peerPubkey, msg.channelType);
+				csvPolicy = createAuxiliaryOpeningCsvPolicy(
+					this.config.auxiliaryChannels?.openingCsvPolicy?.(peerPubkey),
+					baseConfig.toSelfDelay,
+					msg.toSelfDelay
+				);
+			} catch (error) {
+				this.refuseInboundOpen(
+					peerPubkey,
+					msg.channelId,
+					error instanceof Error ? error.message : String(error)
+				);
+				return;
+			}
+		}
 		const nativeFunding = this.peerNegotiatedNativeFunding(peerPubkey);
 		let interactive: INativeInteractiveFundingSetup | undefined;
 		if (msg.interactiveFundingSessionId) {
@@ -8327,18 +8402,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			}
 		}
 		const proposedTempId = msg.channelId.toString('hex');
-		if (isOverlayChannel(msg.channelType)) {
-			try {
-				this.negotiateAssetHtlcOutputs(peerPubkey, msg.channelType);
-			} catch (error) {
-				this.refuseInboundOpen(
-					peerPubkey,
-					msg.channelId,
-					error instanceof Error ? error.message : String(error)
-				);
-				return;
-			}
-		}
+
 		if (
 			this.tempChannels.has(proposedTempId) ||
 			this.channels.has(proposedTempId) ||
@@ -8478,7 +8542,9 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 				temporaryChannelId: msg.channelId,
 				fundingSatoshis: 0n,
 				pushMsat: 0n,
-				localConfig: this.config.localConfig || DEFAULT_CHANNEL_CONFIG,
+				localConfig: csvPolicy
+					? { ...baseConfig, toSelfDelay: csvPolicy.localDelay }
+					: baseConfig,
 				localBasepoints: chKeys.basepoints,
 				localPerCommitmentSeed: chKeys.perCommitmentSeed,
 				remoteBasepoints: {
@@ -8517,6 +8583,8 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 					interactive,
 					msg.fundingFeeratePerkw
 				);
+			if (csvPolicy && state.auxiliaryState)
+				state.auxiliaryState.openingCsvPolicy = csvPolicy;
 			channel.setBlockHeight(this._currentBlockHeight);
 			if (this.config.chainHash) {
 				channel.announcementChainHash = this.config.chainHash;
@@ -8548,8 +8616,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 				).maxHtlcValueInFlightMsat,
 				htlcMinimumMsat: (this.config.localConfig || DEFAULT_CHANNEL_CONFIG)
 					.htlcMinimumMsat,
-				toSelfDelay: (this.config.localConfig || DEFAULT_CHANNEL_CONFIG)
-					.toSelfDelay,
+				toSelfDelay: csvPolicy?.localDelay ?? baseConfig.toSelfDelay,
 				maxAcceptedHtlcs: (this.config.localConfig || DEFAULT_CHANNEL_CONFIG)
 					.maxAcceptedHtlcs,
 				locktime: msg.locktime,

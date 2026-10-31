@@ -53,8 +53,8 @@ function wordsToSigningBytes(words: number[]): Buffer {
 }
 
 /**
- * Compute the signing hash for a BOLT 11 invoice.
- * Per BOLT 11: SHA256( UTF8(hrp) || wordsToBytes(data) )
+ * Construct the BOLT 11 message before the signer's single SHA256 operation.
+ * The message is UTF8(hrp) || wordsToBytes(data).
  *
  * The data words (5-bit values) are converted to 8-bit bytes with
  * right-padding before hashing. This matches the reference implementation
@@ -62,11 +62,18 @@ function wordsToSigningBytes(words: number[]): Buffer {
  *
  * Note: dataWords includes timestamp + tagged fields, but NOT the signature words.
  */
-export function computeSigningHash(hrp: string, dataWords: number[]): Buffer {
+export function computeSigningMessage(
+	hrp: string,
+	dataWords: number[]
+): Buffer {
 	const hrpBytes = Buffer.from(hrp, 'utf8');
 	const dataBytes = wordsToSigningBytes(dataWords);
-	const preimage = Buffer.concat([hrpBytes, dataBytes]);
-	return sha256Digest(preimage);
+	return Buffer.concat([hrpBytes, dataBytes]);
+}
+
+/** Compute the single SHA256 digest signed by a BOLT 11 invoice. */
+export function computeSigningHash(hrp: string, dataWords: number[]): Buffer {
+	return sha256Digest(computeSigningMessage(hrp, dataWords));
 }
 
 /**

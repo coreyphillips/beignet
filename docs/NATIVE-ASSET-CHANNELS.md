@@ -20,6 +20,28 @@ HTLC state and revocation records. A restored asset channel requires its
 provider again; missing providers fail closed. Every native channel reconstruction
 must pass the configured provider, including startup, rollback and recovery.
 
+A peer-scoped `auxiliaryChannels.openingCsvPolicy` can select
+`{ mode: 'symmetric', preferredDelay: 144, maximumDelay: 2016 }` for an
+integrated upstream peer whose asset implementation requires equal CSV delays.
+This uses ordinary `open_channel`/`accept_channel` fields. Incoming opens mirror
+an in-range peer delay; outgoing opens advertise the preferred delay and reject
+an unequal acceptance before asset funding preparation or signatures. The
+minimum defaults to the configured local delay and cannot reduce that protection.
+All bounds must be integers from 1 through 2016. The preferred delay defaults to
+the minimum. Without this profile, native asymmetric CSV behavior is unchanged.
+The effective policy is persisted with pending opens, including native dual
+funding, so restart or a later configuration change cannot rewrite advertised
+terms. Existing restored channels without the field retain their original terms.
+An unequal response requires a new opening, not a rewrite of accepted fields.
+
+This CSV profile does not opt into legacy HTLC signatures. A new upstream channel
+without fixed-output support still requires the independent, explicit
+`allowLegacyHtlcSignatures(peerPubkey)` policy. Applications should restrict both
+policies to identified peers. Asset channels in the published upstream deployment
+require [integrated litd](https://docs.lightning.engineering/lightning-network-tools/taproot-assets/taproot-assets-channels);
+[standalone tapd](https://docs.lightning.engineering/lightning-network-tools/taproot-assets/get-tapd)
+connected to a vanilla LND node does not provide that channel integration.
+
 Funding validation hooks can wait for asynchronous proof verification before
 sending accept_channel or signing funding_created. Pending checks are bounded,
 duplicates are coalesced, conflicting messages abort, and detach invalidates

@@ -184,6 +184,17 @@ describe('Blinded-path payer self-relay (issue #550)', function () {
 
 			const settled: unknown[] = [];
 			bob.on('invoice:settled', (info: unknown) => settled.push(info));
+			const receiver = bob as unknown as {
+				handleFinalHopHtlc: (...args: unknown[]) => void;
+			};
+			const original = receiver.handleFinalHopHtlc.bind(bob);
+			const receivedCltv: number[] = [];
+			receiver.handleFinalHopHtlc = (...args): void => {
+				receivedCltv.push(
+					(args[4] as { outgoingCltvValue: number }).outgoingCltvValue
+				);
+				original(...args);
+			};
 
 			const payment = alice.payBolt12Invoice(invoice);
 			expect(payment.status, payment.failureReason ?? '').to.equal(
@@ -194,6 +205,10 @@ describe('Blinded-path payer self-relay (issue #550)', function () {
 			// inverted away by the self-relay).
 			expect(payment.amountMsat).to.equal(amountMsat);
 			expect(settled, 'bob settled the invoice').to.have.length(1);
+			expect(
+				receivedCltv,
+				'final payload uses the current height baseline'
+			).deep.equal([0]);
 		} finally {
 			alice.destroy();
 			bob.destroy();

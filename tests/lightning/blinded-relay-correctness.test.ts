@@ -32,6 +32,14 @@ import { encodeShortChannelId } from '../../src/lightning/gossip/types';
 import { MessageType } from '../../src/lightning/message/types';
 import { decodeUpdateFailMalformedHtlcMessage } from '../../src/lightning/message/channel-update';
 import { INVALID_ONION_BLINDING } from '../../src/lightning/onion/types';
+import {
+	IBolt12Invoice,
+	encodeInvoiceTlv,
+	getTlvRecords,
+	computeMerkleRootFromRecords,
+	computeSignatureHash,
+	schnorrSign
+} from '../../src/lightning/offer';
 
 // ─────────────── Helpers (mirrors node.test.ts) ───────────────
 
@@ -181,6 +189,8 @@ function buildTwoHopBlinded(opts: {
 	registerOutScid: boolean;
 	relay?: IRelayTerms;
 	bobConfig?: Partial<INodeConfig>;
+	finalCltv?: number;
+	tightCltv?: boolean;
 }): {
 	alice: LightningNode;
 	bob: LightningNode;
@@ -238,30 +248,38 @@ function buildTwoHopBlinded(opts: {
 	const issue = (
 		relay: IRelayTerms = opts.relay ?? defaultRelay
 	): { invoiceStr: string; paymentHash: Buffer } => {
+		const finalCltv = opts.finalCltv ?? 40;
 		const baseInv = carol.createInvoice({
 			amountMsat: 1_000_000n,
-			description: 'blinded-relay'
+			description: 'blinded-relay',
+			minFinalCltvExpiry: finalCltv
 		});
 		const decoded = decodeInvoice(baseInv.bolt11);
 		const hopData: IBlindedHopData[] = [
 			{
-				nextNodeId: carolPub,
 				shortChannelId: scidBC,
 				paymentRelay: relay,
-				paymentConstraints: CONSTRAINTS
+				paymentConstraints: opts.tightCltv
+					? { ...CONSTRAINTS, maxCltvExpiry: relay.cltvExpiryDelta + finalCltv }
+					: CONSTRAINTS
 			},
-			{ pathId: decoded.paymentSecret, paymentConstraints: CONSTRAINTS }
+			{
+				pathId: decoded.paymentSecret,
+				paymentConstraints: opts.tightCltv
+					? { ...CONSTRAINTS, maxCltvExpiry: finalCltv }
+					: CONSTRAINTS
+			}
 		];
 		const path = constructBlindedPath(
 			crypto.randomBytes(32),
 			[bobPub, carolPub],
 			hopData
 		);
-		// One relay hop, so the aggregate payinfo is the hop's own terms.
+		// Canonical BOLT11 aggregates the relay and final recipient delays.
 		const payInfo = {
 			feeBaseMsat: relay.feeBaseMsat,
 			feeProportionalMillionths: relay.feeProportionalMillionths,
-			cltvExpiryDelta: relay.cltvExpiryDelta,
+			cltvExpiryDelta: relay.cltvExpiryDelta + finalCltv,
 			htlcMinimumMsat: 0n,
 			htlcMaximumMsat: 1_000_000_000n
 		};
@@ -272,7 +290,7 @@ function buildTwoHopBlinded(opts: {
 			paymentSecret: decoded.paymentSecret,
 			description: 'blinded-relay',
 			blindedPaths: [{ path, payInfo }],
-			minFinalCltvExpiry: 40,
+			minFinalCltvExpiry: finalCltv,
 			privateKey: nodePrivkeyFor(3)
 		});
 		return { invoiceStr, paymentHash: decoded.paymentHash };
@@ -300,6 +318,77 @@ function tryPay(alice: LightningNode, invoiceStr: string): void {
 }
 
 describe('Blinded relay correctness (S-4.M1 / S-4.M2)', function () {
+	for (const finalCltv of [40, 96])
+		it(`pays a signed BOLT12 path with tight aggregate bounds and final delay ${finalCltv}`, () => {
+			const { alice, bob, carol, invoiceStr, paymentHash } = buildTwoHopBlinded(
+				{ registerOutScid: true, finalCltv, tightCltv: true }
+			);
+			const original = decodeInvoice(invoiceStr);
+			const invoice: IBolt12Invoice = {
+				description: 'Tight BOLT12 aggregate delay',
+				createdAt: BigInt(original.timestamp),
+				amount: original.amountMsat!,
+				paymentHash,
+				nodeId: getPublicKey(nodePrivkeyFor(3)),
+				paths: original.blindedPaths!.map((entry) => entry.path),
+				blindedPayInfo: original.blindedPaths!.map((entry) => entry.payInfo)
+			};
+			invoice.signature = schnorrSign(
+				computeSignatureHash(
+					'lightninginvoicesignature',
+					computeMerkleRootFromRecords(getTlvRecords(encodeInvoiceTlv(invoice)))
+				),
+				nodePrivkeyFor(3)
+			);
+			const expiries: number[] = [];
+			for (const node of [alice, bob])
+				node.on('message:outbound', (_peer, type, payload) => {
+					if (type === MessageType.UPDATE_ADD_HTLC)
+						expiries.push(payload.readUInt32BE(80));
+				});
+			try {
+				expect(carol.getOfferManager().verifyInvoiceSignature(invoice)).equal(
+					true
+				);
+				expect(alice.payBolt12Invoice(invoice).status).equal(
+					PaymentStatus.COMPLETED
+				);
+				expect(carol.getPayment(paymentHash)!.status).equal(
+					PaymentStatus.COMPLETED
+				);
+				expect(expiries).members([40 + finalCltv, finalCltv]);
+			} finally {
+				for (const node of [alice, bob, carol]) node.destroy();
+			}
+		});
+	for (const finalCltv of [40, 96])
+		it(`pays a canonical BOLT11 path with exactly its aggregate CLTV and final delay ${finalCltv}`, () => {
+			const { alice, bob, carol, invoiceStr, paymentHash } = buildTwoHopBlinded(
+				{
+					registerOutScid: true,
+					finalCltv,
+					tightCltv: true
+				}
+			);
+			const expiries: number[] = [];
+			for (const node of [alice, bob])
+				node.on('message:outbound', (_peer, type, payload) => {
+					if (type === MessageType.UPDATE_ADD_HTLC)
+						expiries.push(payload.readUInt32BE(80));
+				});
+			try {
+				alice.sendPayment(invoiceStr);
+				expect(alice.getPayment(paymentHash)!.status).equal(
+					PaymentStatus.COMPLETED
+				);
+				expect(carol.getPayment(paymentHash)!.status).equal(
+					PaymentStatus.COMPLETED
+				);
+				expect(expiries).members([40 + finalCltv, finalCltv]);
+			} finally {
+				for (const node of [alice, bob, carol]) node.destroy();
+			}
+		});
 	it('forwards the exact spec amount through a proportional-fee blinded hop (S-4.M1)', function () {
 		const { alice, bob, carol, invoiceStr, paymentHash } = buildTwoHopBlinded({
 			registerOutScid: true

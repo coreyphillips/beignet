@@ -19,7 +19,7 @@ import {
 } from './types';
 import { buildHrp } from './amount';
 import { bufferToWords, encodeUintToWords, encodeTaggedField } from './words';
-import { signInvoice } from './signing';
+import { computeSigningMessage, signInvoice, verifyInvoice } from './signing';
 import { encodeLndInvoiceBlindedPath } from '../onion/blinded-path';
 
 /**
@@ -27,6 +27,52 @@ import { encodeLndInvoiceBlindedPath } from '../onion/blinded-path';
  * Returns the bech32-encoded invoice string.
  */
 export function encode(options: IInvoiceCreationOptions): string {
+	const { hrp, dataWords } = encodeUnsigned(options);
+	const signature = signInvoice(hrp, dataWords, options.privateKey);
+	return bech32.encode(
+		hrp,
+		[...dataWords, ...bufferToWords(signature)],
+		BECH32_MAX_LIMIT
+	);
+}
+
+/**
+ * Encode with an authorized external signer, without exporting a private key.
+ * The signer receives the exact message to hash once with SHA256 and returns
+ * 65 BOLT 11 bytes: compact ECDSA r || s followed by the recovery ID (0 to 3).
+ * The recovered identity must match publicKey before an invoice is returned.
+ */
+export async function encodeWithSigner(
+	options: Omit<IInvoiceCreationOptions, 'privateKey'>,
+	publicKey: Buffer,
+	signMessage: (message: Buffer) => Promise<Buffer>
+): Promise<string> {
+	if (publicKey.length !== 33 || (publicKey[0] !== 2 && publicKey[0] !== 3)) {
+		throw new Error('Invoice signer public key must be compressed');
+	}
+	const expectedKey = Buffer.from(publicKey);
+	if (options.payeeNodeKey && !options.payeeNodeKey.equals(expectedKey)) {
+		throw new Error('Invoice payee does not match the external signer');
+	}
+	const { hrp, dataWords } = encodeUnsigned(options);
+	const signature = Buffer.from(
+		await signMessage(computeSigningMessage(hrp, dataWords))
+	);
+	const recovered = verifyInvoice(hrp, dataWords, signature);
+	if (!recovered?.equals(expectedKey)) {
+		throw new Error('External invoice signature does not match the signer');
+	}
+	return bech32.encode(
+		hrp,
+		[...dataWords, ...bufferToWords(signature)],
+		BECH32_MAX_LIMIT
+	);
+}
+
+function encodeUnsigned(options: Omit<IInvoiceCreationOptions, 'privateKey'>): {
+	hrp: string;
+	dataWords: number[];
+} {
 	// Validate required fields
 	if (!options.paymentHash || options.paymentHash.length !== 32) {
 		throw new Error('paymentHash must be 32 bytes');
@@ -166,14 +212,7 @@ export function encode(options: IInvoiceCreationOptions): string {
 		);
 	}
 
-	// Sign: hash(hrp || dataWords) → 65-byte signature
-	const sigBytes = signInvoice(hrp, dataWords, options.privateKey);
-
-	// Convert 65-byte signature to 5-bit words (104 words)
-	const sigWords = bufferToWords(sigBytes);
-	const allWords = [...dataWords, ...sigWords];
-
-	return bech32.encode(hrp, allWords, BECH32_MAX_LIMIT);
+	return { hrp, dataWords };
 }
 
 /**

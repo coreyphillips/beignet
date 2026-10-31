@@ -234,6 +234,10 @@ describe('FFOR BOLT 12 issuer (M9.5, section 9.7)', function () {
 			w.w.getNodeId()
 		);
 		expect(invoice.paths![0].blindedHops, 'W, S, R').to.have.length(3);
+		expect(
+			invoice.blindedPayInfo![0].cltvExpiryDelta,
+			'both relays and recipient delay'
+		).to.equal(120);
 		// The attestation verifies under R's node id.
 		const att = invoice.records!.find(
 			(r) => r.type === FF_ISSUER_ATTESTATION_TLV

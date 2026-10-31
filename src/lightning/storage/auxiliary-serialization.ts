@@ -1,3 +1,4 @@
+import { copyAuxiliaryOpeningCsvPolicy } from '../channel/auxiliary-csv';
 import { ecc } from '../../utils/ecc';
 import type { HtlcDirection } from '../channel/types';
 import type {
@@ -20,6 +21,7 @@ interface ISerializedAuxiliaryCommitment {
 	htlcOutputIndexes?: [string, number][];
 }
 export interface ISerializedAuxiliaryState {
+	openingCsvPolicy?: IChannelAuxiliaryState['openingCsvPolicy'];
 	childRevocationBasepoints?: [string, string][];
 	channelData: string;
 	resolvedHtlcs?: [
@@ -133,6 +135,13 @@ export function serializeAuxiliaryState(
 		peerSignatures: serializeCustomRecords(value.peerSignatures)
 	});
 	return {
+		...(state.openingCsvPolicy
+			? {
+					openingCsvPolicy: copyAuxiliaryOpeningCsvPolicy(
+						state.openingCsvPolicy
+					)
+			  }
+			: {}),
 		channelData: state.channelData.toString('hex'),
 		childRevocationBasepoints:
 			state.childRevocationBasepoints &&
@@ -233,6 +242,13 @@ export function deserializeAuxiliaryState(
 	if (localBalance + remoteBalance > 0xffffffffffffffffn)
 		throw new Error('Serialized asset balances overflow');
 	return {
+		...(state.openingCsvPolicy !== undefined
+			? {
+					openingCsvPolicy: copyAuxiliaryOpeningCsvPolicy(
+						state.openingCsvPolicy
+					)
+			  }
+			: {}),
 		channelData: bytes(state.channelData),
 		childRevocationBasepoints:
 			state.childRevocationBasepoints &&

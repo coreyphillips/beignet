@@ -1,3 +1,4 @@
+import { auxiliaryCsvPolicyError } from './auxiliary-csv';
 import {
 	acceptChildRevocationRecord,
 	addChildRevocationRecord
@@ -2304,6 +2305,12 @@ export class Channel {
 		// ChannelManager keys tempChannels by.
 		const refuse = (reason: string): ChannelAction[] =>
 			refuseWithWireError(this._state.temporaryChannelId, reason);
+		const csvError = auxiliaryCsvPolicyError(
+			this._state.auxiliaryState?.openingCsvPolicy,
+			this._state.localConfig.toSelfDelay,
+			msg.toSelfDelay
+		);
+		if (csvError) return refuse(csvError);
 		const auxiliaryError = validateAuxiliaryChannelType(
 			this._state,
 			msg.channelType
@@ -2462,6 +2469,14 @@ export class Channel {
 				}
 			];
 		}
+
+		const csvError = auxiliaryCsvPolicyError(
+			this._state.auxiliaryState?.openingCsvPolicy,
+			this._state.localConfig.toSelfDelay,
+			this._state.remoteConfig.toSelfDelay
+		);
+		if (csvError)
+			return refuseWithWireError(this._state.temporaryChannelId, csvError);
 
 		this._state.fundingTxid = fundingTxid;
 		this._state.fundingOutputIndex = fundingOutputIndex;
@@ -2725,6 +2740,12 @@ export class Channel {
 		// demands, having been sliced from the wire by decodeOpenChannelMessage.
 		const refuse = (reason: string): ChannelAction[] =>
 			refuseWithWireError(msg.temporaryChannelId, reason);
+		const csvError = auxiliaryCsvPolicyError(
+			this._state.auxiliaryState?.openingCsvPolicy,
+			this._state.localConfig.toSelfDelay,
+			msg.toSelfDelay
+		);
+		if (csvError) return refuse(csvError);
 		const auxiliaryError = validateAuxiliaryChannelType(
 			this._state,
 			msg.channelType
@@ -2996,6 +3017,12 @@ export class Channel {
 		// above and cannot be steered.
 		const refuse = (reason: string): ChannelAction[] =>
 			refuseWithWireError(msg.temporaryChannelId, reason);
+		const csvError = auxiliaryCsvPolicyError(
+			this._state.auxiliaryState?.openingCsvPolicy,
+			this._state.localConfig.toSelfDelay,
+			this._state.remoteConfig.toSelfDelay
+		);
+		if (csvError) return refuse(csvError);
 
 		this._state.fundingTxid = msg.fundingTxid;
 		this._state.fundingOutputIndex = msg.fundingOutputIndex;
@@ -17907,6 +17934,12 @@ export class Channel {
 		// error is scoped to the id the opener used.
 		const refuse = (reason: string): ChannelAction[] =>
 			refuseWithWireError(msg.channelId, reason);
+		const csvError = auxiliaryCsvPolicyError(
+			this._state.auxiliaryState?.openingCsvPolicy,
+			this._state.localConfig.toSelfDelay,
+			msg.toSelfDelay
+		);
+		if (csvError) return refuse(csvError);
 
 		const acceptV2MaxHtlcErr = validateU64(
 			localParams.maxHtlcValueInFlightMsat,
@@ -18208,6 +18241,12 @@ export class Channel {
 		}
 		const refuse = (reason: string): ChannelAction[] =>
 			refuseWithWireError(msg.channelId, reason);
+		const csvError = auxiliaryCsvPolicyError(
+			this._state.auxiliaryState?.openingCsvPolicy,
+			this._state.localConfig.toSelfDelay,
+			msg.toSelfDelay
+		);
+		if (csvError) return refuse(csvError);
 		if (this._state.state !== ChannelState.DUAL_FUNDING_V2) {
 			// Wire-visible, unlike the state guards of handleOpenChannel,
 			// handleOpenChannel2, handleAcceptChannel, handleFundingCreated and

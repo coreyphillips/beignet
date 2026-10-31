@@ -479,7 +479,25 @@ describe('Async receive service (issue #709)', () => {
 			expect(grant.maxHoldBlocks).to.equal(20);
 			await disconnect(lsp, carol, w.cutBC);
 
-			const first = await payAndSettle(w, 5_000_000n);
+			// Ask for more time explicitly so admission must clamp it. Canonical
+			// payinfo already includes the complete recipient and hold delays.
+			const payWithExtraCltv = async (): Promise<
+				ReturnType<typeof asyncInvoice>
+			> => {
+				const invoice = asyncInvoice(carol, 5_000_000n);
+				payPart(
+					alice,
+					invoice.bolt11,
+					invoice.paymentHash,
+					invoice.paymentSecret,
+					5_000_000n,
+					5_000_000n,
+					43
+				);
+				await settle();
+				return invoice;
+			};
+			const first = await payWithExtraCltv();
 			const [r] = heldRecords(lsp);
 			expect(r.paymentHashHex).to.equal(first.paymentHash.toString('hex'));
 			const proposed = Math.min(r.forwardCltv - 40, r.incomingCltvExpiry - 18);
@@ -500,7 +518,7 @@ describe('Async receive service (issue #709)', () => {
 			// The same path judged later, with fewer than minRemainingCltv
 			// blocks left before its cutoff: refused, nothing reserved.
 			lsp.handleNewBlock(proposed - 5);
-			const late = await payAndSettle(w, 5_000_000n);
+			const late = await payWithExtraCltv();
 			await waitFor(
 				() =>
 					alice.getPayment(late.paymentHash)?.status === PaymentStatus.FAILED,

@@ -1,3 +1,7 @@
+import type { INativeInteractiveFundingSetup } from '../../src/lightning/channel/interactive-funding';
+import { decodeAcceptChannel2Message } from '../../src/lightning/message/dual-funding';
+import type { IAuxiliaryOpeningCsvPolicy } from '../../src/lightning/channel/auxiliary';
+import { decodeAcceptChannelMessage } from '../../src/lightning/message/channel-open';
 import { ChainMonitor } from '../../src/lightning/chain/chain-monitor';
 import { buildAuxiliaryJusticePackage } from '../../src/lightning/watchtower/auxiliary';
 import {
@@ -1865,5 +1869,372 @@ describe('native asset funding broadcaster configuration', () => {
 		} finally {
 			node.destroy();
 		}
+	});
+});
+
+describe('Peer-scoped auxiliary opening CSV policy', () => {
+	async function opening(
+		options: {
+			aliceDelay?: number;
+			bobDelay?: number;
+			alicePolicy?: IAuxiliaryOpeningCsvPolicy;
+			bobPolicy?: IAuxiliaryOpeningCsvPolicy;
+			allowLegacy?: boolean;
+			dual?: boolean;
+		} = {}
+	) {
+		const descriptor: IAuxiliaryFundingDescriptor = {
+			temporaryChannelId: hash('csv-policy-opening'),
+			fundingTaprootMerkleRoot: hash('csv-policy-root'),
+			channelData: Buffer.from('csv funding assets'),
+			localBalance: 900n,
+			remoteBalance: 100n
+		};
+		const extension = provider();
+		const aliceConfig = config(1, extension, descriptor);
+		const bobConfig = config(2, provider(), {
+			...descriptor,
+			localBalance: 100n,
+			remoteBalance: 900n
+		});
+		aliceConfig.localConfig!.toSelfDelay = options.aliceDelay ?? 144;
+		bobConfig.localConfig!.toSelfDelay = options.bobDelay ?? 144;
+		aliceConfig.auxiliaryChannels!.openingCsvPolicy = () => options.alicePolicy;
+		bobConfig.auxiliaryChannels!.openingCsvPolicy = () => options.bobPolicy;
+		aliceConfig.auxiliaryChannels!.allowLegacyHtlcSignatures = () =>
+			options.allowLegacy !== false;
+		const calls = { prepare: 0, resolve: 0, accepted: 0, commitments: 0 };
+		const resolve = bobConfig.auxiliaryChannels!.resolveIncoming!;
+		bobConfig.auxiliaryChannels!.resolveIncoming = (...args) => {
+			calls.resolve++;
+			return resolve(...args);
+		};
+		bobConfig.auxiliaryChannels!.beforeAccept = async () => {
+			calls.prepare++;
+		};
+		const build = extension.buildCommitment;
+		extension.buildCommitment = (...args) => {
+			calls.commitments++;
+			return build(...args);
+		};
+		const alice = new ChannelManager(aliceConfig);
+		const bob = new ChannelManager(bobConfig);
+		const aPub = aliceConfig.localBasepoints.fundingPubkey.toString('hex');
+		const bPub = bobConfig.localBasepoints.fundingPubkey.toString('hex');
+		const outgoing: { side: string; type: number; payload: Buffer }[] = [];
+		const errors: string[] = [];
+		for (const [side, manager] of [
+			['alice', alice],
+			['bob', bob]
+		] as const) {
+			manager.on('error', (_id, error) => errors.push(String(error)));
+			manager.on('message:outbound', (_peer, type, payload) =>
+				outgoing.push({ side, type, payload })
+			);
+		}
+		alice.on('channel:accepted', () => calls.accepted++);
+		let channel: Channel;
+		const openType = options.dual
+			? MessageType.OPEN_CHANNEL2
+			: MessageType.OPEN_CHANNEL;
+		const acceptType = options.dual
+			? MessageType.ACCEPT_CHANNEL2
+			: MessageType.ACCEPT_CHANNEL;
+		if (options.dual) {
+			const features = FeatureFlags.empty();
+			for (const feature of [
+				Feature.DUAL_FUND,
+				Feature.OPTION_TAPROOT_OVERLAY,
+				Feature.OPTION_TAPROOT_INTERACTIVE_FUNDING
+			])
+				features.setOptional(feature);
+			for (const manager of [alice, bob]) {
+				manager['config'].localFeatures = features;
+				(manager as unknown as { peerManager: unknown }).peerManager = {
+					getPeer: () => ({ getRemoteInit: () => ({ features }) }),
+					sendToPeer: (peer: string, type: number, payload: Buffer) => {
+						manager.emit('message:outbound', peer, type, payload);
+						return true;
+					}
+				};
+			}
+			const setup: INativeInteractiveFundingSetup = {
+				plan: {
+					sessionId: hash('csv interactive session'),
+					kind: 'dual',
+					fundingTaprootMerkleRoot: descriptor.fundingTaprootMerkleRoot,
+					localBalance: 900n,
+					remoteBalance: 100n,
+					data: descriptor.channelData
+				},
+				contributionSats: 2_000_000n,
+				inputs: [],
+				changeScript: Buffer.alloc(0),
+				contributions: []
+			};
+			bobConfig.auxiliaryChannels!.resolveInteractiveFunding = () => {
+				calls.resolve++;
+				return {
+					...setup,
+					contributionSats: 0n,
+					plan: { ...setup.plan, localBalance: 100n, remoteBalance: 900n }
+				};
+			};
+			channel = alice.createDualFundedChannel(
+				bPub,
+				{
+					fundingSatoshis: setup.contributionSats,
+					fundingFeeratePerkw: 1000,
+					commitmentFeeratePerkw: 1000,
+					dustLimitSatoshis: 330n,
+					maxHtlcValueInFlightMsat:
+						DEFAULT_CHANNEL_CONFIG.maxHtlcValueInFlightMsat,
+					htlcMinimumMsat: DEFAULT_CHANNEL_CONFIG.htlcMinimumMsat,
+					toSelfDelay: aliceConfig.localConfig!.toSelfDelay,
+					maxAcceptedHtlcs: 83,
+					locktime: 0,
+					localBasepoints: aliceConfig.localBasepoints,
+					localPerCommitmentSeed: aliceConfig.localPerCommitmentSeed,
+					secondPerCommitmentPoint: getPublicKey(hash('csv second point'))
+				},
+				{ interactiveFunding: setup }
+			);
+		} else
+			channel = alice.openChannel(bPub, 2_000_000n, 500_000_000n, undefined, {
+				auxiliary: descriptor
+			});
+		const offer = outgoing.find((frame) => frame.type === openType)!;
+		bob.handleMessage(aPub, openType, offer.payload);
+		await new Promise<void>((resolveWait) => setImmediate(resolveWait));
+		const accepted = outgoing.find((frame) => frame.type === acceptType);
+		return {
+			alice,
+			bob,
+			aliceConfig,
+			bobConfig,
+			channel,
+			extension,
+			outgoing,
+			errors,
+			calls,
+			accepted,
+			accept: () => {
+				if (!accepted) throw new Error('Missing accept_channel');
+				alice.handleMessage(bPub, acceptType, accepted.payload);
+			}
+		};
+	}
+
+	it('mirrors a permitted incoming delay before preparation and completes normal funding', async () => {
+		const fixture = await opening({
+			alicePolicy: { mode: 'symmetric', preferredDelay: 288 },
+			bobPolicy: { mode: 'symmetric', maximumDelay: 500 }
+		});
+		expect(fixture.calls.prepare).equal(1);
+		expect(
+			decodeAcceptChannelMessage(fixture.accepted!.payload).toSelfDelay
+		).equal(288);
+		expect(fixture.bobConfig.localConfig!.toSelfDelay).equal(144);
+		fixture.accept();
+		expect(fixture.calls.accepted).equal(1);
+		expect(fixture.channel.getFullState().remoteConfig.toSelfDelay).equal(288);
+		expect(
+			fixture.channel.getFullState().auxiliaryState!.openingCsvPolicy
+		).deep.equal({
+			mode: 'symmetric',
+			minimumDelay: 144,
+			maximumDelay: 2016,
+			localDelay: 288
+		});
+		expect(
+			fixture.alice.createFunding(
+				fixture.channel,
+				hash('csv funding'),
+				0,
+				Buffer.alloc(64)
+			)
+		).not.equal(null);
+		expect(fixture.errors).deep.equal([]);
+	});
+
+	for (const delay of [72, 501])
+		it(`refuses incoming CSV ${delay} before descriptor and proof callbacks`, async () => {
+			const fixture = await opening({
+				aliceDelay: delay,
+				bobPolicy: { mode: 'symmetric', maximumDelay: 500 }
+			});
+			expect(fixture.accepted).equal(undefined);
+			expect(fixture.calls.resolve).equal(0);
+			expect(fixture.calls.prepare).equal(0);
+			expect(
+				fixture.outgoing.some(
+					(frame) =>
+						frame.side === 'bob' &&
+						frame.type === MessageType.ERROR &&
+						frame.payload.toString().includes('outside the permitted range')
+				)
+			).equal(true);
+		});
+
+	it('rejects unequal acceptance before accepted callbacks and funding signatures', async () => {
+		const fixture = await opening({
+			alicePolicy: { mode: 'symmetric' },
+			bobDelay: 288
+		});
+		fixture.accept();
+		expect(fixture.calls.accepted).equal(0);
+		expect(fixture.calls.commitments).equal(0);
+		expect(
+			fixture.errors.some((error) =>
+				error.includes('requires symmetric CSV delays')
+			)
+		).equal(true);
+		expect(
+			fixture.outgoing.some(
+				(frame) => frame.type === MessageType.FUNDING_CREATED
+			)
+		).equal(false);
+	});
+
+	it('retains the pending opening policy across serialization without consulting new configuration', async () => {
+		const fixture = await opening({
+			alicePolicy: { mode: 'symmetric' },
+			bobDelay: 288
+		});
+		const stored = serializeChannelState(fixture.channel.getFullState());
+		const restored = new Channel(
+			deserializeChannelState(stored),
+			fixture.channel.getSigner()!,
+			fixture.extension
+		);
+		fixture.aliceConfig.auxiliaryChannels!.openingCsvPolicy = () => undefined;
+		const rejected = restored.handleAcceptChannel(
+			decodeAcceptChannelMessage(fixture.accepted!.payload)
+		);
+		expect(
+			rejected.some(
+				(action) =>
+					action.type === ChannelActionType.ERROR &&
+					action.message.includes('symmetric CSV')
+			)
+		).equal(true);
+		delete stored.auxiliaryState!.openingCsvPolicy;
+		const legacy = new Channel(
+			deserializeChannelState(stored),
+			fixture.channel.getSigner()!,
+			fixture.extension
+		);
+		expect(
+			legacy
+				.handleAcceptChannel(
+					decodeAcceptChannelMessage(fixture.accepted!.payload)
+				)
+				.some((action) => action.type === ChannelActionType.ERROR)
+		).equal(false);
+	});
+
+	it('rechecks the persisted delay before any funding signature', async () => {
+		const fixture = await opening({
+			alicePolicy: { mode: 'symmetric' },
+			bobPolicy: { mode: 'symmetric' }
+		});
+		fixture.accept();
+		fixture.channel.getFullState().remoteConfig.toSelfDelay = 288;
+		expect(
+			fixture.alice.createFunding(
+				fixture.channel,
+				hash('changed CSV funding'),
+				0,
+				Buffer.alloc(64)
+			)
+		).equal(null);
+		expect(fixture.calls.commitments).equal(0);
+		expect(fixture.channel.getFullState().fundingTxid).equal(null);
+	});
+
+	it('preserves asymmetric native openings when no profile was selected', async () => {
+		const fixture = await opening({ aliceDelay: 144, bobDelay: 288 });
+		fixture.accept();
+		expect(fixture.calls.accepted).equal(1);
+		expect(fixture.channel.getFullState().remoteConfig.toSelfDelay).equal(288);
+		expect(
+			fixture.channel.getFullState().auxiliaryState!.openingCsvPolicy
+		).equal(undefined);
+	});
+
+	it('applies the same safe policy to native dual-funded opens before resolving their asset plan', async () => {
+		const refused = await opening({
+			dual: true,
+			aliceDelay: 72,
+			bobPolicy: { mode: 'symmetric' }
+		});
+		expect(refused.accepted).equal(undefined);
+		expect(refused.calls.resolve).equal(0);
+		const mirrored = await opening({
+			dual: true,
+			alicePolicy: { mode: 'symmetric', preferredDelay: 288 },
+			bobPolicy: { mode: 'symmetric' }
+		});
+		expect(mirrored.errors).deep.equal([]);
+		expect(
+			decodeAcceptChannel2Message(mirrored.accepted!.payload).toSelfDelay
+		).equal(288);
+		const stored = serializeChannelState(mirrored.channel.getFullState());
+		const restored = new Channel(
+			deserializeChannelState(stored),
+			mirrored.channel.getSigner()!,
+			mirrored.extension
+		);
+		const mismatched = {
+			...decodeAcceptChannel2Message(mirrored.accepted!.payload),
+			toSelfDelay: 144
+		};
+		expect(
+			restored
+				.handleAcceptChannel2(mismatched)
+				.some(
+					(action) =>
+						action.type === ChannelActionType.ERROR &&
+						action.message.includes('symmetric CSV')
+				)
+		).equal(true);
+		expect(restored.getFullState().v2InFlight).equal(null);
+	});
+
+	it('rejects corrupted persisted bounds and independently clones the effective policy', async () => {
+		const fixture = await opening({ alicePolicy: { mode: 'symmetric' } });
+		const stored = serializeChannelState(fixture.channel.getFullState());
+		stored.auxiliaryState!.openingCsvPolicy!.maximumDelay = 100;
+		expect(
+			fixture.channel.getFullState().auxiliaryState!.openingCsvPolicy!
+				.maximumDelay
+		).equal(2016);
+		expect(() => deserializeChannelState(stored)).throws(
+			'Invalid persisted asset channel CSV policy'
+		);
+	});
+
+	it('does not authorize legacy signatures or reduce configured protection', async () => {
+		let rejected: Error | undefined;
+		try {
+			await opening({ allowLegacy: false, alicePolicy: { mode: 'symmetric' } });
+		} catch (error) {
+			rejected = error as Error;
+		}
+		expect(rejected?.message).includes('fixed HTLC outputs');
+
+		const fixture = await opening({
+			bobPolicy: { mode: 'symmetric', minimumDelay: 72 }
+		});
+		expect(fixture.calls.resolve).equal(0);
+		expect(
+			fixture.outgoing.some(
+				(frame) =>
+					frame.type === MessageType.ERROR &&
+					frame.payload
+						.toString()
+						.includes('cannot reduce configured protection')
+			)
+		).equal(true);
 	});
 });

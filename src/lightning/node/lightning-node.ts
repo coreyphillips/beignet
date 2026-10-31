@@ -18963,13 +18963,18 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		// one (the sender learns only the introduction node, never the payee).
 		if (invoice.blindedPaths && invoice.blindedPaths.length > 0) {
 			const blinded = invoice.blindedPaths[0];
+			// Canonical BOLT11 tag20 payinfo already includes the recipient's
+			// final delay. The historical tag25 format carried relay deltas only.
+			const blindedFinalCltv = blinded.path.legacyPaymentData
+				? finalCltvExpiry
+				: 0;
 			const blindedRoute = findRouteToBlindedPath(
 				this.graph,
 				sourceNodeId,
 				blinded.path,
 				blinded.payInfo,
 				paymentAmountMsat,
-				finalCltvExpiry,
+				blindedFinalCltv,
 				undefined,
 				excludedChannels,
 				this.missionControl,
@@ -19388,6 +19393,10 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 						if (!hop.legacyBlindedPaymentData) {
 							delete payload.paymentSecret;
 							delete payload.totalMsat;
+							// BOLT 4 uses the height baseline inside a blinded final
+							// payload. The HTLC itself retains the aggregate delay,
+							// including when the final hop is also the introduction.
+							payload.outgoingCltvValue = baseHeight;
 						}
 						payload.totalAmountMsat = totalMsat ?? hop.amountToForwardMsat;
 					}
@@ -29039,14 +29048,17 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		}
 	}
 
-	/** Quote a blinded route with one explicitly selected asset first hop. */
+	/** Quote a blinded route with one explicitly selected asset first hop.
+	 * Canonical payinfo includes the final delay; finalCltvExpiry is an
+	 * optional additional allowance, defaulting to zero except for tag25.
+	 */
 	queryAuxiliaryBlindedRoute(
 		channelId: Buffer,
 		paths: readonly IBlindedPaymentPath[],
 		amountMsat: bigint,
 		maxFeeMsat: bigint,
 		paymentHash: Buffer,
-		finalCltvExpiry: number = DEFAULT_MIN_FINAL_CLTV_EXPIRY
+		finalCltvExpiry?: number
 	): {
 		route: IRoute;
 		valueMsat: bigint;
@@ -29096,7 +29108,8 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				path.path,
 				path.payInfo,
 				amountMsat,
-				finalCltvExpiry,
+				finalCltvExpiry ??
+					(path.path.legacyPaymentData ? DEFAULT_MIN_FINAL_CLTV_EXPIRY : 0),
 				undefined,
 				undefined,
 				this.missionControl,
@@ -33131,7 +33144,8 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 					invoice.paths[i],
 					payInfo,
 					amountMsat,
-					finalCltvExpiry,
+					// BOLT 4 payinfo already aggregates the final recipient delay.
+					0,
 					undefined,
 					excludedChannels,
 					this.missionControl,

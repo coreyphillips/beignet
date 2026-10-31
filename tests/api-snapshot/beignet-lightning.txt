@@ -100,6 +100,7 @@ property ISerializedAuxiliaryState.closeTransactions?: [ string, string ][]
 property ISerializedAuxiliaryState.localBalance: string
 property ISerializedAuxiliaryState.localCommitments: [ string, ISerializedAuxiliaryCommitment ][]
 property ISerializedAuxiliaryState.localShutdownRecords?: SerializedCustomRecords
+property ISerializedAuxiliaryState.openingCsvPolicy?: channel.IChannelAuxiliaryState['openingCsvPolicy']
 property ISerializedAuxiliaryState.remoteBalance: string
 property ISerializedAuxiliaryState.remoteCommitments: [ string, ISerializedAuxiliaryCommitment ][]
 property ISerializedAuxiliaryState.remoteShutdownRecords?: SerializedCustomRecords
@@ -1638,6 +1639,7 @@ method channel.IAuxiliaryChannelConfig.onAccepted?(channel: channel.Channel, pee
 method channel.IAuxiliaryChannelConfig.onForwardAdmissionFailed?(context: channel.IAuxiliaryForwardPlacement & { customRecords?: message.CustomRecords; }): void
 method channel.IAuxiliaryChannelConfig.onHtlcResolved?(context: channel.IAuxiliaryHtlcResolution & { state: channel.IChannelState; peerPubkey: string; channelId: Buffer; }): void
 method channel.IAuxiliaryChannelConfig.onRevokedCommitment?(channelId: Buffer, revokedTransaction: Buffer, build: (feeRates?: readonly number[]) => watchtower.IAuxiliaryJusticePackage): void
+method channel.IAuxiliaryChannelConfig.openingCsvPolicy?(peerPubkey: string): channel.IAuxiliaryOpeningCsvPolicy | undefined
 method channel.IAuxiliaryChannelConfig.prepareForwardHtlc?(context: channel.IAuxiliaryForwardPlacement): channel.IAuxiliaryPayment
 property channel.IAuxiliaryChannelConfig.provider: channel.IChannelAuxiliaryProvider
 method channel.IAuxiliaryChannelConfig.resolveForwardChannel?(context: channel.IAuxiliaryForwardContext): { channelId: Buffer; peerPubkey: string; } | undefined
@@ -1743,6 +1745,16 @@ property channel.IAuxiliaryInteractiveFundingPlan.kind: 'dual' | 'splice'
 property channel.IAuxiliaryInteractiveFundingPlan.localBalance: bigint
 property channel.IAuxiliaryInteractiveFundingPlan.remoteBalance: bigint
 property channel.IAuxiliaryInteractiveFundingPlan.sessionId: Buffer
+interface channel.IAuxiliaryOpeningCsvPolicy
+property channel.IAuxiliaryOpeningCsvPolicy.maximumDelay?: number
+property channel.IAuxiliaryOpeningCsvPolicy.minimumDelay?: number
+property channel.IAuxiliaryOpeningCsvPolicy.mode: 'symmetric'
+property channel.IAuxiliaryOpeningCsvPolicy.preferredDelay?: number
+interface channel.IAuxiliaryOpeningCsvState
+property channel.IAuxiliaryOpeningCsvState.localDelay: number
+property channel.IAuxiliaryOpeningCsvState.maximumDelay: number
+property channel.IAuxiliaryOpeningCsvState.minimumDelay: number
+property channel.IAuxiliaryOpeningCsvState.mode: 'symmetric'
 interface channel.IAuxiliaryOutput
 property channel.IAuxiliaryOutput.bitcoinValue: bigint
 property channel.IAuxiliaryOutput.cltvExpiry?: number
@@ -1849,6 +1861,7 @@ property channel.IChannelAuxiliaryState.closeTransactions?: Map<string, Buffer>
 property channel.IChannelAuxiliaryState.localBalance: bigint
 property channel.IChannelAuxiliaryState.localCommitments: Map<bigint, channel.IAuxiliaryCommitmentData>
 property channel.IChannelAuxiliaryState.localShutdownRecords?: Map<bigint, Buffer>
+property channel.IChannelAuxiliaryState.openingCsvPolicy?: channel.IAuxiliaryOpeningCsvState
 property channel.IChannelAuxiliaryState.remoteBalance: bigint
 property channel.IChannelAuxiliaryState.remoteCommitments: Map<bigint, channel.IAuxiliaryCommitmentData>
 property channel.IChannelAuxiliaryState.remoteShutdownRecords?: Map<bigint, Buffer>
@@ -4657,12 +4670,14 @@ member invoice.TagType.ROUTING_INFO = 3
 function invoice.bufferToWords(data: Buffer): number[]
 function invoice.buildHrp(network: invoice.Network, amountMsat?: bigint): string
 function invoice.computeSigningHash(hrp: string, dataWords: number[]): Buffer
+function invoice.computeSigningMessage(hrp: string, dataWords: number[]): Buffer
 function invoice.decode(invoiceString: string, options?: invoice.IDecodeOptions): invoice.IInvoice
 function invoice.decodeTaggedField(words: number[], offset: number): { type: number; dataWords: number[]; nextOffset: number; }
 function invoice.decodeUintFromWords(words: number[]): number
 function invoice.encode(options: invoice.IInvoiceCreationOptions): string
 function invoice.encodeTaggedField(type: number, dataWords: number[]): number[]
 function invoice.encodeUintToWords(value: number, wordCount: number): number[]
+function invoice.encodeWithSigner(options: Omit<invoice.IInvoiceCreationOptions, 'privateKey'>, publicKey: Buffer, signMessage: (message: Buffer) => Promise<Buffer>): Promise<string>
 function invoice.ensureHmac(): void
 function invoice.getInvoiceSignerPubkey(privateKey: Buffer): Buffer
 function invoice.hrpAmountToMsat(amountStr: string): bigint
