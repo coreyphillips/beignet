@@ -11,13 +11,14 @@ import type {
 	IFforVoucherChainResolution
 } from './voucher-archive';
 import { fforChainReceiptId, mergeFforVoucherArchive } from './voucher-archive';
+import { decodeFforAssetTerms } from './assets';
 
 /** Preserve observed proof and archive final value with its owning monitor write. */
 export function archiveFforChainEvidence(
 	record: IFforVoucherArchive,
 	monitor: IChainMonitorState
 ): IFforVoucherArchive {
-	if (record.role !== 'R') return record;
+	if (record.role !== 'R' && !record.asset) return record;
 	const broadcast = monitor.commitmentBroadcast;
 	if (
 		!broadcast ||
@@ -34,14 +35,20 @@ export function archiveFforChainEvidence(
 		output.confirmationHeight > 0 &&
 		monitor.currentBlockHeight - output.confirmationHeight >= IRREVOCABLE_DEPTH;
 	let next = record;
+	const carrierMsat = record.asset
+		? decodeFforAssetTerms(Buffer.from(record.asset.terms, 'hex')).carrierMsat
+		: BigInt(record.amountMsat);
 	for (const output of monitor.trackedOutputs) {
 		const spend = output.receivedHtlcSpend;
 		if (
-			output.outputType !== OutputType.RECEIVED_HTLC ||
+			output.outputType !==
+				(record.role === 'R'
+					? OutputType.RECEIVED_HTLC
+					: OutputType.OFFERED_HTLC) ||
 			output.txid !== broadcast.txid ||
 			output.htlcId?.toString() !== record.htlcId ||
 			output.paymentHash?.toString('hex') !== record.paymentHash ||
-			output.amount !== BigInt(record.amountMsat) / 1000n ||
+			output.amount !== carrierMsat / 1000n ||
 			output.cltvExpiry !== record.voucherExpiry ||
 			!spend ||
 			output.resolutionTxid !== spend.txid
@@ -66,8 +73,15 @@ export function archiveFforChainEvidence(
 		)
 			continue;
 		let secondLevel: IFforVoucherChainResolution['secondLevel'];
+		const auxiliaryData =
+			output.auxiliarySweepAttempts?.[spend.txid]?.auxiliaryData;
+		const localAssetClaim =
+			record.asset &&
+			(record.role === 'R' ? !!spend.preimage : !spend.preimage);
+		if (localAssetClaim && !auxiliaryData) continue;
 		if (
-			spend.preimage &&
+			((spend.preimage && record.role === 'R') ||
+				(!spend.preimage && record.role === 'S')) &&
 			broadcast.commitmentType === CommitmentType.OUR_COMMITMENT
 		) {
 			// The monitor only adopts this output after verifying our success
@@ -77,10 +91,17 @@ export function archiveFforChainEvidence(
 					o.txid === spend.txid && o.outputIndex === 0 && o.isSecondLevelHtlc
 			);
 			if (!descendant || !final(descendant)) continue;
+			const descendantData =
+				descendant.auxiliarySweepAttempts?.[descendant.resolutionTxid!]
+					?.auxiliaryData;
+			if (localAssetClaim && !descendantData) continue;
 			secondLevel = {
 				outputIndex: descendant.outputIndex,
 				spendingTxid: descendant.resolutionTxid!,
-				confirmationHeight: descendant.confirmationHeight
+				confirmationHeight: descendant.confirmationHeight,
+				...(descendantData
+					? { auxiliaryData: descendantData.toString('hex') }
+					: {})
 			};
 		}
 		next = mergeFforVoucherArchive(next, {
@@ -91,6 +112,9 @@ export function archiveFforChainEvidence(
 					confirmationHeight: output.confirmationHeight,
 					finalizedHeight: monitor.currentBlockHeight,
 					amountMsat: (output.amount * 1000n).toString(),
+					...(auxiliaryData
+						? { auxiliaryData: auxiliaryData.toString('hex') }
+						: {}),
 					...(secondLevel ? { secondLevel } : {})
 				}
 			]

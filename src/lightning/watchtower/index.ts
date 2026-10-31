@@ -7,6 +7,7 @@ export * from './types';
 export * from './wtwire';
 export * from './blob';
 export * from './justice';
+export * from './auxiliary';
 export { TowerConnection, parseTowerUri } from './tower-connection';
 export {
 	WatchtowerClient,

@@ -9,6 +9,11 @@
 import { calculateCommitmentFee } from '../channel/commitment-builder';
 import type { IFforEpochParams } from './types';
 import {
+	encodeFforAssetTerms,
+	fforVoucherWireAmount,
+	quoteFforAssetAmount
+} from './assets';
+import {
 	FF_BLINDED_HOPS_N,
 	FF_MAX_K,
 	FF_RECONCILE_MARGIN_BLOCKS,
@@ -141,6 +146,9 @@ export function checkDelegatedAmounts(
 
 /** What the book checks need to know about the channel. */
 export interface IFforBookCheckContext {
+	/** S's unreserved asset balance, when the channel carries assets. */
+	sAssetBalance?: bigint;
+	taproot?: boolean;
 	/** R's limits bind the vouchers (S-offered). */
 	rMaxAcceptedHtlcs: number;
 	rMaxHtlcValueInFlightMsat: bigint;
@@ -170,6 +178,35 @@ export function checkVoucherBook(
 ): string | null {
 	const amounts = params.voucherAmountsMsat;
 	const K = params.maxPayments;
+	if (params.assetTerms) {
+		try {
+			encodeFforAssetTerms(params.assetTerms);
+		} catch {
+			return 'invalid asset custody terms';
+		}
+		if (
+			params.assetTerms.amounts.length !== K ||
+			params.assetTerms.amounts.some(
+				(amount, index) =>
+					quoteFforAssetAmount(params.assetTerms!, amount) !== amounts[index]
+			)
+		)
+			return 'asset quote does not match voucher values';
+		const assetSum = params.assetTerms.amounts.reduce(
+			(sum, amount) => sum + amount,
+			0n
+		);
+		if (ctx.sAssetBalance === undefined || assetSum > ctx.sAssetBalance)
+			return 'S cannot cover the asset voucher budget';
+		if (
+			params.hashChain &&
+			params.assetTerms.amounts.some(
+				(amount) => amount !== params.assetTerms!.amounts[0]
+			)
+		)
+			return 'asset hash chain requires uniform voucher units';
+	} else if (ctx.sAssetBalance !== undefined)
+		return 'asset channel requires signed custody terms';
 	if (params.variant !== FforVariant.D) {
 		return `variant ${params.variant} is not Variant D`;
 	}
@@ -188,16 +225,18 @@ export function checkVoucherBook(
 		return `K = ${K} exceeds R's max_accepted_htlcs ${ctx.rMaxAcceptedHtlcs}`;
 	}
 	let sum = 0n;
+	let wireSum = 0n;
 	for (let i = 0; i < amounts.length; i++) {
 		const d = amounts[i];
 		const k = i + 1;
 		if (d < params.minPaymentMsat) {
 			return `d_${k} = ${d} below min_payment_msat ${params.minPaymentMsat}`;
 		}
-		if (d < ctx.htlcMinimumMsat) {
+		const carrier = fforVoucherWireAmount(params, i);
+		if (carrier < ctx.htlcMinimumMsat) {
 			return `d_${k} = ${d} below htlc_minimum_msat ${ctx.htlcMinimumMsat}`;
 		}
-		if (d / 1000n < ctx.dustLimitSatoshis) {
+		if (carrier / 1000n < ctx.dustLimitSatoshis) {
 			return `d_${k} = ${d} would trim (dust limit ${ctx.dustLimitSatoshis} sat)`;
 		}
 		if (d * BigInt(params.feeProportionalMillionths) > U64_MAX) {
@@ -210,11 +249,12 @@ export function checkVoucherBook(
 			return `gross_into_S(d_${k}) overflows u64`;
 		}
 		sum += d;
+		wireSum += carrier;
 	}
 	if (sum !== params.budgetMsat) {
 		return `sum of d_k ${sum} != budget_msat ${params.budgetMsat}`;
 	}
-	if (sum > ctx.rMaxHtlcValueInFlightMsat) {
+	if (wireSum > ctx.rMaxHtlcValueInFlightMsat) {
 		return `sum of d_k ${sum} exceeds R's max_htlc_value_in_flight_msat`;
 	}
 	if (
@@ -224,7 +264,7 @@ export function checkVoucherBook(
 		return `voucher_expiry ${params.voucherExpiry} < settlement_deadline ${params.settlementDeadline} + ${FF_RECONCILE_MARGIN_BLOCKS}`;
 	}
 	// S holds budget + its reserve spendable.
-	if (ctx.sLocalBalanceMsat < sum + ctx.sChannelReserveSat * 1000n) {
+	if (ctx.sLocalBalanceMsat < wireSum + ctx.sChannelReserveSat * 1000n) {
 		return 'S cannot cover budget_msat plus its channel reserve';
 	}
 	// The funder covers fee(K) + anchors at the frozen rate, and the
@@ -234,15 +274,15 @@ export function checkVoucherBook(
 		ctx.feeratePerKw,
 		K,
 		ctx.anchors,
-		false
+		ctx.taproot ?? false
 	);
 	const feeSpike = calculateCommitmentFee(
 		2 * ctx.feeratePerKw,
 		K,
 		ctx.anchors,
-		false
+		ctx.taproot ?? false
 	);
-	const sAfterMsat = ctx.sLocalBalanceMsat - sum;
+	const sAfterMsat = ctx.sLocalBalanceMsat - wireSum;
 	const funderAfterSat =
 		(ctx.sIsFunder ? sAfterMsat : ctx.rLocalBalanceMsat) / 1000n;
 	const funderReserve = ctx.sIsFunder

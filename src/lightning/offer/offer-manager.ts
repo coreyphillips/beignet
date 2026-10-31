@@ -74,6 +74,8 @@ const INVOICE_SIGNATURE_TAG = 'lightninginvoicesignature';
 const INVOICE_REQUEST_SIGNATURE_TAG = 'lightninginvoice_requestsignature';
 
 export interface ICreateOfferOptions {
+	/** Required local invoice policy, durably bound to this offer before publication. */
+	invoicePolicy?: string;
 	/** Amount in millisatoshis (optional for "any amount" offers) */
 	amount?: bigint;
 	/** Human-readable description */
@@ -157,6 +159,24 @@ export type IssuanceAnswer =
  */
 export type IssuancePolicy = (ctx: IIssuanceContext) => IssuanceAnswer;
 
+export interface InvoicePaymentPolicyContext {
+	offer: IOffer;
+	paymentHash: Buffer;
+	pathId: Buffer;
+	amountMsat: bigint;
+}
+export interface InvoicePaymentPolicyDecision {
+	/** Signed invoice feature policy, including optional or compulsory MPP. */
+	features?: Buffer;
+	paths: IBlindedPaymentPath[];
+	relativeExpiry: number;
+	/** Persist authorization before the native invoice is published. */
+	onIssued(invoice: IBolt12Invoice): void;
+}
+export type InvoicePaymentPolicy = (
+	context: InvoicePaymentPolicyContext
+) => InvoicePaymentPolicyDecision;
+
 export interface IRequestInvoiceOptions {
 	/** Amount to pay in millisatoshis (required if offer has no amount) */
 	amount?: bigint;
@@ -179,6 +199,7 @@ export class OfferManager extends EventEmitter {
 			tlvData: Buffer;
 			pathId?: Buffer;
 			asyncHold?: boolean;
+			invoicePolicy?: string;
 			/** Set for a delegated offer: the policy answers, not this node. */
 			policy?: IssuancePolicy;
 		}
@@ -290,6 +311,14 @@ export class OfferManager extends EventEmitter {
 	/** Persistent backend for offers; null keeps the manager memory-only. */
 	private storage: IStorageBackend | null = null;
 	private storageAttached = false;
+	private invoicePolicies = new Map<string, InvoicePaymentPolicy>();
+
+	registerInvoicePolicy(key: string, policy?: InvoicePaymentPolicy): void {
+		if (!/^[a-z0-9][a-z0-9/-]{0,63}$/.test(key))
+			throw new Error('Invalid invoice policy key');
+		if (policy) this.invoicePolicies.set(key, policy);
+		else this.invoicePolicies.delete(key);
+	}
 
 	constructor(
 		nodePrivkey: Buffer,
@@ -382,7 +411,10 @@ export class OfferManager extends EventEmitter {
 					encoded: row.encoded,
 					tlvData,
 					pathId: row.pathId ?? undefined,
-					asyncHold: row.asyncHold || undefined
+					asyncHold: row.asyncHold || undefined,
+					invoicePolicy:
+						storage.loadMetadata('offer/invoice-policy/' + offerIdHex) ??
+						undefined
 				});
 			} catch (err) {
 				// A row that cannot be decoded is LEFT IN PLACE: a decode throw
@@ -510,24 +542,41 @@ export class OfferManager extends EventEmitter {
 		const previous = this.offers.get(offerIdHex);
 		const effectivePathId = options.pathId ?? previous?.pathId;
 		const effectiveAsyncHold = options.asyncHold ?? previous?.asyncHold;
+		const invoicePolicy = options.invoicePolicy ?? previous?.invoicePolicy;
+		if (
+			invoicePolicy &&
+			(!/^[a-z0-9][a-z0-9/-]{0,63}$/.test(invoicePolicy) ||
+				!this.invoicePolicies.has(invoicePolicy))
+		)
+			throw new Error('Offer invoice policy is unavailable');
+		if (previous?.invoicePolicy && previous.invoicePolicy !== invoicePolicy)
+			throw new Error('Offer invoice policy cannot change');
 
 		// Persist FIRST (saveOffer is synchronous): if it throws, memory is
 		// untouched, so a fresh create is fully rolled back and a re-create
 		// keeps its previous, still-persisted entry. Half-created (live and
 		// payable now, silently gone after restart) is the worst outcome.
-		this.storage?.saveOffer?.(
-			offerIdHex,
-			encoded,
-			effectivePathId ?? null,
-			Date.now(),
-			effectiveAsyncHold ?? false
-		);
+		this.storage?.transaction(() => {
+			this.storage!.saveOffer?.(
+				offerIdHex,
+				encoded,
+				effectivePathId ?? null,
+				Date.now(),
+				effectiveAsyncHold ?? false
+			);
+			if (invoicePolicy)
+				this.storage!.saveMetadata(
+					'offer/invoice-policy/' + offerIdHex,
+					invoicePolicy
+				);
+		});
 		this.offers.set(offerIdHex, {
 			offer,
 			encoded,
 			tlvData,
 			pathId: effectivePathId,
-			asyncHold: effectiveAsyncHold
+			asyncHold: effectiveAsyncHold,
+			invoicePolicy
 		});
 
 		this.emit('offer:created', offer, encoded);
@@ -933,6 +982,27 @@ export class OfferManager extends EventEmitter {
 		// single-hop path terminating at us — the same shape CLN issues for a
 		// node without announced channels.
 		const invoicePathId = randomBytes(32);
+		const invoicePolicy = this.offers.get(matchedOfferIdHex!)?.invoicePolicy;
+		const paymentPolicy = invoicePolicy
+			? this.invoicePolicies.get(invoicePolicy)
+			: undefined;
+		if (invoicePolicy && !paymentPolicy)
+			throw new Error('Offer invoice policy is unavailable');
+		const prepared = paymentPolicy?.({
+			offer: matchedOffer,
+			paymentHash,
+			pathId: invoicePathId,
+			amountMsat: amount
+		});
+		if (
+			prepared &&
+			(!prepared.paths.length ||
+				prepared.paths.length > 64 ||
+				!Number.isSafeInteger(prepared.relativeExpiry) ||
+				prepared.relativeExpiry < 1 ||
+				prepared.relativeExpiry > 86400)
+		)
+			throw new Error('Invalid offer invoice policy decision');
 		const isAsyncHold = this.offers.get(matchedOfferIdHex!)?.asyncHold === true;
 		let holdPaths: IBlindedPaymentPath[] = [];
 		if (isAsyncHold) {
@@ -955,7 +1025,10 @@ export class OfferManager extends EventEmitter {
 		}
 		let invoicePaths: IBlindedPath[];
 		let invoicePayInfo: IBolt12Invoice['blindedPayInfo'];
-		if (holdPaths.length > 0) {
+		if (prepared) {
+			invoicePaths = prepared.paths.map((path) => path.path);
+			invoicePayInfo = prepared.paths.map((path) => path.payInfo);
+		} else if (holdPaths.length > 0) {
 			invoicePaths = holdPaths.map((p) => p.path);
 			invoicePayInfo = holdPaths.map((p) => p.payInfo);
 		} else if (privatePaths.length > 0) {
@@ -986,8 +1059,9 @@ export class OfferManager extends EventEmitter {
 			amount,
 			description: matchedOffer.description,
 			createdAt: BigInt(Math.floor(Date.now() / 1000)),
-			relativeExpiry: 7200, // 2 hours
+			relativeExpiry: prepared?.relativeExpiry ?? 7200,
 			nodeId: this.nodeId,
+			features: prepared?.features,
 			paths: invoicePaths,
 			blindedPayInfo: invoicePayInfo
 		};
@@ -1005,6 +1079,10 @@ export class OfferManager extends EventEmitter {
 		// structural re-encode that would drop the mirror.
 		invoice.records = getTlvRecords(encodeInvoiceTlv(invoice, records));
 
+		prepared?.onIssued(invoice);
+		// Both policy authorization and native preimages must persist before publication.
+		this.emit('invoice:issued', invoice, preimage, invoicePathId);
+
 		// Send via reply path if available
 		if (replyPath && this.onionMessageManager) {
 			const signedInvoiceTlv = encodeInvoiceTlv(invoice, records);
@@ -1019,7 +1097,6 @@ export class OfferManager extends EventEmitter {
 		// preimage: receive-side authentication must never be lost while the
 		// payment stays claimable. Distinct from `invoice:received`, which also
 		// fires when we are the PAYER and hold no preimage.
-		this.emit('invoice:issued', invoice, preimage, invoicePathId);
 		this.emit('invoice:received', invoice);
 		return invoice;
 	}
@@ -1268,6 +1345,7 @@ export class OfferManager extends EventEmitter {
 		}
 		this.pendingInvoiceRequests.clear();
 		this.offers.clear();
+		this.invoicePolicies.clear();
 		this.invoicePreimages.clear();
 		this.invoicePreimageDeadlines.clear();
 		this.onionMessageManager = null;

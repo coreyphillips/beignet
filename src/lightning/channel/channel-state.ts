@@ -1,3 +1,6 @@
+import type { IAuxiliaryInteractiveFundingPlan } from './interactive-funding';
+import type { IFundingEpoch } from './funding-state';
+import type { ITaprootFundingRound } from './funding-musig';
 import type {
 	IChannelAuxiliaryProvider,
 	IChannelAuxiliaryState
@@ -29,6 +32,9 @@ import {
  * output, and exchange splice_locked.
  */
 export interface ISpliceInFlight {
+	taprootRound?: ITaprootFundingRound;
+	auxiliaryState?: IChannelAuxiliaryState;
+	fundingTaprootMerkleRoot?: Buffer;
 	/** Splice txid in tx.getHash() internal byte order. */
 	spliceTxid: Buffer;
 	newFundingOutputIndex: number;
@@ -133,10 +139,13 @@ export interface ISpliceInFlight {
  * BOLT 2 obliges us to remember the funding transaction and resume the
  * signature exchange on reconnect via channel_reestablish.next_funding.
  * Everything needed to resume after a disconnect or a restart without the
- * live interactive-tx builder or the wallet's signWitness closures. Taproot
- * never appears here: taproot v2 opens fail closed before any signature.
+ * live interactive-tx builder or the wallet's signWitness closures. Native
+ * Taproot funding also retains its nonce round and verified partial signatures.
  */
 export interface IV2InFlight {
+	taprootRound?: ITaprootFundingRound;
+	auxiliaryState?: IChannelAuxiliaryState;
+	fundingTaprootMerkleRoot?: Buffer;
 	/** Funding txid in tx.getHash() internal byte order. */
 	fundingTxid: Buffer;
 	fundingOutputIndex: number;
@@ -280,6 +289,15 @@ export type ChannelCloseReason =
 	| 'HTLC_EXPIRY_FORCE_CLOSE';
 
 export interface IChannelState {
+	/** Both init vectors explicitly negotiated native interactive Taproot funding. */
+	nativeTaprootFunding?: boolean;
+	fundingEpochs?: Map<string, IFundingEpoch>;
+	interactiveFunding?: IAuxiliaryInteractiveFundingPlan;
+	/** Domain of the currently adopted funding attempt. */
+	taprootNonceDomain?: Buffer;
+	/** Public nonces and signatures only, retained even after an attempt aborts. */
+	taprootFundingRounds?: Map<string, ITaprootFundingRound>;
+
 	/** Identity */
 	channelId: Buffer | null;
 	temporaryChannelId: Buffer;
@@ -972,11 +990,11 @@ export interface IChannelState {
 	 * commitment (the peer co-signs our commitment against it; we consume it only
 	 * at force-close). This object is ALSO the secret-nonce handle (the MuSig2
 	 * library keys the secret nonce by this object's identity), so it MUST be the
-	 * exact value returned by generateNonce — never copied. NOT serialized, but it
-	 * is DETERMINISTIC per commitment height (see Channel._deriveVerificationNonce):
-	 * re-derived (identical) on reconnect/restart, which keeps the pre-reconnect
-	 * commitment force-closeable. Safe because each height's nonce signs exactly
-	 * one commitment, once.
+	 * exact value returned by generateNonce, never copied. It is not serialized.
+	 * Derivation binds the commitment height and, for native interactive funding,
+	 * the funding transaction domain. Reconnect and restart reproduce the same
+	 * handle for that commitment; splices and replacements use distinct domains.
+	 * Each domain and height pair signs only its single committed transaction.
 	 */
 	localNonce?: Uint8Array;
 	/**
@@ -986,7 +1004,7 @@ export interface IChannelState {
 	 * then rotated via each revoke_and_ack), mirroring how next_per_commitment_point
 	 * is pipelined. On adopting a new commitment this is promoted to `localNonce`
 	 * (becomes the current commitment's nonce) and the next one is derived. Same
-	 * deterministic-per-height + secret-handle-object-identity rules as `localNonce`.
+	 * height, funding-domain and secret-handle identity rules as `localNonce`.
 	 */
 	localNextNonce?: Uint8Array;
 	/**

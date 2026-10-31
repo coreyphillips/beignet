@@ -1,3 +1,4 @@
+import { INTERACTIVE_FUNDING_SESSION_TLV } from './dual-funding';
 /**
  * BOLT 2: Splice message encode/decode (lightning/bolts PR #1160).
  *
@@ -41,6 +42,7 @@ export interface ISpliceMessage {
 	fundingFeeratePerkw: number;
 	locktime: number;
 	requireConfirmedInputs?: boolean;
+	interactiveFundingSessionId?: Buffer;
 	/**
 	 * Confirmations this splice must reach before either side sends
 	 * splice_locked, whatever the channel type (beignet extension, TLV
@@ -59,6 +61,7 @@ export interface ISpliceAckMessage {
 	fundingPubkey: Buffer;
 	relativeSatoshis: bigint; // signed: positive = splice-in, negative = splice-out
 	requireConfirmedInputs?: boolean;
+	interactiveFundingSessionId?: Buffer;
 	/** The splice_init lock depth, echoed by an acceptor that will honour it. */
 	lockDepth?: number;
 }
@@ -98,7 +101,8 @@ function writeBigSize(n: number): Buffer {
 const SPLICE_REQUIRE_CONFIRMED_INPUTS_TLV = 2n;
 const SPLICE_TLV_TYPES = new Set<bigint>([
 	SPLICE_REQUIRE_CONFIRMED_INPUTS_TLV,
-	BigInt(SPLICE_LOCK_DEPTH_TLV)
+	BigInt(SPLICE_LOCK_DEPTH_TLV),
+	INTERACTIVE_FUNDING_SESSION_TLV
 ]);
 
 /**
@@ -108,6 +112,7 @@ const SPLICE_TLV_TYPES = new Set<bigint>([
  */
 function encodeSpliceTlvs(msg: {
 	requireConfirmedInputs?: boolean;
+	interactiveFundingSessionId?: Buffer;
 	lockDepth?: number;
 }): Buffer[] {
 	const parts: Buffer[] = [];
@@ -126,17 +131,38 @@ function encodeSpliceTlvs(msg: {
 		value.writeUInt16BE(msg.lockDepth, 0);
 		parts.push(writeBigSize(SPLICE_LOCK_DEPTH_TLV), writeBigSize(2), value);
 	}
+	if (msg.interactiveFundingSessionId) {
+		if (msg.interactiveFundingSessionId.length !== 32)
+			throw new Error('Invalid interactive funding session ID');
+		parts.push(
+			writeBigSize(Number(INTERACTIVE_FUNDING_SESSION_TLV)),
+			writeBigSize(32),
+			msg.interactiveFundingSessionId
+		);
+	}
 	return parts;
 }
 
 function decodeSpliceTlvs(
 	payload: Buffer,
 	offset: number
-): { requireConfirmedInputs?: boolean; lockDepth?: number } {
-	const out: { requireConfirmedInputs?: boolean; lockDepth?: number } = {};
+): {
+	requireConfirmedInputs?: boolean;
+	interactiveFundingSessionId?: Buffer;
+	lockDepth?: number;
+} {
+	const out: {
+		requireConfirmedInputs?: boolean;
+		interactiveFundingSessionId?: Buffer;
+		lockDepth?: number;
+	} = {};
 	const { records } = decodeTlvStream(payload, offset, SPLICE_TLV_TYPES);
 	for (const { type, value } of records) {
-		if (type === SPLICE_REQUIRE_CONFIRMED_INPUTS_TLV) {
+		if (type === INTERACTIVE_FUNDING_SESSION_TLV) {
+			if (value.length !== 32)
+				throw new Error('Invalid interactive funding session ID');
+			out.interactiveFundingSessionId = Buffer.from(value);
+		} else if (type === SPLICE_REQUIRE_CONFIRMED_INPUTS_TLV) {
 			if (value.length !== 0)
 				throw new Error('require_confirmed_inputs must be empty');
 			out.requireConfirmedInputs = true;
@@ -228,6 +254,9 @@ export function decodeSpliceMessage(payload: Buffer): ISpliceMessage {
 		relativeSatoshis,
 		fundingFeeratePerkw,
 		locktime,
+		...(tlvs.interactiveFundingSessionId
+			? { interactiveFundingSessionId: tlvs.interactiveFundingSessionId }
+			: {}),
 		requireConfirmedInputs: tlvs.requireConfirmedInputs,
 		lockDepth: tlvs.lockDepth
 	};
@@ -289,6 +318,9 @@ export function decodeSpliceAckMessage(payload: Buffer): ISpliceAckMessage {
 		channelId,
 		fundingPubkey,
 		relativeSatoshis,
+		...(tlvs.interactiveFundingSessionId
+			? { interactiveFundingSessionId: tlvs.interactiveFundingSessionId }
+			: {}),
 		requireConfirmedInputs: tlvs.requireConfirmedInputs,
 		lockDepth: tlvs.lockDepth
 	};

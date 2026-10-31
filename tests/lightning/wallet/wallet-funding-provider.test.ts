@@ -493,6 +493,68 @@ describe('WalletFundingProvider', () => {
 			return { wallet, changeAddress };
 		}
 
+		it('refreshes confirmed CPFP change without reusing its reserved parent fee coin', async () => {
+			const { wallet } = createSpliceMockWallet({
+				utxos: [{ valueSats: 50000 }, { valueSats: 49000 }]
+			});
+			const original = wallet.listUtxos!(),
+				old = original[0],
+				change = original[1];
+			const cpfp = new bitcoin.Transaction();
+			cpfp.addInput(Buffer.from(old.tx_hash, 'hex').reverse(), old.tx_pos);
+			cpfp.addOutput(
+				bitcoin.address.toOutputScript(change.address, network),
+				49000
+			);
+			const changed = {
+				...change,
+				tx_hash: cpfp.getId(),
+				tx_pos: 0,
+				height: 100
+			};
+			let visible = [old],
+				confirmed = false,
+				refreshes = 0;
+			wallet.listUtxos = () => visible;
+			wallet.refreshWallet = async () => {
+				refreshes++;
+				if (confirmed) visible = [changed];
+				return mockOk('refreshed');
+			};
+			const get = wallet.electrum.getTransactions!;
+			wallet.electrum.getTransactions = async (request) =>
+				request.txHashes.some((hash) => hash.tx_hash === cpfp.getId())
+					? ({
+							isErr: () => false,
+							isOk: () => true,
+							value: {
+								data: [{ result: { txid: cpfp.getId(), hex: cpfp.toHex() } }]
+							}
+					  } as any)
+					: get(request);
+			const provider = new WalletFundingProvider(wallet);
+			const first = await provider.selectFeeBumpInputs(1000n, 253);
+			expect(first.inputs).length(1);
+			let refused = false;
+			try {
+				await provider.selectFeeBumpInputs(1000n, 253);
+			} catch {
+				refused = true;
+			}
+			expect(refused).equal(true);
+			expect(refreshes).equal(1);
+			confirmed = true;
+			const second = await provider.selectFeeBumpInputs(1000n, 253);
+			expect(refreshes).equal(2);
+			expect(second.inputs).length(1);
+			expect(
+				bitcoin.Transaction.fromBuffer(second.inputs[0].prevTx).getId()
+			).equal(cpfp.getId());
+			expect(
+				bitcoin.Transaction.fromBuffer(first.inputs[0].prevTx).getId()
+			).equal(old.tx_hash);
+		});
+
 		it('selects a single UTXO covering amount + fee and builds verifiable witnesses', async () => {
 			const { wallet, changeAddress } = createSpliceMockWallet({
 				utxos: [{ valueSats: 500_000 }]

@@ -82,7 +82,7 @@ describe('BOLT 11 blinded paths (M1.1)', function () {
 		expect(got.path.blindingPoint).to.deep.equal(want.path.blindingPoint);
 		expect(got.path.blindedHops).to.have.length(2);
 		expect(got.path.blindedHops[0].blindedNodeId).to.deep.equal(
-			want.path.blindedHops[0].blindedNodeId
+			want.path.introductionNodeId
 		);
 		expect(got.path.blindedHops[1].encryptedData).to.deep.equal(
 			want.path.blindedHops[1].encryptedData

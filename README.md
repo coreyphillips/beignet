@@ -498,9 +498,11 @@ const node = await BeignetNode.create({
 ```
 
 - **Altruist only.** Sessions use `reward = 0`. There is no server mode: beignet is a tower client, not a tower.
-- **LND-tower compatible.** Implements LND's `wtwire` protocol (Init/CreateSession/StateUpdate/DeleteSession, message types 600-607) and the version-0 justice blob (XChaCha20-Poly1305, breach hint `SHA256(txid)[:16]`, key `SHA256(txid‖txid)`), so it works with existing public LND altruist towers.
-- **Legacy + anchor channels.** The to_local revocation penalty (the fund-critical punishment) is packed for both. Taproot channels are not yet backed up.
+- **LND-tower compatible.** Implements LND's `wtwire` protocol (Init/CreateSession/StateUpdate/DeleteSession, message types 600-607) and the version-0 and Taproot version-1 justice blobs (XChaCha20-Poly1305, breach hint `SHA256(txid)[:16]`, key `SHA256(txid‖txid)`), so it works with existing public LND altruist towers.
+- **Legacy, anchor and Taproot Bitcoin channels.** The to_local revocation penalty is covered for these channel types. Asset channels require an asset-aware auxiliary watchtower integration; standard LND justice kits refuse asset commitments.
 - **Durable.** Per-tower session state and the un-acked backlog are persisted (encrypted at rest) and drained with exponential backoff on reconnect. An un-acked update is never dropped silently.
+
+The auxiliary asset integration can also export independent Taproot `SINGLE|ANYONECANPAY` remedies for outputs whose Bitcoin value cannot cover fees. A compatible asset tower appends wallet fee inputs while preserving the signed asset output. Such a backup requires an explicit sponsorship-capable acknowledgement and retains the exact funded candidate before broadcast. Native local recovery likewise persists each funded transaction and its proof payload before publication.
 
 Daemon: `GET /watchtowers`, `POST /watchtower/add`, `DELETE /watchtower/remove`.
 CLI: `beignet watchtower list|add <pubkey@host:port>|remove <uri>`, daemon flag `--watchtower` (repeatable) or `BEIGNET_WATCHTOWERS`.

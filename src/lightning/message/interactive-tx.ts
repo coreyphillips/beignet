@@ -52,8 +52,18 @@ export interface ITxRemoveOutputMessage {
 	serialId: bigint;
 }
 
+export const TAPROOT_FUNDING_NONCES_TLV = 65547n;
+export const TAPROOT_SHARED_PARTIAL_TLV = 65549n;
+export interface ITaprootFundingNonces {
+	domain: Buffer;
+	verificationNonce: Buffer;
+	sharedNonce?: Buffer;
+	nextVerificationNonce?: Buffer;
+}
 export interface ITxCompleteMessage {
 	channelId: Buffer;
+	/** Native extension, gated by option_taproot_interactive_funding. */
+	taprootFunding?: ITaprootFundingNonces;
 }
 
 export interface ITxSignaturesMessage {
@@ -67,6 +77,7 @@ export interface ITxSignaturesMessage {
 	 * witnesses array (witnesses only cover the sender's own inputs).
 	 */
 	sharedInputSignature?: Buffer;
+	sharedInputPartialSignatureWithNonce?: Buffer;
 }
 
 export interface ITxInitRbfMessage {
@@ -336,26 +347,61 @@ export function decodeTxRemoveOutputMessage(
  * Encode a tx_complete message payload (without 2-byte type prefix).
  */
 export function encodeTxCompleteMessage(msg: ITxCompleteMessage): Buffer {
-	if (msg.channelId.length !== 32) {
-		throw new Error(`Channel ID must be 32 bytes, got ${msg.channelId.length}`);
-	}
-
-	return Buffer.from(msg.channelId);
+	if (msg.channelId.length !== 32)
+		throw new Error('Channel ID must be 32 bytes');
+	const nonce = msg.taprootFunding;
+	if (!nonce) return Buffer.from(msg.channelId);
+	if (
+		nonce.domain.length !== 32 ||
+		nonce.verificationNonce.length !== 66 ||
+		(nonce.sharedNonce && nonce.sharedNonce.length !== 66) ||
+		!!nonce.sharedNonce !== !!nonce.nextVerificationNonce ||
+		(nonce.nextVerificationNonce && nonce.nextVerificationNonce.length !== 66)
+	)
+		throw new Error('Invalid funding nonce record');
+	return Buffer.concat([
+		msg.channelId,
+		encodeTlvStream([
+			{
+				type: TAPROOT_FUNDING_NONCES_TLV,
+				value: Buffer.concat([
+					nonce.domain,
+					nonce.verificationNonce,
+					...(nonce.sharedNonce
+						? [nonce.sharedNonce, nonce.nextVerificationNonce!]
+						: [])
+				])
+			}
+		])
+	]);
 }
-
-/**
- * Decode a tx_complete message payload.
- */
 export function decodeTxCompleteMessage(payload: Buffer): ITxCompleteMessage {
-	if (payload.length < 32) {
-		throw new Error(
-			`tx_complete too short: need 32 bytes, got ${payload.length}`
-		);
-	}
-
-	const channelId = Buffer.from(payload.subarray(0, 32));
-
-	return { channelId };
+	if (payload.length < 32)
+		throw new Error('tx_complete too short: need 32 bytes');
+	const result: ITxCompleteMessage = {
+		channelId: Buffer.from(payload.subarray(0, 32))
+	};
+	if (payload.length > 32)
+		for (const record of decodeTlvStream(
+			payload,
+			32,
+			new Set([TAPROOT_FUNDING_NONCES_TLV])
+		).records) {
+			if (record.type !== TAPROOT_FUNDING_NONCES_TLV) continue;
+			if (record.value.length !== 98 && record.value.length !== 230)
+				throw new Error('Invalid funding nonce record');
+			result.taprootFunding = {
+				domain: Buffer.from(record.value.subarray(0, 32)),
+				verificationNonce: Buffer.from(record.value.subarray(32, 98)),
+				...(record.value.length === 230
+					? {
+							sharedNonce: Buffer.from(record.value.subarray(98, 164)),
+							nextVerificationNonce: Buffer.from(record.value.subarray(164))
+					  }
+					: {})
+			};
+		}
+	return result;
 }
 
 // ---- tx_signatures (71) ----
@@ -405,11 +451,26 @@ export function encodeTxSignaturesMessage(msg: ITxSignaturesMessage): Buffer {
 		);
 	}
 
+	if (msg.sharedInputPartialSignatureWithNonce) {
+		if (
+			msg.sharedInputSignature ||
+			msg.sharedInputPartialSignatureWithNonce.length !== 98
+		)
+			throw new Error('Invalid shared funding partial');
+		parts.push(
+			encodeTlvStream([
+				{
+					type: TAPROOT_SHARED_PARTIAL_TLV,
+					value: msg.sharedInputPartialSignatureWithNonce
+				}
+			])
+		);
+	}
 	return Buffer.concat(parts);
 }
 
 /** shared_input_signature (type 0) is the only tx_signatures TLV. */
-const TX_SIGNATURES_TLV_TYPES = new Set([0n]);
+const TX_SIGNATURES_TLV_TYPES = new Set([0n, TAPROOT_SHARED_PARTIAL_TLV]);
 
 /**
  * Decode a tx_signatures message payload.
@@ -458,12 +519,23 @@ export function decodeTxSignaturesMessage(
 			TX_SIGNATURES_TLV_TYPES
 		);
 		for (const record of records) {
+			if (record.type === TAPROOT_SHARED_PARTIAL_TLV) {
+				if (record.value.length !== 98)
+					throw new Error('Invalid shared funding partial');
+				result.sharedInputPartialSignatureWithNonce = Buffer.from(record.value);
+			}
+
 			if (record.type === 0n && record.value.length === 64) {
 				result.sharedInputSignature = Buffer.from(record.value);
 			}
 		}
 	}
 
+	if (
+		result.sharedInputSignature &&
+		result.sharedInputPartialSignatureWithNonce
+	)
+		throw new Error('Conflicting shared funding signatures');
 	return result;
 }
 

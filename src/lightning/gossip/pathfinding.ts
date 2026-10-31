@@ -1031,6 +1031,7 @@ export function findRouteToBlindedPath(
 		feeBaseMsat: 0,
 		feeProportionalMillionths: 0,
 		encryptedRecipientData: hop.encryptedData,
+		legacyBlindedPaymentData: blindedPath.legacyPaymentData,
 		...(i === 0 ? { blindingPoint: blindedPath.blindingPoint } : {})
 	}));
 

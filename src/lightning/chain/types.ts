@@ -40,12 +40,30 @@ export enum OutputType {
 
 /** A tracked on-chain output */
 export interface ITrackedOutput {
+	/** Funding epoch that authorized this asset-bearing commitment. */
+	fundingOutpoint?: { txid: string; outputIndex: number };
 	/** Durable asset transition and proof payload, recorded before broadcast. */
 	auxiliaryData?: Buffer;
-	/** Exact asset transition retained for every signed Bitcoin sweep attempt. */
+	/** This asset claim needs external Bitcoin fee inputs before broadcast. */
+	auxiliaryFeeFunding?: boolean;
+	/** The stored candidate already includes wallet fee signatures. */
+	auxiliaryFeeFunded?: boolean;
+	/** The stored first-level HTLC transaction already has wallet fee signatures. */
+	auxiliaryHtlcFeeFunded?: boolean;
+	/** Exact paid fee of the last finalized sponsored candidate. */
+	auxiliarySweepFee?: bigint;
+	/** Parent HTLC asset transition, retained separately from the terminal claim. */
+	auxiliaryParentData?: Buffer;
+	/** Exact sweep attempts, including Bitcoin-only companions of asset outputs. */
 	auxiliarySweepAttempts?: Record<
 		string,
-		{ transaction: string; auxiliaryData: Buffer }
+		{
+			transaction: string;
+			auxiliaryData?: Buffer;
+			auxiliarySweepFee?: bigint;
+			auxiliaryFeeFunded?: boolean;
+			auxiliaryHtlcFeeFunded?: boolean;
+		}
 	>;
 	auxiliaryHtlcDirection?: HtlcDirection;
 	auxiliaryCommitmentNumber?: bigint;
@@ -69,7 +87,9 @@ export interface ITrackedOutput {
 	cltvExpiry?: number;
 	witnessScript?: Buffer;
 	resolutionTxid?: string;
-	/** Witness evidence bound to a spend of our received HTLC on a current commitment. */
+	/** Exact chain-observed asset spend, including external recovery transactions. */
+	resolutionTxHex?: string;
+	/** Witness evidence bound to a spend of an HTLC on a current commitment. */
 	receivedHtlcSpend?: {
 		txid: string;
 		preimage?: string;
@@ -229,6 +249,7 @@ export enum ChainActionType {
 }
 
 export interface IBroadcastTxChainAction {
+	requiresMonitorPersistence?: boolean;
 	type: ChainActionType.BROADCAST_TX;
 	tx: Buffer;
 	description: string;
@@ -246,9 +267,35 @@ export interface IBroadcastTxChainAction {
  * - `anchor-cpfp`: `tx` is the commitment tx; a child spending our local anchor
  *   (`anchorOutputIndex` / `anchorWitnessScript`) is built to bump the package.
  */
+export interface IAuxiliarySweepFeeAttachment {
+	/** Prevouts of the original asset inputs, in transaction order. */
+	prevoutScripts: Buffer[];
+	prevoutValues: bigint[];
+	/** Absolute fee of the previous replacement candidate, if any. */
+	previousFee?: bigint;
+	/** Rebind the proof payload and sign original inputs using every final prevout. */
+	sign(
+		transaction: Buffer,
+		prevoutScripts: Buffer[],
+		prevoutValues: bigint[],
+		/** Restricted to a one-input/one-output template when sponsorship is requested. */
+		hashType?: 0 | 0x83
+	): { transaction: Buffer; auxiliaryData: Buffer };
+	/** Install the exact signed candidate. False means the monitor moved on. */
+	finalize(transaction: Buffer, auxiliaryData: Buffer, fee?: bigint): boolean;
+}
 export interface IFeeBumpAndBroadcastChainAction {
 	type: ChainActionType.FEE_BUMP_AND_BROADCAST;
-	kind: 'htlc-fee-attach' | 'anchor-cpfp';
+	kind: 'htlc-fee-attach' | 'anchor-cpfp' | 'auxiliary-sweep-fee-attach';
+	/** Persist the exact sponsored HTLC parent before broadcast. */
+	finalizeHtlcFunding?(transaction: Buffer, fee?: bigint): boolean;
+	/** Highest paid fee among retained candidates conflicting with this action. */
+	previousFee?: bigint;
+	/** Attempts spending an original action input; their change cannot fund a replacement. */
+	conflictingCandidateTxids?: string[];
+	/** An exact retained funded candidate whose wallet fee inputs may be reused. */
+	previousFundedTransaction?: Buffer;
+	auxiliarySweep?: IAuxiliarySweepFeeAttachment;
 	tx: Buffer;
 	description: string;
 	/** Target fee rate in sat/vByte for the bumped transaction/package. */

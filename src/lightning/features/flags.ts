@@ -87,6 +87,8 @@ export enum Feature {
 	OPTION_TAPROOT = 180,
 	/** Taproot Asset overlay. Its deployed optional partner is 2025. */
 	OPTION_TAPROOT_OVERLAY = 2026,
+	/** Native transcript-bound Taproot splice and interactive funding extension. */
+	OPTION_TAPROOT_INTERACTIVE_FUNDING = 446,
 	/**
 	 * Liquidity ads / option_will_fund (bLIP-0051): advertises that this node
 	 * leases inbound liquidity (rates carried in node_announcement). Experimental
@@ -122,7 +124,9 @@ export enum Feature {
 	 * option_ff_receive and option_quiesce. Advertised by default when both
 	 * dependencies are present; fforConcurrent.enabled can disable it.
 	 */
-	OPTION_FF_CONCURRENT = 442
+	OPTION_FF_CONCURRENT = 442,
+	/** Signed asset custody terms for the Variant D voucher round. */
+	OPTION_FF_ASSET = 448
 }
 
 /**
@@ -355,6 +359,7 @@ export function hasUnsupportedRequiredFeatures(
 			// choice even though the implementation understands the feature.
 			if (
 				(bit === Feature.OPTION_FF_CONCURRENT ||
+					bit === Feature.OPTION_FF_ASSET ||
 					bit === Feature.OPTION_TAPROOT_OVERLAY) &&
 				!localFeatures.hasFeature(bit)
 			) {

@@ -33,6 +33,7 @@ export interface ISerializedAuxiliaryState {
 	localShutdownRecords?: SerializedCustomRecords;
 	remoteShutdownRecords?: SerializedCustomRecords;
 	closeTransactions?: [string, string][];
+	acceptedClosingSigned?: string;
 	localCommitments: [string, ISerializedAuxiliaryCommitment][];
 	remoteCommitments: [string, ISerializedAuxiliaryCommitment][];
 }
@@ -140,6 +141,7 @@ export function serializeAuxiliaryState(
 		remoteBalance: state.remoteBalance.toString(),
 		localShutdownRecords: serializeCustomRecords(state.localShutdownRecords),
 		remoteShutdownRecords: serializeCustomRecords(state.remoteShutdownRecords),
+		acceptedClosingSigned: state.acceptedClosingSigned?.toString('hex'),
 		closeTransactions: state.closeTransactions
 			? [...state.closeTransactions].map(([txid, data]) => [
 					txid,
@@ -238,6 +240,9 @@ export function deserializeAuxiliaryState(
 		remoteShutdownRecords: deserializeCustomRecords(
 			state.remoteShutdownRecords
 		),
+		acceptedClosingSigned: state.acceptedClosingSigned
+			? bytes(state.acceptedClosingSigned)
+			: undefined,
 		closeTransactions: state.closeTransactions
 			? uniqueMap(
 					state.closeTransactions.map(([txid, data]) => {

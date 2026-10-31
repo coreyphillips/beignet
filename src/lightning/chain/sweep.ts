@@ -10,6 +10,7 @@ import { ecc } from '../../utils/ecc';
 import { sign } from '../crypto/ecdh';
 
 import { OutputType } from './types';
+import type { IAuxiliarySweepFeeAttachment } from './types';
 import type { ISpliceWalletInput } from '../channel/channel';
 import { P2WPKH_DUST_LIMIT } from '../channel/splice-weight';
 import { tweakTaprootKeyPathPrivkey } from '../script/commitment-taproot';
@@ -519,6 +520,21 @@ function encodeDerSignature(sig: Buffer): Buffer {
  */
 const DUMMY_P2WPKH_WITNESS: Buffer[] = [Buffer.alloc(72), Buffer.alloc(33)];
 
+function walletSweepFee(
+	vsize: number,
+	rate: number,
+	previousFee?: bigint
+): bigint {
+	if (previousFee !== undefined && previousFee < 0n)
+		throw new Error('Invalid previous sweep fee');
+	const target = BigInt(Math.ceil(vsize * rate));
+	// Reserve one sat/vByte for replacement relay even when the new input
+	// selection makes the transaction smaller than the previous candidate.
+	const replacement =
+		previousFee === undefined ? 0n : previousFee + BigInt(vsize);
+	return target > replacement ? target : replacement;
+}
+
 /** Internal-byte-order txid hash of a previous transaction (for addInput). */
 function prevTxHash(prevTx: Buffer): Buffer {
 	return bitcoin.Transaction.fromBuffer(prevTx).getHash();
@@ -539,6 +555,8 @@ export interface IAttachFeeInputsParams {
 	changeScript: Buffer;
 	/** Target fee rate in sat/vByte for the whole bumped transaction. */
 	feeratePerVbyte: number;
+	/** Absolute fee of a candidate this transaction must replace. */
+	previousFee?: bigint;
 }
 
 /**
@@ -594,7 +612,11 @@ export function attachFeeInputsToZeroFeeHtlcTx(
 	walletInputs.forEach((_, i) =>
 		sizing.setWitness(1 + i, DUMMY_P2WPKH_WITNESS)
 	);
-	const fee = BigInt(Math.ceil(sizing.virtualSize() * feeratePerVbyte));
+	const fee = walletSweepFee(
+		sizing.virtualSize(),
+		feeratePerVbyte,
+		params.previousFee
+	);
 	const change = walletTotal - fee;
 	if (change < 0n) {
 		throw new Error(
@@ -611,6 +633,193 @@ export function attachFeeInputsToZeroFeeHtlcTx(
 	});
 
 	return { tx, txid: tx.getId() };
+}
+
+/** Fund an asset carrier without deducting Bitcoin fees from its output. */
+export function attachFeeInputsToAuxiliarySweepTx(params: {
+	sweepTx: bitcoin.Transaction;
+	walletInputs: ISpliceWalletInput[];
+	changeScript: Buffer;
+	feeratePerVbyte: number;
+	attachment: IAuxiliarySweepFeeAttachment;
+}): {
+	tx: bitcoin.Transaction;
+	txid: string;
+	auxiliaryData: Buffer;
+	feeSatoshis: bigint;
+} {
+	const { sweepTx, walletInputs, changeScript, feeratePerVbyte, attachment } =
+		params;
+	const originalInputCount = sweepTx.ins.length;
+	const originalValue = attachment.prevoutValues.reduce(
+		(total, value) => total + value,
+		0n
+	);
+	if (
+		originalInputCount === 0 ||
+		sweepTx.outs.length !== 1 ||
+		attachment.prevoutScripts.length !== originalInputCount ||
+		attachment.prevoutValues.length !== originalInputCount ||
+		attachment.prevoutValues.some((value) => value <= 0n) ||
+		originalValue !== BigInt(sweepTx.outs[0].value) ||
+		sweepTx.ins.some((input) => !input.witness.length)
+	) {
+		throw new Error(
+			'Auxiliary fee attachment requires a signed zero-fee carrier sweep'
+		);
+	}
+	if (!Number.isFinite(feeratePerVbyte) || feeratePerVbyte <= 0) {
+		throw new Error('Invalid auxiliary sweep fee rate');
+	}
+	if (attachment.previousFee !== undefined && attachment.previousFee < 0n) {
+		throw new Error('Invalid previous auxiliary sweep fee');
+	}
+	if (!walletInputs.length)
+		throw new Error('Auxiliary sweep requires wallet fee inputs');
+	if (
+		changeScript.length !== 22 ||
+		changeScript[0] !== 0 ||
+		changeScript[1] !== 20
+	) {
+		throw new Error('Auxiliary sweep fee change must be P2WPKH');
+	}
+	const outpoints = new Set(
+		sweepTx.ins.map((input) => `${input.hash.toString('hex')}:${input.index}`)
+	);
+	if (outpoints.size !== originalInputCount)
+		throw new Error('Duplicate auxiliary sweep input');
+	const previous = walletInputs.map((input) => {
+		const transaction = bitcoin.Transaction.fromBuffer(input.prevTx);
+		const output = transaction.outs[input.prevOutputIndex];
+		const outpoint = `${transaction.getHash().toString('hex')}:${
+			input.prevOutputIndex
+		}`;
+		if (
+			!output ||
+			input.value <= 0n ||
+			BigInt(output.value) !== input.value ||
+			output.script.length !== 22 ||
+			output.script[0] !== 0 ||
+			output.script[1] !== 20 ||
+			outpoints.has(outpoint)
+		) {
+			throw new Error('Invalid auxiliary sweep wallet fee input');
+		}
+		outpoints.add(outpoint);
+		return { transaction, output };
+	});
+	const walletTotal = walletInputs.reduce(
+		(total, input) => total + input.value,
+		0n
+	);
+	if (walletTotal > BigInt(Number.MAX_SAFE_INTEGER)) {
+		throw new Error(
+			'Auxiliary sweep wallet value exceeds the safe integer range'
+		);
+	}
+	const build = (changeValue?: bigint): bitcoin.Transaction => {
+		const tx = bitcoin.Transaction.fromBuffer(sweepTx.toBuffer());
+		walletInputs.forEach((input, index) => {
+			tx.addInput(
+				previous[index].transaction.getHash(),
+				input.prevOutputIndex,
+				input.sequence
+			);
+			tx.setWitness(index + originalInputCount, DUMMY_P2WPKH_WITNESS);
+		});
+		if (changeValue !== undefined)
+			tx.addOutput(changeScript, Number(changeValue));
+		return tx;
+	};
+	const sizing = build(walletTotal);
+	const minimumFee = (vsize: number): bigint =>
+		walletSweepFee(vsize, feeratePerVbyte, attachment.previousFee);
+	const fee = minimumFee(sizing.virtualSize());
+	const change = walletTotal - fee;
+	if (change < 0n)
+		throw new Error('Insufficient wallet value for auxiliary sweep fee');
+	const funded = build(change >= P2WPKH_DUST_LIMIT ? change : undefined);
+	const signed = attachment.sign(
+		funded.toBuffer(),
+		[
+			...attachment.prevoutScripts.map((script) => Buffer.from(script)),
+			...previous.map(({ output }) => Buffer.from(output.script))
+		],
+		[...attachment.prevoutValues, ...walletInputs.map((input) => input.value)]
+	);
+	const tx = bitcoin.Transaction.fromBuffer(signed.transaction);
+	if (
+		tx.version !== funded.version ||
+		tx.locktime !== funded.locktime ||
+		tx.ins.length !== funded.ins.length ||
+		tx.outs.length !== funded.outs.length ||
+		tx.ins.some((input, index) => {
+			const original = funded.ins[index];
+			return (
+				!input.hash.equals(original.hash) ||
+				input.index !== original.index ||
+				input.sequence !== original.sequence ||
+				!input.script.equals(original.script)
+			);
+		}) ||
+		tx.outs.some(
+			(output, index) =>
+				output.value !== funded.outs[index].value ||
+				(index !== 0 && !output.script.equals(funded.outs[index].script))
+		) ||
+		tx.ins
+			.slice(0, originalInputCount)
+			.some((input) => !input.witness.length) ||
+		tx.outs[0].script.length !== 34 ||
+		tx.outs[0].script[0] !== 0x51 ||
+		tx.outs[0].script[1] !== 0x20 ||
+		!Buffer.isBuffer(signed.auxiliaryData) ||
+		!signed.auxiliaryData.length
+	) {
+		throw new Error('Auxiliary signer changed the funded sweep allocation');
+	}
+	// The asset binding can replace output zero's script. Wallet SIGHASH_ALL
+	// signatures are therefore produced only after the binding is final.
+	const signedAllocation = tx.getId();
+	walletInputs.forEach((input, index) => {
+		const previousWitnesses = tx.ins
+			.slice(0, index + originalInputCount)
+			.map((entry) => entry.witness.map((item) => Buffer.from(item)));
+		tx.setWitness(
+			index + originalInputCount,
+			input.signWitness(tx, index + originalInputCount, input.value)
+		);
+		if (
+			previousWitnesses.some(
+				(witness, inputIndex) =>
+					witness.length !== tx.ins[inputIndex].witness.length ||
+					witness.some(
+						(item, itemIndex) =>
+							!item.equals(tx.ins[inputIndex].witness[itemIndex])
+					)
+			)
+		) {
+			throw new Error(
+				'Wallet signer changed an existing auxiliary sweep witness'
+			);
+		}
+	});
+	if (tx.getId() !== signedAllocation) {
+		throw new Error('Wallet signer changed the funded auxiliary sweep');
+	}
+	const actualFee =
+		originalValue +
+		walletTotal -
+		tx.outs.reduce((total, output) => total + BigInt(output.value), 0n);
+	if (actualFee < minimumFee(tx.virtualSize())) {
+		throw new Error('Auxiliary sweep witness exceeds its funded fee budget');
+	}
+	return {
+		tx,
+		txid: tx.getId(),
+		auxiliaryData: Buffer.from(signed.auxiliaryData),
+		feeSatoshis: actualFee
+	};
 }
 
 export interface IAnchorCpfpParams {

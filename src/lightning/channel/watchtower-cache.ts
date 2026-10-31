@@ -55,14 +55,17 @@ export class WatchtowerCache {
 	cacheRemoteCommitment(
 		point: Buffer | null,
 		commitmentNumber: bigint,
-		spliced?: IChannelState
+		spliced?: IChannelState,
+		signedTransaction?: bitcoin.Transaction
 	): void {
 		try {
 			const view = spliced ?? this._state;
 			if (!point || !view.remoteBasepoints || !view.fundingTxid) {
 				return;
 			}
-			const built = buildRemoteCommitment(view, point, commitmentNumber);
+			const transaction =
+				signedTransaction ??
+				buildRemoteCommitment(view, point, commitmentNumber).result.tx;
 			const cache = (this._state.watchtowerRemoteCommitmentTxs ??= new Map<
 				string,
 				Buffer[]
@@ -79,7 +82,7 @@ export class WatchtowerCache {
 								bitcoin.Transaction.fromBuffer(tx).ins[0]?.hash.equals(current)
 					  )
 					: [];
-			cache.set(key, [...kept, built.result.tx.toBuffer()]);
+			cache.set(key, [...kept, transaction.toBuffer()]);
 			// Bound the cache: only unrevoked states matter and there are few.
 			while (cache.size > REVOKED_TX_CACHE_MAX) {
 				const oldest = cache.keys().next().value;

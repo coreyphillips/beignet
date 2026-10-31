@@ -1,3 +1,4 @@
+export const INTERACTIVE_FUNDING_SESSION_TLV = 65551n;
 /**
  * BOLT 2: `open_channel2` and `accept_channel2` message encoding/decoding.
  *
@@ -68,13 +69,15 @@ const OPEN_CHANNEL2_TLV_TYPES = new Set<bigint>([
 	TLV_UPFRONT_SHUTDOWN_SCRIPT,
 	TLV_CHANNEL_TYPE,
 	TLV_REQUEST_FUNDS,
-	TLV_DISABLE_CHANNEL_RESERVE
+	TLV_DISABLE_CHANNEL_RESERVE,
+	INTERACTIVE_FUNDING_SESSION_TLV
 ]);
 const ACCEPT_CHANNEL2_TLV_TYPES = new Set<bigint>([
 	TLV_UPFRONT_SHUTDOWN_SCRIPT,
 	TLV_CHANNEL_TYPE,
 	TLV_WILL_FUND,
-	TLV_DISABLE_CHANNEL_RESERVE
+	TLV_DISABLE_CHANNEL_RESERVE,
+	INTERACTIVE_FUNDING_SESSION_TLV
 ]);
 
 /** Buyer's lease request, carried in open_channel2 (bLIP-0051). */
@@ -152,6 +155,7 @@ export interface IOpenChannel2Message {
 	secondPerCommitmentPoint: Buffer;
 	channelFlags: number;
 	channelType?: Buffer;
+	interactiveFundingSessionId?: Buffer;
 	/** Liquidity ads (bLIP-0051): buyer's inbound-liquidity request. */
 	requestFunds?: IRequestFunds;
 	/** Waive the receiver's channel reserve. Requires negotiated support. */
@@ -175,6 +179,7 @@ export interface IAcceptChannel2Message {
 	firstPerCommitmentPoint: Buffer;
 	secondPerCommitmentPoint: Buffer;
 	channelType?: Buffer;
+	interactiveFundingSessionId?: Buffer;
 	/** Liquidity ads (bLIP-0051): seller's signed lease commitment. */
 	willFund?: IWillFund;
 	/** Waive the receiver's channel reserve. Requires negotiated support. */
@@ -258,6 +263,14 @@ export function encodeOpenChannel2Message(msg: IOpenChannel2Message): Buffer {
 		tlvRecords.push({
 			type: TLV_DISABLE_CHANNEL_RESERVE,
 			value: Buffer.alloc(0)
+		});
+	}
+	if (msg.interactiveFundingSessionId) {
+		if (msg.interactiveFundingSessionId.length !== 32)
+			throw new Error('Invalid interactive funding session ID');
+		tlvRecords.push({
+			type: INTERACTIVE_FUNDING_SESSION_TLV,
+			value: msg.interactiveFundingSessionId
 		});
 	}
 	if (tlvRecords.length > 0) {
@@ -358,7 +371,11 @@ export function decodeOpenChannel2Message(
 			OPEN_CHANNEL2_TLV_TYPES
 		);
 		for (const record of records) {
-			if (record.type === TLV_DISABLE_CHANNEL_RESERVE) {
+			if (record.type === INTERACTIVE_FUNDING_SESSION_TLV) {
+				if (record.value.length !== 32)
+					throw new Error('Invalid interactive funding session ID');
+				result.interactiveFundingSessionId = Buffer.from(record.value);
+			} else if (record.type === TLV_DISABLE_CHANNEL_RESERVE) {
 				if (record.value.length !== 0)
 					throw new Error('disable_channel_reserve must be empty');
 				result.disableChannelReserve = true;
@@ -433,6 +450,14 @@ export function encodeAcceptChannel2Message(
 		tlvRecords.push({
 			type: TLV_DISABLE_CHANNEL_RESERVE,
 			value: Buffer.alloc(0)
+		});
+	}
+	if (msg.interactiveFundingSessionId) {
+		if (msg.interactiveFundingSessionId.length !== 32)
+			throw new Error('Invalid interactive funding session ID');
+		tlvRecords.push({
+			type: INTERACTIVE_FUNDING_SESSION_TLV,
+			value: msg.interactiveFundingSessionId
 		});
 	}
 	if (tlvRecords.length > 0) {
@@ -520,7 +545,11 @@ export function decodeAcceptChannel2Message(
 			ACCEPT_CHANNEL2_TLV_TYPES
 		);
 		for (const record of records) {
-			if (record.type === TLV_DISABLE_CHANNEL_RESERVE) {
+			if (record.type === INTERACTIVE_FUNDING_SESSION_TLV) {
+				if (record.value.length !== 32)
+					throw new Error('Invalid interactive funding session ID');
+				result.interactiveFundingSessionId = Buffer.from(record.value);
+			} else if (record.type === TLV_DISABLE_CHANNEL_RESERVE) {
 				if (record.value.length !== 0)
 					throw new Error('disable_channel_reserve must be empty');
 				result.disableChannelReserve = true;

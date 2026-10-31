@@ -8,6 +8,7 @@
 
 import type { IRoutingHintHop, Network } from '../invoice/types';
 import type { IBolt12Invoice } from '../offer/types';
+import type { IBlindedPaymentPath } from '../onion/blinded-path';
 import type { IChannelConfig, ChannelState } from '../channel/types';
 import type { ChannelErrorCode } from '../channel/channel-actions';
 import { CodedError } from '../../utils/errors';
@@ -105,6 +106,17 @@ export function clampFeeRateSatPerVbyte(
 export interface IUtxoSelectionOpts {
 	utxos?: Array<{ txid: string; vout: number }>;
 	allowTopUp?: boolean;
+}
+
+/** Limits new fee coins and identifies original pledged inputs for a replacement. */
+export interface IFeeBumpSelectionOpts {
+	excludeTxids?: readonly string[];
+	confirmedOnly?: boolean;
+	replacementInputs?: readonly {
+		txid: string;
+		vout: number;
+		sequence: number;
+	}[];
 }
 
 export interface IFundingProvider {
@@ -268,11 +280,20 @@ export interface IFundingProvider {
 	 */
 	selectFeeBumpInputs?(
 		targetFeeSats: bigint,
-		feeratePerKw: number
+		feeratePerKw: number,
+		opts?: IFeeBumpSelectionOpts
 	): Promise<{
 		inputs: import('../channel/channel').ISpliceWalletInput[];
 		changeScript: Buffer;
 	}>;
+	/** Restore owned, still-pledged P2WPKH signers without releasing their reservations. */
+	restoreFeeBumpInputs?(
+		inputs: readonly {
+			prevTx: Buffer;
+			prevOutputIndex: number;
+			sequence: number;
+		}[]
+	): Promise<import('../channel/channel').ISpliceWalletInput[]>;
 }
 
 /**
@@ -687,6 +708,12 @@ export interface INodeConfig {
 	 * mainnet balances yet.
 	 */
 	preferTaproot?: boolean;
+	/**
+	 * Native MuSig2 dual funding and splicing, negotiated through feature 446/447.
+	 * Verification nonces bind each exact funding attempt; signed rounds survive
+	 * restart. Taproot HTLC updates pause until the splice reaches splice_locked.
+	 */
+	nativeTaprootFunding?: boolean;
 	/** Native asset channel implementation with durable funding admission. */
 	auxiliaryChannels?: import('../channel/auxiliary-funding').IAuxiliaryChannelConfig;
 	/**
@@ -1045,12 +1072,13 @@ export interface ICreateInvoiceOptions {
 	 * Emit receiver route-blinding blinded paths instead of cleartext routing
 	 * hints (BOLT 4 / BOLT 11). Each usable channel becomes a 2-hop blinded path
 	 * [peer → us] so payers learn the introduction node (our peer) but not our
-	 * node id. NOTE: beignet's encrypted hop data is not yet BOLT 4 TLV, so the
-	 * introduction peer must also be a beignet node — interop with LND/CLN as the
-	 * introduction node is a follow-up. Falls back to cleartext hints when no
-	 * blinded path can be built.
+	 * node id in the route hints. Uses LND-compatible tag20 framing and BOLT 4
+	 * encrypted recipient data. Falls back to cleartext hints when no path can
+	 * be built.
 	 */
 	useBlindedPaths?: boolean;
+	/** Exact caller-built payment paths, for example encrypted asset RFQ aliases. */
+	blindedPaymentPaths?: (pathId: Buffer) => IBlindedPaymentPath[];
 	/**
 	 * Number of NODES in each generated blinded path, including us (only
 	 * meaningful with `useBlindedPaths`). 3 (the default) inserts one real
@@ -1063,9 +1091,8 @@ export interface ICreateInvoiceOptions {
 	blindedPathNumHops?: number;
 	/**
 	 * With `useBlindedPaths`, ALSO emit cleartext BOLT 11 routing hints (tag 3)
-	 * for private channels, so a payer that does not understand the non-spec
-	 * blinded-paths tag (25) can still route (e.g. CLN/LND paying a private
-	 * channel). Off by default: a cleartext hint exposes the node id that
+	 * for private channels, so an older payer without blinded-path support
+	 * can still route. Off by default: a cleartext hint exposes the node id that
 	 * blinding is meant to hide, so this trades that privacy for routability.
 	 */
 	includeCleartextHintsWithBlinded?: boolean;

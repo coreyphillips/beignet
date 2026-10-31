@@ -16,6 +16,7 @@ import type { IChannelBasepoints } from '../../src/lightning/keys/derivation';
 import type { IChannelConfig } from '../../src/lightning/channel/types';
 import { Network } from '../../src/lightning/invoice/types';
 import { Feature } from '../../src/lightning/features/flags';
+import type { IChannelAuxiliaryProvider } from '../../src/lightning/channel/auxiliary';
 import { noopLogger } from '../../src/logger';
 const sinon = require('sinon');
 
@@ -280,6 +281,7 @@ describe('LightningNode.fromMnemonic options', () => {
 		// compile here until it is listed.
 		const given: Record<keyof LightningNodeSeedOptions, unknown> = {
 			auxiliaryChannels: undefined,
+			nativeTaprootFunding: undefined,
 			zeroReserve: undefined,
 			network: undefined,
 			channelConfig: undefined,
@@ -383,6 +385,39 @@ describe('LightningNode.fromMnemonic options', () => {
 		const iroh = input.iroh as { relays: string[]; secretKey: Uint8Array };
 		expect(iroh.relays).to.deep.equal(['sentinel']);
 		expect(iroh.secretKey).to.have.length(32);
+	});
+
+	it('advertises the required simple Taproot dependency for asset overlays', () => {
+		const node = LightningNode.fromMnemonic(MNEMONIC, {
+			auxiliaryChannels: {
+				provider: {} as IChannelAuxiliaryProvider,
+				resolveIncoming: () => undefined
+			}
+		});
+		nodes.push(node);
+		const flags = node.getLocalFeatures();
+		expect(flags.listSetBits()).to.include(181);
+		expect(flags.listSetBits()).to.include(2025);
+		expect(flags.hasFeature(Feature.STATIC_REMOTE_KEY)).to.equal(true);
+		expect(flags.hasFeature(Feature.ANCHOR_ZERO_FEE_HTLC)).to.equal(true);
+	});
+
+	it('advertises asset custody only when its concurrent round protocol is enabled', () => {
+		for (const enabled of [false, true]) {
+			const node = LightningNode.fromMnemonic(MNEMONIC, {
+				ffor: { concurrent: { enabled } },
+				auxiliaryChannels: {
+					provider: {
+						validateFforAssetTerms: () => undefined
+					} as unknown as IChannelAuxiliaryProvider,
+					resolveIncoming: () => undefined
+				}
+			});
+			nodes.push(node);
+			expect(
+				node.getLocalFeatures().hasFeature(Feature.OPTION_FF_ASSET)
+			).to.equal(enabled);
+		}
 	});
 
 	it('applies the options it used to drop', () => {

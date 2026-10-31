@@ -1,3 +1,4 @@
+import { EAddressType } from '../../types';
 /**
  * Wallet funding provider adapter.
  *
@@ -8,7 +9,11 @@
 import * as bitcoin from 'bitcoinjs-lib';
 import { ecc } from '../../utils/ecc';
 import { getECPair } from '../../utils/ecc-apis';
-import type { IFundingProvider, IUtxoSelectionOpts } from '../node/types';
+import type {
+	IFundingProvider,
+	IUtxoSelectionOpts,
+	IFeeBumpSelectionOpts
+} from '../node/types';
 import type { ISpliceWalletInput } from '../channel/channel';
 import {
 	estimateSpliceTxWeight,
@@ -124,10 +129,16 @@ export interface IWalletLike {
 		}): Promise<IResult>;
 	};
 	listUtxos?(): ISpliceUtxo[];
+	/** Refresh Bitcoin change after another fee transaction consumes the available coin. */
+	refreshWallet?(options: Record<string, never>): Promise<IResult>;
 	/** Returns the WIF-encoded private key for a derivation path. */
 	getPrivateKey?(path: string): string;
+	/** Public derivation metadata survives spent-UTXO removal and wallet restart. */
+	getAddressFromScriptHash?(
+		hash: string
+	): { address: string; path: string; publicKey: string } | undefined;
 	/** Returns Result<{ address: string }>. */
-	getChangeAddress?(): Promise<IResult>;
+	getChangeAddress?(addressType?: EAddressType): Promise<IResult>;
 	/** A beignet `Network` value: 'bitcoin' | 'testnet' | 'regtest' | 'signet'. */
 	network?: string;
 	/** UTXO freeze API, used to pledge inputs to in-flight fundings so two
@@ -440,7 +451,9 @@ export class WalletFundingProvider implements IFundingProvider {
 	}
 
 	/** Unfreeze pledges whose funding tx spent them or that timed out. */
-	private async prunePledges(): Promise<void> {
+	private async prunePledges(
+		protectedInputs?: ReadonlySet<string>
+	): Promise<void> {
 		this.adoptStalePledges();
 		if (this.pledged.size === 0 || !this.wallet.listUtxos) return;
 		const utxos = this.wallet.listUtxos();
@@ -452,6 +465,7 @@ export class WalletFundingProvider implements IFundingProvider {
 		const live = new Set(utxos.map((u) => `${u.tx_hash}:${u.tx_pos}`));
 		const now = Date.now();
 		for (const key of [...this.pledged.keys()]) {
+			if (protectedInputs?.has(key)) continue;
 			// Read the timestamp live: a renewal can land between this snapshot
 			// and the unfreeze below, and expiring it on the stale one would drop
 			// the reservation the renewal just made.
@@ -687,7 +701,8 @@ export class WalletFundingProvider implements IFundingProvider {
 	 */
 	async selectFeeBumpInputs(
 		targetFeeSats: bigint,
-		feeratePerKw: number
+		feeratePerKw: number,
+		opts?: IFeeBumpSelectionOpts
 	): Promise<{ inputs: ISpliceWalletInput[]; changeScript: Buffer }> {
 		// P2WPKH only: the fee-bump attach paths (sweep.ts) sign wallet inputs
 		// with (tx, index, value) and cannot supply the full prevout set a
@@ -701,7 +716,9 @@ export class WalletFundingProvider implements IFundingProvider {
 					feeratePerKw
 				) +
 				P2WPKH_DUST_LIMIT,
-			true
+			true,
+			undefined,
+			opts
 		);
 	}
 
@@ -880,10 +897,17 @@ export class WalletFundingProvider implements IFundingProvider {
 		purpose: string,
 		computeTarget: (selectedCount: number) => bigint,
 		p2wpkhOnly = false,
-		opts?: IUtxoSelectionOpts
+		opts?: IUtxoSelectionOpts,
+		feeOpts?: IFeeBumpSelectionOpts
 	): Promise<{ inputs: ISpliceWalletInput[]; changeScript: Buffer }> {
 		return this.runSelection(() =>
-			this.gatherWalletInputsLocked(purpose, computeTarget, p2wpkhOnly, opts)
+			this.gatherWalletInputsLocked(
+				purpose,
+				computeTarget,
+				p2wpkhOnly,
+				opts,
+				feeOpts
+			)
 		);
 	}
 
@@ -891,7 +915,8 @@ export class WalletFundingProvider implements IFundingProvider {
 		purpose: string,
 		computeTarget: (selectedCount: number) => bigint,
 		p2wpkhOnly = false,
-		opts?: IUtxoSelectionOpts
+		opts?: IUtxoSelectionOpts,
+		feeOpts?: IFeeBumpSelectionOpts
 	): Promise<{ inputs: ISpliceWalletInput[]; changeScript: Buffer }> {
 		const wallet = this.wallet;
 		if (
@@ -905,13 +930,75 @@ export class WalletFundingProvider implements IFundingProvider {
 			);
 		}
 
-		await this.prunePledges();
-		let candidates = this.spendableP2wpkhUtxos(p2wpkhOnly);
+		const excluded = new Set(
+			(feeOpts?.excludeTxids ?? []).map((value) => {
+				if (!/^[a-f0-9]{64}$/i.test(value))
+					throw new Error('Invalid excluded fee transaction');
+				return value.toLowerCase();
+			})
+		);
+		const specs = feeOpts?.replacementInputs ?? [],
+			protectedInputs = new Set<string>();
+		for (const input of specs) {
+			if (
+				!/^[a-f0-9]{64}$/i.test(input.txid) ||
+				excluded.has(input.txid.toLowerCase())
+			)
+				throw new Error('Forbidden replacement fee input');
+			protectedInputs.add(`${input.txid.toLowerCase()}:${input.vout}`);
+		}
+		const previous = specs.length
+			? await this.previousTransactions(
+					specs.map((input) => input.txid.toLowerCase())
+			  )
+			: new Map<string, string>();
+		const reused = specs.length
+			? await this.restoreFeeBumpInputsLocked(
+					specs.map((input) => {
+						const raw = previous.get(input.txid.toLowerCase());
+						if (!raw)
+							throw new Error('Replacement fee previous transaction missing');
+						return {
+							prevTx: Buffer.from(raw, 'hex'),
+							prevOutputIndex: input.vout,
+							sequence: input.sequence
+						};
+					})
+			  )
+			: [];
+		const reusedSum = reused.reduce((sum, input) => sum + input.value, 0n);
+		const eligible = (): ISpliceUtxo[] =>
+			this.spendableP2wpkhUtxos(p2wpkhOnly).filter(
+				(input) =>
+					!excluded.has(input.tx_hash.toLowerCase()) &&
+					!protectedInputs.has(`${input.tx_hash}:${input.tx_pos}`) &&
+					(!(feeOpts?.confirmedOnly || specs.length > 0) || input.height > 0)
+			);
+		await this.prunePledges(protectedInputs);
+		let candidates = eligible();
+		if (
+			purpose === 'fee-bump' &&
+			wallet.refreshWallet &&
+			reusedSum +
+				candidates.reduce((sum, coin) => sum + BigInt(coin.value), 0n) <
+				computeTarget(Math.max(candidates.length + reused.length, 1))
+		) {
+			const refreshed = await wallet.refreshWallet({});
+			if (refreshed.isErr())
+				throw new Error(
+					`wallet refresh for fee-bump failed: ${
+						(refreshed as IResultErr).error.message
+					}`
+				);
+			await this.prunePledges(protectedInputs);
+			candidates = eligible();
+		}
+
 		const network = this.bitcoinJsNetwork();
 
 		const selected: ISpliceUtxo[] = [];
-		let selectedSum = 0n;
-		let target = 0n;
+		let selectedSum = reusedSum;
+		let target = computeTarget(Math.max(reused.length, 1));
 		// An empty directed list must not degrade into unrestricted greedy
 		// selection (issue #572 review): direct provider callers get the same
 		// refusal the shared selection entry enforces.
@@ -941,7 +1028,7 @@ export class WalletFundingProvider implements IFundingProvider {
 				selected.push(match);
 				selectedSum += BigInt(match.value);
 			}
-			target = computeTarget(selected.length);
+			target = computeTarget(selected.length + reused.length);
 			// Without allowTopUp the named coins must carry the whole target;
 			// the shared shortfall error below reports the deficit.
 			candidates = opts.allowTopUp
@@ -949,14 +1036,14 @@ export class WalletFundingProvider implements IFundingProvider {
 				: [];
 		}
 		for (const utxo of candidates) {
-			if (selectedSum >= target && selected.length > 0) break;
+			if (selectedSum >= target && selected.length + reused.length > 0) break;
 			selected.push(utxo);
 			selectedSum += BigInt(utxo.value);
 			// Each added input grows the tx (and thus the fee) — recompute.
-			target = computeTarget(selected.length);
+			target = computeTarget(selected.length + reused.length);
 			if (selectedSum >= target) break;
 		}
-		if (selectedSum < target || selected.length === 0) {
+		if (selectedSum < target || selected.length + reused.length === 0) {
 			// Directed selections filtered the seeded coins out of candidates,
 			// so the spendable total is the seeded sum plus what remains.
 			const have =
@@ -970,9 +1057,15 @@ export class WalletFundingProvider implements IFundingProvider {
 		}
 
 		// Fetch the raw previous transactions in one batch.
-		const txResult = await wallet.electrum.getTransactions({
-			txHashes: selected.map((u) => ({ tx_hash: u.tx_hash }))
-		});
+		const txResult: IResult = selected.length
+			? await wallet.electrum.getTransactions({
+					txHashes: selected.map((u) => ({ tx_hash: u.tx_hash }))
+			  })
+			: ({
+					isErr: () => false,
+					isOk: () => true,
+					value: { data: [] }
+			  } as IResultOk<{ data: [] }>);
 		if (txResult.isErr()) {
 			throw new Error(
 				`failed to fetch ${purpose} prev txs: ${
@@ -994,98 +1087,18 @@ export class WalletFundingProvider implements IFundingProvider {
 			if (txid && entry.result?.hex) hexByTxid.set(txid, entry.result.hex);
 		}
 
-		const inputs: ISpliceWalletInput[] = selected.map((utxo) => {
-			const hex = hexByTxid.get(utxo.tx_hash);
-			if (!hex) {
-				throw new Error(`missing raw tx for ${purpose} input ${utxo.tx_hash}`);
-			}
-			const keyPair = getECPair().fromWIF(
-				wallet.getPrivateKey!(utxo.path),
-				network
-			);
-			const pubkey = Buffer.from(keyPair.publicKey);
-			if (pubkey.toString('hex') !== utxo.publicKey) {
-				throw new Error(
-					`derived key mismatch for ${purpose} input ${utxo.tx_hash}:${utxo.tx_pos}`
-				);
-			}
-			const privKey = Buffer.from(keyPair.privateKey!);
-			const outputScript = bitcoin.address.toOutputScript(
-				utxo.address,
-				network
-			);
-			const kind = scriptKind(outputScript);
+		const inputs: ISpliceWalletInput[] = [
+			...reused,
+			...selected.map((utxo) => {
+				const hex = hexByTxid.get(utxo.tx_hash);
+				if (!hex) throw new Error(`Missing ${purpose} previous transaction`);
+				return this.walletInput(utxo, hex, purpose);
+			})
+		];
 
-			const base = {
-				prevTx: Buffer.from(hex, 'hex'),
-				prevOutputIndex: utxo.tx_pos,
-				value: BigInt(utxo.value),
-				sequence: 0xfffffffd,
-				confirmed: utxo.height > 0
-			};
-
-			if (kind === 'p2tr') {
-				// BIP 86 key-path spend: sign with the taproot-tweaked key over
-				// the BIP 341 sighash, which commits to every input's prevout.
-				// BOLT 2 requires SIGHASH_ALL on every tx_signatures signature,
-				// so the explicit 65-byte form is emitted rather than the
-				// 64-byte SIGHASH_DEFAULT shorthand (identical coverage, but
-				// the interactive-tx rule names ALL and peers may enforce it).
-				const tweakedPriv = taprootTweakPrivateKey(privKey, pubkey);
-				return {
-					...base,
-					signWitness: (
-						tx: bitcoin.Transaction,
-						inputIndex: number,
-						_value: bigint,
-						prevouts?: { scripts: Buffer[]; values: bigint[] }
-					): Buffer[] => {
-						if (!prevouts) {
-							throw new Error(
-								'P2TR input needs the full prevout set to sign (BIP 341)'
-							);
-						}
-						const sighash = tx.hashForWitnessV1(
-							inputIndex,
-							prevouts.scripts,
-							prevouts.values.map((v) => Number(v)),
-							bitcoin.Transaction.SIGHASH_ALL
-						);
-						return [
-							Buffer.concat([
-								Buffer.from(ecc.signSchnorr(sighash, tweakedPriv)),
-								Buffer.from([bitcoin.Transaction.SIGHASH_ALL])
-							])
-						];
-					}
-				};
-			}
-
-			const scriptCode = bitcoin.payments.p2pkh({ pubkey, network }).output!;
-			return {
-				...base,
-				signWitness: (
-					tx: bitcoin.Transaction,
-					inputIndex: number,
-					value: bigint
-				): Buffer[] => {
-					const sighash = tx.hashForWitnessV0(
-						inputIndex,
-						scriptCode,
-						Number(value),
-						bitcoin.Transaction.SIGHASH_ALL
-					);
-					const sig64 = Buffer.from(ecc.sign(sighash, privKey));
-					const der = bitcoin.script.signature.encode(
-						sig64,
-						bitcoin.Transaction.SIGHASH_ALL
-					);
-					return [der, pubkey];
-				}
-			};
-		});
-
-		const changeRes = await wallet.getChangeAddress();
+		const changeRes = await wallet.getChangeAddress(
+			p2wpkhOnly ? EAddressType.p2wpkh : undefined
+		);
 		if (changeRes.isErr()) {
 			throw new Error(
 				`failed to get change address: ${
@@ -1105,6 +1118,222 @@ export class WalletFundingProvider implements IFundingProvider {
 		}
 
 		return { inputs, changeScript };
+	}
+
+	private walletInput(
+		utxo: ISpliceUtxo,
+		hex: string,
+		purpose: string,
+		sequence = 0xfffffffd
+	): ISpliceWalletInput {
+		const wallet = this.wallet,
+			network = this.bitcoinJsNetwork();
+		const keyPair = getECPair().fromWIF(
+			wallet.getPrivateKey!(utxo.path),
+			network
+		);
+		const pubkey = Buffer.from(keyPair.publicKey);
+		if (pubkey.toString('hex') !== utxo.publicKey) {
+			throw new Error(
+				`derived key mismatch for ${purpose} input ${utxo.tx_hash}:${utxo.tx_pos}`
+			);
+		}
+		const privKey = Buffer.from(keyPair.privateKey!);
+		const outputScript = bitcoin.address.toOutputScript(utxo.address, network);
+		const kind = scriptKind(outputScript);
+
+		const base = {
+			prevTx: Buffer.from(hex, 'hex'),
+			prevOutputIndex: utxo.tx_pos,
+			value: BigInt(utxo.value),
+			sequence,
+			confirmed: utxo.height > 0
+		};
+
+		if (kind === 'p2tr') {
+			// BIP 86 key-path spend: sign with the taproot-tweaked key over
+			// the BIP 341 sighash, which commits to every input's prevout.
+			// BOLT 2 requires SIGHASH_ALL on every tx_signatures signature,
+			// so the explicit 65-byte form is emitted rather than the
+			// 64-byte SIGHASH_DEFAULT shorthand (identical coverage, but
+			// the interactive-tx rule names ALL and peers may enforce it).
+			const tweakedPriv = taprootTweakPrivateKey(privKey, pubkey);
+			return {
+				...base,
+				signWitness: (
+					tx: bitcoin.Transaction,
+					inputIndex: number,
+					_value: bigint,
+					prevouts?: { scripts: Buffer[]; values: bigint[] }
+				): Buffer[] => {
+					if (!prevouts) {
+						throw new Error(
+							'P2TR input needs the full prevout set to sign (BIP 341)'
+						);
+					}
+					const sighash = tx.hashForWitnessV1(
+						inputIndex,
+						prevouts.scripts,
+						prevouts.values.map((v) => Number(v)),
+						bitcoin.Transaction.SIGHASH_ALL
+					);
+					return [
+						Buffer.concat([
+							Buffer.from(ecc.signSchnorr(sighash, tweakedPriv)),
+							Buffer.from([bitcoin.Transaction.SIGHASH_ALL])
+						])
+					];
+				}
+			};
+		}
+
+		const scriptCode = bitcoin.payments.p2pkh({ pubkey, network }).output!;
+		return {
+			...base,
+			signWitness: (
+				tx: bitcoin.Transaction,
+				inputIndex: number,
+				value: bigint
+			): Buffer[] => {
+				const sighash = tx.hashForWitnessV0(
+					inputIndex,
+					scriptCode,
+					Number(value),
+					bitcoin.Transaction.SIGHASH_ALL
+				);
+				const sig64 = Buffer.from(ecc.sign(sighash, privKey));
+				const der = bitcoin.script.signature.encode(
+					sig64,
+					bitcoin.Transaction.SIGHASH_ALL
+				);
+				return [der, pubkey];
+			}
+		};
+	}
+
+	private async previousTransactions(
+		txids: readonly string[]
+	): Promise<Map<string, string>> {
+		if (!this.wallet.electrum.getTransactions)
+			throw new Error('Fee input transaction lookup is unavailable');
+		const result = await this.wallet.electrum.getTransactions({
+			txHashes: [...new Set(txids)].map((tx_hash) => ({ tx_hash }))
+		});
+		if (result.isErr())
+			throw new Error('Failed to fetch replacement fee input transactions');
+		const entries =
+			(
+				result as IResultOk<{
+					data: Array<{
+						data?: { tx_hash?: string };
+						result?: { hex?: string; txid?: string };
+					}>;
+				}>
+			).value.data ?? [];
+		const transactions = new Map<string, string>();
+		for (const entry of entries) {
+			const hex = entry.result?.hex;
+			if (!hex) continue;
+			const transaction = bitcoin.Transaction.fromHex(hex);
+			const identity = entry.result?.txid ?? entry.data?.tx_hash;
+			if (identity && transaction.getId() !== identity.toLowerCase())
+				throw new Error('Replacement fee transaction identity mismatch');
+			transactions.set(transaction.getId(), hex);
+		}
+		return transactions;
+	}
+
+	async restoreFeeBumpInputs(
+		inputs: readonly {
+			prevTx: Buffer;
+			prevOutputIndex: number;
+			sequence: number;
+		}[]
+	): Promise<ISpliceWalletInput[]> {
+		return this.runSelection(() => this.restoreFeeBumpInputsLocked(inputs));
+	}
+
+	private async restoreFeeBumpInputsLocked(
+		inputs: readonly {
+			prevTx: Buffer;
+			prevOutputIndex: number;
+			sequence: number;
+		}[]
+	): Promise<ISpliceWalletInput[]> {
+		if (!this.wallet.getAddressFromScriptHash || !this.wallet.getPrivateKey)
+			throw new Error('Wallet fee input restoration is unavailable');
+		this.adoptStalePledges();
+		const unique = new Set<string>();
+		const restored = inputs.map((input) => {
+			if (
+				!Number.isInteger(input.prevOutputIndex) ||
+				input.prevOutputIndex < 0 ||
+				!Number.isInteger(input.sequence) ||
+				input.sequence < 0 ||
+				input.sequence > 0xffffffff
+			)
+				throw new Error('Invalid replacement fee input');
+			const transaction = bitcoin.Transaction.fromBuffer(input.prevTx),
+				txid = transaction.getId(),
+				key = `${txid}:${input.prevOutputIndex}`,
+				previous = transaction.outs[input.prevOutputIndex];
+			if (unique.has(key)) throw new Error('Duplicate replacement fee input');
+			unique.add(key);
+			if (!previous || scriptKind(previous.script) !== 'p2wpkh')
+				throw new Error('Replacement fee input is not P2WPKH');
+			const frozen = this.wallet
+				.listFrozenUtxos?.()
+				.find(
+					(coin) =>
+						coin.tx_hash === txid && coin.tx_pos === input.prevOutputIndex
+				);
+			if (
+				!this.pledged.has(key) ||
+				!this.ownedFreezes.has(key) ||
+				this.wallet.isUtxoFrozen?.(txid, input.prevOutputIndex) !== true ||
+				(frozen && frozen.freezeTag !== WalletFundingProvider.PLEDGE_TAG)
+			)
+				throw new Error('Replacement fee input is not an owned pledge');
+			const descriptor = this.wallet.getAddressFromScriptHash!(
+				Buffer.from(bitcoin.crypto.sha256(previous.script))
+					.reverse()
+					.toString('hex')
+			);
+			if (
+				!descriptor ||
+				!bitcoin.address
+					.toOutputScript(descriptor.address, this.bitcoinJsNetwork())
+					.equals(previous.script)
+			)
+				throw new Error('Replacement fee input has no owned derivation');
+			const utxo: ISpliceUtxo = {
+				...descriptor,
+				tx_hash: txid,
+				tx_pos: input.prevOutputIndex,
+				value: previous.value,
+				height: 0
+			};
+			const signer = this.walletInput(
+				utxo,
+				transaction.toHex(),
+				'replacement fee',
+				input.sequence
+			);
+			if (
+				!bitcoin.payments
+					.p2wpkh({ pubkey: Buffer.from(descriptor.publicKey, 'hex') })
+					.output!.equals(previous.script)
+			)
+				throw new Error('Replacement fee input key does not match its prevout');
+			return signer;
+		});
+		for (const input of inputs) {
+			const txid = bitcoin.Transaction.fromBuffer(input.prevTx).getId();
+			const refused = await this.pledge(txid, input.prevOutputIndex, true);
+			if (refused)
+				throw new Error(`Replacement fee pledge renewal failed: ${refused}`);
+		}
+		return restored;
 	}
 
 	/**

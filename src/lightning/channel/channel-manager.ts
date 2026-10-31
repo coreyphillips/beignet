@@ -1,3 +1,4 @@
+import type { INativeInteractiveFundingSetup } from './interactive-funding';
 import { applyAuxiliaryClose } from './auxiliary-close';
 import {
 	applyAuxiliaryFunding,
@@ -94,6 +95,7 @@ import {
 	satPerVbyteToSatPerKw
 } from '../chain/types';
 import {
+	attachFeeInputsToAuxiliarySweepTx,
 	attachFeeInputsToZeroFeeHtlcTx,
 	buildAnchorCpfpTx
 } from '../chain/sweep';
@@ -102,7 +104,7 @@ import {
 	buildAnchorOutput,
 	buildAnchorScript
 } from '../script/anchor';
-import type { IFundingProvider } from '../node/types';
+import type { IFundingProvider, IFeeBumpSelectionOpts } from '../node/types';
 import {
 	canSelectDualFundingInputs,
 	releaseInputPledgesBestEffort,
@@ -359,6 +361,8 @@ export interface IChannelManagerConfig {
 	 * those sends. LightningNode supplies one backed by its storage.
 	 */
 	persistence: IChannelPersistence;
+	/** Acknowledge the exact monitor snapshot saved by monitor:updated before an auxiliary sweep broadcasts. */
+	isMonitorPersisted?: (channelIdHex: string) => boolean;
 	zeroReserve?: import('./zero-reserve').IZeroReserveConfig;
 	/** Durable book lookup supplied by the node's voucher custody index. */
 	fforVoucherLookup?: (paymentHash: string) => IFforVoucherArchive | undefined;
@@ -6452,7 +6456,10 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		// admissions, the CURRENT init exchange must advertise the base and
 		// concurrent capabilities on both sides. Judged here, on every
 		// reestablish, and handed to the channel before it runs.
-		channel.setFforCapabilities(this.peerNegotiatedFforConcurrent(peerPubkey));
+		channel.setFforCapabilities(
+			this.peerNegotiatedFforConcurrent(peerPubkey),
+			this.peerNegotiatedFforAssets(peerPubkey)
+		);
 		const actions = channel.handleReestablish(msg);
 		this.processActions(peerPubkey, channel, actions);
 
@@ -6723,6 +6730,18 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		);
 	}
 
+	peerNegotiatedFforAssets(peerPubkey: string): boolean {
+		const local = this.config.localFeatures;
+		const remote = this.fforPeerFeatureSource
+			? this.fforPeerFeatureSource(peerPubkey)
+			: this.peerManager?.getPeer(peerPubkey)?.getRemoteInit()?.features;
+		return (
+			!!local?.hasFeature(Feature.OPTION_FF_RECEIVE) &&
+			local.hasFeature(Feature.OPTION_FF_ASSET) &&
+			!!remote?.hasFeature(Feature.OPTION_FF_RECEIVE) &&
+			remote.hasFeature(Feature.OPTION_FF_ASSET)
+		);
+	}
 	/** Hand the channel its peer's node id and our node-key signer. */
 	/** S's terms for answering ff_init (issue #729); null answers on any. */
 	private fforSettlePolicy: IFforSettlePolicy | null = null;
@@ -6735,6 +6754,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		if (!/^[0-9a-f]{66}$/i.test(peerPubkey)) return;
 		const nodeKey = this.config.nodePrivateKey ?? null;
 		channel.setFforContext({
+			assetsNegotiated: this.peerNegotiatedFforAssets(peerPubkey),
 			...(this.fforSettlePolicy ? { settlePolicy: this.fforSettlePolicy } : {}),
 			remoteNodeId: Buffer.from(peerPubkey, 'hex'),
 			signFn: nodeKey
@@ -6984,6 +7004,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 	initiateFforEpoch(
 		channelId: Buffer,
 		request: {
+			assetTerms?: import('../ffor/assets').IFforAssetTerms;
 			voucherAmountsMsat: bigint[];
 			minPaymentMsat: bigint;
 			settlementDeadline: number;
@@ -7232,7 +7253,43 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		// from the peer's live init features before validating.
 		channel.setMaxFundingSatoshis(this.maxFundingForPeer(peerPubkey));
 		this.configureZeroReserve(channel, peerPubkey);
-		const actions = channel.handleSplice(msg);
+		let relative = 0n;
+		if (isTaprootChannel(channel.getFullState().channelType)) {
+			if (!this.peerNegotiatedNativeFunding(peerPubkey)) {
+				this.processActions(
+					peerPubkey,
+					channel,
+					channel.refuseSpliceInit(
+						'Native funding was not negotiated',
+						'Native Taproot splice requires peer support'
+					)
+				);
+				return;
+			}
+			channel.enableTaprootInteractiveFunding();
+			if (msg.interactiveFundingSessionId) {
+				const setup =
+					this.config.auxiliaryChannels?.resolveInteractiveFunding?.(
+						peerPubkey,
+						msg.interactiveFundingSessionId,
+						'splice'
+					);
+				if (!setup) {
+					this.processActions(
+						peerPubkey,
+						channel,
+						channel.refuseSpliceInit(
+							'Unknown asset splice session',
+							'Unknown asset splice session'
+						)
+					);
+					return;
+				}
+				this.installInteractiveFunding(channel, setup, msg.fundingFeeratePerkw);
+				relative = setup.contributionSats;
+			}
+		}
+		const actions = channel.handleSplice(msg, relative);
 		this.processActions(peerPubkey, channel, actions);
 	}
 
@@ -7326,7 +7383,8 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		channelId: Buffer,
 		relativeSatoshis: bigint,
 		fundingFeeratePerkw: number,
-		locktime?: number
+		locktime?: number,
+		interactiveFunding?: INativeInteractiveFundingSetup
 	): ChannelResult {
 		const idHex = channelId.toString('hex');
 		const channel = this.channels.get(idHex);
@@ -7351,10 +7409,47 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			return { ok: false, actions: [], error };
 		}
 
+		if (
+			interactiveFunding &&
+			(channel.getState() !== ChannelState.NORMAL ||
+				!channel.isQuiescent() ||
+				channel.getFullState().spliceInFlight)
+		)
+			return {
+				ok: false,
+				actions: [],
+				error: 'Another funding transition owns this channel'
+			};
+
 		// Refresh the (possibly wumbo-lifted) funding cap before the splice-in
 		// growth check inside initiateSplice.
 		channel.setMaxFundingSatoshis(this.maxFundingForPeer(peerPubkey));
 		this.configureZeroReserve(channel, peerPubkey);
+		if (isTaprootChannel(channel.getFullState().channelType)) {
+			if (!this.peerNegotiatedNativeFunding(peerPubkey))
+				return {
+					ok: false,
+					actions: [],
+					error: 'Peer did not negotiate native Taproot splicing'
+				};
+			channel.enableTaprootInteractiveFunding();
+			if (interactiveFunding) {
+				if (
+					interactiveFunding.plan.kind !== 'splice' ||
+					interactiveFunding.contributionSats !== relativeSatoshis
+				)
+					return {
+						ok: false,
+						actions: [],
+						error: 'Invalid asset splice contribution'
+					};
+				this.installInteractiveFunding(
+					channel,
+					interactiveFunding,
+					fundingFeeratePerkw
+				);
+			}
+		}
 		const actions = channel.initiateSplice(
 			relativeSatoshis,
 			fundingFeeratePerkw,
@@ -7691,14 +7786,54 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 	 * fundingUtxos or a lease request; the node-level openChannelV2 refuses
 	 * those combinations up front.
 	 */
+	peerNegotiatedNativeFunding(peerPubkey: string): boolean {
+		return !!(
+			this.config.localFeatures?.hasFeature(
+				Feature.OPTION_TAPROOT_INTERACTIVE_FUNDING
+			) &&
+			this.peerManager
+				?.getPeer(peerPubkey)
+				?.getRemoteInit()
+				?.features.hasFeature(Feature.OPTION_TAPROOT_INTERACTIVE_FUNDING)
+		);
+	}
+	private installInteractiveFunding(
+		channel: Channel,
+		setup: INativeInteractiveFundingSetup,
+		feerate: number
+	): void {
+		channel.enableTaprootInteractiveFunding();
+		channel.setInteractiveFundingPlan(setup.plan);
+		channel.setNativeFundingContributions(setup.contributions);
+		if (setup.plan.kind === 'dual')
+			channel.setDualFundingContribution(
+				setup.inputs,
+				setup.changeScript,
+				setup.contributionSats,
+				feerate
+			);
+		else
+			channel.setSpliceInInputs(setup.inputs, setup.changeScript, {
+				lockAtDepth: setup.lockAtDepth
+			});
+	}
 	createDualFundedChannel(
 		peerPubkey: string,
 		params: IDualFundingParams,
 		opts?: {
 			trusted?: boolean;
+			interactiveFunding?: INativeInteractiveFundingSetup;
 			contribution?: { inputs: ISpliceWalletInput[]; changeScript: Buffer };
 		}
 	): Channel {
+		const nativeFunding = this.peerNegotiatedNativeFunding(peerPubkey);
+		if (
+			opts?.interactiveFunding &&
+			(!nativeFunding ||
+				opts.interactiveFunding.plan.kind !== 'dual' ||
+				opts.interactiveFunding.contributionSats !== params.fundingSatoshis)
+		)
+			throw new Error('Invalid or unnegotiated native asset dual funding');
 		if (opts?.trusted && !this.zeroConfManager.canOpenZeroConfTo(peerPubkey)) {
 			throw new Error(
 				`Peer ${peerPubkey} is not in the trusted set; add it with addTrustedPeer (or let it register a JIT receive intent) before a trusted open`
@@ -7707,8 +7842,8 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		// V2 establishment is conditioned on NEGOTIATED option_dual_fund on
 		// the explicit API too: the generic openChannel routes by these
 		// bits, but openChannelV2 arrives here directly, and without the
-		// same enforcement a masked vector (preferTaproot masks dual_fund
-		// because taproot v2 signing does not exist) or an unsupporting
+		// same enforcement a masked vector (Taproot without the negotiated
+		// native funding extension) or an unsupporting
 		// peer would still get an OPEN_CHANNEL2, a burned key index and a
 		// retained temp channel for a negotiation that cannot complete.
 		// With a real peer manager the peer must be connected, init-complete
@@ -7746,16 +7881,26 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		// it: a refused type must burn no key index and retain no channel.
 		// CLN requires the channel_type TLV on open_channel2 (tx_abort:
 		// "open_channel2 missing channel_type"). Default it to
-		// static_remotekey plus anchors when preferred; the legacy open's
-		// taproot default is deliberately NOT mirrored here, because taproot
-		// v2 signing does not exist and validateV2ChannelType refuses the
-		// bit outright (a preferTaproot node cannot reach this path through
-		// the node API anyway: the global dual_fund mask throws above).
+		// static_remotekey plus anchors for ordinary peers. Native interactive
+		// funding selects the asset overlay, or simple Taproot when preferred,
+		// only after the corresponding extension has been negotiated.
 		let channelType = params.channelType;
 		if (!channelType) {
 			const typeFlags = FeatureFlags.empty();
-			typeFlags.setCompulsory(Feature.STATIC_REMOTE_KEY);
-			if (this.config.preferAnchors) {
+			if (opts?.interactiveFunding)
+				typeFlags.setCompulsory(Feature.OPTION_TAPROOT_OVERLAY);
+			else if (this.config.preferTaproot && nativeFunding)
+				typeFlags.setCompulsory(Feature.OPTION_TAPROOT);
+			else {
+				if (this.config.preferTaproot)
+					throw new Error('Peer did not negotiate native Taproot dual funding');
+				typeFlags.setCompulsory(Feature.STATIC_REMOTE_KEY);
+			}
+			if (
+				this.config.preferAnchors &&
+				!opts?.interactiveFunding &&
+				!this.config.preferTaproot
+			) {
 				typeFlags.setCompulsory(Feature.ANCHOR_ZERO_FEE_HTLC);
 			}
 			channelType = typeFlags.toBuffer();
@@ -7817,6 +7962,13 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			signer,
 			this.config.auxiliaryChannels?.provider
 		);
+		if (nativeFunding) channel.enableTaprootInteractiveFunding();
+		if (opts?.interactiveFunding)
+			this.installInteractiveFunding(
+				channel,
+				opts.interactiveFunding,
+				params.fundingFeeratePerkw
+			);
 		channel.setBlockHeight(this._currentBlockHeight);
 		if (this.config.chainHash) {
 			channel.announcementChainHash = this.config.chainHash;
@@ -7978,9 +8130,9 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		// BOTH our advertised vector and the peer's init must carry it, so
 		// an open_channel2 outside that contract is refused ahead of
 		// everything with an effect: no keys derived, no temp channel, no
-		// row. This is what makes a masked feature vector (quorum +
-		// preferTaproot masks the bit because taproot v2 signing does not
-		// exist) hold on the INBOUND side too. The refusal is PEER-VISIBLE:
+		// row. This also enforces feature masks for quorum operation and for
+		// Taproot peers without the native funding extension on the inbound
+		// side. The refusal is PEER-VISIBLE:
 		// a local event alone would leave the opener parked in
 		// DUAL_FUNDING_V2 forever, so a wire error scoped to the temporary
 		// channel id cancels the open on its side. A manager built without
@@ -8009,6 +8161,35 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 				'open_channel2 refused: channel_id does not match the opener revocation basepoint'
 			);
 			return;
+		}
+		const nativeFunding = this.peerNegotiatedNativeFunding(peerPubkey);
+		let interactive: INativeInteractiveFundingSetup | undefined;
+		if (msg.interactiveFundingSessionId) {
+			if (!nativeFunding) {
+				this.refuseInboundOpen(
+					peerPubkey,
+					msg.channelId,
+					'Native interactive funding was not negotiated'
+				);
+				return;
+			}
+			interactive = this.config.auxiliaryChannels?.resolveInteractiveFunding?.(
+				peerPubkey,
+				msg.interactiveFundingSessionId,
+				'dual'
+			);
+			if (
+				!interactive ||
+				interactive.plan.kind !== 'dual' ||
+				!interactive.plan.sessionId.equals(msg.interactiveFundingSessionId)
+			) {
+				this.refuseInboundOpen(
+					peerPubkey,
+					msg.channelId,
+					'Unknown interactive asset funding session'
+				);
+				return;
+			}
 		}
 		const proposedTempId = msg.channelId.toString('hex');
 		if (
@@ -8182,6 +8363,13 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 				signer,
 				this.config.auxiliaryChannels?.provider
 			);
+			if (nativeFunding) channel.enableTaprootInteractiveFunding();
+			if (interactive)
+				this.installInteractiveFunding(
+					channel,
+					interactive,
+					msg.fundingFeeratePerkw
+				);
 			channel.setBlockHeight(this._currentBlockHeight);
 			if (this.config.chainHash) {
 				channel.announcementChainHash = this.config.chainHash;
@@ -8381,6 +8569,14 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 				);
 			}
 
+			if (interactive) {
+				localParams.fundingSatoshis = interactive.contributionSats;
+				this.installInteractiveFunding(
+					channel,
+					interactive,
+					msg.fundingFeeratePerkw
+				);
+			}
 			const answer = channel.handleOpenChannel2(msg, localParams);
 			answered = true;
 			this.dispatchInboundOpenActions(
@@ -8997,7 +9193,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			this.findTempChannel(msg.channelId);
 		if (!channel) return;
 
-		const actions = channel.handleTxComplete();
+		const actions = channel.handleTxComplete(msg);
 		// tx_complete may trigger our v2 commitment_signed, which sets the
 		// derived channelId — promote before processActions so PERSIST_STATE
 		// resolves the channel by its permanent id.
@@ -11295,6 +11491,17 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		for (const action of actions) {
 			switch (action.type) {
 				case ChainActionType.BROADCAST_TX:
+					if (
+						action.requiresMonitorPersistence &&
+						this.config.isMonitorPersisted?.(channelId.toString('hex')) !== true
+					) {
+						this.emit(
+							'error',
+							channelId,
+							'Auxiliary sweep is waiting for durable monitor persistence'
+						);
+						break;
+					}
 					this.emit('broadcast:tx', action.tx);
 					break;
 				case ChainActionType.FEE_BUMP_AND_BROADCAST:
@@ -11330,6 +11537,15 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 					// the bumped feerate and rebroadcast (RBF). Critical for penalty
 					// txs that must confirm before the cheater's to_self_delay matures.
 					const mon = this.monitors.get(channelId.toString('hex'));
+					if (mon && typeof mon.rebuildSweepActions === 'function') {
+						const replacementActions = mon.rebuildSweepActions(
+							action.output,
+							action.feeRatePerVbyte
+						);
+						this.emit('monitor:updated', channelId.toString('hex'), mon);
+						this.processChainActions(channelId, replacementActions);
+						break;
+					}
 					const rebuilt =
 						mon && typeof mon.rebuildSweeps === 'function'
 							? mon.rebuildSweeps(action.output, action.feeRatePerVbyte)
@@ -11338,6 +11554,20 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 							  ].filter(
 									(tx): tx is import('bitcoinjs-lib').Transaction => !!tx
 							  );
+					if (action.output.auxiliaryData && mon) {
+						this.emit('monitor:updated', channelId.toString('hex'), mon);
+						if (
+							this.config.isMonitorPersisted?.(channelId.toString('hex')) !==
+							true
+						) {
+							this.emit(
+								'error',
+								channelId,
+								'Auxiliary sweep rebuild is waiting for durable monitor persistence'
+							);
+							break;
+						}
+					}
 					for (const tx of rebuilt) {
 						// Sweep rebuilds return bitcoin.Transaction objects; every
 						// broadcast listener expects a raw Buffer.
@@ -11368,8 +11598,114 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 	 * Resolution is detected by watching the spent commitment output, so the bumped
 	 * transaction's different txid needs no re-tracking. Any failure (no funding
 	 * provider, insufficient UTXOs, build error) falls back to broadcasting the
-	 * unbumped transaction so a force-close is never stranded.
+	 * unbumped transaction for ordinary anchor paths. Asset carrier sweeps wait
+	 * for funded fees and an acknowledged durable monitor update.
 	 */
+	private feeBumpSelectionOptions(
+		action: IFeeBumpAndBroadcastChainAction,
+		base: bitcoin.Transaction,
+		monitor?: ChainMonitor
+	): IFeeBumpSelectionOpts {
+		const excluded = new Set(action.conflictingCandidateTxids ?? []);
+		const original = new Set(
+			base.ins.map(
+				(input) =>
+					`${Buffer.from(input.hash).reverse().toString('hex')}:${input.index}`
+			)
+		);
+		const assetOutpoints = new Set(original);
+		for (const output of monitor?.getTrackedOutputs() ?? [])
+			assetOutpoints.add(`${output.txid}:${output.outputIndex}`);
+		const replacementInputs: NonNullable<
+			IFeeBumpSelectionOpts['replacementInputs']
+		>[number][] = [];
+		if (action.previousFundedTransaction) {
+			const previous = bitcoin.Transaction.fromBuffer(
+				action.previousFundedTransaction
+			);
+			const previousOutpoints = new Set(
+				previous.ins.map(
+					(input) =>
+						`${Buffer.from(input.hash).reverse().toString('hex')}:${
+							input.index
+						}`
+				)
+			);
+			if ([...original].some((key) => !previousOutpoints.has(key)))
+				throw new Error(
+					'Fee replacement candidate does not cover the asset inputs'
+				);
+			excluded.add(previous.getId());
+			for (const input of previous.ins) {
+				const txid = Buffer.from(input.hash).reverse().toString('hex');
+				if (assetOutpoints.has(`${txid}:${input.index}`)) continue;
+				if (
+					input.witness.length !== 2 ||
+					input.witness[1].length !== 33 ||
+					![2, 3].includes(input.witness[1][0])
+				)
+					continue;
+				replacementInputs.push({
+					txid,
+					vout: input.index,
+					sequence: input.sequence
+				});
+			}
+		}
+		return {
+			excludeTxids: [...excluded],
+			confirmedOnly:
+				!!action.previousFundedTransaction ||
+				action.previousFee !== undefined ||
+				action.auxiliarySweep?.previousFee !== undefined,
+			replacementInputs
+		};
+	}
+
+	private validateFeeSelection(
+		inputs: ISpliceWalletInput[],
+		opts: IFeeBumpSelectionOpts
+	): void {
+		const excluded = new Set(opts.excludeTxids ?? []);
+		const reused = new Set(
+			(opts.replacementInputs ?? []).map(
+				(input) => `${input.txid}:${input.vout}`
+			)
+		);
+		const seen = new Set<string>();
+		for (const input of inputs) {
+			const txid = bitcoin.Transaction.fromBuffer(input.prevTx).getId();
+			const point = `${txid}:${input.prevOutputIndex}`;
+			if (excluded.has(txid))
+				throw new Error(
+					'Fee input descends from a conflicting sweep candidate'
+				);
+			if (seen.has(point)) throw new Error('Duplicate sweep fee input');
+			seen.add(point);
+			if (opts.confirmedOnly && !reused.has(point) && input.confirmed !== true)
+				throw new Error('Replacement fee top-up requires a confirmed input');
+		}
+	}
+
+	private async releaseUnusedFeeInputs(
+		provider: IFundingProvider,
+		inputs: ISpliceWalletInput[],
+		opts: IFeeBumpSelectionOpts
+	): Promise<void> {
+		const reused = new Set(
+			(opts.replacementInputs ?? []).map(
+				(input) => `${input.txid}:${input.vout}`
+			)
+		);
+		const release = inputs
+			.map((input) => ({
+				txid: bitcoin.Transaction.fromBuffer(input.prevTx).getId(),
+				vout: input.prevOutputIndex
+			}))
+			.filter((input) => !reused.has(`${input.txid}:${input.vout}`));
+		if (release.length) await provider.releaseInputPledges?.(release);
+	}
+
 	private async _handleFeeBumpAndBroadcast(
 		channelId: Buffer,
 		action: IFeeBumpAndBroadcastChainAction
@@ -11377,43 +11713,173 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		const fp = this.fundingProvider;
 		const feeratePerVbyte = action.feeratePerVbyte;
 		const feeratePerKw = satPerVbyteToSatPerKw(feeratePerVbyte);
+		const auxiliaryClaim =
+			action.kind === 'auxiliary-sweep-fee-attach' ||
+			!!action.finalizeHtlcFunding;
 
 		if (!fp?.selectFeeBumpInputs) {
 			this.emit(
 				'error',
 				channelId,
-				`anchor fee bump (${action.kind}) skipped: no funding provider; broadcasting unbumped`
+				`anchor fee bump (${action.kind}) skipped: no funding provider${
+					auxiliaryClaim ? '' : '; broadcasting unbumped'
+				}`
 			);
-			this.emit('broadcast:tx', action.tx);
+			if (!auxiliaryClaim) this.emit('broadcast:tx', action.tx);
 			return;
 		}
 
 		try {
+			if (action.kind === 'auxiliary-sweep-fee-attach') {
+				const channelIdHex = channelId.toString('hex');
+				const monitor = this.monitors.get(channelIdHex);
+				const attachment = action.auxiliarySweep;
+				if (!monitor || !attachment)
+					throw new Error('Auxiliary sweep monitor or signer is unavailable');
+				const sweepTx = bitcoin.Transaction.fromBuffer(action.tx);
+				const selection = this.feeBumpSelectionOptions(
+					action,
+					sweepTx,
+					monitor
+				);
+				let targetFeeSats = BigInt(
+					Math.ceil(sweepTx.virtualSize() * feeratePerVbyte)
+				);
+				if (attachment.previousFee !== undefined) {
+					const minimumReplacementFee =
+						attachment.previousFee + BigInt(sweepTx.virtualSize());
+					if (minimumReplacementFee > targetFeeSats)
+						targetFeeSats = minimumReplacementFee;
+				}
+				const { inputs, changeScript } = await fp.selectFeeBumpInputs(
+					targetFeeSats,
+					attachment.previousFee === undefined
+						? feeratePerKw
+						: satPerVbyteToSatPerKw(Math.max(feeratePerVbyte, 1)),
+					selection
+				);
+				let installed = false;
+				try {
+					this.validateFeeSelection(inputs, selection);
+					if (this.monitors.get(channelIdHex) !== monitor) return;
+					const { tx, auxiliaryData, feeSatoshis } =
+						attachFeeInputsToAuxiliarySweepTx({
+							sweepTx,
+							walletInputs: inputs,
+							changeScript,
+							feeratePerVbyte,
+							attachment
+						});
+					const transaction = tx.toBuffer();
+					if (!attachment.finalize(transaction, auxiliaryData, feeSatoshis))
+						return;
+					installed = true;
+					// The exact funded witness and proof payload must survive a crash
+					// before the transaction can become visible to the network.
+					this.emit('monitor:updated', channelIdHex, monitor);
+					if (this.config.isMonitorPersisted?.(channelIdHex) !== true) {
+						throw new Error(
+							'Auxiliary sweep is waiting for durable monitor persistence'
+						);
+					}
+					this.emit('broadcast:tx', transaction);
+				} finally {
+					if (!installed) {
+						await this.releaseUnusedFeeInputs(fp, inputs, selection);
+					}
+				}
+				return;
+			}
 			if (action.kind === 'htlc-fee-attach') {
+				const monitor = action.finalizeHtlcFunding
+					? this.monitors.get(channelId.toString('hex'))
+					: undefined;
 				const htlcTx = bitcoin.Transaction.fromBuffer(action.tx);
+				const selection = this.feeBumpSelectionOptions(action, htlcTx, monitor);
 				const htlcWitness = htlcTx.ins[0]?.witness;
 				if (!htlcWitness || htlcWitness.length === 0) {
-					// No pre-signed witness — bumping cannot make it valid.
-					this.emit('broadcast:tx', action.tx);
+					// Fee inputs cannot repair a missing original signature.
+					if (!auxiliaryClaim) this.emit('broadcast:tx', action.tx);
 					return;
 				}
 				// The wallet must cover the whole fee (the HTLC tx pays zero). Pass the
 				// HTLC tx's own fee; the provider adds the wallet input/change weight.
-				const targetFeeSats = BigInt(
+				let targetFeeSats = BigInt(
 					Math.ceil(htlcTx.virtualSize() * feeratePerVbyte)
 				);
+				if (action.previousFee !== undefined) {
+					const replacementFee =
+						action.previousFee + BigInt(htlcTx.virtualSize());
+					if (replacementFee > targetFeeSats) targetFeeSats = replacementFee;
+				}
 				const { inputs, changeScript } = await fp.selectFeeBumpInputs(
 					targetFeeSats,
-					feeratePerKw
+					action.previousFee === undefined
+						? feeratePerKw
+						: satPerVbyteToSatPerKw(Math.max(feeratePerVbyte, 1)),
+					selection
 				);
-				const { tx } = attachFeeInputsToZeroFeeHtlcTx({
-					htlcTx,
-					htlcWitness,
-					walletInputs: inputs,
-					changeScript,
-					feeratePerVbyte
-				});
-				this.emit('broadcast:tx', tx.toBuffer());
+				let installed = false;
+				try {
+					this.validateFeeSelection(inputs, selection);
+					if (
+						action.finalizeHtlcFunding &&
+						(!monitor ||
+							this.monitors.get(channelId.toString('hex')) !== monitor)
+					)
+						return;
+					if (
+						action.finalizeHtlcFunding &&
+						(changeScript.length !== 22 ||
+							changeScript[0] !== 0 ||
+							changeScript[1] !== 20)
+					) {
+						throw new Error('Auxiliary HTLC fee change must be P2WPKH');
+					}
+					const originalWitness = htlcWitness.map((item) => Buffer.from(item));
+					const { tx } = attachFeeInputsToZeroFeeHtlcTx({
+						htlcTx,
+						htlcWitness,
+						walletInputs: inputs,
+						changeScript,
+						feeratePerVbyte,
+						previousFee: action.previousFee
+					});
+					const transaction = tx.toBuffer();
+					if (action.finalizeHtlcFunding) {
+						if (!monitor)
+							throw new Error('Auxiliary HTLC monitor is unavailable');
+						if (
+							tx.ins[0].witness.length !== originalWitness.length ||
+							originalWitness.some(
+								(item, index) => !item.equals(tx.ins[0].witness[index])
+							)
+						)
+							throw new Error(
+								'Wallet signer changed the auxiliary HTLC witness'
+							);
+						const paidFee =
+							inputs.reduce((total, input) => total + input.value, 0n) -
+							tx.outs
+								.slice(1)
+								.reduce((total, output) => total + BigInt(output.value), 0n);
+						if (!action.finalizeHtlcFunding(transaction, paidFee)) return;
+						installed = true;
+						this.emit('monitor:updated', channelId.toString('hex'), monitor);
+						if (
+							this.config.isMonitorPersisted?.(channelId.toString('hex')) !==
+							true
+						)
+							throw new Error(
+								'Auxiliary HTLC is waiting for durable monitor persistence'
+							);
+					}
+					this.emit('broadcast:tx', transaction);
+				} finally {
+					if (action.finalizeHtlcFunding && !installed) {
+						await this.releaseUnusedFeeInputs(fp, inputs, selection);
+					}
+				}
 				return;
 			}
 
@@ -11491,13 +11957,13 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			this.emit(
 				'error',
 				channelId,
-				`anchor fee bump (${action.kind}) failed, broadcasting unbumped: ${
-					(err as Error).message
-				}`
+				`anchor fee bump (${action.kind}) failed${
+					auxiliaryClaim ? '' : ', broadcasting unbumped'
+				}: ${(err as Error).message}`
 			);
 			// The zero-fee HTLC tx still gets a (futile but harmless) broadcast as a
 			// fallback; the commitment is already broadcast for the CPFP case.
-			if (action.kind === 'htlc-fee-attach')
+			if (action.kind === 'htlc-fee-attach' && !auxiliaryClaim)
 				this.emit('broadcast:tx', action.tx);
 			// anchor-cpfp failed to emit a child (e.g. no confirmed UTXOs). Flag it so
 			// reCpfpStuckCommitments retries next cycle rather than treating the paid

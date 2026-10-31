@@ -68,11 +68,11 @@ export function hasScidAliasChannelType(channelType: Buffer | null): boolean {
  * BOLT 2 defines channel types as explicit even-bit combinations, so this
  * is an allow-list, not a bit filter: static_remotekey, optionally with
  * anchors_zero_fee_htlc_tx, optionally with scid_alias (+zero_conf, which
- * BOLT 9 makes dependent on scid_alias). Everything else is refused,
- * including option_taproot: taproot v2 signing is unimplemented (the
- * commitment stage fails closed), and a negotiation that is guaranteed to
- * die later must be refused at admission, before keys are derived, state
- * is retained or an ACCEPT_CHANNEL2 is sent.
+ * BOLT 9 makes dependent on scid_alias). Simple Taproot and asset overlay
+ * types additionally require the native interactive funding extension,
+ * negotiated in both feature vectors or explicitly supplied by the host.
+ * Its funding transaction domains and persisted nonce rounds support v2
+ * signing. Other combinations fail before keys, state or ACCEPT_CHANNEL2.
  *
  * BOLT 2 makes channel_type REQUIRED on open_channel2 (unlike the legacy
  * open, where it is optional), so an absent or empty value is refused
@@ -91,7 +91,8 @@ export function hasScidAliasChannelType(channelType: Buffer | null): boolean {
 export function validateV2ChannelType(
 	channelType: Buffer | null | undefined,
 	localFeatures?: FeatureFlags | null,
-	remoteFeatures?: FeatureFlags | null
+	remoteFeatures?: FeatureFlags | null,
+	nativeInteractive = false
 ): string | null {
 	if (!channelType || channelType.length === 0) {
 		return 'open_channel2 requires a channel_type';
@@ -100,7 +101,14 @@ export function validateV2ChannelType(
 		return 'channel_type must use a minimal encoding';
 	}
 	const flags = FeatureFlags.fromBuffer(channelType);
-	if (isTaprootChannel(channelType)) {
+	const taproot = isTaprootChannel(channelType);
+	const nativeFunding =
+		nativeInteractive ||
+		!!(
+			localFeatures?.hasFeature(Feature.OPTION_TAPROOT_INTERACTIVE_FUNDING) &&
+			remoteFeatures?.hasFeature(Feature.OPTION_TAPROOT_INTERACTIVE_FUNDING)
+		);
+	if (taproot && !nativeFunding) {
 		return 'channel_type option_taproot is not supported for dual-funded (v2) channels';
 	}
 	// Only the even (compulsory) bits of the known combinations may appear;
@@ -110,6 +118,10 @@ export function validateV2ChannelType(
 	allowed.setCompulsory(Feature.ANCHOR_ZERO_FEE_HTLC);
 	allowed.setCompulsory(Feature.SCID_ALIAS);
 	allowed.setCompulsory(Feature.ZERO_CONF);
+	if (taproot && nativeFunding) {
+		allowed.setCompulsory(Feature.OPTION_TAPROOT);
+		allowed.setCompulsory(Feature.OPTION_TAPROOT_OVERLAY);
+	}
 	const mask = allowed.toBuffer();
 	for (let i = 0; i < channelType.length; i++) {
 		const bits = channelType[channelType.length - 1 - i];
@@ -118,7 +130,7 @@ export function validateV2ChannelType(
 			return 'channel_type is not a recognized dual-funded (v2) combination';
 		}
 	}
-	if (!flags.hasFeature(Feature.STATIC_REMOTE_KEY)) {
+	if (!taproot && !flags.hasFeature(Feature.STATIC_REMOTE_KEY)) {
 		return 'channel_type must include static_remotekey';
 	}
 	if (
@@ -142,12 +154,14 @@ export function validateV2ChannelType(
 		}
 	}
 	if (
+		!taproot &&
 		localFeatures != null &&
 		!localFeatures.hasFeature(Feature.STATIC_REMOTE_KEY)
 	) {
 		return 'channel_type static_remotekey was not negotiated: this node does not advertise it';
 	}
 	if (
+		!taproot &&
 		remoteFeatures != null &&
 		!remoteFeatures.hasFeature(Feature.STATIC_REMOTE_KEY)
 	) {

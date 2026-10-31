@@ -1,3 +1,7 @@
+import {
+	selectFundingEpoch,
+	selectFundingEpochForTransaction
+} from '../channel/funding-state';
 /**
  * BOLT 5: Output resolver.
  *
@@ -8,7 +12,7 @@
 import * as bitcoin from 'bitcoinjs-lib';
 import { ecc } from '../../utils/ecc';
 import { sha256 } from '../crypto/provider';
-import type { ITrackedOutput } from './types';
+import type { ITrackedOutput, IAuxiliarySweepFeeAttachment } from './types';
 import { CommitmentType, OutputType, OutputStatus } from './types';
 import {
 	buildToLocalSweepTx,
@@ -178,7 +182,13 @@ function matchSecondLevelTree(
 	keys: ITaprootCommitKeys,
 	script: Buffer,
 	network: bitcoin.Network
-) {
+):
+	| {
+			tree: ReturnType<typeof buildTaprootSecondLevelOutput>;
+			htlcId?: bigint;
+			auxiliaryHtlcDirection?: HtlcDirection;
+	  }
+	| undefined {
 	const view = (
 		isOurs
 			? state.auxiliaryState?.localCommitments
@@ -325,6 +335,73 @@ function prepareAuxiliarySweep(
 		input.output.auxiliaryData = Buffer.from(result.customData);
 	return Buffer.from(result.customData);
 }
+function auxiliaryLeafFeeFunding(
+	state: IChannelState,
+	isOurs: boolean,
+	height: bigint | undefined,
+	input: IPrivateSweepInput,
+	previousScript: Buffer,
+	destinationScript: Buffer,
+	extraWitness: Buffer[] = []
+): Omit<IAuxiliarySweepFeeAttachment, 'finalize'> {
+	return {
+		prevoutScripts: [Buffer.from(previousScript)],
+		prevoutValues: [input.output.amount],
+		sign: (
+			raw,
+			scripts,
+			values,
+			hashType = bitcoin.Transaction.SIGHASH_DEFAULT
+		): { transaction: Buffer; auxiliaryData: Buffer } => {
+			const funded = bitcoin.Transaction.fromBuffer(raw);
+			if (
+				hashType !== bitcoin.Transaction.SIGHASH_DEFAULT &&
+				(hashType !== SIGHASH_ANCHOR ||
+					funded.ins.length !== 1 ||
+					funded.outs.length !== 1)
+			)
+				throw new Error('Asset sponsorship requires a single input and output');
+			if (
+				scripts.length !== funded.ins.length ||
+				values.length !== funded.ins.length ||
+				!scripts[0].equals(previousScript) ||
+				values[0] !== input.output.amount ||
+				Buffer.from(funded.ins[0].hash).reverse().toString('hex') !==
+					input.output.txid ||
+				funded.ins[0].index !== input.output.outputIndex
+			)
+				throw new Error('Invalid funded asset sweep prevouts');
+			const payload = prepareAuxiliarySweep(
+				state,
+				isOurs,
+				height,
+				funded,
+				[{ ...input, output: { ...input.output } }],
+				destinationScript
+			);
+			if (!payload || !input.leafScript || !input.controlBlock)
+				throw new Error('Incomplete asset leaf recovery descriptor');
+			const digest = funded.hashForWitnessV1(
+				0,
+				scripts,
+				values.map(Number),
+				hashType,
+				tapleafHash(input.leafScript, input.leafVersion)
+			);
+			funded.setWitness(0, [
+				Buffer.concat([
+					signTaprootHtlcLeaf(digest, input.privateKey),
+					hashType === 0 ? Buffer.alloc(0) : Buffer.from([hashType])
+				]),
+				...extraWitness,
+				input.leafScript,
+				input.controlBlock
+			]);
+			return { transaction: funded.toBuffer(), auxiliaryData: payload };
+		}
+	};
+}
+
 const SIGHASH_ANCHOR =
 	bitcoin.Transaction.SIGHASH_SINGLE | bitcoin.Transaction.SIGHASH_ANYONECANPAY;
 
@@ -357,6 +434,7 @@ export interface IClassifiedCommitment {
  * A resolved output with its spend transaction and witness.
  */
 export interface IResolvedOutput {
+	auxiliaryFunding?: Omit<IAuxiliarySweepFeeAttachment, 'finalize'>;
 	auxiliaryData?: Buffer;
 	trackedOutput: ITrackedOutput;
 	spendTx?: bitcoin.Transaction;
@@ -424,6 +502,7 @@ export function classifyCommitmentTx(
 	tx: bitcoin.Transaction,
 	state: IChannelState
 ): IClassifiedCommitment {
+	state = selectFundingEpochForTransaction(state, tx);
 	// A funding spend with no inputs is not evidence of anything; route it to
 	// the ERROR arm rather than throwing or silently resolving the channel.
 	if (tx.ins.length === 0) {
@@ -985,6 +1064,17 @@ export function classifyOutputs(
 	commitmentType: CommitmentType,
 	commitmentNumber: bigint
 ): ITrackedOutput[] {
+	state = selectFundingEpochForTransaction(state, tx);
+	const bind = (outputs: ITrackedOutput[]): ITrackedOutput[] =>
+		state.auxiliaryState && state.fundingTxid
+			? outputs.map((output) => ({
+					...output,
+					fundingOutpoint: {
+						txid: Buffer.from(state.fundingTxid!).reverse().toString('hex'),
+						outputIndex: state.fundingOutputIndex
+					}
+			  }))
+			: outputs;
 	// THEIR_FUTURE_COMMITMENT (data-loss / SCB recovery) matches only our
 	// to_remote output, which derives from our STATIC payment basepoint - the
 	// one classification that works without the peer's basepoints.
@@ -999,14 +1089,18 @@ export function classifyOutputs(
 	const outputs: ITrackedOutput[] = [];
 
 	if (commitmentType === CommitmentType.OUR_COMMITMENT) {
-		return classifyOurCommitmentOutputs(tx, state, txid, commitmentNumber);
+		return bind(
+			classifyOurCommitmentOutputs(tx, state, txid, commitmentNumber)
+		);
 	} else if (
 		commitmentType === CommitmentType.THEIR_CURRENT_COMMITMENT ||
 		commitmentType === CommitmentType.THEIR_REVOKED_COMMITMENT
 	) {
-		return classifyTheirCommitmentOutputs(tx, state, txid, commitmentNumber);
+		return bind(
+			classifyTheirCommitmentOutputs(tx, state, txid, commitmentNumber)
+		);
 	} else if (commitmentType === CommitmentType.THEIR_FUTURE_COMMITMENT) {
-		return classifyTheirFutureCommitmentOutputs(tx, state, txid);
+		return bind(classifyTheirFutureCommitmentOutputs(tx, state, txid));
 	}
 
 	// For cooperative close, track outputs but they're already resolved
@@ -1021,7 +1115,7 @@ export function classifyOutputs(
 		});
 	}
 
-	return outputs;
+	return bind(outputs);
 }
 
 function classifyOurCommitmentOutputs(
@@ -1981,6 +2075,7 @@ function classifyTaprootCommitmentOutputs(
 		if (htlc) {
 			outputs.push({
 				...base,
+				witnessScript: Buffer.from(outScript),
 				outputType:
 					htlc.direction === HtlcDirection.OFFERED
 						? OutputType.OFFERED_HTLC
@@ -2006,6 +2101,29 @@ function classifyTaprootCommitmentOutputs(
  * - offered HTLC: HTLC-timeout after CLTV
  * - received HTLC: HTLC-success with preimage
  */
+function outputFundingView(
+	state: IChannelState,
+	outputs: readonly ITrackedOutput[]
+): IChannelState {
+	const points = new Map(
+		outputs
+			.filter((x) => x.fundingOutpoint)
+			.map((x) => [
+				`${x.fundingOutpoint!.txid}:${x.fundingOutpoint!.outputIndex}`,
+				x.fundingOutpoint!
+			])
+	);
+	if (points.size > 1)
+		throw new Error('Asset outputs belong to different funding epochs');
+	const point = points.values().next().value;
+	if (!point) return state;
+	return selectFundingEpoch(
+		state,
+		Buffer.from(point.txid, 'hex').reverse(),
+		point.outputIndex
+	);
+}
+
 export function resolveOurCommitmentOutputs(
 	state: IChannelState,
 	trackedOutputs: ITrackedOutput[],
@@ -2017,6 +2135,9 @@ export function resolveOurCommitmentOutputs(
 	htlcBasepointSecret?: Buffer,
 	remoteHtlcSignatures?: Buffer[]
 ): IResolvedOutput[] {
+	const selected = outputFundingView(state, trackedOutputs);
+	if (selected !== state) remoteHtlcSignatures = selected.remoteHtlcSignatures;
+	state = selected;
 	if (!state.remoteBasepoints) return [];
 
 	if (isTaprootChannel(state.channelType)) {
@@ -2331,6 +2452,9 @@ export function resolveSecondLevelHtlcOutput(
 			// internal + single delay leaf), not the commitment to_local tree.
 			isSecondLevelHtlc: true,
 			secondLevelTxHex: state.auxiliaryState ? htlcTx.toHex() : undefined,
+			auxiliaryParentData: previousAuxiliaryData
+				? Buffer.from(previousAuxiliaryData)
+				: undefined,
 			auxiliaryData: previousAuxiliaryData
 				? Buffer.from(previousAuxiliaryData)
 				: undefined,
@@ -2340,7 +2464,16 @@ export function resolveSecondLevelHtlcOutput(
 				? commitmentNumber
 				: undefined
 		};
-		const sweepValue = sweepOutputValue(amount, feeSatoshis, destinationScript);
+		const economicalValue = sweepOutputValue(
+			amount,
+			feeSatoshis,
+			destinationScript
+		);
+		const needsFeeFunding = !!previousAuxiliaryData && economicalValue === null;
+		const sweepValue = needsFeeFunding
+			? Math.max(Number(amount), 330)
+			: economicalValue;
+		if (needsFeeFunding) trackedOutput.auxiliaryFeeFunding = true;
 		if (sweepValue === null) {
 			// Still ours to track and watch; the monitor retries it as fees fall.
 			return { trackedOutput, declinedAsUneconomic: true };
@@ -2384,8 +2517,66 @@ export function resolveSecondLevelHtlcOutput(
 			tapleafHash(sl.delay.script, sl.delay.leafVersion)
 		);
 		const sig = signTaprootHtlcLeaf(sighash, delayedPrivkey);
+		const auxiliaryFunding: IResolvedOutput['auxiliaryFunding'] =
+			needsFeeFunding
+				? {
+						prevoutScripts: [Buffer.from(sl.output)],
+						prevoutValues: [amount],
+						sign: (
+							raw,
+							scripts,
+							values
+						): { transaction: Buffer; auxiliaryData: Buffer } => {
+							const funded = bitcoin.Transaction.fromBuffer(raw);
+							if (
+								scripts.length !== funded.ins.length ||
+								values.length !== funded.ins.length ||
+								!scripts[0].equals(sl.output) ||
+								values[0] !== amount
+							)
+								throw new Error('Invalid funded asset sweep prevouts');
+							const payload = prepareAuxiliarySweep(
+								state,
+								true,
+								commitmentNumber,
+								funded,
+								[
+									{
+										output: { ...trackedOutput },
+										commitmentOutputIndex: 0,
+										kind: 'second_level_delayed',
+										privateKey: delayedPrivkey,
+										leafScript: sl.delay.script,
+										leafVersion: sl.delay.leafVersion,
+										controlBlock: sl.delay.controlBlock,
+										sourceTransaction: htlcTx,
+										previousAuxiliaryData
+									}
+								],
+								destinationScript
+							);
+							if (!payload)
+								throw new Error('Funded asset sweep omitted provenance');
+							const digest = funded.hashForWitnessV1(
+								0,
+								scripts,
+								values.map(Number),
+								bitcoin.Transaction.SIGHASH_DEFAULT,
+								tapleafHash(sl.delay.script, sl.delay.leafVersion)
+							);
+							funded.setWitness(0, [
+								signTaprootHtlcLeaf(digest, delayedPrivkey),
+								sl.delay.script,
+								sl.delay.controlBlock
+							]);
+							return { transaction: funded.toBuffer(), auxiliaryData: payload };
+						}
+				  }
+				: undefined;
+
 		return {
 			trackedOutput,
+			auxiliaryFunding,
 			spendTx: sweepTx,
 			witness: [sig, sl.delay.script, sl.delay.controlBlock],
 			csvDelay: toSelfDelay
@@ -2511,6 +2702,29 @@ function resolveOurTaprootCommitmentOutputs(
 
 	const resolved: IResolvedOutput[] = [];
 	for (const output of trackedOutputs) {
+		if (output.isSecondLevelHtlc && output.secondLevelTxHex) {
+			const result = resolveSecondLevelHtlcOutput(
+				state,
+				bitcoin.Transaction.fromHex(output.secondLevelTxHex),
+				output.confirmationHeight,
+				commitmentNumber,
+				destinationScript,
+				feeRatePerVbyte,
+				delayedPaymentBasepointSecret,
+				undefined,
+				output.auxiliaryParentData ?? output.auxiliaryData
+			);
+			if (result) {
+				Object.assign(output, {
+					auxiliaryFeeFunding: result.trackedOutput.auxiliaryFeeFunding,
+					auxiliaryParentData: result.trackedOutput.auxiliaryParentData,
+					auxiliaryData: result.trackedOutput.auxiliaryData
+				});
+				resolved.push({ ...result, trackedOutput: output });
+			}
+			continue;
+		}
+
 		if (output.outputType === OutputType.TO_LOCAL) {
 			// A second-level-derived output uses the TaprootSecondLevelScriptTree
 			// (revocation-key internal + single delay leaf), NOT the commitment
@@ -2544,11 +2758,23 @@ function resolveOurTaprootCommitmentOutputs(
 							auxiliarySweepVbytes(state, destinationScript))
 				)
 			);
-			const sweepValue = sweepOutputValue(
+			const pricedValue = sweepOutputValue(
 				output.amount,
 				feeSatoshis,
 				destinationScript
 			);
+			const needsFeeFunding =
+				(pricedValue === null || pricedValue < 330) &&
+				!!commitmentAuxiliaryLeaf(
+					state,
+					true,
+					commitmentNumber,
+					output.outputIndex
+				);
+			const sweepValue = needsFeeFunding
+				? Math.max(Number(output.amount), 330)
+				: pricedValue;
+			if (needsFeeFunding) output.auxiliaryFeeFunding = true;
 			if (sweepValue === null) {
 				// Not economical to sweep. Track it without a spend so the rest of
 				// this commitment's outputs still resolve.
@@ -2609,6 +2835,24 @@ function resolveOurTaprootCommitmentOutputs(
 				trackedOutput: output,
 				spendTx: sweepTx,
 				witness: [sig, toLocal.delay.script, toLocal.delay.controlBlock],
+				auxiliaryFunding: needsFeeFunding
+					? auxiliaryLeafFeeFunding(
+							state,
+							true,
+							commitmentNumber,
+							{
+								output,
+								commitmentOutputIndex: output.outputIndex,
+								kind: 'to_local_delayed',
+								privateKey: delayedPrivkey,
+								leafScript: toLocal.delay.script,
+								leafVersion: toLocal.delay.leafVersion,
+								controlBlock: toLocal.delay.controlBlock
+							},
+							toLocal.output,
+							destinationScript
+					  )
+					: undefined,
 				csvDelay: toSelfDelay
 			});
 		} else if (output.outputType === OutputType.TO_REMOTE) {
@@ -2820,6 +3064,10 @@ function resolveTheirCurrentTaprootCommitmentOutputs(
 			: undefined;
 	const resolved: IResolvedOutput[] = [];
 
+	const feeFundings = new Map<
+		bitcoin.Transaction,
+		Omit<IAuxiliarySweepFeeAttachment, 'finalize'>
+	>();
 	const spendLeaf = (
 		output: ITrackedOutput,
 		spk: Buffer,
@@ -2838,11 +3086,23 @@ function resolveTheirCurrentTaprootCommitmentOutputs(
 						auxiliarySweepVbytes(state, destinationScript))
 			)
 		);
-		const sweepValue = sweepOutputValue(
+		const pricedValue = sweepOutputValue(
 			output.amount,
 			feeSatoshis,
 			destinationScript
 		);
+		const needsFeeFunding =
+			(pricedValue === null || pricedValue < 330) &&
+			!!commitmentAuxiliaryLeaf(
+				state,
+				false,
+				output.auxiliaryCommitmentNumber,
+				output.outputIndex
+			);
+		const sweepValue = needsFeeFunding
+			? Math.max(Number(output.amount), 330)
+			: pricedValue;
+		if (needsFeeFunding) output.auxiliaryFeeFunding = true;
 		// Not economical to spend; the caller tracks the output without a spend.
 		if (sweepValue === null) return null;
 		const tx = new bitcoin.Transaction();
@@ -2887,6 +3147,33 @@ function resolveTheirCurrentTaprootCommitmentOutputs(
 		);
 		const sig = signTaprootHtlcLeaf(sighash, privkey);
 		tx.ins[0].witness = [sig, ...extraWitness, leafScript, controlBlock];
+		if (needsFeeFunding)
+			feeFundings.set(
+				tx,
+				auxiliaryLeafFeeFunding(
+					state,
+					false,
+					output.auxiliaryCommitmentNumber,
+					{
+						output,
+						commitmentOutputIndex: output.outputIndex,
+						kind:
+							output.outputType === OutputType.TO_REMOTE
+								? 'to_remote'
+								: extraWitness.length
+								? 'htlc_success'
+								: 'htlc_timeout',
+						privateKey: privkey,
+						leafScript,
+						leafVersion,
+						controlBlock,
+						preimage: extraWitness[0]
+					},
+					spk,
+					destinationScript,
+					extraWitness
+				)
+			);
 		return tx;
 	};
 
@@ -2927,6 +3214,7 @@ function resolveTheirCurrentTaprootCommitmentOutputs(
 			resolved.push({
 				trackedOutput: output,
 				spendTx: tx,
+				auxiliaryFunding: feeFundings.get(tx),
 				witness: tx.ins[0].witness,
 				csvDelay: 1
 			});
@@ -2976,6 +3264,7 @@ function resolveTheirCurrentTaprootCommitmentOutputs(
 			resolved.push({
 				trackedOutput: output,
 				spendTx: tx,
+				auxiliaryFunding: feeFundings.get(tx),
 				witness: tx.ins[0].witness,
 				cltvExpiry: output.cltvExpiry
 			});
@@ -3026,6 +3315,7 @@ function resolveTheirCurrentTaprootCommitmentOutputs(
 			resolved.push({
 				trackedOutput: output,
 				spendTx: tx,
+				auxiliaryFunding: feeFundings.get(tx),
 				witness: tx.ins[0].witness
 			});
 		}
@@ -3048,6 +3338,8 @@ export function resolveTheirCurrentCommitmentOutputs(
 	htlcBasepointSecret?: Buffer,
 	remotePerCommitmentPoint?: Buffer
 ): IResolvedOutput[] {
+	const selected = outputFundingView(state, trackedOutputs);
+	state = selected;
 	if (!state.remoteBasepoints) {
 		// SCB recovery (THEIR_FUTURE_COMMITMENT on a reconstructed state): only
 		// our to_remote is resolvable - it pays our STATIC payment basepoint and
@@ -3395,6 +3687,15 @@ export function matchRevokedHtlcSnapshotOutputs(
 	const matchGroups = new Map<string, ISnapshotMatchCandidate[]>();
 
 	for (const entry of snapshot) {
+		if (state.auxiliaryState) {
+			const view = state.auxiliaryState.remoteCommitments.get(commitmentNumber);
+			if (!view?.htlcOutputIndexes)
+				throw new Error('Missing persisted asset HTLC output map');
+			// Retained snapshots can include an HTLC added after this commitment,
+			// or already removed from it. Its script is not an output candidate.
+			if (!view.htlcOutputIndexes.has(`${entry.direction}:${entry.id}`))
+				continue;
+		}
 		// On their commitment our offered HTLC uses their received script, and
 		// our received HTLC uses their offered script.
 		let witnessScript: Buffer | undefined;
@@ -3508,6 +3809,7 @@ export function resolveRevokedCommitmentOutputs(
 	currentHeight?: number,
 	claimedOutputIndices?: ClaimedOutputIndices
 ): IResolvedOutput[] {
+	state = selectFundingEpochForTransaction(state, revokedTx);
 	if (!state.remoteBasepoints) return [];
 
 	if (isTaprootChannel(state.channelType)) {
@@ -3830,6 +4132,99 @@ export function resolveRevokedCommitmentOutputs(
  * Our own to_remote balance is claimed in a separate tx (1-block-CSV leaf). All
  * spend paths were regtest-validated in the P4 taproot spend tests.
  */
+/** Re-sign every revocation input after the final wallet fee allocation is known. */
+function auxiliaryRevocationFeeFunding(
+	state: IChannelState,
+	height: bigint,
+	inputs: IPrivateSweepInput[],
+	previousScripts: Buffer[],
+	merkleRoots: (Buffer | undefined)[],
+	destinationScript: Buffer
+): Omit<IAuxiliarySweepFeeAttachment, 'finalize'> {
+	return {
+		prevoutScripts: previousScripts.map((script) => Buffer.from(script)),
+		prevoutValues: inputs.map((input) => input.output.amount),
+		sign: (
+			raw,
+			scripts,
+			values,
+			hashType = bitcoin.Transaction.SIGHASH_DEFAULT
+		): { transaction: Buffer; auxiliaryData: Buffer } => {
+			const funded = bitcoin.Transaction.fromBuffer(raw);
+			if (
+				hashType !== bitcoin.Transaction.SIGHASH_DEFAULT &&
+				(hashType !== SIGHASH_ANCHOR ||
+					funded.ins.length !== 1 ||
+					funded.outs.length !== 1)
+			)
+				throw new Error('Asset sponsorship requires a single input and output');
+			if (
+				funded.ins.length < inputs.length ||
+				scripts.length !== funded.ins.length ||
+				values.length !== funded.ins.length ||
+				inputs.some(
+					(input, index) =>
+						!scripts[index].equals(previousScripts[index]) ||
+						values[index] !== input.output.amount ||
+						Buffer.from(funded.ins[index].hash).reverse().toString('hex') !==
+							input.output.txid ||
+						funded.ins[index].index !== input.output.outputIndex
+				)
+			)
+				throw new Error('Invalid funded asset revocation prevouts');
+			const payload = prepareAuxiliarySweep(
+				state,
+				false,
+				height,
+				funded,
+				inputs.map((input) => ({ ...input, output: { ...input.output } })),
+				destinationScript
+			);
+			if (!payload)
+				throw new Error('Funded asset revocation omitted provenance');
+			inputs.forEach((input, index) => {
+				const root = merkleRoots[index];
+				if (root) {
+					const digest = funded.hashForWitnessV1(
+						index,
+						scripts,
+						values.map(Number),
+						hashType
+					);
+					funded.setWitness(index, [
+						Buffer.concat([
+							signTaprootHtlcLeaf(
+								digest,
+								tweakTaprootKeyPathPrivkey(input.privateKey, root)
+							),
+							hashType === 0 ? Buffer.alloc(0) : Buffer.from([hashType])
+						])
+					]);
+				} else {
+					if (!input.leafScript || !input.controlBlock)
+						throw new Error('Missing asset revocation leaf');
+					const digest = funded.hashForWitnessV1(
+						index,
+						scripts,
+						values.map(Number),
+						hashType,
+						tapleafHash(input.leafScript, input.leafVersion)
+					);
+					funded.setWitness(index, [
+						Buffer.concat([
+							signTaprootHtlcLeaf(digest, input.privateKey),
+							hashType === 0 ? Buffer.alloc(0) : Buffer.from([hashType])
+						]),
+						input.leafScript,
+						input.controlBlock
+					]);
+				}
+			});
+			return { transaction: funded.toBuffer(), auxiliaryData: payload };
+		}
+	};
+}
+
 function resolveRevokedTaprootCommitmentOutputs(
 	state: IChannelState,
 	trackedOutputs: ITrackedOutput[],
@@ -3941,11 +4336,22 @@ function resolveRevokedTaprootCommitmentOutputs(
 							auxiliarySweepVbytes(state, destinationScript))
 				)
 			);
-			const claimValue = sweepOutputValue(
+			const pricedValue = sweepOutputValue(
 				o.amount,
 				feeSatoshis,
 				destinationScript
 			);
+			const needsFeeFunding =
+				pricedValue === null &&
+				!!commitmentAuxiliaryLeaf(
+					state,
+					false,
+					commitmentNumber,
+					o.outputIndex
+				);
+			const claimValue = needsFeeFunding
+				? Math.max(Number(o.amount), 330)
+				: pricedValue;
 			// Not economical to claim. Skip it rather than abandoning the penalty
 			// spends for the remaining outputs of this revoked commitment.
 			if (claimValue === null) continue;
@@ -3986,6 +4392,24 @@ function resolveRevokedTaprootCommitmentOutputs(
 			claimTx.ins[0].witness = [sig, tr.spend.script, tr.spend.controlBlock];
 			resolved.push({
 				trackedOutput: o,
+				auxiliaryFunding: needsFeeFunding
+					? auxiliaryLeafFeeFunding(
+							state,
+							false,
+							commitmentNumber,
+							{
+								output: o,
+								commitmentOutputIndex: o.outputIndex,
+								kind: 'to_remote',
+								privateKey: paymentPrivkey,
+								leafScript: tr.spend.script,
+								leafVersion: tr.spend.leafVersion,
+								controlBlock: tr.spend.controlBlock
+							},
+							tr.output,
+							destinationScript
+					  )
+					: undefined,
 				spendTx: claimTx,
 				witness: claimTx.ins[0].witness,
 				csvDelay: 1
@@ -4081,7 +4505,21 @@ function resolveRevokedTaprootCommitmentOutputs(
 			TAPROOT_PENALTY_OUTPUT_VBYTES +
 			(state.auxiliaryState ? Math.max(0, 34 - destinationScript.length) : 0);
 		const fee = BigInt(Math.ceil(feeRatePerVbyte * estVbytes));
-		const penaltyValue = sweepOutputValue(totalIn, fee, destinationScript);
+		const pricedValue = sweepOutputValue(totalIn, fee, destinationScript);
+		const needsFeeFunding =
+			pricedValue === null &&
+			ins.some(
+				(pin) =>
+					!!commitmentAuxiliaryLeaf(
+						state,
+						false,
+						commitmentNumber,
+						pin.output.outputIndex
+					)
+			);
+		const penaltyValue = needsFeeFunding
+			? Math.max(Number(totalIn), 330)
+			: pricedValue;
 		if (penaltyValue === null) {
 			// This batch cannot pay for itself. Return rather than handing
 			// addOutput a negative value: the caller splits urgent inputs into
@@ -4112,6 +4550,24 @@ function resolveRevokedTaprootCommitmentOutputs(
 		);
 		const prevScripts = ins.map((p) => p.spk);
 		const values = ins.map((p) => p.value);
+		const auxiliaryFunding = needsFeeFunding
+			? auxiliaryRevocationFeeFunding(
+					state,
+					commitmentNumber,
+					ins.map((pin) => ({
+						output: pin.output,
+						commitmentOutputIndex: pin.output.outputIndex,
+						kind: pin.merkleRoot ? 'htlc_revocation' : 'to_local_revocation',
+						privateKey: revocationPrivkey,
+						leafScript: pin.leafScript,
+						controlBlock: pin.controlBlock,
+						leafVersion: pin.leafScript ? TAPLEAF_VERSION : undefined
+					})),
+					prevScripts,
+					ins.map((pin) => pin.merkleRoot),
+					destinationScript
+			  )
+			: undefined;
 
 		for (let i = 0; i < ins.length; i++) {
 			const pin = ins[i];
@@ -4147,6 +4603,7 @@ function resolveRevokedTaprootCommitmentOutputs(
 			penaltyTx.setWitness(i, witness);
 			resolved.push({
 				trackedOutput: pin.output,
+				auxiliaryFunding,
 				spendTx: penaltyTx,
 				witness
 			});
@@ -4248,11 +4705,18 @@ export function resolveRevokedSecondLevelOutput(
 			const sl = match.tree;
 			const merkleRoot = sl.merkleRoot;
 			const amount = BigInt(out.value);
-			const claimValue = sweepOutputValue(
+			const pricedValue = sweepOutputValue(
 				amount,
 				feeSatoshis,
 				destinationScript
 			);
+			const needsFeeFunding =
+				pricedValue === null &&
+				!!state.auxiliaryState &&
+				match.htlcId !== undefined;
+			const claimValue = needsFeeFunding
+				? Math.max(Number(amount), 330)
+				: pricedValue;
 			if (claimValue === null) continue;
 			const claimTx = new bitcoin.Transaction();
 			claimTx.version = 2;
@@ -4303,6 +4767,24 @@ export function resolveRevokedSecondLevelOutput(
 			claimTx.setWitness(0, witness);
 			resolved.push({
 				trackedOutput,
+				auxiliaryFunding: needsFeeFunding
+					? auxiliaryRevocationFeeFunding(
+							state,
+							commitmentNumber,
+							[
+								{
+									output: trackedOutput,
+									commitmentOutputIndex: i,
+									kind: 'second_level_revocation',
+									privateKey: revocationPrivkey,
+									sourceTransaction: spendingTx
+								}
+							],
+							[sl.output],
+							[merkleRoot],
+							destinationScript
+					  )
+					: undefined,
 				spendTx: claimTx,
 				witness
 			});

@@ -1,3 +1,7 @@
+import {
+	serializeChainMonitorState,
+	deserializeChainMonitorState
+} from '../../src/lightning/storage/serialization';
 import { expect } from 'chai';
 import { EventEmitter } from 'events';
 import * as bitcoin from 'bitcoinjs-lib';
@@ -22,7 +26,11 @@ const settle = (): Promise<void> =>
 const fixture = async (twoInputs = false) => {
 	const { opener, openerPrivkeys } = setupNormalChannels();
 	const channelId = opener.getChannelId()!;
-	const parent = Buffer.alloc(32, 0x74).toString('hex');
+	const parentTx = new bitcoin.Transaction();
+	parentTx.addInput(Buffer.alloc(32, 0x74), 0);
+	parentTx.addOutput(Buffer.from('0014' + 'bb'.repeat(20), 'hex'), 50000);
+	parentTx.addOutput(Buffer.from('0014' + 'bb'.repeat(20), 'hex'), 50000);
+	const parent = parentTx.getId();
 	const sweep = (value: number, indexes: number[]): bitcoin.Transaction => {
 		const tx = new bitcoin.Transaction();
 		tx.version = 2;
@@ -103,8 +111,17 @@ const fixture = async (twoInputs = false) => {
 		handleFundingSpendAbsent() {
 			return false;
 		}
-		handleOutputSpent() {}
-		handleOutputUnspent() {}
+		handleOutputSpent(
+			txid: string,
+			index: number,
+			tx: bitcoin.Transaction,
+			height: number
+		) {
+			monitor.handleOutputSpent(txid, index, tx, height);
+		}
+		handleOutputUnspent(txid: string, index: number) {
+			monitor.handleSpendUnconfirmed(txid, index);
+		}
 	}
 	const manager = new Manager();
 	let header: (height: number) => void = () => undefined;
@@ -140,6 +157,8 @@ const fixture = async (twoInputs = false) => {
 		winner,
 		obsolete,
 		parent,
+		parentTx,
+		channel: opener,
 		channelId,
 		block: (height: number) => header(height),
 		send: (tx = obsolete) => manager.emit('broadcast:tx', tx.toBuffer()),
@@ -196,6 +215,7 @@ describe('Confirmed asset sweep retry retirement', () => {
 				});
 			};
 			env.send();
+			await settle();
 			env.confirm();
 			env.block(100 + IRREVOCABLE_DEPTH);
 			reject(new Error('conflicting sweep already mined'));
@@ -239,7 +259,7 @@ describe('Confirmed asset sweep retry retirement', () => {
 		}
 	});
 
-	for (const depth of [0, 1])
+	for (const depth of [0])
 		it(`preserves retry exhaustion while winner depth is ${depth}`, async () => {
 			const env = await fixture();
 			try {
@@ -256,6 +276,135 @@ describe('Confirmed asset sweep retry retirement', () => {
 				env.watcher.stop();
 			}
 		});
+	it('pauses a confirmed conflict below finality and resumes its remaining retry budget after reorg', async () => {
+		const env = await fixture(true);
+		try {
+			env.send();
+			await settle();
+			env.confirm();
+			for (let height = 101; height < 125; height++) {
+				env.block(height);
+				await settle();
+			}
+			expect(env.sent).to.have.length(1);
+			expect(env.permanent).to.have.length(0);
+			expect(env.output().status).to.equal(OutputStatus.SPEND_CONFIRMED);
+			expect(env.monitor.getFullState().trackedOutputs[1].status).to.equal(
+				OutputStatus.UNCONFIRMED
+			);
+			env.send(env.fresh());
+			await settle();
+			expect(env.sent).to.include(env.fresh().getId());
+			env.monitor.handleSpendUnconfirmed(env.parent, 0);
+			env.block(125);
+			await settle();
+			expect(
+				env.sent.filter((id) => id === env.obsolete.getId())
+			).to.have.length(2);
+			for (let height = 126; height < 140; height++) {
+				env.block(height);
+				await settle();
+			}
+			expect(
+				env.sent.filter((id) => id === env.obsolete.getId())
+			).to.have.length(13);
+			expect(
+				env.permanent.some((error) =>
+					error.message.includes(env.obsolete.getId())
+				)
+			).to.equal(true);
+		} finally {
+			env.watcher.stop();
+		}
+	});
+	it('holds a newly submitted confirmed conflict and a delayed refusal without emitting failure', async () => {
+		const env = await fixture();
+		try {
+			let reject: (error: Error) => void = () => undefined;
+			env.backend.broadcastTransaction = async (raw) => {
+				env.sent.push(bitcoin.Transaction.fromHex(raw).getId());
+				return new Promise<string>((_resolve, fail) => {
+					reject = fail;
+				});
+			};
+			env.send();
+			await settle();
+			env.confirm();
+			reject(new Error('competing sweep confirmed'));
+			await settle();
+			env.send();
+			await settle();
+			expect(env.sent).to.have.length(1);
+			expect(env.failures).to.have.length(0);
+			env.block(100 + IRREVOCABLE_DEPTH);
+			await settle();
+			expect(env.permanent).to.have.length(0);
+		} finally {
+			env.watcher.stop();
+		}
+	});
+	it('does not pause a confirmation that still requires live re-verification', async () => {
+		const env = await fixture();
+		try {
+			env.send();
+			await settle();
+			env.confirm();
+			env.output().spendReverifyPending = true;
+			for (let height = 101; height < 115; height++) {
+				env.block(height);
+				await settle();
+			}
+			expect(env.sent).to.have.length(13);
+			expect(env.permanent).to.have.length(1);
+		} finally {
+			env.watcher.stop();
+		}
+	});
+	it('discovers an external confirmed remedy before broadcasting and resumes after its reorg', async () => {
+		const env = await fixture();
+		try {
+			env.channel['_state'].auxiliaryState = {
+				channelData: Buffer.alloc(0),
+				localBalance: 0n,
+				remoteBalance: 0n,
+				localCommitments: new Map(),
+				remoteCommitments: new Map()
+			};
+			delete env.output().auxiliarySweepAttempts![env.winner.getId()];
+			env.backend.getTransaction = async (id) => {
+				if (id === env.parent) return env.parentTx.toBuffer();
+				if (id === env.winner.getId()) return env.winner.toBuffer();
+				throw new Error('Unexpected transaction');
+			};
+			env.backend.getScriptHashHistory = async () => [
+				{ txid: env.parent, height: 90 },
+				{ txid: env.winner.getId(), height: 100 }
+			];
+			env.block(101);
+			env.send();
+			await settle();
+			expect(env.sent).to.have.length(0);
+			expect(env.failures).to.have.length(0);
+			expect(env.output().resolutionTxHex).to.equal(env.winner.toHex());
+			expect(
+				deserializeChainMonitorState(
+					serializeChainMonitorState(env.monitor.getFullState())
+				).trackedOutputs[0].resolutionTxHex
+			).to.equal(env.winner.toHex());
+			expect(env.output().status).to.equal(OutputStatus.SPEND_CONFIRMED);
+			env.backend.getScriptHashHistory = async () => [
+				{ txid: env.parent, height: 90 }
+			];
+			await env.watcher['checkOutputSpend'](`${env.parent}:0`);
+			expect(env.output().resolutionTxHex).to.equal(undefined);
+			env.block(102);
+			await settle();
+			expect(env.sent).to.deep.equal([env.obsolete.getId()]);
+			expect(env.permanent).to.have.length(0);
+		} finally {
+			env.watcher.stop();
+		}
+	});
 	it('requires the exact retained winning transaction before suppressing a failure', async () => {
 		const env = await fixture();
 		try {

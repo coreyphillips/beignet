@@ -250,7 +250,7 @@ function buildTwoHopBlinded(opts: {
 				paymentRelay: relay,
 				paymentConstraints: CONSTRAINTS
 			},
-			{ paymentConstraints: CONSTRAINTS }
+			{ pathId: decoded.paymentSecret, paymentConstraints: CONSTRAINTS }
 		];
 		const path = constructBlindedPath(
 			crypto.randomBytes(32),
@@ -415,7 +415,7 @@ describe('Blinded relay correctness (S-4.M1 / S-4.M2)', function () {
 				paymentRelay: relay,
 				paymentConstraints: CONSTRAINTS
 			},
-			{ paymentConstraints: CONSTRAINTS }
+			{ pathId: decoded.paymentSecret, paymentConstraints: CONSTRAINTS }
 		];
 		const path = constructBlindedPath(
 			crypto.randomBytes(32),

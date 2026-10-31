@@ -440,6 +440,10 @@ export class InteractiveTxBuilder {
 	/**
 	 * Get all inputs.
 	 */
+	getLocktime(): number {
+		return this.session.locktime;
+	}
+
 	getInputs(): IInteractiveTxInput[] {
 		return [...this.session.inputs.values()];
 	}

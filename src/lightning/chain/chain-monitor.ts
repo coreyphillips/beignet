@@ -1,3 +1,7 @@
+import {
+	selectFundingEpoch,
+	selectFundingEpochForTransaction
+} from '../channel/funding-state';
 /**
  * BOLT 5: Chain Monitor state machine.
  *
@@ -12,7 +16,9 @@ import type {
 	ChainAction,
 	ITrackedOutput,
 	ICommitmentBroadcast,
-	IFundingSpendScan
+	IFundingSpendScan,
+	IAuxiliarySweepFeeAttachment,
+	IFeeBumpAndBroadcastChainAction
 } from './types';
 import {
 	ChainActionType,
@@ -84,6 +90,12 @@ export class ChainMonitor {
 	 */
 	private _commitmentReverifyPending = false;
 
+	private _auxiliaryFeeGenerations = new WeakMap<ITrackedOutput, number>();
+	private _auxiliaryFeeFunding = new Map<
+		string,
+		Omit<IAuxiliarySweepFeeAttachment, 'finalize'>
+	>();
+
 	constructor(
 		channelState: IChannelState,
 		destinationScript: Buffer,
@@ -143,18 +155,36 @@ export class ChainMonitor {
 		auxiliaryData?: Buffer
 	): void {
 		const data = auxiliaryData ?? output.auxiliaryData;
-		if (!data || (!transaction && !output.sweepTxHex)) return;
+		if (
+			(!data && !this._channelState.auxiliaryState) ||
+			(!transaction && !output.sweepTxHex)
+		)
+			return;
 		const tx = transaction ?? bitcoin.Transaction.fromHex(output.sweepTxHex!);
 		output.auxiliarySweepAttempts ??= {};
 		output.auxiliarySweepAttempts[tx.getId()] = {
 			transaction: tx.toHex(),
-			auxiliaryData: Buffer.from(data)
+			...(data ? { auxiliaryData: Buffer.from(data) } : {}),
+			...(output.sweepTxHex === tx.toHex() &&
+			(output.auxiliaryFeeFunded || output.auxiliaryHtlcFeeFunded)
+				? {
+						auxiliarySweepFee: output.auxiliarySweepFee,
+						auxiliaryFeeFunded: output.auxiliaryFeeFunded,
+						auxiliaryHtlcFeeFunded: output.auxiliaryHtlcFeeFunded
+				  }
+				: {})
 		};
 	}
 
 	private _selectAuxiliarySweep(output: ITrackedOutput, txid: string): void {
 		const attempt = output.auxiliarySweepAttempts?.[txid];
-		if (attempt) output.auxiliaryData = Buffer.from(attempt.auxiliaryData);
+		if (attempt) {
+			output.auxiliarySweepFee = attempt.auxiliarySweepFee;
+			output.auxiliaryFeeFunded = attempt.auxiliaryFeeFunded;
+			output.auxiliaryHtlcFeeFunded = attempt.auxiliaryHtlcFeeFunded;
+		}
+		if (attempt?.auxiliaryData)
+			output.auxiliaryData = Buffer.from(attempt.auxiliaryData);
 	}
 
 	/**
@@ -287,6 +317,20 @@ export class ChainMonitor {
 		delayedPaymentBasepointSecret?: Buffer,
 		htlcBasepointSecret?: Buffer
 	): ChainMonitor {
+		const funding = saved.commitmentBroadcast?.spentOutpoint;
+		if (funding) {
+			const hash = Buffer.from(funding.txid, 'hex').reverse();
+			if (
+				channelState.fundingEpochs?.has(
+					`${hash.toString('hex')}:${funding.outputIndex}`
+				)
+			)
+				channelState = selectFundingEpoch(
+					channelState,
+					hash,
+					funding.outputIndex
+				);
+		}
 		const monitor = new ChainMonitor(
 			channelState,
 			destinationScript,
@@ -724,6 +768,10 @@ export class ChainMonitor {
 		// same view of the two.
 		this._currentBlockHeight = Math.max(this._currentBlockHeight, blockHeight);
 
+		this._channelState = selectFundingEpochForTransaction(
+			this._channelState,
+			spendingTx
+		);
 		const classified = classifyCommitmentTx(spendingTx, this._channelState);
 		const txid = spendingTx.getId();
 
@@ -1133,6 +1181,9 @@ export class ChainMonitor {
 			(candidate) =>
 				candidate.txid === txid && spentIndices.has(candidate.outputIndex)
 		);
+		if (this._channelState.auxiliaryState)
+			for (const spent of spentTrackedOutputs)
+				spent.resolutionTxHex = spendingTx.toHex();
 		// Capture proof before any persistence or idempotent return. Bind it to
 		// the exact input and current spender, so a reorg cannot turn an old
 		// success witness into evidence for a later timeout.
@@ -1144,7 +1195,8 @@ export class ChainMonitor {
 		) {
 			for (const spent of spentTrackedOutputs) {
 				if (
-					spent.outputType !== OutputType.RECEIVED_HTLC ||
+					(spent.outputType !== OutputType.RECEIVED_HTLC &&
+						spent.outputType !== OutputType.OFFERED_HTLC) ||
 					!spent.paymentHash ||
 					!spent.witnessScript
 				)
@@ -1154,13 +1206,32 @@ export class ChainMonitor {
 						Buffer.from(i.hash).reverse().toString('hex') === spent.txid &&
 						i.index === spent.outputIndex
 				);
-				const witness = input?.witness ?? [];
+				const witness = (input?.witness ?? []).map((item) => Buffer.from(item));
+				let argumentsOnly: Buffer[];
 				if (
-					!witness.length ||
-					!Buffer.from(witness[witness.length - 1]).equals(spent.witnessScript)
-				)
-					continue;
-				const preimage = witness.find(
+					spent.witnessScript.length === 34 &&
+					spent.witnessScript[0] === 0x51 &&
+					spent.witnessScript[1] === 32
+				) {
+					// Verify the revealed Taproot leaf and control block against this exact output.
+					if (witness.length && witness[witness.length - 1][0] === 0x50)
+						witness.pop();
+					if (witness.length < 2) continue;
+					try {
+						bitcoin.payments.p2tr({ output: spent.witnessScript, witness });
+					} catch {
+						continue;
+					}
+					argumentsOnly = witness.slice(0, -2);
+				} else {
+					if (
+						!witness.length ||
+						!witness[witness.length - 1].equals(spent.witnessScript)
+					)
+						continue;
+					argumentsOnly = witness.slice(0, -1);
+				}
+				const preimage = argumentsOnly.find(
 					(el) => el.length === 32 && sha256(el).equals(spent.paymentHash!)
 				);
 				spent.receivedHtlcSpend = {
@@ -1369,6 +1440,13 @@ export class ChainMonitor {
 					// The revocation path has no timelock — broadcast immediately
 					// (mirrors _handleRevokedCommitment; witness already set by the
 					// resolver). The claim races the cheater's to_self_delay.
+					if (r.auxiliaryFunding) {
+						r.trackedOutput.auxiliaryFeeFunding = true;
+						this._auxiliaryFeeFunding.set(
+							`${r.trackedOutput.txid}:${r.trackedOutput.outputIndex}`,
+							r.auxiliaryFunding
+						);
+					}
 					const txBuf = r.spendTx.toBuffer();
 					r.trackedOutput.status = OutputStatus.SPEND_BROADCAST;
 					r.trackedOutput.broadcastHeight = blockHeight;
@@ -1389,11 +1467,13 @@ export class ChainMonitor {
 						txid: r.trackedOutput.txid,
 						outputIndex: r.trackedOutput.outputIndex
 					});
-					actions.push({
-						type: ChainActionType.BROADCAST_TX,
-						tx: txBuf,
-						description: 'penalty sweep (revoked second-level HTLC)'
-					});
+					actions.push(
+						this._broadcastSweepAction(
+							r.trackedOutput,
+							txBuf,
+							'penalty sweep (revoked second-level HTLC)'
+						)
+					);
 				}
 			}
 		}
@@ -1487,6 +1567,7 @@ export class ChainMonitor {
 				survivor.currentFeeRate = undefined;
 				survivor.maturityHeight = undefined;
 				survivor.resolutionTxid = undefined;
+				delete survivor.resolutionTxHex;
 			}
 		}
 		if (hasSurvivors) {
@@ -1582,6 +1663,7 @@ export class ChainMonitor {
 			: [output];
 		for (const candidate of reorgedOutputs) {
 			candidate.resolutionTxid = undefined;
+			delete candidate.resolutionTxHex;
 		}
 		// If the monitor had declared the channel fully resolved on the strength of
 		// this spend, resume resolving so handleNewBlock keeps working the output.
@@ -1659,6 +1741,7 @@ export class ChainMonitor {
 					) {
 						candidate.status = OutputStatus.SPEND_BROADCAST;
 						candidate.resolutionTxid = undefined;
+						delete candidate.resolutionTxHex;
 						candidate.confirmationHeight = revokedBroadcast.blockHeight;
 						candidate.sweepTxHex = retainedHex;
 						this._selectAuxiliarySweep(candidate, retainedSweep.getId());
@@ -1920,6 +2003,89 @@ export class ChainMonitor {
 
 	// ─────────────── Private Handlers ───────────────
 
+	/** Bind fee selection to conflicts on the original source outpoints only. */
+	private _auxiliaryFeeSelectionContext(
+		base: bitcoin.Transaction,
+		output: ITrackedOutput
+	): Pick<
+		IFeeBumpAndBroadcastChainAction,
+		'conflictingCandidateTxids' | 'previousFundedTransaction' | 'previousFee'
+	> {
+		const key = (input: bitcoin.Transaction['ins'][number]): string =>
+			`${Buffer.from(input.hash).reverse().toString('hex')}:${input.index}`;
+		const original = new Set(base.ins.map(key));
+		const tracked = new Set(
+			this._trackedOutputs.map((row) => `${row.txid}:${row.outputIndex}`)
+		);
+		const candidates = new Map<
+			string,
+			{ transaction: bitcoin.Transaction; funded: boolean; fee?: bigint }
+		>();
+		const retain = (hex: string, funded: boolean, fee?: bigint): void => {
+			const transaction = bitcoin.Transaction.fromHex(hex);
+			if (!transaction.ins.some((input) => original.has(key(input)))) return;
+			const id = transaction.getId(),
+				previous = candidates.get(id);
+			candidates.set(id, {
+				transaction,
+				funded: funded || previous?.funded === true,
+				fee:
+					fee === undefined
+						? previous?.fee
+						: previous?.fee !== undefined && previous.fee > fee
+						? previous.fee
+						: fee
+			});
+		};
+		for (const row of this._trackedOutputs) {
+			for (const attempt of Object.values(row.auxiliarySweepAttempts ?? {}))
+				retain(
+					attempt.transaction,
+					!!(attempt.auxiliaryFeeFunded || attempt.auxiliaryHtlcFeeFunded),
+					attempt.auxiliarySweepFee
+				);
+			if (row.sweepTxHex)
+				retain(
+					row.sweepTxHex,
+					!!(row.auxiliaryFeeFunded || row.auxiliaryHtlcFeeFunded),
+					row.auxiliaryFeeFunded || row.auxiliaryHtlcFeeFunded
+						? row.auxiliarySweepFee
+						: undefined
+				);
+		}
+		let previousFee = output.auxiliarySweepFee;
+		let chosen: { transaction: bitcoin.Transaction; fee?: bigint } | undefined;
+		for (const candidate of candidates.values()) {
+			if (
+				candidate.fee !== undefined &&
+				(previousFee === undefined || candidate.fee > previousFee)
+			)
+				previousFee = candidate.fee;
+			// Reuse only a candidate with the same original input prefix. Other tracked
+			// asset outputs must never be mistaken for wallet fee inputs after a batch splits.
+			if (
+				!candidate.funded ||
+				candidate.transaction.ins.length <= base.ins.length ||
+				!base.ins.every(
+					(input, index) => key(input) === key(candidate.transaction.ins[index])
+				) ||
+				candidate.transaction.ins
+					.slice(base.ins.length)
+					.some((input) => tracked.has(key(input)))
+			)
+				continue;
+			if (!chosen || (candidate.fee ?? -1n) >= (chosen.fee ?? -1n))
+				chosen = candidate;
+		}
+		return {
+			conflictingCandidateTxids: [...candidates.keys()].sort(),
+			...(chosen
+				? { previousFundedTransaction: chosen.transaction.toBuffer() }
+				: {}),
+			...(previousFee !== undefined ? { previousFee } : {})
+		};
+	}
+
 	/**
 	 * Build the chain action to broadcast a sweep transaction.
 	 *
@@ -1932,6 +2098,81 @@ export class ChainMonitor {
 		txBuf: Buffer,
 		description: string
 	): ChainAction {
+		if (output.auxiliaryFeeFunding && !output.auxiliaryFeeFunded) {
+			this._retainAuxiliarySweep(output);
+			const rate = output.currentFeeRate || this._feeRatePerVbyte;
+			const base = this._rebuildSingleSweep(output, rate);
+			const funding = this._auxiliaryFeeFunding.get(
+				`${output.txid}:${output.outputIndex}`
+			);
+			if (!base || !funding)
+				throw new Error('Asset sweep fee signer cannot be restored');
+			const covered = this._trackedOutputs.filter((candidate) =>
+				base.ins.some(
+					(input) =>
+						Buffer.from(input.hash).reverse().toString('hex') ===
+							candidate.txid && input.index === candidate.outputIndex
+				)
+			);
+			if (covered.length !== funding.prevoutScripts.length)
+				throw new Error('Asset sweep input tracking is incomplete');
+			const feeSelection = this._auxiliaryFeeSelectionContext(base, output);
+			const expected = covered.map((candidate) => {
+				const generation =
+					(this._auxiliaryFeeGenerations.get(candidate) ?? 0) + 1;
+				this._auxiliaryFeeGenerations.set(candidate, generation);
+				return { candidate, hex: candidate.sweepTxHex, generation };
+			});
+			return {
+				type: ChainActionType.FEE_BUMP_AND_BROADCAST,
+				kind: 'auxiliary-sweep-fee-attach',
+				...feeSelection,
+				tx: base.toBuffer(),
+				description,
+				feeratePerVbyte: rate,
+				auxiliarySweep: {
+					...funding,
+					previousFee: feeSelection.previousFee,
+					finalize: (raw, data, fee): boolean => {
+						if (
+							expected.some(
+								({ candidate, hex, generation }) =>
+									!this._trackedOutputs.includes(candidate) ||
+									candidate.sweepTxHex !== hex ||
+									this._auxiliaryFeeGenerations.get(candidate) !== generation ||
+									candidate.status === OutputStatus.SPEND_CONFIRMED ||
+									candidate.status === OutputStatus.IRREVOCABLY_RESOLVED
+							)
+						)
+							return false;
+						const funded = bitcoin.Transaction.fromBuffer(raw);
+						if (
+							covered.some(
+								(candidate) =>
+									!funded.ins.some(
+										(input) =>
+											Buffer.from(input.hash).reverse().toString('hex') ===
+												candidate.txid && input.index === candidate.outputIndex
+									)
+							)
+						)
+							return false;
+						for (const candidate of covered) {
+							candidate.auxiliaryFeeFunded = true;
+							if (fee !== undefined) candidate.auxiliarySweepFee = fee;
+							candidate.sweepTxHex = funded.toHex();
+							candidate.auxiliaryData = Buffer.from(data);
+							candidate.status = OutputStatus.SPEND_BROADCAST;
+							candidate.currentFeeRate = rate;
+							candidate.broadcastHeight = this._currentBlockHeight;
+							this._retainAuxiliarySweep(candidate);
+						}
+						return true;
+					}
+				}
+			};
+		}
+
 		// Only our OWN commitment's second-level HTLC txs are the pre-signed
 		// zero-fee variant that needs a fee attached. HTLC claims on the remote's
 		// commitment are direct spends that already deduct a fee, and penalty
@@ -1945,15 +2186,94 @@ export class ChainMonitor {
 			(output.outputType === OutputType.OFFERED_HTLC ||
 				output.outputType === OutputType.RECEIVED_HTLC)
 		) {
+			if (!output.auxiliaryData)
+				return {
+					type: ChainActionType.FEE_BUMP_AND_BROADCAST,
+					kind: 'htlc-fee-attach',
+					tx: txBuf,
+					description,
+					feeratePerVbyte: output.currentFeeRate || this._feeRatePerVbyte
+				};
+			if (output.auxiliaryData && output.auxiliaryHtlcFeeFunded)
+				return {
+					type: ChainActionType.BROADCAST_TX,
+					tx: txBuf,
+					description,
+					requiresMonitorPersistence: true
+				};
+			const base = bitcoin.Transaction.fromBuffer(txBuf),
+				expected = output.sweepTxHex,
+				generation = (this._auxiliaryFeeGenerations.get(output) ?? 0) + 1;
+			if (output.auxiliaryData)
+				this._auxiliaryFeeGenerations.set(output, generation);
 			return {
 				type: ChainActionType.FEE_BUMP_AND_BROADCAST,
 				kind: 'htlc-fee-attach',
+				...this._auxiliaryFeeSelectionContext(base, output),
 				tx: txBuf,
 				description,
-				feeratePerVbyte: output.currentFeeRate || this._feeRatePerVbyte
+				feeratePerVbyte: output.currentFeeRate || this._feeRatePerVbyte,
+				...(output.auxiliaryData
+					? {
+							finalizeHtlcFunding: (raw: Buffer, fee?: bigint): boolean => {
+								if (
+									!this._trackedOutputs.includes(output) ||
+									output.sweepTxHex !== expected ||
+									this._auxiliaryFeeGenerations.get(output) !== generation ||
+									output.status === OutputStatus.SPEND_CONFIRMED ||
+									output.status === OutputStatus.IRREVOCABLY_RESOLVED
+								)
+									return false;
+								const funded = bitcoin.Transaction.fromBuffer(raw);
+								if (
+									funded.version !== base.version ||
+									funded.locktime !== base.locktime ||
+									funded.ins.length < base.ins.length ||
+									funded.outs.length < base.outs.length
+								)
+									return false;
+								if (
+									base.ins.some((input, index) => {
+										const actual = funded.ins[index];
+										return (
+											!input.hash.equals(actual.hash) ||
+											input.index !== actual.index ||
+											input.sequence !== actual.sequence ||
+											!input.script.equals(actual.script) ||
+											input.witness.length !== actual.witness.length ||
+											input.witness.some(
+												(item, i) => !item.equals(actual.witness[i])
+											)
+										);
+									})
+								)
+									return false;
+								if (
+									base.outs.some(
+										(value, index) =>
+											value.value !== funded.outs[index].value ||
+											!value.script.equals(funded.outs[index].script)
+									)
+								)
+									return false;
+								output.sweepTxHex = funded.toHex();
+								output.auxiliaryHtlcFeeFunded = true;
+								if (fee !== undefined) output.auxiliarySweepFee = fee;
+								output.status = OutputStatus.SPEND_BROADCAST;
+								output.broadcastHeight = this._currentBlockHeight;
+								this._retainAuxiliarySweep(output);
+								return true;
+							}
+					  }
+					: {})
 			};
 		}
-		return { type: ChainActionType.BROADCAST_TX, tx: txBuf, description };
+		return {
+			type: ChainActionType.BROADCAST_TX,
+			tx: txBuf,
+			description,
+			requiresMonitorPersistence: !!output.auxiliaryData
+		};
 	}
 
 	private _handleCooperativeClose(actions: ChainAction[]): ChainAction[] {
@@ -2331,6 +2651,7 @@ export class ChainMonitor {
 			spendTx?: bitcoin.Transaction;
 			witness?: Buffer[];
 			auxiliaryData?: Buffer;
+			auxiliaryFunding?: Omit<IAuxiliarySweepFeeAttachment, 'finalize'>;
 		},
 		description: string
 	): void {
@@ -2339,6 +2660,15 @@ export class ChainMonitor {
 		}
 		if (r.witness) {
 			r.spendTx.setWitness(0, r.witness);
+		}
+
+		if (r.auxiliaryFunding) {
+			r.trackedOutput.auxiliaryFeeFunding = true;
+			r.trackedOutput.auxiliaryFeeFunded = false;
+			this._auxiliaryFeeFunding.set(
+				`${r.trackedOutput.txid}:${r.trackedOutput.outputIndex}`,
+				r.auxiliaryFunding
+			);
 		}
 
 		const txBuf = r.spendTx.toBuffer();
@@ -2505,7 +2835,8 @@ export class ChainMonitor {
 			this._commitmentBroadcast?.commitmentType ===
 				CommitmentType.THEIR_REVOKED_COMMITMENT &&
 			output.sweepTxHex &&
-			!output.secondLevelTxHex
+			!output.secondLevelTxHex &&
+			!output.auxiliaryData
 				? this._rebuildRevokedPenaltySweeps(output, feeRatePerVbyte, false)
 				: [this._rebuildSingleSweep(output, feeRatePerVbyte)].filter(
 						(tx): tx is bitcoin.Transaction => !!tx
@@ -2535,12 +2866,37 @@ export class ChainMonitor {
 			this._commitmentBroadcast?.commitmentType ===
 				CommitmentType.THEIR_REVOKED_COMMITMENT &&
 			output.sweepTxHex &&
-			!output.secondLevelTxHex
+			!output.secondLevelTxHex &&
+			!output.auxiliaryData
 		) {
 			return this._rebuildRevokedPenaltySweeps(output, feeRatePerVbyte, true);
 		}
 		const rebuilt = this._rebuildSingleSweep(output, feeRatePerVbyte);
 		return rebuilt ? [rebuilt] : [];
+	}
+
+	/** Rebuild claims with their required wallet funding and persistence barriers. */
+	rebuildSweepActions(
+		output: ITrackedOutput,
+		feeRatePerVbyte: number
+	): ChainAction[] {
+		return this.rebuildSweeps(output, feeRatePerVbyte).map((transaction) => {
+			const tracked = this._trackedOutputs.find(
+				(candidate) =>
+					candidate.sweepTxHex === transaction.toHex() &&
+					transaction.ins.some(
+						(input) =>
+							Buffer.from(input.hash).reverse().toString('hex') ===
+								candidate.txid && input.index === candidate.outputIndex
+					)
+			);
+			if (!tracked) throw new Error('Rebuilt sweep has no tracked input');
+			return this._broadcastSweepAction(
+				tracked,
+				transaction.toBuffer(),
+				'rebuilt sweep'
+			);
+		});
 	}
 
 	private _rebuildSingleSweep(
@@ -2553,8 +2909,13 @@ export class ChainMonitor {
 		if (output.sweepTxHex) {
 			try {
 				const parsedSweep = bitcoin.Transaction.fromHex(output.sweepTxHex);
-				const expectedInput =
-					parsedSweep.ins.length === 1 && parsedSweep.ins[0];
+				const expectedInput = output.auxiliaryData
+					? parsedSweep.ins.find(
+							(input) =>
+								Buffer.from(input.hash).reverse().toString('hex') ===
+									output.txid && input.index === output.outputIndex
+					  )
+					: parsedSweep.ins.length === 1 && parsedSweep.ins[0];
 				if (
 					expectedInput &&
 					Buffer.from(expectedInput.hash).reverse().toString('hex') ===
@@ -2654,11 +3015,21 @@ export class ChainMonitor {
 					// commitment cannot be rebuilt from it — signing would target the
 					// wrong outpoint.
 					if (output.txid !== revokedTx.getId()) return null;
-					const rebuildOutputs = [output];
+					const rebuildOutputs = output.auxiliaryData
+						? this._trackedOutputs.filter(
+								(candidate) =>
+									candidate.txid === output.txid &&
+									candidate.sweepTxHex === output.sweepTxHex &&
+									candidate.status !== OutputStatus.SPEND_CONFIRMED &&
+									candidate.status !== OutputStatus.IRREVOCABLY_RESOLVED
+						  )
+						: [output];
+					const selectedIndices = new Set(
+						rebuildOutputs.map((candidate) => candidate.outputIndex)
+					);
 					const claimedOutsideBatch = new Set<number>();
-					for (let i = 0; i < revokedTx.outs.length; i++) {
-						if (i !== output.outputIndex) claimedOutsideBatch.add(i);
-					}
+					for (let i = 0; i < revokedTx.outs.length; i++)
+						if (!selectedIndices.has(i)) claimedOutsideBatch.add(i);
 					resolved = resolveRevokedCommitmentOutputs(
 						this._channelState,
 						rebuildOutputs,
@@ -2699,24 +3070,64 @@ export class ChainMonitor {
 					r.trackedOutput.outputIndex === output.outputIndex
 			) ?? (resolved.length === 1 ? resolved[0] : undefined);
 		if (match?.spendTx) {
+			if (output.auxiliaryHtlcFeeFunded) output.auxiliaryHtlcFeeFunded = false;
 			// Penalty txs come back with witnesses already set; others carry a
 			// separate witness to attach.
-			if (match.witness) match.spendTx.setWitness(0, match.witness);
-			if (previousSweep) {
+			if (match.witness && !match.spendTx.ins[0].witness.length)
+				match.spendTx.setWitness(0, match.witness);
+			if (
+				match.auxiliaryFunding &&
+				previousSweep &&
+				output.auxiliarySweepFee === undefined
+			) {
+				const previousInputs = previousSweep.ins.map((input) =>
+					this._trackedOutputs.find(
+						(candidate) =>
+							candidate.txid ===
+								Buffer.from(input.hash).reverse().toString('hex') &&
+							candidate.outputIndex === input.index
+					)
+				);
+				if (previousInputs.every((candidate) => candidate !== undefined)) {
+					const paid =
+						previousInputs.reduce(
+							(sum, candidate) => sum + candidate!.amount,
+							0n
+						) -
+						previousSweep.outs.reduce(
+							(sum, txOutput) => sum + BigInt(txOutput.value),
+							0n
+						);
+					if (paid > 0n) output.auxiliarySweepFee = paid;
+				}
+			}
+			if (match.auxiliaryFunding) {
+				output.auxiliaryFeeFunding = true;
+				output.auxiliaryFeeFunded = false;
+				this._auxiliaryFeeFunding.set(
+					`${output.txid}:${output.outputIndex}`,
+					match.auxiliaryFunding
+				);
+			}
+			if (previousSweep && !match.auxiliaryFunding) {
 				const feeForSingleInput = (
 					tx: bitcoin.Transaction
 				): number | undefined => {
-					if (tx.ins.length !== 1) return undefined;
-					const input = tx.ins[0];
-					if (
-						Buffer.from(input.hash).reverse().toString('hex') !== output.txid ||
-						input.index !== output.outputIndex
-					) {
+					const previousInputs = tx.ins.map((input) =>
+						this._trackedOutputs.find(
+							(candidate) =>
+								candidate.txid ===
+									Buffer.from(input.hash).reverse().toString('hex') &&
+								candidate.outputIndex === input.index
+						)
+					);
+					if (previousInputs.some((candidate) => candidate === undefined))
 						return undefined;
-					}
 					return (
-						Number(output.amount) -
-						tx.outs.reduce((sum, txOutput) => sum + txOutput.value, 0)
+						previousInputs.reduce(
+							(sum, candidate) => sum + Number(candidate!.amount),
+							0
+						) - tx.outs.reduce((sum, txOutput) => sum + txOutput.value, 0)
 					);
 				};
 				const oldFee = feeForSingleInput(previousSweep);
@@ -2773,6 +3184,10 @@ export class ChainMonitor {
 			for (const candidate of this._trackedOutputs) {
 				if (spentOutpoints.has(`${candidate.txid}:${candidate.outputIndex}`)) {
 					candidate.status = OutputStatus.SPEND_BROADCAST;
+					if (match.auxiliaryFunding) {
+						candidate.auxiliaryFeeFunding = true;
+						candidate.auxiliaryFeeFunded = false;
+					}
 					candidate.sweepTxHex = rebuiltHex;
 					if (match.auxiliaryData)
 						candidate.auxiliaryData = Buffer.from(match.auxiliaryData);
@@ -3055,6 +3470,7 @@ export class ChainMonitor {
 				candidate.currentFeeRate = appliedFeeRate;
 				candidate.broadcastHeight = this._currentBlockHeight;
 				candidate.resolutionTxid = undefined;
+				delete candidate.resolutionTxHex;
 				continue;
 			}
 			// The old batch no longer manages this member. Return it to the retry
@@ -3066,6 +3482,7 @@ export class ChainMonitor {
 			candidate.currentFeeRate = undefined;
 			candidate.maturityHeight = undefined;
 			candidate.resolutionTxid = undefined;
+			delete candidate.resolutionTxHex;
 		}
 
 		return replacements;
@@ -3130,7 +3547,10 @@ export class ChainMonitor {
 		resolved: ReturnType<typeof resolveRevokedCommitmentOutputs>,
 		description: string
 	): void {
-		const broadcastTxids = new Set<string>();
+		const pending = new Map<
+			string,
+			{ output: ITrackedOutput; transaction: bitcoin.Transaction }
+		>();
 		for (const entry of resolved) {
 			// Adopt before anything else: a settled-HTLC output rebuilt from the
 			// snapshot is not in the tracked set, and writing this pass's bookkeeping
@@ -3157,15 +3577,20 @@ export class ChainMonitor {
 				r.spendTx.setWitness(0, r.witness);
 			}
 			const txBuf = r.spendTx.toBuffer();
-			if (!broadcastTxids.has(r.spendTx.getId())) {
-				broadcastTxids.add(r.spendTx.getId());
-				this._recordClaimedOutpoints(r.spendTx);
-				actions.push({
-					type: ChainActionType.BROADCAST_TX,
-					tx: txBuf,
-					description
+			if (!pending.has(r.spendTx.getId()))
+				pending.set(r.spendTx.getId(), {
+					output: r.trackedOutput,
+					transaction: r.spendTx
 				});
+			if (r.auxiliaryFunding) {
+				r.trackedOutput.auxiliaryFeeFunding = true;
+				r.trackedOutput.auxiliaryFeeFunded = false;
+				this._auxiliaryFeeFunding.set(
+					`${r.trackedOutput.txid}:${r.trackedOutput.outputIndex}`,
+					r.auxiliaryFunding
+				);
 			}
+
 			r.trackedOutput.status = OutputStatus.SPEND_BROADCAST;
 			r.trackedOutput.broadcastHeight = this._currentBlockHeight;
 			r.trackedOutput.originalFeeRate = this._feeRatePerVbyte;
@@ -3173,6 +3598,12 @@ export class ChainMonitor {
 			if (r.auxiliaryData)
 				r.trackedOutput.auxiliaryData = Buffer.from(r.auxiliaryData);
 			this._retainAuxiliarySweep(r.trackedOutput);
+		}
+		for (const { output, transaction } of pending.values()) {
+			this._recordClaimedOutpoints(transaction);
+			actions.push(
+				this._broadcastSweepAction(output, transaction.toBuffer(), description)
+			);
 		}
 	}
 

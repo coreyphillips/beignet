@@ -1,5 +1,32 @@
+import {
+	auxiliaryClosingWeight,
+	auxiliaryClosingRelayProfile
+} from './auxiliary-close';
+import {
+	deserializeInteractiveFundingPlan,
+	serializeInteractiveFundingPlan,
+	type IAuxiliaryInteractiveFundingPlan,
+	type NativeFundingContribution
+} from './interactive-funding';
+import { applyAuxiliaryFunding } from './auxiliary-funding';
+import type { IChannelAuxiliaryState } from './auxiliary';
+import { retainFundingEpoch, selectFundingEpoch } from './funding-state';
+import {
+	deriveFundingNonce,
+	fundingNonceDomain,
+	bindFundingPeerNonces,
+	type ITaprootFundingRound
+} from './funding-musig';
+import {
+	signFundingSharedInput,
+	verifyFundingSharedInput,
+	finalizeFundingSharedInput,
+	type ITaprootSharedInput
+} from './funding-musig';
 import type { IChannelAuxiliaryProvider } from './auxiliary';
 import {
+	AUXILIARY_CHANNEL_DUST_LIMIT,
+	MAX_AUXILIARY_HTLCS_PER_PARTY,
 	copyAuxiliaryCommitment,
 	requireAuxiliaryProvider,
 	validateAuxiliaryChannelType
@@ -14,6 +41,14 @@ import { copyCustomRecords } from '../message/custom-records';
  * actual transport/broadcast operations.
  */
 
+import {
+	encodeFforAssetTerms,
+	decodeFforAssetTerms,
+	decodeFforAssetRecords,
+	fforVoucherWireAmount,
+	type IFforAssetTerms
+} from '../ffor/assets';
+import { encodeTlvStream as encodeFforCustomRecords } from '../message/tlv';
 import { hmacSha256, randomBytes, sha256 } from '../crypto/provider';
 import * as bitcoin from 'bitcoinjs-lib';
 import { ecc } from '../../utils/ecc';
@@ -186,6 +221,8 @@ import {
 	aggregateLocalCommitmentSig,
 	buildRemoteCommitment,
 	signRemoteCommitment,
+	signRemoteCommitmentPartial,
+	signRemoteHtlcSignaturesTaproot,
 	verifyRemoteCommitmentSig,
 	verifyRemoteCommitmentPartial,
 	verifyRemoteHtlcSignatures,
@@ -356,6 +393,7 @@ import type {
 	ITxRemoveInputMessage,
 	ITxRemoveOutputMessage,
 	ITxSignaturesMessage,
+	ITxCompleteMessage,
 	ITxInitRbfMessage,
 	ITxAckRbfMessage
 } from '../message/interactive-tx';
@@ -1255,6 +1293,8 @@ export class Channel {
 	// The splice transaction once built and partially/fully signed: the tx, the
 	// index of the shared 2-of-2 funding input, the new funding output index, the
 	// old funding witness script, and our signature on the shared input.
+	private _interactiveContributions: NativeFundingContribution[] | null = null;
+	private _spliceAuxiliaryState: IChannelAuxiliaryState | undefined;
 	private _spliceTx: {
 		tx: import('bitcoinjs-lib').Transaction;
 		sharedInputIndex: number;
@@ -1405,6 +1445,190 @@ export class Channel {
 	/**
 	 * Set or update the channel signer (used for commitment signature verification).
 	 */
+	/** Set only after both peers explicitly negotiated the native extension. */
+	enableTaprootInteractiveFunding(): void {
+		this._state.nativeTaprootFunding = true;
+	}
+
+	/** Install only a peer-agreed, verified asset plan before negotiation starts. */
+	private _interactiveFundingIdProblem(
+		id: Buffer | undefined,
+		kind: 'dual' | 'splice'
+	): string | undefined {
+		const plan = this._state.interactiveFunding;
+		if (!this._state.auxiliaryState && !plan && !id) return undefined;
+		if (
+			!this._state.nativeTaprootFunding ||
+			!plan ||
+			plan.kind !== kind ||
+			!id?.equals(plan.sessionId)
+		)
+			return 'Interactive asset funding session was not agreed';
+		return undefined;
+	}
+	setInteractiveFundingPlan(plan: IAuxiliaryInteractiveFundingPlan): void {
+		if (!this._state.nativeTaprootFunding)
+			throw new Error('Native interactive funding was not negotiated');
+		const copy = deserializeInteractiveFundingPlan(
+			serializeInteractiveFundingPlan(plan)
+		);
+		const prior = this._state.interactiveFunding;
+		if (this._state.spliceInFlight || this._state.v2InFlight) {
+			if (
+				!prior ||
+				JSON.stringify(serializeInteractiveFundingPlan(prior)) !==
+					JSON.stringify(serializeInteractiveFundingPlan(copy))
+			)
+				throw new Error('Cannot replace a committed asset funding plan');
+			return;
+		}
+		this._state.interactiveFunding = copy;
+		if (plan.kind === 'dual')
+			applyAuxiliaryFunding(this._state, {
+				temporaryChannelId: this._state.temporaryChannelId,
+				fundingTaprootMerkleRoot: copy.fundingTaprootMerkleRoot,
+				channelData: copy.data,
+				localBalance: copy.localBalance,
+				remoteBalance: copy.remoteBalance
+			});
+	}
+	/** Ordered local contributions. Signing closures are registered separately. */
+	setNativeFundingContributions(
+		contributions: readonly NativeFundingContribution[]
+	): void {
+		if (
+			!this._state.nativeTaprootFunding ||
+			this._state.spliceInFlight ||
+			this._state.v2InFlight
+		)
+			throw new Error('Cannot replace native funding contributions');
+		const ids = new Set<string>();
+		this._interactiveContributions = contributions.map((entry) => {
+			const item = entry.kind === 'input' ? entry.input : entry.output;
+			if (
+				item.serialId < 0n ||
+				item.serialId > 0xffffffffffffffffn ||
+				ids.has(item.serialId.toString())
+			)
+				throw new Error('Invalid native funding serial ID');
+			ids.add(item.serialId.toString());
+			return entry.kind === 'input'
+				? {
+						...entry,
+						input: {
+							...entry.input,
+							prevTx: entry.input.prevTx
+								? Buffer.from(entry.input.prevTx)
+								: undefined,
+							prevTxid: Buffer.from(entry.input.prevTxid)
+						},
+						sharedInputTxid: entry.sharedInputTxid
+							? Buffer.from(entry.sharedInputTxid)
+							: undefined
+				  }
+				: {
+						...entry,
+						output: {
+							...entry.output,
+							scriptPubkey: Buffer.from(entry.output.scriptPubkey)
+						}
+				  };
+		});
+	}
+	private _plannedFundingContributions(
+		kind: 'dual' | 'splice'
+	): NativeFundingContribution[] | null {
+		if (!this._interactiveContributions) return null;
+		const initiator =
+			kind === 'dual'
+				? this._state.dualFundingSession!.isInitiator()
+				: this._spliceSession!.isInitiator();
+		const parity = initiator ? 0n : 1n;
+		return this._interactiveContributions.map((entry) => {
+			const serial =
+				entry.kind === 'input' ? entry.input.serialId : entry.output.serialId;
+			if ((serial & 1n) !== parity)
+				throw new Error(
+					'Native funding contribution has the peer serial parity'
+				);
+			if (entry.kind !== 'output' || !entry.funding) return entry;
+			if (!initiator)
+				throw new Error(
+					'Only the funding initiator contributes the funding output'
+				);
+			const script =
+				kind === 'splice'
+					? this._spliceFundingScript(
+							this._state.localBasepoints.fundingPubkey,
+							this._spliceSession!.getRemoteFundingPubkey()!,
+							true
+					  ).p2wshOutput
+					: createTaprootFundingScript(
+							this._state.localBasepoints.fundingPubkey,
+							this._state.remoteBasepoints!.fundingPubkey,
+							undefined,
+							this._state.fundingTaprootMerkleRoot
+					  ).p2trOutput;
+			return { ...entry, output: { ...entry.output, scriptPubkey: script } };
+		});
+	}
+	private _finalizeInteractiveAssets(
+		transaction: bitcoin.Transaction,
+		fundingOutputIndex: number,
+		kind: 'dual' | 'splice'
+	): IChannelAuxiliaryState | undefined {
+		if (!this._state.auxiliaryState && !this._state.interactiveFunding)
+			return undefined;
+		const plan = this._state.interactiveFunding,
+			provider = this._state.auxiliaryProvider;
+		if (!plan || plan.kind !== kind || !provider?.buildFunding)
+			throw new Error(
+				'Asset interactive funding requires a verified funding plan and builder'
+			);
+		const remoteFundingKey =
+			kind === 'splice'
+				? this._spliceSession?.getRemoteFundingPubkey() ??
+				  this._state.remoteBasepoints?.fundingPubkey
+				: this._state.remoteBasepoints?.fundingPubkey;
+		if (!remoteFundingKey)
+			throw new Error('Interactive funding keys are unavailable');
+		const fundingInternalKey = Buffer.concat([
+			Buffer.from([2]),
+			createTaprootFundingScript(
+				this._state.localBasepoints.fundingPubkey,
+				remoteFundingKey,
+				undefined,
+				plan.fundingTaprootMerkleRoot
+			).internalKey
+		]);
+		const descriptor = provider.buildFunding({
+			state: this._state,
+			plan,
+			transaction,
+			fundingOutputIndex,
+			fundingInternalKey
+		});
+		if (
+			!descriptor.fundingTaprootMerkleRoot.equals(
+				plan.fundingTaprootMerkleRoot
+			) ||
+			descriptor.localBalance !== plan.localBalance ||
+			descriptor.remoteBalance !== plan.remoteBalance
+		)
+			throw new Error('Final asset funding differs from agreed plan');
+		const candidate = { ...this._state };
+		applyAuxiliaryFunding(candidate, descriptor);
+		if (
+			kind === 'splice' &&
+			candidate.auxiliaryState &&
+			this._state.auxiliaryState?.resolvedHtlcs
+		)
+			candidate.auxiliaryState.resolvedHtlcs = new Map(
+				this._state.auxiliaryState.resolvedHtlcs
+			);
+		return candidate.auxiliaryState;
+	}
+
 	setSigner(signer: ISigner): void {
 		this._signer = signer;
 	}
@@ -1656,6 +1880,18 @@ export class Channel {
 		// option_anchors_zero_fee_htlc_tx (bit 22) when requested.
 		const channelTypeFlags = FeatureFlags.empty();
 		if (this._state.auxiliaryState) {
+			this._state.localConfig = {
+				...this._state.localConfig,
+				dustLimitSatoshis:
+					this._state.localConfig.dustLimitSatoshis >
+					AUXILIARY_CHANNEL_DUST_LIMIT
+						? AUXILIARY_CHANNEL_DUST_LIMIT
+						: this._state.localConfig.dustLimitSatoshis,
+				maxAcceptedHtlcs: Math.min(
+					this._state.localConfig.maxAcceptedHtlcs,
+					MAX_AUXILIARY_HTLCS_PER_PARTY
+				)
+			};
 			preferTaproot = true;
 			channelTypeFlags.setCompulsory(Feature.OPTION_TAPROOT_OVERLAY);
 		} else if (preferTaproot) {
@@ -1805,7 +2041,18 @@ export class Channel {
 	 * two channels sharing a seed share every verification nonce, and their
 	 * force closes at one height sign two sighashes under one secnonce.
 	 */
-	private _deriveVerificationNonce(height: bigint): Uint8Array {
+	private _deriveVerificationNonce(
+		height: bigint,
+		view: IChannelState = this._state
+	): Uint8Array {
+		if (view.taprootNonceDomain)
+			return deriveFundingNonce(
+				view.localPerCommitmentSeed,
+				view.localBasepoints.fundingPubkey,
+				view.taprootNonceDomain,
+				'commitment',
+				height
+			);
 		const heightBuf = Buffer.alloc(8);
 		heightBuf.writeBigUInt64BE(height);
 		const sessionId = hmacSha256(
@@ -2047,6 +2294,13 @@ export class Channel {
 			msg.channelType
 		);
 		if (auxiliaryError) return refuse(auxiliaryError);
+		if (
+			this._state.auxiliaryState &&
+			msg.maxAcceptedHtlcs > MAX_AUXILIARY_HTLCS_PER_PARTY
+		)
+			return refuse(
+				`Asset channel max accepted HTLCs exceeds ${MAX_AUXILIARY_HTLCS_PER_PARTY}`
+			);
 
 		// Validate the acceptor's parameters against what WE proposed in
 		// open_channel BEFORE adopting them. Without this an adversarial acceptor
@@ -2461,6 +2715,13 @@ export class Channel {
 			msg.channelType
 		);
 		if (auxiliaryError) return refuse(auxiliaryError);
+		if (
+			this._state.auxiliaryState &&
+			msg.maxAcceptedHtlcs > MAX_AUXILIARY_HTLCS_PER_PARTY
+		)
+			return refuse(
+				`Asset channel max accepted HTLCs exceeds ${MAX_AUXILIARY_HTLCS_PER_PARTY}`
+			);
 
 		// Peer-supplied, so the bounds that only apply to a value we did not
 		// choose run too. ChannelManager.handleOpenChannel has already seeded
@@ -4467,7 +4728,7 @@ export class Channel {
 			entry.fforVoucher === true &&
 			!this._addNotYetCommitted(entry);
 		if (redeemed) {
-			const slot = matchVoucher(this._fforBook(ffor!), entry);
+			const slot = matchVoucher(this._fforWireBook(ffor!), entry);
 			if (slot) {
 				ffor!.slotRedeemed ??= ffor!.paymentHashes.map(() => false);
 				ffor!.slotRedeemed[slot.k - 1] = true;
@@ -5182,7 +5443,9 @@ export class Channel {
 			this._state.remoteCurrentPerCommitmentPoint;
 		this._watchtowerCache.cacheRemoteCommitment(
 			signedPoint,
-			this._state.remoteCommitmentNumber + 1n
+			this._state.remoteCommitmentNumber + 1n,
+			undefined,
+			auxiliaryCommitment?.result.tx
 		);
 		const splicedView = spliceBatch ? this._splicedState() : null;
 		if (splicedView) {
@@ -6032,8 +6295,8 @@ export class Channel {
 				(entry.state === HtlcState.FULFILLED ||
 					entry.state === HtlcState.FAILED)
 			) {
-				const slot = matchVoucher(this._fforBook(f), entry);
-				if (slot) {
+				const slot = matchVoucher(this._fforWireBook(f), entry);
+				if (slot && this._fforAssetEntryMatches(f, entry, slot.k)) {
 					f.voucherOutcomes ??= f.paymentHashes.map(() => null);
 					f.voucherOutcomes[slot.k - 1] ??= {
 						outcome:
@@ -7256,7 +7519,67 @@ export class Channel {
 	 * sweeps - reads this rather than the channel. Null whenever live state is
 	 * the answer.
 	 */
+	/** Resolve the exact public funding view without changing live channel state. */
+	fundingViewForOutpoint(outpoint: {
+		txid: string;
+		outputIndex: number;
+	}): IChannelState | undefined {
+		const hash = Buffer.from(outpoint.txid, 'hex').reverse();
+		if (
+			this._state.fundingTxid?.equals(hash) &&
+			this._state.fundingOutputIndex === outpoint.outputIndex
+		)
+			return this._state;
+		if (
+			this._state.fundingEpochs?.has(
+				`${hash.toString('hex')}:${outpoint.outputIndex}`
+			)
+		)
+			return selectFundingEpoch(this._state, hash, outpoint.outputIndex);
+		if (
+			this._state.spliceInFlight?.spliceTxid.equals(hash) &&
+			this._state.spliceInFlight.newFundingOutputIndex === outpoint.outputIndex
+		) {
+			const adoption = this._computeSpliceAdoption();
+			if (adoption?.fundingTxid?.equals(hash))
+				return { ...this._state, ...adoption };
+		}
+		const rec = this._state.v2PreviousAttempts?.find(
+			(x) =>
+				x.fundingTxid.equals(hash) &&
+				x.fundingOutputIndex === outpoint.outputIndex
+		);
+		if (rec)
+			return {
+				...this._state,
+				fundingTxid: rec.fundingTxid,
+				fundingOutputIndex: rec.fundingOutputIndex,
+				fundingSatoshis: rec.fundingSatoshis ?? this._state.fundingSatoshis,
+				localBalanceMsat: rec.localBalanceMsat ?? this._state.localBalanceMsat,
+				remoteBalanceMsat:
+					rec.remoteBalanceMsat ?? this._state.remoteBalanceMsat,
+				remoteCommitmentSignature: rec.remoteCommitmentSig,
+				remoteHtlcSignatures: [],
+				fundingTaprootMerkleRoot: rec.fundingTaprootMerkleRoot,
+				taprootNonceDomain: rec.taprootRound?.domain,
+				auxiliaryState: rec.auxiliaryState ?? this._state.auxiliaryState
+			};
+		return undefined;
+	}
 	getForceCloseBroadcastView(): IChannelState | null {
+		const historical = this._state.closeSpendsFundingTxid;
+		if (historical && !this._state.fundingTxid?.equals(historical)) {
+			const epoch = [...(this._state.fundingEpochs?.values() ?? [])].find((x) =>
+				x.fundingTxid.equals(historical)
+			);
+			if (epoch)
+				return selectFundingEpoch(
+					this._state,
+					historical,
+					epoch.fundingOutputIndex
+				);
+		}
+
 		if (this._forceCloseBroadcastView) return this._forceCloseBroadcastView;
 		// The in-memory view dies with the process, and a restart inside the
 		// window restores everything else from live (pre-splice) state. Rebuild
@@ -7301,6 +7624,20 @@ export class Channel {
 		outpoint: { txid: string; outputIndex: number },
 		confirmed: boolean
 	): { view: IChannelState | null; changed: boolean } {
+		const hash = Buffer.from(outpoint.txid, 'hex').reverse();
+		if (
+			this._state.fundingEpochs?.has(
+				`${hash.toString('hex')}:${outpoint.outputIndex}`
+			) &&
+			!this._state.fundingTxid?.equals(hash)
+		) {
+			const view = selectFundingEpoch(this._state, hash, outpoint.outputIndex),
+				changed = !this._state.closeSpendsFundingTxid?.equals(hash);
+			this._state.closeSpendsFundingTxid = Buffer.from(hash);
+			this._state.closeSpendsSpliceTxid = null;
+			this._forceCloseBroadcastView = view;
+			return { view, changed };
+		}
 		const inflight = this._state.spliceInFlight;
 		if (!inflight) return { view: null, changed: false };
 		const spliceTxidHex = Buffer.from(inflight.spliceTxid)
@@ -7685,7 +8022,7 @@ export class Channel {
 		// (remoteSigningNonce); without it we cannot aggregate, which is why that
 		// is the very first thing asked.
 		const localNonce = taproot
-			? this._deriveVerificationNonce(closing.localCommitmentNumber)
+			? this._deriveVerificationNonce(closing.localCommitmentNumber, closing)
 			: null;
 		if (localNonce) closing.localNonce = localNonce;
 
@@ -8103,25 +8440,32 @@ export class Channel {
 		// The peer chooses its shutdown script later. Price a P2TR/P2WSH
 		// output until that script is known and label every quote estimated.
 		const remoteLength = state.remoteShutdownScript?.length ?? 34;
-		const weight = closingTxWeight(scriptPubkey.length, remoteLength, taproot);
-		const calculated = calculateClosingFee(
-			rate,
-			scriptPubkey.length,
-			remoteLength,
-			taproot
+		const weight = auxiliaryClosingWeight(
+			state,
+			closingTxWeight(
+				state.auxiliaryState ? 34 : scriptPubkey.length,
+				remoteLength,
+				taproot
+			)
 		);
+		const calculated = state.auxiliaryState
+			? BigInt(Math.ceil((weight * rate) / 1000))
+			: calculateClosingFee(rate, scriptPubkey.length, remoteLength, taproot);
 		const floor = minRelayFeeForWeight(weight);
 		const fee = calculated > floor ? calculated : floor;
 		const localPays = simple || state.role === ChannelRole.OPENER;
 		const localFee = localPays ? fee : 0n;
 		const amount = state.localBalanceMsat / 1000n - localFee;
-		const dust = simple
-			? isDustOutput(scriptPubkey, amount)
-			: amount <
-			  closingOutputDustLimit(
-					scriptPubkey,
-					state.localConfig.dustLimitSatoshis
-			  );
+		const dust =
+			(state.auxiliaryState?.localBalance ?? 0n) > 0n
+				? amount < 330n
+				: simple
+				? isDustOutput(scriptPubkey, amount)
+				: amount <
+				  closingOutputDustLimit(
+						scriptPubkey,
+						state.localConfig.dustLimitSatoshis
+				  );
 		if (amount <= 0n || dust)
 			throw new Error('Cannot close cooperatively: our payout would be dust');
 		const profile = closingTxRelayProfile({
@@ -8758,6 +9102,18 @@ export class Channel {
 		signClosingFn: (feeSatoshis: bigint) => Buffer,
 		verifyClosingFn?: (feeSatoshis: bigint, signature: Buffer) => boolean
 	): ChannelAction[] {
+		// A peer can echo the already accepted close after our reply crossed it.
+		// Only that exact authenticated message is idempotent, including after
+		// restart. Do not reconstruct a session or reuse a consumed nonce.
+		if (
+			this._state.state === ChannelState.CLOSED &&
+			this._state.lastCooperativeCloseTxHex &&
+			this._state.auxiliaryState?.acceptedClosingSigned?.equals(
+				encodeClosingSignedMessage(msg)
+			)
+		)
+			return [];
+
 		if (
 			this._state.state !== ChannelState.NEGOTIATING_CLOSING &&
 			this._state.state !== ChannelState.SHUTTING_DOWN
@@ -8810,11 +9166,20 @@ export class Channel {
 
 		// Simple-taproot close: single-round MuSig2 negotiation.
 		if (isTaprootChannel(this._state.channelType)) {
-			return this._handleTaprootClosingSigned(
+			const actions = this._handleTaprootClosingSigned(
 				msg,
 				signClosingFn,
 				verifyClosingFn
 			);
+			if (
+				this._state.auxiliaryState &&
+				actions.some(
+					(action) => action.type === ChannelActionType.CHANNEL_CLOSED
+				)
+			)
+				this._state.auxiliaryState.acceptedClosingSigned =
+					encodeClosingSignedMessage(msg);
+			return actions;
 		}
 
 		// Initialize our fee range if not done yet
@@ -9048,7 +9413,10 @@ export class Channel {
 		const bandLocalLen = this._state.localShutdownScript?.length ?? 22;
 		const bandRemoteLen = this._state.remoteShutdownScript?.length ?? 22;
 		const bandWeight = BigInt(
-			closingTxWeight(bandLocalLen, bandRemoteLen, true)
+			auxiliaryClosingWeight(
+				this._state,
+				closingTxWeight(bandLocalLen, bandRemoteLen, true)
+			)
 		);
 		const idealFee = (bandWeight * bandFeeRate + 999n) / 1000n;
 		// The lenient interop floor, but never below what the tx needs to relay:
@@ -9160,12 +9528,23 @@ export class Channel {
 		// real weight.
 		const localLen = this._state.localShutdownScript?.length ?? 22;
 		const remoteLen = this._state.remoteShutdownScript?.length ?? 22;
-		const fee = calculateClosingFee(
-			feeRate,
-			localLen,
-			remoteLen,
-			isTaprootChannel(this._state.channelType)
-		);
+		const fee = this._state.auxiliaryState
+			? BigInt(
+					Math.ceil(
+						(auxiliaryClosingWeight(
+							this._state,
+							closingTxWeight(localLen, remoteLen, true)
+						) *
+							feeRate) /
+							1000
+					)
+			  )
+			: calculateClosingFee(
+					feeRate,
+					localLen,
+					remoteLen,
+					isTaprootChannel(this._state.channelType)
+			  );
 		// A feerate below ~1 sat/vB (a stale or lowballed commitment feerate on a
 		// non-anchor channel) prices a tx nothing will relay, and the acceptance
 		// range and counter clamp are both fractions of this one fee.
@@ -9186,10 +9565,13 @@ export class Channel {
 		const localLen = this._state.localShutdownScript?.length ?? 22;
 		const remoteLen = this._state.remoteShutdownScript?.length ?? 22;
 		return minRelayFeeForWeight(
-			closingTxWeight(
-				localLen,
-				remoteLen,
-				isTaprootChannel(this._state.channelType)
+			auxiliaryClosingWeight(
+				this._state,
+				closingTxWeight(
+					localLen,
+					remoteLen,
+					isTaprootChannel(this._state.channelType)
+				)
 			)
 		);
 	}
@@ -9235,6 +9617,21 @@ export class Channel {
 				this.ownClosingOutputDustLimit()
 		)
 			return false;
+		if (
+			this._state.auxiliaryState &&
+			this._state.localShutdownScript &&
+			this._state.remoteShutdownScript
+		) {
+			try {
+				const { feePaid, weight } = auxiliaryClosingRelayProfile(
+					this._state,
+					feeSatoshis
+				);
+				return feePaid >= minRelayFeeForWeight(weight);
+			} catch {
+				return false;
+			}
+		}
 		const { feePaid, weight } = closingTxRelayProfile({
 			fundingAmount: this._state.fundingSatoshis,
 			localScriptPubkey:
@@ -10619,8 +11016,8 @@ export class Channel {
 		const fforTlv = this._fforReestablishTlv();
 		if (fforTlv) msg.ffor = fforTlv;
 
-		// option_taproot: our MuSig2 verification nonces are DETERMINISTIC per
-		// commitment height (see _deriveVerificationNonce), so re-derive the SAME
+		// Taproot verification nonces are deterministic per commitment height and,
+		// for native interactive funding, per funding domain. Re-derive the SAME
 		// nonces on reconnect rather than fresh random ones, and re-seed the peer
 		// with our next-commitment verification nonce (mirrors revoke_and_ack's
 		// next_local_nonce). Because the re-derived current-commitment nonce is
@@ -10979,9 +11376,8 @@ export class Channel {
 						(msg.nextFundingRetransmitFlags & 1) === 1 ||
 						msg.nextCommitmentNumber === 0n;
 					if (peerWantsCommitment) {
-						// Re-sign commitment #0 byte-identically (RFC 6979 over
-						// the same funding outpoint and per-commitment point;
-						// taproot cannot appear here). This is also the release
+						// Replay the persisted Taproot partial, or re-sign the same
+						// ECDSA commitment #0 deterministically. This is also the release
 						// of a commitment we OWED: a crash between the persist
 						// that recorded the peer's commitment_signed and our own
 						// send leaves the peer asking for a signature that never
@@ -11112,7 +11508,12 @@ export class Channel {
 						channelId: this._state.channelId,
 						txid: inflight.spliceTxid,
 						witnesses: inflight.ourWalletWitnesses,
-						sharedInputSignature: inflight.ourSharedInputSig
+						...(isTaprootChannel(this._state.channelType)
+							? {
+									sharedInputPartialSignatureWithNonce:
+										inflight.ourSharedInputSig
+							  }
+							: { sharedInputSignature: inflight.ourSharedInputSig })
 					})
 				)
 			];
@@ -11125,7 +11526,11 @@ export class Channel {
 						channelId: this._state.channelId,
 						txid: Buffer.from(this._spliceTx.tx.getHash()),
 						witnesses: this._spliceTx.ourWalletWitnesses,
-						sharedInputSignature: this._spliceTx.localSig
+						...(isTaprootChannel(this._state.channelType)
+							? {
+									sharedInputPartialSignatureWithNonce: this._spliceTx.localSig
+							  }
+							: { sharedInputSignature: this._spliceTx.localSig })
 					})
 				)
 			];
@@ -11147,8 +11552,16 @@ export class Channel {
 			!this._state.fundingTxid
 		)
 			return;
+		this._spliceAuxiliaryState = inflight.auxiliaryState;
 		const tx = bitcoin.Transaction.fromHex(inflight.spliceTxHex);
-		const oldFunding = createFundingScript(
+		if (inflight.taprootRound) {
+			this._state.taprootFundingRounds ??= new Map();
+			this._state.taprootFundingRounds.set(
+				inflight.taprootRound.domain.toString('hex'),
+				inflight.taprootRound
+			);
+		}
+		const oldFunding = this._spliceFundingScript(
 			this._state.localBasepoints.fundingPubkey,
 			this._state.remoteBasepoints.fundingPubkey
 		);
@@ -11186,10 +11599,10 @@ export class Channel {
 			localSpliceLocked: inflight.localSpliceLocked,
 			remoteSpliceLocked: inflight.remoteSpliceLocked
 		});
-		// An in-flight splice only exists once the mid-splice commitment round
-		// completed (or our sigs left), so both commitment flags are true.
+		// Our outgoing commitment is retained before the peer replies. A restart
+		// must preserve the missing peer-signature gate on funding signatures.
 		this._spliceSentCommitment = true;
-		this._spliceReceivedCommitment = true;
+		this._spliceReceivedCommitment = inflight.remoteCommitmentSig !== null;
 		this._spliceSentTxSigs = inflight.sentTxSignatures;
 		this._spliceRemoteCommitmentSig = inflight.remoteCommitmentSig;
 		this._spliceRemoteHtlcSigs = inflight.remoteHtlcSignatures ?? null;
@@ -11206,10 +11619,14 @@ export class Channel {
 		const inflight = this._state.v2InFlight;
 		if (!inflight || this._state.dualFundingSession) return;
 		if (!this._state.channelId || !this._state.remoteBasepoints) return;
-		// Taproot v2 opens fail closed before any signature, so a taproot
-		// record cannot exist; refuse to resume one rather than resume into a
-		// MuSig2 exchange that does not exist.
-		if (isTaprootChannel(this._state.channelType)) return;
+		// Taproot v2 recovery requires the negotiated native extension and the
+		// persisted nonce round for this exact funding attempt. Refuse an
+		// incomplete record before reconstructing any signing session.
+		if (
+			isTaprootChannel(this._state.channelType) &&
+			(!this._state.nativeTaprootFunding || !inflight.taprootRound)
+		)
+			return;
 
 		this._state.dualFundingSession = DualFundingSession.restore({
 			channelId: this._state.channelId,
@@ -13001,13 +13418,13 @@ export class Channel {
 			];
 		}
 
-		// The splice commitment machinery is ECDSA-only: the mid-splice round
-		// signs with signRemoteCommitment, which would produce garbage for a
-		// MuSig2 funding and wedge the negotiation against a real peer. Refuse
-		// up front with a real answer instead. Taproot splicing (aggregate key
-		// for the new funding, nonce lifecycle across the splice, batched
-		// partials) is tracked separately.
-		if (isTaprootChannel(this._state.channelType)) {
+		// Taproot splices use the native interactive extension's funding and
+		// shared-input nonce rounds. Require that negotiation before entering
+		// quiescence; ordinary upstream Taproot peers cannot use this path.
+		if (
+			isTaprootChannel(this._state.channelType) &&
+			!this._state.nativeTaprootFunding
+		) {
 			return [
 				{
 					type: ChannelActionType.ERROR,
@@ -13239,6 +13656,12 @@ export class Channel {
 		fundingFeeratePerkw: number,
 		locktime: number
 	): ChannelAction[] {
+		const idProblem = this._interactiveFundingIdProblem(
+			this._state.interactiveFunding?.sessionId,
+			'splice'
+		);
+		if (idProblem)
+			return [{ type: ChannelActionType.ERROR, message: idProblem }];
 		// The depth comes from the request that is starting now, never from a
 		// field a later request may have overwritten while this one was
 		// parked on the stfu (issue #760).
@@ -13288,7 +13711,13 @@ export class Channel {
 		// the peer sees the request.
 		return [
 			{ type: ChannelActionType.PERSIST_STATE },
-			sendMsg(MessageType.SPLICE, encodeSpliceMessage(spliceMsg))
+			sendMsg(
+				MessageType.SPLICE,
+				encodeSpliceMessage({
+					...spliceMsg,
+					interactiveFundingSessionId: this._state.interactiveFunding?.sessionId
+				})
+			)
 		];
 	}
 
@@ -13327,6 +13756,11 @@ export class Channel {
 		msg: ISpliceMessage,
 		localRelativeSatoshis = 0n
 	): ChannelAction[] {
+		const idProblem = this._interactiveFundingIdProblem(
+			msg.interactiveFundingSessionId,
+			'splice'
+		);
+		if (idProblem) return this.refuseSpliceInit(idProblem, idProblem);
 		if (this._state.state !== ChannelState.NORMAL) {
 			return [
 				{
@@ -13352,12 +13786,13 @@ export class Channel {
 			];
 		}
 
-		// Mirror of initiateSplice: the ECDSA-only splice commitment machinery
-		// cannot serve a MuSig2 funding. Refuse ON THE WIRE (tx_abort) so the
-		// peer stops waiting for splice_ack, and unwind the quiescence the
-		// handshake already established so this side resumes normal operation
-		// instead of sitting silently quiescent on a splice it rejected.
-		if (isTaprootChannel(this._state.channelType)) {
+		// Mirror the outbound native Taproot capability gate. A peer without
+		// the extension receives tx_abort, and the already established
+		// quiescence is unwound so ordinary channel traffic can resume.
+		if (
+			isTaprootChannel(this._state.channelType) &&
+			!this._state.nativeTaprootFunding
+		) {
 			return this.refuseSpliceInit(
 				'taproot splicing unsupported',
 				'Cannot accept splice: taproot (MuSig2) channels do not support splicing yet'
@@ -13453,7 +13888,13 @@ export class Channel {
 		// the peer sees the acceptance.
 		return [
 			{ type: ChannelActionType.PERSIST_STATE },
-			sendMsg(MessageType.SPLICE_ACK, encodeSpliceAckMessage(ackMsg))
+			sendMsg(
+				MessageType.SPLICE_ACK,
+				encodeSpliceAckMessage({
+					...ackMsg,
+					interactiveFundingSessionId: this._state.interactiveFunding?.sessionId
+				})
+			)
 		];
 	}
 
@@ -13461,6 +13902,13 @@ export class Channel {
 	 * Handle splice_ack from remote (initiator side).
 	 */
 	handleSpliceAck(msg: ISpliceAckMessage): ChannelAction[] {
+		const idProblem = this._interactiveFundingIdProblem(
+			msg.interactiveFundingSessionId,
+			'splice'
+		);
+		if (idProblem) {
+			return this.abortSplice(idProblem);
+		}
 		// A splice abort of ours is still awaiting its echo: any splice_ack the
 		// peer sent before processing our tx_abort answers a dead splice_init
 		// (the cancelled-while-quiescing unwind aborts in the same batch as the
@@ -13750,6 +14198,11 @@ export class Channel {
 		this._spliceContribIndex = 0;
 		this._spliceSentTxComplete = false;
 
+		const planned = this._plannedFundingContributions('splice');
+		if (planned) {
+			this._spliceContributions = planned;
+			return;
+		}
 		const session = this._spliceSession;
 		if (!session || !this._state.fundingTxid) return;
 		const localFundingPubkey = this._state.localBasepoints.fundingPubkey;
@@ -13776,9 +14229,10 @@ export class Channel {
 		const oldCapacity = this._state.fundingSatoshis;
 		const netChange = session.getNetCapacityChange(); // negative for splice-out
 		const feeratePerKw = session.getFundingFeeratePerkw() || 253;
-		const newFunding = createFundingScript(
+		const newFunding = this._spliceFundingScript(
 			localFundingPubkey,
-			remoteFundingPubkey
+			remoteFundingPubkey,
+			true
 		);
 		const txWeight = estimateSpliceTxWeight({
 			walletInputCount: this._spliceInInputs?.inputs.length ?? 0,
@@ -13874,6 +14328,263 @@ export class Channel {
 	 * exhausted). Invoked when it is our turn: right after splice_ack, and again
 	 * each time the peer sends us an interactive-tx message during the splice.
 	 */
+
+	private _interactiveFundingTransaction(): bitcoin.Transaction | null {
+		const builder =
+			this._spliceSession?.getTxBuilder() ??
+			this._state.dualFundingSession?.getTxBuilder();
+		if (!builder) return null;
+		return buildSpliceTx(
+			builder.getInputs().map((input) => ({
+				serialId: input.serialId,
+				prevTxid: input.prevTx?.length
+					? extractTxidFromPrevTx(input.prevTx)
+					: input.prevTxid,
+				prevOutputIndex: input.prevTxVout ?? input.prevOutputIndex,
+				sequence: input.sequence
+			})),
+			builder.getOutputs().map((output) => ({
+				serialId: output.serialId,
+				script: output.scriptPubkey,
+				valueSats: output.amountSats
+			})),
+			builder.getLocktime()
+		);
+	}
+	private _fundingRound(
+		transaction: bitcoin.Transaction
+	): ITaprootFundingRound {
+		if (!this._state.nativeTaprootFunding)
+			throw new Error('Native Taproot interactive funding was not negotiated');
+		const domain = fundingNonceDomain(transaction),
+			key = domain.toString('hex');
+		this._state.taprootFundingRounds ??= new Map();
+		let round = this._state.taprootFundingRounds.get(key);
+		if (!round) {
+			const height = this._spliceSession
+				? this._state.localCommitmentNumber
+				: 0n;
+			round = {
+				domain,
+				localVerificationNonce: Buffer.from(
+					deriveFundingNonce(
+						this._state.localPerCommitmentSeed,
+						this._state.localBasepoints.fundingPubkey,
+						domain,
+						'commitment',
+						height
+					)
+				),
+				...(this._spliceSession
+					? {
+							localSharedNonce: Buffer.from(
+								deriveFundingNonce(
+									this._state.localPerCommitmentSeed,
+									this._state.localBasepoints.fundingPubkey,
+									domain,
+									'shared'
+								)
+							)
+					  }
+					: {})
+			};
+			if (this._spliceSession)
+				round.localNextVerificationNonce = Buffer.from(
+					deriveFundingNonce(
+						this._state.localPerCommitmentSeed,
+						this._state.localBasepoints.fundingPubkey,
+						domain,
+						'commitment',
+						this._state.localCommitmentNumber + 1n
+					)
+				);
+			this._state.taprootFundingRounds.set(key, round);
+		}
+		return round;
+	}
+	private _interactiveCompleteMessage(channelId: Buffer): ITxCompleteMessage {
+		if (!isTaprootChannel(this._state.channelType)) return { channelId };
+		const tx = this._interactiveFundingTransaction();
+		if (!tx) throw new Error('Interactive funding transaction missing');
+		const round = this._fundingRound(tx);
+		return {
+			channelId,
+			taprootFunding: {
+				domain: round.domain,
+				verificationNonce: round.localVerificationNonce,
+				...(round.localSharedNonce
+					? {
+							sharedNonce: round.localSharedNonce,
+							nextVerificationNonce: round.localNextVerificationNonce
+					  }
+					: {})
+			}
+		};
+	}
+	private _bindInteractiveComplete(msg?: ITxCompleteMessage): void {
+		if (!isTaprootChannel(this._state.channelType)) return;
+		const tx = this._interactiveFundingTransaction(),
+			peer = msg?.taprootFunding;
+		if (!tx || !peer || !fundingNonceDomain(tx).equals(peer.domain))
+			throw new Error('Peer funding nonce transcript differs');
+		if (!!peer.sharedNonce !== !!this._spliceSession)
+			throw new Error('Peer funding nonce role differs');
+		bindFundingPeerNonces(
+			this._fundingRound(tx),
+			peer.verificationNonce,
+			peer.sharedNonce,
+			peer.nextVerificationNonce
+		);
+	}
+	private _signInteractiveCommitment(
+		view: IChannelState,
+		round: ITaprootFundingRound,
+		height: bigint
+	): {
+		partial: Buffer;
+		htlcSignatures: Buffer[];
+		customRecords?: CustomRecords;
+	} {
+		if (
+			!this._signer ||
+			!round.remoteVerificationNonce ||
+			!view.remoteCurrentPerCommitmentPoint
+		)
+			throw new Error('Interactive commitment nonce is missing');
+		const built = buildRemoteCommitment(
+			view,
+			view.remoteCurrentPerCommitmentPoint,
+			height
+		);
+		const digest = sha256(built.result.tx.toBuffer());
+		if (round.ourCommitmentDigest && !round.ourCommitmentDigest.equals(digest))
+			throw new Error('Interactive commitment changed after signing');
+		if (round.ourCommitmentMessage) {
+			if (view.auxiliaryState && built.auxiliary)
+				view.auxiliaryState.remoteCommitments.set(
+					height,
+					copyAuxiliaryCommitment(built.auxiliary)
+				);
+			const prior = decodeCommitmentSignedMessage(round.ourCommitmentMessage);
+			if (!prior.partialSignatureWithNonce?.equals(round.ourCommitmentPartial!))
+				throw new Error(
+					'Persisted funding partial differs from replay message'
+				);
+			return {
+				partial: Buffer.from(round.ourCommitmentPartial!),
+				htlcSignatures: prior.htlcSignatures,
+				customRecords: prior.customRecords
+			};
+		}
+		if (!round.ourCommitmentPartial) {
+			const nonce = generateNonce({
+				publicKey: view.localBasepoints.fundingPubkey,
+				sessionId: randomBytes(32)
+			});
+			const partial = signRemoteCommitmentPartial(
+				view,
+				this._signer,
+				nonce,
+				round.remoteVerificationNonce,
+				view.remoteCurrentPerCommitmentPoint,
+				height
+			);
+			round.ourCommitmentPartial = Buffer.concat([partial, Buffer.from(nonce)]);
+			round.ourCommitmentDigest = Buffer.from(digest);
+		}
+		let customRecords: CustomRecords | undefined;
+		if (view.auxiliaryState) {
+			customRecords = copyCustomRecords(
+				requireAuxiliaryProvider(view).signHtlcs(
+					{
+						state: view,
+						side: 'remote',
+						commitmentNumber: height,
+						perCommitmentPoint: view.remoteCurrentPerCommitmentPoint,
+						commitment: built
+					},
+					this._signer
+				)
+			);
+			if (!built.auxiliary)
+				throw new Error('Missing interactive asset commitment');
+			view.auxiliaryState.remoteCommitments.set(
+				height,
+				copyAuxiliaryCommitment(built.auxiliary)
+			);
+		}
+		return {
+			customRecords,
+			partial: Buffer.from(round.ourCommitmentPartial),
+			htlcSignatures: signRemoteHtlcSignaturesTaproot(
+				view,
+				this._signer,
+				view.remoteCurrentPerCommitmentPoint,
+				height
+			)
+		};
+	}
+	private _verifyInteractiveCommitment(
+		view: IChannelState,
+		round: ITaprootFundingRound,
+		msg: ICommitmentSignedMessage,
+		height: bigint
+	): boolean {
+		const partial = msg.partialSignatureWithNonce;
+		if (!partial || partial.length !== 98) return false;
+		if (
+			round.remoteCommitmentPartial &&
+			(!round.remoteCommitmentPartial.equals(partial.subarray(0, 32)) ||
+				!round.remoteSigningNonce?.equals(partial.subarray(32)))
+		)
+			return false;
+		const point = getPerCommitmentPoint(view.localPerCommitmentSeed, height);
+		if (
+			!verifyRemoteCommitmentPartial(
+				view,
+				partial.subarray(0, 32),
+				round.localVerificationNonce,
+				partial.subarray(32),
+				point,
+				height
+			)
+		)
+			return false;
+		if (
+			!verifyRemoteHtlcSignaturesTaproot(
+				view,
+				point,
+				msg.htlcSignatures,
+				height
+			)
+		)
+			return false;
+		if (view.auxiliaryState) {
+			const built = buildLocalCommitment(view, point, height);
+			if (
+				!built.auxiliary ||
+				!requireAuxiliaryProvider(view).verifyHtlcs(
+					{
+						state: view,
+						side: 'local',
+						commitmentNumber: height,
+						perCommitmentPoint: point,
+						commitment: built
+					},
+					msg.customRecords ?? new Map()
+				)
+			)
+				return false;
+			const auxiliary = copyAuxiliaryCommitment(built.auxiliary);
+			auxiliary.peerSignatures = copyCustomRecords(
+				msg.customRecords ?? new Map()
+			);
+			view.auxiliaryState.localCommitments.set(height, auxiliary);
+		}
+		round.remoteCommitmentPartial = Buffer.from(partial.subarray(0, 32));
+		round.remoteSigningNonce = Buffer.from(partial.subarray(32));
+		return true;
+	}
 	private _driveSplice(): ChannelAction[] {
 		const session = this._spliceSession;
 		if (
@@ -13888,7 +14599,9 @@ export class Channel {
 		// each of our turns we simply (re)send tx_complete until both sides have
 		// completed. The builder resets SENT_COMPLETE -> COLLECTING when the peer
 		// adds, so this re-sends correctly across the negotiation.
-		if (!session.isInitiator()) {
+		if (this._interactiveContributions && !this._spliceContributions)
+			this._computeSpliceContributions();
+		if (!session.isInitiator() && !this._interactiveContributions) {
 			const builderState = session.getTxBuilderState();
 			if (
 				builderState === InteractiveTxState.COLLECTING ||
@@ -13899,9 +14612,9 @@ export class Channel {
 				return [
 					sendMsg(
 						MessageType.TX_COMPLETE,
-						encodeTxCompleteMessage({
-							channelId: this._state.channelId
-						})
+						encodeTxCompleteMessage(
+							this._interactiveCompleteMessage(this._state.channelId)
+						)
 					)
 				];
 			}
@@ -13944,16 +14657,20 @@ export class Channel {
 		}
 
 		// Nothing left to add: send our tx_complete once.
-		if (!this._spliceSentTxComplete) {
+		if (
+			!this._spliceSentTxComplete ||
+			session.getTxBuilderState() === InteractiveTxState.COLLECTING ||
+			session.getTxBuilderState() === InteractiveTxState.RECEIVED_COMPLETE
+		) {
 			this._spliceSentTxComplete = true;
 			const err = session.markTxComplete();
 			if (err) return [{ type: ChannelActionType.ERROR, message: err }];
 			return [
 				sendMsg(
 					MessageType.TX_COMPLETE,
-					encodeTxCompleteMessage({
-						channelId: this._state.channelId
-					})
+					encodeTxCompleteMessage(
+						this._interactiveCompleteMessage(this._state.channelId)
+					)
 				)
 			];
 		}
@@ -13970,6 +14687,39 @@ export class Channel {
 	 * Both peers run this against the identical negotiated transaction, so they
 	 * derive the same txid and can exchange shared-input signatures.
 	 */
+	private _spliceFundingScript(
+		local: Buffer,
+		remote: Buffer,
+		pending = false
+	): { p2wshOutput: Buffer; witnessScript: Buffer } {
+		if (!isTaprootChannel(this._state.channelType))
+			return createFundingScript(local, remote);
+		const funding = createTaprootFundingScript(
+			local,
+			remote,
+			undefined,
+			pending
+				? this._state.interactiveFunding?.fundingTaprootMerkleRoot ??
+						this._state.fundingTaprootMerkleRoot
+				: this._state.fundingTaprootMerkleRoot
+		);
+		return { p2wshOutput: funding.p2trOutput, witnessScript: Buffer.alloc(0) };
+	}
+	private _spliceSharedInputContext(): ITaprootSharedInput {
+		const st = this._spliceTx,
+			prevouts = this._spliceInputPrevouts();
+		if (!st || !prevouts || !this._state.remoteBasepoints)
+			throw new Error('Missing Taproot splice prevouts');
+		return {
+			transaction: st.tx,
+			inputIndex: st.sharedInputIndex,
+			prevoutScripts: prevouts.scripts,
+			prevoutValues: prevouts.values.map(Number),
+			localFundingPubkey: this._state.localBasepoints.fundingPubkey,
+			remoteFundingPubkey: this._state.remoteBasepoints.fundingPubkey,
+			fundingMerkleRoot: this._state.fundingTaprootMerkleRoot
+		};
+	}
 	buildAndSignSpliceTx(): {
 		spliceTxid: Buffer;
 		sharedInputIndex: number;
@@ -13998,6 +14748,8 @@ export class Channel {
 			};
 		}
 
+		if (isTaprootChannel(this._state.channelType))
+			retainFundingEpoch(this._state);
 		const built = session.buildTransaction();
 		if (!built) return null;
 
@@ -14016,7 +14768,7 @@ export class Channel {
 
 		// The shared input spends our current funding output (a 2-of-2 of the
 		// current funding pubkeys).
-		const oldFunding = createFundingScript(
+		const oldFunding = this._spliceFundingScript(
 			this._state.localBasepoints.fundingPubkey,
 			this._state.remoteBasepoints.fundingPubkey
 		);
@@ -14031,9 +14783,10 @@ export class Channel {
 		const remoteSpliceFundingPubkey =
 			session.getRemoteFundingPubkey() ||
 			this._state.remoteBasepoints.fundingPubkey;
-		const newFunding = createFundingScript(
+		const newFunding = this._spliceFundingScript(
 			this._state.localBasepoints.fundingPubkey,
-			remoteSpliceFundingPubkey
+			remoteSpliceFundingPubkey,
+			true
 		);
 		const newFundingOutputIndex = findOutputIndex(tx, newFunding.p2wshOutput);
 
@@ -14047,13 +14800,20 @@ export class Channel {
 			return null;
 		}
 
-		const signature = signSpliceSharedInput(
+		this._spliceAuxiliaryState = this._finalizeInteractiveAssets(
 			tx,
-			sharedInputIndex,
-			oldFunding.witnessScript,
-			this._state.fundingSatoshis,
-			this._signer
+			newFundingOutputIndex,
+			'splice'
 		);
+		let signature = isTaprootChannel(this._state.channelType)
+			? Buffer.alloc(0)
+			: signSpliceSharedInput(
+					tx,
+					sharedInputIndex,
+					oldFunding.witnessScript,
+					this._state.fundingSatoshis,
+					this._signer
+			  );
 
 		// Sign any wallet inputs we contributed (splice-in) and apply their
 		// witnesses directly to the tx. Collect them (in tx-input order) so we can
@@ -14063,9 +14823,7 @@ export class Channel {
 		const ourWalletInputIndices: number[] = [];
 		const ourExternalInputIndices: number[] = [];
 		if (this._spliceInInputs) {
-			const p2wshScript = bitcoin.payments.p2wsh({
-				redeem: { output: oldFunding.witnessScript }
-			}).output as Buffer;
+			const p2wshScript = oldFunding.p2wshOutput;
 			const prevouts = this._collectPrevouts(
 				tx,
 				[...this._spliceInInputs.inputs, ...built.inputs],
@@ -14117,6 +14875,15 @@ export class Channel {
 			ourExternalInputIndices
 		};
 
+		if (isTaprootChannel(this._state.channelType)) {
+			signature = signFundingSharedInput(
+				this._fundingRound(tx),
+				this._spliceSharedInputContext(),
+				this._state.localPerCommitmentSeed,
+				this._signer
+			);
+			this._spliceTx.localSig = signature;
+		}
 		return {
 			spliceTxid: Buffer.from(tx.getHash()),
 			sharedInputIndex,
@@ -14146,14 +14913,20 @@ export class Channel {
 			return 'no negotiated splice transaction';
 		}
 		const { tx, sharedInputIndex, oldWitnessScript } = this._spliceTx;
-		const ok = verifySpliceSharedInput(
-			tx,
-			sharedInputIndex,
-			oldWitnessScript,
-			this._state.fundingSatoshis,
-			this._state.remoteBasepoints.fundingPubkey,
-			remoteSig
-		);
+		const ok = isTaprootChannel(this._state.channelType)
+			? verifyFundingSharedInput(
+					this._fundingRound(tx),
+					this._spliceSharedInputContext(),
+					remoteSig
+			  )
+			: verifySpliceSharedInput(
+					tx,
+					sharedInputIndex,
+					oldWitnessScript,
+					this._state.fundingSatoshis,
+					this._state.remoteBasepoints.fundingPubkey,
+					remoteSig
+			  );
 		return ok ? null : 'invalid peer splice signature';
 	}
 
@@ -14183,25 +14956,39 @@ export class Channel {
 		} = this._spliceTx;
 		const remoteFundingPubkey = this._state.remoteBasepoints.fundingPubkey;
 
-		const ok = verifySpliceSharedInput(
-			tx,
-			sharedInputIndex,
-			oldWitnessScript,
-			this._state.fundingSatoshis,
-			remoteFundingPubkey,
-			remoteSig
-		);
-		if (!ok) return null;
+		if (isTaprootChannel(this._state.channelType)) {
+			try {
+				tx.setWitness(sharedInputIndex, [
+					finalizeFundingSharedInput(
+						this._fundingRound(tx),
+						this._spliceSharedInputContext(),
+						remoteSig
+					)
+				]);
+			} catch {
+				return null;
+			}
+		} else {
+			const ok = verifySpliceSharedInput(
+				tx,
+				sharedInputIndex,
+				oldWitnessScript,
+				this._state.fundingSatoshis,
+				remoteFundingPubkey,
+				remoteSig
+			);
+			if (!ok) return null;
 
-		finalizeSpliceSharedWitness(
-			tx,
-			sharedInputIndex,
-			localSig,
-			remoteSig,
-			this._state.localBasepoints.fundingPubkey,
-			remoteFundingPubkey,
-			oldWitnessScript
-		);
+			finalizeSpliceSharedWitness(
+				tx,
+				sharedInputIndex,
+				localSig,
+				remoteSig,
+				this._state.localBasepoints.fundingPubkey,
+				remoteFundingPubkey,
+				oldWitnessScript
+			);
+		}
 
 		// Apply the peer's wallet-input witnesses to the non-shared inputs we
 		// did not sign ourselves (in ascending input order). Exactly one stack
@@ -14820,6 +15607,8 @@ export class Channel {
 		this._spliceOutDestination = null;
 		this._spliceInInputs = null;
 		this._spliceTx = null;
+		this._spliceAuxiliaryState = undefined;
+		this._interactiveContributions = null;
 		this._spliceCallerTxSigsSignaled = false;
 	}
 
@@ -14844,6 +15633,16 @@ export class Channel {
 			const prevouts = this._spliceInputPrevouts();
 			this._state.spliceInFlight = {
 				spliceTxid: Buffer.from(st.tx.getHash()),
+				...(this._spliceAuxiliaryState
+					? {
+							auxiliaryState: this._spliceAuxiliaryState,
+							fundingTaprootMerkleRoot:
+								this._state.interactiveFunding!.fundingTaprootMerkleRoot
+					  }
+					: {}),
+				...(isTaprootChannel(this._state.channelType)
+					? { taprootRound: this._fundingRound(st.tx) }
+					: {}),
 				newFundingOutputIndex: st.newFundingOutputIndex,
 				newFundingSatoshis: BigInt(st.tx.outs[st.newFundingOutputIndex].value),
 				spliceTxHex: st.tx.toHex(),
@@ -15153,6 +15952,20 @@ export class Channel {
 
 		return {
 			...base,
+			...(this._spliceAuxiliaryState
+				? {
+						auxiliaryState: this._spliceAuxiliaryState,
+						fundingTaprootMerkleRoot:
+							this._state.interactiveFunding?.fundingTaprootMerkleRoot ??
+							this._state.spliceInFlight?.fundingTaprootMerkleRoot
+				  }
+				: {}),
+			...(isTaprootChannel(base.channelType)
+				? {
+						taprootNonceDomain: this._fundingRound(tx).domain,
+						remoteSigningNonce: this._fundingRound(tx).remoteSigningNonce
+				  }
+				: {}),
 			fundingTxid: Buffer.from(tx.getHash()),
 			fundingOutputIndex: idx,
 			fundingSatoshis: newCapacity,
@@ -15193,12 +16006,24 @@ export class Channel {
 		const spliced = this._splicedState();
 		if (!spliced) return [];
 
-		const { signature, htlcSignatures } = signRemoteCommitment(
-			spliced,
-			this._signer,
-			this._state.remoteCurrentPerCommitmentPoint,
-			this._state.remoteCommitmentNumber
-		);
+		const nativePartial = isTaprootChannel(spliced.channelType)
+			? this._signInteractiveCommitment(
+					spliced,
+					this._fundingRound(this._spliceTx!.tx),
+					this._state.remoteCommitmentNumber
+			  )
+			: undefined;
+		const { signature, htlcSignatures } = nativePartial
+			? {
+					signature: Buffer.alloc(64),
+					htlcSignatures: nativePartial.htlcSignatures
+			  }
+			: signRemoteCommitment(
+					spliced,
+					this._signer,
+					this._state.remoteCurrentPerCommitmentPoint,
+					this._state.remoteCommitmentNumber
+			  );
 		this._watchtowerCache.cacheRemoteCommitment(
 			this._state.remoteCurrentPerCommitmentPoint,
 			this._state.remoteCommitmentNumber,
@@ -15221,8 +16046,13 @@ export class Channel {
 			channelId: this._state.channelId,
 			signature,
 			htlcSignatures,
-			fundingTxid: spliceTxid
+			fundingTxid: spliceTxid,
+			partialSignatureWithNonce: nativePartial?.partial,
+			customRecords: nativePartial?.customRecords
 		};
+		if (nativePartial)
+			this._fundingRound(this._spliceTx!.tx).ourCommitmentMessage =
+				encodeCommitmentSignedMessage(msg);
 		return [
 			{ type: ChannelActionType.PERSIST_STATE },
 			sendMsg(MessageType.COMMITMENT_SIGNED, encodeCommitmentSignedMessage(msg))
@@ -15767,13 +16597,20 @@ export class Channel {
 			this._state.localPerCommitmentSeed,
 			this._state.localCommitmentNumber
 		);
-		const valid = verifyRemoteCommitmentSig(
-			spliced,
-			this._signer,
-			ourPoint,
-			msg.signature,
-			this._state.localCommitmentNumber
-		);
+		const valid = isTaprootChannel(spliced.channelType)
+			? this._verifyInteractiveCommitment(
+					spliced,
+					this._fundingRound(this._spliceTx!.tx),
+					msg,
+					this._state.localCommitmentNumber
+			  )
+			: verifyRemoteCommitmentSig(
+					spliced,
+					this._signer,
+					ourPoint,
+					msg.signature,
+					this._state.localCommitmentNumber
+			  );
 		if (!valid) {
 			return [
 				{
@@ -15808,7 +16645,11 @@ export class Channel {
 				}
 			];
 		}
-		this._spliceRemoteCommitmentSig = Buffer.from(msg.signature);
+		this._spliceRemoteCommitmentSig = Buffer.from(
+			isTaprootChannel(spliced.channelType)
+				? msg.partialSignatureWithNonce!.subarray(0, 32)
+				: msg.signature
+		);
 		this._spliceRemoteHtlcSigs = msg.htlcSignatures.map((s) => Buffer.from(s));
 		this._spliceReceivedCommitment = true;
 		// This signature is what a force close rebuilds against once the splice
@@ -16032,7 +16873,9 @@ export class Channel {
 			channelId: this._state.channelId,
 			txid: signed.spliceTxid,
 			witnesses: this._spliceTx!.ourWalletWitnesses,
-			sharedInputSignature: signed.signature
+			...(isTaprootChannel(this._state.channelType)
+				? { sharedInputPartialSignatureWithNonce: signed.signature }
+				: { sharedInputSignature: signed.signature })
 		};
 		const actions: ChannelAction[] = [
 			// Persist the records, then arm both watches, then let our
@@ -16261,6 +17104,23 @@ export class Channel {
 		// The funding has moved: from here on the funder-fee guard admits the
 		// climb-out adds eclair sends on a spliced channel (issue #1020).
 		fields.hasBeenSpliced = true;
+		if (this._state.spliceInFlight?.auxiliaryState) {
+			fields.auxiliaryState = this._state.spliceInFlight.auxiliaryState;
+			fields.fundingTaprootMerkleRoot =
+				this._state.spliceInFlight.fundingTaprootMerkleRoot;
+			fields.interactiveFunding = undefined;
+		}
+		const round = this._state.spliceInFlight?.taprootRound;
+		if (round) {
+			fields.taprootNonceDomain = Buffer.from(round.domain);
+			fields.remoteSigningNonce = round.remoteSigningNonce;
+			fields.remoteNonce = round.remoteNextVerificationNonce;
+			fields.localNonce = undefined;
+			fields.localNextNonce = this._deriveVerificationNonce(
+				this._state.localCommitmentNumber + 1n,
+				{ ...this._state, ...fields }
+			);
+		}
 		// Keep the funding this adoption retires (issue #1060). The state
 		// still holds the OLD txid here: the swap above is a value in
 		// `fields`, applied by the caller. Only a real swap appends, so the
@@ -16791,6 +17651,15 @@ export class Channel {
 	 * Initiate opening a v2 (dual-funded) channel. Sends open_channel2.
 	 */
 	initiateOpenV2(params: IDualFundingParams): ChannelAction[] {
+		if (this._state.auxiliaryState)
+			params = {
+				...params,
+				maxAcceptedHtlcs: Math.min(
+					params.maxAcceptedHtlcs,
+					MAX_AUXILIARY_HTLCS_PER_PARTY
+				),
+				dustLimitSatoshis: this._state.localConfig.dustLimitSatoshis
+			};
 		if (this._state.state !== ChannelState.NONE) {
 			return [
 				{
@@ -16823,13 +17692,22 @@ export class Channel {
 			defaultType.setCompulsory(Feature.STATIC_REMOTE_KEY);
 			params = { ...params, channelType: defaultType.toBuffer() };
 		}
-		// Admission validation of the type this open would propose, BEFORE
-		// any state mutation: taproot v2 signing does not exist, so a
-		// taproot (or otherwise unrecognized) type must never leave this
-		// method as an OPEN_CHANNEL2. The manager additionally validates
-		// against both init vectors; a raw Channel has none, so the
-		// presence, structural and taproot rules still hold here.
-		const v2TypeErr = validateV2ChannelType(params.channelType);
+		// Validate the proposed type before changing state or sending open_channel2.
+		// Taproot requires the native interactive funding extension. The manager
+		// additionally checks both init vectors; a raw Channel still enforces
+		// the structural rules and its explicit native capability state.
+		const v2TypeErr = validateV2ChannelType(
+			params.channelType,
+			undefined,
+			undefined,
+			this._state.nativeTaprootFunding
+		);
+		const auxiliaryError = validateAuxiliaryChannelType(
+			this._state,
+			params.channelType
+		);
+		if (auxiliaryError)
+			return [{ type: ChannelActionType.ERROR, message: auxiliaryError }];
 		if (v2TypeErr) {
 			return [
 				{
@@ -16925,7 +17803,10 @@ export class Channel {
 		return [
 			sendMsg(
 				MessageType.OPEN_CHANNEL2,
-				encodeOpenChannel2Message(result.message)
+				encodeOpenChannel2Message({
+					...result.message,
+					interactiveFundingSessionId: this._state.interactiveFunding?.sessionId
+				})
 			)
 		];
 	}
@@ -16938,6 +17819,26 @@ export class Channel {
 		msg: IOpenChannel2Message,
 		localParams: IDualFundingParams
 	): ChannelAction[] {
+		if (this._state.auxiliaryState) {
+			if (msg.maxAcceptedHtlcs > MAX_AUXILIARY_HTLCS_PER_PARTY)
+				return refuseWithWireError(
+					msg.channelId,
+					'Asset HTLC count exceeds negotiated maximum'
+				);
+			localParams = {
+				...localParams,
+				maxAcceptedHtlcs: Math.min(
+					localParams.maxAcceptedHtlcs,
+					MAX_AUXILIARY_HTLCS_PER_PARTY
+				),
+				dustLimitSatoshis: this._state.localConfig.dustLimitSatoshis
+			};
+		}
+		const idProblem = this._interactiveFundingIdProblem(
+			msg.interactiveFundingSessionId,
+			'dual'
+		);
+		if (idProblem) return refuseWithWireError(msg.channelId, idProblem);
 		if (this._state.state !== ChannelState.NONE) {
 			// Deliberately LOCAL-only: this guard can only fire on a channel
 			// that already has a life (a replayed or misrouted open), and a
@@ -16971,7 +17872,18 @@ export class Channel {
 		// open_channel2, so an absent type is refused too. The manager
 		// validates against both init vectors; a raw Channel has none, so
 		// the presence, structural and taproot rules still hold here.
-		const v2TypeErr = validateV2ChannelType(msg.channelType ?? null);
+		const v2TypeErr = validateV2ChannelType(
+			msg.channelType ?? null,
+			undefined,
+			undefined,
+			this._state.nativeTaprootFunding
+		);
+		const auxiliaryError = validateAuxiliaryChannelType(
+			this._state,
+			msg.channelType
+		);
+		if (auxiliaryError)
+			return refuseWithWireError(msg.channelId, auxiliaryError);
 		if (v2TypeErr) {
 			return refuse(`open_channel2 refused: ${v2TypeErr}`);
 		}
@@ -17216,7 +18128,10 @@ export class Channel {
 		return [
 			sendMsg(
 				MessageType.ACCEPT_CHANNEL2,
-				encodeAcceptChannel2Message(result.message)
+				encodeAcceptChannel2Message({
+					...result.message,
+					interactiveFundingSessionId: this._state.interactiveFunding?.sessionId
+				})
 			)
 		];
 	}
@@ -17225,6 +18140,21 @@ export class Channel {
 	 * Handle accept_channel2 from remote (opener side).
 	 */
 	handleAcceptChannel2(msg: IAcceptChannel2Message): ChannelAction[] {
+		if (
+			this._state.auxiliaryState &&
+			msg.maxAcceptedHtlcs > MAX_AUXILIARY_HTLCS_PER_PARTY
+		)
+			return refuseWithWireError(
+				msg.channelId,
+				'Asset HTLC count exceeds negotiated maximum'
+			);
+		const idProblem = this._interactiveFundingIdProblem(
+			msg.interactiveFundingSessionId,
+			'dual'
+		);
+		if (idProblem) {
+			return refuseWithWireError(msg.channelId, idProblem);
+		}
 		const refuse = (reason: string): ChannelAction[] =>
 			refuseWithWireError(msg.channelId, reason);
 		if (this._state.state !== ChannelState.DUAL_FUNDING_V2) {
@@ -17881,6 +18811,12 @@ export class Channel {
 		const session = this._state.dualFundingSession;
 		const c = this._dualFundingContribution;
 		if (!session || !c) return 'No dual-funding contribution registered';
+		const planned = this._plannedFundingContributions('dual');
+		if (planned) {
+			this._dualFundingContribs = planned;
+			this._dualFundingContribIndex = 0;
+			return null;
+		}
 		const initiator = session.isInitiator();
 
 		// A zero contribution (a plain v2 accept: no inputs, no funding share)
@@ -18230,9 +19166,9 @@ export class Channel {
 		return [
 			sendMsg(
 				MessageType.TX_COMPLETE,
-				encodeTxCompleteMessage({
-					channelId: this._v2ChannelId()
-				})
+				encodeTxCompleteMessage(
+					this._interactiveCompleteMessage(this._v2ChannelId())
+				)
 			),
 			...commitment
 		];
@@ -18241,7 +19177,21 @@ export class Channel {
 	/**
 	 * Handle tx_complete from peer.
 	 */
-	handleTxComplete(): ChannelAction[] {
+	handleTxComplete(msg?: ITxCompleteMessage): ChannelAction[] {
+		try {
+			this._bindInteractiveComplete(msg);
+		} catch (error) {
+			const reason =
+				error instanceof Error
+					? error.message
+					: 'Invalid funding nonce transcript';
+			return this._spliceSession
+				? [
+						this._txAbort(this._state.channelId!, reason),
+						...this.abortSplice(reason)
+				  ]
+				: this._unwindV2NegotiationOrRollback(reason);
+		}
 		if (this._spliceTxNegotiationActive()) {
 			const err = this._spliceSession!.handlePeerTxComplete();
 			if (err) {
@@ -18406,7 +19356,17 @@ export class Channel {
 						? this._spliceSession!.getRemoteFundingPubkey() ??
 						  this._state.remoteBasepoints.fundingPubkey
 						: this._state.remoteBasepoints.fundingPubkey;
-				fundingScript = createFundingScript(localPub, remotePub).p2wshOutput;
+				fundingScript = isTaprootChannel(this._state.channelType)
+					? createTaprootFundingScript(
+							localPub,
+							remotePub,
+							undefined,
+							kind === 'splice'
+								? this._state.interactiveFunding?.fundingTaprootMerkleRoot ??
+										this._state.fundingTaprootMerkleRoot
+								: this._state.fundingTaprootMerkleRoot
+					  ).p2trOutput
+					: createFundingScript(localPub, remotePub).p2wshOutput;
 			} catch {
 				fundingScript = null;
 			}
@@ -18586,7 +19546,15 @@ export class Channel {
 		const session = this._state.dualFundingSession;
 		if (!session || !this._state.remoteBasepoints) return null;
 		const built = session.buildTransaction();
-		if (!built) return null;
+		if (!built) {
+			const prior = this._state.v2InFlight;
+			if (!prior?.taprootRound || session.getRbfCount() !== prior.rbfAttempt)
+				return null;
+			return {
+				tx: bitcoin.Transaction.fromHex(prior.fundingTxHex),
+				outputIndex: prior.fundingOutputIndex
+			};
+		}
 		let tx;
 		try {
 			// The interactive-tx final ordering (ascending serial_id) is exactly
@@ -18615,7 +19583,15 @@ export class Channel {
 			this._state.localBasepoints.fundingPubkey,
 			this._state.remoteBasepoints.fundingPubkey
 		);
-		const outputIndex = findOutputIndex(tx, funding.p2wshOutput);
+		const script = isTaprootChannel(this._state.channelType)
+			? createTaprootFundingScript(
+					this._state.localBasepoints.fundingPubkey,
+					this._state.remoteBasepoints.fundingPubkey,
+					undefined,
+					this._state.fundingTaprootMerkleRoot
+			  ).p2trOutput
+			: funding.p2wshOutput;
+		const outputIndex = findOutputIndex(tx, script);
 		if (outputIndex < 0) return null;
 		if (BigInt(tx.outs[outputIndex].value) !== this._state.fundingSatoshis) {
 			return null;
@@ -18806,6 +19782,11 @@ export class Channel {
 		if (!session) return null;
 		const built = this._v2NegotiatedTx();
 		if (!built) return null;
+		const auxiliary = this._finalizeInteractiveAssets(
+			built.tx,
+			built.outputIndex,
+			'dual'
+		);
 		const signed = this._signV2ContributionWitnesses(built);
 		if (!signed) return null;
 		// The complete prevout set must survive the process: witness
@@ -18815,7 +19796,17 @@ export class Channel {
 		if (!prevouts) return null;
 		const params = session.getLocalParams();
 		return {
+			...(isTaprootChannel(this._state.channelType)
+				? { taprootRound: this._fundingRound(built.tx) }
+				: {}),
 			fundingTxid: Buffer.from(built.tx.getHash()),
+			...(auxiliary
+				? {
+						auxiliaryState: auxiliary,
+						fundingTaprootMerkleRoot:
+							this._state.interactiveFunding!.fundingTaprootMerkleRoot
+				  }
+				: {}),
 			fundingOutputIndex: built.outputIndex,
 			// The signing pass above applied our witnesses to built.tx.
 			fundingTxHex: built.tx.toHex(),
@@ -18993,9 +19984,10 @@ export class Channel {
 				a.serialId < b.serialId ? -1 : 1
 			);
 			if (sorted.length !== st.tx.ins.length) return null;
-			const p2wshScript = bitcoin.payments.p2wsh({
-				redeem: { output: st.oldWitnessScript }
-			}).output as Buffer;
+			const p2wshScript = this._spliceFundingScript(
+				this._state.localBasepoints.fundingPubkey,
+				this._state.remoteBasepoints!.fundingPubkey
+			).p2wshOutput;
 			return this._collectPrevouts(st.tx, sorted, {
 				index: st.sharedInputIndex,
 				script: p2wshScript,
@@ -19534,9 +20526,12 @@ export class Channel {
 		// broadcastable attempts; disconnect forgets the abort entirely).
 		// The rollback abort freezes it the same way until its echo.
 		if (this._v2AbortPending || this._v2RollbackAbortPending) return [];
-		// v2 + simple taproot would need a MuSig2 funding co-sign round that
-		// does not exist yet — fail closed rather than open without an exit.
-		if (isTaprootChannel(this._state.channelType)) {
+		// The native extension supplies the attempt-bound MuSig2 co-sign round.
+		// Refuse Taproot v2 when that capability was not negotiated.
+		if (
+			isTaprootChannel(this._state.channelType) &&
+			!this._state.nativeTaprootFunding
+		) {
 			return [
 				{
 					type: ChannelActionType.ERROR,
@@ -19569,13 +20564,32 @@ export class Channel {
 
 		let signature: Buffer;
 		let htlcSignatures: Buffer[];
+		let partialSignatureWithNonce: Buffer | undefined;
+		let customRecords: CustomRecords | undefined;
 		try {
-			({ signature, htlcSignatures } = signRemoteCommitment(
-				this._state,
-				this._signer,
-				this._state.remoteCurrentPerCommitmentPoint,
-				0n
-			));
+			if (isTaprootChannel(this._state.channelType)) {
+				const round = record.taprootRound!;
+				if (record.auxiliaryState) {
+					this._state.auxiliaryState = record.auxiliaryState;
+					this._state.fundingTaprootMerkleRoot =
+						record.fundingTaprootMerkleRoot;
+				}
+				this._state.taprootNonceDomain = Buffer.from(round.domain);
+				this._state.localNonce = undefined;
+				this._state.localNextNonce = undefined;
+				const signed = this._signInteractiveCommitment(this._state, round, 0n);
+				signature = Buffer.alloc(64);
+				htlcSignatures = signed.htlcSignatures;
+				partialSignatureWithNonce = signed.partial;
+				customRecords = signed.customRecords;
+			} else {
+				({ signature, htlcSignatures } = signRemoteCommitment(
+					this._state,
+					this._signer,
+					this._state.remoteCurrentPerCommitmentPoint,
+					0n
+				));
+			}
 		} catch {
 			// The signer failed AFTER the record swap: undo it before
 			// anything else observes attempt N+1, or this side would keep
@@ -19632,9 +20646,14 @@ export class Channel {
 		);
 		const msg: ICommitmentSignedMessage = {
 			channelId: this._state.channelId!,
+			partialSignatureWithNonce,
+			customRecords,
 			signature,
 			htlcSignatures
 		};
+		if (record.taprootRound)
+			record.taprootRound.ourCommitmentMessage =
+				encodeCommitmentSignedMessage(msg);
 		// Persist BEFORE the message leaves: the peer holds our signature from
 		// this point on.
 		const actions: ChannelAction[] = [
@@ -19697,13 +20716,17 @@ export class Channel {
 			this._state.localPerCommitmentSeed,
 			0n
 		);
-		const valid = verifyRemoteCommitmentSig(
-			this._state,
-			this._signer,
-			point0,
-			msg.signature,
-			0n
-		);
+		const round = this._state.v2InFlight?.taprootRound;
+		const valid = isTaprootChannel(this._state.channelType)
+			? !!round &&
+			  this._verifyInteractiveCommitment(this._state, round, msg, 0n)
+			: verifyRemoteCommitmentSig(
+					this._state,
+					this._signer,
+					point0,
+					msg.signature,
+					0n
+			  );
 		if (!valid) {
 			// Peer-held fault at the signature stage: wire-visible, with the
 			// disposition picked by broadcastability (issue 426). The bare
@@ -19713,7 +20736,11 @@ export class Channel {
 				'Invalid commitment signature in v2 open'
 			);
 		}
-		this._state.remoteCommitmentSignature = Buffer.from(msg.signature);
+		this._state.remoteCommitmentSignature = Buffer.from(
+			round?.remoteCommitmentPartial ?? msg.signature
+		);
+		if (round)
+			this._state.remoteSigningNonce = Buffer.from(round.remoteSigningNonce!);
 		this._state.remoteHtlcSignatures = [];
 		this._state.lastSignedCommitFeeratePerKw = getLocalCommitmentFeeRate(
 			this._state
@@ -19721,7 +20748,9 @@ export class Channel {
 		this._state.lastSignedCommitLeaseBlockheight =
 			getLocalCommitmentLeaseBlockheight(this._state);
 		this._v2ReceivedCommitment = true;
-		this._syncV2InFlight({ remoteCommitmentSig: Buffer.from(msg.signature) });
+		this._syncV2InFlight({
+			remoteCommitmentSig: Buffer.from(this._state.remoteCommitmentSignature)
+		});
 		actions.push({ type: ChannelActionType.PERSIST_STATE });
 		// Commitment round complete — release tx_signatures if ordering allows.
 		actions.push(...this._maybeSendV2TxSigs());
@@ -19950,6 +20979,21 @@ export class Channel {
 				minimumDepth: this._state.minimumDepth
 			}
 		];
+
+		// An external wallet may complete our half after the peer's half was
+		// persisted, including after a restart. That final witness is also a
+		// broadcast obligation, gated by the same durable funding barrier.
+		if (
+			this._state.v2InFlight?.fullySigned &&
+			this._state.v2InFlight.ourWalletInputIndices.length &&
+			this._state.pendingFundingTxHex
+		) {
+			actions.push({
+				type: ChannelActionType.BROADCAST_TX,
+				tx: Buffer.from(this._state.pendingFundingTxHex, 'hex'),
+				fundingCritical: true
+			});
+		}
 
 		// Zero-conf v2: send channel_ready right behind tx_signatures instead of
 		// waiting for confirmation, mirroring the v1 fast-tracks on
@@ -20301,7 +21345,9 @@ export class Channel {
 			channelId: this._state.channelId!,
 			txid: spliceTxid,
 			witnesses: updated,
-			sharedInputSignature: record.ourSharedInputSig
+			...(isTaprootChannel(this._state.channelType)
+				? { sharedInputPartialSignatureWithNonce: record.ourSharedInputSig }
+				: { sharedInputSignature: record.ourSharedInputSig })
 		};
 		// Same order as _maybeSendSpliceTxSigs: persist, arm both watches, then
 		// let our signature out; the completion tail then broadcasts and locks
@@ -20493,9 +21539,12 @@ export class Channel {
 			// only its OWN wallet inputs. Legacy beignet (pre-TLV) sent the sig as
 			// witnesses[0] = a single 64-byte element — unambiguous vs real wallet
 			// witness stacks (P2WPKH stacks have 2 elements), so accept both.
-			let peerSig = msg.sharedInputSignature;
+			let peerSig = isTaprootChannel(this._state.channelType)
+				? msg.sharedInputPartialSignatureWithNonce
+				: msg.sharedInputSignature;
 			let peerWalletWitnesses = msg.witnesses || [];
 			if (
+				!isTaprootChannel(this._state.channelType) &&
 				!peerSig &&
 				peerWalletWitnesses[0]?.length === 1 &&
 				peerWalletWitnesses[0][0]?.length === 64
@@ -20742,7 +21791,14 @@ export class Channel {
 			// now in hand: assemble and broadcast the funding tx ourselves
 			// (mirrors the splice path; the opener usually broadcasts too, and
 			// a duplicate broadcast is harmless).
-			if (this._dualFundingContribution && this._state.pendingFundingTxHex) {
+			if (
+				(this._dualFundingContribution ||
+					this._state.v2InFlight?.ourWalletInputIndices.length) &&
+				this._state.pendingFundingTxHex &&
+				!actions.some(
+					(action) => action.type === ChannelActionType.BROADCAST_TX
+				)
+			) {
 				// Same reason as the splice above: once our own
 				// tx_signatures have been released this batch has nothing
 				// barrier-class left to hold it.
@@ -21464,6 +22520,35 @@ export class Channel {
 	 * value that no commitment builder reads (issue #387).
 	 */
 	private _restoreV2RecordSnapshot(record: IV2InFlight): void {
+		if (record.auxiliaryState) {
+			this._state.auxiliaryState = record.auxiliaryState;
+			this._state.fundingTaprootMerkleRoot = record.fundingTaprootMerkleRoot;
+		}
+
+		if (record.taprootRound) {
+			this._state.taprootFundingRounds ??= new Map();
+			const key = record.taprootRound.domain.toString('hex'),
+				prior = this._state.taprootFundingRounds.get(key);
+			if (prior) {
+				for (const [name, value] of Object.entries(record.taprootRound)) {
+					const previous = prior[name as keyof ITaprootFundingRound];
+					if (previous && value && !previous.equals(value))
+						throw new Error('Conflicting persisted funding evidence');
+				}
+				Object.assign(prior, record.taprootRound);
+				record.taprootRound = prior;
+			} else this._state.taprootFundingRounds.set(key, record.taprootRound);
+			this._state.taprootNonceDomain = Buffer.from(record.taprootRound.domain);
+			this._state.remoteSigningNonce = record.taprootRound.remoteSigningNonce
+				? Buffer.from(record.taprootRound.remoteSigningNonce)
+				: undefined;
+			this._state.remoteNonce = record.taprootRound.remoteVerificationNonce
+				? Buffer.from(record.taprootRound.remoteVerificationNonce)
+				: undefined;
+			this._state.localNonce = undefined;
+			this._state.localNextNonce = undefined;
+		}
+
 		if (record.fundingSatoshis === undefined) {
 			this._deriveV2ChannelReserves();
 			return;
@@ -21839,6 +22924,18 @@ export class Channel {
 		if (index < 0) return null;
 		const adopted = previous[index];
 		const fields: Partial<IChannelState> = {
+			...(adopted.auxiliaryState
+				? {
+						auxiliaryState: adopted.auxiliaryState,
+						fundingTaprootMerkleRoot: adopted.fundingTaprootMerkleRoot
+				  }
+				: {}),
+			...(adopted.taprootRound
+				? {
+						taprootNonceDomain: adopted.taprootRound.domain,
+						remoteSigningNonce: adopted.taprootRound.remoteSigningNonce
+				  }
+				: {}),
 			v2InFlight: adopted,
 			v2PreviousAttempts: undefined,
 			fundingTxid: Buffer.from(adopted.fundingTxid),
@@ -23075,12 +24172,18 @@ export class Channel {
 	 * (IFforEpochRecord.capabilityHold); a later compatible one lifts the
 	 * hold. Nothing else writes it, and handleReestablish persists a change.
 	 */
-	setFforCapabilities(concurrentNegotiated: boolean): void {
+	setFforCapabilities(
+		concurrentNegotiated: boolean,
+		assetsNegotiated = false
+	): void {
 		const f = this._state.ffor;
 		if (!f) return;
 		const live = this._fforLive();
 		const hold =
-			live !== null && this._fforIsConcurrent(live) && !concurrentNegotiated;
+			live !== null &&
+			this._fforIsConcurrent(live) &&
+			(!concurrentNegotiated ||
+				(!!live.params.assetTerms && !assetsNegotiated));
 		if ((f.capabilityHold === true) === hold) return;
 		if (hold) {
 			f.capabilityHold = true;
@@ -23112,7 +24215,9 @@ export class Channel {
 			return 'the close of the voucher book is being recovered with the peer';
 		}
 		if (f.capabilityHold === true) {
-			return 'the peer did not advertise option_ff_receive and option_ff_concurrent on this connection';
+			return f.params.assetTerms
+				? 'the peer did not advertise the required asset custody capabilities on this connection'
+				: 'the peer did not advertise option_ff_receive and option_ff_concurrent on this connection';
 		}
 		return null;
 	}
@@ -23459,7 +24564,8 @@ export class Channel {
 				entry.direction !== direction ||
 				entry.id !== slot.sHtlcId ||
 				!entry.paymentHash.equals(slot.paymentHash) ||
-				entry.amountMsat !== slot.amountMsat ||
+				entry.amountMsat !== fforVoucherWireAmount(f.params, slot.k - 1) ||
+				!this._fforAssetEntryMatches(f, entry, slot.k) ||
 				entry.cltvExpiry !== slot.voucherExpiry
 			) {
 				return `FFOR voucher ${slot.k} no longer matches the book`;
@@ -23475,7 +24581,7 @@ export class Channel {
 			if (entry.state !== HtlcState.COMMITTED) continue;
 			const key = tuple(
 				slot.paymentHash,
-				slot.amountMsat / 1000n,
+				fforVoucherWireAmount(f.params, slot.k - 1) / 1000n,
 				slot.voucherExpiry
 			);
 			required.set(key, (required.get(key) ?? 0) + 1);
@@ -23540,7 +24646,7 @@ export class Channel {
 						entry.state === HtlcState.FULFILLED &&
 						entry.fforVoucher === true &&
 						entry.direction === HtlcDirection.RECEIVED &&
-						matchVoucher(this._fforBook(f), entry)?.k === k
+						matchVoucher(this._fforWireBook(f), entry)?.k === k
 				)
 			);
 		}
@@ -23713,6 +24819,66 @@ export class Channel {
 	}
 
 	/** The book, rebuilt from the record (section 7.5.3). */
+
+	private _fforAssetTermsRefusal(
+		params: IFforEpochParams,
+		role: FforRole,
+		epochId?: Buffer
+	): string | null {
+		if (!params.assetTerms)
+			return this._state.auxiliaryState
+				? 'asset channel requires signed asset custody terms'
+				: null;
+		if (!this._state.auxiliaryState || this._fforCtx?.assetsNegotiated !== true)
+			return 'asset custody terms require negotiated asset FFOR';
+		try {
+			const validate = requireAuxiliaryProvider(
+				this._state
+			).validateFforAssetTerms;
+			if (!validate) return 'asset provider does not support FFOR custody';
+			validate.call(
+				requireAuxiliaryProvider(this._state),
+				this._state,
+				params.assetTerms
+			);
+			if (
+				role === 'S' &&
+				this._fforCtx.settlePolicy?.acceptAssetTerms?.(
+					Buffer.from(this._state.channelId!),
+					decodeFforAssetTerms(encodeFforAssetTerms(params.assetTerms)),
+					[...params.voucherAmountsMsat],
+					Buffer.from(epochId!)
+				) !== true
+			)
+				return 'asset custody price policy refused terms';
+		} catch (error) {
+			return `invalid asset custody terms: ${(error as Error).message}`;
+		}
+		return null;
+	}
+	private _fforWireBook(f: IFforEpochRecord): IFforBookEntry[] {
+		return this._fforBook(f).map((entry) => ({
+			...entry,
+			amountMsat: fforVoucherWireAmount(f.params, entry.k - 1)
+		}));
+	}
+	private _fforAssetEntryMatches(
+		f: IFforEpochRecord,
+		entry: IHtlcEntry,
+		k: number
+	): boolean {
+		const terms = f.params.assetTerms;
+		if (!terms) return entry.auxiliaryAmount === undefined;
+		return (
+			entry.auxiliaryAmount === terms.amounts[k - 1] &&
+			encodeFforCustomRecords(
+				[...(entry.customRecords ?? new Map())].map(([type, value]) => ({
+					type,
+					value
+				}))
+			).equals(terms.customRecords[k - 1])
+		);
+	}
 	private _fforBook(f: IFforEpochRecord): IFforBookEntry[] {
 		return this._fforBookFrom(f, f.paymentHashes, f.sHtlcIdBase ?? 0n);
 	}
@@ -23779,6 +24945,14 @@ export class Channel {
 		const rCfg = role === 'R' ? local : remote;
 		const sIsLocal = role === 'S';
 		return {
+			...(this._state.auxiliaryState
+				? {
+						sAssetBalance: sIsLocal
+							? this._state.auxiliaryState.localBalance
+							: this._state.auxiliaryState.remoteBalance
+				  }
+				: {}),
+			taproot: isTaprootChannel(this._state.channelType),
 			rMaxAcceptedHtlcs: rCfg.maxAcceptedHtlcs,
 			rMaxHtlcValueInFlightMsat: rCfg.maxHtlcValueInFlightMsat,
 			htlcMinimumMsat: rCfg.htlcMinimumMsat,
@@ -23845,9 +25019,18 @@ export class Channel {
 		if (!isAnchorChannel(this._state.channelType)) {
 			return 'FFOR requires an anchor channel';
 		}
-		if (isTaprootChannel(this._state.channelType)) {
-			return 'FFOR does not support simple-taproot channels';
+		if (
+			isTaprootChannel(this._state.channelType) &&
+			!this._state.auxiliaryState
+		) {
+			return 'FFOR requires signed asset custody terms on simple-taproot channels';
 		}
+		if (
+			this._state.auxiliaryState &&
+			(this._fforCtx?.assetsNegotiated !== true ||
+				!requireAuxiliaryProvider(this._state).validateFforAssetTerms)
+		)
+			return 'asset FFOR capability is not negotiated';
 		if (this._state.htlcs.size > 0 || hasPendingHtlcs(this._state)) {
 			return 'channel must carry no HTLCs and no pending updates';
 		}
@@ -23863,6 +25046,7 @@ export class Channel {
 	 * budget_msat its sum. `epochId` is random unless a test pins it.
 	 */
 	initiateFforEpoch(request: {
+		assetTerms?: IFforAssetTerms;
 		voucherAmountsMsat: bigint[];
 		minPaymentMsat: bigint;
 		settlementDeadline: number;
@@ -23903,6 +25087,18 @@ export class Channel {
 					type: ChannelActionType.ERROR,
 					message:
 						'Cannot start FFOR epoch: unsupported concurrent version or missing concurrent request',
+					cleanup: 'none'
+				}
+			];
+		}
+		if (
+			request.assetTerms &&
+			(!request.concurrent || request.concurrentVersion !== 2)
+		) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: 'Asset custody requires concurrent version 2',
 					cleanup: 'none'
 				}
 			];
@@ -23955,6 +25151,13 @@ export class Channel {
 			escapeGranularityMsat: 0n,
 			rPerCommitmentPoints: [],
 			voucherAmountsMsat: [...request.voucherAmountsMsat],
+			...(request.assetTerms
+				? {
+						assetTerms: decodeFforAssetTerms(
+							encodeFforAssetTerms(request.assetTerms)
+						)
+				  }
+				: {}),
 			...(request.witnessPeers && request.witnessPeers.length > 0
 				? { witnessPeers: request.witnessPeers.map((p) => Buffer.from(p)) }
 				: {}),
@@ -23966,7 +25169,9 @@ export class Channel {
 				  }
 				: {})
 		};
-		const bookError = checkVoucherBook(params, this._fforBookContext('R'));
+		const bookError =
+			this._fforAssetTermsRefusal(params, 'R') ??
+			checkVoucherBook(params, this._fforBookContext('R'));
 		if (bookError) {
 			return [
 				{
@@ -24252,6 +25457,12 @@ export class Channel {
 		// above, and independent hashes), the value is the one we select, and this
 		// peer offers it. Never answered as a baseline epoch instead: the
 		// refusal burns the epoch id, and a baseline attempt is a new epoch.
+		if (msg.assetTerms && msg.concurrentVersion !== 2) {
+			return refuse(
+				FforAbortReason.TERMS_REFUSED,
+				'Asset custody requires concurrent version 2'
+			);
+		}
 		const concurrent = msg.concurrentVersion !== undefined;
 		if (concurrent) {
 			if (ctx.concurrentNegotiated !== true) {
@@ -24291,11 +25502,14 @@ export class Channel {
 			escapeGranularityMsat: msg.escapeGranularityMsat,
 			rPerCommitmentPoints: msg.rPerCommitmentPoints,
 			voucherAmountsMsat: msg.voucherAmountsMsat,
+			...(msg.assetTerms ? { assetTerms: msg.assetTerms } : {}),
 			...(msg.witnessPeers ? { witnessPeers: msg.witnessPeers } : {}),
 			...(msg.hashChain ? { hashChain: true } : {}),
 			...(concurrent ? { concurrentVersion: msg.concurrentVersion } : {})
 		};
-		const bookError = checkVoucherBook(params, this._fforBookContext('S'));
+		const bookError =
+			this._fforAssetTermsRefusal(params, 'S', msg.epochId) ??
+			checkVoucherBook(params, this._fforBookContext('S'));
 		if (bookError) return refuse(FforAbortReason.TERMS_REFUSED, bookError);
 		if (params.settlementDeadline <= this._currentBlockHeight) {
 			return refuse(
@@ -24349,6 +25563,7 @@ export class Channel {
 				paymentHashes: hashes,
 				sHtlcIdBase,
 				voucherAmountsMsat: params.voucherAmountsMsat,
+				...(params.assetTerms ? { assetTerms: params.assetTerms } : {}),
 				initHash: tInit,
 				// The exact signed echo is the only thing that selects the
 				// concurrent profile (docs/specs/CONCURRENT-RECEIVE.md section 1.1).
@@ -24404,10 +25619,17 @@ export class Channel {
 					paymentHash: entry.paymentHash
 				});
 				const addActions = this.addHtlc(
-					entry.amountMsat,
+					fforVoucherWireAmount(f.params, entry.k - 1),
 					entry.paymentHash,
 					entry.voucherExpiry,
-					onion
+					onion,
+					undefined,
+					undefined,
+					f.params.assetTerms
+						? decodeFforAssetRecords(
+								f.params.assetTerms.customRecords[entry.k - 1]
+						  )
+						: undefined
 				);
 				const failed =
 					addActions.some((a) => a.type === ChannelActionType.ERROR) ||
@@ -24521,6 +25743,20 @@ export class Channel {
 			);
 		}
 		const K = f.params.maxPayments;
+		if (
+			!(
+				msg.assetTerms ? encodeFforAssetTerms(msg.assetTerms) : Buffer.alloc(0)
+			).equals(
+				f.params.assetTerms
+					? encodeFforAssetTerms(f.params.assetTerms)
+					: Buffer.alloc(0)
+			)
+		)
+			return this._fforAbortLocal(
+				f,
+				FforAbortReason.TERMS_REFUSED,
+				'ff_accept did not echo exact asset custody terms'
+			);
 		if (
 			msg.voucherAmountsMsat.length !== K ||
 			msg.voucherAmountsMsat.some(
@@ -24665,13 +25901,13 @@ export class Channel {
 		) {
 			return;
 		}
-		const match = matchVoucher(this._fforBook(f), {
+		const match = matchVoucher(this._fforWireBook(f), {
 			id: entry.id,
 			amountMsat: entry.amountMsat,
 			paymentHash: entry.paymentHash,
 			cltvExpiry: entry.cltvExpiry
 		});
-		if (match) {
+		if (match && this._fforAssetEntryMatches(f, entry, match.k)) {
 			entry.fforVoucher = true;
 			if (f.state === FforState.ABORTED) {
 				// BOLT 2 replayed the add after a reconnect: a voucher of an
@@ -24685,7 +25921,7 @@ export class Channel {
 					entry.onionRoutingPacket,
 					nodeKey,
 					f.epochId,
-					match
+					this._fforBook(f)[match.k - 1]
 				);
 				if (bad && f.state === FforState.NEGOTIATING) {
 					f.voucherRoundFailed = true;
@@ -24870,7 +26106,10 @@ export class Channel {
 				return `${view} view HTLC output ${i} is not a book voucher`;
 			}
 			seen.add(entry.k);
-			if (meta.amount !== entry.amountMsat / 1000n) {
+			if (
+				meta.amount !==
+				fforVoucherWireAmount(f.params, entry.k - 1) / 1000n
+			) {
 				return `${view} view voucher ${entry.k} amount ${meta.amount} != floor(d_k / 1000)`;
 			}
 			if (meta.cltvExpiry !== entry.voucherExpiry) {
@@ -25044,6 +26283,8 @@ export class Channel {
 		const bookCtx = this._fforBookContext('S');
 		for (const voucher of this._fforVoucherEntries(f).values()) {
 			bookCtx.sLocalBalanceMsat += voucher.amountMsat;
+			if (bookCtx.sAssetBalance !== undefined)
+				bookCtx.sAssetBalance += voucher.auxiliaryAmount ?? 0n;
 		}
 		const bookError = checkVoucherBook(f.params, bookCtx);
 		if (bookError) {
@@ -25459,7 +26700,7 @@ export class Channel {
 	private _fforRecordVoucherOutcomes(): void {
 		const f = this._state.ffor;
 		if (!f || f.role !== 'R') return;
-		const book = this._fforBook(f);
+		const book = this._fforWireBook(f);
 		for (const entry of this._state.signedLocalRemovals ?? []) {
 			if (
 				entry.direction !== HtlcDirection.RECEIVED ||
@@ -25469,7 +26710,12 @@ export class Channel {
 			)
 				continue;
 			const slot = matchVoucher(book, entry);
-			if (!slot || f.voucherOutcomes?.[slot.k - 1]) continue;
+			if (
+				!slot ||
+				!this._fforAssetEntryMatches(f, entry, slot.k) ||
+				f.voucherOutcomes?.[slot.k - 1]
+			)
+				continue;
 			f.voucherOutcomes ??= f.paymentHashes.map(() => null);
 			f.voucherOutcomes[slot.k - 1] = {
 				outcome:

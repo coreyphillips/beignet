@@ -1,3 +1,7 @@
+import {
+	MAX_AUXILIARY_HTLCS_PER_PARTY,
+	AUXILIARY_CHANNEL_DUST_LIMIT
+} from './auxiliary';
 import type { CustomRecords } from '../message/custom-records';
 import type { IHopPayload } from '../onion/types';
 import type { IInvoiceInfo } from '../storage/types';
@@ -73,7 +77,20 @@ export interface IAuxiliaryForwardPlacement extends IAuxiliaryForwardContext {
 }
 
 export interface IAuxiliaryChannelConfig {
+	resolveInteractiveFunding?(
+		peerPubkey: string,
+		sessionId: Buffer,
+		kind: 'dual' | 'splice'
+	): import('./interactive-funding').INativeInteractiveFundingSetup | undefined;
 	provider: IChannelAuxiliaryProvider;
+	/** Persist an encrypted external asset justice backup before returning. */
+	onRevokedCommitment?(
+		channelId: Buffer,
+		revokedTransaction: Buffer,
+		build: (
+			feeRates?: readonly number[]
+		) => import('../watchtower/auxiliary').IAuxiliaryJusticePackage
+	): void;
 	/** Return the quoted Bitcoin value of the admitted asset amount, or throw. */
 	valueIncomingHtlc?(context: IAuxiliaryIncomingHtlc): bigint;
 	/** Read-only lookup of a peer-bound RFQ alias before Bitcoin forwarding checks. */
@@ -125,15 +142,33 @@ export function applyAuxiliaryFunding(
 	)
 		throw new Error('Invalid asset funding identity');
 	const max = (1n << 64n) - 1n;
+	const locked =
+		state.interactiveFunding?.kind === 'splice'
+			? [...state.htlcs.values()].reduce(
+					(sum, htlc) => sum + (htlc.auxiliaryAmount ?? 0n),
+					0n
+			  )
+			: 0n;
 	if (
 		descriptor.localBalance < 0n ||
 		descriptor.remoteBalance < 0n ||
-		descriptor.localBalance + descriptor.remoteBalance <= 0n ||
-		descriptor.localBalance + descriptor.remoteBalance > max
+		descriptor.localBalance + descriptor.remoteBalance + locked <= 0n ||
+		descriptor.localBalance + descriptor.remoteBalance + locked > max
 	)
 		throw new Error('Invalid asset funding balances');
 	if (descriptor.channelData.length > 64 * 1024 * 1024)
 		throw new Error('Asset funding data exceeds limit');
+	state.localConfig = {
+		...state.localConfig,
+		dustLimitSatoshis:
+			state.localConfig.dustLimitSatoshis > AUXILIARY_CHANNEL_DUST_LIMIT
+				? AUXILIARY_CHANNEL_DUST_LIMIT
+				: state.localConfig.dustLimitSatoshis,
+		maxAcceptedHtlcs: Math.min(
+			state.localConfig.maxAcceptedHtlcs,
+			MAX_AUXILIARY_HTLCS_PER_PARTY
+		)
+	};
 	state.fundingTaprootMerkleRoot = Buffer.from(
 		descriptor.fundingTaprootMerkleRoot
 	);

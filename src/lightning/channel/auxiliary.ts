@@ -12,6 +12,11 @@ import type {
 } from './commitment-builder';
 import type { HtlcDirection, IHtlcEntry } from './types';
 
+/** Pinned Taproot Assets bound keeping commitment signatures within one frame. */
+export const MAX_AUXILIARY_HTLCS_PER_PARTY = 83;
+/** Dust policy preserving the upstream 354-satoshi asset HTLC carrier. */
+export const AUXILIARY_CHANNEL_DUST_LIMIT = 354n;
+
 export interface IAuxiliaryOutput {
 	outputIndex: number;
 	role:
@@ -78,6 +83,8 @@ export interface IChannelAuxiliaryState {
 	localShutdownRecords?: Map<bigint, Buffer>;
 	remoteShutdownRecords?: Map<bigint, Buffer>;
 	closeTransactions?: Map<string, Buffer>;
+	/** Exact authenticated closing_signed accepted before the signed close was saved. */
+	acceptedClosingSigned?: Buffer;
 	/** Signed views retained for force-close and revoked-commitment recovery. */
 	localCommitments: Map<bigint, IAuxiliaryCommitmentData>;
 	remoteCommitments: Map<bigint, IAuxiliaryCommitmentData>;
@@ -158,8 +165,19 @@ export interface IAuxiliaryCloseContext {
 	localOutputIndex?: number;
 	remoteOutputIndex?: number;
 	feeSatoshis: bigint;
+	localAmount: bigint;
+	remoteAmount: bigint;
+	localDustLimit: bigint;
+	remoteDustLimit: bigint;
 }
 export interface IAuxiliaryCloseResult {
+	/** Complete, deterministically ordered payout layout, when assets use separate anchors. */
+	outputs?: readonly {
+		value: bigint;
+		script: Buffer;
+		side: 'local' | 'remote';
+		asset: boolean;
+	}[];
 	outputScripts: Map<number, Buffer>;
 	customData: Buffer;
 }
@@ -174,6 +192,12 @@ export interface IAuxiliaryShutdown {
  * restore; no callback is serialized. Exceptions stop the signing transition.
  */
 export interface IChannelAuxiliaryProvider {
+	/** Authenticate the immutable asset identity and every slot's exact asset records. */
+	validateFforAssetTerms?(
+		state: Readonly<IChannelState>,
+		terms: import('../ffor/assets').IFforAssetTerms
+	): void;
+	buildFunding?: import('./interactive-funding').AuxiliaryFundingBuilder;
 	buildCommitment(
 		context: IAuxiliaryCommitmentContext
 	): IAuxiliaryCommitmentData;
@@ -191,6 +215,10 @@ export interface IChannelAuxiliaryProvider {
 		signer: ISigner
 	): IAuxiliaryShutdown;
 	verifyShutdown(state: IChannelState, shutdown: IAuxiliaryShutdown): boolean;
+	/** Fee-independent output sizes added beyond the ordinary Bitcoin payouts. */
+	extraCloseOutputScriptLengths?(
+		state: Readonly<IChannelState>
+	): readonly number[];
 	buildClose(context: IAuxiliaryCloseContext): IAuxiliaryCloseResult;
 	/** Required before spending any output carrying an auxiliary asset leaf. */
 	prepareSweep?(context: IAuxiliarySweepContext): IAuxiliarySweepResult;

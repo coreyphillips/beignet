@@ -22,6 +22,7 @@ import {
 } from './blinding';
 import { privateMultiply, isValidPublicKey } from '../crypto/ecdh';
 import { encodeTlvStream, decodeTlvStream } from '../message/tlv';
+import { encodeBigSize, decodeBigSize } from '../message/codec';
 
 export interface IBlindedHop {
 	/** The blinded (tweaked) node ID */
@@ -31,6 +32,8 @@ export interface IBlindedHop {
 }
 
 export interface IBlindedPath {
+	/** Compatibility marker for invoices using the historical tag25 payload. */
+	legacyPaymentData?: boolean;
 	/** First node in the blinded portion (public, known to sender) */
 	introductionNodeId: Buffer;
 	/** Initial blinding point (ephemeral public key) */
@@ -292,15 +295,8 @@ export function constructBlindedPath(
 
 // ── Shared wire serialization ───────────────────────────────────────
 //
-// These serializers are the single source of truth for putting blinded
-// paths on the wire. They are reused by BOLT 12 (offer/tlv.ts) and BOLT 11
-// (invoice blinded-paths tagged field) so the byte layout cannot drift
-// between the two surfaces.
-//
-// NOTE: the encrypted_recipient_data blobs themselves use beignet's compact
-// encodeBlindedHopData format (above), NOT the BOLT 4 TLV format, so this is
-// currently a beignet-to-beignet wire — full LND/CLN interop requires swapping
-// encodeBlindedHopData for real BOLT 4 TLVs (tracked as a follow-up).
+// BOLT 12 paths and the LND BOLT 11 extension share BOLT 4 encrypted hop
+// data and payinfo. Their enclosing path framing is encoded separately.
 
 /** Pay parameters advertised for a blinded payment path (BOLT 4 §payinfo). */
 export interface IBlindedPayInfo {
@@ -541,8 +537,97 @@ export function decodeInvoiceBlindedPaymentPaths(
 		const info = decodeBlindedPayInfo(buf, offset);
 		offset = info.offset;
 		entries.push({ path: p.path, payInfo: info.info });
+		p.path.legacyPaymentData = true;
 	}
 	return entries;
+}
+
+/** LND zpay32 repeatable BOLT 11 tag20: payinfo, path key, count, BigSize hop blobs. */
+export function encodeLndInvoiceBlindedPath(
+	entry: IBlindedPaymentPath
+): Buffer {
+	const { path, payInfo } = entry;
+	if (
+		path.introductionNodeId.length !== 33 ||
+		path.blindingPoint.length !== 33 ||
+		!isValidPublicKey(path.introductionNodeId) ||
+		!isValidPublicKey(path.blindingPoint) ||
+		path.blindedHops.length < 1 ||
+		path.blindedHops.length > 7
+	)
+		throw new Error('Invalid BOLT 11 blinded path');
+	const parts = [
+		encodeBlindedPayInfo(payInfo),
+		path.blindingPoint,
+		Buffer.from([path.blindedHops.length])
+	];
+	for (let index = 0; index < path.blindedHops.length; index++) {
+		const hop = path.blindedHops[index];
+		const key = index === 0 ? path.introductionNodeId : hop.blindedNodeId;
+		if (
+			key.length !== 33 ||
+			!isValidPublicKey(key) ||
+			hop.encryptedData.length > 535
+		)
+			throw new Error('Invalid BOLT 11 blinded hop');
+		parts.push(
+			key,
+			encodeBigSize(BigInt(hop.encryptedData.length)),
+			hop.encryptedData
+		);
+	}
+	const result = Buffer.concat(parts);
+	if (result.length > 639)
+		throw new Error('BOLT 11 blinded path exceeds tagged field limit');
+	return result;
+}
+
+/** Decode the exact pinned LND blinded payment-path framing. */
+export function decodeLndInvoiceBlindedPath(
+	bytes: Buffer
+): IBlindedPaymentPath {
+	if (bytes.length > 639) throw new Error('Oversized BOLT 11 blinded path');
+	const decoded = decodeBlindedPayInfo(bytes, 0);
+	let offset = decoded.offset;
+	if (offset + 34 > bytes.length)
+		throw new Error('Truncated BOLT 11 blinded path');
+	const blindingPoint = Buffer.from(bytes.subarray(offset, offset + 33));
+	offset += 33;
+	const count = bytes[offset++];
+	if (!isValidPublicKey(blindingPoint) || count < 1 || count > 7)
+		throw new Error('Invalid BOLT 11 blinded path');
+	const hops: IBlindedHop[] = [];
+	for (let index = 0; index < count; index++) {
+		if (offset + 33 > bytes.length)
+			throw new Error('Truncated BOLT 11 blinded hop');
+		const blindedNodeId = Buffer.from(bytes.subarray(offset, offset + 33));
+		offset += 33;
+		const size = decodeBigSize(bytes, offset);
+		offset += size.bytesRead;
+		if (
+			!isValidPublicKey(blindedNodeId) ||
+			size.value > 535n ||
+			offset + Number(size.value) > bytes.length
+		)
+			throw new Error('Invalid BOLT 11 blinded hop');
+		hops.push({
+			blindedNodeId,
+			encryptedData: Buffer.from(
+				bytes.subarray(offset, offset + Number(size.value))
+			)
+		});
+		offset += Number(size.value);
+	}
+	if (offset !== bytes.length)
+		throw new Error('Trailing BOLT 11 blinded path bytes');
+	return {
+		path: {
+			introductionNodeId: Buffer.from(hops[0].blindedNodeId),
+			blindingPoint,
+			blindedHops: hops
+		},
+		payInfo: decoded.info
+	};
 }
 
 /**

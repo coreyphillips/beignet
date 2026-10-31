@@ -730,6 +730,8 @@ export interface IInvoiceInfo {
 	createdAt: number;
 	/** Hold invoice — matching HTLCs are parked until settle/cancel. */
 	hold?: boolean;
+	/** Explicit durable authorization to disclose the hold preimage, including on chain. */
+	holdSettlementAuthorized?: boolean;
 	/**
 	 * BOLT 12-issued invoice (created for an offer's invoice_request). The
 	 * receive path authenticates these by blinded-path path_id, never by

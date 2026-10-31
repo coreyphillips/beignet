@@ -1867,154 +1867,184 @@ describe('Lightning Node', function () {
 				.digest();
 		}
 
-		it('pays a 3-hop blinded path (Alice → Bob(intro) → Carol(mid) → Dave)', function () {
-			const alice = createNode(1);
-			// The hand-built relay below charges base fee only, and since #721 a
-			// forwarding node refuses a blinded path that understates its policy,
-			// so the forwarding nodes advertise exactly what the path pays.
-			const bob = createNode(2, { forwardingFeePropMillionths: 0 });
-			const carol = createNode(3, { forwardingFeePropMillionths: 0 });
-			const dave = createNode(4);
-			connectNodes(alice, bob);
-			connectNodes(bob, carol);
-			connectNodes(carol, dave);
+		for (const binding of ['correct', 'omitted', 'mismatched'])
+			it(
+				binding === 'correct'
+					? 'pays a 3-hop blinded path (Alice → Bob(intro) → Carol(mid) → Dave)'
+					: `rejects a modern 3-hop blinded payment with ${binding} invoice binding`,
+				function () {
+					const alice = createNode(1);
+					// The hand-built relay below charges base fee only, and since #721 a
+					// forwarding node refuses a blinded path that understates its policy,
+					// so the forwarding nodes advertise exactly what the path pays.
+					const bob = createNode(2, { forwardingFeePropMillionths: 0 });
+					const carol = createNode(3, { forwardingFeePropMillionths: 0 });
+					const dave = createNode(4);
+					connectNodes(alice, bob);
+					connectNodes(bob, carol);
+					connectNodes(carol, dave);
 
-			const abChannelId = openReadyChannel(alice, bob, 2_000_000n);
-			const bcChannelId = openReadyChannel(bob, carol, 2_000_000n);
-			const cdChannelId = openReadyChannel(carol, dave, 2_000_000n);
+					const abChannelId = openReadyChannel(alice, bob, 2_000_000n);
+					const bcChannelId = openReadyChannel(bob, carol, 2_000_000n);
+					const cdChannelId = openReadyChannel(carol, dave, 2_000_000n);
 
-			const scidAB = encodeShortChannelId({
-				block: 900,
-				txIndex: 1,
-				outputIndex: 0
-			});
-			const scidBC = encodeShortChannelId({
-				block: 900,
-				txIndex: 2,
-				outputIndex: 0
-			});
-			const scidCD = encodeShortChannelId({
-				block: 900,
-				txIndex: 3,
-				outputIndex: 0
-			});
-			bob.registerChannelScid(abChannelId, scidAB);
-			bob.registerChannelScid(bcChannelId, scidBC);
-			carol.registerChannelScid(bcChannelId, scidBC);
-			carol.registerChannelScid(cdChannelId, scidCD);
+					const scidAB = encodeShortChannelId({
+						block: 900,
+						txIndex: 1,
+						outputIndex: 0
+					});
+					const scidBC = encodeShortChannelId({
+						block: 900,
+						txIndex: 2,
+						outputIndex: 0
+					});
+					const scidCD = encodeShortChannelId({
+						block: 900,
+						txIndex: 3,
+						outputIndex: 0
+					});
+					bob.registerChannelScid(abChannelId, scidAB);
+					bob.registerChannelScid(bcChannelId, scidBC);
+					carol.registerChannelScid(bcChannelId, scidBC);
+					carol.registerChannelScid(cdChannelId, scidCD);
 
-			const alicePub = getPublicKey(nodePrivkeyFor(1));
-			const bobPub = getPublicKey(nodePrivkeyFor(2));
-			const carolPub = getPublicKey(nodePrivkeyFor(3));
-			const davePub = getPublicKey(nodePrivkeyFor(4));
+					const alicePub = getPublicKey(nodePrivkeyFor(1));
+					const bobPub = getPublicKey(nodePrivkeyFor(2));
+					const carolPub = getPublicKey(nodePrivkeyFor(3));
+					const davePub = getPublicKey(nodePrivkeyFor(4));
 
-			// Alice needs a graph route to Bob (the introduction node).
-			const abIs1 = Buffer.compare(alicePub, bobPub) < 0;
-			alice.getGraph().addChannelAnnouncement({
-				nodeSignature1: Buffer.alloc(64),
-				nodeSignature2: Buffer.alloc(64),
-				bitcoinSignature1: Buffer.alloc(64),
-				bitcoinSignature2: Buffer.alloc(64),
-				features: Buffer.alloc(0),
-				chainHash: REGTEST_CHAIN_HASH,
-				shortChannelId: scidAB,
-				nodeId1: abIs1 ? alicePub : bobPub,
-				nodeId2: abIs1 ? bobPub : alicePub,
-				bitcoinKey1: Buffer.alloc(33, 2),
-				bitcoinKey2: Buffer.alloc(33, 3)
-			});
-			for (const dir of [0, 1]) {
-				alice.getGraph().applyChannelUpdate({
-					signature: Buffer.alloc(64),
-					chainHash: REGTEST_CHAIN_HASH,
-					shortChannelId: scidAB,
-					timestamp: Math.floor(Date.now() / 1000),
-					messageFlags: 1,
-					channelFlags: dir,
-					cltvExpiryDelta: 40,
-					htlcMinimumMsat: 1000n,
-					feeBaseMsat: 1000,
-					feeProportionalMillionths: 1,
-					htlcMaximumMsat: 1_000_000_000n
-				});
-			}
-			alice.registerChannelScid(abChannelId, scidAB);
+					// Alice needs a graph route to Bob (the introduction node).
+					const abIs1 = Buffer.compare(alicePub, bobPub) < 0;
+					alice.getGraph().addChannelAnnouncement({
+						nodeSignature1: Buffer.alloc(64),
+						nodeSignature2: Buffer.alloc(64),
+						bitcoinSignature1: Buffer.alloc(64),
+						bitcoinSignature2: Buffer.alloc(64),
+						features: Buffer.alloc(0),
+						chainHash: REGTEST_CHAIN_HASH,
+						shortChannelId: scidAB,
+						nodeId1: abIs1 ? alicePub : bobPub,
+						nodeId2: abIs1 ? bobPub : alicePub,
+						bitcoinKey1: Buffer.alloc(33, 2),
+						bitcoinKey2: Buffer.alloc(33, 3)
+					});
+					for (const dir of [0, 1]) {
+						alice.getGraph().applyChannelUpdate({
+							signature: Buffer.alloc(64),
+							chainHash: REGTEST_CHAIN_HASH,
+							shortChannelId: scidAB,
+							timestamp: Math.floor(Date.now() / 1000),
+							messageFlags: 1,
+							channelFlags: dir,
+							cltvExpiryDelta: 40,
+							htlcMinimumMsat: 1000n,
+							feeBaseMsat: 1000,
+							feeProportionalMillionths: 1,
+							htlcMaximumMsat: 1_000_000_000n
+						});
+					}
+					alice.registerChannelScid(abChannelId, scidAB);
 
-			// Dave registers the preimage/secret via a normal invoice, then we re-issue
-			// it carrying a hand-built 3-hop blinded path through Bob and Carol.
-			const baseInv = dave.createInvoice({
-				amountMsat: 5_000_000n,
-				description: 'mh'
-			});
-			const decoded = decodeInvoice(baseInv.bolt11);
+					// Dave registers the preimage/secret via a normal invoice, then we re-issue
+					// it carrying a hand-built 3-hop blinded path through Bob and Carol.
+					const baseInv = dave.createInvoice({
+						amountMsat: 5_000_000n,
+						description: 'mh'
+					});
+					const decoded = decodeInvoice(baseInv.bolt11);
 
-			const constraints = { maxCltvExpiry: 10_000_000, htlcMinimumMsat: 0n };
-			// feeProp=0 so per-hop fees distribute exactly across the chain.
-			const relay = {
-				cltvExpiryDelta: 40,
-				feeProportionalMillionths: 0,
-				feeBaseMsat: 1000
-			};
-			const hopData: IBlindedHopData[] = [
-				{
-					nextNodeId: carolPub,
-					shortChannelId: scidBC,
-					paymentRelay: relay,
-					paymentConstraints: constraints
-				},
-				{
-					nextNodeId: davePub,
-					shortChannelId: scidCD,
-					paymentRelay: relay,
-					paymentConstraints: constraints
-				},
-				{ paymentConstraints: constraints }
-			];
-			const path = constructBlindedPath(
-				crypto.randomBytes(32),
-				[bobPub, carolPub, davePub],
-				hopData
+					const constraints = {
+						maxCltvExpiry: 10_000_000,
+						htlcMinimumMsat: 0n
+					};
+					// feeProp=0 so per-hop fees distribute exactly across the chain.
+					const relay = {
+						cltvExpiryDelta: 40,
+						feeProportionalMillionths: 0,
+						feeBaseMsat: 1000
+					};
+					const hopData: IBlindedHopData[] = [
+						{
+							nextNodeId: carolPub,
+							shortChannelId: scidBC,
+							paymentRelay: relay,
+							paymentConstraints: constraints
+						},
+						{
+							nextNodeId: davePub,
+							shortChannelId: scidCD,
+							paymentRelay: relay,
+							paymentConstraints: constraints
+						},
+						// Modern blinded payloads bind the final hop through path_id.
+						{
+							pathId:
+								binding === 'correct'
+									? decoded.paymentSecret
+									: binding === 'mismatched'
+									? Buffer.alloc(32, 7)
+									: undefined,
+							paymentConstraints: constraints
+						}
+					];
+					const path = constructBlindedPath(
+						crypto.randomBytes(32),
+						[bobPub, carolPub, davePub],
+						hopData
+					);
+					const payInfo = {
+						feeBaseMsat: 2000, // sum of the two forwarding hops' base fees
+						feeProportionalMillionths: 0,
+						cltvExpiryDelta: 80, // sum of the two hops' deltas
+						htlcMinimumMsat: 0n,
+						htlcMaximumMsat: 1_000_000_000n
+					};
+
+					const invoiceStr = encodeInvoice({
+						network: Network.REGTEST,
+						amountMsat: 5_000_000n,
+						paymentHash: decoded.paymentHash,
+						paymentSecret: decoded.paymentSecret,
+						description: 'mh-blinded',
+						blindedPaths: [{ path, payInfo }],
+						minFinalCltvExpiry: 40,
+						privateKey: nodePrivkeyFor(4)
+					});
+
+					let bobFwd = false;
+					let carolFwd = false;
+					bob.on('htlc:forward', () => {
+						bobFwd = true;
+					});
+					carol.on('htlc:forward', () => {
+						carolFwd = true;
+					});
+
+					alice.sendPayment(invoiceStr);
+
+					// The HTLC traversed both blinded forwarding hops to the recipient.
+					expect(bobFwd, 'Bob (intro) forwarded').to.be.true;
+					expect(carolFwd, 'Carol (mid) forwarded').to.be.true;
+					if (binding !== 'correct') {
+						expect(dave.getPayment(decoded.paymentHash)!.status).to.equal(
+							PaymentStatus.PENDING
+						);
+						expect(alice.getPayment(decoded.paymentHash)!.status).to.equal(
+							PaymentStatus.FAILED
+						);
+						expect(alice.getPayment(decoded.paymentHash)!.preimage).to.equal(
+							undefined
+						);
+						return;
+					}
+					expect(dave.getPayment(decoded.paymentHash)!.status).to.equal(
+						PaymentStatus.COMPLETED
+					);
+					expect(alice.getPayment(decoded.paymentHash)!.status).to.equal(
+						PaymentStatus.COMPLETED
+					);
+				}
 			);
-			const payInfo = {
-				feeBaseMsat: 2000, // sum of the two forwarding hops' base fees
-				feeProportionalMillionths: 0,
-				cltvExpiryDelta: 80, // sum of the two hops' deltas
-				htlcMinimumMsat: 0n,
-				htlcMaximumMsat: 1_000_000_000n
-			};
-
-			const invoiceStr = encodeInvoice({
-				network: Network.REGTEST,
-				amountMsat: 5_000_000n,
-				paymentHash: decoded.paymentHash,
-				paymentSecret: decoded.paymentSecret,
-				description: 'mh-blinded',
-				blindedPaths: [{ path, payInfo }],
-				minFinalCltvExpiry: 40,
-				privateKey: nodePrivkeyFor(4)
-			});
-
-			let bobFwd = false;
-			let carolFwd = false;
-			bob.on('htlc:forward', () => {
-				bobFwd = true;
-			});
-			carol.on('htlc:forward', () => {
-				carolFwd = true;
-			});
-
-			alice.sendPayment(invoiceStr);
-
-			// The HTLC traversed both blinded forwarding hops to the recipient.
-			expect(bobFwd, 'Bob (intro) forwarded').to.be.true;
-			expect(carolFwd, 'Carol (mid) forwarded').to.be.true;
-			expect(dave.getPayment(decoded.paymentHash)!.status).to.equal(
-				PaymentStatus.COMPLETED
-			);
-			expect(alice.getPayment(decoded.paymentHash)!.status).to.equal(
-				PaymentStatus.COMPLETED
-			);
-		});
 
 		it('pays a GENERATED 3-node blinded path (Dave builds [Bob → Carol → Dave] from his graph)', function () {
 			const alice = createNode(1);

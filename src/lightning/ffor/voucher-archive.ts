@@ -1,6 +1,18 @@
 import { sha256 } from '../crypto/provider';
 import type { IFforEpochRecord } from './types';
 import { IRREVOCABLE_DEPTH } from '../chain/types';
+import {
+	decodeFforAssetTerms,
+	encodeFforAssetTerms,
+	quoteFforAssetAmount
+} from './assets';
+
+export interface IFforVoucherAsset {
+	/** Canonical terms restricted to this slot, including exact custom records. */
+	terms: string;
+	/** Commitment to the full signed epoch terms, retained after channel pruning. */
+	epochTermsHash: string;
+}
 
 /** Observed spend identity. Its presence alone never establishes final value. */
 export interface IFforVoucherChainObservation {
@@ -17,11 +29,14 @@ export interface IFforVoucherChainResolution
 	finalizedHeight: number;
 	/** The original output value, before any claim transaction fees. */
 	amountMsat: string;
+	/** Signed virtual transfer for the exact confirmed Bitcoin spending attempt. */
+	auxiliaryData?: string;
 	/** A local commitment claim also needs its CSV output's final sweep. */
 	secondLevel?: {
 		outputIndex: number;
 		spendingTxid: string;
 		confirmationHeight: number;
+		auxiliaryData?: string;
 	};
 }
 
@@ -33,6 +48,7 @@ export interface IFforVoucherArchive {
 	role: 'R' | 'S';
 	paymentHash: string;
 	amountMsat: string;
+	asset?: IFforVoucherAsset;
 	htlcId: string;
 	voucherExpiry: number;
 	concurrentVersion: number;
@@ -110,6 +126,22 @@ export function validateFforVoucherArchive(
 	) {
 		throw new Error('Invalid FFOR voucher archive preimage');
 	}
+	if (record.asset !== undefined) {
+		if (
+			!record.asset ||
+			!hex(record.asset.epochTermsHash) ||
+			typeof record.asset.terms !== 'string' ||
+			!/^([0-9a-f]{2}){1,48000}$/.test(record.asset.terms)
+		)
+			throw new Error('Invalid FFOR voucher asset archive');
+		const terms = decodeFforAssetTerms(Buffer.from(record.asset.terms, 'hex'));
+		if (
+			terms.amounts.length !== 1 ||
+			quoteFforAssetAmount(terms, terms.amounts[0]) !==
+				BigInt(record.amountMsat)
+		)
+			throw new Error('FFOR voucher asset valuation changed');
+	}
 	if (
 		record.outcome !== undefined &&
 		(!record.outcome ||
@@ -164,6 +196,24 @@ export function validateFforVoucherArchive(
 						IRREVOCABLE_DEPTH))
 		)
 			throw new Error('Invalid FFOR voucher chain resolution');
+		if (record.asset) {
+			const terms = decodeFforAssetTerms(
+				Buffer.from(record.asset.terms, 'hex')
+			);
+			const payload = (s: unknown): boolean =>
+				typeof s === 'string' &&
+				s.length <= 128 * 1024 * 1024 &&
+				/^([0-9a-f]{2})+$/.test(s);
+			if (
+				BigInt(r.amountMsat) !== terms.carrierMsat ||
+				((record.role === 'R' ? !!r.preimage : !r.preimage) &&
+					(!payload(r.auxiliaryData) ||
+						(r.secondLevel && !payload(r.secondLevel.auxiliaryData))))
+			)
+				throw new Error(
+					'FFOR asset receipt lacks exact carrier and recovery evidence'
+				);
+		}
 	}
 	if (
 		record.creditedReceiptId !== undefined &&
@@ -196,7 +246,9 @@ export function mergeFforVoucherArchive(
 			r.amountMsat,
 			r.htlcId,
 			r.voucherExpiry,
-			r.concurrentVersion
+			r.concurrentVersion,
+			r.asset?.terms,
+			r.asset?.epochTermsHash
 		]);
 	if (identity(previous) !== identity(incoming))
 		throw new Error('FFOR voucher archive identity changed');
@@ -264,6 +316,7 @@ export function archiveFforVouchers(
 	return epoch.paymentHashes.map((hash, i) => {
 		const outcome = epoch.voucherOutcomes?.[i];
 		const preimage = epoch.role === 'R' ? epoch.knownPreimages[i] : undefined;
+		const terms = epoch.params.assetTerms;
 		return validateFforVoucherArchive({
 			channelId,
 			epochId: epoch.epochId.toString('hex'),
@@ -271,6 +324,20 @@ export function archiveFforVouchers(
 			role: epoch.role,
 			paymentHash: hash.toString('hex'),
 			amountMsat: epoch.params.voucherAmountsMsat[i].toString(),
+			...(terms
+				? {
+						asset: {
+							terms: encodeFforAssetTerms({
+								...terms,
+								amounts: [terms.amounts[i]],
+								customRecords: [terms.customRecords[i]]
+							}).toString('hex'),
+							epochTermsHash: sha256(encodeFforAssetTerms(terms)).toString(
+								'hex'
+							)
+						}
+				  }
+				: {}),
 			htlcId: (epoch.sHtlcIdBase! + BigInt(i)).toString(),
 			voucherExpiry: epoch.params.voucherExpiry,
 			concurrentVersion: epoch.concurrentVersion ?? 0,

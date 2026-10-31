@@ -18,7 +18,10 @@ import { parseHrp } from './amount';
 import { wordsToBuffer, decodeUintFromWords, decodeTaggedField } from './words';
 import { verifyInvoice } from './signing';
 import type { IBlindedPaymentPath } from '../onion/blinded-path';
-import { decodeInvoiceBlindedPaymentPaths } from '../onion/blinded-path';
+import {
+	decodeInvoiceBlindedPaymentPaths,
+	decodeLndInvoiceBlindedPath
+} from '../onion/blinded-path';
 
 /**
  * BOLT 11 exact data_lengths (in 5-bit words) for the fixed-length tagged
@@ -156,8 +159,13 @@ export function decode(
 				result.metadata = wordsToBuffer(field.dataWords);
 				break;
 			case TagType.BLINDED_PATHS:
-				blindedPaths = decodeInvoiceBlindedPaymentPaths(
-					wordsToBuffer(field.dataWords)
+				(blindedPaths ??= []).push(
+					decodeLndInvoiceBlindedPath(wordsToBuffer(field.dataWords))
+				);
+				break;
+			case TagType.LEGACY_BLINDED_PATHS:
+				(blindedPaths ??= []).push(
+					...decodeInvoiceBlindedPaymentPaths(wordsToBuffer(field.dataWords))
 				);
 				break;
 			default:

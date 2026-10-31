@@ -90,6 +90,8 @@ interface IWatchedFunding {
 	confirmed: boolean;
 	confirmationHeight: number;
 	announcementTriggered: boolean;
+	position?: { txid: string; height: number; txIndex: number };
+	positionLookup?: { txid: string; height: number };
 	/**
 	 * A spend by this txid is NOT a hostile close and must be ignored. Used for
 	 * the pre-splice funding output during an in-flight splice: the splice tx
@@ -249,6 +251,8 @@ interface IWatchedOutput {
 	 * which is what a sibling of the same batched spend consults.
 	 */
 	scanInFlight: boolean;
+	/** Asset broadcast preflight waits for an already-running spend scan. */
+	scanWaiters?: Array<() => void>;
 	rescanRequested: boolean;
 	activeScanInvalidated: boolean;
 	activeScanSequence?: number;
@@ -594,6 +598,7 @@ export async function classifyAnnouncedChannelFunding(
  *   splice itself is unconfirmed, so the splice can never confirm (issue
  *   #760). Once per watched input; again only if the spender changes. A
  *   mempool-only conflict is not reported
+ * - 'funding:position' (channelId: Buffer, displayTxid: string, height: number, txIndex: number)
  * - 'announcement:depth' (channelId: Buffer, height: number, txIndex: number)
  * - 'output:spent' (txid: string, outputIndex: number)
  * - 'output:unspent' (txid: string, outputIndex: number)
@@ -1703,7 +1708,11 @@ export class ChainWatcher extends EventEmitter {
 			return;
 		}
 
-		const state = channel.getFullState();
+		const state =
+			channel.fundingViewForOutpoint?.({
+				txid: displayTxid,
+				outputIndex: fundingOutputIndex
+			}) ?? channel.getFullState();
 		if (!state.remoteBasepoints) {
 			this.emitError(
 				new Error(
@@ -1782,13 +1791,36 @@ export class ChainWatcher extends EventEmitter {
 				this.activeBroadcasts.delete(attempt);
 				return;
 			}
+			if (this.hasConfirmedConflictingSweep(attempt)) {
+				this.queueFailedBroadcast(attempt);
+				this.activeBroadcasts.delete(attempt);
+				return;
+			}
 		}
 
-		this.broadcastTransaction(tx)
-			.catch((err) => {
+		const send =
+			attempt && this.hasRetainedAssetSweep(attempt)
+				? this.refreshAssetOutputSpends(attempt, generation).then(() => {
+						if (!this.isCurrentGeneration(generation)) return;
+						this.retireResolvedAttempt(attempt!);
+						if (attempt!.retired) return;
+						if (this.hasConfirmedConflictingSweep(attempt!)) {
+							this.queueFailedBroadcast(attempt!);
+							return;
+						}
+						return this.broadcastTransaction(tx);
+				  })
+				: this.broadcastTransaction(tx);
+		send
+			.catch(async (err) => {
+				if (attempt) await this.refreshAssetOutputSpends(attempt, generation);
 				if (!this.isCurrentGeneration(generation)) return;
 				if (attempt) this.retireResolvedAttempt(attempt);
 				if (attempt?.retired) return;
+				if (attempt && this.hasConfirmedConflictingSweep(attempt)) {
+					this.queueFailedBroadcast(attempt);
+					return;
+				}
 				const txidHex = attempt?.txidHex;
 				if (txidHex !== undefined && this.isDuplicateRejection(err)) {
 					this.emit('broadcast:success', txidHex);
@@ -1806,6 +1838,144 @@ export class ChainWatcher extends EventEmitter {
 				if (attempt) this.activeBroadcasts.delete(attempt);
 			});
 	};
+
+	private hasRetainedAssetSweep(attempt: IFailedBroadcast): boolean {
+		for (const monitor of this.channelManager.getMonitors?.().values() ?? []) {
+			if (typeof monitor.getFullState !== 'function') continue;
+			if (
+				monitor
+					.getFullState()
+					.trackedOutputs.some(
+						(output) =>
+							output.auxiliarySweepAttempts?.[attempt.txidHex]?.transaction ===
+							attempt.rawTx.toString('hex')
+					)
+			)
+				return true;
+		}
+		return false;
+	}
+
+	/** Reuse live spend verification before submitting a restored asset remedy. */
+	private async refreshAssetOutputSpends(
+		attempt: IFailedBroadcast,
+		generation: number
+	): Promise<void> {
+		if (
+			!this.hasRetainedAssetSweep(attempt) ||
+			!this.isCurrentGeneration(generation)
+		)
+			return;
+		const tx = bitcoin.Transaction.fromBuffer(attempt.rawTx);
+		const inputs = new Set(
+			tx.ins.map(
+				(input) =>
+					`${Buffer.from(input.hash).reverse().toString('hex')}:${input.index}`
+			)
+		);
+		for (const monitor of this.channelManager.getMonitors?.().values() ?? []) {
+			if (typeof monitor.getFullState !== 'function') continue;
+			for (const output of monitor.getFullState().trackedOutputs) {
+				const key = `${output.txid}:${output.outputIndex}`;
+				if (
+					!inputs.has(key) ||
+					output.auxiliarySweepAttempts?.[attempt.txidHex]?.transaction !==
+						attempt.rawTx.toString('hex')
+				)
+					continue;
+				try {
+					if (!this.watchedOutputs.has(key)) {
+						const parent = bitcoin.Transaction.fromBuffer(
+							await this.backend.getTransaction(output.txid)
+						);
+						if (!this.isCurrentGeneration(generation)) return;
+						if (
+							parent.getId() !== output.txid ||
+							!parent.outs[output.outputIndex]
+						)
+							continue;
+						await this.watchOutput(
+							output.txid,
+							output.outputIndex,
+							Buffer.from(parent.outs[output.outputIndex].script),
+							output.resolutionTxid,
+							output.confirmationHeight,
+							generation
+						);
+					}
+					const watched = this.watchedOutputs.get(key);
+					if (watched?.scanInFlight)
+						await new Promise<void>((resolve) => {
+							(watched.scanWaiters ??= []).push(resolve);
+						});
+					else await this.checkOutputSpend(key, generation);
+				} catch {
+					/* An unavailable scan cannot suppress the actual broadcast result. */
+				}
+			}
+		}
+	}
+
+	private queueFailedBroadcast(attempt: IFailedBroadcast): void {
+		if (
+			!this.failedBroadcasts.some(
+				(existing) => existing.txidHex === attempt.txidHex
+			)
+		)
+			this.failedBroadcasts.push(attempt);
+	}
+
+	/** A verified competing confirmation pauses retries until finality or reorg. */
+	private hasConfirmedConflictingSweep(attempt: IFailedBroadcast): boolean {
+		for (const monitor of this.channelManager.getMonitors?.().values() ?? []) {
+			if (typeof monitor.getFullState !== 'function') continue;
+			const state = monitor.getFullState();
+			for (const output of state.trackedOutputs) {
+				if (
+					(output.status !== OutputStatus.SPEND_CONFIRMED &&
+						output.status !== OutputStatus.IRREVOCABLY_RESOLVED) ||
+					output.spendReverifyPending ||
+					!output.resolutionTxid ||
+					output.resolutionTxid === attempt.txidHex ||
+					output.confirmationHeight <= 0 ||
+					output.confirmationHeight > state.currentBlockHeight
+				)
+					continue;
+				const candidate = output.auxiliarySweepAttempts?.[attempt.txidHex];
+				const winner =
+					output.auxiliarySweepAttempts?.[output.resolutionTxid]?.transaction ??
+					output.resolutionTxHex;
+				if (
+					!candidate ||
+					!winner ||
+					candidate.transaction !== attempt.rawTx.toString('hex')
+				)
+					continue;
+				try {
+					const spends = (raw: string, expectedId: string): boolean => {
+						const tx = bitcoin.Transaction.fromHex(raw);
+						return (
+							tx.getId() === expectedId &&
+							tx.ins.some(
+								(input) =>
+									input.index === output.outputIndex &&
+									Buffer.from(input.hash).reverse().toString('hex') ===
+										output.txid
+							)
+						);
+					};
+					if (
+						spends(candidate.transaction, attempt.txidHex) &&
+						spends(winner, output.resolutionTxid)
+					)
+						return true;
+				} catch {
+					/* Invalid evidence cannot suppress a genuine failure. */
+				}
+			}
+		}
+		return false;
+	}
 
 	/** Retire exact obsolete attempts only after the monitor has verified finality. */
 	private onOutputResolved = (
@@ -1829,7 +1999,8 @@ export class ChainWatcher extends EventEmitter {
 		)
 			return;
 		const archive = output.auxiliarySweepAttempts;
-		const winner = archive?.[output.resolutionTxid];
+		const winner =
+			archive?.[output.resolutionTxid]?.transaction ?? output.resolutionTxHex;
 		if (!archive || !winner) return;
 		const matches = (rawHex: string, expectedId: string): boolean => {
 			try {
@@ -1846,7 +2017,7 @@ export class ChainWatcher extends EventEmitter {
 				return false;
 			}
 		};
-		if (!matches(winner.transaction, output.resolutionTxid)) return;
+		if (!matches(winner, output.resolutionTxid)) return;
 		for (const attempt of new Set([
 			...this.failedBroadcasts,
 			...this.activeBroadcasts
@@ -1945,6 +2116,10 @@ export class ChainWatcher extends EventEmitter {
 			for (const fb of pendingBroadcasts) {
 				this.retireResolvedAttempt(fb);
 				if (fb.retired) continue;
+				if (this.hasConfirmedConflictingSweep(fb)) {
+					this.queueFailedBroadcast(fb);
+					continue;
+				}
 				fb.retryCount++;
 				if (fb.retryCount > MAX_BROADCAST_RETRIES) {
 					// The txid as a second argument (issue #1062): the node
@@ -1967,6 +2142,11 @@ export class ChainWatcher extends EventEmitter {
 						if (!this.isCurrentGeneration(generation)) return;
 						this.retireResolvedAttempt(fb);
 						if (fb.retired) return;
+						if (this.hasConfirmedConflictingSweep(fb)) {
+							fb.retryCount = Math.max(0, fb.retryCount - 1);
+							this.queueFailedBroadcast(fb);
+							return;
+						}
 						// Mined or in the mempool by now: done, as on a success.
 						if (this.isDuplicateRejection(err)) {
 							this.emit('broadcast:success', fb.txidHex);
@@ -1994,6 +2174,12 @@ export class ChainWatcher extends EventEmitter {
 				});
 				continue;
 			}
+			if (watched.seenTxid && watched.seenHeight)
+				void this.reportFundingPosition(
+					watched,
+					watched.seenTxid,
+					watched.seenHeight
+				);
 			if (!watched.announcementTriggered && watched.confirmationHeight > 0) {
 				// Check if 6 confirmations reached for channel announcement
 				const depth = height - watched.confirmationHeight + 1;
@@ -2154,10 +2340,73 @@ export class ChainWatcher extends EventEmitter {
 		txid: string,
 		height: number
 	): void {
-		if (watched.seenTxid === txid && watched.seenHeight === height) return;
+		const changed = watched.seenTxid !== txid || watched.seenHeight !== height;
 		watched.seenTxid = txid;
 		watched.seenHeight = height;
-		this.emit('funding:seen', watched.channelId, txid, height);
+		void this.reportFundingPosition(watched, txid, height);
+		if (changed) this.emit('funding:seen', watched.channelId, txid, height);
+	}
+
+	/** Verified position is usable for private routing before public announcement depth. */
+	private async reportFundingPosition(
+		watched: IWatchedFunding,
+		txid: string,
+		height: number
+	): Promise<void> {
+		// Early positions serve known private channels. Public or unattached
+		// watches keep the existing six-confirmation lookup and retry schedule.
+		const privateChannel = this.channelManager
+			.listChannels()
+			.some((channel) => {
+				const state = channel.getFullState();
+				return (
+					state.channelId?.equals(watched.channelId) && !state.announceChannel
+				);
+			});
+		if (
+			!this.started ||
+			!privateChannel ||
+			!this.backend.getTransactionMerkleProof ||
+			height <= 0 ||
+			(watched.position?.txid === txid && watched.position.height === height) ||
+			(watched.positionLookup?.txid === txid &&
+				watched.positionLookup.height === height)
+		)
+			return;
+		const generation = this.lifecycleGeneration;
+		const lookup = { txid, height };
+		watched.positionLookup = lookup;
+		const current = (): boolean =>
+			this.isCurrentGeneration(generation) &&
+			[...this.watchedFundings.values()].some((entry) => entry === watched) &&
+			watched.positionLookup === lookup &&
+			watched.seenTxid === txid &&
+			watched.seenHeight === height;
+		try {
+			const result = await this.backend.getTransactionMerkleProof(txid, height);
+			if (!current()) return;
+			if (
+				result.blockHeight !== height ||
+				!Number.isSafeInteger(result.txIndex) ||
+				result.txIndex < 0 ||
+				result.txIndex > 0xffffff ||
+				!Number.isSafeInteger(height) ||
+				height > 0xffffff
+			)
+				throw new Error('Invalid funding transaction position');
+			watched.position = { ...lookup, txIndex: result.txIndex };
+			this.emit(
+				'funding:position',
+				watched.channelId,
+				txid,
+				height,
+				result.txIndex
+			);
+		} catch (error) {
+			if (current()) this.emitError(error);
+		} finally {
+			if (watched.positionLookup === lookup) delete watched.positionLookup;
+		}
 	}
 
 	/**
@@ -2170,6 +2419,8 @@ export class ChainWatcher extends EventEmitter {
 		const txid = watched.seenTxid ?? watched.txid;
 		watched.seenTxid = undefined;
 		watched.seenHeight = undefined;
+		delete watched.position;
+		delete watched.positionLookup;
 		this.releaseSpliceConflictLatch(watched.channelId, txid);
 		this.emit('funding:unseen', watched.channelId, txid);
 	}
@@ -2971,6 +3222,14 @@ export class ChainWatcher extends EventEmitter {
 					return channel;
 				}
 			}
+			if (
+				state.fundingEpochs?.has(
+					`${Buffer.from(txidHex, 'hex')
+						.reverse()
+						.toString('hex')}:${outputIndex}`
+				)
+			)
+				return channel;
 			// Match a pending splice outpoint (during AWAITING_SPLICE_LOCKED, before
 			// completeSplice swaps it into fundingTxid).
 			if (state.spliceFundingTxid) {
@@ -3032,6 +3291,7 @@ export class ChainWatcher extends EventEmitter {
 			throw err;
 		} finally {
 			watched.scanInFlight = false;
+			for (const resolve of watched.scanWaiters?.splice(0) ?? []) resolve();
 			delete watched.activeScanSequence;
 			if (retryAfterFailure) {
 				this.checkOutputSpend(key, generation).catch((err) => {

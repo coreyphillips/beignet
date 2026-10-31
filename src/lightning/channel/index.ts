@@ -15,3 +15,7 @@ export * from './dual-funding';
 export * from './auxiliary';
 
 export * from './auxiliary-funding';
+
+export * from './funding-state';
+
+export * from './interactive-funding';

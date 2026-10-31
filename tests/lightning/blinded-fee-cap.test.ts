@@ -286,7 +286,7 @@ function buildHostileWorld(): IWorld & {
 			paymentRelay: HOSTILE_RELAY,
 			paymentConstraints: CONSTRAINTS
 		},
-		{ paymentConstraints: CONSTRAINTS }
+		{ pathId: decoded.paymentSecret, paymentConstraints: CONSTRAINTS }
 	];
 	const path = constructBlindedPath(
 		crypto.randomBytes(32),

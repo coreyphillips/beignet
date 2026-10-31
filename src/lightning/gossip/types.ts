@@ -248,6 +248,8 @@ export interface IGraphNode {
 }
 
 export interface IRouteHop {
+	/** Existing tag25 invoices authenticate with the historical payment_data payload. */
+	legacyBlindedPaymentData?: boolean;
 	pubkey: Buffer;
 	shortChannelId: Buffer;
 	amountToForwardMsat: bigint;

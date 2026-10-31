@@ -11,6 +11,7 @@
  */
 
 /** Section 14 message types used by Variant D. */
+import type { IFforAssetTerms } from './assets';
 export const FF_INIT_TYPE = 55001;
 export const FF_ACCEPT_TYPE = 55003;
 export const FF_INVOICES_TYPE = 55005;
@@ -124,6 +125,8 @@ export const FF_BLINDED_HOPS_N = 8;
  * codec is complete.
  */
 export interface IFforEpochParams {
+	/** TLV 19: fixed asset units and their signed exchange quote. */
+	assetTerms?: IFforAssetTerms;
 	variant: FforVariant;
 	budgetMsat: bigint;
 	maxPayments: number;
@@ -336,6 +339,13 @@ export interface IFforEpochRecord {
  * more than Channel.MAX_HTLC_CLTV_EXPIRY_DELTA blocks away.
  */
 export interface IFforSettlePolicy {
+	/** Asset quotes require an explicit local price policy before custody is locked. */
+	acceptAssetTerms?: (
+		channelId: Buffer,
+		terms: Readonly<IFforAssetTerms>,
+		quotedValuesMsat: readonly bigint[],
+		epochId: Buffer
+	) => boolean;
 	enabled: boolean;
 	/** Refuse a book whose budget exceeds this. */
 	maxBudgetMsat?: bigint;
@@ -358,6 +368,8 @@ export interface IFforSettlePolicy {
 
 /** What the channel needs from its host to run an epoch. */
 export interface IFforChannelContext {
+	/** Both peers advertised option_ff_asset, as well as baseline FFOR. */
+	assetsNegotiated?: boolean;
 	/** S's terms for answering ff_init; absent answers on any terms. */
 	settlePolicy?: IFforSettlePolicy;
 	/** The peer's node id; every signed FFOR message verifies against it. */
@@ -394,6 +406,8 @@ export interface IFforInitMessage extends IFforEpochParams {
 
 /** Wire-level ff_accept (section 7.2). */
 export interface IFforAcceptMessage {
+	/** Exact signed echo of ff_init TLV 19. */
+	assetTerms?: IFforAssetTerms;
 	channelId: Buffer;
 	epochId: Buffer;
 	sCommitmentNumber: bigint;

@@ -18,6 +18,9 @@
 
 import { expect } from 'chai';
 import crypto from 'crypto';
+import * as fs from 'fs';
+import * as os from 'os';
+import * as path from 'path';
 import { LightningNode } from '../../src/lightning/node/lightning-node';
 import { IStorageBackend } from '../../src/lightning/storage/types';
 import { MemoryStorage } from '../../src/lightning/storage/memory-storage';
@@ -1615,4 +1618,167 @@ describe('Crash-Safe State Persistence', function () {
 			bob.destroy();
 		});
 	});
+});
+
+// Real stores exercise promotion and repair with the same recovery journal as opens.
+describe('Channel opening row promotion', function () {
+	for (const backend of ['memory', 'sqlite'] as const) {
+		const fixture = (): {
+			dir: string;
+			store: MemoryStorage | SqliteStorage;
+			alice: LightningNode;
+			bob: LightningNode;
+			temporary: Buffer;
+			opening: NonNullable<ReturnType<IStorageBackend['loadChannel']>>;
+			id: Buffer;
+			cleanup(): void;
+		} => {
+			const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'opening-promotion-'));
+			const store =
+				backend === 'memory'
+					? new MemoryStorage()
+					: new SqliteStorage(path.join(dir, 'channels.db'));
+			store.open();
+			const alice = createTestNodeWithId(1);
+			const bob = createTestNodeWithId(2, store);
+			connectNodes(alice, bob);
+			const channel = alice.openChannel(bob.getNodeId(), 1_000_000n);
+			const temporary = channel.getTemporaryChannelId();
+			expect(bob['persistChannel'](temporary)?.committed).to.equal(true);
+			const opening = store.loadChannel(temporary.toString('hex'))!;
+			expect(opening).to.not.equal(null);
+			const id = alice.createFunding(
+				channel,
+				crypto.randomBytes(32),
+				0,
+				crypto.randomBytes(64)
+			)!;
+			alice.handleFundingConfirmed(id);
+			bob.handleFundingConfirmed(id);
+			return {
+				dir,
+				store,
+				alice,
+				bob,
+				temporary,
+				opening,
+				id,
+				cleanup: (): void => {
+					store.close();
+					fs.rmSync(dir, { recursive: true, force: true });
+				}
+			};
+		};
+
+		it(`${backend}: removes the temporary row and migrates a legacy duplicate on restart`, function () {
+			const { dir, store, alice, bob, temporary, opening, id, cleanup } =
+				fixture();
+			try {
+				expect(
+					store.loadAllChannels().map((row) => row.channelId)
+				).to.deep.equal([id.toString('hex')]);
+				store.saveChannel(
+					temporary.toString('hex'),
+					opening.state,
+					opening.peerPubkey
+				);
+				store.saveOutboxMessage({
+					peerId: opening.peerPubkey,
+					channelId: temporary.toString('hex'),
+					messageType: 33,
+					wireMessage: Buffer.alloc(32),
+					disposition: 'sent_unacked'
+				});
+				bob.destroy();
+				const reopened =
+					backend === 'memory'
+						? store
+						: new SqliteStorage(path.join(dir, 'channels.db'));
+				reopened.open();
+				const restored = createTestNodeWithId(2, reopened);
+				try {
+					expect(reopened.loadChannel(temporary.toString('hex'))).to.equal(
+						null
+					);
+					expect(
+						reopened.loadOutboxMessages(temporary.toString('hex'))
+					).to.have.length(0);
+					expect(restored.getChannelManager().listChannels()).to.have.length(1);
+					expect(reopened.loadChannel(id.toString('hex'))).to.not.equal(null);
+				} finally {
+					restored.destroy();
+				}
+			} finally {
+				alice.destroy();
+				bob.destroy();
+				cleanup();
+			}
+		});
+
+		it(`${backend}: rolls back canonical state when temporary-row removal fails`, function () {
+			const { store, alice, bob, temporary, opening, id, cleanup } = fixture();
+			try {
+				const temporaryHex = temporary.toString('hex');
+				store.saveChannel(temporaryHex, opening.state, opening.peerPubkey);
+				store.deleteChannel(id.toString('hex'));
+				const remove = store.deleteChannel.bind(store);
+				store.deleteChannel = (key: string): void => {
+					if (key === temporaryHex) throw new Error('promotion disk failure');
+					remove(key);
+				};
+				const result = bob['persistChannel'](id);
+				expect(result?.committed).to.equal(false);
+				expect(store.loadChannel(id.toString('hex'))).to.equal(null);
+				expect(store.loadChannel(temporaryHex)).to.not.equal(null);
+				store.deleteChannel = remove;
+				expect(bob['persistChannel'](id)?.committed).to.equal(true);
+				expect(store.loadChannel(id.toString('hex'))).to.not.equal(null);
+				expect(store.loadChannel(temporaryHex)).to.equal(null);
+			} finally {
+				alice.destroy();
+				bob.destroy();
+				cleanup();
+			}
+		});
+
+		it(`${backend}: preserves ambiguous funded aliases instead of discarding commitment evidence`, function () {
+			const { store, alice, bob, temporary, id, cleanup } = fixture();
+			try {
+				const current = store.loadChannel(id.toString('hex'))!;
+				store.saveChannel(
+					temporary.toString('hex'),
+					current.state,
+					current.peerPubkey
+				);
+				expect(() =>
+					bob['restoreFromStorage'](store.loadAllChannels())
+				).to.throw('Conflicting funded channel rows');
+				expect(store.loadChannel(temporary.toString('hex'))).to.not.equal(null);
+				expect(store.loadChannel(id.toString('hex'))).to.not.equal(null);
+			} finally {
+				alice.destroy();
+				bob.destroy();
+				cleanup();
+			}
+		});
+
+		it(`${backend}: retains a different opening that reuses a temporary id`, function () {
+			const { store, alice, bob, temporary, opening, id, cleanup } = fixture();
+			try {
+				opening.state.localPerCommitmentSeed = makeSeed(91);
+				store.saveChannel(
+					temporary.toString('hex'),
+					opening.state,
+					opening.peerPubkey
+				);
+				expect(bob['persistChannel'](id)?.committed).to.equal(true);
+				expect(store.loadChannel(temporary.toString('hex'))).to.not.equal(null);
+				expect(store.loadChannel(id.toString('hex'))).to.not.equal(null);
+			} finally {
+				alice.destroy();
+				bob.destroy();
+				cleanup();
+			}
+		});
+	}
 });

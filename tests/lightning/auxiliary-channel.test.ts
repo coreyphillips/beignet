@@ -1,4 +1,8 @@
 import {
+	applyAuxiliaryClose,
+	auxiliaryClosingRelayProfile
+} from '../../src/lightning/channel/auxiliary-close';
+import {
 	encodeInitMessage,
 	decodeInitMessage
 } from '../../src/lightning/message/init';
@@ -54,7 +58,8 @@ import {
 } from '../../src/lightning/message/channel-commitment';
 import {
 	encodeShutdownMessage,
-	decodeShutdownMessage
+	decodeShutdownMessage,
+	decodeClosingSignedMessage
 } from '../../src/lightning/message/channel-close';
 import { COMMIT_ALL } from './helpers/channel-persistence';
 import {
@@ -176,6 +181,66 @@ function provider(): IChannelAuxiliaryProvider {
 				customData: Buffer.from('signed close assets')
 			};
 		}
+	};
+}
+
+function useSeparateCloseAnchors(p: IChannelAuxiliaryProvider): void {
+	p.extraCloseOutputScriptLengths = (state) =>
+		[state.auxiliaryState!.localBalance, state.auxiliaryState!.remoteBalance]
+			.filter((amount) => amount > 0n)
+			.map(() => 34);
+	p.buildClose = (context) => {
+		const outputs: NonNullable<
+			ReturnType<IChannelAuxiliaryProvider['buildClose']>['outputs']
+		>[number][] = [];
+		for (const [side, amount, balance, dust, records, script] of [
+			[
+				'local',
+				context.localAmount,
+				context.state.auxiliaryState!.localBalance,
+				context.localDustLimit,
+				context.state.auxiliaryState!.localShutdownRecords!,
+				context.state.localShutdownScript!
+			],
+			[
+				'remote',
+				context.remoteAmount,
+				context.state.auxiliaryState!.remoteBalance,
+				context.remoteDustLimit,
+				context.state.auxiliaryState!.remoteShutdownRecords!,
+				context.state.remoteShutdownScript!
+			]
+		] as const) {
+			if (balance > 0n) {
+				const remainder = amount - 330n;
+				outputs.push({
+					side,
+					asset: true,
+					value: remainder > dust ? 330n : amount,
+					script: bitcoin.payments.p2tr({
+						internalPubkey: records.get(65539n)!.subarray(1),
+						scriptTree: { output: leafFor(`close:${balance}`).script }
+					}).output!
+				});
+				if (remainder > dust)
+					outputs.push({ side, asset: false, value: remainder, script });
+			} else if (amount > dust)
+				outputs.push({ side, asset: false, value: amount, script });
+		}
+		outputs.sort((a, b) =>
+			a.value === b.value
+				? Buffer.compare(a.script, b.script)
+				: a.value < b.value
+				? -1
+				: 1
+		);
+		return {
+			outputs,
+			outputScripts: new Map(
+				outputs.map((output, index) => [index, output.script])
+			),
+			customData: Buffer.from('split close assets')
+		};
 	};
 }
 
@@ -684,6 +749,20 @@ describe('native auxiliary asset channel host', function () {
 		).to.deep.equal([2026]);
 	});
 
+	it('negotiates the upstream auxiliary HTLC signature frame limit', function () {
+		const { aliceChannel, bobChannel } = pair();
+		for (const channel of [aliceChannel, bobChannel]) {
+			expect(channel.getFullState().localConfig.dustLimitSatoshis).to.equal(
+				354n
+			);
+			expect(channel.getFullState().localConfig.maxAcceptedHtlcs).to.equal(83);
+			expect(channel.getFullState().remoteConfig!.maxAcceptedHtlcs).to.equal(
+				83
+			);
+		}
+		expect(DEFAULT_CHANNEL_CONFIG.maxAcceptedHtlcs).to.equal(483);
+	});
+
 	it('persists asset HTLCs, settles them in both views, restores and force closes', function () {
 		const { alice, bob, aliceChannel, bobChannel, id, errors, aliceProvider } =
 			pair();
@@ -800,6 +879,110 @@ describe('native auxiliary asset channel host', function () {
 		expect(
 			bobChannel.getFullState().auxiliaryState!.localCommitments.has(1n)
 		).to.equal(false);
+	});
+
+	it('signs separate asset anchors and Bitcoin payouts with the complete close weight', function () {
+		const {
+			alice,
+			aliceChannel,
+			bobChannel,
+			aliceProvider,
+			bobProvider,
+			id,
+			errors
+		} = pair();
+		useSeparateCloseAnchors(aliceProvider);
+		useSeparateCloseAnchors(bobProvider);
+		alice.initiateShutdown(id, Buffer.from('0014' + '11'.repeat(20), 'hex'));
+		expect(errors, errors.join('; ')).to.deep.equal([]);
+		const state = aliceChannel.getFullState();
+		const tx = bitcoin.Transaction.fromHex(state.lastCooperativeCloseTxHex!);
+		expect(tx.outs.length).to.equal(4);
+		expect(tx.outs.filter((output) => output.value === 330).length).to.equal(2);
+		expect(tx.weight()).to.equal(960);
+		expect(
+			state.fundingSatoshis -
+				tx.outs.reduce((sum, output) => sum + BigInt(output.value), 0n)
+		).to.equal(243n);
+		verifySpend(tx, aliceChannel);
+		for (const channel of [aliceChannel, bobChannel])
+			expect(
+				deserializeChannelState(serializeChannelState(channel.getFullState()))
+					.auxiliaryState!.closeTransactions!.get(tx.getId())!
+					.toString()
+			).to.equal('split close assets');
+	});
+
+	it('ignores only the exact accepted asset closing signature after restart', function () {
+		const { alice, aliceChannel, aliceProvider, id, messages, errors } = pair();
+		alice.initiateShutdown(id, Buffer.from('0014' + '11'.repeat(20), 'hex'));
+		expect(errors).to.deep.equal([]);
+		const wire = messages.find(
+			(message) =>
+				message.side === 'bob' && message.type === MessageType.CLOSING_SIGNED
+		)!;
+		const message = decodeClosingSignedMessage(wire.payload);
+		const restored = new Channel(
+			deserializeChannelState(
+				JSON.parse(
+					JSON.stringify(serializeChannelState(aliceChannel.getFullState()))
+				)
+			),
+			aliceChannel.getSigner()!,
+			aliceProvider
+		);
+		const neverSign = (): Buffer => {
+			throw new Error('A closed channel must not sign again');
+		};
+		expect(restored.handleClosingSigned(message, neverSign)).to.deep.equal([]);
+		const altered = { ...message, feeSatoshis: message.feeSatoshis + 1n };
+		expect(restored.handleClosingSigned(altered, neverSign)[0].type).to.equal(
+			ChannelActionType.ERROR
+		);
+		const invalid = { ...message, partialSignature: Buffer.alloc(32) };
+		expect(restored.handleClosingSigned(invalid, neverSign)[0].type).to.equal(
+			ChannelActionType.ERROR
+		);
+	});
+
+	it('restores a dust-trimmed asset party and rejects a payout that loses its value', function () {
+		const { aliceChannel, aliceProvider } = pair();
+		useSeparateCloseAnchors(aliceProvider);
+		const state = aliceChannel['_state'];
+		const shutdown = aliceProvider.prepareShutdown(
+			state,
+			Buffer.alloc(0),
+			aliceChannel['_signer']!
+		);
+		state.localShutdownScript = shutdown.scriptPubkey;
+		state.remoteShutdownScript = shutdown.scriptPubkey;
+		state.auxiliaryState!.localShutdownRecords = new Map(
+			shutdown.customRecords
+		);
+		state.auxiliaryState!.remoteShutdownRecords = new Map(
+			shutdown.customRecords
+		);
+		state.localBalanceMsat = 353000n;
+		state.remoteBalanceMsat =
+			state.fundingSatoshis * 1000n - state.localBalanceMsat;
+		const tx = new bitcoin.Transaction();
+		tx.addInput(Buffer.alloc(32), 0);
+		applyAuxiliaryClose(state, tx, 0n);
+		expect(tx.outs.map((output) => output.value)).to.include(353);
+		expect(auxiliaryClosingRelayProfile(state, 0n)).to.deep.equal({
+			weight: 788,
+			feePaid: 0n
+		});
+		const build = aliceProvider.buildClose;
+		aliceProvider.buildClose = (context) => {
+			const result = build(context);
+			const outputs = result.outputs!.map((output) => ({ ...output }));
+			outputs.find((output) => output.side === 'local')!.value--;
+			return { ...result, outputs };
+		};
+		expect(() => applyAuxiliaryClose(state, tx, 0n)).to.throw(
+			'Asset close payout would lose funds'
+		);
 	});
 
 	it('cooperatively closes with both rooted asset outputs and durable close payload', function () {

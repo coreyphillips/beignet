@@ -1,3 +1,16 @@
+import { serializeHtlcEntry, deserializeHtlcEntry } from './htlc-serialization';
+import type { ISerializedHtlcEntry } from './htlc-serialization';
+export { serializeHtlcEntry, deserializeHtlcEntry } from './htlc-serialization';
+export type { ISerializedHtlcEntry } from './htlc-serialization';
+import {
+	serializeInteractiveFundingPlan,
+	deserializeInteractiveFundingPlan
+} from '../channel/interactive-funding';
+import {
+	serializeFundingEpoch,
+	deserializeFundingEpoch
+} from '../channel/funding-state';
+import type { ITaprootFundingRound } from '../channel/funding-musig';
 import {
 	serializeAuxiliaryState,
 	deserializeAuxiliaryState,
@@ -30,7 +43,12 @@ import type {
 	IFforEpochRecord
 } from '../ffor/types';
 import { isFforConcurrentVersion } from '../ffor/types';
-import { fforTranscriptConcurrentVersion } from '../ffor/messages';
+import {
+	fforTranscriptConcurrentVersion,
+	decodeFforInitMessage,
+	decodeFforAcceptMessage
+} from '../ffor/messages';
+import { encodeFforAssetTerms, decodeFforAssetTerms } from '../ffor/assets';
 import { validateFforSyncState } from '../ffor/sync-state';
 import type { IShaChainEntry } from '../keys/shachain';
 import { ShaChainStore } from '../keys/shachain';
@@ -41,8 +59,7 @@ import type {
 	IChannelConfig,
 	IHtlcEntry,
 	IHtlcSnapshotEntry,
-	HtlcDirection,
-	HtlcState
+	HtlcDirection
 } from '../channel/types';
 import { DEFAULT_CHANNEL_CONFIG } from '../channel/types';
 import type {
@@ -158,48 +175,6 @@ export function deserializeBasepoints(
 
 // ─── IHtlcEntry ───
 
-export interface ISerializedHtlcEntry {
-	customRecords?: SerializedCustomRecords;
-	auxiliaryAmount?: string;
-	key: string;
-	id: string;
-	amountMsat: string;
-	paymentHash: string;
-	cltvExpiry: number;
-	onionRoutingPacket: string;
-	direction: string;
-	state: string;
-	/** Route blinding: blinding_point (hex) so an in-flight blinded receive
-	 * survives restart and can still peel its onion with the blinded key. */
-	blindingPoint?: string;
-	/** Two-phase update flags (see IHtlcEntry). Optional for compatibility. */
-	addRemoteCommitted?: boolean;
-	removalRemoteCommitted?: boolean;
-	commitCoverPending?: boolean;
-	addLocallyRevoked?: boolean;
-	removalLocallyRevoked?: boolean;
-	addRemotelyRevoked?: boolean;
-	addCoverPending?: boolean;
-	/** FFOR Variant D voucher marker (see IHtlcEntry.fforVoucher). */
-	fforVoucher?: boolean;
-	/** FFOR Variant D mismatching-add marker (see IHtlcEntry.fforMismatch). */
-	fforMismatch?: boolean;
-	/** Whether the stored remote signature covers this add (see IHtlcEntry). */
-	addRemoteSigned?: boolean;
-	/** Edge-trigger marker for HTLC_FORWARDED dispatch (see IHtlcEntry). */
-	forwardEmitted?: boolean;
-	/** Admission-time dust-exposure classification (see IHtlcEntry). */
-	dustExposureFailback?: boolean;
-	/** Admission-time expired-at-our-tip classification (see IHtlcEntry). */
-	expiredOnArrival?: boolean;
-	/** Admission-time funder-fee band classification (see IHtlcEntry). */
-	funderFeeFailback?: boolean;
-	/** Admitted while the capsule-restore hold stood (see IHtlcEntry). */
-	addedWhileRestoreUnproven?: boolean;
-	/** Admitted while the funding-missing quarantine stood (see IHtlcEntry). */
-	addedWhileFundingUnaccounted?: boolean;
-}
-
 export interface ISerializedHtlcSnapshot {
 	commitmentNumber: string;
 	htlcs: Array<{
@@ -249,139 +224,6 @@ export function deserializeHtlcSnapshotEntries(
 	}));
 }
 
-export function serializeHtlcEntry(
-	key: string,
-	e: IHtlcEntry
-): ISerializedHtlcEntry {
-	return {
-		key,
-		customRecords: serializeCustomRecords(e.customRecords),
-		auxiliaryAmount: e.auxiliaryAmount?.toString(),
-		id: bigintToStr(e.id),
-		amountMsat: bigintToStr(e.amountMsat),
-		paymentHash: e.paymentHash.toString('hex'),
-		cltvExpiry: e.cltvExpiry,
-		onionRoutingPacket: e.onionRoutingPacket.toString('hex'),
-		direction: e.direction,
-		state: e.state,
-		...(e.fforVoucher === true ? { fforVoucher: true } : {}),
-		...(e.fforMismatch === true ? { fforMismatch: true } : {}),
-		...(e.blindingPoint
-			? { blindingPoint: e.blindingPoint.toString('hex') }
-			: {}),
-		...(e.addRemoteCommitted !== undefined
-			? { addRemoteCommitted: e.addRemoteCommitted }
-			: {}),
-		...(e.removalRemoteCommitted !== undefined
-			? { removalRemoteCommitted: e.removalRemoteCommitted }
-			: {}),
-		...(e.commitCoverPending !== undefined
-			? { commitCoverPending: e.commitCoverPending }
-			: {}),
-		...(e.addLocallyRevoked !== undefined
-			? { addLocallyRevoked: e.addLocallyRevoked }
-			: {}),
-		...(e.removalLocallyRevoked !== undefined
-			? { removalLocallyRevoked: e.removalLocallyRevoked }
-			: {}),
-		...(e.addRemotelyRevoked !== undefined
-			? { addRemotelyRevoked: e.addRemotelyRevoked }
-			: {}),
-		...(e.addCoverPending !== undefined
-			? { addCoverPending: e.addCoverPending }
-			: {}),
-		...(e.addRemoteSigned !== undefined
-			? { addRemoteSigned: e.addRemoteSigned }
-			: {}),
-		...(e.forwardEmitted !== undefined
-			? { forwardEmitted: e.forwardEmitted }
-			: {}),
-		...(e.dustExposureFailback !== undefined
-			? { dustExposureFailback: e.dustExposureFailback }
-			: {}),
-		...(e.expiredOnArrival !== undefined
-			? { expiredOnArrival: e.expiredOnArrival }
-			: {}),
-		...(e.funderFeeFailback !== undefined
-			? { funderFeeFailback: e.funderFeeFailback }
-			: {}),
-		...(e.addedWhileRestoreUnproven !== undefined
-			? { addedWhileRestoreUnproven: e.addedWhileRestoreUnproven }
-			: {}),
-		...(e.addedWhileFundingUnaccounted !== undefined
-			? { addedWhileFundingUnaccounted: e.addedWhileFundingUnaccounted }
-			: {})
-	};
-}
-
-export function deserializeHtlcEntry(s: ISerializedHtlcEntry): {
-	key: string;
-	entry: IHtlcEntry;
-} {
-	return {
-		key: s.key,
-		entry: {
-			customRecords: deserializeCustomRecords(s.customRecords),
-			auxiliaryAmount:
-				s.auxiliaryAmount !== undefined ? BigInt(s.auxiliaryAmount) : undefined,
-			id: strToBigint(s.id),
-			amountMsat: strToBigint(s.amountMsat),
-			paymentHash: Buffer.from(s.paymentHash, 'hex'),
-			cltvExpiry: s.cltvExpiry,
-			onionRoutingPacket: Buffer.from(s.onionRoutingPacket, 'hex'),
-			direction: s.direction as HtlcDirection,
-			state: s.state as HtlcState,
-			...(s.fforVoucher === true ? { fforVoucher: true } : {}),
-			...(s.fforMismatch === true ? { fforMismatch: true } : {}),
-			...(s.blindingPoint
-				? { blindingPoint: Buffer.from(s.blindingPoint, 'hex') }
-				: {}),
-			...(s.addRemoteCommitted !== undefined
-				? { addRemoteCommitted: s.addRemoteCommitted }
-				: {}),
-			...(s.removalRemoteCommitted !== undefined
-				? { removalRemoteCommitted: s.removalRemoteCommitted }
-				: {}),
-			...(s.commitCoverPending !== undefined
-				? { commitCoverPending: s.commitCoverPending }
-				: {}),
-			...(s.addLocallyRevoked !== undefined
-				? { addLocallyRevoked: s.addLocallyRevoked }
-				: {}),
-			...(s.removalLocallyRevoked !== undefined
-				? { removalLocallyRevoked: s.removalLocallyRevoked }
-				: {}),
-			...(s.addRemotelyRevoked !== undefined
-				? { addRemotelyRevoked: s.addRemotelyRevoked }
-				: {}),
-			...(s.addCoverPending !== undefined
-				? { addCoverPending: s.addCoverPending }
-				: {}),
-			...(s.addRemoteSigned !== undefined
-				? { addRemoteSigned: s.addRemoteSigned }
-				: {}),
-			...(s.forwardEmitted !== undefined
-				? { forwardEmitted: s.forwardEmitted }
-				: {}),
-			...(s.dustExposureFailback !== undefined
-				? { dustExposureFailback: s.dustExposureFailback }
-				: {}),
-			...(s.expiredOnArrival !== undefined
-				? { expiredOnArrival: s.expiredOnArrival }
-				: {}),
-			...(s.funderFeeFailback !== undefined
-				? { funderFeeFailback: s.funderFeeFailback }
-				: {}),
-			...(s.addedWhileRestoreUnproven !== undefined
-				? { addedWhileRestoreUnproven: s.addedWhileRestoreUnproven }
-				: {}),
-			...(s.addedWhileFundingUnaccounted !== undefined
-				? { addedWhileFundingUnaccounted: s.addedWhileFundingUnaccounted }
-				: {})
-		}
-	};
-}
-
 // ─── ShaChainStore ───
 
 export interface ISerializedShaChainEntry {
@@ -416,6 +258,11 @@ export function deserializeShaChainStore(data: {
 // ─── IChannelState ───
 
 export interface ISerializedChannelState {
+	nativeTaprootFunding?: boolean;
+	interactiveFunding?: ReturnType<typeof serializeInteractiveFundingPlan>;
+	fundingEpochs?: Array<[string, ReturnType<typeof serializeFundingEpoch>]>;
+	taprootNonceDomain?: string;
+	taprootFundingRounds?: Array<[string, SerializedFundingRound]>;
 	fundingTaprootMerkleRoot?: string;
 	auxiliaryState?: ISerializedAuxiliaryState;
 	lastSentAuxiliaryRecords?: SerializedCustomRecords;
@@ -701,7 +548,55 @@ export interface ISerializedChannelState {
 	fforUsedEpochIds?: string[];
 }
 
+type SerializedFundingRound = { [K in keyof ITaprootFundingRound]: string };
+function serializeFundingRound(
+	round: ITaprootFundingRound
+): SerializedFundingRound {
+	return Object.fromEntries(
+		Object.entries(round)
+			.filter(([, value]) => value !== undefined)
+			.map(([key, value]) => [key, value!.toString('hex')])
+	) as SerializedFundingRound;
+}
+function deserializeFundingRound(
+	round: SerializedFundingRound
+): ITaprootFundingRound {
+	const sizes: Record<string, number> = {
+		domain: 32,
+		localVerificationNonce: 66,
+		remoteVerificationNonce: 66,
+		localSharedNonce: 66,
+		remoteSharedNonce: 66,
+		localNextVerificationNonce: 66,
+		remoteNextVerificationNonce: 66,
+		ourCommitmentPartial: 98,
+		ourCommitmentDigest: 32,
+		remoteCommitmentPartial: 32,
+		remoteSigningNonce: 66,
+		ourSharedPartial: 32,
+		sharedDigest: 32
+	};
+	const result: Record<string, Buffer> = {};
+	for (const [name, value] of Object.entries(round)) {
+		if (typeof value !== 'string' || !/^(?:[0-9a-f]{2})+$/.test(value))
+			throw new Error('Malformed persisted funding hex');
+		const length = value.length / 2;
+		if (
+			name === 'ourCommitmentMessage'
+				? length > 65535
+				: !sizes[name] || sizes[name] !== length
+		)
+			throw new Error(`Invalid Taproot funding evidence ${name}`);
+		result[name] = Buffer.from(value, 'hex');
+	}
+	if (!result.domain || !result.localVerificationNonce)
+		throw new Error('Incomplete persisted Taproot funding round');
+	return result as unknown as ITaprootFundingRound;
+}
 export interface ISerializedSpliceInFlight {
+	taprootRound?: SerializedFundingRound;
+	auxiliaryState?: ISerializedAuxiliaryState;
+	fundingTaprootMerkleRoot?: string;
 	spliceTxid: string;
 	newFundingOutputIndex: number;
 	newFundingSatoshis: string;
@@ -744,6 +639,15 @@ export function serializeSpliceInFlight(
 	f: ISpliceInFlight
 ): ISerializedSpliceInFlight {
 	return {
+		...(f.auxiliaryState
+			? { auxiliaryState: serializeAuxiliaryState(f.auxiliaryState) }
+			: {}),
+		...(f.fundingTaprootMerkleRoot
+			? { fundingTaprootMerkleRoot: f.fundingTaprootMerkleRoot.toString('hex') }
+			: {}),
+		...(f.taprootRound
+			? { taprootRound: serializeFundingRound(f.taprootRound) }
+			: {}),
 		spliceTxid: f.spliceTxid.toString('hex'),
 		newFundingOutputIndex: f.newFundingOutputIndex,
 		newFundingSatoshis: bigintToStr(f.newFundingSatoshis),
@@ -784,6 +688,15 @@ export function deserializeSpliceInFlight(
 	s: ISerializedSpliceInFlight
 ): ISpliceInFlight {
 	return {
+		...(s.auxiliaryState
+			? { auxiliaryState: deserializeAuxiliaryState(s.auxiliaryState) }
+			: {}),
+		...(s.fundingTaprootMerkleRoot
+			? { fundingTaprootMerkleRoot: hexToBuf(s.fundingTaprootMerkleRoot)! }
+			: {}),
+		...(s.taprootRound
+			? { taprootRound: deserializeFundingRound(s.taprootRound) }
+			: {}),
 		spliceTxid: Buffer.from(s.spliceTxid, 'hex'),
 		newFundingOutputIndex: s.newFundingOutputIndex,
 		newFundingSatoshis: strToBigint(s.newFundingSatoshis),
@@ -823,6 +736,9 @@ export function deserializeSpliceInFlight(
 }
 
 export interface ISerializedV2InFlight {
+	taprootRound?: SerializedFundingRound;
+	auxiliaryState?: ISerializedAuxiliaryState;
+	fundingTaprootMerkleRoot?: string;
 	fundingTxid: string;
 	fundingOutputIndex: number;
 	fundingTxHex: string;
@@ -857,6 +773,15 @@ export interface ISerializedV2InFlight {
 
 export function serializeV2InFlight(f: IV2InFlight): ISerializedV2InFlight {
 	return {
+		...(f.auxiliaryState
+			? { auxiliaryState: serializeAuxiliaryState(f.auxiliaryState) }
+			: {}),
+		...(f.fundingTaprootMerkleRoot
+			? { fundingTaprootMerkleRoot: f.fundingTaprootMerkleRoot.toString('hex') }
+			: {}),
+		...(f.taprootRound
+			? { taprootRound: serializeFundingRound(f.taprootRound) }
+			: {}),
 		fundingTxid: f.fundingTxid.toString('hex'),
 		fundingOutputIndex: f.fundingOutputIndex,
 		fundingTxHex: f.fundingTxHex,
@@ -905,6 +830,15 @@ export function serializeV2InFlight(f: IV2InFlight): ISerializedV2InFlight {
 
 export function deserializeV2InFlight(s: ISerializedV2InFlight): IV2InFlight {
 	return {
+		...(s.auxiliaryState
+			? { auxiliaryState: deserializeAuxiliaryState(s.auxiliaryState) }
+			: {}),
+		...(s.fundingTaprootMerkleRoot
+			? { fundingTaprootMerkleRoot: hexToBuf(s.fundingTaprootMerkleRoot)! }
+			: {}),
+		...(s.taprootRound
+			? { taprootRound: deserializeFundingRound(s.taprootRound) }
+			: {}),
 		fundingTxid: Buffer.from(s.fundingTxid, 'hex'),
 		fundingOutputIndex: s.fundingOutputIndex,
 		fundingTxHex: s.fundingTxHex,
@@ -991,12 +925,45 @@ export function serializeChannelState(
 	}
 
 	return {
+		...(s.nativeTaprootFunding ? { nativeTaprootFunding: true } : {}),
+		...(s.taprootNonceDomain
+			? { taprootNonceDomain: s.taprootNonceDomain.toString('hex') }
+			: {}),
+		...(s.taprootFundingRounds
+			? {
+					taprootFundingRounds: [...s.taprootFundingRounds].map(
+						([key, round]) =>
+							[key, serializeFundingRound(round)] as [
+								string,
+								SerializedFundingRound
+							]
+					)
+			  }
+			: {}),
 		channelId: bufToHex(s.channelId),
 		temporaryChannelId: s.temporaryChannelId.toString('hex'),
 		role: s.role,
 		state: s.state,
 		fundingTaprootMerkleRoot: s.fundingTaprootMerkleRoot?.toString('hex'),
 		auxiliaryState: serializeAuxiliaryState(s.auxiliaryState),
+		...(s.interactiveFunding
+			? {
+					interactiveFunding: serializeInteractiveFundingPlan(
+						s.interactiveFunding
+					)
+			  }
+			: {}),
+		...(s.fundingEpochs
+			? {
+					fundingEpochs: [...s.fundingEpochs].map(
+						([key, value]) =>
+							[key, serializeFundingEpoch(value)] as [
+								string,
+								ReturnType<typeof serializeFundingEpoch>
+							]
+					)
+			  }
+			: {}),
 		lastSentAuxiliaryRecords: serializeCustomRecords(
 			s.lastSentAuxiliaryRecords
 		),
@@ -1225,6 +1192,7 @@ export interface ISerializedFforEpoch {
 		escapeGranularityMsat: string;
 		rPerCommitmentPoints: string[];
 		voucherAmountsMsat: string[];
+		assetTerms?: string;
 		witnessPeers?: string[];
 		hashChain?: boolean;
 		/** ff_init TLV 17 as requested; absent when the TLV was. */
@@ -1314,6 +1282,13 @@ export function serializeFforEpoch(f: IFforEpochRecord): ISerializedFforEpoch {
 				p.toString('hex')
 			),
 			voucherAmountsMsat: f.params.voucherAmountsMsat.map(bigintToStr),
+			...(f.params.assetTerms
+				? {
+						assetTerms: encodeFforAssetTerms(f.params.assetTerms).toString(
+							'hex'
+						)
+				  }
+				: {}),
 			...(f.params.witnessPeers
 				? { witnessPeers: f.params.witnessPeers.map((p) => p.toString('hex')) }
 				: {}),
@@ -1480,6 +1455,43 @@ export function deserializeFforEpoch(
 	}
 	const initWire = Buffer.from(s.initWire, 'hex');
 	const acceptWire = hexToBuf(s.acceptWire);
+	if (
+		s.params.assetTerms !== undefined ||
+		(acceptWire &&
+			(() => {
+				try {
+					return !!decodeFforAcceptMessage(acceptWire.subarray(2)).assetTerms;
+				} catch {
+					return false;
+				}
+			})()) ||
+		(initWire.length > 2 &&
+			(() => {
+				try {
+					return !!decodeFforInitMessage(initWire.subarray(2)).assetTerms;
+				} catch {
+					return false;
+				}
+			})())
+	) {
+		const requested = decodeFforInitMessage(initWire.subarray(2)).assetTerms;
+		const accepted = acceptWire
+			? decodeFforAcceptMessage(acceptWire.subarray(2)).assetTerms
+			: undefined;
+		if (
+			!requested ||
+			s.params.assetTerms !== encodeFforAssetTerms(requested).toString('hex') ||
+			(acceptWire &&
+				(!accepted ||
+					!encodeFforAssetTerms(accepted).equals(
+						encodeFforAssetTerms(requested)
+					)))
+		)
+			throw new Error(
+				'Stored FFOR asset terms conflict with the signed transcript'
+			);
+	}
+
 	const concurrent = storedConcurrentVersion(
 		s.concurrentVersion,
 		s.params.concurrentVersion,
@@ -1504,6 +1516,13 @@ export function deserializeFforEpoch(
 				Buffer.from(p, 'hex')
 			),
 			voucherAmountsMsat: s.params.voucherAmountsMsat.map(strToBigint),
+			...(s.params.assetTerms
+				? {
+						assetTerms: decodeFforAssetTerms(
+							Buffer.from(s.params.assetTerms, 'hex')
+						)
+				  }
+				: {}),
 			...(s.params.witnessPeers
 				? {
 						witnessPeers: s.params.witnessPeers.map((p) =>
@@ -1606,6 +1625,21 @@ export function deserializeFforEpoch(
 export function deserializeChannelState(
 	s: ISerializedChannelState
 ): IChannelState {
+	if (s.taprootNonceDomain && !/^[0-9a-f]{64}$/.test(s.taprootNonceDomain))
+		throw new Error('Invalid active funding nonce domain');
+	if (s.taprootFundingRounds) {
+		const keys = new Set<string>();
+		for (const [key, round] of s.taprootFundingRounds) {
+			if (keys.has(key) || key !== round.domain || !/^[0-9a-f]{64}$/.test(key))
+				throw new Error('Invalid funding nonce map identity');
+			keys.add(key);
+		}
+	}
+	if (
+		s.fundingEpochs &&
+		new Set(s.fundingEpochs.map(([key]) => key)).size !== s.fundingEpochs.length
+	)
+		throw new Error('Duplicate historical funding epoch');
 	const htlcs = new Map<string, IHtlcEntry>();
 	for (const h of s.htlcs) {
 		const { key, entry } = deserializeHtlcEntry(h);
@@ -1629,6 +1663,20 @@ export function deserializeChannelState(
 	}
 
 	return {
+		...(s.nativeTaprootFunding ? { nativeTaprootFunding: true } : {}),
+		...(s.taprootNonceDomain
+			? { taprootNonceDomain: Buffer.from(s.taprootNonceDomain, 'hex') }
+			: {}),
+		...(s.taprootFundingRounds
+			? {
+					taprootFundingRounds: new Map(
+						s.taprootFundingRounds.map(([key, round]) => [
+							key,
+							deserializeFundingRound(round)
+						])
+					)
+			  }
+			: {}),
 		channelId: hexToBuf(s.channelId),
 		temporaryChannelId: Buffer.from(s.temporaryChannelId, 'hex'),
 		role: s.role as ChannelRole,
@@ -1637,6 +1685,30 @@ export function deserializeChannelState(
 			? Buffer.from(s.fundingTaprootMerkleRoot, 'hex')
 			: undefined,
 		auxiliaryState: deserializeAuxiliaryState(s.auxiliaryState),
+		...(s.interactiveFunding
+			? {
+					interactiveFunding: deserializeInteractiveFundingPlan(
+						s.interactiveFunding
+					)
+			  }
+			: {}),
+		...(s.fundingEpochs
+			? {
+					fundingEpochs: new Map(
+						s.fundingEpochs.map(([key, value]) => {
+							const epoch = deserializeFundingEpoch(value);
+							if (
+								key !==
+								`${epoch.fundingTxid.toString('hex')}:${
+									epoch.fundingOutputIndex
+								}`
+							)
+								throw new Error('Historical funding map key mismatch');
+							return [key, epoch];
+						})
+					)
+			  }
+			: {}),
 		lastSentAuxiliaryRecords: deserializeCustomRecords(
 			s.lastSentAuxiliaryRecords
 		),
@@ -2116,6 +2188,7 @@ export interface ISerializedInvoiceInfo {
 	expiry: number;
 	createdAt: number;
 	hold?: boolean;
+	holdSettlementAuthorized?: boolean;
 	bolt12?: boolean;
 	cancelledAt?: number;
 	jitFee?: { flatFeeSat: number; feePpm: number };
@@ -2136,6 +2209,7 @@ export function serializeInvoiceInfo(
 		expiry: invoice.expiry,
 		createdAt: invoice.createdAt,
 		hold: invoice.hold,
+		holdSettlementAuthorized: invoice.holdSettlementAuthorized,
 		bolt12: invoice.bolt12,
 		cancelledAt: invoice.cancelledAt,
 		jitFee: invoice.jitFee,
@@ -2154,6 +2228,7 @@ export function deserializeInvoiceInfo(
 		expiry: s.expiry,
 		createdAt: s.createdAt,
 		hold: s.hold,
+		holdSettlementAuthorized: s.holdSettlementAuthorized,
 		bolt12: s.bolt12,
 		cancelledAt: s.cancelledAt,
 		// A row written before #595 has none; the allowance is then absent

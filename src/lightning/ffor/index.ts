@@ -1,4 +1,5 @@
 export * from './amounts';
+export * from './assets';
 export * from './issuer-ledger';
 export * from './issuer-messages';
 export * from './issuer-paths';

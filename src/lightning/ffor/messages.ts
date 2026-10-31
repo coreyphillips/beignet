@@ -57,6 +57,12 @@ import {
 	FforState
 } from './types';
 
+import {
+	encodeFforAssetTerms,
+	decodeFforAssetTerms,
+	FF_ASSET_TERMS_TLV
+} from './assets';
+
 const HEADER_LEN = 64;
 const SIG_LEN = 64;
 const MSG_TAG = Buffer.from('ffor/msg', 'ascii');
@@ -347,6 +353,11 @@ export function encodeFforInitUnsigned(
 			value: encodeConcurrentVersion(msg.concurrentVersion)
 		});
 	}
+	if (msg.assetTerms)
+		records.push({
+			type: FF_ASSET_TERMS_TLV,
+			value: encodeFforAssetTerms(msg.assetTerms)
+		});
 	return Buffer.concat([
 		msg.channelId,
 		msg.epochId,
@@ -466,6 +477,9 @@ export function decodeFforInitMessage(body: Buffer): IFforInitMessage {
 			: {}),
 		...(hashChain !== undefined ? { hashChain: true } : {}),
 		...(concurrentVersion !== undefined ? { concurrentVersion } : {}),
+		...(tlvList(tlvs, FF_ASSET_TERMS_TLV) !== undefined
+			? { assetTerms: decodeFforAssetTerms(tlvList(tlvs, FF_ASSET_TERMS_TLV)!) }
+			: {}),
 		signature
 	};
 }
@@ -498,6 +512,11 @@ export function encodeFforAcceptUnsigned(
 			value: encodeConcurrentVersion(msg.concurrentVersion)
 		});
 	}
+	if (msg.assetTerms)
+		records.push({
+			type: FF_ASSET_TERMS_TLV,
+			value: encodeFforAssetTerms(msg.assetTerms)
+		});
 	return Buffer.concat([
 		msg.channelId,
 		msg.epochId,
@@ -541,6 +560,9 @@ export function decodeFforAcceptMessage(body: Buffer): IFforAcceptMessage {
 				: [],
 		initHash,
 		...(concurrentVersion !== undefined ? { concurrentVersion } : {}),
+		...(tlvList(tlvs, FF_ASSET_TERMS_TLV) !== undefined
+			? { assetTerms: decodeFforAssetTerms(tlvList(tlvs, FF_ASSET_TERMS_TLV)!) }
+			: {}),
 		signature
 	};
 }
