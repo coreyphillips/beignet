@@ -31,7 +31,8 @@ import {
 	DEFAULT_CHANNEL_CONFIG,
 	HtlcDirection,
 	isOverlayChannel,
-	isTaprootChannel
+	isTaprootChannel,
+	isFixedAssetHtlcChannel
 } from '../../src/lightning/channel/types';
 import { ChannelActionType } from '../../src/lightning/channel/channel-actions';
 import {
@@ -40,8 +41,24 @@ import {
 	hasUnsupportedRequiredFeatures
 } from '../../src/lightning/features/flags';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
+import {
+	classifyOutputs,
+	resolveOurCommitmentOutputs
+} from '../../src/lightning/chain/output-resolver';
+import { tapleafHash } from '../../src/lightning/script/htlc-taproot';
+import {
+	derivePrivateKey,
+	derivePublicKey,
+	perCommitmentPointFromSecret
+} from '../../src/lightning/keys/derivation';
+import { generateFromSeed, MAX_INDEX } from '../../src/lightning/keys/shachain';
+import {
+	retainFundingEpoch,
+	selectFundingEpoch
+} from '../../src/lightning/channel/funding-state';
 import { createTaprootFundingScript } from '../../src/lightning/script/funding-taproot';
 import { taprootCommitmentSighash } from '../../src/lightning/channel/commitment-musig';
+import { verifyRemoteHtlcSignaturesTaproot } from '../../src/lightning/channel/commitment-builder';
 import {
 	deserializeChannelState,
 	serializeChannelState,
@@ -64,6 +81,7 @@ import {
 import { COMMIT_ALL } from './helpers/channel-persistence';
 import {
 	MonitorState,
+	CommitmentType,
 	OutputStatus,
 	OutputType
 } from '../../src/lightning/chain/types';
@@ -268,6 +286,7 @@ function config(
 		preferTaproot: true,
 		persistence: COMMIT_ALL,
 		auxiliaryChannels: {
+			allowLegacyHtlcSignatures: () => true,
 			provider: extension,
 			resolveIncoming: (_peer, id) =>
 				id.equals(descriptor.temporaryChannelId) ? descriptor : undefined
@@ -275,7 +294,7 @@ function config(
 	};
 }
 
-function pair() {
+function pair(fixed = true) {
 	const descriptor = {
 		temporaryChannelId: hash('auxiliary-temporary'),
 		fundingTaprootMerkleRoot: hash('asset funding root'),
@@ -295,6 +314,26 @@ function pair() {
 	);
 	const aPub = alice['config'].localBasepoints.fundingPubkey.toString('hex');
 	const bPub = bob['config'].localBasepoints.fundingPubkey.toString('hex');
+	if (fixed) {
+		const features = FeatureFlags.empty();
+		features.setOptional(Feature.OPTION_TAPROOT_OVERLAY);
+		features.setOptional(Feature.OPTION_ASSET_FIXED_HTLC_OUTPUTS);
+		for (const manager of [alice, bob]) {
+			manager['config'].localFeatures = features;
+			manager.setFundingProvider({
+				supportsFixedOutputFees: () => true,
+				buildFundingTransaction: async () => {
+					throw new Error('Unexpected ordinary funding');
+				},
+				broadcastTransaction: async () => ''
+			});
+			(manager as unknown as { peerManager: unknown }).peerManager = {
+				getPeer: () => ({ getRemoteInit: () => ({ features }) }),
+				sendToPeer: (peer: string, type: MessageType, payload: Buffer) =>
+					manager.emit('message:outbound', peer, type, payload)
+			};
+		}
+	}
 	const errors: string[] = [];
 	const messages: { side: string; type: number; payload: Buffer }[] = [];
 	alice.on('error', (_id: unknown, error: string) =>
@@ -375,6 +414,7 @@ function nodePair() {
 	const resolutions: Array<{ side: number; outcome: string; amount: bigint }> =
 		[];
 	const configs: IAuxiliaryChannelConfig[] = stores.map((store, side) => ({
+		allowLegacyHtlcSignatures: () => true,
 		provider: provider(),
 		resolveIncoming: (_peer, temporaryId) =>
 			temporaryId.equals(descriptor.temporaryChannelId)
@@ -405,6 +445,7 @@ function nodePair() {
 	const alice = createNode('auxiliary-native-payment', 1, stores[0], {
 		preferTaproot: true,
 		fundingProvider: {
+			supportsFixedOutputFees: () => true,
 			buildFundingTransaction: async () => {
 				throw new Error('Unexpected ordinary Bitcoin funding');
 			},
@@ -414,6 +455,13 @@ function nodePair() {
 	});
 	const bob = createNode('auxiliary-native-payment', 2, stores[1], {
 		preferTaproot: true,
+		fundingProvider: {
+			supportsFixedOutputFees: () => true,
+			buildFundingTransaction: async () => {
+				throw new Error('Unexpected ordinary funding');
+			},
+			broadcastTransaction: async () => ''
+		},
 		auxiliaryChannels: configs[1]
 	});
 	const errors: string[] = [];
@@ -732,6 +780,229 @@ describe('native asset payment routing', function () {
 });
 
 describe('native auxiliary asset channel host', function () {
+	it('negotiates fixed peer signatures and retains the exact historical channel mode', () => {
+		const { alice, bobChannel, aliceChannel } = pair();
+		const state = deserializeChannelState(
+			serializeChannelState(aliceChannel.getFullState())
+		);
+		expect(isFixedAssetHtlcChannel(state.channelType)).equal(true);
+		expect(
+			isFixedAssetHtlcChannel(bobChannel.getFullState().channelType)
+		).equal(true);
+		const peer = bobChannel
+			.getFullState()
+			.localBasepoints.fundingPubkey.toString('hex');
+		expect(alice.getAuxiliaryHtlcMode(peer)).equal('fixed');
+		retainFundingEpoch(state);
+		const originalTxid = Buffer.from(state.fundingTxid!);
+		state.fundingTxid = hash('later fixed-output funding');
+		const compatibility = FeatureFlags.empty();
+		compatibility.setCompulsory(Feature.OPTION_TAPROOT_OVERLAY);
+		state.channelType = compatibility.toBuffer();
+		expect(
+			isFixedAssetHtlcChannel(
+				selectFundingEpoch(
+					deserializeChannelState(serializeChannelState(state)),
+					originalTxid,
+					state.fundingOutputIndex
+				).channelType
+			)
+		).equal(true);
+		const legacy = pair(false).aliceChannel.getFullState();
+		expect(
+			isFixedAssetHtlcChannel(
+				deserializeChannelState(serializeChannelState(legacy)).channelType
+			)
+		).equal(false);
+	});
+
+	it('refuses native downgrade, missing fee capability and implicit legacy fallback before opening', () => {
+		const { alice, bobChannel } = pair();
+		const peer = bobChannel
+			.getFullState()
+			.localBasepoints.fundingPubkey.toString('hex');
+		const legacy = FeatureFlags.empty();
+		legacy.setCompulsory(Feature.OPTION_TAPROOT_OVERLAY);
+		const internal = alice as unknown as {
+			negotiateAssetHtlcOutputs(peer: string, type?: Buffer): boolean;
+			peerManager: { getPeer: unknown };
+		};
+		expect(() =>
+			internal.negotiateAssetHtlcOutputs(peer, legacy.toBuffer())
+		).to.throw('downgraded');
+		alice.setFundingProvider(null);
+		expect(() => alice.getAuxiliaryHtlcMode(peer)).to.throw(
+			'durable bounded fee preparation'
+		);
+		internal.peerManager.getPeer = () => ({
+			getRemoteInit: () => ({ features: legacy })
+		});
+		alice['config'].auxiliaryChannels!.allowLegacyHtlcSignatures = () => false;
+		expect(() => alice.getAuxiliaryHtlcMode(peer)).to.throw(
+			'explicit peer compatibility'
+		);
+		alice['config'].auxiliaryChannels!.allowLegacyHtlcSignatures = (
+			candidate
+		) => candidate === peer;
+		expect(alice.getAuxiliaryHtlcMode(peer)).equal('legacy');
+	});
+
+	it('uses peer ALL signatures that prevent a revoked owner from appending unknown asset outputs', () => {
+		const { alice, aliceChannel, aliceProvider, id, errors } = pair();
+		aliceProvider.prepareSweep = (context) => ({
+			outputScripts: new Map([[0, context.transaction.outs[0].script]]),
+			customData: Buffer.from('retained asset transition')
+		});
+		const preimage = hash('fixed output HTLC');
+		expect(
+			alice.addHtlc(
+				id,
+				100_000_000n,
+				hash(preimage),
+				600000,
+				Buffer.alloc(1366),
+				undefined,
+				undefined,
+				amountRecord(75n)
+			).ok
+		).equal(true);
+		expect(errors).deep.equal([]);
+		const state = aliceChannel.getFullState();
+		const close = aliceChannel
+			.forceClose(aliceChannel.getSigner()!)
+			.find((action) => action.type === ChannelActionType.BROADCAST_TX);
+		if (close?.type !== ChannelActionType.BROADCAST_TX)
+			throw new Error('Missing commitment');
+		const commitment = bitcoin.Transaction.fromBuffer(close.tx);
+		const tracked = classifyOutputs(
+			commitment,
+			state,
+			CommitmentType.OUR_COMMITMENT,
+			state.localCommitmentNumber
+		);
+		const resolved = resolveOurCommitmentOutputs(
+			state,
+			tracked,
+			state.localCommitmentNumber,
+			bitcoin.payments.p2tr({
+				internalPubkey: getPublicKey(hash('fixed destination')).subarray(1)
+			}).output!,
+			1,
+			new Map(),
+			hash('auxiliary-test:1:3'),
+			hash('auxiliary-test:1:4'),
+			state.remoteHtlcSignatures
+		);
+		const child = resolved.find(
+			(item) => item.trackedOutput.outputType === OutputType.OFFERED_HTLC
+		)!;
+		expect(child.witness?.[0][64]).equal(0x81);
+		expect(child.witness?.[1][64]).equal(0x81);
+		const tx = child.spendTx!;
+		tx.setWitness(0, child.witness!);
+		const point = perCommitmentPointFromSecret(
+			generateFromSeed(
+				state.localPerCommitmentSeed,
+				MAX_INDEX - state.localCommitmentNumber
+			)
+		);
+		const remoteKey = derivePublicKey(
+			state.remoteBasepoints!.htlcBasepoint,
+			point
+		).subarray(1);
+		const leafHash = tapleafHash(child.witness![child.witness!.length - 2]);
+		const digest = (
+			transaction: bitcoin.Transaction,
+			type: number,
+			inputIndex = 0
+		) =>
+			transaction.hashForWitnessV1(
+				inputIndex,
+				transaction.ins.map((_, index) =>
+					index === inputIndex
+						? child.trackedOutput.witnessScript!
+						: Buffer.alloc(0)
+				),
+				transaction.ins.map((_, index) =>
+					index === inputIndex ? Number(child.trackedOutput.amount) : 0
+				),
+				type,
+				leafHash
+			);
+		expect(
+			ecc.verifySchnorr(
+				digest(tx, 0x81),
+				remoteKey,
+				child.witness![0].subarray(0, 64)
+			)
+		).equal(true);
+
+		expect(
+			verifyRemoteHtlcSignaturesTaproot(
+				state,
+				point,
+				state.remoteHtlcSignatures,
+				state.localCommitmentNumber
+			)
+		).equal(true);
+		const wrongMode = Buffer.from(
+			ecc.signSchnorr(
+				digest(tx, 0x83),
+				derivePrivateKey(
+					hash('auxiliary-test:2:4'),
+					point,
+					state.remoteBasepoints!.htlcBasepoint
+				)
+			)
+		);
+		expect(
+			verifyRemoteHtlcSignaturesTaproot(
+				state,
+				point,
+				[wrongMode],
+				state.localCommitmentNumber
+			)
+		).equal(false);
+		const changed = tx.clone();
+		changed.addOutput(
+			bitcoin.payments.p2tr({
+				internalPubkey: getPublicKey(hash('unknown exclusion key')).subarray(1)
+			}).output!,
+			330
+		);
+		const ownerKey = derivePrivateKey(
+			hash('auxiliary-test:1:4'),
+			point,
+			state.localBasepoints.htlcBasepoint
+		);
+		const ownersReplacement = Buffer.from(
+			ecc.signSchnorr(digest(changed, 0x83), ownerKey)
+		);
+		expect(
+			ecc.verifySchnorr(
+				digest(changed, 0x83),
+				getPublicKey(ownerKey).subarray(1),
+				ownersReplacement
+			)
+		).equal(true);
+		expect(
+			ecc.verifySchnorr(
+				digest(changed, 0x81),
+				remoteKey,
+				child.witness![0].subarray(0, 64)
+			)
+		).equal(false);
+		const reordered = tx.clone();
+		reordered.addInput(hash('third party fee input'), 0);
+		[reordered.ins[0], reordered.ins[1]] = [reordered.ins[1], reordered.ins[0]];
+		expect(
+			ecc.verifySchnorr(
+				digest(reordered, 0x81, 1),
+				remoteKey,
+				child.witness![0].subarray(0, 64)
+			)
+		).equal(true);
+	});
 	it('uses the deployed overlay feature pair and rejects an unavailable extension', function () {
 		const optional = FeatureFlags.empty();
 		optional.setOptional(Feature.OPTION_TAPROOT_OVERLAY);

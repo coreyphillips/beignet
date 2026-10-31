@@ -333,6 +333,203 @@ describe('Wallet funded auxiliary carrier sweeps', () => {
 		expect(frozen).equal(true);
 	});
 
+	for (const outcome of [
+		'initial',
+		'late_success',
+		'late_failure',
+		'current_failure'
+	] as const) {
+		it(`discards ${outcome} stale fee work without releasing a retained candidate`, async () => {
+			const value = fixture(),
+				id = Buffer.alloc(32, 23),
+				failures: string[] = [],
+				broadcasts: Buffer[] = [];
+			let current = outcome !== 'initial',
+				selected = 0,
+				released = 0;
+			const manager = new ChannelManager({
+				localBasepoints: {
+					fundingPubkey: publicKey,
+					revocationBasepoint: publicKey,
+					paymentBasepoint: publicKey,
+					delayedPaymentBasepoint: publicKey,
+					htlcBasepoint: publicKey,
+					firstPerCommitmentPoint: publicKey
+				},
+				localPerCommitmentSeed: Buffer.alloc(32, 9),
+				localFundingPrivkey: secret,
+				persistence: COMMIT_ALL
+			});
+			manager.on('error', (_id, message) => failures.push(message));
+			manager.on('broadcast:tx', (raw) => broadcasts.push(raw));
+			manager.setFundingProvider({
+				buildFundingTransaction: async () => {
+					throw new Error('Unexpected funding');
+				},
+				broadcastTransaction: async () => {
+					throw new Error('Unexpected publication');
+				},
+				selectFeeBumpInputs: async () => {
+					selected++;
+					await Promise.resolve();
+					if (outcome !== 'current_failure') current = false;
+					if (outcome.endsWith('failure'))
+						throw new Error('Current fee selection failed');
+					return { inputs: [value.walletInput], changeScript };
+				},
+				releaseInputPledges: async () => {
+					released++;
+				}
+			});
+			const internal = manager as unknown as {
+				monitors: Map<string, ChainMonitor>;
+				_handleFeeBumpAndBroadcast(
+					id: Buffer,
+					action: IFeeBumpAndBroadcastChainAction
+				): Promise<void>;
+			};
+			internal.monitors.set(id.toString('hex'), {
+				getTrackedOutputs: () => []
+			} as unknown as ChainMonitor);
+			await internal._handleFeeBumpAndBroadcast(id, {
+				type: ChainActionType.FEE_BUMP_AND_BROADCAST,
+				kind: 'auxiliary-sweep-fee-attach',
+				tx: value.sweepTx.toBuffer(),
+				description: 'stale fee work',
+				feeratePerVbyte: 2,
+				auxiliarySweep: value.attachment,
+				isCurrent: () => current
+			});
+			expect(selected).equal(outcome === 'initial' ? 0 : 1);
+			expect(released).equal(outcome === 'late_success' ? 1 : 0);
+			expect(failures).length(outcome === 'current_failure' ? 1 : 0);
+			expect(broadcasts).length(0);
+		});
+	}
+
+	for (const outcome of ['saved', 'deferred', 'uncapped'] as const) {
+		it(`preserves fixed peer outputs with ${outcome} bounded fee preparation`, async () => {
+			const value = fixture(),
+				id = Buffer.alloc(32, 19);
+			const signature = Buffer.concat([
+				Buffer.from(
+					ecc.signSchnorr(
+						value.sweepTx.hashForWitnessV1(0, [assetScript], [355], 0x81),
+						secret
+					)
+				),
+				Buffer.from([0x81])
+			]);
+			value.sweepTx.setWitness(0, [signature, signature]);
+			const manager = new ChannelManager({
+				localBasepoints: {
+					fundingPubkey: publicKey,
+					revocationBasepoint: publicKey,
+					paymentBasepoint: publicKey,
+					delayedPaymentBasepoint: publicKey,
+					htlcBasepoint: publicKey,
+					firstPerCommitmentPoint: publicKey
+				},
+				localPerCommitmentSeed: Buffer.alloc(32, 9),
+				localFundingPrivkey: secret,
+				persistence: COMMIT_ALL,
+				isMonitorPersisted: () => true
+			});
+			let deferred = false,
+				released = false,
+				saved = false,
+				writes = 0;
+			const broadcasts: Buffer[] = [],
+				failures: string[] = [];
+			manager.on('error', (_id, message) => failures.push(message));
+			manager.on('broadcast:tx', (transaction) => broadcasts.push(transaction));
+			manager.on('monitor:updated', () => writes++);
+			manager.setFundingProvider({
+				supportsFixedOutputFees: () => true,
+				buildFundingTransaction: async () => {
+					throw new Error('Unexpected funding transaction');
+				},
+				broadcastTransaction: async () => {
+					throw new Error('Unexpected direct publication');
+				},
+				selectFeeBumpInputs: async (_target, _rate, options) => {
+					expect(options?.fixedOutputs).equal(true);
+					expect(options?.feeActionId).equal(
+						`asset-htlc:${id.toString('hex')}:${Buffer.from(
+							value.sweepTx.ins[0].hash
+						)
+							.reverse()
+							.toString('hex')}:0`
+					);
+					if (outcome === 'deferred')
+						throw Object.assign(new Error('Awaiting fee preparation'), {
+							code: 'FEE_PREPARATION_PENDING',
+							transactionId: 'aa'.repeat(32)
+						});
+					return {
+						inputs: [value.walletInput],
+						changeScript,
+						...(outcome === 'uncapped' ? {} : { maxFeeSatoshis: 20000n })
+					};
+				},
+				releaseInputPledges: async () => {
+					released = true;
+				}
+			} as IFundingProvider);
+			const internal = manager as unknown as {
+				monitors: Map<string, ChainMonitor>;
+				_handleFeeBumpAndBroadcast(
+					id: Buffer,
+					action: IFeeBumpAndBroadcastChainAction
+				): Promise<void>;
+			};
+			internal.monitors.set(id.toString('hex'), {
+				getTrackedOutputs: () => []
+			} as unknown as ChainMonitor);
+			await internal._handleFeeBumpAndBroadcast(id, {
+				type: ChainActionType.FEE_BUMP_AND_BROADCAST,
+				kind: 'htlc-fee-attach',
+				tx: value.sweepTx.toBuffer(),
+				description: 'fixed peer HTLC',
+				feeratePerVbyte: 2,
+				fixedHtlcOutputs: true,
+				signHtlcFunding: (raw) => raw,
+				deferHtlcFunding: () => {
+					deferred = true;
+					return true;
+				},
+				finalizeHtlcFunding: (raw, fee) => {
+					const transaction = bitcoin.Transaction.fromBuffer(raw);
+					expect(transaction.outs).deep.equal(value.sweepTx.outs);
+					expect(transaction.ins[0].witness).deep.equal(
+						value.sweepTx.ins[0].witness
+					);
+					expect(
+						ecc.verifySchnorr(
+							transaction.hashForWitnessV1(
+								0,
+								[assetScript, changeScript],
+								[355, 20000],
+								0x81
+							),
+							publicKey.subarray(1),
+							signature.subarray(0, 64)
+						)
+					).equal(true);
+					expect(fee).equal(20000n);
+					saved = true;
+					return true;
+				}
+			});
+			expect(broadcasts).length(outcome === 'saved' ? 1 : 0);
+			expect(deferred).equal(outcome === 'deferred');
+			expect(saved).equal(outcome === 'saved');
+			expect(released).equal(outcome === 'uncapped');
+			expect(writes).equal(outcome === 'uncapped' ? 0 : 1);
+			expect(failures).length(outcome === 'uncapped' ? 1 : 0);
+		});
+	}
+
 	for (const kind of [
 		'auxiliary-sweep-fee-attach',
 		'htlc-fee-attach'
@@ -448,6 +645,7 @@ describe('Wallet funded auxiliary carrier sweeps', () => {
 					tx: value.sweepTx.toBuffer(),
 					description: 'asset carrier',
 					feeratePerVbyte: 2,
+					isCurrent: () => installed === undefined,
 					auxiliarySweep: value.attachment,
 					previousFundedTransaction: previousFunded,
 					conflictingCandidateTxids:
@@ -514,7 +712,10 @@ describe('Wallet funded auxiliary carrier sweeps', () => {
 					).to.equal(true);
 				if (outcome === 'saved')
 					expect(broadcasts[0].equals(installed!)).to.equal(true);
-				if (outcome === 'refused') expect(installed).to.not.equal(undefined);
+				if (outcome === 'refused') {
+					expect(installed).to.not.equal(undefined);
+					expect(failures).length(1);
+				}
 			});
 		}
 	}

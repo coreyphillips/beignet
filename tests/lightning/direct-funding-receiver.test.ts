@@ -463,15 +463,15 @@ describe('Direct funding receiver: admission (issue #612)', () => {
 	});
 });
 
+async function until(condition: () => boolean): Promise<void> {
+	const end = Date.now() + 5_000;
+	while (!condition() && Date.now() < end) await sleep(20);
+}
+
 // Issue #855. A phone back from the background has lost its Electrum socket
 // and takes seconds to get it back; a lookup that failed for that is no
 // answer, and the offer waits for one rather than being decided on nothing.
 describe('Direct funding receiver: a chain source that cannot answer (issue #855)', () => {
-	async function until(condition: () => boolean): Promise<void> {
-		const end = Date.now() + 5_000;
-		while (!condition() && Date.now() < end) await sleep(20);
-	}
-
 	function captureDrops(h: IHarness): unknown[] {
 		const drops: unknown[] = [];
 		(h.node as IDfReceiverDeps).log = (action, data): void => {
@@ -3834,7 +3834,7 @@ describe('Direct funding receiver: live splice feerate (issue #763)', () => {
 		);
 		h.node.feeEstimateHangs = true;
 		h.engine.handleFrame(h.payer.offerFrame(h.offer));
-		await sleep(60);
+		await until(() => h.lastAck()?.accepted === true);
 		await flush();
 		expect(h.lastAck()?.accepted).to.equal(true);
 		expect(h.node.splices[0].feeratePerKw).to.equal(

@@ -254,6 +254,27 @@ describe('pledged fee replacement inputs', () => {
 		);
 		expect(f.unfreezes()).equal(0);
 	});
+	it('refuses a foreign takeover of an already spent fee input', async () => {
+		const f = fixture(),
+			provider = new WalletFundingProvider(f.wallet);
+		await provider.selectFeeBumpInputs(1000n, 2500);
+		f.setCoins([]);
+		const foreign = { frozenAt: Date.now(), freezeTag: 'asset-anchor' };
+		f.frozen.set(`${f.original.getId()}:0`, foreign);
+		await rejection(
+			provider.restoreFeeBumpInputs([
+				{
+					prevTx: f.original.toBuffer(),
+					prevOutputIndex: 0,
+					sequence: 0xfffffffd
+				}
+			]),
+			'not an owned pledge'
+		);
+		expect(f.frozen.get(`${f.original.getId()}:0`)).deep.equal(foreign);
+		expect(f.unfreezes()).equal(0);
+	});
+
 	it('restores an unsigned persisted fee intent without selecting another coin', async () => {
 		const f = fixture(),
 			provider = new WalletFundingProvider(f.wallet);

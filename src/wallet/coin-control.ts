@@ -123,16 +123,19 @@ export class CoinControl {
 		if (!Number.isInteger(vout) || vout < 0) {
 			return err('vout must be a non-negative integer.');
 		}
+		// A published replacement may spend a reserved coin before its monitor
+		// catches up. Its durable freeze remains valid across that spend and a
+		// possible reorg, even while the live UTXO list no longer contains it.
+		if (this.isUtxoFrozen({ txid, vout })) {
+			return tag === undefined
+				? this.untagFrozenUtxo(txid, vout)
+				: ok({ created: false });
+		}
 		const utxo = this._data.utxos.find(
 			(u) => u.tx_hash === txid && u.tx_pos === vout
 		);
 		if (!utxo) {
 			return err(`UTXO ${txid}:${vout} is not known to this wallet.`);
-		}
-		if (this.isUtxoFrozen({ txid, vout })) {
-			return tag === undefined
-				? this.untagFrozenUtxo(txid, vout)
-				: ok({ created: false });
 		}
 		// keyPair must never be persisted with the frozen entry.
 		const { keyPair, ...frozen } = utxo;

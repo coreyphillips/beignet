@@ -541,6 +541,10 @@ function prevTxHash(prevTx: Buffer): Buffer {
 }
 
 export interface IAttachFeeInputsParams {
+	/** Negotiated peer signatures bind every output; wallet inputs pay their full value as fee. */
+	fixedOutputs?: boolean;
+	/** Mandatory hard cap on burned wallet value when fixedOutputs is true. */
+	maxFeeSatoshis?: bigint;
 	/** The pre-signed zero-fee second-level HTLC tx (1 input, 1 output). */
 	htlcTx: bitcoin.Transaction;
 	/**
@@ -565,8 +569,9 @@ export interface IAttachFeeInputsParams {
  * Attach wallet fee inputs (and a change output) to a zero-fee anchor
  * second-level HTLC transaction so it pays its own fee and can confirm.
  *
- * The peer signature keeps SIGHASH_SINGLE|ANYONECANPAY. Asset HTLCs bind the
- * broadcaster signature to all final outputs before wallet SIGHASH_ALL
+ * Compatible channels retain the peer SINGLE|ANYONECANPAY signature. Native
+ * fixed-output channels use ALL|ANYONECANPAY for both HTLC signatures. Asset
+ * broadcasters bind all final outputs before wallet SIGHASH_ALL
  * signatures are added. The resulting transaction pays its own fee without
  * package relay. Callers must track its new transaction ID.
  */
@@ -580,7 +585,60 @@ export function attachFeeInputsToZeroFeeHtlcTx(
 			'attachFeeInputsToZeroFeeHtlcTx requires at least one wallet input'
 		);
 	}
+	if (params.fixedOutputs) {
+		if (
+			!Number.isFinite(feeratePerVbyte) ||
+			feeratePerVbyte <= 0 ||
+			typeof params.maxFeeSatoshis !== 'bigint' ||
+			params.maxFeeSatoshis <= 0n ||
+			params.maxFeeSatoshis > BigInt(Number.MAX_SAFE_INTEGER)
+		)
+			throw new Error('Invalid fixed-output HTLC fee policy');
+		const spent = new Set(
+			htlcTx.ins.map((input) => `${input.hash.toString('hex')}:${input.index}`)
+		);
+		for (const input of walletInputs) {
+			const previous = bitcoin.Transaction.fromBuffer(input.prevTx);
+			const output = previous.outs[input.prevOutputIndex];
+			if (
+				!Number.isInteger(input.prevOutputIndex) ||
+				input.prevOutputIndex < 0 ||
+				!output ||
+				!Number.isSafeInteger(output.value) ||
+				output.value <= 0 ||
+				typeof input.value !== 'bigint' ||
+				input.value !== BigInt(output.value) ||
+				output.script.length !== 22 ||
+				output.script[0] !== 0 ||
+				output.script[1] !== 20
+			)
+				throw new Error(
+					'Fixed-output fee input does not match its P2WPKH prevout'
+				);
+			const outpoint = `${previous.getHash().toString('hex')}:${
+				input.prevOutputIndex
+			}`;
+			if (spent.has(outpoint))
+				throw new Error('Duplicate fixed-output fee input');
+			spent.add(outpoint);
+		}
+	}
 	const walletTotal = walletInputs.reduce((sum, w) => sum + w.value, 0n);
+	if (
+		params.fixedOutputs &&
+		(htlcTx.ins.length !== 1 ||
+			htlcTx.outs.length !== 1 ||
+			params.maxFeeSatoshis === undefined ||
+			params.maxFeeSatoshis <= 0n ||
+			walletTotal > params.maxFeeSatoshis ||
+			htlcWitness.length < 2 ||
+			htlcWitness
+				.slice(0, 2)
+				.some((signature) => signature.length !== 65 || signature[64] !== 0x81))
+	)
+		throw new Error(
+			'Fixed-output HTLC funding requires bounded inputs and both ALL|ANYONECANPAY signatures'
+		);
 
 	const build = (
 		includeChange: boolean,
@@ -595,7 +653,7 @@ export function attachFeeInputsToZeroFeeHtlcTx(
 			htlcTx.ins[0].index,
 			htlcTx.ins[0].sequence
 		);
-		// output 0: the second-level to-self output — SIGHASH_SINGLE commits to it,
+		// Output 0 is the second-level to-self output committed by the peer,
 		// so it must stay at index 0 with its original value.
 		tx.addOutput(htlcTx.outs[0].script, htlcTx.outs[0].value);
 		for (const w of walletInputs) {
@@ -607,8 +665,8 @@ export function attachFeeInputsToZeroFeeHtlcTx(
 		return tx;
 	};
 
-	// Size the candidate (with change) using dummy witnesses, then derive change.
-	const sizing = build(true, walletTotal);
+	// Size the selected output layout using conservative wallet witnesses.
+	const sizing = build(!params.fixedOutputs, walletTotal);
 	sizing.setWitness(0, htlcWitness);
 	walletInputs.forEach((_, i) =>
 		sizing.setWitness(1 + i, DUMMY_P2WPKH_WITNESS)
@@ -625,7 +683,7 @@ export function attachFeeInputsToZeroFeeHtlcTx(
 		);
 	}
 	// Below dust: fold the change into the fee (drop the change output).
-	const includeChange = change >= P2WPKH_DUST_LIMIT;
+	const includeChange = !params.fixedOutputs && change >= P2WPKH_DUST_LIMIT;
 
 	let tx = build(includeChange, includeChange ? change : 0n);
 	tx.setWitness(0, htlcWitness);

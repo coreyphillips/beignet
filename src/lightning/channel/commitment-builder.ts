@@ -40,7 +40,8 @@ import {
 	HtlcDirection,
 	HtlcState,
 	isAnchorChannel,
-	isTaprootChannel
+	isTaprootChannel,
+	assetHtlcSighashType
 } from './types';
 import {
 	buildTaprootToLocalOutput,
@@ -1513,7 +1514,8 @@ export function signRemoteHtlcSignaturesTaproot(
 			output,
 			Number(meta.amount),
 			leafScript,
-			leafVersion
+			leafVersion,
+			assetHtlcSighashType(state.channelType)
 		);
 		// The signer derives our per-commitment HTLC privkey internally (same
 		// derivation as the ECDSA path in signRemoteCommitment).
@@ -1606,7 +1608,8 @@ export function verifyRemoteHtlcSignaturesTaproot(
 			output,
 			Number(meta.amount),
 			leafScript,
-			leafVersion
+			leafVersion,
+			assetHtlcSighashType(state.channelType)
 		);
 		if (
 			!verifyTaprootHtlcLeaf(sighash, keys.remoteHtlcPubkey, htlcSignatures[k])

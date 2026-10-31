@@ -126,7 +126,9 @@ export enum Feature {
 	 */
 	OPTION_FF_CONCURRENT = 442,
 	/** Signed asset custody terms for the Variant D voucher round. */
-	OPTION_FF_ASSET = 448
+	OPTION_FF_ASSET = 448,
+	/** Native asset HTLC signatures bind the complete second-level output set. */
+	OPTION_ASSET_FIXED_HTLC_OUTPUTS = 450
 }
 
 /**
@@ -360,6 +362,7 @@ export function hasUnsupportedRequiredFeatures(
 			if (
 				(bit === Feature.OPTION_FF_CONCURRENT ||
 					bit === Feature.OPTION_FF_ASSET ||
+					bit === Feature.OPTION_ASSET_FIXED_HTLC_OUTPUTS ||
 					bit === Feature.OPTION_TAPROOT_OVERLAY) &&
 				!localFeatures.hasFeature(bit)
 			) {

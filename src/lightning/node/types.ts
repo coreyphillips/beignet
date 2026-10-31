@@ -110,6 +110,12 @@ export interface IUtxoSelectionOpts {
 
 /** Limits new fee coins and identifies original pledged inputs for a replacement. */
 export interface IFeeBumpSelectionOpts {
+	/** Keep every HTLC output fixed and burn only bounded prepared wallet inputs. */
+	fixedOutputs?: boolean;
+	/** Stable channel and original HTLC outpoint identity across replacements. */
+	feeActionId?: string;
+	/** Optional stricter fixed-output action cap, also retained across retries. */
+	maxFeeSatoshis?: bigint;
 	excludeTxids?: readonly string[];
 	confirmedOnly?: boolean;
 	replacementInputs?: readonly {
@@ -120,6 +126,12 @@ export interface IFeeBumpSelectionOpts {
 }
 
 export interface IFundingProvider {
+	/** True only with durable bounded fixed-output fee preparation configured. */
+	supportsFixedOutputFees?(): boolean;
+	/** Retire one fee action only after irrevocable resolution; lifetime accounting remains charged. */
+	retireFixedOutputFeeAction?(feeActionId: string): Promise<void>;
+	/** Exact canonical native HTLC actions retained for this channel, including abandoned sources. */
+	getFixedOutputFeeActionIds?(channelId: Buffer): readonly string[];
 	/**
 	 * Build (but do not broadcast) the channel funding transaction.
 	 * @param max When true, sweep the whole balance into the funding output (no
@@ -285,6 +297,8 @@ export interface IFundingProvider {
 	): Promise<{
 		inputs: import('../channel/channel').ISpliceWalletInput[];
 		changeScript: Buffer;
+		/** Required independent no-change fee cap for fixed-output HTLCs. */
+		maxFeeSatoshis?: bigint;
 	}>;
 	/** Restore owned, still-pledged P2WPKH signers without releasing their reservations. */
 	restoreFeeBumpInputs?(

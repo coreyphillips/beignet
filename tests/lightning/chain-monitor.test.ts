@@ -269,6 +269,45 @@ describe('Chain Monitor (Phase 4C)', function () {
 		});
 	});
 
+	it('uses fresh funding evidence before retiring abandoned fee actions after restart', () => {
+		const { opener, openerPrivkeys } = setupNormalChannels(),
+			state = opener.getFullState(),
+			destination = makeP2wpkhScript(getPublicKey(openerPrivkeys[0]));
+		const action = opener
+			.forceClose(opener.getSigner()!)
+			.find((item) => item.type === ChannelActionType.BROADCAST_TX);
+		if (action?.type !== ChannelActionType.BROADCAST_TX)
+			throw new Error('Missing commitment');
+		const transaction = bitcoin.Transaction.fromBuffer(action.tx);
+		const monitor = new ChainMonitor(
+			state,
+			destination,
+			10,
+			openerPrivkeys[1],
+			openerPrivkeys[2],
+			network
+		);
+		monitor.handleFundingSpent(transaction, 100);
+		monitor.handleNewBlock(100 + IRREVOCABLE_DEPTH - 1);
+		expect(monitor.isFundingSpendIrrevocable()).equal(false);
+		monitor.handleNewBlock(100 + IRREVOCABLE_DEPTH);
+		expect(monitor.isFundingSpendIrrevocable()).equal(true);
+		const restored = ChainMonitor.restore(
+			monitor.getFullState(),
+			state,
+			destination,
+			10,
+			openerPrivkeys[1],
+			openerPrivkeys[2],
+			network
+		);
+		expect(restored.isFundingSpendIrrevocable()).equal(false);
+		restored.handleFundingSpent(transaction, 100);
+		expect(restored.isFundingSpendIrrevocable()).equal(true);
+		restored.handleFundingSpent(transaction, 0);
+		expect(restored.isFundingSpendIrrevocable()).equal(false);
+	});
+
 	describe('Cooperative Close', function () {
 		it('should resolve only once the close reaches irrevocable depth', function () {
 			const { opener, openerPrivkeys } = setupNormalChannels();

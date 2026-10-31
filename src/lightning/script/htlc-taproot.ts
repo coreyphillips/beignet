@@ -32,9 +32,10 @@ import {
 bitcoin.initEccLib(ecc);
 
 /**
- * BIP342 sighash type for taproot HTLC second-level signatures: SIGHASH_SINGLE
+ * Compatibility sighash type for Taproot HTLC second-level signatures: SIGHASH_SINGLE
  * (0x03) | SIGHASH_ANYONECANPAY (0x80) = 0x83. The byte is implicit on the wire
  * (sigs are 64 bytes) and appended only when assembling the spend witness.
+ * Native asset channel mode 450 instead selects ALL|ANYONECANPAY (0x81).
  */
 export const TAPROOT_HTLC_SIGHASH_TYPE =
 	bitcoin.Transaction.SIGHASH_SINGLE | bitcoin.Transaction.SIGHASH_ANYONECANPAY;
@@ -59,13 +60,14 @@ export function taprootHtlcLeafSighash(
 	htlcOutputScript: Buffer,
 	htlcAmountSat: number,
 	leafScript: Buffer,
-	leafVersion: number = TAPLEAF_VERSION
+	leafVersion: number = TAPLEAF_VERSION,
+	hashType: 0x81 | 0x83 = 0x83
 ): Buffer {
 	return tx.hashForWitnessV1(
 		0,
 		[htlcOutputScript],
 		[htlcAmountSat],
-		TAPROOT_HTLC_SIGHASH_TYPE,
+		hashType,
 		tapleafHash(leafScript, leafVersion)
 	);
 }

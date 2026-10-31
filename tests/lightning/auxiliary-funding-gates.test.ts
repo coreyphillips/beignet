@@ -143,6 +143,7 @@ const pair = (
 				}
 			},
 			auxiliaryChannels: {
+				allowLegacyHtlcSignatures: () => true,
 				provider: fixtureProvider(() => {
 					if (seed === 2) signs++;
 				}),

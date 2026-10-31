@@ -77,6 +77,8 @@ export interface IAuxiliaryForwardPlacement extends IAuxiliaryForwardContext {
 }
 
 export interface IAuxiliaryChannelConfig {
+	/** Explicit new-channel compatibility for peers lacking native fixed-output HTLCs. */
+	allowLegacyHtlcSignatures?(peerPubkey: string): boolean;
 	resolveInteractiveFunding?(
 		peerPubkey: string,
 		sessionId: Buffer,

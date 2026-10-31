@@ -1059,6 +1059,55 @@ describe('UTXO freeze durability', function () {
 		expect(wallet.listFrozenUtxos()[0].freezeTag).to.equal(undefined);
 	});
 
+	it('retains an existing owned freeze after its live UTXO disappears and across restart', async () => {
+		const initial = await wallet.freezeUtxoIfUnfrozen({
+			txid: utxo.tx_hash,
+			index: utxo.tx_pos,
+			tag: 'funding-pledge'
+		});
+		if (initial.isErr()) throw initial.error;
+		const original = wallet.listFrozenUtxos()[0];
+		const spent = await wallet.updateData({ utxos: [], balance: 0 });
+		if (spent.isErr()) throw spent.error;
+		await wallet.stop();
+		const reopened = await Wallet.create({
+			mnemonic: MNEMONIC,
+			name: 'freezedurability',
+			network,
+			storage,
+			electrumOptions,
+			remainOffline: true
+		});
+		if (reopened.isErr()) throw reopened.error;
+		wallet = reopened.value;
+		expect(wallet.data.utxos).length(0);
+		for (const tag of ['funding-pledge', 'another-owner']) {
+			const renewal = await wallet.freezeUtxoIfUnfrozen({
+				txid: utxo.tx_hash,
+				index: utxo.tx_pos,
+				tag
+			});
+			if (renewal.isErr()) throw renewal.error;
+			expect(renewal.value.created).equal(false);
+			expect(wallet.listFrozenUtxos()).deep.equal([original]);
+		}
+		const unknown = await wallet.freezeUtxoIfUnfrozen({
+			txid: TXID_B,
+			index: 0,
+			tag: 'funding-pledge'
+		});
+		expect(unknown.isErr()).equal(true);
+		const reorg = await wallet.updateData({
+			utxos: [utxo],
+			balance: utxo.value
+		});
+		if (reorg.isErr()) throw reorg.error;
+		expect(wallet.isUtxoFrozen(utxo.tx_hash, utxo.tx_pos)).equal(true);
+		expect(
+			JSON.parse(store.get('freezedurability-regtest-blacklistedUtxos')!)
+		).deep.equal([original]);
+	});
+
 	it('an untagged freeze takes over a tagged one', async () => {
 		// The tagged owner lifts only entries that still carry its tag, so the
 		// user's freeze has to clear it to outlive that owner's release.

@@ -11,6 +11,8 @@ import {
 
 /** Funding-specific public data retained for historical commitment recovery. */
 export interface IFundingEpoch {
+	/** Exact immutable commitment profile for this historical funding. */
+	channelType?: Buffer;
 	fundingTxid: Buffer;
 	fundingOutputIndex: number;
 	fundingSatoshis: bigint;
@@ -35,6 +37,7 @@ const keyOf = (txid: Buffer, index: number): string =>
 	`${txid.toString('hex')}:${index}`;
 export function serializeFundingEpoch(epoch: IFundingEpoch) {
 	return {
+		channelType: epoch.channelType?.toString('hex'),
 		fundingTxid: epoch.fundingTxid.toString('hex'),
 		fundingOutputIndex: epoch.fundingOutputIndex,
 		fundingSatoshis: epoch.fundingSatoshis.toString(),
@@ -99,7 +102,15 @@ export function deserializeFundingEpoch(
 			(!Number.isInteger(rate) || rate < 0 || rate > 0xffffffff)
 		)
 			throw new Error('Invalid historical commitment feerate');
+	if (
+		value.channelType !== undefined &&
+		!/^(?:[0-9a-f]{2}){1,512}$/.test(value.channelType)
+	)
+		throw new Error('Invalid historical channel type');
 	return {
+		...(value.channelType !== undefined
+			? { channelType: Buffer.from(value.channelType, 'hex') }
+			: {}),
 		fundingTxid: bytes(value.fundingTxid, 32),
 		fundingOutputIndex: value.fundingOutputIndex,
 		fundingSatoshis: amount(value.fundingSatoshis),
@@ -173,6 +184,7 @@ export function retainFundingEpoch(state: IChannelState): void {
 		throw new Error('Cannot retain an unbound funding epoch');
 	const snapshot = deserializeFundingEpoch(
 		serializeFundingEpoch({
+			...(state.channelType ? { channelType: state.channelType } : {}),
 			fundingTxid: state.fundingTxid,
 			fundingOutputIndex: state.fundingOutputIndex,
 			fundingSatoshis: state.fundingSatoshis,

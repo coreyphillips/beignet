@@ -275,12 +275,21 @@ export function validateAuxiliaryChannelType(
 	channelType: Buffer | null | undefined
 ): string | null {
 	const overlay = isOverlayChannel(channelType);
+	if (
+		channelType &&
+		FeatureFlags.fromBuffer(channelType).hasFeature(
+			Feature.OPTION_ASSET_FIXED_HTLC_OUTPUTS
+		) &&
+		!overlay
+	)
+		return 'Fixed HTLC outputs require an asset overlay channel';
 	if (!overlay && !state.auxiliaryState && !state.fundingTaprootMerkleRoot)
 		return null;
 	if (!overlay || !channelType || channelType[0] === 0)
 		return 'Asset channel requires the Taproot overlay channel type';
 	const allowed = new Set<number>([
 		Feature.OPTION_TAPROOT_OVERLAY,
+		Feature.OPTION_ASSET_FIXED_HTLC_OUTPUTS,
 		Feature.SCID_ALIAS,
 		Feature.ZERO_CONF
 	]);

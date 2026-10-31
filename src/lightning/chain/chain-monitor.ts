@@ -48,7 +48,11 @@ import {
 } from '../keys/derivation';
 import { generateFromSeed, MAX_INDEX } from '../keys/shachain';
 import type { IChannelState } from '../channel/channel-state';
-import { isAnchorChannel } from '../channel/types';
+import {
+	isAnchorChannel,
+	isFixedAssetHtlcChannel,
+	assetHtlcSighashType
+} from '../channel/types';
 
 /** Number of blocks before re-broadcasting unconfirmed sweeps */
 const REBROADCAST_INTERVAL = 6;
@@ -96,6 +100,7 @@ export class ChainMonitor {
 	 * fresh chain evidence.
 	 */
 	private _commitmentReverifyPending = false;
+	private _verifiedFundingSpender: string | undefined;
 
 	private _auxiliaryFeeGenerations = new WeakMap<ITrackedOutput, number>();
 	private _auxiliaryFeeFunding = new Map<
@@ -599,6 +604,18 @@ export class ChainMonitor {
 		return this._commitmentReverifyPending;
 	}
 
+	/** Whether fresh chain evidence or a previously finalized monitor makes the funding spend final. */
+	isFundingSpendIrrevocable(): boolean {
+		const spend = this._commitmentBroadcast;
+		return (
+			!!spend &&
+			spend.blockHeight > 0 &&
+			(this.isFullyResolved() ||
+				(this._verifiedFundingSpender === spend.txid &&
+					this._currentBlockHeight - spend.blockHeight >= IRREVOCABLE_DEPTH))
+		);
+	}
+
 	/**
 	 * An unspent output only the PEER can spend: its to_remote on OUR
 	 * commitment, or its own to_local on ITS current (unrevoked) commitment.
@@ -706,6 +723,8 @@ export class ChainMonitor {
 		// window the restore reset opened: every arm below either binds a height,
 		// demotes on a competing spend, or replaces the record outright.
 		this._commitmentReverifyPending = false;
+		this._verifiedFundingSpender =
+			blockHeight > 0 ? spendingTx.getId() : undefined;
 		if (this._state !== MonitorState.WATCHING) {
 			// Commitment SWAP: a DIFFERENT tx now spends the funding output. The
 			// funding outpoint can only be spent once per chain, so a confirmed
@@ -1020,6 +1039,20 @@ export class ChainMonitor {
 				if (ourCommitment) {
 					const ourAnchorHtlc = isAnchorChannel(this._channelState.channelType);
 					if (
+						output.auxiliaryFeePreparationPending &&
+						output.status === OutputStatus.SPEND_BROADCAST &&
+						output.sweepTxHex
+					) {
+						actions.push(
+							this._broadcastSweepAction(
+								output,
+								Buffer.from(output.sweepTxHex, 'hex'),
+								'asset HTLC fee preparation retry'
+							)
+						);
+						continue;
+					}
+					if (
 						ourAnchorHtlc &&
 						output.status === OutputStatus.SPEND_BROADCAST &&
 						output.broadcastHeight !== undefined &&
@@ -1332,8 +1365,16 @@ export class ChainMonitor {
 					// (SIGHASH_SINGLE|ANYONECANPAY keeps that input/witness unchanged).
 					// Without this match the fee-bumped HTLC tx's CSV output would
 					// never be tracked or swept.
-					const tIn = template.ins[0];
-					const sIn = spendingTx.ins[0];
+					const assetInput = (transaction: bitcoin.Transaction) =>
+						isFixedAssetHtlcChannel(this._channelState.channelType)
+							? transaction.ins.find(
+									(input) =>
+										Buffer.from(input.hash).reverse().toString('hex') ===
+											output.txid && input.index === output.outputIndex
+							  )
+							: transaction.ins[0];
+					const tIn = assetInput(template);
+					const sIn = assetInput(spendingTx);
 					// Output 0 must ALSO be the expected second-level CSV output:
 					// byte-equal script and exact value versus the pre-signed
 					// template. The SIGHASH_SINGLE|ANYONECANPAY witness already binds
@@ -1344,7 +1385,8 @@ export class ChainMonitor {
 					const tOut = template.outs[0];
 					const sOut = spendingTx.outs[0];
 					isOurSecondLevel =
-						(output.auxiliaryData
+						(output.auxiliaryData ||
+						isFixedAssetHtlcChannel(this._channelState.channelType)
 							? this._matchesAuxiliaryHtlcFunding(output, template, spendingTx)
 							: true) &&
 						!!tIn &&
@@ -1373,7 +1415,8 @@ export class ChainMonitor {
 						?.auxiliaryData ??
 					output.auxiliaryData;
 				if (
-					output.auxiliaryData &&
+					(output.auxiliaryData ||
+						isFixedAssetHtlcChannel(this._channelState.channelType)) &&
 					this._matchesAuxiliaryHtlcFunding(
 						output,
 						secondLevelTemplate!,
@@ -2132,8 +2175,18 @@ export class ChainMonitor {
 		transaction: bitcoin.Transaction
 	): boolean {
 		try {
-			const original = template.ins[0],
-				actual = transaction.ins[0];
+			const fixed = isFixedAssetHtlcChannel(this._channelState.channelType);
+			const sourceIndex = (tx: bitcoin.Transaction) =>
+				fixed
+					? tx.ins.findIndex(
+							(input) =>
+								Buffer.from(input.hash).reverse().toString('hex') ===
+									output.txid && input.index === output.outputIndex
+					  )
+					: 0;
+			const actualIndex = sourceIndex(transaction);
+			const original = template.ins[sourceIndex(template)],
+				actual = transaction.ins[actualIndex];
 			if (
 				!original ||
 				!actual ||
@@ -2141,7 +2194,8 @@ export class ChainMonitor {
 				!this._commitmentBroadcast ||
 				(original.witness.length !== 4 && original.witness.length !== 5) ||
 				original.witness[0].length !== 65 ||
-				original.witness[0][64] !== 0x83 ||
+				original.witness[0][64] !==
+					assetHtlcSighashType(this._channelState.channelType) ||
 				original.witness[1].length !== 65 ||
 				original.witness[1][64] !== 0x81 ||
 				template.version !== transaction.version ||
@@ -2178,24 +2232,36 @@ export class ChainMonitor {
 				this._channelState.localBasepoints.htlcBasepoint,
 				point
 			);
-			const digest = transaction.hashForWitnessV1(
-				0,
-				transaction.ins.map((_, index) =>
-					index === 0 ? output.witnessScript! : Buffer.alloc(0)
-				),
-				transaction.ins.map((_, index) =>
-					index === 0 ? Number(output.amount) : 0
-				),
-				0x81,
-				tapleafHash(
-					actual.witness[actual.witness.length - 2],
-					actual.witness[actual.witness.length - 1][0] & 0xfe
+			const digest = (hashType: number) =>
+				transaction.hashForWitnessV1(
+					actualIndex,
+					transaction.ins.map((_, index) =>
+						index === actualIndex ? output.witnessScript! : Buffer.alloc(0)
+					),
+					transaction.ins.map((_, index) =>
+						index === actualIndex ? Number(output.amount) : 0
+					),
+					hashType,
+					tapleafHash(
+						actual.witness[actual.witness.length - 2],
+						actual.witness[actual.witness.length - 1][0] & 0xfe
+					)
+				);
+			return (
+				verifyTaprootHtlcLeaf(
+					digest(0x81),
+					publicKey,
+					actual.witness[1].subarray(0, 64)
+				) &&
+				!!this._channelState.remoteBasepoints &&
+				verifyTaprootHtlcLeaf(
+					digest(assetHtlcSighashType(this._channelState.channelType)),
+					derivePublicKey(
+						this._channelState.remoteBasepoints.htlcBasepoint,
+						point
+					),
+					actual.witness[0].subarray(0, 64)
 				)
-			);
-			return verifyTaprootHtlcLeaf(
-				digest,
-				publicKey,
-				actual.witness[1].subarray(0, 64)
 			);
 		} catch {
 			return false;
@@ -2209,8 +2275,10 @@ export class ChainMonitor {
 	) {
 		const prevout = output.witnessScript;
 		const witness = base.ins[0]?.witness;
+		const mode = assetHtlcSighashType(this._channelState.channelType);
 		if (
 			!this._htlcBasepointSecret ||
+			!this._channelState.remoteBasepoints ||
 			!this._commitmentBroadcast ||
 			!prevout ||
 			prevout.length !== 34 ||
@@ -2221,9 +2289,9 @@ export class ChainMonitor {
 			!witness ||
 			(witness.length !== 4 && witness.length !== 5) ||
 			witness[0].length !== 65 ||
-			witness[0][64] !== 0x83 ||
+			witness[0][64] !== mode ||
 			witness[1].length !== 65 ||
-			witness[1][64] !== 0x83 ||
+			witness[1][64] !== mode ||
 			Buffer.from(base.ins[0].hash).reverse().toString('hex') !== output.txid ||
 			base.ins[0].index !== output.outputIndex ||
 			BigInt(base.outs[0].value) !== output.amount
@@ -2262,9 +2330,17 @@ export class ChainMonitor {
 			);
 		if (
 			!verifyTaprootHtlcLeaf(
-				digest(base, 0x83),
+				digest(base, mode),
 				publicKey,
 				witness[1].subarray(0, 64)
+			) ||
+			!verifyTaprootHtlcLeaf(
+				digest(base, mode),
+				derivePublicKey(
+					this._channelState.remoteBasepoints.htlcBasepoint,
+					point
+				),
+				witness[0].subarray(0, 64)
 			)
 		)
 			throw new Error(
@@ -2276,6 +2352,7 @@ export class ChainMonitor {
 			transaction.ins.length > 1 &&
 			transaction.outs.length >= 1 &&
 			transaction.outs.length <= 2 &&
+			(mode !== 0x81 || transaction.outs.length === 1) &&
 			transaction.ins[0].hash.equals(base.ins[0].hash) &&
 			transaction.ins[0].index === base.ins[0].index &&
 			transaction.ins[0].sequence === base.ins[0].sequence &&
@@ -2347,9 +2424,19 @@ export class ChainMonitor {
 				this._auxiliaryFeeGenerations.set(candidate, generation);
 				return { candidate, hex: candidate.sweepTxHex, generation };
 			});
+			const isCurrent = (): boolean =>
+				!expected.some(
+					({ candidate, hex, generation }) =>
+						!this._trackedOutputs.includes(candidate) ||
+						candidate.sweepTxHex !== hex ||
+						this._auxiliaryFeeGenerations.get(candidate) !== generation ||
+						candidate.status === OutputStatus.SPEND_CONFIRMED ||
+						candidate.status === OutputStatus.IRREVOCABLY_RESOLVED
+				);
 			return {
 				type: ChainActionType.FEE_BUMP_AND_BROADCAST,
 				kind: 'auxiliary-sweep-fee-attach',
+				isCurrent,
 				...feeSelection,
 				tx: base.toBuffer(),
 				description,
@@ -2358,17 +2445,7 @@ export class ChainMonitor {
 					...funding,
 					previousFee: feeSelection.previousFee,
 					finalize: (raw, data, fee): boolean => {
-						if (
-							expected.some(
-								({ candidate, hex, generation }) =>
-									!this._trackedOutputs.includes(candidate) ||
-									candidate.sweepTxHex !== hex ||
-									this._auxiliaryFeeGenerations.get(candidate) !== generation ||
-									candidate.status === OutputStatus.SPEND_CONFIRMED ||
-									candidate.status === OutputStatus.IRREVOCABLY_RESOLVED
-							)
-						)
-							return false;
+						if (!isCurrent()) return false;
 						const funded = bitcoin.Transaction.fromBuffer(raw);
 						if (
 							covered.some(
@@ -2410,7 +2487,9 @@ export class ChainMonitor {
 			(output.outputType === OutputType.OFFERED_HTLC ||
 				output.outputType === OutputType.RECEIVED_HTLC)
 		) {
-			if (!output.auxiliaryData)
+			const fixed = isFixedAssetHtlcChannel(this._channelState.channelType);
+			const guarded = !!output.auxiliaryData || fixed;
+			if (!guarded)
 				return {
 					type: ChainActionType.FEE_BUMP_AND_BROADCAST,
 					kind: 'htlc-fee-attach',
@@ -2418,7 +2497,7 @@ export class ChainMonitor {
 					description,
 					feeratePerVbyte: output.currentFeeRate || this._feeRatePerVbyte
 				};
-			if (output.auxiliaryData && output.auxiliaryHtlcFeeFunded)
+			if (output.auxiliaryHtlcFeeFunded)
 				return {
 					type: ChainActionType.BROADCAST_TX,
 					tx: txBuf,
@@ -2429,27 +2508,33 @@ export class ChainMonitor {
 				expected = output.sweepTxHex,
 				generation = (this._auxiliaryFeeGenerations.get(output) ?? 0) + 1;
 			const outputBinding = this._auxiliaryHtlcOutputBinding(output, base);
-			if (output.auxiliaryData)
-				this._auxiliaryFeeGenerations.set(output, generation);
+			if (guarded) this._auxiliaryFeeGenerations.set(output, generation);
+			const isCurrent = (): boolean =>
+				this._trackedOutputs.includes(output) &&
+				output.sweepTxHex === expected &&
+				this._auxiliaryFeeGenerations.get(output) === generation &&
+				output.status !== OutputStatus.SPEND_CONFIRMED &&
+				output.status !== OutputStatus.IRREVOCABLY_RESOLVED;
+
 			return {
 				type: ChainActionType.FEE_BUMP_AND_BROADCAST,
 				kind: 'htlc-fee-attach',
+				isCurrent,
 				...this._auxiliaryFeeSelectionContext(base, output),
+				fixedHtlcOutputs: fixed,
 				tx: txBuf,
 				description,
 				feeratePerVbyte: output.currentFeeRate || this._feeRatePerVbyte,
-				...(output.auxiliaryData
+				...(guarded
 					? {
 							signHtlcFunding: outputBinding.sign,
+							deferHtlcFunding: (): boolean => {
+								if (!isCurrent()) return false;
+								output.auxiliaryFeePreparationPending = true;
+								return true;
+							},
 							finalizeHtlcFunding: (raw: Buffer, fee?: bigint): boolean => {
-								if (
-									!this._trackedOutputs.includes(output) ||
-									output.sweepTxHex !== expected ||
-									this._auxiliaryFeeGenerations.get(output) !== generation ||
-									output.status === OutputStatus.SPEND_CONFIRMED ||
-									output.status === OutputStatus.IRREVOCABLY_RESOLVED
-								)
-									return false;
+								if (!isCurrent()) return false;
 								const funded = bitcoin.Transaction.fromBuffer(raw);
 								if (!outputBinding.verify(funded)) return false;
 								if (
@@ -2486,6 +2571,7 @@ export class ChainMonitor {
 								)
 									return false;
 								output.sweepTxHex = funded.toHex();
+								delete output.auxiliaryFeePreparationPending;
 								output.auxiliaryHtlcFeeFunded = true;
 								if (fee !== undefined) output.auxiliarySweepFee = fee;
 								output.status = OutputStatus.SPEND_BROADCAST;

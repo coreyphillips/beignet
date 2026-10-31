@@ -459,7 +459,8 @@ import {
 	CommitmentType,
 	MonitorState,
 	OutputStatus,
-	OutputType
+	OutputType,
+	parseFixedOutputHtlcFeeActionId
 } from '../chain/types';
 import { ChainMonitor } from '../chain/chain-monitor';
 import type { ElectrumBackend } from '../chain/electrum-backend';
@@ -1438,6 +1439,14 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	> = new Map();
 	private fundingPubkey: Buffer;
 	private fundingProvider: IFundingProvider | null = null;
+	private readonly retiredFixedFeeActions = new WeakMap<
+		IFundingProvider,
+		Set<string>
+	>();
+	private readonly retiringFixedFeeActions = new WeakMap<
+		IFundingProvider,
+		Set<string>
+	>();
 	private fundingPrivkey: Buffer;
 	/** Custom channel-signer factory (see INodeConfig.signerFactory). */
 	private signerFactory: SignerFactory | undefined;
@@ -2125,7 +2134,15 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			// The overlay feature depends on simple Taproot in the peer init vector.
 			localFeatures.setOptional(Feature.OPTION_TAPROOT);
 			localFeatures.setOptional(Feature.OPTION_TAPROOT_OVERLAY);
+			if (config.fundingProvider?.supportsFixedOutputFees?.() === true)
+				localFeatures.setOptional(Feature.OPTION_ASSET_FIXED_HTLC_OUTPUTS);
+			else {
+				localFeatures.clearBit(Feature.OPTION_ASSET_FIXED_HTLC_OUTPUTS);
+				localFeatures.clearBit(Feature.OPTION_ASSET_FIXED_HTLC_OUTPUTS + 1);
+			}
 		} else {
+			localFeatures.clearBit(Feature.OPTION_ASSET_FIXED_HTLC_OUTPUTS);
+			localFeatures.clearBit(Feature.OPTION_ASSET_FIXED_HTLC_OUTPUTS + 1);
 			localFeatures.clearBit(2025);
 			localFeatures.clearBit(2026);
 		}
@@ -8762,9 +8779,84 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	 * follows the monitor lifetime even when its channel has closed. Renewal is
 	 * best effort; a failure is reported and retried on the next chain event.
 	 */
+	/** Return unused bounded fee coins only after durable monitor finality. */
+	private retireFinalFixedFeeActions(
+		channelId: string,
+		monitor: ChainMonitor
+	): void {
+		const provider = this.fundingProvider;
+		if (
+			!provider?.retireFixedOutputFeeAction ||
+			!provider.getFixedOutputFeeActionIds ||
+			(this.recovery &&
+				(this.dirtyMonitors.has(channelId) ||
+					this.monitorsAwaitingChannel.has(channelId) ||
+					this.openTransitions.includes(channelId)))
+		)
+			return;
+		let completed = this.retiredFixedFeeActions.get(provider),
+			pending = this.retiringFixedFeeActions.get(provider);
+		if (!completed) {
+			completed = new Set();
+			this.retiredFixedFeeActions.set(provider, completed);
+		}
+		if (!pending) {
+			pending = new Set();
+			this.retiringFixedFeeActions.set(provider, pending);
+		}
+		const outputs = monitor.getTrackedOutputs(),
+			fundingFinal = monitor.isFundingSpendIrrevocable();
+		let ids: readonly string[];
+		try {
+			ids = provider.getFixedOutputFeeActionIds(Buffer.from(channelId, 'hex'));
+		} catch (error) {
+			this.emitStructuredLog('chain', 'fixed_fee_retirement_failed', {
+				channelId,
+				error: (error as Error).message
+			});
+			return;
+		}
+		for (const id of ids) {
+			const parsed = parseFixedOutputHtlcFeeActionId(id);
+			if (
+				!parsed ||
+				parsed.channelId.toString('hex') !== channelId ||
+				completed.has(id) ||
+				pending.has(id)
+			)
+				continue;
+			const source = outputs.find(
+				(output) =>
+					output.txid === parsed.txid &&
+					output.outputIndex === parsed.outputIndex
+			);
+			if (
+				source
+					? source.status !== OutputStatus.IRREVOCABLY_RESOLVED ||
+					  source.spendReverifyPending === true
+					: !fundingFinal
+			)
+				continue;
+			pending.add(id);
+			const done = completed,
+				active = pending;
+			Promise.resolve()
+				.then(() => provider.retireFixedOutputFeeAction!(id))
+				.then(() => done.add(id))
+				.catch((error) =>
+					this.emitStructuredLog('chain', 'fixed_fee_retirement_failed', {
+						channelId,
+						error: (error as Error).message
+					})
+				)
+				.finally(() => active.delete(id));
+		}
+	}
+
 	private renewAuxiliarySweepPledges(): void {
 		const transactions = new Set<string>();
-		for (const monitor of this.channelManager.getMonitors().values()) {
+		for (const [channelId, monitor] of this.channelManager.getMonitors()) {
+			this.retireFinalFixedFeeActions(channelId, monitor);
 			if (monitor.isFullyResolved()) continue;
 			for (const output of monitor.getTrackedOutputs()) {
 				if (
@@ -12382,6 +12474,13 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 					: state.remoteConfig.dustLimitSatoshis,
 			...(scid ? { shortChannelId: Buffer.from(scid) } : {})
 		};
+	}
+
+	/** Preflight new asset-channel compatibility before the wallet prepares funding. */
+	getAuxiliaryHtlcMode(peerPubkey: string): 'fixed' | 'legacy' {
+		const error = validateHexPubkey(peerPubkey, 'peerPubkey');
+		if (error) throw new InvalidChannelOpenError(error);
+		return this.channelManager.getAuxiliaryHtlcMode(peerPubkey);
 	}
 
 	/** Begin an asset channel after the peer has verified the funding assets. */

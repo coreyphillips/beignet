@@ -58,8 +58,7 @@ import {
 	buildTaprootHtlcTimeoutTx,
 	taprootHtlcLeafSighash,
 	tapleafHash,
-	signTaprootHtlcLeaf,
-	TAPROOT_HTLC_SIGHASH_TYPE
+	signTaprootHtlcLeaf
 } from '../script/htlc-taproot';
 import {
 	buildPenaltyTx,
@@ -89,7 +88,8 @@ import {
 	HtlcDirection,
 	HtlcState,
 	isAnchorChannel,
-	isTaprootChannel
+	isTaprootChannel,
+	assetHtlcSighashType
 } from '../channel/types';
 import {
 	getCommitmentFeeRate,
@@ -2694,7 +2694,8 @@ function resolveOurTaprootCommitmentOutputs(
 	const perCommitmentPoint = perCommitmentPointFromSecret(perCommitmentSecret);
 	const keys = deriveTaprootCommitKeys(state, perCommitmentPoint, true);
 	const toSelfDelay = keys.toSelfDelay;
-	const sighashByte = Buffer.from([TAPROOT_HTLC_SIGHASH_TYPE]);
+	const htlcSighashType = assetHtlcSighashType(state.channelType);
+	const sighashByte = Buffer.from([htlcSighashType]);
 
 	const hasHtlcSig = (o: ITrackedOutput): boolean =>
 		!!htlcBasepointSecret &&
@@ -2915,7 +2916,8 @@ function resolveOurTaprootCommitmentOutputs(
 					htlcOut.output,
 					Number(output.amount),
 					htlcOut.timeout.script,
-					htlcOut.timeout.leafVersion
+					htlcOut.timeout.leafVersion,
+					htlcSighashType
 				);
 				const localSig = signTaprootHtlcLeaf(sighash, localHtlcPrivkey);
 				const remoteSig = remoteHtlcSignatures![output.htlcSigIndex!];
@@ -2997,7 +2999,8 @@ function resolveOurTaprootCommitmentOutputs(
 					htlcOut.output,
 					Number(output.amount),
 					htlcOut.success.script,
-					htlcOut.success.leafVersion
+					htlcOut.success.leafVersion,
+					htlcSighashType
 				);
 				const localSig = signTaprootHtlcLeaf(sighash, localHtlcPrivkey);
 				const remoteSig = remoteHtlcSignatures![output.htlcSigIndex!];

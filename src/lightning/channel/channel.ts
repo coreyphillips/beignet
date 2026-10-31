@@ -1834,11 +1834,14 @@ export class Channel {
 	 * Initiate opening a channel. Sends open_channel.
 	 * @param chainHash - Optional chain hash (defaults to Bitcoin mainnet)
 	 * @param preferAnchors - If true, negotiate option_anchors_zero_fee_htlc_tx
+	 * @param preferTaproot - If true, negotiate simple Taproot commitments
+	 * @param fixedAssetHtlcOutputs - Require the mutually negotiated native asset HTLC mode
 	 */
 	initiateOpen(
 		chainHash?: Buffer,
 		preferAnchors?: boolean,
-		preferTaproot?: boolean
+		preferTaproot?: boolean,
+		fixedAssetHtlcOutputs = false
 	): ChannelAction[] {
 		if (this._state.state !== ChannelState.NONE) {
 			return [
@@ -1894,6 +1897,8 @@ export class Channel {
 			};
 			preferTaproot = true;
 			channelTypeFlags.setCompulsory(Feature.OPTION_TAPROOT_OVERLAY);
+			if (fixedAssetHtlcOutputs)
+				channelTypeFlags.setCompulsory(Feature.OPTION_ASSET_FIXED_HTLC_OUTPUTS);
 		} else if (preferTaproot) {
 			channelTypeFlags.setCompulsory(Feature.OPTION_TAPROOT);
 		} else {

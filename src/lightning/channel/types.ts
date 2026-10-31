@@ -48,6 +48,25 @@ export function isOverlayChannel(
 	);
 }
 
+/** Immutable native asset channel mode, fixed when its channel type is accepted. */
+export function isFixedAssetHtlcChannel(
+	channelType: Buffer | null | undefined
+): boolean {
+	return (
+		isOverlayChannel(channelType) &&
+		FeatureFlags.fromBuffer(channelType!).hasBit(
+			Feature.OPTION_ASSET_FIXED_HTLC_OUTPUTS
+		)
+	);
+}
+
+/** Bitcoin HTLC signature mode encoded implicitly by the negotiated channel type. */
+export function assetHtlcSighashType(
+	channelType: Buffer | null | undefined
+): 0x81 | 0x83 {
+	return isFixedAssetHtlcChannel(channelType) ? 0x81 : 0x83;
+}
+
 /**
  * Check whether a negotiated channel_type includes option_scid_alias.
  *
@@ -121,8 +140,21 @@ export function validateV2ChannelType(
 	if (taproot && nativeFunding) {
 		allowed.setCompulsory(Feature.OPTION_TAPROOT);
 		allowed.setCompulsory(Feature.OPTION_TAPROOT_OVERLAY);
+		if (isOverlayChannel(channelType))
+			allowed.setCompulsory(Feature.OPTION_ASSET_FIXED_HTLC_OUTPUTS);
 	}
 	const mask = allowed.toBuffer();
+	if (flags.hasFeature(Feature.OPTION_ASSET_FIXED_HTLC_OUTPUTS)) {
+		if (!isOverlayChannel(channelType))
+			return 'Fixed HTLC outputs require an asset overlay channel';
+		if (
+			(localFeatures &&
+				!localFeatures.hasFeature(Feature.OPTION_ASSET_FIXED_HTLC_OUTPUTS)) ||
+			(remoteFeatures &&
+				!remoteFeatures.hasFeature(Feature.OPTION_ASSET_FIXED_HTLC_OUTPUTS))
+		)
+			return 'Fixed asset HTLC outputs were not negotiated';
+	}
 	for (let i = 0; i < channelType.length; i++) {
 		const bits = channelType[channelType.length - 1 - i];
 		const permitted = i < mask.length ? mask[mask.length - 1 - i] : 0;

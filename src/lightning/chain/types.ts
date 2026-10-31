@@ -1,4 +1,40 @@
 import type { HtlcDirection } from '../channel/types';
+
+/** Stable identity for a bounded fee reservation attached to one channel HTLC source. */
+export function fixedOutputHtlcFeeActionId(
+	channelId: Buffer,
+	txid: string,
+	outputIndex: number
+): string {
+	if (
+		channelId.length !== 32 ||
+		!/^[0-9a-f]{64}$/i.test(txid) ||
+		!Number.isInteger(outputIndex) ||
+		outputIndex < 0 ||
+		outputIndex > 0xffffffff
+	)
+		throw new Error('Invalid fixed-output HTLC fee identity');
+	return `asset-htlc:${channelId.toString(
+		'hex'
+	)}:${txid.toLowerCase()}:${outputIndex}`;
+}
+
+/** Parse only a complete canonical HTLC fee identity, never a namespace prefix. */
+export function parseFixedOutputHtlcFeeActionId(
+	value: string
+): { channelId: Buffer; txid: string; outputIndex: number } | undefined {
+	const match =
+		/^asset-htlc:([0-9a-f]{64}):([0-9a-f]{64}):(0|[1-9][0-9]*)$/.exec(value);
+	if (!match) return undefined;
+	const outputIndex = Number(match[3]);
+	if (!Number.isSafeInteger(outputIndex) || outputIndex > 0xffffffff)
+		return undefined;
+	return {
+		channelId: Buffer.from(match[1], 'hex'),
+		txid: match[2],
+		outputIndex
+	};
+}
 /**
  * BOLT 5: Chain monitor types.
  *
@@ -50,6 +86,8 @@ export interface ITrackedOutput {
 	auxiliaryFeeFunded?: boolean;
 	/** The stored first-level HTLC transaction already has wallet fee signatures. */
 	auxiliaryHtlcFeeFunded?: boolean;
+	/** A durable fee split is awaiting confirmation before this claim can be funded. */
+	auxiliaryFeePreparationPending?: boolean;
 	/** Exact paid fee of the last finalized sponsored candidate. */
 	auxiliarySweepFee?: bigint;
 	/** Parent HTLC asset transition, retained separately from the terminal claim. */
@@ -287,8 +325,14 @@ export interface IAuxiliarySweepFeeAttachment {
 export interface IFeeBumpAndBroadcastChainAction {
 	type: ChainActionType.FEE_BUMP_AND_BROADCAST;
 	kind: 'htlc-fee-attach' | 'anchor-cpfp' | 'auxiliary-sweep-fee-attach';
+	/** Whether this monitor generation still needs its funded transaction. */
+	isCurrent?(): boolean;
+	/** Negotiated peer signatures forbid appending any HTLC transaction outputs. */
+	fixedHtlcOutputs?: boolean;
 	/** Bind the broadcaster's HTLC signature to every final output before wallet signing. */
 	signHtlcFunding?(transaction: Buffer): Buffer;
+	/** Retry a still-current claim on the next block after fee preparation publishes. */
+	deferHtlcFunding?(): boolean;
 	/** Persist the exact sponsored HTLC parent before broadcast. */
 	finalizeHtlcFunding?(transaction: Buffer, fee?: bigint): boolean;
 	/** Highest paid fee among retained candidates conflicting with this action. */

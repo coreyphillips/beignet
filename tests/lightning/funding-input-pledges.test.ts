@@ -1254,7 +1254,7 @@ describe('Funding input pledges', function () {
 			}
 		});
 
-		describe('a refused renewal keeps its freeze through refused user unfreezes on either side (issue #1267)', function () {
+		describe('an idempotent renewal keeps its freeze through refused user unfreezes on either side (issue #1267)', function () {
 			for (const { name: endName, end } of endings) {
 				it(`when ${endName}`, async function () {
 					const provider = new WalletFundingProvider(wallet as never);
@@ -1292,7 +1292,10 @@ describe('Funding input pledges', function () {
 					const userB = wallet.unfreezeUtxo({ txid: TXID_X, index: 0 });
 					finishA();
 					expect((await userA).isErr()).to.equal(true);
-					expect((await renewal)?.message).to.match(/not known/);
+					// A restored our durable freeze before renewal acquired the lock.
+					// The spent coin no longer needs a new live-UTXO freeze, and the
+					// successful renewal must retain ownership while B can roll back.
+					expect(await renewal).to.equal(null);
 					expect(wallet.isUtxoFrozen(TXID_X, 0)).to.equal(false);
 
 					finishB();

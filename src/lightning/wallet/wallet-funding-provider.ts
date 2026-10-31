@@ -1,4 +1,6 @@
 import { EAddressType } from '../../types';
+import { FixedOutputFeePool } from './fixed-output-fees';
+import type { IFixedOutputFeePolicy } from './fixed-output-fees';
 /**
  * Wallet funding provider adapter.
  *
@@ -91,7 +93,7 @@ export interface ISpliceUtxo {
 }
 
 /**
- * Minimal wallet interface — only the methods we need.
+ * Minimal wallet interface with only the methods we need.
  * Structurally compatible with beignet's Wallet class without
  * requiring an import dependency on it.
  *
@@ -100,6 +102,11 @@ export interface ISpliceUtxo {
  * them, and selectSpliceInputs throws a descriptive error if they are missing.
  */
 export interface IWalletLike {
+	id?: string;
+	signPsbtWithOurKey?(psbt: string): IResult;
+	importSignedPsbt?(signed: string, unsigned?: string): IResult;
+	/** Run an explicit preparation without racing ordinary wallet sends. */
+	withSendLock?<T>(fn: () => Promise<T>): Promise<T>;
 	send(params: {
 		address: string;
 		amount: number;
@@ -190,6 +197,7 @@ export interface IWalletLike {
  */
 export class WalletFundingProvider implements IFundingProvider {
 	private wallet: IWalletLike;
+	private fixedOutputFeePool?: FixedOutputFeePool;
 
 	/**
 	 * Outpoints pledged to an in-flight funding, keyed txid:vout with the
@@ -238,16 +246,93 @@ export class WalletFundingProvider implements IFundingProvider {
 	 * network events) is also the one that interleaves, so the whole
 	 * select-and-pledge critical section runs under one lock.
 	 */
-	private selectionLock: Promise<unknown> = Promise.resolve();
+	private static readonly walletLocks = new Map<
+		string | IWalletLike,
+		Promise<unknown>
+	>();
 
-	constructor(wallet: IWalletLike) {
+	constructor(
+		wallet: IWalletLike,
+		options: { fixedOutputFees?: IFixedOutputFeePolicy } = {}
+	) {
 		this.wallet = wallet;
+		if (options.fixedOutputFees)
+			this.fixedOutputFeePool = new FixedOutputFeePool(
+				wallet,
+				options.fixedOutputFees,
+				{
+					previousTransactions: (ids): Promise<Map<string, string>> =>
+						this.previousTransactions(ids),
+					input: (coin, raw): ISpliceWalletInput =>
+						this.walletInput(coin, raw, 'fixed-output fee'),
+					pledge: async (txid, index, tag): Promise<void> => {
+						this.adoptStalePledges();
+						const existing = this.wallet
+							.listFrozenUtxos?.()
+							.find((coin) => coin.tx_hash === txid && coin.tx_pos === index);
+						if (existing && existing.freezeTag !== tag)
+							throw new Error(
+								'Fixed-output fee coin is reserved by another owner'
+							);
+						const refusal = await this.pledge(txid, index, true);
+						if (refusal || !this.ownedFreezes.has(`${txid}:${index}`))
+							throw new Error(
+								'Fixed-output fee pledge was refused or belongs to another owner'
+							);
+					},
+					release: async (txid, index, tag): Promise<void> => {
+						const result = await this.wallet.unfreezeUtxoIfTagged!({
+							txid,
+							index,
+							tag
+						});
+						if (result.isErr())
+							throw new Error(
+								'Fixed-output retired reservation release failed'
+							);
+						if ((result as IResultOk<{ unfrozen: boolean }>).value.unfrozen) {
+							const key = `${txid}:${index}`;
+							this.ownedFreezes.delete(key);
+							this.pledged.delete(key);
+							this.renewedPledges.delete(key);
+						}
+					}
+				}
+			);
+	}
+	supportsFixedOutputFees(): boolean {
+		return this.fixedOutputFeePool !== undefined;
+	}
+
+	/** Release only this action's fee freezes after the host establishes irrevocable resolution. */
+	retireFixedOutputFeeAction(feeActionId: string): Promise<void> {
+		return this.runSelection(async () => {
+			await this.fixedOutputFeePool?.retire(feeActionId);
+		});
+	}
+
+	/** Retained native HTLC actions for one exact channel, excluding fully retired entries. */
+	getFixedOutputFeeActionIds(channelId: Buffer): readonly string[] {
+		return this.fixedOutputFeePool?.actionIds(channelId) ?? [];
 	}
 
 	/** Run fn after every previously queued selection has finished. */
 	private runSelection<T>(fn: () => Promise<T>): Promise<T> {
-		const run = this.selectionLock.then(fn, fn);
-		this.selectionLock = run.catch(() => undefined);
+		const key = this.wallet.id
+			? `${this.wallet.network ?? 'bitcoin'}:${this.wallet.id}`
+			: this.wallet;
+		const prior =
+			WalletFundingProvider.walletLocks.get(key) ?? Promise.resolve();
+		const run = prior.then(fn, fn);
+		const settled = run.then(
+			() => undefined,
+			() => undefined
+		);
+		WalletFundingProvider.walletLocks.set(key, settled);
+		void settled.then(() => {
+			if (WalletFundingProvider.walletLocks.get(key) === settled)
+				WalletFundingProvider.walletLocks.delete(key);
+		});
 		return run;
 	}
 
@@ -269,7 +354,13 @@ export class WalletFundingProvider implements IFundingProvider {
 		renewed = false
 	): Promise<string | null> {
 		const key = `${txid}:${vout}`;
-		const params = { txid, index: vout, tag: WalletFundingProvider.PLEDGE_TAG };
+		const params = {
+			txid,
+			index: vout,
+			tag:
+				this.fixedOutputFeePool?.reservationTag(txid, vout) ??
+				WalletFundingProvider.PLEDGE_TAG
+		};
 		let res: IResult | undefined;
 		let owned: boolean;
 		if (this.wallet.freezeUtxoIfUnfrozen) {
@@ -308,8 +399,7 @@ export class WalletFundingProvider implements IFundingProvider {
 						.listFrozenUtxos?.()
 						.some(
 							(f) =>
-								`${f.tx_hash}:${f.tx_pos}` === key &&
-								f.freezeTag === WalletFundingProvider.PLEDGE_TAG
+								`${f.tx_hash}:${f.tx_pos}` === key && f.freezeTag === params.tag
 						) === true
 				: res !== undefined && !res.isErr();
 		}
@@ -442,7 +532,11 @@ export class WalletFundingProvider implements IFundingProvider {
 		this.adoptedStale = true;
 		const frozen = this.wallet.listFrozenUtxos?.() ?? [];
 		for (const f of frozen) {
-			if (f.freezeTag !== WalletFundingProvider.PLEDGE_TAG) continue;
+			if (
+				f.freezeTag !== WalletFundingProvider.PLEDGE_TAG &&
+				!this.fixedOutputFeePool?.ownsFreeze(f.tx_hash, f.tx_pos, f.freezeTag)
+			)
+				continue;
 			const key = `${f.tx_hash}:${f.tx_pos}`;
 			this.ownedFreezes.add(key);
 			if (this.pledged.has(key)) continue;
@@ -454,6 +548,10 @@ export class WalletFundingProvider implements IFundingProvider {
 	private async prunePledges(
 		protectedInputs?: ReadonlySet<string>
 	): Promise<void> {
+		protectedInputs = new Set([
+			...(protectedInputs ?? []),
+			...(this.fixedOutputFeePool?.reservedOutpoints() ?? [])
+		]);
 		this.adoptStalePledges();
 		if (this.pledged.size === 0 || !this.wallet.listUtxos) return;
 		const utxos = this.wallet.listUtxos();
@@ -513,7 +611,11 @@ export class WalletFundingProvider implements IFundingProvider {
 			this.adoptStalePledges();
 			for (const { txid, vout } of outpoints) {
 				const key = `${txid}:${vout}`;
-				if (!this.pledged.has(key)) continue;
+				if (
+					!this.pledged.has(key) ||
+					this.fixedOutputFeePool?.isReserved(txid, vout)
+				)
+					continue;
 				if (await this.releasePledge(txid, vout)) {
 					this.pledged.delete(key);
 					this.renewedPledges.delete(key);
@@ -703,7 +805,18 @@ export class WalletFundingProvider implements IFundingProvider {
 		targetFeeSats: bigint,
 		feeratePerKw: number,
 		opts?: IFeeBumpSelectionOpts
-	): Promise<{ inputs: ISpliceWalletInput[]; changeScript: Buffer }> {
+	): Promise<{
+		inputs: ISpliceWalletInput[];
+		changeScript: Buffer;
+		maxFeeSatoshis?: bigint;
+	}> {
+		if (opts?.fixedOutputs) {
+			if (!this.fixedOutputFeePool)
+				throw new Error('Fixed-output fee preparation is not configured');
+			return this.runSelection(() =>
+				this.fixedOutputFeePool!.select(targetFeeSats, feeratePerKw, opts)
+			);
+		}
 		// P2WPKH only: the fee-bump attach paths (sweep.ts) sign wallet inputs
 		// with (tx, index, value) and cannot supply the full prevout set a
 		// P2TR input's BIP 341 sighash commits to.
@@ -746,6 +859,8 @@ export class WalletFundingProvider implements IFundingProvider {
 			// failed.
 			if (this.wallet.isUtxoFrozen?.(u.tx_hash, u.tx_pos)) return false;
 			if (this.pledged.has(`${u.tx_hash}:${u.tx_pos}`)) return false;
+			if (this.fixedOutputFeePool?.isReserved(u.tx_hash, u.tx_pos))
+				return false;
 			try {
 				const kind = scriptKind(
 					bitcoin.address.toOutputScript(u.address, network)
@@ -1291,7 +1406,12 @@ export class WalletFundingProvider implements IFundingProvider {
 				!this.pledged.has(key) ||
 				!this.ownedFreezes.has(key) ||
 				this.wallet.isUtxoFrozen?.(txid, input.prevOutputIndex) !== true ||
-				(frozen && frozen.freezeTag !== WalletFundingProvider.PLEDGE_TAG)
+				(frozen &&
+					frozen.freezeTag !==
+						(this.fixedOutputFeePool?.reservationTag(
+							txid,
+							input.prevOutputIndex
+						) ?? WalletFundingProvider.PLEDGE_TAG))
 			)
 				throw new Error('Replacement fee input is not an owned pledge');
 			const descriptor = this.wallet.getAddressFromScriptHash!(

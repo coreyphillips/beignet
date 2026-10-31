@@ -91,6 +91,7 @@ import {
 	ChainActionType,
 	CommitmentType,
 	IRREVOCABLE_DEPTH,
+	fixedOutputHtlcFeeActionId,
 	OutputType,
 	satPerVbyteToSatPerKw
 } from '../chain/types';
@@ -151,6 +152,8 @@ import {
 	hasScidAliasChannelType,
 	isAnchorChannel,
 	isTaprootChannel,
+	isOverlayChannel,
+	isFixedAssetHtlcChannel,
 	scidAliasAnnounceRefusal,
 	validateV2ChannelType,
 	MAX_FUNDING_SATOSHIS,
@@ -1514,6 +1517,9 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 
 		if (opts?.auxiliary && !this.config.auxiliaryChannels)
 			throw new Error('Asset channel provider is required');
+		const fixedAssetOutputs = opts?.auxiliary
+			? this.negotiateAssetHtlcOutputs(peerPubkey)
+			: false;
 		if (
 			opts?.auxiliary &&
 			this.tempChannels.has(opts.auxiliary.temporaryChannelId.toString('hex'))
@@ -1573,7 +1579,8 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		const actions = channel.initiateOpen(
 			this.config.chainHash,
 			this.config.preferAnchors,
-			this.config.preferTaproot || !!opts?.auxiliary
+			this.config.preferTaproot || !!opts?.auxiliary,
+			fixedAssetOutputs
 		);
 		this.processActions(peerPubkey, channel, actions);
 
@@ -4322,6 +4329,18 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			return;
 		}
 		const tempId = msg.temporaryChannelId.toString('hex');
+		if (isOverlayChannel(msg.channelType)) {
+			try {
+				this.negotiateAssetHtlcOutputs(peerPubkey, msg.channelType);
+			} catch (error) {
+				this.refuseInboundOpen(
+					peerPubkey,
+					msg.temporaryChannelId,
+					error instanceof Error ? error.message : String(error)
+				);
+				return;
+			}
+		}
 		if (this.channelIdInUse(tempId)) {
 			this.refuseInboundOpen(
 				peerPubkey,
@@ -7803,6 +7822,63 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 	 * fundingUtxos or a lease request; the node-level openChannelV2 refuses
 	 * those combinations up front.
 	 */
+	/** Preflight the immutable HTLC mode for a new asset channel without reserving funds. */
+	getAuxiliaryHtlcMode(peerPubkey: string): 'fixed' | 'legacy' {
+		peerPubkey = normalizeHexPubkey(peerPubkey);
+		if (!this.config.auxiliaryChannels)
+			throw new Error('Asset channel provider is required');
+		if (this.peerManager && !this.peerManager.getPeer(peerPubkey))
+			throw new PeerError(
+				PeerErrorCode.NOT_CONNECTED,
+				`Not connected to peer ${peerPubkey}`
+			);
+		return this.negotiateAssetHtlcOutputs(peerPubkey) ? 'fixed' : 'legacy';
+	}
+
+	private negotiateAssetHtlcOutputs(
+		peerPubkey: string,
+		proposed?: Buffer
+	): boolean {
+		const remoteInit = this.peerManager?.getPeer(peerPubkey)?.getRemoteInit();
+		if (this.peerManager && !remoteInit)
+			throw new Error('Asset channel peer feature negotiation is incomplete');
+		if (
+			remoteInit &&
+			!remoteInit.features.hasFeature(Feature.OPTION_TAPROOT_OVERLAY)
+		)
+			throw new Error('Peer did not advertise asset channels');
+		const local =
+			this.config.localFeatures?.hasFeature(
+				Feature.OPTION_ASSET_FIXED_HTLC_OUTPUTS
+			) === true;
+		const remote =
+			remoteInit?.features.hasFeature(
+				Feature.OPTION_ASSET_FIXED_HTLC_OUTPUTS
+			) === true;
+		const fixed = local && remote;
+		if (fixed) {
+			if (this.fundingProvider?.supportsFixedOutputFees?.() !== true)
+				throw new Error(
+					'Fixed asset HTLC outputs require durable bounded fee preparation'
+				);
+			if (proposed && !isFixedAssetHtlcChannel(proposed))
+				throw new Error(
+					'Native asset HTLC output binding cannot be downgraded'
+				);
+			return true;
+		}
+		if (proposed && isFixedAssetHtlcChannel(proposed))
+			throw new Error('Fixed asset HTLC outputs were not mutually negotiated');
+		if (
+			this.config.auxiliaryChannels?.allowLegacyHtlcSignatures?.(peerPubkey) !==
+			true
+		)
+			throw new Error(
+				'New asset channels require fixed HTLC outputs or explicit peer compatibility'
+			);
+		return false;
+	}
+
 	peerNegotiatedNativeFunding(peerPubkey: string): boolean {
 		return !!(
 			this.config.localFeatures?.hasFeature(
@@ -7904,9 +7980,11 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		let channelType = params.channelType;
 		if (!channelType) {
 			const typeFlags = FeatureFlags.empty();
-			if (opts?.interactiveFunding)
+			if (opts?.interactiveFunding) {
 				typeFlags.setCompulsory(Feature.OPTION_TAPROOT_OVERLAY);
-			else if (this.config.preferTaproot && nativeFunding)
+				if (this.negotiateAssetHtlcOutputs(peerPubkey))
+					typeFlags.setCompulsory(Feature.OPTION_ASSET_FIXED_HTLC_OUTPUTS);
+			} else if (this.config.preferTaproot && nativeFunding)
 				typeFlags.setCompulsory(Feature.OPTION_TAPROOT);
 			else {
 				if (this.config.preferTaproot)
@@ -7947,6 +8025,8 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			this.config.localFeatures,
 			this.peerManager?.getPeer(peerPubkey)?.getRemoteInit()?.features
 		);
+		if (opts?.interactiveFunding)
+			this.negotiateAssetHtlcOutputs(peerPubkey, channelType);
 		if (typeRefusal) {
 			throw new Error(`Cannot open a dual-funded (v2) channel: ${typeRefusal}`);
 		}
@@ -8209,6 +8289,18 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			}
 		}
 		const proposedTempId = msg.channelId.toString('hex');
+		if (isOverlayChannel(msg.channelType)) {
+			try {
+				this.negotiateAssetHtlcOutputs(peerPubkey, msg.channelType);
+			} catch (error) {
+				this.refuseInboundOpen(
+					peerPubkey,
+					msg.channelId,
+					error instanceof Error ? error.message : String(error)
+				);
+				return;
+			}
+		}
 		if (
 			this.tempChannels.has(proposedTempId) ||
 			this.channels.has(proposedTempId) ||
@@ -11787,6 +11879,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		channelId: Buffer,
 		action: IFeeBumpAndBroadcastChainAction
 	): Promise<void> {
+		if (action.isCurrent?.() === false) return;
 		const fp = this.fundingProvider;
 		const feeratePerVbyte = action.feeratePerVbyte;
 		const feeratePerKw = satPerVbyteToSatPerKw(feeratePerVbyte);
@@ -11806,6 +11899,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			return;
 		}
 
+		let monitorInstalled = false;
 		try {
 			if (action.kind === 'auxiliary-sweep-fee-attach') {
 				const channelIdHex = channelId.toString('hex');
@@ -11837,6 +11931,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 				);
 				let installed = false;
 				try {
+					if (action.isCurrent?.() === false) return;
 					this.validateFeeSelection(inputs, selection);
 					if (this.monitors.get(channelIdHex) !== monitor) return;
 					const { tx, auxiliaryData, feeSatoshis } =
@@ -11851,6 +11946,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 					if (!attachment.finalize(transaction, auxiliaryData, feeSatoshis))
 						return;
 					installed = true;
+					monitorInstalled = true;
 					// The exact funded witness and proof payload must survive a crash
 					// before the transaction can become visible to the network.
 					this.emit('monitor:updated', channelIdHex, monitor);
@@ -11868,11 +11964,27 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 				return;
 			}
 			if (action.kind === 'htlc-fee-attach') {
+				if (action.fixedHtlcOutputs && fp.supportsFixedOutputFees?.() !== true)
+					throw new Error(
+						'Fixed asset HTLC outputs require durable bounded fee preparation'
+					);
 				const monitor = action.finalizeHtlcFunding
 					? this.monitors.get(channelId.toString('hex'))
 					: undefined;
 				const htlcTx = bitcoin.Transaction.fromBuffer(action.tx);
-				const selection = this.feeBumpSelectionOptions(action, htlcTx, monitor);
+				const selection = {
+					...this.feeBumpSelectionOptions(action, htlcTx, monitor),
+					...(action.fixedHtlcOutputs
+						? {
+								fixedOutputs: true,
+								feeActionId: fixedOutputHtlcFeeActionId(
+									channelId,
+									Buffer.from(htlcTx.ins[0].hash).reverse().toString('hex'),
+									htlcTx.ins[0].index
+								)
+						  }
+						: {})
+				};
 				const htlcWitness = htlcTx.ins[0]?.witness;
 				if (!htlcWitness || htlcWitness.length === 0) {
 					// Fee inputs cannot repair a missing original signature.
@@ -11889,16 +12001,25 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 						action.previousFee + BigInt(htlcTx.virtualSize());
 					if (replacementFee > targetFeeSats) targetFeeSats = replacementFee;
 				}
-				const { inputs, changeScript } = await fp.selectFeeBumpInputs(
-					targetFeeSats,
-					action.previousFee === undefined
-						? feeratePerKw
-						: satPerVbyteToSatPerKw(Math.max(feeratePerVbyte, 1)),
-					selection
-				);
+				const { inputs, changeScript, maxFeeSatoshis } =
+					await fp.selectFeeBumpInputs(
+						targetFeeSats,
+						action.previousFee === undefined
+							? feeratePerKw
+							: satPerVbyteToSatPerKw(Math.max(feeratePerVbyte, 1)),
+						selection
+					);
 				let installed = false;
 				try {
+					if (action.isCurrent?.() === false) return;
 					this.validateFeeSelection(inputs, selection);
+					if (
+						action.fixedHtlcOutputs &&
+						(typeof maxFeeSatoshis !== 'bigint' || maxFeeSatoshis <= 0n)
+					)
+						throw new Error(
+							'Fixed asset HTLC fee selection has no bounded policy'
+						);
 					if (
 						action.finalizeHtlcFunding &&
 						(!monitor ||
@@ -11907,6 +12028,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 						return;
 					if (
 						action.finalizeHtlcFunding &&
+						!action.fixedHtlcOutputs &&
 						(changeScript.length !== 22 ||
 							changeScript[0] !== 0 ||
 							changeScript[1] !== 20)
@@ -11925,6 +12047,8 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 						changeScript,
 						feeratePerVbyte,
 						previousFee: action.previousFee,
+						fixedOutputs: action.fixedHtlcOutputs,
+						maxFeeSatoshis,
 						signHtlcFunding: action.signHtlcFunding
 					});
 					const transaction = tx.toBuffer();
@@ -11950,6 +12074,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 								.reduce((total, output) => total + BigInt(output.value), 0n);
 						if (!action.finalizeHtlcFunding(transaction, paidFee)) return;
 						installed = true;
+						monitorInstalled = true;
 						this.emit('monitor:updated', channelId.toString('hex'), monitor);
 						if (
 							this.config.isMonitorPersisted?.(channelId.toString('hex')) !==
@@ -12039,6 +12164,18 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 				pending.lastAttemptFailed = false;
 			}
 		} catch (err) {
+			if (!monitorInstalled && action.isCurrent?.() === false) return;
+			if (
+				action.fixedHtlcOutputs &&
+				(err as { code?: string })?.code === 'FEE_PREPARATION_PENDING'
+			) {
+				if (action.deferHtlcFunding?.()) {
+					const monitor = this.monitors.get(channelId.toString('hex'));
+					if (monitor)
+						this.emit('monitor:updated', channelId.toString('hex'), monitor);
+				}
+				return;
+			}
 			this.emit(
 				'error',
 				channelId,
