@@ -133,7 +133,8 @@ export const defaultWalletData: Readonly<IWalletData> = {
 		timestamp: 0
 	},
 	addressLabels: {},
-	birthdayHeight: 0
+	birthdayHeight: 0,
+	unlistedUtxoAddresses: {}
 };
 
 export const defaultFeesShape: IOnchainFees = {

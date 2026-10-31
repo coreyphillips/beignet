@@ -616,6 +616,7 @@ property IWalletData.selectedFeeId: EFeeId
 property IWalletData.transaction: ISendTransaction
 property IWalletData.transactions: IFormattedTransactions
 property IWalletData.unconfirmedTransactions: IFormattedTransactions
+property IWalletData.unlistedUtxoAddresses: IAddresses
 property IWalletData.utxos: IUtxo[]
 interface IWalletStorage
 property IWalletStorage.getData?: TGetData

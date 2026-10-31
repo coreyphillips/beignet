@@ -589,7 +589,8 @@ describe('block notification refresh requests (#1663)', function () {
 		expect(wallet.data.utxos.map((u) => u.tx_hash)).to.deep.equal([txid]);
 	});
 
-	/** Each answer a server can fail in part without failing the refresh. */
+	/** Each answer a server can fail in part. A failed UTXO entry fails the
+	 *  refresh, and the others leave their part out. */
 	const partialFailures: Array<
 		[string, (receive: IAddress, txid: string) => void]
 	> = [

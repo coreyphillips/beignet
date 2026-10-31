@@ -1640,7 +1640,8 @@ export class Electrum {
 	 * @additionalAddresses {string[]} [additionalAddresses]
 	 * @param {IAddresses} [additionalScriptHashes] Listed besides the
 	 * addresses the strategy picks.
-	 * @returns {Promise<Result<IGetUtxosResponse>>}
+	 * @returns {Promise<Result<IGetUtxosResponse>>} Err when the server
+	 * answers any one address with an error.
 	 */
 	async getUtxos({
 		scanningStrategy = EScanningStrategy.gapLimit,
@@ -1684,7 +1685,13 @@ export class Electrum {
 				...existingUtxos
 			};
 
-			return this.listUnspentAddressScriptHashes({ addresses: data });
+			// The answer replaces the wallet's whole set, so a failed entry read as
+			// empty would drop that address's coins, and with them the address
+			// from every later scan whose window has moved past it.
+			return this.listUnspentAddressScriptHashes({
+				addresses: data,
+				rejectFailedEntries: true
+			});
 		} catch (e) {
 			return err(e);
 		}

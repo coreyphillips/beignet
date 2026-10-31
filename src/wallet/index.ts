@@ -1500,14 +1500,37 @@ export class Wallet {
 			return err(r1.error);
 		}
 		if (this._stopped) return err(stopped);
+		const utxoAddresses = {
+			...this._data.unlistedUtxoAddresses,
+			...scan.utxoAddresses
+		};
 		const r2 = await this.refreshUtxos({
 			scanningStrategy: scanAllAddresses ? EScanningStrategy.all : undefined,
 			additionalAddresses,
-			additionalScriptHashes: scan.utxoAddresses
+			additionalScriptHashes: utxoAddresses
 		});
+		const unlisted = this._data.unlistedUtxoAddresses;
 		if (r2.isErr()) {
+			// switchNetwork replaced the data, and these are the old network's.
+			// Saved, not only kept: issuing a receive address saves the receive
+			// index past them, and a restart scans from the saved index.
+			if (
+				this.electrum === electrum &&
+				Object.keys(scan.utxoAddresses).length
+			) {
+				Object.assign(unlisted, scan.utxoAddresses);
+				await this.saveWalletData('unlistedUtxoAddresses', unlisted);
+			}
 			return err(r2.error);
 		}
+		const listed = Object.keys(unlisted).filter(
+			(scriptHash) => scriptHash in utxoAddresses
+		);
+		if (listed.length) {
+			for (const scriptHash of listed) delete unlisted[scriptHash];
+			await this.saveWalletData('unlistedUtxoAddresses', unlisted);
+		}
+		await this.saveAddressIndexes();
 		if (this._stopped) return err(stopped);
 		const r3 = await this.updateTransactions({ scanAllAddresses, scan });
 		if (r3.isErr()) {
@@ -1788,6 +1811,9 @@ export class Wallet {
 							break;
 						case 'birthdayHeight':
 							walletData[key] = data as number;
+							break;
+						case 'unlistedUtxoAddresses':
+							walletData[key] = data as IAddresses;
 							break;
 						default:
 							this.logger.warn(`Unhandled key in getWalletData: ${key}`);
@@ -3100,29 +3126,41 @@ export class Wallet {
 		try {
 			await Promise.all(promises);
 			if (this.electrum !== electrum) throw switched;
-			if (updated) {
-				await Promise.all([
-					this.saveReceiveIndex(),
-					this.saveWalletData(
-						'changeAddressIndex',
-						this._data.changeAddressIndex
-					),
-					this.saveWalletData(
-						'lastUsedAddressIndex',
-						this._data.lastUsedAddressIndex
-					),
-					this.saveWalletData(
-						'lastUsedChangeAddressIndex',
-						this._data.lastUsedChangeAddressIndex
-					)
-				]);
-			}
+			if (updated) this.unsavedAddressIndexes = true;
 			return ok(
 				updated ? 'Successfully updated indexes.' : 'No update needed.'
 			);
 		} catch (e) {
 			return err(e);
 		}
+	}
+
+	// Set when updateAddressIndexes moved the indexes. They are saved only once
+	// a UTXO listing succeeds: a restart scans from the saved indexes, so ones
+	// saved past coins whose listing failed would leave those coins unlisted.
+	private unsavedAddressIndexes = false;
+
+	/**
+	 * Saves the indexes updateAddressIndexes moved since the last save.
+	 * @private
+	 * @async
+	 * @returns {Promise<void>}
+	 */
+	private async saveAddressIndexes(): Promise<void> {
+		if (!this.unsavedAddressIndexes) return;
+		this.unsavedAddressIndexes = false;
+		await Promise.all([
+			this.saveReceiveIndex(),
+			this.saveWalletData('changeAddressIndex', this._data.changeAddressIndex),
+			this.saveWalletData(
+				'lastUsedAddressIndex',
+				this._data.lastUsedAddressIndex
+			),
+			this.saveWalletData(
+				'lastUsedChangeAddressIndex',
+				this._data.lastUsedChangeAddressIndex
+			)
+		]);
 	}
 
 	/**
@@ -3440,10 +3478,11 @@ export class Wallet {
 	 * @returns {Promise<Result<IGetUtxosResponse>>} The pair the scan applied
 	 * to memory, or, when a newer scan already landed, memory's pair as it
 	 * stands, applied and written by that scan instead. Err, with nothing
-	 * applied, when the wallet switched networks while the query was out, or
-	 * when Electrum did not return the tip or the transaction of a coin young
-	 * enough to be an immature coinbase. A write that storage refuses is
-	 * logged, not returned: the scan itself succeeded.
+	 * applied, when the wallet switched networks while the query was out, when
+	 * Electrum failed any address the scan listed, or when it did not return
+	 * the tip or the transaction of a coin young enough to be an immature
+	 * coinbase. A write that storage refuses is logged, not returned: the scan
+	 * itself succeeded.
 	 */
 	public async refreshUtxos({
 		scanningStrategy = EScanningStrategy.gapLimit,
