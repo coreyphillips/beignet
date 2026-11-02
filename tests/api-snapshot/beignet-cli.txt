@@ -193,6 +193,7 @@ member BeignetErrorCode.NOT_FOUND = "NOT_FOUND"
 member BeignetErrorCode.NOT_PERSISTED = "NOT_PERSISTED"
 member BeignetErrorCode.NO_CHANNEL_TO_HOP = "NO_CHANNEL_TO_HOP"
 member BeignetErrorCode.NO_DATA = "NO_DATA"
+member BeignetErrorCode.NO_PRIMARY_AVAILABLE = "NO_PRIMARY_AVAILABLE"
 member BeignetErrorCode.NO_ROUTE = "NO_ROUTE"
 member BeignetErrorCode.NO_SUITABLE_UTXO = "NO_SUITABLE_UTXO"
 member BeignetErrorCode.OFFER_DECLINED = "OFFER_DECLINED"
@@ -290,7 +291,7 @@ static method BeignetNode.create(opts?: BeignetNodeOptions): Promise<BeignetNode
 method BeignetNode.createDirectFundingRequest(opts: { host?: string; port?: number; amountSats?: number; }): { paymentHash: PaymentHashHex; expiresAt: number; request: string; }
 method BeignetNode.createHoldInvoice(opts: { paymentHash: PaymentHashHex; amountMsat?: bigint; amountSats?: number; description?: string; expiry?: number; minFinalCltvExpiry?: number; }): InvoiceInfo
 method BeignetNode.createInvoice(amountSats?: number, description?: string, expirySecs?: number, descriptionHash?: Buffer, minFinalCltvExpiry?: number): InvoiceInfo
-method BeignetNode.createJitInvoice(opts: { lspPubkey: string; amountSats?: number; description?: string; expirySecs?: number; targetRemainingInboundSat?: number; maxFlatFeeSat?: number; maxFeePpm?: number; feeMode?: 'skim' | 'hop'; }): Promise<InvoiceInfo & { flatFeeSat: number; feePpm: number; feeMode: 'skim' | 'hop'; }>
+method BeignetNode.createJitInvoice(opts: { lspPubkey?: string; amountSats?: number; description?: string; expirySecs?: number; targetRemainingInboundSat?: number; maxFlatFeeSat?: number; maxFeePpm?: number; feeMode?: 'skim' | 'hop'; timeoutMs?: number; }): Promise<JitInvoiceInfo>
 method BeignetNode.createOffer(options: { description: string; amountSats?: number; issuer?: string; expirySecs?: number; }): OfferInfo
 method BeignetNode.decodeInvoice(bolt11: string): DecodedInvoice
 method BeignetNode.decodeOfferString(offerStr: string): OfferInfo
@@ -347,7 +348,7 @@ method BeignetNode.getGuardianHostSurfaceStatus(): { serving: boolean; listenErr
 method BeignetNode.getHealth(): HealthInfo
 method BeignetNode.getInfo(): NodeInfo
 method BeignetNode.getInvoice(paymentHash: PaymentHashHex): InvoiceInfo | null
-method BeignetNode.getJitQuote(opts: { lspPubkey: string; amountSats?: number; targetRemainingInboundSat?: number; }): Promise<JitQuoteInfo>
+method BeignetNode.getJitQuote(opts: { lspPubkey?: string; amountSats?: number; targetRemainingInboundSat?: number; timeoutMs?: number; }): Promise<JitQuoteInfo>
 method BeignetNode.getJitStatus(): JitStatusInfo
 method BeignetNode.getLiquiditySnapshot(): LiquiditySnapshot
 method BeignetNode.getMainnetReadiness(): ReadinessReport
@@ -1017,6 +1018,12 @@ unexported interface IrohDaemonConfig
 property IrohDaemonConfig.iroh?: boolean
 property IrohDaemonConfig.irohDiscovery?: boolean
 property IrohDaemonConfig.irohRelays?: string[]
+interface JitInvoiceInfo extends InvoiceInfo
+property JitInvoiceInfo.feeMode: 'skim' | 'hop'
+property JitInvoiceInfo.feePpm: number
+property JitInvoiceInfo.flatFeeSat: number
+property JitInvoiceInfo.lspPubkey: string
+property JitInvoiceInfo.skipped?: ReceiveSteerSkip[]
 interface JitQuoteInfo
 property JitQuoteInfo.accepted: boolean
 property JitQuoteInfo.amountSats: number | null
@@ -1028,6 +1035,7 @@ property JitQuoteInfo.fundingSats: number
 property JitQuoteInfo.lspPubkey: string
 property JitQuoteInfo.maxClientFundingSats: number
 property JitQuoteInfo.reason: string | null
+property JitQuoteInfo.skipped?: ReceiveSteerSkip[]
 property JitQuoteInfo.withinCeilings: boolean
 interface JitStatusInfo
 property JitStatusInfo.client: { maxFlatFeeSat: number; maxFeePpm: number; }
@@ -1120,9 +1128,9 @@ property OfferInfo.offerId: string
 property OfferInfo.quantityMax?: number
 unexported class OfflineReceive
 constructor OfflineReceive(node: BeignetNode, save: (jobs: OfflineReceiveJob[]) => void, initial: OfflineReceiveJob[], now?: () => number)
-method OfflineReceive.create(body: any, peer: string): Promise<any>
+method OfflineReceive.create(body: any, peer?: string): Promise<any>
 method OfflineReceive.ownsInvoice(hash: string): boolean
-method OfflineReceive.quote(peer: string, amountSats: number, requestId?: string): Promise<any>
+method OfflineReceive.quote(peer: string | undefined, amountSats: number, requestId?: string): Promise<any>
 method OfflineReceive.reservedIds(): Set<string>
 method OfflineReceive.status(): { available: boolean; reservedChannelIds: string[]; requests: { reservedInboundSats?: number | undefined; unresolvedSlots?: number | undefined; kind: OfflineReceiveKind; id: string; peer: string; amountSats: number; allocationId?: string | undefined; channelId?: string | undefined; epochId?: string | undefined; concurrent?: boolean | undefined; concurrentVersion?: 1 | 2 | undefined; previousEpochId?: string | undefined; expiresAt?: number | undefined; invoice?: any; request?: string | undefined; paymentHash?: string | undefined; done?: boolean | undefined; }[]; }
 method OfflineReceive.stop(): void
@@ -1354,6 +1362,12 @@ property RebalanceResult.feeMsat: string
 property RebalanceResult.feeSats: number
 property RebalanceResult.hops: number
 property RebalanceResult.paymentHash: PaymentHashHex
+interface ReceiveSteerSkip
+property ReceiveSteerSkip.code: string
+property ReceiveSteerSkip.message: string
+property ReceiveSteerSkip.pubkey: string
+property ReceiveSteerSkip.rank: number
+property ReceiveSteerSkip.stage: 'connect' | 'attempt' | 'budget'
 unexported type RecoveryMode = 'off' | 'peer-storage' | 'async-remote' | 'quorum'
 interface RetryPaymentOptions
 property RetryPaymentOptions.amountSats?: number

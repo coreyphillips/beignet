@@ -291,6 +291,48 @@ describe('FFOR surface: routes on a node with no epoch (issue #729)', () => {
 		expect(away.status).to.equal(409);
 		expect(away.body.error).to.deep.include({ code: 'RECEIVE_UNAVAILABLE' });
 	});
+
+	it('steers a quote that names no peer through the primaries (issue #1922)', async () => {
+		// No peer and no primary: the caller's own omission.
+		const none = await request(
+			portOf(daemon),
+			'GET',
+			'/receive/quote?amountSats=20000'
+		);
+		expect(none.status).to.equal(400);
+		expect(none.body.error).to.deep.include({
+			code: 'INVALID_PARAMS',
+			message: 'A primary node public key is required, or configure primaries.'
+		});
+		// A primary nobody is connected to is passed over (the coordinator
+		// never dials), and with no other the answer is the typed refusal.
+		const primary = '02' + '33'.repeat(32);
+		daemon.node.addPrimary({ pubkey: primary });
+		try {
+			const steered = await request(
+				portOf(daemon),
+				'GET',
+				'/receive/quote?amountSats=20000'
+			);
+			expect(steered.status).to.equal(503);
+			expect(steered.body.error).to.deep.include({
+				code: 'NO_PRIMARY_AVAILABLE'
+			});
+			expect((steered.body.error as { message: string }).message).to.include(
+				`${primary.slice(0, 16)} (rank 1): PEER_NOT_CONNECTED`
+			);
+			// Naming the peer is still its own, unsteered answer.
+			const named = await request(
+				portOf(daemon),
+				'GET',
+				`/receive/quote?peer=${primary}&amountSats=20000`
+			);
+			expect(named.status).to.equal(409);
+			expect(named.body.error).to.deep.include({ code: 'RECEIVE_UNAVAILABLE' });
+		} finally {
+			daemon.node.removePrimary(primary);
+		}
+	});
 	it('reports the witness and issuer roles it runs', async () => {
 		const witness = await request(
 			portOf(daemon),

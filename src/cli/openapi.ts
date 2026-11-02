@@ -351,10 +351,10 @@ export function getOpenApiSpec(): Record<string, unknown> {
 			'/jit/invoice': {
 				post: {
 					summary:
-						'Create a JIT receive invoice: registers a receive intent with the LSP and returns an invoice payable through a channel that does not exist yet. The LSP intercepts the HTLC, funds the channel and forwards. The quoted opening fee (flatFeeSat + feePpm) is collected per feeMode: skim (default) deducts it from the delivery, hop puts it in the invoice routing hint so the sender pays it on top and the full amount is delivered. Requires the LSP peer to be connected and running the JIT receive engine. With no usable channel to that LSP the invoice is a promise that it may open one, so it is refused with NEW_CHANNELS_REFUSED (503) while this node would refuse a brand-new channel: a bare-seed boot that has not learned a chain tip yet, or an unresolved Recovery Capsule restore. Both lift on their own, and an invoice that routes over an existing usable channel is never refused for it',
+						'Create a JIT receive invoice: registers a receive intent with the LSP and returns an invoice payable through a channel that does not exist yet. The LSP intercepts the HTLC, funds the channel and forwards. The quoted opening fee (flatFeeSat + feePpm) is collected per feeMode: skim (default) deducts it from the delivery, hop puts it in the invoice routing hint so the sender pays it on top and the full amount is delivered. Requires the LSP peer to be connected and running the JIT receive engine. With no usable channel to that LSP the invoice is a promise that it may open one, so it is refused with NEW_CHANNELS_REFUSED (503) while this node would refuse a brand-new channel: a bare-seed boot that has not learned a chain tip yet, or an unresolved Recovery Capsule restore. Both lift on their own, and an invoice that routes over an existing usable channel is never refused for it. With no lspPubkey the receive is steered through the ranked primaries (GET /primaries): each is tried in selectionOrder, dialed by its stored address when not connected, and passed over when unreachable, timed out, declining, above the fee ceilings or fenced, under one 18 s budget for the whole walk. The answer then carries the lspPubkey that took it and the skipped primaries with their reasons; 503 NO_PRIMARY_AVAILABLE names every reason when none took it, 400 INVALID_PARAMS when no primary is configured. Naming lspPubkey never falls back',
 					tags: ['Invoices'],
 					requestBody: bodyContent({
-						lspPubkey: 'string',
+						lspPubkey: 'string?',
 						amountSats: 'number?',
 						description: 'string?',
 						expirySecs: 'number?',
@@ -373,9 +373,20 @@ export function getOpenApiSpec(): Record<string, unknown> {
 									{
 										type: 'object',
 										properties: {
+											lspPubkey: {
+												type: 'string',
+												description:
+													'The LSP the intent was registered with: the one named, or the primary that took it'
+											},
 											flatFeeSat: { type: 'number' },
 											feePpm: { type: 'number' },
-											feeMode: { type: 'string', enum: ['skim', 'hop'] }
+											feeMode: { type: 'string', enum: ['skim', 'hop'] },
+											skipped: {
+												type: 'array',
+												description:
+													'Steered receives only: the primaries passed over before this one',
+												items: { $ref: '#/components/schemas/ReceiveSteerSkip' }
+											}
 										}
 									}
 								]
@@ -428,7 +439,7 @@ export function getOpenApiSpec(): Record<string, unknown> {
 			'/primaries': {
 				get: {
 					summary:
-						"Read the ranked receive primaries: each one's rank, address, the fill threshold that applies to it, our local balance summed over our usable channels with it, and whether a receive with no peer named would go to it. The target is the first primary in rank order below the threshold; when every one is at or above it, the one with the lowest balance, ties to the higher rank. selectionOrder is the order a receive tries them. Nothing steers a receive by this list yet. Readonly scope",
+						"Read the ranked receive primaries: each one's rank, address, the fill threshold that applies to it, our local balance summed over our usable channels with it, and whether a receive with no peer named would go to it. The target is the first primary in rank order below the threshold; when every one is at or above it, the one with the lowest balance, ties to the higher rank. selectionOrder is the order a receive tries them: POST /jit/invoice, GET /jit/quote, GET /receive/quote and POST /receive/invoice walk it when the caller names no peer. Readonly scope",
 					tags: ['Primaries'],
 					responses: {
 						'200': {
@@ -2333,7 +2344,7 @@ export function getOpenApiSpec(): Record<string, unknown> {
 			'/receive/quote': {
 				get: {
 					summary:
-						"Quote automatic offline receiving at a connected primary without reserving funds. Answers mode='bolt11' when a channel that ALREADY exists with this peer can carry the amount offline (NORMAL, usable, concurrent settlement negotiated or no spendable local balance, unreserved, no live epoch, inbound >= amountSats + 50000), otherwise mode='direct-funding', the fallback where a payer's on-chain payment becomes this node's channel funding. This route never opens a channel. The peer must be connected either way",
+						"Quote automatic offline receiving at a connected primary without reserving funds. Answers mode='bolt11' when a channel that ALREADY exists with this peer can carry the amount offline (NORMAL, usable, concurrent settlement negotiated or no spendable local balance, unreserved, no live epoch, inbound >= amountSats + 50000), otherwise mode='direct-funding', the fallback where a payer's on-chain payment becomes this node's channel funding. This route never opens a channel. The peer must be connected either way. With no peer the ranked primaries choose (GET /primaries): a requestId already under way keeps its own peer; otherwise the primaries are tried in selectionOrder and the first one that is connected, serves the amount on the route it would take, and could be created against (direct funding not configured for another peer) is quoted, with the others listed in skipped. The answer's peer is what POST /receive/invoice binds to. 503 NO_PRIMARY_AVAILABLE names every reason when none qualifies, 400 INVALID_PARAMS when no primary is configured. A named peer is quoted as before, with no fallback",
 					tags: ['FFOR'],
 					parameters: [
 						{
@@ -2347,8 +2358,10 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						{
 							name: 'peer',
 							in: 'query',
-							required: true,
-							schema: { type: 'string' }
+							required: false,
+							schema: { type: 'string' },
+							description:
+								'The primary to quote at. Omitted: the ranked primaries choose'
 						},
 						{
 							name: 'amountSats',
@@ -2360,7 +2373,7 @@ export function getOpenApiSpec(): Record<string, unknown> {
 					responses: {
 						'200': {
 							description:
-								'available, mode, peer, amountSats, feeSats and expiresAt (60s). bolt11 mode adds the sender fee terms and its minimum is the 354 sat dust limit; direct-funding mode adds minAmountSat, the configured direct-funding minimum (5000 by default)',
+								'available, mode, peer, amountSats, feeSats and expiresAt (60s). bolt11 mode adds the sender fee terms and its minimum is the 354 sat dust limit; direct-funding mode adds minAmountSat, the configured direct-funding minimum (5000 by default). A steered quote adds skipped, the primaries passed over',
 							content: jsonContent({
 								type: 'object',
 								required: [
@@ -2397,17 +2410,26 @@ export function getOpenApiSpec(): Record<string, unknown> {
 									minAmountSat: {
 										type: 'integer',
 										description: 'direct-funding mode'
+									},
+									skipped: {
+										type: 'array',
+										description: 'steered quotes only',
+										items: { $ref: '#/components/schemas/ReceiveSteerSkip' }
 									}
 								}
 							})
 						},
 						'400': {
 							description:
-								'AMOUNT_TOO_SMALL naming the minimum of the applicable mode, or INVALID_PARAMS'
+								'AMOUNT_TOO_SMALL naming the minimum of the applicable mode, or INVALID_PARAMS (also: no peer named and no primary configured)'
 						},
 						'409': {
 							description:
 								"RECEIVE_UNAVAILABLE: the peer is not connected, or in bolt11 mode did not answer within 15 s or refused (the message is the peer's own, e.g. 'Your node does not provide offline receiving.'); RECEIVE_BUSY: too many receive requests in flight"
+						},
+						'503': {
+							description:
+								"NO_PRIMARY_AVAILABLE: no peer was named and no ranked primary qualified; the message names each one's reason"
 						}
 					}
 				}
@@ -2415,10 +2437,10 @@ export function getOpenApiSpec(): Record<string, unknown> {
 			'/receive/invoice': {
 				post: {
 					summary:
-						'Prepare and durably save an offline payment request. Retry the same requestId after interrupted creation. With a suitable existing channel this reserves liquidity on it and returns a bolt11 invoice; with none it falls back to direct funding, configuring direct funding for this peer when nothing is configured (an existing config for the same peer is reused untouched, one for a different peer refuses) and minting a direct-funding request. It never opens a channel. Admin scope. Paid or expired reservations reconcile automatically after restart; a direct-funding request reserves nothing and simply expires.',
+						'Prepare and durably save an offline payment request. Retry the same requestId after interrupted creation. With a suitable existing channel this reserves liquidity on it and returns a bolt11 invoice; with none it falls back to direct funding, configuring direct funding for this peer when nothing is configured (an existing config for the same peer is reused untouched, one for a different peer refuses) and minting a direct-funding request. It never opens a channel. With no peer the one the reviewed quote named is used: the review bound it, and create never chooses another. Admin scope. Paid or expired reservations reconcile automatically after restart; a direct-funding request reserves nothing and simply expires.',
 					tags: ['FFOR'],
 					requestBody: bodyContent({
-						peer: 'string',
+						peer: 'string?',
 						requestId: 'string',
 						amountSats: 'number',
 						description: 'string',
@@ -4119,15 +4141,16 @@ export function getOpenApiSpec(): Record<string, unknown> {
 			'/jit/quote': {
 				get: {
 					summary:
-						'Price a JIT receive at the named LSP without registering an intent: the opening fee it would deduct, the fee on this amount, what it would front, and whether it would serve the receive right now (a decline is an answer with a plain-language reason, not an error). Asked over the beignet custom message type, so the LSP peer must be connected and running the JIT receive engine; PEER_NOT_CONNECTED and JIT_TIMEOUT are the transport failures. Readonly scope',
+						'Price a JIT receive at the named LSP without registering an intent: the opening fee it would deduct, the fee on this amount, what it would front, and whether it would serve the receive right now (a decline is an answer with a plain-language reason, not an error). Asked over the beignet custom message type, so the LSP peer must be connected and running the JIT receive engine; PEER_NOT_CONNECTED and JIT_TIMEOUT are the transport failures. With no lspPubkey the ranked primaries choose (GET /primaries), the way POST /jit/invoice does: the answer prices the first primary in selectionOrder that would serve the receive within the fee ceilings, names it in lspPubkey, and lists the others in skipped, so a create naming that lspPubkey lands where the quote did. 503 NO_PRIMARY_AVAILABLE when none would serve it, 400 INVALID_PARAMS when no primary is configured. Readonly scope',
 					tags: ['Invoices'],
 					parameters: [
 						{
 							name: 'lspPubkey',
 							in: 'query',
-							required: true,
+							required: false,
 							schema: { type: 'string' },
-							description: 'The LSP peer, 33-byte compressed pubkey as hex'
+							description:
+								'The LSP peer, 33-byte compressed pubkey as hex. Omitted: the ranked primaries choose'
 						},
 						{
 							name: 'amountSats',
@@ -6007,7 +6030,25 @@ export function getOpenApiSpec(): Record<string, unknown> {
 								maxFlatFeeSat: { type: 'integer' },
 								maxFeePpm: { type: 'integer' }
 							}
+						},
+						skipped: {
+							type: 'array',
+							description:
+								'Steered quotes only: the primaries passed over before this one',
+							items: { $ref: '#/components/schemas/ReceiveSteerSkip' }
 						}
+					}
+				},
+				ReceiveSteerSkip: {
+					type: 'object',
+					description:
+						"Why a steered receive passed one ranked primary over. stage budget means it was not tried: the walk's budget ran out before it",
+					properties: {
+						pubkey: { type: 'string' },
+						rank: { type: 'integer', description: '1-based configured rank' },
+						stage: { type: 'string', enum: ['connect', 'attempt', 'budget'] },
+						code: { type: 'string' },
+						message: { type: 'string' }
 					}
 				},
 				DirectFundingConfig: {

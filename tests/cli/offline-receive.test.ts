@@ -12,6 +12,7 @@
 
 import assert from 'assert';
 import type { BeignetNode } from '../../src/cli/beignet-node';
+import { BeignetError } from '../../src/cli/errors';
 import { OfflineReceive } from '../../src/cli/offline-receive';
 
 const channelId = '11'.repeat(32),
@@ -49,12 +50,15 @@ type Channel = {
 type Peer = { pubkey: string; host: string; port: number; state: string };
 type Json = Record<string, unknown>;
 type Failure = Error & { code?: string };
+type Primary = { pubkey: string; host?: string; port?: number };
 type Opts = {
 	/** Add an empty inbound channel with the peer that a request may reserve. */
 	spare?: boolean;
 	jobs?: Json[];
 	peers?: Peer[];
 	config?: Json;
+	/** The ranked primaries, highest rank first, for a quote that names no peer. */
+	primaries?: Primary[];
 };
 
 /**
@@ -126,6 +130,24 @@ function fixture(overrides: Json = {}, opts: Opts = {}): any {
 		fforEpoch: (id: string) => epochs.find((e) => e.channelId === id),
 		decodeInvoice: () => ({ timestamp: 1000, expiry: 600 }),
 		getDirectFundingConfig: () => ({ ...config }),
+		// Rank order is selection order here: no thresholds in these cells.
+		listPrimaries: () => ({
+			fillThresholdSat: null,
+			receiveTarget: opts.primaries?.[0]?.pubkey ?? null,
+			primaries: (opts.primaries ?? []).map((p, i) => ({
+				pubkey: p.pubkey,
+				rank: i + 1,
+				host: p.host ?? null,
+				port: p.port ?? null,
+				uri: null,
+				thresholdSat: null,
+				balanceSat: 0,
+				channelCount: 0,
+				belowThreshold: true,
+				isReceiveTarget: i === 0,
+				selectionOrder: i + 1
+			}))
+		}),
 		configureDirectFunding: (update: Json) => {
 			configured.push(update);
 			Object.assign(config, update);
@@ -674,6 +696,257 @@ describe('receive route selection', () => {
 			{ spare: true, jobs: [], config: { minAmountSat: 25000 } }
 		);
 		assert.equal((await ok.coordinator.quote(peer, 20000)).mode, 'bolt11');
+	});
+});
+
+describe('receive steered through the primaries (issue #1922)', () => {
+	const ready = (pubkey: string): Peer => ({
+		pubkey,
+		host: 'lsp.example',
+		port: 9735,
+		state: 'ready'
+	});
+	const body = (quote: unknown): Json => ({
+		requestId: 'request-123456789',
+		amountSats: 20000,
+		description: 'coffee',
+		quote
+	});
+
+	it('needs a peer when no primary is configured', async () => {
+		const f = fixture({}, { jobs: [] });
+		await assert.rejects(
+			f.coordinator.quote(undefined, 20000),
+			(e: Failure) => {
+				assert.equal(e.code, 'INVALID_PARAMS');
+				assert.match(e.message, /configure primaries/);
+				return true;
+			}
+		);
+		assert.equal(f.sent.length, 0);
+	});
+
+	it('quotes the first primary that is connected, naming the ones passed over', async () => {
+		const f = fixture(
+			{},
+			{
+				spare: true,
+				jobs: [],
+				peers: [ready(peer)],
+				primaries: [{ pubkey: otherPeer }, { pubkey: peer }]
+			}
+		);
+		const quote = await f.coordinator.quote(undefined, 20000);
+		assert.equal(quote.mode, 'bolt11');
+		assert.equal(quote.peer, peer);
+		assert.deepEqual(quote.terms, { feeBaseMsat: 0, feePpm: 0 });
+		assert.deepEqual(
+			quote.skipped.map((s: Json) => [s.pubkey, s.rank, s.stage, s.code]),
+			[[otherPeer, 1, 'connect', 'PEER_NOT_CONNECTED']]
+		);
+		// Only the chosen peer was asked anything.
+		assert.deepEqual(f.sent, [{ op: 'quote' }]);
+	});
+
+	it('passes over a primary that direct funding is not configured for', async () => {
+		// Neither primary has a channel, so both would be direct-funding; the
+		// node is configured for the second, so the first cannot be created
+		// against and the quote must not bind it.
+		const f = fixture(
+			{},
+			{
+				jobs: [],
+				peers: [ready(otherPeer), ready(peer)],
+				config: { lspPubkey: peer },
+				primaries: [{ pubkey: otherPeer }, { pubkey: peer }]
+			}
+		);
+		const quote = await f.coordinator.quote(undefined, 20000);
+		assert.equal(quote.mode, 'direct-funding');
+		assert.equal(quote.peer, peer);
+		assert.equal(quote.skipped.length, 1);
+		assert.equal(quote.skipped[0].pubkey, otherPeer);
+		assert.equal(quote.skipped[0].code, 'RECEIVE_UNAVAILABLE');
+		assert.match(quote.skipped[0].message, /configured for another peer/);
+		assert.equal(f.sent.length, 0);
+	});
+
+	it("measures the amount against each primary's own route", async () => {
+		// 20000 sats is under the 25000 direct-funding minimum the first
+		// primary would need, but fine on the channel the second has.
+		const f = fixture(
+			{},
+			{
+				spare: true,
+				jobs: [],
+				peers: [ready(otherPeer), ready(peer)],
+				config: { minAmountSat: 25000 },
+				primaries: [{ pubkey: otherPeer }, { pubkey: peer }]
+			}
+		);
+		const quote = await f.coordinator.quote(undefined, 20000);
+		assert.equal(quote.mode, 'bolt11');
+		assert.equal(quote.peer, peer);
+		assert.equal(quote.skipped[0].code, 'AMOUNT_TOO_SMALL');
+		assert.match(quote.skipped[0].message, /25000/);
+	});
+
+	it('passes over a primary whose node does not serve the receive', async () => {
+		const f = fixture(
+			{},
+			{
+				jobs: [],
+				peers: [ready(otherPeer), ready(peer)],
+				primaries: [{ pubkey: otherPeer }, { pubkey: peer }]
+			}
+		);
+		// Both primaries have a channel, and only the second answers the
+		// fee quote; the first's refusal carries its own message.
+		f.channels.push(
+			{
+				channelId: '77'.repeat(32),
+				peerPubkey: otherPeer,
+				state: 'NORMAL',
+				htlcUsable: true,
+				localBalanceSats: 0,
+				remoteBalanceSats: 100000
+			},
+			{
+				channelId: spareId,
+				peerPubkey: peer,
+				state: 'NORMAL',
+				htlcUsable: true,
+				localBalanceSats: 0,
+				remoteBalanceSats: 100000
+			}
+		);
+		// The service turns a peer's refusal into the coordinator's own typed
+		// error, carrying the peer's message.
+		f.node.getFforReceiveService = () => ({
+			request: async (to: string, request: Json) => {
+				f.sent.push({ ...request, to });
+				if (to === otherPeer)
+					throw new BeignetError(
+						'RECEIVE_UNAVAILABLE',
+						'Your node does not provide offline receiving.'
+					);
+				return { version: 1, feeBaseMsat: 0, feePpm: 0 };
+			},
+			receipts: async () => undefined
+		});
+		const quote = await f.coordinator.quote(undefined, 20000);
+		assert.equal(quote.peer, peer);
+		assert.equal(quote.mode, 'bolt11');
+		assert.equal(quote.skipped[0].pubkey, otherPeer);
+		assert.match(
+			quote.skipped[0].message,
+			/does not provide offline receiving/
+		);
+		assert.deepEqual(f.sent, [
+			{ op: 'quote', to: otherPeer },
+			{ op: 'quote', to: peer }
+		]);
+	});
+
+	it('fails typed when no primary qualifies', async () => {
+		const f = fixture(
+			{},
+			{
+				jobs: [],
+				peers: [],
+				primaries: [{ pubkey: otherPeer }, { pubkey: peer }]
+			}
+		);
+		await assert.rejects(
+			f.coordinator.quote(undefined, 20000),
+			(e: Failure) => {
+				assert.equal(e.code, 'NO_PRIMARY_AVAILABLE');
+				assert.match(e.message, /2 of 2 tried/);
+				assert.match(
+					e.message,
+					new RegExp(
+						`${otherPeer.slice(0, 16)} \\(rank 1\\): PEER_NOT_CONNECTED`
+					)
+				);
+				assert.match(
+					e.message,
+					new RegExp(`${peer.slice(0, 16)} \\(rank 2\\): PEER_NOT_CONNECTED`)
+				);
+				return true;
+			}
+		);
+	});
+
+	it('a request under way keeps its own peer, whatever the ranks say', async () => {
+		const f = fixture(
+			{ id: 'request-123456789', expiresAt: undefined, epochId: undefined },
+			{
+				spare: true,
+				peers: [ready(otherPeer), ready(peer)],
+				primaries: [{ pubkey: otherPeer }, { pubkey: peer }]
+			}
+		);
+		f.channels.push({
+			channelId: '77'.repeat(32),
+			peerPubkey: otherPeer,
+			state: 'NORMAL',
+			htlcUsable: true,
+			localBalanceSats: 0,
+			remoteBalanceSats: 100000
+		});
+		const quote = await f.coordinator.quote(
+			undefined,
+			20000,
+			'request-123456789'
+		);
+		assert.equal(quote.peer, peer);
+		assert.equal(quote.skipped, undefined);
+	});
+
+	it('binds a create that names no peer to the one its quote named', async () => {
+		const f = fixture(
+			{},
+			{
+				spare: true,
+				jobs: [],
+				peers: [ready(otherPeer), ready(peer)],
+				primaries: [{ pubkey: otherPeer }, { pubkey: peer }]
+			}
+		);
+		f.channels.push({
+			channelId: '77'.repeat(32),
+			peerPubkey: otherPeer,
+			state: 'NORMAL',
+			htlcUsable: true,
+			localBalanceSats: 0,
+			remoteBalanceSats: 100000
+		});
+		const quote = await f.coordinator.quote(undefined, 20000);
+		assert.equal(quote.peer, otherPeer);
+		// The ranks change between review and create: the request does not.
+		f.node.listPrimaries = () => ({
+			fillThresholdSat: null,
+			receiveTarget: peer,
+			primaries: []
+		});
+		const created = await f.coordinator.create(body(quote));
+		assert.equal(created.kind, 'bolt11');
+		assert.equal(f.coordinator.status().requests[0].peer, otherPeer);
+		assert.deepEqual([...f.coordinator.reservedIds()], ['77'.repeat(32)]);
+	});
+
+	it("a create naming a peer other than its quote's is a stale review", async () => {
+		const f = fixture({}, { spare: true, jobs: [] });
+		const quote = await f.coordinator.quote(peer, 20000);
+		await assert.rejects(
+			f.coordinator.create(body(quote), otherPeer),
+			(e: Failure) => e.code === 'INVALID_REVIEW'
+		);
+		await assert.rejects(
+			f.coordinator.create(body({ ...quote, peer: 42 })),
+			(e: Failure) => e.code === 'INVALID_REVIEW'
+		);
+		assert.equal(f.started, 0);
 	});
 });
 

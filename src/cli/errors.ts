@@ -68,6 +68,13 @@ export enum BeignetErrorCode {
 	SWAP_NOT_CANCELLABLE = 'SWAP_NOT_CANCELLABLE',
 	// The LSP never answered the intent inside the ack window.
 	JIT_TIMEOUT = 'JIT_TIMEOUT',
+	/**
+	 * A receive that named no peer walked the ranked primaries (issue #1922)
+	 * and none took it: each was unreachable, timed out, declined, or was not
+	 * reached inside the budget. The message names every one's reason.
+	 * Transient as a whole, since a down or slow primary is the usual cause.
+	 */
+	NO_PRIMARY_AVAILABLE = 'NO_PRIMARY_AVAILABLE',
 	CONNECT_FAILED = 'CONNECT_FAILED',
 
 	// Channels
@@ -357,6 +364,9 @@ export function isRetryableError(err: BeignetError): boolean {
 		BeignetErrorCode.CONNECT_FAILED,
 		BeignetErrorCode.CONNECT_TIMEOUT,
 		BeignetErrorCode.JIT_TIMEOUT,
+		// Every primary was down, slow or declining at once; the next walk
+		// finds a different world.
+		BeignetErrorCode.NO_PRIMARY_AVAILABLE,
 		// Reaching an upstream (the fee source, an L402 target, a guardian
 		// quorum) failed; the next attempt reaches a different world.
 		BeignetErrorCode.FEE_ESTIMATE_FAILED,
