@@ -36,5 +36,15 @@ jobs:
       # queries the registry advisory endpoint; no npm ci needed.
       # Moderate, not high: bip21 parses QR and pasted URIs with qs, and qs's
       # denial-of-service advisories are rated moderate.
-      - name: Audit dependencies
-        run: npm audit --audit-level=moderate
+      #
+      # Two gates. The first covers what ships, with no exceptions. The second
+      # covers everything, the test and lint tools included, and takes the
+      # named, dated exceptions in audit-allowlist.json (scripts/audit-gate.js
+      # states the rules), so an advisory no dependent has fixed yet is
+      # excepted by name until a date rather than failing every run or having
+      # the gate switched off.
+      - name: Audit the dependencies that ship
+        run: npm audit --audit-level=moderate --omit=dev
+
+      - name: Audit everything, with the exceptions in audit-allowlist.json
+        run: node scripts/audit-gate.js
