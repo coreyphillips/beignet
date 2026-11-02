@@ -178,15 +178,17 @@ describe('LFBW app surface (issue #614)', () => {
 			);
 		});
 
-		// 3B, issue #595. The app posts three fields and reads two back.
+		// 3B, issue #595. The app posts three fields and reads two back. The
+		// LSP it names reaches the node as given (issue #1922 steers only a
+		// call that names none).
 		it('POST /jit/invoice takes lspPubkey, amountSats and description', () => {
 			expect(requestParams('/jit/invoice')).to.include.members([
 				'lspPubkey',
 				'amountSats',
 				'description'
 			]);
-			expect(handlerSource('POST /jit/invoice')).to.include(
-				"if (!lspPubkey) return failure('INVALID_PARAMS'"
+			expect(handlerSource('POST /jit/invoice')).to.match(
+				/createJitInvoice\(\{\s*lspPubkey,/
 			);
 		});
 
@@ -210,8 +212,8 @@ describe('LFBW app surface (issue #614)', () => {
 				'maxClientFundingSats',
 				'withinCeilings'
 			]);
-			expect(handlerSource('GET /jit/quote')).to.include(
-				"if (!lspPubkey) return failure('INVALID_PARAMS'"
+			expect(handlerSource('GET /jit/quote')).to.match(
+				/getJitQuote\(\{\s*lspPubkey,/
 			);
 		});
 
@@ -220,9 +222,11 @@ describe('LFBW app surface (issue #614)', () => {
 		// library's own default rather than arrive as an explicit undefined,
 		// and the inbound target has to mean "leave none over".
 		it('POST /jit/invoice defaults the two fields the app omits', () => {
+			// The library call lives in jitInvoiceAt, which both the named-LSP
+			// path and the steered walk go through.
 			const create = declaration(
 				beignetNodeSrc,
-				'async createJitInvoice(opts: {',
+				'private async jitInvoiceAt(',
 				2500
 			);
 			expect(create).to.include(

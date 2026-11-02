@@ -478,12 +478,37 @@ export interface JitStatusInfo {
 }
 
 /**
+ * Why a steered receive passed one ranked primary over (issue #1922). `budget`
+ * means it was not tried: the walk's budget ran out before it.
+ */
+export interface ReceiveSteerSkip {
+	pubkey: string;
+	/** 1-based configured rank. */
+	rank: number;
+	stage: 'connect' | 'attempt' | 'budget';
+	code: string;
+	message: string;
+}
+
+/** A JIT invoice: the invoice, the agreed opening fee, and the LSP behind it. */
+export interface JitInvoiceInfo extends InvoiceInfo {
+	/** The LSP the intent was registered with: the one named, or the primary that took it. */
+	lspPubkey: string;
+	flatFeeSat: number;
+	feePpm: number;
+	feeMode: 'skim' | 'hop';
+	/** Steered receives only: the primaries passed over before this one. */
+	skipped?: ReceiveSteerSkip[];
+}
+
+/**
  * GET /jit/quote (issue #687): what a just-in-time receive of this size
  * would cost at the named LSP and whether it would be served right now,
  * asked without registering an intent. A decline is an answer, not an
  * error: `accepted` false with `reason` in plain language.
  */
 export interface JitQuoteInfo {
+	/** The LSP priced: the one named, or the first primary that would serve the receive. */
 	lspPubkey: string;
 	/** The receive priced; null for an amount-less invoice (the cap is priced). */
 	amountSats: number | null;
@@ -504,6 +529,8 @@ export interface JitQuoteInfo {
 	withinCeilings: boolean;
 	/** Those ceilings, so a refusal on them can be explained. */
 	client: { maxFlatFeeSat: number; maxFeePpm: number };
+	/** Steered quotes only: the primaries passed over before this one. */
+	skipped?: ReceiveSteerSkip[];
 }
 
 export interface DirectFundingConfigInfo {

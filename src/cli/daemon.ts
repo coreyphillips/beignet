@@ -436,6 +436,9 @@ const STATUS_BY_ERROR_CODE: Partial<Record<BeignetErrorCodeValue, number>> = {
 	JIT_REFUSED: 400,
 	// Our own fence, not the LSP's policy: waiting genuinely changes it.
 	NEW_CHANNELS_REFUSED: 503,
+	// No ranked primary took a steered receive: down, slow or declining
+	// peers, so a later walk can end differently.
+	NO_PRIMARY_AVAILABLE: 503,
 	SWAP_NOT_CANCELLABLE: 409,
 	JIT_TIMEOUT: 504,
 	PAYMENT_FAILED: 502,
@@ -2196,7 +2199,8 @@ async function bootDaemon(
 				maxFeePpm?: number;
 				feeMode?: 'skim' | 'hop';
 			};
-			if (!lspPubkey) return failure('INVALID_PARAMS', 'lspPubkey required');
+			// No lspPubkey: steered through the ranked primaries (issue
+			// #1922), 400 INVALID_PARAMS when none is configured.
 			return success(
 				await node.createJitInvoice({
 					lspPubkey,
@@ -2219,8 +2223,9 @@ async function bootDaemon(
 		// The LSP's decline is an answer (accepted false, reason); only the
 		// transport failures are errors.
 		'GET /jit/quote': async (_body, query) => {
-			const lspPubkey = query.get('lspPubkey');
-			if (!lspPubkey) return failure('INVALID_PARAMS', 'lspPubkey required');
+			// No lspPubkey: priced at the first ranked primary that would serve
+			// the receive (issue #1922).
+			const lspPubkey = query.get('lspPubkey') || undefined;
 			return success(
 				await node.getJitQuote({
 					lspPubkey,
@@ -3298,16 +3303,16 @@ async function bootDaemon(
 		'GET /receive/status': () => success(node.getOfflineReceive().status()),
 		'GET /receive/quote': async (_body, query) =>
 			success(
-				await node
-					.getOfflineReceive()
-					.quote(
-						query.get('peer') || '',
-						Number(query.get('amountSats')),
-						query.get('requestId') ?? undefined
-					)
+				await node.getOfflineReceive().quote(
+					// No peer: the ranked primaries choose (issue #1922).
+					query.get('peer') || undefined,
+					Number(query.get('amountSats')),
+					query.get('requestId') ?? undefined
+				)
 			),
 		'POST /receive/invoice': async (body) => {
-			const b = body as { peer: string };
+			// No peer: the one the reviewed quote named (issue #1922).
+			const b = body as { peer?: string };
 			return success(await node.getOfflineReceive().create(body, b.peer));
 		},
 		'GET /ffor/epochs': () => success(node.fforEpochs()),

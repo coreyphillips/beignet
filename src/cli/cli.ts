@@ -1207,28 +1207,28 @@ async function handleChannel(): Promise<void> {
 	}
 }
 
+/**
+ * A leading positional that is a node pubkey, split off from the rest. The
+ * JIT commands take the LSP first and the amount after it; with the LSP left
+ * out (the ranked primaries choose), the amount moves up one place.
+ */
+function optionalPubkey(positional: string[]): [string | undefined, string[]] {
+	return /^0[23][0-9a-fA-F]{64}$/.test(positional[0] ?? '')
+		? [positional[0], positional.slice(1)]
+		: [undefined, positional];
+}
+
 async function handleJit(): Promise<void> {
 	const sub = filteredArgs[1];
 	switch (sub) {
 		case 'status':
 			return outputResult(await httpRequest('GET', '/jit/status'));
 		case 'quote': {
-			// What a JIT receive would cost, before any invoice exists.
-			const lspPubkey = filteredArgs[2];
-			if (!lspPubkey) {
-				output({
-					ok: false,
-					error: {
-						code: 'INVALID_PARAMS',
-						message:
-							'Usage: beignet jit quote <lspPubkey> [amountSats] [--target-inbound sats]'
-					}
-				});
-				process.exitCode = 1;
-				return;
-			}
-			const params = new URLSearchParams({ lspPubkey });
-			if (filteredArgs[3]) params.set('amountSats', filteredArgs[3]);
+			// What a JIT receive would cost, before any invoice exists. With no
+			// LSP named, the daemon prices it at the ranked primaries' choice.
+			const [lspPubkey, rest] = optionalPubkey(filteredArgs.slice(2));
+			const params = new URLSearchParams(lspPubkey ? { lspPubkey } : {});
+			if (rest[0]) params.set('amountSats', rest[0]);
 			const target = parseFlag('--target-inbound');
 			if (target !== undefined) params.set('targetRemainingInboundSat', target);
 			return outputResult(
@@ -1265,21 +1265,9 @@ async function handleInvoice(): Promise<void> {
 		case 'jit': {
 			// Payable with no channel: the LSP holds the HTLC, funds a channel
 			// and forwards, taking the quoted opening fee out of the delivery.
-			const lspPubkey = filteredArgs[2];
-			if (!lspPubkey) {
-				output({
-					ok: false,
-					error: {
-						code: 'INVALID_PARAMS',
-						message:
-							'Usage: beignet invoice jit <lspPubkey> [amountSats] [description] ' +
-							'[--expiry secs] [--target-inbound sats] [--max-flat-fee-sat n] [--max-fee-ppm n] ' +
-							'[--fee-mode skim|hop]'
-					}
-				});
-				process.exitCode = 1;
-				return;
-			}
+			// With no LSP named, the daemon steers it through the ranked
+			// primaries (beignet primaries).
+			const [lspPubkey, rest] = optionalPubkey(filteredArgs.slice(2));
 			const numberFlag = (name: string): number | undefined => {
 				const raw = parseFlag(name);
 				return raw === undefined ? undefined : parseInt(raw, 10);
@@ -1287,10 +1275,8 @@ async function handleInvoice(): Promise<void> {
 			return outputResult(
 				await httpRequest('POST', '/jit/invoice', {
 					lspPubkey,
-					amountSats: filteredArgs[3]
-						? parseInt(filteredArgs[3], 10)
-						: undefined,
-					description: filteredArgs[4] || '',
+					amountSats: rest[0] ? parseInt(rest[0], 10) : undefined,
+					description: rest[1] || '',
 					expirySecs: numberFlag('--expiry'),
 					targetRemainingInboundSat: numberFlag('--target-inbound'),
 					maxFlatFeeSat: numberFlag('--max-flat-fee-sat'),
@@ -3224,20 +3210,24 @@ Channels:
 Invoices & Payments:
   invoice create <sats> [description] [--min-final-cltv blocks]
                                          Create BOLT 11 invoice
-  invoice jit <lspPubkey> [sats] [description] [--expiry secs]
+  invoice jit [lspPubkey] [sats] [description] [--expiry secs]
              [--target-inbound sats] [--max-flat-fee-sat n] [--max-fee-ppm n]
              [--fee-mode skim|hop]       Create an invoice payable with no
                                          channel: the LSP funds one mid-payment
                                          and takes the agreed opening fee out
                                          of the delivery (skim, default) or
-                                         from the sender via the hint (hop)
+                                         from the sender via the hint (hop).
+                                         No lspPubkey: the ranked primaries
+                                         choose (see primaries)
   jit status                             The JIT receive role as it stands:
                                          fee, exposure caps, sats reserved and
                                          fronted, live intents
-  jit quote <lspPubkey> [sats] [--target-inbound sats]
+  jit quote [lspPubkey] [sats] [--target-inbound sats]
                                          What a JIT receive would cost at that
                                          LSP and whether it would be served
-                                         right now; registers nothing
+                                         right now; registers nothing. No
+                                         lspPubkey: priced at the primary the
+                                         ranked list would steer it to
 
 Swaps (reverse: a peer pays us over Lightning, we fund an on-chain contract;
        submarine: a peer funds a contract, we pay its invoice and claim):
