@@ -1,0 +1,242 @@
+/**
+ * Direct-funding requests bound to a peer (issue #1922, step 2b). The peer
+ * `POST /direct-funding/request` names, or the ranked primary it is steered
+ * to, is what the envelope's relay descriptors name and what the request
+ * record binds, so the receiver negotiates the funding with it whatever the
+ * direct-funding policy says by then. A request that names no peer and has
+ * no primaries follows the policy, unbound, as before.
+ */
+
+import { expect } from 'chai';
+import * as fs from 'fs';
+import * as http from 'http';
+import * as os from 'os';
+import * as path from 'path';
+import { AddressInfo } from 'net';
+import * as sinon from 'sinon';
+import { IStartedDaemon, startDaemon } from '../../src/cli/daemon';
+import type { PeerInfo } from '../../src/cli/types';
+import { decodeRequestEnvelope } from '../../src/lightning/direct-funding/envelope';
+import { DfTransportType } from '../../src/lightning/direct-funding/types';
+import type { IDfOnionTransport } from '../../src/lightning/direct-funding/types';
+import { getPublicKey } from '../../src/lightning/crypto/ecdh';
+
+const MNEMONIC =
+	'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about';
+
+const OFFLINE = {
+	electrumHost: '127.0.0.1',
+	electrumPort: 65529,
+	electrumTls: false,
+	rapidGossipSync: false,
+	autoGossipSync: false,
+	logLevel: 'silent' as const,
+	network: 'regtest' as const,
+	mnemonic: MNEMONIC,
+	daemonPort: 0
+};
+
+// Real curve points: a blinded path is minted through the bound peer.
+const point = (fill: number): string =>
+	getPublicKey(Buffer.alloc(32, fill)).toString('hex');
+const POLICY_PEER = point(0x11);
+const REACHABLE = point(0x22);
+const UNREACHABLE = point(0x33);
+
+function httpCall(
+	port: number,
+	method: 'GET' | 'POST',
+	route: string,
+	body?: unknown
+): Promise<{ status: number; json: Record<string, unknown> }> {
+	return new Promise((resolve, reject) => {
+		const req = http.request(
+			{
+				host: '127.0.0.1',
+				port,
+				path: route,
+				method,
+				headers: { 'content-type': 'application/json' }
+			},
+			(res) => {
+				let raw = '';
+				res.on('data', (c) => (raw += c));
+				res.on('end', () =>
+					resolve({ status: res.statusCode ?? 0, json: JSON.parse(raw) })
+				);
+			}
+		);
+		req.on('error', reject);
+		req.end(body === undefined ? undefined : JSON.stringify(body));
+	});
+}
+
+/** The peer a minted request is bound to, read from the node's request store. */
+function boundPeerOf(
+	daemon: IStartedDaemon,
+	paymentHash: string
+): string | undefined {
+	const inner = (
+		daemon.node as unknown as {
+			node: {
+				directFunding: {
+					requests: {
+						byReceiptHash(hash: string): { liquidityPeer?: string } | null;
+					};
+				};
+			};
+		}
+	).node;
+	return inner.directFunding.requests.byReceiptHash(paymentHash)?.liquidityPeer;
+}
+
+function relayOf(request: string): IDfOnionTransport | undefined {
+	return decodeRequestEnvelope(request).transports.find(
+		(t) => t.type === DfTransportType.ONION_MESSAGE
+	) as IDfOnionTransport | undefined;
+}
+
+describe('direct-funding requests bound to a peer (issue #1922)', function () {
+	this.timeout(30_000);
+	let dataDir: string;
+	let daemon: IStartedDaemon;
+	let port: number;
+	let peers: PeerInfo[] = [];
+
+	const mint = (
+		body: Record<string, unknown>
+	): Promise<{ status: number; json: Record<string, unknown> }> =>
+		httpCall(port, 'POST', '/direct-funding/request', body);
+
+	before(async () => {
+		dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'beignet-df-steer-'));
+		daemon = await startDaemon({ ...OFFLINE, dataDir });
+		port = (daemon.server.address() as AddressInfo).port;
+		// The mint only needs to know where a peer is; nothing is dialed.
+		sinon.stub(daemon.node, 'listPeers').callsFake(() => peers);
+	});
+
+	after(async () => {
+		sinon.restore();
+		await daemon.stop();
+		fs.rmSync(dataDir, { recursive: true, force: true });
+	});
+
+	it('binds the request to lspPubkey, at the address it is connected on', async () => {
+		peers = [
+			{ pubkey: REACHABLE, host: '10.0.0.8', port: 9737, state: 'ready' }
+		];
+		const { status, json } = await mint({
+			amountSats: 50_000,
+			lspPubkey: REACHABLE.toUpperCase()
+		});
+		expect(status).to.equal(200);
+		const result = json.result as Record<string, unknown>;
+		expect(result.lspPubkey).to.equal(REACHABLE);
+		expect(result).to.not.have.property('skipped');
+		const relay = relayOf(result.request as string);
+		expect(relay?.introNodeId.toString('hex')).to.equal(REACHABLE);
+		expect(relay).to.include({ host: '10.0.0.8', port: 9737 });
+		expect(boundPeerOf(daemon, result.paymentHash as string)).to.equal(
+			REACHABLE
+		);
+		// The policy was not written: the request carries its own peer.
+		expect(daemon.node.getDirectFundingConfig().lspPubkey).to.equal(null);
+	});
+
+	it('binds to a named peer with no known address, emitting no relay descriptor', async () => {
+		peers = [];
+		const { status, json } = await mint({ lspPubkey: UNREACHABLE });
+		expect(status).to.equal(200);
+		const result = json.result as Record<string, unknown>;
+		expect(result.lspPubkey).to.equal(UNREACHABLE);
+		expect(
+			decodeRequestEnvelope(result.request as string).transports
+		).to.have.length(0);
+		expect(boundPeerOf(daemon, result.paymentHash as string)).to.equal(
+			UNREACHABLE
+		);
+	});
+
+	it('follows the policy, unbound, when nothing names a peer and no primaries are configured', async () => {
+		daemon.node.configureDirectFunding({
+			lspPubkey: POLICY_PEER,
+			lspHost: '10.0.0.7',
+			lspPort: 9736
+		});
+		const { status, json } = await mint({});
+		expect(status).to.equal(200);
+		const result = json.result as Record<string, unknown>;
+		expect(result.lspPubkey).to.equal(POLICY_PEER);
+		const relay = relayOf(result.request as string);
+		expect(relay?.introNodeId.toString('hex')).to.equal(POLICY_PEER);
+		expect(relay).to.include({ host: '10.0.0.7', port: 9736 });
+		// Unbound: it is negotiated with whatever the policy names at admission.
+		expect(boundPeerOf(daemon, result.paymentHash as string)).to.equal(
+			undefined
+		);
+	});
+
+	it('takes the policy address for the policy peer when it is named outright', async () => {
+		const { json } = await mint({ lspPubkey: POLICY_PEER });
+		const result = json.result as Record<string, unknown>;
+		expect(relayOf(result.request as string)).to.include({
+			host: '10.0.0.7',
+			port: 9736
+		});
+		expect(boundPeerOf(daemon, result.paymentHash as string)).to.equal(
+			POLICY_PEER
+		);
+	});
+
+	it('steers through the primaries ahead of the policy, passing over one with no known address', async () => {
+		daemon.node.addPrimary({ pubkey: UNREACHABLE });
+		daemon.node.addPrimary({
+			pubkey: REACHABLE,
+			host: 'relay.example',
+			port: 9999
+		});
+		peers = [
+			{ pubkey: REACHABLE, host: '10.0.0.8', port: 9737, state: 'ready' }
+		];
+		const { status, json } = await mint({ amountSats: 50_000 });
+		expect(status).to.equal(200);
+		const result = json.result as Record<string, unknown>;
+		expect(result.lspPubkey).to.equal(REACHABLE);
+		expect(
+			(result.skipped as Record<string, unknown>[]).map((s) => [
+				s.pubkey,
+				s.rank,
+				s.stage,
+				s.code
+			])
+		).to.deep.equal([[UNREACHABLE, 1, 'connect', 'PEER_NOT_CONNECTED']]);
+		// The address stored with the primary wins over the connection's.
+		const relay = relayOf(result.request as string);
+		expect(relay?.introNodeId.toString('hex')).to.equal(REACHABLE);
+		expect(relay).to.include({ host: 'relay.example', port: 9999 });
+		expect(boundPeerOf(daemon, result.paymentHash as string)).to.equal(
+			REACHABLE
+		);
+		expect(daemon.node.getDirectFundingConfig().lspPubkey).to.equal(
+			POLICY_PEER
+		);
+	});
+
+	it('answers 503 NO_PRIMARY_AVAILABLE when no primary has an address', async () => {
+		daemon.node.removePrimary(REACHABLE);
+		peers = [];
+		const { status, json } = await mint({});
+		expect(status).to.equal(503);
+		const error = json.error as { code: string; message: string };
+		expect(error.code).to.equal('NO_PRIMARY_AVAILABLE');
+		expect(error.message).to.contain(UNREACHABLE.slice(0, 16));
+		expect(error.message).to.contain('no address is known');
+	});
+
+	it('refuses a malformed lspPubkey with 400 INVALID_PARAMS', async () => {
+		const { status, json } = await mint({ lspPubkey: 'zz' });
+		expect(status).to.equal(400);
+		expect((json.error as { code: string }).code).to.equal('INVALID_PARAMS');
+	});
+});

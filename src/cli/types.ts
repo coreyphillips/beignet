@@ -533,8 +533,28 @@ export interface JitQuoteInfo {
 	skipped?: ReceiveSteerSkip[];
 }
 
+/** A minted direct-funding request, and the peer it is bound to. */
+export interface DirectFundingRequestInfo {
+	/** The receipt hash; its preimage is revealed to the payer after broadcast. */
+	paymentHash: PaymentHashHex;
+	expiresAt: number;
+	/** The base64url envelope a payer pays (BIP 21 parameter `bgnq`). */
+	request: string;
+	/**
+	 * The peer the funding is negotiated with (issue #1922): the one named or
+	 * steered to, else the policy's liquidity peer, else null, when no relay
+	 * descriptor was emitted and no offer is served until a policy names one.
+	 */
+	lspPubkey: string | null;
+	/** The primaries passed over on the way to `lspPubkey`, when any were. */
+	skipped?: ReceiveSteerSkip[];
+}
+
 export interface DirectFundingConfigInfo {
-	/** The liquidity peer every direct-funded channel is negotiated with. */
+	/**
+	 * The liquidity peer a direct-funded channel is negotiated with when the
+	 * request bound no peer of its own (issue #1922).
+	 */
 	lspPubkey: string | null;
 	lspHost: string | null;
 	lspPort: number | null;

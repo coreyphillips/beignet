@@ -139,6 +139,44 @@ export function dialTargetOf(candidate: ISteerCandidate): {
 	return {};
 }
 
+/**
+ * The TCP address a payer can reach a primary's relay on, for a direct-funding
+ * request bound to it (issue #1922): the host and port stored for the
+ * primary, else its stored peer URI when that is a plain TCP one, else the
+ * address of `connected`, the peer entry it is up on, when that is TCP. A ws
+ * or iroh address is no use to a payer dialing a Lightning relay, so none of
+ * those count. Undefined when nothing is known.
+ */
+export function relayAddressOf(
+	stored: { host?: string; port?: number; uri?: string } | undefined,
+	connected:
+		| { host?: string; port?: number; transport?: 'tcp' | 'ws' | 'iroh' }
+		| undefined
+): { host: string; port: number } | undefined {
+	if (stored?.host !== undefined && stored.port !== undefined) {
+		return { host: stored.host, port: stored.port };
+	}
+	if (stored?.uri !== undefined) {
+		try {
+			const parsed = parsePeerUri(stored.uri);
+			if (parsed.transport === undefined && parsed.host && parsed.port) {
+				return { host: parsed.host, port: parsed.port };
+			}
+		} catch {
+			// A URI the store would not have taken: nothing to dial from it.
+		}
+	}
+	if (
+		connected &&
+		(connected.transport === undefined || connected.transport === 'tcp') &&
+		connected.host &&
+		connected.port
+	) {
+		return { host: connected.host, port: connected.port };
+	}
+	return undefined;
+}
+
 function short(pubkey: string): string {
 	return pubkey.slice(0, 16);
 }

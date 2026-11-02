@@ -1117,8 +1117,11 @@ export class DirectFundingReceiver extends TypedEmitter<DirectFundingReceiverEve
 			return;
 		}
 
-		// 4. A liquidity peer to negotiate the funding with.
-		const lsp = this.deps.liquidityPeer();
+		// 4. A liquidity peer to negotiate the funding with: the one the request
+		// was minted for (issue #1922), else the policy's. A bound request keeps
+		// its peer across a policy change, because its envelope sent the payer
+		// through that peer's relay and it is that peer the channel opens with.
+		const lsp = record.liquidityPeer ?? this.deps.liquidityPeer();
 		if (!lsp) {
 			decline('no liquidity peer');
 			return;

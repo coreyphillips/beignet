@@ -319,7 +319,10 @@ export interface IDfReceiverDeps {
 	 * `DF_DEFAULT_SPLICE_FEERATE_PERKW` (issue #763).
 	 */
 	estimateFeeSatPerVbyte?(targetBlocks: number): Promise<number | null>;
-	/** The liquidity peer every direct-funded channel is negotiated with. */
+	/**
+	 * The policy's liquidity peer: what a request that bound no peer of its
+	 * own is negotiated with (a bound request names its own, issue #1922).
+	 */
 	liquidityPeer(): string | null;
 	/** A channel with this peer a splice could ride, or null. */
 	usableChannelWith(peerHex: string): Buffer | null;

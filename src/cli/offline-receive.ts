@@ -2,7 +2,11 @@ import type { BeignetNode } from './beignet-node';
 import type { ChannelInfo } from './types';
 import type { BeignetErrorCodeValue } from './errors';
 import { BeignetError } from './errors';
-import { OFFLINE_RECEIVE_STEER_CODES, steerReceive } from './receive-steering';
+import {
+	OFFLINE_RECEIVE_STEER_CODES,
+	relayAddressOf,
+	steerReceive
+} from './receive-steering';
 import type { ISteerCandidate } from './receive-steering';
 import { DEFAULT_CHANNEL_CONFIG } from '../lightning/channel/types';
 
@@ -339,28 +343,40 @@ export class OfflineReceive {
 	}
 
 	/**
-	 * Whether a direct-funded request could be created at this peer. The
-	 * create-time rules of `directFunding`, applied before a steered quote
+	 * Whether a direct-funded request could be created at this peer: the
+	 * payer has to be told where to reach the peer's relay, so an address must
+	 * be known for it, from the primaries list, from the direct-funding policy
+	 * when it names this peer, or from the TCP connection the peer is up on.
+	 * The create-time rule of `directFunding`, applied before a steered quote
 	 * binds a peer the create would then refuse. The coordinator never dials,
 	 * so a candidate that is not connected is passed over by `route`.
 	 */
 	private directFundingEligible(peer: string): void {
-		const configured = this.node
-			.getDirectFundingConfig()
-			.lspPubkey?.toLowerCase();
-		if (configured && configured !== peer)
+		const config = this.node.getDirectFundingConfig();
+		if (
+			config.lspPubkey?.toLowerCase() === peer &&
+			config.lspHost &&
+			config.lspPort
+		)
+			return;
+		const stored = this.node
+			.listPrimaries()
+			.primaries.find((p) => p.pubkey === peer);
+		const address = relayAddressOf(
+			stored
+				? {
+						...(stored.host !== null ? { host: stored.host } : {}),
+						...(stored.port !== null ? { port: stored.port } : {}),
+						...(stored.uri !== null ? { uri: stored.uri } : {})
+				  }
+				: undefined,
+			this.node.listPeers().find((p) => p.pubkey === peer)
+		);
+		if (!address)
 			fail(
 				'RECEIVE_UNAVAILABLE',
-				'Direct funding is configured for another peer. Change that setting before receiving from this one.'
+				'No address is known for this peer. Connect to it over TCP, or store its host and port with the primaries, before creating this payment request.'
 			);
-		if (!configured) {
-			const entry = this.node.listPeers().find((p) => p.pubkey === peer);
-			if (!entry?.host || !entry.port)
-				fail(
-					'RECEIVE_UNAVAILABLE',
-					'Connect to your node before creating this payment request.'
-				);
-		}
 	}
 
 	private async steeredQuote(amountSats: number): Promise<any> {
@@ -471,13 +487,18 @@ export class OfflineReceive {
 		);
 	}
 	/**
-	 * The direct-funding fallback: point the node at this peer and mint a request.
+	 * The direct-funding fallback: mint a request bound to this peer.
 	 *
-	 * No epoch, no reservation and no channel of our own. An existing config for
-	 * the SAME peer is left exactly as the operator set it, because retargeting
-	 * inbound target, zero-conf trust or the splice switches behind their back is
-	 * a policy change nobody asked for. A config naming a DIFFERENT peer refuses
-	 * rather than silently moving the node's liquidity relationship.
+	 * No epoch, no reservation and no channel of our own. The request carries
+	 * the peer it was quoted at (issue #1922): its relay descriptors name that
+	 * peer and the receiver negotiates the funding with it, so the node's
+	 * direct-funding policy is neither consulted for the peer nor retargeted.
+	 * An existing policy, for this peer or another, is left exactly as the
+	 * operator set it, because moving the inbound target, the zero-conf trust,
+	 * the splice switches or the liquidity relationship behind their back is a
+	 * change nobody asked for. With no policy yet, the first request still
+	 * configures one for its peer, on the address it is connected on: that is
+	 * the peer a request naming no peer and no primaries falls back to.
 	 */
 	private directFunding(
 		body: { requestId: string; amountSats: number },
@@ -486,15 +507,17 @@ export class OfflineReceive {
 	): OfflineReceiveResult {
 		this.directFundingEligible(peer);
 		if (!this.node.getDirectFundingConfig().lspPubkey) {
-			const entry = this.node.listPeers().find((p) => p.pubkey === peer)!;
-			this.node.configureDirectFunding({
-				lspPubkey: peer,
-				lspHost: entry.host,
-				lspPort: entry.port
-			});
+			const entry = this.node.listPeers().find((p) => p.pubkey === peer);
+			if (entry?.host && entry.port)
+				this.node.configureDirectFunding({
+					lspPubkey: peer,
+					lspHost: entry.host,
+					lspPort: entry.port
+				});
 		}
 		const minted = this.node.createDirectFundingRequest({
-			amountSats: body.amountSats
+			amountSats: body.amountSats,
+			lspPubkey: peer
 		});
 		const job: OfflineReceiveJob =
 			existing ??

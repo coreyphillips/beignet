@@ -828,7 +828,10 @@ export type LightningNodeSeedOptions = Omit<
  * on a restart.
  */
 export interface IDirectFundingPolicy {
-	/** The peer every direct-funded channel is negotiated with. */
+	/**
+	 * The peer a direct-funded channel is negotiated with when the request
+	 * bound no peer of its own (`mintDirectFundingRequest`, issue #1922).
+	 */
 	liquidityPeer?: string;
 	/** Where that peer is reachable, for the relay and onion descriptors. */
 	liquidityHost?: string;

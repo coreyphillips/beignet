@@ -221,6 +221,8 @@ import {
 	JIT_STEER_CODES,
 	STEER_BUDGET_MS,
 	dialTargetOf,
+	noPrimaryAvailable,
+	relayAddressOf,
 	steerReceive
 } from './receive-steering';
 import type { ISteerCandidate, ISteerSkip } from './receive-steering';
@@ -332,6 +334,7 @@ import type {
 	TOnchainQuote,
 	TChannelFundingQuote,
 	DirectFundingConfigInfo,
+	DirectFundingRequestInfo,
 	PrimariesInfo,
 	JitInvoiceInfo,
 	JitStatusInfo,
@@ -10523,12 +10526,25 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	 * dashboard sends the browser's own hostname and the app's manager sends
 	 * PUBLIC_HOST, both with this wallet's listen port, and this node has no way
 	 * to know which is right.
+	 *
+	 * `lspPubkey` names the peer the funding is negotiated with (issue #1922):
+	 * the envelope's relay descriptors name it, at the address the primaries
+	 * list stores for it, else the policy's address for it, else the one it is
+	 * connected on, and the receiver opens the channel with it when the offer
+	 * arrives, whatever the direct-funding policy says by then. Omitted, the
+	 * ranked primaries choose when any are configured: the first in
+	 * `listPrimaries` selection order with a known address is bound, the
+	 * others are listed in `skipped`, and NO_PRIMARY_AVAILABLE answers when
+	 * none has one. Nothing is dialed, since the request is paid later and
+	 * the payer reaches this node through that primary's relay. With no
+	 * primaries the policy's liquidity peer serves, as before.
 	 */
 	createDirectFundingRequest(opts: {
 		host?: string;
 		port?: number;
 		amountSats?: number;
-	}): { paymentHash: PaymentHashHex; expiresAt: number; request: string } {
+		lspPubkey?: string;
+	}): DirectFundingRequestInfo {
 		if (opts.port !== undefined) {
 			if (!Number.isInteger(opts.port) || opts.port < 1 || opts.port > 65535) {
 				throw new BeignetError(
@@ -10537,20 +10553,65 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 				);
 			}
 		}
+		if (
+			opts.lspPubkey !== undefined &&
+			!/^0[23][0-9a-fA-F]{64}$/.test(opts.lspPubkey)
+		) {
+			throw new BeignetError(
+				BeignetErrorCode.INVALID_PARAMS,
+				'lspPubkey must be a 33-byte compressed public key (66 hex chars)'
+			);
+		}
 		const amountSats =
 			opts.amountSats !== undefined && opts.amountSats !== 0
 				? requireNonNegativeSafeInteger(opts.amountSats, 'amountSats')
 				: undefined;
+		const base = {
+			...(opts.host !== undefined ? { host: opts.host } : {}),
+			...(opts.port !== undefined ? { port: opts.port } : {}),
+			...(amountSats !== undefined ? { amountSat: BigInt(amountSats) } : {})
+		};
+		if (opts.lspPubkey !== undefined) {
+			const pubkey = opts.lspPubkey.toLowerCase();
+			return this.mintDirectFundingRequestAt(base, {
+				pubkey,
+				address: this.liquidityAddressOf(pubkey)
+			});
+		}
+		if (this.primariesStore().get().primaries.length > 0) {
+			return this.steeredDirectFundingRequest(base);
+		}
+		return this.mintDirectFundingRequestAt(base);
+	}
+
+	/** The mint at one peer, or at the policy's: the library call and its typed failures. */
+	private mintDirectFundingRequestAt(
+		base: { host?: string; port?: number; amountSat?: bigint },
+		bound?: { pubkey: string; address?: { host: string; port: number } }
+	): DirectFundingRequestInfo {
 		try {
 			const minted = this.node.mintDirectFundingRequest({
-				...(opts.host !== undefined ? { host: opts.host } : {}),
-				...(opts.port !== undefined ? { port: opts.port } : {}),
-				...(amountSats !== undefined ? { amountSat: BigInt(amountSats) } : {})
+				...base,
+				...(bound
+					? {
+							liquidityPeer: bound.pubkey,
+							...(bound.address
+								? {
+										liquidityHost: bound.address.host,
+										liquidityPort: bound.address.port
+								  }
+								: {})
+					  }
+					: {})
 			});
 			return {
 				paymentHash: minted.record.receiptHash,
 				expiresAt: minted.expiresAt,
-				request: minted.request
+				request: minted.request,
+				lspPubkey:
+					minted.record.liquidityPeer ??
+					this.node.getDirectFundingPolicy()?.liquidityPeer ??
+					null
 			};
 		} catch (err) {
 			// A mint that fails degrades to a plain BIP 21 URI in the app, silently,
@@ -10560,6 +10621,68 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 			});
 			throw this.directFundingFailure(err);
 		}
+	}
+
+	/**
+	 * Where a payer reaches this peer's relay: the address the primaries list
+	 * stores for it (host and port, or a TCP peer URI), else the address the
+	 * direct-funding policy names for it, else the one it is connected on.
+	 */
+	private liquidityAddressOf(
+		pubkey: string
+	): { host: string; port: number } | undefined {
+		const stored = this.primariesStore()
+			.get()
+			.primaries.find((p) => p.pubkey === pubkey);
+		const fromStored = relayAddressOf(stored, undefined);
+		if (fromStored) return fromStored;
+		const policy = this.node.getDirectFundingPolicy();
+		if (
+			policy?.liquidityPeer?.toLowerCase() === pubkey &&
+			policy.liquidityHost &&
+			policy.liquidityPort
+		) {
+			return { host: policy.liquidityHost, port: policy.liquidityPort };
+		}
+		return relayAddressOf(
+			undefined,
+			this.listPeers().find((p) => p.pubkey === pubkey)
+		);
+	}
+
+	/**
+	 * The request bound to the first primary in selection order whose relay a
+	 * payer could be told how to reach. A primary with no known address is
+	 * passed over and listed in `skipped`; with none left, NO_PRIMARY_AVAILABLE.
+	 */
+	private steeredDirectFundingRequest(base: {
+		host?: string;
+		port?: number;
+		amountSat?: bigint;
+	}): DirectFundingRequestInfo {
+		const skipped: ISteerSkip[] = [];
+		for (const candidate of this.receiveCandidates()) {
+			const address = this.liquidityAddressOf(candidate.pubkey);
+			if (!address) {
+				const skip: ISteerSkip = {
+					pubkey: candidate.pubkey,
+					rank: candidate.rank,
+					stage: 'connect',
+					code: BeignetErrorCode.PEER_NOT_CONNECTED,
+					message:
+						'no address is known for this primary: store its host and port, or connect to it over TCP'
+				};
+				skipped.push(skip);
+				this.logSteerSkip('direct-funding request', skip);
+				continue;
+			}
+			const minted = this.mintDirectFundingRequestAt(base, {
+				pubkey: candidate.pubkey,
+				address
+			});
+			return skipped.length ? { ...minted, skipped } : minted;
+		}
+		throw noPrimaryAvailable(skipped);
 	}
 
 	/**

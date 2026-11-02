@@ -2431,7 +2431,7 @@ method directFunding.DirectFundingRequestStore.markAttemptFunding(receiptHashHex
 method directFunding.DirectFundingRequestStore.markReceiptRevealed(receiptHashHex: string, paidBy?: { offerIdHex: string; fundingTxidHex: string; amountSat?: string; }): void
 method directFunding.DirectFundingRequestStore.markReceivedLocked(fundingTxidHex: string, at?: number): boolean
 method directFunding.DirectFundingRequestStore.markReceivedReverted(fundingTxidHex: string): number
-method directFunding.DirectFundingRequestStore.mint(opts?: { ttlMs?: number; amountSat?: bigint; }): directFunding.IDfRequestRecord
+method directFunding.DirectFundingRequestStore.mint(opts?: { ttlMs?: number; amountSat?: bigint; liquidityPeer?: string; }): directFunding.IDfRequestRecord
 method directFunding.DirectFundingRequestStore.paidOffer(receiptHashHex: string): { offerIdHex: string; fundingTxidHex: string; } | null
 method directFunding.DirectFundingRequestStore.receiptPreimage(receiptHashHex: string): string | null
 method directFunding.DirectFundingRequestStore.received(): directFunding.IDfReceivedRecord[]
@@ -2775,6 +2775,7 @@ property directFunding.IDfRequestRecord.amountSat?: string
 property directFunding.IDfRequestRecord.attempts?: number
 property directFunding.IDfRequestRecord.encryptionPrivateKeyHex: string
 property directFunding.IDfRequestRecord.expiresAt: number
+property directFunding.IDfRequestRecord.liquidityPeer?: string
 property directFunding.IDfRequestRecord.onionPathSecretHex: string
 property directFunding.IDfRequestRecord.paidBy?: { offerIdHex: string; fundingTxidHex: string; channelIdHex?: string; splice?: boolean; amountSat?: string; }
 property directFunding.IDfRequestRecord.preimageHex: string
@@ -5707,7 +5708,7 @@ method node.LightningNode.listenIroh(): Promise<void>
 method node.LightningNode.listenWebSocket(port: number, host?: string): Promise<void>
 method node.LightningNode.loadRapidGossipSnapshot(data: Buffer): gossip.IRapidGossipResult
 method node.LightningNode.loadRapidGossipSnapshotAsync(data: Buffer, opts?: { cancelled?: () => boolean; onSlice?: (ms: number) => void; }): Promise<gossip.IRapidGossipResult>
-method node.LightningNode.mintDirectFundingRequest(opts: { host?: string; port?: number; amountSat?: bigint; ttlMs?: number; }): { record: directFunding.IDfRequestRecord; request: string; expiresAt: number; }
+method node.LightningNode.mintDirectFundingRequest(opts: { host?: string; port?: number; amountSat?: bigint; ttlMs?: number; liquidityPeer?: string; liquidityHost?: string; liquidityPort?: number; }): { record: directFunding.IDfRequestRecord; request: string; expiresAt: number; }
 method node.LightningNode.openChannel(peerPubkey: string, fundingSatoshis: bigint, pushMsat?: bigint, satsPerVbyte?: number, fundMax?: boolean, trusted?: boolean): channel.Channel
 method node.LightningNode.openChannelV2(peerPubkey: string, params: { fundingSatoshis: bigint; fundingFeeratePerkw?: number; commitmentFeeratePerkw?: number; locktime?: number; requestFunds?: message.IRequestFunds; maxLeaseRates?: gossip.ILeaseRates; channelType?: Buffer; fundMax?: boolean; trusted?: boolean; fundingUtxos?: { utxos: Array<{ txid: string; vout: number; }>; allowTopUp?: boolean; }; contribution?: { inputs: channel.ISpliceWalletInput[]; changeScript: Buffer; }; }): channel.Channel
 method node.LightningNode.openZeroConfChannel(peerPubkey: string, fundingSatoshis: bigint, pushMsat?: bigint): channel.Channel

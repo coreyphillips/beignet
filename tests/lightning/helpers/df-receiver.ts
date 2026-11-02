@@ -615,10 +615,15 @@ export class FakeDfNode implements IDfReceiverDeps {
 		this.requests.restore();
 	}
 
-	mintRequest(ttlMs?: number, amountSat?: bigint): IDfRequestRecord {
+	mintRequest(
+		ttlMs?: number,
+		amountSat?: bigint,
+		liquidityPeer?: string
+	): IDfRequestRecord {
 		return this.requests.mint({
 			...(ttlMs === undefined ? {} : { ttlMs }),
-			...(amountSat === undefined ? {} : { amountSat })
+			...(amountSat === undefined ? {} : { amountSat }),
+			...(liquidityPeer === undefined ? {} : { liquidityPeer })
 		});
 	}
 

@@ -47,7 +47,13 @@ type Channel = {
 	htlcCount?: number;
 	ffor?: { reservedInboundSats: number; unresolvedSlots: number };
 };
-type Peer = { pubkey: string; host: string; port: number; state: string };
+type Peer = {
+	pubkey: string;
+	host: string;
+	port: number;
+	state: string;
+	transport?: 'tcp' | 'ws' | 'iroh';
+};
 type Json = Record<string, unknown>;
 type Failure = Error & { code?: string };
 type Primary = { pubkey: string; host?: string; port?: number };
@@ -115,6 +121,8 @@ function fixture(overrides: Json = {}, opts: Opts = {}): any {
 		...(opts.config ?? {})
 	};
 	const configured: Json[] = [];
+	/** Every direct-funding request this coordinator had the node mint. */
+	const mints: Json[] = [];
 	/** Every op this coordinator put on the wire toward the peer. */
 	const sent: Json[] = [];
 	const saved: unknown[] = [];
@@ -153,8 +161,12 @@ function fixture(overrides: Json = {}, opts: Opts = {}): any {
 			Object.assign(config, update);
 			return { ...config };
 		},
-		createDirectFundingRequest: (body: { amountSats: number }) => {
+		createDirectFundingRequest: (body: {
+			amountSats: number;
+			lspPubkey?: string;
+		}) => {
 			minted++;
+			mints.push(body);
 			return {
 				request: `df-request-${minted}-${body.amountSats}`,
 				paymentHash: receiptHash,
@@ -223,6 +235,7 @@ function fixture(overrides: Json = {}, opts: Opts = {}): any {
 		saved,
 		config,
 		configured,
+		mints,
 		channels,
 		get queries() {
 			return queries;
@@ -748,16 +761,44 @@ describe('receive steered through the primaries (issue #1922)', () => {
 		assert.deepEqual(f.sent, [{ op: 'quote' }]);
 	});
 
-	it('passes over a primary that direct funding is not configured for', async () => {
+	it('binds the request to the primary it was quoted at, whatever direct funding is configured for', async () => {
 		// Neither primary has a channel, so both would be direct-funding; the
-		// node is configured for the second, so the first cannot be created
-		// against and the quote must not bind it.
+		// node's policy names the second, and the first is still the one the
+		// quote picks and the create mints for. The policy is not touched.
 		const f = fixture(
 			{},
 			{
 				jobs: [],
 				peers: [ready(otherPeer), ready(peer)],
-				config: { lspPubkey: peer },
+				config: { lspPubkey: peer, lspHost: 'lsp.example', lspPort: 9735 },
+				primaries: [{ pubkey: otherPeer }, { pubkey: peer }]
+			}
+		);
+		const quote = await f.coordinator.quote(undefined, 20000);
+		assert.equal(quote.mode, 'direct-funding');
+		assert.equal(quote.peer, otherPeer);
+		assert.equal(quote.skipped, undefined);
+		const created = await f.coordinator.create(body(quote));
+		assert.equal(created.kind, 'direct-funding');
+		assert.equal(created.peer, otherPeer);
+		assert.deepEqual(f.mints, [{ amountSats: 20000, lspPubkey: otherPeer }]);
+		assert.deepEqual(f.configured, []);
+		assert.equal(f.config.lspPubkey, peer);
+		assert.equal(f.sent.length, 0);
+	});
+
+	it('passes over a primary whose relay a payer could not be told how to reach', async () => {
+		// The first primary is up over WebSocket and stores no address, so a
+		// request bound to it would carry no relay descriptor; the second is
+		// reached over TCP.
+		const f = fixture(
+			{},
+			{
+				jobs: [],
+				peers: [
+					{ ...ready(otherPeer), transport: 'ws' },
+					{ ...ready(peer), transport: 'tcp' }
+				],
 				primaries: [{ pubkey: otherPeer }, { pubkey: peer }]
 			}
 		);
@@ -767,8 +808,26 @@ describe('receive steered through the primaries (issue #1922)', () => {
 		assert.equal(quote.skipped.length, 1);
 		assert.equal(quote.skipped[0].pubkey, otherPeer);
 		assert.equal(quote.skipped[0].code, 'RECEIVE_UNAVAILABLE');
-		assert.match(quote.skipped[0].message, /configured for another peer/);
-		assert.equal(f.sent.length, 0);
+		assert.match(quote.skipped[0].message, /No address is known/);
+	});
+
+	it('takes the relay address stored with the primary when the connection has none', async () => {
+		const f = fixture(
+			{},
+			{
+				jobs: [],
+				peers: [{ pubkey: peer, host: '', port: 0, state: 'ready' }],
+				primaries: [{ pubkey: peer, host: 'relay.example', port: 9737 }]
+			}
+		);
+		const quote = await f.coordinator.quote(undefined, 20000);
+		assert.equal(quote.peer, peer);
+		const created = await f.coordinator.create(body(quote));
+		assert.equal(created.kind, 'direct-funding');
+		assert.deepEqual(f.mints, [{ amountSats: 20000, lspPubkey: peer }]);
+		// No policy was written: the connection names no address to write.
+		assert.deepEqual(f.configured, []);
+		assert.equal(f.config.lspPubkey, null);
 	});
 
 	it("measures the amount against each primary's own route", async () => {
@@ -1030,19 +1089,45 @@ describe('receive request creation', () => {
 		assert.equal(f.config.allowSplice, true);
 	});
 
-	it('refuses rather than retargeting a node configured for another peer', async () => {
+	it('mints for another peer without retargeting the configured one (issue #1922)', async () => {
 		const f = fixture({}, { jobs: [], config: { lspPubkey: otherPeer } });
+		const quote = await f.coordinator.quote(peer, 20000);
+		const created = await f.coordinator.create(body(quote), peer);
+		assert.equal(created.kind, 'direct-funding');
+		assert.equal(created.peer, peer);
+		// The request carries its own peer; the policy stays the operator's.
+		assert.deepEqual(f.mints, [{ amountSats: 20000, lspPubkey: peer }]);
+		assert.deepEqual(f.configured, []);
+		assert.equal(f.config.lspPubkey, otherPeer);
+		assert.equal(f.coordinator.status().requests.length, 1);
+	});
+
+	it('refuses a peer no payer could be told how to reach', async () => {
+		const f = fixture(
+			{},
+			{
+				jobs: [],
+				peers: [
+					{
+						pubkey: peer,
+						host: 'ws.example',
+						port: 443,
+						state: 'ready',
+						transport: 'ws'
+					}
+				]
+			}
+		);
 		const quote = await f.coordinator.quote(peer, 20000);
 		await assert.rejects(
 			f.coordinator.create(body(quote), peer),
 			(e: Failure) => {
 				assert.equal(e.code, 'RECEIVE_UNAVAILABLE');
-				assert.match(e.message, /configured for another peer/);
+				assert.match(e.message, /No address is known/);
 				return true;
 			}
 		);
 		assert.equal(f.minted, 0);
-		assert.equal(f.config.lspPubkey, otherPeer);
 		assert.equal(f.coordinator.status().requests.length, 0);
 	});
 

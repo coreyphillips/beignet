@@ -258,7 +258,7 @@ method BeignetNode.connectPeer(pubkey: string, host?: string, port?: number, tra
 method BeignetNode.connectToSeeds(maxPeers?: number): Promise<string[]>
 method BeignetNode.consolidateUtxos(satsPerVbyte?: number): Promise<ConsolidateResult>
 static method BeignetNode.create(opts?: BeignetNodeOptions): Promise<BeignetNode>
-method BeignetNode.createDirectFundingRequest(opts: { host?: string; port?: number; amountSats?: number; }): { paymentHash: PaymentHashHex; expiresAt: number; request: string; }
+method BeignetNode.createDirectFundingRequest(opts: { host?: string; port?: number; amountSats?: number; lspPubkey?: string; }): DirectFundingRequestInfo
 method BeignetNode.createHoldInvoice(opts: { paymentHash: PaymentHashHex; amountMsat?: bigint; amountSats?: number; description?: string; expiry?: number; minFinalCltvExpiry?: number; }): InvoiceInfo
 method BeignetNode.createInvoice(amountSats?: number, description?: string, expirySecs?: number, descriptionHash?: Buffer, minFinalCltvExpiry?: number): InvoiceInfo
 method BeignetNode.createJitInvoice(opts: { lspPubkey?: string; amountSats?: number; description?: string; expirySecs?: number; targetRemainingInboundSat?: number; maxFlatFeeSat?: number; maxFeePpm?: number; feeMode?: 'skim' | 'hop'; timeoutMs?: number; }): Promise<JitInvoiceInfo>
@@ -753,6 +753,12 @@ property DirectFundingConfigInfo.minAmountSat: number
 property DirectFundingConfigInfo.targetInboundSat: number
 property DirectFundingConfigInfo.trusted: boolean
 property DirectFundingConfigInfo.unpairedSpliceDepth: number
+interface DirectFundingRequestInfo
+property DirectFundingRequestInfo.expiresAt: number
+property DirectFundingRequestInfo.lspPubkey: string | null
+property DirectFundingRequestInfo.paymentHash: PaymentHashHex
+property DirectFundingRequestInfo.request: string
+property DirectFundingRequestInfo.skipped?: ReceiveSteerSkip[]
 unexported interface ElectrumTlsConfig
 property ElectrumTlsConfig.electrumTlsFingerprints?: string[]
 property ElectrumTlsConfig.electrumTlsVerify?: boolean

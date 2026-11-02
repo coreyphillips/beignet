@@ -70,8 +70,8 @@ opens a channel to obtain inbound liquidity.
   choose. A `requestId` already under way keeps its own peer; otherwise the
   primaries are tried in the `selectionOrder` that `GET /primaries` reports,
   and the first one that is connected, serves the amount on the route it
-  would take, and could be created against (direct funding not configured for
-  another peer) is quoted, with the others listed in `skipped` and their
+  would take, and could be created against (an address is known for its
+  relay) is quoted, with the others listed in `skipped` and their
   reasons. The coordinator never dials: a primary that is not connected is
   passed over. The answer's `peer` is what the create binds to. 503
   `NO_PRIMARY_AVAILABLE` names every reason when no primary qualifies, and
@@ -98,14 +98,20 @@ opens a channel to obtain inbound liquidity.
   (the base64url envelope a payer pays, also embeddable in a BIP 21 URI),
   `paymentHash` (the receipt hash), `expiresAt`, `amountSats`, `peer` and
   `offlineReceive: false`. Display either only after success.
-- Direct funding is negotiated with ONE liquidity peer. With no
-  `/direct-funding/config` yet, the first such request configures the node for
-  this peer using the host and port it is connected on and leaves every other
-  setting at its default. An existing config naming the SAME peer is reused
-  untouched, so an operator's `targetInboundSat`, `trusted` and splice switches
-  survive. An existing config naming a DIFFERENT peer refuses with
-  `RECEIVE_UNAVAILABLE` rather than retargeting the node silently; a steered
-  quote applies the same rule and passes such a primary over.
+- A direct-funding request is bound to the peer it was quoted at (issue
+  #1922): the envelope's relay descriptors name that peer, at the address the
+  primaries list stores for it, else the policy's address for it, else the
+  one it is connected on, and the receiver negotiates the funding with that
+  peer when the offer arrives, whatever `/direct-funding/config` names by
+  then. An existing config is left exactly as the operator set it whichever
+  peer it names, so `targetInboundSat`, `trusted` and the splice switches
+  survive and the node's liquidity relationship is never retargeted behind
+  their back. With no config yet, the first such request still configures the
+  node for its peer, on the host and port it is connected on, with every other
+  setting at its default: that is the peer a `POST /direct-funding/request`
+  naming no peer falls back to when no primaries are configured. A peer with
+  no known address refuses with `RECEIVE_UNAVAILABLE`, and a steered quote
+  passes such a primary over.
 - A direct-funding request is idempotent on `requestId` while it is unexpired:
   the same call returns the same envelope. Once it expires, the same id mints a
   replacement. It reserves nothing, starts no epoch and appears in no

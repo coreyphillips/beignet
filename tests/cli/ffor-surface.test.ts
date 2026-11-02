@@ -27,6 +27,8 @@ import {
 	IFforEpochRecord
 } from '../../src/lightning/ffor/types';
 import { decodeRequestEnvelope } from '../../src/lightning/direct-funding/envelope';
+import { DfTransportType } from '../../src/lightning/direct-funding/types';
+import type { IDfOnionTransport } from '../../src/lightning/direct-funding/types';
 import { BeignetCustomSubtype } from '../../src/lightning/message/custom';
 import { writableState } from '../lightning/helpers/writable-state';
 
@@ -47,6 +49,25 @@ const OFFLINE = {
 
 function tmpDir(tag: string): string {
 	return fs.mkdtempSync(path.join(os.tmpdir(), `beignet-ffor-${tag}-`));
+}
+
+/** The peer a minted request is bound to, read from the node's request store. */
+function boundPeerOf(
+	daemon: IStartedDaemon,
+	paymentHash: string
+): string | undefined {
+	const inner = (
+		daemon.node as unknown as {
+			node: {
+				directFunding: {
+					requests: {
+						byReceiptHash(hash: string): { liquidityPeer?: string } | null;
+					};
+				};
+			};
+		}
+	).node;
+	return inner.directFunding.requests.byReceiptHash(paymentHash)?.liquidityPeer;
 }
 
 function portOf(daemon: IStartedDaemon): number {
@@ -1416,7 +1437,7 @@ describe('automatic receive falls back to direct funding', function () {
 		expect(retry.body.result).to.deep.equal(result);
 	});
 
-	it('refuses a second peer rather than retargeting the configured one', async () => {
+	it('mints for a second peer and leaves the configured one alone (issue #1922)', async () => {
 		peers = [
 			...peers,
 			{ pubkey: stranger, host: '10.0.0.8', port: 9737, state: 'connected' }
@@ -1433,12 +1454,24 @@ describe('automatic receive falls back to direct funding', function () {
 			requestId: 'daemon-receive-0002',
 			quote: quoted.body.result
 		});
-		expect(created.status).to.equal(409);
-		expect(created.body.error).to.deep.include({
-			code: 'RECEIVE_UNAVAILABLE'
+		expect(created.status).to.equal(200);
+		const result = created.body.result as Record<string, unknown>;
+		expect(result).to.include({
+			kind: 'direct-funding',
+			peer: stranger,
+			amountSats: 120_000
 		});
-		expect((created.body.error as { message: string }).message).to.contain(
-			'another peer'
+		// The envelope sends the payer through the stranger's relay, at the
+		// address it is connected on, and the request is bound to the stranger,
+		// so that is the peer the channel opens with when the offer arrives.
+		const env = decodeRequestEnvelope(result.request as string);
+		const relay = env.transports.find(
+			(t) => t.type === DfTransportType.ONION_MESSAGE
+		) as IDfOnionTransport;
+		expect(relay.introNodeId.toString('hex')).to.equal(stranger);
+		expect(relay).to.include({ host: '10.0.0.8', port: 9737 });
+		expect(boundPeerOf(daemon, result.paymentHash as string)).to.equal(
+			stranger
 		);
 		const config = await request(port, 'GET', '/direct-funding/config');
 		expect((config.body.result as { lspPubkey: string }).lspPubkey).to.equal(

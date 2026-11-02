@@ -28494,18 +28494,32 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	 * PUBLIC_HOST, both with this wallet's listen port, and this node has no way
 	 * to know which is right. With neither, no direct-peer descriptor is emitted
 	 * and the payer reaches us through the liquidity peer.
+	 *
+	 * `liquidityPeer` binds the request to that peer (issue #1922): its onion
+	 * and relay descriptors name it, at `liquidityHost` and `liquidityPort` (or
+	 * the policy's address when the policy names the same peer), and the
+	 * receiver negotiates the funding with it when the offer arrives, whatever
+	 * the policy's liquidity peer is by then. Without it the request follows
+	 * the policy, as before.
 	 */
 	mintDirectFundingRequest(opts: {
 		host?: string;
 		port?: number;
 		amountSat?: bigint;
 		ttlMs?: number;
+		liquidityPeer?: string;
+		liquidityHost?: string;
+		liquidityPort?: number;
 	}): { record: IDfRequestRecord; request: string; expiresAt: number } {
 		const df = this.directFunding;
 		if (!df) throw new Error('direct funding is not configured on this node');
+		const relay = this.directFundingRelay(opts);
 		const record = df.requests.mint({
 			ttlMs: opts.ttlMs ?? df.requestTtlMs,
-			...(opts.amountSat !== undefined ? { amountSat: opts.amountSat } : {})
+			...(opts.amountSat !== undefined ? { amountSat: opts.amountSat } : {}),
+			...(opts.liquidityPeer !== undefined
+				? { liquidityPeer: opts.liquidityPeer }
+				: {})
 		});
 		let envelope: string;
 		try {
@@ -28521,7 +28535,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 							: {}),
 						receiptHash: Buffer.from(record.receiptHash, 'hex'),
 						encryptionKey: requestEncryptionPublicKey(record),
-						transports: this.directFundingTransports(record, opts)
+						transports: this.directFundingTransports(record, opts, relay)
 					},
 					(message) => this.signMessage(message)
 				)
@@ -28536,9 +28550,36 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	}
 
 	/**
+	 * The peer a request's onion and relay descriptors go through, with the
+	 * address a payer dials it at: the peer the mint bound, at the address
+	 * given with it or, when it is the policy's own peer, the policy's address;
+	 * else the policy's peer at the policy's address. Null when there is no
+	 * such peer or no address for it, and then no relay descriptor is emitted.
+	 */
+	private directFundingRelay(opts: {
+		liquidityPeer?: string;
+		liquidityHost?: string;
+		liquidityPort?: number;
+	}): { peer: string; host: string; port: number } | null {
+		const policy = this.directFunding?.policy ?? {};
+		const peer = opts.liquidityPeer ?? policy.liquidityPeer;
+		if (!peer) return null;
+		const policyPeer =
+			policy.liquidityPeer !== undefined &&
+			policy.liquidityPeer.toLowerCase() === peer.toLowerCase();
+		const host =
+			opts.liquidityHost ?? (policyPeer ? policy.liquidityHost : undefined);
+		const port =
+			opts.liquidityPort ?? (policyPeer ? policy.liquidityPort : undefined);
+		if (!host || !port) return null;
+		return { peer, host, port };
+	}
+
+	/**
 	 * The descriptors one request publishes, in the order a payer should try
 	 * them: the direct peer connection when the caller told us where we are, then
-	 * a blinded path through the liquidity peer.
+	 * a blinded path through the relay peer (the one the request is bound to,
+	 * else the policy's liquidity peer).
 	 *
 	 * Only ONE onion descriptor is emitted where the fork emitted an onion and a
 	 * relay: the registry synthesizes the relay fall-back from the onion's
@@ -28547,7 +28588,8 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	 */
 	private directFundingTransports(
 		record: IDfRequestRecord,
-		opts: { host?: string; port?: number }
+		opts: { host?: string; port?: number },
+		relay: { peer: string; host: string; port: number } | null
 	): DfTransportDescriptor[] {
 		const df = this.directFunding;
 		if (!df) return [];
@@ -28559,8 +28601,12 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				port: opts.port
 			});
 		}
-		const { liquidityPeer, liquidityHost, liquidityPort } = df.policy;
-		if (!liquidityPeer || !liquidityHost || !liquidityPort) return transports;
+		if (!relay) return transports;
+		const {
+			peer: liquidityPeer,
+			host: liquidityHost,
+			port: liquidityPort
+		} = relay;
 		try {
 			const path = mintDfBlindedPath(
 				Buffer.from(liquidityPeer, 'hex'),

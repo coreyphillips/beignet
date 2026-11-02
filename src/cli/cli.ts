@@ -2224,7 +2224,8 @@ async function handleDirectFunding(): Promise<void> {
 				await httpRequest('POST', '/direct-funding/request', {
 					host: parseFlag('--host'),
 					port: numberFlag('--port'),
-					amountSats: pos[2] ? parseInt(pos[2], 10) : undefined
+					amountSats: pos[2] ? parseInt(pos[2], 10) : undefined,
+					lspPubkey: parseFlag('--lsp')
 				})
 			);
 		}
@@ -3349,10 +3350,12 @@ Direct funding (a payer's on-chain payment IS this node's channel funding):
   direct-funding config                  Read the effective policy back
   direct-funding received                List the payments received against
                                          our requests
-  direct-funding request [sats] [--host H] [--port P]
+  direct-funding request [sats] [--host H] [--port P] [--lsp <pubkey>]
                                          Mint a payment request; the receipt
                                          preimage stays here. --host/--port are
-                                         where a payer can reach this node
+                                         where a payer can reach this node.
+                                         --lsp binds it to that peer; omitted,
+                                         the primaries choose, else the policy
   direct-funding prepare <request>       Decode a request and start connecting
                                          to the node a send would use, without
                                          spending anything
