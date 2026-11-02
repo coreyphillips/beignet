@@ -83,6 +83,15 @@ interface IPair {
 	corruptNext: (type: MessageType, mutate: (p: Buffer) => Buffer) => void;
 	/** Drop everything from the next message of `type` (fromB) onward. */
 	cutBefore: (type: MessageType, fromB?: boolean) => void;
+	/** Undo a cut: deliver again in both directions. */
+	revive: () => void;
+	/** Queue outbound messages instead of delivering them. */
+	hold: () => void;
+	/**
+	 * Deliver the queue in send order, queueing what each delivery produces
+	 * behind it, the way a real transport interleaves two reconnecting sides.
+	 */
+	flush: () => void;
 }
 
 function makePair(tag: string): IPair {
@@ -103,6 +112,8 @@ function makePair(tag: string): IPair {
 	let cutType: MessageType | null = null;
 	let cutFromB = false;
 	let alive = true;
+	let holding = false;
+	const pending: Array<{ toB: boolean; type: number; payload: Buffer }> = [];
 
 	A.on('error', (_id, m: string) => errors.push(`A: ${m}`));
 	B.on('error', (_id, m: string) => errors.push(`B: ${m}`));
@@ -118,6 +129,10 @@ function makePair(tag: string): IPair {
 			corrupt = null;
 		}
 		toB.push({ type, payload });
+		if (holding) {
+			pending.push({ toB: true, type, payload });
+			return;
+		}
 		B.handleMessage(aPub, type, payload);
 	});
 	B.on('message:outbound', (to: string, type: number, p: Buffer) => {
@@ -127,6 +142,10 @@ function makePair(tag: string): IPair {
 			return;
 		}
 		toA.push({ type, payload: p });
+		if (holding) {
+			pending.push({ toB: false, type, payload: p });
+			return;
+		}
 		A.handleMessage(bPub, type, p);
 	});
 
@@ -153,6 +172,21 @@ function makePair(tag: string): IPair {
 		cutBefore: (type, fromB = false): void => {
 			cutType = type;
 			cutFromB = fromB;
+		},
+		revive: (): void => {
+			cutType = null;
+			alive = true;
+		},
+		hold: (): void => {
+			holding = true;
+		},
+		flush: (): void => {
+			while (pending.length > 0) {
+				const m = pending.shift()!;
+				if (m.toB) B.handleMessage(aPub, m.type, m.payload);
+				else A.handleMessage(bPub, m.type, m.payload);
+			}
+			holding = false;
 		}
 	};
 }
@@ -804,5 +838,236 @@ describe('undecodable-payload decode guards (issue 426)', function () {
 		expect(actions).to.have.length(1);
 		expect(actions[0].type).to.equal(ChannelActionType.ERROR);
 		expect(channel.getState()).to.equal(ChannelState.SPLICING);
+	});
+});
+
+/**
+ * Issue #1929: LND 0.21 answers a taproot shutdown with closing_complete
+ * carrying MuSig2 partial signatures in TLVs 5 to 7, a form this codec does
+ * not know. Type 6 is even, so the decode throws, and until this fix the
+ * undecodable-payload guard failed the channel on the wire, which broadcasts
+ * our commitment over a disagreement about message shape. A closing message
+ * that cannot be decoded mid close now earns a warning and a disconnect, and
+ * the channel keeps its closing state so the next reconnect restarts the
+ * close from shutdown.
+ */
+describe('undecodable closing messages during a cooperative close (issue #1929)', function () {
+	const SCRIPT_A = Buffer.from('0014' + 'aa'.repeat(20), 'hex');
+	const pubOf = (tag: string, side: 'A' | 'B'): string =>
+		getPublicKey(makeConfig(`${tag}-${side}`).nodePrivateKey!).toString('hex');
+
+	/**
+	 * A closing_complete/closing_sig body with the fixed fields intact and the
+	 * given TLV records (98 bytes each, LND's partial signature plus nonce).
+	 */
+	function closingPayloadWithTlvs(channelId: Buffer, types: number[]): Buffer {
+		const script = Buffer.from('0014' + 'ab'.repeat(20), 'hex');
+		const len = Buffer.from([0x00, script.length]);
+		const fixed = Buffer.concat([
+			channelId,
+			len,
+			script,
+			len,
+			script,
+			Buffer.alloc(8),
+			Buffer.alloc(4)
+		]);
+		const records = types.map((type) =>
+			Buffer.concat([Buffer.from([type, 98]), Buffer.alloc(98, 0x11)])
+		);
+		return Buffer.concat([fixed, ...records]);
+	}
+
+	/**
+	 * Shutdown both ways, then drop the funder's closing_signed: both sides
+	 * wait in NEGOTIATING_CLOSING, B for the offer and A for the answer.
+	 */
+	function holdMidClose(tag: string): IPair {
+		const t = makePair(tag);
+		t.cutBefore(MessageType.CLOSING_SIGNED);
+		const res = t.A.initiateShutdown(t.channelId, SCRIPT_A);
+		expect(res.ok, res.error).to.equal(true);
+		expect(t.bChannel.getState()).to.equal(ChannelState.NEGOTIATING_CLOSING);
+		expect(t.aChannel.getState()).to.equal(ChannelState.NEGOTIATING_CLOSING);
+		return t;
+	}
+
+	/** Our shutdown sent and the reply dropped: A waits in SHUTTING_DOWN. */
+	function holdInShuttingDown(tag: string): IPair {
+		const t = makePair(tag);
+		t.cutBefore(MessageType.SHUTDOWN, true);
+		const res = t.A.initiateShutdown(t.channelId, SCRIPT_A);
+		expect(res.ok, res.error).to.equal(true);
+		expect(t.aChannel.getState()).to.equal(ChannelState.SHUTTING_DOWN);
+		return t;
+	}
+
+	/** A transport stub that records sends and disconnect requests. */
+	function stubTransport(manager: ChannelManager): {
+		sent: Array<{ to: string; type: number; payload: Buffer }>;
+		disconnected: string[];
+	} {
+		const sent: Array<{ to: string; type: number; payload: Buffer }> = [];
+		const disconnected: string[] = [];
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		(manager as any)['peerManager'] = {
+			getPeer: (): undefined => undefined,
+			sendToPeer: (to: string, type: number, payload: Buffer): void => {
+				sent.push({ to, type, payload });
+			},
+			disconnectPeer: (pubkey: string): void => {
+				disconnected.push(pubkey);
+			}
+		};
+		return { sent, disconnected };
+	}
+
+	it("LND 0.21's taproot closing_complete (even TLV 6) draws a warning and a disconnect, not a channel failure", function () {
+		const tag = 'closing-complete-tlv6';
+		const t = holdMidClose(tag);
+		const aPub = pubOf(tag, 'A');
+		const errored: string[] = [];
+		t.B.on('channel:errored', (_id: Buffer, reason: string) =>
+			errored.push(reason)
+		);
+		const wire = stubTransport(t.B);
+
+		t.B.handleMessage(
+			aPub,
+			MessageType.CLOSING_COMPLETE,
+			closingPayloadWithTlvs(t.channelId, [5, 6])
+		);
+
+		const warnings = wire.sent.filter((m) => m.type === MessageType.WARNING);
+		expect(warnings.length, 'one warning').to.equal(1);
+		const warning = decodeErrorMessage(warnings[0].payload);
+		expect(warning.channelId.equals(t.channelId)).to.equal(true);
+		expect(warning.data.toString('ascii')).to.contain(
+			'Undecodable closing_complete'
+		);
+		expect(
+			wire.sent.filter((m) => m.type === MessageType.ERROR),
+			'no wire error'
+		).to.have.length(0);
+		expect(wire.disconnected).to.deep.equal([aPub]);
+		expect(t.bChannel.getState()).to.equal(ChannelState.NEGOTIATING_CLOSING);
+		expect(errored, 'no channel:errored').to.deep.equal([]);
+		expect(t.errors.join('; ')).to.contain('Undecodable closing_complete');
+	});
+
+	it('the same holds in SHUTTING_DOWN, before the peer answered our shutdown', function () {
+		const tag = 'closing-complete-shutting-down';
+		const t = holdInShuttingDown(tag);
+		const bPub = pubOf(tag, 'B');
+		const wire = stubTransport(t.A);
+
+		t.A.handleMessage(
+			bPub,
+			MessageType.CLOSING_COMPLETE,
+			closingPayloadWithTlvs(t.channelId, [5, 6])
+		);
+
+		expect(
+			wire.sent.filter((m) => m.type === MessageType.WARNING)
+		).to.have.length(1);
+		expect(
+			wire.sent.filter((m) => m.type === MessageType.ERROR)
+		).to.have.length(0);
+		expect(wire.disconnected).to.deep.equal([bPub]);
+		expect(t.aChannel.getState()).to.equal(ChannelState.SHUTTING_DOWN);
+	});
+
+	it('odd-only taproot signature TLVs (5 and 7) decode to no signature and get the same answer', function () {
+		const tag = 'closing-complete-tlv57';
+		const t = holdMidClose(tag);
+		const aPub = pubOf(tag, 'A');
+		const wire = stubTransport(t.B);
+
+		t.B.handleMessage(
+			aPub,
+			MessageType.CLOSING_COMPLETE,
+			closingPayloadWithTlvs(t.channelId, [5, 7])
+		);
+
+		expect(
+			wire.sent.filter((m) => m.type === MessageType.WARNING)
+		).to.have.length(1);
+		expect(
+			wire.sent.filter((m) => m.type === MessageType.ERROR)
+		).to.have.length(0);
+		expect(wire.disconnected).to.deep.equal([aPub]);
+		expect(t.bChannel.getState()).to.equal(ChannelState.NEGOTIATING_CLOSING);
+	});
+
+	it('an undecodable closing_sig to the side awaiting a closing answer keeps NEGOTIATING_CLOSING', function () {
+		const tag = 'closing-sig-tlv6';
+		const t = holdMidClose(tag);
+		const bPub = pubOf(tag, 'B');
+		const wire = stubTransport(t.A);
+
+		t.A.handleMessage(
+			bPub,
+			MessageType.CLOSING_SIG,
+			closingPayloadWithTlvs(t.channelId, [6])
+		);
+
+		const warnings = wire.sent.filter((m) => m.type === MessageType.WARNING);
+		expect(warnings.length).to.equal(1);
+		expect(
+			decodeErrorMessage(warnings[0].payload).data.toString('ascii')
+		).to.contain('Undecodable closing_sig');
+		expect(
+			wire.sent.filter((m) => m.type === MessageType.ERROR)
+		).to.have.length(0);
+		expect(wire.disconnected).to.deep.equal([bPub]);
+		expect(t.aChannel.getState()).to.equal(ChannelState.NEGOTIATING_CLOSING);
+	});
+
+	it('the channel still closes cooperatively on the next reconnect', function () {
+		const tag = 'closing-complete-reconnect';
+		const t = holdMidClose(tag);
+		const aPub = pubOf(tag, 'A');
+		const bPub = pubOf(tag, 'B');
+		t.B.handleMessage(
+			aPub,
+			MessageType.CLOSING_COMPLETE,
+			closingPayloadWithTlvs(t.channelId, [5, 6])
+		);
+		expect(t.bChannel.getState()).to.equal(ChannelState.NEGOTIATING_CLOSING);
+
+		// The disconnect the warning asked for, then a reconnect with delivery
+		// restored: reestablish re-sends shutdown and the legacy closing_signed
+		// round completes.
+		t.A.handlePeerDisconnected(bPub);
+		t.B.handlePeerDisconnected(aPub);
+		t.revive();
+		// Both sides send channel_reestablish on connection, before either
+		// reads the other's, so the retransmissions each triggers come after.
+		t.hold();
+		t.A.handlePeerReconnected(bPub);
+		t.B.handlePeerReconnected(aPub);
+		t.flush();
+
+		expect(t.aChannel.getState()).to.equal(ChannelState.CLOSED);
+		expect(t.bChannel.getState()).to.equal(ChannelState.CLOSED);
+		expect(wireErrorsIn(t.toA), 'no wire error either way').to.deep.equal([]);
+		expect(wireErrorsIn(t.toB)).to.deep.equal([]);
+	});
+
+	it('control: an undecodable closing_complete for a channel that is not closing still fails it on the wire', function () {
+		const tag = 'closing-complete-normal';
+		const t = makePair(tag);
+		const aPub = pubOf(tag, 'A');
+
+		t.B.handleMessage(
+			aPub,
+			MessageType.CLOSING_COMPLETE,
+			closingPayloadWithTlvs(t.channelId, [5, 6])
+		);
+
+		const wireErrors = wireErrorsIn(t.toA);
+		expect(wireErrors.length, 'wire error sent').to.be.greaterThan(0);
+		expect(wireErrors.join('; ')).to.contain('Undecodable closing_complete');
+		expect(t.bChannel.getState()).to.equal(ChannelState.ERRORED);
 	});
 });

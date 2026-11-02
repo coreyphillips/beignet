@@ -4,9 +4,11 @@
  * Wire format (pinned against live LND v0.20, simple-taproot channels):
  * - shutdown carries the sender's 66-byte MuSig2 closing nonce as TLV type 8;
  *   every (re)transmitted shutdown starts a fresh closing session.
- * - the legacy closing_signed flow is used (option_simple_close excludes
- *   taproot); closing_signed carries a 32-byte MuSig2 partial signature as
- *   TLV type 6 with the fixed ECDSA field zeroed.
+ * - the legacy closing_signed flow is used (the taproot form of
+ *   option_simple_close is not implemented, and the node drops bit 61 from
+ *   init while it advertises taproot so LND 0.21 keeps its legacy closer,
+ *   issue #1929); closing_signed carries a 32-byte MuSig2 partial signature
+ *   as TLV type 6 with the fixed ECDSA field zeroed.
  * - fee negotiation is single-round: the responder accepts the initiator's
  *   first offer verbatim, the initiator errors on any other fee. Each side's
  *   closing nonce therefore signs exactly one sighash.
