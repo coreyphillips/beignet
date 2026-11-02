@@ -393,7 +393,7 @@ Entries survive a restart. The queue dispatches the restored ones once some chan
 | `getAdvisorRecommendations()` | `AdvisorRecommendations` | Liquidity analysis plus the concrete circular-rebalance plan (read-only) |
 | `rebalanceChannel(fromId, toId, amountSats, maxFeeSats)` | `Promise<RebalanceResult>` | Circular rebalance (self-payment out fromId, back in toId). Aborts without paying if the route fee exceeds `maxFeeSats`. The fee counts against `dailySpendLimitSats` |
 | `executeRebalances(budgetSatsPerDay?)` | `Promise<RebalanceExecutionSummary>` | Run the advisor's rebalance plan under a per-UTC-day fee budget (persisted; restarts never overspend the day). The fees count against `dailySpendLimitSats` |
-| `listPrimaries()` | `PrimariesInfo` | The ranked receive primaries (issue #1922): each one's `rank`, address, `thresholdSat`, `balanceSat` (our local balance summed over our usable channels with it), `channelCount`, `belowThreshold`, `isReceiveTarget` and `selectionOrder`, plus `fillThresholdSat` and `receiveTarget`. The target is the first primary in rank order below the threshold; when every one is at or above it, the lowest balance, ties to the higher rank. Nothing steers a receive by it yet |
+| `listPrimaries()` | `PrimariesInfo` | The ranked receive primaries (issue #1922): each one's `rank`, address, `thresholdSat`, `balanceSat` (our local balance summed over our usable channels with it), `channelCount`, `belowThreshold`, `isReceiveTarget` and `selectionOrder`, plus `fillThresholdSat` and `receiveTarget`. The target is the first primary in rank order below the threshold; when every one is at or above it, the lowest balance, ties to the higher rank. `createJitInvoice`, `getJitQuote` and the `/receive/*` routes walk `selectionOrder` when the caller names no peer |
 | `addPrimary({ pubkey, host?, port?, uri?, rank? })` | `PrimariesInfo` | Add a primary at `rank` (1-based, default last), reached by `host`/`port` or by a `uri` (`pubkey@address`, ws://, wss:// and iroh: included). Refuses a malformed pubkey, a duplicate, a bad port, a host without a port, an out-of-range rank or a 33rd entry with `INVALID_PARAMS`. Persisted |
 | `removePrimary(pubkey)` | `PrimariesInfo` | Drop a primary (`INVALID_PARAMS` when it is not one). Its channels are left as they are. Persisted |
 | `reorderPrimaries(pubkeys)` | `PrimariesInfo` | Re-rank: `pubkeys` names every primary once, highest rank first (`INVALID_PARAMS` otherwise). Persisted |
@@ -1510,6 +1510,7 @@ not repeat a 4xx unchanged.
 | `JIT_REFUSED` | Invoices | 400 | JIT receive: the LSP declined the intent, quoted above the wallet's ceiling, or answered with no intercept scid; the message carries the reason |
 | `SWAP_NOT_CANCELLABLE` | Swaps | 409 | Reverse swap provider: the swap is past CREATED/HELD, so it resolves on chain by claim or refund and cannot be cancelled |
 | `JIT_TIMEOUT` | Invoices | 504 | JIT receive: the LSP never answered the intent inside the ack window (retryable) |
+| `NO_PRIMARY_AVAILABLE` | Invoices | 503 | A receive that named no peer walked the ranked primaries and none took it: unreachable, timed out, declined, or not reached inside the budget; the message names each one's reason (retryable) |
 | `CONNECT_FAILED` | Peers | 502 | Dialing the peer failed |
 | `CONNECT_TIMEOUT` | Peers | 504 | The peer did not answer the dial in time |
 | `NODE_DESTROYED` | Node | 409 | Operation on destroyed node |
@@ -1882,8 +1883,15 @@ beignet primaries list
 ```
 
 The list and the threshold are saved in the wallet database and survive a
-restart. They only describe where receives should go: receive calls still name
-their peer.
+restart. A receive that names no peer is steered by them: `invoice jit` and
+`jit quote` without an LSP, and `GET /receive/quote` without a `peer`, walk
+the primaries in `selectionOrder`, dial one that is not connected by its
+stored address (JIT only), and pass over one that is unreachable, times out,
+declines or quotes above the fee ceilings, under one 18 s budget for the
+whole walk. The answer names the primary that took it in `lspPubkey` (or
+`peer`) and lists the others in `skipped`; 503 `NO_PRIMARY_AVAILABLE` names
+every reason when none took it, and 400 `INVALID_PARAMS` answers when no
+primary is configured. A call that names its peer never falls back.
 
 ### Channels
 
@@ -2147,7 +2155,8 @@ a `mode` and `POST /receive/invoice` with a matching `kind`: `bolt11` when a
 channel that already exists with that peer can carry the payment offline, and
 `direct-funding` otherwise, which returns a direct-funding `request` instead of
 an invoice. Automatic receiving never opens a channel to obtain inbound
-liquidity. See
+liquidity. A quote with no `peer` is steered through the ranked primaries, and
+a create with no `peer` binds to the one its reviewed quote named. See
 [automatic receiving](../../docs/AUTOMATIC-OFFLINE-RECEIVE.md#daemon-api) for
 the durable invoice preparation and reconciliation API.
 
@@ -2586,9 +2595,9 @@ The matching commands are `wallet sweep-prepare <requestJson|requestFile>`, `wal
 | POST | `/channel/splice-in` | `{ channelId, amountSats, feeratePerkw }` | Splice-in funds. A 2xx means the splice started; a refusal is a failure envelope (404 `CHANNEL_NOT_FOUND`, 409 `SPLICING_NOT_NEGOTIATED` / `FUNDING_PROVIDER_REQUIRED` / `SPLICE_REFUSED`, 503 `SPLICE_BUSY`, 400 `INVALID_PARAMS`) |
 | POST | `/channel/splice-out` | `{ channelId, amountSats, feeratePerkw, address? }` | Splice-out funds, optionally to an external address. Same refusal codes, plus 409 `INSUFFICIENT_BALANCE` |
 | POST | `/invoice/create` | `{ amountSats?, description?, minFinalCltvExpiry? }` | Create invoice (omit amountSats for amount-less; `minFinalCltvExpiry` buys final-CLTV headroom for a receive an LSP may settle through a splice) |
-| POST | `/jit/invoice` | `{ lspPubkey, amountSats?, description?, expirySecs?, targetRemainingInboundSat?, maxFlatFeeSat?, maxFeePpm? }` | Create an invoice payable with no channel: registers a receive intent with the LSP, which funds a channel mid-payment and deducts the quoted opening fee. Returns the invoice plus `flatFeeSat` and `feePpm` |
+| POST | `/jit/invoice` | `{ lspPubkey?, amountSats?, description?, expirySecs?, targetRemainingInboundSat?, maxFlatFeeSat?, maxFeePpm? }` | Create an invoice payable with no channel: registers a receive intent with the LSP, which funds a channel mid-payment and deducts the quoted opening fee. Returns the invoice plus `lspPubkey`, `flatFeeSat` and `feePpm`. No `lspPubkey`: steered through `/primaries` in `selectionOrder`, with the passed-over ones in `skipped` (503 `NO_PRIMARY_AVAILABLE` when none takes it) |
 | GET | `/jit/status` | -- | The JIT receive role as it stands: `enabled`, the client ceilings, and (when on) `lsp` with the opening fee, the exposure caps, sats reserved and fronted, live intents, held HTLCs and fundings in flight. Readonly scope |
-| GET | `/jit/quote` | `?lspPubkey=&amountSats=&targetRemainingInboundSat=` | Price a JIT receive at that LSP without registering an intent: `accepted`, a plain-language `reason` when declined, `flatFeeSat`, `feePpm`, `feeSats` on this amount, `fundingSats` the LSP would front, `maxClientFundingSats`, and `withinCeilings` against this node's own limits. The LSP must be connected (409 `PEER_NOT_CONNECTED`, 504 `JIT_TIMEOUT`). Readonly scope |
+| GET | `/jit/quote` | `?lspPubkey=&amountSats=&targetRemainingInboundSat=` | Price a JIT receive at that LSP without registering an intent: `accepted`, a plain-language `reason` when declined, `flatFeeSat`, `feePpm`, `feeSats` on this amount, `fundingSats` the LSP would front, `maxClientFundingSats`, and `withinCeilings` against this node's own limits. The LSP must be connected (409 `PEER_NOT_CONNECTED`, 504 `JIT_TIMEOUT`). No `lspPubkey`: priced at the first ranked primary that would serve it, named in `lspPubkey`, the others in `skipped`. Readonly scope |
 | GET | `/swaps/status` | -- | Swap provider (issues #737 and #743): `enabled`, and when on the fee terms, exposure caps, timing, reverse swaps per state and `exposedSat` at risk on chain; `submarine` reports the on-chain to Lightning direction the same way (`enabled: false` when it is off). Readonly scope |
 | GET | `/swaps` | `?id=<hex>` | The swap ledger (or one swap) in both directions (`direction` is `reverse` or `submarine`): state, contract terms, funding, payment, claim, refund and resolution facts; amounts as decimal strings, no private key. Readonly scope |
 | POST | `/swaps/cancel` | `{ id }` | Cancel a swap before any funds moved: a reverse swap in CREATED or HELD (closes its hold invoice), a submarine swap before PAYING (the peer refunds its own coins at the refund height). Also ends a stranded reverse swap: EXPOSED, with `strandedHeight` set because this process found its funding absent past the refund height; the operator vouches the funding will not confirm, and spending its inputs makes sure. Answers `{ id, cancelled: true }`; past that a swap resolves on chain by claim or refund (409 `SWAP_NOT_CANCELLABLE`). Admin scope |

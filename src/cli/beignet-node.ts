@@ -217,6 +217,13 @@ import {
 	PrimariesStore,
 	selectReceiveTargets
 } from '../lightning/liquidity/primaries';
+import {
+	JIT_STEER_CODES,
+	STEER_BUDGET_MS,
+	dialTargetOf,
+	steerReceive
+} from './receive-steering';
+import type { ISteerCandidate, ISteerSkip } from './receive-steering';
 import { directFundingWallet } from './direct-funding';
 import {
 	AUTH_KEY_OVERRIDES_STORAGE_KEY,
@@ -326,6 +333,7 @@ import type {
 	TChannelFundingQuote,
 	DirectFundingConfigInfo,
 	PrimariesInfo,
+	JitInvoiceInfo,
 	JitStatusInfo,
 	SwapsStatusInfo,
 	JitQuoteInfo
@@ -2183,6 +2191,9 @@ function listenerLabel(kind: ListenerKind): string {
 		: 'WebSocket listener';
 }
 
+/** How long `connectPeer` waits for a dial unless `connectTimeoutMs` says otherwise. */
+const DEFAULT_CONNECT_TIMEOUT_MS = 15_000;
+
 export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	private fforReceiveService?: FforReceiveService;
 	private offlineReceive?: OfflineReceive;
@@ -2440,7 +2451,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	 * the node down), so an attempt that outlived its node records nothing.
 	 */
 	private _listenEpoch = 0;
-	private _connectTimeoutMs = 15_000;
+	private _connectTimeoutMs = DEFAULT_CONNECT_TIMEOUT_MS;
 	private _dailySpendLimitSats?: number;
 	// The daily ledger (issue #977). _dailySpentSats is the combined LN +
 	// onchain total; the two source counters below only feed the
@@ -8065,6 +8076,27 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 		port?: number,
 		transport?: IPeerTransportOptions
 	): Promise<PeerInfo> {
+		return this.connectPeerWithin(
+			pubkey,
+			host,
+			port,
+			transport,
+			this._connectTimeoutMs
+		);
+	}
+
+	/**
+	 * `connectPeer` under a caller's own deadline. A steered receive passes
+	 * what its budget allows for this one dial; the public method passes the
+	 * node's connect timeout.
+	 */
+	private async connectPeerWithin(
+		pubkey: string,
+		host: string | undefined,
+		port: number | undefined,
+		transport: IPeerTransportOptions | undefined,
+		timeoutMs: number
+	): Promise<PeerInfo> {
 		// listPeers reports the lowercase key the node registers the peer under.
 		pubkey = normalizeHexPubkey(pubkey);
 		// Where we are dialing, for error messages: explicit host:port, or the
@@ -8083,10 +8115,10 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 					reject(
 						new BeignetError(
 							'CONNECT_TIMEOUT',
-							`connectPeer timed out after ${this._connectTimeoutMs}ms (is ${target} the peer's P2P address?)`
+							`connectPeer timed out after ${timeoutMs}ms (is ${target} the peer's P2P address?)`
 						)
 					),
-				this._connectTimeoutMs
+				timeoutMs
 			);
 		});
 		try {
@@ -9733,9 +9765,23 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	 * Needs the LSP peer connected and running the JIT receive engine. A
 	 * declined, timed-out or over-priced intent throws, and no invoice is
 	 * created: nothing then carries an allowance for a fee nobody agreed.
+	 *
+	 * With no `lspPubkey` the receive is steered through the ranked primaries
+	 * (issue #1922): each is tried in `listPrimaries` selection order, dialed
+	 * by its stored address when it is not connected, and passed over when
+	 * it is unreachable, times out, declines, quotes above the ceilings, or
+	 * is fenced by NEW_CHANNELS_REFUSED. One budget bounds the whole walk.
+	 * NO_PRIMARY_AVAILABLE names every primary's reason when none takes it;
+	 * INVALID_PARAMS when none is configured. Passing over a primary is safe
+	 * because the invoice is minted only after an LSP's ack: an intent that
+	 * timed out there expires on its own and is never advertised.
 	 */
 	async createJitInvoice(opts: {
-		lspPubkey: string;
+		/**
+		 * The LSP to register the intent with. Omitted: the ranked primaries
+		 * choose, as described above.
+		 */
+		lspPubkey?: string;
 		amountSats?: number;
 		description?: string;
 		expirySecs?: number;
@@ -9749,14 +9795,16 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 		 * node receives; `hop` puts it in the invoice hint so the sender pays.
 		 */
 		feeMode?: 'skim' | 'hop';
-	}): Promise<
-		InvoiceInfo & {
-			flatFeeSat: number;
-			feePpm: number;
-			feeMode: 'skim' | 'hop';
-		}
-	> {
-		if (!/^0[23][0-9a-fA-F]{64}$/.test(opts.lspPubkey)) {
+		/**
+		 * Steered only: the budget for the whole walk over the primaries, in
+		 * ms (default 18 s). Ignored when `lspPubkey` is given.
+		 */
+		timeoutMs?: number;
+	}): Promise<JitInvoiceInfo> {
+		if (
+			opts.lspPubkey !== undefined &&
+			!/^0[23][0-9a-fA-F]{64}$/.test(opts.lspPubkey)
+		) {
 			throw new BeignetError(
 				BeignetErrorCode.INVALID_PARAMS,
 				'lspPubkey must be a 33-byte compressed public key (66 hex chars)'
@@ -9782,10 +9830,129 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 		if (opts.expirySecs !== undefined)
 			requireInvoiceExpiry(opts.expirySecs, 'expirySecs');
 		requireInvoiceDescription(opts.description);
+		if (opts.lspPubkey !== undefined) {
+			return this.jitInvoiceAt(opts.lspPubkey, opts, amountMsat);
+		}
+		const budgetMs = this.steerBudget(opts.timeoutMs);
+		const { value, skipped } = await steerReceive({
+			candidates: this.receiveCandidates(),
+			isConnected: (pubkey) => this.isPeerConnected(pubkey),
+			connect: (candidate, timeoutMs) => this.dialPrimary(candidate, timeoutMs),
+			attempt: (candidate, timeoutMs) =>
+				this.jitInvoiceAt(candidate.pubkey, opts, amountMsat, timeoutMs),
+			candidateCodes: JIT_STEER_CODES,
+			budgetMs,
+			lastConnectCapMs: this._connectTimeoutMs ?? DEFAULT_CONNECT_TIMEOUT_MS,
+			onSkip: (skip) => this.logSteerSkip('JIT invoice', skip)
+		});
+		return skipped.length ? { ...value, skipped } : value;
+	}
+
+	/**
+	 * The budget a steered receive walks under: the caller's, else the
+	 * default that fits inside a 20 s client timeout.
+	 */
+	private steerBudget(timeoutMs: number | undefined): number {
+		if (timeoutMs === undefined) return STEER_BUDGET_MS;
+		if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0) {
+			throw new BeignetError(
+				BeignetErrorCode.INVALID_PARAMS,
+				'timeoutMs must be a positive whole number of milliseconds'
+			);
+		}
+		return timeoutMs;
+	}
+
+	private logSteerSkip(what: string, skip: ISteerSkip): void {
+		this.log(
+			'info',
+			`${what}: passed over primary ${skip.pubkey.slice(0, 16)}`,
+			{
+				rank: skip.rank,
+				stage: skip.stage,
+				code: skip.code,
+				message: skip.message
+			}
+		);
+	}
+
+	/** Whether the node has this peer up, init exchanged or at least transport up. */
+	private isPeerConnected(pubkey: string): boolean {
+		return this.listPeers().some(
+			(p) =>
+				p.pubkey === pubkey && (p.state === 'ready' || p.state === 'connected')
+		);
+	}
+
+	/**
+	 * The ranked primaries in the order a receive tries them, each with the
+	 * address it was configured with, for the dial. INVALID_PARAMS when none
+	 * is configured: a wallet without a policy names its peer, as before.
+	 */
+	private receiveCandidates(): ISteerCandidate[] {
+		const policy = this.primariesStore().get();
+		if (policy.primaries.length === 0) {
+			throw new BeignetError(
+				BeignetErrorCode.INVALID_PARAMS,
+				'lspPubkey is required when no primaries are configured (see listPrimaries)'
+			);
+		}
+		const byKey = new Map(policy.primaries.map((p) => [p.pubkey, p]));
+		const balances = this.primaryBalances();
+		return selectReceiveTargets(
+			policy,
+			new Map([...balances].map(([peer, b]) => [peer, b.sats]))
+		).map((c) => {
+			const stored = byKey.get(c.pubkey);
+			return {
+				pubkey: c.pubkey,
+				rank: c.rank,
+				balanceSat: c.balanceSat,
+				...(stored?.host !== undefined ? { host: stored.host } : {}),
+				...(stored?.port !== undefined ? { port: stored.port } : {}),
+				...(stored?.uri !== undefined ? { uri: stored.uri } : {})
+			};
+		});
+	}
+
+	/** Dial a primary by its stored address, under the walk's deadline. */
+	private async dialPrimary(
+		candidate: ISteerCandidate,
+		timeoutMs: number
+	): Promise<void> {
+		const { host, port, transport } = dialTargetOf(candidate);
+		await this.connectPeerWithin(
+			candidate.pubkey,
+			host,
+			port,
+			transport,
+			timeoutMs
+		);
+	}
+
+	/**
+	 * The JIT invoice at one LSP: the library call and its typed failures.
+	 * `timeoutMs` bounds the wait for the LSP's ack when a steered walk has
+	 * less than the ack window left.
+	 */
+	private async jitInvoiceAt(
+		lspPubkey: string,
+		opts: {
+			amountSats?: number;
+			description?: string;
+			expirySecs?: number;
+			targetRemainingInboundSat?: number;
+			maxFlatFeeSat?: number;
+			maxFeePpm?: number;
+			feeMode?: 'skim' | 'hop';
+		},
+		amountMsat: bigint | undefined,
+		timeoutMs?: number
+	): Promise<JitInvoiceInfo> {
 		let result: Awaited<ReturnType<typeof this.node.createJitInvoice>>;
 		try {
 			result = await this.node.createJitInvoice({
-				lspPubkeyHex: opts.lspPubkey,
+				lspPubkeyHex: lspPubkey,
 				amountMsat,
 				description: opts.description || '',
 				...(opts.expirySecs !== undefined ? { expiry: opts.expirySecs } : {}),
@@ -9813,20 +9980,18 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 							)
 					  }
 					: {}),
-				...(opts.feeMode !== undefined ? { feeMode: opts.feeMode } : {})
+				...(opts.feeMode !== undefined ? { feeMode: opts.feeMode } : {}),
+				...(timeoutMs !== undefined ? { timeoutMs } : {})
 			});
 		} catch (err) {
 			throw jitInvoiceError(err);
 		}
-		const info: InvoiceInfo & {
-			flatFeeSat: number;
-			feePpm: number;
-			feeMode: 'skim' | 'hop';
-		} = {
+		const info: JitInvoiceInfo = {
 			bolt11: result.bolt11,
 			paymentHash: result.paymentHash.toString('hex'),
 			paymentSecret: result.paymentSecret.toString('hex'),
 			amountSats: opts.amountSats || undefined,
+			lspPubkey,
 			flatFeeSat: Number(result.flatFeeSat),
 			feePpm: result.feePpm,
 			feeMode: result.feeMode
@@ -10093,13 +10258,26 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	 * #687). Transport failures (peer not connected, no reply in time) are
 	 * typed the way POST /jit/invoice types them; the LSP's own decline is
 	 * carried in the answer.
+	 *
+	 * With no `lspPubkey` the quote is steered the way `createJitInvoice`
+	 * steers the invoice (issue #1922): the answer prices the first ranked
+	 * primary that would serve the receive within the ceilings, so a create
+	 * that names that `lspPubkey` lands where the quote did. A decline moves
+	 * on to the next primary; NO_PRIMARY_AVAILABLE carries every reason when
+	 * none would serve it.
 	 */
 	async getJitQuote(opts: {
-		lspPubkey: string;
+		/** The LSP to price. Omitted: the ranked primaries choose. */
+		lspPubkey?: string;
 		amountSats?: number;
 		targetRemainingInboundSat?: number;
+		/** Steered only: the budget for the whole walk, in ms (default 18 s). */
+		timeoutMs?: number;
 	}): Promise<JitQuoteInfo> {
-		if (!/^0[23][0-9a-fA-F]{64}$/.test(opts.lspPubkey)) {
+		if (
+			opts.lspPubkey !== undefined &&
+			!/^0[23][0-9a-fA-F]{64}$/.test(opts.lspPubkey)
+		) {
 			throw new BeignetError(
 				BeignetErrorCode.INVALID_PARAMS,
 				'lspPubkey must be a 33-byte compressed public key (66 hex chars)'
@@ -10109,25 +10287,78 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 			opts.amountSats !== undefined && opts.amountSats !== 0
 				? requireNonNegativeSafeInteger(opts.amountSats, 'amountSats')
 				: null;
+		const targetRemainingInboundSat = BigInt(
+			requireNonNegativeSafeInteger(
+				opts.targetRemainingInboundSat ?? 0,
+				'targetRemainingInboundSat'
+			)
+		);
+		if (opts.lspPubkey !== undefined) {
+			return this.jitQuoteAt(
+				opts.lspPubkey,
+				amountSats,
+				targetRemainingInboundSat
+			);
+		}
+		const budgetMs = this.steerBudget(opts.timeoutMs);
+		const { value, skipped } = await steerReceive({
+			candidates: this.receiveCandidates(),
+			isConnected: (pubkey) => this.isPeerConnected(pubkey),
+			connect: (candidate, timeoutMs) => this.dialPrimary(candidate, timeoutMs),
+			attempt: async (candidate, timeoutMs) => {
+				const quote = await this.jitQuoteAt(
+					candidate.pubkey,
+					amountSats,
+					targetRemainingInboundSat,
+					timeoutMs
+				);
+				// A decline or an over-ceiling price is this primary's answer,
+				// and a create here would be refused the same way: on to the
+				// next one, so quote and create agree on the peer.
+				if (!quote.accepted) {
+					throw new BeignetError(
+						BeignetErrorCode.JIT_REFUSED,
+						`LSP declined the JIT receive: ${quote.reason ?? 'no reason given'}`
+					);
+				}
+				if (!quote.withinCeilings) {
+					throw new BeignetError(
+						BeignetErrorCode.JIT_REFUSED,
+						`LSP quote (${quote.flatFeeSat} sat + ${quote.feePpm} ppm) is above the accepted ceiling (${quote.client.maxFlatFeeSat} sat + ${quote.client.maxFeePpm} ppm)`
+					);
+				}
+				return quote;
+			},
+			candidateCodes: JIT_STEER_CODES,
+			budgetMs,
+			lastConnectCapMs: this._connectTimeoutMs ?? DEFAULT_CONNECT_TIMEOUT_MS,
+			onSkip: (skip) => this.logSteerSkip('JIT quote', skip)
+		});
+		return skipped.length ? { ...value, skipped } : value;
+	}
+
+	/** The quote at one LSP: the library call and its typed failures. */
+	private async jitQuoteAt(
+		lspPubkey: string,
+		amountSats: number | null,
+		targetRemainingInboundSat: bigint,
+		timeoutMs?: number
+	): Promise<JitQuoteInfo> {
 		let quote: Awaited<ReturnType<typeof this.node.requestJitQuote>>;
 		try {
-			quote = await this.node.requestJitQuote(opts.lspPubkey, {
+			quote = await this.node.requestJitQuote(lspPubkey, {
 				...(amountSats !== null
 					? { maxAmountMsat: BigInt(amountSats) * 1000n }
 					: {}),
-				targetRemainingInboundSat: BigInt(
-					requireNonNegativeSafeInteger(
-						opts.targetRemainingInboundSat ?? 0,
-						'targetRemainingInboundSat'
-					)
-				)
+				targetRemainingInboundSat,
+				...(timeoutMs !== undefined ? { timeoutMs } : {})
 			});
 		} catch (err) {
 			throw jitInvoiceError(err);
 		}
 		const ceilings = this.node.getJitClientCeilings();
 		return {
-			lspPubkey: opts.lspPubkey,
+			lspPubkey,
 			amountSats,
 			accepted: quote.accepted,
 			reason: quote.reason ?? null,
@@ -10220,8 +10451,8 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 
 	/**
 	 * The ranked primaries with their balances, and which one a receive with no
-	 * peer named would go to. Nothing here steers a receive yet: callers still
-	 * name the peer.
+	 * peer named goes to. `createJitInvoice`, `getJitQuote` and the automatic
+	 * offline receive routes walk this order when the caller names no peer.
 	 */
 	listPrimaries(): PrimariesInfo {
 		const policy = this.primariesStore().get();

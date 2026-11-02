@@ -397,7 +397,7 @@ describe('JIT receive daemon surface', function () {
 		}
 	});
 
-	it('dispatches GET /jit/quote and requires the LSP pubkey', async () => {
+	it('dispatches GET /jit/quote and needs the LSP pubkey while no primary is configured', async () => {
 		const { port } = daemon.server.address() as AddressInfo;
 		const get = (route: string): Promise<{ status: number; body: string }> =>
 			new Promise((resolve, reject) => {
@@ -412,6 +412,8 @@ describe('JIT receive daemon surface', function () {
 				req.on('error', reject);
 				req.end();
 			});
+		// No LSP named and no primary to steer to (issue #1922): the caller's
+		// own omission, refused before any peer work.
 		const missing = await get('/jit/quote?amountSats=1000');
 		expect(JSON.parse(missing.body).error.code).to.equal('INVALID_PARAMS');
 		expect(JSON.parse(missing.body).error.message).to.match(/lspPubkey/);
@@ -432,30 +434,66 @@ describe('JIT receive daemon surface', function () {
 		);
 	});
 
-	it('dispatches POST /jit/invoice and requires the LSP pubkey', async () => {
+	const postJit = (
+		body: unknown
+	): Promise<{ status: number; body: string }> => {
 		const { port } = daemon.server.address() as AddressInfo;
-		const response = await new Promise<{ status: number; body: string }>(
-			(resolve, reject) => {
-				const req = http.request(
-					{
-						host: '127.0.0.1',
-						port,
-						path: '/jit/invoice',
-						method: 'POST',
-						headers: { 'content-type': 'application/json' }
-					},
-					(res) => {
-						let body = '';
-						res.on('data', (c) => (body += c));
-						res.on('end', () => resolve({ status: res.statusCode ?? 0, body }));
-					}
-				);
-				req.on('error', reject);
-				req.end(JSON.stringify({ amountSats: 1_000 }));
-			}
-		);
+		return new Promise((resolve, reject) => {
+			const req = http.request(
+				{
+					host: '127.0.0.1',
+					port,
+					path: '/jit/invoice',
+					method: 'POST',
+					headers: { 'content-type': 'application/json' }
+				},
+				(res) => {
+					let data = '';
+					res.on('data', (c) => (data += c));
+					res.on('end', () =>
+						resolve({ status: res.statusCode ?? 0, body: data })
+					);
+				}
+			);
+			req.on('error', reject);
+			req.end(JSON.stringify(body));
+		});
+	};
+
+	it('dispatches POST /jit/invoice and needs the LSP pubkey while no primary is configured', async () => {
+		const response = await postJit({ amountSats: 1_000 });
 		// The route exists (a missing one answers NOT_FOUND) and refuses the
 		// call before any peer work.
+		expect(response.status).to.equal(400);
 		expect(JSON.parse(response.body).error.code).to.equal('INVALID_PARAMS');
+		expect(JSON.parse(response.body).error.message).to.match(/lspPubkey/);
+	});
+
+	it('steers POST /jit/invoice through the primaries and answers 503 when none takes it', async () => {
+		// One primary, reachable at nothing: the dial fails, the walk ends,
+		// and the answer is the typed, retryable refusal naming it.
+		const primary = '02'.padEnd(66, 'b');
+		daemon.node.addPrimary({ pubkey: primary, host: '127.0.0.1', port: 1 });
+		try {
+			const response = await postJit({ amountSats: 1_000 });
+			expect(response.status).to.equal(
+				statusForErrorCode('NO_PRIMARY_AVAILABLE')
+			);
+			const error = JSON.parse(response.body).error;
+			expect(error.code).to.equal('NO_PRIMARY_AVAILABLE');
+			expect(error.message).to.include('(1 of 1 tried)');
+			expect(error.message).to.include(`${primary.slice(0, 16)} (rank 1)`);
+			expect(
+				isRetryableError(new BeignetError(error.code, error.message))
+			).to.equal(true);
+			// A named LSP is still its own call, with no fallback to the list.
+			const named = await postJit({
+				lspPubkey: '02'.padEnd(66, 'a'),
+				amountSats: 1_000
+			});
+			expect(JSON.parse(named.body).error.code).to.equal('PEER_NOT_CONNECTED');
+		} finally {
+			daemon.node.removePrimary(primary);
+		}
 	});
 });

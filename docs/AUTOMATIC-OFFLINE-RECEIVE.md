@@ -66,7 +66,17 @@ opens a channel to obtain inbound liquidity.
 
 - `GET /receive/quote?peer=<compressed-pubkey>&amountSats=<integer>` returns
   `available`, `mode`, `peer`, `amountSats`, `feeSats` and a 60-second
-  `expiresAt`. In `bolt11` mode it also returns the sender fee `terms` read from
+  `expiresAt`. `peer` may be left out (issue #1922): then the ranked primaries
+  choose. A `requestId` already under way keeps its own peer; otherwise the
+  primaries are tried in the `selectionOrder` that `GET /primaries` reports,
+  and the first one that is connected, serves the amount on the route it
+  would take, and could be created against (direct funding not configured for
+  another peer) is quoted, with the others listed in `skipped` and their
+  reasons. The coordinator never dials: a primary that is not connected is
+  passed over. The answer's `peer` is what the create binds to. 503
+  `NO_PRIMARY_AVAILABLE` names every reason when no primary qualifies, and
+  400 `INVALID_PARAMS` answers when none is configured. A named `peer` is
+  quoted as before, with no fallback. In `bolt11` mode it also returns the sender fee `terms` read from
   the peer. Pass `requestId` when refreshing an interrupted request to reuse its reserved channel. The minimum is 354 sats (the dust limit). In `direct-funding`
   mode it returns `minAmountSat`, the
   configured direct-funding minimum (5000 sats by default). A funded candidate may first query the peer's concurrent terms before selecting this fallback. An amount under the
@@ -78,7 +88,10 @@ opens a channel to obtain inbound liquidity.
   `POST /receive/invoice` answers the same way.
 - `POST /receive/invoice` takes `peer`, `amountSats`, `description`, `quote`,
   and a stable `requestId` (16 to 160 letters, digits, underscores or hyphens).
-  Use the same id on retries, including after a lost response. In `bolt11` mode
+  Use the same id on retries, including after a lost response. `peer` may be
+  left out: then the one the reviewed `quote` named is used. The review bound
+  it, and create never chooses another, so a changed rank between review and
+  create cannot move the request. In `bolt11` mode
   success returns `kind: 'bolt11'`, `bolt11`, `paymentHash`, `amountSats`,
   `expiresAt` and `offlineReceive: true`, plus `concurrent: true` and `concurrentVersion` when selected. The invoice expires after ten minutes.
   In `direct-funding` mode success returns `kind: 'direct-funding'`, `request`
@@ -91,7 +104,8 @@ opens a channel to obtain inbound liquidity.
   setting at its default. An existing config naming the SAME peer is reused
   untouched, so an operator's `targetInboundSat`, `trusted` and splice switches
   survive. An existing config naming a DIFFERENT peer refuses with
-  `RECEIVE_UNAVAILABLE` rather than retargeting the node silently.
+  `RECEIVE_UNAVAILABLE` rather than retargeting the node silently; a steered
+  quote applies the same rule and passes such a primary over.
 - A direct-funding request is idempotent on `requestId` while it is unexpired:
   the same call returns the same envelope. Once it expires, the same id mints a
   replacement. It reserves nothing, starts no epoch and appears in no
