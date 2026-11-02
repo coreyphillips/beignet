@@ -2013,6 +2013,20 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			localFeatures.clearBit(Feature.DUAL_FUND);
 			localFeatures.clearBit(Feature.DUAL_FUND + 1);
 		}
+		// Taproot channels only close through closing_signed here (MuSig2
+		// partial signature in TLV 6), while LND 0.21 runs its RBF close
+		// (closing_complete / closing_sig, partial signatures in TLVs 5 to 7)
+		// on every taproot channel once both inits carry option_simple_close.
+		// The two forms do not meet: the close stalls, or an undecodable TLV
+		// fails the channel. LND reads the bit from the init of each
+		// connection, so it comes off the whole advertisement while taproot is
+		// on; a caller-supplied set is masked too. Non-taproot channels with
+		// those peers lose RBF close until the taproot form of simple close
+		// lands (issue #1929).
+		if (localFeatures.hasFeature(Feature.OPTION_TAPROOT)) {
+			localFeatures.clearBit(Feature.SIMPLE_CLOSE);
+			localFeatures.clearBit(Feature.SIMPLE_CLOSE + 1);
+		}
 		// Async receive service (issue #709): the odd bit is advertised in init
 		// and node_announcement ONLY while the service is enabled. A receiver
 		// reads it before asking for a grant, so it never marks a path
@@ -30872,7 +30886,9 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		//  - ROUTE_BLINDING (24): advertised per-invoice (see invoiceFeatures),
 		//    not in the init set.
 		//  - OPTION_TAPROOT (180/181): negotiated via channel_type when
-		//    preferTaproot is set; staging bits are not init-advertised.
+		//    preferTaproot is set; staging bits are not init-advertised. A
+		//    caller that adds them loses SIMPLE_CLOSE: the constructor clears
+		//    it while taproot is advertised (issue #1929).
 		return flags;
 	}
 

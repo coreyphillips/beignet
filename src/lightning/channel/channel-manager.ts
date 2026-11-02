@@ -4827,6 +4827,61 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		);
 	}
 
+	/**
+	 * An undecodable closing_complete or closing_sig for a channel that is
+	 * mid cooperative close. Unlike the other undecodable payloads this one
+	 * does not fail the channel: nothing about the balances is in dispute,
+	 * only the shape of the closing message, and the ERRORED path would
+	 * broadcast our commitment over a disagreement the next reconnect can
+	 * settle (channel_reestablish restarts the close from shutdown). The peer
+	 * gets a BOLT 1 warning scoped to the channel and is disconnected; the
+	 * channel keeps its closing state. The reason this exists is LND 0.21,
+	 * which answers a taproot shutdown with closing_complete carrying its
+	 * partial signatures in TLVs 5 to 7, including even type 6 (issue #1929).
+	 *
+	 * A channel in any other state, an unknown id and another peer's channel
+	 * all take the usual path, with its ownership check.
+	 */
+	private refuseUndecodableClosingMessage(
+		peerPubkey: string,
+		payload: Buffer,
+		name: string,
+		err: unknown
+	): void {
+		const channelId =
+			payload.length >= 32 ? Buffer.from(payload.subarray(0, 32)) : null;
+		const channel = channelId ? this.findChannelByChannelId(channelId) : null;
+		const state = channel?.getState();
+		const owner = channel ? this.findPeerForChannel(channel) : undefined;
+		if (
+			!channel ||
+			!channelId ||
+			(state !== ChannelState.SHUTTING_DOWN &&
+				state !== ChannelState.NEGOTIATING_CLOSING) ||
+			(owner !== undefined && owner !== peerPubkey)
+		) {
+			this.failChannelForUndecodablePayload(peerPubkey, payload, name, err);
+			return;
+		}
+		const detail = err instanceof Error ? err.message : String(err);
+		const reason = `Undecodable ${name}: ${detail}`;
+		const actions: ChannelAction[] = [
+			{ type: ChannelActionType.ERROR, message: reason }
+		];
+		if (canScopeWireError(channelId)) {
+			actions.unshift({
+				type: ChannelActionType.SEND_MESSAGE,
+				messageType: MessageType.WARNING,
+				payload: encodeErrorMessage({
+					channelId,
+					data: clampWireErrorData(reason)
+				})
+			});
+		}
+		this.processActions(peerPubkey, channel, actions);
+		this.peerManager?.disconnectPeer(peerPubkey);
+	}
+
 	private handleShutdownMsg(peerPubkey: string, payload: Buffer): void {
 		let msg: ReturnType<typeof decodeShutdownMessage>;
 		try {
@@ -5663,7 +5718,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		try {
 			msg = decodeClosingCompleteMessage(payload);
 		} catch (err) {
-			this.failChannelForUndecodablePayload(
+			this.refuseUndecodableClosingMessage(
 				peerPubkey,
 				payload,
 				'closing_complete',
@@ -5776,7 +5831,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		try {
 			msg = decodeClosingSigMessage(payload);
 		} catch (err) {
-			this.failChannelForUndecodablePayload(
+			this.refuseUndecodableClosingMessage(
 				peerPubkey,
 				payload,
 				'closing_sig',

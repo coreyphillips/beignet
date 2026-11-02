@@ -9002,10 +9002,13 @@ export class Channel {
 	 * on reestablish (features are per-connection).
 	 */
 	setSimpleClose(simple: boolean): void {
-		// Simple-taproot channels always close via the legacy closing_signed
-		// flow carrying MuSig2 partial-sig TLVs; LND excludes taproot from
-		// option_simple_close/RBF close, so force the legacy path even when
-		// both peers advertise feature 60.
+		// Simple-taproot channels close via the legacy closing_signed flow
+		// carrying MuSig2 partial-sig TLVs: the taproot form of simple close
+		// (partial signatures and nonces in TLVs 5 to 7, next_closee_nonce in
+		// closing_sig) is not implemented, so the legacy path is forced even
+		// when both peers advertise feature 60. LND up to 0.20 made the same
+		// choice; LND 0.21 would pick closing_complete here, which is why the
+		// node never advertises 60 alongside taproot (issue #1929).
 		if (isTaprootChannel(this._state.channelType)) {
 			this._state.simpleClose = false;
 			return;
