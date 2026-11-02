@@ -425,6 +425,105 @@ export function getOpenApiSpec(): Record<string, unknown> {
 					}
 				}
 			},
+			'/primaries': {
+				get: {
+					summary:
+						"Read the ranked receive primaries: each one's rank, address, the fill threshold that applies to it, our local balance summed over our usable channels with it, and whether a receive with no peer named would go to it. The target is the first primary in rank order below the threshold; when every one is at or above it, the one with the lowest balance, ties to the higher rank. selectionOrder is the order a receive tries them. Nothing steers a receive by this list yet. Readonly scope",
+					tags: ['Primaries'],
+					responses: {
+						'200': {
+							description: 'The list, the threshold and the receive target',
+							content: jsonContent({ $ref: '#/components/schemas/Primaries' })
+						}
+					}
+				}
+			},
+			'/primaries/add': {
+				post: {
+					summary:
+						'Add a receive primary at rank (1-based, default last). Reach it by host and port, or by uri (pubkey@address, for ws://, wss:// and iroh: peers), whose pubkey must match. A malformed pubkey, a pubkey already in the list, a bad port, a host without a port, a rank out of range, or a 33rd entry is refused with 400 INVALID_PARAMS. Persisted. Admin scope',
+					tags: ['Primaries'],
+					requestBody: bodyContent({
+						pubkey: 'string',
+						host: 'string?',
+						port: 'integer?',
+						uri: 'string?',
+						rank: 'integer?'
+					}),
+					responses: {
+						'200': {
+							description: 'The whole list after the change',
+							content: jsonContent({ $ref: '#/components/schemas/Primaries' })
+						}
+					}
+				}
+			},
+			'/primaries/remove': {
+				post: {
+					summary:
+						'Drop a receive primary. A pubkey not in the list is refused with 400 INVALID_PARAMS. Channels with it are left as they are. Persisted. Admin scope',
+					tags: ['Primaries'],
+					requestBody: bodyContent({ pubkey: 'string' }),
+					responses: {
+						'200': {
+							description: 'The whole list after the change',
+							content: jsonContent({ $ref: '#/components/schemas/Primaries' })
+						}
+					}
+				}
+			},
+			'/primaries/reorder': {
+				post: {
+					summary:
+						'Re-rank the receive primaries. order names every primary exactly once, highest rank first; anything else is refused with 400 INVALID_PARAMS, so a reorder can neither add nor drop one. Persisted. Admin scope',
+					tags: ['Primaries'],
+					requestBody: {
+						content: {
+							'application/json': {
+								schema: {
+									type: 'object',
+									properties: {
+										order: { type: 'array', items: { type: 'string' } }
+									},
+									required: ['order']
+								}
+							}
+						}
+					},
+					responses: {
+						'200': {
+							description: 'The whole list after the change',
+							content: jsonContent({ $ref: '#/components/schemas/Primaries' })
+						}
+					}
+				}
+			},
+			'/primaries/threshold': {
+				post: {
+					summary:
+						'Set the fill threshold: sats of local balance a primary is filled to before receives move to the next one. A non-negative integer, or null for no cap (the first-ranked primary always takes the receive); a negative or fractional value is refused with 400 INVALID_PARAMS. Persisted. Admin scope',
+					tags: ['Primaries'],
+					requestBody: {
+						content: {
+							'application/json': {
+								schema: {
+									type: 'object',
+									properties: {
+										fillThresholdSat: { type: 'integer', nullable: true }
+									},
+									required: ['fillThresholdSat']
+								}
+							}
+						}
+					},
+					responses: {
+						'200': {
+							description: 'The whole list after the change',
+							content: jsonContent({ $ref: '#/components/schemas/Primaries' })
+						}
+					}
+				}
+			},
 			'/direct-funding/received': {
 				get: {
 					summary:
@@ -5950,6 +6049,59 @@ export function getOpenApiSpec(): Record<string, unknown> {
 							type: 'integer',
 							description:
 								'Smallest offer served, never below the 5000 sat protocol floor'
+						}
+					}
+				},
+				Primaries: {
+					type: 'object',
+					properties: {
+						fillThresholdSat: {
+							type: 'integer',
+							nullable: true,
+							description:
+								'Sats a primary is filled to before receives move on. Null means no cap'
+						},
+						primaries: {
+							type: 'array',
+							description: 'Rank order, highest first',
+							items: { $ref: '#/components/schemas/Primary' }
+						},
+						receiveTarget: {
+							type: 'string',
+							nullable: true,
+							description:
+								'The pubkey a receive with no peer named would go to. Null with no primaries'
+						}
+					}
+				},
+				Primary: {
+					type: 'object',
+					properties: {
+						pubkey: { type: 'string' },
+						rank: { type: 'integer', description: '1 is the highest rank' },
+						host: { type: 'string', nullable: true },
+						port: { type: 'integer', nullable: true },
+						uri: { type: 'string', nullable: true },
+						thresholdSat: {
+							type: 'integer',
+							nullable: true,
+							description: 'The fill threshold that applies to this primary'
+						},
+						balanceSat: {
+							type: 'integer',
+							description:
+								'Our local balance summed over our usable channels with it'
+						},
+						channelCount: {
+							type: 'integer',
+							description: 'Usable channels with it; 0 means none yet'
+						},
+						belowThreshold: { type: 'boolean' },
+						isReceiveTarget: { type: 'boolean' },
+						selectionOrder: {
+							type: 'integer',
+							description:
+								'1-based position in the order a receive tries the primaries'
 						}
 					}
 				},

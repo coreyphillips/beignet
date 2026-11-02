@@ -45,7 +45,7 @@ src/lightning/
 ├── offer/           BOLT 12 offers, TLV encode/decode, Schnorr, merkle tree
 ├── async-payments/  AsyncPaymentManager, held-forward ledger, release capability
 ├── ffor/            FFOR Variant D offline receive: epochs, voucher book, witness and issuer
-├── liquidity/       JIT channel receive (LSP and wallet roles)
+├── liquidity/       JIT channel receive (LSP and wallet roles), ranked receive primaries
 ├── direct-funding/  Third-party funding: request envelopes, transport lanes, receiver and payer
 ├── swaps/           Reverse and submarine swap providers, HTLC contract, ledger, chain resolver
 ├── l402/            L402 (HTTP 402) client: challenges, macaroons, paid credentials
@@ -1469,7 +1469,7 @@ One row per namespace `beignet/lightning` exports (a test checks this table agai
 | `offer` | `OfferManager`, `encodeOffer`, `decodeOffer`, TLV, Schnorr, merkle | 12 |
 | `async-payments` | `AsyncPaymentManager`, `HeldForwardLedger`, release capability (held forward, notice, release, wake) | 4, 11 |
 | `ffor` | `FforWitnessService`, `FforIssuerService`, epoch messages, voucher book checks, transcript hashes | -- |
-| `liquidity` | `JitReceiveManager`, JIT quote/ack/authorization messages, intercept SCIDs | -- |
+| `liquidity` | `JitReceiveManager`, JIT quote/ack/authorization messages, intercept SCIDs, `PrimariesStore` and `selectReceiveTargets` (ranked receive primaries) | -- |
 | `direct-funding` | Request envelopes, sealed frames, `DirectFundingRequestStore`, `DirectFundingReceiver`, `DirectFundingSender`, transport lanes | -- |
 | `swaps` | P2WSH HTLC contract, claim/refund transactions, swap ledger, chain resolver, `ReverseSwapProvider`, `SubmarineSwapProvider` | -- |
 | `l402` | `l402Fetch`, `parseL402Challenge`, macaroon reading, credentials | -- |

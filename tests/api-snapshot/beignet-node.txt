@@ -233,6 +233,7 @@ type BeignetErrorCodeValue = `${BeignetErrorCode}`
 class BeignetNode extends TypedEmitter<BeignetNodeEvents>
 private constructor BeignetNode()
 static property BeignetNode.INITIAL_GOSSIP_PRIME_TIMEOUT_MS: number
+method BeignetNode.addPrimary(opts: { pubkey: string; host?: string; port?: number; uri?: string; rank?: number; }): PrimariesInfo
 method BeignetNode.addTrustedPeer(pubkey: string): TrustedPeerInfo
 method BeignetNode.addWatchtower(uri: string): void
 method BeignetNode.backup(destPath: string): Promise<void>
@@ -360,6 +361,7 @@ method BeignetNode.listOffers(): OfferInfo[]
 method BeignetNode.listOnchainTransactions(): OnchainTxInfo[]
 method BeignetNode.listPayments(filter?: PaymentFilter): PaymentInfo[]
 method BeignetNode.listPeers(): PeerInfo[]
+method BeignetNode.listPrimaries(): PrimariesInfo
 method BeignetNode.listQueue(): QueuedPayment[]
 method BeignetNode.listQueueHistory(opts?: { limit?: number; before?: string; }): QueuedPayment[]
 method BeignetNode.listSwaps(id?: string): Record<string, unknown>[]
@@ -392,8 +394,10 @@ method BeignetNode.rebroadcastClose(channelId: ChannelIdHex): Promise<{ ok: bool
 method BeignetNode.recoverFallbackFunds(opts?: { feeRatePerVbyte?: number; }): Promise<{ txid: TxidHex; amountSat: number; inputCount: number; } | null>
 method BeignetNode.refreshWallet(): Promise<void>
 method BeignetNode.removeOffer(offerId: string): boolean
+method BeignetNode.removePrimary(pubkey: string): PrimariesInfo
 method BeignetNode.removeTrustedPeer(pubkey: string): TrustedPeerInfo
 method BeignetNode.removeWatchtower(uri: string): void
+method BeignetNode.reorderPrimaries(pubkeys: string[]): PrimariesInfo
 method BeignetNode.resolveGuardianUri(uri: string): Promise<{ guardianId: string; url: string; entry: string; guardianSetIds: string[]; maxCiphertextBytes: number; }>
 method BeignetNode.resolveInterruptedPayment(bolt11: string): Promise<InterruptedPaymentOutcome>
 get BeignetNode.restartRequired(): boolean
@@ -414,6 +418,7 @@ method BeignetNode.sendToRoute(paymentHash: PaymentHashHex, route: { hops: Route
 method BeignetNode.setAddressLabel(address: string, label: string): Promise<{ address: string; label: string; }>
 method BeignetNode.setDraining(enabled: boolean): void
 method BeignetNode.setPaymentMetadata(paymentHash: PaymentHashHex, metadata: Record<string, string>): void
+method BeignetNode.setPrimariesFillThreshold(fillThresholdSat: number | null): PrimariesInfo
 method BeignetNode.settleHoldInvoice(preimage: string): { paymentHash: PaymentHashHex; }
 method BeignetNode.signMessage(message: string): { signature: string; pubkey: string; }
 method BeignetNode.spliceIn(channelId: ChannelIdHex, amountSats: number, feeratePerkw: number, fundingUtxos?: { utxos: Array<{ txid: TxidHex; vout: number; }>; allowTopUp?: boolean; }): SpliceResult
@@ -1212,6 +1217,22 @@ property PeerInfo.pubkey: string
 property PeerInfo.state: PeerState
 property PeerInfo.transport?: 'tcp' | 'ws' | 'iroh'
 type PeerState = 'ready' | 'connected' | 'connecting' | 'disconnected'
+interface PrimariesInfo
+property PrimariesInfo.fillThresholdSat: number | null
+property PrimariesInfo.primaries: PrimaryInfo[]
+property PrimariesInfo.receiveTarget: string | null
+interface PrimaryInfo
+property PrimaryInfo.balanceSat: number
+property PrimaryInfo.belowThreshold: boolean
+property PrimaryInfo.channelCount: number
+property PrimaryInfo.host: string | null
+property PrimaryInfo.isReceiveTarget: boolean
+property PrimaryInfo.port: number | null
+property PrimaryInfo.pubkey: string
+property PrimaryInfo.rank: number
+property PrimaryInfo.selectionOrder: number
+property PrimaryInfo.thresholdSat: number | null
+property PrimaryInfo.uri: string | null
 interface PsbtBuildInfo
 property PsbtBuildInfo.feeSats: number
 property PsbtBuildInfo.inputs: Array<{ txid: TxidHex; vout: number; address: string; valueSats: number; path: string; }>

@@ -214,6 +214,8 @@ const ROUTE_TABLE = [
 	{ method: 'POST', path: '/direct-funding/request', scopes: ['invoice'] },
 	// Policy readback, no secrets in it.
 	{ method: 'GET', path: '/direct-funding/config', scopes: ['readonly'] },
+	// Ranked receive primaries: pubkeys, addresses and our balances with them.
+	{ method: 'GET', path: '/primaries', scopes: ['readonly'] },
 	// Payments received against our requests: amounts and txids, no secrets.
 	{ method: 'GET', path: '/direct-funding/received', scopes: ['readonly'] },
 	{ method: 'POST', path: '/invoice/create-hold', scopes: ['invoice'] },
@@ -304,6 +306,12 @@ const ROUTE_TABLE = [
 	// Sets the liquidity peer every direct-funded channel is negotiated with,
 	// and whether such an open may go zero-conf.
 	{ method: 'POST', path: '/direct-funding/configure', scopes: [] },
+	// Which peers this wallet's receives are steered to, and how full each
+	// channel gets: admin, like the liquidity peer above.
+	{ method: 'POST', path: '/primaries/add', scopes: [] },
+	{ method: 'POST', path: '/primaries/remove', scopes: [] },
+	{ method: 'POST', path: '/primaries/reorder', scopes: [] },
+	{ method: 'POST', path: '/primaries/threshold', scopes: [] },
 	// A retried open opens a second channel. open-and-wait is left out: its
 	// wait usually outlasts the timeout, and a thrown timeout is not cached,
 	// so a keyed retry would open again anyway.

@@ -393,6 +393,11 @@ Entries survive a restart. The queue dispatches the restored ones once some chan
 | `getAdvisorRecommendations()` | `AdvisorRecommendations` | Liquidity analysis plus the concrete circular-rebalance plan (read-only) |
 | `rebalanceChannel(fromId, toId, amountSats, maxFeeSats)` | `Promise<RebalanceResult>` | Circular rebalance (self-payment out fromId, back in toId). Aborts without paying if the route fee exceeds `maxFeeSats`. The fee counts against `dailySpendLimitSats` |
 | `executeRebalances(budgetSatsPerDay?)` | `Promise<RebalanceExecutionSummary>` | Run the advisor's rebalance plan under a per-UTC-day fee budget (persisted; restarts never overspend the day). The fees count against `dailySpendLimitSats` |
+| `listPrimaries()` | `PrimariesInfo` | The ranked receive primaries (issue #1922): each one's `rank`, address, `thresholdSat`, `balanceSat` (our local balance summed over our usable channels with it), `channelCount`, `belowThreshold`, `isReceiveTarget` and `selectionOrder`, plus `fillThresholdSat` and `receiveTarget`. The target is the first primary in rank order below the threshold; when every one is at or above it, the lowest balance, ties to the higher rank. Nothing steers a receive by it yet |
+| `addPrimary({ pubkey, host?, port?, uri?, rank? })` | `PrimariesInfo` | Add a primary at `rank` (1-based, default last), reached by `host`/`port` or by a `uri` (`pubkey@address`, ws://, wss:// and iroh: included). Refuses a malformed pubkey, a duplicate, a bad port, a host without a port, an out-of-range rank or a 33rd entry with `INVALID_PARAMS`. Persisted |
+| `removePrimary(pubkey)` | `PrimariesInfo` | Drop a primary (`INVALID_PARAMS` when it is not one). Its channels are left as they are. Persisted |
+| `reorderPrimaries(pubkeys)` | `PrimariesInfo` | Re-rank: `pubkeys` names every primary once, highest rank first (`INVALID_PARAMS` otherwise). Persisted |
+| `setPrimariesFillThreshold(sats \| null)` | `PrimariesInfo` | Sats of local balance a primary is filled to before receives move on; `null` for no cap. A negative or fractional value is `INVALID_PARAMS`. Persisted |
 
 Automatic execution is **off by default**: pass `autoRebalance: { enabled: true, budgetSatsPerDay, minImbalancePct }` and/or `autoTuneFees: { enabled: true, intervalMs, floorPpm, ceilPpm }` in `BeignetNodeOptions` to turn on the periodic rebalance scan and routing-fee (ppm) auto-tuning.
 
@@ -1864,6 +1869,22 @@ An acceptor that does not carry the opener refuses a zero_conf open outright
 rather than downgrading it to a confirmed one, which is why a wallet receiving
 through a JIT LSP has to carry that LSP here.
 
+### Receive primaries
+
+```bash
+beignet primaries add <pubkey> --host 10.0.0.2 --port 9735 [--rank 1]
+beignet primaries add <pubkey> --uri '<pubkey>@iroh:<endpoint-id>'
+beignet primaries threshold 1000000          # or: none
+beignet primaries reorder <pubkeyB> <pubkeyA>
+beignet primaries remove <pubkey>
+beignet primaries list
+# {"ok":true,"result":{"fillThresholdSat":1000000,"receiveTarget":"02ab...","primaries":[{"pubkey":"02ab...","rank":1,"balanceSat":400000,"isReceiveTarget":true,...}]}}
+```
+
+The list and the threshold are saved in the wallet database and survive a
+restart. They only describe where receives should go: receive calls still name
+their peer.
+
 ### Channels
 
 ```bash
@@ -2577,6 +2598,11 @@ The matching commands are `wallet sweep-prepare <requestJson|requestFile>`, `wal
 | POST | `/direct-funding/request` | `{ host?, port?, amountSats? }` | Mint a payment request: returns `{ paymentHash, expiresAt, request }`, where `request` is the base64url envelope a payer pays (BIP 21 parameter `bgnq`). `host`/`port` are the address a payer can reach this node on and are used exactly as given |
 | POST | `/direct-funding/prepare` | `{ request }` | Decode a request and start connecting to the node a send would talk to first, without waiting for the dial. Returns `{ requestId, receiverNodeId, amountSat, expiresAt, connection, peerNodeId? }`, where `connection` is `connected`, `connecting`, `awaiting_receiver` or `none`. Spends nothing and writes no payment record; a later `send` joins a dial still in progress. Admin scope |
 | POST | `/direct-funding/send` | `{ request, amountSats?, maxTotalFeeSat?, recoverReceipt? }` | Pay a request from one of our coins. Set `recoverReceipt` to ask the receiver to replay a receipt that never arrived (issue #767): it acts only on a post-witness payment with no receipt yet, re-sends the recorded offer with no second coin, signature or freeze, and returns the recorded outcome plus a `caveat` if the receiver cannot be reached. **Rejects only before our witness leaves the device**; after that it resolves with what is known plus a `caveat`, because a client that falls back to a plain on-chain send on any error cannot tell a late rejection from an early one and would pay twice. Idempotent on the request id, sets no deadline of its own, and accepts `feeHeadroomSats` as an alias for `maxTotalFeeSat`. The money leaves for a stranger's channel, so amount + fee ceiling counts against the combined daily spend limit, and a draining node refuses it (both before the exchange opens, and neither for a request that already has an attempt: a duplicate call spends nothing new, and refusing one would be read as "nothing happened") |
+| GET | `/primaries` | -- | The ranked receive primaries with their balances and the current receive target, as `listPrimaries` returns them. Readonly scope |
+| POST | `/primaries/add` | `{ pubkey, host?, port?, uri?, rank? }` | Add a primary (400 `INVALID_PARAMS` on a malformed pubkey, a duplicate, a bad port or rank). Returns the whole list. Admin scope |
+| POST | `/primaries/remove` | `{ pubkey }` | Drop a primary. Returns the whole list. Admin scope |
+| POST | `/primaries/reorder` | `{ order }` | Re-rank: `order` names every primary once, highest rank first. Returns the whole list. Admin scope |
+| POST | `/primaries/threshold` | `{ fillThresholdSat }` | Set the fill threshold in sats, `null` for no cap (400 `INVALID_PARAMS` when negative or fractional). Returns the whole list. Admin scope |
 | POST | `/invoice/create-hold` | `{ paymentHash, amountMsat?, amountSats?, description?, expiry?, minFinalCltvExpiry? }` | Create hold invoice for a caller-supplied payment hash (HTLCs park until settle/cancel). `minFinalCltvExpiry` is 1..2016 blocks; on a swap leg it has to clear the on-chain refund timeout plus the 18-block hold cancellation margin and the refund's own resolution time |
 | POST | `/invoice/settle-hold` | `{ preimage }` | Settle a parked hold invoice (fulfills all MPP parts) |
 | POST | `/invoice/cancel-hold` | `{ paymentHash }` | Cancel a hold invoice; fails parked HTLCs back |

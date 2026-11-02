@@ -211,6 +211,12 @@ import {
 	DirectFundingSender,
 	chainHashForNetwork
 } from '../lightning/direct-funding';
+import {
+	PrimariesError,
+	PrimariesErrorCode,
+	PrimariesStore,
+	selectReceiveTargets
+} from '../lightning/liquidity/primaries';
 import { directFundingWallet } from './direct-funding';
 import {
 	AUTH_KEY_OVERRIDES_STORAGE_KEY,
@@ -319,6 +325,7 @@ import type {
 	TOnchainQuote,
 	TChannelFundingQuote,
 	DirectFundingConfigInfo,
+	PrimariesInfo,
 	JitStatusInfo,
 	SwapsStatusInfo,
 	JitQuoteInfo
@@ -2179,6 +2186,7 @@ function listenerLabel(kind: ListenerKind): string {
 export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	private fforReceiveService?: FforReceiveService;
 	private offlineReceive?: OfflineReceive;
+	private _primaries?: { store: PrimariesStore; storage: unknown };
 	private offlineReceiveTimer?: ReturnType<typeof setInterval>;
 	getOfflineReceive(): OfflineReceive {
 		if (!this.offlineReceive)
@@ -10151,6 +10159,129 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 				policy.unpairedSpliceDepth ?? DF_DEFAULT_UNPAIRED_SPLICE_DEPTH,
 			minAmountSat: clampDirectFundingMinimum(policy.minAmountSat ?? 0)
 		};
+	}
+
+	// ───────── Ranked receive primaries (issue #1922) ─────────
+
+	/**
+	 * The store over the current storage, rebuilt when the storage is replaced
+	 * (a capsule restore swaps the database in-process).
+	 */
+	private primariesStore(): PrimariesStore {
+		const storage = this.storage;
+		if (!this._primaries || this._primaries.storage !== storage) {
+			const store = new PrimariesStore({ storage });
+			store.restore();
+			this._primaries = { store, storage };
+		}
+		return this._primaries.store;
+	}
+
+	/** Run a store write, mapping its refusals onto the node's error codes. */
+	private primariesWrite(
+		write: (store: PrimariesStore) => void
+	): PrimariesInfo {
+		try {
+			write(this.primariesStore());
+		} catch (err) {
+			if (err instanceof PrimariesError) {
+				throw new BeignetError(
+					err.code === PrimariesErrorCode.PERSIST_FAILED
+						? BeignetErrorCode.INTERNAL_ERROR
+						: BeignetErrorCode.INVALID_PARAMS,
+					err.message
+				);
+			}
+			throw err;
+		}
+		return this.listPrimaries();
+	}
+
+	/**
+	 * Local balance and channel count per peer, over the channels a routing
+	 * hint would be built for (looking through a reconnect), so a primary that
+	 * is briefly away keeps the balance it holds.
+	 */
+	private primaryBalances(): Map<string, { sats: number; channels: number }> {
+		const out = new Map<string, { sats: number; channels: number }>();
+		const manager = this.node.getChannelManager();
+		for (const channel of manager.listChannels()) {
+			if (!channel.acceptsNewHtlcs(true)) continue;
+			const channelId = channel.getChannelId();
+			const peer = channelId ? manager.getPeerForChannel(channelId) : null;
+			if (!peer) continue;
+			const entry = out.get(peer) ?? { sats: 0, channels: 0 };
+			entry.sats += Number(channel.getFullState().localBalanceMsat / 1000n);
+			entry.channels += 1;
+			out.set(peer, entry);
+		}
+		return out;
+	}
+
+	/**
+	 * The ranked primaries with their balances, and which one a receive with no
+	 * peer named would go to. Nothing here steers a receive yet: callers still
+	 * name the peer.
+	 */
+	listPrimaries(): PrimariesInfo {
+		const policy = this.primariesStore().get();
+		const balances = this.primaryBalances();
+		const order = selectReceiveTargets(
+			policy,
+			new Map([...balances].map(([peer, b]) => [peer, b.sats]))
+		);
+		const position = new Map(order.map((c, i) => [c.pubkey, i]));
+		return {
+			fillThresholdSat: policy.fillThresholdSat,
+			primaries: policy.primaries.map((p, i) => {
+				const at = position.get(p.pubkey)!;
+				return {
+					pubkey: p.pubkey,
+					rank: i + 1,
+					host: p.host ?? null,
+					port: p.port ?? null,
+					uri: p.uri ?? null,
+					thresholdSat: policy.fillThresholdSat,
+					balanceSat: order[at].balanceSat,
+					channelCount: balances.get(p.pubkey)?.channels ?? 0,
+					belowThreshold: order[at].belowThreshold,
+					isReceiveTarget: at === 0,
+					selectionOrder: at + 1
+				};
+			}),
+			receiveTarget: order[0]?.pubkey ?? null
+		};
+	}
+
+	/**
+	 * Add a primary at `rank` (1-based, default last). Reach it by `host` and
+	 * `port`, or by `uri` for ws://, wss:// and iroh: peers.
+	 */
+	addPrimary(opts: {
+		pubkey: string;
+		host?: string;
+		port?: number;
+		uri?: string;
+		rank?: number;
+	}): PrimariesInfo {
+		const { rank, ...entry } = opts;
+		return this.primariesWrite((store) => store.add(entry, rank));
+	}
+
+	removePrimary(pubkey: string): PrimariesInfo {
+		return this.primariesWrite((store) => store.remove(pubkey));
+	}
+
+	/** Re-rank: `pubkeys` names every primary once, highest rank first. */
+	reorderPrimaries(pubkeys: string[]): PrimariesInfo {
+		return this.primariesWrite((store) => store.reorder(pubkeys));
+	}
+
+	/** Set the fill threshold in sats, or null for no cap. */
+	setPrimariesFillThreshold(fillThresholdSat: number | null): PrimariesInfo {
+		return this.primariesWrite((store) =>
+			store.setFillThreshold(fillThresholdSat)
+		);
 	}
 
 	/**
