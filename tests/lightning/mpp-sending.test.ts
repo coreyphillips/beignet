@@ -16,6 +16,7 @@ import {
 } from '../../src/lightning/node/types';
 import { createFailureMessage } from '../../src/lightning/onion/failures';
 import {
+	MPP_TIMEOUT,
 	TEMPORARY_NODE_FAILURE,
 	TEMPORARY_CHANNEL_FAILURE
 } from '../../src/lightning/onion/types';
@@ -873,7 +874,10 @@ describe('MPP Sending (Phase 5)', function () {
 			expect(payment.failureCode, 'a local failure').to.equal(undefined);
 			expect(payment.completedAt).to.be.a('number');
 			expect(failedEvents, 'payment:failed emitted once').to.equal(1);
-			expect(aliceAny.outboundMppPayments.size).to.equal(0);
+			// The dispatched part's secrets stay until bob fails it back.
+			expect(aliceAny.outboundMppPayments.get(hashHex).parts.length).to.equal(
+				1
+			);
 			// Bob holds the lone part: an incomplete set is never credited.
 			expect(bob.getPayment(paymentHash)!.status).to.equal(
 				PaymentStatus.PENDING
@@ -906,6 +910,10 @@ describe('MPP Sending (Phase 5)', function () {
 			expect(adds, 'no redispatch').to.equal(1);
 			expect(aliceAny.htlcPaymentMap.size).to.equal(0);
 			expect(aliceAny.paymentRetryContexts.has(hashHex)).to.equal(false);
+			expect(
+				aliceAny.outboundMppPayments.size,
+				'MPP state dropped with the last part'
+			).to.equal(0);
 			expect(bob.getPayment(paymentHash)!.status).to.not.equal(
 				PaymentStatus.COMPLETED
 			);
@@ -973,6 +981,83 @@ describe('MPP Sending (Phase 5)', function () {
 			expect(bob.getPayment(paymentHash)!.status).to.equal(
 				PaymentStatus.PENDING
 			);
+
+			alice.destroy();
+			bob.destroy();
+		});
+
+		it('siblings failing back after a local failure keep its reason and decrypt with their own secrets (#1941)', async function () {
+			const htlcSecretFor = (seedId: number): Buffer =>
+				crypto
+					.createHash('sha256')
+					.update(makeSeed(seedId))
+					.update(Buffer.from([4]))
+					.digest();
+			const alice = new LightningNode({
+				...makeNodeConfig(88),
+				htlcBasepointSecret: htlcSecretFor(88)
+			});
+			const bob = new LightningNode({
+				...makeNodeConfig(89),
+				htlcBasepointSecret: htlcSecretFor(89),
+				mppTimeoutMs: 1
+			});
+			connectNodes(alice, bob);
+			openReadyChannel(alice, bob, 200_000n);
+			openReadyChannel(alice, bob, 200_000n);
+			openReadyChannel(alice, bob, 200_000n);
+
+			let adds = 0;
+			alice.on('message:outbound', (_pk: string, type: number) => {
+				if (type === MessageType.UPDATE_ADD_HTLC) adds++;
+			});
+			let failedEvents = 0;
+			alice.on('payment:failed', () => failedEvents++);
+
+			// Two parts leave, each its own onion; the third finds no channel.
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			const aliceAny = alice as any;
+			const resolve = aliceAny.firstHopChannelFor.bind(alice);
+			let resolutions = 0;
+			aliceAny.firstHopChannelFor = (route: IRoute): unknown =>
+				++resolutions < 3 ? resolve(route) : undefined;
+
+			const { bolt11, paymentHash } = hintlessMppInvoice(
+				bob,
+				89,
+				450_000_000n,
+				'third hop gone'
+			);
+			const payment = alice.sendPayment(bolt11);
+			const hashHex = paymentHash.toString('hex');
+
+			expect(resolutions, 'three parts were planned').to.equal(3);
+			expect(adds, 'two parts left').to.equal(2);
+			expect(payment.status).to.equal(PaymentStatus.FAILED);
+			expect(payment.failureReason).to.match(/first-hop channel is gone/);
+			expect(failedEvents, 'payment:failed emitted once').to.equal(1);
+			expect(aliceAny.outboundMppPayments.get(hashHex).parts.length).to.equal(
+				2
+			);
+
+			// Bob's MPP timeout fails both held parts back. The second part's
+			// failure decrypts only with its own secrets: read with the first
+			// part's, it would land as an HMAC mismatch over the local reason.
+			await new Promise((r) => setTimeout(r, 5));
+			bob.failTimedOutMppPayments();
+			await new Promise((r) => setTimeout(r, 50));
+
+			const after = alice.getPayment(paymentHash)!;
+			expect(after.status).to.equal(PaymentStatus.FAILED);
+			expect(after.failureReason, 'the local reason survives').to.match(
+				/first-hop channel is gone/
+			);
+			expect(after.failureCode).to.equal(MPP_TIMEOUT);
+			expect(failedEvents, 'no second payment:failed').to.equal(1);
+			expect(adds, 'no redispatch').to.equal(2);
+			expect(aliceAny.outboundMppPayments.size).to.equal(0);
+			expect(aliceAny.htlcPaymentMap.size).to.equal(0);
+			expect(aliceAny.paymentRetryContexts.has(hashHex)).to.equal(false);
 
 			alice.destroy();
 			bob.destroy();

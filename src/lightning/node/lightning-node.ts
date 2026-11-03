@@ -19636,9 +19636,10 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	 * add. The record is FAILED with `reason`, journaled in one transition
 	 * with the release of `htlcKey` (the mapping written for a part the
 	 * channel refused; a part that never resolved a channel wrote none), and
-	 * payment:failed fires once. A dispatched part that already failed back
-	 * (synchronously, on a loopback transport) ended the record first; its
-	 * timestamp and event stand.
+	 * payment:failed fires once. A dispatched part can resolve before this one
+	 * is reached (synchronously, on a loopback transport): a fulfil completed
+	 * the record, and the preimage stands over this failure; a fail-back ended
+	 * it first, and its timestamp and event stand.
 	 *
 	 * No rollback of the parts already dispatched: BOLT 2 gives no way to
 	 * withdraw an update_add_htlc we have sent. Only the downstream peer can
@@ -19651,13 +19652,14 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	 * The dispatched parts settle themselves: the payee cannot claim an
 	 * incomplete MPP set, so it fails them back on its own MPP timeout. Each
 	 * lands in settleOwnPaymentFailure, which releases its mapping and leaves
-	 * an already FAILED record's status, timestamp and event alone. The retry
-	 * context stays: a later send of the hash sizes its settled row against
-	 * that context's invoice (issue #1189), and the give-up path drops the
-	 * context when the last dispatched part fails back. Its budget is frozen
-	 * at what was used: with the MPP state gone, a part failing back with a
-	 * temporary code would otherwise redispatch the whole invoice, and pay
-	 * it, after this payment reported FAILED.
+	 * an already FAILED record's status, timestamp and event alone. The MPP
+	 * state stays until the last of them resolves, as after a full dispatch:
+	 * each part's failure decrypts only with that part's secrets, and while
+	 * the state stands no part is auto-retried, so a temporary code coming
+	 * back cannot redispatch the whole invoice after this payment reported
+	 * FAILED. The retry context stays: a later send of the hash sizes its
+	 * settled row against that context's invoice (issue #1189), and the
+	 * give-up path drops the context when the last dispatched part fails back.
 	 */
 	private failMppDispatch(
 		payment: IPaymentInfo,
@@ -19665,13 +19667,21 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		htlcKey?: string
 	): void {
 		const hashHex = payment.paymentHash.toString('hex');
-		const firstFailure = payment.status !== PaymentStatus.FAILED;
-		payment.status = PaymentStatus.FAILED;
-		if (firstFailure) payment.completedAt = Date.now();
-		payment.failureReason = boundedFailureReason(reason);
-		this.outboundMppPayments.delete(hashHex);
-		const retryCtx = this.paymentRetryContexts.get(hashHex);
-		if (retryCtx) retryCtx.maxRetries = retryCtx.retryCount;
+		const firstFailure = payment.status === PaymentStatus.PENDING;
+		if (payment.status !== PaymentStatus.COMPLETED) {
+			payment.status = PaymentStatus.FAILED;
+			if (firstFailure) payment.completedAt = Date.now();
+			payment.failureReason = boundedFailureReason(reason);
+		}
+		const mppState = this.outboundMppPayments.get(hashHex);
+		if (mppState) {
+			mppState.dispatchComplete = true;
+			if (
+				mppState.parts.every((part) => part.status !== PaymentStatus.PENDING)
+			) {
+				this.outboundMppPayments.delete(hashHex);
+			}
+		}
 		const mutations: RecoveryMutation[] = [];
 		if (htlcKey !== undefined) {
 			this.htlcPaymentMap.delete(htlcKey);
