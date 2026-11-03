@@ -7,7 +7,8 @@ import crypto from 'crypto';
 import { NetworkGraph } from '../../src/lightning/gossip/network-graph';
 import {
 	findRoute,
-	findMultiPathRoute
+	findMultiPathRoute,
+	ILocalChannelEdge
 } from '../../src/lightning/gossip/pathfinding';
 import {
 	encodeShortChannelId,
@@ -16,6 +17,7 @@ import {
 	MESSAGE_FLAG_HTLC_MAX
 } from '../../src/lightning/gossip/types';
 import { BITCOIN_CHAIN_HASH } from '../../src/lightning/channel/types';
+import { IRoute } from '../../src/lightning/gossip/types';
 import { LightningNode } from '../../src/lightning/node/lightning-node';
 import { IChannelBasepoints } from '../../src/lightning/keys/derivation';
 import { Feature } from '../../src/lightning/features/flags';
@@ -426,5 +428,122 @@ describe('MPP (Phase 7)', function () {
 			expect(route).to.not.be.null;
 			expect(route!.hops.length).to.equal(1);
 		});
+	});
+});
+
+describe('MPP part sizing across distinct first hops (issue #1922)', function () {
+	/**
+	 * source holds one local channel per entry of `outboundMsat`, each to its
+	 * own peer, and every peer has an announced 1M-sat channel to dest.
+	 */
+	function distinctFirstHops(outboundMsat: bigint[]): {
+		graph: NetworkGraph;
+		source: Buffer;
+		dest: Buffer;
+		localChannels: ILocalChannelEdge[];
+	} {
+		const graph = new NetworkGraph();
+		const source = makeNodeId(0x01);
+		const dest = makeNodeId(0xff);
+		const localChannels: ILocalChannelEdge[] = [];
+		outboundMsat.forEach((outbound, i) => {
+			const peer = makeNodeId(0x10 + i);
+			const peerToDest = makeScid(200, i + 1, 0);
+			graph.addChannelAnnouncement(makeAnnouncement(peerToDest, peer, dest));
+			const peerIsFirst = Buffer.compare(peer, dest) < 0;
+			graph.applyChannelUpdate(
+				makeUpdate(peerToDest, peerIsFirst ? 0 : 1, 1_000_000_000n)
+			);
+			graph.applyChannelUpdate(
+				makeUpdate(peerToDest, peerIsFirst ? 1 : 0, 1_000_000_000n)
+			);
+			localChannels.push({
+				shortChannelId: makeScid(100, i + 1, 0),
+				peer,
+				outboundMsat: outbound
+			});
+		});
+		return { graph, source, dest, localChannels };
+	}
+
+	function firstHopAmounts(parts: IRoute[]): Map<string, bigint> {
+		const byScid = new Map<string, bigint>();
+		for (const part of parts) {
+			const scid = part.hops[0].shortChannelId.toString('hex');
+			byScid.set(scid, (byScid.get(scid) ?? 0n) + part.totalAmountMsat);
+		}
+		return byScid;
+	}
+
+	it('widens a halved part to what its first hop carries: 100k and 20k pay 115k in two parts', function () {
+		const { graph, source, dest, localChannels } = distinctFirstHops([
+			100_000_000n,
+			20_000_000n
+		]);
+		const amount = 115_000_000n;
+		const result = findMultiPathRoute(
+			graph,
+			source,
+			dest,
+			amount,
+			40,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			localChannels
+		);
+		expect(result, 'the payment routes').to.not.equal(null);
+		expect(result!.parts.length).to.equal(2);
+		const delivered = result!.parts.reduce(
+			(acc, part) => acc + part.hops[part.hops.length - 1].amountToForwardMsat,
+			0n
+		);
+		expect(delivered).to.equal(amount);
+		// Each first hop carries one part, within its spendable balance.
+		const byScid = firstHopAmounts(result!.parts);
+		expect(byScid.size).to.equal(2);
+		for (const lc of localChannels) {
+			const sent = byScid.get(lc.shortChannelId.toString('hex'));
+			expect(sent, 'a part over every first hop').to.not.equal(undefined);
+			expect(sent! <= lc.outboundMsat).to.equal(true);
+		}
+	});
+
+	it('five local channels split a payment that needs all five without a maxParts argument, and an explicit 4 still refuses', function () {
+		const { graph, source, dest, localChannels } = distinctFirstHops(
+			Array(5).fill(100_000_000n)
+		);
+		const amount = 450_000_000n;
+		const route = (maxParts?: number) =>
+			findMultiPathRoute(
+				graph,
+				source,
+				dest,
+				amount,
+				40,
+				maxParts,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				localChannels
+			);
+		const unbounded = route();
+		expect(unbounded, 'the default bound covers every channel').to.not.equal(
+			null
+		);
+		expect(unbounded!.parts.length).to.equal(5);
+		expect(firstHopAmounts(unbounded!.parts).size).to.equal(5);
+		expect(route(4), 'an explicit bound is kept').to.equal(null);
+	});
+
+	it('a graph with no local channels keeps the four-part default', function () {
+		const { graph, source, dest } = buildParallelGraph();
+		// Two 50k paths; 80k needs two parts and fits the default of four.
+		const result = findMultiPathRoute(graph, source, dest, 80_000_000n, 40);
+		expect(result).to.not.equal(null);
+		expect(result!.parts.length).to.be.lessThanOrEqual(4);
 	});
 });
