@@ -530,11 +530,20 @@ Step 5d landed this surface:
   2-of-2 P2WSH third-party input against CLN v26.06.1: CLN admits the input
   at `tx_complete`, signs first, and adopts the spliced channel once the
   delivered 2-of-2 witness completes the transaction (regtest, 2026-11-03,
-  capacity 500000 to 580000 sats). CLN does not advertise bits 454/455, so
-  step 5c settles how a CLN peer is told apart (its own
-  `shutdown_wrong_funding` pair 104/105 is one signal) before it is
-  selectable; a peer that is neither a beignet with the bit nor a recognised
-  CLN is not selected.
+  capacity 500000 to 580000 sats). CLN does not advertise bits 454/455.
+  Step 5c tells a CLN peer apart by its own `shutdown_wrong_funding` pair
+  104/105 (`peerSupportsCompositeSpliceInputs`), but CLN sets that pair only
+  when started with its experimental shutdown-wrong-funding flag: a default
+  CLN v26.06.1 advertises the init features `800898882a8a59a1`, nothing
+  above bit 63 (regtest, 2026-11-03, step 5e). Such a peer is not recognised
+  and its channels are left out of a plan by name. The step 5e regtest case
+  that composes across a beignet primary and CLN therefore vouches for the
+  CLN peer in the test (the recognition is a method the test overrides for
+  that one pubkey) and proves the protocol path: the composite completes
+  and CLN runs on the new funding. Making a default CLN selectable needs an
+  operator declaration per peer (for example a flag on the primaries entry);
+  that is an open decision, not part of step 5. A peer that is neither a
+  beignet with the bit nor a recognised CLN is not selected.
 - eclair does not splice in our stack and LND does not splice at all; their
   channels are never selected and the refusal says so.
 
@@ -590,6 +599,24 @@ Each lands alone, fund-relevant ones after the full matrix with interop:
   refusal, the single execution's accounting and idempotency, the
   composite's reservation through RELEASED, ABORTED and CONFLICTED, restored
   composites in the listing, and the daemon envelopes.
-- 5e. Regtest qualification: a wallet with two beignet primaries pays an
-  address from both channels in one transaction, including the abort and
-  restart cases, on the live stack.
+- 5e. Regtest qualification,
+  `tests/lightning/interop/composite-splice-regtest.test.ts` on the docker
+  stack (bitcoind, electrs, CLN v26.06.1; skipped when bitcoind is
+  unreachable): a wallet daemon with channels to beignet primaries over TCP
+  pays an address out of two channels in one transaction through
+  `quoteChannelSend` and `executeChannelSend`; the transaction is read back
+  from bitcoind (two 2-of-2 inputs with four witness items each, the
+  destination and two funding outputs), both channels adopt it after
+  `splice_locked`, one record and one spend charge remain. Then: an amount
+  that fits one channel takes the single-channel splice-out from the fuller
+  channel; a primary without `option_composite_splice_inputs` is left out
+  of the plan by name; a restart between the broadcast and the locks keeps
+  the record and the charge and the composite still locks; a primary that
+  disconnects as the wallet's `splice_init` reaches it aborts the composite
+  at once with every channel NORMAL again on both sides, no transaction
+  agreed and nothing charged; and a composite across a beignet primary and
+  CLN completes with CLN on the new funding (section 8 on how the CLN peer
+  is recognised there). The failures a live stack cannot force (a peer that
+  never signs, a contributing peer, a restart before release or at
+  COMMITTED, a force close after release) stay with the in-process tests of
+  step 5c.

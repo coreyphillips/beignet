@@ -15001,7 +15001,11 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	 * option_composite_splice_inputs (bits 454/455), or it is Core Lightning,
 	 * which admits such inputs without the bit (CLN matrix tier C3) and is
 	 * told apart by its own shutdown_wrong_funding pair (104/105), a bit no
-	 * other implementation uses. Null when the peer's init is not known.
+	 * other implementation uses. CLN sets that pair only when started with
+	 * its experimental shutdown-wrong-funding flag: a default CLN v26.06.1
+	 * advertises no init bit above 63 (regtest, 2026-11-03), so it is not
+	 * recognised here and its channels are left out of a composite by name.
+	 * Null when the peer's init is not known.
 	 */
 	peerSupportsCompositeSpliceInputs(peerPubkey: string): boolean | null {
 		const init = this.peerManager?.getPeer(peerPubkey)?.getRemoteInit();
