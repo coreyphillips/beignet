@@ -2456,6 +2456,9 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		peerPubkey: string,
 		cause?: { initiator: 'local' | 'remote'; reason?: string }
 	): void {
+		// Before the channels forget their pre-commitment splices: a composite
+		// splice (issue #1922) ends with the connection and must hear it first.
+		this.emit('peer:disconnected', peerPubkey);
 		const openDiedOnDisconnect = (state: ChannelState): string => {
 			const base = `Peer disconnected during channel open (state: ${state})`;
 			if (!cause) return base;
@@ -7212,6 +7215,61 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 	}
 
 	/**
+	 * Release the splice commitment_signed a composite session held at
+	 * tx_complete (issue #1922), once the node has checked every session of
+	 * the composite negotiated the same transaction.
+	 */
+	releaseCompositeSpliceCommitment(channelId: Buffer): ChannelResult {
+		const idHex = channelId.toString('hex');
+		const channel = this.channels.get(idHex);
+		if (!channel) {
+			const error = `Channel not found: ${idHex}`;
+			this.emit('error', channelId, error);
+			return { ok: false, actions: [], error };
+		}
+		const peerPubkey = this.channelPeers.get(idHex);
+		if (!peerPubkey) {
+			const error = `Peer not found for channel: ${idHex}`;
+			this.emit('error', channelId, error);
+			return { ok: false, actions: [], error };
+		}
+		const actions = channel.releaseCompositeSpliceCommitment();
+		this.processActions(peerPubkey, channel, actions);
+		return {
+			ok: !actions.some((a) => a.type === ChannelActionType.ERROR),
+			actions
+		};
+	}
+
+	/**
+	 * Forget a channel's in-flight splice whose tx_signatures never left this
+	 * side, owing the peer a tx_abort (issue #1922): the restore path of a
+	 * composite that ended before RELEASED. The channel refuses once its
+	 * signatures are out.
+	 */
+	forgetUnsentSplice(channelId: Buffer, reason: string): ChannelResult {
+		const idHex = channelId.toString('hex');
+		const channel = this.channels.get(idHex);
+		if (!channel) {
+			const error = `Channel not found: ${idHex}`;
+			this.emit('error', channelId, error);
+			return { ok: false, actions: [], error };
+		}
+		const peerPubkey = this.channelPeers.get(idHex);
+		if (!peerPubkey) {
+			const error = `Peer not found for channel: ${idHex}`;
+			this.emit('error', channelId, error);
+			return { ok: false, actions: [], error };
+		}
+		const actions = channel.forgetUnsentSplice(reason);
+		this.processActions(peerPubkey, channel, actions);
+		return {
+			ok: !actions.some((a) => a.type === ChannelActionType.ERROR),
+			actions
+		};
+	}
+
+	/**
 	 * Send splice_locked after splice tx confirmation.
 	 */
 	sendSpliceLocked(channelId: Buffer): ChannelResult {
@@ -10219,6 +10277,17 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 						action.fundingOutputIndex,
 						action.inputIndices,
 						action.externalInputIndices
+					);
+					break;
+				case ChannelActionType.SPLICE_TX_NEGOTIATED:
+					// A composite session holds its commitment; the node decides
+					// (issue #1922). Nothing left the node, so no persist gate.
+					this.emit(
+						'splice:negotiated',
+						action.channelId,
+						action.compositeId,
+						action.spliceTxid,
+						action.newFundingOutputIndex
 					);
 					break;
 				case ChannelActionType.SPLICE_TX_SIGNATURES_NEEDED:

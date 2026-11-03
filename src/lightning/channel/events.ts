@@ -36,6 +36,8 @@ export interface ChannelManagerEvents {
 	'channel:restore-ready': (channelId: Buffer) => void;
 	/** A channel completed reestablishment back to NORMAL. Fires on EVERY reconnect, so listeners must gate on durable facts. */
 	'channel:reestablished': (channelId: Buffer) => void;
+	/** The connection to a peer ended; its channels are being marked for reestablish. Emitted before any of them is. */
+	'peer:disconnected': (peerPubkey: string) => void;
 	/** The real short channel id was assigned once the funding reached announcement depth. */
 	'channel:scid-assigned': (channelId: Buffer, shortChannelId: Buffer) => void;
 	/** A caller-driven v2 open owes its tx_signatures. */
@@ -52,6 +54,12 @@ export interface ChannelManagerEvents {
 		spliceTxid: Buffer,
 		newFundingOutputIndex: number,
 		externalInputIndices: number[]
+	) => void;
+	'splice:negotiated': (
+		channelId: Buffer,
+		compositeId: Buffer,
+		spliceTxid: Buffer,
+		newFundingOutputIndex: number
 	) => void;
 	/** A restored v2 open was rolled back or refused. */
 	'channel:v2-open-disposed': (

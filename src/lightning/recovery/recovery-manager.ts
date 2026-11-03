@@ -386,6 +386,11 @@ export class RecoveryManager {
 					throw new Error('Storage cannot persist FFOR voucher custody');
 				this.storage.saveFforVoucher(mutation.record);
 				break;
+			case 'composite_splice':
+				if (!this.storage.saveCompositeSplice)
+					throw new Error('Storage cannot persist composite splice records');
+				this.storage.saveCompositeSplice(mutation.record);
+				break;
 			case 'channel_state':
 				this.storage.saveChannel(
 					mutation.channelId,

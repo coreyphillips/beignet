@@ -16,6 +16,7 @@
 
 import type { IFforVoucherArchive } from '../ffor/voucher-archive';
 import { validateFforVoucherArchive } from '../ffor/voucher-archive';
+import { validateCompositeSpliceRecord } from '../channel/composite-splice-record';
 import { sha256 } from '../crypto/provider';
 import type {
 	ISerializedChannelState,
@@ -168,6 +169,11 @@ function encodeMutation(
 				type: mutation.type,
 				record: validateFforVoucherArchive(mutation.record)
 			};
+		case 'composite_splice':
+			return {
+				type: mutation.type,
+				record: validateCompositeSpliceRecord(mutation.record)
+			};
 		case 'channel_state':
 			return {
 				type: mutation.type,
@@ -275,6 +281,11 @@ function decodeMutation(encoded: IEncodedMutation): RecoveryMutation {
 			return {
 				type: encoded.type,
 				record: validateFforVoucherArchive(encoded.record)
+			};
+		case 'composite_splice':
+			return {
+				type: encoded.type,
+				record: validateCompositeSpliceRecord(encoded.record)
 			};
 		case 'channel_state':
 			return {

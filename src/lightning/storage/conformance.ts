@@ -26,6 +26,7 @@ import type { IPaymentInfo } from '../node/payment-types';
 import { PaymentDirection, PaymentStatus } from '../node/payment-types';
 import type { IGraphChannel, IGraphNode } from '../gossip/types';
 import type { IFforVoucherArchive } from '../ffor/voucher-archive';
+import type { ICompositeSpliceRecord } from '../channel/composite-splice-record';
 import type { IWatchtowerSession } from '../watchtower/types';
 import { sha256 } from '../crypto/provider';
 import type {
@@ -326,6 +327,47 @@ function fforVoucher(seed: number, withPreimage: boolean): IFforVoucherArchive {
 		voucherExpiry: 800_500,
 		concurrentVersion: 0,
 		...(withPreimage ? { preimage: preimage.toString('hex') } : {})
+	};
+}
+
+function compositeSplice(seed: number): ICompositeSpliceRecord {
+	return {
+		id: hexId(seed),
+		stage: 'PLANNED',
+		channels: [
+			{
+				channelId: hexId(seed + 1),
+				peerPubkey: point(seed + 2).toString('hex'),
+				fundingTxid: hexId(seed + 3),
+				fundingOutputIndex: 0,
+				debitSats: '60000',
+				feeSats: '300',
+				oldCapacitySats: '1000000',
+				newCapacitySats: '939700',
+				inputSerialId: '0',
+				fundingOutputSerialId: '4'
+			},
+			{
+				channelId: hexId(seed + 4),
+				peerPubkey: point(seed + 5).toString('hex'),
+				fundingTxid: hexId(seed + 6),
+				fundingOutputIndex: 1,
+				debitSats: '40000',
+				feeSats: '200',
+				oldCapacitySats: '500000',
+				newCapacitySats: '459800',
+				inputSerialId: '2',
+				fundingOutputSerialId: '6'
+			}
+		],
+		destinationScript: '0014' + bytes(seed + 7, 20).toString('hex'),
+		destinationSerialId: '8',
+		amountSats: '100000',
+		feeSats: '500',
+		feeratePerkw: 1000,
+		locktime: 0,
+		createdAt: 1_700_000_000_000,
+		updatedAt: 1_700_000_000_000
 	};
 }
 
@@ -949,6 +991,39 @@ export function storageConformanceChecks(
 		ensure(
 			throwsError(() => s.saveFforVoucher({ ...bare, amountMsat: '2000000' })),
 			'a save that changes the voucher identity did not throw'
+		);
+	});
+
+	optional('compositeSplices', 'composite splice records round-trip', (s) => {
+		const first = compositeSplice(130);
+		ensure(
+			s.loadCompositeSplice(first.id) === null,
+			'missing composite splice is not null'
+		);
+		s.saveCompositeSplice(first);
+		same(s.loadCompositeSplice(first.id), first, 'loadCompositeSplice');
+		// A stage change replaces the row whole.
+		const released = {
+			...first,
+			stage: 'RELEASED' as const,
+			txid: hexId(131),
+			txHex: 'deadbeef',
+			updatedAt: first.updatedAt + 1
+		};
+		s.saveCompositeSplice(released);
+		same(s.loadCompositeSplice(first.id), released, 'replaced stage');
+		s.saveCompositeSplice(compositeSplice(140));
+		same(s.loadAllCompositeSplices().length, 2, 'loadAllCompositeSplices');
+		s.deleteCompositeSplice(first.id);
+		ensure(s.loadCompositeSplice(first.id) === null, 'deleted record is gone');
+		same(s.loadAllCompositeSplices().length, 1, 'delete leaves the other row');
+		s.deleteCompositeSplice(hexId(199));
+		same(s.loadAllCompositeSplices().length, 1, 'unknown id delete is a no-op');
+		ensure(
+			throwsError(() =>
+				s.saveCompositeSplice({ ...first, stage: 'NOPE' as 'PLANNED' })
+			),
+			'an invalid record was accepted'
 		);
 	});
 

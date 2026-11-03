@@ -12,6 +12,8 @@
 
 import type { IPeerTransportOptions } from '../transport/duplex-transport';
 import type { IFforVoucherArchive } from '../ffor/voucher-archive';
+import type { ICompositeSpliceRecord } from '../channel/composite-splice-record';
+import { validateCompositeSpliceRecord } from '../channel/composite-splice-record';
 import {
 	fforVoucherArchiveId,
 	mergeFforVoucherArchive,
@@ -271,6 +273,7 @@ export class MemoryStorage implements IStorageBackend {
 	private readonly channels = this.table<string, IChannelRow>();
 	private readonly revokedHtlcSnapshots = this.table<string, string>();
 	private readonly fforVouchers = this.table<string, string>();
+	private readonly compositeSplices = this.table<string, string>();
 	private readonly payments = this.table<string, string>();
 	private readonly preimages = this.table<string, string>();
 	private readonly scidMappings = this.table<string, string>();
@@ -514,6 +517,38 @@ export class MemoryStorage implements IStorageBackend {
 		const record = validateFforVoucherArchive(JSON.parse(json));
 		if (fforVoucherArchiveId(record) !== id)
 			throw new Error('FFOR archive row key mismatch');
+		return record;
+	}
+
+	// ─── Composite splice records (issue #1922) ───
+
+	saveCompositeSplice(record: ICompositeSpliceRecord): void {
+		const valid = validateCompositeSpliceRecord(record);
+		this.compositeSplices.put(valid.id, JSON.stringify(valid));
+	}
+
+	loadCompositeSplice(id: string): ICompositeSpliceRecord | null {
+		const json = this.compositeSplices.get(id);
+		return json === undefined ? null : this.decodeCompositeSplice(id, json);
+	}
+
+	loadAllCompositeSplices(): ICompositeSpliceRecord[] {
+		return this.compositeSplices
+			.entries()
+			.sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+			.map(([id, json]) => this.decodeCompositeSplice(id, json));
+	}
+
+	deleteCompositeSplice(id: string): void {
+		this.compositeSplices.delete(id);
+	}
+
+	private decodeCompositeSplice(
+		id: string,
+		json: string
+	): ICompositeSpliceRecord {
+		const record = validateCompositeSpliceRecord(JSON.parse(json));
+		if (record.id !== id) throw new Error('Composite splice row key mismatch');
 		return record;
 	}
 

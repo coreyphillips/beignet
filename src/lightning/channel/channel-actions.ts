@@ -35,7 +35,8 @@ export enum ChannelActionType {
 	SPLICE_REVERTED = 'SPLICE_REVERTED',
 	SPLICE_CONFLICT_REQUEST_READY = 'SPLICE_CONFLICT_REQUEST_READY',
 	TX_SIGNATURES_NEEDED = 'TX_SIGNATURES_NEEDED',
-	SPLICE_TX_SIGNATURES_NEEDED = 'SPLICE_TX_SIGNATURES_NEEDED'
+	SPLICE_TX_SIGNATURES_NEEDED = 'SPLICE_TX_SIGNATURES_NEEDED',
+	SPLICE_TX_NEGOTIATED = 'SPLICE_TX_NEGOTIATED'
 }
 
 export interface ISendMessageAction {
@@ -388,6 +389,23 @@ export interface ISpliceTxSignaturesNeededAction {
 }
 
 /**
+ * A composite splice session (issue #1922) finished its interactive
+ * negotiation and audited the result, but is holding its splice
+ * commitment_signed: the node compares this txid with the other sessions'
+ * and releases every commitment (releaseCompositeSpliceCommitment) only once
+ * they all agree, or aborts them all.
+ */
+export interface ISpliceTxNegotiatedAction {
+	type: ChannelActionType.SPLICE_TX_NEGOTIATED;
+	channelId: Buffer;
+	/** The composite operation this session belongs to. */
+	compositeId: Buffer;
+	/** Negotiated txid in tx.getHash() internal byte order. */
+	spliceTxid: Buffer;
+	newFundingOutputIndex: number;
+}
+
+/**
  * Wire messages BOLT 2 can require us to retransmit after a reconnect, and so
  * the ones worth retaining byte-exactly in the recovery outbox
  * (docs/RECOVERY-PROTOCOL.md 5.2). Anything outside this set is either
@@ -635,4 +653,5 @@ export type ChannelAction =
 	| ISpliceRevertedAction
 	| ISpliceConflictRequestReadyAction
 	| ITxSignaturesNeededAction
-	| ISpliceTxSignaturesNeededAction;
+	| ISpliceTxSignaturesNeededAction
+	| ISpliceTxNegotiatedAction;

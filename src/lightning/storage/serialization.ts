@@ -676,6 +676,7 @@ export interface ISerializedSpliceInFlight {
 	remoteRelativeSatoshis: string;
 	remoteFundingPubkey: string;
 	ourSharedInputSig: string;
+	remoteSharedInputSig?: string;
 	ourWalletWitnesses: string[][];
 	ourWalletInputIndices: number[];
 	// Issue #592: tx-input indices of externally owned splice inputs whose
@@ -718,6 +719,7 @@ export function serializeSpliceInFlight(
 		remoteRelativeSatoshis: bigintToStr(f.remoteRelativeSatoshis),
 		remoteFundingPubkey: f.remoteFundingPubkey.toString('hex'),
 		ourSharedInputSig: f.ourSharedInputSig.toString('hex'),
+		remoteSharedInputSig: f.remoteSharedInputSig?.toString('hex'),
 		ourWalletWitnesses: f.ourWalletWitnesses.map((w) =>
 			w.map((b) => b.toString('hex'))
 		),
@@ -758,6 +760,10 @@ export function deserializeSpliceInFlight(
 		remoteRelativeSatoshis: strToBigint(s.remoteRelativeSatoshis),
 		remoteFundingPubkey: Buffer.from(s.remoteFundingPubkey, 'hex'),
 		ourSharedInputSig: Buffer.from(s.ourSharedInputSig, 'hex'),
+		remoteSharedInputSig:
+			s.remoteSharedInputSig !== undefined
+				? Buffer.from(s.remoteSharedInputSig, 'hex')
+				: undefined,
 		ourWalletWitnesses: s.ourWalletWitnesses.map((w) =>
 			w.map((h) => Buffer.from(h, 'hex'))
 		),

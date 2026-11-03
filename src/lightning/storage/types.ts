@@ -7,6 +7,7 @@
 
 import type { IPeerTransportOptions } from '../transport/duplex-transport';
 import type { IFforVoucherArchive } from '../ffor/voucher-archive';
+import type { ICompositeSpliceRecord } from '../channel/composite-splice-record';
 import type { IChannelState } from '../channel/channel-state';
 import type { IPaymentInfo } from '../node/payment-types';
 import type { IChainMonitorState } from '../chain/chain-monitor';
@@ -192,6 +193,21 @@ export interface IFforStorage {
 	saveFforVoucher(record: IFforVoucherArchive): void;
 	loadFforVoucher(id: string): IFforVoucherArchive | null;
 	loadAllFforVouchers(): IFforVoucherArchive[];
+}
+
+/**
+ * Composite splice-out records (issue #1922, docs/MULTI-CHANNEL-SPLICE-OUT.md
+ * section 5): one row per operation, keyed by its id, replaced whole at every
+ * stage change. Written through the `composite_splice` recovery mutation so
+ * a stage rides the channel transaction that causes it. Required for a node
+ * to start a composite splice; absent, the feature is refused.
+ */
+export interface ICompositeSpliceStorage {
+	saveCompositeSplice(record: ICompositeSpliceRecord): void;
+	loadCompositeSplice(id: string): ICompositeSpliceRecord | null;
+	loadAllCompositeSplices(): ICompositeSpliceRecord[];
+	/** Drop a terminal record past its retention window; unknown ids are no-ops. */
+	deleteCompositeSplice(id: string): void;
 }
 
 /**
@@ -519,6 +535,7 @@ export interface IOfferStorage {
  */
 export interface IStorageCapabilities {
 	ffor: IFforStorage;
+	compositeSplices: ICompositeSpliceStorage;
 	invoicePathIds: IInvoicePathIdStorage;
 	announcedPeerAddresses: IAnnouncedPeerAddressStorage;
 	channelKeyIndexHistory: IChannelKeyIndexHistoryStorage;
@@ -548,6 +565,7 @@ export type StorageCapability = keyof IStorageCapabilities;
 export interface IStorageBackend
 	extends IStorageCore,
 		Partial<IFforStorage>,
+		Partial<ICompositeSpliceStorage>,
 		Partial<IInvoicePathIdStorage>,
 		Partial<IAnnouncedPeerAddressStorage>,
 		Partial<IChannelKeyIndexHistoryStorage>,

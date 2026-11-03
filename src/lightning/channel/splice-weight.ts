@@ -55,6 +55,12 @@ export function estimateSpliceTxWeight(opts: {
 	 * each SHARED_FUNDING_INPUT_WEIGHT. Default 0.
 	 */
 	fundingInputCount?: number;
+	/**
+	 * 2-of-2 funding outputs besides this channel's own: the other channels'
+	 * new funding outputs in a composite splice (issue #1922), each a 34-byte
+	 * P2WSH output. Default 0.
+	 */
+	fundingOutputCount?: number;
 	fundingScriptLen?: number;
 	changeScriptLen?: number;
 	destinationScriptLen?: number;
@@ -64,6 +70,7 @@ export function estimateSpliceTxWeight(opts: {
 		SHARED_FUNDING_INPUT_WEIGHT +
 		opts.walletInputCount * P2WPKH_INPUT_WEIGHT +
 		(opts.fundingInputCount ?? 0) * SHARED_FUNDING_INPUT_WEIGHT +
+		(opts.fundingOutputCount ?? 0) * outputWeight(34) +
 		outputWeight(opts.fundingScriptLen ?? 34);
 	if (opts.changeScriptLen !== undefined) {
 		weight += outputWeight(opts.changeScriptLen);

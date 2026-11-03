@@ -10,4 +10,5 @@ export * from './zero-conf';
 export * from './quiescence';
 export * from './splice';
 export * from './splice-weight';
+export * from './composite-splice-record';
 export * from './dual-funding';
