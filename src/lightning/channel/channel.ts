@@ -6961,10 +6961,36 @@ export class Channel {
 	 * Retain the opener's funding tx with the channel state before
 	 * funding_created goes out, so the frame that records funding_signed
 	 * carries the bytes. A candidate only: nothing may broadcast it until the
-	 * authorization action.
+	 * authorization action. The same bytes become the channel's durable
+	 * `fundingTxHex`, which outlives the broadcast obligation.
 	 */
 	retainFundingPayload(txHex: string): void {
 		this._state.pendingFundingTxHex = txHex;
+		this._state.fundingTxHex = txHex;
+	}
+
+	/**
+	 * Record the funding transaction's bytes for a channel that lacks them
+	 * (issue #1922, step 5a). Refused, returning false, unless the hex parses
+	 * to the transaction whose hash is the current funding txid and that has
+	 * an output at the funding index: a composite splice would otherwise hand
+	 * a peer a prev_tx that does not create the outpoint it spends. Returns
+	 * true only when this call set or changed the field.
+	 */
+	setFundingTxHex(txHex: string): boolean {
+		if (!this._state.fundingTxid) return false;
+		let tx: import('bitcoinjs-lib').Transaction;
+		try {
+			tx = bitcoin.Transaction.fromHex(txHex);
+		} catch {
+			return false;
+		}
+		if (!tx.getHash().equals(this._state.fundingTxid)) return false;
+		if (this._state.fundingOutputIndex >= tx.outs.length) return false;
+		const hex = tx.toHex();
+		if (this._state.fundingTxHex === hex) return false;
+		this._state.fundingTxHex = hex;
+		return true;
 	}
 
 	/**
@@ -16174,6 +16200,24 @@ export class Channel {
 				];
 			}
 		}
+		// The adopted funding's own bytes (issue #1922, step 5a): a later
+		// composite splice spends this outpoint as an ordinary input and needs
+		// the whole transaction as prev_tx. Only a real swap writes the field,
+		// and only from a record holding every witness; a force-close adoption
+		// of a half-signed record leaves it for the chain to fill
+		// (LightningNode.getFundingTxHex).
+		if (
+			fields.fundingTxid &&
+			this._state.fundingTxid &&
+			!fields.fundingTxid.equals(this._state.fundingTxid)
+		) {
+			fields.fundingTxHex =
+				record?.fullySigned &&
+				record.spliceTxHex &&
+				record.spliceTxid.equals(fields.fundingTxid)
+					? record.spliceTxHex
+					: undefined;
+		}
 		fields.spliceInFlight = null;
 		return fields;
 	}
@@ -18578,6 +18622,7 @@ export class Channel {
 		const assembled = this._assembleV2FundingTx();
 		if (!assembled) return false;
 		this._state.pendingFundingTxHex = assembled.toString('hex');
+		this._state.fundingTxHex = this._state.pendingFundingTxHex;
 		this._syncV2InFlight({
 			receivedTxSignatures: true,
 			fullySigned: true,
@@ -21555,7 +21600,8 @@ export class Channel {
 				: null,
 			// A v2 opening commitment (#0) carries no HTLCs.
 			remoteHtlcSignatures: [],
-			pendingFundingTxHex: undefined
+			pendingFundingTxHex: undefined,
+			fundingTxHex: adopted.fullySigned ? adopted.fundingTxHex : undefined
 		};
 		// The amounts this attempt's commitment was signed at; absent on
 		// records predating per-attempt contributions, whose amounts are the
@@ -21619,6 +21665,7 @@ export class Channel {
 		this._state.pendingFundingTxHex = record.fullySigned
 			? record.fundingTxHex
 			: undefined;
+		this._state.fundingTxHex = this._state.pendingFundingTxHex;
 		this.restoreV2InFlight();
 		this._state.state = this._v2StateForRecord(record);
 	}
@@ -21670,6 +21717,7 @@ export class Channel {
 		this._state.pendingFundingTxHex = adopted.fullySigned
 			? adopted.fundingTxHex
 			: undefined;
+		this._state.fundingTxHex = this._state.pendingFundingTxHex;
 		this.restoreV2InFlight();
 		this._state.state = ChannelState.AWAITING_FUNDING_CONFIRMED;
 		const actions: ChannelAction[] = [

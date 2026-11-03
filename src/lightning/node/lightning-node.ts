@@ -12921,6 +12921,39 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	}
 
 	/**
+	 * The transaction that created a channel's current funding outpoint, as
+	 * hex (issue #1922, step 5a). Channels opened or spliced since the field
+	 * existed carry it in their state; for one that does not (a v1 fundee, a
+	 * channel from before the field, a force-close adoption of a half-signed
+	 * splice) the chain backend is asked once, the bytes are checked against
+	 * the funding txid and output index, written to the channel and
+	 * persisted. Null when the channel is unknown, has no funding txid yet,
+	 * or the backend is missing, fails or returns a different transaction;
+	 * nothing is thrown, since a caller planning a composite splice treats
+	 * null as "this channel cannot take part".
+	 * @param channelId - 32-byte channel ID
+	 */
+	async getFundingTxHex(channelId: Buffer): Promise<string | null> {
+		const cidErr = validateBuffer(channelId, 32, 'channelId');
+		if (cidErr) throw new Error(cidErr);
+		const channel = this.channelManager.getChannel(channelId);
+		if (!channel) return null;
+		const state = channel.getFullState();
+		if (state.fundingTxHex) return state.fundingTxHex;
+		if (!state.fundingTxid || !this._chainBackend) return null;
+		const txidHex = Buffer.from(state.fundingTxid).reverse().toString('hex');
+		let raw: Buffer;
+		try {
+			raw = await this._chainBackend.getTransaction(txidHex);
+		} catch {
+			return null;
+		}
+		if (!channel.setFundingTxHex(raw.toString('hex'))) return null;
+		this.persistChannel(channelId);
+		return channel.getFullState().fundingTxHex ?? null;
+	}
+
+	/**
 	 * The negotiated funding transaction of an in-flight dual-funded open,
 	 * with the data a third-party input owner needs to sign its input (issue
 	 * #612): the v2 twin of getPendingSpliceTx. Null while the interactive

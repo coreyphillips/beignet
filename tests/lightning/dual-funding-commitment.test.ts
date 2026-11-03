@@ -544,6 +544,22 @@ describe('Dual Funding v2 commitment_signed exchange (e2e, real keys)', () => {
 			ChannelState.AWAITING_FUNDING_CONFIRMED
 		);
 
+		// ── Both hold the fully signed funding transaction for the channel's
+		//    life (issue #1922 step 5a), beside the broadcast obligation ──
+		for (const ch of [h.opener, h.acceptor]) {
+			const st = ch.getFullState();
+			expect(st.fundingTxHex, 'durable funding hex').to.equal(
+				st.v2InFlight!.fundingTxHex
+			);
+			expect(st.fundingTxHex).to.equal(st.pendingFundingTxHex);
+			expect(
+				bitcoin.Transaction.fromHex(st.fundingTxHex!)
+					.getHash()
+					.equals(st.fundingTxid!),
+				'the hex is the transaction that created the funding'
+			).to.equal(true);
+		}
+
 		// ── Both derived the SAME channel id and funding txid ──
 		const openerChanId = h.opener.getChannelId()!;
 		const acceptorChanId = h.acceptor.getChannelId()!;

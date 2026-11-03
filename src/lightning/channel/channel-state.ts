@@ -306,6 +306,20 @@ export interface IChannelState {
 	 */
 	pendingFundingTxHex?: string;
 	/**
+	 * The transaction that created the CURRENT funding outpoint, complete with
+	 * witnesses, kept for the channel's life (issue #1922, step 5a). Unlike
+	 * `pendingFundingTxHex` it carries no obligation: nothing broadcasts it
+	 * and nothing retires it at confirmation. Set when the funding is built
+	 * (v1 funder) or fully signed (v2, both roles), replaced when a splice is
+	 * adopted; absent on a v1 fundee, on channels from before the field
+	 * existed and on a force-close adoption whose splice record lacked the
+	 * peer's witnesses. `LightningNode.getFundingTxHex` fills those from the
+	 * chain. A composite splice spends another channel's funding as an
+	 * ordinary input, and `tx_add_input` needs the whole previous
+	 * transaction, which a txid cannot reproduce.
+	 */
+	fundingTxHex?: string;
+	/**
 	 * Block height at which the funding transaction was FIRST observed absent
 	 * from mempool and chain, or unset while it is present.
 	 *
