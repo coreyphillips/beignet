@@ -15,7 +15,10 @@
 import { expect } from 'chai';
 import crypto from 'crypto';
 import * as bitcoin from 'bitcoinjs-lib';
-import { createOpenerState } from '../../src/lightning/channel/channel-state';
+import {
+	createOpenerState,
+	IChannelState
+} from '../../src/lightning/channel/channel-state';
 import {
 	ChannelState,
 	DEFAULT_CHANNEL_CONFIG
@@ -212,10 +215,7 @@ describe('Durable funding transaction bytes (issue #1922 step 5a)', function () 
 			return channelId;
 		}
 
-		const stateOf = (
-			n: LightningNode,
-			id: Buffer
-		): ReturnType<ReturnType<LightningNode['getRawChannel']>['getFullState']> =>
+		const stateOf = (n: LightningNode, id: Buffer): Readonly<IChannelState> =>
 			n.getRawChannel(id)!.getFullState();
 
 		it('fetches the bytes once, checks them, persists them and serves them from state after', async function () {
