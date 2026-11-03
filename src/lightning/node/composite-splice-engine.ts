@@ -180,6 +180,8 @@ interface IActiveChannel {
 	peerSigned: boolean;
 	completed: boolean;
 	aborted: boolean;
+	/** The manager said this channel is closing, errored or reverted. */
+	left: boolean;
 }
 
 interface IActive {
@@ -958,7 +960,8 @@ export class CompositeSpliceEngine {
 				negotiatedTxid: null,
 				peerSigned: false,
 				completed: false,
-				aborted: false
+				aborted: false,
+				left: false
 			});
 		}
 		outputs.push({
@@ -1374,11 +1377,15 @@ export class CompositeSpliceEngine {
 		const active = this.active;
 		if (!active) return;
 		const hex = channelId.toString('hex');
-		if (!active.channels.has(hex)) return;
+		const entry = active.channels.get(hex);
+		if (!entry) return;
 		if (!compositeSpliceStageAtLeast(active.record.stage, 'RELEASED')) {
 			this.abortAll(active, `session ${hex.slice(0, 12)} left before release`);
 			return;
 		}
+		// Remembered, so the verdict does not depend on the state the channel
+		// shows at the moment the event fires.
+		entry.left = true;
 		this.maybeSettled(active);
 	};
 
@@ -1390,6 +1397,11 @@ export class CompositeSpliceEngine {
 		if (this.active !== active) return;
 		if (!compositeSpliceStageAtLeast(active.record.stage, 'RELEASED')) return;
 		const txid = active.record.txid;
+		let pending = false;
+		// Every channel is looked at: one that left ends the composite even
+		// when another is still waiting for its lock (the map order follows
+		// the funding outpoints, so stopping at the first pending channel
+		// would make the verdict depend on which channel sorts first).
 		for (const [hex, entry] of active.channels) {
 			if (entry.completed) continue;
 			const state = entry.channel.getFullState();
@@ -1410,6 +1422,7 @@ export class CompositeSpliceEngine {
 				continue;
 			}
 			const gone =
+				entry.left ||
 				live === ChannelState.SHUTTING_DOWN ||
 				live === ChannelState.NEGOTIATING_CLOSING ||
 				live === ChannelState.CLOSED ||
@@ -1433,8 +1446,9 @@ export class CompositeSpliceEngine {
 				this.prune();
 				return;
 			}
-			return; // still pending its lock
+			pending = true;
 		}
+		if (pending) return;
 		const record = this.setStage(active, 'LOCKED');
 		this.active = null;
 		this.deps.withMutations([{ type: 'composite_splice', record }], standalone);
@@ -1495,7 +1509,8 @@ export class CompositeSpliceEngine {
 				peerSigned: !!inflight?.remoteSharedInputSig,
 				// maybeSettled reads the channel's state for the rest.
 				completed: false,
-				aborted: false
+				aborted: false,
+				left: false
 			});
 		}
 		if (channels.size === 0) return null;
