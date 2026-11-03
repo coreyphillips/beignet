@@ -346,10 +346,12 @@ export class OfflineReceive {
 	 * Whether a direct-funded request could be created at this peer: the
 	 * payer has to be told where to reach the peer's relay, so an address must
 	 * be known for it, from the primaries list, from the direct-funding policy
-	 * when it names this peer, or from the TCP connection the peer is up on.
-	 * The create-time rule of `directFunding`, applied before a steered quote
-	 * binds a peer the create would then refuse. The coordinator never dials,
-	 * so a candidate that is not connected is passed over by `route`.
+	 * when it names this peer, or from the TCP dial this node last reached it
+	 * by. The address a peer that dialed us is up on is no use: its port is
+	 * the ephemeral source port of its socket. The create-time rule of
+	 * `directFunding`, applied before a steered quote binds a peer the create
+	 * would then refuse. The coordinator never dials, so a candidate that is
+	 * not connected is passed over by `route`.
 	 */
 	private directFundingEligible(peer: string): void {
 		const config = this.node.getDirectFundingConfig();
@@ -370,12 +372,12 @@ export class OfflineReceive {
 						...(stored.uri !== null ? { uri: stored.uri } : {})
 				  }
 				: undefined,
-			this.node.listPeers().find((p) => p.pubkey === peer)
+			this.node.getPeerAddress(peer)
 		);
 		if (!address)
 			fail(
 				'RECEIVE_UNAVAILABLE',
-				'No address is known for this peer. Connect to it over TCP, or store its host and port with the primaries, before creating this payment request.'
+				'No address is known for this peer. Dial it over TCP, or store its host and port with the primaries, before creating this payment request.'
 			);
 	}
 
@@ -497,8 +499,9 @@ export class OfflineReceive {
 	 * operator set it, because moving the inbound target, the zero-conf trust,
 	 * the splice switches or the liquidity relationship behind their back is a
 	 * change nobody asked for. With no policy yet, the first request still
-	 * configures one for its peer, on the address it is connected on: that is
-	 * the peer a request naming no peer and no primaries falls back to.
+	 * configures one for its peer, at the TCP address this node dialed it at
+	 * when there is one: that is the peer a request naming no peer and no
+	 * primaries falls back to.
 	 */
 	private directFunding(
 		body: { requestId: string; amountSats: number },
@@ -507,12 +510,17 @@ export class OfflineReceive {
 	): OfflineReceiveResult {
 		this.directFundingEligible(peer);
 		if (!this.node.getDirectFundingConfig().lspPubkey) {
-			const entry = this.node.listPeers().find((p) => p.pubkey === peer);
-			if (entry?.host && entry.port)
+			// The policy outlives this request and a later unbound request takes
+			// its relay from it, so only an address a payer could dial is
+			// written: the one the request itself uses when the primaries store
+			// none, and nothing at all for a peer up over ws or iroh, or one that
+			// dialed us, whose listed port is its socket's source port.
+			const dialed = relayAddressOf(undefined, this.node.getPeerAddress(peer));
+			if (dialed)
 				this.node.configureDirectFunding({
 					lspPubkey: peer,
-					lspHost: entry.host,
-					lspPort: entry.port
+					lspHost: dialed.host,
+					lspPort: dialed.port
 				});
 		}
 		const minted = this.node.createDirectFundingRequest({

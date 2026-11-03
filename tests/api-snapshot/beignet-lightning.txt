@@ -5660,6 +5660,7 @@ method node.LightningNode.getOnionMessageManager(): onionMessage.OnionMessageMan
 method node.LightningNode.getOutgoingHtlcs(paymentHash: Buffer): node.IOutgoingPaymentResolution
 method node.LightningNode.getPayment(paymentHash: Buffer): node.IPaymentInfo | undefined
 method node.LightningNode.getPaymentProof(paymentHash: Buffer): node.IPaymentProof | null
+method node.LightningNode.getPeerAddress(pubkey: string): { host: string; port: number; transport?: transport.IPeerTransportOptions; } | undefined
 method node.LightningNode.getPeerManager(): transport.PeerManager | null
 method node.LightningNode.getPendingSpliceTx(channelId: Buffer): ReturnType<channel.Channel['getPendingSpliceTx']>
 method node.LightningNode.getPendingV2FundingTx(channelId: Buffer): ReturnType<channel.Channel['getPendingV2FundingTx']>

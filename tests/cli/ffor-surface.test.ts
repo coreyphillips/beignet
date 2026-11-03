@@ -1337,6 +1337,11 @@ describe('automatic receive falls back to direct funding', function () {
 		// talks to the peer in this mode, which is the point of the fallback.
 		peers = [{ pubkey: lsp, host: '10.0.0.7', port: 9736, state: 'ready' }];
 		sinon.stub(daemon.node, 'listPeers').callsFake(() => peers);
+		// Every peer here was dialed by this node, at the address it is listed on.
+		sinon.stub(daemon.node, 'getPeerAddress').callsFake((pubkey: string) => {
+			const p = peers.find((e) => e.pubkey === pubkey);
+			return p ? { host: p.host, port: p.port } : undefined;
+		});
 	});
 
 	after(async function () {
@@ -1397,8 +1402,8 @@ describe('automatic receive falls back to direct funding', function () {
 		expect(env.amountSat).to.equal(120_000n);
 		expect(env.receiptHash.toString('hex')).to.equal(result.paymentHash);
 
-		// Direct funding now points at this peer, on the address it is connected
-		// on, with every other setting left at its default.
+		// Direct funding now points at this peer, at the address this node dialed
+		// it at, with every other setting left at its default.
 		const config = await request(port, 'GET', '/direct-funding/config');
 		expect(config.body.result).to.deep.equal({
 			lspPubkey: lsp,

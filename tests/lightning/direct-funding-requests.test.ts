@@ -167,6 +167,23 @@ describe('Direct funding: outstanding requests', () => {
 		expect(second.store.byReceiptHash(record.receiptHash)).to.equal(null);
 	});
 
+	it('reads a restored bound peer lower-case, however the row spells it', () => {
+		const first = harness();
+		const peer = '02' + 'ab'.repeat(32);
+		const record = first.store.mint({ liquidityPeer: peer });
+		const rows = JSON.parse(first.wallet.get(DF_REQUESTS_STORAGE_KEY)!);
+		rows[0].liquidityPeer = peer.toUpperCase();
+		first.wallet.set(DF_REQUESTS_STORAGE_KEY, JSON.stringify(rows));
+
+		const second = harness({}, { wallet: first.wallet, clock: first.clock });
+		// The receiver matches the bound peer against its channels' peer hex: an
+		// upper-case one would open a second channel instead of splicing.
+		expect(second.store.restore()).to.equal(1);
+		expect(
+			second.store.byReceiptHash(record.receiptHash)?.liquidityPeer
+		).to.equal(peer);
+	});
+
 	it('restores across a restart with both indexes rebuilt', () => {
 		const first = harness();
 		const record = first.store.mint();

@@ -101,14 +101,15 @@ opens a channel to obtain inbound liquidity.
 - A direct-funding request is bound to the peer it was quoted at (issue
   #1922): the envelope's relay descriptors name that peer, at the address the
   primaries list stores for it, else the policy's address for it, else the
-  one it is connected on, and the receiver negotiates the funding with that
-  peer when the offer arrives, whatever `/direct-funding/config` names by
+  one this node dialed it at (never the far end of a connection the peer
+  opened, whose port is ephemeral), and the receiver negotiates the funding
+  with that peer when the offer arrives, whatever `/direct-funding/config` names by
   then. An existing config is left exactly as the operator set it whichever
   peer it names, so `targetInboundSat`, `trusted` and the splice switches
   survive and the node's liquidity relationship is never retargeted behind
   their back. With no config yet, the first such request still configures the
-  node for its peer, on the host and port it is connected on, with every other
-  setting at its default: that is the peer a `POST /direct-funding/request`
+  node for its peer, at the TCP address this node dialed it at when there is
+  one, with every other setting at its default: that is the peer a `POST /direct-funding/request`
   naming no peer falls back to when no primaries are configured. A peer with
   no known address refuses with `RECEIVE_UNAVAILABLE`, and a steered quote
   passes such a primary over.

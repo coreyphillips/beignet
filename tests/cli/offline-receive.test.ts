@@ -53,6 +53,8 @@ type Peer = {
 	port: number;
 	state: string;
 	transport?: 'tcp' | 'ws' | 'iroh';
+	/** The peer dialed us: never dialed back, so its listed port is its socket's. */
+	inbound?: boolean;
 };
 type Json = Record<string, unknown>;
 type Failure = Error & { code?: string };
@@ -121,6 +123,9 @@ function fixture(overrides: Json = {}, opts: Opts = {}): any {
 		...(opts.config ?? {})
 	};
 	const configured: Json[] = [];
+	const peerList: Peer[] = opts.peers ?? [
+		{ pubkey: peer, host: 'lsp.example', port: 9735, state: 'ready' }
+	];
 	/** Every direct-funding request this coordinator had the node mint. */
 	const mints: Json[] = [];
 	/** Every op this coordinator put on the wire toward the peer. */
@@ -129,10 +134,19 @@ function fixture(overrides: Json = {}, opts: Opts = {}): any {
 	const node: Json = {
 		fforConcurrentNegotiated: () => false,
 		listChannels: () => channels,
-		listPeers: () =>
-			opts.peers ?? [
-				{ pubkey: peer, host: 'lsp.example', port: 9735, state: 'ready' }
-			],
+		listPeers: () => peerList,
+		// What this node dialed the peer at: its listed address unless it came
+		// to us, in which case nothing (see Peer.inbound).
+		getPeerAddress: (pubkey: string) => {
+			const entry = peerList.find((p) => p.pubkey === pubkey && !p.inbound);
+			return entry
+				? {
+						host: entry.host,
+						port: entry.port,
+						...(entry.transport ? { transport: entry.transport } : {})
+				  }
+				: undefined;
+		},
 		getInfo: () => ({ blockHeight: 800000 }),
 		fforEpochs: () => epochs,
 		fforEpoch: (id: string) => epochs.find((e) => e.channelId === id),
@@ -811,6 +825,33 @@ describe('receive steered through the primaries (issue #1922)', () => {
 		assert.match(quote.skipped[0].message, /No address is known/);
 	});
 
+	it("passes over a primary that dialed us, whose listed port is its socket's source port", async () => {
+		// The first primary is up, but it connected to this node: nothing was
+		// ever dialed, so the port listed for it is ephemeral and no payer could
+		// reach a relay there. The second was dialed, at its listening port.
+		const f = fixture(
+			{},
+			{
+				jobs: [],
+				peers: [
+					{ ...ready(otherPeer), host: '10.0.0.5', port: 54123, inbound: true },
+					ready(peer)
+				],
+				primaries: [{ pubkey: otherPeer }, { pubkey: peer }]
+			}
+		);
+		const quote = await f.coordinator.quote(undefined, 20000);
+		assert.equal(quote.mode, 'direct-funding');
+		assert.equal(quote.peer, peer);
+		assert.deepEqual(
+			quote.skipped.map((s: Json) => [s.pubkey, s.stage, s.code]),
+			[[otherPeer, 'attempt', 'RECEIVE_UNAVAILABLE']]
+		);
+		const created = await f.coordinator.create(body(quote));
+		assert.equal(created.peer, peer);
+		assert.deepEqual(f.mints, [{ amountSats: 20000, lspPubkey: peer }]);
+	});
+
 	it('takes the relay address stored with the primary when the connection has none', async () => {
 		const f = fixture(
 			{},
@@ -825,7 +866,8 @@ describe('receive steered through the primaries (issue #1922)', () => {
 		const created = await f.coordinator.create(body(quote));
 		assert.equal(created.kind, 'direct-funding');
 		assert.deepEqual(f.mints, [{ amountSats: 20000, lspPubkey: peer }]);
-		// No policy was written: the connection names no address to write.
+		// No policy was written: this node never dialed the peer, so there is
+		// no address to write.
 		assert.deepEqual(f.configured, []);
 		assert.equal(f.config.lspPubkey, null);
 	});
@@ -1129,6 +1171,63 @@ describe('receive request creation', () => {
 		);
 		assert.equal(f.minted, 0);
 		assert.equal(f.coordinator.status().requests.length, 0);
+	});
+
+	it('writes no policy for a peer up over ws whose relay the primaries store (issue #1922)', async () => {
+		// The request is fine: its relay is the address stored with the primary.
+		// The policy is not written, since an unbound request later would take
+		// its relay from there and a ws address is no use to a payer.
+		const f = fixture(
+			{},
+			{
+				jobs: [],
+				peers: [
+					{
+						pubkey: peer,
+						host: 'ws.example',
+						port: 443,
+						state: 'ready',
+						transport: 'ws'
+					}
+				],
+				primaries: [{ pubkey: peer, host: 'relay.example', port: 9737 }]
+			}
+		);
+		const quote = await f.coordinator.quote(peer, 20000);
+		const created = await f.coordinator.create(body(quote), peer);
+		assert.equal(created.kind, 'direct-funding');
+		assert.deepEqual(f.mints, [{ amountSats: 20000, lspPubkey: peer }]);
+		assert.deepEqual(f.configured, []);
+		assert.equal(f.config.lspPubkey, null);
+	});
+
+	it('refuses a peer that dialed us when nothing stores its address', async () => {
+		const f = fixture(
+			{},
+			{
+				jobs: [],
+				peers: [
+					{
+						pubkey: peer,
+						host: '10.0.0.5',
+						port: 54123,
+						state: 'ready',
+						inbound: true
+					}
+				]
+			}
+		);
+		const quote = await f.coordinator.quote(peer, 20000);
+		await assert.rejects(
+			f.coordinator.create(body(quote), peer),
+			(e: Failure) => {
+				assert.equal(e.code, 'RECEIVE_UNAVAILABLE');
+				assert.match(e.message, /No address is known/);
+				return true;
+			}
+		);
+		assert.deepEqual(f.configured, []);
+		assert.equal(f.minted, 0);
 	});
 
 	it('is idempotent on requestId while the request lives, and replaces it once expired', async () => {

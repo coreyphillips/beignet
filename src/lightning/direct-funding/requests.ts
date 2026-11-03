@@ -162,6 +162,11 @@ export class DirectFundingRequestStore {
 				dropped++;
 				continue;
 			}
+			// Stored lower-case by mint, and read the same way from a row edited
+			// by hand: the receiver matches the bound peer against its channels'
+			// peer hex, and a case mismatch would open a second channel.
+			if (entry.liquidityPeer !== undefined)
+				entry.liquidityPeer = entry.liquidityPeer.toLowerCase();
 			// The strip comes FIRST: a row whose only claim on life is a marker
 			// that did not come back intact has no funding to answer for.
 			if (stripMalformedAttempt(entry)) stripped = true;

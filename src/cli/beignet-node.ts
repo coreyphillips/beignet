@@ -1572,6 +1572,22 @@ function requirePositiveSafeInteger(value: unknown, field: string): number {
 }
 
 /**
+ * Refuse an `lspPubkey` option that is not a compressed public key. The type
+ * is checked before the pattern: a regex alone reads an array holding one
+ * key as its string form and passes it, and the first `.toLowerCase()` on it
+ * then surfaces as a server error instead of INVALID_PARAMS.
+ */
+function checkLspPubkey(value: unknown): void {
+	if (value === undefined) return;
+	if (typeof value !== 'string' || !/^0[23][0-9a-fA-F]{64}$/.test(value)) {
+		throw new BeignetError(
+			BeignetErrorCode.INVALID_PARAMS,
+			'lspPubkey must be a 33-byte compressed public key (66 hex chars)'
+		);
+	}
+}
+
+/**
  * A satoshi amount that may legitimately be nothing: a fee ceiling of zero
  * ("route for free or fail"), an invoice with no amount, a push of nothing.
  * Everything else requirePositiveSafeInteger refuses is refused here too.
@@ -8174,6 +8190,24 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	}
 
 	/**
+	 * The address this node last dialed a peer at, if it ever did, and the
+	 * transport it used. A peer that only ever connected inbound has none:
+	 * `listPeers` then shows the far end of its socket, whose port is
+	 * ephemeral, so this is what to consult for an address others can dial.
+	 */
+	getPeerAddress(
+		pubkey: string
+	): Pick<PeerInfo, 'host' | 'port' | 'transport'> | undefined {
+		const addr = this.node.getPeerAddress(pubkey);
+		if (!addr) return undefined;
+		return {
+			host: addr.host,
+			port: addr.port,
+			...(addr.transport ? { transport: addr.transport.type } : {})
+		};
+	}
+
+	/**
 	 * Start a p2p gossip sync with one peer, logging rather than throwing on
 	 * failure. The automatic connect-time path routes through here, deferred
 	 * behind _initialGossipPrime while the boot RGS attempt is in flight.
@@ -9804,15 +9838,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 		 */
 		timeoutMs?: number;
 	}): Promise<JitInvoiceInfo> {
-		if (
-			opts.lspPubkey !== undefined &&
-			!/^0[23][0-9a-fA-F]{64}$/.test(opts.lspPubkey)
-		) {
-			throw new BeignetError(
-				BeignetErrorCode.INVALID_PARAMS,
-				'lspPubkey must be a 33-byte compressed public key (66 hex chars)'
-			);
-		}
+		checkLspPubkey(opts.lspPubkey);
 		if (
 			opts.feeMode !== undefined &&
 			opts.feeMode !== 'skim' &&
@@ -10081,15 +10107,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 				`unpairedSpliceDepth must be an integer between 1 and ${DF_UNPAIRED_SPLICE_DEPTH_MAX}`
 			);
 		}
-		if (
-			update.lspPubkey !== undefined &&
-			!/^0[23][0-9a-fA-F]{64}$/.test(update.lspPubkey)
-		) {
-			throw new BeignetError(
-				BeignetErrorCode.INVALID_PARAMS,
-				'lspPubkey must be a 33-byte compressed public key (66 hex chars)'
-			);
-		}
+		checkLspPubkey(update.lspPubkey);
 		if (update.lspPort !== undefined) {
 			if (
 				!Number.isInteger(update.lspPort) ||
@@ -10277,15 +10295,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 		/** Steered only: the budget for the whole walk, in ms (default 18 s). */
 		timeoutMs?: number;
 	}): Promise<JitQuoteInfo> {
-		if (
-			opts.lspPubkey !== undefined &&
-			!/^0[23][0-9a-fA-F]{64}$/.test(opts.lspPubkey)
-		) {
-			throw new BeignetError(
-				BeignetErrorCode.INVALID_PARAMS,
-				'lspPubkey must be a 33-byte compressed public key (66 hex chars)'
-			);
-		}
+		checkLspPubkey(opts.lspPubkey);
 		const amountSats =
 			opts.amountSats !== undefined && opts.amountSats !== 0
 				? requireNonNegativeSafeInteger(opts.amountSats, 'amountSats')
@@ -10529,10 +10539,10 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	 *
 	 * `lspPubkey` names the peer the funding is negotiated with (issue #1922):
 	 * the envelope's relay descriptors name it, at the address the primaries
-	 * list stores for it, else the policy's address for it, else the one it is
-	 * connected on, and the receiver opens the channel with it when the offer
-	 * arrives, whatever the direct-funding policy says by then. Omitted, the
-	 * ranked primaries choose when any are configured: the first in
+	 * list stores for it, else the policy's address for it, else the one this
+	 * node dialed it at, and the receiver opens the channel with it when the
+	 * offer arrives, whatever the direct-funding policy says by then. Omitted,
+	 * the ranked primaries choose when any are configured: the first in
 	 * `listPrimaries` selection order with a known address is bound, the
 	 * others are listed in `skipped`, and NO_PRIMARY_AVAILABLE answers when
 	 * none has one. Nothing is dialed, since the request is paid later and
@@ -10553,15 +10563,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 				);
 			}
 		}
-		if (
-			opts.lspPubkey !== undefined &&
-			!/^0[23][0-9a-fA-F]{64}$/.test(opts.lspPubkey)
-		) {
-			throw new BeignetError(
-				BeignetErrorCode.INVALID_PARAMS,
-				'lspPubkey must be a 33-byte compressed public key (66 hex chars)'
-			);
-		}
+		checkLspPubkey(opts.lspPubkey);
 		const amountSats =
 			opts.amountSats !== undefined && opts.amountSats !== 0
 				? requireNonNegativeSafeInteger(opts.amountSats, 'amountSats')
@@ -10626,7 +10628,9 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	/**
 	 * Where a payer reaches this peer's relay: the address the primaries list
 	 * stores for it (host and port, or a TCP peer URI), else the address the
-	 * direct-funding policy names for it, else the one it is connected on.
+	 * direct-funding policy names for it, else the one this node dialed it at.
+	 * Never the one it is merely up on: a peer that dialed us is listed at its
+	 * socket's source port, which is ephemeral.
 	 */
 	private liquidityAddressOf(
 		pubkey: string
@@ -10644,10 +10648,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 		) {
 			return { host: policy.liquidityHost, port: policy.liquidityPort };
 		}
-		return relayAddressOf(
-			undefined,
-			this.listPeers().find((p) => p.pubkey === pubkey)
-		);
+		return relayAddressOf(undefined, this.getPeerAddress(pubkey));
 	}
 
 	/**
@@ -10667,10 +10668,10 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 				const skip: ISteerSkip = {
 					pubkey: candidate.pubkey,
 					rank: candidate.rank,
-					stage: 'connect',
-					code: BeignetErrorCode.PEER_NOT_CONNECTED,
+					stage: 'attempt',
+					code: BeignetErrorCode.RECEIVE_UNAVAILABLE,
 					message:
-						'no address is known for this primary: store its host and port, or connect to it over TCP'
+						'no address is known for this primary: store its host and port with it, or dial it over TCP'
 				};
 				skipped.push(skip);
 				this.logSteerSkip('direct-funding request', skip);

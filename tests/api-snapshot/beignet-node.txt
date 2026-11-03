@@ -332,6 +332,7 @@ method BeignetNode.getOnchainSweep(requestId: string): OnchainSweepInfo | null
 method BeignetNode.getPayment(paymentHash: PaymentHashHex): PaymentInfo | null
 method BeignetNode.getPaymentProof(paymentHash: PaymentHashHex): PaymentProof | null
 method BeignetNode.getPaymentQueue(): PaymentQueue
+method BeignetNode.getPeerAddress(pubkey: string): Pick<PeerInfo, 'host' | 'port' | 'transport'> | undefined
 method BeignetNode.getPeerRetrievedBackup(): { encoded: string; createdAt: number; fromPeer: string; channelCount: number; source: 'scb' | 'capsule'; } | null
 method BeignetNode.getQueuedPayment(id: string): QueuedPayment | undefined
 method BeignetNode.getReadyChannels(): ChannelInfo[]

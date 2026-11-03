@@ -9916,6 +9916,20 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	}
 
 	/**
+	 * The address this node last dialed a peer at, if it ever did: the one
+	 * `listPeers` reports for it while it is up, and the first a reconnect
+	 * tries. A peer that has only ever connected inbound has none, since its
+	 * TCP source port is ephemeral, and `listPeers` then shows that port.
+	 */
+	getPeerAddress(
+		pubkey: string
+	):
+		| { host: string; port: number; transport?: IPeerTransportOptions }
+		| undefined {
+		return this.peerManager?.getPeerAddress(pubkey);
+	}
+
+	/**
 	 * Connected peers advertising option_provide_storage (BOLT 1 peer
 	 * storage): the set a restore can expect a Recovery Capsule from.
 	 */
@@ -28642,8 +28656,9 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	 * Build the request store, the lanes and the receiver, and route inbound
 	 * frames into it.
 	 *
-	 * Constructed but inert: with no liquidity peer named the receiver declines
-	 * every offer, and with no request minted every frame is dropped as unknown.
+	 * Constructed but inert: with no liquidity peer named, by the policy or by
+	 * the request an offer answers, the receiver declines every offer, and with
+	 * no request minted every frame is dropped as unknown.
 	 * What this does at construction is make sure a request minted later can be
 	 * ANSWERED, which needs the lanes subscribed before the first frame arrives.
 	 */
