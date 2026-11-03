@@ -8,6 +8,10 @@
  * read an index ChannelManager rebuilds only when its channels or their
  * scids change, so these tests pin both halves: gossip never touches the
  * channel list, and the index still sees every real scid write and removal.
+ *
+ * The state-read counts cover this cell's channels only. The spy is on the
+ * prototype, and a timer left running by an earlier file in the same mocha
+ * worker once added a read of its own channel (issue #1937).
  */
 
 import { expect } from 'chai';
@@ -153,13 +157,24 @@ function feed(node: LightningNode, type: number, payload: Buffer): void {
 	).handleGossipMessage('aa'.repeat(33), type, payload);
 }
 
-/** Counts listChannels calls and channel state reads until restored. */
+/**
+ * Counts listChannels calls, and getFullState calls on the channels `cm`
+ * holds, until restored. The getFullState spy sits on the prototype and so
+ * sees every Channel in the process: a timer another test file left behind in
+ * this mocha worker (a quiescence watchdog reading its channel every 60 ms,
+ * issue #1937) must not count against this cell.
+ */
 function spyOnChannelReads(cm: ChannelManager): {
 	listChannels: number;
 	getFullState: number;
 	restore(): void;
 } {
 	const counts = { listChannels: 0, getFullState: 0, restore: (): void => {} };
+	const maps = cm as unknown as TManagerMaps;
+	const own = new Set<Channel>([
+		...maps.channels.values(),
+		...maps.tempChannels.values()
+	]);
 	const listChannels = cm.listChannels;
 	cm.listChannels = function (this: ChannelManager): Channel[] {
 		counts.listChannels++;
@@ -167,7 +182,7 @@ function spyOnChannelReads(cm: ChannelManager): {
 	};
 	const getFullState = Channel.prototype.getFullState;
 	Channel.prototype.getFullState = function (this: Channel) {
-		counts.getFullState++;
+		if (own.has(this)) counts.getFullState++;
 		return getFullState.call(this);
 	};
 	counts.restore = (): void => {
