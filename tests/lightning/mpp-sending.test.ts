@@ -16,7 +16,6 @@ import {
 } from '../../src/lightning/node/types';
 import { createFailureMessage } from '../../src/lightning/onion/failures';
 import {
-	MPP_TIMEOUT,
 	TEMPORARY_NODE_FAILURE,
 	TEMPORARY_CHANNEL_FAILURE
 } from '../../src/lightning/onion/types';
@@ -826,12 +825,9 @@ describe('MPP Sending (Phase 5)', function () {
 				...makeNodeConfig(84),
 				htlcBasepointSecret: htlcSecretFor(84)
 			});
-			// Bob's MPP timeout is shortened so the test can run the fail-back
-			// of the one part that did leave.
 			const bob = new LightningNode({
 				...makeNodeConfig(85),
-				htlcBasepointSecret: htlcSecretFor(85),
-				mppTimeoutMs: 1
+				htlcBasepointSecret: htlcSecretFor(85)
 			});
 			connectNodes(alice, bob);
 			openReadyChannel(alice, bob, 200_000n);
@@ -849,6 +845,8 @@ describe('MPP Sending (Phase 5)', function () {
 			// the first part and for no other.
 			// eslint-disable-next-line @typescript-eslint/no-explicit-any
 			const aliceAny = alice as any;
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			const bobAny = bob as any;
 			const resolve = aliceAny.firstHopChannelFor.bind(alice);
 			let resolutions = 0;
 			let goneScid = '';
@@ -881,18 +879,29 @@ describe('MPP Sending (Phase 5)', function () {
 				PaymentStatus.PENDING
 			);
 
-			// Bob releases the part at his MPP timeout. Its failure lands on a
-			// record already failed: the mapping is released, the code recorded,
-			// the retry context given up, and nothing is re-failed or
-			// redispatched.
-			await new Promise((r) => setTimeout(r, 5));
-			bob.failTimedOutMppPayments();
+			// Bob releases the part with a temporary code, as his MPP timeout
+			// would with MPP_TIMEOUT. Its failure lands on a record already
+			// failed: the mapping is released, the code recorded, the retry
+			// context given up, and nothing is re-failed or redispatched. The
+			// resolver answers again first, so a redispatch would really leave
+			// and pay bob after alice reported FAILED.
+			aliceAny.firstHopChannelFor = resolve;
+			const held = bobAny.pendingMppPayments.get(hashHex);
+			for (const part of held.receivedParts) {
+				part.status = PaymentStatus.FAILED;
+				bobAny.failRejectedMppPart(
+					part.channelId,
+					part.htlcId,
+					TEMPORARY_NODE_FAILURE
+				);
+			}
+			bobAny.pendingMppPayments.delete(hashHex);
 			await new Promise((r) => setTimeout(r, 50));
 
 			const after = alice.getPayment(paymentHash)!;
 			expect(after.status).to.equal(PaymentStatus.FAILED);
 			expect(after.failureReason).to.match(/first-hop channel is gone/);
-			expect(after.failureCode).to.equal(MPP_TIMEOUT);
+			expect(after.failureCode).to.equal(TEMPORARY_NODE_FAILURE);
 			expect(failedEvents, 'no second payment:failed').to.equal(1);
 			expect(adds, 'no redispatch').to.equal(1);
 			expect(aliceAny.htlcPaymentMap.size).to.equal(0);

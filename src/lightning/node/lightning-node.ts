@@ -19636,7 +19636,9 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	 * add. The record is FAILED with `reason`, journaled in one transition
 	 * with the release of `htlcKey` (the mapping written for a part the
 	 * channel refused; a part that never resolved a channel wrote none), and
-	 * payment:failed fires once.
+	 * payment:failed fires once. A dispatched part that already failed back
+	 * (synchronously, on a loopback transport) ended the record first; its
+	 * timestamp and event stand.
 	 *
 	 * No rollback of the parts already dispatched: BOLT 2 gives no way to
 	 * withdraw an update_add_htlc we have sent. Only the downstream peer can
@@ -19652,7 +19654,10 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	 * an already FAILED record's status, timestamp and event alone. The retry
 	 * context stays: a later send of the hash sizes its settled row against
 	 * that context's invoice (issue #1189), and the give-up path drops the
-	 * context when the last dispatched part fails back.
+	 * context when the last dispatched part fails back. Its budget is frozen
+	 * at what was used: with the MPP state gone, a part failing back with a
+	 * temporary code would otherwise redispatch the whole invoice, and pay
+	 * it, after this payment reported FAILED.
 	 */
 	private failMppDispatch(
 		payment: IPaymentInfo,
@@ -19660,10 +19665,13 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		htlcKey?: string
 	): void {
 		const hashHex = payment.paymentHash.toString('hex');
+		const firstFailure = payment.status !== PaymentStatus.FAILED;
 		payment.status = PaymentStatus.FAILED;
-		payment.completedAt = Date.now();
+		if (firstFailure) payment.completedAt = Date.now();
 		payment.failureReason = boundedFailureReason(reason);
 		this.outboundMppPayments.delete(hashHex);
+		const retryCtx = this.paymentRetryContexts.get(hashHex);
+		if (retryCtx) retryCtx.maxRetries = retryCtx.retryCount;
 		const mutations: RecoveryMutation[] = [];
 		if (htlcKey !== undefined) {
 			this.htlcPaymentMap.delete(htlcKey);
@@ -19672,7 +19680,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		const paymentMutation = this.paymentMutation(payment.paymentHash);
 		if (paymentMutation) mutations.push(paymentMutation);
 		this.commitMutations('fail MPP dispatch', mutations);
-		this.emit('payment:failed', payment);
+		if (firstFailure) this.emit('payment:failed', payment);
 	}
 
 	// ─────────────── HTLC Event Handlers ───────────────
