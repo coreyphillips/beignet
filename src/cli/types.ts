@@ -11,6 +11,10 @@ import type { IGuardianConfigEntry } from '../lightning/recovery/assembly';
 import type { IGraphRestoreStats } from '../lightning/node/types';
 import type { ChannelErrorCode } from '../lightning/channel/channel-actions';
 import type {
+	CompositeSpliceStage,
+	ICompositeSpliceRecord
+} from '../lightning/channel/composite-splice-record';
+import type {
 	HoldCancelReason,
 	SpliceRefusalCode
 } from '../lightning/node/types';
@@ -884,6 +888,70 @@ export interface SpliceResult {
 	code?: SpliceRefusalCode;
 }
 
+/**
+ * How a channel send (issue #1922) pays an address: one channel's splice-out,
+ * or one transaction that splices out of several channels at once.
+ */
+export type ChannelSendKind = 'single' | 'composite';
+
+/**
+ * The stage of a channel send: STARTED for a single-channel splice-out (its
+ * outcome arrives on splice:complete or splice:aborted for that channel),
+ * else the composite record's stage.
+ */
+export type ChannelSendStage = 'STARTED' | CompositeSpliceStage;
+
+export interface ChannelSendQuoteChannel {
+	channelId: ChannelIdHex;
+	/** What this channel pays into the destination. */
+	debitSats: number;
+	/** This channel's share of the on-chain fee. */
+	feeSats: number;
+	oldCapacitySats: number;
+	newCapacitySats: number;
+}
+
+/** The plan a channel send would run, valid until `expiresAt`. */
+export interface ChannelSendQuote {
+	/** 32-byte hex; the operation id once executed. */
+	quoteId: string;
+	kind: ChannelSendKind;
+	address: string;
+	amountSats: number;
+	/** The whole on-chain fee (sum of the channels' shares). */
+	feeSats: number;
+	/** amountSats + feeSats: what the per-payment and daily limits count. */
+	totalSats: number;
+	feeratePerkw: number;
+	channels: ChannelSendQuoteChannel[];
+	/** Channels considered for a composite and left out, with the reason. */
+	skipped: Array<{ channelId: ChannelIdHex; reason: string }>;
+	/** Epoch ms; executeChannelSend refuses the quote afterwards. */
+	expiresAt: number;
+}
+
+/** A channel send that was executed, or a composite found without a quote after a restart. */
+export interface ChannelSendStatus {
+	/** The quote id the execute call returned, or the composite id for a composite restored without one. */
+	id: string;
+	kind: ChannelSendKind;
+	stage: ChannelSendStage;
+	address?: string;
+	amountSats: number;
+	feeSats: number;
+	/** Single: the channel that spliced out. */
+	channelId?: ChannelIdHex;
+	/** Composite: the composite record id (hex). */
+	compositeId?: string;
+	/** Composite: the agreed transaction, display order, from COMMITTED on. */
+	txid?: TxidHex;
+	/** Why the operation ended in ABORTED or CONFLICTED. */
+	reason?: string;
+	startedAt: number;
+	/** Composite: the full record. */
+	record?: ICompositeSpliceRecord;
+}
+
 export interface BootstrapPeerInfo {
 	pubkey: string;
 	host: string;
@@ -1644,6 +1712,14 @@ export interface BeignetNodeEvents {
 	}) => void;
 	/** A splice negotiation was unwound by tx_abort before its point of no return. */
 	'splice:aborted': (data: { channelId: ChannelIdHex; reason: string }) => void;
+	/** A channel send (issue #1922) reached a stage: STARTED for a single-channel splice-out, else the composite record's stage (PLANNED, NEGOTIATING, COMMITTED, PEERS_SIGNED, RELEASED, BROADCAST, LOCKED, ABORTED or CONFLICTED, with the reason). `id` is the quote id the execute call returned, or the composite id for a composite restored without one; `txid` (display order) is the agreed transaction from COMMITTED on. */
+	'channel-send:stage': (data: {
+		id: string;
+		compositeId?: string;
+		stage: ChannelSendStage;
+		txid?: TxidHex;
+		reason?: string;
+	}) => void;
 	/** An input of an in-flight splice that this node does not vouch for was spent by conflictTxid, confirmed six deep while the splice is not on chain: the splice can never confirm, and the peer is being asked to revert (issue #760). */
 	'splice:conflicted': (data: {
 		channelId: ChannelIdHex;

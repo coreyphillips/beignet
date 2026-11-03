@@ -4254,7 +4254,7 @@ export function getOpenApiSpec(): Record<string, unknown> {
 			'/events': {
 				get: {
 					summary:
-						'Server-Sent Events stream (payment:received, payment:sent, payment:failed, invoice:settled, the hold-invoice lifecycle events hold:accepted, hold:settled, hold:cancelled (issue #746; each carries paymentHash, state, heldAmountMsat as a decimal string, htlcCount, and the GET /invoices/held expiry fields minFinalCltvExpiry, earliestExpiry, cancelMarginBlocks and cancelHeight (issue #770), hold:cancelled also the reason; hold:accepted fires per new parked part, including partial MPP payments: compare the total with the full expected msat before funding; terminal event totals describe the resolved set), transaction:received, transaction:sent, transaction:confirmed, channel:opening, channel:ready, channel:pending-close, channel:force-closing, channel:closed, channel:resolved, the splice lifecycle splice:complete, splice:aborted, splice:conflicted, splice:reverted (issue #760; channelId plus spliceTxid and conflictTxid where they exist, display order), peer:connect, peer:disconnect (pubkey, plus closedBy peer or us, reason, direction inbound or outbound and uptimeMs when the transport knows the cause), node:error, node:ready, and the Recovery Protocol events recovery:durable, recovery:fenced, recovery:backfill-lost, recovery:reestablish-held, recovery:capsule-retrieved, recovery:guardian_unreachable, recovery:restore-progress, recovery:restored, the guardian hosting events guardian:set-registered, guardian:quota-refused, guardian:session-violation, the rotation events recovery:rotation-progress, recovery:rotated, recovery:rotation-followed, the JIT receive progress events jit:intent, jit:intent-superseded, jit:intercepted, jit:funding, jit:forwarded, jit:failed (LSP side, satoshi figures as decimal strings) and the direct-funding receiver events direct-funding:offer:accepted, direct-funding:offer:declined, direct-funding:offer:failed, direct-funding:offer:completed, the FFOR offline-receive events ffor:state, ffor:settled, ffor:slot-resolved (terminal concurrent slot outcome: channelId, epochId, k, paymentHash, amountMsat as a decimal string, outcome fulfilled or cancelled), ffor:delegated-failed, ffor:enforce (carries restoreRecencyUnproven: true for a capsule hold, reestablishRecencyUnproven: true for an unproven peer claim and reestablishSecretMissing: true for a missing local per-commitment secret, including several when several hold; either requires acceptStaleStateRisk: true on POST /ffor/enforce and on POST /ffor/recover with forceCloseIfUnreachable: true; issues #908 and #907), ffor:witness-provisioned, ffor:witness-recorded, ffor:witness-released, ffor:witness-refused, ffor:witness-closed, ffor:witness-expired, ffor:witness-audit (a fetched record that failed verification: channelId, witnessNodeId, k, reason), ffor:issuer-provisioned, ffor:issuer-issued, ffor:issuer-retired (issue #729; buffers as hex, amounts as decimal strings), the reverse swap provider events swap:created, swap:held, swap:funding, swap:funded, swap:claimed, swap:settled, swap:refund-broadcast, swap:refunded, swap:hold-cancelled, swap:exposed, swap:failed (issue #737), the submarine swap provider events swap:funding-seen, swap:funding-lost, swap:paying, swap:payment-unresolved, swap:preimage, swap:claim-broadcast, swap:claim-confirmed, swap:payment-failed, swap:cancelled (issue #743; every swap event carries direction); plus htlc:forwarded, htlc:fulfilled, htlc:failed when the daemon is started with htlcEvents). Every frame carries an `event:` name and a JSON `data:` object; node:ready has no fields and arrives as {}. node:error carries code, message, timestamp and, when the failure belongs to a channel, channelId: it is the only place a failed open reports its reason. The broadcast codes BROADCAST_FAILED (the chain watcher could not hand a transaction to the backend and will retry it on the next block), BROADCAST_PERMANENT_FAILURE (the watcher gave up after its retries) and SPLICE_BROADCAST_REFUSED (the backend refused a fully signed splice the node re-sends every block; raised once per transaction and reason) also carry txid, the transaction in display order, and retained: true when the node itself still holds that transaction and rebroadcasts it on every block until it confirms (a pending funding, an in-flight or adopted but unconfirmed splice), false when the watcher queue was its only driver, such as a close or a sweep (issue #1062).node:error code REESTABLISH_SECRET_MISSING is raised when this node cannot build its own channel_reestablish for a channel, because its shachain store holds no per-commitment secret at the index its revocation counter names: nothing is sent to the peer (all zeroes there is a protocol violation), the channel is failed and held, and the message names the channel, the revocation index and the acknowledged force close that is the exit. node:error code HTLC_DEADLINE_HELD is raised by each on-chain HTLC deadline backstop (HTLC_CLAIM_FORCE_CLOSE, FORWARD_TIMEOUT_FORCE_CLOSE, HTLC_EXPIRY_FORCE_CLOSE) that declines to force-close a channel held under restoreRecencyUnproven or reestablishRecencyUnproven, naming the channel, the HTLC and its payment hash, its cltv_expiry, the current height, which hold it is and the acknowledged force close (/channel/forceclose with acceptStaleStateRisk: true) that is the exit; throttled per HTLC per backstop, since only an operator can resolve such an HTLC before its deadline. node:error code LISTEN_FAILED is raised when the OS refuses a configured TCP or WebSocket listener bind (the port is taken or not permitted): the message names the listener, the port and the OS error, says inbound peers cannot connect and, for a guardian host, that its guardian is unreachable. It is not fatal and nothing retries it; GET /info carries the same failure as listenError or websocketListenError. A bind failure at startup is raised before this stream is wired, so read it from GET /info or GET /logs?category=error (issue #861)',
+						'Server-Sent Events stream (payment:received, payment:sent, payment:failed, invoice:settled, the hold-invoice lifecycle events hold:accepted, hold:settled, hold:cancelled (issue #746; each carries paymentHash, state, heldAmountMsat as a decimal string, htlcCount, and the GET /invoices/held expiry fields minFinalCltvExpiry, earliestExpiry, cancelMarginBlocks and cancelHeight (issue #770), hold:cancelled also the reason; hold:accepted fires per new parked part, including partial MPP payments: compare the total with the full expected msat before funding; terminal event totals describe the resolved set), transaction:received, transaction:sent, transaction:confirmed, channel:opening, channel:ready, channel:pending-close, channel:force-closing, channel:closed, channel:resolved, the splice lifecycle splice:complete, splice:aborted, splice:conflicted, splice:reverted (issue #760; channelId plus spliceTxid and conflictTxid where they exist, display order), the channel send stages channel-send:stage (issue #1922; id, compositeId, stage, txid in display order and the abort reason), peer:connect, peer:disconnect (pubkey, plus closedBy peer or us, reason, direction inbound or outbound and uptimeMs when the transport knows the cause), node:error, node:ready, and the Recovery Protocol events recovery:durable, recovery:fenced, recovery:backfill-lost, recovery:reestablish-held, recovery:capsule-retrieved, recovery:guardian_unreachable, recovery:restore-progress, recovery:restored, the guardian hosting events guardian:set-registered, guardian:quota-refused, guardian:session-violation, the rotation events recovery:rotation-progress, recovery:rotated, recovery:rotation-followed, the JIT receive progress events jit:intent, jit:intent-superseded, jit:intercepted, jit:funding, jit:forwarded, jit:failed (LSP side, satoshi figures as decimal strings) and the direct-funding receiver events direct-funding:offer:accepted, direct-funding:offer:declined, direct-funding:offer:failed, direct-funding:offer:completed, the FFOR offline-receive events ffor:state, ffor:settled, ffor:slot-resolved (terminal concurrent slot outcome: channelId, epochId, k, paymentHash, amountMsat as a decimal string, outcome fulfilled or cancelled), ffor:delegated-failed, ffor:enforce (carries restoreRecencyUnproven: true for a capsule hold, reestablishRecencyUnproven: true for an unproven peer claim and reestablishSecretMissing: true for a missing local per-commitment secret, including several when several hold; either requires acceptStaleStateRisk: true on POST /ffor/enforce and on POST /ffor/recover with forceCloseIfUnreachable: true; issues #908 and #907), ffor:witness-provisioned, ffor:witness-recorded, ffor:witness-released, ffor:witness-refused, ffor:witness-closed, ffor:witness-expired, ffor:witness-audit (a fetched record that failed verification: channelId, witnessNodeId, k, reason), ffor:issuer-provisioned, ffor:issuer-issued, ffor:issuer-retired (issue #729; buffers as hex, amounts as decimal strings), the reverse swap provider events swap:created, swap:held, swap:funding, swap:funded, swap:claimed, swap:settled, swap:refund-broadcast, swap:refunded, swap:hold-cancelled, swap:exposed, swap:failed (issue #737), the submarine swap provider events swap:funding-seen, swap:funding-lost, swap:paying, swap:payment-unresolved, swap:preimage, swap:claim-broadcast, swap:claim-confirmed, swap:payment-failed, swap:cancelled (issue #743; every swap event carries direction); plus htlc:forwarded, htlc:fulfilled, htlc:failed when the daemon is started with htlcEvents). Every frame carries an `event:` name and a JSON `data:` object; node:ready has no fields and arrives as {}. node:error carries code, message, timestamp and, when the failure belongs to a channel, channelId: it is the only place a failed open reports its reason. The broadcast codes BROADCAST_FAILED (the chain watcher could not hand a transaction to the backend and will retry it on the next block), BROADCAST_PERMANENT_FAILURE (the watcher gave up after its retries) and SPLICE_BROADCAST_REFUSED (the backend refused a fully signed splice the node re-sends every block; raised once per transaction and reason) also carry txid, the transaction in display order, and retained: true when the node itself still holds that transaction and rebroadcasts it on every block until it confirms (a pending funding, an in-flight or adopted but unconfirmed splice), false when the watcher queue was its only driver, such as a close or a sweep (issue #1062).node:error code REESTABLISH_SECRET_MISSING is raised when this node cannot build its own channel_reestablish for a channel, because its shachain store holds no per-commitment secret at the index its revocation counter names: nothing is sent to the peer (all zeroes there is a protocol violation), the channel is failed and held, and the message names the channel, the revocation index and the acknowledged force close that is the exit. node:error code HTLC_DEADLINE_HELD is raised by each on-chain HTLC deadline backstop (HTLC_CLAIM_FORCE_CLOSE, FORWARD_TIMEOUT_FORCE_CLOSE, HTLC_EXPIRY_FORCE_CLOSE) that declines to force-close a channel held under restoreRecencyUnproven or reestablishRecencyUnproven, naming the channel, the HTLC and its payment hash, its cltv_expiry, the current height, which hold it is and the acknowledged force close (/channel/forceclose with acceptStaleStateRisk: true) that is the exit; throttled per HTLC per backstop, since only an operator can resolve such an HTLC before its deadline. node:error code LISTEN_FAILED is raised when the OS refuses a configured TCP or WebSocket listener bind (the port is taken or not permitted): the message names the listener, the port and the OS error, says inbound peers cannot connect and, for a guardian host, that its guardian is unreachable. It is not fatal and nothing retries it; GET /info carries the same failure as listenError or websocketListenError. A bind failure at startup is raised before this stream is wired, so read it from GET /info or GET /logs?category=error (issue #861)',
 					tags: ['Node'],
 					responses: {
 						'200': {
@@ -4829,6 +4829,137 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						'503': {
 							description:
 								'SPLICE_BUSY: the channel is momentarily unable to splice (a splice already in progress, a previous abort awaiting its echo, a peer-owned quiescence session, another splice request already awaiting quiescence, HTLCs still settling, the peer reconnecting). Retry the same request.'
+						}
+					}
+				}
+			},
+			'/channel-send/quote': {
+				post: {
+					summary:
+						'Quote paying an address out of one channel, or out of several channels in one transaction (issue #1922)',
+					tags: ['Channels'],
+					requestBody: bodyContent({
+						address: 'string',
+						amountSats: 'number',
+						feeratePerkw: 'number'
+					}),
+					responses: {
+						'200': {
+							description:
+								'The plan: kind single (one channel covers amount plus fee; the one with the largest spendable balance) or composite (several channels, debited largest spendable balance first, with the fee split in proportion), each channel debit and fee share, the total the spend limits count, the channels left out with the reason, and a quoteId that executeChannelSend accepts for two minutes. Nothing moves.',
+							content: jsonContent({
+								$ref: '#/components/schemas/ChannelSendQuote'
+							})
+						},
+						'400': {
+							description:
+								'INVALID_PARAMS: missing or undecodable address, non-integer amount, feeratePerkw outside 253..100000, amount below the dust floor, or a fee at or above the amount'
+						},
+						'403': {
+							description:
+								'SPENDING_LIMIT_EXCEEDED: amount plus fee over maxPaymentSats or dailySpendLimitSats'
+						},
+						'409': {
+							description:
+								'INSUFFICIENT_BALANCE (no channel set covers amount plus fees at this feerate), SPLICE_REFUSED (no channel qualifies; the message names each channel and why)'
+						},
+						'503': {
+							description:
+								'SPLICE_BUSY (a composite is already live; one at a time), NOT_PERSISTED (the storage backend lacks the compositeSplices group or the recovery journal is off)'
+						}
+					}
+				}
+			},
+			'/channel-send/execute': {
+				post: {
+					summary: 'Execute a channel send quote',
+					tags: ['Channels'],
+					requestBody: bodyContent({ quoteId: 'string' }),
+					responses: {
+						'200': {
+							description:
+								'The send started: a single-channel splice-out (stage STARTED; watch splice:complete or splice:aborted for that channel) or a composite (its record and stage; watch channel-send:stage). The limits are checked again; a composite reserves amount plus fee until RELEASED charges it or ABORTED releases it. The same quoteId returns the first execution and runs nothing.',
+							content: jsonContent({
+								$ref: '#/components/schemas/ChannelSendStatus'
+							})
+						},
+						'400': {
+							description:
+								'INVALID_PARAMS: malformed quoteId, or an expired quote'
+						},
+						'403': { description: 'SPENDING_LIMIT_EXCEEDED' },
+						'404': {
+							description: 'NOT_FOUND: unknown or already executed quoteId'
+						},
+						'409': {
+							description:
+								'INSUFFICIENT_BALANCE, SPLICE_REFUSED or SPLICING_NOT_NEGOTIATED from the channel the plan named'
+						},
+						'503': { description: 'SPLICE_BUSY or NOT_PERSISTED' }
+					}
+				}
+			},
+			'/channel-send/status': {
+				get: {
+					summary: 'The stage and record of a channel send',
+					tags: ['Channels'],
+					parameters: [
+						{
+							name: 'id',
+							in: 'query',
+							required: true,
+							schema: { type: 'string' },
+							description:
+								'The quoteId the execute call returned, or a composite record id'
+						}
+					],
+					responses: {
+						'200': {
+							description: 'The channel send',
+							content: jsonContent({
+								$ref: '#/components/schemas/ChannelSendStatus'
+							})
+						},
+						'400': { description: 'INVALID_PARAMS: id is not 32-byte hex' },
+						'404': { description: 'NOT_FOUND' }
+					}
+				}
+			},
+			'/channel-send/list': {
+				get: {
+					summary:
+						'Every channel send this node executed, plus composites it holds without a quote (after a restart), oldest first',
+					tags: ['Channels'],
+					responses: {
+						'200': {
+							description: 'The channel sends',
+							content: jsonContent({
+								type: 'array',
+								items: { $ref: '#/components/schemas/ChannelSendStatus' }
+							})
+						}
+					}
+				}
+			},
+			'/channel-send/abort': {
+				post: {
+					summary:
+						'Abort a composite channel send before its signatures are released',
+					tags: ['Channels'],
+					requestBody: bodyContent({ id: 'string', reason: 'string?' }),
+					responses: {
+						'200': {
+							description:
+								'Every session is being unwound with tx_abort and nothing was spent; the channel send at its ABORTED stage',
+							content: jsonContent({
+								$ref: '#/components/schemas/ChannelSendStatus'
+							})
+						},
+						'400': { description: 'INVALID_PARAMS: id is not 32-byte hex' },
+						'404': { description: 'NOT_FOUND' },
+						'409': {
+							description:
+								'SPLICE_REFUSED: past RELEASED (the transaction may confirm), or a single-channel send'
 						}
 					}
 				}
@@ -6723,6 +6854,111 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						'A started splice. Refusals are answered as failure envelopes with their own status, so `ok` is always true here.',
 					properties: {
 						ok: { type: 'boolean', enum: [true] }
+					}
+				},
+				ChannelSendQuoteChannel: {
+					type: 'object',
+					required: [
+						'channelId',
+						'debitSats',
+						'feeSats',
+						'oldCapacitySats',
+						'newCapacitySats'
+					],
+					properties: {
+						channelId: { type: 'string' },
+						debitSats: { type: 'integer' },
+						feeSats: { type: 'integer' },
+						oldCapacitySats: { type: 'integer' },
+						newCapacitySats: { type: 'integer' }
+					}
+				},
+				ChannelSendQuote: {
+					type: 'object',
+					description:
+						'The plan a channel send would run (issue #1922), valid until expiresAt.',
+					required: [
+						'quoteId',
+						'kind',
+						'address',
+						'amountSats',
+						'feeSats',
+						'totalSats',
+						'feeratePerkw',
+						'channels',
+						'skipped',
+						'expiresAt'
+					],
+					properties: {
+						quoteId: { type: 'string' },
+						kind: { type: 'string', enum: ['single', 'composite'] },
+						address: { type: 'string' },
+						amountSats: { type: 'integer' },
+						feeSats: { type: 'integer' },
+						totalSats: {
+							type: 'integer',
+							description: 'amountSats + feeSats, what the spend limits count'
+						},
+						feeratePerkw: { type: 'integer' },
+						channels: {
+							type: 'array',
+							items: { $ref: '#/components/schemas/ChannelSendQuoteChannel' }
+						},
+						skipped: {
+							type: 'array',
+							items: {
+								type: 'object',
+								properties: {
+									channelId: { type: 'string' },
+									reason: { type: 'string' }
+								}
+							}
+						},
+						expiresAt: { type: 'integer' }
+					}
+				},
+				ChannelSendStatus: {
+					type: 'object',
+					description:
+						'A channel send that was executed, or a composite found without a quote after a restart (issue #1922).',
+					required: [
+						'id',
+						'kind',
+						'stage',
+						'amountSats',
+						'feeSats',
+						'startedAt'
+					],
+					properties: {
+						id: { type: 'string' },
+						kind: { type: 'string', enum: ['single', 'composite'] },
+						stage: {
+							type: 'string',
+							enum: [
+								'STARTED',
+								'PLANNED',
+								'NEGOTIATING',
+								'COMMITTED',
+								'PEERS_SIGNED',
+								'RELEASED',
+								'BROADCAST',
+								'LOCKED',
+								'ABORTED',
+								'CONFLICTED'
+							]
+						},
+						address: { type: 'string' },
+						amountSats: { type: 'integer' },
+						feeSats: { type: 'integer' },
+						channelId: { type: 'string' },
+						compositeId: { type: 'string' },
+						txid: { type: 'string' },
+						reason: { type: 'string' },
+						startedAt: { type: 'integer' },
+						record: {
+							type: 'object',
+							description: 'The composite record, as stored'
+						}
 					}
 				},
 				BootstrapPeerInfo: {

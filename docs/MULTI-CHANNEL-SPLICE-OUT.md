@@ -470,26 +470,49 @@ payment into several transactions, force closes or substitutes a swap
 The amount plus the total fee counts once against the per-payment and daily
 limits. Today `spliceOut` records the spend at initiation and holds it until
 the UTC midnight reset even if the splice later fails. The composite does
-better by using the existing reservation: `_pendingSpendSats` is reserved at
-PLANNED, converted to a recorded spend at RELEASED (the point past which the
-money leaves) and released at ABORTED. The charge is in the composite record,
-so it survives a restart and is charged exactly once across retries.
-`_pendingSpendSats` itself is not persisted (boot restores only async spend
-claims), so a node re-adds the reservation of every composite record still
-live between PLANNED and PEERS_SIGNED when it loads. The single-channel
-address splice-out keeps its current accounting in step 5; moving it to the
-same reservation is a separate change.
+better by using the existing reservation: `_pendingSpendSats` is reserved
+when the composite starts, converted to a recorded spend at RELEASED (the
+point past which the money leaves) and released at ABORTED or at a CONFLICTED
+that comes before any charge (a charge already made stays, as the Lightning
+claims treat an uncertain outcome as spent). Step 5d implements this in
+`BeignetNode.executeChannelSend` and its `composite-splice:stage` listener;
+the charge is written to the persisted daily ledger inside the RELEASED
+stage event, which fires before the RELEASED record is staged, so a crash
+between the two leaves the ledger charged and the record short of RELEASED,
+and the restore table then aborts the record: the day's budget is consumed
+by nothing, the safe direction. Nothing has to be re-added at boot:
+`_pendingSpendSats` is not persisted, but the restore table (section 5)
+closes every record short of RELEASED before `BeignetNode` loads its spend
+state, and a record at RELEASED or later was charged before it was written.
+The single-channel address splice-out keeps its current accounting in step
+5, through `executeChannelSend` as well; moving it to the same reservation is
+a separate change.
 
 ### API surface
 
-- `BeignetNode.quoteChannelSend`, `executeChannelSend`,
-  `getChannelSend(operationId)`, `listChannelSends()`.
-- Daemon routes under `/channel-send/*` in `src/cli/routes.ts`: quote, status
-  and list at readonly scope, execute at admin scope and idempotent, the
-  split `/channel/splice-quote` and `/channel/splice-out` use today (invoice
-  scope covers receive-side routes only, `tests/cli/auth-scopes.test.ts`).
-- Events: `channel-send:stage` with the operation id and the new stage.
-- OpenAPI, `npm run api:snapshot`, `npm run docs:tables` for the new events.
+Step 5d landed this surface:
+
+- `BeignetNode.quoteChannelSend(address, amountSats, feeratePerkw)`,
+  `executeChannelSend(quoteId)`, `getChannelSend(id)`, `listChannelSends()`,
+  `abortChannelSend(id, reason?)`. A quote lasts two minutes
+  (`CHANNEL_SEND_QUOTE_TTL_MS`); executing the same quote id again returns
+  the first execution and runs nothing. The single path picks the channel
+  with the largest spendable balance whose `spliceQuote` bound covers the
+  amount plus fee; the composite path is the engine's plan. A composite's
+  refusal keeps the engine's code (`BUSY` answers `SPLICE_BUSY`,
+  `STORAGE_REQUIRED` answers `NOT_PERSISTED`, `NO_ELIGIBLE_CHANNELS` answers
+  `SPLICE_REFUSED`) and carries each skipped channel's reason in its message.
+- Daemon routes under `/channel-send/*` in `src/cli/routes.ts`: `quote`
+  (POST), `status` and `list` (GET) at readonly scope, `execute` at admin
+  scope and idempotent, `abort` at admin scope; the split
+  `/channel/splice-quote` and `/channel/splice-out` use today (invoice scope
+  covers receive-side routes only, `tests/cli/auth-scopes.test.ts`).
+- CLI: `beignet channel send-quote|send|send-status|send-list|send-abort`.
+- Event `channel-send:stage` with the quote id (or the composite id for a
+  composite restored without a quote), the composite id, the stage, the
+  txid from COMMITTED on and the abort reason; relayed on the SSE stream.
+- OpenAPI paths and schemas (`ChannelSendQuote`, `ChannelSendStatus`), the
+  CLI README tables, `npm run docs:tables` for the event.
 
 ## 8. Peer support
 
@@ -562,7 +585,11 @@ Each lands alone, fund-relevant ones after the full matrix with interop:
   debits, the refusals, operator abort, a contributing peer, a peer that
   never signs, restart before and after release.
 - 5d. `BeignetNode` quote and execute, spend-limit reservation, routes,
-  OpenAPI, snapshot, CLI, docs.
+  OpenAPI, CLI, docs (section 7 above lists what landed). Tests in
+  `tests/cli/channel-send.test.ts`: the single and composite quotes, every
+  refusal, the single execution's accounting and idempotency, the
+  composite's reservation through RELEASED, ABORTED and CONFLICTED, restored
+  composites in the listing, and the daemon envelopes.
 - 5e. Regtest qualification: a wallet with two beignet primaries pays an
   address from both channels in one transaction, including the abort and
   restart cases, on the live stack.

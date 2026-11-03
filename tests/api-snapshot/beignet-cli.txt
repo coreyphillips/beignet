@@ -264,6 +264,7 @@ type BeignetErrorCodeValue = `${BeignetErrorCode}`
 class BeignetNode extends TypedEmitter<BeignetNodeEvents>
 private constructor BeignetNode()
 static property BeignetNode.INITIAL_GOSSIP_PRIME_TIMEOUT_MS: number
+method BeignetNode.abortChannelSend(id: string, reason?: string): ChannelSendStatus
 method BeignetNode.addPrimary(opts: { pubkey: string; host?: string; port?: number; uri?: string; rank?: number; }): PrimariesInfo
 method BeignetNode.addTrustedPeer(pubkey: string): TrustedPeerInfo
 method BeignetNode.addWatchtower(uri: string): void
@@ -302,6 +303,7 @@ method BeignetNode.enqueuePayment(bolt11: string, priority?: number, opts?: { am
 method BeignetNode.ensureMinimumChannels(count: number, satsPerChannel: number, _opts?: { timeoutMs?: number; }): Promise<ChannelInfo[]>
 method BeignetNode.estimatePayment(bolt11: string, amountSats?: number): PaymentEstimate | null
 method BeignetNode.estimateRouteFee(bolt11: string, amountSats?: number): RouteEstimate | null
+method BeignetNode.executeChannelSend(quoteId: string): Promise<ChannelSendStatus>
 method BeignetNode.executeRebalances(budgetSatsPerDay?: number): Promise<RebalanceExecutionSummary>
 method BeignetNode.exportDescriptors(): DescriptorsInfo
 method BeignetNode.exportStaticChannelBackup(): { encoded: string; channelCount: number; path: string; }
@@ -333,6 +335,7 @@ method BeignetNode.getChannel(channelId: ChannelIdHex): ChannelInfo | null
 method BeignetNode.getChannelDiagnostics(channelId: ChannelIdHex): Record<string, unknown> | null
 method BeignetNode.getChannelHealth(channelId: ChannelIdHex): IChannelHealth | null
 method BeignetNode.getChannelPolicy(channelId: ChannelIdHex): ChannelPolicyInfo | null
+method BeignetNode.getChannelSend(id: string): ChannelSendStatus | null
 method BeignetNode.getChannelSuggestions(count?: number): ChannelSuggestion[]
 method BeignetNode.getDailySpendInfo(): { limitSats: number | null; spentSats: number; remainingSats: number; pendingSats: number; resetsAt: number; totalSats: number; lightningSats: number; onchainSats: number; }
 method BeignetNode.getDirectFundingConfig(): DirectFundingConfigInfo
@@ -382,6 +385,7 @@ method BeignetNode.l402Fetch(url: string, init: beignet/lightning#l402.IL402Requ
 get BeignetNode.lightningNode(): beignet/lightning#node.LightningNode
 method BeignetNode.listAddressLabels(): Record<string, string>
 method BeignetNode.listBoostableTransactions(): BoostableTransactions
+method BeignetNode.listChannelSends(): ChannelSendStatus[]
 method BeignetNode.listChannels(): ChannelInfo[]
 method BeignetNode.listDirectFundingPayments(): beignet/lightning#directFunding.IDfPaymentRecord[]
 method BeignetNode.listDirectFundingReceived(): beignet/lightning#directFunding.IDfReceivedRecord[]
@@ -419,6 +423,7 @@ method BeignetNode.prepareOnchainSweep(request: OnchainSweepRequest): Promise<On
 method BeignetNode.probeRoute(destination: string, amountSats: number): { success: boolean; feeSats?: number; feeMsat?: string; hops?: number; path?: Array<{ pubkey: string; shortChannelId: string; }>; }
 method BeignetNode.queryRoute(destination: string, amountSats: number, maxFeeSats?: number): RouteQueryResult
 method BeignetNode.quoteChannelFunding({ peerPubkey, satsPerVbyte }: { peerPubkey: string; satsPerVbyte?: number; }): Promise<TChannelFundingQuote>
+method BeignetNode.quoteChannelSend(address: string, amountSats: number, feeratePerkw: number): Promise<ChannelSendQuote>
 method BeignetNode.quoteOnchain({ address, amountSats, satsPerVbyte, max, channelFunding }?: { address?: string; amountSats?: number; satsPerVbyte?: number; max?: boolean; channelFunding?: boolean; }): Promise<TOnchainQuote>
 method BeignetNode.quotePayAll(bolt11: string, maxFeeMsat: number | string): PayAllQuote
 method BeignetNode.rebalanceChannel(fromChannelId: ChannelIdHex, toChannelId: ChannelIdHex, amountSats: number, maxFeeSats: number): Promise<RebalanceResult>
@@ -478,6 +483,7 @@ method BeignetNode.whenReadyToPay(run: () => void): void
 interface BeignetNodeEvents
 property BeignetNodeEvents.'backup:completed': (data: { path: string; timestamp: number; }) => void
 property BeignetNodeEvents.'backup:failed': (data: { path: string; error: string; timestamp: number; }) => void
+property BeignetNodeEvents.'channel-send:stage': (data: { id: string; compositeId?: string; stage: ChannelSendStage; txid?: TxidHex; reason?: string; }) => void
 property BeignetNodeEvents.'channel:closed': (data: { channelId: ChannelIdHex; }) => void
 property BeignetNodeEvents.'channel:force-closing': (data: { channelId: ChannelIdHex; initiator: 'local' | 'remote'; }) => void
 property BeignetNodeEvents.'channel:opening': (data: { channelId: ChannelIdHex; fundingTxid: TxidHex; }) => void
@@ -729,6 +735,38 @@ property ChannelPolicyUpdateParams.feeBaseMsat?: number
 property ChannelPolicyUpdateParams.feeProportionalMillionths?: number
 property ChannelPolicyUpdateParams.htlcMaximumMsat?: number | string
 property ChannelPolicyUpdateParams.htlcMinimumMsat?: number | string
+type ChannelSendKind = 'single' | 'composite'
+interface ChannelSendQuote
+property ChannelSendQuote.address: string
+property ChannelSendQuote.amountSats: number
+property ChannelSendQuote.channels: ChannelSendQuoteChannel[]
+property ChannelSendQuote.expiresAt: number
+property ChannelSendQuote.feeSats: number
+property ChannelSendQuote.feeratePerkw: number
+property ChannelSendQuote.kind: ChannelSendKind
+property ChannelSendQuote.quoteId: string
+property ChannelSendQuote.skipped: Array<{ channelId: ChannelIdHex; reason: string; }>
+property ChannelSendQuote.totalSats: number
+interface ChannelSendQuoteChannel
+property ChannelSendQuoteChannel.channelId: ChannelIdHex
+property ChannelSendQuoteChannel.debitSats: number
+property ChannelSendQuoteChannel.feeSats: number
+property ChannelSendQuoteChannel.newCapacitySats: number
+property ChannelSendQuoteChannel.oldCapacitySats: number
+type ChannelSendStage = 'STARTED' | beignet/lightning#channel.CompositeSpliceStage
+interface ChannelSendStatus
+property ChannelSendStatus.address?: string
+property ChannelSendStatus.amountSats: number
+property ChannelSendStatus.channelId?: ChannelIdHex
+property ChannelSendStatus.compositeId?: string
+property ChannelSendStatus.feeSats: number
+property ChannelSendStatus.id: string
+property ChannelSendStatus.kind: ChannelSendKind
+property ChannelSendStatus.reason?: string
+property ChannelSendStatus.record?: beignet/lightning#channel.ICompositeSpliceRecord
+property ChannelSendStatus.stage: ChannelSendStage
+property ChannelSendStatus.startedAt: number
+property ChannelSendStatus.txid?: TxidHex
 type ChannelStateString = 'NONE' | 'AWAITING_FUNDING_CONFIRMED' | 'AWAITING_CHANNEL_READY' | 'NORMAL' | 'SHUTTING_DOWN' | 'NEGOTIATING_CLOSING' | 'FORCE_CLOSED' | 'AWAITING_REESTABLISH' | 'CLOSED' | 'ERRORED' | 'ANNOUNCEMENT_READY'
 interface ChannelSuggestion
 property ChannelSuggestion.alias?: string
