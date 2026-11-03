@@ -70,6 +70,11 @@ output and gains a `fundingCount` parameter (default 1) so the wallet's
 quote, the engine's preflight and each channel's contribution arithmetic keep
 using the same function, as its header demands.
 
+The acceptor's audit floor (`auditMinInputWeightWu`) prices every input that
+is not P2TR at the P2WPKH weight. Step 5b floors a P2WSH input at
+`SHARED_FUNDING_INPUT_WEIGHT`, the 2-of-2 spend being the only P2WSH form an
+acceptor admits, so its fee check does not run lenient on a composite.
+
 The fee is apportioned to channels in proportion to their debit, rounded up
 per channel so the sum never falls short:
 `fee_i = ceil(total_fee * debit_i / amount)`. Each channel's
@@ -181,14 +186,20 @@ ordinary input today:
    order channel j's funding script lists the keys. The session then releases
    as the existing delivery path does (`provideSpliceExternalWitness`
    internally, no embedder involved).
-3. Verifiable P2WSH. `_validateWitnessForInput` and `_v2CheckInputSpendable`
-   admit exactly one P2WSH form: a witness script of
-   `OP_2 <33-byte key> <33-byte key> OP_2 OP_CHECKMULTISIG` whose hash is the
-   prevout's program, with a witness `[<>, sig, sig, script]` where both
-   signatures verify under BIP 143 against the key they correspond to. That
-   is fully verifiable, like a P2TR key spend, so a beignet acceptor can
-   accept another wallet's composite splice. Every other P2WSH shape stays
-   refused.
+3. Verifiable P2WSH. At `tx_complete` an acceptor sees only each input's
+   prevout, and a P2WSH prevout is a 32-byte program that says nothing about
+   the script behind it, so `_v2CheckInputSpendable` admits a P2WSH prevout in
+   a splice session (a v2 open keeps refusing it) and the check moves to the
+   witness. `_validateWitnessForInput` admits exactly one P2WSH form: a
+   witness script of `OP_2 <33-byte key> <33-byte key> OP_2 OP_CHECKMULTISIG`
+   whose SHA256 is the prevout's program, with a witness
+   `[<>, sig, sig, script]` where both signatures verify under BIP 143
+   against the key they correspond to, in script order. That is fully
+   verifiable, like a P2TR key spend, so a beignet acceptor can accept another
+   wallet's composite splice. Every other P2WSH shape stays refused where the
+   refusal lives today, at witness time. An initiator that never delivers a
+   verifiable witness leaves the acceptor where a third party that never
+   delivers one does (#592): holding a splice it forgets at reestablish.
 
 Requirements:
 
@@ -198,8 +209,8 @@ Requirements:
   `shared_input_signature` received in session j that verified against
   channel j's funding script and the composite's txid.
 - An acceptor MUST verify both signatures of a 2-of-2 P2WSH initiator input
-  before accepting the negotiation, and MUST keep refusing every other P2WSH
-  form.
+  before accepting its witness, at `tx_signatures` or on external delivery,
+  and MUST keep refusing every other P2WSH form.
 
 ## 4. Signatures and the point of no return
 
@@ -287,9 +298,14 @@ Requirements:
 
 ### The composite record
 
-A new persisted record, `ICompositeSpliceRecord`, written through the same
-storage transaction mechanism channel persistence uses (one transaction per
-dispatch, `IDispatchContext`):
+A new persisted record, `ICompositeSpliceRecord`, written in the same storage
+transaction as channel state. `persistChannelState` builds one
+`recovery.commit` per dispatch, so the record is a new `RecoveryMutation`
+variant on the model of `ffor_voucher`, behind its own optional storage
+interface, with stage changes queued through `withStagedMutations` so they
+ride the channel save that causes them. It is not a wallet-data record:
+wallet data sits outside that transaction, and the record has to be durable
+before the first `tx_signatures` leaves.
 
 ```
 id                 32 random bytes (the operation id the API returns)
@@ -386,16 +402,21 @@ the UTC midnight reset even if the splice later fails. The composite does
 better by using the existing reservation: `_pendingSpendSats` is reserved at
 PLANNED, converted to a recorded spend at RELEASED (the point past which the
 money leaves) and released at ABORTED. The charge is in the composite record,
-so it survives a restart and is charged exactly once across retries. The
-single-channel address splice-out keeps its current accounting in step 5;
-moving it to the same reservation is a separate change.
+so it survives a restart and is charged exactly once across retries.
+`_pendingSpendSats` itself is not persisted (boot restores only async spend
+claims), so a node re-adds the reservation of every composite record still
+live between PLANNED and PEERS_SIGNED when it loads. The single-channel
+address splice-out keeps its current accounting in step 5; moving it to the
+same reservation is a separate change.
 
 ### API surface
 
 - `BeignetNode.quoteChannelSend`, `executeChannelSend`,
   `getChannelSend(operationId)`, `listChannelSends()`.
-- Daemon routes under `/channel-send/*` in `src/cli/routes.ts`: quote and
-  status at invoice scope, execute at admin scope, like the splice routes.
+- Daemon routes under `/channel-send/*` in `src/cli/routes.ts`: quote, status
+  and list at readonly scope, execute at admin scope and idempotent, the
+  split `/channel/splice-quote` and `/channel/splice-out` use today (invoice
+  scope covers receive-side routes only, `tests/cli/auth-scopes.test.ts`).
 - Events: `channel-send:stage` with the operation id and the new stage.
 - OpenAPI, `npm run api:snapshot`, `npm run docs:tables` for the new events.
 
@@ -406,9 +427,9 @@ moving it to the same reservation is a separate change.
 - Composite inputs need the acceptor to admit a verifiable 2-of-2 P2WSH
   initiator input (section 3). A beignet acceptor advertises that with a new
   odd feature bit in beignet's custom range, `option_composite_splice_inputs`
-  (next free pair after the bits in `src/lightning/features/flags.ts`, which
-  reach 453 today), set optional. A beignet primary without the bit is not
-  selected.
+  (bits 454/455, the next free pair after the ones in
+  `src/lightning/features/flags.ts`), set optional. A beignet primary without
+  the bit is not selected.
 - CLN is the one third-party implementation that splices with beignet
   (`docker/docker-compose.yml`, `cln-splice-matrix.test.ts`). Whether CLN
   accepts a P2WSH initiator input it cannot verify is not known from this
@@ -417,23 +438,26 @@ moving it to the same reservation is a separate change.
 - eclair does not splice in our stack and LND does not splice at all; their
   channels are never selected and the refusal says so.
 
-## 9. Open decisions
+## 9. Decisions
 
-These are proposed above and need confirmation before step 5 starts:
+Proposed in the sections above and confirmed on 2026-11-03 (issue #1922). The
+alternatives are kept for the record.
 
-1. Debit order: largest spendable balance first (section 1). Alternative: rank
-   order.
+1. Debit order: largest spendable balance first (section 1). Confirmed; rank
+   order was the alternative.
 2. Fee apportionment: proportional to debit, rounded up per channel
-   (section 1). Alternative: all from the largest channel.
+   (section 1). Confirmed; all from the largest channel was the alternative.
 3. Mixed wallet-plus-channel transactions: out of scope, separate follow-up
-   (section 7).
+   (section 7). Confirmed.
 4. One composite at a time per node, refused not queued (section 6).
+   Confirmed.
 5. The composite reservation for spend limits replaces initiation-time
    recording for composites only; the single-channel splice-out keeps its
-   accounting (section 7).
+   accounting (section 7). Confirmed.
 6. The capability is a feature bit rather than a custom-message probe
-   (section 8).
+   (section 8). Confirmed; bits 454/455.
 7. CLN peers are excluded until the matrix tier exists (section 8).
+   Confirmed; the tier lands with step 5b.
 
 ## 10. Implementation plan for step 5
 
