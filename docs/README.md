@@ -44,6 +44,7 @@ The option and event tables in the two READMEs above are generated from the code
 | [specs/CONCURRENT-RECEIVE.md](specs/CONCURRENT-RECEIVE.md) | FFOR concurrent receive, extension version 1: ordinary payments on a channel with a live voucher book |
 | [FFOR-RESERVED-RETIREMENT.md](FFOR-RESERVED-RETIREMENT.md) | FFOR concurrent receive and reserved retirement: the version 1 and 2 contracts |
 | [SPLICE-LOCK-DEPTH.md](SPLICE-LOCK-DEPTH.md) | Depth-locked splices and conflicted-splice revert, two BOLT 2 extensions |
+| [MULTI-CHANNEL-SPLICE-OUT.md](MULTI-CHANNEL-SPLICE-OUT.md) | Design note: one transaction that splices out of several channels and pays an address once, with session composition, signatures, abort, restart, fees and peer support |
 | [DIRECT-FUNDING-OWNERSHIP-PROOFS.md](DIRECT-FUNDING-OWNERSHIP-PROOFS.md) | How a direct-funding receiver proves control of its named input |
 
 ## Records
