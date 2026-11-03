@@ -43,6 +43,11 @@ import {
 	realInitialCommitmentSig
 } from './helpers/real-signing';
 import { COMMIT_ALL } from './helpers/channel-persistence';
+import {
+	connectNodes,
+	createNode,
+	openReadyChannel
+} from './helpers/loopback-nodes';
 
 function makeBasepoints(seed: Buffer): IChannelBasepoints {
 	const keys: Buffer[] = [];
@@ -129,7 +134,21 @@ function connectManagers(
 	);
 }
 
+// Every ChannelManager a test builds is detached once the test ends. A manager
+// left quiescing re-arms its watchdog forever, and under mocha --parallel that
+// timer keeps reading channel state in whatever file the worker runs next
+// (issue #1937).
+const managers: ChannelManager[] = [];
+function track(manager: ChannelManager): ChannelManager {
+	managers.push(manager);
+	return manager;
+}
+
 describe('Quiescence (STFU)', function () {
+	afterEach(function () {
+		for (const manager of managers.splice(0)) manager.detachFromPeerManager();
+	});
+
 	const openerSeed = Buffer.alloc(32, 0x01);
 	const acceptorSeed = Buffer.alloc(32, 0x02);
 	const openerCommitmentSeed = crypto
@@ -871,8 +890,8 @@ describe('Quiescence (STFU)', function () {
 			alice: ChannelManager;
 			bob: ChannelManager;
 		} {
-			const alice = new ChannelManager(aliceConfig);
-			const bob = new ChannelManager(bobConfig);
+			const alice = track(new ChannelManager(aliceConfig));
+			const bob = track(new ChannelManager(bobConfig));
 			connectManagers(alice, alicePubkey, bob, bobPubkey);
 			// Absorb errors
 			alice.on('error', () => {});
@@ -1139,14 +1158,18 @@ describe('Quiescence (STFU)', function () {
 			bob: ChannelManager;
 			channelId: Buffer;
 		} {
-			const alice = new ChannelManager({
-				...aliceConfig,
-				quiescenceTimeoutMs: QUIESCENCE_TIMEOUT_MS
-			});
-			const bob = new ChannelManager({
-				...bobConfig,
-				quiescenceTimeoutMs: QUIESCENCE_TIMEOUT_MS
-			});
+			const alice = track(
+				new ChannelManager({
+					...aliceConfig,
+					quiescenceTimeoutMs: QUIESCENCE_TIMEOUT_MS
+				})
+			);
+			const bob = track(
+				new ChannelManager({
+					...bobConfig,
+					quiescenceTimeoutMs: QUIESCENCE_TIMEOUT_MS
+				})
+			);
 			connectDroppingStfu(alice, bob);
 			alice.on('error', () => {});
 			bob.on('error', () => {});
@@ -1166,14 +1189,18 @@ describe('Quiescence (STFU)', function () {
 		it('a crossing add drains in SENT_STFU and the deferred stfu reply completes the handshake', function () {
 			// Order-preserving wire: once deferred, every message queues and is
 			// delivered strictly FIFO, exactly as the ordered transport would.
-			const alice = new ChannelManager({
-				...aliceConfig,
-				quiescenceTimeoutMs: QUIESCENCE_TIMEOUT_MS
-			});
-			const bob = new ChannelManager({
-				...bobConfig,
-				quiescenceTimeoutMs: QUIESCENCE_TIMEOUT_MS
-			});
+			const alice = track(
+				new ChannelManager({
+					...aliceConfig,
+					quiescenceTimeoutMs: QUIESCENCE_TIMEOUT_MS
+				})
+			);
+			const bob = track(
+				new ChannelManager({
+					...bobConfig,
+					quiescenceTimeoutMs: QUIESCENCE_TIMEOUT_MS
+				})
+			);
 			let deferDelivery = false;
 			const wire: Array<() => void> = [];
 			const route = (
@@ -1309,14 +1336,18 @@ describe('Quiescence (STFU)', function () {
 		it('a QUIESCENT session with a live HTLC also times out', async function () {
 			// The MUST covers the whole session, not just the handshake: a
 			// stalled dependent protocol with an HTLC pending must disconnect.
-			const alice = new ChannelManager({
-				...aliceConfig,
-				quiescenceTimeoutMs: QUIESCENCE_TIMEOUT_MS
-			});
-			const bob = new ChannelManager({
-				...bobConfig,
-				quiescenceTimeoutMs: QUIESCENCE_TIMEOUT_MS
-			});
+			const alice = track(
+				new ChannelManager({
+					...aliceConfig,
+					quiescenceTimeoutMs: QUIESCENCE_TIMEOUT_MS
+				})
+			);
+			const bob = track(
+				new ChannelManager({
+					...bobConfig,
+					quiescenceTimeoutMs: QUIESCENCE_TIMEOUT_MS
+				})
+			);
 			connectManagers(alice, alicePubkey, bob, bobPubkey);
 			alice.on('error', () => {});
 			bob.on('error', () => {});
@@ -1347,6 +1378,29 @@ describe('Quiescence (STFU)', function () {
 
 			await sleep(QUIESCENCE_TIMEOUT_MS * 3);
 			expect(timeouts.length).to.be.above(0);
+		});
+	});
+
+	describe('a destroyed node retires its quiescence watchdog (issue #1937)', function () {
+		it('destroy() clears the watchdog of a channel left quiescing, so nothing reads the channel afterwards', function () {
+			const alice = createNode('quiescence-1937', 1);
+			const bob = createNode('quiescence-1937', 2);
+			connectNodes(alice, bob);
+			const channelId = openReadyChannel(alice, bob);
+			const manager = alice.getChannelManager();
+			expect(manager.initiateQuiescence(channelId).ok).to.equal(true);
+			const timers = (
+				manager as unknown as { quiescenceTimers: Map<string, unknown> }
+			).quiescenceTimers;
+			expect(
+				timers.size,
+				'the watchdog is armed while the session lives'
+			).to.equal(1);
+
+			alice.destroy();
+
+			expect(timers.size, 'destroy() retires it').to.equal(0);
+			bob.destroy();
 		});
 	});
 });

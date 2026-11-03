@@ -11722,6 +11722,10 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		if (this.peerManager) {
 			this.peerManager.destroy();
 		}
+		// ChannelManager timers would outlive the node otherwise: a quiescence
+		// watchdog re-arms itself for as long as its channel stays quiescent, and
+		// the held unknown-reestablish timer waits on a peer that is gone (#1937).
+		this.channelManager.detachFromPeerManager();
 		this.onionMessageManager.destroy();
 		this.offerManager.destroy();
 		// Persist mission control on destroy
