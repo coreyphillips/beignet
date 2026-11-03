@@ -194,14 +194,14 @@ export interface LightningNodeEvents
 	// ─── Splices ───
 
 	/** splice_locked exchanged both ways: the channel runs on the new funding. */
-	/** A composite splice-out (issue #1922) reached a stage; ABORTED carries the reason. */
-	'composite-splice:stage': (
-		data: import('./composite-splice-engine').ICompositeSpliceStageEvent
-	) => void;
 	'splice:complete': (data: {
 		channelId: Buffer;
 		fundingTxid: Buffer | null | undefined;
 	}) => void;
+	/** A composite splice-out (issue #1922) reached a stage; ABORTED carries the reason. */
+	'composite-splice:stage': (
+		data: import('./composite-splice-engine').ICompositeSpliceStageEvent
+	) => void;
 	/** A splice negotiation was unwound by tx_abort before its point of no return. */
 	'splice:aborted': (data: { channelId: Buffer; reason: string }) => void;
 	/** An input of an in-flight splice that this node does not vouch for (a depth-locked splice carrying a stranger's coin, issue #760) was spent by another transaction, confirmed six deep while the splice is not on chain: the splice can never confirm. The node records it durably, raises `node:error` code `SPLICE_INPUT_CONFLICT`, and asks the peer to verify and revert; the request is re-sent every block and on reconnect until agreed. */
