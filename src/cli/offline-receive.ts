@@ -343,27 +343,31 @@ export class OfflineReceive {
 	}
 
 	/**
-	 * Whether a direct-funded request could be created at this peer: the
-	 * payer has to be told where to reach the peer's relay, so an address must
-	 * be known for it, from the primaries list, from the direct-funding policy
-	 * when it names this peer, or from the TCP dial this node last reached it
-	 * by. The address a peer that dialed us is up on is no use: its port is
-	 * the ephemeral source port of its socket. The create-time rule of
+	 * Whether a direct-funded request could be created at this peer. The peer
+	 * must be one the operator configured, a primary or the policy's own, or
+	 * with no policy yet the one this request configures it for, since the
+	 * mint takes a named peer from nowhere else. And the payer has to be told
+	 * where to reach the peer's relay, so an address must be known for it,
+	 * from the primaries list, from the direct-funding policy when it names
+	 * this peer, or from the TCP dial this node last reached it by. The
+	 * address a peer that dialed us is up on is no use: its port is the
+	 * ephemeral source port of its socket. The create-time rule of
 	 * `directFunding`, applied before a steered quote binds a peer the create
 	 * would then refuse. The coordinator never dials, so a candidate that is
 	 * not connected is passed over by `route`.
 	 */
 	private directFundingEligible(peer: string): void {
 		const config = this.node.getDirectFundingConfig();
-		if (
-			config.lspPubkey?.toLowerCase() === peer &&
-			config.lspHost &&
-			config.lspPort
-		)
-			return;
+		const policyPeer = config.lspPubkey?.toLowerCase();
+		if (policyPeer === peer && config.lspHost && config.lspPort) return;
 		const stored = this.node
 			.listPrimaries()
 			.primaries.find((p) => p.pubkey === peer);
+		if (policyPeer !== undefined && policyPeer !== peer && !stored)
+			fail(
+				'RECEIVE_UNAVAILABLE',
+				'This peer is neither a configured primary nor the direct-funding liquidity peer. Add it to the primaries before creating this payment request.'
+			);
 		const address = relayAddressOf(
 			stored
 				? {

@@ -3354,7 +3354,8 @@ Direct funding (a payer's on-chain payment IS this node's channel funding):
                                          Mint a payment request; the receipt
                                          preimage stays here. --host/--port are
                                          where a payer can reach this node.
-                                         --lsp binds it to that peer; omitted,
+                                         --lsp binds it to that peer, which is
+                                         a primary or the policy's; omitted,
                                          the primaries choose, else the policy
   direct-funding prepare <request>       Decode a request and start connecting
                                          to the node a send would use, without

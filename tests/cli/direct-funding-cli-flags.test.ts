@@ -117,7 +117,9 @@ describe('CLI direct funding with trailing local flags', function () {
 	});
 
 	it('binds the request to --lsp (issue #1922)', async () => {
+		// A named peer must be a configured primary or the policy's peer.
 		const lsp = '02' + 'ab'.repeat(32);
+		daemon.node.addPrimary({ pubkey: lsp });
 		const parsed = await runCli(home, [
 			'direct-funding',
 			'request',

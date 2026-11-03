@@ -1447,6 +1447,9 @@ describe('automatic receive falls back to direct funding', function () {
 			...peers,
 			{ pubkey: stranger, host: '10.0.0.8', port: 9737, state: 'connected' }
 		];
+		// A named peer must be one the operator configured: a primary, or the
+		// configured one. Being up and dialed is not enough.
+		daemon.node.addPrimary({ pubkey: stranger });
 		const quoted = await request(
 			port,
 			'GET',
@@ -1467,8 +1470,9 @@ describe('automatic receive falls back to direct funding', function () {
 			amountSats: 120_000
 		});
 		// The envelope sends the payer through the stranger's relay, at the
-		// address it is connected on, and the request is bound to the stranger,
-		// so that is the peer the channel opens with when the offer arrives.
+		// address this node dialed it at, and the request is bound to the
+		// stranger, so that is the peer the channel opens with when the offer
+		// arrives.
 		const env = decodeRequestEnvelope(result.request as string);
 		const relay = env.transports.find(
 			(t) => t.type === DfTransportType.ONION_MESSAGE
@@ -1478,6 +1482,38 @@ describe('automatic receive falls back to direct funding', function () {
 		expect(boundPeerOf(daemon, result.paymentHash as string)).to.equal(
 			stranger
 		);
+		const config = await request(port, 'GET', '/direct-funding/config');
+		expect((config.body.result as { lspPubkey: string }).lspPubkey).to.equal(
+			lsp
+		);
+	});
+
+	it('refuses a named peer that is neither a primary nor the configured one (issue #1922)', async () => {
+		// Up and dialed, but configured nowhere: the peer a direct-funded
+		// channel opens with holds every payment it receives, so it comes from
+		// the operator's configuration and nowhere else.
+		const outsider =
+			'03' + 'c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5';
+		peers = [
+			...peers,
+			{ pubkey: outsider, host: '10.0.0.9', port: 9738, state: 'ready' }
+		];
+		const quoted = await request(
+			port,
+			'GET',
+			`/receive/quote?peer=${outsider}&amountSats=120000`
+		);
+		expect(quoted.status).to.equal(200);
+		const created = await request(port, 'POST', '/receive/invoice', {
+			peer: outsider,
+			amountSats: 120_000,
+			requestId: 'daemon-receive-0003',
+			quote: quoted.body.result
+		});
+		expect(created.status).to.equal(409);
+		const error = created.body.error as { code: string; message: string };
+		expect(error.code).to.equal('RECEIVE_UNAVAILABLE');
+		expect(error.message).to.contain('neither a configured primary');
 		const config = await request(port, 'GET', '/direct-funding/config');
 		expect((config.body.result as { lspPubkey: string }).lspPubkey).to.equal(
 			lsp

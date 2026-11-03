@@ -8190,7 +8190,8 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	}
 
 	/**
-	 * The address this node last dialed a peer at, if it ever did, and the
+	 * The address this node last dialed a peer at, if it ever did, in this run
+	 * or an earlier one (the last successful dial is persisted), and the
 	 * transport it used. A peer that only ever connected inbound has none:
 	 * `listPeers` then shows the far end of its socket, whose port is
 	 * ephemeral, so this is what to consult for an address others can dial.
@@ -10537,8 +10538,11 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	 * PUBLIC_HOST, both with this wallet's listen port, and this node has no way
 	 * to know which is right.
 	 *
-	 * `lspPubkey` names the peer the funding is negotiated with (issue #1922):
-	 * the envelope's relay descriptors name it, at the address the primaries
+	 * `lspPubkey` names the peer the funding is negotiated with (issue #1922).
+	 * It must be a configured primary or the policy's liquidity peer, else
+	 * INVALID_PARAMS: the route that names it runs at invoice scope, and the
+	 * peer a direct-funded channel opens with holds every payment it receives.
+	 * The envelope's relay descriptors name it, at the address the primaries
 	 * list stores for it, else the policy's address for it, else the one this
 	 * node dialed it at, and the receiver opens the channel with it when the
 	 * offer arrives, whatever the direct-funding policy says by then. Omitted,
@@ -10575,6 +10579,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 		};
 		if (opts.lspPubkey !== undefined) {
 			const pubkey = opts.lspPubkey.toLowerCase();
+			this.requireLiquidityPeerConfigured(pubkey);
 			return this.mintDirectFundingRequestAt(base, {
 				pubkey,
 				address: this.liquidityAddressOf(pubkey)
@@ -10623,6 +10628,30 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 			});
 			throw this.directFundingFailure(err);
 		}
+	}
+
+	/**
+	 * Refuse a named liquidity peer the operator never configured. The route
+	 * that names one runs at invoice scope, and the peer a direct-funded
+	 * channel opens with holds every payment it receives, so which peers can
+	 * be named stays with the admin routes: the primaries, and the policy.
+	 */
+	private requireLiquidityPeerConfigured(pubkey: string): void {
+		if (
+			this.node.getDirectFundingPolicy()?.liquidityPeer?.toLowerCase() ===
+			pubkey
+		)
+			return;
+		if (
+			this.primariesStore()
+				.get()
+				.primaries.some((p) => p.pubkey === pubkey)
+		)
+			return;
+		throw new BeignetError(
+			BeignetErrorCode.INVALID_PARAMS,
+			'lspPubkey is neither a configured primary nor the direct-funding liquidity peer'
+		);
 	}
 
 	/**

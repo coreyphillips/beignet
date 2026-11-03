@@ -1132,7 +1132,16 @@ describe('receive request creation', () => {
 	});
 
 	it('mints for another peer without retargeting the configured one (issue #1922)', async () => {
-		const f = fixture({}, { jobs: [], config: { lspPubkey: otherPeer } });
+		// The other peer is a configured primary: a named peer has to be one,
+		// or the configured peer itself.
+		const f = fixture(
+			{},
+			{
+				jobs: [],
+				config: { lspPubkey: otherPeer },
+				primaries: [{ pubkey: peer }]
+			}
+		);
 		const quote = await f.coordinator.quote(peer, 20000);
 		const created = await f.coordinator.create(body(quote), peer);
 		assert.equal(created.kind, 'direct-funding');
@@ -1142,6 +1151,30 @@ describe('receive request creation', () => {
 		assert.deepEqual(f.configured, []);
 		assert.equal(f.config.lspPubkey, otherPeer);
 		assert.equal(f.coordinator.status().requests.length, 1);
+	});
+
+	it('refuses a peer that is neither a primary nor the configured one once a policy exists', async () => {
+		// Up and dialed, so a request could carry a relay for it, but the
+		// operator never configured it: the peer a direct-funded channel opens
+		// with holds every payment it receives, so the choice stays theirs.
+		const f = fixture(
+			{},
+			{
+				jobs: [],
+				config: { lspPubkey: otherPeer, lspHost: 'lsp.example', lspPort: 9735 }
+			}
+		);
+		const quote = await f.coordinator.quote(peer, 20000);
+		await assert.rejects(
+			f.coordinator.create(body(quote), peer),
+			(e: Failure) => {
+				assert.equal(e.code, 'RECEIVE_UNAVAILABLE');
+				assert.match(e.message, /neither a configured primary/);
+				return true;
+			}
+		);
+		assert.equal(f.minted, 0);
+		assert.deepEqual(f.configured, []);
 	});
 
 	it('refuses a peer no payer could be told how to reach', async () => {

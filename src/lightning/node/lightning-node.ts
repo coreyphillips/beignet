@@ -9918,15 +9918,28 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	/**
 	 * The address this node last dialed a peer at, if it ever did: the one
 	 * `listPeers` reports for it while it is up, and the first a reconnect
-	 * tries. A peer that has only ever connected inbound has none, since its
-	 * TCP source port is ephemeral, and `listPeers` then shows that port.
+	 * tries. Read from the live dial cache, else from the address the last
+	 * successful dial persisted, which is all a peer dialed in an earlier run
+	 * and not yet in this one has. A peer that has only ever connected inbound
+	 * has neither, since its TCP source port is ephemeral, and `listPeers`
+	 * then shows that port.
 	 */
 	getPeerAddress(
 		pubkey: string
 	):
 		| { host: string; port: number; transport?: IPeerTransportOptions }
 		| undefined {
-		return this.peerManager?.getPeerAddress(pubkey);
+		const live = this.peerManager?.getPeerAddress(pubkey);
+		if (live) return live;
+		if (!this.storage) return undefined;
+		const key = normalizeHexPubkey(pubkey);
+		const saved = this.loadPeerAddresses().find((a) => a.pubkey === key);
+		if (!saved) return undefined;
+		return {
+			host: saved.host,
+			port: saved.port,
+			...(saved.transport ? { transport: saved.transport } : {})
+		};
 	}
 
 	/**
@@ -28527,7 +28540,6 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	}): { record: IDfRequestRecord; request: string; expiresAt: number } {
 		const df = this.directFunding;
 		if (!df) throw new Error('direct funding is not configured on this node');
-		const relay = this.directFundingRelay(opts);
 		const record = df.requests.mint({
 			ttlMs: opts.ttlMs ?? df.requestTtlMs,
 			...(opts.amountSat !== undefined ? { amountSat: opts.amountSat } : {}),
@@ -28537,6 +28549,20 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		});
 		let envelope: string;
 		try {
+			// Resolved after the mint, from the record's bound peer: validated and
+			// lower-cased by the store, so a malformed one is refused typed there
+			// rather than tripping on a string method here.
+			const relay = this.directFundingRelay({
+				...(record.liquidityPeer !== undefined
+					? { liquidityPeer: record.liquidityPeer }
+					: {}),
+				...(opts.liquidityHost !== undefined
+					? { liquidityHost: opts.liquidityHost }
+					: {}),
+				...(opts.liquidityPort !== undefined
+					? { liquidityPort: opts.liquidityPort }
+					: {})
+			});
 			envelope = encodeRequestEnvelope(
 				mintRequestEnvelope(
 					{

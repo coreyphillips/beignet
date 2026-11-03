@@ -112,7 +112,10 @@ opens a channel to obtain inbound liquidity.
   one, with every other setting at its default: that is the peer a `POST /direct-funding/request`
   naming no peer falls back to when no primaries are configured. A peer with
   no known address refuses with `RECEIVE_UNAVAILABLE`, and a steered quote
-  passes such a primary over.
+  passes such a primary over. Once a config exists, a named `peer` that is
+  neither a primary nor the configured peer refuses with `RECEIVE_UNAVAILABLE`
+  too: the peer a direct-funded channel opens with holds every payment it
+  receives, so it comes from the operator's configuration and nowhere else.
 - A direct-funding request is idempotent on `requestId` while it is unexpired:
   the same call returns the same envelope. Once it expires, the same id mints a
   replacement. It reserves nothing, starts no epoch and appears in no
