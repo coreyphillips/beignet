@@ -82,6 +82,8 @@ function harness(
 		authenticatedPeer?: string;
 		offer?: IDfOfferOverrides;
 		publish?: boolean;
+		/** Mint the request bound to this peer (issue #1922). */
+		boundPeer?: string;
 	} = {}
 ): IHarness {
 	const node = new FakeDfNode();
@@ -92,7 +94,7 @@ function harness(
 		...config
 	});
 	engine.start();
-	const record = node.mintRequest();
+	const record = node.mintRequest(undefined, undefined, opts.boundPeer);
 	const payer = new FakePayerLane(record, 'payer-lane', opts.authenticatedPeer);
 	const coin = makeCoin(opts.coinKind ?? 'p2wpkh', opts.coinValue ?? 100_000);
 	if (opts.publish !== false) node.publish(coin);
@@ -435,6 +437,24 @@ describe('Direct funding receiver: admission (issue #612)', () => {
 		expect(() => input.signWitness(new bitcoin.Transaction(), 0, 0n)).to.throw(
 			'witness comes from the payer'
 		);
+	});
+
+	it('opens the channel with the peer the request was minted for, not the policy peer (issue #1922)', async () => {
+		const bound = '03' + '7c'.repeat(32);
+		const h = harness({}, { boundPeer: bound });
+		await h.sendOffer();
+		expect(h.acks()[0]).to.deep.equal({ accepted: true });
+		expect(h.node.opens).to.have.length(1);
+		expect(h.node.opens[0].peerHex).to.equal(bound);
+	});
+
+	it('serves a bound request when the policy names no liquidity peer', async () => {
+		const bound = '03' + '7c'.repeat(32);
+		const h = harness({}, { boundPeer: bound });
+		h.node.lspPubkey = null;
+		await h.sendOffer();
+		expect(h.acks()[0]).to.deep.equal({ accepted: true });
+		expect(h.node.opens[0].peerHex).to.equal(bound);
 	});
 
 	it('sets confirmed from what the chain says, not from the payer', async () => {

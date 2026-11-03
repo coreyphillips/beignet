@@ -2,7 +2,11 @@ import type { BeignetNode } from './beignet-node';
 import type { ChannelInfo } from './types';
 import type { BeignetErrorCodeValue } from './errors';
 import { BeignetError } from './errors';
-import { OFFLINE_RECEIVE_STEER_CODES, steerReceive } from './receive-steering';
+import {
+	OFFLINE_RECEIVE_STEER_CODES,
+	relayAddressOf,
+	steerReceive
+} from './receive-steering';
 import type { ISteerCandidate } from './receive-steering';
 import { DEFAULT_CHANNEL_CONFIG } from '../lightning/channel/types';
 
@@ -339,28 +343,46 @@ export class OfflineReceive {
 	}
 
 	/**
-	 * Whether a direct-funded request could be created at this peer. The
-	 * create-time rules of `directFunding`, applied before a steered quote
-	 * binds a peer the create would then refuse. The coordinator never dials,
-	 * so a candidate that is not connected is passed over by `route`.
+	 * Whether a direct-funded request could be created at this peer. The peer
+	 * must be one the operator configured, a primary or the policy's own, or
+	 * with no policy yet the one this request configures it for, since the
+	 * mint takes a named peer from nowhere else. And the payer has to be told
+	 * where to reach the peer's relay, so an address must be known for it,
+	 * from the primaries list, from the direct-funding policy when it names
+	 * this peer, or from the TCP dial this node last reached it by. The
+	 * address a peer that dialed us is up on is no use: its port is the
+	 * ephemeral source port of its socket. The create-time rule of
+	 * `directFunding`, applied before a steered quote binds a peer the create
+	 * would then refuse. The coordinator never dials, so a candidate that is
+	 * not connected is passed over by `route`.
 	 */
 	private directFundingEligible(peer: string): void {
-		const configured = this.node
-			.getDirectFundingConfig()
-			.lspPubkey?.toLowerCase();
-		if (configured && configured !== peer)
+		const config = this.node.getDirectFundingConfig();
+		const policyPeer = config.lspPubkey?.toLowerCase();
+		if (policyPeer === peer && config.lspHost && config.lspPort) return;
+		const stored = this.node
+			.listPrimaries()
+			.primaries.find((p) => p.pubkey === peer);
+		if (policyPeer !== undefined && policyPeer !== peer && !stored)
 			fail(
 				'RECEIVE_UNAVAILABLE',
-				'Direct funding is configured for another peer. Change that setting before receiving from this one.'
+				'This peer is neither a configured primary nor the direct-funding liquidity peer. Add it to the primaries before creating this payment request.'
 			);
-		if (!configured) {
-			const entry = this.node.listPeers().find((p) => p.pubkey === peer);
-			if (!entry?.host || !entry.port)
-				fail(
-					'RECEIVE_UNAVAILABLE',
-					'Connect to your node before creating this payment request.'
-				);
-		}
+		const address = relayAddressOf(
+			stored
+				? {
+						...(stored.host !== null ? { host: stored.host } : {}),
+						...(stored.port !== null ? { port: stored.port } : {}),
+						...(stored.uri !== null ? { uri: stored.uri } : {})
+				  }
+				: undefined,
+			this.node.getPeerAddress(peer)
+		);
+		if (!address)
+			fail(
+				'RECEIVE_UNAVAILABLE',
+				'No address is known for this peer. Dial it over TCP, or store its host and port with the primaries, before creating this payment request.'
+			);
 	}
 
 	private async steeredQuote(amountSats: number): Promise<any> {
@@ -471,13 +493,19 @@ export class OfflineReceive {
 		);
 	}
 	/**
-	 * The direct-funding fallback: point the node at this peer and mint a request.
+	 * The direct-funding fallback: mint a request bound to this peer.
 	 *
-	 * No epoch, no reservation and no channel of our own. An existing config for
-	 * the SAME peer is left exactly as the operator set it, because retargeting
-	 * inbound target, zero-conf trust or the splice switches behind their back is
-	 * a policy change nobody asked for. A config naming a DIFFERENT peer refuses
-	 * rather than silently moving the node's liquidity relationship.
+	 * No epoch, no reservation and no channel of our own. The request carries
+	 * the peer it was quoted at (issue #1922): its relay descriptors name that
+	 * peer and the receiver negotiates the funding with it, so the node's
+	 * direct-funding policy is neither consulted for the peer nor retargeted.
+	 * An existing policy, for this peer or another, is left exactly as the
+	 * operator set it, because moving the inbound target, the zero-conf trust,
+	 * the splice switches or the liquidity relationship behind their back is a
+	 * change nobody asked for. With no policy yet, the first request still
+	 * configures one for its peer, at the TCP address this node dialed it at
+	 * when there is one: that is the peer a request naming no peer and no
+	 * primaries falls back to.
 	 */
 	private directFunding(
 		body: { requestId: string; amountSats: number },
@@ -486,15 +514,22 @@ export class OfflineReceive {
 	): OfflineReceiveResult {
 		this.directFundingEligible(peer);
 		if (!this.node.getDirectFundingConfig().lspPubkey) {
-			const entry = this.node.listPeers().find((p) => p.pubkey === peer)!;
-			this.node.configureDirectFunding({
-				lspPubkey: peer,
-				lspHost: entry.host,
-				lspPort: entry.port
-			});
+			// The policy outlives this request and a later unbound request takes
+			// its relay from it, so only an address a payer could dial is
+			// written: the one the request itself uses when the primaries store
+			// none, and nothing at all for a peer up over ws or iroh, or one that
+			// dialed us, whose listed port is its socket's source port.
+			const dialed = relayAddressOf(undefined, this.node.getPeerAddress(peer));
+			if (dialed)
+				this.node.configureDirectFunding({
+					lspPubkey: peer,
+					lspHost: dialed.host,
+					lspPort: dialed.port
+				});
 		}
 		const minted = this.node.createDirectFundingRequest({
-			amountSats: body.amountSats
+			amountSats: body.amountSats,
+			lspPubkey: peer
 		});
 		const job: OfflineReceiveJob =
 			existing ??

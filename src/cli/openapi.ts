@@ -424,7 +424,7 @@ export function getOpenApiSpec(): Record<string, unknown> {
 			'/direct-funding/config': {
 				get: {
 					summary:
-						'Read the effective direct-funding policy. lspPubkey is null when no liquidity peer has been set, in which case this node serves no offers. Readonly scope',
+						'Read the effective direct-funding policy. lspPubkey is null when no liquidity peer has been set, in which case a request that bound no peer of its own is not served (one minted with lspPubkey, or steered to a primary, names its own peer, issue #1922). Readonly scope',
 					tags: ['DirectFunding'],
 					responses: {
 						'200': {
@@ -554,22 +554,29 @@ export function getOpenApiSpec(): Record<string, unknown> {
 			'/direct-funding/request': {
 				post: {
 					summary:
-						'Mint a direct-funding payment request. Returns the receipt hash (its preimage stays here and is revealed to the payer after broadcast, as a delivery receipt) and `request`, the base64url envelope a payer pays; put it in a BIP 21 URI under the bgnq parameter. host and port are the address a payer can reach this node on and are used exactly as given: the daemon has no way to know which of a browser hostname and a public host is right. With neither, no direct-peer descriptor is emitted and the payer reaches this node through the liquidity peer. Invoice scope',
+						'Mint a direct-funding payment request. Returns the receipt hash (its preimage stays here and is revealed to the payer after broadcast, as a delivery receipt) and `request`, the base64url envelope a payer pays; put it in a BIP 21 URI under the bgnq parameter. host and port are the address a payer can reach this node on and are used exactly as given: the daemon has no way to know which of a browser hostname and a public host is right. With neither, no direct-peer descriptor is emitted and the payer reaches this node through the liquidity peer. lspPubkey binds the request to that peer (issue #1922), which must be a configured primary or the policy liquidity peer, else 400 INVALID_PARAMS, since this route runs at invoice scope and that peer holds every payment the channel receives: the relay descriptors name it, at the address the primaries list stores for it, else the policy address for it, else the one this node dialed it at, and the receiver negotiates the funding with it when the offer arrives, whatever the direct-funding policy says by then. Omitted, the ranked primaries choose when any are configured (GET /primaries): the first in selectionOrder with a known address is bound, the others are listed in skipped, and 503 NO_PRIMARY_AVAILABLE answers when none has one; nothing is dialed, since the payer reaches this node through that primary relay later. With no primaries the policy liquidity peer serves, as before. The answer names the peer in lspPubkey. Invoice scope',
 					tags: ['DirectFunding'],
 					requestBody: bodyContent({
 						host: 'string?',
 						port: 'number?',
-						amountSats: 'number?'
+						amountSats: 'number?',
+						lspPubkey: 'string?'
 					}),
 					responses: {
 						'200': {
-							description: 'The minted request',
+							description:
+								'The minted request, the peer it is bound to, and the primaries passed over when it was steered',
 							content: jsonContent({
 								type: 'object',
 								properties: {
 									paymentHash: { type: 'string' },
 									expiresAt: { type: 'number' },
-									request: { type: 'string' }
+									request: { type: 'string' },
+									lspPubkey: { type: 'string', nullable: true },
+									skipped: {
+										type: 'array',
+										items: { $ref: '#/components/schemas/ReceiveSteerSkip' }
+									}
 								}
 							})
 						}
@@ -2344,7 +2351,7 @@ export function getOpenApiSpec(): Record<string, unknown> {
 			'/receive/quote': {
 				get: {
 					summary:
-						"Quote automatic offline receiving at a connected primary without reserving funds. Answers mode='bolt11' when a channel that ALREADY exists with this peer can carry the amount offline (NORMAL, usable, concurrent settlement negotiated or no spendable local balance, unreserved, no live epoch, inbound >= amountSats + 50000), otherwise mode='direct-funding', the fallback where a payer's on-chain payment becomes this node's channel funding. This route never opens a channel. The peer must be connected either way. With no peer the ranked primaries choose (GET /primaries): a requestId already under way keeps its own peer; otherwise the primaries are tried in selectionOrder and the first one that is connected, serves the amount on the route it would take, and could be created against (direct funding not configured for another peer) is quoted, with the others listed in skipped. The answer's peer is what POST /receive/invoice binds to. 503 NO_PRIMARY_AVAILABLE names every reason when none qualifies, 400 INVALID_PARAMS when no primary is configured. A named peer is quoted as before, with no fallback",
+						"Quote automatic offline receiving at a connected primary without reserving funds. Answers mode='bolt11' when a channel that ALREADY exists with this peer can carry the amount offline (NORMAL, usable, concurrent settlement negotiated or no spendable local balance, unreserved, no live epoch, inbound >= amountSats + 50000), otherwise mode='direct-funding', the fallback where a payer's on-chain payment becomes this node's channel funding. This route never opens a channel. The peer must be connected either way. With no peer the ranked primaries choose (GET /primaries): a requestId already under way keeps its own peer; otherwise the primaries are tried in selectionOrder and the first one that is connected, serves the amount on the route it would take, and could be created against (an address is known for its relay) is quoted, with the others listed in skipped. The answer's peer is what POST /receive/invoice binds to. 503 NO_PRIMARY_AVAILABLE names every reason when none qualifies, 400 INVALID_PARAMS when no primary is configured. A named peer is quoted as before, with no fallback",
 					tags: ['FFOR'],
 					parameters: [
 						{
@@ -2437,7 +2444,7 @@ export function getOpenApiSpec(): Record<string, unknown> {
 			'/receive/invoice': {
 				post: {
 					summary:
-						'Prepare and durably save an offline payment request. Retry the same requestId after interrupted creation. With a suitable existing channel this reserves liquidity on it and returns a bolt11 invoice; with none it falls back to direct funding, configuring direct funding for this peer when nothing is configured (an existing config for the same peer is reused untouched, one for a different peer refuses) and minting a direct-funding request. It never opens a channel. With no peer the one the reviewed quote named is used: the review bound it, and create never chooses another. Admin scope. Paid or expired reservations reconcile automatically after restart; a direct-funding request reserves nothing and simply expires.',
+						'Prepare and durably save an offline payment request. Retry the same requestId after interrupted creation. With a suitable existing channel this reserves liquidity on it and returns a bolt11 invoice; with none it falls back to direct funding, minting a request bound to this peer (issue #1922): its relay descriptors name the peer and the receiver negotiates the funding with it, whatever the direct-funding policy says, so an existing policy is left untouched whichever peer it names, and with no policy yet the first such request still configures one for this peer. It never opens a channel. With no peer the one the reviewed quote named is used: the review bound it, and create never chooses another. Admin scope. Paid or expired reservations reconcile automatically after restart; a direct-funding request reserves nothing and simply expires.',
 					tags: ['FFOR'],
 					requestBody: bodyContent({
 						peer: 'string?',
@@ -2471,7 +2478,7 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						},
 						'409': {
 							description:
-								"RECEIVE_UNAVAILABLE: the peer is not connected, in bolt11 mode did not answer within 15 s or refused (the message is the peer's own, e.g. 'Your node does not provide offline receiving.'), or direct funding is configured for a different peer; RECEIVE_BUSY: another request is being prepared or too many receive requests are in flight"
+								"RECEIVE_UNAVAILABLE: the peer is not connected, in bolt11 mode did not answer within 15 s or refused (the message is the peer's own, e.g. 'Your node does not provide offline receiving.'), or no address is known for the peer's relay; RECEIVE_BUSY: another request is being prepared or too many receive requests are in flight"
 						}
 					}
 				}
@@ -6058,7 +6065,7 @@ export function getOpenApiSpec(): Record<string, unknown> {
 							type: 'string',
 							nullable: true,
 							description:
-								'The liquidity peer every direct-funded channel is negotiated with. Null means this node serves no offers'
+								'The liquidity peer a direct-funded channel is negotiated with when the request bound no peer of its own (issue #1922). Null means those requests are not served'
 						},
 						lspHost: { type: 'string', nullable: true },
 						lspPort: { type: 'integer', nullable: true },

@@ -162,6 +162,11 @@ export class DirectFundingRequestStore {
 				dropped++;
 				continue;
 			}
+			// Stored lower-case by mint, and read the same way from a row edited
+			// by hand: the receiver matches the bound peer against its channels'
+			// peer hex, and a case mismatch would open a second channel.
+			if (entry.liquidityPeer !== undefined)
+				entry.liquidityPeer = entry.liquidityPeer.toLowerCase();
 			// The strip comes FIRST: a row whose only claim on life is a marker
 			// that did not come back intact has no funding to answer for.
 			if (stripMalformedAttempt(entry)) stripped = true;
@@ -246,7 +251,9 @@ export class DirectFundingRequestStore {
 	 * minted with. It is recorded here because this is the copy the receiver
 	 * checks an arriving offer against; the envelope's is the payer's.
 	 */
-	mint(opts: { ttlMs?: number; amountSat?: bigint } = {}): IDfRequestRecord {
+	mint(
+		opts: { ttlMs?: number; amountSat?: bigint; liquidityPeer?: string } = {}
+	): IDfRequestRecord {
 		this.sweep();
 		if (this.byHash.size >= this.maxOutstanding) {
 			throw new DirectFundingError(
@@ -259,6 +266,14 @@ export class DirectFundingRequestStore {
 			(opts.amountSat <= 0n || opts.amountSat > DF_MAX_AMOUNT_SAT)
 		) {
 			throw malformed(`amount_sat out of range: ${opts.amountSat}`);
+		}
+		if (
+			opts.liquidityPeer !== undefined &&
+			!isCompressedPubkeyHex(opts.liquidityPeer)
+		) {
+			throw malformed(
+				`liquidity_peer is not a compressed public key: ${opts.liquidityPeer}`
+			);
 		}
 		const ttl = Math.min(opts.ttlMs ?? this.ttlMs, DF_MAX_REQUEST_TTL_MS);
 		const preimage = randomBytes(DF_PREIMAGE_BYTES);
@@ -276,6 +291,9 @@ export class DirectFundingRequestStore {
 			expiresAt: this.now() + ttl,
 			...(opts.amountSat !== undefined
 				? { amountSat: opts.amountSat.toString() }
+				: {}),
+			...(opts.liquidityPeer !== undefined
+				? { liquidityPeer: opts.liquidityPeer.toLowerCase() }
 				: {})
 		};
 		this.index(record);
@@ -946,8 +964,16 @@ function isWellFormedRecord(entry: unknown): entry is IDfRequestRecord {
 		// A fixed amount that did not come back intact must not read as "any
 		// amount will do": the record is dropped and the request goes unpayable,
 		// which is the recoverable half of that choice.
-		(r.amountSat === undefined || isPositiveDecimal(r.amountSat))
+		(r.amountSat === undefined || isPositiveDecimal(r.amountSat)) &&
+		// Likewise a bound peer: served from the policy's peer instead, the
+		// payer's coin would fund a channel with a peer the request never named.
+		(r.liquidityPeer === undefined || isCompressedPubkeyHex(r.liquidityPeer))
 	);
+}
+
+/** A 33-byte compressed secp256k1 public key, hex. */
+function isCompressedPubkeyHex(value: unknown): value is string {
+	return typeof value === 'string' && /^0[23][0-9a-f]{64}$/i.test(value);
 }
 
 /**

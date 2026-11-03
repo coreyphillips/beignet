@@ -382,6 +382,15 @@ export interface IDfRequestRecord {
 	};
 	/** Reserved for the deferred rendezvous transport (#533), never minted. */
 	swarmSeedHex?: string;
+	/**
+	 * The peer this request's funding is negotiated with, 33-byte hex, when
+	 * the mint named one (issue #1922). The envelope carries that peer's relay
+	 * descriptors, so the offer arrives through it and the channel opens with
+	 * it, whatever the policy's liquidity peer is by then. Absent on a request
+	 * minted from the policy alone: that one is negotiated with the policy's
+	 * peer at admission, as before.
+	 */
+	liquidityPeer?: string;
 }
 
 /** PAID once the receipt is revealed; REVERTED when the splice it went into was. */

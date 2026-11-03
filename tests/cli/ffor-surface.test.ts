@@ -27,6 +27,8 @@ import {
 	IFforEpochRecord
 } from '../../src/lightning/ffor/types';
 import { decodeRequestEnvelope } from '../../src/lightning/direct-funding/envelope';
+import { DfTransportType } from '../../src/lightning/direct-funding/types';
+import type { IDfOnionTransport } from '../../src/lightning/direct-funding/types';
 import { BeignetCustomSubtype } from '../../src/lightning/message/custom';
 import { writableState } from '../lightning/helpers/writable-state';
 
@@ -47,6 +49,25 @@ const OFFLINE = {
 
 function tmpDir(tag: string): string {
 	return fs.mkdtempSync(path.join(os.tmpdir(), `beignet-ffor-${tag}-`));
+}
+
+/** The peer a minted request is bound to, read from the node's request store. */
+function boundPeerOf(
+	daemon: IStartedDaemon,
+	paymentHash: string
+): string | undefined {
+	const inner = (
+		daemon.node as unknown as {
+			node: {
+				directFunding: {
+					requests: {
+						byReceiptHash(hash: string): { liquidityPeer?: string } | null;
+					};
+				};
+			};
+		}
+	).node;
+	return inner.directFunding.requests.byReceiptHash(paymentHash)?.liquidityPeer;
 }
 
 function portOf(daemon: IStartedDaemon): number {
@@ -1316,6 +1337,11 @@ describe('automatic receive falls back to direct funding', function () {
 		// talks to the peer in this mode, which is the point of the fallback.
 		peers = [{ pubkey: lsp, host: '10.0.0.7', port: 9736, state: 'ready' }];
 		sinon.stub(daemon.node, 'listPeers').callsFake(() => peers);
+		// Every peer here was dialed by this node, at the address it is listed on.
+		sinon.stub(daemon.node, 'getPeerAddress').callsFake((pubkey: string) => {
+			const p = peers.find((e) => e.pubkey === pubkey);
+			return p ? { host: p.host, port: p.port } : undefined;
+		});
 	});
 
 	after(async function () {
@@ -1376,8 +1402,8 @@ describe('automatic receive falls back to direct funding', function () {
 		expect(env.amountSat).to.equal(120_000n);
 		expect(env.receiptHash.toString('hex')).to.equal(result.paymentHash);
 
-		// Direct funding now points at this peer, on the address it is connected
-		// on, with every other setting left at its default.
+		// Direct funding now points at this peer, at the address this node dialed
+		// it at, with every other setting left at its default.
 		const config = await request(port, 'GET', '/direct-funding/config');
 		expect(config.body.result).to.deep.equal({
 			lspPubkey: lsp,
@@ -1416,11 +1442,14 @@ describe('automatic receive falls back to direct funding', function () {
 		expect(retry.body.result).to.deep.equal(result);
 	});
 
-	it('refuses a second peer rather than retargeting the configured one', async () => {
+	it('mints for a second peer and leaves the configured one alone (issue #1922)', async () => {
 		peers = [
 			...peers,
 			{ pubkey: stranger, host: '10.0.0.8', port: 9737, state: 'connected' }
 		];
+		// A named peer must be one the operator configured: a primary, or the
+		// configured one. Being up and dialed is not enough.
+		daemon.node.addPrimary({ pubkey: stranger });
 		const quoted = await request(
 			port,
 			'GET',
@@ -1433,13 +1462,58 @@ describe('automatic receive falls back to direct funding', function () {
 			requestId: 'daemon-receive-0002',
 			quote: quoted.body.result
 		});
-		expect(created.status).to.equal(409);
-		expect(created.body.error).to.deep.include({
-			code: 'RECEIVE_UNAVAILABLE'
+		expect(created.status).to.equal(200);
+		const result = created.body.result as Record<string, unknown>;
+		expect(result).to.include({
+			kind: 'direct-funding',
+			peer: stranger,
+			amountSats: 120_000
 		});
-		expect((created.body.error as { message: string }).message).to.contain(
-			'another peer'
+		// The envelope sends the payer through the stranger's relay, at the
+		// address this node dialed it at, and the request is bound to the
+		// stranger, so that is the peer the channel opens with when the offer
+		// arrives.
+		const env = decodeRequestEnvelope(result.request as string);
+		const relay = env.transports.find(
+			(t) => t.type === DfTransportType.ONION_MESSAGE
+		) as IDfOnionTransport;
+		expect(relay.introNodeId.toString('hex')).to.equal(stranger);
+		expect(relay).to.include({ host: '10.0.0.8', port: 9737 });
+		expect(boundPeerOf(daemon, result.paymentHash as string)).to.equal(
+			stranger
 		);
+		const config = await request(port, 'GET', '/direct-funding/config');
+		expect((config.body.result as { lspPubkey: string }).lspPubkey).to.equal(
+			lsp
+		);
+	});
+
+	it('refuses a named peer that is neither a primary nor the configured one (issue #1922)', async () => {
+		// Up and dialed, but configured nowhere: the peer a direct-funded
+		// channel opens with holds every payment it receives, so it comes from
+		// the operator's configuration and nowhere else.
+		const outsider =
+			'03' + 'c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5';
+		peers = [
+			...peers,
+			{ pubkey: outsider, host: '10.0.0.9', port: 9738, state: 'ready' }
+		];
+		const quoted = await request(
+			port,
+			'GET',
+			`/receive/quote?peer=${outsider}&amountSats=120000`
+		);
+		expect(quoted.status).to.equal(200);
+		const created = await request(port, 'POST', '/receive/invoice', {
+			peer: outsider,
+			amountSats: 120_000,
+			requestId: 'daemon-receive-0003',
+			quote: quoted.body.result
+		});
+		expect(created.status).to.equal(409);
+		const error = created.body.error as { code: string; message: string };
+		expect(error.code).to.equal('RECEIVE_UNAVAILABLE');
+		expect(error.message).to.contain('neither a configured primary');
 		const config = await request(port, 'GET', '/direct-funding/config');
 		expect((config.body.result as { lspPubkey: string }).lspPubkey).to.equal(
 			lsp

@@ -9916,6 +9916,33 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	}
 
 	/**
+	 * The address this node last dialed a peer at, if it ever did: the one
+	 * `listPeers` reports for it while it is up, and the first a reconnect
+	 * tries. Read from the live dial cache, else from the address the last
+	 * successful dial persisted, which is all a peer dialed in an earlier run
+	 * and not yet in this one has. A peer that has only ever connected inbound
+	 * has neither, since its TCP source port is ephemeral, and `listPeers`
+	 * then shows that port.
+	 */
+	getPeerAddress(
+		pubkey: string
+	):
+		| { host: string; port: number; transport?: IPeerTransportOptions }
+		| undefined {
+		const live = this.peerManager?.getPeerAddress(pubkey);
+		if (live) return live;
+		if (!this.storage) return undefined;
+		const key = normalizeHexPubkey(pubkey);
+		const saved = this.loadPeerAddresses().find((a) => a.pubkey === key);
+		if (!saved) return undefined;
+		return {
+			host: saved.host,
+			port: saved.port,
+			...(saved.transport ? { transport: saved.transport } : {})
+		};
+	}
+
+	/**
 	 * Connected peers advertising option_provide_storage (BOLT 1 peer
 	 * storage): the set a restore can expect a Recovery Capsule from.
 	 */
@@ -28494,21 +28521,48 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	 * PUBLIC_HOST, both with this wallet's listen port, and this node has no way
 	 * to know which is right. With neither, no direct-peer descriptor is emitted
 	 * and the payer reaches us through the liquidity peer.
+	 *
+	 * `liquidityPeer` binds the request to that peer (issue #1922): its onion
+	 * and relay descriptors name it, at `liquidityHost` and `liquidityPort` (or
+	 * the policy's address when the policy names the same peer), and the
+	 * receiver negotiates the funding with it when the offer arrives, whatever
+	 * the policy's liquidity peer is by then. Without it the request follows
+	 * the policy, as before.
 	 */
 	mintDirectFundingRequest(opts: {
 		host?: string;
 		port?: number;
 		amountSat?: bigint;
 		ttlMs?: number;
+		liquidityPeer?: string;
+		liquidityHost?: string;
+		liquidityPort?: number;
 	}): { record: IDfRequestRecord; request: string; expiresAt: number } {
 		const df = this.directFunding;
 		if (!df) throw new Error('direct funding is not configured on this node');
 		const record = df.requests.mint({
 			ttlMs: opts.ttlMs ?? df.requestTtlMs,
-			...(opts.amountSat !== undefined ? { amountSat: opts.amountSat } : {})
+			...(opts.amountSat !== undefined ? { amountSat: opts.amountSat } : {}),
+			...(opts.liquidityPeer !== undefined
+				? { liquidityPeer: opts.liquidityPeer }
+				: {})
 		});
 		let envelope: string;
 		try {
+			// Resolved after the mint, from the record's bound peer: validated and
+			// lower-cased by the store, so a malformed one is refused typed there
+			// rather than tripping on a string method here.
+			const relay = this.directFundingRelay({
+				...(record.liquidityPeer !== undefined
+					? { liquidityPeer: record.liquidityPeer }
+					: {}),
+				...(opts.liquidityHost !== undefined
+					? { liquidityHost: opts.liquidityHost }
+					: {}),
+				...(opts.liquidityPort !== undefined
+					? { liquidityPort: opts.liquidityPort }
+					: {})
+			});
 			envelope = encodeRequestEnvelope(
 				mintRequestEnvelope(
 					{
@@ -28521,7 +28575,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 							: {}),
 						receiptHash: Buffer.from(record.receiptHash, 'hex'),
 						encryptionKey: requestEncryptionPublicKey(record),
-						transports: this.directFundingTransports(record, opts)
+						transports: this.directFundingTransports(record, opts, relay)
 					},
 					(message) => this.signMessage(message)
 				)
@@ -28536,9 +28590,36 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	}
 
 	/**
+	 * The peer a request's onion and relay descriptors go through, with the
+	 * address a payer dials it at: the peer the mint bound, at the address
+	 * given with it or, when it is the policy's own peer, the policy's address;
+	 * else the policy's peer at the policy's address. Null when there is no
+	 * such peer or no address for it, and then no relay descriptor is emitted.
+	 */
+	private directFundingRelay(opts: {
+		liquidityPeer?: string;
+		liquidityHost?: string;
+		liquidityPort?: number;
+	}): { peer: string; host: string; port: number } | null {
+		const policy = this.directFunding?.policy ?? {};
+		const peer = opts.liquidityPeer ?? policy.liquidityPeer;
+		if (!peer) return null;
+		const policyPeer =
+			policy.liquidityPeer !== undefined &&
+			policy.liquidityPeer.toLowerCase() === peer.toLowerCase();
+		const host =
+			opts.liquidityHost ?? (policyPeer ? policy.liquidityHost : undefined);
+		const port =
+			opts.liquidityPort ?? (policyPeer ? policy.liquidityPort : undefined);
+		if (!host || !port) return null;
+		return { peer, host, port };
+	}
+
+	/**
 	 * The descriptors one request publishes, in the order a payer should try
 	 * them: the direct peer connection when the caller told us where we are, then
-	 * a blinded path through the liquidity peer.
+	 * a blinded path through the relay peer (the one the request is bound to,
+	 * else the policy's liquidity peer).
 	 *
 	 * Only ONE onion descriptor is emitted where the fork emitted an onion and a
 	 * relay: the registry synthesizes the relay fall-back from the onion's
@@ -28547,7 +28628,8 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	 */
 	private directFundingTransports(
 		record: IDfRequestRecord,
-		opts: { host?: string; port?: number }
+		opts: { host?: string; port?: number },
+		relay: { peer: string; host: string; port: number } | null
 	): DfTransportDescriptor[] {
 		const df = this.directFunding;
 		if (!df) return [];
@@ -28559,8 +28641,12 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				port: opts.port
 			});
 		}
-		const { liquidityPeer, liquidityHost, liquidityPort } = df.policy;
-		if (!liquidityPeer || !liquidityHost || !liquidityPort) return transports;
+		if (!relay) return transports;
+		const {
+			peer: liquidityPeer,
+			host: liquidityHost,
+			port: liquidityPort
+		} = relay;
 		try {
 			const path = mintDfBlindedPath(
 				Buffer.from(liquidityPeer, 'hex'),
@@ -28596,8 +28682,9 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	 * Build the request store, the lanes and the receiver, and route inbound
 	 * frames into it.
 	 *
-	 * Constructed but inert: with no liquidity peer named the receiver declines
-	 * every offer, and with no request minted every frame is dropped as unknown.
+	 * Constructed but inert: with no liquidity peer named, by the policy or by
+	 * the request an offer answers, the receiver declines every offer, and with
+	 * no request minted every frame is dropped as unknown.
 	 * What this does at construction is make sure a request minted later can be
 	 * ANSWERED, which needs the lanes subscribed before the first frame arrives.
 	 */

@@ -116,6 +116,20 @@ describe('CLI direct funding with trailing local flags', function () {
 		expect(parsed.result?.request).to.be.a('string');
 	});
 
+	it('binds the request to --lsp (issue #1922)', async () => {
+		// A named peer must be a configured primary or the policy's peer.
+		const lsp = '02' + 'ab'.repeat(32);
+		daemon.node.addPrimary({ pubkey: lsp });
+		const parsed = await runCli(home, [
+			'direct-funding',
+			'request',
+			'--lsp',
+			lsp
+		]);
+		expect(parsed.ok).to.equal(true);
+		expect(parsed.result?.lspPubkey).to.equal(lsp);
+	});
+
 	it('sends with no amount when only the fee ceiling follows the request', async () => {
 		const parsed = await runCli(home, [
 			'direct-funding',

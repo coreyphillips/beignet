@@ -129,6 +129,61 @@ describe('Direct funding: outstanding requests', () => {
 		expect(second.store.byReceiptHash(record.receiptHash)).to.equal(null);
 	});
 
+	it('records the peer a request is bound to and keeps it across a restart (issue #1922)', () => {
+		const first = harness();
+		const peer = '02' + 'ab'.repeat(32);
+		const record = first.store.mint({ liquidityPeer: peer.toUpperCase() });
+		expect(record.liquidityPeer).to.equal(peer);
+		expect(first.store.mint().liquidityPeer).to.equal(undefined);
+		for (const bad of [
+			'nope',
+			'04' + 'ab'.repeat(32),
+			'02' + 'ab'.repeat(31)
+		]) {
+			expect(
+				errorCode(() => first.store.mint({ liquidityPeer: bad })),
+				bad
+			).to.equal(DirectFundingErrorCode.MALFORMED);
+		}
+
+		const second = harness({}, { wallet: first.wallet, clock: first.clock });
+		expect(second.store.restore()).to.equal(2);
+		expect(
+			second.store.byReceiptHash(record.receiptHash)?.liquidityPeer
+		).to.equal(peer);
+	});
+
+	it('drops a restored record whose bound peer did not survive', () => {
+		const first = harness();
+		const record = first.store.mint({ liquidityPeer: '02' + 'ab'.repeat(32) });
+		const rows = JSON.parse(first.wallet.get(DF_REQUESTS_STORAGE_KEY)!);
+		rows[0].liquidityPeer = 'not-a-pubkey';
+		first.wallet.set(DF_REQUESTS_STORAGE_KEY, JSON.stringify(rows));
+
+		const second = harness({}, { wallet: first.wallet, clock: first.clock });
+		// Served from the policy's peer instead, the payer's coin would fund a
+		// channel with a peer the request never named.
+		expect(second.store.restore()).to.equal(0);
+		expect(second.store.byReceiptHash(record.receiptHash)).to.equal(null);
+	});
+
+	it('reads a restored bound peer lower-case, however the row spells it', () => {
+		const first = harness();
+		const peer = '02' + 'ab'.repeat(32);
+		const record = first.store.mint({ liquidityPeer: peer });
+		const rows = JSON.parse(first.wallet.get(DF_REQUESTS_STORAGE_KEY)!);
+		rows[0].liquidityPeer = peer.toUpperCase();
+		first.wallet.set(DF_REQUESTS_STORAGE_KEY, JSON.stringify(rows));
+
+		const second = harness({}, { wallet: first.wallet, clock: first.clock });
+		// The receiver matches the bound peer against its channels' peer hex: an
+		// upper-case one would open a second channel instead of splicing.
+		expect(second.store.restore()).to.equal(1);
+		expect(
+			second.store.byReceiptHash(record.receiptHash)?.liquidityPeer
+		).to.equal(peer);
+	});
+
 	it('restores across a restart with both indexes rebuilt', () => {
 		const first = harness();
 		const record = first.store.mint();

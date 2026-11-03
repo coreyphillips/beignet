@@ -221,6 +221,8 @@ import {
 	JIT_STEER_CODES,
 	STEER_BUDGET_MS,
 	dialTargetOf,
+	noPrimaryAvailable,
+	relayAddressOf,
 	steerReceive
 } from './receive-steering';
 import type { ISteerCandidate, ISteerSkip } from './receive-steering';
@@ -332,6 +334,7 @@ import type {
 	TOnchainQuote,
 	TChannelFundingQuote,
 	DirectFundingConfigInfo,
+	DirectFundingRequestInfo,
 	PrimariesInfo,
 	JitInvoiceInfo,
 	JitStatusInfo,
@@ -1566,6 +1569,22 @@ function requirePositiveSafeInteger(value: unknown, field: string): number {
 		);
 	}
 	return value;
+}
+
+/**
+ * Refuse an `lspPubkey` option that is not a compressed public key. The type
+ * is checked before the pattern: a regex alone reads an array holding one
+ * key as its string form and passes it, and the first `.toLowerCase()` on it
+ * then surfaces as a server error instead of INVALID_PARAMS.
+ */
+function checkLspPubkey(value: unknown): void {
+	if (value === undefined) return;
+	if (typeof value !== 'string' || !/^0[23][0-9a-fA-F]{64}$/.test(value)) {
+		throw new BeignetError(
+			BeignetErrorCode.INVALID_PARAMS,
+			'lspPubkey must be a 33-byte compressed public key (66 hex chars)'
+		);
+	}
 }
 
 /**
@@ -8171,6 +8190,25 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	}
 
 	/**
+	 * The address this node last dialed a peer at, if it ever did, in this run
+	 * or an earlier one (the last successful dial is persisted), and the
+	 * transport it used. A peer that only ever connected inbound has none:
+	 * `listPeers` then shows the far end of its socket, whose port is
+	 * ephemeral, so this is what to consult for an address others can dial.
+	 */
+	getPeerAddress(
+		pubkey: string
+	): Pick<PeerInfo, 'host' | 'port' | 'transport'> | undefined {
+		const addr = this.node.getPeerAddress(pubkey);
+		if (!addr) return undefined;
+		return {
+			host: addr.host,
+			port: addr.port,
+			...(addr.transport ? { transport: addr.transport.type } : {})
+		};
+	}
+
+	/**
 	 * Start a p2p gossip sync with one peer, logging rather than throwing on
 	 * failure. The automatic connect-time path routes through here, deferred
 	 * behind _initialGossipPrime while the boot RGS attempt is in flight.
@@ -9801,15 +9839,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 		 */
 		timeoutMs?: number;
 	}): Promise<JitInvoiceInfo> {
-		if (
-			opts.lspPubkey !== undefined &&
-			!/^0[23][0-9a-fA-F]{64}$/.test(opts.lspPubkey)
-		) {
-			throw new BeignetError(
-				BeignetErrorCode.INVALID_PARAMS,
-				'lspPubkey must be a 33-byte compressed public key (66 hex chars)'
-			);
-		}
+		checkLspPubkey(opts.lspPubkey);
 		if (
 			opts.feeMode !== undefined &&
 			opts.feeMode !== 'skim' &&
@@ -10078,15 +10108,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 				`unpairedSpliceDepth must be an integer between 1 and ${DF_UNPAIRED_SPLICE_DEPTH_MAX}`
 			);
 		}
-		if (
-			update.lspPubkey !== undefined &&
-			!/^0[23][0-9a-fA-F]{64}$/.test(update.lspPubkey)
-		) {
-			throw new BeignetError(
-				BeignetErrorCode.INVALID_PARAMS,
-				'lspPubkey must be a 33-byte compressed public key (66 hex chars)'
-			);
-		}
+		checkLspPubkey(update.lspPubkey);
 		if (update.lspPort !== undefined) {
 			if (
 				!Number.isInteger(update.lspPort) ||
@@ -10274,15 +10296,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 		/** Steered only: the budget for the whole walk, in ms (default 18 s). */
 		timeoutMs?: number;
 	}): Promise<JitQuoteInfo> {
-		if (
-			opts.lspPubkey !== undefined &&
-			!/^0[23][0-9a-fA-F]{64}$/.test(opts.lspPubkey)
-		) {
-			throw new BeignetError(
-				BeignetErrorCode.INVALID_PARAMS,
-				'lspPubkey must be a 33-byte compressed public key (66 hex chars)'
-			);
-		}
+		checkLspPubkey(opts.lspPubkey);
 		const amountSats =
 			opts.amountSats !== undefined && opts.amountSats !== 0
 				? requireNonNegativeSafeInteger(opts.amountSats, 'amountSats')
@@ -10523,12 +10537,28 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	 * dashboard sends the browser's own hostname and the app's manager sends
 	 * PUBLIC_HOST, both with this wallet's listen port, and this node has no way
 	 * to know which is right.
+	 *
+	 * `lspPubkey` names the peer the funding is negotiated with (issue #1922).
+	 * It must be a configured primary or the policy's liquidity peer, else
+	 * INVALID_PARAMS: the route that names it runs at invoice scope, and the
+	 * peer a direct-funded channel opens with holds every payment it receives.
+	 * The envelope's relay descriptors name it, at the address the primaries
+	 * list stores for it, else the policy's address for it, else the one this
+	 * node dialed it at, and the receiver opens the channel with it when the
+	 * offer arrives, whatever the direct-funding policy says by then. Omitted,
+	 * the ranked primaries choose when any are configured: the first in
+	 * `listPrimaries` selection order with a known address is bound, the
+	 * others are listed in `skipped`, and NO_PRIMARY_AVAILABLE answers when
+	 * none has one. Nothing is dialed, since the request is paid later and
+	 * the payer reaches this node through that primary's relay. With no
+	 * primaries the policy's liquidity peer serves, as before.
 	 */
 	createDirectFundingRequest(opts: {
 		host?: string;
 		port?: number;
 		amountSats?: number;
-	}): { paymentHash: PaymentHashHex; expiresAt: number; request: string } {
+		lspPubkey?: string;
+	}): DirectFundingRequestInfo {
 		if (opts.port !== undefined) {
 			if (!Number.isInteger(opts.port) || opts.port < 1 || opts.port > 65535) {
 				throw new BeignetError(
@@ -10537,20 +10567,58 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 				);
 			}
 		}
+		checkLspPubkey(opts.lspPubkey);
 		const amountSats =
 			opts.amountSats !== undefined && opts.amountSats !== 0
 				? requireNonNegativeSafeInteger(opts.amountSats, 'amountSats')
 				: undefined;
+		const base = {
+			...(opts.host !== undefined ? { host: opts.host } : {}),
+			...(opts.port !== undefined ? { port: opts.port } : {}),
+			...(amountSats !== undefined ? { amountSat: BigInt(amountSats) } : {})
+		};
+		if (opts.lspPubkey !== undefined) {
+			const pubkey = opts.lspPubkey.toLowerCase();
+			this.requireLiquidityPeerConfigured(pubkey);
+			return this.mintDirectFundingRequestAt(base, {
+				pubkey,
+				address: this.liquidityAddressOf(pubkey)
+			});
+		}
+		if (this.primariesStore().get().primaries.length > 0) {
+			return this.steeredDirectFundingRequest(base);
+		}
+		return this.mintDirectFundingRequestAt(base);
+	}
+
+	/** The mint at one peer, or at the policy's: the library call and its typed failures. */
+	private mintDirectFundingRequestAt(
+		base: { host?: string; port?: number; amountSat?: bigint },
+		bound?: { pubkey: string; address?: { host: string; port: number } }
+	): DirectFundingRequestInfo {
 		try {
 			const minted = this.node.mintDirectFundingRequest({
-				...(opts.host !== undefined ? { host: opts.host } : {}),
-				...(opts.port !== undefined ? { port: opts.port } : {}),
-				...(amountSats !== undefined ? { amountSat: BigInt(amountSats) } : {})
+				...base,
+				...(bound
+					? {
+							liquidityPeer: bound.pubkey,
+							...(bound.address
+								? {
+										liquidityHost: bound.address.host,
+										liquidityPort: bound.address.port
+								  }
+								: {})
+					  }
+					: {})
 			});
 			return {
 				paymentHash: minted.record.receiptHash,
 				expiresAt: minted.expiresAt,
-				request: minted.request
+				request: minted.request,
+				lspPubkey:
+					minted.record.liquidityPeer ??
+					this.node.getDirectFundingPolicy()?.liquidityPeer ??
+					null
 			};
 		} catch (err) {
 			// A mint that fails degrades to a plain BIP 21 URI in the app, silently,
@@ -10560,6 +10628,91 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 			});
 			throw this.directFundingFailure(err);
 		}
+	}
+
+	/**
+	 * Refuse a named liquidity peer the operator never configured. The route
+	 * that names one runs at invoice scope, and the peer a direct-funded
+	 * channel opens with holds every payment it receives, so which peers can
+	 * be named stays with the admin routes: the primaries, and the policy.
+	 */
+	private requireLiquidityPeerConfigured(pubkey: string): void {
+		if (
+			this.node.getDirectFundingPolicy()?.liquidityPeer?.toLowerCase() ===
+			pubkey
+		)
+			return;
+		if (
+			this.primariesStore()
+				.get()
+				.primaries.some((p) => p.pubkey === pubkey)
+		)
+			return;
+		throw new BeignetError(
+			BeignetErrorCode.INVALID_PARAMS,
+			'lspPubkey is neither a configured primary nor the direct-funding liquidity peer'
+		);
+	}
+
+	/**
+	 * Where a payer reaches this peer's relay: the address the primaries list
+	 * stores for it (host and port, or a TCP peer URI), else the address the
+	 * direct-funding policy names for it, else the one this node dialed it at.
+	 * Never the one it is merely up on: a peer that dialed us is listed at its
+	 * socket's source port, which is ephemeral.
+	 */
+	private liquidityAddressOf(
+		pubkey: string
+	): { host: string; port: number } | undefined {
+		const stored = this.primariesStore()
+			.get()
+			.primaries.find((p) => p.pubkey === pubkey);
+		const fromStored = relayAddressOf(stored, undefined);
+		if (fromStored) return fromStored;
+		const policy = this.node.getDirectFundingPolicy();
+		if (
+			policy?.liquidityPeer?.toLowerCase() === pubkey &&
+			policy.liquidityHost &&
+			policy.liquidityPort
+		) {
+			return { host: policy.liquidityHost, port: policy.liquidityPort };
+		}
+		return relayAddressOf(undefined, this.getPeerAddress(pubkey));
+	}
+
+	/**
+	 * The request bound to the first primary in selection order whose relay a
+	 * payer could be told how to reach. A primary with no known address is
+	 * passed over and listed in `skipped`; with none left, NO_PRIMARY_AVAILABLE.
+	 */
+	private steeredDirectFundingRequest(base: {
+		host?: string;
+		port?: number;
+		amountSat?: bigint;
+	}): DirectFundingRequestInfo {
+		const skipped: ISteerSkip[] = [];
+		for (const candidate of this.receiveCandidates()) {
+			const address = this.liquidityAddressOf(candidate.pubkey);
+			if (!address) {
+				const skip: ISteerSkip = {
+					pubkey: candidate.pubkey,
+					rank: candidate.rank,
+					stage: 'attempt',
+					code: BeignetErrorCode.RECEIVE_UNAVAILABLE,
+					message:
+						'no address is known for this primary: store its host and port with it, or dial it over TCP'
+				};
+				skipped.push(skip);
+				this.logSteerSkip('direct-funding request', skip);
+				continue;
+			}
+			const minted = this.mintDirectFundingRequestAt(base, {
+				pubkey: candidate.pubkey,
+				address
+			});
+			return skipped.length ? { ...minted, skipped } : minted;
+		}
+		throw noPrimaryAvailable(skipped);
 	}
 
 	/**

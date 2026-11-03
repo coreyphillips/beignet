@@ -2342,21 +2342,28 @@ async function bootDaemon(
 		// host and port come from the CALLER and are passed through untouched:
 		// the dashboard sends the browser's own hostname and the app's manager
 		// sends PUBLIC_HOST, and the daemon has no way to know which is right.
+		//
+		// lspPubkey binds the request to that peer (issue #1922); omitted, the
+		// ranked primaries choose when any are configured, else the policy's
+		// liquidity peer serves as before.
 		'POST /direct-funding/request': (body) => {
 			const {
 				host: dfHost,
 				port: dfPort,
-				amountSats
+				amountSats,
+				lspPubkey
 			} = body as {
 				host?: string;
 				port?: number;
 				amountSats?: number;
+				lspPubkey?: string;
 			};
 			return success(
 				node.createDirectFundingRequest({
 					...(dfHost !== undefined ? { host: dfHost } : {}),
 					...(dfPort !== undefined ? { port: dfPort } : {}),
-					...(amountSats !== undefined ? { amountSats } : {})
+					...(amountSats !== undefined ? { amountSats } : {}),
+					...(lspPubkey !== undefined ? { lspPubkey } : {})
 				})
 			);
 		},
