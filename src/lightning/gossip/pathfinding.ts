@@ -847,9 +847,23 @@ export interface IMultiPathRoute {
 }
 
 /**
+ * Parts a multi-path payment may split into when the caller sets no bound and
+ * the source holds no more local channels than this.
+ */
+const DEFAULT_MAX_MPP_PARTS = 4;
+
+/**
  * Find multiple paths from source to destination that together deliver the
  * required amount. Iteratively finds single paths, deducting used capacity
  * from each channel to avoid reusing the same liquidity.
+ *
+ * Each part first tries the whole remaining amount. When that fails, the
+ * amount is halved until a path is found, and that path is then widened to
+ * the most its channels can still carry (fees included), so a part takes what
+ * its first hop has left instead of a power-of-two fraction of the remainder.
+ * With no `maxParts`, the bound is the larger of DEFAULT_MAX_MPP_PARTS and the
+ * number of local channels, so a payment that needs one part per channel is
+ * never refused by the default alone (issue #1922).
  *
  * Returns null if the total deliverable amount across all paths is insufficient.
  */
@@ -859,7 +873,7 @@ export function findMultiPathRoute(
 	destination: Buffer,
 	amountMsat: bigint,
 	finalCltvExpiry: number,
-	maxParts = 4,
+	maxParts?: number,
 	maxHops: number = DEFAULT_MAX_HOPS,
 	missionControl?: MissionControl,
 	routingHints?: IRoutingHintHop[][],
@@ -869,6 +883,8 @@ export function findMultiPathRoute(
 	maxCltvExpiry: number = DEFAULT_MAX_CLTV_EXPIRY,
 	policyOverrides?: TPolicyOverrides
 ): IMultiPathRoute | null {
+	const partBound =
+		maxParts ?? Math.max(DEFAULT_MAX_MPP_PARTS, localChannels?.length ?? 0);
 	// Every search below runs against the same graph, so they share one
 	// overlay.
 	const search: IRouteSearch = {
@@ -895,7 +911,7 @@ export function findMultiPathRoute(
 	const parts: IRoute[] = [];
 	let remaining = amountMsat;
 
-	for (let i = 0; i < maxParts && remaining > 0n; i++) {
+	for (let i = 0; i < partBound && remaining > 0n; i++) {
 		// Try to route the full remaining amount first
 		let route = searchRoute(search, remaining, usedCapacity);
 
@@ -907,6 +923,12 @@ export function findMultiPathRoute(
 				if (route) break;
 				tryAmount = tryAmount / 2n;
 			}
+			// A halved part leaves the rest of its path's capacity to later
+			// parts, which then run out before the amount does: two first
+			// hops of 100k and 20k paying 115k spent four parts on 57.5k,
+			// 28.75k, 14.375k and 7.1875k and failed. Widen the part to what
+			// its path can carry.
+			if (route) route = widenPart(search, route, remaining, usedCapacity);
 		}
 
 		if (!route) {
@@ -939,6 +961,117 @@ export function findMultiPathRoute(
 	}
 
 	return { parts, totalAmountMsat, totalFeeMsat };
+}
+
+/**
+ * The most `route`'s channels can still carry, less what earlier parts use,
+ * as the amount arriving on each hop; null when a hop's channel cannot be
+ * resolved the way the search resolved it.
+ */
+function routeHopCapacities(
+	search: IRouteSearch,
+	route: IRoute,
+	usedCapacity: Map<string, bigint>
+): bigint[] | null {
+	const { syntheticEdges, hintDestMap } = search.overlay;
+	const capacities: bigint[] = [];
+	for (let i = 0; i < route.hops.length; i++) {
+		const hop = route.hops[i];
+		const scidHex = hop.shortChannelId.toString('hex');
+		const upstreamHex =
+			i === 0 ? search.sourceHex : route.hops[i - 1].pubkey.toString('hex');
+		const downstreamHex = hop.pubkey.toString('hex');
+		let update: IChannelUpdateMessage | undefined;
+		const hintDest = hintDestMap.get(scidHex);
+		if (hintDest !== undefined) {
+			update = syntheticEdges
+				.get(hintDest)
+				?.find((edge) => edge.scidHex === scidHex)?.channel.update1;
+		} else {
+			const channel = search.graph.getChannel(hop.shortChannelId);
+			if (!channel) return null;
+			update =
+				downstreamHex === channel.nodeId2.toString('hex')
+					? channel.update1
+					: channel.update2;
+		}
+		update = policyFor(
+			update,
+			search.policyOverrides,
+			scidHex,
+			upstreamHex,
+			downstreamHex
+		);
+		if (!update) return null;
+		const maximum =
+			(update.messageFlags & MESSAGE_FLAG_HTLC_MAX) !== 0
+				? update.htlcMaximumMsat ?? 0xffffffffffffffffn
+				: 0xffffffffffffffffn;
+		const used = usedCapacity.get(scidHex) ?? 0n;
+		capacities.push(maximum > used ? maximum - used : 0n);
+	}
+	return capacities;
+}
+
+/**
+ * The amount each hop of `route` carries when `deliveredMsat` reaches the
+ * destination: hop i receives what hop i+1 receives plus hop i's own
+ * forwarding fee, which is the fee policy a hop record carries.
+ */
+function hopAmountsFor(route: IRoute, deliveredMsat: bigint): bigint[] {
+	const amounts = new Array<bigint>(route.hops.length);
+	let amount = deliveredMsat;
+	for (let i = route.hops.length - 1; i >= 0; i--) {
+		amounts[i] = amount;
+		if (i > 0) {
+			amount += calculateFee(
+				amount,
+				route.hops[i - 1].feeBaseMsat,
+				route.hops[i - 1].feeProportionalMillionths
+			);
+		}
+	}
+	return amounts;
+}
+
+/**
+ * Grow a part found by halving to the largest delivered amount, at most
+ * `remaining`, that every channel on its path can still carry with the fees
+ * the hops charge for it, then search at that amount so the returned route is
+ * one the same search would produce (the overlay and used capacity are
+ * unchanged between the two calls). The halved route stands when nothing wider
+ * routes.
+ */
+function widenPart(
+	search: IRouteSearch,
+	route: IRoute,
+	remaining: bigint,
+	usedCapacity: Map<string, bigint>
+): IRoute {
+	const delivered = route.hops[route.hops.length - 1].amountToForwardMsat;
+	if (delivered >= remaining) return route;
+	const capacities = routeHopCapacities(search, route, usedCapacity);
+	if (!capacities) return route;
+	const fits = (deliveredMsat: bigint): boolean =>
+		hopAmountsFor(route, deliveredMsat).every(
+			(amount, i) => amount <= capacities[i]
+		);
+	if (!fits(delivered)) return route;
+	let low = delivered;
+	let high = remaining;
+	if (fits(high)) {
+		low = high;
+	} else {
+		// Hop amounts only grow with the delivered amount, so the largest fit
+		// sits between a delivered amount that fits and one that does not.
+		while (high - low > 1n) {
+			const mid = (low + high) / 2n;
+			if (fits(mid)) low = mid;
+			else high = mid;
+		}
+	}
+	if (low <= delivered) return route;
+	return searchRoute(search, low, usedCapacity) ?? route;
 }
 
 // ── Blinded Path Route Finding ──────────────────────────────────────
