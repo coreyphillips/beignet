@@ -83,6 +83,16 @@ import {
 	MAX_SPLICE_FEERATE_PERKW,
 	spliceFeeSats
 } from '../channel/splice-weight';
+import { CompositeSpliceEngine } from './composite-splice-engine';
+import type {
+	CompositeSpliceRefusalCode,
+	ICompositeSpliceEngineDeps,
+	ICompositeSpliceOutRequest,
+	ICompositeSplicePlanResult,
+	ICompositeSpliceStageEvent,
+	ICompositeSpliceStartResult
+} from './composite-splice-engine';
+import type { ICompositeSpliceRecord } from '../channel/composite-splice-record';
 import type { IHtlcEntry } from '../channel/types';
 import {
 	ChannelState,
@@ -1122,6 +1132,8 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	 */
 	private _wiredChainWatcher: ChainWatcher | null = null;
 	private currentBlockHeight = 0;
+	/** Composite splice-out engine (issue #1922); built once the manager exists. */
+	private compositeSplices: CompositeSpliceEngine | null = null;
 	/**
 	 * Issue #906: true from a birth boot (decided in restoreFromStorage)
 	 * until the chain-tip floor on the next channel key index has fired and
@@ -2175,6 +2187,10 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		// Let the channel manager attach wallet inputs for anchor fee bumps
 		// (zero-fee second-level HTLC txs and commitment CPFP).
 		this.channelManager.setFundingProvider(this.fundingProvider);
+		this.compositeSplices = new CompositeSpliceEngine(
+			this.compositeSpliceDeps()
+		);
+		this.compositeSplices.attach();
 		// A wallet-owned sweep destination handed in at CONSTRUCTION must reach
 		// the channel manager too: its shutdown-script logic only learned the
 		// wallet address through setSweepDestinationScript, a path taken when
@@ -3762,6 +3778,9 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		// runs whether or not the lanes are ever attached.
 		this.restoreDirectFundingPolicy();
 		this.directFunding?.requests.restore();
+		// Composite splice records (issue #1922): abort what never released its
+		// signatures, keep tracking what did. Channels are restored by now.
+		this.compositeSplices?.restore();
 
 		// Scan for expiring HTLCs immediately on restore (may have missed blocks while down)
 		if (this.currentBlockHeight > 0) {
@@ -11625,6 +11644,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 
 	destroy(): void {
 		this._destroyed = true;
+		this.compositeSplices?.detach();
 		// A restore of the stored map ends here, before its storage closes.
 		if (this.graphRestore) this.cancelGraphRestore(this.graphRestore);
 		this.guardianHost?.close();
@@ -12698,6 +12718,17 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		// times out into a force-close, that path relabels with the terminal
 		// reason.
 		const channel = this.channelManager.getChannel(channelId);
+		if (this.compositeSplices?.isChannelReserved(channelId)) {
+			const error =
+				'channel is part of a live composite splice (issue #1922); wait for it to lock or abort it before closing';
+			this.emit('node:error', {
+				code: 'CLOSE_CHANNEL_FAILED',
+				channelId,
+				message: error,
+				timestamp: Date.now()
+			});
+			return { ok: false, error };
+		}
 		const prevReason = channel?.getFullState().closeReason;
 		const stamped = channel?.recordCloseReason('user') ?? false;
 		const result = this.channelManager.initiateShutdown(
@@ -14965,6 +14996,113 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	}
 
 	/**
+	 * Whether a peer admits a bare 2-of-2 P2WSH initiator input in a splice
+	 * (issue #1922, docs/MULTI-CHANNEL-SPLICE-OUT.md section 8): it advertises
+	 * option_composite_splice_inputs (bits 454/455), or it is Core Lightning,
+	 * which admits such inputs without the bit (CLN matrix tier C3) and is
+	 * told apart by its own shutdown_wrong_funding pair (104/105), a bit no
+	 * other implementation uses. Null when the peer's init is not known.
+	 */
+	peerSupportsCompositeSpliceInputs(peerPubkey: string): boolean | null {
+		const init = this.peerManager?.getPeer(peerPubkey)?.getRemoteInit();
+		if (!init) return null;
+		return (
+			init.features.hasFeature(Feature.OPTION_COMPOSITE_SPLICE_INPUTS) ||
+			init.features.hasBit(104) ||
+			init.features.hasBit(105)
+		);
+	}
+
+	/**
+	 * Plan a composite splice-out (issue #1922): one transaction that pays
+	 * `amountSats` to the destination out of several channels' funding
+	 * outpoints, debited largest spendable balance first, with the fee split
+	 * in proportion to each debit. Pure: no message leaves and nothing is
+	 * reserved. A refusal names the code and, per channel left out, why.
+	 */
+	planCompositeSpliceOut(
+		request: ICompositeSpliceOutRequest
+	): Promise<ICompositeSplicePlanResult> {
+		return this.compositeSplice().plan(request);
+	}
+
+	/**
+	 * Plan and start a composite splice-out (issue #1922). Resolves once every
+	 * session has been started (or the plan was refused); the operation then
+	 * reports its stages on 'composite-splice:stage' and its record through
+	 * getCompositeSplice. One composite at a time per node; a second request
+	 * is refused with BUSY, not queued. Until RELEASED (our first
+	 * tx_signatures), abortCompositeSplice unwinds every session with
+	 * tx_abort and nothing is spent.
+	 */
+	startCompositeSpliceOut(
+		request: ICompositeSpliceOutRequest
+	): Promise<ICompositeSpliceStartResult> {
+		if (this._destroyed) throw new Error('Node destroyed');
+		return this.compositeSplice().start(request);
+	}
+
+	/** Abort a live composite splice before RELEASED (issue #1922). */
+	abortCompositeSplice(
+		id: Buffer,
+		reason?: string
+	): { ok: boolean; error?: string; code?: CompositeSpliceRefusalCode } {
+		const idErr = validateBuffer(id, 32, 'id');
+		if (idErr) throw new Error(idErr);
+		return this.compositeSplice().abort(id, reason);
+	}
+
+	/** The record of a composite splice (issue #1922), or null. */
+	getCompositeSplice(id: Buffer): ICompositeSpliceRecord | null {
+		const idErr = validateBuffer(id, 32, 'id');
+		if (idErr) throw new Error(idErr);
+		return this.compositeSplice().get(id);
+	}
+
+	/** Every composite splice record this node holds, oldest first. */
+	listCompositeSplices(): ICompositeSpliceRecord[] {
+		return this.compositeSplice().list();
+	}
+
+	private compositeSplice(): CompositeSpliceEngine {
+		if (!this.compositeSplices) {
+			throw new Error('composite splice engine is not available');
+		}
+		return this.compositeSplices;
+	}
+
+	private compositeSpliceDeps(): ICompositeSpliceEngineDeps {
+		return {
+			channelManager: this.channelManager,
+			recordsSupported: () =>
+				!!this.storage?.saveCompositeSplice &&
+				!!this.storage?.loadAllCompositeSplices &&
+				!!this.recovery,
+			loadAllRecords: () => this.storage!.loadAllCompositeSplices!(),
+			withMutations: (mutations, fn) => this.withStagedMutations(mutations, fn),
+			fundingTxHex: (channelId) => this.getFundingTxHex(channelId),
+			peerSupportsSplicing: (peer) => this.peerSupportsSplicing(peer),
+			peerSupportsCompositeSpliceInputs: (peer) =>
+				this.peerSupportsCompositeSpliceInputs(peer),
+			resolveDestination: (script) => this._spliceOutDestination(script),
+			currentHeight: () => this.currentBlockHeight,
+			rebroadcast: (txHex, idHex) =>
+				this.rebroadcastAuthorizedSplice(idHex, txHex),
+			emitStage: (event: ICompositeSpliceStageEvent) =>
+				this.emit('composite-splice:stage', event),
+			emitError: (code, message, channelId) =>
+				this.emit('node:error', {
+					code,
+					message,
+					...(channelId ? { channelId } : {}),
+					timestamp: Date.now()
+				}),
+			log: (event, fields) => this.emitStructuredLog('channel', event, fields),
+			now: () => Date.now()
+		};
+	}
+
+	/**
 	 * Shared splice pre-flight checks: dust-level amounts and peer feature
 	 * support (option_splice + option_quiesce). Returns an error string or null.
 	 */
@@ -14980,6 +15118,13 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			return {
 				error: `splice amount ${amountSats} sats is below the dust floor (${LightningNode.SPLICE_MIN_AMOUNT_SATS} sats)`,
 				code: SpliceRefusalCode.INVALID_PARAMS
+			};
+		}
+		if (this.compositeSplices?.isChannelReserved(channelId)) {
+			return {
+				error:
+					'channel is part of a live composite splice (issue #1922); wait for it to lock or abort it',
+				code: SpliceRefusalCode.SPLICE_BUSY
 			};
 		}
 		const peerPubkey = this.channelManager.getPeerForChannel(channelId);

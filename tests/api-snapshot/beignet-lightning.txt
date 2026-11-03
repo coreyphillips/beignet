@@ -946,6 +946,7 @@ namespace channel
 const channel.BITCOIN_CHAIN_HASH: Buffer
 const channel.CHANNEL_INDEX_FLOOR_MAX: number
 const channel.CHANNEL_INDEX_FLOOR_STRIDE = 128
+const channel.COMPOSITE_SPLICE_STAGES: readonly channel.CompositeSpliceStage[]
 class channel.Channel
 constructor channel.Channel(state: channel.IChannelState, signer?: keys.ISigner)
 static readonly property channel.Channel.MAX_DUST_HTLC_EXPOSURE_MSAT = 5000000n
@@ -1016,6 +1017,7 @@ method channel.Channel.fforSync(): channel.ChannelAction[]
 method channel.Channel.fforTakeReconnectRequest(): boolean
 method channel.Channel.fforWitnessAcked(mailboxId: Buffer, retentionUntil: number): channel.ChannelAction[]
 method channel.Channel.forceClose(signer: keys.ISigner, chain?: channel.IForceCloseChainFacts): channel.ChannelAction[]
+method channel.Channel.forgetUnsentSplice(reason: string): channel.ChannelAction[]
 method channel.Channel.fulfillHtlc(htlcId: bigint, paymentPreimage: Buffer): channel.ChannelAction[]
 method channel.Channel.fundingConfirmed(confirmedTxid?: Buffer): channel.ChannelAction[]
 method channel.Channel.fundingMissingSince(): number | undefined
@@ -1024,6 +1026,7 @@ method channel.Channel.getChannelId(): Buffer | null
 method channel.Channel.getClosingFeeratePerKw(): number
 method channel.Channel.getClosingNonces(): { local: Uint8Array | null; remote: Buffer | null; }
 method channel.Channel.getCommitmentNumbers(): { local: bigint; remote: bigint; }
+method channel.Channel.getCompositeSpliceId(): Buffer | null
 method channel.Channel.getCurrentChannelId(): Buffer
 method channel.Channel.getDualFundingSession(): channel.DualFundingSession | null
 method channel.Channel.getFforEpoch(): ffor.IFforEpochRecord | null
@@ -1159,6 +1162,7 @@ method channel.Channel.recoverCloseSpendsFunding(fundingTxid: Buffer): boolean
 method channel.Channel.refuseHeldMutualClose(): channel.ChannelAction[]
 method channel.Channel.refuseSpliceInit(wireReason: string, errorMessage: string): channel.ChannelAction[]
 method channel.Channel.refuseUnviableV2InFlight(): 'none' | 'rolled-back' | 'refused'
+method channel.Channel.releaseCompositeSpliceCommitment(): channel.ChannelAction[]
 method channel.Channel.removeTxInput(serialId: bigint): channel.ChannelAction[]
 method channel.Channel.removeTxOutput(serialId: bigint): channel.ChannelAction[]
 method channel.Channel.reopenForceCloseResolution(): boolean
@@ -1181,6 +1185,7 @@ method channel.Channel.sendTxComplete(): channel.ChannelAction[]
 method channel.Channel.sendTxSignatures(txid: Buffer, outputIndex: number, witnesses: Buffer[][]): channel.ChannelAction[]
 method channel.Channel.setBlockHeight(height: number): void
 method channel.Channel.setClosingFeeratePerKw(feeratePerKw: number): void
+method channel.Channel.setCompositeSpliceContribution(contribution: channel.ICompositeSpliceContribution): string | null
 method channel.Channel.setDualFundingContribution(inputs: channel.ISpliceWalletInput[], changeScript: Buffer, contributionSats: bigint, feeratePerKw: number): void
 method channel.Channel.setFforCapabilities(concurrentNegotiated: boolean): void
 method channel.Channel.setFforContext(ctx: ffor.IFforChannelContext): void
@@ -1211,7 +1216,7 @@ method channel.Channel.takeRevokedCommitmentTxs(perCommitmentSecret: Buffer): Bu
 method channel.Channel.unregisteredV2TopUpInputs(inputs: channel.ISpliceWalletInput[]): channel.ISpliceWalletInput[]
 method channel.Channel.updateFee(feeratePerKw: number): channel.ChannelAction[]
 method channel.Channel.validateOutgoingHtlc(amountMsat: bigint, cltvExpiry: number): channel.ChannelAction[]
-type channel.ChannelAction = channel.ISendMessageAction | channel.IBroadcastTxAction | channel.IAuthorizeFundingBroadcastAction | channel.IWatchFundingAction | channel.IWatchPreSpliceSpendAction | channel.IChannelReadyAction | channel.IChannelClosedAction | channel.IErrorAction | channel.IHtlcForwardedAction | channel.IHtlcFulfilledAction | channel.IHtlcFailedAction | channel.IForceCloseAction | channel.IWatchOutputAction | channel.IPreimageLearnedAction | channel.IChannelFullyResolvedAction | channel.IAnnouncementReadyAction | channel.IProposeClosingFeeAction | channel.IPersistStateAction | channel.ISpliceCompleteAction | channel.ISpliceAbortedAction | channel.ISpliceRevertedAction | channel.ISpliceConflictRequestReadyAction | channel.ITxSignaturesNeededAction | channel.ISpliceTxSignaturesNeededAction
+type channel.ChannelAction = channel.ISendMessageAction | channel.IBroadcastTxAction | channel.IAuthorizeFundingBroadcastAction | channel.IWatchFundingAction | channel.IWatchPreSpliceSpendAction | channel.IChannelReadyAction | channel.IChannelClosedAction | channel.IErrorAction | channel.IHtlcForwardedAction | channel.IHtlcFulfilledAction | channel.IHtlcFailedAction | channel.IForceCloseAction | channel.IWatchOutputAction | channel.IPreimageLearnedAction | channel.IChannelFullyResolvedAction | channel.IAnnouncementReadyAction | channel.IProposeClosingFeeAction | channel.IPersistStateAction | channel.ISpliceCompleteAction | channel.ISpliceAbortedAction | channel.ISpliceRevertedAction | channel.ISpliceConflictRequestReadyAction | channel.ITxSignaturesNeededAction | channel.ISpliceTxSignaturesNeededAction | channel.ISpliceTxNegotiatedAction
 enum channel.ChannelActionType
 member channel.ChannelActionType.ANNOUNCEMENT_READY = "ANNOUNCEMENT_READY"
 member channel.ChannelActionType.AUTHORIZE_FUNDING_BROADCAST = "AUTHORIZE_FUNDING_BROADCAST"
@@ -1232,6 +1237,7 @@ member channel.ChannelActionType.SPLICE_ABORTED = "SPLICE_ABORTED"
 member channel.ChannelActionType.SPLICE_COMPLETE = "SPLICE_COMPLETE"
 member channel.ChannelActionType.SPLICE_CONFLICT_REQUEST_READY = "SPLICE_CONFLICT_REQUEST_READY"
 member channel.ChannelActionType.SPLICE_REVERTED = "SPLICE_REVERTED"
+member channel.ChannelActionType.SPLICE_TX_NEGOTIATED = "SPLICE_TX_NEGOTIATED"
 member channel.ChannelActionType.SPLICE_TX_SIGNATURES_NEEDED = "SPLICE_TX_SIGNATURES_NEEDED"
 member channel.ChannelActionType.TX_SIGNATURES_NEEDED = "TX_SIGNATURES_NEEDED"
 member channel.ChannelActionType.WATCH_FUNDING = "WATCH_FUNDING"
@@ -1283,6 +1289,7 @@ method channel.ChannelManager.fforSetupTimeout(channelId: Buffer): channel.Chann
 method channel.ChannelManager.fforSync(channelId: Buffer): channel.ChannelResult
 method channel.ChannelManager.fforWitnessAcked(channelId: Buffer, mailboxId: Buffer, retentionUntil: number): channel.ChannelResult
 method channel.ChannelManager.forceClose(channelId: Buffer, destinationScript: Buffer, feeRatePerVbyte?: number, network?: bitcoinjs-lib#Network): channel.ChannelResult
+method channel.ChannelManager.forgetUnsentSplice(channelId: Buffer, reason: string): channel.ChannelResult
 method channel.ChannelManager.fulfillHtlc(channelId: Buffer, htlcId: bigint, preimage: Buffer): channel.ChannelResult
 method channel.ChannelManager.getChannel(channelId: Buffer): channel.Channel | undefined
 method channel.ChannelManager.getChannelsByPeer(peerPubkey: string): channel.Channel[]
@@ -1336,6 +1343,7 @@ method channel.ChannelManager.reauthorizeFundingBroadcast(channelId: Buffer): bo
 method channel.ChannelManager.reauthorizeSpliceBroadcast(channelId: Buffer): boolean
 method channel.ChannelManager.rebuildForceCloseCommitment(channelId: Buffer, feeRatePerVbyte: number): { ok: boolean; tx?: Buffer; error?: string; retryable?: boolean; }
 method channel.ChannelManager.recordPreimage(paymentHash: Buffer, preimage: Buffer): void
+method channel.ChannelManager.releaseCompositeSpliceCommitment(channelId: Buffer): channel.ChannelResult
 method channel.ChannelManager.removeTrustedPeer(pubkeyHex: string): void
 method channel.ChannelManager.requestSpliceConflictRevert(channelId: Buffer): channel.ChannelResult
 method channel.ChannelManager.restoreChannel(channel: channel.Channel, peerPubkey: string, keyIndex?: number | null, perChannelKeys?: channel.IPerChannelKeys | null): void
@@ -1402,6 +1410,7 @@ property channel.ChannelManagerEvents.'reestablish:secret-missing': (channelId: 
 property channel.ChannelManagerEvents.'splice:aborted': (channelId: Buffer, reason: string) => void
 property channel.ChannelManagerEvents.'splice:complete': (channelId: Buffer) => void
 property channel.ChannelManagerEvents.'splice:conflict-request-ready': (channelId: Buffer) => void
+property channel.ChannelManagerEvents.'splice:negotiated': (channelId: Buffer, compositeId: Buffer, spliceTxid: Buffer, newFundingOutputIndex: number) => void
 property channel.ChannelManagerEvents.'splice:reverted': (channelId: Buffer, spliceTxid: string, conflictTxid: string) => void
 property channel.ChannelManagerEvents.'sweep:uneconomic': (channelId: Buffer, action: chain.ISweepUneconomicChainAction) => void
 property channel.ChannelManagerEvents.'transition:begin': (channelIdHex: string | null) => void
@@ -1446,6 +1455,7 @@ member channel.ChannelState.SENT_FUNDING_SIGNED = "SENT_FUNDING_SIGNED"
 member channel.ChannelState.SENT_OPEN = "SENT_OPEN"
 member channel.ChannelState.SHUTTING_DOWN = "SHUTTING_DOWN"
 member channel.ChannelState.SPLICING = "SPLICING"
+type channel.CompositeSpliceStage = 'PLANNED' | 'NEGOTIATING' | 'COMMITTED' | 'PEERS_SIGNED' | 'RELEASED' | 'BROADCAST' | 'LOCKED' | 'ABORTED'
 const channel.DEFAULT_CHANNEL_CONFIG: channel.IChannelConfig
 const channel.DEFAULT_MINIMUM_DEPTH = 3
 const channel.DUAL_FUNDING_INPUT_WEIGHT = 320
@@ -1737,6 +1747,36 @@ property channel.ICommitmentKeys.localHtlcPubkey: Buffer
 property channel.ICommitmentKeys.remoteHtlcPubkey: Buffer
 property channel.ICommitmentKeys.remotePaymentPubkey: Buffer
 property channel.ICommitmentKeys.revocationPubkey: Buffer
+interface channel.ICompositeSpliceChannel
+property channel.ICompositeSpliceChannel.channelId: string
+property channel.ICompositeSpliceChannel.debitSats: string
+property channel.ICompositeSpliceChannel.feeSats: string
+property channel.ICompositeSpliceChannel.fundingOutputIndex: number
+property channel.ICompositeSpliceChannel.fundingOutputSerialId: string
+property channel.ICompositeSpliceChannel.fundingTxid: string
+property channel.ICompositeSpliceChannel.inputSerialId: string
+property channel.ICompositeSpliceChannel.newCapacitySats: string
+property channel.ICompositeSpliceChannel.oldCapacitySats: string
+property channel.ICompositeSpliceChannel.peerPubkey: string
+interface channel.ICompositeSpliceContribution
+property channel.ICompositeSpliceContribution.compositeId: Buffer
+property channel.ICompositeSpliceContribution.inputs: Array<{ serialId: bigint; prevTxid: Buffer; prevOutputIndex: number; prevTx: Buffer; valueSats: bigint; shared: boolean; }>
+property channel.ICompositeSpliceContribution.outputs: Array<{ serialId: bigint; scriptPubkey: Buffer; amountSats: bigint; }>
+interface channel.ICompositeSpliceRecord
+property channel.ICompositeSpliceRecord.amountSats: string
+property channel.ICompositeSpliceRecord.channels: channel.ICompositeSpliceChannel[]
+property channel.ICompositeSpliceRecord.createdAt: number
+property channel.ICompositeSpliceRecord.destinationScript: string
+property channel.ICompositeSpliceRecord.destinationSerialId: string
+property channel.ICompositeSpliceRecord.feeSats: string
+property channel.ICompositeSpliceRecord.feeratePerkw: number
+property channel.ICompositeSpliceRecord.id: string
+property channel.ICompositeSpliceRecord.locktime: number
+property channel.ICompositeSpliceRecord.reason?: string
+property channel.ICompositeSpliceRecord.stage: channel.CompositeSpliceStage
+property channel.ICompositeSpliceRecord.txHex?: string
+property channel.ICompositeSpliceRecord.txid?: string
+property channel.ICompositeSpliceRecord.updatedAt: number
 interface channel.IDualFundingParams
 property channel.IDualFundingParams.chainHash?: Buffer
 property channel.IDualFundingParams.channelFlags?: number
@@ -1898,6 +1938,7 @@ property channel.ISpliceInFlight.remoteCommitmentSigLeaseBlockheight?: number
 property channel.ISpliceInFlight.remoteFundingPubkey: Buffer
 property channel.ISpliceInFlight.remoteHtlcSignatures?: Buffer[]
 property channel.ISpliceInFlight.remoteRelativeSatoshis: bigint
+property channel.ISpliceInFlight.remoteSharedInputSig?: Buffer
 property channel.ISpliceInFlight.remoteSpliceLocked: boolean
 property channel.ISpliceInFlight.sentTxSignatures: boolean
 property channel.ISpliceInFlight.spliceTxHex: string
@@ -1920,6 +1961,12 @@ property channel.ISpliceSessionParams.localFundingPubkey: Buffer
 property channel.ISpliceSessionParams.localRelativeSatoshis: bigint
 property channel.ISpliceSessionParams.lockDepth?: number
 property channel.ISpliceSessionParams.locktime: number
+interface channel.ISpliceTxNegotiatedAction
+property channel.ISpliceTxNegotiatedAction.channelId: Buffer
+property channel.ISpliceTxNegotiatedAction.compositeId: Buffer
+property channel.ISpliceTxNegotiatedAction.newFundingOutputIndex: number
+property channel.ISpliceTxNegotiatedAction.spliceTxid: Buffer
+property channel.ISpliceTxNegotiatedAction.type: channel.ChannelActionType.SPLICE_TX_NEGOTIATED
 interface channel.ISpliceTxSignaturesNeededAction
 property channel.ISpliceTxSignaturesNeededAction.channelId: Buffer
 property channel.ISpliceTxSignaturesNeededAction.externalInputIndices: number[]
@@ -2092,6 +2139,8 @@ function channel.aggregateLocalCommitmentSig(state: channel.IChannelState, signe
 function channel.buildLocalCommitment(state: channel.IChannelState, perCommitmentPoint: Buffer, commitmentNumber?: bigint, signedLocal?: boolean): channel.IBuiltCommitment
 function channel.buildRemoteCommitment(state: channel.IChannelState, remotePerCommitmentPoint: Buffer, commitmentNumber?: bigint): channel.IBuiltCommitment
 function channel.calculateCommitmentFee(feeratePerKw: number, numUntrimmedHtlcs: number, isAnchor?: boolean, isTaproot?: boolean): bigint
+function channel.compositeSpliceStageAtLeast(stage: channel.CompositeSpliceStage, floor: channel.CompositeSpliceStage): boolean
+function channel.compositeSpliceStageIsTerminal(stage: channel.CompositeSpliceStage): boolean
 function channel.createAcceptorChannel(params: { temporaryChannelId: Buffer; localConfig?: channel.IChannelConfig; localBasepoints: keys.IChannelBasepoints; localPerCommitmentSeed: Buffer; }): channel.Channel
 function channel.createAcceptorState(params: { temporaryChannelId: Buffer; fundingSatoshis: bigint; pushMsat: bigint; localConfig: channel.IChannelConfig; localBasepoints: keys.IChannelBasepoints; localPerCommitmentSeed: Buffer; remoteBasepoints: keys.IChannelBasepoints; remoteConfig: channel.IChannelConfig; }): channel.IChannelState
 function channel.createOpenerChannel(params: { fundingSatoshis: bigint; pushMsat?: bigint; localConfig?: channel.IChannelConfig; localBasepoints: keys.IChannelBasepoints; localPerCommitmentSeed: Buffer; }): channel.Channel
@@ -2102,7 +2151,7 @@ function channel.deriveV2ChannelId(revocationBasepointA: Buffer, revocationBasep
 function channel.deriveV2TemporaryChannelId(openerRevocationBasepoint: Buffer): Buffer
 function channel.dualFundingContributionWeight(inputCount: number, initiator: boolean): number
 function channel.dualFundingTopUpWeight(inputCount: number): number
-function channel.estimateSpliceTxWeight(opts: { walletInputCount: number; fundingInputCount?: number; fundingScriptLen?: number; changeScriptLen?: number; destinationScriptLen?: number; }): number
+function channel.estimateSpliceTxWeight(opts: { walletInputCount: number; fundingInputCount?: number; fundingOutputCount?: number; fundingScriptLen?: number; changeScriptLen?: number; destinationScriptLen?: number; }): number
 function channel.filterUntrimmedHtlcs<T extends { amount: bigint; direction: channel.HtlcDirection; }>(htlcOutputs: T[], dustLimitSat: bigint, feeratePerKw: number, isAnchor: boolean): T[]
 function channel.funderCommitmentCostSats(feeratePerKw: number, numUntrimmedHtlcs: number, channelType: Buffer | null): bigint
 function channel.generateTemporaryChannelId(): Buffer
@@ -2129,6 +2178,7 @@ function channel.spliceFeeSats(weight: number, feeratePerKw: number): bigint
 function channel.txInputOutpoints(txHex: string): Array<{ txid: string; vout: number; }>
 function channel.validateAcceptChannelParams(open: channel.IProposedOpenParams, accept: message.IAcceptChannelMessage, waivers?: { localReserveWaived?: boolean; remoteReserveWaived?: boolean; }): string | null
 function channel.validateChannelPoints(msg: Pick<message.IOpenChannelMessage, 'fundingPubkey' | 'revocationBasepoint' | 'paymentBasepoint' | 'delayedPaymentBasepoint' | 'htlcBasepoint' | 'firstPerCommitmentPoint'>): string | null
+function channel.validateCompositeSpliceRecord(value: unknown): channel.ICompositeSpliceRecord
 function channel.validateOpenChannelParams(msg: message.IOpenChannelMessage, maxFundingSatoshis?: bigint, allowZeroReserve?: boolean): string | null
 function channel.validatePeerOpenChannelParams(msg: message.IOpenChannelMessage, maxFundingSatoshis?: bigint, allowZeroReserve?: boolean): string | null
 function channel.validateU64(value: bigint, field: string): string | null
@@ -5058,6 +5108,28 @@ member node.ChannelFundingUnavailableCode.FUNDING_PROVIDER_REQUIRED = "FUNDING_P
 member node.ChannelFundingUnavailableCode.INSUFFICIENT_BALANCE = "INSUFFICIENT_BALANCE"
 class node.ChannelFundingUnavailableError extends beignet#CodedError<node.ChannelFundingUnavailableCode>
 constructor node.ChannelFundingUnavailableError(code: node.ChannelFundingUnavailableCode, message: string)
+class node.CompositeSpliceEngine
+constructor node.CompositeSpliceEngine(deps: node.ICompositeSpliceEngineDeps)
+method node.CompositeSpliceEngine.abort(id: Buffer, reason?: string): { ok: boolean; error?: string; code?: node.CompositeSpliceRefusalCode; }
+method node.CompositeSpliceEngine.attach(): void
+method node.CompositeSpliceEngine.detach(): void
+method node.CompositeSpliceEngine.get(id: Buffer): channel.ICompositeSpliceRecord | null
+method node.CompositeSpliceEngine.isChannelReserved(channelId: Buffer): boolean
+method node.CompositeSpliceEngine.list(): channel.ICompositeSpliceRecord[]
+method node.CompositeSpliceEngine.plan(request: node.ICompositeSpliceOutRequest): Promise<node.ICompositeSplicePlanResult>
+method node.CompositeSpliceEngine.restore(): void
+method node.CompositeSpliceEngine.start(request: node.ICompositeSpliceOutRequest): Promise<node.ICompositeSpliceStartResult>
+enum node.CompositeSpliceRefusalCode
+member node.CompositeSpliceRefusalCode.BUSY = "BUSY"
+member node.CompositeSpliceRefusalCode.CHANNEL_NOT_FOUND = "CHANNEL_NOT_FOUND"
+member node.CompositeSpliceRefusalCode.INSUFFICIENT_BALANCE = "INSUFFICIENT_BALANCE"
+member node.CompositeSpliceRefusalCode.INVALID_PARAMS = "INVALID_PARAMS"
+member node.CompositeSpliceRefusalCode.NOT_FOUND = "NOT_FOUND"
+member node.CompositeSpliceRefusalCode.NO_ELIGIBLE_CHANNELS = "NO_ELIGIBLE_CHANNELS"
+member node.CompositeSpliceRefusalCode.SINGLE_CHANNEL_SUFFICES = "SINGLE_CHANNEL_SUFFICES"
+member node.CompositeSpliceRefusalCode.STORAGE_REQUIRED = "STORAGE_REQUIRED"
+member node.CompositeSpliceRefusalCode.TOO_LATE = "TOO_LATE"
+const node.DEFAULT_COMPOSITE_SPLICE_BUDGET_MS = 60000
 const node.DF_POLICY_STORAGE_KEY = "df:policy"
 type node.ForwardPlacement = 'forwarded' | 'held' | 'refused'
 class node.FundingWaitTimeoutError extends Error
@@ -5144,6 +5216,59 @@ property node.ICloseStatus.confirmationHeight: number
 property node.ICloseStatus.fundsAvailableHeight?: number
 property node.ICloseStatus.reason?: string
 property node.ICloseStatus.resolution: 'pending' | 'sweeping' | 'resolved'
+interface node.ICompositeSpliceChannelRefusal
+property node.ICompositeSpliceChannelRefusal.channelId: Buffer
+property node.ICompositeSpliceChannelRefusal.reason: string
+interface node.ICompositeSpliceEngineDeps
+property node.ICompositeSpliceEngineDeps.channelManager: channel.ChannelManager
+method node.ICompositeSpliceEngineDeps.currentHeight(): number
+method node.ICompositeSpliceEngineDeps.emitError(code: node.NodeErrorCode, message: string, channelId?: Buffer): void
+method node.ICompositeSpliceEngineDeps.emitStage(event: node.ICompositeSpliceStageEvent): void
+method node.ICompositeSpliceEngineDeps.fundingTxHex(channelId: Buffer): Promise<string | null>
+method node.ICompositeSpliceEngineDeps.loadAllRecords(): channel.ICompositeSpliceRecord[]
+method node.ICompositeSpliceEngineDeps.log(event: string, fields: Record<string, unknown>): void
+method node.ICompositeSpliceEngineDeps.now(): number
+method node.ICompositeSpliceEngineDeps.peerSupportsCompositeSpliceInputs(peerPubkey: string): boolean | null
+method node.ICompositeSpliceEngineDeps.peerSupportsSplicing(peerPubkey: string): boolean | null
+method node.ICompositeSpliceEngineDeps.rebroadcast(txHex: string, idHex: string): void
+method node.ICompositeSpliceEngineDeps.recordsSupported(): boolean
+method node.ICompositeSpliceEngineDeps.resolveDestination(script?: Buffer): Buffer
+method node.ICompositeSpliceEngineDeps.withMutations(mutations: recovery.RecoveryMutation[], fn: () => void): void
+interface node.ICompositeSpliceOutRequest
+property node.ICompositeSpliceOutRequest.amountSats: bigint
+property node.ICompositeSpliceOutRequest.budgetMs?: number
+property node.ICompositeSpliceOutRequest.channelIds?: Buffer[]
+property node.ICompositeSpliceOutRequest.destinationScript?: Buffer
+property node.ICompositeSpliceOutRequest.fundingFeeratePerkw: number
+interface node.ICompositeSplicePlan
+property node.ICompositeSplicePlan.amountSats: bigint
+property node.ICompositeSplicePlan.channels: node.ICompositeSplicePlanChannel[]
+property node.ICompositeSplicePlan.destinationScript: Buffer
+property node.ICompositeSplicePlan.feeSats: bigint
+property node.ICompositeSplicePlan.feeratePerkw: number
+property node.ICompositeSplicePlan.locktime: number
+property node.ICompositeSplicePlan.skipped: node.ICompositeSpliceChannelRefusal[]
+property node.ICompositeSplicePlan.weight: number
+interface node.ICompositeSplicePlanChannel
+property node.ICompositeSplicePlanChannel.channelId: Buffer
+property node.ICompositeSplicePlanChannel.debitSats: bigint
+property node.ICompositeSplicePlanChannel.feeSats: bigint
+property node.ICompositeSplicePlanChannel.maxDebitSats: bigint
+property node.ICompositeSplicePlanChannel.newCapacitySats: bigint
+property node.ICompositeSplicePlanChannel.oldCapacitySats: bigint
+property node.ICompositeSplicePlanChannel.peerPubkey: string
+type node.ICompositeSplicePlanResult = { ok: true; plan: node.ICompositeSplicePlan; } | node.ICompositeSpliceRefusal
+interface node.ICompositeSpliceRefusal
+property node.ICompositeSpliceRefusal.code: node.CompositeSpliceRefusalCode
+property node.ICompositeSpliceRefusal.error: string
+property node.ICompositeSpliceRefusal.ok: false
+property node.ICompositeSpliceRefusal.skipped?: node.ICompositeSpliceChannelRefusal[]
+interface node.ICompositeSpliceStageEvent
+property node.ICompositeSpliceStageEvent.id: Buffer
+property node.ICompositeSpliceStageEvent.reason?: string
+property node.ICompositeSpliceStageEvent.stage: channel.CompositeSpliceStage
+property node.ICompositeSpliceStageEvent.txid?: Buffer
+type node.ICompositeSpliceStartResult = { ok: true; id: Buffer; plan: node.ICompositeSplicePlan; } | node.ICompositeSpliceRefusal
 interface node.ICreateInvoiceOptions
 property node.ICreateInvoiceOptions.amountMsat?: bigint
 property node.ICreateInvoiceOptions.asyncHold?: boolean
@@ -5577,6 +5702,7 @@ constructor node.LightningNode(nodeConfig: node.INodeConfig)
 static property node.LightningNode.AFTER_GRAPH_RESTORE_MAX: number
 static property node.LightningNode.GRAPH_RESTORE_SLICE_MS: number
 static property node.LightningNode.RAPID_GOSSIP_SLICE_MS: number
+method node.LightningNode.abortCompositeSplice(id: Buffer, reason?: string): { ok: boolean; error?: string; code?: node.CompositeSpliceRefusalCode; }
 method node.LightningNode.abortDualFundedOpen(channelId: Buffer, reason?: string): { ok: boolean; error?: string; pending?: boolean; }
 method node.LightningNode.abortFforEpoch(channelIdHex: string, reason?: ffor.FforAbortReason, text?: string): channel.ChannelResult
 method node.LightningNode.addTrustedPeer(pubkeyHex: string): void
@@ -5633,6 +5759,7 @@ method node.LightningNode.getChannelHealth(channelId: Buffer): node.IChannelHeal
 method node.LightningNode.getChannelManager(): channel.ChannelManager
 method node.LightningNode.getChannelPolicy(channelId: Buffer): node.IChannelPolicy | null
 method node.LightningNode.getChannelSuggestions(count?: number): advisor.IChannelSuggestion[]
+method node.LightningNode.getCompositeSplice(id: Buffer): channel.ICompositeSpliceRecord | null
 method node.LightningNode.getCurrentBlockHeight(): number
 method node.LightningNode.getDirectFundingPolicy(): node.IDirectFundingPolicy | null
 method node.LightningNode.getDirectFundingReceiver(): directFunding.DirectFundingReceiver | undefined
@@ -5697,6 +5824,7 @@ method node.LightningNode.isNetworkingEnabled(): boolean
 method node.LightningNode.listAsyncReceiveGrants(): asyncPayments.IReceiverGrant[]
 method node.LightningNode.listAsyncReceiveRegistrations(): asyncPayments.IAsyncRegistrationRecord[]
 method node.LightningNode.listChannels(): node.IChannelInfo[]
+method node.LightningNode.listCompositeSplices(): channel.ICompositeSpliceRecord[]
 method node.LightningNode.listExternalClosePayments(): Array<{ channelId: string; txid: string; scriptHex: string; amountSats: number; feeSats: number; networkFeeSats: number; satsPerVbyte: number; timestamp: number; confirmationHeight: number; }>
 method node.LightningNode.listForwards(filter?: storage.IForwardingEventFilter): storage.IForwardingEvent[]
 method node.LightningNode.listHeldForwards(): asyncPayments.IHeldForwardRecord[]
@@ -5722,7 +5850,9 @@ method node.LightningNode.payBolt12Invoice(invoice: offer.IBolt12Invoice, exclud
 method node.LightningNode.paymentHashInUse(paymentHash: Buffer): boolean
 method node.LightningNode.peerAdvertisesAsyncReceive(pubkeyHex: string): boolean
 method node.LightningNode.peerFundingInfo(peerPubkey: string): { peerKnown: boolean; dualFund: boolean; }
+method node.LightningNode.peerSupportsCompositeSpliceInputs(peerPubkey: string): boolean | null
 method node.LightningNode.peerSupportsSplicing(peerPubkey: string): boolean | null
+method node.LightningNode.planCompositeSpliceOut(request: node.ICompositeSpliceOutRequest): Promise<node.ICompositeSplicePlanResult>
 method node.LightningNode.planRebalanceRecommendations(minImbalancePct?: number): advisor.IRebalancePlan[]
 method node.LightningNode.probeRoute(destination: string, amountSats: number): { success: boolean; feeSats?: number; feeMsat?: bigint; hops?: number; path?: Array<{ pubkey: string; shortChannelId: string; }>; }
 method node.LightningNode.provideSpliceExternalWitness(channelId: Buffer, prevTxid: Buffer, prevOutputIndex: number, witness: Buffer[]): { ok: boolean; error?: string; sendsWithheld?: boolean; }
@@ -5777,6 +5907,7 @@ method node.LightningNode.spliceInWithInputs(channelId: Buffer, amountSats: bigi
 method node.LightningNode.spliceOut(channelId: Buffer, amountSats: bigint, fundingFeeratePerkw?: number, destinationScript?: Buffer): node.ISpliceRequestResult
 method node.LightningNode.spliceQuote(channelId: Buffer, direction: 'in' | 'out', fundingFeeratePerkw?: number, destinationScript?: Buffer): { direction: 'in' | 'out'; feeSats: number; spendableSats: number; maxAmountSats: number; reserveSats?: number; commitmentCostSats?: number; inputCount?: number; }
 method node.LightningNode.startChainWatcher(): Promise<void>
+method node.LightningNode.startCompositeSpliceOut(request: node.ICompositeSpliceOutRequest): Promise<node.ICompositeSpliceStartResult>
 method node.LightningNode.startDirectFunding(): Promise<void>
 method node.LightningNode.startFforEpoch(channelIdHex: string, request: { voucherAmountsMsat: bigint[]; minPaymentMsat: bigint; settlementDeadline: number; voucherExpiry: number; feeBaseMsat: number; feeProportionalMillionths: number; epochId?: Buffer; witnessPeers?: Buffer[]; hashChain?: boolean; concurrent?: boolean; concurrentVersion?: 1 | 2; }): channel.ChannelResult
 method node.LightningNode.startSwapProvider(): Promise<void>
@@ -5807,6 +5938,7 @@ property node.LightningNodeEvents.'channel:resolved': (data: { channelId: Buffer
 property node.LightningNodeEvents.'channel:splice-txsigs-needed': (data: { channelId: Buffer; spliceTxid: Buffer; newFundingOutputIndex: number; externalInputIndices: number[]; }) => void
 property node.LightningNodeEvents.'channel:txsigs-needed': (data: { channelId: Buffer; fundingTxid: Buffer; fundingOutputIndex: number; inputIndices: number[]; externalInputIndices?: number[]; }) => void
 property node.LightningNodeEvents.'channel:voided': (data: { channelId: Buffer; }) => void
+property node.LightningNodeEvents.'composite-splice:stage': (data: node.ICompositeSpliceStageEvent) => void
 property node.LightningNodeEvents.'custom-message': (message: { peerPubkey: string; version: number; subtype: number; payload: Buffer; }) => void
 property node.LightningNodeEvents.'direct-funding:offer:accepted': (data: { offerId: string; paired: boolean; resumed?: boolean; }) => void
 property node.LightningNodeEvents.'direct-funding:offer:completed': (data: { offerId: string; }) => void
@@ -5885,7 +6017,7 @@ class node.LightningPaymentError extends beignet#CodedError<node.LightningErrorC
 constructor node.LightningPaymentError(code: node.LightningErrorCode, message: string)
 const node.MAX_FEE_RATE_SAT_PER_VBYTE = 5000
 const node.MAX_HELD_PARTS_PER_HASH = 64
-type node.NodeErrorCode = 'AUTO_FUNDING_FAILED' | 'AUTO_RECONNECT_FAILED' | 'BARRIER_DISPATCH_FAILED' | 'BLOCK_WORK_FAILED' | 'BOLT12_INVOICE_ERROR' | 'BROADCAST_FAILED' | 'BROADCAST_PERMANENT_FAILURE' | 'CHAIN_RESTORE_WATCH_FAILED' | 'CHAIN_WATCHER_ERROR' | 'CHAIN_WATCHER_START_FAILED' | 'CHANNEL_ERROR' | 'CHANNEL_FAILED_FORCE_CLOSED' | 'CHANNEL_FAILED_FORCE_CLOSE_FAILED' | 'CLOSE_CHANNEL_FAILED' | 'DURABILITY_BARRIER_TIMEOUT' | 'ERRORED_TIMEOUT_FORCE_CLOSED' | 'FORCE_CLOSE_FAILED' | 'FORCE_CLOSE_REVOKED' | 'FORWARD_TIMEOUT_FORCE_CLOSE' | 'FUNDING_BROADCAST_FAILED' | 'FUNDING_MISSING' | 'GRAPH_RESTORE_FAILED' | 'HTLC_CLAIM_FORCE_CLOSE' | 'HTLC_DEADLINE_HELD' | 'HTLC_EXPIRY_FORCE_CLOSE' | 'LISTEN_FAILED' | 'MESSAGE_TOO_LARGE' | 'NO_ROUTING_HINTS' | 'ONION_MESSAGE_ERROR' | 'ONION_PROCESSING_FAILED' | 'PERSISTENCE_ERROR' | 'PRESPLICE_WATCH_FAILED' | 'PROVIDE_EXTERNAL_WITNESS_FAILED' | 'RBF_OPEN_FAILED' | 'RECOVERY_WATCH_FAILED' | 'REESTABLISH_SECRET_MISSING' | 'REESTABLISH_TIMEOUT_FORCE_CLOSED' | 'SEND_TX_SIGNATURES_FAILED' | 'SPLICE_BROADCAST_REFUSED' | 'SPLICE_INPUT_CONFLICT' | 'SPLICE_IN_FAILED' | 'SPLICE_OUT_FAILED' | 'STARTUP_RECONNECT_FAILED' | 'STARTUP_REPAIR_COMPLETION_FAILED' | 'STARTUP_REPAIR_UNRECEIPTED' | 'STUCK_CHANNEL' | 'STUCK_CHANNEL_FORCE_CLOSED' | 'UPDATE_FEE_FAILED' | 'WAL_CHECKPOINT_FAILED' | 'WATCH_OUTPUT_FAILED'
+type node.NodeErrorCode = 'AUTO_FUNDING_FAILED' | 'AUTO_RECONNECT_FAILED' | 'BARRIER_DISPATCH_FAILED' | 'BLOCK_WORK_FAILED' | 'BOLT12_INVOICE_ERROR' | 'BROADCAST_FAILED' | 'BROADCAST_PERMANENT_FAILURE' | 'CHAIN_RESTORE_WATCH_FAILED' | 'CHAIN_WATCHER_ERROR' | 'CHAIN_WATCHER_START_FAILED' | 'CHANNEL_ERROR' | 'CHANNEL_FAILED_FORCE_CLOSED' | 'CHANNEL_FAILED_FORCE_CLOSE_FAILED' | 'CLOSE_CHANNEL_FAILED' | 'DURABILITY_BARRIER_TIMEOUT' | 'ERRORED_TIMEOUT_FORCE_CLOSED' | 'FORCE_CLOSE_FAILED' | 'FORCE_CLOSE_REVOKED' | 'FORWARD_TIMEOUT_FORCE_CLOSE' | 'FUNDING_BROADCAST_FAILED' | 'FUNDING_MISSING' | 'GRAPH_RESTORE_FAILED' | 'HTLC_CLAIM_FORCE_CLOSE' | 'HTLC_DEADLINE_HELD' | 'HTLC_EXPIRY_FORCE_CLOSE' | 'LISTEN_FAILED' | 'MESSAGE_TOO_LARGE' | 'NO_ROUTING_HINTS' | 'ONION_MESSAGE_ERROR' | 'ONION_PROCESSING_FAILED' | 'PERSISTENCE_ERROR' | 'PRESPLICE_WATCH_FAILED' | 'PROVIDE_EXTERNAL_WITNESS_FAILED' | 'RBF_OPEN_FAILED' | 'RECOVERY_WATCH_FAILED' | 'REESTABLISH_SECRET_MISSING' | 'REESTABLISH_TIMEOUT_FORCE_CLOSED' | 'SEND_TX_SIGNATURES_FAILED' | 'SPLICE_BROADCAST_REFUSED' | 'SPLICE_INPUT_CONFLICT' | 'SPLICE_IN_FAILED' | 'SPLICE_OUT_FAILED' | 'COMPOSITE_SPLICE_ABORTED' | 'COMPOSITE_SPLICE_RESTORE_FAILED' | 'STARTUP_RECONNECT_FAILED' | 'STARTUP_REPAIR_COMPLETION_FAILED' | 'STARTUP_REPAIR_UNRECEIPTED' | 'STUCK_CHANNEL' | 'STUCK_CHANNEL_FORCE_CLOSED' | 'UPDATE_FEE_FAILED' | 'WAL_CHECKPOINT_FAILED' | 'WATCH_OUTPUT_FAILED'
 const node.OUTGOING_CLTV_REJECT_DELTA = 3
 type node.OutgoingHtlcState = 'offered' | 'fulfilled' | 'failed' | 'onchain-pending' | 'onchain-resolved'
 enum node.PaymentDirection
@@ -7151,7 +7283,7 @@ method recovery.RecoveryManager.getOutbox(channelId?: string): recovery.IRecover
 method recovery.RecoveryManager.markSent(ids: Array<number | null>): void
 get recovery.RecoveryManager.outboxSupported(): boolean
 method recovery.RecoveryManager.supersedeChannelOutbox(channelId: string, messageTypes?: number[]): void
-type recovery.RecoveryMutation = { type: 'ffor_voucher'; record: ffor.IFforVoucherArchive; } | { type: 'channel_state'; channelId: string; state: channel.IChannelState; peerPubkey: string; } | { type: 'channel_key_index'; channelId: string; channelIndex: number; } | { type: 'chain_monitor'; channelId: string; state: chain.IChainMonitorState; } | { type: 'payment_preimage'; paymentHash: string; preimage: Buffer; } | { type: 'htlc_payment_mapping'; htlcKey: string; paymentHash: string; } | { type: 'delete_htlc_payment_mapping'; htlcKey: string; } | { type: 'htlc_shared_secret'; key: string; secret: Buffer; } | { type: 'delete_htlc_shared_secret'; key: string; } | { type: 'forwarded_htlc'; outKey: string; inChannelId: Buffer; inHtlcId: bigint; } | { type: 'delete_forwarded_htlc'; outKey: string; } | { type: 'payment_state'; paymentHash: string; payment: node.IPaymentInfo; } | { type: 'payment_secret'; paymentHash: string; secret: Buffer; } | { type: 'delete_payment_secret'; paymentHash: string; } | { type: 'delete_payment'; paymentHash: string; } | { type: 'delete_preimage'; paymentHash: string; } | { type: 'invoice_state'; paymentHash: string; invoice: node.IInvoiceInfo; } | { type: 'delete_invoice'; paymentHash: string; } | { type: 'invoice_path_id'; paymentHash: string; pathId: Buffer; } | { type: 'delete_invoice_path_id'; paymentHash: string; } | { type: 'forwarding_event'; event: Omit<storage.IForwardingEvent, 'id'>; } | { type: 'channel_closed'; channelId: string; } | { type: 'outbox_supersede'; channelId: string; messageTypes?: number[]; }
+type recovery.RecoveryMutation = { type: 'ffor_voucher'; record: ffor.IFforVoucherArchive; } | { type: 'composite_splice'; record: channel.ICompositeSpliceRecord; } | { type: 'channel_state'; channelId: string; state: channel.IChannelState; peerPubkey: string; } | { type: 'channel_key_index'; channelId: string; channelIndex: number; } | { type: 'chain_monitor'; channelId: string; state: chain.IChainMonitorState; } | { type: 'payment_preimage'; paymentHash: string; preimage: Buffer; } | { type: 'htlc_payment_mapping'; htlcKey: string; paymentHash: string; } | { type: 'delete_htlc_payment_mapping'; htlcKey: string; } | { type: 'htlc_shared_secret'; key: string; secret: Buffer; } | { type: 'delete_htlc_shared_secret'; key: string; } | { type: 'forwarded_htlc'; outKey: string; inChannelId: Buffer; inHtlcId: bigint; } | { type: 'delete_forwarded_htlc'; outKey: string; } | { type: 'payment_state'; paymentHash: string; payment: node.IPaymentInfo; } | { type: 'payment_secret'; paymentHash: string; secret: Buffer; } | { type: 'delete_payment_secret'; paymentHash: string; } | { type: 'delete_payment'; paymentHash: string; } | { type: 'delete_preimage'; paymentHash: string; } | { type: 'invoice_state'; paymentHash: string; invoice: node.IInvoiceInfo; } | { type: 'delete_invoice'; paymentHash: string; } | { type: 'invoice_path_id'; paymentHash: string; pathId: Buffer; } | { type: 'delete_invoice_path_id'; paymentHash: string; } | { type: 'forwarding_event'; event: Omit<storage.IForwardingEvent, 'id'>; } | { type: 'channel_closed'; channelId: string; } | { type: 'outbox_supersede'; channelId: string; messageTypes?: number[]; }
 type recovery.RecoveryOutboundMessage = storage.IRecoveryOutboxMessage
 type recovery.RecoveryOutboxDisposition = 'pending_send' | 'sent_unacked' | 'superseded'
 interface recovery.RecoverySnapshot
@@ -7473,6 +7605,10 @@ interface storage.IChannelPolicyStorage
 method storage.IChannelPolicyStorage.deleteChannelPolicy(channelId: string): void
 method storage.IChannelPolicyStorage.loadAllChannelPolicies(): Array<{ channelId: string; policy: storage.IPersistedChannelPolicy; }>
 method storage.IChannelPolicyStorage.saveChannelPolicy(channelId: string, policy: storage.IPersistedChannelPolicy): void
+interface storage.ICompositeSpliceStorage
+method storage.ICompositeSpliceStorage.loadAllCompositeSplices(): channel.ICompositeSpliceRecord[]
+method storage.ICompositeSpliceStorage.loadCompositeSplice(id: string): channel.ICompositeSpliceRecord | null
+method storage.ICompositeSpliceStorage.saveCompositeSplice(record: channel.ICompositeSpliceRecord): void
 interface storage.IFforStorage
 method storage.IFforStorage.loadAllFforVouchers(): ffor.IFforVoucherArchive[]
 method storage.IFforStorage.loadFforVoucher(id: string): ffor.IFforVoucherArchive | null
@@ -7861,6 +7997,7 @@ property storage.ISerializedSpliceInFlight.remoteCommitmentSigLeaseBlockheight?:
 property storage.ISerializedSpliceInFlight.remoteFundingPubkey: string
 property storage.ISerializedSpliceInFlight.remoteHtlcSignatures?: string[]
 property storage.ISerializedSpliceInFlight.remoteRelativeSatoshis: string
+property storage.ISerializedSpliceInFlight.remoteSharedInputSig?: string
 property storage.ISerializedSpliceInFlight.remoteSpliceLocked: boolean
 property storage.ISerializedSpliceInFlight.sentTxSignatures: boolean
 property storage.ISerializedSpliceInFlight.spliceTxHex: string
@@ -7889,7 +8026,7 @@ property storage.ISerializedV2InFlight.remoteCommitmentSig: string | null
 property storage.ISerializedV2InFlight.remoteContributionSats: string
 property storage.ISerializedV2InFlight.sentTxSignatures: boolean
 property storage.ISerializedV2InFlight.weSignFirst: boolean
-interface storage.IStorageBackend extends storage.IStorageCore, Partial<storage.IFforStorage>, Partial<storage.IInvoicePathIdStorage>, Partial<storage.IAnnouncedPeerAddressStorage>, Partial<storage.IChannelKeyIndexHistoryStorage>, Partial<storage.IMetadataScanStorage>, Partial<storage.IWalletDataStorage>, Partial<storage.IGossipPagingStorage>, Partial<storage.IGossipPruningStorage>, Partial<storage.IChannelPolicyStorage>, Partial<storage.IPeerStorageBlobStorage>, Partial<storage.IForwardingStorage>, Partial<storage.IActionLogStorage>, Partial<storage.IWatchtowerStorage>, Partial<storage.IRecoveryOutboxStorage>, Partial<storage.IRecoveryJournalStorage>, Partial<storage.IOfferStorage>
+interface storage.IStorageBackend extends storage.IStorageCore, Partial<storage.IFforStorage>, Partial<storage.ICompositeSpliceStorage>, Partial<storage.IInvoicePathIdStorage>, Partial<storage.IAnnouncedPeerAddressStorage>, Partial<storage.IChannelKeyIndexHistoryStorage>, Partial<storage.IMetadataScanStorage>, Partial<storage.IWalletDataStorage>, Partial<storage.IGossipPagingStorage>, Partial<storage.IGossipPruningStorage>, Partial<storage.IChannelPolicyStorage>, Partial<storage.IPeerStorageBlobStorage>, Partial<storage.IForwardingStorage>, Partial<storage.IActionLogStorage>, Partial<storage.IWatchtowerStorage>, Partial<storage.IRecoveryOutboxStorage>, Partial<storage.IRecoveryJournalStorage>, Partial<storage.IOfferStorage>
 method storage.IStorageBackend.checkpoint?(): void
 method storage.IStorageBackend.corruptRowCount?(): number
 method storage.IStorageBackend.inTransaction?(): boolean
@@ -7900,6 +8037,7 @@ property storage.IStorageCapabilities.actionLog: storage.IActionLogStorage
 property storage.IStorageCapabilities.announcedPeerAddresses: storage.IAnnouncedPeerAddressStorage
 property storage.IStorageCapabilities.channelKeyIndexHistory: storage.IChannelKeyIndexHistoryStorage
 property storage.IStorageCapabilities.channelPolicies: storage.IChannelPolicyStorage
+property storage.IStorageCapabilities.compositeSplices: storage.ICompositeSpliceStorage
 property storage.IStorageCapabilities.ffor: storage.IFforStorage
 property storage.IStorageCapabilities.forwarding: storage.IForwardingStorage
 property storage.IStorageCapabilities.gossipPaging: storage.IGossipPagingStorage
@@ -8028,6 +8166,7 @@ method storage.MemoryStorage.loadAllChainMonitors(): Array<{ channelId: string; 
 method storage.MemoryStorage.loadAllChannelKeyIndices(): Array<{ channelId: string; channelIndex: number; }>
 method storage.MemoryStorage.loadAllChannelPolicies(): Array<{ channelId: string; policy: storage.IPersistedChannelPolicy; }>
 method storage.MemoryStorage.loadAllChannels(): Array<{ channelId: string; state: channel.IChannelState; peerPubkey: string; }>
+method storage.MemoryStorage.loadAllCompositeSplices(): channel.ICompositeSpliceRecord[]
 method storage.MemoryStorage.loadAllFforVouchers(): ffor.IFforVoucherArchive[]
 method storage.MemoryStorage.loadAllForwardedHtlcs(): Array<{ outKey: string; inChannelId: Buffer; inHtlcId: bigint; }>
 method storage.MemoryStorage.loadAllGossipChannels(): gossip.IGraphChannel[]
@@ -8045,6 +8184,7 @@ method storage.MemoryStorage.loadAllScidMappings(): Array<{ scidHex: string; cha
 method storage.MemoryStorage.loadChainMonitor(channelId: string): chain.IChainMonitorState | null
 method storage.MemoryStorage.loadChannel(id: string): { state: channel.IChannelState; peerPubkey: string; } | null
 method storage.MemoryStorage.loadChannelKeyIndex(channelId: string): number | null
+method storage.MemoryStorage.loadCompositeSplice(id: string): channel.ICompositeSpliceRecord | null
 method storage.MemoryStorage.loadFforVoucher(id: string): ffor.IFforVoucherArchive | null
 method storage.MemoryStorage.loadGossipChannelsAfter(afterRowid: number, limit: number): storage.IGossipRowPage<gossip.IGraphChannel>
 method storage.MemoryStorage.loadGossipNodesAfter(afterRowid: number, limit: number): storage.IGossipRowPage<gossip.IGraphNode>
@@ -8073,6 +8213,7 @@ method storage.MemoryStorage.saveChainMonitor(channelId: string, state: chain.IC
 method storage.MemoryStorage.saveChannel(id: string, state: channel.IChannelState, peerPubkey: string): void
 method storage.MemoryStorage.saveChannelKeyIndex(channelId: string, channelIndex: number): void
 method storage.MemoryStorage.saveChannelPolicy(channelId: string, policy: storage.IPersistedChannelPolicy): void
+method storage.MemoryStorage.saveCompositeSplice(record: channel.ICompositeSpliceRecord): void
 method storage.MemoryStorage.saveFforVoucher(record: ffor.IFforVoucherArchive): void
 method storage.MemoryStorage.saveForwardedHtlc(outKey: string, inChannelId: Buffer, inHtlcId: bigint): void
 method storage.MemoryStorage.saveForwardingEvent(event: Omit<storage.IForwardingEvent, 'id'>): void

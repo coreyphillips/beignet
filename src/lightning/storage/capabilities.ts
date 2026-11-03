@@ -80,6 +80,11 @@ const CAPABILITY_MEMBERS: {
 		loadFforVoucher: true,
 		loadAllFforVouchers: true
 	},
+	compositeSplices: {
+		saveCompositeSplice: true,
+		loadCompositeSplice: true,
+		loadAllCompositeSplices: true
+	},
 	invoicePathIds: { saveInvoicePathId: true, loadAllInvoicePathIds: true },
 	announcedPeerAddresses: {
 		saveAnnouncedPeerAddresses: true,

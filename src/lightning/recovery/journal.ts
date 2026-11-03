@@ -2499,6 +2499,16 @@ export function reconstructFromFrames(
 	) {
 		throw new Error('Recovery target cannot persist FFOR voucher custody');
 	}
+	if (
+		!target.saveCompositeSplice &&
+		frames
+			.slice(snapshotIndex, replayEnd)
+			.some((frame) =>
+				frame.mutations.some((m) => m.type === 'composite_splice')
+			)
+	) {
+		throw new Error('Recovery target cannot persist composite splice records');
+	}
 	// The target must be empty: applySnapshot and replay only insert and
 	// replace, so rows already present that the journal never mentions would
 	// silently survive into the "reconstructed" state.

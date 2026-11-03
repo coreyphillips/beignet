@@ -246,12 +246,26 @@ the composite record marked ABORTED, the spend-limit reservation released.
 direction. The composite needs the refusal only for the direction that
 matters: a session that has received the peer's `tx_signatures` but has not
 sent its own may still abort, because the peer cannot broadcast. The refusal
-is kept for `sentTxSignatures`. A peer that had signed and then receives our
-`tx_abort` must forget the splice; a peer that instead resumes it at
-reestablish (CLN was observed doing this for a forgotten negotiation) gets
-`tx_abort` again before our `channel_reestablish`, the path
-`markForReestablish` already uses through `_forgottenSplice` and
-`spliceAbortOwed`.
+is kept for `sentTxSignatures`. Step 5c implements this (`abortSplice` admits
+the received-only case for a composite session).
+
+What the peer does with that `tx_abort` is the one residue of this design.
+BOLT 2 forbids a side that sent `tx_signatures` to forget the transaction on
+`tx_abort`, since the aborting side may hold enough to publish it, and a
+beignet acceptor refuses its own abort past that point and keeps the splice
+at reestablish too (`_handleReestablishSplice` forgets only a splice with no
+signatures in either direction). A peer that signed before the composite
+aborted therefore keeps its `spliceInFlight` with `sentTxSignatures` and
+stays in SPLICING, although nothing of its can confirm: the initiator holds
+every witness it lacks. `tests/lightning/composite-splice.test.ts` pins that
+("a peer that never signs within the budget"). The window is one round trip
+per peer, between the commitment release and the peers' `tx_signatures`,
+and only a peer that crashes or stalls exactly then can open it. Closing it
+needs an acceptor-side change outside step 5: on `tx_abort` after sending
+`tx_signatures`, return the channel to NORMAL on the old funding while
+remembering the transaction and watching for it, as the conflicted-splice
+revert of `docs/SPLICE-LOCK-DEPTH.md` remembers a reverted splice. That is
+a follow-up issue, not part of #1922.
 
 ### After the point of no return
 
@@ -326,7 +340,20 @@ createdAt, updatedAt
 It is written at PLANNED before the first `splice_init`, and at every stage
 change before the message that causes it leaves. Per-channel state stays in
 each channel's `spliceInFlight`, created at that channel's `commitment_signed`
-as today; the composite record only adds the cross-channel facts.
+as today; the composite record only adds the cross-channel facts. Step 5c
+adds `remoteSharedInputSig` to `spliceInFlight` (the peer's half of the
+shared input, kept once verified) so the witness of input j can be
+assembled in every other session after a restart as well.
+
+The record is not a recovery snapshot table (`RecoverySnapshot` and its
+schema versions are unchanged): it is operational state with a life of
+minutes. A journal rebuilt from a snapshot drops records older than that
+snapshot, which the missing-record rules below absorb. Storage carries it in
+the optional `compositeSplices` capability group (`saveCompositeSplice`,
+`loadCompositeSplice`, `loadAllCompositeSplices`; SQLite table
+`composite_splices`, schema version 20), and a node whose storage lacks the
+group, or that runs without a recovery journal, refuses to start a
+composite (`STORAGE_REQUIRED`).
 
 ### On restore
 
@@ -363,10 +390,16 @@ a reservation over its channel set from PLANNED to a terminal stage:
   already declines while a splice with the liquidity peer is pending,
   `docs/SPLICE-LOCK-DEPTH.md`);
 - a channel already reserved by any of those is not selected at planning;
-- quiescence is requested on every channel of the set, in channel id order,
-  and the composite starts only when all are QUIESCENT with us as initiator.
-  A channel whose peer wins the quiescence tie (`handleStfuMessage`) aborts
-  the composite before anything is sent;
+- quiescence is requested on every channel of the set through each
+  session's own splice start (`initiateSplice` sends `stfu` and parks the
+  `splice_init` until the channel is quiescent with us as initiator), in
+  input order. Step 5c does not quiesce every channel before the first
+  `splice_init`: quiescence has no end message of its own, so a set
+  quiesced ahead of time could not be released cleanly if a later channel
+  failed to quiesce, whereas a session that has started can be ended with
+  `tx_abort`, which releases quiescence on both sides. A channel whose peer
+  wins the quiescence tie (`handleStfuMessage`) drops its parked splice
+  with an error, which aborts the composite before any `commitment_signed`;
 - one composite at a time per node. A second request while one is live is
   refused with a typed busy result, not queued.
 
@@ -482,11 +515,20 @@ Each lands alone, fund-relevant ones after the full matrix with interop:
   `option_composite_splice_inputs`, with the matrix tier that proves a
   beignet acceptor completes a composite and that CLN either does or does
   not.
-- 5c. The composite engine in `LightningNode`: shared serial ids, identical
-  contributions, cross-session txid check, held release, abort rules, the
-  composite record, restore. In-process tests in the style of
-  `tests/lightning/splice-external-inputs.test.ts` for the happy path, every
-  row of the failure table and restart at every stage.
+- 5c. The composite engine in `LightningNode`
+  (`src/lightning/node/composite-splice-engine.ts`): shared serial ids,
+  identical contributions, the cross-session txid check with the held
+  `commitment_signed` (`SPLICE_TX_NEGOTIATED`,
+  `releaseCompositeSpliceCommitment`), the held `tx_signatures` through the
+  #592 external slots, the abort rules, the composite record
+  (`composite_splice` recovery mutation) and the restore table. Public
+  surface: `planCompositeSpliceOut`, `startCompositeSpliceOut`,
+  `abortCompositeSplice`, `getCompositeSplice`, `listCompositeSplices`,
+  `peerSupportsCompositeSpliceInputs`, event `composite-splice:stage`.
+  Tests in `tests/lightning/composite-splice.test.ts` (three in-process
+  nodes with real funding transactions): the happy path, largest-first
+  debits, the refusals, operator abort, a contributing peer, a peer that
+  never signs, restart before and after release.
 - 5d. `BeignetNode` quote and execute, spend-limit reservation, routes,
   OpenAPI, snapshot, CLI, docs.
 - 5e. Regtest qualification: a wallet with two beignet primaries pays an

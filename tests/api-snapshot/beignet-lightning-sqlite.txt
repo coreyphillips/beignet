@@ -109,7 +109,7 @@ method IStoredPaymentRef.load(): beignet/lightning#node.IPaymentInfo | null
 property IStoredPaymentRef.paymentHash: string
 class SqliteStorage implements beignet/lightning#storage.IStorageBackend
 constructor SqliteStorage(dbPath: string, onCorruptRow?: (error: unknown) => void, opts?: { encryptionKey?: Buffer; })
-static readonly property SqliteStorage.CURRENT_SCHEMA_VERSION = 19
+static readonly property SqliteStorage.CURRENT_SCHEMA_VERSION = 20
 method SqliteStorage.addWatchtowerUpdate(update: beignet/lightning#watchtower.IWatchtowerUpdate): number
 method SqliteStorage.backup(destPath: string): Promise<void>
 method SqliteStorage.checkpoint(): void
@@ -154,6 +154,7 @@ method SqliteStorage.loadAllChainMonitors(): Array<{ channelId: string; state: b
 method SqliteStorage.loadAllChannelKeyIndices(): Array<{ channelId: string; channelIndex: number; }>
 method SqliteStorage.loadAllChannelPolicies(): Array<{ channelId: string; policy: beignet/lightning#storage.IPersistedChannelPolicy; }>
 method SqliteStorage.loadAllChannels(): Array<{ channelId: string; state: beignet/lightning#channel.IChannelState; peerPubkey: string; }>
+method SqliteStorage.loadAllCompositeSplices(): beignet/lightning#channel.ICompositeSpliceRecord[]
 method SqliteStorage.loadAllFforVouchers(): beignet/lightning#ffor.IFforVoucherArchive[]
 method SqliteStorage.loadAllForwardedHtlcs(): Array<{ outKey: string; inChannelId: Buffer; inHtlcId: bigint; }>
 method SqliteStorage.loadAllGossipChannels(): beignet/lightning#gossip.IGraphChannel[]
@@ -173,6 +174,7 @@ method SqliteStorage.loadAllWebhooks(): Array<{ id: string; url: string; events:
 method SqliteStorage.loadChainMonitor(channelId: string): beignet/lightning#chain.IChainMonitorState | null
 method SqliteStorage.loadChannel(id: string): { state: beignet/lightning#channel.IChannelState; peerPubkey: string; } | null
 method SqliteStorage.loadChannelKeyIndex(channelId: string): number | null
+method SqliteStorage.loadCompositeSplice(id: string): beignet/lightning#channel.ICompositeSpliceRecord | null
 method SqliteStorage.loadFforVoucher(id: string): beignet/lightning#ffor.IFforVoucherArchive | null
 method SqliteStorage.loadGossipChannelsAfter(afterRowid: number, limit: number): beignet/lightning#storage.IGossipRowPage<beignet/lightning#gossip.IGraphChannel>
 method SqliteStorage.loadGossipNodesAfter(afterRowid: number, limit: number): beignet/lightning#storage.IGossipRowPage<beignet/lightning#gossip.IGraphNode>
@@ -205,6 +207,7 @@ method SqliteStorage.saveChainMonitor(channelId: string, state: beignet/lightnin
 method SqliteStorage.saveChannel(id: string, state: beignet/lightning#channel.IChannelState, peerPubkey: string): void
 method SqliteStorage.saveChannelKeyIndex(channelId: string, channelIndex: number): void
 method SqliteStorage.saveChannelPolicy(channelId: string, policy: beignet/lightning#storage.IPersistedChannelPolicy): void
+method SqliteStorage.saveCompositeSplice(record: beignet/lightning#channel.ICompositeSpliceRecord): void
 method SqliteStorage.saveFforVoucher(record: beignet/lightning#ffor.IFforVoucherArchive): void
 method SqliteStorage.saveForwardedHtlc(outKey: string, inChannelId: Buffer, inHtlcId: bigint): void
 method SqliteStorage.saveForwardingEvent(event: Omit<beignet/lightning#storage.IForwardingEvent, 'id'>): void

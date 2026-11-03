@@ -53,6 +53,12 @@ export interface ChannelManagerEvents {
 		newFundingOutputIndex: number,
 		externalInputIndices: number[]
 	) => void;
+	'splice:negotiated': (
+		channelId: Buffer,
+		compositeId: Buffer,
+		spliceTxid: Buffer,
+		newFundingOutputIndex: number
+	) => void;
 	/** A restored v2 open was rolled back or refused. */
 	'channel:v2-open-disposed': (
 		channelId: Buffer,

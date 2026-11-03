@@ -12,6 +12,8 @@ import {
 import { parseWebSocketUrl } from '../transport/websocket';
 import type { IPeerTransportOptions } from '../transport/duplex-transport';
 import type { IFforVoucherArchive } from '../ffor/voucher-archive';
+import type { ICompositeSpliceRecord } from '../channel/composite-splice-record';
+import { validateCompositeSpliceRecord } from '../channel/composite-splice-record';
 import {
 	fforVoucherArchiveId,
 	mergeFforVoucherArchive,
@@ -432,7 +434,7 @@ export class SqliteStorage implements IStorageBackend {
 	// ─── Schema ───
 
 	/** Current schema version. Increment when adding migrations. */
-	static readonly CURRENT_SCHEMA_VERSION = 19;
+	static readonly CURRENT_SCHEMA_VERSION = 20;
 
 	/**
 	 * Row cap for forwarding_events: bounds DB growth on busy routing nodes.
@@ -456,6 +458,7 @@ export class SqliteStorage implements IStorageBackend {
 		{ table: 'revoked_htlc_snapshots', pk: 'rowid', columns: ['htlcs_json'] },
 		{ table: 'payments', pk: 'payment_hash', columns: ['payment_json'] },
 		{ table: 'ffor_vouchers', pk: 'id', columns: ['record_json'] },
+		{ table: 'composite_splices', pk: 'id', columns: ['record_json'] },
 		{ table: 'preimages', pk: 'payment_hash', columns: ['preimage'] },
 		{
 			table: 'htlc_payment_map',
@@ -725,6 +728,10 @@ export class SqliteStorage implements IStorageBackend {
 			);
 
 			CREATE TABLE IF NOT EXISTS ffor_vouchers (
+				id TEXT PRIMARY KEY,
+				record_json TEXT NOT NULL
+			);
+			CREATE TABLE IF NOT EXISTS composite_splices (
 				id TEXT PRIMARY KEY,
 				record_json TEXT NOT NULL
 			);
@@ -1120,6 +1127,41 @@ export class SqliteStorage implements IStorageBackend {
 			);
 			this._stmt('DELETE FROM recovery_outbox WHERE channel_id = ?').run(id);
 		})();
+	}
+
+	// ─── Composite splice records (issue #1922) ───
+
+	saveCompositeSplice(record: ICompositeSpliceRecord): void {
+		const valid = validateCompositeSpliceRecord(record);
+		this._stmt(
+			'INSERT OR REPLACE INTO composite_splices (id, record_json) VALUES (?, ?)'
+		).run(valid.id, this._enc(JSON.stringify(valid)));
+	}
+
+	loadCompositeSplice(id: string): ICompositeSpliceRecord | null {
+		const row = this._stmt(
+			'SELECT record_json FROM composite_splices WHERE id = ?'
+		).get(id) as { record_json: string } | undefined;
+		if (!row) return null;
+		const record = validateCompositeSpliceRecord(
+			JSON.parse(this._dec(row.record_json))
+		);
+		if (record.id !== id) throw new Error('Composite splice row key mismatch');
+		return record;
+	}
+
+	loadAllCompositeSplices(): ICompositeSpliceRecord[] {
+		const rows = this._stmt(
+			'SELECT id, record_json FROM composite_splices ORDER BY id'
+		).all() as { id: string; record_json: string }[];
+		return rows.map((row) => {
+			const record = validateCompositeSpliceRecord(
+				JSON.parse(this._dec(row.record_json))
+			);
+			if (record.id !== row.id)
+				throw new Error('Composite splice row key mismatch');
+			return record;
+		});
 	}
 
 	saveFforVoucher(record: IFforVoucherArchive): void {
@@ -2221,6 +2263,10 @@ export class SqliteStorage implements IStorageBackend {
 						'INSERT OR IGNORE INTO encryption_scrub_pending (id) VALUES (1)'
 					);
 				}
+			},
+			// Migration 19->20: composite_splices (issue #1922) is created above.
+			(): void => {
+				// No-op
 			}
 		];
 

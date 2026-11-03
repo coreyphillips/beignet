@@ -38,6 +38,7 @@ import {
 } from '../crypto/provider';
 import { hkdfKey } from '../storage/encryption';
 import type { IStorageBackend, IStoredRecoveryFrame } from '../storage/types';
+import type { ICompositeSpliceRecord } from '../channel/composite-splice-record';
 import { CorruptRecoveryRowError } from '../storage/types';
 import type { IStaticChannelBackup } from '../backup/scb';
 import { decodeScb } from '../backup/scb';
@@ -147,6 +148,7 @@ export const PROBE_MUTATION_COVERAGE: Record<RecoveryMutation['type'], true> = {
 	delete_forwarded_htlc: true,
 	payment_state: true,
 	ffor_voucher: true,
+	composite_splice: true,
 	payment_secret: true,
 	delete_payment_secret: true,
 	delete_payment: true,
@@ -263,6 +265,35 @@ function probeOutboxMessage(): {
  * here would let that backend's failure on it masquerade as a capsule
  * content defect (see PROBE_MUTATION_COVERAGE / PROBE_SNAPSHOT_COVERAGE).
  */
+function probeCompositeSplice(): ICompositeSpliceRecord {
+	return {
+		id: 'ee'.repeat(32),
+		stage: 'PLANNED',
+		channels: [
+			{
+				channelId: PROBE_CHANNEL_ID,
+				peerPubkey: getPublicKey(Buffer.alloc(32, 7)).toString('hex'),
+				fundingTxid: PROBE_HASH,
+				fundingOutputIndex: 0,
+				debitSats: '1000',
+				feeSats: '10',
+				oldCapacitySats: '100000',
+				newCapacitySats: '98990',
+				inputSerialId: '0',
+				fundingOutputSerialId: '2'
+			}
+		],
+		destinationScript: '0014' + 'cc'.repeat(20),
+		destinationSerialId: '4',
+		amountSats: '1000',
+		feeSats: '10',
+		feeratePerkw: 253,
+		locktime: 0,
+		createdAt: 0,
+		updatedAt: 0
+	};
+}
+
 export function knownGoodProbeFrames(): VerifiedRecoveryChain {
 	const snapshot: RecoveryFrame = {
 		version: 1,
@@ -356,6 +387,7 @@ export function knownGoodProbeFrames(): VerifiedRecoveryChain {
 		timestamp: 0,
 		mutations: [
 			{ type: 'ffor_voucher', record: probeVoucher(2) },
+			{ type: 'composite_splice', record: probeCompositeSplice() },
 			{
 				type: 'channel_state',
 				channelId: PROBE_CHANNEL_ID,

@@ -69,6 +69,8 @@ export type NodeErrorCode =
 	| 'SPLICE_INPUT_CONFLICT'
 	| 'SPLICE_IN_FAILED'
 	| 'SPLICE_OUT_FAILED'
+	| 'COMPOSITE_SPLICE_ABORTED'
+	| 'COMPOSITE_SPLICE_RESTORE_FAILED'
 	| 'STARTUP_RECONNECT_FAILED'
 	| 'STARTUP_REPAIR_COMPLETION_FAILED'
 	| 'STARTUP_REPAIR_UNRECEIPTED'
@@ -192,6 +194,10 @@ export interface LightningNodeEvents
 	// ─── Splices ───
 
 	/** splice_locked exchanged both ways: the channel runs on the new funding. */
+	/** A composite splice-out (issue #1922) reached a stage; ABORTED carries the reason. */
+	'composite-splice:stage': (
+		data: import('./composite-splice-engine').ICompositeSpliceStageEvent
+	) => void;
 	'splice:complete': (data: {
 		channelId: Buffer;
 		fundingTxid: Buffer | null | undefined;

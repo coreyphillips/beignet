@@ -751,6 +751,60 @@ node.provideSpliceExternalWitness(channelId, prevTxid, prevOutputIndex, witness)
 node.getRawChannel(channelId);
 ```
 
+### Composite splice-out (library only)
+
+One transaction can splice out of several channels at once and pay one
+destination (issue #1922, [docs/MULTI-CHANNEL-SPLICE-OUT.md](../../docs/MULTI-CHANNEL-SPLICE-OUT.md)):
+every participating channel's funding outpoint is an input, every channel
+gets a new funding output at `old - debit - fee`, and the destination
+receives `sum(debit)`. The node is the initiator in N ordinary splice
+sessions that negotiate the identical transaction, holds every
+`commitment_signed` until all N agree on the txid, and releases its
+`tx_signatures` in every session only once every peer has signed. Before that
+release nothing is spent and the operation can be aborted; after it the
+transaction is broadcast and each channel locks on its own.
+
+```typescript
+// Pure: which channels would take part, debited largest spendable balance
+// first, with the fee split in proportion to each debit.
+const plan = await node.planCompositeSpliceOut({
+  destinationScript,          // optional; the wallet's own address otherwise
+  amountSats: 1_500_000n,
+  fundingFeeratePerkw: 1000,
+  channelIds,                 // optional: use exactly these channels
+  budgetMs                    // optional: time to every peer's signature
+});
+// plan.ok ? plan.plan.channels[i].{channelId, debitSats, feeSats, newCapacitySats}
+//         : plan.code (INVALID_PARAMS, BUSY, STORAGE_REQUIRED, CHANNEL_NOT_FOUND,
+//                      NO_ELIGIBLE_CHANNELS, INSUFFICIENT_BALANCE,
+//                      SINGLE_CHANNEL_SUFFICES) and plan.skipped[] with a reason per channel
+
+// Plan and start. Resolves once every session has started; the operation
+// then reports on 'composite-splice:stage' and through its record.
+const started = await node.startCompositeSpliceOut({ destinationScript, amountSats, fundingFeeratePerkw });
+node.getCompositeSplice(started.id);      // the record: stage, channels, txid, txHex
+node.listCompositeSplices();              // every record this node holds
+node.abortCompositeSplice(started.id);    // until RELEASED; TOO_LATE afterwards
+node.peerSupportsCompositeSpliceInputs(peerPubkey); // bits 454/455, or Core Lightning
+```
+
+Stages: `PLANNED`, `NEGOTIATING`, `COMMITTED` (every session negotiated the
+same transaction; the commitments are released), `PEERS_SIGNED`, `RELEASED`
+(our `tx_signatures` left in every session; the record is on disk first),
+`BROADCAST`, `LOCKED`, or `ABORTED` with a reason. One composite runs at a
+time; a second request is refused with `BUSY`, not queued. A channel in a
+live composite refuses a single splice and a cooperative close. The record
+is a `composite_splice` recovery mutation and needs a storage backend with
+the `compositeSplices` capability group plus a recovery journal; at boot a
+record that never reached `RELEASED` is marked `ABORTED` and its unsent
+sessions are forgotten (owing the peer a `tx_abort`), a `RELEASED` or
+`BROADCAST` one is rebroadcast and tracked to `LOCKED`. A peer is selected
+only when it advertises `option_composite_splice_inputs` or is Core
+Lightning (which admits the inputs without the bit, see the design note's
+section 8); a peer that signed before the composite aborted keeps its splice
+until an operator acts, as BOLT 2 requires of a side that sent
+`tx_signatures` (section 4 of the note).
+
 None of this has a daemon or CLI surface, deliberately. `POST /channel/open-v2`
 and `POST /channel/splice-in` take no `fundingUtxos` and no `contribution`, and
 no route accepts a witness. The only in-tree consumer is the direct-funding
@@ -1320,7 +1374,8 @@ const result = await node.recoverFromStaticChannelBackup(scb.channels);
 | `channel:aborted` | `(temporaryChannelId: Buffer, reason: string)` | A negotiated but unfunded open was torn down. |
 | `channel:voided` | `(data: { channelId: Buffer })` | Unfunded or abandoned channel discarded. |
 | `announcement:ready` | `(channelId: Buffer)` | Channel eligible for announcement. |
-| `splice:complete` | `(data: { channelId: Buffer; fundingTxid: Buffer \| null \| undefined })` | splice_locked exchanged both ways: the channel runs on the new funding. |
+| `composite-splice:stage` | `(data: ICompositeSpliceStageEvent)` | A composite splice-out (issue #1922) reached a stage; ABORTED carries the reason. |
+| `splice:complete` | `(data: { channelId: Buffer; fundingTxid: Buffer \| null \| undefined })` |  |
 | `splice:aborted` | `(data: { channelId: Buffer; reason: string })` | A splice negotiation was unwound by tx_abort before its point of no return. |
 | `splice:conflicted` | `(data: { channelId: Buffer; spliceTxid: string; conflictTxid: string; inputIndex: number; height: number })` | An input of an in-flight splice that this node does not vouch for (a depth-locked splice carrying a stranger's coin, issue #760) was spent by another transaction, confirmed six deep while the splice is not on chain: the splice can never confirm. The node records it durably, raises `node:error` code `SPLICE_INPUT_CONFLICT`, and asks the peer to verify and revert; the request is re-sent every block and on reconnect until agreed. |
 | `splice:reverted` | `(data: { channelId: Buffer; spliceTxid: string; conflictTxid: string })` | A conflicted splice was unwound by agreement: both sides verified the conflict on their own chain view and returned to the pre-splice funding, which both still hold valid commitments for. The channel is NORMAL on the old outpoint, its watch re-armed; a `spliceInAndWait` on that splice rejects, and a direct-funding request behind it is failed (`direct-funding:offer:failed`, "the payer spent the offered coin elsewhere"), or, when its receipt already went out, its received record is marked REVERTED. |
