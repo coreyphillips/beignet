@@ -4276,15 +4276,15 @@ describe('Splice', function () {
 
 				it('refuses a splice-in from an unverifiable prevout type at negotiation time', function () {
 					const pair = makeWirePair();
-					const p2wshScript = Buffer.concat([
-						Buffer.from([0x00, 0x20]),
+					const witnessV2Script = Buffer.concat([
+						Buffer.from([0x52, 0x20]),
 						crypto.randomBytes(32)
 					]);
 					const value = 400_000n;
 					const prevTx = new bitcoin.Transaction();
 					prevTx.version = 2;
 					prevTx.addInput(crypto.randomBytes(32), 0);
-					prevTx.addOutput(p2wshScript, Number(value));
+					prevTx.addOutput(witnessV2Script, Number(value));
 					startSpliceIn(pair, 300_000n, {
 						walletInput: {
 							prevTx: prevTx.toBuffer(),
@@ -4301,7 +4301,7 @@ describe('Splice', function () {
 						])
 					});
 
-					// The ACCEPTOR refuses the opener's P2WSH input at its
+					// The ACCEPTOR refuses the opener's witness-v2 input at its
 					// negotiated-tx audit, before its commitment signs anything,
 					// and fails the NEGOTIATION with tx_abort: both sides unwind
 					// to NORMAL and the channel keeps operating.
@@ -4808,15 +4808,15 @@ describe('Splice', function () {
 					// Withhold the opener's real stray commitment so the orderings
 					// can be hand-driven below.
 					pair.drop(MessageType.COMMITMENT_SIGNED, 1);
-					const p2wshScript = Buffer.concat([
-						Buffer.from([0x00, 0x20]),
+					const witnessV2Script = Buffer.concat([
+						Buffer.from([0x52, 0x20]),
 						crypto.randomBytes(32)
 					]);
 					const value = 400_000n;
 					const prevTx = new bitcoin.Transaction();
 					prevTx.version = 2;
 					prevTx.addInput(crypto.randomBytes(32), 0);
-					prevTx.addOutput(p2wshScript, Number(value));
+					prevTx.addOutput(witnessV2Script, Number(value));
 					startSpliceIn(pair, 300_000n, {
 						walletInput: {
 							prevTx: prevTx.toBuffer(),
@@ -4873,15 +4873,15 @@ describe('Splice', function () {
 				it('a commitment tagged with the CURRENT funding txid is processed while the window is armed', function () {
 					const pair = makeWirePair();
 					pair.drop(MessageType.COMMITMENT_SIGNED, 1);
-					const p2wshScript = Buffer.concat([
-						Buffer.from([0x00, 0x20]),
+					const witnessV2Script = Buffer.concat([
+						Buffer.from([0x52, 0x20]),
 						crypto.randomBytes(32)
 					]);
 					const value = 400_000n;
 					const prevTx = new bitcoin.Transaction();
 					prevTx.version = 2;
 					prevTx.addInput(crypto.randomBytes(32), 0);
-					prevTx.addOutput(p2wshScript, Number(value));
+					prevTx.addOutput(witnessV2Script, Number(value));
 					startSpliceIn(pair, 300_000n, {
 						walletInput: {
 							prevTx: prevTx.toBuffer(),
@@ -6977,21 +6977,21 @@ describe('Splice', function () {
 				createNormalChannelPair();
 
 			openerManager.initiateQuiescence(channelId);
-			// Unverifiable P2WSH prevout: the acceptor's negotiated-tx audit
+			// Unverifiable witness-v2 prevout: the acceptor's negotiated-tx audit
 			// refuses with tx_abort. connectManagers routes SYNCHRONOUSLY, so
 			// the abort echo returns BEFORE the opener's outer action loop has
 			// sent its already-built mid-splice commitment_signed; the stray
 			// arrives after the echo and must be classified, not trusted to
 			// arrive first.
-			const p2wshScript = Buffer.concat([
-				Buffer.from([0x00, 0x20]),
+			const witnessV2Script = Buffer.concat([
+				Buffer.from([0x52, 0x20]),
 				crypto.randomBytes(32)
 			]);
 			const value = 400_000n;
 			const prevTx = new bitcoin.Transaction();
 			prevTx.version = 2;
 			prevTx.addInput(crypto.randomBytes(32), 0);
-			prevTx.addOutput(p2wshScript, Number(value));
+			prevTx.addOutput(witnessV2Script, Number(value));
 			openerChannel.setSpliceInInputs(
 				[
 					{

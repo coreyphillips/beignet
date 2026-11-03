@@ -66,14 +66,19 @@ SPLICE_TX_BASE_WEIGHT
 ```
 
 `estimateSpliceTxWeight` counts exactly one shared input and one funding
-output and gains a `fundingCount` parameter (default 1) so the wallet's
-quote, the engine's preflight and each channel's contribution arithmetic keep
-using the same function, as its header demands.
+output. Step 5b gave it `fundingInputCount` (default 0): further 2-of-2
+inputs, each `SHARED_FUNDING_INPUT_WEIGHT`, which a single channel's
+splice-in already uses for a P2WSH wallet input (`spliceWalletInputCounts` in
+`channel.ts`). Step 5c adds the extra funding outputs so the wallet's quote,
+the engine's preflight and each channel's contribution arithmetic keep using
+the same function, as its header demands.
 
-The acceptor's audit floor (`auditMinInputWeightWu`) prices every input that
-is not P2TR at the P2WPKH weight. Step 5b floors a P2WSH input at
+The acceptor's audit floor (`auditMinInputWeightWu`) priced every input that
+is not P2TR at the P2WPKH weight. Since step 5b it floors a P2WSH input at
 `SHARED_FUNDING_INPUT_WEIGHT`, the 2-of-2 spend being the only P2WSH form an
-acceptor admits, so its fee check does not run lenient on a composite.
+acceptor admits, so its fee check does not run lenient on a composite; the
+initiator prices such an input with the same constant, so an exact-feerate
+composite always passes.
 
 The fee is apportioned to channels in proportion to their debit, rounded up
 per channel so the sum never falls short:
@@ -161,11 +166,12 @@ ordinary input today:
    key. A 2-of-2 funding input needs the other channel's peer's signature
    too, and that arrives only in that peer's `tx_signatures`, as its
    `shared_input_signature`.
-3. A beignet acceptor refuses any peer input that is not P2WPKH or P2TR
-   (`_v2CheckInputSpendable` during the `tx_complete` audit), and the
-   deferred-witness path refuses P2WSH as well
-   (`_validateWitnessForInput`). Both fail closed because a general P2WSH
-   witness cannot be verified without running the script.
+3. Before step 5b a beignet acceptor refused any peer input that is not
+   P2WPKH or P2TR (`_v2CheckInputSpendable` during the `tx_complete` audit),
+   and the deferred-witness path refused P2WSH as well
+   (`_validateWitnessForInput`). Both failed closed because a general P2WSH
+   witness cannot be verified without running the script. Step 5b admits
+   the one verifiable form, as point 3 of the design says.
 
 ### Design
 
@@ -431,10 +437,16 @@ same reservation is a separate change.
   `src/lightning/features/flags.ts`), set optional. A beignet primary without
   the bit is not selected.
 - CLN is the one third-party implementation that splices with beignet
-  (`docker/docker-compose.yml`, `cln-splice-matrix.test.ts`). Whether CLN
-  accepts a P2WSH initiator input it cannot verify is not known from this
-  repository and is settled by a new matrix tier before CLN peers are
-  selectable; until then only beignet peers are.
+  (`docker/docker-compose.yml`, `cln-splice-matrix.test.ts`). Tier C3 of
+  that matrix, added in step 5b, has beignet splice in with a confirmed bare
+  2-of-2 P2WSH third-party input against CLN v26.06.1: CLN admits the input
+  at `tx_complete`, signs first, and adopts the spliced channel once the
+  delivered 2-of-2 witness completes the transaction (regtest, 2026-11-03,
+  capacity 500000 to 580000 sats). CLN does not advertise bits 454/455, so
+  step 5c settles how a CLN peer is told apart (its own
+  `shutdown_wrong_funding` pair 104/105 is one signal) before it is
+  selectable; a peer that is neither a beignet with the bit nor a recognised
+  CLN is not selected.
 - eclair does not splice in our stack and LND does not splice at all; their
   channels are never selected and the refusal says so.
 
@@ -457,7 +469,8 @@ alternatives are kept for the record.
 6. The capability is a feature bit rather than a custom-message probe
    (section 8). Confirmed; bits 454/455.
 7. CLN peers are excluded until the matrix tier exists (section 8).
-   Confirmed; the tier lands with step 5b.
+   Confirmed; the tier (C3) landed with step 5b and CLN v26.06.1 completes
+   the splice, so step 5c may select CLN peers once it can tell one apart.
 
 ## 10. Implementation plan for step 5
 

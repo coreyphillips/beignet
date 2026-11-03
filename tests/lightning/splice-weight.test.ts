@@ -55,6 +55,33 @@ describe('Splice weight estimation', function () {
 		expect(three - one).to.equal(2 * P2WPKH_INPUT_WEIGHT);
 	});
 
+	it('prices extra 2-of-2 funding inputs at the shared input weight (issue #1922)', function () {
+		const base = estimateSpliceTxWeight({
+			walletInputCount: 1,
+			changeScriptLen: 22
+		});
+		const withOne = estimateSpliceTxWeight({
+			walletInputCount: 1,
+			fundingInputCount: 1,
+			changeScriptLen: 22
+		});
+		const withTwo = estimateSpliceTxWeight({
+			walletInputCount: 1,
+			fundingInputCount: 2,
+			changeScriptLen: 22
+		});
+		expect(withOne - base).to.equal(SHARED_FUNDING_INPUT_WEIGHT);
+		expect(withTwo - withOne).to.equal(SHARED_FUNDING_INPUT_WEIGHT);
+		// Absent means none, so every existing caller is priced as before.
+		expect(
+			estimateSpliceTxWeight({
+				walletInputCount: 1,
+				fundingInputCount: 0,
+				changeScriptLen: 22
+			})
+		).to.equal(base);
+	});
+
 	it('computes fees with ceiling rounding', function () {
 		expect(spliceFeeSats(724, 253)).to.equal(184n); // ceil(183.172)
 		expect(spliceFeeSats(996, 253)).to.equal(252n); // ceil(251.988)

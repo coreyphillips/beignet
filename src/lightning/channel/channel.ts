@@ -570,8 +570,12 @@ function interactiveInputValueSats(input: IInteractiveTxInput): bigint | null {
  * 108 our own funding-side estimate reserves, and a P2TR key-spend witness
  * is 66 WU (64 byte Schnorr sig, default sighash). Charging the funding
  * estimate here refused every solo-funded eclair v2 open paying the exact
- * negotiated feerate (issue #359). Unknown or unparseable prevouts fall
- * back to the P2WPKH floor.
+ * negotiated feerate (issue #359). A P2WSH prevout is priced as the shared
+ * funding input is: the bare 2-of-2 spend is the only P2WSH form a splice
+ * acceptor admits (issue #1922), and its initiator sizes the fee with the
+ * same SHARED_FUNDING_INPUT_WEIGHT, so an audit at the P2WPKH floor would
+ * run lenient on it. Unknown or unparseable prevouts fall back to the P2WPKH
+ * floor.
  */
 function auditMinInputWeightWu(input: IInteractiveTxInput): number {
 	// outpoint(36) + scriptSig len(1) + sequence(4) = 41 bytes x4
@@ -589,12 +593,56 @@ function auditMinInputWeightWu(input: IInteractiveTxInput): number {
 				// P2TR key-spend: count(1) + Schnorr sig(1+64)
 				return base + 66;
 			}
+			if (
+				out &&
+				out.script.length === 34 &&
+				out.script[0] === 0x00 &&
+				out.script[1] === 0x20
+			) {
+				return SHARED_FUNDING_INPUT_WEIGHT;
+			}
 		}
 	} catch {
 		/* fall through to the P2WPKH floor */
 	}
 	// P2WPKH: count(1) + low-R DER sig(1+71) + pubkey(1+33)
 	return base + 107;
+}
+
+/**
+ * How a splice-in's wallet inputs are priced for estimateSpliceTxWeight. A
+ * wallet input spending a P2WSH output is another channel's 2-of-2 funding
+ * outpoint, the one P2WSH form a peer admits (issue #1922), and weighs what
+ * the shared funding input weighs; every other input is priced as P2WPKH, as
+ * before. An unreadable prevout is priced as P2WPKH and left for the
+ * negotiation to refuse.
+ */
+function spliceWalletInputCounts(inputs: readonly ISpliceWalletInput[]): {
+	walletInputCount: number;
+	fundingInputCount: number;
+} {
+	let fundingInputCount = 0;
+	for (const input of inputs) {
+		try {
+			const out = bitcoin.Transaction.fromBuffer(input.prevTx).outs[
+				input.prevOutputIndex
+			];
+			if (
+				out &&
+				out.script.length === 34 &&
+				out.script[0] === 0x00 &&
+				out.script[1] === 0x20
+			) {
+				fundingInputCount++;
+			}
+		} catch {
+			/* priced as P2WPKH */
+		}
+	}
+	return {
+		walletInputCount: inputs.length - fundingInputCount,
+		fundingInputCount
+	};
 }
 
 /** A force close this channel cannot perform, and why. */
@@ -12799,7 +12847,7 @@ export class Channel {
 				}
 				const feeSats = spliceFeeSats(
 					estimateSpliceTxWeight({
-						walletInputCount: this._spliceInInputs.inputs.length,
+						...spliceWalletInputCounts(this._spliceInInputs.inputs),
 						fundingScriptLen: createFundingScript(
 							this._state.localBasepoints.fundingPubkey,
 							remoteFundingPubkey
@@ -13518,7 +13566,9 @@ export class Channel {
 			remoteFundingPubkey
 		);
 		const txWeight = estimateSpliceTxWeight({
-			walletInputCount: this._spliceInInputs?.inputs.length ?? 0,
+			...(this._spliceInInputs
+				? spliceWalletInputCounts(this._spliceInInputs.inputs)
+				: { walletInputCount: 0 }),
 			fundingScriptLen: newFunding.p2wshOutput.length,
 			changeScriptLen: this._spliceInInputs?.changeScript.length,
 			destinationScriptLen: this._spliceInInputs
@@ -18189,14 +18239,15 @@ export class Channel {
 				ourExternalSpliceInput
 			) {
 				// Witnesses can only be VERIFIED for P2WPKH and P2TR key-spend
-				// prevouts; every other type would have to be accepted on
-				// shape alone. Refuse the negotiation HERE, before the
-				// commitment round signs anything for this transaction, rather
-				// than at tx_signatures when signatures may already be out.
-				// Splice checks REMOTE inputs and our own external ones: our
-				// closure-signed splice-in inputs (any script type) never pass
-				// through our witness validator.
-				const unsupported = this._v2CheckInputSpendable(input);
+				// prevouts, plus, in a splice, the bare 2-of-2 P2WSH form of a
+				// channel funding output (issue #1922); every other type would
+				// have to be accepted on shape alone. Refuse the negotiation
+				// HERE, before the commitment round signs anything for this
+				// transaction, rather than at tx_signatures when signatures may
+				// already be out. Splice checks REMOTE inputs and our own
+				// external ones: our closure-signed splice-in inputs (any
+				// script type) never pass through our witness validator.
+				const unsupported = this._v2CheckInputSpendable(input, kind);
 				if (unsupported) return unsupported;
 			}
 			weight += isShared
@@ -19093,7 +19144,18 @@ export class Channel {
 	 * cryptographically verified, and an unverifiable input must never make
 	 * it into the negotiated tx.
 	 */
-	private _v2CheckInputSpendable(input: IInteractiveTxInput): string | null {
+	/**
+	 * Whether a negotiated input's prevout is one whose witness this side can
+	 * verify at tx_signatures. A P2WSH program says nothing about the script
+	 * behind it, so it is admitted only in a splice session, where the one
+	 * form _validateWitnessForInput accepts (the bare 2-of-2 of a channel
+	 * funding output, issue #1922) has a reason to appear; a v2 open keeps
+	 * refusing it, and so does every other output type.
+	 */
+	private _v2CheckInputSpendable(
+		input: IInteractiveTxInput,
+		kind: 'v2' | 'splice'
+	): string | null {
 		if (!input.prevTx || input.prevTx.length < 32) {
 			return 'funding input carries no previous transaction';
 		}
@@ -19108,12 +19170,15 @@ export class Channel {
 		}
 		const isP2wpkh =
 			script.length === 22 && script[0] === 0x00 && script[1] === 0x14;
+		const isP2wsh =
+			script.length === 34 && script[0] === 0x00 && script[1] === 0x20;
 		const isP2tr =
 			script.length === 34 && script[0] === 0x51 && script[1] === 0x20;
-		if (!isP2wpkh && !isP2tr) {
-			return 'funding input pays an unsupported output type (only P2WPKH and P2TR witnesses can be verified)';
-		}
-		return null;
+		if (isP2wpkh || isP2tr) return null;
+		if (isP2wsh && kind === 'splice') return null;
+		return kind === 'splice'
+			? 'funding input pays an unsupported output type (only P2WPKH, P2TR and 2-of-2 P2WSH witnesses can be verified)'
+			: 'funding input pays an unsupported output type (only P2WPKH and P2TR witnesses can be verified)';
 	}
 
 	private _validateWitnessForInput(
@@ -19221,13 +19286,78 @@ export class Channel {
 			return 'P2TR script-path spends are not supported for funding inputs';
 		}
 		if (isP2wsh) {
-			// A P2WSH witness cannot be verified without executing the script
-			// (a hash-matched OP_FALSE spend would pass any structural check):
-			// fail closed. The negotiation-time check refuses P2WSH funding
-			// inputs before anything signs, so this is defense in depth.
-			return 'P2WSH peer funding inputs are not supported (the witness cannot be verified)';
+			// A general P2WSH witness cannot be verified without executing the
+			// script (a hash-matched OP_FALSE spend would pass any structural
+			// check), so exactly one form is admitted (issue #1922): the bare
+			// 2-of-2 of a channel funding output, OP_2 <key> <key> OP_2
+			// OP_CHECKMULTISIG, spent as [<>, sig, sig, script], whose
+			// semantics are fully known: both signatures must verify under
+			// BIP 143 against the key in the same position. Everything else
+			// stays refused here, which is where a splice session defers the
+			// judgment to (_v2CheckInputSpendable admits the program at
+			// tx_complete, where only the 32-byte hash is visible).
+			return this._validateBare2of2Witness(tx, index, stack, script, value);
 		}
 		return 'peer funding input is not a supported segwit output';
+	}
+
+	/**
+	 * The one P2WSH witness form a funding input may carry (issue #1922): a
+	 * bare 2-of-2 multisig in the canonical BOLT 3 funding form, with both
+	 * signatures present, SIGHASH_ALL, low-S, each verifying against the key
+	 * at its position. Returns the problem, or null when acceptable.
+	 */
+	private _validateBare2of2Witness(
+		tx: import('bitcoinjs-lib').Transaction,
+		index: number,
+		stack: Buffer[],
+		prevoutScript: Buffer,
+		value: bigint
+	): string | null {
+		if (stack.length !== 4 || stack[0].length !== 0) {
+			return 'P2WSH witness must be [<>, signature, signature, script] (bare 2-of-2)';
+		}
+		const script = stack[3];
+		if (!sha256(script).equals(prevoutScript.subarray(2))) {
+			return 'P2WSH witness script does not match the prevout program';
+		}
+		const chunks = bitcoin.script.decompile(script);
+		const isKey = (c: unknown): c is Buffer =>
+			Buffer.isBuffer(c) && c.length === 33 && (c[0] === 0x02 || c[0] === 0x03);
+		if (
+			!chunks ||
+			chunks.length !== 5 ||
+			chunks[0] !== bitcoin.opcodes.OP_2 ||
+			!isKey(chunks[1]) ||
+			!isKey(chunks[2]) ||
+			chunks[3] !== bitcoin.opcodes.OP_2 ||
+			chunks[4] !== bitcoin.opcodes.OP_CHECKMULTISIG ||
+			!bitcoin.script.compile(chunks).equals(script)
+		) {
+			return 'P2WSH witness script is not a bare 2-of-2 (OP_2 <key> <key> OP_2 OP_CHECKMULTISIG)';
+		}
+		const keys = [chunks[1], chunks[2]];
+		const sighash = tx.hashForWitnessV0(
+			index,
+			script,
+			Number(value),
+			bitcoin.Transaction.SIGHASH_ALL
+		);
+		for (let k = 0; k < 2; k++) {
+			const decoded = this._decodeDerSighashAll(stack[1 + k]);
+			if (typeof decoded === 'string') return `2-of-2 ${decoded}`;
+			let valid = false;
+			try {
+				// strict: high-S signatures are refused (BIP 62 standardness).
+				valid = ecc.verify(sighash, keys[k], decoded, true);
+			} catch {
+				valid = false;
+			}
+			if (!valid) {
+				return `2-of-2 signature ${k + 1} does not verify against its key`;
+			}
+		}
+		return null;
 	}
 
 	/**

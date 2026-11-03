@@ -156,10 +156,12 @@ describe('Feature bit collisions with other implementations (issue #1886)', () =
 		}
 	});
 
-	it('the beignet block is 440-445', () => {
+	it('the beignet block is 440-445 plus the 454/455 pair', () => {
 		expect(Feature.OPTION_FF_RECEIVE).to.equal(440);
 		expect(Feature.OPTION_FF_CONCURRENT).to.equal(442);
 		expect(Feature.ASYNC_RECEIVE_SERVICE).to.equal(444);
+		// 446-453 are left for the taproot asset channel work.
+		expect(Feature.OPTION_COMPOSITE_SPLICE_INPUTS).to.equal(454);
 	});
 
 	it('a node with every beignet feature on puts no foreign bit in init or node_announcement', () => {
@@ -168,6 +170,12 @@ describe('Feature bit collisions with other implementations (issue #1886)', () =
 		expect(local.hasFeature(Feature.OPTION_FF_RECEIVE)).to.equal(true);
 		expect(local.hasFeature(Feature.OPTION_FF_CONCURRENT)).to.equal(true);
 		expect(local.hasFeature(Feature.ASYNC_RECEIVE_SERVICE)).to.equal(true);
+		expect(local.hasFeature(Feature.OPTION_COMPOSITE_SPLICE_INPUTS)).to.equal(
+			true
+		);
+		expect(local.hasBit(455), 'the odd composite bit is advertised').to.equal(
+			true
+		);
 		expect(collisions(local.listSetBits()), 'init').to.deep.equal([]);
 		for (let bit = 560; bit <= 565; bit++) {
 			expect(local.hasBit(bit), `bit ${bit}`).to.equal(false);
