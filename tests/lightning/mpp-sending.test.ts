@@ -16,9 +16,11 @@ import {
 } from '../../src/lightning/node/types';
 import { createFailureMessage } from '../../src/lightning/onion/failures';
 import {
+	MPP_TIMEOUT,
 	TEMPORARY_NODE_FAILURE,
 	TEMPORARY_CHANNEL_FAILURE
 } from '../../src/lightning/onion/types';
+import { MessageType } from '../../src/lightning/message/types';
 import { PaymentDirection } from '../../src/lightning/node/types';
 import { IRoute } from '../../src/lightning/gossip/types';
 import { Network } from '../../src/lightning/invoice/types';
@@ -133,6 +135,41 @@ function openReadyChannel(
 	alice.handleFundingConfirmed(channelId);
 	bob.handleFundingConfirmed(channelId);
 	return channelId;
+}
+
+/**
+ * Bob's own invoice (he holds its preimage and secret), re-signed without
+ * routing hints. A hint for a direct peer names alice herself as the
+ * forwarding node, and the single-path router may take that edge for the
+ * whole amount; without hints an amount above every local channel goes
+ * straight to the MPP planner, and firstHopChannelFor is called only from
+ * sendPaymentMpp.
+ */
+function hintlessMppInvoice(
+	bob: LightningNode,
+	bobSeedId: number,
+	amountMsat: bigint,
+	description: string
+): { bolt11: string; paymentHash: Buffer } {
+	const template = decodeInvoice(
+		bob.createInvoice({ amountMsat, description }).bolt11
+	);
+	const feats = FeatureFlags.empty();
+	feats.setCompulsory(Feature.TLV_ONION);
+	feats.setCompulsory(Feature.PAYMENT_SECRET);
+	feats.setCompulsory(Feature.BASIC_MPP);
+	const key = makeNodeConfig(bobSeedId).nodePrivateKey;
+	const bolt11 = encodeInvoice({
+		network: Network.REGTEST,
+		paymentHash: template.paymentHash,
+		paymentSecret: template.paymentSecret,
+		description,
+		amountMsat,
+		payeeNodeKey: getPublicKey(key),
+		privateKey: key,
+		featureBits: feats
+	});
+	return { bolt11, paymentHash: template.paymentHash };
 }
 
 // ─────────────── Gossip Helpers ───────────────
@@ -773,6 +810,254 @@ describe('MPP Sending (Phase 5)', function () {
 			// Every part resolved and dispatch finished: state is dropped.
 			// eslint-disable-next-line @typescript-eslint/no-explicit-any
 			expect((alice as any).outboundMppPayments.size).to.equal(0);
+
+			alice.destroy();
+			bob.destroy();
+		});
+
+		it('a part whose first-hop channel is gone at dispatch fails the payment locally, not at the payee timeout (#1941)', async function () {
+			const htlcSecretFor = (seedId: number): Buffer =>
+				crypto
+					.createHash('sha256')
+					.update(makeSeed(seedId))
+					.update(Buffer.from([4]))
+					.digest();
+			const alice = new LightningNode({
+				...makeNodeConfig(84),
+				htlcBasepointSecret: htlcSecretFor(84)
+			});
+			const bob = new LightningNode({
+				...makeNodeConfig(85),
+				htlcBasepointSecret: htlcSecretFor(85)
+			});
+			connectNodes(alice, bob);
+			openReadyChannel(alice, bob, 200_000n);
+			openReadyChannel(alice, bob, 200_000n);
+
+			let adds = 0;
+			alice.on('message:outbound', (_pk: string, type: number) => {
+				if (type === MessageType.UPDATE_ADD_HTLC) adds++;
+			});
+			let failedEvents = 0;
+			alice.on('payment:failed', () => failedEvents++);
+
+			// The second part's channel is gone by the time dispatch reaches it
+			// (a close or void landed after planning): resolution answers for
+			// the first part and for no other.
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			const aliceAny = alice as any;
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			const bobAny = bob as any;
+			const resolve = aliceAny.firstHopChannelFor.bind(alice);
+			let resolutions = 0;
+			let goneScid = '';
+			aliceAny.firstHopChannelFor = (route: IRoute): unknown => {
+				if (++resolutions === 1) return resolve(route);
+				goneScid = route.hops[0].shortChannelId.toString('hex');
+				return undefined;
+			};
+
+			const { bolt11, paymentHash } = hintlessMppInvoice(
+				bob,
+				85,
+				250_000_000n,
+				'first hop gone'
+			);
+			const payment = alice.sendPayment(bolt11);
+			const hashHex = paymentHash.toString('hex');
+
+			expect(resolutions, 'two parts were planned').to.equal(2);
+			expect(adds, 'only the first part left').to.equal(1);
+			expect(payment.status).to.equal(PaymentStatus.FAILED);
+			expect(payment.failureReason).to.match(/first-hop channel is gone/);
+			expect(payment.failureReason, 'names the part SCID').to.include(goneScid);
+			expect(payment.failureCode, 'a local failure').to.equal(undefined);
+			expect(payment.completedAt).to.be.a('number');
+			expect(failedEvents, 'payment:failed emitted once').to.equal(1);
+			// The dispatched part's secrets stay until bob fails it back.
+			expect(aliceAny.outboundMppPayments.get(hashHex).parts.length).to.equal(
+				1
+			);
+			// Bob holds the lone part: an incomplete set is never credited.
+			expect(bob.getPayment(paymentHash)!.status).to.equal(
+				PaymentStatus.PENDING
+			);
+
+			// Bob releases the part with a temporary code, as his MPP timeout
+			// would with MPP_TIMEOUT. Its failure lands on a record already
+			// failed: the mapping is released, the code recorded, the retry
+			// context given up, and nothing is re-failed or redispatched. The
+			// resolver answers again first, so a redispatch would really leave
+			// and pay bob after alice reported FAILED.
+			aliceAny.firstHopChannelFor = resolve;
+			const held = bobAny.pendingMppPayments.get(hashHex);
+			for (const part of held.receivedParts) {
+				part.status = PaymentStatus.FAILED;
+				bobAny.failRejectedMppPart(
+					part.channelId,
+					part.htlcId,
+					TEMPORARY_NODE_FAILURE
+				);
+			}
+			bobAny.pendingMppPayments.delete(hashHex);
+			await new Promise((r) => setTimeout(r, 50));
+
+			const after = alice.getPayment(paymentHash)!;
+			expect(after.status).to.equal(PaymentStatus.FAILED);
+			expect(after.failureReason).to.match(/first-hop channel is gone/);
+			expect(after.failureCode).to.equal(TEMPORARY_NODE_FAILURE);
+			expect(failedEvents, 'no second payment:failed').to.equal(1);
+			expect(adds, 'no redispatch').to.equal(1);
+			expect(aliceAny.htlcPaymentMap.size).to.equal(0);
+			expect(aliceAny.paymentRetryContexts.has(hashHex)).to.equal(false);
+			expect(
+				aliceAny.outboundMppPayments.size,
+				'MPP state dropped with the last part'
+			).to.equal(0);
+			expect(bob.getPayment(paymentHash)!.status).to.not.equal(
+				PaymentStatus.COMPLETED
+			);
+
+			alice.destroy();
+			bob.destroy();
+		});
+
+		it('a payment none of whose parts can resolve a first hop fails at once instead of staying PENDING (#1941)', function () {
+			const htlcSecretFor = (seedId: number): Buffer =>
+				crypto
+					.createHash('sha256')
+					.update(makeSeed(seedId))
+					.update(Buffer.from([4]))
+					.digest();
+			const alice = new LightningNode({
+				...makeNodeConfig(86),
+				htlcBasepointSecret: htlcSecretFor(86)
+			});
+			const bob = new LightningNode({
+				...makeNodeConfig(87),
+				htlcBasepointSecret: htlcSecretFor(87)
+			});
+			connectNodes(alice, bob);
+			openReadyChannel(alice, bob, 200_000n);
+			openReadyChannel(alice, bob, 200_000n);
+
+			let adds = 0;
+			alice.on('message:outbound', (_pk: string, type: number) => {
+				if (type === MessageType.UPDATE_ADD_HTLC) adds++;
+			});
+			let failedEvents = 0;
+			alice.on('payment:failed', () => failedEvents++);
+
+			// Every channel to bob stopped taking HTLCs after planning.
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			const aliceAny = alice as any;
+			let resolutions = 0;
+			aliceAny.firstHopChannelFor = (): undefined => {
+				resolutions++;
+				return undefined;
+			};
+
+			const { bolt11, paymentHash } = hintlessMppInvoice(
+				bob,
+				87,
+				250_000_000n,
+				'every first hop gone'
+			);
+			const payment = alice.sendPayment(bolt11);
+
+			expect(resolutions, 'the first part was tried').to.equal(1);
+			expect(adds, 'nothing left').to.equal(0);
+			expect(payment.status).to.equal(PaymentStatus.FAILED);
+			expect(payment.failureReason).to.match(/first-hop channel is gone/);
+			expect(payment.completedAt).to.be.a('number');
+			expect(failedEvents, 'payment:failed emitted once').to.equal(1);
+			expect(alice.getPayment(paymentHash)!.status).to.equal(
+				PaymentStatus.FAILED
+			);
+			// No HTLC or MPP state is left waiting on a record nothing could
+			// ever resolve.
+			expect(aliceAny.outboundMppPayments.size).to.equal(0);
+			expect(aliceAny.htlcPaymentMap.size).to.equal(0);
+			expect(bob.getPayment(paymentHash)!.status).to.equal(
+				PaymentStatus.PENDING
+			);
+
+			alice.destroy();
+			bob.destroy();
+		});
+
+		it('siblings failing back after a local failure keep its reason and decrypt with their own secrets (#1941)', async function () {
+			const htlcSecretFor = (seedId: number): Buffer =>
+				crypto
+					.createHash('sha256')
+					.update(makeSeed(seedId))
+					.update(Buffer.from([4]))
+					.digest();
+			const alice = new LightningNode({
+				...makeNodeConfig(88),
+				htlcBasepointSecret: htlcSecretFor(88)
+			});
+			const bob = new LightningNode({
+				...makeNodeConfig(89),
+				htlcBasepointSecret: htlcSecretFor(89),
+				mppTimeoutMs: 1
+			});
+			connectNodes(alice, bob);
+			openReadyChannel(alice, bob, 200_000n);
+			openReadyChannel(alice, bob, 200_000n);
+			openReadyChannel(alice, bob, 200_000n);
+
+			let adds = 0;
+			alice.on('message:outbound', (_pk: string, type: number) => {
+				if (type === MessageType.UPDATE_ADD_HTLC) adds++;
+			});
+			let failedEvents = 0;
+			alice.on('payment:failed', () => failedEvents++);
+
+			// Two parts leave, each its own onion; the third finds no channel.
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			const aliceAny = alice as any;
+			const resolve = aliceAny.firstHopChannelFor.bind(alice);
+			let resolutions = 0;
+			aliceAny.firstHopChannelFor = (route: IRoute): unknown =>
+				++resolutions < 3 ? resolve(route) : undefined;
+
+			const { bolt11, paymentHash } = hintlessMppInvoice(
+				bob,
+				89,
+				450_000_000n,
+				'third hop gone'
+			);
+			const payment = alice.sendPayment(bolt11);
+			const hashHex = paymentHash.toString('hex');
+
+			expect(resolutions, 'three parts were planned').to.equal(3);
+			expect(adds, 'two parts left').to.equal(2);
+			expect(payment.status).to.equal(PaymentStatus.FAILED);
+			expect(payment.failureReason).to.match(/first-hop channel is gone/);
+			expect(failedEvents, 'payment:failed emitted once').to.equal(1);
+			expect(aliceAny.outboundMppPayments.get(hashHex).parts.length).to.equal(
+				2
+			);
+
+			// Bob's MPP timeout fails both held parts back. The second part's
+			// failure decrypts only with its own secrets: read with the first
+			// part's, it would land as an HMAC mismatch over the local reason.
+			await new Promise((r) => setTimeout(r, 5));
+			bob.failTimedOutMppPayments();
+			await new Promise((r) => setTimeout(r, 50));
+
+			const after = alice.getPayment(paymentHash)!;
+			expect(after.status).to.equal(PaymentStatus.FAILED);
+			expect(after.failureReason, 'the local reason survives').to.match(
+				/first-hop channel is gone/
+			);
+			expect(after.failureCode).to.equal(MPP_TIMEOUT);
+			expect(failedEvents, 'no second payment:failed').to.equal(1);
+			expect(adds, 'no redispatch').to.equal(2);
+			expect(aliceAny.outboundMppPayments.size).to.equal(0);
+			expect(aliceAny.htlcPaymentMap.size).to.equal(0);
+			expect(aliceAny.paymentRetryContexts.has(hashHex)).to.equal(false);
 
 			alice.destroy();
 			bob.destroy();

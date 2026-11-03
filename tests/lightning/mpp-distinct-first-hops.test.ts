@@ -25,6 +25,7 @@ import {
 	createNode,
 	destroyAll,
 	nodePrivkey,
+	settle,
 	waitFor,
 	wire
 } from './helpers/async-world';
@@ -262,6 +263,100 @@ describe('MPP across distinct first-hop peers (issue #1922)', function () {
 
 		expect(world.wAdds, 'one part per primary').to.equal(2);
 		expect(world.primaries.map((p) => p.forwards)).to.deep.equal([1, 1]);
+		destroyAll(...world.nodes);
+	});
+
+	it('a primary channel voided between planning and dispatch fails the payment locally (#1941)', async function () {
+		this.timeout(30_000);
+		const world = await buildWorld(7180, [200_000n, 200_000n]);
+		const amountMsat = sum(world.spendable) - FEE_MARGIN_MSAT;
+		const invoice = world.d.createInvoice({
+			amountMsat,
+			description: 'primary gone'
+		});
+
+		// The first part's update_add_htlc is the moment after planning and
+		// before the second part's dispatch: W's channel with the other
+		// primary is voided there, as a close or void landing mid-send would.
+		let voided: Buffer | undefined;
+		world.w.on(
+			'message:outbound',
+			(_pk: string, type: number, payload: Buffer) => {
+				if (type !== MessageType.UPDATE_ADD_HTLC || voided) return;
+				const used = payload.subarray(0, 32);
+				const other = world.primaries.find((p) => !p.wChannelId.equals(used))!;
+				voided = other.wChannelId;
+				world.w.getChannelManager().voidChannel(other.wChannelId);
+			}
+		);
+		let failedEvents = 0;
+		world.w.on('payment:failed', () => failedEvents++);
+
+		const payment = world.w.sendPayment(invoice.bolt11);
+		await settle();
+
+		expect(voided, 'the first part left').to.exist;
+		expect(world.wAdds, 'the second part never left').to.equal(1);
+		expect(payment.status).to.equal(PaymentStatus.FAILED);
+		expect(payment.failureReason).to.match(/first-hop channel is gone/);
+		expect(failedEvents, 'payment:failed emitted once').to.equal(1);
+		// The dispatched part's secrets stay until D fails it back.
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		expect((world.w as any).outboundMppPayments.size).to.equal(1);
+		// D holds the lone part it was forwarded and credits nothing.
+		expect(sum(world.primaries.map((p) => BigInt(p.forwards)))).to.equal(1n);
+		expect(world.d.getPayment(invoice.paymentHash)!.status).to.equal(
+			PaymentStatus.PENDING
+		);
+		destroyAll(...world.nodes);
+	});
+
+	it('a part fulfilled before a later part finds its channel gone leaves the payment COMPLETED (#1941)', async function () {
+		this.timeout(30_000);
+		const world = await buildWorld(7200, [200_000n, 200_000n]);
+		const amountMsat = sum(world.spendable) - FEE_MARGIN_MSAT;
+		const invoice = world.d.createInvoice({
+			amountMsat,
+			description: 'settled mid-dispatch',
+			hold: true
+		});
+
+		// D settles the first part the moment it is held, as a hold-invoice
+		// consumer may. This wire delivers inline, so W holds the preimage
+		// before the second part's dispatch step, which then finds W's channel
+		// with the other primary voided on the first part's update_add_htlc.
+		world.d.on('hold:accepted', () => {
+			world.d.settleHeldHtlc(invoice.paymentHash);
+		});
+		let voided: Buffer | undefined;
+		world.w.on(
+			'message:outbound',
+			(_pk: string, type: number, payload: Buffer) => {
+				if (type !== MessageType.UPDATE_ADD_HTLC || voided) return;
+				const used = payload.subarray(0, 32);
+				const other = world.primaries.find((p) => !p.wChannelId.equals(used))!;
+				voided = other.wChannelId;
+				world.w.getChannelManager().voidChannel(other.wChannelId);
+			}
+		);
+		const events: string[] = [];
+		world.w.on('payment:sent', () => events.push('sent'));
+		world.w.on('payment:failed', () => events.push('failed'));
+
+		const payment = world.w.sendPayment(invoice.bolt11);
+		await settle();
+
+		expect(voided, 'the first part left').to.exist;
+		expect(world.wAdds, 'the second part never left').to.equal(1);
+		expect(events, 'the preimage ended the payment').to.deep.equal(['sent']);
+		expect(payment.status).to.equal(PaymentStatus.COMPLETED);
+		expect(payment.preimage).to.exist;
+		expect(payment.failureReason).to.equal(undefined);
+		expect(world.w.getPayment(invoice.paymentHash)!.status).to.equal(
+			PaymentStatus.COMPLETED
+		);
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		expect((world.w as any).outboundMppPayments.size).to.equal(0);
 		destroyAll(...world.nodes);
 	});
 });
