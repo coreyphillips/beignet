@@ -2456,6 +2456,9 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		peerPubkey: string,
 		cause?: { initiator: 'local' | 'remote'; reason?: string }
 	): void {
+		// Before the channels forget their pre-commitment splices: a composite
+		// splice (issue #1922) ends with the connection and must hear it first.
+		this.emit('peer:disconnected', peerPubkey);
 		const openDiedOnDisconnect = (state: ChannelState): string => {
 			const base = `Peer disconnected during channel open (state: ${state})`;
 			if (!cause) return base;

@@ -279,13 +279,18 @@ spend and the new funding, and sends `splice_locked` at depth
 cannot undo anything: the transaction is valid and broadcast, and the channel
 adopts the new funding at depth as a single-channel splice does.
 
-A composite transaction cannot be in conflict with another spend of its
-inputs (each is a 2-of-2 we co-signed once), so the conflicted-splice revert
-of `docs/SPLICE-LOCK-DEPTH.md` does not apply. What can go wrong after
-broadcast is a fee too low to confirm. Fee bumping a composite is out of scope
-for step 5: the quote refuses a feerate below the backend's estimate for the
-target, and the operator may bump with the single-channel RBF path later if
-one is added.
+A composite transaction can lose an input after release: a peer can force
+close on its old funding (it co-signed that commitment), and once that spend
+confirms the composite can never confirm. The engine does not watch the
+chain for this itself; it ends the record CONFLICTED and lifts the
+reservation when a participating channel force closes, errors, closes or
+reverts its splice (`channel:force-closing`, `channel:errored`,
+`channel:closed`, `splice:reverted`), and the surviving channels' own splice
+records follow the single-channel rules from there. What can also go wrong
+after broadcast is a fee too low to confirm. Fee bumping a composite is out
+of scope for step 5: the quote refuses a feerate below the backend's estimate
+for the target, and the operator may bump with the single-channel RBF path
+later if one is added.
 
 ### Failure table
 
@@ -296,7 +301,8 @@ to both `tx_complete`), C commitment round, S peers' `tx_signatures`, R our
 | Event                                                | P, Q, N, C, S (before R)                                                                          | R, B (after R)                                                                                         | L                                                                                                    |
 | ---------------------------------------------------- | ------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------- |
 | Peer refuses (`tx_abort`, error, wrong `splice_ack`) | abort every session; nothing spent                                                                | ignore for that channel: the tx stands; channel resumes at reestablish with `next_funding_txid`        | none left                                                                                            |
-| Peer disconnects                                     | abort every session (negotiation does not survive a connection, `markForReestablish`)             | channel keeps `spliceInFlight`; resume at reestablish                                                  | wait for `splice_locked`                                                                             |
+| Peer disconnects                                     | abort every session at once (the manager's `peer:disconnected` reaches the engine before the channel forgets its splice; a session dropped behind the engine's back is caught at the commitment check) | channel keeps `spliceInFlight`; resume at reestablish                                                  | wait for `splice_locked`                                                                             |
+| A participating channel closes or reverts its splice (a peer's force close of its old funding, an error) | abort every session                                                                               | the transaction can no longer confirm whole: the record ends CONFLICTED and the reservation lifts; the surviving channels' own records follow the single-channel rules | none                                                                                                 |
 | Peer never signs within the budget                   | abort every session                                                                               | not possible: R needs every S                                                                          | peer's `splice_locked` missing; channel stays pending-lock, HTLCs flow via dual commitments as today |
 | Our crash                                            | record says ABORTED on restore if any session had not reached S; `tx_abort` owed in every session | record says RELEASED or BROADCAST: rebroadcast from `spliceTxHex`, resume each channel from its record | per channel as today                                                                                 |
 | Invalid peer signature                               | abort every session                                                                               | cannot happen: R only after every S verified                                                           | none                                                                                                 |
@@ -364,11 +370,37 @@ composite (`STORAGE_REQUIRED`).
 | RELEASED, BROADCAST     | The transaction may confirm. Rebroadcast `txHex` (fundingCritical), keep every channel's `spliceInFlight`, resume each at reestablish with `next_funding_txid` and `retransmit_flags` as `_handleReestablishSplice` does. Mark the spend charge final. |
 | LOCKED, ABORTED         | Terminal. Kept for the operation's status until the retention window.                                                                                                                                                                                  |
 
-A channel record found with `spliceInFlight` pointing at a composite txid
-whose composite record is missing is treated as RELEASED (the safe side: the
-transaction may exist). A composite record naming a channel that has no
+Two or more channels whose `spliceInFlight` records name the same
+transaction can only be a composite (a single splice is one channel's own).
+When no record describes that txid (a journal rebuilt from a snapshot older
+than the record), restore synthesizes one from the channel rows: RELEASED
+when any session sent its `tx_signatures` (the slots still owed are filled
+and the operation is tracked to LOCKED), ABORTED otherwise (every session is
+forgotten). The debit and fee split cannot be recovered from the rows, so the
+synthesized record carries each channel's whole relative change as its debit
+and says so in its reason. A composite record naming a channel that has no
 `spliceInFlight` and is NORMAL on the pre-splice funding is treated as
 ABORTED for that channel.
+
+ABORTED rides the first session unwind's persist and each later unwind is its
+own commit, so a crash between them leaves a channel holding a splice its
+record says is over; restore finishes the unwind of every such session whose
+`tx_signatures` never left. A restored channel parks its live state in
+`preReestablishState` until the peer is back; forgetting a splice at restore
+resets a SPLICING parked there to the pre-splice state (the operator abort
+path steps around the same trap), so reestablish does not bring the channel
+back as a spliceless SPLICING. The reestablish that follows answers the
+peers' `next_funding_txid` with a `tx_abort` whose acknowledgement latch can
+stay armed until the next reconnect; it holds back a new splice on that
+channel, not payments.
+
+Restore does not rebroadcast a released composite from the record: every
+participating channel holds the fully signed transaction in its own
+in-flight record, and the node's splice rebroadcast path resumes it through
+the durability barrier (`reauthorizeSpliceBroadcast`), as for a single
+splice. Terminal records (LOCKED, ABORTED, CONFLICTED) are kept for seven
+days (`COMPOSITE_SPLICE_RETENTION_MS`) and pruned at boot and when a later
+record ends.
 
 Requirements:
 

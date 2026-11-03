@@ -138,7 +138,8 @@ describe('Composite splice record (issue #1922)', function () {
 			'RELEASED',
 			'BROADCAST',
 			'LOCKED',
-			'ABORTED'
+			'ABORTED',
+			'CONFLICTED'
 		]);
 		expect(compositeSpliceStageAtLeast('RELEASED', 'COMMITTED')).to.equal(true);
 		expect(compositeSpliceStageAtLeast('COMMITTED', 'RELEASED')).to.equal(
@@ -151,9 +152,16 @@ describe('Composite splice record (issue #1922)', function () {
 		expect(compositeSpliceStageAtLeast('ABORTED', 'PLANNED')).to.equal(false);
 		expect(compositeSpliceStageAtLeast('LOCKED', 'ABORTED')).to.equal(false);
 		expect(compositeSpliceStageAtLeast('ABORTED', 'ABORTED')).to.equal(true);
+		expect(compositeSpliceStageAtLeast('CONFLICTED', 'RELEASED')).to.equal(
+			false
+		);
+		expect(compositeSpliceStageAtLeast('LOCKED', 'CONFLICTED')).to.equal(false);
+		expect(compositeSpliceStageAtLeast('CONFLICTED', 'CONFLICTED')).to.equal(
+			true
+		);
 		for (const stage of COMPOSITE_SPLICE_STAGES) {
 			expect(compositeSpliceStageIsTerminal(stage)).to.equal(
-				stage === 'LOCKED' || stage === 'ABORTED'
+				stage === 'LOCKED' || stage === 'ABORTED' || stage === 'CONFLICTED'
 			);
 		}
 	});

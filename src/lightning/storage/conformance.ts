@@ -1014,6 +1014,11 @@ export function storageConformanceChecks(
 		same(s.loadCompositeSplice(first.id), released, 'replaced stage');
 		s.saveCompositeSplice(compositeSplice(140));
 		same(s.loadAllCompositeSplices().length, 2, 'loadAllCompositeSplices');
+		s.deleteCompositeSplice(first.id);
+		ensure(s.loadCompositeSplice(first.id) === null, 'deleted record is gone');
+		same(s.loadAllCompositeSplices().length, 1, 'delete leaves the other row');
+		s.deleteCompositeSplice(hexId(199));
+		same(s.loadAllCompositeSplices().length, 1, 'unknown id delete is a no-op');
 		ensure(
 			throwsError(() =>
 				s.saveCompositeSplice({ ...first, stage: 'NOPE' as 'PLANNED' })

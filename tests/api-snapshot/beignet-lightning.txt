@@ -1402,6 +1402,7 @@ property channel.ChannelManagerEvents.'message:outbound': (peerPubkey: string, t
 property channel.ChannelManagerEvents.'monitor:updated': (channelIdHex: string, monitor: chain.ChainMonitor) => void
 property channel.ChannelManagerEvents.'outbox:sent': (ids: Array<number | null>) => void
 property channel.ChannelManagerEvents.'output:resolved': (txid: string, outputIndex: number, channelId: Buffer | undefined, outputType: chain.OutputType, paymentHash: Buffer | undefined, htlcId: bigint | undefined) => void
+property channel.ChannelManagerEvents.'peer:disconnected': (peerPubkey: string) => void
 property channel.ChannelManagerEvents.'preimage:learned': (paymentHash: Buffer, preimage: Buffer) => void
 property channel.ChannelManagerEvents.'quiescence:ended': (channelIdHex: string) => void
 property channel.ChannelManagerEvents.'quiescence:timeout': (channelIdHex: string, peerPubkey: string) => void
@@ -1455,7 +1456,7 @@ member channel.ChannelState.SENT_FUNDING_SIGNED = "SENT_FUNDING_SIGNED"
 member channel.ChannelState.SENT_OPEN = "SENT_OPEN"
 member channel.ChannelState.SHUTTING_DOWN = "SHUTTING_DOWN"
 member channel.ChannelState.SPLICING = "SPLICING"
-type channel.CompositeSpliceStage = 'PLANNED' | 'NEGOTIATING' | 'COMMITTED' | 'PEERS_SIGNED' | 'RELEASED' | 'BROADCAST' | 'LOCKED' | 'ABORTED'
+type channel.CompositeSpliceStage = 'PLANNED' | 'NEGOTIATING' | 'COMMITTED' | 'PEERS_SIGNED' | 'RELEASED' | 'BROADCAST' | 'LOCKED' | 'ABORTED' | 'CONFLICTED'
 const channel.DEFAULT_CHANNEL_CONFIG: channel.IChannelConfig
 const channel.DEFAULT_MINIMUM_DEPTH = 3
 const channel.DUAL_FUNDING_INPUT_WEIGHT = 320
@@ -5101,6 +5102,7 @@ function message.isRequiredMessageType(type: number): boolean
 function message.messageTypeName(type: number): string
 function message.readBigSizeParts(data: Buffer, offset: number, out: { hi: number; lo: number; }): number
 namespace node
+const node.COMPOSITE_SPLICE_RETENTION_MS: number
 enum node.ChannelFundingUnavailableCode
 member node.ChannelFundingUnavailableCode.CHANNEL_NOT_FOUND = "CHANNEL_NOT_FOUND"
 member node.ChannelFundingUnavailableCode.FEE_ESTIMATE_NOT_READY = "FEE_ESTIMATE_NOT_READY"
@@ -5222,6 +5224,7 @@ property node.ICompositeSpliceChannelRefusal.reason: string
 interface node.ICompositeSpliceEngineDeps
 property node.ICompositeSpliceEngineDeps.channelManager: channel.ChannelManager
 method node.ICompositeSpliceEngineDeps.currentHeight(): number
+method node.ICompositeSpliceEngineDeps.deleteRecord(id: string): void
 method node.ICompositeSpliceEngineDeps.emitError(code: node.NodeErrorCode, message: string, channelId?: Buffer): void
 method node.ICompositeSpliceEngineDeps.emitStage(event: node.ICompositeSpliceStageEvent): void
 method node.ICompositeSpliceEngineDeps.fundingTxHex(channelId: Buffer): Promise<string | null>
@@ -5230,7 +5233,6 @@ method node.ICompositeSpliceEngineDeps.log(event: string, fields: Record<string,
 method node.ICompositeSpliceEngineDeps.now(): number
 method node.ICompositeSpliceEngineDeps.peerSupportsCompositeSpliceInputs(peerPubkey: string): boolean | null
 method node.ICompositeSpliceEngineDeps.peerSupportsSplicing(peerPubkey: string): boolean | null
-method node.ICompositeSpliceEngineDeps.rebroadcast(txHex: string, idHex: string): void
 method node.ICompositeSpliceEngineDeps.recordsSupported(): boolean
 method node.ICompositeSpliceEngineDeps.resolveDestination(script?: Buffer): Buffer
 method node.ICompositeSpliceEngineDeps.withMutations(mutations: recovery.RecoveryMutation[], fn: () => void): void
@@ -7606,6 +7608,7 @@ method storage.IChannelPolicyStorage.deleteChannelPolicy(channelId: string): voi
 method storage.IChannelPolicyStorage.loadAllChannelPolicies(): Array<{ channelId: string; policy: storage.IPersistedChannelPolicy; }>
 method storage.IChannelPolicyStorage.saveChannelPolicy(channelId: string, policy: storage.IPersistedChannelPolicy): void
 interface storage.ICompositeSpliceStorage
+method storage.ICompositeSpliceStorage.deleteCompositeSplice(id: string): void
 method storage.ICompositeSpliceStorage.loadAllCompositeSplices(): channel.ICompositeSpliceRecord[]
 method storage.ICompositeSpliceStorage.loadCompositeSplice(id: string): channel.ICompositeSpliceRecord | null
 method storage.ICompositeSpliceStorage.saveCompositeSplice(record: channel.ICompositeSpliceRecord): void
@@ -8135,6 +8138,7 @@ method storage.MemoryStorage.corruptRowCount(): number
 method storage.MemoryStorage.countOutboxMessages(channelId: string): number
 method storage.MemoryStorage.deleteChannel(id: string): void
 method storage.MemoryStorage.deleteChannelPolicy(channelId: string): void
+method storage.MemoryStorage.deleteCompositeSplice(id: string): void
 method storage.MemoryStorage.deleteForwardedHtlc(outKey: string): void
 method storage.MemoryStorage.deleteGossipChannel(scidHex: string): void
 method storage.MemoryStorage.deleteGossipNode(nodeIdHex: string): void

@@ -539,6 +539,10 @@ export class MemoryStorage implements IStorageBackend {
 			.map(([id, json]) => this.decodeCompositeSplice(id, json));
 	}
 
+	deleteCompositeSplice(id: string): void {
+		this.compositeSplices.delete(id);
+	}
+
 	private decodeCompositeSplice(
 		id: string,
 		json: string

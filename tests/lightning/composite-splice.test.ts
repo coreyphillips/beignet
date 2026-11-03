@@ -28,6 +28,7 @@ import {
 	encodeTxAddOutputMessage
 } from '../../src/lightning/message/interactive-tx';
 import {
+	COMPOSITE_SPLICE_RETENTION_MS,
 	CompositeSpliceRefusalCode,
 	ICompositeSpliceStageEvent
 } from '../../src/lightning/node/composite-splice-engine';
@@ -36,6 +37,7 @@ import {
 	createNode,
 	wire,
 	waitFor,
+	disconnect,
 	reconnectRestarted,
 	ICut,
 	IWireGate
@@ -159,6 +161,90 @@ function lockAll(world: IWorld): void {
 		world.wallet.getChannelManager().sendSpliceLocked(world.channels[i]);
 		world.peers[i].getChannelManager().sendSpliceLocked(world.channels[i]);
 	}
+}
+
+/**
+ * Re-wire peer i by hand so one message type from it can be withheld; the
+ * standard wire for that pair is silenced meanwhile. `release` restores it.
+ */
+function holdFromPeer(
+	w: IWorld,
+	i: number,
+	type: MessageType
+): { held: Buffer[]; release: () => void } {
+	const peer = w.peers[i];
+	w.cuts[i].val = true;
+	const held: Buffer[] = [];
+	const walletToPeer = (pk: string, t: number, payload: Buffer): void => {
+		if (pk === peer.getNodeId()) {
+			peer.handlePeerMessage(w.wallet.getNodeId(), t, payload);
+		}
+	};
+	const peerToWallet = (pk: string, t: number, payload: Buffer): void => {
+		if (pk !== w.wallet.getNodeId()) return;
+		if (t === type) {
+			held.push(payload);
+			return;
+		}
+		w.wallet.handlePeerMessage(peer.getNodeId(), t, payload);
+	};
+	w.wallet.on('message:outbound', walletToPeer);
+	peer.on('message:outbound', peerToWallet);
+	return {
+		held,
+		release: (): void => {
+			w.wallet.removeListener('message:outbound', walletToPeer);
+			peer.removeListener('message:outbound', peerToWallet);
+			w.cuts[i].val = false;
+		}
+	};
+}
+
+/** Silence every wire of the old wallet before a restart replaces it. */
+function silence(w: IWorld): void {
+	for (const cut of w.cuts) cut.val = true;
+}
+
+const request = (
+	budgetMs?: number
+): Parameters<LightningNode['startCompositeSpliceOut']>[0] => ({
+	destinationScript: destinationScript(),
+	amountSats: 1_500_000n,
+	fundingFeeratePerkw: 1000,
+	...(budgetMs !== undefined ? { budgetMs } : {})
+});
+
+function storedRecord(
+	id: string,
+	stage: ICompositeSpliceRecord['stage'],
+	updatedAt: number
+): ICompositeSpliceRecord {
+	return {
+		id,
+		stage,
+		channels: [
+			{
+				channelId: 'aa'.repeat(32),
+				peerPubkey: '02' + 'bb'.repeat(32),
+				fundingTxid: 'cc'.repeat(32),
+				fundingOutputIndex: 0,
+				debitSats: '1000',
+				feeSats: '10',
+				oldCapacitySats: '100000',
+				newCapacitySats: '98990',
+				inputSerialId: '0',
+				fundingOutputSerialId: '2'
+			}
+		],
+		destinationScript: '0014' + 'dd'.repeat(20),
+		destinationSerialId: '4',
+		amountSats: '1000',
+		feeSats: '10',
+		feeratePerkw: 253,
+		locktime: 0,
+		createdAt: updatedAt,
+		updatedAt
+	};
 }
 
 const stageNames = (w: IWorld): string[] => w.stages.map((s) => s.stage);
@@ -784,6 +870,320 @@ describe('Composite splice-out (issue #1922)', function () {
 		expect(storage.loadCompositeSplice(res.id.toString('hex'))!.stage).to.equal(
 			'LOCKED'
 		);
+	});
+
+	it('a restart at COMMITTED aborts the composite and both channels come back NORMAL on the old funding after reestablish', async function () {
+		const storage = new MemoryStorage();
+		const w = await makeWorld(7200, [FUNDING, FUNDING], storage);
+		worlds.push(w);
+		// Hold the second peer's tx_signatures: both sessions commit, the
+		// composite parks at COMMITTED with a commitment-round record on both
+		// wallet channels, and nothing of ours has left.
+		const hold = holdFromPeer(w, 1, MessageType.TX_SIGNATURES);
+		const res = await w.wallet.startCompositeSpliceOut(request(60_000));
+		expect(res.ok).to.equal(true);
+		if (!res.ok) return;
+		expect(hold.held).to.have.length(1);
+		expect(w.wallet.getCompositeSplice(res.id)!.stage).to.equal('COMMITTED');
+		for (const id of w.channels) {
+			const st = w.wallet.getRawChannel(id)!.getFullState();
+			expect(st.spliceInFlight, 'commitment-round record').to.not.equal(null);
+			expect(st.spliceInFlight!.sentTxSignatures).to.equal(false);
+		}
+
+		hold.release();
+		silence(w);
+		w.wallet.destroy();
+		const restarted = createNode(7200, storage);
+		allowCompositePeers(restarted);
+		w.nodes.push(restarted);
+		await waitFor(
+			() => restarted.getChannelManager().listChannels().length === 2,
+			'channels restored'
+		);
+		const record = restarted.getCompositeSplice(res.id)!;
+		expect(record.stage).to.equal('ABORTED');
+		expect(record.reason).to.match(/COMMITTED at restart/);
+		// The sessions are forgotten and the parked state is the OLD one, so
+		// reestablish does not restore a spliceless SPLICING.
+		for (const id of w.channels) {
+			const st = restarted.getRawChannel(id)!.getFullState();
+			expect(st.spliceInFlight).to.equal(null);
+			expect(st.state).to.equal(ChannelState.AWAITING_REESTABLISH);
+			expect(st.preReestablishState).to.equal(ChannelState.NORMAL);
+			expect(st.spliceAbortOwed).to.equal(true);
+		}
+		for (let i = 0; i < 2; i++) await reconnectRestarted(restarted, w.peers[i]);
+		await waitFor(
+			() =>
+				w.channels.every(
+					(id) =>
+						restarted.getRawChannel(id)!.getState() === ChannelState.NORMAL
+				),
+			'both wallet channels NORMAL after reestablish'
+		);
+		for (const id of w.channels) {
+			const ch = restarted.getRawChannel(id)!;
+			expect(ch.getFullState().fundingSatoshis).to.equal(FUNDING);
+			expect(ch.getFullState().spliceInFlight).to.equal(null);
+			expect(ch.isHtlcUsable(), 'the channel routes again').to.equal(true);
+			// The peers signed and keep their splice (section 4), so the
+			// reestablish answered their next_funding_txid with a second
+			// tx_abort whose acknowledgement latch stays armed until the next
+			// reconnect; it holds back a new splice on this channel, not
+			// payments.
+			expect(ch.spliceBusyReason() ?? '').to.match(
+				/^$|abort is not yet acknowledged/
+			);
+		}
+		expect(w.broadcasts).to.deep.equal([]);
+	});
+
+	it('a restart after release with one channel already locked still reaches LOCKED and frees the channels', async function () {
+		const storage = new MemoryStorage();
+		const w = await makeWorld(7210, [FUNDING, FUNDING], storage);
+		worlds.push(w);
+		const res = await w.wallet.startCompositeSpliceOut(request());
+		expect(res.ok).to.equal(true);
+		if (!res.ok) return;
+		await waitFor(
+			() => w.stages.some((s) => s.stage === 'BROADCAST'),
+			'broadcast'
+		);
+		const txid = w.wallet.getCompositeSplice(res.id)!.txid!;
+		// Channel 0 locks before the crash; channel 1 does not.
+		w.wallet.getChannelManager().sendSpliceLocked(w.channels[0]);
+		w.peers[0].getChannelManager().sendSpliceLocked(w.channels[0]);
+		await waitFor(() => {
+			const st = w.wallet.getRawChannel(w.channels[0])!.getFullState();
+			return (
+				st.state === ChannelState.NORMAL &&
+				st.fundingTxid!.toString('hex') === txid
+			);
+		}, 'channel 0 adopted');
+		expect(w.wallet.getCompositeSplice(res.id)!.stage).to.equal('BROADCAST');
+
+		silence(w);
+		w.wallet.destroy();
+		const restarted = createNode(7210, storage);
+		w.nodes.push(restarted);
+		await waitFor(
+			() => restarted.getChannelManager().listChannels().length === 2,
+			'channels restored'
+		);
+		expect(restarted.getCompositeSplice(res.id)!.stage).to.equal('BROADCAST');
+		// Reconnect the pending channel's peer first and lock it, then the
+		// adopted channel's peer: the order the review used.
+		await reconnectRestarted(restarted, w.peers[1]);
+		restarted.getChannelManager().sendSpliceLocked(w.channels[1]);
+		w.peers[1].getChannelManager().sendSpliceLocked(w.channels[1]);
+		await reconnectRestarted(restarted, w.peers[0]);
+		await waitFor(
+			() => restarted.getCompositeSplice(res.id)!.stage === 'LOCKED',
+			'LOCKED once both channels run on the composite'
+		);
+		for (const id of w.channels) {
+			const st = restarted.getRawChannel(id)!.getFullState();
+			expect(st.state).to.equal(ChannelState.NORMAL);
+			expect(st.fundingTxid!.toString('hex')).to.equal(txid);
+		}
+		// Nothing is reserved any more: a close is not refused for the composite.
+		const close = restarted.closeChannel(w.channels[0], destinationScript());
+		expect(close.error ?? '').to.not.match(/composite splice/);
+		const again = await restarted.planCompositeSpliceOut(request());
+		if (!again.ok)
+			expect(again.code).to.not.equal(CompositeSpliceRefusalCode.BUSY);
+	});
+
+	it('a channel that force closes after release ends the composite CONFLICTED and lifts the reservation', async function () {
+		const w = await makeWorld(7220, [FUNDING, FUNDING]);
+		worlds.push(w);
+		const res = await w.wallet.startCompositeSpliceOut(request());
+		expect(res.ok).to.equal(true);
+		if (!res.ok) return;
+		await waitFor(
+			() => w.stages.some((s) => s.stage === 'BROADCAST'),
+			'broadcast'
+		);
+		// A spend of channel 0's OLD funding by a commitment transaction makes
+		// the composite unconfirmable: the engine must stop holding channel 1.
+		const forced = w.wallet.forceCloseChannel(
+			w.channels[0],
+			destinationScript()
+		);
+		expect(forced.ok, forced.error).to.equal(true);
+		await waitFor(
+			() => w.wallet.getCompositeSplice(res.id)!.stage === 'CONFLICTED',
+			'the composite to end CONFLICTED'
+		);
+		const record = w.wallet.getCompositeSplice(res.id)!;
+		expect(record.reason).to.match(/left \(FORCE_CLOSED\)|left \(/);
+		expect(w.storage.loadCompositeSplice(record.id)!.stage).to.equal(
+			'CONFLICTED'
+		);
+		expect(stageNames(w).slice(-1)).to.deep.equal(['CONFLICTED']);
+		// Channel 1 is no longer reserved by the composite.
+		const close = w.wallet.closeChannel(w.channels[1], destinationScript());
+		expect(close.error ?? '').to.not.match(/composite splice/);
+		const plan = await w.wallet.planCompositeSpliceOut(request());
+		if (!plan.ok)
+			expect(plan.code).to.not.equal(CompositeSpliceRefusalCode.BUSY);
+	});
+
+	it('a peer disconnect before commitment aborts the composite at once, not at the end of the budget', async function () {
+		const w = await makeWorld(7230, [FUNDING, FUNDING]);
+		worlds.push(w);
+		w.gates[1].hold = true;
+		const res = await w.wallet.startCompositeSpliceOut(request(60_000));
+		expect(res.ok).to.equal(true);
+		if (!res.ok) return;
+		expect(w.wallet.getCompositeSplice(res.id)!.stage).to.equal('NEGOTIATING');
+		const started = Date.now();
+		await disconnect(w.wallet, w.peers[1], w.cuts[1]);
+		await waitFor(
+			() => w.wallet.getCompositeSplice(res.id)!.stage === 'ABORTED',
+			'the composite to abort on the disconnect'
+		);
+		expect(Date.now() - started, 'did not wait for the budget').to.be.lessThan(
+			5_000
+		);
+		expect(w.wallet.getCompositeSplice(res.id)!.reason).to.match(
+			/disconnected before release/
+		);
+		w.gates[1].hold = false;
+		while (w.gates[1].queue.length > 0) {
+			const m = w.gates[1].queue.shift()!;
+			m.to.handlePeerMessage(m.from, m.type, m.p);
+		}
+		await waitFor(
+			() =>
+				w.wallet.getRawChannel(w.channels[0])!.getState() ===
+					ChannelState.NORMAL &&
+				w.wallet.getRawChannel(w.channels[0])!.getFullState().spliceInFlight ===
+					null,
+			'the first channel back to NORMAL'
+		);
+		expect(w.broadcasts).to.deep.equal([]);
+	});
+
+	it('terminal records older than the retention window are pruned at boot', async function () {
+		const storage = new MemoryStorage();
+		const now = Date.now();
+		const old = storedRecord(
+			'11'.repeat(32),
+			'LOCKED',
+			now - COMPOSITE_SPLICE_RETENTION_MS - 60_000
+		);
+		const recent = storedRecord('22'.repeat(32), 'ABORTED', now - 60_000);
+		storage.saveCompositeSplice(old);
+		storage.saveCompositeSplice(recent);
+		const w = await makeWorld(7240, [FUNDING, FUNDING], storage);
+		worlds.push(w);
+		expect(w.wallet.listCompositeSplices().map((r) => r.id)).to.deep.equal([
+			recent.id
+		]);
+		expect(storage.loadCompositeSplice(old.id)).to.equal(null);
+		expect(storage.loadCompositeSplice(recent.id)!.stage).to.equal('ABORTED');
+	});
+
+	it('channels sharing an in-flight splice with no record get a synthesized one at boot and still reach LOCKED', async function () {
+		const storage = new MemoryStorage();
+		const w = await makeWorld(7250, [FUNDING, FUNDING], storage);
+		worlds.push(w);
+		const res = await w.wallet.startCompositeSpliceOut(request());
+		expect(res.ok).to.equal(true);
+		if (!res.ok) return;
+		await waitFor(
+			() => w.stages.some((s) => s.stage === 'BROADCAST'),
+			'broadcast'
+		);
+		const txid = w.wallet.getCompositeSplice(res.id)!.txid!;
+		// A journal rebuilt from a snapshot older than the record: the record
+		// is gone, the channel rows are not.
+		storage.deleteCompositeSplice(res.id.toString('hex'));
+		silence(w);
+		w.wallet.destroy();
+		const restarted = createNode(7250, storage);
+		w.nodes.push(restarted);
+		await waitFor(
+			() => restarted.getChannelManager().listChannels().length === 2,
+			'channels restored'
+		);
+		const list = restarted.listCompositeSplices();
+		expect(list).to.have.length(1);
+		const synthesized = list[0];
+		expect(synthesized.id).to.not.equal(res.id.toString('hex'));
+		expect(synthesized.stage).to.equal('RELEASED');
+		expect(synthesized.txid).to.equal(txid);
+		expect(synthesized.reason).to.match(/synthesized from channel records/);
+		expect(synthesized.channels.map((c) => c.channelId).sort()).to.deep.equal(
+			w.channels.map((c) => c.toString('hex')).sort()
+		);
+		expect(storage.loadCompositeSplice(synthesized.id)!.stage).to.equal(
+			'RELEASED'
+		);
+		for (let i = 0; i < 2; i++) await reconnectRestarted(restarted, w.peers[i]);
+		for (let i = 0; i < 2; i++) {
+			restarted.getChannelManager().sendSpliceLocked(w.channels[i]);
+			w.peers[i].getChannelManager().sendSpliceLocked(w.channels[i]);
+		}
+		await waitFor(
+			() =>
+				restarted.getCompositeSplice(Buffer.from(synthesized.id, 'hex'))!
+					.stage === 'LOCKED',
+			'the synthesized record to reach LOCKED'
+		);
+	});
+
+	it('an ABORTED record whose sessions were not all unwound is finished at boot', async function () {
+		const storage = new MemoryStorage();
+		const w = await makeWorld(7260, [FUNDING, FUNDING], storage);
+		worlds.push(w);
+		const hold = holdFromPeer(w, 1, MessageType.TX_SIGNATURES);
+		const res = await w.wallet.startCompositeSpliceOut(request(60_000));
+		expect(res.ok).to.equal(true);
+		if (!res.ok) return;
+		expect(w.wallet.getCompositeSplice(res.id)!.stage).to.equal('COMMITTED');
+		// A crash between the terminal write and the session unwinds: the
+		// record says ABORTED while both channels still hold their splice.
+		const stored = storage.loadCompositeSplice(res.id.toString('hex'))!;
+		storage.saveCompositeSplice({
+			...stored,
+			stage: 'ABORTED',
+			reason: 'simulated crash between the terminal write and the unwinds'
+		});
+		hold.release();
+		silence(w);
+		w.wallet.destroy();
+		const restarted = createNode(7260, storage);
+		w.nodes.push(restarted);
+		await waitFor(
+			() => restarted.getChannelManager().listChannels().length === 2,
+			'channels restored'
+		);
+		expect(restarted.getCompositeSplice(res.id)!.stage).to.equal('ABORTED');
+		for (const id of w.channels) {
+			const st = restarted.getRawChannel(id)!.getFullState();
+			expect(st.spliceInFlight, 'the leftover session was forgotten').to.equal(
+				null
+			);
+			expect(st.preReestablishState).to.equal(ChannelState.NORMAL);
+			expect(st.spliceAbortOwed).to.equal(true);
+		}
+		for (let i = 0; i < 2; i++) await reconnectRestarted(restarted, w.peers[i]);
+		await waitFor(
+			() =>
+				w.channels.every(
+					(id) =>
+						restarted.getRawChannel(id)!.getState() === ChannelState.NORMAL
+				),
+			'both channels NORMAL on the old funding'
+		);
+		for (const id of w.channels) {
+			expect(
+				restarted.getRawChannel(id)!.getFullState().fundingSatoshis
+			).to.equal(FUNDING);
+		}
 	});
 
 	it('a one-channel record read from storage round-trips through the node API', async function () {

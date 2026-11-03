@@ -13604,6 +13604,16 @@ export class Channel {
 		if (this._state.state === ChannelState.SPLICING) {
 			this._state.state = this._state.preSpliceState ?? ChannelState.NORMAL;
 			this._state.preSpliceState = null;
+		} else if (this._state.state === ChannelState.AWAITING_REESTABLISH) {
+			// Restored but not yet reconnected: the live state is parked in
+			// preReestablishState, and a SPLICING left there would come back as
+			// a spliceless SPLICING when reestablish completes, the trap
+			// initiateSpliceAbort steps around for the operator path.
+			if (this._state.preReestablishState === ChannelState.SPLICING) {
+				this._state.preReestablishState =
+					this._state.preSpliceState ?? ChannelState.NORMAL;
+			}
+			this._state.preSpliceState = null;
 		}
 		this._state.spliceAbortOwed = true;
 		return [
@@ -13748,21 +13758,6 @@ export class Channel {
 			this._state.remoteBasepoints?.fundingPubkey;
 		if (!remoteFundingPubkey) return;
 
-		// Shared input: the channel's current funding output, signalled via the
-		// shared_input_txid TLV with an empty prevTx.
-		this._spliceContributions.push({
-			kind: 'input',
-			sharedInputTxid: this._state.fundingTxid,
-			input: {
-				serialId: session.nextSerialId()!,
-				prevTxid: this._state.fundingTxid,
-				prevOutputIndex: this._state.fundingOutputIndex,
-				sequence: 0xfffffffd,
-				prevTx: Buffer.alloc(0),
-				prevTxVout: this._state.fundingOutputIndex
-			}
-		});
-
 		if (this._compositeSplice) {
 			// Composite (issue #1922): the node allocated every serial id and
 			// built the identical lists for every session; this channel's own
@@ -13770,8 +13765,6 @@ export class Channel {
 			// funding transactions as prev_tx, and the outputs are the N new
 			// funding outputs plus the destination. Nothing is derived here.
 			const { contribution } = this._compositeSplice;
-			this._spliceContributions.length = 0;
-			this._spliceContributions.shift();
 			for (const input of contribution.inputs) {
 				this._spliceContributions.push({
 					kind: 'input',
@@ -13798,6 +13791,21 @@ export class Channel {
 			}
 			return;
 		}
+
+		// Shared input: the channel's current funding output, signalled via the
+		// shared_input_txid TLV with an empty prevTx.
+		this._spliceContributions.push({
+			kind: 'input',
+			sharedInputTxid: this._state.fundingTxid,
+			input: {
+				serialId: session.nextSerialId()!,
+				prevTxid: this._state.fundingTxid,
+				prevOutputIndex: this._state.fundingOutputIndex,
+				sequence: 0xfffffffd,
+				prevTx: Buffer.alloc(0),
+				prevTxVout: this._state.fundingOutputIndex
+			}
+		});
 
 		const oldCapacity = this._state.fundingSatoshis;
 		const netChange = session.getNetCapacityChange(); // negative for splice-out

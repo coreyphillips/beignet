@@ -48,6 +48,9 @@ import type { NodeErrorCode } from './events';
 /** Default time budget from the first stfu to the last peer tx_signatures. */
 export const DEFAULT_COMPOSITE_SPLICE_BUDGET_MS = 60_000;
 
+/** How long a terminal record (LOCKED, ABORTED, CONFLICTED) is kept. */
+export const COMPOSITE_SPLICE_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
+
 /** Conservative dust floor for the destination (covers all standard outputs). */
 const MIN_DESTINATION_SATS = 546n;
 
@@ -160,8 +163,8 @@ export interface ICompositeSpliceEngineDeps {
 	/** Validates and resolves the destination (throws on a bad script). */
 	resolveDestination(script?: Buffer): Buffer;
 	currentHeight(): number;
-	/** Rebroadcast a released composite after a restart. */
-	rebroadcast(txHex: string, idHex: string): void;
+	/** Drop a terminal record past its retention window (best effort). */
+	deleteRecord(id: string): void;
 	emitStage(event: ICompositeSpliceStageEvent): void;
 	emitError(code: NodeErrorCode, message: string, channelId?: Buffer): void;
 	log(event: string, fields: Record<string, unknown>): void;
@@ -209,8 +212,14 @@ export class CompositeSpliceEngine {
 		cm.on('channel:splice-txsigs-needed', this.onPeerSigned);
 		cm.on('splice:aborted', this.onSpliceAborted);
 		cm.on('splice:complete', this.onSpliceComplete);
+		cm.on('channel:reestablished', this.onReestablished);
+		cm.on('peer:disconnected', this.onPeerDisconnected);
 		cm.on('broadcast:tx', this.onBroadcast);
 		cm.on('error', this.onChannelError);
+		cm.on('channel:force-closing', this.onParticipantLeft);
+		cm.on('channel:closed', this.onParticipantLeft);
+		cm.on('channel:errored', this.onParticipantLeft);
+		cm.on('splice:reverted', this.onParticipantLeft);
 	}
 
 	detach(): void {
@@ -221,15 +230,29 @@ export class CompositeSpliceEngine {
 		cm.removeListener('channel:splice-txsigs-needed', this.onPeerSigned);
 		cm.removeListener('splice:aborted', this.onSpliceAborted);
 		cm.removeListener('splice:complete', this.onSpliceComplete);
+		cm.removeListener('channel:reestablished', this.onReestablished);
+		cm.removeListener('peer:disconnected', this.onPeerDisconnected);
 		cm.removeListener('broadcast:tx', this.onBroadcast);
 		cm.removeListener('error', this.onChannelError);
+		cm.removeListener('channel:force-closing', this.onParticipantLeft);
+		cm.removeListener('channel:closed', this.onParticipantLeft);
+		cm.removeListener('channel:errored', this.onParticipantLeft);
+		cm.removeListener('splice:reverted', this.onParticipantLeft);
 		if (this.active?.timer) clearTimeout(this.active.timer);
 		this.active = null;
 	}
 
 	/**
-	 * Apply the restore table of section 5 to every stored record. Called once
-	 * at boot, after the channels are restored and before peers connect.
+	 * Apply the restore table of section 5 to every stored record, then look
+	 * for composites the records do not describe. Called once at boot, after
+	 * the channels are restored and before peers connect.
+	 *
+	 * Rebroadcasting a released composite is not done here: every
+	 * participating channel holds the fully signed transaction in its own
+	 * in-flight record, and the node's splice rebroadcast path resumes it
+	 * through the durability barrier (reauthorizeSpliceBroadcast), as it does
+	 * for a single splice. A direct rebroadcast from the record would skip
+	 * that barrier.
 	 */
 	restore(): void {
 		if (!this.deps.recordsSupported()) return;
@@ -245,49 +268,240 @@ export class CompositeSpliceEngine {
 			);
 			return;
 		}
+		const described = new Set<string>();
 		for (const record of records) {
+			if (record.txid) described.add(record.txid);
+			if (compositeSpliceStageIsTerminal(record.stage)) {
+				if (
+					this.deps.now() - record.updatedAt >
+					COMPOSITE_SPLICE_RETENTION_MS
+				) {
+					this.deleteRecord(record.id);
+					continue;
+				}
+				this.records.set(record.id, record);
+				// A crash between the terminal write and the last session unwind
+				// leaves a channel holding a splice its record says is over
+				// (ABORTED rides the first unwind's persist). Finish the unwind.
+				if (record.stage === 'ABORTED' && record.txid) {
+					this.forgetUnsentSessions(
+						record,
+						`composite splice ${record.id.slice(0, 12)} is ABORTED`
+					);
+				}
+				continue;
+			}
 			this.records.set(record.id, record);
-			if (compositeSpliceStageIsTerminal(record.stage)) continue;
 			if (!compositeSpliceStageAtLeast(record.stage, 'RELEASED')) {
 				// Nothing of ours left: forget every unsent session (owing the
 				// peer a tx_abort) and close the record.
 				const reason = `composite splice ${record.stage} at restart`;
-				for (const c of record.channels) {
-					const channelId = Buffer.from(c.channelId, 'hex');
-					if (!this.deps.channelManager.getChannel(channelId)) continue;
-					const result = this.deps.channelManager.forgetUnsentSplice(
-						channelId,
-						reason
-					);
-					if (!result.ok) {
-						this.deps.log('composite_splice_restore_forget_refused', {
-							id: record.id,
-							channelId: c.channelId,
-							error: result.error
-						});
-					}
-				}
+				this.forgetUnsentSessions(record, reason);
 				this.writeRecord({ ...record, stage: 'ABORTED', reason });
 				continue;
 			}
-			// RELEASED or BROADCAST: the transaction may confirm. Rebroadcast,
-			// keep tracking the channels to LOCKED, and finish any slot that a
+			// RELEASED or BROADCAST: the transaction may confirm. Keep tracking
+			// the channels to LOCKED (or CONFLICTED) and finish any slot that a
 			// session still owes (a crash between two fills).
+			if (this.active) {
+				this.deps.log('composite_splice_restore_second_live_record', {
+					id: record.id,
+					active: this.active.record.id
+				});
+				continue;
+			}
 			this.active = this.activeFromRecord(record);
-			// Prefer a session's fully signed copy: a crash between RELEASED and
-			// BROADCAST leaves the record with the unsigned COMMITTED hex.
-			const signed = [...(this.active?.channels.values() ?? [])]
-				.map((e) => e.channel.getFullState().spliceInFlight)
-				.find((f) => f?.fullySigned)?.spliceTxHex;
-			const hex = signed ?? record.txHex;
-			if (hex) this.deps.rebroadcast(hex, record.id);
 			if (this.active) {
 				this.fillAllSlots(this.active);
-				this.maybeLocked(this.active);
+				this.maybeSettled(this.active);
 			}
 		}
-		// Only one operation can be live; a second RELEASED record (impossible
-		// in normal operation) is tracked only through its channels.
+		this.adoptUndescribedComposites(described);
+	}
+
+	/**
+	 * Forget every session of `record` whose tx_signatures never left, owing
+	 * the peer a tx_abort; a session past that point is left alone.
+	 */
+	private forgetUnsentSessions(
+		record: ICompositeSpliceRecord,
+		reason: string
+	): void {
+		for (const c of record.channels) {
+			const channelId = Buffer.from(c.channelId, 'hex');
+			const channel = this.deps.channelManager.getChannel(channelId);
+			if (!channel) continue;
+			const inflight = channel.getFullState().spliceInFlight;
+			if (
+				record.txid &&
+				inflight &&
+				inflight.spliceTxid.toString('hex') !== record.txid
+			) {
+				continue; // a later, unrelated splice of this channel
+			}
+			if (inflight?.sentTxSignatures) continue;
+			if (!inflight && !channel.getSpliceSession()) continue;
+			const result = this.deps.channelManager.forgetUnsentSplice(
+				channelId,
+				reason
+			);
+			if (!result.ok) {
+				this.deps.log('composite_splice_restore_forget_refused', {
+					id: record.id,
+					channelId: c.channelId,
+					error: result.error
+				});
+			}
+		}
+	}
+
+	/**
+	 * The missing-record rule of section 5. Two or more channels whose
+	 * in-flight splices name the SAME transaction can only be a composite (a
+	 * single splice is one channel's own), so when no record describes that
+	 * txid (a journal rebuilt from a snapshot older than the record), one is
+	 * synthesized from the channel rows: RELEASED when any session sent its
+	 * tx_signatures (the transaction may confirm; fill the slots still owed
+	 * and track to LOCKED), ABORTED otherwise (nothing of ours left; forget
+	 * every session). The debit and fee split is not recoverable from the
+	 * rows, so the record carries each channel's whole relative change as the
+	 * debit and says so in its reason.
+	 */
+	private adoptUndescribedComposites(described: Set<string>): void {
+		const cm = this.deps.channelManager;
+		const groups = new Map<string, Channel[]>();
+		for (const channel of cm.listChannels()) {
+			const inflight = channel.getFullState().spliceInFlight;
+			if (!inflight) continue;
+			const txid = inflight.spliceTxid.toString('hex');
+			if (described.has(txid)) continue;
+			const group = groups.get(txid) ?? [];
+			group.push(channel);
+			groups.set(txid, group);
+		}
+		for (const [txid, group] of groups) {
+			if (group.length < 2) continue;
+			const now = this.deps.now();
+			const released = group.some(
+				(ch) => ch.getFullState().spliceInFlight!.sentTxSignatures
+			);
+			const anyFlight = group[0].getFullState().spliceInFlight!;
+			const signedHex =
+				group
+					.map((ch) => ch.getFullState().spliceInFlight!)
+					.find((f) => f.fullySigned)?.spliceTxHex ?? anyFlight.spliceTxHex;
+			let tx: bitcoin.Transaction | null = null;
+			try {
+				tx = bitcoin.Transaction.fromHex(signedHex);
+			} catch {
+				tx = null;
+			}
+			const fundingScripts = new Set(
+				group.map((ch) => {
+					const st = ch.getFullState();
+					return st.remoteBasepoints
+						? createFundingScript(
+								st.localBasepoints.fundingPubkey,
+								st.remoteBasepoints.fundingPubkey
+						  ).p2wshOutput.toString('hex')
+						: '';
+				})
+			);
+			const destination = tx?.outs.find(
+				(o) => !fundingScripts.has(Buffer.from(o.script).toString('hex'))
+			);
+			const channels: ICompositeSpliceChannel[] = group.map((ch) => {
+				const st = ch.getFullState();
+				const f = st.spliceInFlight!;
+				const relative = -f.localRelativeSatoshis;
+				return {
+					channelId: ch.getChannelId()!.toString('hex'),
+					peerPubkey:
+						cm.getPeerForChannel(ch.getChannelId()!) ?? '00'.repeat(33),
+					fundingTxid: st.fundingTxid!.toString('hex'),
+					fundingOutputIndex: st.fundingOutputIndex,
+					debitSats: (relative > 0n ? relative : 0n).toString(),
+					feeSats: '0',
+					oldCapacitySats: st.fundingSatoshis.toString(),
+					newCapacitySats: f.newFundingSatoshis.toString(),
+					inputSerialId: '0',
+					fundingOutputSerialId: '0'
+				};
+			});
+			const amount = destination ? BigInt(destination.value) : 0n;
+			const inSum = group.reduce(
+				(acc, ch) => acc + ch.getFullState().fundingSatoshis,
+				0n
+			);
+			const outSum =
+				tx?.outs.reduce((acc, o) => acc + BigInt(o.value), 0n) ?? inSum;
+			const record: ICompositeSpliceRecord = {
+				id: randomBytes(32).toString('hex'),
+				stage: released ? 'RELEASED' : 'ABORTED',
+				channels,
+				destinationScript: destination
+					? Buffer.from(destination.script).toString('hex')
+					: '00',
+				destinationSerialId: '0',
+				amountSats: amount.toString(),
+				feeSats: (inSum > outSum ? inSum - outSum : 0n).toString(),
+				feeratePerkw: 253,
+				locktime: tx?.locktime ?? 0,
+				txid,
+				txHex: signedHex,
+				reason: released
+					? 'synthesized from channel records at restart: no composite record described this transaction; the debit and fee split is not known'
+					: 'synthesized from channel records at restart: nothing of ours had left, every session forgotten',
+				createdAt: now,
+				updatedAt: now
+			};
+			this.deps.log('composite_splice_restore_synthesized', {
+				id: record.id,
+				txid,
+				stage: record.stage,
+				channels: channels.length
+			});
+			if (!released) {
+				this.forgetUnsentSessions(record, record.reason!);
+				this.writeRecord(record);
+				continue;
+			}
+			this.writeRecord(record);
+			if (this.active) {
+				this.deps.log('composite_splice_restore_second_live_record', {
+					id: record.id,
+					active: this.active.record.id
+				});
+				continue;
+			}
+			this.active = this.activeFromRecord(record);
+			if (this.active) {
+				this.fillAllSlots(this.active);
+				this.maybeSettled(this.active);
+			}
+		}
+	}
+
+	/** Drop every terminal record past the retention window. */
+	private prune(): void {
+		const now = this.deps.now();
+		for (const record of [...this.records.values()]) {
+			if (!compositeSpliceStageIsTerminal(record.stage)) continue;
+			if (now - record.updatedAt <= COMPOSITE_SPLICE_RETENTION_MS) continue;
+			this.deleteRecord(record.id);
+		}
+	}
+
+	private deleteRecord(id: string): void {
+		this.records.delete(id);
+		try {
+			this.deps.deleteRecord(id);
+		} catch (err) {
+			this.deps.log('composite_splice_prune_failed', {
+				id,
+				error: (err as Error)?.message ?? String(err)
+			});
+		}
 	}
 
 	// ─── Queries ───
@@ -304,6 +518,26 @@ export class CompositeSpliceEngine {
 	isChannelReserved(channelId: Buffer): boolean {
 		return this.active?.channels.has(channelId.toString('hex')) ?? false;
 	}
+
+	/**
+	 * A peer disconnected (section 4, failure table): before RELEASED a
+	 * negotiation does not survive the connection, so the composite ends now
+	 * rather than at the end of its budget. After RELEASED the transaction
+	 * stands and the channel resumes at reestablish.
+	 */
+	private readonly onPeerDisconnected = (peerPubkey: string): void => {
+		const active = this.active;
+		if (!active) return;
+		if (compositeSpliceStageAtLeast(active.record.stage, 'RELEASED')) return;
+		for (const [hex, entry] of active.channels) {
+			if (entry.peerPubkey !== peerPubkey) continue;
+			this.abortAll(
+				active,
+				`peer of session ${hex.slice(0, 12)} disconnected before release`
+			);
+			return;
+		}
+	};
 
 	// ─── Planning ───
 
@@ -747,6 +981,7 @@ export class CompositeSpliceEngine {
 			updatedAt: now
 		};
 		// PLANNED is durable before the first splice_init (section 5).
+		this.prune();
 		this.writeRecord(record);
 		this.deps.log('composite_splice_stage', { id: idHex, stage: 'PLANNED' });
 		this.deps.emitStage({ id, stage: 'PLANNED' });
@@ -889,6 +1124,7 @@ export class CompositeSpliceEngine {
 			}
 		});
 		this.deps.emitError('COMPOSITE_SPLICE_ABORTED', reason);
+		this.prune();
 	}
 
 	// ─── Manager events ───
@@ -912,6 +1148,22 @@ export class CompositeSpliceEngine {
 		if (active.record.stage !== 'NEGOTIATING') return;
 		const entries = [...active.channels.values()];
 		if (entries.some((e) => !e.negotiatedTxid)) return;
+		const id = Buffer.from(active.record.id, 'hex');
+		const dropped = entries.find(
+			(e) => !e.channel.getCompositeSpliceId()?.equals(id)
+		);
+		if (dropped) {
+			// A disconnect forgot the pre-commitment splice on that channel
+			// (markForReestablish) without a word to anyone: the session is gone.
+			this.abortAll(
+				active,
+				`session ${dropped.channel
+					.getChannelId()!
+					.toString('hex')
+					.slice(0, 12)} was dropped before commitment`
+			);
+			return;
+		}
 		const txid = entries[0].negotiatedTxid!;
 		if (entries.some((e) => !e.negotiatedTxid!.equals(txid))) {
 			this.abortAll(active, 'sessions negotiated different transactions');
@@ -1096,32 +1348,97 @@ export class CompositeSpliceEngine {
 		const entry = active.channels.get(channelId.toString('hex'));
 		if (!entry) return;
 		entry.completed = true;
-		this.maybeLocked(active);
+		this.maybeSettled(active);
 	};
 
-	private maybeLocked(active: IActive): void {
+	/**
+	 * A channel that adopted the composite before a restart never emits
+	 * splice:complete again; its reestablish is the moment its state can be
+	 * read as NORMAL on the composite funding.
+	 */
+	private readonly onReestablished = (channelId: Buffer): void => {
+		const active = this.active;
+		if (!active || !active.channels.has(channelId.toString('hex'))) return;
+		this.maybeSettled(active);
+	};
+
+	/**
+	 * A participating channel is closing, closed, errored or reverted its
+	 * splice. Before RELEASED that ends the composite like any session
+	 * failure. After RELEASED the transaction can no longer confirm whole (an
+	 * input is spent elsewhere, or the channel that would adopt it is gone):
+	 * the record ends CONFLICTED and the reservation lifts; the surviving
+	 * channels' own splice records follow the single-channel rules.
+	 */
+	private readonly onParticipantLeft = (channelId: Buffer): void => {
+		const active = this.active;
+		if (!active) return;
+		const hex = channelId.toString('hex');
+		if (!active.channels.has(hex)) return;
+		if (!compositeSpliceStageAtLeast(active.record.stage, 'RELEASED')) {
+			this.abortAll(active, `session ${hex.slice(0, 12)} left before release`);
+			return;
+		}
+		this.maybeSettled(active);
+	};
+
+	/**
+	 * Decide whether a released composite is finished: LOCKED once every
+	 * channel runs on it, CONFLICTED once any channel has left without it.
+	 */
+	private maybeSettled(active: IActive): void {
 		if (this.active !== active) return;
 		if (!compositeSpliceStageAtLeast(active.record.stage, 'RELEASED')) return;
 		const txid = active.record.txid;
-		for (const entry of active.channels.values()) {
+		for (const [hex, entry] of active.channels) {
 			if (entry.completed) continue;
 			const state = entry.channel.getFullState();
-			// After a restart the completion event is history: the channel's
-			// own funding says whether it adopted the composite.
+			// Restored channels park their live state in preReestablishState
+			// until the peer is back; read that one.
+			const live =
+				state.state === ChannelState.AWAITING_REESTABLISH
+					? state.preReestablishState ?? state.state
+					: state.state;
+			const onComposite = !!txid && state.fundingTxid?.toString('hex') === txid;
 			if (
-				txid &&
-				state.state === ChannelState.NORMAL &&
+				live === ChannelState.NORMAL &&
 				!state.spliceInFlight &&
-				state.fundingTxid?.toString('hex') === txid
+				onComposite
 			) {
+				// Adopted (a completion event is history after a restart).
 				entry.completed = true;
 				continue;
 			}
-			return;
+			const gone =
+				live === ChannelState.SHUTTING_DOWN ||
+				live === ChannelState.NEGOTIATING_CLOSING ||
+				live === ChannelState.CLOSED ||
+				live === ChannelState.FORCE_CLOSED ||
+				live === ChannelState.ERRORED ||
+				// Back to NORMAL on a funding that is not the composite's: the
+				// channel reverted or replaced the splice.
+				(live === ChannelState.NORMAL && !state.spliceInFlight && !onComposite);
+			if (gone) {
+				const reason = `channel ${hex.slice(
+					0,
+					12
+				)} left (${live}) without adopting the transaction`;
+				const record = this.setStage(active, 'CONFLICTED', { reason });
+				if (active.timer) clearTimeout(active.timer);
+				this.active = null;
+				this.deps.withMutations(
+					[{ type: 'composite_splice', record }],
+					standalone
+				);
+				this.prune();
+				return;
+			}
+			return; // still pending its lock
 		}
 		const record = this.setStage(active, 'LOCKED');
 		this.active = null;
 		this.deps.withMutations([{ type: 'composite_splice', record }], standalone);
+		this.prune();
 	}
 
 	// ─── Record bookkeeping ───
@@ -1176,6 +1493,7 @@ export class CompositeSpliceEngine {
 				fundingOutputIndex: c.fundingOutputIndex,
 				negotiatedTxid: record.txid ? Buffer.from(record.txid, 'hex') : null,
 				peerSigned: !!inflight?.remoteSharedInputSig,
+				// maybeSettled reads the channel's state for the rest.
 				completed: false,
 				aborted: false
 			});

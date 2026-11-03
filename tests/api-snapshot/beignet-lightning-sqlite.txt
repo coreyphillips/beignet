@@ -119,6 +119,7 @@ method SqliteStorage.countOutboxMessages(channelId: string): number
 method SqliteStorage.deleteAllWebhooks(): void
 method SqliteStorage.deleteChannel(id: string): void
 method SqliteStorage.deleteChannelPolicy(channelId: string): void
+method SqliteStorage.deleteCompositeSplice(id: string): void
 method SqliteStorage.deleteForwardedHtlc(outKey: string): void
 method SqliteStorage.deleteGossipChannel(scidHex: string): void
 method SqliteStorage.deleteGossipNode(nodeIdHex: string): void

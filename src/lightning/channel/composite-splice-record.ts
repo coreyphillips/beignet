@@ -28,7 +28,14 @@ export type CompositeSpliceStage =
 	| 'RELEASED'
 	| 'BROADCAST'
 	| 'LOCKED'
-	| 'ABORTED';
+	| 'ABORTED'
+	/**
+	 * Released, then an input was spent by another transaction (a peer's
+	 * force close of its old funding) or a participating channel closed:
+	 * the transaction can never confirm. Terminal; the surviving channels'
+	 * own splice records follow the single-channel rules from here.
+	 */
+	| 'CONFLICTED';
 
 /** The stages in the order an operation passes through them. */
 export const COMPOSITE_SPLICE_STAGES: readonly CompositeSpliceStage[] = [
@@ -39,7 +46,8 @@ export const COMPOSITE_SPLICE_STAGES: readonly CompositeSpliceStage[] = [
 	'RELEASED',
 	'BROADCAST',
 	'LOCKED',
-	'ABORTED'
+	'ABORTED',
+	'CONFLICTED'
 ];
 
 /** One channel's part in a composite splice. */
@@ -93,18 +101,21 @@ export interface ICompositeSpliceRecord {
 export function compositeSpliceStageIsTerminal(
 	stage: CompositeSpliceStage
 ): boolean {
-	return stage === 'LOCKED' || stage === 'ABORTED';
+	return stage === 'LOCKED' || stage === 'ABORTED' || stage === 'CONFLICTED';
 }
 
 /**
- * Whether `stage` is at or past `floor` on the forward path. ABORTED is
- * outside the path: it is never at or past anything but itself.
+ * Whether `stage` is at or past `floor` on the forward path. ABORTED and
+ * CONFLICTED are outside the path: neither is at or past anything but
+ * itself.
  */
 export function compositeSpliceStageAtLeast(
 	stage: CompositeSpliceStage,
 	floor: CompositeSpliceStage
 ): boolean {
-	if (stage === 'ABORTED' || floor === 'ABORTED') return stage === floor;
+	const outside = (s: CompositeSpliceStage): boolean =>
+		s === 'ABORTED' || s === 'CONFLICTED';
+	if (outside(stage) || outside(floor)) return stage === floor;
 	return (
 		COMPOSITE_SPLICE_STAGES.indexOf(stage) >=
 		COMPOSITE_SPLICE_STAGES.indexOf(floor)

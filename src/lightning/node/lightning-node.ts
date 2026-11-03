@@ -15086,8 +15086,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				this.peerSupportsCompositeSpliceInputs(peer),
 			resolveDestination: (script) => this._spliceOutDestination(script),
 			currentHeight: () => this.currentBlockHeight,
-			rebroadcast: (txHex, idHex) =>
-				this.rebroadcastAuthorizedSplice(idHex, txHex),
+			deleteRecord: (id) => this.storage?.deleteCompositeSplice?.(id),
 			emitStage: (event: ICompositeSpliceStageEvent) =>
 				this.emit('composite-splice:stage', event),
 			emitError: (code, message, channelId) =>

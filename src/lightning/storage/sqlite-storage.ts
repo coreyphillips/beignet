@@ -1164,6 +1164,10 @@ export class SqliteStorage implements IStorageBackend {
 		});
 	}
 
+	deleteCompositeSplice(id: string): void {
+		this._stmt('DELETE FROM composite_splices WHERE id = ?').run(id);
+	}
+
 	saveFforVoucher(record: IFforVoucherArchive): void {
 		const id = fforVoucherArchiveId(record);
 		const merged = mergeFforVoucherArchive(this.loadFforVoucher(id), record);

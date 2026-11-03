@@ -83,7 +83,8 @@ const CAPABILITY_MEMBERS: {
 	compositeSplices: {
 		saveCompositeSplice: true,
 		loadCompositeSplice: true,
-		loadAllCompositeSplices: true
+		loadAllCompositeSplices: true,
+		deleteCompositeSplice: true
 	},
 	invoicePathIds: { saveInvoicePathId: true, loadAllInvoicePathIds: true },
 	announcedPeerAddresses: {

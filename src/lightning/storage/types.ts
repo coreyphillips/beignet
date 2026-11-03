@@ -206,6 +206,8 @@ export interface ICompositeSpliceStorage {
 	saveCompositeSplice(record: ICompositeSpliceRecord): void;
 	loadCompositeSplice(id: string): ICompositeSpliceRecord | null;
 	loadAllCompositeSplices(): ICompositeSpliceRecord[];
+	/** Drop a terminal record past its retention window; unknown ids are no-ops. */
+	deleteCompositeSplice(id: string): void;
 }
 
 /**

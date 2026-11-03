@@ -791,14 +791,20 @@ node.peerSupportsCompositeSpliceInputs(peerPubkey); // bits 454/455, or Core Lig
 Stages: `PLANNED`, `NEGOTIATING`, `COMMITTED` (every session negotiated the
 same transaction; the commitments are released), `PEERS_SIGNED`, `RELEASED`
 (our `tx_signatures` left in every session; the record is on disk first),
-`BROADCAST`, `LOCKED`, or `ABORTED` with a reason. One composite runs at a
-time; a second request is refused with `BUSY`, not queued. A channel in a
-live composite refuses a single splice and a cooperative close. The record
-is a `composite_splice` recovery mutation and needs a storage backend with
-the `compositeSplices` capability group plus a recovery journal; at boot a
+`BROADCAST`, `LOCKED`, `ABORTED` with a reason, or `CONFLICTED` when a
+participating channel force closed, errored, closed or reverted after the
+release, so the transaction can no longer confirm whole. One composite runs
+at a time; a second request is refused with `BUSY`, not queued. A channel in
+a live composite refuses a single splice and a cooperative close. A peer
+disconnect before `RELEASED` aborts the composite at once. The record is a
+`composite_splice` recovery mutation and needs a storage backend with the
+`compositeSplices` capability group plus a recovery journal; at boot a
 record that never reached `RELEASED` is marked `ABORTED` and its unsent
 sessions are forgotten (owing the peer a `tx_abort`), a `RELEASED` or
-`BROADCAST` one is rebroadcast and tracked to `LOCKED`. A peer is selected
+`BROADCAST` one is tracked to `LOCKED` (the channels' own splice rebroadcast
+path republishes it through the durability barrier), and channels sharing an
+in-flight splice that no record describes get a synthesized record.
+Terminal records are kept for seven days. A peer is selected
 only when it advertises `option_composite_splice_inputs` or is Core
 Lightning (which admits the inputs without the bit, see the design note's
 section 8); a peer that signed before the composite aborted keeps its splice
