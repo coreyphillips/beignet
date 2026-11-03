@@ -40,6 +40,7 @@ import {
 import { bitcoinRpc, mineBlocks, ensureBitcoindFunds } from './shared-helpers';
 import { LightningNode } from '../../../src/lightning/node/lightning-node';
 import type { ISpliceWalletInput } from '../../../src/lightning/channel/channel';
+import { createFundingScript } from '../../../src/lightning/script/funding';
 import { MessageType } from '../../../src/lightning/message/types';
 
 bitcoin.initEccLib(ecc);
@@ -548,6 +549,175 @@ describe('Interop: Beignet ↔ CLN splice matrix (regtest)', function () {
 			await waitForClnSplicedNormal(node.getNodeId(), spliceTxid);
 			console.log(
 				`    C2 spliced in 80k with a third-party input: cap ${oldCap} -> ${after.fundingSatoshis}`
+			);
+		});
+
+		/**
+		 * A REAL confirmed bare 2-of-2 P2WSH UTXO: the form of another channel's
+		 * funding output (issue #1922), with both keys ours so the witness can
+		 * be produced out of band the way a composite splice assembles it.
+		 */
+		const makeReal2of2Input = async (
+			tag: string,
+			valueSat: number
+		): Promise<IRealInput> => {
+			const holders = ['a', 'b']
+				.map((k) => {
+					const priv = crypto
+						.createHash('sha256')
+						.update(`splice-matrix-${tag}-${k}`)
+						.digest();
+					return { priv, pub: Buffer.from(ecc.pointFromScalar(priv, true)!) };
+				})
+				.sort((x, y) => Buffer.compare(x.pub, y.pub));
+			const funding = createFundingScript(
+				holders[0].pub,
+				holders[1].pub,
+				bitcoin.networks.regtest
+			);
+			const txid = (await bitcoinRpc('sendtoaddress', [
+				funding.address,
+				valueSat / 1e8
+			])) as string;
+			await mineBlocks(1);
+			const raw = (await bitcoinRpc('getrawtransaction', [txid])) as string;
+			const prevTx = bitcoin.Transaction.fromHex(raw);
+			const vout = prevTx.outs.findIndex((o) =>
+				Buffer.from(o.script).equals(funding.p2wshOutput)
+			);
+			expect(vout, 'funded 2-of-2 output present').to.be.gte(0);
+			const sign = (tx: bitcoin.Transaction, inputIndex: number): Buffer[] => {
+				const sighash = tx.hashForWitnessV0(
+					inputIndex,
+					funding.witnessScript,
+					valueSat,
+					bitcoin.Transaction.SIGHASH_ALL
+				);
+				const sigs = holders.map((h) =>
+					bitcoin.script.signature.encode(
+						Buffer.from(ecc.sign(sighash, h.priv)),
+						bitcoin.Transaction.SIGHASH_ALL
+					)
+				);
+				return [Buffer.alloc(0), sigs[0], sigs[1], funding.witnessScript];
+			};
+			return {
+				sign,
+				input: {
+					prevTx: prevTx.toBuffer(),
+					prevOutputIndex: vout,
+					value: BigInt(valueSat),
+					sequence: 0xfffffffd,
+					confirmed: true,
+					external: true,
+					signWitness: (): Buffer[] => {
+						throw new Error('external input: the owner signs out of band');
+					}
+				}
+			};
+		};
+
+		it('C3: CLN admits a bare 2-of-2 P2WSH third-party input (another channel funding form) and adopts the splice (issue #1922)', async function () {
+			if (skipAll) this.skip();
+			const setup = await setupClnChannel(cln, clnPubkey, 229, 500_000, 0);
+			const node = setup.node;
+			nodes.push(node);
+			const channelId = setup.channelId;
+			const cm = node.getChannelManager();
+			const before = cm.getChannel(channelId)!.getFullState();
+			const oldTxid = Buffer.from(before.fundingTxid!).toString('hex');
+			const oldCap = before.fundingSatoshis;
+
+			const own = await makeRealInput('c3-own', 60_000);
+			const ext = await makeReal2of2Input('c3-2of2', 50_000);
+			const changeScript = bitcoin.payments.p2wpkh({
+				pubkey: Buffer.from(
+					ecc.pointFromScalar(
+						crypto
+							.createHash('sha256')
+							.update('splice-matrix-c3-change')
+							.digest(),
+						true
+					)!
+				)
+			}).output!;
+
+			// CLN judges the P2WSH initiator input at its tx_complete audit.
+			// CLN v26.06.1 admits the program and, contributing nothing, signs
+			// first (the received-first withhold of C2); a refusal would come
+			// as tx_abort with the channel unwinding to NORMAL. The outcome is
+			// what lets a composite select CLN peers (design note section 8),
+			// so a CLN that starts refusing fails this tier by name.
+			const outcome = new Promise<
+				| { kind: 'needed'; externalInputIndices: number[] }
+				| { kind: 'aborted'; reason: string }
+			>((resolve, reject) => {
+				const timer = setTimeout(
+					() =>
+						reject(
+							new Error(
+								'neither splice-txsigs-needed nor splice:aborted within 90 s'
+							)
+						),
+					90_000
+				);
+				node.once(
+					'channel:splice-txsigs-needed',
+					(data: { externalInputIndices: number[] }) => {
+						clearTimeout(timer);
+						resolve({
+							kind: 'needed',
+							externalInputIndices: data.externalInputIndices
+						});
+					}
+				);
+				node.once('splice:aborted', (data: { reason: string }) => {
+					clearTimeout(timer);
+					resolve({ kind: 'aborted', reason: data.reason });
+				});
+			});
+			const prevSplice = spliceTxidHex(node, channelId);
+			const started = node.spliceInWithInputs(
+				channelId,
+				80_000n,
+				[own.input, ext.input],
+				changeScript,
+				1000
+			);
+			expect(started.ok, started.error ?? '').to.equal(true);
+			const result = await outcome;
+
+			if (result.kind === 'aborted') {
+				expect.fail(
+					`CLN refused the 2-of-2 P2WSH initiator input (${result.reason}): composite selection of CLN peers rests on this tier`
+				);
+			}
+
+			const withheld = cm.getChannel(channelId)!.getFullState().spliceInFlight!;
+			expect(withheld.receivedTxSignatures).to.equal(true);
+			expect(withheld.sentTxSignatures).to.equal(false);
+			expect(result.externalInputIndices).to.deep.equal(
+				withheld.externalInputIndices
+			);
+
+			const pending = node.getPendingSpliceTx(channelId)!;
+			expect(pending.owedExternalInputs).to.have.length(1);
+			const owed = pending.owedExternalInputs[0];
+			const delivered = node.provideSpliceExternalWitness(
+				channelId,
+				owed.prevTxid,
+				owed.prevOutputIndex,
+				ext.sign(pending.tx, owed.inputIndex)
+			);
+			expect(delivered.ok, delivered.error ?? '').to.equal(true);
+
+			const spliceTxid = await confirmSplice(node, channelId, prevSplice);
+			await waitForSpliceComplete(node, channelId, oldTxid);
+			const after = cm.getChannel(channelId)!.getFullState();
+			expect(after.fundingSatoshis).to.equal(oldCap + 80_000n);
+			await waitForClnSplicedNormal(node.getNodeId(), spliceTxid);
+			console.log(
+				`    C3 CLN admitted the 2-of-2 P2WSH input and adopted the splice: cap ${oldCap} -> ${after.fundingSatoshis}`
 			);
 		});
 	});

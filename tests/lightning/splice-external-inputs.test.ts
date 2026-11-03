@@ -13,7 +13,9 @@
  *  - the wait survives disconnect and restart, and the reconnect never
  *    retransmits the withheld message,
  *  - the external input is attributed to US, so the peer's own witness stacks
- *    keep their count and placement.
+ *    keep their count and placement,
+ *  - a P2WSH external input is admitted at negotiation and judged on delivery,
+ *    where exactly the bare 2-of-2 funding form verifies (issue #1922).
  */
 
 import { expect } from 'chai';
@@ -366,7 +368,23 @@ interface IExternalWallet {
 	extPrevTx: bitcoin.Transaction;
 	extPriv: Buffer;
 	extPub: Buffer;
+	/** The second key and the witness script of a P2WSH multisig prevout. */
+	extPriv2: Buffer;
+	extPub2: Buffer;
+	witnessScript: Buffer | null;
 }
+
+type ExternalKind =
+	| 'p2wpkh'
+	| 'p2tr'
+	/** A random 32-byte program: nothing can spend it. */
+	| 'p2wsh'
+	/** The bare 2-of-2 of a channel funding output, both keys ours. */
+	| 'p2wsh-2of2'
+	/** A hash-matched multisig that is NOT the bare 2-of-2 form. */
+	| 'p2wsh-1of2'
+	/** A witness version nothing verifies. */
+	| 'witness-v2';
 
 /**
  * A splice-in contribution of one OWN P2WPKH input (real signing closure) plus
@@ -374,7 +392,7 @@ interface IExternalWallet {
  * never call it.
  */
 function makeExternalSpliceWallet(
-	kind: 'p2wpkh' | 'p2tr' | 'p2wsh' = 'p2wpkh'
+	kind: ExternalKind = 'p2wpkh'
 ): IExternalWallet {
 	const ownPriv = crypto.createHash('sha256').update('splice-own-key').digest();
 	const ownPub = Buffer.from(ecc.pointFromScalar(ownPriv, true)!);
@@ -389,16 +407,44 @@ function makeExternalSpliceWallet(
 
 	const extPriv = crypto.randomBytes(32);
 	const extPub = Buffer.from(ecc.pointFromScalar(extPriv, true)!);
+	const extPriv2 = crypto.randomBytes(32);
+	const extPub2 = Buffer.from(ecc.pointFromScalar(extPriv2, true)!);
 	let extScript: Buffer;
+	let witnessScript: Buffer | null = null;
 	if (kind === 'p2wpkh') {
 		extScript = bitcoin.payments.p2wpkh({ pubkey: extPub }).output!;
 	} else if (kind === 'p2tr') {
 		extScript = bitcoin.payments.p2tr({
 			internalPubkey: extPub.subarray(1, 33)
 		}).output!;
+	} else if (kind === 'p2wsh-2of2') {
+		// Exactly what another channel's funding output looks like.
+		const funding = createFundingScript(extPub, extPub2);
+		witnessScript = funding.witnessScript;
+		extScript = funding.p2wshOutput;
+	} else if (kind === 'p2wsh-1of2') {
+		const [k1, k2] = [extPub, extPub2].sort(Buffer.compare);
+		witnessScript = bitcoin.script.compile([
+			bitcoin.opcodes.OP_1,
+			k1,
+			k2,
+			bitcoin.opcodes.OP_2,
+			bitcoin.opcodes.OP_CHECKMULTISIG
+		]);
+		extScript = bitcoin.payments.p2wsh({
+			redeem: { output: witnessScript }
+		}).output!;
+	} else if (kind === 'witness-v2') {
+		// Native segwit (so the tx_add_input receive checks pass) but a
+		// witness version whose spend no validator can judge.
+		extScript = Buffer.concat([
+			Buffer.from([0x52, 0x20]),
+			crypto.randomBytes(32)
+		]);
 	} else {
-		// Native segwit (so the tx_add_input receive checks pass) but a script
-		// kind whose witness no generic validator can judge.
+		// A P2WSH program nothing stands behind: admitted at negotiation like
+		// any P2WSH prevout (the program alone cannot tell it from a funding
+		// output), refused when a witness is delivered for it.
 		extScript = Buffer.concat([
 			Buffer.from([0x00, 0x20]),
 			crypto.randomBytes(32)
@@ -414,6 +460,9 @@ function makeExternalSpliceWallet(
 		extPrevTx,
 		extPriv,
 		extPub,
+		extPriv2,
+		extPub2,
+		witnessScript,
 		changeScript: bitcoin.payments.p2wpkh({ pubkey: ownPub }).output!,
 		inputs: [
 			{
@@ -501,15 +550,73 @@ function signExternalP2wpkh(
 	];
 }
 
+const SECP256K1_N = BigInt(
+	'0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141'
+);
+
+/** The same signature with its s negated: valid for libsecp, non-standard. */
+function highS(sig64: Buffer): Buffer {
+	const s = BigInt('0x' + sig64.subarray(32).toString('hex'));
+	const hi = (SECP256K1_N - s).toString(16).padStart(64, '0');
+	return Buffer.concat([sig64.subarray(0, 32), Buffer.from(hi, 'hex')]);
+}
+
+/**
+ * Sign the external 2-of-2 input over the negotiated tx as the two key
+ * holders would, in the key order the script lists (issue #1922), with the
+ * named defect applied to the stack.
+ */
+function signExternal2of2(
+	record: ISpliceInFlight,
+	wallet: IExternalWallet,
+	defect: {
+		swap?: boolean;
+		wrongKey?: boolean;
+		highS?: boolean;
+		sighashNone?: boolean;
+		script?: Buffer;
+	} = {}
+): Buffer[] {
+	const tx = bitcoin.Transaction.fromHex(record.spliceTxHex);
+	const script = defect.script ?? wallet.witnessScript!;
+	const sighash = tx.hashForWitnessV0(
+		externalIndexOf(record, wallet.extPrevTx),
+		script,
+		Number(EXT_UTXO_SATS),
+		bitcoin.Transaction.SIGHASH_ALL
+	);
+	const holders: Array<[Buffer, Buffer]> = [
+		[wallet.extPub, wallet.extPriv],
+		[wallet.extPub2, wallet.extPriv2]
+	];
+	holders.sort((a, b) => Buffer.compare(a[0], b[0]));
+	const sign = (priv: Buffer): Buffer => {
+		const raw = Buffer.from(ecc.sign(sighash, priv));
+		return bitcoin.script.signature.encode(
+			defect.highS ? highS(raw) : raw,
+			defect.sighashNone
+				? bitcoin.Transaction.SIGHASH_NONE
+				: bitcoin.Transaction.SIGHASH_ALL
+		);
+	};
+	const stranger = crypto.createHash('sha256').update('not-a-holder').digest();
+	let sigs = [
+		sign(holders[0][1]),
+		sign(defect.wrongKey ? stranger : holders[1][1])
+	];
+	if (defect.swap) sigs = [sigs[1], sigs[0]];
+	return [Buffer.alloc(0), sigs[0], sigs[1], script];
+}
+
 /** Drive to the received-first withhold: the acceptor signed, we did not. */
-function driveToWithhold(): {
+function driveToWithhold(kind: ExternalKind = 'p2wpkh'): {
 	pair: IWirePair;
 	wallet: IExternalWallet;
 	record: ISpliceInFlight;
 	extIdx: number;
 } {
 	const pair = makeWirePair();
-	const wallet = makeExternalSpliceWallet();
+	const wallet = makeExternalSpliceWallet(kind);
 	startSpliceIn(pair, wallet);
 	expect(pair.errors).to.deep.equal([]);
 	const record = pair.opener.getFullState().spliceInFlight!;
@@ -766,9 +873,9 @@ describe('Splice external inputs (issue #592)', function () {
 		);
 	});
 
-	it('an external input paying an unverifiable script aborts before any commitment', function () {
+	it('an external input paying an unverifiable witness version aborts before any commitment', function () {
 		const pair = makeWirePair();
-		const wallet = makeExternalSpliceWallet('p2wsh');
+		const wallet = makeExternalSpliceWallet('witness-v2');
 		startSpliceIn(pair, wallet);
 
 		expect(
@@ -787,6 +894,198 @@ describe('Splice external inputs (issue #592)', function () {
 		).to.equal(false);
 		expect(pair.opener.getFullState().spliceInFlight).to.equal(null);
 		expect(pair.broadcasts).to.deep.equal([]);
+	});
+
+	it('a P2WSH external input is admitted at negotiation and judged on delivery (issue #1922)', function () {
+		// A 32-byte program says nothing about the script behind it, so the
+		// negotiation cannot tell a funding output from this unspendable
+		// prevout: both reach the withhold, and the delivered witness decides.
+		const { pair, wallet, record, extIdx } = driveToWithhold('p2wsh');
+		expect(record.receivedTxSignatures).to.equal(true);
+		expect(record.sentTxSignatures).to.equal(false);
+		expect(pair.signals).to.have.length(1);
+
+		const posed = makeExternalSpliceWallet('p2wsh-2of2');
+		const stack = signExternal2of2(record, {
+			...posed,
+			extPrevTx: wallet.extPrevTx
+		});
+		expect(() =>
+			pair.opener.provideSpliceExternalWitness(
+				Buffer.from(wallet.extPrevTx.getHash()),
+				0,
+				stack
+			)
+		).to.throw(
+			/external witness rejected: P2WSH witness script does not match the prevout program/
+		);
+		const still = pair.opener.getFullState().spliceInFlight!;
+		expect(
+			still.ourWalletWitnesses[still.ourWalletInputIndices.indexOf(extIdx)]
+		).to.deep.equal([]);
+		expect(still.sentTxSignatures).to.equal(false);
+		expect(pair.broadcasts).to.deep.equal([]);
+	});
+
+	it('a bare 2-of-2 P2WSH external input completes once both signatures are delivered (issue #1922)', function () {
+		const { pair, wallet, record, extIdx } = driveToWithhold('p2wsh-2of2');
+		expect(pair.errors).to.deep.equal([]);
+		expect(record.externalInputIndices).to.deep.equal([extIdx]);
+
+		const release = pair.opener.provideSpliceExternalWitness(
+			Buffer.from(wallet.extPrevTx.getHash()),
+			0,
+			signExternal2of2(record, wallet)
+		);
+		pair.enqueue(pair.acceptor, pair.opener, release);
+		pair.pump();
+		expect(pair.errors).to.deep.equal([]);
+
+		// Our side released, and the ACCEPTOR verified the 2-of-2 witness that
+		// rode in our tx_signatures: both sides hold a fully signed record and
+		// broadcast the same transaction.
+		expect(pair.opener.getFullState().spliceInFlight!.fullySigned).to.equal(
+			true
+		);
+		expect(pair.acceptor.getFullState().spliceInFlight!.fullySigned).to.equal(
+			true
+		);
+		expect(pair.broadcasts).to.have.length(2);
+		expect(pair.broadcasts[0].equals(pair.broadcasts[1])).to.equal(true);
+		const broadcast = bitcoin.Transaction.fromBuffer(pair.broadcasts[0]);
+		const witness = broadcast.ins[extIdx].witness;
+		expect(witness).to.have.length(4);
+		expect(witness[0]).to.have.length(0);
+		expect(witness[3].equals(wallet.witnessScript!)).to.equal(true);
+		// The transaction is what the record says it is, and the splice is
+		// waiting for its lock on both sides.
+		expect(Buffer.from(broadcast.getHash()).equals(record.spliceTxid)).to.equal(
+			true
+		);
+		expect(pair.opener.isSplicePendingLock()).to.equal(true);
+		expect(pair.acceptor.isSplicePendingLock()).to.equal(true);
+	});
+
+	it('every other P2WSH witness shape is refused on delivery, and the good one still releases (issue #1922)', function () {
+		const { pair, wallet, record, extIdx } = driveToWithhold('p2wsh-2of2');
+		const extTxid = Buffer.from(wallet.extPrevTx.getHash());
+		const good = signExternal2of2(record, wallet);
+		const deliver = (stack: Buffer[]): void => {
+			pair.opener.provideSpliceExternalWitness(extTxid, 0, stack);
+		};
+		const shape =
+			/external witness rejected: P2WSH witness must be \[<>, signature, signature, script\] \(bare 2-of-2\)/;
+
+		// Wrong stack shapes.
+		expect(() => deliver([good[1], wallet.extPub])).to.throw(shape);
+		expect(() => deliver([good[1], good[2], good[3]])).to.throw(shape);
+		expect(() => deliver([...good, Buffer.alloc(1)])).to.throw(shape);
+		expect(() =>
+			deliver([Buffer.from([0x01]), good[1], good[2], good[3]])
+		).to.throw(shape);
+		// A script that is not the one behind the program.
+		expect(() =>
+			deliver(
+				signExternal2of2(record, wallet, { script: crypto.randomBytes(71) })
+			)
+		).to.throw(/does not match the prevout program/);
+		// Right script, wrong signatures.
+		expect(() =>
+			deliver(signExternal2of2(record, wallet, { swap: true }))
+		).to.throw(/2-of-2 signature 1 does not verify against its key/);
+		expect(() =>
+			deliver(signExternal2of2(record, wallet, { wrongKey: true }))
+		).to.throw(/2-of-2 signature 2 does not verify against its key/);
+		expect(() =>
+			deliver(signExternal2of2(record, wallet, { highS: true }))
+		).to.throw(/2-of-2 signature 1 does not verify against its key/);
+		expect(() =>
+			deliver(signExternal2of2(record, wallet, { sighashNone: true }))
+		).to.throw(/2-of-2 signature is not SIGHASH_ALL/);
+
+		// Nothing moved: the slot is still a hole and nothing left the node.
+		const still = pair.opener.getFullState().spliceInFlight!;
+		expect(
+			still.ourWalletWitnesses[still.ourWalletInputIndices.indexOf(extIdx)]
+		).to.deep.equal([]);
+		expect(still.sentTxSignatures).to.equal(false);
+		expect(pair.broadcasts).to.deep.equal([]);
+
+		pair.enqueue(
+			pair.acceptor,
+			pair.opener,
+			pair.opener.provideSpliceExternalWitness(extTxid, 0, good)
+		);
+		pair.pump();
+		expect(pair.errors).to.deep.equal([]);
+		expect(pair.acceptor.getFullState().spliceInFlight!.fullySigned).to.equal(
+			true
+		);
+	});
+
+	it('a hash-matched multisig that is not the bare 2-of-2 is refused (issue #1922)', function () {
+		// A 1-of-2 behind the program is spendable with ONE signature, which
+		// is exactly the kind of script the acceptor must not take on faith:
+		// the form is checked, not just the hash and the signature count.
+		const { pair, wallet, record, extIdx } = driveToWithhold('p2wsh-1of2');
+		const extTxid = Buffer.from(wallet.extPrevTx.getHash());
+		const posed = signExternal2of2(record, wallet);
+		expect(() =>
+			pair.opener.provideSpliceExternalWitness(extTxid, 0, posed)
+		).to.throw(
+			/external witness rejected: P2WSH witness script is not a bare 2-of-2/
+		);
+		// The 1-of-2's own valid spend is the wrong shape to begin with.
+		expect(() =>
+			pair.opener.provideSpliceExternalWitness(extTxid, 0, [
+				Buffer.alloc(0),
+				posed[1],
+				posed[3]
+			])
+		).to.throw(/bare 2-of-2/);
+		const still = pair.opener.getFullState().spliceInFlight!;
+		expect(
+			still.ourWalletWitnesses[still.ourWalletInputIndices.indexOf(extIdx)]
+		).to.deep.equal([]);
+		expect(pair.broadcasts).to.deep.equal([]);
+	});
+
+	it('the acceptor verifies the 2-of-2 witness in our tx_signatures itself (issue #1922)', function () {
+		const { pair, wallet, record, extIdx } = driveToWithhold('p2wsh-2of2');
+		const extPos = record.ourWalletInputIndices.indexOf(extIdx);
+		// An adversarial wire swaps the two signatures after our own validator
+		// accepted the stack; the acceptor must judge it again, not trust the
+		// initiator's word for it.
+		pair.intercept(MessageType.TX_SIGNATURES, (payload) => {
+			const msg = decodeTxSignaturesMessage(payload);
+			const stack = msg.witnesses[extPos];
+			if (!stack || stack.length !== 4) return payload;
+			msg.witnesses[extPos] = [stack[0], stack[2], stack[1], stack[3]];
+			return encodeTxSignaturesMessage(msg);
+		});
+		pair.enqueue(
+			pair.acceptor,
+			pair.opener,
+			pair.opener.provideSpliceExternalWitness(
+				Buffer.from(wallet.extPrevTx.getHash()),
+				0,
+				signExternal2of2(record, wallet)
+			)
+		);
+		pair.pump();
+		expect(
+			pair.errorsFrom.some(
+				(e) =>
+					e.from === pair.acceptor &&
+					/2-of-2 signature 1 does not verify/.test(e.message)
+			),
+			pair.errors.join(' | ')
+		).to.equal(true);
+		expect(pair.acceptor.getFullState().spliceInFlight!.fullySigned).to.equal(
+			false
+		);
+		// Only our own copy went out; the acceptor published nothing.
+		expect(pair.broadcasts).to.have.length(1);
 	});
 
 	it('survives a restart: no retransmit, a fresh reminder, delivery completes', function () {

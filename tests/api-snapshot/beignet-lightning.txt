@@ -2102,7 +2102,7 @@ function channel.deriveV2ChannelId(revocationBasepointA: Buffer, revocationBasep
 function channel.deriveV2TemporaryChannelId(openerRevocationBasepoint: Buffer): Buffer
 function channel.dualFundingContributionWeight(inputCount: number, initiator: boolean): number
 function channel.dualFundingTopUpWeight(inputCount: number): number
-function channel.estimateSpliceTxWeight(opts: { walletInputCount: number; fundingScriptLen?: number; changeScriptLen?: number; destinationScriptLen?: number; }): number
+function channel.estimateSpliceTxWeight(opts: { walletInputCount: number; fundingInputCount?: number; fundingScriptLen?: number; changeScriptLen?: number; destinationScriptLen?: number; }): number
 function channel.filterUntrimmedHtlcs<T extends { amount: bigint; direction: channel.HtlcDirection; }>(htlcOutputs: T[], dustLimitSat: bigint, feeratePerKw: number, isAnchor: boolean): T[]
 function channel.funderCommitmentCostSats(feeratePerKw: number, numUntrimmedHtlcs: number, channelType: Buffer | null): bigint
 function channel.generateTemporaryChannelId(): Buffer
@@ -2990,6 +2990,7 @@ member features.Feature.GOSSIP_QUERIES_EX = 10
 member features.Feature.KEYSEND = 54
 member features.Feature.LARGE_CHANNELS = 18
 member features.Feature.ONION_MESSAGES = 38
+member features.Feature.OPTION_COMPOSITE_SPLICE_INPUTS = 454
 member features.Feature.OPTION_FF_CONCURRENT = 442
 member features.Feature.OPTION_FF_RECEIVE = 440
 member features.Feature.OPTION_TAPROOT = 180

@@ -47,7 +47,14 @@ export function outputWeight(scriptLen: number): number {
  * later drops a dust change output — a slight, safe overestimate.
  */
 export function estimateSpliceTxWeight(opts: {
+	/** Wallet inputs priced as P2WPKH. */
 	walletInputCount: number;
+	/**
+	 * 2-of-2 funding inputs besides the shared one this channel always
+	 * spends: other channels' funding outpoints riding along (issue #1922),
+	 * each SHARED_FUNDING_INPUT_WEIGHT. Default 0.
+	 */
+	fundingInputCount?: number;
 	fundingScriptLen?: number;
 	changeScriptLen?: number;
 	destinationScriptLen?: number;
@@ -56,6 +63,7 @@ export function estimateSpliceTxWeight(opts: {
 		SPLICE_TX_BASE_WEIGHT +
 		SHARED_FUNDING_INPUT_WEIGHT +
 		opts.walletInputCount * P2WPKH_INPUT_WEIGHT +
+		(opts.fundingInputCount ?? 0) * SHARED_FUNDING_INPUT_WEIGHT +
 		outputWeight(opts.fundingScriptLen ?? 34);
 	if (opts.changeScriptLen !== undefined) {
 		weight += outputWeight(opts.changeScriptLen);

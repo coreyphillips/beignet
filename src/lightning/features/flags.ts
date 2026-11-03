@@ -91,8 +91,9 @@ export enum Feature {
 	 * bit pending a spec assignment.
 	 */
 	OPTION_WILL_FUND = 112,
-	// beignet's own experimental bits sit in the 440-445 block. None may share
-	// a bit with another implementation or the bLIP-2 registry: a peer that
+	// beignet's own experimental bits sit in the 440-445 block and on the
+	// 454/455 pair (446-453 are reserved for the taproot asset channel work).
+	// None may share a bit with another implementation or the bLIP-2 registry: a peer that
 	// reads our bit as its own feature sends messages we do not know, and we
 	// disconnect (560-563 collided with eclair's on-the-fly funding, #1886).
 	// The foreign table is in tests/lightning/feature-bit-collisions.test.ts.
@@ -120,7 +121,19 @@ export enum Feature {
 	 * option_ff_receive and option_quiesce. Advertised by default when both
 	 * dependencies are present; fforConcurrent.enabled can disable it.
 	 */
-	OPTION_FF_CONCURRENT = 442
+	OPTION_FF_CONCURRENT = 442,
+	/**
+	 * Composite splice inputs (issue #1922, docs/MULTI-CHANNEL-SPLICE-OUT.md
+	 * section 8), bits 454/455 in the experimental range. As a splice
+	 * acceptor this node admits an initiator input that spends a bare 2-of-2
+	 * P2WSH output, the funding output of another channel, and verifies both
+	 * signatures of its witness before accepting it. A wallet splicing out of
+	 * several channels in one transaction selects only peers that advertise
+	 * the odd bit; a peer without it still refuses such an input at
+	 * tx_complete, so the bit is what makes the selection safe, not what makes
+	 * the input acceptable.
+	 */
+	OPTION_COMPOSITE_SPLICE_INPUTS = 454
 }
 
 /**
@@ -398,5 +411,6 @@ export function implementedFeatures(): FeatureFlags {
 	flags.setOptional(Feature.PROVIDE_STORAGE);
 	flags.setOptional(Feature.OPTION_FF_RECEIVE);
 	flags.setOptional(Feature.OPTION_FF_CONCURRENT);
+	flags.setOptional(Feature.OPTION_COMPOSITE_SPLICE_INPUTS);
 	return flags;
 }

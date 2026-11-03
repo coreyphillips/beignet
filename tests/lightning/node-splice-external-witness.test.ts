@@ -271,15 +271,15 @@ describe('LightningNode splice external-input surface (issue #592)', function ()
 
 		// An EXTERNAL input whose witness could never be verified is refused
 		// here, not after the negotiation has committed to it.
-		const p2wsh = Buffer.concat([
-			Buffer.from([0x00, 0x20]),
+		const witnessV2 = Buffer.concat([
+			Buffer.from([0x52, 0x20]),
 			crypto.randomBytes(32)
 		]);
 		expect(() =>
 			node.spliceInWithInputs(
 				channelId,
 				amount,
-				[makeInput(200_000, p2wsh, true)],
+				[makeInput(200_000, witnessV2, true)],
 				changeScript()
 			)
 		).to.throw(/unsupported output type/);
@@ -295,8 +295,15 @@ describe('LightningNode splice external-input surface (issue #592)', function ()
 		// Every refusal so far left the channel where it was.
 		expect(channel.getState()).to.equal(ChannelState.NORMAL);
 
-		// The same script is fine for an input we sign ourselves, and an
-		// accepted contribution reaches the negotiation (quiescence first).
+		// A P2WSH EXTERNAL input is admitted (issue #1922): the one P2WSH form
+		// the witness validator accepts is another channel's bare 2-of-2
+		// funding output, and the program alone cannot tell it apart, so the
+		// judgment waits for the delivered witness. The accepted contribution
+		// reaches the negotiation (quiescence first).
+		const p2wsh = Buffer.concat([
+			Buffer.from([0x00, 0x20]),
+			crypto.randomBytes(32)
+		]);
 		const outbound: number[] = [];
 		// eslint-disable-next-line @typescript-eslint/no-explicit-any
 		(node as any).channelManager.on(
@@ -306,7 +313,7 @@ describe('LightningNode splice external-input surface (issue #592)', function ()
 		const started = node.spliceInWithInputs(
 			channelId,
 			amount,
-			[makeInput(200_000, p2wsh)],
+			[makeInput(200_000, p2wsh, true)],
 			changeScript()
 		);
 		expect(started.ok).to.equal(true);

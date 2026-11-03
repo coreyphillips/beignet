@@ -716,7 +716,14 @@ const outResult = node.spliceOut(channelId, 50_000n, 253);
 
 An input someone else owns can fund a v2 open or a splice-in. It is contributed
 and negotiated like any of ours, but its `signWitness` is never called, our
-`tx_signatures` is withheld, and the finished witness arrives out of band.
+`tx_signatures` is withheld, and the finished witness arrives out of band. The
+delivered witness is verified before it is stored, so the input must pay a
+P2WPKH or P2TR output (key-spend), or, in a splice only, the bare 2-of-2 P2WSH
+of a channel funding output, whose witness `[<>, sig, sig, script]` is checked
+signature by signature (issue #1922); every other prevout is refused before the
+negotiation commits to it. A peer that admits such a 2-of-2 input advertises
+`Feature.OPTION_COMPOSITE_SPLICE_INPUTS` (bits 454/455), which beignet sets by
+default.
 
 ```typescript
 // Register the inputs ahead of the negotiation, bypassing wallet selection.

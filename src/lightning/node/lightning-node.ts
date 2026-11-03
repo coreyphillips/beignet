@@ -14332,17 +14332,21 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			}
 			if (input.external) {
 				// Its witness will be judged by _validateWitnessForInput on
-				// delivery, which can only verify P2WPKH and P2TR key-spends.
-				// Refuse here rather than after the negotiation has committed to
-				// a transaction whose witness we could never accept.
+				// delivery, which verifies P2WPKH, P2TR key-spends and the bare
+				// 2-of-2 P2WSH form of a channel funding output (issue #1922).
+				// Refuse any other prevout here rather than after the
+				// negotiation has committed to a transaction whose witness we
+				// could never accept.
 				const script = prevTx.outs[input.prevOutputIndex].script;
 				const isP2wpkh =
 					script.length === 22 && script[0] === 0x00 && script[1] === 0x14;
+				const isP2wsh =
+					script.length === 34 && script[0] === 0x00 && script[1] === 0x20;
 				const isP2tr =
 					script.length === 34 && script[0] === 0x51 && script[1] === 0x20;
-				if (!isP2wpkh && !isP2tr) {
+				if (!isP2wpkh && !isP2wsh && !isP2tr) {
 					throw new InvalidSpliceError(
-						`${where} is external and pays an unsupported output type (only P2WPKH and P2TR witnesses can be verified)`
+						`${where} is external and pays an unsupported output type (only P2WPKH, P2TR and 2-of-2 P2WSH witnesses can be verified)`
 					);
 				}
 			}
@@ -31025,6 +31029,11 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		flags.setOptional(Feature.KEYSEND);
 		flags.setOptional(Feature.QUIESCE);
 		flags.setOptional(Feature.SPLICE);
+		// Composite splice inputs (issue #1922): as a splice acceptor this node
+		// admits a bare 2-of-2 P2WSH initiator input once both of its
+		// signatures verify, so the capability is always advertised. An
+		// initiator selects only peers that advertise it.
+		flags.setOptional(Feature.OPTION_COMPOSITE_SPLICE_INPUTS);
 		// Anchors are the default channel type (LND/CLN/Eclair all default to them).
 		// Advertised so peers may propose anchor channels and so we negotiate them.
 		flags.setOptional(Feature.ANCHOR_ZERO_FEE_HTLC);
