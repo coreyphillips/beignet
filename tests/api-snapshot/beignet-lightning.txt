@@ -1185,6 +1185,7 @@ method channel.Channel.setDualFundingContribution(inputs: channel.ISpliceWalletI
 method channel.Channel.setFforCapabilities(concurrentNegotiated: boolean): void
 method channel.Channel.setFforContext(ctx: ffor.IFforChannelContext): void
 method channel.Channel.setFundingOutpoint(fundingTxid: Buffer, fundingOutputIndex: number): void
+method channel.Channel.setFundingTxHex(txHex: string): boolean
 method channel.Channel.setLocalNodeIdLower(lower: boolean): void
 method channel.Channel.setMaxFundingSatoshis(max: bigint): void
 method channel.Channel.setSigner(signer: keys.ISigner): void
@@ -1626,6 +1627,7 @@ property channel.IChannelState.fundingLocktime: number
 property channel.IChannelState.fundingMissingSinceHeight?: number
 property channel.IChannelState.fundingOutputIndex: number
 property channel.IChannelState.fundingSatoshis: bigint
+property channel.IChannelState.fundingTxHex?: string
 property channel.IChannelState.fundingTxIndex: number
 property channel.IChannelState.fundingTxid: Buffer | null
 property channel.IChannelState.fundingUnaccounted?: boolean
@@ -5642,6 +5644,7 @@ method node.LightningNode.getFforVoucherReceipts(channelIdHex?: string): { chann
 method node.LightningNode.getFforWitnessService(): ffor.FforWitnessService | null
 method node.LightningNode.getForwardingSummary(options?: { since?: number; }): storage.IForwardingSummary
 method node.LightningNode.getFundingAddress(): string
+method node.LightningNode.getFundingTxHex(channelId: Buffer): Promise<string | null>
 method node.LightningNode.getGossipSyncState(pubkey: string): string | null
 method node.LightningNode.getGraph(): gossip.NetworkGraph
 method node.LightningNode.getGraphRestoreStats(): node.IGraphRestoreStats | null
@@ -7627,6 +7630,7 @@ property storage.ISerializedChannelState.fundingLocktime?: number
 property storage.ISerializedChannelState.fundingMissingSinceHeight?: number
 property storage.ISerializedChannelState.fundingOutputIndex: number
 property storage.ISerializedChannelState.fundingSatoshis: string
+property storage.ISerializedChannelState.fundingTxHex?: string
 property storage.ISerializedChannelState.fundingTxIndex: number
 property storage.ISerializedChannelState.fundingTxid: string | null
 property storage.ISerializedChannelState.fundingUnaccounted?: boolean

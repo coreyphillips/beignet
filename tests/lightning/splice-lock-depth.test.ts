@@ -787,6 +787,10 @@ describe('Splice lock depth on a zero-conf channel (issue #760)', function () {
 		// The chain reaches depth on both sides: the node stamps the record
 		// confirmed and sends splice_locked. The splice completes.
 		const spliceTxid = Buffer.from(openerRecord.spliceTxid);
+		const spliceTxHex = openerRecord.spliceTxHex;
+		expect(
+			bitcoin.Transaction.fromHex(spliceTxHex).getHash().equals(spliceTxid)
+		).to.equal(true);
 		pair.opener.markSpliceConfirmed();
 		pair.enqueue(pair.acceptor, pair.opener, pair.opener.sendSpliceLocked());
 		pair.pump();
@@ -819,6 +823,9 @@ describe('Splice lock depth on a zero-conf channel (issue #760)', function () {
 			expect(ch.getState()).to.equal(ChannelState.NORMAL);
 			expect(state.spliceInFlight).to.equal(null);
 			expect(state.fundingTxid!.equals(spliceTxid)).to.equal(true);
+			// The adopted funding keeps its bytes for life (issue #1922 step
+			// 5a): the record that held them is gone, the field carries them.
+			expect(state.fundingTxHex).to.equal(spliceTxHex);
 			// The record was confirmed at adoption: no rebroadcast is owed.
 			expect(state.unconfirmedSpliceTxs ?? []).to.have.length(0);
 			expect(ch.buildSpliceRebroadcastActions()).to.have.length(0);
@@ -856,6 +863,14 @@ describe('Splice lock depth on a zero-conf channel (issue #760)', function () {
 			// Locked at zero confirmations: the BOLT 2 broadcast obligation
 			// stays (issue #756).
 			expect(state.unconfirmedSpliceTxs).to.have.length(1);
+			// And the durable funding hex is the same transaction (issue #1922
+			// step 5a).
+			expect(state.fundingTxHex).to.equal(state.unconfirmedSpliceTxs![0].txHex);
+			expect(
+				bitcoin.Transaction.fromHex(state.fundingTxHex!)
+					.getHash()
+					.equals(state.fundingTxid!)
+			).to.equal(true);
 		}
 	});
 

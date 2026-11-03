@@ -730,6 +730,9 @@ node.spliceInWithInputs(channelId, amountSats, inputs, changeScript, 253);
 // full prevout set BIP 341 commits to, and the outpoints still owed.
 node.getPendingV2FundingTx(channelId);  // v2 open,   issue #612
 node.getPendingSpliceTx(channelId);     // splice-in, issue #592
+// The bytes of a channel's current funding transaction, fetched from the
+// chain and persisted the first time a channel lacks them (issue #1922).
+await node.getFundingTxHex(channelId);
 
 // Where the witness goes back. The last one released the withheld
 // tx_signatures; `sendsWithheld` says it did not actually reach the peer.

@@ -6,6 +6,7 @@
 
 import { expect } from 'chai';
 import crypto from 'crypto';
+import * as bitcoin from 'bitcoinjs-lib';
 import { Channel } from '../../src/lightning/channel/channel';
 import { createOpenerState } from '../../src/lightning/channel/channel-state';
 import {
@@ -158,14 +159,55 @@ describe('Channel named state transitions (issue #1699)', () => {
 		expect(open.getState()).to.equal(ChannelState.NORMAL);
 	});
 
-	it('retainFundingPayload is what clearRetainedFundingPayload retires', () => {
+	it('retainFundingPayload is what clearRetainedFundingPayload retires, and the durable funding hex stays', () => {
 		const channel = makeChannel();
 		expect(
 			changedFields(channel, () => channel.retainFundingPayload('0200'))
-		).to.deep.equal(['pendingFundingTxHex']);
+		).to.deep.equal(['fundingTxHex', 'pendingFundingTxHex']);
 		expect(channel.getFullState().pendingFundingTxHex).to.equal('0200');
+		expect(channel.getFullState().fundingTxHex).to.equal('0200');
 		expect(channel.clearRetainedFundingPayload()).to.equal(true);
 		expect('pendingFundingTxHex' in channel.getFullState()).to.equal(false);
+		// Issue #1922 step 5a: the bytes outlive the broadcast obligation.
+		expect(channel.getFullState().fundingTxHex).to.equal('0200');
+	});
+
+	it('setFundingTxHex changes exactly fundingTxHex, and only for the transaction that created the funding', () => {
+		const tx = new bitcoin.Transaction();
+		tx.version = 2;
+		tx.addInput(crypto.randomBytes(32), 0);
+		tx.addOutput(
+			Buffer.concat([Buffer.from([0x00, 0x20]), crypto.randomBytes(32)]),
+			1_000_000
+		);
+		const channel = makeChannel();
+		// No funding txid yet: nothing to check the bytes against.
+		expect(channel.setFundingTxHex(tx.toHex())).to.equal(false);
+		expect('fundingTxHex' in channel.getFullState()).to.equal(false);
+
+		writableState(channel).fundingTxid = tx.getHash();
+		writableState(channel).fundingOutputIndex = 0;
+		expect(channel.setFundingTxHex('zz')).to.equal(false);
+		const other = tx.clone();
+		other.locktime = 1;
+		expect(channel.setFundingTxHex(other.toHex()), 'a different txid').to.equal(
+			false
+		);
+		writableState(channel).fundingOutputIndex = 1;
+		expect(
+			channel.setFundingTxHex(tx.toHex()),
+			'the funding output index must exist'
+		).to.equal(false);
+		writableState(channel).fundingOutputIndex = 0;
+		expect('fundingTxHex' in channel.getFullState()).to.equal(false);
+
+		expect(
+			changedFields(channel, () =>
+				expect(channel.setFundingTxHex(tx.toHex())).to.equal(true)
+			)
+		).to.deep.equal(['fundingTxHex']);
+		expect(channel.getFullState().fundingTxHex).to.equal(tx.toHex());
+		expect(channel.setFundingTxHex(tx.toHex()), 'unchanged').to.equal(false);
 	});
 
 	it('stampFundingBroadcastHeight stamps once, and never without a chain tip', () => {

@@ -390,6 +390,7 @@ export interface ISerializedChannelState {
 	pushMsat: string;
 	fundingTxid: string | null;
 	pendingFundingTxHex?: string;
+	fundingTxHex?: string;
 	fundingMissingSinceHeight?: number;
 	/**
 	 * Issue #593: the funding is unaccounted for on chain and the channel is
@@ -962,6 +963,7 @@ export function serializeChannelState(
 		pushMsat: bigintToStr(s.pushMsat),
 		fundingTxid: bufToHex(s.fundingTxid),
 		pendingFundingTxHex: s.pendingFundingTxHex,
+		fundingTxHex: s.fundingTxHex,
 		fundingMissingSinceHeight: s.fundingMissingSinceHeight,
 		fundingUnaccounted: s.fundingUnaccounted,
 		hasBeenSpliced: s.hasBeenSpliced,
@@ -1595,6 +1597,7 @@ export function deserializeChannelState(
 		pushMsat: strToBigint(s.pushMsat),
 		fundingTxid: hexToBuf(s.fundingTxid),
 		pendingFundingTxHex: s.pendingFundingTxHex,
+		fundingTxHex: s.fundingTxHex,
 		fundingMissingSinceHeight: s.fundingMissingSinceHeight,
 		fundingUnaccounted: s.fundingUnaccounted,
 		hasBeenSpliced: s.hasBeenSpliced,
