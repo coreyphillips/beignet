@@ -19538,7 +19538,21 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			// refused part cannot be rolled back once earlier parts are out.
 			// Same selection rule as sendPaymentToRoute.
 			const outChannel = this.firstHopChannelFor(partRoute);
-			if (!outChannel) continue;
+			if (!outChannel) {
+				// No channel to the first hop takes new HTLCs any more: a close,
+				// void or disconnect landed between planning and dispatch. The
+				// part cannot leave, so the payment is over here, like a part the
+				// channel refuses below. Skipping the part instead sent the rest
+				// for the payee to hold until its MPP timeout, and with every part
+				// skipped left a PENDING record nothing could resolve (#1941).
+				this.failMppDispatch(
+					payment,
+					`Local failure: MPP part's first-hop channel is gone (${hops[0].shortChannelId.toString(
+						'hex'
+					)})`
+				);
+				return payment;
+			}
 
 			const channelId = outChannel.getChannelId()!;
 			const cltvExpiry = hops[0].outgoingCltvValue + baseHeight;
@@ -19593,37 +19607,14 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 					  )
 					: { ok: false as const, error: ceilingProblem };
 			if (!result.ok) {
-				// No rollback of the parts already dispatched: BOLT 2 gives no way to
-				// withdraw an update_add_htlc we have sent. Only the downstream peer
-				// can fail it back, or it times out. The loop that used to stand here
-				// called failHtlc with these OFFERED ids and the default RECEIVED
-				// direction, which at best errored and at worst cancelled an unrelated
-				// inbound HTLC that happened to share the numeric id. It was
-				// unreachable until addHtlc started reporting refusals honestly.
-				//
-				// The dispatched parts settle themselves: the payee cannot claim an
-				// incomplete MPP set, so it fails them back on its own MPP timeout.
-				this.htlcPaymentMap.delete(mppHtlcKey);
 				mppState.parts.pop();
-
-				// Part failed to dispatch — mark payment failed
-				payment.status = PaymentStatus.FAILED;
-				payment.completedAt = Date.now();
-				payment.failureReason = boundedFailureReason(
+				this.failMppDispatch(
+					payment,
 					`Local failure: MPP part could not be dispatched (${
 						result.error ?? 'unknown reason'
-					})`
+					})`,
+					mppHtlcKey
 				);
-				this.outboundMppPayments.delete(hashHex);
-				// The mapping release and the FAILED record are one journaled
-				// transition, mirroring the single-path local-failure cleanup.
-				const mppFailMutations: RecoveryMutation[] = [
-					{ type: 'delete_htlc_payment_mapping', htlcKey: mppHtlcKey }
-				];
-				const mppFailPayment = this.paymentMutation(paymentHash);
-				if (mppFailPayment) mppFailMutations.push(mppFailPayment);
-				this.commitMutations('release failed MPP mapping', mppFailMutations);
-				this.emit('payment:failed', payment);
 				return payment;
 			}
 		}
@@ -19637,6 +19628,51 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		}
 
 		return payment;
+	}
+
+	/**
+	 * End an MPP payment whose part cannot leave: no channel to its first hop
+	 * takes HTLCs, the CLTV ceiling refuses it, or the channel declines the
+	 * add. The record is FAILED with `reason`, journaled in one transition
+	 * with the release of `htlcKey` (the mapping written for a part the
+	 * channel refused; a part that never resolved a channel wrote none), and
+	 * payment:failed fires once.
+	 *
+	 * No rollback of the parts already dispatched: BOLT 2 gives no way to
+	 * withdraw an update_add_htlc we have sent. Only the downstream peer can
+	 * fail it back, or it times out. The loop that used to stand here called
+	 * failHtlc with these OFFERED ids and the default RECEIVED direction,
+	 * which at best errored and at worst cancelled an unrelated inbound HTLC
+	 * that happened to share the numeric id. It was unreachable until addHtlc
+	 * started reporting refusals honestly.
+	 *
+	 * The dispatched parts settle themselves: the payee cannot claim an
+	 * incomplete MPP set, so it fails them back on its own MPP timeout. Each
+	 * lands in settleOwnPaymentFailure, which releases its mapping and leaves
+	 * an already FAILED record's status, timestamp and event alone. The retry
+	 * context stays: a later send of the hash sizes its settled row against
+	 * that context's invoice (issue #1189), and the give-up path drops the
+	 * context when the last dispatched part fails back.
+	 */
+	private failMppDispatch(
+		payment: IPaymentInfo,
+		reason: string,
+		htlcKey?: string
+	): void {
+		const hashHex = payment.paymentHash.toString('hex');
+		payment.status = PaymentStatus.FAILED;
+		payment.completedAt = Date.now();
+		payment.failureReason = boundedFailureReason(reason);
+		this.outboundMppPayments.delete(hashHex);
+		const mutations: RecoveryMutation[] = [];
+		if (htlcKey !== undefined) {
+			this.htlcPaymentMap.delete(htlcKey);
+			mutations.push({ type: 'delete_htlc_payment_mapping', htlcKey });
+		}
+		const paymentMutation = this.paymentMutation(payment.paymentHash);
+		if (paymentMutation) mutations.push(paymentMutation);
+		this.commitMutations('fail MPP dispatch', mutations);
+		this.emit('payment:failed', payment);
 	}
 
 	// ─────────────── HTLC Event Handlers ───────────────
