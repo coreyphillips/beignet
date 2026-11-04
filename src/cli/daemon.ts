@@ -24,7 +24,10 @@ import {
 	parseRecoveryMode,
 	spliceRefusalError
 } from './beignet-node';
-import { parseGuardianEntry } from '../lightning/recovery';
+import {
+	GUARDIAN_RECORD_LIMIT_FLOOR_BYTES,
+	parseGuardianEntry
+} from '../lightning/recovery';
 import type { ILogger } from '../logger';
 import { createConsoleLogger } from '../logger';
 import type { BeignetErrorCodeValue } from './errors';
@@ -1162,24 +1165,28 @@ async function bootDaemon(
 	) {
 		throw new BeignetError('INVALID_PARAMS', 'guardianToken must be a string');
 	}
-	for (const [name, value, max] of [
+	// A hosted guardian below the record floor would be refused by every
+	// node that configures it (issue #1954), so it is a configuration error.
+	for (const [name, value, min, max] of [
 		[
 			'guardianMaxBytesPerSet',
 			opts.guardianMaxBytesPerSet,
+			1,
 			Number.MAX_SAFE_INTEGER
 		],
-		['guardianMaxSets', opts.guardianMaxSets, 65535],
+		['guardianMaxSets', opts.guardianMaxSets, 1, 65535],
 		[
 			'guardianMaxCiphertextBytes',
 			opts.guardianMaxCiphertextBytes,
+			GUARDIAN_RECORD_LIMIT_FLOOR_BYTES,
 			16 * 1024 * 1024
 		]
-	] as Array<[string, number | undefined, number]>) {
+	] as Array<[string, number | undefined, number, number]>) {
 		if (value === undefined) continue;
-		if (!Number.isInteger(value) || value < 1 || value > max) {
+		if (!Number.isInteger(value) || value < min || value > max) {
 			throw new BeignetError(
 				'INVALID_PARAMS',
-				`${name} must be an integer between 1 and ${max}`
+				`${name} must be an integer between ${min} and ${max}`
 			);
 		}
 	}

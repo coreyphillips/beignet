@@ -6510,6 +6510,7 @@ const recovery.GUARDIAN_HOST_RECORD_OVERHEAD_BYTES: number
 const recovery.GUARDIAN_HOST_REGISTRATION_BYTES: number
 const recovery.GUARDIAN_HTTP_BASE_PATH = "/beignet-guardian/v1"
 const recovery.GUARDIAN_PROTOCOL_VERSION = 1
+const recovery.GUARDIAN_RECORD_LIMIT_FLOOR_BYTES: number
 const recovery.GUARDIAN_RECORD_OVERHEAD_BYTES: number
 const recovery.GUARDIAN_REGISTRATION_BYTES: number
 const recovery.GUARDIAN_RETAIN_FLOOR_BYTES: number
@@ -6998,7 +6999,7 @@ interface recovery.IGuardianReplicationEvent
 property recovery.IGuardianReplicationEvent.detail: string
 property recovery.IGuardianReplicationEvent.receipts?: number
 property recovery.IGuardianReplicationEvent.sequence?: bigint
-property recovery.IGuardianReplicationEvent.type: 'namespace:registered' | 'namespace:exists' | 'namespace:no-quorum' | 'namespace:inconsistent' | 'namespace:not-held' | 'record:replicated' | 'record:under-replicated' | 'record:rejected' | 'record:conflict' | 'record:too-large' | 'record:quota-refused' | 'writer:fenced' | 'writer:supersession-unproven'
+property recovery.IGuardianReplicationEvent.type: 'namespace:registered' | 'namespace:exists' | 'namespace:no-quorum' | 'namespace:inconsistent' | 'namespace:not-held' | 'record:replicated' | 'record:under-replicated' | 'record:rejected' | 'record:conflict' | 'record:too-large' | 'record:limit-too-small' | 'record:quota-refused' | 'writer:fenced' | 'writer:supersession-unproven'
 interface recovery.IGuardianResolver
 method recovery.IGuardianResolver.forRequest(verb: recovery.GuardianVerbName, body: Buffer): recovery.ReferenceGuardian | Buffer
 method recovery.IGuardianResolver.info(): recovery.IGuardianInfoResponse

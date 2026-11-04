@@ -170,7 +170,7 @@ await node.destroy();
 | `guardianToken?` | `string` | Bearer token every guardian session must present; absent runs open. |
 | `guardianMaxBytesPerSet?` | `number` | Disk one served set may occupy before writes are refused (256 MiB). |
 | `guardianMaxSets?` | `number` | Sets this node will register (default 16). |
-| `guardianMaxCiphertextBytes?` | `number` | Advertised per-record ciphertext limit (default 4 MiB). |
+| `guardianMaxCiphertextBytes?` | `number` | Advertised per-record ciphertext limit (default 4 MiB, which is also the least a node accepts from a guardian). |
 | `storageEncryption?` | `boolean` | Encrypt the SQLite database at rest with a key derived from the wallet seed (default true). An existing plaintext database is migrated in place on first open; restoring a backup requires the same mnemonic. Set false to keep storage in plaintext. |
 | `peerStorageEnabled?` | `boolean` | BOLT 1 peer storage (default true): push our seed-encrypted static channel backup to connected peers that advertise option_provide_storage, store one small blob per channel/trusted peer in return, and keep the newest valid SCB peers hand back on reconnect (see getPeerRetrievedBackup). Recovery stays explicit via restoreFromScb. |
 | `autoRebalance?` | `object` | Automatic circular rebalancing (default DISABLED). When enabled the node periodically executes the advisor's rebalance plan, spending at most budgetSatsPerDay in routing fees per UTC day. Off unless enabled: true. Each run is an executeRebalances call, so drain mode and dailySpendLimitSats hold it as they hold a manual one. |

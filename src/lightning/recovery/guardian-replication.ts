@@ -67,6 +67,22 @@ import {
 	verifyGuardianRotation
 } from './guardian-client';
 import { GUARDIAN_HOST_DEFAULT_MAX_CIPHERTEXT_BYTES } from './guardian-host';
+
+/**
+ * The smallest record limit a guardian may advertise and still be used:
+ * the host default, so a limit can only be raised.
+ *
+ * A delta frame carries a whole channel transition: one channel's state is
+ * about 9 KB idle and grows by a few KB for every HTLC in flight. A
+ * guardian whose limit is in the tens of kilobytes would refuse the first
+ * busy transition and, taking only the next sequence, every record after
+ * it, so it is refused up front instead (issue #1954). The labelled
+ * payment row a settlement carries is not what this floor is for: the
+ * journal moves its label into a frame of its own when the two do not fit
+ * together (RecoveryJournal.moveLabelsOutOfDelta).
+ */
+export const GUARDIAN_RECORD_LIMIT_FLOOR_BYTES =
+	GUARDIAN_HOST_DEFAULT_MAX_CIPHERTEXT_BYTES;
 import {
 	JOURNAL_META_KEYS,
 	META_LAST_SNAPSHOT_GROUP,
@@ -280,6 +296,7 @@ export interface IGuardianReplicationEvent {
 		| 'record:rejected'
 		| 'record:conflict'
 		| 'record:too-large'
+		| 'record:limit-too-small'
 		| 'record:quota-refused'
 		| 'writer:fenced'
 		| 'writer:supersession-unproven';
@@ -426,6 +443,8 @@ export class GuardianReplicator {
 	private readonly advertisedCeilings = new Map<string, number>();
 	/** Too-large refusals already reported, as `guardian:sequence`. */
 	private readonly reportedTooLarge = new Set<string>();
+	/** Guardians refused for a limit below the floor, reported once each. */
+	private readonly reportedLimitTooSmall = new Set<string>();
 	/** Guardians whose quota refusal was reported and has not lifted since. */
 	private readonly reportedQuotaRefusal = new Set<string>();
 	/** Where findHeldRetainFloor last found no group (see there). */
@@ -480,24 +499,61 @@ export class GuardianReplicator {
 		this.verifiedBindings = await verifyGuardianBindings(
 			this.config.guardians,
 			this.config.context,
-			(key, info) => {
-				if (info.maxCiphertextBytes > 0) {
-					this.advertisedCeilings.set(key, info.maxCiphertextBytes);
-				}
-			}
+			(key, info) => this.noteAdvertisedLimit(key, info.maxCiphertextBytes)
 		);
 		return this.verifiedBindings;
 	}
 
 	/**
-	 * The largest record ciphertext every guardian in the set accepts. A
-	 * guardian refuses a bigger record and, accepting only the next sequence,
-	 * every record after it, so the journal holds its frames under this. A
-	 * guardian whose INFO has not been read yet counts at the host default.
+	 * Keep the limit a guardian advertised. One below the floor is reported
+	 * once and the guardian takes no records: a frame carrying a busy
+	 * channel's settlement would be refused and wedge it for good, and its
+	 * limit must not shape the frames the usable guardians receive.
+	 */
+	private noteAdvertisedLimit(key: string, bytes: number): void {
+		if (!(bytes > 0)) return;
+		this.advertisedCeilings.set(key, bytes);
+		if (bytes >= GUARDIAN_RECORD_LIMIT_FLOOR_BYTES) {
+			this.reportedLimitTooSmall.delete(key);
+			return;
+		}
+		if (this.reportedLimitTooSmall.has(key)) return;
+		this.reportedLimitTooSmall.add(key);
+		this.emit({
+			type: 'record:limit-too-small',
+			detail:
+				`guardian ${key} accepts records of at most ${bytes} bytes, below ` +
+				`the ${GUARDIAN_RECORD_LIMIT_FLOOR_BYTES} byte floor this node ` +
+				`needs to journal a busy channel's transitions, so it is sent ` +
+				`nothing until its operator raises the limit (the protocol allows ` +
+				`up to 16 MiB); until then it holds no record, so the other ` +
+				`guardians keep every record they are sent: raise the limit or ` +
+				`rotate to a set without it`
+		});
+	}
+
+	/** Whether a guardian's advertised limit keeps it out of the set. */
+	private belowFloor(entry: IBoundGuardianClient): boolean {
+		const advertised = this.advertisedCeilings.get(
+			entry.expectedGuardianId.toString('hex')
+		);
+		return (
+			advertised !== undefined && advertised < GUARDIAN_RECORD_LIMIT_FLOOR_BYTES
+		);
+	}
+
+	/**
+	 * The largest record ciphertext every usable guardian in the set accepts.
+	 * A guardian refuses a bigger record and, accepting only the next
+	 * sequence, every record after it, so the journal holds its frames under
+	 * this. A guardian whose INFO has not been read yet counts at the host
+	 * default, and one below the floor does not count at all: it is sent
+	 * nothing, so its limit sizes nothing.
 	 */
 	maxRecordBytes(): number {
 		let ceiling = Number.POSITIVE_INFINITY;
 		for (const entry of this.config.guardians) {
+			if (this.belowFloor(entry)) continue;
 			const advertised = this.advertisedCeilings.get(
 				entry.expectedGuardianId.toString('hex')
 			);
@@ -506,13 +562,15 @@ export class GuardianReplicator {
 				advertised ?? GUARDIAN_HOST_DEFAULT_MAX_CIPHERTEXT_BYTES
 			);
 		}
-		return ceiling;
+		return Number.isFinite(ceiling)
+			? ceiling
+			: GUARDIAN_HOST_DEFAULT_MAX_CIPHERTEXT_BYTES;
 	}
 
 	/** Start from the limits another replicator read for the same guardians. */
 	adoptRecordLimits(from: GuardianReplicator): void {
 		for (const [key, bytes] of from.advertisedCeilings) {
-			this.advertisedCeilings.set(key, bytes);
+			this.noteAdvertisedLimit(key, bytes);
 		}
 	}
 
@@ -525,25 +583,28 @@ export class GuardianReplicator {
 		await Promise.all(
 			this.config.guardians.map(async (entry) => {
 				const key = entry.expectedGuardianId.toString('hex');
-				if (this.advertisedCeilings.has(key)) return;
+				// A limit below the floor is asked again each pass, fresh rather
+				// than from the client's cache, so raising it on the guardian
+				// takes effect without restarting this writer.
+				const refused = this.belowFloor(entry);
+				if (this.advertisedCeilings.has(key) && !refused) return;
 				try {
 					// The client's cached compatibility INFO: a guardian that
 					// answered any verb has a known limit without another request
 					// that could fail. A guardian outside our protocol range is
 					// refused with the INFO it sent, and that limit still binds
 					// once it is back in range.
-					const info = await entry.client
-						.checkVersion()
-						.catch((error) =>
-							error instanceof GuardianProtocolMismatchError
-								? error.info
-								: entry.client.info()
-						);
-					if (
-						info.guardianId.equals(entry.expectedGuardianId) &&
-						info.maxCiphertextBytes > 0
-					) {
-						this.advertisedCeilings.set(key, info.maxCiphertextBytes);
+					const info = refused
+						? await entry.client.info()
+						: await entry.client
+								.checkVersion()
+								.catch((error) =>
+									error instanceof GuardianProtocolMismatchError
+										? error.info
+										: entry.client.info()
+								);
+					if (info.guardianId.equals(entry.expectedGuardianId)) {
+						this.noteAdvertisedLimit(key, info.maxCiphertextBytes);
 					}
 				} catch {
 					// Still unreachable: asked again next pass.
@@ -1808,6 +1869,21 @@ export class GuardianReplicator {
 			entry: IBoundGuardianClient,
 			retainFloor: IGuardianRetainFloor | undefined
 		): Promise<IGuardianStreamResult> => {
+			// Sent nothing, so it proves nothing: it counts like an unreachable
+			// guardian, and in quorum mode the barrier holds when the rest of
+			// the set cannot make the quorum without it.
+			if (this.belowFloor(entry)) {
+				return {
+					provenThrough: null,
+					sawSupersession: false,
+					sawRetired: false,
+					conflictAt: null,
+					tooLargeAt: null,
+					quotaRefusedAt: null,
+					behindAt: null,
+					requests: 0
+				};
+			}
 			const stream = (): Promise<IGuardianStreamResult> =>
 				this.streamToGuardian(entry, backlog, lease, retainFloor);
 			const result = await stream();

@@ -1041,17 +1041,34 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 			return last;
 		}
 
-		const sequence = BigInt(tipSequence) + 1n;
-		const previousFrameHash = this.storedTipHash();
-		const { frameHash, plaintextBytes } = this.writeFrame({
+		const delta: RecoveryFrame = {
 			version: 1,
 			writerEpoch: this.writerEpoch(),
-			sequence,
-			previousFrameHash,
+			sequence: BigInt(tipSequence) + 1n,
+			previousFrameHash: this.storedTipHash(),
 			timestamp: Date.now(),
 			mutations,
 			outboundMessages
-		});
+		};
+		const labelled = this.moveLabelsOutOfDelta(delta);
+		let { frameHash, plaintextBytes } = this.writeFrame(delta);
+		let sequence = delta.sequence;
+		// Each labelled row follows in a frame of its own, in this same
+		// transaction, so the transition is durable once its labels are.
+		for (const row of labelled) {
+			sequence += 1n;
+			const written = this.writeFrame({
+				version: 1,
+				writerEpoch: delta.writerEpoch,
+				sequence,
+				previousFrameHash: frameHash,
+				timestamp: delta.timestamp,
+				mutations: [row],
+				outboundMessages: []
+			});
+			frameHash = written.frameHash;
+			plaintextBytes += written.plaintextBytes;
+		}
 
 		// Snapshot on whichever bound trips first (spec 5.3): N delta frames
 		// or M bytes of delta plaintext since the last snapshot.
@@ -1623,6 +1640,61 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 		if (this.durability === 'quorum') {
 			frame.durabilityPolicy = WIRE_SAFETY_POLICY_VERSION;
 		}
+	}
+
+	/**
+	 * Hold a delta under the replicas' record ceiling when only the labels
+	 * on its payment rows put it over (issue #1954), and return the rows
+	 * whose labels were taken out, unchanged, for the caller to write in
+	 * frames of their own right after it.
+	 *
+	 * A settled payment row rides the channel transition that fulfils its
+	 * HTLC, so its frame holds the channel's state beside the row, and the
+	 * row checks size the row alone. Over the ceiling, the frame keeps each
+	 * row with only its engine keys (the `_` ones: the payment proof's
+	 * invoice, the keysend classification), so the status, preimage and
+	 * every other part of the transition still commit together, and the
+	 * label arrives one frame later as an ordinary upsert. A restore that
+	 * stops between the two has the settled row without its label.
+	 *
+	 * Nothing moves when the frame fits, or when it is still over without
+	 * the labels: writeFrame reports that one as before.
+	 */
+	private moveLabelsOutOfDelta(frame: RecoveryFrame): RecoveryMutation[] {
+		const ceiling = this.maxFrameCiphertextBytes?.();
+		if (ceiling === undefined) return [];
+		this.stampFramePolicy(frame);
+		const size = (): number =>
+			encodeFrame(frame).length + FRAME_CIPHERTEXT_OVERHEAD;
+		if (size() <= ceiling) return [];
+		const moved: RecoveryMutation[] = [];
+		const unlabelled = frame.mutations.map((mutation): RecoveryMutation => {
+			const metadata =
+				mutation.type === 'payment_state'
+					? mutation.payment.metadata
+					: undefined;
+			if (mutation.type !== 'payment_state' || !metadata) return mutation;
+			const engine = Object.entries(metadata).filter(([key]) =>
+				key.startsWith('_')
+			);
+			if (engine.length === Object.keys(metadata).length) return mutation;
+			moved.push(mutation);
+			return {
+				...mutation,
+				payment: {
+					...mutation.payment,
+					metadata: engine.length ? Object.fromEntries(engine) : undefined
+				}
+			};
+		});
+		if (moved.length === 0) return [];
+		const original = frame.mutations;
+		frame.mutations = unlabelled;
+		if (size() > ceiling) {
+			frame.mutations = original;
+			return [];
+		}
+		return moved;
 	}
 
 	/**
