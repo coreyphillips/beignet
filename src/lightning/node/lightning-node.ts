@@ -20017,23 +20017,73 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		// too, or its replacement would draw on balances the parts still to
 		// leave need. The caller's loop takes it once the last one is out.
 		mppState.dispatchComplete = false;
-		for (const partRoute of multiRoute.parts) {
-			if (partRoute.hops.length === 0) continue;
-			const sent = this.dispatchMppPart(
-				payment,
-				mppState,
-				paymentSecret,
-				partRoute
-			);
-			if (!sent.ok) {
-				// Like a planned part the channel refuses: the siblings are out
-				// and cannot be withdrawn, so the payment ends here.
-				this.failMppDispatch(payment, sent.reason, sent.htlcKey);
-				return undefined;
+		try {
+			for (const partRoute of multiRoute.parts) {
+				if (partRoute.hops.length === 0) continue;
+				const partsBefore = mppState.parts.length;
+				let sent: ReturnType<LightningNode['dispatchMppPart']>;
+				try {
+					sent = this.dispatchMppPart(
+						payment,
+						mppState,
+						paymentSecret,
+						partRoute
+					);
+				} catch (err) {
+					// A throw from addHtlc (the outbound transport, say) can leave
+					// the part's HTLC on the channel: the part then resolves like
+					// any other, as a single-path retry's record does. A part that
+					// never left ends the payment like one the channel refuses.
+					// The throw stops here either way: this runs from a channel
+					// event, and the finally below restores dispatchComplete, or
+					// every part that failed back later would wait in
+					// partsAwaitingReplacement for a dispatcher that never runs.
+					const detail = err instanceof Error ? err.message : String(err);
+					this.emitStructuredLog('payment', 'retry_dispatch_threw', {
+						paymentHash: hashHex,
+						error: detail
+					});
+					const pushed = mppState.parts.length > partsBefore;
+					const part = mppState.parts[mppState.parts.length - 1];
+					if (pushed && this.mppPartInFlight(paymentHash, part)) {
+						return undefined;
+					}
+					let htlcKey: string | undefined;
+					if (pushed) {
+						mppState.parts.pop();
+						htlcKey = `${part.channelId.toString('hex')}:offered-${
+							part.htlcId
+						}`;
+					}
+					this.failMppDispatch(
+						payment,
+						`Local failure: MPP part could not be dispatched (${detail})`,
+						htlcKey
+					);
+					return undefined;
+				}
+				if (!sent.ok) {
+					// Like a planned part the channel refuses: the siblings are out
+					// and cannot be withdrawn, so the payment ends here.
+					this.failMppDispatch(payment, sent.reason, sent.htlcKey);
+					return undefined;
+				}
 			}
+		} finally {
+			mppState.dispatchComplete = true;
 		}
-		mppState.dispatchComplete = true;
 		return undefined;
+	}
+
+	/** Whether the part's HTLC is on its channel and can still settle. */
+	private mppPartInFlight(
+		paymentHash: Buffer,
+		part: IOutboundMppPart
+	): boolean {
+		const view = this.getOutgoingHtlcs(paymentHash).htlcs.find(
+			(h) => h.htlcId === part.htlcId && h.channelId.equals(part.channelId)
+		);
+		return view !== undefined && LightningNode.htlcViewInFlight(view);
 	}
 
 	/**
@@ -27368,6 +27418,14 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		// compliant blinded peer's invalid_onion_blinding was unreadable, the
 		// broken path was never excluded, and the retry hammered it while a
 		// working path sat unused (issue #550 review).
+		//
+		// An MPP payment's parts share this record (issue #1942), so what an
+		// earlier part's failure decoded must not stand in for one that
+		// decodes to nothing: a stale permanent code would end a payment
+		// whose part failed for a reason nobody read, and a stale source
+		// index would blame a hop of this part's route that never answered.
+		payment.failureCode = undefined;
+		payment.failureSourceIndex = undefined;
 		const malformedCode = LightningNode.malformedFailureCode(reason);
 		if (malformedCode !== undefined) {
 			payment.failureCode = malformedCode;

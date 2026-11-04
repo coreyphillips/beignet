@@ -895,6 +895,167 @@ describe('MPP Sending (Phase 5)', function () {
 			bob.destroy();
 		});
 
+		it('a part failing with an unreadable reason after a height-skew replacement is still replaced (#1942)', async function () {
+			const htlcSecretFor = (seedId: number): Buffer =>
+				crypto
+					.createHash('sha256')
+					.update(makeSeed(seedId))
+					.update(Buffer.from([4]))
+					.digest();
+			const alice = new LightningNode({
+				...makeNodeConfig(94),
+				htlcBasepointSecret: htlcSecretFor(94)
+			});
+			const bob = new LightningNode({
+				...makeNodeConfig(95),
+				htlcBasepointSecret: htlcSecretFor(95)
+			});
+			connectNodes(alice, bob);
+			openReadyChannel(alice, bob, 200_000n);
+			openReadyChannel(alice, bob, 200_000n);
+
+			// Bob is ahead of alice, so the first planned part fails back with
+			// his height: a permanent code read as skew, and the part is
+			// replaced. Bob fails the second planned part with an empty
+			// reason, which decodes to nothing. The parts share one record, so
+			// the first failure's code must not stand in for the second's and
+			// end the payment as permanent.
+			alice.handleNewBlock(1000);
+			bob.handleNewBlock(1005);
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			const bobAny = bob as any;
+			const finalHop = bobAny.handleFinalHopHtlc.bind(bob);
+			let arrivals = 0;
+			bobAny.handleFinalHopHtlc = (
+				channelId: Buffer,
+				htlcId: bigint,
+				...rest: unknown[]
+			): void => {
+				if (++arrivals === 2) {
+					setTimeout(
+						() =>
+							bobAny.channelManager.failHtlc(
+								channelId,
+								htlcId,
+								Buffer.alloc(0)
+							),
+						0
+					);
+					return;
+				}
+				setTimeout(() => finalHop(channelId, htlcId, ...rest), 0);
+			};
+
+			const invoice = bob.createInvoice({
+				description: 'unreadable second failure',
+				amountMsat: 250_000_000n
+			});
+			const payment = alice.sendPayment(invoice.bolt11);
+			for (
+				let i = 0;
+				i < 100 && payment.status === PaymentStatus.PENDING;
+				i++
+			) {
+				await new Promise((r) => setTimeout(r, 10));
+			}
+
+			expect(payment.status).to.equal(PaymentStatus.COMPLETED);
+			expect(payment.retryCount, 'both planned parts replaced').to.equal(2);
+			expect(bob.getPayment(invoice.paymentHash)!.status).to.equal(
+				PaymentStatus.COMPLETED
+			);
+
+			alice.destroy();
+			bob.destroy();
+		});
+
+		it('a replacement whose dispatch throws leaves no part waiting for a dispatcher that never runs (#1942)', async function () {
+			const htlcSecretFor = (seedId: number): Buffer =>
+				crypto
+					.createHash('sha256')
+					.update(makeSeed(seedId))
+					.update(Buffer.from([4]))
+					.digest();
+			const alice = new LightningNode({
+				...makeNodeConfig(92),
+				htlcBasepointSecret: htlcSecretFor(92)
+			});
+			const bob = new LightningNode({
+				...makeNodeConfig(93),
+				htlcBasepointSecret: htlcSecretFor(93)
+			});
+			connectNodes(alice, bob);
+			openReadyChannel(alice, bob, 200_000n);
+			openReadyChannel(alice, bob, 200_000n);
+
+			// Bob fails every part that reaches him. The transport throws as the
+			// first replacement's update_add_htlc leaves, after alice's channel
+			// already holds it, so bob never sees that one.
+			let attempts = 0;
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			const bobAny = bob as any;
+			bobAny.handleFinalHopHtlc = (channelId: Buffer, htlcId: bigint): void => {
+				attempts++;
+				const sharedSecret = bobAny.receivedHtlcSharedSecrets.get(
+					`${channelId.toString('hex')}:${htlcId}`
+				);
+				bobAny.channelManager.failHtlc(
+					channelId,
+					htlcId,
+					createFailureMessage(sharedSecret, TEMPORARY_NODE_FAILURE)
+				);
+			};
+			let adds = 0;
+			alice.prependListener('message:outbound', (_pk: string, type: number) => {
+				if (type !== MessageType.UPDATE_ADD_HTLC) return;
+				if (++adds === 3) throw new Error('transport failed');
+			});
+			let failedEvents = 0;
+			alice.on('payment:failed', () => failedEvents++);
+			const actions: string[] = [];
+			alice.on('log', (log: { action: string }) => actions.push(log.action));
+
+			const { bolt11, paymentHash } = hintlessMppInvoice(
+				bob,
+				93,
+				250_000_000n,
+				'replacement throws'
+			);
+			const payment = alice.sendPayment(bolt11);
+			await new Promise((r) => setTimeout(r, 50));
+
+			// The thrown replacement stays out on its channel and pins its
+			// liquidity. The other part's queued failure is still taken up: its
+			// replacement finds no route around the pinned channel, and the
+			// payment ends there instead of waiting on a dispatcher that never
+			// runs.
+			expect(actions).to.include('retry_dispatch_threw');
+			expect(adds, 'two planned parts and the thrown replacement').to.equal(3);
+			expect(attempts, 'the thrown replacement never reached bob').to.equal(2);
+			expect(payment.retryCount).to.equal(1);
+			expect(payment.status).to.equal(PaymentStatus.FAILED);
+			expect(payment.failureReason).to.match(
+				/Replacement part not sent: no route/
+			);
+			expect(failedEvents, 'payment:failed emitted once').to.equal(1);
+			const live = alice
+				.getOutgoingHtlcs(paymentHash)
+				.htlcs.filter((htlc) => !htlc.terminal);
+			expect(
+				live,
+				'the thrown replacement is still on its channel'
+			).to.have.length(1);
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			const mppState = (alice as any).outboundMppPayments.get(
+				paymentHash.toString('hex')
+			);
+			expect(mppState.dispatchComplete).to.equal(true);
+			expect(mppState.partsAwaitingReplacement ?? []).to.have.length(0);
+
+			alice.destroy();
+			bob.destroy();
+		});
+
 		it('a part whose first-hop channel is gone at dispatch fails the payment locally, not at the payee timeout (#1941)', async function () {
 			const htlcSecretFor = (seedId: number): Buffer =>
 				crypto
