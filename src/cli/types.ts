@@ -895,9 +895,10 @@ export interface SpliceResult {
 export type ChannelSendKind = 'single' | 'composite';
 
 /**
- * The stage of a channel send: STARTED for a single-channel splice-out (its
- * outcome arrives on splice:complete or splice:aborted for that channel),
- * else the composite record's stage.
+ * The stage of a channel send: a single-channel splice-out is STARTED, then
+ * LOCKED (with the new funding txid) or ABORTED (with the reason) as its
+ * channel's splice completes or aborts; a composite reports its record's
+ * stage.
  */
 export type ChannelSendStage = 'STARTED' | CompositeSpliceStage;
 
@@ -1712,7 +1713,7 @@ export interface BeignetNodeEvents {
 	}) => void;
 	/** A splice negotiation was unwound by tx_abort before its point of no return. */
 	'splice:aborted': (data: { channelId: ChannelIdHex; reason: string }) => void;
-	/** A channel send (issue #1922) reached a stage: STARTED for a single-channel splice-out, else the composite record's stage (PLANNED, NEGOTIATING, COMMITTED, PEERS_SIGNED, RELEASED, BROADCAST, LOCKED, ABORTED or CONFLICTED, with the reason). `id` is the quote id the execute call returned, or the composite id for a composite restored without one; `txid` (display order) is the agreed transaction from COMMITTED on. */
+	/** A channel send (issue #1922) reached a stage: a single-channel splice-out is STARTED, then LOCKED or ABORTED as its channel's splice completes or aborts; a composite reports its record's stage (PLANNED, NEGOTIATING, COMMITTED, PEERS_SIGNED, RELEASED, BROADCAST, LOCKED, ABORTED or CONFLICTED, with the reason), every stage from PLANNED on. `id` is the quote id the execute call returned, or the composite id for a composite restored without one; `txid` (display order) is the new funding transaction, for a composite from COMMITTED on. */
 	'channel-send:stage': (data: {
 		id: string;
 		compositeId?: string;

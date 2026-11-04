@@ -4878,7 +4878,7 @@ export function getOpenApiSpec(): Record<string, unknown> {
 					responses: {
 						'200': {
 							description:
-								'The send started: a single-channel splice-out (stage STARTED; watch splice:complete or splice:aborted for that channel) or a composite (its record and stage; watch channel-send:stage). The limits are checked again; a composite reserves amount plus fee until RELEASED charges it or ABORTED releases it. The same quoteId returns the first execution and runs nothing.',
+								"The send started: a single-channel splice-out (stage STARTED, then LOCKED or ABORTED on channel-send:stage as its channel's splice completes or aborts) or a composite (its record and stage, planned again on the current balances so the fee counted is the one priced now; watch channel-send:stage). The limits are checked again; a composite reserves amount plus fee until RELEASED charges it or ABORTED releases it. The same quoteId returns the first execution and runs nothing.",
 							content: jsonContent({
 								$ref: '#/components/schemas/ChannelSendStatus'
 							})

@@ -24,7 +24,10 @@ import {
 import { BeignetErrorCode } from '../../src/cli/errors';
 import type { ChannelSendQuote, ChannelSendStatus } from '../../src/cli/types';
 import type { ICompositeSpliceRecord } from '../../src/lightning/channel/composite-splice-record';
-import { CompositeSpliceRefusalCode } from '../../src/lightning/node/composite-splice-engine';
+import {
+	COMPOSITE_SPLICE_RETENTION_MS,
+	CompositeSpliceRefusalCode
+} from '../../src/lightning/node/composite-splice-engine';
 
 const MNEMONIC =
 	'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about';
@@ -41,6 +44,13 @@ const REGTEST_ADDRESS = bitcoin.payments.p2wpkh({
 const CHANNEL_A = 'aa'.repeat(32);
 const CHANNEL_B = 'bb'.repeat(32);
 const PEER = '02' + '11'.repeat(32);
+// Records hold txids in internal byte order and the API shows display order;
+// non-palindromic fixtures make the reversal part of what the tests pin.
+const TXID_INTERNAL = '0a1b2c3d'.repeat(8);
+const TXID2_INTERNAL = '4e5f6071'.repeat(8);
+function reverseHex(hex: string): string {
+	return Buffer.from(hex, 'hex').reverse().toString('hex');
+}
 
 interface IFakeChannel {
 	id: string;
@@ -48,6 +58,8 @@ interface IFakeChannel {
 	maxAmountSats: number;
 	feeSats: number;
 	capacitySats: number;
+	/** The negotiated interactive-tx dust floor; 546 when unset. */
+	dustFloorSats?: number;
 }
 
 interface IFakeEngine {
@@ -110,6 +122,12 @@ interface IFake {
 		txid?: Buffer;
 		reason?: string;
 	}) => void;
+	_onSingleChannelSendSpliceEvent: (
+		channelId: string,
+		stage: 'LOCKED' | 'ABORTED',
+		detail: { txid?: string; reason?: string }
+	) => void;
+	_channelSends?: Map<string, { status: ChannelSendStatus; endedAt?: number }>;
 }
 
 function compositeRecord(
@@ -196,7 +214,8 @@ function fakeNode(opts: {
 					getState: () => 'NORMAL',
 					spliceBusyReason: () => null,
 					getFullState: () => ({ spliceInFlight: null }),
-					getFundingSatoshis: () => BigInt(c.capacitySats)
+					getFundingSatoshis: () => BigInt(c.capacitySats),
+					spliceInteractiveTxDustFloor: () => BigInt(c.dustFloorSats ?? 546)
 				})),
 			getPeerForChannel: () => PEER
 		}),
@@ -494,12 +513,20 @@ describe('Channel send (issue #1922)', function () {
 				compositeId,
 				compositeRecord(compositeId, 'NEGOTIATING')
 			);
-			const stages: Array<{ id: string; stage: string; compositeId?: string }> =
-				[];
+			const stages: Array<{
+				id: string;
+				stage: string;
+				compositeId?: string;
+				txid?: string;
+			}> = [];
 			fake.on(
 				'channel-send:stage',
-				(d: { id: string; stage: string; compositeId?: string }) =>
-					stages.push(d)
+				(d: {
+					id: string;
+					stage: string;
+					compositeId?: string;
+					txid?: string;
+				}) => stages.push(d)
 			);
 
 			const quote = await fake.quoteChannelSend(
@@ -518,12 +545,12 @@ describe('Channel send (issue #1922)', function () {
 
 			fake.node.records.set(compositeId, {
 				...compositeRecord(compositeId, 'RELEASED'),
-				txid: '99'.repeat(32)
+				txid: TXID_INTERNAL
 			});
 			fake._onCompositeSpliceStage({
 				id: Buffer.from(compositeId, 'hex'),
 				stage: 'RELEASED',
-				txid: Buffer.from('99'.repeat(32), 'hex')
+				txid: Buffer.from(TXID_INTERNAL, 'hex')
 			});
 			expect(fake._pendingSpendSats, 'reservation converted').to.equal(0);
 			expect(fake._dailySpentSats, 'charged once at RELEASED').to.equal(
@@ -532,7 +559,7 @@ describe('Channel send (issue #1922)', function () {
 			expect(fake._dailySpentOnchainSats).to.equal(1_200_700);
 			const status = fake.getChannelSend(quote.quoteId)!;
 			expect(status.stage).to.equal('RELEASED');
-			expect(status.txid).to.equal('99'.repeat(32));
+			expect(status.txid, 'display order').to.equal(reverseHex(TXID_INTERNAL));
 
 			fake._onCompositeSpliceStage({
 				id: Buffer.from(compositeId, 'hex'),
@@ -552,6 +579,9 @@ describe('Channel send (issue #1922)', function () {
 					(s) => s.id === quote.quoteId && s.compositeId === compositeId
 				)
 			).to.equal(true);
+			expect(stages[0].txid, 'event txid in display order').to.equal(
+				reverseHex(TXID_INTERNAL)
+			);
 			// A second execute of the consumed quote answers the first run.
 			const again = await fake.executeChannelSend(quote.quoteId);
 			expect(again.compositeId).to.equal(compositeId);
@@ -609,6 +639,323 @@ describe('Channel send (issue #1922)', function () {
 			expect(fake.node.startCalls).to.equal(2);
 		});
 
+		it('stages the engine emits inside start() carry the quote id and settle the reservation, and a start that throws releases it', async function () {
+			const fake = fakeNode({ channels: twoChannels, limitSats: 2_000_000 });
+			fake.node.plan = compositePlan();
+			const compositeId = 'a1'.repeat(32);
+			const stages: Array<{ id: string; stage: string; compositeId?: string }> =
+				[];
+			fake.on(
+				'channel-send:stage',
+				(d: { id: string; stage: string; compositeId?: string }) =>
+					stages.push(d)
+			);
+			// The engine plans, then starts each session; a session that refuses
+			// to start aborts the composite before start() has returned ok.
+			fake.node.startCompositeSpliceOut = async () => {
+				fake.node.startCalls++;
+				for (const stage of ['PLANNED', 'NEGOTIATING', 'ABORTED'] as const) {
+					const reason =
+						stage === 'ABORTED' ? 'session refused to start' : undefined;
+					fake.node.records.set(compositeId, {
+						...compositeRecord(compositeId, stage),
+						...(reason ? { reason } : {})
+					});
+					fake._onCompositeSpliceStage({
+						id: Buffer.from(compositeId, 'hex'),
+						stage,
+						...(reason ? { reason } : {})
+					});
+				}
+				return {
+					ok: true,
+					id: Buffer.from(compositeId, 'hex'),
+					plan: compositePlan().plan
+				};
+			};
+			const quote = await fake.quoteChannelSend(
+				REGTEST_ADDRESS,
+				1_200_000,
+				1000
+			);
+			const run = await fake.executeChannelSend(quote.quoteId);
+			expect(run.stage).to.equal('ABORTED');
+			expect(run.reason).to.equal('session refused to start');
+			expect(run.compositeId).to.equal(compositeId);
+			expect(
+				fake._pendingSpendSats,
+				'released by the abort inside start'
+			).to.equal(0);
+			expect(fake._dailySpentSats).to.equal(0);
+			expect(stages.map((s) => s.stage)).to.deep.equal([
+				'PLANNED',
+				'NEGOTIATING',
+				'ABORTED'
+			]);
+			expect(
+				stages.every(
+					(s) => s.id === quote.quoteId && s.compositeId === compositeId
+				),
+				'relayed under the quote id'
+			).to.equal(true);
+
+			// A start that throws: the reservation is released, nothing is
+			// registered under the quote, and the quote stays for a retry.
+			fake.node.startCompositeSpliceOut = async () => {
+				fake.node.startCalls++;
+				throw new Error('Node destroyed');
+			};
+			const second = await fake.quoteChannelSend(
+				REGTEST_ADDRESS,
+				1_200_000,
+				1000
+			);
+			const thrown = await refusal(() =>
+				fake.executeChannelSend(second.quoteId)
+			);
+			expect(thrown.message).to.equal('Node destroyed');
+			expect(fake._pendingSpendSats, 'released on the throw').to.equal(0);
+			expect(fake.getChannelSend(second.quoteId)).to.equal(null);
+			expect(
+				fake._channelSendQuotes!.has(second.quoteId),
+				'quote kept'
+			).to.equal(true);
+			expect(fake.node.startCalls).to.equal(2);
+		});
+
+		it('a retry while the first execution is still starting awaits it, and two composites starting together never share a reservation', async function () {
+			const fake = fakeNode({ channels: twoChannels, limitSats: 5_000_000 });
+			fake.node.plan = compositePlan();
+			const first = 'b1'.repeat(32);
+			let releaseStart: (() => void) | null = null;
+			fake.node.startCompositeSpliceOut = () =>
+				new Promise((resolve) => {
+					fake.node.startCalls++;
+					fake.node.records.set(first, compositeRecord(first, 'NEGOTIATING'));
+					releaseStart = () =>
+						resolve({
+							ok: true,
+							id: Buffer.from(first, 'hex'),
+							plan: compositePlan().plan
+						});
+				});
+			const quote = await fake.quoteChannelSend(
+				REGTEST_ADDRESS,
+				1_200_000,
+				1000
+			);
+			const a = fake.executeChannelSend(quote.quoteId);
+			const b = fake.executeChannelSend(quote.quoteId);
+			await new Promise((r) => setImmediate(r));
+			expect(fake.node.startCalls, 'one start for two calls').to.equal(1);
+			expect(fake._pendingSpendSats, 'reserved once').to.equal(1_200_700);
+			releaseStart!();
+			const [ra, rb] = await Promise.all([a, b]);
+			expect(ra.compositeId).to.equal(first);
+			expect(rb.compositeId).to.equal(first);
+			expect(fake.node.startCalls).to.equal(1);
+			expect(fake._pendingSpendSats).to.equal(1_200_700);
+
+			// Two quotes executed at once: the second start waits for the first
+			// and the engine refuses it BUSY; only the first's reservation stands.
+			const other = fakeNode({ channels: twoChannels, limitSats: 5_000_000 });
+			other.node.plan = compositePlan();
+			const c1 = 'b2'.repeat(32);
+			let releaseFirst: (() => void) | null = null;
+			other.node.startCompositeSpliceOut = () => {
+				other.node.startCalls++;
+				if (other.node.startCalls === 1) {
+					return new Promise((resolve) => {
+						other.node.records.set(c1, compositeRecord(c1, 'NEGOTIATING'));
+						releaseFirst = () =>
+							resolve({
+								ok: true,
+								id: Buffer.from(c1, 'hex'),
+								plan: compositePlan().plan
+							});
+					});
+				}
+				return Promise.resolve({
+					ok: false,
+					error: 'a composite splice is already live',
+					code: CompositeSpliceRefusalCode.BUSY
+				});
+			};
+			const q1 = await other.quoteChannelSend(REGTEST_ADDRESS, 1_200_000, 1000);
+			const q2 = await other.quoteChannelSend(REGTEST_ADDRESS, 1_200_000, 1000);
+			const e1 = other.executeChannelSend(q1.quoteId);
+			const e2 = refusal(() => other.executeChannelSend(q2.quoteId));
+			await new Promise((r) => setImmediate(r));
+			expect(other.node.startCalls, 'the second waits for the first').to.equal(
+				1
+			);
+			expect(other._pendingSpendSats, 'only the first reserved').to.equal(
+				1_200_700
+			);
+			releaseFirst!();
+			const [r1, refused] = await Promise.all([e1, e2]);
+			expect(r1.compositeId).to.equal(c1);
+			expect(r1.stage).to.equal('NEGOTIATING');
+			expect(refused.code).to.equal(BeignetErrorCode.SPLICE_BUSY);
+			expect(other.node.startCalls).to.equal(2);
+			expect(
+				other._pendingSpendSats,
+				'the refused start reserved nothing'
+			).to.equal(1_200_700);
+			expect(other.getChannelSend(q2.quoteId)).to.equal(null);
+		});
+
+		it('the fee is priced again at execute: a dearer one is checked against the limits before the engine starts, and the ledger counts it', async function () {
+			const fake = fakeNode({ channels: twoChannels, limitSats: 1_200_800 });
+			fake.node.plan = compositePlan();
+			const compositeId = 'c1'.repeat(32);
+			const quote = await fake.quoteChannelSend(
+				REGTEST_ADDRESS,
+				1_200_000,
+				1000
+			);
+			expect(quote.totalSats).to.equal(1_200_700);
+			// A balance moved since the quote: the fee now rounds to 900.
+			const dearer = compositePlan();
+			(dearer.plan as { feeSats: bigint }).feeSats = 900n;
+			fake.node.plan = dearer;
+			fake.node.start = {
+				ok: true,
+				id: Buffer.from(compositeId, 'hex'),
+				plan: dearer.plan
+			};
+			fake.node.records.set(
+				compositeId,
+				compositeRecord(compositeId, 'NEGOTIATING')
+			);
+			const over = await refusal(() => fake.executeChannelSend(quote.quoteId));
+			expect(over.code).to.equal(BeignetErrorCode.SPENDING_LIMIT_EXCEEDED);
+			expect(fake.node.startCalls, 'refused before the engine').to.equal(0);
+			expect(fake._pendingSpendSats).to.equal(0);
+			// With room in the budget the send runs, and what is reserved and
+			// then charged is the fee priced at execute.
+			fake._dailySpendLimitSats = 2_000_000;
+			const run = await fake.executeChannelSend(quote.quoteId);
+			expect(run.feeSats).to.equal(900);
+			expect(fake._pendingSpendSats).to.equal(1_200_900);
+			fake._onCompositeSpliceStage({
+				id: Buffer.from(compositeId, 'hex'),
+				stage: 'RELEASED'
+			});
+			expect(fake._dailySpentSats).to.equal(1_200_900);
+			expect(fake._pendingSpendSats).to.equal(0);
+		});
+
+		it('a channel the amount cannot leave through is not chosen for a single send: the negotiated dust floor and a fee at or above the amount', async function () {
+			const floor = fakeNode({
+				channels: [
+					{ ...twoChannels[0], dustFloorSats: 10_000 },
+					twoChannels[1]
+				],
+				limitSats: 2_000_000
+			});
+			const quote = await floor.quoteChannelSend(REGTEST_ADDRESS, 5_000, 1000);
+			expect(quote.kind).to.equal('single');
+			expect(
+				quote.channels[0].channelId,
+				'the channel with the lower floor'
+			).to.equal(CHANNEL_B);
+			const dear = fakeNode({
+				channels: [{ ...twoChannels[0], feeSats: 5_000 }, twoChannels[1]],
+				limitSats: 2_000_000
+			});
+			const cheap = await dear.quoteChannelSend(REGTEST_ADDRESS, 5_000, 1000);
+			expect(
+				cheap.channels[0].channelId,
+				'the channel whose fee is below the amount'
+			).to.equal(CHANNEL_B);
+		});
+
+		it('a malformed or oversized abort reason is refused before the engine is asked', async function () {
+			const fake = fakeNode({ channels: twoChannels });
+			const compositeId = 'd1'.repeat(32);
+			fake.node.records.set(
+				compositeId,
+				compositeRecord(compositeId, 'NEGOTIATING')
+			);
+			let abortCalls = 0;
+			fake.node.abortCompositeSplice = () => {
+				abortCalls++;
+				return { ok: true };
+			};
+			const bad = await refusal(async () =>
+				fake.abortChannelSend(compositeId, {
+					why: 'object'
+				} as unknown as string)
+			);
+			expect(bad.code).to.equal(BeignetErrorCode.INVALID_PARAMS);
+			const long = await refusal(async () =>
+				fake.abortChannelSend(compositeId, 'x'.repeat(1025))
+			);
+			expect(long.code).to.equal(BeignetErrorCode.INVALID_PARAMS);
+			expect(abortCalls, 'nothing reached the engine').to.equal(0);
+			expect(
+				fake.abortChannelSend(compositeId, 'operator changed their mind').id
+			).to.equal(compositeId);
+			expect(abortCalls).to.equal(1);
+		});
+
+		it("a single send follows its channel's splice to LOCKED or ABORTED, and sends that ended before the retention window are dropped", async function () {
+			const fake = fakeNode({ channels: twoChannels, limitSats: 2_000_000 });
+			const stages: Array<{ id: string; stage: string }> = [];
+			fake.on('channel-send:stage', (d: { id: string; stage: string }) =>
+				stages.push(d)
+			);
+			const first = await fake.quoteChannelSend(REGTEST_ADDRESS, 300_000, 1000);
+			const runA = await fake.executeChannelSend(first.quoteId);
+			expect(runA.channelId).to.equal(CHANNEL_A);
+			const txid = reverseHex(TXID_INTERNAL);
+			// Another channel's splice is not this send.
+			fake._onSingleChannelSendSpliceEvent(CHANNEL_B, 'LOCKED', { txid });
+			expect(fake.getChannelSend(first.quoteId)!.stage).to.equal('STARTED');
+			fake._onSingleChannelSendSpliceEvent(CHANNEL_A, 'LOCKED', { txid });
+			const locked = fake.getChannelSend(first.quoteId)!;
+			expect(locked.stage).to.equal('LOCKED');
+			expect(locked.txid).to.equal(txid);
+			// A later splice on the same channel is not this send either.
+			fake._onSingleChannelSendSpliceEvent(CHANNEL_A, 'ABORTED', {
+				reason: 'later'
+			});
+			expect(fake.getChannelSend(first.quoteId)!.stage).to.equal('LOCKED');
+
+			const second = await fake.quoteChannelSend(
+				REGTEST_ADDRESS,
+				300_000,
+				1000
+			);
+			await fake.executeChannelSend(second.quoteId);
+			fake._onSingleChannelSendSpliceEvent(CHANNEL_A, 'ABORTED', {
+				reason: 'peer refused'
+			});
+			const aborted = fake.getChannelSend(second.quoteId)!;
+			expect(aborted.stage).to.equal('ABORTED');
+			expect(aborted.reason).to.equal('peer refused');
+			expect(stages.map((s) => [s.id, s.stage])).to.deep.equal([
+				[first.quoteId, 'STARTED'],
+				[first.quoteId, 'LOCKED'],
+				[second.quoteId, 'STARTED'],
+				[second.quoteId, 'ABORTED']
+			]);
+
+			// Retention: a send that ended longer ago than the engine keeps its
+			// records is dropped from the list; one still under way stays.
+			const third = await fake.quoteChannelSend(REGTEST_ADDRESS, 300_000, 1000);
+			await fake.executeChannelSend(third.quoteId);
+			const old = Date.now() - COMPOSITE_SPLICE_RETENTION_MS - 60_000;
+			fake._channelSends!.get(first.quoteId)!.endedAt = old;
+			fake._channelSends!.get(second.quoteId)!.endedAt = old;
+			expect(fake.listChannelSends().map((s) => s.id)).to.deep.equal([
+				third.quoteId
+			]);
+			expect(fake.getChannelSend(first.quoteId)).to.equal(null);
+			expect(fake.getChannelSend(third.quoteId)!.stage).to.equal('STARTED');
+		});
+
 		it('refuses an unknown, malformed or expired quote before any side effect', async function () {
 			const fake = fakeNode({ channels: twoChannels });
 			expect(
@@ -636,7 +983,7 @@ describe('Channel send (issue #1922)', function () {
 			const compositeId = '66'.repeat(32);
 			fake.node.records.set(compositeId, {
 				...compositeRecord(compositeId, 'BROADCAST'),
-				txid: '12'.repeat(32),
+				txid: TXID2_INTERNAL,
 				reason: undefined
 			});
 			const list = fake.listChannelSends();
@@ -645,7 +992,9 @@ describe('Channel send (issue #1922)', function () {
 			expect(list[0].kind).to.equal('composite');
 			expect(list[0].stage).to.equal('BROADCAST');
 			expect(list[0].amountSats).to.equal(1_200_000);
-			expect(list[0].txid).to.equal('12'.repeat(32));
+			expect(list[0].txid, 'display order').to.equal(
+				reverseHex(TXID2_INTERNAL)
+			);
 			expect(fake.getChannelSend(compositeId)!.record!.stage).to.equal(
 				'BROADCAST'
 			);
