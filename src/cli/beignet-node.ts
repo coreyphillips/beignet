@@ -799,7 +799,7 @@ export interface BeignetNodeOptions
 	guardianMaxBytesPerSet?: number;
 	/** Sets this node will register (default 16). */
 	guardianMaxSets?: number;
-	/** Advertised per-record ciphertext limit (default 4 MiB). */
+	/** Advertised per-record ciphertext limit (default 4 MiB, at least 1 MiB). */
 	guardianMaxCiphertextBytes?: number;
 	/**
 	 * Encrypt the SQLite database at rest with a key derived from the wallet
@@ -4816,27 +4816,32 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	 * A guardian that refuses a record as too large, or because its quota
 	 * is full, can take nothing after it, so in quorum mode the node stops
 	 * releasing channel updates and in async mode its backup stops
-	 * advancing. Neither shows up anywhere else.
+	 * advancing. One that advertises a record limit below the floor is sent
+	 * nothing at all (issue #1954). None of these shows up anywhere else.
 	 */
 	private relayRecordTooLarge(event: IGuardianReplicationEvent): void {
-		if (
-			event.type !== 'record:too-large' &&
-			event.type !== 'record:quota-refused'
-		) {
-			return;
-		}
-		const tooLarge = event.type === 'record:too-large';
-		this.log(
-			'error',
-			tooLarge
-				? 'Recovery guardian refused an oversized record'
-				: 'Recovery guardian refused a record: its quota is full',
-			{ detail: event.detail }
-		);
+		const relayed: Partial<
+			Record<IGuardianReplicationEvent['type'], [string, string]>
+		> = {
+			'record:too-large': [
+				'Recovery guardian refused an oversized record',
+				'RECOVERY_RECORD_TOO_LARGE'
+			],
+			'record:quota-refused': [
+				'Recovery guardian refused a record: its quota is full',
+				'RECOVERY_GUARDIAN_QUOTA_EXCEEDED'
+			],
+			'record:limit-too-small': [
+				'Recovery guardian refused: its record limit is too small for this node',
+				'RECOVERY_GUARDIAN_LIMIT_TOO_SMALL'
+			]
+		};
+		const entry = relayed[event.type];
+		if (!entry) return;
+		const [message, code] = entry;
+		this.log('error', message, { detail: event.detail });
 		const data = {
-			code: tooLarge
-				? 'RECOVERY_RECORD_TOO_LARGE'
-				: 'RECOVERY_GUARDIAN_QUOTA_EXCEEDED',
+			code,
 			message: event.detail,
 			timestamp: Date.now()
 		};

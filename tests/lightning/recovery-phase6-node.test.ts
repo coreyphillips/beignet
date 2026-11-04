@@ -46,11 +46,14 @@ import { IStorageBackend } from '../../src/lightning/storage/types';
 import {
 	CRASH_V1_PROFILE,
 	DurabilityBarrier,
+	GUARDIAN_HOST_DEFAULT_MAX_CIPHERTEXT_BYTES,
+	GUARDIAN_RECORD_LIMIT_FLOOR_BYTES,
 	GuardianClient,
 	GuardianHttpServer,
 	GuardianReplicator,
 	GuardianStartupGate,
 	IBoundGuardianClient,
+	IGuardianReplicationEvent,
 	IWriterLeaseKeys,
 	JOURNAL_META_KEYS,
 	RecoveryCriticality,
@@ -108,12 +111,16 @@ interface IServed {
 	id: Buffer;
 }
 
-async function serve(index: number): Promise<IServed> {
+async function serve(
+	index: number,
+	maxCiphertextBytes?: number
+): Promise<IServed> {
 	const guardian = new ReferenceGuardian({
 		path: ':memory:',
 		guardianSecret: GUARDIAN_SECRETS[index],
 		members: GUARDIAN_IDS,
-		clock
+		clock,
+		maxCiphertextBytes
 	});
 	const server = new GuardianHttpServer({ guardian });
 	const port = await server.listen(0);
@@ -2127,6 +2134,155 @@ describe('Recovery phase 6: barrier disconnects reach the host on external trans
 
 		node.destroy();
 		await shutdown(served);
+		storage.close();
+	});
+});
+
+describe('Recovery phase 6: the settlement frame fits the guardian record limit (issue #1954)', () => {
+	/**
+	 * The frame that settles an outgoing payment: the channel transition that
+	 * fulfils its HTLC, with the COMPLETED row riding it.
+	 */
+	function settlementFrame(
+		storage: SqliteStorage,
+		hashHex: string
+	): { ciphertext: number; mutations: string[] } {
+		const journal = new RecoveryJournal(
+			storage,
+			deriveRecoveryMasterKey(NODE_SECRET),
+			NODE_ID,
+			ROOT.recoveryId
+		);
+		const stored = new Map(
+			storage.loadRecoveryFrames().map((f) => [f.sequence, f.ciphertext.length])
+		);
+		for (const frame of journal.loadVerifiedFrames()) {
+			const settles = frame.mutations.some(
+				(m) =>
+					m.type === 'payment_state' &&
+					m.paymentHash === hashHex &&
+					m.payment.status === PaymentStatus.COMPLETED
+			);
+			if (!settles) continue;
+			expect(frame.mutations.map((m) => m.type)).to.include('channel_state');
+			return {
+				ciphertext: stored.get(Number(frame.sequence))!,
+				mutations: frame.mutations.map((m) => m.type)
+			};
+		}
+		throw new Error('no settlement frame');
+	}
+
+	it('refuses a guardian below the floor up front, and a labelled settlement that would have overflowed its limit is sized for the usable guardians', async function (): Promise<void> {
+		this.timeout(20_000);
+		// One guardian in the tens of kilobytes: a settled row beside its
+		// channel's state outgrows that, as the issue measured.
+		const REFUSED_LIMIT = 16_000;
+		const served = await Promise.all([
+			serve(0, REFUSED_LIMIT),
+			serve(1),
+			serve(2)
+		]);
+		const storage = openStorage();
+		const events: IGuardianReplicationEvent[] = [];
+		const replicator = new GuardianReplicator({
+			storage,
+			guardians: bind(served),
+			context: CONTEXT,
+			required: CRASH_V1_PROFILE.required,
+			recoveryRoot: ROOT,
+			clock,
+			onEvent: (event): void => {
+				events.push(event);
+			}
+		});
+		// Binding reads every guardian's limit; nothing is sent afterwards.
+		expect((await replicator.ensureNamespace()).outcome).to.equal(
+			'registered'
+		);
+		const refused = events.filter((e) => e.type === 'record:limit-too-small');
+		expect(refused).to.have.length(1);
+		expect(refused[0].detail).to.contain(GUARDIAN_IDS[0].toString('hex'));
+		expect(replicator.maxRecordBytes()).to.equal(16 * 1024 * 1024);
+
+		const node = createNode(storage, {
+			enabled: true,
+			durability: 'async-remote',
+			barrier: barrierFor(replicator, () => null, 'async-remote')
+		});
+		const actions: string[] = [];
+		node.on('log', (log: { action: string }) => actions.push(log.action));
+		const payee = createLoopbackNode('floor-settlement', 2);
+		connectNodes(node, payee);
+		node.handleNewBlock(1000);
+		payee.handleNewBlock(1000);
+		openReadyChannel(node, payee);
+
+		// Well inside the label budget the usable guardians leave, and enough
+		// that the row plus the channel state passes the refused limit.
+		const invoice = payee.createInvoice({
+			amountMsat: 5_000_000n,
+			description: 'floor'
+		});
+		node.sendPaymentWithOptions(invoice.bolt11, {
+			metadata: { note: 'x'.repeat(9_000) }
+		});
+		expect(
+			(await node.awaitPaymentResolution(invoice.paymentHash, 5_000)).status
+		).to.equal(PaymentStatus.COMPLETED);
+		await new Promise((resolve) => setImmediate(resolve));
+
+		const frame = settlementFrame(storage, invoice.paymentHash.toString('hex'));
+		expect(frame.ciphertext).to.be.greaterThan(REFUSED_LIMIT);
+		expect(frame.ciphertext).to.be.at.most(
+			GUARDIAN_HOST_DEFAULT_MAX_CIPHERTEXT_BYTES
+		);
+		expect(actions).to.not.include('recovery_frame_oversized');
+
+		payee.destroy();
+		node.destroy();
+		await shutdown(served);
+		storage.close();
+	});
+
+	it('at the host default, the longest label the budget allows settles with every frame under the limit', async function (): Promise<void> {
+		this.timeout(20_000);
+		const CEILING = GUARDIAN_HOST_DEFAULT_MAX_CIPHERTEXT_BYTES;
+		expect(CEILING).to.be.at.least(GUARDIAN_RECORD_LIMIT_FLOOR_BYTES);
+		const { node, storage, room } = nodeUnderCeiling(CEILING);
+		const actions: string[] = [];
+		node.on('log', (log: { action: string }) => actions.push(log.action));
+		const payee = createLoopbackNode('default-ceiling-label', 2);
+		connectNodes(node, payee);
+		node.handleNewBlock(1000);
+		payee.handleNewBlock(1000);
+		openReadyChannel(node, payee);
+
+		// Metadata may take half the room, and at this ceiling that is what
+		// binds: the row's own growth is a few kilobytes.
+		const note = 'x'.repeat(
+			Math.floor(room / 2) - JSON.stringify({ note: '' }).length
+		);
+		expect(JSON.stringify({ note }).length).to.be.at.most(room / 2);
+		const invoice = payee.createInvoice({
+			amountMsat: 5_000_000n,
+			description: 'longest'
+		});
+		node.sendPaymentWithOptions(invoice.bolt11, { metadata: { note } });
+		expect(
+			(await node.awaitPaymentResolution(invoice.paymentHash, 10_000)).status
+		).to.equal(PaymentStatus.COMPLETED);
+		await new Promise((resolve) => setImmediate(resolve));
+
+		const frame = settlementFrame(storage, invoice.paymentHash.toString('hex'));
+		expect(frame.ciphertext).to.be.greaterThan(room / 2);
+		for (const stored of storage.loadRecoveryFrames()) {
+			expect(stored.ciphertext.length).to.be.at.most(CEILING);
+		}
+		expect(actions).to.not.include('recovery_frame_oversized');
+
+		payee.destroy();
+		node.destroy();
 		storage.close();
 	});
 });
