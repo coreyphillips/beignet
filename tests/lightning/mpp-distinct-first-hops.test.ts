@@ -12,7 +12,12 @@
 import { expect } from 'chai';
 import crypto from 'crypto';
 import { LightningNode } from '../../src/lightning/node/lightning-node';
-import { INodeConfig, PaymentStatus } from '../../src/lightning/node/types';
+import {
+	INodeConfig,
+	IPaymentInfo,
+	PaymentStatus
+} from '../../src/lightning/node/types';
+import { MemoryStorage } from '../../src/lightning/storage/memory-storage';
 import {
 	FEE_INSUFFICIENT,
 	MPP_TIMEOUT,
@@ -95,6 +100,12 @@ async function openChannelOf(
 interface IWorldOptions {
 	/** Each primary's channel to D, 1M sats unless given. */
 	dChannelSats?: bigint[];
+	/**
+	 * More W channels with the first primary, after its own: parts over them
+	 * share that primary's channel to D. Their spendable balances follow the
+	 * primaries' in `spendable`.
+	 */
+	extraWChannelSats?: bigint[];
 	wExtra?: Partial<INodeConfig>;
 	dExtra?: Partial<INodeConfig>;
 }
@@ -141,6 +152,10 @@ async function buildWorld(
 		);
 		primaries.push(primary);
 	}
+	const extraWChannelIds: Buffer[] = [];
+	for (const sats of options.extraWChannelSats ?? []) {
+		extraWChannelIds.push(await openChannelOf(w, primaries[0].node, sats));
+	}
 	const nodes = [w, d, ...primaries.map((p) => p.node)];
 	await waitFor(
 		() =>
@@ -167,8 +182,8 @@ async function buildWorld(
 		d,
 		primaries,
 		wAdds: 0,
-		spendable: primaries.map((p) =>
-			w.getChannelManager().getChannel(p.wChannelId)!.getSpendableOutboundMsat()
+		spendable: [...primaries.map((p) => p.wChannelId), ...extraWChannelIds].map(
+			(id) => w.getChannelManager().getChannel(id)!.getSpendableOutboundMsat()
 		),
 		nodes
 	};
@@ -623,6 +638,154 @@ describe('MPP across distinct first-hop peers (issue #1922)', function () {
 		expect(sum(world.primaries.map((p) => p.forwardedMsat))).to.equal(
 			amountMsat
 		);
+		destroyAll(...world.nodes);
+	});
+
+	it('two parts over one primary are both replaced when it re-prices its channel to D (#1942)', async function () {
+		this.timeout(30_000);
+		// W holds two channels with P1 and the invoice needs both, so both
+		// parts cross P1's channel to D. P1 fails each with fee_insufficient
+		// and the same signed channel_update, on separate ticks: the second
+		// comes back after the first replacement stored the new price. That
+		// part was planned at the old price too, so its failure is a re-price
+		// as well, not a fault at a known price, and nothing is excluded.
+		const seedBase = 7300;
+		const world = await buildWorld(seedBase, [200_000n], {
+			extraWChannelSats: [200_000n]
+		});
+		const amountMsat = world.spendable[0] + REMAINDER_MSAT;
+		const invoice = world.d.createInvoice({
+			amountMsat,
+			description: 'repriced shared channel'
+		});
+		const hint = decodeInvoice(invoice.bolt11)
+			.routingHints!.flat()
+			.find((hop) => hop.shortChannelId.equals(hintScidOf(0)))!;
+		const p1Key = nodePrivkey(seedBase + 2);
+		const p1Pubkey = getPublicKey(p1Key);
+		const dPubkey = getPublicKey(nodePrivkey(seedBase + 1));
+		const update: IChannelUpdateMessage = {
+			signature: Buffer.alloc(64),
+			chainHash: REGTEST_CHAIN_HASH,
+			shortChannelId: hintScidOf(0),
+			timestamp: Math.floor(Date.now() / 1000),
+			messageFlags: 0,
+			channelFlags: Buffer.compare(p1Pubkey, dPubkey) < 0 ? 0 : 1,
+			cltvExpiryDelta: hint.cltvExpiryDelta,
+			htlcMinimumMsat: 1n,
+			feeBaseMsat: hint.feeBaseMsat + 1_000,
+			feeProportionalMillionths: hint.feeProportionalMillionths
+		};
+		const signed = encodeChannelUpdateMessage({
+			...update,
+			signature: signChannelUpdate(encodeChannelUpdateMessage(update), p1Key)
+		});
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		const p1 = world.primaries[0].node as any;
+		const forward = p1.handleForwardHtlc.bind(p1);
+		let failed = 0;
+		p1.handleForwardHtlc = (
+			inChannelId: Buffer,
+			inHtlcId: bigint,
+			_paymentHash: Buffer,
+			processed: { sharedSecret: Buffer },
+			incomingAmountMsat: bigint
+		): void => {
+			if (++failed === 2) p1.handleForwardHtlc = forward;
+			const data = Buffer.alloc(10 + signed.length);
+			data.writeBigUInt64BE(incomingAmountMsat, 0);
+			data.writeUInt16BE(signed.length, 8);
+			signed.copy(data, 10);
+			p1.channelManager.failHtlc(
+				inChannelId,
+				inHtlcId,
+				createFailureMessage(processed.sharedSecret, FEE_INSUFFICIENT, data)
+			);
+		};
+		const logs: Array<{ action: string; data: Record<string, unknown> }> = [];
+		world.w.on('log', (log: (typeof logs)[number]) => logs.push(log));
+
+		await payAndSettle(world, invoice.bolt11, invoice.paymentHash);
+
+		const payment = world.w.getPayment(invoice.paymentHash)!;
+		expect(
+			logs.filter((log) => log.action === 'retry_repriced'),
+			'each part failure read as a re-price'
+		).to.have.length(2);
+		// The first part fills its channel, so at the higher fee its
+		// replacement no longer fits that channel alone and is re-split over
+		// both: the adds are the planned parts plus whatever the replacements
+		// were split into.
+		const replaced = logs.filter((log) => log.action === 'mpp_part_replaced');
+		expect(replaced, 'both parts replaced').to.have.length(2);
+		expect(world.wAdds).to.equal(
+			replaced.reduce((n, log) => n + (log.data.replacementParts as number), 2)
+		);
+		expect(
+			world.primaries[0].forwardedMsat,
+			'P1 forwarded the invoice to D once over'
+		).to.equal(amountMsat);
+		expect(payment.retryCount).to.equal(2);
+		destroyAll(...world.nodes);
+	});
+
+	it('a replacement whose record cannot be written is not sent and the payment fails once (#1942)', async function () {
+		this.timeout(30_000);
+		// The replaced-part world, with W on storage that refuses the one
+		// write the replacement needs: the record carrying its debit. The
+		// replacement stays home, since a restart after its HTLC landed would
+		// find a record short of what the channels show, and the payment ends
+		// as one with no route does.
+		const storage = new MemoryStorage();
+		let refuseNextSave = false;
+		const savePayment = storage.savePayment.bind(storage);
+		storage.savePayment = (hash: string, record: IPaymentInfo): void => {
+			if (refuseNextSave) {
+				refuseNextSave = false;
+				throw new Error('injected savePayment failure');
+			}
+			savePayment(hash, record);
+		};
+		const world = await buildWorld(7320, [200_000n, 100_000n, 100_000n], {
+			dChannelSats: [1_000_000n, 30_000n, 1_000_000n],
+			wExtra: { storage }
+		});
+		penalise(world, 2);
+		const amountMsat = world.spendable[0] + REMAINDER_MSAT;
+		const invoice = world.d.createInvoice({
+			amountMsat,
+			description: 'unwritable record'
+		});
+		let failedEvents = 0;
+		world.w.on('payment:failed', () => failedEvents++);
+		const errors: string[] = [];
+		world.w.on('node:error', (err: { code: string }) => errors.push(err.code));
+		// The failed part's resolution is reported once its mapping is
+		// released; the next record write is the replacement's.
+		world.w.on('payment:htlc-resolved', () => {
+			refuseNextSave = true;
+		});
+
+		const payment = world.w.sendPayment(invoice.bolt11);
+		const plannedMsat = payment.sentMsat;
+		await waitFor(
+			() => payment.status === PaymentStatus.FAILED,
+			'the payment to fail on W'
+		);
+		await settle();
+
+		expect(world.wAdds, 'the two planned parts only').to.equal(2);
+		expect(world.primaries.map((p) => p.forwards)).to.deep.equal([1, 0, 0]);
+		expect(payment.failureReason).to.match(
+			/Replacement part not sent: the payment record could not be persisted/
+		);
+		expect(payment.retryCount ?? 0, 'no replacement counted').to.equal(0);
+		expect(payment.sentMsat, 'the planned parts alone').to.equal(plannedMsat);
+		expect(errors).to.include('PERSISTENCE_ERROR');
+		expect(failedEvents).to.equal(1);
+		const stored = storage.loadPayment(invoice.paymentHash.toString('hex'))!;
+		expect(stored.status).to.equal(PaymentStatus.FAILED);
+		expect(stored.sentMsat).to.equal(plannedMsat);
 		destroyAll(...world.nodes);
 	});
 });

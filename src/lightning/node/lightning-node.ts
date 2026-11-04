@@ -19240,24 +19240,26 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		if (!signer.equals(erringHop.pubkey)) return false;
 		if (!verifyChannelUpdate(update, payload, nodeId1, nodeId2)) return false;
 
-		// What this attempt routed with: the override an earlier failure of
-		// this payment stored, else the graph's policy for the erring node's
-		// side, else (a hint edge) the fee and delta the route recorded.
+		// What this attempt routed with: the route's own hops carry the fee
+		// and delta the planner priced the erring channel at, whether from the
+		// graph, from the override an earlier failure of this payment stored,
+		// or from a hint. The limits a route does not carry are read from
+		// that override, else the graph. The fees are not read from the
+		// override: an MPP part planned before a sibling's failure stored it
+		// is priced at the older figure, so the same update coming back on
+		// that part is still a re-price, not a fault at a price we knew.
 		const key = policyOverrideKey(scidHex, direction);
-		const routedWith =
+		const limits =
 			ctx.policyOverrides?.get(key) ??
 			(known ? (direction === 0 ? known.update1 : known.update2) : undefined);
-		const unchanged = routedWith
-			? routedWith.feeBaseMsat === update.feeBaseMsat &&
-			  routedWith.feeProportionalMillionths ===
-					update.feeProportionalMillionths &&
-			  routedWith.cltvExpiryDelta === update.cltvExpiryDelta &&
-			  routedWith.htlcMinimumMsat === update.htlcMinimumMsat &&
-			  routedWith.htlcMaximumMsat === update.htlcMaximumMsat
-			: erringHop.feeBaseMsat === update.feeBaseMsat &&
-			  erringHop.feeProportionalMillionths ===
-					update.feeProportionalMillionths &&
-			  outgoingHop.cltvExpiryDelta === update.cltvExpiryDelta;
+		const unchanged =
+			erringHop.feeBaseMsat === update.feeBaseMsat &&
+			erringHop.feeProportionalMillionths ===
+				update.feeProportionalMillionths &&
+			outgoingHop.cltvExpiryDelta === update.cltvExpiryDelta &&
+			(!limits ||
+				(limits.htlcMinimumMsat === update.htlcMinimumMsat &&
+					limits.htlcMaximumMsat === update.htlcMaximumMsat));
 		if (unchanged) return false;
 
 		if (!ctx.policyOverrides) ctx.policyOverrides = new Map();
@@ -19977,18 +19979,31 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			}
 		}
 
+		const sentBefore = payment.sentMsat;
+		const retriesBefore = payment.retryCount;
 		retryCtx.retryCount++;
 		payment.retryCount = retryCtx.retryCount;
 		// sentMsat is what left this node for the payment: the failed part's
 		// first-hop amount comes off, the replacement's goes on. Persisted
 		// before the replacement leaves: a restart after its HTLC is durable
 		// finds no MPP state to re-sum it from, so the record must already
-		// carry the debit the channels will show.
+		// carry the debit the channels will show. A record that cannot be
+		// written holds the replacement back for the same reason, and the
+		// payment ends as one with no route does.
 		payment.sentMsat =
 			(payment.sentMsat ?? 0n) -
 			failedPart.amountMsat +
 			multiRoute.totalAmountMsat;
-		this.persistPayment(paymentHash);
+		const revised = this.paymentMutation(paymentHash);
+		if (
+			revised &&
+			!this.commitMutations('persist replaced MPP part', [revised])
+		) {
+			payment.sentMsat = sentBefore;
+			payment.retryCount = retriesBefore;
+			retryCtx.retryCount--;
+			return 'replacement part not sent: the payment record could not be persisted';
+		}
 		this.emitStructuredLog('payment', 'mpp_part_replaced', {
 			paymentHash: hashHex,
 			failedChannelId: failedPart.channelId.toString('hex'),
