@@ -15,8 +15,22 @@ import { LightningNode } from '../../src/lightning/node/lightning-node';
 import {
 	INodeConfig,
 	IPaymentInfo,
+	InvalidRequestError,
 	PaymentStatus
 } from '../../src/lightning/node/types';
+import { IRoutingHintHop } from '../../src/lightning/invoice/types';
+import {
+	CRASH_V1_PROFILE,
+	DurabilityBarrier,
+	GuardianClient,
+	GuardianReplicator,
+	RecoveryJournal,
+	computeGuardianSetId,
+	deriveRecoveryMasterKey,
+	deriveRecoveryRoot,
+	xOnlyFromSecret
+} from '../../src/lightning/recovery';
+import { encodedMutationBytes } from '../../src/lightning/recovery/frame-codec';
 import { MemoryStorage } from '../../src/lightning/storage/memory-storage';
 import {
 	FEE_INSUFFICIENT,
@@ -206,6 +220,185 @@ function hintScidOf(i: number): Buffer {
 function penalise(world: IWorld, i: number): void {
 	// eslint-disable-next-line @typescript-eslint/no-explicit-any
 	(world.w as any).missionControl.recordFailure(hintScidOf(i).toString('hex'));
+}
+
+const GUARDIAN_IDS = [1, 2, 3].map((i) =>
+	xOnlyFromSecret(
+		crypto.createHash('sha256').update(`mpp-guardian-${i}`).digest()
+	)
+);
+const GUARDIAN_SET_ID = computeGuardianSetId({
+	...CRASH_V1_PROFILE,
+	guardianIds: GUARDIAN_IDS
+});
+let guardianClock = 2_230_000_000_000n;
+
+/**
+ * Recovery config whose guardians take records up to `ceiling` bytes. No
+ * lease, so nothing is ever sent to them: the journal only learns the limit.
+ */
+function recoveryUnderCeiling(
+	seedId: number,
+	storage: MemoryStorage,
+	ceiling: number
+): INodeConfig['recovery'] {
+	const replicator = new GuardianReplicator({
+		storage,
+		guardians: GUARDIAN_IDS.map((id) => ({
+			client: new GuardianClient({
+				url: 'http://127.0.0.1:9',
+				guardianSetId: GUARDIAN_SET_ID
+			}),
+			expectedGuardianId: id
+		})),
+		context: { guardianSetId: GUARDIAN_SET_ID, members: GUARDIAN_IDS },
+		required: CRASH_V1_PROFILE.required,
+		recoveryRoot: deriveRecoveryRoot(nodePrivkey(seedId)),
+		clock: () => ++guardianClock
+	});
+	replicator.maxRecordBytes = (): number => ceiling;
+	return {
+		enabled: true,
+		durability: 'async-remote',
+		barrier: new DurabilityBarrier({
+			durability: 'async-remote',
+			replicator,
+			lease: () => null,
+			timeoutMs: 2_000,
+			retryDelayMs: 50
+		})
+	};
+}
+
+interface IChainWorld {
+	w: LightningNode;
+	d: LightningNode;
+	/** The four nodes of the long path, Q1 first. */
+	chain: LightningNode[];
+	nodes: LightningNode[];
+	/** update_add_htlc messages W sent, one per part. */
+	wAdds: number;
+	/** Adds Q1 forwarded down the long path. */
+	chainForwards: number;
+	/** W's spendable balance with P1, the primary whose part fails. */
+	p1Spendable: bigint;
+	/** Hints for the long path D's invoices carry. */
+	chainHints: IRoutingHintHop[][];
+	/** Encoded bytes a payment_state mutation may take in W's frames. */
+	room: number;
+	/** Encoded bytes of every payment_state W journaled for the hash. */
+	rowBytes: (paymentHash: Buffer) => number[];
+}
+
+/**
+ * W, on a journal whose guardians take records up to `ceiling` bytes, pays D
+ * over two primaries and one long path. P1's channel with W carries most of
+ * an amount and its channel to D is far too small for it, so P1 fails its
+ * part back once P2's has left. P2 has nothing left for the replacement
+ * after its own part, which leaves the long path: W-Q1-Q2-Q3-Q4-D, five
+ * hops against the planned parts' two. The long path is penalised so the
+ * plan takes the primaries, and its private links are hinted by alias.
+ */
+async function buildChainWorld(
+	seedBase: number,
+	ceiling: number
+): Promise<IChainWorld> {
+	const storage = new MemoryStorage();
+	const w = createNode(seedBase, storage, {
+		recovery: recoveryUnderCeiling(seedBase, storage, ceiling)
+	});
+	const d = createNode(seedBase + 1);
+	const p1 = createNode(seedBase + 2);
+	const p2 = createNode(seedBase + 3);
+	const chain = [0, 1, 2, 3].map((i) => createNode(seedBase + 4 + i));
+	for (const p of [p1, p2]) {
+		wire(w, p, { val: false });
+		wire(p, d, { val: false });
+	}
+	const path = [w, ...chain, d];
+	for (let i = 0; i < path.length - 1; i++) {
+		wire(path[i], path[i + 1], { val: false });
+	}
+	const wP1 = await openChannelOf(w, p1, 200_000n);
+	await openChannelOf(w, p2, 100_000n);
+	const links: Array<{ from: LightningNode; to: LightningNode; id: Buffer }> = [
+		{ from: p1, to: d, id: await openChannelOf(p1, d, 30_000n) },
+		{ from: p2, to: d, id: await openChannelOf(p2, d, 1_000_000n) }
+	];
+	await openChannelOf(w, chain[0], 230_000n);
+	for (let i = 1; i < path.length - 1; i++) {
+		links.push({
+			from: path[i],
+			to: path[i + 1],
+			id: await openChannelOf(path[i], path[i + 1], 1_000_000n)
+		});
+	}
+	links.forEach(({ from, to, id }, i) => {
+		const scid = hintScidOf(i);
+		from.registerChannelScid(id, scid);
+		writableState(from.getChannelManager().getChannel(id)!).remoteScidAlias =
+			scid;
+		writableState(to.getChannelManager().getChannel(id)!).remoteScidAlias =
+			scid;
+	});
+	// D's own hint for P1 prices every hop of the long path: each node runs
+	// the same default forwarding policy.
+	const priced = decodeInvoice(
+		d.createInvoice({ amountMsat: 1_000n, description: 'price' }).bolt11
+	).routingHints![0][0];
+	const chainHints = [
+		chain.map((node, i) => ({
+			...priced,
+			pubkey: Buffer.from(node.getNodeId(), 'hex'),
+			shortChannelId: hintScidOf(2 + i)
+		}))
+	];
+	// eslint-disable-next-line @typescript-eslint/no-explicit-any
+	const missionControl = (w as any).missionControl;
+	missionControl.recordFailure(hintScidOf(2).toString('hex'));
+	missionControl.recordFailure(hintScidOf(5).toString('hex'));
+	const room = (
+		w as unknown as { recoveryJournal: { mutationRoom(): number } }
+	).recoveryJournal.mutationRoom();
+	const reader = new RecoveryJournal(
+		storage,
+		deriveRecoveryMasterKey(nodePrivkey(seedBase)),
+		getPublicKey(nodePrivkey(seedBase)),
+		deriveRecoveryRoot(nodePrivkey(seedBase)).recoveryId
+	);
+	const world: IChainWorld = {
+		w,
+		d,
+		chain,
+		nodes: [w, d, p1, p2, ...chain],
+		wAdds: 0,
+		chainForwards: 0,
+		p1Spendable: w
+			.getChannelManager()
+			.getChannel(wP1)!
+			.getSpendableOutboundMsat(),
+		chainHints,
+		room,
+		rowBytes: (paymentHash): number[] => {
+			const bytes: number[] = [];
+			for (const frame of reader.loadVerifiedFrames()) {
+				for (const mutation of frame.mutations) {
+					if (
+						mutation.type === 'payment_state' &&
+						mutation.paymentHash === paymentHash.toString('hex')
+					) {
+						bytes.push(encodedMutationBytes(mutation));
+					}
+				}
+			}
+			return bytes;
+		}
+	};
+	w.on('message:outbound', (_pk: string, type: number) => {
+		if (type === MessageType.UPDATE_ADD_HTLC) world.wAdds++;
+	});
+	chain[0].on('htlc:forward', () => world.chainForwards++);
+	return world;
 }
 
 const sum = (values: bigint[]): bigint => values.reduce((a, b) => a + b, 0n);
@@ -786,6 +979,84 @@ describe('MPP across distinct first-hop peers (issue #1922)', function () {
 		const stored = storage.loadPayment(invoice.paymentHash.toString('hex'))!;
 		expect(stored.status).to.equal(PaymentStatus.FAILED);
 		expect(stored.sentMsat).to.equal(plannedMsat);
+		destroyAll(...world.nodes);
+	});
+
+	it('a replacement whose longer route would outgrow the labelled payment row is not sent (#1942)', async function () {
+		this.timeout(60_000);
+		// Guardians this small make the row, not the half-frame rule, what
+		// bounds a label: the longest one the planned two-hop parts allow
+		// leaves no room in the row for a five-hop route.
+		const world = await buildChainWorld(7340, 5_000);
+		const amountMsat = world.p1Spendable + REMAINDER_MSAT;
+		let payment: IPaymentInfo | undefined;
+		for (
+			let length = Math.floor(world.room / 2);
+			!payment && length > 0;
+			length -= 16
+		) {
+			const invoice = world.d.createInvoice({
+				amountMsat,
+				description: 'long replacement',
+				extraRoutingHints: world.chainHints
+			});
+			try {
+				payment = world.w.sendPaymentWithOptions(invoice.bolt11, {
+					metadata: { note: 'x'.repeat(length) }
+				});
+			} catch (err) {
+				if (!(err instanceof InvalidRequestError)) throw err;
+			}
+		}
+		expect(payment, 'a label the planned parts fit').to.exist;
+		const sent = payment!;
+		await waitFor(
+			() => sent.status !== PaymentStatus.PENDING,
+			'the payment to resolve on W'
+		);
+		await settle();
+
+		const rows = world.rowBytes(sent.paymentHash);
+		expect(rows).to.not.have.length(0);
+		for (const bytes of rows) expect(bytes).to.be.at.most(world.room);
+		expect(sent.status).to.equal(PaymentStatus.FAILED);
+		expect(sent.failureReason).to.match(
+			/replacement part not sent: the payment record would be too large for the recovery guardians/i
+		);
+		expect(world.wAdds, 'the two planned parts only').to.equal(2);
+		expect(world.chainForwards, 'nothing took the long path').to.equal(0);
+		expect(sent.retryCount ?? 0, 'no replacement counted').to.equal(0);
+		destroyAll(...world.nodes);
+	});
+
+	it('a replacement over a longer route takes over a labelled row that still fits (#1942)', async function () {
+		this.timeout(60_000);
+		const world = await buildChainWorld(7360, 5_000);
+		const invoice = world.d.createInvoice({
+			amountMsat: world.p1Spendable + REMAINDER_MSAT,
+			description: 'long replacement fits',
+			extraRoutingHints: world.chainHints
+		});
+		const payment = world.w.sendPaymentWithOptions(invoice.bolt11, {
+			metadata: { note: 'short' }
+		});
+		await waitFor(
+			() => payment.status === PaymentStatus.COMPLETED,
+			'the payment to complete on W'
+		);
+
+		expect(world.wAdds, 'two planned parts and one replacement').to.equal(3);
+		expect(world.chainForwards, 'the replacement took the long path').to.equal(
+			1
+		);
+		expect(payment.retryCount, 'one part replaced').to.equal(1);
+		expect(
+			payment.route!.hops,
+			"the replacement took the failed part's place on the row"
+		).to.have.length(5);
+		const rows = world.rowBytes(invoice.paymentHash);
+		expect(rows).to.not.have.length(0);
+		for (const bytes of rows) expect(bytes).to.be.at.most(world.room);
 		destroyAll(...world.nodes);
 	});
 });

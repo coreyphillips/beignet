@@ -19645,20 +19645,9 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		const settledInvoice =
 			this.paymentRetryContexts.get(hashHex)?.invoiceStr ?? invoiceStr;
 		if (
-			metadata &&
-			!multiRoute.parts.every((part) => {
-				const labelled: IPaymentInfo = {
-					...payment,
-					cltvBaseHeight: this.cltvBaseHeight(paymentHash),
-					route: part as IPaymentInfo['route'],
-					sharedSecrets: part.hops.map(() => Buffer.alloc(32))
-				};
-				return this.paymentMetadataFits(
-					metadata,
-					[{ type: 'payment_state', paymentHash: hashHex, payment: labelled }],
-					[this.settledPaymentMutation(labelled, settledInvoice)]
-				);
-			})
+			!multiRoute.parts.every((part) =>
+				this.mppRowFitsWithRoute(payment, part as IRoute, settledInvoice)
+			)
 		) {
 			throw new InvalidRequestError(
 				'payment metadata is too large for the recovery guardians to accept'
@@ -19878,6 +19867,47 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	}
 
 	/**
+	 * Whether a labelled MPP payment row still fits a recovery frame on its
+	 * own (paymentMetadataFits) with `route` as its payment-level route: the
+	 * row as dispatch leaves it, with the route and one shared secret per hop
+	 * (dispatchMppPart), and as settlement journals it. An unlabelled row is
+	 * not sized here, as no other send path sizes one.
+	 *
+	 * Every part a payment sends has to pass, the planned ones and each
+	 * replacement's (issue #1942): any of them can end up on the row, since
+	 * the first part to leave takes it and a replaced part hands it on. A
+	 * guardian refuses a frame over its limit and every frame after it, and
+	 * the journal writes such a frame anyway, so a part that could grow the
+	 * settled row past the room must not leave. The channel update the
+	 * settled row rides with shares its frame and is not sized here (issue
+	 * #1954).
+	 */
+	private mppRowFitsWithRoute(
+		payment: IPaymentInfo,
+		route: IRoute,
+		settledInvoice: string | undefined
+	): boolean {
+		if (!payment.metadata) return true;
+		const labelled: IPaymentInfo = {
+			...payment,
+			cltvBaseHeight: this.cltvBaseHeight(payment.paymentHash),
+			route,
+			sharedSecrets: route.hops.map(() => Buffer.alloc(32))
+		};
+		return this.paymentMetadataFits(
+			payment.metadata,
+			[
+				{
+					type: 'payment_state',
+					paymentHash: payment.paymentHash.toString('hex'),
+					payment: labelled
+				}
+			],
+			[this.settledPaymentMutation(labelled, settledInvoice)]
+		);
+	}
+
+	/**
 	 * Whether a failed MPP part may be replaced inside the same payment
 	 * (issue #1942): a BOLT 11 payment still open, whose failure is not
 	 * permanent. Keysend, BOLT 12 and pay-all never split, so their contexts
@@ -19978,6 +20008,17 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				return `replacement part not sent: fees of ${liveFeeMsat} msat would exceed the cap of ${retryCtx.maxFeeMsat} msat`;
 			}
 		}
+		// Sized as the planned parts were, before anything is counted or
+		// written: a replacement's route can be longer than the part it
+		// replaces, and the row it may take over must still fit the room a
+		// guardian accepts.
+		if (
+			!multiRoute.parts.every((part) =>
+				this.mppRowFitsWithRoute(payment, part, retryCtx.invoiceStr)
+			)
+		) {
+			return 'replacement part not sent: the payment record would be too large for the recovery guardians to accept over its route';
+		}
 
 		const sentBefore = payment.sentMsat;
 		const retriesBefore = payment.retryCount;
@@ -20014,7 +20055,8 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		});
 		// Completion credits the payment-level route in MissionControl, so a
 		// failed part's route must not stay there: the replacement's first part
-		// takes it over the way the first planned part took it.
+		// takes it over the way the first planned part took it. Every
+		// replacement part was sized for the row above.
 		if (payment.route === failedPart.route) {
 			payment.route = undefined;
 			payment.sharedSecrets = undefined;
