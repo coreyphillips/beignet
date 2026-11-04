@@ -38,19 +38,16 @@ import { decode as decodeInvoice } from '../../src/lightning/invoice/decode';
 import {
 	DEFAULT_CHANNEL_CONFIG,
 	HtlcState,
-	MAX_ACCEPTED_HTLCS,
 	REGTEST_CHAIN_HASH
 } from '../../src/lightning/channel/types';
 import { IChannelBasepoints } from '../../src/lightning/keys/derivation';
 import { SqliteStorage } from '../../src/lightning/storage/sqlite-storage';
 import { IStorageBackend } from '../../src/lightning/storage/types';
 import {
-	CHANNEL_STATE_RESERVE_BYTES,
 	CRASH_V1_PROFILE,
 	DurabilityBarrier,
 	GUARDIAN_HOST_DEFAULT_MAX_CIPHERTEXT_BYTES,
 	GUARDIAN_RECORD_LIMIT_FLOOR_BYTES,
-	PAYMENT_ROW_MAX_BYTES,
 	GuardianClient,
 	GuardianHttpServer,
 	GuardianReplicator,
@@ -60,12 +57,14 @@ import {
 	IWriterLeaseKeys,
 	JOURNAL_META_KEYS,
 	RecoveryCriticality,
+	RecoveryFrame,
 	RecoveryJournal,
 	RecoveryManager,
 	ReferenceGuardian,
 	computeGuardianSetId,
 	deriveRecoveryMasterKey,
 	deriveRecoveryRoot,
+	reconstructFromFrames,
 	xOnlyFromSecret
 } from '../../src/lightning/recovery';
 import { encodedMutationBytes } from '../../src/lightning/recovery/frame-codec';
@@ -325,8 +324,6 @@ async function waitFor(
 /**
  * A node whose guardians take records up to `ceiling` bytes, and readers of
  * what it journals. No lease, so nothing is ever sent to the guardians.
- * `room` is what a payment row may take: the frame's room under a small
- * ceiling, the row cap under one at the floor or above (issue #1954).
  */
 function nodeUnderCeiling(ceiling: number): {
 	node: LightningNode;
@@ -352,14 +349,11 @@ function nodeUnderCeiling(ceiling: number): {
 		durability: 'async-remote',
 		barrier: barrierFor(replicator, () => null, 'async-remote')
 	});
-	const room = Math.min(
-		(
-			node as unknown as {
-				recoveryJournal: { mutationRoom(): number };
-			}
-		).recoveryJournal.mutationRoom(),
-		PAYMENT_ROW_MAX_BYTES
-	);
+	const room = (
+		node as unknown as {
+			recoveryJournal: { mutationRoom(): number };
+		}
+	).recoveryJournal.mutationRoom();
 	const journal = new RecoveryJournal(
 		storage,
 		deriveRecoveryMasterKey(NODE_SECRET),
@@ -2255,14 +2249,11 @@ describe('Recovery phase 6: the settlement frame fits the guardian record limit 
 		storage.close();
 	});
 
-	it('at the host default, the longest label the budget allows settles with every frame under the limit, leaving a full channel its reserve', async function (): Promise<void> {
+	it('at the host default, the longest label the budget allows settles with every frame under the limit', async function (): Promise<void> {
 		this.timeout(20_000);
 		const CEILING = GUARDIAN_HOST_DEFAULT_MAX_CIPHERTEXT_BYTES;
 		expect(CEILING).to.be.at.least(GUARDIAN_RECORD_LIMIT_FLOOR_BYTES);
 		const { node, storage, room } = nodeUnderCeiling(CEILING);
-		// At the floor the row cap binds, not the frame: the frame has to
-		// hold the channel's state beside the row.
-		expect(room).to.equal(PAYMENT_ROW_MAX_BYTES);
 		const actions: string[] = [];
 		node.on('log', (log: { action: string }) => actions.push(log.action));
 		const payee = createLoopbackNode('default-ceiling-label', 2);
@@ -2277,7 +2268,6 @@ describe('Recovery phase 6: the settlement frame fits the guardian record limit 
 			Math.floor(room / 2) - JSON.stringify({ note: '' }).length
 		);
 		expect(JSON.stringify({ note }).length).to.be.at.most(room / 2);
-		// One byte more fits the frame alone, and is refused all the same.
 		const over = payee.createInvoice({
 			amountMsat: 5_000_000n,
 			description: 'over'
@@ -2301,10 +2291,6 @@ describe('Recovery phase 6: the settlement frame fits the guardian record limit 
 
 		const frame = settlementFrame(storage, invoice.paymentHash.toString('hex'));
 		expect(frame.ciphertext).to.be.greaterThan(room / 2);
-		// A channel at the reserve in this idle one's place would still fit.
-		expect(
-			frame.ciphertext - frame.channelState + CHANNEL_STATE_RESERVE_BYTES
-		).to.be.at.most(CEILING);
 		for (const stored of storage.loadRecoveryFrames()) {
 			expect(stored.ciphertext.length).to.be.at.most(CEILING);
 		}
@@ -2315,65 +2301,164 @@ describe('Recovery phase 6: the settlement frame fits the guardian record limit 
 		storage.close();
 	});
 
-	it('the channel state reserve holds a channel full in both directions', async function (): Promise<void> {
-		this.timeout(60_000);
-		const { node, storage } = nodeUnderCeiling(
-			GUARDIAN_HOST_DEFAULT_MAX_CIPHERTEXT_BYTES
+	/** Every verified frame with its stored ciphertext size. */
+	function journaledFrames(
+		storage: SqliteStorage
+	): Array<{ frame: RecoveryFrame; ciphertext: number }> {
+		const journal = new RecoveryJournal(
+			storage,
+			deriveRecoveryMasterKey(NODE_SECRET),
+			NODE_ID,
+			ROOT.recoveryId
 		);
-		const payee = createLoopbackNode('reserve-full-channel', 2);
+		const stored = new Map(
+			storage.loadRecoveryFrames().map((f) => [f.sequence, f.ciphertext.length])
+		);
+		return journal.loadVerifiedFrames().map((frame) => ({
+			frame,
+			ciphertext: stored.get(Number(frame.sequence))!
+		}));
+	}
+
+	/** The payment rows a frame journals for one hash. */
+	function rowsFor(frame: RecoveryFrame, hashHex: string): IPaymentInfo[] {
+		return frame.mutations.flatMap((m) =>
+			m.type === 'payment_state' && m.paymentHash === hashHex ? [m.payment] : []
+		);
+	}
+
+	it('a settlement over the limit only for its label is journaled without it, the label follows in the next frame, and a restore from the chain has it', async function (): Promise<void> {
+		this.timeout(20_000);
+		// The issue's shape: a limit in the tens of kilobytes, where one
+		// channel's state already takes more than half a frame. A stubbed
+		// limit, below the floor a guardian could advertise.
+		const CEILING = 16_000;
+		const { node, storage, room } = nodeUnderCeiling(CEILING);
+		const actions: string[] = [];
+		node.on('log', (log: { action: string }) => actions.push(log.action));
+		const payee = createLoopbackNode('label-follows', 2);
 		connectNodes(node, payee);
 		node.handleNewBlock(1000);
 		payee.handleNewBlock(1000);
-		openReadyChannel(node, payee, 16_000_000n);
+		openReadyChannel(node, payee);
 
-		// The channel_state a settlement frame carries, with whatever the
-		// channel holds in flight at the time, read from a payment settled
-		// after the holds below: its fulfil commits every add before it.
-		const settledChannelState = async (
-			description: string
-		): Promise<number> => {
-			const invoice = payee.createInvoice({
-				amountMsat: 5_000_000_000n,
-				description
-			});
-			node.sendPaymentWithOptions(invoice.bolt11, {});
-			expect(
-				(await node.awaitPaymentResolution(invoice.paymentHash, 10_000)).status
-			).to.equal(PaymentStatus.COMPLETED);
-			await new Promise((resolve) => setImmediate(resolve));
-			return settlementFrame(storage, invoice.paymentHash.toString('hex'))
-				.channelState;
-		};
-		const hold = (
-			from: LightningNode,
-			to: LightningNode,
-			count: number
-		): void => {
-			for (let i = 0; i < count; i++) {
-				const preimage = crypto.randomBytes(32);
-				const invoice = to.createInvoice({
-					amountMsat: 1_000_000n,
-					description: 'held',
-					hold: true,
-					paymentHash: crypto.createHash('sha256').update(preimage).digest()
-				});
-				from.sendPaymentWithOptions(invoice.bolt11, {});
-			}
-		};
+		// Inside the label budget, and with the channel's state beside it
+		// more than a frame can take.
+		const note = 'x'.repeat(6_000);
+		expect(JSON.stringify({ note }).length).to.be.at.most(room / 2);
+		const invoice = payee.createInvoice({
+			amountMsat: 5_000_000n,
+			description: 'label follows'
+		});
+		const hashHex = invoice.paymentHash.toString('hex');
+		node.sendPaymentWithOptions(invoice.bolt11, { metadata: { note } });
+		expect(
+			(await node.awaitPaymentResolution(invoice.paymentHash, 5_000)).status
+		).to.equal(PaymentStatus.COMPLETED);
+		await new Promise((resolve) => setImmediate(resolve));
 
-		// The first settlement also gives the payee a balance to send back.
-		const idle = await settledChannelState('idle');
-		const HELD = 20;
-		hold(node, payee, HELD);
-		hold(payee, node, HELD);
-		const busy = await settledChannelState('busy');
-		const perHtlc = (busy - idle) / (2 * HELD);
-		expect(perHtlc).to.be.greaterThan(1_000);
-		// A delta grows by the same amount per HTLC whichever way it goes, so
-		// a channel full both ways at the protocol limit stays in the reserve.
-		expect(idle + perHtlc * 2 * MAX_ACCEPTED_HTLCS).to.be.at.most(
-			CHANNEL_STATE_RESERVE_BYTES
+		for (const stored of storage.loadRecoveryFrames()) {
+			expect(stored.ciphertext.length).to.be.at.most(CEILING);
+		}
+		expect(actions).to.not.include('recovery_frame_oversized');
+
+		const frames = journaledFrames(storage);
+		const settles = frames.findIndex(({ frame }) =>
+			rowsFor(frame, hashHex).some((p) => p.status === PaymentStatus.COMPLETED)
 		);
+		expect(settles).to.be.at.least(0);
+		const settlement = frames[settles].frame;
+		// The transition still commits whole: the channel update, the
+		// mapping teardown, the consumed secret and the settled row, with
+		// the proof's invoice and the preimage but not the label.
+		expect(settlement.mutations.map((m) => m.type)).to.include.members([
+			'channel_state',
+			'delete_htlc_payment_mapping',
+			'delete_payment_secret',
+			'payment_state'
+		]);
+		const [unlabelled] = rowsFor(settlement, hashHex);
+		expect(unlabelled.preimage).to.not.equal(undefined);
+		expect(unlabelled.metadata?._invoice).to.equal(invoice.bolt11);
+		expect(unlabelled.metadata).to.not.have.property('note');
+		// The label is the very next frame: the same row, whole, on its own.
+		const follow = frames[settles + 1].frame;
+		expect(follow.sequence).to.equal(settlement.sequence + 1n);
+		expect(follow.outboundMessages).to.have.length(0);
+		expect(follow.mutations.map((m) => m.type)).to.deep.equal([
+			'payment_state'
+		]);
+		const [labelled] = rowsFor(follow, hashHex);
+		expect(labelled.status).to.equal(PaymentStatus.COMPLETED);
+		expect(labelled.metadata?.note).to.equal(note);
+
+		// The whole chain restores the label; one cut between the two frames
+		// restores the settled payment without it.
+		const restored = openStorage();
+		reconstructFromFrames(
+			restored,
+			frames.map(({ frame }) => frame)
+		);
+		expect(restored.loadPayment(hashHex)!.metadata?.note).to.equal(note);
+		expect(restored.loadPayment(hashHex)!.status).to.equal(
+			PaymentStatus.COMPLETED
+		);
+		const cut = openStorage();
+		reconstructFromFrames(
+			cut,
+			frames.slice(0, settles + 1).map(({ frame }) => frame)
+		);
+		expect(cut.loadPayment(hashHex)!.status).to.equal(PaymentStatus.COMPLETED);
+		expect(cut.loadPayment(hashHex)!.preimage).to.not.equal(undefined);
+		expect(cut.loadPayment(hashHex)!.metadata).to.not.have.property('note');
+
+		restored.close();
+		cut.close();
+		payee.destroy();
+		node.destroy();
+		storage.close();
+	});
+
+	it('a delta still over the limit without its labels is journaled whole and reported, as before', async function (): Promise<void> {
+		this.timeout(20_000);
+		// Below one channel's state: moving the label cannot bring the
+		// settlement under, so nothing moves.
+		const CEILING = 8_000;
+		const { node, storage } = nodeUnderCeiling(CEILING);
+		const actions: string[] = [];
+		node.on('log', (log: { action: string }) => actions.push(log.action));
+		const payee = createLoopbackNode('label-stays', 2);
+		connectNodes(node, payee);
+		node.handleNewBlock(1000);
+		payee.handleNewBlock(1000);
+		openReadyChannel(node, payee);
+
+		const invoice = payee.createInvoice({
+			amountMsat: 5_000_000n,
+			description: 'label stays'
+		});
+		const hashHex = invoice.paymentHash.toString('hex');
+		node.sendPaymentWithOptions(invoice.bolt11, {
+			metadata: { note: 'stays' }
+		});
+		expect(
+			(await node.awaitPaymentResolution(invoice.paymentHash, 5_000)).status
+		).to.equal(PaymentStatus.COMPLETED);
+		await new Promise((resolve) => setImmediate(resolve));
+
+		const frames = journaledFrames(storage);
+		const settles = frames.findIndex(({ frame }) =>
+			rowsFor(frame, hashHex).some((p) => p.status === PaymentStatus.COMPLETED)
+		);
+		expect(settles).to.be.at.least(0);
+		expect(frames[settles].ciphertext).to.be.greaterThan(CEILING);
+		expect(rowsFor(frames[settles].frame, hashHex)[0].metadata?.note).to.equal(
+			'stays'
+		);
+		for (const { frame } of frames.slice(settles + 1)) {
+			expect(rowsFor(frame, hashHex)).to.have.length(0);
+		}
+		expect(actions).to.include('recovery_frame_oversized');
 
 		payee.destroy();
 		node.destroy();

@@ -72,33 +72,17 @@ import { GUARDIAN_HOST_DEFAULT_MAX_CIPHERTEXT_BYTES } from './guardian-host';
  * The smallest record limit a guardian may advertise and still be used:
  * the host default, so a limit can only be raised.
  *
- * A delta frame carries a whole channel transition, and a settled payment
- * row rides the transition that settles its HTLC, so the frame holds the
- * channel's state beside the row. The row checks size the row alone,
- * against PAYMENT_ROW_MAX_BYTES; this floor is what leaves the rest for
- * the channel. A guardian below it would refuse the first busy settlement
- * and, taking only the next sequence, every record after it, so it is
- * refused up front instead (issue #1954).
+ * A delta frame carries a whole channel transition: one channel's state is
+ * about 9 KB idle and grows by a few KB for every HTLC in flight. A
+ * guardian whose limit is in the tens of kilobytes would refuse the first
+ * busy transition and, taking only the next sequence, every record after
+ * it, so it is refused up front instead (issue #1954). The labelled
+ * payment row a settlement carries is not what this floor is for: the
+ * journal moves its label into a frame of its own when the two do not fit
+ * together (RecoveryJournal.moveLabelsOutOfDelta).
  */
 export const GUARDIAN_RECORD_LIMIT_FLOOR_BYTES =
 	GUARDIAN_HOST_DEFAULT_MAX_CIPHERTEXT_BYTES;
-
-/**
- * The most a channel_state takes in a delta frame: about 9 KB idle and
- * about 3.4 KB per HTLC in flight (measured), with both directions full
- * at the 483 HTLCs each may hold, about 3.3 MB, and margin over that.
- */
-export const CHANNEL_STATE_RESERVE_BYTES = 3_670_016;
-
-/**
- * The most a payment_state row may take, however large the guardians'
- * limit: what the floor leaves beside a full channel, the frame header and
- * the mapping and secret deletions a settlement also carries. A row sized
- * against the frame alone would settle beside a busy channel in a frame
- * over the floor (issue #1954).
- */
-export const PAYMENT_ROW_MAX_BYTES =
-	GUARDIAN_RECORD_LIMIT_FLOOR_BYTES - CHANNEL_STATE_RESERVE_BYTES - 1_024;
 import {
 	JOURNAL_META_KEYS,
 	META_LAST_SNAPSHOT_GROUP,
@@ -539,8 +523,8 @@ export class GuardianReplicator {
 			type: 'record:limit-too-small',
 			detail:
 				`guardian ${key} accepts records of at most ${bytes} bytes, below ` +
-				`the ${GUARDIAN_RECORD_LIMIT_FLOOR_BYTES} bytes a channel transition ` +
-				`and a labelled payment row can take together, so it is sent ` +
+				`the ${GUARDIAN_RECORD_LIMIT_FLOOR_BYTES} byte floor this node ` +
+				`needs to journal a busy channel's transitions, so it is sent ` +
 				`nothing until its operator raises the limit (the protocol allows ` +
 				`up to 16 MiB); until then it holds no record, so the other ` +
 				`guardians keep every record they are sent: raise the limit or ` +

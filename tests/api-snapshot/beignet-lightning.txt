@@ -6441,7 +6441,6 @@ method recovery.Bolt8GuardianSession.request(verb: number, body: Buffer, options
 readonly property recovery.Bolt8GuardianSession.target: recovery.IBolt8GuardianTarget
 const recovery.CAPSULE_INLINE_RESERVE_BYTES: number
 const recovery.CAPSULE_MAX_BYTES: number
-const recovery.CHANNEL_STATE_RESERVE_BYTES = 3670016
 const recovery.COMPACT_SNAPSHOT_SCHEMA_VERSION = "2+ffor-vouchers+htlc-history"
 const recovery.CRASH_V1_PROFILE: Readonly<{ profileId: 1; required: 2; total: 3; }>
 class recovery.CapsuleCandidateError extends Error
@@ -7225,7 +7224,6 @@ const recovery.META_LAST_SNAPSHOT_GROUP = "journal_last_snapshot_group"
 const recovery.META_REPLICATED_THROUGH = "guardian_replicated_through"
 const recovery.META_REPLICATED_THROUGH_HASH = "guardian_replicated_through_hash"
 type recovery.NamespaceDecision = { outcome: 'rotated'; rotation: recovery.IGuardianRotateSetRequest; } | { outcome: 'already-held'; lease: recovery.IWriterLeaseKeys; } | { outcome: 'registered'; lease: recovery.IWriterLeaseKeys; } | { outcome: 'exists-remotely'; states: recovery.GuardianState[]; } | { outcome: 'no-quorum'; responded: number; } | { outcome: 'inconsistent'; detail: string; } | { outcome: 'not-held'; detail: string; }
-const recovery.PAYMENT_ROW_MAX_BYTES: number
 const recovery.PEER_STORAGE_SNAPSHOT_INTERVAL_BYTES: number
 const recovery.PROBE_MUTATION_COVERAGE: Record<recovery.RecoveryMutation['type'], true>
 const recovery.PROBE_SNAPSHOT_COVERAGE: Record<Exclude<keyof recovery.RecoverySnapshot, 'schemaVersion' | 'pageFrames'>, true>
