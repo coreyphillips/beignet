@@ -799,7 +799,10 @@ export interface BeignetNodeOptions
 	guardianMaxBytesPerSet?: number;
 	/** Sets this node will register (default 16). */
 	guardianMaxSets?: number;
-	/** Advertised per-record ciphertext limit (default 4 MiB, at least 1 MiB). */
+	/**
+	 * Advertised per-record ciphertext limit (default 4 MiB, which is also
+	 * the least a node accepts from a guardian).
+	 */
 	guardianMaxCiphertextBytes?: number;
 	/**
 	 * Encrypt the SQLite database at rest with a key derived from the wallet

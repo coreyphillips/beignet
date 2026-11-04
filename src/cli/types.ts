@@ -1151,9 +1151,10 @@ export interface BeignetConfig extends IrohDaemonConfig, ElectrumTlsConfig {
 	/** Guardian sets this node will register (default 16). Env:
 	 *  BEIGNET_GUARDIAN_MAX_SETS. */
 	guardianMaxSets?: number;
-	/** Advertised per-record ciphertext limit (default 4194304, 4 MiB; at
-	 *  least 1 MiB, the floor a node accepts from a guardian; the protocol cap
-	 *  is 16 MiB). Env: BEIGNET_GUARDIAN_MAX_CIPHERTEXT_BYTES. */
+	/** Advertised per-record ciphertext limit (default 4194304, 4 MiB, which
+	 *  is also the floor a node accepts from a guardian, so it can only be
+	 *  raised; the protocol cap is 16 MiB). Env:
+	 *  BEIGNET_GUARDIAN_MAX_CIPHERTEXT_BYTES. */
 	guardianMaxCiphertextBytes?: number;
 	/** Node-wide default routing fee policy advertised in channel_update
 	 *  (BOLT 7; base u32 msat, proportional u32 millionths, cltv delta u16).

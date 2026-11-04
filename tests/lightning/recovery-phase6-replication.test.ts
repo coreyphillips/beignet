@@ -58,9 +58,16 @@ import {
 	IGuardianReceipt
 } from '../../src/lightning/recovery';
 
-/** A limit under the host default that a node still accepts (issue #1954). */
-const SMALL_LIMIT = 2 * 1024 * 1024;
+/**
+ * A limit under the reference guardian's 16 MiB cap, and above the host
+ * default unread INFO counts at, that a node still accepts (issue #1954).
+ */
+const SMALL_LIMIT = 2 * GUARDIAN_RECORD_LIMIT_FLOOR_BYTES;
 import { SqliteStorage } from '../../src/lightning/storage/sqlite-storage';
+import {
+	PaymentDirection,
+	PaymentStatus
+} from '../../src/lightning/node/payment-types';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
 
 const sha = (s: string): Buffer =>
@@ -923,7 +930,11 @@ describe('Recovery phase 6: fencing needs proof', () => {
 describe('Recovery phase 6: records over a guardian limit (issue #1014)', () => {
 	it('reports the smallest record limit the set advertises', async function (): Promise<void> {
 		this.timeout(20_000);
-		const served = await Promise.all([serve(0, SMALL_LIMIT), serve(1), serve(2)]);
+		const served = await Promise.all([
+			serve(0, SMALL_LIMIT),
+			serve(1),
+			serve(2)
+		]);
 		const { storage } = journaledStorage(1);
 		const rep = replicator(storage, bind(served));
 		// Unread INFO counts at the host default, never at the protocol cap.
@@ -947,7 +958,11 @@ describe('Recovery phase 6: records over a guardian limit (issue #1014)', () => 
 
 	it('reads the limit of a guardian that was down when the set was bound', async function (): Promise<void> {
 		this.timeout(20_000);
-		const served = await Promise.all([serve(0, SMALL_LIMIT), serve(1), serve(2)]);
+		const served = await Promise.all([
+			serve(0, SMALL_LIMIT),
+			serve(1),
+			serve(2)
+		]);
 		let down = true;
 		const flaky: IBoundGuardianClient = {
 			expectedGuardianId: served[0].id,
@@ -1006,7 +1021,7 @@ describe('Recovery phase 6: records over a guardian limit (issue #1014)', () => 
 			})
 		};
 		const storage = openStorage();
-		for (let i = 0; i < 20_000; i++) {
+		for (let i = 0; i < 2_000; i++) {
 			storage.saveForwardingEvent({
 				settledAt: 1_700_000_000_000 + i,
 				inChannelId: Buffer.alloc(32, 1).toString('hex'),
@@ -1014,6 +1029,20 @@ describe('Recovery phase 6: records over a guardian limit (issue #1014)', () => 
 				amountInMsat: 1_001_000n,
 				amountOutMsat: 1_000_000n,
 				feeMsat: 1_000n
+			});
+		}
+		// The snapshot keeps at most a thousand forwarding events, so what
+		// puts it over the floor is failed receives, the other history a
+		// snapshot may drop: five labelled rows of a megabyte each.
+		for (let i = 1; i <= 5; i++) {
+			const paymentHash = sha(`failed-receive-${i}`);
+			storage.savePayment(paymentHash.toString('hex'), {
+				paymentHash,
+				amountMsat: 1_000_000n,
+				status: PaymentStatus.FAILED,
+				direction: PaymentDirection.INCOMING,
+				createdAt: 1_700_000_000_000 + i,
+				metadata: { note: 'x'.repeat(1_000_000) }
 			});
 		}
 		const events: IGuardianReplicationEvent[] = [];
@@ -1071,7 +1100,11 @@ describe('Recovery phase 6: records over a guardian limit (issue #1014)', () => 
 
 	it('reads the limits before the first frame of a restart and on an idle pass', async function (): Promise<void> {
 		this.timeout(20_000);
-		const served = await Promise.all([serve(0, SMALL_LIMIT), serve(1), serve(2)]);
+		const served = await Promise.all([
+			serve(0, SMALL_LIMIT),
+			serve(1),
+			serve(2)
+		]);
 		const { storage } = journaledStorage(1);
 		const lease = await registered(replicator(storage, bind(served)));
 
@@ -1109,7 +1142,11 @@ describe('Recovery phase 6: records over a guardian limit (issue #1014)', () => 
 
 	it('reads the limit of a guardian whose INFO is outside our protocol range', async function (): Promise<void> {
 		this.timeout(20_000);
-		const served = await Promise.all([serve(0, SMALL_LIMIT), serve(1), serve(2)]);
+		const served = await Promise.all([
+			serve(0, SMALL_LIMIT),
+			serve(1),
+			serve(2)
+		]);
 		const { storage } = journaledStorage(1);
 		await registered(replicator(storage, bind(served)));
 
@@ -1141,7 +1178,7 @@ describe('Recovery phase 6: records over a guardian limit (issue #1014)', () => 
 		const storage = openStorage();
 		// Enough state that the bootstrap snapshot outgrows the floor limit
 		// plus the transport's envelope allowance.
-		for (let i = 1; i <= 10_000; i++) {
+		for (let i = 1; i <= 40_000; i++) {
 			const preimage = sha(`too-large-${i}`);
 			storage.savePreimage(
 				crypto.createHash('sha256').update(preimage).digest().toString('hex'),
@@ -1212,7 +1249,7 @@ describe('Recovery phase 6: records over a guardian limit (issue #1014)', () => 
 			serve(1),
 			serve(2)
 		]);
-		const { storage } = journaledStorage(1);
+		const { storage, manager } = journaledStorage(1);
 		const events: IGuardianReplicationEvent[] = [];
 		const rep = replicator(storage, bind(served), events);
 		const lease = await registered(rep);
@@ -1243,6 +1280,32 @@ describe('Recovery phase 6: records over a guardian limit (issue #1014)', () => 
 		const next = replicator(storage, bind(served), events);
 		next.adoptRecordLimits(rep);
 		expect(next.maxRecordBytes()).to.equal(16 * 1024 * 1024);
+		expect(refused()).to.have.length(2);
+
+		// Raising the limit on the guardian is enough: the running writer
+		// reads it again on its next pass and sends the guardian what it
+		// missed, with no restart.
+		(
+			served[0].guardian as unknown as { maxCiphertextBytes: number }
+		).maxCiphertextBytes = GUARDIAN_RECORD_LIMIT_FLOOR_BYTES;
+		expect((await rep.replicatePending(lease)).attempted).to.equal(0);
+		expect(rep.maxRecordBytes()).to.equal(GUARDIAN_RECORD_LIMIT_FLOOR_BYTES);
+		manager.commit({
+			criticality: RecoveryCriticality.SafetyCritical,
+			mutations: [
+				{
+					type: 'payment_preimage',
+					paymentHash: Buffer.alloc(32, 9).toString('hex'),
+					preimage: Buffer.alloc(32, 9)
+				}
+			],
+			outboundMessages: []
+		});
+		const resumed = await rep.replicatePending(lease);
+		expect(resumed.outcome).to.equal('replicated');
+		expect(resumed.replicatedThrough).to.equal(2n);
+		const raisedHead = await served[0].client.getHead(ROOT.recoveryId);
+		expect(raisedHead.state?.logHead.sequence).to.equal(2n);
 		expect(refused()).to.have.length(2);
 		await shutdown(served);
 		storage.close();

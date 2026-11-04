@@ -69,20 +69,23 @@ import {
 import { GUARDIAN_HOST_DEFAULT_MAX_CIPHERTEXT_BYTES } from './guardian-host';
 
 /**
- * The smallest record limit a guardian may advertise and still be used.
+ * The smallest record limit a guardian may advertise and still be used:
+ * the host default, so a limit can only be raised.
  *
  * A delta frame carries a whole channel transition, and a settled payment
  * row rides the transition that settles its HTLC, so the frame holds the
- * channel's state (about 8 KB idle, about 3 KB more per HTLC in flight)
+ * channel's state (about 9 KB idle, about 3.4 KB more per HTLC in flight)
  * beside a row the label budget lets take half the frame. The row checks
  * size the row alone; this floor is what leaves the other half for the
- * channel. At 1 MiB that half holds a channel with well over a hundred HTLCs
- * in flight, and the 4 MiB host default four times that. A guardian below
- * it would refuse the first busy settlement and, taking only the next
- * sequence, every record after it, so it is refused up front instead
- * (issue #1954).
+ * channel. At 4 MiB that half holds a channel at the default limit of 483
+ * HTLCs in flight with over a hundred to spare; a channel full in both
+ * directions, about 3.3 MB, fits beside a label under 900 KB. A guardian
+ * below the floor would refuse the first busy settlement and, taking only
+ * the next sequence, every record after it, so it is refused up front
+ * instead (issue #1954).
  */
-export const GUARDIAN_RECORD_LIMIT_FLOOR_BYTES = 1024 * 1024;
+export const GUARDIAN_RECORD_LIMIT_FLOOR_BYTES =
+	GUARDIAN_HOST_DEFAULT_MAX_CIPHERTEXT_BYTES;
 import {
 	JOURNAL_META_KEYS,
 	META_LAST_SNAPSHOT_GROUP,
@@ -526,7 +529,9 @@ export class GuardianReplicator {
 				`the ${GUARDIAN_RECORD_LIMIT_FLOOR_BYTES} bytes a channel transition ` +
 				`and a labelled payment row can take together, so it is sent ` +
 				`nothing until its operator raises the limit (the protocol allows ` +
-				`up to 16 MiB)`
+				`up to 16 MiB); until then it holds no record, so the other ` +
+				`guardians keep every record they are sent: raise the limit or ` +
+				`rotate to a set without it`
 		});
 	}
 
@@ -581,20 +586,26 @@ export class GuardianReplicator {
 		await Promise.all(
 			this.config.guardians.map(async (entry) => {
 				const key = entry.expectedGuardianId.toString('hex');
-				if (this.advertisedCeilings.has(key)) return;
+				// A limit below the floor is asked again each pass, fresh rather
+				// than from the client's cache, so raising it on the guardian
+				// takes effect without restarting this writer.
+				const refused = this.belowFloor(entry);
+				if (this.advertisedCeilings.has(key) && !refused) return;
 				try {
 					// The client's cached compatibility INFO: a guardian that
 					// answered any verb has a known limit without another request
 					// that could fail. A guardian outside our protocol range is
 					// refused with the INFO it sent, and that limit still binds
 					// once it is back in range.
-					const info = await entry.client
-						.checkVersion()
-						.catch((error) =>
-							error instanceof GuardianProtocolMismatchError
-								? error.info
-								: entry.client.info()
-						);
+					const info = refused
+						? await entry.client.info()
+						: await entry.client
+								.checkVersion()
+								.catch((error) =>
+									error instanceof GuardianProtocolMismatchError
+										? error.info
+										: entry.client.info()
+								);
 					if (info.guardianId.equals(entry.expectedGuardianId)) {
 						this.noteAdvertisedLimit(key, info.maxCiphertextBytes);
 					}
