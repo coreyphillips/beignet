@@ -1767,6 +1767,12 @@ export interface BeignetNodeEvents {
 	}) => void;
 	/** A peer connection reported an error. */
 	'peer:error': (data: { pubkey: string; message: string }) => void;
+	/** A peer sent a BOLT 1 warning: the connection and its channels stay as they were, so it is not a `node:error`. channelId is null when the warning is about the connection rather than one channel; text is the peer's text as printable ASCII. */
+	'peer:warning': (data: {
+		pubkey: string;
+		channelId: ChannelIdHex | null;
+		text: string;
+	}) => void;
 	/** An operational error (non-fatal), also passed to the onError option. `code` is a NodeErrorCode or one BeignetNode raises itself, such as ELECTRUM_FAILOVER_FAILED. */
 	'node:error': (data: {
 		code: string;

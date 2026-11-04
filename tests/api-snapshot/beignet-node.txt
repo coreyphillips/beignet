@@ -510,6 +510,7 @@ property BeignetNodeEvents.'payment:sent': (info: PaymentInfo) => void
 property BeignetNodeEvents.'peer:connect': (data: { pubkey: string; }) => void
 property BeignetNodeEvents.'peer:disconnect': (data: { pubkey: string; closedBy?: 'peer' | 'us'; reason?: string; direction?: 'inbound' | 'outbound'; uptimeMs?: number; }) => void
 property BeignetNodeEvents.'peer:error': (data: { pubkey: string; message: string; }) => void
+property BeignetNodeEvents.'peer:warning': (data: { pubkey: string; channelId: ChannelIdHex | null; text: string; }) => void
 property BeignetNodeEvents.'recovery:backfill-lost': (data: { detail: string; }) => void
 property BeignetNodeEvents.'recovery:capsule-retrieved': (data: { fromPeer: string; writerEpoch: string; latestSequence: string; inline: boolean; channelCount: number; candidates: number; }) => void
 property BeignetNodeEvents.'recovery:durable': (data: { through: string; }) => void

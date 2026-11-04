@@ -1403,6 +1403,7 @@ property channel.ChannelManagerEvents.'monitor:updated': (channelIdHex: string, 
 property channel.ChannelManagerEvents.'outbox:sent': (ids: Array<number | null>) => void
 property channel.ChannelManagerEvents.'output:resolved': (txid: string, outputIndex: number, channelId: Buffer | undefined, outputType: chain.OutputType, paymentHash: Buffer | undefined, htlcId: bigint | undefined) => void
 property channel.ChannelManagerEvents.'peer:disconnected': (peerPubkey: string) => void
+property channel.ChannelManagerEvents.'peer:warning': (peerPubkey: string, channelId: Buffer | null, text: string) => void
 property channel.ChannelManagerEvents.'preimage:learned': (paymentHash: Buffer, preimage: Buffer) => void
 property channel.ChannelManagerEvents.'quiescence:ended': (channelIdHex: string) => void
 property channel.ChannelManagerEvents.'quiescence:timeout': (channelIdHex: string, peerPubkey: string) => void
@@ -5983,6 +5984,7 @@ property node.LightningNodeEvents.'peer:connect': (pubkey: string) => void
 property node.LightningNodeEvents.'peer:disconnect': (pubkey: string, info?: transport.IPeerDisconnectInfo) => void
 property node.LightningNodeEvents.'peer:disconnect-requested': (pubkey: string) => void
 property node.LightningNodeEvents.'peer:error': (pubkey: string, error: Error) => void
+property node.LightningNodeEvents.'peer:warning': (warning: { pubkey: string; channelId: Buffer | null; text: string; }) => void
 property node.LightningNodeEvents.'peer_storage:retrieved': (peerPubkey: string, blob: Buffer) => void
 property node.LightningNodeEvents.'preimage:learned': (paymentHash: Buffer, preimage: Buffer) => void
 property node.LightningNodeEvents.'recovery:backfill-lost': (detail: string) => void

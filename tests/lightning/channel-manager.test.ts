@@ -1029,11 +1029,15 @@ describe('Channel Manager', function () {
 			expect(errors).to.include('Channel state write threw: disk unavailable');
 		});
 
-		it('surfaces a remote warning without failing the channel', function () {
+		it('surfaces a remote warning with its sender, not as an error, without failing the channel', function () {
 			const { alice, channelId } = openAndReadyChannel();
-			const warnings: string[] = [];
+			const warnings: Array<[string, Buffer | null, string]> = [];
+			const errors: string[] = [];
+			alice.on('peer:warning', (peer, cid, text) =>
+				warnings.push([peer, cid, text])
+			);
 			alice.on('error', (_cid: Buffer | null, message: string) =>
-				warnings.push(message)
+				errors.push(message)
 			);
 			alice.handleMessage(
 				bobPubkey,
@@ -1043,9 +1047,33 @@ describe('Channel Manager', function () {
 					data: Buffer.from('feerate too low', 'utf8')
 				})
 			);
-			expect(
-				warnings.some((w) => w.includes('Remote warning: feerate too low'))
-			).to.be.true;
+			expect(warnings).to.have.length(1);
+			expect(warnings[0][0]).to.equal(bobPubkey);
+			expect(warnings[0][1]!.equals(channelId)).to.equal(true);
+			expect(warnings[0][2]).to.equal('feerate too low');
+			expect(errors).to.deep.equal([]);
+			expect(alice.getChannel(channelId)!.getState()).to.equal(
+				ChannelState.NORMAL
+			);
+		});
+
+		it('reports a connection-level warning with a null channel id', function () {
+			const { alice, channelId } = openAndReadyChannel();
+			const warnings: Array<[string, Buffer | null, string]> = [];
+			alice.on('peer:warning', (peer, cid, text) =>
+				warnings.push([peer, cid, text])
+			);
+			alice.handleMessage(
+				bobPubkey,
+				1,
+				encodeErrorMessage({
+					channelId: Buffer.alloc(32),
+					data: Buffer.from('Unknown UTXO 503816x1343x1', 'utf8')
+				})
+			);
+			expect(warnings).to.deep.equal([
+				[bobPubkey, null, 'Unknown UTXO 503816x1343x1']
+			]);
 			expect(alice.getChannel(channelId)!.getState()).to.equal(
 				ChannelState.NORMAL
 			);
@@ -1057,6 +1085,7 @@ describe('Channel Manager', function () {
 			alice.on('error', (_cid: Buffer | null, message: string) =>
 				surfaced.push(message)
 			);
+			alice.on('peer:warning', (_peer, _cid, text) => surfaced.push(text));
 			const data = Buffer.from('bad\n[INFO] forged line\x1b[2J', 'ascii');
 			alice.handleMessage(
 				bobPubkey,
@@ -1068,7 +1097,7 @@ describe('Channel Manager', function () {
 				17,
 				encodeErrorMessage({ channelId, data })
 			);
-			expect(surfaced).to.include('Remote warning: bad?[INFO] forged line?[2J');
+			expect(surfaced).to.include('bad?[INFO] forged line?[2J');
 			expect(surfaced).to.include('Remote error: bad?[INFO] forged line?[2J');
 		});
 	});

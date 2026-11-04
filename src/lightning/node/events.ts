@@ -274,6 +274,12 @@ export interface LightningNodeEvents
 	'peer:disconnect-requested': (pubkey: string) => void;
 	/** Peer error (networking mode). */
 	'peer:error': (pubkey: string, error: Error) => void;
+	/** A peer sent a BOLT 1 warning, which leaves the connection and its channels as they were, so it is not a `node:error`. `channelId` is null for a connection-level warning (the all-zero id); `text` is the peer's text as printable ASCII. */
+	'peer:warning': (warning: {
+		pubkey: string;
+		channelId: Buffer | null;
+		text: string;
+	}) => void;
 	/** A beignet custom message (type 44069) arrived from a peer. */
 	'custom-message': (message: {
 		peerPubkey: string;
