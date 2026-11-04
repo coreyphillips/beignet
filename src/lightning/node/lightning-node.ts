@@ -20012,6 +20012,13 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			replacementParts: multiRoute.parts.length,
 			retryCount: retryCtx.retryCount
 		});
+		// Completion credits the payment-level route in MissionControl, so a
+		// failed part's route must not stay there: the replacement's first part
+		// takes it over the way the first planned part took it.
+		if (payment.route === failedPart.route) {
+			payment.route = undefined;
+			payment.sharedSecrets = undefined;
+		}
 		// The replacement's parts leave one by one like the planned ones, so a
 		// part that fails back between them waits in partsAwaitingReplacement
 		// too, or its replacement would draw on balances the parts still to
@@ -20032,7 +20039,9 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				} catch (err) {
 					// A throw from addHtlc (the outbound transport, say) can leave
 					// the part's HTLC on the channel: the part then resolves like
-					// any other, as a single-path retry's record does. A part that
+					// any other, as a single-path retry's record does, and the rest
+					// of a re-split replacement still has to leave, or the payee
+					// holds a set that can never reach total_msat. A part that
 					// never left ends the payment like one the channel refuses.
 					// The throw stops here either way: this runs from a channel
 					// event, and the finally below restores dispatchComplete, or
@@ -20046,7 +20055,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 					const pushed = mppState.parts.length > partsBefore;
 					const part = mppState.parts[mppState.parts.length - 1];
 					if (pushed && this.mppPartInFlight(paymentHash, part)) {
-						return undefined;
+						continue;
 					}
 					let htlcKey: string | undefined;
 					if (pushed) {
