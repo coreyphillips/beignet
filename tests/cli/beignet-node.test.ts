@@ -600,6 +600,50 @@ describe('BeignetNode', () => {
 		}
 	});
 
+	it('relays a peer warning with its sender and a hex or null channel id, not as node:error (issue #1956)', async function () {
+		this.timeout(20_000);
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'beignet-warn-'));
+		const node = await BeignetNode.create({
+			network: 'regtest',
+			dataDir: dir,
+			logLevel: 'silent',
+			...OFFLINE_ELECTRUM
+		});
+		try {
+			const seen: Array<Parameters<BeignetNodeEvents['peer:warning']>[0]> = [];
+			const errors: string[] = [];
+			node.on('peer:warning', (data) => seen.push(data));
+			node.on('node:error', (err) => errors.push(err.code));
+			const ln = node.getNode();
+			const channelId = Buffer.alloc(32, 0xab);
+			ln.emit('peer:warning', {
+				pubkey: 'deadbeefpeer',
+				channelId: null,
+				text: 'Unknown UTXO 503816x1343x1'
+			});
+			ln.emit('peer:warning', {
+				pubkey: 'deadbeefpeer',
+				channelId,
+				text: 'Splice feerate_perkw is too low'
+			});
+			expect(seen).to.deep.equal([
+				{
+					pubkey: 'deadbeefpeer',
+					channelId: null,
+					text: 'Unknown UTXO 503816x1343x1'
+				},
+				{
+					pubkey: 'deadbeefpeer',
+					channelId: channelId.toString('hex'),
+					text: 'Splice feerate_perkw is too low'
+				}
+			]);
+			expect(errors).to.deep.equal([]);
+		} finally {
+			await node.destroy();
+		}
+	});
+
 	it('reports how the stored network map came back and how long building the node took', async function () {
 		this.timeout(20_000);
 		const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'beignet-graph-stats-'));

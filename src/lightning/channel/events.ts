@@ -290,6 +290,16 @@ export interface ChannelManagerEvents {
 		payload: Buffer
 	) => void;
 	/**
+	 * A peer sent a BOLT 1 warning. The connection and every channel stay as
+	 * they were. `channelId` is null when the warning is about the connection
+	 * (the all-zero id); `text` is the peer's text as printable ASCII.
+	 */
+	'peer:warning': (
+		peerPubkey: string,
+		channelId: Buffer | null,
+		text: string
+	) => void;
+	/**
 	 * A channel-level or protocol error. Node's EventEmitter throws on an
 	 * 'error' with no listener, so code that drives a ChannelManager directly
 	 * should attach one.

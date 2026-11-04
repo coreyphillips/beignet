@@ -137,6 +137,13 @@ describe('Event granularity (M4 batch 2b)', () => {
 			expect(getRelayedEvents(true)).to.include('node:error');
 		});
 
+		// A peer's warning is not an error, so it rides its own event, and a
+		// client loses it unless the daemon relays that one too (issue #1956).
+		it('relays peer:warning, with and without htlc events', () => {
+			expect(getRelayedEvents()).to.include('peer:warning');
+			expect(getRelayedEvents(true)).to.include('peer:warning');
+		});
+
 		it('relays the hold-invoice events, with and without htlc events', () => {
 			for (const e of HOLD_EVENTS) {
 				expect(getRelayedEvents(), e).to.include(e);

@@ -5963,6 +5963,20 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			}
 		);
 
+		this.channelManager.on(
+			'peer:warning',
+			(pubkey: string, channelId: Buffer | null, text: string) => {
+				const data = {
+					pubkey,
+					...(channelId ? { channelId: channelId.toString('hex') } : {}),
+					text
+				};
+				this.logger.warn('Peer warning', data);
+				this.emitStructuredLog('peer', 'warning', data);
+				this.emit('peer:warning', { pubkey, channelId, text });
+			}
+		);
+
 		// Record every node:error, wherever it was raised. These carry the reason a
 		// channel open failed (peer rejection, funding build/broadcast failure,
 		// disconnect mid-open). Emitting them alone is not enough: a caller that is

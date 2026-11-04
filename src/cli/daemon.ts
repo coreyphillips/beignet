@@ -695,6 +695,9 @@ export function getRelayedEvents(
 		'channel-send:stage',
 		'peer:connect',
 		'peer:disconnect',
+		// A peer's BOLT 1 warning, kept off node:error because nothing failed.
+		// Often the only clue to a protocol disagreement with that peer.
+		'peer:warning',
 		// Every channel failure reason (peer rejection, funding build/broadcast
 		// failure, disconnect mid-open) is reported as node:error. Without it on
 		// this list a failed open is invisible to clients: the pending channel

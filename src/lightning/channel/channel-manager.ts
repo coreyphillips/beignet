@@ -9313,14 +9313,20 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		this.emit('channel:errored', channelId, reason);
 	}
 
-	private handleWarningMsg(_peerPubkey: string, payload: Buffer): void {
+	private handleWarningMsg(peerPubkey: string, payload: Buffer): void {
 		// BOLT 1 warning shares the error wire format (channel_id ++ data). A
-		// warning is informational — the peer keeps the connection/channel alive —
-		// but the text is often the only clue to a protocol disagreement (CLN
-		// reports e.g. "Splice feerate_perkw is too low" this way), so surface it.
+		// warning is informational (the peer keeps the connection and channel
+		// alive), but the text is often the only clue to a protocol disagreement
+		// (CLN reports e.g. "Splice feerate_perkw is too low" this way), so
+		// surface it with its sender, and not as an error.
 		const msg = decodeErrorMessage(payload);
-		const warningText = getErrorText(msg);
-		this.emit('error', msg.channelId, `Remote warning: ${warningText}`);
+		const connectionWide = msg.channelId.every((b) => b === 0);
+		this.emit(
+			'peer:warning',
+			peerPubkey,
+			connectionWide ? null : msg.channelId,
+			getErrorText(msg)
+		);
 	}
 
 	private findTempChannel(channelId: Buffer): Channel | undefined {

@@ -4179,6 +4179,14 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 			this.log('warn', 'Peer error', { pubkey, error: err.message });
 			this.emit('peer:error', { pubkey, message: err.message });
 		});
+		// The engine logs it already, through the same logger.
+		this.node.on('peer:warning', ({ pubkey, channelId, text }) => {
+			this.emit('peer:warning', {
+				pubkey,
+				channelId: channelId ? channelId.toString('hex') : null,
+				text
+			});
+		});
 
 		// Forward node:ready event
 		this.node.on('node:ready', () => {

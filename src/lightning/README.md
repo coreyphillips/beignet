@@ -1400,6 +1400,7 @@ const result = await node.recoverFromStaticChannelBackup(scb.channels);
 | `peer:disconnect` | `(pubkey: string, info?: IPeerDisconnectInfo)` | Peer disconnected (networking mode). `info` says who closed the connection and why, when known. |
 | `peer:disconnect-requested` | `(pubkey: string)` | The node needs this peer's connection severed but holds no socket for it (event-transport mode, or an unconnected peer): the host must close its transport. The protocol side (channels marked for reestablish) is already applied; reconnect and reestablish as usual. |
 | `peer:error` | `(pubkey: string, error: Error)` | Peer error (networking mode). |
+| `peer:warning` | `(warning: { pubkey: string; channelId: Buffer \| null; text: string })` | A peer sent a BOLT 1 warning, which leaves the connection and its channels as they were, so it is not a `node:error`. `channelId` is null for a connection-level warning (the all-zero id); `text` is the peer's text as printable ASCII. |
 | `custom-message` | `(message: { peerPubkey: string; version: number; subtype: number; payload: Buffer })` | A beignet custom message (type 44069) arrived from a peer. |
 | `peer_storage:retrieved` | `(peerPubkey: string, blob: Buffer)` | A peer returned the blob it stores for this node (BOLT 1 peer storage), unpadded. |
 | `onion:received` | `(payload: IOnionMessagePayload)` | Onion message received (type 513). |
