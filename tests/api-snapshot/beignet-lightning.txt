@@ -7266,7 +7266,7 @@ property recovery.RecoveryFrame.previousFrameHash: Buffer
 property recovery.RecoveryFrame.sequence: bigint
 property recovery.RecoveryFrame.snapshot?: recovery.RecoverySnapshot
 property recovery.RecoveryFrame.timestamp: number
-property recovery.RecoveryFrame.version: 1 | 2 | 3
+property recovery.RecoveryFrame.version: 1 | 2 | 3 | 4
 property recovery.RecoveryFrame.writerEpoch: bigint
 class recovery.RecoveryJournal implements recovery.IRecoveryJournalSink
 constructor recovery.RecoveryJournal(storage: storage.IStorageBackend, masterKey: Buffer, nodeId: Buffer, recoveryId: Buffer, options?: recovery.IRecoveryJournalOptions)
@@ -7822,7 +7822,7 @@ property storage.ISerializedChannelState.pendingFundingTxHex?: string
 property storage.ISerializedChannelState.pendingLeaseBlockheight?: number
 property storage.ISerializedChannelState.pendingLeaseBlockheightCommitted?: boolean
 property storage.ISerializedChannelState.pendingLeaseBlockheightSignable?: boolean
-property storage.ISerializedChannelState.pendingLocalUpdates?: Array<{ type: number; payloadHex: string; }>
+property storage.ISerializedChannelState.pendingLocalUpdates?: Array<{ type: number; payloadHex: string; onionFromHtlc?: true; }>
 property storage.ISerializedChannelState.pendingLocalUpdatesSignedCount?: number
 property storage.ISerializedChannelState.preReestablishState: string | null
 property storage.ISerializedChannelState.preSpliceSpendWatches?: Array<{ txid: string; outputIndex: number; script: string; spliceTxid: string; }>
@@ -8289,7 +8289,7 @@ function storage.runStorageConformanceSuite(factory: () => storage.IStorageBacke
 function storage.serializeBasepoints(bp: keys.IChannelBasepoints): storage.ISerializedBasepoints
 function storage.serializeChainMonitorState(s: chain.IChainMonitorState): string
 function storage.serializeChannelConfig(c: channel.IChannelConfig): storage.ISerializedChannelConfig
-function storage.serializeChannelState(s: channel.IChannelState, options?: { legacyHtlcHistory?: boolean; htlcHistory?: 'all' | 'unsaved' | 'none'; }): storage.ISerializedChannelState
+function storage.serializeChannelState(s: channel.IChannelState, options?: { legacyHtlcHistory?: boolean; htlcHistory?: 'all' | 'unsaved' | 'none'; addOnionsByReference?: boolean; }): storage.ISerializedChannelState
 function storage.serializeFforEpoch(f: ffor.IFforEpochRecord): storage.ISerializedFforEpoch
 function storage.serializeGraphChannel(ch: gossip.IGraphChannel): string
 function storage.serializeGraphNode(node: gossip.IGraphNode): string

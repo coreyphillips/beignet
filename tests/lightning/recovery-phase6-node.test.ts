@@ -68,6 +68,7 @@ import {
 	xOnlyFromSecret
 } from '../../src/lightning/recovery';
 import { encodedMutationBytes } from '../../src/lightning/recovery/frame-codec';
+import { MessageType } from '../../src/lightning/message/types';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
 import {
 	IChannelAnnouncementMessage,
@@ -2460,6 +2461,140 @@ describe('Recovery phase 6: the settlement frame fits the guardian record limit 
 		}
 		expect(actions).to.include('recovery_frame_oversized');
 
+		payee.destroy();
+		node.destroy();
+		storage.close();
+	});
+});
+
+describe('Recovery phase 6: a channel with every HTLC slot in flight fits a frame (issue #1959)', () => {
+	it('483 HTLCs each way with commitments withheld journal every frame under the floor, the labelled settlement too, and restore whole', async function (): Promise<void> {
+		// About 50 s alone: every add journals the whole channel.
+		this.timeout(600_000);
+		const CEILING = GUARDIAN_HOST_DEFAULT_MAX_CIPHERTEXT_BYTES;
+		expect(CEILING).to.equal(GUARDIAN_RECORD_LIMIT_FLOOR_BYTES);
+		const SLOTS = DEFAULT_CHANNEL_CONFIG.maxAcceptedHtlcs;
+		const { node, storage, room } = nodeUnderCeiling(CEILING);
+		const actions: string[] = [];
+		node.on('log', (log: { action: string }) => actions.push(log.action));
+		// Every frame written, compacted away or not.
+		const written: number[] = [];
+		const save = storage.saveRecoveryFrame.bind(storage);
+		storage.saveRecoveryFrame = (frame): void => {
+			written.push(frame.ciphertext.length);
+			save(frame);
+		};
+		const payee = createLoopbackNode('every-slot', 2);
+		// A peer that never answers: no commitment_signed crosses, so every
+		// add stays pending with its update queued for retransmission.
+		let withholdCommitments = false;
+		for (const [from, to] of [
+			[node, payee],
+			[payee, node]
+		] as const) {
+			from.on(
+				'message:outbound',
+				(pubkey: string, type: number, payload: Buffer) => {
+					if (pubkey !== to.getNodeId()) return;
+					if (withholdCommitments && type === MessageType.COMMITMENT_SIGNED)
+						return;
+					to.handlePeerMessage(from.getNodeId(), type, payload);
+				}
+			);
+		}
+		node.handleNewBlock(1000);
+		payee.handleNewBlock(1000);
+		const opened = node.openChannel(
+			payee.getNodeId(),
+			16_000_000n,
+			8_000_000_000n
+		);
+		const channelId = node.createFunding(
+			opened,
+			crypto.randomBytes(32),
+			0,
+			crypto.randomBytes(64)
+		)!;
+		node.handleFundingConfirmed(channelId);
+		payee.handleFundingConfirmed(channelId);
+		const settle = async (): Promise<void> => {
+			for (let i = 0; i < 20; i++) {
+				await new Promise((resolve) => setImmediate(resolve));
+			}
+		};
+
+		// A committed hold payment carrying the longest label allowed.
+		const preimage = sha('every-slot-hold');
+		const held = payee.createInvoice({
+			amountMsat: 10_000_000n,
+			description: 'held',
+			hold: true,
+			paymentHash: crypto.createHash('sha256').update(preimage).digest()
+		});
+		const note = 'x'.repeat(
+			Math.floor(room / 2) - JSON.stringify({ note: '' }).length
+		);
+		node.sendPaymentWithOptions(held.bolt11, { metadata: { note } });
+		await settle();
+
+		// Then every slot either side allows, none of them committed.
+		withholdCommitments = true;
+		for (let i = 0; i < SLOTS; i++) {
+			if (i < SLOTS - 1) {
+				node.sendPayment(
+					payee.createInvoice({ amountMsat: 10_000_000n, description: `o${i}` })
+						.bolt11
+				);
+			}
+			payee.sendPayment(
+				node.createInvoice({ amountMsat: 10_000_000n, description: `r${i}` })
+					.bolt11
+			);
+			if (i % 20 === 0) await settle();
+		}
+		await settle();
+		const channel = node.getChannelManager().getChannel(channelId)!;
+		const state = channel.getFullState();
+		const keys = [...state.htlcs.keys()];
+		expect(keys.filter((k) => k.startsWith('offered-'))).to.have.length(SLOTS);
+		expect(keys.filter((k) => k.startsWith('received-'))).to.have.length(SLOTS);
+		expect(state.pendingLocalUpdates).to.have.length(SLOTS - 1);
+
+		expect(payee.settleHeldHtlc(held.paymentHash, preimage)).to.equal(true);
+		expect(
+			(await node.awaitPaymentResolution(held.paymentHash, 10_000)).status
+		).to.equal(PaymentStatus.COMPLETED);
+		await settle();
+
+		expect(written.length).to.be.greaterThan(2 * SLOTS);
+		for (const bytes of written) expect(bytes).to.be.at.most(CEILING);
+		expect(actions).to.not.include('recovery_frame_oversized');
+
+		// The adds were journaled once, and a restore rebuilds each one
+		// byte for byte from its HTLC's onion.
+		const journal = new RecoveryJournal(
+			storage,
+			deriveRecoveryMasterKey(NODE_SECRET),
+			NODE_ID,
+			ROOT.recoveryId
+		);
+		const frames = journal.loadVerifiedFrames();
+		expect(frames.map((f) => f.version)).to.include(4);
+		const restored = openStorage();
+		reconstructFromFrames(restored, frames);
+		const live = channel.getFullState().pendingLocalUpdates;
+		const back = restored.loadChannel(channelId.toString('hex'))!.state
+			.pendingLocalUpdates;
+		expect(back).to.have.length(live.length);
+		back.forEach((update, i) => {
+			expect(update.type).to.equal(live[i].type);
+			expect(update.payload.equals(live[i].payload)).to.equal(true);
+		});
+		const settled = restored.loadPayment(held.paymentHash.toString('hex'))!;
+		expect(settled.status).to.equal(PaymentStatus.COMPLETED);
+		expect(settled.metadata?.note).to.equal(note);
+
+		restored.close();
 		payee.destroy();
 		node.destroy();
 		storage.close();

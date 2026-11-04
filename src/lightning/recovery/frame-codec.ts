@@ -30,6 +30,11 @@ import {
 	serializePaymentInfo,
 	deserializePaymentInfo
 } from '../storage/serialization';
+import {
+	addWithoutOnion,
+	hasReferencedAddOnions,
+	restoreAddOnion
+} from '../storage/add-onion';
 import { usesCompactHtlcHistory } from '../storage/htlc-history';
 import type {
 	IForwardingEvent,
@@ -56,6 +61,8 @@ interface IEncodedOutboundMessage {
 	messageType: number;
 	wireMessage: string;
 	disposition: IRecoveryOutboxMessage['disposition'];
+	/** Version 4 snapshots: an add without the onion its channel's HTLC holds. */
+	onionFromHtlc?: true;
 }
 
 interface IEncodedSnapshot {
@@ -182,7 +189,8 @@ function encodeMutation(
 				// the deltas before this one carry the rest.
 				state: serializeChannelState(mutation.state, {
 					legacyHtlcHistory: version === 1,
-					htlcHistory: 'unsaved'
+					htlcHistory: 'unsaved',
+					addOnionsByReference: version === 4
 				}),
 				peerPubkey: mutation.peerPubkey
 			};
@@ -434,7 +442,8 @@ function encodeSnapshot(
 		channels: snapshot.channels.map((c) => ({
 			channelId: c.channelId,
 			state: serializeChannelState(c.state, {
-				legacyHtlcHistory: version === 1
+				legacyHtlcHistory: version === 1,
+				addOnionsByReference: version === 4
 			}),
 			peerPubkey: c.peerPubkey
 		})),
@@ -474,11 +483,30 @@ function encodeSnapshot(
 			pathId: i.pathId.toString('hex')
 		})),
 		forwardingEvents: snapshot.forwardingEvents.map(encodeForwardingEvent),
-		outbox: snapshot.outbox.map((row) => ({
-			...encodeOutboundMessage(row),
-			frameSequence: row.frameSequence
-		}))
+		outbox: snapshot.outbox.map((row) => {
+			const rest = version === 4 ? outboxAddWithoutOnion(snapshot, row) : null;
+			return {
+				...encodeOutboundMessage(row),
+				...(rest
+					? { wireMessage: rest.toString('hex'), onionFromHtlc: true as const }
+					: {}),
+				frameSequence: row.frameSequence
+			};
+		})
 	};
+}
+
+/**
+ * A snapshot's outbox row for an add its channel's pending adds also carry,
+ * without the onion that channel's HTLC entry holds. Null for any other row.
+ */
+function outboxAddWithoutOnion(
+	snapshot: RecoverySnapshot,
+	row: RecoveryOutboundMessage
+): Buffer | null {
+	const channel = snapshot.channels.find((c) => c.channelId === row.channelId);
+	if (!channel) return null;
+	return addWithoutOnion(channel.state.htlcs, row.messageType, row.wireMessage);
 }
 
 function decodeSnapshot(encoded: IEncodedSnapshot): RecoverySnapshot {
@@ -516,6 +544,11 @@ function decodeSnapshot(encoded: IEncodedSnapshot): RecoverySnapshot {
 			'Recovery snapshot pageFrames, when present, must be a positive integer'
 		);
 	}
+	const channels = encoded.channels.map((c) => ({
+		channelId: c.channelId,
+		state: deserializeChannelState(c.state),
+		peerPubkey: c.peerPubkey
+	}));
 	return {
 		...(encoded.schemaVersion !== undefined
 			? { schemaVersion: encoded.schemaVersion }
@@ -526,11 +559,7 @@ function decodeSnapshot(encoded: IEncodedSnapshot): RecoverySnapshot {
 		...(encoded.fforVouchers !== undefined
 			? { fforVouchers: encoded.fforVouchers.map(validateFforVoucherArchive) }
 			: {}),
-		channels: encoded.channels.map((c) => ({
-			channelId: c.channelId,
-			state: deserializeChannelState(c.state),
-			peerPubkey: c.peerPubkey
-		})),
+		channels,
 		keyIndices: encoded.keyIndices,
 		chainMonitors: encoded.chainMonitors.map((m) => ({
 			channelId: m.channelId,
@@ -567,10 +596,21 @@ function decodeSnapshot(encoded: IEncodedSnapshot): RecoverySnapshot {
 			pathId: Buffer.from(i.pathId, 'hex')
 		})),
 		forwardingEvents: encoded.forwardingEvents.map(decodeForwardingEvent),
-		outbox: encoded.outbox.map((row) => ({
-			...decodeOutboundMessage(row),
-			frameSequence: row.frameSequence
-		}))
+		outbox: encoded.outbox.map((row) => {
+			const message = decodeOutboundMessage(row);
+			if (row.onionFromHtlc === true) {
+				const channel = channels.find((c) => c.channelId === row.channelId);
+				if (!channel) {
+					throw new Error('An outbox add without its onion names no channel');
+				}
+				message.wireMessage = restoreAddOnion(
+					channel.state.htlcs,
+					row.messageType,
+					row.wireMessage
+				);
+			}
+			return { ...message, frameSequence: row.frameSequence };
+		})
 	};
 }
 
@@ -600,6 +640,24 @@ export function encodedMutationBytes(mutation: RecoveryMutation): number {
 export function frameVersionForContent(
 	frame: RecoveryFrame
 ): RecoveryFrame['version'] {
+	// Version 4 journals a pending add of ours without the onion its HTLC
+	// entry carries, which would otherwise take every add's onion twice and
+	// let one channel with hundreds of HTLCs in flight outgrow a guardian
+	// record. Releases before it would replay those adds truncated.
+	const states = [
+		...frame.mutations.flatMap((mutation) =>
+			mutation.type === 'channel_state' ? [mutation.state] : []
+		),
+		...(frame.snapshot?.channels.map((channel) => channel.state) ?? [])
+	];
+	if (
+		states.some(hasReferencedAddOnions) ||
+		frame.snapshot?.outbox.some(
+			(row) => outboxAddWithoutOnion(frame.snapshot!, row) !== null
+		)
+	) {
+		return 4;
+	}
 	if (frame.mutations.some((mutation) => mutation.type === 'channel_state')) {
 		return 3;
 	}
@@ -647,9 +705,29 @@ export function encodeFrame(frame: RecoveryFrame): Buffer {
 /** Decode plaintext frame bytes. Throws on any malformed content. */
 export function decodeFrame(plaintext: Buffer): RecoveryFrame {
 	const encoded = JSON.parse(plaintext.toString('utf8')) as IEncodedFrame;
-	if (encoded.version !== 1 && encoded.version !== 2 && encoded.version !== 3) {
+	if (
+		encoded.version !== 1 &&
+		encoded.version !== 2 &&
+		encoded.version !== 3 &&
+		encoded.version !== 4
+	) {
 		throw new Error(`Unsupported recovery frame version: ${encoded.version}`);
 	}
+	if (
+		encoded.version !== 4 &&
+		([
+			...encoded.mutations.flatMap((mutation) =>
+				mutation.type === 'channel_state'
+					? [mutation.state as ISerializedChannelState]
+					: []
+			),
+			...(encoded.snapshot?.channels.map((channel) => channel.state) ?? [])
+		].some((state) =>
+			(state.pendingLocalUpdates ?? []).some((u) => u.onionFromHtlc === true)
+		) ||
+			encoded.snapshot?.outbox.some((row) => row.onionFromHtlc === true))
+	)
+		throw new Error('An add without its onion requires frame version 4');
 	if (
 		encoded.version === 1 &&
 		(encoded.mutations.some(

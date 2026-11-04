@@ -2045,7 +2045,9 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 		// means a fresh journal is never seen as needing the repair.
 		this.storage.setRecoveryMeta!(
 			META_SNAPSHOT_SCHEMA,
-			frameVersionForContent(frame) === 2
+			frame.snapshot?.channels.some((channel) =>
+				usesCompactHtlcHistory(channel.state)
+			)
 				? COMPACT_SNAPSHOT_SCHEMA_VERSION
 				: frame.snapshot?.fforVouchers !== undefined
 				? FFOR_SNAPSHOT_SCHEMA_VERSION

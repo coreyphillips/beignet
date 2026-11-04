@@ -63,8 +63,11 @@ import { withStorageTransaction } from '../../src/lightning/storage/transaction'
 import { IChannelBasepoints } from '../../src/lightning/keys/derivation';
 import {
 	DEFAULT_CHANNEL_CONFIG,
-	ChannelState
+	ChannelState,
+	HtlcDirection,
+	HtlcState
 } from '../../src/lightning/channel/types';
+import { frameVersionForContent } from '../../src/lightning/recovery/frame-codec';
 import {
 	IChannelState,
 	createOpenerState
@@ -586,6 +589,208 @@ describe('Recovery phase 2: frame codec', () => {
 		};
 		expect(JSON.stringify(serializeChannelState(decodedState.state))).to.equal(
 			JSON.stringify(serializeChannelState(state))
+		);
+	});
+});
+
+describe('Recovery phase 2: a pending add journals its onion once (issue #1959)', () => {
+	const ONION_BYTES = 1366;
+
+	/** A channel with one offered add queued for retransmission. */
+	function pendingAdd(onionMatches: boolean): {
+		state: IChannelState;
+		channelId: Buffer;
+		payload: Buffer;
+	} {
+		const rand = mulberry32(1959);
+		const channelId = prngBytes(rand, 32);
+		const state = makeChannelState(channelId, 500_000_000n);
+		const id = 7n;
+		const onion = prngBytes(rand, ONION_BYTES);
+		const fixed = Buffer.alloc(52);
+		fixed.writeBigUInt64BE(id, 0);
+		fixed.writeBigUInt64BE(2_000_000n, 8);
+		prngBytes(rand, 32).copy(fixed, 16);
+		fixed.writeUInt32BE(800, 48);
+		// A TLV stream after the onion (a blinding point), kept in place.
+		const tail = Buffer.concat([Buffer.from([0, 33]), prngBytes(rand, 33)]);
+		const payload = Buffer.concat([channelId, fixed, onion, tail]);
+		state.htlcs.set(`offered-${id}`, {
+			id,
+			amountMsat: 2_000_000n,
+			paymentHash: fixed.subarray(16, 48),
+			cltvExpiry: 800,
+			onionRoutingPacket: onionMatches ? onion : prngBytes(rand, ONION_BYTES),
+			direction: HtlcDirection.OFFERED,
+			state: HtlcState.PENDING
+		});
+		state.pendingLocalUpdates.push(
+			{ type: MessageType.UPDATE_ADD_HTLC, payload },
+			{ type: MessageType.UPDATE_FULFILL_HTLC, payload: prngBytes(rand, 72) }
+		);
+		return { state, channelId, payload };
+	}
+
+	function delta(state: IChannelState, channelId: Buffer): RecoveryFrame {
+		const frame: RecoveryFrame = {
+			version: 1,
+			writerEpoch: 1n,
+			sequence: 2n,
+			previousFrameHash: Buffer.alloc(32),
+			timestamp: 1_700_000_000_000,
+			mutations: [
+				{
+					type: 'channel_state',
+					channelId: channelId.toString('hex'),
+					state,
+					peerPubkey: 'ab'.repeat(33)
+				}
+			],
+			outboundMessages: []
+		};
+		frame.version = frameVersionForContent(frame);
+		return frame;
+	}
+
+	function snapshot(
+		state: IChannelState,
+		channelId: Buffer,
+		payload: Buffer
+	): RecoveryFrame {
+		const frame: RecoveryFrame = {
+			version: 1,
+			writerEpoch: 1n,
+			sequence: 1n,
+			previousFrameHash: Buffer.alloc(32),
+			timestamp: 1_700_000_000_000,
+			mutations: [],
+			outboundMessages: [],
+			snapshot: {
+				channels: [
+					{
+						channelId: channelId.toString('hex'),
+						state,
+						peerPubkey: 'ab'.repeat(33)
+					}
+				],
+				keyIndices: [],
+				chainMonitors: [],
+				preimages: [],
+				payments: [],
+				paymentSecrets: [],
+				htlcPaymentMappings: [],
+				forwardedHtlcs: [],
+				htlcSharedSecrets: [],
+				invoices: [],
+				invoicePathIds: [],
+				forwardingEvents: [],
+				outbox: [
+					{
+						peerId: 'ab'.repeat(33),
+						channelId: channelId.toString('hex'),
+						messageType: MessageType.UPDATE_ADD_HTLC,
+						wireMessage: payload,
+						disposition: 'pending_send',
+						frameSequence: 1
+					}
+				]
+			}
+		};
+		frame.version = frameVersionForContent(frame);
+		return frame;
+	}
+
+	/** The parts of an encoded frame these tests read. */
+	interface IEncodedView {
+		mutations: Array<{
+			state: {
+				htlcs: unknown[];
+				pendingLocalUpdates: Array<Record<string, unknown>>;
+			};
+		}>;
+		snapshot: { outbox: Array<Record<string, unknown>> };
+	}
+
+	const encoded = (frame: RecoveryFrame): IEncodedView =>
+		JSON.parse(encodeFrame(frame).toString('utf8'));
+
+	it('writes the add without the onion its HTLC holds, at version 4, and decodes it byte for byte', () => {
+		const { state, channelId, payload } = pendingAdd(true);
+		const frame = delta(state, channelId);
+		expect(frame.version).to.equal(4);
+		const [add, fulfill] =
+			encoded(frame).mutations[0].state.pendingLocalUpdates;
+		expect(add.onionFromHtlc).to.equal(true);
+		expect(add.payloadHex).to.have.length(2 * (payload.length - ONION_BYTES));
+		expect(fulfill).to.not.have.property('onionFromHtlc');
+
+		const plaintext = encodeFrame(frame);
+		const decoded = decodeFrame(plaintext);
+		expect(encodeFrame(decoded).equals(plaintext)).to.equal(true);
+		const back = (decoded.mutations[0] as { state: IChannelState }).state
+			.pendingLocalUpdates;
+		expect(back.map((u) => u.type)).to.deep.equal(
+			state.pendingLocalUpdates.map((u) => u.type)
+		);
+		back.forEach((u, i) =>
+			expect(u.payload.equals(state.pendingLocalUpdates[i].payload)).to.equal(
+				true
+			)
+		);
+		// Local storage keeps the whole message.
+		expect(serializeChannelState(state).pendingLocalUpdates![0]).to.deep.equal({
+			type: MessageType.UPDATE_ADD_HTLC,
+			payloadHex: payload.toString('hex')
+		});
+	});
+
+	it("keeps an add whose onion is not its HTLC entry's whole, and the frame at version 3", () => {
+		const { state, channelId, payload } = pendingAdd(false);
+		const frame = delta(state, channelId);
+		expect(frame.version).to.equal(3);
+		const [add] = encoded(frame).mutations[0].state.pendingLocalUpdates;
+		expect(add).to.deep.equal({
+			type: MessageType.UPDATE_ADD_HTLC,
+			payloadHex: payload.toString('hex')
+		});
+	});
+
+	it('writes a snapshot outbox row for the add once too, and restores it', () => {
+		const { state, channelId, payload } = pendingAdd(true);
+		const frame = snapshot(state, channelId, payload);
+		expect(frame.version).to.equal(4);
+		const [row] = encoded(frame).snapshot.outbox;
+		expect(row.onionFromHtlc).to.equal(true);
+		expect(row.wireMessage).to.have.length(2 * (payload.length - ONION_BYTES));
+
+		const plaintext = encodeFrame(frame);
+		const decoded = decodeFrame(plaintext);
+		expect(encodeFrame(decoded).equals(plaintext)).to.equal(true);
+		expect(decoded.snapshot!.outbox[0].wireMessage.equals(payload)).to.equal(
+			true
+		);
+		expect(
+			decoded.snapshot!.channels[0].state.pendingLocalUpdates[0].payload.equals(
+				payload
+			)
+		).to.equal(true);
+	});
+
+	it('refuses an add without its onion in a frame below version 4, or with no HTLC to take it from', () => {
+		const { state, channelId, payload } = pendingAdd(true);
+		const parsed = encoded(delta(state, channelId));
+		const decode = (value: unknown): RecoveryFrame =>
+			decodeFrame(Buffer.from(JSON.stringify(value), 'utf8'));
+		expect(() => decode({ ...parsed, version: 3 })).to.throw(
+			/requires frame version 4/
+		);
+		const orphan = JSON.parse(JSON.stringify(parsed));
+		orphan.mutations[0].state.htlcs = [];
+		expect(() => decode(orphan)).to.throw(/no offered HTLC/);
+
+		const snap = encoded(snapshot(state, channelId, payload));
+		expect(() => decode({ ...snap, version: 2 })).to.throw(
+			/requires frame version 4/
 		);
 	});
 });
