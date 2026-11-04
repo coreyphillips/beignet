@@ -686,6 +686,10 @@ export function getRelayedEvents(
 		'splice:aborted',
 		'splice:conflicted',
 		'splice:reverted',
+		// A channel send (issue #1922): a client that executed a quote watches
+		// its composite through RELEASED, BROADCAST and LOCKED, or learns why it
+		// aborted.
+		'channel-send:stage',
 		'peer:connect',
 		'peer:disconnect',
 		// Every channel failure reason (peer rejection, funding build/broadcast
@@ -2979,6 +2983,42 @@ async function bootDaemon(
 			return spliceOrRefuse(
 				node.spliceOut(channelId, amountSats, feeratePerkw, address)
 			);
+		},
+		// Channel send (issue #1922): pay an address out of one channel or
+		// several channels in one transaction. Refusals are thrown as
+		// BeignetErrors by the node, so they answer as failure envelopes.
+		'POST /channel-send/quote': async (body) => {
+			const { address, amountSats, feeratePerkw } = body as {
+				address?: string;
+				amountSats?: number;
+				feeratePerkw?: number;
+			};
+			if (!address || amountSats === undefined || feeratePerkw === undefined)
+				return failure(
+					'INVALID_PARAMS',
+					'address, amountSats and feeratePerkw required'
+				);
+			return success(
+				await node.quoteChannelSend(address, amountSats, feeratePerkw)
+			);
+		},
+		'POST /channel-send/execute': async (body) => {
+			const { quoteId } = body as { quoteId?: string };
+			if (!quoteId) return failure('INVALID_PARAMS', 'quoteId required');
+			return success(await node.executeChannelSend(quoteId));
+		},
+		'GET /channel-send/status': (body, query) => {
+			const id = query.get('id') || (body as { id?: string }).id;
+			if (!id) return failure('INVALID_PARAMS', 'id required');
+			const status = node.getChannelSend(id);
+			if (!status) return failure('NOT_FOUND', 'Channel send not found');
+			return success(status);
+		},
+		'GET /channel-send/list': () => success(node.listChannelSends()),
+		'POST /channel-send/abort': (body) => {
+			const { id, reason } = body as { id?: string; reason?: string };
+			if (!id) return failure('INVALID_PARAMS', 'id required');
+			return success(node.abortChannelSend(id, reason));
 		},
 
 		// ── Wait APIs ──

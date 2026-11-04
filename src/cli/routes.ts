@@ -346,6 +346,20 @@ const ROUTE_TABLE = [
 		scopes: [],
 		idempotent: true
 	},
+	// Channel send (issue #1922): quote, status and list are reads. Execute
+	// moves funds to an external address out of one or several channels, a
+	// real spend a retried request must not run twice. Abort changes state
+	// but spends nothing.
+	{ method: 'POST', path: '/channel-send/quote', scopes: ['readonly'] },
+	{ method: 'GET', path: '/channel-send/status', scopes: ['readonly'] },
+	{ method: 'GET', path: '/channel-send/list', scopes: ['readonly'] },
+	{
+		method: 'POST',
+		path: '/channel-send/execute',
+		scopes: [],
+		idempotent: true
+	},
+	{ method: 'POST', path: '/channel-send/abort', scopes: [] },
 	{ method: 'POST', path: '/channel/update-commitment-feerate', scopes: [] },
 	// Deprecated alias of /channel/update-commitment-feerate, served by the
 	// same handler.

@@ -1064,6 +1064,44 @@ async function handleChannel(): Promise<void> {
 				})
 			);
 		}
+		case 'send-quote': {
+			// Channel send (issue #1922): quote a payment to an address out of one
+			// channel, or several channels in one transaction.
+			const pos = positionalArgs();
+			return outputResult(
+				await httpRequest('POST', '/channel-send/quote', {
+					address: pos[2],
+					amountSats: parseInt(pos[3], 10),
+					feeratePerkw: parseInt(pos[4], 10)
+				})
+			);
+		}
+		case 'send': {
+			const pos = positionalArgs();
+			return outputResult(
+				await httpRequest('POST', '/channel-send/execute', {
+					quoteId: pos[2]
+				})
+			);
+		}
+		case 'send-status':
+			return outputResult(
+				await httpRequest(
+					'GET',
+					`/channel-send/status?id=${encodeURIComponent(filteredArgs[2] || '')}`
+				)
+			);
+		case 'send-list':
+			return outputResult(await httpRequest('GET', '/channel-send/list'));
+		case 'send-abort': {
+			const pos = positionalArgs();
+			return outputResult(
+				await httpRequest('POST', '/channel-send/abort', {
+					id: pos[2],
+					...(pos[3] !== undefined ? { reason: pos[3] } : {})
+				})
+			);
+		}
 		case 'ensure-minimum':
 			return outputResult(
 				await httpRequest('POST', '/channels/ensure-minimum', {
@@ -1200,7 +1238,7 @@ async function handleChannel(): Promise<void> {
 				error: {
 					code: 'UNKNOWN_COMMAND',
 					message:
-						'Usage: beignet channel [open|open-zeroconf|open-v2|open-and-wait|connect-and-open|close|forceclose|rebroadcast-close|funding-quote|splice-quote|splice-in|splice-out|ensure-minimum|update-policy|update-commitment-feerate|policy|diagnostics|health|suggestions|wait-ready|ready|list|get]'
+						'Usage: beignet channel [open|open-zeroconf|open-v2|open-and-wait|connect-and-open|close|forceclose|rebroadcast-close|funding-quote|splice-quote|splice-in|splice-out|send-quote|send|send-status|send-list|send-abort|ensure-minimum|update-policy|update-commitment-feerate|policy|diagnostics|health|suggestions|wait-ready|ready|list|get]'
 				}
 			});
 			process.exitCode = 1;
@@ -3192,6 +3230,13 @@ Channels:
   channel splice-out <id> <sats> <feerate> [address]
                                          Withdraw funds from channel, to the
                                          wallet or an external address
+  channel send-quote <address> <sats> <feerate>
+                                         Quote paying an address out of one
+                                         channel, or several in one transaction
+  channel send <quoteId>                 Execute a channel send quote
+  channel send-status <id>               Stage and record of a channel send
+  channel send-list                      Every channel send this node holds
+  channel send-abort <id> [reason]       Abort a composite send before release
   channel ensure-minimum <count> <sats>  Auto-open channels to minimum count
   channel update-policy <id|all> [--base-fee-msat N] [--ppm N] [--cltv-delta N]
                         [--htlc-min-msat N] [--htlc-max-msat N]

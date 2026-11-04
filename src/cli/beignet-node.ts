@@ -47,6 +47,11 @@ import type {
 } from '../utils/identifiers';
 import { txidToDisplayHex } from '../utils/identifiers';
 import type {
+	ChannelSendQuote,
+	ChannelSendQuoteChannel,
+	ChannelSendStatus
+} from './types';
+import type {
 	IFormattedTransaction,
 	IOnchainFees,
 	TMessageDataMap
@@ -82,6 +87,19 @@ import {
 	MAX_SPLICE_FEERATE_PERKW,
 	spliceFeeSats
 } from '../lightning/channel/splice-weight';
+import {
+	COMPOSITE_SPLICE_RETENTION_MS,
+	CompositeSpliceRefusalCode
+} from '../lightning/node/composite-splice-engine';
+import type {
+	ICompositeSpliceRefusal,
+	ICompositeSpliceStageEvent
+} from '../lightning/node/composite-splice-engine';
+import type { ICompositeSpliceRecord } from '../lightning/channel/composite-splice-record';
+import {
+	compositeSpliceStageAtLeast,
+	compositeSpliceStageIsTerminal
+} from '../lightning/channel/composite-splice-record';
 import type { IL402Credential, IL402RequestInit } from '../lightning/l402';
 import {
 	isPrivateNetworkUrl,
@@ -1287,6 +1305,71 @@ const SPLICE_REFUSAL_CODES: Record<SpliceRefusalCode, BeignetErrorCode> = {
 	[SpliceRefusalCode.SPLICE_REFUSED]: BeignetErrorCode.SPLICE_REFUSED
 };
 
+/** How long a channel send quote (issue #1922) can be executed. */
+export const CHANNEL_SEND_QUOTE_TTL_MS = 2 * 60_000;
+/** The most an operator's abort reason may carry; it travels in tx_abort. */
+const CHANNEL_SEND_ABORT_REASON_MAX_BYTES = 1024;
+
+const COMPOSITE_REFUSAL_CODES: Record<
+	CompositeSpliceRefusalCode,
+	BeignetErrorCode
+> = {
+	[CompositeSpliceRefusalCode.INVALID_PARAMS]: BeignetErrorCode.INVALID_PARAMS,
+	[CompositeSpliceRefusalCode.BUSY]: BeignetErrorCode.SPLICE_BUSY,
+	[CompositeSpliceRefusalCode.STORAGE_REQUIRED]: BeignetErrorCode.NOT_PERSISTED,
+	[CompositeSpliceRefusalCode.CHANNEL_NOT_FOUND]:
+		BeignetErrorCode.CHANNEL_NOT_FOUND,
+	[CompositeSpliceRefusalCode.NO_ELIGIBLE_CHANNELS]:
+		BeignetErrorCode.SPLICE_REFUSED,
+	[CompositeSpliceRefusalCode.INSUFFICIENT_BALANCE]:
+		BeignetErrorCode.INSUFFICIENT_BALANCE,
+	[CompositeSpliceRefusalCode.SINGLE_CHANNEL_SUFFICES]:
+		BeignetErrorCode.SPLICE_REFUSED,
+	[CompositeSpliceRefusalCode.NOT_FOUND]: BeignetErrorCode.NOT_FOUND,
+	[CompositeSpliceRefusalCode.TOO_LATE]: BeignetErrorCode.SPLICE_REFUSED
+};
+
+/**
+ * A composite splice refusal as the BeignetError the daemon answers with: the
+ * engine's code mapped to the error code's status, and the per-channel
+ * reasons, when any, appended to the message so a client knows what to fix.
+ */
+export function compositeSpliceRefusalError(
+	refusal: ICompositeSpliceRefusal
+): BeignetError {
+	const skipped = refusal.skipped?.length
+		? `; skipped: ${refusal.skipped
+				.map((c) => `${c.channelId.toString('hex').slice(0, 12)}: ${c.reason}`)
+				.join(', ')}`
+		: '';
+	return new BeignetError(
+		COMPOSITE_REFUSAL_CODES[refusal.code] ?? BeignetErrorCode.SPLICE_REFUSED,
+		`${refusal.error}${skipped}`
+	);
+}
+
+/** A composite's reservation against the daily spend limit (issue #1922). */
+interface ICompositeSpendReservation {
+	totalSats: number;
+	/** Converted to a recorded spend at RELEASED. */
+	charged: boolean;
+	/** No longer counted in _pendingSpendSats (charged or released). */
+	released: boolean;
+}
+
+interface IStoredChannelSendQuote {
+	quote: ChannelSendQuote;
+	destinationScript: Buffer;
+	channelIds: Buffer[];
+}
+
+interface IChannelSendRun {
+	status: ChannelSendStatus;
+	reservation?: ICompositeSpendReservation;
+	/** When the run reached a terminal stage, for the retention sweep. */
+	endedAt?: number;
+}
+
 /**
  * A refusing SpliceResult as the error the daemon answers with, or null for a
  * splice that started. An untyped refusal (an older engine, a code this build
@@ -2482,6 +2565,26 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	private _dailySpentOnchainSats = 0;
 	private _dailySpendResetTime = 0;
 	private _pendingSpendSats = 0;
+	/**
+	 * Channel send (issue #1922): quotes by id until executed or expired,
+	 * executions by quote id, and the spend reservation of each composite by
+	 * its record id. Declared optional and created on first use: a BeignetNode
+	 * built with Object.create (several test fakes) runs no field
+	 * initializers.
+	 */
+	private _channelSendQuotes?: Map<string, IStoredChannelSendQuote>;
+	private _channelSends?: Map<string, IChannelSendRun>;
+	private _compositeReservations?: Map<string, ICompositeSpendReservation>;
+	/** Executions whose start has not returned yet, by quote id: a retry awaits the same one. */
+	private _channelSendInflight?: Map<string, Promise<ChannelSendStatus>>;
+	/**
+	 * Composite starts run one at a time through this node: the engine emits
+	 * PLANNED, NEGOTIATING and, when a session refuses to start, ABORTED
+	 * synchronously inside start(), before the id comes back, and
+	 * _onCompositeSpliceStage binds them to the one run that is starting.
+	 */
+	private _compositeStartChain?: Promise<void>;
+	private _startingChannelSend?: IChannelSendRun | null;
 	/**
 	 * paymentHash hex -> the budget claim of every Lightning payment attempt
 	 * dispatched for that hash, oldest first, whichever path sent it. A
@@ -3751,6 +3854,9 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 					: undefined;
 				this.log('info', 'Splice complete', { channelId, fundingTxid });
 				this.emit('splice:complete', { channelId, fundingTxid });
+				this._onSingleChannelSendSpliceEvent(channelId, 'LOCKED', {
+					txid: fundingTxid
+				});
 			}
 		);
 		// The rest of the splice lifecycle (issue #760): an abort, a conflict
@@ -3763,7 +3869,17 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 				const channelId = data.channelId.toString('hex');
 				this.log('info', 'Splice aborted', { channelId, reason: data.reason });
 				this.emit('splice:aborted', { channelId, reason: data.reason });
+				this._onSingleChannelSendSpliceEvent(channelId, 'ABORTED', {
+					reason: data.reason
+				});
 			}
+		);
+		// A composite channel send (issue #1922): its stages drive the spend
+		// reservation (charged at RELEASED, released at ABORTED) and are
+		// relayed as channel-send:stage under the quote id.
+		this.node.on(
+			'composite-splice:stage',
+			(event: ICompositeSpliceStageEvent) => this._onCompositeSpliceStage(event)
 		);
 		this.node.on(
 			'splice:conflicted',
@@ -13856,6 +13972,685 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	}
 
 	// ─────────────── BOLT 12 Offers ───────────────
+
+	// ─── Channel send (issue #1922) ───
+
+	private channelSendQuotes(): Map<string, IStoredChannelSendQuote> {
+		return (this._channelSendQuotes ??= new Map());
+	}
+
+	private channelSendRuns(): Map<string, IChannelSendRun> {
+		return (this._channelSends ??= new Map());
+	}
+
+	private compositeReservations(): Map<string, ICompositeSpendReservation> {
+		return (this._compositeReservations ??= new Map());
+	}
+
+	private channelSendInflight(): Map<string, Promise<ChannelSendStatus>> {
+		return (this._channelSendInflight ??= new Map());
+	}
+
+	/**
+	 * Quote paying `address` out of this node's channels (issue #1922,
+	 * docs/MULTI-CHANNEL-SPLICE-OUT.md section 7). One channel whose
+	 * splice-out bound covers amount plus fee takes the single-channel path,
+	 * from the channel with the largest spendable balance; otherwise the
+	 * composite engine plans one transaction out of several channels, debited
+	 * largest spendable balance first, with the fee split in proportion. The
+	 * amount plus the whole fee is checked against the per-payment and daily
+	 * limits here, so a refusal comes before anything is reserved. Nothing
+	 * moves: the quote is executed with executeChannelSend within
+	 * CHANNEL_SEND_QUOTE_TTL_MS.
+	 */
+	async quoteChannelSend(
+		address: string,
+		amountSats: number,
+		feeratePerkw: number
+	): Promise<ChannelSendQuote> {
+		if (typeof address !== 'string' || address.length === 0) {
+			throw new BeignetError(
+				BeignetErrorCode.INVALID_PARAMS,
+				'address required'
+			);
+		}
+		requirePositiveSafeInteger(amountSats, 'amountSats');
+		requireU32(feeratePerkw, 'feeratePerkw', 253, MAX_SPLICE_FEERATE_PERKW);
+		const destinationScript = this._decodeSpliceDestination(address);
+		if (!destinationScript) {
+			throw new BeignetError(
+				BeignetErrorCode.INVALID_PARAMS,
+				'address required'
+			);
+		}
+		const quoteId = crypto.randomBytes(32).toString('hex');
+		const expiresAt = Date.now() + CHANNEL_SEND_QUOTE_TTL_MS;
+		let quote: ChannelSendQuote;
+		let channelIds: Buffer[];
+		const single = this._singleChannelSend(
+			amountSats,
+			feeratePerkw,
+			destinationScript
+		);
+		if (single) {
+			channelIds = [single.channelId];
+			quote = {
+				quoteId,
+				kind: 'single',
+				address,
+				amountSats,
+				feeSats: single.feeSats,
+				totalSats: amountSats + single.feeSats,
+				feeratePerkw,
+				channels: [
+					{
+						channelId: single.channelId.toString('hex'),
+						debitSats: amountSats,
+						feeSats: single.feeSats,
+						oldCapacitySats: single.oldCapacitySats,
+						newCapacitySats:
+							single.oldCapacitySats - amountSats - single.feeSats
+					}
+				],
+				skipped: [],
+				expiresAt
+			};
+		} else {
+			const planned = await this.node.planCompositeSpliceOut({
+				destinationScript,
+				amountSats: BigInt(amountSats),
+				fundingFeeratePerkw: feeratePerkw
+			});
+			if (!planned.ok) throw compositeSpliceRefusalError(planned);
+			const plan = planned.plan;
+			channelIds = plan.channels.map((c) => c.channelId);
+			const channels: ChannelSendQuoteChannel[] = plan.channels.map((c) => ({
+				channelId: c.channelId.toString('hex'),
+				debitSats: Number(c.debitSats),
+				feeSats: Number(c.feeSats),
+				oldCapacitySats: Number(c.oldCapacitySats),
+				newCapacitySats: Number(c.newCapacitySats)
+			}));
+			quote = {
+				quoteId,
+				kind: 'composite',
+				address,
+				amountSats,
+				feeSats: Number(plan.feeSats),
+				totalSats: amountSats + Number(plan.feeSats),
+				feeratePerkw,
+				channels,
+				skipped: plan.skipped.map((c) => ({
+					channelId: c.channelId.toString('hex'),
+					reason: c.reason
+				})),
+				expiresAt
+			};
+		}
+		this._checkMaxPayment(quote.totalSats, amountSats, {
+			name: 'on-chain fees',
+			param: 'feeratePerkw'
+		});
+		this._checkSpendLimit(quote.totalSats);
+		this.pruneChannelSendQuotes();
+		this.channelSendQuotes().set(quoteId, {
+			quote,
+			destinationScript,
+			channelIds
+		});
+		return quote;
+	}
+
+	/**
+	 * The channel with the largest spendable balance whose single splice-out
+	 * bound covers the amount plus its fee, or null when none does. The same
+	 * predicate spliceOut applies (spliceQuote), on channels that are NORMAL,
+	 * not busy, not pending a lock, and whose peer splices.
+	 */
+	private _singleChannelSend(
+		amountSats: number,
+		feeratePerkw: number,
+		destinationScript: Buffer
+	): {
+		channelId: Buffer;
+		feeSats: number;
+		oldCapacitySats: number;
+		spendableSats: number;
+	} | null {
+		let best: {
+			channelId: Buffer;
+			feeSats: number;
+			oldCapacitySats: number;
+			spendableSats: number;
+		} | null = null;
+		const manager = this.node.getChannelManager();
+		for (const channel of manager.listChannels()) {
+			const channelId = channel.getChannelId();
+			if (!channelId) continue;
+			if (channel.getState() !== ChannelState.NORMAL) continue;
+			if (channel.spliceBusyReason()) continue;
+			if (channel.getFullState().spliceInFlight) continue;
+			const peer = manager.getPeerForChannel(channelId);
+			if (peer && this.node.peerSupportsSplicing(peer) === false) continue;
+			let quote: ReturnType<LightningNode['spliceQuote']>;
+			try {
+				quote = this.node.spliceQuote(
+					channelId,
+					'out',
+					feeratePerkw,
+					destinationScript
+				);
+			} catch {
+				continue;
+			}
+			if (quote.maxAmountSats < amountSats) continue;
+			// The amount-specific preflight spliceOut runs: the destination is an
+			// interactive-tx output that must clear this channel's negotiated
+			// dust floor, and a fee at or above the amount is refused as a
+			// footgun. A channel that would refuse at execute is not ranked.
+			if (BigInt(amountSats) < channel.spliceInteractiveTxDustFloor()) {
+				continue;
+			}
+			if (quote.feeSats >= amountSats) continue;
+			if (!best || quote.spendableSats > best.spendableSats) {
+				best = {
+					channelId,
+					feeSats: quote.feeSats,
+					oldCapacitySats: Number(channel.getFundingSatoshis()),
+					spendableSats: quote.spendableSats
+				};
+			}
+		}
+		return best;
+	}
+
+	private pruneChannelSendQuotes(): void {
+		const now = Date.now();
+		for (const [id, stored] of this.channelSendQuotes()) {
+			if (stored.quote.expiresAt < now) this.channelSendQuotes().delete(id);
+		}
+	}
+
+	/**
+	 * Run a quoted channel send (issue #1922). The limits are checked again
+	 * against the current ledger. A single-channel quote runs spliceOut and
+	 * records amount plus fee at once, as an address-targeted splice-out does.
+	 * A composite reserves amount plus fee in _pendingSpendSats at PLANNED,
+	 * records it at RELEASED (the point past which the money leaves) and
+	 * releases it at ABORTED or CONFLICTED, so a composite that never
+	 * releases costs nothing of the day's budget. Executing the same quote id
+	 * again returns the first execution and runs nothing (the daemon route is
+	 * idempotent on top of this). A stale or unknown quote is refused before
+	 * any side effect.
+	 */
+	async executeChannelSend(quoteId: string): Promise<ChannelSendStatus> {
+		requireChannelIdHex(quoteId, 'quoteId');
+		const existing = this.channelSendRuns().get(quoteId);
+		if (existing) return this.channelSendStatus(existing);
+		// A retry that arrives while the first execution is still starting
+		// awaits that execution instead of entering the engine again.
+		const inflight = this.channelSendInflight().get(quoteId);
+		if (inflight) return inflight;
+		const execution = this._executeChannelSendOnce(quoteId).finally(() =>
+			this.channelSendInflight().delete(quoteId)
+		);
+		this.channelSendInflight().set(quoteId, execution);
+		return execution;
+	}
+
+	private async _executeChannelSendOnce(
+		quoteId: string
+	): Promise<ChannelSendStatus> {
+		const stored = this.channelSendQuotes().get(quoteId);
+		if (!stored) {
+			throw new BeignetError(
+				BeignetErrorCode.NOT_FOUND,
+				'channel send quote not found (unknown, expired or already executed)'
+			);
+		}
+		if (Date.now() > stored.quote.expiresAt) {
+			this.channelSendQuotes().delete(quoteId);
+			throw new BeignetError(
+				BeignetErrorCode.INVALID_PARAMS,
+				'channel send quote expired; quote again'
+			);
+		}
+		const { quote, destinationScript, channelIds } = stored;
+		this._checkMaxPayment(quote.totalSats, quote.amountSats, {
+			name: 'on-chain fees',
+			param: 'feeratePerkw'
+		});
+		this._checkSpendLimit(quote.totalSats);
+
+		if (quote.kind === 'single') {
+			const result = fundingOrRefuse(() =>
+				this.node.spliceOut(
+					channelIds[0],
+					BigInt(quote.amountSats),
+					quote.feeratePerkw,
+					destinationScript
+				)
+			);
+			if (!result.ok) throw spliceRefusalError(result)!;
+			this._recordSpend(quote.totalSats, 'onchain');
+			this.channelSendQuotes().delete(quoteId);
+			const run: IChannelSendRun = {
+				status: {
+					id: quoteId,
+					kind: 'single',
+					stage: 'STARTED',
+					address: quote.address,
+					amountSats: quote.amountSats,
+					feeSats: quote.feeSats,
+					channelId: quote.channels[0].channelId,
+					startedAt: Date.now()
+				}
+			};
+			this.channelSendRuns().set(quoteId, run);
+			this.emit('channel-send:stage', { id: quoteId, stage: 'STARTED' });
+			return this.channelSendStatus(run);
+		}
+
+		// Composite. The quote may be two minutes old: plan again on the current
+		// balances over the quoted channel set, so the fee the engine prices now
+		// is what the limits see and the ledger counts (a channel that no longer
+		// qualifies refuses the plan).
+		const replanned = await this.node.planCompositeSpliceOut({
+			destinationScript,
+			amountSats: BigInt(quote.amountSats),
+			fundingFeeratePerkw: quote.feeratePerkw,
+			channelIds
+		});
+		if (!replanned.ok) throw compositeSpliceRefusalError(replanned);
+		const feeSats = Number(replanned.plan.feeSats);
+		const totalSats = quote.amountSats + feeSats;
+		if (totalSats !== quote.totalSats) {
+			this._checkMaxPayment(totalSats, quote.amountSats, {
+				name: 'on-chain fees',
+				param: 'feeratePerkw'
+			});
+			this._checkSpendLimit(totalSats);
+		}
+		const reservation: ICompositeSpendReservation = {
+			totalSats,
+			charged: false,
+			released: false
+		};
+		const run: IChannelSendRun = {
+			status: {
+				id: quoteId,
+				kind: 'composite',
+				stage: 'PLANNED',
+				address: quote.address,
+				amountSats: quote.amountSats,
+				feeSats,
+				startedAt: Date.now()
+			},
+			reservation
+		};
+		await this._withCompositeStartLock(async () => {
+			// Reserve before the engine runs, so a concurrent spend cannot
+			// double-count the day's budget while the sessions negotiate, and
+			// register the run before the await, so a stage the engine emits
+			// inside start() is relayed under the quote id.
+			this._pendingSpendSats += totalSats;
+			this._startingChannelSend = run;
+			this.channelSendRuns().set(quoteId, run);
+			let started: Awaited<
+				ReturnType<LightningNode['startCompositeSpliceOut']>
+			>;
+			try {
+				started = await this.node.startCompositeSpliceOut({
+					destinationScript,
+					amountSats: BigInt(quote.amountSats),
+					fundingFeeratePerkw: quote.feeratePerkw,
+					channelIds
+				});
+			} catch (err) {
+				this._releaseCompositeReservation(reservation);
+				this.channelSendRuns().delete(quoteId);
+				throw err;
+			} finally {
+				this._startingChannelSend = null;
+			}
+			if (!started.ok) {
+				this._releaseCompositeReservation(reservation);
+				this.channelSendRuns().delete(quoteId);
+				throw compositeSpliceRefusalError(started);
+			}
+			const compositeId = started.id.toString('hex');
+			run.status.compositeId = compositeId;
+			this.compositeReservations().set(compositeId, reservation);
+			this.channelSendQuotes().delete(quoteId);
+			// The fee the engine priced at start is what leaves. A balance that
+			// moved between the plan above and the start changes it: the
+			// reservation follows, and a total the limits no longer admit
+			// unwinds the composite before any commitment.
+			const startedTotal = quote.amountSats + Number(started.plan.feeSats);
+			if (startedTotal !== reservation.totalSats && !reservation.charged) {
+				if (startedTotal > reservation.totalSats) {
+					try {
+						this._checkMaxPayment(startedTotal, quote.amountSats, {
+							name: 'on-chain fees',
+							param: 'feeratePerkw'
+						});
+						this._checkSpendLimit(startedTotal - reservation.totalSats);
+					} catch (err) {
+						this.node.abortCompositeSplice(
+							started.id,
+							'fee priced at start exceeds the spend limits'
+						);
+						this._releaseCompositeReservation(reservation);
+						this.channelSendRuns().delete(quoteId);
+						throw err;
+					}
+				}
+				if (!reservation.released) {
+					this._pendingSpendSats += startedTotal - reservation.totalSats;
+				}
+				reservation.totalSats = startedTotal;
+				run.status.feeSats = Number(started.plan.feeSats);
+			}
+			// Stages the engine emitted inside start() were bound to this run by
+			// _onCompositeSpliceStage; the record settles anything that was not.
+			this._reconcileCompositeReservation(run, started.id);
+		});
+		return this.channelSendStatus(run);
+	}
+
+	private _withCompositeStartLock<T>(fn: () => Promise<T>): Promise<T> {
+		const previous = this._compositeStartChain ?? Promise.resolve();
+		const next = previous.then(fn, fn);
+		this._compositeStartChain = next.then(
+			() => undefined,
+			() => undefined
+		);
+		return next;
+	}
+
+	/**
+	 * Settle a composite's reservation from its record: RELEASED or later
+	 * charges it, ABORTED or CONFLICTED before any charge releases it. Covers
+	 * a stage the engine emitted before the run was bound to its id, and
+	 * brings the run's status up to the record.
+	 */
+	private _reconcileCompositeReservation(
+		run: IChannelSendRun,
+		compositeId: Buffer
+	): void {
+		const record = this.node.getCompositeSplice(compositeId);
+		if (!record) return;
+		const reservation = run.reservation;
+		if (reservation && !reservation.charged) {
+			if (compositeSpliceStageAtLeast(record.stage, 'RELEASED')) {
+				this._chargeCompositeReservation(reservation);
+			} else if (record.stage === 'ABORTED' || record.stage === 'CONFLICTED') {
+				this._releaseCompositeReservation(reservation);
+			}
+		}
+		run.status.stage = record.stage;
+		if (record.txid) {
+			run.status.txid = txidToDisplayHex(Buffer.from(record.txid, 'hex'));
+		}
+		if (record.reason) run.status.reason = record.reason;
+		if (compositeSpliceStageIsTerminal(record.stage)) {
+			run.endedAt ??= Date.now();
+		}
+	}
+
+	/** The reservation becomes a recorded on-chain spend, once. */
+	private _chargeCompositeReservation(
+		reservation: ICompositeSpendReservation
+	): void {
+		if (reservation.charged) return;
+		reservation.charged = true;
+		this._releaseCompositeReservation(reservation);
+		this._recordSpend(reservation.totalSats, 'onchain');
+	}
+
+	/**
+	 * A single-channel send is a splice-out on one channel, so its outcome is
+	 * the channel's: splice:complete moves the run to LOCKED with the new
+	 * funding txid, splice:aborted to ABORTED with the reason, each relayed on
+	 * channel-send:stage. A run already past STARTED is left alone (a later
+	 * splice on the same channel is not this send).
+	 */
+	private _onSingleChannelSendSpliceEvent(
+		channelId: string,
+		stage: 'LOCKED' | 'ABORTED',
+		detail: { txid?: string; reason?: string }
+	): void {
+		for (const run of this.channelSendRuns().values()) {
+			if (run.status.kind !== 'single') continue;
+			if (run.status.channelId !== channelId) continue;
+			if (run.status.stage !== 'STARTED') continue;
+			run.status.stage = stage;
+			if (detail.txid) run.status.txid = detail.txid;
+			if (detail.reason) run.status.reason = detail.reason;
+			run.endedAt = Date.now();
+			const data = {
+				id: run.status.id,
+				stage,
+				...(detail.txid ? { txid: detail.txid } : {}),
+				...(detail.reason ? { reason: detail.reason } : {})
+			};
+			this.log('info', 'Channel send stage', data);
+			this.emit('channel-send:stage', data);
+		}
+	}
+
+	/**
+	 * Drop runs that ended longer ago than the engine keeps its records
+	 * (COMPOSITE_SPLICE_RETENTION_MS), so a long-lived daemon's list does not
+	 * grow without end. A run still under way is never dropped.
+	 */
+	private pruneChannelSendRuns(): void {
+		const cutoff = Date.now() - COMPOSITE_SPLICE_RETENTION_MS;
+		for (const [id, run] of this.channelSendRuns()) {
+			if (run.endedAt === undefined || run.endedAt >= cutoff) continue;
+			this.channelSendRuns().delete(id);
+			if (run.status.compositeId) {
+				this.compositeReservations().delete(run.status.compositeId);
+			}
+		}
+	}
+
+	private _releaseCompositeReservation(
+		reservation: ICompositeSpendReservation
+	): void {
+		if (reservation.released) return;
+		reservation.released = true;
+		this._pendingSpendSats = Math.max(
+			0,
+			this._pendingSpendSats - reservation.totalSats
+		);
+	}
+
+	/**
+	 * A composite's stage (issue #1922). RELEASED converts the reservation into
+	 * a recorded on-chain spend; ABORTED or CONFLICTED before the charge
+	 * releases it (a charge that already happened stays: CONFLICTED follows
+	 * RELEASED, and the budget treats an uncertain outcome as spent, as the
+	 * Lightning claims do). The stage is relayed under the quote id, or the
+	 * composite id for a composite this node did not quote (a restart).
+	 */
+	private _onCompositeSpliceStage(event: ICompositeSpliceStageEvent): void {
+		const compositeId = event.id.toString('hex');
+		let run: IChannelSendRun | undefined;
+		for (const candidate of this.channelSendRuns().values()) {
+			if (candidate.status.compositeId === compositeId) {
+				run = candidate;
+				break;
+			}
+		}
+		// PLANNED is the first stage of a new composite and the engine emits it
+		// inside start(), before the id comes back: it belongs to the one run
+		// that is starting (starts are serialized), which learns its id here.
+		const starting = this._startingChannelSend;
+		if (
+			!run &&
+			event.stage === 'PLANNED' &&
+			starting &&
+			!starting.status.compositeId
+		) {
+			run = starting;
+			run.status.compositeId = compositeId;
+			if (run.reservation) {
+				this.compositeReservations().set(compositeId, run.reservation);
+			}
+		}
+		const reservation = this.compositeReservations().get(compositeId);
+		if (reservation) {
+			if (event.stage === 'RELEASED') {
+				this._chargeCompositeReservation(reservation);
+			} else if (
+				(event.stage === 'ABORTED' || event.stage === 'CONFLICTED') &&
+				!reservation.charged
+			) {
+				this._releaseCompositeReservation(reservation);
+			}
+		}
+		const txid = event.txid ? txidToDisplayHex(event.txid) : undefined;
+		if (run) {
+			run.status.stage = event.stage;
+			if (txid) run.status.txid = txid;
+			if (event.reason) run.status.reason = event.reason;
+			if (compositeSpliceStageIsTerminal(event.stage)) {
+				run.endedAt ??= Date.now();
+			}
+		}
+		const data = {
+			id: run?.status.id ?? compositeId,
+			compositeId,
+			stage: event.stage,
+			...(txid ? { txid } : {}),
+			...(event.reason ? { reason: event.reason } : {})
+		};
+		this.log('info', 'Channel send stage', data);
+		this.emit('channel-send:stage', data);
+	}
+
+	private channelSendStatus(run: IChannelSendRun): ChannelSendStatus {
+		const status: ChannelSendStatus = { ...run.status };
+		if (status.compositeId) {
+			const record = this.node.getCompositeSplice(
+				Buffer.from(status.compositeId, 'hex')
+			);
+			if (record) {
+				status.record = record;
+				status.stage = record.stage;
+				if (record.txid) {
+					status.txid = txidToDisplayHex(Buffer.from(record.txid, 'hex'));
+				}
+				if (record.reason) status.reason = record.reason;
+			}
+		}
+		return status;
+	}
+
+	private channelSendStatusFromRecord(
+		record: ICompositeSpliceRecord
+	): ChannelSendStatus {
+		return {
+			id: record.id,
+			kind: 'composite',
+			stage: record.stage,
+			amountSats: Number(record.amountSats),
+			feeSats: Number(record.feeSats),
+			compositeId: record.id,
+			...(record.txid
+				? { txid: txidToDisplayHex(Buffer.from(record.txid, 'hex')) }
+				: {}),
+			...(record.reason ? { reason: record.reason } : {}),
+			startedAt: record.createdAt,
+			record
+		};
+	}
+
+	/**
+	 * A channel send by its quote id, or a composite by its record id (one
+	 * this node restored without having quoted it). Null when unknown.
+	 */
+	getChannelSend(id: string): ChannelSendStatus | null {
+		requireChannelIdHex(id, 'id');
+		this.pruneChannelSendRuns();
+		const run = this.channelSendRuns().get(id);
+		if (run) return this.channelSendStatus(run);
+		const record = this.node.getCompositeSplice(Buffer.from(id, 'hex'));
+		return record ? this.channelSendStatusFromRecord(record) : null;
+	}
+
+	/** Every channel send this node executed, plus composites it holds without a quote, oldest first. */
+	listChannelSends(): ChannelSendStatus[] {
+		this.pruneChannelSendRuns();
+		const out: ChannelSendStatus[] = [];
+		const seen = new Set<string>();
+		for (const run of this.channelSendRuns().values()) {
+			out.push(this.channelSendStatus(run));
+			if (run.status.compositeId) seen.add(run.status.compositeId);
+		}
+		for (const record of this.node.listCompositeSplices()) {
+			if (seen.has(record.id)) continue;
+			out.push(this.channelSendStatusFromRecord(record));
+		}
+		return out.sort((a, b) => a.startedAt - b.startedAt);
+	}
+
+	/**
+	 * Abort a composite channel send before RELEASED (issue #1922) and return
+	 * its status. A single-channel send is a splice-out already under way and
+	 * is not aborted from here; past RELEASED the transaction may confirm and
+	 * the engine refuses.
+	 */
+	abortChannelSend(id: string, reason?: string): ChannelSendStatus {
+		requireChannelIdHex(id, 'id');
+		// The reason rides every session's tx_abort; a value that cannot be
+		// encoded would stop the unwind between channels.
+		if (reason !== undefined) {
+			if (typeof reason !== 'string') {
+				throw new BeignetError(
+					BeignetErrorCode.INVALID_PARAMS,
+					'reason must be a string'
+				);
+			}
+			if (
+				Buffer.byteLength(reason, 'utf8') > CHANNEL_SEND_ABORT_REASON_MAX_BYTES
+			) {
+				throw new BeignetError(
+					BeignetErrorCode.INVALID_PARAMS,
+					`reason must be at most ${CHANNEL_SEND_ABORT_REASON_MAX_BYTES} bytes of UTF-8`
+				);
+			}
+		}
+		const run = this.channelSendRuns().get(id);
+		if (run && run.status.kind === 'single') {
+			throw new BeignetError(
+				BeignetErrorCode.SPLICE_REFUSED,
+				'a single-channel send is a splice-out already under way; it cannot be aborted here'
+			);
+		}
+		const compositeId = run?.status.compositeId ?? id;
+		const result = this.node.abortCompositeSplice(
+			Buffer.from(compositeId, 'hex'),
+			reason
+		);
+		if (!result.ok) {
+			throw new BeignetError(
+				result.code === CompositeSpliceRefusalCode.NOT_FOUND
+					? BeignetErrorCode.NOT_FOUND
+					: BeignetErrorCode.SPLICE_REFUSED,
+				result.error ?? 'composite splice cannot be aborted'
+			);
+		}
+		const status = this.getChannelSend(id);
+		if (!status) {
+			throw new BeignetError(
+				BeignetErrorCode.NOT_FOUND,
+				'channel send not found after the abort'
+			);
+		}
+		return status;
+	}
 
 	decodeOfferString(offerStr: string): OfferInfo {
 		const offer = decodeOfferInput(offerStr);
