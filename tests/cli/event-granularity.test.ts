@@ -144,6 +144,13 @@ describe('Event granularity (M4 batch 2b)', () => {
 			expect(getRelayedEvents(true)).to.include('peer:warning');
 		});
 
+		// A refused forward used to arrive as a node:error, which is always
+		// relayed. A client keeps seeing it without htlc events (issue #1957).
+		it('relays htlc:forward-refused, with and without htlc events', () => {
+			expect(getRelayedEvents()).to.include('htlc:forward-refused');
+			expect(getRelayedEvents(true)).to.include('htlc:forward-refused');
+		});
+
 		it('relays the hold-invoice events, with and without htlc events', () => {
 			for (const e of HOLD_EVENTS) {
 				expect(getRelayedEvents(), e).to.include(e);

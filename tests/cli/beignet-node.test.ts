@@ -30,6 +30,7 @@ import { BoostError } from '../../src/utils/boost';
 import * as rapidSync from '../../src/lightning/gossip/rapid-sync';
 import { NetworkGraph } from '../../src/lightning/gossip/network-graph';
 import { LightningNode as LightningNodeClass } from '../../src/lightning/node/lightning-node';
+import { ChannelErrorCode } from '../../src/lightning/channel/channel-actions';
 import { ILogger } from '../../src/logger';
 import {
 	buildV1Snapshot,
@@ -638,6 +639,57 @@ describe('BeignetNode', () => {
 					text: 'Splice feerate_perkw is too low'
 				}
 			]);
+			expect(errors).to.deep.equal([]);
+		} finally {
+			await node.destroy();
+		}
+	});
+
+	it('relays a refused forward with hex ids and a decimal amount, and logs it at info (issue #1957)', async function () {
+		this.timeout(20_000);
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'beignet-refused-'));
+		const node = await BeignetNode.create({
+			network: 'regtest',
+			dataDir: dir,
+			logLevel: 'silent',
+			...OFFLINE_ELECTRUM
+		});
+		try {
+			const seen: Array<
+				Parameters<BeignetNodeEvents['htlc:forward-refused']>[0]
+			> = [];
+			const errors: string[] = [];
+			const lines: Array<[string, string, unknown]> = [];
+			node.on('htlc:forward-refused', (data) => seen.push(data));
+			node.on('node:error', (err) => errors.push(err.code));
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			const internals = node as any;
+			const log = internals.log.bind(node);
+			internals.log = (level: string, message: string, data?: unknown) => {
+				lines.push([level, message, data]);
+				log(level, message, data);
+			};
+			const inChannelId = Buffer.alloc(32, 0x95);
+			const outChannelId = Buffer.alloc(32, 0xe1);
+			const paymentHash = Buffer.alloc(32, 0xad);
+			node.getNode().emit('htlc:forward-refused', {
+				inChannelId,
+				outChannelId,
+				amountMsat: 62_934_000n,
+				paymentHash,
+				reason: 'Insufficient balance for HTLC',
+				channelErrorCode: ChannelErrorCode.INSUFFICIENT_BALANCE
+			});
+			const expected = {
+				inChannelId: inChannelId.toString('hex'),
+				outChannelId: outChannelId.toString('hex'),
+				amountMsat: '62934000',
+				paymentHash: paymentHash.toString('hex'),
+				reason: 'Insufficient balance for HTLC',
+				channelErrorCode: ChannelErrorCode.INSUFFICIENT_BALANCE
+			};
+			expect(seen).to.deep.equal([expected]);
+			expect(lines).to.deep.equal([['info', 'HTLC forward refused', expected]]);
 			expect(errors).to.deep.equal([]);
 		} finally {
 			await node.destroy();

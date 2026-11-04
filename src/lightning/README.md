@@ -1390,6 +1390,7 @@ const result = await node.recoverFromStaticChannelBackup(scb.channels);
 | `htlc:forward` | `(inChannelId: Buffer, outChannelId: Buffer, amountMsat: bigint, paymentHash: Buffer)` | An HTLC was relayed to the next hop. |
 | `htlc:forwarded` | `(data: { inChannelId: Buffer; outChannelId: Buffer; amountInMsat: bigint; amountOutMsat: bigint; feeMsat: bigint })` | A forwarded HTLC settled: the fee was earned. |
 | `htlc:forward-failed` | `(data: { inChannelId: Buffer; outChannelId: Buffer })` | A forwarded HTLC failed downstream. |
+| `htlc:forward-refused` | `(data: { inChannelId: Buffer; outChannelId: Buffer; amountMsat: bigint; paymentHash: Buffer; reason: string; channelErrorCode?: ChannelErrorCode })` | The outgoing channel refused to add a forward, so it was failed back to the sender with temporary_channel_failure. Not a `node:error`: someone else's payment was turned away, nothing of this node's failed. `reason` is the channel's refusal ('Insufficient balance for HTLC', 'Max pending HTLCs exceeded', ...) and `channelErrorCode` its code, when the refusing arm gave one. |
 | `htlc:fulfilled` | `(data: { channelId: Buffer; htlcId: bigint })` | The peer fulfilled an HTLC this node offered: a part of its own payment or the outgoing leg of a forward. |
 | `htlc:failed` | `(data: { channelId: Buffer; htlcId: bigint })` | The peer failed an HTLC this node offered: a part of its own payment or the outgoing leg of a forward. |
 | `broadcast:tx` | `(tx: Buffer)` | Transaction to broadcast on chain. |

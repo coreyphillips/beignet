@@ -521,6 +521,7 @@ property BeignetNodeEvents.'hold:accepted': (data: HoldInvoiceEvent) => void
 property BeignetNodeEvents.'hold:cancelled': (data: HoldInvoiceEvent & { reason: beignet/lightning#node.HoldCancelReason; }) => void
 property BeignetNodeEvents.'hold:settled': (data: HoldInvoiceEvent) => void
 property BeignetNodeEvents.'htlc:failed': (data: { channelId: ChannelIdHex; htlcId: string; }) => void
+property BeignetNodeEvents.'htlc:forward-refused': (data: { inChannelId: ChannelIdHex; outChannelId: ChannelIdHex; amountMsat: string; paymentHash: PaymentHashHex; reason: string; channelErrorCode?: beignet/lightning#channel.ChannelErrorCode; }) => void
 property BeignetNodeEvents.'htlc:forwarded': (data: { inChannelId: ChannelIdHex; outChannelId: ChannelIdHex; amountInMsat: string; amountOutMsat: string; feeMsat: string; }) => void
 property BeignetNodeEvents.'htlc:fulfilled': (data: { channelId: ChannelIdHex; htlcId: string; }) => void
 property BeignetNodeEvents.'invoice:settled': (data: { paymentHash: PaymentHashHex; bolt11: string; amountSats: number; }) => void

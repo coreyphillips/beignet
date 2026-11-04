@@ -698,6 +698,10 @@ export function getRelayedEvents(
 		// A peer's BOLT 1 warning, kept off node:error because nothing failed.
 		// Often the only clue to a protocol disagreement with that peer.
 		'peer:warning',
+		// A forward the outgoing channel turned away. Always on, unlike the
+		// other HTLC events: it used to arrive as a node:error, and it is how a
+		// dashboard tells a turned-away forward from a failed send of its own.
+		'htlc:forward-refused',
 		// Every channel failure reason (peer rejection, funding build/broadcast
 		// failure, disconnect mid-open) is reported as node:error. Without it on
 		// this list a failed open is invisible to clients: the pending channel

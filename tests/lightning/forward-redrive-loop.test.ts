@@ -443,5 +443,86 @@ describe('Stuck forward re-drive loop', function () {
 			// The arm's code rides along with its message (issue #1689).
 			expect(result.code).to.equal(ChannelErrorCode.INSUFFICIENT_BALANCE);
 		});
+
+		it('leaves the refusal to the caller when emitRefusal is false (issue #1957)', function () {
+			const aliceConfig = makeConfig(3);
+			const bobConfig = makeConfig(4);
+			const alicePubkey =
+				aliceConfig.localBasepoints.fundingPubkey.toString('hex');
+			const bobPubkey = bobConfig.localBasepoints.fundingPubkey.toString('hex');
+			const alice = new ChannelManager(aliceConfig);
+			const bob = new ChannelManager(bobConfig);
+			alice.on(
+				'message:outbound',
+				(peer: string, type: number, payload: Buffer) => {
+					if (peer === bobPubkey) bob.handleMessage(alicePubkey, type, payload);
+				}
+			);
+			bob.on(
+				'message:outbound',
+				(peer: string, type: number, payload: Buffer) => {
+					if (peer === alicePubkey)
+						alice.handleMessage(bobPubkey, type, payload);
+				}
+			);
+			const errors: string[] = [];
+			alice.on('error', (_id: Buffer | null, message: string) => {
+				errors.push(message);
+			});
+			bob.on('error', () => undefined);
+
+			const channel = alice.openChannel(bobPubkey, 1_000_000n);
+			const channelId = alice.createFunding(
+				channel,
+				crypto.randomBytes(32),
+				0,
+				crypto.randomBytes(64)
+			)!;
+			alice.handleFundingConfirmed(channelId);
+			bob.handleFundingConfirmed(channelId);
+			expect(errors).to.deep.equal([]);
+
+			const add = (
+				emitRefusal?: boolean
+			): ReturnType<ChannelManager['addHtlc']> =>
+				alice.addHtlc(
+					channelId,
+					10_000_000_000n,
+					crypto.randomBytes(32),
+					500000,
+					crypto.randomBytes(1366),
+					undefined,
+					undefined,
+					emitRefusal === undefined ? undefined : { emitRefusal }
+				);
+
+			const quiet = add(false);
+			expect(quiet.ok).to.equal(false);
+			expect(quiet.error).to.equal('Insufficient balance for HTLC');
+			expect(quiet.code).to.equal(ChannelErrorCode.INSUFFICIENT_BALANCE);
+			expect(errors, 'no error event').to.deep.equal([]);
+			expect(alice.getChannel(channelId)!.getState()).to.equal(
+				ChannelState.NORMAL
+			);
+
+			// The same for a channel the manager does not hold.
+			const missing = alice.addHtlc(
+				crypto.randomBytes(32),
+				1_000n,
+				crypto.randomBytes(32),
+				500000,
+				crypto.randomBytes(1366),
+				undefined,
+				undefined,
+				{ emitRefusal: false }
+			);
+			expect(missing.ok).to.equal(false);
+			expect(missing.error).to.match(/^Channel not found/);
+			expect(errors, 'no error event').to.deep.equal([]);
+
+			// Every other caller still hears about it.
+			expect(add().ok).to.equal(false);
+			expect(errors).to.deep.equal(['Insufficient balance for HTLC']);
+		});
 	});
 });

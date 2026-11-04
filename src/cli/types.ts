@@ -1745,6 +1745,15 @@ export interface BeignetNodeEvents {
 		amountOutMsat: string;
 		feeMsat: string;
 	}) => void;
+	/** The outgoing channel refused to add a forward, so it was failed back to the sender with temporary_channel_failure. Someone else's payment was turned away, so it is not a `node:error`. `reason` is the channel's refusal text, `channelErrorCode` its code when it gave one (INSUFFICIENT_BALANCE, LIMIT_EXCEEDED, ...), `amountMsat` the amount it would have carried as a decimal string. */
+	'htlc:forward-refused': (data: {
+		inChannelId: ChannelIdHex;
+		outChannelId: ChannelIdHex;
+		amountMsat: string;
+		paymentHash: PaymentHashHex;
+		reason: string;
+		channelErrorCode?: ChannelErrorCode;
+	}) => void;
 	/** The peer fulfilled an HTLC this node offered: a part of its own payment or the outgoing leg of a forward. */
 	'htlc:fulfilled': (data: { channelId: ChannelIdHex; htlcId: string }) => void;
 	/** The peer failed an HTLC this node offered: a part of its own payment or the outgoing leg of a forward. */

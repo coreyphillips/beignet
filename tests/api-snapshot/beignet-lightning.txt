@@ -1262,7 +1262,7 @@ method channel.ChannelManager.abortDualFundedOpen(channelId: Buffer, reason?: st
 method channel.ChannelManager.abortFforEpoch(channelId: Buffer, reason?: ffor.FforAbortReason, text?: string): channel.ChannelResult
 method channel.ChannelManager.abortPendingOpen(channel: channel.Channel, reason: string): void
 method channel.ChannelManager.abortSplice(channelId: Buffer, reason?: string): channel.ChannelResult
-method channel.ChannelManager.addHtlc(channelId: Buffer, amountMsat: bigint, paymentHash: Buffer, cltvExpiry: number, onionRoutingPacket: Buffer, blindingPoint?: Buffer, skimmedFeeMsat?: bigint): channel.ChannelResult
+method channel.ChannelManager.addHtlc(channelId: Buffer, amountMsat: bigint, paymentHash: Buffer, cltvExpiry: number, onionRoutingPacket: Buffer, blindingPoint?: Buffer, skimmedFeeMsat?: bigint, options?: { emitRefusal?: boolean; }): channel.ChannelResult
 method channel.ChannelManager.addTrustedPeer(pubkeyHex: string): void
 method channel.ChannelManager.armChannelIndexTipFloor(knownTipHeight?: number): void
 method channel.ChannelManager.attachToPeerManager(peerManager: transport.PeerManager): void
@@ -5961,6 +5961,7 @@ property node.LightningNodeEvents.'hold:settled': (event: node.IHoldInvoiceState
 property node.LightningNodeEvents.'htlc:failed': (data: { channelId: Buffer; htlcId: bigint; }) => void
 property node.LightningNodeEvents.'htlc:forward': (inChannelId: Buffer, outChannelId: Buffer, amountMsat: bigint, paymentHash: Buffer) => void
 property node.LightningNodeEvents.'htlc:forward-failed': (data: { inChannelId: Buffer; outChannelId: Buffer; }) => void
+property node.LightningNodeEvents.'htlc:forward-refused': (data: { inChannelId: Buffer; outChannelId: Buffer; amountMsat: bigint; paymentHash: Buffer; reason: string; channelErrorCode?: channel.ChannelErrorCode; }) => void
 property node.LightningNodeEvents.'htlc:forwarded': (data: { inChannelId: Buffer; outChannelId: Buffer; amountInMsat: bigint; amountOutMsat: bigint; feeMsat: bigint; }) => void
 property node.LightningNodeEvents.'htlc:fulfilled': (data: { channelId: Buffer; htlcId: bigint; }) => void
 property node.LightningNodeEvents.'htlc:held': (data: { paymentHash: Buffer; amountMsat: bigint; }) => void
