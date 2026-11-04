@@ -4032,6 +4032,7 @@ property gossip.IShortChannelId.txIndex: number
 const gossip.LEASE_RATES_FIXED_LEN = 10
 const gossip.MAX_GOSSIP_TIMESTAMP_SKEW = 3600
 const gossip.MAX_RGS_SNAPSHOT_BYTES: number
+const gossip.MESSAGE_FLAG_DONT_FORWARD = 2
 const gossip.MESSAGE_FLAG_HTLC_MAX = 1
 class gossip.MissionControl
 constructor gossip.MissionControl(config?: gossip.IMissionControlConfig)

@@ -23,6 +23,7 @@ import type {
 import {
 	CHANNEL_FLAG_DIRECTION,
 	DEFAULT_PRUNE_MAX_AGE,
+	MESSAGE_FLAG_DONT_FORWARD,
 	gossipTimestampTooFarFuture,
 	decodeShortChannelId
 } from './types';
@@ -68,6 +69,17 @@ function compareScids(a: Buffer, b: Buffer): number {
  */
 function isSignatureless(sig: Buffer): boolean {
 	return sig.equals(ZERO_SIG);
+}
+
+/**
+ * BOLT 7: a dont_forward update is meant for the channel peer alone, and
+ * other nodes discard it (Core Lightning warns the sender). The graph serves
+ * what its slots hold, so it never stores one. A peer's update for one of
+ * our own channels still reaches the channel state, which is where route
+ * hints and blinded paths read it.
+ */
+function isDontForward(msg: IChannelUpdateMessage): boolean {
+	return (msg.messageFlags & MESSAGE_FLAG_DONT_FORWARD) !== 0;
 }
 
 /** Whether two channel_announcements carry the same signed content. */
@@ -541,7 +553,8 @@ export class NetworkGraph {
 	/**
 	 * Apply a channel_update to an existing channel.
 	 * Direction bit determines whether to set update1 (dir=0) or update2 (dir=1).
-	 * Rejects if channel unknown or timestamp is not strictly newer.
+	 * Rejects if channel unknown, timestamp is not strictly newer, or the
+	 * update has dont_forward set.
 	 * Pass { verified: true } only for signature-verified (or self-signed)
 	 * updates, { verified: 'deferred' } for signed-but-unchecked ones;
 	 * anything else is stored unverified and excluded from query responses.
@@ -584,6 +597,9 @@ export class NetworkGraph {
 		if (gossipTimestampTooFarFuture(msg.timestamp)) {
 			return false;
 		}
+		// Refused rather than stored unservable, so it can never take the
+		// slot of a public update from the same direction.
+		if (isDontForward(msg)) return false;
 		const channel = this._channels.get(scidHex);
 		if (!channel) {
 			return false;
@@ -712,14 +728,16 @@ export class NetworkGraph {
 	}
 
 	/**
-	 * Whether a channel_update could change the graph at all. False when the
-	 * channel is unknown, or when the held update for that direction is
-	 * verified and not older (the verified-over-unverified takeover is then
-	 * out of reach, so a stale re-send can be refused by its timestamp alone,
-	 * never needing its signature).
+	 * Whether a channel_update could change the graph at all. False for a
+	 * dont_forward update, when the channel is unknown, or when the held
+	 * update for that direction is verified and not older (the
+	 * verified-over-unverified takeover is then out of reach, so a stale
+	 * re-send can be refused by its timestamp alone, never needing its
+	 * signature).
 	 */
 	wouldAcceptChannelUpdate(msg: IChannelUpdateMessage): boolean {
 		if (gossipTimestampTooFarFuture(msg.timestamp)) return false;
+		if (isDontForward(msg)) return false;
 		const channel = this._channels.get(msg.shortChannelId.toString('hex'));
 		if (!channel) return false;
 		const direction = msg.channelFlags & CHANNEL_FLAG_DIRECTION;
@@ -973,10 +991,12 @@ export class NetworkGraph {
 		// freed slot takes the next real update, a row left with no updates is
 		// pruned right after restore, and per the issue #443 precedent the
 		// repair is not written back (the row self-heals on the next accepted
-		// update).
+		// update). A dont_forward update saved before intake refused it is
+		// dropped the same way, or query replies would serve it.
 		if (
 			channel.update1 &&
-			gossipTimestampTooFarFuture(channel.update1.timestamp)
+			(gossipTimestampTooFarFuture(channel.update1.timestamp) ||
+				isDontForward(channel.update1))
 		) {
 			channel.update1 = undefined;
 			channel.update1Verified = undefined;
@@ -984,7 +1004,8 @@ export class NetworkGraph {
 		}
 		if (
 			channel.update2 &&
-			gossipTimestampTooFarFuture(channel.update2.timestamp)
+			(gossipTimestampTooFarFuture(channel.update2.timestamp) ||
+				isDontForward(channel.update2))
 		) {
 			channel.update2 = undefined;
 			channel.update2Verified = undefined;

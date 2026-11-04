@@ -286,6 +286,8 @@ export const CHANNEL_FLAG_DIRECTION = 0x01;
 export const CHANNEL_FLAG_DISABLED = 0x02;
 
 export const MESSAGE_FLAG_HTLC_MAX = 0x01;
+/** BOLT 7 dont_forward: the update is for the channel peer alone. */
+export const MESSAGE_FLAG_DONT_FORWARD = 0x02;
 
 export const ANNOUNCEMENT_SIGNATURES_LENGTH = 168;
 
