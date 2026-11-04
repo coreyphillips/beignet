@@ -14,11 +14,21 @@ import crypto from 'crypto';
 import { LightningNode } from '../../src/lightning/node/lightning-node';
 import { INodeConfig, PaymentStatus } from '../../src/lightning/node/types';
 import {
+	FEE_INSUFFICIENT,
 	MPP_TIMEOUT,
 	TEMPORARY_CHANNEL_FAILURE
 } from '../../src/lightning/onion/types';
-import { ChannelState } from '../../src/lightning/channel/types';
-import { encodeShortChannelId } from '../../src/lightning/gossip/types';
+import { createFailureMessage } from '../../src/lightning/onion/failures';
+import {
+	ChannelState,
+	REGTEST_CHAIN_HASH
+} from '../../src/lightning/channel/types';
+import {
+	IChannelUpdateMessage,
+	encodeShortChannelId
+} from '../../src/lightning/gossip/types';
+import { encodeChannelUpdateMessage } from '../../src/lightning/gossip/messages';
+import { signChannelUpdate } from '../../src/lightning/gossip/validation';
 import { MessageType } from '../../src/lightning/message/types';
 import { encode as encodeInvoice } from '../../src/lightning/invoice/encode';
 import { decode as decodeInvoice } from '../../src/lightning/invoice/decode';
@@ -536,6 +546,83 @@ describe('MPP across distinct first-hop peers (issue #1922)', function () {
 		expect(payment.failureReason).to.match(/0 part retries used/);
 		expect(payment.failureCode).to.equal(TEMPORARY_CHANNEL_FAILURE);
 		expect(failedEvents).to.equal(1);
+		destroyAll(...world.nodes);
+	});
+
+	it('a first hop that re-prices its channel to D carries its own replacement at the new price (#1942)', async function () {
+		this.timeout(30_000);
+		// W's channel with P3 cannot carry the remainder, so only P2 can
+		// replace the part P2 fails. P2 fails it with fee_insufficient and a
+		// signed channel_update for its channel to D at a higher base fee than
+		// the hint carries: a price, not a fault, so neither that channel nor
+		// W's channel to P2 is excluded from the replacement.
+		const seedBase = 7280;
+		const world = await buildWorld(seedBase, [200_000n, 100_000n, 20_000n]);
+		const amountMsat = world.spendable[0] + REMAINDER_MSAT;
+		const invoice = world.d.createInvoice({
+			amountMsat,
+			description: 'repriced first hop'
+		});
+		const hint = decodeInvoice(invoice.bolt11)
+			.routingHints!.flat()
+			.find((hop) => hop.shortChannelId.equals(hintScidOf(1)))!;
+		const p2Key = nodePrivkey(seedBase + 3);
+		const p2Pubkey = getPublicKey(p2Key);
+		const dPubkey = getPublicKey(nodePrivkey(seedBase + 1));
+		const update: IChannelUpdateMessage = {
+			signature: Buffer.alloc(64),
+			chainHash: REGTEST_CHAIN_HASH,
+			shortChannelId: hintScidOf(1),
+			timestamp: Math.floor(Date.now() / 1000),
+			messageFlags: 0,
+			channelFlags: Buffer.compare(p2Pubkey, dPubkey) < 0 ? 0 : 1,
+			cltvExpiryDelta: hint.cltvExpiryDelta,
+			htlcMinimumMsat: 1n,
+			feeBaseMsat: hint.feeBaseMsat + 1_000,
+			feeProportionalMillionths: hint.feeProportionalMillionths
+		};
+		const signed = encodeChannelUpdateMessage({
+			...update,
+			signature: signChannelUpdate(encodeChannelUpdateMessage(update), p2Key)
+		});
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		const p2 = world.primaries[1].node as any;
+		const forward = p2.handleForwardHtlc.bind(p2);
+		p2.handleForwardHtlc = (
+			inChannelId: Buffer,
+			inHtlcId: bigint,
+			_paymentHash: Buffer,
+			processed: { sharedSecret: Buffer },
+			incomingAmountMsat: bigint
+		): void => {
+			p2.handleForwardHtlc = forward;
+			// fee_insufficient: [u64 htlc_msat][u16 len][channel_update]
+			const data = Buffer.alloc(10 + signed.length);
+			data.writeBigUInt64BE(incomingAmountMsat, 0);
+			data.writeUInt16BE(signed.length, 8);
+			signed.copy(data, 10);
+			p2.channelManager.failHtlc(
+				inChannelId,
+				inHtlcId,
+				createFailureMessage(processed.sharedSecret, FEE_INSUFFICIENT, data)
+			);
+		};
+		const actions: string[] = [];
+		world.w.on('log', (log: { action: string }) => actions.push(log.action));
+
+		await payAndSettle(world, invoice.bolt11, invoice.paymentHash);
+
+		const payment = world.w.getPayment(invoice.paymentHash)!;
+		expect(actions).to.include('retry_repriced');
+		expect(world.wAdds, 'two planned parts and one replacement').to.equal(3);
+		expect(
+			world.primaries.map((p) => p.forwards),
+			'P2 forwarded its own replacement'
+		).to.deep.equal([1, 1, 0]);
+		expect(payment.retryCount).to.equal(1);
+		expect(sum(world.primaries.map((p) => p.forwardedMsat))).to.equal(
+			amountMsat
+		);
 		destroyAll(...world.nodes);
 	});
 });

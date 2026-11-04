@@ -19062,11 +19062,17 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	 * - it must exceed the height THIS attempt was built against, otherwise it
 	 *   tells us nothing we did not already act on and every later failure to the
 	 *   same payee would masquerade as skew until the retries ran out.
+	 *
+	 * An MPP part passes the height it was built against: a replacement sent
+	 * after an earlier part's skew failure is built higher than the planned
+	 * parts, and a planned part failing back afterwards is judged against its
+	 * own height, not the replacement's.
 	 */
 	private noteHeightSkewFailure(
 		payment: IPaymentInfo,
 		failureData?: Buffer,
-		route: IPaymentInfo['route'] = payment.route
+		route: IPaymentInfo['route'] = payment.route,
+		attemptBase: number | undefined = payment.cltvBaseHeight
 	): boolean {
 		if (payment.failureCode !== INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS) {
 			return false;
@@ -19079,8 +19085,9 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		if (!failureData || failureData.length < 12) return false;
 
 		const reportedHeight = failureData.readUInt32BE(8);
-		const attemptBase = payment.cltvBaseHeight ?? this.currentBlockHeight;
-		if (reportedHeight <= attemptBase) return false;
+		if (reportedHeight <= (attemptBase ?? this.currentBlockHeight)) {
+			return false;
+		}
 		if (
 			reportedHeight - this.currentBlockHeight >
 			MAX_TRUSTED_PEER_HEIGHT_SKEW
@@ -19742,8 +19749,9 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		const hops = partRoute.hops;
 		// Route CLTVs are relative deltas; the wire needs absolute (height + delta).
 		const baseHeight = this.cltvBaseHeight(paymentHash);
-		// Every part converts against the same height, so this records what a
-		// height-skew failure has to beat to count as new information.
+		// The part records the height it converts against, since a
+		// replacement can be built higher than the planned parts and a
+		// height-skew failure is judged against the failed part's own.
 		payment.cltvBaseHeight = baseHeight;
 
 		// Each part's final hop must have paymentSecret and totalMsat = full invoice amount
@@ -19840,7 +19848,8 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			htlcId,
 			amountMsat: amount,
 			status: PaymentStatus.PENDING,
-			sharedSecrets
+			sharedSecrets,
+			cltvBaseHeight: baseHeight
 		});
 
 		const result =
@@ -19971,11 +19980,15 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		retryCtx.retryCount++;
 		payment.retryCount = retryCtx.retryCount;
 		// sentMsat is what left this node for the payment: the failed part's
-		// first-hop amount comes off, the replacement's goes on.
+		// first-hop amount comes off, the replacement's goes on. Persisted
+		// before the replacement leaves: a restart after its HTLC is durable
+		// finds no MPP state to re-sum it from, so the record must already
+		// carry the debit the channels will show.
 		payment.sentMsat =
 			(payment.sentMsat ?? 0n) -
 			failedPart.amountMsat +
 			multiRoute.totalAmountMsat;
+		this.persistPayment(paymentHash);
 		this.emitStructuredLog('payment', 'mpp_part_replaced', {
 			paymentHash: hashHex,
 			failedChannelId: failedPart.channelId.toString('hex'),
@@ -19984,6 +19997,11 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			replacementParts: multiRoute.parts.length,
 			retryCount: retryCtx.retryCount
 		});
+		// The replacement's parts leave one by one like the planned ones, so a
+		// part that fails back between them waits in partsAwaitingReplacement
+		// too, or its replacement would draw on balances the parts still to
+		// leave need. The caller's loop takes it once the last one is out.
+		mppState.dispatchComplete = false;
 		for (const partRoute of multiRoute.parts) {
 			if (partRoute.hops.length === 0) continue;
 			const sent = this.dispatchMppPart(
@@ -19999,17 +20017,16 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				return undefined;
 			}
 		}
-		// A replacement part can resolve inside its own dispatch on a
-		// loopback transport; the record is persisted whatever it did.
-		this.persistPayment(paymentHash);
+		mppState.dispatchComplete = true;
 		return undefined;
 	}
 
 	/**
-	 * Replace the parts that failed back while the planned parts were still
-	 * leaving (see IOutboundMppState.partsAwaitingReplacement), now that every
-	 * planned part has drawn its liquidity. A part that cannot be replaced
-	 * gives the payment up the way a post-dispatch failure does.
+	 * Replace the parts that failed back while the planned parts, or an
+	 * earlier replacement's, were still leaving (see
+	 * IOutboundMppState.partsAwaitingReplacement), now that every one of them
+	 * has drawn its liquidity. A part that cannot be replaced gives the
+	 * payment up the way a post-dispatch failure does.
 	 */
 	private replaceMppPartsFailedDuringDispatch(
 		payment: IPaymentInfo,
@@ -27367,7 +27384,8 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		const heightSkew = this.noteHeightSkewFailure(
 			payment,
 			failureData,
-			failureRoute
+			failureRoute,
+			failedPart?.cltvBaseHeight
 		);
 
 		const retryCtx = this.paymentRetryContexts.get(hashHex);
@@ -27439,11 +27457,12 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		// replaced inside the same payment instead (issue #1942): only its own
 		// delivered amount is re-planned over the channels that remain, with
 		// the culpable SCID excluded and, when the failure came from our own
-		// peer, its first hop too, as new parts of the same set. The bound
-		// (retry count and the payee's MPP window), the fee cap and a missing
-		// route end the payment as a failed part did before. A part that
-		// fails back before the planned parts have all left waits for them
-		// (see IOutboundMppState.partsAwaitingReplacement).
+		// peer, its first hop too, as new parts of the same set. A re-priced
+		// hop excludes neither: the replacement takes it at its real price.
+		// The bound (retry count and the payee's MPP window), the fee cap and
+		// a missing route end the payment as a failed part did before. A part
+		// that fails back before the parts being dispatched have all left
+		// waits for them (see IOutboundMppState.partsAwaitingReplacement).
 		if (
 			mppState &&
 			failedPart &&
@@ -27454,6 +27473,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			}
 			if (
 				!heightSkew &&
+				!repriced &&
 				payment.failureSourceIndex === 0 &&
 				failedPart.route.hops.length > 0
 			) {
@@ -27480,18 +27500,10 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			) {
 				return;
 			}
-			if (!mppState.dispatchComplete) {
-				(mppState.partsAwaitingReplacement ??= []).push(failedPart);
-				return;
+			(mppState.partsAwaitingReplacement ??= []).push(failedPart);
+			if (mppState.dispatchComplete) {
+				this.replaceMppPartsFailedDuringDispatch(payment, mppState);
 			}
-			const problem = this.replaceMppPart(
-				payment,
-				mppState,
-				retryCtx,
-				failedPart
-			);
-			if (problem === undefined) return;
-			this.giveUpMppPayment(payment, mppState, problem);
 			return;
 		}
 		if (

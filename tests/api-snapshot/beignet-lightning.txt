@@ -5513,6 +5513,7 @@ property node.INodeInfo.peerCount: number
 interface node.IOutboundMppPart
 property node.IOutboundMppPart.amountMsat: bigint
 property node.IOutboundMppPart.channelId: Buffer
+property node.IOutboundMppPart.cltvBaseHeight?: number
 property node.IOutboundMppPart.htlcId: bigint
 property node.IOutboundMppPart.route: gossip.IRoute
 property node.IOutboundMppPart.sharedSecrets: Buffer[]

@@ -835,6 +835,66 @@ describe('MPP Sending (Phase 5)', function () {
 			bob.destroy();
 		});
 
+		it('a planned part failing for height skew after a replacement left is judged against its own height (#1942)', async function () {
+			const htlcSecretFor = (seedId: number): Buffer =>
+				crypto
+					.createHash('sha256')
+					.update(makeSeed(seedId))
+					.update(Buffer.from([4]))
+					.digest();
+			const alice = new LightningNode({
+				...makeNodeConfig(90),
+				htlcBasepointSecret: htlcSecretFor(90)
+			});
+			const bob = new LightningNode({
+				...makeNodeConfig(91),
+				htlcBasepointSecret: htlcSecretFor(91)
+			});
+			connectNodes(alice, bob);
+			openReadyChannel(alice, bob, 200_000n);
+			openReadyChannel(alice, bob, 200_000n);
+
+			// Bob is five blocks ahead of alice, so every part alice builds
+			// against her own height expires too soon for him and fails back
+			// with his height. Bob answers each part on its own later tick, so
+			// the first part's replacement (built against bob's height) has
+			// left before the second planned part's failure arrives. That
+			// failure reports the same height the replacement was built
+			// against, and only the second part's own height shows it is skew.
+			alice.handleNewBlock(1000);
+			bob.handleNewBlock(1005);
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			const bobAny = bob as any;
+			const finalHop = bobAny.handleFinalHopHtlc.bind(bob);
+			bobAny.handleFinalHopHtlc = (...args: unknown[]): void => {
+				setTimeout(() => finalHop(...args), 0);
+			};
+
+			const invoice = bob.createInvoice({
+				description: 'payee ahead',
+				amountMsat: 250_000_000n
+			});
+			const payment = alice.sendPayment(invoice.bolt11);
+			for (
+				let i = 0;
+				i < 100 && payment.status === PaymentStatus.PENDING;
+				i++
+			) {
+				await new Promise((r) => setTimeout(r, 10));
+			}
+
+			expect(payment.status).to.equal(PaymentStatus.COMPLETED);
+			expect(payment.retryCount, 'both planned parts replaced').to.equal(2);
+			expect(bob.getPayment(invoice.paymentHash)!.status).to.equal(
+				PaymentStatus.COMPLETED
+			);
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			expect((alice as any).outboundMppPayments.size).to.equal(0);
+
+			alice.destroy();
+			bob.destroy();
+		});
+
 		it('a part whose first-hop channel is gone at dispatch fails the payment locally, not at the payee timeout (#1941)', async function () {
 			const htlcSecretFor = (seedId: number): Buffer =>
 				crypto
