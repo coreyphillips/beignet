@@ -25784,7 +25784,10 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 					part.forwardCltv,
 					nextOnionBuf,
 					part.nextBlindingPoint,
-					part.skimmedFeeMsat
+					part.skimmedFeeMsat,
+					// Reported below as htlc:forward-refused. As a node:error it
+					// read exactly like a refused send of the user's own.
+					{ emitRefusal: false }
 				);
 			}
 		);
@@ -25828,6 +25831,13 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 					}
 				}
 			);
+			if (placement === 'refused') {
+				this.reportForwardRefused(
+					outChannelId,
+					part,
+					result as ChannelResult | null
+				);
+			}
 			return placement;
 		}
 
@@ -25839,6 +25849,36 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			part.paymentHash
 		);
 		return 'forwarded';
+	}
+
+	/**
+	 * Report a forward its outgoing channel refused to add. It already failed
+	 * back; this is the record of it, in the action log and as an event, so
+	 * the refusal is not mistaken for a send of this node's own.
+	 */
+	private reportForwardRefused(
+		outChannelId: Buffer,
+		part: IHeldJitPart,
+		result: ChannelResult | null
+	): void {
+		const reason = result?.error ?? 'outgoing add refused';
+		this.emitStructuredLog('htlc', 'forward_refused', {
+			paymentHash: part.paymentHash.toString('hex'),
+			inChannelId: part.inChannelId.toString('hex'),
+			inHtlcId: Number(part.inHtlcId),
+			outChannelId: outChannelId.toString('hex'),
+			amountMsat: part.forwardAmountMsat.toString(),
+			reason,
+			...(result?.code !== undefined ? { channelErrorCode: result.code } : {})
+		});
+		this.emit('htlc:forward-refused', {
+			inChannelId: part.inChannelId,
+			outChannelId,
+			amountMsat: part.forwardAmountMsat,
+			paymentHash: part.paymentHash,
+			reason,
+			...(result?.code !== undefined ? { channelErrorCode: result.code } : {})
+		});
 	}
 
 	/**

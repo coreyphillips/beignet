@@ -4085,6 +4085,20 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 				});
 			}
 		);
+		this.node.on('htlc:forward-refused', (data) => {
+			const info = {
+				inChannelId: data.inChannelId.toString('hex'),
+				outChannelId: data.outChannelId.toString('hex'),
+				amountMsat: data.amountMsat.toString(),
+				paymentHash: data.paymentHash.toString('hex'),
+				reason: data.reason,
+				...(data.channelErrorCode !== undefined
+					? { channelErrorCode: data.channelErrorCode }
+					: {})
+			};
+			this.log('info', 'HTLC forward refused', info);
+			this.emit('htlc:forward-refused', info);
+		});
 		this.node.on(
 			'htlc:fulfilled',
 			(data: { channelId: Buffer; htlcId: bigint }) => {

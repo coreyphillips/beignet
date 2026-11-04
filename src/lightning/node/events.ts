@@ -2,6 +2,7 @@ import type { IReceiverGrant } from '../async-payments/receiver-grant';
 import type { IHeldForwardRecord } from '../async-payments/held-forward-ledger';
 import type { IHeldForwardNotice } from '../async-payments/types';
 import type { ISweepUneconomicChainAction } from '../chain/types';
+import type { ChannelErrorCode } from '../channel/channel-actions';
 import type { FforState, IFforEpochRecord } from '../ffor/types';
 import type { FforIssuerEvents } from '../ffor/issuer-service';
 import type { FforWitnessEvents } from '../ffor/witness-service';
@@ -240,6 +241,15 @@ export interface LightningNodeEvents
 	'htlc:forward-failed': (data: {
 		inChannelId: Buffer;
 		outChannelId: Buffer;
+	}) => void;
+	/** The outgoing channel refused to add a forward, so it was failed back to the sender with temporary_channel_failure. Not a `node:error`: someone else's payment was turned away, nothing of this node's failed. `reason` is the channel's refusal ('Insufficient balance for HTLC', 'Max pending HTLCs exceeded', ...) and `channelErrorCode` its code, when the refusing arm gave one. */
+	'htlc:forward-refused': (data: {
+		inChannelId: Buffer;
+		outChannelId: Buffer;
+		amountMsat: bigint;
+		paymentHash: Buffer;
+		reason: string;
+		channelErrorCode?: ChannelErrorCode;
 	}) => void;
 	/** The peer fulfilled an HTLC this node offered: a part of its own payment or the outgoing leg of a forward. */
 	'htlc:fulfilled': (data: { channelId: Buffer; htlcId: bigint }) => void;

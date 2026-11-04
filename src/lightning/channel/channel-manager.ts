@@ -1747,6 +1747,11 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 
 	/**
 	 * Add an HTLC to a channel.
+	 *
+	 * A refusal comes back in the result and is also emitted as `error`,
+	 * unless `options.emitRefusal` is false. The forwarding path passes false
+	 * and reports its refusal itself (`htlc:forward-refused`), because a
+	 * channel turning away someone else's payment is not a fault of this node.
 	 */
 	addHtlc(
 		channelId: Buffer,
@@ -1755,19 +1760,21 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		cltvExpiry: number,
 		onionRoutingPacket: Buffer,
 		blindingPoint?: Buffer,
-		skimmedFeeMsat?: bigint
+		skimmedFeeMsat?: bigint,
+		options?: { emitRefusal?: boolean }
 	): ChannelResult {
+		const emitRefusal = options?.emitRefusal !== false;
 		const idHex = channelId.toString('hex');
 		const channel = this.channels.get(idHex);
 		if (!channel) {
 			const error = `Channel not found: ${idHex}`;
-			this.emit('error', channelId, error);
+			if (emitRefusal) this.emit('error', channelId, error);
 			return { ok: false, actions: [], error };
 		}
 		const peerPubkey = this.channelPeers.get(idHex);
 		if (!peerPubkey) {
 			const error = `Peer not found for channel: ${idHex}`;
-			this.emit('error', channelId, error);
+			if (emitRefusal) this.emit('error', channelId, error);
 			return { ok: false, actions: [], error };
 		}
 
@@ -1779,7 +1786,15 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			blindingPoint,
 			skimmedFeeMsat
 		);
-		this.processActions(peerPubkey, channel, actions);
+		// A refused add changed nothing in the channel and its ERROR carries no
+		// cleanup, so dropping it from the dispatch only drops the event.
+		this.processActions(
+			peerPubkey,
+			channel,
+			emitRefusal
+				? actions
+				: actions.filter((a) => a.type !== ChannelActionType.ERROR)
+		);
 
 		// BOLT 2: after sending update_add_htlc we must send commitment_signed so
 		// the peer commits the HTLC. This kicks off the commitment exchange.
