@@ -50,6 +50,7 @@ import {
 	usesCompactHtlcHistory
 } from './htlc-history';
 import { unsavedRevokedHtlcSnapshots } from '../channel/htlc-snapshots';
+import { addWithoutOnion, restoreAddOnion } from './add-onion';
 
 // ─── Primitive helpers ───
 
@@ -500,7 +501,16 @@ export interface ISerializedChannelState {
 	lastSentRevokeSecret: string | null;
 	lastSentRevokeNextPoint: string | null;
 	lastSentWasRevoke?: boolean | null;
-	pendingLocalUpdates?: Array<{ type: number; payloadHex: string }>;
+	/**
+	 * `onionFromHtlc` marks an update_add_htlc journaled without its onion,
+	 * which the offered HTLC entry it added carries (recovery frame version
+	 * 4). Local storage always writes the whole message.
+	 */
+	pendingLocalUpdates?: Array<{
+		type: number;
+		payloadHex: string;
+		onionFromHtlc?: true;
+	}>;
 	pendingLocalUpdatesSignedCount?: number;
 	preReestablishState: string | null;
 	lastProposedClosingFeeSat: string | null;
@@ -934,6 +944,12 @@ export function serializeChannelState(
 		 * as additions to that table.
 		 */
 		htlcHistory?: 'all' | 'unsaved' | 'none';
+		/**
+		 * Journal a pending update_add_htlc of ours without the onion its
+		 * offered HTLC entry already holds. Only recovery frames of version 4
+		 * may carry that form.
+		 */
+		addOnionsByReference?: boolean;
 	} = {}
 ): ISerializedChannelState {
 	const htlcs: ISerializedHtlcEntry[] = [];
@@ -1043,10 +1059,18 @@ export function serializeChannelState(
 		lastSentPartialSignatureWithNonce: bufToHex(
 			s.lastSentPartialSignatureWithNonce
 		),
-		pendingLocalUpdates: (s.pendingLocalUpdates ?? []).map((u) => ({
-			type: u.type,
-			payloadHex: u.payload.toString('hex')
-		})),
+		pendingLocalUpdates: (s.pendingLocalUpdates ?? []).map((u) => {
+			const rest = options.addOnionsByReference
+				? addWithoutOnion(s.htlcs, u.type, u.payload)
+				: null;
+			return rest
+				? {
+						type: u.type,
+						payloadHex: rest.toString('hex'),
+						onionFromHtlc: true as const
+				  }
+				: { type: u.type, payloadHex: u.payload.toString('hex') };
+		}),
 		pendingLocalUpdatesSignedCount: s.pendingLocalUpdatesSignedCount ?? 0,
 		lastSentHtlcSignatures: s.lastSentHtlcSignatures.map((b) =>
 			b.toString('hex')
@@ -1689,7 +1713,10 @@ export function deserializeChannelState(
 		),
 		pendingLocalUpdates: (s.pendingLocalUpdates ?? []).map((u) => ({
 			type: u.type,
-			payload: Buffer.from(u.payloadHex, 'hex')
+			payload:
+				u.onionFromHtlc === true
+					? restoreAddOnion(htlcs, u.type, u.payloadHex)
+					: Buffer.from(u.payloadHex, 'hex')
 		})),
 		pendingLocalUpdatesSignedCount: s.pendingLocalUpdatesSignedCount ?? 0,
 		lastSentHtlcSignatures: (s.lastSentHtlcSignatures || []).map((h) =>

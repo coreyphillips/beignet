@@ -317,6 +317,8 @@ Concurrent receive channels encode their complete revoked HTLC history using a t
 
 A channel state in a delta frame carries only the revoked HTLC snapshots its commit added, and a reader adds them to the ones it already holds. Frames with a channel state declare version 3 for this, since older readers would replace the history with the delta. Snapshot frames still carry the whole history.
 
+An update_add_htlc of ours waiting for the peer's revocation is kept twice in the channel state: whole in `pendingLocalUpdates` for retransmission, and its onion again in the offered HTLC entry. A snapshot's outbox holds it a third time. With hundreds of HTLCs in flight that alone would outgrow the 4 MiB floor. So a frame writes such an add (and a snapshot its outbox row for that add) without the 1,366 onion bytes, marked `onionFromHtlc`, and a reader puts back the onion of `offered-<id>` from the same channel state. Frames using this declare version 4, since older readers would replay the add truncated, and a lower version carrying the mark is corrupt. Frames without such an add keep the version they had. Local storage always keeps the whole message. With this, a channel holding 483 HTLCs each way and no commitment exchanged journals every frame under the floor.
+
 New tables: `recovery_frames(sequence PRIMARY KEY, writer_epoch, frame_hash, previous_hash, ciphertext, created_at)` and `recovery_meta(key, value)` for the current epoch, tip hash, and snapshot sequence.
 
 Deterministic reconstruction: `reconstructFromFrames(snapshot, deltas)` rebuilds every safety-critical table byte-identically. This must be property-tested (section 10).
