@@ -436,7 +436,8 @@ import {
 	journalSupported,
 	loadWriterLease,
 	composeRecoveryCapsule,
-	assertEmptyTarget
+	assertEmptyTarget,
+	PAYMENT_ROW_MAX_BYTES
 } from '../recovery';
 import type {
 	IChannelPersistOutbox,
@@ -27535,19 +27536,33 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	}
 
 	/**
+	 * Encoded bytes a payment_state row may take: what a frame holds, and
+	 * no more than PAYMENT_ROW_MAX_BYTES, since a settled row rides the
+	 * channel transition that fulfils its HTLC and the channel's state can
+	 * fill the rest of the frame (issue #1954).
+	 */
+	private paymentRowRoom(): number | undefined {
+		const room = this.recoveryJournal?.mutationRoom();
+		return room === undefined
+			? undefined
+			: Math.min(room, PAYMENT_ROW_MAX_BYTES);
+	}
+
+	/**
 	 * A guardian refuses a record over its limit, and every record after it,
 	 * so one payment row that outgrows a frame stops replication for good.
-	 * Metadata is the part of a row the caller sizes, and it may take half a
-	 * frame: the rest is left for what the payment carries and gains after
-	 * it is labelled (route, shared secrets, preimage, a retry's invoice, a
-	 * failure, received parts). Given the batches that store the row, as it
-	 * is written and as it settles, each has to fit a frame as well.
+	 * Metadata is the part of a row the caller sizes, and it may take half
+	 * the row's room: the rest is left for what the payment carries and
+	 * gains after it is labelled (route, shared secrets, preimage, a retry's
+	 * invoice, a failure, received parts). Given the batches that store the
+	 * row, as it is written and as it settles, each has to fit the room as
+	 * well.
 	 */
 	private paymentMetadataFits(
 		metadata: Record<string, string>,
 		...batches: RecoveryMutation[][]
 	): boolean {
-		const room = this.recoveryJournal?.mutationRoom();
+		const room = this.paymentRowRoom();
 		if (room === undefined) return true;
 		if (Buffer.byteLength(JSON.stringify(metadata), 'utf8') > room / 2) {
 			return false;
@@ -27638,7 +27653,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	 * count from growing the settled row past what a guardian accepts.
 	 */
 	private settledRowFits(hashHex: string): boolean {
-		const room = this.recoveryJournal?.mutationRoom();
+		const room = this.paymentRowRoom();
 		const payment = this.payments.get(hashHex);
 		return (
 			room === undefined ||

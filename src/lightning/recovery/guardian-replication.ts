@@ -74,18 +74,31 @@ import { GUARDIAN_HOST_DEFAULT_MAX_CIPHERTEXT_BYTES } from './guardian-host';
  *
  * A delta frame carries a whole channel transition, and a settled payment
  * row rides the transition that settles its HTLC, so the frame holds the
- * channel's state (about 9 KB idle, about 3.4 KB more per HTLC in flight)
- * beside a row the label budget lets take half the frame. The row checks
- * size the row alone; this floor is what leaves the other half for the
- * channel. At 4 MiB that half holds a channel at the default limit of 483
- * HTLCs in flight with over a hundred to spare; a channel full in both
- * directions, about 3.3 MB, fits beside a label under 900 KB. A guardian
- * below the floor would refuse the first busy settlement and, taking only
- * the next sequence, every record after it, so it is refused up front
- * instead (issue #1954).
+ * channel's state beside the row. The row checks size the row alone,
+ * against PAYMENT_ROW_MAX_BYTES; this floor is what leaves the rest for
+ * the channel. A guardian below it would refuse the first busy settlement
+ * and, taking only the next sequence, every record after it, so it is
+ * refused up front instead (issue #1954).
  */
 export const GUARDIAN_RECORD_LIMIT_FLOOR_BYTES =
 	GUARDIAN_HOST_DEFAULT_MAX_CIPHERTEXT_BYTES;
+
+/**
+ * The most a channel_state takes in a delta frame: about 9 KB idle and
+ * about 3.4 KB per HTLC in flight (measured), with both directions full
+ * at the 483 HTLCs each may hold, about 3.3 MB, and margin over that.
+ */
+export const CHANNEL_STATE_RESERVE_BYTES = 3_670_016;
+
+/**
+ * The most a payment_state row may take, however large the guardians'
+ * limit: what the floor leaves beside a full channel, the frame header and
+ * the mapping and secret deletions a settlement also carries. A row sized
+ * against the frame alone would settle beside a busy channel in a frame
+ * over the floor (issue #1954).
+ */
+export const PAYMENT_ROW_MAX_BYTES =
+	GUARDIAN_RECORD_LIMIT_FLOOR_BYTES - CHANNEL_STATE_RESERVE_BYTES - 1_024;
 import {
 	JOURNAL_META_KEYS,
 	META_LAST_SNAPSHOT_GROUP,
