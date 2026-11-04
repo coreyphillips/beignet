@@ -27,14 +27,18 @@ import {
 	encodeShortChannelId,
 	IChannelAnnouncementMessage,
 	IChannelUpdateMessage,
+	IGraphChannel,
 	INodeAnnouncementMessage,
 	IReplyChannelRangeMessage,
 	IReplyShortChannelIdsEndMessage
 } from '../../src/lightning/gossip/types';
 import {
 	decodeChannelAnnouncementMessage,
-	encodeChannelAnnouncementMessage
+	decodeChannelUpdateMessage,
+	encodeChannelAnnouncementMessage,
+	encodeChannelUpdateMessage
 } from '../../src/lightning/gossip/messages';
+import { signChannelUpdate } from '../../src/lightning/gossip/validation';
 import { NetworkGraph } from '../../src/lightning/gossip/network-graph';
 import {
 	makeSignedChannelKeys,
@@ -143,6 +147,27 @@ function makeChannelUpdate(
 		feeProportionalMillionths: 1,
 		htlcMaximumMsat: 1_000_000_000n
 	};
+}
+
+/** A genuinely signed channel_update with dont_forward set. */
+function makeSignedDontForwardUpdate(
+	scid: Buffer,
+	signerKey: Buffer,
+	direction: 0 | 1,
+	timestamp: number
+): { msg: IChannelUpdateMessage; payload: Buffer } {
+	const payload = encodeChannelUpdateMessage({
+		...makeSignedChannelUpdate(
+			scid,
+			signerKey,
+			direction,
+			timestamp,
+			REGTEST_CHAIN_HASH
+		).msg,
+		messageFlags: 0x03
+	});
+	signChannelUpdate(payload, signerKey).copy(payload, 0);
+	return { msg: decodeChannelUpdateMessage(payload), payload };
 }
 
 function makeNodeAnnouncement(
@@ -1753,6 +1778,83 @@ describe('Gossip Sync (Phase 5)', function () {
 		});
 	});
 
+	describe('dont_forward updates are never stored or served (issue #1955)', function () {
+		const scid = makeScid(898237, 1683, 0);
+		const keys = makeSignedChannelKeys();
+		const ann = makeSignedChannelAnnouncement(scid, keys, REGTEST_CHAIN_HASH);
+		const public1 = makeSignedChannelUpdate(
+			scid,
+			keys.nodeKey1,
+			0,
+			1000,
+			REGTEST_CHAIN_HASH
+		);
+		const public2 = makeSignedChannelUpdate(
+			scid,
+			keys.nodeKey2,
+			1,
+			1000,
+			REGTEST_CHAIN_HASH
+		);
+		const private1 = makeSignedDontForwardUpdate(scid, keys.nodeKey1, 0, 2000);
+
+		it('refuses a newer dont_forward update without displacing the public one, and a later public update still replaces it', function () {
+			const graph = new NetworkGraph(REGTEST_CHAIN_HASH);
+			graph.addChannelAnnouncement(ann.msg, { verified: true });
+			graph.applyChannelUpdate(public1.msg, { verified: true });
+			graph.applyChannelUpdate(public2.msg, { verified: true });
+
+			expect(graph.wouldAcceptChannelUpdate(private1.msg)).to.be.false;
+			expect(graph.applyChannelUpdate(private1.msg, { verified: true })).to.be
+				.false;
+			expect(graph.getChannel(scid)!.update1!.timestamp).to.equal(1000);
+			const served = graph.getGossipMessagesForChannels([scid]);
+			expect(served.updates.map((u) => u.timestamp)).to.deep.equal([
+				1000, 1000
+			]);
+
+			const later = makeSignedChannelUpdate(
+				scid,
+				keys.nodeKey1,
+				0,
+				3000,
+				REGTEST_CHAIN_HASH
+			);
+			expect(graph.applyChannelUpdate(later.msg, { verified: true })).to.be
+				.true;
+			expect(
+				graph.getGossipMessagesForChannels([scid]).updates[0].timestamp
+			).to.equal(3000);
+		});
+
+		it('drops a dont_forward update a stored row already holds', function () {
+			const graph = new NetworkGraph(REGTEST_CHAIN_HASH);
+			const row: IGraphChannel = {
+				shortChannelId: scid,
+				nodeId1: ann.msg.nodeId1,
+				nodeId2: ann.msg.nodeId2,
+				features: Buffer.alloc(0),
+				announcement: ann.msg,
+				update1: private1.msg,
+				update2: public2.msg,
+				announcementVerified: true,
+				update1Verified: true,
+				update2Verified: true
+			};
+			graph.restoreChannel(row);
+
+			expect(graph.getChannel(scid)!.update1).to.equal(undefined);
+			const served = graph.getGossipMessagesForChannels([scid]);
+			expect(served.announcements).to.have.length(1);
+			expect(served.updates).to.have.length(1);
+			expect(served.updates[0].channelFlags & 0x01).to.equal(1);
+			// The freed slot takes the public update the stored one had
+			// shadowed by timestamp.
+			expect(graph.applyChannelUpdate(public1.msg, { verified: true })).to.be
+				.true;
+		});
+	});
+
 	describe('Deferred gossip provenance (issue #443)', function () {
 		// Lazy verification: foreign gossip is admitted as 'deferred' and only
 		// verified when a gossip query asks for the entry. The #340 contract
@@ -3233,6 +3335,77 @@ describe('Gossip Sync (Phase 5)', function () {
 			expect(served.updates[0].channelFlags & 0x01).to.equal(0);
 			node.destroy();
 		});
+
+		for (const eager of [false, true]) {
+			it(`answers query_short_channel_ids with the public updates only after a peer sends a dont_forward one (issue #1955, ${
+				eager ? 'eager' : 'lazy'
+			} mode)`, async function () {
+				const node = makeNode(false, crypto.randomBytes(32), eager);
+				const peer = 'aa'.repeat(33);
+				const scid = makeScid(152, 1, 0);
+				const keys = makeSignedChannelKeys();
+				const ann = makeSignedChannelAnnouncement(
+					scid,
+					keys,
+					REGTEST_CHAIN_HASH
+				);
+				const public1 = makeSignedChannelUpdate(
+					scid,
+					keys.nodeKey1,
+					0,
+					1000,
+					REGTEST_CHAIN_HASH
+				);
+				const public2 = makeSignedChannelUpdate(
+					scid,
+					keys.nodeKey2,
+					1,
+					1000,
+					REGTEST_CHAIN_HASH
+				);
+				const private1 = makeSignedDontForwardUpdate(
+					scid,
+					keys.nodeKey1,
+					0,
+					2000
+				);
+				for (const [type, payload] of [
+					[MessageType.CHANNEL_ANNOUNCEMENT, ann.payload],
+					[MessageType.CHANNEL_UPDATE, public1.payload],
+					[MessageType.CHANNEL_UPDATE, public2.payload],
+					[MessageType.CHANNEL_UPDATE, private1.payload]
+				] as const) {
+					node.handlePeerMessage(peer, type, payload);
+				}
+				await node.flushGossip();
+
+				const outbound: Array<{ type: number; payload: Buffer }> = [];
+				node.on(
+					'message:outbound',
+					(_pubkey: string, type: number, payload: Buffer) => {
+						outbound.push({ type, payload });
+					}
+				);
+				node.handlePeerMessage(
+					peer,
+					MessageType.QUERY_SHORT_CHANNEL_IDS,
+					encodeQueryShortChannelIdsMessage({
+						chainHash: REGTEST_CHAIN_HASH,
+						encodedShortIds: encodeShortChannelIds([scid])
+					})
+				);
+				const served = (type: number): Buffer[] =>
+					outbound.filter((m) => m.type === type).map((m) => m.payload);
+				expect(served(MessageType.CHANNEL_ANNOUNCEMENT)).to.deep.equal([
+					ann.payload
+				]);
+				expect(served(MessageType.CHANNEL_UPDATE)).to.deep.equal([
+					public1.payload,
+					public2.payload
+				]);
+				node.destroy();
+			});
+		}
 
 		it('defers intake verification and resolves it at serve time (issue #443, lazy default)', async function () {
 			const node = makeNode();

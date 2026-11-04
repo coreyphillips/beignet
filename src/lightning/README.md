@@ -1209,6 +1209,8 @@ signatures). Pass `{ verified: true }` only for signature-checked messages that
 re-encode byte-identically to the signed wire payload, or
 `{ verified: 'deferred' }` for signed-but-unchecked ones. Rapid Gossip Sync
 entries are always unverified because RGS strips signatures.
+`applyChannelUpdate` refuses an update with `dont_forward` set, whatever its
+provenance: BOLT 7 meant it for the channel peer alone.
 
 A full mainnet RGS snapshot (about 28k channels and twice as many updates)
 holds the event loop for hundreds of milliseconds when applied in one pass
