@@ -12,7 +12,11 @@
 import { expect } from 'chai';
 import crypto from 'crypto';
 import { LightningNode } from '../../src/lightning/node/lightning-node';
-import { PaymentStatus } from '../../src/lightning/node/types';
+import { INodeConfig, PaymentStatus } from '../../src/lightning/node/types';
+import {
+	MPP_TIMEOUT,
+	TEMPORARY_CHANNEL_FAILURE
+} from '../../src/lightning/onion/types';
 import { ChannelState } from '../../src/lightning/channel/types';
 import { encodeShortChannelId } from '../../src/lightning/gossip/types';
 import { MessageType } from '../../src/lightning/message/types';
@@ -39,6 +43,8 @@ interface IPrimary {
 	dChannelId: Buffer;
 	/** Adds this primary forwarded to D. */
 	forwards: number;
+	/** What those adds carried to D. */
+	forwardedMsat: bigint;
 }
 
 interface IWorld {
@@ -76,30 +82,53 @@ async function openChannelOf(
 	return channelId;
 }
 
+interface IWorldOptions {
+	/** Each primary's channel to D, 1M sats unless given. */
+	dChannelSats?: bigint[];
+	wExtra?: Partial<INodeConfig>;
+	dExtra?: Partial<INodeConfig>;
+}
+
 /**
  * W opens one channel per entry of `wChannelSats` to a fresh primary, and each
- * primary opens a 1M-sat channel to D, so D has inbound on every primary and W
- * holds the balance on its side. The P-D channels are private: D's invoice
- * hints them by the alias the primary chose, which the primary forwards over
- * once registered, as the async-world setup does.
+ * primary opens a 1M-sat channel to D (or its `dChannelSats` entry), so D has
+ * inbound on every primary and W holds the balance on its side. The P-D
+ * channels are private: D's invoice hints them by the alias the primary chose,
+ * which the primary forwards over once registered, as the async-world setup
+ * does.
  */
 async function buildWorld(
 	seedBase: number,
-	wChannelSats: bigint[]
+	wChannelSats: bigint[],
+	options: IWorldOptions = {}
 ): Promise<IWorld> {
-	const w = createNode(seedBase);
-	const d = createNode(seedBase + 1);
+	const w = createNode(seedBase, undefined, options.wExtra);
+	const d = createNode(seedBase + 1, undefined, options.dExtra);
 	const primaries: IPrimary[] = [];
 	for (let i = 0; i < wChannelSats.length; i++) {
 		const node = createNode(seedBase + 2 + i);
 		wire(w, node, { val: false });
 		wire(node, d, { val: false });
 		const wChannelId = await openChannelOf(w, node, wChannelSats[i]);
-		const dChannelId = await openChannelOf(node, d, 1_000_000n);
-		const primary: IPrimary = { node, wChannelId, dChannelId, forwards: 0 };
-		node.on('htlc:forward', () => {
-			primary.forwards++;
-		});
+		const dChannelId = await openChannelOf(
+			node,
+			d,
+			options.dChannelSats?.[i] ?? 1_000_000n
+		);
+		const primary: IPrimary = {
+			node,
+			wChannelId,
+			dChannelId,
+			forwards: 0,
+			forwardedMsat: 0n
+		};
+		node.on(
+			'htlc:forward',
+			(_inChannel: Buffer, _outChannel: Buffer, amountMsat: bigint) => {
+				primary.forwards++;
+				primary.forwardedMsat += amountMsat;
+			}
+		);
 		primaries.push(primary);
 	}
 	const nodes = [w, d, ...primaries.map((p) => p.node)];
@@ -114,11 +143,7 @@ async function buildWorld(
 		'every channel on every node to reach NORMAL'
 	);
 	primaries.forEach((p, i) => {
-		const scid = encodeShortChannelId({
-			block: 840,
-			txIndex: i + 1,
-			outputIndex: 0
-		});
+		const scid = hintScidOf(i);
 		p.node.registerChannelScid(p.dChannelId, scid);
 		writableState(
 			p.node.getChannelManager().getChannel(p.dChannelId)!
@@ -141,6 +166,21 @@ async function buildWorld(
 		if (type === MessageType.UPDATE_ADD_HTLC) world.wAdds++;
 	});
 	return world;
+}
+
+/** The alias primary `i` registers for its channel to D, which D's invoice hints. */
+function hintScidOf(i: number): Buffer {
+	return encodeShortChannelId({ block: 840, txIndex: i + 1, outputIndex: 0 });
+}
+
+/**
+ * Make W's planner prefer the other primaries over primary `i` when more than
+ * one can carry a part: a MissionControl penalty on the hinted channel adds a
+ * cost, not an exclusion, so a replacement part can still take it.
+ */
+function penalise(world: IWorld, i: number): void {
+	// eslint-disable-next-line @typescript-eslint/no-explicit-any
+	(world.w as any).missionControl.recordFailure(hintScidOf(i).toString('hex'));
 }
 
 const sum = (values: bigint[]): bigint => values.reduce((a, b) => a + b, 0n);
@@ -357,6 +397,145 @@ describe('MPP across distinct first-hop peers (issue #1922)', function () {
 		);
 		// eslint-disable-next-line @typescript-eslint/no-explicit-any
 		expect((world.w as any).outboundMppPayments.size).to.equal(0);
+		destroyAll(...world.nodes);
+	});
+
+	/**
+	 * Three primaries. W's channel with P1 carries most of the amount and the
+	 * rest fits P2 or P3; P3 is penalised so the plan takes P2. P2's channel
+	 * to D is far too small for its part, which a hint cannot show, so P2
+	 * fails the part back with temporary_channel_failure once the siblings
+	 * have left.
+	 */
+	const REMAINDER_MSAT = 50_000_000n;
+
+	it('a part its primary fails is replaced over another primary under the same payment (#1942)', async function () {
+		this.timeout(30_000);
+		const world = await buildWorld(7220, [200_000n, 100_000n, 100_000n], {
+			dChannelSats: [1_000_000n, 30_000n, 1_000_000n]
+		});
+		penalise(world, 2);
+		const amountMsat = world.spendable[0] + REMAINDER_MSAT;
+		const invoice = world.d.createInvoice({
+			amountMsat,
+			description: 'replaced part'
+		});
+		const events: string[] = [];
+		world.w.on('payment:sent', () => events.push('sent'));
+		world.w.on('payment:failed', () => events.push('failed'));
+
+		await payAndSettle(world, invoice.bolt11, invoice.paymentHash);
+
+		const payment = world.w.getPayment(invoice.paymentHash)!;
+		expect(world.wAdds, 'two planned parts and one replacement').to.equal(3);
+		expect(
+			world.primaries.map((p) => p.forwards),
+			'P2 forwarded nothing, P3 carried the replacement'
+		).to.deep.equal([1, 0, 1]);
+		expect(payment.retryCount, 'one part replaced').to.equal(1);
+		expect(
+			payment.failureCode,
+			'the part failure stays on the record'
+		).to.equal(TEMPORARY_CHANNEL_FAILURE);
+		expect(events, 'one completion event').to.deep.equal(['sent']);
+		expect(payment.sentMsat! >= amountMsat).to.equal(true);
+		expect(payment.sentMsat! < amountMsat + FEE_MARGIN_MSAT).to.equal(true);
+		// Everything D was ever sent is the invoice exactly: the replacement
+		// took the failed part's place, it did not join it.
+		expect(
+			sum(world.primaries.map((p) => p.forwardedMsat)),
+			'D received total_msat once'
+		).to.equal(amountMsat);
+		expect(world.d.getPayment(invoice.paymentHash)!.amountMsat).to.equal(
+			amountMsat
+		);
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		expect((world.w as any).outboundMppPayments.size).to.equal(0);
+		destroyAll(...world.nodes);
+	});
+
+	it('the failed first hop is excluded from the replacement and the payment fails once every alternative fails (#1942)', async function () {
+		this.timeout(30_000);
+		const world = await buildWorld(7240, [200_000n, 100_000n, 100_000n], {
+			dChannelSats: [1_000_000n, 30_000n, 30_000n],
+			dExtra: { mppTimeoutMs: 1 }
+		});
+		penalise(world, 2);
+		const amountMsat = world.spendable[0] + REMAINDER_MSAT;
+		const invoice = world.d.createInvoice({
+			amountMsat,
+			description: 'no alternative'
+		});
+		let failedEvents = 0;
+		world.w.on('payment:failed', () => failedEvents++);
+
+		const payment = world.w.sendPayment(invoice.bolt11);
+		await waitFor(
+			() => payment.status === PaymentStatus.FAILED,
+			'the payment to fail on W'
+		);
+		await settle();
+
+		expect(
+			world.wAdds,
+			'P2, then P3 as its replacement, then nothing'
+		).to.equal(3);
+		expect(world.primaries.map((p) => p.forwards)).to.deep.equal([1, 0, 0]);
+		expect(payment.retryCount).to.equal(1);
+		expect(payment.failureReason).to.match(
+			/Replacement part not sent: no route/
+		);
+		expect(failedEvents, 'payment:failed emitted once').to.equal(1);
+		// Both failed primaries' hinted channels and W's channels to them are
+		// out; P1's channel stays in, it did its part.
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		const wAny = world.w as any;
+		const excluded: Set<string> | undefined = wAny.paymentRetryContexts.get(
+			invoice.paymentHash.toString('hex')
+		)?.excludedChannels;
+		expect(excluded, 'the context went with the payment').to.equal(undefined);
+		// D holds P1's part alone and releases it at its MPP timeout; the
+		// record is already FAILED, so that failure changes nothing but the
+		// code it records.
+		await new Promise((r) => setTimeout(r, 5));
+		world.d.failTimedOutMppPayments();
+		await settle();
+		expect(payment.failureCode).to.equal(MPP_TIMEOUT);
+		expect(failedEvents).to.equal(1);
+		expect(wAny.outboundMppPayments.size).to.equal(0);
+		expect(world.d.getPayment(invoice.paymentHash)!.status).to.equal(
+			PaymentStatus.PENDING
+		);
+		destroyAll(...world.nodes);
+	});
+
+	it('the retry bound ends the payment FAILED without a replacement (#1942)', async function () {
+		this.timeout(30_000);
+		const world = await buildWorld(7260, [200_000n, 100_000n, 100_000n], {
+			dChannelSats: [1_000_000n, 30_000n, 1_000_000n],
+			wExtra: { maxPaymentRetries: 0 }
+		});
+		penalise(world, 2);
+		const amountMsat = world.spendable[0] + REMAINDER_MSAT;
+		const invoice = world.d.createInvoice({
+			amountMsat,
+			description: 'no retries'
+		});
+		let failedEvents = 0;
+		world.w.on('payment:failed', () => failedEvents++);
+
+		const payment = world.w.sendPayment(invoice.bolt11);
+		await waitFor(
+			() => payment.status === PaymentStatus.FAILED,
+			'the payment to fail on W'
+		);
+		await settle();
+
+		expect(world.wAdds, 'the two planned parts only').to.equal(2);
+		expect(world.primaries.map((p) => p.forwards)).to.deep.equal([1, 0, 0]);
+		expect(payment.failureReason).to.match(/0 part retries used/);
+		expect(payment.failureCode).to.equal(TEMPORARY_CHANNEL_FAILURE);
+		expect(failedEvents).to.equal(1);
 		destroyAll(...world.nodes);
 	});
 });

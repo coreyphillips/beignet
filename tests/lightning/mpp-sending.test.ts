@@ -725,7 +725,7 @@ describe('MPP Sending (Phase 5)', function () {
 			]);
 		});
 
-		it('a failed part never redispatches the full invoice and decrypts with its own secrets', async function () {
+		it('a failed part never redispatches the full invoice, is replaced part by part within the retry bound, and decrypts with its own secrets', async function () {
 			// Non-dust HTLCs need real HTLC signatures in the loopback harness.
 			const htlcSecretFor = (seedId: number): Buffer =>
 				crypto
@@ -749,15 +749,23 @@ describe('MPP Sending (Phase 5)', function () {
 			openReadyChannel(alice, bob, 200_000n);
 
 			// Bob rejects every incoming part with a retryable failure and
-			// counts what arrives. Anything above the original part count
-			// means the whole invoice was redispatched after a part failure,
-			// which lets the receiver hold old + new parts summing past
-			// total_msat and overpay the invoice.
+			// counts what arrives, with the amounts. A failed part is replaced
+			// by a part for its own amount (#1942), never by the whole invoice:
+			// that would let the receiver hold old + new parts summing past
+			// total_msat and overpay the invoice. So every attempt carries
+			// less than the invoice, and the attempts stop at the planned
+			// parts plus the retry bound.
 			let attempts = 0;
+			const attemptAmounts: bigint[] = [];
 			// eslint-disable-next-line @typescript-eslint/no-explicit-any
 			const bobAny = bob as any;
-			bobAny.handleFinalHopHtlc = (channelId: Buffer, htlcId: bigint): void => {
+			bobAny.handleFinalHopHtlc = (
+				channelId: Buffer,
+				htlcId: bigint,
+				amountMsat: bigint
+			): void => {
 				attempts++;
+				attemptAmounts.push(amountMsat);
 				const key = `${channelId.toString('hex')}:${htlcId}`;
 				const sharedSecret = bobAny.receivedHtlcSharedSecrets.get(key);
 				bobAny.channelManager.failHtlc(
@@ -794,9 +802,21 @@ describe('MPP Sending (Phase 5)', function () {
 			const attemptsAtReturn = attempts;
 			await new Promise((r) => setTimeout(r, 50));
 
-			expect(attemptsAtReturn, 'exactly the original two parts').to.equal(2);
-			expect(attempts, 'no redispatch after the failures settled').to.equal(2);
+			// Two planned parts, then one replacement per retry (default 3).
+			expect(
+				attemptsAtReturn,
+				'the two planned parts and the bounded replacements'
+			).to.equal(2 + 3);
+			expect(attempts, 'no redispatch after the failures settled').to.equal(
+				2 + 3
+			);
+			expect(payment.retryCount).to.equal(3);
+			expect(
+				attemptAmounts.every((amount) => amount < 250_000_000n),
+				'no attempt carried the whole invoice'
+			).to.equal(true);
 			expect(payment.status).to.equal(PaymentStatus.FAILED);
+			expect(payment.failureReason).to.match(/3 part retries used/);
 			expect(failedEvents, 'payment:failed emitted once').to.equal(1);
 
 			// The failure returned on the SECOND part is a distinct onion; it

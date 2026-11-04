@@ -1514,6 +1514,13 @@ export interface IOutboundMppState {
 	 * resolved, or the late parts' failures lose their decryption context.
 	 */
 	dispatchComplete?: boolean;
+	/**
+	 * Parts that failed back before dispatch finished and are owed a
+	 * replacement (issue #1942). A replacement planned mid-dispatch would see
+	 * channel balances the undispatched parts have not drawn on yet and could
+	 * take their liquidity, so these wait until the last planned part is out.
+	 */
+	partsAwaitingReplacement?: IOutboundMppPart[];
 }
 
 // ─── Swap provider foundations (issue #737, phase 2) ───

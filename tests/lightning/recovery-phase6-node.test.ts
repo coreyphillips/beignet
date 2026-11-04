@@ -1376,6 +1376,10 @@ describe('Recovery phase 6: the node drives durability', () => {
 		const { node, storage, room, rowBytes, longestLabel } =
 			nodeUnderCeiling(1_700);
 		const payer = createLoopbackNode('settled-parts', 4);
+		// A part refused for want of room comes back with a temporary code,
+		// which the payer would replace up to its retry bound (#1942). The
+		// counts below are the node's refusals of the seven planned parts.
+		(payer as unknown as { maxPaymentRetries: number }).maxPaymentRetries = 0;
 		connectNodes(node, payer);
 		node.handleNewBlock(1000);
 		payer.handleNewBlock(1000);
