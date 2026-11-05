@@ -1148,6 +1148,7 @@ property OnchainTxInfo.address: string
 property OnchainTxInfo.channelId?: ChannelIdHex
 property OnchainTxInfo.confirmTimestamp?: number
 property OnchainTxInfo.confirmed: boolean
+property OnchainTxInfo.dropped?: true
 property OnchainTxInfo.feeSats: number
 property OnchainTxInfo.height?: number
 property OnchainTxInfo.satsPerVbyte: number

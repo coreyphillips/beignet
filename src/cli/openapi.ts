@@ -5524,6 +5524,12 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						confirmed: { type: 'boolean' },
 						timestamp: { type: 'integer' },
 						confirmTimestamp: { type: 'integer' },
+						dropped: {
+							type: 'boolean',
+							enum: [true],
+							description:
+								"Present, and true, on an unconfirmed transaction the wallet's server no longer has in the mempool or in a block: it was replaced, a conflicting spend of its inputs confirmed, or the mempool evicted it. It will not confirm and is not in the balance. Absent once the server has it again"
+						},
 						source: {
 							type: 'string',
 							enum: ['cooperative-close', 'onchain-sweep'],
