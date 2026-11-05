@@ -1524,6 +1524,45 @@ describe('BeignetNode new methods', () => {
 		expect(txs[1].confirmed).to.be.true;
 	});
 
+	it('listOnchainTransactions marks a transaction the server no longer has as dropped', () => {
+		// The losing version of a cooperative close: the other signed version
+		// confirmed, the server dropped this one, and the wallet's ghost check
+		// cleared its exists flag. The listing read it as waiting for a block.
+		const record = (txid: string, extra: object) => ({
+			txid,
+			type: 'received',
+			value: 0.00000979,
+			fee: 0.00000141,
+			satsPerByte: 1,
+			address: 'bcrt1qexample',
+			height: 0,
+			timestamp: 3000,
+			...extra
+		});
+		const fakeWallet = {
+			transactions: {
+				gone: record('gone', { exists: false }),
+				live: record('live', { exists: true, timestamp: 2000 }),
+				unflagged: record('unflagged', { timestamp: 1000 }),
+				// Never written by the wallet, but a block outranks the flag.
+				mined: record('mined', { exists: false, height: 100, timestamp: 500 })
+			}
+		};
+		const txs = BeignetNode.prototype.listOnchainTransactions.call(
+			Object.assign(Object.create(BeignetNode.prototype), {
+				wallet: fakeWallet,
+				node: { listExternalClosePayments: () => [] }
+			}) as unknown as BeignetNode
+		);
+		const byId = new Map(txs.map((tx) => [tx.txid, tx]));
+		expect(byId.get('gone')!.dropped).to.equal(true);
+		expect(byId.get('gone')!.confirmed).to.be.false;
+		expect(byId.get('gone')!.valueSats).to.equal(979);
+		for (const txid of ['live', 'unflagged', 'mined'])
+			expect(byId.get(txid)!, txid).to.not.have.property('dropped');
+		expect(byId.get('mined')!.confirmed).to.be.true;
+	});
+
 	describe('sendOnchain broadcast handling', () => {
 		// Raw regtest tx captured from a live send; txid is its double-SHA id.
 		const rawTxHex =

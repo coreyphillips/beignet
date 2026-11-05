@@ -8078,7 +8078,12 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 			timestamp: tx.timestamp,
 			...(tx.confirmTimestamp !== undefined
 				? { confirmTimestamp: tx.confirmTimestamp }
-				: {})
+				: {}),
+			// The wallet clears exists when its server no longer has the
+			// transaction anywhere (updateGhostTransactions), and sets it again
+			// when a lookup finds it (issue #945). Without this, a transaction
+			// that can no longer confirm read as one waiting for a block.
+			...(tx.exists === false && !tx.height ? { dropped: true as const } : {})
 		};
 	}
 

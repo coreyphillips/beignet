@@ -760,6 +760,13 @@ export interface OnchainTxInfo {
 	confirmed: boolean;
 	timestamp: number;
 	confirmTimestamp?: number;
+	/**
+	 * Set on an unconfirmed transaction the wallet's server no longer has,
+	 * in the mempool or in a block. It was replaced, a conflicting spend of
+	 * its inputs confirmed, or the mempool evicted it, so it will not confirm
+	 * and is not in the balance. Absent once the server has it again.
+	 */
+	dropped?: true;
 }
 
 export interface UtxoInfo {
