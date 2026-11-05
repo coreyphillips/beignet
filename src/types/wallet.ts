@@ -555,7 +555,10 @@ export type TAddressScan = {
 	 * or repaired since the first was asked for.
 	 */
 	current: () => boolean;
-	/** What the UTXO scan of each extension round would have listed. */
+	/**
+	 * Left for the refresh's UTXO listing by a scan that extended: every
+	 * address its rounds check, and the window around the stored index.
+	 */
 	utxoAddresses: IAddresses;
 };
 

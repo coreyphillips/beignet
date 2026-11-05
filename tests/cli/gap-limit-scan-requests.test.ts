@@ -380,6 +380,69 @@ describe('gap-limit scan requests (#1661)', function () {
 		expect(duplicates).to.deep.equal([]);
 	});
 
+	/** Pays each index on one chain of the p2wpkh type. */
+	const payAt = async (indexes: number[], change: boolean): Promise<void> => {
+		for (const index of indexes) {
+			const gen = await wallet.generateAddresses({
+				addressAmount: change ? 0 : 1,
+				addressIndex: index,
+				changeAddressAmount: change ? 1 : 0,
+				changeAddressIndex: index,
+				addressType: EAddressType.p2wpkh
+			});
+			if (gen.isErr()) throw gen.error;
+			pay(at(change ? gen.value.changeAddresses : gen.value.addresses, index));
+		}
+	};
+
+	const coinIndexes = (): number[] =>
+		wallet.data.utxos.map((u) => u.index).sort((a, b) => a - b);
+
+	for (const change of [false, true]) {
+		const chain = change ? 'change' : 'receive';
+		it(`keeps the coins in the ${chain} windows between the first and the last (#1943)`, async function () {
+			const first = await wallet.refreshWallet();
+			expect(first.isOk(), first.isErr() ? first.error.message : '').to.equal(
+				true
+			);
+			// The scan extends four times and moves the index to 61, whose
+			// look-behind starts at 41. Neither that window nor the one around
+			// the index the scan started at reaches 22.
+			await payAt([3, 22, 41, 60], change);
+			utxoScans = 0;
+
+			for (const round of ['first', 'second']) {
+				const res = await wallet.refreshWallet();
+				expect(res.isOk(), res.isErr() ? res.error.message : '').to.equal(true);
+				expect(coinIndexes(), `${round} refresh`).to.deep.equal([
+					3, 22, 41, 60
+				]);
+				expect(wallet.data.balance).to.equal(400_000);
+			}
+			const index = change
+				? wallet.data.changeAddressIndex
+				: wallet.data.addressIndex;
+			expect(index[EAddressType.p2wpkh].index).to.equal(61);
+			expect(utxoScans, 'one UTXO listing per refresh').to.equal(2);
+			expect(duplicates).to.deep.equal([]);
+		});
+	}
+
+	it('lists the coins every extension round reached when called without a refresh (#1943)', async function () {
+		const first = await wallet.refreshWallet();
+		expect(first.isOk(), first.isErr() ? first.error.message : '').to.equal(
+			true
+		);
+		await payAt([3, 22, 41, 60], false);
+
+		const res = await wallet.fetchNextAvailableAddress(EAddressType.p2wpkh);
+		expect(res.isOk(), res.isErr() ? res.error.message : '').to.equal(true);
+		if (res.isErr()) return;
+
+		expect(res.value.addressIndex.index).to.equal(61);
+		expect(coinIndexes()).to.deep.equal([3, 22, 41, 60]);
+	});
+
 	it('asks again for a history the scan was answered before the check repaired its record', async function () {
 		const first = await wallet.refreshWallet();
 		expect(first.isOk(), first.isErr() ? first.error.message : '').to.equal(

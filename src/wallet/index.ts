@@ -2722,9 +2722,11 @@ export class Wallet {
 				// Store the newly created addresses used for this method.
 				allAddresses = [...allAddresses, ...addressesToScan];
 				allChangeAddresses = [...allChangeAddresses, ...changeAddressesToScan];
-				// What a UTXO scan of this round would list. It is listed once,
-				// after the gap scan, since each listing also repeats every UTXO
-				// the wallet holds.
+				// Listed once, after the gap scan, since each listing also repeats
+				// every UTXO the wallet holds. utxoScanAddresses picks the window
+				// around the stored index, which the scan has not moved yet. The
+				// window around the index the scan ends at does not reach back to
+				// the middle rounds, so every address the rounds check is listed too.
 				Object.assign(
 					scan.utxoAddresses,
 					this.electrum.utxoScanAddresses({
@@ -2733,6 +2735,9 @@ export class Wallet {
 						addressTypesToCheck: [addressType]
 					})
 				);
+				for (const address of [...allAddresses, ...allChangeAddresses]) {
+					scan.utxoAddresses[address.scriptHash] = address;
+				}
 			}
 
 			await this.saveGrownAddressMaps();
