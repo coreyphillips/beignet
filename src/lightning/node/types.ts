@@ -1448,6 +1448,13 @@ export interface IOutboundMppPart {
 	 * attributed) with the secrets of the part it came back on.
 	 */
 	sharedSecrets: Buffer[];
+	/**
+	 * Block height this part converted its route's CLTV deltas against. A
+	 * replacement part (issue #1942) can be built higher than the planned
+	 * ones, so a payee's height-skew claim is judged against the failed
+	 * part's own height, not the payment's latest.
+	 */
+	cltvBaseHeight?: number;
 }
 
 export interface ILightningBalance {
@@ -1514,6 +1521,14 @@ export interface IOutboundMppState {
 	 * resolved, or the late parts' failures lose their decryption context.
 	 */
 	dispatchComplete?: boolean;
+	/**
+	 * Parts that failed back before dispatch, of the planned parts or of a
+	 * replacement's, finished and are owed a replacement (issue #1942). A
+	 * replacement planned mid-dispatch would see channel balances the
+	 * undispatched parts have not drawn on yet and could take their
+	 * liquidity, so these wait until the last part being sent is out.
+	 */
+	partsAwaitingReplacement?: IOutboundMppPart[];
 }
 
 // ─── Swap provider foundations (issue #737, phase 2) ───

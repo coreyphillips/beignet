@@ -22,9 +22,20 @@ The caller of `findMultiPathRoute` may pass a bound. `sendPayment` passes none, 
 
 The bound is a ceiling on parts, not a target: a payment that fits one channel is still sent as one part.
 
+## When a part fails
+
+A part that fails back with a temporary failure is replaced inside the same payment (issue #1942); the invoice is never sent again while sibling parts are held. Only the failed part's delivered amount is planned again, over the channels that remain, with the same payment hash, payment secret and `total_msat`, so the recipient never holds parts summing past the invoice. The failed part is irrevocably gone from the wallet's channel before the replacement is planned, so a channel's spendable balance counts the replacement and never the failed part as well.
+
+The replacement is planned with the culpable channel excluded, and when the failure came from the wallet's own peer, that first hop excluded too, provided another channel of the wallet remains. A failure that re-prices a hop (`fee_insufficient` with a signed `channel_update`, say) excludes nothing: the replacement takes the hop at its real price. It is split the same way a payment is, so a replacement that fits no single route leaves as several parts. The fee cap applies to the live parts plus the replacement, judged once.
+
+Replacements are bounded by the payment's retry count (`maxPaymentRetries`, default 3, counted per replaced part) and by a window of 45 seconds after the first part left, inside the 60 seconds BOLT 4 has the recipient hold a partial set, so a replacement does not reach the recipient after it has failed the siblings back. When the bound is hit, no route carries the amount, or the cap would be exceeded, the payment fails as a failed part failed it before: one `payment:failed`, the reason on the record, and the recipient releases the other parts at its MPP timeout. A permanent failure, `mpp_timeout` among them, is never replaced.
+
+A part that fails back before the parts being sent, planned or a replacement's, have all left waits until they have: a replacement planned mid-dispatch would draw on balances the undispatched parts have not taken yet. The revised `sentMsat` is persisted before a replacement leaves, so a restart after its HTLC is durable keeps the debit the channels show; a record that cannot be written holds the replacement back, and the payment ends as one with no route does. The record's `retryCount` is the number of replacements sent, and each replacement is logged as `mpp_part_replaced` with the failed part's channel and HTLC id.
+
+A restart during a payment keeps today's rule: retry contexts are not persisted, so nothing is replaced after a restart; the parts still out resolve through their persisted HTLC mappings and end the record, and no part whose outcome is unknown is ever sent again.
+
 ## What this does not cover
 
 - Pay-all is single-part and does not fall back to MPP; see [PAY-ALL.md](PAY-ALL.md).
-- BOLT 12 offers, keysend and blinded-path payments take their own single-path branches and never split.
-- A part that fails after dispatch is not retried or re-split; the payment fails and the recipient releases the other parts at its MPP timeout.
+- BOLT 12 offers, keysend and blinded-path payments take their own single-path branches and never split, so their failures are retried whole, as before.
 - The router does not know a peer's `max_htlc_value_in_flight_msat` cap, which `addHtlc` still enforces locally.

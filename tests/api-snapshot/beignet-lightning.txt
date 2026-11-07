@@ -5515,6 +5515,7 @@ property node.INodeInfo.peerCount: number
 interface node.IOutboundMppPart
 property node.IOutboundMppPart.amountMsat: bigint
 property node.IOutboundMppPart.channelId: Buffer
+property node.IOutboundMppPart.cltvBaseHeight?: number
 property node.IOutboundMppPart.htlcId: bigint
 property node.IOutboundMppPart.route: gossip.IRoute
 property node.IOutboundMppPart.sharedSecrets: Buffer[]
@@ -5523,6 +5524,7 @@ interface node.IOutboundMppState
 property node.IOutboundMppState.createdAt: number
 property node.IOutboundMppState.dispatchComplete?: boolean
 property node.IOutboundMppState.parts: node.IOutboundMppPart[]
+property node.IOutboundMppState.partsAwaitingReplacement?: node.IOutboundMppPart[]
 property node.IOutboundMppState.paymentHash: Buffer
 property node.IOutboundMppState.totalMsat: bigint
 interface node.IOutgoingHtlcView
