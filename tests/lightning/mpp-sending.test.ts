@@ -2136,3 +2136,143 @@ describe('MPP Sending (Phase 5)', function () {
 		});
 	});
 });
+
+/**
+ * The estimate prices what the payment would do (coreyphillips/beignet#1924):
+ * an amount no single channel carries is estimated as the multi-path payment
+ * sendPayment falls back to, instead of being refused as "no route" while
+ * the payment itself would have gone through.
+ */
+describe('estimatePayment prices the split a payment would make', function () {
+	/**
+	 * Alice with two 100k sat channels to bob, both announced with a generous
+	 * maximum, so what bounds a part is the channel's own spendable balance.
+	 */
+	function twoChannels(seed: number): {
+		alice: LightningNode;
+		bob: LightningNode;
+	} {
+		const alice = createNode(seed);
+		const bob = createNode(seed + 1);
+		connectNodes(alice, bob);
+		openReadyChannel(alice, bob, 100_000n);
+		openReadyChannel(alice, bob, 100_000n);
+		const graph = alice.getGraph();
+		const alicePub = Buffer.from(alice.getNodeId(), 'hex');
+		const bobPub = Buffer.from(bob.getNodeId(), 'hex');
+		const [n1, n2] =
+			Buffer.compare(alicePub, bobPub) < 0
+				? [alicePub, bobPub]
+				: [bobPub, alicePub];
+		for (let i = 0; i < 2; i++) {
+			const scid = makeScid(950 + seed, i + 1, 0);
+			graph.addChannelAnnouncement({
+				nodeSignature1: crypto.randomBytes(64),
+				nodeSignature2: crypto.randomBytes(64),
+				bitcoinSignature1: crypto.randomBytes(64),
+				bitcoinSignature2: crypto.randomBytes(64),
+				features: Buffer.alloc(0),
+				chainHash: BITCOIN_CHAIN_HASH,
+				shortChannelId: scid,
+				nodeId1: n1,
+				nodeId2: n2,
+				bitcoinKey1: crypto.randomBytes(33),
+				bitcoinKey2: crypto.randomBytes(33)
+			});
+			const update: IChannelUpdateMessage = {
+				signature: crypto.randomBytes(64),
+				chainHash: BITCOIN_CHAIN_HASH,
+				shortChannelId: scid,
+				timestamp: Math.floor(Date.now() / 1000) + i,
+				messageFlags: 1,
+				channelFlags: 0,
+				cltvExpiryDelta: 40,
+				htlcMinimumMsat: 1000n,
+				feeBaseMsat: 1000,
+				feeProportionalMillionths: 1,
+				htlcMaximumMsat: 1_000_000_000n
+			};
+			graph.applyChannelUpdate(update);
+			graph.applyChannelUpdate({ ...update, channelFlags: 1 });
+		}
+		return { alice, bob };
+	}
+
+	it('an amount no single channel carries is estimated as the split the payment would make', function () {
+		const { alice, bob } = twoChannels(70);
+		try {
+			// 150k sat: above either 100k channel, within the two together.
+			const invoice = bob.createInvoice({
+				description: 'split estimate',
+				amountMsat: 150_000_000n
+			}).bolt11;
+			const estimate = alice.estimatePayment(invoice);
+			expect(estimate).to.not.be.null;
+			// Two direct parts: no forwarding node, so no fee, one hop each.
+			expect(estimate!.estimatedFeeMsat).to.equal(0n);
+			expect(estimate!.estimatedFeeSats).to.equal(0);
+			expect(estimate!.hopCount).to.equal(1);
+			expect(estimate!.alternativeAvailable).to.equal(true);
+			expect(estimate!.successProbabilityPct).to.be.within(1, 100);
+			// The payment the estimate describes is the one that is made.
+			const payment = alice.sendPayment(invoice);
+			expect(payment.status).to.not.equal(PaymentStatus.FAILED);
+		} finally {
+			alice.destroy();
+			bob.destroy();
+		}
+	});
+
+	it('is still no route when the payee takes no parts, or when both channels together fall short', function () {
+		const { alice, bob } = twoChannels(72);
+		try {
+			const template = decodeInvoice(
+				bob.createInvoice({ amountMsat: 150_000_000n, description: 'no parts' })
+					.bolt11
+			);
+			const feats = FeatureFlags.empty();
+			feats.setCompulsory(Feature.TLV_ONION);
+			feats.setCompulsory(Feature.PAYMENT_SECRET);
+			const key = makeNodeConfig(73).nodePrivateKey;
+			const noParts = encodeInvoice({
+				network: Network.REGTEST,
+				paymentHash: template.paymentHash,
+				paymentSecret: template.paymentSecret,
+				description: 'no parts',
+				amountMsat: 150_000_000n,
+				payeeNodeKey: getPublicKey(key),
+				privateKey: key,
+				featureBits: feats
+			});
+			expect(alice.estimatePayment(noParts)).to.be.null;
+			const tooMuch = bob.createInvoice({
+				description: 'too much',
+				amountMsat: 250_000_000n
+			}).bolt11;
+			expect(alice.estimatePayment(tooMuch)).to.be.null;
+		} finally {
+			alice.destroy();
+			bob.destroy();
+		}
+	});
+
+	it('an amount one channel carries is still priced as one route, with the split standing by', function () {
+		const { alice, bob } = twoChannels(74);
+		try {
+			const invoice = bob.createInvoice({
+				description: 'one route',
+				amountMsat: 50_000_000n
+			}).bolt11;
+			const estimate = alice.estimatePayment(invoice);
+			expect(estimate).to.not.be.null;
+			expect(estimate!.hopCount).to.equal(1);
+			expect(estimate!.estimatedFeeMsat).to.equal(0n);
+			// One channel carries it, so the planner takes one path too: no split
+			// stands by, as before.
+			expect(estimate!.alternativeAvailable).to.equal(false);
+		} finally {
+			alice.destroy();
+			bob.destroy();
+		}
+	});
+});

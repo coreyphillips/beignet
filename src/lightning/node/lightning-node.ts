@@ -27784,45 +27784,102 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			if (!destination) return null;
 
 			const sourceBuf = Buffer.from(this.nodeId, 'hex');
+			const finalCltvExpiry =
+				decoded.minFinalCltvExpiry || DEFAULT_MIN_FINAL_CLTV_EXPIRY;
+			const localChannels = this.getLocalChannelEdges();
 
 			// Try to find a route
-			const route = findRoute(
+			let route = findRoute(
 				this.graph,
 				sourceBuf,
 				destination,
 				amountMsat,
-				decoded.minFinalCltvExpiry || DEFAULT_MIN_FINAL_CLTV_EXPIRY,
+				finalCltvExpiry,
 				20, // maxHops
 				undefined, // excludedChannels
 				this.missionControl,
 				undefined, // maxCltvExpiry
 				decoded.routingHints,
 				undefined, // currentTimestamp
-				this.getLocalChannelEdges()
+				localChannels
 			);
+			// As sendPayment judges it: a single route whose outgoing channel
+			// cannot carry the total would only die in addHtlc, so the payment
+			// splits instead, and the estimate prices what the payment would do.
+			if (route) {
+				const firstHopChannel = this.firstHopChannelFor(route);
+				if (
+					firstHopChannel &&
+					firstHopChannel.getSpendableOutboundMsat() < route.totalAmountMsat
+				) {
+					route = null;
+				}
+			}
 
-			if (!route) return null;
+			// The paths priced: the one route, or the parts a multi-path payment
+			// takes when no single path carries the amount and the payee takes
+			// parts (basic_mpp with a payment secret, BOLT 4), exactly the
+			// fallback sendPayment makes. An estimate that stopped at the single
+			// path refused, as "no route", a payment the engine would have split
+			// across two channels (coreyphillips/beignet#1924).
+			let parts: IRoute[];
+			let totalFeeMsat: bigint;
+			let split = false;
+			if (route) {
+				parts = [route];
+				totalFeeMsat = route.totalFeeMsat;
+			} else {
+				if (
+					!decoded.paymentSecret ||
+					!decoded.featureBits?.hasFeature(Feature.BASIC_MPP)
+				)
+					return null;
+				const multiRoute = findMultiPathRoute(
+					this.graph,
+					sourceBuf,
+					destination,
+					amountMsat,
+					finalCltvExpiry,
+					undefined,
+					undefined,
+					this.missionControl,
+					decoded.routingHints,
+					undefined, // currentTimestamp
+					localChannels
+				);
+				if (!multiRoute) return null;
+				parts = multiRoute.parts;
+				totalFeeMsat = multiRoute.totalFeeMsat;
+				split = true;
+			}
 
-			// Calculate success probability from MissionControl penalties
+			// Calculate success probability from MissionControl penalties: every
+			// hop of every part has to succeed, each judged at its part's amount.
 			let successProbability = 1.0;
-			for (const hop of route.hops) {
-				const scidHex = hop.shortChannelId.toString('hex');
-				const penalty = this.missionControl.getPenalty(scidHex, amountMsat);
-				// Higher penalty = lower success probability
-				// MissionControl penalties are in msat, normalize to a probability
-				const hopProb =
-					penalty > 0n
-						? Math.max(0.1, 1.0 - Number(penalty) / 1_000_000)
-						: 0.95;
-				successProbability *= hopProb;
+			for (const part of parts) {
+				for (const hop of part.hops) {
+					const scidHex = hop.shortChannelId.toString('hex');
+					const penalty = this.missionControl.getPenalty(
+						scidHex,
+						part.totalAmountMsat
+					);
+					// Higher penalty = lower success probability
+					// MissionControl penalties are in msat, normalize to a probability
+					const hopProb =
+						penalty > 0n
+							? Math.max(0.1, 1.0 - Number(penalty) / 1_000_000)
+							: 0.95;
+					successProbability *= hopProb;
+				}
 			}
 
 			const successPct = Math.round(successProbability * 100);
-			const hopCount = route.hops.length;
+			// The parts fly together, so the longest part sets the hop count.
+			const hopCount = Math.max(...parts.map((part) => part.hops.length));
 			// Rounded UP, like estimateRouteFee: maxFeeSats is whole sats checked
 			// against the route in msat, so a cap equal to a floored quote refused
 			// the very route it priced (issue #998).
-			const feeSats = Number((route.totalFeeMsat + 999n) / 1000n);
+			const feeSats = Number((totalFeeMsat + 999n) / 1000n);
 
 			// Route quality based on hop count and probability
 			let routeQuality: 'HIGH' | 'MEDIUM' | 'LOW' = 'HIGH';
@@ -27832,25 +27889,27 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			// Estimated time: ~2s per hop for HTLC settlement
 			const estimatedTimeMs = hopCount * 2000;
 
-			// Check if alternative routes exist (MPP)
-			let alternativeAvailable = false;
-			try {
-				const altRoute = findMultiPathRoute(
-					this.graph,
-					sourceBuf,
-					destination,
-					amountMsat,
-					decoded.minFinalCltvExpiry || DEFAULT_MIN_FINAL_CLTV_EXPIRY,
-					undefined,
-					undefined,
-					this.missionControl,
-					decoded.routingHints,
-					undefined, // currentTimestamp
-					this.getLocalChannelEdges()
-				);
-				alternativeAvailable = altRoute !== null && altRoute.parts.length > 1;
-			} catch {
-				// No alternative route
+			// Check if alternative routes exist (MPP): a split is one already.
+			let alternativeAvailable = split;
+			if (!split) {
+				try {
+					const altRoute = findMultiPathRoute(
+						this.graph,
+						sourceBuf,
+						destination,
+						amountMsat,
+						finalCltvExpiry,
+						undefined,
+						undefined,
+						this.missionControl,
+						decoded.routingHints,
+						undefined, // currentTimestamp
+						localChannels
+					);
+					alternativeAvailable = altRoute !== null && altRoute.parts.length > 1;
+				} catch {
+					// No alternative route
+				}
 			}
 
 			// Warnings
@@ -27870,7 +27929,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				warning,
 				alternativeAvailable,
 				estimatedFeeSats: feeSats,
-				estimatedFeeMsat: route.totalFeeMsat,
+				estimatedFeeMsat: totalFeeMsat,
 				hopCount
 			};
 		} catch {
