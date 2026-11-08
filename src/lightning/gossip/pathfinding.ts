@@ -386,7 +386,9 @@ export function buildEdgeOverlay(
 	// given OR it is empty: advisory surfaces (queryRoute, estimatePayment)
 	// legitimately compute hypothetical graph-only routes for a node holding
 	// no usable channels, and an empty set would turn every such query into
-	// no-route.
+	// no-route. A channel that takes HTLCs but can send nothing is still in
+	// the overlay, at zero outbound, so its own graph copy never stands in for
+	// it.
 	const localFirstHopScids: Set<string> | null =
 		localChannels && localChannels.length > 0
 			? new Set(localChannels.map((lc) => lc.shortChannelId.toString('hex')))

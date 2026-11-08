@@ -2276,3 +2276,119 @@ describe('estimatePayment prices the split a payment would make', function () {
 		}
 	});
 });
+
+describe('a channel that can send nothing is not routed over its gossip copy', function () {
+	/**
+	 * The field case (beignet-umbrel): the hub opened a 2,006,977 sat channel,
+	 * the wallet held 20,000 sats of it against a 20,069 sat reserve, so it
+	 * could send nothing. The channel is public, so the graph holds its copy
+	 * with the advertised maximum. getLocalChannelEdges skipped the channel for
+	 * having no spendable outbound, the overlay came out empty, and an empty
+	 * overlay admits graph edges leaving the source: the estimate priced 20,000
+	 * sats over one hop at 95%, and the payment died in addHtlc as "MPP part
+	 * could not be dispatched (Insufficient balance for HTLC)".
+	 *
+	 * Here bob opens the channel, so alice holds nothing on it, and alice's
+	 * graph carries the announced copy at its real scid.
+	 */
+	function bobOpened(seed: number): {
+		alice: LightningNode;
+		bob: LightningNode;
+		channelId: Buffer;
+	} {
+		const alice = createNode(seed);
+		const bob = createNode(seed + 1);
+		connectNodes(alice, bob);
+		const channelId = openReadyChannel(bob, alice, 2_000_000n);
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		const channel = (alice as any).channelManager.getChannel(channelId);
+		const st = channel.getFullState();
+		const scid = (st.shortChannelId ?? st.scidAlias) as Buffer;
+		const graph = alice.getGraph();
+		const alicePub = Buffer.from(alice.getNodeId(), 'hex');
+		const bobPub = Buffer.from(bob.getNodeId(), 'hex');
+		const [n1, n2] =
+			Buffer.compare(alicePub, bobPub) < 0
+				? [alicePub, bobPub]
+				: [bobPub, alicePub];
+		expect(
+			graph.addChannelAnnouncement({
+				nodeSignature1: crypto.randomBytes(64),
+				nodeSignature2: crypto.randomBytes(64),
+				bitcoinSignature1: crypto.randomBytes(64),
+				bitcoinSignature2: crypto.randomBytes(64),
+				features: Buffer.alloc(0),
+				chainHash: REGTEST_CHAIN_HASH,
+				shortChannelId: scid,
+				nodeId1: n1,
+				nodeId2: n2,
+				bitcoinKey1: crypto.randomBytes(33),
+				bitcoinKey2: crypto.randomBytes(33)
+			}),
+			'announcement entered the graph'
+		).to.be.true;
+		const update: IChannelUpdateMessage = {
+			signature: crypto.randomBytes(64),
+			chainHash: REGTEST_CHAIN_HASH,
+			shortChannelId: scid,
+			timestamp: Math.floor(Date.now() / 1000),
+			messageFlags: 1,
+			channelFlags: 0,
+			cltvExpiryDelta: 40,
+			htlcMinimumMsat: 1000n,
+			feeBaseMsat: 1000,
+			feeProportionalMillionths: 1,
+			htlcMaximumMsat: 2_000_000_000n
+		};
+		expect(graph.applyChannelUpdate(update), 'update entered the graph').to.be
+			.true;
+		expect(
+			graph.applyChannelUpdate({ ...update, channelFlags: 1 }),
+			'reverse update entered the graph'
+		).to.be.true;
+		expect(channel.acceptsNewHtlcs(), 'the channel takes HTLCs').to.equal(true);
+		expect(
+			channel.getSpendableOutboundMsat(),
+			'and alice can send nothing'
+		).to.equal(0n);
+		return { alice, bob, channelId };
+	}
+
+	it('the estimate is no route, not a one-hop route the channel refuses', function () {
+		const { alice, bob } = bobOpened(80);
+		try {
+			const invoice = bob.createInvoice({
+				description: 'nothing to send',
+				amountMsat: 20_000_000n
+			}).bolt11;
+			expect(alice.estimatePayment(invoice)).to.be.null;
+		} finally {
+			alice.destroy();
+			bob.destroy();
+		}
+	});
+
+	it('the payment is refused as no route before anything is dispatched', function () {
+		const { alice, bob } = bobOpened(82);
+		try {
+			const invoice = bob.createInvoice({
+				description: 'nothing to send',
+				amountMsat: 20_000_000n
+			}).bolt11;
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			const cm = (alice as any).channelManager;
+			let dispatched = 0;
+			const origAdd = cm.addHtlc.bind(cm);
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			cm.addHtlc = (...args: any[]): unknown => {
+				dispatched++;
+				return origAdd(...args);
+			};
+			expect(() => alice.sendPayment(invoice)).to.throw(/No route found/);
+			expect(dispatched, 'no HTLC was offered').to.equal(0);
+		} finally {
+			alice.destroy();
+			bob.destroy();
+		}
+	});
+});

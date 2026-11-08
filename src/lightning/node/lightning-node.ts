@@ -17981,8 +17981,16 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			// previously used for NORMAL channels let a near-balance single
 			// path or MPP part through that could only die locally in addHtlc
 			// as "insufficient balance" (#254).
+			//
+			// A channel that can send nothing right now stays in the list at
+			// zero, which carries no amount. Leaving it out emptied the overlay
+			// for a node whose only channels are below their reserve, and an
+			// empty overlay lets graph edges leaving the source in, so the
+			// channel's own gossip copy, at its advertised maximum, was routed
+			// over instead: the estimate priced it and the payment died in
+			// addHtlc as "Insufficient balance for HTLC" (beignet-umbrel field
+			// report: 20,000 sats held against a 20,069 sat reserve).
 			const outboundMsat = channel.getSpendableOutboundMsat();
-			if (outboundMsat <= 0n) continue;
 			edges.push({
 				shortChannelId: scid,
 				peer: Buffer.from(peerHex, 'hex'),
