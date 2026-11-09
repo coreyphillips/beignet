@@ -20,7 +20,11 @@ import {
 	deriveBlindingSharedSecret,
 	deriveNextBlindingKey
 } from './blinding';
-import { privateMultiply, isValidPublicKey } from '../crypto/ecdh';
+import {
+	getPublicKey,
+	privateMultiply,
+	isValidPublicKey
+} from '../crypto/ecdh';
 import { encodeTlvStream, decodeTlvStream } from '../message/tlv';
 
 export interface IBlindedHop {
@@ -576,6 +580,48 @@ export function processBlindedHop(
 		deriveNextBlindingKey(blindingKey, sharedSecret);
 
 	return { hopData, nextBlindingKey };
+}
+
+/**
+ * A blinded onion-message path as seen from its sender, past any leading hops
+ * that are the sender itself. A sender cannot hand a message to itself over
+ * the wire, so each such hop is processed here the way it would be on
+ * receipt: decrypt its encrypted_data, take next_node_id as the new
+ * introduction node and advance the path key. This is the case of an offer
+ * from an unannounced node whose path this node introduces. A path that ends
+ * at the sender comes back as the one-hop path to it. Throws when one of our
+ * own hops cannot be decrypted or names no next node.
+ */
+export function advancePastOwnHops(
+	path: IBlindedPath,
+	nodePrivkey: Buffer
+): IBlindedPath {
+	const ownId = getPublicKey(nodePrivkey);
+	let current = path;
+	while (
+		current.blindedHops.length > 1 &&
+		current.introductionNodeId.equals(ownId)
+	) {
+		let hop: ReturnType<typeof processBlindedHop>;
+		try {
+			hop = processBlindedHop(
+				current.blindingPoint,
+				nodePrivkey,
+				current.blindedHops[0].encryptedData
+			);
+		} catch {
+			throw new Error('Cannot decrypt our own hop of the blinded path');
+		}
+		if (!hop.hopData.nextNodeId) {
+			throw new Error('Our own hop of the blinded path names no next node');
+		}
+		current = {
+			introductionNodeId: hop.hopData.nextNodeId,
+			blindingPoint: hop.nextBlindingKey,
+			blindedHops: current.blindedHops.slice(1)
+		};
+	}
+	return current;
 }
 
 /**

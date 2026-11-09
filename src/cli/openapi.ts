@@ -5109,7 +5109,7 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						},
 						'409': {
 							description:
-								'FEE_EXCEEDS_MAX, every route costs more than maxFeeSats / maxFeeMsat; nothing was sent. DUPLICATE_PAYMENT, with error.paymentHash, for a keyed retry of a timed-out payment that can still settle'
+								'FEE_EXCEEDS_MAX, every route costs more than maxFeeSats / maxFeeMsat; nothing was sent. DUPLICATE_PAYMENT, with error.paymentHash, for a keyed retry of a timed-out payment that can still settle. PEER_NOT_CONNECTED, no link to the node the invoice request is handed to; nothing was sent'
 						},
 						'504': {
 							description:

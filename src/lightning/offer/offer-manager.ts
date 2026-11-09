@@ -43,8 +43,12 @@ import { decodeNoChecksum } from './bech32-nochecksum';
 import type { ITlvRecord } from '../message/tlv';
 import type { IStorageBackend } from '../storage/types';
 import type { IBlindedPath, IBlindedPaymentPath } from '../onion/blinded-path';
-import { constructBlindedPath } from '../onion/blinded-path';
+import {
+	advancePastOwnHops,
+	constructBlindedPath
+} from '../onion/blinded-path';
 import type { OnionMessageManager } from '../onion-message/manager';
+import { InvalidRequestError } from '../node/types';
 import { getPublicKey } from '../crypto/ecdh';
 import { BITCOIN_CHAIN_HASH } from '../channel/types';
 
@@ -732,14 +736,24 @@ export class OfferManager extends EventEmitter {
 					? constructBlindedPath(randomBytes(32), [offer.issuerId], [{}])
 					: null);
 			if (sendPath) {
-				// The request is handed straight to the introduction node.
+				// The request is handed straight to the introduction node, or to
+				// the hop after us when we introduce the path ourselves (an
+				// unannounced issuer whose channel peer we are).
+				let firstHopPath: IBlindedPath;
+				try {
+					firstHopPath = advancePastOwnHops(sendPath, this.nodePrivkey);
+				} catch (err) {
+					throw new InvalidRequestError(
+						`Unusable offer path: ${(err as Error).message}`
+					);
+				}
 				if (this.connectFirstHop) {
 					await this.connectFirstHop(
-						sendPath.introductionNodeId,
+						firstHopPath.introductionNodeId,
 						this.invoiceRequestTimeoutMs
 					);
 				}
-				this.onionMessageManager.sendReply(sendPath, messageData, {
+				this.onionMessageManager.sendReply(firstHopPath, messageData, {
 					replyPath
 				});
 			}
