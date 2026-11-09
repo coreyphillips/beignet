@@ -6334,6 +6334,7 @@ const onion.ROUTING_INFO_LENGTH = 1300
 const onion.TEMPORARY_CHANNEL_FAILURE: number
 const onion.TEMPORARY_NODE_FAILURE: number
 const onion.UNKNOWN_NEXT_PEER: number
+function onion.advancePastOwnHops(path: onion.IBlindedPath, nodePrivkey: Buffer): onion.IBlindedPath
 function onion.computeBlindedNodeId(nodePubkey: Buffer, sharedSecret: Buffer): Buffer
 function onion.computeBlindingFactor(ephemeralKey: Buffer, sharedSecret: Buffer): Buffer
 function onion.computeSharedSecrets(sessionKey: Buffer, hops: Buffer[]): { sharedSecrets: Buffer[]; ephemeralKeys: Buffer[]; }

@@ -14814,6 +14814,16 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 				if (err instanceof InvalidRequestError) {
 					throw new BeignetError(BeignetErrorCode.INVALID_OFFER, err.message);
 				}
+				// No link to the node the invoice_request is handed to.
+				if (
+					err instanceof PeerError &&
+					err.code === PeerErrorCode.NOT_CONNECTED
+				) {
+					throw new BeignetError(
+						BeignetErrorCode.PEER_NOT_CONNECTED,
+						err.message
+					);
+				}
 				throw err;
 			});
 		// Re-checked after the await: the request is a round trip to the payee,

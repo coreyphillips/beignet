@@ -20,7 +20,11 @@ import {
 import { constructReplyOnionMessage } from './construct';
 import { processOnionMessage } from './process';
 import type { IBlindedPath } from '../onion/blinded-path';
-import { constructBlindedPath } from '../onion/blinded-path';
+import {
+	advancePastOwnHops,
+	constructBlindedPath
+} from '../onion/blinded-path';
+import { getPublicKey } from '../crypto/ecdh';
 
 /** TLV type handler callback */
 type TlvHandler = (
@@ -55,6 +59,7 @@ interface IPeerRateLimit {
  */
 export class OnionMessageManager extends EventEmitter {
 	private nodePrivkey: Buffer;
+	private nodeId: Buffer;
 	private rateLimits: Map<string, IPeerRateLimit> = new Map();
 	private rateLimitConfig: IRateLimitConfig;
 	private tlvHandlers: Map<number, TlvHandler[]> = new Map();
@@ -68,6 +73,7 @@ export class OnionMessageManager extends EventEmitter {
 	) {
 		super();
 		this.nodePrivkey = nodePrivkey;
+		this.nodeId = getPublicKey(nodePrivkey);
 		this.rateLimitConfig = {
 			maxPerWindow: rateLimitConfig?.maxPerWindow ?? 10,
 			windowMs: rateLimitConfig?.windowMs ?? 60_000
@@ -140,10 +146,6 @@ export class OnionMessageManager extends EventEmitter {
 		messageData: Map<number, Buffer>,
 		options?: ISendOnionMessageOptions
 	): void {
-		if (!this.sendMessage) {
-			throw new Error('Send function not configured');
-		}
-
 		const nodeIds = [...intermediateNodes, destination];
 		const hopData = nodeIds.map((_, i) =>
 			i < nodeIds.length - 1
@@ -153,19 +155,7 @@ export class OnionMessageManager extends EventEmitter {
 				: {}
 		);
 		const path = constructBlindedPath(randomBytes(32), nodeIds, hopData);
-		const msg = constructReplyOnionMessage(
-			path,
-			messageData,
-			undefined,
-			options
-		);
-		const wirePayload = encodeOnionMessageWire(msg);
-
-		// The first hop is addressed by its REAL id on the transport; only the
-		// sphinx layer uses the blinded ids.
-		const firstHop = path.introductionNodeId.toString('hex');
-		this.sendMessage(firstHop, 513, wirePayload);
-		this.emit('message:send', firstHop, 513, wirePayload);
+		this.sendAlongPath(path, messageData, options);
 	}
 
 	/**
@@ -179,22 +169,7 @@ export class OnionMessageManager extends EventEmitter {
 		messageData: Map<number, Buffer>,
 		options?: ISendOnionMessageOptions
 	): void {
-		if (!this.sendMessage) {
-			throw new Error('Send function not configured');
-		}
-
-		const msg = constructReplyOnionMessage(
-			replyPath,
-			messageData,
-			undefined,
-			options
-		);
-		const wirePayload = encodeOnionMessageWire(msg);
-
-		// Send to the introduction node
-		const introHex = replyPath.introductionNodeId.toString('hex');
-		this.sendMessage(introHex, 513, wirePayload);
-		this.emit('message:send', introHex, 513, wirePayload);
+		this.sendAlongPath(replyPath, messageData, options);
 	}
 
 	/**
@@ -220,6 +195,14 @@ export class OnionMessageManager extends EventEmitter {
 			return;
 		}
 
+		this.processMessage(fromPeer, msg);
+	}
+
+	/**
+	 * Peel one layer of a decoded onion message, then deliver it to the TLV
+	 * handlers or forward it to the next hop.
+	 */
+	private processMessage(fromPeer: string, msg: IOnionMessage): void {
 		try {
 			const result = processOnionMessage(
 				msg.onionRoutingPacket,
@@ -293,6 +276,45 @@ export class OnionMessageManager extends EventEmitter {
 	}
 
 	// ─────────────── Private ───────────────
+
+	/**
+	 * Build the onion for a blinded path and hand it to the path's first hop.
+	 * Hops that are this node are peeled first (an offer path we introduce),
+	 * since a send addressed to our own id has no link to go out on; a path
+	 * that ends here is delivered locally.
+	 */
+	private sendAlongPath(
+		path: IBlindedPath,
+		messageData: Map<number, Buffer>,
+		options?: ISendOnionMessageOptions
+	): void {
+		const send = this.sendMessage;
+		if (!send) {
+			throw new Error('Send function not configured');
+		}
+		const sendPath = advancePastOwnHops(path, this.nodePrivkey);
+		const msg = constructReplyOnionMessage(
+			sendPath,
+			messageData,
+			undefined,
+			options
+		);
+		if (sendPath.introductionNodeId.equals(this.nodeId)) {
+			// On a later turn, as a peer's message would arrive: a sender such
+			// as requestInvoice registers what the answer resolves after the
+			// send returns.
+			const ownHex = this.nodeId.toString('hex');
+			setTimeout(() => this.processMessage(ownHex, msg), 0);
+			return;
+		}
+		const wirePayload = encodeOnionMessageWire(msg);
+
+		// The first hop is addressed by its REAL id on the transport; only the
+		// sphinx layer uses the blinded ids.
+		const firstHop = sendPath.introductionNodeId.toString('hex');
+		send(firstHop, 513, wirePayload);
+		this.emit('message:send', firstHop, 513, wirePayload);
+	}
 
 	/**
 	 * Check and update rate limit for a peer.
