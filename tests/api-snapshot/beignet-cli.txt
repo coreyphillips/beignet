@@ -289,7 +289,7 @@ method BeignetNode.connectPeer(pubkey: string, host?: string, port?: number, tra
 method BeignetNode.connectToSeeds(maxPeers?: number): Promise<string[]>
 method BeignetNode.consolidateUtxos(satsPerVbyte?: number): Promise<ConsolidateResult>
 static method BeignetNode.create(opts?: BeignetNodeOptions): Promise<BeignetNode>
-method BeignetNode.createDirectFundingRequest(opts: { host?: string; port?: number; amountSats?: number; lspPubkey?: string; }): DirectFundingRequestInfo
+method BeignetNode.createDirectFundingRequest(opts: { host?: string; port?: number; amountSats?: number; lspPubkey?: string; expirySecs?: number; }): DirectFundingRequestInfo
 method BeignetNode.createHoldInvoice(opts: { paymentHash: PaymentHashHex; amountMsat?: bigint; amountSats?: number; description?: string; expiry?: number; minFinalCltvExpiry?: number; }): InvoiceInfo
 method BeignetNode.createInvoice(amountSats?: number, description?: string, expirySecs?: number, descriptionHash?: Buffer, minFinalCltvExpiry?: number): InvoiceInfo
 method BeignetNode.createJitInvoice(opts: { lspPubkey?: string; amountSats?: number; description?: string; expirySecs?: number; targetRemainingInboundSat?: number; maxFlatFeeSat?: number; maxFeePpm?: number; feeMode?: 'skim' | 'hop'; timeoutMs?: number; }): Promise<JitInvoiceInfo>

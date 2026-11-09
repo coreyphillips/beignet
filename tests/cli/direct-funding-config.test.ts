@@ -394,6 +394,42 @@ describe('direct funding daemon surface', function () {
 		expect(env.amountSat).to.equal(undefined);
 	});
 
+	it('mints a request that lives as long as expirySecs asks', async () => {
+		const week = 7 * 24 * 60 * 60;
+		const before = Date.now();
+		const { json } = await call('POST', '/direct-funding/request', {
+			expirySecs: week
+		});
+		const result = resultOf(json);
+		const expiresAt = result.expiresAt as number;
+		expect(expiresAt).to.be.at.least(before + week * 1000 - 1000);
+		expect(expiresAt).to.be.at.most(Date.now() + week * 1000 + 1000);
+		// The envelope carries the same expiry the answer reports.
+		const env = decodeRequestEnvelope(result.request as string);
+		expect(Number(env.expiresAt)).to.equal(expiresAt);
+	});
+
+	it('keeps the hour default when expirySecs is left out', async () => {
+		const before = Date.now();
+		const { json } = await call('POST', '/direct-funding/request', {});
+		const expiresAt = resultOf(json).expiresAt as number;
+		expect(expiresAt).to.be.at.least(before + 60 * 60 * 1000 - 1000);
+		expect(expiresAt).to.be.at.most(Date.now() + 60 * 60 * 1000 + 1000);
+	});
+
+	it('refuses an expirySecs past the seven-day ceiling or not a whole number', async () => {
+		for (const expirySecs of [7 * 24 * 60 * 60 + 1, 0, -5, 1.5, '3600']) {
+			const { json, status } = await call('POST', '/direct-funding/request', {
+				expirySecs
+			});
+			expect((json.error as { code: string }).code).to.equal('INVALID_PARAMS');
+			expect((json.error as { message: string }).message).to.contain(
+				'expirySecs'
+			);
+			expect(status).to.equal(400);
+		}
+	});
+
 	it('refuses a port that is not a port', async () => {
 		const { json } = await call('POST', '/direct-funding/request', {
 			host: 'h',

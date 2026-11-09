@@ -223,6 +223,7 @@ import type {
 } from '../lightning/direct-funding';
 import {
 	DF_HARD_MIN_OFFER_AMOUNT_SAT,
+	DF_MAX_REQUEST_TTL_MS,
 	DF_POST_WITNESS_STATES,
 	DirectFundingError,
 	DirectFundingPaymentStore,
@@ -1647,6 +1648,29 @@ async function resolveHostToIPv4(host: string): Promise<string> {
  * not a check: it lets through 0.5 satoshis, Infinity, and 2^60. Reject them at
  * the edge rather than leaving deeper transaction code to trip over them.
  */
+/**
+ * A direct-funding request's lifetime from the route's `expirySecs`, in
+ * milliseconds, or undefined to leave the store's default. Refused rather
+ * than clamped above the envelope's ceiling: a caller publishing a request
+ * for a week has to know it got a week, not a silently shorter life.
+ */
+function requestTtlMsOf(expirySecs: unknown): number | undefined {
+	if (expirySecs === undefined) return undefined;
+	const maxSecs = DF_MAX_REQUEST_TTL_MS / 1000;
+	if (
+		typeof expirySecs !== 'number' ||
+		!Number.isSafeInteger(expirySecs) ||
+		expirySecs <= 0 ||
+		expirySecs > maxSecs
+	) {
+		throw new BeignetError(
+			BeignetErrorCode.INVALID_PARAMS,
+			`expirySecs must be a whole number of seconds from 1 to ${maxSecs}`
+		);
+	}
+	return expirySecs * 1000;
+}
+
 function requirePositiveSafeInteger(value: unknown, field: string): number {
 	if (typeof value !== 'number' || !Number.isSafeInteger(value) || value <= 0) {
 		throw new BeignetError(
@@ -10703,12 +10727,17 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	 * none has one. Nothing is dialed, since the request is paid later and
 	 * the payer reaches this node through that primary's relay. With no
 	 * primaries the policy's liquidity peer serves, as before.
+	 *
+	 * `expirySecs` is how long the request stays payable, a whole number of
+	 * seconds no longer than the envelope's seven-day ceiling
+	 * (DF_MAX_REQUEST_TTL_MS); omitted, the store's default (an hour) applies.
 	 */
 	createDirectFundingRequest(opts: {
 		host?: string;
 		port?: number;
 		amountSats?: number;
 		lspPubkey?: string;
+		expirySecs?: number;
 	}): DirectFundingRequestInfo {
 		if (opts.port !== undefined) {
 			if (!Number.isInteger(opts.port) || opts.port < 1 || opts.port > 65535) {
@@ -10723,10 +10752,12 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 			opts.amountSats !== undefined && opts.amountSats !== 0
 				? requireNonNegativeSafeInteger(opts.amountSats, 'amountSats')
 				: undefined;
+		const ttlMs = requestTtlMsOf(opts.expirySecs);
 		const base = {
 			...(opts.host !== undefined ? { host: opts.host } : {}),
 			...(opts.port !== undefined ? { port: opts.port } : {}),
-			...(amountSats !== undefined ? { amountSat: BigInt(amountSats) } : {})
+			...(amountSats !== undefined ? { amountSat: BigInt(amountSats) } : {}),
+			...(ttlMs !== undefined ? { ttlMs } : {})
 		};
 		if (opts.lspPubkey !== undefined) {
 			const pubkey = opts.lspPubkey.toLowerCase();
@@ -10744,7 +10775,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 
 	/** The mint at one peer, or at the policy's: the library call and its typed failures. */
 	private mintDirectFundingRequestAt(
-		base: { host?: string; port?: number; amountSat?: bigint },
+		base: { host?: string; port?: number; amountSat?: bigint; ttlMs?: number },
 		bound?: { pubkey: string; address?: { host: string; port: number } }
 	): DirectFundingRequestInfo {
 		try {
@@ -10840,6 +10871,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 		host?: string;
 		port?: number;
 		amountSat?: bigint;
+		ttlMs?: number;
 	}): DirectFundingRequestInfo {
 		const skipped: ISteerSkip[] = [];
 		for (const candidate of this.receiveCandidates()) {
