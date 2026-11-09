@@ -2364,24 +2364,32 @@ async function bootDaemon(
 		// lspPubkey binds the request to that peer (issue #1922); omitted, the
 		// ranked primaries choose when any are configured, else the policy's
 		// liquidity peer serves as before.
+		//
+		// expirySecs sets how long the request stays payable, up to the
+		// envelope's seven-day ceiling; omitted, the hour default applies. A
+		// request published once for many payers to find (a Paykit endpoint)
+		// needs the longer life, and is minted again when paid or near expiry.
 		'POST /direct-funding/request': (body) => {
 			const {
 				host: dfHost,
 				port: dfPort,
 				amountSats,
-				lspPubkey
+				lspPubkey,
+				expirySecs
 			} = body as {
 				host?: string;
 				port?: number;
 				amountSats?: number;
 				lspPubkey?: string;
+				expirySecs?: number;
 			};
 			return success(
 				node.createDirectFundingRequest({
 					...(dfHost !== undefined ? { host: dfHost } : {}),
 					...(dfPort !== undefined ? { port: dfPort } : {}),
 					...(amountSats !== undefined ? { amountSats } : {}),
-					...(lspPubkey !== undefined ? { lspPubkey } : {})
+					...(lspPubkey !== undefined ? { lspPubkey } : {}),
+					...(expirySecs !== undefined ? { expirySecs } : {})
 				})
 			);
 		},
