@@ -1029,13 +1029,14 @@ export class Peer extends EventEmitter {
 			const ping = encodePingMessage(1, 0);
 			this.sendMessage(MessageType.PING, ping);
 
-			// Clear existing pong timer before starting new one
-			if (this.pongTimer) {
-				clearTimeout(this.pongTimer);
-				this.pongTimer = null;
-			}
-			// Start pong timeout
+			// The deadline runs from the oldest ping still unanswered. Starting
+			// it again on every ping, with pings every 30s and a 60s deadline,
+			// meant it never ran out, and a connection that went silent without
+			// a socket error (a suspended phone, a dead Tor circuit) stayed
+			// listed as connected for good.
+			if (this.pongTimer) return;
 			this.pongTimer = setTimeout(() => {
+				this.pongTimer = null;
 				this.emit('error', new Error('Pong timeout'));
 				this.disconnect();
 			}, this.pongTimeoutMs);
