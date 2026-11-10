@@ -166,7 +166,7 @@
     "bip39": "3.1.0",
     "bitcoin-address-validation": "2.2.3",
     "bitcoin-units": "0.3.0",
-    "bitcoinjs-lib": "6.1.4",
+    "bitcoinjs-lib": "6.1.10",
     "ecpair": "2.1.0",
     "lodash.clonedeep": "4.5.0",
     "net": "1.0.2",
