@@ -644,8 +644,12 @@ describe('External-Signer PSBT Flow', function () {
 			const signed = bitcoin.Psbt.fromBase64(unsigned.toBase64(), {
 				network: regtest
 			});
-			signed.updateInput(0, { nonWitnessUtxo: parent.toBuffer() });
+			// Signed on the witness record alone, then given a parent that
+			// disagrees with it. bitcoinjs-lib 6.1.8 and later refuses to sign
+			// over two records that disagree, but another signer need not, so
+			// the import must still refuse the result.
 			signed.signInput(0, key);
+			signed.updateInput(0, { nonWitnessUtxo: parent.toBuffer() });
 			const res = watchOnly.importSignedPsbt(
 				signed.toBase64(),
 				unsigned.toBase64()
