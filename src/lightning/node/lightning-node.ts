@@ -12,6 +12,11 @@ import {
 	normalizeIrohEndpointId,
 	validateIrohRelayUrl
 } from '../transport/iroh';
+import {
+	derivePorchDefaultTag,
+	derivePorchHostSecret
+} from '../transport/porch';
+import type { IPorchHostStatus, IPorchLink } from '../transport/porch-host';
 import type { IFforVoucherArchive } from '../ffor/voucher-archive';
 import {
 	archiveFforVouchers,
@@ -2590,7 +2595,8 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				socks5ProxyScope: this.socks5ProxyScope,
 				learnedAddressDials: config.learnedAddressDials,
 				webSocketImpl: config.webSocketImpl,
-				iroh: config.iroh
+				iroh: config.iroh,
+				porch: config.porch
 			});
 			this.channelManager.attachToPeerManager(this.peerManager);
 			// The socket boundary answers to the startup quarantine gate
@@ -7514,6 +7520,9 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		this.peerManager.on('peer:error', (pubkey: string, err: Error) => {
 			this.emit('peer:error', pubkey, err);
 		});
+		this.peerManager.on('porch:status', (status: IPorchHostStatus) => {
+			this.emit('porch:status', status);
+		});
 	}
 
 	/**
@@ -10042,6 +10051,39 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 
 	getIrohConnectionString(): string | undefined {
 		return this.peerManager?.getIrohConnectionString();
+	}
+
+	/**
+	 * Start waiting at the configured Porch relays, alongside any other
+	 * listener. It returns at once: whether a relay is reachable is status
+	 * (getPorchStatus, 'porch:status'), not an error.
+	 */
+	listenPorch(): void {
+		if (!this.peerManager) throw new Error('Networking is not enabled');
+		this.assertPeerContactPermitted('listenPorch');
+		this.peerManager.listenPorch();
+	}
+
+	/** One entry per configured Porch relay. Empty when Porch is not configured. */
+	getPorchStatus(): IPorchHostStatus[] {
+		return this.peerManager?.getPorchStatus() ?? [];
+	}
+
+	/**
+	 * The peer URIs this node can be reached by through Porch, one per link
+	 * and relay. A URI works while its relay's status is 'ready'.
+	 */
+	getPorchLinks(): IPorchLink[] {
+		return this.peerManager?.getPorchLinks() ?? [];
+	}
+
+	/**
+	 * Replace the Porch links served (16-byte tags). A link left out stops
+	 * resolving, and the connections that came in through it are closed.
+	 */
+	setPorchTags(tags: readonly Uint8Array[]): void {
+		if (!this.peerManager) throw new Error('Networking is not enabled');
+		this.peerManager.setPorchTags(tags);
 	}
 
 	/** Start the opt-in WebSocket listener alongside TCP. */
@@ -31247,6 +31289,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			seed: givenSeed,
 			coinType: givenCoinType,
 			iroh,
+			porch,
 			channelKeyDeriver: givenChannelKeyDeriver,
 			...config
 		} = options ?? {};
@@ -31305,6 +31348,13 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			delayedPaymentBasepointSecret: keys.delayedPaymentBasepointSecret,
 			iroh: iroh
 				? { ...iroh, secretKey: deriveIrohSecretKey(seed) }
+				: undefined,
+			porch: porch
+				? {
+						...porch,
+						hostSecret: derivePorchHostSecret(seed),
+						tags: porch.tags ?? [derivePorchDefaultTag(seed)]
+				  }
 				: undefined,
 			channelKeyDeriver
 		});

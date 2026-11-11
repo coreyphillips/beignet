@@ -8,6 +8,7 @@ interface IDuplexTransport extends EventEmitter
 method IDuplexTransport.destroy(error?: Error): this
 method IDuplexTransport.getIrohDiagnostics?(): beignet/lightning#transport.IIrohDiagnostics
 method IDuplexTransport.markEstablished?(): void
+readonly property IDuplexTransport.porch?: beignet/lightning#transport.IPorchCircuitInfo
 readonly property IDuplexTransport.remoteAddress?: string
 readonly property IDuplexTransport.remotePort?: number
 method IDuplexTransport.setKeepAlive(enable?: boolean, initialDelay?: number): this

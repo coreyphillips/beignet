@@ -5487,6 +5487,7 @@ property node.INodeConfig.nodePrivateKey: Buffer
 property node.INodeConfig.paymentBasepointSecret?: Buffer
 property node.INodeConfig.peerStorageEnabled?: boolean
 property node.INodeConfig.perCommitmentSeed: Buffer
+property node.INodeConfig.porch?: transport.IPorchConfig
 property node.INodeConfig.preferAnchors?: boolean
 property node.INodeConfig.preferTaproot?: boolean
 property node.INodeConfig.quiescenceTimeoutMs?: number
@@ -5801,6 +5802,8 @@ method node.LightningNode.getPeerAddress(pubkey: string): { host: string; port: 
 method node.LightningNode.getPeerManager(): transport.PeerManager | null
 method node.LightningNode.getPendingSpliceTx(channelId: Buffer): ReturnType<channel.Channel['getPendingSpliceTx']>
 method node.LightningNode.getPendingV2FundingTx(channelId: Buffer): ReturnType<channel.Channel['getPendingV2FundingTx']>
+method node.LightningNode.getPorchLinks(): transport.IPorchLink[]
+method node.LightningNode.getPorchStatus(): transport.IPorchHostStatus[]
 method node.LightningNode.getRawChannel(channelId: Buffer): channel.Channel | null
 method node.LightningNode.getRecoveryGateState(): string
 method node.LightningNode.getRecoveryGeneration(): bigint
@@ -5844,6 +5847,7 @@ method node.LightningNode.listSwaps(): swaps.ISwapRecord[]
 method node.LightningNode.listTrustedPeers(): string[]
 method node.LightningNode.listen(port: number, host?: string): Promise<void>
 method node.LightningNode.listenIroh(): Promise<void>
+method node.LightningNode.listenPorch(): void
 method node.LightningNode.listenWebSocket(port: number, host?: string): Promise<void>
 method node.LightningNode.loadRapidGossipSnapshot(data: Buffer): gossip.IRapidGossipResult
 method node.LightningNode.loadRapidGossipSnapshotAsync(data: Buffer, opts?: { cancelled?: () => boolean; onSlice?: (ms: number) => void; }): Promise<gossip.IRapidGossipResult>
@@ -5903,6 +5907,7 @@ method node.LightningNode.sendTxSignatures(channelId: Buffer, txid: Buffer, outp
 method node.LightningNode.setChannelPolicy(channelId: Buffer | 'all', policy: node.IChannelPolicyUpdate): void
 method node.LightningNode.setDirectFundingPolicy(update: node.IDirectFundingPolicy): node.IDirectFundingPolicy
 method node.LightningNode.setPaymentMetadata(paymentHash: Buffer, metadata: Record<string, string>): void
+method node.LightningNode.setPorchTags(tags: readonly Uint8Array[]): void
 method node.LightningNode.setRecoveryGuardians(descriptors: recovery.GuardianDescriptor[]): void
 method node.LightningNode.setSweepDestinationScript(destinationScript: Buffer): void
 method node.LightningNode.settleHeldHtlc(paymentHash: Buffer, preimage?: Buffer): boolean
@@ -5989,6 +5994,7 @@ property node.LightningNodeEvents.'peer:disconnect-requested': (pubkey: string) 
 property node.LightningNodeEvents.'peer:error': (pubkey: string, error: Error) => void
 property node.LightningNodeEvents.'peer:warning': (warning: { pubkey: string; channelId: Buffer | null; text: string; }) => void
 property node.LightningNodeEvents.'peer_storage:retrieved': (peerPubkey: string, blob: Buffer) => void
+property node.LightningNodeEvents.'porch:status': (status: transport.IPorchHostStatus) => void
 property node.LightningNodeEvents.'preimage:learned': (paymentHash: Buffer, preimage: Buffer) => void
 property node.LightningNodeEvents.'recovery:backfill-lost': (detail: string) => void
 property node.LightningNodeEvents.'recovery:durable': (through: bigint) => void
@@ -6020,7 +6026,7 @@ property node.LightningNodeEvents.'swap:refunded': (event: swaps.ISwapEvent) => 
 property node.LightningNodeEvents.'swap:settled': (event: swaps.ISwapEvent) => void
 property node.LightningNodeEvents.'sweep:uneconomic': (channelId: Buffer, action: chain.ISweepUneconomicChainAction) => void
 property node.LightningNodeEvents.log: (entry: node.IStructuredLog) => void
-type node.LightningNodeSeedOptions = Omit<node.INodeConfig, SeedDerivedNodeConfigKey | 'iroh'> & { passphrase?: string; seed?: Buffer; coinType?: number; iroh?: Omit<transport.IIrohConfig, 'secretKey'>; }
+type node.LightningNodeSeedOptions = Omit<node.INodeConfig, SeedDerivedNodeConfigKey | 'iroh' | 'porch'> & { passphrase?: string; seed?: Buffer; coinType?: number; iroh?: Omit<transport.IIrohConfig, 'secretKey'>; porch?: Omit<transport.IPorchConfig, 'hostSecret' | 'tags'> & { tags?: transport.IPorchConfig['tags']; }; }
 class node.LightningPaymentError extends beignet#CodedError<node.LightningErrorCode>
 constructor node.LightningPaymentError(code: node.LightningErrorCode, message: string)
 const node.MAX_FEE_RATE_SAT_PER_VBYTE = 5000
@@ -8907,11 +8913,14 @@ method transport.CipherState.encryptMessage(plaintext: Buffer): Buffer
 method transport.CipherState.encryptWithAd(plaintext: Buffer, aad: Buffer): Buffer
 method transport.CipherState.getNonce(): bigint
 const transport.DEFAULT_MAX_WS_PAYLOAD_BYTES: number
+const transport.DEFAULT_PORCH_HOST_TIMING: Readonly<transport.IPorchHostTiming>
+const transport.DEFAULT_PORCH_STANDBYS = 2
 const transport.DEFAULT_TOR_PROXY: { host: string; port: number; }
 interface transport.IDuplexTransport extends EventEmitter
 method transport.IDuplexTransport.destroy(error?: Error): this
 method transport.IDuplexTransport.getIrohDiagnostics?(): transport.IIrohDiagnostics
 method transport.IDuplexTransport.markEstablished?(): void
+readonly property transport.IDuplexTransport.porch?: transport.IPorchCircuitInfo
 readonly property transport.IDuplexTransport.remoteAddress?: string
 readonly property transport.IDuplexTransport.remotePort?: number
 method transport.IDuplexTransport.setKeepAlive(enable?: boolean, initialDelay?: number): this
@@ -8987,6 +8996,7 @@ property transport.IPeerEvents.message: (type: number, payload: Buffer) => void
 interface transport.IPeerInfo
 property transport.IPeerInfo.host: string
 property transport.IPeerInfo.iroh?: transport.IIrohDiagnostics
+property transport.IPeerInfo.porch?: transport.IPorchCircuitInfo
 property transport.IPeerInfo.port: number
 property transport.IPeerInfo.pubkey: string
 property transport.IPeerInfo.remoteInit: message.IInitMessage | null
@@ -9010,6 +9020,7 @@ property transport.IPeerManagerOptions.maxPendingInbound?: number
 property transport.IPeerManagerOptions.maxPendingInboundPerAddress?: number
 property transport.IPeerManagerOptions.maxReconnectDelay?: number
 property transport.IPeerManagerOptions.networks?: Buffer[]
+property transport.IPeerManagerOptions.porch?: transport.IPorchConfig
 property transport.IPeerManagerOptions.socks5Proxy?: { host: string; port: number; }
 property transport.IPeerManagerOptions.socks5ProxyScope?: transport.Socks5ProxyScope
 property transport.IPeerManagerOptions.socks5TimeoutMs?: number
@@ -9038,6 +9049,43 @@ property transport.IPorchChallenge.authority: string
 property transport.IPorchChallenge.nonce: string
 property transport.IPorchChallenge.t: 'challenge'
 property transport.IPorchChallenge.v: number
+interface transport.IPorchCircuitInfo
+property transport.IPorchCircuitInfo.relay: string
+property transport.IPorchCircuitInfo.tag: string
+interface transport.IPorchConfig
+property transport.IPorchConfig.hostSecret: Uint8Array
+property transport.IPorchConfig.relays: readonly (string | transport.IPorchRelayConfig)[]
+property transport.IPorchConfig.standbys?: number
+property transport.IPorchConfig.tags: readonly Uint8Array[]
+property transport.IPorchConfig.timing?: Partial<transport.IPorchHostTiming>
+property transport.IPorchConfig.via?: transport.PorchVia
+interface transport.IPorchHostOptions
+property transport.IPorchHostOptions.hostSecret: Uint8Array
+property transport.IPorchHostOptions.onCircuit: (transport: transport.PorchCircuitTransport) => void
+property transport.IPorchHostOptions.relay: transport.IPorchRelayAddress
+property transport.IPorchHostOptions.standbys?: number
+property transport.IPorchHostOptions.tags: () => readonly Uint8Array[]
+property transport.IPorchHostOptions.timing?: Partial<transport.IPorchHostTiming>
+property transport.IPorchHostOptions.token?: string
+property transport.IPorchHostOptions.webSocket: transport.WebSocketConstructor
+interface transport.IPorchHostStatus
+property transport.IPorchHostStatus.circuits: number
+property transport.IPorchHostStatus.idle: number
+property transport.IPorchHostStatus.lastError?: string
+property transport.IPorchHostStatus.relay: string
+property transport.IPorchHostStatus.state: transport.PorchHostState
+interface transport.IPorchHostTiming
+property transport.IPorchHostTiming.backoffMs: number
+property transport.IPorchHostTiming.dialBurst: number
+property transport.IPorchHostTiming.dialRefillMs: number
+property transport.IPorchHostTiming.maxBackoffMs: number
+property transport.IPorchHostTiming.refusedBackoffMs: number
+property transport.IPorchHostTiming.registerTimeoutMs: number
+property transport.IPorchHostTiming.silenceMs: number
+interface transport.IPorchLink
+property transport.IPorchLink.relay: string
+property transport.IPorchLink.tag: string
+property transport.IPorchLink.uri: string
 interface transport.IPorchRegister
 property transport.IPorchRegister.key: string
 property transport.IPorchRegister.sig: string
@@ -9056,6 +9104,9 @@ property transport.IPorchRelayAddress.host: string
 property transport.IPorchRelayAddress.origin: string
 property transport.IPorchRelayAddress.port: number
 property transport.IPorchRelayAddress.secure: boolean
+interface transport.IPorchRelayConfig
+property transport.IPorchRelayConfig.token?: string
+property transport.IPorchRelayConfig.url: string
 const transport.IROH_ALPN = "beignet/bolt8/1"
 interface transport.IWebSocketConnectOptions
 property transport.IWebSocketConnectOptions.webSocketImpl?: transport.WebSocketConstructor
@@ -9102,6 +9153,7 @@ method transport.IrohTransport.write(data: Uint8Array | string, cb?: (error?: Er
 type transport.LearnedAddressDials = 'any' | 'proxy-only'
 class transport.LearnedAddressRefusedError extends transport.PeerError
 constructor transport.LearnedAddressRefusedError(pubkey: string, target: string)
+const transport.MAX_PORCH_STANDBYS = 8
 class transport.NodeWebSocket implements transport.IWebSocketLike
 constructor transport.NodeWebSocket(url: string, protocolsOrOptions?: string | string[] | transport.INodeWebSocketOptions)
 property transport.NodeWebSocket.binaryType: string
@@ -9117,9 +9169,11 @@ const transport.PORCH_CLOSE_REFUSED = 1008
 const transport.PORCH_CLOSE_TRY_LATER = 1013
 const transport.PORCH_HOST_PATH = "/v1/host"
 const transport.PORCH_MAX_CONTROL_BYTES: number
+const transport.PORCH_MAX_MESSAGE_BYTES: number
 const transport.PORCH_MAX_TAGS = 256
 const transport.PORCH_MAX_TOKEN_BYTES = 256
 const transport.PORCH_NONCE_BYTES = 32
+const transport.PORCH_PRE_HANDSHAKE_MAX_BYTES: number
 const transport.PORCH_TAG_BYTES = 16
 const transport.PORCH_VERSION = 1
 const transport.PORCH_VISITOR_PATH_PREFIX = "/v1/p/"
@@ -9130,6 +9184,7 @@ method transport.Peer.acceptInbound(socket: transport.IDuplexTransport): Promise
 method transport.Peer.connect(): Promise<void>
 method transport.Peer.disconnect(): void
 method transport.Peer.getIrohDiagnostics(): transport.IIrohDiagnostics | undefined
+method transport.Peer.getPorchCircuit(): transport.IPorchCircuitInfo | undefined
 method transport.Peer.getRemoteInit(): message.IInitMessage | null
 method transport.Peer.getState(): PeerState
 method transport.Peer.getTransportType(): 'tcp' | 'ws' | 'iroh' | undefined
@@ -9161,16 +9216,21 @@ method transport.PeerManager.getConnectionInfo(pubkey: string): transport.IPeerC
 method transport.PeerManager.getIrohConnectionString(): string | undefined
 method transport.PeerManager.getPeer(pubkey: string): transport.Peer | undefined
 method transport.PeerManager.getPeerAddress(pubkey: string): { host: string; port: number; transport?: transport.IPeerTransportOptions; } | undefined
+method transport.PeerManager.getPorchLinks(): transport.IPorchLink[]
+method transport.PeerManager.getPorchStatus(): transport.IPorchHostStatus[]
 method transport.PeerManager.getWebSocketListenerPort(): number | null
 method transport.PeerManager.isIrohEnabled(): boolean
 method transport.PeerManager.isLanePeer(pubkey: string): boolean
 method transport.PeerManager.isListening(): boolean
+method transport.PeerManager.isListeningPorch(): boolean
 method transport.PeerManager.isListeningWebSocket(): boolean
+method transport.PeerManager.isPorchEnabled(): boolean
 method transport.PeerManager.keepReconnecting(pubkey: string): void
 method transport.PeerManager.lanePeerCount(): number
 method transport.PeerManager.listPeers(): transport.IPeerInfo[]
 method transport.PeerManager.listen(port: number, host?: string): Promise<void>
 method transport.PeerManager.listenIroh(): Promise<void>
+method transport.PeerManager.listenPorch(): void
 method transport.PeerManager.listenWebSocket(port: number, host?: string): Promise<void>
 method transport.PeerManager.onMessage(type: number, handler: MessageHandler): void
 method transport.PeerManager.sendToPeer(pubkey: string, type: number, payload: Buffer): void
@@ -9179,9 +9239,26 @@ method transport.PeerManager.setConnectionGate(gate: (() => boolean) | null): vo
 method transport.PeerManager.setInboundGate(gate: ((pubkey: string, type: number) => boolean) | null): void
 method transport.PeerManager.setLaneGate(gate: transport.IPeerLaneGate | null): void
 method transport.PeerManager.setOutboundGate(gate: ((pubkey: string, type: number) => boolean) | null): void
+method transport.PeerManager.setPorchTags(tags: readonly Uint8Array[]): void
 method transport.PeerManager.setWireObserver(observer: transport.WireObserver | null): void
 method transport.PeerManager.stopListening(): void
+class transport.PorchCircuitTransport extends transport.WebSocketTransport
+constructor transport.PorchCircuitTransport(ws: transport.IWebSocketLike, relay: transport.IPorchRelayAddress, tag: string, closed?: () => void)
+method transport.PorchCircuitTransport.markEstablished(): void
+protected method transport.PorchCircuitTransport.onClosed(): void
+readonly property transport.PorchCircuitTransport.porch: transport.IPorchCircuitInfo
+readonly property transport.PorchCircuitTransport.transportType: "ws"
 type transport.PorchControlMessage = transport.IPorchChallenge | transport.IPorchRegister | { t: 'ready'; } | { t: 'paired'; tag: string; } | { t: 'ping'; } | { t: 'pong'; }
+class transport.PorchHost extends EventEmitter
+constructor transport.PorchHost(options: transport.IPorchHostOptions)
+method transport.PorchHost.closeCircuits(tag?: string): void
+method transport.PorchHost.refresh(): void
+readonly property transport.PorchHost.relay: transport.IPorchRelayAddress
+method transport.PorchHost.start(): void
+method transport.PorchHost.status(): transport.IPorchHostStatus
+method transport.PorchHost.stop(): void
+type transport.PorchHostState = 'stopped' | 'connecting' | 'ready' | 'refused' | 'unreachable'
+type transport.PorchVia = 'direct' | 'tor'
 type transport.Socks5ProxyScope = 'all' | 'onion'
 class transport.TransportCipher
 constructor transport.TransportCipher(sendKey: Buffer, recvKey: Buffer, chainingKey: Buffer)
@@ -9216,6 +9293,7 @@ method transport.WebSocketServerTransport.write(data: Uint8Array | string, cb?: 
 class transport.WebSocketTransport extends transport.BufferedDataEmitter implements transport.IDuplexTransport
 constructor transport.WebSocketTransport(ws: transport.IWebSocketLike, remote?: { address?: string; port?: number; })
 method transport.WebSocketTransport.destroy(error?: Error): this
+protected method transport.WebSocketTransport.onClosed(): void
 protected method transport.WebSocketTransport.onPendingOverflow(): void
 readonly property transport.WebSocketTransport.remoteAddress?: string
 readonly property transport.WebSocketTransport.remotePort?: number
@@ -9277,6 +9355,7 @@ function transport.responderAct2(state: transport.IHandshakeState, ephemeralPriv
 function transport.responderProcessAct1(state: transport.IHandshakeState, act1: Buffer): void
 function transport.responderProcessAct3(state: transport.IHandshakeState, act3: Buffer): Buffer
 function transport.selectOutboundProxy(host: string, proxy: { host: string; port: number; } | undefined, scope?: transport.Socks5ProxyScope): { host: string; port: number; } | undefined
+function transport.selectPorchProxy(host: string, via: transport.PorchVia | undefined, proxy: { host: string; port: number; } | undefined, scope?: transport.Socks5ProxyScope): { host: string; port: number; } | undefined
 function transport.socks5SocketFactory(proxy: { host: string; port: number; }, timeoutMs?: number): (host: string, port: number) => Promise<net#Socket>
 function transport.validateIrohRelayUrl(value: string): string
 namespace validation

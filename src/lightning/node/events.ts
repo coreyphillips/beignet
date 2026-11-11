@@ -12,6 +12,7 @@ import type { IOnionMessagePayload } from '../onion-message/types';
 import type { GuardianState } from '../recovery/guardian-wire';
 import type { ISwapEvent } from '../swaps/engine-common';
 import type { IPeerDisconnectInfo } from '../transport/peer-manager';
+import type { IPorchHostStatus } from '../transport/porch-host';
 import type {
 	IGraphRestoreStats,
 	IHoldCancelledEvent,
@@ -284,6 +285,8 @@ export interface LightningNodeEvents
 	'peer:disconnect-requested': (pubkey: string) => void;
 	/** Peer error (networking mode). */
 	'peer:error': (pubkey: string, error: Error) => void;
+	/** A Porch relay's standbys changed: the relay became reachable, was lost or refused the node, or a visitor connected or left. Carries that relay's whole status; `state: 'ready'` means links through it work. */
+	'porch:status': (status: IPorchHostStatus) => void;
 	/** A peer sent a BOLT 1 warning, which leaves the connection and its channels as they were, so it is not a `node:error`. `channelId` is null for a connection-level warning (the all-zero id); `text` is the peer's text as printable ASCII. */
 	'peer:warning': (warning: {
 		pubkey: string;

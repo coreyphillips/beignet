@@ -69,9 +69,11 @@ sends or receives text. A host sends and receives text only until it is
 paired. A receiver ignores fields it does not know, and closes the connection
 on a message that is malformed or unexpected.
 
-No sender puts more than 128 KiB in one WebSocket frame. One BOLT 8 message is
-at most 65,569 bytes, and the in-repo transports send each in a frame of its
-own.
+No sender puts more than 128 KiB in one WebSocket frame, or in one message
+however it is split into frames: the relay copies fragments as they come, but
+a host may put a message back together before it reads it, and holds a
+stranger to that size. One BOLT 8 message is at most 65,569 bytes, and the
+in-repo transports send each in a frame of its own.
 
 ### Host standby: `GET /v1/host`
 
@@ -105,6 +107,14 @@ relay -> host   {"t":"ready"}
 A standby serves **one** circuit. The host keeps a small number of standbys
 open and opens a replacement when one is paired or lost, at a bounded rate so
 a flood of visitors cannot make it dial without bound.
+
+The host in this repository keeps 2 standbys at each relay unless told
+otherwise (at most 8). It may open 4 connections in a burst and one more
+every 2 seconds after that. A connection that fails is retried after 1
+second, doubling up to a minute, and after 5 minutes when the relay refused
+the registration itself (close code 1008), since a wrong token or too many
+links will not come right by asking again. A relay that lets a registered
+standby go is redialed at once, within the same allowance.
 
 While a standby is idle the relay sends `{"t":"ping"}` about every 20 seconds
 and the host answers `{"t":"pong"}`. The relay drops a standby that leaves two
