@@ -2588,6 +2588,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 					this.channelManager.getChannelsByPeer(pubkey).length > 0,
 				socks5Proxy: config.socks5Proxy,
 				socks5ProxyScope: this.socks5ProxyScope,
+				learnedAddressDials: config.learnedAddressDials,
 				webSocketImpl: config.webSocketImpl,
 				iroh: config.iroh
 			});
@@ -7699,9 +7700,13 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		}
 
 		// Count how many peers we need to reconnect
-		const peersToConnect = peerAddresses.filter((p) =>
-			channelPeers.has(p.pubkey)
-		);
+		const peersToConnect: Array<{
+			pubkey: string;
+			host: string;
+			port: number;
+			transport?: IPeerTransportOptions;
+			learned?: boolean;
+		}> = peerAddresses.filter((p) => channelPeers.has(p.pubkey));
 
 		// Seed gossip-announced reconnect fallbacks for every channel peer, and
 		// dial peers that have no stored address at all (they only ever
@@ -7744,15 +7749,11 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				addresses: newest.addresses
 			});
 			this.peerManager.setAnnouncedAddresses(pubkey, newest.addresses);
-			if (
-				newest.addresses.length > 0 &&
-				!peersToConnect.some((p) => p.pubkey === pubkey)
-			) {
-				peersToConnect.push({
-					pubkey,
-					host: newest.addresses[0].host,
-					port: newest.addresses[0].port
-				});
+			// The peer chose these, so they are dialed as learned addresses,
+			// and one the node would refuse is not worth a start-up dial.
+			const announced = this.firstDialableLearnedAddress(newest.addresses);
+			if (announced && !peersToConnect.some((p) => p.pubkey === pubkey)) {
+				peersToConnect.push({ pubkey, ...announced, learned: true });
 			}
 		}
 		// A sliced restore of the stored map has not brought the graph's
@@ -7776,12 +7777,12 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		let delay = 0;
 		const STAGGER_MS = 500;
 
-		for (const { pubkey, host, port, transport } of peersToConnect) {
+		for (const { pubkey, host, port, transport, learned } of peersToConnect) {
 			const pm = this.peerManager;
 			const timer = setTimeout(() => {
 				this._reconnectTimers.delete(timer);
 				if (this._destroyed) return;
-				pm.connectPeer(pubkey, host, port, transport)
+				pm.connectPeer(pubkey, host, port, transport, { learned })
 					.catch((err) => {
 						this.emit('node:error', {
 							code: 'AUTO_RECONNECT_FAILED',
@@ -7802,6 +7803,18 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			this._reconnectTimers.add(timer);
 			delay += STAGGER_MS;
 		}
+	}
+
+	/**
+	 * The first of a peer's announced addresses the peer manager would dial
+	 * as a learned address (every one under learnedAddressDials 'any').
+	 */
+	private firstDialableLearnedAddress(
+		addresses: Array<{ host: string; port: number }>
+	): { host: string; port: number } | undefined {
+		const pm = this.peerManager;
+		if (!pm) return undefined;
+		return addresses.find((addr) => pm.canDialLearnedAddress(addr.host));
 	}
 
 	/**
@@ -7829,19 +7842,20 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				addresses
 			});
 			pm.setAnnouncedAddresses(pubkey, addresses);
-			if (dialing.has(pubkey) || addresses.length === 0) continue;
+			const announced = this.firstDialableLearnedAddress(addresses);
+			if (dialing.has(pubkey) || !announced) continue;
 			if (pm.getPeer(pubkey)) continue;
-			pm.connectPeer(pubkey, addresses[0].host, addresses[0].port).catch(
-				(err) => {
-					this.emit('node:error', {
-						code: 'AUTO_RECONNECT_FAILED',
-						message: `Failed to reconnect ${pubkey.slice(0, 8)}...: ${
-							(err as Error).message
-						}`,
-						timestamp: Date.now()
-					});
-				}
-			);
+			pm.connectPeer(pubkey, announced.host, announced.port, undefined, {
+				learned: true
+			}).catch((err) => {
+				this.emit('node:error', {
+					code: 'AUTO_RECONNECT_FAILED',
+					message: `Failed to reconnect ${pubkey.slice(0, 8)}...: ${
+						(err as Error).message
+					}`,
+					timestamp: Date.now()
+				});
+			});
 		}
 	}
 
@@ -9821,6 +9835,8 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			const dialable = nodeAddressToHostPort(addr);
 			if (dialable) candidates.push(dialable);
 		}
+		// Whoever announced or seeded these chose them, not the operator.
+		const learnedOptions: IPeerDialOptions = { ...options, learned: true };
 		for (const { host, port } of candidates) {
 			assertNotCancelled();
 			try {
@@ -9829,7 +9845,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 					host,
 					port,
 					undefined,
-					options
+					learnedOptions
 				);
 				return;
 			} catch (err) {
@@ -9879,7 +9895,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 						peer.host,
 						peer.port,
 						undefined,
-						options
+						learnedOptions
 					);
 					return;
 				} catch (err) {
@@ -11420,7 +11436,13 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		for (const peer of peers.slice(0, maxPeers)) {
 			try {
 				const pubkeyHex = peer.pubkey.toString('hex');
-				await this.peerManager.connectPeer(pubkeyHex, peer.host, peer.port);
+				await this.peerManager.connectPeer(
+					pubkeyHex,
+					peer.host,
+					peer.port,
+					undefined,
+					{ learned: true }
+				);
 				connected.push(pubkeyHex);
 			} catch {
 				// Skip failed connections
@@ -29102,9 +29124,12 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 						if (peer === this.getNodeId()) {
 							throw new Error('refusing to dial this node itself');
 						}
+						// A lane's address comes from a descriptor the
+						// counterparty wrote.
 						await this.connectPeer(peer, host, port, undefined, {
 							...options,
-							...(timeoutMs !== undefined ? { timeoutMs } : {})
+							...(timeoutMs !== undefined ? { timeoutMs } : {}),
+							learned: true
 						});
 					},
 					onPeerConnect: (cb): (() => void) => {
@@ -29529,7 +29554,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			isPeerConnected: (peerHex: string) =>
 				this.listPeers().some((p) => p.pubkey === peerHex),
 			connectPeer: (peerHex: string, host: string, port: number) =>
-				this.connectPeer(peerHex, host, port)
+				this.connectPeer(peerHex, host, port, undefined, { learned: true })
 		};
 		const estimateFee = (targetBlocks: number): Promise<number | null> =>
 			this.estimateClampedFeeSatPerVbyte(targetBlocks);
