@@ -583,11 +583,16 @@ describe('learnedAddressDials', function () {
 				'peerHex, host, port, remainingMs',
 				'via hook'
 			],
-			// Start-up reconnect: stored addresses, and announced ones flagged.
+			// Start-up reconnect: an announced address, then a stored one.
 			[
 				'src/lightning/node/lightning-node.ts',
-				'pubkey, host, port, transport, { learned }',
-				'forwards'
+				'pubkey, host, port, transport, { learned: true }',
+				'learned'
+			],
+			[
+				'src/lightning/node/lightning-node.ts',
+				'pubkey, host, port, transport',
+				'operator'
 			],
 			[
 				'src/lightning/node/lightning-node.ts',

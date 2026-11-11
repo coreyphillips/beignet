@@ -7782,7 +7782,12 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			const timer = setTimeout(() => {
 				this._reconnectTimers.delete(timer);
 				if (this._destroyed) return;
-				pm.connectPeer(pubkey, host, port, transport, { learned })
+				// A stored address is dialed exactly as before; only one the
+				// peer announced carries the mark.
+				(learned
+					? pm.connectPeer(pubkey, host, port, transport, { learned: true })
+					: pm.connectPeer(pubkey, host, port, transport)
+				)
 					.catch((err) => {
 						this.emit('node:error', {
 							code: 'AUTO_RECONNECT_FAILED',
