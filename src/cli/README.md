@@ -1651,7 +1651,7 @@ A 2xx means the splice **started**. Its outcome arrives on the `splice:complete`
 
 ## CLI Commands
 
-The CLI is a thin HTTP client. `init` and `start` are handled locally; all other commands send requests to the daemon on `127.0.0.1:2112`.
+The CLI is a thin HTTP client. `init` and `start` are handled locally, and `porch-relay` runs a server of its own; all other commands send requests to the daemon on `127.0.0.1:2112`.
 
 All output is JSON. Add `--pretty` for indented output.
 
@@ -2193,6 +2193,45 @@ separately. `POST /ffor/sync` refreshes receipts without retiring the book. The
 reserved inbound capacity and unresolved slots. Keep reserved channels out of
 automatic splicing and channel close. Retirement of version 2 unknown slots
 can remain `DRAINING` after the invoice expires.
+
+### Porch relay
+
+`beignet porch-relay` runs a Porch relay: a small server that lets a node at
+home hand out a `wss://` peer link without telling anyone where it runs. The
+node dials out to the relay and waits there. A visitor connects to the relay
+with an ordinary `pubkey@wss://relay/v1/p/<id>` link, and the relay pairs the
+two and copies bytes it cannot read (they are BOLT 8). It needs no wallet, no
+data directory and no daemon, and belongs on a small server with a public
+address. The protocol, what each party learns and every limit are in
+[docs/PORCH-PROTOCOL.md](../../docs/PORCH-PROTOCOL.md).
+
+```bash
+# Behind a TLS terminator (Caddy, nginx) that forwards wss://relay.example here
+beignet porch-relay --url wss://relay.example --trusted-proxy 127.0.0.1
+
+# Serving TLS itself
+beignet porch-relay --url wss://relay.example:8443 --host 0.0.0.0 --port 8443 \
+  --tls-cert fullchain.pem --tls-key privkey.pem
+```
+
+| Flag | Meaning |
+| --- | --- |
+| `--url <url>` | The relay's public URL as nodes are given it: `wss://host[:port]`, or `ws://` for an onion service. Required. Repeat it for a relay with more than one name. A node registers only with a relay that names itself by the URL the node dialed. |
+| `--port <n>` | Listen port (default 2114) |
+| `--host <address>` | Listen address (default `127.0.0.1`) |
+| `--tls-cert <path>`, `--tls-key <path>` | Serve TLS directly. Without them, put a TLS terminator in front. |
+| `--token-file <path>` | A private relay: only a node that presents this token may register. `BEIGNET_PORCH_RELAY_TOKEN` sets it too. |
+| `--trusted-proxy <ip>` | A reverse proxy whose `X-Forwarded-For` is believed. Repeatable. Without it every connection through a proxy counts as the proxy's own, and the per-address limits do nothing. |
+| `--limit <name>=<n>` | Override one limit by its name in `IPorchRelayLimits`, for example `--limit connections=2048`. Repeatable. |
+| `--stats <seconds>` | Print the relay's counters to stderr at this interval |
+
+An unknown flag is an error. `GET /health` answers `{"ok":true}`. The relay
+keeps no state: restarting it drops the connections that were open, and nodes
+dial back in. It prints one JSON line when it is listening and runs until it is
+signalled.
+
+The node side of Porch (configuration, links and routes) is tracked in
+[#1980](https://github.com/coreyphillips/beignet/issues/1980).
 
 ### JSON Envelope
 

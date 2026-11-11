@@ -9029,6 +9029,29 @@ property transport.IPeerTransportOptions.fallbackOnion?: { host: string; port: n
 property transport.IPeerTransportOptions.relayUrl?: string
 property transport.IPeerTransportOptions.type: 'tcp' | 'ws' | 'iroh'
 property transport.IPeerTransportOptions.url?: string
+interface transport.IPorchChallenge
+property transport.IPorchChallenge.authority: string
+property transport.IPorchChallenge.nonce: string
+property transport.IPorchChallenge.t: 'challenge'
+property transport.IPorchChallenge.v: number
+interface transport.IPorchRegister
+property transport.IPorchRegister.key: string
+property transport.IPorchRegister.sig: string
+property transport.IPorchRegister.t: 'register'
+property transport.IPorchRegister.tags: string[]
+property transport.IPorchRegister.token?: string
+property transport.IPorchRegister.v: number
+interface transport.IPorchRegistration
+property transport.IPorchRegistration.hostKey: Buffer
+property transport.IPorchRegistration.routeIds: string[]
+property transport.IPorchRegistration.tags: Buffer[]
+property transport.IPorchRegistration.token?: string
+interface transport.IPorchRelayAddress
+property transport.IPorchRelayAddress.authority: string
+property transport.IPorchRelayAddress.host: string
+property transport.IPorchRelayAddress.origin: string
+property transport.IPorchRelayAddress.port: number
+property transport.IPorchRelayAddress.secure: boolean
 const transport.IROH_ALPN = "beignet/bolt8/1"
 interface transport.IWebSocketConnectOptions
 property transport.IWebSocketConnectOptions.webSocketImpl?: transport.WebSocketConstructor
@@ -9083,6 +9106,16 @@ property transport.NodeWebSocket.onmessage: ((ev: { data: unknown; }) => void) |
 property transport.NodeWebSocket.onopen: ((ev?: unknown) => void) | null
 property transport.NodeWebSocket.readyState: number
 method transport.NodeWebSocket.send(data: Uint8Array | string): void
+const transport.PORCH_CLOSE_REFUSED = 1008
+const transport.PORCH_CLOSE_TRY_LATER = 1013
+const transport.PORCH_HOST_PATH = "/v1/host"
+const transport.PORCH_MAX_CONTROL_BYTES: number
+const transport.PORCH_MAX_TAGS = 256
+const transport.PORCH_MAX_TOKEN_BYTES = 256
+const transport.PORCH_NONCE_BYTES = 32
+const transport.PORCH_TAG_BYTES = 16
+const transport.PORCH_VERSION = 1
+const transport.PORCH_VISITOR_PATH_PREFIX = "/v1/p/"
 const transport.PRE_HANDSHAKE_MAX_WS_BYTES: number
 class transport.Peer extends EventEmitter
 constructor transport.Peer(options: transport.IPeerOptions)
@@ -9139,6 +9172,7 @@ method transport.PeerManager.setLaneGate(gate: transport.IPeerLaneGate | null): 
 method transport.PeerManager.setOutboundGate(gate: ((pubkey: string, type: number) => boolean) | null): void
 method transport.PeerManager.setWireObserver(observer: transport.WireObserver | null): void
 method transport.PeerManager.stopListening(): void
+type transport.PorchControlMessage = transport.IPorchChallenge | transport.IPorchRegister | { t: 'ready'; } | { t: 'paired'; tag: string; } | { t: 'ping'; } | { t: 'pong'; }
 type transport.Socks5ProxyScope = 'all' | 'onion'
 class transport.TransportCipher
 constructor transport.TransportCipher(sendKey: Buffer, recvKey: Buffer, chainingKey: Buffer)
@@ -9194,16 +9228,22 @@ readonly property transport.WsProtocolError.closeCode: number
 function transport.acceptWebSocketUpgrade(socket: net#Socket, key: string): void
 function transport.applyWsMask(payload: Buffer, maskKey: Buffer): Buffer
 function transport.buildWebSocketUrl(host: string, port: number): string
+function transport.checkPorchRegister(message: transport.IPorchRegister, challenge: { nonce: Uint8Array; authority: string; }, maxTags?: number): transport.IPorchRegistration | { refused: string; }
 function transport.checkWebSocketUpgrade(req: { method?: string; headers: http#IncomingHttpHeaders; }): { key: string; } | { deny: transport.IWebSocketUpgradeDenial; }
 function transport.computeWebSocketAccept(secWebSocketKey: string): string
 function transport.connectIrohWithFallback(primary: () => Promise<transport.IDuplexTransport>, fallback: () => Promise<transport.IDuplexTransport>, delayMs?: number, signal?: AbortSignal): Promise<transport.IDuplexTransport>
 function transport.connectWebSocket(url: string, options?: transport.IWebSocketConnectOptions): Promise<transport.WebSocketTransport>
 function transport.createInitiatorHandshake(localStaticPriv: Buffer, remoteStaticPub: Buffer, ephemeralPriv?: Buffer): { state: transport.IHandshakeState; act1: Buffer; processAct2: (act2: Buffer) => void; createAct3: () => Buffer; deriveTransport: () => transport.TransportCipher; }
+function transport.createPorchRegister(input: { hostSecret: Uint8Array; nonce: Uint8Array; authority: string; tags: readonly Uint8Array[]; token?: string; }): transport.IPorchRegister
 function transport.createResponderHandshake(localStaticPriv: Buffer, ephemeralPriv?: Buffer): { state: transport.IHandshakeState; processAct1: (act1: Buffer) => void; createAct2: () => Buffer; processAct3: (act3: Buffer) => Buffer; deriveTransport: () => transport.TransportCipher; }
+function transport.decodePorchControl(text: string): transport.PorchControlMessage | undefined
 function transport.decodeWsClosePayload(payload: Buffer): { code: number; reason: string; }
 function transport.denyWebSocketUpgrade(socket: net#Socket, denial: transport.IWebSocketUpgradeDenial): void
 function transport.deriveIrohSecretKey(seed: Uint8Array): Buffer
+function transport.derivePorchDefaultTag(seed: Uint8Array): Buffer
+function transport.derivePorchHostSecret(seed: Uint8Array): Buffer
 function transport.deriveTransportCipher(ck: Buffer, initiator: boolean): transport.TransportCipher
+function transport.encodePorchControl(message: transport.PorchControlMessage): string
 function transport.encodeWsClosePayload(code: number, reason?: string): Buffer
 function transport.encodeWsFrame(opts: { opcode: number; payload?: Buffer; fin?: boolean; maskKey?: Buffer; }): Buffer
 function transport.formatIrohAddress(address: transport.IIrohAddress): string
@@ -9211,12 +9251,18 @@ function transport.inboundAddressKey(address: string | undefined): string | null
 function transport.initiatorAct1(state: transport.IHandshakeState, ephemeralPriv?: Buffer): Buffer
 function transport.initiatorAct3(state: transport.IHandshakeState): Buffer
 function transport.initiatorProcessAct2(state: transport.IHandshakeState, act2: Buffer): void
+function transport.isPorchRouteId(value: unknown): value is string
 function transport.isPrivateOrLoopbackHost(host: string): boolean
 function transport.nodeWebSocketVia(connect: NonNullable<transport.INodeWebSocketOptions['connect']>, options?: Omit<transport.INodeWebSocketOptions, 'connect'>): transport.WebSocketConstructor
 function transport.normalizeIrohEndpointId(value: string): string
 function transport.parseIrohAddress(address: string): transport.IIrohAddress
 function transport.parsePeerUri(uri: string): transport.IParsedPeerUri
+function transport.parsePorchRelayUrl(url: string): transport.IPorchRelayAddress
 function transport.parseWebSocketUrl(url: string): { host: string; port: number; secure: boolean; }
+function transport.porchHostUrl(relay: transport.IPorchRelayAddress): string
+function transport.porchLink(nodeId: string, relay: transport.IPorchRelayAddress, routeId: string): string
+function transport.porchRegisterDigest(nonce: Uint8Array, authority: string, tags: readonly Uint8Array[]): Buffer
+function transport.porchRouteId(hostKey: Uint8Array, tag: Uint8Array): string
 function transport.resolveWebSocketConstructor(injected?: transport.WebSocketConstructor): transport.WebSocketConstructor
 function transport.responderAct2(state: transport.IHandshakeState, ephemeralPriv?: Buffer): Buffer
 function transport.responderProcessAct1(state: transport.IHandshakeState, act1: Buffer): void
