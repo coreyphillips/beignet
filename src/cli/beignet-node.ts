@@ -8282,14 +8282,16 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	/**
 	 * `connectPeer` under a caller's own deadline. A steered receive passes
 	 * what its budget allows for this one dial; the public method passes the
-	 * node's connect timeout.
+	 * node's connect timeout. `learned` marks an address the operator did not
+	 * choose (see the node's learnedAddressDials).
 	 */
 	private async connectPeerWithin(
 		pubkey: string,
 		host: string | undefined,
 		port: number | undefined,
 		transport: IPeerTransportOptions | undefined,
-		timeoutMs: number
+		timeoutMs: number,
+		learned = false
 	): Promise<PeerInfo> {
 		// listPeers reports the lowercase key the node registers the peer under.
 		pubkey = normalizeHexPubkey(pubkey);
@@ -8302,7 +8304,13 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 				? `${host}:${port}`
 				: 'resolved address (gossip graph / DNS bootstrap)';
 		let timer: ReturnType<typeof setTimeout> | undefined;
-		const connectPromise = this.node.connectPeer(pubkey, host, port, transport);
+		const connectPromise = this.node.connectPeer(
+			pubkey,
+			host,
+			port,
+			transport,
+			learned ? { learned: true } : undefined
+		);
 		const timeoutPromise = new Promise<never>((_, reject) => {
 			timer = setTimeout(
 				() =>
@@ -8664,7 +8672,15 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 						const addr =
 							addrs.find((a) => a.type === 1 || a.type === 2) || addrs[0];
 						try {
-							await this.connectPeer(suggestion.nodeId, addr.host, addr.port);
+							// A graph address: the suggested node chose it.
+							await this.connectPeerWithin(
+								suggestion.nodeId,
+								addr.host,
+								addr.port,
+								undefined,
+								this._connectTimeoutMs,
+								true
+							);
 						} catch {
 							// May already be connected — continue
 						}

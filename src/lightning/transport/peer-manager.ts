@@ -207,6 +207,25 @@ export function socks5SocketFactory(
 	};
 }
 
+/**
+ * How an address somebody other than the operator chose is dialed: a
+ * peer's node_announcement, the gossip graph, DNS seeds, a payment
+ * descriptor. Whoever supplies such an address sees the source of the dial,
+ * so a node that keeps its own address private must not dial one directly.
+ *
+ * - `'any'`: dialed like any other address (the default).
+ * - `'proxy-only'`: dialed only over TCP through the SOCKS5 proxy, whatever
+ *   socks5ProxyScope says. Without a proxy, and for private or loopback
+ *   hosts (which never ride one), the dial is refused with
+ *   LearnedAddressRefusedError. A learned address that connects is not kept
+ *   as the peer's last-known-good address, so it never becomes a direct
+ *   reconnect target later.
+ *
+ * Addresses the operator supplied (IPeerDialOptions.learned unset) are not
+ * affected.
+ */
+export type LearnedAddressDials = 'any' | 'proxy-only';
+
 export interface IPeerManagerOptions {
 	/** Local node private key (32 bytes) */
 	localPrivateKey: Buffer;
@@ -264,6 +283,9 @@ export interface IPeerManagerOptions {
 	 *  dialed with transport {type: 'ws'}. */
 	webSocketImpl?: WebSocketConstructor;
 	iroh?: IIrohConfig;
+	/** How learned addresses are dialed (default 'any'); see
+	 *  LearnedAddressDials. */
+	learnedAddressDials?: LearnedAddressDials;
 }
 
 /**
@@ -322,6 +344,13 @@ export interface IPeerDialOptions {
 	 * otherwise retry for good. A peer that was already a target stays one.
 	 */
 	reconnect?: boolean;
+	/**
+	 * true: somebody other than the operator chose this address (gossip, a
+	 * DNS seed, a descriptor a counterparty sent). Under learnedAddressDials
+	 * 'proxy-only' such a dial goes through the proxy or is refused; see
+	 * LearnedAddressDials.
+	 */
+	learned?: boolean;
 }
 
 type MessageHandler = (pubkey: string, type: number, payload: Buffer) => void;
@@ -343,7 +372,9 @@ export enum PeerErrorCode {
 	/** A lane peer carries only the message types its lane gate allows. */
 	LANE_REFUSED = 'LANE_REFUSED',
 	/** An explicit disconnectPeer() overtook the dial. */
-	DIAL_CANCELLED = 'DIAL_CANCELLED'
+	DIAL_CANCELLED = 'DIAL_CANCELLED',
+	/** A learned address may only be dialed through a proxy here. */
+	LEARNED_ADDRESS_REFUSED = 'LEARNED_ADDRESS_REFUSED'
 }
 
 /**
@@ -372,6 +403,22 @@ export class PeerDialCancelledError extends PeerError {
 			`Connection to peer ${pubkey} was cancelled while establishing`
 		);
 		this.name = 'PeerDialCancelledError';
+	}
+}
+
+/**
+ * A dial to a learned address that learnedAddressDials 'proxy-only' does
+ * not allow: no proxy carries it, so dialing would show this node's own
+ * address to whoever supplied the target. TYPED so a caller walking
+ * several candidates can tell a refusal from an unreachable host.
+ */
+export class LearnedAddressRefusedError extends PeerError {
+	constructor(pubkey: string, target: string) {
+		super(
+			PeerErrorCode.LEARNED_ADDRESS_REFUSED,
+			`Refusing to dial learned address ${target} for peer ${pubkey} without a proxy`
+		);
+		this.name = 'LearnedAddressRefusedError';
 	}
 }
 
@@ -438,6 +485,7 @@ export class PeerManager extends EventEmitter {
 	private wsServer: WebSocketServer | null = null;
 	private socks5Proxy?: { host: string; port: number };
 	private socks5ProxyScope: Socks5ProxyScope;
+	private learnedAddressDials: LearnedAddressDials;
 	private socks5TimeoutMs: number;
 	private maxInboundPeers: number;
 	private isChannelPeer?: (pubkey: string) => boolean;
@@ -485,6 +533,7 @@ export class PeerManager extends EventEmitter {
 			options.maxReconnectDelay ?? DEFAULT_MAX_RECONNECT_DELAY_MS;
 		this.socks5Proxy = options.socks5Proxy;
 		this.socks5ProxyScope = options.socks5ProxyScope ?? 'all';
+		this.learnedAddressDials = options.learnedAddressDials ?? 'any';
 		this.socks5TimeoutMs = options.socks5TimeoutMs ?? 20_000;
 		this.maxInboundPeers = options.maxInboundPeers ?? 125;
 		// NaN would silently disable the cap: `count >= NaN` is never true.
@@ -540,7 +589,14 @@ export class PeerManager extends EventEmitter {
 			this.noReconnectPeers.add(pubkey);
 		}
 		try {
-			await this.dialPeer(pubkey, host, port, transport, options.timeoutMs);
+			await this.dialPeer(
+				pubkey,
+				host,
+				port,
+				transport,
+				options.timeoutMs,
+				options.learned === true
+			);
 		} catch (err) {
 			// An explicit disconnectPeer() during the dial (a peer:error
 			// observer's cleanup, an operator decision) already cancelled
@@ -587,11 +643,14 @@ export class PeerManager extends EventEmitter {
 		host: string,
 		port: number,
 		transport?: IPeerTransportOptions,
-		timeoutMs?: number
+		timeoutMs?: number,
+		learned = false
 	): Promise<void> {
+		// A restricted dial is a different dial from a plain one to the same
+		// address (it rides the proxy), so the two never share an attempt.
 		const key = `${pubkey}|${host}|${port}|${
 			transport ? JSON.stringify(transport) : ''
-		}`;
+		}${this.restrictsLearned(learned) ? '|learned' : ''}`;
 		const joined = this.inflightDials.get(key);
 		if (joined) {
 			if (timeoutMs === undefined) return joined;
@@ -608,10 +667,24 @@ export class PeerManager extends EventEmitter {
 				// The failed dial's own cleanup may not have run yet.
 				if (this.inflightDials.get(key) === joined)
 					this.inflightDials.delete(key);
-				return this.dialPeer(pubkey, host, port, transport, remainingMs);
+				return this.dialPeer(
+					pubkey,
+					host,
+					port,
+					transport,
+					remainingMs,
+					learned
+				);
 			});
 		}
-		const attempt = this.dialPeerOnce(pubkey, host, port, transport, timeoutMs);
+		const attempt = this.dialPeerOnce(
+			pubkey,
+			host,
+			port,
+			transport,
+			timeoutMs,
+			learned
+		);
 		this.inflightDials.set(key, attempt);
 		void attempt
 			.catch(() => undefined)
@@ -632,7 +705,8 @@ export class PeerManager extends EventEmitter {
 		host: string,
 		port: number,
 		transport?: IPeerTransportOptions,
-		timeoutMs?: number
+		timeoutMs?: number,
+		learned = false
 	): Promise<void> {
 		const dialGeneration = this.cancelGenerations.get(pubkey) ?? 0;
 		const dialAbort = new AbortController();
@@ -649,13 +723,30 @@ export class PeerManager extends EventEmitter {
 		// Keep stored address objects shaped exactly as before for TCP peers
 		// (no `transport` key unless a non-default transport was requested).
 		const addressEntry = transport ? { host, port, transport } : { host, port };
+		// A restricted dial never becomes the peer's last-known-good address:
+		// that slot is redialed under the configured proxy scope, which may be
+		// direct. The peer stays reachable through the announced set, which
+		// is held to the same rule on every round.
+		const restricted = this.restrictsLearned(learned);
 		if (this.peers.has(pubkey)) {
 			// Idempotent: the post-condition "connected to this peer" already holds.
 			// Throwing here forces every caller (reconnect loops, app code) to special-
 			// case an already-connected peer; instead refresh the cached address and
 			// return successfully.
-			this.peerAddresses.set(pubkey, addressEntry);
+			if (!restricted) this.peerAddresses.set(pubkey, addressEntry);
 			return;
+		}
+		// Checked before any socket, resolver or proxy is touched.
+		const learnedProxy = restricted
+			? this.learnedAddressProxy(host, transport)
+			: undefined;
+		if (restricted && !learnedProxy) {
+			throw new LearnedAddressRefusedError(
+				pubkey,
+				transport?.type === 'ws' && transport.url
+					? transport.url
+					: `${host}:${port}`
+			);
 		}
 
 		// Remember the last-known-good address: a failed dial to a NEW address
@@ -663,7 +754,7 @@ export class PeerManager extends EventEmitter {
 		// address (e.g. one typo'd manual connectPeer permanently breaks
 		// reconnection to a channel peer).
 		const previousAddress = this.peerAddresses.get(pubkey);
-		this.peerAddresses.set(pubkey, addressEntry);
+		if (!restricted) this.peerAddresses.set(pubkey, addressEntry);
 
 		let createSocket:
 			| ((h: string, p: number) => Promise<IDuplexTransport>)
@@ -731,11 +822,9 @@ export class PeerManager extends EventEmitter {
 			//   public clearnet  -> via the configured proxy under scope 'all'
 			//                       (privacy), direct under scope 'onion' or
 			//                       when no proxy is set
-			const proxy = selectOutboundProxy(
-				host,
-				this.socks5Proxy,
-				this.socks5ProxyScope
-			);
+			const proxy =
+				learnedProxy ??
+				selectOutboundProxy(host, this.socks5Proxy, this.socks5ProxyScope);
 			createSocket = proxy
 				? this.buildSocks5Factory(proxy, timeoutMs)
 				: undefined;
@@ -812,7 +901,7 @@ export class PeerManager extends EventEmitter {
 		}
 		// The completed handshake proves this address dials the peer: later
 		// overlapping failures roll back to it, never past it.
-		burst.previous = addressEntry;
+		if (!restricted) burst.previous = addressEntry;
 		// Recheck AFTER the async establishment: a freeze, destroy or gate
 		// closure that landed mid-handshake must win over registration.
 		if (
@@ -887,7 +976,7 @@ export class PeerManager extends EventEmitter {
 		// A newer overlapping dial may have stored its own attempt meanwhile;
 		// the registered connection's address is the one listPeers() reports
 		// and the peer:connect handlers persist, so re-assert it.
-		this.peerAddresses.set(pubkey, addressEntry);
+		if (!restricted) this.peerAddresses.set(pubkey, addressEntry);
 		// Reset the backoff only AFTER the connection proves stable, not
 		// immediately — otherwise a peer that drops right after connecting keeps
 		// reconnecting at the minimum delay. The disconnect handler clears this
@@ -1506,25 +1595,65 @@ export class PeerManager extends EventEmitter {
 	 * Addresses a reconnect round dials, in order: the last-known-good outbound
 	 * address first, then gossip-announced fallbacks (deduplicated against it).
 	 */
-	private reconnectCandidates(
-		pubkey: string
-	): Array<{ host: string; port: number; transport?: IPeerTransportOptions }> {
+	private reconnectCandidates(pubkey: string): Array<{
+		host: string;
+		port: number;
+		transport?: IPeerTransportOptions;
+		learned?: boolean;
+	}> {
 		const candidates: Array<{
 			host: string;
 			port: number;
 			transport?: IPeerTransportOptions;
+			learned?: boolean;
 		}> = [];
 		const dialed = this.peerAddresses.get(pubkey);
 		if (dialed && (dialed.transport?.type !== 'iroh' || this.isIrohEnabled()))
 			candidates.push(dialed);
 		for (const addr of this.announcedAddresses.get(pubkey) ?? []) {
+			// One the proxy cannot carry would only ever be refused; leaving
+			// it out keeps a peer with nothing else from being retried for good.
+			if (!this.canDialLearnedAddress(addr.host)) continue;
 			if (
 				!candidates.some((c) => c.host === addr.host && c.port === addr.port)
 			) {
-				candidates.push(addr);
+				candidates.push({ ...addr, learned: true });
 			}
 		}
 		return candidates;
+	}
+
+	/**
+	 * Whether a dial to a learned address at `host` would be attempted: always
+	 * under learnedAddressDials 'any', and under 'proxy-only' when the proxy
+	 * carries it. For a caller choosing among several learned addresses.
+	 */
+	canDialLearnedAddress(host: string): boolean {
+		return (
+			this.learnedAddressDials === 'any' ||
+			this.learnedAddressProxy(host, undefined) !== undefined
+		);
+	}
+
+	private restrictsLearned(learned: boolean): boolean {
+		return learned && this.learnedAddressDials === 'proxy-only';
+	}
+
+	/**
+	 * The proxy a restricted learned dial rides, or undefined when it must be
+	 * refused. Scope 'all' whatever the configured scope is: under 'onion' a
+	 * public clearnet host is dialed directly, which is exactly what the
+	 * restriction exists to prevent. WebSocket and Iroh dials do not go
+	 * through the SOCKS5 proxy at all.
+	 */
+	private learnedAddressProxy(
+		host: string,
+		transport: IPeerTransportOptions | undefined
+	): { host: string; port: number } | undefined {
+		if (transport && transport.type !== 'tcp') return undefined;
+		// selectOutboundProxy falls back to Tor's default port for .onion with
+		// no proxy set; every other host needs a configured one.
+		return selectOutboundProxy(host, this.socks5Proxy, 'all');
 	}
 
 	/**
@@ -2129,7 +2258,14 @@ export class PeerManager extends EventEmitter {
 			for (const addr of this.reconnectCandidates(pubkey)) {
 				if (cancelled()) return;
 				try {
-					await this.dialPeer(pubkey, addr.host, addr.port, addr.transport);
+					await this.dialPeer(
+						pubkey,
+						addr.host,
+						addr.port,
+						addr.transport,
+						undefined,
+						addr.learned === true
+					);
 					return;
 				} catch {
 					// try the next candidate

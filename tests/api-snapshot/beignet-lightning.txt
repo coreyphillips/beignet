@@ -55,6 +55,7 @@ property IResolvedNodeDefaults.htlcSafetyMargin: number
 property IResolvedNodeDefaults.jitReceive?: Readonly<liquidity.IJitReceiveConfig & { holdExpiryMarginBlocks: number; }>
 property IResolvedNodeDefaults.jitReceiveClient: Readonly<Required<NonNullable<node.INodeConfig['jitReceiveClient']>>>
 property IResolvedNodeDefaults.largeChannels: boolean
+property IResolvedNodeDefaults.learnedAddressDials: transport.LearnedAddressDials
 property IResolvedNodeDefaults.logger: beignet#ILogger
 property IResolvedNodeDefaults.maxPaymentRetries: number
 property IResolvedNodeDefaults.maxTotalInFlightHtlcs: number
@@ -5470,6 +5471,7 @@ property node.INodeConfig.iroh?: transport.IIrohConfig
 property node.INodeConfig.jitReceive?: liquidity.IJitReceiveConfig
 property node.INodeConfig.jitReceiveClient?: { maxFlatFeeSat?: bigint; maxFeePpm?: number; }
 property node.INodeConfig.largeChannels?: boolean
+property node.INodeConfig.learnedAddressDials?: transport.LearnedAddressDials
 property node.INodeConfig.leaseRates?: gossip.ILeaseRates
 property node.INodeConfig.localFeatures?: features.FeatureFlags
 property node.INodeConfig.logger?: beignet#ILogger
@@ -8968,6 +8970,7 @@ interface transport.IPeerConnectionInfo
 property transport.IPeerConnectionInfo.connectedAt: number
 property transport.IPeerConnectionInfo.direction: 'inbound' | 'outbound'
 interface transport.IPeerDialOptions
+property transport.IPeerDialOptions.learned?: boolean
 property transport.IPeerDialOptions.reconnect?: boolean
 property transport.IPeerDialOptions.timeoutMs?: number
 interface transport.IPeerDisconnectInfo
@@ -8997,6 +9000,7 @@ property transport.IPeerManagerOptions.autoReconnect?: boolean
 property transport.IPeerManagerOptions.inboundHandshakeTimeoutMs?: number
 property transport.IPeerManagerOptions.iroh?: transport.IIrohConfig
 property transport.IPeerManagerOptions.isChannelPeer?: (pubkey: string) => boolean
+property transport.IPeerManagerOptions.learnedAddressDials?: transport.LearnedAddressDials
 property transport.IPeerManagerOptions.localFeatures?: features.FeatureFlags
 property transport.IPeerManagerOptions.localPrivateKey: Buffer
 property transport.IPeerManagerOptions.maxInboundPeers?: number
@@ -9095,6 +9099,9 @@ method transport.IrohTransport.setTimeout(timeout: number, callback?: () => void
 readonly property transport.IrohTransport.transportType: "iroh"
 get transport.IrohTransport.writableLength(): number
 method transport.IrohTransport.write(data: Uint8Array | string, cb?: (error?: Error) => void): boolean
+type transport.LearnedAddressDials = 'any' | 'proxy-only'
+class transport.LearnedAddressRefusedError extends transport.PeerError
+constructor transport.LearnedAddressRefusedError(pubkey: string, target: string)
 class transport.NodeWebSocket implements transport.IWebSocketLike
 constructor transport.NodeWebSocket(url: string, protocolsOrOptions?: string | string[] | transport.INodeWebSocketOptions)
 property transport.NodeWebSocket.binaryType: string
@@ -9138,10 +9145,12 @@ constructor transport.PeerError(code: transport.PeerErrorCode, message: string)
 enum transport.PeerErrorCode
 member transport.PeerErrorCode.DIAL_CANCELLED = "DIAL_CANCELLED"
 member transport.PeerErrorCode.LANE_REFUSED = "LANE_REFUSED"
+member transport.PeerErrorCode.LEARNED_ADDRESS_REFUSED = "LEARNED_ADDRESS_REFUSED"
 member transport.PeerErrorCode.NOT_CONNECTED = "NOT_CONNECTED"
 member transport.PeerErrorCode.OUTBOUND_GATE_REFUSED = "OUTBOUND_GATE_REFUSED"
 class transport.PeerManager extends EventEmitter
 constructor transport.PeerManager(options: transport.IPeerManagerOptions)
+method transport.PeerManager.canDialLearnedAddress(host: string): boolean
 method transport.PeerManager.cancellationToken(pubkey: string): number
 method transport.PeerManager.connectPeer(pubkey: string, host: string, port: number, transport?: transport.IPeerTransportOptions, options?: transport.IPeerDialOptions): Promise<void>
 method transport.PeerManager.destroy(): void

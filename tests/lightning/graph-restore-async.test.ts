@@ -743,6 +743,7 @@ describe('Cooperative restore of the stored network map', () => {
 		const { node } = open(store.dbPath, false);
 		const announced: string[] = [];
 		const dialed: string[] = [];
+		const learned: boolean[] = [];
 		const inner = node as unknown as {
 			peerManager: unknown;
 			seedReconnectsFromGraph(peers: Set<string>, dialing: Set<string>): void;
@@ -752,8 +753,16 @@ describe('Cooperative restore of the stored network map', () => {
 				announced.push(pubkey);
 			},
 			getPeer: (): undefined => undefined,
-			connectPeer: (pubkey: string): Promise<void> => {
+			canDialLearnedAddress: (): boolean => true,
+			connectPeer: (
+				pubkey: string,
+				_host: string,
+				_port: number,
+				_transport: undefined,
+				options?: { learned?: boolean }
+			): Promise<void> => {
 				dialed.push(pubkey);
+				learned.push(options?.learned === true);
 				return Promise.resolve();
 			}
 		};
@@ -767,6 +776,8 @@ describe('Cooperative restore of the stored network map', () => {
 			);
 			expect(announced).to.have.members([fresh, already]);
 			expect(dialed).to.deep.equal([fresh]);
+			// The graph supplied the address, so the dial is marked learned.
+			expect(learned).to.deep.equal([true]);
 		} finally {
 			inner.peerManager = null;
 		}

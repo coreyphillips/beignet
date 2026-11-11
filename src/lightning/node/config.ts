@@ -22,7 +22,10 @@ import type { IZeroReserveConfig } from '../channel/zero-reserve';
 import type { IJitReceiveConfig } from '../liquidity/jit-receive';
 import type { IFforWitnessConfig } from '../ffor/witness-service';
 import type { ISwapConfirmationPolicy, ISwapExposurePolicy } from '../swaps';
-import type { Socks5ProxyScope } from '../transport/peer-manager';
+import type {
+	LearnedAddressDials,
+	Socks5ProxyScope
+} from '../transport/peer-manager';
 import type { RecoveryDurability } from '../recovery/types';
 import type { GuardianDescriptor } from '../recovery/capsule';
 import type {
@@ -112,6 +115,7 @@ interface IResolvedNodeDefaults {
 	mppTimeoutMs: number;
 	announcedAddresses: INodeAddress[];
 	socks5ProxyScope: Socks5ProxyScope;
+	learnedAddressDials: LearnedAddressDials;
 	watchtowers: string[];
 	preferAnchors: boolean;
 	largeChannels: boolean;
@@ -294,6 +298,7 @@ export function resolveNodeConfig(
 			(a, b) => a.type - b.type
 		),
 		socks5ProxyScope: input.socks5ProxyScope ?? 'all',
+		learnedAddressDials: input.learnedAddressDials ?? 'any',
 		watchtowers: input.watchtowers ?? [],
 		// Anchors are the default channel type now that wallet-funded fee
 		// bumping makes their force-close safe.
