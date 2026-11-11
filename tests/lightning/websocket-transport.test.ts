@@ -15,8 +15,16 @@
  */
 
 import { expect } from 'chai';
+import { execSync } from 'child_process';
 import crypto from 'crypto';
+import fs from 'fs';
+import http from 'http';
+import https from 'https';
 import net from 'net';
+import os from 'os';
+import path from 'path';
+import sinon from 'sinon';
+import tls from 'tls';
 import {
 	resolveWebSocketConstructor,
 	buildWebSocketUrl,
@@ -29,7 +37,10 @@ import {
 import {
 	WebSocketServer,
 	WebSocketServerTransport,
-	PRE_HANDSHAKE_MAX_WS_BYTES
+	PRE_HANDSHAKE_MAX_WS_BYTES,
+	checkWebSocketUpgrade,
+	denyWebSocketUpgrade,
+	acceptWebSocketUpgrade
 } from '../../src/lightning/transport/websocket-server';
 import {
 	encodeWsFrame,
@@ -40,7 +51,10 @@ import {
 	DEFAULT_MAX_WS_PAYLOAD_BYTES
 } from '../../src/lightning/transport/websocket-frame';
 import { parsePeerUri } from '../../src/lightning/transport/peer-uri';
-import { NodeWebSocket } from '../../src/lightning/transport/websocket-node-client';
+import {
+	NodeWebSocket,
+	nodeWebSocketVia
+} from '../../src/lightning/transport/websocket-node-client';
 import { IDuplexTransport } from '../../src/lightning/transport/duplex-transport';
 import { Peer } from '../../src/lightning/transport/peer';
 import { PeerManager } from '../../src/lightning/transport/peer-manager';
@@ -133,6 +147,83 @@ function nextClose(socket: net.Socket): Promise<{ code: number }> {
 			}
 		});
 		socket.on('error', reject);
+	});
+}
+
+interface IFrameServer {
+	port: number;
+	/** The request line and headers of each upgrade, as received. */
+	requests: Array<{ url: string; host: string }>;
+	/** Every data frame a client sent. */
+	frames: Array<{ opcode: number; payload: string }>;
+	/** Send a frame to the most recent client. */
+	send(opcode: number, payload: Buffer, fin?: boolean): void;
+	close(): Promise<void>;
+}
+
+/**
+ * A WebSocket server built from the exported upgrade helpers, which records
+ * what it is sent instead of treating it as BOLT 8 bytes. With `tlsOptions`
+ * it serves wss://.
+ */
+async function startFrameServer(
+	tlsOptions?: https.ServerOptions
+): Promise<IFrameServer> {
+	const requests: IFrameServer['requests'] = [];
+	const frames: IFrameServer['frames'] = [];
+	const sockets = new Set<net.Socket>();
+	let latest: net.Socket | undefined;
+	const server = tlsOptions
+		? https.createServer(tlsOptions)
+		: http.createServer();
+	server.on('upgrade', (req: http.IncomingMessage, socket: net.Socket) => {
+		const checked = checkWebSocketUpgrade(req);
+		if ('deny' in checked) return denyWebSocketUpgrade(socket, checked.deny);
+		requests.push({ url: req.url ?? '', host: req.headers.host ?? '' });
+		acceptWebSocketUpgrade(socket, checked.key);
+		latest = socket;
+		sockets.add(socket);
+		const parser = new WsFrameParser({ requireMasked: true });
+		socket.on('data', (d: Buffer) => {
+			for (const f of parser.push(d)) {
+				if (f.opcode === WsOpcode.TEXT || f.opcode === WsOpcode.BINARY)
+					frames.push({ opcode: f.opcode, payload: f.payload.toString() });
+			}
+		});
+		socket.on('error', () => undefined);
+		socket.on('close', () => sockets.delete(socket));
+	});
+	server.on('tlsClientError', () => undefined);
+	await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+	return {
+		port: (server.address() as net.AddressInfo).port,
+		requests,
+		frames,
+		send: (opcode, payload, fin = true): void => {
+			latest?.write(encodeWsFrame({ opcode, payload, fin }));
+		},
+		close: (): Promise<void> => {
+			for (const socket of sockets) socket.destroy();
+			return new Promise((resolve) => server.close(() => resolve()));
+		}
+	};
+}
+
+/** A connected TCP stream to a local port, as an injected dial returns. */
+function dialLocal(port: number): Promise<net.Socket> {
+	return new Promise((resolve, reject) => {
+		const socket: net.Socket = net.createConnection(port, '127.0.0.1', () =>
+			resolve(socket)
+		);
+		socket.once('error', reject);
+	});
+}
+
+/** Resolve once a client WebSocket is open; reject if it fails first. */
+function opened(ws: IWebSocketLike): Promise<void> {
+	return new Promise((resolve, reject) => {
+		ws.onopen = (): void => resolve();
+		ws.onerror = (e): void => reject(e);
 	});
 }
 
@@ -933,6 +1024,434 @@ describe('WebSocket transport (offline)', function () {
 				ws.close();
 			} finally {
 				server.close();
+			}
+		});
+
+		it('sends a string as a text message and bytes as a binary one', async function () {
+			const server = await startFrameServer();
+			try {
+				const ws = new NodeWebSocket(`ws://127.0.0.1:${server.port}`);
+				const received: unknown[] = [];
+				ws.onmessage = (ev): void => {
+					received.push(ev.data);
+				};
+				await opened(ws);
+				ws.send('{"t":"héllo"}');
+				ws.send(Buffer.from('bytes'));
+				await waitFor(() => server.frames.length === 2, 5000, 'frames');
+				expect(server.frames).to.deep.equal([
+					{ opcode: WsOpcode.TEXT, payload: '{"t":"héllo"}' },
+					{ opcode: WsOpcode.BINARY, payload: 'bytes' }
+				]);
+				// And the other way: text arrives as a string, bytes as a buffer.
+				server.send(WsOpcode.TEXT, Buffer.from('{"t":"ready"}'));
+				server.send(WsOpcode.BINARY, Buffer.from('raw'));
+				await waitFor(() => received.length === 2, 5000, 'messages');
+				expect(received[0]).to.equal('{"t":"ready"}');
+				expect(Buffer.from(received[1] as ArrayBuffer).toString()).to.equal(
+					'raw'
+				);
+				ws.close();
+			} finally {
+				await server.close();
+			}
+		});
+
+		it('closes on a message over maxPayloadBytes, whole or in fragments', async function () {
+			const server = await startFrameServer();
+			try {
+				for (const fragmented of [false, true]) {
+					const ws = new NodeWebSocket(`ws://127.0.0.1:${server.port}`, {
+						maxPayloadBytes: 1024
+					});
+					const messages: unknown[] = [];
+					const errors: Error[] = [];
+					let closed = false;
+					ws.onmessage = (ev): void => {
+						messages.push(ev.data);
+					};
+					await opened(ws);
+					ws.onerror = (e): void => {
+						errors.push(e as Error);
+					};
+					ws.onclose = (): void => {
+						closed = true;
+					};
+					// At the cap is delivered.
+					server.send(WsOpcode.BINARY, Buffer.alloc(1024, 1));
+					await waitFor(() => messages.length === 1, 5000, 'message at cap');
+					if (fragmented) {
+						server.send(WsOpcode.BINARY, Buffer.alloc(600, 2), false);
+						server.send(WsOpcode.CONTINUATION, Buffer.alloc(600, 3));
+					} else {
+						server.send(WsOpcode.BINARY, Buffer.alloc(1025, 2));
+					}
+					await waitFor(() => closed, 5000, 'close');
+					expect(messages).to.have.length(1);
+					expect(errors).to.have.length(1);
+				}
+			} finally {
+				await server.close();
+			}
+		});
+
+		it('keeps the 16 MiB default when no cap is given', function () {
+			const ws = new NodeWebSocket('ws://127.0.0.1:1');
+			ws.onerror = (): void => {};
+			expect(
+				(ws as unknown as { maxPayloadBytes: number }).maxPayloadBytes
+			).to.equal(DEFAULT_MAX_WS_PAYLOAD_BYTES);
+			ws.close();
+		});
+
+		describe('with an injected connect', function () {
+			it('hands over the host as written and never dials it itself', async function () {
+				const server = await startFrameServer();
+				const dialed: Array<[string, number]> = [];
+				const direct = sinon.spy(net, 'connect');
+				try {
+					// A name that does not resolve: only the injected dial can
+					// reach the server.
+					const ws = new NodeWebSocket(
+						'ws://relay.example.invalid:4321/v1/host?x=1',
+						{
+							connect: (host, port): Promise<net.Socket> => {
+								dialed.push([host, port]);
+								return dialLocal(server.port);
+							}
+						}
+					);
+					await opened(ws);
+					expect(dialed).to.deep.equal([['relay.example.invalid', 4321]]);
+					expect(direct.called).to.equal(false);
+					expect(server.requests).to.deep.equal([
+						{ url: '/v1/host?x=1', host: 'relay.example.invalid:4321' }
+					]);
+					ws.send('hello');
+					await waitFor(() => server.frames.length === 1, 5000, 'frame');
+					ws.close();
+				} finally {
+					direct.restore();
+					await server.close();
+				}
+			});
+
+			it('accepts a stream returned without a promise', async function () {
+				const server = await startFrameServer();
+				try {
+					const ws = new NodeWebSocket('ws://relay.example.invalid:1/', {
+						connect: (): net.Socket =>
+							net.createConnection(server.port, '127.0.0.1')
+					});
+					await opened(ws);
+					ws.close();
+				} finally {
+					await server.close();
+				}
+			});
+
+			it('fails the connection when the dial is refused', async function () {
+				for (const connect of [
+					(): Promise<net.Socket> => Promise.reject(new Error('no tunnel')),
+					(): net.Socket => {
+						throw new Error('no tunnel');
+					}
+				]) {
+					const ws = new NodeWebSocket('ws://relay.example.invalid:1/', {
+						connect
+					});
+					const outcome = await new Promise<string>((resolve) => {
+						let error = '';
+						ws.onopen = (): void => resolve('open');
+						ws.onerror = (e): void => {
+							error = (e as Error).message;
+						};
+						ws.onclose = (): void => resolve(error);
+					});
+					expect(outcome).to.equal('no tunnel');
+					expect(ws.readyState).to.equal(3);
+				}
+			});
+
+			it('destroys a stream that arrives after close()', async function () {
+				const server = await startFrameServer();
+				try {
+					let release: (socket: net.Socket) => void = () => undefined;
+					const ws = new NodeWebSocket('ws://relay.example.invalid:1/', {
+						connect: (): Promise<net.Socket> =>
+							new Promise<net.Socket>((resolve) => {
+								release = resolve;
+							})
+					});
+					let closes = 0;
+					ws.onclose = (): void => {
+						closes++;
+					};
+					await sleep(10);
+					ws.close();
+					expect(closes).to.equal(1);
+					const socket = await dialLocal(server.port);
+					release(socket);
+					await waitFor(() => socket.destroyed, 5000, 'stream destroyed');
+					expect(server.requests).to.have.length(0);
+					expect(closes).to.equal(1);
+				} finally {
+					await server.close();
+				}
+			});
+
+			describe('wss://', function () {
+				let dir: string;
+				let key: string;
+				let cert: string;
+
+				before(function () {
+					dir = fs.mkdtempSync(path.join(os.tmpdir(), 'beignet-wss-'));
+					const keyPath = path.join(dir, 'key.pem');
+					const certPath = path.join(dir, 'cert.pem');
+					key = crypto.generateKeyPairSync('rsa', {
+						modulusLength: 2048,
+						privateKeyEncoding: { type: 'pkcs8', format: 'pem' },
+						publicKeyEncoding: { type: 'spki', format: 'pem' }
+					}).privateKey;
+					fs.writeFileSync(keyPath, key);
+					execSync(
+						`openssl req -new -x509 -key ${keyPath} -out ${certPath} -days 1 -subj "/CN=localhost" -batch 2>/dev/null`
+					);
+					cert = fs.readFileSync(certPath, 'utf8');
+				});
+
+				after(function () {
+					fs.rmSync(dir, { recursive: true, force: true });
+				});
+
+				const tunnelTo =
+					(port: number, streams: net.Socket[]) =>
+					async (): Promise<net.Socket> => {
+						const socket = await dialLocal(port);
+						streams.push(socket);
+						return socket;
+					};
+
+				it('runs TLS inside the stream, for the host in the URL', async function () {
+					const server = await startFrameServer({ key, cert });
+					const streams: net.Socket[] = [];
+					// The test certificate is its own authority: trust it for
+					// this dial and change nothing else about the call.
+					const original = tls.connect.bind(tls) as (
+						options: tls.ConnectionOptions,
+						listener?: () => void
+					) => tls.TLSSocket;
+					const calls: tls.ConnectionOptions[] = [];
+					const stub = sinon.stub(tls, 'connect').callsFake(((
+						options: tls.ConnectionOptions,
+						listener?: () => void
+					) => {
+						calls.push(options);
+						return original({ ...options, ca: cert }, listener);
+					}) as unknown as typeof tls.connect);
+					try {
+						const ws = new NodeWebSocket(
+							`wss://localhost:${server.port}/v1/host`,
+							{ connect: tunnelTo(server.port, streams) }
+						);
+						await opened(ws);
+						expect(calls).to.have.length(1);
+						expect(calls[0].socket).to.equal(streams[0]);
+						expect(calls[0].servername).to.equal('localhost');
+						// No address of its own to dial, and verification left on.
+						expect(calls[0]).to.not.have.property('host');
+						expect(calls[0]).to.not.have.property('port');
+						expect(calls[0]).to.not.have.property('rejectUnauthorized');
+						ws.send('over tls');
+						await waitFor(() => server.frames.length === 1, 5000, 'frame');
+						expect(server.frames[0].payload).to.equal('over tls');
+						ws.close();
+					} finally {
+						stub.restore();
+						await server.close();
+					}
+				});
+
+				it('refuses a certificate it cannot verify', async function () {
+					const server = await startFrameServer({ key, cert });
+					try {
+						const ws = new NodeWebSocket(
+							`wss://localhost:${server.port}/v1/host`,
+							{ connect: tunnelTo(server.port, []) }
+						);
+						const outcome = await new Promise<string>((resolve) => {
+							ws.onopen = (): void => resolve('open');
+							ws.onerror = (e): void =>
+								resolve((e as NodeJS.ErrnoException).code ?? 'error');
+						});
+						expect(outcome).to.match(/SELF_SIGNED/);
+						expect(server.requests).to.have.length(0);
+					} finally {
+						await server.close();
+					}
+				});
+			});
+		});
+
+		describe('nodeWebSocketVia', function () {
+			it('builds a constructor whose every connection uses the given dial', async function () {
+				const server = await startFrameServer();
+				const dialed: string[] = [];
+				try {
+					const Via = nodeWebSocketVia(
+						(host, port) => {
+							dialed.push(`${host}:${port}`);
+							return net.createConnection(server.port, '127.0.0.1');
+						},
+						{ maxPayloadBytes: 2048 }
+					);
+					const ws = new Via('ws://one.example.invalid:9735/');
+					await opened(ws);
+					expect(ws).to.be.instanceOf(NodeWebSocket);
+					expect(
+						(ws as unknown as { maxPayloadBytes: number }).maxPayloadBytes
+					).to.equal(2048);
+					// The standard second argument cannot replace the dial.
+					const other = new Via('ws://two.example.invalid:9736/', ['x']);
+					await opened(other);
+					expect(dialed).to.deep.equal([
+						'one.example.invalid:9735',
+						'two.example.invalid:9736'
+					]);
+					ws.close();
+					other.close();
+				} finally {
+					await server.close();
+				}
+			});
+
+			it('carries a BOLT 8 transport through connectWebSocket', async function () {
+				const { server, port } = await startWsServer();
+				try {
+					const inbound = new Promise<WebSocketServerTransport>((resolve) => {
+						server.once('connection', resolve);
+					});
+					const dialed: string[] = [];
+					const transport = await connectWebSocket(
+						'ws://node.example.invalid:9735',
+						{
+							webSocketImpl: nodeWebSocketVia((host, p) => {
+								dialed.push(`${host}:${p}`);
+								return net.createConnection(port, '127.0.0.1');
+							})
+						}
+					);
+					const serverSide = await inbound;
+					const got = new Promise<Buffer>((resolve) => {
+						serverSide.on('data', resolve);
+					});
+					transport.write(Buffer.from('act one'));
+					expect((await got).toString()).to.equal('act one');
+					expect(dialed).to.deep.equal(['node.example.invalid:9735']);
+					transport.destroy();
+				} finally {
+					server.close();
+				}
+			});
+		});
+	});
+
+	describe('upgrade helpers', function () {
+		const request = (
+			headers: Record<string, string>,
+			method = 'GET'
+		): { method: string; headers: http.IncomingHttpHeaders } => ({
+			method,
+			headers
+		});
+		const good = {
+			upgrade: 'websocket',
+			'sec-websocket-version': '13',
+			'sec-websocket-key': crypto.randomBytes(16).toString('base64')
+		};
+
+		it('returns the key of a well-formed request', function () {
+			expect(checkWebSocketUpgrade(request(good))).to.deep.equal({
+				key: good['sec-websocket-key']
+			});
+			expect(
+				checkWebSocketUpgrade(request({ ...good, upgrade: 'WebSocket' }))
+			).to.have.property('key');
+		});
+
+		it('names the denial for each malformed request', function () {
+			const denied = (
+				headers: Record<string, string>,
+				method?: string
+			): unknown => {
+				const checked = checkWebSocketUpgrade(request(headers, method));
+				return 'deny' in checked ? checked.deny : 'accepted';
+			};
+			expect(denied(good, 'POST')).to.deep.equal({
+				status: 405,
+				message: 'Method Not Allowed'
+			});
+			expect(denied({ ...good, upgrade: 'h2c' })).to.deep.equal({
+				status: 400,
+				message: 'Bad Request'
+			});
+			expect(denied({ ...good, 'sec-websocket-version': '8' })).to.deep.equal({
+				status: 426,
+				message: 'Upgrade Required',
+				headers: 'Sec-WebSocket-Version: 13\r\n'
+			});
+			expect(
+				denied({ ...good, 'sec-websocket-key': 'c2hvcnQ=' })
+			).to.deep.equal({ status: 400, message: 'Bad Request' });
+			const { 'sec-websocket-key': _key, ...keyless } = good;
+			expect(denied(keyless)).to.deep.equal({
+				status: 400,
+				message: 'Bad Request'
+			});
+		});
+
+		it('writes the denial and the acceptance a client expects', async function () {
+			const server = await startFrameServer();
+			try {
+				const exchange = (lines: string[]): Promise<string> =>
+					new Promise((resolve, reject) => {
+						const socket = net.connect(server.port, '127.0.0.1', () => {
+							socket.write(lines.join('\r\n') + '\r\n\r\n');
+						});
+						let got = '';
+						socket.on('data', (d) => {
+							got += d.toString('latin1');
+							if (got.includes('\r\n\r\n')) {
+								resolve(got);
+								socket.destroy();
+							}
+						});
+						socket.once('error', reject);
+					});
+				const base = [
+					'GET / HTTP/1.1',
+					'Host: 127.0.0.1',
+					'Connection: Upgrade',
+					'Upgrade: websocket',
+					'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ=='
+				];
+				expect(await exchange([...base, 'Sec-WebSocket-Version: 12'])).to.equal(
+					'HTTP/1.1 426 Upgrade Required\r\n' +
+						'Connection: close\r\n' +
+						'Sec-WebSocket-Version: 13\r\n' +
+						'\r\n'
+				);
+				// The RFC 6455 section 1.3 example key and its accept value.
+				expect(await exchange([...base, 'Sec-WebSocket-Version: 13'])).to.equal(
+					'HTTP/1.1 101 Switching Protocols\r\n' +
+						'Upgrade: websocket\r\n' +
+						'Connection: Upgrade\r\n' +
+						'Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n' +
+						'\r\n'
+				);
+			} finally {
+				await server.close();
 			}
 		});
 	});

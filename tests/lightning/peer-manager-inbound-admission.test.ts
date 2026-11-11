@@ -101,6 +101,22 @@ describe('inboundAddressKey', () => {
 		expect(inboundAddressKey('2001:db8::1')).to.equal('2001:db8:0:0::/64');
 	});
 
+	it('keys a source that is not an IP address on the name itself', () => {
+		// A relay names where its connections come from; each relay is one
+		// source, and two relays are two.
+		expect(inboundAddressKey('porch:relay.example')).to.equal(
+			'porch:relay.example'
+		);
+		expect(inboundAddressKey('porch:Relay.Example:8443')).to.equal(
+			'porch:relay.example:8443'
+		);
+		expect(inboundAddressKey('porch:other.example')).to.not.equal(
+			inboundAddressKey('porch:relay.example')
+		);
+		expect(inboundAddressKey('porch:127.0.0.1')).to.equal('porch:127.0.0.1');
+		expect(inboundAddressKey('node.example')).to.equal('node.example');
+	});
+
 	it('leaves private, loopback and unknown sources unlimited', () => {
 		for (const address of [
 			'127.0.0.1',

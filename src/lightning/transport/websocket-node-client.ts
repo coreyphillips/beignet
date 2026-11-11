@@ -18,7 +18,7 @@
 import type net from 'net';
 import { nodeNet, nodeTls } from '../../utils/node-builtins';
 import { randomBytes } from '../crypto/provider';
-import type { IWebSocketLike } from './websocket';
+import type { IWebSocketLike, WebSocketConstructor } from './websocket';
 import { parseWebSocketUrl } from './websocket';
 import { computeWebSocketAccept } from './websocket-server';
 import type { IWsFrame } from './websocket-frame';
@@ -37,12 +37,25 @@ const OPEN = 1;
 const CLOSING = 2;
 const CLOSED = 3;
 
+export interface INodeWebSocketOptions {
+	/**
+	 * Opens the byte stream to the server in place of a direct TCP dial: a
+	 * SOCKS5 tunnel, for example. It is given the URL's host exactly as
+	 * written (a name is not resolved first) and its port. For wss:// the TLS
+	 * session runs inside the stream it returns, verified against the URL's
+	 * host as usual.
+	 */
+	connect?: (host: string, port: number) => net.Socket | Promise<net.Socket>;
+	/** Largest message accepted from the server (default 16 MiB). */
+	maxPayloadBytes?: number;
+}
+
 /**
  * Standard-shaped WebSocket client over net/tls for Node. Construct with
  * `new NodeWebSocket(url)` — the same signature the injectable
  * WebSocketConstructor expects, so it drops into webSocketImpl directly.
- * Binary-only delivery is exercised (binaryType 'arraybuffer'); text frames
- * are surfaced as strings so the transport layer can reject them.
+ * Binary messages arrive as ArrayBuffers (binaryType 'arraybuffer') and text
+ * messages as strings; the BOLT 8 transport layer rejects the latter.
  */
 export class NodeWebSocket implements IWebSocketLike {
 	binaryType = 'arraybuffer';
@@ -56,10 +69,8 @@ export class NodeWebSocket implements IWebSocketLike {
 	onerror: ((ev?: unknown) => void) | null = null;
 
 	private socket: net.Socket | null = null;
-	private parser = new WsFrameParser({
-		maxPayloadBytes: DEFAULT_MAX_WS_PAYLOAD_BYTES,
-		requireMasked: false // server-to-client frames are unmasked
-	});
+	private maxPayloadBytes: number;
+	private parser: WsFrameParser;
 	private handshakeBuffer = Buffer.alloc(0);
 	private handshakeDone = false;
 	private closeSent = false;
@@ -71,7 +82,25 @@ export class NodeWebSocket implements IWebSocketLike {
 	private fragmentText = false;
 	private fragmentInProgress = false;
 
-	constructor(url: string) {
+	/**
+	 * The second argument is the standard constructor's subprotocol list
+	 * (ignored: none is negotiated) or this client's own options.
+	 */
+	constructor(
+		url: string,
+		protocolsOrOptions?: string | string[] | INodeWebSocketOptions
+	) {
+		const options: INodeWebSocketOptions =
+			typeof protocolsOrOptions === 'object' &&
+			!Array.isArray(protocolsOrOptions)
+				? protocolsOrOptions
+				: {};
+		this.maxPayloadBytes =
+			options.maxPayloadBytes ?? DEFAULT_MAX_WS_PAYLOAD_BYTES;
+		this.parser = new WsFrameParser({
+			maxPayloadBytes: this.maxPayloadBytes,
+			requireMasked: false // server-to-client frames are unmasked
+		});
 		const { host, port, secure } = parseWebSocketUrl(url);
 		const key = randomBytes(16).toString('base64');
 		const parsedPath = ((): string => {
@@ -96,52 +125,88 @@ export class NodeWebSocket implements IWebSocketLike {
 			);
 		};
 
-		const socket = secure
-			? nodeTls().connect({ host, port, servername: host }, onConnect)
-			: nodeNet().connect({ host, port }, onConnect);
-		this.socket = socket;
-		socket.setNoDelay(true);
+		const attach = (socket: net.Socket): void => {
+			this.socket = socket;
+			socket.setNoDelay(true);
+			socket.on('data', (chunk: Buffer) => {
+				if (!this.handshakeDone) {
+					this.handleHandshakeData(chunk, key);
+				} else {
+					this.handleFrames(chunk);
+				}
+			});
+			socket.on('error', (err: Error) => {
+				this.failConnection(err);
+			});
+			socket.on('close', () => {
+				if (this.readyState === CLOSED) return;
+				const wasOpen = this.readyState === OPEN;
+				this.readyState = CLOSED;
+				this.fireClose(
+					this.closeReceived?.code ??
+						(wasOpen ? WsCloseCode.GOING_AWAY : undefined),
+					this.closeReceived?.reason ?? '',
+					this.closeReceived !== null
+				);
+			});
+		};
 
-		socket.on('data', (chunk: Buffer) => {
-			if (!this.handshakeDone) {
-				this.handleHandshakeData(chunk, key);
-			} else {
-				this.handleFrames(chunk);
-			}
-		});
-		socket.on('error', (err: Error) => {
-			this.failConnection(err);
-		});
-		socket.on('close', () => {
-			if (this.readyState === CLOSED) return;
-			const wasOpen = this.readyState === OPEN;
-			this.readyState = CLOSED;
-			this.fireClose(
-				this.closeReceived?.code ??
-					(wasOpen ? WsCloseCode.GOING_AWAY : undefined),
-				this.closeReceived?.reason ?? '',
-				this.closeReceived !== null
+		const connect = options.connect;
+		if (!connect) {
+			attach(
+				secure
+					? nodeTls().connect({ host, port, servername: host }, onConnect)
+					: nodeNet().connect({ host, port }, onConnect)
 			);
-		});
+			return;
+		}
+		// The stream arrives later, and already connected.
+		Promise.resolve()
+			.then(() => connect(host, port))
+			.then(
+				(stream) => {
+					if (this.readyState === CLOSED) {
+						// close() ran while the stream was still being opened.
+						stream.destroy();
+						return;
+					}
+					if (secure) {
+						stream.on('error', (err: Error) => this.failConnection(err));
+						attach(
+							nodeTls().connect({ socket: stream, servername: host }, onConnect)
+						);
+					} else {
+						attach(stream);
+						onConnect();
+					}
+				},
+				(err) =>
+					this.failConnection(
+						err instanceof Error ? err : new Error(String(err))
+					)
+			);
 	}
 
 	get bufferedAmount(): number {
 		return this.socket ? this.socket.writableLength : 0;
 	}
 
-	send(data: Uint8Array): void {
+	send(data: Uint8Array | string): void {
 		if (this.readyState === CONNECTING) {
 			throw new Error('NodeWebSocket: cannot send while CONNECTING');
 		}
 		if (this.readyState !== OPEN || !this.socket) {
 			return; // CLOSING/CLOSED: standard behavior is to discard
 		}
-		const payload = Buffer.isBuffer(data)
+		const text = typeof data === 'string';
+		const payload = text
+			? Buffer.from(data, 'utf8')
+			: Buffer.isBuffer(data)
 			? data
 			: Buffer.from(data.buffer, data.byteOffset, data.byteLength);
 		this.socket.write(
 			encodeWsFrame({
-				opcode: WsOpcode.BINARY,
+				opcode: text ? WsOpcode.TEXT : WsOpcode.BINARY,
 				payload,
 				maskKey: randomBytes(4) // client frames MUST be masked
 			})
@@ -307,7 +372,7 @@ export class NodeWebSocket implements IWebSocketLike {
 
 	private pushFragment(payload: Buffer): boolean {
 		this.fragmentBytes += payload.length;
-		if (this.fragmentBytes > DEFAULT_MAX_WS_PAYLOAD_BYTES) {
+		if (this.fragmentBytes > this.maxPayloadBytes) {
 			this.sendCloseFrame(WsCloseCode.MESSAGE_TOO_BIG, '');
 			this.failConnection(
 				new Error('NodeWebSocket: fragmented message exceeds cap')
@@ -372,4 +437,20 @@ export class NodeWebSocket implements IWebSocketLike {
 		this.readyState = CLOSED;
 		if (this.onclose) this.onclose({ code, reason, wasClean });
 	}
+}
+
+/**
+ * A WebSocket constructor whose connections are opened by `connect` (see
+ * INodeWebSocketOptions.connect), for anywhere a WebSocketConstructor is
+ * injected: `webSocketImpl: nodeWebSocketVia(openSocksTunnel)`.
+ */
+export function nodeWebSocketVia(
+	connect: NonNullable<INodeWebSocketOptions['connect']>,
+	options: Omit<INodeWebSocketOptions, 'connect'> = {}
+): WebSocketConstructor {
+	return class extends NodeWebSocket {
+		constructor(url: string) {
+			super(url, { ...options, connect });
+		}
+	};
 }

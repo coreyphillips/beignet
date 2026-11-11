@@ -114,13 +114,15 @@ export function isPrivateOrLoopbackHost(host: string): boolean {
  * loopback sources are not: a Tor onion service, a reverse proxy or a
  * container gateway hands every peer it carries to us from one such address.
  * IPv6 keys on the /64, since a single host is routinely given a whole /64.
+ * A source that is not an IP address at all (a transport that names where
+ * its connections come from, a relay for instance) is its own key, verbatim.
  */
 export function inboundAddressKey(address: string | undefined): string | null {
 	if (!address || isPrivateOrLoopbackHost(address)) return null;
 	const a = address.toLowerCase();
 	const mapped = a.match(/^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/);
 	if (mapped) return mapped[1];
-	if (!a.includes(':')) return a;
+	if (!a.includes(':') || !/^[0-9a-f:.]+(%.*)?$/.test(a)) return a;
 	const [head, tail] = a.split('::');
 	const front = head ? head.split(':') : [];
 	const back = tail ? tail.split(':') : [];
