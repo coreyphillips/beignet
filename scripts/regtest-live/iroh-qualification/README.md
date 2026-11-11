@@ -37,7 +37,87 @@ Wallet data and the disposable seeds stay in the ignored data directories.
 Do not commit those directories. Use a fresh pair of data directories for a
 new qualification. Setup refuses a wallet that already has channels.
 
-Afterward:
+## Relay-only, on the engine from this checkout
+
+`compose.local.yaml` runs the same two endpoints on the engine packed from the
+working tree, and `QUALIFY_RELAY_ONLY=true` starts the primary with
+`irohRelayOnly`. The phone stays an ordinary Iroh endpoint, as anyone holding
+the primary's link would be.
+
+From the repository root, then this directory:
+
+```sh
+npm run build
+npm pack --pack-destination scripts/regtest-live/iroh-qualification
+cd scripts/regtest-live/iroh-qualification
+mv beignet-*.tgz beignet-local.tgz
+mkdir -m 700 primary-data phone-data
+QUALIFY_RELAY_ONLY=true docker compose -f compose.local.yaml up --build -d
+node setup.cjs
+node balance.cjs
+node qualify.cjs relay-only baseline
+node qualify.cjs relay-only outages
+node qualify.cjs relay-only restart
+node final.cjs
+```
+
+In `relay-only` mode the firewall is left open, so a direct path over the
+Docker bridge would be taken if the primary offered one. The mode adds a leak
+check, run after the baseline, around every outage, after every restart and
+after the cuts:
+
+- Path: each endpoint samples the path of its Iroh peers every 100 ms from
+  the moment its process starts. No sample on either end may read `direct`.
+- Addresses: the phone's own Iroh stack is asked what it holds for the
+  primary's endpoint. It may hold no address other than loopback.
+- Packets: the phone's firewall counts packets to and from the primary
+  container's address, of any protocol, and the datagrams among them. Every
+  count must be zero.
+
+The `restart` phase restarts the primary process three times and redials
+nothing by hand, so the two ends set up a connection from nothing while the
+counters run. `QUALIFY_RESTART_ROLE=phone` restarts the phone instead, which is
+what opening the app is. The phase is not part of `all`. It works in the other
+modes too, as a comparison.
+
+The strict checks need a phone that never met the primary with relay-only off:
+start from fresh containers, or restart the phone container after any control
+run. The results of 2026-11-11 are in
+[docs/IROH-RELAY-ONLY-QUALIFICATION-2026-11-11.md](../../../docs/IROH-RELAY-ONLY-QUALIFICATION-2026-11-11.md).
+
+For a control, start the same image without `QUALIFY_RELAY_ONLY` and run
+`node qualify.cjs direct baseline`: every sample reads `direct` and the packet
+counters in `baseline-passed` are far from zero.
+
+### A phone that already knew the address
+
+Relay-only cannot make a peer forget. A phone that connected while relay-only
+was off holds the primary's addresses until its own process restarts, and it
+keeps probing them. Switching the primary to relay-only under a running phone
+reproduces that:
+
+```sh
+docker compose -f compose.local.yaml up -d            # relay-only off
+node qualify.cjs direct baseline                       # the phone learns the address
+QUALIFY_RELAY_ONLY=true docker compose -f compose.local.yaml up -d
+QUALIFY_PHONE_KNOWS_PRIMARY=true node qualify.cjs relay-only restart
+```
+
+With `QUALIFY_PHONE_KNOWS_PRIMARY=true` the check is what a relay-only
+endpoint owes such a peer: the phone may hold and probe the addresses it had
+when the phase began and no others, no path sample reads `direct` after the
+phase began, and the primary sends the phone no datagram from its own address.
+Without the variable a phone that holds any address fails the phase at its
+start.
+
+The primary serves no link for its first twelve seconds (see the relay-only
+section of the CLI README); setup and the restart phase wait for it. A Docker
+bridge has no router that grants port mappings, so `loopback-pin` holds here.
+That part of the design is not exercised by this fixture.
+
+## Teardown
+
+Either compose file:
 
 ```sh
 docker compose down

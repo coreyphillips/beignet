@@ -53,7 +53,8 @@ The option and event tables in the two READMEs above are generated from the code
 | Document | Contents |
 |----------|----------|
 | [IROH-QUALIFICATION-2026-10-03.md](IROH-QUALIFICATION-2026-10-03.md) | Iroh transport qualification on the released engine, with its [raw results](IROH-QUALIFICATION-2026-10-03.json) |
-| [scripts/regtest-live/iroh-qualification/README.md](../scripts/regtest-live/iroh-qualification/README.md) | How to rerun the Iroh qualification |
+| [IROH-RELAY-ONLY-QUALIFICATION-2026-11-11.md](IROH-RELAY-ONLY-QUALIFICATION-2026-11-11.md) | Relay-only Iroh qualification: the leak checks, payment and recovery times next to a direct path, and what a peer that already knew the address keeps, with its [raw results](IROH-RELAY-ONLY-QUALIFICATION-2026-11-11.json) |
+| [scripts/regtest-live/iroh-qualification/README.md](../scripts/regtest-live/iroh-qualification/README.md) | How to rerun the Iroh qualifications |
 | [tests/lightning/conformance/vectors/SOURCE.md](../tests/lightning/conformance/vectors/SOURCE.md) | Provenance of the vendored BOLT test vectors |
 | [specs/SOURCE.md](specs/SOURCE.md) | Provenance of the FFOR specifications copied into `docs/specs` |
 | [ROADMAP.md](ROADMAP.md) | The feature roadmap from the July 2026 review. Historical: last updated 2026-07-24; open work is tracked in GitHub issues |

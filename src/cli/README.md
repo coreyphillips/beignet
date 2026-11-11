@@ -2391,8 +2391,13 @@ What that costs and what it does not cover:
   identities, timing and traffic volume. With the default relays that is n0. Set
   `irohRelays` to a relay you run to keep it to yourself.
 - Every packet takes the relay. The qualification run in
-  `docs/IROH-QUALIFICATION-2026-10-03.md` measured a median payment of 306 ms on
-  the relay path against 177 to 236 ms on a direct one.
+  `docs/IROH-RELAY-ONLY-QUALIFICATION-2026-11-11.md` measured a median payment of
+  171 to 192 ms relay-only against 92 to 108 ms on a direct path, and a phone
+  with a usable channel 1.3 s after its engine restarted against 0.7 s.
+- It does not take the address back. A peer that connected while relay-only was
+  off keeps the addresses it learned until its own process restarts, and may go
+  on probing them; the node no longer answers there. Switch relay-only on before
+  the link is first handed out.
 - It needs a relay: an empty `irohRelays` with `irohRelayOnly` refuses startup.
   `/info` publishes `irohUri` once the node has a home relay.
 - It covers Iroh. Whoever is given an address to dial sees where the dial comes
@@ -2416,7 +2421,9 @@ What that costs and what it does not cover:
 Iroh adds the mapped public address to the endpoint's own address list. The node
 watches that list for as long as the endpoint lives, and for the first twelve
 seconds the endpoint stays silent: it accepts no connection, makes none, and
-`/info` carries no `irohUri`. Startup is not held up by the watch. When a
+`/info` carries no `irohUri`. Startup is not held up by the watch, but a peer
+waits for it: the same qualification measured 17 to 20 s from a node restart to
+a usable channel, against about 2 s with relay-only off. When a
 routable address appears the node closes the endpoint and does not bind another:
 `/info` carries `irohListenError` with `errno: "IROH_RELAY_ONLY_VIOLATED"`, and
 `node:error` is raised with that code (`LISTEN_FAILED` instead when the address

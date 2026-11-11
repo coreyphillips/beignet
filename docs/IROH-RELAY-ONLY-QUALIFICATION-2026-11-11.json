@@ -1,0 +1,1036 @@
+{
+	"date": "2026-11-11",
+	"engine": "beignet 0.38.4 plus irohRelayOnly (commit 7778036a), packed from the working tree",
+	"runtime": {
+		"node": "22.23.4",
+		"iroh": "@number0/iroh 1.1.0",
+		"platform": "linux",
+		"architecture": "arm64"
+	},
+	"relay": "use1-1.relay.n0.iroh.link",
+	"relayOnly": {
+		"baseline": {
+			"leakChecks": [
+				{
+					"at": "2026-11-11T17:50:20.973Z",
+					"label": "baseline",
+					"relayOnlyMode": "loopback-pin",
+					"samples": {
+						"primary": {
+							"direct": 0,
+							"relay": 283,
+							"unknown": 0
+						},
+						"phone": {
+							"direct": 0,
+							"relay": 285,
+							"unknown": 0
+						}
+					},
+					"learnedAddresses": 0,
+					"routableAddresses": 0,
+					"pairPackets": {
+						"out": 0,
+						"in": 0
+					},
+					"violations": 0
+				}
+			],
+			"passed": true,
+			"result": [
+				{
+					"at": "2026-11-11T17:50:21.134Z",
+					"mode": "relay-only",
+					"payments": 20,
+					"engineMs": {
+						"p50": 171,
+						"p90": 179,
+						"max": 180
+					},
+					"pairPackets": {
+						"out": 0,
+						"in": 0
+					}
+				}
+			]
+		},
+		"outages": {
+			"leakChecks": [
+				{
+					"at": "2026-11-11T17:50:42.664Z",
+					"label": "before the 30 s outage",
+					"relayOnlyMode": "loopback-pin",
+					"samples": {
+						"primary": {
+							"direct": 0,
+							"relay": 496,
+							"unknown": 0
+						},
+						"phone": {
+							"direct": 0,
+							"relay": 498,
+							"unknown": 0
+						}
+					},
+					"learnedAddresses": 0,
+					"routableAddresses": 0,
+					"pairPackets": {
+						"out": 0,
+						"in": 0
+					},
+					"violations": 0
+				},
+				{
+					"at": "2026-11-11T17:51:13.319Z",
+					"label": "during the 30 s outage",
+					"relayOnlyMode": "loopback-pin",
+					"samples": {
+						"primary": {
+							"direct": 0,
+							"relay": 797,
+							"unknown": 0
+						},
+						"phone": {
+							"direct": 0,
+							"relay": 799,
+							"unknown": 0
+						}
+					},
+					"learnedAddresses": 0,
+					"routableAddresses": 0,
+					"pairPackets": {
+						"out": 0,
+						"in": 0
+					},
+					"violations": 0
+				},
+				{
+					"at": "2026-11-11T17:51:18.169Z",
+					"label": "after the 30 s outage",
+					"relayOnlyMode": "loopback-pin",
+					"samples": {
+						"primary": {
+							"direct": 0,
+							"relay": 845,
+							"unknown": 0
+						},
+						"phone": {
+							"direct": 0,
+							"relay": 846,
+							"unknown": 0
+						}
+					},
+					"learnedAddresses": 0,
+					"routableAddresses": 0,
+					"pairPackets": {
+						"out": 0,
+						"in": 0
+					},
+					"violations": 0
+				},
+				{
+					"at": "2026-11-11T17:52:19.557Z",
+					"label": "before the 120 s outage",
+					"relayOnlyMode": "loopback-pin",
+					"samples": {
+						"primary": {
+							"direct": 0,
+							"relay": 1446,
+							"unknown": 0
+						},
+						"phone": {
+							"direct": 0,
+							"relay": 1449,
+							"unknown": 0
+						}
+					},
+					"learnedAddresses": 0,
+					"routableAddresses": 0,
+					"pairPackets": {
+						"out": 0,
+						"in": 0
+					},
+					"violations": 0
+				},
+				{
+					"at": "2026-11-11T17:54:20.242Z",
+					"label": "during the 120 s outage",
+					"relayOnlyMode": "loopback-pin",
+					"samples": {
+						"primary": {
+							"direct": 0,
+							"relay": 1766,
+							"unknown": 0
+						},
+						"phone": {
+							"direct": 0,
+							"relay": 1768,
+							"unknown": 0
+						}
+					},
+					"learnedAddresses": 0,
+					"routableAddresses": 0,
+					"pairPackets": {
+						"out": 0,
+						"in": 0
+					},
+					"violations": 0
+				},
+				{
+					"at": "2026-11-11T17:54:46.745Z",
+					"label": "after the 120 s outage",
+					"relayOnlyMode": "loopback-pin",
+					"samples": {
+						"primary": {
+							"direct": 0,
+							"relay": 1793,
+							"unknown": 0
+						},
+						"phone": {
+							"direct": 0,
+							"relay": 1795,
+							"unknown": 0
+						}
+					},
+					"learnedAddresses": 0,
+					"routableAddresses": 0,
+					"pairPackets": {
+						"out": 0,
+						"in": 0
+					},
+					"violations": 0
+				},
+				{
+					"at": "2026-11-11T17:55:48.099Z",
+					"label": "before the 300 s outage",
+					"relayOnlyMode": "loopback-pin",
+					"samples": {
+						"primary": {
+							"direct": 0,
+							"relay": 2395,
+							"unknown": 0
+						},
+						"phone": {
+							"direct": 0,
+							"relay": 2397,
+							"unknown": 0
+						}
+					},
+					"learnedAddresses": 0,
+					"routableAddresses": 0,
+					"pairPackets": {
+						"out": 0,
+						"in": 0
+					},
+					"violations": 0
+				},
+				{
+					"at": "2026-11-11T18:00:48.889Z",
+					"label": "during the 300 s outage",
+					"relayOnlyMode": "loopback-pin",
+					"samples": {
+						"primary": {
+							"direct": 0,
+							"relay": 2700,
+							"unknown": 0
+						},
+						"phone": {
+							"direct": 0,
+							"relay": 2701,
+							"unknown": 0
+						}
+					},
+					"learnedAddresses": 0,
+					"routableAddresses": 0,
+					"pairPackets": {
+						"out": 0,
+						"in": 0
+					},
+					"violations": 0
+				},
+				{
+					"at": "2026-11-11T18:01:56.082Z",
+					"label": "after the 300 s outage",
+					"relayOnlyMode": "loopback-pin",
+					"samples": {
+						"primary": {
+							"direct": 0,
+							"relay": 2736,
+							"unknown": 0
+						},
+						"phone": {
+							"direct": 0,
+							"relay": 2737,
+							"unknown": 0
+						}
+					},
+					"learnedAddresses": 0,
+					"routableAddresses": 0,
+					"pairPackets": {
+						"out": 0,
+						"in": 0
+					},
+					"violations": 0
+				}
+			],
+			"passed": true,
+			"outages": [
+				{
+					"at": "2026-11-11T17:51:18.170Z",
+					"mode": "relay-only",
+					"seconds": 30,
+					"blockedMs": 30646,
+					"usableMs": 60,
+					"firstPaymentMs": 3340
+				},
+				{
+					"at": "2026-11-11T17:54:46.745Z",
+					"mode": "relay-only",
+					"seconds": 120,
+					"blockedMs": 120705,
+					"usableMs": 24012,
+					"firstPaymentMs": 24909
+				},
+				{
+					"at": "2026-11-11T18:01:56.083Z",
+					"mode": "relay-only",
+					"seconds": 300,
+					"blockedMs": 300708,
+					"usableMs": 63658,
+					"firstPaymentMs": 64900
+				}
+			]
+		},
+		"baselineSecondRun": {
+			"leakChecks": [
+				{
+					"at": "2026-11-11T18:16:21.312Z",
+					"label": "baseline",
+					"relayOnlyMode": "loopback-pin",
+					"phoneKnowsPrimary": false,
+					"samples": {
+						"primary": {
+							"direct": 0,
+							"relay": 659,
+							"unknown": 0
+						},
+						"phone": {
+							"direct": 0,
+							"relay": 695,
+							"unknown": 0
+						}
+					},
+					"samplesSincePhaseStart": {
+						"primary": {
+							"direct": 0,
+							"relay": 212,
+							"unknown": 0
+						},
+						"phone": {
+							"direct": 0,
+							"relay": 214,
+							"unknown": 0
+						}
+					},
+					"learnedAddresses": 0,
+					"routableAddresses": 0,
+					"addressesLearnedSincePhaseStart": 0,
+					"pairPackets": {
+						"out": 0,
+						"in": 0,
+						"udpOut": 0,
+						"udpIn": 0
+					},
+					"violations": 0
+				}
+			],
+			"passed": true,
+			"result": [
+				{
+					"at": "2026-11-11T18:16:21.488Z",
+					"mode": "relay-only",
+					"payments": 20,
+					"engineMs": {
+						"p50": 192,
+						"p90": 341,
+						"max": 409
+					},
+					"pairPackets": {
+						"out": 0,
+						"in": 0,
+						"udpOut": 0,
+						"udpIn": 0
+					}
+				}
+			]
+		},
+		"restart": {
+			"leakChecks": [
+				{
+					"at": "2026-11-11T18:16:54.847Z",
+					"label": "after restart 1",
+					"relayOnlyMode": "loopback-pin",
+					"phoneKnowsPrimary": false,
+					"samples": {
+						"primary": {
+							"direct": 0,
+							"relay": 26,
+							"unknown": 0
+						},
+						"phone": {
+							"direct": 0,
+							"relay": 842,
+							"unknown": 0
+						}
+					},
+					"samplesSincePhaseStart": {
+						"primary": {
+							"direct": 0,
+							"relay": 26,
+							"unknown": 0
+						},
+						"phone": {
+							"direct": 0,
+							"relay": 33,
+							"unknown": 0
+						}
+					},
+					"learnedAddresses": 0,
+					"routableAddresses": 0,
+					"addressesLearnedSincePhaseStart": 0,
+					"pairPackets": {
+						"out": 0,
+						"in": 0,
+						"udpOut": 0,
+						"udpIn": 0
+					},
+					"violations": 0
+				},
+				{
+					"at": "2026-11-11T18:18:16.259Z",
+					"label": "after restart 2",
+					"relayOnlyMode": "loopback-pin",
+					"phoneKnowsPrimary": false,
+					"samples": {
+						"primary": {
+							"direct": 0,
+							"relay": 27,
+							"unknown": 0
+						},
+						"phone": {
+							"direct": 0,
+							"relay": 1476,
+							"unknown": 0
+						}
+					},
+					"samplesSincePhaseStart": {
+						"primary": {
+							"direct": 0,
+							"relay": 27,
+							"unknown": 0
+						},
+						"phone": {
+							"direct": 0,
+							"relay": 667,
+							"unknown": 0
+						}
+					},
+					"learnedAddresses": 0,
+					"routableAddresses": 0,
+					"addressesLearnedSincePhaseStart": 0,
+					"pairPackets": {
+						"out": 0,
+						"in": 0,
+						"udpOut": 0,
+						"udpIn": 0
+					},
+					"violations": 0
+				},
+				{
+					"at": "2026-11-11T18:19:40.424Z",
+					"label": "after restart 3",
+					"relayOnlyMode": "loopback-pin",
+					"phoneKnowsPrimary": false,
+					"samples": {
+						"primary": {
+							"direct": 0,
+							"relay": 27,
+							"unknown": 0
+						},
+						"phone": {
+							"direct": 0,
+							"relay": 2107,
+							"unknown": 0
+						}
+					},
+					"samplesSincePhaseStart": {
+						"primary": {
+							"direct": 0,
+							"relay": 27,
+							"unknown": 0
+						},
+						"phone": {
+							"direct": 0,
+							"relay": 1298,
+							"unknown": 0
+						}
+					},
+					"learnedAddresses": 0,
+					"routableAddresses": 0,
+					"addressesLearnedSincePhaseStart": 0,
+					"pairPackets": {
+						"out": 0,
+						"in": 0,
+						"udpOut": 0,
+						"udpIn": 0
+					},
+					"violations": 0
+				}
+			],
+			"passed": true,
+			"restarts": [
+				{
+					"at": "2026-11-11T18:16:54.936Z",
+					"mode": "relay-only",
+					"i": 0,
+					"restartMs": 793,
+					"usableMs": 18441,
+					"firstPaymentMs": 19371,
+					"pairPackets": {
+						"out": 0,
+						"in": 0,
+						"udpOut": 0,
+						"udpIn": 0
+					}
+				},
+				{
+					"at": "2026-11-11T18:18:16.327Z",
+					"mode": "relay-only",
+					"i": 1,
+					"restartMs": 694,
+					"usableMs": 16934,
+					"firstPaymentMs": 17819,
+					"pairPackets": {
+						"out": 0,
+						"in": 0,
+						"udpOut": 0,
+						"udpIn": 0
+					}
+				},
+				{
+					"at": "2026-11-11T18:19:40.495Z",
+					"mode": "relay-only",
+					"i": 2,
+					"restartMs": 669,
+					"usableMs": 19815,
+					"firstPaymentMs": 20724,
+					"pairPackets": {
+						"out": 0,
+						"in": 0,
+						"udpOut": 0,
+						"udpIn": 0
+					}
+				}
+			]
+		},
+		"restartPhoneKnewAddress": {
+			"leakChecks": [
+				{
+					"at": "2026-11-11T18:21:41.120Z",
+					"label": "after restart 1",
+					"relayOnlyMode": "loopback-pin",
+					"phoneKnowsPrimary": true,
+					"samples": {
+						"primary": {
+							"direct": 0,
+							"relay": 26,
+							"unknown": 0
+						},
+						"phone": {
+							"direct": 177,
+							"relay": 2760,
+							"unknown": 0
+						}
+					},
+					"samplesSincePhaseStart": {
+						"primary": {
+							"direct": 0,
+							"relay": 24,
+							"unknown": 0
+						},
+						"phone": {
+							"direct": 0,
+							"relay": 41,
+							"unknown": 0
+						}
+					},
+					"learnedAddresses": 1,
+					"routableAddresses": 1,
+					"addressesLearnedSincePhaseStart": 0,
+					"pairPackets": {
+						"out": 1,
+						"in": 1,
+						"udpOut": 1,
+						"udpIn": 0
+					},
+					"violations": 0
+				},
+				{
+					"at": "2026-11-11T18:22:59.901Z",
+					"label": "after restart 2",
+					"relayOnlyMode": "loopback-pin",
+					"phoneKnowsPrimary": true,
+					"samples": {
+						"primary": {
+							"direct": 0,
+							"relay": 27,
+							"unknown": 0
+						},
+						"phone": {
+							"direct": 177,
+							"relay": 3397,
+							"unknown": 0
+						}
+					},
+					"samplesSincePhaseStart": {
+						"primary": {
+							"direct": 0,
+							"relay": 25,
+							"unknown": 0
+						},
+						"phone": {
+							"direct": 0,
+							"relay": 678,
+							"unknown": 0
+						}
+					},
+					"learnedAddresses": 0,
+					"routableAddresses": 0,
+					"addressesLearnedSincePhaseStart": 0,
+					"pairPackets": {
+						"out": 8,
+						"in": 8,
+						"udpOut": 8,
+						"udpIn": 0
+					},
+					"violations": 0
+				},
+				{
+					"at": "2026-11-11T18:24:24.912Z",
+					"label": "after restart 3",
+					"relayOnlyMode": "loopback-pin",
+					"phoneKnowsPrimary": true,
+					"samples": {
+						"primary": {
+							"direct": 0,
+							"relay": 27,
+							"unknown": 0
+						},
+						"phone": {
+							"direct": 177,
+							"relay": 4033,
+							"unknown": 0
+						}
+					},
+					"samplesSincePhaseStart": {
+						"primary": {
+							"direct": 0,
+							"relay": 25,
+							"unknown": 0
+						},
+						"phone": {
+							"direct": 0,
+							"relay": 1314,
+							"unknown": 0
+						}
+					},
+					"learnedAddresses": 0,
+					"routableAddresses": 0,
+					"addressesLearnedSincePhaseStart": 0,
+					"pairPackets": {
+						"out": 0,
+						"in": 0,
+						"udpOut": 0,
+						"udpIn": 0
+					},
+					"violations": 0
+				}
+			],
+			"passed": true,
+			"restarts": [
+				{
+					"at": "2026-11-11T18:21:41.207Z",
+					"mode": "relay-only",
+					"i": 0,
+					"restartMs": 866,
+					"usableMs": 15824,
+					"firstPaymentMs": 16790,
+					"pairPackets": {
+						"out": 1,
+						"in": 1,
+						"udpOut": 1,
+						"udpIn": 0
+					}
+				},
+				{
+					"at": "2026-11-11T18:22:59.992Z",
+					"mode": "relay-only",
+					"i": 1,
+					"restartMs": 782,
+					"usableMs": 13958,
+					"firstPaymentMs": 14963,
+					"pairPackets": {
+						"out": 8,
+						"in": 8,
+						"udpOut": 8,
+						"udpIn": 0
+					}
+				},
+				{
+					"at": "2026-11-11T18:24:25.009Z",
+					"mode": "relay-only",
+					"i": 2,
+					"restartMs": 768,
+					"usableMs": 20240,
+					"firstPaymentMs": 21174,
+					"pairPackets": {
+						"out": 0,
+						"in": 0,
+						"udpOut": 0,
+						"udpIn": 0
+					}
+				}
+			]
+		},
+		"phoneRestart": {
+			"leakChecks": [
+				{
+					"at": "2026-11-11T18:25:40.668Z",
+					"label": "after phone restart 1",
+					"relayOnlyMode": "loopback-pin",
+					"phoneKnowsPrimary": false,
+					"samples": {
+						"primary": {
+							"direct": 0,
+							"relay": 756,
+							"unknown": 0
+						},
+						"phone": {
+							"direct": 0,
+							"relay": 25,
+							"unknown": 0
+						}
+					},
+					"samplesSincePhaseStart": {
+						"primary": {
+							"direct": 0,
+							"relay": 33,
+							"unknown": 0
+						},
+						"phone": {
+							"direct": 0,
+							"relay": 25,
+							"unknown": 0
+						}
+					},
+					"learnedAddresses": 0,
+					"routableAddresses": 0,
+					"addressesLearnedSincePhaseStart": 0,
+					"pairPackets": {
+						"out": 0,
+						"in": 0,
+						"udpOut": 0,
+						"udpIn": 0
+					},
+					"violations": 0
+				},
+				{
+					"at": "2026-11-11T18:26:46.694Z",
+					"label": "after phone restart 2",
+					"relayOnlyMode": "loopback-pin",
+					"phoneKnowsPrimary": false,
+					"samples": {
+						"primary": {
+							"direct": 0,
+							"relay": 1390,
+							"unknown": 0
+						},
+						"phone": {
+							"direct": 0,
+							"relay": 26,
+							"unknown": 0
+						}
+					},
+					"samplesSincePhaseStart": {
+						"primary": {
+							"direct": 0,
+							"relay": 667,
+							"unknown": 0
+						},
+						"phone": {
+							"direct": 0,
+							"relay": 26,
+							"unknown": 0
+						}
+					},
+					"learnedAddresses": 0,
+					"routableAddresses": 0,
+					"addressesLearnedSincePhaseStart": 0,
+					"pairPackets": {
+						"out": 0,
+						"in": 0,
+						"udpOut": 0,
+						"udpIn": 0
+					},
+					"violations": 0
+				},
+				{
+					"at": "2026-11-11T18:27:52.709Z",
+					"label": "after phone restart 3",
+					"relayOnlyMode": "loopback-pin",
+					"phoneKnowsPrimary": false,
+					"samples": {
+						"primary": {
+							"direct": 0,
+							"relay": 2024,
+							"unknown": 0
+						},
+						"phone": {
+							"direct": 0,
+							"relay": 25,
+							"unknown": 0
+						}
+					},
+					"samplesSincePhaseStart": {
+						"primary": {
+							"direct": 0,
+							"relay": 1301,
+							"unknown": 0
+						},
+						"phone": {
+							"direct": 0,
+							"relay": 25,
+							"unknown": 0
+						}
+					},
+					"learnedAddresses": 0,
+					"routableAddresses": 0,
+					"addressesLearnedSincePhaseStart": 0,
+					"pairPackets": {
+						"out": 0,
+						"in": 0,
+						"udpOut": 0,
+						"udpIn": 0
+					},
+					"violations": 0
+				}
+			],
+			"passed": true,
+			"restarts": [
+				{
+					"at": "2026-11-11T18:25:40.757Z",
+					"mode": "relay-only",
+					"role": "phone",
+					"i": 0,
+					"restartMs": 852,
+					"usableMs": 1247,
+					"firstPaymentMs": 2238,
+					"pairPackets": {
+						"out": 0,
+						"in": 0,
+						"udpOut": 0,
+						"udpIn": 0
+					}
+				},
+				{
+					"at": "2026-11-11T18:26:46.791Z",
+					"mode": "relay-only",
+					"role": "phone",
+					"i": 1,
+					"restartMs": 778,
+					"usableMs": 1293,
+					"firstPaymentMs": 2238,
+					"pairPackets": {
+						"out": 0,
+						"in": 0,
+						"udpOut": 0,
+						"udpIn": 0
+					}
+				},
+				{
+					"at": "2026-11-11T18:27:52.800Z",
+					"mode": "relay-only",
+					"role": "phone",
+					"i": 2,
+					"restartMs": 832,
+					"usableMs": 1221,
+					"firstPaymentMs": 2256,
+					"pairPackets": {
+						"out": 0,
+						"in": 0,
+						"udpOut": 0,
+						"udpIn": 0
+					}
+				}
+			]
+		}
+	},
+	"control": {
+		"directBaseline": {
+			"passed": true,
+			"result": [
+				{
+					"at": "2026-11-11T18:06:42.928Z",
+					"mode": "direct",
+					"payments": 20,
+					"engineMs": {
+						"p50": 92,
+						"p90": 104,
+						"max": 114
+					},
+					"pairPackets": {
+						"out": 220,
+						"in": 224
+					}
+				}
+			]
+		},
+		"relayBaseline": {
+			"passed": true,
+			"result": [
+				{
+					"at": "2026-11-11T18:07:45.851Z",
+					"mode": "relay",
+					"payments": 20,
+					"engineMs": {
+						"p50": 170,
+						"p90": 174,
+						"max": 174
+					},
+					"pairPackets": {
+						"out": 28,
+						"in": 28
+					}
+				}
+			]
+		},
+		"directBaselineSecondRun": {
+			"passed": true,
+			"result": [
+				{
+					"at": "2026-11-11T18:21:01.887Z",
+					"mode": "direct",
+					"payments": 20,
+					"engineMs": {
+						"p50": 108,
+						"p90": 249,
+						"max": 349
+					},
+					"pairPackets": {
+						"out": 237,
+						"in": 234,
+						"udpOut": 237,
+						"udpIn": 234
+					}
+				}
+			]
+		},
+		"directRestart": {
+			"passed": true,
+			"restarts": [
+				{
+					"at": "2026-11-11T18:07:56.671Z",
+					"mode": "direct",
+					"i": 0,
+					"restartMs": 667,
+					"usableMs": 1666,
+					"firstPaymentMs": 2591,
+					"pairPackets": {
+						"out": 60,
+						"in": 54
+					}
+				},
+				{
+					"at": "2026-11-11T18:09:02.565Z",
+					"mode": "direct",
+					"i": 1,
+					"restartMs": 678,
+					"usableMs": 2170,
+					"firstPaymentMs": 3072,
+					"pairPackets": {
+						"out": 73,
+						"in": 71
+					}
+				},
+				{
+					"at": "2026-11-11T18:10:08.062Z",
+					"mode": "direct",
+					"i": 2,
+					"restartMs": 682,
+					"usableMs": 1691,
+					"firstPaymentMs": 2620,
+					"pairPackets": {
+						"out": 77,
+						"in": 72
+					}
+				}
+			]
+		},
+		"directPhoneRestart": {
+			"passed": true,
+			"restarts": [
+				{
+					"at": "2026-11-11T18:29:01.408Z",
+					"mode": "direct",
+					"role": "phone",
+					"i": 0,
+					"restartMs": 816,
+					"usableMs": 727,
+					"firstPaymentMs": 1646,
+					"pairPackets": {
+						"out": 70,
+						"in": 65,
+						"udpOut": 70,
+						"udpIn": 65
+					}
+				},
+				{
+					"at": "2026-11-11T18:30:06.496Z",
+					"mode": "direct",
+					"role": "phone",
+					"i": 1,
+					"restartMs": 782,
+					"usableMs": 719,
+					"firstPaymentMs": 1650,
+					"pairPackets": {
+						"out": 66,
+						"in": 61,
+						"udpOut": 66,
+						"udpIn": 61
+					}
+				},
+				{
+					"at": "2026-11-11T18:31:11.830Z",
+					"mode": "direct",
+					"role": "phone",
+					"i": 2,
+					"restartMs": 789,
+					"usableMs": 780,
+					"firstPaymentMs": 1723,
+					"pairPackets": {
+						"out": 67,
+						"in": 64,
+						"udpOut": 67,
+						"udpIn": 64
+					}
+				}
+			]
+		}
+	},
+	"final": {
+		"at": "2026-11-11T18:32:13.617Z",
+		"fundingOutputUnspent": true,
+		"fundingConfirmations": 19,
+		"channelFailures": 0
+	}
+}

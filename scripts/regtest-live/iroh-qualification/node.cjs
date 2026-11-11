@@ -8,9 +8,13 @@ const { BeignetNode } = require(root + '/dist/cli/beignet-node.js');
 const { parsePeerUri } = require(root +
 	'/dist/lightning/transport/peer-uri.js');
 const version = require(root + '/package.json').version;
-assert.equal(version, '0.26.0');
+// The released image pins its engine; compose.local.yaml runs the checkout's.
+if (process.env.QUALIFY_ENGINE !== 'local') assert.equal(version, '0.26.0');
+const relayOnly = process.env.QUALIFY_RELAY_ONLY === 'true';
 const events = [],
 	jobs = new Map();
+// Which path each Iroh peer reported, sampled every 100 ms since start.
+const pathSamples = { direct: 0, relay: 0, unknown: 0 };
 let node,
 	serial = 0;
 const json = (value) =>
@@ -29,8 +33,27 @@ async function request(op, body) {
 				health: node.getHealth(),
 				peers: node.listPeers(),
 				channels: node.listChannels(),
+				pathSamples: { ...pathSamples },
 				events
 			};
+		case 'iroh-learned': {
+			// What this endpoint's own Iroh stack holds for a remote endpoint:
+			// the addresses a holder of that endpoint's link ends up knowing.
+			const iroh = require(require.resolve('@number0/iroh/index.js', {
+				paths: [root]
+			}));
+			const native = node.node.peerManager.irohEndpoint?.endpoint;
+			assert.ok(native, 'No Iroh endpoint is bound');
+			const learned = await native.remoteAddr(
+				iroh.EndpointId.fromBytes(
+					Array.from(Buffer.from(body.endpointId, 'hex'))
+				)
+			);
+			return {
+				relayUrl: learned ? learned.relayUrl() : null,
+				directAddresses: learned ? learned.directAddresses() : []
+			};
+		}
 		case 'address':
 			return node.getNewAddress();
 		case 'refresh':
@@ -129,6 +152,7 @@ async function request(op, body) {
 		electrumTls: false,
 		iroh: true,
 		irohDiscovery: false,
+		...(relayOnly ? { irohRelayOnly: true } : {}),
 		autoBootstrap: false,
 		autoGossipSync: false,
 		autoReconnect: true,
@@ -164,6 +188,14 @@ async function request(op, body) {
 		'peer:error'
 	])
 		node.on(name, (value) => event(name, value));
+	node.on('node:error', (value) => {
+		if (value.code === 'IROH_RELAY_ONLY_VIOLATED') event('node:error', value);
+	});
+	setInterval(() => {
+		for (const peer of node.listPeers())
+			if (peer.transport === 'iroh')
+				pathSamples[peer.iroh?.path ?? 'unknown']++;
+	}, 100).unref();
 	const server = http.createServer(async (req, res) => {
 		try {
 			let raw = '';
