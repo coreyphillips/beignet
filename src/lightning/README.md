@@ -1687,6 +1687,8 @@ const [link] = lightning.getPorchLinks(); // { relay, tag, uri }
 - `listenPorch()` returns at once. Whether a relay is reachable is status
   (`getPorchStatus()`, `porch:status`), not an error: a link works while its
   relay's state is `ready`, and a relay that is away is retried with backoff.
+  With no link to serve the node stays away from the relay and the state
+  reads `no-links`.
 - `fromMnemonic` derives the host key from the seed, apart from the Lightning
   key, and serves one link whose tag is also derived. Pass `porch.tags`
   (16 bytes each) to serve other links, and `setPorchTags()` to change them

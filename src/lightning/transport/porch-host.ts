@@ -161,6 +161,8 @@ export const MAX_PORCH_STANDBYS = 8;
 export type PorchHostState =
 	/** Not started, or stopped. */
 	| 'stopped'
+	/** Started with no link to serve, so it stays away from the relay. */
+	| 'no-links'
 	/** No standby is registered yet, or all were lost and one is on its way. */
 	| 'connecting'
 	/** At least one standby is registered: the links work. */
@@ -321,6 +323,8 @@ export class PorchHost extends EventEmitter {
 			? 'stopped'
 			: idle > 0
 			? 'ready'
+			: this.linkTags().length === 0
+			? 'no-links'
 			: this.refused
 			? 'refused'
 			: this.failures > 1
@@ -331,7 +335,9 @@ export class PorchHost extends EventEmitter {
 			state,
 			idle,
 			circuits: this.circuits.size,
-			...(this.lastError !== undefined && state !== 'ready'
+			...(this.lastError !== undefined &&
+			state !== 'ready' &&
+			state !== 'no-links'
 				? { lastError: this.lastError }
 				: {})
 		};
@@ -396,13 +402,18 @@ export class PorchHost extends EventEmitter {
 		}
 	}
 
-	private open(): boolean {
-		const tags = this.options
+	/** The links to register now: well formed, ascending, hex. */
+	private linkTags(): string[] {
+		return this.options
 			.tags()
 			.map((tag) => Buffer.from(tag))
 			.filter((tag) => tag.length === PORCH_TAG_BYTES)
 			.sort(Buffer.compare)
 			.map((tag) => tag.toString('hex'));
+	}
+
+	private open(): boolean {
+		const tags = this.linkTags();
 		// Nothing to serve: no reason to be known to the relay at all.
 		if (tags.length === 0) return false;
 		let ws: IWebSocketLike;

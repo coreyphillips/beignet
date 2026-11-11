@@ -239,7 +239,7 @@ describe('Porch host', function () {
 		}
 	});
 
-	it('does not connect at all while it has no link to serve', async function () {
+	it('does not connect at all while it has no link to serve, and says that is why', async function () {
 		await startRelay();
 		let tags: Buffer[] = [];
 		const h = host({ tags: () => tags });
@@ -247,9 +247,49 @@ describe('Porch host', function () {
 		await sleep(80);
 		expect(dials).to.equal(0);
 		expect(relay?.stats().connections).to.equal(0);
+		expect(h.status()).to.deep.equal({
+			relay: RELAY_URL,
+			state: 'no-links',
+			idle: 0,
+			circuits: 0
+		});
 		tags = [tagA];
 		h.refresh();
 		await waitFor(() => h.status().idle === 2, 'standbys');
+		expect(h.status().state).to.equal('ready');
+
+		// The last link revoked: it leaves the relay and reports why it is
+		// away, not a failure it is retrying.
+		tags = [];
+		h.refresh();
+		await waitFor(() => relay?.stats().standbys === 0, 'the standbys closing');
+		expect(h.status()).to.deep.equal({
+			relay: RELAY_URL,
+			state: 'no-links',
+			idle: 0,
+			circuits: 0
+		});
+		const before = dials;
+		await sleep(80);
+		expect(dials).to.equal(before);
+	});
+
+	it('does not report an old failure once it has no link to serve', async function () {
+		await startRelay({ token: 'open sesame' });
+		let tags = [tagA];
+		const h = host({ token: 'open says me', tags: () => tags });
+		h.start();
+		await waitFor(() => h.status().state === 'refused', 'the refusal');
+		expect(h.status().lastError).to.be.a('string');
+		// The refusal was about a registration it no longer wants to make.
+		tags = [];
+		h.refresh();
+		expect(h.status()).to.deep.equal({
+			relay: RELAY_URL,
+			state: 'no-links',
+			idle: 0,
+			circuits: 0
+		});
 	});
 
 	it('hands a paired visitor to the peer layer as a transport, and replaces the standby', async function () {

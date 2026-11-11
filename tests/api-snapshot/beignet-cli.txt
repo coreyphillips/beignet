@@ -46,7 +46,7 @@ property BalanceInfo.onchain: number
 property BalanceInfo.splicingSats?: number
 property BalanceInfo.total: number
 property BalanceInfo.unsettledSats?: number
-interface BeignetConfig extends IrohDaemonConfig, ElectrumTlsConfig
+interface BeignetConfig extends IrohDaemonConfig, PorchDaemonConfig, ElectrumTlsConfig
 property BeignetConfig.alias?: string
 property BeignetConfig.announceAddresses?: string[]
 property BeignetConfig.apiKeys?: Array<{ name: string; key: string; scopes: Array<'readonly' | 'invoice' | 'admin'>; expiresAt?: string; }>
@@ -294,6 +294,7 @@ method BeignetNode.createHoldInvoice(opts: { paymentHash: PaymentHashHex; amount
 method BeignetNode.createInvoice(amountSats?: number, description?: string, expirySecs?: number, descriptionHash?: Buffer, minFinalCltvExpiry?: number): InvoiceInfo
 method BeignetNode.createJitInvoice(opts: { lspPubkey?: string; amountSats?: number; description?: string; expirySecs?: number; targetRemainingInboundSat?: number; maxFlatFeeSat?: number; maxFeePpm?: number; feeMode?: 'skim' | 'hop'; timeoutMs?: number; }): Promise<JitInvoiceInfo>
 method BeignetNode.createOffer(options: { description: string; amountSats?: number; issuer?: string; expirySecs?: number; }): OfferInfo
+method BeignetNode.createPorchLink(label?: string): PorchLinkInfo
 method BeignetNode.decodeInvoice(bolt11: string): DecodedInvoice
 method BeignetNode.decodeOfferString(offerStr: string): OfferInfo
 method BeignetNode.describeGraph(limit?: number, offset?: number): GraphDescribeResult
@@ -367,6 +368,7 @@ method BeignetNode.getPaymentProof(paymentHash: PaymentHashHex): PaymentProof | 
 method BeignetNode.getPaymentQueue(): PaymentQueue
 method BeignetNode.getPeerAddress(pubkey: string): Pick<PeerInfo, 'host' | 'port' | 'transport'> | undefined
 method BeignetNode.getPeerRetrievedBackup(): { encoded: string; createdAt: number; fromPeer: string; channelCount: number; source: 'scb' | 'capsule'; } | null
+method BeignetNode.getPorchLinks(): PorchLinksInfo
 method BeignetNode.getQueuedPayment(id: string): QueuedPayment | undefined
 method BeignetNode.getReadyChannels(): ChannelInfo[]
 method BeignetNode.getRecoverySurfaceStatus(): { mode: RecoveryMode; profile: 'crash-v1' | null; generation: string; configuredSetStale: boolean; rotation: { inProgress: boolean; pending: boolean; retirePending: boolean; lastEvent: { type: string; detail: string; } | null; followed: { generation: string; from: string[]; to: string[]; } | null; }; guardians: Array<{ guardianId: string; url: string; }>; state: 'disabled' | 'running' | 'restore-required' | 'restoring' | 'restart-required' | 'fenced'; node: ReturnType<beignet/lightning#node.LightningNode['getRecoveryStatus']> | null; capsules: { candidates: number; best: { writerEpoch: string; latestSequence: string; inline: boolean; channelCount: number; guardians: IReportedGuardian[]; fromPeer: string; receivedAt: number; } | null; }; restore?: { inProgress: boolean; lastEvent?: { type: string; detail: string; }; }; autoApply: { enabled: boolean; phase: 'idle' | 'settling' | 'applying' | 'applied' | 'refused'; settleUntil: number | null; lastReason: string | null; }; }
@@ -444,6 +446,7 @@ method BeignetNode.restoreFromScb(encoded: string): Promise<{ recovering: string
 get BeignetNode.restorePending(): boolean
 get BeignetNode.resuming(): boolean
 method BeignetNode.revealCapsuleGuardians(): { fromPeer: string; head: { writerEpoch: string; latestSequence: string; }; guardians: beignet/lightning#recovery.GuardianDescriptor[]; entries: beignet/lightning#recovery.IGuardianConfigEntry[]; }
+method BeignetNode.revokePorchLink(id: string): { revoked: true; id: string; }
 method BeignetNode.rotateGuardians(entries: Array<string | beignet/lightning#recovery.IGuardianConfigEntry>): Promise<{ generation: string; guardians: Array<{ guardianId: string; url: string; }>; retired: number; }>
 method BeignetNode.sendDirectFunding(opts: { request?: string; amountSats?: number; maxTotalFeeSat?: number; feeHeadroomSats?: number; recoverReceipt?: boolean; }): Promise<beignet/lightning#directFunding.IDfSendResult>
 method BeignetNode.sendKeysend(pubkey: string, amountSats: number, timeoutMs?: number, maxFeeSats?: number, metadata?: Record<string, string>, onPaymentHash?: (paymentHash: PaymentHashHex) => void): Promise<PaymentInfo>
@@ -581,7 +584,7 @@ property BeignetNodeEvents.'transaction:confirmed': (info: OnchainTxInfo) => voi
 property BeignetNodeEvents.'transaction:received': (info: OnchainTxInfo) => void
 property BeignetNodeEvents.'transaction:sent': (info: OnchainTxInfo) => void
 property BeignetNodeEvents.log: (entry: { level: string; message: string; data?: Record<string, unknown>; timestamp: number; }) => void
-interface BeignetNodeOptions extends IrohDaemonConfig, ElectrumTlsConfig
+interface BeignetNodeOptions extends IrohDaemonConfig, PorchDaemonConfig, ElectrumTlsConfig
 property BeignetNodeOptions.addressType?: 'p2wpkh' | 'p2tr'
 property BeignetNodeOptions.alias?: string
 property BeignetNodeOptions.allowMultipleInstances?: boolean
@@ -1149,6 +1152,9 @@ property NodeInfo.onchainBalanceSats: number
 property NodeInfo.openChannelCount: number
 property NodeInfo.peerCount: number
 property NodeInfo.pendingCloseBalanceSats: number
+property NodeInfo.porch?: PorchInfo
+property NodeInfo.porchAvailable?: boolean
+property NodeInfo.porchListenError?: ListenerProblem
 property NodeInfo.splicingBalanceSats: number
 property NodeInfo.websocketListenError?: ListenerProblem
 property NodeInfo.websocketPort?: number
@@ -1328,11 +1334,40 @@ type PaymentValidationStatus = 'OK' | 'WARN' | 'FAIL'
 interface PeerInfo
 property PeerInfo.host: string
 property PeerInfo.iroh?: beignet/lightning#transport.IIrohDiagnostics
+property PeerInfo.porch?: { relay: string; link: string; }
 property PeerInfo.port: number
 property PeerInfo.pubkey: string
 property PeerInfo.state: PeerState
 property PeerInfo.transport?: 'tcp' | 'ws' | 'iroh'
 type PeerState = 'ready' | 'connected' | 'connecting' | 'disconnected'
+unexported interface PorchDaemonConfig
+property PorchDaemonConfig.porchRelays?: (string | beignet/lightning#transport.IPorchRelayConfig)[]
+property PorchDaemonConfig.porchStandbys?: number
+property PorchDaemonConfig.porchToken?: string
+property PorchDaemonConfig.porchVia?: beignet/lightning#transport.PorchVia
+interface PorchInfo
+property PorchInfo.links: number
+property PorchInfo.relays: PorchRelayInfo[]
+property PorchInfo.uris: string[]
+interface PorchLinkInfo
+property PorchLinkInfo.createdAt?: number
+property PorchLinkInfo.default?: true
+property PorchLinkInfo.id: string
+property PorchLinkInfo.label?: string
+property PorchLinkInfo.uris: string[]
+interface PorchLinksInfo
+property PorchLinksInfo.enabled: boolean
+property PorchLinksInfo.links: PorchLinkInfo[]
+property PorchLinksInfo.listening: boolean
+property PorchLinksInfo.problem?: string
+property PorchLinksInfo.relays: PorchRelayInfo[]
+interface PorchRelayInfo
+property PorchRelayInfo.circuits: number
+property PorchRelayInfo.idle: number
+property PorchRelayInfo.lastError?: string
+property PorchRelayInfo.proxied: boolean
+property PorchRelayInfo.relay: string
+property PorchRelayInfo.state: beignet/lightning#transport.PorchHostState
 interface PrimariesInfo
 property PrimariesInfo.fillThresholdSat: number | null
 property PrimariesInfo.primaries: PrimaryInfo[]

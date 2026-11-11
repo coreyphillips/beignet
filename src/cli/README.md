@@ -186,6 +186,10 @@ await node.destroy();
 | `iroh?` | `boolean` | Experimental phone link. Peers and relays can see your IP address. |
 | `irohRelays?` | `string[]` | Custom relays replace the public defaults. Empty disables relays. |
 | `irohDiscovery?` | `boolean` | Public endpoint discovery and publication (default true when enabled). |
+| `porchRelays?` | `(string \| IPorchRelayConfig)[]` | Porch relays to wait at, so the node can hand out `wss://` peer links that do not say where it runs. Each is a relay URL (`wss://host[:port]`), or `{ url, token }` for a relay that asks a node for a token. Unset or empty leaves Porch off. |
+| `porchVia?` | `PorchVia` | How the relays are dialed. `tor` sends every relay connection through the SOCKS5 proxy (torProxy, else 127.0.0.1:9050), so the relay does not learn the node's address either. `direct` dials them directly whatever torProxy says. Unset dials a relay as any other peer at that host. |
+| `porchStandbys?` | `number` | Idle connections kept at each relay. Each one takes one visitor, and is replaced when it does. Default 2, at most 8. |
+| `porchToken?` | `string` | The token of a private relay, when exactly one relay is configured. With several, each relay's token goes in its own porchRelays entry. |
 | `electrumTlsVerify?` | `boolean` | Verify Electrum TLS certificates (default false). Every TLS connection the wallet opens, to the configured server or to a public fallback, is accepted only when its certificate chains to a trusted CA and matches the host name, or when its SHA-256 fingerprint is in electrumTlsFingerprints. |
 | `electrumTlsFingerprints?` | `string[]` | SHA-256 fingerprints of Electrum certificates to accept without a CA, for servers with self-signed certificates. Hex with or without colons, as printed by `openssl x509 -noout -fingerprint -sha256`. Needs electrumTlsVerify. |
 <!-- options:BeignetNodeOptions:end -->
@@ -237,6 +241,9 @@ The signatures name three of those IDs: `ChannelIdHex` and `PaymentHashHex` (32 
 | `connectPeer(pubkey, host, port)` | `Promise<PeerInfo>` | Connect to Lightning peer. Times out after `connectTimeoutMs` (default 15s). |
 | `disconnectPeer(pubkey)` | `void` | Disconnect peer |
 | `listPeers()` | `PeerInfo[]` | List connected peers |
+| `getPorchLinks()` | `PorchLinksInfo` | The [Porch links](#porch-links) this node serves, each with one URI per relay, and how it stands with each relay. `enabled: false` when no relay is configured |
+| `createPorchLink(label?)` | `PorchLinkInfo` | Make a Porch link of its own, to hand to one person or device. Written to the database before the relays are told of it. Throws `INVALID_PARAMS` when Porch is off, the label is over 64 characters or 256 links are served |
+| `revokePorchLink(id)` | `{ revoked: true, id }` | Revoke a Porch link for good: it stops resolving and every peer connected through it is disconnected. Throws `NOT_FOUND` for a link that is not served |
 | `getPeerAddress(pubkey)` | `Pick<PeerInfo, 'host' \| 'port' \| 'transport'> \| undefined` | The address this node last dialed the peer at, if it ever did, in this run or, from the persisted peer addresses, an earlier one. A peer that only ever connected inbound has none: `listPeers()` then shows its socket's ephemeral source port |
 
 #### DNS Bootstrap (BOLT 10)
@@ -2194,6 +2201,21 @@ reserved inbound capacity and unresolved slots. Keep reserved channels out of
 automatic splicing and channel close. Retirement of version 2 unknown slots
 can remain `DRAINING` after the invoice expires.
 
+### Porch links (CLI)
+
+```bash
+beignet porch links
+# {"ok":true,"result":{"enabled":true,"listening":true,"links":[{"id":"5f0c...","default":true,"uris":["02ab...@wss://relay.example/v1/p/k3v..."]}],"relays":[{"relay":"wss://relay.example","state":"ready","idle":2,"circuits":0,"proxied":false}]}}
+
+beignet porch links create --label "Dana's phone"
+# {"ok":true,"result":{"id":"9d41...","label":"Dana's phone","createdAt":1731350000000,"uris":["02ab...@wss://relay.example/v1/p/q7x..."]}}
+
+beignet porch links revoke 9d41...
+# {"ok":true,"result":{"revoked":true,"id":"9d41..."}}
+```
+
+The node needs `porchRelays` configured: see [Porch links](#porch-links).
+
 ### Porch relay
 
 `beignet porch-relay` runs a Porch relay: a small server that lets a node at
@@ -2230,8 +2252,8 @@ keeps no state: restarting it drops the connections that were open, and nodes
 dial back in. It prints one JSON line when it is listening and runs until it is
 signalled.
 
-The node side of Porch (configuration, links and routes) is tracked in
-[#1980](https://github.com/coreyphillips/beignet/issues/1980).
+A node is pointed at a relay with `porchRelays`: see
+[Porch links](#porch-links).
 
 ### JSON Envelope
 
@@ -2466,6 +2488,98 @@ test is simulated. Live relay-only payments, the mid-payment network-cut sweep,
 long outage timing, and real Umbrel and phone lifecycle tests remain release
 validation work. Umbrel's per-wallet switch and Connect card, and Chicory's
 native mobile bridge and primary settings, are separate companion changes.
+
+### Porch links
+
+A Porch link is a peer URI that reaches the node without saying where it
+runs:
+
+```text
+<lightning-pubkey>@wss://<relay>/v1/p/<route>
+```
+
+The node dials out to one or more Porch relays and waits there. Whoever holds
+the link connects to the relay, the relay pairs the two connections, and BOLT 8
+runs end to end through it. The dialer needs nothing new: the link is an
+ordinary `wss://` peer address, so `beignet peer connect '<link>'` and
+`primaries add --uri '<link>'` take it as they take any other. No inbound port,
+port forwarding or public address is needed at home. Run a relay with
+[`beignet porch-relay`](#porch-relay), or use one somebody else runs.
+
+| Environment variable | Config key | Meaning |
+| --- | --- | --- |
+| `BEIGNET_PORCH_RELAYS` | `porchRelays` | Comma-separated relay URLs (`wss://host[:port]`, or `ws://` for an onion service). Empty or unset leaves Porch off. In the config file an entry can also be `{ "url": "...", "token": "..." }` |
+| `BEIGNET_PORCH_VIA` | `porchVia` | `tor` dials every relay through the SOCKS5 proxy (`torProxy`, else `127.0.0.1:9050`), with the relay's name unresolved and no direct dial to fall back to. `direct` dials them directly whatever `torProxy` says. Unset dials a relay as any other peer at that host |
+| `BEIGNET_PORCH_STANDBYS` | `porchStandbys` | Idle connections kept at each relay (default 2, at most 8). Each takes one visitor and is replaced at once |
+| `BEIGNET_PORCH_TOKEN` | `porchToken` | The token of a private relay, when exactly one relay is configured. With several relays this is refused, because a token sent to each would be disclosed to the others: give each its own in a `{ url, token }` entry |
+
+Who learns what:
+
+- **Whoever holds a link** learns the relay's name and the node's Lightning
+  pubkey, which the link states. Not the node's address.
+- **The relay** sees the node's address, each visitor's address, when they
+  connect and how much they send. It cannot read or change the traffic. It is
+  not told the Lightning pubkey, though it can test a guess by dialing the
+  link itself. `GET /info` reports `proxied: false` for such a relay. With
+  `porchVia: tor` (`proxied: true`) the relay does not see the node's address
+  either, at the cost of Tor's latency on every message.
+- A relay you run yourself is one whose operator is you.
+
+With Porch on, the node stops dialing addresses a peer chose: an address
+learned from a peer's `node_announcement` is dialed only through the SOCKS5
+proxy, because a direct dial to it would show the peer where the node is. A
+clearnet address in `announceAddresses` still publishes itself to the whole
+network, and startup logs a warning when one is set.
+
+`GET /info` carries `porchAvailable: true` on engines with this integration
+and, once relays are configured, a `porch` block:
+
+```json
+{
+  "porch": {
+    "uris": ["02ab...@wss://relay.example/v1/p/k3v..."],
+    "links": 1,
+    "relays": [
+      { "relay": "wss://relay.example", "state": "ready", "idle": 2, "circuits": 0, "proxied": false }
+    ]
+  }
+}
+```
+
+`uris` is the seed's link, one URI per relay; any of them reaches the node.
+A relay's `state` is `ready` (links through it work), `connecting`,
+`unreachable` (retried with backoff, with the reason in `lastError`),
+`refused` (the relay turned the node down: a wrong token, too many links),
+`no-links` (every link is revoked, so the node stays away) or `stopped`. A
+relay that is away is status, not a failed listener: the node keeps dialing
+and the same link works again when the relay is back. `porchListenError`
+appears only when the node is not waiting at all, held by a guardian recovery
+mode's startup quarantine or fenced, as `listenError` does for the TCP
+listener.
+
+**Links.** Every node has one link from its seed, so it is the same after a
+restore. `POST /porch/links/create` (`beignet porch links create`) makes
+another with a random id and an optional label, up to 256, so each person or
+device can have its own. `POST /porch/links/revoke` takes one back: it stops
+resolving at the relays and every peer connected through it is disconnected,
+channel peers included. Their channels stay open, and they reconnect once
+they are given a link that works. Revoking is permanent and is written to the
+database before it takes effect. The seed's link can be revoked as well and
+stays revoked on that database, including across a capsule restore, which
+carries the record over. Two cases bring a revoked link back, because the
+record of the revocation is not there: a restore from the seed alone (the
+seed's link returns and the made links are gone), and a database restored
+from a backup taken before the revocation.
+
+`GET /peers` lists a peer that came in through a link with
+`host: "porch:<relay>"`, `transport: "ws"` and
+`porch: { relay, link }`, where `link` is the id of the link it used. The
+node never learns such a peer's address. All visitors through one relay share
+the per-address admission limits (4 handshakes in progress, 8 peers without a
+channel); a peer with a channel is admitted past the second.
+
+The protocol and every limit are in
+[docs/PORCH-PROTOCOL.md](../../docs/PORCH-PROTOCOL.md).
 
 ### Tor proxy
 
@@ -2732,6 +2846,9 @@ The matching commands are `wallet sweep-prepare <requestJson|requestFile>`, `wal
 | POST | `/webhooks/register` | `{ url, events, secret? }` | Register webhook callback |
 | DELETE | `/webhooks/unregister` | `{ id }` | Remove webhook |
 | GET | `/webhooks` | -- | List registered webhooks |
+| GET | `/porch/links` | -- | The [Porch links](#porch-links) served, each with one URI per relay, and each relay's state |
+| POST | `/porch/links/create` | `{ label? }` | Make a Porch link of its own (admin) |
+| POST | `/porch/links/revoke` | `{ id }` | Revoke a Porch link and disconnect the peers that came in through it (admin) |
 | POST | `/queue/add` | `{ bolt11, priority?, amountSats?, maxFeeSats?, metadata? }` | Enqueue payment. Dispatched through `/invoice/pay-safe`, with the same default fee cap and limits |
 | GET | `/queue` | -- | List the queued and dispatching payments, with the 1000 most recently finished |
 | GET | `/queue/history` | `?limit=&before=` | Finished queue entries, the most recently finished first: up to `limit` (default 100, at most 1000), after the entry with id `before` |

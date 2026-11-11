@@ -8,6 +8,20 @@
 
 import type { IrohDaemonConfig } from './iroh-config';
 import { validateIrohConfig } from './iroh-config';
+import type { PorchDaemonConfig } from './porch-config';
+import { porchRelayEntries, validatePorchConfig } from './porch-config';
+import { PorchLinkStore, porchLinkLabel } from './porch-links';
+import {
+	PORCH_MAX_TAGS,
+	derivePorchDefaultTag,
+	parsePorchRelayUrl
+} from '../lightning/transport/porch';
+import type {
+	IPorchConfig,
+	IPorchHostStatus,
+	IPorchRelayConfig,
+	PorchHostState
+} from '../lightning/transport/porch-host';
 import type { ElectrumTlsConfig } from './electrum-tls-config';
 import {
 	checkElectrumTls,
@@ -207,6 +221,7 @@ import type {
 import {
 	PeerError,
 	PeerErrorCode,
+	selectPorchProxy,
 	socks5SocketFactory
 } from '../lightning/transport/peer-manager';
 import {
@@ -248,6 +263,7 @@ import type { ISteerCandidate, ISteerSkip } from './receive-steering';
 import { directFundingWallet } from './direct-funding';
 import {
 	AUTH_KEY_OVERRIDES_STORAGE_KEY,
+	PORCH_LINKS_STORAGE_KEY,
 	WEBHOOK_SECRETS_STORAGE_KEY
 } from './daemon-state-keys';
 import type {
@@ -291,6 +307,10 @@ import type {
 	ListenerProblem,
 	NodeInfo,
 	PeerInfo,
+	PorchInfo,
+	PorchLinkInfo,
+	PorchLinksInfo,
+	PorchRelayInfo,
 	ChannelInfo,
 	PaymentInfo,
 	PayAllQuote,
@@ -377,6 +397,7 @@ export interface LogEntry {
  */
 export interface BeignetNodeOptions
 	extends IrohDaemonConfig,
+		PorchDaemonConfig,
 		ElectrumTlsConfig {
 	/** Primary-only switch for new private client channels. Default false. */
 	waiveClientReserve?: boolean;
@@ -2302,11 +2323,23 @@ interface IRecencyHold {
 }
 
 /** The inbound listeners a node can be asked to bind. */
-type ListenerKind = 'tcp' | 'websocket' | 'iroh';
+type ListenerKind = 'tcp' | 'websocket' | 'iroh' | 'porch';
+
+const LISTENER_KINDS: readonly ListenerKind[] = [
+	'tcp',
+	'websocket',
+	'iroh',
+	'porch'
+];
 
 const LISTENER_HELD_MESSAGE =
 	'held by the startup quarantine until writer ownership is confirmed ' +
 	'and any startup repair is receipted; it binds then';
+
+const PORCH_LINKS_UNREADABLE =
+	'The stored Porch links could not be read, so none is served: which were ' +
+	'revoked is not known. Make a link (POST /porch/links/create) to start ' +
+	"again; the seed's link stays revoked";
 
 const LISTENER_FENCED_MESSAGE =
 	'this node is fenced: another device owns its recovery namespace, so ' +
@@ -2317,6 +2350,8 @@ function listenerLabel(kind: ListenerKind): string {
 		? 'Lightning listener'
 		: kind === 'iroh'
 		? 'Iroh listener'
+		: kind === 'porch'
+		? 'Porch listener'
 		: 'WebSocket listener';
 }
 
@@ -2568,6 +2603,15 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	private _websocketPort?: number;
 	private _irohBound = false;
 	private _irohListenError?: ListenerProblem;
+	/** True while the node waits at its Porch relays, reachable or not. */
+	private _porchBound = false;
+	private _porchListenError?: ListenerProblem;
+	/** The links served through Porch; set while porchRelays is configured. */
+	private _porchLinks?: PorchLinkStore;
+	/** Per relay (`ws(s)://name`): whether it is dialed through the proxy. */
+	private _porchProxied?: Map<string, boolean>;
+	/** The state last logged for each relay, so a count changing is not news. */
+	private _porchLogged?: Map<string, PorchHostState>;
 	/** The TCP port asked for, bound or not. */
 	private _requestedListenPort?: number;
 	/** Why a configured listener is not bound (issues #861 and #933). */
@@ -2732,6 +2776,16 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 		try {
 			validateIrohConfig(opts);
 			validateElectrumTlsConfig(opts);
+			validatePorchConfig(opts);
+			// The two combinations no proxy setting can rescue: Tor does not
+			// reach a private address, and an onion name resolves nowhere else.
+			for (const entry of porchRelayEntries(opts)) {
+				selectPorchProxy(
+					parsePorchRelayUrl(entry.url).host,
+					opts.porchVia,
+					undefined
+				);
+			}
 		} catch (err) {
 			throw new BeignetError('INVALID_PARAMS', (err as Error).message);
 		}
@@ -3396,6 +3450,12 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 			// rebuild, and while the node's block height is zero.
 			newChannelsRefused: (): string | null => this.newChannelRefusal(),
 			enableNetworking: true,
+			porch: this.porchNodeConfig(
+				opts,
+				socks5Proxy,
+				socks5ProxyScope,
+				announcedAddresses
+			),
 			iroh: opts.iroh
 				? {
 						factory: createNodeIrohEndpoint,
@@ -3687,6 +3747,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 
 		// Forward errors to callback or absorb to prevent process crash
 		this.wireNodeErrorRelay(opts.onError);
+		this.wirePorchStatusLog();
 
 		// Forward payment events with JSON-safe types + structured logging
 		this.node.on('payment:received', (info: IPaymentInfo) => {
@@ -4428,6 +4489,9 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 		}
 		if (opts.iroh) {
 			await this.bindListener('iroh', 0);
+		}
+		if (this._porchLinks) {
+			await this.bindListener('porch', 0);
 		}
 
 		// 11. Connect timeout + Daily spending limit
@@ -6133,14 +6197,19 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	 * retrieve the capsules (so
 	 * the restored node dials its channel peers on its own), and the daily
 	 * spend ledger (a resume must not hand the day's allowance back, issue
-	 * #977). The auth override is mandatory; the rest is best effort and
-	 * logged.
+	 * #977), and the Porch links made and revoked (a dropped record serves
+	 * a revoked link again). The auth override and the Porch links are
+	 * mandatory; the rest is best effort and logged.
 	 */
 	private carryDaemonState(from: SqliteStorage, to: SqliteStorage): void {
 		this.onchainSweeps().carryTo(to);
 		const overrides = from.loadWalletData(AUTH_KEY_OVERRIDES_STORAGE_KEY);
 		if (overrides !== null) {
 			to.saveWalletData(AUTH_KEY_OVERRIDES_STORAGE_KEY, overrides);
+		}
+		const porchLinks = from.loadWalletData(PORCH_LINKS_STORAGE_KEY);
+		if (porchLinks !== null) {
+			to.saveWalletData(PORCH_LINKS_STORAGE_KEY, porchLinks);
 		}
 		try {
 			for (const hook of from.loadAllWebhooks()) {
@@ -6914,6 +6983,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 		const lightningBalance = this.getLightningBalanceSats();
 		const result: NodeInfo = {
 			irohAvailable: true,
+			porchAvailable: true,
 			nodeId: info.nodeId,
 			alias: info.alias,
 			network: this.networkName,
@@ -6941,6 +7011,11 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 		}
 		if (this._websocketListenError) {
 			result.websocketListenError = { ...this._websocketListenError };
+		}
+		const porch = this.porchInfo();
+		if (porch) result.porch = porch;
+		if (this._porchListenError) {
+			result.porchListenError = { ...this._porchListenError };
 		}
 		return result;
 	}
@@ -8368,7 +8443,8 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 			port: p.port,
 			state: p.state as import('./types').PeerState,
 			...(p.transport ? { transport: p.transport } : {}),
-			...(p.iroh ? { iroh: p.iroh } : {})
+			...(p.iroh ? { iroh: p.iroh } : {}),
+			...(p.porch ? { porch: { relay: p.porch.relay, link: p.porch.tag } } : {})
 		}));
 	}
 
@@ -16905,6 +16981,203 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 		return this._peerRetrievedScb;
 	}
 
+	// ─────────────── Porch ───────────────
+
+	/**
+	 * The node's Porch settings, or undefined when no relay is configured.
+	 * It opens the link store on the database in use, so a node rebuilt in
+	 * process serves the links of the database it was rebuilt on.
+	 */
+	private porchNodeConfig(
+		opts: BeignetNodeOptions,
+		proxy: { host: string; port: number } | undefined,
+		scope: Socks5ProxyScope,
+		announced: INodeAddress[] | undefined
+	): Omit<IPorchConfig, 'hostSecret'> | undefined {
+		this._porchLinks = undefined;
+		this._porchProxied = undefined;
+		this._porchLogged = undefined;
+		let relays: IPorchRelayConfig[];
+		const proxied = new Map<string, boolean>();
+		try {
+			relays = porchRelayEntries(opts);
+			for (const entry of relays) {
+				const relay = parsePorchRelayUrl(entry.url);
+				proxied.set(
+					relay.origin,
+					selectPorchProxy(relay.host, opts.porchVia, proxy, scope) !==
+						undefined
+				);
+			}
+		} catch (err) {
+			throw new BeignetError('INVALID_PARAMS', (err as Error).message);
+		}
+		if (relays.length === 0) return undefined;
+		const links = new PorchLinkStore(derivePorchDefaultTag(this.walletSeed()), {
+			load: (): string | null =>
+				this.storage.loadWalletData(PORCH_LINKS_STORAGE_KEY),
+			save: (value): void =>
+				this.storage.saveWalletData(PORCH_LINKS_STORAGE_KEY, value)
+		});
+		if (links.unreadable) {
+			this.log('warn', PORCH_LINKS_UNREADABLE);
+		}
+		// Not refused: the address may be a tunnel or a server in front of
+		// the node. One that is the node's own undoes what Porch is for.
+		const clearnet = (announced ?? []).filter(
+			(address) => !address.host.toLowerCase().endsWith('.onion')
+		).length;
+		if (clearnet > 0) {
+			this.log(
+				'warn',
+				`Porch links do not say where this node runs, and announceAddresses ` +
+					`publishes ${clearnet} clearnet address(es) to the whole network; ` +
+					'make sure none of them is where this node runs'
+			);
+		}
+		this._porchLinks = links;
+		this._porchProxied = proxied;
+		return {
+			relays,
+			tags: links.tags(),
+			...(opts.porchVia !== undefined ? { via: opts.porchVia } : {}),
+			...(opts.porchStandbys !== undefined
+				? { standbys: opts.porchStandbys }
+				: {})
+		};
+	}
+
+	/**
+	 * Log a relay's state when it changes. A relay that is away is status
+	 * (GET /info, GET /porch/links), and the node keeps dialing it.
+	 */
+	private wirePorchStatusLog(): void {
+		this.node.on('porch:status', (status: IPorchHostStatus) => {
+			const logged = (this._porchLogged ??= new Map());
+			if (logged.get(status.relay) === status.state) return;
+			logged.set(status.relay, status.state);
+			const failing =
+				status.state === 'refused' || status.state === 'unreachable';
+			this.log(
+				failing ? 'warn' : 'info',
+				`Porch relay ${status.relay}: ${status.state}`,
+				status.lastError !== undefined ? { error: status.lastError } : undefined
+			);
+		});
+	}
+
+	private porchRelayInfos(): PorchRelayInfo[] {
+		return this.node.getPorchStatus().map((status) => ({
+			...status,
+			proxied: this._porchProxied?.get(status.relay) === true
+		}));
+	}
+
+	/** Every link served, each with its URIs in the relays' configured order. */
+	private porchLinkInfos(): PorchLinkInfo[] {
+		const store = this._porchLinks;
+		if (!store) return [];
+		const uris = new Map<string, string[]>();
+		for (const link of this.node.getPorchLinks()) {
+			const list = uris.get(link.tag) ?? [];
+			list.push(link.uri);
+			uris.set(link.tag, list);
+		}
+		return store
+			.list()
+			.map((link) => ({ ...link, uris: uris.get(link.id) ?? [] }));
+	}
+
+	private porchInfo(): PorchInfo | undefined {
+		if (!this._porchLinks) return undefined;
+		const links = this.porchLinkInfos();
+		return {
+			// No URI is handed out while the node is not waiting at a relay.
+			uris: this._porchBound
+				? links.find((link) => link.default)?.uris ?? []
+				: [],
+			links: links.length,
+			relays: this.porchRelayInfos()
+		};
+	}
+
+	private requirePorchLinks(): PorchLinkStore {
+		if (!this._porchLinks) {
+			throw new BeignetError(
+				'INVALID_PARAMS',
+				'Porch is not enabled: configure porchRelays (BEIGNET_PORCH_RELAYS)'
+			);
+		}
+		return this._porchLinks;
+	}
+
+	/**
+	 * The links this node can be reached by through its Porch relays, and
+	 * how it stands with each relay.
+	 */
+	getPorchLinks(): PorchLinksInfo {
+		const store = this._porchLinks;
+		if (!store) {
+			return { enabled: false, listening: false, links: [], relays: [] };
+		}
+		return {
+			enabled: true,
+			listening: this._porchBound === true,
+			links: this.porchLinkInfos(),
+			relays: this.porchRelayInfos(),
+			...(store.unreadable ? { problem: PORCH_LINKS_UNREADABLE } : {})
+		};
+	}
+
+	/**
+	 * Make a link of its own to hand to one person or device, so it can be
+	 * revoked later without touching the others. It works as soon as the
+	 * relays have the node's next registration, which is sent at once.
+	 */
+	createPorchLink(label?: string): PorchLinkInfo {
+		const store = this.requirePorchLinks();
+		let clean: string | undefined;
+		try {
+			clean = porchLinkLabel(label);
+		} catch (err) {
+			throw new BeignetError('INVALID_PARAMS', (err as Error).message);
+		}
+		if (store.list().length >= PORCH_MAX_TAGS) {
+			throw new BeignetError(
+				'INVALID_PARAMS',
+				`A node serves at most ${PORCH_MAX_TAGS} Porch links; revoke one first`
+			);
+		}
+		const created = store.create(clean);
+		this.node.setPorchTags(store.tags());
+		const link = this.porchLinkInfos().find((info) => info.id === created.id);
+		return link ?? { ...created, uris: [] };
+	}
+
+	/**
+	 * Stop serving a link, for good. It stops resolving at the relays and
+	 * every peer that came in through it is disconnected, channel peers
+	 * included. The seed's link can be revoked too, and stays revoked on
+	 * this database.
+	 */
+	revokePorchLink(id: string): { revoked: true; id: string } {
+		const store = this.requirePorchLinks();
+		const wanted = typeof id === 'string' ? id.toLowerCase() : '';
+		if (!/^[0-9a-f]{32}$/.test(wanted)) {
+			throw new BeignetError(
+				'INVALID_PARAMS',
+				'id must be a link id: 32 hex characters, as GET /porch/links lists it'
+			);
+		}
+		// Written before it is applied: a revocation that did not reach the
+		// database would be undone by the next restart.
+		if (!store.revoke(wanted)) {
+			throw new BeignetError('NOT_FOUND', 'No such Porch link');
+		}
+		this.node.setPorchTags(store.tags());
+		return { revoked: true, id: wanted };
+	}
+
 	// ─────────────── Inbound listeners ───────────────
 
 	/**
@@ -16919,6 +17192,8 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 		this._websocketPort = undefined;
 		this._irohBound = false;
 		this._irohListenError = undefined;
+		this._porchBound = false;
+		this._porchListenError = undefined;
 		this._requestedListenPort = undefined;
 		this._listenError = undefined;
 		this._websocketListenError = undefined;
@@ -16954,6 +17229,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 		try {
 			if (kind === 'tcp') await node.listen(port);
 			else if (kind === 'iroh') await node.listenIroh();
+			else if (kind === 'porch') node.listenPorch();
 			else await node.listenWebSocket(port);
 		} catch (err) {
 			if (stale()) return;
@@ -16984,10 +17260,16 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 		const wasHeld = this.listenerProblem(kind)?.state === 'held';
 		if (kind === 'tcp') this._listenPort = port;
 		else if (kind === 'iroh') this._irohBound = true;
+		else if (kind === 'porch') this._porchBound = true;
 		else this._websocketPort = port;
 		this.setListenerProblem(kind, undefined);
 		if (wasHeld) {
-			this.log('info', `${listenerLabel(kind)} bound on port ${port}`);
+			this.log(
+				'info',
+				kind === 'porch'
+					? 'Porch listener started: the node is dialing its relays'
+					: `${listenerLabel(kind)} bound on port ${port}`
+			);
 		}
 	}
 
@@ -17064,6 +17346,8 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 			? this._listenError
 			: kind === 'iroh'
 			? this._irohListenError
+			: kind === 'porch'
+			? this._porchListenError
 			: this._websocketListenError;
 	}
 
@@ -17073,6 +17357,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	): void {
 		if (kind === 'tcp') this._listenError = problem;
 		else if (kind === 'iroh') this._irohListenError = problem;
+		else if (kind === 'porch') this._porchListenError = problem;
 		else this._websocketListenError = problem;
 	}
 
@@ -17086,7 +17371,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	private bindHeldListeners(): void {
 		if (this.destroyed || !this.node) return;
 		const held: Array<[ListenerKind, number]> = [];
-		for (const kind of ['tcp', 'websocket', 'iroh'] as const) {
+		for (const kind of LISTENER_KINDS) {
 			const problem = this.listenerProblem(kind);
 			if (problem?.state === 'held') held.push([kind, problem.port]);
 		}
@@ -17107,7 +17392,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	 * a socket nobody answers. A failed bind keeps its OS error.
 	 */
 	private fenceListeners(): void {
-		for (const kind of ['tcp', 'websocket', 'iroh'] as const) {
+		for (const kind of LISTENER_KINDS) {
 			const problem = this.listenerProblem(kind);
 			const bound =
 				kind === 'tcp'
@@ -17116,12 +17401,17 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 					? this._irohBound
 						? 0
 						: undefined
+					: kind === 'porch'
+					? this._porchBound
+						? 0
+						: undefined
 					: this._websocketPort;
 			const port =
 				bound ?? (problem?.state === 'held' ? problem.port : undefined);
 			if (port === undefined) continue;
 			if (kind === 'tcp') this._listenPort = undefined;
 			else if (kind === 'iroh') this._irohBound = false;
+			else if (kind === 'porch') this._porchBound = false;
 			else this._websocketPort = undefined;
 			this.setListenerProblem(kind, {
 				port,
