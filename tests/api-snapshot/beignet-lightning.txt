@@ -5786,6 +5786,7 @@ method node.LightningNode.getGuardianHostStatus(): recovery.IGuardianHostStatus 
 method node.LightningNode.getHeldInvoiceSnapshot(paymentHash: Buffer): node.IHeldInvoiceSnapshot | null
 method node.LightningNode.getInvoice(paymentHashHex: string): node.IInvoiceInfo | null
 method node.LightningNode.getIrohConnectionString(): string | undefined
+method node.LightningNode.getIrohRelayOnlyStatus(): { mode?: transport.IrohRelayOnlyMode; failure?: string; } | undefined
 method node.LightningNode.getJitClientCeilings(): { maxFlatFeeSat: bigint; maxFeePpm: number; }
 method node.LightningNode.getJitReceiveManager(): liquidity.JitReceiveManager | undefined
 method node.LightningNode.getLiquiditySnapshot(): advisor.ILiquiditySnapshot
@@ -6025,7 +6026,7 @@ class node.LightningPaymentError extends beignet#CodedError<node.LightningErrorC
 constructor node.LightningPaymentError(code: node.LightningErrorCode, message: string)
 const node.MAX_FEE_RATE_SAT_PER_VBYTE = 5000
 const node.MAX_HELD_PARTS_PER_HASH = 64
-type node.NodeErrorCode = 'AUTO_FUNDING_FAILED' | 'AUTO_RECONNECT_FAILED' | 'BARRIER_DISPATCH_FAILED' | 'BLOCK_WORK_FAILED' | 'BOLT12_INVOICE_ERROR' | 'BROADCAST_FAILED' | 'BROADCAST_PERMANENT_FAILURE' | 'CHAIN_RESTORE_WATCH_FAILED' | 'CHAIN_WATCHER_ERROR' | 'CHAIN_WATCHER_START_FAILED' | 'CHANNEL_ERROR' | 'CHANNEL_FAILED_FORCE_CLOSED' | 'CHANNEL_FAILED_FORCE_CLOSE_FAILED' | 'CLOSE_CHANNEL_FAILED' | 'DURABILITY_BARRIER_TIMEOUT' | 'ERRORED_TIMEOUT_FORCE_CLOSED' | 'FORCE_CLOSE_FAILED' | 'FORCE_CLOSE_REVOKED' | 'FORWARD_TIMEOUT_FORCE_CLOSE' | 'FUNDING_BROADCAST_FAILED' | 'FUNDING_MISSING' | 'GRAPH_RESTORE_FAILED' | 'HTLC_CLAIM_FORCE_CLOSE' | 'HTLC_DEADLINE_HELD' | 'HTLC_EXPIRY_FORCE_CLOSE' | 'LISTEN_FAILED' | 'MESSAGE_TOO_LARGE' | 'NO_ROUTING_HINTS' | 'ONION_MESSAGE_ERROR' | 'ONION_PROCESSING_FAILED' | 'PERSISTENCE_ERROR' | 'PRESPLICE_WATCH_FAILED' | 'PROVIDE_EXTERNAL_WITNESS_FAILED' | 'RBF_OPEN_FAILED' | 'RECOVERY_WATCH_FAILED' | 'REESTABLISH_SECRET_MISSING' | 'REESTABLISH_TIMEOUT_FORCE_CLOSED' | 'SEND_TX_SIGNATURES_FAILED' | 'SPLICE_BROADCAST_REFUSED' | 'SPLICE_INPUT_CONFLICT' | 'SPLICE_IN_FAILED' | 'SPLICE_OUT_FAILED' | 'COMPOSITE_SPLICE_ABORTED' | 'COMPOSITE_SPLICE_RESTORE_FAILED' | 'STARTUP_RECONNECT_FAILED' | 'STARTUP_REPAIR_COMPLETION_FAILED' | 'STARTUP_REPAIR_UNRECEIPTED' | 'STUCK_CHANNEL' | 'STUCK_CHANNEL_FORCE_CLOSED' | 'UPDATE_FEE_FAILED' | 'WAL_CHECKPOINT_FAILED' | 'WATCH_OUTPUT_FAILED'
+type node.NodeErrorCode = 'AUTO_FUNDING_FAILED' | 'AUTO_RECONNECT_FAILED' | 'BARRIER_DISPATCH_FAILED' | 'BLOCK_WORK_FAILED' | 'BOLT12_INVOICE_ERROR' | 'BROADCAST_FAILED' | 'BROADCAST_PERMANENT_FAILURE' | 'CHAIN_RESTORE_WATCH_FAILED' | 'CHAIN_WATCHER_ERROR' | 'CHAIN_WATCHER_START_FAILED' | 'CHANNEL_ERROR' | 'CHANNEL_FAILED_FORCE_CLOSED' | 'CHANNEL_FAILED_FORCE_CLOSE_FAILED' | 'CLOSE_CHANNEL_FAILED' | 'DURABILITY_BARRIER_TIMEOUT' | 'ERRORED_TIMEOUT_FORCE_CLOSED' | 'FORCE_CLOSE_FAILED' | 'FORCE_CLOSE_REVOKED' | 'FORWARD_TIMEOUT_FORCE_CLOSE' | 'FUNDING_BROADCAST_FAILED' | 'FUNDING_MISSING' | 'GRAPH_RESTORE_FAILED' | 'HTLC_CLAIM_FORCE_CLOSE' | 'HTLC_DEADLINE_HELD' | 'HTLC_EXPIRY_FORCE_CLOSE' | 'IROH_RELAY_ONLY_VIOLATED' | 'LISTEN_FAILED' | 'MESSAGE_TOO_LARGE' | 'NO_ROUTING_HINTS' | 'ONION_MESSAGE_ERROR' | 'ONION_PROCESSING_FAILED' | 'PERSISTENCE_ERROR' | 'PRESPLICE_WATCH_FAILED' | 'PROVIDE_EXTERNAL_WITNESS_FAILED' | 'RBF_OPEN_FAILED' | 'RECOVERY_WATCH_FAILED' | 'REESTABLISH_SECRET_MISSING' | 'REESTABLISH_TIMEOUT_FORCE_CLOSED' | 'SEND_TX_SIGNATURES_FAILED' | 'SPLICE_BROADCAST_REFUSED' | 'SPLICE_INPUT_CONFLICT' | 'SPLICE_IN_FAILED' | 'SPLICE_OUT_FAILED' | 'COMPOSITE_SPLICE_ABORTED' | 'COMPOSITE_SPLICE_RESTORE_FAILED' | 'STARTUP_RECONNECT_FAILED' | 'STARTUP_REPAIR_COMPLETION_FAILED' | 'STARTUP_REPAIR_UNRECEIPTED' | 'STUCK_CHANNEL' | 'STUCK_CHANNEL_FORCE_CLOSED' | 'UPDATE_FEE_FAILED' | 'WAL_CHECKPOINT_FAILED' | 'WATCH_OUTPUT_FAILED'
 const node.OUTGOING_CLTV_REJECT_DELTA = 3
 type node.OutgoingHtlcState = 'offered' | 'fulfilled' | 'failed' | 'onchain-pending' | 'onchain-resolved'
 enum node.PaymentDirection
@@ -8945,11 +8946,14 @@ method transport.IIrohEndpoint.address(): transport.IIrohAddress
 method transport.IIrohEndpoint.close(): Promise<void>
 method transport.IIrohEndpoint.connect(address: transport.IIrohAddress, timeoutMs: number): Promise<transport.IDuplexTransport>
 method transport.IIrohEndpoint.listen(onConnection: (socket: transport.IDuplexTransport) => void, onError: (error: Error) => void): void
+readonly property transport.IIrohEndpoint.relayOnly?: transport.IrohRelayOnlyMode
 method transport.IIrohEndpoint.stopListening(): void
 interface transport.IIrohEndpointOptions
 property transport.IIrohEndpointOptions.discovery?: boolean
 property transport.IIrohEndpointOptions.handshakeTimeoutMs?: number
 property transport.IIrohEndpointOptions.maxPendingInbound?: number
+property transport.IIrohEndpointOptions.onRelayOnlyViolation?: (error: transport.IrohRelayOnlyError) => void
+property transport.IIrohEndpointOptions.relayOnly?: boolean
 property transport.IIrohEndpointOptions.relays?: string[]
 property transport.IIrohEndpointOptions.secretKey: Uint8Array
 interface transport.IIrohStream
@@ -9056,6 +9060,10 @@ property transport.IWsFrame.masked: boolean
 property transport.IWsFrame.opcode: number
 property transport.IWsFrame.payload: Buffer
 type transport.IrohEndpointFactory = (options: transport.IIrohEndpointOptions) => Promise<transport.IIrohEndpoint>
+class transport.IrohRelayOnlyError extends Error
+constructor transport.IrohRelayOnlyError(message: string)
+readonly property transport.IrohRelayOnlyError.code = "IROH_RELAY_ONLY_VIOLATED"
+type transport.IrohRelayOnlyMode = 'native' | 'loopback-pin'
 class transport.IrohTransport extends transport.BufferedDataEmitter
 constructor transport.IrohTransport(stream: transport.IIrohStream)
 method transport.IrohTransport.destroy(error?: Error): this
@@ -9119,10 +9127,13 @@ method transport.PeerManager.freezeConnections(): void
 method transport.PeerManager.getAnnouncedAddresses(pubkey: string): Array<{ host: string; port: number; }>
 method transport.PeerManager.getConnectionInfo(pubkey: string): transport.IPeerConnectionInfo | undefined
 method transport.PeerManager.getIrohConnectionString(): string | undefined
+method transport.PeerManager.getIrohRelayOnlyFailure(): transport.IrohRelayOnlyError | undefined
+method transport.PeerManager.getIrohRelayOnlyMode(): transport.IrohRelayOnlyMode | undefined
 method transport.PeerManager.getPeer(pubkey: string): transport.Peer | undefined
 method transport.PeerManager.getPeerAddress(pubkey: string): { host: string; port: number; transport?: transport.IPeerTransportOptions; } | undefined
 method transport.PeerManager.getWebSocketListenerPort(): number | null
 method transport.PeerManager.isIrohEnabled(): boolean
+method transport.PeerManager.isIrohRelayOnly(): boolean
 method transport.PeerManager.isLanePeer(pubkey: string): boolean
 method transport.PeerManager.isListening(): boolean
 method transport.PeerManager.isListeningWebSocket(): boolean
@@ -9210,6 +9221,7 @@ function transport.inboundAddressKey(address: string | undefined): string | null
 function transport.initiatorAct1(state: transport.IHandshakeState, ephemeralPriv?: Buffer): Buffer
 function transport.initiatorAct3(state: transport.IHandshakeState): Buffer
 function transport.initiatorProcessAct2(state: transport.IHandshakeState, act2: Buffer): void
+function transport.isLoopbackSocketAddress(address: string): boolean
 function transport.isPrivateOrLoopbackHost(host: string): boolean
 function transport.normalizeIrohEndpointId(value: string): string
 function transport.parseIrohAddress(address: string): transport.IIrohAddress
@@ -9219,6 +9231,7 @@ function transport.resolveWebSocketConstructor(injected?: transport.WebSocketCon
 function transport.responderAct2(state: transport.IHandshakeState, ephemeralPriv?: Buffer): Buffer
 function transport.responderProcessAct1(state: transport.IHandshakeState, act1: Buffer): void
 function transport.responderProcessAct3(state: transport.IHandshakeState, act3: Buffer): Buffer
+function transport.routableSocketAddresses(addresses: string[]): string[]
 function transport.selectOutboundProxy(host: string, proxy: { host: string; port: number; } | undefined, scope?: transport.Socks5ProxyScope): { host: string; port: number; } | undefined
 function transport.socks5SocketFactory(proxy: { host: string; port: number; }, timeoutMs?: number): (host: string, port: number) => Promise<net#Socket>
 function transport.validateIrohRelayUrl(value: string): string

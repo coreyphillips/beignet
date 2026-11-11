@@ -141,6 +141,8 @@ import type {
 	IRoute
 } from '../lightning/gossip/types';
 import {
+	ADDRESS_TYPE_TORV2,
+	ADDRESS_TYPE_TORV3,
 	CHANNEL_FLAG_DISABLED,
 	encodeShortChannelId,
 	decodeShortChannelId
@@ -3358,6 +3360,21 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 					);
 				}
 			});
+			// Not refused: the address may be a tunnel or a VPS in front of
+			// the node. One that is the node's own undoes relay-only.
+			const clearnet = announcedAddresses.filter(
+				(addr) =>
+					addr.type !== ADDRESS_TYPE_TORV2 && addr.type !== ADDRESS_TYPE_TORV3
+			).length;
+			if (opts.iroh && opts.irohRelayOnly && clearnet > 0) {
+				this.log(
+					'warn',
+					`irohRelayOnly hides this node's IP address from Iroh peers, and ` +
+						`announceAddresses publishes ${clearnet} clearnet address(es) ` +
+						'to the whole network; make sure none of them is where this ' +
+						'node runs'
+				);
+			}
 		}
 
 		// Install the gossip-prime latch before the LightningNode exists: its
@@ -3400,7 +3417,8 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 				? {
 						factory: createNodeIrohEndpoint,
 						relays: opts.irohRelays,
-						discovery: opts.irohDiscovery
+						discovery: opts.irohDiscovery,
+						...(opts.irohRelayOnly ? { relayOnly: true } : {})
 				  }
 				: undefined,
 			autoReconnect: opts.autoReconnect ?? true,
@@ -6932,6 +6950,11 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 		if (irohUri) result.irohUri = irohUri;
 		if (this._irohListenError)
 			result.irohListenError = { ...this._irohListenError };
+		const relayOnly = this.node.getIrohRelayOnlyStatus();
+		if (relayOnly) {
+			result.irohRelayOnly = true;
+			if (relayOnly.mode) result.irohRelayOnlyMode = relayOnly.mode;
+		}
 		if (this._requestedListenPort !== undefined) {
 			result.listenPort = this._requestedListenPort;
 		}
@@ -9763,6 +9786,16 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	 */
 	private wireNodeErrorRelay(onError: BeignetNodeOptions['onError']): void {
 		this.node.on('node:error', (err: ILightningError) => {
+			if (err.code === 'IROH_RELAY_ONLY_VIOLATED') {
+				// The endpoint closed itself and nothing rebinds it.
+				this._irohBound = false;
+				this._irohListenError = {
+					port: 0,
+					state: 'failed',
+					message: err.message,
+					errno: err.code
+				};
+			}
 			const data: {
 				code: string;
 				message: string;

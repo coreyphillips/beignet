@@ -5474,6 +5474,17 @@ export function getOpenApiSpec(): Record<string, unknown> {
 							description: 'Iroh connection string, present while listening'
 						},
 						irohListenError: { $ref: '#/components/schemas/ListenerProblem' },
+						irohRelayOnly: {
+							type: 'boolean',
+							description:
+								'True when Iroh is configured relay-only (irohRelayOnly): no direct path is offered or taken, so a peer does not learn this node IP address; the relay operator still sees it'
+						},
+						irohRelayOnlyMode: {
+							type: 'string',
+							enum: ['native', 'loopback-pin'],
+							description:
+								'How the bound relay-only endpoint keeps to the relay, present while one is bound. native: the endpoint has no IP transport. loopback-pin: its sockets are bound to loopback, and it shuts down (irohListenError with errno IROH_RELAY_ONLY_VIOLATED, node:error IROH_RELAY_ONLY_VIOLATED) if the router ever grants it a port mapping'
+						},
 						websocketListenError: {
 							$ref: '#/components/schemas/ListenerProblem'
 						}

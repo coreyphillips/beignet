@@ -13,6 +13,10 @@ import { startDaemon, IStartedDaemon } from '../../src/cli/daemon';
 import { BeignetNode } from '../../src/cli/beignet-node';
 import { BeignetConfig, NodeInfo, PeerInfo } from '../../src/cli/types';
 import { SqliteStorage } from '../../src/lightning/storage/sqlite-storage';
+import {
+	IFakeIrohBinding,
+	fakeIrohBinding
+} from '../lightning/helpers/fake-iroh';
 
 const MNEMONIC =
 	'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about';
@@ -98,6 +102,53 @@ describe('Iroh daemon configuration', () => {
 		expect(options.iroh).to.equal(true);
 		expect(options.irohDiscovery).to.equal(false);
 		expect(options.irohRelays).to.deep.equal(config.irohRelays);
+	});
+	it('reads relay-only from the environment and forwards it to the daemon', () => {
+		const previous = process.env.BEIGNET_IROH_RELAY_ONLY;
+		try {
+			delete process.env.BEIGNET_IROH_RELAY_ONLY;
+			expect(irohBooleanEnv('BEIGNET_IROH_RELAY_ONLY')).to.equal(undefined);
+			process.env.BEIGNET_IROH_RELAY_ONLY = 'true';
+			expect(irohBooleanEnv('BEIGNET_IROH_RELAY_ONLY')).to.equal(true);
+			process.env.BEIGNET_IROH_RELAY_ONLY = '1';
+			expect(() => irohBooleanEnv('BEIGNET_IROH_RELAY_ONLY')).to.throw(
+				'exactly true or false'
+			);
+		} finally {
+			if (previous === undefined) delete process.env.BEIGNET_IROH_RELAY_ONLY;
+			else process.env.BEIGNET_IROH_RELAY_ONLY = previous;
+		}
+		const on = daemonOptions(
+			{ network: 'regtest', iroh: true, irohRelayOnly: true } as BeignetConfig,
+			0
+		);
+		expect(on.irohRelayOnly).to.equal(true);
+		const off = daemonOptions(
+			{ network: 'regtest', iroh: true } as BeignetConfig,
+			0
+		);
+		expect(off.irohRelayOnly).to.equal(undefined);
+	});
+	it('refuses relay-only with relays disabled, and a non-boolean value', async () => {
+		expect(() =>
+			validateIrohConfig({ irohRelayOnly: 'true' as unknown as boolean })
+		).to.throw('irohRelayOnly must be a boolean');
+		expect(() =>
+			validateIrohConfig({ iroh: true, irohRelayOnly: true, irohRelays: [] })
+		).to.throw('needs a relay');
+		// With Iroh off the switch has nothing to act on, and with relays left
+		// at their default there is one to use.
+		validateIrohConfig({ irohRelayOnly: true, irohRelays: [] });
+		validateIrohConfig({ iroh: true, irohRelayOnly: true });
+		const error = await BeignetNode.create({
+			iroh: true,
+			irohRelayOnly: true,
+			irohRelays: []
+		}).then(
+			() => null,
+			(err: Error) => err
+		);
+		expect(error?.message).to.contain('needs a relay');
 	});
 	it('rejects invalid settings before starting a node', async () => {
 		expect(() =>
@@ -225,5 +276,157 @@ describe('Iroh daemon surface', function () {
 		});
 		expect(invalid.status).to.equal(400);
 		expect(calls).to.have.length(1);
+	});
+});
+
+describe('Iroh relay-only daemon surface', function () {
+	this.timeout(20_000);
+	const PUBLIC_ADDRESS = '203.0.113.9:4433';
+	let daemon: IStartedDaemon | undefined;
+	let fake: IFakeIrohBinding | undefined;
+	let dir: string;
+	before(function () {
+		try {
+			require('@number0/iroh/index.js');
+		} catch {
+			this.skip();
+		}
+	});
+	beforeEach(() => {
+		dir = fs.mkdtempSync(path.join(os.tmpdir(), 'beignet-iroh-relay-only-'));
+	});
+	afterEach(async () => {
+		await daemon?.stop();
+		daemon = undefined;
+		fake?.restore();
+		fake = undefined;
+		fs.rmSync(dir, { recursive: true, force: true });
+	});
+	async function boot(
+		extra: Partial<Parameters<typeof startDaemon>[0]> = {}
+	): Promise<void> {
+		daemon = await startDaemon({
+			mnemonic: MNEMONIC,
+			network: 'regtest',
+			dataDir: dir,
+			daemonPort: 0,
+			electrumHost: '127.0.0.1',
+			electrumPort: 65529,
+			electrumTls: false,
+			rapidGossipSync: false,
+			autoGossipSync: false,
+			autoBootstrap: false,
+			autoReconnect: false,
+			logLevel: 'silent',
+			iroh: true,
+			irohRelayOnly: true,
+			irohDiscovery: false,
+			irohRelays: ['https://relay.example/'],
+			...extra
+		});
+	}
+	async function info(): Promise<NodeInfo> {
+		const port = (daemon!.server.address() as AddressInfo).port;
+		const response = await fetch(`http://127.0.0.1:${port}/info`);
+		return ((await response.json()) as { result: NodeInfo }).result;
+	}
+	async function until(check: () => Promise<boolean>): Promise<void> {
+		const deadline = Date.now() + 5_000;
+		while (!(await check())) {
+			if (Date.now() > deadline) throw new Error('condition timed out');
+			await new Promise((resolve) => setTimeout(resolve, 50));
+		}
+	}
+
+	it('reports the mode, publishes the link once a relay is known, and takes it down on a violation', async () => {
+		fake = fakeIrohBinding({ native: true });
+		const errors: Array<{ code: string; message: string }> = [];
+		await boot({ onError: (error) => errors.push(error) });
+		const endpoint = fake.builders[0].endpoint;
+		expect(fake.builders[0].calls).to.include('clearIpTransports');
+
+		const bound = await info();
+		expect(bound.irohRelayOnly).to.equal(true);
+		expect(bound.irohRelayOnlyMode).to.equal('native');
+		expect(bound.irohListenError).to.equal(undefined);
+		expect(bound.irohUri).to.equal(undefined);
+		expect(bound.listening).to.equal(true);
+
+		endpoint.relayUrl = 'https://relay.example/';
+		const linked = await info();
+		expect(linked.irohUri).to.contain('?relay=https%3A%2F%2Frelay.example%2F');
+
+		// The endpoint's own address list gains an address a peer could use.
+		endpoint.addresses = [PUBLIC_ADDRESS];
+		await until(async () => (await info()).irohListenError !== undefined);
+		const down = await info();
+		expect(down.irohListenError).to.deep.include({
+			state: 'failed',
+			errno: 'IROH_RELAY_ONLY_VIOLATED'
+		});
+		expect(down.irohListenError?.message).to.not.contain('203.0.113');
+		expect(down.irohUri).to.equal(undefined);
+		expect(down.irohRelayOnly).to.equal(true);
+		expect(down.irohRelayOnlyMode).to.equal(undefined);
+		expect(down.listening).to.equal(false);
+		expect(endpoint.closed).to.equal(true);
+		expect(errors.map((error) => error.code)).to.deep.equal([
+			'IROH_RELAY_ONLY_VIOLATED'
+		]);
+		// Nothing binds a second endpoint.
+		expect(fake.builders).to.have.length(1);
+	});
+
+	it('starts without the listener when relay-only cannot be kept at bind', async () => {
+		fake = fakeIrohBinding({
+			native: true,
+			endpoint: () => ({ addresses: [PUBLIC_ADDRESS] })
+		});
+		await boot();
+		const result = await info();
+		expect(result.irohRelayOnly).to.equal(true);
+		expect(result.irohRelayOnlyMode).to.equal(undefined);
+		expect(result.irohUri).to.equal(undefined);
+		expect(result.irohListenError).to.deep.include({
+			state: 'failed',
+			errno: 'IROH_RELAY_ONLY_VIOLATED'
+		});
+		expect(result.irohListenError?.message).to.not.contain('203.0.113');
+		expect(fake.builders[0].endpoint.closed).to.equal(true);
+	});
+
+	it('leaves the relay-only fields off /info for an ordinary Iroh node', async () => {
+		fake = fakeIrohBinding();
+		await boot({ irohRelayOnly: false });
+		const result = await info();
+		expect(result).to.not.have.property('irohRelayOnly');
+		expect(result).to.not.have.property('irohRelayOnlyMode');
+		expect(fake.builders[0].bindAddrs).to.deep.equal([]);
+	});
+
+	it('warns when a clearnet address is announced beside relay-only', async () => {
+		fake = fakeIrohBinding({ native: true });
+		const warnings: string[] = [];
+		const logger = {
+			debug: (): void => undefined,
+			info: (): void => undefined,
+			warn: (message: string): void => {
+				warnings.push(message);
+			},
+			error: (): void => undefined
+		};
+		await boot({
+			logLevel: 'warn',
+			logger,
+			announceAddresses: [
+				'203.0.113.7:9735',
+				'vww6ybal4bd7szmgncyruucpgfkqahzddi37ktceo3ah7ngmcopnpyyd.onion:9735'
+			]
+		});
+		const about = warnings.filter((message) =>
+			message.includes('irohRelayOnly')
+		);
+		expect(about).to.have.length(1);
+		expect(about[0]).to.contain('1 clearnet address');
 	});
 });

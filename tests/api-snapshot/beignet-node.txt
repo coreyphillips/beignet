@@ -1004,6 +1004,7 @@ property InvoiceInfo.status?: 'PENDING' | 'PAID' | 'EXPIRED'
 unexported interface IrohDaemonConfig
 property IrohDaemonConfig.iroh?: boolean
 property IrohDaemonConfig.irohDiscovery?: boolean
+property IrohDaemonConfig.irohRelayOnly?: boolean
 property IrohDaemonConfig.irohRelays?: string[]
 interface JitInvoiceInfo extends InvoiceInfo
 property JitInvoiceInfo.feeMode: 'skim' | 'hop'
@@ -1078,6 +1079,8 @@ property NodeInfo.channelCount: number
 property NodeInfo.erroredBalanceSats: number
 property NodeInfo.irohAvailable?: boolean
 property NodeInfo.irohListenError?: ListenerProblem
+property NodeInfo.irohRelayOnly?: boolean
+property NodeInfo.irohRelayOnlyMode?: beignet/lightning#transport.IrohRelayOnlyMode
 property NodeInfo.irohUri?: string
 property NodeInfo.lightningBalanceSats: number
 property NodeInfo.listenError?: ListenerProblem

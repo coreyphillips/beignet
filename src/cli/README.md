@@ -186,6 +186,7 @@ await node.destroy();
 | `iroh?` | `boolean` | Experimental phone link. Peers and relays can see your IP address. |
 | `irohRelays?` | `string[]` | Custom relays replace the public defaults. Empty disables relays. |
 | `irohDiscovery?` | `boolean` | Public endpoint discovery and publication (default true when enabled). |
+| `irohRelayOnly?` | `boolean` | Keep every Iroh connection on the relay (default false). No direct path is offered or taken, so someone who holds the node's Iroh link cannot learn its IP address; the relay operator still sees it. Slower than a direct path. Needs a relay, and learned addresses are then dialed through the SOCKS5 proxy or not at all. With an Iroh binding that cannot remove its IP transport, the node stops serving Iroh on a network whose router grants port mappings (see the Iroh section). |
 | `electrumTlsVerify?` | `boolean` | Verify Electrum TLS certificates (default false). Every TLS connection the wallet opens, to the configured server or to a public fallback, is accepted only when its certificate chains to a trusted CA and matches the host name, or when its SHA-256 fingerprint is in electrumTlsFingerprints. |
 | `electrumTlsFingerprints?` | `string[]` | SHA-256 fingerprints of Electrum certificates to accept without a CA, for servers with self-signed certificates. Hex with or without colons, as printed by `openssl x509 -noout -fingerprint -sha256`. Needs electrumTlsVerify. |
 <!-- options:BeignetNodeOptions:end -->
@@ -2367,12 +2368,64 @@ your IP address. There is no automatic switch of existing peers to Iroh.
 | `BEIGNET_IROH` | Exactly `true` enables the experimental transport; unset or `false` leaves it off |
 | `BEIGNET_IROH_RELAYS` | Comma-separated HTTP(S) relay URLs replacing n0's public defaults; an empty value disables relays |
 | `BEIGNET_IROH_DISCOVERY` | Exactly `false` disables public endpoint discovery and publication; defaults to `true` when Iroh is enabled |
+| `BEIGNET_IROH_RELAY_ONLY` | Exactly `true` keeps every Iroh connection on the relay so a peer never learns this node's IP address; unset or `false` allows direct paths |
 
-The corresponding config keys are `iroh`, `irohRelays` and `irohDiscovery`.
+The corresponding config keys are `iroh`, `irohRelays`, `irohDiscovery` and
+`irohRelayOnly`.
 Discovery and relay selection are independent. To avoid public discovery and
 public relays, disable discovery and provide your own relay URLs. With discovery
 disabled, a dial requires a relay hint, and `/info` waits for a home relay before
 publishing the URI. No inbound port mapping or router forwarding is required.
+
+#### Relay-only
+
+By default, anyone who dials the node's Iroh link learns its IP address while the
+two endpoints look for a direct path, so the link is only safe in the owner's
+hands. `BEIGNET_IROH_RELAY_ONLY=true` (config key `irohRelayOnly`) keeps every
+Iroh connection on the relay, inbound and outbound. The node offers no IP address
+to a peer and takes no direct path, so the link can be given to someone else.
+
+What that costs and what it does not cover:
+
+- The relay operator still sees the node's IP address, along with endpoint
+  identities, timing and traffic volume. With the default relays that is n0. Set
+  `irohRelays` to a relay you run to keep it to yourself.
+- Every packet takes the relay. The qualification run in
+  `docs/IROH-QUALIFICATION-2026-10-03.md` measured a median payment of 306 ms on
+  the relay path against 177 to 236 ms on a direct one.
+- It needs a relay: an empty `irohRelays` with `irohRelayOnly` refuses startup.
+  `/info` publishes `irohUri` once the node has a home relay.
+- It covers Iroh. Whoever is given an address to dial sees where the dial comes
+  from, so a relay-only node also dials addresses it merely learned (a channel
+  peer's announced address, a node found through gossip or DNS seeds, a
+  direct-funding lane) through the SOCKS5 proxy (`BEIGNET_TOR_PROXY`) or not at
+  all. Addresses you pass to `peer connect` yourself are dialed as before, and so
+  is an address stored before the mode was switched on.
+- `announceAddresses` still publishes what you put in it. Startup logs a warning
+  when it holds a clearnet address.
+
+`/info` reports `irohRelayOnly: true` and, while the endpoint is bound,
+`irohRelayOnlyMode`:
+
+| Mode | Meaning |
+| --- | --- |
+| `native` | The Iroh binding removed the endpoint's IP transport. It has no socket to send from, asks the router for nothing and discovers no address. |
+| `loopback-pin` | The binding cannot remove the IP transport (`@number0/iroh` up to 1.2.0), so its UDP sockets are bound to loopback. No direct path can form, but Iroh still asks the router for a port mapping. |
+
+`loopback-pin` is best effort. Where the router answers UPnP, NAT-PMP or PCP,
+Iroh adds the mapped public address to the endpoint's own address list. The node
+watches that list for as long as the endpoint lives, and for the first twelve
+seconds the endpoint stays silent: it accepts no connection, makes none, and
+`/info` carries no `irohUri`. Startup is not held up by the watch. When a
+routable address appears the node closes the endpoint and does not bind another:
+`/info` carries `irohListenError` with `errno: "IROH_RELAY_ONLY_VIOLATED"`, and
+`node:error` is raised with that code (`LISTEN_FAILED` instead when the address
+is already there as the endpoint binds). The message counts the addresses and
+never prints them. So on a home network with port mapping switched on,
+`loopback-pin` refuses to run. Turn port mapping off on the router, or run the
+node on a bridged container network (Umbrel's default), where no router answers.
+A mapping first granted while peers are connected can reach them in the moment
+before the endpoint closes.
 
 `GET /info` includes `irohAvailable: true` for engines with this integration, plus
 `irohUri` while an Iroh connection string is available. The URI has the form:

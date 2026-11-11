@@ -298,7 +298,11 @@ export function resolveNodeConfig(
 			(a, b) => a.type - b.type
 		),
 		socks5ProxyScope: input.socks5ProxyScope ?? 'all',
-		learnedAddressDials: input.learnedAddressDials ?? 'any',
+		// A relay-only Iroh endpoint hides the node's address, and one direct
+		// dial to an address a peer named would give it away.
+		learnedAddressDials: input.iroh?.relayOnly
+			? 'proxy-only'
+			: input.learnedAddressDials ?? 'any',
 		watchtowers: input.watchtowers ?? [],
 		// Anchors are the default channel type now that wallet-funded fee
 		// bumping makes their force-close safe.

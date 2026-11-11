@@ -5,7 +5,10 @@
 
 import type { IrohDaemonConfig } from './iroh-config';
 import type { ElectrumTlsConfig } from './electrum-tls-config';
-import type { IIrohDiagnostics } from '../lightning/transport/iroh';
+import type {
+	IIrohDiagnostics,
+	IrohRelayOnlyMode
+} from '../lightning/transport/iroh';
 import type { TLogLevel } from '../logger';
 import type { IGuardianConfigEntry } from '../lightning/recovery/assembly';
 import type { IGraphRestoreStats } from '../lightning/node/types';
@@ -32,6 +35,14 @@ export interface NodeInfo {
 	/** Present only while accepting Iroh peers. */
 	irohUri?: string;
 	irohListenError?: ListenerProblem;
+	/** True when Iroh is configured relay-only (irohRelayOnly). */
+	irohRelayOnly?: boolean;
+	/**
+	 * How the bound endpoint keeps to the relay, present while one is bound:
+	 * `native` has no IP transport at all, `loopback-pin` binds its sockets to
+	 * loopback and shuts down if the router ever maps a port for it.
+	 */
+	irohRelayOnlyMode?: IrohRelayOnlyMode;
 	nodeId: string;
 	alias?: string;
 	network: string;
@@ -99,7 +110,11 @@ export interface ListenerProblem {
 	state: 'failed' | 'held' | 'fenced';
 	/** The OS error, or why the bind is held. */
 	message: string;
-	/** The OS error code (EADDRINUSE, EACCES, ...) when the OS refused. */
+	/**
+	 * The OS error code (EADDRINUSE, EACCES, ...) when the OS refused, or
+	 * IROH_RELAY_ONLY_VIOLATED when a relay-only Iroh endpoint could not keep
+	 * the node's address private.
+	 */
 	errno?: string;
 }
 
