@@ -280,6 +280,7 @@ export class Peer extends EventEmitter {
 					throw new Error('Peer aborted while connecting');
 				}
 				this.socket.setKeepAlive(true, TCP_KEEPALIVE_DELAY_MS);
+				this.socket.setNoDelay?.(true);
 				// Set handshake timeout
 				this.socket.setTimeout(this.handshakeTimeoutMs);
 				this.socket.once('timeout', () => {
@@ -315,6 +316,12 @@ export class Peer extends EventEmitter {
 					reject(err);
 				};
 				this.socket = nodeNet().connect(this.port, this.host);
+				// A Lightning message is one small write, and the next often
+				// follows before the first is acknowledged: a commitment after
+				// an HTLC, a revocation after a commitment. Nagle's algorithm
+				// holds that second write back until the acknowledgement
+				// arrives, which the other end may itself delay.
+				this.socket.setNoDelay?.(true);
 
 				// Set TCP connect timeout
 				this.socket.setTimeout(this.connectTimeoutMs);
@@ -381,6 +388,7 @@ export class Peer extends EventEmitter {
 		this.state = 'handshaking';
 		this.aborted = false;
 		socket.setKeepAlive(true, TCP_KEEPALIVE_DELAY_MS);
+		socket.setNoDelay?.(true);
 
 		let abortEstablish: (err: Error) => void = () => undefined;
 		const abortPromise = new Promise<never>((_, reject) => {
