@@ -115,6 +115,27 @@ section of the CLI README); setup and the restart phase wait for it. A Docker
 bridge has no router that grants port mappings, so `loopback-pin` holds here.
 That part of the design is not exercised by this fixture.
 
+## What discovery publishes
+
+`discovery-record.cjs` is a check for the host, not for the containers. It
+binds two throwaway Iroh endpoints with fresh keys, one as Iroh binds by
+default and one with its UDP sockets on loopback as relay-only binds them, and
+reads each one's discovery record back from n0's DNS server three times over
+half a minute. It prints kinds and counts and never an address.
+
+```sh
+node discovery-record.cjs
+```
+
+It exits 0 when no record carried an address, 1 when one did, and 2 when no
+record could be read. A run shows something only where an endpoint holds an
+address a stranger could route to (`anEndpointHeldARoutableAddress`), and a
+home network with port mapping is such a place.
+
+On 2026-11-11, with binding 1.1.0 on a home network with port mapping, the
+default endpoint held two routable addresses and the loopback-bound one held
+one. All six records read carried a relay URL and no address.
+
 ## Teardown
 
 Either compose file:

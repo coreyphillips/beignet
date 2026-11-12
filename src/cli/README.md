@@ -2497,6 +2497,16 @@ node on a bridged container network (Umbrel's default), where no router answers.
 A mapping first granted while peers are connected can reach them in the moment
 before the endpoint closes.
 
+Iroh's discovery is not a second way out. With the default preset the endpoint
+publishes a signed record to n0's DNS server so that others can find it by its
+id, and the node does not hold that back during the watch. Iroh publishes relay
+addresses only: it drops every IP address before it signs the record (the
+publisher's default, `AddrFilter::relay_only`, in the Iroh that the bindings up
+to 1.2.0 are built on). Read back from n0's server on a home network with port
+mapping, the record of an endpoint that held a routable address carried its
+relay URL and nothing else. `scripts/regtest-live/iroh-qualification/discovery-record.cjs`
+repeats the check.
+
 `GET /info` includes `irohAvailable: true` for engines with this integration, plus
 `irohUri` while an Iroh connection string is available. The URI has the form:
 
