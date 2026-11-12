@@ -1,0 +1,401 @@
+{
+	"date": "2026-11-11",
+	"engine": "beignet 0.38.4 at commit 5ccf0c11 (the Porch daemon surface), packed from the working tree",
+	"runtime": {"node": "v22.23.4", "platform": "linux", "architecture": "arm64", "tor": "0.4.9.11", "caddy": "2.10.2", "docker": "29.9.2"},
+	"host": {"cpus": 18, "note": "hostLoad is the one-minute load average of the machine the containers ran on, read as each measurement finished. Other work ran on it throughout."},
+	"paths": {
+		"porch": {
+			"startedAt": "2026-11-11T22:42:30.445Z",
+			"finishedAt": "2026-11-11T23:04:48.905Z",
+			"passed": true,
+			"addresses": {"primary": "172.24.0.6", "phone": "172.24.0.4", "relay": "172.24.0.3", "tor": "172.24.0.5", "caddy": "172.24.0.2"},
+			"baseline": {
+				"hostLoad": 6.1,
+				"payments": 40,
+				"completed": 40,
+				"engineMs": {"p50": 91, "p95": 120, "max": 131, "mean": 95},
+				"engineMsByPayer": {"phone": [99, 106, 109, 111, 88, 91, 86, 94, 102, 84, 85, 87, 87, 94, 88, 89, 86, 93, 99, 90], "primary": [131, 114, 93, 91, 86, 86, 97, 83, 85, 88, 85, 89, 118, 91, 90, 85, 120, 85, 100, 103]}
+			},
+			"latency": {
+				"msPerMsOneWay": 3.9,
+				"points": [
+					{"addedMsOneWay": 0, "hostLoad": 6.1, "payments": 20, "p50": 89, "p95": 107, "max": 107, "mean": 90},
+					{"addedMsOneWay": 20, "hostLoad": 5.6, "payments": 20, "p50": 162, "p95": 187, "max": 187, "mean": 164},
+					{"addedMsOneWay": 40, "hostLoad": 5.4, "payments": 20, "p50": 245, "p95": 262, "max": 262, "mean": 246}
+				]
+			},
+			"restarts": [
+				{"role": "phone", "restartMs": 692, "usableMs": 735, "firstPaymentMs": 1545, "processUsableMs": 330, "paymentsMs": [106, 102]},
+				{"role": "phone", "restartMs": 676, "usableMs": 761, "firstPaymentMs": 1579, "processUsableMs": 332, "paymentsMs": [119, 101]},
+				{"role": "phone", "restartMs": 727, "usableMs": 1068, "firstPaymentMs": 2280, "processUsableMs": 444, "paymentsMs": [233, 179]},
+				{"role": "primary", "restartMs": 693, "usableMs": 1041, "firstPaymentMs": 1978, "processUsableMs": 526, "paymentsMs": [153, 136]},
+				{"role": "primary", "restartMs": 686, "usableMs": 952, "firstPaymentMs": 1835, "processUsableMs": 508, "paymentsMs": [140, 129]},
+				{"role": "primary", "restartMs": 680, "usableMs": 1031, "firstPaymentMs": 2002, "processUsableMs": 418, "paymentsMs": [155, 136]},
+				{"role": "relay", "restartMs": 165, "usableMs": 1971, "firstPaymentMs": 2873, "processUsableMs": null, "paymentsMs": [127, 140]},
+				{"role": "relay", "restartMs": 193, "usableMs": 1533, "firstPaymentMs": 2443, "processUsableMs": null, "paymentsMs": [134, 140]},
+				{"role": "relay", "restartMs": 168, "usableMs": 1133, "firstPaymentMs": 2048, "processUsableMs": null, "paymentsMs": [134, 124]}
+			],
+			"outages": [
+				{"seconds": 30, "blockedMs": 32098, "usableMs": 74, "firstPaymentMs": 5797, "paymentsMs": [5330, 140]},
+				{"seconds": 120, "blockedMs": 122295, "usableMs": 8422, "firstPaymentMs": 9383, "paymentsMs": [159, 144]},
+				{"seconds": 300, "blockedMs": 302188, "usableMs": 86, "firstPaymentMs": 993, "paymentsMs": [143, 139]}
+			],
+			"leakChecks": [
+				{"label": "baseline", "packets": {"phone": {"primary": {"out": 0, "in": 0}}, "primary": {"phone": {"out": 0, "in": 0}, "relay": {"out": 404, "in": 404}}, "relay": {"primary": {"out": 404, "in": 404}}}, "dialedSinceStart": {"primary": {}, "phone": {}}, "primaryHoldsForPeer": [{"host": "porch:relay:2114", "port": 0, "transport": "ws", "porch": {"relay": "relay:2114", "link": "0b655de797672cc59840f4b45a9c9c3a"}}], "phoneHoldsForPeer": [{"host": "relay", "port": 2114, "transport": "ws"}], "relays": [{"relay": "ws://relay:2114", "state": "ready", "idle": 2, "circuits": 1, "proxied": false}]},
+				{"label": "after phone restart 1", "packets": {"phone": {"primary": {"out": 0, "in": 0}}, "primary": {"phone": {"out": 0, "in": 0}, "relay": {"out": 940, "in": 990}}, "relay": {"primary": {"out": 990, "in": 940}}}, "dialedSinceStart": {"primary": {"relay:2114": 1}, "phone": {"192.168.65.254:60001": 1, "relay:2114": 1}}, "primaryHoldsForPeer": [{"host": "porch:relay:2114", "port": 0, "transport": "ws", "porch": {"relay": "relay:2114", "link": "0b655de797672cc59840f4b45a9c9c3a"}}], "phoneHoldsForPeer": [{"host": "relay", "port": 2114, "transport": "ws"}], "relays": [{"relay": "ws://relay:2114", "state": "ready", "idle": 2, "circuits": 1, "proxied": false}]},
+				{"label": "after phone restart 2", "packets": {"phone": {"primary": {"out": 0, "in": 0}}, "primary": {"phone": {"out": 0, "in": 0}, "relay": {"out": 1001, "in": 1052}}, "relay": {"primary": {"out": 1052, "in": 1001}}}, "dialedSinceStart": {"primary": {"relay:2114": 2}, "phone": {"192.168.65.254:60001": 1, "relay:2114": 1}}, "primaryHoldsForPeer": [{"host": "porch:relay:2114", "port": 0, "transport": "ws", "porch": {"relay": "relay:2114", "link": "0b655de797672cc59840f4b45a9c9c3a"}}], "phoneHoldsForPeer": [{"host": "relay", "port": 2114, "transport": "ws"}], "relays": [{"relay": "ws://relay:2114", "state": "ready", "idle": 2, "circuits": 1, "proxied": false}]},
+				{"label": "after phone restart 3", "packets": {"phone": {"primary": {"out": 0, "in": 0}}, "primary": {"phone": {"out": 0, "in": 0}, "relay": {"out": 1066, "in": 1113}}, "relay": {"primary": {"out": 1113, "in": 1066}}}, "dialedSinceStart": {"primary": {"relay:2114": 3}, "phone": {"192.168.65.254:60001": 1, "relay:2114": 1}}, "primaryHoldsForPeer": [{"host": "porch:relay:2114", "port": 0, "transport": "ws", "porch": {"relay": "relay:2114", "link": "0b655de797672cc59840f4b45a9c9c3a"}}], "phoneHoldsForPeer": [{"host": "relay", "port": 2114, "transport": "ws"}], "relays": [{"relay": "ws://relay:2114", "state": "ready", "idle": 2, "circuits": 1, "proxied": false}]},
+				{"label": "after primary restart 1", "packets": {"phone": {"primary": {"out": 0, "in": 0}}, "primary": {"phone": {"out": 0, "in": 0}, "relay": {"out": 1138, "in": 1186}}, "relay": {"primary": {"out": 1197, "in": 1145}}}, "dialedSinceStart": {"primary": {"192.168.65.254:60001": 1, "relay:2114": 3}, "phone": {"192.168.65.254:60001": 1, "relay:2114": 2}}, "primaryHoldsForPeer": [{"host": "porch:relay:2114", "port": 0, "transport": "ws", "porch": {"relay": "relay:2114", "link": "0b655de797672cc59840f4b45a9c9c3a"}}], "phoneHoldsForPeer": [{"host": "relay", "port": 2114, "transport": "ws"}], "relays": [{"relay": "ws://relay:2114", "state": "ready", "idle": 2, "circuits": 1, "proxied": false}]},
+				{"label": "after primary restart 2", "packets": {"phone": {"primary": {"out": 0, "in": 0}}, "primary": {"phone": {"out": 0, "in": 0}, "relay": {"out": 1207, "in": 1254}}, "relay": {"primary": {"out": 1276, "in": 1221}}}, "dialedSinceStart": {"primary": {"192.168.65.254:60001": 1, "relay:2114": 3}, "phone": {"192.168.65.254:60001": 1, "relay:2114": 3}}, "primaryHoldsForPeer": [{"host": "porch:relay:2114", "port": 0, "transport": "ws", "porch": {"relay": "relay:2114", "link": "0b655de797672cc59840f4b45a9c9c3a"}}], "phoneHoldsForPeer": [{"host": "relay", "port": 2114, "transport": "ws"}], "relays": [{"relay": "ws://relay:2114", "state": "ready", "idle": 2, "circuits": 1, "proxied": false}]},
+				{"label": "after primary restart 3", "packets": {"phone": {"primary": {"out": 0, "in": 0}}, "primary": {"phone": {"out": 0, "in": 0}, "relay": {"out": 1275, "in": 1323}}, "relay": {"primary": {"out": 1356, "in": 1296}}}, "dialedSinceStart": {"primary": {"192.168.65.254:60001": 1, "relay:2114": 3}, "phone": {"192.168.65.254:60001": 1, "relay:2114": 4}}, "primaryHoldsForPeer": [{"host": "porch:relay:2114", "port": 0, "transport": "ws", "porch": {"relay": "relay:2114", "link": "0b655de797672cc59840f4b45a9c9c3a"}}], "phoneHoldsForPeer": [{"host": "relay", "port": 2114, "transport": "ws"}], "relays": [{"relay": "ws://relay:2114", "state": "ready", "idle": 2, "circuits": 1, "proxied": false}]},
+				{"label": "after relay restart 1", "packets": {"phone": {"primary": {"out": 0, "in": 0}}, "primary": {"phone": {"out": 0, "in": 0}, "relay": {"out": 1351, "in": 1401}}, "relay": {"primary": {"out": 1426, "in": 1367}}}, "dialedSinceStart": {"primary": {"192.168.65.254:60001": 1, "relay:2114": 8}, "phone": {"192.168.65.254:60001": 1, "relay:2114": 5}}, "primaryHoldsForPeer": [{"host": "porch:relay:2114", "port": 0, "transport": "ws", "porch": {"relay": "relay:2114", "link": "0b655de797672cc59840f4b45a9c9c3a"}}], "phoneHoldsForPeer": [{"host": "relay", "port": 2114, "transport": "ws"}], "relays": [{"relay": "ws://relay:2114", "state": "ready", "idle": 2, "circuits": 1, "proxied": false}]},
+				{"label": "after relay restart 2", "packets": {"phone": {"primary": {"out": 0, "in": 0}}, "primary": {"phone": {"out": 0, "in": 0}, "relay": {"out": 1426, "in": 1477}}, "relay": {"primary": {"out": 1494, "in": 1437}}}, "dialedSinceStart": {"primary": {"192.168.65.254:60001": 1, "relay:2114": 13}, "phone": {"192.168.65.254:60001": 1, "relay:2114": 6}}, "primaryHoldsForPeer": [{"host": "porch:relay:2114", "port": 0, "transport": "ws", "porch": {"relay": "relay:2114", "link": "0b655de797672cc59840f4b45a9c9c3a"}}], "phoneHoldsForPeer": [{"host": "relay", "port": 2114, "transport": "ws"}], "relays": [{"relay": "ws://relay:2114", "state": "ready", "idle": 2, "circuits": 1, "proxied": false}]},
+				{"label": "after relay restart 3", "packets": {"phone": {"primary": {"out": 0, "in": 0}}, "primary": {"phone": {"out": 0, "in": 0}, "relay": {"out": 1507, "in": 1555}}, "relay": {"primary": {"out": 1564, "in": 1513}}}, "dialedSinceStart": {"primary": {"192.168.65.254:60001": 1, "relay:2114": 18}, "phone": {"192.168.65.254:60001": 1, "relay:2114": 7}}, "primaryHoldsForPeer": [{"host": "porch:relay:2114", "port": 0, "transport": "ws", "porch": {"relay": "relay:2114", "link": "0b655de797672cc59840f4b45a9c9c3a"}}], "phoneHoldsForPeer": [{"host": "relay", "port": 2114, "transport": "ws"}], "relays": [{"relay": "ws://relay:2114", "state": "ready", "idle": 2, "circuits": 1, "proxied": false}]},
+				{"label": "before the 30 s outage", "packets": {"phone": {"primary": {"out": 0, "in": 0}}, "primary": {"phone": {"out": 0, "in": 0}, "relay": {"out": 1523, "in": 1572}}, "relay": {"primary": {"out": 1581, "in": 1529}}}, "dialedSinceStart": {"primary": {"192.168.65.254:60001": 1, "relay:2114": 18}, "phone": {"192.168.65.254:60001": 1, "relay:2114": 7}}, "primaryHoldsForPeer": [{"host": "porch:relay:2114", "port": 0, "transport": "ws", "porch": {"relay": "relay:2114", "link": "0b655de797672cc59840f4b45a9c9c3a"}}], "phoneHoldsForPeer": [{"host": "relay", "port": 2114, "transport": "ws"}], "relays": [{"relay": "ws://relay:2114", "state": "ready", "idle": 2, "circuits": 1, "proxied": false}]},
+				{"label": "during the 30 s outage", "packets": {"phone": {"primary": {"out": 0, "in": 0}}, "primary": {"phone": {"out": 0, "in": 0}, "relay": {"out": 1526, "in": 1577}}, "relay": {"primary": {"out": 1586, "in": 1532}}}, "dialedSinceStart": {"primary": {"192.168.65.254:60001": 1, "relay:2114": 18}, "phone": {"192.168.65.254:60001": 4, "relay:2114": 7}}, "primaryHoldsForPeer": [{"host": "porch:relay:2114", "port": 0, "transport": "ws", "porch": {"relay": "relay:2114", "link": "0b655de797672cc59840f4b45a9c9c3a"}}], "phoneHoldsForPeer": [{"host": "relay", "port": 2114, "transport": "ws"}], "relays": [{"relay": "ws://relay:2114", "state": "ready", "idle": 2, "circuits": 1, "proxied": false}]},
+				{"label": "after the 30 s outage", "packets": {"phone": {"primary": {"out": 0, "in": 0}}, "primary": {"phone": {"out": 0, "in": 0}, "relay": {"out": 1546, "in": 1600}}, "relay": {"primary": {"out": 1609, "in": 1552}}}, "dialedSinceStart": {"primary": {"192.168.65.254:60001": 1, "relay:2114": 18}, "phone": {"192.168.65.254:60001": 5, "relay:2114": 7}}, "primaryHoldsForPeer": [{"host": "porch:relay:2114", "port": 0, "transport": "ws", "porch": {"relay": "relay:2114", "link": "0b655de797672cc59840f4b45a9c9c3a"}}], "phoneHoldsForPeer": [{"host": "relay", "port": 2114, "transport": "ws"}], "relays": [{"relay": "ws://relay:2114", "state": "ready", "idle": 2, "circuits": 1, "proxied": false}]},
+				{"label": "before the 120 s outage", "packets": {"phone": {"primary": {"out": 0, "in": 0}}, "primary": {"phone": {"out": 0, "in": 0}, "relay": {"out": 1558, "in": 1619}}, "relay": {"primary": {"out": 1628, "in": 1564}}}, "dialedSinceStart": {"primary": {"192.168.65.254:60001": 1, "relay:2114": 18}, "phone": {"192.168.65.254:60001": 5, "relay:2114": 7}}, "primaryHoldsForPeer": [{"host": "porch:relay:2114", "port": 0, "transport": "ws", "porch": {"relay": "relay:2114", "link": "0b655de797672cc59840f4b45a9c9c3a"}}], "phoneHoldsForPeer": [{"host": "relay", "port": 2114, "transport": "ws"}], "relays": [{"relay": "ws://relay:2114", "state": "ready", "idle": 2, "circuits": 1, "proxied": false}]},
+				{"label": "during the 120 s outage", "packets": {"phone": {"primary": {"out": 0, "in": 0}}, "primary": {"phone": {"out": 0, "in": 0}, "relay": {"out": 1576, "in": 1649}}, "relay": {"primary": {"out": 1658, "in": 1582}}}, "dialedSinceStart": {"primary": {"192.168.65.254:60001": 1, "relay:2114": 18}, "phone": {"192.168.65.254:60001": 17, "relay:2114": 10}}, "primaryHoldsForPeer": [], "phoneHoldsForPeer": [], "relays": [{"relay": "ws://relay:2114", "state": "ready", "idle": 2, "circuits": 0, "proxied": false}]},
+				{"label": "after the 120 s outage", "packets": {"phone": {"primary": {"out": 0, "in": 0}}, "primary": {"phone": {"out": 0, "in": 0}, "relay": {"out": 1642, "in": 1716}}, "relay": {"primary": {"out": 1725, "in": 1648}}}, "dialedSinceStart": {"primary": {"192.168.65.254:60001": 1, "relay:2114": 21}, "phone": {"192.168.65.254:60001": 19, "relay:2114": 11}}, "primaryHoldsForPeer": [{"host": "porch:relay:2114", "port": 0, "transport": "ws", "porch": {"relay": "relay:2114", "link": "0b655de797672cc59840f4b45a9c9c3a"}}], "phoneHoldsForPeer": [{"host": "relay", "port": 2114, "transport": "ws"}], "relays": [{"relay": "ws://relay:2114", "state": "ready", "idle": 2, "circuits": 1, "proxied": false}]},
+				{"label": "before the 300 s outage", "packets": {"phone": {"primary": {"out": 0, "in": 0}}, "primary": {"phone": {"out": 0, "in": 0}, "relay": {"out": 1668, "in": 1743}}, "relay": {"primary": {"out": 1752, "in": 1674}}}, "dialedSinceStart": {"primary": {"192.168.65.254:60001": 1, "relay:2114": 22}, "phone": {"192.168.65.254:60001": 19, "relay:2114": 11}}, "primaryHoldsForPeer": [{"host": "porch:relay:2114", "port": 0, "transport": "ws", "porch": {"relay": "relay:2114", "link": "0b655de797672cc59840f4b45a9c9c3a"}}], "phoneHoldsForPeer": [{"host": "relay", "port": 2114, "transport": "ws"}], "relays": [{"relay": "ws://relay:2114", "state": "ready", "idle": 2, "circuits": 1, "proxied": false}]},
+				{"label": "during the 300 s outage", "packets": {"phone": {"primary": {"out": 0, "in": 0}}, "primary": {"phone": {"out": 0, "in": 0}, "relay": {"out": 1703, "in": 1808}}, "relay": {"primary": {"out": 1817, "in": 1709}}}, "dialedSinceStart": {"primary": {"192.168.65.254:60001": 1, "relay:2114": 22}, "phone": {"192.168.65.254:60001": 49, "relay:2114": 18}}, "primaryHoldsForPeer": [], "phoneHoldsForPeer": [], "relays": [{"relay": "ws://relay:2114", "state": "ready", "idle": 2, "circuits": 0, "proxied": false}]},
+				{"label": "after the 300 s outage", "packets": {"phone": {"primary": {"out": 0, "in": 0}}, "primary": {"phone": {"out": 0, "in": 0}, "relay": {"out": 1746, "in": 1849}}, "relay": {"primary": {"out": 1858, "in": 1752}}}, "dialedSinceStart": {"primary": {"192.168.65.254:60001": 1, "relay:2114": 23}, "phone": {"192.168.65.254:60001": 50, "relay:2114": 18}}, "primaryHoldsForPeer": [{"host": "porch:relay:2114", "port": 0, "transport": "ws", "porch": {"relay": "relay:2114", "link": "0b655de797672cc59840f4b45a9c9c3a"}}], "phoneHoldsForPeer": [{"host": "relay", "port": 2114, "transport": "ws"}], "relays": [{"relay": "ws://relay:2114", "state": "ready", "idle": 2, "circuits": 1, "proxied": false}]},
+				{"label": "end", "packets": {"phone": {"primary": {"out": 0, "in": 0}}, "primary": {"phone": {"out": 0, "in": 0}, "relay": {"out": 1761, "in": 1865}}, "relay": {"primary": {"out": 1874, "in": 1767}}}, "dialedSinceStart": {"primary": {"192.168.65.254:60001": 1, "relay:2114": 23}, "phone": {"192.168.65.254:60001": 50, "relay:2114": 18}}, "primaryHoldsForPeer": [{"host": "porch:relay:2114", "port": 0, "transport": "ws", "porch": {"relay": "relay:2114", "link": "0b655de797672cc59840f4b45a9c9c3a"}}], "phoneHoldsForPeer": [{"host": "relay", "port": 2114, "transport": "ws"}], "relays": [{"relay": "ws://relay:2114", "state": "ready", "idle": 2, "circuits": 1, "proxied": false}]}
+			],
+			"packetsAtEnd": {"phone": {"primary": {"out": 0, "in": 0}}, "primary": {"phone": {"out": 0, "in": 0}, "relay": {"out": 1761, "in": 1865}}, "relay": {"primary": {"out": 1874, "in": 1767}}}
+		},
+		"porch-tls": {
+			"startedAt": "2026-11-11T23:04:55.045Z",
+			"finishedAt": "2026-11-11T23:27:37.144Z",
+			"passed": true,
+			"addresses": {"primary": "172.24.0.6", "phone": "172.24.0.4", "relay": "172.24.0.3", "tor": "172.24.0.5", "caddy": "172.24.0.2"},
+			"baseline": {
+				"hostLoad": 19,
+				"payments": 40,
+				"completed": 40,
+				"engineMs": {"p50": 134, "p95": 154, "max": 167, "mean": 135},
+				"engineMsByPayer": {"phone": [130, 142, 140, 126, 126, 143, 136, 143, 130, 122, 143, 145, 140, 130, 138, 127, 150, 135, 128, 150], "primary": [152, 132, 131, 122, 125, 144, 142, 134, 129, 122, 135, 128, 125, 123, 123, 129, 142, 134, 154, 167]}
+			},
+			"latency": {
+				"msPerMsOneWay": 4.05,
+				"points": [
+					{"addedMsOneWay": 0, "hostLoad": 19, "payments": 20, "p50": 130, "p95": 149, "max": 149, "mean": 128},
+					{"addedMsOneWay": 20, "hostLoad": 18.2, "payments": 20, "p50": 201, "p95": 210, "max": 210, "mean": 201},
+					{"addedMsOneWay": 40, "hostLoad": 18, "payments": 20, "p50": 291, "p95": 306, "max": 306, "mean": 290}
+				]
+			},
+			"restarts": [
+				{"role": "phone", "restartMs": 744, "usableMs": 1103, "firstPaymentMs": 2070, "processUsableMs": 466, "paymentsMs": [150, 136]},
+				{"role": "phone", "restartMs": 688, "usableMs": 976, "firstPaymentMs": 1880, "processUsableMs": 407, "paymentsMs": [140, 121]},
+				{"role": "phone", "restartMs": 661, "usableMs": 768, "firstPaymentMs": 1640, "processUsableMs": 354, "paymentsMs": [107, 100]},
+				{"role": "primary", "restartMs": 675, "usableMs": 725, "firstPaymentMs": 1595, "processUsableMs": 376, "paymentsMs": [106, 101]},
+				{"role": "primary", "restartMs": 654, "usableMs": 734, "firstPaymentMs": 1565, "processUsableMs": 620, "paymentsMs": [113, 99]},
+				{"role": "primary", "restartMs": 681, "usableMs": 728, "firstPaymentMs": 1559, "processUsableMs": 361, "paymentsMs": [108, 102]},
+				{"role": "relay", "restartMs": 148, "usableMs": 1219, "firstPaymentMs": 2055, "processUsableMs": null, "paymentsMs": [116, 99]},
+				{"role": "relay", "restartMs": 148, "usableMs": 1712, "firstPaymentMs": 2538, "processUsableMs": null, "paymentsMs": [101, 102]},
+				{"role": "relay", "restartMs": 137, "usableMs": 1729, "firstPaymentMs": 2538, "processUsableMs": null, "paymentsMs": [98, 97]}
+			],
+			"outages": [
+				{"seconds": 30, "blockedMs": 31616, "usableMs": 61, "firstPaymentMs": 7113, "paymentsMs": [6547, 96]},
+				{"seconds": 120, "blockedMs": 121601, "usableMs": 12587, "firstPaymentMs": 13426, "paymentsMs": [96, 97]},
+				{"seconds": 300, "blockedMs": 301625, "usableMs": 551, "firstPaymentMs": 907, "paymentsMs": [99, 98]}
+			],
+			"leakChecks": [
+				{"label": "baseline", "packets": {"phone": {"primary": {"out": 0, "in": 0}}, "primary": {"phone": {"out": 0, "in": 0}, "relay": {"out": 0, "in": 0}}, "relay": {"primary": {"out": 0, "in": 0}}}, "dialedSinceStart": {"primary": {}, "phone": {}}, "primaryHoldsForPeer": [{"host": "porch:relay.test", "port": 0, "transport": "ws", "porch": {"relay": "relay.test", "link": "0b655de797672cc59840f4b45a9c9c3a"}}], "phoneHoldsForPeer": [{"host": "relay.test", "port": 443, "transport": "ws"}], "relays": [{"relay": "wss://relay.test", "state": "ready", "idle": 2, "circuits": 1, "proxied": false}]},
+				{"label": "after phone restart 1", "packets": {"phone": {"primary": {"out": 0, "in": 0}}, "primary": {"phone": {"out": 0, "in": 0}, "relay": {"out": 0, "in": 0}}, "relay": {"primary": {"out": 0, "in": 0}}}, "dialedSinceStart": {"primary": {"relay.test:443": 1}, "phone": {"192.168.65.254:60001": 1, "relay.test:443": 1}}, "primaryHoldsForPeer": [{"host": "porch:relay.test", "port": 0, "transport": "ws", "porch": {"relay": "relay.test", "link": "0b655de797672cc59840f4b45a9c9c3a"}}], "phoneHoldsForPeer": [{"host": "relay.test", "port": 443, "transport": "ws"}], "relays": [{"relay": "wss://relay.test", "state": "ready", "idle": 2, "circuits": 1, "proxied": false}]},
+				{"label": "after phone restart 2", "packets": {"phone": {"primary": {"out": 0, "in": 0}}, "primary": {"phone": {"out": 0, "in": 0}, "relay": {"out": 0, "in": 0}}, "relay": {"primary": {"out": 0, "in": 0}}}, "dialedSinceStart": {"primary": {"relay.test:443": 2}, "phone": {"192.168.65.254:60001": 1, "relay.test:443": 1}}, "primaryHoldsForPeer": [{"host": "porch:relay.test", "port": 0, "transport": "ws", "porch": {"relay": "relay.test", "link": "0b655de797672cc59840f4b45a9c9c3a"}}], "phoneHoldsForPeer": [{"host": "relay.test", "port": 443, "transport": "ws"}], "relays": [{"relay": "wss://relay.test", "state": "ready", "idle": 2, "circuits": 1, "proxied": false}]},
+				{"label": "after phone restart 3", "packets": {"phone": {"primary": {"out": 0, "in": 0}}, "primary": {"phone": {"out": 0, "in": 0}, "relay": {"out": 0, "in": 0}}, "relay": {"primary": {"out": 0, "in": 0}}}, "dialedSinceStart": {"primary": {"relay.test:443": 3}, "phone": {"192.168.65.254:60001": 1, "relay.test:443": 1}}, "primaryHoldsForPeer": [{"host": "porch:relay.test", "port": 0, "transport": "ws", "porch": {"relay": "relay.test", "link": "0b655de797672cc59840f4b45a9c9c3a"}}], "phoneHoldsForPeer": [{"host": "relay.test", "port": 443, "transport": "ws"}], "relays": [{"relay": "wss://relay.test", "state": "ready", "idle": 2, "circuits": 1, "proxied": false}]},
+				{"label": "after primary restart 1", "packets": {"phone": {"primary": {"out": 0, "in": 0}}, "primary": {"phone": {"out": 0, "in": 0}, "relay": {"out": 0, "in": 0}}, "relay": {"primary": {"out": 0, "in": 0}}}, "dialedSinceStart": {"primary": {"192.168.65.254:60001": 1, "relay.test:443": 3}, "phone": {"192.168.65.254:60001": 1, "relay.test:443": 2}}, "primaryHoldsForPeer": [{"host": "porch:relay.test", "port": 0, "transport": "ws", "porch": {"relay": "relay.test", "link": "0b655de797672cc59840f4b45a9c9c3a"}}], "phoneHoldsForPeer": [{"host": "relay.test", "port": 443, "transport": "ws"}], "relays": [{"relay": "wss://relay.test", "state": "ready", "idle": 2, "circuits": 1, "proxied": false}]},
+				{"label": "after primary restart 2", "packets": {"phone": {"primary": {"out": 0, "in": 0}}, "primary": {"phone": {"out": 0, "in": 0}, "relay": {"out": 0, "in": 0}}, "relay": {"primary": {"out": 0, "in": 0}}}, "dialedSinceStart": {"primary": {"192.168.65.254:60001": 1, "relay.test:443": 3}, "phone": {"192.168.65.254:60001": 1, "relay.test:443": 3}}, "primaryHoldsForPeer": [{"host": "porch:relay.test", "port": 0, "transport": "ws", "porch": {"relay": "relay.test", "link": "0b655de797672cc59840f4b45a9c9c3a"}}], "phoneHoldsForPeer": [{"host": "relay.test", "port": 443, "transport": "ws"}], "relays": [{"relay": "wss://relay.test", "state": "ready", "idle": 2, "circuits": 1, "proxied": false}]},
+				{"label": "after primary restart 3", "packets": {"phone": {"primary": {"out": 0, "in": 0}}, "primary": {"phone": {"out": 0, "in": 0}, "relay": {"out": 0, "in": 0}}, "relay": {"primary": {"out": 0, "in": 0}}}, "dialedSinceStart": {"primary": {"192.168.65.254:60001": 1, "relay.test:443": 3}, "phone": {"192.168.65.254:60001": 1, "relay.test:443": 4}}, "primaryHoldsForPeer": [{"host": "porch:relay.test", "port": 0, "transport": "ws", "porch": {"relay": "relay.test", "link": "0b655de797672cc59840f4b45a9c9c3a"}}], "phoneHoldsForPeer": [{"host": "relay.test", "port": 443, "transport": "ws"}], "relays": [{"relay": "wss://relay.test", "state": "ready", "idle": 2, "circuits": 1, "proxied": false}]},
+				{"label": "after relay restart 1", "packets": {"phone": {"primary": {"out": 0, "in": 0}}, "primary": {"phone": {"out": 0, "in": 0}, "relay": {"out": 0, "in": 0}}, "relay": {"primary": {"out": 0, "in": 0}}}, "dialedSinceStart": {"primary": {"192.168.65.254:60001": 1, "relay.test:443": 8}, "phone": {"192.168.65.254:60001": 1, "relay.test:443": 5}}, "primaryHoldsForPeer": [{"host": "porch:relay.test", "port": 0, "transport": "ws", "porch": {"relay": "relay.test", "link": "0b655de797672cc59840f4b45a9c9c3a"}}], "phoneHoldsForPeer": [{"host": "relay.test", "port": 443, "transport": "ws"}], "relays": [{"relay": "wss://relay.test", "state": "ready", "idle": 2, "circuits": 1, "proxied": false}]},
+				{"label": "after relay restart 2", "packets": {"phone": {"primary": {"out": 0, "in": 0}}, "primary": {"phone": {"out": 0, "in": 0}, "relay": {"out": 0, "in": 0}}, "relay": {"primary": {"out": 0, "in": 0}}}, "dialedSinceStart": {"primary": {"192.168.65.254:60001": 1, "relay.test:443": 13}, "phone": {"192.168.65.254:60001": 1, "relay.test:443": 6}}, "primaryHoldsForPeer": [{"host": "porch:relay.test", "port": 0, "transport": "ws", "porch": {"relay": "relay.test", "link": "0b655de797672cc59840f4b45a9c9c3a"}}], "phoneHoldsForPeer": [{"host": "relay.test", "port": 443, "transport": "ws"}], "relays": [{"relay": "wss://relay.test", "state": "ready", "idle": 2, "circuits": 1, "proxied": false}]},
+				{"label": "after relay restart 3", "packets": {"phone": {"primary": {"out": 0, "in": 0}}, "primary": {"phone": {"out": 0, "in": 0}, "relay": {"out": 0, "in": 0}}, "relay": {"primary": {"out": 0, "in": 0}}}, "dialedSinceStart": {"primary": {"192.168.65.254:60001": 1, "relay.test:443": 18}, "phone": {"192.168.65.254:60001": 1, "relay.test:443": 7}}, "primaryHoldsForPeer": [{"host": "porch:relay.test", "port": 0, "transport": "ws", "porch": {"relay": "relay.test", "link": "0b655de797672cc59840f4b45a9c9c3a"}}], "phoneHoldsForPeer": [{"host": "relay.test", "port": 443, "transport": "ws"}], "relays": [{"relay": "wss://relay.test", "state": "ready", "idle": 2, "circuits": 1, "proxied": false}]},
+				{"label": "before the 30 s outage", "packets": {"phone": {"primary": {"out": 0, "in": 0}}, "primary": {"phone": {"out": 0, "in": 0}, "relay": {"out": 0, "in": 0}}, "relay": {"primary": {"out": 0, "in": 0}}}, "dialedSinceStart": {"primary": {"192.168.65.254:60001": 1, "relay.test:443": 18}, "phone": {"192.168.65.254:60001": 1, "relay.test:443": 7}}, "primaryHoldsForPeer": [{"host": "porch:relay.test", "port": 0, "transport": "ws", "porch": {"relay": "relay.test", "link": "0b655de797672cc59840f4b45a9c9c3a"}}], "phoneHoldsForPeer": [{"host": "relay.test", "port": 443, "transport": "ws"}], "relays": [{"relay": "wss://relay.test", "state": "ready", "idle": 2, "circuits": 1, "proxied": false}]},
+				{"label": "during the 30 s outage", "packets": {"phone": {"primary": {"out": 0, "in": 0}}, "primary": {"phone": {"out": 0, "in": 0}, "relay": {"out": 0, "in": 0}}, "relay": {"primary": {"out": 0, "in": 0}}}, "dialedSinceStart": {"primary": {"192.168.65.254:60001": 1, "relay.test:443": 18}, "phone": {"192.168.65.254:60001": 4, "relay.test:443": 7}}, "primaryHoldsForPeer": [{"host": "porch:relay.test", "port": 0, "transport": "ws", "porch": {"relay": "relay.test", "link": "0b655de797672cc59840f4b45a9c9c3a"}}], "phoneHoldsForPeer": [{"host": "relay.test", "port": 443, "transport": "ws"}], "relays": [{"relay": "wss://relay.test", "state": "ready", "idle": 2, "circuits": 1, "proxied": false}]},
+				{"label": "after the 30 s outage", "packets": {"phone": {"primary": {"out": 0, "in": 0}}, "primary": {"phone": {"out": 0, "in": 0}, "relay": {"out": 0, "in": 0}}, "relay": {"primary": {"out": 0, "in": 0}}}, "dialedSinceStart": {"primary": {"192.168.65.254:60001": 1, "relay.test:443": 18}, "phone": {"192.168.65.254:60001": 5, "relay.test:443": 7}}, "primaryHoldsForPeer": [{"host": "porch:relay.test", "port": 0, "transport": "ws", "porch": {"relay": "relay.test", "link": "0b655de797672cc59840f4b45a9c9c3a"}}], "phoneHoldsForPeer": [{"host": "relay.test", "port": 443, "transport": "ws"}], "relays": [{"relay": "wss://relay.test", "state": "ready", "idle": 2, "circuits": 1, "proxied": false}]},
+				{"label": "before the 120 s outage", "packets": {"phone": {"primary": {"out": 0, "in": 0}}, "primary": {"phone": {"out": 0, "in": 0}, "relay": {"out": 0, "in": 0}}, "relay": {"primary": {"out": 0, "in": 0}}}, "dialedSinceStart": {"primary": {"192.168.65.254:60001": 1, "relay.test:443": 18}, "phone": {"192.168.65.254:60001": 5, "relay.test:443": 7}}, "primaryHoldsForPeer": [{"host": "porch:relay.test", "port": 0, "transport": "ws", "porch": {"relay": "relay.test", "link": "0b655de797672cc59840f4b45a9c9c3a"}}], "phoneHoldsForPeer": [{"host": "relay.test", "port": 443, "transport": "ws"}], "relays": [{"relay": "wss://relay.test", "state": "ready", "idle": 2, "circuits": 1, "proxied": false}]},
+				{"label": "during the 120 s outage", "packets": {"phone": {"primary": {"out": 0, "in": 0}}, "primary": {"phone": {"out": 0, "in": 0}, "relay": {"out": 0, "in": 0}}, "relay": {"primary": {"out": 0, "in": 0}}}, "dialedSinceStart": {"primary": {"192.168.65.254:60001": 1, "relay.test:443": 18}, "phone": {"192.168.65.254:60001": 17, "relay.test:443": 10}}, "primaryHoldsForPeer": [], "phoneHoldsForPeer": [], "relays": [{"relay": "wss://relay.test", "state": "ready", "idle": 2, "circuits": 0, "proxied": false}]},
+				{"label": "after the 120 s outage", "packets": {"phone": {"primary": {"out": 0, "in": 0}}, "primary": {"phone": {"out": 0, "in": 0}, "relay": {"out": 0, "in": 0}}, "relay": {"primary": {"out": 0, "in": 0}}}, "dialedSinceStart": {"primary": {"192.168.65.254:60001": 1, "relay.test:443": 21}, "phone": {"192.168.65.254:60001": 18, "relay.test:443": 11}}, "primaryHoldsForPeer": [{"host": "porch:relay.test", "port": 0, "transport": "ws", "porch": {"relay": "relay.test", "link": "0b655de797672cc59840f4b45a9c9c3a"}}], "phoneHoldsForPeer": [{"host": "relay.test", "port": 443, "transport": "ws"}], "relays": [{"relay": "wss://relay.test", "state": "ready", "idle": 2, "circuits": 1, "proxied": false}]},
+				{"label": "before the 300 s outage", "packets": {"phone": {"primary": {"out": 0, "in": 0}}, "primary": {"phone": {"out": 0, "in": 0}, "relay": {"out": 0, "in": 0}}, "relay": {"primary": {"out": 0, "in": 0}}}, "dialedSinceStart": {"primary": {"192.168.65.254:60001": 1, "relay.test:443": 22}, "phone": {"192.168.65.254:60001": 18, "relay.test:443": 11}}, "primaryHoldsForPeer": [{"host": "porch:relay.test", "port": 0, "transport": "ws", "porch": {"relay": "relay.test", "link": "0b655de797672cc59840f4b45a9c9c3a"}}], "phoneHoldsForPeer": [{"host": "relay.test", "port": 443, "transport": "ws"}], "relays": [{"relay": "wss://relay.test", "state": "ready", "idle": 2, "circuits": 1, "proxied": false}]},
+				{"label": "during the 300 s outage", "packets": {"phone": {"primary": {"out": 0, "in": 0}}, "primary": {"phone": {"out": 0, "in": 0}, "relay": {"out": 0, "in": 0}}, "relay": {"primary": {"out": 0, "in": 0}}}, "dialedSinceStart": {"primary": {"192.168.65.254:60001": 1, "relay.test:443": 22}, "phone": {"192.168.65.254:60001": 48, "relay.test:443": 17}}, "primaryHoldsForPeer": [], "phoneHoldsForPeer": [], "relays": [{"relay": "wss://relay.test", "state": "ready", "idle": 2, "circuits": 0, "proxied": false}]},
+				{"label": "after the 300 s outage", "packets": {"phone": {"primary": {"out": 0, "in": 0}}, "primary": {"phone": {"out": 0, "in": 0}, "relay": {"out": 0, "in": 0}}, "relay": {"primary": {"out": 0, "in": 0}}}, "dialedSinceStart": {"primary": {"192.168.65.254:60001": 1, "relay.test:443": 23}, "phone": {"192.168.65.254:60001": 49, "relay.test:443": 18}}, "primaryHoldsForPeer": [{"host": "porch:relay.test", "port": 0, "transport": "ws", "porch": {"relay": "relay.test", "link": "0b655de797672cc59840f4b45a9c9c3a"}}], "phoneHoldsForPeer": [{"host": "relay.test", "port": 443, "transport": "ws"}], "relays": [{"relay": "wss://relay.test", "state": "ready", "idle": 2, "circuits": 1, "proxied": false}]},
+				{"label": "end", "packets": {"phone": {"primary": {"out": 0, "in": 0}}, "primary": {"phone": {"out": 0, "in": 0}, "relay": {"out": 0, "in": 0}}, "relay": {"primary": {"out": 0, "in": 0}}}, "dialedSinceStart": {"primary": {"192.168.65.254:60001": 1, "relay.test:443": 23}, "phone": {"192.168.65.254:60001": 49, "relay.test:443": 18}}, "primaryHoldsForPeer": [{"host": "porch:relay.test", "port": 0, "transport": "ws", "porch": {"relay": "relay.test", "link": "0b655de797672cc59840f4b45a9c9c3a"}}], "phoneHoldsForPeer": [{"host": "relay.test", "port": 443, "transport": "ws"}], "relays": [{"relay": "wss://relay.test", "state": "ready", "idle": 2, "circuits": 1, "proxied": false}]}
+			],
+			"packetsAtEnd": {"phone": {"primary": {"out": 0, "in": 0}}, "primary": {"phone": {"out": 0, "in": 0}, "relay": {"out": 0, "in": 0}}, "relay": {"primary": {"out": 0, "in": 0}}}
+		},
+		"porch-tor": {
+			"startedAt": "2026-11-11T23:27:49.429Z",
+			"finishedAt": "2026-11-11T23:52:05.083Z",
+			"passed": true,
+			"addresses": {"primary": "172.24.0.6", "phone": "172.24.0.4", "relay": "172.24.0.3", "tor": "172.24.0.5", "caddy": "172.24.0.2"},
+			"baseline": {
+				"hostLoad": 9.1,
+				"payments": 40,
+				"completed": 40,
+				"engineMs": {"p50": 1475, "p95": 1786, "max": 1963, "mean": 1494},
+				"engineMsByPayer": {"phone": [1449, 1491, 1471, 1378, 1296, 1367, 1654, 1428, 1267, 1520, 1750, 1653, 1553, 1475, 1511, 1594, 1413, 1636, 1345, 1471], "primary": [1387, 1558, 1533, 1362, 1361, 1625, 1353, 1786, 1317, 1531, 1501, 1648, 1445, 1518, 1963, 1469, 1507, 1322, 1436, 1405]}
+			},
+			"restarts": [
+				{"role": "phone", "restartMs": 687, "usableMs": 2616, "firstPaymentMs": 4855, "processUsableMs": 2305, "paymentsMs": [1733, 1380]},
+				{"role": "phone", "restartMs": 681, "usableMs": 3109, "firstPaymentMs": 5368, "processUsableMs": 2213, "paymentsMs": [1587, 1392]},
+				{"role": "phone", "restartMs": 673, "usableMs": 3159, "firstPaymentMs": 4930, "processUsableMs": 2414, "paymentsMs": [1372, 1436]},
+				{"role": "primary", "restartMs": 664, "usableMs": 5055, "firstPaymentMs": 6827, "processUsableMs": 4852, "paymentsMs": [1185, 1403]},
+				{"role": "primary", "restartMs": 678, "usableMs": 4650, "firstPaymentMs": 6460, "processUsableMs": 4552, "paymentsMs": [1530, 1564]},
+				{"role": "primary", "restartMs": 662, "usableMs": 5043, "firstPaymentMs": 6799, "processUsableMs": 4818, "paymentsMs": [1432, 1690]},
+				{"role": "relay", "restartMs": 135, "usableMs": 4611, "firstPaymentMs": 6396, "processUsableMs": null, "paymentsMs": [1481, 1569]},
+				{"role": "relay", "restartMs": 140, "usableMs": 4629, "firstPaymentMs": 6450, "processUsableMs": null, "paymentsMs": [1417, 1558]},
+				{"role": "relay", "restartMs": 148, "usableMs": 5077, "firstPaymentMs": 37251, "processUsableMs": null, "paymentsMs": [31543, 6593]}
+			],
+			"outages": [
+				{"seconds": 30, "blockedMs": 31563, "usableMs": 57, "firstPaymentMs": 13001, "paymentsMs": [12326, 1311]},
+				{"seconds": 120, "blockedMs": 121618, "usableMs": 4442, "firstPaymentMs": 6204, "paymentsMs": [1424, 1370]},
+				{"seconds": 300, "blockedMs": 301634, "usableMs": 6955, "firstPaymentMs": 8758, "paymentsMs": [1403, 1543]}
+			],
+			"leakChecks": [
+				{"label": "baseline", "packets": {"phone": {"primary": {"out": 0, "in": 0}}, "primary": {"phone": {"out": 0, "in": 0}, "relay": {"out": 0, "in": 0}}, "relay": {"primary": {"out": 0, "in": 0}}}, "dialedSinceStart": {"primary": {}, "phone": {}}, "primaryHoldsForPeer": [{"host": "porch:lv7vi7mv7eejitnscth3vje3d2ltynvxdlrnr5y4mzlmv6gztu4zmqyd.onion:2114", "port": 0, "transport": "ws", "porch": {"relay": "lv7vi7mv7eejitnscth3vje3d2ltynvxdlrnr5y4mzlmv6gztu4zmqyd.onion:2114", "link": "0b655de797672cc59840f4b45a9c9c3a"}}], "phoneHoldsForPeer": [{"host": "relay", "port": 2114, "transport": "ws"}], "relays": [{"relay": "ws://lv7vi7mv7eejitnscth3vje3d2ltynvxdlrnr5y4mzlmv6gztu4zmqyd.onion:2114", "state": "ready", "idle": 2, "circuits": 1, "proxied": true}]},
+				{"label": "after phone restart 1", "packets": {"phone": {"primary": {"out": 0, "in": 0}}, "primary": {"phone": {"out": 0, "in": 0}, "relay": {"out": 0, "in": 0}}, "relay": {"primary": {"out": 0, "in": 0}}}, "dialedSinceStart": {"primary": {"tor:9050": 1}, "phone": {"192.168.65.254:60001": 1, "relay:2114": 1}}, "primaryHoldsForPeer": [{"host": "porch:lv7vi7mv7eejitnscth3vje3d2ltynvxdlrnr5y4mzlmv6gztu4zmqyd.onion:2114", "port": 0, "transport": "ws", "porch": {"relay": "lv7vi7mv7eejitnscth3vje3d2ltynvxdlrnr5y4mzlmv6gztu4zmqyd.onion:2114", "link": "0b655de797672cc59840f4b45a9c9c3a"}}], "phoneHoldsForPeer": [{"host": "relay", "port": 2114, "transport": "ws"}], "relays": [{"relay": "ws://lv7vi7mv7eejitnscth3vje3d2ltynvxdlrnr5y4mzlmv6gztu4zmqyd.onion:2114", "state": "ready", "idle": 2, "circuits": 1, "proxied": true}]},
+				{"label": "after phone restart 2", "packets": {"phone": {"primary": {"out": 0, "in": 0}}, "primary": {"phone": {"out": 0, "in": 0}, "relay": {"out": 0, "in": 0}}, "relay": {"primary": {"out": 0, "in": 0}}}, "dialedSinceStart": {"primary": {"tor:9050": 2}, "phone": {"192.168.65.254:60001": 1, "relay:2114": 1}}, "primaryHoldsForPeer": [{"host": "porch:lv7vi7mv7eejitnscth3vje3d2ltynvxdlrnr5y4mzlmv6gztu4zmqyd.onion:2114", "port": 0, "transport": "ws", "porch": {"relay": "lv7vi7mv7eejitnscth3vje3d2ltynvxdlrnr5y4mzlmv6gztu4zmqyd.onion:2114", "link": "0b655de797672cc59840f4b45a9c9c3a"}}], "phoneHoldsForPeer": [{"host": "relay", "port": 2114, "transport": "ws"}], "relays": [{"relay": "ws://lv7vi7mv7eejitnscth3vje3d2ltynvxdlrnr5y4mzlmv6gztu4zmqyd.onion:2114", "state": "ready", "idle": 2, "circuits": 1, "proxied": true}]},
+				{"label": "after phone restart 3", "packets": {"phone": {"primary": {"out": 0, "in": 0}}, "primary": {"phone": {"out": 0, "in": 0}, "relay": {"out": 0, "in": 0}}, "relay": {"primary": {"out": 0, "in": 0}}}, "dialedSinceStart": {"primary": {"tor:9050": 3}, "phone": {"192.168.65.254:60001": 1, "relay:2114": 1}}, "primaryHoldsForPeer": [{"host": "porch:lv7vi7mv7eejitnscth3vje3d2ltynvxdlrnr5y4mzlmv6gztu4zmqyd.onion:2114", "port": 0, "transport": "ws", "porch": {"relay": "lv7vi7mv7eejitnscth3vje3d2ltynvxdlrnr5y4mzlmv6gztu4zmqyd.onion:2114", "link": "0b655de797672cc59840f4b45a9c9c3a"}}], "phoneHoldsForPeer": [{"host": "relay", "port": 2114, "transport": "ws"}], "relays": [{"relay": "ws://lv7vi7mv7eejitnscth3vje3d2ltynvxdlrnr5y4mzlmv6gztu4zmqyd.onion:2114", "state": "ready", "idle": 2, "circuits": 1, "proxied": true}]},
+				{"label": "after primary restart 1", "packets": {"phone": {"primary": {"out": 0, "in": 0}}, "primary": {"phone": {"out": 0, "in": 0}, "relay": {"out": 0, "in": 0}}, "relay": {"primary": {"out": 0, "in": 0}}}, "dialedSinceStart": {"primary": {"192.168.65.254:60001": 1, "tor:9050": 3}, "phone": {"192.168.65.254:60001": 1, "relay:2114": 2}}, "primaryHoldsForPeer": [{"host": "porch:lv7vi7mv7eejitnscth3vje3d2ltynvxdlrnr5y4mzlmv6gztu4zmqyd.onion:2114", "port": 0, "transport": "ws", "porch": {"relay": "lv7vi7mv7eejitnscth3vje3d2ltynvxdlrnr5y4mzlmv6gztu4zmqyd.onion:2114", "link": "0b655de797672cc59840f4b45a9c9c3a"}}], "phoneHoldsForPeer": [{"host": "relay", "port": 2114, "transport": "ws"}], "relays": [{"relay": "ws://lv7vi7mv7eejitnscth3vje3d2ltynvxdlrnr5y4mzlmv6gztu4zmqyd.onion:2114", "state": "ready", "idle": 2, "circuits": 1, "proxied": true}]},
+				{"label": "after primary restart 2", "packets": {"phone": {"primary": {"out": 0, "in": 0}}, "primary": {"phone": {"out": 0, "in": 0}, "relay": {"out": 0, "in": 0}}, "relay": {"primary": {"out": 0, "in": 0}}}, "dialedSinceStart": {"primary": {"192.168.65.254:60001": 1, "tor:9050": 3}, "phone": {"192.168.65.254:60001": 1, "relay:2114": 3}}, "primaryHoldsForPeer": [{"host": "porch:lv7vi7mv7eejitnscth3vje3d2ltynvxdlrnr5y4mzlmv6gztu4zmqyd.onion:2114", "port": 0, "transport": "ws", "porch": {"relay": "lv7vi7mv7eejitnscth3vje3d2ltynvxdlrnr5y4mzlmv6gztu4zmqyd.onion:2114", "link": "0b655de797672cc59840f4b45a9c9c3a"}}], "phoneHoldsForPeer": [{"host": "relay", "port": 2114, "transport": "ws"}], "relays": [{"relay": "ws://lv7vi7mv7eejitnscth3vje3d2ltynvxdlrnr5y4mzlmv6gztu4zmqyd.onion:2114", "state": "ready", "idle": 2, "circuits": 1, "proxied": true}]},
+				{"label": "after primary restart 3", "packets": {"phone": {"primary": {"out": 0, "in": 0}}, "primary": {"phone": {"out": 0, "in": 0}, "relay": {"out": 0, "in": 0}}, "relay": {"primary": {"out": 0, "in": 0}}}, "dialedSinceStart": {"primary": {"192.168.65.254:60001": 1, "tor:9050": 3}, "phone": {"192.168.65.254:60001": 1, "relay:2114": 4}}, "primaryHoldsForPeer": [{"host": "porch:lv7vi7mv7eejitnscth3vje3d2ltynvxdlrnr5y4mzlmv6gztu4zmqyd.onion:2114", "port": 0, "transport": "ws", "porch": {"relay": "lv7vi7mv7eejitnscth3vje3d2ltynvxdlrnr5y4mzlmv6gztu4zmqyd.onion:2114", "link": "0b655de797672cc59840f4b45a9c9c3a"}}], "phoneHoldsForPeer": [{"host": "relay", "port": 2114, "transport": "ws"}], "relays": [{"relay": "ws://lv7vi7mv7eejitnscth3vje3d2ltynvxdlrnr5y4mzlmv6gztu4zmqyd.onion:2114", "state": "ready", "idle": 2, "circuits": 1, "proxied": true}]},
+				{"label": "after relay restart 1", "packets": {"phone": {"primary": {"out": 0, "in": 0}}, "primary": {"phone": {"out": 0, "in": 0}, "relay": {"out": 0, "in": 0}}, "relay": {"primary": {"out": 0, "in": 0}}}, "dialedSinceStart": {"primary": {"192.168.65.254:60001": 1, "tor:9050": 6}, "phone": {"192.168.65.254:60001": 1, "relay:2114": 5}}, "primaryHoldsForPeer": [{"host": "porch:lv7vi7mv7eejitnscth3vje3d2ltynvxdlrnr5y4mzlmv6gztu4zmqyd.onion:2114", "port": 0, "transport": "ws", "porch": {"relay": "lv7vi7mv7eejitnscth3vje3d2ltynvxdlrnr5y4mzlmv6gztu4zmqyd.onion:2114", "link": "0b655de797672cc59840f4b45a9c9c3a"}}], "phoneHoldsForPeer": [{"host": "relay", "port": 2114, "transport": "ws"}], "relays": [{"relay": "ws://lv7vi7mv7eejitnscth3vje3d2ltynvxdlrnr5y4mzlmv6gztu4zmqyd.onion:2114", "state": "ready", "idle": 2, "circuits": 1, "proxied": true}]},
+				{"label": "after relay restart 2", "packets": {"phone": {"primary": {"out": 0, "in": 0}}, "primary": {"phone": {"out": 0, "in": 0}, "relay": {"out": 0, "in": 0}}, "relay": {"primary": {"out": 0, "in": 0}}}, "dialedSinceStart": {"primary": {"192.168.65.254:60001": 1, "tor:9050": 9}, "phone": {"192.168.65.254:60001": 1, "relay:2114": 6}}, "primaryHoldsForPeer": [{"host": "porch:lv7vi7mv7eejitnscth3vje3d2ltynvxdlrnr5y4mzlmv6gztu4zmqyd.onion:2114", "port": 0, "transport": "ws", "porch": {"relay": "lv7vi7mv7eejitnscth3vje3d2ltynvxdlrnr5y4mzlmv6gztu4zmqyd.onion:2114", "link": "0b655de797672cc59840f4b45a9c9c3a"}}], "phoneHoldsForPeer": [{"host": "relay", "port": 2114, "transport": "ws"}], "relays": [{"relay": "ws://lv7vi7mv7eejitnscth3vje3d2ltynvxdlrnr5y4mzlmv6gztu4zmqyd.onion:2114", "state": "ready", "idle": 2, "circuits": 1, "proxied": true}]},
+				{"label": "after relay restart 3", "packets": {"phone": {"primary": {"out": 0, "in": 0}}, "primary": {"phone": {"out": 0, "in": 0}, "relay": {"out": 0, "in": 0}}, "relay": {"primary": {"out": 0, "in": 0}}}, "dialedSinceStart": {"primary": {"192.168.65.254:60001": 1, "tor:9050": 12}, "phone": {"192.168.65.254:60001": 1, "relay:2114": 7}}, "primaryHoldsForPeer": [{"host": "porch:lv7vi7mv7eejitnscth3vje3d2ltynvxdlrnr5y4mzlmv6gztu4zmqyd.onion:2114", "port": 0, "transport": "ws", "porch": {"relay": "lv7vi7mv7eejitnscth3vje3d2ltynvxdlrnr5y4mzlmv6gztu4zmqyd.onion:2114", "link": "0b655de797672cc59840f4b45a9c9c3a"}}], "phoneHoldsForPeer": [{"host": "relay", "port": 2114, "transport": "ws"}], "relays": [{"relay": "ws://lv7vi7mv7eejitnscth3vje3d2ltynvxdlrnr5y4mzlmv6gztu4zmqyd.onion:2114", "state": "ready", "idle": 2, "circuits": 1, "proxied": true}]},
+				{"label": "before the 30 s outage", "packets": {"phone": {"primary": {"out": 0, "in": 0}}, "primary": {"phone": {"out": 0, "in": 0}, "relay": {"out": 0, "in": 0}}, "relay": {"primary": {"out": 0, "in": 0}}}, "dialedSinceStart": {"primary": {"192.168.65.254:60001": 1, "tor:9050": 12}, "phone": {"192.168.65.254:60001": 1, "relay:2114": 7}}, "primaryHoldsForPeer": [{"host": "porch:lv7vi7mv7eejitnscth3vje3d2ltynvxdlrnr5y4mzlmv6gztu4zmqyd.onion:2114", "port": 0, "transport": "ws", "porch": {"relay": "lv7vi7mv7eejitnscth3vje3d2ltynvxdlrnr5y4mzlmv6gztu4zmqyd.onion:2114", "link": "0b655de797672cc59840f4b45a9c9c3a"}}], "phoneHoldsForPeer": [{"host": "relay", "port": 2114, "transport": "ws"}], "relays": [{"relay": "ws://lv7vi7mv7eejitnscth3vje3d2ltynvxdlrnr5y4mzlmv6gztu4zmqyd.onion:2114", "state": "ready", "idle": 2, "circuits": 1, "proxied": true}]},
+				{"label": "during the 30 s outage", "packets": {"phone": {"primary": {"out": 0, "in": 0}}, "primary": {"phone": {"out": 0, "in": 0}, "relay": {"out": 0, "in": 0}}, "relay": {"primary": {"out": 0, "in": 0}}}, "dialedSinceStart": {"primary": {"192.168.65.254:60001": 1, "tor:9050": 12}, "phone": {"192.168.65.254:60001": 4, "relay:2114": 7}}, "primaryHoldsForPeer": [{"host": "porch:lv7vi7mv7eejitnscth3vje3d2ltynvxdlrnr5y4mzlmv6gztu4zmqyd.onion:2114", "port": 0, "transport": "ws", "porch": {"relay": "lv7vi7mv7eejitnscth3vje3d2ltynvxdlrnr5y4mzlmv6gztu4zmqyd.onion:2114", "link": "0b655de797672cc59840f4b45a9c9c3a"}}], "phoneHoldsForPeer": [{"host": "relay", "port": 2114, "transport": "ws"}], "relays": [{"relay": "ws://lv7vi7mv7eejitnscth3vje3d2ltynvxdlrnr5y4mzlmv6gztu4zmqyd.onion:2114", "state": "ready", "idle": 2, "circuits": 1, "proxied": true}]},
+				{"label": "after the 30 s outage", "packets": {"phone": {"primary": {"out": 0, "in": 0}}, "primary": {"phone": {"out": 0, "in": 0}, "relay": {"out": 0, "in": 0}}, "relay": {"primary": {"out": 0, "in": 0}}}, "dialedSinceStart": {"primary": {"192.168.65.254:60001": 1, "tor:9050": 12}, "phone": {"192.168.65.254:60001": 5, "relay:2114": 7}}, "primaryHoldsForPeer": [{"host": "porch:lv7vi7mv7eejitnscth3vje3d2ltynvxdlrnr5y4mzlmv6gztu4zmqyd.onion:2114", "port": 0, "transport": "ws", "porch": {"relay": "lv7vi7mv7eejitnscth3vje3d2ltynvxdlrnr5y4mzlmv6gztu4zmqyd.onion:2114", "link": "0b655de797672cc59840f4b45a9c9c3a"}}], "phoneHoldsForPeer": [{"host": "relay", "port": 2114, "transport": "ws"}], "relays": [{"relay": "ws://lv7vi7mv7eejitnscth3vje3d2ltynvxdlrnr5y4mzlmv6gztu4zmqyd.onion:2114", "state": "ready", "idle": 2, "circuits": 1, "proxied": true}]},
+				{"label": "before the 120 s outage", "packets": {"phone": {"primary": {"out": 0, "in": 0}}, "primary": {"phone": {"out": 0, "in": 0}, "relay": {"out": 0, "in": 0}}, "relay": {"primary": {"out": 0, "in": 0}}}, "dialedSinceStart": {"primary": {"192.168.65.254:60001": 1, "tor:9050": 12}, "phone": {"192.168.65.254:60001": 5, "relay:2114": 7}}, "primaryHoldsForPeer": [{"host": "porch:lv7vi7mv7eejitnscth3vje3d2ltynvxdlrnr5y4mzlmv6gztu4zmqyd.onion:2114", "port": 0, "transport": "ws", "porch": {"relay": "lv7vi7mv7eejitnscth3vje3d2ltynvxdlrnr5y4mzlmv6gztu4zmqyd.onion:2114", "link": "0b655de797672cc59840f4b45a9c9c3a"}}], "phoneHoldsForPeer": [{"host": "relay", "port": 2114, "transport": "ws"}], "relays": [{"relay": "ws://lv7vi7mv7eejitnscth3vje3d2ltynvxdlrnr5y4mzlmv6gztu4zmqyd.onion:2114", "state": "ready", "idle": 2, "circuits": 1, "proxied": true}]},
+				{"label": "during the 120 s outage", "packets": {"phone": {"primary": {"out": 0, "in": 0}}, "primary": {"phone": {"out": 0, "in": 0}, "relay": {"out": 0, "in": 0}}, "relay": {"primary": {"out": 0, "in": 0}}}, "dialedSinceStart": {"primary": {"192.168.65.254:60001": 1, "tor:9050": 12}, "phone": {"192.168.65.254:60001": 17, "relay:2114": 9}}, "primaryHoldsForPeer": [], "phoneHoldsForPeer": [], "relays": [{"relay": "ws://lv7vi7mv7eejitnscth3vje3d2ltynvxdlrnr5y4mzlmv6gztu4zmqyd.onion:2114", "state": "ready", "idle": 2, "circuits": 0, "proxied": true}]},
+				{"label": "after the 120 s outage", "packets": {"phone": {"primary": {"out": 0, "in": 0}}, "primary": {"phone": {"out": 0, "in": 0}, "relay": {"out": 0, "in": 0}}, "relay": {"primary": {"out": 0, "in": 0}}}, "dialedSinceStart": {"primary": {"192.168.65.254:60001": 1, "tor:9050": 14}, "phone": {"192.168.65.254:60001": 18, "relay:2114": 10}}, "primaryHoldsForPeer": [{"host": "porch:lv7vi7mv7eejitnscth3vje3d2ltynvxdlrnr5y4mzlmv6gztu4zmqyd.onion:2114", "port": 0, "transport": "ws", "porch": {"relay": "lv7vi7mv7eejitnscth3vje3d2ltynvxdlrnr5y4mzlmv6gztu4zmqyd.onion:2114", "link": "0b655de797672cc59840f4b45a9c9c3a"}}], "phoneHoldsForPeer": [{"host": "relay", "port": 2114, "transport": "ws"}], "relays": [{"relay": "ws://lv7vi7mv7eejitnscth3vje3d2ltynvxdlrnr5y4mzlmv6gztu4zmqyd.onion:2114", "state": "ready", "idle": 2, "circuits": 1, "proxied": true}]},
+				{"label": "before the 300 s outage", "packets": {"phone": {"primary": {"out": 0, "in": 0}}, "primary": {"phone": {"out": 0, "in": 0}, "relay": {"out": 0, "in": 0}}, "relay": {"primary": {"out": 0, "in": 0}}}, "dialedSinceStart": {"primary": {"192.168.65.254:60001": 1, "tor:9050": 14}, "phone": {"192.168.65.254:60001": 18, "relay:2114": 10}}, "primaryHoldsForPeer": [{"host": "porch:lv7vi7mv7eejitnscth3vje3d2ltynvxdlrnr5y4mzlmv6gztu4zmqyd.onion:2114", "port": 0, "transport": "ws", "porch": {"relay": "lv7vi7mv7eejitnscth3vje3d2ltynvxdlrnr5y4mzlmv6gztu4zmqyd.onion:2114", "link": "0b655de797672cc59840f4b45a9c9c3a"}}], "phoneHoldsForPeer": [{"host": "relay", "port": 2114, "transport": "ws"}], "relays": [{"relay": "ws://lv7vi7mv7eejitnscth3vje3d2ltynvxdlrnr5y4mzlmv6gztu4zmqyd.onion:2114", "state": "ready", "idle": 2, "circuits": 1, "proxied": true}]},
+				{"label": "during the 300 s outage", "packets": {"phone": {"primary": {"out": 0, "in": 0}}, "primary": {"phone": {"out": 0, "in": 0}, "relay": {"out": 0, "in": 0}}, "relay": {"primary": {"out": 0, "in": 0}}}, "dialedSinceStart": {"primary": {"192.168.65.254:60001": 1, "tor:9050": 14}, "phone": {"192.168.65.254:60001": 48, "relay:2114": 17}}, "primaryHoldsForPeer": [], "phoneHoldsForPeer": [], "relays": [{"relay": "ws://lv7vi7mv7eejitnscth3vje3d2ltynvxdlrnr5y4mzlmv6gztu4zmqyd.onion:2114", "state": "ready", "idle": 2, "circuits": 0, "proxied": true}]},
+				{"label": "after the 300 s outage", "packets": {"phone": {"primary": {"out": 0, "in": 0}}, "primary": {"phone": {"out": 0, "in": 0}, "relay": {"out": 0, "in": 0}}, "relay": {"primary": {"out": 0, "in": 0}}}, "dialedSinceStart": {"primary": {"192.168.65.254:60001": 1, "tor:9050": 15}, "phone": {"192.168.65.254:60001": 49, "relay:2114": 17}}, "primaryHoldsForPeer": [{"host": "porch:lv7vi7mv7eejitnscth3vje3d2ltynvxdlrnr5y4mzlmv6gztu4zmqyd.onion:2114", "port": 0, "transport": "ws", "porch": {"relay": "lv7vi7mv7eejitnscth3vje3d2ltynvxdlrnr5y4mzlmv6gztu4zmqyd.onion:2114", "link": "0b655de797672cc59840f4b45a9c9c3a"}}], "phoneHoldsForPeer": [{"host": "relay", "port": 2114, "transport": "ws"}], "relays": [{"relay": "ws://lv7vi7mv7eejitnscth3vje3d2ltynvxdlrnr5y4mzlmv6gztu4zmqyd.onion:2114", "state": "ready", "idle": 2, "circuits": 1, "proxied": true}]},
+				{"label": "end", "packets": {"phone": {"primary": {"out": 0, "in": 0}}, "primary": {"phone": {"out": 0, "in": 0}, "relay": {"out": 0, "in": 0}}, "relay": {"primary": {"out": 0, "in": 0}}}, "dialedSinceStart": {"primary": {"192.168.65.254:60001": 1, "tor:9050": 15}, "phone": {"192.168.65.254:60001": 49, "relay:2114": 17}}, "primaryHoldsForPeer": [{"host": "porch:lv7vi7mv7eejitnscth3vje3d2ltynvxdlrnr5y4mzlmv6gztu4zmqyd.onion:2114", "port": 0, "transport": "ws", "porch": {"relay": "lv7vi7mv7eejitnscth3vje3d2ltynvxdlrnr5y4mzlmv6gztu4zmqyd.onion:2114", "link": "0b655de797672cc59840f4b45a9c9c3a"}}], "phoneHoldsForPeer": [{"host": "relay", "port": 2114, "transport": "ws"}], "relays": [{"relay": "ws://lv7vi7mv7eejitnscth3vje3d2ltynvxdlrnr5y4mzlmv6gztu4zmqyd.onion:2114", "state": "ready", "idle": 2, "circuits": 1, "proxied": true}]}
+			],
+			"packetsAtEnd": {"phone": {"primary": {"out": 0, "in": 0}}, "primary": {"phone": {"out": 0, "in": 0}, "relay": {"out": 0, "in": 0}}, "relay": {"primary": {"out": 0, "in": 0}}}
+		},
+		"tcp": {
+			"startedAt": "2026-11-11T23:52:09.828Z",
+			"finishedAt": "2026-11-12T00:11:44.688Z",
+			"passed": true,
+			"addresses": {"primary": "172.24.0.6", "phone": "172.24.0.4", "relay": "172.24.0.3", "tor": "172.24.0.5", "caddy": "172.24.0.2"},
+			"baseline": {
+				"hostLoad": 8.1,
+				"payments": 40,
+				"completed": 40,
+				"engineMs": {"p50": 109, "p95": 116, "max": 118, "mean": 109},
+				"engineMsByPayer": {"phone": [113, 108, 105, 107, 111, 109, 114, 103, 105, 105, 106, 104, 105, 108, 105, 110, 110, 108, 104, 108], "primary": [111, 116, 108, 112, 111, 107, 110, 107, 113, 109, 112, 106, 111, 111, 109, 110, 109, 118, 111, 115]}
+			},
+			"latency": {
+				"msPerMsOneWay": 8.275,
+				"points": [
+					{"addedMsOneWay": 0, "hostLoad": 8.1, "payments": 20, "p50": 108, "p95": 113, "max": 113, "mean": 108},
+					{"addedMsOneWay": 20, "hostLoad": 7.4, "payments": 20, "p50": 262, "p95": 279, "max": 279, "mean": 263},
+					{"addedMsOneWay": 40, "hostLoad": 6.3, "payments": 20, "p50": 436, "p95": 514, "max": 514, "mean": 439}
+				]
+			},
+			"restarts": [
+				{"role": "primary", "restartMs": 691, "usableMs": 683, "firstPaymentMs": 1478, "processUsableMs": 579, "paymentsMs": [94, 123]},
+				{"role": "primary", "restartMs": 669, "usableMs": 2629, "firstPaymentMs": 3478, "processUsableMs": 2219, "paymentsMs": [102, 125]},
+				{"role": "primary", "restartMs": 670, "usableMs": 2168, "firstPaymentMs": 2529, "processUsableMs": 2020, "paymentsMs": [100, 118]},
+				{"role": "phone", "restartMs": 680, "usableMs": 700, "firstPaymentMs": 1544, "processUsableMs": 333, "paymentsMs": [121, 117]},
+				{"role": "phone", "restartMs": 689, "usableMs": 695, "firstPaymentMs": 1537, "processUsableMs": 336, "paymentsMs": [126, 119]},
+				{"role": "phone", "restartMs": 673, "usableMs": 716, "firstPaymentMs": 1582, "processUsableMs": 351, "paymentsMs": [125, 116]}
+			],
+			"outages": [
+				{"seconds": 30, "blockedMs": 31615, "usableMs": 60, "firstPaymentMs": 7179, "paymentsMs": [6537, 125]},
+				{"seconds": 120, "blockedMs": 121627, "usableMs": 10731, "firstPaymentMs": 11573, "paymentsMs": [108, 117]},
+				{"seconds": 300, "blockedMs": 301625, "usableMs": 8784, "firstPaymentMs": 9148, "paymentsMs": [95, 121]}
+			],
+			"leakChecks": [
+				{"label": "baseline", "packets": {"phone": {"primary": {"out": 479, "in": 478}}, "primary": {"phone": {"out": 478, "in": 479}, "relay": {"out": 0, "in": 0}}, "relay": {"primary": {"out": 0, "in": 0}}}, "dialedSinceStart": {"primary": {}, "phone": {}}, "primaryHoldsForPeer": [{"host": "172.24.0.4", "port": 47940}], "phoneHoldsForPeer": [{"host": "primary", "port": 9735}], "relays": null},
+				{"label": "after primary restart 1", "packets": {"phone": {"primary": {"out": 1095, "in": 1092}}, "primary": {"phone": {"out": 1090, "in": 1094}, "relay": {"out": 0, "in": 0}}, "relay": {"primary": {"out": 0, "in": 0}}}, "dialedSinceStart": {"primary": {"192.168.65.254:60001": 1}, "phone": {"primary:9735": 1}}, "primaryHoldsForPeer": [{"host": "172.24.0.4", "port": 37782}], "phoneHoldsForPeer": [{"host": "primary", "port": 9735}], "relays": null},
+				{"label": "after primary restart 2", "packets": {"phone": {"primary": {"out": 1143, "in": 1141}}, "primary": {"phone": {"out": 1136, "in": 1140}, "relay": {"out": 0, "in": 0}}, "relay": {"primary": {"out": 0, "in": 0}}}, "dialedSinceStart": {"primary": {"192.168.65.254:60001": 1}, "phone": {"primary:9735": 3}}, "primaryHoldsForPeer": [{"host": "172.24.0.4", "port": 44898}], "phoneHoldsForPeer": [{"host": "primary", "port": 9735}], "relays": null},
+				{"label": "after primary restart 3", "packets": {"phone": {"primary": {"out": 1194, "in": 1191}}, "primary": {"phone": {"out": 1183, "in": 1189}, "relay": {"out": 0, "in": 0}}, "relay": {"primary": {"out": 0, "in": 0}}}, "dialedSinceStart": {"primary": {"192.168.65.254:60001": 1}, "phone": {"primary:9735": 5}}, "primaryHoldsForPeer": [{"host": "172.24.0.4", "port": 60126}], "phoneHoldsForPeer": [{"host": "primary", "port": 9735}], "relays": null},
+				{"label": "after phone restart 1", "packets": {"phone": {"primary": {"out": 1242, "in": 1239}}, "primary": {"phone": {"out": 1232, "in": 1239}, "relay": {"out": 0, "in": 0}}, "relay": {"primary": {"out": 0, "in": 0}}}, "dialedSinceStart": {"primary": {"192.168.65.254:60001": 1}, "phone": {"192.168.65.254:60001": 1, "primary:9735": 1}}, "primaryHoldsForPeer": [{"host": "172.24.0.4", "port": 58108}], "phoneHoldsForPeer": [{"host": "primary", "port": 9735}], "relays": null},
+				{"label": "after phone restart 2", "packets": {"phone": {"primary": {"out": 1290, "in": 1285}}, "primary": {"phone": {"out": 1279, "in": 1289}, "relay": {"out": 0, "in": 0}}, "relay": {"primary": {"out": 0, "in": 0}}}, "dialedSinceStart": {"primary": {"192.168.65.254:60001": 1}, "phone": {"192.168.65.254:60001": 1, "primary:9735": 1}}, "primaryHoldsForPeer": [{"host": "172.24.0.4", "port": 37668}], "phoneHoldsForPeer": [{"host": "primary", "port": 9735}], "relays": null},
+				{"label": "after phone restart 3", "packets": {"phone": {"primary": {"out": 1339, "in": 1332}}, "primary": {"phone": {"out": 1327, "in": 1340}, "relay": {"out": 0, "in": 0}}, "relay": {"primary": {"out": 0, "in": 0}}}, "dialedSinceStart": {"primary": {"192.168.65.254:60001": 1}, "phone": {"192.168.65.254:60001": 1, "primary:9735": 1}}, "primaryHoldsForPeer": [{"host": "172.24.0.4", "port": 40260}], "phoneHoldsForPeer": [{"host": "primary", "port": 9735}], "relays": null},
+				{"label": "before the 30 s outage", "packets": {"phone": {"primary": {"out": 1346, "in": 1340}}, "primary": {"phone": {"out": 1335, "in": 1347}, "relay": {"out": 0, "in": 0}}, "relay": {"primary": {"out": 0, "in": 0}}}, "dialedSinceStart": {"primary": {"192.168.65.254:60001": 1}, "phone": {"192.168.65.254:60001": 1, "primary:9735": 1}}, "primaryHoldsForPeer": [{"host": "172.24.0.4", "port": 40260}], "phoneHoldsForPeer": [{"host": "primary", "port": 9735}], "relays": null},
+				{"label": "during the 30 s outage", "packets": {"phone": {"primary": {"out": 1351, "in": 1346}}, "primary": {"phone": {"out": 1341, "in": 1347}, "relay": {"out": 0, "in": 0}}, "relay": {"primary": {"out": 0, "in": 0}}}, "dialedSinceStart": {"primary": {"192.168.65.254:60001": 1}, "phone": {"192.168.65.254:60001": 4, "primary:9735": 1}}, "primaryHoldsForPeer": [{"host": "172.24.0.4", "port": 40260}], "phoneHoldsForPeer": [{"host": "primary", "port": 9735}], "relays": null},
+				{"label": "after the 30 s outage", "packets": {"phone": {"primary": {"out": 1372, "in": 1368}}, "primary": {"phone": {"out": 1364, "in": 1368}, "relay": {"out": 0, "in": 0}}, "relay": {"primary": {"out": 0, "in": 0}}}, "dialedSinceStart": {"primary": {"192.168.65.254:60001": 1}, "phone": {"192.168.65.254:60001": 5, "primary:9735": 1}}, "primaryHoldsForPeer": [{"host": "172.24.0.4", "port": 40260}], "phoneHoldsForPeer": [{"host": "primary", "port": 9735}], "relays": null},
+				{"label": "before the 120 s outage", "packets": {"phone": {"primary": {"out": 1378, "in": 1375}}, "primary": {"phone": {"out": 1371, "in": 1374}, "relay": {"out": 0, "in": 0}}, "relay": {"primary": {"out": 0, "in": 0}}}, "dialedSinceStart": {"primary": {"192.168.65.254:60001": 1}, "phone": {"192.168.65.254:60001": 5, "primary:9735": 1}}, "primaryHoldsForPeer": [{"host": "172.24.0.4", "port": 40260}], "phoneHoldsForPeer": [{"host": "primary", "port": 9735}], "relays": null},
+				{"label": "during the 120 s outage", "packets": {"phone": {"primary": {"out": 1413, "in": 1385}}, "primary": {"phone": {"out": 1381, "in": 1374}, "relay": {"out": 0, "in": 0}}, "relay": {"primary": {"out": 0, "in": 0}}}, "dialedSinceStart": {"primary": {"192.168.65.254:60001": 1}, "phone": {"192.168.65.254:60001": 17, "primary:9735": 4}}, "primaryHoldsForPeer": [], "phoneHoldsForPeer": [], "relays": null},
+				{"label": "after the 120 s outage", "packets": {"phone": {"primary": {"out": 1453, "in": 1421}}, "primary": {"phone": {"out": 1417, "in": 1414}, "relay": {"out": 0, "in": 0}}, "relay": {"primary": {"out": 0, "in": 0}}}, "dialedSinceStart": {"primary": {"192.168.65.254:60001": 1}, "phone": {"192.168.65.254:60001": 18, "primary:9735": 5}}, "primaryHoldsForPeer": [{"host": "172.24.0.4", "port": 33278}], "phoneHoldsForPeer": [{"host": "primary", "port": 9735}], "relays": null},
+				{"label": "before the 300 s outage", "packets": {"phone": {"primary": {"out": 1460, "in": 1428}}, "primary": {"phone": {"out": 1424, "in": 1421}, "relay": {"out": 0, "in": 0}}, "relay": {"primary": {"out": 0, "in": 0}}}, "dialedSinceStart": {"primary": {"192.168.65.254:60001": 1}, "phone": {"192.168.65.254:60001": 18, "primary:9735": 5}}, "primaryHoldsForPeer": [{"host": "172.24.0.4", "port": 33278}], "phoneHoldsForPeer": [{"host": "primary", "port": 9735}], "relays": null},
+				{"label": "during the 300 s outage", "packets": {"phone": {"primary": {"out": 1519, "in": 1438}}, "primary": {"phone": {"out": 1434, "in": 1421}, "relay": {"out": 0, "in": 0}}, "relay": {"primary": {"out": 0, "in": 0}}}, "dialedSinceStart": {"primary": {"192.168.65.254:60001": 1}, "phone": {"192.168.65.254:60001": 48, "primary:9735": 11}}, "primaryHoldsForPeer": [], "phoneHoldsForPeer": [], "relays": null},
+				{"label": "after the 300 s outage", "packets": {"phone": {"primary": {"out": 1560, "in": 1473}}, "primary": {"phone": {"out": 1469, "in": 1462}, "relay": {"out": 0, "in": 0}}, "relay": {"primary": {"out": 0, "in": 0}}}, "dialedSinceStart": {"primary": {"192.168.65.254:60001": 1}, "phone": {"192.168.65.254:60001": 49, "primary:9735": 12}}, "primaryHoldsForPeer": [{"host": "172.24.0.4", "port": 47672}], "phoneHoldsForPeer": [{"host": "primary", "port": 9735}], "relays": null},
+				{"label": "end", "packets": {"phone": {"primary": {"out": 1567, "in": 1480}}, "primary": {"phone": {"out": 1476, "in": 1469}, "relay": {"out": 0, "in": 0}}, "relay": {"primary": {"out": 0, "in": 0}}}, "dialedSinceStart": {"primary": {"192.168.65.254:60001": 1}, "phone": {"192.168.65.254:60001": 49, "primary:9735": 12}}, "primaryHoldsForPeer": [{"host": "172.24.0.4", "port": 47672}], "phoneHoldsForPeer": [{"host": "primary", "port": 9735}], "relays": null}
+			],
+			"packetsAtEnd": {"phone": {"primary": {"out": 1567, "in": 1480}}, "primary": {"phone": {"out": 1476, "in": 1469}, "relay": {"out": 0, "in": 0}}, "relay": {"primary": {"out": 0, "in": 0}}}
+		}
+	},
+	"rotation": [
+		{
+			"round": 1,
+			"path": "porch",
+			"tcpNoDelay": false,
+			"passed": true,
+			"hostLoad": 6,
+			"payments": 40,
+			"completed": 40,
+			"engineMs": {"p50": 89, "p95": 104, "max": 111, "mean": 91},
+			"engineMsByPayer": {"phone": [93, 92, 90, 95, 87, 88, 95, 88, 93, 96, 91, 95, 88, 90, 87, 91, 89, 89, 90, 86], "primary": [111, 94, 89, 89, 104, 85, 87, 88, 89, 89, 88, 91, 92, 89, 94, 87, 87, 91, 88, 87]},
+			"packetsAtEnd": {"phone": {"primary": {"out": 0, "in": 0}}, "primary": {"phone": {"out": 0, "in": 0}, "relay": {"out": 403, "in": 405}}, "relay": {"primary": {"out": 405, "in": 403}}}
+		},
+		{
+			"round": 1,
+			"path": "porch-tls",
+			"tcpNoDelay": false,
+			"passed": true,
+			"hostLoad": 6,
+			"payments": 40,
+			"completed": 40,
+			"engineMs": {"p50": 90, "p95": 101, "max": 102, "mean": 90},
+			"engineMsByPayer": {"phone": [89, 90, 92, 102, 90, 93, 90, 90, 87, 95, 89, 86, 89, 94, 86, 94, 89, 90, 93, 91], "primary": [90, 89, 87, 88, 90, 92, 88, 86, 88, 90, 101, 89, 89, 91, 92, 86, 87, 90, 86, 95]},
+			"packetsAtEnd": {"phone": {"primary": {"out": 0, "in": 0}}, "primary": {"phone": {"out": 0, "in": 0}, "relay": {"out": 0, "in": 0}}, "relay": {"primary": {"out": 0, "in": 0}}}
+		},
+		{
+			"round": 1,
+			"path": "tcp",
+			"tcpNoDelay": false,
+			"passed": true,
+			"hostLoad": 5.7,
+			"payments": 40,
+			"completed": 40,
+			"engineMs": {"p50": 111, "p95": 118, "max": 126, "mean": 111},
+			"engineMsByPayer": {"phone": [116, 112, 113, 109, 107, 112, 114, 116, 108, 108, 110, 106, 106, 109, 107, 110, 110, 106, 111, 109], "primary": [114, 114, 118, 110, 113, 126, 108, 114, 112, 108, 116, 112, 111, 113, 109, 109, 116, 110, 111, 110]},
+			"packetsAtEnd": {"phone": {"primary": {"out": 479, "in": 478}}, "primary": {"phone": {"out": 478, "in": 479}, "relay": {"out": 0, "in": 0}}, "relay": {"primary": {"out": 0, "in": 0}}}
+		},
+		{
+			"round": 1,
+			"path": "tcp",
+			"tcpNoDelay": true,
+			"passed": true,
+			"hostLoad": 5.4,
+			"payments": 40,
+			"completed": 40,
+			"engineMs": {"p50": 89, "p95": 96, "max": 96, "mean": 90},
+			"engineMsByPayer": {"phone": [92, 89, 93, 95, 89, 92, 96, 94, 86, 89, 94, 85, 91, 88, 92, 85, 95, 96, 86, 95], "primary": [90, 87, 88, 90, 85, 88, 88, 89, 88, 91, 89, 87, 88, 95, 96, 87, 89, 88, 87, 86]},
+			"packetsAtEnd": {"phone": {"primary": {"out": 400, "in": 400}}, "primary": {"phone": {"out": 400, "in": 400}, "relay": {"out": 0, "in": 0}}, "relay": {"primary": {"out": 0, "in": 0}}}
+		},
+		{
+			"round": 2,
+			"path": "porch",
+			"tcpNoDelay": false,
+			"passed": true,
+			"hostLoad": 6.1,
+			"payments": 40,
+			"completed": 40,
+			"engineMs": {"p50": 88, "p95": 104, "max": 108, "mean": 89},
+			"engineMsByPayer": {"phone": [89, 90, 89, 104, 87, 90, 99, 87, 89, 87, 91, 90, 90, 89, 86, 87, 87, 88, 89, 91], "primary": [88, 86, 88, 93, 86, 88, 87, 85, 87, 86, 89, 86, 86, 87, 108, 86, 87, 93, 93, 90]},
+			"packetsAtEnd": {"phone": {"primary": {"out": 0, "in": 0}}, "primary": {"phone": {"out": 0, "in": 0}, "relay": {"out": 404, "in": 404}}, "relay": {"primary": {"out": 404, "in": 404}}}
+		},
+		{
+			"round": 2,
+			"path": "porch-tls",
+			"tcpNoDelay": false,
+			"passed": true,
+			"hostLoad": 7,
+			"payments": 40,
+			"completed": 40,
+			"engineMs": {"p50": 91, "p95": 97, "max": 100, "mean": 91},
+			"engineMsByPayer": {"phone": [88, 88, 91, 93, 93, 88, 91, 84, 97, 91, 91, 90, 96, 88, 88, 87, 94, 89, 93, 96], "primary": [89, 89, 89, 100, 91, 95, 91, 95, 90, 86, 88, 93, 88, 92, 90, 94, 87, 87, 86, 94]},
+			"packetsAtEnd": {"phone": {"primary": {"out": 0, "in": 0}}, "primary": {"phone": {"out": 0, "in": 0}, "relay": {"out": 0, "in": 0}}, "relay": {"primary": {"out": 0, "in": 0}}}
+		},
+		{
+			"round": 2,
+			"path": "tcp",
+			"tcpNoDelay": false,
+			"passed": true,
+			"hostLoad": 5.5,
+			"payments": 40,
+			"completed": 40,
+			"engineMs": {"p50": 111, "p95": 118, "max": 121, "mean": 111},
+			"engineMsByPayer": {"phone": [110, 109, 114, 112, 109, 115, 110, 107, 106, 112, 109, 110, 110, 116, 105, 109, 109, 113, 108, 108], "primary": [114, 112, 115, 114, 115, 107, 112, 121, 115, 109, 118, 114, 113, 114, 110, 111, 108, 112, 111, 108]},
+			"packetsAtEnd": {"phone": {"primary": {"out": 479, "in": 479}}, "primary": {"phone": {"out": 479, "in": 479}, "relay": {"out": 0, "in": 0}}, "relay": {"primary": {"out": 0, "in": 0}}}
+		},
+		{
+			"round": 2,
+			"path": "tcp",
+			"tcpNoDelay": true,
+			"passed": true,
+			"hostLoad": 6.5,
+			"payments": 40,
+			"completed": 40,
+			"engineMs": {"p50": 91, "p95": 106, "max": 109, "mean": 93},
+			"engineMsByPayer": {"phone": [87, 99, 89, 90, 100, 104, 106, 100, 92, 87, 89, 86, 91, 104, 100, 95, 88, 94, 90, 88], "primary": [92, 89, 90, 95, 96, 94, 90, 93, 90, 91, 85, 91, 99, 109, 101, 92, 88, 90, 88, 91]},
+			"packetsAtEnd": {"phone": {"primary": {"out": 400, "in": 400}}, "primary": {"phone": {"out": 400, "in": 400}, "relay": {"out": 0, "in": 0}}, "relay": {"primary": {"out": 0, "in": 0}}}
+		},
+		{
+			"round": 3,
+			"path": "porch",
+			"tcpNoDelay": false,
+			"passed": true,
+			"hostLoad": 6.2,
+			"payments": 40,
+			"completed": 40,
+			"engineMs": {"p50": 90, "p95": 105, "max": 107, "mean": 91},
+			"engineMsByPayer": {"phone": [107, 88, 87, 89, 85, 98, 96, 98, 87, 89, 85, 91, 85, 88, 90, 88, 89, 96, 92, 91], "primary": [91, 90, 92, 90, 87, 88, 89, 92, 92, 89, 105, 103, 84, 96, 89, 86, 94, 92, 88, 87]},
+			"packetsAtEnd": {"phone": {"primary": {"out": 0, "in": 0}}, "primary": {"phone": {"out": 0, "in": 0}, "relay": {"out": 406, "in": 408}}, "relay": {"primary": {"out": 408, "in": 406}}}
+		},
+		{
+			"round": 3,
+			"path": "porch-tls",
+			"tcpNoDelay": false,
+			"passed": true,
+			"hostLoad": 6.7,
+			"payments": 40,
+			"completed": 40,
+			"engineMs": {"p50": 92, "p95": 108, "max": 113, "mean": 93},
+			"engineMsByPayer": {"phone": [104, 88, 91, 87, 98, 92, 96, 89, 87, 93, 113, 88, 89, 87, 90, 87, 94, 89, 89, 90], "primary": [91, 92, 93, 96, 94, 90, 97, 93, 96, 108, 108, 92, 89, 90, 87, 94, 87, 92, 86, 99]},
+			"packetsAtEnd": {"phone": {"primary": {"out": 0, "in": 0}}, "primary": {"phone": {"out": 0, "in": 0}, "relay": {"out": 0, "in": 0}}, "relay": {"primary": {"out": 0, "in": 0}}}
+		},
+		{
+			"round": 3,
+			"path": "tcp",
+			"tcpNoDelay": false,
+			"passed": true,
+			"hostLoad": 5.8,
+			"payments": 40,
+			"completed": 40,
+			"engineMs": {"p50": 113, "p95": 121, "max": 123, "mean": 113},
+			"engineMsByPayer": {"phone": [113, 109, 108, 114, 110, 123, 109, 110, 109, 110, 109, 115, 111, 111, 109, 110, 107, 107, 115, 111], "primary": [113, 118, 118, 121, 115, 115, 118, 115, 116, 112, 119, 114, 110, 115, 112, 113, 114, 113, 113, 120]},
+			"packetsAtEnd": {"phone": {"primary": {"out": 476, "in": 474}}, "primary": {"phone": {"out": 474, "in": 476}, "relay": {"out": 0, "in": 0}}, "relay": {"primary": {"out": 0, "in": 0}}}
+		},
+		{
+			"round": 3,
+			"path": "tcp",
+			"tcpNoDelay": true,
+			"passed": true,
+			"hostLoad": 5.6,
+			"payments": 40,
+			"completed": 40,
+			"engineMs": {"p50": 90, "p95": 103, "max": 114, "mean": 92},
+			"engineMsByPayer": {"phone": [94, 101, 88, 97, 90, 91, 114, 98, 93, 103, 93, 90, 90, 87, 90, 87, 86, 99, 88, 90], "primary": [87, 94, 89, 89, 96, 88, 89, 88, 86, 90, 87, 86, 96, 89, 90, 89, 87, 100, 90, 96]},
+			"packetsAtEnd": {"phone": {"primary": {"out": 401, "in": 399}}, "primary": {"phone": {"out": 399, "in": 401}, "relay": {"out": 0, "in": 0}}, "relay": {"primary": {"out": 0, "in": 0}}}
+		}
+	],
+	"latencyRepeats": {
+		"tcpNoDelay": {
+			"passed": true,
+			"msPerMsOneWay": 3.9,
+			"points": [
+				{"addedMsOneWay": 0, "hostLoad": 5.4, "payments": 20, "p50": 91, "p95": 110, "max": 110, "mean": 93},
+				{"addedMsOneWay": 20, "hostLoad": 5.2, "payments": 20, "p50": 165, "p95": 173, "max": 173, "mean": 165},
+				{"addedMsOneWay": 40, "hostLoad": 5.3, "payments": 20, "p50": 248, "p95": 267, "max": 267, "mean": 249}
+			]
+		},
+		"tcpSecondRun": {
+			"passed": true,
+			"msPerMsOneWay": 7.875,
+			"points": [
+				{"addedMsOneWay": 0, "hostLoad": 5, "payments": 20, "p50": 112, "p95": 126, "max": 126, "mean": 113},
+				{"addedMsOneWay": 20, "hostLoad": 5.6, "payments": 20, "p50": 267, "p95": 348, "max": 348, "mean": 270},
+				{"addedMsOneWay": 40, "hostLoad": 5.6, "payments": 20, "p50": 426, "p95": 473, "max": 473, "mean": 428}
+			]
+		}
+	},
+	"final": {"at": "2026-11-12T00:21:06.083Z", "channelId": "b4c7692fcae00ae596dfcbd3d7f37201f39d591bb48ab117da3dfab0e54745d8", "state": "NORMAL", "primaryBalanceSats": 700000, "phoneBalanceSats": 300000, "fundingOutputUnspent": true, "fundingConfirmations": 6, "channelFailures": 0}
+}

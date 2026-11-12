@@ -311,6 +311,7 @@ Generated from `node/types.ts` by `npm run docs:tables`; edit the doc comments t
 | `learnedAddressDials?` | `LearnedAddressDials` | How addresses the operator did not choose are dialed (default 'any'): a channel peer's announced reconnect addresses, a node id resolved through the gossip graph or DNS seeds, a direct-funding lane a counterparty named. 'proxy-only' sends those dials through socks5Proxy whatever socks5ProxyScope says, and refuses them when no proxy carries them, so nobody can learn this node's address by naming one of their own. Addresses passed to connectPeer are not affected. Always 'proxy-only' when iroh.relayOnly is set. |
 | `webSocketImpl?` | `WebSocketConstructor` | WebSocket constructor for outbound WS peer connections. Defaults to the in-repo RFC-cased Node client under Node (CLN's ws listener rejects the built-in WebSocket's lowercased headers) and to globalThis.WebSocket in browsers. Only consulted when a peer is dialed with transport {type: 'ws'}; mirrors how electrumOptions injects net/tls. |
 | `iroh?` | `IIrohConfig` | Opt-in Iroh endpoint, supplied by Node or a native mobile bridge. `relayOnly: true` keeps every Iroh connection on the relay so a peer never learns this node's IP address (the relay operator still does); it needs a factory whose endpoint reports IIrohEndpoint.relayOnly, and it switches learnedAddressDials to 'proxy-only'. |
+| `porch?` | `IPorchConfig` | Opt-in Porch relays (docs/PORCH-PROTOCOL.md): the node dials out to each and waits there, so it can be reached by a `wss://` link that does not say where it runs. Started with listenPorch(). Setting it switches learnedAddressDials to 'proxy-only'. |
 | `watchtowers?` | `string[]` | Watchtowers to ship encrypted justice data to at every revocation, as `pubkey@host:port` URIs (LND altruist wtwire protocol). Empty/undefined disables the watchtower client entirely. |
 | `preferAnchors?` | `boolean` | Prefer anchor channels (option_anchors_zero_fee_htlc_tx) when opening channels |
 | `largeChannels?` | `boolean` | option_wumbo (large_channels, bit 18, default false): advertise the bit and lift the BOLT 2 2^24 sat funding cap to MAX_WUMBO_FUNDING_SATOSHIS (10 BTC) for peers that also advertise it. Opens/accepts/splices with non-wumbo peers keep the 2^24 cap. |
@@ -1402,6 +1403,7 @@ const result = await node.recoverFromStaticChannelBackup(scb.channels);
 | `peer:disconnect` | `(pubkey: string, info?: IPeerDisconnectInfo)` | Peer disconnected (networking mode). `info` says who closed the connection and why, when known. |
 | `peer:disconnect-requested` | `(pubkey: string)` | The node needs this peer's connection severed but holds no socket for it (event-transport mode, or an unconnected peer): the host must close its transport. The protocol side (channels marked for reestablish) is already applied; reconnect and reestablish as usual. |
 | `peer:error` | `(pubkey: string, error: Error)` | Peer error (networking mode). |
+| `porch:status` | `(status: IPorchHostStatus)` | A Porch relay's standbys changed: the relay became reachable, was lost or refused the node, or a visitor connected or left. Carries that relay's whole status; `state: 'ready'` means links through it work. |
 | `peer:warning` | `(warning: { pubkey: string; channelId: Buffer \| null; text: string })` | A peer sent a BOLT 1 warning, which leaves the connection and its channels as they were, so it is not a `node:error`. `channelId` is null for a connection-level warning (the all-zero id); `text` is the peer's text as printable ASCII. |
 | `custom-message` | `(message: { peerPubkey: string; version: number; subtype: number; payload: Buffer })` | A beignet custom message (type 44069) arrived from a peer. |
 | `peer_storage:retrieved` | `(peerPubkey: string, blob: Buffer)` | A peer returned the blob it stores for this node (BOLT 1 peer storage), unpadded. |
@@ -1660,3 +1662,53 @@ of the previous one, while reusing the derived identity. Iroh is opt-in per
 peer. It reveals IP addresses to peers and relays and does not provide Tor's
 anonymity. See the CLI README for relay/discovery settings, API diagnostics and
 remaining device and relay validation.
+
+### Porch relays
+
+A node that should not show where it runs can wait at a Porch relay instead of
+listening: it dials out to the relay, and a visitor reaches it through an
+ordinary `pubkey@wss://relay/v1/p/<id>` peer URI. The relay copies BOLT 8
+bytes it cannot read. The protocol is in
+[docs/PORCH-PROTOCOL.md](../../docs/PORCH-PROTOCOL.md), and
+`beignet porch-relay` runs a relay.
+
+```ts
+import { node } from 'beignet/lightning';
+
+const lightning = node.LightningNode.fromMnemonic(mnemonic, {
+  enableNetworking: true,
+  porch: { relays: ['wss://relay.example'] }
+});
+lightning.on('porch:status', (status) => console.log(status.relay, status.state));
+lightning.listenPorch();
+const [link] = lightning.getPorchLinks(); // { relay, tag, uri }
+```
+
+- `listenPorch()` returns at once. Whether a relay is reachable is status
+  (`getPorchStatus()`, `porch:status`), not an error: a link works while its
+  relay's state is `ready`, and a relay that is away is retried with backoff.
+  With no link to serve the node stays away from the relay and the state
+  reads `no-links`.
+- `fromMnemonic` derives the host key from the seed, apart from the Lightning
+  key, and serves one link whose tag is also derived. Pass `porch.tags`
+  (16 bytes each) to serve other links, and `setPorchTags()` to change them
+  while running: a link left out stops resolving and the connections that
+  came in through it are closed. Direct `new LightningNode(config)` callers
+  pass `porch.hostSecret` (`derivePorchHostSecret(seed)`) and `porch.tags`.
+- `porch.via` decides how the relays are dialed. Unset, a relay is dialed as
+  a peer at that host would be, so it rides `socks5Proxy` when the proxy
+  covers public hosts. `'tor'` sends every relay connection through the proxy
+  (Tor's default port when none is set) with the relay's name unresolved, and
+  has no direct dial to fall back to. `'direct'` dials from this machine even
+  when a proxy is set.
+- Setting `porch` switches `learnedAddressDials` to `'proxy-only'`: a node
+  that hides its address does not dial one a peer chose.
+- A peer that came in through a relay is listed with `host: 'porch:<relay>'`
+  and a `porch` field naming the relay and the link. Its own address is never
+  known. All visitors through one relay count as one source for
+  `maxPendingInboundPerAddress` and `maxInboundPeersPerAddress`; channel
+  peers are admitted past the second, as from any address.
+
+What the relay learns: this node's address unless the relays are dialed
+through Tor, each visitor's address, the host key and link tags, timing and
+volume. It does not see the Lightning key or any traffic in the clear.

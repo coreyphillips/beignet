@@ -11,3 +11,6 @@ export const AUTH_KEY_OVERRIDES_STORAGE_KEY = 'daemon:auth-key-overrides:v1';
 
 /** wallet_data key the daemon keeps raw webhook HMAC secrets under. */
 export const WEBHOOK_SECRETS_STORAGE_KEY = 'daemon:webhook-secrets:v1';
+
+/** wallet_data key for the Porch links made and revoked on this node. */
+export const PORCH_LINKS_STORAGE_KEY = 'daemon:porch-links:v1';
