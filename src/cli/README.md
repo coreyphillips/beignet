@@ -189,6 +189,7 @@ await node.destroy();
 | `irohRelayOnly?` | `boolean` | Keep every Iroh connection on the relay (default false). No direct path is offered or taken, so someone who holds the node's Iroh link cannot learn its IP address; the relay operator still sees it. Slower than a direct path. Needs a relay, and learned addresses are then dialed through the SOCKS5 proxy or not at all. With an Iroh binding that cannot remove its IP transport, the node stops serving Iroh on a network whose router grants port mappings (see the Iroh section). |
 | `porchRelays?` | `(string \| IPorchRelayConfig)[]` | Porch relays to wait at, so the node can hand out `wss://` peer links that do not say where it runs. Each is a relay URL (`wss://host[:port]`), or `{ url, token }` for a relay that asks a node for a token. Unset or empty leaves Porch off. |
 | `porchVia?` | `PorchVia` | How the relays are dialed. `tor` sends every relay connection through the SOCKS5 proxy (torProxy, else 127.0.0.1:9050), so the relay does not learn the node's address either. `direct` dials them directly whatever torProxy says. Unset dials a relay as any other peer at that host. |
+| `porchProxy?` | `string` | A SOCKS5 proxy for the relay connections alone, as "host:port". Every relay is dialed through it and never directly, so the relay sees the proxy and not the node, while peers go on being dialed as torProxy says. Any SOCKS5 proxy that asks for no credentials will do: a second Tor, or a VPN or tunnel that offers one, which costs far less time than Tor. Refused together with porchVia `direct`. |
 | `porchStandbys?` | `number` | Idle connections kept at each relay. Each one takes one visitor, and is replaced when it does. Default 2, at most 8. |
 | `porchToken?` | `string` | The token of a private relay, when exactly one relay is configured. With several, each relay's token goes in its own porchRelays entry. |
 | `electrumTlsVerify?` | `boolean` | Verify Electrum TLS certificates (default false). Every TLS connection the wallet opens, to the configured server or to a public fallback, is accepted only when its certificate chains to a trusted CA and matches the host name, or when its SHA-256 fingerprint is in electrumTlsFingerprints. |
@@ -2582,6 +2583,7 @@ port forwarding or public address is needed at home. Run a relay with
 | --- | --- | --- |
 | `BEIGNET_PORCH_RELAYS` | `porchRelays` | Comma-separated relay URLs (`wss://host[:port]`, or `ws://` for an onion service). Empty or unset leaves Porch off. In the config file an entry can also be `{ "url": "...", "token": "..." }` |
 | `BEIGNET_PORCH_VIA` | `porchVia` | `tor` dials every relay through the SOCKS5 proxy (`torProxy`, else `127.0.0.1:9050`), with the relay's name unresolved and no direct dial to fall back to. `direct` dials them directly whatever `torProxy` says. Unset dials a relay as any other peer at that host |
+| `BEIGNET_PORCH_PROXY` | `porchProxy` | A SOCKS5 proxy for the relay connections alone, as `host:port`. Every relay is dialed through it, with the relay's name unresolved and no direct dial to fall back to, while peers go on being dialed as `torProxy` says. Any SOCKS5 proxy that asks for no credentials will do, Tor or not. Refused together with `porchVia: direct`, and for a relay at a private address |
 | `BEIGNET_PORCH_STANDBYS` | `porchStandbys` | Idle connections kept at each relay (default 2, at most 8). Each takes one visitor and is replaced at once |
 | `BEIGNET_PORCH_TOKEN` | `porchToken` | The token of a private relay, when exactly one relay is configured. With several relays this is refused, because a token sent to each would be disclosed to the others: give each its own in a `{ url, token }` entry |
 
@@ -2594,7 +2596,12 @@ Who learns what:
   not told the Lightning pubkey, though it can test a guess by dialing the
   link itself. `GET /info` reports `proxied: false` for such a relay. With
   `porchVia: tor` (`proxied: true`) the relay does not see the node's address
-  either, at the cost of Tor's latency on every message.
+  either, at the cost of Tor's latency on every message. `porchProxy` does
+  the same through a proxy of your choosing, which then sees the address in
+  the relay's place.
+- A visitor whose peer dials go through a proxy (`torProxy`) reaches the
+  relay through it, so the relay does not see the visitor's address either.
+  With both ends proxied it sees neither.
 - A relay you run yourself is one whose operator is you.
 
 With Porch on, the node stops dialing addresses a peer chose: an address

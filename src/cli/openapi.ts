@@ -7289,7 +7289,7 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						proxied: {
 							type: 'boolean',
 							description:
-								"True when the node reaches this relay through the SOCKS5 proxy (porchVia tor, or torProxy), so the relay does not see the node's address. False: the relay's operator does, and nobody else"
+								"True when the node reaches this relay through a SOCKS5 proxy (porchProxy, porchVia tor, or torProxy), so the relay does not see the node's address. False: the relay's operator does, and nobody else"
 						}
 					},
 					required: ['relay', 'state', 'idle', 'circuits', 'proxied']

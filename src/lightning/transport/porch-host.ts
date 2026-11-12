@@ -68,6 +68,15 @@ export interface IPorchConfig {
 	 * machine. 'direct' dials from this machine even when a proxy is set.
 	 */
 	via?: PorchVia;
+	/**
+	 * A SOCKS5 proxy for the relay connections alone, in place of the one
+	 * peers are dialed through. With it every relay is dialed through this
+	 * proxy and never directly, as under via 'tor', so the relay sees the
+	 * proxy and not this machine. It need not be Tor: any SOCKS5 proxy that
+	 * asks for no credentials will do. Setting it with via 'direct' is a
+	 * configuration error.
+	 */
+	proxy?: { host: string; port: number };
 	/** Idle standbys to keep at each relay (default 2, at most 8). */
 	standbys?: number;
 	timing?: Partial<IPorchHostTiming>;

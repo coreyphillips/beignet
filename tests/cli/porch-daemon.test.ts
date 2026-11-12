@@ -18,6 +18,8 @@ import { daemonOptions } from '../../src/cli/daemon-options';
 import { PORCH_LINKS_STORAGE_KEY } from '../../src/cli/daemon-state-keys';
 import {
 	PorchDaemonConfig,
+	parsePorchProxy,
+	porchProxyEnv,
 	porchRelayEntries,
 	porchRelaysEnv,
 	porchStandbysEnv,
@@ -184,11 +186,58 @@ describe('Porch daemon configuration', () => {
 		}
 	});
 
+	it('reads a proxy for the relays alone, as host:port and nothing more', () => {
+		withEnv({ BEIGNET_PORCH_PROXY: undefined }, () => {
+			expect(porchProxyEnv()).to.equal(undefined);
+		});
+		// Unset by being empty, as a compose file leaves it.
+		for (const value of ['', '  ']) {
+			withEnv({ BEIGNET_PORCH_PROXY: value }, () => {
+				expect(porchProxyEnv()).to.equal(undefined);
+			});
+		}
+		withEnv({ BEIGNET_PORCH_PROXY: ' 127.0.0.1:1080 ' }, () => {
+			expect(porchProxyEnv()).to.equal('127.0.0.1:1080');
+		});
+
+		expect(parsePorchProxy('127.0.0.1:1080')).to.deep.equal({
+			host: '127.0.0.1',
+			port: 1080
+		});
+		expect(parsePorchProxy('proxy.example:65535')).to.deep.equal({
+			host: 'proxy.example',
+			port: 65535
+		});
+		// A scheme or credentials are refused, not guessed at: the proxy is
+		// asked for no authentication, and a secret here would be one more
+		// thing to keep out of logs.
+		for (const value of [
+			'socks5://127.0.0.1:1080',
+			'user:secret@127.0.0.1:1080',
+			'127.0.0.1',
+			'127.0.0.1:',
+			':1080',
+			'127.0.0.1:0',
+			'127.0.0.1:65536',
+			'127.0.0.1:port',
+			'127.0.0.1:1080/path',
+			'127.0.0.1 :1080',
+			'',
+			1080,
+			undefined
+		]) {
+			expect(() => parsePorchProxy(value), String(value)).to.throw(
+				'porchProxy must be a SOCKS5 proxy as "host:port"'
+			);
+		}
+	});
+
 	it('carries the environment through resolveConfig and into the daemon options', () => {
 		withEnv(
 			{
 				BEIGNET_PORCH_RELAYS: 'wss://relay.example',
 				BEIGNET_PORCH_VIA: 'tor',
+				BEIGNET_PORCH_PROXY: '127.0.0.1:1080',
 				BEIGNET_PORCH_STANDBYS: '3',
 				BEIGNET_PORCH_TOKEN: 'open sesame'
 			},
@@ -198,6 +247,7 @@ describe('Porch daemon configuration', () => {
 				const options = daemonOptions(config, 0);
 				expect(options.porchRelays).to.deep.equal(['wss://relay.example']);
 				expect(options.porchVia).to.equal('tor');
+				expect(options.porchProxy).to.equal('127.0.0.1:1080');
 				expect(options.porchStandbys).to.equal(3);
 				expect(options.porchToken).to.equal('open sesame');
 				// A flag beats the environment.
@@ -241,6 +291,13 @@ describe('Porch daemon configuration', () => {
 			[{ porchToken: '' }, 'porchToken must be a string of 1 to 256 bytes'],
 			[{ porchToken: 'x'.repeat(257) }, 'porchToken must be a string'],
 			[{ porchVia: 'onion' as never }, "porchVia must be 'direct' or 'tor'"],
+			[{ porchProxy: 'socks5://127.0.0.1:1080' }, 'as "host:port"'],
+			[{ porchProxy: 1080 as never }, 'as "host:port"'],
+			[
+				// One says through a proxy, the other says directly.
+				{ porchProxy: '127.0.0.1:1080', porchVia: 'direct' },
+				"porchVia 'direct' dials them directly; set one"
+			],
 			[{ porchStandbys: 0 }, 'from 1 to 8'],
 			[{ porchStandbys: 9 }, 'from 1 to 8'],
 			[{ porchStandbys: 1.5 }, 'from 1 to 8'],
@@ -258,7 +315,13 @@ describe('Porch daemon configuration', () => {
 			{ porchRelays: [] },
 			{ porchVia: 'tor', porchStandbys: 8, porchToken: 'x'.repeat(256) },
 			{ porchRelays: ['wss://relay.example'], porchStandbys: 1 },
-			{ porchRelays: ['ws://abcdefghijklmnop.onion'], porchVia: 'tor' }
+			{ porchRelays: ['ws://abcdefghijklmnop.onion'], porchVia: 'tor' },
+			{ porchProxy: '127.0.0.1:1080' },
+			{
+				porchRelays: ['wss://relay.example'],
+				porchProxy: 'proxy.example:1080',
+				porchVia: 'tor'
+			}
 		] as PorchDaemonConfig[]) {
 			expect(() => validatePorchConfig(config)).to.not.throw();
 		}
@@ -322,6 +385,14 @@ describe('Porch daemon configuration', () => {
 			[
 				{ porchRelays: ['ws://abcdefghijklmnop.onion'], porchVia: 'direct' },
 				'onion service'
+			],
+			[
+				{ porchRelays: ['ws://127.0.0.1:2114'], porchProxy: '127.0.0.1:1080' },
+				'not reached through a proxy'
+			],
+			[
+				{ porchRelays: ['wss://relay.example'], porchProxy: 'localhost' },
+				'as "host:port"'
 			]
 		];
 		for (const [config, message] of failures) {
@@ -565,7 +636,13 @@ interface IPorchInternals {
 		scope: 'all' | 'onion',
 		announced: Array<{ type: number; host: string; port: number }> | undefined
 	):
-		| { relays: unknown[]; tags: Buffer[]; via?: string; standbys?: number }
+		| {
+				relays: unknown[];
+				tags: Buffer[];
+				via?: string;
+				proxy?: { host: string; port: number };
+				standbys?: number;
+		  }
 		| undefined;
 	bindListener(kind: string, port: number): Promise<void>;
 	bindHeldListeners(): void;
@@ -725,6 +802,40 @@ describe('Porch on a daemon node', () => {
 			)
 		)
 			.to.throw('private address')
+			.with.property('code', 'INVALID_PARAMS');
+		// A proxy for the relays alone carries a public relay whatever
+		// torProxy and its scope say, and is what the node is given to dial
+		// through.
+		for (const [via, scope] of [
+			[undefined, 'all'],
+			[proxy, 'onion']
+		] as const) {
+			const config = node.porchNodeConfig(
+				{ porchRelays: [relays[0]], porchProxy: '10.64.0.1:1080' },
+				via,
+				scope,
+				undefined
+			);
+			expect(config?.proxy).to.deep.equal({ host: '10.64.0.1', port: 1080 });
+			expect(node.getPorchLinks().relays[0].proxied).to.equal(true);
+		}
+		expect(
+			node.porchNodeConfig(
+				{ porchRelays: [relays[0]] },
+				proxy,
+				'all',
+				undefined
+			)
+		).to.not.have.property('proxy');
+		expect(() =>
+			node.porchNodeConfig(
+				{ porchRelays: relays, porchProxy: '10.64.0.1:1080' },
+				undefined,
+				'all',
+				undefined
+			)
+		)
+			.to.throw('not reached through a proxy')
 			.with.property('code', 'INVALID_PARAMS');
 	});
 

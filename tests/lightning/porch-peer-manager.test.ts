@@ -121,6 +121,37 @@ describe('Porch in the peer manager', function () {
 				selectPorchProxy('relayaddress.onion', 'direct', proxy, 'all')
 			).to.throw(/onion service: it cannot be dialed with via 'direct'/);
 		});
+
+		it('sends every relay through a proxy of its own when Porch has one', function () {
+			const own = { host: '127.0.0.1', port: 11080 };
+			const through: Array<
+				[string, 'tor' | undefined, typeof proxy | undefined, 'all' | 'onion']
+			> = [
+				// Whatever the peers' proxy and its scope say.
+				['relay.example', undefined, undefined, 'all'],
+				['relay.example', undefined, proxy, 'all'],
+				['relay.example', undefined, proxy, 'onion'],
+				['relay.example', 'tor', proxy, 'all'],
+				['relay.example', 'tor', undefined, 'onion'],
+				['relayaddress.onion', undefined, proxy, 'all'],
+				['relayaddress.onion', 'tor', undefined, 'all']
+			];
+			for (const [host, via, given, scope] of through) {
+				expect(
+					selectPorchProxy(host, via, given, scope, own),
+					`${host}, via ${via ?? 'unset'}`
+				).to.equal(own);
+			}
+			// It contradicts 'direct', and it does not reach a private address.
+			expect(() =>
+				selectPorchProxy('relay.example', 'direct', proxy, 'all', own)
+			).to.throw(/a proxy of its own and via 'direct'.*set one/);
+			for (const host of ['127.0.0.1', 'localhost', '192.168.1.20']) {
+				expect(() =>
+					selectPorchProxy(host, undefined, proxy, 'all', own)
+				).to.throw(/private address: it is not reached through a proxy/);
+			}
+		});
 	});
 
 	describe('configuration', function () {
@@ -148,6 +179,17 @@ describe('Porch in the peer manager', function () {
 				[
 					{ relays: ['ws://relayaddress.onion'], via: 'direct' },
 					/onion service/
+				],
+				[
+					{ proxy: { host: '127.0.0.1', port: 11080 }, via: 'direct' },
+					/a proxy of its own and via 'direct'/
+				],
+				[
+					{
+						relays: ['ws://127.0.0.1:2114'],
+						proxy: { host: '127.0.0.1', port: 11080 }
+					},
+					/not reached through a proxy/
 				],
 				[{ standbys: 9 }, /whole number from 1 to 8/],
 				[{ standbys: 0 }, /whole number from 1 to 8/],
