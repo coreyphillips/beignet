@@ -33,7 +33,11 @@ import type {
 	IPeerTransportOptions
 } from './duplex-transport';
 import type { WebSocketConstructor } from './websocket';
-import { connectWebSocket, buildWebSocketUrl } from './websocket';
+import {
+	connectWebSocket,
+	buildWebSocketUrl,
+	parseWebSocketUrl
+} from './websocket';
 import { WebSocketServer } from './websocket-server';
 import { NodeWebSocket, nodeWebSocketVia } from './websocket-node-client';
 import type { IPorchRelayAddress } from './porch';
@@ -63,12 +67,14 @@ import { CodedError } from '../../utils/errors';
  * resolves globalThis.WebSocket.
  */
 function defaultWebSocketImpl(): WebSocketConstructor | undefined {
+	return isNodeRuntime() ? NodeWebSocket : undefined;
+}
+
+/** Whether this runtime opens its own sockets, as Node does. */
+function isNodeRuntime(): boolean {
 	const proc = (globalThis as { process?: { versions?: { node?: string } } })
 		.process;
-	if (proc?.versions?.node) {
-		return NodeWebSocket;
-	}
-	return undefined;
+	return Boolean(proc?.versions?.node);
 }
 
 const DEFAULT_MAX_RECONNECT_DELAY_MS = 300_000; // 5 minutes
@@ -300,10 +306,11 @@ export interface IPeerManagerOptions {
 	autoReconnect?: boolean;
 	/** Max reconnect delay in ms (default 5 min) */
 	maxReconnectDelay?: number;
-	/** SOCKS5 proxy for outbound connections (e.g. Tor on 127.0.0.1:9050).
-	 *  Which hosts use it is decided by socks5ProxyScope; private and
-	 *  loopback hosts never do. When not set, .onion addresses auto-route
-	 *  through 127.0.0.1:9050 and everything else is dialed directly. */
+	/** SOCKS5 proxy for outbound connections (e.g. Tor on 127.0.0.1:9050),
+	 *  TCP and WebSocket peers alike. Which hosts use it is decided by
+	 *  socks5ProxyScope; private and loopback hosts never do. When not set,
+	 *  .onion addresses auto-route through 127.0.0.1:9050 and everything
+	 *  else is dialed directly. */
 	socks5Proxy?: { host: string; port: number };
 	/** Which destinations ride socks5Proxy (default 'all'): 'all' proxies
 	 *  every public host, 'onion' proxies .onion hosts only and dials public
@@ -343,7 +350,9 @@ export interface IPeerManagerOptions {
 	 *  the in-repo RFC-cased Node client under Node (CLN's ws listener
 	 *  rejects the built-in WebSocket's lowercased headers) and to
 	 *  globalThis.WebSocket in browsers. Only consulted when a peer is
-	 *  dialed with transport {type: 'ws'}. */
+	 *  dialed with transport {type: 'ws'} and the dial is a direct one: a
+	 *  dial that socks5Proxy carries is made by the in-repo client over the
+	 *  proxy's socket, and fails where that client cannot run. */
 	webSocketImpl?: WebSocketConstructor;
 	iroh?: IIrohConfig;
 	/**
@@ -901,11 +910,32 @@ export class PeerManager extends EventEmitter {
 						)
 				: primary;
 		} else if (transport?.type === 'ws') {
-			// WebSocket transport (does NOT route through the SOCKS5 proxy)
+			// Routed as a TCP dial is (selectOutboundProxy), by the host the
+			// WebSocket connects to. Through a proxy the dial is made by the
+			// in-repo client over the proxy's socket: the name goes to the
+			// proxy unresolved, TLS runs inside the tunnel, and there is no
+			// direct dial behind it. An injected webSocketImpl cannot be
+			// handed a socket, so it serves direct dials only.
+			//
+			// With no proxy configured an onion host falls back to Tor's
+			// default port, which helps only a runtime that opens its own
+			// sockets. A browser has nothing but its own WebSocket to reach
+			// an onion host with, and keeps it.
 			const url = transport.url ?? buildWebSocketUrl(host, port);
-			const webSocketImpl = this.webSocketImpl ?? defaultWebSocketImpl();
-			createSocket = (): Promise<IDuplexTransport> =>
-				connectWebSocket(url, { webSocketImpl });
+			createSocket = async (): Promise<IDuplexTransport> => {
+				const proxy =
+					this.socks5Proxy || isNodeRuntime()
+						? selectOutboundProxy(
+								parseWebSocketUrl(url).host,
+								this.socks5Proxy,
+								this.socks5ProxyScope
+						  )
+						: undefined;
+				const webSocketImpl = proxy
+					? nodeWebSocketVia(this.buildSocks5Factory(proxy, timeoutMs))
+					: this.webSocketImpl ?? defaultWebSocketImpl();
+				return connectWebSocket(url, { webSocketImpl });
+			};
 		} else {
 			// Route selection for the outbound socket (selectOutboundProxy):
 			//   .onion           -> always via Tor (explicit proxy, else the default)
@@ -1737,8 +1767,8 @@ export class PeerManager extends EventEmitter {
 	 * The proxy a restricted learned dial rides, or undefined when it must be
 	 * refused. Scope 'all' whatever the configured scope is: under 'onion' a
 	 * public clearnet host is dialed directly, which is exactly what the
-	 * restriction exists to prevent. WebSocket and Iroh dials do not go
-	 * through the SOCKS5 proxy at all.
+	 * restriction exists to prevent. Only a TCP address qualifies: a learned
+	 * WebSocket or Iroh address is refused.
 	 */
 	private learnedAddressProxy(
 		host: string,

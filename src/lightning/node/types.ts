@@ -672,7 +672,10 @@ export interface INodeConfig {
 	 * in-repo RFC-cased Node client under Node (CLN's ws listener rejects the
 	 * built-in WebSocket's lowercased headers) and to globalThis.WebSocket in
 	 * browsers. Only consulted when a peer is dialed with transport
-	 * {type: 'ws'}; mirrors how electrumOptions injects net/tls.
+	 * {type: 'ws'} and the dial is a direct one; mirrors how electrumOptions
+	 * injects net/tls. A dial that the SOCKS5 proxy carries is made by the
+	 * in-repo client over the proxy's socket, and fails where that client
+	 * cannot run.
 	 */
 	webSocketImpl?: WebSocketConstructor;
 	/**

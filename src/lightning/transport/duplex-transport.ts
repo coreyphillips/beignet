@@ -85,8 +85,9 @@ export interface IPeerTransportOptions {
 	fallbackOnion?: { host: string; port: number };
 	/**
 	 * WS only: explicit WebSocket URL (ws:// or wss://). Defaults to
-	 * `ws://host:port` built from the dial address. Note that WebSocket
-	 * connections do not route through the SOCKS5 proxy.
+	 * `ws://host:port` built from the dial address. The host in this URL is
+	 * the one dialed, and it decides whether the SOCKS5 proxy carries the
+	 * connection, as a TCP peer's host does.
 	 */
 	url?: string;
 }

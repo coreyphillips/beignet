@@ -2673,6 +2673,11 @@ Tor refuses them.
 | private or loopback | direct | direct |
 | public clearnet | proxy | direct |
 
+A WebSocket peer (`ws://` or `wss://`, a Porch link included) is routed by the
+same table, on the host in its URL. Through the proxy the name is sent to the
+proxy unresolved, TLS runs inside the tunnel, and a proxy that is down fails
+the dial: there is no direct dial behind it.
+
 Guardian sessions over bolt8 already dial only onion hosts through the proxy.
 
 ### Priority Order
