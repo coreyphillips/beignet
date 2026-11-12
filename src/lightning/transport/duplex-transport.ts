@@ -42,6 +42,12 @@ export interface IDuplexTransport extends EventEmitter {
 	/** Enable transport-level keepalive probing where supported (else no-op). */
 	setKeepAlive(enable?: boolean, initialDelay?: number): this;
 	/**
+	 * Send every write at once, instead of holding a small one back until
+	 * the one before it is acknowledged (TCP_NODELAY on a TCP socket).
+	 * Optional: a transport that does not hold writes back leaves it out.
+	 */
+	setNoDelay?(noDelay?: boolean): this;
+	/**
 	 * Tear the transport down immediately. When `error` is provided it is
 	 * emitted as 'error' (if listeners exist) and 'close' reports hadError.
 	 */
