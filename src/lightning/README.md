@@ -1701,6 +1701,10 @@ const [link] = lightning.getPorchLinks(); // { relay, tag, uri }
   (Tor's default port when none is set) with the relay's name unresolved, and
   has no direct dial to fall back to. `'direct'` dials from this machine even
   when a proxy is set.
+- `porch.proxy` is a SOCKS5 proxy for the relay connections alone. Every
+  relay is dialed through it, as under `'tor'`, whatever `socks5Proxy` and
+  its scope say about peers. It need not be Tor. With `via: 'direct'`, or for
+  a relay at a private address, it is refused when the node is built.
 - Setting `porch` switches `learnedAddressDials` to `'proxy-only'`: a node
   that hides its address does not dial one a peer chose.
 - A peer that came in through a relay is listed with `host: 'porch:<relay>'`

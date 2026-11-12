@@ -29,6 +29,15 @@ export interface PorchDaemonConfig {
 	 */
 	porchVia?: PorchVia;
 	/**
+	 * A SOCKS5 proxy for the relay connections alone, as "host:port". Every
+	 * relay is dialed through it and never directly, so the relay sees the
+	 * proxy and not the node, while peers go on being dialed as torProxy
+	 * says. Any SOCKS5 proxy that asks for no credentials will do: a second
+	 * Tor, or a VPN or tunnel that offers one, at that detour's cost in time
+	 * and not Tor's. Refused together with porchVia `direct`.
+	 */
+	porchProxy?: string;
+	/**
 	 * Idle connections kept at each relay. Each one takes one visitor, and is
 	 * replaced when it does. Default 2, at most 8.
 	 */
@@ -53,6 +62,32 @@ export function porchViaEnv(): PorchVia | undefined {
 	if (value === undefined || value === '') return undefined;
 	if (value === 'direct' || value === 'tor') return value;
 	throw new Error('BEIGNET_PORCH_VIA must be exactly direct or tor');
+}
+
+/** `BEIGNET_PORCH_PROXY`: a SOCKS5 proxy as `host:port`. */
+export function porchProxyEnv(): string | undefined {
+	const value = process.env.BEIGNET_PORCH_PROXY?.trim();
+	return value ? value : undefined;
+}
+
+/**
+ * porchProxy as the node takes it. A scheme or credentials are refused
+ * rather than guessed at: the proxy is asked for no authentication.
+ */
+export function parsePorchProxy(value: unknown): {
+	host: string;
+	port: number;
+} {
+	const match =
+		typeof value === 'string' ? /^([^\s:@/]+):(\d{1,5})$/.exec(value) : null;
+	const port = match ? parseInt(match[2], 10) : 0;
+	if (!match || port < 1 || port > 65535) {
+		throw new Error(
+			'porchProxy must be a SOCKS5 proxy as "host:port", with no scheme ' +
+				'and no credentials'
+		);
+	}
+	return { host: match[1], port };
 }
 
 /** `BEIGNET_PORCH_STANDBYS`: a whole number. */
@@ -154,6 +189,14 @@ export function validatePorchConfig(config: PorchDaemonConfig): void {
 		config.porchVia !== 'tor'
 	) {
 		throw new Error("porchVia must be 'direct' or 'tor'");
+	}
+	if (config.porchProxy !== undefined) {
+		parsePorchProxy(config.porchProxy);
+		if (config.porchVia === 'direct') {
+			throw new Error(
+				"porchProxy sends every relay connection through a proxy and porchVia 'direct' dials them directly; set one"
+			);
+		}
 	}
 	const standbys = config.porchStandbys;
 	if (

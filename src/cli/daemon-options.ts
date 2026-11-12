@@ -38,6 +38,7 @@ export function daemonOptions(
 		maxInboundPeers: config.maxInboundPeers,
 		porchRelays: config.porchRelays,
 		porchVia: config.porchVia,
+		porchProxy: config.porchProxy,
 		porchStandbys: config.porchStandbys,
 		porchToken: config.porchToken,
 		daemonPort,

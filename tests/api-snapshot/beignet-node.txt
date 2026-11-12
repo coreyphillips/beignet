@@ -1284,6 +1284,7 @@ property PeerInfo.state: PeerState
 property PeerInfo.transport?: 'tcp' | 'ws' | 'iroh'
 type PeerState = 'ready' | 'connected' | 'connecting' | 'disconnected'
 unexported interface PorchDaemonConfig
+property PorchDaemonConfig.porchProxy?: string
 property PorchDaemonConfig.porchRelays?: (string | beignet/lightning#transport.IPorchRelayConfig)[]
 property PorchDaemonConfig.porchStandbys?: number
 property PorchDaemonConfig.porchToken?: string

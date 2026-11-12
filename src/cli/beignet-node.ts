@@ -9,7 +9,11 @@
 import type { IrohDaemonConfig } from './iroh-config';
 import { validateIrohConfig } from './iroh-config';
 import type { PorchDaemonConfig } from './porch-config';
-import { porchRelayEntries, validatePorchConfig } from './porch-config';
+import {
+	parsePorchProxy,
+	porchRelayEntries,
+	validatePorchConfig
+} from './porch-config';
 import { PorchLinkStore, porchLinkLabel } from './porch-links';
 import {
 	PORCH_MAX_TAGS,
@@ -2779,13 +2783,20 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 			validateIrohConfig(opts);
 			validateElectrumTlsConfig(opts);
 			validatePorchConfig(opts);
-			// The two combinations no proxy setting can rescue: Tor does not
-			// reach a private address, and an onion name resolves nowhere else.
+			// The two combinations no proxy setting can rescue: a proxy does
+			// not reach a private address, and an onion name resolves nowhere
+			// else.
+			const porchProxy =
+				opts.porchProxy !== undefined
+					? parsePorchProxy(opts.porchProxy)
+					: undefined;
 			for (const entry of porchRelayEntries(opts)) {
 				selectPorchProxy(
 					parsePorchRelayUrl(entry.url).host,
 					opts.porchVia,
-					undefined
+					undefined,
+					'all',
+					porchProxy
 				);
 			}
 		} catch (err) {
@@ -17031,14 +17042,16 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 		this._porchProxied = undefined;
 		this._porchLogged = undefined;
 		let relays: IPorchRelayConfig[];
+		let own: { host: string; port: number } | undefined;
 		const proxied = new Map<string, boolean>();
 		try {
 			relays = porchRelayEntries(opts);
+			if (opts.porchProxy !== undefined) own = parsePorchProxy(opts.porchProxy);
 			for (const entry of relays) {
 				const relay = parsePorchRelayUrl(entry.url);
 				proxied.set(
 					relay.origin,
-					selectPorchProxy(relay.host, opts.porchVia, proxy, scope) !==
+					selectPorchProxy(relay.host, opts.porchVia, proxy, scope, own) !==
 						undefined
 				);
 			}
@@ -17074,6 +17087,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 			relays,
 			tags: links.tags(),
 			...(opts.porchVia !== undefined ? { via: opts.porchVia } : {}),
+			...(own ? { proxy: own } : {}),
 			...(opts.porchStandbys !== undefined
 				? { standbys: opts.porchStandbys }
 				: {})

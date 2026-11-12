@@ -23,14 +23,15 @@ numbers are in [PORCH-QUALIFICATION-2026-11-11.md](PORCH-QUALIFICATION-2026-11-1
 
 ## Which setup
 
-| Setup                             | Who learns the node's address         | A payment in the laboratory                     |
-| --------------------------------- | ------------------------------------- | ----------------------------------------------- |
-| TCP listener, or an Iroh link     | everyone who holds the link           | 90 ms over TCP (111 ms up to 0.38.4)            |
-| Iroh, relay-only                  | the Iroh relay's operator             | about 80 ms more than a direct Iroh path        |
-| Porch, a relay somebody else runs | that relay's operator                 | 89 ms, and 90 ms with TLS in front of the relay |
-| Porch, a relay you run            | you, and the server's hosting company | the same                                        |
-| Porch, reached through Tor        | nobody                                | about 1.5 s, an upper bound                     |
-| Tor onion service                 | nobody                                | not measured here; the phone needs Tor as well  |
+| Setup                             | Who learns the node's address         | A payment in the laboratory                      |
+| --------------------------------- | ------------------------------------- | ------------------------------------------------ |
+| TCP listener, or an Iroh link     | everyone who holds the link           | 90 ms over TCP (111 ms up to 0.38.4)             |
+| Iroh, relay-only                  | the Iroh relay's operator             | about 80 ms more than a direct Iroh path         |
+| Porch, a relay somebody else runs | that relay's operator                 | 89 ms, and 90 ms with TLS in front of the relay  |
+| Porch, a relay you run            | you, and the server's hosting company | the same                                         |
+| Porch, reached through Tor        | nobody                                | about 1.5 s, an upper bound                      |
+| Porch, reached through a proxy    | that proxy's operator                 | not measured here: what the proxy's detour costs |
+| Tor onion service                 | nobody                                | not measured here; the phone needs Tor as well   |
 
 The laboratory puts the relay next to both ends, so the Porch number is what
 the relay itself adds: nothing that could be measured. The relay-only Iroh
@@ -239,24 +240,24 @@ revocation.
 
 On the other side a link is used like any peer address:
 `beignet peer connect '<link>'`, or as a primary in an app that takes a
-`wss://` peer URI. It is dialed as any other peer is: a node or wallet that
-sends its dials through a SOCKS5 proxy (`BEIGNET_TOR_PROXY`) reaches the relay
-through it as well, so the relay does not see where the visitor is. Up to
-0.38.4 a `wss://` address was dialed directly whatever the proxy setting said.
+`wss://` peer URI. It is dialed as any other peer is, through the visitor's
+proxy when they have one: see [The visitor](#the-visitor).
 
 ## Who learns what
 
-|                      | Learns                                                                               | Does not learn                                  |
-| -------------------- | ------------------------------------------------------------------------------------ | ----------------------------------------------- |
-| Whoever holds a link | the relay's name, and the node's Lightning pubkey, which the link states             | the node's address                              |
-| The relay            | the node's address, each visitor's address, when they connect and how much they send | what is sent; the Lightning pubkey, by watching |
-| The node             | which link a visitor used                                                            | the visitor's address                           |
+|                      | Learns                                                                       | Does not learn                                  |
+| -------------------- | ---------------------------------------------------------------------------- | ----------------------------------------------- |
+| Whoever holds a link | the relay's name, and the node's Lightning pubkey, which the link states     | the node's address                              |
+| The relay            | the address each end dials it from, when they connect and how much they send | what is sent; the Lightning pubkey, by watching |
+| The node             | which link a visitor used                                                    | the visitor's address                           |
 
 Three things follow.
 
-- **The relay's operator is the one party that sees the home address.** Run
-  the relay yourself and that party is you, plus the company that hosts the
-  server. Use somebody else's relay and it is them.
+- **The relay's operator is the one party that sees the home address**, and
+  each visitor's, when both ends dial it directly. Run the relay yourself and
+  that party is you, plus the company that hosts the server. Use somebody
+  else's relay and it is them. Either end can keep its own address from the
+  relay: see [Hiding from the relay too](#hiding-from-the-relay-too).
 - **The relay can test a guess.** It is not told which Lightning node waits
   behind a link, but it can dial the link itself and see whether a pubkey it
   suspects answers. For a link meant for strangers, use a relay you run or
@@ -267,11 +268,16 @@ Three things follow.
 
 ## Hiding from the relay too
 
+The relay sees two addresses: the one the node dials it from and the one each
+visitor dials it from. Each end can keep its own from the relay, and neither
+needs the other to do anything.
+
+### The node, through Tor
+
 `BEIGNET_PORCH_VIA=tor` (`porchVia: "tor"`) makes the node reach every relay
 through Tor. The relay then sees a Tor exit instead of the home address, and
 nobody at all holds it. The phone still dials the relay directly and needs no
-Tor. A visitor that does use Tor is hidden from the relay in the same way,
-whatever the node does: each side chooses for itself.
+Tor.
 
 ```bash
 BEIGNET_PORCH_RELAYS=wss://relay.example BEIGNET_PORCH_VIA=tor \
@@ -289,6 +295,55 @@ An earlier run the same day measured 2.2 s and 5 to 8.5 s: Tor circuits differ
 from one hour to the next. That is without Tor on the phone, and the phone
 does not wait for a circuit to be built: the node's connections to the relay
 are already open when it arrives.
+
+### The node, through another proxy
+
+`BEIGNET_PORCH_PROXY=host:port` (`porchProxy`) names a SOCKS5 proxy for the
+relay connections alone. Every relay is dialed through it and never directly,
+with the relay's name unresolved, while peers go on being dialed as
+`BEIGNET_TOR_PROXY` says. The relay sees the proxy's address, and the proxy's
+operator becomes the party that sees the home address.
+
+It is for a proxy that is not Tor: a VPN provider's SOCKS5 endpoint, a local
+bridge to a WireGuard tunnel, or `ssh -D` to a server. Such a detour costs
+what its distance costs, where Tor costs a second or more. It has not been
+measured here. The proxy must ask for no credentials.
+
+```bash
+BEIGNET_PORCH_RELAYS=wss://relay.example BEIGNET_PORCH_PROXY=127.0.0.1:1080 \
+  beignet start
+```
+
+`proxied` reads `true` as it does with Tor, and with the proxy down the relay
+shows as `unreachable`: there is no direct dial here either. It is refused
+together with `BEIGNET_PORCH_VIA=direct`, and for a relay at a private
+address, which a proxy elsewhere does not reach.
+
+### The visitor
+
+A link is dialed as any other peer address is. A node or wallet on this
+engine that sends its peer dials through a SOCKS5 proxy (`BEIGNET_TOR_PROXY`,
+Tor or any other) reaches the relay through it too: the relay's name goes to
+the proxy unresolved, TLS runs inside the tunnel, and a proxy that is down
+fails the dial. Up to 0.38.4 a `wss://` address was dialed directly whatever
+the proxy setting said
+([#1992](https://github.com/coreyphillips/beignet/issues/1992)).
+
+An app that carries its own build of the engine follows its own settings for
+`wss://` peers. A device whose whole connection runs through a VPN or Tor is
+hidden from the relay whatever the app does.
+
+### Both ends
+
+With the node behind Tor or a proxy and the visitor behind theirs, the relay
+sees neither address. It pairs two connections that arrive from two proxies.
+It still sees when they connect and how much they send, and someone who can
+also watch the network at either end can match that traffic.
+
+One relay cannot do this by itself: whatever dials it shows an address.
+Splitting the work between two relays run by different people, so that one
+sees the visitor and the other the node, is not built
+([#1993](https://github.com/coreyphillips/beignet/issues/1993)).
 
 ## What Porch does not hide
 

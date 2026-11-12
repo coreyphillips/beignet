@@ -225,14 +225,33 @@ export function selectOutboundProxy(
  * The two refusals are configuration errors: Tor will not carry a
  * connection to a private address, and an onion name resolves nowhere else.
  * Under 'tor' there is no direct dial to fall back to.
+ *
+ * `own` is a proxy for the relays alone (IPorchConfig.proxy). With it every
+ * relay is dialed through `own`, whatever `proxy` and `scope` say: the 'tor'
+ * column with `own` in place of the proxy. It contradicts via 'direct', and
+ * the two together are refused.
  */
 export function selectPorchProxy(
 	host: string,
 	via: PorchVia | undefined,
 	proxy: { host: string; port: number } | undefined,
-	scope: Socks5ProxyScope = 'all'
+	scope: Socks5ProxyScope = 'all',
+	own?: { host: string; port: number }
 ): { host: string; port: number } | undefined {
 	const onion = host.trim().toLowerCase().endsWith('.onion');
+	if (own) {
+		if (via === 'direct') {
+			throw new Error(
+				"Porch has a proxy of its own and via 'direct': the relays are dialed one way or the other, so set one"
+			);
+		}
+		if (!onion && isPrivateOrLoopbackHost(host)) {
+			throw new Error(
+				`Porch relay ${host} is a private address: it is not reached through a proxy, so a Porch proxy cannot be used`
+			);
+		}
+		return own;
+	}
 	if (via === 'direct') {
 		if (onion) {
 			throw new Error(
@@ -2064,7 +2083,8 @@ export class PeerManager extends EventEmitter {
 				relay.host,
 				config.via,
 				this.socks5Proxy,
-				this.socks5ProxyScope
+				this.socks5ProxyScope,
+				config.proxy
 			);
 			// A host's message cap is fixed for the life of the connection, so
 			// it is the one a stranger gets.

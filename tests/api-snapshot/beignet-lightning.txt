@@ -9059,6 +9059,7 @@ property transport.IPorchCircuitInfo.relay: string
 property transport.IPorchCircuitInfo.tag: string
 interface transport.IPorchConfig
 property transport.IPorchConfig.hostSecret: Uint8Array
+property transport.IPorchConfig.proxy?: { host: string; port: number; }
 property transport.IPorchConfig.relays: readonly (string | transport.IPorchRelayConfig)[]
 property transport.IPorchConfig.standbys?: number
 property transport.IPorchConfig.tags: readonly Uint8Array[]
@@ -9369,7 +9370,7 @@ function transport.responderProcessAct1(state: transport.IHandshakeState, act1: 
 function transport.responderProcessAct3(state: transport.IHandshakeState, act3: Buffer): Buffer
 function transport.routableSocketAddresses(addresses: string[]): string[]
 function transport.selectOutboundProxy(host: string, proxy: { host: string; port: number; } | undefined, scope?: transport.Socks5ProxyScope): { host: string; port: number; } | undefined
-function transport.selectPorchProxy(host: string, via: transport.PorchVia | undefined, proxy: { host: string; port: number; } | undefined, scope?: transport.Socks5ProxyScope): { host: string; port: number; } | undefined
+function transport.selectPorchProxy(host: string, via: transport.PorchVia | undefined, proxy: { host: string; port: number; } | undefined, scope?: transport.Socks5ProxyScope, own?: { host: string; port: number; }): { host: string; port: number; } | undefined
 function transport.socks5SocketFactory(proxy: { host: string; port: number; }, timeoutMs?: number): (host: string, port: number) => Promise<net#Socket>
 function transport.validateIrohRelayUrl(value: string): string
 namespace validation

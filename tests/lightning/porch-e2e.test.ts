@@ -522,4 +522,74 @@ describe('Porch end to end', function () {
 		expect(dials.ports).to.have.length(toProxy + toRelay);
 		expect(visitorDials).to.equal(1);
 	});
+
+	it('is dialed by neither end when each has a proxy of its own', async function () {
+		relay = new PorchRelay({ authorities: ['relay.test'] });
+		await relay.listen(0, '127.0.0.1');
+		const relayPort = (relay.address() as net.AddressInfo).port;
+		// Three proxies: the node's for its relays, the node's for its peers
+		// (which a relay dial must not use), and the visitor's.
+		const homeProxy = await socksTo(relayPort);
+		const peerProxy = await socksTo(relayPort);
+		const visitorProxy = await socksTo(relayPort);
+		closers.push(homeProxy.close, peerProxy.close, visitorProxy.close);
+
+		dials = recordDials();
+		const home = makeNode(HOME_MNEMONIC, {
+			socks5Proxy: { host: '127.0.0.1', port: peerProxy.port },
+			porch: {
+				relays: ['ws://relay.test'],
+				proxy: { host: '127.0.0.1', port: homeProxy.port }
+			}
+		});
+		// The visitor holds a link and nothing else, and sends its peer
+		// dials through a proxy as it would for any other peer (#1992).
+		const visitor = makeNode(VISITOR_MNEMONIC, {
+			socks5Proxy: { host: '127.0.0.1', port: visitorProxy.port }
+		});
+		nodes.push(home, visitor);
+
+		home.listenPorch();
+		await waitFor(
+			() => home.getPorchStatus()[0].idle === 2,
+			'the node registering through its proxy'
+		);
+		const link = parsePeerUri(home.getPorchLinks()[0].uri);
+		await visitor.connectPeer(
+			link.pubkey,
+			link.host,
+			link.port,
+			link.transport
+		);
+		await waitFor(
+			() =>
+				home.listPeers()[0]?.state === 'ready' &&
+				visitor.listPeers()[0]?.state === 'ready',
+			'the two ends meeting'
+		);
+		await waitFor(
+			() => home.getPorchStatus()[0].idle === 2,
+			'the standby being replaced'
+		);
+
+		// Each proxy was asked for the relay by name: neither end resolved it.
+		const byName = { type: 0x03, host: 'relay.test', port: 80 };
+		expect(homeProxy.requested.length).to.be.at.least(3);
+		for (const request of homeProxy.requested) {
+			expect(request).to.deep.equal(byName);
+		}
+		expect(visitorProxy.requested).to.deep.equal([byName]);
+		expect(peerProxy.requested).to.deep.equal([]);
+
+		// Every connection the relay took was made by a proxy. One dial of
+		// its own from either end would leave more dials to the relay than
+		// the proxies were asked for.
+		const count = (port: number): number =>
+			dials!.ports.filter((dialed) => dialed === port).length;
+		const asked = homeProxy.requested.length + visitorProxy.requested.length;
+		expect(count(homeProxy.port)).to.equal(homeProxy.requested.length);
+		expect(count(visitorProxy.port)).to.equal(1);
+		expect(count(relayPort)).to.equal(asked);
+		expect(dials.ports).to.have.length(2 * asked);
+	});
 });

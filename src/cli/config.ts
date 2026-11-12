@@ -4,7 +4,12 @@
  */
 
 import { irohBooleanEnv, irohRelaysEnv } from './iroh-config';
-import { porchRelaysEnv, porchStandbysEnv, porchViaEnv } from './porch-config';
+import {
+	porchProxyEnv,
+	porchRelaysEnv,
+	porchStandbysEnv,
+	porchViaEnv
+} from './porch-config';
 import {
 	electrumTlsFingerprintsEnv,
 	electrumTlsVerifyEnv
@@ -479,6 +484,7 @@ export function resolveConfig(cliFlags: Partial<BeignetConfig>): BeignetConfig {
 			file.websocketPort,
 		porchRelays: cliFlags.porchRelays ?? porchRelaysEnv() ?? file.porchRelays,
 		porchVia: cliFlags.porchVia ?? porchViaEnv() ?? file.porchVia,
+		porchProxy: cliFlags.porchProxy ?? porchProxyEnv() ?? file.porchProxy,
 		porchStandbys:
 			cliFlags.porchStandbys ?? porchStandbysEnv() ?? file.porchStandbys,
 		porchToken:
