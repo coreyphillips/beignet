@@ -8924,6 +8924,7 @@ readonly property transport.IDuplexTransport.porch?: transport.IPorchCircuitInfo
 readonly property transport.IDuplexTransport.remoteAddress?: string
 readonly property transport.IDuplexTransport.remotePort?: number
 method transport.IDuplexTransport.setKeepAlive(enable?: boolean, initialDelay?: number): this
+method transport.IDuplexTransport.setNoDelay?(noDelay?: boolean): this
 method transport.IDuplexTransport.setTimeout(timeout: number, callback?: () => void): this
 readonly property transport.IDuplexTransport.transportType?: 'tcp' | 'ws' | 'iroh'
 readonly property transport.IDuplexTransport.writableLength: number

@@ -3545,7 +3545,10 @@ describe('Gossip Sync (Phase 5)', function () {
 					error = err instanceof Error ? err.message : String(err);
 				}
 				expect(dials).to.deep.equal([]);
-				expect(error).to.not.include('4242');
+				// The message names the node id, whose hex can hold any digits:
+				// look for the address, not for the bare port.
+				expect(error).to.not.include('127.0.0.1');
+				expect(error).to.not.include(':4242');
 				// The poisoned announcement settled false at the read.
 				expect(
 					node.getGraph().getNode(getPublicKey(keys.nodeKey1))!
