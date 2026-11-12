@@ -21,6 +21,7 @@ Every document in the repository, by what it is for. A test (`tests/lightning/do
 | [MPP-SENDING.md](MPP-SENDING.md) | How a BOLT 11 payment splits over the wallet's channels, including channels to different peers, how parts are sized and what bounds their number |
 | [packages/direct-funding/README.md](../packages/direct-funding/README.md) | Standalone payer SDK, Bitcoin Core and PSBT adapters, transport, storage and regtest qualification |
 | [ZERO-RESERVE.md](ZERO-RESERVE.md) | Zero-reserve home channels (`option_zero_reserve`): policy and configuration |
+| [PORCH.md](PORCH.md) | Porch links, a link to a node that does not say where it is: running a relay, pointing a node at it, handing out and revoking links, who learns what, and what each setup costs in speed |
 
 ## Reference
 
@@ -53,6 +54,8 @@ The option and event tables in the two READMEs above are generated from the code
 
 | Document | Contents |
 |----------|----------|
+| [PORCH-QUALIFICATION-2026-11-11.md](PORCH-QUALIFICATION-2026-11-11.md) | Porch qualification: the leak checks, and payment, restart and outage times through a relay, through a relay behind TLS and through Tor, next to a direct TCP connection, with its [raw results](PORCH-QUALIFICATION-2026-11-11.json) |
+| [scripts/regtest-live/porch-qualification/README.md](../scripts/regtest-live/porch-qualification/README.md) | How to rerun the Porch qualification |
 | [IROH-QUALIFICATION-2026-10-03.md](IROH-QUALIFICATION-2026-10-03.md) | Iroh transport qualification on the released engine, with its [raw results](IROH-QUALIFICATION-2026-10-03.json) |
 | [scripts/regtest-live/iroh-qualification/README.md](../scripts/regtest-live/iroh-qualification/README.md) | How to rerun the Iroh qualification |
 | [tests/lightning/conformance/vectors/SOURCE.md](../tests/lightning/conformance/vectors/SOURCE.md) | Provenance of the vendored BOLT test vectors |
