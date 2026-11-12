@@ -1,0 +1,85 @@
+# Two regtest endpoints, a Porch relay between them, a TLS terminator in front
+# of the relay, and Tor. QUALIFY_PATH chooses how the primary can be reached:
+# tcp, porch, porch-tls or porch-tor.
+name: beignet-porch-qualification
+x-fixture: &fixture
+  image: beignet-porch-qualification:local
+  build: .
+  labels:
+    beignet.test: porch-qualification
+  networks: [qualification]
+services:
+  caddy:
+    image: caddy:2.10
+    container_name: beignet-porch-caddy
+    labels:
+      beignet.test: porch-qualification
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy:/data
+    networks:
+      qualification:
+        aliases: [relay.test]
+  relay:
+    <<: *fixture
+    container_name: beignet-porch-relay
+    cap_add: [NET_ADMIN]
+    # The relay is told the proxy's address when it starts.
+    depends_on: [caddy]
+    entrypoint: ['sh', '/fixture/relay.sh']
+    volumes:
+      - .:/fixture:ro
+      - onion:/onion:ro
+  tor:
+    <<: *fixture
+    container_name: beignet-porch-tor
+    # The relay's name has to resolve when Tor reads its configuration.
+    depends_on: [relay]
+    entrypoint: ['tor', '-f', '/fixture/torrc']
+    volumes:
+      - .:/fixture:ro
+      - onion:/onion
+  primary:
+    <<: *fixture
+    container_name: beignet-porch-primary
+    cap_add: [NET_ADMIN]
+    depends_on: [relay, tor]
+    entrypoint: ['sh', '/fixture/endpoint.sh']
+    environment:
+      QUALIFY_ROLE: primary
+      QUALIFY_PATH: ${QUALIFY_PATH:-porch}
+      QUALIFY_TCP_NODELAY: ${QUALIFY_TCP_NODELAY:-false}
+      NODE_EXTRA_CA_CERTS: /caddy/caddy/pki/authorities/local/root.crt
+    volumes:
+      - .:/fixture:ro
+      - ./primary-data:/data
+      - onion:/onion:ro
+      - caddy:/caddy:ro
+  phone:
+    <<: *fixture
+    container_name: beignet-porch-phone
+    cap_add: [NET_ADMIN]
+    depends_on: [caddy]
+    entrypoint: ['sh', '/fixture/endpoint.sh']
+    environment:
+      QUALIFY_ROLE: phone
+      QUALIFY_TCP_NODELAY: ${QUALIFY_TCP_NODELAY:-false}
+      NODE_EXTRA_CA_CERTS: /caddy/caddy/pki/authorities/local/root.crt
+    volumes:
+      - .:/fixture:ro
+      - ./phone-data:/data
+      - caddy:/caddy:ro
+networks:
+  qualification:
+    name: beignet-porch-qualification
+    labels:
+      beignet.test: porch-qualification
+volumes:
+  onion:
+    name: beignet-porch-onion
+    labels:
+      beignet.test: porch-qualification
+  caddy:
+    name: beignet-porch-caddy
+    labels:
+      beignet.test: porch-qualification

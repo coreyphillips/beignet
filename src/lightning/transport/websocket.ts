@@ -33,7 +33,8 @@ export interface IWebSocketLike {
 	binaryType: string;
 	readonly bufferedAmount: number;
 	readonly readyState: number;
-	send(data: Uint8Array): void;
+	/** Bytes go out as a binary message, a string as a text message. */
+	send(data: Uint8Array | string): void;
 	close(code?: number, reason?: string): void;
 	onopen: ((ev?: unknown) => void) | null;
 	onmessage: ((ev: { data: unknown }) => void) | null;
@@ -284,8 +285,19 @@ export class WebSocketTransport
 		} catch {
 			// Closing a CONNECTING/CLOSED socket may throw in some impls
 		}
+		this.onClosed();
 		this.emit('close', this.hadError);
 		return this;
+	}
+
+	/**
+	 * Called once when the transport closes, whichever side closed it. For a
+	 * subclass that keeps count of its connections: a 'close' listener will
+	 * not do, because the peer layer removes every listener from a transport
+	 * before it destroys one.
+	 */
+	protected onClosed(): void {
+		// Nothing to do for a plain transport.
 	}
 
 	// ── Internal ─────────────────────────────────────────────────
@@ -314,6 +326,7 @@ export class WebSocketTransport
 		this.destroyed = true;
 		this.clearDeadline();
 		this.detach();
+		this.onClosed();
 		this.emit('close', this.hadError);
 	}
 

@@ -1,0 +1,8 @@
+# The Tor side of the fixture: a SOCKS port for the primary, and an onion
+# service in front of the relay so that Tor has a way to reach it. Both are
+# reachable on the fixture network only; nothing is published to the host.
+DataDirectory /onion/state
+SocksPort 0.0.0.0:9050
+HiddenServiceDir /onion/relay
+HiddenServicePort 2114 relay:2114
+Log notice stdout

@@ -190,6 +190,8 @@ async function main(): Promise<void> {
 			return handleStart();
 		case 'stop':
 			return handleStop();
+		case 'porch-relay':
+			return handlePorchRelay();
 		case 'info':
 			return outputResult(await httpRequest('GET', '/info'));
 		case 'balance':
@@ -362,6 +364,8 @@ async function main(): Promise<void> {
 			return handleNode();
 		case 'webhooks':
 			return handleWebhooks();
+		case 'porch':
+			return handlePorch();
 		case 'queue':
 			return handleQueue();
 		case 'direct-funding':
@@ -639,6 +643,64 @@ async function handleStart(): Promise<void> {
 	} catch (err: unknown) {
 		const msg = err instanceof Error ? err.message : String(err);
 		output({ ok: false, error: { code: 'START_FAILED', message: msg } });
+		process.exitCode = 1;
+	}
+}
+
+/**
+ * `beignet porch-relay`: run a Porch relay in the foreground
+ * (docs/PORCH-PROTOCOL.md). It reads no config and no data directory, so it
+ * runs on a machine that has never seen a wallet.
+ */
+async function handlePorchRelay(): Promise<void> {
+	// Loaded here so that no other command pays for it.
+	const { PorchRelay, porchRelayCommand } = await import('./porch-relay');
+	try {
+		const command = porchRelayCommand(filteredArgs.slice(1), process.env);
+		const relay = new PorchRelay(command.options);
+		relay.on('error', (err: Error) => {
+			process.stderr.write(`beignet: porch relay: ${err.message}\n`);
+		});
+		await relay.listen(command.port, command.host);
+		for (const warning of command.warnings) {
+			process.stderr.write(`beignet: warning: ${warning}\n`);
+		}
+		if (command.statsSeconds !== undefined) {
+			setInterval(() => {
+				process.stderr.write(
+					JSON.stringify({ at: new Date().toISOString(), ...relay.stats() }) +
+						'\n'
+				);
+			}, command.statsSeconds * 1000).unref();
+		}
+		let shuttingDown = false;
+		const shutdown = (): void => {
+			// Second signal: the operator insists.
+			if (shuttingDown) process.exit(1);
+			shuttingDown = true;
+			void relay
+				.close()
+				.catch(() => undefined)
+				.then(() => process.exit(0));
+		};
+		process.on('SIGINT', shutdown);
+		process.on('SIGTERM', shutdown);
+		const bound = relay.address();
+		output({
+			ok: true,
+			result: {
+				message: 'Porch relay started',
+				urls: command.urls,
+				host: command.host,
+				port: bound && typeof bound === 'object' ? bound.port : command.port,
+				tls: command.options.tls !== undefined,
+				private: command.options.token !== undefined,
+				pid: process.pid
+			}
+		});
+	} catch (err: unknown) {
+		const msg = err instanceof Error ? err.message : String(err);
+		output({ ok: false, error: { code: 'PORCH_RELAY_FAILED', message: msg } });
 		process.exitCode = 1;
 	}
 }
@@ -1920,6 +1982,51 @@ async function handleWebhooks(): Promise<void> {
 						'Usage: beignet webhooks [register <url> <events>|unregister <id>|list]'
 				}
 			});
+			process.exitCode = 1;
+	}
+}
+
+/**
+ * `beignet porch links`: the links a node hands out through its Porch
+ * relays. (`beignet porch-relay` is the relay itself, a server of its own.)
+ */
+async function handlePorch(): Promise<void> {
+	const usage =
+		'Usage: beignet porch links [list|create [--label <text>]|revoke <id>]';
+	if (filteredArgs[1] !== 'links') {
+		output({ ok: false, error: { code: 'UNKNOWN_COMMAND', message: usage } });
+		process.exitCode = 1;
+		return;
+	}
+	switch (filteredArgs[2]) {
+		case undefined:
+		case 'list':
+			return outputResult(await httpRequest('GET', '/porch/links'));
+		case 'create':
+			return outputResult(
+				await httpRequest('POST', '/porch/links/create', {
+					label: parseFlag('--label')
+				})
+			);
+		case 'revoke': {
+			const id = filteredArgs[3];
+			if (!id) {
+				output({
+					ok: false,
+					error: {
+						code: 'INVALID_PARAMS',
+						message: 'Usage: beignet porch links revoke <id>'
+					}
+				});
+				process.exitCode = 1;
+				return;
+			}
+			return outputResult(
+				await httpRequest('POST', '/porch/links/revoke', { id })
+			);
+		}
+		default:
+			output({ ok: false, error: { code: 'UNKNOWN_COMMAND', message: usage } });
 			process.exitCode = 1;
 	}
 }
@@ -3429,6 +3536,33 @@ API auth (scoped keys; see apiKeys config):
   auth rotate <name>                     Mint a new random secret for a named
                                          key (printed ONCE, never again); the
                                          old secret stops working immediately
+
+Porch links (a wss:// peer link that does not say where the node runs;
+needs porchRelays or BEIGNET_PORCH_RELAYS):
+  porch links                            List the links served, each with one
+                                         URI per relay, and each relay's state
+  porch links create [--label <text>]    Make a link of its own, to hand to one
+                                         person or device
+  porch links revoke <id>                Revoke a link: it stops resolving and
+                                         peers connected through it are dropped
+
+Porch relay (a server of its own: no wallet, no daemon):
+  porch-relay --url <wss://host[:port]> [--url ...]
+                                         Run a blind relay that lets a node hand
+                                         out a wss:// peer link without revealing
+                                         where it runs (docs/PORCH-PROTOCOL.md)
+    --port <n>                           Listen port (default: 2114)
+    --host <address>                     Listen address (default: 127.0.0.1)
+    --tls-cert <path> --tls-key <path>   Serve TLS directly; without them, put a
+                                         TLS terminator in front
+    --token-file <path>                  Private relay: only nodes presenting the
+                                         token may register (or set
+                                         BEIGNET_PORCH_RELAY_TOKEN)
+    --trusted-proxy <ip>                 Reverse proxy whose X-Forwarded-For is
+                                         believed (repeatable)
+    --limit <name>=<n>                   Override a limit, e.g. connections=2048
+                                         (repeatable)
+    --stats <seconds>                    Print counters to stderr at this interval
 
 Start flags:
   --network <name>                       mainnet | testnet | signet | regtest

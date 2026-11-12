@@ -35,7 +35,23 @@ import type {
 import type { WebSocketConstructor } from './websocket';
 import { connectWebSocket, buildWebSocketUrl } from './websocket';
 import { WebSocketServer } from './websocket-server';
-import { NodeWebSocket } from './websocket-node-client';
+import { NodeWebSocket, nodeWebSocketVia } from './websocket-node-client';
+import type { IPorchRelayAddress } from './porch';
+import {
+	PORCH_MAX_TAGS,
+	PORCH_TAG_BYTES,
+	parsePorchRelayUrl,
+	porchLink,
+	porchRouteId
+} from './porch';
+import type {
+	IPorchCircuitInfo,
+	IPorchConfig,
+	IPorchHostStatus,
+	IPorchLink,
+	PorchVia
+} from './porch-host';
+import { PORCH_MAX_MESSAGE_BYTES, PorchHost } from './porch-host';
 import { normalizeHexPubkey } from '../validation';
 import { CodedError } from '../../utils/errors';
 
@@ -120,13 +136,15 @@ export function isPrivateOrLoopbackHost(host: string): boolean {
  * loopback sources are not: a Tor onion service, a reverse proxy or a
  * container gateway hands every peer it carries to us from one such address.
  * IPv6 keys on the /64, since a single host is routinely given a whole /64.
+ * A source that is not an IP address at all (a transport that names where
+ * its connections come from, a relay for instance) is its own key, verbatim.
  */
 export function inboundAddressKey(address: string | undefined): string | null {
 	if (!address || isPrivateOrLoopbackHost(address)) return null;
 	const a = address.toLowerCase();
 	const mapped = a.match(/^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/);
 	if (mapped) return mapped[1];
-	if (!a.includes(':')) return a;
+	if (!a.includes(':') || !/^[0-9a-f:.]+(%.*)?$/.test(a)) return a;
 	const [head, tail] = a.split('::');
 	const front = head ? head.split(':') : [];
 	const back = tail ? tail.split(':') : [];
@@ -185,6 +203,47 @@ export function selectOutboundProxy(
 	}
 	if (isPrivateOrLoopbackHost(host)) return undefined;
 	return scope === 'onion' ? undefined : proxy;
+}
+
+/**
+ * The proxy a Porch standby dials its relay through, or undefined for a
+ * direct dial. A relay is a host the operator chose, so by default it is
+ * dialed as a peer at that host would be; `via` overrides that for the
+ * relays alone:
+ *
+ *   relay host         | via unset               | via 'tor'                | via 'direct'
+ *   .onion             | proxy, else Tor default | proxy, else Tor default  | refused
+ *   private / loopback | direct                  | refused                  | direct
+ *   public             | as selectOutboundProxy  | proxy, else Tor default  | direct
+ *
+ * The two refusals are configuration errors: Tor will not carry a
+ * connection to a private address, and an onion name resolves nowhere else.
+ * Under 'tor' there is no direct dial to fall back to.
+ */
+export function selectPorchProxy(
+	host: string,
+	via: PorchVia | undefined,
+	proxy: { host: string; port: number } | undefined,
+	scope: Socks5ProxyScope = 'all'
+): { host: string; port: number } | undefined {
+	const onion = host.trim().toLowerCase().endsWith('.onion');
+	if (via === 'direct') {
+		if (onion) {
+			throw new Error(
+				`Porch relay ${host} is an onion service: it cannot be dialed with via 'direct'`
+			);
+		}
+		return undefined;
+	}
+	if (via === 'tor') {
+		if (!onion && isPrivateOrLoopbackHost(host)) {
+			throw new Error(
+				`Porch relay ${host} is a private address: Tor cannot reach it, so via 'tor' cannot be used`
+			);
+		}
+		return proxy ?? DEFAULT_TOR_PROXY;
+	}
+	return selectOutboundProxy(host, proxy, scope);
 }
 
 /**
@@ -287,6 +346,13 @@ export interface IPeerManagerOptions {
 	 *  dialed with transport {type: 'ws'}. */
 	webSocketImpl?: WebSocketConstructor;
 	iroh?: IIrohConfig;
+	/**
+	 * Porch relays to wait at (docs/PORCH-PROTOCOL.md), so the node can be
+	 * reached through a link that does not say where it runs. Setting it
+	 * switches learnedAddressDials to 'proxy-only': a node that hides its
+	 * address must not dial one a peer chose. Started with listenPorch().
+	 */
+	porch?: IPorchConfig;
 	/** How learned addresses are dialed (default 'any'); see
 	 *  LearnedAddressDials. */
 	learnedAddressDials?: LearnedAddressDials;
@@ -313,6 +379,11 @@ export interface IPeerInfo {
 	/** Active transport when known ('tcp' when absent). */
 	transport?: 'tcp' | 'ws' | 'iroh';
 	iroh?: IIrohDiagnostics;
+	/**
+	 * Set when the peer came in through a Porch relay. Its `host` then names
+	 * the relay ('porch:<relay>'): the peer's own address is never known.
+	 */
+	porch?: IPorchCircuitInfo;
 }
 
 /** What peer:disconnect knows about the connection that ended. */
@@ -531,6 +602,12 @@ export class PeerManager extends EventEmitter {
 	 */
 	private irohRelayOnlyFailure?: IrohRelayOnlyError;
 	private webSocketImpl?: WebSocketConstructor;
+	/** One per configured Porch relay, in the order they were given. */
+	private porchHosts: PorchHost[] = [];
+	private porchRelays: IPorchRelayAddress[] = [];
+	private porchHostKey?: Buffer;
+	/** The links served now: sorted, distinct, 16 bytes each. */
+	private porchTags: Buffer[] = [];
 
 	constructor(options: IPeerManagerOptions) {
 		super();
@@ -543,7 +620,11 @@ export class PeerManager extends EventEmitter {
 			options.maxReconnectDelay ?? DEFAULT_MAX_RECONNECT_DELAY_MS;
 		this.socks5Proxy = options.socks5Proxy;
 		this.socks5ProxyScope = options.socks5ProxyScope ?? 'all';
-		this.learnedAddressDials = options.learnedAddressDials ?? 'any';
+		// A node behind a Porch relay is hiding its address, and a dial to an
+		// address a peer chose would give it away (see LearnedAddressDials).
+		this.learnedAddressDials = options.porch
+			? 'proxy-only'
+			: options.learnedAddressDials ?? 'any';
 		this.socks5TimeoutMs = options.socks5TimeoutMs ?? 20_000;
 		this.maxInboundPeers = options.maxInboundPeers ?? 125;
 		// NaN would silently disable the cap: `count >= NaN` is never true.
@@ -567,6 +648,7 @@ export class PeerManager extends EventEmitter {
 		this.maxLanePeers = options.maxLanePeers ?? 32;
 		this.webSocketImpl = options.webSocketImpl;
 		this.irohConfig = options.iroh;
+		if (options.porch) this.configurePorch(options.porch);
 	}
 
 	/**
@@ -1556,6 +1638,8 @@ export class PeerManager extends EventEmitter {
 				info.transport = 'iroh';
 				info.iroh = diagnostics;
 			}
+			const porch = peer.getPorchCircuit();
+			if (porch) info.porch = porch;
 			result.push(info);
 		}
 		return result;
@@ -1923,11 +2007,160 @@ export class PeerManager extends EventEmitter {
 		return `${this.localPubkeyHex}@${formatIrohAddress(address)}`;
 	}
 
+	// ── Porch ────────────────────────────────────────────────────
+
+	/**
+	 * Check the Porch configuration and build one host per relay. Nothing is
+	 * dialed until listenPorch(), but a relay that could never be dialed as
+	 * configured fails here, when the node is built.
+	 */
+	private configurePorch(config: IPorchConfig): void {
+		if (config.relays.length === 0) {
+			throw new Error('Porch needs at least one relay');
+		}
+		const hostSecret = Buffer.from(config.hostSecret);
+		this.porchHostKey = getPublicKey(hostSecret);
+		this.porchTags = PeerManager.porchTagList(config.tags);
+		const seen = new Set<string>();
+		for (const entry of config.relays) {
+			const { url, token } =
+				typeof entry === 'string' ? { url: entry, token: undefined } : entry;
+			const relay = parsePorchRelayUrl(url);
+			if (seen.has(relay.authority)) {
+				throw new Error(`Porch relay ${relay.authority} is listed twice`);
+			}
+			seen.add(relay.authority);
+			const proxy = selectPorchProxy(
+				relay.host,
+				config.via,
+				this.socks5Proxy,
+				this.socks5ProxyScope
+			);
+			// A host's message cap is fixed for the life of the connection, so
+			// it is the one a stranger gets.
+			const limits = { maxPayloadBytes: PORCH_MAX_MESSAGE_BYTES };
+			const host = new PorchHost({
+				relay,
+				hostSecret,
+				tags: (): readonly Uint8Array[] => this.porchTags,
+				...(token !== undefined ? { token } : {}),
+				...(config.standbys !== undefined ? { standbys: config.standbys } : {}),
+				...(config.timing ? { timing: config.timing } : {}),
+				// The one place a relay is dialed. With a proxy the name goes to
+				// the proxy unresolved, and there is no direct dial behind it.
+				webSocket: proxy
+					? nodeWebSocketVia(
+							socks5SocketFactory(proxy, this.socks5TimeoutMs),
+							limits
+					  )
+					: class extends NodeWebSocket {
+							constructor(target: string) {
+								super(target, limits);
+							}
+					  },
+				onCircuit: (circuit): void => this.handleInboundConnection(circuit)
+			});
+			host.on('status', (status: IPorchHostStatus) => {
+				this.emit('porch:status', status);
+			});
+			this.porchRelays.push(relay);
+			this.porchHosts.push(host);
+		}
+	}
+
+	/** Sorted, distinct and well formed, as a registration lists them. */
+	private static porchTagList(tags: readonly Uint8Array[]): Buffer[] {
+		if (tags.length > PORCH_MAX_TAGS) {
+			throw new Error(`A Porch host serves at most ${PORCH_MAX_TAGS} links`);
+		}
+		const sorted = tags.map((tag) => {
+			if (tag.length !== PORCH_TAG_BYTES) {
+				throw new Error(`Porch link tag must be ${PORCH_TAG_BYTES} bytes`);
+			}
+			return Buffer.from(tag);
+		});
+		sorted.sort(Buffer.compare);
+		return sorted.filter((tag, i) => i === 0 || !tag.equals(sorted[i - 1]));
+	}
+
+	/** Whether Porch relays are configured. */
+	isPorchEnabled(): boolean {
+		return this.porchHosts.length > 0;
+	}
+
+	/**
+	 * Start waiting at the configured Porch relays. It returns at once and
+	 * dials in the background: a relay that is away or refuses is reported
+	 * through 'porch:status' and getPorchStatus(), and retried, where a port
+	 * that cannot be bound is an error.
+	 */
+	listenPorch(): void {
+		if (this.connectionsDisabled()) throw new Error('Connections are disabled');
+		if (!this.isPorchEnabled()) {
+			throw new Error('Porch is not enabled; configure porch.relays');
+		}
+		for (const host of this.porchHosts) host.start();
+	}
+
+	/** Whether the node is waiting at its Porch relays (reachable or not). */
+	isListeningPorch(): boolean {
+		return this.porchHosts.some((host) => host.status().state !== 'stopped');
+	}
+
+	/** One entry per configured relay, in the order they were given. */
+	getPorchStatus(): IPorchHostStatus[] {
+		return this.porchHosts.map((host) => host.status());
+	}
+
+	/**
+	 * The peer URIs this node can be reached by through Porch: one per link
+	 * and relay. A URI works while that relay's status is 'ready'.
+	 */
+	getPorchLinks(): IPorchLink[] {
+		const hostKey = this.porchHostKey;
+		if (!hostKey) return [];
+		const links: IPorchLink[] = [];
+		for (const tag of this.porchTags) {
+			const routeId = porchRouteId(hostKey, tag);
+			for (const relay of this.porchRelays) {
+				links.push({
+					relay: relay.origin,
+					tag: tag.toString('hex'),
+					uri: porchLink(this.localPubkeyHex, relay, routeId)
+				});
+			}
+		}
+		return links;
+	}
+
+	/**
+	 * Replace the links served. A link that is no longer listed stops
+	 * resolving at the relays, and the connections that came in through it
+	 * are closed, channel peers included: a link is revoked for whoever
+	 * holds it.
+	 */
+	setPorchTags(tags: readonly Uint8Array[]): void {
+		if (!this.isPorchEnabled()) {
+			throw new Error('Porch is not enabled; configure porch.relays');
+		}
+		const next = PeerManager.porchTagList(tags);
+		const kept = new Set(next.map((tag) => tag.toString('hex')));
+		const removed = this.porchTags
+			.map((tag) => tag.toString('hex'))
+			.filter((tag) => !kept.has(tag));
+		this.porchTags = next;
+		for (const host of this.porchHosts) {
+			host.refresh();
+			for (const tag of removed) host.closeCircuits(tag);
+		}
+	}
+
 	/** Stop all inbound listeners, retaining the endpoint for outbound dials. */
 	stopListening(): void {
 		this.irohListenEpoch++;
 		this.irohListening = false;
 		this.irohEndpoint?.stopListening();
+		for (const host of this.porchHosts) host.stop();
 		if (this.server) {
 			this.server.close();
 			this.server = null;
@@ -1940,13 +2173,14 @@ export class PeerManager extends EventEmitter {
 
 	/**
 	 * Whether the peer manager is listening for inbound connections
-	 * (TCP, WebSocket or Iroh).
+	 * (TCP, WebSocket, Iroh or Porch).
 	 */
 	isListening(): boolean {
 		return (
 			(this.server !== null && this.server.listening) ||
 			(this.wsServer !== null && this.wsServer.isListening()) ||
-			this.irohListening
+			this.irohListening ||
+			this.isListeningPorch()
 		);
 	}
 

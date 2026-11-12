@@ -5,6 +5,7 @@
  */
 
 import { validateIrohConfig } from './iroh-config';
+import { validatePorchConfig } from './porch-config';
 import { validateElectrumTlsConfig } from './electrum-tls-config';
 import {
 	normalizeIrohEndpointId,
@@ -934,6 +935,7 @@ async function bootDaemon(
 	try {
 		validateIrohConfig(opts);
 		validateElectrumTlsConfig(opts);
+		validatePorchConfig(opts);
 	} catch (err) {
 		throw new BeignetError('INVALID_PARAMS', (err as Error).message);
 	}
@@ -3612,6 +3614,23 @@ async function bootDaemon(
 			return success({ unregistered: true });
 		},
 		'GET /webhooks': () => success(webhookManager.list()),
+
+		// ── Porch links ──
+		'GET /porch/links': () => success(node.getPorchLinks()),
+		'POST /porch/links/create': (body) => {
+			const { label } = body as { label?: unknown };
+			if (label !== undefined && typeof label !== 'string') {
+				return failure('INVALID_PARAMS', 'label must be a string');
+			}
+			return success(node.createPorchLink(label));
+		},
+		'POST /porch/links/revoke': (body) => {
+			const { id } = body as { id?: unknown };
+			if (typeof id !== 'string' || !id) {
+				return failure('INVALID_PARAMS', 'id required');
+			}
+			return success(node.revokePorchLink(id));
+		},
 
 		// ── Payment Queue ──
 		'POST /queue/add': (body) => {

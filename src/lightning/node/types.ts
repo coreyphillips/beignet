@@ -42,6 +42,7 @@ import type { IFforSettlePolicy } from '../ffor/types';
 import type { IFforWitnessConfig } from '../ffor/witness-service';
 import type { IFforIssuerConfig } from '../ffor/issuer-service';
 import type { IIrohConfig } from '../transport/iroh';
+import type { IPorchConfig } from '../transport/porch-host';
 import type { IPayAllBudget, PaymentStatus } from './payment-types';
 
 export type { IInvoiceInfo };
@@ -683,6 +684,13 @@ export interface INodeConfig {
 	 */
 	iroh?: import('../transport/iroh').IIrohConfig;
 	/**
+	 * Opt-in Porch relays (docs/PORCH-PROTOCOL.md): the node dials out to
+	 * each and waits there, so it can be reached by a `wss://` link that does
+	 * not say where it runs. Started with listenPorch(). Setting it switches
+	 * learnedAddressDials to 'proxy-only'.
+	 */
+	porch?: IPorchConfig;
+	/**
 	 * Watchtowers to ship encrypted justice data to at every revocation, as
 	 * `pubkey@host:port` URIs (LND altruist wtwire protocol). Empty/undefined
 	 * disables the watchtower client entirely.
@@ -822,7 +830,7 @@ type SeedDerivedNodeConfigKey =
  */
 export type LightningNodeSeedOptions = Omit<
 	INodeConfig,
-	SeedDerivedNodeConfigKey | 'iroh'
+	SeedDerivedNodeConfigKey | 'iroh' | 'porch'
 > & {
 	/** BIP39 passphrase. */
 	passphrase?: string;
@@ -836,6 +844,13 @@ export type LightningNodeSeedOptions = Omit<
 	coinType?: number;
 	/** Opt-in Iroh endpoint. Its secret key is derived from the seed. */
 	iroh?: Omit<IIrohConfig, 'secretKey'>;
+	/**
+	 * Opt-in Porch relays. The host key is derived from the seed, and so is
+	 * the one link served when `tags` is left out.
+	 */
+	porch?: Omit<IPorchConfig, 'hostSecret' | 'tags'> & {
+		tags?: IPorchConfig['tags'];
+	};
 };
 
 // ─── Direct funding ───

@@ -68,6 +68,9 @@ export class TowerConnection extends EventEmitter implements ITowerTransport {
 	async connect(): Promise<void> {
 		const socket = await this.openSocket();
 		this.socket = socket;
+		// Init follows act three before the tower has answered anything, and
+		// Nagle's algorithm would hold it back until act three is acknowledged.
+		socket.setNoDelay(true);
 
 		const handshake = createInitiatorHandshake(
 			this.localPrivateKey,

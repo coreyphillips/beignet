@@ -21,6 +21,7 @@ Every document in the repository, by what it is for. A test (`tests/lightning/do
 | [MPP-SENDING.md](MPP-SENDING.md) | How a BOLT 11 payment splits over the wallet's channels, including channels to different peers, how parts are sized and what bounds their number |
 | [packages/direct-funding/README.md](../packages/direct-funding/README.md) | Standalone payer SDK, Bitcoin Core and PSBT adapters, transport, storage and regtest qualification |
 | [ZERO-RESERVE.md](ZERO-RESERVE.md) | Zero-reserve home channels (`option_zero_reserve`): policy and configuration |
+| [PORCH.md](PORCH.md) | Porch links, a link to a node that does not say where it is: running a relay, pointing a node at it, handing out and revoking links, who learns what, and what each setup costs in speed |
 
 ## Reference
 
@@ -44,6 +45,7 @@ The option and event tables in the two READMEs above are generated from the code
 | [specs/ffor-offline-receive.md](specs/ffor-offline-receive.md) | FFOR, Fast-Forward Offline Receive: the protocol specification (v0.9.4) the FFOR code cites by section |
 | [specs/CONCURRENT-RECEIVE.md](specs/CONCURRENT-RECEIVE.md) | FFOR concurrent receive, extension version 1: ordinary payments on a channel with a live voucher book |
 | [FFOR-RESERVED-RETIREMENT.md](FFOR-RESERVED-RETIREMENT.md) | FFOR concurrent receive and reserved retirement: the version 1 and 2 contracts |
+| [PORCH-PROTOCOL.md](PORCH-PROTOCOL.md) | Porch, version 1: a blind relay that lets a node hand out a `wss://` peer link without revealing where it runs. Roles and trust, messages, limits, test vectors |
 | [SPLICE-LOCK-DEPTH.md](SPLICE-LOCK-DEPTH.md) | Depth-locked splices and conflicted-splice revert, two BOLT 2 extensions |
 | [MULTI-CHANNEL-SPLICE-OUT.md](MULTI-CHANNEL-SPLICE-OUT.md) | Design note: one transaction that splices out of several channels and pays an address once, with session composition, signatures, abort, restart, fees and peer support |
 | [DIRECT-FUNDING-OWNERSHIP-PROOFS.md](DIRECT-FUNDING-OWNERSHIP-PROOFS.md) | How a direct-funding receiver proves control of its named input |
@@ -52,6 +54,8 @@ The option and event tables in the two READMEs above are generated from the code
 
 | Document | Contents |
 |----------|----------|
+| [PORCH-QUALIFICATION-2026-11-11.md](PORCH-QUALIFICATION-2026-11-11.md) | Porch qualification: the leak checks, and payment, restart and outage times through a relay, through a relay behind TLS and through Tor, next to a direct TCP connection, with its [raw results](PORCH-QUALIFICATION-2026-11-11.json) |
+| [scripts/regtest-live/porch-qualification/README.md](../scripts/regtest-live/porch-qualification/README.md) | How to rerun the Porch qualification |
 | [IROH-QUALIFICATION-2026-10-03.md](IROH-QUALIFICATION-2026-10-03.md) | Iroh transport qualification on the released engine, with its [raw results](IROH-QUALIFICATION-2026-10-03.json) |
 | [IROH-RELAY-ONLY-QUALIFICATION-2026-11-11.md](IROH-RELAY-ONLY-QUALIFICATION-2026-11-11.md) | Relay-only Iroh qualification: the leak checks, payment and recovery times next to a direct path, and what a peer that already knew the address keeps, with its [raw results](IROH-RELAY-ONLY-QUALIFICATION-2026-11-11.json) |
 | [scripts/regtest-live/iroh-qualification/README.md](../scripts/regtest-live/iroh-qualification/README.md) | How to rerun the Iroh qualifications |

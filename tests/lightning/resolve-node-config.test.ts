@@ -16,6 +16,10 @@ import type { IChannelBasepoints } from '../../src/lightning/keys/derivation';
 import type { IChannelConfig } from '../../src/lightning/channel/types';
 import { Network } from '../../src/lightning/invoice/types';
 import { Feature } from '../../src/lightning/features/flags';
+import {
+	derivePorchDefaultTag,
+	derivePorchHostSecret
+} from '../../src/lightning/transport/porch';
 import { noopLogger } from '../../src/logger';
 const sinon = require('sinon');
 
@@ -324,6 +328,7 @@ describe('LightningNode.fromMnemonic options', () => {
 			learnedAddressDials: undefined,
 			webSocketImpl: undefined,
 			iroh: undefined,
+			porch: undefined,
 			watchtowers: undefined,
 			preferAnchors: undefined,
 			largeChannels: undefined,
@@ -349,11 +354,18 @@ describe('LightningNode.fromMnemonic options', () => {
 			seed: undefined,
 			coinType: undefined
 		};
-		const derivation = new Set(['passphrase', 'seed', 'coinType', 'iroh']);
+		const derivation = new Set([
+			'passphrase',
+			'seed',
+			'coinType',
+			'iroh',
+			'porch'
+		]);
 		const options: Record<string, unknown> = {
 			seed: bip39.mnemonicToSeedSync(MNEMONIC),
 			coinType: 1,
-			iroh: { relays: ['sentinel'] }
+			iroh: { relays: ['sentinel'] },
+			porch: { relays: ['wss://sentinel.example'], via: 'tor' }
 		};
 		for (const key of Object.keys(given)) {
 			if (!derivation.has(key)) options[key] = { sentinel: key };
@@ -384,6 +396,48 @@ describe('LightningNode.fromMnemonic options', () => {
 		const iroh = input.iroh as { relays: string[]; secretKey: Uint8Array };
 		expect(iroh.relays).to.deep.equal(['sentinel']);
 		expect(iroh.secretKey).to.have.length(32);
+		// Porch: what was given, plus a host key and one link from the seed,
+		// neither of which is the Lightning key or the Iroh one.
+		const seed = bip39.mnemonicToSeedSync(MNEMONIC);
+		const porch = input.porch as {
+			relays: string[];
+			via: string;
+			hostSecret: Buffer;
+			tags: Buffer[];
+		};
+		expect(porch.relays).to.deep.equal(['wss://sentinel.example']);
+		expect(porch.via).to.equal('tor');
+		expect(porch.hostSecret.equals(derivePorchHostSecret(seed))).to.equal(true);
+		expect(porch.tags).to.have.length(1);
+		expect(porch.tags[0].equals(derivePorchDefaultTag(seed))).to.equal(true);
+		expect(porch.hostSecret.equals(input.nodePrivateKey as Buffer)).to.equal(
+			false
+		);
+		expect(porch.hostSecret.equals(Buffer.from(iroh.secretKey))).to.equal(
+			false
+		);
+	});
+
+	it('serves the links it is given in place of the one from the seed', () => {
+		const seen: INodeConfig[] = [];
+		sinon
+			.stub(configModule, 'resolveNodeConfig')
+			.callsFake((input: INodeConfig) => {
+				seen.push(input);
+				throw new Error('captured');
+			});
+		const tags = [Buffer.alloc(16, 1), Buffer.alloc(16, 2)];
+		expect(() =>
+			LightningNode.fromMnemonic(MNEMONIC, {
+				porch: { relays: ['wss://sentinel.example'], tags }
+			})
+		).to.throw('captured');
+		expect(seen[0].porch?.tags).to.equal(tags);
+		expect(seen[0].porch?.hostSecret).to.have.length(32);
+
+		// Without the option there is no host key to derive.
+		expect(() => LightningNode.fromMnemonic(MNEMONIC, {})).to.throw('captured');
+		expect(seen[1]).to.have.property('porch', undefined);
 	});
 
 	it('applies the options it used to drop', () => {

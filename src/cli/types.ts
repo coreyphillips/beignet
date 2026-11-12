@@ -26,6 +26,8 @@ import type {
 	PaymentHashHex,
 	TxidHex
 } from '../utils/identifiers';
+import type { PorchDaemonConfig } from './porch-config';
+import type { PorchHostState } from '../lightning/transport/porch-host';
 
 export type { ChannelIdHex, PaymentHashHex, TxidHex };
 
@@ -80,7 +82,10 @@ export interface NodeInfo {
 	/** Channels not in a terminal state (CLOSED, FORCE_CLOSED, ERRORED). */
 	openChannelCount: number;
 	peerCount: number;
-	/** True while an inbound listener (TCP, WebSocket or Iroh) is bound. */
+	/**
+	 * True while an inbound listener is up: TCP, WebSocket or Iroh bound, or
+	 * the node waiting at its Porch relays.
+	 */
 	listening: boolean;
 	/**
 	 * The TCP listen port this node was asked for, present whenever one was
@@ -93,6 +98,81 @@ export interface NodeInfo {
 	websocketPort?: number;
 	/** Why the configured WebSocket listener is not bound; absent while it is. */
 	websocketListenError?: ListenerProblem;
+	/** True when this engine can wait at Porch relays (porchRelays). */
+	porchAvailable?: boolean;
+	/** Present when Porch relays are configured. */
+	porch?: PorchInfo;
+	/**
+	 * Why the node is not waiting at its Porch relays; absent while it is. A
+	 * relay that is away is not one of these: see `porch.relays`.
+	 */
+	porchListenError?: ListenerProblem;
+}
+
+/** One Porch relay, as the node stands with it. */
+export interface PorchRelayInfo {
+	/** `ws(s)://name`, as configured. */
+	relay: string;
+	/**
+	 * `ready`: registered, so links through this relay work. `connecting`:
+	 * on its way. `unreachable`: the last attempts failed and it is retrying.
+	 * `refused`: the relay turned the node down (a wrong token, too many
+	 * links). `no-links`: every link is revoked, so the node stays away.
+	 * `stopped`: not waiting (held, fenced or shut down).
+	 */
+	state: PorchHostState;
+	/** Connections waiting for a visitor. */
+	idle: number;
+	/** Visitors connected through this relay now. */
+	circuits: number;
+	/** Why the last attempt failed, while the relay is not `ready`. */
+	lastError?: string;
+	/**
+	 * True when the node reaches this relay through the SOCKS5 proxy, so the
+	 * relay does not see the node's address. False: the relay's operator does.
+	 */
+	proxied: boolean;
+}
+
+/** The `porch` block of GET /info. */
+export interface PorchInfo {
+	/**
+	 * The peer URIs of the seed's link, one per relay, while the node waits
+	 * at its relays. Empty once that link is revoked. GET /porch/links has
+	 * every link.
+	 */
+	uris: string[];
+	/** Links served: the seed's, unless revoked, and those made since. */
+	links: number;
+	relays: PorchRelayInfo[];
+}
+
+/** One link a node can be reached by through its Porch relays. */
+export interface PorchLinkInfo {
+	/** The link's id, to revoke it by. */
+	id: string;
+	/** True for the link every node has from its seed. */
+	default?: true;
+	label?: string;
+	/** Unix ms. The seed's link has none. */
+	createdAt?: number;
+	/** `pubkey@wss://relay/v1/p/<route>`, one per relay. Any of them reaches the node. */
+	uris: string[];
+}
+
+/** GET /porch/links. */
+export interface PorchLinksInfo {
+	/** False when no Porch relay is configured; the lists are then empty. */
+	enabled: boolean;
+	/** True while the node waits at its relays. */
+	listening: boolean;
+	links: PorchLinkInfo[];
+	relays: PorchRelayInfo[];
+	/**
+	 * Present when the stored links could not be read. None is served until
+	 * one is made, and the seed's link stays revoked.
+	 */
+	problem?: string;
 }
 
 /**
@@ -123,6 +203,8 @@ export type PeerState = 'ready' | 'connected' | 'connecting' | 'disconnected';
 export interface PeerInfo {
 	transport?: 'tcp' | 'ws' | 'iroh';
 	iroh?: IIrohDiagnostics;
+	/** Set for a peer that came in through a Porch link: the relay's name and the link's id. */
+	porch?: { relay: string; link: string };
 	pubkey: string;
 	host: string;
 	port: number;
@@ -990,7 +1072,10 @@ export interface Bolt12InvoiceInfo {
 	relativeExpiry?: number;
 }
 
-export interface BeignetConfig extends IrohDaemonConfig, ElectrumTlsConfig {
+export interface BeignetConfig
+	extends IrohDaemonConfig,
+		PorchDaemonConfig,
+		ElectrumTlsConfig {
 	/** Primary-only switch for new private client channels. Default false. */
 	waiveClientReserve?: boolean;
 	mnemonic?: string;
