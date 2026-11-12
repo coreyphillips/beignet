@@ -34,9 +34,10 @@ reproduction instructions.
 - The relay cost nothing that could be measured. A payment took 89 ms through
   it, 90 ms through it behind TLS, and 90 ms on a direct TCP connection with
   Nagle's algorithm off.
-- Direct TCP as the engine ships took 111 ms, and twice the round trips with
-  distance. That is a finding of its own:
-  [#1989](https://github.com/coreyphillips/beignet/issues/1989).
+- Direct TCP as the engine shipped took 111 ms, and twice the round trips
+  with distance. That is a finding of its own,
+  [#1989](https://github.com/coreyphillips/beignet/issues/1989), fixed after
+  this run by [#1990](https://github.com/coreyphillips/beignet/pull/1990).
 - With the relay reached through Tor, a payment took 1.5 s and a channel was
   usable about 3 s after the phone restarted, over a Tor path twice as long as
   a public relay gets.
@@ -244,8 +245,10 @@ and 4 ms against 8 ms for each millisecond of distance.
 The rows marked "Nagle's algorithm off" were measured with
 `QUALIFY_TCP_NODELAY=true`, which sets `TCP_NODELAY` on both endpoints' peer
 sockets from outside the engine. The engine itself is unchanged in this run.
-The fix is [#1990](https://github.com/coreyphillips/beignet/pull/1990), where
-the patched engine was measured against master and gave the same figures.
+The fix is [#1990](https://github.com/coreyphillips/beignet/pull/1990), merged
+after this run, where the patched engine was measured against master and gave
+the same figures. It also covers the watchtower client's socket, which this
+fixture does not exercise.
 
 ## Final state
 

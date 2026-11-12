@@ -25,7 +25,7 @@ numbers are in [PORCH-QUALIFICATION-2026-11-11.md](PORCH-QUALIFICATION-2026-11-1
 
 | Setup                             | Who learns the node's address         | A payment in the laboratory                     |
 | --------------------------------- | ------------------------------------- | ----------------------------------------------- |
-| TCP listener, or an Iroh link     | everyone who holds the link           | 111 ms over TCP                                 |
+| TCP listener, or an Iroh link     | everyone who holds the link           | 90 ms over TCP (111 ms up to 0.38.4)            |
 | Iroh, relay-only                  | the Iroh relay's operator             | about 80 ms more than a direct Iroh path        |
 | Porch, a relay somebody else runs | that relay's operator                 | 89 ms, and 90 ms with TLS in front of the relay |
 | Porch, a relay you run            | you, and the server's hosting company | the same                                        |
@@ -34,18 +34,18 @@ numbers are in [PORCH-QUALIFICATION-2026-11-11.md](PORCH-QUALIFICATION-2026-11-1
 
 The laboratory puts the relay next to both ends, so the Porch number is what
 the relay itself adds: nothing that could be measured. The relay-only Iroh
-figure is from its own qualification, through n0's public relay. Direct TCP is
-slower than the relay only because of a delay the engine's TCP sockets have and
-its WebSocket ones do not
-([#1989](https://github.com/coreyphillips/beignet/issues/1989)); without it
-TCP measured 90 ms.
+figure is from its own qualification, through n0's public relay. Direct TCP
+measured 111 ms in that run, slower than the relay, because of a delay the
+engine's TCP sockets had up to 0.38.4 and its WebSocket ones never had
+([#1989](https://github.com/coreyphillips/beignet/issues/1989)). With the
+delay gone, as it is in every later release, TCP measured 90 ms.
 
 On the Internet a payment through a relay gains about 4 ms for each
 millisecond between the phone and the node, one way, which is the phone to the
 relay plus the relay to the node. A relay 10 ms from the phone and 10 ms from
 home makes a payment about 170 ms; one on another continent costs what the
-detour costs. Direct TCP gains about 8 ms per millisecond until that delay is
-gone, and 4 after.
+detour costs. Direct TCP gains the same 4 ms per millisecond, and 8 on
+0.38.4 and earlier, which have that delay.
 
 The practical choice for most people is a relay they run on a small server
 near where they live. The link then hides the node from everyone it is handed

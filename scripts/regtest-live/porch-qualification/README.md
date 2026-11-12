@@ -158,7 +158,10 @@ Nagle's algorithm off on both endpoints' TCP peer sockets, which the WebSocket
 transports already have: the two endpoints are started again with the setting,
 and back without it by the next run that does not ask for it. It is for
 telling what that algorithm costs the `tcp` path apart from what the path
-costs.
+costs. An engine after 0.38.4 turns it off on those sockets itself
+([#1990](https://github.com/coreyphillips/beignet/pull/1990)), so there the
+switch changes nothing and the `tcp` path measures like the 2026-11-11
+record's "Nagle's algorithm off" rows.
 
 Payment time also moves with what else the machine is doing, on every path
 alike, and each result records the host's load average beside it. To compare
