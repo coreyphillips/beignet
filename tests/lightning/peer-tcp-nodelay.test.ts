@@ -3,7 +3,8 @@
  * before the first is acknowledged. With Nagle's algorithm on, the second
  * waits for that acknowledgement. Every TCP socket a peer is carried by has
  * it turned off: the one a node dials, the one a socket factory (a SOCKS5
- * proxy, a native bridge) hands over, and the one a listener accepts.
+ * proxy, a native bridge) hands over, and the one a listener accepts. So has
+ * the socket a watchtower is reached by, which is not a Peer.
  */
 
 import { expect } from 'chai';
@@ -11,6 +12,7 @@ import * as crypto from 'crypto';
 import * as net from 'net';
 import { Peer } from '../../src/lightning/transport/peer';
 import { PeerManager } from '../../src/lightning/transport/peer-manager';
+import { TowerConnection } from '../../src/lightning/watchtower/tower-connection';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
 
 const key = (label: string): Buffer =>
@@ -124,6 +126,42 @@ describe('TCP peer sockets send without delay', () => {
 			expect(told(port)).to.deep.equal({ dialed: 1, accepted: 1 });
 		} finally {
 			guest.disconnect();
+		}
+	});
+
+	it('on the socket a watchtower is dialed by, before the handshake is written', async () => {
+		// A tower that accepts and says nothing: the handshake never completes.
+		const accepted: net.Socket[] = [];
+		const received: Buffer[] = [];
+		const tower = net.createServer((socket) => {
+			accepted.push(socket);
+			socket.on('data', (chunk: Buffer) => received.push(chunk));
+			socket.on('error', () => undefined);
+		});
+		await new Promise<void>((resolve) => tower.listen(0, '127.0.0.1', resolve));
+		const { port } = tower.address() as net.AddressInfo;
+		const pubkey = getPublicKey(key('nodelay-tower')).toString('hex');
+		const connection = new TowerConnection({
+			localPrivateKey: key('nodelay-tower-client'),
+			address: {
+				pubkey,
+				host: '127.0.0.1',
+				port,
+				uri: `${pubkey}@127.0.0.1:${port}`
+			}
+		});
+		connection.on('error', () => undefined);
+
+		try {
+			connection.connect().catch(() => undefined);
+			// Act one has arrived, so the option was set before anything was sent.
+			await until(() => Buffer.concat(received).length >= 50);
+
+			expect(told(port).dialed).to.equal(1);
+		} finally {
+			connection.close();
+			for (const socket of accepted) socket.destroy();
+			await new Promise<void>((resolve) => tower.close(() => resolve()));
 		}
 	});
 });
