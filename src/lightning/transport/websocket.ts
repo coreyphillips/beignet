@@ -33,7 +33,8 @@ export interface IWebSocketLike {
 	binaryType: string;
 	readonly bufferedAmount: number;
 	readonly readyState: number;
-	send(data: Uint8Array): void;
+	/** Bytes go out as a binary message, a string as a text message. */
+	send(data: Uint8Array | string): void;
 	close(code?: number, reason?: string): void;
 	onopen: ((ev?: unknown) => void) | null;
 	onmessage: ((ev: { data: unknown }) => void) | null;

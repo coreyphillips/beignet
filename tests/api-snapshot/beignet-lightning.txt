@@ -8959,6 +8959,9 @@ method transport.IIrohStream.closed(): Promise<void>
 method transport.IIrohStream.diagnostics(): transport.IIrohDiagnostics
 method transport.IIrohStream.read(limit: number): Promise<Uint8Array>
 method transport.IIrohStream.writeAll(data: Uint8Array): Promise<void>
+interface transport.INodeWebSocketOptions
+property transport.INodeWebSocketOptions.connect?: (host: string, port: number) => net#Socket | Promise<net#Socket>
+property transport.INodeWebSocketOptions.maxPayloadBytes?: number
 interface transport.IParsedPeerUri
 property transport.IParsedPeerUri.host: string
 property transport.IParsedPeerUri.port: number
@@ -9043,7 +9046,7 @@ property transport.IWebSocketLike.onerror: ((ev?: unknown) => void) | null
 property transport.IWebSocketLike.onmessage: ((ev: { data: unknown; }) => void) | null
 property transport.IWebSocketLike.onopen: ((ev?: unknown) => void) | null
 readonly property transport.IWebSocketLike.readyState: number
-method transport.IWebSocketLike.send(data: Uint8Array): void
+method transport.IWebSocketLike.send(data: Uint8Array | string): void
 interface transport.IWebSocketServerOptions
 property transport.IWebSocketServerOptions.maxFramePayloadBytes?: number
 property transport.IWebSocketServerOptions.maxPendingUpgrades?: number
@@ -9051,6 +9054,10 @@ property transport.IWebSocketServerOptions.maxPendingUpgradesPerAddress?: number
 property transport.IWebSocketServerOptions.path?: string
 property transport.IWebSocketServerOptions.upgradeAddressKey?: (address: string | undefined) => string | null
 property transport.IWebSocketServerOptions.upgradeTimeoutMs?: number
+interface transport.IWebSocketUpgradeDenial
+property transport.IWebSocketUpgradeDenial.headers?: string
+property transport.IWebSocketUpgradeDenial.message: string
+property transport.IWebSocketUpgradeDenial.status: number
 interface transport.IWsFrame
 property transport.IWsFrame.fin: boolean
 property transport.IWsFrame.masked: boolean
@@ -9074,7 +9081,7 @@ type transport.LearnedAddressDials = 'any' | 'proxy-only'
 class transport.LearnedAddressRefusedError extends transport.PeerError
 constructor transport.LearnedAddressRefusedError(pubkey: string, target: string)
 class transport.NodeWebSocket implements transport.IWebSocketLike
-constructor transport.NodeWebSocket(url: string)
+constructor transport.NodeWebSocket(url: string, protocolsOrOptions?: string | string[] | transport.INodeWebSocketOptions)
 property transport.NodeWebSocket.binaryType: string
 get transport.NodeWebSocket.bufferedAmount(): number
 method transport.NodeWebSocket.close(code?: 1000, reason?: string): void
@@ -9083,7 +9090,7 @@ property transport.NodeWebSocket.onerror: ((ev?: unknown) => void) | null
 property transport.NodeWebSocket.onmessage: ((ev: { data: unknown; }) => void) | null
 property transport.NodeWebSocket.onopen: ((ev?: unknown) => void) | null
 property transport.NodeWebSocket.readyState: number
-method transport.NodeWebSocket.send(data: Uint8Array): void
+method transport.NodeWebSocket.send(data: Uint8Array | string): void
 const transport.PRE_HANDSHAKE_MAX_WS_BYTES: number
 class transport.Peer extends EventEmitter
 constructor transport.Peer(options: transport.IPeerOptions)
@@ -9194,14 +9201,17 @@ const transport.WsOpcode: { readonly CONTINUATION: 0; readonly TEXT: 1; readonly
 class transport.WsProtocolError extends Error
 constructor transport.WsProtocolError(closeCode: number, message: string)
 readonly property transport.WsProtocolError.closeCode: number
+function transport.acceptWebSocketUpgrade(socket: net#Socket, key: string): void
 function transport.applyWsMask(payload: Buffer, maskKey: Buffer): Buffer
 function transport.buildWebSocketUrl(host: string, port: number): string
+function transport.checkWebSocketUpgrade(req: { method?: string; headers: http#IncomingHttpHeaders; }): { key: string; } | { deny: transport.IWebSocketUpgradeDenial; }
 function transport.computeWebSocketAccept(secWebSocketKey: string): string
 function transport.connectIrohWithFallback(primary: () => Promise<transport.IDuplexTransport>, fallback: () => Promise<transport.IDuplexTransport>, delayMs?: number, signal?: AbortSignal): Promise<transport.IDuplexTransport>
 function transport.connectWebSocket(url: string, options?: transport.IWebSocketConnectOptions): Promise<transport.WebSocketTransport>
 function transport.createInitiatorHandshake(localStaticPriv: Buffer, remoteStaticPub: Buffer, ephemeralPriv?: Buffer): { state: transport.IHandshakeState; act1: Buffer; processAct2: (act2: Buffer) => void; createAct3: () => Buffer; deriveTransport: () => transport.TransportCipher; }
 function transport.createResponderHandshake(localStaticPriv: Buffer, ephemeralPriv?: Buffer): { state: transport.IHandshakeState; processAct1: (act1: Buffer) => void; createAct2: () => Buffer; processAct3: (act3: Buffer) => Buffer; deriveTransport: () => transport.TransportCipher; }
 function transport.decodeWsClosePayload(payload: Buffer): { code: number; reason: string; }
+function transport.denyWebSocketUpgrade(socket: net#Socket, denial: transport.IWebSocketUpgradeDenial): void
 function transport.deriveIrohSecretKey(seed: Uint8Array): Buffer
 function transport.deriveTransportCipher(ck: Buffer, initiator: boolean): transport.TransportCipher
 function transport.encodeWsClosePayload(code: number, reason?: string): Buffer
@@ -9212,6 +9222,7 @@ function transport.initiatorAct1(state: transport.IHandshakeState, ephemeralPriv
 function transport.initiatorAct3(state: transport.IHandshakeState): Buffer
 function transport.initiatorProcessAct2(state: transport.IHandshakeState, act2: Buffer): void
 function transport.isPrivateOrLoopbackHost(host: string): boolean
+function transport.nodeWebSocketVia(connect: NonNullable<transport.INodeWebSocketOptions['connect']>, options?: Omit<transport.INodeWebSocketOptions, 'connect'>): transport.WebSocketConstructor
 function transport.normalizeIrohEndpointId(value: string): string
 function transport.parseIrohAddress(address: string): transport.IIrohAddress
 function transport.parsePeerUri(uri: string): transport.IParsedPeerUri

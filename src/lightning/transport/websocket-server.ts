@@ -49,6 +49,71 @@ export function computeWebSocketAccept(secWebSocketKey: string): string {
 		.digest('base64');
 }
 
+/** The HTTP response that turns an upgrade request away. */
+export interface IWebSocketUpgradeDenial {
+	status: number;
+	message: string;
+	/** Extra response header lines, each ending in CRLF. */
+	headers?: string;
+}
+
+/**
+ * Check an HTTP Upgrade request against RFC 6455 section 4.2.1: a GET that
+ * asks for the websocket protocol at version 13 with a 16-byte key. Returns
+ * the key to answer with, or how to deny the request.
+ */
+export function checkWebSocketUpgrade(req: {
+	method?: string;
+	headers: http.IncomingHttpHeaders;
+}): { key: string } | { deny: IWebSocketUpgradeDenial } {
+	if ((req.method || 'GET').toUpperCase() !== 'GET') {
+		return { deny: { status: 405, message: 'Method Not Allowed' } };
+	}
+	const upgrade = String(req.headers.upgrade || '').toLowerCase();
+	if (upgrade !== 'websocket') {
+		return { deny: { status: 400, message: 'Bad Request' } };
+	}
+	if (req.headers['sec-websocket-version'] !== '13') {
+		return {
+			deny: {
+				status: 426,
+				message: 'Upgrade Required',
+				headers: 'Sec-WebSocket-Version: 13\r\n'
+			}
+		};
+	}
+	const key = req.headers['sec-websocket-key'];
+	if (typeof key !== 'string' || Buffer.from(key, 'base64').length !== 16) {
+		return { deny: { status: 400, message: 'Bad Request' } };
+	}
+	return { key };
+}
+
+/** Answer an upgrade request with a denial and drop the connection. */
+export function denyWebSocketUpgrade(
+	socket: net.Socket,
+	denial: IWebSocketUpgradeDenial
+): void {
+	socket.write(
+		`HTTP/1.1 ${denial.status} ${denial.message}\r\n` +
+			'Connection: close\r\n' +
+			(denial.headers ?? '') +
+			'\r\n'
+	);
+	socket.destroy();
+}
+
+/** Complete the upgrade: the 101 response for a checked request's key. */
+export function acceptWebSocketUpgrade(socket: net.Socket, key: string): void {
+	socket.write(
+		'HTTP/1.1 101 Switching Protocols\r\n' +
+			'Upgrade: websocket\r\n' +
+			'Connection: Upgrade\r\n' +
+			`Sec-WebSocket-Accept: ${computeWebSocketAccept(key)}\r\n` +
+			'\r\n'
+	);
+}
+
 // ─── Server-side connection transport ──────────────────────────
 
 /**
@@ -436,45 +501,18 @@ export class WebSocketServer extends EventEmitter {
 		socket: net.Socket,
 		head: Buffer
 	): void {
-		const deny = (status: number, message: string, headers = ''): void => {
-			socket.write(
-				`HTTP/1.1 ${status} ${message}\r\n` +
-					'Connection: close\r\n' +
-					headers +
-					'\r\n'
-			);
-			socket.destroy();
-		};
-
-		if ((req.method || 'GET').toUpperCase() !== 'GET') {
-			return deny(405, 'Method Not Allowed');
-		}
-		const upgrade = String(req.headers.upgrade || '').toLowerCase();
-		if (upgrade !== 'websocket') {
-			return deny(400, 'Bad Request');
-		}
-		const version = req.headers['sec-websocket-version'];
-		if (version !== '13') {
-			return deny(426, 'Upgrade Required', 'Sec-WebSocket-Version: 13\r\n');
-		}
-		const key = req.headers['sec-websocket-key'];
-		if (typeof key !== 'string' || Buffer.from(key, 'base64').length !== 16) {
-			return deny(400, 'Bad Request');
-		}
+		const checked = checkWebSocketUpgrade(req);
+		if ('deny' in checked) return denyWebSocketUpgrade(socket, checked.deny);
 		if (this.options.path) {
 			const reqPath = (req.url || '/').split('?')[0];
 			if (reqPath !== this.options.path) {
-				return deny(404, 'Not Found');
+				return denyWebSocketUpgrade(socket, {
+					status: 404,
+					message: 'Not Found'
+				});
 			}
 		}
-
-		socket.write(
-			'HTTP/1.1 101 Switching Protocols\r\n' +
-				'Upgrade: websocket\r\n' +
-				'Connection: Upgrade\r\n' +
-				`Sec-WebSocket-Accept: ${computeWebSocketAccept(key)}\r\n` +
-				'\r\n'
-		);
+		acceptWebSocketUpgrade(socket, checked.key);
 
 		const transport = new WebSocketServerTransport(socket, {
 			maxFramePayloadBytes: this.options.maxFramePayloadBytes,
