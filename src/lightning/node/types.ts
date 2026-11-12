@@ -24,7 +24,10 @@ import type { ILogger } from '../../logger';
 import type { IPerChannelKeys } from '../channel/channel-manager';
 import type { SignerFactory } from '../keys/signer';
 import type { WebSocketConstructor } from '../transport/websocket';
-import type { Socks5ProxyScope } from '../transport/peer-manager';
+import type {
+	LearnedAddressDials,
+	Socks5ProxyScope
+} from '../transport/peer-manager';
 import type { GuardianStartupGate } from '../recovery/startup-gate';
 import type { DurabilityBarrier } from '../recovery/durability-barrier';
 import type { IGuardianHostConfig } from '../recovery/guardian-host';
@@ -652,6 +655,16 @@ export interface INodeConfig {
 	 * everything else is direct already.
 	 */
 	socks5ProxyScope?: Socks5ProxyScope;
+	/**
+	 * How addresses the operator did not choose are dialed (default 'any'):
+	 * a channel peer's announced reconnect addresses, a node id resolved
+	 * through the gossip graph or DNS seeds, a direct-funding lane a
+	 * counterparty named. 'proxy-only' sends those dials through socks5Proxy
+	 * whatever socks5ProxyScope says, and refuses them when no proxy carries
+	 * them, so nobody can learn this node's address by naming one of their
+	 * own. Addresses passed to connectPeer are not affected.
+	 */
+	learnedAddressDials?: LearnedAddressDials;
 	/**
 	 * WebSocket constructor for outbound WS peer connections. Defaults to the
 	 * in-repo RFC-cased Node client under Node (CLN's ws listener rejects the
