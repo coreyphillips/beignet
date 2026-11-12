@@ -75,6 +75,8 @@ const ROUTE_TABLE = [
 	{ method: 'GET', path: '/spend-limit', scopes: ['readonly'] },
 	{ method: 'GET', path: '/liquidity', scopes: ['readonly'] },
 	{ method: 'GET', path: '/watchtowers', scopes: ['readonly'] },
+	// The links are what GET /info already hands out for the seed's link.
+	{ method: 'GET', path: '/porch/links', scopes: ['readonly'] },
 	{ method: 'GET', path: '/advisor/recommendations', scopes: ['readonly'] },
 	{ method: 'GET', path: '/fees', scopes: ['readonly'] },
 	{ method: 'GET', path: '/fees/estimates', scopes: ['readonly'] },
@@ -395,6 +397,9 @@ const ROUTE_TABLE = [
 	{ method: 'DELETE', path: '/watchtower/remove', scopes: [] },
 	{ method: 'POST', path: '/webhooks/register', scopes: [] },
 	{ method: 'DELETE', path: '/webhooks/unregister', scopes: [] },
+	// Who may reach this node, and cutting a peer off.
+	{ method: 'POST', path: '/porch/links/create', scopes: [] },
+	{ method: 'POST', path: '/porch/links/revoke', scopes: [] },
 	{
 		method: 'POST',
 		path: '/stop',

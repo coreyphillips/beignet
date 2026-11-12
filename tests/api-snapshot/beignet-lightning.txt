@@ -9258,7 +9258,7 @@ readonly property transport.PorchHost.relay: transport.IPorchRelayAddress
 method transport.PorchHost.start(): void
 method transport.PorchHost.status(): transport.IPorchHostStatus
 method transport.PorchHost.stop(): void
-type transport.PorchHostState = 'stopped' | 'connecting' | 'ready' | 'refused' | 'unreachable'
+type transport.PorchHostState = 'stopped' | 'no-links' | 'connecting' | 'ready' | 'refused' | 'unreachable'
 type transport.PorchVia = 'direct' | 'tor'
 type transport.Socks5ProxyScope = 'all' | 'onion'
 class transport.TransportCipher
