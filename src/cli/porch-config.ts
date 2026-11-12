@@ -33,8 +33,8 @@ export interface PorchDaemonConfig {
 	 * relay is dialed through it and never directly, so the relay sees the
 	 * proxy and not the node, while peers go on being dialed as torProxy
 	 * says. Any SOCKS5 proxy that asks for no credentials will do: a second
-	 * Tor, or a VPN or tunnel that offers one, which costs far less time than
-	 * Tor. Refused together with porchVia `direct`.
+	 * Tor, or a VPN or tunnel that offers one, at that detour's cost in time
+	 * and not Tor's. Refused together with porchVia `direct`.
 	 */
 	porchProxy?: string;
 	/**
