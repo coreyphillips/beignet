@@ -10,3 +10,4 @@ export * from './websocket-node-client';
 export * from './peer-uri';
 export * from './iroh';
 export * from './porch';
+export * from './porch-host';

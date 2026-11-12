@@ -202,6 +202,11 @@ export class Peer extends EventEmitter {
 		return this.socket?.getIrohDiagnostics?.();
 	}
 
+	/** The relay and link this connection came in through, when it did. */
+	getPorchCircuit(): import('./porch-host').IPorchCircuitInfo | undefined {
+		return this.socket?.porch;
+	}
+
 	getState(): PeerState {
 		return this.state;
 	}

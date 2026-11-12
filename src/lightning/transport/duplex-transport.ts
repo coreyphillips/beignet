@@ -17,10 +17,13 @@
 
 import type { EventEmitter } from 'events';
 import type { IIrohDiagnostics } from './iroh';
+import type { IPorchCircuitInfo } from './porch-host';
 
 export interface IDuplexTransport extends EventEmitter {
 	readonly transportType?: 'tcp' | 'ws' | 'iroh';
 	getIrohDiagnostics?(): IIrohDiagnostics;
+	/** Set on a connection a Porch relay carried in. */
+	readonly porch?: IPorchCircuitInfo;
 	/**
 	 * Queue bytes for sending. The optional callback fires once the data has
 	 * been handed to the underlying transport (or with an error on failure).
