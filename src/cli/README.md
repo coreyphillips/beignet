@@ -2224,7 +2224,9 @@ node dials out to the relay and waits there. A visitor connects to the relay
 with an ordinary `pubkey@wss://relay/v1/p/<id>` link, and the relay pairs the
 two and copies bytes it cannot read (they are BOLT 8). It needs no wallet, no
 data directory and no daemon, and belongs on a small server with a public
-address. The protocol, what each party learns and every limit are in
+address. Setting one up, with the proxy configuration and a service unit, is
+in [docs/PORCH.md](../../docs/PORCH.md). The protocol, what each party learns
+and every limit are in
 [docs/PORCH-PROTOCOL.md](../../docs/PORCH-PROTOCOL.md).
 
 ```bash
@@ -2578,7 +2580,8 @@ node never learns such a peer's address. All visitors through one relay share
 the per-address admission limits (4 handshakes in progress, 8 peers without a
 channel); a peer with a channel is admitted past the second.
 
-The protocol and every limit are in
+Which setup to choose and what each one measured is in
+[docs/PORCH.md](../../docs/PORCH.md). The protocol and every limit are in
 [docs/PORCH-PROTOCOL.md](../../docs/PORCH-PROTOCOL.md).
 
 ### Tor proxy

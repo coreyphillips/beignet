@@ -1,0 +1,7 @@
+# The TLS terminator of the porch-tls path: the relay behind a reverse proxy,
+# as the hosting guide sets one up. `tls internal` makes a certificate
+# authority of the fixture's own in place of a public one.
+relay.test {
+	tls internal
+	reverse_proxy relay:2114
+}
