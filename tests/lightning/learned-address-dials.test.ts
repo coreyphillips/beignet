@@ -236,7 +236,7 @@ describe('learnedAddressDials', function () {
 			await target.close();
 		});
 
-		it('refuses a learned WebSocket address, which the proxy does not carry', async function () {
+		it('refuses a learned WebSocket address: only a TCP one is dialed through the proxy', async function () {
 			const proxy = await flagServer();
 			const target = await flagServer();
 			const pm = new PeerManager({

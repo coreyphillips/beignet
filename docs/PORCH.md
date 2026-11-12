@@ -239,7 +239,10 @@ revocation.
 
 On the other side a link is used like any peer address:
 `beignet peer connect '<link>'`, or as a primary in an app that takes a
-`wss://` peer URI.
+`wss://` peer URI. It is dialed as any other peer is: a node or wallet that
+sends its dials through a SOCKS5 proxy (`BEIGNET_TOR_PROXY`) reaches the relay
+through it as well, so the relay does not see where the visitor is. Up to
+0.38.4 a `wss://` address was dialed directly whatever the proxy setting said.
 
 ## Who learns what
 
@@ -267,7 +270,8 @@ Three things follow.
 `BEIGNET_PORCH_VIA=tor` (`porchVia: "tor"`) makes the node reach every relay
 through Tor. The relay then sees a Tor exit instead of the home address, and
 nobody at all holds it. The phone still dials the relay directly and needs no
-Tor.
+Tor. A visitor that does use Tor is hidden from the relay in the same way,
+whatever the node does: each side chooses for itself.
 
 ```bash
 BEIGNET_PORCH_RELAYS=wss://relay.example BEIGNET_PORCH_VIA=tor \
