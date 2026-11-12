@@ -125,6 +125,7 @@ import { parseWebSocketUrl } from '../transport/websocket';
 import { NetworkGraph } from '../gossip/network-graph';
 import type {
 	ILocalChannelEdge,
+	IMultiPathRoute,
 	TPolicyOverrides
 } from '../gossip/pathfinding';
 import {
@@ -341,6 +342,7 @@ import type {
 	IUtxoSelectionOpts,
 	IFeeEstimator,
 	IPaymentRetryContext,
+	IOutboundMppPart,
 	IOutboundMppState,
 	IPendingMppPayment,
 	IPaymentPart,
@@ -772,6 +774,15 @@ const ISSUED_INVOICE_SWEEP_GRACE_SECONDS = 3600;
  * BlockPadding.
  */
 const FINAL_CLTV_EXPIRY_PADDING = 3;
+
+/**
+ * How long after an MPP payment's first part left a failed part may still be
+ * replaced (issue #1942). BOLT 4 has the payee hold a partial set for at
+ * least 60 seconds; a replacement sent past this point could reach the payee
+ * after it failed the siblings back and would then sit alone until its own
+ * timeout, so the window stops short of the payee's.
+ */
+const MPP_PART_REPLACEMENT_WINDOW_MS = 45_000;
 
 /**
  * Fallback sat/vB feerate for a force-close package when we have no live fee data
@@ -18611,7 +18622,8 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 					finalCltvExpiry,
 					excludedChannels,
 					cltvCeiling,
-					metadata
+					metadata,
+					{ maxFeeMsat, amountMsat, policyOverrides: overrides }
 				);
 			}
 		}
@@ -19168,11 +19180,17 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	 * - it must exceed the height THIS attempt was built against, otherwise it
 	 *   tells us nothing we did not already act on and every later failure to the
 	 *   same payee would masquerade as skew until the retries ran out.
+	 *
+	 * An MPP part passes the height it was built against: a replacement sent
+	 * after an earlier part's skew failure is built higher than the planned
+	 * parts, and a planned part failing back afterwards is judged against its
+	 * own height, not the replacement's.
 	 */
 	private noteHeightSkewFailure(
 		payment: IPaymentInfo,
 		failureData?: Buffer,
-		route: IPaymentInfo['route'] = payment.route
+		route: IPaymentInfo['route'] = payment.route,
+		attemptBase: number | undefined = payment.cltvBaseHeight
 	): boolean {
 		if (payment.failureCode !== INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS) {
 			return false;
@@ -19185,8 +19203,9 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		if (!failureData || failureData.length < 12) return false;
 
 		const reportedHeight = failureData.readUInt32BE(8);
-		const attemptBase = payment.cltvBaseHeight ?? this.currentBlockHeight;
-		if (reportedHeight <= attemptBase) return false;
+		if (reportedHeight <= (attemptBase ?? this.currentBlockHeight)) {
+			return false;
+		}
 		if (
 			reportedHeight - this.currentBlockHeight >
 			MAX_TRUSTED_PEER_HEIGHT_SKEW
@@ -19339,24 +19358,26 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		if (!signer.equals(erringHop.pubkey)) return false;
 		if (!verifyChannelUpdate(update, payload, nodeId1, nodeId2)) return false;
 
-		// What this attempt routed with: the override an earlier failure of
-		// this payment stored, else the graph's policy for the erring node's
-		// side, else (a hint edge) the fee and delta the route recorded.
+		// What this attempt routed with: the route's own hops carry the fee
+		// and delta the planner priced the erring channel at, whether from the
+		// graph, from the override an earlier failure of this payment stored,
+		// or from a hint. The limits a route does not carry are read from
+		// that override, else the graph. The fees are not read from the
+		// override: an MPP part planned before a sibling's failure stored it
+		// is priced at the older figure, so the same update coming back on
+		// that part is still a re-price, not a fault at a price we knew.
 		const key = policyOverrideKey(scidHex, direction);
-		const routedWith =
+		const limits =
 			ctx.policyOverrides?.get(key) ??
 			(known ? (direction === 0 ? known.update1 : known.update2) : undefined);
-		const unchanged = routedWith
-			? routedWith.feeBaseMsat === update.feeBaseMsat &&
-			  routedWith.feeProportionalMillionths ===
-					update.feeProportionalMillionths &&
-			  routedWith.cltvExpiryDelta === update.cltvExpiryDelta &&
-			  routedWith.htlcMinimumMsat === update.htlcMinimumMsat &&
-			  routedWith.htlcMaximumMsat === update.htlcMaximumMsat
-			: erringHop.feeBaseMsat === update.feeBaseMsat &&
-			  erringHop.feeProportionalMillionths ===
-					update.feeProportionalMillionths &&
-			  outgoingHop.cltvExpiryDelta === update.cltvExpiryDelta;
+		const unchanged =
+			erringHop.feeBaseMsat === update.feeBaseMsat &&
+			erringHop.feeProportionalMillionths ===
+				update.feeProportionalMillionths &&
+			outgoingHop.cltvExpiryDelta === update.cltvExpiryDelta &&
+			(!limits ||
+				(limits.htlcMinimumMsat === update.htlcMinimumMsat &&
+					limits.htlcMaximumMsat === update.htlcMaximumMsat));
 		if (unchanged) return false;
 
 		if (!ctx.policyOverrides) ctx.policyOverrides = new Map();
@@ -19706,7 +19727,12 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		_finalCltvExpiry: number,
 		excludedChannels?: Set<string>,
 		maxCltvExpiryHeight?: number,
-		metadata?: Record<string, string>
+		metadata?: Record<string, string>,
+		budget: {
+			maxFeeMsat?: bigint;
+			amountMsat?: bigint;
+			policyOverrides?: TPolicyOverrides;
+		} = {}
 	): IPaymentInfo {
 		const paymentHash = invoice.paymentHash;
 		const hashHex = paymentHash.toString('hex');
@@ -19737,20 +19763,9 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		const settledInvoice =
 			this.paymentRetryContexts.get(hashHex)?.invoiceStr ?? invoiceStr;
 		if (
-			metadata &&
-			!multiRoute.parts.every((part) => {
-				const labelled: IPaymentInfo = {
-					...payment,
-					cltvBaseHeight: this.cltvBaseHeight(paymentHash),
-					route: part as IPaymentInfo['route'],
-					sharedSecrets: part.hops.map(() => Buffer.alloc(32))
-				};
-				return this.paymentMetadataFits(
-					metadata,
-					[{ type: 'payment_state', paymentHash: hashHex, payment: labelled }],
-					[this.settledPaymentMutation(labelled, settledInvoice)]
-				);
-			})
+			!multiRoute.parts.every((part) =>
+				this.mppRowFitsWithRoute(payment, part as IRoute, settledInvoice)
+			)
 		) {
 			throw new InvalidRequestError(
 				'payment metadata is too large for the recovery guardians to accept'
@@ -19770,14 +19785,19 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 
 		// Store retry context. Seed it with the exclusions this attempt was
 		// routed under so a retry keeps avoiding those SCIDs and the failure
-		// handler accumulates onto the same set.
+		// handler accumulates onto the same set. The fee cap, the amount of an
+		// amount-less invoice and the learned policies ride it too: a part
+		// replaced after a failure (issue #1942) is planned under them.
 		if (!this.paymentRetryContexts.has(hashHex)) {
 			this.paymentRetryContexts.set(hashHex, {
 				invoiceStr,
 				excludedChannels: excludedChannels ?? new Set(),
 				retryCount: 0,
 				maxRetries: this.maxPaymentRetries,
+				maxFeeMsat: budget.maxFeeMsat,
+				amountMsat: budget.amountMsat,
 				maxCltvExpiryHeight,
+				policyOverrides: budget.policyOverrides,
 				metadata: metadata && { ...metadata }
 			});
 		}
@@ -19793,131 +19813,15 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 
 		// Dispatch each part
 		for (const partRoute of multiRoute.parts) {
-			const hops = partRoute.hops;
-			if (hops.length === 0) continue;
-			// Route CLTVs are relative deltas; the wire needs absolute (height + delta).
-			const baseHeight = this.cltvBaseHeight(paymentHash);
-			// Every part converts against the same height, so this records what a
-			// height-skew failure has to beat to count as new information.
-			payment.cltvBaseHeight = baseHeight;
-
-			// Each part's final hop must have paymentSecret and totalMsat = full invoice amount
-			const onionHops: { pubkey: Buffer; payload: IHopPayload }[] = hops.map(
-				(hop, idx) => {
-					const isFinal = idx === hops.length - 1;
-					const payload: IHopPayload = isFinal
-						? {
-								amountToForwardMsat: hop.amountToForwardMsat,
-								outgoingCltvValue: hop.outgoingCltvValue + baseHeight
-						  }
-						: {
-								amountToForwardMsat: hops[idx + 1].amountToForwardMsat,
-								outgoingCltvValue: hops[idx + 1].outgoingCltvValue + baseHeight,
-								shortChannelId: hops[idx + 1].shortChannelId
-						  };
-					if (isFinal && invoice.paymentSecret) {
-						payload.paymentSecret = invoice.paymentSecret;
-						payload.totalMsat = totalMsat; // Full amount, not part amount
-					}
-					return { pubkey: hop.pubkey, payload };
-				}
+			if (partRoute.hops.length === 0) continue;
+			const sent = this.dispatchMppPart(
+				payment,
+				mppState,
+				invoice.paymentSecret,
+				partRoute
 			);
-
-			const sessionKey = randomBytes(32);
-			const hopPubkeys = hops.map((h) => h.pubkey);
-			const { sharedSecrets } = computeSharedSecrets(sessionKey, hopPubkeys);
-
-			const onionPacket = constructOnionPacket(
-				sessionKey,
-				onionHops,
-				paymentHash
-			);
-			const onionBuf = encodeOnionPacket(onionPacket);
-
-			// Honor the planner's channel: MPP capacity was accounted per SCID,
-			// so each part must leave over the channel it was sized for.
-			// Peer-based selection could reseat the part on a sibling channel
-			// (chosen by balance) that cannot actually carry it, and a locally
-			// refused part cannot be rolled back once earlier parts are out.
-			// Same selection rule as sendPaymentToRoute.
-			const outChannel = this.firstHopChannelFor(partRoute);
-			if (!outChannel) {
-				// No channel to the first hop takes new HTLCs any more: a close,
-				// void or disconnect landed between planning and dispatch. The
-				// part cannot leave, so the payment is over here, like a part the
-				// channel refuses below. Skipping the part instead sent the rest
-				// for the payee to hold until its MPP timeout, and with every part
-				// skipped left a PENDING record nothing could resolve (#1941).
-				this.failMppDispatch(
-					payment,
-					`Local failure: MPP part's first-hop channel is gone (${hops[0].shortChannelId.toString(
-						'hex'
-					)})`
-				);
-				return payment;
-			}
-
-			const channelId = outChannel.getChannelId()!;
-			const cltvExpiry = hops[0].outgoingCltvValue + baseHeight;
-			const amount = hops[0].amountToForwardMsat;
-
-			const htlcId = outChannel.getFullState().localHtlcCounter;
-			const mppHtlcKey = `${channelId.toString('hex')}:offered-${htlcId}`;
-			// The expiry ceiling gate (issue #737) runs before the mapping is
-			// written so a refused part leaves nothing behind; a refusal takes
-			// the same exit as a channel that declines the add.
-			const ceilingProblem = this.cltvCeilingViolation(paymentHash, cltvExpiry);
-			if (ceilingProblem === undefined) {
-				this.htlcPaymentMap.set(mppHtlcKey, hashHex);
-				this.commitMutations(
-					'saveHtlcPaymentMapping',
-					[
-						{
-							type: 'htlc_payment_mapping',
-							htlcKey: mppHtlcKey,
-							paymentHash: hashHex
-						}
-					],
-					RecoveryCriticality.SafetyCritical
-				);
-			}
-
-			// The first part doubles as the payment-level route/secrets (display
-			// and single-path fallbacks); every part keeps its own for failure
-			// decryption, since each part is a distinct onion.
-			if (!payment.sharedSecrets) {
-				payment.sharedSecrets = sharedSecrets;
-				payment.route = partRoute as IPaymentInfo['route'];
-			}
-
-			mppState.parts.push({
-				route: partRoute,
-				channelId,
-				htlcId,
-				amountMsat: amount,
-				status: PaymentStatus.PENDING,
-				sharedSecrets
-			});
-
-			const result =
-				ceilingProblem === undefined
-					? this.channelManager.addHtlc(
-							channelId,
-							amount,
-							paymentHash,
-							cltvExpiry,
-							onionBuf
-					  )
-					: { ok: false as const, error: ceilingProblem };
-			if (!result.ok) {
-				mppState.parts.pop();
-				this.failMppDispatch(
-					payment,
-					`Local failure: MPP part could not be dispatched (${
-						result.error ?? 'unknown reason'
-					})`,
-					mppHtlcKey
-				);
+			if (!sent.ok) {
+				this.failMppDispatch(payment, sent.reason, sent.htlcKey);
 				return payment;
 			}
 		}
@@ -19926,11 +19830,495 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		// part is even dispatched, so resolution-time cleanup is deferred
 		// until here (see IOutboundMppState.dispatchComplete).
 		mppState.dispatchComplete = true;
+		this.replaceMppPartsFailedDuringDispatch(payment, mppState);
 		if (mppState.parts.every((part) => part.status !== PaymentStatus.PENDING)) {
 			this.outboundMppPayments.delete(hashHex);
 		}
 
 		return payment;
+	}
+
+	/**
+	 * Build one MPP part's onion and add it to the channel the planner sized it
+	 * for, recording it in `mppState` with its own secrets. The final hop
+	 * carries the payment secret and the invoice's full amount as total_msat,
+	 * so every part, original or replacement, belongs to the same payment set
+	 * at the payee. Returns the reason a part could not leave (and the mapping
+	 * written for it, if any), for the caller to end the payment with.
+	 */
+	private dispatchMppPart(
+		payment: IPaymentInfo,
+		mppState: IOutboundMppState,
+		paymentSecret: Buffer | undefined,
+		partRoute: IRoute
+	): { ok: true } | { ok: false; reason: string; htlcKey?: string } {
+		const paymentHash = payment.paymentHash;
+		const hashHex = paymentHash.toString('hex');
+		const totalMsat = mppState.totalMsat;
+		const hops = partRoute.hops;
+		// Route CLTVs are relative deltas; the wire needs absolute (height + delta).
+		const baseHeight = this.cltvBaseHeight(paymentHash);
+		// The part records the height it converts against, since a
+		// replacement can be built higher than the planned parts and a
+		// height-skew failure is judged against the failed part's own.
+		payment.cltvBaseHeight = baseHeight;
+
+		// Each part's final hop must have paymentSecret and totalMsat = full invoice amount
+		const onionHops: { pubkey: Buffer; payload: IHopPayload }[] = hops.map(
+			(hop, idx) => {
+				const isFinal = idx === hops.length - 1;
+				const payload: IHopPayload = isFinal
+					? {
+							amountToForwardMsat: hop.amountToForwardMsat,
+							outgoingCltvValue: hop.outgoingCltvValue + baseHeight
+					  }
+					: {
+							amountToForwardMsat: hops[idx + 1].amountToForwardMsat,
+							outgoingCltvValue: hops[idx + 1].outgoingCltvValue + baseHeight,
+							shortChannelId: hops[idx + 1].shortChannelId
+					  };
+				if (isFinal && paymentSecret) {
+					payload.paymentSecret = paymentSecret;
+					payload.totalMsat = totalMsat; // Full amount, not part amount
+				}
+				return { pubkey: hop.pubkey, payload };
+			}
+		);
+
+		const sessionKey = randomBytes(32);
+		const hopPubkeys = hops.map((h) => h.pubkey);
+		const { sharedSecrets } = computeSharedSecrets(sessionKey, hopPubkeys);
+
+		const onionPacket = constructOnionPacket(
+			sessionKey,
+			onionHops,
+			paymentHash
+		);
+		const onionBuf = encodeOnionPacket(onionPacket);
+
+		// Honor the planner's channel: MPP capacity was accounted per SCID,
+		// so each part must leave over the channel it was sized for.
+		// Peer-based selection could reseat the part on a sibling channel
+		// (chosen by balance) that cannot actually carry it, and a locally
+		// refused part cannot be rolled back once earlier parts are out.
+		// Same selection rule as sendPaymentToRoute.
+		const outChannel = this.firstHopChannelFor(partRoute);
+		if (!outChannel) {
+			// No channel to the first hop takes new HTLCs any more: a close,
+			// void or disconnect landed between planning and dispatch. The
+			// part cannot leave, so the payment is over here, like a part the
+			// channel refuses below. Skipping the part instead sent the rest
+			// for the payee to hold until its MPP timeout, and with every part
+			// skipped left a PENDING record nothing could resolve (#1941).
+			return {
+				ok: false,
+				reason: `Local failure: MPP part's first-hop channel is gone (${hops[0].shortChannelId.toString(
+					'hex'
+				)})`
+			};
+		}
+
+		const channelId = outChannel.getChannelId()!;
+		const cltvExpiry = hops[0].outgoingCltvValue + baseHeight;
+		const amount = hops[0].amountToForwardMsat;
+
+		const htlcId = outChannel.getFullState().localHtlcCounter;
+		const mppHtlcKey = `${channelId.toString('hex')}:offered-${htlcId}`;
+		// The expiry ceiling gate (issue #737) runs before the mapping is
+		// written so a refused part leaves nothing behind; a refusal takes
+		// the same exit as a channel that declines the add.
+		const ceilingProblem = this.cltvCeilingViolation(paymentHash, cltvExpiry);
+		if (ceilingProblem === undefined) {
+			this.htlcPaymentMap.set(mppHtlcKey, hashHex);
+			this.commitMutations(
+				'saveHtlcPaymentMapping',
+				[
+					{
+						type: 'htlc_payment_mapping',
+						htlcKey: mppHtlcKey,
+						paymentHash: hashHex
+					}
+				],
+				RecoveryCriticality.SafetyCritical
+			);
+		}
+
+		// The first part doubles as the payment-level route/secrets (display
+		// and single-path fallbacks); every part keeps its own for failure
+		// decryption, since each part is a distinct onion.
+		if (!payment.sharedSecrets) {
+			payment.sharedSecrets = sharedSecrets;
+			payment.route = partRoute as IPaymentInfo['route'];
+		}
+
+		mppState.parts.push({
+			route: partRoute,
+			channelId,
+			htlcId,
+			amountMsat: amount,
+			status: PaymentStatus.PENDING,
+			sharedSecrets,
+			cltvBaseHeight: baseHeight
+		});
+
+		const result =
+			ceilingProblem === undefined
+				? this.channelManager.addHtlc(
+						channelId,
+						amount,
+						paymentHash,
+						cltvExpiry,
+						onionBuf
+				  )
+				: { ok: false as const, error: ceilingProblem };
+		if (!result.ok) {
+			mppState.parts.pop();
+			return {
+				ok: false,
+				reason: `Local failure: MPP part could not be dispatched (${
+					result.error ?? 'unknown reason'
+				})`,
+				htlcKey: mppHtlcKey
+			};
+		}
+		return { ok: true };
+	}
+
+	/**
+	 * Whether a labelled MPP payment row still fits a recovery frame on its
+	 * own (paymentMetadataFits) with `route` as its payment-level route: the
+	 * row as dispatch leaves it, with the route and one shared secret per hop
+	 * (dispatchMppPart), and as settlement journals it. An unlabelled row is
+	 * not sized here, as no other send path sizes one.
+	 *
+	 * Every part a payment sends has to pass, the planned ones and each
+	 * replacement's (issue #1942): any of them can end up on the row, since
+	 * the first part to leave takes it and a replaced part hands it on. A
+	 * guardian refuses a frame over its limit and every frame after it, and
+	 * the journal writes such a frame anyway, so a part that could grow the
+	 * settled row past the room must not leave. The channel update the
+	 * settled row rides with shares its frame and is not sized here (issue
+	 * #1954).
+	 */
+	private mppRowFitsWithRoute(
+		payment: IPaymentInfo,
+		route: IRoute,
+		settledInvoice: string | undefined
+	): boolean {
+		if (!payment.metadata) return true;
+		const labelled: IPaymentInfo = {
+			...payment,
+			cltvBaseHeight: this.cltvBaseHeight(payment.paymentHash),
+			route,
+			sharedSecrets: route.hops.map(() => Buffer.alloc(32))
+		};
+		return this.paymentMetadataFits(
+			payment.metadata,
+			[
+				{
+					type: 'payment_state',
+					paymentHash: payment.paymentHash.toString('hex'),
+					payment: labelled
+				}
+			],
+			[this.settledPaymentMutation(labelled, settledInvoice)]
+		);
+	}
+
+	/**
+	 * Whether a failed MPP part may be replaced inside the same payment
+	 * (issue #1942): a BOLT 11 payment still open, whose failure is not
+	 * permanent. Keysend, BOLT 12 and pay-all never split, so their contexts
+	 * never reach this.
+	 */
+	private mppPartReplaceable(
+		payment: IPaymentInfo,
+		retryCtx: IPaymentRetryContext | undefined,
+		heightSkew: boolean
+	): retryCtx is IPaymentRetryContext {
+		return (
+			retryCtx !== undefined &&
+			retryCtx.invoiceStr !== undefined &&
+			!retryCtx.keysend &&
+			!retryCtx.bolt12Invoice &&
+			!retryCtx.payAll &&
+			payment.status === PaymentStatus.PENDING &&
+			(heightSkew || !this.isPermanentFailure(payment.failureCode))
+		);
+	}
+
+	/**
+	 * Replace one failed MPP part under the same payment identity: plan the
+	 * part's delivered amount (not the invoice) over the channels that remain,
+	 * under the context's exclusions, fee cap, ceiling and learned policies,
+	 * and send it as new parts of the same `mppState`, each carrying the same
+	 * payment hash, secret and total_msat. The payee can then never hold parts
+	 * summing past total_msat: the failed part is irrevocably gone from our
+	 * channel before this runs, and the replacement takes its place.
+	 *
+	 * Bounded by the context's retry count and by a deadline inside the
+	 * payee's MPP window (MPP_PART_REPLACEMENT_WINDOW_MS after the first part
+	 * left), so a replacement does not land after the payee has already failed
+	 * the siblings back. The fee cap is judged once, on every live part plus
+	 * the replacement. A replacement's liquidity is the channel's own live
+	 * spendable balance, which the failed part no longer draws on.
+	 *
+	 * Returns undefined when the payment's fate is settled here (replacement
+	 * out, or a local refusal that ended the payment through failMppDispatch),
+	 * else why no replacement was sent, for the caller to give the payment up
+	 * with.
+	 */
+	private replaceMppPart(
+		payment: IPaymentInfo,
+		mppState: IOutboundMppState,
+		retryCtx: IPaymentRetryContext,
+		failedPart: IOutboundMppPart
+	): string | undefined {
+		const paymentHash = payment.paymentHash;
+		const hashHex = paymentHash.toString('hex');
+		if (retryCtx.retryCount >= retryCtx.maxRetries) {
+			return `replacement part not sent: ${retryCtx.maxRetries} part retries used`;
+		}
+		if (Date.now() >= mppState.createdAt + MPP_PART_REPLACEMENT_WINDOW_MS) {
+			return "replacement part not sent: the payee's MPP window is closing";
+		}
+		const deliveredMsat =
+			failedPart.route.hops[failedPart.route.hops.length - 1]
+				.amountToForwardMsat;
+		let multiRoute: IMultiPathRoute | null;
+		let paymentSecret: Buffer | undefined;
+		try {
+			const invoice = decodeInvoice(retryCtx.invoiceStr!);
+			const destination = invoice.payeeNodeKey || invoice.recoveredPubkey;
+			if (!destination) return 'replacement part not sent: no payee';
+			paymentSecret = invoice.paymentSecret;
+			multiRoute = findMultiPathRoute(
+				this.graph,
+				this.ownNodeId(),
+				destination,
+				deliveredMsat,
+				this.paddedFinalCltvExpiry(invoice.minFinalCltvExpiry),
+				undefined,
+				undefined,
+				this.missionControl,
+				invoice.routingHints,
+				undefined,
+				this.getLocalChannelEdges(),
+				retryCtx.excludedChannels,
+				this.cltvBudgetFor(paymentHash, retryCtx.maxCltvExpiryHeight),
+				retryCtx.policyOverrides
+			);
+		} catch (err) {
+			const detail = err instanceof Error ? err.message : String(err);
+			return `replacement part not sent: ${detail}`;
+		}
+		if (!multiRoute) {
+			return `replacement part not sent: no route for ${deliveredMsat} msat over the remaining channels`;
+		}
+		if (retryCtx.maxFeeMsat !== undefined) {
+			let liveFeeMsat = multiRoute.totalFeeMsat;
+			for (const part of mppState.parts) {
+				if (part.status !== PaymentStatus.FAILED) {
+					liveFeeMsat += part.route.totalFeeMsat;
+				}
+			}
+			if (liveFeeMsat > retryCtx.maxFeeMsat) {
+				return `replacement part not sent: fees of ${liveFeeMsat} msat would exceed the cap of ${retryCtx.maxFeeMsat} msat`;
+			}
+		}
+		// Sized as the planned parts were, before anything is counted or
+		// written: a replacement's route can be longer than the part it
+		// replaces, and the row it may take over must still fit the room a
+		// guardian accepts.
+		if (
+			!multiRoute.parts.every((part) =>
+				this.mppRowFitsWithRoute(payment, part, retryCtx.invoiceStr)
+			)
+		) {
+			return 'replacement part not sent: the payment record would be too large for the recovery guardians to accept over its route';
+		}
+
+		const sentBefore = payment.sentMsat;
+		const retriesBefore = payment.retryCount;
+		retryCtx.retryCount++;
+		payment.retryCount = retryCtx.retryCount;
+		// sentMsat is what left this node for the payment: the failed part's
+		// first-hop amount comes off, the replacement's goes on. Persisted
+		// before the replacement leaves: a restart after its HTLC is durable
+		// finds no MPP state to re-sum it from, so the record must already
+		// carry the debit the channels will show. A record that cannot be
+		// written holds the replacement back for the same reason, and the
+		// payment ends as one with no route does.
+		payment.sentMsat =
+			(payment.sentMsat ?? 0n) -
+			failedPart.amountMsat +
+			multiRoute.totalAmountMsat;
+		const revised = this.paymentMutation(paymentHash);
+		if (
+			revised &&
+			!this.commitMutations('persist replaced MPP part', [revised])
+		) {
+			payment.sentMsat = sentBefore;
+			payment.retryCount = retriesBefore;
+			retryCtx.retryCount--;
+			return 'replacement part not sent: the payment record could not be persisted';
+		}
+		this.emitStructuredLog('payment', 'mpp_part_replaced', {
+			paymentHash: hashHex,
+			failedChannelId: failedPart.channelId.toString('hex'),
+			failedHtlcId: Number(failedPart.htlcId),
+			deliveredMsat: deliveredMsat.toString(),
+			replacementParts: multiRoute.parts.length,
+			retryCount: retryCtx.retryCount
+		});
+		// Completion credits the payment-level route in MissionControl, so a
+		// failed part's route must not stay there: the replacement's first part
+		// takes it over the way the first planned part took it. Every
+		// replacement part was sized for the row above.
+		if (payment.route === failedPart.route) {
+			payment.route = undefined;
+			payment.sharedSecrets = undefined;
+		}
+		// The replacement's parts leave one by one like the planned ones, so a
+		// part that fails back between them waits in partsAwaitingReplacement
+		// too, or its replacement would draw on balances the parts still to
+		// leave need. The caller's loop takes it once the last one is out.
+		mppState.dispatchComplete = false;
+		try {
+			for (const partRoute of multiRoute.parts) {
+				if (partRoute.hops.length === 0) continue;
+				const partsBefore = mppState.parts.length;
+				let sent: ReturnType<LightningNode['dispatchMppPart']>;
+				try {
+					sent = this.dispatchMppPart(
+						payment,
+						mppState,
+						paymentSecret,
+						partRoute
+					);
+				} catch (err) {
+					// A throw from addHtlc (the outbound transport, say) can leave
+					// the part's HTLC on the channel: the part then resolves like
+					// any other, as a single-path retry's record does, and the rest
+					// of a re-split replacement still has to leave, or the payee
+					// holds a set that can never reach total_msat. A part that
+					// never left ends the payment like one the channel refuses.
+					// The throw stops here either way: this runs from a channel
+					// event, and the finally below restores dispatchComplete, or
+					// every part that failed back later would wait in
+					// partsAwaitingReplacement for a dispatcher that never runs.
+					const detail = err instanceof Error ? err.message : String(err);
+					this.emitStructuredLog('payment', 'retry_dispatch_threw', {
+						paymentHash: hashHex,
+						error: detail
+					});
+					const pushed = mppState.parts.length > partsBefore;
+					const part = mppState.parts[mppState.parts.length - 1];
+					if (pushed && this.mppPartInFlight(paymentHash, part)) {
+						continue;
+					}
+					let htlcKey: string | undefined;
+					if (pushed) {
+						mppState.parts.pop();
+						htlcKey = `${part.channelId.toString('hex')}:offered-${
+							part.htlcId
+						}`;
+					}
+					this.failMppDispatch(
+						payment,
+						`Local failure: MPP part could not be dispatched (${detail})`,
+						htlcKey
+					);
+					return undefined;
+				}
+				if (!sent.ok) {
+					// Like a planned part the channel refuses: the siblings are out
+					// and cannot be withdrawn, so the payment ends here.
+					this.failMppDispatch(payment, sent.reason, sent.htlcKey);
+					return undefined;
+				}
+			}
+		} finally {
+			mppState.dispatchComplete = true;
+		}
+		return undefined;
+	}
+
+	/** Whether the part's HTLC is on its channel and can still settle. */
+	private mppPartInFlight(
+		paymentHash: Buffer,
+		part: IOutboundMppPart
+	): boolean {
+		const view = this.getOutgoingHtlcs(paymentHash).htlcs.find(
+			(h) => h.htlcId === part.htlcId && h.channelId.equals(part.channelId)
+		);
+		return view !== undefined && LightningNode.htlcViewInFlight(view);
+	}
+
+	/**
+	 * Replace the parts that failed back while the planned parts, or an
+	 * earlier replacement's, were still leaving (see
+	 * IOutboundMppState.partsAwaitingReplacement), now that every one of them
+	 * has drawn its liquidity. A part that cannot be replaced gives the
+	 * payment up the way a post-dispatch failure does.
+	 */
+	private replaceMppPartsFailedDuringDispatch(
+		payment: IPaymentInfo,
+		mppState: IOutboundMppState
+	): void {
+		const hashHex = payment.paymentHash.toString('hex');
+		while (mppState.partsAwaitingReplacement?.length) {
+			const failedPart = mppState.partsAwaitingReplacement.shift()!;
+			const retryCtx = this.paymentRetryContexts.get(hashHex);
+			if (
+				this.payments.get(hashHex) !== payment ||
+				payment.status !== PaymentStatus.PENDING ||
+				!retryCtx
+			) {
+				return;
+			}
+			const problem = this.replaceMppPart(
+				payment,
+				mppState,
+				retryCtx,
+				failedPart
+			);
+			if (problem !== undefined) {
+				this.giveUpMppPayment(payment, mppState, problem);
+				return;
+			}
+		}
+	}
+
+	/**
+	 * End an MPP payment whose failed part found no replacement, once its
+	 * mapping is already released: the payment-level transition of the
+	 * give-up path in settleOwnPaymentFailure, without an HTLC to tear down.
+	 */
+	private giveUpMppPayment(
+		payment: IPaymentInfo,
+		mppState: IOutboundMppState,
+		problem: string
+	): void {
+		const hashHex = payment.paymentHash.toString('hex');
+		if (payment.status === PaymentStatus.COMPLETED) return;
+		this.paymentRetryContexts.delete(hashHex);
+		const firstFailure = payment.status !== PaymentStatus.FAILED;
+		payment.status = PaymentStatus.FAILED;
+		if (firstFailure) payment.completedAt = Date.now();
+		payment.failureReason = boundedFailureReason(
+			payment.failureReason
+				? `${payment.failureReason}; ${problem}`
+				: problem.charAt(0).toUpperCase() + problem.slice(1)
+		);
+		if (
+			mppState.dispatchComplete &&
+			mppState.parts.every((part) => part.status !== PaymentStatus.PENDING)
+		) {
+			this.outboundMppPayments.delete(hashHex);
+		}
+		this.persistPayment(payment.paymentHash);
+		if (firstFailure) this.emit('payment:failed', payment);
 	}
 
 	/**
@@ -27239,6 +27627,14 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		// compliant blinded peer's invalid_onion_blinding was unreadable, the
 		// broken path was never excluded, and the retry hammered it while a
 		// working path sat unused (issue #550 review).
+		//
+		// An MPP payment's parts share this record (issue #1942), so what an
+		// earlier part's failure decoded must not stand in for one that
+		// decodes to nothing: a stale permanent code would end a payment
+		// whose part failed for a reason nobody read, and a stale source
+		// index would blame a hop of this part's route that never answered.
+		payment.failureCode = undefined;
+		payment.failureSourceIndex = undefined;
 		const malformedCode = LightningNode.malformedFailureCode(reason);
 		if (malformedCode !== undefined) {
 			payment.failureCode = malformedCode;
@@ -27270,7 +27666,8 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		const heightSkew = this.noteHeightSkewFailure(
 			payment,
 			failureData,
-			failureRoute
+			failureRoute,
+			failedPart?.cltvBaseHeight
 		);
 
 		const retryCtx = this.paymentRetryContexts.get(hashHex);
@@ -27295,11 +27692,10 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		// price, and nothing else reads it. Every other failure is routed
 		// around by the MissionControl penalty and the retry's
 		// excludedChannels below; fresh policy arrives via ordinary gossip.
-		// An MPP part is never auto-retried (see below), so its failure is
-		// not re-priced either: the penalty and exclusion apply as before.
+		// A replaced MPP part (issue #1942) is planned under the same context,
+		// so its re-priced hop serves the replacement as it serves a retry.
 		const repriced =
 			!heightSkew &&
-			!mppState &&
 			this.notePolicyFailureUpdate(
 				retryCtx,
 				payment,
@@ -27336,14 +27732,62 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			failureRoute,
 			heightSkew
 		);
-		// MPP payments are never auto-retried here: redispatching the FULL
-		// invoice while sibling parts are still held by the recipient lets the
-		// old parts and the retry's parts sum past total_msat, and the
-		// recipient fulfills every held part, overpaying the invoice. Until a
-		// part-level retry exists, a failed part fails the payment; the
-		// recipient releases the sibling holds at its own MPP timeout. The
-		// culpable SCID is still recorded in MissionControl above, and the
-		// exclusion set still serves manual re-sends.
+		// An MPP part is never retried by redispatching the FULL invoice:
+		// while sibling parts are still held by the recipient, the old parts
+		// and the retry's parts would sum past total_msat, and the recipient
+		// fulfills every held part, overpaying the invoice. A failed part is
+		// replaced inside the same payment instead (issue #1942): only its own
+		// delivered amount is re-planned over the channels that remain, with
+		// the culpable SCID excluded and, when the failure came from our own
+		// peer, its first hop too, as new parts of the same set. A re-priced
+		// hop excludes neither: the replacement takes it at its real price.
+		// The bound (retry count and the payee's MPP window), the fee cap and
+		// a missing route end the payment as a failed part did before. A part
+		// that fails back before the parts being dispatched have all left
+		// waits for them (see IOutboundMppState.partsAwaitingReplacement).
+		if (
+			mppState &&
+			failedPart &&
+			this.mppPartReplaceable(payment, retryCtx, heightSkew)
+		) {
+			if (culpableScid && !heightSkew && !repriced) {
+				retryCtx.excludedChannels.add(culpableScid);
+			}
+			if (
+				!heightSkew &&
+				!repriced &&
+				payment.failureSourceIndex === 0 &&
+				failedPart.route.hops.length > 0
+			) {
+				const firstHopScid =
+					failedPart.route.hops[0].shortChannelId.toString('hex');
+				const alternative = this.getLocalChannelEdges().some((edge) => {
+					const scid = edge.shortChannelId.toString('hex');
+					return scid !== firstHopScid && !retryCtx.excludedChannels.has(scid);
+				});
+				if (alternative) retryCtx.excludedChannels.add(firstHopScid);
+			}
+			// This part is over whatever happens next; a replacement gets its
+			// own channel and htlc id, so its mapping is released here.
+			this.htlcPaymentMap.delete(key);
+			this.commitMutations('release replaced MPP part mapping', [
+				{ type: 'delete_htlc_payment_mapping', htlcKey: key }
+			]);
+			this.emitHtlcResolved(payment.paymentHash, channelId, htlcId, 'failed');
+			// A listener may have ended this payment or sent the hash again.
+			if (
+				this.payments.get(hashHex) !== payment ||
+				this.paymentRetryContexts.get(hashHex) !== retryCtx ||
+				payment.status !== PaymentStatus.PENDING
+			) {
+				return;
+			}
+			(mppState.partsAwaitingReplacement ??= []).push(failedPart);
+			if (mppState.dispatchComplete) {
+				this.replaceMppPartsFailedDuringDispatch(payment, mppState);
+			}
+			return;
+		}
 		if (
 			retryCtx &&
 			!mppState &&
