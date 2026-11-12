@@ -27,6 +27,34 @@ export interface IIrohStream {
 	diagnostics(): IIrohDiagnostics;
 }
 
+/**
+ * How a relay-only endpoint keeps its traffic on the relay.
+ *
+ * - `'native'`: the endpoint has no IP transport at all, so it has no
+ *   socket to send from, nothing to map on the router and no address to
+ *   discover.
+ * - `'loopback-pin'`: the binding cannot remove the IP transport, so its
+ *   sockets are bound to loopback instead. No direct path can form, but
+ *   Iroh's port mapper still runs, and on a network where UPnP, NAT-PMP or
+ *   PCP answers it adds the router's public address to the endpoint's own
+ *   address list. The endpoint is watched before it accepts or makes a
+ *   connection and for as long as it lives, and it shuts itself down when a
+ *   routable address appears. So this mode is best effort: it holds on
+ *   networks with no port mapper to answer (a Docker bridge) and refuses to
+ *   run on the others. A mapping first granted while peers are connected
+ *   can reach them in the moment before the endpoint closes.
+ */
+export type IrohRelayOnlyMode = 'native' | 'loopback-pin';
+
+/** A relay-only endpoint that can no longer keep the node's address private. */
+export class IrohRelayOnlyError extends Error {
+	readonly code = 'IROH_RELAY_ONLY_VIOLATED';
+	constructor(message: string) {
+		super(message);
+		this.name = 'IrohRelayOnlyError';
+	}
+}
+
 export interface IIrohEndpoint {
 	address(): IIrohAddress;
 	connect(address: IIrohAddress, timeoutMs: number): Promise<IDuplexTransport>;
@@ -36,6 +64,13 @@ export interface IIrohEndpoint {
 	): void;
 	stopListening(): void;
 	close(): Promise<void>;
+	/**
+	 * Set by an endpoint that was bound relay-only, and only by one. A factory
+	 * that ignores IIrohEndpointOptions.relayOnly leaves it unset, which is how
+	 * the peer manager tells a relay-only endpoint from one that would offer
+	 * its addresses to every peer.
+	 */
+	readonly relayOnly?: IrohRelayOnlyMode;
 }
 
 export interface IIrohEndpointOptions {
@@ -44,6 +79,19 @@ export interface IIrohEndpointOptions {
 	relays?: string[];
 	/** False disables public address discovery and publication. */
 	discovery?: boolean;
+	/**
+	 * true: no direct paths. All traffic rides the relay and no IP address is
+	 * offered to a peer, so whoever holds this endpoint's link cannot learn
+	 * where it runs. The relay operator still sees the address. Needs a
+	 * relay, and an endpoint that sets IIrohEndpoint.relayOnly in return.
+	 */
+	relayOnly?: boolean;
+	/**
+	 * Called once when a bound relay-only endpoint finds it cannot keep that
+	 * promise. The endpoint has already closed itself. A problem found while
+	 * binding rejects the factory instead.
+	 */
+	onRelayOnlyViolation?: (error: IrohRelayOnlyError) => void;
 	maxPendingInbound?: number;
 	handshakeTimeoutMs?: number;
 }
@@ -53,6 +101,25 @@ export type IrohEndpointFactory = (
 ) => Promise<IIrohEndpoint>;
 export interface IIrohConfig extends IIrohEndpointOptions {
 	factory: IrohEndpointFactory;
+}
+
+/**
+ * Whether an `ip:port` socket address is loopback: 127.0.0.0/8, ::1, or
+ * either one mapped into IPv6. Strict on purpose: a private LAN address is
+ * not loopback, and neither is anything this cannot parse.
+ */
+export function isLoopbackSocketAddress(address: string): boolean {
+	const bracketed = /^\[([0-9a-f:.]+)\](?::\d+)?$/i.exec(address);
+	const host = bracketed ? bracketed[1] : address.replace(/:\d+$/, '');
+	const mapped = /^::ffff:(.+)$/i.exec(host);
+	const ip = (mapped ? mapped[1] : host).toLowerCase();
+	if (/^127(\.\d{1,3}){3}$/.test(ip)) return true;
+	return ip === '::1' || ip === '0:0:0:0:0:0:0:1';
+}
+
+/** The addresses in an endpoint's list that a peer could route to. */
+export function routableSocketAddresses(addresses: string[]): string[] {
+	return addresses.filter((address) => !isLoopbackSocketAddress(address));
 }
 
 /** HKDF-SHA256 from the BIP39 seed, independent of Lightning signing keys. */

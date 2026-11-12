@@ -34,6 +34,7 @@ export function daemonOptions(
 		iroh: config.iroh,
 		irohRelays: config.irohRelays,
 		irohDiscovery: config.irohDiscovery,
+		irohRelayOnly: config.irohRelayOnly,
 		maxInboundPeers: config.maxInboundPeers,
 		porchRelays: config.porchRelays,
 		porchVia: config.porchVia,

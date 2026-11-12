@@ -663,7 +663,8 @@ export interface INodeConfig {
 	 * counterparty named. 'proxy-only' sends those dials through socks5Proxy
 	 * whatever socks5ProxyScope says, and refuses them when no proxy carries
 	 * them, so nobody can learn this node's address by naming one of their
-	 * own. Addresses passed to connectPeer are not affected.
+	 * own. Addresses passed to connectPeer are not affected. Always
+	 * 'proxy-only' when iroh.relayOnly is set.
 	 */
 	learnedAddressDials?: LearnedAddressDials;
 	/**
@@ -674,7 +675,13 @@ export interface INodeConfig {
 	 * {type: 'ws'}; mirrors how electrumOptions injects net/tls.
 	 */
 	webSocketImpl?: WebSocketConstructor;
-	/** Opt-in Iroh endpoint, supplied by Node or a native mobile bridge. */
+	/**
+	 * Opt-in Iroh endpoint, supplied by Node or a native mobile bridge.
+	 * `relayOnly: true` keeps every Iroh connection on the relay so a peer
+	 * never learns this node's IP address (the relay operator still does);
+	 * it needs a factory whose endpoint reports IIrohEndpoint.relayOnly, and
+	 * it switches learnedAddressDials to 'proxy-only'.
+	 */
 	iroh?: import('../transport/iroh').IIrohConfig;
 	/**
 	 * Opt-in Porch relays (docs/PORCH-PROTOCOL.md): the node dials out to

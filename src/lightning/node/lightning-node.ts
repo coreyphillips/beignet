@@ -12,6 +12,7 @@ import {
 	normalizeIrohEndpointId,
 	validateIrohRelayUrl
 } from '../transport/iroh';
+import type { IrohRelayOnlyMode } from '../transport/iroh';
 import {
 	derivePorchDefaultTag,
 	derivePorchHostSecret
@@ -7520,6 +7521,13 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		this.peerManager.on('peer:error', (pubkey: string, err: Error) => {
 			this.emit('peer:error', pubkey, err);
 		});
+		this.peerManager.on('iroh:relay-only-violated', (err: Error) => {
+			this.emit('node:error', {
+				code: 'IROH_RELAY_ONLY_VIOLATED',
+				message: err.message,
+				timestamp: Date.now()
+			});
+		});
 		this.peerManager.on('porch:status', (status: IPorchHostStatus) => {
 			this.emit('porch:status', status);
 		});
@@ -10051,6 +10059,25 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 
 	getIrohConnectionString(): string | undefined {
 		return this.peerManager?.getIrohConnectionString();
+	}
+
+	/**
+	 * How the Iroh endpoint keeps its traffic on the relay, when
+	 * `iroh.relayOnly` is set: `mode` while an endpoint is bound, `failure`
+	 * once one had to shut down (nothing rebinds after that). Undefined when
+	 * relay-only was not asked for.
+	 */
+	getIrohRelayOnlyStatus():
+		| { mode?: IrohRelayOnlyMode; failure?: string }
+		| undefined {
+		const pm = this.peerManager;
+		if (!pm?.isIrohRelayOnly()) return undefined;
+		const mode = pm.getIrohRelayOnlyMode();
+		const failure = pm.getIrohRelayOnlyFailure()?.message;
+		return {
+			...(mode ? { mode } : {}),
+			...(failure ? { failure } : {})
+		};
 	}
 
 	/**

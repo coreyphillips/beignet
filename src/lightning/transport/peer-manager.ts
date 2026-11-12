@@ -8,8 +8,14 @@
  * - Reconnection with exponential backoff
  */
 
-import type { IIrohConfig, IIrohEndpoint, IIrohDiagnostics } from './iroh';
+import type {
+	IIrohConfig,
+	IIrohEndpoint,
+	IIrohDiagnostics,
+	IrohRelayOnlyMode
+} from './iroh';
 import {
+	IrohRelayOnlyError,
 	formatIrohAddress,
 	connectIrohWithFallback,
 	normalizeIrohEndpointId
@@ -589,6 +595,12 @@ export class PeerManager extends EventEmitter {
 	private irohBinding?: Promise<IIrohEndpoint>;
 	private irohListening = false;
 	private irohListenEpoch = 0;
+	/**
+	 * Why relay-only Iroh is off for the rest of this manager's life. Once an
+	 * endpoint could not keep the promise, another bind would only ask the
+	 * router again, so nothing rebinds until the operator restarts.
+	 */
+	private irohRelayOnlyFailure?: IrohRelayOnlyError;
 	private webSocketImpl?: WebSocketConstructor;
 	/** One per configured Porch relay, in the order they were given. */
 	private porchHosts: PorchHost[] = [];
@@ -1879,15 +1891,38 @@ export class PeerManager extends EventEmitter {
 			return Promise.reject(
 				new Error('Iroh is not enabled; configure an Iroh endpoint factory')
 			);
+		if (this.irohRelayOnlyFailure)
+			return Promise.reject(this.irohRelayOnlyFailure);
 		if (this.irohEndpoint) return Promise.resolve(this.irohEndpoint);
 		if (!this.irohBinding) {
 			const { factory, ...config } = this.irohConfig;
+			const relayOnly = config.relayOnly === true;
 			this.irohBinding = factory({
 				...config,
+				...(relayOnly
+					? {
+							onRelayOnlyViolation: (error: IrohRelayOnlyError): void => {
+								this.irohRelayOnlyViolated(error);
+								config.onRelayOnlyViolation?.(error);
+							}
+					  }
+					: {}),
 				maxPendingInbound: this.maxPendingInbound,
 				handshakeTimeoutMs: this.inboundHandshakeTimeoutMs
 			})
 				.then(async (endpoint) => {
+					// A factory that ignored the option hands back an endpoint
+					// that offers its addresses to every peer.
+					if (relayOnly && !endpoint.relayOnly) {
+						await endpoint.close().catch(() => undefined);
+						throw new IrohRelayOnlyError(
+							'Iroh relay-only was asked for, and the endpoint factory did not provide it'
+						);
+					}
+					if (this.irohRelayOnlyFailure) {
+						await endpoint.close().catch(() => undefined);
+						throw this.irohRelayOnlyFailure;
+					}
 					if (this.connectionsDisabled()) {
 						await endpoint.close();
 						throw new Error('Iroh endpoint invalidated while binding');
@@ -1895,11 +1930,47 @@ export class PeerManager extends EventEmitter {
 					this.irohEndpoint = endpoint;
 					return endpoint;
 				})
+				.catch((err) => {
+					if (err instanceof IrohRelayOnlyError)
+						this.irohRelayOnlyFailure ??= err;
+					throw err;
+				})
 				.finally(() => {
 					this.irohBinding = undefined;
 				});
 		}
 		return this.irohBinding;
+	}
+
+	/**
+	 * A relay-only endpoint found a routable address in its own list and
+	 * closed itself, which drops every peer it carried. Stop offering the
+	 * link, keep the reason, and tell the node.
+	 */
+	private irohRelayOnlyViolated(error: IrohRelayOnlyError): void {
+		if (this.irohRelayOnlyFailure) return;
+		this.irohRelayOnlyFailure = error;
+		this.irohListening = false;
+		this.irohEndpoint = undefined;
+		this.emit('iroh:relay-only-violated', error);
+	}
+
+	/** Whether the Iroh endpoint was configured relay-only. */
+	isIrohRelayOnly(): boolean {
+		return this.irohConfig?.relayOnly === true;
+	}
+
+	/**
+	 * How the bound Iroh endpoint keeps to its relay: undefined when relay-only
+	 * was not asked for, or while no endpoint is bound.
+	 */
+	getIrohRelayOnlyMode(): IrohRelayOnlyMode | undefined {
+		return this.irohEndpoint?.relayOnly;
+	}
+
+	/** Why relay-only Iroh shut down, if it did. */
+	getIrohRelayOnlyFailure(): IrohRelayOnlyError | undefined {
+		return this.irohRelayOnlyFailure;
 	}
 
 	async listenIroh(): Promise<void> {
@@ -1926,8 +1997,12 @@ export class PeerManager extends EventEmitter {
 	getIrohConnectionString(): string | undefined {
 		if (!this.irohListening || !this.irohEndpoint) return undefined;
 		const address = this.irohEndpoint.address();
-		// Private discovery needs a relay hint before this URI is dialable.
-		if (this.irohConfig?.discovery === false && !address.relayUrl)
+		// Private discovery needs a relay hint before this URI is dialable,
+		// and a relay-only endpoint is reachable no other way.
+		if (
+			(this.irohConfig?.discovery === false || this.irohConfig?.relayOnly) &&
+			!address.relayUrl
+		)
 			return undefined;
 		return `${this.localPubkeyHex}@${formatIrohAddress(address)}`;
 	}

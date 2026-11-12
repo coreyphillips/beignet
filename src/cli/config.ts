@@ -467,6 +467,10 @@ export function resolveConfig(cliFlags: Partial<BeignetConfig>): BeignetConfig {
 			irohBooleanEnv('BEIGNET_IROH_DISCOVERY') ??
 			file.irohDiscovery,
 		irohRelays: cliFlags.irohRelays ?? irohRelaysEnv() ?? file.irohRelays,
+		irohRelayOnly:
+			cliFlags.irohRelayOnly ??
+			irohBooleanEnv('BEIGNET_IROH_RELAY_ONLY') ??
+			file.irohRelayOnly,
 		websocketPort:
 			cliFlags.websocketPort ||
 			(process.env.BEIGNET_WEBSOCKET_PORT
