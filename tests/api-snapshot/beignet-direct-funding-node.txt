@@ -11,6 +11,7 @@ method IDuplexTransport.markEstablished?(): void
 readonly property IDuplexTransport.remoteAddress?: string
 readonly property IDuplexTransport.remotePort?: number
 method IDuplexTransport.setKeepAlive(enable?: boolean, initialDelay?: number): this
+method IDuplexTransport.setNoDelay?(noDelay?: boolean): this
 method IDuplexTransport.setTimeout(timeout: number, callback?: () => void): this
 readonly property IDuplexTransport.transportType?: 'tcp' | 'ws' | 'iroh'
 readonly property IDuplexTransport.writableLength: number
