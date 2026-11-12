@@ -331,6 +331,8 @@ describe('Porch host', function () {
 
 		// The used standby is replaced, and the circuit is counted.
 		await waitFor(() => standbys() === 2, 'the replacement');
+		// The relay counts a standby a moment before the host hears `ready`.
+		await waitFor(() => h.status().idle === 2, 'the host hearing of it');
 		expect(h.status()).to.include({ state: 'ready', idle: 2, circuits: 1 });
 		expect(dials).to.equal(3);
 
@@ -357,6 +359,8 @@ describe('Porch host', function () {
 		};
 		await waitFor(() => circuits.length === 1, 'the circuit');
 		await waitFor(() => standbys() === 2, 'the replacement');
+		// The relay counts a standby a moment before the host hears `ready`.
+		await waitFor(() => h.status().idle === 2, 'the host hearing of it');
 		expect(h.status().circuits).to.equal(1);
 		// What Peer does with a transport it is done with.
 		circuits[0].removeAllListeners();

@@ -358,6 +358,11 @@ describe('Porch in the peer manager', function () {
 			expect(pm.isListening()).to.equal(true);
 			expect(pm.isListeningPorch()).to.equal(true);
 			await waitFor(() => relay.stats().standbys === 2, 'standbys');
+			// The relay counts a standby a moment before the host hears `ready`.
+			await waitFor(
+				() => pm.getPorchStatus()[0].idle === 2,
+				'the host hearing of it'
+			);
 			expect(pm.getPorchStatus()).to.deep.equal([
 				{ relay: `ws://${relayName}`, state: 'ready', idle: 2, circuits: 0 }
 			]);
