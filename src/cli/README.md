@@ -186,7 +186,7 @@ await node.destroy();
 | `iroh?` | `boolean` | Experimental phone link. Peers and relays can see your IP address. |
 | `irohRelays?` | `string[]` | Custom relays replace the public defaults. Empty disables relays. |
 | `irohDiscovery?` | `boolean` | Public endpoint discovery and publication (default true when enabled). |
-| `irohRelayOnly?` | `boolean` | Keep every Iroh connection on the relay (default false). No direct path is offered or taken, so someone who holds the node's Iroh link cannot learn its IP address; the relay operator still sees it. Slower than a direct path. Needs a relay, and learned addresses are then dialed through the SOCKS5 proxy or not at all. With an Iroh binding that cannot remove its IP transport, the node stops serving Iroh on a network whose router grants port mappings (see the Iroh section). |
+| `irohRelayOnly?` | `boolean` | Keep every Iroh connection on the relay (default false). No direct path is offered or taken, so someone who holds the node's Iroh link cannot learn its IP address; the relay operator still sees it. Slower than a direct path. Needs a relay, and learned addresses are then dialed through the SOCKS5 proxy or not at all. The node dials out over Iroh only with irohDiscovery off, and only to a peer on one of its own relays: any other relay would see its address. With an Iroh binding that cannot remove its IP transport, the node stops serving Iroh on a network whose router grants port mappings (see the Iroh section). |
 | `porchRelays?` | `(string \| IPorchRelayConfig)[]` | Porch relays to wait at, so the node can hand out `wss://` peer links that do not say where it runs. Each is a relay URL (`wss://host[:port]`), or `{ url, token }` for a relay that asks a node for a token. Unset or empty leaves Porch off. |
 | `porchVia?` | `PorchVia` | How the relays are dialed. `tor` sends every relay connection through the SOCKS5 proxy (torProxy, else 127.0.0.1:9050), so the relay does not learn the node's address either. `direct` dials them directly whatever torProxy says. Unset dials a relay as any other peer at that host. |
 | `porchProxy?` | `string` | A SOCKS5 proxy for the relay connections alone, as "host:port". Every relay is dialed through it and never directly, so the relay sees the proxy and not the node, while peers go on being dialed as torProxy says. Any SOCKS5 proxy that asks for no credentials will do: a second Tor, or a VPN or tunnel that offers one, at that detour's cost in time and not Tor's. Refused together with porchVia `direct`. |
@@ -2470,6 +2470,16 @@ What that costs and what it does not cover:
   direct-funding lane) through the SOCKS5 proxy (`BEIGNET_TOR_PROXY`) or not at
   all. Addresses you pass to `peer connect` yourself are dialed as before, and so
   is an address stored before the mode was switched on.
+- It dials out over Iroh only through its own relays (`irohRelays`, or n0's).
+  A dial reaches a peer through the peer's relay, that relay sees where the dial
+  comes from, and the peer picks it: as the relay in its link, and as the relay
+  in the record it publishes, which Iroh looks up on every dial while discovery
+  is on and then sends to as well. So with discovery on (the default) a
+  relay-only node makes no Iroh dial at all, and with `irohDiscovery` off it
+  dials only an address whose relay is one of its own. `peer connect` to any
+  other `iroh:` address fails before anything is sent, and says which of the two
+  it was. Peers connecting in are not affected, and the node goes on serving its
+  link.
 - `announceAddresses` still publishes what you put in it. Startup logs a warning
   when it holds a clearnet address.
 
