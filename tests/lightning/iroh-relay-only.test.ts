@@ -288,7 +288,35 @@ describe('Iroh relay-only: Node backend', () => {
 		await done;
 		expect(state.error).to.be.instanceOf(IrohRelayOnlyError);
 		expect(state.error?.message).to.contain('off loopback');
+		expect(state.error?.message).to.not.contain('disable_ipv6');
 		expect(fake.builders[0].endpoint.closed).to.equal(true);
+	});
+
+	it('says how to get the IPv6 loopback back where only IPv4 could be pinned', async () => {
+		// IPv6 switched off by sysctl: ::1 is gone, and Iroh's own IPv6 socket
+		// still binds, on every address.
+		fake = fakeIrohBinding({
+			failBind: (_builder, index) => index === 0,
+			endpoint: () => ({ sockets: ['127.0.0.1:4433', '[::]:4433'] })
+		});
+		const { state, done } = bind();
+		await done;
+		expect(fake.builders).to.have.length(2);
+		expect(state.error).to.be.instanceOf(IrohRelayOnlyError);
+		expect(state.error?.message).to.contain('1 socket(s) off loopback');
+		expect(state.error?.message).to.contain('net.ipv6.conf.lo.disable_ipv6=0');
+		expect(fake.builders[1].endpoint.closed).to.equal(true);
+	});
+
+	it('keeps that advice for the IPv6 socket alone', async () => {
+		fake = fakeIrohBinding({
+			failBind: (_builder, index) => index === 0,
+			endpoint: () => ({ sockets: ['0.0.0.0:4433', '[::]:4433'] })
+		});
+		const { state, done } = bind();
+		await done;
+		expect(state.error?.message).to.contain('2 socket(s) off loopback');
+		expect(state.error?.message).to.not.contain('disable_ipv6');
 	});
 
 	it('refuses an endpoint whose address list is routable as it binds', async () => {

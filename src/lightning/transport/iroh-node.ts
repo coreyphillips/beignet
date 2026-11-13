@@ -47,13 +47,14 @@ export async function createNodeIrohEndpoint(
 	}
 	if (options.relays !== undefined && options.relays.length === 0)
 		throw new Error('Iroh relay-only needs a relay; relays are disabled');
-	const { endpoint, mode } = await bindRelayOnly(binding, options);
+	const { endpoint, mode, ipv4Only } = await bindRelayOnly(binding, options);
 	try {
 		// A socket the pin did not cover would carry direct paths after all.
 		const sockets = routableSocketAddresses(endpoint.boundSockets());
 		if (sockets.length)
 			throw new IrohRelayOnlyError(
-				`Iroh relay-only could not be enforced: the endpoint bound ${sockets.length} socket(s) off loopback`
+				`Iroh relay-only could not be enforced: the endpoint bound ${sockets.length} socket(s) off loopback` +
+					(ipv4Only && sockets.every(isIpv6Wildcard) ? NO_IPV6_LOOPBACK : '')
 			);
 		const violation = relayOnlyViolation(endpoint, mode);
 		if (violation) throw violation;
@@ -99,7 +100,12 @@ function configure(
 async function bindRelayOnly(
 	binding: typeof Binding,
 	options: IIrohEndpointOptions
-): Promise<{ endpoint: Binding.Endpoint; mode: IrohRelayOnlyMode }> {
+): Promise<{
+	endpoint: Binding.Endpoint;
+	mode: IrohRelayOnlyMode;
+	/** The IPv6 loopback bind was refused, so only IPv4 is pinned. */
+	ipv4Only?: boolean;
+}> {
 	const first = configure(binding, options) as Binding.EndpointBuilder & {
 		clearIpTransports?: () => void;
 	};
@@ -114,13 +120,34 @@ async function bindRelayOnly(
 		for (const address of addresses) builder.bindAddr(address);
 		return builder.bind();
 	};
-	let endpoint: Binding.Endpoint;
 	try {
-		endpoint = await pinned(first, ['127.0.0.1:0', '[::1]:0']);
+		return {
+			endpoint: await pinned(first, ['127.0.0.1:0', '[::1]:0']),
+			mode: 'loopback-pin'
+		};
 	} catch {
-		endpoint = await pinned(configure(binding, options), ['127.0.0.1:0']);
+		return {
+			endpoint: await pinned(configure(binding, options), ['127.0.0.1:0']),
+			mode: 'loopback-pin',
+			ipv4Only: true
+		};
 	}
-	return { endpoint, mode: 'loopback-pin' };
+}
+
+/**
+ * What the IPv4-only retry leaves behind on a host that has IPv6 sockets and
+ * no IPv6 loopback address: Iroh's own IPv6 socket, on every address. Linux
+ * with IPv6 switched off by sysctl is such a host. The address comes back
+ * with the loopback interface alone, whatever the other interfaces are set to.
+ */
+const NO_IPV6_LOOPBACK =
+	'. Its IPv6 socket could not be pinned to ::1, most likely because IPv6 ' +
+	'is switched off on this host (sysctl net.ipv6.conf.all.disable_ipv6=1). ' +
+	'Switch it back on for the loopback interface alone ' +
+	'(net.ipv6.conf.lo.disable_ipv6=0); the other interfaces can stay as they are';
+
+function isIpv6Wildcard(address: string): boolean {
+	return /^\[::\]:\d+$/.test(address);
 }
 
 /**

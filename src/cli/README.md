@@ -2508,6 +2508,14 @@ node on a bridged container network (Umbrel's default), where no router answers.
 A mapping first granted while peers are connected can reach them in the moment
 before the endpoint closes.
 
+The pin needs the host's IPv6 loopback address as well as the IPv4 one. On Linux
+with IPv6 switched off by sysctl (`net.ipv6.conf.all.disable_ipv6=1`) there is
+no `::1`, while Iroh can still open an IPv6 socket, on every address. The node
+does not serve Iroh over such a socket: it refuses the bind, and
+`irohListenError` says why. Switching IPv6 back on for the loopback interface
+alone (`net.ipv6.conf.lo.disable_ipv6=0`) is enough, and the other interfaces
+can stay as they are.
+
 Iroh's discovery is not a second way out. With the default preset the endpoint
 publishes a signed record to n0's DNS server so that others can find it by its
 id, and the node does not hold that back during the watch. Iroh publishes relay
