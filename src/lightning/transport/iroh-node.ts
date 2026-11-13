@@ -12,8 +12,10 @@ import type {
 } from './iroh';
 import {
 	IROH_ALPN,
+	IrohRelayOnlyDialError,
 	IrohRelayOnlyError,
 	IrohTransport,
+	irohRelayOnlyDialRefusal,
 	normalizeIrohEndpointId,
 	routableSocketAddresses,
 	validateIrohRelayUrl
@@ -178,6 +180,7 @@ class NodeIrohEndpoint implements IIrohEndpoint {
 	 */
 	private settling?: Promise<void>;
 	private endSettling?: (error?: Error) => void;
+	private ownRelays?: string[];
 
 	constructor(
 		private readonly binding: typeof Binding,
@@ -233,6 +236,17 @@ class NodeIrohEndpoint implements IIrohEndpoint {
 		this.options.onRelayOnlyViolation?.(violation);
 	}
 
+	/**
+	 * The relays this endpoint was bound with (configure): the ones it was
+	 * given, or n0's production set, which is what both presets resolve to.
+	 */
+	private relays(): string[] {
+		this.ownRelays ??=
+			this.options.relays ??
+			this.binding.RelayMode.defaultMode().relayMap().urls();
+		return this.ownRelays;
+	}
+
 	address(): IIrohAddress {
 		// No relay while watched: without one the node publishes no link.
 		const relayUrl = this.settling
@@ -253,15 +267,24 @@ class NodeIrohEndpoint implements IIrohEndpoint {
 		timeoutMs: number
 	): Promise<IDuplexTransport> {
 		if (this.closed) throw new Error('Iroh endpoint is closed');
+		const relay = address.relayUrl
+			? validateIrohRelayUrl(address.relayUrl)
+			: undefined;
+		if (this.relayOnly) {
+			// Ahead of the watch: a dial that is refused has nothing to wait for.
+			const refusal = irohRelayOnlyDialRefusal(
+				{ relayUrl: relay },
+				this.options.discovery !== false,
+				this.relays()
+			);
+			if (refusal) throw new IrohRelayOnlyDialError(refusal);
+		}
 		if (this.settling) await withDeadline(this.settling, timeoutMs);
 		const id = this.binding.EndpointId.fromBytes(
 			Array.from(
 				Buffer.from(normalizeIrohEndpointId(address.endpointId), 'hex')
 			)
 		);
-		const relay = address.relayUrl
-			? validateIrohRelayUrl(address.relayUrl)
-			: undefined;
 		if (
 			this.options.discovery === false &&
 			!relay &&
