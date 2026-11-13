@@ -9143,6 +9143,9 @@ property transport.IWsFrame.masked: boolean
 property transport.IWsFrame.opcode: number
 property transport.IWsFrame.payload: Buffer
 type transport.IrohEndpointFactory = (options: transport.IIrohEndpointOptions) => Promise<transport.IIrohEndpoint>
+class transport.IrohRelayOnlyDialError extends Error
+constructor transport.IrohRelayOnlyDialError(message: string)
+readonly property transport.IrohRelayOnlyDialError.code = "IROH_RELAY_ONLY_DIAL_REFUSED"
 class transport.IrohRelayOnlyError extends Error
 constructor transport.IrohRelayOnlyError(message: string)
 readonly property transport.IrohRelayOnlyError.code = "IROH_RELAY_ONLY_VIOLATED"
@@ -9351,6 +9354,8 @@ function transport.inboundAddressKey(address: string | undefined): string | null
 function transport.initiatorAct1(state: transport.IHandshakeState, ephemeralPriv?: Buffer): Buffer
 function transport.initiatorAct3(state: transport.IHandshakeState): Buffer
 function transport.initiatorProcessAct2(state: transport.IHandshakeState, act2: Buffer): void
+function transport.irohRelayOnlyDialRefusal(address: Pick<transport.IIrohAddress, 'relayUrl'>, discovery: boolean, ownRelays: string[]): string | undefined
+function transport.irohRelayServer(value: string): string
 function transport.isLoopbackSocketAddress(address: string): boolean
 function transport.isPorchRouteId(value: unknown): value is string
 function transport.isPrivateOrLoopbackHost(host: string): boolean

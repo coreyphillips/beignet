@@ -10,8 +10,11 @@ import {
 	IIrohEndpoint,
 	IIrohEndpointOptions,
 	IrohEndpointFactory,
+	IrohRelayOnlyDialError,
 	IrohRelayOnlyError,
 	IrohRelayOnlyMode,
+	irohRelayOnlyDialRefusal,
+	irohRelayServer,
 	isLoopbackSocketAddress,
 	routableSocketAddresses
 } from '../../src/lightning/transport/iroh';
@@ -22,6 +25,10 @@ const sinon = require('sinon');
 
 const SECRET = Buffer.alloc(32, 1);
 const PUBLIC_ADDRESS = '203.0.113.9:4433';
+/** A valid endpoint id: the binding checks that it is a point on the curve. */
+const REMOTE_ID =
+	'd75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a';
+const OWN_RELAY = 'https://relay.example/';
 
 describe('isLoopbackSocketAddress', () => {
 	it('accepts loopback in every form Iroh prints', () => {
@@ -55,6 +62,65 @@ describe('isLoopbackSocketAddress', () => {
 		expect(
 			routableSocketAddresses(['127.0.0.1:1', PUBLIC_ADDRESS, '[::1]:2'])
 		).to.deep.equal([PUBLIC_ADDRESS]);
+	});
+});
+
+describe('irohRelayOnlyDialRefusal', () => {
+	it('names a relay server one way however its URL is spelled', () => {
+		for (const url of [
+			'https://relay.example/',
+			'https://relay.example',
+			'https://relay.example./',
+			'https://RELAY.Example:443/',
+			'https://relay.example/some/path?token=1'
+		])
+			expect(irohRelayServer(url), url).to.equal('https://relay.example');
+		expect(irohRelayServer('http://127.0.0.1:3340/')).to.equal(
+			'http://127.0.0.1:3340'
+		);
+		expect(() => irohRelayServer('ftp://relay.example/')).to.throw(
+			'http(s) URL'
+		);
+	});
+
+	it('refuses every dial while discovery is on, an own relay or not', () => {
+		for (const relayUrl of [OWN_RELAY, 'https://other.example/', undefined])
+			expect(
+				irohRelayOnlyDialRefusal({ relayUrl }, true, [OWN_RELAY]),
+				String(relayUrl)
+			).to.contain('discovery is on');
+	});
+
+	it('with discovery off, allows a relay of its own and refuses any other', () => {
+		const own = [OWN_RELAY, 'https://second.example:8443/'];
+		for (const relayUrl of [
+			'https://relay.example',
+			'https://relay.example./',
+			'https://second.example:8443/'
+		])
+			expect(
+				irohRelayOnlyDialRefusal({ relayUrl }, false, own),
+				relayUrl
+			).to.equal(undefined);
+		for (const relayUrl of [
+			'https://other.example/',
+			// The same name is another server on another scheme or port,
+			'http://relay.example/',
+			'https://relay.example:8443/',
+			'https://second.example/',
+			// and a name that only starts like an own relay is somebody else's.
+			'https://relay.example.other.example/'
+		]) {
+			const refusal = irohRelayOnlyDialRefusal({ relayUrl }, false, own);
+			expect(refusal, relayUrl).to.contain('not one of');
+			expect(refusal, relayUrl).to.contain(irohRelayServer(relayUrl));
+		}
+	});
+
+	it('leaves an address that names no relay to the caller', () => {
+		expect(irohRelayOnlyDialRefusal({}, false, [OWN_RELAY])).to.equal(
+			undefined
+		);
 	});
 });
 
@@ -180,14 +246,10 @@ describe('Iroh relay-only: Node backend', () => {
 
 	it('holds an outbound dial until the watch is over', async () => {
 		fake = fakeIrohBinding();
-		const { state, done } = bind();
+		const { state, done } = bind({ discovery: false, relays: [OWN_RELAY] });
 		await done;
 		const endpoint = state.endpoint as IIrohEndpoint;
-		const target = {
-			endpointId:
-				'd75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a',
-			relayUrl: 'https://relay.example/'
-		};
+		const target = { endpointId: REMOTE_ID, relayUrl: OWN_RELAY };
 		const failure = (promise: Promise<unknown>): Promise<Error> =>
 			promise.then(
 				() => new Error('connected'),
@@ -243,14 +305,16 @@ describe('Iroh relay-only: Node backend', () => {
 		fake = fakeIrohBinding();
 		const violations: IrohRelayOnlyError[] = [];
 		const { state, done } = bind({
+			discovery: false,
+			relays: [OWN_RELAY],
 			onRelayOnlyViolation: (error) => violations.push(error)
 		});
 		await done;
 		const endpoint = state.endpoint as IIrohEndpoint;
-		fake.builders[0].endpoint.relayUrl = 'https://relay.example/';
+		fake.builders[0].endpoint.relayUrl = OWN_RELAY;
 		endpoint.listen(noop, noop);
 		const dial = endpoint
-			.connect({ endpointId: 'ab'.repeat(32) }, 20_000)
+			.connect({ endpointId: REMOTE_ID, relayUrl: OWN_RELAY }, 20_000)
 			.catch((error: Error) => error);
 		await clock.tickAsync(3_000);
 		expect(violations).to.deep.equal([]);
@@ -318,6 +382,110 @@ describe('Iroh relay-only: Node backend', () => {
 			).to.throw('closed');
 		});
 	}
+
+	/** What a dial ends in: the refusal, or the fake binding's 'no route'. */
+	const dialed = (endpoint: IIrohEndpoint, relayUrl?: string): Promise<Error> =>
+		endpoint.connect({ endpointId: REMOTE_ID, relayUrl }, 20_000).then(
+			() => new Error('connected'),
+			(error: Error) => error
+		);
+
+	it('refuses every outbound dial while discovery is on, at once and with nothing sent', async () => {
+		fake = fakeIrohBinding();
+		const { state, done } = bind();
+		await done;
+		const endpoint = state.endpoint as IIrohEndpoint;
+		const [own] = require('@number0/iroh/index.js')
+			.RelayMode.defaultMode()
+			.relayMap()
+			.urls();
+		// The watch has twelve seconds to run and the clock is not moved: the
+		// refusal does not wait for it.
+		for (const relayUrl of [own, 'https://other.example/', undefined]) {
+			const error = await dialed(endpoint, relayUrl);
+			expect(error, String(relayUrl)).to.be.instanceOf(IrohRelayOnlyDialError);
+			expect((error as IrohRelayOnlyDialError).code).to.equal(
+				'IROH_RELAY_ONLY_DIAL_REFUSED'
+			);
+			expect(error.message).to.contain('discovery is on');
+		}
+		await clock.tickAsync(20_000);
+		expect(fake.builders[0].endpoint.connects).to.equal(0);
+		// A refused dial is not a violation: the endpoint goes on serving.
+		expect(fake.builders[0].endpoint.closed).to.equal(false);
+		endpoint.listen(noop, noop);
+		expect(advertised()).to.have.length(1);
+	});
+
+	it("with discovery off, dials through n0's relays when it was given none, and through no other", async () => {
+		fake = fakeIrohBinding();
+		const { state, done } = bind({ discovery: false });
+		await done;
+		await clock.tickAsync(12_000);
+		const endpoint = state.endpoint as IIrohEndpoint;
+		const relays: string[] = require('@number0/iroh/index.js')
+			.RelayMode.defaultMode()
+			.relayMap()
+			.urls();
+		expect(relays.length).to.be.greaterThan(1);
+		// Iroh prints its relays as fully qualified names; a link may not.
+		const allowed = [...relays, relays[0].replace('./', '/')];
+		for (const relayUrl of allowed)
+			expect((await dialed(endpoint, relayUrl)).message, relayUrl).to.equal(
+				'no route'
+			);
+		expect(fake.builders[0].endpoint.connects).to.equal(allowed.length);
+		for (const relayUrl of [
+			'https://other.example/',
+			relays[0].replace('https:', 'http:'),
+			relays[0].replace('./', '.other.example/')
+		]) {
+			const error = await dialed(endpoint, relayUrl);
+			expect(error, relayUrl).to.be.instanceOf(IrohRelayOnlyDialError);
+			expect(error.message).to.contain(irohRelayServer(relayUrl));
+		}
+		expect(fake.builders[0].endpoint.connects).to.equal(allowed.length);
+		expect(fake.builders[0].endpoint.closed).to.equal(false);
+	});
+
+	it('with discovery off and relays of its own, dials through those alone', async () => {
+		fake = fakeIrohBinding();
+		const { state, done } = bind({ discovery: false, relays: [OWN_RELAY] });
+		await done;
+		await clock.tickAsync(12_000);
+		const endpoint = state.endpoint as IIrohEndpoint;
+		expect((await dialed(endpoint, 'https://relay.example')).message).to.equal(
+			'no route'
+		);
+		const [n0] = require('@number0/iroh/index.js')
+			.RelayMode.defaultMode()
+			.relayMap()
+			.urls();
+		expect(await dialed(endpoint, n0)).to.be.instanceOf(IrohRelayOnlyDialError);
+		expect(fake.builders[0].endpoint.connects).to.equal(1);
+	});
+
+	it('removing the IP transport does not lift the rule', async () => {
+		fake = fakeIrohBinding({ native: true });
+		const { state, done } = bind();
+		await done;
+		expect(state.endpoint?.relayOnly).to.equal('native');
+		expect(
+			await dialed(state.endpoint as IIrohEndpoint, 'https://other.example/')
+		).to.be.instanceOf(IrohRelayOnlyDialError);
+		expect(fake.builders[0].endpoint.connects).to.equal(0);
+	});
+
+	it('leaves the dials of an endpoint that is not relay-only alone', async () => {
+		fake = fakeIrohBinding();
+		const { state, done } = bind({ relayOnly: false });
+		await done;
+		expect(
+			(await dialed(state.endpoint as IIrohEndpoint, 'https://other.example/'))
+				.message
+		).to.equal('no route');
+		expect(fake.builders[0].endpoint.connects).to.equal(1);
+	});
 
 	it('refuses relay-only with relays disabled, before binding anything', async () => {
 		fake = fakeIrohBinding();
@@ -473,6 +641,35 @@ describe('Iroh relay-only: PeerManager', () => {
 		);
 		expect(dial).to.be.instanceOf(Error);
 		expect(binds).to.equal(1);
+	});
+
+	it('passes a refused dial on as a failed dial, and keeps serving the link', async () => {
+		const endpoint = stubEndpoint('loopback-pin');
+		endpoint.relayUrl = OWN_RELAY;
+		const refusal = new IrohRelayOnlyDialError('not one of its own relays');
+		endpoint.connect = (): Promise<never> => Promise.reject(refusal);
+		const pm = manager(async () => endpoint);
+		await pm.listenIroh();
+		const link = pm.getIrohConnectionString();
+		const dial = await rejection(
+			pm.connectPeer(
+				'02' + 'cd'.repeat(32),
+				REMOTE_ID,
+				0,
+				{
+					type: 'iroh',
+					endpointId: REMOTE_ID,
+					relayUrl: 'https://other.example/'
+				},
+				{ reconnect: false, timeoutMs: 500 }
+			)
+		);
+		expect(dial).to.equal(refusal);
+		expect(pm.getIrohRelayOnlyFailure()).to.equal(undefined);
+		expect(pm.getIrohRelayOnlyMode()).to.equal('loopback-pin');
+		expect(pm.isListening()).to.equal(true);
+		expect(pm.getIrohConnectionString()).to.equal(link);
+		expect(endpoint.closed).to.equal(false);
 	});
 
 	it('takes any endpoint when relay-only was not asked for', async () => {
