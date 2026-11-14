@@ -10841,6 +10841,71 @@ describe('Splice', function () {
 				expectFailedOnTheWire(h, /Invalid batched splice commitment signature/);
 			});
 
+			/**
+			 * Issue #2063: the current-funding member is checked by the standard
+			 * path under a borrowed NORMAL, and restoring SPLICING afterwards used
+			 * to overwrite the ERRORED it set. The wire error went out while the
+			 * channel stayed live, persisted as SPLICING, with no channel:errored.
+			 */
+			function corruptCurrentMember(
+				h: IBatchHarness,
+				edit: (m: ReturnType<typeof decodeCommitmentSignedMessage>) => void
+			): void {
+				const current = h.pair.acceptorChannel.getFullState().fundingTxid!;
+				const index = decodeCommitmentSignedMessage(
+					h.round[2].payload
+				).fundingTxid!.equals(current)
+					? 2
+					: 3;
+				replaceMember(h, index, edit);
+			}
+
+			function expectFailedLocally(
+				h: IBatchHarness,
+				deliverRound: () => void
+			): void {
+				const persisted: ChannelState[] = [];
+				onPersist(h.pair.acceptorManager, ({ channel }) => {
+					if (channel === h.pair.acceptorChannel) {
+						persisted.push(channel.getState());
+					}
+				});
+				const errored: Buffer[] = [];
+				h.pair.acceptorManager.on('channel:errored', (channelId) =>
+					errored.push(channelId)
+				);
+				deliverRound();
+				expect(persisted[persisted.length - 1], 'persisted state').to.equal(
+					ChannelState.ERRORED
+				);
+				expect(errored.length, 'one channel:errored').to.equal(1);
+				expect(errored[0].equals(h.pair.channelId)).to.equal(true);
+				expect(h.pair.acceptorChannel.acceptsNewHtlcs()).to.equal(false);
+			}
+
+			it('a batch with an invalid current-funding commitment signature fails the channel (issue #2063)', function () {
+				const h = batchRound();
+				corruptCurrentMember(h, (m) => {
+					m.signature = Buffer.from(m.signature);
+					m.signature[10] ^= 0xff;
+				});
+				expectFailedLocally(h, () => deliver(h, h.round));
+				expectFailedOnTheWire(h, /^Invalid commitment signature on channel/);
+			});
+
+			it('a batch with an invalid current-funding HTLC signature fails the channel (issue #2063)', function () {
+				const h = batchRound();
+				corruptCurrentMember(h, (m) => {
+					expect(m.htlcSignatures.length, 'the staged HTLC is signed').to.equal(
+						1
+					);
+					m.htlcSignatures = [Buffer.from(m.htlcSignatures[0])];
+					m.htlcSignatures[0][10] ^= 0xff;
+				});
+				expectFailedLocally(h, () => deliver(h, h.round));
+				expectFailedOnTheWire(h, /^Invalid HTLC signature$/);
+			});
+
 			it('a splice_locked for a txid that is no pending splice draws a warning and a disconnect, and the splice stays pending', function () {
 				const { acceptorManager, acceptorChannel, channelId, openerPubkey } =
 					pendingLockPair();
