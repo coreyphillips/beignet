@@ -15942,13 +15942,17 @@ export class Channel {
 		// verifies at the same post-round height, adopts any staged feerate,
 		// advances the commitment number and emits the single revoke_and_ack
 		// for the whole batch). The state briefly reads NORMAL so the standard
-		// branch accepts it; SPLICING is restored either way.
+		// branch accepts it. Only that NORMAL is undone: a state the standard
+		// path moved to (ERRORED on a bad signature) must survive, or the
+		// manager persists a live channel and never emits channel:errored.
 		let actions: ChannelAction[];
 		this._state.state = ChannelState.NORMAL;
 		try {
 			actions = this.handleCommitmentSigned(currentMsg);
 		} finally {
-			this._state.state = ChannelState.SPLICING;
+			if (this._state.state === ChannelState.NORMAL) {
+				this._state.state = ChannelState.SPLICING;
+			}
 		}
 
 		const failed = actions.some((a) => a.type === ChannelActionType.ERROR);
