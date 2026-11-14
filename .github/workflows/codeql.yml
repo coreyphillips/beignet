@@ -1,0 +1,54 @@
+name: codeql
+
+on:
+  workflow_dispatch:
+  pull_request:
+  # Pushes to master give pull request results a baseline to compare with.
+  push:
+    branches: [master]
+  # Weekly as well: new queries in a CodeQL release run against unchanged code.
+  schedule:
+    - cron: '41 5 * * 1'
+
+permissions:
+  contents: read
+
+# A new push to a pull request cancels that pull request's run in progress.
+# Every other event gets a group of its own (the run id), so master pushes
+# never wait on or cancel each other.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  analyze:
+    name: Analyze JavaScript and TypeScript
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+
+    steps:
+      - name: Check out Git repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+
+      # JavaScript and TypeScript are extracted from source, so no install or
+      # build. Only src/ is analysed: it is all that ships (dist/ is built from
+      # it), and tests/, scripts/ and example/ would bury its alerts under
+      # fixture keys, test randomness and local tooling.
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
+        with:
+          languages: javascript-typescript
+          build-mode: none
+          queries: security-extended
+          config: |
+            paths:
+              - src
+
+      - name: Analyze
+        uses: github/codeql-action/analyze@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
+        with:
+          category: /language:javascript-typescript

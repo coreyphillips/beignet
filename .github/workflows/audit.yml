@@ -5,6 +5,10 @@ on:
   pull_request:
   push:
     branches: [master]
+  # Weekly as well: an advisory published against an unchanged lockfile
+  # fails here before it fails someone's unrelated pull request.
+  schedule:
+    - cron: '17 6 * * 1'
 
 permissions:
   contents: read
@@ -46,5 +50,8 @@ jobs:
       - name: Audit the dependencies that ship
         run: npm audit --audit-level=moderate --omit=dev
 
+      # Runs even when the first gate fails, so the job summary always lists
+      # the exceptions and the days each has left.
       - name: Audit everything, with the exceptions in audit-allowlist.json
+        if: ${{ !cancelled() }}
         run: node scripts/audit-gate.js
