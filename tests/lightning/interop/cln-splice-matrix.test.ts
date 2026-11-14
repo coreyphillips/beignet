@@ -17,6 +17,8 @@
  *      until the owner's witness is delivered out of band (issue #592)
  *   D1 mid-splice disconnect after the commitment round (beignet's
  *      tx_signatures dropped) -> reconnect -> next_funding_txid resume
+ *   F1 the splice reaches its depth while disconnected -> beignet's lock
+ *      reaches CLN only through my_current_funding_locked (issue #2042)
  *
  * Not here: a restart while a pending-lock commitment batch is un-acked
  * (issue #2043). These nodes keep no storage, so they cannot restart. A node
@@ -789,6 +791,135 @@ describe('Interop: Beignet ↔ CLN splice matrix (regtest)', function () {
 			const spliceTxid = await confirmSplice(node, channelId, null);
 			await waitForSpliceComplete(node, channelId, oldTxid, 90_000);
 			await waitForClnSplicedNormal(node.getNodeId(), spliceTxid);
+		});
+	});
+
+	// ── Tier F: a lock that crosses a disconnect (issue #2042) ──
+	// The splice reaches its depth while the two are apart, so neither side
+	// can send splice_locked. beignet's lock travels only in its
+	// channel_reestablish's my_current_funding_locked. CLN v26.06.1 names the
+	// old funding there (its channel daemon learns the depth from the next
+	// block) and then sends splice_locked.
+	describe('Tier F: lock recovered across a disconnect', function () {
+		it('F1: depth reached while disconnected, beignet locks through my_current_funding_locked', async function () {
+			if (skipAll) this.skip();
+			const setup = await setupClnChannel(
+				cln,
+				clnPubkey,
+				225,
+				900_000,
+				300_000_000
+			);
+			const node = setup.node;
+			nodes.push(node);
+			const channelId = setup.channelId;
+			const cm = node.getChannelManager();
+			const oldTxid = Buffer.from(
+				cm.getChannel(channelId)!.getFullState().fundingTxid!
+			).toString('hex');
+
+			const res = node.spliceOut(channelId, 40_000n, 1000);
+			expect(res.ok, res.error).to.equal(true);
+			const lockDeadline = Date.now() + 30_000;
+			while (
+				Date.now() < lockDeadline &&
+				!cm.getChannel(channelId)!.isSplicePendingLock()
+			) {
+				await sleep(500);
+			}
+			const spliceTxid = spliceTxidHex(node, channelId);
+			expect(spliceTxid, 'splice txid known').to.not.equal(null);
+			const seenDeadline = Date.now() + 30_000;
+			let seen = false;
+			while (!seen && Date.now() < seenDeadline) {
+				try {
+					await bitcoinRpc('getrawtransaction', [spliceTxid!]);
+					seen = true;
+				} catch {
+					await sleep(1000);
+				}
+			}
+			expect(seen, 'splice tx broadcast').to.equal(true);
+			// Let beignet's tx_signatures reach CLN before the cut.
+			await sleep(3000);
+
+			node.disconnectPeer(clnPubkey);
+			await sleep(2000);
+			await mineBlocks(6);
+			await waitForClnSync(cln);
+			// No chain backend in this harness: record the confirmation the way
+			// the node does when splice_locked cannot be sent.
+			cm.getChannel(channelId)!.markSpliceConfirmed();
+
+			const channel = cm.getChannel(channelId)!;
+			const received: Array<Buffer | undefined> = [];
+			const handle = channel.handleReestablish.bind(channel);
+			channel.handleReestablish = (msg): ReturnType<typeof handle> => {
+				received.push(msg.myCurrentFundingLocked?.txid);
+				return handle(msg);
+			};
+			const pm = (
+				node as unknown as {
+					peerManager: {
+						sendToPeer(pk: string, type: number, payload: Buffer): void;
+					};
+				}
+			).peerManager;
+			const realSend = pm.sendToPeer.bind(pm);
+			let spliceLockedSent = 0;
+			pm.sendToPeer = (pk: string, type: number, payload: Buffer): void => {
+				if (type === MessageType.SPLICE_LOCKED) spliceLockedSent++;
+				realSend(pk, type, payload);
+			};
+
+			await node.connectPeer(clnPubkey, CLN_P2P_HOST, CLN_P2P_PORT);
+			// CLN's channel daemon learns a splice's depth from block
+			// notifications, and the one that ran during the disconnect is gone.
+			await sleep(3000);
+			await mineBlocks(1);
+			const named = (): string =>
+				received
+					.map((t) => (t ? Buffer.from(t).reverse().toString('hex') : 'none'))
+					.join(',');
+			try {
+				await waitForSpliceComplete(node, channelId, oldTxid, 90_000);
+				await waitForClnSplicedNormal(node.getNodeId(), spliceTxid!);
+			} catch (err) {
+				throw new Error(
+					`${
+						(err as Error).message
+					} (CLN my_current_funding_locked: ${named()}; beignet splice_locked sent: ${spliceLockedSent})`
+				);
+			}
+			pm.sendToPeer = realSend;
+			console.log(
+				`    F1 CLN my_current_funding_locked: ${named()} (splice ${spliceTxid}, old ${Buffer.from(
+					oldTxid,
+					'hex'
+				)
+					.reverse()
+					.toString('hex')})`
+			);
+
+			// beignet sent no splice_locked, so its lock reached CLN only in its
+			// reestablish: CLN completing proves it read the TLV.
+			expect(received.length, 'CLN reestablished').to.be.gte(1);
+			expect(received[0], 'CLN sent my_current_funding_locked').to.not.equal(
+				undefined
+			);
+			expect(spliceLockedSent, 'beignet sent no splice_locked').to.equal(0);
+
+			const invoice = node.createInvoice({
+				amountMsat: 10_000_000n,
+				description: 'tier-f1'
+			});
+			const payResult = await Promise.race([
+				cln.pay(invoice.bolt11),
+				sleep(60_000).then(() => {
+					throw new Error('CLN pay timed out after the recovered lock');
+				})
+			]);
+			expect(payResult.status).to.equal('complete');
 		});
 	});
 

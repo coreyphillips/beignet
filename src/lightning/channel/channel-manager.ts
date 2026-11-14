@@ -2680,6 +2680,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 	 * re-entrant handler throwing out of the action loop.
 	 */
 	private sendReestablish(peerPubkey: string, channel: Channel): void {
+		channel.setSpliceNegotiated(this.peerSupportsSplicing(peerPubkey));
 		const actions = channel.createReestablish();
 		const missing = channel.takeReestablishSecretMissingNotice();
 		if (missing) {

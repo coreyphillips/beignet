@@ -14,6 +14,10 @@
  *     sent commitment_signed for the new funding tx but have not received the
  *     peer's tx_signatures. Flags bit 0 = "retransmit your commitment_signed".
  *     (Decode also accepts legacy type 0 = bare 32-byte txid.)
+ *   type 5 (my_current_funding_locked): [32: txid][1: retransmit_flags] -
+ *     the funding tx the sender last locked (splice_locked, or channel_ready
+ *     for the original funding), same byte order. Flags bit 0 = "retransmit
+ *     your announcement_signatures".
  */
 
 import type { ITlvRecord } from './tlv';
@@ -47,12 +51,28 @@ export interface IChannelReestablishMessage {
 	 */
 	nextLocalNonce?: Buffer;
 	/**
+	 * Splice spec (bolts#1160) TLV 5: the funding tx the sender last locked.
+	 * A receiver treats it as a splice_locked for that txid, which is how a
+	 * lock lost across a disconnect is recovered.
+	 */
+	myCurrentFundingLocked?: IMyCurrentFundingLocked;
+	/**
 	 * FFOR (docs/specs/ffor-offline-receive.md section 11.1): TLV 55001, the
 	 * epoch id, lifecycle state, last_seq and H_act of the channel's epoch.
 	 * Odd, so a peer without the feature ignores it.
 	 */
 	ffor?: IFforReestablishTlv;
 }
+
+export interface IMyCurrentFundingLocked {
+	/** Internal byte order, as in splice_locked and tx_signatures. */
+	txid: Buffer;
+	/** Bit 0 ({@link RETRANSMIT_ANNOUNCEMENT_SIGNATURES}) asks for announcement_signatures. */
+	retransmitFlags: number;
+}
+
+/** my_current_funding_locked retransmit_flags bit 0. */
+export const RETRANSMIT_ANNOUNCEMENT_SIGNATURES = 1;
 
 const CHANNEL_REESTABLISH_LENGTH = 113; // 32 + 8 + 8 + 32 + 33
 
@@ -66,10 +86,12 @@ const TLV_NEXT_FUNDING = 1n;
 const TLV_NEXT_FUNDING_LEGACY = 0n;
 /** option_taproot verification nonce (LND local_nonce convention). */
 const TLV_NEXT_LOCAL_NONCE = 4n;
+const TLV_MY_CURRENT_FUNDING_LOCKED = 5n;
 const CHANNEL_REESTABLISH_TLV_TYPES = new Set<bigint>([
 	TLV_NEXT_FUNDING_LEGACY,
 	TLV_NEXT_FUNDING,
 	TLV_NEXT_LOCAL_NONCE,
+	TLV_MY_CURRENT_FUNDING_LOCKED,
 	FF_REESTABLISH_TLV_TYPE
 ]);
 
@@ -118,6 +140,18 @@ export function encodeChannelReestablishMessage(
 		tlvRecords.push({
 			type: TLV_NEXT_LOCAL_NONCE,
 			value: msg.nextLocalNonce
+		});
+	}
+	if (msg.myCurrentFundingLocked) {
+		const { txid, retransmitFlags } = msg.myCurrentFundingLocked;
+		if (txid.length !== 32) {
+			throw new Error(
+				`my_current_funding_locked txid must be 32 bytes, got ${txid.length}`
+			);
+		}
+		tlvRecords.push({
+			type: TLV_MY_CURRENT_FUNDING_LOCKED,
+			value: Buffer.concat([txid, Buffer.from([retransmitFlags & 0xff])])
 		});
 	}
 	if (msg.ffor) {
@@ -192,6 +226,16 @@ export function decodeChannelReestablishMessage(
 				record.value.length === 66
 			) {
 				result.nextLocalNonce = Buffer.from(record.value);
+			} else if (
+				record.type === TLV_MY_CURRENT_FUNDING_LOCKED &&
+				record.value.length >= 33
+			) {
+				// A short record is dropped like any malformed odd TLV; bytes past
+				// the flags are left for a future extension.
+				result.myCurrentFundingLocked = {
+					txid: Buffer.from(record.value.subarray(0, 32)),
+					retransmitFlags: record.value[32]
+				};
 			} else if (record.type === FF_REESTABLISH_TLV_TYPE) {
 				// A malformed epoch TLV is a peer bug in an odd record: drop
 				// the record rather than the whole reestablish.

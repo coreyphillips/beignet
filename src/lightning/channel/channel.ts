@@ -80,8 +80,14 @@ import {
 	closingOutputDustLimit,
 	minRelayFeeForWeight
 } from '../chain/closing';
-import type { IChannelReestablishMessage } from '../message/channel-reestablish';
-import { encodeChannelReestablishMessage } from '../message/channel-reestablish';
+import type {
+	IChannelReestablishMessage,
+	IMyCurrentFundingLocked
+} from '../message/channel-reestablish';
+import {
+	encodeChannelReestablishMessage,
+	RETRANSMIT_ANNOUNCEMENT_SIGNATURES
+} from '../message/channel-reestablish';
 import { canScopeWireError, encodeErrorMessage } from '../message/error';
 import type {
 	ChannelAction,
@@ -1209,6 +1215,20 @@ export class Channel {
 	// tx_abort) by retransmitting ours. Without the latch two nodes that both
 	// retransmit would ping-pong reestablish forever.
 	private _reestablishRetransmitted = false;
+	// option_splice negotiated on the current connection: gates sending
+	// my_current_funding_locked (TLV 5) on channel_reestablish. Set by the
+	// manager before each reestablish; false for a channel driven directly.
+	private _spliceNegotiated = false;
+	// The txid our last channel_reestablish carried in
+	// my_current_funding_locked, or null when it carried none.
+	private _sentFundingLockedTxid: Buffer | null = null;
+	// A peer's my_current_funding_locked naming our in-flight splice while we
+	// still lack its tx_signatures. Applied when they arrive; cleared on
+	// disconnect, since the next reestablish carries the TLV again.
+	private _pendingRemoteSpliceLockTxid: Buffer | null = null;
+	// The peer's last reestablish asked for our announcement_signatures for
+	// the funding we are now on (my_current_funding_locked flag bit 0).
+	private _announcementSigsRequested = false;
 	// Splice-out only: where withdrawn funds are paid (wallet-owned script) and
 	// how much. Set by the node when it requests a splice-out.
 	private _spliceOutDestination: { script: Buffer; sats: bigint } | null = null;
@@ -9109,6 +9129,25 @@ export class Channel {
 		this._state.closingFeeMax = max < openerBalance ? max : openerBalance;
 	}
 
+	/**
+	 * Whether option_splice was negotiated on the current connection. Set by
+	 * the manager before it builds a channel_reestablish: the splice spec only
+	 * puts my_current_funding_locked on the wire when it was. Receiving the
+	 * TLV is not gated, since only a splice we negotiated can match it.
+	 */
+	setSpliceNegotiated(negotiated: boolean): void {
+		this._spliceNegotiated = negotiated;
+	}
+
+	/**
+	 * The peer's last channel_reestablish asked us to retransmit our
+	 * announcement_signatures for the current funding (my_current_funding_locked
+	 * retransmit_flags bit 0). Cleared on disconnect.
+	 */
+	isAnnouncementSignaturesRequested(): boolean {
+		return this._announcementSigsRequested;
+	}
+
 	// ─────────────── option_simple_close ───────────────
 
 	/**
@@ -10031,6 +10070,8 @@ export class Channel {
 		this._txAbortSent = false;
 		this._spliceAbortIgnoreCommitment = false;
 		this._reestablishRetransmitted = false;
+		this._pendingRemoteSpliceLockTxid = null;
+		this._announcementSigsRequested = false;
 		this._announcements.handleDisconnect();
 		// Any coins selected for a raise the peer never acked go back to the
 		// wallet: the request dies here, so nothing will ever spend them.
@@ -10535,6 +10576,19 @@ export class Channel {
 			}
 		}
 
+		const lockedTxid = this._spliceNegotiated
+			? this._myCurrentFundingLockedTxid()
+			: null;
+		this._sentFundingLockedTxid = lockedTxid;
+		if (lockedTxid) {
+			msg.myCurrentFundingLocked = {
+				txid: lockedTxid,
+				retransmitFlags: this._wantsAnnouncementSignatures(lockedTxid)
+					? RETRANSMIT_ANNOUNCEMENT_SIGNATURES
+					: 0
+			};
+		}
+
 		const actions: ChannelAction[] = [];
 
 		// We dropped an unresumable splice; the peer may still hold it in-flight.
@@ -10644,6 +10698,55 @@ export class Channel {
 	}
 
 	/**
+	 * my_current_funding_locked for our channel_reestablish, by the splice
+	 * spec's three rules in order: a splice that reached its lock depth while
+	 * we were disconnected, else the last splice we sent splice_locked for,
+	 * else the funding we sent channel_ready for. Null before channel_ready.
+	 *
+	 * A completed splice is the channel's funding from then on, so the last
+	 * two rules both name fundingTxid once nothing is in flight.
+	 */
+	private _myCurrentFundingLockedTxid(): Buffer | null {
+		const spliceTxid = this._lockableSpliceTxid();
+		if (spliceTxid) return spliceTxid;
+		if (!this._state.localChannelReady || !this._state.fundingTxid) return null;
+		return Buffer.from(this._state.fundingTxid);
+	}
+
+	/**
+	 * The in-flight splice's txid when we have locked it, or may lock it now
+	 * because it confirmed while splice_locked could not be sent. Null
+	 * otherwise. handleReestablish records the second case as our lock, so the
+	 * value sent in my_current_funding_locked and our state agree.
+	 */
+	private _lockableSpliceTxid(): Buffer | null {
+		const inflight = this._state.spliceInFlight;
+		const session = this._spliceSession;
+		const txid = inflight?.spliceTxid ?? session?.getSpliceTxid() ?? null;
+		if (!txid) return null;
+		if (inflight?.localSpliceLocked || session?.hasSentSpliceLocked()) {
+			return Buffer.from(txid);
+		}
+		if (inflight?.confirmed && inflight.receivedTxSignatures) {
+			return Buffer.from(txid);
+		}
+		return null;
+	}
+
+	/**
+	 * retransmit_flags bit 0 for my_current_funding_locked: set on a public
+	 * channel when we hold no announcement_signatures from the peer for that
+	 * funding. A splice that is not yet adopted has none by definition: the
+	 * announcement state is reset when it completes.
+	 */
+	private _wantsAnnouncementSignatures(lockedTxid: Buffer): boolean {
+		if (!this._state.announceChannel) return false;
+		const current = this._state.fundingTxid;
+		if (!current || !lockedTxid.equals(current)) return true;
+		return !this._state.announcementSigsReceived;
+	}
+
+	/**
 	 * The txid of an in-flight v2 open whose signature exchange is incomplete
 	 * (the condition for setting next_funding_txid on channel_reestablish), or
 	 * null. Unlike the splice regime above (announce until locked), BOLT 2
@@ -10750,28 +10853,72 @@ export class Channel {
 			}
 		}
 
-		// ── splice_locked retransmission (analogous to channel_ready) ──
+		// ── Lock recovery ──
+		// A peer that sends my_current_funding_locked reads ours too (splice
+		// spec). When our reestablish named this splice, our lock already
+		// reached the peer, and a splice_locked on top is a duplicate some
+		// peers fail the channel for. Any other peer still gets the message.
+		const lockReachedPeer =
+			msg.myCurrentFundingLocked !== undefined &&
+			!!ourSpliceTxid &&
+			!!this._sentFundingLockedTxid?.equals(ourSpliceTxid);
 		if (this._state.state === ChannelState.SPLICING && this._state.channelId) {
 			if (
 				(inflight?.localSpliceLocked || session?.hasSentSpliceLocked()) &&
 				ourSpliceTxid
 			) {
-				actions.push(
-					sendMsg(
-						MessageType.SPLICE_LOCKED,
-						encodeSpliceLockedMessage({
-							channelId: this._state.channelId,
-							fundingTxid: ourSpliceTxid
-						})
-					)
-				);
+				if (!lockReachedPeer) {
+					actions.push(
+						sendMsg(
+							MessageType.SPLICE_LOCKED,
+							encodeSpliceLockedMessage({
+								channelId: this._state.channelId,
+								fundingTxid: ourSpliceTxid
+							})
+						)
+					);
+				}
 			} else if (inflight?.confirmed && inflight.receivedTxSignatures) {
 				// The splice tx confirmed while we were disconnected: lock it now.
-				actions.push(...this.sendSpliceLocked());
+				actions.push(...this._lockSplice(!lockReachedPeer));
 			}
+		}
+		if (msg.myCurrentFundingLocked) {
+			actions.push(
+				...this._applyRemoteFundingLocked(msg.myCurrentFundingLocked)
+			);
 		}
 
 		return actions;
+	}
+
+	/**
+	 * The peer's my_current_funding_locked, processed as a splice_locked for
+	 * that txid (splice spec). Only our in-flight splice's txid can lock
+	 * anything: the current funding txid means nothing new, and any other txid
+	 * names a transaction this channel cannot adopt, so it is ignored.
+	 */
+	private _applyRemoteFundingLocked(
+		locked: IMyCurrentFundingLocked
+	): ChannelAction[] {
+		const session = this._spliceSession;
+		if (this._state.state !== ChannelState.SPLICING || !session) return [];
+		const spliceTxid =
+			this._state.spliceInFlight?.spliceTxid ?? session.getSpliceTxid();
+		if (!spliceTxid || !locked.txid.equals(spliceTxid)) return [];
+		if (session.hasReceivedSpliceLocked()) return [];
+		if (session.getState() === SpliceState.AWAITING_TX_SIGNATURES) {
+			// The peer locked before we hold its tx_signatures (they are being
+			// retransmitted over this connection). _spliceCompletionTail applies
+			// it once they arrive.
+			this._pendingRemoteSpliceLockTxid = Buffer.from(locked.txid);
+			return [];
+		}
+		if (session.getState() !== SpliceState.AWAITING_SPLICE_LOCKED) return [];
+		return this.handleSpliceLocked({
+			channelId: this._state.channelId!,
+			fundingTxid: Buffer.from(locked.txid)
+		});
 	}
 
 	/**
@@ -12093,6 +12240,16 @@ export class Channel {
 		} else {
 			actions.push(...this._handleReestablishSplice(msg));
 		}
+
+		// Read after the splice handler, which may have adopted the splice the
+		// TLV names: the request is for that funding's announcement.
+		const lockedTlv = msg.myCurrentFundingLocked;
+		const fundingTxid = this._state.fundingTxid;
+		this._announcementSigsRequested =
+			lockedTlv !== undefined &&
+			(lockedTlv.retransmitFlags & RETRANSMIT_ANNOUNCEMENT_SIGNATURES) !== 0 &&
+			!!fundingTxid &&
+			lockedTlv.txid.equals(fundingTxid);
 
 		// ── FFOR section 7.5.5 retransmission rules ──
 		// A reestablish decides the hold afresh, from a clean set. A peer may
@@ -14422,6 +14579,15 @@ export class Channel {
 	 * Send splice_locked after the splice tx is confirmed.
 	 */
 	sendSpliceLocked(): ChannelAction[] {
+		return this._lockSplice(true);
+	}
+
+	/**
+	 * Record our splice lock and, when `send`, put splice_locked on the wire.
+	 * Without it the lock reached the peer some other way: the
+	 * my_current_funding_locked TLV of our channel_reestablish.
+	 */
+	private _lockSplice(send: boolean): ChannelAction[] {
 		if (this._state.state !== ChannelState.SPLICING) {
 			return [
 				{
@@ -14469,9 +14635,11 @@ export class Channel {
 			this.completeSplice();
 		}
 		actions.push({ type: ChannelActionType.PERSIST_STATE });
-		actions.push(
-			sendMsg(MessageType.SPLICE_LOCKED, encodeSpliceLockedMessage(lockedMsg))
-		);
+		if (send) {
+			actions.push(
+				sendMsg(MessageType.SPLICE_LOCKED, encodeSpliceLockedMessage(lockedMsg))
+			);
+		}
 		if (spliceComplete) {
 			actions.push({ type: ChannelActionType.SPLICE_COMPLETE });
 		}
@@ -16226,6 +16394,18 @@ export class Channel {
 			this._state.spliceInFlight?.confirmed
 		) {
 			actions.push(...this.sendSpliceLocked());
+		}
+		// The peer's lock arrived in its channel_reestablish ahead of these
+		// signatures; it will not send splice_locked again.
+		const pendingLock = this._pendingRemoteSpliceLockTxid;
+		this._pendingRemoteSpliceLockTxid = null;
+		if (pendingLock?.equals(spliceTxid)) {
+			actions.push(
+				...this._applyRemoteFundingLocked({
+					txid: pendingLock,
+					retransmitFlags: 0
+				})
+			);
 		}
 		return actions;
 	}

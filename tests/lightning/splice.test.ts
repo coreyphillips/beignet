@@ -72,7 +72,10 @@ import {
 	encodeCommitmentSignedMessage,
 	decodeRevokeAndAckMessage
 } from '../../src/lightning/message/channel-commitment';
-import { decodeChannelReestablishMessage } from '../../src/lightning/message/channel-reestablish';
+import {
+	decodeChannelReestablishMessage,
+	RETRANSMIT_ANNOUNCEMENT_SIGNATURES
+} from '../../src/lightning/message/channel-reestablish';
 import {
 	serializeChannelState,
 	deserializeChannelState
@@ -6771,6 +6774,283 @@ describe('Splice', function () {
 				pair.pump();
 				expect(pair.opener.getState()).to.equal(ChannelState.NORMAL);
 				expect(pair.acceptor.getState()).to.equal(ChannelState.NORMAL);
+			});
+
+			describe('my_current_funding_locked (issue #2042)', function () {
+				/** Count splice_locked messages that reach the wire from here on. */
+				function countSpliceLocked(pair: IWirePair): { sent: number } {
+					const counter = { sent: 0 };
+					pair.intercept(MessageType.SPLICE_LOCKED, (payload) => {
+						counter.sent++;
+						return payload;
+					});
+					return counter;
+				}
+
+				function negotiate(
+					pair: IWirePair,
+					opener = true,
+					acceptor = true
+				): void {
+					pair.opener.setSpliceNegotiated(opener);
+					pair.acceptor.setSpliceNegotiated(acceptor);
+				}
+
+				function expectAdopted(pair: IWirePair, spliceTxid: Buffer): void {
+					for (const ch of [pair.opener, pair.acceptor]) {
+						expect(ch.getState()).to.equal(ChannelState.NORMAL);
+						expect(ch.getFullState().fundingTxid!.equals(spliceTxid)).to.equal(
+							true
+						);
+						expect(ch.getFullState().spliceInFlight).to.equal(null);
+					}
+				}
+
+				it('a lost splice_locked is recovered from the TLV, with no splice_locked retransmitted', function () {
+					const pair = makeWirePair();
+					startSpliceOut(pair);
+					negotiate(pair);
+					const spliceTxid = Buffer.from(
+						pair.opener.getSpliceSession()!.getSpliceTxid()!
+					);
+					const broadcastsBefore = pair.broadcasts.length;
+
+					// The opener locks and its splice_locked is lost. The acceptor
+					// locks too and the opener receives that, so only the acceptor
+					// is left waiting.
+					pair.drop(MessageType.SPLICE_LOCKED, 1);
+					pair.enqueue(
+						pair.acceptor,
+						pair.opener,
+						pair.opener.sendSpliceLocked()
+					);
+					pair.pump();
+					pair.enqueue(
+						pair.opener,
+						pair.acceptor,
+						pair.acceptor.sendSpliceLocked()
+					);
+					pair.pump();
+					expect(pair.opener.getState()).to.equal(ChannelState.NORMAL);
+					expect(pair.acceptor.getState()).to.equal(ChannelState.SPLICING);
+					expect(pair.acceptor.getSpliceSession()!.hasReceivedSpliceLocked()).to
+						.be.false;
+
+					disconnect(pair);
+					const counts = countSpliceLocked(pair);
+					const { openerMsg, acceptorMsg } = reconnect(pair);
+
+					// Both name the splice: the opener because it adopted it, the
+					// acceptor because it sent splice_locked for it.
+					expect(openerMsg.myCurrentFundingLocked!.txid).to.deep.equal(
+						spliceTxid
+					);
+					expect(acceptorMsg.myCurrentFundingLocked!.txid).to.deep.equal(
+						spliceTxid
+					);
+					expect(pair.errors).to.deep.equal([]);
+					expectAdopted(pair, spliceTxid);
+					expect(counts.sent, 'splice_locked after the reconnect').to.equal(0);
+					expect(pair.broadcasts.length, 'no on-chain action').to.equal(
+						broadcastsBefore
+					);
+				});
+
+				it('a splice that reached depth on both sides while disconnected locks through the TLV alone', function () {
+					const pair = makeWirePair();
+					startSpliceOut(pair);
+					negotiate(pair);
+					const spliceTxid = Buffer.from(
+						pair.opener.getSpliceSession()!.getSpliceTxid()!
+					);
+
+					disconnect(pair);
+					pair.opener.markSpliceConfirmed();
+					pair.acceptor.markSpliceConfirmed();
+					const counts = countSpliceLocked(pair);
+					const { openerMsg, acceptorMsg } = reconnect(pair);
+
+					expect(openerMsg.myCurrentFundingLocked!.txid).to.deep.equal(
+						spliceTxid
+					);
+					expect(acceptorMsg.myCurrentFundingLocked!.txid).to.deep.equal(
+						spliceTxid
+					);
+					expect(pair.errors).to.deep.equal([]);
+					expectAdopted(pair, spliceTxid);
+					expect(counts.sent, 'splice_locked after the reconnect').to.equal(0);
+				});
+
+				it('names the pre-splice funding while the splice is unlocked, and the peer reads it as nothing new', function () {
+					const pair = makeWirePair();
+					const fundingTxid = Buffer.from(
+						pair.opener.getFullState().fundingTxid!
+					);
+					startSpliceOut(pair);
+					negotiate(pair);
+
+					disconnect(pair);
+					const counts = countSpliceLocked(pair);
+					const { openerMsg, acceptorMsg } = reconnect(pair);
+					expect(openerMsg.myCurrentFundingLocked!.txid).to.deep.equal(
+						fundingTxid
+					);
+					expect(acceptorMsg.myCurrentFundingLocked!.txid).to.deep.equal(
+						fundingTxid
+					);
+					expect(pair.errors).to.deep.equal([]);
+					for (const ch of [pair.opener, pair.acceptor]) {
+						expect(ch.getState()).to.equal(ChannelState.SPLICING);
+						expect(ch.getSpliceSession()!.hasReceivedSpliceLocked()).to.be
+							.false;
+					}
+					expect(counts.sent, 'splice_locked after the reconnect').to.equal(0);
+				});
+
+				it('still retransmits splice_locked to a peer whose reestablish has no TLV', function () {
+					const pair = makeWirePair();
+					startSpliceOut(pair);
+					// The acceptor stands in for a peer without the TLV: it does not
+					// send one (it still reads the opener's).
+					negotiate(pair, true, false);
+					const spliceTxid = Buffer.from(
+						pair.opener.getSpliceSession()!.getSpliceTxid()!
+					);
+
+					pair.drop(MessageType.SPLICE_LOCKED, 1);
+					pair.enqueue(
+						pair.acceptor,
+						pair.opener,
+						pair.opener.sendSpliceLocked()
+					);
+					pair.pump();
+
+					disconnect(pair);
+					const counts = countSpliceLocked(pair);
+					const { acceptorMsg } = reconnect(pair);
+					expect(acceptorMsg.myCurrentFundingLocked).to.be.undefined;
+					expect(counts.sent, 'the opener retransmitted its lock').to.equal(1);
+					expect(pair.errors).to.deep.equal([]);
+					expect(pair.acceptor.getSpliceSession()!.hasReceivedSpliceLocked()).to
+						.be.true;
+
+					pair.enqueue(
+						pair.opener,
+						pair.acceptor,
+						pair.acceptor.sendSpliceLocked()
+					);
+					pair.pump();
+					expect(pair.errors).to.deep.equal([]);
+					expectAdopted(pair, spliceTxid);
+				});
+
+				it('applies a lock that arrives before the peer’s retransmitted tx_signatures', function () {
+					const pair = makeWirePair();
+					// The second tx_signatures is lost: its sender is fully signed
+					// and broadcasts, the first sender still lacks the signatures.
+					pair.drop(MessageType.TX_SIGNATURES, 1, 1);
+					startSpliceOut(pair);
+					negotiate(pair);
+					const [lacking, signed] = pair.opener.getFullState().spliceInFlight!
+						.receivedTxSignatures
+						? [pair.acceptor, pair.opener]
+						: [pair.opener, pair.acceptor];
+					expect(lacking.getFullState().spliceInFlight!.receivedTxSignatures).to
+						.be.false;
+					expect(signed.getFullState().spliceInFlight!.receivedTxSignatures).to
+						.be.true;
+					const spliceTxid = Buffer.from(
+						signed.getFullState().spliceInFlight!.spliceTxid
+					);
+
+					// The splice confirms while the two are apart.
+					disconnect(pair);
+					pair.opener.markSpliceConfirmed();
+					pair.acceptor.markSpliceConfirmed();
+					const { openerMsg, acceptorMsg } = reconnect(pair);
+					const signedMsg = signed === pair.opener ? openerMsg : acceptorMsg;
+					expect(signedMsg.myCurrentFundingLocked!.txid).to.deep.equal(
+						spliceTxid
+					);
+					expect(pair.errors).to.deep.equal([]);
+					expectAdopted(pair, spliceTxid);
+				});
+
+				it('retransmits splice_locked when its own reestablish carried no TLV, whatever the peer sent', function () {
+					const pair = makeWirePair();
+					startSpliceOut(pair);
+					negotiate(pair, false, true);
+					pair.drop(MessageType.SPLICE_LOCKED, 1);
+					pair.enqueue(
+						pair.acceptor,
+						pair.opener,
+						pair.opener.sendSpliceLocked()
+					);
+					pair.pump();
+
+					disconnect(pair);
+					const counts = countSpliceLocked(pair);
+					const { openerMsg, acceptorMsg } = reconnect(pair);
+					expect(openerMsg.myCurrentFundingLocked).to.be.undefined;
+					expect(acceptorMsg.myCurrentFundingLocked).to.not.be.undefined;
+					expect(counts.sent, 'the opener retransmitted its lock').to.equal(1);
+					expect(pair.errors).to.deep.equal([]);
+					expect(pair.acceptor.getSpliceSession()!.hasReceivedSpliceLocked()).to
+						.be.true;
+				});
+
+				it('sends no TLV when option_splice was not negotiated', function () {
+					const pair = makeWirePair();
+					disconnect(pair);
+					const { openerMsg, acceptorMsg } = reconnect(pair);
+					expect(openerMsg.myCurrentFundingLocked).to.be.undefined;
+					expect(acceptorMsg.myCurrentFundingLocked).to.be.undefined;
+				});
+
+				it('asks for announcement_signatures it lacks, and records a peer asking for ours', function () {
+					const pair = makeWirePair();
+					negotiate(pair);
+					const fundingTxid = Buffer.from(
+						pair.opener.getFullState().fundingTxid!
+					);
+					writableState(pair.opener).announceChannel = true;
+					writableState(pair.acceptor).announceChannel = true;
+					// The opener holds the acceptor's signatures; the acceptor lost
+					// the opener's.
+					writableState(pair.opener).announcementSigsReceived = true;
+					writableState(pair.acceptor).announcementSigsReceived = false;
+
+					disconnect(pair);
+					const { openerMsg, acceptorMsg } = reconnect(pair);
+					expect(openerMsg.myCurrentFundingLocked).to.deep.equal({
+						txid: fundingTxid,
+						retransmitFlags: 0
+					});
+					expect(acceptorMsg.myCurrentFundingLocked).to.deep.equal({
+						txid: fundingTxid,
+						retransmitFlags: RETRANSMIT_ANNOUNCEMENT_SIGNATURES
+					});
+					expect(pair.opener.isAnnouncementSignaturesRequested()).to.equal(
+						true
+					);
+					expect(pair.acceptor.isAnnouncementSignaturesRequested()).to.equal(
+						false
+					);
+
+					// A private channel never asks.
+					writableState(pair.acceptor).announceChannel = false;
+					disconnect(pair);
+					expect(pair.opener.isAnnouncementSignaturesRequested()).to.equal(
+						false
+					);
+					const second = reconnect(pair);
+					expect(
+						second.acceptorMsg.myCurrentFundingLocked!.retransmitFlags
+					).to.equal(0);
+					expect(pair.opener.isAnnouncementSignaturesRequested()).to.equal(
+						false
+					);
+				});
 			});
 
 			/** splice_locked both ways and pump → back to NORMAL on the new outpoint. */

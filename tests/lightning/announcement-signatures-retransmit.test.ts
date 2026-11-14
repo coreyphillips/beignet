@@ -19,6 +19,7 @@ import { Channel } from '../../src/lightning/channel/channel';
 import { ChannelManager } from '../../src/lightning/channel/channel-manager';
 import { IChannelBasepoints } from '../../src/lightning/keys/derivation';
 import { MessageType } from '../../src/lightning/message/types';
+import { Feature, FeatureFlags } from '../../src/lightning/features/flags';
 import {
 	decodeOpenChannelMessage,
 	decodeAcceptChannelMessage
@@ -773,5 +774,104 @@ describe('LightningNode announcement work after reestablish (issue #2041)', func
 		node.getChannelManager().emit('channel:reestablished', channelId);
 		expect(calls).to.equal(0);
 		node.destroy();
+	});
+});
+
+describe('my_current_funding_locked through ChannelManager and LightningNode (issue #2042)', function () {
+	/** A's channel_reestablish as its manager sends it on reconnect. */
+	function reestablishFromManager(
+		side: ISide
+	): ReturnType<typeof decodeChannelReestablishMessage> {
+		side.manager.removeAllListeners('message:outbound');
+		const sent: Buffer[] = [];
+		side.manager.on(
+			'message:outbound',
+			(_peer: string, type: MessageType, payload: Buffer) => {
+				if (type === MessageType.CHANNEL_REESTABLISH) sent.push(payload);
+			}
+		);
+		side.channel.markForReestablish();
+		side.manager.handlePeerReconnected(side.peerHex);
+		expect(sent).to.have.length(1);
+		return decodeChannelReestablishMessage(sent[0]);
+	}
+
+	function peerInit(splice: boolean): unknown {
+		const features = new FeatureFlags();
+		features.setOptional(Feature.QUIESCE);
+		if (splice) features.setOptional(Feature.SPLICE);
+		return { getPeer: () => ({ getRemoteInit: () => ({ features }) }) };
+	}
+
+	it('names the funding txid when the peer negotiated splicing', function () {
+		const { a } = setupPair();
+		(a.manager as unknown as { peerManager: unknown }).peerManager =
+			peerInit(true);
+		const msg = reestablishFromManager(a);
+		expect(msg.myCurrentFundingLocked!.txid).to.deep.equal(
+			a.channel.getFullState().fundingTxid
+		);
+	});
+
+	it('leaves the TLV out when the peer did not negotiate splicing', function () {
+		const { a } = setupPair();
+		(a.manager as unknown as { peerManager: unknown }).peerManager =
+			peerInit(false);
+		expect(reestablishFromManager(a).myCurrentFundingLocked).to.be.undefined;
+	});
+
+	it('re-sends stored signatures the peer asks for, though we hold its own', function () {
+		const { a, b, channelId, drop } = setupPair();
+		a.manager.handleNewBlock(FUNDING_BLOCK + 5);
+		b.manager.handleNewBlock(FUNDING_BLOCK + 5);
+		// Every message from A is lost: A holds B's signatures, B lacks A's.
+		drop.aToB = true;
+		depthReached(a, channelId);
+		depthReached(b, channelId);
+		expect(a.channel.getFullState().announcementSigsReceived).to.be.true;
+		expect(b.channel.getFullState().announcementSigsReceived).to.be.false;
+		drop.aToB = false;
+
+		const backend: IChainBackend = {
+			subscribeToHeaders: async () => {},
+			subscribeToScriptHash: async () => {},
+			getScriptHashHistory: async () => [],
+			getTransaction: async () => Buffer.alloc(0),
+			broadcastTransaction: async () => ''
+		};
+		const node = new LightningNode({
+			nodePrivateKey: openerNodePriv,
+			channelBasepoints: makeBasepoints(Buffer.alloc(32, 0x75)).basepoints,
+			perCommitmentSeed: Buffer.alloc(32, 0x76),
+			fundingPrivkey: Buffer.alloc(32, 0x77),
+			network: Network.REGTEST,
+			chainBackend: backend
+		});
+		node.on('node:error', () => {});
+		// Restoring marks the channel for reestablish, so it goes first.
+		node.getChannelManager().restoreChannel(a.channel, a.peerHex);
+
+		a.channel.setSpliceNegotiated(true);
+		b.channel.setSpliceNegotiated(true);
+		reconnect(a, b);
+		expect(a.channel.isAnnouncementSignaturesRequested()).to.be.true;
+		expect(b.channel.isAnnouncementSignaturesRequested()).to.be.false;
+
+		const resent: Buffer[] = [];
+		node.getChannelManager().resendAnnouncementSignatures = ((cid: Buffer) => {
+			resent.push(cid);
+			return true;
+		}) as any;
+		node.getChannelManager().emit('channel:reestablished', channelId);
+		expect(resent).to.have.length(1);
+		expect(resent[0].equals(channelId)).to.be.true;
+		node.destroy();
+
+		// What the node's resend does: B now holds A's signatures and builds
+		// the announcement.
+		a.manager.resendAnnouncementSignatures(channelId);
+		expect(b.channel.getFullState().announcementSigsReceived).to.be.true;
+		expect(b.ready.length).to.equal(1);
+		expect(verifyFullAnnouncement(b.ready[0]).allValid).to.be.true;
 	});
 });
