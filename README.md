@@ -37,7 +37,7 @@ console.log(wallet.getBalance());
 
 From here: [the on-chain wallet](#on-chain-wallet) for sending, PSBTs, multisig and watch-only, or [Lightning](#lightning) for channels and payments.
 
-For adding `bgnq` direct-funding payments to another wallet, see the [standalone TypeScript payer SDK](packages/direct-funding/README.md). It includes a PSBT signing adapter, Bitcoin Core integration, and a channel-free peer client.
+For adding `bgnq` direct-funding payments to another wallet, see the [standalone TypeScript payer SDK](packages/direct-funding/README.md). It includes a PSBT signing adapter, Bitcoin Core integration, and a channel-free peer client. This package exports the same SDK as `beignet/direct-funding` and `beignet/direct-funding/node`.
 
 ## Try the examples
 
@@ -114,6 +114,10 @@ Both examples run through `ts-node`. The on-chain example runs straight off the 
 | `beignet/daemon` | `startDaemon`, API keys, webhooks | You serve the HTTP API from your own Node process |
 | `beignet/cli` | Both of the above | Existing imports; it loads the daemon too |
 | `beignet/lightning` | Namespaced protocol modules (`node`, `channel`, `onion`, ...) | You need the raw BOLT layer: bigint msat, Buffer IDs, wire messages |
+| `beignet/lightning/sqlite` | `SqliteStorage`, `GuardianStore` | You persist a node to SQLite. Needs the optional `better-sqlite3` |
+| `beignet/lightning/iroh-node` | `createNodeIrohEndpoint` | You link nodes over Iroh on Node.js. Needs the optional `@number0/iroh` addon |
+| `beignet/direct-funding` | `DirectFundingClient`, `BitcoinCoreWalletAdapter`, `createPsbtCoinSigner` | You pay `bgnq` direct-funding requests from another wallet. Loads no node, wallet or receiver engine |
+| `beignet/direct-funding/node` | `FileDirectFundingStorage`, `NodePeerMessaging` | The payer SDK on Node.js: file storage and a channel-free BOLT 8 peer client |
 
 ## On-chain wallet
 
@@ -498,8 +502,9 @@ const node = await BeignetNode.create({
 ```
 
 - **Altruist only.** Sessions use `reward = 0`. There is no server mode: beignet is a tower client, not a tower.
-- **LND-tower compatible.** Implements LND's `wtwire` protocol (Init/CreateSession/StateUpdate/DeleteSession, message types 600-607) and the version-0 justice blob (XChaCha20-Poly1305, breach hint `SHA256(txid)[:16]`, key `SHA256(txid‖txid)`), so it works with existing public LND altruist towers.
-- **Legacy + anchor channels.** The to_local revocation penalty (the fund-critical punishment) is packed for both. Taproot channels are not yet backed up.
+- **LND-tower compatible.** Implements LND's `wtwire` protocol (Init/CreateSession/StateUpdate/DeleteSession, message types 600-607) and both justice blob versions (XChaCha20-Poly1305, breach hint `SHA256(txid)[:16]`, key `SHA256(txid‖txid)`), so it works with existing public LND altruist towers.
+- **Legacy, anchor and taproot channels.** The to_local revocation penalty (the fund-critical punishment) is packed for all three. Legacy and anchor channels use the version-0 kit; simple taproot channels use the version-1 kit (schnorr signatures). An LND tower accepts one blob type per session, so the client runs a separate session per blob type against each tower.
+- **Taproot needs a tower that accepts it.** An LND v0.20 tower does (tested live). A tower that refuses the taproot blob type (`CreateSession` code 64) gets no taproot backups: they stay queued and are offered again on the next connection, while legacy and anchor backups to that tower keep flowing.
 - **Durable.** Per-tower session state and the un-acked backlog are persisted (encrypted at rest) and drained with exponential backoff on reconnect. An un-acked update is never dropped silently.
 
 Daemon: `GET /watchtowers`, `POST /watchtower/add`, `DELETE /watchtower/remove`.
@@ -789,13 +794,13 @@ Beignet is under active development. Known gaps and caveats:
 | Feature | Status | Detail |
 |---------|--------|--------|
 | Mainnet battle-testing | Limited | Interop-tested on regtest, with some flows validated live on mainnet. Exercise caution with large balances. |
-| Watchtowers | Client only (altruist) | Punishes breaches while you are offline via remote LND altruist towers. Legacy + anchor channels only: taproot channels are not backed up. No server mode. |
+| Watchtowers | Client only (altruist) | Punishes breaches while you are offline via remote LND altruist towers. Legacy, anchor and taproot channels are backed up, each blob type in its own session. Taproot backups need a tower that accepts the taproot blob type, and stay queued at one that refuses it. No server mode. |
 | LSP / LSPS protocols | Not implemented | No automated inbound liquidity via LSPS0/1/2. Liquidity ads (bLIP-51) cover negotiated leases; otherwise open channels manually. |
 | Trampoline routing | Not implemented | All route computation is local. |
 | BOLT 12 offers | Newer | Offers, invoice_request/invoice over onion messages and receive-side settlement work, but the surface is less battle-tested than BOLT 11. Prefer BOLT 11 in production. |
 | Async payments | LSP-dependent | Hold invoices plus AsyncPaymentManager let an offline receiver be paid, but the receiver's LSP must run the held-forward/wake flow. |
 | Simple taproot channels | Experimental | Full lifecycle validated against LND v0.20 on regtest, but the feature bit is still in staging upstream. Not recommended for mainnet balances. |
-| Splicing / dual funding | Partial | Splice-out and splice-in validated live against CLN; v2 dual-funded opens implemented both as initiator and acceptor. CLN-initiated splices, repeat splices and multi-UTXO splice-ins are untested. |
+| Splicing / dual funding | Partial | Validated against CLN on regtest (`cln-splice-matrix.test.ts`): splice-out, repeat splices on a spliced channel, payments over it, CLN-initiated splices with beignet as acceptor, multi-UTXO and third-party-input splice-ins, and resume after a mid-splice disconnect. Splice-in and splice-out were also validated live against CLN on mainnet. v2 dual-funded opens are implemented both as initiator and acceptor. Not yet supported: splice RBF ([#765](https://github.com/coreyphillips/beignet/issues/765)) and splicing taproot channels ([#150](https://github.com/coreyphillips/beignet/issues/150)). |
 | Mobile background | Limited | Works on React Native but has no background sync or push-notification support. |
 
 Recommended safeguards in production:
@@ -850,7 +855,7 @@ Nothing in the `beignet` entry loads Node `crypto` until `createEncryptedStorage
 
 [docs/README.md](docs/README.md) indexes every guide, reference and design document in the repository.
 
-The API reference for every entry point (`beignet`, `beignet/node`, `beignet/daemon`, `beignet/cli`, `beignet/lightning`, `beignet/lightning/sqlite`, `beignet/lightning/iroh-node`) is generated by typedoc and not kept in git. CI builds it on every run and uploads it as the `api-docs` artifact of the docs workflow; `npm run docs:html` (or `docs:markdown`) builds it locally into `api-docs/`.
+The API reference for every entry point (`beignet`, `beignet/node`, `beignet/daemon`, `beignet/cli`, `beignet/lightning`, `beignet/lightning/sqlite`, `beignet/lightning/iroh-node`, `beignet/direct-funding`, `beignet/direct-funding/node`) is generated by typedoc and not kept in git. CI builds it on every run and uploads it as the `api-docs` artifact of the docs workflow; `npm run docs:html` (or `docs:markdown`) builds it locally into `api-docs/`.
 
 ## Support
 

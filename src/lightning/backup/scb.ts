@@ -1,11 +1,11 @@
 /**
  * Static channel backup (SCB): a portable, versioned, encrypted blob carrying
  * the minimum per-channel data needed to recover funds without the full
- * database. Recovery (follow-up work) uses the fell-behind DLP path: reconnect
- * to the peer with intentionally stale state, the peer force-closes, and the
- * chain monitor sweeps our to_remote output. Each entry therefore carries the
- * peer identity/addresses, the funding outpoint, and the key material locator
- * (channelKeyIndex) that flow needs.
+ * database. Recovery (BeignetNode.restoreFromScb, POST /restore/scb) uses the
+ * fell-behind DLP path: reconnect to the peer with intentionally stale state,
+ * the peer force-closes, and the chain monitor sweeps our to_remote output.
+ * Each entry therefore carries the peer identity/addresses, the funding
+ * outpoint, and the key material locator (channelKeyIndex) that flow needs.
  *
  * This covers every channel type we run, INCLUDING simple taproot channels:
  * the to_remote output always pays our STATIC payment basepoint

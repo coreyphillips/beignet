@@ -6,7 +6,9 @@
     "src/cli/index.ts",
     "src/lightning/index.ts",
     "src/lightning/sqlite.ts",
-    "src/lightning/transport/iroh-node.ts"
+    "src/lightning/transport/iroh-node.ts",
+    "src/direct-funding/index.ts",
+    "src/direct-funding/node.ts"
   ],
   "out": "api-docs/html",
   "plugin": ["./scripts/typedoc-minimatch.js"],
