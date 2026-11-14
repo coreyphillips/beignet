@@ -9263,6 +9263,11 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		);
 	}
 
+	/** Whether the channel's signed announcement is waiting for depth. */
+	isAnnouncementHeld(channelId: Buffer): boolean {
+		return this._announcementsHeldForDepth.has(channelId.toString('hex'));
+	}
+
 	private _scidAtAnnouncementDepth(scid: Buffer): boolean {
 		const block = (scid[0] << 16) | (scid[1] << 8) | scid[2];
 		return (
@@ -9279,11 +9284,14 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		for (const idHex of [...this._announcementsHeldForDepth]) {
 			const channel = this.channels.get(idHex);
 			const scid = channel?.getShortChannelId();
-			if (!channel || !scid || !channel.isHtlcUsable(true)) {
+			if (!channel || !scid) {
 				this._announcementsHeldForDepth.delete(idHex);
 				continue;
 			}
-			if (!this._scidAtAnnouncementDepth(scid)) continue;
+			// Kept while unusable: a splice that is later aborted would
+			// otherwise lose the only release this announcement gets.
+			if (!channel.isHtlcUsable(true) || !this._scidAtAnnouncementDepth(scid))
+				continue;
 			this._announcementsHeldForDepth.delete(idHex);
 			this.reannounceChannel(Buffer.from(idHex, 'hex'));
 		}

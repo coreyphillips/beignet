@@ -470,6 +470,23 @@ describe('announcement_signatures retransmission (issue #2041)', function () {
 		expect(a.ready.length).to.equal(1);
 	});
 
+	it('keeps a held announcement through a splice that is aborted', function () {
+		const { a, b, channelId } = setupPair();
+		a.manager.handleNewBlock(FUNDING_BLOCK + 2);
+		b.manager.handleNewBlock(FUNDING_BLOCK + 2);
+		depthReached(b, channelId);
+		expect(a.manager.isAnnouncementHeld(channelId)).to.be.true;
+
+		writableState(a.channel).state = ChannelState.SPLICING;
+		a.manager.handleNewBlock(FUNDING_BLOCK + 3);
+		expect(a.manager.isAnnouncementHeld(channelId)).to.be.true;
+
+		writableState(a.channel).state = ChannelState.NORMAL;
+		a.manager.handleNewBlock(FUNDING_BLOCK + 5);
+		expect(a.ready.length, 'released after the abort').to.equal(1);
+		expect(a.manager.isAnnouncementHeld(channelId)).to.be.false;
+	});
+
 	it('reannounceChannel waits for depth too', function () {
 		const { a, b, channelId } = setupPair();
 		a.manager.handleNewBlock(FUNDING_BLOCK + 5);
@@ -641,6 +658,27 @@ describe('LightningNode announcement work after reestablish (issue #2041)', func
 		expect(rearmed).to.deep.equal([
 			Buffer.from(fundingTxid).reverse().toString('hex')
 		]);
+		node.destroy();
+	});
+
+	it('does not count a held announcement as published', function () {
+		const node = makeNode();
+		const { a, b, channelId } = setupPair();
+		a.manager.handleNewBlock(FUNDING_BLOCK + 2);
+		b.manager.handleNewBlock(FUNDING_BLOCK + 2);
+		depthReached(b, channelId);
+		const st = a.channel.getFullState();
+		expect(st.announcementSigsSent && st.announcementSigsReceived).to.be.true;
+
+		const cm = node.getChannelManager();
+		cm.restoreChannel(a.channel, a.peerHex);
+		(cm as any)._currentBlockHeight = FUNDING_BLOCK + 2;
+		cm.reannounceChannel(channelId);
+		expect(cm.isAnnouncementHeld(channelId)).to.be.true;
+		expect((node as any).hasPublishedPublicChannel()).to.be.false;
+
+		(cm as any)._announcementsHeldForDepth.clear();
+		expect((node as any).hasPublishedPublicChannel()).to.be.true;
 		node.destroy();
 	});
 

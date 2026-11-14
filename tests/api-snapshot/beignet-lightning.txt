@@ -1319,6 +1319,7 @@ method channel.ChannelManager.initiateFundingRbf(channelId: Buffer, feeratePerKw
 method channel.ChannelManager.initiateQuiescence(channelId: Buffer): channel.ChannelResult
 method channel.ChannelManager.initiateShutdown(channelId: Buffer, scriptPubkey: Buffer, acceptStaleStateRisk?: boolean, externalDestination?: boolean): channel.ChannelResult
 method channel.ChannelManager.initiateSplice(channelId: Buffer, relativeSatoshis: bigint, fundingFeeratePerkw: number, locktime?: number): channel.ChannelResult
+method channel.ChannelManager.isAnnouncementHeld(channelId: Buffer): boolean
 method channel.ChannelManager.isChannelRestoredFromDisk(channelId: Buffer): boolean
 method channel.ChannelManager.isJitClient(pubkeyHex: string): boolean
 method channel.ChannelManager.isTrustedPeer(pubkeyHex: string): boolean

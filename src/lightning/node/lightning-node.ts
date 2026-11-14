@@ -16998,7 +16998,8 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	 * announceChannel alone is an INTENT flag: it stays true on pending and
 	 * closed channels, and a preferTaproot opener keeps it true while the
 	 * wire flag is private, so gating on it suppressed valid private paths
-	 * (issue #544 review).
+	 * (issue #544 review). A pair signed before 6 confirmations is held by
+	 * the ChannelManager and is not in anyone's graph yet.
 	 */
 	private hasPublishedPublicChannel(): boolean {
 		return this.channelManager.listChannels().some((channel) => {
@@ -17007,6 +17008,9 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				st.announceChannel === true &&
 				st.announcementSigsSent &&
 				st.announcementSigsReceived &&
+				!(
+					st.channelId && this.channelManager.isAnnouncementHeld(st.channelId)
+				) &&
 				channel.acceptsNewHtlcs(true)
 			);
 		});
