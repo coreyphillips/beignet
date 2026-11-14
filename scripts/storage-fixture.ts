@@ -4,14 +4,15 @@
  * dumps the database as SQL.
  *
  * A fixture must come from the code that wrote that schema, so before
- * bumping CURRENT_SCHEMA_VERSION, write one from the current master:
+ * bumping CURRENT_SCHEMA_VERSION, write one from the current master, where
+ * <NN> is master's CURRENT_SCHEMA_VERSION in two digits:
  *
  *   mkdir /tmp/old && git archive master src types tsconfig.json package.json \
  *     | tar -x -C /tmp/old && ln -s "$PWD/node_modules" /tmp/old/node_modules
  *   FIXTURE_SOURCE=$(git rev-parse --short master) \
  *   TS_NODE_TRANSPILE_ONLY=1 node --no-strip-types -r ts-node/register \
  *     scripts/storage-fixture.ts /tmp/old \
- *     tests/lightning/fixtures/sqlite-schema/schema-NN.sql
+ *     tests/lightning/fixtures/sqlite-schema/schema-<NN>.sql
  */
 import fs from 'fs';
 import os from 'os';

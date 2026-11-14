@@ -14,6 +14,8 @@
  *   here: that is how a local file such as docker/docker-compose.override.yml
  *   is cited.
  * URLs are not checked, so a file in another repository is cited by its URL.
+ * A placeholder goes in angle brackets (`schema-<NN>.sql`), since a bare one
+ * such as `schema-NN.sql` reads as a file that does not exist.
  */
 import { execFileSync } from 'child_process';
 import * as fs from 'fs';
@@ -76,7 +78,9 @@ export function commentsOf(
 		}));
 }
 
-const PATH_TOKEN = /(?<![\w@.\/-])(?:\.{1,2}\/)*[\w@.-]+(?:\/[\w@.-]+)*\/?/g;
+// A token right after `*`, `}` or `>` is the tail of a glob, brace or
+// placeholder pattern, such as the extension of docs/specs/<name>.md.
+const PATH_TOKEN = /(?<![\w@.\/*}>-])(?:\.{1,2}\/)*[\w@.-]+(?:\/[\w@.-]+)*\/?/g;
 
 /**
  * The tokens of a comment that cite a file of this repository, with their
@@ -92,8 +96,8 @@ export function citationsIn(
 	for (const match of text.matchAll(PATH_TOKEN)) {
 		const offset = match.index ?? 0;
 		const after = text[offset + match[0].length] ?? '';
-		// A glob or brace pattern names files, not a file.
-		if (after === '*' || after === '{') continue;
+		// The head of a glob, brace or placeholder pattern is not a file either.
+		if (after === '*' || after === '{' || after === '<') continue;
 		const cited = match[0].replace(/\.+$/, '');
 		const rooted =
 			index.topDirs.has(cited.split('/')[0]) &&
