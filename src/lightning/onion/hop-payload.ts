@@ -102,6 +102,11 @@ export function encodeHopPayload(payload: IHopPayload): Buffer {
 		records.push({ type: 12, value: payload.blindingPoint });
 	}
 
+	// Type 16: payment_metadata (final hop, from the invoice's m field)
+	if (payload.paymentMetadata) {
+		records.push({ type: 16, value: payload.paymentMetadata });
+	}
+
 	// Type 18: total_amount_msat (tu64) — blinded final hop
 	if (payload.totalAmountMsat !== undefined) {
 		records.push({
@@ -184,6 +189,7 @@ export function decodeHopPayload(
 	let totalMsat: bigint | undefined;
 	let encryptedRecipientData: Buffer | undefined;
 	let blindingPoint: Buffer | undefined;
+	let paymentMetadata: Buffer | undefined;
 	let totalAmountMsat: bigint | undefined;
 	let customRecords: Map<number, Buffer> | undefined;
 
@@ -254,6 +260,10 @@ export function decodeHopPayload(
 				}
 				blindingPoint = Buffer.from(tlvValue);
 				break;
+			case 16:
+				// payment_metadata: opaque bytes the recipient put in its invoice
+				paymentMetadata = Buffer.from(tlvValue);
+				break;
 			case 18:
 				// total_amount_msat (tu64) — blinded final hop
 				totalAmountMsat = decodeTruncatedUint(tlvValue);
@@ -307,6 +317,9 @@ export function decodeHopPayload(
 	}
 	if (blindingPoint) {
 		result.blindingPoint = blindingPoint;
+	}
+	if (paymentMetadata) {
+		result.paymentMetadata = paymentMetadata;
 	}
 	if (totalAmountMsat !== undefined) {
 		result.totalAmountMsat = totalAmountMsat;

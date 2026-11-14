@@ -3058,6 +3058,7 @@ member features.Feature.OPTION_FF_RECEIVE = 440
 member features.Feature.OPTION_TAPROOT = 180
 member features.Feature.OPTION_WILL_FUND = 112
 member features.Feature.OPTION_ZERO_RESERVE = 64
+member features.Feature.PAYMENT_METADATA = 48
 member features.Feature.PAYMENT_SECRET = 14
 member features.Feature.PROVIDE_STORAGE = 42
 member features.Feature.QUIESCE = 34
@@ -5297,6 +5298,7 @@ property node.ICreateInvoiceOptions.includeCleartextHintsWithBlinded?: boolean
 property node.ICreateInvoiceOptions.jitFeeAllowance?: { flatFeeSat: number; feePpm: number; }
 property node.ICreateInvoiceOptions.minFinalCltvExpiry?: number
 property node.ICreateInvoiceOptions.paymentHash?: Buffer
+property node.ICreateInvoiceOptions.paymentMetadata?: Buffer
 property node.ICreateInvoiceOptions.useBlindedPaths?: boolean
 interface node.ICreateInvoiceResult
 property node.ICreateInvoiceResult.bolt11: string
@@ -5414,6 +5416,7 @@ property node.IInvoiceInfo.hold?: boolean
 property node.IInvoiceInfo.jitFee?: { flatFeeSat: number; feePpm: number; }
 property node.IInvoiceInfo.minFinalCltvExpiry?: number
 property node.IInvoiceInfo.paymentHash: string
+property node.IInvoiceInfo.paymentMetadata?: string
 interface node.IKeysendOptions
 property node.IKeysendOptions.amountMsat: bigint
 property node.IKeysendOptions.customRecords?: Map<number, Buffer>
@@ -5911,7 +5914,7 @@ method node.LightningNode.sendOnionMessage(destination: Buffer, messageData: Map
 method node.LightningNode.sendPayAll(invoiceStr: string, debitMsat: bigint, maxFeeMsat: bigint, metadata?: Record<string, string>): node.IPaymentInfo
 method node.LightningNode.sendPayment(invoiceStr: string, excludedChannels?: Set<string>, maxFeeMsat?: bigint, amountMsat?: bigint, maxCltvExpiryHeight?: number, policyOverrides?: gossip.TPolicyOverrides, metadata?: Record<string, string>): node.IPaymentInfo
 method node.LightningNode.sendPaymentAsync(invoiceStr: string, timeoutMs?: number, maxFeeMsat?: bigint, amountMsat?: bigint, maxCltvExpiryHeight?: number): Promise<node.IPaymentInfo>
-method node.LightningNode.sendPaymentToRoute(route: { hops: Array<{ pubkey: Buffer; shortChannelId: Buffer; amountToForwardMsat: bigint; outgoingCltvValue: number; encryptedRecipientData?: Buffer; blindingPoint?: Buffer; }>; }, paymentHash: Buffer, finalCltvExpiry: number, paymentSecret?: Buffer, totalMsat?: bigint, metadata?: Record<string, string>, payAll?: node.IPayAllBudget): node.IPaymentInfo
+method node.LightningNode.sendPaymentToRoute(route: { hops: Array<{ pubkey: Buffer; shortChannelId: Buffer; amountToForwardMsat: bigint; outgoingCltvValue: number; encryptedRecipientData?: Buffer; blindingPoint?: Buffer; }>; }, paymentHash: Buffer, finalCltvExpiry: number, paymentSecret?: Buffer, totalMsat?: bigint, metadata?: Record<string, string>, payAll?: node.IPayAllBudget, paymentMetadata?: Buffer): node.IPaymentInfo
 method node.LightningNode.sendPaymentWithOptions(invoiceStr: string, options?: node.ISendPaymentOptions): node.IPaymentInfo
 method node.LightningNode.sendTxSignatures(channelId: Buffer, txid: Buffer, outputIndex: number, witnesses: Buffer[][]): { ok: boolean; error?: string; }
 method node.LightningNode.setChannelPolicy(channelId: Buffer | 'all', policy: node.IChannelPolicyUpdate): void
@@ -6306,6 +6309,7 @@ property onion.IHopPayload.customRecords?: Map<number, Buffer>
 property onion.IHopPayload.encryptedRecipientData?: Buffer
 property onion.IHopPayload.omitForwardAmounts?: boolean
 property onion.IHopPayload.outgoingCltvValue: number
+property onion.IHopPayload.paymentMetadata?: Buffer
 property onion.IHopPayload.paymentSecret?: Buffer
 property onion.IHopPayload.shortChannelId?: Buffer
 property onion.IHopPayload.totalAmountMsat?: bigint
@@ -6396,6 +6400,7 @@ function onion.generateFiller(sharedSecrets: Buffer[], payloadSizes: number[]): 
 function onion.generateKey(keyType: string, secret: Buffer): Buffer
 function onion.generateSharedSecret(sessionKey: Buffer, hopPubkey: Buffer): Buffer
 function onion.isFinalHop(packet: onion.IOnionPacket): boolean
+function onion.onionPayloadBytes(payloads: onion.IHopPayload[]): number
 function onion.processBlindedHop(blindingKey: Buffer, nodePrivkey: Buffer, encryptedData: Buffer): { hopData: onion.IBlindedHopData; nextBlindingKey: Buffer; }
 function onion.processOnionPacket(packet: onion.IOnionPacket, nodePrivkey: Buffer, associatedData?: Buffer): onion.IProcessedOnion
 function onion.wrapFailureMessage(sharedSecret: Buffer, message: Buffer): Buffer
@@ -7686,6 +7691,7 @@ property storage.IInvoiceInfo.hold?: boolean
 property storage.IInvoiceInfo.jitFee?: { flatFeeSat: number; feePpm: number; }
 property storage.IInvoiceInfo.minFinalCltvExpiry?: number
 property storage.IInvoiceInfo.paymentHash: string
+property storage.IInvoiceInfo.paymentMetadata?: string
 interface storage.IInvoicePathIdStorage
 method storage.IInvoicePathIdStorage.loadAllInvoicePathIds(): Array<{ paymentHashHex: string; pathId: Buffer; }>
 method storage.IInvoicePathIdStorage.saveInvoicePathId(paymentHashHex: string, pathId: Buffer): void
@@ -7980,6 +7986,7 @@ property storage.ISerializedInvoiceInfo.hold?: boolean
 property storage.ISerializedInvoiceInfo.jitFee?: { flatFeeSat: number; feePpm: number; }
 property storage.ISerializedInvoiceInfo.minFinalCltvExpiry?: number
 property storage.ISerializedInvoiceInfo.paymentHash: string
+property storage.ISerializedInvoiceInfo.paymentMetadata?: string
 interface storage.ISerializedPaymentInfo
 property storage.ISerializedPaymentInfo.amountMsat: string
 property storage.ISerializedPaymentInfo.completedAt?: number

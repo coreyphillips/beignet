@@ -777,4 +777,10 @@ export interface IInvoiceInfo {
 	 * took the node default: both enforce DEFAULT_MIN_FINAL_CLTV_EXPIRY.
 	 */
 	minFinalCltvExpiry?: number;
+	/**
+	 * Hex of the BOLT 11 `m` field this invoice was issued with. The final
+	 * hop requires every HTLC for the invoice to carry the same bytes as
+	 * payment_metadata (onion TLV 16). Absent when the invoice had none.
+	 */
+	paymentMetadata?: string;
 }

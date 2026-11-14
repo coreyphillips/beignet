@@ -310,7 +310,8 @@ function invoice(seed: number): IInvoiceInfo {
 		bolt12: false,
 		cancelledAt: 1_700_000_100_000,
 		jitFee: { flatFeeSat: 2000, feePpm: 1000 },
-		minFinalCltvExpiry: 144
+		minFinalCltvExpiry: 144,
+		paymentMetadata: 'c0ffee'
 	};
 }
 

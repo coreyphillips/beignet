@@ -17,6 +17,11 @@ export interface IHopPayload {
 	/** TLV type 12: blinding_point (33-byte ephemeral key for blinded hops) */
 	blindingPoint?: Buffer;
 	/**
+	 * TLV type 16: payment_metadata (final hop only). The opaque bytes of the
+	 * BOLT 11 invoice's `m` field, which the payer MUST return with every HTLC.
+	 */
+	paymentMetadata?: Buffer;
+	/**
 	 * TLV type 18: total_amount_msat — REQUIRED on the FINAL hop of a blinded
 	 * payment path (payment_data/payment_secret is not used there; the
 	 * encrypted path_id authenticates instead). CLN fails the HTLC with

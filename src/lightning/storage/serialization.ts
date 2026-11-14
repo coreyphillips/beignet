@@ -2107,6 +2107,7 @@ export interface ISerializedInvoiceInfo {
 	cancelledAt?: number;
 	jitFee?: { flatFeeSat: number; feePpm: number };
 	minFinalCltvExpiry?: number;
+	paymentMetadata?: string;
 }
 
 export function serializeInvoiceInfo(
@@ -2126,7 +2127,8 @@ export function serializeInvoiceInfo(
 		bolt12: invoice.bolt12,
 		cancelledAt: invoice.cancelledAt,
 		jitFee: invoice.jitFee,
-		minFinalCltvExpiry: invoice.minFinalCltvExpiry
+		minFinalCltvExpiry: invoice.minFinalCltvExpiry,
+		paymentMetadata: invoice.paymentMetadata
 	};
 }
 
@@ -2148,6 +2150,7 @@ export function deserializeInvoiceInfo(
 		jitFee: s.jitFee,
 		// A row written before #770 has none: the final hop then enforces
 		// the node default, which is what it advertised.
-		minFinalCltvExpiry: s.minFinalCltvExpiry
+		minFinalCltvExpiry: s.minFinalCltvExpiry,
+		paymentMetadata: s.paymentMetadata
 	};
 }
