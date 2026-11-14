@@ -241,6 +241,30 @@ describe('BOLT 1 string rule and minimal features (#2039)', () => {
 				);
 			});
 		}
+
+		for (const hold of [false, true]) {
+			it(`rejected descriptions leave no invoice state (hold=${hold})`, () => {
+				const node = makeNode();
+				const options = {
+					description: 'a' + cp(0x202e) + 'b',
+					hold,
+					paymentHash: hold ? crypto.randomBytes(32) : undefined
+				};
+				try {
+					expect(() => node.createInvoice(options)).to.throw(
+						'Invoice description contains U+202E'
+					);
+					expect(node['preimages'].size).to.equal(0);
+					expect(node['paymentSecrets'].size).to.equal(0);
+					expect(node['heldInvoiceHashes'].size).to.equal(0);
+					expect(() =>
+						node.createInvoice({ ...options, description: 'corrected' })
+					).to.not.throw();
+				} finally {
+					node.destroy();
+				}
+			});
+		}
 	});
 
 	describe('BOLT 12 offers', () => {

@@ -17911,6 +17911,9 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		) {
 			throw new Error('Must specify either description or descriptionHash');
 		}
+		if (options.description !== undefined) {
+			assertBolt1String(options.description, 'Invoice description');
+		}
 
 		// A JIT allowance is an authorization to be paid LESS than the onion
 		// says, so a malformed quote must not reach the invoice record: it is
