@@ -1178,6 +1178,7 @@ method channel.Channel.restoreSpliceInFlight(): void
 method channel.Channel.restoreV2InFlight(): void
 method channel.Channel.retainFundingPayload(txHex: string): void
 method channel.Channel.retirePreSpliceSpendWatch(txid: string, outputIndex: number): boolean
+method channel.Channel.retransmitAnnouncementSignatures(localNodeId: Buffer, remoteNodeId: Buffer): channel.ChannelAction[]
 method channel.Channel.revertConflictedSplice(): channel.ChannelAction[]
 method channel.Channel.rollbackShutdown(previous: Pick<channel.IChannelState, 'state' | 'localShutdownScript' | 'externalClose' | 'staleCloseRiskAccepted' | 'simpleClose'>): void
 method channel.Channel.sendClosingComplete(feeSatoshis: bigint, locktime: number, signFn: (variant: message.ClosingSigVariant, feeSatoshis: bigint, locktime: number, closerScriptPubkey: Buffer, closeeScriptPubkey: Buffer) => Buffer): channel.ChannelAction[]
@@ -1347,6 +1348,7 @@ method channel.ChannelManager.recordPreimage(paymentHash: Buffer, preimage: Buff
 method channel.ChannelManager.releaseCompositeSpliceCommitment(channelId: Buffer): channel.ChannelResult
 method channel.ChannelManager.removeTrustedPeer(pubkeyHex: string): void
 method channel.ChannelManager.requestSpliceConflictRevert(channelId: Buffer): channel.ChannelResult
+method channel.ChannelManager.resendAnnouncementSignatures(channelId: Buffer): boolean
 method channel.ChannelManager.restoreChannel(channel: channel.Channel, peerPubkey: string, keyIndex?: number | null, perChannelKeys?: channel.IPerChannelKeys | null): void
 method channel.ChannelManager.restoreMonitor(channelId: string, monitor: chain.ChainMonitor): void
 method channel.ChannelManager.revertConflictedSplice(channelId: Buffer): channel.ChannelResult

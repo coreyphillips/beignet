@@ -10020,6 +10020,7 @@ export class Channel {
 		this._txAbortSent = false;
 		this._spliceAbortIgnoreCommitment = false;
 		this._reestablishRetransmitted = false;
+		this._announcements.handleDisconnect();
 		// Any coins selected for a raise the peer never acked go back to the
 		// wallet: the request dies here, so nothing will ever spend them.
 		this._releasePendingRbfTopUp();
@@ -16791,6 +16792,21 @@ export class Channel {
 			remoteNodeId,
 			localNodeSig,
 			localBitcoinSig
+		);
+	}
+
+	/**
+	 * Our stored announcement_signatures, for a peer that has not sent its own
+	 * (BOLT 7 retransmission on reconnect). Empty when there is nothing signed
+	 * to send.
+	 */
+	retransmitAnnouncementSignatures(
+		localNodeId: Buffer,
+		remoteNodeId: Buffer
+	): ChannelAction[] {
+		return this._announcements.retransmitAnnouncementSignatures(
+			localNodeId,
+			remoteNodeId
 		);
 	}
 
