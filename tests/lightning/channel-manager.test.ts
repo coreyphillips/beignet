@@ -292,6 +292,53 @@ describe('Channel Manager', function () {
 			expect(bob.listChannels()).to.have.length(0);
 		});
 
+		it('fails an open_channel that carries no channel_type (issue 2046)', function () {
+			// option_channel_type is assumed (bolts#1232), so there is no implicit
+			// type to fall back to. The opener must hear why at the first message.
+			const alice = new ChannelManager(makeConfig(1));
+			const bob = new ChannelManager(makeConfig(2));
+
+			let openPayload: Buffer | null = null;
+			alice.on(
+				'message:outbound',
+				(_peer: string, type: number, payload: Buffer) => {
+					if (type === MessageType.OPEN_CHANNEL) openPayload = payload;
+				}
+			);
+			const errors: string[] = [];
+			bob.on('error', (_id: Buffer | null, message: string) =>
+				errors.push(message)
+			);
+			const wire: Array<{ type: number; payload: Buffer }> = [];
+			bob.on(
+				'message:outbound',
+				(_peer: string, type: number, payload: Buffer) =>
+					wire.push({ type, payload })
+			);
+
+			alice.openChannel(bobPubkey, 1_000_000n);
+			const open = decodeOpenChannelMessage(openPayload!);
+			delete open.channelType;
+			bob.handleMessage(
+				alicePubkey,
+				MessageType.OPEN_CHANNEL,
+				encodeOpenChannelMessage(open)
+			);
+
+			expect(
+				wire.map((m) => m.type),
+				'an error and no accept_channel'
+			).to.deep.equal([MessageType.ERROR]);
+			const refusal = decodeErrorMessage(wire[0].payload);
+			expect(refusal.channelId.equals(open.temporaryChannelId)).to.equal(true);
+			expect(refusal.data.toString('ascii')).to.equal(
+				'open_channel omitted channel_type'
+			);
+			expect(errors).to.deep.equal(['open_channel omitted channel_type']);
+			expect(bob.getTempChannel(open.temporaryChannelId)).to.equal(undefined);
+			expect(bob.listChannels()).to.have.length(0);
+		});
+
 		it('drops an open_channel under the reserved all-zero id, silently (issue 381)', function () {
 			// Every other refusal is now scoped to the id the opener chose, and
 			// BOLT 1 reserves the all-zero one for every channel with the peer, so
