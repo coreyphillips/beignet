@@ -15980,22 +15980,21 @@ export class Channel {
 		msg: ICommitmentSignedMessage
 	): ChannelAction[] {
 		const actions: ChannelAction[] = [];
-		// Make sure our own commitment_signed has gone out (the peer may send first).
+		// Make sure our own commitment_signed has gone out (the peer may send
+		// first). This can mark our commitment sent and queue its persist and
+		// send, so every return below carries these actions.
 		actions.push(...this._maybeSendSpliceCommitment());
 
 		const spliced = this._splicedState();
 		if (!spliced) {
-			return [
-				{
-					type: ChannelActionType.ERROR,
-					message: 'Unexpected splice commitment_signed: tx not built'
-				}
-			];
+			actions.push({
+				type: ChannelActionType.ERROR,
+				message: 'Unexpected splice commitment_signed: tx not built'
+			});
+			return actions;
 		}
 
-		// Route by funding_txid (internal byte order). If the peer specified a
-		// funding_txid that is neither our spliced tx nor the current funding tx,
-		// ignore it (BOLT: ignore commitment_signed whose funding_txid is unknown).
+		// Route by funding_txid (internal byte order).
 		const spliceTxid = this._spliceTx
 			? Buffer.from(this._spliceTx.tx.getHash())
 			: null;
@@ -16008,17 +16007,19 @@ export class Channel {
 				// splice). Accept silently; it is not the spliced commitment.
 				return actions;
 			}
-			// Peer's commitment is for a splice tx we did not build — the two sides
-			// constructed different splice transactions. Surface both txids (display
-			// order) so the divergence is visible.
+			// Stray commitments from an aborted splice were filtered out in
+			// handleCommitmentSigned, so this one is for a splice tx we did not
+			// build: the two sides negotiated different transactions and this
+			// splice can never complete. Fail the channel, as for an unknown
+			// batch member. Both txids (display order) show the divergence.
 			const peerTxid = Buffer.from(msg.fundingTxid).reverse().toString('hex');
 			const ourTxid = Buffer.from(spliceTxid).reverse().toString('hex');
-			return [
-				{
-					type: ChannelActionType.ERROR,
-					message: `splice commitment_signed funding_txid mismatch: peer=${peerTxid} ours=${ourTxid}`
-				}
-			];
+			actions.push(
+				...this._failChannelWithWireError(
+					`splice commitment_signed funding_txid mismatch: peer=${peerTxid} ours=${ourTxid}`
+				)
+			);
+			return actions;
 		}
 
 		// Cannot verify -> must not cache: the signature stored below is the
@@ -16026,13 +16027,12 @@ export class Channel {
 		// flag it sets gates the rest of the splice round. A plain ERROR, not
 		// a wire error: the missing pieces are a LOCAL invariant failure.
 		if (!this._signer || !this._state.remoteBasepoints) {
-			return [
-				{
-					type: ChannelActionType.ERROR,
-					message:
-						'Cannot verify splice commitment signature: no signer or remote basepoints'
-				}
-			];
+			actions.push({
+				type: ChannelActionType.ERROR,
+				message:
+					'Cannot verify splice commitment signature: no signer or remote basepoints'
+			});
+			return actions;
 		}
 		const ourPoint = getPerCommitmentPoint(
 			this._state.localPerCommitmentSeed,
@@ -16046,12 +16046,11 @@ export class Channel {
 			this._state.localCommitmentNumber
 		);
 		if (!valid) {
-			return [
-				{
-					type: ChannelActionType.ERROR,
-					message: 'Invalid splice commitment signature'
-				}
-			];
+			// BOLT 2: an invalid commitment signature fails the channel.
+			actions.push(
+				...this._failChannelWithWireError('Invalid splice commitment signature')
+			);
+			return actions;
 		}
 		// Committed HTLCs riding through the splice (S-2.M8) put HTLC
 		// outputs on the spliced commitment; verify the peer's second-level
@@ -16072,12 +16071,12 @@ export class Channel {
 					this._state.localCommitmentNumber
 			  );
 		if (!htlcSigsValid) {
-			return [
-				{
-					type: ChannelActionType.ERROR,
-					message: 'Invalid splice commitment HTLC signature'
-				}
-			];
+			actions.push(
+				...this._failChannelWithWireError(
+					'Invalid splice commitment HTLC signature'
+				)
+			);
+			return actions;
 		}
 		this._spliceRemoteCommitmentSig = Buffer.from(msg.signature);
 		this._spliceRemoteHtlcSigs = msg.htlcSignatures.map((s) => Buffer.from(s));
