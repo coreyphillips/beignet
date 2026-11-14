@@ -4310,6 +4310,7 @@ function invoice.msatToHrpAmount(amountMsat: bigint): string
 function invoice.parseHrp(hrp: string): { network: invoice.Network; amountMsat: bigint | null; }
 function invoice.signInvoice(hrp: string, dataWords: number[], privateKey: Buffer): Buffer
 function invoice.verifyInvoice(hrp: string, dataWords: number[], signature: Buffer): Buffer | null
+function invoice.verifyInvoiceSignature(hrp: string, dataWords: number[], signature: Buffer, pubkey: Buffer): boolean
 function invoice.wordsToBuffer(words: number[]): Buffer
 namespace keys
 class keys.ChannelSigner implements keys.ISigner

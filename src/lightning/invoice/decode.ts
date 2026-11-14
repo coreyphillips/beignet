@@ -16,14 +16,13 @@ import {
 } from './types';
 import { parseHrp } from './amount';
 import { wordsToBuffer, decodeUintFromWords, decodeTaggedField } from './words';
-import { verifyInvoice } from './signing';
+import { verifyInvoice, verifyInvoiceSignature } from './signing';
 import type { IBlindedPaymentPath } from '../onion/blinded-path';
 import { decodeInvoiceBlindedPaymentPaths } from '../onion/blinded-path';
 
 /**
  * BOLT 11 exact data_lengths (in 5-bit words) for the fixed-length tagged
  * fields: p/h/s are 52 words (256 bits + padding), n is 53 words (264 bits).
- * A field of any other length MUST be skipped, not truncated.
  */
 const FIXED_LENGTH_TAG_WORDS: Partial<Record<TagType, number>> = {
 	[TagType.PAYMENT_HASH]: 52,
@@ -32,17 +31,39 @@ const FIXED_LENGTH_TAG_WORDS: Partial<Record<TagType, number>> = {
 	[TagType.PAYEE_PUBKEY]: 53
 };
 
+/**
+ * Fields BOLT 11 allows once. With two, one component could show or record
+ * the first while the payer pays the second.
+ */
+const SINGLE_TAGS: ReadonlySet<number> = new Set([
+	TagType.PAYMENT_HASH,
+	TagType.PAYMENT_SECRET
+]);
+
+/** Fields a writer must encode in minimal length, with no leading zero word. */
+const MINIMAL_TAGS: ReadonlySet<number> = new Set([
+	TagType.MIN_FINAL_CLTV_EXPIRY,
+	TagType.EXPIRY,
+	TagType.FEATURE_BITS
+]);
+
+/** The bech32 character for a tag type, as BOLT 11 names its fields. */
+function tagLetter(type: number): string {
+	return 'qpzry9x8gf2tvdw0s3jn54khce6mua7l'[type];
+}
+
 /** How decode treats an invoice's signature. */
 export interface IDecodeOptions {
 	/**
-	 * Whether to recover the signer, reject an invoice whose signature does
-	 * not recover, and check the signer against an `n` field. On by default,
-	 * as BOLT 11 requires for any invoice that came from outside. Turn it off
-	 * only for an invoice this node issued and stored itself and now reads
-	 * back, as a phone does with each request it saved on every start: its
-	 * signature is the node's own, and recovering it costs tens of
-	 * milliseconds of pure-JS secp256k1 on a phone. Every other field is
-	 * parsed and checked the same way, and `recoveredPubkey` is left out.
+	 * Whether to check the signature. With an `n` field it must be a low-S
+	 * signature by that key; without one the signer is recovered, and either
+	 * S is accepted. On by default, as BOLT 11 requires for any invoice that
+	 * came from outside. Turn it off only for an invoice this node issued and
+	 * stored itself and now reads back, as a phone does with each request it
+	 * saved on every start: its signature is the node's own, and checking it
+	 * costs tens of milliseconds of pure-JS secp256k1 on a phone. Every other
+	 * field is parsed and checked the same way, and `recoveredPubkey` is left
+	 * out.
 	 */
 	recoverSigner?: boolean;
 }
@@ -85,40 +106,41 @@ export function decode(
 	// Tagged fields are between timestamp and signature
 	const taggedWords = Array.from(words.slice(TIMESTAMP_WORDS, sigStart));
 
-	// Verify signature and recover pubkey. BOLT 11: an invoice whose signature
-	// does not recover to a public key is invalid and MUST be rejected — do not
-	// return a half-parsed invoice with no recoverable payee.
-	let recoveredPubkey: Buffer | null = null;
-	if (options.recoverSigner !== false) {
-		const dataWords = Array.from(words.slice(0, sigStart));
-		recoveredPubkey = verifyInvoice(prefix, dataWords, signature);
-		if (!recoveredPubkey) {
-			throw new Error('Invoice signature is not recoverable');
-		}
-	}
-
 	// Parse tagged fields
 	const result: Partial<IInvoice> = {};
 	const unknownTags: Array<{ type: number; words: number[] }> = [];
 	const routingHints: IRoutingHintHop[][] = [];
 	let blindedPaths: IBlindedPaymentPath[] | undefined;
+	const seenSingleTags = new Set<number>();
 
 	let offset = 0;
 	while (offset < taggedWords.length) {
 		const field = decodeTaggedField(taggedWords, offset);
 		offset = field.nextOffset;
 
-		// BOLT 11: a reader MUST skip over p, h, s or n fields that do not have
-		// data_lengths of 52, 52, 52 or 53 respectively. Truncating an over-length
-		// field instead would yield a wrong payment hash / secret / payee that we
-		// would then try to pay.
 		const expectedWords = FIXED_LENGTH_TAG_WORDS[field.type as TagType];
 		if (
 			expectedWords !== undefined &&
 			field.dataWords.length !== expectedWords
 		) {
-			unknownTags.push({ type: field.type, words: field.dataWords });
-			continue;
+			throw new Error(
+				`Invoice field ${tagLetter(field.type)} has data_length ${
+					field.dataWords.length
+				}, expected ${expectedWords}`
+			);
+		}
+		if (SINGLE_TAGS.has(field.type)) {
+			if (seenSingleTags.has(field.type)) {
+				throw new Error(
+					`Invoice has more than one ${tagLetter(field.type)} field`
+				);
+			}
+			seenSingleTags.add(field.type);
+		}
+		if (MINIMAL_TAGS.has(field.type) && field.dataWords[0] === 0) {
+			throw new Error(
+				`Invoice field ${tagLetter(field.type)} starts with a zero word`
+			);
 		}
 
 		switch (field.type) {
@@ -171,17 +193,33 @@ export function decode(
 		throw new Error('Invoice missing required payment_hash (tag 1)');
 	}
 
-	// BOLT 11: when an `n` field is present the reader MUST use it to validate
-	// the signature (equivalently: the recovered key must BE `n`). Otherwise a
-	// signature by anyone routes a payment to the claimed payee.
-	if (
-		recoveredPubkey &&
-		result.payeeNodeKey &&
-		!result.payeeNodeKey.equals(recoveredPubkey)
-	) {
-		throw new Error(
-			'Invoice signature does not match the payee node id (n field)'
-		);
+	// BOLT 11: with an `n` field the signature is checked against it, and must
+	// be low-S; recovery would accept a high-S copy of the same invoice. With
+	// no `n`, an invoice whose signature does not recover is refused rather
+	// than returned with no payee.
+	let recoveredPubkey: Buffer | null = null;
+	if (options.recoverSigner !== false) {
+		const dataWords = Array.from(words.slice(0, sigStart));
+		if (result.payeeNodeKey) {
+			if (
+				!verifyInvoiceSignature(
+					prefix,
+					dataWords,
+					signature,
+					result.payeeNodeKey
+				)
+			) {
+				throw new Error(
+					'Invoice signature is not a low-S signature by the payee node id (n field)'
+				);
+			}
+			recoveredPubkey = Buffer.from(result.payeeNodeKey);
+		} else {
+			recoveredPubkey = verifyInvoice(prefix, dataWords, signature);
+			if (!recoveredPubkey) {
+				throw new Error('Invoice signature is not recoverable');
+			}
+		}
 	}
 
 	// Validate: must have exactly one of description or description_hash
