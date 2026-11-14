@@ -152,6 +152,26 @@ function restrictFileMode(filePath: string): void {
 	}
 }
 
+function columnNames(db: Database.Database, table: string): Set<string> {
+	const rows = db.pragma(`table_info(${table})`) as Array<{ name: string }>;
+	return new Set(rows.map((row) => row.name));
+}
+
+/**
+ * Add a column an older release's table lacks. A fresh database already has
+ * it (_createTables), so the ALTER runs only when it is missing, and any
+ * error it throws rolls the migration back rather than recording it done.
+ */
+function addColumnIfMissing(
+	db: Database.Database,
+	table: string,
+	column: string,
+	definition: string
+): void {
+	if (columnNames(db, table).has(column)) return;
+	db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+}
+
 /** A recovery_frames row as read; a header query leaves out the last two. */
 interface IRecoveryFrameRow {
 	sequence: unknown;
@@ -433,8 +453,136 @@ export class SqliteStorage implements IStorageBackend {
 
 	// ─── Schema ───
 
-	/** Current schema version. Increment when adding migrations. */
+	/**
+	 * Current schema version. Increment when adding migrations, and commit a
+	 * fixture of the schema before it (scripts/storage-fixture.ts).
+	 */
 	static readonly CURRENT_SCHEMA_VERSION = 20;
+
+	/**
+	 * The columns this class reads and writes, by table: a new database's,
+	 * less channels.channel_index (migration 0->1), which nothing reads.
+	 * open() refuses a database that lacks one after its migrations, so a
+	 * migration that did not take fails there instead of in whichever
+	 * statement first names the column. sqlite-schema-upgrade.test.ts keeps
+	 * this list equal to what _createTables and the migrations build.
+	 */
+	private static readonly REQUIRED_COLUMNS: Readonly<
+		Record<string, ReadonlyArray<string>>
+	> = {
+		action_log: ['id', 'category', 'action', 'timestamp', 'data'],
+		announced_peer_addresses: [
+			'pubkey',
+			'announcement_timestamp',
+			'addresses_json'
+		],
+		chain_monitors: ['channel_id', 'state_json'],
+		channel_key_indices: ['channel_id', 'channel_index'],
+		channel_policies: ['channel_id', 'policy_json'],
+		channels: ['channel_id', 'state_json', 'peer_pubkey'],
+		composite_splices: ['id', 'record_json'],
+		encryption_scrub_pending: ['id'],
+		ffor_vouchers: ['id', 'record_json'],
+		forwarded_htlcs: ['out_key', 'in_channel_id', 'in_htlc_id'],
+		forwarding_events: [
+			'id',
+			'settled_at',
+			'in_channel_id',
+			'out_channel_id',
+			'in_scid',
+			'out_scid',
+			'amount_in_msat',
+			'amount_out_msat',
+			'fee_msat'
+		],
+		gossip_channels: ['scid_hex', 'channel_json'],
+		gossip_nodes: ['node_id_hex', 'node_json'],
+		htlc_payment_map: ['htlc_key', 'payment_hash_hex'],
+		htlc_shared_secrets: ['key', 'secret'],
+		invoice_path_ids: ['payment_hash_hex', 'path_id'],
+		invoices: ['payment_hash_hex', 'invoice_json'],
+		metadata: ['key', 'value'],
+		mission_control: ['id', 'data_json'],
+		offers: ['offer_id', 'encoded', 'path_id', 'created_at', 'async_hold'],
+		payment_queue: [
+			'id',
+			'bolt11',
+			'priority',
+			'status',
+			'amount_sats',
+			'max_fee_sats',
+			'metadata',
+			'error',
+			'created_at',
+			'completed_at'
+		],
+		payment_secrets: ['payment_hash_hex', 'secret'],
+		payments: [
+			'payment_hash',
+			'payment_json',
+			'created_at',
+			'status',
+			'direction',
+			'metadata_tags'
+		],
+		peer_addresses: [
+			'pubkey',
+			'host',
+			'port',
+			'last_connected',
+			'transport_json'
+		],
+		peer_storage_blobs: ['peer_pubkey', 'blob', 'received_at'],
+		preimages: ['payment_hash', 'preimage'],
+		recovery_frames: [
+			'sequence',
+			'writer_epoch',
+			'frame_hash',
+			'previous_hash',
+			'ciphertext',
+			'created_at'
+		],
+		recovery_meta: ['key', 'value'],
+		recovery_outbox: [
+			'id',
+			'peer_pubkey',
+			'channel_id',
+			'message_type',
+			'wire_message',
+			'disposition',
+			'frame_sequence',
+			'created_at'
+		],
+		revoked_htlc_snapshots: ['channel_id', 'commitment_number', 'htlcs_json'],
+		schema_version: ['version'],
+		scid_mappings: ['scid_hex', 'channel_id'],
+		wallet_data: ['key', 'value'],
+		watchtower_sessions: [
+			'session_id',
+			'tower_uri',
+			'tower_pubkey',
+			'session_key',
+			'blob_type',
+			'max_updates',
+			'sweep_fee_rate',
+			'seq_num',
+			'last_applied',
+			'created_at',
+			'dials_with_session_key'
+		],
+		watchtower_updates: [
+			'id',
+			'tower_uri',
+			'channel_id',
+			'hint',
+			'encrypted_blob',
+			'seq_num',
+			'acked',
+			'created_at',
+			'blob_type'
+		],
+		webhooks: ['id', 'url', 'events', 'secret_hash', 'created_at']
+	};
 
 	/**
 	 * Row cap for forwarding_events: bounds DB growth on busy routing nodes.
@@ -975,6 +1123,30 @@ export class SqliteStorage implements IStorageBackend {
 
 		// Run migrations
 		this._runMigrations();
+		this._checkRequiredColumns();
+	}
+
+	/**
+	 * CREATE TABLE IF NOT EXISTS never adds a column to a table an older
+	 * release created, so a column only a migration adds is missing for good
+	 * once that migration is recorded without it.
+	 */
+	private _checkRequiredColumns(): void {
+		const missing: string[] = [];
+		for (const [table, required] of Object.entries(
+			SqliteStorage.REQUIRED_COLUMNS
+		)) {
+			const present = columnNames(this.db, table);
+			for (const column of required) {
+				if (!present.has(column)) missing.push(`${table}.${column}`);
+			}
+		}
+		if (missing.length > 0) {
+			throw new Error(
+				`SQLite database at schema version ${this.getSchemaVersion()} ` +
+					`is missing ${missing.join(', ')}; refusing to open it`
+			);
+		}
 	}
 
 	// ─── Channels ───
@@ -2068,14 +2240,12 @@ export class SqliteStorage implements IStorageBackend {
 			// Migration 0→1: Add peer_addresses, channel_key_indices tables
 			// (tables already created in _createTables via CREATE IF NOT EXISTS)
 			(db): void => {
-				// Ensure column exists on pre-existing channels table
-				try {
-					db.exec(
-						'ALTER TABLE channels ADD COLUMN channel_index INTEGER DEFAULT 0'
-					);
-				} catch {
-					// Column may already exist
-				}
+				addColumnIfMissing(
+					db,
+					'channels',
+					'channel_index',
+					'INTEGER DEFAULT 0'
+				);
 			},
 			// Migration 1→2: Add webhooks and payment_queue tables
 			// (tables already created in _createTables via CREATE IF NOT EXISTS)
@@ -2130,20 +2300,18 @@ export class SqliteStorage implements IStorageBackend {
 			// dials_with_session_key records which Noise key the tower keyed the
 			// session to; pre-existing rows used the node identity key (0).
 			(db): void => {
-				try {
-					db.exec(
-						'ALTER TABLE watchtower_updates ADD COLUMN blob_type INTEGER NOT NULL DEFAULT 2'
-					);
-				} catch {
-					// Column may already exist (fresh DBs create it in _createTables)
-				}
-				try {
-					db.exec(
-						'ALTER TABLE watchtower_sessions ADD COLUMN dials_with_session_key INTEGER NOT NULL DEFAULT 0'
-					);
-				} catch {
-					// Column may already exist
-				}
+				addColumnIfMissing(
+					db,
+					'watchtower_updates',
+					'blob_type',
+					'INTEGER NOT NULL DEFAULT 2'
+				);
+				addColumnIfMissing(
+					db,
+					'watchtower_sessions',
+					'dials_with_session_key',
+					'INTEGER NOT NULL DEFAULT 0'
+				);
 			},
 			// Migration 9->10: offers table (BOLT 12 offer persistence, so a
 			// shared offer survives a restart instead of dying with the
@@ -2160,13 +2328,12 @@ export class SqliteStorage implements IStorageBackend {
 			// offers.async_hold (an async-hold offer must keep issuing LSP
 			// hold payment paths after a restart).
 			(db): void => {
-				try {
-					db.exec(
-						'ALTER TABLE offers ADD COLUMN async_hold INTEGER NOT NULL DEFAULT 0'
-					);
-				} catch {
-					// Column may already exist (fresh DBs create it in _createTables)
-				}
+				addColumnIfMissing(
+					db,
+					'offers',
+					'async_hold',
+					'INTEGER NOT NULL DEFAULT 0'
+				);
 			},
 			// Migration 11->12: recovery_outbox table (Recovery Protocol phase 1,
 			// docs/RECOVERY-PROTOCOL.md 5.2). Created via CREATE IF NOT EXISTS
