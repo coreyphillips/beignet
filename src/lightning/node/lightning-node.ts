@@ -5121,6 +5121,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		// event where the restore repair above is not.
 		this.channelManager.on('channel:reestablished', (channelId: Buffer) => {
 			this.sendPrivateChannelPolicy(channelId);
+			this.triggerPendingAnnouncementSigning(channelId);
 			this.settleForwardsOwedUpstream(channelId);
 			this.fulfillSettledReceivedHtlcs(channelId);
 			// A conflict verdict the peer has not yet agreed is re-asked on
@@ -5159,9 +5160,8 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			// and waitForReady() spuriously times out. Idempotent via _readyEmitted.
 			this.emitReady();
 
-			// After reestablish, check if we still need to send announcement_signatures.
-			// This handles the case where LND sent its sigs before, but beignet never
-			// sent back (e.g. ChainWatcher didn't fire announcement:depth).
+			// The depth trigger may have fired before the channel was NORMAL, or
+			// the peer's announcement_signatures may already be in.
 			this.triggerPendingAnnouncementSigning(channelId);
 		});
 
@@ -6399,8 +6399,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	 * have come from the peer, e.g. a post-splice re-announcement). Before
 	 * signing, verify the SCID actually points at this channel's CURRENT
 	 * funding transaction via a merkle-position lookup — signing a stale or
-	 * bogus SCID produces an announcement the network rejects and burns our
-	 * one announcement_signatures send for the session.
+	 * bogus SCID produces an announcement the network rejects.
 	 */
 	private async signAnnouncementForScid(
 		channelId: Buffer,
@@ -6469,16 +6468,15 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	}
 
 	/**
-	 * Check if a channel needs announcement_signatures sent and trigger signing.
-	 * Called after channel reaches NORMAL (including after reestablishment).
+	 * Owe the peer our announcement_signatures? Called when a channel reaches
+	 * NORMAL: first channel_ready, and every reestablish after it.
 	 */
 	private triggerPendingAnnouncementSigning(channelId: Buffer): void {
-		const channel = this.channelManager
-			.listChannels()
-			.find((ch) => ch.getChannelId()?.equals(channelId));
+		const channel = this.channelManager.getChannel(channelId);
 		if (!channel) return;
 
 		const state = channel.getFullState();
+		if (state.state !== ChannelState.NORMAL) return;
 		if (
 			state.announcementSigsReceived &&
 			!state.announcementSigsSent &&
@@ -6488,6 +6486,31 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			// verified against the funding tx's actual position before signing
 			// (it can be stale, e.g. from a pre-splice funding generation).
 			void this.signAnnouncementForScid(channelId, state.shortChannelId);
+			return;
+		}
+		// BOLT 7: on reconnection, a node that has not received the peer's
+		// announcement_signatures sends its own again.
+		if (
+			state.announceChannel &&
+			state.announcementSigsSent &&
+			!state.announcementSigsReceived
+		) {
+			this.channelManager.resendAnnouncementSignatures(channelId);
+			return;
+		}
+		// Nothing signed yet, or a private channel with no real SCID: the
+		// one-shot depth trigger may have fired while the channel was not NORMAL
+		// (peer offline at the sixth confirmation). Re-arm it; it fires now if
+		// the funding is deep enough, else at the block that makes it so.
+		const unsigned =
+			state.announceChannel &&
+			!state.announcementSigsSent &&
+			!state.announcementSigsReceived;
+		if ((unsigned || !state.shortChannelId) && state.fundingTxid) {
+			this.chainWatcher?.rearmAnnouncementTracking(
+				channelId,
+				Buffer.from(state.fundingTxid).reverse().toString('hex')
+			);
 		}
 	}
 
@@ -16975,7 +16998,8 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	 * announceChannel alone is an INTENT flag: it stays true on pending and
 	 * closed channels, and a preferTaproot opener keeps it true while the
 	 * wire flag is private, so gating on it suppressed valid private paths
-	 * (issue #544 review).
+	 * (issue #544 review). A pair signed before 6 confirmations is held by
+	 * the ChannelManager and is not in anyone's graph yet.
 	 */
 	private hasPublishedPublicChannel(): boolean {
 		return this.channelManager.listChannels().some((channel) => {
@@ -16984,6 +17008,9 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				st.announceChannel === true &&
 				st.announcementSigsSent &&
 				st.announcementSigsReceived &&
+				!(
+					st.channelId && this.channelManager.isAnnouncementHeld(st.channelId)
+				) &&
 				channel.acceptsNewHtlcs(true)
 			);
 		});
