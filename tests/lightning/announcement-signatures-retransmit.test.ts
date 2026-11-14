@@ -437,6 +437,72 @@ describe('announcement_signatures retransmission (issue #2041)', function () {
 		expect(annSigsFrom(delivered, 'a')).to.equal(2);
 	});
 
+	it('answers again on the same connection for a new funding generation', function () {
+		const { a, b, channelId, drop, delivered } = setupPair();
+		const spliceBlock = FUNDING_BLOCK + 100;
+		a.manager.handleNewBlock(spliceBlock + 5);
+		b.manager.handleNewBlock(spliceBlock + 5);
+		drop.aToB = true;
+		depthReached(a, channelId);
+		drop.aToB = false;
+		depthReached(b, channelId);
+		expect(annSigsFrom(delivered, 'a')).to.equal(1);
+
+		// A splice locks without a reconnect, and A's new signatures are lost
+		// the same way.
+		for (const side of [a, b]) {
+			const st = writableState(side.channel);
+			st.announcementSigsSent = false;
+			st.announcementSigsReceived = false;
+			st.localAnnouncementNodeSig = null;
+			st.localAnnouncementBitcoinSig = null;
+			st.remoteAnnouncementNodeSig = null;
+			st.remoteAnnouncementBitcoinSig = null;
+		}
+		const signSplice = (side: ISide): void =>
+			side.manager.triggerAnnouncementDepth(
+				channelId,
+				spliceBlock,
+				7,
+				side.nodeId,
+				side.sign
+			);
+		drop.aToB = true;
+		signSplice(a);
+		drop.aToB = false;
+		signSplice(b);
+
+		expect(annSigsFrom(delivered, 'a'), 'A answered the new SCID').to.equal(2);
+		const ann = verifyFullAnnouncement(b.ready[b.ready.length - 1]);
+		expect(
+			ann.scid.equals(
+				encodeShortChannelId({ block: spliceBlock, txIndex: 7, outputIndex: 0 })
+			)
+		).to.be.true;
+		expect(ann.allValid).to.be.true;
+	});
+
+	it('rebuilds the announcement when a re-sent message repairs our signature', function () {
+		const { a, b, channelId } = setupPair();
+		a.manager.handleNewBlock(FUNDING_BLOCK + 5);
+		b.manager.handleNewBlock(FUNDING_BLOCK + 5);
+		depthReached(a, channelId);
+		depthReached(b, channelId);
+		expect(a.ready.length).to.equal(1);
+
+		// A stored bitcoin signature made with the wrong key, as older
+		// versions did.
+		writableState(a.channel).localAnnouncementBitcoinSig =
+			crypto.randomBytes(64);
+		reconnect(a, b);
+		b.manager.resendAnnouncementSignatures(channelId);
+
+		expect(a.ready.length, 'A rebuilt it with the repaired signature').to.equal(
+			2
+		);
+		expect(verifyFullAnnouncement(a.ready[1]).allValid).to.be.true;
+	});
+
 	it('signs for a peer that signs at 3 confirmations and holds the announcement until the sixth', function () {
 		const { a, b, channelId, drop, delivered } = setupPair();
 		// 3 confirmations: the channel is NORMAL but not announceable.
@@ -677,7 +743,13 @@ describe('LightningNode announcement work after reestablish (issue #2041)', func
 		expect(cm.isAnnouncementHeld(channelId)).to.be.true;
 		expect((node as any).hasPublishedPublicChannel()).to.be.false;
 
+		// After a restart the set stays empty until the graph restore
+		// rebuilds the announcement, and the depth still decides.
 		(cm as any)._announcementsHeldForDepth.clear();
+		expect(cm.isAnnouncementHeld(channelId)).to.be.true;
+		expect((node as any).hasPublishedPublicChannel()).to.be.false;
+
+		(cm as any)._currentBlockHeight = FUNDING_BLOCK + 5;
 		expect((node as any).hasPublishedPublicChannel()).to.be.true;
 		node.destroy();
 	});

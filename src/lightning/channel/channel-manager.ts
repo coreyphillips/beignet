@@ -9265,7 +9265,12 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 
 	/** Whether the channel's signed announcement is waiting for depth. */
 	isAnnouncementHeld(channelId: Buffer): boolean {
-		return this._announcementsHeldForDepth.has(channelId.toString('hex'));
+		const idHex = channelId.toString('hex');
+		if (this._announcementsHeldForDepth.has(idHex)) return true;
+		// A restored channel joins the set only when it is next rebuilt, so
+		// its depth is judged here too.
+		const scid = this.channels.get(idHex)?.getShortChannelId();
+		return !!scid && !this._scidAtAnnouncementDepth(scid);
 	}
 
 	private _scidAtAnnouncementDepth(scid: Buffer): boolean {

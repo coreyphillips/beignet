@@ -32,10 +32,12 @@ export interface IAnnouncementHost {
 
 export class ChannelAnnouncements {
 	private readonly _host: IAnnouncementHost;
-	// We answered a peer's announcement_signatures on this connection. BOLT 7
-	// asks for a reply to every one received, so two nodes that both follow it
-	// would answer each other forever without this latch. Cleared on disconnect.
-	private _repliedOnConnection = false;
+	// The SCID we answered a peer's announcement_signatures for on this
+	// connection. BOLT 7 asks for a reply to every one received, so two nodes
+	// that both follow it would answer each other forever without this latch.
+	// Keyed by SCID so a splice's announcement gets its own reply. Cleared on
+	// disconnect.
+	private _repliedForScid: Buffer | null = null;
 
 	constructor(host: IAnnouncementHost) {
 		this._host = host;
@@ -197,6 +199,7 @@ export class ChannelAnnouncements {
 			// announcement advertises the per-channel key — peers reject it with
 			// "Bad bitcoin_signature"). Verify against the advertised key and
 			// re-sign with the channel signer when invalid.
+			const storedBitcoinSig = localBitcoinSig;
 			localBitcoinSig = this._repairAnnouncementBitcoinSig(
 				localNodeId,
 				remoteNodeId,
@@ -206,28 +209,31 @@ export class ChannelAnnouncements {
 			// ours (lost before a disconnect, or dropped because it was not
 			// ready for it), and only our signatures let it build the
 			// announcement too.
-			if (!this._repliedOnConnection) {
-				this._repliedOnConnection = true;
+			const scid = this._state.shortChannelId!;
+			if (!this._repliedForScid?.equals(scid)) {
+				this._repliedForScid = Buffer.from(scid);
 				actions.push(
 					sendMsg(
 						MessageType.ANNOUNCEMENT_SIGNATURES,
 						encodeAnnouncementSignaturesMessage({
 							channelId: this._state.channelId!,
-							shortChannelId: this._state.shortChannelId!,
+							shortChannelId: scid,
 							nodeSignature: localNodeSig,
 							bitcoinSignature: localBitcoinSig
 						})
 					)
 				);
 			}
-			const ready = duplicate
-				? null
-				: this.buildFullAnnouncement(
-						localNodeId,
-						remoteNodeId,
-						localNodeSig,
-						localBitcoinSig
-				  );
+			// A repaired signature changes the announcement, so it is rebuilt.
+			const ready =
+				duplicate && localBitcoinSig === storedBitcoinSig
+					? null
+					: this.buildFullAnnouncement(
+							localNodeId,
+							remoteNodeId,
+							localNodeSig,
+							localBitcoinSig
+					  );
 			if (ready) actions.push(ready);
 		}
 
@@ -278,7 +284,7 @@ export class ChannelAnnouncements {
 
 	/** The connection carrying this channel dropped. */
 	handleDisconnect(): void {
-		this._repliedOnConnection = false;
+		this._repliedForScid = null;
 	}
 
 	/**
