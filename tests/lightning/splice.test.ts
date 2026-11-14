@@ -2356,6 +2356,186 @@ describe('Splice', function () {
 			expect((opener as any)._spliceReceivedCommitment).to.equal(false);
 		});
 
+		describe('refusing the peer splice commitment_signed (issue #2064)', function () {
+			/**
+			 * The opener at the mid-splice commitment exchange with its own
+			 * commitment_signed owed again, as a reestablish that asks for a
+			 * retransmit leaves it: the peer's commitment_signed is then what
+			 * sends ours.
+			 */
+			function openerOwingSpliceCommitment(): {
+				opener: Channel;
+				channelId: Buffer;
+			} {
+				const { opener } = makeNormalChannel();
+				quiesce(opener);
+				const channelId = opener.getChannelId()!;
+				const destScript = Buffer.concat([
+					Buffer.from([0x00, 0x14]),
+					crypto.randomBytes(20)
+				]);
+				const withdraw = 50_000n;
+				const spliceOutFee = spliceFeeSats(
+					estimateSpliceTxWeight({
+						walletInputCount: 0,
+						destinationScriptLen: destScript.length
+					}),
+					253
+				);
+				opener.setSpliceOutDestination(destScript, withdraw);
+				opener.initiateSplice(-(withdraw + spliceOutFee), 253);
+				opener.handleSpliceAck({
+					channelId,
+					fundingPubkey: makeBasepoints(acceptorSeed).fundingPubkey,
+					relativeSatoshis: 0n
+				});
+				opener.handleTxComplete();
+				opener.handleTxComplete();
+				const done = opener.handleTxComplete();
+				expect(findSendAction(done, MessageType.COMMITMENT_SIGNED)).to.exist;
+				// eslint-disable-next-line @typescript-eslint/no-explicit-any
+				(opener as any)._spliceSentCommitment = false;
+				return { opener, channelId };
+			}
+
+			function expectOursSentAndChannelFailed(
+				opener: Channel,
+				actions: ChannelAction[],
+				reason: string
+			): void {
+				// Our commitment_signed, and the persist ahead of it, still leave.
+				const ours = findSendAction(actions, MessageType.COMMITMENT_SIGNED);
+				expect(ours, 'our commitment_signed').to.exist;
+				const persistAt = actions.findIndex(
+					(a) => a.type === ChannelActionType.PERSIST_STATE
+				);
+				expect(persistAt).to.be.within(0, actions.indexOf(ours) - 1);
+				// The peer is told on the wire and the channel is failed.
+				const wire = findSendAction(actions, MessageType.ERROR);
+				expect(wire, 'wire error').to.exist;
+				expect(decodeErrorMessage(wire.payload).data.toString()).to.contain(
+					reason
+				);
+				expect(opener.getState()).to.equal(ChannelState.ERRORED);
+				// Nothing of the refused commitment is kept.
+				// eslint-disable-next-line @typescript-eslint/no-explicit-any
+				expect((opener as any)._spliceRemoteCommitmentSig).to.equal(null);
+				// eslint-disable-next-line @typescript-eslint/no-explicit-any
+				expect((opener as any)._spliceReceivedCommitment).to.equal(false);
+			}
+
+			it('keeps our commitment_signed and fails the channel on an invalid signature', function () {
+				const { opener, channelId } = openerOwingSpliceCommitment();
+				const actions = opener.handleCommitmentSigned({
+					channelId,
+					signature: Buffer.alloc(64, 0x01),
+					htlcSignatures: []
+				});
+				expectOursSentAndChannelFailed(
+					opener,
+					actions,
+					'Invalid splice commitment signature'
+				);
+			});
+
+			it('keeps our commitment_signed and fails the channel on an unknown funding_txid', function () {
+				const { opener, channelId } = openerOwingSpliceCommitment();
+				const actions = opener.handleCommitmentSigned({
+					channelId,
+					signature: Buffer.alloc(64, 0x01),
+					htlcSignatures: [],
+					fundingTxid: Buffer.alloc(32, 0x5a)
+				});
+				expectOursSentAndChannelFailed(
+					opener,
+					actions,
+					'splice commitment_signed funding_txid mismatch'
+				);
+			});
+
+			it('keeps our commitment_signed when the commitment is for the current funding', function () {
+				const { opener, channelId } = openerOwingSpliceCommitment();
+				const actions = opener.handleCommitmentSigned({
+					channelId,
+					signature: Buffer.alloc(64, 0x01),
+					htlcSignatures: [],
+					fundingTxid: opener.getFullState().fundingTxid!
+				});
+				expect(findSendAction(actions, MessageType.COMMITMENT_SIGNED)).to.exist;
+				expect(findAction(actions, ChannelActionType.ERROR)).to.not.exist;
+				expect(opener.getState()).to.equal(ChannelState.SPLICING);
+			});
+
+			it('fails the channel on the wire for an invalid splice HTLC signature', function () {
+				const pair = createNormalChannelPair();
+				// The acceptor's splice commitment_signed reaches the opener with
+				// one HTLC signature too many (the splice carries no HTLCs), so
+				// its commitment signature verifies and the HTLC check refuses.
+				pair.acceptorManager.removeAllListeners('message:outbound');
+				pair.acceptorManager.on(
+					'message:outbound',
+					(peerPubkey: string, type: number, payload: Buffer) => {
+						if (peerPubkey !== pair.openerPubkey) return;
+						let delivered = payload;
+						if (
+							type === MessageType.COMMITMENT_SIGNED &&
+							pair.openerChannel.getState() === ChannelState.SPLICING
+						) {
+							const msg = decodeCommitmentSignedMessage(payload);
+							delivered = encodeCommitmentSignedMessage({
+								...msg,
+								htlcSignatures: [...msg.htlcSignatures, Buffer.alloc(64, 0x01)]
+							});
+						}
+						pair.openerManager.handleMessage(
+							pair.acceptorPubkey,
+							type,
+							delivered
+						);
+					}
+				);
+				const errorsToAcceptor: string[] = [];
+				pair.openerManager.on(
+					'message:outbound',
+					(peerPubkey: string, type: number, payload: Buffer) => {
+						if (
+							peerPubkey === pair.acceptorPubkey &&
+							type === MessageType.ERROR
+						) {
+							errorsToAcceptor.push(
+								decodeErrorMessage(payload).data.toString()
+							);
+						}
+					}
+				);
+
+				pair.openerManager.initiateQuiescence(pair.channelId);
+				const destScript = Buffer.concat([
+					Buffer.from([0x00, 0x14]),
+					crypto.randomBytes(20)
+				]);
+				const withdraw = 50_000n;
+				const spliceOutFee = spliceFeeSats(
+					estimateSpliceTxWeight({
+						walletInputCount: 0,
+						destinationScriptLen: destScript.length
+					}),
+					253
+				);
+				pair.openerChannel.setSpliceOutDestination(destScript, withdraw);
+				pair.openerManager.initiateSplice(
+					pair.channelId,
+					-(withdraw + spliceOutFee),
+					253
+				);
+
+				expect(errorsToAcceptor).to.deep.equal([
+					'Invalid splice commitment HTLC signature'
+				]);
+				expect(pair.openerChannel.getState()).to.equal(ChannelState.ERRORED);
+			});
+		});
+
 		it('should unwind the splice on peer tx_abort (channel returns to NORMAL)', function () {
 			const { acceptor } = makeNormalChannel();
 			quiesceAsResponder(acceptor);
