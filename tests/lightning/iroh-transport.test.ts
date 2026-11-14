@@ -29,6 +29,9 @@ import {
 import { parsePeerUri } from '../../src/lightning/transport/peer-uri';
 import { parseScbAddress } from '../../src/lightning/backup/scb';
 import { PeerManager } from '../../src/lightning/transport/peer-manager';
+import { Peer } from '../../src/lightning/transport/peer';
+import { MessageType } from '../../src/lightning/message/types';
+import { getPublicKey } from '../../src/lightning/crypto/ecdh';
 import { LightningNode } from '../../src/lightning/node/lightning-node';
 import { SqliteStorage } from '../../src/lightning/storage/sqlite-storage';
 
@@ -247,6 +250,69 @@ describe('Iroh duplex adapter', () => {
 		stream.closedResult.resolve();
 		await closed;
 		expect(stream.closeCount).to.equal(1);
+	});
+});
+
+describe('Iroh peer dropped after a warning (issue #2044)', () => {
+	const remoteKey = Buffer.alloc(32, 3);
+	const remote = getPublicKey(remoteKey).toString('hex');
+
+	/** A registered, ready Peer over an Iroh stream, with a null cipher. */
+	function registeredPeer(stream: IIrohStream): PeerManager {
+		const pm = new PeerManager({ localPrivateKey: Buffer.alloc(32, 1) });
+		const peer = new Peer({
+			localPrivateKey: Buffer.alloc(32, 1),
+			remotePublicKey: getPublicKey(remoteKey),
+			host: ID,
+			port: 0
+		});
+		peer.on('error', () => undefined);
+		const internals = peer as unknown as {
+			state: string;
+			socket: IrohTransport;
+			transport: { encryptPacket(message: Buffer): Buffer };
+		};
+		internals.state = 'ready';
+		internals.socket = new IrohTransport(stream);
+		internals.transport = { encryptPacket: (message): Buffer => message };
+		(pm as unknown as { peers: Map<string, Peer> }).peers.set(remote, peer);
+		return pm;
+	}
+
+	it('lets the queued warning reach the stream before the transport closes', async () => {
+		const stream = fakeStream();
+		const release = deferred<void>();
+		stream.writeAll = async (bytes): Promise<void> => {
+			stream.writes.push(bytes);
+			await release.promise;
+		};
+		const pm = registeredPeer(stream);
+		pm.sendToPeer(remote, MessageType.PING, Buffer.from('0001000000', 'hex'));
+		pm.sendToPeer(remote, MessageType.WARNING, Buffer.alloc(34));
+		pm.disconnectPeer(remote, 1_000);
+		expect(pm.getPeer(remote)).to.equal(undefined);
+		expect(stream.closeCount).to.equal(0);
+
+		release.resolve();
+		for (let i = 0; i < 20 && stream.closeCount === 0; i++) await tick();
+		const types = stream.writes
+			.filter((bytes) => bytes.length >= 2)
+			.map((bytes) => Buffer.from(bytes).readUInt16BE(0));
+		expect(types).to.deep.equal([MessageType.PING, MessageType.WARNING]);
+		expect(stream.closeCount).to.equal(1);
+		pm.destroy();
+	});
+
+	it('closes the transport after the bound when the write never completes', async () => {
+		const stream = fakeStream();
+		stream.writeAll = (): Promise<void> => new Promise(() => undefined);
+		const pm = registeredPeer(stream);
+		pm.sendToPeer(remote, MessageType.WARNING, Buffer.alloc(34));
+		pm.disconnectPeer(remote, 20);
+		expect(stream.closeCount).to.equal(0);
+		await new Promise((resolve) => setTimeout(resolve, 60));
+		expect(stream.closeCount).to.equal(1);
+		pm.destroy();
 	});
 });
 

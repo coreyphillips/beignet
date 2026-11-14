@@ -1204,11 +1204,12 @@ export class PeerManager extends EventEmitter {
 	private removeRegisteredPeer(
 		pubkey: string,
 		peer: Peer,
-		reason?: string
+		reason?: string,
+		flushMs?: number
 	): void {
 		if (this.peers.get(pubkey) !== peer) return;
 		peer.removeAllListeners();
-		peer.disconnect();
+		peer.disconnect(flushMs);
 		this.peers.delete(pubkey);
 		this.clearStabilityTimer(pubkey);
 		const info = this.takeDisconnectInfo(
@@ -1299,9 +1300,10 @@ export class PeerManager extends EventEmitter {
 	}
 
 	/**
-	 * Disconnect from a peer.
+	 * Disconnect from a peer. `flushMs` bounds how long writes already queued
+	 * to it may take to leave (see Peer.disconnect).
 	 */
-	disconnectPeer(pubkey: string): void {
+	disconnectPeer(pubkey: string, flushMs?: number): void {
 		pubkey = normalizeHexPubkey(pubkey);
 		const lanePeer = this.lanePeers.get(pubkey);
 		if (lanePeer) {
@@ -1339,7 +1341,7 @@ export class PeerManager extends EventEmitter {
 
 		const peer = this.peers.get(pubkey);
 		if (peer) {
-			this.removeRegisteredPeer(pubkey, peer, 'disconnect requested');
+			this.removeRegisteredPeer(pubkey, peer, 'disconnect requested', flushMs);
 		}
 	}
 

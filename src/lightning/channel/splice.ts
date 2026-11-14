@@ -71,6 +71,11 @@ export interface ISpliceResult {
 	message?: ISpliceMessage | ISpliceAckMessage | ISpliceLockedMessage;
 	/** Message type constant name for routing */
 	messageType?: 'splice' | 'splice_ack' | 'splice_locked';
+	/**
+	 * The refusal is a splice_locked naming a txid that is not our pending
+	 * splice, which the spec answers on the wire rather than locally.
+	 */
+	txidMismatch?: boolean;
 }
 
 export class SpliceSession {
@@ -582,7 +587,11 @@ export class SpliceSession {
 			msg.fundingTxid &&
 			!msg.fundingTxid.equals(this._spliceTxid)
 		) {
-			return { ok: false, error: 'Funding txid mismatch in splice_locked' };
+			return {
+				ok: false,
+				error: 'Funding txid mismatch in splice_locked',
+				txidMismatch: true
+			};
 		}
 
 		this._remoteSpliceLocked = true;

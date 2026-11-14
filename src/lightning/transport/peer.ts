@@ -531,9 +531,12 @@ export class Peer extends EventEmitter {
 	private static readonly MAX_WRITE_BUFFER = 72 * 1024 * 1024; // 72 MB
 
 	/**
-	 * Disconnect from the peer gracefully.
+	 * Disconnect from the peer gracefully. With `flushMs` the writes already
+	 * queued (a warning that explains the disconnect) get up to that long to
+	 * reach the transport before it is destroyed. Nothing is read or sent
+	 * meanwhile.
 	 */
-	disconnect(): void {
+	disconnect(flushMs = 0): void {
 		const established = this.state === 'ready';
 		// An in-flight connect/accept must not survive this call: the abort
 		// flag stops the handshake at its next boundary, a socket factory
@@ -548,7 +551,7 @@ export class Peer extends EventEmitter {
 		// re-establishment re-arms a FRESH hold (rearmHeldMessages).
 		this.heldMessages = null;
 		this.stopPingTimer();
-		this.destroySocket();
+		this.destroySocket(flushMs);
 		this.state = 'disconnected';
 		if (established) {
 			// destroySocket strips the socket's close listener, so the close
@@ -1146,10 +1149,23 @@ export class Peer extends EventEmitter {
 		});
 	}
 
-	private destroySocket(): void {
-		if (this.socket) {
-			this.socket.removeAllListeners();
-			this.socket.destroy();
+	private destroySocket(flushMs = 0): void {
+		const socket = this.socket;
+		if (socket) {
+			socket.removeAllListeners();
+			if (flushMs > 0 && socket.writableLength > 0) {
+				// destroy() drops queued writes. Write callbacks run in order, so
+				// the empty write's runs once everything ahead of it is out.
+				socket.on('error', () => undefined);
+				const timer = setTimeout(() => socket.destroy(), flushMs);
+				timer.unref?.();
+				socket.write(Buffer.alloc(0), () => {
+					clearTimeout(timer);
+					socket.destroy();
+				});
+			} else {
+				socket.destroy();
+			}
 			this.socket = null;
 		}
 		this.transport = null;

@@ -38,6 +38,8 @@ export interface ChannelManagerEvents {
 	'channel:reestablished': (channelId: Buffer) => void;
 	/** The connection to a peer ended; its channels are being marked for reestablish. Emitted before any of them is. */
 	'peer:disconnected': (peerPubkey: string) => void;
+	/** A protocol violation was answered with a warning and the connection must close. Emitted only when no PeerManager holds the peer's connection. */
+	'peer:disconnect-needed': (peerPubkey: string, reason: string) => void;
 	/** The real short channel id was assigned once the funding reached announcement depth. */
 	'channel:scid-assigned': (channelId: Buffer, shortChannelId: Buffer) => void;
 	/** A caller-driven v2 open owes its tx_signatures. */

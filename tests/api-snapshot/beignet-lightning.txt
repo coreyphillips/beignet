@@ -1218,7 +1218,7 @@ method channel.Channel.takeRevokedCommitmentTxs(perCommitmentSecret: Buffer): Bu
 method channel.Channel.unregisteredV2TopUpInputs(inputs: channel.ISpliceWalletInput[]): channel.ISpliceWalletInput[]
 method channel.Channel.updateFee(feeratePerKw: number): channel.ChannelAction[]
 method channel.Channel.validateOutgoingHtlc(amountMsat: bigint, cltvExpiry: number): channel.ChannelAction[]
-type channel.ChannelAction = channel.ISendMessageAction | channel.IBroadcastTxAction | channel.IAuthorizeFundingBroadcastAction | channel.IWatchFundingAction | channel.IWatchPreSpliceSpendAction | channel.IChannelReadyAction | channel.IChannelClosedAction | channel.IErrorAction | channel.IHtlcForwardedAction | channel.IHtlcFulfilledAction | channel.IHtlcFailedAction | channel.IForceCloseAction | channel.IWatchOutputAction | channel.IPreimageLearnedAction | channel.IChannelFullyResolvedAction | channel.IAnnouncementReadyAction | channel.IProposeClosingFeeAction | channel.IPersistStateAction | channel.ISpliceCompleteAction | channel.ISpliceAbortedAction | channel.ISpliceRevertedAction | channel.ISpliceConflictRequestReadyAction | channel.ITxSignaturesNeededAction | channel.ISpliceTxSignaturesNeededAction | channel.ISpliceTxNegotiatedAction
+type channel.ChannelAction = channel.ISendMessageAction | channel.IBroadcastTxAction | channel.IAuthorizeFundingBroadcastAction | channel.IWatchFundingAction | channel.IWatchPreSpliceSpendAction | channel.IChannelReadyAction | channel.IChannelClosedAction | channel.IErrorAction | channel.IHtlcForwardedAction | channel.IHtlcFulfilledAction | channel.IHtlcFailedAction | channel.IForceCloseAction | channel.IWatchOutputAction | channel.IPreimageLearnedAction | channel.IChannelFullyResolvedAction | channel.IAnnouncementReadyAction | channel.IProposeClosingFeeAction | channel.IPersistStateAction | channel.ISpliceCompleteAction | channel.ISpliceAbortedAction | channel.ISpliceRevertedAction | channel.ISpliceConflictRequestReadyAction | channel.ITxSignaturesNeededAction | channel.ISpliceTxSignaturesNeededAction | channel.ISpliceTxNegotiatedAction | channel.IDisconnectPeerAction
 enum channel.ChannelActionType
 member channel.ChannelActionType.ANNOUNCEMENT_READY = "ANNOUNCEMENT_READY"
 member channel.ChannelActionType.AUTHORIZE_FUNDING_BROADCAST = "AUTHORIZE_FUNDING_BROADCAST"
@@ -1226,6 +1226,7 @@ member channel.ChannelActionType.BROADCAST_TX = "BROADCAST_TX"
 member channel.ChannelActionType.CHANNEL_CLOSED = "CHANNEL_CLOSED"
 member channel.ChannelActionType.CHANNEL_FULLY_RESOLVED = "CHANNEL_FULLY_RESOLVED"
 member channel.ChannelActionType.CHANNEL_READY = "CHANNEL_READY"
+member channel.ChannelActionType.DISCONNECT_PEER = "DISCONNECT_PEER"
 member channel.ChannelActionType.ERROR = "ERROR"
 member channel.ChannelActionType.FORCE_CLOSE = "FORCE_CLOSE"
 member channel.ChannelActionType.HTLC_FAILED = "HTLC_FAILED"
@@ -1406,6 +1407,7 @@ property channel.ChannelManagerEvents.'message:outbound': (peerPubkey: string, t
 property channel.ChannelManagerEvents.'monitor:updated': (channelIdHex: string, monitor: chain.ChainMonitor) => void
 property channel.ChannelManagerEvents.'outbox:sent': (ids: Array<number | null>) => void
 property channel.ChannelManagerEvents.'output:resolved': (txid: string, outputIndex: number, channelId: Buffer | undefined, outputType: chain.OutputType, paymentHash: Buffer | undefined, htlcId: bigint | undefined) => void
+property channel.ChannelManagerEvents.'peer:disconnect-needed': (peerPubkey: string, reason: string) => void
 property channel.ChannelManagerEvents.'peer:disconnected': (peerPubkey: string) => void
 property channel.ChannelManagerEvents.'peer:warning': (peerPubkey: string, channelId: Buffer | null, text: string) => void
 property channel.ChannelManagerEvents.'preimage:learned': (paymentHash: Buffer, preimage: Buffer) => void
@@ -1783,6 +1785,9 @@ property channel.ICompositeSpliceRecord.stage: channel.CompositeSpliceStage
 property channel.ICompositeSpliceRecord.txHex?: string
 property channel.ICompositeSpliceRecord.txid?: string
 property channel.ICompositeSpliceRecord.updatedAt: number
+interface channel.IDisconnectPeerAction
+property channel.IDisconnectPeerAction.reason: string
+property channel.IDisconnectPeerAction.type: channel.ChannelActionType.DISCONNECT_PEER
 interface channel.IDualFundingParams
 property channel.IDualFundingParams.chainHash?: Buffer
 property channel.IDualFundingParams.channelFlags?: number
@@ -1954,6 +1959,7 @@ property channel.ISpliceResult.error?: string
 property channel.ISpliceResult.message?: message.ISpliceMessage | message.ISpliceAckMessage | message.ISpliceLockedMessage
 property channel.ISpliceResult.messageType?: 'splice' | 'splice_ack' | 'splice_locked'
 property channel.ISpliceResult.ok: boolean
+property channel.ISpliceResult.txidMismatch?: boolean
 interface channel.ISpliceRevertedAction
 property channel.ISpliceRevertedAction.channelId: Buffer
 property channel.ISpliceRevertedAction.conflictTxid: string
@@ -9198,7 +9204,7 @@ class transport.Peer extends EventEmitter
 constructor transport.Peer(options: transport.IPeerOptions)
 method transport.Peer.acceptInbound(socket: transport.IDuplexTransport): Promise<void>
 method transport.Peer.connect(): Promise<void>
-method transport.Peer.disconnect(): void
+method transport.Peer.disconnect(flushMs?: number): void
 method transport.Peer.getIrohDiagnostics(): transport.IIrohDiagnostics | undefined
 method transport.Peer.getPorchCircuit(): transport.IPorchCircuitInfo | undefined
 method transport.Peer.getRemoteInit(): message.IInitMessage | null
@@ -9225,7 +9231,7 @@ method transport.PeerManager.canDialLearnedAddress(host: string): boolean
 method transport.PeerManager.cancellationToken(pubkey: string): number
 method transport.PeerManager.connectPeer(pubkey: string, host: string, port: number, transport?: transport.IPeerTransportOptions, options?: transport.IPeerDialOptions): Promise<void>
 method transport.PeerManager.destroy(): void
-method transport.PeerManager.disconnectPeer(pubkey: string): void
+method transport.PeerManager.disconnectPeer(pubkey: string, flushMs?: number): void
 method transport.PeerManager.freezeConnections(): void
 method transport.PeerManager.getAnnouncedAddresses(pubkey: string): Array<{ host: string; port: number; }>
 method transport.PeerManager.getConnectionInfo(pubkey: string): transport.IPeerConnectionInfo | undefined

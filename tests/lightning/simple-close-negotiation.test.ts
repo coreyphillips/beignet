@@ -38,6 +38,8 @@ import {
 	deserializeChainMonitorState
 } from '../../src/lightning/storage/serialization';
 import { COMMIT_ALL } from './helpers/channel-persistence';
+import { decodeErrorMessage } from '../../src/lightning/message/error';
+import { PeerManager } from '../../src/lightning/transport/peer-manager';
 
 function makeSeed(id: number): Buffer {
 	return crypto
@@ -94,17 +96,23 @@ function makeConfig(
 	};
 }
 
-/** Stub peer manager exposing only the remote init features. */
+/**
+ * Stub peer manager exposing the remote init features and recording
+ * disconnect requests. Sends fall back to 'message:outbound'.
+ */
 function stubPeers(
 	manager: ChannelManager,
 	remoteFeatures: FeatureFlags
-): void {
+): string[] {
+	const disconnected: string[] = [];
 	// eslint-disable-next-line @typescript-eslint/no-explicit-any
 	(manager as any)['peerManager'] = {
 		getPeer: () => ({
 			getRemoteInit: () => ({ features: remoteFeatures })
-		})
+		}),
+		disconnectPeer: (pubkey: string) => disconnected.push(pubkey)
 	};
+	return disconnected;
 }
 
 interface IOutMsg {
@@ -153,6 +161,9 @@ interface IHarness {
 	aliceChannel: Channel;
 	bobChannel: Channel;
 	channelId: Buffer;
+	/** Peers each side asked its PeerManager to disconnect. */
+	aliceDisconnects: string[];
+	bobDisconnects: string[];
 }
 
 /**
@@ -173,8 +184,8 @@ function openChannelHarness(
 	const remoteFeatures = simpleClose
 		? simpleCloseFeatures()
 		: FeatureFlags.empty();
-	stubPeers(alice, remoteFeatures);
-	stubPeers(bob, remoteFeatures);
+	const aliceDisconnects = stubPeers(alice, remoteFeatures);
+	const bobDisconnects = stubPeers(bob, remoteFeatures);
 
 	const aliceOut = collectOutbound(alice);
 	const bobOut = collectOutbound(bob);
@@ -211,7 +222,9 @@ function openChannelHarness(
 		bobTxs,
 		aliceChannel,
 		bobChannel,
-		channelId
+		channelId,
+		aliceDisconnects,
+		bobDisconnects
 	};
 }
 
@@ -744,6 +757,239 @@ describe('option_simple_close negotiation (ChannelManager)', function () {
 			const result = h.alice.bumpCloseFee(h.channelId, 10_000n);
 			expect(result.ok).to.equal(false);
 			expect(result.error).to.match(/awaiting closing_sig/);
+		});
+
+		/**
+		 * Issue #2044: these refusals used to be local only, so the peer waited
+		 * for a closing_sig that never came. BOLT 2 asks for a warning and a
+		 * disconnect (or an error and a failed channel); the warning is the
+		 * answer here, because the reconnect restarts the close from shutdown.
+		 */
+		describe('refusals reach the peer as a warning and a disconnect (issue #2044)', function () {
+			function expectWarned(
+				out: IOutMsg[],
+				h: IHarness,
+				pattern: RegExp,
+				label: string
+			): void {
+				const warnings = out.filter((m) => m.type === MessageType.WARNING);
+				expect(warnings.length, `${label}: one warning`).to.equal(1);
+				const warning = decodeErrorMessage(warnings[0].payload);
+				expect(warning.channelId.equals(h.channelId), label).to.equal(true);
+				expect(warning.data.toString('ascii'), label).to.match(pattern);
+				expect(
+					out.some((m) => m.type === MessageType.ERROR),
+					`${label}: no wire error`
+				).to.equal(false);
+			}
+
+			it('a refused closing_complete: warning, disconnect, no closing_sig, the close state kept', function () {
+				const cases: Array<{
+					label: string;
+					overrides: Partial<IClosingCompleteMessage>;
+					pattern: RegExp;
+				}> = [
+					{
+						label: 'fee above the closer balance',
+						overrides: { feeSatoshis: 700_000n },
+						pattern: /fee exceeds closer balance/
+					},
+					{
+						label: 'closee script is not ours',
+						overrides: {
+							closeeScriptPubkey: Buffer.from('0014' + 'cc'.repeat(20), 'hex')
+						},
+						pattern: /closee script does not match/
+					},
+					{
+						label: 'invalid signature',
+						overrides: {},
+						pattern: /signature failed to verify/
+					},
+					{
+						label: 'only closer_output_only for our non-dust output',
+						overrides: {
+							closerAndCloseeSig: undefined,
+							closerOutputOnlySig: crypto.randomBytes(64)
+						},
+						pattern: /closer_output_only for our non-dust output/
+					}
+				];
+				for (const c of cases) {
+					const h = negotiatingHarness(41, 42);
+					h.bob.on('error', () => {});
+					h.bob.handleMessage(
+						h.aPub,
+						MessageType.CLOSING_COMPLETE,
+						craftedClosingComplete(h, c.overrides)
+					);
+					expectWarned(h.bobOut, h, c.pattern, c.label);
+					expect(
+						h.bobOut.some((m) => m.type === MessageType.CLOSING_SIG),
+						c.label
+					).to.equal(false);
+					expect(h.bobDisconnects, c.label).to.deep.equal([h.aPub]);
+					expect(h.bobChannel.getState(), c.label).to.equal(
+						ChannelState.NEGOTIATING_CLOSING
+					);
+					expect(h.bobTxs.length, c.label).to.equal(0);
+				}
+			});
+
+			it('our output is dust and the closer_output_only signature is missing', function () {
+				// Nothing pushed: bob's side of the channel is empty, so his output
+				// is dust and the only variant he may sign is closer_output_only.
+				const h = openChannelHarness(43, 44, 0n);
+				h.alice.on('error', () => {});
+				h.bob.on('error', () => {});
+				expect(h.alice.initiateShutdown(h.channelId, ALICE_SCRIPT).ok).to.equal(
+					true
+				);
+				pump(h.aliceOut, h.bob, h.aPub); // shutdown
+				h.bobOut.length = 0;
+				h.bob.handleMessage(
+					h.aPub,
+					MessageType.CLOSING_COMPLETE,
+					encodeClosingCompleteMessage({
+						channelId: h.channelId,
+						closerScriptPubkey: ALICE_SCRIPT,
+						closeeScriptPubkey:
+							h.bobChannel.getFullState().localShutdownScript!,
+						feeSatoshis: 700n,
+						locktime: 0,
+						closerAndCloseeSig: crypto.randomBytes(64)
+					})
+				);
+				expectWarned(
+					h.bobOut,
+					h,
+					/our output is dust but no closer_output_only sig/,
+					'dust'
+				);
+				expect(h.bobDisconnects).to.deep.equal([h.aPub]);
+				expect(h.bobChannel.getState()).to.not.equal(ChannelState.CLOSED);
+				expect(h.bobChannel.getState()).to.not.equal(ChannelState.ERRORED);
+			});
+
+			it('a refused closing_sig: warning and disconnect for each violation, the close state kept', function () {
+				const h = negotiatingHarness(45, 46);
+				h.alice.on('error', () => {});
+				const aliceCC = decodeClosingCompleteMessage(
+					h.aliceOut.find((m) => m.type === MessageType.CLOSING_COMPLETE)!
+						.payload
+				);
+				h.aliceOut.length = 0;
+				const cases: Array<{
+					label: string;
+					msg: Parameters<typeof encodeClosingSigMessage>[0];
+					pattern: RegExp;
+				}> = [
+					{
+						label: 'fee not echoed',
+						msg: {
+							...aliceCC,
+							feeSatoshis: aliceCC.feeSatoshis + 1n,
+							closerOutputOnlySig: undefined,
+							closeeOutputOnlySig: undefined,
+							closerAndCloseeSig: crypto.randomBytes(64)
+						},
+						pattern: /does not echo our closing_complete/
+					},
+					{
+						label: 'two signatures',
+						msg: {
+							...aliceCC,
+							closerOutputOnlySig: crypto.randomBytes(64),
+							closerAndCloseeSig: crypto.randomBytes(64)
+						},
+						pattern: /exactly one signature, got 2/
+					},
+					{
+						label: 'a variant we did not offer',
+						msg: {
+							...aliceCC,
+							closerOutputOnlySig: undefined,
+							closeeOutputOnlySig: crypto.randomBytes(64),
+							closerAndCloseeSig: undefined
+						},
+						pattern: /not offered by us/
+					},
+					{
+						label: 'invalid signature',
+						msg: {
+							...aliceCC,
+							closerOutputOnlySig: undefined,
+							closeeOutputOnlySig: undefined,
+							closerAndCloseeSig: crypto.randomBytes(64)
+						},
+						pattern: /peer signature failed to verify/
+					}
+				];
+				for (const c of cases) {
+					h.aliceOut.length = 0;
+					h.aliceDisconnects.length = 0;
+					h.alice.handleMessage(
+						h.bPub,
+						MessageType.CLOSING_SIG,
+						encodeClosingSigMessage(c.msg)
+					);
+					expectWarned(h.aliceOut, h, c.pattern, c.label);
+					expect(h.aliceDisconnects, c.label).to.deep.equal([h.bPub]);
+					expect(h.aliceChannel.getState(), c.label).to.equal(
+						ChannelState.NEGOTIATING_CLOSING
+					);
+				}
+				expect(h.aliceTxs.length).to.equal(0);
+			});
+
+			it('the close completes on the reconnect the warning asked for', function () {
+				const h = negotiatingHarness(47, 48);
+				h.alice.on('error', () => {});
+				h.bob.on('error', () => {});
+				h.bob.handleMessage(
+					h.aPub,
+					MessageType.CLOSING_COMPLETE,
+					craftedClosingComplete(h, {})
+				);
+				expect(h.bobDisconnects).to.deep.equal([h.aPub]);
+
+				// The disconnect: alice's real closing_complete is lost with it.
+				h.aliceOut.length = 0;
+				h.bobOut.length = 0;
+				h.alice.handlePeerDisconnected(h.bPub);
+				h.bob.handlePeerDisconnected(h.aPub);
+				h.alice.handlePeerReconnected(h.bPub);
+				h.bob.handlePeerReconnected(h.aPub);
+				for (let i = 0; i < 6; i++) {
+					pump(h.aliceOut, h.bob, h.aPub);
+					pump(h.bobOut, h.alice, h.bPub);
+				}
+
+				expect(h.aliceChannel.getState()).to.equal(ChannelState.CLOSED);
+				expect(h.bobChannel.getState()).to.equal(ChannelState.CLOSED);
+				expect(h.aliceTxs.length + h.bobTxs.length).to.be.greaterThan(0);
+			});
+
+			it('a peer the PeerManager does not hold: the host is asked to disconnect it', function () {
+				const h = negotiatingHarness(49, 50);
+				h.bob.on('error', () => {});
+				// Real and empty: the send falls back to 'message:outbound'.
+				const pm = new PeerManager({ localPrivateKey: crypto.randomBytes(32) });
+				(h.bob as unknown as { peerManager: PeerManager }).peerManager = pm;
+				const needed: string[] = [];
+				h.bob.on('peer:disconnect-needed', (peer: string) => needed.push(peer));
+				h.bob.handleMessage(
+					h.aPub,
+					MessageType.CLOSING_COMPLETE,
+					craftedClosingComplete(h, { feeSatoshis: 700_000n })
+				);
+				expectWarned(h.bobOut, h, /fee exceeds closer balance/, 'unheld peer');
+				expect(needed).to.deep.equal([h.aPub]);
+				expect(h.bobChannel.getState()).to.equal(
+					ChannelState.NEGOTIATING_CLOSING
+				);
+				pm.destroy();
+			});
 		});
 	});
 
