@@ -911,7 +911,9 @@ describe('undecodable closing messages during a cooperative close (issue #1929)'
 		const disconnected: string[] = [];
 		// eslint-disable-next-line @typescript-eslint/no-explicit-any
 		(manager as any)['peerManager'] = {
-			getPeer: (): undefined => undefined,
+			getPeer: (): { getRemoteInit: () => undefined } => ({
+				getRemoteInit: (): undefined => undefined
+			}),
 			sendToPeer: (to: string, type: number, payload: Buffer): void => {
 				sent.push({ to, type, payload });
 			},

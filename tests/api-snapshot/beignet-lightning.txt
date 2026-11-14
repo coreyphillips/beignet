@@ -9204,7 +9204,7 @@ class transport.Peer extends EventEmitter
 constructor transport.Peer(options: transport.IPeerOptions)
 method transport.Peer.acceptInbound(socket: transport.IDuplexTransport): Promise<void>
 method transport.Peer.connect(): Promise<void>
-method transport.Peer.disconnect(): void
+method transport.Peer.disconnect(flushMs?: number): void
 method transport.Peer.getIrohDiagnostics(): transport.IIrohDiagnostics | undefined
 method transport.Peer.getPorchCircuit(): transport.IPorchCircuitInfo | undefined
 method transport.Peer.getRemoteInit(): message.IInitMessage | null
@@ -9231,7 +9231,7 @@ method transport.PeerManager.canDialLearnedAddress(host: string): boolean
 method transport.PeerManager.cancellationToken(pubkey: string): number
 method transport.PeerManager.connectPeer(pubkey: string, host: string, port: number, transport?: transport.IPeerTransportOptions, options?: transport.IPeerDialOptions): Promise<void>
 method transport.PeerManager.destroy(): void
-method transport.PeerManager.disconnectPeer(pubkey: string): void
+method transport.PeerManager.disconnectPeer(pubkey: string, flushMs?: number): void
 method transport.PeerManager.freezeConnections(): void
 method transport.PeerManager.getAnnouncedAddresses(pubkey: string): Array<{ host: string; port: number; }>
 method transport.PeerManager.getConnectionInfo(pubkey: string): transport.IPeerConnectionInfo | undefined

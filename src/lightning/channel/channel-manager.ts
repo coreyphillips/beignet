@@ -4916,16 +4916,23 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		this.processActions(peerPubkey, channel, actions);
 	}
 
+	/** How long the warning ahead of a DISCONNECT_PEER may take to leave. */
+	private static readonly VIOLATION_WARNING_FLUSH_MS = 2_000;
+
 	/**
 	 * The DISCONNECT_PEER action: drop the connection after a warning, so the
 	 * channel_reestablish on the next one restarts what the violation broke.
-	 * A manager with no PeerManager has no socket of its own, so the host that
-	 * carries its messages is asked instead.
+	 * A peer the PeerManager does not hold gets its messages through
+	 * 'message:outbound' (see sendMessage), so the host that carries them is
+	 * asked instead.
 	 */
 	private disconnectPeerForViolation(peerPubkey: string, reason: string): void {
-		if (this.peerManager) {
+		if (this.peerManager?.getPeer(peerPubkey)) {
 			try {
-				this.peerManager.disconnectPeer(peerPubkey);
+				this.peerManager.disconnectPeer(
+					peerPubkey,
+					ChannelManager.VIOLATION_WARNING_FLUSH_MS
+				);
 			} catch {
 				// Already gone, or the teardown raced: the warning and the local
 				// error have run, and nothing after this action depends on it.

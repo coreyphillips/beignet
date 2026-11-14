@@ -39,6 +39,7 @@ import {
 } from '../../src/lightning/storage/serialization';
 import { COMMIT_ALL } from './helpers/channel-persistence';
 import { decodeErrorMessage } from '../../src/lightning/message/error';
+import { PeerManager } from '../../src/lightning/transport/peer-manager';
 
 function makeSeed(id: number): Buffer {
 	return crypto
@@ -967,6 +968,27 @@ describe('option_simple_close negotiation (ChannelManager)', function () {
 				expect(h.aliceChannel.getState()).to.equal(ChannelState.CLOSED);
 				expect(h.bobChannel.getState()).to.equal(ChannelState.CLOSED);
 				expect(h.aliceTxs.length + h.bobTxs.length).to.be.greaterThan(0);
+			});
+
+			it('a peer the PeerManager does not hold: the host is asked to disconnect it', function () {
+				const h = negotiatingHarness(49, 50);
+				h.bob.on('error', () => {});
+				// Real and empty: the send falls back to 'message:outbound'.
+				const pm = new PeerManager({ localPrivateKey: crypto.randomBytes(32) });
+				(h.bob as unknown as { peerManager: PeerManager }).peerManager = pm;
+				const needed: string[] = [];
+				h.bob.on('peer:disconnect-needed', (peer: string) => needed.push(peer));
+				h.bob.handleMessage(
+					h.aPub,
+					MessageType.CLOSING_COMPLETE,
+					craftedClosingComplete(h, { feeSatoshis: 700_000n })
+				);
+				expectWarned(h.bobOut, h, /fee exceeds closer balance/, 'unheld peer');
+				expect(needed).to.deep.equal([h.aPub]);
+				expect(h.bobChannel.getState()).to.equal(
+					ChannelState.NEGOTIATING_CLOSING
+				);
+				pm.destroy();
 			});
 		});
 	});

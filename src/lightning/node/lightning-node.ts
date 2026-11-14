@@ -5696,9 +5696,8 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		);
 
 		// A peer protocol violation answered with a warning (simple close, a
-		// splice_locked for no pending splice). Only emitted when the channel
-		// manager has no PeerManager attached; otherwise it already dropped the
-		// peer itself.
+		// splice_locked for no pending splice). Only emitted when no
+		// PeerManager holds the peer; otherwise the manager already dropped it.
 		this.channelManager.on(
 			'peer:disconnect-needed',
 			(peerPubkey: string, reason: string) => {
