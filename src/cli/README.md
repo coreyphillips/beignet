@@ -1950,6 +1950,15 @@ beignet channel forceclose <channelId> [--accept-stale-state-risk]
 # flag. Cooperative: a mutual close pays out restored balances that cannot be
 # proven current. Force: if the peer holds a newer state the broadcast is
 # revoked and the whole channel balance goes to the justice path.
+beignet channel forceclose <channelId> --offline [--network <network>] [--accept-stale-state-risk]
+# The same force close with the daemon stopped, for when it cannot start. The
+# wallet comes from config.json or BEIGNET_MNEMONIC, never from the command
+# line, and Electrum is dialed with the configured host, port and TLS
+# settings. It takes the daemon's instance lock, so it is refused while the
+# daemon runs. It connects to no peers, waits up to a minute for Electrum
+# (closing nothing if it never answers) and up to a minute for the broadcast,
+# then prints the commitment txid. Run it again on a channel already force
+# closed and it rebroadcasts the commitment.
 beignet channel rebroadcast-close <channelId>
 beignet channel splice-in <channelId> <sats> <feeratePerkw>
 beignet channel splice-out <channelId> <sats> <feeratePerkw> [address]

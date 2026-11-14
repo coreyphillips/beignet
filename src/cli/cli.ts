@@ -25,7 +25,15 @@ import {
 import { AUTH_OFF_WARNING, startDaemon } from './daemon';
 import { daemonOptions } from './daemon-options';
 import { unpatchedNodeWarning } from '../utils/node-version';
-import { defaultDataDirForMnemonic } from './beignet-node';
+import { BeignetNode, defaultDataDirForMnemonic } from './beignet-node';
+import { BeignetError } from './errors';
+import {
+	OFFLINE_FORCE_CLOSE_DEFAULTS,
+	offlineForceCloseOptions,
+	runOfflineForceClose
+} from './offline-force-close';
+import { createConsoleLogger, noopLogger } from '../logger';
+import { Console } from 'console';
 import { performDbRestore } from './restore';
 import { deriveBackupMacKey } from './backup-mac';
 import * as bip39 from 'bip39';
@@ -968,6 +976,7 @@ async function handleChannel(): Promise<void> {
 				})
 			);
 		case 'forceclose':
+			if (hasFlag('--offline')) return handleOfflineForceClose();
 			return outputResult(
 				await httpRequest('POST', '/channel/forceclose', {
 					channelId: filteredArgs[2],
@@ -1305,6 +1314,99 @@ async function handleChannel(): Promise<void> {
 			});
 			process.exitCode = 1;
 	}
+}
+
+/**
+ * `channel forceclose <id> --offline`: the same close without the daemon, for
+ * when it cannot run. The wallet comes from the config file or
+ * BEIGNET_MNEMONIC like every other command, and the node takes the daemon's
+ * instance lock, so a running daemon refuses this and keeps the channel.
+ */
+async function handleOfflineForceClose(): Promise<void> {
+	restrictUmask();
+	const channelId = positionalArgs(
+		new Set(['--network']),
+		new Set(['--offline', '--accept-stale-state-risk'])
+	)[2];
+	if (!channelId) {
+		output({
+			ok: false,
+			error: {
+				code: 'INVALID_PARAMS',
+				message:
+					'Usage: beignet channel forceclose <id> --offline [--network N] [--accept-stale-state-risk]'
+			}
+		});
+		process.exitCode = 1;
+		return;
+	}
+	const networkFlag = parseFlag('--network');
+	const config = resolveConfig(
+		networkFlag ? { network: networkFlag as BeignetConfig['network'] } : {}
+	);
+	if (!config.mnemonic) {
+		output({
+			ok: false,
+			error: {
+				code: 'NO_MNEMONIC',
+				message:
+					'No mnemonic found. Run "beignet init" first or set BEIGNET_MNEMONIC.'
+			}
+		});
+		process.exitCode = 1;
+		return;
+	}
+
+	// Stdout carries exactly one JSON line. The Electrum client prints its
+	// connection errors with a bare console.log, so the console's stdout
+	// methods go to stderr for the rest of this one-shot process.
+	const stderrConsole = new Console({
+		stdout: process.stderr,
+		stderr: process.stderr
+	});
+	console.log = stderrConsole.log.bind(stderrConsole);
+	console.info = stderrConsole.info.bind(stderrConsole);
+	console.debug = stderrConsole.debug.bind(stderrConsole);
+	const logger =
+		config.logLevel && config.logLevel !== 'silent'
+			? createConsoleLogger(config.logLevel, stderrConsole)
+			: noopLogger;
+
+	let node: BeignetNode | undefined;
+	try {
+		node = await BeignetNode.create(offlineForceCloseOptions(config, logger));
+		let lastBroadcastError: string | undefined;
+		node.on('node:error', (e) => {
+			if (e.code === 'BROADCAST_FAILED') lastBroadcastError = e.message;
+		});
+		const result = await runOfflineForceClose(node, channelId, {
+			...OFFLINE_FORCE_CLOSE_DEFAULTS,
+			acceptStaleStateRisk: hasFlag('--accept-stale-state-risk'),
+			lastBroadcastError: () => lastBroadcastError
+		});
+		output(result);
+		if (!result.ok) process.exitCode = 1;
+	} catch (err: unknown) {
+		const code = err instanceof BeignetError ? err.code : 'FORCE_CLOSE_FAILED';
+		const message = err instanceof Error ? err.message : String(err);
+		output({
+			ok: false,
+			error: {
+				code,
+				message:
+					code === 'INSTANCE_ALREADY_RUNNING'
+						? `A running daemon holds this wallet: drop --offline to close through it. ${message}`
+						: message
+			}
+		});
+		process.exitCode = 1;
+	} finally {
+		if (node) {
+			await node.gracefulShutdown(10_000).catch(() => node?.destroy());
+		}
+	}
+	// A wallet socket left half open must not keep a one-shot command alive.
+	setTimeout(() => process.exit(), 5_000).unref();
 }
 
 /**
@@ -3327,6 +3429,11 @@ Channels:
                                          Recovery Capsule, or on a fenced or
                                          quarantined device, whose commitment
                                          the peer may have already revoked
+  channel forceclose <id> --offline [--network N]
+                                         Force close with the daemon stopped:
+                                         opens the wallet from the config or
+                                         BEIGNET_MNEMONIC, waits for the
+                                         broadcast, prints the commitment txid
   channel rebroadcast-close <id>         Rebroadcast recorded close tx
   channel funding-quote <pubkey> [satsPerVbyte]
                                          Peer-aware max open preview: v1 or
