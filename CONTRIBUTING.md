@@ -14,7 +14,7 @@ CI runs each of these on every pull request, and all must pass:
 - `npm run tsc:check`, then `npm run build` and `npm run tsc:check:tests`
 - `npm run test:api`. A PR that changes the exported API commits the snapshot that `npm run api:snapshot` regenerates, and the snapshot diff is reviewed with the code.
 - `npm run docs:check` and `npm run docs:paths`. A new markdown file also needs a link in [docs/README.md](docs/README.md).
-- `npm audit --audit-level=moderate --omit=dev` for the dependencies that ship, with no exceptions, and `node scripts/audit-gate.js` for everything, which takes the named, dated exceptions in `audit-allowlist.json` (devDependencies only, each with the reason and the date it lapses).
+- `npm audit --audit-level=moderate --omit=dev` for the dependencies that ship, with no exceptions, and `node scripts/audit-gate.js` for everything, which takes the named, dated exceptions in `audit-allowlist.json` (devDependencies only, each with the reason, the open issue that removes it, and a date at most a month out).
 - the test suites in [.github/workflows/tests.yml](.github/workflows/tests.yml)
 
 A bug fix comes with a test that fails without it.
