@@ -1635,6 +1635,8 @@ export function getOpenApiSpec(): Record<string, unknown> {
 			'/offer/create': {
 				post: {
 					summary: 'Create a BOLT 12 offer',
+					description:
+						'amountSats, when given, must be a positive integer. Omit it for an offer that takes any amount; 0 is refused with INVALID_PARAMS, since BOLT 12 readers will not answer an offer whose amount is zero.',
 					tags: ['Offers'],
 					requestBody: bodyContent({
 						description: 'string',

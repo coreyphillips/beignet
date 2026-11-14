@@ -201,6 +201,25 @@ describe('BOLT 12: Offers', () => {
 			expect(decoded.amount).to.equal(50_000n);
 		});
 
+		// Issue #2040: the reader refuses a zero offer_amount, so the writer
+		// must not produce one.
+		it('refuses to write a zero offer_amount', () => {
+			const offer: IOffer = {
+				offerId: Buffer.alloc(32),
+				description: 'free',
+				amount: 0n,
+				issuerId: pubkey1
+			};
+			expect(() => encodeOfferTlv(offer)).to.throw(
+				'offer_amount must be greater than zero'
+			);
+			expect(() => encodeOffer(offer)).to.throw(
+				'offer_amount must be greater than zero'
+			);
+			const anyAmount = { ...offer, amount: undefined };
+			expect(decodeOffer(encodeOffer(anyAmount)).amount).to.equal(undefined);
+		});
+
 		it('should encode and decode offer with all fields', () => {
 			const chainHash = crypto.randomBytes(32);
 			const offer: IOffer = {
