@@ -6514,11 +6514,14 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			return;
 		}
 		// BOLT 7: on reconnection, a node that has not received the peer's
-		// announcement_signatures sends its own again.
+		// announcement_signatures sends its own again. The splice spec adds the
+		// peer asking for ours in its channel_reestablish, which covers ours
+		// being lost after theirs arrived.
 		if (
 			state.announceChannel &&
 			state.announcementSigsSent &&
-			!state.announcementSigsReceived
+			(!state.announcementSigsReceived ||
+				channel.isAnnouncementSignaturesRequested())
 		) {
 			this.channelManager.resendAnnouncementSignatures(channelId);
 			return;

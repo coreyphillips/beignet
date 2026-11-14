@@ -55,7 +55,8 @@ import {
 import {
 	encodeChannelReestablishMessage,
 	decodeChannelReestablishMessage,
-	IChannelReestablishMessage
+	IChannelReestablishMessage,
+	RETRANSMIT_ANNOUNCEMENT_SIGNATURES
 } from '../../src/lightning/message/channel-reestablish';
 
 function randomBytes(n: number): Buffer {
@@ -1106,16 +1107,90 @@ describe('BOLT 2 Channel Messages', function () {
 			expect(decoded.nextFundingRetransmitFlags).to.equal(1);
 		});
 
-		it('should ignore unknown odd reestablish TLVs (e.g. CLN my_current_funding_locked)', function () {
+		it('should ignore unknown odd reestablish TLVs', function () {
 			const msg = makeChannelReestablish();
 			const base = encodeChannelReestablishMessage(msg);
-			// Unknown odd TLV type 5 with a 32-byte payload must not break decoding.
-			const tlv = Buffer.concat([Buffer.from([5, 32]), randomBytes(32)]);
+			// Unknown odd TLV type 7 with a 32-byte payload must not break decoding.
+			const tlv = Buffer.concat([Buffer.from([7, 32]), randomBytes(32)]);
 			const decoded = decodeChannelReestablishMessage(
 				Buffer.concat([base, tlv])
 			);
 			expect(decoded.channelId).to.deep.equal(msg.channelId);
 			expect(decoded.nextFundingTxid).to.be.undefined;
+			expect(decoded.myCurrentFundingLocked).to.be.undefined;
+		});
+
+		describe('my_current_funding_locked (TLV 5, issue #2042)', function () {
+			it('round-trips the txid and retransmit flags as type 5, length 33', function () {
+				const msg = makeChannelReestablish();
+				const txid = randomBytes(32);
+				msg.myCurrentFundingLocked = {
+					txid,
+					retransmitFlags: RETRANSMIT_ANNOUNCEMENT_SIGNATURES
+				};
+				const encoded = encodeChannelReestablishMessage(msg);
+				expect(encoded.length).to.equal(113 + 2 + 33);
+				expect(encoded[113]).to.equal(5);
+				expect(encoded[114]).to.equal(33);
+				expect(encoded.subarray(115, 147)).to.deep.equal(txid);
+				expect(encoded[147]).to.equal(1);
+				const decoded = decodeChannelReestablishMessage(encoded);
+				expect(decoded.myCurrentFundingLocked).to.deep.equal({
+					txid,
+					retransmitFlags: 1
+				});
+			});
+
+			it('round-trips beside next_funding and next_local_nonce in type order', function () {
+				const msg = makeChannelReestablish();
+				msg.nextFundingTxid = randomBytes(32);
+				msg.nextFundingRetransmitFlags = 1;
+				msg.nextLocalNonce = randomBytes(66);
+				msg.myCurrentFundingLocked = {
+					txid: randomBytes(32),
+					retransmitFlags: 0
+				};
+				const encoded = encodeChannelReestablishMessage(msg);
+				const types: number[] = [];
+				for (let i = 113; i < encoded.length; ) {
+					types.push(encoded[i]);
+					i += 2 + encoded[i + 1];
+				}
+				expect(types).to.deep.equal([1, 4, 5]);
+				const decoded = decodeChannelReestablishMessage(encoded);
+				expect(decoded.nextFundingTxid).to.deep.equal(msg.nextFundingTxid);
+				expect(decoded.nextLocalNonce).to.deep.equal(msg.nextLocalNonce);
+				expect(decoded.myCurrentFundingLocked).to.deep.equal(
+					msg.myCurrentFundingLocked
+				);
+			});
+
+			it('decodes a reestablish without it as undefined', function () {
+				const decoded = decodeChannelReestablishMessage(
+					encodeChannelReestablishMessage(makeChannelReestablish())
+				);
+				expect(decoded.myCurrentFundingLocked).to.be.undefined;
+			});
+
+			it('drops a record shorter than 33 bytes and keeps the rest of the message', function () {
+				const msg = makeChannelReestablish();
+				const base = encodeChannelReestablishMessage(msg);
+				const tlv = Buffer.concat([Buffer.from([5, 32]), randomBytes(32)]);
+				const decoded = decodeChannelReestablishMessage(
+					Buffer.concat([base, tlv])
+				);
+				expect(decoded.channelId).to.deep.equal(msg.channelId);
+				expect(decoded.myCurrentFundingLocked).to.be.undefined;
+			});
+
+			it('refuses a txid that is not 32 bytes on encode', function () {
+				const msg = makeChannelReestablish();
+				msg.myCurrentFundingLocked = {
+					txid: Buffer.alloc(31),
+					retransmitFlags: 0
+				};
+				expect(() => encodeChannelReestablishMessage(msg)).to.throw('32 bytes');
+			});
 		});
 	});
 });

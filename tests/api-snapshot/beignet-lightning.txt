@@ -1117,6 +1117,7 @@ method channel.Channel.initiateSplice(relativeSatoshis: bigint, fundingFeeratePe
 method channel.Channel.initiateSpliceAbort(reason?: string): channel.ChannelAction[]
 method channel.Channel.initiateTxRbf(newFeeratePerkw: number, newLocktime?: number, newContribution?: { fundingSatoshis: bigint; topUpInputs?: channel.ISpliceWalletInput[]; }): channel.ChannelAction[]
 method channel.Channel.isAbandonedV2Open(): boolean
+method channel.Channel.isAnnouncementSignaturesRequested(): boolean
 method channel.Channel.isAwaitingRemoteRevocation(): boolean
 method channel.Channel.isCollectingBatch(): boolean
 method channel.Channel.isFundingKnownOnChain(): boolean
@@ -1198,6 +1199,7 @@ method channel.Channel.setMaxFundingSatoshis(max: bigint): void
 method channel.Channel.setSigner(signer: keys.ISigner): void
 method channel.Channel.setSimpleClose(simple: boolean): void
 method channel.Channel.setSpliceInInputs(inputs: channel.ISpliceWalletInput[], changeScript: Buffer, options?: { lockAtDepth?: number; }): void
+method channel.Channel.setSpliceNegotiated(negotiated: boolean): void
 method channel.Channel.setSpliceOutDestination(script: Buffer, sats: bigint): void
 method channel.Channel.setTaprootClosingCache(cache: channel.ITaprootClosingCache | null): void
 method channel.Channel.setTrustedPeer(): void
@@ -4724,6 +4726,7 @@ property message.IChannelReadyMessage.shortChannelId?: Buffer
 interface message.IChannelReestablishMessage
 property message.IChannelReestablishMessage.channelId: Buffer
 property message.IChannelReestablishMessage.ffor?: ffor.IFforReestablishTlv
+property message.IChannelReestablishMessage.myCurrentFundingLocked?: message.IMyCurrentFundingLocked
 property message.IChannelReestablishMessage.myCurrentPerCommitmentPoint: Buffer
 property message.IChannelReestablishMessage.nextCommitmentNumber: bigint
 property message.IChannelReestablishMessage.nextFundingRetransmitFlags?: number
@@ -4775,6 +4778,9 @@ property message.IFundingSignedMessage.signature: Buffer
 interface message.IInitMessage
 property message.IInitMessage.features: features.FeatureFlags
 property message.IInitMessage.networks?: Buffer[]
+interface message.IMyCurrentFundingLocked
+property message.IMyCurrentFundingLocked.retransmitFlags: number
+property message.IMyCurrentFundingLocked.txid: Buffer
 interface message.IOpenChannel2Message
 property message.IOpenChannel2Message.chainHash?: Buffer
 property message.IOpenChannel2Message.channelFlags: number
@@ -5012,6 +5018,7 @@ member message.MessageType.UPDATE_FEE = 134
 member message.MessageType.UPDATE_FULFILL_HTLC = 130
 member message.MessageType.WARNING = 1
 const message.PEER_STORAGE_MAX_BYTES = 65531
+const message.RETRANSMIT_ANNOUNCEMENT_SIGNATURES = 1
 const message.SPLICE_LOCK_DEPTH_ACCEPT_MAX = 6
 const message.SPLICE_LOCK_DEPTH_MAX = 2016
 const message.SPLICE_LOCK_DEPTH_TLV = 65537
