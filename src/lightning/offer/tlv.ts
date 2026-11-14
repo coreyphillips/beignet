@@ -27,6 +27,11 @@ import type {
 	IFallbackAddress
 } from './types';
 import { computeOfferId } from './merkle';
+import {
+	decodeBolt1String,
+	encodeBolt1String,
+	isMinimalFeatures
+} from '../message/field-rules';
 
 // ── Offer TLV Types (BOLT 12) ──────────────────────────────────────
 
@@ -56,6 +61,7 @@ export enum InvoiceRequestTlvType {
 	QUANTITY = 86,
 	PAYER_KEY = 88,
 	PAYER_NOTE = 89,
+	BIP_353_NAME = 91,
 	SIGNATURE = 240
 }
 
@@ -145,9 +151,10 @@ export function encodeOfferTlv(offer: IOffer): Buffer {
 	}
 	records.push({
 		type: BigInt(OfferTlvType.DESCRIPTION),
-		value: Buffer.from(offer.description, 'utf8')
+		value: encodeBolt1String(offer.description, 'Offer description')
 	});
 	if (offer.features && offer.features.length > 0) {
+		assertMinimalFeatures(offer.features, 'Offer');
 		records.push({
 			type: BigInt(OfferTlvType.FEATURES),
 			value: offer.features
@@ -168,7 +175,7 @@ export function encodeOfferTlv(offer: IOffer): Buffer {
 	if (offer.issuer) {
 		records.push({
 			type: BigInt(OfferTlvType.ISSUER),
-			value: Buffer.from(offer.issuer, 'utf8')
+			value: encodeBolt1String(offer.issuer, 'Offer issuer')
 		});
 	}
 	if (offer.quantityMax !== undefined) {
@@ -241,12 +248,23 @@ const INVOICE_REQUEST_KNOWN_FEATURES = FeatureFlags.empty();
 const INVOICE_KNOWN_FEATURES = FeatureFlags.empty();
 INVOICE_KNOWN_FEATURES.setOptional(Feature.BASIC_MPP);
 
-/** Reject a features field carrying an even (required) bit not in `known`. */
-function assertNoUnknownRequiredFeatures(
+/** Writers must minimally encode a features field (BOLT 12). */
+function assertMinimalFeatures(features: Buffer, field: string): void {
+	if (!isMinimalFeatures(features)) {
+		throw new Error(`${field} features are not minimally encoded`);
+	}
+}
+
+/**
+ * Reject a received features field that is not minimally encoded or that
+ * carries an even (required) bit not in `known`.
+ */
+function assertReadableFeatures(
 	features: Buffer,
 	known: FeatureFlags,
 	field: string
 ): void {
+	assertMinimalFeatures(features, field);
 	const unknownRequired = FeatureFlags.fromBuffer(features)
 		.listSetBits()
 		.find(
@@ -257,23 +275,13 @@ function assertNoUnknownRequiredFeatures(
 	}
 }
 
-/** Decode UTF-8 rejecting invalid/truncated sequences (BOLT 12 MUST). */
-const strictUtf8Decoder = new TextDecoder('utf-8', { fatal: true });
-function decodeStrictUtf8(value: Buffer, field: string): string {
-	try {
-		return strictUtf8Decoder.decode(value);
-	} catch {
-		throw new Error(`Offer ${field} is not valid UTF-8`);
-	}
-}
-
 /**
  * Decode an IOffer from a TLV stream, enforcing the BOLT 12 reader MUSTs:
  * offer types confined to 1..79 and the 1000000000..1999999999 experimental
  * range, unknown even types rejected, description required exactly when an
  * amount is set, currency only with an amount, non-zero amount, whole 32-byte
- * chains, valid UTF-8 strings, a valid issuer_id point, and issuer_id or at
- * least one path present.
+ * chains, strings that pass the BOLT 1 rule, minimal offer_features, a valid
+ * issuer_id point, and issuer_id or at least one path present.
  * Does NOT set offerId — caller must compute the merkle root.
  */
 export function decodeOfferTlv(data: Buffer): {
@@ -329,7 +337,7 @@ export function decodeOfferTlv(data: Buffer): {
 	const offer: Omit<IOffer, 'offerId'> = {
 		// Optional in the spec (required only with an amount, enforced above);
 		// IOffer keeps the field mandatory, so an absent description maps to ''.
-		description: descVal ? decodeStrictUtf8(descVal, 'description') : ''
+		description: descVal ? decodeBolt1String(descVal, 'Offer description') : ''
 	};
 
 	if (chainsVal) {
@@ -343,15 +351,17 @@ export function decodeOfferTlv(data: Buffer): {
 		offer.chains = chains;
 	}
 	if (metadataVal) offer.metadata = metadataVal;
-	if (currencyVal) offer.currency = decodeStrictUtf8(currencyVal, 'currency');
+	if (currencyVal) {
+		offer.currency = decodeBolt1String(currencyVal, 'Offer currency');
+	}
 	if (amountVal) offer.amount = decodeTruncatedU64(amountVal);
 	if (featuresVal) {
-		assertNoUnknownRequiredFeatures(featuresVal, OFFER_KNOWN_FEATURES, 'Offer');
+		assertReadableFeatures(featuresVal, OFFER_KNOWN_FEATURES, 'Offer');
 		offer.features = featuresVal;
 	}
 	if (expiryVal) offer.absoluteExpiry = decodeTruncatedU64(expiryVal);
 	if (pathsVal) offer.paths = decodeBlindedPathsValue(pathsVal);
-	if (issuerVal) offer.issuer = decodeStrictUtf8(issuerVal, 'issuer');
+	if (issuerVal) offer.issuer = decodeBolt1String(issuerVal, 'Offer issuer');
 	if (qtyMaxVal) offer.quantityMax = decodeTruncatedU64(qtyMaxVal);
 	if (issuerIdVal) offer.issuerId = issuerIdVal;
 
@@ -401,6 +411,7 @@ export function encodeInvoiceRequestTlv(
 		});
 	}
 	if (request.features && request.features.length > 0) {
+		assertMinimalFeatures(request.features, 'Invoice request');
 		records.push({
 			type: BigInt(InvoiceRequestTlvType.FEATURES),
 			value: request.features
@@ -419,7 +430,7 @@ export function encodeInvoiceRequestTlv(
 	if (request.payerNote) {
 		records.push({
 			type: BigInt(InvoiceRequestTlvType.PAYER_NOTE),
-			value: Buffer.from(request.payerNote, 'utf8')
+			value: encodeBolt1String(request.payerNote, 'Invoice request payer note')
 		});
 	}
 	// signature (type 240): serialized last so it is on the wire. It is excluded
@@ -441,11 +452,36 @@ export function encodeInvoiceRequestTlv(
 	return encodeTlvStream(records);
 }
 
+const BIP_353_NAME_BYTE = /^[0-9A-Za-z_.-]*$/;
+
+/**
+ * BOLT 12 invreq_bip_353_name: `[u8 name_len][name][u8 domain_len][domain]`,
+ * filling the record exactly, with only 0-9, a-z, A-Z, `-`, `_` and `.` in
+ * either part.
+ */
+function assertBip353Name(value: Buffer): void {
+	const nameEnd = 1 + (value[0] ?? 0);
+	const domainLen = value[nameEnd];
+	if (domainLen === undefined || value.length !== nameEnd + 1 + domainLen) {
+		throw new Error(
+			'Invoice request invreq_bip_353_name length does not match its fields'
+		);
+	}
+	const name = value.subarray(1, nameEnd).toString('latin1');
+	const domain = value.subarray(nameEnd + 1).toString('latin1');
+	if (!BIP_353_NAME_BYTE.test(name) || !BIP_353_NAME_BYTE.test(domain)) {
+		throw new Error(
+			'Invoice request invreq_bip_353_name has a byte outside 0-9, a-z, A-Z, -, _ and .'
+		);
+	}
+}
+
 /**
  * Decode an IInvoiceRequest from a TLV stream, enforcing the BOLT 12 reader
  * MUSTs on its shape: types confined to 0..159, the signature range and the
- * experimental range up to 2999999999, unknown even types rejected, and no
- * unknown even bit in invreq_features.
+ * experimental range up to 2999999999, unknown even types rejected, minimal
+ * invreq_features with no unknown even bit, a payer note that passes the
+ * BOLT 1 string rule, and a well-formed invreq_bip_353_name.
  */
 export function decodeInvoiceRequestTlv(data: Buffer): {
 	request: IInvoiceRequest;
@@ -485,12 +521,17 @@ export function decodeInvoiceRequestTlv(data: Buffer): {
 		throw new Error('Invoice request missing required payer_key field');
 	}
 	if (featuresVal) {
-		assertNoUnknownRequiredFeatures(
+		assertReadableFeatures(
 			featuresVal,
 			INVOICE_REQUEST_KNOWN_FEATURES,
 			'Invoice request'
 		);
 	}
+	const bip353Val = findTlvRecord(
+		records,
+		BigInt(InvoiceRequestTlvType.BIP_353_NAME)
+	);
+	if (bip353Val) assertBip353Name(bip353Val);
 
 	// Compute offerId from the offer TLV records mirrored into the request. Offer
 	// TLVs occupy types 1-79; invreq_metadata (type 0) and the invreq fields
@@ -509,7 +550,12 @@ export function decodeInvoiceRequestTlv(data: Buffer): {
 	if (amountVal) request.amount = decodeTruncatedU64(amountVal);
 	if (featuresVal) request.features = featuresVal;
 	if (qtyVal) request.quantity = decodeTruncatedU64(qtyVal);
-	if (payerNoteVal) request.payerNote = payerNoteVal.toString('utf8');
+	if (payerNoteVal) {
+		request.payerNote = decodeBolt1String(
+			payerNoteVal,
+			'Invoice request payer note'
+		);
+	}
 	if (metadataVal) request.metadata = metadataVal;
 	if (signatureVal) request.signature = signatureVal;
 
@@ -588,6 +634,7 @@ export function encodeInvoiceTlv(
 		});
 	}
 	if (invoice.features && invoice.features.length > 0) {
+		assertMinimalFeatures(invoice.features, 'Invoice');
 		records.push({
 			type: BigInt(InvoiceTlvType.FEATURES),
 			value: invoice.features
@@ -614,8 +661,9 @@ export function encodeInvoiceTlv(
 /**
  * Decode an IBolt12Invoice from a TLV stream, enforcing the BOLT 12 reader
  * MUSTs on its shape: types confined to 0..239, the signature range and the
- * experimental range up to 3999999999, unknown even types rejected, no
- * unknown even bit in invoice_features, and a valid invoice_node_id point.
+ * experimental range up to 3999999999, unknown even types rejected, minimal
+ * invoice_features with no unknown even bit, and a valid invoice_node_id
+ * point.
  */
 export function decodeInvoiceTlv(data: Buffer): {
 	invoice: IBolt12Invoice;
@@ -657,11 +705,7 @@ export function decodeInvoiceTlv(data: Buffer): {
 		throw new Error('Invoice invoice_node_id is not a valid point');
 	}
 	if (featuresVal) {
-		assertNoUnknownRequiredFeatures(
-			featuresVal,
-			INVOICE_KNOWN_FEATURES,
-			'Invoice'
-		);
+		assertReadableFeatures(featuresVal, INVOICE_KNOWN_FEATURES, 'Invoice');
 	}
 
 	// The mirrored offer_description (type 10) rides in the invoice per the
@@ -670,7 +714,9 @@ export function decodeInvoiceTlv(data: Buffer): {
 	const invoice: IBolt12Invoice = {
 		paymentHash: payHashVal,
 		amount: decodeTruncatedU64(amountVal),
-		description: mirroredDesc ? mirroredDesc.toString('utf8') : '',
+		description: mirroredDesc
+			? decodeBolt1String(mirroredDesc, 'Invoice offer description')
+			: '',
 		createdAt: decodeTruncatedU64(createdAtVal),
 		nodeId: nodeIdVal
 	};

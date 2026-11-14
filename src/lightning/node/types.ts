@@ -633,7 +633,11 @@ export interface INodeConfig {
 	forwardingPolicyGraceMs?: number;
 	/** MPP partial payment timeout in ms (default 60000) */
 	mppTimeoutMs?: number;
-	/** Human-readable node alias (max 32 bytes UTF-8, per BOLT 7) */
+	/**
+	 * Human-readable node alias (max 32 bytes UTF-8, per BOLT 7). The node
+	 * refuses to start if it holds a character BOLT 1 forbids: control,
+	 * format (zero-width, bidi), private-use, unassigned, U+2028 or U+2029.
+	 */
 	alias?: string;
 	/** Addresses to advertise in our node_announcement (BOLT 7 descriptors,
 	 *  e.g. from parseAnnouncedAddress). Only meaningful once the node has at

@@ -21,6 +21,7 @@ rather than hand-written fixtures.
 | `bolt04/blinded-onion-message.json` | `bolt04/blinded-onion-message-onion-test.json` |
 | `bolt04/onion-error.json` | `bolt04/onion-error-test.json` |
 | `bolt07/extended-queries.json` | `bolt07/extended-queries.json` |
+| `bolt07/node-announcement-alias.json` | `07-routing-gossip.md`: Test vectors (aliases with illegal unicode characters), at commit `191462825ae341f0a27098765c075f01ca9bc6c2` (master, fetched 2026-11-14) |
 | `bolt08/transport.json` | `08-transport.md` — Appendix A: Transport Test Vectors |
 | `bolt11/invoices.json` | `11-payment-encoding.md` — Examples / Examples of Invalid Invoices |
 | `bolt11/invoice-test.json` | `bolt11/invoice-test.json`, byte for byte at commit `191462825ae341f0a27098765c075f01ca9bc6c2` (master, fetched 2026-11-14) |

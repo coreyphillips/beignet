@@ -302,7 +302,7 @@ Generated from `node/types.ts` by `npm run docs:tables`; edit the doc comments t
 | `forwardingFeePropMillionths?` | `number` | **Deprecated.** Use `forwarding.feePropMillionths`. |
 | `forwardingPolicyGraceMs?` | `number` | **Deprecated.** Use `forwarding.policyGraceMs`. |
 | `mppTimeoutMs?` | `number` | MPP partial payment timeout in ms (default 60000) |
-| `alias?` | `string` | Human-readable node alias (max 32 bytes UTF-8, per BOLT 7) |
+| `alias?` | `string` | Human-readable node alias (max 32 bytes UTF-8, per BOLT 7). The node refuses to start if it holds a character BOLT 1 forbids: control, format (zero-width, bidi), private-use, unassigned, U+2028 or U+2029. |
 | `announcedAddresses?` | `INodeAddress[]` | Addresses to advertise in our node_announcement (BOLT 7 descriptors, e.g. from parseAnnouncedAddress). Only meaningful once the node has at least one announced (public) channel. |
 | `socks5Proxy?` | `object` | SOCKS5 proxy for outbound peer connections (e.g. Tor on 127.0.0.1:9050) |
 | `socks5Proxy.host` | `string` | Proxy host. |

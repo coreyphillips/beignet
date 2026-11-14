@@ -6181,6 +6181,7 @@ member offer.InvoiceErrorTlvType.ERROR = 5
 member offer.InvoiceErrorTlvType.SUGGESTED_VALUE = 3
 enum offer.InvoiceRequestTlvType
 member offer.InvoiceRequestTlvType.AMOUNT = 82
+member offer.InvoiceRequestTlvType.BIP_353_NAME = 91
 member offer.InvoiceRequestTlvType.CHAIN = 80
 member offer.InvoiceRequestTlvType.FEATURES = 84
 member offer.InvoiceRequestTlvType.METADATA = 0

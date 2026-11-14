@@ -173,6 +173,7 @@ import {
 	nodeAddressToHostPort,
 	announcedDialableAddresses
 } from '../gossip/messages';
+import { assertBolt1String } from '../message/field-rules';
 import {
 	decodeReplyChannelRangeMessage,
 	decodeReplyShortChannelIdsEndMessage,
@@ -1746,6 +1747,11 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		const leaveLifecycleToCreate = constructingForCreate;
 		constructingForCreate = false;
 		const config = resolveNodeConfig(nodeConfig);
+		// Peers ignore a node_announcement whose alias breaks the BOLT 1 string
+		// rule, so the node would silently vanish from their graphs.
+		if (config.alias !== undefined) {
+			assertBolt1String(config.alias, 'Node alias');
+		}
 
 		this.nodePrivkey = config.nodePrivateKey;
 		this.ownNodeIdBytes = getPublicKey(config.nodePrivateKey);
