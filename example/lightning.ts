@@ -24,14 +24,16 @@ type IFundingProvider = lnNode.IFundingProvider;
 
 const NETWORKS = ['mainnet', 'testnet', 'regtest'];
 
+// The mnemonic comes from BEIGNET_MNEMONIC, never from argv: an argument sits
+// in shell history and in the process list for as long as the REPL runs.
 function parseArgs(argv: string[]): {
-	mnemonic?: string;
 	alias?: string;
 	torProxy?: string;
 	network?: string;
 	electrumHost?: string;
 	electrumPort?: number;
 	electrumTls?: boolean;
+	strayArgument: boolean;
 } {
 	const args = argv.slice(2);
 	let alias: string | undefined;
@@ -40,7 +42,7 @@ function parseArgs(argv: string[]): {
 	let electrumHost: string | undefined;
 	let electrumPort: number | undefined;
 	let electrumTls: boolean | undefined;
-	const mnemonicWords: string[] = [];
+	let strayArgument = false;
 
 	for (let i = 0; i < args.length; i++) {
 		if (args[i] === '--alias' && i + 1 < args.length) {
@@ -63,18 +65,18 @@ function parseArgs(argv: string[]): {
 		} else if (args[i].startsWith('--')) {
 			// skip flags like --low-level, --payment-flow
 		} else {
-			mnemonicWords.push(args[i]);
+			strayArgument = true;
 		}
 	}
 
 	return {
-		mnemonic: mnemonicWords.length > 0 ? mnemonicWords.join(' ') : undefined,
 		alias,
 		torProxy,
 		network,
 		electrumHost,
 		electrumPort,
-		electrumTls
+		electrumTls,
+		strayArgument
 	};
 }
 
@@ -228,10 +230,11 @@ export async function createFundingProvider(
 // ─────────────── Example ───────────────
 
 const runExample = async (
-	mnemonic = generateMnemonic(),
+	suppliedMnemonic?: string,
 	alias?: string,
 	torProxy?: string
 ): Promise<void> => {
+	const mnemonic = suppliedMnemonic ?? generateMnemonic();
 	// 1. Set up SQLite persistence
 	const dataDir = path.resolve('example/lightningData');
 	await fs.mkdir(dataDir, { recursive: true });
@@ -269,10 +272,14 @@ const runExample = async (
 	console.log('Node ID:   ', info.nodeId);
 	console.log('Network:   ', info.network);
 	if (info.alias) console.log('Alias:     ', info.alias);
-	console.log('Mnemonic:  ', mnemonic);
-	console.log(
-		"           This mnemonic is the node's only backup: write it down before funding it."
-	);
+	if (suppliedMnemonic) {
+		console.log('Mnemonic:   from BEIGNET_MNEMONIC');
+	} else {
+		console.log('Mnemonic:  ', mnemonic);
+		console.log(
+			"           This mnemonic is the node's only backup: write it down before funding it."
+		);
+	}
 	console.log('Address:   ', node.getFundingAddress());
 	console.log('Storage:   ', path.join(dataDir, 'node.db'));
 	console.log('Channels:  ', info.channelCount);
@@ -342,7 +349,7 @@ const runExample = async (
 // ─────────────── BeignetNode Example (simplified API) ───────────────
 
 const runBeignetExample = async (
-	mnemonic = generateMnemonic(),
+	suppliedMnemonic?: string,
 	network: 'mainnet' | 'testnet' | 'regtest' = 'regtest',
 	electrumHost?: string,
 	electrumPort?: number,
@@ -351,11 +358,16 @@ const runBeignetExample = async (
 	torProxy?: string,
 	electrumTls?: boolean
 ): Promise<void> => {
+	const mnemonic = suppliedMnemonic ?? generateMnemonic();
 	console.log('Network: ', network);
-	console.log('Mnemonic:', mnemonic);
-	console.log(
-		"This mnemonic is the node's only backup: write it down before funding it."
-	);
+	if (suppliedMnemonic) {
+		console.log('Mnemonic: from BEIGNET_MNEMONIC');
+	} else {
+		console.log('Mnemonic:', mnemonic);
+		console.log(
+			"This mnemonic is the node's only backup: write it down before funding it."
+		);
+	}
 	if (torProxy) await probeSocksProxy(torProxy);
 	const node = await BeignetNode.create({
 		mnemonic,
@@ -675,14 +687,24 @@ const runPaymentFlowExample = async (): Promise<void> => {
 // ─────────────── Entry Point ───────────────
 
 const {
-	mnemonic,
 	alias,
 	torProxy,
 	network,
 	electrumHost,
 	electrumPort,
-	electrumTls
+	electrumTls,
+	strayArgument
 } = parseArgs(process.argv);
+// Not echoed: a stray argument may be seed words.
+if (strayArgument) {
+	console.error(
+		'\n[beignet] Unexpected argument. Positional arguments are a network name ' +
+			'only.\n[beignet] Pass an existing mnemonic in BEIGNET_MNEMONIC, never ' +
+			'as an argument.\n'
+	);
+	process.exit(1);
+}
+const mnemonic = process.env.BEIGNET_MNEMONIC?.trim() || undefined;
 const useLowLevel = process.argv.includes('--low-level');
 const usePaymentFlow = process.argv.includes('--payment-flow');
 const useFullGraph = process.argv.includes('--full-graph');

@@ -2,10 +2,12 @@
 
 Copy-paste sequences for exercising a live `BeignetNode` from the REPL.
 
-Start the node:
+Start the node. The example reads the mnemonic from `BEIGNET_MNEMONIC` and refuses
+one on the command line; `read -rs` takes it without echoing:
 
 ```bash
-npm run example:lightning -- "<YOUR MNEMONIC>" mainnet --alias "Beignet Lightning"
+read -rs BEIGNET_MNEMONIC && export BEIGNET_MNEMONIC   # paste your mnemonic, press Enter
+npm run example:lightning -- mainnet --alias "Beignet Lightning"
 ```
 
 Inside the REPL the node is bound to `node`. Type `help()` for the full command list.
@@ -18,14 +20,14 @@ Inside the REPL the node is bound to `node`. Type `help()` for the full command 
 
 ## REPL flags
 
-Everything after `--` is passed to `example/lightning.ts`. Positional args are
-order-independent: a recognized network name sets the network, and any other bare
-words are collected as the mnemonic.
+Everything after `--` is passed to `example/lightning.ts`. The only positional arg
+is a network name. Any other bare word makes the example exit, so a mnemonic never
+reaches shell history or the process list: an existing one goes in `BEIGNET_MNEMONIC`,
+and without it the example generates one.
 
 | Flag | Effect |
 |------|--------|
 | `mainnet` \| `testnet` \| `regtest` | Network (default `regtest`). The example does not wire up signet |
-| `<12 or 24 bare words>` | Reuse a mnemonic. Omit to generate a fresh one |
 | `--alias <name>` | Node alias advertised in `node_announcement` (max 32 bytes UTF-8) |
 | `--electrum-host <host>` | Electrum server host (default: the network's public server) |
 | `--electrum-port <port>` | Electrum server port |
@@ -36,17 +38,17 @@ words are collected as the mnemonic.
 | `--low-level` | Drive `LightningNode` directly instead of `BeignetNode`: bigint msat, Buffer IDs, manual funding. Prompt becomes `lightning>` and state goes to `example/lightningData/node.db`. Mainnet only: exits unless `mainnet` is passed |
 | `--payment-flow` | Non-interactive: spins up two `BeignetNode`s on regtest and walks the payment API (invoice creation, decode, `canSend`, health, mainnet readiness), then shuts down. It opens no channels, so no payment is actually settled |
 
-Examples:
+Examples (the mainnet ones expect `BEIGNET_MNEMONIC` exported as above):
 
 ```bash
 # named regtest node against a local Electrum server
 npm run example:lightning -- regtest --electrum-host 127.0.0.1 --electrum-port 60001 --alias mynode
 
 # mainnet node over Tor with the full network graph
-npm run example:lightning -- "<YOUR MNEMONIC>" mainnet --tor-proxy 127.0.0.1:9050 --full-graph
+npm run example:lightning -- mainnet --tor-proxy 127.0.0.1:9050 --full-graph
 
 # protocol-layer REPL (mainnet only)
-npm run example:lightning -- "<YOUR MNEMONIC>" mainnet --low-level
+npm run example:lightning -- mainnet --low-level
 ```
 
 `BeignetNode` state lives in a SQLite DB under `~/.beignet/data/<hash-of-mnemonic>/`,

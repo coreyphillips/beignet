@@ -19,15 +19,20 @@ const NETWORKS = new Map<
 ]);
 
 const runExample = async (
-	mnemonic = generateMnemonic(),
+	suppliedMnemonic?: string,
 	networkName = 'regtest'
 ): Promise<void> => {
 	const network = NETWORKS.get(networkName)!;
+	const mnemonic = suppliedMnemonic ?? generateMnemonic();
 	console.log('Network: ', networkName);
-	console.log('Mnemonic:', mnemonic);
-	console.log(
-		"This mnemonic is the wallet's only backup: write it down before funding it."
-	);
+	if (suppliedMnemonic) {
+		console.log('Mnemonic: from BEIGNET_MNEMONIC');
+	} else {
+		console.log('Mnemonic:', mnemonic);
+		console.log(
+			"This mnemonic is the wallet's only backup: write it down before funding it."
+		);
+	}
 
 	// Create Wallet
 	const createWalletResponse = await Wallet.create({
@@ -117,11 +122,19 @@ const runExample = async (
 	});
 };
 
-// A bare network name picks the network (default regtest). Any other words
-// are the mnemonic, quoted as one argument or not.
+// A bare network name picks the network (default regtest). The mnemonic comes
+// from BEIGNET_MNEMONIC: an argument would sit in shell history and in the
+// process list for as long as the REPL runs. Nothing else is accepted, and
+// the rejected argument is not echoed, since it may be seed words.
 const args = process.argv.slice(2);
-const words = args.filter((arg) => !NETWORKS.has(arg));
+if (args.some((arg) => !NETWORKS.has(arg))) {
+	console.error(
+		'Usage: npm run example -- [mainnet|testnet|regtest]\n' +
+			'Pass an existing mnemonic in BEIGNET_MNEMONIC, never as an argument.'
+	);
+	process.exit(1);
+}
 void runExample(
-	words.length > 0 ? words.join(' ') : undefined,
+	process.env.BEIGNET_MNEMONIC?.trim() || undefined,
 	args.find((arg) => NETWORKS.has(arg))
 );
