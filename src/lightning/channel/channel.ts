@@ -5385,15 +5385,12 @@ export class Channel {
 			// operation, but with TWO active fundings every commitment update
 			// MUST arrive as a start_batch of one commitment_signed per funding.
 			// A lone commitment_signed here (no preceding start_batch) is invalid
-			// and would revoke on only one funding.
+			// and would revoke on only one funding. The splicing spec fails the
+			// channel for it.
 			if (this.isSplicePendingLock()) {
-				return [
-					{
-						type: ChannelActionType.ERROR,
-						message:
-							'commitment_signed during a pending splice must be a start_batch'
-					}
-				];
+				return this._failChannelWithWireError(
+					'commitment_signed during a pending splice must be a start_batch'
+				);
 			}
 			// Mid-splice: the peer sends commitment_signed for the new commitment
 			// (spending the spliced funding output) after the interactive tx
@@ -9350,9 +9347,17 @@ export class Channel {
 			closeeScriptPubkey: Buffer
 		) => Buffer
 	): ChannelAction[] {
+		// A closing_complete that does not fit the channel's state (or arrives
+		// while something is still unresolved) is refused locally. One refused
+		// for its content, by the spec or by our own fee, locktime and payout
+		// checks, would otherwise leave the peer waiting for a closing_sig that
+		// never comes: it gets a warning and a disconnect, and the reconnect
+		// restarts the close from shutdown.
 		const err = (message: string): ChannelAction[] => [
 			{ type: ChannelActionType.ERROR, message }
 		];
+		const refuse = (message: string): ChannelAction[] =>
+			this._warnAndDisconnect(message);
 
 		// Concurrent-close race: both sides may send closing_complete. If we
 		// already reached CLOSED through one direction, still co-sign the peer's
@@ -9390,7 +9395,7 @@ export class Channel {
 
 		// The closer pays the fee from its own (remote, from our view) balance.
 		if (msg.feeSatoshis > this._state.remoteBalanceMsat / 1000n) {
-			return err('closing_complete: fee exceeds closer balance');
+			return refuse('closing_complete: fee exceeds closer balance');
 		}
 		// And never less than the tx needs to relay. Co-signing is closing:
 		// the closee cannot bump (only the closer RBFs, sendClosingComplete),
@@ -9411,7 +9416,7 @@ export class Channel {
 			});
 			const floor = minRelayFeeForWeight(weight);
 			if (feePaid < floor) {
-				return err(
+				return refuse(
 					`closing_complete: fee ${msg.feeSatoshis} sat pays ${feePaid} sat on the closing tx, below the ${floor} sat relay floor`
 				);
 			}
@@ -9424,13 +9429,13 @@ export class Channel {
 		// anti-fee-sniping), and refuse any nonzero value while we have no tip
 		// to judge against.
 		if (msg.locktime >= 500_000_000) {
-			return err(
+			return refuse(
 				`closing_complete: locktime ${msg.locktime} is not a block height`
 			);
 		}
 		if (msg.locktime > 0) {
 			if (this._currentBlockHeight <= 0) {
-				return err(
+				return refuse(
 					`closing_complete: no chain tip to validate locktime ${msg.locktime} against`
 				);
 			}
@@ -9438,7 +9443,7 @@ export class Channel {
 				msg.locktime >
 				this._currentBlockHeight + SIMPLE_CLOSE_LOCKTIME_FUTURE_TOLERANCE
 			) {
-				return err(
+				return refuse(
 					`closing_complete: locktime ${msg.locktime} is beyond our chain tip ${this._currentBlockHeight}`
 				);
 			}
@@ -9448,12 +9453,12 @@ export class Channel {
 			!this._state.localShutdownScript ||
 			!msg.closeeScriptPubkey.equals(this._state.localShutdownScript)
 		) {
-			return err('closing_complete: closee script does not match ours');
+			return refuse('closing_complete: closee script does not match ours');
 		}
 		// Their script may differ from their shutdown (simple close allows script
 		// updates), but must still be a standard form (OP_RETURN allowed here).
 		if (!isValidShutdownScript(msg.closerScriptPubkey, true, true)) {
-			return err('closing_complete: invalid closer script');
+			return refuse('closing_complete: invalid closer script');
 		}
 		this._state.remoteShutdownScript = msg.closerScriptPubkey;
 		if (!alreadyClosed) {
@@ -9466,12 +9471,14 @@ export class Channel {
 		const ourValue = this._state.localBalanceMsat / 1000n;
 		const ourDust = isDustOutput(msg.closeeScriptPubkey, ourValue);
 		if (this._state.externalClose && ourDust)
-			return err('Cannot close cooperatively: external payout would be dust');
+			return refuse(
+				'Cannot close cooperatively: external payout would be dust'
+			);
 		let variant: ClosingSigVariant;
 		let theirSig: Buffer;
 		if (ourDust) {
 			if (!msg.closerOutputOnlySig) {
-				return err(
+				return refuse(
 					'closing_complete: our output is dust but no closer_output_only sig'
 				);
 			}
@@ -9486,7 +9493,7 @@ export class Channel {
 		} else {
 			// Only closer_output_only offered but our output is not dust — signing
 			// it would burn our balance to their close. Refuse.
-			return err(
+			return refuse(
 				'closing_complete: peer offered only closer_output_only for our non-dust output'
 			);
 		}
@@ -9501,7 +9508,7 @@ export class Channel {
 				theirSig
 			)
 		) {
-			return err('closing_complete: peer signature failed to verify');
+			return refuse('closing_complete: peer signature failed to verify');
 		}
 
 		const ourSig = signFn(
@@ -9555,9 +9562,13 @@ export class Channel {
 			signature: Buffer
 		) => boolean
 	): ChannelAction[] {
+		// State refusals stay local; a closing_sig refused for its content gets
+		// a warning and a disconnect, as in handleClosingComplete.
 		const err = (message: string): ChannelAction[] => [
 			{ type: ChannelActionType.ERROR, message }
 		];
+		const refuse = (message: string): ChannelAction[] =>
+			this._warnAndDisconnect(message);
 
 		// Concurrent-close race: our closing_complete may be answered after we
 		// already reached CLOSED as the closee of the peer's round. Accept it —
@@ -9592,7 +9603,7 @@ export class Channel {
 		}
 		const last = this._state.lastLocalClosingComplete;
 		if (!last || !this._state.awaitingClosingSig) {
-			return err('closing_sig without a pending closing_complete');
+			return refuse('closing_sig without a pending closing_complete');
 		}
 		if (
 			msg.feeSatoshis !== last.feeSatoshis ||
@@ -9600,7 +9611,7 @@ export class Channel {
 			!msg.closerScriptPubkey.equals(last.closerScript) ||
 			!msg.closeeScriptPubkey.equals(last.closeeScript)
 		) {
-			return err('closing_sig does not echo our closing_complete');
+			return refuse('closing_sig does not echo our closing_complete');
 		}
 
 		const sigs: Array<{ variant: ClosingSigVariant; sig: Buffer }> = [];
@@ -9623,13 +9634,13 @@ export class Channel {
 			});
 		}
 		if (sigs.length !== 1) {
-			return err(
+			return refuse(
 				`closing_sig must carry exactly one signature, got ${sigs.length}`
 			);
 		}
 		const { variant, sig } = sigs[0];
 		if (!last.sentVariants.includes(variant)) {
-			return err('closing_sig signature variant was not offered by us');
+			return refuse('closing_sig signature variant was not offered by us');
 		}
 
 		if (
@@ -9642,7 +9653,7 @@ export class Channel {
 				sig
 			)
 		) {
-			return err('closing_sig: peer signature failed to verify');
+			return refuse('closing_sig: peer signature failed to verify');
 		}
 
 		this._state.awaitingClosingSig = false;
@@ -10355,6 +10366,37 @@ export class Channel {
 				'acceptStaleStateRisk: true), which publishes a commitment the ' +
 				'peer may already hold a revocation for'
 		);
+	}
+
+	/**
+	 * BOLT 1 `warning` and a disconnect: the lighter of the two answers BOLT 2
+	 * allows for a protocol violation ("send a `warning` and close the
+	 * connection, or send an `error` and fail the channel"). For a fault the
+	 * next channel_reestablish recovers from, where failing the channel would
+	 * broadcast a commitment over a disagreement a reconnect settles. Nothing
+	 * about the channel changes here, so there is nothing to persist.
+	 */
+	private _warnAndDisconnect(message: string): ChannelAction[] {
+		return [
+			...this._wireWarning(message),
+			{ type: ChannelActionType.ERROR, message },
+			{ type: ChannelActionType.DISCONNECT_PEER, reason: message }
+		];
+	}
+
+	/**
+	 * A BOLT 1 `warning` scoped to this channel. Same scope rule as
+	 * wireErrorFor: an id that cannot carry one sends nothing.
+	 */
+	private _wireWarning(message: string): ChannelAction[] {
+		const channelId = this._state.channelId ?? this._state.temporaryChannelId;
+		if (!canScopeWireError(channelId)) return [];
+		return [
+			sendMsg(
+				MessageType.WARNING,
+				encodeErrorMessage({ channelId, data: Buffer.from(message, 'ascii') })
+			)
+		];
 	}
 
 	private _failChannelWithWireError(
@@ -14356,6 +14398,10 @@ export class Channel {
 
 		const result = this._spliceSession.handleSpliceLocked(msg);
 		if (!result.ok) {
+			// A txid that matches no pending splice. The spec allows a warning
+			// and a disconnect, and nothing is lost by reconnecting: the
+			// reestablish exchange settles which funding is locked.
+			if (result.txidMismatch) return this._warnAndDisconnect(result.error!);
 			return [{ type: ChannelActionType.ERROR, message: result.error! }];
 		}
 
@@ -15507,6 +15553,9 @@ export class Channel {
 			this._state.spliceFundingTxid !== null &&
 			this._state.fundingTxid !== null &&
 			this._state.spliceFundingTxid.equals(this._state.fundingTxid);
+		// Refused locally and nothing collected: the members that follow are
+		// judged one by one, which is what the spec asks of a start_batch the
+		// receiver ignores.
 		if (!this.isSplicePendingLock() && !postSpliceNormal) {
 			return [
 				{
@@ -15515,6 +15564,9 @@ export class Channel {
 				}
 			];
 		}
+		// The spec ignores a start_batch for another message type and processes
+		// what follows sequentially. A lone commitment_signed during the pending
+		// splice then fails the channel in handleCommitmentSigned.
 		if (msg.messageType !== undefined && msg.messageType !== 132) {
 			return [
 				{
@@ -15523,17 +15575,24 @@ export class Channel {
 				}
 			];
 		}
-		// Exactly one current funding + one pending splice (no splice RBF yet):
-		// the batch MUST carry one commitment_signed per active funding. A
-		// smaller batch would revoke on only one funding (see the fund-safety
-		// note in _handleCommitmentSignedBatch).
-		if (msg.batchSize !== 2) {
+		// A batch_size of 0 or 1 is ignored with a warning (spec); the lone
+		// commitment_signed after it meets the same arm as above.
+		if (msg.batchSize <= 1) {
+			const message = `Ignoring start_batch of size ${msg.batchSize}`;
 			return [
-				{
-					type: ChannelActionType.ERROR,
-					message: `Unsupported start_batch size ${msg.batchSize} (expected 2)`
-				}
+				...this._wireWarning(message),
+				{ type: ChannelActionType.ERROR, message }
 			];
+		}
+		// Exactly one current funding + one pending splice (no splice RBF yet):
+		// the batch MUST carry one commitment_signed per active funding. Any
+		// other size means the peer is signing a different set of fundings, and
+		// the two sides would revoke on different commitments (see the
+		// fund-safety note in _handleCommitmentSignedBatch).
+		if (msg.batchSize !== 2) {
+			return this._failChannelWithWireError(
+				`Unsupported start_batch size ${msg.batchSize} (expected 2)`
+			);
 		}
 		this._pendingBatch = { size: msg.batchSize, msgs: [] };
 		return [];
@@ -15574,13 +15633,9 @@ export class Channel {
 					m.fundingTxid.equals(this._state.fundingTxid)
 			);
 			if (!current) {
-				return [
-					{
-						type: ChannelActionType.ERROR,
-						message:
-							'Commitment batch without a pending splice or a current-funding commitment'
-					}
-				];
+				return this._failChannelWithWireError(
+					'Commitment batch without a pending splice or a current-funding commitment'
+				);
 			}
 			return this.handleCommitmentSigned(current);
 		}
@@ -15590,12 +15645,9 @@ export class Channel {
 		for (const m of msgs) {
 			if (m.fundingTxid && m.fundingTxid.equals(inflight.spliceTxid)) {
 				if (spliceMsg) {
-					return [
-						{
-							type: ChannelActionType.ERROR,
-							message: 'Commitment batch has two splice-funding commitments'
-						}
-					];
+					return this._failChannelWithWireError(
+						'Commitment batch has two splice-funding commitments'
+					);
 				}
 				spliceMsg = m;
 			} else if (
@@ -15603,23 +15655,17 @@ export class Channel {
 				m.fundingTxid?.equals(this._state.fundingTxid)
 			) {
 				if (currentMsg) {
-					return [
-						{
-							type: ChannelActionType.ERROR,
-							message: 'Commitment batch has two current-funding commitments'
-						}
-					];
+					return this._failChannelWithWireError(
+						'Commitment batch has two current-funding commitments'
+					);
 				}
 				currentMsg = m;
 			} else {
 				// Every member carries a funding_txid: refused above otherwise.
 				const peerTxid = Buffer.from(m.fundingTxid!).reverse().toString('hex');
-				return [
-					{
-						type: ChannelActionType.ERROR,
-						message: `Commitment batch funding_txid unknown: ${peerTxid}`
-					}
-				];
+				return this._failChannelWithWireError(
+					`Commitment batch funding_txid unknown: ${peerTxid}`
+				);
 			}
 		}
 		// Fund-safety (both required): the revoke_and_ack the standard path emits
@@ -15630,20 +15676,14 @@ export class Channel {
 		// the splice-funding commitment while leaving us with only a stale
 		// signature for it, and hence no unilateral exit on the spliced channel.
 		if (!currentMsg) {
-			return [
-				{
-					type: ChannelActionType.ERROR,
-					message: 'Commitment batch missing the current-funding commitment'
-				}
-			];
+			return this._failChannelWithWireError(
+				'Commitment batch missing the current-funding commitment'
+			);
 		}
 		if (!spliceMsg) {
-			return [
-				{
-					type: ChannelActionType.ERROR,
-					message: 'Commitment batch missing the splice-funding commitment'
-				}
-			];
+			return this._failChannelWithWireError(
+				'Commitment batch missing the splice-funding commitment'
+			);
 		}
 
 		// Verify the SPLICE-funding commitment first, at the post-round height
@@ -15693,12 +15733,9 @@ export class Channel {
 				nextNum
 			)
 		) {
-			return [
-				{
-					type: ChannelActionType.ERROR,
-					message: 'Invalid batched splice commitment signature'
-				}
-			];
+			return this._failChannelWithWireError(
+				'Invalid batched splice commitment signature'
+			);
 		}
 		// Committed HTLCs may ride through a splice (S-2.M8): the spliced
 		// commitment then carries HTLC outputs, and the peer's second-level
@@ -15722,12 +15759,9 @@ export class Channel {
 						nextNum
 				  );
 			if (!htlcSigsValid) {
-				return [
-					{
-						type: ChannelActionType.ERROR,
-						message: 'Invalid HTLC signature in a pending-lock batch'
-					}
-				];
+				return this._failChannelWithWireError(
+					'Invalid HTLC signature in a pending-lock batch'
+				);
 			}
 		}
 		// The rate the spliced commitment was verified at (before the standard

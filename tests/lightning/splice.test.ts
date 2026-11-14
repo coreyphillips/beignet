@@ -10342,6 +10342,267 @@ describe('Splice', function () {
 			);
 		});
 
+		/**
+		 * Issue #2044: the batch faults below used to refuse locally, so the
+		 * peer was never told and the channel stalled until an HTLC timed out.
+		 * Each now reaches the peer as the spec's answer.
+		 */
+		describe('peer batch violations reach the wire (issue #2044)', function () {
+			interface IBatchHarness {
+				pair: ReturnType<typeof pendingLockPair>;
+				/** The opener's real round: add, start_batch, two commitment_signed. */
+				round: Array<{ type: number; payload: Buffer }>;
+				/** What the acceptor sent the opener from here on. */
+				fromAcceptor: Array<{ type: number; payload: Buffer }>;
+				commitBefore: bigint;
+			}
+
+			function batchRound(): IBatchHarness {
+				const pair = pendingLockPair();
+				const {
+					openerManager,
+					acceptorManager,
+					channelId,
+					acceptorChannel,
+					openerPubkey,
+					acceptorPubkey
+				} = pair;
+				openerManager.removeAllListeners('message:outbound');
+				acceptorManager.removeAllListeners('message:outbound');
+				acceptorManager.on('error', () => {});
+				const round: Array<{ type: number; payload: Buffer }> = [];
+				const fromAcceptor: Array<{ type: number; payload: Buffer }> = [];
+				openerManager.on('message:outbound', (pk, type, payload) => {
+					if (pk === acceptorPubkey) round.push({ type, payload });
+				});
+				acceptorManager.on('message:outbound', (pk, type, payload) => {
+					if (pk === openerPubkey) fromAcceptor.push({ type, payload });
+				});
+				openerManager.addHtlc(
+					channelId,
+					15_000_000n,
+					crypto.randomBytes(32),
+					500000,
+					crypto.randomBytes(1366)
+				);
+				expect(round.map((m) => m.type)).to.deep.equal([
+					MessageType.UPDATE_ADD_HTLC,
+					MessageType.START_BATCH,
+					MessageType.COMMITMENT_SIGNED,
+					MessageType.COMMITMENT_SIGNED
+				]);
+				return {
+					pair,
+					round,
+					fromAcceptor,
+					commitBefore: acceptorChannel.getFullState().localCommitmentNumber
+				};
+			}
+
+			function deliver(
+				h: IBatchHarness,
+				msgs: Array<{ type: number; payload: Buffer }>
+			): void {
+				for (const m of msgs) {
+					h.pair.acceptorManager.handleMessage(
+						h.pair.openerPubkey,
+						m.type,
+						m.payload
+					);
+				}
+			}
+
+			function expectFailedOnTheWire(h: IBatchHarness, pattern: RegExp): void {
+				const errors = h.fromAcceptor.filter(
+					(m) => m.type === MessageType.ERROR
+				);
+				expect(errors.length, 'one wire error').to.equal(1);
+				const error = decodeErrorMessage(errors[0].payload);
+				expect(error.channelId.equals(h.pair.channelId)).to.equal(true);
+				expect(error.data.toString('ascii')).to.match(pattern);
+				expect(
+					h.fromAcceptor.some((m) => m.type === MessageType.REVOKE_AND_ACK),
+					'nothing revoked'
+				).to.equal(false);
+				expect(h.pair.acceptorChannel.getState()).to.equal(
+					ChannelState.ERRORED
+				);
+				expect(
+					h.pair.acceptorChannel.getFullState().localCommitmentNumber
+				).to.equal(h.commitBefore);
+			}
+
+			function replaceMember(
+				h: IBatchHarness,
+				index: 2 | 3,
+				edit: (m: ReturnType<typeof decodeCommitmentSignedMessage>) => void
+			): void {
+				const msg = decodeCommitmentSignedMessage(h.round[index].payload);
+				edit(msg);
+				h.round[index] = {
+					type: MessageType.COMMITMENT_SIGNED,
+					payload: encodeCommitmentSignedMessage(msg)
+				};
+			}
+
+			it('a lone commitment_signed during the pending splice fails the channel', function () {
+				const h = batchRound();
+				// The add and the first member only: no start_batch ahead of it.
+				deliver(h, [h.round[0], h.round[2]]);
+				expectFailedOnTheWire(
+					h,
+					/commitment_signed during a pending splice must be a start_batch/
+				);
+			});
+
+			it('a start_batch of more than two fails the channel', function () {
+				const h = batchRound();
+				deliver(h, [
+					h.round[0],
+					{
+						type: MessageType.START_BATCH,
+						payload: encodeStartBatchMessage({
+							channelId: h.pair.channelId,
+							batchSize: 3,
+							messageType: MessageType.COMMITMENT_SIGNED
+						})
+					}
+				]);
+				expectFailedOnTheWire(h, /Unsupported start_batch size 3/);
+				expect(h.pair.acceptorChannel.isCollectingBatch()).to.equal(false);
+			});
+
+			it('a start_batch of one is ignored with a warning, and the lone member after it fails the channel', function () {
+				const h = batchRound();
+				deliver(h, [
+					h.round[0],
+					{
+						type: MessageType.START_BATCH,
+						payload: encodeStartBatchMessage({
+							channelId: h.pair.channelId,
+							batchSize: 1,
+							messageType: MessageType.COMMITMENT_SIGNED
+						})
+					}
+				]);
+				expect(h.fromAcceptor.map((m) => m.type)).to.deep.equal([
+					MessageType.WARNING
+				]);
+				expect(
+					decodeErrorMessage(h.fromAcceptor[0].payload).data.toString('ascii')
+				).to.match(/Ignoring start_batch of size 1/);
+				expect(h.pair.acceptorChannel.isCollectingBatch()).to.equal(false);
+				expect(h.pair.acceptorChannel.getState()).to.equal(
+					ChannelState.SPLICING
+				);
+
+				deliver(h, [h.round[2]]);
+				expectFailedOnTheWire(h, /must be a start_batch/);
+			});
+
+			it('a start_batch for another message type is ignored, and its members then fail the channel one by one', function () {
+				const h = batchRound();
+				deliver(h, [
+					h.round[0],
+					{
+						type: MessageType.START_BATCH,
+						payload: encodeStartBatchMessage({
+							channelId: h.pair.channelId,
+							batchSize: 2,
+							messageType: MessageType.UPDATE_ADD_HTLC
+						})
+					}
+				]);
+				expect(h.fromAcceptor, 'nothing on the wire yet').to.deep.equal([]);
+				expect(h.pair.acceptorChannel.isCollectingBatch()).to.equal(false);
+
+				deliver(h, [h.round[2]]);
+				expectFailedOnTheWire(h, /must be a start_batch/);
+			});
+
+			it('a batch whose second member names an unknown funding fails the channel', function () {
+				const h = batchRound();
+				replaceMember(h, 3, (m) => {
+					m.fundingTxid = crypto.randomBytes(32);
+				});
+				deliver(h, h.round);
+				expectFailedOnTheWire(h, /Commitment batch funding_txid unknown/);
+			});
+
+			it('a batch with two current-funding members (none for the splice) fails the channel', function () {
+				const h = batchRound();
+				const current = h.pair.acceptorChannel.getFullState().fundingTxid!;
+				for (const index of [2, 3] as const) {
+					replaceMember(h, index, (m) => {
+						m.fundingTxid = Buffer.from(current);
+					});
+				}
+				deliver(h, h.round);
+				expectFailedOnTheWire(
+					h,
+					/Commitment batch has two current-funding commitments/
+				);
+			});
+
+			it('a batch with an invalid splice-funding signature fails the channel', function () {
+				const h = batchRound();
+				const spliceTxid =
+					h.pair.acceptorChannel.getFullState().spliceInFlight!.spliceTxid;
+				const index = decodeCommitmentSignedMessage(
+					h.round[2].payload
+				).fundingTxid!.equals(spliceTxid)
+					? 2
+					: 3;
+				replaceMember(h, index, (m) => {
+					m.signature = Buffer.from(m.signature);
+					m.signature[10] ^= 0xff;
+				});
+				deliver(h, h.round);
+				expectFailedOnTheWire(h, /Invalid batched splice commitment signature/);
+			});
+
+			it('a splice_locked for a txid that is no pending splice draws a warning and a disconnect, and the splice stays pending', function () {
+				const { acceptorManager, acceptorChannel, channelId, openerPubkey } =
+					pendingLockPair();
+				acceptorManager.removeAllListeners('message:outbound');
+				acceptorManager.on('error', () => {});
+				const fromAcceptor: Array<{ type: number; payload: Buffer }> = [];
+				acceptorManager.on('message:outbound', (pk, type, payload) => {
+					if (pk === openerPubkey) fromAcceptor.push({ type, payload });
+				});
+				const disconnects: Array<{ peer: string; reason: string }> = [];
+				acceptorManager.on('peer:disconnect-needed', (peer, reason) =>
+					disconnects.push({ peer, reason })
+				);
+
+				acceptorManager.handleMessage(
+					openerPubkey,
+					MessageType.SPLICE_LOCKED,
+					encodeSpliceLockedMessage({
+						channelId,
+						fundingTxid: crypto.randomBytes(32)
+					})
+				);
+
+				expect(fromAcceptor.map((m) => m.type)).to.deep.equal([
+					MessageType.WARNING
+				]);
+				const warning = decodeErrorMessage(fromAcceptor[0].payload);
+				expect(warning.channelId.equals(channelId)).to.equal(true);
+				expect(warning.data.toString('ascii')).to.match(
+					/Funding txid mismatch in splice_locked/
+				);
+				expect(disconnects).to.deep.equal([
+					{
+						peer: openerPubkey,
+						reason: 'Funding txid mismatch in splice_locked'
+					}
+				]);
+				expect(acceptorChannel.getState()).to.equal(ChannelState.SPLICING);
+				expect(acceptorChannel.isSplicePendingLock()).to.equal(true);
+			});
+		});
+
 		it('retransmits an un-acked pending-lock batch on reestablish', function () {
 			const pair = pendingLockPair();
 			const { openerManager, acceptorManager, channelId, openerPubkey } = pair;

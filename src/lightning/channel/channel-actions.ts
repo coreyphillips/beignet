@@ -36,7 +36,8 @@ export enum ChannelActionType {
 	SPLICE_CONFLICT_REQUEST_READY = 'SPLICE_CONFLICT_REQUEST_READY',
 	TX_SIGNATURES_NEEDED = 'TX_SIGNATURES_NEEDED',
 	SPLICE_TX_SIGNATURES_NEEDED = 'SPLICE_TX_SIGNATURES_NEEDED',
-	SPLICE_TX_NEGOTIATED = 'SPLICE_TX_NEGOTIATED'
+	SPLICE_TX_NEGOTIATED = 'SPLICE_TX_NEGOTIATED',
+	DISCONNECT_PEER = 'DISCONNECT_PEER'
 }
 
 export interface ISendMessageAction {
@@ -406,6 +407,18 @@ export interface ISpliceTxNegotiatedAction {
 }
 
 /**
+ * Close the connection to this channel's peer, leaving the channel's own state
+ * to the reconnect. The answer to a protocol violation the next
+ * channel_reestablish can recover from, sent after a BOLT 1 `warning` that
+ * says why. Runs in batch order, so the warning ahead of it is on the wire
+ * first.
+ */
+export interface IDisconnectPeerAction {
+	type: ChannelActionType.DISCONNECT_PEER;
+	reason: string;
+}
+
+/**
  * Wire messages BOLT 2 can require us to retransmit after a reconnect, and so
  * the ones worth retaining byte-exactly in the recovery outbox
  * (docs/RECOVERY-PROTOCOL.md 5.2). Anything outside this set is either
@@ -654,4 +667,5 @@ export type ChannelAction =
 	| ISpliceConflictRequestReadyAction
 	| ITxSignaturesNeededAction
 	| ISpliceTxSignaturesNeededAction
-	| ISpliceTxNegotiatedAction;
+	| ISpliceTxNegotiatedAction
+	| IDisconnectPeerAction;

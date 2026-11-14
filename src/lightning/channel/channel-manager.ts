@@ -4900,7 +4900,8 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		const detail = err instanceof Error ? err.message : String(err);
 		const reason = `Undecodable ${name}: ${detail}`;
 		const actions: ChannelAction[] = [
-			{ type: ChannelActionType.ERROR, message: reason }
+			{ type: ChannelActionType.ERROR, message: reason },
+			{ type: ChannelActionType.DISCONNECT_PEER, reason }
 		];
 		if (canScopeWireError(channelId)) {
 			actions.unshift({
@@ -4913,7 +4914,25 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			});
 		}
 		this.processActions(peerPubkey, channel, actions);
-		this.peerManager?.disconnectPeer(peerPubkey);
+	}
+
+	/**
+	 * The DISCONNECT_PEER action: drop the connection after a warning, so the
+	 * channel_reestablish on the next one restarts what the violation broke.
+	 * A manager with no PeerManager has no socket of its own, so the host that
+	 * carries its messages is asked instead.
+	 */
+	private disconnectPeerForViolation(peerPubkey: string, reason: string): void {
+		if (this.peerManager) {
+			try {
+				this.peerManager.disconnectPeer(peerPubkey);
+			} catch {
+				// Already gone, or the teardown raced: the warning and the local
+				// error have run, and nothing after this action depends on it.
+			}
+			return;
+		}
+		this.emit('peer:disconnect-needed', peerPubkey, reason);
 	}
 
 	private handleShutdownMsg(peerPubkey: string, payload: Buffer): void {
@@ -10508,6 +10527,9 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 						action.spliceTxid,
 						action.conflictTxid
 					);
+					break;
+				case ChannelActionType.DISCONNECT_PEER:
+					this.disconnectPeerForViolation(peerPubkey, action.reason);
 					break;
 			}
 			if (progress) progress.completedIndex = index;

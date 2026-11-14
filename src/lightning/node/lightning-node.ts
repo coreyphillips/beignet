@@ -5695,6 +5695,23 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			}
 		);
 
+		// A peer protocol violation answered with a warning (simple close, a
+		// splice_locked for no pending splice). Only emitted when the channel
+		// manager has no PeerManager attached; otherwise it already dropped the
+		// peer itself.
+		this.channelManager.on(
+			'peer:disconnect-needed',
+			(peerPubkey: string, reason: string) => {
+				this.emitStructuredLog('channel', 'peer_disconnect_needed', {
+					peerPubkey,
+					reason
+				});
+				setImmediate(() => {
+					this.requestPeerDisconnect(peerPubkey);
+				});
+			}
+		);
+
 		// Recovery 5.7 (issue #462): a peer is waiting on a channel this node
 		// has no record of, and the reply is parked rather than sent. This is
 		// the operator's cue that a Recovery Capsule has to be applied before
