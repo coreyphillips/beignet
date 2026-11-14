@@ -46,7 +46,7 @@
     "docs:paths": "ts-node scripts/comment-paths.ts",
     "api:snapshot": "ts-node scripts/api-snapshot.ts",
     "docs:html": "typedoc --out api-docs/html",
-    "docs:markdown": "typedoc --plugin typedoc-plugin-markdown --out api-docs/markdown",
+    "docs:markdown": "typedoc --plugin ./scripts/typedoc-minimatch.js --plugin typedoc-plugin-markdown --out api-docs/markdown",
     "docs": "npm run docs:tables && npm run docs:html && npm run docs:markdown"
   },
   "repository": {
@@ -157,6 +157,9 @@
     },
     "test-exclude": {
       "glob": "14.0.6",
+      "minimatch": "11.0.8"
+    },
+    "typedoc": {
       "minimatch": "11.0.8"
     }
   },
