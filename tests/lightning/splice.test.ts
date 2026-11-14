@@ -8591,6 +8591,133 @@ describe('Splice', function () {
 				expect(acceptorChannel.getState()).to.equal(ChannelState.NORMAL);
 			});
 
+			it('a batch rebuilt after a restart names the funding of each member (#2043)', function () {
+				const pair = pendingLockPair();
+				const {
+					openerManager,
+					acceptorManager,
+					channelId,
+					openerChannel,
+					acceptorChannel,
+					openerPubkey,
+					acceptorPubkey
+				} = pair;
+				const currentFunding = Buffer.from(
+					openerChannel.getFullState().fundingTxid!
+				);
+				const spliceFunding = Buffer.from(
+					openerChannel.getFullState().spliceInFlight!.spliceTxid
+				);
+
+				openerManager.removeAllListeners('message:outbound');
+				acceptorManager.removeAllListeners('message:outbound');
+				const fromOpener: Array<{ type: number; payload: Buffer }> = [];
+				const fromAcceptor: Array<{ type: number; payload: Buffer }> = [];
+				openerManager.on('message:outbound', (pk, type, payload) => {
+					if (pk === acceptorPubkey) fromOpener.push({ type, payload });
+				});
+				acceptorManager.on('message:outbound', (pk, type, payload) => {
+					if (pk === openerPubkey) fromAcceptor.push({ type, payload });
+				});
+
+				const preimage = crypto.randomBytes(32);
+				openerManager.addHtlc(
+					channelId,
+					15_000_000n,
+					crypto.createHash('sha256').update(preimage).digest(),
+					500000,
+					crypto.randomBytes(1366)
+				);
+				// [update_add_htlc, start_batch, commitment_signed x2]: only the add
+				// arrives, so no revoke_and_ack comes back before the restart.
+				expect(fromOpener.map((m) => m.type)).to.deep.equal([
+					MessageType.UPDATE_ADD_HTLC,
+					MessageType.START_BATCH,
+					MessageType.COMMITMENT_SIGNED,
+					MessageType.COMMITMENT_SIGNED
+				]);
+				acceptorManager.handleMessage(
+					openerPubkey,
+					fromOpener[0].type,
+					fromOpener[0].payload
+				);
+				openerManager.handlePeerDisconnected(acceptorPubkey);
+				acceptorManager.handlePeerDisconnected(openerPubkey);
+
+				// Restart the opener from its persisted row with no outbox rows to
+				// restore, so reestablish has to rebuild the batch.
+				const restarted = new Channel(
+					deserializeChannelState(
+						JSON.parse(
+							JSON.stringify(
+								serializeChannelState(openerChannel.getFullState())
+							)
+						)
+					)
+				);
+				openerManager.restoreChannel(restarted, acceptorPubkey);
+
+				fromOpener.length = 0;
+				fromAcceptor.length = 0;
+				openerManager.handlePeerReconnected(acceptorPubkey);
+				acceptorManager.handlePeerReconnected(openerPubkey);
+				const openerReest = fromOpener.splice(0);
+				const acceptorReest = fromAcceptor.splice(0);
+				openerManager.removeAllListeners('message:outbound');
+				acceptorManager.removeAllListeners('message:outbound');
+				const replayed: Array<{ type: number; payload: Buffer }> = [];
+				openerManager.on('message:outbound', (pk, type, payload) => {
+					if (pk === acceptorPubkey) replayed.push({ type, payload });
+				});
+				connectManagers(
+					openerManager,
+					openerPubkey,
+					acceptorManager,
+					acceptorPubkey
+				);
+				for (const m of openerReest) {
+					acceptorManager.handleMessage(openerPubkey, m.type, m.payload);
+				}
+				for (const m of acceptorReest) {
+					openerManager.handleMessage(acceptorPubkey, m.type, m.payload);
+				}
+
+				const batchStart = replayed.findIndex(
+					(m) => m.type === MessageType.START_BATCH
+				);
+				expect(batchStart, 'the batch was retransmitted').to.be.gte(0);
+				const members = replayed.slice(batchStart + 1, batchStart + 3);
+				expect(members.map((m) => m.type)).to.deep.equal([
+					MessageType.COMMITMENT_SIGNED,
+					MessageType.COMMITMENT_SIGNED
+				]);
+				const tags = members.map(
+					(m) =>
+						decodeCommitmentSignedMessage(m.payload).fundingTxid?.toString(
+							'hex'
+						)
+				);
+				expect(tags).to.deep.equal([
+					currentFunding.toString('hex'),
+					spliceFunding.toString('hex')
+				]);
+
+				// The acceptor, which now refuses an untagged member, verified each
+				// signature against the funding its tag names and revoked.
+				expect(acceptorChannel.getState()).to.equal(ChannelState.SPLICING);
+				const oEntry = [...restarted.getFullState().htlcs.values()][0];
+				const aEntry = [...acceptorChannel.getFullState().htlcs.values()][0];
+				expect(oEntry?.state).to.equal(HtlcState.COMMITTED);
+				expect(aEntry?.state).to.equal(HtlcState.COMMITTED);
+
+				acceptorManager.fulfillHtlc(channelId, 0n, preimage);
+				expect(restarted.getFullState().htlcs.size).to.equal(0);
+				openerManager.sendSpliceLocked(channelId);
+				acceptorManager.sendSpliceLocked(channelId);
+				expect(restarted.getState()).to.equal(ChannelState.NORMAL);
+				expect(acceptorChannel.getState()).to.equal(ChannelState.NORMAL);
+			});
+
 			it('a restart replays the OUTBOX batch VERBATIM and reports ReplayRequired', function () {
 				// Recovery phase 5 acceptance (docs/RECOVERY-PROTOCOL.md 9): the
 				// ReplayRequired branch of the status machine, served from the
@@ -10156,6 +10283,60 @@ describe('Splice', function () {
 			expect(actions.some((a) => a.type === ChannelActionType.ERROR)).to.equal(
 				true
 			);
+			expect(acceptorChannel.getFullState().localCommitmentNumber).to.equal(
+				before
+			);
+		});
+
+		it('fails the channel on a batch member without funding_txid, without revoking (#2043)', function () {
+			const {
+				openerManager,
+				acceptorManager,
+				channelId,
+				acceptorChannel,
+				openerPubkey,
+				acceptorPubkey
+			} = pendingLockPair();
+			openerManager.removeAllListeners('message:outbound');
+			acceptorManager.removeAllListeners('message:outbound');
+			const fromOpener: Array<{ type: number; payload: Buffer }> = [];
+			const fromAcceptor: number[] = [];
+			openerManager.on('message:outbound', (pk, type, payload) => {
+				if (pk === acceptorPubkey) fromOpener.push({ type, payload });
+			});
+			acceptorManager.on('message:outbound', (pk, type) => {
+				if (pk === openerPubkey) fromAcceptor.push(type);
+			});
+			openerManager.addHtlc(
+				channelId,
+				15_000_000n,
+				crypto.randomBytes(32),
+				500000,
+				crypto.randomBytes(1366)
+			);
+			expect(fromOpener.map((m) => m.type)).to.deep.equal([
+				MessageType.UPDATE_ADD_HTLC,
+				MessageType.START_BATCH,
+				MessageType.COMMITMENT_SIGNED,
+				MessageType.COMMITMENT_SIGNED
+			]);
+			// The opener's real batch, with only the current-funding member's tag
+			// removed: every signature in it is valid.
+			const current = decodeCommitmentSignedMessage(fromOpener[2].payload);
+			expect(current.fundingTxid).to.not.equal(undefined);
+			delete current.fundingTxid;
+			fromOpener[2] = {
+				type: MessageType.COMMITMENT_SIGNED,
+				payload: encodeCommitmentSignedMessage(current)
+			};
+
+			const before = acceptorChannel.getFullState().localCommitmentNumber;
+			for (const m of fromOpener) {
+				acceptorManager.handleMessage(openerPubkey, m.type, m.payload);
+			}
+			expect(fromAcceptor).to.include(MessageType.ERROR);
+			expect(fromAcceptor).to.not.include(MessageType.REVOKE_AND_ACK);
+			expect(acceptorChannel.getState()).to.equal(ChannelState.ERRORED);
 			expect(acceptorChannel.getFullState().localCommitmentNumber).to.equal(
 				before
 			);
