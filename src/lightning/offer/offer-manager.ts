@@ -39,7 +39,7 @@ import {
 } from './merkle';
 import { schnorrSign, schnorrVerify, toXOnlyPubkey } from './schnorr';
 import { encodeOffer } from './encode';
-import { decodeNoChecksum } from './bech32-nochecksum';
+import { decodeNoChecksum, encodeNoChecksum } from './bech32-nochecksum';
 import type { ITlvRecord } from '../message/tlv';
 import type { IStorageBackend } from '../storage/types';
 import type { IBlindedPath, IBlindedPaymentPath } from '../onion/blinded-path';
@@ -545,11 +545,11 @@ export class OfferManager extends EventEmitter {
 	 * re-registers what it rehydrates.
 	 */
 	registerDelegatedOffer(offer: IOffer, policy: IssuancePolicy): string {
-		const tlvData = encodeOfferTlv(offer);
+		const tlvData = encodeOfferTlv(offer, true);
 		const offerIdHex = computeOfferId(getTlvRecords(tlvData)).toString('hex');
 		this.offers.set(offerIdHex, {
 			offer: { ...offer, offerId: Buffer.from(offerIdHex, 'hex') },
-			encoded: encodeOffer(offer),
+			encoded: encodeNoChecksum('lno', tlvData),
 			tlvData,
 			policy
 		});
@@ -680,7 +680,7 @@ export class OfferManager extends EventEmitter {
 		if (chain) request.chain = chain;
 
 		// Encode the invoice request TLV (includes offer fields)
-		const offerTlvData = encodeOfferTlv(offer);
+		const offerTlvData = encodeOfferTlv(offer, true);
 		const requestTlvData = encodeInvoiceRequestTlv(request, offerTlvData);
 
 		// Sign the invoice request with the payer key

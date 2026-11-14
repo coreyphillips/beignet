@@ -87,6 +87,7 @@ import { LightningNode } from '../lightning/node/lightning-node';
 import { CommitmentType, OutputType } from '../lightning/chain/types';
 import { DF_DEFAULT_UNPAIRED_SPLICE_DEPTH } from '../lightning/direct-funding/receiver/types';
 import { SPLICE_LOCK_DEPTH_ACCEPT_MAX as DF_UNPAIRED_SPLICE_DEPTH_MAX } from '../lightning/message/splice';
+import { assertBolt1String } from '../lightning/message/field-rules';
 import type { IFforEpochRecord } from '../lightning/ffor/types';
 import {
 	FforAbortReason,
@@ -1809,7 +1810,25 @@ function requireInvoiceExpiry(value: unknown, field: string): number {
  */
 const MAX_INVOICE_DESCRIPTION_BYTES = 639;
 
+/**
+ * A string bound for an invoice or offer. Invoice and offer encoding refuse
+ * one that breaks the BOLT 1 string rule; caught here it is the caller's
+ * error rather than an internal one.
+ */
+function requireBolt1String(value: string | undefined, field: string): void {
+	if (typeof value !== 'string') return;
+	try {
+		assertBolt1String(value, field);
+	} catch (err) {
+		throw new BeignetError(
+			BeignetErrorCode.INVALID_PARAMS,
+			(err as Error).message
+		);
+	}
+}
+
 function requireInvoiceDescription(value: string | undefined): void {
+	requireBolt1String(value, 'description');
 	if (
 		typeof value === 'string' &&
 		Buffer.byteLength(value, 'utf8') > MAX_INVOICE_DESCRIPTION_BYTES
@@ -9168,6 +9187,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 		k?: number;
 		description?: string;
 	}): Record<string, unknown> {
+		requireBolt1String(body.description, 'description');
 		const idBuf = this.fforChannelId(body.channelId);
 		if (typeof body.k !== 'number' || !Number.isInteger(body.k) || body.k < 1) {
 			throw new BeignetError('INVALID_PARAMS', 'k must be a positive integer');
@@ -14891,6 +14911,8 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 				'expirySecs must be a positive integer number of seconds'
 			);
 		}
+		requireBolt1String(options.description, 'description');
+		requireBolt1String(options.issuer, 'issuer');
 		const amountMsat =
 			options.amountSats !== undefined
 				? BigInt(options.amountSats) * 1000n

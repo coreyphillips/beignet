@@ -109,6 +109,24 @@ describe('Issue #2040: POST /offer/create never returns an unanswerable offer', 
 		}
 	});
 
+	// Issue #2039: a string BOLT 1 forbids is the caller's error, not a 500.
+	it('refuses a description or issuer BOLT 1 forbids, with INVALID_PARAMS', async () => {
+		const before = daemon.node.listOffers().length;
+		const bad = 'shop' + String.fromCodePoint(0x200b);
+		for (const [field, body] of [
+			['description', { description: bad }],
+			['issuer', { description: 'fine', issuer: bad }]
+		] as const) {
+			const res = await post(port, '/offer/create', body);
+			expect(res.status, field).to.equal(400);
+			expect(res.body.error?.code, field).to.equal('INVALID_PARAMS');
+			expect(res.body.error?.message, field).to.equal(
+				`${field} contains U+200B, which BOLT 1 forbids`
+			);
+		}
+		expect(daemon.node.listOffers()).to.have.length(before);
+	});
+
 	it('every accepted amount, issuer and expiry combination decodes', async () => {
 		const amounts = [
 			undefined,

@@ -173,6 +173,49 @@ describe('Issue #1043: invoice expiry and description bounds', () => {
 		}
 	});
 
+	// Issue #2039: the encoder refuses a character BOLT 1 forbids, which the
+	// daemon would otherwise scrub to a 500.
+	it('refuses a description BOLT 1 forbids, as INVALID_PARAMS', async () => {
+		const description = 'pay ' + String.fromCodePoint(0x202e) + 'me';
+		const calls: Array<[string, () => unknown]> = [
+			['create', (): unknown => bn.createInvoice(1_000, description)],
+			[
+				'create-hold',
+				(): unknown =>
+					bn.createHoldInvoice({ paymentHash: hash(), description })
+			],
+			[
+				'ffor',
+				(): unknown =>
+					bn.fforCreateInvoice({
+						channelId: 'ab'.repeat(32),
+						k: 1,
+						description
+					})
+			]
+		];
+		for (const [label, call] of calls) {
+			const err = refusal(call, label);
+			expect(err.code, label).to.equal(BeignetErrorCode.INVALID_PARAMS);
+			expect(err.message, label).to.equal(
+				'description contains U+202E, which BOLT 1 forbids'
+			);
+		}
+		expect(encoded).to.equal(0);
+		try {
+			await bn.createJitInvoice({
+				lspPubkey: '02' + 'ab'.repeat(32),
+				description
+			});
+			expect.fail('expected the JIT invoice to be refused');
+		} catch (err: unknown) {
+			expect(err).to.be.instanceOf(BeignetError);
+			expect((err as BeignetError).code).to.equal(
+				BeignetErrorCode.INVALID_PARAMS
+			);
+		}
+	});
+
 	it('encodes both limits exactly as asked', () => {
 		const plain = decode(
 			bn.createInvoice(1_000, LONGEST_DESCRIPTION, ONE_YEAR_SECS).bolt11

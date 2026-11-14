@@ -397,7 +397,7 @@ describe('BOLT 12: Offers', () => {
 
 			it('accepts unknown odd fields in the invoice_request ranges', () => {
 				const data = withExtraRecords(tlv, [
-					extra(91n),
+					extra(93n),
 					extra(241n),
 					extra(2_000_000_001n)
 				]);

@@ -70,6 +70,7 @@ import {
 	decodeTlvStream,
 	findTlvRecord
 } from '../message/tlv';
+import { decodeNodeAlias, isMinimalFeatures } from '../message/field-rules';
 
 // ── Channel Announcement ────────────────────────────────────────────
 
@@ -137,6 +138,11 @@ export function decodeChannelAnnouncementMessage(
 	offset += 2;
 	const features = Buffer.from(payload.subarray(offset, offset + flen));
 	offset += flen;
+	// BOLT 7: a receiver MUST ignore an announcement whose features are not
+	// minimally encoded.
+	if (!isMinimalFeatures(features)) {
+		throw new Error('channel_announcement features are not minimally encoded');
+	}
 
 	const chainHash = Buffer.from(payload.subarray(offset, offset + 32));
 	offset += 32;
@@ -251,6 +257,11 @@ export function decodeNodeAnnouncementMessage(
 	offset += 2;
 	const features = Buffer.from(payload.subarray(offset, offset + flen));
 	offset += flen;
+	// BOLT 7: a receiver MUST ignore an announcement whose features are not
+	// minimally encoded, or whose alias breaks the BOLT 1 string rule.
+	if (!isMinimalFeatures(features)) {
+		throw new Error('node_announcement features are not minimally encoded');
+	}
 
 	const timestamp = payload.readUInt32BE(offset);
 	offset += 4;
@@ -266,6 +277,7 @@ export function decodeNodeAnnouncementMessage(
 	offset += 3;
 	const alias = Buffer.from(payload.subarray(offset, offset + 32));
 	offset += 32;
+	decodeNodeAlias(alias);
 
 	const addrlen = payload.readUInt16BE(offset);
 	offset += 2;

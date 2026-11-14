@@ -19,6 +19,7 @@ import { wordsToBuffer, decodeUintFromWords, decodeTaggedField } from './words';
 import { verifyInvoice, verifyInvoiceSignature } from './signing';
 import type { IBlindedPaymentPath } from '../onion/blinded-path';
 import { decodeInvoiceBlindedPaymentPaths } from '../onion/blinded-path';
+import { decodeBolt1String } from '../message/field-rules';
 
 /**
  * BOLT 11 exact data_lengths (in 5-bit words) for the fixed-length tagged
@@ -298,9 +299,9 @@ function decodeFixedLengthHash(words: number[], expectedBytes: number): Buffer {
 	return buf.subarray(0, expectedBytes);
 }
 
-/** Decode a UTF-8 description string from 5-bit words. */
+/** Decode the description from 5-bit words under the BOLT 1 string rule. */
 function decodeDescription(words: number[]): string {
-	return wordsToBuffer(words).toString('utf8');
+	return decodeBolt1String(wordsToBuffer(words), 'Invoice field d');
 }
 
 /** Decode a 33-byte compressed public key from 5-bit words. */

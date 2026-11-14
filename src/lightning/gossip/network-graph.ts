@@ -28,6 +28,7 @@ import {
 	decodeShortChannelId
 } from './types';
 import { encodeChannelAnnouncementMessage } from './messages';
+import { decodeNodeAlias, isMinimalFeatures } from '../message/field-rules';
 import {
 	verifyChannelAnnouncementMessage,
 	verifyChannelUpdateMessage,
@@ -91,6 +92,17 @@ function sameChannelAnnouncement(
 		return encodeChannelAnnouncementMessage(a).equals(
 			encodeChannelAnnouncementMessage(b)
 		);
+	} catch {
+		return false;
+	}
+}
+
+/** The BOLT 7 alias and features rules decodeNodeAnnouncementMessage applies. */
+function nodeAnnouncementFieldsValid(msg: INodeAnnouncementMessage): boolean {
+	if (!isMinimalFeatures(msg.features)) return false;
+	try {
+		decodeNodeAlias(msg.alias);
+		return true;
 	} catch {
 		return false;
 	}
@@ -1128,6 +1140,11 @@ export class NetworkGraph {
 			node.announcement &&
 			gossipTimestampTooFarFuture(node.announcement.timestamp)
 		) {
+			node.announcement = undefined;
+		}
+		// Rows stored before intake applied the BOLT 7 alias and features
+		// rules would otherwise still be served and shown.
+		if (node.announcement && !nodeAnnouncementFieldsValid(node.announcement)) {
 			node.announcement = undefined;
 		}
 		const slot = sanitizeSlot(

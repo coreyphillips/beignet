@@ -11,7 +11,7 @@
  */
 
 import assert from 'assert';
-import type { BeignetNode } from '../../src/cli/beignet-node';
+import { BeignetNode } from '../../src/cli/beignet-node';
 import { BeignetError } from '../../src/cli/errors';
 import { OfflineReceive } from '../../src/cli/offline-receive';
 
@@ -1057,6 +1057,35 @@ describe('receive request creation', () => {
 		amountSats: 20000,
 		description: 'coffee',
 		quote
+	});
+
+	it('returns INVALID_PARAMS for a forbidden voucher description and permits a corrected retry', async () => {
+		const f = fixture({}, { spare: true, jobs: [] });
+		const start = f.node.fforStartEpoch;
+		f.node.fforStartEpoch = (params: unknown): Epoch => {
+			const epoch = start(params);
+			delete epoch.slots[0].bolt11;
+			return epoch;
+		};
+		f.node.fforCreateInvoice = BeignetNode.prototype.fforCreateInvoice;
+		const quote = await f.coordinator.quote(peer, 20000);
+		await assert.rejects(
+			f.coordinator.create(
+				{ ...body(quote), description: 'coffee\nlarge' },
+				peer
+			),
+			(err: unknown) =>
+				err instanceof BeignetError &&
+				err.code === 'INVALID_PARAMS' &&
+				err.message.includes('U+000A')
+		);
+		f.node.fforCreateInvoice = (): { bolt11: string; paymentHash: string } => ({
+			bolt11: 'lnbcrt-spare',
+			paymentHash: spareHash
+		});
+		const corrected = await f.coordinator.create(body(quote), peer);
+		assert.equal(corrected.bolt11, 'lnbcrt-spare');
+		assert.equal(f.started, 1);
 	});
 
 	it('a suitable channel still produces a bolt11 invoice', async () => {

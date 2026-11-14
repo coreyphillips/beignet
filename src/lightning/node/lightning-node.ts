@@ -173,6 +173,7 @@ import {
 	nodeAddressToHostPort,
 	announcedDialableAddresses
 } from '../gossip/messages';
+import { assertBolt1String } from '../message/field-rules';
 import {
 	decodeReplyChannelRangeMessage,
 	decodeReplyShortChannelIdsEndMessage,
@@ -1746,6 +1747,11 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		const leaveLifecycleToCreate = constructingForCreate;
 		constructingForCreate = false;
 		const config = resolveNodeConfig(nodeConfig);
+		// Peers ignore a node_announcement whose alias breaks the BOLT 1 string
+		// rule, so the node would silently vanish from their graphs.
+		if (config.alias !== undefined) {
+			assertBolt1String(config.alias, 'Node alias');
+		}
 
 		this.nodePrivkey = config.nodePrivateKey;
 		this.ownNodeIdBytes = getPublicKey(config.nodePrivateKey);
@@ -17905,6 +17911,9 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		) {
 			throw new Error('Must specify either description or descriptionHash');
 		}
+		if (options.description !== undefined) {
+			assertBolt1String(options.description, 'Invoice description');
+		}
 
 		// A JIT allowance is an authorization to be paid LESS than the onion
 		// says, so a malformed quote must not reach the invoice record: it is
@@ -21339,6 +21348,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		description = 'FFOR voucher',
 		expirySecs?: number
 	): ICreateInvoiceResult {
+		assertBolt1String(description, 'Invoice description');
 		if (
 			expirySecs !== undefined &&
 			(!Number.isSafeInteger(expirySecs) ||

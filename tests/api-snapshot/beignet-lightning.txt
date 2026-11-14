@@ -6181,6 +6181,7 @@ member offer.InvoiceErrorTlvType.ERROR = 5
 member offer.InvoiceErrorTlvType.SUGGESTED_VALUE = 3
 enum offer.InvoiceRequestTlvType
 member offer.InvoiceRequestTlvType.AMOUNT = 82
+member offer.InvoiceRequestTlvType.BIP_353_NAME = 91
 member offer.InvoiceRequestTlvType.CHAIN = 80
 member offer.InvoiceRequestTlvType.FEATURES = 84
 member offer.InvoiceRequestTlvType.METADATA = 0
@@ -6256,7 +6257,7 @@ function offer.encodeInvoiceRequest(request: offer.IInvoiceRequest, offerTlvData
 function offer.encodeInvoiceRequestTlv(request: offer.IInvoiceRequest, offerTlvData?: Buffer): Buffer
 function offer.encodeInvoiceTlv(invoice: offer.IBolt12Invoice, mirrorRecords?: message.ITlvRecord[], extraRecords?: message.ITlvRecord[]): Buffer
 function offer.encodeOffer(offer: offer.IOffer): string
-function offer.encodeOfferTlv(offer: offer.IOffer): Buffer
+function offer.encodeOfferTlv(offer: offer.IOffer, received?: boolean): Buffer
 function offer.encodeTlvRecordRaw(record: message.ITlvRecord): Buffer
 function offer.encodeTruncatedU32(val: number): Buffer
 function offer.encodeTruncatedU64(val: bigint): Buffer
