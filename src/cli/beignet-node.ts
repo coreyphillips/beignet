@@ -9187,6 +9187,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 		k?: number;
 		description?: string;
 	}): Record<string, unknown> {
+		requireBolt1String(body.description, 'description');
 		const idBuf = this.fforChannelId(body.channelId);
 		if (typeof body.k !== 'number' || !Number.isInteger(body.k) || body.k < 1) {
 			throw new BeignetError('INVALID_PARAMS', 'k must be a positive integer');

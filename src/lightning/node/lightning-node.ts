@@ -21348,6 +21348,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		description = 'FFOR voucher',
 		expirySecs?: number
 	): ICreateInvoiceResult {
+		assertBolt1String(description, 'Invoice description');
 		if (
 			expirySecs !== undefined &&
 			(!Number.isSafeInteger(expirySecs) ||

@@ -183,6 +183,15 @@ describe('Issue #1043: invoice expiry and description bounds', () => {
 				'create-hold',
 				(): unknown =>
 					bn.createHoldInvoice({ paymentHash: hash(), description })
+			],
+			[
+				'ffor',
+				(): unknown =>
+					bn.fforCreateInvoice({
+						channelId: 'ab'.repeat(32),
+						k: 1,
+						description
+					})
 			]
 		];
 		for (const [label, call] of calls) {

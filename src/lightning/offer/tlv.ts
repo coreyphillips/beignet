@@ -116,8 +116,9 @@ const decodeBlindedPathsValue = decodeBlindedPaths;
 /**
  * Encode an IOffer into a TLV stream (raw bytes, no signature).
  * The resulting TLV records are in strictly increasing type order.
+ * Received strings keep the reader rule because Unicode tables vary by runtime.
  */
-export function encodeOfferTlv(offer: IOffer): Buffer {
+export function encodeOfferTlv(offer: IOffer, received = false): Buffer {
 	const records: ITlvRecord[] = [];
 
 	if (offer.chains && offer.chains.length > 0) {
@@ -151,7 +152,7 @@ export function encodeOfferTlv(offer: IOffer): Buffer {
 	}
 	records.push({
 		type: BigInt(OfferTlvType.DESCRIPTION),
-		value: encodeBolt1String(offer.description, 'Offer description')
+		value: encodeBolt1String(offer.description, 'Offer description', received)
 	});
 	if (offer.features && offer.features.length > 0) {
 		assertMinimalFeatures(offer.features, 'Offer');
@@ -175,7 +176,7 @@ export function encodeOfferTlv(offer: IOffer): Buffer {
 	if (offer.issuer) {
 		records.push({
 			type: BigInt(OfferTlvType.ISSUER),
-			value: encodeBolt1String(offer.issuer, 'Offer issuer')
+			value: encodeBolt1String(offer.issuer, 'Offer issuer', received)
 		});
 	}
 	if (offer.quantityMax !== undefined) {

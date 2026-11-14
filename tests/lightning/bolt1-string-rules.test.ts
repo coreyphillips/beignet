@@ -54,6 +54,12 @@ import { NetworkGraph } from '../../src/lightning/gossip/network-graph';
 import { INodeAnnouncementMessage } from '../../src/lightning/gossip/types';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
 import { LightningNode } from '../../src/lightning/node/lightning-node';
+import { SqliteStorage } from '../../src/lightning/storage/sqlite-storage';
+import {
+	activate,
+	createWorld,
+	record as fforRecord
+} from './helpers/ffor-world';
 import {
 	DEFAULT_CHANNEL_CONFIG,
 	REGTEST_CHAIN_HASH
@@ -265,6 +271,50 @@ describe('BOLT 1 string rule and minimal features (#2039)', () => {
 				}
 			});
 		}
+
+		it('a refused voucher description leaves its durable slot available for retry', () => {
+			const storage = new SqliteStorage(':memory:');
+			storage.open();
+			const w = createWorld({ rStorage: storage });
+			try {
+				activate(w);
+				for (const description of [
+					'coffee\nlarge',
+					'coffee\u202e',
+					'coffee\u0378'
+				]) {
+					expect(() =>
+						w.r.createFforVoucherInvoice(w.srHex, 1, description)
+					).to.throw('Invoice description contains U+');
+					expect(fforRecord(w.r, w.srHex).exposedSlots).to.deep.equal([
+						false,
+						false,
+						false
+					]);
+					expect(
+						storage.loadChannel(w.srHex)!.state.ffor!.exposedSlots
+					).to.deep.equal([false, false, false]);
+					expect(storage.loadAllInvoices()).to.have.length(0);
+				}
+				const invoice = w.r.createFforVoucherInvoice(
+					w.srHex,
+					1,
+					'coffee large'
+				);
+				expect(decodeInvoice(invoice.bolt11).description).to.equal(
+					'coffee large'
+				);
+				expect(storage.loadAllInvoices()).to.have.length(1);
+				expect(fforRecord(w.r, w.srHex).exposedSlots).to.deep.equal([
+					true,
+					false,
+					false
+				]);
+			} finally {
+				for (const n of [w.p, w.s, w.r]) n.destroy();
+				storage.close();
+			}
+		});
 	});
 
 	describe('BOLT 12 offers', () => {
@@ -328,6 +378,11 @@ describe('BOLT 1 string rule and minimal features (#2039)', () => {
 			expect(() => encodeOfferTlv({ ...offer, issuer: cp(0x200b) })).to.throw(
 				'Offer issuer contains U+200B'
 			);
+			for (const field of ['description', 'issuer'] as const) {
+				expect(() =>
+					encodeOfferTlv({ ...offer, [field]: cp(0x0378) })
+				).to.throw('U+0378');
+			}
 			expect(() =>
 				encodeOfferTlv({ ...offer, features: Buffer.from([0x00, 0x02]) })
 			).to.throw('Offer features are not minimally encoded');

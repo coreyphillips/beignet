@@ -122,8 +122,15 @@ export class FforIssuerService {
 		for (const m of this.deps.ledger.listManifests()) {
 			// Retired manifests stay registered too: their refusals must not
 			// differ from a live manifest's.
-			this.registerOffer(m);
-			n++;
+			try {
+				this.registerOffer(m);
+				n++;
+			} catch (err) {
+				this.deps.log('ffor_issuer_rehydrate_failed', {
+					mailboxId: m.id,
+					error: err instanceof Error ? err.message : String(err)
+				});
+			}
 		}
 		return n;
 	}

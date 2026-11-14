@@ -46,11 +46,15 @@ export function decodeBolt1String(bytes: Uint8Array, field: string): string {
 }
 
 /**
- * Check a string we are about to send under the BOLT 1 writer rule. Throws,
- * naming `field` and the character, when it may not be sent.
+ * Check outgoing text under the writer rule, or the reader rule for received
+ * text being mirrored. Throws with `field` and the forbidden character.
  */
-export function assertBolt1String(value: string, field: string): void {
-	const bad = WRITER_FORBIDDEN.exec(value);
+export function assertBolt1String(
+	value: string,
+	field: string,
+	received = false
+): void {
+	const bad = (received ? READER_FORBIDDEN : WRITER_FORBIDDEN).exec(value);
 	if (bad) {
 		throw new Error(
 			`${field} contains ${codePointName(bad[0])}, which BOLT 1 forbids`
@@ -59,8 +63,12 @@ export function assertBolt1String(value: string, field: string): void {
 }
 
 /** {@link assertBolt1String}, then the UTF-8 bytes. */
-export function encodeBolt1String(value: string, field: string): Buffer {
-	assertBolt1String(value, field);
+export function encodeBolt1String(
+	value: string,
+	field: string,
+	received = false
+): Buffer {
+	assertBolt1String(value, field, received);
 	return Buffer.from(value, 'utf8');
 }
 

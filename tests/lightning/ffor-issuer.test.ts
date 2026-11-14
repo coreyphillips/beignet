@@ -20,8 +20,20 @@ import { BITCOIN_CHAIN_HASH } from '../../src/lightning/channel/types';
 import { IOffer, IBolt12Invoice } from '../../src/lightning/offer/types';
 import {
 	encodeInvoiceTlv,
-	decodeInvoiceErrorTlv
+	decodeInvoiceErrorTlv,
+	getTlvRecords,
+	OfferTlvType
 } from '../../src/lightning/offer/tlv';
+import { encodeTlvStream } from '../../src/lightning/message/tlv';
+import { decodeOffer } from '../../src/lightning/offer/decode';
+import { computeOfferId } from '../../src/lightning/offer/merkle';
+import { MetadataLedgerStore } from '../../src/lightning/storage/durable-ledger';
+import {
+	FF_ISSUER_MANIFEST_LEDGER_PREFIX,
+	fforIssuerManifestCodec,
+	IFforIssuerManifestRecord
+} from '../../src/lightning/ffor/issuer-ledger';
+import { FF_ISSUER_PROVISION_TYPE } from '../../src/lightning/ffor/witness-types';
 import { IBlindedPath } from '../../src/lightning/onion/blinded-path';
 import { FforSlotState } from '../../src/lightning/ffor/types';
 import {
@@ -33,6 +45,10 @@ import {
 	FF_ISSUER_REFUSAL,
 	IFforIssuerHop,
 	decodeAttestationTlvValue,
+	decodeIssuerProvision,
+	encodeIssuerManifest,
+	encodeIssuerProvision,
+	signAttestation,
 	verifyAttestation
 } from '../../src/lightning/ffor/issuer-messages';
 import {
@@ -215,8 +231,135 @@ function invoiceBytes(inv: IBolt12Invoice): Buffer {
 	return encodeInvoiceTlv(inv, inv.records);
 }
 
+function offerText(data: Buffer, description: string, issuer?: string): Buffer {
+	const records = getTlvRecords(data).filter(
+		(r) => r.type !== BigInt(OfferTlvType.ISSUER)
+	);
+	records.find((r) => r.type === BigInt(OfferTlvType.DESCRIPTION))!.value =
+		Buffer.from(description, 'utf8');
+	if (issuer !== undefined)
+		records.push({
+			type: BigInt(OfferTlvType.ISSUER),
+			value: Buffer.from(issuer, 'utf8')
+		});
+	return encodeTlvStream(records.sort((a, b) => (a.type < b.type ? -1 : 1)));
+}
+
+function rewriteProvisionedOffer(
+	w: IIssuerWorld,
+	description: string,
+	issuer?: string
+): void {
+	const service = w.w.getFforIssuerService()!;
+	const handle = service.handleMessage.bind(service);
+	service.handleMessage = (peer, type, payload): boolean => {
+		if (type === FF_ISSUER_PROVISION_TYPE) {
+			const { requestId, manifest } = decodeIssuerProvision(payload);
+			manifest.offer = offerText(manifest.offer, description, issuer);
+			const r = record(w.r, w.srHex);
+			manifest.rAttestation = signAttestation(
+				computeOfferId(getTlvRecords(manifest.offer)),
+				r.hAct!,
+				r.hBook!,
+				w.rConfig.nodePrivateKey
+			);
+			payload = encodeIssuerProvision(
+				requestId,
+				encodeIssuerManifest(manifest)
+			);
+		}
+		return handle(peer, type, payload);
+	};
+}
+
 describe('FFOR BOLT 12 issuer (M9.5, section 9.7)', function () {
 	this.timeout(60_000);
+
+	it('skips forbidden stored offer text at startup and keeps valid manifests registered', async () => {
+		const w = createIssuerWorld();
+		let restored: LightningNode | undefined;
+		try {
+			const { offer } = await setup(w, [G], G);
+			const manifest = w.w.getFforIssuerService()!.ledger.listManifests()[0];
+			const store = new MetadataLedgerStore<IFforIssuerManifestRecord>(
+				w.wStorage,
+				FF_ISSUER_MANIFEST_LEDGER_PREFIX,
+				fforIssuerManifestCodec
+			);
+			const invalid = ['Coffee\nlarge', 'Coffee\u200dlarge'].map((text, i) => ({
+				...manifest,
+				id: Buffer.alloc(32, i + 1).toString('hex'),
+				offerHex: offerText(
+					Buffer.from(manifest.offerHex, 'hex'),
+					i === 0 ? text : 'Coffee',
+					i === 1 ? text : undefined
+				).toString('hex')
+			}));
+			for (const m of invalid) store.put(m);
+			restored = new LightningNode(w.wConfig);
+			expect(
+				restored
+					.getOfferManager()
+					.listOffers()
+					.map((o) => o.offerId)
+			).to.deep.equal([offer.offerId]);
+			expect(restored.getFforIssuerService()!.rehydrate()).to.equal(1);
+			for (const m of invalid) expect(store.load(m.id)).to.deep.equal(m);
+			expect(
+				restored
+					.getActionLog()
+					.filter((l) => l.action === 'ffor_issuer_rehydrate_failed')
+			).to.have.length(4);
+		} finally {
+			restored?.destroy();
+			for (const n of [w.p, w.s, w.r, w.w]) n.destroy();
+			w.wStorage.close();
+		}
+	});
+
+	it('refuses forbidden provisioned text before storing the manifest', async () => {
+		const w = createIssuerWorld();
+		try {
+			rewriteProvisionedOffer(w, 'Coffee\nlarge');
+			let error: Error | undefined;
+			try {
+				await setup(w, [G], G);
+			} catch (err) {
+				error = err as Error;
+			}
+			expect(error?.message).to.include('U+000A');
+			expect(w.w.getFforIssuerService()!.ledger.listManifests()).to.have.length(
+				0
+			);
+			expect(w.w.getOfferManager().listOffers()).to.have.length(0);
+		} finally {
+			for (const n of [w.p, w.s, w.r, w.w]) n.destroy();
+			w.wStorage.close();
+		}
+	});
+
+	it('provisions, requests and rehydrates received offers with unassigned characters', async () => {
+		const w = createIssuerWorld();
+		let restored: LightningNode | undefined;
+		try {
+			rewriteProvisionedOffer(w, 'Coffee\u0378', 'Seller\u0378');
+			await setup(w, [G], G);
+			const { encoded } = w.w.getOfferManager().listOfferEntries()[0];
+			const received = decodeOffer(encoded);
+			expect(received.description).to.equal('Coffee\u0378');
+			expect(received.issuer).to.equal('Seller\u0378');
+			const invoice = await w.p.getOfferManager().requestInvoice(received);
+			expect(invoice.description).to.equal(received.description);
+			restored = new LightningNode(w.wConfig);
+			expect(restored.getOfferManager().listOfferEntries()[0].encoded).to.equal(
+				encoded
+			);
+		} finally {
+			restored?.destroy();
+			for (const n of [w.p, w.s, w.r, w.w]) n.destroy();
+			w.wStorage.close();
+		}
+	});
 
 	it('a stock payer with only the offer obtains a slot invoice over the path, pays through the witness, and R recovers d_k', async () => {
 		const w = createIssuerWorld();
