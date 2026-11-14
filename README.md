@@ -54,7 +54,7 @@ npm install
 npm run example
 ```
 
-Creates a regtest wallet (a fresh mnemonic unless you pass one), syncs it against a public Electrum server, prints the balance and a receive address, then drops you at a `>` prompt with the wallet bound to `wallet`. Type `help()` for the command list.
+Creates a regtest wallet (a fresh mnemonic unless `BEIGNET_MNEMONIC` holds one), syncs it against a public Electrum server, prints the balance and a receive address, then drops you at a `>` prompt with the wallet bound to `wallet`. Type `help()` for the command list.
 
 ```js
 > wallet.getBalance()
@@ -63,7 +63,7 @@ Creates a regtest wallet (a fresh mnemonic unless you pass one), syncs it agains
 > await wallet.send({ address: 'bcrt1q...', amount: 10000, satsPerByte: 2 })
 ```
 
-State persists as JSON under `example/walletData/`. Pass a mnemonic to reuse a wallet: `npm run example -- "abandon abandon ... about"`. Pass `testnet` or `mainnet` to change the network.
+State persists as JSON under `example/walletData/`. Pass `testnet` or `mainnet` to change the network. To reuse a wallet, see [reusing a mnemonic](#reusing-a-mnemonic) below.
 
 ### 2. Lightning node REPL
 
@@ -86,7 +86,6 @@ The flags you will actually reach for (everything after `--`):
 | Flag | Effect |
 |------|--------|
 | `mainnet` \| `testnet` \| `regtest` | Network, as a bare positional arg (default `regtest`) |
-| `<12 or 24 words>` | Reuse a mnemonic, as bare positional args (default generates one) |
 | `--electrum-host <h>` `--electrum-port <p>` | Point at your own Electrum server |
 | `--alias <name>` | Node alias in `node_announcement` |
 
@@ -95,8 +94,6 @@ The flags you will actually reach for (everything after `--`):
 npm run example:lightning -- regtest --electrum-host 127.0.0.1 --electrum-port 60001 --alias mynode
 ```
 
-Both examples print the network and the mnemonic before anything else. A generated mnemonic exists only in that output, so write it down before funding the wallet, and pass your own on mainnet.
-
 Tor, full-graph gossip, the low-level `LightningNode` variant and the non-interactive payment-API walkthrough have flags too: see [the flag reference](example/REPL_TESTING.md#repl-flags).
 
 Node state lives in a SQLite DB under `~/.beignet/data/<hash-of-mnemonic>/` (the `--low-level` example uses `example/lightningData/node.db`).
@@ -104,6 +101,17 @@ Node state lives in a SQLite DB under `~/.beignet/data/<hash-of-mnemonic>/` (the
 Both examples run through `ts-node`. The on-chain example runs straight off the TypeScript sources. The Lightning example imports only the public entry points (`beignet`, `beignet/cli`, `beignet/lightning`, `beignet/lightning/sqlite`), so `npm run example:lightning` builds `dist/` first, and the file runs unchanged in a project that installed `beignet` from npm.
 
 **→ [example/REPL_TESTING.md](example/REPL_TESTING.md) is a copy-pasteable walkthrough** of the whole lifecycle in the REPL: funding, peers, channels, invoices, payments, keysend, offers, splicing, closing, backup.
+
+### Reusing a mnemonic
+
+Both examples read an existing mnemonic from `BEIGNET_MNEMONIC` and exit if one is passed as an argument, where it would sit in shell history and the process list. `read -rs` keeps it off the screen as well:
+
+```bash
+read -rs BEIGNET_MNEMONIC && export BEIGNET_MNEMONIC   # paste the words, press Enter
+npm run example:lightning -- mainnet
+```
+
+Without `BEIGNET_MNEMONIC`, both examples generate a mnemonic and print it before anything else. That output is its only copy, so write it down before funding the wallet, and bring your own on mainnet.
 
 ## Which entry point?
 
