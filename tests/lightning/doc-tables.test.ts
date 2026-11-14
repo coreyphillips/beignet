@@ -144,6 +144,58 @@ describe('Generated README tables (issue #1687)', function () {
 		expect(missing, 'add these to docs/README.md').to.deep.equal([]);
 	});
 
+	it('every package.json entry point has a README row and an API reference (issue #2037)', () => {
+		const exports = JSON.parse(read('package.json')).exports as Record<
+			string,
+			string | { types: string }
+		>;
+		// Import path -> the source file its declarations are built from.
+		const entries = new Map<string, string>();
+		for (const [key, target] of Object.entries(exports)) {
+			if (key === './package.json') continue;
+			expect(target, key).to.have.property('types');
+			const types = (target as { types: string }).types;
+			expect(types, key).to.match(/^\.\/dist\/types\/.+\.d\.ts$/);
+			entries.set(
+				key === '.' ? 'beignet' : `beignet/${key.slice(2)}`,
+				types.replace(/^\.\/dist\/types\//, 'src/').replace(/\.d\.ts$/, '.ts')
+			);
+		}
+		const names = [...entries.keys()].sort();
+
+		const readme = read('README.md');
+		const table = readme.slice(
+			readme.indexOf('## Which entry point?'),
+			readme.indexOf('## On-chain wallet')
+		);
+		const rowNames = [...table.matchAll(/^\| `(beignet[^`]*)` \|/gm)].map(
+			(match) => match[1]
+		);
+		expect([...rowNames].sort(), 'README import table').to.deep.equal(names);
+
+		const sentence = readme.match(
+			/^The API reference for every entry point \(([^)]+)\)/m
+		);
+		expect(sentence, 'README API reference sentence').to.not.equal(null);
+		const listed = [...(sentence?.[1] ?? '').matchAll(/`([^`]+)`/g)].map(
+			(match) => match[1]
+		);
+		expect([...listed].sort(), 'README API reference sentence').to.deep.equal(
+			names
+		);
+
+		const typedoc = JSON.parse(read('typedoc.json')) as {
+			entryPoints: string[];
+		};
+		expect([...typedoc.entryPoints].sort(), 'typedoc.json').to.deep.equal(
+			[...entries.values()].sort()
+		);
+		// The tag names the module in the API reference by its import path.
+		for (const [name, file] of entries) {
+			expect(read(file), file).to.include(`@module ${name}\n`);
+		}
+	});
+
 	it('README.md links the security policy and the contributing guide (issue #1712)', () => {
 		const readme = read('README.md');
 		for (const file of ['SECURITY.md', 'CONTRIBUTING.md']) {

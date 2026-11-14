@@ -1,4 +1,7 @@
-/** Payer SDK entry point. Does not load the node, wallet, or receiver engine. */
+/**
+ * Payer SDK entry point. Does not load the node, wallet, or receiver engine.
+ * @module beignet/direct-funding
+ */
 export * from './client';
 export * from './psbt';
 export * from './bitcoin-core';

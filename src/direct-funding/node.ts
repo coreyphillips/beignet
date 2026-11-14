@@ -1,3 +1,8 @@
+/**
+ * The Node.js half of the payer SDK: file storage and a channel-free BOLT 8
+ * peer client.
+ * @module beignet/direct-funding/node
+ */
 import * as fs from 'fs';
 import * as path from 'path';
 import { createHash, randomBytes } from 'crypto';
