@@ -133,6 +133,11 @@ export function encodeOfferTlv(offer: IOffer): Buffer {
 		});
 	}
 	if (offer.amount !== undefined) {
+		// BOLT 12 readers refuse to answer a zero offer_amount (decodeOfferTlv
+		// included); an any-amount offer omits the record instead.
+		if (offer.amount <= 0n) {
+			throw new Error('offer_amount must be greater than zero');
+		}
 		records.push({
 			type: BigInt(OfferTlvType.AMOUNT),
 			value: encodeTruncatedU64(offer.amount)

@@ -14866,15 +14866,18 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 		issuer?: string;
 		expirySecs?: number;
 	}): OfferInfo {
+		// BOLT 12 has no zero offer_amount. 0 is refused rather than read as
+		// "any amount": a price that miscomputed to 0 should not publish an
+		// offer that takes whatever the payer sends.
 		if (
 			options.amountSats !== undefined &&
 			(typeof options.amountSats !== 'number' ||
 				!Number.isSafeInteger(options.amountSats) ||
-				options.amountSats < 0)
+				options.amountSats <= 0)
 		) {
 			throw new BeignetError(
 				'INVALID_PARAMS',
-				'amountSats must be a non-negative integer number of satoshis'
+				'amountSats must be a positive integer number of satoshis; omit it for an offer that takes any amount'
 			);
 		}
 		if (
