@@ -23,11 +23,18 @@ rather than hand-written fixtures.
 | `bolt07/extended-queries.json` | `bolt07/extended-queries.json` |
 | `bolt08/transport.json` | `08-transport.md` — Appendix A: Transport Test Vectors |
 | `bolt11/invoices.json` | `11-payment-encoding.md` — Examples / Examples of Invalid Invoices |
+| `bolt11/invoice-test.json` | `bolt11/invoice-test.json`, byte for byte at commit `191462825ae341f0a27098765c075f01ca9bc6c2` (master, fetched 2026-11-14) |
 | `bolt12/offers.json` | `bolt12/offers-test.json` |
 | `bolt12/format-string.json` | `bolt12/format-string-test.json` |
 | `bolt12/signature.json` | `bolt12/signature-test.json` |
 
-Each JSON carries a `_source` field naming its upstream origin. Values are the
+`bolt11/invoice-test.json` is upstream's own file, so it has no `_source`
+field. Its test records, for each invalid vector, whether `decode()` or the
+payer's checks refuse it. Upstream's "Non canonical signature (high-S) with
+'n' field defined" vector also carries two `s` fields, so `decode()` refuses
+it on the duplicate first; the test checks its high-S signature separately.
+
+Each other JSON carries a `_source` field naming its upstream origin. Values are the
 spec's hex/decimal as published; the JSON wrappers only reshape them into
 machine-loadable records (no values altered — uint64-range decimals are quoted
 as strings so JSON.parse cannot lose precision). To re-sync, refetch the files

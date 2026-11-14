@@ -3,11 +3,15 @@
  *
  * Covers three audit findings:
  * - S-4.M6: a p/h/s/n field whose data_length is not exactly 52/52/52/53
- *   words must be skipped, never truncated to the expected size.
- * - S-4.M7: the payer must validate the recovered signing key against the
- *   `n` field, must not pay invoices carrying unknown even feature bits,
- *   and must not pay secretless invoices.
+ *   words is never truncated to the expected size. Since issue #2038 it
+ *   fails the invoice, as BOLT 11 now requires, rather than being skipped.
+ * - S-4.M7: the payer must validate the signature against the `n` field,
+ *   must not pay invoices carrying unknown even feature bits, and must not
+ *   pay secretless invoices.
  * - S-4.M8 lives in mpp-sending.test.ts (basic_mpp gate on the MPP fallback).
+ *
+ * Issue #2038 also adds: one `p` and one `s` at most, no leading zero word
+ * in `c`, `x` or `9`, and a low-S signature when `n` is present.
  */
 
 import { expect } from 'chai';
@@ -19,6 +23,7 @@ import {
 	TagType,
 	Network,
 	BECH32_MAX_LIMIT,
+	SIGNATURE_WORDS,
 	TIMESTAMP_WORDS
 } from '../../src/lightning/invoice/types';
 import {
@@ -70,6 +75,32 @@ function craftInvoice(
 	return bech32.encode(
 		hrp,
 		[...dataWords, ...bufferToWords(sigBytes)],
+		BECH32_MAX_LIMIT
+	);
+}
+
+const SECP256K1_ORDER = BigInt(
+	'0xfffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141'
+);
+
+/**
+ * The same invoice with its signature's S replaced by N - S and the recovery
+ * id flipped: still a valid signature by the same key, and it still recovers
+ * to that key.
+ */
+function highSCopy(invoice: string): string {
+	const { prefix, words } = bech32.decode(invoice, BECH32_MAX_LIMIT);
+	const sigStart = words.length - SIGNATURE_WORDS;
+	const sig = Buffer.from(bech32.fromWords(words.slice(sigStart)));
+	const s = BigInt('0x' + sig.subarray(32, 64).toString('hex'));
+	Buffer.from((SECP256K1_ORDER - s).toString(16).padStart(64, '0'), 'hex').copy(
+		sig,
+		32
+	);
+	sig[64] ^= 1;
+	return bech32.encode(
+		prefix,
+		[...words.slice(0, sigStart), ...bufferToWords(sig)],
 		BECH32_MAX_LIMIT
 	);
 }
@@ -127,8 +158,8 @@ function makeNodeConfig(label: string): INodeConfig {
 describe('BOLT 11 payer safety', function () {
 	const payeeKey = makeKey('payee');
 
-	describe('over-length p/h/s/n fields (S-4.M6)', function () {
-		it('skips an over-length payment_hash instead of truncating it', function () {
+	describe('wrong-length p/h/s/n fields (S-4.M6, issue #2038)', function () {
+		it('refuses an over-length payment_hash instead of truncating it', function () {
 			// 33-byte "hash" → 53 words instead of the required 52
 			const inv = craftInvoice(
 				[
@@ -140,13 +171,12 @@ describe('BOLT 11 payer safety', function () {
 				],
 				payeeKey
 			);
-			// The malformed p field is skipped, leaving no payment hash at all
 			expect(() => decodeInvoice(inv)).to.throw(
-				'missing required payment_hash'
+				'field p has data_length 53, expected 52'
 			);
 		});
 
-		it('skips an over-length payment_secret instead of truncating it', function () {
+		it('refuses an over-length payment_secret instead of truncating it', function () {
 			const inv = craftInvoice(
 				[
 					{
@@ -161,14 +191,13 @@ describe('BOLT 11 payer safety', function () {
 				],
 				payeeKey
 			);
-			const decoded = decodeInvoice(inv);
-			expect(decoded.paymentSecret).to.equal(undefined);
-			expect(
-				decoded.unknownTags?.some((t) => t.type === TagType.PAYMENT_SECRET)
-			).to.equal(true);
+			expect(() => decodeInvoice(inv)).to.throw(
+				'field s has data_length 53, expected 52'
+			);
 		});
 
-		it('skips an under-length description_hash and an over-length payee pubkey', function () {
+		it('refuses an under-length description_hash next to a valid description', function () {
+			// Skipping it used to drop the hash commitment without a word.
 			const inv = craftInvoice(
 				[
 					{
@@ -179,7 +208,23 @@ describe('BOLT 11 payer safety', function () {
 					{
 						type: TagType.DESCRIPTION_HASH,
 						dataWords: bufferToWords(crypto.randomBytes(31))
+					}
+				],
+				payeeKey
+			);
+			expect(() => decodeInvoice(inv)).to.throw(
+				'field h has data_length 50, expected 52'
+			);
+		});
+
+		it('refuses an over-length payee pubkey instead of recovering the payee', function () {
+			const inv = craftInvoice(
+				[
+					{
+						type: TagType.PAYMENT_HASH,
+						dataWords: bufferToWords(crypto.randomBytes(32))
 					},
+					descriptionField(),
 					{
 						type: TagType.PAYEE_PUBKEY,
 						dataWords: bufferToWords(crypto.randomBytes(34))
@@ -187,9 +232,9 @@ describe('BOLT 11 payer safety', function () {
 				],
 				payeeKey
 			);
-			const decoded = decodeInvoice(inv);
-			expect(decoded.descriptionHash).to.equal(undefined);
-			expect(decoded.payeeNodeKey).to.equal(undefined);
+			expect(() => decodeInvoice(inv)).to.throw(
+				'field n has data_length 55, expected 53'
+			);
 		});
 
 		it('still decodes exact-length fields as before', function () {
@@ -229,7 +274,7 @@ describe('BOLT 11 payer safety', function () {
 				privateKey: payeeKey
 			});
 			expect(() => decodeInvoice(inv)).to.throw(
-				'does not match the payee node id'
+				'not a low-S signature by the payee node id'
 			);
 		});
 
@@ -243,9 +288,167 @@ describe('BOLT 11 payer safety', function () {
 				payeeNodeKey: getPublicKey(payeeKey),
 				privateKey: payeeKey
 			});
-			expect(
-				decodeInvoice(inv).payeeNodeKey?.equals(getPublicKey(payeeKey))
-			).to.equal(true);
+			const decoded = decodeInvoice(inv);
+			expect(decoded.payeeNodeKey?.equals(getPublicKey(payeeKey))).to.equal(
+				true
+			);
+			expect(decoded.recoveredPubkey?.equals(getPublicKey(payeeKey))).to.equal(
+				true
+			);
+		});
+	});
+
+	// ───── Issue #2038: high-S signatures and the n field (bolts#1284) ─────
+
+	describe('high-S signatures (issue #2038)', function () {
+		function signedInvoice(withPayeeKey: boolean): string {
+			return encodeInvoice({
+				network: Network.REGTEST,
+				paymentHash: crypto.randomBytes(32),
+				paymentSecret: crypto.randomBytes(32),
+				description: 'malleable?',
+				amountMsat: 1000n,
+				...(withPayeeKey && { payeeNodeKey: getPublicKey(payeeKey) }),
+				privateKey: payeeKey
+			});
+		}
+
+		it('refuses the high-S copy of an invoice that carries n', function () {
+			const inv = signedInvoice(true);
+			expect(decodeInvoice(inv).payeeNodeKey).to.not.equal(undefined);
+			expect(() => decodeInvoice(highSCopy(inv))).to.throw(
+				'not a low-S signature by the payee node id'
+			);
+		});
+
+		it('accepts both forms of an invoice without n, recovering the same payee', function () {
+			const inv = signedInvoice(false);
+			const lowS = decodeInvoice(inv);
+			const highS = decodeInvoice(highSCopy(inv));
+			expect(lowS.payeeNodeKey).to.equal(undefined);
+			expect(lowS.recoveredPubkey?.equals(getPublicKey(payeeKey))).to.equal(
+				true
+			);
+			expect(highS.recoveredPubkey?.equals(getPublicKey(payeeKey))).to.equal(
+				true
+			);
+		});
+
+		it('skips the signature check, high-S included, when recoverSigner is off', function () {
+			const highS = highSCopy(signedInvoice(true));
+			const decoded = decodeInvoice(highS, { recoverSigner: false });
+			expect(decoded.recoveredPubkey).to.equal(undefined);
+		});
+	});
+
+	// ───── Issue #2038: one p and one s field (bolts#1357) ─────
+
+	describe('repeated p and s fields (issue #2038)', function () {
+		const hashField = (
+			hash: Buffer
+		): { type: number; dataWords: number[] } => ({
+			type: TagType.PAYMENT_HASH,
+			dataWords: bufferToWords(hash)
+		});
+		const secretField = (
+			secret: Buffer
+		): { type: number; dataWords: number[] } => ({
+			type: TagType.PAYMENT_SECRET,
+			dataWords: bufferToWords(secret)
+		});
+
+		it('refuses two distinct p fields', function () {
+			const inv = craftInvoice(
+				[
+					hashField(crypto.randomBytes(32)),
+					hashField(crypto.randomBytes(32)),
+					secretField(crypto.randomBytes(32)),
+					descriptionField()
+				],
+				payeeKey
+			);
+			expect(() => decodeInvoice(inv)).to.throw('more than one p field');
+		});
+
+		it('refuses the same p field twice', function () {
+			const hash = crypto.randomBytes(32);
+			const inv = craftInvoice(
+				[
+					hashField(hash),
+					secretField(crypto.randomBytes(32)),
+					hashField(hash),
+					descriptionField()
+				],
+				payeeKey
+			);
+			expect(() => decodeInvoice(inv)).to.throw('more than one p field');
+		});
+
+		it('refuses two s fields', function () {
+			const inv = craftInvoice(
+				[
+					hashField(crypto.randomBytes(32)),
+					secretField(crypto.randomBytes(32)),
+					descriptionField(),
+					secretField(crypto.randomBytes(32))
+				],
+				payeeKey
+			);
+			expect(() => decodeInvoice(inv)).to.throw('more than one s field');
+		});
+	});
+
+	// ───── Issue #2038: minimal c, x and 9 fields (bolts#1245) ─────
+
+	describe('leading zero words in c, x and 9 (issue #2038)', function () {
+		const baseFields = (): Array<{ type: number; dataWords: number[] }> => [
+			{
+				type: TagType.PAYMENT_HASH,
+				dataWords: bufferToWords(crypto.randomBytes(32))
+			},
+			{
+				type: TagType.PAYMENT_SECRET,
+				dataWords: bufferToWords(crypto.randomBytes(32))
+			},
+			descriptionField()
+		];
+
+		for (const [name, type, letter] of [
+			['min_final_cltv_expiry', TagType.MIN_FINAL_CLTV_EXPIRY, 'c'],
+			['expiry', TagType.EXPIRY, 'x'],
+			['feature bits', TagType.FEATURE_BITS, '9']
+		] as const) {
+			it(`refuses a leading zero word in the ${letter} field (${name})`, function () {
+				const minimal = craftInvoice(
+					[...baseFields(), { type, dataWords: [1, 0] }],
+					payeeKey
+				);
+				expect(() => decodeInvoice(minimal)).to.not.throw();
+				const padded = craftInvoice(
+					[...baseFields(), { type, dataWords: [0, 1, 0] }],
+					payeeKey
+				);
+				expect(() => decodeInvoice(padded)).to.throw(
+					`field ${letter} starts with a zero word`
+				);
+			});
+		}
+
+		it('encodes a zero expiry and cltv delta as empty fields, and omits empty feature bits', function () {
+			const inv = encodeInvoice({
+				network: Network.REGTEST,
+				paymentHash: crypto.randomBytes(32),
+				paymentSecret: crypto.randomBytes(32),
+				description: 'zeros',
+				expiry: 0,
+				minFinalCltvExpiry: 0,
+				featureBits: FeatureFlags.empty(),
+				privateKey: payeeKey
+			});
+			const decoded = decodeInvoice(inv);
+			expect(decoded.expiry).to.equal(0);
+			expect(decoded.minFinalCltvExpiry).to.equal(0);
+			expect(decoded.featureBits).to.equal(undefined);
 		});
 	});
 

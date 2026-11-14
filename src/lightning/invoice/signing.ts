@@ -127,3 +127,32 @@ export function verifyInvoice(
 		return null;
 	}
 }
+
+/**
+ * Verify an invoice signature against a known signer, as BOLT 11 requires
+ * when the invoice carries an `n` field. A high-S signature fails here,
+ * although recovery accepts it: with both forms valid, one signed invoice
+ * would have two strings. The recovery id is not used, but must be 0 to 3.
+ *
+ * @param signature - 65-byte buffer: [sig(64) || recoveryId(1)]
+ * @param pubkey - 33-byte compressed public key from the `n` field
+ */
+export function verifyInvoiceSignature(
+	hrp: string,
+	dataWords: number[],
+	signature: Buffer,
+	pubkey: Buffer
+): boolean {
+	if (signature.length !== 65 || signature[64] > 3) {
+		return false;
+	}
+	const hash = computeSigningHash(hrp, dataWords);
+	try {
+		// fromCompact, not the raw bytes: verify() tries DER first, and a
+		// compact signature can happen to parse as DER.
+		const sig = secp.Signature.fromCompact(signature.subarray(0, 64));
+		return secp.verify(sig, hash, pubkey, { strict: true });
+	} catch {
+		return false;
+	}
+}

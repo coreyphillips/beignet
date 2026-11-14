@@ -74,6 +74,10 @@ export interface IInvoice {
 	featureBits?: FeatureFlags;
 	metadata?: Buffer;
 	signature: Buffer;
+	/**
+	 * The key that signed the invoice: the `n` key once the signature verified
+	 * against it, otherwise the key recovered from the signature.
+	 */
 	recoveredPubkey?: Buffer;
 	unknownTags?: Array<{ type: number; words: number[] }>;
 }
