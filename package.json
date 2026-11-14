@@ -32,10 +32,10 @@
     "test:cli": "npx mocha --exit --parallel --timeout 20000 -r ts-node/register --ignore 'tests/cli/daemon-security.test.ts' --ignore 'tests/cli/daemon-integration.test.ts' 'tests/cli/**/*.test.ts'",
     "test:integration": "npx mocha --exit --timeout 60000 -r ts-node/register 'tests/cli/daemon-security.test.ts' 'tests/cli/daemon-integration.test.ts'",
     "example:lightning": "npm run build && ts-node example/lightning.ts",
-    "lint": "eslint . --cache --ext .js,.jsx,.ts,.tsx && npm run lint:cycles",
-    "lint:check": "eslint . --ext .js,.jsx,.ts,.tsx && npm run lint:cycles",
+    "lint": "eslint . --cache && npm run lint:cycles",
+    "lint:check": "eslint . && npm run lint:cycles",
     "lint:cycles": "ts-node scripts/import-cycles.ts",
-    "lint:fix": "eslint . --fix --ext .js,.jsx,.ts,.tsx",
+    "lint:fix": "eslint . --fix",
     "tsc:check": "tsc -p tsconfig.json --noEmit",
     "tsc:check:tests": "tsc -p tsconfig.test.json --noEmit",
     "build": "tsc",
@@ -46,7 +46,7 @@
     "docs:paths": "ts-node scripts/comment-paths.ts",
     "api:snapshot": "ts-node scripts/api-snapshot.ts",
     "docs:html": "typedoc --out api-docs/html",
-    "docs:markdown": "typedoc --plugin typedoc-plugin-markdown --out api-docs/markdown",
+    "docs:markdown": "typedoc --plugin ./scripts/typedoc-minimatch.js --plugin typedoc-plugin-markdown --out api-docs/markdown",
     "docs": "npm run docs:tables && npm run docs:html && npm run docs:markdown"
   },
   "repository": {
@@ -148,7 +148,20 @@
   "overrides": {
     "axios": "0.34.0",
     "js-yaml": "4.3.2",
-    "serialize-javascript": "7.1.3"
+    "serialize-javascript": "7.1.3",
+    "@typescript-eslint/typescript-estree": {
+      "minimatch": "11.0.8"
+    },
+    "mocha": {
+      "glob": "14.0.6"
+    },
+    "test-exclude": {
+      "glob": "14.0.6",
+      "minimatch": "11.0.8"
+    },
+    "typedoc": {
+      "minimatch": "11.0.8"
+    }
   },
   "bugs": {
     "url": "https://github.com/coreyphillips/beignet/issues"
@@ -174,18 +187,19 @@
     "socks": "^2.8.7"
   },
   "devDependencies": {
+    "@eslint/js": "10.0.1",
     "@types/chai": "4.3.0",
     "@types/mocha": "9.0.0",
     "@types/node": "22.20.5",
-    "@typescript-eslint/eslint-plugin": "8.71.0",
-    "@typescript-eslint/parser": "8.71.0",
+    "@typescript-eslint/eslint-plugin": "8.72.2",
+    "@typescript-eslint/parser": "8.72.2",
     "bitcoin-json-rpc": "1.3.3",
     "bw-electrum-client": "BlueWallet/rn-electrum-client#47acb51149e97fab249c3f8a314f708dbee4fb6e",
     "c8": "12.0.0",
     "chai": "4.3.4",
-    "eslint": "8.57.1",
-    "eslint-config-prettier": "9.0.0",
-    "eslint-plugin-prettier": "5.0.0",
+    "eslint": "10.15.0",
+    "eslint-config-prettier": "10.1.8",
+    "eslint-plugin-prettier": "5.5.7",
     "mocha": "11.3.0",
     "prettier": "3.0.2",
     "sinon": "18.0.0",

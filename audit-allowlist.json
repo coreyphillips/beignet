@@ -1,14 +1,1 @@
-[
-	{
-		"advisory": "GHSA-g3hv-75wg-m249",
-		"package": "minimatch",
-		"reason": "minimatch below 11.0.1 (denial of service via globparts amplification). Reached only through devDependencies: eslint 8 (end of life), mocha, typedoc, the typescript-eslint packages and c8/test-exclude all pin earlier majors, and no backport to the 3.x, 5.x, 9.x or 10.x lines exists as of 2026-11-02. Not in the published package: npm audit --omit=dev is clean.",
-		"expires": "2026-12-31"
-	},
-	{
-		"advisory": "GHSA-3g3m-2fjr-6pw4",
-		"package": "glob",
-		"reason": "glob 9 to 14.0.1 (AbortSignal cancellation bypass), reached only through mocha, rimraf and test-exclude, which pin it. Not in the published package: npm audit --omit=dev is clean.",
-		"expires": "2026-12-31"
-	}
-]
+[]

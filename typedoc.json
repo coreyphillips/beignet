@@ -9,5 +9,6 @@
     "src/lightning/transport/iroh-node.ts"
   ],
   "out": "api-docs/html",
+  "plugin": ["./scripts/typedoc-minimatch.js"],
   "readme": "none"
 }
