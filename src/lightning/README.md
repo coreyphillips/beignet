@@ -843,6 +843,15 @@ const result2 = node.createInvoice({
   descriptionHash: descHash
 });
 
+// Or attach up to 639 opaque bytes as the BOLT 11 `m` field. The payer
+// returns them in every HTLC's onion, and an HTLC without the same bytes
+// fails, so the node can recognise a payment from the metadata alone.
+const result3 = node.createInvoice({
+  amountMsat: 50_000_000n,
+  description: 'Order 12345',
+  paymentMetadata: Buffer.from('order:12345')
+});
+
 // Decode any BOLT 11 invoice
 const decoded = inv.decode(result.bolt11);
 // => { paymentHash, amountMsat, description, network, ... }

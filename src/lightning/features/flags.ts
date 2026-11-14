@@ -60,6 +60,8 @@ export enum Feature {
 	CHANNEL_TYPE = 44,
 	/** SCID alias */
 	SCID_ALIAS = 46,
+	/** option_payment_metadata (invoice only): payment_metadata in the final onion payload */
+	PAYMENT_METADATA = 48,
 	/** Zero-conf channels */
 	ZERO_CONF = 50,
 	/** Keysend (bLIP-0003) — spontaneous payments via sender-generated preimage */

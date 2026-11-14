@@ -192,7 +192,8 @@ import {
 import {
 	constructOnionPacket,
 	encodeOnionPacket,
-	decodeOnionPacket
+	decodeOnionPacket,
+	onionPayloadBytes
 } from '../onion/construct';
 import {
 	processOnionPacket,
@@ -227,7 +228,8 @@ import {
 	CHANNEL_DISABLED,
 	MPP_TIMEOUT,
 	TEMPORARY_NODE_FAILURE,
-	EXPIRY_TOO_FAR
+	EXPIRY_TOO_FAR,
+	ROUTING_INFO_LENGTH
 } from '../onion/types';
 import { checkDelegatedAmounts } from '../ffor/amounts';
 import type { IFforEpochRecord } from '../ffor/types';
@@ -796,8 +798,15 @@ const PAYER_UNDERSTOOD_INVOICE_FEATURES: ReadonlySet<number> = new Set([
 	Feature.TLV_ONION,
 	Feature.PAYMENT_SECRET,
 	Feature.BASIC_MPP,
-	Feature.ROUTE_BLINDING
+	Feature.ROUTE_BLINDING,
+	Feature.PAYMENT_METADATA
 ]);
+
+/**
+ * The largest BOLT 11 `m` field: a tagged field holds at most 1023 5-bit
+ * words, and 639 bytes is the most that fits.
+ */
+const MAX_INVOICE_METADATA_BYTES = 639;
 
 /** BOLT 2: a node forgets an unconfirmed funding only after 2016 blocks. */
 const FUNDING_FORGET_BLOCKS = 2016;
@@ -17924,6 +17933,19 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			}
 		}
 
+		// Checked before any state is written: encodeInvoice would throw on an
+		// oversized field only after the preimage and secret were registered.
+		const paymentMetadata = options.paymentMetadata;
+		if (
+			paymentMetadata !== undefined &&
+			(paymentMetadata.length === 0 ||
+				paymentMetadata.length > MAX_INVOICE_METADATA_BYTES)
+		) {
+			throw new Error(
+				`paymentMetadata must be 1 to ${MAX_INVOICE_METADATA_BYTES} bytes`
+			);
+		}
+
 		// Hold invoice with an externally-held preimage: the caller supplies only
 		// the hash, so we never learn the preimage until settle time. Otherwise we
 		// generate the preimage ourselves (and can hold it for a hold invoice).
@@ -18009,6 +18031,9 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		if (useBlinded) {
 			invoiceFeatures.setOptional(Feature.ROUTE_BLINDING); // bit 25
 		}
+		if (paymentMetadata) {
+			invoiceFeatures.setOptional(Feature.PAYMENT_METADATA); // bit 49
+		}
 
 		const invoiceStr = encodeInvoice({
 			network: this.network,
@@ -18031,7 +18056,8 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 					? routingHints
 					: undefined,
 			blindedPaths: useBlinded ? blindedPaths : undefined,
-			featureBits: invoiceFeatures
+			featureBits: invoiceFeatures,
+			metadata: paymentMetadata
 		});
 
 		const payment: IPaymentInfo = {
@@ -18067,6 +18093,11 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		// back to the default and admit an HTLC the invoice promised to refuse.
 		if (options.minFinalCltvExpiry !== undefined) {
 			record.minFinalCltvExpiry = options.minFinalCltvExpiry;
+		}
+		// The final hop checks every HTLC's payment_metadata against this, so
+		// it has to survive a restart like the c tag above.
+		if (paymentMetadata) {
+			record.paymentMetadata = paymentMetadata.toString('hex');
 		}
 
 		this.persistInvoiceRecords(paymentHash, record, preimage, paymentSecret);
@@ -18354,7 +18385,8 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			invoice.paymentSecret!,
 			found.route.hops[found.route.hops.length - 1].amountToForwardMsat,
 			context,
-			metadata
+			metadata,
+			invoice.metadata
 		);
 	}
 
@@ -18572,7 +18604,8 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 					policyOverrides: overrides,
 					metadata: metadata && { ...metadata }
 				},
-				metadata
+				metadata,
+				invoice.metadata
 			);
 		}
 
@@ -18648,6 +18681,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 					{
 						paymentHash: invoice.paymentHash,
 						paymentSecret: invoice.paymentSecret,
+						paymentMetadata: invoice.metadata,
 						amountMsat: paymentAmountMsat
 					},
 					multiRoute,
@@ -18690,7 +18724,8 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				policyOverrides: overrides,
 				metadata: metadata && { ...metadata }
 			},
-			metadata
+			metadata,
+			invoice.metadata
 		);
 	}
 
@@ -18711,7 +18746,8 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		paymentSecret: Buffer,
 		paymentAmountMsat: bigint,
 		context: IPaymentRetryContext,
-		metadata?: Record<string, string>
+		metadata?: Record<string, string>,
+		paymentMetadata?: Buffer
 	): IPaymentInfo {
 		const hashHex = paymentHash.toString('hex');
 		if (!this.paymentRetryContexts.has(hashHex)) {
@@ -18732,7 +18768,8 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				paymentSecret,
 				paymentAmountMsat,
 				metadata,
-				context.payAll
+				context.payAll,
+				paymentMetadata
 			);
 			if (payment.status === PaymentStatus.FAILED) release();
 			return payment;
@@ -18745,6 +18782,26 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			}
 			throw err;
 		}
+	}
+
+	/**
+	 * Refuse a route whose hop payloads do not fit the 1300-byte payment
+	 * onion. Only a large payment_metadata gets there in practice, and the
+	 * route is fixed by then, so the refusal is NO_ROUTE.
+	 */
+	private assertOnionFits(
+		payloads: IHopPayload[],
+		paymentMetadata?: Buffer
+	): void {
+		const used = onionPayloadBytes(payloads);
+		if (used <= ROUTING_INFO_LENGTH) return;
+		throw new LightningPaymentError(
+			LightningErrorCode.NO_ROUTE,
+			`The route's onion payloads take ${used} bytes, more than the ${ROUTING_INFO_LENGTH} a payment onion holds` +
+				(paymentMetadata
+					? ` (the invoice's payment_metadata is ${paymentMetadata.length} bytes)`
+					: '')
+		);
 	}
 
 	/**
@@ -18767,6 +18824,12 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		);
 	}
 
+	/**
+	 * Send along an explicit route. `paymentMetadata` is the invoice's BOLT 11
+	 * `m` field, written as payment_metadata (TLV 16) beside the payment
+	 * secret in the final payload. A route whose payloads do not fit the onion
+	 * is refused with NO_ROUTE before any record or HTLC exists.
+	 */
 	sendPaymentToRoute(
 		route: {
 			hops: Array<{
@@ -18783,7 +18846,8 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		paymentSecret?: Buffer,
 		totalMsat?: bigint,
 		metadata?: Record<string, string>,
-		payAll?: IPayAllBudget
+		payAll?: IPayAllBudget,
+		paymentMetadata?: Buffer
 	): IPaymentInfo {
 		if (route.hops.length === 0) {
 			throw new Error('Route must have at least one hop');
@@ -18876,6 +18940,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				if (isFinal && paymentSecret) {
 					payload.paymentSecret = paymentSecret;
 					payload.totalMsat = totalMsat ?? hop.amountToForwardMsat;
+					if (paymentMetadata) payload.paymentMetadata = paymentMetadata;
 				}
 				// Route blinding (BOLT 4): the introduction node and each blinded
 				// hop read their own encrypted_recipient_data (TLV 10) to learn the
@@ -18904,6 +18969,10 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				}
 				return { pubkey: hop.pubkey, payload };
 			}
+		);
+		this.assertOnionFits(
+			onionHops.map((h) => h.payload),
+			paymentMetadata
 		);
 
 		// Generate session key and compute shared secrets for failure decryption
@@ -19715,6 +19784,45 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	}
 
 	/**
+	 * One MPP part's onion payloads. The final payload carries the payment
+	 * secret, the payment's FULL total (not the part's amount) and the
+	 * invoice's payment_metadata.
+	 */
+	private mppPartOnionHops(
+		hops: Array<{
+			pubkey: Buffer;
+			shortChannelId: Buffer;
+			amountToForwardMsat: bigint;
+			outgoingCltvValue: number;
+		}>,
+		baseHeight: number,
+		invoice: { paymentSecret?: Buffer; paymentMetadata?: Buffer },
+		totalMsat: bigint
+	): { pubkey: Buffer; payload: IHopPayload }[] {
+		return hops.map((hop, idx) => {
+			const isFinal = idx === hops.length - 1;
+			const payload: IHopPayload = isFinal
+				? {
+						amountToForwardMsat: hop.amountToForwardMsat,
+						outgoingCltvValue: hop.outgoingCltvValue + baseHeight
+				  }
+				: {
+						amountToForwardMsat: hops[idx + 1].amountToForwardMsat,
+						outgoingCltvValue: hops[idx + 1].outgoingCltvValue + baseHeight,
+						shortChannelId: hops[idx + 1].shortChannelId
+				  };
+			if (isFinal && invoice.paymentSecret) {
+				payload.paymentSecret = invoice.paymentSecret;
+				payload.totalMsat = totalMsat;
+				if (invoice.paymentMetadata) {
+					payload.paymentMetadata = invoice.paymentMetadata;
+				}
+			}
+			return { pubkey: hop.pubkey, payload };
+		});
+	}
+
+	/**
 	 * Send a payment using multi-path routing (MPP).
 	 * Splits payment across multiple routes, each carrying a portion.
 	 */
@@ -19723,6 +19831,8 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		invoice: {
 			paymentHash: Buffer;
 			paymentSecret?: Buffer;
+			/** The invoice's `m` field, sent with every part. */
+			paymentMetadata?: Buffer;
 			// The amount being paid, not the invoice field: a zero-amount
 			// invoice has none, and this becomes the record's amount and every
 			// part's total_msat.
@@ -19754,6 +19864,20 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		const paymentHash = invoice.paymentHash;
 		const hashHex = paymentHash.toString('hex');
 		const totalMsat = invoice.amountMsat;
+		// A part refused after an earlier one left would strand that part at
+		// the payee until its MPP timeout, so every part is sized first.
+		for (const part of multiRoute.parts) {
+			if (part.hops.length === 0) continue;
+			this.assertOnionFits(
+				this.mppPartOnionHops(
+					part.hops,
+					this.cltvBaseHeight(paymentHash),
+					invoice,
+					totalMsat
+				).map((h) => h.payload),
+				invoice.paymentMetadata
+			);
+		}
 
 		// Create a single payment record, journaled BEFORE any part leaves,
 		// as the single-path send does: a restart mid-flight must find the
@@ -19844,26 +19968,11 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			// height-skew failure has to beat to count as new information.
 			payment.cltvBaseHeight = baseHeight;
 
-			// Each part's final hop must have paymentSecret and totalMsat = full invoice amount
-			const onionHops: { pubkey: Buffer; payload: IHopPayload }[] = hops.map(
-				(hop, idx) => {
-					const isFinal = idx === hops.length - 1;
-					const payload: IHopPayload = isFinal
-						? {
-								amountToForwardMsat: hop.amountToForwardMsat,
-								outgoingCltvValue: hop.outgoingCltvValue + baseHeight
-						  }
-						: {
-								amountToForwardMsat: hops[idx + 1].amountToForwardMsat,
-								outgoingCltvValue: hops[idx + 1].outgoingCltvValue + baseHeight,
-								shortChannelId: hops[idx + 1].shortChannelId
-						  };
-					if (isFinal && invoice.paymentSecret) {
-						payload.paymentSecret = invoice.paymentSecret;
-						payload.totalMsat = totalMsat; // Full amount, not part amount
-					}
-					return { pubkey: hop.pubkey, payload };
-				}
+			const onionHops = this.mppPartOnionHops(
+				hops,
+				baseHeight,
+				invoice,
+				totalMsat
 			);
 
 			const sessionKey = randomBytes(32);
@@ -22334,6 +22443,31 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				this.channelManager.failHtlc(channelId, htlcId, reason);
 				return;
 			}
+		}
+
+		// An invoice issued with an `m` field is paid only by HTLCs that
+		// return the same bytes as payment_metadata (BOLT 4 makes the payer
+		// include it in every HTLC). Without such an invoice the record is
+		// ignored.
+		const expectedMetadata = this.invoices.get(hashHex)?.paymentMetadata;
+		if (
+			expectedMetadata !== undefined &&
+			hopPayload?.paymentMetadata?.toString('hex') !== expectedMetadata
+		) {
+			this.emitStructuredLog('htlc', 'payment_metadata_mismatch', {
+				paymentHash: hashHex,
+				present: hopPayload?.paymentMetadata !== undefined
+			});
+			const reason = sharedSecret
+				? createFailureMessage(
+						sharedSecret,
+						INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS,
+						this.incorrectPaymentDetailsData(amountMsat)
+				  )
+				: Buffer.alloc(FAILURE_MESSAGE_LENGTH);
+			this.cleanupHtlcSharedSecret(htlcSecretKey);
+			this.channelManager.failHtlc(channelId, htlcId, reason);
+			return;
 		}
 
 		// BOLT 12: an invoice we issued binds its payment to the path_id we
@@ -25211,6 +25345,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				hopPayload.omitForwardAmounts !== true ||
 				hopPayload.shortChannelId !== undefined ||
 				hopPayload.paymentSecret !== undefined ||
+				hopPayload.paymentMetadata !== undefined ||
 				hopPayload.totalAmountMsat !== undefined;
 			try {
 				const { hopData, nextBlindingKey } = processBlindedHop(

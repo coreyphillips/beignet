@@ -1081,6 +1081,16 @@ export interface ICreateInvoiceOptions {
 	expiry?: number;
 	minFinalCltvExpiry?: number;
 	/**
+	 * Opaque bytes written as the invoice's BOLT 11 `m` field, with feature
+	 * bit 49 (option_payment_metadata). A payer returns them as
+	 * payment_metadata in every HTLC's final onion payload, and an HTLC for
+	 * this invoice without the same bytes fails with
+	 * incorrect_or_unknown_payment_details. At most 639 bytes, the largest
+	 * field BOLT 11 can carry; long metadata shortens the routes a payer can
+	 * use, since it shares the 1300-byte onion with every hop.
+	 */
+	paymentMetadata?: Buffer;
+	/**
 	 * Emit receiver route-blinding blinded paths instead of cleartext routing
 	 * hints (BOLT 4 / BOLT 11). Each usable channel becomes a 2-hop blinded path
 	 * [peer → us] so payers learn the introduction node (our peer) but not our

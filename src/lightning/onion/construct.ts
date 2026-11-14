@@ -59,6 +59,15 @@ export function generateFiller(
 }
 
 /**
+ * Bytes the hop payloads take of a payment onion's routing info: each
+ * encoded payload plus its 32-byte HMAC. A route fits when this is at most
+ * ROUTING_INFO_LENGTH.
+ */
+export function onionPayloadBytes(payloads: IHopPayload[]): number {
+	return payloads.reduce((sum, p) => sum + encodeHopPayload(p).length + 32, 0);
+}
+
+/**
  * Construct a complete onion packet from a session key and hop payloads.
  */
 export function constructOnionPacket(
@@ -82,6 +91,12 @@ export function constructOnionPacket(
 	// Pre-encode all hop payloads
 	const encodedPayloads = hops.map((h) => encodeHopPayload(h.payload));
 	const payloadSizes = encodedPayloads.map((p) => p.length);
+	const used = payloadSizes.reduce((sum, size) => sum + size + 32, 0);
+	if (used > ROUTING_INFO_LENGTH) {
+		throw new Error(
+			`Hop payloads take ${used} bytes; a payment onion holds ${ROUTING_INFO_LENGTH}`
+		);
+	}
 
 	// Generate filler
 	const filler = generateFiller(sharedSecrets, payloadSizes);
