@@ -99,12 +99,26 @@ describe('Comment citations resolve (issue #1688)', function () {
 		for (const comment of [
 			'// https://github.com/bitcoin/bitcoin/blob/master/doc/descriptors.md',
 			'// tests/lightning/recovery-phase7-*.test.ts',
+			'// docs/specs/*.md and docs/{RECOVERY-PROTOCOL,CONCURRENT-RECEIVE}.md',
 			'// Injectable for tests/custom sinks.',
 			'// BOLT 4 vector bolt04/onion-test.json, rn-electrum-client/helpers/index.js',
 			'// ~/.beignet/config.json and <dataDir>/requests.json'
 		]) {
 			expect(citationsIn(comment, INDEX), comment).to.deep.equal([]);
 		}
+	});
+
+	it('a placeholder in angle brackets is not a citation, and a bare one is dangling (issue #2066)', () => {
+		for (const comment of [
+			'// tests/lightning/fixtures/sqlite-schema/schema-<NN>.sql',
+			'// tests/lightning/fixtures/sqlite-schema/schema.v<NN>.sql',
+			'// docs/specs/<name>.md'
+		]) {
+			expect(citationsIn(comment, INDEX), comment).to.deep.equal([]);
+		}
+		expect(
+			dangling('// tests/lightning/fixtures/sqlite-schema/schema-NN.sql')
+		).to.deep.equal(['tests/lightning/fixtures/sqlite-schema/schema-NN.sql']);
 	});
 
 	it('reads comments only, including one in an empty block, and not strings', () => {
