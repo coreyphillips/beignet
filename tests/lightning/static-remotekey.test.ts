@@ -222,7 +222,7 @@ describe('Phase 3: option_static_remotekey', () => {
 			expect(flags.hasFeature(Feature.STATIC_REMOTE_KEY)).to.be.true;
 		});
 
-		it('should default to static_remotekey when no channel type in open_channel', () => {
+		it('refuses an open_channel with no channel type (option_channel_type is assumed)', () => {
 			const openActions = opener.initiateOpen();
 			const openPayload = (
 				openActions[0] as {
@@ -232,7 +232,7 @@ describe('Phase 3: option_static_remotekey', () => {
 			).payload;
 			const openMsg = decodeOpenChannelMessage(openPayload);
 
-			// Remove channel type to simulate a peer that doesn't send it
+			// A peer still on implicit negotiation omits TLV 1.
 			delete openMsg.channelType;
 
 			acceptor = createAcceptorChannel({
@@ -242,13 +242,15 @@ describe('Phase 3: option_static_remotekey', () => {
 			});
 
 			const acceptActions = acceptor.handleOpenChannel(openMsg);
-			expect(acceptActions).to.have.lengthOf(1);
-
-			// Acceptor should still have static_remotekey as default
-			const state = acceptor.getFullState();
-			expect(state.channelType).to.not.be.null;
-			const flags = FeatureFlags.fromBuffer(state.channelType!);
-			expect(flags.hasFeature(Feature.STATIC_REMOTE_KEY)).to.be.true;
+			expectWireRefusal(
+				acceptActions,
+				openMsg.temporaryChannelId,
+				/open_channel omitted channel_type/
+			);
+			expect(
+				acceptActions.filter((a) => a.type === ChannelActionType.SEND_MESSAGE),
+				'the wire error is the only message: no accept_channel'
+			).to.have.lengthOf(1);
 		});
 	});
 

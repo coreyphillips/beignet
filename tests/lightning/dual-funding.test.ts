@@ -2944,7 +2944,8 @@ describe('Round 17: v2 channel_type admission', () => {
 				delayedPaymentBasepoint: points.delayedPaymentBasepoint,
 				htlcBasepoint: points.htlcBasepoint,
 				firstPerCommitmentPoint: points.firstPerCommitmentPoint,
-				channelFlags: 0
+				channelFlags: 0,
+				channelType: typeOf(Feature.STATIC_REMOTE_KEY)
 			});
 		}
 
@@ -5206,7 +5207,8 @@ describe('Round 17: v2 channel_type admission', () => {
 					delayedPaymentBasepoint: openPoints.delayedPaymentBasepoint,
 					htlcBasepoint: openPoints.htlcBasepoint,
 					firstPerCommitmentPoint: openPoints.firstPerCommitmentPoint,
-					channelFlags: 0
+					channelFlags: 0,
+					channelType: typeOf(Feature.STATIC_REMOTE_KEY)
 				})
 			);
 			const inbound = acceptor.getTempChannel(inboundTempId);

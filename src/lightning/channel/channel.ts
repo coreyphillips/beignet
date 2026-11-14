@@ -2616,10 +2616,11 @@ export class Channel {
 			}
 			this._state.channelType = msg.channelType;
 		} else {
-			// If no channel type proposed, default to static_remotekey
-			const defaultType = FeatureFlags.empty();
-			defaultType.setCompulsory(Feature.STATIC_REMOTE_KEY);
-			this._state.channelType = defaultType.toBuffer();
+			// BOLT 2 (option_channel_type is assumed): fail the channel. A peer
+			// still on implicit negotiation may assume anchors from our shared
+			// features while we would build static_remotekey, which surfaces much
+			// later as a commitment signature mismatch.
+			return refuse('open_channel omitted channel_type');
 		}
 
 		// BOLT 2 couplings for the accept_channel WE build: our channel_reserve

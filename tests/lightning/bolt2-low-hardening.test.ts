@@ -64,6 +64,7 @@ import { decodeUpdateAddHtlcMessage } from '../../src/lightning/message/channel-
 import { perCommitmentPointFromSecret } from '../../src/lightning/keys/derivation';
 import { generateFromSeed, MAX_INDEX } from '../../src/lightning/keys/shachain';
 import { writableState } from './helpers/writable-state';
+import { Feature, FeatureFlags } from '../../src/lightning/features/flags';
 
 function realBasepoints(seed?: Buffer): IChannelBasepoints {
 	// With a seed, derive with the seedKey convention so signerFromSeed(seed)
@@ -105,6 +106,8 @@ function errorOf(actions: any[]): string | null {
 
 function makeValidOpenMsg(): IOpenChannelMessage {
 	const bp = realBasepoints();
+	const channelType = FeatureFlags.empty();
+	channelType.setCompulsory(Feature.STATIC_REMOTE_KEY);
 	return {
 		chainHash: BITCOIN_CHAIN_HASH,
 		temporaryChannelId: crypto.randomBytes(32),
@@ -123,7 +126,8 @@ function makeValidOpenMsg(): IOpenChannelMessage {
 		delayedPaymentBasepoint: bp.delayedPaymentBasepoint,
 		htlcBasepoint: bp.htlcBasepoint,
 		firstPerCommitmentPoint: bp.firstPerCommitmentPoint,
-		channelFlags: 0x01
+		channelFlags: 0x01,
+		channelType: channelType.toBuffer()
 	};
 }
 
