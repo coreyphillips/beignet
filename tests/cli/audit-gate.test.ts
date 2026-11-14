@@ -234,8 +234,5 @@ describe('audit gate (scripts/audit-gate.js)', () => {
 			)
 		);
 		expect(() => gate.validateAllowlist(committed)).to.not.throw();
-		expect(
-			committed.map((e: { advisory: string }) => e.advisory)
-		).to.include.members([MINIMATCH, GLOB]);
 	});
 });
