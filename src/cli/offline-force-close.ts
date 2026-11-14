@@ -170,7 +170,14 @@ export async function runOfflineForceClose(
 	let nextRebroadcast = alreadyForceClosed ? now() : now() + opts.rebroadcastMs;
 	let rebroadcastError: string | undefined;
 	for (;;) {
-		if (node.getChannel(channelId)?.closeStatus?.broadcast === true) {
+		const status = node.getChannel(channelId)?.closeStatus;
+		// On a re-run, a sighting of our commitment can come from an earlier run
+		// and the tx may have left the mempool since, so only a rebroadcast from
+		// this run counts. A peer's close is not ours to rebroadcast.
+		if (
+			status?.broadcast === true &&
+			!(alreadyForceClosed && status.closer === 'local')
+		) {
 			return done();
 		}
 		if (now() >= nextRebroadcast) {

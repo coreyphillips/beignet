@@ -117,6 +117,7 @@ function fakeNode(
 	clock: { t: number },
 	setup: {
 		state?: ChannelInfo['state'];
+		closer?: 'local' | 'remote';
 		connectAt?: number;
 		broadcastAt?: number;
 		rebroadcastOk?: boolean;
@@ -138,7 +139,7 @@ function fakeNode(
 			const info = { channelId: CHANNEL, state } as ChannelInfo;
 			if (closedAt !== undefined) {
 				info.closeStatus = {
-					closer: 'local',
+					closer: setup.closer ?? 'local',
 					closingTxid: TXID,
 					broadcast:
 						setup.broadcastAt !== undefined && clock.t >= setup.broadcastAt,
@@ -253,6 +254,28 @@ describe('runOfflineForceClose', () => {
 		expect(node.closes).to.deep.equal([]);
 		expect(node.rebroadcasts).to.equal(1);
 		expect(clock.t).to.equal(0);
+	});
+
+	it('on a re-run, does not take a sighting of our commitment from an earlier run as the broadcast', async () => {
+		const node = fakeNode(clock, {
+			state: 'FORCE_CLOSED',
+			broadcastAt: 0,
+			rebroadcastOk: false
+		});
+		const result = await runOfflineForceClose(node, CHANNEL, timing);
+		expect(result.error?.code).to.equal('BROADCAST_FAILED');
+		expect(node.rebroadcasts).to.equal(7);
+	});
+
+	it('on a re-run, takes a sighting of the peer close without rebroadcasting', async () => {
+		const node = fakeNode(clock, {
+			state: 'FORCE_CLOSED',
+			closer: 'remote',
+			broadcastAt: 0
+		});
+		const result = await runOfflineForceClose(node, CHANNEL, timing);
+		expect(result.ok).to.equal(true);
+		expect(node.rebroadcasts).to.equal(0);
 	});
 
 	it('fails with the txid and the last broadcast error when nothing lands', async () => {
