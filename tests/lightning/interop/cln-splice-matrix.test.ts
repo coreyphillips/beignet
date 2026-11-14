@@ -18,6 +18,13 @@
  *   D1 mid-splice disconnect after the commitment round (beignet's
  *      tx_signatures dropped) -> reconnect -> next_funding_txid resume
  *
+ * Not here: a restart while a pending-lock commitment batch is un-acked
+ * (issue #2043). These nodes keep no storage, so they cannot restart. A node
+ * that does (chaos-cln-crash-resume.test.ts) replays the batch byte for byte
+ * from its recovery outbox and never reaches the rebuild that dropped the
+ * current member's funding_txid. splice.test.ts covers that rebuild against
+ * a receiver that refuses an untagged member, as the spec requires.
+ *
  * Requires the compose `cln` container (v26.06.1, --experimental-splicing).
  * Auto-skips when CLN is unreachable.
  */

@@ -11889,6 +11889,7 @@ export class Channel {
 			} else if (
 				this._signer &&
 				this._state.channelId &&
+				this._state.fundingTxid &&
 				this._state.spliceInFlight &&
 				this._state.lastSentCommitmentSigned &&
 				!isTaprootChannel(this._state.channelType)
@@ -11920,7 +11921,8 @@ export class Channel {
 						const currentBytes = encodeCommitmentSignedMessage({
 							channelId: this._state.channelId,
 							signature: this._state.lastSentCommitmentSigned,
-							htlcSignatures: this._state.lastSentHtlcSignatures ?? []
+							htlcSignatures: this._state.lastSentHtlcSignatures ?? [],
+							fundingTxid: Buffer.from(this._state.fundingTxid)
 						});
 						const spliceBytes = encodeCommitmentSignedMessage({
 							channelId: this._state.channelId,
@@ -15549,6 +15551,15 @@ export class Channel {
 	private _handleCommitmentSignedBatch(
 		msgs: ICommitmentSignedMessage[]
 	): ChannelAction[] {
+		// Every batch member must name the funding it spends, the current one
+		// included, and the splicing spec fails the channel when one does not.
+		// Guessing that an untagged member is the current funding would hide a
+		// sender that other implementations refuse.
+		if (msgs.some((m) => !m.fundingTxid)) {
+			return this._failChannelWithWireError(
+				'Commitment batch member without funding_txid'
+			);
+		}
 		const inflight = this._state.spliceInFlight;
 		if (!inflight) {
 			// The batch raced our splice_locked: the peer built it before
@@ -15587,9 +15598,8 @@ export class Channel {
 				}
 				spliceMsg = m;
 			} else if (
-				!m.fundingTxid ||
-				(this._state.fundingTxid &&
-					m.fundingTxid.equals(this._state.fundingTxid))
+				this._state.fundingTxid &&
+				m.fundingTxid?.equals(this._state.fundingTxid)
 			) {
 				if (currentMsg) {
 					return [
@@ -15601,7 +15611,8 @@ export class Channel {
 				}
 				currentMsg = m;
 			} else {
-				const peerTxid = Buffer.from(m.fundingTxid).reverse().toString('hex');
+				// Every member carries a funding_txid: refused above otherwise.
+				const peerTxid = Buffer.from(m.fundingTxid!).reverse().toString('hex');
 				return [
 					{
 						type: ChannelActionType.ERROR,
