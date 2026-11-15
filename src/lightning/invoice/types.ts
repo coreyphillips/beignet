@@ -32,11 +32,11 @@ export enum TagType {
 	/**
 	 * Blinded payment paths (receiver route blinding).
 	 *
-	 * BOLT 11 has no finalized blinded-paths tag yet, and beignet's
-	 * encrypted_recipient_data uses a compact non-BOLT4 format, so this is a
-	 * beignet-internal field for now. 25 is an otherwise-unused 5-bit tag value;
-	 * other implementations decode it as an unknown tag and ignore it. Revisit
-	 * the value (and switch to BOLT 4 TLV hop data) when the spec lands.
+	 * BOLT 11 has no blinded-paths tag, so the tag itself is a beignet
+	 * extension that other payers skip as unknown. The paths inside are
+	 * ordinary BOLT 4 blinded paths with BOLT 4 encrypted_recipient_data, which
+	 * any route-blinding relay can carry. 25 is an otherwise-unused 5-bit tag
+	 * value; revisit it if the spec assigns one.
 	 */
 	BLINDED_PATHS = 25
 }

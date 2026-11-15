@@ -281,7 +281,6 @@ function buildHostileWorld(): IWorld & {
 	const decoded = decodeInvoice(baseInv.bolt11);
 	const hopData: IBlindedHopData[] = [
 		{
-			nextNodeId: carolPub,
 			shortChannelId: scidBC,
 			paymentRelay: HOSTILE_RELAY,
 			paymentConstraints: CONSTRAINTS

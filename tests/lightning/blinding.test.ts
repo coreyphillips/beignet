@@ -296,11 +296,11 @@ describe('Route Blinding (BOLT 4 Extension)', function () {
 		});
 
 		it('should encode/decode data with all fields', function () {
-			const nextNodeId = getPublicKey(randomPrivkey());
+			// short_channel_id and next_node_id are alternatives (BOLT 4: a
+			// reader refuses both), so this relay hop names its channel.
 			const scid = Buffer.from('0001000200030004', 'hex');
 			const padding = crypto.randomBytes(20);
 			const data: IBlindedHopData = {
-				nextNodeId,
 				shortChannelId: scid,
 				paymentRelay: {
 					cltvExpiryDelta: 144,
@@ -317,7 +317,7 @@ describe('Route Blinding (BOLT 4 Extension)', function () {
 			const encoded = encodeBlindedHopData(data);
 			const decoded = decodeBlindedHopData(encoded);
 
-			expect(decoded.nextNodeId!.equals(nextNodeId)).to.be.true;
+			expect(decoded.nextNodeId).to.be.undefined;
 			expect(decoded.shortChannelId!.equals(scid)).to.be.true;
 			expect(decoded.paymentRelay!.cltvExpiryDelta).to.equal(144);
 			expect(decoded.paymentRelay!.feeProportionalMillionths).to.equal(5000);
@@ -576,14 +576,9 @@ describe('Route Blinding (BOLT 4 Extension)', function () {
 			const nodePubkeys = nodeKeys.map((k) => getPublicKey(k));
 
 			const hopDataList: IBlindedHopData[] = [
-				{
-					nextNodeId: nodePubkeys[1],
-					shortChannelId: Buffer.from('0001000200030004', 'hex')
-				},
-				{
-					nextNodeId: nodePubkeys[2],
-					shortChannelId: Buffer.from('0005000600070008', 'hex')
-				},
+				// One hop of each next-hop form.
+				{ nextNodeId: nodePubkeys[1] },
+				{ shortChannelId: Buffer.from('0005000600070008', 'hex') },
 				{
 					paymentConstraints: {
 						maxCltvExpiry: 1000000,
@@ -607,9 +602,7 @@ describe('Route Blinding (BOLT 4 Extension)', function () {
 			);
 			expect(result0.hopData.nextNodeId).to.not.be.undefined;
 			expect(result0.hopData.nextNodeId!.equals(nodePubkeys[1])).to.be.true;
-			expect(result0.hopData.shortChannelId!.toString('hex')).to.equal(
-				'0001000200030004'
-			);
+			expect(result0.hopData.shortChannelId).to.be.undefined;
 
 			// Process hop 1
 			currentBlindingKey = result0.nextBlindingKey;
@@ -618,8 +611,7 @@ describe('Route Blinding (BOLT 4 Extension)', function () {
 				nodeKeys[1],
 				path.blindedHops[1].encryptedData
 			);
-			expect(result1.hopData.nextNodeId).to.not.be.undefined;
-			expect(result1.hopData.nextNodeId!.equals(nodePubkeys[2])).to.be.true;
+			expect(result1.hopData.nextNodeId).to.be.undefined;
 			expect(result1.hopData.shortChannelId!.toString('hex')).to.equal(
 				'0005000600070008'
 			);

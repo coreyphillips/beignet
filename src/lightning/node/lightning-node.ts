@@ -71,12 +71,15 @@ import {
 import type {
 	IBlindedHopData,
 	IBlindedPath,
-	IBlindedPaymentPath
+	IBlindedPaymentPath,
+	IChannelEnds
 } from '../onion/blinded-path';
 import {
 	constructBlindedPath,
 	processBlindedHop,
-	deriveBlindedPrivkey
+	deriveBlindedPrivkey,
+	payInfoRequiresUnknownFeature,
+	resolveIntroductionNode
 } from '../onion/blinded-path';
 import type { IPerChannelKeys } from '../channel/channel-manager';
 import { ChannelManager, txInputOutpoints } from '../channel/channel-manager';
@@ -2288,6 +2291,9 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			(toPeer: string, type: number, payload: Buffer) => {
 				this.emitOutbound(toPeer, type, payload);
 			}
+		);
+		this.onionMessageManager.setChannelLookup((scid) =>
+			this.channelEndsForScid(scid)
 		);
 		this.wireOnionMessageEvents();
 
@@ -18523,44 +18529,85 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 
 		// Route blinding: if the invoice advertises blinded paths, route through
 		// one (the sender learns only the introduction node, never the payee).
+		// Each path is tried in turn, as payBolt12Invoice does: a path with no
+		// route, an unusable self-introduction, a fee over the cap or a
+		// payinfo requiring an unknown feature is skipped, and a retry skips
+		// the paths whose blinded segment already failed.
 		if (invoice.blindedPaths && invoice.blindedPaths.length > 0) {
-			const blinded = invoice.blindedPaths[0];
-			const blindedRoute = findRouteToBlindedPath(
-				this.graph,
-				sourceNodeId,
-				blinded.path,
-				blinded.payInfo,
-				paymentAmountMsat,
-				finalCltvExpiry,
-				undefined,
-				excludedChannels,
-				this.missionControl,
-				this.getLocalChannelEdges(),
-				cltvBudget,
-				overrides
-			);
+			const excludedPaths =
+				this.paymentRetryContexts.get(dedupHashHex)?.bolt12ExcludedPathIndices;
+			let blindedRoute: IRoute | null = null;
+			let pathIndex = 0;
+			let overCap = false;
+			let selfIntroError: LightningPaymentError | undefined;
+			for (let i = 0; i < invoice.blindedPaths.length; i++) {
+				if (excludedPaths?.has(i)) continue;
+				const blinded = invoice.blindedPaths[i];
+				if (payInfoRequiresUnknownFeature(blinded.payInfo)) continue;
+				const path = resolveIntroductionNode(blinded.path, (scid) =>
+					this.channelEndsForScid(scid)
+				);
+				if (!path) continue;
+				const candidate = findRouteToBlindedPath(
+					this.graph,
+					sourceNodeId,
+					path,
+					blinded.payInfo,
+					paymentAmountMsat,
+					finalCltvExpiry,
+					undefined,
+					excludedChannels,
+					this.missionControl,
+					this.getLocalChannelEdges(),
+					cltvBudget,
+					overrides
+				);
+				if (!candidate) continue;
+				// The fee cap judges the fee actually PAID: a self-introduction
+				// send removes our own introduction fee on the wire, so a
+				// genuinely zero-fee payment must pass maxFeeMsat 0 (issue #550
+				// review). prepareSelfIntroSend also validates the path, so an
+				// unusable self-intro path moves on to the next one. A grafted
+				// route is judged on what leaves us beyond what the recipient
+				// receives: that includes the payee-written blinded fee, which
+				// the route's reported fee used to leave out (issue #1001).
+				let selfIntroForCap: { wireRoute: { totalFeeMsat: bigint } } | null;
+				try {
+					selfIntroForCap = this.prepareSelfIntroSend(candidate);
+				} catch (err) {
+					if (
+						err instanceof LightningPaymentError &&
+						(err.code === LightningErrorCode.NO_ROUTE ||
+							err.code === LightningErrorCode.NO_CHANNEL_TO_HOP)
+					) {
+						selfIntroError = err;
+						continue;
+					}
+					throw err;
+				}
+				const effectiveFeeMsat =
+					selfIntroForCap?.wireRoute.totalFeeMsat ??
+					candidate.totalAmountMsat - paymentAmountMsat;
+				if (maxFeeMsat !== undefined && effectiveFeeMsat > maxFeeMsat) {
+					overCap = true;
+					continue;
+				}
+				blindedRoute = candidate;
+				pathIndex = i;
+				break;
+			}
 			if (!blindedRoute) {
+				if (overCap) {
+					throw new LightningPaymentError(
+						LightningErrorCode.FEE_EXCEEDS_MAX,
+						'Route fee exceeds maximum'
+					);
+				}
+				// An unusable self-introduction path fails by its own reason.
+				if (selfIntroError) throw selfIntroError;
 				throw new LightningPaymentError(
 					LightningErrorCode.NO_ROUTE,
 					'No route to blinded path introduction node'
-				);
-			}
-			// The fee cap judges the fee actually PAID: a self-introduction
-			// send removes our own introduction fee on the wire, so a
-			// genuinely zero-fee payment must pass maxFeeMsat 0 (issue #550
-			// review). prepareSelfIntroSend also validates the path, so an
-			// unusable self-intro path fails here by name. A grafted route is
-			// judged on what leaves us beyond what the recipient receives:
-			// that includes the payee-written blinded fee, which the route's
-			// reported fee used to leave out (issue #1001).
-			const selfIntroForCap = this.prepareSelfIntroSend(blindedRoute);
-			const effectiveFeeMsat =
-				selfIntroForCap?.wireRoute.totalFeeMsat ??
-				blindedRoute.totalAmountMsat - paymentAmountMsat;
-			if (maxFeeMsat !== undefined && effectiveFeeMsat > maxFeeMsat) {
-				throw new LightningPaymentError(
-					LightningErrorCode.FEE_EXCEEDS_MAX,
-					'Route fee exceeds maximum'
 				);
 			}
 			return this.dispatchInvoiceRoute(
@@ -18578,7 +18625,8 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 					amountMsat,
 					maxCltvExpiryHeight: cltvCeiling,
 					policyOverrides: overrides,
-					metadata: metadata && { ...metadata }
+					metadata: metadata && { ...metadata },
+					bolt12PathIndex: pathIndex
 				},
 				metadata,
 				invoice.metadata
@@ -18726,8 +18774,13 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		paymentMetadata?: Buffer
 	): IPaymentInfo {
 		const hashHex = paymentHash.toString('hex');
-		if (!this.paymentRetryContexts.has(hashHex)) {
+		const registered = this.paymentRetryContexts.get(hashHex);
+		if (!registered) {
 			this.paymentRetryContexts.set(hashHex, context);
+		} else {
+			// A retry keeps its context; only the blinded path it now uses
+			// is this attempt's own.
+			registered.bolt12PathIndex = context.bolt12PathIndex;
 		}
 		// By identity: a payment:failed listener may already have started a
 		// new send of the hash, and the context there now is that send's.
@@ -19317,8 +19370,10 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		route: IPaymentInfo['route'],
 		heightSkew: boolean
 	): boolean {
-		if (!ctx?.bolt12Invoice || heightSkew) return false;
+		if (!ctx || heightSkew) return false;
 		if (ctx.bolt12PathIndex === undefined) return false;
+		const pathCount = this.blindedPathCount(ctx);
+		if (pathCount === 0) return false;
 		const hops = route?.hops as IRouteHop[] | undefined;
 		if (!hops || payment.failureSourceIndex === undefined) return false;
 		const introIndex = hops.findIndex(
@@ -19337,10 +19392,18 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			ctx.bolt12ExcludedPathIndices = new Set();
 		}
 		ctx.bolt12ExcludedPathIndices.add(ctx.bolt12PathIndex);
-		return (
-			ctx.bolt12ExcludedPathIndices.size <
-			(ctx.bolt12Invoice.paths?.length ?? 0)
-		);
+		return ctx.bolt12ExcludedPathIndices.size < pathCount;
+	}
+
+	/** How many blinded paths the payment's invoice offers (BOLT 12 or 11). */
+	private blindedPathCount(ctx: IPaymentRetryContext): number {
+		if (ctx.bolt12Invoice) return ctx.bolt12Invoice.paths?.length ?? 0;
+		if (!ctx.invoiceStr) return 0;
+		try {
+			return decodeInvoice(ctx.invoiceStr).blindedPaths?.length ?? 0;
+		} catch {
+			return 0;
+		}
 	}
 
 	/**
@@ -20262,6 +20325,23 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			],
 			RecoveryCriticality.SafetyCritical
 		);
+
+		// BOLT 4: an HTLC that arrived with a path_key in update_add_htlc MUST
+		// be refused when its payload also carries current_path_key. Only one
+		// of the two can be the hop's real blinding source.
+		if (htlcEntry.blindingPoint && processed.hopPayload.blindingPoint) {
+			this.emitStructuredLog('htlc', 'blinded_double_path_key', {
+				channelId: channelId.toString('hex'),
+				htlcId: htlcId.toString()
+			});
+			this.failBlindedIncomingHtlc(
+				channelId,
+				htlcId,
+				'mid',
+				processed.sharedSecret
+			);
+			return;
+		}
 
 		// Policy fail-backs (issue 410): BOLT 2's dust-exposure section says an
 		// HTLC over the ceiling SHOULD be failed once committed and its preimage
@@ -25304,6 +25384,9 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		// hop's own payment_relay (not the cleartext onion), so per-hop fees
 		// distribute correctly across >2 blinded hops.
 		let outgoingScid = hopPayload.shortChannelId;
+		// A blinded hop may name its next node instead of a channel (BOLT 4
+		// next_node_id); any of our usable channels to that peer will do.
+		let outgoingNodeId: Buffer | undefined;
 		let nextBlindingPoint: Buffer | undefined;
 		let holdForLsp = false;
 		let holdRegistrationId: Buffer | undefined;
@@ -25331,6 +25414,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 					hopPayload.encryptedRecipientData
 				);
 				outgoingScid = hopData.shortChannelId;
+				outgoingNodeId = hopData.nextNodeId;
 				nextBlindingPoint = nextBlindingKey;
 				holdForLsp = !!hopData.holdHtlc;
 				holdRegistrationId = hopData.holdRegistrationId;
@@ -25448,6 +25532,9 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			inHtlcId: Number(inHtlcId),
 			amountInMsat: Number(incomingAmountMsat),
 			outgoingScid: outgoingScid?.toString('hex'),
+			...(outgoingNodeId && {
+				outgoingNodeId: outgoingNodeId.toString('hex')
+			}),
 			blinded: isBlindedForward
 		});
 
@@ -25477,6 +25564,17 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			return;
 		}
 
+		let peerChannelId: Buffer | undefined;
+		if (!outgoingScid && isBlindedForward && outgoingNodeId) {
+			const toPeer = this.findChannelForPeer(
+				outgoingNodeId.toString('hex'),
+				forwardAmount
+			);
+			const st = toPeer?.getFullState();
+			peerChannelId = toPeer?.getChannelId() ?? undefined;
+			outgoingScid =
+				st?.shortChannelId ?? st?.scidAlias ?? st?.remoteScidAlias ?? undefined;
+		}
 		if (!outgoingScid) {
 			failIncoming(UNKNOWN_NEXT_PEER);
 			return;
@@ -25486,7 +25584,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		// the policy checks: the fee/CLTV we enforce is the OUTGOING channel's
 		// effective policy (per-channel override or node defaults).
 		const scidHex = outgoingScid.toString('hex');
-		const outChannelId = this.scidToChannelId.get(scidHex);
+		const outChannelId = peerChannelId ?? this.scidToChannelId.get(scidHex);
 		if (!outChannelId) {
 			// JIT receive (LSP role): an unknown SCID may be an intercept SCID we
 			// minted for a wallet peer, so hold the HTLC and fund a channel to it
@@ -31589,6 +31687,10 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		// recipient and the settlement-peer roles are implemented.
 		flags.setOptional(Feature.OPTION_FF_RECEIVE);
 		flags.setOptional(Feature.OPTION_FF_CONCURRENT);
+		// Route blinding (BOLT 4): we relay blinded payments and onion
+		// messages as an introduction or intermediate node. LND, CLN, Eclair
+		// and LDK only pick blinded hops among nodes that set this bit.
+		flags.setOptional(Feature.ROUTE_BLINDING);
 		// LARGE_CHANNELS (18) is not set here but the constructor sets it by
 		// default (largeChannels defaults to true), so it is advertised unless
 		// opted out; the > 2^24 cap is still only lifted with a wumbo peer.
@@ -31601,8 +31703,6 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		//  - OPTION_WILL_FUND (112): liquidity ads negotiate via open_channel2
 		//    TLVs when liquidity rates are configured; init-bit advertising is a
 		//    separate decision.
-		//  - ROUTE_BLINDING (24): advertised per-invoice (see invoiceFeatures),
-		//    not in the init set.
 		//  - OPTION_TAPROOT (180/181): negotiated via channel_type when
 		//    preferTaproot is set; staging bits are not init-advertised. A
 		//    caller that adds them loses SIMPLE_CLOSE: the constructor clears
@@ -32167,17 +32267,25 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			let overCap = false;
 			for (let i = 0; i < invoice.paths.length && !blindedRoute; i++) {
 				if (excludedPaths?.has(i)) continue;
-				const payInfo = invoice.blindedPayInfo?.[i] ?? {
+				// BOLT 12: never pay over a path whose payinfo sets an unknown
+				// even feature bit.
+				const advertised = invoice.blindedPayInfo?.[i];
+				if (advertised && payInfoRequiresUnknownFeature(advertised)) continue;
+				const payInfo = advertised ?? {
 					feeBaseMsat: 0,
 					feeProportionalMillionths: 0,
 					cltvExpiryDelta: 0,
 					htlcMinimumMsat: 0n,
 					htlcMaximumMsat: amountMsat
 				};
+				const path = resolveIntroductionNode(invoice.paths[i], (scid) =>
+					this.channelEndsForScid(scid)
+				);
+				if (!path) continue;
 				blindedRoute = findRouteToBlindedPath(
 					this.graph,
 					sourceNodeId,
-					invoice.paths[i],
+					path,
 					payInfo,
 					amountMsat,
 					finalCltvExpiry,
@@ -34278,6 +34386,49 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			}
 		}
 		return undefined;
+	}
+
+	/**
+	 * The two ends of a channel by SCID: one of ours (real SCID or either
+	 * alias, in any state, since an onion message relay needs only the peer)
+	 * or one from the gossip graph. Feeds onion message next hops named by
+	 * channel and `sciddir` introduction points.
+	 */
+	private channelEndsForScid(scid: Buffer): IChannelEnds | undefined {
+		if (scid.length !== 8) return undefined;
+		const peer = this.peerOnChannelScid(scid);
+		if (peer) {
+			const own = this.ownNodeId();
+			return Buffer.compare(own, peer) < 0
+				? { nodeId1: own, nodeId2: peer }
+				: { nodeId1: peer, nodeId2: own };
+		}
+		const graphChannel = this.graph?.getChannel(scid);
+		return graphChannel
+			? { nodeId1: graphChannel.nodeId1, nodeId2: graphChannel.nodeId2 }
+			: undefined;
+	}
+
+	/** The peer at the other end of our channel with this SCID. */
+	private peerOnChannelScid(scid: Buffer): Buffer | undefined {
+		let channelId = this.scidToChannelId.get(scid.toString('hex'));
+		if (!channelId) {
+			for (const channel of this.channelManager.listChannels()) {
+				const st = channel.getFullState();
+				if (
+					(st.shortChannelId && st.shortChannelId.equals(scid)) ||
+					(st.scidAlias && st.scidAlias.equals(scid)) ||
+					(st.remoteScidAlias && st.remoteScidAlias.equals(scid))
+				) {
+					channelId = channel.getChannelId() ?? undefined;
+					break;
+				}
+			}
+		}
+		const peer = channelId
+			? this.channelManager.getPeerForChannel(channelId)
+			: undefined;
+		return peer ? Buffer.from(peer, 'hex') : undefined;
 	}
 
 	private findLocalChannelByScid(

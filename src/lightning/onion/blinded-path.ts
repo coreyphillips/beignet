@@ -88,6 +88,11 @@ export interface IBlindedHopData {
 	 * hop unblinds with the key its own route creator chose.
 	 */
 	nextPathKeyOverride?: Buffer;
+	/**
+	 * allowed_features (BOLT 4 encrypted_recipient_data type 14). No feature
+	 * is defined for it yet, so the reader refuses any set bit.
+	 */
+	allowedFeatures?: Buffer;
 	/** Padding for uniform hop sizes */
 	padding?: Buffer;
 }
@@ -100,6 +105,18 @@ const ERD_PATH_ID = 6n;
 const ERD_NEXT_PATH_KEY_OVERRIDE = 8n;
 const ERD_PAYMENT_RELAY = 10n;
 const ERD_PAYMENT_CONSTRAINTS = 12n;
+const ERD_ALLOWED_FEATURES = 14n;
+/** Every even type the reader understands; any other even type is refused. */
+const ERD_KNOWN_TYPES = new Set<bigint>([
+	ERD_PADDING,
+	ERD_SHORT_CHANNEL_ID,
+	ERD_NEXT_NODE_ID,
+	ERD_PATH_ID,
+	ERD_NEXT_PATH_KEY_OVERRIDE,
+	ERD_PAYMENT_RELAY,
+	ERD_PAYMENT_CONSTRAINTS,
+	ERD_ALLOWED_FEATURES
+]);
 /**
  * beignet-custom async-payments hold_htlc marker. Odd, so spec nodes that don't
  * understand it ignore it (async receive only matters when a beignet LSP is the
@@ -177,6 +194,9 @@ export function encodeBlindedHopData(data: IBlindedHopData): Buffer {
 			])
 		});
 	}
+	if (data.allowedFeatures) {
+		records.push({ type: ERD_ALLOWED_FEATURES, value: data.allowedFeatures });
+	}
 	if (data.holdHtlc) {
 		if (data.holdRegistrationId && data.holdRegistrationId.length !== 32) {
 			throw new Error('hold registration id must be 32 bytes');
@@ -191,36 +211,73 @@ export function encodeBlindedHopData(data: IBlindedHopData): Buffer {
 }
 
 /**
- * Decode BOLT 4 encrypted_recipient_data. Unknown TLV records are ignored
- * (forward-compatible), as the TLV stream decoder tolerates odd unknown types.
+ * Decode BOLT 4 encrypted_recipient_data, applying the reader's MUSTs: an
+ * unknown even type, a hop naming both short_channel_id and next_node_id,
+ * any bit in allowed_features (none is defined for blinded hops yet), and a
+ * field of the wrong length all throw. Unknown odd types are skipped.
  */
 export function decodeBlindedHopData(buf: Buffer): IBlindedHopData {
 	const data: IBlindedHopData = {};
 	if (buf.length === 0) return data;
-	const { records } = decodeTlvStream(buf);
+	const { records } = decodeTlvStream(buf, 0, ERD_KNOWN_TYPES);
+	const fixedLength = (
+		r: { type: bigint; value: Buffer },
+		len: number
+	): void => {
+		if (r.value.length !== len) {
+			throw new Error(
+				`encrypted_recipient_data type ${r.type} must be ${len} bytes, got ${r.value.length}`
+			);
+		}
+	};
+	const boundedLength = (
+		r: { type: bigint; value: Buffer },
+		min: number,
+		max: number
+	): void => {
+		if (r.value.length < min || r.value.length > max) {
+			throw new Error(
+				`encrypted_recipient_data type ${r.type} has invalid length ${r.value.length}`
+			);
+		}
+	};
 
 	for (const r of records) {
 		if (r.type === ERD_PADDING) {
 			data.padding = Buffer.from(r.value);
 		} else if (r.type === ERD_SHORT_CHANNEL_ID) {
+			fixedLength(r, 8);
 			data.shortChannelId = Buffer.from(r.value);
 		} else if (r.type === ERD_NEXT_NODE_ID) {
+			fixedLength(r, 33);
 			data.nextNodeId = Buffer.from(r.value);
 		} else if (r.type === ERD_PATH_ID) {
 			data.pathId = Buffer.from(r.value);
 		} else if (r.type === ERD_NEXT_PATH_KEY_OVERRIDE) {
+			fixedLength(r, 33);
 			data.nextPathKeyOverride = Buffer.from(r.value);
 		} else if (r.type === ERD_PAYMENT_RELAY) {
+			// u16 + u32 + tu32
+			boundedLength(r, 6, 10);
 			data.paymentRelay = {
 				cltvExpiryDelta: r.value.readUInt16BE(0),
 				feeProportionalMillionths: r.value.readUInt32BE(2),
 				feeBaseMsat: Number(decodeTruncatedUint(r.value.subarray(6)))
 			};
 		} else if (r.type === ERD_PAYMENT_CONSTRAINTS) {
+			// u32 + tu64
+			boundedLength(r, 4, 12);
 			data.paymentConstraints = {
 				maxCltvExpiry: r.value.readUInt32BE(0),
 				htlcMinimumMsat: decodeTruncatedUint(r.value.subarray(4))
 			};
+		} else if (r.type === ERD_ALLOWED_FEATURES) {
+			if (r.value.some((b) => b !== 0)) {
+				throw new Error(
+					'encrypted_recipient_data allowed_features names an unknown feature'
+				);
+			}
+			data.allowedFeatures = Buffer.from(r.value);
 		} else if (r.type === ERD_HOLD_HTLC) {
 			data.holdHtlc = true;
 			if (r.value.length === 32) {
@@ -228,8 +285,28 @@ export function decodeBlindedHopData(buf: Buffer): IBlindedHopData {
 			}
 		}
 	}
+	if (data.shortChannelId && data.nextNodeId) {
+		throw new Error(
+			'encrypted_recipient_data names both short_channel_id and next_node_id'
+		);
+	}
 
 	return data;
+}
+
+/**
+ * True when a blinded path's payinfo sets an even feature bit. No feature is
+ * defined for blinded_payinfo yet, so every even bit is unknown, and BOLT 12
+ * forbids paying over such a path.
+ */
+export function payInfoRequiresUnknownFeature(info: {
+	features?: Buffer;
+}): boolean {
+	const features = info.features;
+	if (!features) return false;
+	// Feature bits are big-endian: bit 0 is the low bit of the last byte, so
+	// even bits are the 0x55 positions of every byte.
+	return features.some((b) => (b & 0x55) !== 0);
 }
 
 /**
@@ -299,12 +376,8 @@ export function constructBlindedPath(
 // These serializers are the single source of truth for putting blinded
 // paths on the wire. They are reused by BOLT 12 (offer/tlv.ts) and BOLT 11
 // (invoice blinded-paths tagged field) so the byte layout cannot drift
-// between the two surfaces.
-//
-// NOTE: the encrypted_recipient_data blobs themselves use beignet's compact
-// encodeBlindedHopData format (above), NOT the BOLT 4 TLV format, so this is
-// currently a beignet-to-beignet wire — full LND/CLN interop requires swapping
-// encodeBlindedHopData for real BOLT 4 TLVs (tracked as a follow-up).
+// between the two surfaces. The encrypted_recipient_data blobs inside are
+// BOLT 4 TLV streams (encodeBlindedHopData above).
 
 /** Pay parameters advertised for a blinded payment path (BOLT 4 §payinfo). */
 export interface IBlindedPayInfo {
@@ -622,6 +695,32 @@ export function advancePastOwnHops(
 		};
 	}
 	return current;
+}
+
+/** The two ends of a channel, node_1 before node_2 as BOLT 7 orders them. */
+export interface IChannelEnds {
+	nodeId1: Buffer;
+	nodeId2: Buffer;
+}
+
+/**
+ * A path whose first_node_id is a node id. The `sciddir` form (direction
+ * byte then short_channel_id) names node_1 of that channel for direction 0
+ * and node_2 for direction 1. Returns null when the lookup does not know the
+ * channel; a path that already starts at a pubkey comes back unchanged.
+ */
+export function resolveIntroductionNode(
+	path: IBlindedPath,
+	lookup: (scid: Buffer) => IChannelEnds | undefined
+): IBlindedPath | null {
+	const first = path.introductionNodeId;
+	if (first.length !== 9) return path;
+	const ends = lookup(first.subarray(1));
+	if (!ends) return null;
+	return {
+		...path,
+		introductionNodeId: first[0] === 0 ? ends.nodeId1 : ends.nodeId2
+	};
 }
 
 /**

@@ -721,41 +721,58 @@ export class OfferManager extends EventEmitter {
 				[{ pathId: replyPathId }]
 			);
 
-			// Send along the offer's first blinded path, or — for a pathless
+			// Send along one of the offer's blinded paths, or — for a pathless
 			// offer — along a 1-hop blinded path we build to the issuer: BOLT 4
 			// onion messages are ALWAYS blinded (every hop payload carries
 			// encrypted_data and the sphinx layer is addressed to blinded node
 			// ids), so a raw unblinded send is silently dropped by CLN/LND.
-			const offerPath =
-				offer.paths && offer.paths.length > 0 ? offer.paths[0] : undefined;
-			terminalNodeId =
-				offerPath?.blindedHops[offerPath.blindedHops.length - 1]?.blindedNodeId;
-			const sendPath =
-				offerPath ??
-				(offer.issuerId
-					? constructBlindedPath(randomBytes(32), [offer.issuerId], [{}])
-					: null);
-			if (sendPath) {
+			// The paths are tried in order: one whose introduction point we
+			// cannot resolve, decrypt past or connect to gives way to the next,
+			// and only the last path's error reaches the caller.
+			const candidates: IBlindedPath[] =
+				offer.paths && offer.paths.length > 0
+					? offer.paths
+					: offer.issuerId
+					? [constructBlindedPath(randomBytes(32), [offer.issuerId], [{}])]
+					: [];
+			for (let i = 0; i < candidates.length; i++) {
+				const sendPath = candidates[i];
+				const last = i === candidates.length - 1;
 				// The request is handed straight to the introduction node, or to
 				// the hop after us when we introduce the path ourselves (an
 				// unannounced issuer whose channel peer we are).
 				let firstHopPath: IBlindedPath;
 				try {
-					firstHopPath = advancePastOwnHops(sendPath, this.nodePrivkey);
+					firstHopPath = advancePastOwnHops(
+						this.onionMessageManager.resolveIntroduction(sendPath),
+						this.nodePrivkey
+					);
 				} catch (err) {
+					if (!last) continue;
 					throw new InvalidRequestError(
 						`Unusable offer path: ${(err as Error).message}`
 					);
 				}
-				if (this.connectFirstHop) {
-					await this.connectFirstHop(
-						firstHopPath.introductionNodeId,
-						this.invoiceRequestTimeoutMs
-					);
+				try {
+					if (this.connectFirstHop) {
+						await this.connectFirstHop(
+							firstHopPath.introductionNodeId,
+							Math.max(0, deadline - Date.now())
+						);
+					}
+					this.onionMessageManager.sendReply(firstHopPath, messageData, {
+						replyPath
+					});
+				} catch (err) {
+					if (!last) continue;
+					throw err;
 				}
-				this.onionMessageManager.sendReply(firstHopPath, messageData, {
-					replyPath
-				});
+				if (offer.paths && offer.paths.length > 0) {
+					terminalNodeId =
+						sendPath.blindedHops[sendPath.blindedHops.length - 1]
+							?.blindedNodeId;
+				}
+				break;
 			}
 		}
 
