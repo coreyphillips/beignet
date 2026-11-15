@@ -554,6 +554,122 @@ export async function classifyAnnouncedChannelFunding(
 }
 
 /**
+ * What became of a gossiped channel's funding output (issue #2048).
+ * 'spent' = the funding transaction sits at the SCID's position and a
+ * confirmed transaction spends that output through the announced 2-of-2,
+ * at `height`. 'unspent' = the output is still in the unspent set.
+ * 'unknown' = the answers settle neither (a fabricated SCID, an unconfirmed
+ * spend, an announcement without bitcoin keys). 'unavailable' = no answer.
+ * `lookups` counts the backend calls made, at most
+ * MAX_FUNDING_SPEND_LOOKUPS.
+ */
+export type AnnouncedFundingSpend =
+	| { verdict: 'spent'; height: number; lookups: number }
+	| { verdict: 'unspent' | 'unknown' | 'unavailable'; lookups: number };
+
+/**
+ * Transactions in the funding script's history fetched to find the spend.
+ * The script is the channel's own 2-of-2, so its history is normally the
+ * funding and the spend alone.
+ */
+const FUNDING_SPEND_CANDIDATES = 2;
+
+/** Backend calls one findAnnouncedChannelSpend makes at most. */
+export const MAX_FUNDING_SPEND_LOOKUPS = 3 + FUNDING_SPEND_CANDIDATES;
+
+/**
+ * Find whether and where a channel_announcement's funding output was spent.
+ * Never throws.
+ */
+export async function findAnnouncedChannelSpend(
+	backend: IChainBackend,
+	announcement: {
+		shortChannelId: Buffer;
+		bitcoinKey1: Buffer;
+		bitcoinKey2: Buffer;
+	}
+): Promise<AnnouncedFundingSpend> {
+	let lookups = 0;
+	const result = (
+		verdict: 'unspent' | 'unknown' | 'unavailable'
+	): AnnouncedFundingSpend => ({ verdict, lookups });
+	if (!backend.listUnspent || !backend.getTransactionMerkleProof) {
+		return result('unknown');
+	}
+	let scid: ReturnType<typeof decodeShortChannelId>;
+	let witnessScript: Buffer;
+	let scriptHash: string;
+	try {
+		scid = decodeShortChannelId(announcement.shortChannelId);
+		const funding = createFundingScript(
+			announcement.bitcoinKey1,
+			announcement.bitcoinKey2
+		);
+		witnessScript = funding.witnessScript;
+		scriptHash = computeScriptHash(funding.p2wshOutput);
+	} catch {
+		return result('unknown');
+	}
+	let unspent: Awaited<ReturnType<NonNullable<IChainBackend['listUnspent']>>>;
+	let history: Array<{ txid: string; height: number }>;
+	try {
+		lookups += 2;
+		[unspent, history] = await Promise.all([
+			backend.listUnspent(scriptHash),
+			backend.getScriptHashHistory(scriptHash)
+		]);
+	} catch {
+		return result('unavailable');
+	}
+	if (
+		unspent.some(
+			(u) => u.height === scid.block && u.outputIndex === scid.outputIndex
+		)
+	) {
+		return result('unspent');
+	}
+	const funding = history.find((h) => h.height === scid.block);
+	if (!funding) return result('unknown');
+	try {
+		lookups++;
+		const { txIndex } = await backend.getTransactionMerkleProof(
+			funding.txid,
+			funding.height
+		);
+		// Index 0 proves no position (see classifyAnnouncedChannelFunding).
+		if (txIndex === 0 || txIndex !== scid.txIndex) return result('unknown');
+	} catch {
+		return result('unavailable');
+	}
+	const candidates = history
+		.filter((h) => h.txid !== funding.txid && h.height >= scid.block)
+		.sort((a, b) => a.height - b.height)
+		.slice(0, FUNDING_SPEND_CANDIDATES);
+	for (const candidate of candidates) {
+		let tx: bitcoin.Transaction;
+		try {
+			lookups++;
+			tx = bitcoin.Transaction.fromBuffer(
+				await backend.getTransaction(candidate.txid)
+			);
+		} catch {
+			return result('unavailable');
+		}
+		const spends = tx.ins.some(
+			(input) =>
+				input.index === scid.outputIndex &&
+				Buffer.from(input.hash).reverse().toString('hex') === funding.txid &&
+				input.witness.length > 0 &&
+				Buffer.from(input.witness[input.witness.length - 1]).equals(
+					witnessScript
+				)
+		);
+		if (spends) return { verdict: 'spent', height: candidate.height, lookups };
+	}
+	return result('unknown');
+}
+
+/**
  * Watches the blockchain for funding confirmations, output spends,
  * and new blocks, bridging these events to the ChannelManager.
  *
