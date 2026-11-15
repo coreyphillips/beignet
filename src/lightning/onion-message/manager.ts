@@ -117,6 +117,20 @@ export class OnionMessageManager extends EventEmitter {
 		return resolved;
 	}
 
+	/**
+	 * The path as this node hands it on: the introduction point resolved and
+	 * any leading hops that are this node peeled (see advancePastOwnHops),
+	 * with a hop naming its next node by channel resolved to our peer on it.
+	 * Throws when either step cannot resolve the next node.
+	 */
+	resolveSendPath(path: IBlindedPath): IBlindedPath {
+		return advancePastOwnHops(
+			this.resolveIntroduction(path),
+			this.nodePrivkey,
+			(scid) => this.peerOnChannel(scid)
+		);
+	}
+
 	/** Our peer on the channel with this SCID, if we are one of its ends. */
 	private peerOnChannel(scid: Buffer): Buffer | undefined {
 		const ends = this.channelLookup?.(scid);
@@ -329,10 +343,7 @@ export class OnionMessageManager extends EventEmitter {
 		if (!send) {
 			throw new Error('Send function not configured');
 		}
-		const sendPath = advancePastOwnHops(
-			this.resolveIntroduction(path),
-			this.nodePrivkey
-		);
+		const sendPath = this.resolveSendPath(path);
 		const msg = constructReplyOnionMessage(
 			sendPath,
 			messageData,

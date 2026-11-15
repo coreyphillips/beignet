@@ -43,10 +43,7 @@ import { decodeNoChecksum, encodeNoChecksum } from './bech32-nochecksum';
 import type { ITlvRecord } from '../message/tlv';
 import type { IStorageBackend } from '../storage/types';
 import type { IBlindedPath, IBlindedPaymentPath } from '../onion/blinded-path';
-import {
-	advancePastOwnHops,
-	constructBlindedPath
-} from '../onion/blinded-path';
+import { constructBlindedPath } from '../onion/blinded-path';
 import type { OnionMessageManager } from '../onion-message/manager';
 import { InvalidRequestError } from '../node/types';
 import { getPublicKey } from '../crypto/ecdh';
@@ -743,10 +740,7 @@ export class OfferManager extends EventEmitter {
 				// unannounced issuer whose channel peer we are).
 				let firstHopPath: IBlindedPath;
 				try {
-					firstHopPath = advancePastOwnHops(
-						this.onionMessageManager.resolveIntroduction(sendPath),
-						this.nodePrivkey
-					);
+					firstHopPath = this.onionMessageManager.resolveSendPath(sendPath);
 				} catch (err) {
 					if (!last) continue;
 					throw new InvalidRequestError(

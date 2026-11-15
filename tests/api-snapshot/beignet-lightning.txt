@@ -6369,7 +6369,7 @@ const onion.ROUTING_INFO_LENGTH = 1300
 const onion.TEMPORARY_CHANNEL_FAILURE: number
 const onion.TEMPORARY_NODE_FAILURE: number
 const onion.UNKNOWN_NEXT_PEER: number
-function onion.advancePastOwnHops(path: onion.IBlindedPath, nodePrivkey: Buffer): onion.IBlindedPath
+function onion.advancePastOwnHops(path: onion.IBlindedPath, nodePrivkey: Buffer, resolveScid?: (scid: Buffer) => Buffer | undefined): onion.IBlindedPath
 function onion.computeBlindedNodeId(nodePubkey: Buffer, sharedSecret: Buffer): Buffer
 function onion.computeBlindingFactor(ephemeralKey: Buffer, sharedSecret: Buffer): Buffer
 function onion.computeSharedSecrets(sessionKey: Buffer, hops: Buffer[]): { sharedSecrets: Buffer[]; ephemeralKeys: Buffer[]; }
@@ -6453,6 +6453,7 @@ method onionMessage.OnionMessageManager.getRateLimitConfig(): onionMessage.IRate
 method onionMessage.OnionMessageManager.handleMessage(fromPeer: string, payload: Buffer): void
 method onionMessage.OnionMessageManager.registerTlvHandler(tlvType: number, handler: TlvHandler): void
 method onionMessage.OnionMessageManager.resolveIntroduction(path: onion.IBlindedPath): onion.IBlindedPath
+method onionMessage.OnionMessageManager.resolveSendPath(path: onion.IBlindedPath): onion.IBlindedPath
 method onionMessage.OnionMessageManager.sendMultiHopOnionMessage(intermediateNodes: Buffer[], destination: Buffer, messageData: Map<number, Buffer>, options?: onionMessage.ISendOnionMessageOptions): void
 method onionMessage.OnionMessageManager.sendOnionMessage(destination: Buffer, messageData: Map<number, Buffer>, options?: onionMessage.ISendOnionMessageOptions): void
 method onionMessage.OnionMessageManager.sendReply(replyPath: onion.IBlindedPath, messageData: Map<number, Buffer>, options?: onionMessage.ISendOnionMessageOptions): void
