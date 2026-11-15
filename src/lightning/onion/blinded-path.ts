@@ -659,15 +659,17 @@ export function processBlindedHop(
  * A blinded onion-message path as seen from its sender, past any leading hops
  * that are the sender itself. A sender cannot hand a message to itself over
  * the wire, so each such hop is processed here the way it would be on
- * receipt: decrypt its encrypted_data, take next_node_id as the new
- * introduction node and advance the path key. This is the case of an offer
- * from an unannounced node whose path this node introduces. A path that ends
- * at the sender comes back as the one-hop path to it. Throws when one of our
- * own hops cannot be decrypted or names no next node.
+ * receipt: decrypt its encrypted_data, take next_node_id (or the peer that
+ * short_channel_id names, through `resolveScid`) as the new introduction
+ * node and advance the path key. This is the case of an offer from an
+ * unannounced node whose path this node introduces. A path that ends at the
+ * sender comes back as the one-hop path to it. Throws when one of our own
+ * hops cannot be decrypted or names no next node we can resolve.
  */
 export function advancePastOwnHops(
 	path: IBlindedPath,
-	nodePrivkey: Buffer
+	nodePrivkey: Buffer,
+	resolveScid?: (scid: Buffer) => Buffer | undefined
 ): IBlindedPath {
 	const ownId = getPublicKey(nodePrivkey);
 	let current = path;
@@ -685,11 +687,21 @@ export function advancePastOwnHops(
 		} catch {
 			throw new Error('Cannot decrypt our own hop of the blinded path');
 		}
-		if (!hop.hopData.nextNodeId) {
+		const { nextNodeId, shortChannelId } = hop.hopData;
+		let next = nextNodeId;
+		if (!next && shortChannelId) {
+			next = resolveScid?.(shortChannelId);
+			if (!next) {
+				throw new Error(
+					'Our own hop of the blinded path names a channel this node is not on'
+				);
+			}
+		}
+		if (!next) {
 			throw new Error('Our own hop of the blinded path names no next node');
 		}
 		current = {
-			introductionNodeId: hop.hopData.nextNodeId,
+			introductionNodeId: next,
 			blindingPoint: hop.nextBlindingKey,
 			blindedHops: current.blindedHops.slice(1)
 		};
