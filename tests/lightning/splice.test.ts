@@ -5099,6 +5099,249 @@ describe('Splice', function () {
 				});
 			});
 
+			describe('peer tx_signatures before its splice commitment_signed (issue #2079)', function () {
+				const EARLY =
+					'tx_signatures before the splice commitment_signed exchange';
+
+				/** A splice-out whose ACCEPTOR commitment_signed is lost on the
+				 *  wire. The opener's leaves first (at its final tx_complete), so
+				 *  the second one dropped is the acceptor's. The acceptor signs
+				 *  first and still sends its tx_signatures; they are returned. */
+				function spliceOutWithoutAcceptorCommitment(pair: IWirePair): Buffer {
+					const txSigs: Buffer[] = [];
+					pair.intercept(MessageType.TX_SIGNATURES, (payload) => {
+						txSigs.push(payload);
+						return payload;
+					});
+					pair.drop(MessageType.COMMITMENT_SIGNED, 1, 1);
+					startSpliceOut(pair);
+					pair.clearIntercepts();
+					// eslint-disable-next-line @typescript-eslint/no-explicit-any
+					expect((pair.opener as any)._spliceReceivedCommitment).to.equal(
+						false
+					);
+					// eslint-disable-next-line @typescript-eslint/no-explicit-any
+					expect((pair.acceptor as any)._spliceReceivedCommitment).to.equal(
+						true
+					);
+					expect(
+						pair.acceptor.getFullState().spliceInFlight!.sentTxSignatures,
+						'the acceptor signed first'
+					).to.equal(true);
+					expect(txSigs.length, 'only the acceptor tx_signatures').to.equal(1);
+					return txSigs[0];
+				}
+
+				function expectOpenerUnsigned(opener: Channel): void {
+					const record = opener.getFullState().spliceInFlight!;
+					expect(record.remoteCommitmentSig).to.equal(null);
+					expect(record.receivedTxSignatures).to.equal(false);
+					expect(record.fullySigned).to.equal(false);
+					expect(record.sentTxSignatures).to.equal(false);
+					expect(opener.getSpliceSession()!.getState()).to.equal(
+						SpliceState.AWAITING_TX_SIGNATURES
+					);
+				}
+
+				it('refuses them, broadcasts nothing and withholds ours', function () {
+					const pair = makeWirePair();
+					const txSigs = spliceOutWithoutAcceptorCommitment(pair);
+
+					expect(pair.broadcasts, 'nothing broadcast').to.deep.equal([]);
+					expect(
+						pair.watches.filter((w) => w.from === pair.opener),
+						'the opener watches no splice outpoint'
+					).to.deep.equal([]);
+					expectOpenerUnsigned(pair.opener);
+					expect(pair.errors).to.deep.equal([EARLY]);
+					expect(
+						pair.acceptor.getFullState().spliceInFlight!.receivedTxSignatures,
+						'our tx_signatures never left'
+					).to.equal(false);
+
+					// The refusal changes nothing, so a repeat gets the same answer:
+					// a warning and a disconnect, which makes the reestablish ask
+					// the peer for its commitment_signed again.
+					const actions = pair.opener.handleTxSignatures(
+						decodeTxSignaturesMessage(txSigs)
+					);
+					expect(actions.map((a) => a.type)).to.deep.equal([
+						ChannelActionType.SEND_MESSAGE,
+						ChannelActionType.ERROR,
+						ChannelActionType.DISCONNECT_PEER
+					]);
+					expect(findSendAction(actions, MessageType.WARNING)).to.exist;
+					expectOpenerUnsigned(pair.opener);
+					expect(pair.opener.getState()).to.equal(ChannelState.SPLICING);
+				});
+
+				it('completes once a reconnect delivers the commitment_signed first', function () {
+					const pair = makeWirePair();
+					spliceOutWithoutAcceptorCommitment(pair);
+
+					disconnect(pair);
+					const { openerMsg } = reconnect(pair);
+					expect(
+						openerMsg.nextFundingRetransmitFlags,
+						'the opener asks for the commitment_signed'
+					).to.equal(1);
+
+					expect(pair.errors).to.deep.equal([EARLY]);
+					const record = pair.opener.getFullState().spliceInFlight!;
+					expect(record.remoteCommitmentSig).to.not.equal(null);
+					expect(record.receivedTxSignatures).to.equal(true);
+					expect(record.fullySigned).to.equal(true);
+					expect(
+						pair.acceptor.getFullState().spliceInFlight!.fullySigned
+					).to.equal(true);
+					expect(
+						pair.broadcasts.map((tx) =>
+							Buffer.from(
+								bitcoin.Transaction.fromBuffer(tx).getHash()
+							).toString('hex')
+						),
+						'both sides broadcast the negotiated splice'
+					).to.deep.equal([
+						record.spliceTxid.toString('hex'),
+						record.spliceTxid.toString('hex')
+					]);
+				});
+
+				it('still refuses them after a restart, then completes on reconnect', function () {
+					const pair = makeWirePair();
+					const txSigs = spliceOutWithoutAcceptorCommitment(pair);
+
+					// The record was written as the opener's commitment_signed left,
+					// before the acceptor's could arrive.
+					const restored = new Channel(
+						deserializeChannelState(
+							JSON.parse(
+								JSON.stringify(
+									serializeChannelState(pair.opener.getFullState())
+								)
+							)
+						)
+					);
+					restored.setSigner(
+						new ChannelSigner(
+							crypto
+								.createHash('sha256')
+								.update(openerSeed)
+								.update(Buffer.from([0]))
+								.digest()
+						)
+					);
+					restored.restoreSpliceInFlight();
+					// eslint-disable-next-line @typescript-eslint/no-explicit-any
+					expect((restored as any)._spliceReceivedCommitment).to.equal(false);
+
+					const actions = restored.handleTxSignatures(
+						decodeTxSignaturesMessage(txSigs)
+					);
+					expect(findAction(actions, ChannelActionType.BROADCAST_TX)).to.not
+						.exist;
+					expect(findAction(actions, ChannelActionType.DISCONNECT_PEER)).to
+						.exist;
+					expectOpenerUnsigned(restored);
+
+					restored.markForReestablish();
+					pair.acceptor.markForReestablish();
+					pair.clearDrops();
+					const rRe = decodeChannelReestablishMessage(
+						findSendAction(
+							restored.createReestablish(),
+							MessageType.CHANNEL_REESTABLISH
+						).payload
+					);
+					const aRe = decodeChannelReestablishMessage(
+						findSendAction(
+							pair.acceptor.createReestablish(),
+							MessageType.CHANNEL_REESTABLISH
+						).payload
+					);
+					expect(rRe.nextFundingRetransmitFlags).to.equal(1);
+					pair.enqueue(
+						pair.acceptor,
+						restored,
+						restored.handleReestablish(aRe)
+					);
+					pair.enqueue(
+						restored,
+						pair.acceptor,
+						pair.acceptor.handleReestablish(rRe)
+					);
+					pair.pump();
+
+					expect(pair.errors, 'only the live refusal').to.deep.equal([EARLY]);
+					const record = restored.getFullState().spliceInFlight!;
+					expect(record.remoteCommitmentSig).to.not.equal(null);
+					expect(record.fullySigned).to.equal(true);
+					expect(
+						pair.acceptor.getFullState().spliceInFlight!.fullySigned
+					).to.equal(true);
+					expect(pair.broadcasts.length).to.equal(2);
+				});
+
+				it('a manager publishes nothing and asks for a disconnect', function () {
+					const pair = createNormalChannelPair();
+					// The acceptor's splice commitment_signed never reaches the
+					// opener; everything else is routed.
+					pair.acceptorManager.removeAllListeners('message:outbound');
+					pair.acceptorManager.on(
+						'message:outbound',
+						(peerPubkey: string, type: number, payload: Buffer) => {
+							if (peerPubkey !== pair.openerPubkey) return;
+							if (
+								type === MessageType.COMMITMENT_SIGNED &&
+								pair.acceptorChannel.getState() === ChannelState.SPLICING
+							) {
+								return;
+							}
+							pair.openerManager.handleMessage(
+								pair.acceptorPubkey,
+								type,
+								payload
+							);
+						}
+					);
+					const broadcasts: Buffer[] = [];
+					pair.openerManager.on('broadcast:tx', (tx: Buffer) =>
+						broadcasts.push(tx)
+					);
+					const disconnects: string[] = [];
+					pair.openerManager.on(
+						'peer:disconnect-needed',
+						(peer: string, reason: string) => {
+							expect(peer).to.equal(pair.acceptorPubkey);
+							disconnects.push(reason);
+						}
+					);
+
+					pair.openerManager.initiateQuiescence(pair.channelId);
+					const destScript = Buffer.concat([
+						Buffer.from([0x00, 0x14]),
+						crypto.randomBytes(20)
+					]);
+					pair.openerChannel.setSpliceOutDestination(destScript, 50_000n);
+					expect(
+						pair.openerManager.initiateSplice(
+							pair.channelId,
+							-(50_000n + SPLICE_OUT_TEST_FEE),
+							253
+						).ok
+					).to.equal(true);
+
+					expect(
+						pair.acceptorChannel.getFullState().spliceInFlight!
+							.sentTxSignatures,
+						'the acceptor sent its tx_signatures'
+					).to.equal(true);
+					expect(broadcasts).to.deep.equal([]);
+					expect(disconnects).to.deep.equal([EARLY]);
+					expectOpenerUnsigned(pair.openerChannel);
+				});
+			});
+
 			describe('durable splice abort unwind (issue #356)', function () {
 				/** Drive the opener into the exposure window: the in-flight record
 				 *  was persisted at the commitment round, but no tx_signatures have

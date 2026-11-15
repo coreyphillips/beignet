@@ -695,6 +695,8 @@ describe('Zero-conf splice semantics (BOLT 2)', function () {
 			confirmed: false,
 			...overrides
 		};
+		ch._spliceSentCommitment = true;
+		ch._spliceReceivedCommitment = true;
 		ch._spliceSession = {
 			getState: () => SpliceState.AWAITING_TX_SIGNATURES,
 			isComplete: () => false,
