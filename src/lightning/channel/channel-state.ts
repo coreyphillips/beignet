@@ -572,7 +572,9 @@ export interface IChannelState {
 	 * covered by our last sent commitment_signed and are dropped when the
 	 * peer's revoke_and_ack arrives; later entries belong to the next round
 	 * and remain queued. A retransmitted commitment_signed goes out behind
-	 * the entries it covers and ahead of the later ones (issue #1300).
+	 * the entries it covers and ahead of the later ones (issue #1300). A peer
+	 * that already holds that signature holds the entries it covers, so those
+	 * are not retransmitted to it, except a fulfil (issue 295).
 	 */
 	pendingLocalUpdates: Array<{ type: number; payload: Buffer }>;
 	/** How many pendingLocalUpdates our last sent commitment_signed covers. */

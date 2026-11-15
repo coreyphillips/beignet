@@ -15,7 +15,11 @@
  *  (a) add, commitment_signed, add: all lost;
  *  (b) the peer received the first add but not the signature or the second;
  *  (c) the peer received the add and the signature, its revoke_and_ack was
- *      lost, the second add was lost (no signature retransmission: pinned);
+ *      lost, the second add was lost (no signature retransmission: only the
+ *      later add is replayed, since the peer holds the covered one);
+ *  (c2) the same for a fail the peer received with our signature, which
+ *      LND rejects as "invalid update" if replayed; a fulfil is still
+ *      replayed, on purpose, for issue 295;
  *  (d) the update queued after the signature is a fulfil or a fail;
  *  (e) update_fee beside the signature, on either side of it;
  *  (f) crossing traffic, including both orders of our own revoke_and_ack
@@ -26,11 +30,19 @@
  *  the same boundary for a start_batch commitment batch while a splice
  *  awaits its lock, for option_taproot, and for an FFOR drain held back
  *  under section 7.5.5 (the held set keeps its order);
- *  plus the cases with NO signature to retransmit, which must stay as they
- *  were: every queued update goes out ahead of a fresh signature.
+ *  plus the cases with NO signature to retransmit: every queued update the
+ *  peer does not already hold goes out ahead of a fresh signature.
  *
  * The boundary is pendingLocalUpdatesSignedCount, which signCommitment has
  * always written and the channel row has always carried beside the queue.
+ *
+ * Every reconnect also checks each update it sends against what the peer
+ * already holds, the way LND does: an add must carry the next id, and a
+ * fulfil or fail must name an HTLC that is not already removed. Beignet's
+ * own receiver ignores such a replay, so without this check the loopback
+ * cannot see a replay that force-closes a channel with an LND peer. A
+ * covered fulfil is still replayed on purpose (issue 295), so it is kept
+ * apart from the other duplicates and pinned in (c2).
  */
 
 import { expect } from 'chai';
@@ -45,6 +57,7 @@ import { Channel } from '../../src/lightning/channel/channel';
 import {
 	ChannelState,
 	DEFAULT_CHANNEL_CONFIG,
+	HtlcState,
 	isTaprootChannel
 } from '../../src/lightning/channel/types';
 import { ChannelActionType } from '../../src/lightning/channel/channel-actions';
@@ -126,6 +139,12 @@ interface IWire {
 	restartB: () => void;
 	/** What each side queued in answer to the peer's channel_reestablish. */
 	replay: Record<Side, string[]>;
+	/** Updates any reconnect sent that the peer already held: LND fails the
+	 *  link with "invalid update" on each, and the sender force-closes. */
+	duplicates: string[];
+	/** The same for update_fulfill_htlc, which is still replayed on purpose
+	 *  so a restarted beignet forwarder can learn its preimage (issue 295). */
+	fulfilDuplicates: string[];
 	/** Every message delivered since the last reconnect, in order. */
 	delivered: string[];
 }
@@ -154,8 +173,39 @@ function makePair(tag: string, taproot = false): IPair {
 	const fulfilled: Record<Side, Buffer[]> = { A: [], B: [] };
 	const failed: Record<Side, bigint[]> = { A: [], B: [] };
 	const replay: Record<Side, string[]> = { A: [], B: [] };
+	const duplicates: string[] = [];
+	const fulfilDuplicates: string[] = [];
 	const delivered: string[] = [];
 	const sideOf = (pub: string): Side => (pub === aPub ? 'A' : 'B');
+
+	// LND's receive checks: ReceiveHTLC wants the next add id, and
+	// ReceiveHTLCSettle / ReceiveFailHTLC want an HTLC that exists and is not
+	// already removed. Every update message carries its id after the 32-byte
+	// channel_id.
+	const peerAlreadyHolds = (m: IQueued): boolean => {
+		if (
+			m.type !== MessageType.UPDATE_ADD_HTLC &&
+			m.type !== MessageType.UPDATE_FULFILL_HTLC &&
+			m.type !== MessageType.UPDATE_FAIL_HTLC &&
+			m.type !== MessageType.UPDATE_FAIL_MALFORMED_HTLC
+		) {
+			return false;
+		}
+		const id = m.p.readBigUInt64BE(32);
+		const htlcs = managers
+			.get(m.to)!
+			.getChannelsByPeer(m.from)[0]
+			.getFullState().htlcs;
+		if (m.type === MessageType.UPDATE_ADD_HTLC) {
+			return htlcs.has(`received-${id}`);
+		}
+		const entry = htlcs.get(`offered-${id}`);
+		return (
+			entry === undefined ||
+			entry.state === HtlcState.FULFILLED ||
+			entry.state === HtlcState.FAILED
+		);
+	};
 
 	let alive = true;
 	let cutType: MessageType | null = null;
@@ -274,6 +324,8 @@ function makePair(tag: string, taproot = false): IPair {
 			dropFilter = filter;
 		},
 		replay,
+		duplicates,
+		fulfilDuplicates,
 		delivered,
 		reconnect: (opts): void => {
 			// Both sides observe the disconnect, then exchange reestablish with
@@ -306,6 +358,15 @@ function makePair(tag: string, taproot = false): IPair {
 			replay.B = queue
 				.filter((m) => m.from === bPub)
 				.map((m) => MessageType[m.type]);
+			for (const m of queue) {
+				if (peerAlreadyHolds(m)) {
+					const seen =
+						m.type === MessageType.UPDATE_FULFILL_HTLC
+							? fulfilDuplicates
+							: duplicates;
+					seen.push(`${sideOf(m.from)}:${MessageType[m.type]}`);
+				}
+			}
 			if (opts?.reorder) {
 				const fromB = opts.reorder(
 					'B',
@@ -472,6 +533,10 @@ function queueOf(c: Channel): { types: string[]; signed: number } {
  */
 function expectLevel(t: IPair): void {
 	expect(t.errors, t.errors.join('; ')).to.have.length(0);
+	expect(
+		t.wire.duplicates,
+		'updates replayed to a peer that already held them'
+	).to.deep.equal([]);
 	const a = t.aChannel();
 	const b = t.bChannel();
 	expect(a.getState(), 'A state').to.equal(ChannelState.NORMAL);
@@ -668,15 +733,126 @@ describe('reestablish: replay order around a retransmitted commitment_signed (is
 
 			t.wire.reconnect();
 			expect(t.errors, t.errors.join('; ')).to.have.length(0);
-			// Unchanged behaviour: with no signature to retransmit the whole
-			// queue is replayed (the peer ignores the add it committed).
-			expect(t.wire.replay.A).to.deep.equal([ADD, ADD]);
+			// The peer holds the signature, so it holds the add the signature
+			// covers: only the later add goes out. Replaying the covered add
+			// too is a duplicate id, which LND rejects as "invalid update".
+			expect(t.wire.replay.A).to.deep.equal([ADD]);
 			expect(t.wire.replay.B).to.deep.equal([RAA, SIG]);
 			expectLevel(t);
 			settle(t, 'B', first);
 			settle(t, 'B', second);
 			expectLevel(t);
 			expect(t.fulfilled.A).to.have.length(2);
+			expectStillUsable(t);
+		});
+	});
+
+	describe('(c2) the peer received our fail or fulfil and the signature; its revoke_and_ack was lost', function () {
+		// A offers two HTLCs to B and both are committed. B then removes
+		// one: update_fail_htlc or update_fulfill_htlc, then commitment_signed.
+		// A gets both and revokes, but the connection dies before B reads
+		// A's revoke_and_ack, so the removal is still in B's queue when they
+		// reconnect, and A's channel_reestablish says it holds B's signature.
+		const removedThenRaaLost = (
+			tag: string
+		): { t: IPair; h1: IPayment; h2: IPayment } => {
+			const t = makeFundedPair(tag);
+			const h1 = offer(t, 'A', 4_000_000n);
+			const h2 = offer(t, 'A', 5_000_000n);
+			expectLevel(t);
+			t.wire.cutBefore(MessageType.REVOKE_AND_ACK);
+			return { t, h1, h2 };
+		};
+
+		it('a fail the peer holds is not replayed', function () {
+			const { t, h1, h2 } = removedThenRaaLost('c2-fail');
+			t.B().failHtlc(t.channelId, receivedId(t, 'B', h1), Buffer.from('no'));
+			expect(queueOf(t.bChannel())).to.deep.equal({
+				types: [FAIL],
+				signed: 1
+			});
+			expect(t.failed.A).to.have.length(1);
+
+			t.wire.reconnect();
+			expect(t.errors, t.errors.join('; ')).to.have.length(0);
+			expect(t.wire.replay.B).to.deep.equal([]);
+			expect(t.wire.replay.A).to.deep.equal([RAA, SIG]);
+			expectLevel(t);
+			expect(t.failed.A).to.have.length(1);
+			settle(t, 'B', h2);
+			expectLevel(t);
+			expect(t.bChannel().getBalances().localMsat).to.equal(
+				B_FLOAT_MSAT + 5_000_000n
+			);
+			expectStillUsable(t);
+		});
+
+		it('a fulfil the peer holds is still replayed (issue 295)', function () {
+			const { t, h1, h2 } = removedThenRaaLost('c2-fulfil');
+			settle(t, 'B', h1);
+			expect(queueOf(t.bChannel())).to.deep.equal({
+				types: [FULFILL],
+				signed: 1
+			});
+
+			t.wire.reconnect();
+			expect(t.errors, t.errors.join('; ')).to.have.length(0);
+			// Kept on purpose: it is how a restarted beignet forwarder that
+			// never persisted the preimage learns it. LND rejects this replay
+			// as "invalid update", so this pins the one remaining exception
+			// until the forwarder persists the preimage with the channel state.
+			expect(t.wire.replay.B).to.deep.equal([FULFILL]);
+			expect(t.wire.fulfilDuplicates).to.deep.equal([`B:${FULFILL}`]);
+			expect(t.wire.replay.A).to.deep.equal([RAA, SIG]);
+			expectLevel(t);
+			settle(t, 'B', h2);
+			expectLevel(t);
+			// h1 twice (the replay re-emits it, issue 295), then h2.
+			expect(t.fulfilled.A).to.have.length(3);
+			expect(t.fulfilled.A[0]).to.deep.equal(h1.preimage);
+			expect(t.fulfilled.A[1]).to.deep.equal(h1.preimage);
+			expect(t.bChannel().getBalances().localMsat).to.equal(
+				B_FLOAT_MSAT + 9_000_000n
+			);
+			expectStillUsable(t);
+		});
+
+		it('a fulfil queued after the signature is still replayed, alone', function () {
+			const { t, h1, h2 } = removedThenRaaLost('c2-fail-then-fulfil');
+			t.B().failHtlc(t.channelId, receivedId(t, 'B', h1), Buffer.from('no'));
+			settle(t, 'B', h2);
+			expect(queueOf(t.bChannel())).to.deep.equal({
+				types: [FAIL, FULFILL],
+				signed: 1
+			});
+
+			t.wire.reconnect();
+			expect(t.errors, t.errors.join('; ')).to.have.length(0);
+			expect(t.wire.replay.B).to.deep.equal([FULFILL]);
+			expectLevel(t);
+			expect(t.failed.A).to.have.length(1);
+			expect(t.fulfilled.A).to.have.length(1);
+			expect(t.bChannel().getBalances().localMsat).to.equal(
+				B_FLOAT_MSAT + 5_000_000n
+			);
+			expectStillUsable(t);
+		});
+
+		it('the same after the failing side restarts', function () {
+			const { t, h1, h2 } = removedThenRaaLost('c2-fail-restart');
+			t.B().failHtlc(t.channelId, receivedId(t, 'B', h1), Buffer.from('no'));
+			t.wire.restartB();
+			expect(queueOf(t.bChannel())).to.deep.equal({
+				types: [FAIL],
+				signed: 1
+			});
+
+			t.wire.reconnect();
+			expect(t.errors, t.errors.join('; ')).to.have.length(0);
+			expect(t.wire.replay.B).to.deep.equal([]);
+			expectLevel(t);
+			settle(t, 'B', h2);
+			expectLevel(t);
 			expectStillUsable(t);
 		});
 	});
@@ -1138,11 +1314,12 @@ describe('reestablish: replay order around a retransmitted commitment_signed (is
 				signed: 1
 			});
 
-			// The peer holds the signature now: none is retransmitted, and its
-			// revoke_and_ack releases our next signature for the later add.
+			// The peer holds the signature now, and with it the covered add:
+			// only the later add is replayed, and the peer's revoke_and_ack
+			// releases our next signature for it.
 			t.wire.reconnect();
 			expect(t.errors, t.errors.join('; ')).to.have.length(0);
-			expect(t.wire.replay.A).to.deep.equal([ADD, ADD]);
+			expect(t.wire.replay.A).to.deep.equal([ADD]);
 			expect(t.wire.replay.B).to.deep.equal([RAA, SIG]);
 			expectLevel(t);
 			settle(t, 'B', first);
@@ -1282,17 +1459,17 @@ describe('reestablish: replay order around a retransmitted commitment_signed (is
 			lockAndCheck(t);
 		});
 
-		it('no batch to retransmit: the whole queue goes out, as before', function () {
+		it('no batch to retransmit: only the add sent after the batch goes out', function () {
 			const t = makePendingLockPair('batch-none');
 			// The batch arrives; the peer's revoke_and_ack and our later add
-			// are lost.
+			// are lost. The peer holds the batch and the add it covers.
 			t.wire.cutBefore(MessageType.REVOKE_AND_ACK, true);
 			const first = offer(t, 'A', 1_000_000n);
 			const second = offer(t, 'A', 2_000_000n);
 
 			t.wire.reconnect();
 			expect(t.errors, t.errors.join('; ')).to.have.length(0);
-			expect(commitmentTraffic(t.wire.replay.A)).to.deep.equal([ADD, ADD]);
+			expect(commitmentTraffic(t.wire.replay.A)).to.deep.equal([ADD]);
 			settle(t, 'B', first);
 			settle(t, 'B', second);
 			expect(t.errors, t.errors.join('; ')).to.have.length(0);
