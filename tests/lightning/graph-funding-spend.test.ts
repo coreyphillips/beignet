@@ -120,6 +120,7 @@ class FakeChain {
 	private history = new Map<string, Array<{ txid: string; height: number }>>();
 	private txs = new Map<string, Buffer>();
 	private positions = new Map<string, number>();
+	private fundings = new Map<string, string>();
 	lookups = 0;
 
 	fund(ann: IChannelAnnouncementMessage): { txid: string } {
@@ -132,8 +133,14 @@ class FakeChain {
 		const scriptHash = computeScriptHash(script.p2wshOutput);
 		this.positions.set(txid, scid.txIndex);
 		this.txs.set(txid, tx.toBuffer());
-		this.history.set(scriptHash, [{ txid, height: scid.block }]);
+		this.fundings.set(ann.shortChannelId.toString('hex'), txid);
+		// Channels opened without a channelKeyDeriver share one script.
+		this.history.set(scriptHash, [
+			...(this.history.get(scriptHash) ?? []),
+			{ txid, height: scid.block }
+		]);
 		this.unspent.set(scriptHash, [
+			...(this.unspent.get(scriptHash) ?? []),
 			{ txid, outputIndex: 0, valueSat: 100_000, height: scid.block }
 		]);
 		return { txid };
@@ -147,7 +154,7 @@ class FakeChain {
 	): void {
 		const script = createFundingScript(ann.bitcoinKey1, ann.bitcoinKey2);
 		const scriptHash = computeScriptHash(script.p2wshOutput);
-		const funding = this.history.get(scriptHash)![0];
+		const fundingTxid = this.fundings.get(ann.shortChannelId.toString('hex'))!;
 		const tx = new bitcoin.Transaction();
 		if (opts.unrelated) {
 			tx.addInput(crypto.randomBytes(32), 0);
@@ -156,7 +163,7 @@ class FakeChain {
 				.get(scriptHash)!
 				.push({ txid: tx.getId(), outputIndex: 0, valueSat: 1_000, height });
 		} else {
-			tx.addInput(Buffer.from(funding.txid, 'hex').reverse(), 0);
+			tx.addInput(Buffer.from(fundingTxid, 'hex').reverse(), 0);
 			tx.setWitness(0, [
 				Buffer.alloc(0),
 				Buffer.alloc(71, 1),
@@ -169,7 +176,7 @@ class FakeChain {
 			);
 			this.unspent.set(
 				scriptHash,
-				this.unspent.get(scriptHash)!.filter((u) => u.txid !== funding.txid)
+				this.unspent.get(scriptHash)!.filter((u) => u.txid !== fundingTxid)
 			);
 		}
 		this.txs.set(tx.getId(), tx.toBuffer());
@@ -350,15 +357,14 @@ describe('findAnnouncedChannelSpend (issue #2048)', () => {
 		const chain = new FakeChain();
 		chain.fund(ann);
 		const backend = chain.backend();
-		expect((await findAnnouncedChannelSpend(backend, ann)).verdict).to.equal(
-			'unspent'
-		);
+		const open = await findAnnouncedChannelSpend(backend, ann);
+		expect(open.verdict).to.equal('unspent');
 
 		chain.spend(ann, 990);
 		const spend = await findAnnouncedChannelSpend(backend, ann);
 		expect(spend).to.deep.include({ verdict: 'spent', height: 990 });
 		expect(spend.lookups).to.be.at.most(MAX_FUNDING_SPEND_LOOKUPS);
-		expect(chain.lookups).to.equal(2 + spend.lookups);
+		expect(chain.lookups).to.equal(open.lookups + spend.lookups);
 	});
 
 	it('a payment to the script that spends nothing proves no spend', async () => {
@@ -380,6 +386,51 @@ describe('findAnnouncedChannelSpend (issue #2048)', () => {
 		const spend = await findAnnouncedChannelSpend(chain.backend(), ann);
 		expect(spend).to.deep.include({ verdict: 'spent', height: 990 });
 		expect(spend.lookups).to.be.at.most(MAX_FUNDING_SPEND_LOOKUPS);
+	});
+
+	/** Another channel on the funding script `ann` uses. */
+	const sharing = (scid: Buffer): IChannelAnnouncementMessage => ({
+		...announcement(scid, pubkey('b'), pubkey('c')),
+		bitcoinKey1: ann.bitcoinKey1,
+		bitcoinKey2: ann.bitcoinKey2
+	});
+
+	it('a close behind another channel on the same script is found by a later check', async () => {
+		const chain = new FakeChain();
+		chain.fund(ann);
+		const other = sharing(scidAt(600));
+		chain.fund(other);
+		chain.spend(other, 650);
+		chain.spend(ann, 990);
+		const backend = chain.backend();
+		const first = await findAnnouncedChannelSpend(backend, ann);
+		expect(first.verdict).to.equal('unknown');
+		expect(first.lookups).to.be.at.most(MAX_FUNDING_SPEND_LOOKUPS);
+		const next = await findAnnouncedChannelSpend(backend, ann, 1);
+		expect(next).to.deep.include({ verdict: 'spent', height: 990 });
+		expect(next.lookups).to.be.at.most(MAX_FUNDING_SPEND_LOOKUPS);
+	});
+
+	it('two channels on one script in one block are told apart by position', async () => {
+		const chain = new FakeChain();
+		const second = sharing(scidAt(500, 2));
+		chain.fund(ann);
+		chain.fund(second);
+		chain.spend(second, 990);
+		const backend = chain.backend();
+		expect(await findAnnouncedChannelSpend(backend, second)).to.deep.include({
+			verdict: 'spent',
+			height: 990
+		});
+		expect((await findAnnouncedChannelSpend(backend, ann)).verdict).to.equal(
+			'unspent'
+		);
+
+		chain.spend(ann, 995);
+		expect(await findAnnouncedChannelSpend(backend, second)).to.deep.include({
+			verdict: 'spent',
+			height: 990
+		});
 	});
 
 	it('settles nothing for a fabricated SCID or a down backend', async () => {
@@ -572,6 +623,100 @@ describe('Spend checks from payments (issue #2048)', () => {
 		// BOLT 7: forgotten 72 blocks after the spend.
 		alice.handleNewBlock(990 + SPENT_CHANNEL_FORGET_DEPTH);
 		expect(graph.getChannel(x.shortChannelId)).to.equal(undefined);
+	});
+
+	it('a later payment avoids a failed channel while its check is pending', async () => {
+		const B = Buffer.from(bob.getNodeId(), 'hex');
+		const C = pubkey('carol');
+		const D = pubkey('dave');
+		const graph = graphOf(alice);
+		const x = addChannel(graph, scidAt(500), B, C);
+		const y = addChannel(graph, scidAt(501), B, D);
+		const z = addChannel(graph, scidAt(502), D, C);
+		const chain = new FakeChain();
+		for (const ann of [x, y, z]) chain.fund(ann);
+		chain.spend(x, 990);
+		let release!: () => void;
+		const gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		const backend = chain.backend();
+		setBackend(alice, {
+			...backend,
+			listUnspent: async (scriptHash: string): Promise<TUnspent> => {
+				await gate;
+				return backend.listUnspent!(scriptHash);
+			}
+		});
+
+		const first = alice.sendKeysend({ destination: C, amountMsat: 10_000n });
+		expect(
+			first.route!.hops[1].shortChannelId.equals(x.shortChannelId)
+		).to.equal(true);
+		for (
+			let i = 0;
+			i < 200 &&
+			alice.getPayment(first.paymentHash)!.status !== PaymentStatus.FAILED;
+			i++
+		) {
+			await new Promise<void>((resolve) => setImmediate(resolve));
+		}
+		expect(alice.getPayment(first.paymentHash)!.failureCode).to.equal(
+			UNKNOWN_NEXT_PEER
+		);
+		expect(graph.getChannel(x.shortChannelId)!.fundingSpentHeight).to.equal(
+			undefined
+		);
+
+		(alice as unknown as { missionControl: MissionControl }).missionControl =
+			new MissionControl();
+		const second = alice.sendKeysend({ destination: C, amountMsat: 10_000n });
+		expect(
+			second.route!.hops[1].shortChannelId.equals(y.shortChannelId)
+		).to.equal(true);
+
+		release();
+		await settle(alice);
+		expect(graph.getChannel(x.shortChannelId)!.fundingSpentHeight).to.equal(
+			990
+		);
+		expect(
+			(alice as unknown as { graphSpendHeld: Set<string> }).graphSpendHeld.size
+		).to.equal(0);
+	});
+
+	it('a close behind another channel on the same script is found by the next check', async () => {
+		const B = Buffer.from(bob.getNodeId(), 'hex');
+		const C = pubkey('carol');
+		const graph = graphOf(alice);
+		const x = addChannel(graph, scidAt(500), B, C);
+		const chain = new FakeChain();
+		chain.fund(x);
+		const other = {
+			...announcement(scidAt(600), B, C),
+			bitcoinKey1: x.bitcoinKey1,
+			bitcoinKey2: x.bitcoinKey2
+		};
+		chain.fund(other);
+		chain.spend(other, 650);
+		chain.spend(x, 990);
+		setBackend(alice, chain.backend());
+		const logs: IStructuredLog[] = [];
+		alice.on('log', (log: IStructuredLog) => logs.push(log));
+
+		alice.sendKeysend({ destination: C, amountMsat: 10_000n });
+		await settle(alice);
+		expect(
+			logs
+				.filter((l) => l.action === 'graph_funding_check')
+				.map((l) => [l.data.reason, l.data.verdict])
+		).to.deep.equal([
+			['selection', 'unknown'],
+			['failure', 'spent']
+		]);
+		expect(graph.getChannel(x.shortChannelId)!.fundingSpentHeight).to.equal(
+			990
+		);
 	});
 
 	it('admits a recently spent announcement as spent instead of refusing it', async () => {

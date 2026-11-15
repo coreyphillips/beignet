@@ -931,7 +931,7 @@ function chain.estimateSimpleCloseFee(feeratePerKw: number, closerScriptLen: num
 function chain.estimateSweepVbytes(outputType: chain.OutputType, leased?: boolean): number
 function chain.extractCommitmentNumber(tx: bitcoinjs-lib#Transaction, openPaymentBasepoint: Buffer, acceptPaymentBasepoint: Buffer): bigint
 function chain.extractPreimageFromWitness(witness: Buffer[]): Buffer | null
-function chain.findAnnouncedChannelSpend(backend: chain.IChainBackend, announcement: { shortChannelId: Buffer; bitcoinKey1: Buffer; bitcoinKey2: Buffer; }): Promise<chain.AnnouncedFundingSpend>
+function chain.findAnnouncedChannelSpend(backend: chain.IChainBackend, announcement: { shortChannelId: Buffer; bitcoinKey1: Buffer; bitcoinKey2: Buffer; }, attempt?: number): Promise<chain.AnnouncedFundingSpend>
 function chain.isDustOutput(scriptPubkey: Buffer, amountSat: bigint): boolean
 function chain.isOpReturnScript(scriptPubkey: Buffer): boolean
 function chain.matchRevokedHtlcSnapshotOutputs(state: channel.IChannelState, commitmentNumber: bigint, revokedTx: bitcoinjs-lib#Transaction, network?: bitcoinjs-lib#Network): Map<number, chain.IRevokedHtlcSnapshotOutput>

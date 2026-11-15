@@ -574,12 +574,22 @@ export type AnnouncedFundingSpend =
  */
 const FUNDING_SPEND_CANDIDATES = 2;
 
+/**
+ * Transactions in the SCID's block placed to find the funding. Channels
+ * opened without a channelKeyDeriver share one funding script, and so can
+ * share a block.
+ */
+const FUNDING_POSITION_CANDIDATES = 2;
+
 /** Backend calls one findAnnouncedChannelSpend makes at most. */
-export const MAX_FUNDING_SPEND_LOOKUPS = 3 + FUNDING_SPEND_CANDIDATES;
+export const MAX_FUNDING_SPEND_LOOKUPS =
+	2 + FUNDING_POSITION_CANDIDATES + FUNDING_SPEND_CANDIDATES;
 
 /**
  * Find whether and where a channel_announcement's funding output was spent.
- * Never throws.
+ * `attempt` counts the earlier checks of this channel that found nothing:
+ * each moves the spend candidates on, so repeated checks reach every
+ * transaction of a shared funding script. Never throws.
  */
 export async function findAnnouncedChannelSpend(
 	backend: IChainBackend,
@@ -587,7 +597,8 @@ export async function findAnnouncedChannelSpend(
 		shortChannelId: Buffer;
 		bitcoinKey1: Buffer;
 		bitcoinKey2: Buffer;
-	}
+	},
+	attempt = 0
 ): Promise<AnnouncedFundingSpend> {
 	let lookups = 0;
 	const result = (
@@ -621,25 +632,32 @@ export async function findAnnouncedChannelSpend(
 	} catch {
 		return result('unavailable');
 	}
+	let fundingTxid: string | undefined;
+	for (const entry of history
+		.filter((h) => h.height === scid.block)
+		.slice(0, FUNDING_POSITION_CANDIDATES)) {
+		try {
+			lookups++;
+			const { txIndex } = await backend.getTransactionMerkleProof(
+				entry.txid,
+				entry.height
+			);
+			// Index 0 proves no position (see classifyAnnouncedChannelFunding).
+			if (txIndex !== 0 && txIndex === scid.txIndex) {
+				fundingTxid = entry.txid;
+				break;
+			}
+		} catch {
+			return result('unavailable');
+		}
+	}
+	if (fundingTxid === undefined) return result('unknown');
 	if (
 		unspent.some(
-			(u) => u.height === scid.block && u.outputIndex === scid.outputIndex
+			(u) => u.txid === fundingTxid && u.outputIndex === scid.outputIndex
 		)
 	) {
 		return result('unspent');
-	}
-	const funding = history.find((h) => h.height === scid.block);
-	if (!funding) return result('unknown');
-	try {
-		lookups++;
-		const { txIndex } = await backend.getTransactionMerkleProof(
-			funding.txid,
-			funding.height
-		);
-		// Index 0 proves no position (see classifyAnnouncedChannelFunding).
-		if (txIndex === 0 || txIndex !== scid.txIndex) return result('unknown');
-	} catch {
-		return result('unavailable');
 	}
 	// Anyone can pay to the public funding script, and only the two parties
 	// can spend those payments, so they stay in the unspent set. Trying those
@@ -647,14 +665,21 @@ export async function findAnnouncedChannelSpend(
 	// of the candidate window. They are kept at all because a splice that
 	// reuses the funding keys also pays to this script.
 	const paysScript = new Set(unspent.map((u) => u.txid));
-	const candidates = history
-		.filter((h) => h.txid !== funding.txid && h.height >= scid.block)
+	const ordered = history
+		.filter((h) => h.txid !== fundingTxid && h.height >= scid.block)
 		.sort(
 			(a, b) =>
 				Number(paysScript.has(a.txid)) - Number(paysScript.has(b.txid)) ||
 				a.height - b.height
-		)
-		.slice(0, FUNDING_SPEND_CANDIDATES);
+		);
+	const start =
+		ordered.length > 0
+			? (attempt * FUNDING_SPEND_CANDIDATES) % ordered.length
+			: 0;
+	const candidates = [
+		...ordered.slice(start),
+		...ordered.slice(0, start)
+	].slice(0, FUNDING_SPEND_CANDIDATES);
 	for (const candidate of candidates) {
 		let tx: bitcoin.Transaction;
 		try {
@@ -668,7 +693,7 @@ export async function findAnnouncedChannelSpend(
 		const spends = tx.ins.some(
 			(input) =>
 				input.index === scid.outputIndex &&
-				Buffer.from(input.hash).reverse().toString('hex') === funding.txid &&
+				Buffer.from(input.hash).reverse().toString('hex') === fundingTxid &&
 				input.witness.length > 0 &&
 				Buffer.from(input.witness[input.witness.length - 1]).equals(
 					witnessScript

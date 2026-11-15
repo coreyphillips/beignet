@@ -1340,9 +1340,17 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	private graphSpendChecking = false;
 	/**
 	 * Height each graph channel was last checked and not found spent, oldest
-	 * first, so a route does not re-check it every payment.
+	 * first, so a route does not re-check it every payment, and how many
+	 * checks in a row settled nothing, so the next one looks further.
 	 */
-	private graphSpendCheckedAt: Map<string, number> = new Map();
+	private graphSpendCheckedAt: Map<string, { height: number; misses: number }> =
+		new Map();
+	/**
+	 * Channels a payment failed at, held out of new routes until their spend
+	 * check answers. A failure does not always penalize a channel in mission
+	 * control, so without this the next payment would fail there too.
+	 */
+	private graphSpendHeld: Set<string> = new Set();
 	/** Our own node_announcement (cached so we can re-broadcast it for propagation). */
 	private _ownNodeAnnouncement?: Buffer;
 	/** Our own channel_announcement + channel_update per channel, cached for re-broadcast. */
@@ -2264,6 +2272,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				this.gossipFundingQueue.delete(scidHex);
 				this.graphSpendQueue.delete(scidHex);
 				this.graphSpendCheckedAt.delete(scidHex);
+				this.graphSpendHeld.delete(scidHex);
 				if (typeof this.storage?.deleteGossipChannel === 'function') {
 					this.writeGossipRow(
 						`channel:${scidHex}`,
@@ -15627,7 +15636,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			amountMsat + toPeerFeeMsat,
 			finalCltvExpiry + toHint.cltvExpiryDelta,
 			undefined,
-			excluded,
+			this.withHeldGraphChannels(excluded),
 			this.missionControl,
 			undefined,
 			undefined,
@@ -17555,7 +17564,11 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		if (!backend?.listUnspent || !backend.getTransactionMerkleProof) {
 			return false;
 		}
-		if (this.graphSpendQueue.has(scidHex)) return false;
+		if (this.graphSpendQueue.has(scidHex)) {
+			// The queued check answers this failure too.
+			if (reason === 'failure') this.graphSpendHeld.add(scidHex);
+			return false;
+		}
 		if (this.graphSpendQueue.size >= LightningNode.GRAPH_SPEND_QUEUE_MAX) {
 			return false;
 		}
@@ -17566,7 +17579,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		if (channel.nodeId1.equals(own) || channel.nodeId2.equals(own)) {
 			return false;
 		}
-		const checkedAt = this.graphSpendCheckedAt.get(scidHex);
+		const checkedAt = this.graphSpendCheckedAt.get(scidHex)?.height;
 		if (
 			reason === 'selection' &&
 			checkedAt !== undefined &&
@@ -17576,6 +17589,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			return false;
 		}
 		this.graphSpendQueue.set(scidHex, { reason, paymentHash });
+		if (reason === 'failure') this.graphSpendHeld.add(scidHex);
 		if (!this.graphSpendChecking) {
 			this.graphSpendChecking = true;
 			void this.runGraphSpendChecks().finally(() => {
@@ -17604,6 +17618,14 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		}
 	}
 
+	/** `excluded` plus the channels held out by graphSpendHeld. */
+	private withHeldGraphChannels(
+		excluded?: Set<string>
+	): Set<string> | undefined {
+		if (this.graphSpendHeld.size === 0) return excluded;
+		return new Set([...(excluded ?? []), ...this.graphSpendHeld]);
+	}
+
 	private async runGraphSpendChecks(): Promise<void> {
 		while (!this._destroyed) {
 			const backend = this._chainBackend;
@@ -17613,11 +17635,21 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			this.graphSpendQueue.delete(scidHex);
 			const scid = Buffer.from(scidHex, 'hex');
 			const channel = this.graph.getChannel(scid);
-			if (!channel || channel.fundingSpentHeight !== undefined) continue;
+			if (!channel || channel.fundingSpentHeight !== undefined) {
+				this.graphSpendHeld.delete(scidHex);
+				continue;
+			}
+			const misses = this.graphSpendCheckedAt.get(scidHex)?.misses ?? 0;
 			const spend = await findAnnouncedChannelSpend(
 				backend,
-				channel.announcement
+				channel.announcement,
+				misses
 			);
+			// A failure that came in meanwhile queued its own check, and the
+			// hold waits for that one.
+			if (!this.graphSpendQueue.has(scidHex)) {
+				this.graphSpendHeld.delete(scidHex);
+			}
 			if (this._destroyed) return;
 			this.emitStructuredLog('payment', 'graph_funding_check', {
 				shortChannelId: scidHex,
@@ -17632,7 +17664,10 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				this.applyGraphFundingSpend(scidHex, channel, spend.height);
 			} else if (spend.verdict !== 'unavailable') {
 				this.graphSpendCheckedAt.delete(scidHex);
-				this.graphSpendCheckedAt.set(scidHex, this.currentBlockHeight);
+				this.graphSpendCheckedAt.set(scidHex, {
+					height: this.currentBlockHeight,
+					misses: spend.verdict === 'unknown' ? misses + 1 : 0
+				});
 				if (
 					this.graphSpendCheckedAt.size > LightningNode.GRAPH_SPEND_CHECKED_MAX
 				) {
@@ -18453,7 +18488,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			finalCltvExpiry: this.paddedFinalCltvExpiry(invoice.minFinalCltvExpiry),
 			localChannels: this.payAllLocalEdges(),
 			routingHints: invoice.routingHints,
-			excludedChannels: context?.excludedChannels,
+			excludedChannels: this.withHeldGraphChannels(context?.excludedChannels),
 			policyOverrides: context?.policyOverrides,
 			maxCltvExpiry: this.cltvBudgetFor(
 				invoice.paymentHash,
@@ -18742,7 +18777,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 					paymentAmountMsat,
 					finalCltvExpiry,
 					undefined,
-					excludedChannels,
+					this.withHeldGraphChannels(excludedChannels),
 					this.missionControl,
 					this.getLocalChannelEdges(),
 					cltvBudget,
@@ -18827,7 +18862,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			paymentAmountMsat,
 			finalCltvExpiry,
 			undefined,
-			excludedChannels,
+			this.withHeldGraphChannels(excludedChannels),
 			this.missionControl,
 			cltvBudget,
 			invoice.routingHints,
@@ -18875,7 +18910,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				invoice.routingHints,
 				undefined,
 				localChannels,
-				excludedChannels,
+				this.withHeldGraphChannels(excludedChannels),
 				cltvBudget,
 				overrides
 			);
@@ -19848,7 +19883,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			amountMsat,
 			finalCltvExpiry,
 			undefined,
-			excludedChannels,
+			this.withHeldGraphChannels(excludedChannels),
 			this.missionControl,
 			undefined,
 			undefined,
@@ -32492,7 +32527,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 					amountMsat,
 					finalCltvExpiry,
 					undefined,
-					excludedChannels,
+					this.withHeldGraphChannels(excludedChannels),
 					this.missionControl,
 					// Our own channels: a direct channel to the introduction node must
 					// be routable even when it never entered the public gossip graph
@@ -32570,7 +32605,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			amountMsat,
 			finalCltvExpiry,
 			undefined,
-			excludedChannels,
+			this.withHeldGraphChannels(excludedChannels),
 			this.missionControl,
 			undefined,
 			undefined,
