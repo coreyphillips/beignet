@@ -233,6 +233,16 @@ export interface IHtlcEntry {
 	 * blinded hop uses it to derive its blinded node key for onion processing.
 	 */
 	blindingPoint?: Buffer;
+	/**
+	 * OFFERED entries the peer fulfilled: the preimage its update_fulfill_htlc
+	 * revealed, checked against paymentHash. It is stored on the entry so it
+	 * reaches disk in the same channel row as the FULFILLED state (issue 295).
+	 * The node-level preimage and forward bookkeeping can land in a later
+	 * commit, and a node killed between the two would otherwise restart
+	 * knowing the HTLC was fulfilled but holding no preimage to settle the
+	 * upstream leg with. handleReestablish re-emits HTLC_FULFILLED from it.
+	 */
+	paymentPreimage?: Buffer;
 
 	/**
 	 * BOLT 2 two-phase updates — OUR side of an update the PEER has not yet

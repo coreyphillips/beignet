@@ -1861,7 +1861,7 @@ export interface BeignetNodeEvents {
 		reason: string;
 		channelErrorCode?: ChannelErrorCode;
 	}) => void;
-	/** The peer fulfilled an HTLC this node offered: a part of its own payment or the outgoing leg of a forward. */
+	/** The peer fulfilled an HTLC this node offered: a part of its own payment or the outgoing leg of a forward. Raised once per HTLC: a reconnect or restart raises it again only when this node had not yet stored what the fulfil settled (the preimage, the forward or the payment record). */
 	'htlc:fulfilled': (data: { channelId: ChannelIdHex; htlcId: string }) => void;
 	/** The peer failed an HTLC this node offered: a part of its own payment or the outgoing leg of a forward. */
 	'htlc:failed': (data: { channelId: ChannelIdHex; htlcId: string }) => void;

@@ -574,7 +574,7 @@ export interface IChannelState {
 	 * and remain queued. A retransmitted commitment_signed goes out behind
 	 * the entries it covers and ahead of the later ones (issue #1300). A peer
 	 * that already holds that signature holds the entries it covers, so those
-	 * are not retransmitted to it, except a fulfil (issue 295).
+	 * are not retransmitted to it.
 	 */
 	pendingLocalUpdates: Array<{ type: number; payload: Buffer }>;
 	/** How many pendingLocalUpdates our last sent commitment_signed covers. */

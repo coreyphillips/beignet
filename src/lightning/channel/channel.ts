@@ -4424,8 +4424,8 @@ export class Channel {
 			// reads this as a MUST-fail, but a legal crossing reaches it: a peer
 			// that crashed after completing the removal round and restored a
 			// lagging snapshot (the issue 295/297 window this codebase embraces)
-			// replays its WHOLE pending-update queue on reestablish, and our own
-			// handleReestablish does exactly that, unconditionally. The replayed
+			// replays its WHOLE pending-update queue on reestablish, as beignet's
+			// own handleReestablish did before #2089. The replayed
 			// fulfill/fail then lands on an entry handleRevokeAndAck already
 			// deleted. A replay that finds the entry takes the repeat branch
 			// below; this arm is the same family one persist further along, and
@@ -4458,10 +4458,13 @@ export class Channel {
 		// in a commit that precedes the node-level preimage and forward
 		// bookkeeping (the quorum pipeline persists deferred snapshots), and a
 		// process killed in that window restarts knowing the fulfill happened
-		// while holding no preimage at all. The peer's retransmission is then
-		// the only remaining source, so swallowing it here would strand the
-		// upstream leg of a forward forever (issue 295). Every listener on the
-		// resulting event is repeat-tolerant.
+		// without the node-level preimage (issue 295). The entry now carries
+		// the preimage itself (paymentPreimage, same row as FULFILLED) and
+		// handleReestablish re-emits HTLC_FULFILLED from it, because a
+		// conformant peer that holds our signature never retransmits the
+		// fulfill. Older beignet peers still do, and this branch keeps that
+		// replay doing the same job. Every listener on the resulting event is
+		// repeat-tolerant.
 		const ffor = this._state.ffor;
 		const redeemed =
 			!!ffor &&
@@ -4484,7 +4487,8 @@ export class Channel {
 				{
 					type: ChannelActionType.HTLC_FULFILLED,
 					htlcId: msg.id,
-					paymentPreimage: msg.paymentPreimage
+					paymentPreimage: msg.paymentPreimage,
+					replay: true
 				}
 			];
 		}
@@ -4496,6 +4500,9 @@ export class Channel {
 		}
 
 		entry.state = HtlcState.FULFILLED;
+		// In the same row as FULFILLED, so no persist of this state can lack it
+		// (issue 295; see IHtlcEntry.paymentPreimage).
+		entry.paymentPreimage = Buffer.from(msg.paymentPreimage);
 		// Two-phase: finalize the balance movement (and delete the entry) only
 		// once the peer has revoked for OUR commitment covering this removal.
 		entry.removalRemoteCommitted = false;
@@ -4919,8 +4926,8 @@ export class Channel {
 	 * entries our last commitment_signed covered ahead of that signature when
 	 * it is retransmitted, the entries queued after it behind it. When the
 	 * peer already holds that signature, the entries it covered are not
-	 * retransmitted, a fulfil excepted (issue 295): the peer holds them too,
-	 * and LND rejects a duplicate as "invalid update".
+	 * retransmitted: the peer holds them too, and LND rejects a duplicate as
+	 * "invalid update".
 	 */
 	private _queuePendingLocalUpdate(type: MessageType, payload: Buffer): void {
 		this._state.pendingLocalUpdates.push({
@@ -10219,7 +10226,7 @@ export class Channel {
 	 *
 	 * The crossing clause also covers the crash-replay family (issue 409): a
 	 * peer restored from a legally lagging snapshot replays its whole pending
-	 * update queue on reestablish (handleReestablish does the same), so the
+	 * update queue on reestablish (beignet did the same before #2089), so the
 	 * "HTLC not found" arms and the pending-HTLC closing_signed arm can fire
 	 * against a conformant peer and stay bare, each argued at its guard. So
 	 * does the taproot closing_signed nonce-exchange arm, whose predicate
@@ -12012,8 +12019,7 @@ export class Channel {
 		// reaches the peer as a duplicate. Beignet's receiver ignores one, but
 		// LND does not: a second add with a used id, or a fulfil or fail of an
 		// HTLC it has already removed, fails its link with "invalid update",
-		// sent as a wire error, and we force-close on that error. A covered
-		// fulfil is the one exception for now (issue 295, argued below).
+		// sent as a wire error, and we force-close on that error.
 		//
 		// A retransmitted commitment_signed must follow exactly the updates it
 		// covers (issue #1300). The queue's first pendingLocalUpdatesSignedCount
@@ -12047,25 +12053,23 @@ export class Channel {
 			for (let i = 0; i < queue.length; i++) {
 				const update = queue[i];
 				// Covered by the commitment the peer holds: the peer has it, and
-				// its lost revoke_and_ack will acknowledge it. A replayed add or
-				// fail is a duplicate LND rejects, and a replayed fee starts
-				// another fee round. The entry stays queued until that
-				// revoke_and_ack trims it. Updates sent after the signature, and
-				// every update when the peer missed the signature, still need
-				// their original replay.
+				// its lost revoke_and_ack will acknowledge it. Whatever the
+				// type: a replayed add, fulfil or fail is a duplicate LND
+				// rejects, and a replayed fee starts another fee round. The entry
+				// stays queued until that revoke_and_ack trims it. Updates sent
+				// after the signature, and every update when the peer missed the
+				// signature, still need their original replay.
 				//
-				// A covered fulfil still goes out, for now. A beignet forwarder
-				// killed between persisting the FULFILLED entry and persisting
-				// the preimage restarts holding our signature but no preimage,
-				// and this replay is how it learns the preimage and settles
-				// upstream (issue 295). LND rejects it as "invalid update", as
-				// it does the fail; that exception goes once the forwarder
-				// persists the preimage with the channel state instead.
+				// A covered fulfil used to go out anyway, so a beignet forwarder
+				// killed before persisting the preimage could learn it again
+				// (issue 295). The forwarder now keeps the preimage on the
+				// FULFILLED entry itself and re-emits it on reestablish, so it no
+				// longer depends on this peer, which matters because LND, CLN
+				// and Eclair never send that replay.
 				if (
 					peerHasCommitment &&
 					Number.isInteger(signedCount) &&
-					i < signedCount &&
-					update.type !== MessageType.UPDATE_FULFILL_HTLC
+					i < signedCount
 				) {
 					continue;
 				}
@@ -12389,6 +12393,35 @@ export class Channel {
 			actions.push(
 				...this.fundingConfirmed(this._state.fundingTxid ?? undefined)
 			);
+		}
+
+		// ── Re-emit fulfils the peer has already revealed (issue 295) ──
+		// An offered HTLC the peer fulfilled keeps the preimage on its entry,
+		// in the same row as FULFILLED. A node killed after that row landed
+		// but before the node-level preimage and forward bookkeeping did
+		// restarts with the HTLC fulfilled and nothing to settle the upstream
+		// leg with, and a peer that holds our signature never retransmits the
+		// fulfil (BOLT 2; beignet stopped doing so in #2089, LND, CLN and
+		// Eclair never did). So re-emit it here, where that replay used to
+		// land. Every HTLC_FULFILLED listener is repeat-tolerant, the same
+		// property the replay relied on, and the node announces a replay to
+		// the application only when it still had something to settle (see
+		// IHtlcFulfilledAction.replay). An unsigned peer fulfil was already
+		// rolled back to COMMITTED by markForReestablish and is not re-emitted:
+		// the peer retransmits that one itself.
+		for (const [key, entry] of this._state.htlcs) {
+			if (
+				key.startsWith('offered-') &&
+				entry.state === HtlcState.FULFILLED &&
+				entry.paymentPreimage
+			) {
+				actions.push({
+					type: ChannelActionType.HTLC_FULFILLED,
+					htlcId: entry.id,
+					paymentPreimage: entry.paymentPreimage,
+					replay: true
+				});
+			}
 		}
 
 		this._lastReestablishOutcome = actions.some(
