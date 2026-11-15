@@ -948,9 +948,9 @@ describe('Production Hardening 5: Phase 4 — Ergonomics & Standards', function 
 			expect(PERMANENT_NODE_FAILURE).to.equal(0x4000 | 0x2000 | 2);
 			expect(PERMANENT_NODE_FAILURE).to.equal(24578);
 
-			// PERMANENT_CHANNEL_FAILURE = PERM (0x4000) | UPDATE (0x1000) | 8
-			expect(PERMANENT_CHANNEL_FAILURE).to.equal(0x4000 | 0x1000 | 8);
-			expect(PERMANENT_CHANNEL_FAILURE).to.equal(20488);
+			// PERMANENT_CHANNEL_FAILURE = PERM (0x4000) | 8, no UPDATE flag
+			expect(PERMANENT_CHANNEL_FAILURE).to.equal(0x4000 | 8);
+			expect(PERMANENT_CHANNEL_FAILURE).to.equal(16392);
 
 			// REQUIRED_NODE_FEATURE_MISSING = PERM (0x4000) | NODE (0x2000) | 3
 			expect(REQUIRED_NODE_FEATURE_MISSING).to.equal(0x4000 | 0x2000 | 3);

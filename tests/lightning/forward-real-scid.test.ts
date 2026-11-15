@@ -22,7 +22,15 @@ import { IChannelBasepoints } from '../../src/lightning/keys/derivation';
 import { LightningNode } from '../../src/lightning/node/lightning-node';
 import { encodeShortChannelId } from '../../src/lightning/gossip/types';
 import { FeatureFlags, Feature } from '../../src/lightning/features/flags';
-import { decryptFailureMessage } from '../../src/lightning/onion/failures';
+import {
+	createFailureMessage,
+	decodeFailureCode,
+	decryptFailureMessage
+} from '../../src/lightning/onion/failures';
+import {
+	PaymentDirection,
+	PaymentStatus
+} from '../../src/lightning/node/types';
 import {
 	UNKNOWN_NEXT_PEER,
 	TEMPORARY_CHANNEL_FAILURE,
@@ -562,7 +570,7 @@ describe('Payment failure attribution', function () {
 
 	// Every BOLT 4 failure that describes the erring node's OUTGOING channel.
 	// permanent_channel_failure and required_channel_feature_missing are easy to
-	// miss: the first carries UPDATE, the second does not.
+	// miss: neither carries the UPDATE flag.
 	const channelScoped = [
 		['temporary_channel_failure', TEMPORARY_CHANNEL_FAILURE],
 		['permanent_channel_failure', PERMANENT_CHANNEL_FAILURE],
@@ -604,5 +612,62 @@ describe('Payment failure attribution', function () {
 		payment.failureSourceIndex = undefined;
 
 		expect((node as any).getCulpableHopScid(payment)).to.be.undefined;
+	});
+
+	// Literal wire codes, not the exported constants, so a wrong constant cannot
+	// agree with itself. BOLT 4: permanent_channel_failure is PERM|8 and
+	// unknown_next_peer (the control) is PERM|10.
+	const wireCodes = [
+		['permanent_channel_failure', 0x4008],
+		['unknown_next_peer', 0x400a]
+	] as const;
+
+	wireCodes.forEach(([name, wireCode]) => {
+		it(`names wire code 0x${wireCode.toString(16)} ${name}`, function () {
+			expect(decodeFailureCode(wireCode).name).to.equal(name);
+		});
+
+		it(`penalises the outgoing channel for an authenticated ${name} from hop 0`, function () {
+			const { channelId } = installChannel(node);
+			const htlcId = 5n;
+			const { route, _ourChannel, _partnerChannel } = twoHopPayment(0, 0);
+			const sharedSecrets = [crypto.randomBytes(32), crypto.randomBytes(32)];
+			const paymentHash = crypto.randomBytes(32);
+			const hashHex = paymentHash.toString('hex');
+			(node as any).payments.set(hashHex, {
+				paymentHash,
+				amountMsat: 1_000_000n,
+				status: PaymentStatus.PENDING,
+				direction: PaymentDirection.OUTGOING,
+				createdAt: Date.now(),
+				sharedSecrets,
+				route
+			});
+			(node as any).htlcPaymentMap.set(
+				`${channelId.toString('hex')}:offered-${htlcId}`,
+				hashHex
+			);
+
+			(node as any).settleOwnPaymentFailure(
+				channelId,
+				htlcId,
+				createFailureMessage(sharedSecrets[0], wireCode)
+			);
+
+			const payment = (node as any).payments.get(hashHex);
+			expect(payment.status).to.equal(PaymentStatus.FAILED);
+			expect(payment.failureCode).to.equal(wireCode);
+			expect(payment.failureSourceIndex).to.equal(0);
+			expect((node as any).getCulpableHopScid(payment)).to.equal(
+				_partnerChannel.toString('hex')
+			);
+			const missionControl = (node as any).missionControl;
+			expect(
+				Number(missionControl.getPenalty(_partnerChannel.toString('hex')))
+			).to.be.greaterThan(0);
+			expect(
+				Number(missionControl.getPenalty(_ourChannel.toString('hex')))
+			).to.equal(0);
+		});
 	});
 });
