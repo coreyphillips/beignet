@@ -11207,10 +11207,11 @@ export class Channel {
 			localSpliceLocked: inflight.localSpliceLocked,
 			remoteSpliceLocked: inflight.remoteSpliceLocked
 		});
-		// An in-flight splice only exists once the mid-splice commitment round
-		// completed (or our sigs left), so both commitment flags are true.
+		// The record is written as OUR splice commitment_signed leaves, which
+		// can be before the peer's arrives: only a recorded signature says we
+		// hold one. Reestablish asks for it by the same test.
 		this._spliceSentCommitment = true;
-		this._spliceReceivedCommitment = true;
+		this._spliceReceivedCommitment = inflight.remoteCommitmentSig !== null;
 		this._spliceSentTxSigs = inflight.sentTxSignatures;
 		this._spliceRemoteCommitmentSig = inflight.remoteCommitmentSig;
 		this._spliceRemoteHtlcSigs = inflight.remoteHtlcSignatures ?? null;
@@ -20944,6 +20945,19 @@ export class Channel {
 			// are already fully signed: benign no-op.
 			if (this._state.spliceInFlight?.receivedTxSignatures) {
 				return [];
+			}
+
+			// The peer's signature completes the shared input, so applying it
+			// publishes the splice. Without the peer's verified splice
+			// commitment_signed we hold no signed commitment on the new funding
+			// output, and so no unilateral exit once the splice confirms. An
+			// honest peer sends that commitment first on the same stream. The
+			// reestablish after this disconnect asks for both again, in order
+			// (retransmit_flags bit 0).
+			if (!this._spliceSentCommitment || !this._spliceReceivedCommitment) {
+				return this._warnAndDisconnect(
+					'tx_signatures before the splice commitment_signed exchange'
+				);
 			}
 
 			// The peer's 2-of-2 funding signature arrives in the
