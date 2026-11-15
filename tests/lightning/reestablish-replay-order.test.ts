@@ -17,9 +17,8 @@
  *  (c) the peer received the add and the signature, its revoke_and_ack was
  *      lost, the second add was lost (no signature retransmission: only the
  *      later add is replayed, since the peer holds the covered one);
- *  (c2) the same for a fail the peer received with our signature, which
- *      LND rejects as "invalid update" if replayed; a fulfil is still
- *      replayed, on purpose, for issue 295;
+ *  (c2) the same for a fail or a fulfil the peer received with our
+ *      signature, which LND rejects as "invalid update" if replayed;
  *  (d) the update queued after the signature is a fulfil or a fail;
  *  (e) update_fee beside the signature, on either side of it;
  *  (f) crossing traffic, including both orders of our own revoke_and_ack
@@ -40,9 +39,7 @@
  * already holds, the way LND does: an add must carry the next id, and a
  * fulfil or fail must name an HTLC that is not already removed. Beignet's
  * own receiver ignores such a replay, so without this check the loopback
- * cannot see a replay that force-closes a channel with an LND peer. A
- * covered fulfil is still replayed on purpose (issue 295), so it is kept
- * apart from the other duplicates and pinned in (c2).
+ * cannot see a replay that force-closes a channel with an LND peer.
  */
 
 import { expect } from 'chai';
@@ -142,9 +139,6 @@ interface IWire {
 	/** Updates any reconnect sent that the peer already held: LND fails the
 	 *  link with "invalid update" on each, and the sender force-closes. */
 	duplicates: string[];
-	/** The same for update_fulfill_htlc, which is still replayed on purpose
-	 *  so a restarted beignet forwarder can learn its preimage (issue 295). */
-	fulfilDuplicates: string[];
 	/** Every message delivered since the last reconnect, in order. */
 	delivered: string[];
 }
@@ -174,7 +168,6 @@ function makePair(tag: string, taproot = false): IPair {
 	const failed: Record<Side, bigint[]> = { A: [], B: [] };
 	const replay: Record<Side, string[]> = { A: [], B: [] };
 	const duplicates: string[] = [];
-	const fulfilDuplicates: string[] = [];
 	const delivered: string[] = [];
 	const sideOf = (pub: string): Side => (pub === aPub ? 'A' : 'B');
 
@@ -325,7 +318,6 @@ function makePair(tag: string, taproot = false): IPair {
 		},
 		replay,
 		duplicates,
-		fulfilDuplicates,
 		delivered,
 		reconnect: (opts): void => {
 			// Both sides observe the disconnect, then exchange reestablish with
@@ -360,11 +352,7 @@ function makePair(tag: string, taproot = false): IPair {
 				.map((m) => MessageType[m.type]);
 			for (const m of queue) {
 				if (peerAlreadyHolds(m)) {
-					const seen =
-						m.type === MessageType.UPDATE_FULFILL_HTLC
-							? fulfilDuplicates
-							: duplicates;
-					seen.push(`${sideOf(m.from)}:${MessageType[m.type]}`);
+					duplicates.push(`${sideOf(m.from)}:${MessageType[m.type]}`);
 				}
 			}
 			if (opts?.reorder) {
@@ -787,7 +775,7 @@ describe('reestablish: replay order around a retransmitted commitment_signed (is
 			expectStillUsable(t);
 		});
 
-		it('a fulfil the peer holds is still replayed (issue 295)', function () {
+		it('a fulfil the peer holds is not replayed; the peer re-emits its stored preimage', function () {
 			const { t, h1, h2 } = removedThenRaaLost('c2-fulfil');
 			settle(t, 'B', h1);
 			expect(queueOf(t.bChannel())).to.deep.equal({
@@ -797,17 +785,16 @@ describe('reestablish: replay order around a retransmitted commitment_signed (is
 
 			t.wire.reconnect();
 			expect(t.errors, t.errors.join('; ')).to.have.length(0);
-			// Kept on purpose: it is how a restarted beignet forwarder that
-			// never persisted the preimage learns it. LND rejects this replay
-			// as "invalid update", so this pins the one remaining exception
-			// until the forwarder persists the preimage with the channel state.
-			expect(t.wire.replay.B).to.deep.equal([FULFILL]);
-			expect(t.wire.fulfilDuplicates).to.deep.equal([`B:${FULFILL}`]);
+			// A holds the fulfil under B's signature, so B sends nothing. A
+			// kept the preimage on its FULFILLED entry and re-emits it on
+			// reestablish, which is what a restarted forwarder that never
+			// persisted the node-level preimage needs (issue 295).
+			expect(t.wire.replay.B).to.deep.equal([]);
 			expect(t.wire.replay.A).to.deep.equal([RAA, SIG]);
 			expectLevel(t);
 			settle(t, 'B', h2);
 			expectLevel(t);
-			// h1 twice (the replay re-emits it, issue 295), then h2.
+			// h1 twice (re-emitted on reestablish, issue 295), then h2.
 			expect(t.fulfilled.A).to.have.length(3);
 			expect(t.fulfilled.A[0]).to.deep.equal(h1.preimage);
 			expect(t.fulfilled.A[1]).to.deep.equal(h1.preimage);
@@ -850,6 +837,35 @@ describe('reestablish: replay order around a retransmitted commitment_signed (is
 			t.wire.reconnect();
 			expect(t.errors, t.errors.join('; ')).to.have.length(0);
 			expect(t.wire.replay.B).to.deep.equal([]);
+			expectLevel(t);
+			settle(t, 'B', h2);
+			expectLevel(t);
+			expectStillUsable(t);
+		});
+
+		it('the fulfilled side keeps the preimage across a restart and re-emits it (issue 295)', function () {
+			const { t, h1, h2 } = removedThenRaaLost('c2-fulfil-restart');
+			settle(t, 'B', h1);
+			// A restarts from its stored row. The node-level copy of the
+			// preimage is gone with the process; the entry's is not.
+			t.wire.restartA();
+			const offered = [...t.aChannel().getFullState().htlcs.entries()].find(
+				([key, h]) =>
+					key.startsWith('offered-') && h.paymentHash.equals(h1.hash)
+			);
+			expect(offered, 'A still holds the fulfilled HTLC').to.not.equal(
+				undefined
+			);
+			expect(offered![1].state).to.equal(HtlcState.FULFILLED);
+			expect(offered![1].paymentPreimage).to.deep.equal(h1.preimage);
+			t.fulfilled.A.length = 0;
+
+			t.wire.reconnect();
+			expect(t.errors, t.errors.join('; ')).to.have.length(0);
+			// B, holding nothing A lacks, sends no fulfil; A learns the preimage
+			// again from its own row.
+			expect(t.wire.replay.B).to.deep.equal([]);
+			expect(t.fulfilled.A).to.deep.equal([h1.preimage]);
 			expectLevel(t);
 			settle(t, 'B', h2);
 			expectLevel(t);

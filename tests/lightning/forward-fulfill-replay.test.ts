@@ -15,9 +15,15 @@
  * CLTV forced a close. That is issue 295: value paid downstream and never
  * claimed off-chain upstream.
  *
- * Three repairs, each with its regression here:
+ * The repairs, each with its regression here:
  * - the dedup branch verifies the preimage and re-emits HTLC_FULFILLED, so
- *   node-level listeners (all repeat-tolerant) run again;
+ *   node-level listeners (all repeat-tolerant) run again when an older
+ *   beignet peer retransmits the fulfill;
+ * - the FULFILLED entry carries the preimage in the same channel row, and
+ *   reestablish re-emits HTLC_FULFILLED from it. A downstream peer that
+ *   holds the forwarder's signature retransmits nothing (BOLT 2: LND, CLN
+ *   and Eclair never did, beignet stopped in #2089), so the kill tests below
+ *   check that the downstream sends no fulfill at all;
  * - the forwarder's settle path checks the inbound leg can actually carry
  *   the fulfill before consuming the linkage, instead of durably deleting
  *   it around a refused fulfill (which also primed the restore-time
@@ -530,6 +536,20 @@ function killAtPipelinedFulfillPersist(
 	};
 }
 
+/** Counts the update_fulfill_htlc messages `from` sends to `to`. */
+function countFulfillsTo(
+	from: LightningNode,
+	to: LightningNode
+): { count: number } {
+	const seen = { count: 0 };
+	from.on('message:outbound', (pk: string, t: number) => {
+		if (pk === to.getNodeId() && t === MessageType.UPDATE_FULFILL_HTLC) {
+			seen.count++;
+		}
+	});
+	return seen;
+}
+
 /** Disk-shape sanity for the kill point issue 295 describes. */
 function assertKillDiskShape(
 	inspect: SqliteStorage,
@@ -709,14 +729,19 @@ describe('Replayed update_fulfill_htlc re-drives settlement (issue 295)', () => 
 		assertKillDiskShape(inspect, invoice.paymentHash.toString('hex'));
 
 		const restored = createNode(BOB_SEED, inspect, quorumRecovery());
+		const downstreamFulfills = countFulfillsTo(charlie, restored);
 		// The payer's channel reestablishes first, then the downstream one:
-		// the replayed fulfill arrives with the inbound leg already NORMAL.
+		// the re-emitted fulfill lands with the inbound leg already NORMAL.
 		await reconnect(restored, alice);
 		await reconnect(restored, charlie);
 		await waitFor(
 			() => payment.status === PaymentStatus.COMPLETED,
-			'the payer to settle from the replayed fulfill'
+			'the payer to settle from the stored preimage'
 		);
+		expect(
+			downstreamFulfills.count,
+			'the downstream peer retransmitted no fulfill'
+		).to.equal(0);
 
 		const inbound = restored.getChannelManager().getChannel(world.abChannelId)!;
 		await waitFor(
@@ -783,6 +808,7 @@ describe('Replayed update_fulfill_htlc re-drives settlement (issue 295)', () => 
 		let upstreamFulfills = 0;
 
 		const restored = createNode(BOB_SEED, inspect, quorumRecovery());
+		const downstreamFulfills = countFulfillsTo(charlie, restored);
 		restored.on('message:outbound', (pk: string, t: number) => {
 			if (pk === alice.getNodeId() && t === MessageType.UPDATE_FULFILL_HTLC) {
 				upstreamFulfills++;
@@ -800,6 +826,10 @@ describe('Replayed update_fulfill_htlc re-drives settlement (issue 295)', () => 
 			'the payer to settle once the inbound leg reestablished'
 		);
 		expect(upstreamFulfills, 'exactly one upstream fulfill').to.equal(1);
+		expect(
+			downstreamFulfills.count,
+			'the downstream peer retransmitted no fulfill'
+		).to.equal(0);
 
 		const inbound = restored.getChannelManager().getChannel(world.abChannelId)!;
 		await waitFor(

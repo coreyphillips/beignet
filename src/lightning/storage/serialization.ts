@@ -161,6 +161,9 @@ export interface ISerializedHtlcEntry {
 	/** Route blinding: blinding_point (hex) so an in-flight blinded receive
 	 * survives restart and can still peel its onion with the blinded key. */
 	blindingPoint?: string;
+	/** The preimage the peer's fulfil revealed (hex; see
+	 * IHtlcEntry.paymentPreimage). Absent on rows written before it existed. */
+	paymentPreimage?: string;
 	/** Two-phase update flags (see IHtlcEntry). Optional for compatibility. */
 	addRemoteCommitted?: boolean;
 	removalRemoteCommitted?: boolean;
@@ -239,6 +242,9 @@ export function serializeHtlcEntry(
 		...(e.blindingPoint
 			? { blindingPoint: e.blindingPoint.toString('hex') }
 			: {}),
+		...(e.paymentPreimage
+			? { paymentPreimage: e.paymentPreimage.toString('hex') }
+			: {}),
 		...(e.addRemoteCommitted !== undefined
 			? { addRemoteCommitted: e.addRemoteCommitted }
 			: {}),
@@ -302,6 +308,9 @@ export function deserializeHtlcEntry(s: ISerializedHtlcEntry): {
 			...(s.fforMismatch === true ? { fforMismatch: true } : {}),
 			...(s.blindingPoint
 				? { blindingPoint: Buffer.from(s.blindingPoint, 'hex') }
+				: {}),
+			...(s.paymentPreimage
+				? { paymentPreimage: Buffer.from(s.paymentPreimage, 'hex') }
 				: {}),
 			...(s.addRemoteCommitted !== undefined
 				? { addRemoteCommitted: s.addRemoteCommitted }

@@ -1862,6 +1862,7 @@ property channel.IHtlcEntry.funderFeeFailback?: boolean
 property channel.IHtlcEntry.id: bigint
 property channel.IHtlcEntry.onionRoutingPacket: Buffer
 property channel.IHtlcEntry.paymentHash: Buffer
+property channel.IHtlcEntry.paymentPreimage?: Buffer
 property channel.IHtlcEntry.removalLocallyRevoked?: boolean
 property channel.IHtlcEntry.removalRemoteCommitted?: boolean
 property channel.IHtlcEntry.state: channel.HtlcState
@@ -7986,6 +7987,7 @@ property storage.ISerializedHtlcEntry.id: string
 property storage.ISerializedHtlcEntry.key: string
 property storage.ISerializedHtlcEntry.onionRoutingPacket: string
 property storage.ISerializedHtlcEntry.paymentHash: string
+property storage.ISerializedHtlcEntry.paymentPreimage?: string
 property storage.ISerializedHtlcEntry.removalLocallyRevoked?: boolean
 property storage.ISerializedHtlcEntry.removalRemoteCommitted?: boolean
 property storage.ISerializedHtlcEntry.state: string
