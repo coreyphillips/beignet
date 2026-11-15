@@ -2,8 +2,8 @@
  * BOLT 4 route blinding rules a reader and relay must apply (issue #2047):
  * the strict encrypted_data_tlv reader, blinded_payinfo features, the
  * sciddir introduction point, both next-hop forms in both relays, the
- * intermediate onion message rules, a double path key, and rotating to an
- * invoice's next blinded path.
+ * intermediate and final onion message rules, a double path key, and
+ * rotating to an invoice's next blinded path.
  */
 
 import { expect } from 'chai';
@@ -43,10 +43,22 @@ import { encodeBigSize } from '../../src/lightning/message/codec';
 import { decodeUpdateFailMalformedHtlcMessage } from '../../src/lightning/message/channel-update';
 import { INVALID_ONION_BLINDING } from '../../src/lightning/onion/types';
 import { Feature } from '../../src/lightning/features/flags';
-import { constructOnionMessagePacket } from '../../src/lightning/onion-message/construct';
-import { encodeOnionMessagePayload } from '../../src/lightning/onion-message/codec';
+import {
+	constructOnionMessagePacket,
+	constructReplyOnionMessage
+} from '../../src/lightning/onion-message/construct';
+import {
+	encodeOnionMessage,
+	encodeOnionMessagePayload
+} from '../../src/lightning/onion-message/codec';
 import { processOnionMessage } from '../../src/lightning/onion-message/process';
+import { OnionMessageManager } from '../../src/lightning/onion-message/manager';
 import type { IOnionMessagePayload } from '../../src/lightning/onion-message/types';
+import {
+	deriveBlindingEncryptionKey,
+	deriveBlindingSharedSecret,
+	encryptBlindedData
+} from '../../src/lightning/onion/blinding';
 
 // ─────────────── Helpers (mirrors node.test.ts) ───────────────
 
@@ -552,6 +564,122 @@ describe('BOLT 4 route blinding reader and relay rules (#2047)', function () {
 			if (result.type === 'forward') {
 				expect(result.nextNodeId).to.deep.equal(carolPub);
 			}
+		});
+	});
+
+	describe('onion message final node (#2083)', function () {
+		const senderPub = pub(0x0a).toString('hex');
+		const carolPriv = Buffer.alloc(32, 0x0c);
+		const carolPub = getPublicKey(carolPriv);
+
+		/** A one-hop path to Carol, with her encrypted data optionally replaced. */
+		function pathToCarol(
+			hop: IBlindedHopData,
+			rawPlaintext?: Buffer
+		): IBlindedPath {
+			const path = constructBlindedPath(
+				crypto.randomBytes(32),
+				[carolPub],
+				[hop]
+			);
+			if (rawPlaintext) {
+				const ss = deriveBlindingSharedSecret(path.blindingPoint, carolPriv);
+				path.blindedHops[0].encryptedData = encryptBlindedData(
+					deriveBlindingEncryptionKey(ss),
+					rawPlaintext
+				);
+			}
+			return path;
+		}
+
+		/** Deliver an application TLV over the path to Carol's manager. */
+		function deliver(path: IBlindedPath): {
+			handled: { data: Buffer; pathId?: Buffer }[];
+			received: number;
+			errors: Error[];
+		} {
+			const mgr = new OnionMessageManager(carolPriv);
+			const handled: { data: Buffer; pathId?: Buffer }[] = [];
+			const errors: Error[] = [];
+			let received = 0;
+			mgr.registerTlvHandler(64, (_from, _type, data, _reply, pathId) =>
+				handled.push({ data, pathId })
+			);
+			mgr.on('message:received', () => received++);
+			mgr.on('message:error', (_from: string, err: Error) => errors.push(err));
+			const msg = constructReplyOnionMessage(
+				path,
+				new Map([[64, Buffer.from('hi')]])
+			);
+			mgr.handleMessage(senderPub, encodeOnionMessage(msg));
+			mgr.destroy();
+			return { handled, received, errors };
+		}
+
+		it('delivers a valid final hop with its path_id', function () {
+			const pathId = Buffer.alloc(32, 6);
+			const result = deliver(pathToCarol({ pathId }));
+			expect(result.errors).to.deep.equal([]);
+			expect(result.received).to.equal(1);
+			expect(result.handled).to.have.length(1);
+			expect(result.handled[0].data.toString()).to.equal('hi');
+			expect(result.handled[0].pathId).to.deep.equal(pathId);
+		});
+
+		it('drops a final hop whose allowed_features sets a bit', function () {
+			const result = deliver(
+				pathToCarol({
+					pathId: Buffer.alloc(32, 6),
+					allowedFeatures: Buffer.from([0x02])
+				})
+			);
+			expect(result.handled).to.deep.equal([]);
+			expect(result.received).to.equal(0);
+			expect(result.errors.map((e) => e.message)).to.deep.equal([
+				'encrypted_recipient_data allowed_features names an unknown feature'
+			]);
+		});
+
+		it('drops a final hop whose encrypted data has an unknown even field', function () {
+			const result = deliver(
+				pathToCarol(
+					{},
+					tlv([
+						[6, Buffer.alloc(32, 6)],
+						[16, Buffer.from([1])]
+					])
+				)
+			);
+			expect(result.handled).to.deep.equal([]);
+			expect(result.received).to.equal(0);
+			expect(result.errors.map((e) => e.message)).to.deep.equal([
+				'Unknown required TLV type: 16'
+			]);
+		});
+
+		it('drops a final hop whose encrypted data fails authentication', function () {
+			const path = pathToCarol({ pathId: Buffer.alloc(32, 6) });
+			path.blindedHops[0].encryptedData[0] ^= 0x01;
+			const result = deliver(path);
+			expect(result.handled).to.deep.equal([]);
+			expect(result.received).to.equal(0);
+			expect(result.errors).to.have.length(1);
+		});
+
+		it('refuses final encrypted data that arrives with no blinding point', function () {
+			const path = pathToCarol({ pathId: Buffer.alloc(32, 6) });
+			const packet = constructOnionMessagePacket(crypto.randomBytes(32), [
+				{
+					pubkey: carolPub,
+					payload: encodeOnionMessagePayload({
+						encryptedRecipientData: path.blindedHops[0].encryptedData,
+						messageTlvs: new Map([[64, Buffer.from('hi')]])
+					})
+				}
+			]);
+			expect(() => processOnionMessage(packet, carolPriv)).to.throw(
+				'no blinding point'
+			);
 		});
 	});
 

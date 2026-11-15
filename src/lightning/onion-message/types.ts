@@ -81,8 +81,8 @@ export interface IOnionMessageDelivery {
 	payload: IOnionMessagePayload;
 	/**
 	 * path_id from the decrypted final-hop encrypted_recipient_data (BOLT 4),
-	 * when present. The recipient verifies it matches a path_id it published;
-	 * absent when the final hop carried no verifiable blinded data.
+	 * when present. The recipient verifies it matches a path_id it published.
+	 * Recipient data that fails to decrypt or decode is never delivered.
 	 */
 	pathId?: Buffer;
 }
