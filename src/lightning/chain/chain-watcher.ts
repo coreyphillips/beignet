@@ -210,7 +210,21 @@ interface IWatchedFunding {
 	 * the outpoints it spends, as `txid:vout`.
 	 */
 	discoveryScan?: Map<string, { out: number | null; ins: string[] }>;
+	/**
+	 * Whether each candidate txid is a coinbase, once known (issue #2045).
+	 * A transaction never changes, so one answer per txid is final.
+	 */
+	coinbase?: Map<string, boolean>;
+	/** Candidate txids whose coinbase answer is being fetched right now. */
+	coinbaseLookups?: Set<string>;
 }
+
+/**
+ * BOLT 2: a fundee MUST wait for at least this many blocks before
+ * `channel_ready` when the funding transaction is a coinbase, because no
+ * commitment spending it can confirm before then (issue #2045).
+ */
+const COINBASE_MATURITY = 100;
 
 /** A generic output being watched for spends */
 interface IWatchedOutput {
@@ -2237,7 +2251,11 @@ export class ChainWatcher extends EventEmitter {
 
 		// Calculate confirmations
 		const confirmations = this.currentBlockHeight - entry.height + 1;
-		if (confirmations >= watched.minimumDepth) {
+		if (
+			confirmations >= watched.minimumDepth &&
+			(confirmations >= COINBASE_MATURITY ||
+				this.isKnownNonCoinbase(watched, key, generation, seen.txid))
+		) {
 			// Adopt the winning candidate into the watch itself, so spend
 			// detection and the announcement proof key off the tx that is
 			// actually on chain.
@@ -2272,6 +2290,114 @@ export class ChainWatcher extends EventEmitter {
 		}).catch((err) => {
 			this.emitError(err);
 		});
+	}
+
+	/**
+	 * Whether this candidate is known NOT to be a coinbase (issue #2045).
+	 * Unknown answers false, so the depth waits rather than guesses.
+	 *
+	 * The channel's own record holds the transaction whenever we built or
+	 * co-signed it (v1 funder, both sides of v2, splices), and those can never
+	 * be coinbases. Only a v1 fundee has just a txid, so its answer comes from
+	 * the backend. That fetch is not awaited here: the spend scan this check
+	 * starts must follow its verdict with no await between them. Its answer
+	 * starts a fresh check instead, and a failed fetch is retried by the next.
+	 *
+	 * A watch no channel answers to has no channel_ready to hold
+	 * (handleFundingConfirmed ignores an unknown channel), so it asks nothing.
+	 */
+	private isKnownNonCoinbase(
+		watched: IWatchedFunding,
+		key: string,
+		generation: number,
+		txid: string
+	): boolean {
+		const known = watched.coinbase?.get(txid);
+		if (known !== undefined) return !known;
+		if (watched.coinbaseLookups?.has(txid)) return false;
+		const local = this.localFundingTransaction(watched.channelId, txid);
+		if (local === undefined) return true;
+		if (local) {
+			const coinbase = local.isCoinbase();
+			(watched.coinbase ??= new Map()).set(txid, coinbase);
+			return !coinbase;
+		}
+		const lookups = (watched.coinbaseLookups ??= new Set());
+		lookups.add(txid);
+		this.backend
+			.getTransaction(txid)
+			.then((raw) => {
+				const tx = bitcoin.Transaction.fromBuffer(raw);
+				if (tx.getId() !== txid) {
+					throw new Error(`backend answered ${txid} with ${tx.getId()}`);
+				}
+				return tx.isCoinbase();
+			})
+			.then(
+				(coinbase) => {
+					lookups.delete(txid);
+					if (
+						!this.isCurrentGeneration(generation) ||
+						this.watchedFundings.get(key) !== watched
+					) {
+						return;
+					}
+					(watched.coinbase ??= new Map()).set(txid, coinbase);
+					// A coinbase needs no fresh check: the per-block sweep reaches
+					// it again, and only depth can release it now.
+					if (coinbase) return;
+					this.checkFundingConfirmation(key, generation).catch((err) => {
+						this.emitError(err);
+					});
+				},
+				(err) => {
+					lookups.delete(txid);
+					if (!this.isCurrentGeneration(generation)) return;
+					this.emitError(
+						new Error(
+							`Cannot tell whether funding ${txid} is a coinbase, so its confirmation waits: ${
+								(err as Error).message
+							}`
+						)
+					);
+				}
+			);
+		return false;
+	}
+
+	/**
+	 * The funding transaction with this txid from the watched channel's own
+	 * record: null when the record does not hold it (a v1 fundee), undefined
+	 * when no channel has this id.
+	 */
+	private localFundingTransaction(
+		channelId: Buffer,
+		txid: string
+	): bitcoin.Transaction | null | undefined {
+		let found = false;
+		for (const channel of this.channelManager.listChannels()) {
+			const state = channel.getFullState();
+			const id = state.channelId ?? state.temporaryChannelId;
+			if (!id?.equals(channelId)) continue;
+			found = true;
+			const held = [
+				state.fundingTxHex,
+				state.pendingFundingTxHex,
+				state.v2InFlight?.fundingTxHex,
+				...(state.v2PreviousAttempts ?? []).map((rec) => rec.fundingTxHex),
+				state.spliceInFlight?.spliceTxHex
+			];
+			for (const hex of held) {
+				if (!hex) continue;
+				try {
+					const tx = bitcoin.Transaction.fromHex(hex);
+					if (tx.getId() === txid) return tx;
+				} catch {
+					// An unparseable copy says nothing; the backend can still answer.
+				}
+			}
+		}
+		return found ? null : undefined;
 	}
 
 	/**
