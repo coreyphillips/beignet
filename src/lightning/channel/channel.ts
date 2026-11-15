@@ -4487,7 +4487,8 @@ export class Channel {
 				{
 					type: ChannelActionType.HTLC_FULFILLED,
 					htlcId: msg.id,
-					paymentPreimage: msg.paymentPreimage
+					paymentPreimage: msg.paymentPreimage,
+					replay: true
 				}
 			];
 		}
@@ -12403,7 +12404,9 @@ export class Channel {
 		// fulfil (BOLT 2; beignet stopped doing so in #2089, LND, CLN and
 		// Eclair never did). So re-emit it here, where that replay used to
 		// land. Every HTLC_FULFILLED listener is repeat-tolerant, the same
-		// property the replay relied on. An unsigned peer fulfil was already
+		// property the replay relied on, and the node announces a replay to
+		// the application only when it still had something to settle (see
+		// IHtlcFulfilledAction.replay). An unsigned peer fulfil was already
 		// rolled back to COMMITTED by markForReestablish and is not re-emitted:
 		// the peer retransmits that one itself.
 		for (const [key, entry] of this._state.htlcs) {
@@ -12415,7 +12418,8 @@ export class Channel {
 				actions.push({
 					type: ChannelActionType.HTLC_FULFILLED,
 					htlcId: entry.id,
-					paymentPreimage: entry.paymentPreimage
+					paymentPreimage: entry.paymentPreimage,
+					replay: true
 				});
 			}
 		}

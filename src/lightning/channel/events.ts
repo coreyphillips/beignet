@@ -154,11 +154,16 @@ export interface ChannelManagerEvents {
 		amountMsat: bigint,
 		paymentHash: Buffer
 	) => void;
-	/** An offered HTLC was fulfilled. */
+	/**
+	 * An offered HTLC was fulfilled. `replay` is true when the fulfil was
+	 * already processed once and is delivered again (re-emitted from the
+	 * stored entry on reestablish, or retransmitted by the peer).
+	 */
 	'htlc:fulfilled': (
 		channelId: Buffer,
 		htlcId: bigint,
-		preimage: Buffer
+		preimage: Buffer,
+		replay: boolean
 	) => void;
 	/** An offered HTLC was failed. `malformedCode` is set only for update_fail_malformed_htlc. */
 	'htlc:failed': (

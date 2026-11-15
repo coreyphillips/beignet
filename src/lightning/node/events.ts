@@ -105,9 +105,9 @@ export interface LightningNodeEvents
 	'payment:sent': (payment: IPaymentInfo) => void;
 	/** Outgoing payment failed. */
 	'payment:failed': (payment: IPaymentInfo) => void;
-	/** One offered HTLC of an outgoing payment reached a terminal state (fulfilled, irrevocably failed, or resolved on chain). */
+	/** One offered HTLC of an outgoing payment reached a terminal state (fulfilled, irrevocably failed, or resolved on chain). A fulfilled HTLC is reported once, as `htlc:fulfilled` is. */
 	'payment:htlc-resolved': (event: IPaymentHtlcResolvedEvent) => void;
-	/** An outgoing payment's preimage became known, from update_fulfill_htlc or an on-chain claim, whatever the record's status was. */
+	/** An outgoing payment's preimage became known, from update_fulfill_htlc or an on-chain claim, whatever the record's status was. From update_fulfill_htlc it is raised once per HTLC, as `htlc:fulfilled` is. */
 	'payment:preimage': (event: IPaymentPreimageEvent) => void;
 	/** Preimage recorded (forwarding and settlement chokepoint). */
 	'preimage:learned': (paymentHash: Buffer, preimage: Buffer) => void;
@@ -253,7 +253,7 @@ export interface LightningNodeEvents
 		reason: string;
 		channelErrorCode?: ChannelErrorCode;
 	}) => void;
-	/** The peer fulfilled an HTLC this node offered: a part of its own payment or the outgoing leg of a forward. */
+	/** The peer fulfilled an HTLC this node offered: a part of its own payment or the outgoing leg of a forward. Raised once per HTLC: a reconnect or restart raises it again only when this node had not yet stored what the fulfil settled (the preimage, the forward or the payment record). */
 	'htlc:fulfilled': (data: { channelId: Buffer; htlcId: bigint }) => void;
 	/** The peer failed an HTLC this node offered: a part of its own payment or the outgoing leg of a forward. */
 	'htlc:failed': (data: { channelId: Buffer; htlcId: bigint }) => void;

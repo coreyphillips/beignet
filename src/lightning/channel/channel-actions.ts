@@ -232,6 +232,13 @@ export interface IHtlcFulfilledAction {
 	type: ChannelActionType.HTLC_FULFILLED;
 	htlcId: bigint;
 	paymentPreimage: Buffer;
+	/**
+	 * Set when the fulfil was already processed once: re-emitted from the
+	 * stored entry on reestablish, or a peer's retransmission of a fulfil the
+	 * entry already holds. The node uses it to settle anything still owed
+	 * without announcing the HTLC to the application a second time.
+	 */
+	replay?: true;
 }
 
 export interface IHtlcFailedAction {

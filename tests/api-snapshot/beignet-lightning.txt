@@ -1403,7 +1403,7 @@ property channel.ChannelManagerEvents.'funding:broadcast-authorized': (channelId
 property channel.ChannelManagerEvents.'htlc:claimed-onchain': (channelId: Buffer, paymentHash: Buffer, preimage: Buffer, claimTxid: string) => void
 property channel.ChannelManagerEvents.'htlc:failed': (channelId: Buffer, htlcId: bigint, reason: Buffer, malformedCode: number | undefined) => void
 property channel.ChannelManagerEvents.'htlc:forwarded': (channelId: Buffer, htlcId: bigint, amountMsat: bigint, paymentHash: Buffer) => void
-property channel.ChannelManagerEvents.'htlc:fulfilled': (channelId: Buffer, htlcId: bigint, preimage: Buffer) => void
+property channel.ChannelManagerEvents.'htlc:fulfilled': (channelId: Buffer, htlcId: bigint, preimage: Buffer, replay: boolean) => void
 property channel.ChannelManagerEvents.'htlc:local-add-abandoned': (channelId: Buffer, adds: channel.IAbandonedLocalAdd[]) => void
 property channel.ChannelManagerEvents.'message:outbound': (peerPubkey: string, type: message.MessageType, payload: Buffer) => void
 property channel.ChannelManagerEvents.'monitor:updated': (channelIdHex: string, monitor: chain.ChainMonitor) => void
@@ -1879,6 +1879,7 @@ property channel.IHtlcForwardedAction.type: channel.ChannelActionType.HTLC_FORWA
 interface channel.IHtlcFulfilledAction
 property channel.IHtlcFulfilledAction.htlcId: bigint
 property channel.IHtlcFulfilledAction.paymentPreimage: Buffer
+property channel.IHtlcFulfilledAction.replay?: true
 property channel.IHtlcFulfilledAction.type: channel.ChannelActionType.HTLC_FULFILLED
 interface channel.IHtlcOutputWithMeta extends script.IHtlcOutput
 property channel.IHtlcOutputWithMeta.amountMsat: bigint

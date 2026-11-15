@@ -5930,9 +5930,15 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 
 		this.channelManager.on(
 			'htlc:fulfilled',
-			(channelId: Buffer, htlcId: bigint, preimage: Buffer) => {
-				this.handleHtlcFulfilled(channelId, htlcId, preimage);
-				this.emit('htlc:fulfilled', { channelId, htlcId });
+			(
+				channelId: Buffer,
+				htlcId: bigint,
+				preimage: Buffer,
+				replay: boolean
+			) => {
+				if (this.handleHtlcFulfilled(channelId, htlcId, preimage, replay)) {
+					this.emit('htlc:fulfilled', { channelId, htlcId });
+				}
 			}
 		);
 
@@ -26438,13 +26444,49 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		}
 	}
 
+	/**
+	 * Settle an HTLC this node offered that the peer fulfilled. Returns false
+	 * when it was a replay with nothing left to do, in which case the
+	 * application-facing events (`htlc:fulfilled`, `payment:htlc-resolved`,
+	 * `payment:preimage`) are not raised again.
+	 */
 	private handleHtlcFulfilled(
 		channelId: Buffer,
 		htlcId: bigint,
-		preimage: Buffer
-	): void {
-		// Persist preimage immediately (proof of payment) before any message sends
+		preimage: Buffer,
+		replay = false
+	): boolean {
 		const preimageHash = sha256(preimage);
+		const outKey = `${channelId.toString('hex')}:offered-${htlcId}`;
+
+		// A replay is a fulfil this node already processed once: the channel
+		// re-emits every FULFILLED entry it still holds on reestablish (issue
+		// 295), and an older beignet peer retransmits the fulfil itself. The
+		// replay exists for a node killed before the node-level work below
+		// reached disk. When that work is already durable (the preimage is
+		// stored, no forward linkage is left to settle and no outgoing record
+		// is still waiting for this preimage), there is nothing to redo, and
+		// raising the events again would make an application that counts
+		// fulfils count this one twice (#2090).
+		if (replay) {
+			const hashHex = preimageHash.toString('hex');
+			const owed = this.payments.get(hashHex);
+			if (
+				this.preimages.has(hashHex) &&
+				!this.forwardedHtlcs.has(outKey) &&
+				!(
+					owed &&
+					owed.direction === PaymentDirection.OUTGOING &&
+					(owed.status === PaymentStatus.PENDING ||
+						owed.status === PaymentStatus.FAILED)
+				)
+			) {
+				this.retriesAwaitingRemoval.delete(outKey);
+				return false;
+			}
+		}
+
+		// Persist preimage immediately (proof of payment) before any message sends
 		this.preimages.set(preimageHash.toString('hex'), preimage);
 		this.commitMutations(
 			'savePreimage',
@@ -26459,7 +26501,6 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		);
 
 		// Check if this is a forwarded HTLC — propagate fulfillment upstream
-		const outKey = `${channelId.toString('hex')}:offered-${htlcId}`;
 		// A failure parked on this HTLC until its removal round completed
 		// (issue #989) is void: the peer fulfilled it after all (a disconnect
 		// before our revocation rolled the fail back, and the peer
@@ -26480,11 +26521,11 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			);
 			if (intercept === 'held') {
 				this.persistChannel(channelId);
-				return;
+				return true;
 			}
 			this.settleForwardUpstream(outKey, forward, preimage, preimageHash);
 			this.persistChannel(channelId);
-			return;
+			return true;
 		}
 
 		// Hash preimage to find the payment
@@ -26551,6 +26592,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		}
 		this.emitHtlcResolved(paymentHash, channelId, htlcId, 'fulfilled');
 		this.emitPaymentPreimage(paymentHash, preimage, 'htlc');
+		return true;
 	}
 
 	/** 'payment:htlc-resolved' for one offered HTLC of an outgoing payment. */

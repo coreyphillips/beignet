@@ -1368,8 +1368,8 @@ const result = await node.recoverFromStaticChannelBackup(scb.channels);
 | `payment:received` | `(payment: IPaymentInfo)` | Incoming payment settled. |
 | `payment:sent` | `(payment: IPaymentInfo)` | Outgoing payment completed. |
 | `payment:failed` | `(payment: IPaymentInfo)` | Outgoing payment failed. |
-| `payment:htlc-resolved` | `(event: IPaymentHtlcResolvedEvent)` | One offered HTLC of an outgoing payment reached a terminal state (fulfilled, irrevocably failed, or resolved on chain). |
-| `payment:preimage` | `(event: IPaymentPreimageEvent)` | An outgoing payment's preimage became known, from update_fulfill_htlc or an on-chain claim, whatever the record's status was. |
+| `payment:htlc-resolved` | `(event: IPaymentHtlcResolvedEvent)` | One offered HTLC of an outgoing payment reached a terminal state (fulfilled, irrevocably failed, or resolved on chain). A fulfilled HTLC is reported once, as `htlc:fulfilled` is. |
+| `payment:preimage` | `(event: IPaymentPreimageEvent)` | An outgoing payment's preimage became known, from update_fulfill_htlc or an on-chain claim, whatever the record's status was. From update_fulfill_htlc it is raised once per HTLC, as `htlc:fulfilled` is. |
 | `preimage:learned` | `(paymentHash: Buffer, preimage: Buffer)` | Preimage recorded (forwarding and settlement chokepoint). |
 | `invoice:settled` | `(data: { paymentHash: Buffer; bolt11: string; amountMsat: bigint })` | Invoice this node issued was settled. |
 | `htlc:held` | `(data: { paymentHash: Buffer; amountMsat: bigint })` | HTLC parked by a hold invoice (one part; read `getHeldInvoiceSnapshot` for the committed set). |
@@ -1402,7 +1402,7 @@ const result = await node.recoverFromStaticChannelBackup(scb.channels);
 | `htlc:forwarded` | `(data: { inChannelId: Buffer; outChannelId: Buffer; amountInMsat: bigint; amountOutMsat: bigint; feeMsat: bigint })` | A forwarded HTLC settled: the fee was earned. |
 | `htlc:forward-failed` | `(data: { inChannelId: Buffer; outChannelId: Buffer })` | A forwarded HTLC failed downstream. |
 | `htlc:forward-refused` | `(data: { inChannelId: Buffer; outChannelId: Buffer; amountMsat: bigint; paymentHash: Buffer; reason: string; channelErrorCode?: ChannelErrorCode })` | The outgoing channel refused to add a forward, so it was failed back to the sender with temporary_channel_failure. Not a `node:error`: someone else's payment was turned away, nothing of this node's failed. `reason` is the channel's refusal ('Insufficient balance for HTLC', 'Max pending HTLCs exceeded', ...) and `channelErrorCode` its code, when the refusing arm gave one. |
-| `htlc:fulfilled` | `(data: { channelId: Buffer; htlcId: bigint })` | The peer fulfilled an HTLC this node offered: a part of its own payment or the outgoing leg of a forward. |
+| `htlc:fulfilled` | `(data: { channelId: Buffer; htlcId: bigint })` | The peer fulfilled an HTLC this node offered: a part of its own payment or the outgoing leg of a forward. Raised once per HTLC: a reconnect or restart raises it again only when this node had not yet stored what the fulfil settled (the preimage, the forward or the payment record). |
 | `htlc:failed` | `(data: { channelId: Buffer; htlcId: bigint })` | The peer failed an HTLC this node offered: a part of its own payment or the outgoing leg of a forward. |
 | `broadcast:tx` | `(tx: Buffer)` | Transaction to broadcast on chain. |
 | `sweep:uneconomic` | `(channelId: Buffer, action: ISweepUneconomicChainAction)` | An on-chain claim was declined because it cannot pay its own fee (`reason: 'skipped'`), or a competing spend path opened while it stayed unclaimed (`reason: 'contested'`). Retries continue in both cases, until the outpoint is spent. |

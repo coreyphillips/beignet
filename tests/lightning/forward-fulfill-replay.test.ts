@@ -388,7 +388,17 @@ interface IForwardWorld {
 	cutAB: ICut;
 	cutBC: ICut;
 	gateAB: IWireGate;
+	gateBC: IWireGate;
 }
+
+/** The nodes and link switches, handed to a hook before the wires attach. */
+type PreWire = (w: {
+	alice: LightningNode;
+	bob: LightningNode;
+	charlie: LightningNode;
+	cutAB: ICut;
+	cutBC: ICut;
+}) => void;
 
 /**
  * Alice -> Bob -> Charlie with a known fee: Bob's policy is base 5000 /
@@ -397,7 +407,8 @@ interface IForwardWorld {
  */
 async function setupForwardWorld(
 	bobStorage?: IStorageBackend,
-	bobRecovery?: INodeConfig['recovery']
+	bobRecovery?: INodeConfig['recovery'],
+	preWire?: PreWire
 ): Promise<IForwardWorld> {
 	const alice = createNode(ALICE_SEED);
 	const bob = createNode(BOB_SEED, bobStorage, bobRecovery);
@@ -405,8 +416,12 @@ async function setupForwardWorld(
 	const cutAB: ICut = { val: false };
 	const cutBC: ICut = { val: false };
 	const gateAB: IWireGate = { hold: false, queue: [] };
+	const gateBC: IWireGate = { hold: false, queue: [] };
+	// Listeners registered here run before the wire's, so a hook can cut a
+	// link as a chosen message leaves, before it is delivered.
+	preWire?.({ alice, bob, charlie, cutAB, cutBC });
 	wire(alice, bob, cutAB, gateAB);
-	wire(bob, charlie, cutBC);
+	wire(bob, charlie, cutBC, gateBC);
 
 	const abChannelId = await openReadyChannel(alice, bob);
 	const bcChannelId = await openReadyChannel(bob, charlie);
@@ -454,7 +469,8 @@ async function setupForwardWorld(
 		bcChannelId,
 		cutAB,
 		cutBC,
-		gateAB
+		gateAB,
+		gateBC
 	};
 }
 
@@ -546,6 +562,58 @@ function countFulfillsTo(
 		if (pk === to.getNodeId() && t === MessageType.UPDATE_FULFILL_HTLC) {
 			seen.count++;
 		}
+	});
+	return seen;
+}
+
+/**
+ * Cut the link as `from` sends its final revoke_and_ack of a fulfil round
+ * to `to`: the first revoke_and_ack after its update_fulfill_htlc. `to`
+ * then holds its offered entry FULFILLED with the removal not yet
+ * acknowledged, the window in which reestablish re-emits the fulfil.
+ */
+function cutFinalRevokeAfterFulfill(
+	from: LightningNode,
+	to: LightningNode,
+	cut: ICut
+): void {
+	let fulfilled = false;
+	let done = false;
+	from.on('message:outbound', (pk: string, t: number) => {
+		if (done || pk !== to.getNodeId()) return;
+		if (t === MessageType.UPDATE_FULFILL_HTLC) fulfilled = true;
+		else if (fulfilled && t === MessageType.REVOKE_AND_ACK) {
+			// Once only: the retransmission after the reconnect must pass.
+			done = true;
+			cut.val = true;
+		}
+	});
+}
+
+/** What a node announced about fulfilled HTLCs, counted per event. */
+function countFulfilEvents(node: LightningNode): {
+	manager: number;
+	fulfilled: number;
+	resolved: number;
+	preimage: number;
+	sent: number;
+	withoutRecord: number;
+} {
+	const seen = {
+		manager: 0,
+		fulfilled: 0,
+		resolved: 0,
+		preimage: 0,
+		sent: 0,
+		withoutRecord: 0
+	};
+	node.getChannelManager().on('htlc:fulfilled', () => seen.manager++);
+	node.on('htlc:fulfilled', () => seen.fulfilled++);
+	node.on('payment:htlc-resolved', () => seen.resolved++);
+	node.on('payment:preimage', () => seen.preimage++);
+	node.on('payment:sent', () => seen.sent++);
+	node.on('log', (log: { action: string }) => {
+		if (log.action === 'fulfilled_without_record') seen.withoutRecord++;
 	});
 	return seen;
 }
@@ -1048,6 +1116,138 @@ describe('Replayed update_fulfill_htlc re-drives settlement (issue 295)', () => 
 			bobInternals.forwardedHtlcs.size,
 			'linkage cleared by the settle'
 		).to.equal(0);
+
+		alice.destroy();
+		bob.destroy();
+		charlie.destroy();
+	});
+
+	it('a fulfil re-emitted on reestablish reaches the application once (#2090)', async function () {
+		this.timeout(20_000);
+		const alice = createNode(ALICE_SEED);
+		const bob = createNode(BOB_SEED);
+		const cut: ICut = { val: false };
+		const gate: IWireGate = { hold: false, queue: [] };
+		cutFinalRevokeAfterFulfill(bob, alice, cut);
+		wire(alice, bob, cut, gate);
+
+		const channelId = await openReadyChannel(alice, bob);
+		const scid = encodeShortChannelId({
+			block: 500,
+			txIndex: 1,
+			outputIndex: 0
+		});
+		addGraphChannel(alice, scid, nodePubkey(ALICE_SEED), nodePubkey(BOB_SEED));
+		alice.registerChannelScid(channelId, scid);
+		const seen = countFulfilEvents(alice);
+
+		const invoice = bob.createInvoice({
+			amountMsat: 50_000n,
+			description: 'reemitted once'
+		});
+		const payment = alice.sendPayment(invoice.bolt11);
+		await waitFor(() => cut.val, "Bob's final revoke_and_ack to be cut");
+		await settle();
+		expect(payment.status, 'payment settled by the fulfill').to.equal(
+			PaymentStatus.COMPLETED
+		);
+		const channel = alice.getChannelManager().getChannel(channelId)!;
+		expect(
+			channel.getFullState().htlcs.get('offered-0')?.state,
+			'entry parked in FULFILLED, removal unacknowledged'
+		).to.equal(HtlcState.FULFILLED);
+		expect(seen, 'the first fulfil, announced once').to.deep.equal({
+			manager: 1,
+			fulfilled: 1,
+			resolved: 1,
+			preimage: 1,
+			sent: 1,
+			withoutRecord: 0
+		});
+
+		await cycleConnection(alice, bob, cut, gate);
+		await waitFor(
+			() => !channel.getFullState().htlcs.has('offered-0'),
+			'the removal to complete after the reconnect'
+		);
+
+		// The channel re-emitted the fulfil (the manager event fired again),
+		// and the node, which had nothing left to settle, kept it from the
+		// application.
+		expect(seen, 'nothing announced twice').to.deep.equal({
+			manager: 2,
+			fulfilled: 1,
+			resolved: 1,
+			preimage: 1,
+			sent: 1,
+			withoutRecord: 0
+		});
+		expect(payment.status).to.equal(PaymentStatus.COMPLETED);
+
+		alice.destroy();
+		bob.destroy();
+	});
+
+	it('a forward fulfil re-emitted on reestablish does not reach the payment path (#2090)', async function () {
+		this.timeout(30_000);
+		const world = await setupForwardWorld(undefined, undefined, (w) =>
+			cutFinalRevokeAfterFulfill(w.charlie, w.bob, w.cutBC)
+		);
+		const { alice, bob, charlie } = world;
+		const seen = countFulfilEvents(bob);
+
+		const invoice = charlie.createInvoice({
+			amountMsat: 80_000n,
+			description: 'forward reemit'
+		});
+		const payment = alice.sendPayment(invoice.bolt11);
+		await waitFor(
+			() => world.cutBC.val,
+			"Charlie's final revoke_and_ack to be cut"
+		);
+		await waitFor(
+			() => payment.status === PaymentStatus.COMPLETED,
+			'the payer to settle'
+		);
+
+		// Bob settled upstream: the linkage is consumed and the preimage
+		// stored, while the outgoing entry still waits for Charlie's
+		// revoke_and_ack.
+		const bobInternals = bob as unknown as {
+			forwardedHtlcs: Map<string, unknown>;
+		};
+		expect(bobInternals.forwardedHtlcs.size, 'linkage consumed').to.equal(0);
+		const outbound = bob.getChannelManager().getChannel(world.bcChannelId)!;
+		expect(
+			outbound.getFullState().htlcs.get('offered-0')?.state,
+			'outgoing entry parked in FULFILLED'
+		).to.equal(HtlcState.FULFILLED);
+		expect(seen, 'the forward announced once').to.deep.equal({
+			manager: 1,
+			fulfilled: 1,
+			resolved: 0,
+			preimage: 0,
+			sent: 0,
+			withoutRecord: 0
+		});
+
+		await cycleConnection(bob, charlie, world.cutBC, world.gateBC);
+		await waitFor(
+			() => !outbound.getFullState().htlcs.has('offered-0'),
+			'the removal to complete after the reconnect'
+		);
+
+		// Before #2090's follow-up the re-emission found no linkage, fell
+		// through to the payment branch, logged fulfilled_without_record and
+		// raised payment:preimage for a hash that is not Bob's payment.
+		expect(seen, 'nothing announced twice').to.deep.equal({
+			manager: 2,
+			fulfilled: 1,
+			resolved: 0,
+			preimage: 0,
+			sent: 0,
+			withoutRecord: 0
+		});
 
 		alice.destroy();
 		bob.destroy();

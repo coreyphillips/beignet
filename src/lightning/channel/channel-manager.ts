@@ -10337,7 +10337,8 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 						'htlc:fulfilled',
 						channel.getChannelId()!,
 						action.htlcId,
-						action.paymentPreimage
+						action.paymentPreimage,
+						action.replay === true
 					);
 					break;
 				case ChannelActionType.HTLC_FAILED:
