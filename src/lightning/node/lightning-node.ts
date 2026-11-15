@@ -27781,10 +27781,10 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	 * eventually leaving no route at all.
 	 *
 	 * Channel-scoped failures are those carrying the UPDATE flag (0x1000), which by
-	 * definition describe the outgoing channel, plus the two BOLT 4 failures that
+	 * definition describe the outgoing channel, plus the three BOLT 4 failures that
 	 * also describe the outgoing channel but carry no channel_update and therefore
-	 * no UPDATE flag: unknown_next_peer and required_channel_feature_missing.
-	 * permanent_channel_failure needs no special case, it is PERM|UPDATE|8.
+	 * no UPDATE flag: permanent_channel_failure, required_channel_feature_missing
+	 * and unknown_next_peer.
 	 */
 	private getCulpableHopScid(
 		payment: IPaymentInfo,
@@ -27811,7 +27811,9 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		if ((code & 0x2000) !== 0) return false;
 		if ((code & 0x1000) !== 0) return true;
 		return (
-			code === UNKNOWN_NEXT_PEER || code === REQUIRED_CHANNEL_FEATURE_MISSING
+			code === PERMANENT_CHANNEL_FAILURE ||
+			code === REQUIRED_CHANNEL_FEATURE_MISSING ||
+			code === UNKNOWN_NEXT_PEER
 		);
 	}
 

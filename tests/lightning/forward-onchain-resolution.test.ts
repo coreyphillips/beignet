@@ -32,6 +32,7 @@ import {
 import { IChannelBasepoints } from '../../src/lightning/keys/derivation';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
 import { INVALID_ONION_BLINDING } from '../../src/lightning/onion/types';
+import { decryptFailureMessage } from '../../src/lightning/onion/failures';
 
 // ─── Helpers (model: audit-remediation.test.ts) ───
 
@@ -248,6 +249,38 @@ describe('S-2.M3: on-chain timeout of a forwarded outgoing leg', function () {
 		// The forward-timeout scan now has nothing to force-close.
 		(alice as any).scanForwardTimeouts(height + 1);
 		expect(forceClose).to.equal(false);
+
+		fx.alice.destroy();
+		fx.bob.destroy();
+		fx.carol.destroy();
+	});
+
+	it('fails the inbound leg with permanent_channel_failure, wire code 0x4008', () => {
+		const fx = setupForwardWithResolvingOutgoingLeg();
+		const { alice, inChannelId, height } = fx;
+		const sharedSecret = crypto.randomBytes(32);
+		(alice as any).receivedHtlcSharedSecrets.set(
+			`${inChannelId.toString('hex')}:7`,
+			sharedSecret
+		);
+		const reasons: Buffer[] = [];
+		const realFailHtlc = (alice as any).channelManager.failHtlc.bind(
+			(alice as any).channelManager
+		);
+		(alice as any).channelManager.failHtlc = (
+			channelId: Buffer,
+			htlcId: bigint,
+			reason: Buffer
+		): ReturnType<typeof realFailHtlc> => {
+			reasons.push(reason);
+			return realFailHtlc(channelId, htlcId, reason);
+		};
+
+		(alice as any).channelManager.handleNewBlock(height + 1);
+
+		expect(reasons).to.have.length(1);
+		const decrypted = decryptFailureMessage([sharedSecret], reasons[0]);
+		expect(decrypted?.failure.failureCode).to.equal(0x4008);
 
 		fx.alice.destroy();
 		fx.bob.destroy();

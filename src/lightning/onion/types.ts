@@ -115,11 +115,15 @@ export const TEMPORARY_NODE_FAILURE = 0x2000 | 2;
 export const EXPIRY_TOO_FAR = 21;
 export const CHANNEL_DISABLED = 0x1000 | 20;
 export const PERMANENT_NODE_FAILURE = 0x4000 | 0x2000 | 2;
-export const PERMANENT_CHANNEL_FAILURE = 0x4000 | 0x1000 | 8;
 /**
- * BOLT 4 PERM|9. Note this describes the OUTGOING channel of the erring node,
- * like permanent_channel_failure, but unlike it carries no UPDATE flag, so it
- * cannot be classified as channel-scoped by that flag alone.
+ * BOLT 4 PERM|8. It describes the OUTGOING channel of the erring node but
+ * carries no UPDATE flag, so it cannot be classified as channel-scoped by that
+ * flag alone.
+ */
+export const PERMANENT_CHANNEL_FAILURE = 0x4000 | 8;
+/**
+ * BOLT 4 PERM|9. Like permanent_channel_failure, this describes the OUTGOING
+ * channel of the erring node and carries no UPDATE flag.
  */
 export const REQUIRED_CHANNEL_FEATURE_MISSING = 0x4000 | 9;
 export const REQUIRED_NODE_FEATURE_MISSING = 0x4000 | 0x2000 | 3;
