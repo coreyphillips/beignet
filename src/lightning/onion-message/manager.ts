@@ -19,10 +19,11 @@ import {
 } from './codec';
 import { constructReplyOnionMessage } from './construct';
 import { processOnionMessage } from './process';
-import type { IBlindedPath } from '../onion/blinded-path';
+import type { IBlindedPath, IChannelEnds } from '../onion/blinded-path';
 import {
 	advancePastOwnHops,
-	constructBlindedPath
+	constructBlindedPath,
+	resolveIntroductionNode
 } from '../onion/blinded-path';
 import { getPublicKey } from '../crypto/ecdh';
 
@@ -66,6 +67,8 @@ export class OnionMessageManager extends EventEmitter {
 	private sendMessage:
 		| ((toPeer: string, type: number, payload: Buffer) => void)
 		| null = null;
+	private channelLookup: ((scid: Buffer) => IChannelEnds | undefined) | null =
+		null;
 
 	constructor(
 		nodePrivkey: Buffer,
@@ -88,6 +91,39 @@ export class OnionMessageManager extends EventEmitter {
 		fn: (toPeer: string, type: number, payload: Buffer) => void
 	): void {
 		this.sendMessage = fn;
+	}
+
+	/**
+	 * Set how a short_channel_id maps to the nodes at its two ends. It lets a
+	 * relayed hop name its next node by channel, and a path start at a
+	 * `sciddir` introduction point. Without it both are refused.
+	 */
+	setChannelLookup(fn: (scid: Buffer) => IChannelEnds | undefined): void {
+		this.channelLookup = fn;
+	}
+
+	/**
+	 * The path with a `sciddir` first_node_id replaced by the node it names.
+	 * Throws when the channel is unknown.
+	 */
+	resolveIntroduction(path: IBlindedPath): IBlindedPath {
+		const lookup = this.channelLookup;
+		const resolved = resolveIntroductionNode(path, (scid) => lookup?.(scid));
+		if (!resolved) {
+			throw new Error(
+				'Blinded path introduction point names a channel this node does not know'
+			);
+		}
+		return resolved;
+	}
+
+	/** Our peer on the channel with this SCID, if we are one of its ends. */
+	private peerOnChannel(scid: Buffer): Buffer | undefined {
+		const ends = this.channelLookup?.(scid);
+		if (!ends) return undefined;
+		if (ends.nodeId1.equals(this.nodeId)) return ends.nodeId2;
+		if (ends.nodeId2.equals(this.nodeId)) return ends.nodeId1;
+		return undefined;
 	}
 
 	/**
@@ -207,7 +243,8 @@ export class OnionMessageManager extends EventEmitter {
 			const result = processOnionMessage(
 				msg.onionRoutingPacket,
 				this.nodePrivkey,
-				msg.blindingPoint
+				msg.blindingPoint,
+				(scid) => this.peerOnChannel(scid)
 			);
 
 			if (result.type === 'delivery') {
@@ -292,7 +329,10 @@ export class OnionMessageManager extends EventEmitter {
 		if (!send) {
 			throw new Error('Send function not configured');
 		}
-		const sendPath = advancePastOwnHops(path, this.nodePrivkey);
+		const sendPath = advancePastOwnHops(
+			this.resolveIntroduction(path),
+			this.nodePrivkey
+		);
 		const msg = constructReplyOnionMessage(
 			sendPath,
 			messageData,

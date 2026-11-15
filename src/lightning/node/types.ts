@@ -1005,10 +1005,13 @@ export interface IPaymentRetryContext {
 	 * accumulated channel exclusions.
 	 */
 	bolt12Invoice?: IBolt12Invoice;
-	/** Index into bolt12Invoice.paths used by the current attempt. */
+	/**
+	 * Index into the invoice's blinded paths used by the current attempt:
+	 * bolt12Invoice.paths, or the BOLT 11 invoice's blindedPaths.
+	 */
 	bolt12PathIndex?: number;
 	/**
-	 * Indices of bolt12Invoice.paths whose BLINDED segment failed. Channel
+	 * Indices of those blinded paths whose BLINDED segment failed. Channel
 	 * exclusion cannot route around a blinded hop (its SCID is opaque), so
 	 * route selection skips these paths entirely and a retry rotates to the
 	 * invoice's other paths (BOLT 4: on a failure from a blinded hop the

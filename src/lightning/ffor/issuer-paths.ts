@@ -68,8 +68,9 @@ export function buildIssuerPaymentPath(
 ): IBlindedPaymentPath {
 	if (hops.length < 2) throw new Error('template needs a relay hop and R');
 	const relays = hops.slice(0, -1);
-	const hopData: IBlindedHopData[] = relays.map((h, i) => ({
-		nextNodeId: hops[i + 1].nodeId,
+	// short_channel_id only: BOLT 4 readers refuse a hop that also names
+	// next_node_id.
+	const hopData: IBlindedHopData[] = relays.map((h) => ({
 		shortChannelId: h.shortChannelId,
 		paymentRelay: {
 			cltvExpiryDelta: h.cltvExpiryDelta,

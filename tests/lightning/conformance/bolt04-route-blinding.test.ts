@@ -78,6 +78,7 @@ interface IRouteBlindingVectors {
 const v = loadVectors<IRouteBlindingVectors>('bolt04/route-blinding.json');
 
 const ERD_NEXT_PATH_KEY_OVERRIDE = 8n;
+const ERD_ALLOWED_FEATURES = 14n;
 
 describe('BOLT 4: route blinding conformance', function () {
 	describe('generate (sender side)', function () {
@@ -172,16 +173,29 @@ describe('BOLT 4: route blinding conformance', function () {
 					hop.next_path_key
 				);
 
-				const processed = processBlindedHop(
-					pathKey,
-					nodePrivkey,
-					hexToBuffer(v.route.hops[i].encrypted_data)
-				);
-				expect(bufferToHex(processed.nextBlindingKey)).to.equal(
-					hop.next_path_key_override ?? hop.next_path_key
-				);
-
 				const { records } = decodeTlvStream(plaintext);
+				const allowed = findTlvRecord(records, ERD_ALLOWED_FEATURES);
+				if (allowed && allowed.some((b) => b !== 0)) {
+					// BOLT 4: allowed_features naming an unknown feature (Eve's
+					// bit 113) MUST be refused, even though the bit is odd.
+					expect(() =>
+						processBlindedHop(
+							pathKey,
+							nodePrivkey,
+							hexToBuffer(v.route.hops[i].encrypted_data)
+						)
+					).to.throw('allowed_features');
+				} else {
+					const processed = processBlindedHop(
+						pathKey,
+						nodePrivkey,
+						hexToBuffer(v.route.hops[i].encrypted_data)
+					);
+					expect(bufferToHex(processed.nextBlindingKey)).to.equal(
+						hop.next_path_key_override ?? hop.next_path_key
+					);
+				}
+
 				const override = findTlvRecord(records, ERD_NEXT_PATH_KEY_OVERRIDE);
 				if (hop.next_path_key_override) {
 					expect(bufferToHex(override as Buffer)).to.equal(
@@ -209,11 +223,15 @@ describe('BOLT 4: route blinding conformance', function () {
 			expect(bob.paymentConstraints?.maxCltvExpiry).to.equal(748005);
 			expect(bob.paymentConstraints?.htlcMinimumMsat).to.equal(1500n);
 
-			// Eve (final hop) carries the recipient's path_id.
-			const eve = decodeBlindedHopData(
-				hexToBuffer(v.unblind.hops[3].decrypted_data)
-			);
-			expect(bufferToHex(eve.pathId as Buffer)).to.equal('deadbeef');
+			// Bob also carries unknown odd type 561 and an empty
+			// allowed_features, both of which a reader accepts.
+			expect(bob.allowedFeatures?.length).to.equal(0);
+
+			// Eve (final hop) names unknown feature 113 in allowed_features,
+			// which the reader MUST refuse.
+			expect(() =>
+				decodeBlindedHopData(hexToBuffer(v.unblind.hops[3].decrypted_data))
+			).to.throw('allowed_features');
 		});
 	});
 });

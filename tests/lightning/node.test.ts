@@ -1957,13 +1957,11 @@ describe('Lightning Node', function () {
 			};
 			const hopData: IBlindedHopData[] = [
 				{
-					nextNodeId: carolPub,
 					shortChannelId: scidBC,
 					paymentRelay: relay,
 					paymentConstraints: constraints
 				},
 				{
-					nextNodeId: davePub,
 					shortChannelId: scidCD,
 					paymentRelay: relay,
 					paymentConstraints: constraints
@@ -3100,7 +3098,6 @@ describe('Lightning Node', function () {
 				[
 					{
 						shortChannelId: outScid,
-						nextNodeId: getPublicKey(crypto.randomBytes(32)),
 						paymentRelay: {
 							cltvExpiryDelta,
 							feeProportionalMillionths: 0,

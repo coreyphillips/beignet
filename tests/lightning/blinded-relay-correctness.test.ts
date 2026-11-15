@@ -245,7 +245,6 @@ function buildTwoHopBlinded(opts: {
 		const decoded = decodeInvoice(baseInv.bolt11);
 		const hopData: IBlindedHopData[] = [
 			{
-				nextNodeId: carolPub,
 				shortChannelId: scidBC,
 				paymentRelay: relay,
 				paymentConstraints: CONSTRAINTS
@@ -404,13 +403,11 @@ describe('Blinded relay correctness (S-4.M1 / S-4.M2)', function () {
 		};
 		const hopData: IBlindedHopData[] = [
 			{
-				nextNodeId: carolPub,
 				shortChannelId: scidBC,
 				paymentRelay: relay,
 				paymentConstraints: CONSTRAINTS
 			},
 			{
-				nextNodeId: davePub,
 				shortChannelId: scidCD,
 				paymentRelay: relay,
 				paymentConstraints: CONSTRAINTS
