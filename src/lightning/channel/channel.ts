@@ -4917,9 +4917,10 @@ export class Channel {
 	 * forgotten across a disconnect, and a restarted peer restores a state
 	 * that may predate it), so handleReestablish retransmits the queue: the
 	 * entries our last commitment_signed covered ahead of that signature when
-	 * it is retransmitted, the entries queued after it behind it. Receivers
-	 * treat replays idempotently (duplicate add ids are ignored; a
-	 * fulfill/fail of an already fulfilled/failed HTLC is a no-op).
+	 * it is retransmitted, the entries queued after it behind it. When the
+	 * peer already holds that signature, the entries it covered are not
+	 * retransmitted, a fulfil excepted (issue 295): the peer holds them too,
+	 * and LND rejects a duplicate as "invalid update".
 	 */
 	private _queuePendingLocalUpdate(type: MessageType, payload: Buffer): void {
 		this._state.pendingLocalUpdates.push({
@@ -11999,13 +12000,20 @@ export class Channel {
 		}
 
 		// ── Retransmit un-acked update messages (BOLT 2) ──
-		// Every queued update the peer has not acknowledged with a
-		// revoke_and_ack may have been lost with the connection (the peer
-		// forgets uncommitted updates; a restarted peer restores a state that
-		// may predate them). Replay them verbatim, in the order they were
-		// sent. Peers that did keep them treat the replays idempotently
-		// (duplicate add ids ignored; fulfill/fail of an already
-		// fulfilled/failed HTLC is a no-op).
+		// A queued update the peer has not acknowledged with a revoke_and_ack
+		// may have been lost with the connection (the peer forgets uncommitted
+		// updates; a restarted peer restores a state that may predate them).
+		// Replay those verbatim, in the order they were sent.
+		//
+		// Except the ones our last commitment_signed covered, when the peer's
+		// next_commitment_number says it holds that signature: it then holds
+		// every update the signature covered, and only its revoke_and_ack was
+		// lost (it retransmits that itself). A replay of a covered update
+		// reaches the peer as a duplicate. Beignet's receiver ignores one, but
+		// LND does not: a second add with a used id, or a fulfil or fail of an
+		// HTLC it has already removed, fails its link with "invalid update",
+		// sent as a wire error, and we force-close on that error. A covered
+		// fulfil is the one exception for now (issue 295, argued below).
 		//
 		// A retransmitted commitment_signed must follow exactly the updates it
 		// covers (issue #1300). The queue's first pendingLocalUpdatesSignedCount
@@ -12019,7 +12027,8 @@ export class Channel {
 		// it), which is where they sat on the original connection. They stay
 		// queued and needsCommitment stays set, so our NEXT signature covers
 		// them once the peer's revoke_and_ack for this one arrives. With no
-		// signature to retransmit the whole queue goes out here, as before.
+		// signature to retransmit, every update the peer does not already hold
+		// goes out here.
 		const peerMissedCommitment =
 			msg.nextCommitmentNumber <= this._state.remoteCommitmentNumber &&
 			this._state.remoteCommitmentNumber > 0n;
@@ -12037,15 +12046,26 @@ export class Channel {
 					: queue.length;
 			for (let i = 0; i < queue.length; i++) {
 				const update = queue[i];
-				// A fee already covered by the commitment the peer holds must not
-				// start another fee round on replay. The lost revoke_and_ack will
-				// acknowledge it; unsigned updates and a missing commitment still
-				// need their original replay.
+				// Covered by the commitment the peer holds: the peer has it, and
+				// its lost revoke_and_ack will acknowledge it. A replayed add or
+				// fail is a duplicate LND rejects, and a replayed fee starts
+				// another fee round. The entry stays queued until that
+				// revoke_and_ack trims it. Updates sent after the signature, and
+				// every update when the peer missed the signature, still need
+				// their original replay.
+				//
+				// A covered fulfil still goes out, for now. A beignet forwarder
+				// killed between persisting the FULFILLED entry and persisting
+				// the preimage restarts holding our signature but no preimage,
+				// and this replay is how it learns the preimage and settles
+				// upstream (issue 295). LND rejects it as "invalid update", as
+				// it does the fail; that exception goes once the forwarder
+				// persists the preimage with the channel state instead.
 				if (
 					peerHasCommitment &&
 					Number.isInteger(signedCount) &&
 					i < signedCount &&
-					update.type === MessageType.UPDATE_FEE
+					update.type !== MessageType.UPDATE_FULFILL_HTLC
 				) {
 					continue;
 				}
