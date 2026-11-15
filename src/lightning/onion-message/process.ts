@@ -18,6 +18,7 @@ import { decodeOnionPacket, encodeOnionPacket } from '../onion/construct';
 import { decodeOnionMessagePayload } from './codec';
 import { decodeBigSize } from '../message/codec';
 import type { OnionMessageProcessResult } from './types';
+import type { IBlindedHopData } from '../onion/blinded-path';
 import {
 	decodeBlindedHopData,
 	deriveBlindedPrivkey
@@ -136,26 +137,22 @@ export function processOnionMessage(
 	const isFinal = nextHmac.equals(Buffer.alloc(32));
 
 	if (isFinal) {
-		// Final delivery — surface the blinded-path path_id (BOLT 4) so the
-		// recipient can verify the message arrived via a path it published.
-		// Only trust a path_id from SUCCESSFULLY DECRYPTED recipient data:
-		// unencrypted/plaintext hop data is attacker-forgeable.
+		// The decrypted path_id lets the recipient check the message came over
+		// a path it published. Recipient data that fails to decrypt or decode
+		// drops the message (BOLT 4). A payload with no recipient data is the
+		// legacy unblinded form (constructSimpleOnionMessage): no path_id.
 		let pathId: Buffer | undefined;
-		if (hopPayload.encryptedRecipientData && blindingPoint) {
-			try {
-				const blindingSharedSecret = deriveBlindingSharedSecret(
-					blindingPoint,
-					nodePrivkey
+		if (hopPayload.encryptedRecipientData) {
+			if (!blindingPoint) {
+				throw new Error(
+					'Final onion message hop carries encrypted_recipient_data but no blinding point'
 				);
-				const encKey = deriveBlindingEncryptionKey(blindingSharedSecret);
-				const plaintext = decryptBlindedData(
-					encKey,
-					hopPayload.encryptedRecipientData
-				);
-				pathId = decodeBlindedHopData(plaintext).pathId;
-			} catch {
-				// Undecryptable final-hop recipient data: no verifiable path_id.
 			}
+			pathId = readRecipientData(
+				hopPayload.encryptedRecipientData,
+				nodePrivkey,
+				blindingPoint
+			).data.pathId;
 		}
 		return {
 			type: 'delivery',
@@ -222,6 +219,24 @@ function countPayloadTlvs(buf: Buffer): number {
 }
 
 /**
+ * Decrypt and strictly decode a hop's encrypted_recipient_data. Throws when
+ * the data fails authentication or the reader refuses it; BOLT 4 has every
+ * hop, the final one included, ignore the message in either case.
+ */
+function readRecipientData(
+	encryptedRecipientData: Buffer,
+	nodePrivkey: Buffer,
+	blindingPoint: Buffer
+): { data: IBlindedHopData; sharedSecret: Buffer } {
+	const sharedSecret = deriveBlindingSharedSecret(blindingPoint, nodePrivkey);
+	const plaintext = decryptBlindedData(
+		deriveBlindingEncryptionKey(sharedSecret),
+		encryptedRecipientData
+	);
+	return { data: decodeBlindedHopData(plaintext), sharedSecret };
+}
+
+/**
  * Resolve next hop from encrypted_recipient_data (BOLT 4 route blinding).
  * Forwarding REQUIRES a blinding point and decryptable recipient data: the
  * plaintext next_node_id fallback (beignet's pre-route-blinding multi-hop
@@ -239,13 +254,11 @@ function resolveNextHop(
 			'Cannot determine next hop: onion message carries no blinding point'
 		);
 	}
-	const blindingSharedSecret = deriveBlindingSharedSecret(
-		blindingPoint,
-		nodePrivkey
+	const { data: blindedHopData, sharedSecret } = readRecipientData(
+		encryptedRecipientData,
+		nodePrivkey,
+		blindingPoint
 	);
-	const encKey = deriveBlindingEncryptionKey(blindingSharedSecret);
-	const plaintext = decryptBlindedData(encKey, encryptedRecipientData);
-	const blindedHopData = decodeBlindedHopData(plaintext);
 
 	// BOLT 4: a path_id belongs to the final hop only; an intermediate node
 	// that finds one MUST ignore the message.
@@ -273,6 +286,6 @@ function resolveNextHop(
 		nextNodeId,
 		nextBlindingKey:
 			blindedHopData.nextPathKeyOverride ??
-			deriveNextBlindingKey(blindingPoint, blindingSharedSecret)
+			deriveNextBlindingKey(blindingPoint, sharedSecret)
 	};
 }
