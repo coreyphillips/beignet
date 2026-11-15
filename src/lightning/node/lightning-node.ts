@@ -16774,6 +16774,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		this.requireGraph('findBlindedIntroExtension');
 		const ourNodeId = this.ownNodeId();
 		for (const edge of this.graph.getNodeChannels(peerPubkey)) {
+			if (edge.fundingSpentHeight !== undefined) continue;
 			const introIsNode1 = edge.nodeId2.equals(peerPubkey);
 			const introPubkey = introIsNode1 ? edge.nodeId1 : edge.nodeId2;
 			if (introPubkey.equals(ourNodeId) || introPubkey.equals(peerPubkey)) {

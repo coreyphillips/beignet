@@ -152,6 +152,9 @@ class FakeChain {
 		if (opts.unrelated) {
 			tx.addInput(crypto.randomBytes(32), 0);
 			tx.addOutput(script.p2wshOutput, 1_000);
+			this.unspent
+				.get(scriptHash)!
+				.push({ txid: tx.getId(), outputIndex: 0, valueSat: 1_000, height });
 		} else {
 			tx.addInput(Buffer.from(funding.txid, 'hex').reverse(), 0);
 			tx.setWitness(0, [
@@ -164,7 +167,10 @@ class FakeChain {
 				Buffer.concat([Buffer.from([0, 20]), Buffer.alloc(20)]),
 				99_000
 			);
-			this.unspent.set(scriptHash, []);
+			this.unspent.set(
+				scriptHash,
+				this.unspent.get(scriptHash)!.filter((u) => u.txid !== funding.txid)
+			);
 		}
 		this.txs.set(tx.getId(), tx.toBuffer());
 		this.history.get(scriptHash)!.push({ txid: tx.getId(), height });
@@ -363,6 +369,17 @@ describe('findAnnouncedChannelSpend (issue #2048)', () => {
 		expect(
 			(await findAnnouncedChannelSpend(chain.backend(), ann)).verdict
 		).to.equal('unspent');
+	});
+
+	it('payments to the script before the close do not hide it', async () => {
+		const chain = new FakeChain();
+		chain.fund(ann);
+		chain.spend(ann, 600, { unrelated: true });
+		chain.spend(ann, 700, { unrelated: true });
+		chain.spend(ann, 990);
+		const spend = await findAnnouncedChannelSpend(chain.backend(), ann);
+		expect(spend).to.deep.include({ verdict: 'spent', height: 990 });
+		expect(spend.lookups).to.be.at.most(MAX_FUNDING_SPEND_LOOKUPS);
 	});
 
 	it('settles nothing for a fabricated SCID or a down backend', async () => {

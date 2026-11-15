@@ -641,9 +641,19 @@ export async function findAnnouncedChannelSpend(
 	} catch {
 		return result('unavailable');
 	}
+	// Anyone can pay to the public funding script, and only the two parties
+	// can spend those payments, so they stay in the unspent set. Trying those
+	// transactions last keeps third-party payments from pushing the spend out
+	// of the candidate window. They are kept at all because a splice that
+	// reuses the funding keys also pays to this script.
+	const paysScript = new Set(unspent.map((u) => u.txid));
 	const candidates = history
 		.filter((h) => h.txid !== funding.txid && h.height >= scid.block)
-		.sort((a, b) => a.height - b.height)
+		.sort(
+			(a, b) =>
+				Number(paysScript.has(a.txid)) - Number(paysScript.has(b.txid)) ||
+				a.height - b.height
+		)
 		.slice(0, FUNDING_SPEND_CANDIDATES);
 	for (const candidate of candidates) {
 		let tx: bitcoin.Transaction;
