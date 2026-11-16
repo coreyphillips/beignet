@@ -726,6 +726,67 @@ describe('host extensions: the members that reach the node, in a node', function
 		expect(built).to.deep.equal([]);
 	});
 
+	it("keeps the provider's extension running, with its storage open, until the node has drained, and stops and fences it after", async () => {
+		const events: string[] = [];
+		let provided: IExtensionContext | undefined;
+		let other: IExtensionContext | undefined;
+		const writes = (context: IExtensionContext | undefined): string => {
+			try {
+				context!.storage.set('state', 'of the next commitment');
+				return 'open';
+			} catch {
+				return 'fenced';
+			}
+		};
+		const node = await boot([
+			watching('assets', (context) => {
+				provided = context;
+				return {
+					auxiliaryChannels: auxiliaryChannels(),
+					stop: (): void => {
+						events.push(`assets stops: its storage ${writes(provided)}`);
+					}
+				};
+			}),
+			watching('reports', (context) => {
+				other = context;
+				return {
+					stop: (): void => {
+						events.push('reports stops');
+					}
+				};
+			})
+		]);
+		await node.extensionHost?.started;
+		const engine = built[0].node as LightningNode;
+		const drain = engine.gracefulShutdown.bind(engine);
+		engine.gracefulShutdown = async (timeoutMs?: number): Promise<void> => {
+			// Here the node still waits for its in-flight HTLCs, each through
+			// commitment updates that call the provider's hooks.
+			events.push(
+				`node drains: assets storage ${writes(provided)}, ` +
+					`reports storage ${writes(other)}`
+			);
+			return drain(timeoutMs);
+		};
+		await node.gracefulShutdown(4000);
+		expect(events).to.deep.equal([
+			'reports stops',
+			'node drains: assets storage open, reports storage fenced',
+			'assets stops: its storage open'
+		]);
+		// Fenced once its stop hook has run.
+		expect(writes(provided)).to.equal('fenced');
+		expect(
+			(node.extensionHost as ExtensionHost)
+				.describe()
+				.map((info) => [info.id, info.state])
+		).to.deep.equal([
+			['assets', 'stopped'],
+			['reports', 'stopped']
+		]);
+	});
+
 	it("restores nothing and takes the node down when the provider's extension refuses it in bind", async () => {
 		const storage = new MemoryStorage();
 		const reads: string[] = [];

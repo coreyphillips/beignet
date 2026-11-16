@@ -843,8 +843,10 @@ method ExtensionHost.binds(): boolean
 method ExtensionHost.describe(): IExtensionInfo[]
 get ExtensionHost.extensions(): readonly IBeignetExtension[]
 method ExtensionHost.fenceForRebuild(): void
+method ExtensionHost.finishShutdown(limitMs?: number): Promise<void>
 method ExtensionHost.handler(id: string, key: string): ExtensionHandler
 method ExtensionHost.holdWrites(): () => void
+method ExtensionHost.keepUntilDrained(id: string | undefined): void
 method ExtensionHost.onEvent(listener: ExtensionEventListener): () => void
 method ExtensionHost.refuseSupply(id: string, err: unknown): void
 method ExtensionHost.shutdown(limitMs?: number): Promise<void>

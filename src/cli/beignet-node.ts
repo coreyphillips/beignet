@@ -2481,6 +2481,8 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	private _restoreAuxiliaryChannels?: INodeConfig['auxiliaryChannels'];
 	/** Whether the node being built runs asset channels, and so gets the gate. */
 	private _gatesAssetPayments = false;
+	/** The extension that supplies the node's asset channels, when one does. */
+	private _assetProviderId?: string;
 	/** The assembled run decision (guardian modes only). */
 	private _recoveryRun?: Extract<GuardianBootDecision, { kind: 'run' }>;
 	/** The env named a guardian set the journal has since rotated away from. */
@@ -3523,6 +3525,8 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 		// holds asset channels this provider does not say it can restore.
 		this._restoreAuxiliaryChannels = auxiliary?.auxiliaryChannels;
 		this._gatesAssetPayments = auxiliary !== undefined;
+		this._assetProviderId = auxiliary?.id;
+		this._extensionHost?.keepUntilDrained(auxiliary?.id);
 
 		// 5. Create electrum backend for chain monitoring
 		const electrumBackend = new ElectrumBackend(this.wallet.electrum);
@@ -17943,11 +17947,20 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 		// push the wallet's stop and the database's close past that exit
 		// (issue #958). No await without an extension, so the shutdown keeps
 		// its timing.
+		//
+		// The extension that supplies the node's asset channels is the
+		// exception: the node calls its provider for every commitment while
+		// it drains its in-flight HTLCs, so that extension is left running,
+		// with its storage open, and is stopped and fenced after the drain.
+		// The drain then gets three quarters of what is left, and the
+		// extension's stop the rest.
 		let drainMs = timeoutMs;
+		const began = Date.now();
+		const provider = this._assetProviderId;
 		if (this._extensionHost) {
-			const began = Date.now();
 			await this._extensionHost.shutdown(timeoutMs / 2);
 			drainMs = Math.max(0, timeoutMs - (Date.now() - began));
+			if (provider !== undefined) drainMs = Math.floor((drainMs * 3) / 4);
 		}
 		// A restore-pending daemon never built the node or the wallet. The
 		// node closes only its view of the database: the wallet writes
@@ -17957,7 +17970,16 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 		try {
 			await (this.node as LightningNode | undefined)?.gracefulShutdown(drainMs);
 		} finally {
-			await this.stopWalletAndCloseStorage();
+			try {
+				// No await without a provider's extension to stop.
+				if (provider !== undefined) {
+					await this._extensionHost?.finishShutdown(
+						Math.max(0, timeoutMs - (Date.now() - began))
+					);
+				}
+			} finally {
+				await this.stopWalletAndCloseStorage();
+			}
 		}
 	}
 

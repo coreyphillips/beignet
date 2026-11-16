@@ -679,6 +679,14 @@ export class ExtensionHost {
 	private settling: Promise<void> = Promise.resolve();
 	private shutDown = false;
 	/**
+	 * The slot shutdown() left running for the node's drain, and whether it
+	 * is there by a retained attachment (a failed start that supplied the
+	 * provider). finishShutdown() stops and fences it.
+	 */
+	private deferred?: { slot: IExtensionSlot; retained: boolean };
+	/** The extension that supplies the node's asset channels (keepUntilDrained). */
+	private keptUntilDrained?: string;
+	/**
 	 * Moves on every attach() and on every teardown. An attach() that finds
 	 * it moved was overtaken: its build is gone, and it attaches nothing more.
 	 */
@@ -1022,8 +1030,15 @@ export class ExtensionHost {
 	 * is shorter: the hooks of this generation run together, alongside
 	 * whatever an earlier one left running, and none adds its wait to
 	 * another's. The node passes a share of its own shutdown budget.
+	 *
+	 * The extension named to keepUntilDrained() is the exception. Its
+	 * routes close with the others, but it is neither stopped nor fenced
+	 * here: the node calls its provider for every commitment while it
+	 * drains its in-flight HTLCs, so the extension and its storage stay as
+	 * they are until finishShutdown(), after the drain.
 	 */
 	async shutdown(limitMs?: number): Promise<void> {
+		const provider = this.keptUntilDrained;
 		if (this.shutDown) return;
 		this.shutDown = true;
 		this.pass++;
@@ -1034,16 +1049,67 @@ export class ExtensionHost {
 		const running = this.slots.filter((slot) => this.isRunning(slot));
 		// Routes close first, so a hook does not race a new request.
 		for (const slot of running) slot.handlers = new Map();
+		const kept =
+			provider === undefined
+				? undefined
+				: this.slots.find(
+						(slot) =>
+							slot.extension.id === provider &&
+							(this.isRunning(slot) || slot.retained !== undefined)
+				  );
+		if (kept) {
+			this.deferred = { slot: kept, retained: kept.retained !== undefined };
+		}
 		await Promise.all([
 			within(this.settling, limit),
-			...running.map((slot) =>
-				this.runStop(slot.extension.id, slot.attachment, 'shutdown', limit)
-			),
-			...this.stopRetained('shutdown', limit)
+			...running
+				.filter((slot) => slot !== kept)
+				.map((slot) =>
+					this.runStop(slot.extension.id, slot.attachment, 'shutdown', limit)
+				),
+			...this.stopRetained('shutdown', limit, kept)
 		]);
-		this.fenceAll();
-		for (const slot of running) slot.state = 'stopped';
+		this.fenceAll(kept);
+		for (const slot of running) {
+			if (slot !== kept) slot.state = 'stopped';
+		}
 		this.listeners.clear();
+	}
+
+	/**
+	 * Name the extension that supplies the asset channels of the node being
+	 * built, or undefined when none does. A graceful shutdown leaves that
+	 * one running, with its storage open, until finishShutdown().
+	 */
+	keepUntilDrained(id: string | undefined): void {
+		this.keptUntilDrained = id;
+	}
+
+	/**
+	 * The node has drained: stop and fence the provider's extension that
+	 * shutdown() left running. The wallet and the storage still work. The
+	 * wait is bounded like every stop hook's. Nothing to do when shutdown()
+	 * kept no extension.
+	 */
+	async finishShutdown(limitMs?: number): Promise<void> {
+		const deferred = this.deferred;
+		if (!deferred) return;
+		this.deferred = undefined;
+		const { slot } = deferred;
+		const limit = Math.max(
+			0,
+			Math.min(this.stopTimeoutMs(), limitMs ?? Infinity)
+		);
+		const attachment = deferred.retained ? slot.retained : slot.attachment;
+		slot.retained = undefined;
+		try {
+			await this.runStop(slot.extension.id, attachment, 'shutdown', limit);
+		} finally {
+			slot.fence?.();
+			slot.fence = undefined;
+			slot.holdWrites = undefined;
+			if (!deferred.retained) slot.state = 'stopped';
+		}
 	}
 
 	/**
@@ -1052,6 +1118,20 @@ export class ExtensionHost {
 	 * everything is fenced at once, and the stop hooks run on unwaited.
 	 */
 	abort(): void {
+		// A graceful shutdown that was cut short may still hold the
+		// provider's extension open: it is fenced here with the rest.
+		const deferred = this.deferred;
+		this.deferred = undefined;
+		if (deferred) {
+			const { slot } = deferred;
+			const attachment = deferred.retained ? slot.retained : slot.attachment;
+			slot.retained = undefined;
+			slot.fence?.();
+			slot.fence = undefined;
+			slot.holdWrites = undefined;
+			void this.runStop(slot.extension.id, attachment, 'shutdown');
+			if (!deferred.retained) slot.state = 'stopped';
+		}
 		if (this.shutDown) return;
 		this.shutDown = true;
 		this.pass++;
@@ -1127,11 +1207,12 @@ export class ExtensionHost {
 	 */
 	private stopRetained(
 		reason: ExtensionStopReason,
-		limitMs?: number
+		limitMs?: number,
+		except?: IExtensionSlot
 	): Promise<void>[] {
 		const stops: Promise<void>[] = [];
 		for (const slot of this.slots) {
-			if (slot.retained === undefined) continue;
+			if (slot.retained === undefined || slot === except) continue;
 			stops.push(
 				this.runStop(slot.extension.id, slot.retained, reason, limitMs)
 			);
@@ -1144,8 +1225,9 @@ export class ExtensionHost {
 		return slot.state === 'attached' || slot.state === 'ready';
 	}
 
-	private fenceAll(): void {
+	private fenceAll(except?: IExtensionSlot): void {
 		for (const slot of this.slots) {
+			if (slot === except) continue;
 			slot.fence?.();
 			slot.fence = undefined;
 			slot.holdWrites = undefined;
