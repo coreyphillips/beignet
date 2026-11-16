@@ -234,7 +234,16 @@ export enum BeignetErrorCode {
 	NO_SUITABLE_UTXO = 'NO_SUITABLE_UTXO',
 	OFFER_DECLINED = 'OFFER_DECLINED',
 	SIGN_REQUEST_REFUSED = 'SIGN_REQUEST_REFUSED',
-	EXCHANGE_TIMEOUT = 'EXCHANGE_TIMEOUT'
+	EXCHANGE_TIMEOUT = 'EXCHANGE_TIMEOUT',
+	// Host extensions (docs/EXTENSIONS.md).
+	/**
+	 * A refusal from an extension's route. The envelope carries the
+	 * extension's id and its own code under `error.extension`, and the status
+	 * is the one the extension chose.
+	 */
+	EXTENSION_ERROR = 'EXTENSION_ERROR',
+	/** A route of an extension that is not running (503). */
+	EXTENSION_UNAVAILABLE = 'EXTENSION_UNAVAILABLE'
 }
 
 /**
@@ -391,7 +400,9 @@ export function isRetryableError(err: BeignetError): boolean {
 		BeignetErrorCode.NOT_PERSISTED,
 		// A sweep's input reservation that did not reach storage, refused so
 		// the same request can run again.
-		BeignetErrorCode.SWEEP_NOT_PERSISTED
+		BeignetErrorCode.SWEEP_NOT_PERSISTED,
+		// An extension that is still attaching, or that a restart brings back.
+		BeignetErrorCode.EXTENSION_UNAVAILABLE
 	]);
 	if (retryableCodes.has(err.code)) return true;
 

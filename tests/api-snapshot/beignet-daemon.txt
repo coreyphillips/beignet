@@ -41,6 +41,11 @@ method HttpRateLimiter.destroy(): void
 method HttpRateLimiter.isAllowed(clientKey: string): boolean
 method HttpRateLimiter.prune(): number
 get HttpRateLimiter.size(): number
+interface IExtensionLoadContext
+property IExtensionLoadContext.api: number
+property IExtensionLoadContext.engineVersion: string
+property IExtensionLoadContext.env: Readonly<Record<string, string | undefined>>
+property IExtensionLoadContext.network: beignet/cli#ExtensionNetwork
 interface IStartedDaemon
 property IStartedDaemon.logger?: beignet#ILogger
 property IStartedDaemon.node: beignet/cli#BeignetNode
@@ -96,7 +101,9 @@ property WebhookRegistration.events: string[]
 property WebhookRegistration.id: string
 property WebhookRegistration.secret?: string
 property WebhookRegistration.url: string
+function extensionPathsFromEnv(value: string | undefined): string[]
 function getOpenApiSpec(): Record<string, unknown>
 function getRouteScopes(routeKey: string): ApiScope[]
+function loadExtensions(files: readonly string[], context: Pick<IExtensionLoadContext, 'network' | 'env'>): Promise<beignet/cli#IBeignetExtension[]>
 function scopesAllowRoute(scopes: ReadonlySet<ApiScope>, routeKey: string): boolean
 function startDaemon(opts: DaemonOptions): Promise<IStartedDaemon>

@@ -146,6 +146,8 @@ member BeignetErrorCode.DURABILITY_FAILED = "DURABILITY_FAILED"
 member BeignetErrorCode.EXCHANGE_TIMEOUT = "EXCHANGE_TIMEOUT"
 member BeignetErrorCode.EXPIRED = "EXPIRED"
 member BeignetErrorCode.EXPIRY_TOO_DISTANT = "EXPIRY_TOO_DISTANT"
+member BeignetErrorCode.EXTENSION_ERROR = "EXTENSION_ERROR"
+member BeignetErrorCode.EXTENSION_UNAVAILABLE = "EXTENSION_UNAVAILABLE"
 member BeignetErrorCode.FEE_CHANGED = "FEE_CHANGED"
 member BeignetErrorCode.FEE_ESTIMATE_FAILED = "FEE_ESTIMATE_FAILED"
 member BeignetErrorCode.FEE_ESTIMATE_NOT_READY = "FEE_ESTIMATE_NOT_READY"
@@ -297,6 +299,7 @@ method BeignetNode.createOffer(options: { description: string; amountSats?: numb
 method BeignetNode.createPorchLink(label?: string): PorchLinkInfo
 method BeignetNode.decodeInvoice(bolt11: string): DecodedInvoice
 method BeignetNode.decodeOfferString(offerStr: string): OfferInfo
+method BeignetNode.describeExtensions(): IExtensionInfo[]
 method BeignetNode.describeGraph(limit?: number, offset?: number): GraphDescribeResult
 method BeignetNode.destroy(): Promise<void>
 method BeignetNode.disconnectPeer(pubkey: string): void
@@ -308,6 +311,7 @@ method BeignetNode.executeChannelSend(quoteId: string): Promise<ChannelSendStatu
 method BeignetNode.executeRebalances(budgetSatsPerDay?: number): Promise<RebalanceExecutionSummary>
 method BeignetNode.exportDescriptors(): DescriptorsInfo
 method BeignetNode.exportStaticChannelBackup(): { encoded: string; channelCount: number; path: string; }
+get BeignetNode.extensionHost(): ExtensionHost | undefined
 method BeignetNode.fforAbortEpoch(body: { channelId?: ChannelIdHex; reason?: number; text?: string; }): Record<string, unknown>
 method BeignetNode.fforAddPreimage(body: { channelId?: ChannelIdHex; preimage?: string; }): Record<string, unknown>
 method BeignetNode.fforCloseEpoch(channelId: ChannelIdHex): Record<string, unknown>
@@ -608,6 +612,7 @@ property BeignetNodeOptions.electrumHost?: string
 property BeignetNodeOptions.electrumPort?: number
 property BeignetNodeOptions.electrumServers?: Array<{ host: string; port: number; tls?: boolean; }>
 property BeignetNodeOptions.electrumTls?: boolean
+property BeignetNodeOptions.extensions?: readonly IBeignetExtension[]
 property BeignetNodeOptions.feeEstimationSource?: 'electrum' | 'http' | 'auto'
 property BeignetNodeOptions.fforConcurrent?: boolean
 property BeignetNodeOptions.fforIssuer?: boolean
@@ -845,6 +850,9 @@ property DirectFundingRequestInfo.lspPubkey: string | null
 property DirectFundingRequestInfo.paymentHash: PaymentHashHex
 property DirectFundingRequestInfo.request: string
 property DirectFundingRequestInfo.skipped?: ReceiveSteerSkip[]
+const EXTENSION_API = "beignet-extension-api/1"
+const EXTENSION_API_VERSION = 1
+const EXTENSION_MAX_BODY_BYTES: number
 unexported interface ElectrumTlsConfig
 property ElectrumTlsConfig.electrumTlsFingerprints?: string[]
 property ElectrumTlsConfig.electrumTlsVerify?: boolean
@@ -852,6 +860,32 @@ unexported type EventMap<E> = { [K in keyof E]: (...args: any[]) => void; }
 interface EventMessage
 property EventMessage.data: Record<string, unknown>
 property EventMessage.type: string
+class ExtensionError extends Error
+constructor ExtensionError(extensionCode: string, message: string, status?: number, details?: unknown)
+readonly property ExtensionError.details?: unknown
+readonly property ExtensionError.extensionCode: string
+readonly property ExtensionError.status: number
+unexported type ExtensionEventListener = (event: string, data: unknown) => void
+type ExtensionHandler = (request: IExtensionRequest) => unknown | Promise<unknown>
+unexported class ExtensionHost
+constructor ExtensionHost(extensions: readonly IBeignetExtension[], opts: IExtensionHostOptions)
+method ExtensionHost.abort(): void
+method ExtensionHost.attach(build: IExtensionBuild): Promise<void>
+method ExtensionHost.describe(): IExtensionInfo[]
+get ExtensionHost.extensions(): readonly IBeignetExtension[]
+method ExtensionHost.fenceForRebuild(): void
+method ExtensionHost.handler(id: string, key: string): ExtensionHandler
+method ExtensionHost.holdWrites(): () => void
+method ExtensionHost.onEvent(listener: ExtensionEventListener): () => void
+method ExtensionHost.shutdown(limitMs?: number): Promise<void>
+method ExtensionHost.start(): Promise<void>
+method ExtensionHost.startInBackground(): void
+property ExtensionHost.started: Promise<void>
+type ExtensionMethod = 'GET' | 'POST' | 'DELETE'
+type ExtensionNetwork = 'mainnet' | 'testnet' | 'regtest' | 'signet'
+type ExtensionScope = 'readonly' | 'invoice'
+type ExtensionState = 'pending' | 'attached' | 'ready' | 'failed' | 'stopped'
+type ExtensionStopReason = 'shutdown' | 'rebuild'
 interface FeeSnapshot
 property FeeSnapshot.avgSatPerVbyte: number
 property FeeSnapshot.currentSatPerVbyte: number
@@ -966,6 +1000,13 @@ method HttpRateLimiter.destroy(): void
 method HttpRateLimiter.isAllowed(clientKey: string): boolean
 method HttpRateLimiter.prune(): number
 get HttpRateLimiter.size(): number
+interface IBeignetExtension
+property IBeignetExtension.api: number
+method IBeignetExtension.attach(context: IExtensionContext): IExtensionAttachment | Promise<IExtensionAttachment>
+property IBeignetExtension.events?: readonly string[]
+property IBeignetExtension.id: string
+property IBeignetExtension.routes?: readonly IExtensionRoute[]
+property IBeignetExtension.version: string
 interface IChannelHealth
 property IChannelHealth.capacitySats: number
 property IChannelHealth.channelId: string
@@ -975,6 +1016,63 @@ property IChannelHealth.maxHtlcs: number
 property IChannelHealth.remoteBalancePct: number
 property IChannelHealth.state: string
 property IChannelHealth.warnings: string[]
+interface IExtensionAttachment
+property IExtensionAttachment.handlers?: Record<string, ExtensionHandler>
+method IExtensionAttachment.start?(): void | Promise<void>
+method IExtensionAttachment.status?(): unknown
+method IExtensionAttachment.stop?(reason: ExtensionStopReason): void | Promise<void>
+unexported interface IExtensionBuild
+property IExtensionBuild.dataDir: string | undefined
+property IExtensionBuild.network: ExtensionNetwork
+property IExtensionBuild.storage: () => beignet/lightning#storage.IStorageBackend
+property IExtensionBuild.wallet: beignet#Wallet
+interface IExtensionContext
+property IExtensionContext.dataDir: string | undefined
+method IExtensionContext.emit(event: string, data: unknown): void
+property IExtensionContext.engineVersion: string
+property IExtensionContext.generation: number
+property IExtensionContext.logger: beignet#ILogger
+property IExtensionContext.network: ExtensionNetwork
+property IExtensionContext.storage: IExtensionStorage
+property IExtensionContext.wallet: beignet#Wallet
+unexported interface IExtensionHostOptions
+property IExtensionHostOptions.attachTimeoutMs?: number
+property IExtensionHostOptions.engineVersion: string
+property IExtensionHostOptions.log: (level: 'debug' | 'info' | 'warn' | 'error', message: string, data?: Record<string, unknown>) => void
+property IExtensionHostOptions.stopTimeoutMs?: number
+interface IExtensionInfo
+property IExtensionInfo.error?: string
+property IExtensionInfo.events: string[]
+property IExtensionInfo.generation: number
+property IExtensionInfo.id: string
+property IExtensionInfo.routes: Array<{ method: ExtensionMethod; path: string; scopes: string[]; idempotent: boolean; }>
+property IExtensionInfo.state: ExtensionState
+property IExtensionInfo.status?: unknown
+property IExtensionInfo.version: string
+interface IExtensionLoadContext
+property IExtensionLoadContext.api: number
+property IExtensionLoadContext.engineVersion: string
+property IExtensionLoadContext.env: Readonly<Record<string, string | undefined>>
+property IExtensionLoadContext.network: ExtensionNetwork
+interface IExtensionRequest
+property IExtensionRequest.body: Record<string, unknown>
+property IExtensionRequest.idempotencyKey?: string
+property IExtensionRequest.query: URLSearchParams
+interface IExtensionRoute
+property IExtensionRoute.idempotent?: boolean
+property IExtensionRoute.maxBodyBytes?: number
+property IExtensionRoute.method: ExtensionMethod
+property IExtensionRoute.path: string
+property IExtensionRoute.requestSchema?: Record<string, unknown>
+property IExtensionRoute.responseSchema?: Record<string, unknown>
+property IExtensionRoute.scopes?: readonly ExtensionScope[]
+property IExtensionRoute.summary: string
+interface IExtensionStorage
+method IExtensionStorage.delete(key: string): void
+method IExtensionStorage.get(key: string): string | null
+method IExtensionStorage.list(prefix: string): Array<{ key: string; value: string; }>
+method IExtensionStorage.set(key: string, value: string): void
+method IExtensionStorage.transaction<T>(fn: () => T): T
 interface IGraphRestoreStats
 property IGraphRestoreStats.busyMs: number
 property IGraphRestoreStats.channelRows: number
@@ -1565,10 +1663,12 @@ property WebhookRegistration.id: string
 property WebhookRegistration.secret?: string
 property WebhookRegistration.url: string
 function describeFailureCode(code: number): string
+function extensionPathsFromEnv(value: string | undefined): string[]
 function getOpenApiSpec(): Record<string, unknown>
 function getRouteScopes(routeKey: string): ApiScope[]
 function isBeignetErrorCode(code: unknown): code is BeignetErrorCodeValue
 function isPermanentFailure(err: BeignetError): boolean
 function isRetryableError(err: BeignetError): boolean
+function loadExtensions(files: readonly string[], context: Pick<IExtensionLoadContext, 'network' | 'env'>): Promise<IBeignetExtension[]>
 function scopesAllowRoute(scopes: ReadonlySet<ApiScope>, routeKey: string): boolean
 function startDaemon(opts: DaemonOptions): Promise<IStartedDaemon>

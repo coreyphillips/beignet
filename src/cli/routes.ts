@@ -75,6 +75,8 @@ const ROUTE_TABLE = [
 	{ method: 'GET', path: '/spend-limit', scopes: ['readonly'] },
 	{ method: 'GET', path: '/liquidity', scopes: ['readonly'] },
 	{ method: 'GET', path: '/watchtowers', scopes: ['readonly'] },
+	// Which host extensions run in this daemon, and the routes they serve.
+	{ method: 'GET', path: '/extensions', scopes: ['readonly'] },
 	// The links are what GET /info already hands out for the seed's link.
 	{ method: 'GET', path: '/porch/links', scopes: ['readonly'] },
 	{ method: 'GET', path: '/advisor/recommendations', scopes: ['readonly'] },

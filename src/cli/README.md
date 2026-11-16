@@ -134,6 +134,7 @@ await node.destroy();
 | `logLevel?` | `LogLevel` | Log level (default 'info'). Set to 'silent' to suppress. |
 | `wireTrace?` | `boolean \| string[]` | Forwarded to LightningNode's wireTrace: log non-gossip wire messages (type and length) at info, for every peer (true) or the listed pubkeys. |
 | `logger?` | `ILogger` | Leveled diagnostic logger. When set, every log entry that passes logLevel is forwarded to it (in addition to the 'log' event) and it is injected into the underlying Wallet and LightningNode. When unset, behavior is unchanged: BeignetNode only emits 'log' events and the wallet keeps its default console output. |
+| `extensions?` | `readonly IBeignetExtension[]` | Host extensions to run inside this node (docs/EXTENSIONS.md). Each is attached once the on-chain wallet exists and again after every in-process rebuild; the daemon serves its routes under `/x/<id>`. A malformed entry refuses create() with INVALID_PARAMS, and one that throws while running is reported by `GET /extensions` and left out. |
 | `electrumServers?` | `Array<{ host: string; port: number; tls?: boolean }>` | Multiple Electrum servers for failover redundancy |
 | `backupPath?` | `string` | Path for automated periodic backups (enables backup scheduling) |
 | `backupIntervalMs?` | `number` | Backup interval in milliseconds (default: 6 hours, requires backupPath) |
@@ -937,7 +938,7 @@ and `remainingSats` subtracts it, so it is what the next payment can pass.
 
 | Method | Returns | Description |
 |--------|---------|-------------|
-| `gracefulShutdown(timeoutMs?)` | `Promise<void>` | Graceful shutdown: drains in-flight HTLCs, persists state, then stops the node, then the on-chain wallet, then closes the database, so the wallet's last writes land (default 30s timeout) |
+| `gracefulShutdown(timeoutMs?)` | `Promise<void>` | Graceful shutdown: drains in-flight HTLCs, persists state, then stops the node, then the on-chain wallet, then closes the database, so the wallet's last writes land (default 30s timeout). With host extensions, their `stop('shutdown')` hooks run first and their wait is part of `timeoutMs`, at most half of it and at most 5 seconds; the HTLC drain gets what is left |
 | `destroy()` | `Promise<void>` | Immediate shutdown (stops the node, then the on-chain wallet, then closes the database) |
 
 ### Events
@@ -1540,6 +1541,8 @@ not repeat a 4xx unchanged.
 | `FORBIDDEN` | Node | 403 | Valid API key without the scope a route requires |
 | `SERVICE_DRAINING` | Node | 409 | Node is draining, no new payments accepted |
 | `IDEMPOTENCY_CONFLICT` | HTTP | 409 | Same idempotency key used with different request body |
+| `EXTENSION_ERROR` | HTTP | set by the extension | A refusal from a host extension's route; `error.extension` carries `{ id, code, details? }` ([docs/EXTENSIONS.md](../../docs/EXTENSIONS.md)) |
+| `EXTENSION_UNAVAILABLE` | HTTP | 503 | A route of a host extension that failed or is stopped; retryable |
 | `RATE_LIMITED` | HTTP | 429 | Too many requests (token bucket rate limiter) |
 
 `SEND_FAILED`, `CLOSE_FAILED`, `FORCE_CLOSE_FAILED`, `ZERO_CONF_FAILED` and the
@@ -1671,9 +1674,13 @@ beignet init [--network regtest] [--alias mynode]
 beignet start [--port 2112] [--host 0.0.0.0] [--daemon] [--anchors] [--api-token <token>] \
   [--backup-path /path/to/backup.db] [--backup-interval 21600000] \
   [--daily-spend-limit 100000] [--tls-cert /path/cert.pem] [--tls-key /path/key.pem] \
-  [--htlc-events] [--log-level info]
+  [--htlc-events] [--log-level info] [--extension /abs/path/module.js]
 beignet stop
 ```
+
+`--extension` (repeatable, or `BEIGNET_EXTENSIONS`) names a host extension to
+run inside the daemon, by the absolute path of its module. A flag with no path
+after it refuses the start. See [docs/EXTENSIONS.md](../../docs/EXTENSIONS.md).
 
 Seed generation is CLI-only: `beignet init` creates the mnemonic (or you supply
 one via `BEIGNET_MNEMONIC`/config); the daemon never generates or replaces a
@@ -1764,6 +1771,9 @@ beignet node uri --host mynode.example.com
 
 beignet node wait-ready --timeout 30000
 # Blocks until the node is operational
+
+beignet extensions
+# {"ok":true,"result":{"api":"beignet-extension-api/1","extensions":[]}}
 ```
 
 ### On-chain
@@ -2378,6 +2388,7 @@ Environment variables override the config file but are overridden by CLI flags.
 | `BEIGNET_TOR_PROXY` | SOCKS5 proxy as `host:port` for outbound Lightning peer and watchtower connections (e.g. Tor at `127.0.0.1:9050`); `.onion` peers need one. Unset, `.onion` peers fall back to `127.0.0.1:9050` and everything else is dialed directly |
 | `BEIGNET_TOR_PROXY_ONION_ONLY` | `true` to use `BEIGNET_TOR_PROXY` for `.onion` hosts only and dial public clearnet hosts directly (hybrid mode, LND's `tor.skip-proxy-for-clearnet-targets`); exact `true`/`false`, anything else is ignored. Needs `BEIGNET_TOR_PROXY`, or startup is refused |
 | `BEIGNET_HTLC_EVENTS` | `true` to relay per-HTLC events over SSE + webhooks |
+| `BEIGNET_EXTENSIONS` | Host extensions to run inside the daemon: comma-separated absolute paths of modules that export `beignetExtension` ([docs/EXTENSIONS.md](../../docs/EXTENSIONS.md)). Environment and `--extension` only, never `config.json`. A path that is relative, missing, or writable by another user refuses the start |
 | `BEIGNET_EAGER_GOSSIP_VERIFY` | `true` to verify foreign gossip signatures at intake instead of lazily at serve time (default: lazy; exact `true`/`false`, anything else is ignored) |
 | `BEIGNET_LOG_LEVEL` | Daemon stderr log level: `debug`, `info`, `warn`, `error`, `silent` (default: silent) |
 | `BEIGNET_WIRE_TRACE` | Log every non-gossip wire message (direction, type, length; no payloads) at `info`: `1` for every peer, or comma-separated peer pubkeys (default: off) |
@@ -2950,6 +2961,7 @@ The matching commands are `wallet sweep-prepare <requestJson|requestFile>`, `wal
 | GET | `/node/uri` | `?host=<addr>` | Node connection URI (`pubkey@host:port`). Optional external host override. |
 | POST | `/payment/estimate` | `{ bolt11, amountSats? }` | Payment intelligence: success probability, route quality, fees |
 | GET | `/liquidity` | -- | Liquidity analysis with recommendations |
+| GET | `/extensions` | -- | Host extensions running in this daemon ([docs/EXTENSIONS.md](../../docs/EXTENSIONS.md)): `{ api, extensions: [{ id, version, state, generation, error?, routes, events, status? }] }`. Each extension's own routes are served under `/x/<id>`, and a refusal from one answers `EXTENSION_ERROR` with the extension's id and code under `error.extension` |
 | GET | `/channel/suggestions` | `?count=<n>` | Graph-based channel open suggestions |
 | GET | `/fees` | -- | On-chain fee trend analysis |
 | GET | `/logs` | `?category=&since=&limit=` | Query persistent action log |

@@ -24,6 +24,7 @@ import {
 } from './config';
 import { AUTH_OFF_WARNING, startDaemon } from './daemon';
 import { daemonOptions } from './daemon-options';
+import { extensionPathsFromEnv, loadExtensions } from './extension-loader';
 import { unpatchedNodeWarning } from '../utils/node-version';
 import { BeignetNode, defaultDataDirForMnemonic } from './beignet-node';
 import { BeignetError } from './errors';
@@ -315,6 +316,8 @@ async function main(): Promise<void> {
 			);
 		case 'watchtower':
 			return handleWatchtower();
+		case 'extensions':
+			return outputResult(await httpRequest('GET', '/extensions'));
 		case 'route':
 			return handleRoute();
 		case 'rebalance':
@@ -571,9 +574,33 @@ async function handleStart(): Promise<void> {
 	const isDaemon = hasFlag('--daemon');
 
 	try {
-		const { stop, logger } = await startDaemon(
-			daemonOptions(config, daemonPort)
-		);
+		// Host extensions (docs/EXTENSIONS.md) are named only here, by the
+		// flag or the environment of the process that starts the daemon:
+		// never by config.json, which an API caller can reach.
+		// A flag with nothing after it names no file. Starting without the
+		// extension the operator meant would hide that, so it is refused.
+		if (filteredArgs[filteredArgs.length - 1] === '--extension') {
+			throw new BeignetError(
+				'INVALID_PARAMS',
+				'--extension needs the absolute path of a module'
+			);
+		}
+		const extensionFiles = [
+			...parseRepeatedFlag('--extension'),
+			...extensionPathsFromEnv(process.env.BEIGNET_EXTENSIONS)
+		];
+		// Without a network the start is refused below, for that reason.
+		const extensions =
+			extensionFiles.length > 0 && config.network
+				? await loadExtensions(extensionFiles, {
+						network: config.network,
+						env: process.env
+				  })
+				: undefined;
+		const { stop, logger } = await startDaemon({
+			...daemonOptions(config, daemonPort),
+			...(extensions ? { extensions } : {})
+		});
 
 		// No credential at all (issue #1005): the daemon logs this at warn
 		// level, which the default silent log level swallows, so the CLI says
@@ -3582,6 +3609,10 @@ Watchtowers:
   watchtower add <pubkey@host:port>      Add an LND altruist watchtower
   watchtower remove <pubkey@host:port>   Remove a watchtower
 
+Extensions:
+  extensions                             Host extensions running in the daemon,
+                                         their state and the routes they serve
+
 BOLT 12 Offers:
   offer create <description> [amountSats]  Create reusable offer
   offer list                             List local offers
@@ -3744,6 +3775,13 @@ Start flags:
                                          (default: off; env BEIGNET_RECOVERY_AUTO_APPLY;
                                          BEIGNET_RECOVERY_AUTO_APPLY_SETTLE_MS and
                                          _MAX_WAIT_MS bound the wait for replicas)
+  --extension <path>                     Run a host extension inside the daemon: the
+                                         absolute path of a module that exports
+                                         beignetExtension, owned by this user or
+                                         root and writable by no one else. It runs
+                                         with the wallet's keys (repeatable; env
+                                         BEIGNET_EXTENSIONS, comma list; never read
+                                         from config.json; docs/EXTENSIONS.md)
 
 Pay-retry flags:
   --max-retries <N>                      Max retry attempts (default: 3)

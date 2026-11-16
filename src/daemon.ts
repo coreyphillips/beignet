@@ -16,6 +16,11 @@ export {
 } from './cli/auth';
 export { getOpenApiSpec } from './cli/openapi';
 export {
+	loadExtensions,
+	extensionPathsFromEnv,
+	IExtensionLoadContext
+} from './cli/extension-loader';
+export {
 	WebhookManager,
 	IWebhookStorage,
 	WebhookDeliveryOptions,
