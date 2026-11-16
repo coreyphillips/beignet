@@ -155,7 +155,7 @@ export interface IFundingProvider {
 	 */
 	getFixedOutputFeeStatus?(
 		forFeeSatoshis?: bigint
-	): import('../wallet/fixed-output-fees').IFixedOutputFeePoolState | undefined;
+	): import('../wallet/fixed-output-fees').IFixedOutputFeeStatus | undefined;
 	/**
 	 * Build (but do not broadcast) the channel funding transaction.
 	 * @param max When true, sweep the whole balance into the funding output (no

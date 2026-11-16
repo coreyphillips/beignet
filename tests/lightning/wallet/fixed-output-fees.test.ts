@@ -15,7 +15,9 @@ import {
 	IFixedOutputFeePolicy,
 	FixedOutputFeeError,
 	FixedOutputFeeBudgetExhaustedError,
-	FixedOutputFeePreparationPendingError
+	FixedOutputFeePreparationPendingError,
+	IFixedOutputFeePoolState,
+	fixedOutputFeePolicyRefusal
 } from '../../../src/lightning/wallet/fixed-output-fees';
 import { ILedgerKeyValueStorage } from '../../../src/lightning/storage/durable-ledger';
 import { fixedOutputHtlcFeeActionId } from '../../../src/lightning/chain/types';
@@ -1894,6 +1896,16 @@ describe('the fee journal, its size and a restore without it', function () {
 });
 
 describe('reading the state of the fee coin pool', () => {
+	/** The state of a provider that has a pool. */
+	const poolState = (
+		provider: WalletFundingProvider,
+		forFeeSatoshis?: bigint
+	): IFixedOutputFeePoolState => {
+		const status = provider.getFixedOutputFeeStatus(forFeeSatoshis);
+		if (!status?.available) throw new Error('the provider has no pool');
+		return status;
+	};
+
 	it('answers nothing on a provider without a fee policy', () => {
 		const f = fixture();
 		expect(new WalletFundingProvider(f.wallet).getFixedOutputFeeStatus()).equal(
@@ -1932,7 +1944,7 @@ describe('reading the state of the fee coin pool', () => {
 		const split = bitcoin.Transaction.fromHex(f.broadcasts[0]).getId();
 		const journal = [...f.store.rows.values()][0],
 			frozen = JSON.stringify([...f.frozen]);
-		const during = p.getFixedOutputFeeStatus()!;
+		const during = poolState(p);
 		expect(during.splits).deep.equal([
 			{
 				state: 'published',
@@ -1969,13 +1981,13 @@ describe('reading the state of the fee coin pool', () => {
 		expect(f.broadcasts).length(1);
 
 		await p.selectFeeBumpInputs(500n, 250, opts);
-		expect(p.getFixedOutputFeeStatus()!.feeCoins).deep.equal({
+		expect(poolState(p).feeCoins).deep.equal({
 			ready: 0,
 			readySatoshis: 0n,
 			unconfirmed: 3
 		});
 		f.confirm();
-		const after = p.getFixedOutputFeeStatus(500n)!;
+		const after = poolState(p, 500n);
 		expect(after.feeCoins).deep.equal({
 			ready: 3,
 			readySatoshis: 1704n,
@@ -2009,7 +2021,7 @@ describe('reading the state of the fee coin pool', () => {
 	it('says a split could not be made now when the budget has no room for it, or no confirmed coin is large enough', () => {
 		const f = fixture();
 		f.policy.maxTotalFeeSatoshis = 900n;
-		expect(f.provider().getFixedOutputFeeStatus()!.preparation).deep.equal({
+		expect(poolState(f.provider()).preparation).deep.equal({
 			possible: false,
 			forFeeSatoshis: 2000n,
 			neededSatoshis: 3000n,
@@ -2020,7 +2032,7 @@ describe('reading the state of the fee coin pool', () => {
 		g.spendSource();
 		g.addCoin(2500);
 		const p = g.provider();
-		expect(p.getFixedOutputFeeStatus()!.preparation).deep.equal({
+		expect(poolState(p).preparation).deep.equal({
 			possible: false,
 			forFeeSatoshis: 2000n,
 			neededSatoshis: 3000n,
@@ -2028,16 +2040,86 @@ describe('reading the state of the fee coin pool', () => {
 			reason: 'FEE_FUNDS_UNAVAILABLE'
 		});
 		// The same wallet could pay for a smaller fee coin.
-		expect(p.getFixedOutputFeeStatus(1000n)!.preparation).deep.equal({
+		expect(poolState(p, 1000n).preparation).deep.equal({
 			possible: true,
 			forFeeSatoshis: 1000n,
 			neededSatoshis: 2000n,
 			largestConfirmedSatoshis: 2500n
 		});
 		// A fee coin is never smaller than dust.
-		expect(p.getFixedOutputFeeStatus(1n)!.preparation.neededSatoshis).equal(
-			1330n
-		);
+		expect(poolState(p, 1n).preparation.neededSatoshis).equal(1330n);
 		expect(() => p.getFixedOutputFeeStatus(0n)).throw('Invalid fixed-output');
+	});
+});
+
+describe('a provider whose fee policy the wallet refused', () => {
+	it('is an ordinary provider that reports its fee coin pool unavailable and ends a fixed-output selection with the refusal', async () => {
+		const f = fixture();
+		const refusal = new FixedOutputFeeError(
+			'FEE_POLICY_REFUSED',
+			'operator',
+			'the policy was refused'
+		);
+		const p = new WalletFundingProvider(f.wallet, {
+			fixedOutputFeeRefusal: refusal
+		});
+		expect(p.supportsFixedOutputFees()).equal(false);
+		expect(p.getFixedOutputFeeBudget()).equal(undefined);
+		expect(p.getFixedOutputFeeStatus()).deep.equal({
+			available: false,
+			error: refusal
+		});
+		expect(p.getFixedOutputFeeStatus(700n)).deep.equal({
+			available: false,
+			error: refusal
+		});
+		expect(fixedOutputFeePolicyRefusal(p)).equal(refusal);
+		let thrown: unknown;
+		try {
+			await p.selectFeeBumpInputs(500n, 250, opts);
+		} catch (error) {
+			thrown = error;
+		}
+		expect(thrown).equal(refusal);
+		// Nothing was written, frozen or published for it.
+		expect(f.store.rows.size).equal(0);
+		expect(f.broadcasts).length(0);
+		expect(ownTags(f)).deep.equal([]);
+		// A selection without fixed outputs is the ordinary provider's: it
+		// takes the wallet's coin, and no journal is begun for it.
+		const taken = await p.selectFeeBumpInputs(500n, 250);
+		expect(taken.inputs).length(1);
+		expect(f.store.rows.size).equal(0);
+	});
+
+	it('is told apart from a provider with a pool, one that was given no policy, and one that cannot say', () => {
+		const f = fixture();
+		const refusal = new FixedOutputFeeError(
+			'FEE_POLICY_REFUSED',
+			'operator',
+			'the policy was refused'
+		);
+		expect(fixedOutputFeePolicyRefusal(f.provider())).equal(undefined);
+		expect(
+			fixedOutputFeePolicyRefusal(new WalletFundingProvider(f.wallet))
+		).equal(undefined);
+		expect(fixedOutputFeePolicyRefusal(undefined)).equal(undefined);
+		expect(fixedOutputFeePolicyRefusal(null)).equal(undefined);
+		expect(fixedOutputFeePolicyRefusal({})).equal(undefined);
+		expect(
+			fixedOutputFeePolicyRefusal({
+				getFixedOutputFeeStatus: () => {
+					throw new Error('the wallet is closed');
+				}
+			})
+		).equal(undefined);
+		// A policy the wallet took is not undone by a refusal given beside it.
+		const both = new WalletFundingProvider(f.wallet, {
+			fixedOutputFees: f.policy,
+			fixedOutputFeeRefusal: refusal
+		});
+		expect(both.supportsFixedOutputFees()).equal(true);
+		expect(both.getFixedOutputFeeStatus()!.available).equal(true);
+		expect(fixedOutputFeePolicyRefusal(both)).equal(undefined);
 	});
 });

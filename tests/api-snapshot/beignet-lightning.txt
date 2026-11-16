@@ -5785,7 +5785,7 @@ method node.IFundingProvider.broadcastTransaction(txHex: string): Promise<string
 method node.IFundingProvider.buildFundingTransaction(address: string, amountSats: bigint, satsPerByte?: number, max?: boolean): Promise<{ txHex: string; txid: Buffer; outputIndex: number; }>
 method node.IFundingProvider.getFixedOutputFeeActionIds?(channelId: Buffer): readonly string[]
 method node.IFundingProvider.getFixedOutputFeeBudget?(): wallet.IFixedOutputFeeBudget | undefined
-method node.IFundingProvider.getFixedOutputFeeStatus?(forFeeSatoshis?: bigint): wallet.IFixedOutputFeePoolState | undefined
+method node.IFundingProvider.getFixedOutputFeeStatus?(forFeeSatoshis?: bigint): wallet.IFixedOutputFeeStatus | undefined
 method node.IFundingProvider.pledgeTransactionInputs?(txHex: string): Promise<void>
 method node.IFundingProvider.quoteDualFundingMax?(feeratePerKw: number): { fundingSatoshis: bigint; spendableSats: bigint; feeSats: bigint; inputCount: number; }
 method node.IFundingProvider.quoteSpliceIn?(feeratePerKw: number): { spendableSats: bigint; feeSats: bigint; maxAmountSats: bigint; inputCount: number; }
@@ -6254,7 +6254,7 @@ method node.LightningNode.getFforEpoch(channelIdHex: string): ffor.IFforEpochRec
 method node.LightningNode.getFforIssuerService(): ffor.FforIssuerService | null
 method node.LightningNode.getFforVoucherReceipts(channelIdHex?: string): { channelId: string; epochId: string; slot: number; paymentHash: string; receiptIds: string[]; creditedReceiptId?: string; uncreditedReceiptIds: string[]; reconciliationRequired: boolean; }[]
 method node.LightningNode.getFforWitnessService(): ffor.FforWitnessService | null
-method node.LightningNode.getFixedOutputFeeStatus(forFeeSatoshis?: bigint): wallet.IFixedOutputFeePoolState | undefined
+method node.LightningNode.getFixedOutputFeeStatus(forFeeSatoshis?: bigint): wallet.IFixedOutputFeeStatus | undefined
 method node.LightningNode.getForwardingSummary(options?: { since?: number; }): storage.IForwardingSummary
 method node.LightningNode.getFundingAddress(): string
 method node.LightningNode.getFundingTxHex(channelId: Buffer): Promise<string | null>
@@ -9973,7 +9973,7 @@ class wallet.FixedOutputFeeError extends Error
 constructor wallet.FixedOutputFeeError(code: wallet.FixedOutputFeeErrorCode, remedy: wallet.FixedOutputFeeRemedy, message: string)
 readonly property wallet.FixedOutputFeeError.code: wallet.FixedOutputFeeErrorCode
 readonly property wallet.FixedOutputFeeError.remedy: wallet.FixedOutputFeeRemedy
-type wallet.FixedOutputFeeErrorCode = 'FEE_PREPARATION_PENDING' | 'FEE_PREPARATION_NOT_PUBLISHED' | 'FEE_WALLET_TIMEOUT' | 'FEE_WALLET_UNAVAILABLE' | 'FEE_RESERVATION_REFUSED' | 'FEE_BUDGET_EXHAUSTED' | 'FEE_FUNDS_UNAVAILABLE' | 'FEE_ACTION_CAP_EXHAUSTED' | 'FEE_PREPARATION_FEE_EXCEEDS_CAP' | 'FEE_PREPARATION_SIGNING_FAILED' | 'FEE_ACTION_RETIRED' | 'FEE_INPUT_UNAVAILABLE'
+type wallet.FixedOutputFeeErrorCode = 'FEE_PREPARATION_PENDING' | 'FEE_PREPARATION_NOT_PUBLISHED' | 'FEE_WALLET_TIMEOUT' | 'FEE_WALLET_UNAVAILABLE' | 'FEE_RESERVATION_REFUSED' | 'FEE_BUDGET_EXHAUSTED' | 'FEE_FUNDS_UNAVAILABLE' | 'FEE_ACTION_CAP_EXHAUSTED' | 'FEE_PREPARATION_FEE_EXCEEDS_CAP' | 'FEE_PREPARATION_SIGNING_FAILED' | 'FEE_POLICY_REFUSED' | 'FEE_ACTION_RETIRED' | 'FEE_INPUT_UNAVAILABLE'
 class wallet.FixedOutputFeePreparationPendingError extends wallet.FixedOutputFeeError
 constructor wallet.FixedOutputFeePreparationPendingError(transactionId: string)
 readonly property wallet.FixedOutputFeePreparationPendingError.transactionId: string
@@ -10000,8 +10000,12 @@ property wallet.IFixedOutputFeePoolState.feeCoins: { ready: number; readySatoshi
 property wallet.IFixedOutputFeePoolState.lastRefusal?: { code: wallet.FixedOutputFeeErrorCode; remedy: wallet.FixedOutputFeeRemedy; at: number; }
 property wallet.IFixedOutputFeePoolState.preparation: { possible: boolean; forFeeSatoshis: bigint; neededSatoshis: bigint; largestConfirmedSatoshis: bigint; reason?: 'FEE_FUNDS_UNAVAILABLE' | 'FEE_BUDGET_EXHAUSTED'; }
 property wallet.IFixedOutputFeePoolState.splits: Array<{ state: 'unsigned' | 'signed' | 'published'; transactionId?: string; feeSatoshis: bigint; feeCoins: number; feeCoinSatoshis: bigint; }>
+interface wallet.IFixedOutputFeePoolUnavailable
+property wallet.IFixedOutputFeePoolUnavailable.available: false
+property wallet.IFixedOutputFeePoolUnavailable.error: wallet.FixedOutputFeeError
 interface wallet.IFixedOutputFeeResolution
 property wallet.IFixedOutputFeeResolution.spendingTransaction: Buffer
+type wallet.IFixedOutputFeeStatus = wallet.IFixedOutputFeePoolState | wallet.IFixedOutputFeePoolUnavailable
 interface wallet.IWalletLike
 property wallet.IWalletLike.electrum: { broadcastTransaction(params: { rawTx: string; subscribeToOutputAddress?: boolean; }): Promise<IResult>; getTransactions?(params: { txHashes: Array<{ tx_hash: string; }>; }): Promise<IResult>; }
 method wallet.IWalletLike.freezeUtxo?(params: { txid: string; index: number; tag?: string; }): Promise<IResult>
@@ -10023,12 +10027,12 @@ method wallet.IWalletLike.unfreezeUtxo?(params: { txid: string; index: number; }
 method wallet.IWalletLike.unfreezeUtxoIfTagged?(params: { txid: string; index: number; tag: string; }): Promise<IResult>
 method wallet.IWalletLike.withSendLock?<T>(fn: () => Promise<T>): Promise<T>
 class wallet.WalletFundingProvider implements node.IFundingProvider
-constructor wallet.WalletFundingProvider(wallet: wallet.IWalletLike, options?: { fixedOutputFees?: wallet.IFixedOutputFeePolicy; })
+constructor wallet.WalletFundingProvider(wallet: wallet.IWalletLike, options?: { fixedOutputFees?: wallet.IFixedOutputFeePolicy; fixedOutputFeeRefusal?: wallet.FixedOutputFeeError; })
 method wallet.WalletFundingProvider.broadcastTransaction(txHex: string): Promise<string>
 method wallet.WalletFundingProvider.buildFundingTransaction(address: string, amountSats: bigint, satsPerByte?: number, max?: boolean): Promise<{ txHex: string; txid: Buffer; outputIndex: number; }>
 method wallet.WalletFundingProvider.getFixedOutputFeeActionIds(channelId: Buffer): readonly string[]
 method wallet.WalletFundingProvider.getFixedOutputFeeBudget(): wallet.IFixedOutputFeeBudget | undefined
-method wallet.WalletFundingProvider.getFixedOutputFeeStatus(forFeeSatoshis?: bigint): wallet.IFixedOutputFeePoolState | undefined
+method wallet.WalletFundingProvider.getFixedOutputFeeStatus(forFeeSatoshis?: bigint): wallet.IFixedOutputFeeStatus | undefined
 method wallet.WalletFundingProvider.pledgeTransactionInputs(txHex: string): Promise<void>
 method wallet.WalletFundingProvider.quoteDualFundingMax(feeratePerKw: number): { fundingSatoshis: bigint; spendableSats: bigint; feeSats: bigint; inputCount: number; }
 method wallet.WalletFundingProvider.quoteSpliceIn(feeratePerKw: number): { spendableSats: bigint; feeSats: bigint; maxAmountSats: bigint; inputCount: number; }
@@ -10040,6 +10044,7 @@ method wallet.WalletFundingProvider.selectFeeBumpInputs(targetFeeSats: bigint, f
 method wallet.WalletFundingProvider.selectMaxDualFundingInputs(): Promise<{ inputs: channel.ISpliceWalletInput[]; changeScript: Buffer; }>
 method wallet.WalletFundingProvider.selectSpliceInputs(amountSats: bigint, feeratePerKw: number, opts?: node.IUtxoSelectionOpts): Promise<{ inputs: channel.ISpliceWalletInput[]; changeScript: Buffer; }>
 method wallet.WalletFundingProvider.supportsFixedOutputFees(): boolean
+function wallet.fixedOutputFeePolicyRefusal(provider: { getFixedOutputFeeStatus?(): wallet.IFixedOutputFeeStatus | undefined; } | null | undefined): wallet.FixedOutputFeeError | undefined
 namespace watchtower
 const watchtower.BREACH_HINT_SIZE = 16
 enum watchtower.BlobFlag

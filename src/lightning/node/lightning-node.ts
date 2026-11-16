@@ -101,6 +101,7 @@ import {
 	auxiliaryRestoreRefusal,
 	isGuardianRecoveryMode
 } from '../recovery/auxiliary-restore';
+import { fixedOutputFeePolicyRefusal } from '../wallet/fixed-output-fees';
 import type { ISpliceWalletInput } from '../channel/channel';
 import { Channel } from '../channel/channel';
 import { isValidShutdownScript } from '../channel/validation';
@@ -2189,6 +2190,11 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		}
 		this.localFeatures = localFeatures;
 
+		// An asset channel is not accepted by a node whose wallet refused the
+		// fee policy its transactions need.
+		const feePolicyRefusal = config.auxiliaryChannels
+			? fixedOutputFeePolicyRefusal(config.fundingProvider)
+			: undefined;
 		this.channelManager = new ChannelManager({
 			persistence: {
 				persist: (request: IChannelPersistRequest): IChannelPersistResult =>
@@ -2222,6 +2228,8 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 							this.peerInitFeatures(peerPubkey),
 						...(isGuardianRecoveryMode(config.recovery)
 							? { auxiliaryOpenRefusal: new AuxiliaryGuardianModeError() }
+							: feePolicyRefusal
+							? { auxiliaryOpenRefusal: feePolicyRefusal }
 							: {})
 				  }
 				: {}),
@@ -30436,13 +30444,14 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	 * way, the last refusal a fee selection ended with, and whether a split
 	 * for a fee coin of `forFeeSatoshis` (the policy's cap when left out)
 	 * could be made now. Nothing is made or changed by asking. Undefined on
-	 * a node whose funding provider has no fee policy.
+	 * a node whose funding provider has no fee policy. When a policy was
+	 * supplied and the wallet refused it, the answer is that the pool is
+	 * unavailable, with the refusal: such a node neither opens nor accepts
+	 * an asset channel.
 	 */
 	getFixedOutputFeeStatus(
 		forFeeSatoshis?: bigint
-	):
-		| import('../wallet/fixed-output-fees').IFixedOutputFeePoolState
-		| undefined {
+	): import('../wallet/fixed-output-fees').IFixedOutputFeeStatus | undefined {
 		return this.fundingProvider?.getFixedOutputFeeStatus?.(forFeeSatoshis);
 	}
 
@@ -30480,6 +30489,8 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		) {
 			throw new AuxiliaryGuardianModeError();
 		}
+		const feePolicyRefusal = fixedOutputFeePolicyRefusal(this.fundingProvider);
+		if (feePolicyRefusal) throw feePolicyRefusal;
 		if (!this.fundingProvider && !this._chainBackend) {
 			throw new InvalidChannelOpenError(
 				'Asset channel funding requires a transaction broadcaster'

@@ -61,6 +61,7 @@ export type FixedOutputFeeErrorCode =
 	| 'FEE_ACTION_CAP_EXHAUSTED'
 	| 'FEE_PREPARATION_FEE_EXCEEDS_CAP'
 	| 'FEE_PREPARATION_SIGNING_FAILED'
+	| 'FEE_POLICY_REFUSED'
 	| 'FEE_ACTION_RETIRED'
 	| 'FEE_INPUT_UNAVAILABLE';
 
@@ -193,6 +194,41 @@ export interface IFixedOutputFeePoolState {
 		remedy: FixedOutputFeeRemedy;
 		at: number;
 	};
+}
+
+/**
+ * A fee policy was supplied and the wallet refused it, so there is no pool:
+ * no fee coin can be prepared or spent until a policy the wallet takes is
+ * supplied.
+ */
+export interface IFixedOutputFeePoolUnavailable {
+	available: false;
+	/** FEE_POLICY_REFUSED, for the operator, with the wallet's reason. */
+	error: FixedOutputFeeError;
+}
+
+/** What a provider that was given a fee policy says of its fee coin pool. */
+export type IFixedOutputFeeStatus =
+	| IFixedOutputFeePoolState
+	| IFixedOutputFeePoolUnavailable;
+
+/**
+ * The refusal of a provider whose fee policy the wallet refused, and
+ * undefined for every other provider: one with a pool, one that was given
+ * no policy, and one from before the read existed.
+ */
+export function fixedOutputFeePolicyRefusal(
+	provider:
+		| { getFixedOutputFeeStatus?(): IFixedOutputFeeStatus | undefined }
+		| null
+		| undefined
+): FixedOutputFeeError | undefined {
+	try {
+		const status = provider?.getFixedOutputFeeStatus?.();
+		return status && !status.available ? status.error : undefined;
+	} catch {
+		return undefined;
+	}
 }
 
 type Coin = { utxo: ISpliceUtxo; previous: string };

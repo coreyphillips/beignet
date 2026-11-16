@@ -1,10 +1,11 @@
 import { EAddressType } from '../../types';
 import { FixedOutputFeePool } from './fixed-output-fees';
 import type {
+	FixedOutputFeeError,
 	IFixedOutputFeeBudget,
 	IFixedOutputFeePolicy,
-	IFixedOutputFeePoolState,
-	IFixedOutputFeeResolution
+	IFixedOutputFeeResolution,
+	IFixedOutputFeeStatus
 } from './fixed-output-fees';
 /**
  * Wallet funding provider adapter.
@@ -203,6 +204,8 @@ export interface IWalletLike {
 export class WalletFundingProvider implements IFundingProvider {
 	private wallet: IWalletLike;
 	private fixedOutputFeePool?: FixedOutputFeePool;
+	/** Why there is no pool although a fee policy was supplied. */
+	private fixedOutputFeeRefusal?: FixedOutputFeeError;
 
 	/**
 	 * Outpoints pledged to an in-flight funding, keyed txid:vout with the
@@ -268,9 +271,19 @@ export class WalletFundingProvider implements IFundingProvider {
 
 	constructor(
 		wallet: IWalletLike,
-		options: { fixedOutputFees?: IFixedOutputFeePolicy } = {}
+		options: {
+			fixedOutputFees?: IFixedOutputFeePolicy;
+			/**
+			 * A fee policy was supplied and refused. The provider is an ordinary
+			 * one that says so: it reports its pool unavailable, and a selection
+			 * with fixed outputs throws this. Ignored beside fixedOutputFees.
+			 */
+			fixedOutputFeeRefusal?: FixedOutputFeeError;
+		} = {}
 	) {
 		this.wallet = wallet;
+		if (!options.fixedOutputFees)
+			this.fixedOutputFeeRefusal = options.fixedOutputFeeRefusal;
 		if (options.fixedOutputFees)
 			this.walletLockKey = wallet.id
 				? `${wallet.network ?? 'bitcoin'}:${wallet.id}`
@@ -346,12 +359,17 @@ export class WalletFundingProvider implements IFundingProvider {
 	 * a fee coin of `forFeeSatoshis` (the policy's maxFeeSatoshis when left
 	 * out) could be made now, and the last refusal a selection ended with.
 	 * It reads the journal and the wallet's listing and changes nothing.
-	 * Undefined without a fee policy.
+	 * Undefined without a fee policy. With a policy the wallet refused, the
+	 * answer is that the pool is unavailable, and the refusal.
 	 */
 	getFixedOutputFeeStatus(
 		forFeeSatoshis?: bigint
-	): IFixedOutputFeePoolState | undefined {
-		return this.fixedOutputFeePool?.status(forFeeSatoshis);
+	): IFixedOutputFeeStatus | undefined {
+		if (this.fixedOutputFeePool)
+			return this.fixedOutputFeePool.status(forFeeSatoshis);
+		return this.fixedOutputFeeRefusal
+			? { available: false, error: this.fixedOutputFeeRefusal }
+			: undefined;
 	}
 
 	/**
@@ -911,7 +929,10 @@ export class WalletFundingProvider implements IFundingProvider {
 	}> {
 		if (opts?.fixedOutputs) {
 			if (!this.fixedOutputFeePool)
-				throw new Error('Fixed-output fee preparation is not configured');
+				throw (
+					this.fixedOutputFeeRefusal ??
+					new Error('Fixed-output fee preparation is not configured')
+				);
 			return this.runSelection(() =>
 				this.fixedOutputFeePool!.select(targetFeeSats, feeratePerKw, opts)
 			);
