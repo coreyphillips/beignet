@@ -5552,9 +5552,11 @@ export class Channel {
 				msg.customRecords,
 				commitment.result.tx
 			);
+			// Only the answer true verifies: a provider that answers anything
+			// else, a promise among them, has not said the signatures are good.
 			if (
 				!commitment.auxiliary ||
-				!requireAuxiliaryProvider(this._state).verifyHtlcs(
+				requireAuxiliaryProvider(this._state).verifyHtlcs(
 					{
 						state: this._state,
 						side: 'local',
@@ -5563,7 +5565,7 @@ export class Channel {
 						commitment
 					},
 					msg.customRecords ?? new Map()
-				)
+				) !== true
 			) {
 				restore();
 				return 'Invalid asset HTLC signature';

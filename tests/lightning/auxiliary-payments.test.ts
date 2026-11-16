@@ -29,7 +29,12 @@ import {
 	decodeUpdateAddHtlcMessage,
 	encodeUpdateAddHtlcMessage
 } from '../../src/lightning/message/channel-update';
-import { amountRecord, taprootPair } from './helpers/auxiliary-pair';
+import {
+	amountRecord,
+	referenceProvider,
+	taprootPair
+} from './helpers/auxiliary-pair';
+import type { IChannelAuxiliaryProvider } from '../../src/lightning/channel/auxiliary';
 import {
 	assetHost,
 	connectHosts,
@@ -1421,6 +1426,73 @@ describe('Asset payments (issue #2093, step 8)', function () {
 				expect(state.localHtlcCounter).to.equal(0n);
 				expect(state.htlcs.size).to.equal(0);
 				expect(made.bobChannel.getFullState().htlcs.size).to.equal(0);
+			});
+		}
+	});
+
+	describe('a provider whose verification answers something other than true', () => {
+		for (const [what, answer] of [
+			['a promise of false', async (): Promise<boolean> => false],
+			['a promise of true', async (): Promise<boolean> => true],
+			['the number 1', (): number => 1],
+			['nothing', (): undefined => undefined]
+		] as const) {
+			it(`${what}: the asset signatures are not taken as verified, and nothing is paid on them`, async () => {
+				// A provider written as async by mistake answers a promise for
+				// every asset signature of the peer, which is truthy.
+				const provider = {
+					...referenceProvider(),
+					verifyHtlcs: answer as unknown
+				} as IChannelAuxiliaryProvider;
+				const alice = assetHost(`aux-verify-answer-${what}`, 1);
+				const bob = assetHost(`aux-verify-answer-${what}`, 2, {
+					provider,
+					valueIncomingHtlc: (context) => context.auxiliaryAmount! * 1000n
+				});
+				hosts.push(alice, bob);
+				connectHosts(alice, bob);
+				let channelId: Buffer | undefined;
+				try {
+					channelId = await openAssetChannel(alice, bob, {
+						tag: `verify answer ${what}`,
+						openerUnits: 9000n,
+						acceptorUnits: 1000n
+					});
+				} catch {
+					// Refused at the opening: the answer was checked there.
+					return;
+				}
+				const invoice = bob.node.createInvoice({
+					amountMsat: 5_000_000n,
+					description: 'verified by something that is not true'
+				});
+				alice.node.sendPaymentToRoute(
+					hopsTo(bob, 5_000_000n, Buffer.alloc(8, 9)),
+					invoice.paymentHash,
+					40,
+					invoice.paymentSecret,
+					undefined,
+					undefined,
+					undefined,
+					undefined,
+					{
+						assetPayment: {
+							channelId,
+							wireAmountMsat: 354_000n,
+							customRecords: amountRecord(5000n)
+						}
+					}
+				);
+				await settle();
+				await settle();
+				expect(bob.node.getPayment(invoice.paymentHash)?.status).to.not.equal(
+					PaymentStatus.COMPLETED
+				);
+				expect(alice.node.getPayment(invoice.paymentHash)!.status).to.not.equal(
+					PaymentStatus.COMPLETED
+				);
+				// Bob holds no more units than before.
+				expect(units(bob, channelId)[0]).to.equal(1000n);
 			});
 		}
 	});
