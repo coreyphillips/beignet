@@ -146,6 +146,21 @@ export interface IAuxiliaryIncomingHtlc {
 	invoice?: IInvoiceInfo;
 }
 
+/** An asset channel a restore is about to bring back. */
+export interface IAuxiliaryRestoredChannel {
+	channelId: Buffer;
+	peerPubkey: string;
+	/**
+	 * Where the channel comes from: the recovery journal, which carries the
+	 * node's rows for it as they were at its head, or a static channel
+	 * backup, which carries no asset state at all and can only ask the peer
+	 * to close.
+	 */
+	source: 'journal' | 'static-backup';
+	/** The asset funding data the journal holds for it. */
+	channelData?: Buffer;
+}
+
 /**
  * Asset channel support, set as `INodeConfig.auxiliaryChannels`. The
  * provider extends the channel state machine; the callbacks tie funding
@@ -241,6 +256,15 @@ export interface IAuxiliaryChannelConfig {
 	): IAuxiliaryFundingDescriptor | undefined;
 	/** Takes over anchor assembly after the peer accepts the Bitcoin parameters. */
 	onAccepted?(channel: Channel, peerPubkey: string): void;
+	/**
+	 * Whether the host can run these asset channels once a restore has
+	 * brought the node's rows for them back. A restore brings nothing of
+	 * what the host keeps beside those rows, so one that holds asset
+	 * channels is refused, with nothing installed, unless this returns
+	 * `true`: absent, `false`, a throw and anything else all refuse
+	 * (`AuxiliaryRestoreRefusedError`). Synchronous.
+	 */
+	canRestore?(channels: readonly IAuxiliaryRestoredChannel[]): boolean;
 }
 
 /** The most asset funding data a channel carries: 64 MiB. */

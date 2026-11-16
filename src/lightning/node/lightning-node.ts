@@ -95,6 +95,11 @@ import type {
 	IAuxiliaryFundingDescriptor
 } from '../channel/auxiliary-funding';
 import { copyCustomRecords } from '../message/custom-records';
+import {
+	AuxiliaryGuardianModeError,
+	auxiliaryRestoreRefusal,
+	isGuardianRecoveryMode
+} from '../recovery/auxiliary-restore';
 import type { ISpliceWalletInput } from '../channel/channel';
 import { Channel } from '../channel/channel';
 import { isValidShutdownScript } from '../channel/validation';
@@ -2213,7 +2218,10 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				? {
 						auxiliaryChannels: config.auxiliaryChannels,
 						auxiliaryPeerFeatures: (peerPubkey: string) =>
-							this.peerInitFeatures(peerPubkey)
+							this.peerInitFeatures(peerPubkey),
+						...(isGuardianRecoveryMode(config.recovery)
+							? { auxiliaryOpenRefusal: new AuxiliaryGuardianModeError() }
+							: {})
 				  }
 				: {}),
 			zeroReserve: { ...config.zeroReserve },
@@ -9413,6 +9421,29 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				skipped.push({
 					channelId: entry.channelId,
 					reason: 'channel already exists'
+				});
+				continue;
+			}
+			// A backup carries nothing of an asset channel's asset state, so
+			// one is recovered only where the provider says it can restore it.
+			const assetRefusal = isOverlayChannel(
+				Buffer.from(entry.channelType, 'hex')
+			)
+				? auxiliaryRestoreRefusal(
+						[
+							{
+								channelId,
+								peerPubkey: entry.peerNodeId,
+								source: 'static-backup'
+							}
+						],
+						this.auxiliaryChannels
+				  )
+				: undefined;
+			if (assetRefusal) {
+				skipped.push({
+					channelId: entry.channelId,
+					reason: assetRefusal.message
 				});
 				continue;
 			}
@@ -30386,6 +30417,15 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			throw new InvalidChannelOpenError(
 				'An auxiliary channel provider is required to open an asset channel'
 			);
+		}
+		if (
+			isGuardianRecoveryMode({
+				barrier: this.recoveryBarrier,
+				startupGate: this.recoveryGate,
+				guardians: this.recoveryGuardians
+			})
+		) {
+			throw new AuxiliaryGuardianModeError();
 		}
 		if (!this.fundingProvider && !this._chainBackend) {
 			throw new InvalidChannelOpenError(

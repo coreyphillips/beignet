@@ -433,6 +433,11 @@ export interface IChannelManagerConfig {
 	 */
 	auxiliaryChannels?: IAuxiliaryChannelConfig;
 	/**
+	 * Set while this node accepts no asset channel (issue #2093): an
+	 * incoming asset open is refused with it before the host is asked.
+	 */
+	auxiliaryOpenRefusal?: Error;
+	/**
 	 * What a peer advertised in its init, for the asset channel checks. A
 	 * node always supplies this, and with it an asset opening is refused
 	 * whenever the peer's features, or this node's own, cannot be read. A
@@ -5444,6 +5449,9 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		if (!isOverlayChannel(msg.channelType)) return undefined;
 		if (!auxiliaryChannelOpens.enabled) {
 			throw new Error('asset channels are not enabled');
+		}
+		if (this.config.auxiliaryOpenRefusal) {
+			throw new AuxiliaryHostError(this.config.auxiliaryOpenRefusal);
 		}
 		const config = this.config.auxiliaryChannels!;
 		const descriptor = askAuxiliaryHost(() => {

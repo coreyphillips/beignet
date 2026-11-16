@@ -46,7 +46,9 @@
  * generation is live.
  */
 
+import type { IAuxiliaryChannelConfig } from '../channel/auxiliary-funding';
 import { sha256 } from '../crypto/provider';
+import { assertAuxiliaryRestore } from './auxiliary-restore';
 import type { IStorageBackend, IStoredRecoveryFrame } from '../storage/types';
 import { withStorageTransaction } from '../storage/transaction';
 import type { GuardianState } from './guardian-wire';
@@ -215,6 +217,14 @@ export function rotationEntries(
 export interface IRestoreDriverConfig {
 	/** The EMPTY database the restored node will run on. */
 	target: IStorageBackend;
+	/**
+	 * The node's asset channel support, when it has any. A restore that
+	 * holds asset channels is refused, and nothing of it installed, unless
+	 * its `canRestore` says yes; without it the refusal is
+	 * `AuxiliaryProviderRequiredError` (issue #2093). The takeover has
+	 * happened by then, and the restore can be run again.
+	 */
+	auxiliaryChannels?: IAuxiliaryChannelConfig;
 	/** Guardians bound to the identities they must prove they hold. */
 	guardians: IBoundGuardianClient[];
 	context: IGuardianSetContext;
@@ -1590,6 +1600,7 @@ export class RestoreDriver {
 				);
 			}
 			reconstructFromFrames(targetStorage, frames);
+			assertAuxiliaryRestore(targetStorage, this.config.auxiliaryChannels);
 			// StateUncertain (5.6), unless the restore can PROVE it is exact.
 			//
 			// Without a proof the certified head can trail what the old device

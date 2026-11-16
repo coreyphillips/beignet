@@ -64,7 +64,9 @@ import type {
 	VerifiedRecoveryChain
 } from './types';
 import type { IChannelState } from '../channel/channel-state';
+import type { IAuxiliaryChannelConfig } from '../channel/auxiliary-funding';
 import { createOpenerState } from '../channel/channel-state';
+import { assertAuxiliaryRestore } from './auxiliary-restore';
 import {
 	ChannelState,
 	DEFAULT_CHANNEL_CONFIG,
@@ -124,6 +126,14 @@ export interface ICapsuleRestoreOptions {
 	 * on the real target cannot be told apart from a broken database.
 	 */
 	scratchStorage?: () => IStorageBackend;
+	/**
+	 * The node's asset channel support, when it has any. A Tier 2 restore
+	 * that holds asset channels is refused, and nothing of it installed,
+	 * unless its `canRestore` says yes; without it the refusal is
+	 * `AuxiliaryProviderRequiredError` (issue #2093). Never read by a
+	 * restore that holds no asset channel.
+	 */
+	auxiliaryChannels?: IAuxiliaryChannelConfig;
 }
 
 /**
@@ -1443,6 +1453,10 @@ export function restoreFromRecoveryCapsule(
 			);
 		}
 		reconstructFromFrames(target, frames);
+		// Refused here, inside the install, when it holds an asset channel
+		// nobody said can be restored: the throw is not a defect of the
+		// capsule, so no older candidate and no Tier 1 fallback is tried.
+		assertAuxiliaryRestore(target, options.auxiliaryChannels);
 		markCapsuleRestoredChannels(target);
 	});
 	return { tier: 2, scb, framesApplied: frames.length };

@@ -583,7 +583,8 @@ const STATUS_BY_ERROR_CODE: Partial<Record<BeignetErrorCodeValue, number>> = {
 	// changes which extensions the daemon is started with.
 	ASSET_PROVIDER_REQUIRED: 409,
 	ASSET_PROVIDER_CONFLICT: 409,
-	ASSET_PROVIDER_FAILED: 409
+	ASSET_PROVIDER_FAILED: 409,
+	ASSET_RESTORE_REFUSED: 409
 	// Left unmapped on purpose, so they keep the 500 default:
 	// WALLET_CREATE_FAILED, ADDRESS_FAILED, REFRESH_FAILED and
 	// DESCRIPTOR_EXPORT_FAILED are node faults, and SEND_FAILED, CLOSE_FAILED,

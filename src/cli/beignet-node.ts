@@ -203,6 +203,7 @@ import type {
 	IGuardianReplicationEvent
 } from '../lightning/recovery';
 import {
+	AuxiliaryRestoreRefusedError,
 	RestoreRefusedError,
 	RestoreRotatedError,
 	buildGuardianRecovery,
@@ -2473,6 +2474,8 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	private recoveryGuardianSet: IParsedGuardian[] = [];
 	/** The node-level recovery config fragment initNode passes at construction. */
 	private recoveryNodeConfig?: INodeConfig['recovery'];
+	/** The asset channel support of the node last built, for a restore to ask. */
+	private _restoreAuxiliaryChannels?: INodeConfig['auxiliaryChannels'];
 	/** The assembled run decision (guardian modes only). */
 	private _recoveryRun?: Extract<GuardianBootDecision, { kind: 'run' }>;
 	/** The env named a guardian set the journal has since rotated away from. */
@@ -3258,6 +3261,31 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	}
 
 	/**
+	 * The engine's refusal of a restore that holds asset channels (issue
+	 * #2093), as the daemon's own: ASSET_RESTORE_REFUSED when the extension
+	 * that supplies the node's asset channels did not say it can restore
+	 * them, and ASSET_PROVIDER_REQUIRED when no extension supplies any.
+	 * Nothing of the restore was installed either way. Undefined for any
+	 * other failure.
+	 */
+	private assetRestoreRefusal(err: unknown): BeignetError | undefined {
+		if (err instanceof AuxiliaryRestoreRefusedError) {
+			return new BeignetError('ASSET_RESTORE_REFUSED', err.message);
+		}
+		if (err instanceof AuxiliaryProviderRequiredError) {
+			const count = err.channelIds.length;
+			return new BeignetError(
+				'ASSET_PROVIDER_REQUIRED',
+				`This restore holds ${count} asset channel${count === 1 ? '' : 's'} ` +
+					'and no extension attached to this wallet can run them, so ' +
+					'nothing was restored. Restore it with the extension that ' +
+					'opened them.'
+			);
+		}
+		return undefined;
+	}
+
+	/**
 	 * The engine's refusal to run stored asset channels without their
 	 * provider (issue #2093), as the daemon's own: a stable code and a
 	 * sentence an operator can act on. Anything else comes back undefined.
@@ -3483,6 +3511,9 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 		// 4. Create funding provider from wallet
 		const { fundingProvider, refused } = this.walletFundingProvider(supplied);
 		const auxiliary = refused ? undefined : supplied;
+		// Kept for a restore this process runs later: it is refused when it
+		// holds asset channels this provider does not say it can restore.
+		this._restoreAuxiliaryChannels = auxiliary?.auxiliaryChannels;
 
 		// 5. Create electrum backend for chain monitoring
 		const electrumBackend = new ElectrumBackend(this.wallet.electrum);
@@ -5111,6 +5142,9 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 		return buildGuardianRecovery({
 			storage: this.storage,
 			nodeSecret: this.nodeSecret(),
+			...(this._restoreAuxiliaryChannels
+				? { auxiliaryChannels: this._restoreAuxiliaryChannels }
+				: {}),
 			durability: mode,
 			guardians,
 			following,
@@ -5696,7 +5730,8 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 			// candidate validated); a staged file that cannot be opened or
 			// written is an operational fault and is reported as one.
 			const installFailure = (err: unknown): BeignetError =>
-				err instanceof CapsuleCandidateError
+				this.assetRestoreRefusal(err) ??
+				(err instanceof CapsuleCandidateError
 					? new BeignetError(
 							'CAPSULE_RESTORE_FAILED',
 							`No retrieved capsule could be restored: ${err.message}`
@@ -5706,7 +5741,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 							`Could not write the restored database: ${
 								err instanceof Error ? err.message : String(err)
 							}`
-					  );
+					  ));
 			let staged: SqliteStorage;
 			try {
 				staged = new Sqlite(
@@ -5730,7 +5765,10 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 						const scratch = new Sqlite(':memory:');
 						scratch.open();
 						return scratch;
-					}
+					},
+					...(this._restoreAuxiliaryChannels
+						? { auxiliaryChannels: this._restoreAuxiliaryChannels }
+						: {})
 				});
 				// Retrieval already refuses wrong-network capsules; this is the
 				// belt on those braces, and a candidate defect if it ever fires.
@@ -7094,7 +7132,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 							err.message
 						);
 					}
-					throw err;
+					throw this.assetRestoreRefusal(err) ?? err;
 				}
 			}
 			// The lease is durably installed, so re-running the boot decision

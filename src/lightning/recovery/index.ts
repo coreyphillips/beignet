@@ -42,6 +42,7 @@ export * from './channel-status';
 export * from './durability-barrier';
 export * from './wire-safety';
 export * from './assembly';
+export * from './auxiliary-restore';
 
 /**
  * @deprecated Import `GuardianStore` from `beignet/lightning/sqlite`. This

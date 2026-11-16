@@ -251,6 +251,12 @@ export enum BeignetErrorCode {
 	 * channel, so the node was not started.
 	 */
 	ASSET_PROVIDER_FAILED = 'ASSET_PROVIDER_FAILED',
+	/**
+	 * A restore holds asset channels and the extension that supplies the
+	 * node's asset channels did not say it can restore them. Nothing of the
+	 * restore was installed.
+	 */
+	ASSET_RESTORE_REFUSED = 'ASSET_RESTORE_REFUSED',
 	// Host extensions (docs/EXTENSIONS.md).
 	/**
 	 * A refusal from an extension's route. The envelope carries the

@@ -1662,6 +1662,7 @@ method channel.IAuxiliaryChannelConfig.allowLegacyHtlcSignatures?(peerPubkey: st
 property channel.IAuxiliaryChannelConfig.allowRevokedChildCustody?: boolean
 method channel.IAuxiliaryChannelConfig.beforeAccept?(channel: channel.Channel, peerPubkey: string): Promise<void>
 method channel.IAuxiliaryChannelConfig.beforeFundingCreated?(channel: channel.Channel, peerPubkey: string): Promise<void>
+method channel.IAuxiliaryChannelConfig.canRestore?(channels: readonly channel.IAuxiliaryRestoredChannel[]): boolean
 property channel.IAuxiliaryChannelConfig.initCustomRecords?: message.CustomRecords
 method channel.IAuxiliaryChannelConfig.onAccepted?(channel: channel.Channel, peerPubkey: string): void
 method channel.IAuxiliaryChannelConfig.onFundingSigned?(context: channel.IAuxiliaryFundingSigned): void
@@ -1793,6 +1794,11 @@ property channel.IAuxiliaryPaymentHtlc.amountMsat: bigint
 property channel.IAuxiliaryPaymentHtlc.channelId: Buffer
 property channel.IAuxiliaryPaymentHtlc.htlc?: channel.IAuxiliaryChannelHtlc
 property channel.IAuxiliaryPaymentHtlc.htlcId: bigint
+interface channel.IAuxiliaryRestoredChannel
+property channel.IAuxiliaryRestoredChannel.channelData?: Buffer
+property channel.IAuxiliaryRestoredChannel.channelId: Buffer
+property channel.IAuxiliaryRestoredChannel.peerPubkey: string
+property channel.IAuxiliaryRestoredChannel.source: 'journal' | 'static-backup'
 interface channel.IAuxiliaryRevokedChildContext
 property channel.IAuxiliaryRevokedChildContext.childTemplate: bitcoinjs-lib#Transaction
 property channel.IAuxiliaryRevokedChildContext.cltvExpiry: number
@@ -1906,6 +1912,7 @@ property channel.IChannelFullyResolvedAction.channelId: Buffer
 property channel.IChannelFullyResolvedAction.type: channel.ChannelActionType.CHANNEL_FULLY_RESOLVED
 interface channel.IChannelManagerConfig
 property channel.IChannelManagerConfig.auxiliaryChannels?: channel.IAuxiliaryChannelConfig
+property channel.IChannelManagerConfig.auxiliaryOpenRefusal?: Error
 method channel.IChannelManagerConfig.auxiliaryPeerFeatures?(peerPubkey: string): features.FeatureFlags | undefined
 property channel.IChannelManagerConfig.chainHash?: Buffer
 property channel.IChannelManagerConfig.channelKeyDeriver?: (channelIndex: number) => channel.IPerChannelKeys
@@ -6931,6 +6938,12 @@ function onionMessage.encodeOnionMessage(msg: onionMessage.IOnionMessage): Buffe
 function onionMessage.encodeOnionMessagePayload(payload: onionMessage.IOnionMessagePayload): Buffer
 function onionMessage.processOnionMessage(onionPacketBuf: Buffer, nodePrivkey: Buffer, blindingPoint?: Buffer, resolveScid?: (scid: Buffer) => Buffer | undefined): onionMessage.OnionMessageProcessResult
 namespace recovery
+class recovery.AuxiliaryGuardianModeError extends beignet#CodedError<'AUXILIARY_GUARDIAN_MODE'>
+constructor recovery.AuxiliaryGuardianModeError()
+class recovery.AuxiliaryRestoreRefusedError extends beignet#CodedError<'AUXILIARY_RESTORE_REFUSED'>
+constructor recovery.AuxiliaryRestoreRefusedError(channelIds: readonly string[], detail?: string)
+readonly property recovery.AuxiliaryRestoreRefusedError.channelIds: readonly string[]
+readonly property recovery.AuxiliaryRestoreRefusedError.detail?: string
 type recovery.BarrierOutcome = { released: true; reason: 'not-required' | 'durable'; } | { released: false; reason: 'timeout' | 'fenced' | 'stopped' | 'missing-frame' | 'backfill-lost'; }
 class recovery.Bolt8GuardianSession
 constructor recovery.Bolt8GuardianSession(options: recovery.IBolt8GuardianSessionOptions)
@@ -7193,6 +7206,7 @@ interface recovery.IBoundGuardianClient
 property recovery.IBoundGuardianClient.client: recovery.GuardianClient
 property recovery.IBoundGuardianClient.expectedGuardianId: Buffer
 interface recovery.ICapsuleRestoreOptions
+property recovery.ICapsuleRestoreOptions.auxiliaryChannels?: channel.IAuxiliaryChannelConfig
 property recovery.ICapsuleRestoreOptions.scratchStorage?: () => storage.IStorageBackend
 interface recovery.ICapsuleRestoreResult
 property recovery.ICapsuleRestoreResult.framesApplied: number
@@ -7253,6 +7267,7 @@ property recovery.IGuardianAlarm.status: recovery.GuardianStatus
 interface recovery.IGuardianAssemblyConfig
 property recovery.IGuardianAssemblyConfig.allowUnencryptedAuth?: boolean
 property recovery.IGuardianAssemblyConfig.allowUnencryptedSecrets?: boolean
+property recovery.IGuardianAssemblyConfig.auxiliaryChannels?: channel.IAuxiliaryChannelConfig
 property recovery.IGuardianAssemblyConfig.barrierTimeoutMs?: number
 property recovery.IGuardianAssemblyConfig.clock?: () => bigint
 property recovery.IGuardianAssemblyConfig.durability: 'async-remote' | 'quorum'
@@ -7629,6 +7644,7 @@ property recovery.IReplicationResult.rotatedTo?: recovery.IGuardianRotateSetRequ
 property recovery.IReplicationResult.verifiedCurrentState?: recovery.GuardianState
 interface recovery.IRestoreDriverConfig
 property recovery.IRestoreDriverConfig.allowUnencryptedSecrets?: boolean
+property recovery.IRestoreDriverConfig.auxiliaryChannels?: channel.IAuxiliaryChannelConfig
 property recovery.IRestoreDriverConfig.clock?: () => bigint
 property recovery.IRestoreDriverConfig.context: recovery.IGuardianSetContext
 property recovery.IRestoreDriverConfig.guardians: recovery.IBoundGuardianClient[]
@@ -7865,6 +7881,7 @@ property recovery.WriterLease.epoch: bigint
 property recovery.WriterLease.writerPublicKey: Buffer
 type recovery.WriterLeaseLoad = { state: 'missing'; journalEpoch: bigint | null; } | { state: 'present'; lease: recovery.IWriterLeaseKeys; }
 function recovery.acquireTranscriptHash(guardianSetId: Buffer, expectedState: recovery.GuardianState, newEpoch: bigint, newWriterPublicKey: Buffer): Buffer
+function recovery.assertAuxiliaryRestore(target: storage.IStorageBackend, auxiliaryChannels: channel.IAuxiliaryChannelConfig | undefined): void
 function recovery.assertDistinctGuardianMembers(bound: recovery.IBoundGuardianClient[], context: recovery.IGuardianSetContext): void
 function recovery.assertEmptyTarget(target: storage.IStorageBackend): void
 function recovery.assertFramesReconstructable(frames: recovery.RecoveryFrame[]): void
@@ -7872,6 +7889,7 @@ function recovery.assertGuardianAuth(value: unknown, where: string): recovery.Gu
 function recovery.assertGuardianDescriptors(value: unknown): recovery.GuardianDescriptor[]
 function recovery.assertMutationEncodable(mutation: recovery.RecoveryMutation): void
 function recovery.assertNoJournalResidue(target: storage.IStorageBackend): void
+function recovery.auxiliaryRestoreRefusal(channels: readonly channel.IAuxiliaryRestoredChannel[], auxiliaryChannels: channel.IAuxiliaryChannelConfig | undefined, unreadableChannelIds?: readonly string[]): node.AuxiliaryProviderRequiredError | recovery.AuxiliaryRestoreRefusedError | undefined
 function recovery.bearerAuthenticator(token: string): (request: http#IncomingMessage) => boolean
 function recovery.bindGuardianSet(guardians: recovery.IParsedGuardian[], options: Pick<recovery.IGuardianAssemblyConfig, 'transportFor' | 'allowUnencryptedAuth'>): { setId: Buffer; context: recovery.IGuardianSetContext; bound: recovery.IBoundGuardianClient[]; }
 function recovery.bolt8BearerAuthenticator(token: string): (auth: Buffer | undefined) => boolean
@@ -7960,6 +7978,7 @@ function recovery.guardianFanOut<T>(clients: recovery.GuardianClient[], operatio
 function recovery.guardianTaggedHash(tag: string, message: Buffer): Buffer
 function recovery.hashFrame(plaintext: Buffer): Buffer
 function recovery.isGenesisLogHead(head: recovery.LogHead): boolean
+function recovery.isGuardianRecoveryMode(recovery: { barrier?: unknown; startupGate?: unknown; guardians?: readonly unknown[]; } | undefined): boolean
 function recovery.isGuardianVerbName(verb: string): verb is recovery.GuardianVerbName
 function recovery.isLoopbackHostname(hostname: string): boolean
 function recovery.isOnionV3Hostname(hostname: string): boolean
