@@ -577,6 +577,14 @@ async function handleStart(): Promise<void> {
 		// Host extensions (docs/EXTENSIONS.md) are named only here, by the
 		// flag or the environment of the process that starts the daemon:
 		// never by config.json, which an API caller can reach.
+		// A flag with nothing after it names no file. Starting without the
+		// extension the operator meant would hide that, so it is refused.
+		if (filteredArgs[filteredArgs.length - 1] === '--extension') {
+			throw new BeignetError(
+				'INVALID_PARAMS',
+				'--extension needs the absolute path of a module'
+			);
+		}
 		const extensionFiles = [
 			...parseRepeatedFlag('--extension'),
 			...extensionPathsFromEnv(process.env.BEIGNET_EXTENSIONS)
@@ -3767,6 +3775,13 @@ Start flags:
                                          (default: off; env BEIGNET_RECOVERY_AUTO_APPLY;
                                          BEIGNET_RECOVERY_AUTO_APPLY_SETTLE_MS and
                                          _MAX_WAIT_MS bound the wait for replicas)
+  --extension <path>                     Run a host extension inside the daemon: the
+                                         absolute path of a module that exports
+                                         beignetExtension, owned by this user or
+                                         root and writable by no one else. It runs
+                                         with the wallet's keys (repeatable; env
+                                         BEIGNET_EXTENSIONS, comma list; never read
+                                         from config.json; docs/EXTENSIONS.md)
 
 Pay-retry flags:
   --max-retries <N>                      Max retry attempts (default: 3)

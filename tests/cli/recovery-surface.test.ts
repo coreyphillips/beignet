@@ -18,6 +18,11 @@ import { AddressInfo } from 'net';
 import { IStartedDaemon, startDaemon } from '../../src/cli/daemon';
 import { resolveConfig } from '../../src/cli/config';
 import { BeignetError } from '../../src/cli/errors';
+import { EXTENSION_API_VERSION } from '../../src/cli/extension';
+import type {
+	IBeignetExtension,
+	IExtensionContext
+} from '../../src/cli/extension';
 import { AUTH_KEY_OVERRIDES_STORAGE_KEY } from '../../src/cli/auth';
 import { encode as encodeInvoice } from '../../src/lightning/invoice/encode';
 import {
@@ -2954,6 +2959,86 @@ describe('Recovery surface: automatic capsule restore (peer-storage auto-apply, 
 				expect(status.state).to.equal('running');
 				expect(status.autoApply.enabled).to.equal(true);
 				expect(status.autoApply.phase).to.equal('idle');
+			} finally {
+				await deviceB.stop();
+			}
+		} finally {
+			fs.rmSync(dirA, { recursive: true, force: true });
+			fs.rmSync(dirB, { recursive: true, force: true });
+		}
+	});
+
+	// A host extension's rows are copied into the staged database, and its
+	// view is fenced only when the node is torn down, after the
+	// capsule:installed event. A write in between would be acknowledged by
+	// the old database and missing from the one installed.
+	it("refuses an extension's write between the copy of its rows and the rebuild (docs/EXTENSIONS.md)", async function (): Promise<void> {
+		this.timeout(120_000);
+		const dirA = tmpDir('auto-ext-a');
+		const dirB = tmpDir('auto-ext-b');
+		try {
+			const { inline } = await composeSource(dirA, 'extension rows probe');
+			const contexts: IExtensionContext[] = [];
+			const extension: IBeignetExtension = {
+				id: 'ledger',
+				version: '1.0.0',
+				api: EXTENSION_API_VERSION,
+				attach: (context) => {
+					contexts.push(context);
+					return {};
+				}
+			};
+			const deviceB = await startDaemon({
+				...OFFLINE,
+				dataDir: dirB,
+				...AUTO,
+				extensions: [extension]
+			});
+			try {
+				expect(contexts).to.have.length(1);
+				const first = contexts[0];
+				first.storage.set('held/1', 'before the restore');
+
+				// What an embedder's own listener could do with a context it
+				// kept: write at the one moment the write cannot survive.
+				let attempted = false;
+				let refusal: unknown;
+				let readDuring: string | null | undefined;
+				deviceB.node.on('recovery:restore-progress', (data) => {
+					if ((data as { type: string }).type !== 'capsule:installed') return;
+					attempted = true;
+					readDuring = first.storage.get('held/1');
+					try {
+						first.storage.set('held/2', 'after the copy');
+					} catch (err) {
+						refusal = err;
+					}
+				});
+				const restored = waitForEvent(deviceB, 'recovery:restored', 60_000);
+				retrieved(deviceB, PEER_A, inline);
+				const done = await restored;
+				expect(done.tier).to.equal(2);
+				expect(done.resumed).to.equal(true);
+
+				// Refused, in words, and not acknowledged; the read went through.
+				expect(attempted).to.equal(true);
+				expect(readDuring).to.equal('before the restore');
+				expect(refusal).to.be.instanceOf(Error);
+				expect((refusal as Error).message).to.include(
+					'The database is being replaced'
+				);
+
+				// The next generation holds exactly what was copied, and writes.
+				expect(contexts).to.have.length(2);
+				const second = contexts[1];
+				expect(second.generation).to.equal(2);
+				expect(second.storage.get('held/1')).to.equal('before the restore');
+				expect(second.storage.get('held/2')).to.equal(null);
+				second.storage.set('held/3', 'after the rebuild');
+				expect(second.storage.get('held/3')).to.equal('after the rebuild');
+				expect(() => first.storage.get('held/1')).to.throw(
+					'The database connection is not open'
+				);
 			} finally {
 				await deviceB.stop();
 			}

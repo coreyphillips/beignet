@@ -216,7 +216,13 @@ function demoExtension(log: IDemoLog, id = 'demo'): IBeignetExtension {
 						asked: query.get('q')
 					}),
 					'POST /echo': ({ body }) => body,
-					'POST /spend': ({ idempotencyKey }) => {
+					'POST /spend': ({ body, idempotencyKey }) => {
+						if (body.engineFault === true) {
+							throw new BeignetError(
+								'INSUFFICIENT_BALANCE',
+								'/private/path/secret.db has no coins'
+							);
+						}
 						log.runs.push({ key: 'spend', idempotencyKey });
 						return { runs: log.runs.length };
 					},
@@ -226,7 +232,15 @@ function demoExtension(log: IDemoLog, id = 'demo'): IBeignetExtension {
 							held: '5'
 						});
 					},
-					'POST /fault': () => {
+					'POST /fault': ({ body }) => {
+						// The engine's own error class, as a wallet call made from
+						// inside a handler could throw it.
+						if (body.engine === true) {
+							throw new BeignetError(
+								'INVALID_PARAMS',
+								'/private/path/secret.db is not a wallet'
+							);
+						}
 						throw new Error('secret detail that must not leak');
 					},
 					'POST /large': ({ body }) => ({
@@ -508,10 +522,69 @@ describe('host extensions: the storage view', () => {
 		expect(view.transaction(() => view.get('kept'))).to.equal('1');
 	});
 
+	it('refuses a transaction inside another before its callback runs', () => {
+		const { storage: view } = extensionStorageView('alpha', () => storage);
+		const other = extensionStorageView('beta', () => storage).storage;
+		let innerRan = false;
+		const inner = (): void => {
+			innerRan = true;
+			view.set('inner', '1');
+			throw new Error('inner gives up');
+		};
+		// Joined to the outer one, the inner write would be committed when
+		// the outer callback catches the inner throw.
+		view.transaction(() => {
+			view.set('outer', '1');
+			expect(() => view.transaction(inner)).to.throw(
+				'cannot be opened inside another transaction'
+			);
+			// Another extension's view of the same database is no way around it.
+			expect(() => other.transaction(inner)).to.throw(
+				'cannot be opened inside another transaction'
+			);
+		});
+		expect(innerRan).to.equal(false);
+		expect(view.get('outer')).to.equal('1');
+		expect(view.get('inner')).to.equal(null);
+		// The refusal left nothing open: the next transaction runs.
+		expect(view.transaction(() => view.get('outer'))).to.equal('1');
+	});
+
+	it('refuses writes while they are held, and takes them again once released', () => {
+		const view = extensionStorageView('alpha', () => storage);
+		view.storage.set('k', 'before');
+		view.holdWrites(true);
+		expect(() => view.storage.set('k', 'during')).to.throw(
+			'The database is being replaced'
+		);
+		expect(() => view.storage.delete('k')).to.throw(
+			'The database is being replaced'
+		);
+		expect(() =>
+			view.storage.transaction(() => view.storage.set('k', 'during'))
+		).to.throw('The database is being replaced');
+		// Reads go on, and so does a transaction that only reads.
+		expect(view.storage.get('k')).to.equal('before');
+		expect(view.storage.list('')).to.have.length(1);
+		expect(view.storage.transaction(() => view.storage.get('k'))).to.equal(
+			'before'
+		);
+		view.holdWrites(false);
+		view.storage.set('k', 'after');
+		expect(view.storage.get('k')).to.equal('after');
+		// Fenced wins over held: the view says what the node's own would.
+		view.holdWrites(true);
+		view.fence();
+		expect(() => view.storage.set('k', 'late')).to.throw(
+			'The database connection is not open'
+		);
+	});
+
 	it('refuses keys that could leave the namespace or break the scan', () => {
 		const { storage: view } = extensionStorageView('alpha', () => storage);
 		expect(() => view.set('', 'v')).to.throw(TypeError);
 		expect(() => view.get('a\u0000b')).to.throw(TypeError);
+		expect(() => view.get('a￿b')).to.throw(TypeError);
 		expect(() => view.set('k', 5 as unknown as string)).to.throw(TypeError);
 		expect(() => view.set('k'.repeat(513), 'v')).to.throw(TypeError);
 	});
@@ -706,6 +779,192 @@ describe('host extensions: the host across node builds', () => {
 		expect(() => h.handler('demo', 'GET /a')).to.throw(/failed: start/);
 	});
 
+	it('stops an attachment it refuses, so what attach() opened is handed back', async () => {
+		const stops: string[] = [];
+		const stop = (reason: string): void => void stops.push(reason);
+		const h = host([
+			minimal({
+				id: 'missing',
+				routes: [{ method: 'GET', path: '/a', summary: 's' }],
+				attach: () => ({ handlers: {}, stop })
+			}),
+			minimal({
+				id: 'extra',
+				attach: () => ({ handlers: { 'GET /hidden': () => 1 }, stop })
+			}),
+			// Not an attachment at all: nothing to stop, and nothing thrown.
+			minimal({ id: 'nothing', attach: () => 7 })
+		]);
+		await h.attach(build());
+		expect(h.describe().map((info) => info.state)).to.deep.equal([
+			'failed',
+			'failed',
+			'failed'
+		]);
+		expect(stops).to.deep.equal(['shutdown', 'shutdown']);
+		// Once each: the teardown does not stop them again.
+		await h.shutdown();
+		expect(stops).to.deep.equal(['shutdown', 'shutdown']);
+	});
+
+	it('starts the extensions together, so one that never finishes holds no other back', async () => {
+		let secondStarted = 0;
+		const h = host([
+			minimal({
+				id: 'hangs',
+				attach: () => ({ start: () => new Promise<void>(() => undefined) })
+			}),
+			minimal({
+				id: 'second',
+				attach: () => ({
+					start: (): void => {
+						secondStarted++;
+					}
+				})
+			})
+		]);
+		await h.attach(build());
+		h.startInBackground();
+		await sleep(5);
+		expect(secondStarted).to.equal(1);
+		const [first, second] = h.describe();
+		expect(first.state).to.equal('attached');
+		expect(second.state).to.equal('ready');
+	});
+
+	it('never starts the next generation from a pass the last one left waiting', async () => {
+		const started: number[] = [];
+		let releaseFirst: () => void = () => undefined;
+		const h = host([
+			minimal({
+				id: 'slow',
+				attach: (context: IExtensionContext) => ({
+					// Only the first generation waits.
+					start: (): Promise<void> | void =>
+						context.generation === 1
+							? new Promise<void>((resolve) => {
+									releaseFirst = resolve;
+							  })
+							: undefined
+				})
+			}),
+			minimal({
+				id: 'counted',
+				attach: (context: IExtensionContext) => ({
+					start: (): void => void started.push(context.generation)
+				})
+			})
+		]);
+		await h.attach(build());
+		h.startInBackground();
+		const firstPass = h.started;
+		await sleep(5);
+		expect(started).to.deep.equal([1]);
+
+		h.fenceForRebuild();
+		await h.attach(build());
+		h.startInBackground();
+		await h.started;
+		expect(started).to.deep.equal([1, 2]);
+
+		// The first pass wakes with generation 2 attached. It has no hook
+		// left to call, and it leaves the states of generation 2 alone.
+		releaseFirst();
+		await firstPass;
+		expect(started).to.deep.equal([1, 2]);
+		expect(h.describe().map((info) => info.state)).to.deep.equal([
+			'ready',
+			'ready'
+		]);
+	});
+
+	it('leaves the next generation alone when a failed start is still stopping', async () => {
+		const stops: string[] = [];
+		const contexts: IExtensionContext[] = [];
+		const h = host([
+			minimal({
+				routes: [{ method: 'GET', path: '/a', summary: 's' }],
+				attach: (context: IExtensionContext) => {
+					contexts.push(context);
+					return {
+						handlers: { 'GET /a': () => context.generation },
+						start: (): void => {
+							if (context.generation === 1) throw new Error('port taken');
+						},
+						stop: async (reason: string): Promise<void> => {
+							await sleep(30);
+							stops.push(`${reason} ${context.generation}`);
+						}
+					};
+				}
+			})
+		]);
+		await h.attach(build());
+		const starting = h.start();
+		// start() threw and the stop hook of generation 1 is running. It is
+		// failed already, with its routes closed.
+		await sleep(5);
+		expect(only(h).state).to.equal('failed');
+		expect(() => h.handler('demo', 'GET /a')).to.throw(/failed: start/);
+
+		// A rebuild comes in the middle of that stop.
+		h.fenceForRebuild();
+		await h.attach(build());
+		await starting;
+		await h.start();
+
+		// One stop for generation 1, and generation 2 is whole: not fenced,
+		// not failed, its routes bound.
+		expect(stops).to.deep.equal(['shutdown 1']);
+		expect(only(h).state).to.equal('ready');
+		expect(only(h).error).to.equal(undefined);
+		expect(only(h).generation).to.equal(2);
+		contexts[1].storage.set('k', 'generation 2 writes');
+		expect(contexts[1].storage.get('k')).to.equal('generation 2 writes');
+		expect(h.handler('demo', 'GET /a')).to.be.a('function');
+		expect(() => contexts[0].storage.get('k')).to.throw(
+			'The database connection is not open'
+		);
+	});
+
+	it('reports an extension whose status() does not serialize, without the status', async () => {
+		const cycle: Record<string, unknown> = {};
+		cycle.self = cycle;
+		const h = host([
+			minimal({
+				id: 'bigint',
+				attach: () => ({ status: () => ({ n: BigInt(5) }) })
+			}),
+			minimal({ id: 'cycle', attach: () => ({ status: () => cycle }) }),
+			minimal({ id: 'nothing', attach: () => ({ status: () => undefined }) }),
+			minimal({
+				id: 'fine',
+				attach: () => ({ status: () => ({ at: new Date(0), n: 1 }) })
+			})
+		]);
+		await h.attach(build());
+		const infos = h.describe();
+		// The answer GET /extensions sends is this, through JSON.stringify.
+		expect(() => JSON.stringify(infos)).not.to.throw();
+		expect(infos.map((info) => info.state)).to.deep.equal([
+			'attached',
+			'attached',
+			'attached',
+			'attached'
+		]);
+		expect(infos[0]).not.to.have.property('status');
+		expect(infos[1]).not.to.have.property('status');
+		expect(infos[2]).not.to.have.property('status');
+		// What a caller would have read after the wire, exactly.
+		expect(infos[3].status).to.deep.equal({
+			at: '1970-01-01T00:00:00.000Z',
+			n: 1
+		});
+		expect(
+			logs.filter((entry) => entry.message === 'Extension status failed')
+		).to.have.length(2);
+	});
+
 	it('gives up on an attach() that does not answer, and stops it when it does', async () => {
 		let release: (attachment: IExtensionAttachment) => void = () => undefined;
 		const stops: string[] = [];
@@ -861,6 +1120,158 @@ describe('host extensions: the host across node builds', () => {
 			'Extension stop timed out',
 			'Extension stop failed'
 		]);
+	});
+
+	it('holds every stop hook of a shutdown to one bound, and to a shorter one it is given', async () => {
+		const hanging = (id: string): IBeignetExtension =>
+			minimal({
+				id,
+				attach: () => ({ stop: () => new Promise<void>(() => undefined) })
+			});
+		// Three hooks that hang wait once, together: not three times.
+		const together = host([hanging('one'), hanging('two'), hanging('three')], {
+			stopTimeoutMs: 150
+		});
+		await together.attach(build());
+		let began = Date.now();
+		await together.shutdown();
+		expect(Date.now() - began).to.be.lessThan(400);
+
+		// The node hands over a share of its own budget, and that is the bound.
+		const limited = host([hanging('one')], { stopTimeoutMs: 5_000 });
+		await limited.attach(build());
+		began = Date.now();
+		await limited.shutdown(40);
+		expect(Date.now() - began).to.be.lessThan(1_000);
+		expect(only(limited).state).to.equal('stopped');
+
+		// So is the wait for hooks an earlier rebuild left running.
+		const settling = host([hanging('one')], { stopTimeoutMs: 5_000 });
+		await settling.attach(build());
+		settling.fenceForRebuild();
+		began = Date.now();
+		await settling.shutdown(40);
+		expect(Date.now() - began).to.be.lessThan(1_000);
+	});
+
+	it('attaches nothing more once a shutdown has begun, and stops what was attaching', async () => {
+		let release: (attachment: IExtensionAttachment) => void = () => undefined;
+		const stops: string[] = [];
+		let secondAttached = 0;
+		const h = host([
+			minimal({
+				id: 'first',
+				attach: () =>
+					new Promise<IExtensionAttachment>((resolve) => {
+						release = resolve;
+					})
+			}),
+			minimal({
+				id: 'second',
+				attach: () => {
+					secondAttached++;
+					return { stop: (): void => void stops.push('second') };
+				}
+			})
+		]);
+		const attaching = h.attach(build());
+		await sleep(5);
+		await h.shutdown();
+		// The first attach() answers after the shutdown is over.
+		release({ stop: (): void => void stops.push('first') });
+		await attaching;
+		await sleep(5);
+		// The second was never attached: it would have had a writable view of
+		// a node that is gone, and no one left to call its stop hook.
+		expect(secondAttached).to.equal(0);
+		expect(stops).to.deep.equal(['first']);
+		expect(h.describe().map((info) => info.state)).to.deep.equal([
+			'stopped',
+			'pending'
+		]);
+		expect(() => h.handler('first', 'GET /a')).to.throw(/is stopped/);
+	});
+
+	it('stops an attachment that arrives while a shutdown waits for the others', async () => {
+		let release: (attachment: IExtensionAttachment) => void = () => undefined;
+		const stops: string[] = [];
+		let lateContext: IExtensionContext | undefined;
+		const h = host([
+			minimal({
+				id: 'running',
+				attach: () => ({
+					stop: async (): Promise<void> => {
+						await sleep(40);
+						stops.push('running');
+					}
+				})
+			}),
+			minimal({
+				id: 'late',
+				routes: [{ method: 'GET', path: '/a', summary: 's' }],
+				attach: (context: IExtensionContext) => {
+					lateContext = context;
+					return new Promise<IExtensionAttachment>((resolve) => {
+						release = resolve;
+					});
+				}
+			})
+		]);
+		const attaching = h.attach(build());
+		await sleep(5);
+		const stopping = h.shutdown();
+		// The shutdown is waiting for the first extension's hook when the
+		// second attach() answers.
+		await sleep(5);
+		release({
+			handlers: { 'GET /a': () => 1 },
+			stop: (): void => void stops.push('late')
+		});
+		await attaching;
+		await stopping;
+		expect(stops).to.deep.equal(['late', 'running']);
+		expect(h.describe().map((info) => info.state)).to.deep.equal([
+			'stopped',
+			'stopped'
+		]);
+		expect(() => h.handler('late', 'GET /a')).to.throw(/is stopped/);
+		expect(() => lateContext?.storage.set('k', 'v')).to.throw(
+			'The database connection is not open'
+		);
+	});
+
+	it('refuses writes between a restore copying the rows and the fence, and takes them again if it gives up', async () => {
+		const log = newLog();
+		const h = host([demoExtension(log)]);
+		await h.attach(build());
+		const first = log.contexts[0];
+		first.storage.set('k', 'copied');
+
+		// The restore gave up before it replaced the database: the node
+		// carries on, and so do the extension's writes.
+		const release = h.holdWrites();
+		expect(() => first.storage.set('k', 'lost')).to.throw(
+			'The database is being replaced'
+		);
+		expect(first.storage.get('k')).to.equal('copied');
+		release();
+		first.storage.set('k', 'kept');
+
+		// The restore goes through: held, then fenced, and the next
+		// generation writes freely. Releasing afterwards opens nothing.
+		const releaseAgain = h.holdWrites();
+		expect(() => first.storage.set('k', 'lost')).to.throw(
+			'The database is being replaced'
+		);
+		h.fenceForRebuild();
+		await h.attach(build());
+		releaseAgain();
+		const second = log.contexts[1];
+		second.storage.set('k', 'generation 2');
+		expect(second.storage.get('k')).to.equal('generation 2');
+		expect(() => first.storage.set('k', 'late')).to.throw(
+			'The database connection is not open'
+		);
 	});
 });
 
@@ -1153,6 +1564,38 @@ describe('host extensions: a daemon serving one', function () {
 		expect(JSON.stringify(reply.json)).not.to.include('secret detail');
 	});
 
+	it("answers the engine's own error class from a handler as a scrubbed 500 too", async () => {
+		// A BeignetError is the daemon's to throw. From inside a handler it is
+		// a fault like any other: its code and its message stay in the log.
+		const reply = await send(port, 'POST', '/x/demo/fault', {
+			token: ADMIN_TOKEN,
+			body: { engine: true }
+		});
+		expect(reply.status).to.equal(500);
+		expect(reply.json).to.deep.equal({
+			ok: false,
+			error: { code: 'INTERNAL_ERROR', message: 'Internal server error' }
+		});
+		// The same on a keyed route's path, where the throw crosses the
+		// in-flight promise before it is classified.
+		const keyed = await send(port, 'POST', '/x/demo/spend', {
+			token: ADMIN_TOKEN,
+			body: { engineFault: true },
+			headers: { 'X-Idempotency-Key': 'engine-fault-1' }
+		});
+		expect(keyed.status).to.equal(500);
+		expect(keyed.json.error?.code).to.equal('INTERNAL_ERROR');
+		expect(JSON.stringify(keyed.json)).not.to.include('secret.db');
+		// What the daemon itself refuses on an extension's route keeps its
+		// own code: a body past the limit is still the caller's to read.
+		const large = await send(port, 'POST', '/x/demo/echo', {
+			token: ADMIN_TOKEN,
+			body: { blob: 'x'.repeat(1024 * 1024 + 1) }
+		});
+		expect(large.status).to.equal(413);
+		expect(large.json.error?.code).to.equal('BODY_TOO_LARGE');
+	});
+
 	it('runs a keyed request once, hands the key to the handler, and refuses a key elsewhere', async () => {
 		const headers = { 'X-Idempotency-Key': 'spend-1' };
 		const before = log.runs.length;
@@ -1261,6 +1704,33 @@ describe('host extensions: a daemon serving one', function () {
 			version: '1.2.3'
 		});
 		expect(spec.paths['/extensions'].get).to.be.an('object');
+	});
+
+	it('answers a write refused during a restore as a fault, and serves reads through it', async () => {
+		const release = daemon.node.extensionHost?.holdWrites();
+		try {
+			const write = await send(port, 'POST', '/x/demo/store', {
+				token: ADMIN_TOKEN,
+				body: { key: 'held/1', value: 'would be lost' }
+			});
+			expect(write.status).to.equal(500);
+			expect(write.json.error?.code).to.equal('INTERNAL_ERROR');
+			const read = await send(port, 'GET', '/x/demo/status', {
+				token: ADMIN_TOKEN
+			});
+			expect(read.status).to.equal(200);
+		} finally {
+			release?.();
+		}
+		expect(daemon.node.getStorage().loadMetadata('x/demo/held/1')).to.equal(
+			null
+		);
+		const after = await send(port, 'POST', '/x/demo/store', {
+			token: ADMIN_TOKEN,
+			body: { key: 'held/1', value: 'kept' }
+		});
+		expect(after.status).to.equal(200);
+		expect(after.json.result).to.deep.equal({ stored: 'kept' });
 	});
 
 	it('attaches again after an in-process rebuild, on the rows it left', async () => {
@@ -1372,6 +1842,36 @@ describe('host extensions: a daemon and an extension that breaks', function () {
 		// The working extension was stopped with the storage still open.
 		expect(log.stops).to.deep.equal(['shutdown']);
 		expect(log.wroteInStop).to.equal(true);
+	});
+
+	it('takes a stop hook that hangs out of the shutdown time, not on top of it', async () => {
+		const hangs = minimal({
+			id: 'hangs',
+			attach: () => ({ stop: () => new Promise<void>(() => undefined) })
+		});
+		const { daemon } = await boot(path.join(root, 'budget'), {
+			extensions: [hangs]
+		});
+		// What the Lightning node is given to wait for payments in flight.
+		const lightning = daemon.node.getNode();
+		const drain = lightning.gracefulShutdown.bind(lightning);
+		let given: number | undefined;
+		lightning.gracefulShutdown = (timeoutMs?: number): Promise<void> => {
+			given = timeoutMs;
+			return drain(timeoutMs);
+		};
+		const began = Date.now();
+		await daemon.stop(2_000);
+		const took = Date.now() - began;
+		// The hook had half of the two seconds and the node the rest. Its own
+		// five seconds, waited first and in full, would have run past the
+		// bound the caller gave before the wallet stopped and the database
+		// closed (issue #958).
+		expect(took).to.be.at.least(900);
+		expect(took).to.be.lessThan(4_000);
+		expect(given).to.be.a('number');
+		expect(given as number).to.be.at.most(1_100);
+		expect(given as number).to.be.at.least(1);
 	});
 
 	it('refuses to start on a description it cannot serve, with nothing left held', async () => {

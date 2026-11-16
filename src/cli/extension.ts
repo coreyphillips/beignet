@@ -25,7 +25,10 @@ import type {
 	IMetadataScanStorage,
 	IStorageBackend
 } from '../lightning/storage/types';
-import { withStorageTransaction } from '../lightning/storage/transaction';
+import {
+	isStorageTransactionActive,
+	withStorageTransaction
+} from '../lightning/storage/transaction';
 import { BeignetError } from './errors';
 
 /**
@@ -126,7 +129,8 @@ export interface IExtensionStorage {
 	list(prefix: string): Array<{ key: string; value: string }>;
 	/**
 	 * Run `fn` atomically: a throw undoes every write it made. `fn` must be
-	 * synchronous; a promise it returns is not waited for.
+	 * synchronous; a promise it returns is not waited for. Transactions do
+	 * not nest: a call made while one is open throws before `fn` runs.
 	 */
 	transaction<T>(fn: () => T): T;
 }
@@ -434,25 +438,44 @@ function checkKey(key: unknown, allowEmpty: boolean): asserts key is string {
 		throw new TypeError('An extension storage key is at most 512 characters');
 	}
 	// The range scan compares code units, and a NUL would end a C string.
-	if (key.includes('\u0000') || key.includes('￿')) {
+	if (key.includes('\u0000') || key.includes('\uffff')) {
 		throw new TypeError('An extension storage key has a reserved character');
 	}
 }
 
+/** What a write throws between a restore's copy of the rows and its fence. */
+const WRITES_HELD =
+	'The database is being replaced: extension writes are refused until the node is rebuilt';
+
+/** What transaction() throws when another transaction is already open. */
+const NESTED_TRANSACTION =
+	'An extension storage transaction cannot be opened inside another transaction';
+
 /**
  * The view one extension gets of the node's metadata rows: only keys under
  * x/<id>/, read through `current` on every call (an in-process restore
- * replaces the database), and closed for good by `fence`.
+ * replaces the database), and closed for good by `fence`. `holdWrites`
+ * refuses set() and delete() while it is on, and leaves reads alone.
  */
 export function extensionStorageView(
 	id: string,
 	current: () => IStorageBackend
-): { storage: IExtensionStorage; fence: () => void } {
+): {
+	storage: IExtensionStorage;
+	fence: () => void;
+	holdWrites: (held: boolean) => void;
+} {
 	const namespace = `${EXTENSION_STORAGE_PREFIX}${id}/`;
 	let fenced = false;
+	let writesHeld = false;
 	const backend = (): ScanStorage => {
 		if (fenced) throw new TypeError(CLOSED_CONNECTION);
 		return requireScanStorage(current());
+	};
+	const writable = (): ScanStorage => {
+		const target = backend();
+		if (writesHeld) throw new Error(WRITES_HELD);
+		return target;
 	};
 	const storage: IExtensionStorage = {
 		get(key) {
@@ -464,11 +487,11 @@ export function extensionStorageView(
 			if (typeof value !== 'string') {
 				throw new TypeError('An extension storage value must be a string');
 			}
-			backend().saveMetadata(namespace + key, value);
+			writable().saveMetadata(namespace + key, value);
 		},
 		delete(key) {
 			checkKey(key, false);
-			backend().deleteMetadata(namespace + key);
+			writable().deleteMetadata(namespace + key);
 		},
 		list(prefix) {
 			checkKey(prefix, true);
@@ -480,13 +503,24 @@ export function extensionStorageView(
 				}));
 		},
 		transaction(fn) {
-			return withStorageTransaction(backend(), fn);
+			const target = backend();
+			// A call made inside another transaction would join it, with no
+			// rollback of its own: a throw the outer callback catches would
+			// leave the inner writes to be committed. Refused before `fn`
+			// runs, so "a throw undoes every write" has no exception.
+			if (isStorageTransactionActive(target)) {
+				throw new Error(NESTED_TRANSACTION);
+			}
+			return withStorageTransaction(target, fn);
 		}
 	};
 	return {
 		storage,
 		fence: (): void => {
 			fenced = true;
+		},
+		holdWrites: (held): void => {
+			writesHeld = held;
 		}
 	};
 }
@@ -539,12 +573,28 @@ interface IExtensionSlot {
 	error?: string;
 	attachment?: IExtensionAttachment;
 	handlers: Map<string, ExtensionHandler>;
+	/** The attach() pass that last took the slot (ExtensionHost.pass). */
+	pass: number;
 	/** Closes the storage view and the emitter of the current generation. */
 	fence?: () => void;
+	/** Holds or releases the writes of the current generation's view. */
+	holdWrites?: (held: boolean) => void;
 }
 
 function errorMessage(err: unknown): string {
 	return err instanceof Error ? err.message : String(err);
+}
+
+/** Wait for `work`, which never rejects, for at most `ms`. */
+function within(work: Promise<void>, ms: number): Promise<void> {
+	return new Promise((resolve) => {
+		const timer = setTimeout(resolve, ms);
+		timer.unref?.();
+		void work.then(() => {
+			clearTimeout(timer);
+			resolve();
+		});
+	});
 }
 
 /**
@@ -557,9 +607,18 @@ export class ExtensionHost {
 	private readonly listeners = new Set<ExtensionEventListener>();
 	private readonly opts: IExtensionHostOptions;
 	private generation = 0;
-	/** The stop hooks of the generation before this one, still running. */
+	/**
+	 * The stop hooks still running: of the generation before this one, and
+	 * of any attachment the node gave up on. The next attach() waits for
+	 * them, and so does shutdown().
+	 */
 	private settling: Promise<void> = Promise.resolve();
 	private shutDown = false;
+	/**
+	 * Moves on every attach() and on every teardown. An attach() that finds
+	 * it moved was overtaken: its build is gone, and it attaches nothing more.
+	 */
+	private pass = 0;
 	/** Settles when the latest pass of start() hooks has finished. */
 	started: Promise<void> = Promise.resolve();
 
@@ -572,7 +631,8 @@ export class ExtensionHost {
 		this.slots = extensions.map((extension) => ({
 			extension,
 			state: 'pending' as ExtensionState,
-			handlers: new Map<string, ExtensionHandler>()
+			handlers: new Map<string, ExtensionHandler>(),
+			pass: 0
 		}));
 	}
 
@@ -595,22 +655,32 @@ export class ExtensionHost {
 	 */
 	async attach(build: IExtensionBuild): Promise<void> {
 		if (this.shutDown) return;
+		const pass = ++this.pass;
 		await this.settling;
+		// A shutdown or a teardown came during that wait: this build is gone.
+		if (pass !== this.pass) return;
 		// Anything still attached belongs to a build that is gone.
 		this.fenceAll();
 		const generation = ++this.generation;
 		for (const slot of this.slots) {
+			// Torn down while an earlier extension was attaching: the rest are
+			// not attached to a build that is gone, where nothing would ever
+			// fence their storage or run their stop hooks.
+			if (pass !== this.pass) return;
 			const { extension } = slot;
+			slot.pass = pass;
 			slot.state = 'pending';
 			slot.error = undefined;
 			slot.attachment = undefined;
 			slot.handlers = new Map();
 			const view = extensionStorageView(extension.id, build.storage);
 			let open = true;
-			slot.fence = (): void => {
+			const fence = (): void => {
 				open = false;
 				view.fence();
 			};
+			slot.fence = fence;
+			slot.holdWrites = view.holdWrites;
 			const declared = new Set(extension.events ?? []);
 			const context: IExtensionContext = {
 				generation,
@@ -632,20 +702,38 @@ export class ExtensionHost {
 					this.publish(`${extension.id}:${event}`, data);
 				}
 			};
+			let attachment: IExtensionAttachment | undefined;
 			try {
-				const attachment = await this.boundedAttach(extension, context);
-				if (!open) {
-					// Torn down while attach() was still running.
-					slot.state = 'stopped';
+				attachment = await this.boundedAttach(extension, context);
+				if (!open || pass !== this.pass) {
+					// Torn down while attach() was still running, or a shutdown
+					// began and is still waiting for the hooks it found: either
+					// way nothing would stop this attachment later, so it is
+					// stopped now. Its view is fenced already, or will be when
+					// that shutdown finishes. The slot is left alone if a later
+					// build has taken it since.
 					this.discard(extension.id, attachment);
+					if (slot.pass === pass) slot.state = 'stopped';
 					continue;
 				}
 				slot.handlers = this.bindHandlers(extension, attachment);
 				slot.attachment = attachment;
 				slot.state = 'attached';
 			} catch (err) {
-				slot.fence();
-				this.fail(slot, 'attach', err);
+				fence();
+				// An attachment the node refuses (its handlers do not match its
+				// routes) has run attach() all the same, and may hold timers,
+				// sockets or locks: its stop hook is the only way to hand them
+				// back, and fail() below forgets the attachment.
+				if (attachment !== undefined) this.discard(extension.id, attachment);
+				if (slot.pass === pass) {
+					this.fail(slot, 'attach', err);
+				} else {
+					this.opts.log('warn', 'Extension attach failed after its build', {
+						extension: extension.id,
+						error: errorMessage(err)
+					});
+				}
 			}
 		}
 	}
@@ -660,29 +748,67 @@ export class ExtensionHost {
 		this.started = this.start();
 	}
 
-	/** Run start() on every attached extension. Never rejects. */
+	/**
+	 * Run start() on every attached extension. Never rejects.
+	 *
+	 * Every hook is called before this returns its promise, and none waits
+	 * for another: an extension that never finishes starting holds no other
+	 * back, and a pass that is still waiting when the node is rebuilt has
+	 * no hook left to call on the attachments of the next generation.
+	 */
 	async start(): Promise<void> {
-		for (const slot of this.slots) {
-			if (slot.state !== 'attached') continue;
-			const attachment = slot.attachment;
-			try {
-				await attachment?.start?.();
-				// A teardown during start() has already settled the state, and
-				// a rebuild may have attached the next generation since.
-				if (slot.attachment === attachment && slot.state === 'attached') {
-					slot.state = 'ready';
-				}
-			} catch (err) {
-				if (slot.attachment !== attachment || slot.state !== 'attached') {
-					continue;
-				}
-				slot.handlers = new Map();
-				await this.runStop(slot, 'shutdown');
-				slot.fence?.();
-				slot.fence = undefined;
-				this.fail(slot, 'start', err);
+		await Promise.all(
+			this.slots
+				.filter((slot) => slot.state === 'attached')
+				.map((slot) => this.startOne(slot, slot.attachment))
+		);
+	}
+
+	private async startOne(
+		slot: IExtensionSlot,
+		attachment: IExtensionAttachment | undefined
+	): Promise<void> {
+		try {
+			await attachment?.start?.();
+			// A teardown during start() has already settled the state, and a
+			// rebuild may have attached the next generation since.
+			if (slot.attachment === attachment && slot.state === 'attached') {
+				slot.state = 'ready';
 			}
+		} catch (err) {
+			if (slot.attachment !== attachment || slot.state !== 'attached') return;
+			// Settled before the stop hook is waited for. The slot can change
+			// hands during that wait: a teardown finds nothing running here
+			// and does not stop the attachment a second time, and a rebuild
+			// that attaches the next generation finds its slot untouched
+			// afterwards. Only this generation's own fence is closed.
+			const fence = slot.fence;
+			slot.handlers = new Map();
+			this.fail(slot, 'start', err);
+			await this.settle(
+				this.runStop(slot.extension.id, attachment, 'shutdown')
+			);
+			fence?.();
+			if (slot.fence === fence) slot.fence = undefined;
 		}
+	}
+
+	/**
+	 * Refuse every extension's writes until the returned function is called,
+	 * or for good once the generation is fenced. A restore calls it when it
+	 * has copied the extensions' rows into the database it installs: a write
+	 * that reached the old database after that copy would be acknowledged
+	 * and then gone. Reads go on working.
+	 */
+	holdWrites(): () => void {
+		const held: Array<(held: boolean) => void> = [];
+		for (const slot of this.slots) {
+			if (slot.holdWrites) held.push(slot.holdWrites);
+		}
+		for (const hold of held) hold(true);
+		return (): void => {
+			for (const hold of held) hold(false);
+		};
 	}
 
 	/**
@@ -692,30 +818,44 @@ export class ExtensionHost {
 	 * waits for them.
 	 */
 	fenceForRebuild(): void {
+		this.pass++;
 		const running = this.slots.filter((slot) => this.isRunning(slot));
 		this.fenceAll();
-		const hooks = running.map((slot) => this.runStop(slot, 'rebuild'));
 		for (const slot of running) {
+			void this.settle(
+				this.runStop(slot.extension.id, slot.attachment, 'rebuild')
+			);
 			slot.state = 'stopped';
 			slot.handlers = new Map();
 		}
-		this.settling = this.settling.then(() =>
-			Promise.all(hooks).then(() => undefined)
-		);
 	}
 
 	/**
 	 * The node is shutting down. The stop hooks run first, bounded, while
 	 * the wallet and the storage still work; then everything is fenced.
+	 *
+	 * The whole wait is one bound, the stop timeout or `limitMs` when that
+	 * is shorter: the hooks of this generation run together, alongside
+	 * whatever an earlier one left running, and none adds its wait to
+	 * another's. The node passes a share of its own shutdown budget.
 	 */
-	async shutdown(): Promise<void> {
+	async shutdown(limitMs?: number): Promise<void> {
 		if (this.shutDown) return;
 		this.shutDown = true;
-		await this.settling;
+		this.pass++;
+		const limit = Math.max(
+			0,
+			Math.min(this.stopTimeoutMs(), limitMs ?? Infinity)
+		);
 		const running = this.slots.filter((slot) => this.isRunning(slot));
 		// Routes close first, so a hook does not race a new request.
 		for (const slot of running) slot.handlers = new Map();
-		await Promise.all(running.map((slot) => this.runStop(slot, 'shutdown')));
+		await Promise.all([
+			within(this.settling, limit),
+			...running.map((slot) =>
+				this.runStop(slot.extension.id, slot.attachment, 'shutdown', limit)
+			)
+		]);
 		this.fenceAll();
 		for (const slot of running) slot.state = 'stopped';
 		this.listeners.clear();
@@ -729,10 +869,11 @@ export class ExtensionHost {
 	abort(): void {
 		if (this.shutDown) return;
 		this.shutDown = true;
+		this.pass++;
 		const running = this.slots.filter((slot) => this.isRunning(slot));
 		this.fenceAll();
 		for (const slot of running) {
-			void this.runStop(slot, 'shutdown');
+			void this.runStop(slot.extension.id, slot.attachment, 'shutdown');
 			slot.state = 'stopped';
 			slot.handlers = new Map();
 		}
@@ -777,7 +918,12 @@ export class ExtensionHost {
 			if (slot.error !== undefined) info.error = slot.error;
 			if (this.isRunning(slot) && slot.attachment?.status) {
 				try {
-					info.status = slot.attachment.status();
+					// Through JSON here, where a value that does not serialize (a
+					// BigInt, a cycle) costs this one field. Left for the answer
+					// to serialize, it would fail GET /extensions for every
+					// extension.
+					const text = JSON.stringify(slot.attachment.status());
+					if (text !== undefined) info.status = JSON.parse(text) as unknown;
 				} catch (err) {
 					this.opts.log('warn', 'Extension status failed', {
 						extension: extension.id,
@@ -797,7 +943,21 @@ export class ExtensionHost {
 		for (const slot of this.slots) {
 			slot.fence?.();
 			slot.fence = undefined;
+			slot.holdWrites = undefined;
 		}
+	}
+
+	private stopTimeoutMs(): number {
+		return this.opts.stopTimeoutMs ?? EXTENSION_STOP_TIMEOUT_MS;
+	}
+
+	/** Have the next attach() and shutdown() wait for a stop hook. */
+	private settle(hook: Promise<void>): Promise<void> {
+		this.settling = Promise.all([this.settling, hook]).then(
+			() => undefined,
+			() => undefined
+		);
+		return hook;
 	}
 
 	private fail(slot: IExtensionSlot, phase: string, err: unknown): void {
@@ -843,56 +1003,53 @@ export class ExtensionHost {
 		throw new Error(`attach() did not finish within ${limit} ms`);
 	}
 
-	/** Stop an attachment that arrived after its generation was over. */
-	private discard(id: string, attachment: IExtensionAttachment): void {
-		if (!isObject(attachment)) return;
-		const stop = attachment.stop;
-		if (typeof stop !== 'function') return;
-		void (async (): Promise<void> => {
-			try {
-				await stop.call(attachment, 'shutdown');
-			} catch (err) {
-				this.opts.log('warn', 'Extension stop failed', {
-					extension: id,
-					error: errorMessage(err)
-				});
-			}
-		})();
+	/**
+	 * Stop an attachment the node will not use: one that arrived after its
+	 * generation was over, or one attach() refused. Not waited for here; the
+	 * next attach() is.
+	 */
+	private discard(id: string, attachment: unknown): void {
+		void this.settle(this.runStop(id, attachment, 'shutdown'));
 	}
 
-	/** One stop hook, bounded and contained. */
+	/**
+	 * One stop hook, bounded and contained: never rejects. Takes whatever
+	 * attach() returned, which need not be an attachment at all.
+	 */
 	private async runStop(
-		slot: IExtensionSlot,
-		reason: ExtensionStopReason
+		id: string,
+		attachment: unknown,
+		reason: ExtensionStopReason,
+		limitMs: number = this.stopTimeoutMs()
 	): Promise<void> {
-		const stop = slot.attachment?.stop;
-		if (!stop) return;
-		const attachment = slot.attachment;
+		if (!isRecord(attachment)) return;
+		const stop = attachment.stop;
+		if (typeof stop !== 'function') return;
 		let timer: ReturnType<typeof setTimeout> | undefined;
 		const bound = new Promise<'timeout'>((resolve) => {
-			timer = setTimeout(
-				() => resolve('timeout'),
-				this.opts.stopTimeoutMs ?? EXTENSION_STOP_TIMEOUT_MS
-			);
+			timer = setTimeout(() => resolve('timeout'), limitMs);
 			timer.unref?.();
 		});
 		try {
 			const outcome = await Promise.race([
 				(async (): Promise<'done'> => {
-					await stop.call(attachment, reason);
+					await (stop as (reason: ExtensionStopReason) => unknown).call(
+						attachment,
+						reason
+					);
 					return 'done';
 				})(),
 				bound
 			]);
 			if (outcome === 'timeout') {
 				this.opts.log('warn', 'Extension stop timed out', {
-					extension: slot.extension.id,
+					extension: id,
 					reason
 				});
 			}
 		} catch (err) {
 			this.opts.log('warn', 'Extension stop failed', {
-				extension: slot.extension.id,
+				extension: id,
 				reason,
 				error: errorMessage(err)
 			});

@@ -5562,6 +5562,8 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 				}
 			}
 		};
+		// Set once the extensions' rows are copied (Tier 2, below).
+		let releaseExtensionWrites: (() => void) | undefined;
 		try {
 			const blobs = [...this._peerRetrievedCapsules.values()].map(
 				(c) => c.blob
@@ -5764,6 +5766,14 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 				dropStaged();
 				throw installFailure(err);
 			}
+			// The extensions' rows are in the staged database now, and the
+			// teardown that fences their views comes after the event below. A
+			// write to the running database in between (from a listener of
+			// that event) would be acknowledged and then lost in the swap, so
+			// their writes are refused from the copy on. Released in the
+			// finally, which matters only when the install gives up before
+			// the teardown and the node carries on with this database.
+			releaseExtensionWrites = this._extensionHost?.holdWrites();
 			staged.close();
 			progress(
 				'capsule:installed',
@@ -5970,6 +5980,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 			return info;
 		} finally {
 			this._restoreInFlight = false;
+			releaseExtensionWrites?.();
 		}
 	}
 
@@ -17661,18 +17672,26 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 				/* best-effort: backup errors already surface via backup:failed */
 			});
 		}
-		// Extensions stop while the wallet and the database still work. No
-		// await without one, so the shutdown keeps its timing.
-		if (this._extensionHost) await this._extensionHost.shutdown();
+		// Extensions stop while the wallet and the database still work. Their
+		// wait comes out of timeoutMs, and is at most half of it, so the bound
+		// the caller gave holds for the two waits together: the CLI exits by
+		// force a few seconds after it, and a stop hook that hangs must not
+		// push the wallet's stop and the database's close past that exit
+		// (issue #958). No await without an extension, so the shutdown keeps
+		// its timing.
+		let drainMs = timeoutMs;
+		if (this._extensionHost) {
+			const began = Date.now();
+			await this._extensionHost.shutdown(timeoutMs / 2);
+			drainMs = Math.max(0, timeoutMs - (Date.now() - began));
+		}
 		// A restore-pending daemon never built the node or the wallet. The
 		// node closes only its view of the database: the wallet writes
 		// through the database too, and its stop() waits for a refresh in
 		// flight and its queued writes. The node stops first, since its chain
 		// backend and funding provider use the wallet (issue #958).
 		try {
-			await (this.node as LightningNode | undefined)?.gracefulShutdown(
-				timeoutMs
-			);
+			await (this.node as LightningNode | undefined)?.gracefulShutdown(drainMs);
 		} finally {
 			await this.stopWalletAndCloseStorage();
 		}

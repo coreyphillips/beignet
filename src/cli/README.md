@@ -938,7 +938,7 @@ and `remainingSats` subtracts it, so it is what the next payment can pass.
 
 | Method | Returns | Description |
 |--------|---------|-------------|
-| `gracefulShutdown(timeoutMs?)` | `Promise<void>` | Graceful shutdown: drains in-flight HTLCs, persists state, then stops the node, then the on-chain wallet, then closes the database, so the wallet's last writes land (default 30s timeout) |
+| `gracefulShutdown(timeoutMs?)` | `Promise<void>` | Graceful shutdown: drains in-flight HTLCs, persists state, then stops the node, then the on-chain wallet, then closes the database, so the wallet's last writes land (default 30s timeout). With host extensions, their `stop('shutdown')` hooks run first and their wait is part of `timeoutMs`, at most half of it and at most 5 seconds; the HTLC drain gets what is left |
 | `destroy()` | `Promise<void>` | Immediate shutdown (stops the node, then the on-chain wallet, then closes the database) |
 
 ### Events
@@ -1679,7 +1679,8 @@ beignet stop
 ```
 
 `--extension` (repeatable, or `BEIGNET_EXTENSIONS`) names a host extension to
-run inside the daemon. See [docs/EXTENSIONS.md](../../docs/EXTENSIONS.md).
+run inside the daemon, by the absolute path of its module. A flag with no path
+after it refuses the start. See [docs/EXTENSIONS.md](../../docs/EXTENSIONS.md).
 
 Seed generation is CLI-only: `beignet init` creates the mnemonic (or you supply
 one via `BEIGNET_MNEMONIC`/config); the daemon never generates or replaces a

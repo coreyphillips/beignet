@@ -228,6 +228,13 @@ describe('beignet start with host extensions', function () {
 				['start'],
 				{ BEIGNET_EXTENSIONS: path.join(modules, 'missing.js') },
 				/missing\.js: no such file/
+			],
+			// A flag with nothing after it: the operator meant an extension, and
+			// a daemon started without it would not say so.
+			[
+				['start', '--extension'],
+				{},
+				/--extension needs the absolute path of a module/
 			]
 		];
 		for (const [args, extra, message] of attempts) {
@@ -247,5 +254,15 @@ describe('beignet start with host extensions', function () {
 		expect(
 			fs.readdirSync(tmpDir).filter((name) => name.endsWith('.pid'))
 		).to.deep.equal([]);
+	});
+
+	it('names the flag and the variable in beignet help', async () => {
+		const help = await finished(
+			run(['help'], childEnv(tmpDir, await freePort(), {}))
+		);
+		expect(help.code, help.stderr).to.equal(0);
+		const text = help.stdout + help.stderr;
+		expect(text).to.match(/--extension <path>/);
+		expect(text).to.include('BEIGNET_EXTENSIONS');
 	});
 });

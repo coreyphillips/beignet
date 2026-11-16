@@ -868,6 +868,25 @@ function extensionFailureJson(id: string, refusal: IExtensionRefusal): string {
 	}
 }
 
+/**
+ * Whatever an extension's handler threw, carried to the route's catch apart
+ * from what the daemon throws around it (a body it could not parse, an
+ * extension that is not running). Only the extension's code can produce
+ * one, so the catch classifies it by the extension's contract alone: a
+ * refusal by shape is the caller's to read, and anything else is a fault,
+ * a BeignetError included. The engine's own codes and messages are not the
+ * extension's to answer with.
+ */
+class ExtensionHandlerThrow extends Error {
+	readonly thrown: unknown;
+
+	constructor(thrown: unknown) {
+		super('An extension handler threw');
+		this.name = 'ExtensionHandlerThrow';
+		this.thrown = thrown;
+	}
+}
+
 /** What a boot has taken so far, so a failed start can hand it all back. */
 interface IStartedResources {
 	node?: BeignetNode;
@@ -4205,13 +4224,18 @@ async function bootDaemon(
 						`${route.method} ${route.path}`
 					);
 					const key = req.headers['x-idempotency-key'];
-					const result = await run({
-						body: requestBody as Record<string, unknown>,
-						query,
-						...(route.idempotent && typeof key === 'string'
-							? { idempotencyKey: key }
-							: {})
-					});
+					let result: unknown;
+					try {
+						result = await run({
+							body: requestBody as Record<string, unknown>,
+							query,
+							...(route.idempotent && typeof key === 'string'
+								? { idempotencyKey: key }
+								: {})
+						});
+					} catch (err: unknown) {
+						throw new ExtensionHandlerThrow(err);
+					}
 					return success(result ?? null);
 			  }
 			: routes.get(routeKey);
@@ -4362,12 +4386,25 @@ async function bootDaemon(
 			const result = await handler(body, query);
 			endWithResult(res, result);
 		} catch (err: unknown) {
-			// Read only for an extension's route: nothing the daemon's own
-			// handlers throw is taken for an extension's refusal.
-			const refusal = extensionRoute ? extensionRefusal(err) : null;
-			if (refusal && extensionRoute) {
-				res.statusCode = refusal.status;
-				res.end(extensionFailureJson(extensionRoute.extension.id, refusal));
+			if (err instanceof ExtensionHandlerThrow && extensionRoute) {
+				// What the extension's handler threw, and nothing else: the
+				// daemon's own handlers and its own refusals on an extension's
+				// route (the body, the hold, an extension that is not running)
+				// take the arms below.
+				const refusal = extensionRefusal(err.thrown);
+				if (refusal) {
+					res.statusCode = refusal.status;
+					res.end(extensionFailureJson(extensionRoute.extension.id, refusal));
+				} else {
+					// A fault, whatever its class. A BeignetError from inside an
+					// extension would otherwise answer with its message, which
+					// may hold a path or a key the caller must not see.
+					reportFault(`Unhandled error on ${routeKey}`, err.thrown);
+					res.statusCode = 500;
+					res.end(
+						JSON.stringify(failure('INTERNAL_ERROR', 'Internal server error'))
+					);
+				}
 			} else if (err instanceof BeignetError) {
 				res.statusCode = statusForFailure(err.code, err.failureCode);
 				// toJSON carries failureCode, which the caller needs to tell a

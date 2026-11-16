@@ -17,7 +17,7 @@ BEIGNET_EXTENSIONS=/opt/app/a.js,/opt/app/b.js beignet start
 
 `config.json` cannot, and no route can. `POST /config` and every other API call reach `config.json`, so a setting there would let an API caller load code into the process that holds the seed.
 
-The path must be absolute. On POSIX the file (after symlinks are resolved) and its directory must belong to the user running the daemon or to root, and be writable by no one else. The daemon refuses to start on a path that fails these checks, on a module that does not load, and on a description it cannot serve. It says which, as `START_FAILED`, and nothing is left running.
+The path must be absolute. On POSIX the file (after symlinks are resolved) and its directory must belong to the user running the daemon or to root, and be writable by no one else. The daemon refuses to start on a path that fails these checks, on an `--extension` with no path after it, on a module that does not load, and on a description it cannot serve. It says which, as `START_FAILED`, and nothing is left running.
 
 A library host passes the same objects to `BeignetNode.create({ extensions })` or `startDaemon({ extensions })`.
 
@@ -73,12 +73,12 @@ The factory's argument carries `network`, the daemon's `env`, the engine's packa
 
 1. **Start refused or not.** Descriptions are checked before the instance lock and the database are taken.
 2. **`attach(context)`** runs once the on-chain wallet exists and before the Lightning node is created, so nothing has spent from the wallet yet. It has 30 seconds. `context.generation` is 1.
-3. **`start()`** runs in the background once the node is built. The daemon does not wait for it, so a slow extension never delays the node. Routes are served from `attach` on: an extension that is not ready yet says so in its own answers.
-4. **`stop('shutdown')`** runs when the daemon stops, before the node and the wallet do. On a graceful stop the storage still takes writes while it runs, and it has 5 seconds. A node destroyed without a graceful stop (`BeignetNode.destroy()`, the fallback when the graceful one fails) fences the storage first and does not wait for the hook.
+3. **`start()`** runs in the background once the node is built. The daemon does not wait for it, so a slow extension never delays the node, and the extensions are started together, so one never delays another. It has no time limit: an extension stays `attached` until its `start()` returns, and is `ready` after. Routes are served from `attach` on: an extension that is not ready yet says so in its own answers.
+4. **`stop('shutdown')`** runs when the daemon stops, before the node and the wallet do. On a graceful stop the storage still takes writes while it runs. The hooks of all extensions run together under one limit: 5 seconds, or half the time the shutdown was given when that is less. That wait is part of the shutdown's time, not added to it, so an extension that hangs shortens the node's wait for payments in flight and never delays the wallet's stop or the database's close. A node destroyed without a graceful stop (`BeignetNode.destroy()`, the fallback when the graceful one fails) fences the storage first and does not wait for the hook.
 
 An in-process rebuild replaces the node and the database under a running daemon (a capsule restore, [RECOVERY-PROTOCOL.md](RECOVERY-PROTOCOL.md)). Then:
 
-1. The extension's rows are copied into the database being installed, with the rest of the daemon's own state.
+1. The extension's rows are copied into the database being installed, with the rest of the daemon's own state. From that copy on, `set` and `delete` through the running generation's storage throw: a write the installed database would not have is refused, not acknowledged and lost. Should the install give up before it replaces the database, they work again.
 2. The storage view and the emitter of the running generation are fenced, synchronously, in the same turn as that copy. From that point every storage call through the old context throws `The database connection is not open`, and `emit` does nothing. Nothing the old generation does can reach the installed database.
 3. `stop('rebuild')` runs, bounded. It must not expect to write.
 4. `attach` runs again on the new wallet and database, with `generation` one higher, once the previous `stop` has returned or timed out. Then `start`.
@@ -92,11 +92,14 @@ A daemon holding for a guardian restore has no node, so no extension is attached
 | What breaks | What happens |
 |-------------|--------------|
 | The path, the module, or the description | The daemon does not start |
-| `attach()` throws or does not answer in 30 seconds | The extension is `failed`. The node is built without it and the wallet runs |
-| `start()` throws | Its `stop('shutdown')` runs, its routes close, and it is `failed` |
+| `attach()` throws or does not answer in 30 seconds | The extension is `failed`. The node is built without it and the wallet runs. An attachment that arrives after the 30 seconds is stopped with `stop('shutdown')` |
+| `attach()` returns handlers that do not match the routes | The extension is `failed`, and the `stop('shutdown')` of what it returned runs, so whatever `attach()` opened can be closed |
+| `start()` throws | It is `failed` and its routes close at once; then its `stop('shutdown')` runs |
+| `start()` never returns | It stays `attached`. The other extensions start, and the node runs |
 | `stop()` throws or hangs | Logged; the node moves on after 5 seconds |
+| `status()` throws, or returns something that is not JSON | Logged; `GET /extensions` reports the extension without `status` |
 | A handler throws an `ExtensionError` | The caller gets that refusal (below) |
-| A handler throws anything else | Logged with its stack; the caller gets a generic `500 INTERNAL_ERROR` |
+| A handler throws anything else, a `BeignetError` included | Logged with its stack; the caller gets a generic `500 INTERNAL_ERROR`. The engine's codes are not an extension's to answer with |
 
 A failed or stopped extension's routes answer `503 EXTENSION_UNAVAILABLE` with the reason, not `404`: the route exists, and a restart may bring it back. `GET /extensions` reports each extension's `state` (`pending`, `attached`, `ready`, `failed`, `stopped`), the `error` of a failed one, and whatever its `status()` returns.
 
@@ -159,7 +162,7 @@ interface IExtensionStorage {
 - Rows live in the `metadata` table under `x/<id>/`. Keys are given without that prefix, and one extension cannot read another's.
 - Values are strings, encrypted at rest with the rest of the table when storage encryption is on (the default).
 - Every call is synchronous and durable when it returns (the database runs with `synchronous = FULL`).
-- `transaction(fn)` is atomic: a throw undoes every write `fn` made. `fn` must be synchronous. A promise it returns is not waited for, and writes made after an `await` are outside the transaction.
+- `transaction(fn)` is atomic: a throw undoes every write `fn` made. `fn` must be synchronous. A promise it returns is not waited for, and writes made after an `await` are outside the transaction. Transactions do not nest: a call made while one is open throws before its `fn` runs, because an inner one could not be undone on its own.
 - The rows are part of the database: `beignet backup` copies them, and an in-process restore carries them into the installed database (the carry is mandatory, so a restore that cannot copy them does not install).
 - They are not in a static channel backup, and the recovery phrase does not recreate them. An extension whose rows are the only record of funds must offer its own export, and say so to its users.
 
