@@ -229,8 +229,6 @@ export interface IGuardianAssemblyConfig {
 	storage: IStorageBackend;
 	/** The node identity secret; derives the recovery root and journal keys. */
 	nodeSecret: Buffer;
-	/** Handed to the restore driver (IRestoreDriverConfig.auxiliaryChannels). */
-	auxiliaryChannels?: import('../channel/auxiliary-funding').IAuxiliaryChannelConfig;
 	/** Guardian-backed modes only; peer-storage-only nodes skip the assembly. */
 	durability: 'async-remote' | 'quorum';
 	/** Exactly the committed set, in any order (crash-v1: three guardians). */
@@ -472,9 +470,6 @@ export async function buildGuardianRecovery(
 				buildRestoreDriver: (onEvent): RestoreDriver =>
 					new RestoreDriver({
 						target: config.storage,
-						...(config.auxiliaryChannels
-							? { auxiliaryChannels: config.auxiliaryChannels }
-							: {}),
 						guardians: bound,
 						context,
 						required: CRASH_V1_PROFILE.required,

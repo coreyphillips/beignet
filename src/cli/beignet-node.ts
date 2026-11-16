@@ -203,6 +203,7 @@ import type {
 	IGuardianReplicationEvent
 } from '../lightning/recovery';
 import {
+	AuxiliaryGuardianRestoreError,
 	AuxiliaryRestoreRefusedError,
 	RestoreRefusedError,
 	storedAuxiliaryChannelIds,
@@ -3273,7 +3274,10 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	 * other failure.
 	 */
 	private assetRestoreRefusal(err: unknown): BeignetError | undefined {
-		if (err instanceof AuxiliaryRestoreRefusedError) {
+		if (
+			err instanceof AuxiliaryRestoreRefusedError ||
+			err instanceof AuxiliaryGuardianRestoreError
+		) {
 			return new BeignetError('ASSET_RESTORE_REFUSED', err.message);
 		}
 		if (err instanceof AuxiliaryProviderRequiredError) {
@@ -5184,9 +5188,6 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 		return buildGuardianRecovery({
 			storage: this.storage,
 			nodeSecret: this.nodeSecret(),
-			...(this._restoreAuxiliaryChannels
-				? { auxiliaryChannels: this._restoreAuxiliaryChannels }
-				: {}),
 			durability: mode,
 			guardians,
 			following,

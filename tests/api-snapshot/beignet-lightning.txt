@@ -6944,6 +6944,9 @@ function onionMessage.processOnionMessage(onionPacketBuf: Buffer, nodePrivkey: B
 namespace recovery
 class recovery.AuxiliaryGuardianModeError extends beignet#CodedError<'AUXILIARY_GUARDIAN_MODE'>
 constructor recovery.AuxiliaryGuardianModeError()
+class recovery.AuxiliaryGuardianRestoreError extends beignet#CodedError<'AUXILIARY_GUARDIAN_RESTORE_REFUSED'>
+constructor recovery.AuxiliaryGuardianRestoreError(channelIds: readonly string[])
+readonly property recovery.AuxiliaryGuardianRestoreError.channelIds: readonly string[]
 class recovery.AuxiliaryGuardianStartError extends beignet#CodedError<'AUXILIARY_GUARDIAN_START_REFUSED'>
 constructor recovery.AuxiliaryGuardianStartError(channelIds: readonly string[])
 readonly property recovery.AuxiliaryGuardianStartError.channelIds: readonly string[]
@@ -7274,7 +7277,6 @@ property recovery.IGuardianAlarm.status: recovery.GuardianStatus
 interface recovery.IGuardianAssemblyConfig
 property recovery.IGuardianAssemblyConfig.allowUnencryptedAuth?: boolean
 property recovery.IGuardianAssemblyConfig.allowUnencryptedSecrets?: boolean
-property recovery.IGuardianAssemblyConfig.auxiliaryChannels?: channel.IAuxiliaryChannelConfig
 property recovery.IGuardianAssemblyConfig.barrierTimeoutMs?: number
 property recovery.IGuardianAssemblyConfig.clock?: () => bigint
 property recovery.IGuardianAssemblyConfig.durability: 'async-remote' | 'quorum'
@@ -7651,7 +7653,6 @@ property recovery.IReplicationResult.rotatedTo?: recovery.IGuardianRotateSetRequ
 property recovery.IReplicationResult.verifiedCurrentState?: recovery.GuardianState
 interface recovery.IRestoreDriverConfig
 property recovery.IRestoreDriverConfig.allowUnencryptedSecrets?: boolean
-property recovery.IRestoreDriverConfig.auxiliaryChannels?: channel.IAuxiliaryChannelConfig
 property recovery.IRestoreDriverConfig.clock?: () => bigint
 property recovery.IRestoreDriverConfig.context: recovery.IGuardianSetContext
 property recovery.IRestoreDriverConfig.guardians: recovery.IBoundGuardianClient[]
@@ -7894,6 +7895,7 @@ function recovery.assertEmptyTarget(target: storage.IStorageBackend): void
 function recovery.assertFramesReconstructable(frames: recovery.RecoveryFrame[]): void
 function recovery.assertGuardianAuth(value: unknown, where: string): recovery.GuardianAuth
 function recovery.assertGuardianDescriptors(value: unknown): recovery.GuardianDescriptor[]
+function recovery.assertGuardianJournalHoldsNoAuxiliaryChannels(target: storage.IStorageBackend): void
 function recovery.assertMutationEncodable(mutation: recovery.RecoveryMutation): void
 function recovery.assertNoJournalResidue(target: storage.IStorageBackend): void
 function recovery.auxiliaryRestoreRefusal(channels: readonly channel.IAuxiliaryRestoredChannel[], auxiliaryChannels: channel.IAuxiliaryChannelConfig | undefined, unreadableChannelIds?: readonly string[]): node.AuxiliaryProviderRequiredError | recovery.AuxiliaryRestoreRefusedError | undefined

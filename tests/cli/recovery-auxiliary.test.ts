@@ -22,6 +22,7 @@ import { AddressInfo } from 'net';
 import * as os from 'os';
 import * as path from 'path';
 import { IStartedDaemon, startDaemon } from '../../src/cli/daemon';
+import { BeignetNode, BeignetNodeOptions } from '../../src/cli/beignet-node';
 import { BeignetError } from '../../src/cli/errors';
 import {
 	EXTENSION_API_VERSION,
@@ -31,6 +32,7 @@ import type { IAuxiliaryChannelConfig } from '../../src/lightning/channel/auxili
 import { AuxiliaryProviderRequiredError } from '../../src/lightning/node/types';
 import {
 	AuxiliaryGuardianModeError,
+	AuxiliaryGuardianRestoreError,
 	AuxiliaryRestoreRefusedError
 } from '../../src/lightning/recovery';
 import { SqliteStorage } from '../../src/lightning/storage/sqlite-storage';
@@ -304,6 +306,91 @@ describe('Recovery modes and asset channels, over the daemon', function () {
 
 		// Any other failure of a restore is left to the code it had.
 		expect(refusalFor(new Error('disk full'))).to.equal(undefined);
+	});
+
+	it('hands a guardian restore no provider, and gives a journal that holds an asset channel the refusal of one this build never replicates', async () => {
+		// The boot decision of a guardian mode is made before any extension
+		// is attached, so the restore it builds cannot be handed one. It is
+		// not meant to be: no guardian journal holds an asset channel.
+		// eslint-disable-next-line @typescript-eslint/no-var-requires
+		const assembly = require('../../src/lightning/recovery/assembly') as {
+			buildGuardianRecovery: (
+				config: Record<string, unknown>
+			) => Promise<unknown>;
+		};
+		const original = assembly.buildGuardianRecovery;
+		const seen: Array<{ keys: string[]; attached: number }> = [];
+		let attached = 0;
+		let asked = 0;
+		const id = 'cd'.repeat(32);
+		const given: IAuxiliaryChannelConfig = {
+			...auxiliaryChannels(),
+			canRestore: (): boolean => {
+				asked++;
+				return true;
+			}
+		};
+		assembly.buildGuardianRecovery = async (config): Promise<unknown> => {
+			seen.push({ keys: Object.keys(config), attached });
+			return {
+				kind: 'restore-required',
+				buildRestoreDriver: () => ({
+					// What the driver throws after it replayed such a journal.
+					restore: async (): Promise<never> => {
+						throw new AuxiliaryGuardianRestoreError([id]);
+					}
+				})
+			};
+		};
+		const dataDir = tmpDir('guardian-restore');
+		dirs.push(dataDir);
+		let node: BeignetNode | undefined;
+		try {
+			node = await BeignetNode.create({
+				...OFFLINE,
+				dataDir,
+				mnemonic: MNEMONICS[0],
+				recoveryMode: 'quorum',
+				// x coordinates of G, 2G and 3G.
+				recoveryGuardians: [
+					'79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798@https://g1.example.com',
+					'c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5@https://g2.example.com',
+					'f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9@https://g3.example.com'
+				],
+				extensions: [
+					{
+						id: 'assets',
+						version: '1.0.0',
+						api: EXTENSION_API_VERSION,
+						attach: (): { auxiliaryChannels: IAuxiliaryChannelConfig } => {
+							attached++;
+							return { auxiliaryChannels: given };
+						}
+					}
+				]
+			} as BeignetNodeOptions);
+			let refusal: unknown;
+			try {
+				await node.restoreFromGuardians();
+			} catch (err) {
+				refusal = err;
+			}
+			expect(seen).to.have.length(1);
+			expect(seen[0].attached).to.equal(0);
+			expect(seen[0].keys).to.not.include('auxiliaryChannels');
+			expect(asked).to.equal(0);
+			expect(refusal).to.be.instanceOf(BeignetError);
+			expect((refusal as BeignetError).code).to.equal('ASSET_RESTORE_REFUSED');
+			expect((refusal as BeignetError).message).to.equal(
+				`The journal the guardians hold for this wallet carries 1 asset channel (${id}). ` +
+					'This build never replicates an asset channel to guardians and ' +
+					'cannot restore one from them, so nothing of the journal was ' +
+					'installed (AUXILIARY_GUARDIAN_RESTORE_REFUSED).'
+			);
+		} finally {
+			assembly.buildGuardianRecovery = original;
+			await node?.destroy();
+		}
 	});
 
 	it('does not start in a guardian mode over a stored asset channel: nothing is built, no guardian hears of it, and the database is as it was', async () => {

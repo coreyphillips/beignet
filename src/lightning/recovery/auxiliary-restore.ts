@@ -74,6 +74,37 @@ export class AuxiliaryGuardianStartError extends CodedError<'AUXILIARY_GUARDIAN_
 }
 
 /**
+ * The journal a guardian restore fetched holds asset channels. Nothing of
+ * it was installed.
+ *
+ * This build never replicates an asset channel to guardians: a node in a
+ * guardian mode neither opens nor accepts one and does not start over one.
+ * So no provider is asked here, and none is handed to a guardian restore.
+ * The takeover has happened by the time the journal can be read, which is
+ * why the refusals that keep an asset channel out of a guardian journal
+ * come first, at the start and at the opening.
+ */
+export class AuxiliaryGuardianRestoreError extends CodedError<'AUXILIARY_GUARDIAN_RESTORE_REFUSED'> {
+	/** The asset channels the journal holds, as channel id hex. */
+	readonly channelIds: readonly string[];
+
+	constructor(channelIds: readonly string[]) {
+		const one = channelIds.length === 1;
+		super(
+			'AUXILIARY_GUARDIAN_RESTORE_REFUSED',
+			`The journal the guardians hold for this wallet carries ` +
+				`${channelIds.length} asset channel${one ? '' : 's'} ` +
+				`(${channelIds.join(', ')}). This build never replicates an ` +
+				`asset channel to guardians and cannot restore one from them, ` +
+				`so nothing of the journal was installed ` +
+				`(AUXILIARY_GUARDIAN_RESTORE_REFUSED).`
+		);
+		this.name = 'AuxiliaryGuardianRestoreError';
+		this.channelIds = [...channelIds];
+	}
+}
+
+/**
  * A restore holds asset channels and the provider did not say it can restore
  * them. Nothing of the restore was installed.
  */
@@ -143,6 +174,18 @@ export function storedAuxiliaryChannelIds(storage: IStorageBackend): string[] {
 		.filter((row) => carriesAssetState(row.state))
 		.map((row) => row.channelId);
 	return [...readable, ...(storage.unreadableAssetChannelIds?.() ?? [])];
+}
+
+/**
+ * Throw when the journal a guardian restore just replayed into `target`
+ * holds an asset channel. Called inside the transaction that installs the
+ * restore, so the throw leaves the target as it was.
+ */
+export function assertGuardianJournalHoldsNoAuxiliaryChannels(
+	target: IStorageBackend
+): void {
+	const held = storedAuxiliaryChannelIds(target);
+	if (held.length > 0) throw new AuxiliaryGuardianRestoreError(held);
 }
 
 /**

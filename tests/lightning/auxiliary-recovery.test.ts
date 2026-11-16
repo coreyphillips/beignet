@@ -21,7 +21,9 @@ import { MessageType } from '../../src/lightning/message/types';
 import type { LightningNode } from '../../src/lightning/node/lightning-node';
 import { AuxiliaryProviderRequiredError } from '../../src/lightning/node/types';
 import {
+	assertGuardianJournalHoldsNoAuxiliaryChannels,
 	AuxiliaryGuardianModeError,
+	AuxiliaryGuardianRestoreError,
 	AuxiliaryGuardianStartError,
 	AuxiliaryRestoreRefusedError,
 	composeRecoveryCapsule,
@@ -193,6 +195,39 @@ describe('asset channels in a guardian recovery mode', () => {
 		expect(alice.node.getAuxiliaryChannelInfo(channelId)).to.equal(undefined);
 		expect(alice.node.listChannels()).to.have.length(1);
 		expect(bob.node.listChannels()).to.have.length(1);
+	});
+
+	it('refuses a journal from the guardians that holds an asset channel as one this build never replicates, and asks no provider', async () => {
+		const tag = 'guardian journal';
+		const alice = assetHost(tag, 1, {}, { sqlite: true });
+		const bob = host(tag, 2, false);
+		hosts.push(alice);
+		connectHosts(alice, bob);
+		const ordinary = openReadyChannel(alice.node, bob.node);
+		// A target that holds only an ordinary channel is read and passed.
+		expect(() =>
+			assertGuardianJournalHoldsNoAuxiliaryChannels(alice.storage!)
+		).to.not.throw();
+		const channelId = await openAssetChannel(alice, bob, {
+			tag,
+			openerUnits: 700n,
+			acceptorUnits: 300n
+		});
+		const hex = channelId.toString('hex');
+		const refusal = thrownBy(() =>
+			assertGuardianJournalHoldsNoAuxiliaryChannels(alice.storage!)
+		);
+		expect(refusal).to.be.instanceOf(AuxiliaryGuardianRestoreError);
+		const typed = refusal as AuxiliaryGuardianRestoreError;
+		expect(typed.code).to.equal('AUXILIARY_GUARDIAN_RESTORE_REFUSED');
+		expect(typed.channelIds).to.deep.equal([hex]);
+		expect(typed.channelIds).to.not.include(ordinary.toString('hex'));
+		expect(typed.message).to.equal(
+			`The journal the guardians hold for this wallet carries 1 asset channel (${hex}). ` +
+				'This build never replicates an asset channel to guardians and ' +
+				'cannot restore one from them, so nothing of the journal was ' +
+				'installed (AUXILIARY_GUARDIAN_RESTORE_REFUSED).'
+		);
 	});
 
 	it('does not start over a stored asset channel, with a provider or without one, and changes nothing', async () => {
