@@ -5639,6 +5639,11 @@ export function getOpenApiSpec(): Record<string, unknown> {
 							type: 'integer',
 							description:
 								'Splice-in-transit funds (see splicingBalanceSats); rejoins lightning at splice_locked. Excluded from total, which counts only currently spendable funds'
+						},
+						assetChannelSats: {
+							type: 'integer',
+							description:
+								"The sats on this wallet's side of its open asset channels, present only when it has one. They carry asset outputs and cannot be sent or received as bitcoin over Lightning. Excluded from lightning and from total"
 						}
 					}
 				},

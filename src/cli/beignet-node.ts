@@ -7196,7 +7196,12 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 			lightning,
 			total: onchain + lightning,
 			unsettledSats,
-			splicingSats
+			splicingSats,
+			...(lnBalance.auxiliaryBalanceMsat !== undefined
+				? {
+						assetChannelSats: Number(lnBalance.auxiliaryBalanceMsat / 1000n)
+				  }
+				: {})
 		};
 	}
 

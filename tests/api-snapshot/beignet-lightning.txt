@@ -5795,6 +5795,7 @@ interface node.IKeysendRetrySource
 property node.IKeysendRetrySource.options: node.IKeysendOptions
 property node.IKeysendRetrySource.preimage: Buffer
 interface node.ILightningBalance
+property node.ILightningBalance.auxiliaryBalanceMsat?: bigint
 property node.ILightningBalance.localBalanceMsat: bigint
 property node.ILightningBalance.remoteBalanceMsat: bigint
 property node.ILightningBalance.unsettledBalanceMsat: bigint

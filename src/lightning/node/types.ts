@@ -1544,6 +1544,12 @@ export interface ILightningBalance {
 	localBalanceMsat: bigint;
 	remoteBalanceMsat: bigint;
 	unsettledBalanceMsat: bigint;
+	/**
+	 * The bitcoin on this node's side of its open asset channels, present
+	 * only when it has one. It carries asset outputs and cannot be sent or
+	 * received over Lightning, so it is in none of the figures above.
+	 */
+	auxiliaryBalanceMsat?: bigint;
 }
 
 /**

@@ -352,6 +352,26 @@ describe('Asset payments (issue #2093, step 8)', function () {
 				aliceAsked.filter((a) => a.hook === 'valueIncomingHtlc')
 			).to.deep.equal([]);
 
+			// The node's Lightning balance is its ordinary channel's; what it
+			// has on the asset channel is reported apart, and not at all by a
+			// node without one.
+			const balance = alice.node.getBalance();
+			const ordinaryRow = alice.node
+				.listChannels()
+				.find((row) => !row.channelId.equals(channelId))!;
+			const assetState = alice.node
+				.getChannelManager()
+				.getChannel(channelId)!
+				.getFullState();
+			expect(balance.localBalanceMsat).to.equal(ordinaryRow.localBalanceMsat);
+			expect(balance.remoteBalanceMsat).to.equal(ordinaryRow.remoteBalanceMsat);
+			expect(balance.auxiliaryBalanceMsat).to.equal(
+				assetState.localBalanceMsat
+			);
+			const plain = plainHost(`aux-pay-plain-${where}`, 5, { sqlite });
+			hosts.push(plain);
+			expect('auxiliaryBalanceMsat' in plain.node.getBalance()).to.equal(false);
+
 			// The channel list marks the asset channel and no other.
 			const rows = alice.node.listChannels();
 			const assetRow = rows.find((row) => row.channelId.equals(channelId))!;

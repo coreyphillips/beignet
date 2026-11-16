@@ -41,6 +41,7 @@ property AuthSuccess.keyName: string | null
 property AuthSuccess.ok: true
 property AuthSuccess.scopes: ReadonlySet<ApiScope>
 interface BalanceInfo
+property BalanceInfo.assetChannelSats?: number
 property BalanceInfo.lightning: number
 property BalanceInfo.onchain: number
 property BalanceInfo.splicingSats?: number

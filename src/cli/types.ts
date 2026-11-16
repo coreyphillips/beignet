@@ -962,6 +962,13 @@ export interface BalanceInfo {
 	 * lightning at splice_locked.
 	 */
 	splicingSats?: number;
+	/**
+	 * The sats on this wallet's side of its open asset channels, present
+	 * only when it has one. They carry asset outputs and cannot be sent or
+	 * received as bitcoin over Lightning, so they are in neither `lightning`
+	 * nor `total`.
+	 */
+	assetChannelSats?: number;
 }
 
 export interface OfferInfo {

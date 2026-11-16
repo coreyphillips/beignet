@@ -11,6 +11,7 @@ property ApiResponse.error?: { code: string; message: string; paymentHash?: Paym
 property ApiResponse.ok: boolean
 property ApiResponse.result?: T
 interface BalanceInfo
+property BalanceInfo.assetChannelSats?: number
 property BalanceInfo.lightning: number
 property BalanceInfo.onchain: number
 property BalanceInfo.splicingSats?: number

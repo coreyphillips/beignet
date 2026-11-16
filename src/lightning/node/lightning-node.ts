@@ -35183,9 +35183,25 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		let localBalanceMsat = 0n;
 		let remoteBalanceMsat = 0n;
 		let unsettledBalanceMsat = 0n;
+		// What this node has on its side of asset channels. That bitcoin only
+		// carries asset outputs: it cannot be sent or received over Lightning,
+		// so it is counted apart from every figure above, and reported only
+		// by a node that has such a channel.
+		let auxiliaryBalanceMsat: bigint | undefined;
 
 		for (const channel of this.channelManager.listChannels()) {
 			const state = channel.getFullState();
+			if (state.auxiliaryState !== undefined) {
+				const effective =
+					state.state === ChannelState.AWAITING_REESTABLISH
+						? state.preReestablishState ?? state.state
+						: state.state;
+				if (effective === ChannelState.NORMAL) {
+					auxiliaryBalanceMsat =
+						(auxiliaryBalanceMsat ?? 0n) + state.localBalanceMsat;
+				}
+				continue;
+			}
 			// Accounting classifies by EFFECTIVE state: the splice's accounting
 			// phase survives a disconnect (AWAITING_REESTABLISH wrapping
 			// SPLICING), or a splice-out would bounce back to its full
@@ -35222,7 +35238,12 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			}
 		}
 
-		return { localBalanceMsat, remoteBalanceMsat, unsettledBalanceMsat };
+		return {
+			localBalanceMsat,
+			remoteBalanceMsat,
+			unsettledBalanceMsat,
+			...(auxiliaryBalanceMsat !== undefined ? { auxiliaryBalanceMsat } : {})
+		};
 	}
 
 	// ─────────────── Phase 6: Timeout Safety Nets ───────────────
