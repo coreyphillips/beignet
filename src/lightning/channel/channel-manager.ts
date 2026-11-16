@@ -5105,10 +5105,18 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 
 	// ─────────────── Asset channel opening (issue #2093) ───────────────
 
+	/** Peers whose opening CSV policy a mode read is consulting right now. */
+	private readonly _auxiliaryModeReads = new Set<string>();
+
 	/**
 	 * The asset HTLC mode a new asset channel with this peer would have,
 	 * without opening anything: for a host to check before its wallet
 	 * prepares funding. Throws where the opening itself would be refused.
+	 *
+	 * The host's openingCsvPolicy is consulted for that, and may itself ask
+	 * for the mode. A read made from inside the policy answers the mode
+	 * without consulting the policy again, so the two cannot call each
+	 * other without end.
 	 */
 	getAuxiliaryHtlcMode(peerPubkey: string): 'fixed' | 'legacy' {
 		peerPubkey = normalizeHexPubkey(peerPubkey);
@@ -5121,10 +5129,17 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			);
 		}
 		const mode = this.negotiateAuxiliaryHtlcMode(peerPubkey);
-		createAuxiliaryOpeningCsvPolicy(
-			config.openingCsvPolicy?.(peerPubkey),
-			(this.config.localConfig || DEFAULT_CHANNEL_CONFIG).toSelfDelay
-		);
+		if (!this._auxiliaryModeReads.has(peerPubkey)) {
+			this._auxiliaryModeReads.add(peerPubkey);
+			try {
+				createAuxiliaryOpeningCsvPolicy(
+					config.openingCsvPolicy?.(peerPubkey),
+					(this.config.localConfig || DEFAULT_CHANNEL_CONFIG).toSelfDelay
+				);
+			} finally {
+				this._auxiliaryModeReads.delete(peerPubkey);
+			}
+		}
 		return mode.fixed ? 'fixed' : 'legacy';
 	}
 

@@ -1940,6 +1940,41 @@ describe('an asset channel opens over open_channel (issue #2093 step 7)', functi
 			).to.throw('Not connected to peer');
 		});
 
+		it('answers a policy that asks for the mode, without asking the policy again', () => {
+			const asked: string[] = [];
+			const seen: string[] = [];
+			const holder: { manager?: ChannelManager } = {};
+			const manager = managerSeeing(features(OVERLAY), features(OVERLAY), {
+				allowLegacyHtlcSignatures: () => true,
+				openingCsvPolicy: (peer) => {
+					asked.push(peer);
+					// A host that sets its delays by the mode of the channel.
+					seen.push(holder.manager!.getAuxiliaryHtlcMode(peer));
+					return undefined;
+				}
+			});
+			holder.manager = manager;
+			expect(manager.getAuxiliaryHtlcMode(PEER)).to.equal('legacy');
+			expect(asked).to.deep.equal([PEER]);
+			expect(seen).to.deep.equal(['legacy']);
+			// The guard is per read: the next one consults the policy again,
+			// and a policy that throws still refuses the read.
+			expect(manager.getAuxiliaryHtlcMode(PEER)).to.equal('legacy');
+			expect(asked).to.deep.equal([PEER, PEER]);
+			const refusing = managerSeeing(features(OVERLAY), features(OVERLAY), {
+				allowLegacyHtlcSignatures: () => true,
+				openingCsvPolicy: () => {
+					throw new Error('no delay for this peer');
+				}
+			});
+			expect(() => refusing.getAuxiliaryHtlcMode(PEER)).to.throw(
+				'no delay for this peer'
+			);
+			expect(() => refusing.getAuxiliaryHtlcMode(PEER)).to.throw(
+				'no delay for this peer'
+			);
+		});
+
 		it('needs a provider that can build the capsule before child custody is selected', () => {
 			const all = features(OVERLAY, FIXED, CUSTODY);
 			expect(() =>
