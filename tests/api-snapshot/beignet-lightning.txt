@@ -1426,7 +1426,7 @@ method channel.ChannelManager.requestSpliceConflictRevert(channelId: Buffer): ch
 method channel.ChannelManager.resendAnnouncementSignatures(channelId: Buffer): boolean
 method channel.ChannelManager.restoreChannel(channel: channel.Channel, peerPubkey: string, keyIndex?: number | null, perChannelKeys?: channel.IPerChannelKeys | null): void
 method channel.ChannelManager.restoreMonitor(channelId: string, monitor: chain.ChainMonitor): void
-method channel.ChannelManager.retryAuxiliaryOwed(settle?: (channelId: Buffer, htlcId: bigint) => channel.ChannelResult | undefined, now?: number): Array<{ channelId: Buffer; htlcId: bigint; kind: 'fulfill' | 'fail'; }>
+method channel.ChannelManager.retryAuxiliaryOwed(settle?: (channelId: Buffer, htlcId: bigint, kind: 'fulfill' | 'fail') => channel.ChannelResult | undefined, now?: number): Array<{ channelId: Buffer; htlcId: bigint; kind: 'fulfill' | 'fail'; }>
 method channel.ChannelManager.revertConflictedSplice(channelId: Buffer): channel.ChannelResult
 method channel.ChannelManager.sendRecoveryCloseRequest(channelId: Buffer): boolean
 method channel.ChannelManager.sendSpliceLocked(channelId: Buffer): channel.ChannelResult

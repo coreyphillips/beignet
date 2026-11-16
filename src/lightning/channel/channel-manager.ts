@@ -2408,7 +2408,11 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 	 * the channels took.
 	 */
 	retryAuxiliaryOwed(
-		settle?: (channelId: Buffer, htlcId: bigint) => ChannelResult | undefined,
+		settle?: (
+			channelId: Buffer,
+			htlcId: bigint,
+			kind: 'fulfill' | 'fail'
+		) => ChannelResult | undefined,
 		now: number = Date.now()
 	): Array<{ channelId: Buffer; htlcId: bigint; kind: 'fulfill' | 'fail' }> {
 		const taken: Array<{
@@ -2473,14 +2477,18 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			}
 			for (const removal of owed) {
 				const result =
-					removal.kind === 'fulfill'
-						? settle?.(removal.channelId, removal.htlcId) ??
-						  this.fulfillHtlc(
+					settle?.(removal.channelId, removal.htlcId, removal.kind) ??
+					(removal.kind === 'fulfill'
+						? this.fulfillHtlc(
 								removal.channelId,
 								removal.htlcId,
 								removal.preimage!
 						  )
-						: this.failHtlc(removal.channelId, removal.htlcId, removal.reason!);
+						: this.failHtlc(
+								removal.channelId,
+								removal.htlcId,
+								removal.reason!
+						  ));
 				if (result.ok) {
 					taken.push({
 						channelId: removal.channelId,
