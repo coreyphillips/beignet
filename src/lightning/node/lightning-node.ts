@@ -16285,6 +16285,8 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			const policy = this.getChannelPolicy(channelId);
 			if (!policy) continue;
 			const st = channel.getFullState();
+			// An asset channel forwards no bitcoin payment: no fee to tune.
+			if (st.auxiliaryState) continue;
 			const capacityMsat = st.fundingSatoshis * 1000n;
 			if (capacityMsat <= 0n) continue;
 			const forwards = this.listForwards({ since, until: now, channelId: hex });
@@ -16996,8 +16998,6 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		// even though the channel is healthy. Including a hint for an
 		// already-propagated public channel is harmless (the payer dedupes it).
 		for (const channel of this.channelManager.listChannels()) {
-			// An asset channel is no way in for an ordinary payment.
-			if (channel.getFullState().auxiliaryState) continue;
 			const hop = this.buildRoutingHintForChannel(channel);
 			if (hop) hints.push([hop]);
 		}
@@ -17015,6 +17015,11 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		reservationHint = false
 	): IRoutingHintHop | null {
 		const state = channel.getFullState();
+		// An asset channel is no way in for an ordinary payment. Said here
+		// and not by each caller, so that nothing built on a hint (an
+		// invoice, a rebalance leg, the inbound a JIT payment is measured
+		// against) can take one for bitcoin liquidity.
+		if (state.auxiliaryState) return null;
 		// Look through a reconnect (SCID and peer info stay valid for hints),
 		// and admit a usable mid-splice channel: it receives fine, still under
 		// its pre-splice scid until the lock.
@@ -17151,6 +17156,8 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		for (const channel of this.channelManager.listChannels()) {
 			const state = channel.getFullState();
 			if (!channel.acceptsNewHtlcs(true)) continue;
+			// An asset channel is no blinded way in either.
+			if (state.auxiliaryState) continue;
 
 			const channelId = channel.getChannelId();
 			if (!channelId) continue;
@@ -18354,8 +18361,9 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		// (e.g. missing SCID/alias, or relying on gossip that hasn't propagated).
 		const allChannels = this.channelManager.listChannels();
 		if (routingHints.length === 0) {
-			const receivableNormal = allChannels.some((ch) =>
-				ch.acceptsNewHtlcs(true)
+			// An asset channel has no hint and is owed none.
+			const receivableNormal = allChannels.some(
+				(ch) => ch.acceptsNewHtlcs(true) && !ch.getFullState().auxiliaryState
 			);
 			if (receivableNormal) {
 				this.emit('node:error', {
@@ -25014,6 +25022,8 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			if (!channelId) continue;
 			if (this.channelManager.getPeerForChannel(channelId) !== peerHex)
 				continue;
+			// A held payment is not delivered over an asset channel.
+			if (channel.getFullState().auxiliaryState) continue;
 			const scid = this.getPeerAddressableScid(channel.getFullState());
 			if (scid) return scid;
 		}

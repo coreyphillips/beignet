@@ -7517,6 +7517,9 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	private getErroredBalanceSats(): number {
 		let totalMsat = 0n;
 		for (const ch of this.node.listChannels()) {
+			// An asset channel's bitcoin only carries asset outputs: it is
+			// not a Lightning balance, errored or not.
+			if (ch.auxiliary) continue;
 			if (ch.state === ChannelState.ERRORED) {
 				totalMsat += ch.localBalanceMsat;
 			}
@@ -15817,6 +15820,9 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 		let sendableMsat = 0n;
 		let maxSendableMsat = 0n;
 		for (const ch of this.node.listChannels()) {
+			// An asset channel is left out, as the engine's snapshot leaves
+			// it out: its bitcoin cannot be sent as a Lightning payment.
+			if (ch.auxiliary) continue;
 			maxSendableMsat += ch.spendableOutboundMsat ?? 0n;
 			// A held restore is NORMAL with htlcUsable false, so this two-clause
 			// test admitted it on the first clause alone (issue #469). Its
@@ -16456,6 +16462,8 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 
 		for (const ch of this.node.listChannels()) {
 			if (ch.state !== ChannelState.NORMAL || isHeldRestore(ch)) continue;
+			// An asset channel sends no bitcoin payment.
+			if (ch.auxiliary) continue;
 			// Subtract channel reserve — we must maintain this minimum balance
 			const reserveMsat = ch.localReserveMsat ?? 0n;
 			const available =
@@ -16491,6 +16499,8 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 
 		for (const ch of this.node.listChannels()) {
 			if (ch.state !== ChannelState.NORMAL || isHeldRestore(ch)) continue;
+			// An asset channel receives no bitcoin payment.
+			if (ch.auxiliary) continue;
 			// Subtract channel reserve — remote must maintain this minimum balance
 			const reserveMsat = ch.remoteReserveMsat ?? 0n;
 			const available =
