@@ -149,6 +149,14 @@ export interface IFundingProvider {
 		| import('../wallet/fixed-output-fees').IFixedOutputFeeBudget
 		| undefined;
 	/**
+	 * What the fee coin pool holds and can do, and whether a split for a fee
+	 * coin of `forFeeSatoshis` could be made now. Reads only. Undefined when
+	 * no fee policy is configured.
+	 */
+	getFixedOutputFeeStatus?(
+		forFeeSatoshis?: bigint
+	): import('../wallet/fixed-output-fees').IFixedOutputFeePoolState | undefined;
+	/**
 	 * Build (but do not broadcast) the channel funding transaction.
 	 * @param max When true, sweep the whole balance into the funding output (no
 	 *   change). The caller must have committed funding_satoshis equal to the swept

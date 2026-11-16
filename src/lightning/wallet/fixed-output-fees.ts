@@ -141,6 +141,60 @@ export interface IFixedOutputFeeResolution {
 	spendingTransaction: Buffer;
 }
 
+/**
+ * What the fee coin pool holds and can do, read without changing anything:
+ * for a host that shows it, or warns before a fee cannot be paid.
+ */
+export interface IFixedOutputFeePoolState {
+	/** A fee policy is in force and the pool can be asked for fee coins. */
+	available: true;
+	budget: IFixedOutputFeeBudget;
+	/**
+	 * The fee coins no action holds, as the wallet lists them now. `ready`
+	 * are confirmed, and are what a selection with confirmedOnly can take.
+	 */
+	feeCoins: { ready: number; readySatoshis: bigint; unconfirmed: number };
+	/** The actions still open: each holds its cap in the budget until retired. */
+	actions: Array<{
+		feeActionId?: string;
+		capSatoshis: bigint;
+		/** The fee coins the action holds, and their sum. */
+		inputs: number;
+		heldSatoshis: bigint;
+	}>;
+	/** The splits on their way: recorded and not yet closed. */
+	splits: Array<{
+		state: 'unsigned' | 'signed' | 'published';
+		transactionId?: string;
+		feeSatoshis: bigint;
+		feeCoins: number;
+		feeCoinSatoshis: bigint;
+	}>;
+	/**
+	 * Whether a split for a fee coin of `forFeeSatoshis` could be made now,
+	 * were one needed: the wallet lists a confirmed ordinary coin of at least
+	 * `neededSatoshis`, and the budget has room for the split's fee. No split
+	 * is made by asking. `reason` is the refusal a selection would end with.
+	 */
+	preparation: {
+		possible: boolean;
+		forFeeSatoshis: bigint;
+		neededSatoshis: bigint;
+		largestConfirmedSatoshis: bigint;
+		reason?: 'FEE_FUNDS_UNAVAILABLE' | 'FEE_BUDGET_EXHAUSTED';
+	};
+	/**
+	 * The refusal the most recent refused selection of this provider ended
+	 * with, and when, in milliseconds since the epoch. It is not cleared by
+	 * a later selection that was served; compare `at`.
+	 */
+	lastRefusal?: {
+		code: FixedOutputFeeErrorCode;
+		remedy: FixedOutputFeeRemedy;
+		at: number;
+	};
+}
+
 type Coin = { utxo: ISpliceUtxo; previous: string };
 type Preparation = {
 	id: string;
@@ -246,6 +300,7 @@ export class FixedOutputFeePool {
 	private view?: View;
 	/** A failed durable write keeps the exact signed bytes for the next in-process retry. */
 	private unsavedSigned = new Map<string, string>();
+	private lastRefusal?: IFixedOutputFeePoolState['lastRefusal'];
 
 	constructor(
 		private readonly wallet: IWalletLike,
@@ -1257,9 +1312,114 @@ export class FixedOutputFeePool {
 		feeratePerKw: number,
 		opts: IFeeBumpSelectionOpts
 	): Promise<Selection> {
-		return this.locked(() =>
-			this.selectLocked(targetFeeSats, feeratePerKw, opts)
-		);
+		try {
+			return await this.locked(() =>
+				this.selectLocked(targetFeeSats, feeratePerKw, opts)
+			);
+		} catch (error) {
+			if (error instanceof FixedOutputFeeError)
+				this.lastRefusal = {
+					code: error.code,
+					remedy: error.remedy,
+					at: Date.now()
+				};
+			throw error;
+		}
+	}
+	/** An unfrozen P2WPKH coin of the wallet that the pool does not hold. */
+	private ordinary(coin: ISpliceUtxo, reserved: Set<string>): boolean {
+		if (
+			reserved.has(key(coin)) ||
+			this.wallet.isUtxoFrozen!(coin.tx_hash, coin.tx_pos)
+		)
+			return false;
+		try {
+			return bitcoin.address.toOutputScript(coin.address, this.network).equals(
+				bitcoin.payments.p2wpkh({
+					pubkey: Buffer.from(coin.publicKey, 'hex')
+				}).output!
+			);
+		} catch {
+			return false;
+		}
+	}
+	/**
+	 * What the pool holds and can do, from the stored journal and the
+	 * wallet's listing as they are: nothing is refreshed, written or frozen.
+	 * `forFeeSatoshis` is the fee coin a split is measured for, the policy's
+	 * maxFeeSatoshis when left out.
+	 */
+	status(forFeeSatoshis?: bigint): IFixedOutputFeePoolState {
+		const fee = forFeeSatoshis ?? this.policy.maxFeeSatoshis;
+		if (!positive(fee)) throw new Error('Invalid fixed-output fee amount');
+		const { journal, reserved } = this.latest();
+		const live = this.wallet.listUtxos!();
+		const listed = new Map(live.map((coin) => [key(coin), coin]));
+		const feeCoins = { ready: 0, readySatoshis: 0n, unconfirmed: 0 };
+		for (const coin of journal.coins ?? []) {
+			const current = listed.get(key(coin.utxo));
+			if (!current) continue;
+			if (current.height > 0) {
+				feeCoins.ready++;
+				feeCoins.readySatoshis += BigInt(current.value);
+			} else feeCoins.unconfirmed++;
+		}
+		const needed =
+			(fee > BigInt(DUST) ? fee : BigInt(DUST)) +
+			this.policy.maxPreparationFeeSatoshis;
+		const largest = live
+			.filter((coin) => coin.height > 0 && this.ordinary(coin, reserved))
+			.reduce(
+				(most, coin) => (BigInt(coin.value) > most ? BigInt(coin.value) : most),
+				0n
+			);
+		const usage = this.usage(journal);
+		const reason =
+			usage.reserved + usage.spent + this.policy.maxPreparationFeeSatoshis >
+			this.policy.maxTotalFeeSatoshis
+				? ('FEE_BUDGET_EXHAUSTED' as const)
+				: largest < needed
+				? ('FEE_FUNDS_UNAVAILABLE' as const)
+				: undefined;
+		return {
+			available: true,
+			budget: this.budgetOf(journal),
+			feeCoins,
+			actions: Object.values(journal.actions)
+				.filter((action) => !action.retired)
+				.map((action) => ({
+					...(action.feeActionId !== undefined
+						? { feeActionId: action.feeActionId }
+						: {}),
+					capSatoshis: BigInt(action.cap),
+					inputs: action.inputs.length,
+					heldSatoshis: action.inputs.reduce(
+						(sum, coin) => sum + BigInt(coin.utxo.value),
+						0n
+					)
+				})),
+			splits: journal.preparations.flatMap((row) => {
+				if (row.state === 'building') return [];
+				const transactionId = this.txidOf(row);
+				return [
+					{
+						state: row.state,
+						...(transactionId !== undefined ? { transactionId } : {}),
+						feeSatoshis: BigInt(row.fee),
+						feeCoins: row.count,
+						feeCoinSatoshis: BigInt(row.amount)
+					}
+				];
+			}),
+			preparation: {
+				possible: reason === undefined,
+				forFeeSatoshis: fee,
+				neededSatoshis: needed,
+				largestConfirmedSatoshis: largest,
+				...(reason !== undefined ? { reason } : {})
+			},
+			...(this.lastRefusal ? { lastRefusal: { ...this.lastRefusal } } : {})
+		};
 	}
 	private async selectLocked(
 		targetFeeSats: bigint,
@@ -1447,14 +1607,8 @@ export class FixedOutputFeePool {
 			const reserved = this.latest().reserved;
 			const ordinary = live.filter(
 				(coin) =>
-					!reserved.has(key(coin)) &&
 					!excluded.has(coin.tx_hash.toLowerCase()) &&
-					!this.wallet.isUtxoFrozen!(coin.tx_hash, coin.tx_pos) &&
-					bitcoin.address.toOutputScript(coin.address, this.network).equals(
-						bitcoin.payments.p2wpkh({
-							pubkey: Buffer.from(coin.publicKey, 'hex')
-						}).output!
-					)
+					this.ordinary(coin, reserved)
 			);
 			const large = (coin: ISpliceUtxo): boolean =>
 				BigInt(coin.value) >= amount + this.policy.maxPreparationFeeSatoshis;

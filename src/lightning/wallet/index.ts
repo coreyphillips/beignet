@@ -3,6 +3,7 @@ export { WalletFundingProvider, IWalletLike } from './wallet-funding-provider';
 export {
 	IFixedOutputFeePolicy,
 	IFixedOutputFeeBudget,
+	IFixedOutputFeePoolState,
 	IFixedOutputFeeResolution,
 	FixedOutputFeeError,
 	FixedOutputFeeErrorCode,

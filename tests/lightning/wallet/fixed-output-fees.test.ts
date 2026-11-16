@@ -1892,3 +1892,152 @@ describe('the fee journal, its size and a restore without it', function () {
 		expect(ordinary.inputs.length).greaterThan(1);
 	});
 });
+
+describe('reading the state of the fee coin pool', () => {
+	it('answers nothing on a provider without a fee policy', () => {
+		const f = fixture();
+		expect(new WalletFundingProvider(f.wallet).getFixedOutputFeeStatus()).equal(
+			undefined
+		);
+	});
+
+	it('reports the budget, the fee coins, the open actions, the split on its way and the last refusal, and changes nothing by being asked', async () => {
+		const f = fixture(),
+			p = f.provider();
+		await drain(p);
+		// Before anything: the wallet's one coin of 50000 sats could be split.
+		// The frozen asset anchor of 100000 is not counted.
+		expect(p.getFixedOutputFeeStatus()).deep.equal({
+			available: true,
+			budget: {
+				totalSatoshis: 20000n,
+				reservedSatoshis: 0n,
+				spentSatoshis: 0n,
+				remainingSatoshis: 20000n
+			},
+			feeCoins: { ready: 0, readySatoshis: 0n, unconfirmed: 0 },
+			actions: [],
+			splits: [],
+			preparation: {
+				possible: true,
+				forFeeSatoshis: 2000n,
+				neededSatoshis: 3000n,
+				largestConfirmedSatoshis: 50000n
+			}
+		});
+		expect(f.store.rows.size).equal(0);
+		expect(f.broadcasts).length(0);
+
+		await prepare(p);
+		const split = bitcoin.Transaction.fromHex(f.broadcasts[0]).getId();
+		const journal = [...f.store.rows.values()][0],
+			frozen = JSON.stringify([...f.frozen]);
+		const during = p.getFixedOutputFeeStatus()!;
+		expect(during.splits).deep.equal([
+			{
+				state: 'published',
+				transactionId: split,
+				feeSatoshis: feeOf(f.broadcasts[0]),
+				feeCoins: 4,
+				feeCoinSatoshis: 568n
+			}
+		]);
+		expect(during.actions).deep.equal([
+			{
+				feeActionId: opts.feeActionId,
+				capSatoshis: 2000n,
+				inputs: 0,
+				heldSatoshis: 0n
+			}
+		]);
+		expect(during.lastRefusal).include({
+			code: 'FEE_PREPARATION_PENDING',
+			remedy: 'wait'
+		});
+		expect(during.lastRefusal!.at).closeTo(Date.now(), 5000);
+		// The split spent the only confirmed coin, and its change has not
+		// confirmed: a second split could not be made now.
+		expect(during.preparation).deep.equal({
+			possible: false,
+			forFeeSatoshis: 2000n,
+			neededSatoshis: 3000n,
+			largestConfirmedSatoshis: 0n,
+			reason: 'FEE_FUNDS_UNAVAILABLE'
+		});
+		expect([...f.store.rows.values()][0]).equal(journal);
+		expect(JSON.stringify([...f.frozen])).equal(frozen);
+		expect(f.broadcasts).length(1);
+
+		await p.selectFeeBumpInputs(500n, 250, opts);
+		expect(p.getFixedOutputFeeStatus()!.feeCoins).deep.equal({
+			ready: 0,
+			readySatoshis: 0n,
+			unconfirmed: 3
+		});
+		f.confirm();
+		const after = p.getFixedOutputFeeStatus(500n)!;
+		expect(after.feeCoins).deep.equal({
+			ready: 3,
+			readySatoshis: 1704n,
+			unconfirmed: 0
+		});
+		expect(after.actions).deep.equal([
+			{
+				feeActionId: opts.feeActionId,
+				capSatoshis: 2000n,
+				inputs: 1,
+				heldSatoshis: 568n
+			}
+		]);
+		expect(after.splits).deep.equal([]);
+		expect(after.preparation).deep.equal({
+			possible: true,
+			forFeeSatoshis: 500n,
+			neededSatoshis: 1500n,
+			largestConfirmedSatoshis: 47494n
+		});
+		expect(after.budget).deep.equal(p.getFixedOutputFeeBudget());
+		// A selection that was served does not clear the last refusal: its
+		// time says how old it is.
+		expect(after.lastRefusal).deep.equal(during.lastRefusal);
+		// Another provider over the same wallet has refused nothing.
+		expect(f.provider().getFixedOutputFeeStatus()).not.have.property(
+			'lastRefusal'
+		);
+	});
+
+	it('says a split could not be made now when the budget has no room for it, or no confirmed coin is large enough', () => {
+		const f = fixture();
+		f.policy.maxTotalFeeSatoshis = 900n;
+		expect(f.provider().getFixedOutputFeeStatus()!.preparation).deep.equal({
+			possible: false,
+			forFeeSatoshis: 2000n,
+			neededSatoshis: 3000n,
+			largestConfirmedSatoshis: 50000n,
+			reason: 'FEE_BUDGET_EXHAUSTED'
+		});
+		const g = fixture();
+		g.spendSource();
+		g.addCoin(2500);
+		const p = g.provider();
+		expect(p.getFixedOutputFeeStatus()!.preparation).deep.equal({
+			possible: false,
+			forFeeSatoshis: 2000n,
+			neededSatoshis: 3000n,
+			largestConfirmedSatoshis: 2500n,
+			reason: 'FEE_FUNDS_UNAVAILABLE'
+		});
+		// The same wallet could pay for a smaller fee coin.
+		expect(p.getFixedOutputFeeStatus(1000n)!.preparation).deep.equal({
+			possible: true,
+			forFeeSatoshis: 1000n,
+			neededSatoshis: 2000n,
+			largestConfirmedSatoshis: 2500n
+		});
+		// A fee coin is never smaller than dust.
+		expect(p.getFixedOutputFeeStatus(1n)!.preparation.neededSatoshis).equal(
+			1330n
+		);
+		expect(() => p.getFixedOutputFeeStatus(0n)).throw('Invalid fixed-output');
+	});
+});

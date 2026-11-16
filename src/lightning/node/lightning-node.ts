@@ -30430,6 +30430,23 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	}
 
 	/**
+	 * The state of the wallet's fee coin pool, which pays the fees of an
+	 * asset channel's transactions whose outputs are fixed: its lifetime
+	 * budget, the fee coins ready, the open fee actions, the splits on their
+	 * way, the last refusal a fee selection ended with, and whether a split
+	 * for a fee coin of `forFeeSatoshis` (the policy's cap when left out)
+	 * could be made now. Nothing is made or changed by asking. Undefined on
+	 * a node whose funding provider has no fee policy.
+	 */
+	getFixedOutputFeeStatus(
+		forFeeSatoshis?: bigint
+	):
+		| import('../wallet/fixed-output-fees').IFixedOutputFeePoolState
+		| undefined {
+		return this.fundingProvider?.getFixedOutputFeeStatus?.(forFeeSatoshis);
+	}
+
+	/**
 	 * Open an asset channel with a connected peer, once the host's asset
 	 * protocol has settled the funding with it. This is always a v1
 	 * open_channel of the taproot overlay type, whatever kind of channel the

@@ -3,6 +3,7 @@ import { FixedOutputFeePool } from './fixed-output-fees';
 import type {
 	IFixedOutputFeeBudget,
 	IFixedOutputFeePolicy,
+	IFixedOutputFeePoolState,
 	IFixedOutputFeeResolution
 } from './fixed-output-fees';
 /**
@@ -337,6 +338,20 @@ export class WalletFundingProvider implements IFundingProvider {
 	 */
 	getFixedOutputFeeBudget(): IFixedOutputFeeBudget | undefined {
 		return this.fixedOutputFeePool?.budget();
+	}
+
+	/**
+	 * What the fee coin pool holds and can do: its budget, the fee coins
+	 * ready, the open actions, the splits on their way, whether a split for
+	 * a fee coin of `forFeeSatoshis` (the policy's maxFeeSatoshis when left
+	 * out) could be made now, and the last refusal a selection ended with.
+	 * It reads the journal and the wallet's listing and changes nothing.
+	 * Undefined without a fee policy.
+	 */
+	getFixedOutputFeeStatus(
+		forFeeSatoshis?: bigint
+	): IFixedOutputFeePoolState | undefined {
+		return this.fixedOutputFeePool?.status(forFeeSatoshis);
 	}
 
 	/**
