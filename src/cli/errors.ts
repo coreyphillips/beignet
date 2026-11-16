@@ -246,9 +246,9 @@ export enum BeignetErrorCode {
 	/** Two attached extensions both supply an asset channel provider. */
 	ASSET_PROVIDER_CONFLICT = 'ASSET_PROVIDER_CONFLICT',
 	/**
-	 * The extension whose provider the node was built with refused the node
-	 * in bind(). A provider that was never given its node cannot run a
-	 * channel, so the node was stopped again.
+	 * The extension whose provider the node was being built with refused the
+	 * node in bind(). A provider that was never given its node cannot run a
+	 * channel, so the node was not started.
 	 */
 	ASSET_PROVIDER_FAILED = 'ASSET_PROVIDER_FAILED',
 	// Host extensions (docs/EXTENSIONS.md).

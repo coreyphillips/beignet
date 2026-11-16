@@ -187,9 +187,12 @@ export interface IExtensionAttachment {
 	 */
 	fixedOutputFees?: ExtensionFixedOutputFees;
 	/**
-	 * Called with the node of this build once it exists: in the turn that
-	 * built it, outside any storage transaction and before any start().
-	 * Synchronous; a promise it returns is not waited for.
+	 * Called with the node of this build as soon as it is constructed:
+	 * before it restores its stored channels, so before any hook of
+	 * `auxiliaryChannels` can be called, outside any storage transaction and
+	 * before any start(). The node has restored and started nothing yet, so
+	 * keep it and ask nothing of it here. Synchronous; a promise it returns
+	 * is not waited for.
 	 */
 	bind?(node: LightningNode): void;
 	/** Runs once the node is built and serving. */
@@ -620,6 +623,12 @@ interface IExtensionSlot {
 	 * unset for an attachment that names none of the three members.
 	 */
 	nodeMembers?: IExtensionNodeMembers;
+	/**
+	 * An attachment whose start() threw while the node holds its asset
+	 * channel provider: failed, and kept unstopped with its storage open
+	 * until the node itself stops or is rebuilt.
+	 */
+	retained?: IExtensionAttachment;
 	handlers: Map<string, ExtensionHandler>;
 	/** The attach() pass that last took the slot (ExtensionHost.pass). */
 	pass: number;
@@ -716,6 +725,7 @@ export class ExtensionHost {
 		if (pass !== this.pass) return;
 		// Anything still attached belongs to a build that is gone.
 		this.fenceAll();
+		for (const stop of this.stopRetained('rebuild')) void this.settle(stop);
 		const generation = ++this.generation;
 		for (const slot of this.slots) {
 			// Torn down while an earlier extension was attaching: the rest are
@@ -842,15 +852,30 @@ export class ExtensionHost {
 	}
 
 	/**
+	 * Whether an attached extension asked for the node of this build. The
+	 * node is given the binding callback only then, so a build with no such
+	 * extension is configured exactly as one with no extension.
+	 */
+	binds(): boolean {
+		return this.slots.some(
+			(slot) =>
+				slot.state === 'attached' && slot.nodeMembers?.bind !== undefined
+		);
+	}
+
+	/**
 	 * Give the node of this build to every attached extension that asked for
-	 * it. Called in the turn that built the node, outside any storage
+	 * it. Called by the node itself as soon as it is constructed and before
+	 * it restores from storage (INodeConfig.beforeRestore), so no stored
+	 * channel calls a hook of an unbound provider. Outside any storage
 	 * transaction, and before start().
 	 *
 	 * An extension whose bind() throws is failed and stopped, and the node
 	 * runs without it, with one exception: `provider`, the extension whose
-	 * asset channel provider the node was built with. That provider is in
-	 * the node already and was never given it, so the throw is passed on as
-	 * ASSET_PROVIDER_FAILED for the caller to stop the node.
+	 * asset channel provider the node is being built with. A provider that
+	 * was never given its node cannot run a channel, so the throw is passed
+	 * on as ASSET_PROVIDER_FAILED and ends the construction before anything
+	 * is restored.
 	 */
 	bindNode(node: LightningNode, provider?: string): void {
 		for (const slot of this.slots) {
@@ -877,7 +902,7 @@ export class ExtensionHost {
 						'ASSET_PROVIDER_FAILED',
 						`Extension "${id}" supplies this node's asset channels and ` +
 							`refused the node it was built for: ${errorMessage(err)}. ` +
-							'The node was stopped.'
+							'The node was not started.'
 					);
 				}
 			}
@@ -923,6 +948,18 @@ export class ExtensionHost {
 			}
 		} catch (err) {
 			if (slot.attachment !== attachment || slot.state !== 'attached') return;
+			if (slot.nodeMembers?.auxiliaryChannels !== undefined) {
+				// The node was built with this extension's asset channel
+				// provider and goes on calling it for the channels that exist,
+				// which it may have to defend on chain. So only the routes
+				// close: the attachment is kept, unstopped and with its storage
+				// open, and is stopped when the node stops or is rebuilt. New
+				// activity is the extension's own to refuse.
+				slot.handlers = new Map();
+				this.fail(slot, 'start', err);
+				slot.retained = attachment;
+				return;
+			}
 			// Settled before the stop hook is waited for. The slot can change
 			// hands during that wait: a teardown finds nothing running here
 			// and does not stop the attachment a second time, and a rebuild
@@ -974,6 +1011,7 @@ export class ExtensionHost {
 			slot.state = 'stopped';
 			slot.handlers = new Map();
 		}
+		for (const stop of this.stopRetained('rebuild')) void this.settle(stop);
 	}
 
 	/**
@@ -1000,7 +1038,8 @@ export class ExtensionHost {
 			within(this.settling, limit),
 			...running.map((slot) =>
 				this.runStop(slot.extension.id, slot.attachment, 'shutdown', limit)
-			)
+			),
+			...this.stopRetained('shutdown', limit)
 		]);
 		this.fenceAll();
 		for (const slot of running) slot.state = 'stopped';
@@ -1023,6 +1062,7 @@ export class ExtensionHost {
 			slot.state = 'stopped';
 			slot.handlers = new Map();
 		}
+		for (const stop of this.stopRetained('shutdown')) void stop;
 		this.listeners.clear();
 	}
 
@@ -1079,6 +1119,25 @@ export class ExtensionHost {
 			}
 			return info;
 		});
+	}
+
+	/**
+	 * Run the stop hook of every attachment that was kept for its provider
+	 * after a failed start(), now that the node it served is going away.
+	 */
+	private stopRetained(
+		reason: ExtensionStopReason,
+		limitMs?: number
+	): Promise<void>[] {
+		const stops: Promise<void>[] = [];
+		for (const slot of this.slots) {
+			if (slot.retained === undefined) continue;
+			stops.push(
+				this.runStop(slot.extension.id, slot.retained, reason, limitMs)
+			);
+			slot.retained = undefined;
+		}
+		return stops;
 	}
 
 	private isRunning(slot: IExtensionSlot): boolean {

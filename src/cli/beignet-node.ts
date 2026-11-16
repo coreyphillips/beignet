@@ -3858,6 +3858,24 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 			announcedAddresses,
 			fundingProvider,
 			...(auxiliary ? { auxiliaryChannels: auxiliary.auxiliaryChannels } : {}),
+			// Extensions that asked for the node are given it by the node
+			// itself, as soon as it is constructed and before it restores a
+			// stored channel: no hook of a provider runs unbound. The one
+			// whose provider this node is built with has to take it, or the
+			// construction ends there (ASSET_PROVIDER_FAILED) with nothing
+			// restored and the half-built node taken down.
+			...(this._extensionHost?.binds()
+				? {
+						beforeRestore: (node: LightningNode): void => {
+							try {
+								this._extensionHost?.bindNode(node, auxiliary?.id);
+							} catch (err) {
+								node.destroy();
+								throw err;
+							}
+						}
+				  }
+				: {}),
 			preferAnchors: opts.preferAnchors,
 			largeChannels: opts.largeChannels,
 			chainBackend: electrumBackend,
@@ -3905,17 +3923,6 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 			recovery: this.recoveryNodeConfig
 		});
 		this._nodeConstructMs = Date.now() - constructStarted;
-		// Extensions that asked for the node are given it in the turn that
-		// built it: outside any storage transaction, before a peer can be
-		// heard and before any start(). The one whose asset channel provider
-		// this node was built with has to take it; a node whose provider was
-		// never bound would hold channels it cannot run, so it is stopped.
-		try {
-			this._extensionHost?.bindNode(this.node, auxiliary?.id);
-		} catch (err) {
-			this.node.destroy();
-			throw err;
-		}
 		// A deferred restore of the stored network map reports when it ends.
 		this.node.on('graph:restored', () => {
 			const stats = this.getGraphRestoreStats();

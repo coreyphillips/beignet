@@ -2841,6 +2841,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		this.wireChannelManagerEvents();
 
 		if (leaveLifecycleToCreate) return;
+		nodeConfig.beforeRestore?.(this);
 		this.restore();
 		this.start();
 	}
@@ -33936,6 +33937,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		}
 		// Synchronous for now, so nothing runs between the steps, as in the
 		// constructor. Async so that restore() can become async later.
+		config.beforeRestore?.(node);
 		node.restore();
 		node.start();
 		return node;

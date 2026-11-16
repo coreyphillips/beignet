@@ -793,6 +793,14 @@ export interface INodeConfig {
 	 */
 	auxiliaryChannels?: IAuxiliaryChannelConfig;
 	/**
+	 * Called once with the node when it is built, before it restores from
+	 * storage: so before any stored channel can call a hook of
+	 * `auxiliaryChannels`. A host whose hooks need the node binds it here
+	 * (issue #2093). Synchronous. A throw ends the construction before a
+	 * stored row is read or rewritten. Unset, the default, nothing is called.
+	 */
+	beforeRestore?: (node: import('./lightning-node').LightningNode) => void;
+	/**
 	 * Liquidity ads (bLIP-0051) SELLER policy: when set, an inbound
 	 * open_channel2 carrying request_funds is answered with a signed will_fund
 	 * at these rates and the requested contribution is funded from the node's

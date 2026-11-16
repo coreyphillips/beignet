@@ -305,6 +305,72 @@ describe('host extensions: the members that reach the node, in the host', () => 
 		expect(stops.sort()).to.deep.equal(['assets', 'notes']);
 	});
 
+	for (const end of ['shutdown', 'rebuild'] as const) {
+		it(`keeps an extension whose start throws unstopped and its storage open while the node holds its provider, until the ${end}`, async () => {
+			const stops: string[] = [];
+			const contexts: IExtensionContext[] = [];
+			const failing = (
+				id: string,
+				withProvider: boolean
+			): IBeignetExtension => ({
+				...extension(id, (context) => {
+					contexts.push(context);
+					return {
+						...(withProvider ? { auxiliaryChannels: auxiliaryChannels() } : {}),
+						handlers: { 'GET /a': (): unknown => ({ ok: true }) },
+						start: (): void => {
+							throw new Error('the asset service did not start');
+						},
+						stop: (reason): void => {
+							stops.push(`${id}:${reason}`);
+						}
+					};
+				}),
+				routes: [{ method: 'GET', path: '/a', summary: 's' }]
+			});
+			const h = host([failing('notes', false), failing('assets', true)]);
+			await h.attach(build());
+			const [notes, assets] = contexts;
+			h.bindNode(node, h.auxiliarySupply()?.id);
+			await h.start();
+
+			// Both failed, and the routes of both are closed.
+			expect(
+				h.describe().map((info) => [info.id, info.state, info.error])
+			).to.deep.equal([
+				['notes', 'failed', 'start: the asset service did not start'],
+				['assets', 'failed', 'start: the asset service did not start']
+			]);
+			expect(() => h.handler('notes', 'GET /a')).to.throw(/failed: start/);
+			expect(() => h.handler('assets', 'GET /a')).to.throw(/failed: start/);
+			// The one without a provider was stopped and fenced, as before.
+			expect(stops).to.deep.equal(['notes:shutdown']);
+			expect(() => notes.storage.get('k')).to.throw();
+			// The one whose provider the node holds was not: what its hooks
+			// need to defend a channel is still there to read and to write.
+			assets.storage.set('proof', 'kept');
+			expect(assets.storage.get('proof')).to.equal('kept');
+			expect(storage.loadMetadata('x/assets/proof')).to.equal('kept');
+
+			if (end === 'shutdown') await h.shutdown();
+			else {
+				h.fenceForRebuild();
+				await h.attach(build());
+			}
+			expect(stops).to.deep.equal(['notes:shutdown', `assets:${end}`]);
+			expect(() => assets.storage.get('proof')).to.throw();
+			if (end === 'rebuild') {
+				// The next build attaches it afresh.
+				expect(contexts).to.have.length(4);
+				expect(h.describe().map((info) => info.state)).to.deep.equal([
+					'attached',
+					'attached'
+				]);
+				await h.shutdown();
+			}
+		});
+	}
+
 	it('drops a supply the node refuses, as if attach had thrown', async () => {
 		let stops = 0;
 		const h = host([
@@ -429,6 +495,8 @@ describe('host extensions: the members that reach the node, in a node', function
 		).to.deep.equal([]);
 		expect(order).to.deep.equal(['bind', 'start']);
 		expect(bound).to.deep.equal([built[0].node]);
+		// The node itself gave it, before its restore.
+		expect(built[0].options.beforeRestore).to.be.a('function');
 		expect(inTransaction).to.equal(false);
 		expect(storage.loadMetadata('x/assets/bound')).to.equal('1');
 		expect(infoOf(node).state).to.equal('ready');
@@ -491,6 +559,8 @@ describe('host extensions: the members that reach the node, in a node', function
 			await new Promise((resolve) => setTimeout(resolve, 50));
 			const latest = built[built.length - 1];
 			expect(latest.options.auxiliaryChannels, name).to.equal(given);
+			// No extension asked for the node, so the node is told of none.
+			expect(latest.options, name).to.not.have.property('beforeRestore');
 			expect(latest.node, name).to.have.property('auxiliaryChannels', given);
 			expect(infoOf(node).state, name).to.equal(state);
 		}
@@ -568,6 +638,63 @@ describe('host extensions: the members that reach the node, in a node', function
 			expect(storage.loadAllChannels()).to.deep.equal(before);
 		});
 
+		it('gives the node to bind before the node reads the stored channel, so no hook of its provider runs unbound', async () => {
+			const { storage, id } = storageWithAssetChannel();
+			const order: string[] = [];
+			const load = storage.loadAllChannels.bind(storage);
+			storage.loadAllChannels = (): ReturnType<typeof load> => {
+				// Only the node's own restore, not the daemon's reads before it.
+				if (built.length > 0) order.push('rows read');
+				return load();
+			};
+			let bound: LightningNode | undefined;
+			const calls: Array<{ hook: string; bound: boolean }> = [];
+			// Like the library's provider: every hook fails closed until the
+			// node was given to bind.
+			const provider = new Proxy(referenceProvider(), {
+				get(target, name, receiver): unknown {
+					const member = Reflect.get(target, name, receiver);
+					if (typeof member !== 'function') return member;
+					return (...args: unknown[]): unknown => {
+						calls.push({ hook: String(name), bound: bound !== undefined });
+						if (!bound) throw new Error('not bound to a node');
+						return (member as (...given: unknown[]) => unknown).apply(
+							target,
+							args
+						);
+					};
+				}
+			});
+			const node = await boot(
+				[
+					watching('assets', () => ({
+						auxiliaryChannels: {
+							provider,
+							resolveIncoming: (): undefined => undefined
+						},
+						bind: (given): void => {
+							order.push('bind');
+							bound = given;
+						}
+					}))
+				],
+				storage
+			);
+			await node.extensionHost?.started;
+
+			expect(order[0]).to.equal('bind');
+			expect(order.filter((event) => event === 'bind')).to.have.length(1);
+			expect(order).to.include('rows read');
+			expect(bound).to.equal(built[0].node);
+			expect(built[0].options).to.have.property('beforeRestore');
+			expect(calls.filter((call) => !call.bound)).to.deep.equal([]);
+			// The stored asset channel is the node's again, with the provider.
+			expect(
+				built[0].node?.getAuxiliaryChannelInfo(Buffer.from(id, 'hex'))
+			).to.not.equal(undefined);
+			expect(infoOf(node).state).to.equal('ready');
+		});
+
 		it('says which extension failed when the one that would supply the provider did', async () => {
 			const { storage } = storageWithAssetChannel();
 			const refusal = await refusalOf(
@@ -599,21 +726,39 @@ describe('host extensions: the members that reach the node, in a node', function
 		expect(built).to.deep.equal([]);
 	});
 
-	it("stops the node again when the provider's extension refuses it in bind", async () => {
+	it("restores nothing and takes the node down when the provider's extension refuses it in bind", async () => {
+		const storage = new MemoryStorage();
+		const reads: string[] = [];
+		const load = storage.loadAllChannels.bind(storage);
+		storage.loadAllChannels = (): ReturnType<typeof load> => {
+			if (built.length > 0) reads.push('rows read');
+			return load();
+		};
+		let given: LightningNode | undefined;
 		const refusal = await refusalOf(
-			boot([
-				watching('assets', () => ({
-					auxiliaryChannels: auxiliaryChannels(),
-					bind: (): void => {
-						throw new Error(
-							'the asset Lightning host is bound to another node'
-						);
-					}
-				}))
-			])
+			boot(
+				[
+					watching('assets', () => ({
+						auxiliaryChannels: auxiliaryChannels(),
+						bind: (node): void => {
+							given = node;
+							throw new Error(
+								'the asset Lightning host is bound to another node'
+							);
+						}
+					}))
+				],
+				storage
+			)
 		);
 		expect(refusal.code).to.equal('ASSET_PROVIDER_FAILED');
+		expect(refusal.message).to.match(
+			/bound to another node.*The node was not started\.$/
+		);
+		// The node was built, given to bind, and never restored or handed on.
 		expect(built).to.have.length(1);
-		expect(built[0].node).to.have.property('_destroyed', true);
+		expect(built[0].node).to.equal(undefined);
+		expect(reads).to.deep.equal([]);
+		expect(given).to.have.property('_destroyed', true);
 	});
 });

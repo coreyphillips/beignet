@@ -5893,6 +5893,7 @@ property node.INodeConfig.autoReleaseHeldForwards?: boolean
 property node.INodeConfig.autoTuneFees?: node.IAutoTuneFeesConfig
 property node.INodeConfig.autoUpdateChannelFees?: boolean
 property node.INodeConfig.auxiliaryChannels?: channel.IAuxiliaryChannelConfig
+property node.INodeConfig.beforeRestore?: (node: node.LightningNode) => void
 property node.INodeConfig.chainBackend?: chain.IChainBackend
 property node.INodeConfig.chainHashes?: Buffer[]
 property node.INodeConfig.channelBasepoints: keys.IChannelBasepoints

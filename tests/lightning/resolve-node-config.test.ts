@@ -335,6 +335,7 @@ describe('LightningNode.fromMnemonic options', () => {
 			largeChannels: undefined,
 			preferTaproot: undefined,
 			auxiliaryChannels: undefined,
+			beforeRestore: undefined,
 			leaseRates: undefined,
 			peerStorageEnabled: undefined,
 			feeEstimator: undefined,
