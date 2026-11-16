@@ -112,16 +112,18 @@ describe('the outcomes of asset HTLCs a channel keeps for its host (issue #2093 
 		host: IAssetHost,
 		channelId: Buffer,
 		direction: HtlcDirection,
-		count: number
+		count: number,
+		first = 1_000_000,
+		paymentHash = Buffer.alloc(32, 7)
 	): void => {
 		const auxiliary = auxiliaryOf(host, channelId);
 		auxiliary.resolvedHtlcs ??= new Map();
 		for (let i = 0; i < count; i++) {
-			const htlcId = BigInt(1_000_000 + i);
+			const htlcId = BigInt(first + i);
 			auxiliary.resolvedHtlcs.set(`${direction}:${htlcId}`, {
 				htlcId,
 				direction,
-				paymentHash: Buffer.alloc(32, 7),
+				paymentHash,
 				auxiliaryAmount: 1n,
 				outcome: 'failed'
 			});
@@ -219,6 +221,71 @@ describe('the outcomes of asset HTLCs a channel keeps for its host (issue #2093 
 		expect(
 			'undeliveredOutcomes' in bob.node.getAuxiliaryChannelInfo(channelId)!
 		).to.equal(false);
+	});
+
+	it('outcomes the host cannot take do not keep a pass from the ones behind them: a pass stops at eight refusals and the next starts behind the last outcome it tried', async () => {
+		const unknown = Buffer.alloc(32, 7);
+		const seen = { refused: 0, taken: [] as string[] };
+		const { alice, bob, channelId } = await open(
+			'aux-outcomes-fair',
+			{
+				// A host that always throws for one hash.
+				onHtlcResolved: (context) => {
+					if (context.paymentHash.equals(unknown)) {
+						seen.refused++;
+						throw new Error('the asset store does not know this HTLC');
+					}
+					seen.taken.push(`${context.direction}:${context.htlcId}`);
+				}
+			},
+			{}
+		);
+		const manager = alice.node.getChannelManager();
+		/** One pass over the channel's outcomes; answers how many the host refused in it. */
+		const pass = (): number => {
+			seen.refused = 0;
+			(
+				manager as unknown as {
+					_notifyAuxiliaryResolutions(channel: unknown): void;
+				}
+			)._notifyAuxiliaryResolutions(manager.getChannel(channelId)!);
+			return seen.refused;
+		};
+		// Twelve outcomes of that hash are ahead of five the host can take.
+		hold(alice, channelId, HtlcDirection.OFFERED, 12);
+		hold(
+			alice,
+			channelId,
+			HtlcDirection.OFFERED,
+			5,
+			2_000_000,
+			Buffer.alloc(32, 9)
+		);
+		expect(pass()).to.equal(8);
+		expect(seen.taken).to.deep.equal([]);
+		// The second pass starts at the ninth: four refusals, the five are
+		// taken, and it goes round to the first four.
+		expect(pass()).to.equal(8);
+		expect(seen.taken).to.deep.equal(
+			[0, 1, 2, 3, 4].map((i) => `${HtlcDirection.OFFERED}:${2_000_000 + i}`)
+		);
+		expect(auxiliaryOf(alice, channelId).resolvedHtlcs!.size).to.equal(12);
+		expect(
+			alice.node.getAuxiliaryChannelInfo(channelId)!.undeliveredOutcomes
+		).to.equal(12);
+		// Never more than eight refusals a pass, whatever is held.
+		expect(pass()).to.equal(8);
+		expect(pass()).to.equal(8);
+
+		// The outcome of a payment made now is behind all twelve, and the
+		// host has it all the same.
+		const hash = await pay(alice, bob, channelId, 500n);
+		expect(alice.node.getPayment(hash)!.status).to.equal(
+			PaymentStatus.COMPLETED
+		);
+		for (let i = 0; i < 3 && seen.taken.length < 6; i++) pass();
+		expect(seen.taken[5]).to.equal(`${HtlcDirection.OFFERED}:0`);
+		expect(auxiliaryOf(alice, channelId).resolvedHtlcs!.size).to.equal(12);
 	});
 
 	it('past the bound the channel offers no further asset HTLC, with a typed refusal, and takes none from its peer, whose HTLC leaves no outcome', async () => {

@@ -11832,6 +11832,15 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 	private readonly _auxiliaryResolutionsInFlight = new Set<string>();
 
 	/**
+	 * Per channel, the last outcome a pass tried when the host's refusals
+	 * stopped it: the next pass starts behind it.
+	 */
+	private readonly _auxiliaryResolutionsTriedLast = new WeakMap<
+		Channel,
+		string
+	>();
+
+	/**
 	 * Asset channels: put the ending of every HTLC that ended on the chain
 	 * in its channel's row and tell the host (onHtlcResolved), as for an
 	 * HTLC that left the channel off chain: the same list, the same count,
@@ -11913,7 +11922,9 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 	 * at once (after the restore, when called from it), so a restart does
 	 * not deliver it again. A host that throws is told again at the next
 	 * pass: one line says so for a pass, with the number of outcomes held,
-	 * and a pass stops after a few refusals.
+	 * and a pass stops at eight refusals. The next pass starts behind the
+	 * last outcome that one tried and goes round, so outcomes the host
+	 * cannot take never keep a pass from the ones behind them.
 	 */
 	private _notifyAuxiliaryResolutions(
 		channel: Channel,
@@ -11934,8 +11945,17 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		let delivered = 0;
 		let refused = 0;
 		let firstRefusal = '';
-		for (const [key, resolution] of [...records]) {
-			const identity = `${channelId.toString('hex')}:${key}`;
+		const hex = channelId.toString('hex');
+		const pending = [...records];
+		const triedLast = this._auxiliaryResolutionsTriedLast.get(channel);
+		const start =
+			triedLast === undefined
+				? 0
+				: pending.findIndex(([key]) => key === triedLast) + 1;
+		this._auxiliaryResolutionsTriedLast.delete(channel);
+		for (let tried = 0; tried < pending.length; tried++) {
+			const [key, resolution] = pending[(start + tried) % pending.length];
+			const identity = `${hex}:${key}`;
 			if (this._auxiliaryResolutionsInFlight.has(identity)) continue;
 			this._auxiliaryResolutionsInFlight.add(identity);
 			try {
@@ -11952,8 +11972,14 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 				this._auxiliaryResolutionsInFlight.delete(identity);
 			}
 			// A host that keeps throwing is not asked for every outcome it
-			// holds at every write of the channel.
-			if (refused >= 8) break;
+			// holds at every write of the channel, and the next pass goes on
+			// from here.
+			if (refused >= 8) {
+				if (tried + 1 < pending.length) {
+					this._auxiliaryResolutionsTriedLast.set(channel, key);
+				}
+				break;
+			}
 		}
 		if (refused > 0) {
 			this.emitContained(
@@ -11967,7 +11993,6 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			);
 		}
 		if (delivered > 0) {
-			const hex = channelId.toString('hex');
 			const write = (): void => {
 				try {
 					if (this.channels.get(hex) !== channel) return;
