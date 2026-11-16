@@ -39,13 +39,49 @@ export interface IAuxiliaryChannelInfo {
 	peerPubkey: string;
 	state: ChannelState;
 	channelData: Buffer;
+	/**
+	 * The asset units on this node's side that no HTLC holds. An HTLC this
+	 * node offered leaves this balance when it is added and comes back only
+	 * if it fails; one in flight is in neither balance, it is in `htlcs`.
+	 */
 	localAssetBalance: bigint;
+	/**
+	 * The asset units on the peer's side that no HTLC holds: an HTLC the
+	 * peer offered left this balance when it arrived.
+	 */
 	remoteAssetBalance: bigint;
 	nextLocalHtlcId: bigint;
 	localBalanceMsat: bigint;
 	remoteBalanceMsat: bigint;
 	dustLimitSatoshis: bigint;
 	shortChannelId?: Buffer;
+	/** The HTLCs in flight on the channel, each side's, with what they carry. */
+	htlcs: IAuxiliaryChannelHtlc[];
+}
+
+/** One HTLC in flight on an asset channel. */
+export interface IAuxiliaryChannelHtlc {
+	htlcId: bigint;
+	/** Offered by this node, or received from the peer. */
+	direction: 'offered' | 'received';
+	paymentHash: Buffer;
+	/** The bitcoin the HTLC carries on the wire. */
+	wireAmountMsat: bigint;
+	cltvExpiry: number;
+	/** The asset units the HTLC carries. Absent for a plain bitcoin HTLC. */
+	auxiliaryAmount?: bigint;
+	/** The custom records the HTLC was added with. Empty for a plain HTLC. */
+	customRecords: CustomRecords;
+}
+
+/** One HTLC an asset payment went out as. */
+export interface IAuxiliaryPaymentHtlc {
+	channelId: Buffer;
+	htlcId: bigint;
+	/** What the HTLC is worth to the payment, as the route carries it. */
+	amountMsat: bigint;
+	/** The HTLC as its channel holds it, while it is in flight there. */
+	htlc?: IAuxiliaryChannelHtlc;
 }
 
 /** The asset side of one outgoing HTLC. */
@@ -57,7 +93,10 @@ export interface IAuxiliaryPayment {
 	customRecords: CustomRecords;
 }
 
-/** An incoming asset HTLC, for the host to value against its quote. */
+/**
+ * An incoming HTLC, for the host to claim and value or to leave alone. It
+ * need not be an asset HTLC, nor have arrived on an asset channel.
+ */
 export interface IAuxiliaryIncomingHtlc {
 	state: IChannelState;
 	peerPubkey: string;
@@ -65,6 +104,9 @@ export interface IAuxiliaryIncomingHtlc {
 	htlcId: bigint;
 	paymentHash: Buffer;
 	wireAmountMsat: bigint;
+	/** The asset units the HTLC carries. Absent for a plain bitcoin HTLC. */
+	auxiliaryAmount?: bigint;
+	/** Empty for a plain bitcoin HTLC. */
 	customRecords: CustomRecords;
 	hopPayload: IHopPayload;
 	isFinalHop: boolean;
@@ -108,8 +150,37 @@ export interface IAuxiliaryChannelConfig {
 	/** Explicit new-channel compatibility for peers lacking native fixed-output HTLCs. */
 	allowLegacyHtlcSignatures?(peerPubkey: string): boolean;
 	provider: IChannelAuxiliaryProvider;
-	/** Return the quoted Bitcoin value of the admitted asset amount, or throw. */
-	valueIncomingHtlc?(context: IAuxiliaryIncomingHtlc): bigint;
+	/**
+	 * Asked, before the node settles or forwards it and outside any storage
+	 * transaction, about every incoming HTLC that ends at this node, whatever
+	 * channel it arrived on, and about every HTLC that carries asset units
+	 * or arrives on an asset channel. Only the host knows that a payment
+	 * hash belongs to an asset invoice, so it sees each of them and can
+	 * refuse. One of three answers:
+	 *
+	 * - A value in millisatoshis, above zero and within a u64: the HTLC is
+	 *   the host's and is worth that much. The node goes on with that value
+	 *   in place of the bitcoin amount on the wire: an invoice is judged paid
+	 *   against it, and a forward judged funded.
+	 * - `undefined`: the HTLC is not the host's. It carries no asset units
+	 *   and its payment hash is not one the host issued an asset invoice or
+	 *   holds a quote for. The node goes on exactly as a node without asset
+	 *   channels would, on the bitcoin amount the HTLC carries. Given for an
+	 *   HTLC that does carry asset units it is a refusal, because such an
+	 *   HTLC is always the host's to value.
+	 * - A throw: the HTLC is failed back. It is never settled, and the
+	 *   node's own invoice logic never sees it. This is the answer for a
+	 *   plain HTLC whose payment hash belongs to an invoice issued for asset
+	 *   units: between two wallets such an invoice's face in satoshis is
+	 *   nominal, and settling it for that many satoshis would give a receipt
+	 *   for the units away.
+	 *
+	 * Anything else returned (null, zero, a negative, not a bigint) refuses
+	 * as a throw does. Without this hook an HTLC that carries asset units or
+	 * arrives on an asset channel is failed back, and no other is asked
+	 * about.
+	 */
+	valueIncomingHtlc?(context: IAuxiliaryIncomingHtlc): bigint | undefined;
 	/** Read-only lookup of a peer-bound RFQ alias before Bitcoin forwarding checks. */
 	resolveForwardChannel?(
 		context: IAuxiliaryForwardContext

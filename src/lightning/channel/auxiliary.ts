@@ -280,8 +280,16 @@ export interface IChannelAuxiliaryProvider {
 		context: IAuxiliarySigningContext,
 		customRecords: CustomRecords
 	): boolean;
-	/** Reject invalid asset metadata before admitting an HTLC into channel state. */
+	/**
+	 * Reject invalid asset metadata before admitting an HTLC into channel
+	 * state. Asked about every HTLC of an asset channel, with or without
+	 * custom records.
+	 */
 	validateHtlc(state: IChannelState, entry: IHtlcEntry): void;
+	/**
+	 * The asset units an HTLC carries. Zero for a plain bitcoin HTLC, which
+	 * an asset channel takes from its peer and never offers.
+	 */
 	getHtlcAmount(state: IChannelState, entry: IHtlcEntry): bigint;
 	prepareShutdown(
 		state: IChannelState,

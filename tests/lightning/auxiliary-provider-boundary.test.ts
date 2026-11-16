@@ -22,7 +22,7 @@ import { MessageType } from '../../src/lightning/message/types';
 import { encodeFrame } from '../../src/lightning/recovery/frame-codec';
 import { serializeChannelState } from '../../src/lightning/storage/serialization';
 import type { IAssetPair } from './helpers/auxiliary-pair';
-import { leafFor, taprootPair } from './helpers/auxiliary-pair';
+import { amountRecord, leafFor, taprootPair } from './helpers/auxiliary-pair';
 import { channelStateFrame } from './helpers/auxiliary-state-fixture';
 import { writableState } from './helpers/writable-state';
 
@@ -65,12 +65,18 @@ describe('the asset provider at the edge of a commitment round (issue #2093 step
 		amountMsat = 50_000_000n
 	): Buffer {
 		const preimage = sha256(Buffer.from(`boundary preimage ${label}`));
+		// An asset channel offers only HTLCs that carry asset units.
+		const carriesAssets =
+			pair.aliceChannel.getFullState().auxiliaryState !== undefined;
 		const result = pair.alice.addHtlc(
 			pair.id,
 			amountMsat,
 			sha256(preimage),
 			500,
-			Buffer.alloc(1366)
+			Buffer.alloc(1366),
+			undefined,
+			undefined,
+			carriesAssets ? { customRecords: amountRecord(1n) } : undefined
 		);
 		expect(result.ok, result.error).to.equal(true);
 		return preimage;
@@ -141,7 +147,10 @@ describe('the asset provider at the edge of a commitment round (issue #2093 step
 					50_000_000n,
 					sha256(Buffer.from('refused')),
 					500,
-					Buffer.alloc(1366)
+					Buffer.alloc(1366),
+					undefined,
+					undefined,
+					{ customRecords: amountRecord(1n) }
 				)
 			);
 			expect(pair.aliceChannel.getFullState().localHtlcCounter).to.equal(0n);

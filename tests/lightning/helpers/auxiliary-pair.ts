@@ -94,12 +94,14 @@ export function referenceProvider(): IChannelAuxiliaryProvider {
 			);
 		},
 		validateHtlc(_state, entry) {
-			if (entry.customRecords?.get(65536n)?.length !== 8) {
-				throw new Error('Missing asset amount');
+			const record = entry.customRecords?.get(65536n);
+			if (record && record.length !== 8) {
+				throw new Error('Malformed asset amount');
 			}
 		},
+		// No amount record: a plain bitcoin HTLC, carrying no units.
 		getHtlcAmount(_state, entry) {
-			return entry.customRecords!.get(65536n)!.readBigUInt64BE();
+			return entry.customRecords?.get(65536n)?.readBigUInt64BE() ?? 0n;
 		},
 		prepareShutdown(state) {
 			const key = state.localBasepoints.fundingPubkey;

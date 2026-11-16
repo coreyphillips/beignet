@@ -71,10 +71,21 @@ export function assetHost(
 	tag: string,
 	seedId: number,
 	hooks: Partial<IAuxiliaryChannelConfig> = {},
-	options: { sqlite?: boolean; extra?: Partial<INodeConfig> } = {}
+	options: {
+		sqlite?: boolean;
+		/** A database file in place of memory, so a later node can restart from it. */
+		sqlitePath?: string;
+		/** Handed the storage before the node is made, and restores from it. */
+		onStorage?: (storage: SqliteStorage) => void;
+		extra?: Partial<INodeConfig>;
+	} = {}
 ): IAssetHost {
-	const storage = options.sqlite ? new SqliteStorage(':memory:') : undefined;
+	const storage =
+		options.sqlite || options.sqlitePath
+			? new SqliteStorage(options.sqlitePath ?? ':memory:')
+			: undefined;
 	storage?.open();
+	if (storage) options.onStorage?.(storage);
 	const host: IAssetHost = {
 		incoming: new Map(),
 		broadcasts: [],

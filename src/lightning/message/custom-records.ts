@@ -32,6 +32,19 @@ export function copyCustomRecords(
 	);
 }
 
+/** Whether two sets of custom records hold the same types and values. */
+export function sameCustomRecords(
+	a?: CustomRecords,
+	b?: CustomRecords
+): boolean {
+	if ((a?.size ?? 0) !== (b?.size ?? 0)) return false;
+	for (const [type, value] of a ?? []) {
+		const other = b?.get(type);
+		if (!other || !other.equals(value)) return false;
+	}
+	return true;
+}
+
 /**
  * The records as TLV entries, in map order. Throws on a type below the
  * custom range, above a u64, or in `reserved`, and on a value that is not

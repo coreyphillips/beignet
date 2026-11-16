@@ -9,7 +9,10 @@
 import type { IRoutingHintHop, Network } from '../invoice/types';
 import type { IBolt12Invoice } from '../offer/types';
 import type { IChannelConfig, ChannelState } from '../channel/types';
-import type { IAuxiliaryChannelConfig } from '../channel/auxiliary-funding';
+import type {
+	IAuxiliaryChannelConfig,
+	IAuxiliaryPayment
+} from '../channel/auxiliary-funding';
 import type { ChannelErrorCode } from '../channel/channel-actions';
 import { CodedError } from '../../utils/errors';
 import type { IChannelBasepoints } from '../keys/derivation';
@@ -1364,6 +1367,14 @@ export interface IChannelInfo {
 	 * with an on-chain funding output).
 	 */
 	closeStatus?: ICloseStatus;
+	/**
+	 * True on an asset channel, and absent on every other channel. The
+	 * bitcoin on an asset channel only carries its asset outputs: it is not
+	 * spendable or receivable as bitcoin over Lightning, and no total that a
+	 * spending or receiving decision is made from counts it. The asset side
+	 * is read with `getAuxiliaryChannelInfo`.
+	 */
+	auxiliary?: true;
 }
 
 /**
@@ -1870,6 +1881,57 @@ export class InvalidRequestError extends Error {
 		super(message);
 		this.name = 'InvalidRequestError';
 	}
+}
+
+/** Why an asset payment, or a payment over an asset channel, was refused. */
+export type AuxiliaryPaymentErrorCode =
+	/** The asset side of the payment is malformed. */
+	| 'ASSET_PAYMENT_INVALID'
+	/** The named channel is not an asset channel to the route's first hop. */
+	| 'ASSET_PAYMENT_CHANNEL_MISMATCH'
+	/** A further attempt of an asset payment did not name its asset channel. */
+	| 'ASSET_PAYMENT_ROUTE_REQUIRED'
+	/** The payment asks for something an asset payment cannot do. */
+	| 'ASSET_PAYMENT_UNSUPPORTED'
+	/** The channel's next HTLC id is no longer the one the payment was prepared for. Nothing was sent. */
+	| 'ASSET_PAYMENT_CIRCUIT_CHANGED'
+	/** The payment could not be recorded. Nothing was sent. */
+	| 'ASSET_PAYMENT_NOT_RECORDED'
+	/** An ordinary payment was directed over an asset channel. */
+	| 'ASSET_CHANNEL_NEEDS_ASSET_PAYMENT';
+
+/**
+ * An asset payment refused before anything left this node, or an ordinary
+ * payment refused because its route leaves over an asset channel. Carries
+ * the reason as a code and the channel it concerns.
+ */
+export class AuxiliaryPaymentError extends CodedError<AuxiliaryPaymentErrorCode> {
+	/** The asset channel the refusal concerns, as channel id hex. */
+	readonly channelId: string;
+
+	constructor(
+		code: AuxiliaryPaymentErrorCode,
+		channelId: Buffer | string,
+		message: string
+	) {
+		const hex = Buffer.isBuffer(channelId)
+			? channelId.toString('hex')
+			: channelId;
+		super(code, `${message} (channel ${hex})`);
+		this.name = 'AuxiliaryPaymentError';
+		this.channelId = hex;
+	}
+}
+
+/** What sendPaymentToRoute takes beyond its positional arguments. */
+export interface ISendToRouteOptions {
+	/**
+	 * The asset side of the payment. The HTLC leaves over this asset channel
+	 * carrying these records and this much bitcoin, while the route and the
+	 * onion keep the amounts the payment is worth. Never retried by the
+	 * node: each attempt names its channel and brings its own records.
+	 */
+	assetPayment?: IAuxiliaryPayment;
 }
 
 /** A channel open refused for the caller's own arguments. */

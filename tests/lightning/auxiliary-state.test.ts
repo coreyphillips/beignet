@@ -803,7 +803,13 @@ describe('asset channel state in the channel row', () => {
 				storage,
 				auxiliaryChannels: {
 					provider: configured,
-					resolveIncoming: (): undefined => undefined
+					resolveIncoming: (): undefined => undefined,
+					// The row holds outcomes its host has not taken yet. A host
+					// that still does not take them keeps them; one that asks
+					// for none would have them dropped.
+					onHtlcResolved: (): never => {
+						throw new Error('not taken');
+					}
 				}
 			});
 			nodes.push(alice);

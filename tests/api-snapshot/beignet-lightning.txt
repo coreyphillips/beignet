@@ -994,7 +994,7 @@ method channel.Channel.abortDualFunding(reason?: string): channel.ChannelAction[
 method channel.Channel.abortFforEpoch(reason?: ffor.FforAbortReason, text?: string): channel.ChannelAction[]
 method channel.Channel.abortSplice(reason?: string): channel.ChannelAction[]
 method channel.Channel.acceptsNewHtlcs(lookThroughReestablish?: boolean, reservationHint?: boolean): boolean
-method channel.Channel.addHtlc(amountMsat: bigint, paymentHash: Buffer, cltvExpiry: number, onionRoutingPacket: Buffer, blindingPoint?: Buffer, skimmedFeeMsat?: bigint): channel.ChannelAction[]
+method channel.Channel.addHtlc(amountMsat: bigint, paymentHash: Buffer, cltvExpiry: number, onionRoutingPacket: Buffer, blindingPoint?: Buffer, skimmedFeeMsat?: bigint, customRecords?: message.CustomRecords): channel.ChannelAction[]
 method channel.Channel.addTxInput(input: interactiveTx.IInteractiveTxInput): channel.ChannelAction[]
 method channel.Channel.addTxOutput(output: interactiveTx.IInteractiveTxOutput): channel.ChannelAction[]
 method channel.Channel.adoptRemoteForwardingPolicy(policy: channel.IRemoteForwardingPolicy): boolean
@@ -1305,7 +1305,7 @@ method channel.ChannelManager.abortDualFundedOpen(channelId: Buffer, reason?: st
 method channel.ChannelManager.abortFforEpoch(channelId: Buffer, reason?: ffor.FforAbortReason, text?: string): channel.ChannelResult
 method channel.ChannelManager.abortPendingOpen(channel: channel.Channel, reason: string): void
 method channel.ChannelManager.abortSplice(channelId: Buffer, reason?: string): channel.ChannelResult
-method channel.ChannelManager.addHtlc(channelId: Buffer, amountMsat: bigint, paymentHash: Buffer, cltvExpiry: number, onionRoutingPacket: Buffer, blindingPoint?: Buffer, skimmedFeeMsat?: bigint, options?: { emitRefusal?: boolean; }): channel.ChannelResult
+method channel.ChannelManager.addHtlc(channelId: Buffer, amountMsat: bigint, paymentHash: Buffer, cltvExpiry: number, onionRoutingPacket: Buffer, blindingPoint?: Buffer, skimmedFeeMsat?: bigint, options?: { emitRefusal?: boolean; customRecords?: message.CustomRecords; expectedHtlcId?: bigint; }): channel.ChannelResult
 method channel.ChannelManager.addTrustedPeer(pubkeyHex: string): void
 method channel.ChannelManager.armChannelIndexTipFloor(knownTipHeight?: number): void
 method channel.ChannelManager.attachToPeerManager(peerManager: transport.PeerManager): void
@@ -1478,6 +1478,7 @@ property channel.ChannelManagerEvents.'watchtower:backup': (channelId: Buffer, p
 property channel.ChannelManagerEvents.error: (channelId: Buffer | null, message: string, code?: channel.ChannelErrorCode) => void
 interface channel.ChannelResult
 property channel.ChannelResult.actions: channel.ChannelAction[]
+property channel.ChannelResult.admissionRejected?: boolean
 property channel.ChannelResult.code?: channel.ChannelErrorCode
 property channel.ChannelResult.error?: string
 property channel.ChannelResult.ok: boolean
@@ -1607,11 +1608,20 @@ method channel.IAuxiliaryChannelConfig.prepareForwardHtlc?(context: channel.IAux
 property channel.IAuxiliaryChannelConfig.provider: channel.IChannelAuxiliaryProvider
 method channel.IAuxiliaryChannelConfig.resolveForwardChannel?(context: channel.IAuxiliaryForwardContext): { channelId: Buffer; peerPubkey: string; } | undefined
 method channel.IAuxiliaryChannelConfig.resolveIncoming(peerPubkey: string, temporaryChannelId: Buffer): channel.IAuxiliaryFundingDescriptor | undefined
-method channel.IAuxiliaryChannelConfig.valueIncomingHtlc?(context: channel.IAuxiliaryIncomingHtlc): bigint
+method channel.IAuxiliaryChannelConfig.valueIncomingHtlc?(context: channel.IAuxiliaryIncomingHtlc): bigint | undefined
+interface channel.IAuxiliaryChannelHtlc
+property channel.IAuxiliaryChannelHtlc.auxiliaryAmount?: bigint
+property channel.IAuxiliaryChannelHtlc.cltvExpiry: number
+property channel.IAuxiliaryChannelHtlc.customRecords: message.CustomRecords
+property channel.IAuxiliaryChannelHtlc.direction: 'offered' | 'received'
+property channel.IAuxiliaryChannelHtlc.htlcId: bigint
+property channel.IAuxiliaryChannelHtlc.paymentHash: Buffer
+property channel.IAuxiliaryChannelHtlc.wireAmountMsat: bigint
 interface channel.IAuxiliaryChannelInfo
 property channel.IAuxiliaryChannelInfo.channelData: Buffer
 property channel.IAuxiliaryChannelInfo.channelId: Buffer
 property channel.IAuxiliaryChannelInfo.dustLimitSatoshis: bigint
+property channel.IAuxiliaryChannelInfo.htlcs: channel.IAuxiliaryChannelHtlc[]
 property channel.IAuxiliaryChannelInfo.localAssetBalance: bigint
 property channel.IAuxiliaryChannelInfo.localBalanceMsat: bigint
 property channel.IAuxiliaryChannelInfo.nextLocalHtlcId: bigint
@@ -1684,6 +1694,7 @@ property channel.IAuxiliaryHtlcResolution.outcome: 'fulfilled' | 'failed'
 property channel.IAuxiliaryHtlcResolution.paymentHash: Buffer
 interface channel.IAuxiliaryIncomingHtlc
 property channel.IAuxiliaryIncomingHtlc.acceptedHtlcs: readonly { channelId: Buffer; htlcId: bigint; amountMsat: bigint; }[]
+property channel.IAuxiliaryIncomingHtlc.auxiliaryAmount?: bigint
 property channel.IAuxiliaryIncomingHtlc.channelId: Buffer
 property channel.IAuxiliaryIncomingHtlc.customRecords: message.CustomRecords
 property channel.IAuxiliaryIncomingHtlc.hopPayload: onion.IHopPayload
@@ -1719,6 +1730,11 @@ property channel.IAuxiliaryPayment.channelId: Buffer
 property channel.IAuxiliaryPayment.customRecords: message.CustomRecords
 property channel.IAuxiliaryPayment.expectedHtlcId?: bigint
 property channel.IAuxiliaryPayment.wireAmountMsat: bigint
+interface channel.IAuxiliaryPaymentHtlc
+property channel.IAuxiliaryPaymentHtlc.amountMsat: bigint
+property channel.IAuxiliaryPaymentHtlc.channelId: Buffer
+property channel.IAuxiliaryPaymentHtlc.htlc?: channel.IAuxiliaryChannelHtlc
+property channel.IAuxiliaryPaymentHtlc.htlcId: bigint
 interface channel.IAuxiliaryRevokedChildContext
 property channel.IAuxiliaryRevokedChildContext.childTemplate: bitcoinjs-lib#Transaction
 property channel.IAuxiliaryRevokedChildContext.cltvExpiry: number
@@ -5218,11 +5234,14 @@ property message.ITxSignaturesMessage.channelId: Buffer
 property message.ITxSignaturesMessage.sharedInputSignature?: Buffer
 property message.ITxSignaturesMessage.txid: Buffer
 property message.ITxSignaturesMessage.witnesses: Buffer[][]
+interface message.IUpdateAddHtlcDecodeOptions
+property message.IUpdateAddHtlcDecodeOptions.customRecords?: boolean
 interface message.IUpdateAddHtlcMessage
 property message.IUpdateAddHtlcMessage.amountMsat: bigint
 property message.IUpdateAddHtlcMessage.blindingPoint?: Buffer
 property message.IUpdateAddHtlcMessage.channelId: Buffer
 property message.IUpdateAddHtlcMessage.cltvExpiry: number
+property message.IUpdateAddHtlcMessage.customRecords?: message.CustomRecords
 property message.IUpdateAddHtlcMessage.id: bigint
 property message.IUpdateAddHtlcMessage.onionRoutingPacket: Buffer
 property message.IUpdateAddHtlcMessage.paymentHash: Buffer
@@ -5373,7 +5392,7 @@ function message.decodeTxInitRbfMessage(payload: Buffer): message.ITxInitRbfMess
 function message.decodeTxRemoveInputMessage(payload: Buffer): message.ITxRemoveInputMessage
 function message.decodeTxRemoveOutputMessage(payload: Buffer): message.ITxRemoveOutputMessage
 function message.decodeTxSignaturesMessage(payload: Buffer): message.ITxSignaturesMessage
-function message.decodeUpdateAddHtlcMessage(payload: Buffer): message.IUpdateAddHtlcMessage
+function message.decodeUpdateAddHtlcMessage(payload: Buffer, options?: message.IUpdateAddHtlcDecodeOptions): message.IUpdateAddHtlcMessage
 function message.decodeUpdateBlockheightMessage(payload: Buffer): message.IUpdateBlockheightMessage
 function message.decodeUpdateFailHtlcMessage(payload: Buffer): message.IUpdateFailHtlcMessage
 function message.decodeUpdateFailMalformedHtlcMessage(payload: Buffer): message.IUpdateFailMalformedHtlcMessage
@@ -5431,11 +5450,16 @@ function message.isConnectionError(msg: message.IErrorMessage): boolean
 function message.isRequiredMessageType(type: number): boolean
 function message.messageTypeName(type: number): string
 function message.readBigSizeParts(data: Buffer, offset: number, out: { hi: number; lo: number; }): number
+function message.sameCustomRecords(a?: message.CustomRecords, b?: message.CustomRecords): boolean
 namespace node
 class node.AuxiliaryChannelRowError extends beignet#CodedError<'AUXILIARY_CHANNEL_ROW_INVALID'>
 constructor node.AuxiliaryChannelRowError(rows: ReadonlyArray<{ channelId: string; reason: string; }>)
 readonly property node.AuxiliaryChannelRowError.channelIds: readonly string[]
 readonly property node.AuxiliaryChannelRowError.reasons: ReadonlyMap<string, string>
+class node.AuxiliaryPaymentError extends beignet#CodedError<node.AuxiliaryPaymentErrorCode>
+constructor node.AuxiliaryPaymentError(code: node.AuxiliaryPaymentErrorCode, channelId: Buffer | string, message: string)
+readonly property node.AuxiliaryPaymentError.channelId: string
+type node.AuxiliaryPaymentErrorCode = 'ASSET_PAYMENT_INVALID' | 'ASSET_PAYMENT_CHANNEL_MISMATCH' | 'ASSET_PAYMENT_ROUTE_REQUIRED' | 'ASSET_PAYMENT_UNSUPPORTED' | 'ASSET_PAYMENT_CIRCUIT_CHANGED' | 'ASSET_PAYMENT_NOT_RECORDED' | 'ASSET_CHANNEL_NEEDS_ASSET_PAYMENT'
 class node.AuxiliaryProviderRequiredError extends beignet#CodedError<'AUXILIARY_PROVIDER_REQUIRED'>
 constructor node.AuxiliaryProviderRequiredError(channelIds: readonly string[])
 readonly property node.AuxiliaryProviderRequiredError.channelIds: readonly string[]
@@ -5497,6 +5521,7 @@ property node.IChannelHealth.remoteBalancePct: number
 property node.IChannelHealth.state: string
 property node.IChannelHealth.warnings: string[]
 interface node.IChannelInfo
+property node.IChannelInfo.auxiliary?: true
 property node.IChannelInfo.channelId: Buffer
 property node.IChannelInfo.channelType: Buffer | null
 property node.IChannelInfo.closeStatus?: node.ICloseStatus
@@ -5999,6 +6024,8 @@ property node.ISendPaymentOptions.maxCltvExpiryHeight?: number
 property node.ISendPaymentOptions.maxFeeMsat?: bigint
 property node.ISendPaymentOptions.metadata?: Record<string, string>
 property node.ISendPaymentOptions.policyOverrides?: Map<string, gossip.IChannelUpdateMessage>
+interface node.ISendToRouteOptions
+property node.ISendToRouteOptions.assetPayment?: channel.IAuxiliaryPayment
 interface node.ISpliceRefusal
 property node.ISpliceRefusal.code: node.SpliceRefusalCode
 property node.ISpliceRefusal.error: string
@@ -6102,6 +6129,7 @@ method node.LightningNode.getAsyncReceiveServiceMetrics(): asyncPayments.IAsyncR
 method node.LightningNode.getAuxiliaryAdvertisement(): node.IAuxiliaryAdvertisement
 method node.LightningNode.getAuxiliaryChannelInfo(channelId: Buffer): channel.IAuxiliaryChannelInfo | undefined
 method node.LightningNode.getAuxiliaryHtlcMode(peerPubkey: string): 'fixed' | 'legacy'
+method node.LightningNode.getAuxiliaryPaymentHtlcs(paymentHash: Buffer): channel.IAuxiliaryPaymentHtlc[]
 method node.LightningNode.getBalance(): node.ILightningBalance
 method node.LightningNode.getChainWatcher(): chain.ChainWatcher | null
 method node.LightningNode.getChannel(channelId: Buffer): node.IChannelInfo | undefined
@@ -6216,6 +6244,7 @@ method node.LightningNode.provideV2ExternalWitness(channelId: Buffer, prevTxid: 
 method node.LightningNode.provisionFforIssuer(channelIdHex: string, issuerNodeIdHex: string, opts: { offer: offer.IOffer; witnessHops: ffor.IFforIssuerHop[]; issueUntil?: number; timeoutMs?: number; }): Promise<{ mailboxId: Buffer; blindedNodeIds: Buffer[]; }>
 method node.LightningNode.provisionFforWitness(channelIdHex: string, witnessNodeIdHex: string, opts?: { retentionUntil?: number; minReceipts?: number; timeoutMs?: number; }): Promise<{ mailboxId: Buffer; retentionUntil: number; }>
 method node.LightningNode.pruneCompletedPayments(): number
+method node.LightningNode.queryAuxiliaryRoute(channelId: Buffer, destination: Buffer, amountMsat: bigint, maxFirstHopMsat: bigint, finalCltvExpiry?: number, routingHints?: invoice.IRoutingHintHop[][]): gossip.IRoute | null
 method node.LightningNode.queryRoute(destination: Buffer, amountMsat: bigint, finalCltvExpiry?: number): gossip.IRoute | null
 method node.LightningNode.quoteDualFundingMaxOpen(satsPerVbyte: number): { feeratePerKw: number; fundingSatoshis: bigint; spendableSats: bigint; feeSats: bigint; inputCount: number; }
 method node.LightningNode.quotePayAll(invoiceStr: string, maxFeeMsat: bigint): node.IPayAllQuote
@@ -6248,7 +6277,7 @@ method node.LightningNode.sendOnionMessage(destination: Buffer, messageData: Map
 method node.LightningNode.sendPayAll(invoiceStr: string, debitMsat: bigint, maxFeeMsat: bigint, metadata?: Record<string, string>): node.IPaymentInfo
 method node.LightningNode.sendPayment(invoiceStr: string, excludedChannels?: Set<string>, maxFeeMsat?: bigint, amountMsat?: bigint, maxCltvExpiryHeight?: number, policyOverrides?: gossip.TPolicyOverrides, metadata?: Record<string, string>): node.IPaymentInfo
 method node.LightningNode.sendPaymentAsync(invoiceStr: string, timeoutMs?: number, maxFeeMsat?: bigint, amountMsat?: bigint, maxCltvExpiryHeight?: number): Promise<node.IPaymentInfo>
-method node.LightningNode.sendPaymentToRoute(route: { hops: Array<{ pubkey: Buffer; shortChannelId: Buffer; amountToForwardMsat: bigint; outgoingCltvValue: number; encryptedRecipientData?: Buffer; blindingPoint?: Buffer; }>; }, paymentHash: Buffer, finalCltvExpiry: number, paymentSecret?: Buffer, totalMsat?: bigint, metadata?: Record<string, string>, payAll?: node.IPayAllBudget, paymentMetadata?: Buffer): node.IPaymentInfo
+method node.LightningNode.sendPaymentToRoute(route: { hops: Array<{ pubkey: Buffer; shortChannelId: Buffer; amountToForwardMsat: bigint; outgoingCltvValue: number; encryptedRecipientData?: Buffer; blindingPoint?: Buffer; }>; }, paymentHash: Buffer, finalCltvExpiry: number, paymentSecret?: Buffer, totalMsat?: bigint, metadata?: Record<string, string>, payAll?: node.IPayAllBudget, paymentMetadata?: Buffer, options?: node.ISendToRouteOptions): node.IPaymentInfo
 method node.LightningNode.sendPaymentWithOptions(invoiceStr: string, options?: node.ISendPaymentOptions): node.IPaymentInfo
 method node.LightningNode.sendRawCustomMessage(peerPubkeyHex: string, type: number, payload: Buffer): void
 method node.LightningNode.sendTxSignatures(channelId: Buffer, txid: Buffer, outputIndex: number, witnesses: Buffer[][]): { ok: boolean; error?: string; }

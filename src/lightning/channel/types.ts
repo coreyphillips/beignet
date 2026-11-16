@@ -626,6 +626,12 @@ export interface ChannelResult {
 	actions: import('./channel-actions').ChannelAction[];
 	error?: string;
 	/**
+	 * Set on a refused addHtlc that admitted nothing: no HTLC id was spent
+	 * and the channel is as it was. A caller that reserved something for the
+	 * exact HTLC id it expected releases it on this.
+	 */
+	admissionRejected?: boolean;
+	/**
 	 * The batch's messages did not reach the wire. Either a failed persist
 	 * withheld them, which only a reconnect retries, or the quorum durability
 	 * barrier parked them, which a refused release then drops. Set by the entry

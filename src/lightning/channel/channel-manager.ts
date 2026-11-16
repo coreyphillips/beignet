@@ -9,6 +9,7 @@
 import { auxiliaryProviderError } from './auxiliary';
 import { auxiliaryUnsupported } from './auxiliary-guard';
 import { auxiliaryChannelOpens } from './auxiliary-switch';
+import type { CustomRecords } from '../message/custom-records';
 import { TypedEmitter } from '../../utils/typed-emitter';
 import type { TxidHex } from '../../utils/identifiers';
 import type { ChannelManagerEvents } from './events';
@@ -1916,7 +1917,16 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		onionRoutingPacket: Buffer,
 		blindingPoint?: Buffer,
 		skimmedFeeMsat?: bigint,
-		options?: { emitRefusal?: boolean }
+		options?: {
+			emitRefusal?: boolean;
+			/** The asset side of the HTLC. Only an asset channel takes them. */
+			customRecords?: CustomRecords;
+			/**
+			 * The HTLC id the caller prepared this add for. When the channel's
+			 * next id is another, nothing is added.
+			 */
+			expectedHtlcId?: bigint;
+		}
 	): ChannelResult {
 		const emitRefusal = options?.emitRefusal !== false;
 		const idHex = channelId.toString('hex');
@@ -1924,22 +1934,32 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		if (!channel) {
 			const error = `Channel not found: ${idHex}`;
 			if (emitRefusal) this.emit('error', channelId, error);
-			return { ok: false, actions: [], error };
+			return { ok: false, actions: [], error, admissionRejected: true };
 		}
 		const peerPubkey = this.channelPeers.get(idHex);
 		if (!peerPubkey) {
 			const error = `Peer not found for channel: ${idHex}`;
 			if (emitRefusal) this.emit('error', channelId, error);
-			return { ok: false, actions: [], error };
+			return { ok: false, actions: [], error, admissionRejected: true };
 		}
 
+		const nextHtlcId = channel.getFullState().localHtlcCounter;
+		if (
+			options?.expectedHtlcId !== undefined &&
+			options.expectedHtlcId !== nextHtlcId
+		) {
+			const error = `Asset HTLC circuit changed before admission (channel ${idHex})`;
+			if (emitRefusal) this.emit('error', channelId, error);
+			return { ok: false, actions: [], error, admissionRejected: true };
+		}
 		const actions = channel.addHtlc(
 			amountMsat,
 			paymentHash,
 			cltvExpiry,
 			onionRoutingPacket,
 			blindingPoint,
-			skimmedFeeMsat
+			skimmedFeeMsat,
+			options?.customRecords
 		);
 		// A refused add changed nothing in the channel and its ERROR carries no
 		// cleanup, so dropping it from the dispatch only drops the event.
@@ -1958,7 +1978,11 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		if (channel.getChannelId()) {
 			this.autoSignAndSendCommitment(channel.getChannelId()!);
 		}
-		return this.resultFromActions(actions);
+		const result = this.resultFromActions(actions);
+		// A refused add that spent no HTLC id admitted nothing.
+		return !result.ok && channel.getFullState().localHtlcCounter === nextHtlcId
+			? { ...result, admissionRejected: true }
+			: result;
 	}
 
 	/**
@@ -3059,6 +3083,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			}
 			this.channels.set(channelId.toString('hex'), channel);
 			this.channelPeers.set(channelId.toString('hex'), peerPubkey);
+			this._notifyAuxiliaryResolutions(channel);
 			// After registering: the listener looks the channel up.
 			this._handOffRevokedCommitments(
 				channelId,
@@ -5189,7 +5214,11 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 	private handleUpdateAddHtlc(peerPubkey: string, payload: Buffer): void {
 		let msg: ReturnType<typeof decodeUpdateAddHtlcMessage>;
 		try {
-			msg = decodeUpdateAddHtlcMessage(payload);
+			// Custom records are read on an asset channel only; for any other
+			// the standard reader stands.
+			msg = decodeUpdateAddHtlcMessage(payload, {
+				customRecords: this.readsCustomRecords(payload)
+			});
 		} catch (err) {
 			this.failChannelForUndecodablePayload(
 				peerPubkey,
@@ -11206,6 +11235,50 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 	 * explicit `committed: true` releases them, so an implementation that
 	 * answers nothing, or throws, has written nothing.
 	 */
+	private readonly _auxiliaryResolutionsInFlight = new Set<string>();
+
+	/**
+	 * Tell the host of every asset HTLC that has left a channel
+	 * (onHtlcResolved). An outcome stays in the channel's row until the
+	 * callback returns for it, so one that throws, or a crash before it ran,
+	 * is delivered again; the callback is idempotent by contract. Called
+	 * once the write that holds the outcome has committed, so never inside
+	 * a storage transaction, and again when the channel is restored.
+	 */
+	private _notifyAuxiliaryResolutions(channel: Channel): void {
+		const callback = this.config.auxiliaryChannels?.onHtlcResolved;
+		const state = channel.getFullState();
+		const channelId = channel.getChannelId();
+		const peerPubkey = channelId && this.getPeerForChannel(channelId);
+		const records = state.auxiliaryState?.resolvedHtlcs;
+		if (!channelId || !peerPubkey || !records) return;
+		if (!callback) {
+			// A host that asks for no outcomes is owed none: nothing is kept
+			// for it, so the row does not grow by an entry per HTLC.
+			records.clear();
+			return;
+		}
+		for (const [key, resolution] of [...records]) {
+			const identity = `${channelId.toString('hex')}:${key}`;
+			if (this._auxiliaryResolutionsInFlight.has(identity)) continue;
+			this._auxiliaryResolutionsInFlight.add(identity);
+			try {
+				callback({ ...resolution, state, channelId, peerPubkey });
+				if (records.get(key) === resolution) records.delete(key);
+			} catch (error) {
+				this.emitContained(
+					'error',
+					channelId,
+					`Asset resolution callback failed (channel ${channelId.toString(
+						'hex'
+					)}): ${error instanceof Error ? error.message : String(error)}`
+				);
+			} finally {
+				this._auxiliaryResolutionsInFlight.delete(identity);
+			}
+		}
+	}
+
 	private _persistBatch(ctx: IDispatchContext): boolean {
 		const { channel, outbox } = ctx;
 		let result: IChannelPersistResult | undefined;
@@ -11267,6 +11340,9 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 				channel.getFforEpoch()?.state ?? null
 			);
 		}
+		// Only now is an outcome recorded by this batch on disk, and only
+		// then is the host told of it.
+		if (result?.committed === true) this._notifyAuxiliaryResolutions(channel);
 		return true;
 	}
 

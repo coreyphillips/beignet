@@ -146,7 +146,10 @@ import {
 	addChildRevocationRecord
 } from './child-revocation';
 import type { CustomRecords } from '../message/custom-records';
-import { copyCustomRecords } from '../message/custom-records';
+import {
+	copyCustomRecords,
+	sameCustomRecords
+} from '../message/custom-records';
 import {
 	bigIntMax,
 	bigIntMin,
@@ -3929,13 +3932,95 @@ export class Channel {
 		return [];
 	}
 
+	/**
+	 * Judge one HTLC of an asset channel before it enters the channel, and
+	 * note on it the asset units it carries. A channel without asset state
+	 * returns at once.
+	 *
+	 * The provider validates the HTLC and says how many units it carries.
+	 * None marks a plain bitcoin HTLC, which an asset channel takes from its
+	 * peer and never offers. An HTLC that carries units must come from a
+	 * side that holds them, and be large enough in bitcoin to keep an output
+	 * of its own on both commitments. Throws on anything else.
+	 */
+	private _prepareAuxiliaryHtlc(entry: IHtlcEntry): void {
+		const auxiliary = this._state.auxiliaryState;
+		if (!auxiliary) return;
+		const offered = entry.direction === HtlcDirection.OFFERED;
+		const provider = requireAuxiliaryProvider(this._state);
+		provider.validateHtlc(this._state, entry);
+		const amount = provider.getHtlcAmount(this._state, entry);
+		if (
+			typeof amount !== 'bigint' ||
+			amount < 0n ||
+			amount > 0xffffffffffffffffn
+		) {
+			throw new Error('invalid asset HTLC amount');
+		}
+		if (amount === 0n) {
+			if (offered) throw new Error('an asset channel offers only asset HTLCs');
+			return;
+		}
+		if (amount > (offered ? auxiliary.localBalance : auxiliary.remoteBalance)) {
+			throw new Error('insufficient asset balance');
+		}
+		const dust =
+			this._state.localConfig.dustLimitSatoshis >
+			this._state.remoteConfig.dustLimitSatoshis
+				? this._state.localConfig.dustLimitSatoshis
+				: this._state.remoteConfig.dustLimitSatoshis;
+		if (entry.amountMsat / 1000n < dust) {
+			throw new Error('asset HTLC carrier is below the negotiated dust limit');
+		}
+		entry.auxiliaryAmount = amount;
+	}
+
+	/**
+	 * Move an HTLC's asset units with its bitcoin: every place that debits
+	 * or credits a balance by an HTLC's amount calls this for the same side
+	 * with the same sign. Nothing moves for a channel without asset state or
+	 * an HTLC that carries no units.
+	 */
+	private _moveAuxiliaryBalance(
+		side: 'local' | 'remote',
+		entry: IHtlcEntry,
+		sign: 1n | -1n
+	): void {
+		const auxiliary = this._state.auxiliaryState;
+		if (!auxiliary || entry.auxiliaryAmount === undefined) return;
+		if (side === 'local')
+			auxiliary.localBalance += sign * entry.auxiliaryAmount;
+		else auxiliary.remoteBalance += sign * entry.auxiliaryAmount;
+	}
+
+	/**
+	 * Keep the outcome of an asset HTLC that has left the channel, in the
+	 * channel's own row, until the host has been told (onHtlcResolved).
+	 */
+	private _recordAuxiliaryResolution(entry: IHtlcEntry): void {
+		const auxiliary = this._state.auxiliaryState;
+		if (!auxiliary || entry.auxiliaryAmount === undefined) return;
+		auxiliary.resolvedHtlcs ??= new Map();
+		auxiliary.resolvedHtlcs.set(`${entry.direction}:${entry.id}`, {
+			htlcId: entry.id,
+			direction: entry.direction,
+			paymentHash: Buffer.from(entry.paymentHash),
+			auxiliaryAmount: entry.auxiliaryAmount,
+			...(entry.customRecords !== undefined
+				? { customRecords: copyCustomRecords(entry.customRecords) }
+				: {}),
+			outcome: entry.state === HtlcState.FULFILLED ? 'fulfilled' : 'failed'
+		});
+	}
+
 	addHtlc(
 		amountMsat: bigint,
 		paymentHash: Buffer,
 		cltvExpiry: number,
 		onionRoutingPacket: Buffer,
 		blindingPoint?: Buffer,
-		skimmedFeeMsat?: bigint
+		skimmedFeeMsat?: bigint,
+		customRecords?: CustomRecords
 	): ChannelAction[] {
 		if (
 			skimmedFeeMsat !== undefined &&
@@ -3946,6 +4031,8 @@ export class Channel {
 		const refusal = this.validateOutgoingHtlc(amountMsat, cltvExpiry);
 		if (refusal.length > 0) return refusal;
 		const htlcId = this._state.localHtlcCounter;
+		const carriesAssets =
+			this._state.auxiliaryState !== undefined || customRecords !== undefined;
 
 		const entry: IHtlcEntry = {
 			id: htlcId,
@@ -3964,20 +4051,6 @@ export class Channel {
 			...(blindingPoint ? { blindingPoint } : {})
 		};
 
-		// Asset channels: the provider is asked about the commitment this add
-		// leads to before the add exists anywhere.
-		const assetRefusal = this._auxiliaryRoundRefusal('an HTLC', {
-			localBalanceMsat: this._state.localBalanceMsat - amountMsat,
-			htlc: { key: `offered-${htlcId}`, entry }
-		});
-		if (assetRefusal) return assetRefusal;
-
-		this._state.localHtlcCounter++;
-		this._state.htlcs.set(`offered-${htlcId}`, entry);
-
-		// Deduct from local balance provisionally
-		this._state.localBalanceMsat -= amountMsat;
-
 		const msg: IUpdateAddHtlcMessage = {
 			channelId: this._state.channelId!,
 			id: htlcId,
@@ -3988,6 +4061,58 @@ export class Channel {
 			...(blindingPoint ? { blindingPoint } : {})
 		};
 		if (skimmedFeeMsat !== undefined) msg.skimmedFeeMsat = skimmedFeeMsat;
+
+		if (carriesAssets) {
+			// An asset channel offers only HTLCs that carry asset units, and
+			// only an asset channel carries custom records. Judged before the
+			// HTLC enters the channel, so a refusal spends no HTLC id and
+			// leaves nothing behind.
+			try {
+				if (!this._state.auxiliaryState) {
+					throw new Error('custom records need an asset channel');
+				}
+				if (customRecords !== undefined) {
+					entry.customRecords = copyCustomRecords(customRecords);
+					msg.customRecords = entry.customRecords;
+				}
+				this._prepareAuxiliaryHtlc(entry);
+				encodeUpdateAddHtlcMessage(msg);
+			} catch (error) {
+				return [
+					{
+						type: ChannelActionType.ERROR,
+						message: `Cannot add asset HTLC (channel ${this._state.channelId!.toString(
+							'hex'
+						)}): ${error instanceof Error ? error.message : String(error)}`
+					}
+				];
+			}
+		}
+
+		// Asset channels: the provider is asked about the commitment this add
+		// leads to before the add exists anywhere, so a refusal spends no HTLC
+		// id and leaves nothing behind.
+		const auxiliary = this._state.auxiliaryState;
+		const assetRefusal = this._auxiliaryRoundRefusal('an HTLC', {
+			localBalanceMsat: this._state.localBalanceMsat - amountMsat,
+			htlc: { key: `offered-${htlcId}`, entry },
+			...(auxiliary && entry.auxiliaryAmount !== undefined
+				? {
+						auxiliaryBalances: {
+							local: auxiliary.localBalance - entry.auxiliaryAmount,
+							remote: auxiliary.remoteBalance
+						}
+				  }
+				: {})
+		});
+		if (assetRefusal) return assetRefusal;
+
+		this._state.localHtlcCounter++;
+		this._state.htlcs.set(`offered-${htlcId}`, entry);
+
+		// Deduct from local balance provisionally
+		this._state.localBalanceMsat -= amountMsat;
+		this._moveAuxiliaryBalance('local', entry, -1n);
 
 		// We added an offered HTLC — we owe the remote a commitment_signed.
 		this._state.needsCommitment = true;
@@ -4072,7 +4197,8 @@ export class Channel {
 				existing.amountMsat === msg.amountMsat &&
 				existing.paymentHash.equals(msg.paymentHash) &&
 				existing.cltvExpiry === msg.cltvExpiry &&
-				existing.onionRoutingPacket.equals(msg.onionRoutingPacket)
+				existing.onionRoutingPacket.equals(msg.onionRoutingPacket) &&
+				sameCustomRecords(existing.customRecords, msg.customRecords)
 			) {
 				return [];
 			}
@@ -4384,8 +4510,25 @@ export class Channel {
 			// commitment and the node fails it back once committed.
 			...(this._state.fundingUnaccounted === true
 				? { addedWhileFundingUnaccounted: true }
+				: {}),
+			// Read only on an asset channel (the manager reads no custom
+			// records for any other).
+			...(msg.customRecords !== undefined
+				? { customRecords: copyCustomRecords(msg.customRecords) }
 				: {})
 		};
+
+		// An asset channel's HTLC is the provider's to validate: records it
+		// refuses, units its sender does not hold, or a carrier too small to
+		// keep an output cannot be committed to, and BOLT 2 gives no way to
+		// refuse an add on the wire.
+		try {
+			this._prepareAuxiliaryHtlc(entry);
+		} catch {
+			return this._failChannelWithWireError(
+				'Invalid asset HTLC metadata or balance'
+			);
+		}
 
 		// The reserve check above is measured against the reserve WE enforce,
 		// which on an asymmetric-dust channel can sit below our own dust limit.
@@ -4423,6 +4566,7 @@ export class Channel {
 
 		// Deduct from remote balance provisionally
 		this._state.remoteBalanceMsat -= msg.amountMsat;
+		this._moveAuxiliaryBalance('remote', entry, -1n);
 
 		// Note: HTLC_FORWARDED is NOT emitted here — per BOLT 2, HTLCs should
 		// only be processed after commitment_signed is verified and revoke_and_ack
@@ -6456,21 +6600,27 @@ export class Channel {
 				if (entry.direction === HtlcDirection.RECEIVED) {
 					// We received and fulfilled: credit our balance
 					this._state.localBalanceMsat += entry.amountMsat;
+					this._moveAuxiliaryBalance('local', entry, 1n);
 					this._retainSignedLocalRemoval(entry);
 				} else {
 					// We offered and remote fulfilled: credit remote balance
 					this._state.remoteBalanceMsat += entry.amountMsat;
+					this._moveAuxiliaryBalance('remote', entry, 1n);
 				}
+				this._recordAuxiliaryResolution(entry);
 				this._state.htlcs.delete(key);
 			} else if (entry.state === HtlcState.FAILED) {
 				if (entry.direction === HtlcDirection.RECEIVED) {
 					// We received but failed: refund remote balance
 					this._state.remoteBalanceMsat += entry.amountMsat;
+					this._moveAuxiliaryBalance('remote', entry, 1n);
 					this._retainSignedLocalRemoval(entry);
 				} else {
 					// We offered but it failed: refund our balance
 					this._state.localBalanceMsat += entry.amountMsat;
+					this._moveAuxiliaryBalance('local', entry, 1n);
 				}
+				this._recordAuxiliaryResolution(entry);
 				this._state.htlcs.delete(key);
 			}
 		}
@@ -10374,7 +10524,9 @@ export class Channel {
 			}
 			let msg: IUpdateAddHtlcMessage;
 			try {
-				msg = decodeUpdateAddHtlcMessage(update.payload);
+				msg = decodeUpdateAddHtlcMessage(update.payload, {
+					customRecords: this._state.auxiliaryState !== undefined
+				});
 			} catch {
 				// Undecodable: leave it exactly as it was rather than guess.
 				kept.push(update);
@@ -10400,6 +10552,7 @@ export class Channel {
 				// arithmetic handleRevokeAndAck applies to a terminally failed
 				// offered HTLC.
 				this._state.localBalanceMsat += entry.amountMsat;
+				this._moveAuxiliaryBalance('local', entry, 1n);
 			}
 			dropped.push({
 				htlcId: msg.id,
@@ -10651,6 +10804,7 @@ export class Channel {
 			) {
 				this._state.htlcs.delete(key);
 				this._state.remoteBalanceMsat += entry.amountMsat;
+				this._moveAuxiliaryBalance('remote', entry, 1n);
 				continue;
 			}
 			// A peer fulfill/fail of our offered HTLC never covered by the
