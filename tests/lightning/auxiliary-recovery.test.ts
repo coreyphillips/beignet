@@ -35,6 +35,7 @@ import {
 	restoreFromRecoveryCapsule
 } from '../../src/lightning/recovery';
 import { SqliteStorage } from '../../src/lightning/storage/sqlite-storage';
+import { isStorageTransactionActive } from '../../src/lightning/storage/transaction';
 import {
 	assetHost,
 	connectHosts,
@@ -402,6 +403,45 @@ describe('a restore that holds asset channels', () => {
 			(refusal as AuxiliaryProviderRequiredError).channelIds
 		).to.deep.equal([channelId.toString('hex')]);
 		expectUntouched(into);
+	});
+
+	it('asks the provider before the install opens: outside any storage transaction, with none of the rows of the restore to read, and for exactly the channels it then installs', async () => {
+		const { channelId, capsule } = await journaled();
+		for (const answer of [false, true]) {
+			const into = target();
+			const seen: Array<{ inside: boolean; rows: number }> = [];
+			const refusal = ((): unknown => {
+				try {
+					restoreFromRecoveryCapsule(capsule, into, SECRET, {
+						auxiliaryChannels: provider(() => {
+							seen.push({
+								inside: isStorageTransactionActive(into),
+								rows: into.loadAllChannels().length
+							});
+							// What the hook writes is its own, not the install's.
+							into.saveMetadata('provider:note', 'written by the hook');
+							return answer;
+						})
+					});
+				} catch (err) {
+					return err;
+				}
+				return undefined;
+			})();
+			expect(seen, String(answer)).to.deep.equal([{ inside: false, rows: 0 }]);
+			expect(into.loadMetadata('provider:note')).to.equal(
+				'written by the hook'
+			);
+			if (answer) {
+				expect(refusal).to.equal(undefined);
+				expect(
+					into.loadAllChannels().map((row) => row.channelId)
+				).to.deep.equal([channelId.toString('hex')]);
+			} else {
+				expect(refusal).to.be.instanceOf(AuxiliaryRestoreRefusedError);
+				expectUntouched(into);
+			}
+		}
 	});
 
 	it('is refused unless the provider says it can restore, and installs nothing', async () => {

@@ -7889,7 +7889,8 @@ property recovery.WriterLease.epoch: bigint
 property recovery.WriterLease.writerPublicKey: Buffer
 type recovery.WriterLeaseLoad = { state: 'missing'; journalEpoch: bigint | null; } | { state: 'present'; lease: recovery.IWriterLeaseKeys; }
 function recovery.acquireTranscriptHash(guardianSetId: Buffer, expectedState: recovery.GuardianState, newEpoch: bigint, newWriterPublicKey: Buffer): Buffer
-function recovery.assertAuxiliaryRestore(target: storage.IStorageBackend, auxiliaryChannels: channel.IAuxiliaryChannelConfig | undefined): void
+function recovery.assertAuxiliaryRestore(channels: ReadonlyArray<{ channelId: string; state: channel.IChannelState; peerPubkey: string; }>, auxiliaryChannels: channel.IAuxiliaryChannelConfig | undefined): string[]
+function recovery.assertAuxiliaryRestoreInstalled(target: storage.IStorageBackend, askedChannelIds: readonly string[]): void
 function recovery.assertDistinctGuardianMembers(bound: recovery.IBoundGuardianClient[], context: recovery.IGuardianSetContext): void
 function recovery.assertEmptyTarget(target: storage.IStorageBackend): void
 function recovery.assertFramesReconstructable(frames: recovery.RecoveryFrame[]): void
@@ -7907,6 +7908,7 @@ function recovery.boundFanOut<T>(bound: recovery.IBoundGuardianClient[], operati
 function recovery.buildGuardianRecovery(config: recovery.IGuardianAssemblyConfig): Promise<recovery.GuardianBootDecision>
 function recovery.chainLostBackfill(storage: storage.IStorageBackend): string | null
 function recovery.chainPromisedQuorum(storage: storage.IStorageBackend, masterKey: Buffer, nodeId: Buffer): boolean
+function recovery.channelsAfterReplay(frames: recovery.RecoveryFrame[]): Array<{ channelId: string; state: channel.IChannelState; peerPubkey: string; }>
 function recovery.composeRecoveryCapsule(options: recovery.IComposeCapsuleOptions): recovery.IComposedCapsule
 function recovery.computeGuardianSetId(profile: recovery.IGuardianSetProfile): Buffer
 function recovery.countReceiptQuorum(results: Array<recovery.IGuardianFanOutResult<{ receipt?: recovery.IGuardianReceipt; }>>, context: recovery.IGuardianSetContext, covers: (receiptState: recovery.GuardianState) => boolean): number

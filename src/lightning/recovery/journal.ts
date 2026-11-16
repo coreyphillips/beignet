@@ -24,6 +24,7 @@
  * originals, which is what makes the rebuilt tables byte-identical.
  */
 
+import type { IChannelState } from '../channel/channel-state';
 import { aes256GcmDecrypt, aes256GcmEncrypt } from '../crypto/provider';
 import { WIRE_SAFETY_POLICY_VERSION } from '../channel/channel-actions';
 import { deriveFrameIv } from './guardian-wire';
@@ -2440,6 +2441,48 @@ function baseSnapshotIndex(frames: RecoveryFrame[]): number {
 		}
 	}
 	return -1;
+}
+
+/**
+ * The channels reconstructFromFrames would leave in an empty target, read
+ * from the decoded frames alone: the base snapshot's rows, then every
+ * channel_state and channel_closed of the frames it replays, in order.
+ * Nothing is written and no backend is touched, so a restore can be judged
+ * by what it holds before its install transaction opens.
+ */
+export function channelsAfterReplay(frames: RecoveryFrame[]): Array<{
+	channelId: string;
+	state: IChannelState;
+	peerPubkey: string;
+}> {
+	const base = baseSnapshotIndex(frames);
+	if (base < 0) return [];
+	const channels = new Map<
+		string,
+		{ channelId: string; state: IChannelState; peerPubkey: string }
+	>();
+	for (const row of frames[base].snapshot!.channels) {
+		channels.set(row.channelId, {
+			channelId: row.channelId,
+			state: row.state,
+			peerPubkey: row.peerPubkey
+		});
+	}
+	const end = lastAppliedFrameIndex(frames);
+	for (let i = base + 1; i <= end; i++) {
+		for (const mutation of frames[i].mutations) {
+			if (mutation.type === 'channel_state') {
+				channels.set(mutation.channelId, {
+					channelId: mutation.channelId,
+					state: mutation.state,
+					peerPubkey: mutation.peerPubkey
+				});
+			} else if (mutation.type === 'channel_closed') {
+				channels.delete(mutation.channelId);
+			}
+		}
+	}
+	return [...channels.values()];
 }
 
 /**

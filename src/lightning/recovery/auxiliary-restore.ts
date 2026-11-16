@@ -225,19 +225,27 @@ export function auxiliaryRestoreRefusal(
 }
 
 /**
- * Throw unless the asset channels a restore just replayed into `target` may
- * be restored. Called inside the transaction that installs the restore, so
- * a throw leaves the target as it was. A target with no asset channel is
- * only read.
+ * Throw unless the asset channels among `channels`, the rows a restore is
+ * about to install, may be restored. Returns their ids, as channel id hex.
+ *
+ * Called BEFORE the transaction that installs the restore opens, with the
+ * rows read from the decoded frames (channelsAfterReplay): `canRestore` is
+ * the provider's code, and a hook that ran inside the install would read
+ * the uncommitted rows of the restore and have whatever it wrote to the
+ * same database made part of it. A restore with no asset channel asks
+ * nobody.
  */
 export function assertAuxiliaryRestore(
-	target: IStorageBackend,
+	channels: ReadonlyArray<{
+		channelId: string;
+		state: IChannelState;
+		peerPubkey: string;
+	}>,
 	auxiliaryChannels: IAuxiliaryChannelConfig | undefined
-): void {
-	const channels = target
-		.loadAllChannels()
-		.filter((row) => carriesAssetState(row.state))
-		.map(
+): string[] {
+	const held = channels.filter((row) => carriesAssetState(row.state));
+	const refusal = auxiliaryRestoreRefusal(
+		held.map(
 			(row): IAuxiliaryRestoredChannel => ({
 				channelId: Buffer.from(row.channelId, 'hex'),
 				peerPubkey: row.peerPubkey,
@@ -246,11 +254,33 @@ export function assertAuxiliaryRestore(
 					? { channelData: Buffer.from(row.state.auxiliaryState.channelData) }
 					: {})
 			})
-		);
-	const refusal = auxiliaryRestoreRefusal(
-		channels,
-		auxiliaryChannels,
-		target.unreadableAssetChannelIds?.() ?? []
+		),
+		auxiliaryChannels
 	);
 	if (refusal) throw refusal;
+	return held.map((row) => row.channelId);
+}
+
+/**
+ * Throw unless the asset channels a restore installed into `target` are
+ * exactly the ones that were asked about before it. Called inside the
+ * install transaction, where it only reads: the answer was given for those
+ * channels and no others, and a row that cannot be read back is one nobody
+ * answered for.
+ */
+export function assertAuxiliaryRestoreInstalled(
+	target: IStorageBackend,
+	askedChannelIds: readonly string[]
+): void {
+	const installed = storedAuxiliaryChannelIds(target).sort();
+	const asked = [...askedChannelIds].sort();
+	if (
+		installed.length !== asked.length ||
+		installed.some((id, index) => id !== asked[index])
+	) {
+		throw new AuxiliaryRestoreRefusedError(
+			[...new Set([...installed, ...asked])].sort(),
+			'the restore installed other asset channels than the ones it was asked about'
+		);
+	}
 }
