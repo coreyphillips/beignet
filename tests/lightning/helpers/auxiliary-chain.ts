@@ -190,6 +190,12 @@ export class TestChain {
 		{ tx: bitcoin.Transaction; fee: number; vsize: number }
 	>();
 	height = 100;
+	/**
+	 * A spend of a P2WSH output is taken on the hash of its witness script
+	 * alone, its script not run: for the channels older than taproot, whose
+	 * scripts this chain does not run. Off unless a test turns it on.
+	 */
+	witnessScriptsOnTrust = false;
 
 	private static key(txid: string, vout: number): string {
 		return `${txid}:${vout}`;
@@ -428,6 +434,22 @@ export class TestChain {
 	): void {
 		const input = tx.ins[index];
 		const output = spent[index];
+		if (
+			this.witnessScriptsOnTrust &&
+			output.script.length === 34 &&
+			output.script[0] === 0x00 &&
+			output.script[1] === 0x20
+		) {
+			const script = input.witness[input.witness.length - 1];
+			if (
+				!script ||
+				input.script.length !== 0 ||
+				!bitcoin.crypto.sha256(script).equals(output.script.subarray(2))
+			) {
+				throw new Error(`input ${index} does not show its witness script`);
+			}
+			return;
+		}
 		if (isP2wpkhOutput(output.script)) {
 			if (input.witness.length !== 2 || input.script.length !== 0) {
 				throw new Error(`input ${index} is not a P2WPKH spend`);
@@ -629,6 +651,7 @@ export class TestChainBackend implements IChainBackend {
 	readonly refused: Array<{ txid: string; reason: string }> = [];
 	private readonly headers: Array<(height: number) => void> = [];
 	private readonly scripts = new Map<string, Array<() => void>>();
+	private held: Array<() => void> | undefined;
 
 	constructor(readonly chain: TestChain) {
 		chain.attach(this);
@@ -639,13 +662,36 @@ export class TestChainBackend implements IChainBackend {
 		this.chain.detach(this);
 	}
 
+	/**
+	 * Keep what the chain announces from the node until `release`, so that a
+	 * test can let two nodes hear of the same block one after the other.
+	 */
+	hold(): void {
+		this.held ??= [];
+	}
+
+	/** Tell the node what the chain announced since `hold`, in order. */
+	release(): void {
+		const held = this.held ?? [];
+		this.held = undefined;
+		for (const tell of held) tell();
+	}
+
 	/** @internal */
 	announceBlock(height: number): void {
+		if (this.held) {
+			this.held.push(() => this.announceBlock(height));
+			return;
+		}
 		for (const heard of [...this.headers]) heard(height);
 	}
 
 	/** @internal */
 	announceScript(scriptHash: string): void {
+		if (this.held) {
+			this.held.push(() => this.announceScript(scriptHash));
+			return;
+		}
 		for (const heard of [...(this.scripts.get(scriptHash) ?? [])]) heard();
 	}
 
