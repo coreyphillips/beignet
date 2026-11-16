@@ -294,6 +294,12 @@ export interface LightningNodeEvents
 		channelId: Buffer | null;
 		text: string;
 	}) => void;
+	/** A registered experimental wire message, without an envelope. Networking supplies the authenticated Noise peer identity; external transports must authenticate handlePeerMessage's peer argument. */
+	'raw-custom-message': (message: {
+		peerPubkey: string;
+		type: number;
+		payload: Buffer;
+	}) => void;
 	/** A beignet custom message (type 44069) arrived from a peer. */
 	'custom-message': (message: {
 		peerPubkey: string;
