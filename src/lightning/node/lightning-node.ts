@@ -3593,6 +3593,10 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			this.htlcPaymentMap.set(key, paymentHashHex);
 		}
 
+		// Asset channels: an outgoing asset payment whose HTLC never entered
+		// its channel is ended here, before the node takes new work.
+		this.endAuxiliaryPaymentsNeverSent();
+
 		// Restore forwarded HTLCs
 		for (const {
 			outKey,
@@ -26385,6 +26389,215 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		}
 	}
 
+	/**
+	 * Asset channels, when the node is restored and before it takes new
+	 * work. An outgoing asset payment is recorded, with the HTLC id it was
+	 * prepared for, before its HTLC enters the channel. A stop between the
+	 * two leaves a PENDING record for an HTLC that never existed, under an
+	 * id the channel gives to its next HTLC. Such a part is in neither the
+	 * channel's HTLCs nor the outcomes the channel keeps, and the channel
+	 * has not handed its id out. It is taken off the record with its HTLC
+	 * mapping, a payment left with no HTLC in a channel ends FAILED in the
+	 * same write, and the host is told through onHtlcResolved with the
+	 * outcome 'never-sent', again at every restore until the callback has
+	 * returned.
+	 *
+	 * A part whose id the channel has handed out is left alone: it entered
+	 * the channel, and what became of it was reported as its outcome. An
+	 * ordinary payment is not looked at.
+	 */
+	private endAuxiliaryPaymentsNeverSent(): void {
+		if (!this.auxiliaryChannels) return;
+		for (const [hashHex, payment] of [...this.payments]) {
+			if (
+				payment.direction !== PaymentDirection.OUTGOING ||
+				(payment.auxiliary !== true && !payment.metadata?._auxiliaryChannelId)
+			) {
+				continue;
+			}
+			const paymentHash = Buffer.from(hashHex, 'hex');
+			try {
+				if (payment.status === PaymentStatus.PENDING) {
+					this.dropAuxiliaryPartsNeverSent(paymentHash, payment);
+				}
+				this.reportAuxiliaryPartsNeverSent(paymentHash, payment);
+			} catch (err) {
+				this.emitStructuredLog('payment', 'asset_never_sent_pass_failed', {
+					paymentHash: hashHex,
+					error: err instanceof Error ? err.message : String(err)
+				});
+			}
+		}
+	}
+
+	/** The first half of endAuxiliaryPaymentsNeverSent, for one PENDING record. */
+	private dropAuxiliaryPartsNeverSent(
+		paymentHash: Buffer,
+		payment: IPaymentInfo
+	): void {
+		const hashHex = paymentHash.toString('hex');
+		const neverSent: Record<string, string> = {};
+		const kept: Record<string, string> = {};
+		let live = false;
+		for (const [key, amount] of Object.entries(
+			this.auxiliaryPartAmounts(payment)
+		)) {
+			const [channelHex, htlcKey] = key.split(':');
+			const id = BigInt(htlcKey.slice('offered-'.length));
+			const state = this.channelManager
+				.getChannel(Buffer.from(channelHex, 'hex'))
+				?.getFullState();
+			const entry = state?.htlcs.get(htlcKey);
+			const inChannel =
+				entry !== undefined && entry.paymentHash.equals(paymentHash);
+			const outcome = state?.auxiliaryState?.resolvedHtlcs?.get(
+				`${HtlcDirection.OFFERED}:${id}`
+			);
+			const reported =
+				outcome !== undefined && outcome.paymentHash.equals(paymentHash);
+			if (
+				state?.auxiliaryState &&
+				!inChannel &&
+				!reported &&
+				state.localHtlcCounter <= id
+			) {
+				neverSent[key] = amount;
+				continue;
+			}
+			kept[key] = amount;
+			if (
+				inChannel &&
+				entry.state !== HtlcState.FULFILLED &&
+				entry.state !== HtlcState.FAILED
+			) {
+				live = true;
+			}
+		}
+		const dropped = Object.keys(neverSent);
+		if (dropped.length === 0) return;
+		const metadata: Record<string, string> = { ...payment.metadata };
+		if (Object.keys(kept).length > 0) {
+			metadata._auxiliaryPartAmounts = JSON.stringify(kept);
+		} else {
+			delete metadata._auxiliaryPartAmounts;
+		}
+		if (this.auxiliaryChannels?.onHtlcResolved) {
+			// Kept beside the payment until the host has been told.
+			metadata._auxiliaryNeverSent = JSON.stringify({
+				...this.auxiliaryNeverSentParts(payment),
+				...neverSent
+			});
+		}
+		payment.metadata = metadata;
+		const mutations: RecoveryMutation[] = [];
+		for (const key of dropped) {
+			if (this.htlcPaymentMap.get(key) !== hashHex) continue;
+			this.htlcPaymentMap.delete(key);
+			mutations.push({ type: 'delete_htlc_payment_mapping', htlcKey: key });
+		}
+		if (!live) {
+			payment.status = PaymentStatus.FAILED;
+			payment.completedAt = Date.now();
+			payment.failureReason = boundedFailureReason(
+				'The asset payment was recorded and never sent: its HTLC did not enter the channel'
+			);
+		}
+		mutations.push({ type: 'payment_state', paymentHash: hashHex, payment });
+		this.commitMutations(
+			'end an asset payment that never left',
+			mutations,
+			RecoveryCriticality.SafetyCritical
+		);
+		this.emitStructuredLog('payment', 'asset_payment_never_sent', {
+			paymentHash: hashHex,
+			parts: dropped.join(','),
+			status: payment.status
+		});
+		if (!live) {
+			// Nobody listens while the node is being built: the event is for
+			// whoever subscribes as soon as it is.
+			setImmediate(() => {
+				if (!this._destroyed) this.emit('payment:failed', payment);
+			});
+		}
+	}
+
+	/** The second half: tell the host of the parts it has not been told of. */
+	private reportAuxiliaryPartsNeverSent(
+		paymentHash: Buffer,
+		payment: IPaymentInfo
+	): void {
+		const callback = this.auxiliaryChannels?.onHtlcResolved;
+		if (!callback || !payment.metadata?._auxiliaryNeverSent) return;
+		const owed = this.auxiliaryNeverSentParts(payment);
+		let told = 0;
+		for (const key of Object.keys(owed)) {
+			const [channelHex, htlcKey] = key.split(':');
+			const channelId = Buffer.from(channelHex, 'hex');
+			const state = this.channelManager.getChannel(channelId)?.getFullState();
+			const peerPubkey = this.channelManager.getPeerForChannel(channelId);
+			if (!state || !peerPubkey) continue;
+			try {
+				callback({
+					htlcId: BigInt(htlcKey.slice('offered-'.length)),
+					direction: HtlcDirection.OFFERED,
+					paymentHash: Buffer.from(paymentHash),
+					auxiliaryAmount: 0n,
+					outcome: 'never-sent',
+					state,
+					peerPubkey,
+					channelId
+				});
+			} catch (err) {
+				this.emit('node:error', {
+					code: 'CHANNEL_ERROR',
+					message: `Asset resolution callback failed for a payment that never left (channel ${channelHex}): ${
+						err instanceof Error ? err.message : String(err)
+					}`,
+					timestamp: Date.now()
+				});
+				continue;
+			}
+			delete owed[key];
+			told++;
+		}
+		if (told === 0) return;
+		const metadata: Record<string, string> = { ...payment.metadata };
+		if (Object.keys(owed).length > 0) {
+			metadata._auxiliaryNeverSent = JSON.stringify(owed);
+		} else {
+			delete metadata._auxiliaryNeverSent;
+		}
+		payment.metadata = metadata;
+		this.persistPayment(paymentHash);
+	}
+
+	/** The parts of a payment that never left and the host has not been told of. */
+	private auxiliaryNeverSentParts(
+		payment: IPaymentInfo
+	): Record<string, string> {
+		const raw = payment.metadata?._auxiliaryNeverSent;
+		const parts: Record<string, string> = {};
+		if (!raw) return parts;
+		try {
+			const parsed: unknown = JSON.parse(raw);
+			if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+				return parts;
+			}
+			for (const [key, value] of Object.entries(parsed)) {
+				if (
+					/^[0-9a-f]{64}:offered-(0|[1-9][0-9]*)$/.test(key) &&
+					typeof value === 'string'
+				) {
+					parts[key] = value;
+				}
+			}
+		} catch {
+			// Nothing readable is owed.
+		}
+		return parts;
+	}
+
 	/** The hash a received HTLC is held for, when it is a part of a held set. */
 	private heldHashOf(channelId: Buffer, htlcId: bigint): string | undefined {
 		for (const [hashHex, parts] of this.heldHtlcs) {
@@ -29833,7 +30046,10 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	 * confirms from `customRecords` that an HTLC left with the records it
 	 * was sent with, and matches `onHtlcResolved` to one attempt by channel
 	 * and HTLC id. Empty for a hash that is not an asset payment of this
-	 * node, and for one whose record has been pruned.
+	 * node, and for one whose record has been pruned. A part whose HTLC never
+	 * entered its channel is not listed: it is reported through
+	 * `onHtlcResolved` with the outcome 'never-sent' when the node is
+	 * restored.
 	 */
 	getAuxiliaryPaymentHtlcs(paymentHash: Buffer): IAuxiliaryPaymentHtlc[] {
 		const payment = this.payments.get(paymentHash.toString('hex'));

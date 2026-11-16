@@ -192,9 +192,20 @@ export interface IAuxiliaryChannelConfig {
 	 * about.
 	 */
 	valueIncomingHtlc?(context: IAuxiliaryIncomingHtlc): bigint | undefined;
-	/** Idempotent durable callback, delivered again after a crash until acknowledged. */
+	/**
+	 * Idempotent durable callback, delivered again after a crash until
+	 * acknowledged.
+	 *
+	 * The outcome 'never-sent' is for a part of an outgoing asset payment
+	 * that was recorded and whose HTLC never entered its channel, because
+	 * the node stopped between the two. It is delivered when the node is
+	 * restored, with the HTLC id the part was prepared for, no units
+	 * (auxiliaryAmount is 0) and no custom records: nothing left the
+	 * channel, which gives that id to its next HTLC.
+	 */
 	onHtlcResolved?(
-		context: IAuxiliaryHtlcResolution & {
+		context: Omit<IAuxiliaryHtlcResolution, 'outcome'> & {
+			outcome: IAuxiliaryHtlcResolution['outcome'] | 'never-sent';
 			state: IChannelState;
 			peerPubkey: string;
 			channelId: Buffer;

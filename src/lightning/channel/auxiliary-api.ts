@@ -44,7 +44,10 @@ export const AUXILIARY_CHANNELS_API = Object.freeze({
 		'IInvoiceInfo.auxiliary',
 		// How many outcomes of a channel's asset HTLCs its host has not
 		// taken, beside the channel's other figures.
-		'IAuxiliaryChannelInfo.undeliveredOutcomes'
+		'IAuxiliaryChannelInfo.undeliveredOutcomes',
+		// onHtlcResolved also reports, with the outcome 'never-sent', a part
+		// of an outgoing asset payment whose HTLC never entered its channel.
+		'onHtlcResolved:never-sent'
 	] as const)
 });
 

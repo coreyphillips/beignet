@@ -1518,7 +1518,8 @@ describe('Asset payments (issue #2093, step 8)', function () {
 				'IPaymentInfo.auxiliary',
 				'IPaymentInfo.auxiliaryValueMsat',
 				'IInvoiceInfo.auxiliary',
-				'IAuxiliaryChannelInfo.undeliveredOutcomes'
+				'IAuxiliaryChannelInfo.undeliveredOutcomes',
+				'onHtlcResolved:never-sent'
 			]);
 			expect(Object.isFrozen(api)).to.equal(true);
 			expect(Object.isFrozen(api.surfaces)).to.equal(true);
