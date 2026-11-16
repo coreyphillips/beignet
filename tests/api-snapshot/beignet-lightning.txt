@@ -4610,6 +4610,7 @@ const invoice.BECH32_MAX_LIMIT = 65535
 const invoice.DEFAULT_EXPIRY = 3600
 const invoice.DEFAULT_MIN_FINAL_CLTV_EXPIRY = 40
 interface invoice.IDecodeOptions
+property invoice.IDecodeOptions.lndBlindedPaths?: boolean
 property invoice.IDecodeOptions.recoverSigner?: boolean
 interface invoice.IFallbackAddress
 property invoice.IFallbackAddress.hash: Buffer
@@ -6835,6 +6836,7 @@ function onion.decodeBlindedPayInfos(buf: Buffer): onion.IBlindedPayInfo[]
 function onion.decodeFailureCode(code: number): { name: string; hasChannelUpdate: boolean; }
 function onion.decodeHopPayload(buf: Buffer, offset: number): { payload: onion.IHopPayload; bytesRead: number; }
 function onion.decodeInvoiceBlindedPaymentPaths(buf: Buffer): onion.IBlindedPaymentPath[]
+function onion.decodeLndInvoiceBlindedPath(bytes: Buffer): onion.IBlindedPaymentPath
 function onion.decodeOnionPacket(buf: Buffer): onion.IOnionPacket
 function onion.decodeTruncatedUint(buf: Buffer): bigint
 function onion.decryptBlindedData(encryptionKey: Buffer, ciphertext: Buffer): Buffer

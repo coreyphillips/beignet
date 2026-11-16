@@ -26,6 +26,7 @@ import {
 	isValidPublicKey
 } from '../crypto/ecdh';
 import { encodeTlvStream, decodeTlvStream } from '../message/tlv';
+import { decodeBigSize } from '../message/codec';
 
 export interface IBlindedHop {
 	/** The blinded (tweaked) node ID */
@@ -620,6 +621,66 @@ export function decodeInvoiceBlindedPaymentPaths(
 		entries.push({ path: p.path, payInfo: info.info });
 	}
 	return entries;
+}
+
+/**
+ * Decode one blinded payment path in the framing of LND's BOLT 11 tag 20
+ * (zpay32): payinfo, the path key, a hop count of one to seven, then each
+ * hop's key and its BigSize-prefixed encrypted data. The first hop is
+ * named by the introduction node's own key, which is also what comes back
+ * as `introductionNodeId`. Read only: the engine writes its blinded paths
+ * under its own tag (encodeInvoiceBlindedPaymentPaths).
+ */
+export function decodeLndInvoiceBlindedPath(
+	bytes: Buffer
+): IBlindedPaymentPath {
+	if (bytes.length > 639) throw new Error('Oversized BOLT 11 blinded path');
+	const decoded = decodeBlindedPayInfo(bytes, 0);
+	let offset = decoded.offset;
+	if (offset + 34 > bytes.length) {
+		throw new Error('Truncated BOLT 11 blinded path');
+	}
+	const blindingPoint = Buffer.from(bytes.subarray(offset, offset + 33));
+	offset += 33;
+	const count = bytes[offset++];
+	if (!isValidPublicKey(blindingPoint) || count < 1 || count > 7) {
+		throw new Error('Invalid BOLT 11 blinded path');
+	}
+	const hops: IBlindedHop[] = [];
+	for (let index = 0; index < count; index++) {
+		if (offset + 33 > bytes.length) {
+			throw new Error('Truncated BOLT 11 blinded hop');
+		}
+		const blindedNodeId = Buffer.from(bytes.subarray(offset, offset + 33));
+		offset += 33;
+		const size = decodeBigSize(bytes, offset);
+		offset += size.bytesRead;
+		if (
+			!isValidPublicKey(blindedNodeId) ||
+			size.value > 535n ||
+			offset + Number(size.value) > bytes.length
+		) {
+			throw new Error('Invalid BOLT 11 blinded hop');
+		}
+		hops.push({
+			blindedNodeId,
+			encryptedData: Buffer.from(
+				bytes.subarray(offset, offset + Number(size.value))
+			)
+		});
+		offset += Number(size.value);
+	}
+	if (offset !== bytes.length) {
+		throw new Error('Trailing BOLT 11 blinded path bytes');
+	}
+	return {
+		path: {
+			introductionNodeId: Buffer.from(hops[0].blindedNodeId),
+			blindingPoint,
+			blindedHops: hops
+		},
+		payInfo: decoded.info
+	};
 }
 
 /**

@@ -18489,12 +18489,25 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		return edges;
 	}
 
+	/**
+	 * Decode a BOLT 11 invoice this node is asked to pay or to price. LND's
+	 * blinded payment path field (tag 20) is read only on a node with asset
+	 * channels configured (issue #2093). On every other node it stays the
+	 * unknown field it has always been, so no invoice reads differently
+	 * there.
+	 */
+	private decodeBolt11(invoiceStr: string): ReturnType<typeof decodeInvoice> {
+		return this.auxiliaryChannels
+			? decodeInvoice(invoiceStr, { lndBlindedPaths: true })
+			: decodeInvoice(invoiceStr);
+	}
+
 	private decodePayAllInvoice(
 		invoiceStr: string
 	): ReturnType<typeof decodeInvoice> {
 		let invoice: ReturnType<typeof decodeInvoice>;
 		try {
-			invoice = decodeInvoice(invoiceStr);
+			invoice = this.decodeBolt11(invoiceStr);
 		} catch {
 			throw new LightningPaymentError(
 				LightningErrorCode.INVALID_INVOICE,
@@ -18710,7 +18723,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		// this call is not mistaken for the retry.
 		const redispatching = this.redispatchingRetryContext;
 		this.redispatchingRetryContext = undefined;
-		const invoice = decodeInvoice(invoiceStr);
+		const invoice = this.decodeBolt11(invoiceStr);
 		// The payee is found by node id alone, so an invoice for another chain
 		// would pay whichever node holds that key on ours.
 		if (invoice.network !== this.network) {
@@ -19937,7 +19950,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		if (ctx.bolt12Invoice) return ctx.bolt12Invoice.paths?.length ?? 0;
 		if (!ctx.invoiceStr) return 0;
 		try {
-			return decodeInvoice(ctx.invoiceStr).blindedPaths?.length ?? 0;
+			return this.decodeBolt11(ctx.invoiceStr).blindedPaths?.length ?? 0;
 		} catch {
 			return 0;
 		}
@@ -29650,7 +29663,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	} | null {
 		this.requireGraph('estimateRouteFee');
 		try {
-			const decoded = decodeInvoice(bolt11);
+			const decoded = this.decodeBolt11(bolt11);
 			// Same precedence sendPayment applies (see estimatePayment).
 			const amountMsat =
 				decoded.amountMsat ??
@@ -29705,7 +29718,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	): IPaymentEstimate | null {
 		this.requireGraph('estimatePayment');
 		try {
-			const decoded = decodeInvoice(bolt11);
+			const decoded = this.decodeBolt11(bolt11);
 			// The precedence sendPayment applies: a fixed invoice is paid for its
 			// ENCODED amount and the override serves an amountless one, so an
 			// estimate built on the override describes a payment that will never
@@ -35963,7 +35976,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		amountMsat?: bigint,
 		maxCltvExpiryHeight?: number
 	): Promise<IPaymentInfo> {
-		const invoice = decodeInvoice(invoiceStr);
+		const invoice = this.decodeBolt11(invoiceStr);
 		const paymentHashHex = invoice.paymentHash.toString('hex');
 
 		return new Promise<IPaymentInfo>((resolve, reject) => {

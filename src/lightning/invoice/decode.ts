@@ -18,7 +18,10 @@ import { parseHrp } from './amount';
 import { wordsToBuffer, decodeUintFromWords, decodeTaggedField } from './words';
 import { verifyInvoice, verifyInvoiceSignature } from './signing';
 import type { IBlindedPaymentPath } from '../onion/blinded-path';
-import { decodeInvoiceBlindedPaymentPaths } from '../onion/blinded-path';
+import {
+	decodeInvoiceBlindedPaymentPaths,
+	decodeLndInvoiceBlindedPath
+} from '../onion/blinded-path';
 import { decodeBolt1String } from '../message/field-rules';
 
 /**
@@ -67,7 +70,20 @@ export interface IDecodeOptions {
 	 * out.
 	 */
 	recoverSigner?: boolean;
+	/**
+	 * Read LND's blinded payment path field (tag 20, one path per field) into
+	 * `blindedPaths`, ahead of any path under the engine's own tag. Off by
+	 * default, and then the field is what it has always been here: an unknown
+	 * tag, kept in `unknownTags` and never looked into. A node turns it on
+	 * when asset channels are configured (issue #2093). With it on, a field
+	 * that is not a well-formed path fails the decode. Nothing here changes
+	 * what is written: the encoder knows only tag 25.
+	 */
+	lndBlindedPaths?: boolean;
 }
+
+/** LND's blinded payment path tag (zpay32). Read on request, never written. */
+const LND_BLINDED_PATH_TAG = 20;
 
 /**
  * Decode a BOLT 11 invoice string into a structured object.
@@ -112,6 +128,7 @@ export function decode(
 	const unknownTags: Array<{ type: number; words: number[] }> = [];
 	const routingHints: IRoutingHintHop[][] = [];
 	let blindedPaths: IBlindedPaymentPath[] | undefined;
+	let lndBlindedPaths: IBlindedPaymentPath[] | undefined;
 	const seenSingleTags = new Set<number>();
 
 	let offset = 0;
@@ -184,6 +201,15 @@ export function decode(
 				);
 				break;
 			default:
+				if (
+					options.lndBlindedPaths === true &&
+					field.type === LND_BLINDED_PATH_TAG
+				) {
+					(lndBlindedPaths ??= []).push(
+						decodeLndInvoiceBlindedPath(wordsToBuffer(field.dataWords))
+					);
+					break;
+				}
 				unknownTags.push({ type: field.type, words: field.dataWords });
 				break;
 		}
@@ -270,6 +296,9 @@ export function decode(
 	}
 	if (routingHints.length > 0) {
 		invoice.routingHints = routingHints;
+	}
+	if (lndBlindedPaths) {
+		blindedPaths = [...lndBlindedPaths, ...(blindedPaths ?? [])];
 	}
 	if (blindedPaths && blindedPaths.length > 0) {
 		invoice.blindedPaths = blindedPaths;
