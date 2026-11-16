@@ -295,6 +295,7 @@ import type {
 	IRebalanceExecutionSummary,
 	IRebalanceResult
 } from '../lightning/node/types';
+import type { AuxiliaryPaymentGate } from '../lightning/node/types';
 import {
 	AuxiliaryProviderRequiredError,
 	InvalidRequestError,
@@ -2476,6 +2477,8 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	private recoveryNodeConfig?: INodeConfig['recovery'];
 	/** The asset channel support of the node last built, for a restore to ask. */
 	private _restoreAuxiliaryChannels?: INodeConfig['auxiliaryChannels'];
+	/** Whether the node being built runs asset channels, and so gets the gate. */
+	private _gatesAssetPayments = false;
 	/** The assembled run decision (guardian modes only). */
 	private _recoveryRun?: Extract<GuardianBootDecision, { kind: 'run' }>;
 	/** The env named a guardian set the journal has since rotated away from. */
@@ -3514,6 +3517,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 		// Kept for a restore this process runs later: it is refused when it
 		// holds asset channels this provider does not say it can restore.
 		this._restoreAuxiliaryChannels = auxiliary?.auxiliaryChannels;
+		this._gatesAssetPayments = auxiliary !== undefined;
 
 		// 5. Create electrum backend for chain monitoring
 		const electrumBackend = new ElectrumBackend(this.wallet.electrum);
@@ -3954,6 +3958,15 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 			recovery: this.recoveryNodeConfig
 		});
 		this._nodeConstructMs = Date.now() - constructStarted;
+		// An asset payment leaves through the extension that holds the node,
+		// not through a route of this daemon, so the node itself asks the
+		// wallet's limits about it (issue #2093). Only a node that runs asset
+		// channels can send one.
+		if (this._gatesAssetPayments) {
+			this.node.setAuxiliaryPaymentGate((payment) =>
+				this.admitAssetPayment(payment)
+			);
+		}
 		// A deferred restore of the stored network map reports when it ends.
 		this.node.on('graph:restored', () => {
 			const stats = this.getGraphRestoreStats();
@@ -16325,6 +16338,64 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 			this._releaseAsyncSpendClaim(claim);
 		}
 		return this.toPaymentInfo(payment);
+	}
+
+	/**
+	 * The gate on every asset payment this node originates (issue #2093,
+	 * step 13): admitted exactly as sendToRoute admits a route. Drain mode,
+	 * the per-payment and daily limits, and a claim on the daily budget
+	 * under the payment hash, all on what the route asks the first hop to
+	 * carry, in sats: the payment's worth and every routing fee, and never
+	 * less than the bitcoin its HTLC carries. The settlement is charged by
+	 * the payment:sent handler in create(), which finds the claim under the
+	 * hash as it does for every other pay path.
+	 *
+	 * A refusal is returned with its own code (SPENDING_LIMIT_EXCEEDED,
+	 * SERVICE_DRAINING) and its sentence, and reaches whoever sent the
+	 * payment as AuxiliaryPaymentError ASSET_PAYMENT_REFUSED with that code
+	 * in `reason`. Nothing was recorded or sent, and nothing is claimed.
+	 */
+	private admitAssetPayment(
+		payment: Parameters<AuxiliaryPaymentGate>[0]
+	): ReturnType<AuxiliaryPaymentGate> {
+		const sentMsat =
+			payment.routeAmountMsat > payment.wireAmountMsat
+				? payment.routeAmountMsat
+				: payment.wireAmountMsat;
+		let claim: AsyncSpendClaim | undefined;
+		try {
+			this._checkDraining();
+			claim = this._admitLightningSpend(
+				payment.paymentHash.toString('hex'),
+				sentMsat,
+				0n
+			);
+		} catch (err) {
+			if (err instanceof BeignetError) {
+				return { reason: err.code, message: err.message };
+			}
+			throw err;
+		}
+		if (claim) {
+			// The send that asked is synchronous and is not this daemon's to
+			// wrap. Once it has returned or thrown, a claim whose payment
+			// dispatched nothing holds no budget (issue #474): the engine
+			// refused it after the gate, with no record or a failed one.
+			const held = claim;
+			const paymentHash = Buffer.from(payment.paymentHash);
+			queueMicrotask(() => {
+				if (!held.reserved) return;
+				try {
+					if (this.node.hasHtlcInFlight(paymentHash)) return;
+					const record = this.node.getPayment(paymentHash);
+					if (record?.status === PaymentStatus.PENDING) return;
+				} catch {
+					// A node that cannot answer is one that sends nothing.
+				}
+				this._releaseAsyncSpendClaim(held);
+			});
+		}
+		return undefined;
 	}
 
 	// ─────────────── Channel Readiness Helpers ───────────────

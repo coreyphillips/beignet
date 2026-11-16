@@ -1961,9 +1961,18 @@ export type AuxiliaryPaymentErrorCode =
 	/** The channel holds more outcomes its host has not taken (onHtlcResolved) than it keeps. Nothing was sent. */
 	| 'ASSET_OUTCOMES_UNDELIVERED';
 
+/** A gate's refusal that names its own stable reason beside the sentence. */
+export interface IAuxiliaryPaymentRefusal {
+	/** The gate's own code for the refusal, for a caller to branch on. */
+	reason: string;
+	message: string;
+}
+
 /**
  * Judges an outgoing asset payment before anything of it is recorded or
- * sent: undefined lets it through, a string is the reason it is refused.
+ * sent: undefined lets it through, a string is the reason it is refused,
+ * and an IAuxiliaryPaymentRefusal is that with the gate's own stable code,
+ * which the refusal then carries as `AuxiliaryPaymentError.reason`.
  */
 export type AuxiliaryPaymentGate = (payment: {
 	paymentHash: Buffer;
@@ -1973,7 +1982,12 @@ export type AuxiliaryPaymentGate = (payment: {
 	amountMsat: bigint;
 	/** The bitcoin its HTLC carries on the wire. */
 	wireAmountMsat: bigint;
-}) => string | undefined;
+	/**
+	 * What the route asks its first hop to carry: the payment's worth and
+	 * every routing fee, which is what leaves this node for it.
+	 */
+	routeAmountMsat: bigint;
+}) => string | IAuxiliaryPaymentRefusal | undefined;
 
 /**
  * An asset payment refused before anything left this node, or an ordinary
@@ -1983,11 +1997,17 @@ export type AuxiliaryPaymentGate = (payment: {
 export class AuxiliaryPaymentError extends CodedError<AuxiliaryPaymentErrorCode> {
 	/** The asset channel the refusal concerns, as channel id hex. */
 	readonly channelId: string;
+	/**
+	 * With ASSET_PAYMENT_REFUSED, the refusing gate's own stable code for
+	 * it, when the gate gave one.
+	 */
+	readonly reason?: string;
 
 	constructor(
 		code: AuxiliaryPaymentErrorCode,
 		channelId: Buffer | string,
-		message: string
+		message: string,
+		reason?: string
 	) {
 		const hex = Buffer.isBuffer(channelId)
 			? channelId.toString('hex')
@@ -1995,6 +2015,7 @@ export class AuxiliaryPaymentError extends CodedError<AuxiliaryPaymentErrorCode>
 		super(code, `${message} (channel ${hex})`);
 		this.name = 'AuxiliaryPaymentError';
 		this.channelId = hex;
+		if (reason !== undefined) this.reason = reason;
 	}
 }
 

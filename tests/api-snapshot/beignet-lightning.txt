@@ -5539,10 +5539,11 @@ constructor node.AuxiliaryChannelRowError(rows: ReadonlyArray<{ channelId: strin
 readonly property node.AuxiliaryChannelRowError.channelIds: readonly string[]
 readonly property node.AuxiliaryChannelRowError.reasons: ReadonlyMap<string, string>
 class node.AuxiliaryPaymentError extends beignet#CodedError<node.AuxiliaryPaymentErrorCode>
-constructor node.AuxiliaryPaymentError(code: node.AuxiliaryPaymentErrorCode, channelId: Buffer | string, message: string)
+constructor node.AuxiliaryPaymentError(code: node.AuxiliaryPaymentErrorCode, channelId: Buffer | string, message: string, reason?: string)
 readonly property node.AuxiliaryPaymentError.channelId: string
+readonly property node.AuxiliaryPaymentError.reason?: string
 type node.AuxiliaryPaymentErrorCode = 'ASSET_PAYMENT_INVALID' | 'ASSET_PAYMENT_CHANNEL_MISMATCH' | 'ASSET_PAYMENT_ROUTE_REQUIRED' | 'ASSET_PAYMENT_UNSUPPORTED' | 'ASSET_PAYMENT_CIRCUIT_CHANGED' | 'ASSET_PAYMENT_NOT_RECORDED' | 'ASSET_CHANNEL_NEEDS_ASSET_PAYMENT' | 'ASSET_PAYMENT_REFUSED' | 'ASSET_OUTCOMES_UNDELIVERED'
-type node.AuxiliaryPaymentGate = (payment: { paymentHash: Buffer; channelId: Buffer; amountMsat: bigint; wireAmountMsat: bigint; }) => string | undefined
+type node.AuxiliaryPaymentGate = (payment: { paymentHash: Buffer; channelId: Buffer; amountMsat: bigint; wireAmountMsat: bigint; routeAmountMsat: bigint; }) => string | node.IAuxiliaryPaymentRefusal | undefined
 class node.AuxiliaryProviderRequiredError extends beignet#CodedError<'AUXILIARY_PROVIDER_REQUIRED'>
 constructor node.AuxiliaryProviderRequiredError(channelIds: readonly string[])
 readonly property node.AuxiliaryProviderRequiredError.channelIds: readonly string[]
@@ -5594,6 +5595,9 @@ property node.IAutoTuneFeesConfig.enabled?: boolean
 property node.IAutoTuneFeesConfig.floorPpm?: number
 property node.IAutoTuneFeesConfig.intervalMs?: number
 type node.IAuxiliaryAdvertisement = { advertised: true; } | { advertised: false; reason: string; }
+interface node.IAuxiliaryPaymentRefusal
+property node.IAuxiliaryPaymentRefusal.message: string
+property node.IAuxiliaryPaymentRefusal.reason: string
 interface node.IChannelHealth
 property node.IChannelHealth.capacitySats: number
 property node.IChannelHealth.channelId: string

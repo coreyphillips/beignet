@@ -19307,23 +19307,29 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			// asset payment yet). Asked before anything is recorded or sent.
 			const gate = this.auxiliaryPaymentGate;
 			if (gate) {
-				let refusal: string | undefined;
+				let refusal: ReturnType<AuxiliaryPaymentGate>;
 				try {
 					refusal = gate({
 						paymentHash: Buffer.from(paymentHash),
 						channelId: Buffer.from(assetPayment.channelId),
 						amountMsat: route.hops[route.hops.length - 1].amountToForwardMsat,
-						wireAmountMsat: assetPayment.wireAmountMsat
+						wireAmountMsat: assetPayment.wireAmountMsat,
+						routeAmountMsat: route.hops[0].amountToForwardMsat
 					});
 				} catch (err) {
 					// A gate that cannot answer has not let the payment through.
 					refusal = err instanceof Error ? err.message : String(err);
 				}
 				if (refusal !== undefined) {
+					const said =
+						typeof refusal === 'object' && refusal !== null
+							? refusal
+							: { message: String(refusal), reason: undefined };
 					throw new AuxiliaryPaymentError(
 						'ASSET_PAYMENT_REFUSED',
 						assetPayment.channelId,
-						String(refusal) || 'The asset payment was refused'
+						String(said.message ?? '') || 'The asset payment was refused',
+						typeof said.reason === 'string' ? said.reason : undefined
 					);
 				}
 			}
