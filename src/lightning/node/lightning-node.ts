@@ -15601,7 +15601,11 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		// held one does not do is count as ACTIVE, and the advisor decides
 		// that from htlcUsable, which already answers false for it (issue
 		// #469).
-		const channels = this.listChannels();
+		//
+		// An asset channel is left out: its bitcoin only carries asset
+		// outputs, so it is neither liquidity to send or receive with nor a
+		// channel the advisor may recommend anything for.
+		const channels = this.listChannels().filter((ch) => !ch.auxiliary);
 		const snapshots: IChannelSnapshot[] = channels.map((ch) => {
 			const channelIdHex = ch.channelId.toString('hex');
 			const reestablishKey = `reestablish:${channelIdHex}`;
@@ -15659,28 +15663,32 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	 * sized toward 50/50. Pure planning -- nothing is executed.
 	 */
 	planRebalanceRecommendations(minImbalancePct?: number): IRebalancePlan[] {
-		const snapshots: IChannelSnapshot[] = this.listChannels().map((ch) => ({
-			channelId: ch.channelId.toString('hex'),
-			state: ch.state as string,
-			localBalanceMsat: ch.localBalanceMsat,
-			remoteBalanceMsat: ch.remoteBalanceMsat,
-			capacitySats: Number(ch.fundingSatoshis),
-			peerPubkey: ch.peerPubkey,
-			// A rebalance is two new HTLCs, so a channel that refuses them
-			// cannot be either leg. The planner reads this rather than the
-			// state, for the same reason the advisor does (issue #469).
-			htlcUsable: ch.htlcUsable,
-			...(ch.restoreRecencyUnproven === true
-				? { restoreRecencyUnproven: true }
-				: {}),
-			...(ch.reestablishRecencyUnproven === true
-				? { reestablishRecencyUnproven: true }
-				: {}),
-			...(ch.reestablishSecretMissing === true
-				? { reestablishSecretMissing: true }
-				: {}),
-			...(ch.restoreRevokedRisk === true ? { restoreRevokedRisk: true } : {})
-		}));
+		// An asset channel is never a leg of a rebalance: it carries no
+		// bitcoin payment.
+		const snapshots: IChannelSnapshot[] = this.listChannels()
+			.filter((ch) => !ch.auxiliary)
+			.map((ch) => ({
+				channelId: ch.channelId.toString('hex'),
+				state: ch.state as string,
+				localBalanceMsat: ch.localBalanceMsat,
+				remoteBalanceMsat: ch.remoteBalanceMsat,
+				capacitySats: Number(ch.fundingSatoshis),
+				peerPubkey: ch.peerPubkey,
+				// A rebalance is two new HTLCs, so a channel that refuses them
+				// cannot be either leg. The planner reads this rather than the
+				// state, for the same reason the advisor does (issue #469).
+				htlcUsable: ch.htlcUsable,
+				...(ch.restoreRecencyUnproven === true
+					? { restoreRecencyUnproven: true }
+					: {}),
+				...(ch.reestablishRecencyUnproven === true
+					? { reestablishRecencyUnproven: true }
+					: {}),
+				...(ch.reestablishSecretMissing === true
+					? { reestablishSecretMissing: true }
+					: {}),
+				...(ch.restoreRevokedRisk === true ? { restoreRevokedRisk: true } : {})
+			}));
 		const plans = planRebalances(snapshots, {
 			minImbalancePct:
 				minImbalancePct ?? this.autoRebalanceConfig.minImbalancePct
@@ -31496,6 +31504,8 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	private usableChannelWith(peerHex: string): Buffer | null {
 		for (const channel of this.listChannels()) {
 			if (channel.peerPubkey !== peerHex) continue;
+			// An asset channel is not spliced and carries no bitcoin payment.
+			if (channel.auxiliary) continue;
 			if (channel.state !== ChannelState.NORMAL) continue;
 			return channel.channelId;
 		}
@@ -31513,6 +31523,9 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	private liveChannelWith(peerHex: string): Buffer | null {
 		for (const channel of this.listChannels()) {
 			if (channel.peerPubkey !== peerHex) continue;
+			// An asset channel receives no bitcoin payment: a wallet that has
+			// only that one with its LSP still needs a channel of its own.
+			if (channel.auxiliary) continue;
 			if (
 				channel.state !== ChannelState.NORMAL &&
 				channel.state !== ChannelState.SPLICING

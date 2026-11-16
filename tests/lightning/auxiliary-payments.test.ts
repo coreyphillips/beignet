@@ -368,6 +368,45 @@ describe('Asset payments (issue #2093, step 8)', function () {
 			expect(balance.auxiliaryBalanceMsat).to.equal(
 				assetState.localBalanceMsat
 			);
+			// The liquidity the node reports, and what it plans rebalances
+			// from, is its ordinary channel alone.
+			const liquidity = alice.node.getLiquiditySnapshot();
+			expect(liquidity.channelCount).to.equal(1);
+			expect(liquidity.totalCapacitySats).to.equal(
+				Number(ordinaryRow.fundingSatoshis)
+			);
+			expect(liquidity.totalLocalBalanceSats).to.equal(
+				Number(ordinaryRow.localBalanceMsat / 1000n)
+			);
+			expect(
+				JSON.stringify(
+					[
+						liquidity.recommendations,
+						alice.node.planRebalanceRecommendations()
+					],
+					(_key, value) =>
+						typeof value === 'bigint' ? value.toString() : value
+				)
+			).to.not.include(channelId.toString('hex'));
+			// What picks a channel with a peer for a splice, or decides that a
+			// wallet already has one to receive on, passes the asset channel
+			// by, though it was opened first.
+			const choosers = alice.node as unknown as {
+				usableChannelWith(peer: string): Buffer | null;
+				liveChannelWith(peer: string): Buffer | null;
+			};
+			expect(
+				same(
+					choosers.usableChannelWith(bob.node.getNodeId()),
+					ordinaryRow.channelId
+				)
+			).to.equal(true);
+			expect(
+				same(
+					choosers.liveChannelWith(bob.node.getNodeId()),
+					ordinaryRow.channelId
+				)
+			).to.equal(true);
 			const plain = plainHost(`aux-pay-plain-${where}`, 5, { sqlite });
 			hosts.push(plain);
 			expect('auxiliaryBalanceMsat' in plain.node.getBalance()).to.equal(false);
