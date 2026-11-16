@@ -8053,6 +8053,28 @@ property script.IPenaltyTxParams.revocationPrivkey: Buffer
 property script.IPenaltyTxParams.revokedTx: bitcoinjs-lib#Transaction
 property script.IPenaltyTxParams.toLocalWitnessScript?: Buffer
 property script.IPenaltyTxParams.witnessScripts: Map<number, Buffer>
+interface script.ITaprootAuxLeaf
+property script.ITaprootAuxLeaf.leafVersion?: number
+property script.ITaprootAuxLeaf.script: Buffer
+interface script.ITaprootCommitOutput
+property script.ITaprootCommitOutput.address: string
+property script.ITaprootCommitOutput.output: Buffer
+property script.ITaprootCommitOutput.outputKey: Buffer
+interface script.ITaprootFundingScript
+property script.ITaprootFundingScript.address: string
+property script.ITaprootFundingScript.internalKey: Buffer
+property script.ITaprootFundingScript.outputKey: Buffer
+property script.ITaprootFundingScript.p2trOutput: Buffer
+property script.ITaprootFundingScript.tweak: Buffer
+interface script.ITaprootHtlcOutput extends script.ITaprootCommitOutput
+property script.ITaprootHtlcOutput.internalKey: Buffer
+property script.ITaprootHtlcOutput.merkleRoot: Buffer
+property script.ITaprootHtlcOutput.success: script.ITaprootLeafSpend
+property script.ITaprootHtlcOutput.timeout: script.ITaprootLeafSpend
+interface script.ITaprootLeafSpend
+property script.ITaprootLeafSpend.controlBlock: Buffer
+property script.ITaprootLeafSpend.leafVersion: number
+property script.ITaprootLeafSpend.script: Buffer
 function script.buildAnchorOutput(fundingPubkey: Buffer): { script: Buffer; witnessScript: Buffer; }
 function script.buildAnchorScript(fundingPubkey: Buffer): Buffer
 function script.buildCommitmentTx(params: script.ICommitmentTxParams): script.ICommitmentTxResult
@@ -8063,12 +8085,16 @@ function script.buildHtlcTimeoutTx(htlcTxid: string, htlcOutputIndex: number, ht
 function script.buildOfferedHtlcScript(revocationPubkey: Buffer, localHtlcPubkey: Buffer, remoteHtlcPubkey: Buffer, paymentHash: Buffer, useAnchors?: boolean): Buffer
 function script.buildPenaltyTx(params: script.IPenaltyTxParams): bitcoinjs-lib#Transaction
 function script.buildReceivedHtlcScript(revocationPubkey: Buffer, localHtlcPubkey: Buffer, remoteHtlcPubkey: Buffer, paymentHash: Buffer, cltvExpiry: number, useAnchors?: boolean): Buffer
+function script.buildTaprootOfferedHtlcOutput(revocationPubkey: Buffer, localHtlcPubkey: Buffer, remoteHtlcPubkey: Buffer, paymentHash: Buffer, network?: bitcoinjs-lib#Network, auxiliaryLeaf?: channel.ITaprootAuxLeaf): script.ITaprootHtlcOutput
+function script.buildTaprootReceivedHtlcOutput(revocationPubkey: Buffer, localHtlcPubkey: Buffer, remoteHtlcPubkey: Buffer, paymentHash: Buffer, cltvExpiry: number, network?: bitcoinjs-lib#Network, auxiliaryLeaf?: channel.ITaprootAuxLeaf): script.ITaprootHtlcOutput
+function script.buildTaprootSecondLevelOutput(revocationPubkey: Buffer, localDelayedPubkey: Buffer, toSelfDelay: number, network?: bitcoinjs-lib#Network, auxiliaryLeaf?: channel.ITaprootAuxLeaf): script.ITaprootCommitOutput & { merkleRoot: Buffer; delay: script.ITaprootLeafSpend; }
 function script.buildToLocalPenaltyWitness(signature: Buffer, witnessScript: Buffer): Buffer[]
 function script.buildToLocalScript(revocationPubkey: Buffer, localDelayedPubkey: Buffer, toSelfDelay: number, leaseCsv?: number): Buffer
 function script.buildToRemoteAnchorOutput(remotePubkey: Buffer, leaseCsv?: number): { script: Buffer; witnessScript: Buffer; }
 function script.buildToRemoteAnchorScript(remotePubkey: Buffer, leaseCsv?: number): Buffer
 function script.calculateObscuredCommitmentNumber(openPaymentBasepoint: Buffer, acceptPaymentBasepoint: Buffer, commitmentNumber: bigint): bigint
 function script.createFundingScript(localFundingPubkey: Buffer, remoteFundingPubkey: Buffer, network?: bitcoinjs-lib#Network): script.IFundingScript
+function script.createTaprootFundingScript(localFundingPubkey: Buffer, remoteFundingPubkey: Buffer, network?: bitcoinjs-lib#Network, merkleRoot?: Buffer): script.ITaprootFundingScript
 function script.csvFromToLocalScript(witnessScript: Buffer): number | undefined
 function script.estimatePenaltyTxFee(outputIndices: number[], witnessScripts: Map<number, Buffer>, feeRatePerVbyte: number, destinationScript?: Buffer): number
 function script.getFundingScriptHash(witnessScript: Buffer): Buffer
