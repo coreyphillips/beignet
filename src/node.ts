@@ -22,6 +22,27 @@ export {
 } from './cli/errors';
 export { CodedError } from './utils/errors';
 export {
+	ExtensionError,
+	EXTENSION_API,
+	EXTENSION_API_VERSION,
+	EXTENSION_MAX_BODY_BYTES
+} from './cli/extension';
+export type {
+	ExtensionHandler,
+	ExtensionMethod,
+	ExtensionNetwork,
+	ExtensionScope,
+	ExtensionState,
+	ExtensionStopReason,
+	IBeignetExtension,
+	IExtensionAttachment,
+	IExtensionContext,
+	IExtensionInfo,
+	IExtensionRequest,
+	IExtensionRoute,
+	IExtensionStorage
+} from './cli/extension';
+export {
 	PaymentQueue,
 	IPaymentQueueStorage,
 	PaymentQueueOptions,

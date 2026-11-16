@@ -21,6 +21,7 @@ Every document in the repository, by what it is for. A test (`tests/lightning/do
 | [MPP-SENDING.md](MPP-SENDING.md) | How a BOLT 11 payment splits over the wallet's channels, including channels to different peers, how parts are sized and what bounds their number |
 | [packages/direct-funding/README.md](../packages/direct-funding/README.md) | Standalone payer SDK, Bitcoin Core and PSBT adapters, transport, storage and regtest qualification |
 | [ZERO-RESERVE.md](ZERO-RESERVE.md) | Zero-reserve home channels (`option_zero_reserve`): policy and configuration |
+| [EXTENSIONS.md](EXTENSIONS.md) | Host extensions: code the operator names at start that runs inside the daemon with the wallet, its own rows in the database, routes under `/x/<id>` and events on the stream; the contract, the lifecycle across a rebuild, and what a failure does |
 | [PORCH.md](PORCH.md) | Porch links, a link to a node that does not say where it is: running a relay, pointing a node at it, handing out and revoking links, who learns what, and what each setup costs in speed |
 
 ## Reference

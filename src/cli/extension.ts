@@ -1,0 +1,1013 @@
+/**
+ * Host extensions: code the operator names at start that runs inside the
+ * daemon, beside the wallet it serves (docs/EXTENSIONS.md).
+ *
+ * An extension is a static description (id, routes, events) plus attach(),
+ * which the node calls once per build with the wallet, a storage view fenced
+ * to the extension's own keys, a logger and an event emitter. The daemon
+ * serves the routes under /x/<id>, behind the same authentication, scopes,
+ * rate limit, idempotency and error mapping as its own, and relays the
+ * events on GET /events as `<id>:<name>`.
+ *
+ * Two rules shape everything here:
+ *
+ * - A configuration the daemon cannot honour is refused before anything
+ *   starts: a malformed description, two extensions with one id, an
+ *   extension built for another version of this contract.
+ * - An extension that breaks while running never takes the wallet with it.
+ *   A throw from attach(), start(), stop() or status() is logged and
+ *   reported by GET /extensions, and the node carries on without it.
+ */
+
+import type { ILogger } from '../logger';
+import type { Wallet } from '../wallet';
+import type {
+	IMetadataScanStorage,
+	IStorageBackend
+} from '../lightning/storage/types';
+import { withStorageTransaction } from '../lightning/storage/transaction';
+import { BeignetError } from './errors';
+
+/**
+ * The contract version, as the marker a supervisor can look for in the
+ * built daemon before it names an extension. The number moves only on a
+ * breaking change to the interfaces below.
+ */
+export const EXTENSION_API = 'beignet-extension-api/1';
+/** The value an extension states in `api`. */
+export const EXTENSION_API_VERSION = 1;
+
+/** Every extension row in the metadata table starts with this. */
+export const EXTENSION_STORAGE_PREFIX = 'x/';
+/** The largest request body a route may ask for (the default is 1 MiB). */
+export const EXTENSION_MAX_BODY_BYTES = 32 * 1024 * 1024;
+/** How long a stop() hook may take before the node moves on without it. */
+export const EXTENSION_STOP_TIMEOUT_MS = 5_000;
+/** How long attach() may take before the node is built without the extension. */
+export const EXTENSION_ATTACH_TIMEOUT_MS = 30_000;
+
+// require, not import: importing a file outside src/ widens tsc's rootDir and
+// moves the build output. The path is the same depth from src/cli and dist/cli.
+const { version: PACKAGE_VERSION } = require('../../package.json') as {
+	version: string;
+};
+/** The engine's package version, as extensions see it in their context. */
+export const ENGINE_VERSION: string = PACKAGE_VERSION;
+
+const ID_RE = /^[a-z][a-z0-9-]{1,31}$/;
+const ROUTE_PATH_RE = /^(\/[a-z0-9]+(-[a-z0-9]+)*)+$/;
+const EVENT_NAME_RE = /^[a-z][a-z0-9-]{0,47}$/;
+const ERROR_CODE_RE = /^[A-Z][A-Z0-9_]{1,63}$/;
+const METHODS: readonly string[] = ['GET', 'POST', 'DELETE'];
+const SCOPES: readonly string[] = ['readonly', 'invoice'];
+const ERROR_STATUSES: readonly number[] = [
+	400, 403, 404, 409, 410, 413, 422, 429, 500, 502, 503, 504
+];
+
+export type ExtensionNetwork = 'mainnet' | 'testnet' | 'regtest' | 'signet';
+export type ExtensionMethod = 'GET' | 'POST' | 'DELETE';
+/** The non-admin scopes a route can accept; admin always qualifies. */
+export type ExtensionScope = 'readonly' | 'invoice';
+export type ExtensionStopReason = 'shutdown' | 'rebuild';
+export type ExtensionState =
+	| 'pending'
+	| 'attached'
+	| 'ready'
+	| 'failed'
+	| 'stopped';
+
+/** One route, served by the daemon at /x/<id><path>. */
+export interface IExtensionRoute {
+	method: ExtensionMethod;
+	/** Lowercase segments under the extension's prefix, such as '/send/prepare'. */
+	path: string;
+	/** Non-admin scopes that may call the route. Omitted means admin only. */
+	scopes?: readonly ExtensionScope[];
+	/**
+	 * A POST that honours X-Idempotency-Key. The daemon replays its cached
+	 * answer for a repeated key while it runs, and hands the key to the
+	 * handler so the extension can make the replay survive a restart.
+	 */
+	idempotent?: boolean;
+	/** Body limit in bytes, up to EXTENSION_MAX_BODY_BYTES. Default 1 MiB. */
+	maxBodyBytes?: number;
+	/** One line for the OpenAPI document. */
+	summary: string;
+	/** JSON Schema of the request body, for the OpenAPI document. */
+	requestSchema?: Record<string, unknown>;
+	/** JSON Schema of the result, for the OpenAPI document. */
+	responseSchema?: Record<string, unknown>;
+}
+
+export interface IExtensionRequest {
+	/** The parsed JSON body; {} when the request had none. */
+	body: Record<string, unknown>;
+	query: URLSearchParams;
+	/** X-Idempotency-Key, on a route that declared `idempotent`. */
+	idempotencyKey?: string;
+}
+
+/** Returns the result; the daemon wraps it as { ok: true, result }. */
+export type ExtensionHandler = (
+	request: IExtensionRequest
+) => unknown | Promise<unknown>;
+
+/**
+ * The extension's own rows in the node's database: metadata keys under
+ * x/<id>/, encrypted at rest with the rest of the table, copied by a
+ * database backup and carried across an in-process restore. Keys are given
+ * without the prefix. Every call is synchronous.
+ */
+export interface IExtensionStorage {
+	get(key: string): string | null;
+	set(key: string, value: string): void;
+	delete(key: string): void;
+	/** Rows whose key starts with `prefix`, in key order; '' lists them all. */
+	list(prefix: string): Array<{ key: string; value: string }>;
+	/**
+	 * Run `fn` atomically: a throw undoes every write it made. `fn` must be
+	 * synchronous; a promise it returns is not waited for.
+	 */
+	transaction<T>(fn: () => T): T;
+}
+
+export interface IExtensionContext {
+	/** 1 for the node built at boot, one more for each in-process rebuild. */
+	generation: number;
+	network: ExtensionNetwork;
+	/** The node's data directory; undefined on injected storage without one. */
+	dataDir: string | undefined;
+	/** The engine's package version. */
+	engineVersion: string;
+	wallet: Wallet;
+	storage: IExtensionStorage;
+	logger: ILogger;
+	/**
+	 * Publish one of the declared events. Subscribers of GET /events and
+	 * webhooks receive it as `<id>:<event>`. An undeclared name is dropped
+	 * with a warning, as is anything emitted after stop().
+	 */
+	emit(event: string, data: unknown): void;
+}
+
+export interface IExtensionAttachment {
+	/** One handler per declared route, keyed '<METHOD> <path>'. */
+	handlers?: Record<string, ExtensionHandler>;
+	/** Runs once the node is built and serving. */
+	start?(): void | Promise<void>;
+	/**
+	 * Runs before the node goes away. On a graceful 'shutdown' the storage
+	 * still takes writes while this runs; a node destroyed without one has
+	 * fenced the view already. On 'rebuild' the database is being replaced:
+	 * the view is fenced, and attach() follows on the new one. Either way a
+	 * storage call that throws here is to be expected, not a fault.
+	 */
+	stop?(reason: ExtensionStopReason): void | Promise<void>;
+	/** A JSON-safe summary for GET /extensions. */
+	status?(): unknown;
+}
+
+export interface IBeignetExtension {
+	/** Route prefix, event prefix and storage namespace. */
+	id: string;
+	/** The extension's own version, reported by GET /extensions. */
+	version: string;
+	/** The contract version it was built for: EXTENSION_API_VERSION. */
+	api: number;
+	routes?: readonly IExtensionRoute[];
+	/** Event names it may emit, without the `<id>:` prefix. */
+	events?: readonly string[];
+	/**
+	 * Called once per node build, after the on-chain wallet exists and before
+	 * the Lightning node is created, and again after every in-process
+	 * rebuild. A throw marks the extension failed; the node runs without it.
+	 */
+	attach(
+		context: IExtensionContext
+	): IExtensionAttachment | Promise<IExtensionAttachment>;
+}
+
+/** What GET /extensions reports for one extension. */
+export interface IExtensionInfo {
+	id: string;
+	version: string;
+	state: ExtensionState;
+	/** The node build the extension is attached to; 0 before the first. */
+	generation: number;
+	/** Why it failed, when state is 'failed'. */
+	error?: string;
+	routes: Array<{
+		method: ExtensionMethod;
+		path: string;
+		scopes: string[];
+		idempotent: boolean;
+	}>;
+	events: string[];
+	/** The attachment's status(), when it has one and is running. */
+	status?: unknown;
+}
+
+/**
+ * A refusal the caller should see. The daemon answers with the status given
+ * and the code EXTENSION_ERROR, carrying `{ id, code, details }` under
+ * `error.extension`. Anything else a handler throws is a fault: logged, and
+ * answered as a generic 500.
+ *
+ * An extension that cannot import this class throws any Error with a string
+ * `extensionCode` (and optionally `status` and `details`) to the same effect.
+ */
+export class ExtensionError extends Error {
+	readonly extensionCode: string;
+	readonly status: number;
+	readonly details?: unknown;
+
+	constructor(
+		extensionCode: string,
+		message: string,
+		status = 400,
+		details?: unknown
+	) {
+		super(message);
+		this.name = 'ExtensionError';
+		this.extensionCode = extensionCode;
+		this.status = status;
+		if (details !== undefined) this.details = details;
+	}
+}
+
+/** The fields of a thrown value the daemon reads as an extension refusal. */
+export interface IExtensionRefusal {
+	code: string;
+	message: string;
+	status: number;
+	details?: unknown;
+}
+
+/**
+ * Read a thrown value as an extension refusal, by shape and not by class,
+ * so an extension bundled with its own copy of this module still answers
+ * with its own code. A code or status outside the contract is not one.
+ */
+export function extensionRefusal(err: unknown): IExtensionRefusal | null {
+	if (!(err instanceof Error)) return null;
+	const candidate = err as Error & {
+		extensionCode?: unknown;
+		status?: unknown;
+		details?: unknown;
+	};
+	if (
+		typeof candidate.extensionCode !== 'string' ||
+		!ERROR_CODE_RE.test(candidate.extensionCode)
+	) {
+		return null;
+	}
+	const status =
+		typeof candidate.status === 'number' &&
+		ERROR_STATUSES.includes(candidate.status)
+			? candidate.status
+			: 400;
+	const refusal: IExtensionRefusal = {
+		code: candidate.extensionCode,
+		message: candidate.message,
+		status
+	};
+	if (candidate.details !== undefined) refusal.details = candidate.details;
+	return refusal;
+}
+
+/** The route key of an extension route as the daemon sees it. */
+export function extensionRouteKey(id: string, route: IExtensionRoute): string {
+	return `${route.method} /${EXTENSION_STORAGE_PREFIX}${id}${route.path}`;
+}
+
+function refuse(message: string): never {
+	throw new BeignetError('INVALID_PARAMS', message);
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+/** isRecord without the narrowing, for values that already have a type. */
+function isObject(value: unknown): boolean {
+	return isRecord(value);
+}
+
+/**
+ * Check a set of extensions before anything is built on them. Throws
+ * INVALID_PARAMS naming the first problem; a description that passes can be
+ * served without another look.
+ */
+export function validateExtensions(
+	extensions: readonly IBeignetExtension[]
+): void {
+	if (!Array.isArray(extensions)) refuse('extensions must be an array');
+	const ids = new Set<string>();
+	for (const extension of extensions) {
+		if (!isObject(extension)) refuse('An extension must be an object');
+		const { id } = extension;
+		if (typeof id !== 'string' || !ID_RE.test(id)) {
+			refuse(
+				`Extension id ${JSON.stringify(id)} is not valid: 2 to 32 ` +
+					'characters, lowercase letters, digits and hyphens, starting with a letter'
+			);
+		}
+		const name = `Extension "${id}"`;
+		if (ids.has(id)) refuse(`${name} is listed twice`);
+		ids.add(id);
+		if (typeof extension.version !== 'string' || extension.version === '') {
+			refuse(`${name} must state its version`);
+		}
+		if (extension.api !== EXTENSION_API_VERSION) {
+			refuse(
+				`${name} was built for extension API ${String(extension.api)}; ` +
+					`this engine provides ${EXTENSION_API_VERSION}`
+			);
+		}
+		if (typeof extension.attach !== 'function') {
+			refuse(`${name} has no attach function`);
+		}
+		if (extension.routes !== undefined && !Array.isArray(extension.routes)) {
+			refuse(`${name} routes must be an array`);
+		}
+		const keys = new Set<string>();
+		for (const route of extension.routes ?? []) {
+			if (!isObject(route)) refuse(`${name} has a route that is not an object`);
+			if (!METHODS.includes(route.method)) {
+				refuse(
+					`${name} route method ${JSON.stringify(
+						route.method
+					)} is not GET, POST or DELETE`
+				);
+			}
+			if (typeof route.path !== 'string' || !ROUTE_PATH_RE.test(route.path)) {
+				refuse(
+					`${name} route path ${JSON.stringify(route.path)} is not valid: ` +
+						'lowercase segments such as /send/prepare'
+				);
+			}
+			const key = `${route.method} ${route.path}`;
+			if (keys.has(key)) refuse(`${name} declares ${key} twice`);
+			keys.add(key);
+			if (typeof route.summary !== 'string' || route.summary === '') {
+				refuse(`${name} route ${key} needs a summary`);
+			}
+			if (route.scopes !== undefined) {
+				if (
+					!Array.isArray(route.scopes) ||
+					(route.scopes as readonly string[]).some(
+						(scope) => !SCOPES.includes(scope)
+					)
+				) {
+					refuse(
+						`${name} route ${key} scopes may list only readonly and invoice`
+					);
+				}
+			}
+			if (route.idempotent !== undefined) {
+				if (typeof route.idempotent !== 'boolean') {
+					refuse(`${name} route ${key} idempotent must be a boolean`);
+				}
+				if (route.idempotent && route.method !== 'POST') {
+					refuse(
+						`${name} route ${key} is not a POST, so it cannot be idempotent`
+					);
+				}
+			}
+			if (route.maxBodyBytes !== undefined) {
+				if (
+					!Number.isInteger(route.maxBodyBytes) ||
+					route.maxBodyBytes < 1 ||
+					route.maxBodyBytes > EXTENSION_MAX_BODY_BYTES
+				) {
+					refuse(
+						`${name} route ${key} maxBodyBytes must be an integer from 1 to ${EXTENSION_MAX_BODY_BYTES}`
+					);
+				}
+			}
+			for (const field of ['requestSchema', 'responseSchema'] as const) {
+				if (route[field] !== undefined && !isObject(route[field])) {
+					refuse(`${name} route ${key} ${field} must be an object`);
+				}
+			}
+		}
+		if (extension.events !== undefined && !Array.isArray(extension.events)) {
+			refuse(`${name} events must be an array`);
+		}
+		const events = new Set<string>();
+		for (const event of extension.events ?? []) {
+			if (typeof event !== 'string' || !EVENT_NAME_RE.test(event)) {
+				refuse(
+					`${name} event ${JSON.stringify(event)} is not valid: lowercase ` +
+						'letters, digits and hyphens, starting with a letter'
+				);
+			}
+			if (events.has(event)) refuse(`${name} declares event ${event} twice`);
+			events.add(event);
+		}
+	}
+}
+
+/** better-sqlite3's error, word for word, as the node's own view throws it. */
+const CLOSED_CONNECTION = 'The database connection is not open';
+
+/** A storage backend that can list and delete metadata rows. */
+type ScanStorage = IStorageBackend & IMetadataScanStorage;
+
+function requireScanStorage(storage: IStorageBackend): ScanStorage {
+	if (
+		typeof storage.loadMetadataByPrefix !== 'function' ||
+		typeof storage.deleteMetadata !== 'function'
+	) {
+		throw new Error(
+			'Extension storage needs a backend with loadMetadataByPrefix and deleteMetadata'
+		);
+	}
+	return storage as ScanStorage;
+}
+
+function checkKey(key: unknown, allowEmpty: boolean): asserts key is string {
+	if (typeof key !== 'string' || (!allowEmpty && key === '')) {
+		throw new TypeError('An extension storage key must be a non-empty string');
+	}
+	if (key.length > 512) {
+		throw new TypeError('An extension storage key is at most 512 characters');
+	}
+	// The range scan compares code units, and a NUL would end a C string.
+	if (key.includes('\u0000') || key.includes('￿')) {
+		throw new TypeError('An extension storage key has a reserved character');
+	}
+}
+
+/**
+ * The view one extension gets of the node's metadata rows: only keys under
+ * x/<id>/, read through `current` on every call (an in-process restore
+ * replaces the database), and closed for good by `fence`.
+ */
+export function extensionStorageView(
+	id: string,
+	current: () => IStorageBackend
+): { storage: IExtensionStorage; fence: () => void } {
+	const namespace = `${EXTENSION_STORAGE_PREFIX}${id}/`;
+	let fenced = false;
+	const backend = (): ScanStorage => {
+		if (fenced) throw new TypeError(CLOSED_CONNECTION);
+		return requireScanStorage(current());
+	};
+	const storage: IExtensionStorage = {
+		get(key) {
+			checkKey(key, false);
+			return backend().loadMetadata(namespace + key);
+		},
+		set(key, value) {
+			checkKey(key, false);
+			if (typeof value !== 'string') {
+				throw new TypeError('An extension storage value must be a string');
+			}
+			backend().saveMetadata(namespace + key, value);
+		},
+		delete(key) {
+			checkKey(key, false);
+			backend().deleteMetadata(namespace + key);
+		},
+		list(prefix) {
+			checkKey(prefix, true);
+			return backend()
+				.loadMetadataByPrefix(namespace + prefix)
+				.map((row) => ({
+					key: row.key.slice(namespace.length),
+					value: row.value
+				}));
+		},
+		transaction(fn) {
+			return withStorageTransaction(backend(), fn);
+		}
+	};
+	return {
+		storage,
+		fence: (): void => {
+			fenced = true;
+		}
+	};
+}
+
+/**
+ * Copy every extension row from one database to another, for a restore
+ * that replaces the database under a running node. All or nothing.
+ */
+export function carryExtensionRows(
+	from: IStorageBackend,
+	to: IStorageBackend
+): number {
+	const rows = requireScanStorage(from).loadMetadataByPrefix(
+		EXTENSION_STORAGE_PREFIX
+	);
+	if (rows.length === 0) return 0;
+	withStorageTransaction(to, () => {
+		for (const row of rows) to.saveMetadata(row.key, row.value);
+	});
+	return rows.length;
+}
+
+/** What the node hands the host for each build. */
+export interface IExtensionBuild {
+	network: ExtensionNetwork;
+	dataDir: string | undefined;
+	wallet: Wallet;
+	/** The node's storage, read on every call. */
+	storage: () => IStorageBackend;
+}
+
+export interface IExtensionHostOptions {
+	engineVersion: string;
+	log: (
+		level: 'debug' | 'info' | 'warn' | 'error',
+		message: string,
+		data?: Record<string, unknown>
+	) => void;
+	/** Overrides EXTENSION_STOP_TIMEOUT_MS. */
+	stopTimeoutMs?: number;
+	/** Overrides EXTENSION_ATTACH_TIMEOUT_MS. */
+	attachTimeoutMs?: number;
+}
+
+export type ExtensionEventListener = (event: string, data: unknown) => void;
+
+interface IExtensionSlot {
+	extension: IBeignetExtension;
+	state: ExtensionState;
+	error?: string;
+	attachment?: IExtensionAttachment;
+	handlers: Map<string, ExtensionHandler>;
+	/** Closes the storage view and the emitter of the current generation. */
+	fence?: () => void;
+}
+
+function errorMessage(err: unknown): string {
+	return err instanceof Error ? err.message : String(err);
+}
+
+/**
+ * Owns the extensions of one node across its builds: attaches each to a new
+ * build, starts and stops them, fences a generation that is over, and
+ * answers for them to the daemon. Nothing here throws into the node.
+ */
+export class ExtensionHost {
+	private readonly slots: IExtensionSlot[];
+	private readonly listeners = new Set<ExtensionEventListener>();
+	private readonly opts: IExtensionHostOptions;
+	private generation = 0;
+	/** The stop hooks of the generation before this one, still running. */
+	private settling: Promise<void> = Promise.resolve();
+	private shutDown = false;
+	/** Settles when the latest pass of start() hooks has finished. */
+	started: Promise<void> = Promise.resolve();
+
+	constructor(
+		extensions: readonly IBeignetExtension[],
+		opts: IExtensionHostOptions
+	) {
+		validateExtensions(extensions);
+		this.opts = opts;
+		this.slots = extensions.map((extension) => ({
+			extension,
+			state: 'pending' as ExtensionState,
+			handlers: new Map<string, ExtensionHandler>()
+		}));
+	}
+
+	get extensions(): readonly IBeignetExtension[] {
+		return this.slots.map((slot) => slot.extension);
+	}
+
+	/** Receive every event an extension emits, named `<id>:<event>`. */
+	onEvent(listener: ExtensionEventListener): () => void {
+		this.listeners.add(listener);
+		return () => {
+			this.listeners.delete(listener);
+		};
+	}
+
+	/**
+	 * Attach every extension to a node build. Waits for the stop hooks of
+	 * the build before it, so two generations of one extension never run
+	 * side by side.
+	 */
+	async attach(build: IExtensionBuild): Promise<void> {
+		if (this.shutDown) return;
+		await this.settling;
+		// Anything still attached belongs to a build that is gone.
+		this.fenceAll();
+		const generation = ++this.generation;
+		for (const slot of this.slots) {
+			const { extension } = slot;
+			slot.state = 'pending';
+			slot.error = undefined;
+			slot.attachment = undefined;
+			slot.handlers = new Map();
+			const view = extensionStorageView(extension.id, build.storage);
+			let open = true;
+			slot.fence = (): void => {
+				open = false;
+				view.fence();
+			};
+			const declared = new Set(extension.events ?? []);
+			const context: IExtensionContext = {
+				generation,
+				network: build.network,
+				dataDir: build.dataDir,
+				engineVersion: this.opts.engineVersion,
+				wallet: build.wallet,
+				storage: view.storage,
+				logger: this.loggerFor(extension.id),
+				emit: (event, data): void => {
+					if (!open) return;
+					if (!declared.has(event)) {
+						this.opts.log('warn', 'Extension emitted an undeclared event', {
+							extension: extension.id,
+							event: String(event)
+						});
+						return;
+					}
+					this.publish(`${extension.id}:${event}`, data);
+				}
+			};
+			try {
+				const attachment = await this.boundedAttach(extension, context);
+				if (!open) {
+					// Torn down while attach() was still running.
+					slot.state = 'stopped';
+					this.discard(extension.id, attachment);
+					continue;
+				}
+				slot.handlers = this.bindHandlers(extension, attachment);
+				slot.attachment = attachment;
+				slot.state = 'attached';
+			} catch (err) {
+				slot.fence();
+				this.fail(slot, 'attach', err);
+			}
+		}
+	}
+
+	/**
+	 * Run the start() hooks without holding the caller: the node finishes
+	 * its boot whatever an extension does in start(). Routes are served
+	 * from attach() on, so an extension that is not ready yet says so in
+	 * its own answers.
+	 */
+	startInBackground(): void {
+		this.started = this.start();
+	}
+
+	/** Run start() on every attached extension. Never rejects. */
+	async start(): Promise<void> {
+		for (const slot of this.slots) {
+			if (slot.state !== 'attached') continue;
+			const attachment = slot.attachment;
+			try {
+				await attachment?.start?.();
+				// A teardown during start() has already settled the state, and
+				// a rebuild may have attached the next generation since.
+				if (slot.attachment === attachment && slot.state === 'attached') {
+					slot.state = 'ready';
+				}
+			} catch (err) {
+				if (slot.attachment !== attachment || slot.state !== 'attached') {
+					continue;
+				}
+				slot.handlers = new Map();
+				await this.runStop(slot, 'shutdown');
+				slot.fence?.();
+				slot.fence = undefined;
+				this.fail(slot, 'start', err);
+			}
+		}
+	}
+
+	/**
+	 * The node is closing its database to replace it. Synchronous on
+	 * purpose: no write of this generation may land after the rows were
+	 * carried across. The stop hooks run on, bounded, and the next attach()
+	 * waits for them.
+	 */
+	fenceForRebuild(): void {
+		const running = this.slots.filter((slot) => this.isRunning(slot));
+		this.fenceAll();
+		const hooks = running.map((slot) => this.runStop(slot, 'rebuild'));
+		for (const slot of running) {
+			slot.state = 'stopped';
+			slot.handlers = new Map();
+		}
+		this.settling = this.settling.then(() =>
+			Promise.all(hooks).then(() => undefined)
+		);
+	}
+
+	/**
+	 * The node is shutting down. The stop hooks run first, bounded, while
+	 * the wallet and the storage still work; then everything is fenced.
+	 */
+	async shutdown(): Promise<void> {
+		if (this.shutDown) return;
+		this.shutDown = true;
+		await this.settling;
+		const running = this.slots.filter((slot) => this.isRunning(slot));
+		// Routes close first, so a hook does not race a new request.
+		for (const slot of running) slot.handlers = new Map();
+		await Promise.all(running.map((slot) => this.runStop(slot, 'shutdown')));
+		this.fenceAll();
+		for (const slot of running) slot.state = 'stopped';
+		this.listeners.clear();
+	}
+
+	/**
+	 * The node is being destroyed without a graceful stop. Synchronous, so
+	 * destroy() reaches the wallet as soon as it did without extensions:
+	 * everything is fenced at once, and the stop hooks run on unwaited.
+	 */
+	abort(): void {
+		if (this.shutDown) return;
+		this.shutDown = true;
+		const running = this.slots.filter((slot) => this.isRunning(slot));
+		this.fenceAll();
+		for (const slot of running) {
+			void this.runStop(slot, 'shutdown');
+			slot.state = 'stopped';
+			slot.handlers = new Map();
+		}
+		this.listeners.clear();
+	}
+
+	/**
+	 * The handler serving one route. A route whose extension is not running
+	 * answers EXTENSION_UNAVAILABLE instead of a 404, because the route
+	 * exists and a retry after a restart may find it.
+	 */
+	handler(id: string, key: string): ExtensionHandler {
+		const slot = this.slots.find((s) => s.extension.id === id);
+		const handler = slot?.handlers.get(key);
+		if (handler) return handler;
+		const why =
+			slot?.state === 'failed'
+				? `failed: ${slot.error ?? 'unknown error'}`
+				: `is ${slot?.state ?? 'not loaded'}`;
+		throw new BeignetError('EXTENSION_UNAVAILABLE', `Extension "${id}" ${why}`);
+	}
+
+	/** One entry per extension, for GET /extensions. */
+	describe(): IExtensionInfo[] {
+		return this.slots.map((slot) => {
+			const { extension } = slot;
+			const info: IExtensionInfo = {
+				id: extension.id,
+				version: extension.version,
+				state: slot.state,
+				generation: slot.state === 'pending' ? 0 : this.generation,
+				routes: (extension.routes ?? []).map((route) => ({
+					method: route.method,
+					path: `/${EXTENSION_STORAGE_PREFIX}${extension.id}${route.path}`,
+					scopes: [...(route.scopes ?? []), 'admin'],
+					idempotent: route.idempotent === true
+				})),
+				events: (extension.events ?? []).map(
+					(event) => `${extension.id}:${event}`
+				)
+			};
+			if (slot.error !== undefined) info.error = slot.error;
+			if (this.isRunning(slot) && slot.attachment?.status) {
+				try {
+					info.status = slot.attachment.status();
+				} catch (err) {
+					this.opts.log('warn', 'Extension status failed', {
+						extension: extension.id,
+						error: errorMessage(err)
+					});
+				}
+			}
+			return info;
+		});
+	}
+
+	private isRunning(slot: IExtensionSlot): boolean {
+		return slot.state === 'attached' || slot.state === 'ready';
+	}
+
+	private fenceAll(): void {
+		for (const slot of this.slots) {
+			slot.fence?.();
+			slot.fence = undefined;
+		}
+	}
+
+	private fail(slot: IExtensionSlot, phase: string, err: unknown): void {
+		slot.state = 'failed';
+		slot.error = `${phase}: ${errorMessage(err)}`;
+		slot.attachment = undefined;
+		this.opts.log(
+			'error',
+			`Extension ${phase} failed; the node runs without it`,
+			{
+				extension: slot.extension.id,
+				error: errorMessage(err)
+			}
+		);
+	}
+
+	/**
+	 * attach(), bounded: the node is built without an extension that does
+	 * not answer. One that answers after the bound is stopped again.
+	 */
+	private async boundedAttach(
+		extension: IBeignetExtension,
+		context: IExtensionContext
+	): Promise<IExtensionAttachment> {
+		const limit = this.opts.attachTimeoutMs ?? EXTENSION_ATTACH_TIMEOUT_MS;
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		const bound = new Promise<'timeout'>((resolve) => {
+			timer = setTimeout(() => resolve('timeout'), limit);
+			timer.unref?.();
+		});
+		const attaching = (async (): Promise<IExtensionAttachment> =>
+			extension.attach(context))();
+		try {
+			const outcome = await Promise.race([attaching, bound]);
+			if (outcome !== 'timeout') return outcome;
+		} finally {
+			if (timer) clearTimeout(timer);
+		}
+		attaching.then(
+			(late) => this.discard(extension.id, late),
+			() => undefined
+		);
+		throw new Error(`attach() did not finish within ${limit} ms`);
+	}
+
+	/** Stop an attachment that arrived after its generation was over. */
+	private discard(id: string, attachment: IExtensionAttachment): void {
+		if (!isObject(attachment)) return;
+		const stop = attachment.stop;
+		if (typeof stop !== 'function') return;
+		void (async (): Promise<void> => {
+			try {
+				await stop.call(attachment, 'shutdown');
+			} catch (err) {
+				this.opts.log('warn', 'Extension stop failed', {
+					extension: id,
+					error: errorMessage(err)
+				});
+			}
+		})();
+	}
+
+	/** One stop hook, bounded and contained. */
+	private async runStop(
+		slot: IExtensionSlot,
+		reason: ExtensionStopReason
+	): Promise<void> {
+		const stop = slot.attachment?.stop;
+		if (!stop) return;
+		const attachment = slot.attachment;
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		const bound = new Promise<'timeout'>((resolve) => {
+			timer = setTimeout(
+				() => resolve('timeout'),
+				this.opts.stopTimeoutMs ?? EXTENSION_STOP_TIMEOUT_MS
+			);
+			timer.unref?.();
+		});
+		try {
+			const outcome = await Promise.race([
+				(async (): Promise<'done'> => {
+					await stop.call(attachment, reason);
+					return 'done';
+				})(),
+				bound
+			]);
+			if (outcome === 'timeout') {
+				this.opts.log('warn', 'Extension stop timed out', {
+					extension: slot.extension.id,
+					reason
+				});
+			}
+		} catch (err) {
+			this.opts.log('warn', 'Extension stop failed', {
+				extension: slot.extension.id,
+				reason,
+				error: errorMessage(err)
+			});
+		} finally {
+			if (timer) clearTimeout(timer);
+		}
+	}
+
+	private bindHandlers(
+		extension: IBeignetExtension,
+		attachment: IExtensionAttachment
+	): Map<string, ExtensionHandler> {
+		if (!isObject(attachment)) {
+			throw new Error('attach() must return an object');
+		}
+		const given = attachment.handlers ?? {};
+		if (!isObject(given)) throw new Error('handlers must be an object');
+		const declared = (extension.routes ?? []).map(
+			(route) => `${route.method} ${route.path}`
+		);
+		const missing = declared.filter((key) => typeof given[key] !== 'function');
+		if (missing.length > 0) {
+			throw new Error(`no handler for ${missing.join(', ')}`);
+		}
+		const extra = Object.keys(given).filter((key) => !declared.includes(key));
+		if (extra.length > 0) {
+			throw new Error(`handler for an undeclared route: ${extra.join(', ')}`);
+		}
+		return new Map(
+			declared.map((key) => [key, given[key] as ExtensionHandler])
+		);
+	}
+
+	private loggerFor(id: string): ILogger {
+		const write =
+			(level: 'debug' | 'info' | 'warn' | 'error') =>
+			(message: string, meta?: unknown): void => {
+				this.opts.log(
+					level,
+					`[${id}] ${message}`,
+					meta === undefined ? undefined : isRecord(meta) ? meta : { meta }
+				);
+			};
+		return {
+			debug: write('debug'),
+			info: write('info'),
+			warn: write('warn'),
+			error: write('error')
+		};
+	}
+
+	private publish(event: string, data: unknown): void {
+		for (const listener of this.listeners) {
+			try {
+				listener(event, data);
+			} catch (err) {
+				this.opts.log('warn', 'Extension event listener failed', {
+					event,
+					error: errorMessage(err)
+				});
+			}
+		}
+	}
+}
+
+/**
+ * Add the extensions' routes to an OpenAPI document. Returns the document
+ * untouched when there are none, so a daemon without extensions serves
+ * exactly what getOpenApiSpec() returns.
+ */
+export function withExtensionOperations(
+	spec: Record<string, unknown>,
+	extensions: readonly IBeignetExtension[]
+): Record<string, unknown> {
+	if (extensions.length === 0) return spec;
+	const paths: Record<string, Record<string, unknown>> = {
+		...(spec.paths as Record<string, Record<string, unknown>>)
+	};
+	for (const extension of extensions) {
+		for (const route of extension.routes ?? []) {
+			const routePath = `/${EXTENSION_STORAGE_PREFIX}${extension.id}${route.path}`;
+			const operation: Record<string, unknown> = {
+				summary: route.summary,
+				tags: [`Extension: ${extension.id}`],
+				'x-extension': { id: extension.id, version: extension.version },
+				'x-accepted-scopes': [...(route.scopes ?? []), 'admin'],
+				responses: {
+					'200': {
+						description: 'Success',
+						content: {
+							'application/json': {
+								schema: {
+									type: 'object',
+									required: ['ok', 'result'],
+									properties: {
+										ok: { type: 'boolean', enum: [true] },
+										result: route.responseSchema ?? {}
+									}
+								}
+							}
+						}
+					}
+				}
+			};
+			if (route.requestSchema) {
+				operation.requestBody = {
+					content: { 'application/json': { schema: route.requestSchema } }
+				};
+			}
+			if (route.idempotent) operation['x-idempotent'] = true;
+			paths[routePath] = {
+				...paths[routePath],
+				[route.method.toLowerCase()]: operation
+			};
+		}
+	}
+	return { ...spec, paths };
+}

@@ -56,7 +56,12 @@ import type { RateLimitOptions } from './http-rate-limiter';
 import { HttpRateLimiter, clientKeyForRequest } from './http-rate-limiter';
 import { encodeBip21 } from '../utils/transaction';
 import { unpatchedNodeWarning } from '../utils/node-version';
-import type { ApiKeyDefinition, AuthSuccess, StoredKeyOverride } from './auth';
+import type {
+	ApiKeyDefinition,
+	ApiScope,
+	AuthSuccess,
+	StoredKeyOverride
+} from './auth';
 import {
 	ApiKeyAuthenticator,
 	AUTH_KEY_OVERRIDES_STORAGE_KEY,
@@ -64,6 +69,18 @@ import {
 	scopesAllowRoute
 } from './auth';
 import type { HandledRouteKey } from './routes';
+import type {
+	IBeignetExtension,
+	IExtensionRefusal,
+	IExtensionRoute
+} from './extension';
+import {
+	EXTENSION_API,
+	extensionRefusal,
+	extensionRouteKey,
+	validateExtensions,
+	withExtensionOperations
+} from './extension';
 import { dispatchTable, routeKeysWhere } from './routes';
 
 /** The daemon keeps its keys, webhooks and queue in SQLite, so it takes no storage. */
@@ -174,14 +191,18 @@ function spliceOrRefuse(result: SpliceResult): ApiResponse<SpliceResult> {
 }
 
 /** 403 message: which scopes the route accepts (admin always qualifies). */
-function insufficientScopeMessage(auth: AuthSuccess, routeKey: string): string {
-	const accepted = [...getRouteScopes(routeKey), 'admin'].join(', ');
+function insufficientScopeMessage(
+	auth: AuthSuccess,
+	routeScopes: readonly ApiScope[]
+): string {
+	const accepted = [...routeScopes, 'admin'].join(', ');
 	const who = auth.keyName === null ? 'API key' : `API key "${auth.keyName}"`;
 	return `${who} lacks the required scope (accepted: ${accepted})`;
 }
 
 export async function parseBody(
-	req: http.IncomingMessage
+	req: http.IncomingMessage,
+	maxBytes: number = MAX_BODY_BYTES
 ): Promise<Record<string, unknown>> {
 	return new Promise((resolve, reject) => {
 		const chunks: Buffer[] = [];
@@ -190,7 +211,7 @@ export async function parseBody(
 		req.on('data', (chunk: Buffer) => {
 			if (overLimit) return;
 			totalBytes += chunk.length;
-			if (totalBytes > MAX_BODY_BYTES) {
+			if (totalBytes > maxBytes) {
 				// The rest is read and dropped rather than the socket destroyed,
 				// which reset the connection before the 413 could be written.
 				// Closing right after the answer does the same to a client
@@ -200,7 +221,7 @@ export async function parseBody(
 				reject(
 					new BeignetError(
 						'BODY_TOO_LARGE',
-						`Request body exceeds ${MAX_BODY_BYTES} bytes`
+						`Request body exceeds ${maxBytes} bytes`
 					)
 				);
 				return;
@@ -229,7 +250,7 @@ export async function parseBody(
 			reject(
 				new BeignetError(
 					'BODY_TOO_LARGE',
-					`Request body exceeds ${MAX_BODY_BYTES} bytes`
+					`Request body exceeds ${maxBytes} bytes`
 				)
 			);
 		});
@@ -551,7 +572,11 @@ const STATUS_BY_ERROR_CODE: Partial<Record<BeignetErrorCodeValue, number>> = {
 	// A storage write that did not land. Retryable on purpose: the request was
 	// refused precisely so it could be, and the next attempt reaches a
 	// different world.
-	NOT_PERSISTED: 503
+	NOT_PERSISTED: 503,
+	// Host extensions (docs/EXTENSIONS.md). An extension's refusal carries
+	// its own status, and this is the one it gets when it names none.
+	EXTENSION_ERROR: 400,
+	EXTENSION_UNAVAILABLE: 503
 	// Left unmapped on purpose, so they keep the 500 default:
 	// WALLET_CREATE_FAILED, ADDRESS_FAILED, REFRESH_FAILED and
 	// DESCRIPTOR_EXPORT_FAILED are node faults, and SEND_FAILED, CLOSE_FAILED,
@@ -817,6 +842,32 @@ export function formatSseFrame(eventName: string, data: unknown): string {
 	return `event: ${eventName}\ndata: ${JSON.stringify(data ?? {})}\n\n`;
 }
 
+/**
+ * The failure envelope for a refusal from an extension's route: the one
+ * code EXTENSION_ERROR, with the extension's id and its own code beside it.
+ * Details that do not serialize are left out instead of failing the answer.
+ */
+function extensionFailureJson(id: string, refusal: IExtensionRefusal): string {
+	const envelope = (details?: unknown): string =>
+		JSON.stringify({
+			ok: false,
+			error: {
+				code: 'EXTENSION_ERROR',
+				message: refusal.message,
+				extension: {
+					id,
+					code: refusal.code,
+					...(details !== undefined ? { details } : {})
+				}
+			}
+		});
+	try {
+		return envelope(refusal.details);
+	} catch {
+		return envelope();
+	}
+}
+
 /** What a boot has taken so far, so a failed start can hand it all back. */
 interface IStartedResources {
 	node?: BeignetNode;
@@ -892,6 +943,46 @@ async function bootDaemon(
 	// Validates apiKeys (names/keys/scopes) up front; throws INVALID_PARAMS
 	// on bad config before the node is created.
 	const authenticator = new ApiKeyAuthenticator(opts.apiToken, opts.apiKeys);
+	// Host extensions (docs/EXTENSIONS.md). The descriptions are static, so
+	// the route table is built, and a clash with the node's own events
+	// refused, before the node is created.
+	const extensions: readonly IBeignetExtension[] = opts.extensions ?? [];
+	validateExtensions(extensions);
+	const extensionRoutes = new Map<
+		string,
+		{
+			extension: IBeignetExtension;
+			route: IExtensionRoute;
+			scopes: readonly ApiScope[];
+		}
+	>();
+	const nodeEventPrefixes = new Set(
+		getRelayedEvents(true).map((name) => name.split(':')[0])
+	);
+	for (const extension of extensions) {
+		// Its events are relayed as `<id>:<name>`, where a subscriber would
+		// take them for the node's.
+		if (nodeEventPrefixes.has(extension.id)) {
+			throw new BeignetError(
+				'INVALID_PARAMS',
+				`Extension id "${extension.id}" is the prefix of the node's own events`
+			);
+		}
+		for (const route of extension.routes ?? []) {
+			extensionRoutes.set(extensionRouteKey(extension.id, route), {
+				extension,
+				route,
+				scopes: route.scopes ?? []
+			});
+		}
+	}
+	// Admin always qualifies; an extension route that lists no scope and a
+	// route in neither table are admin only.
+	const acceptedScopes = (key: string): readonly ApiScope[] =>
+		extensionRoutes.get(key)?.scopes ?? getRouteScopes(key);
+	const scopesAllow = (scopes: ReadonlySet<ApiScope>, key: string): boolean =>
+		scopes.has('admin') ||
+		acceptedScopes(key).some((scope) => scopes.has(scope));
 	// Refuse plainly dangerous configurations before the node is created. A
 	// wallet daemon reachable beyond loopback with no authentication hands
 	// /send, /channel/forceclose and /mnemonic to the whole network segment;
@@ -1586,6 +1677,8 @@ async function bootDaemon(
 		'GET /spend-limit': () => success(node.getDailySpendInfo()),
 		'GET /liquidity': () => success(node.getLiquiditySnapshot()),
 		'GET /watchtowers': () => success({ towers: node.listWatchtowers() }),
+		'GET /extensions': () =>
+			success({ api: EXTENSION_API, extensions: node.describeExtensions() }),
 		'POST /watchtower/add': (body) => {
 			const { uri } = body as { uri?: string };
 			if (!uri) return failure('INVALID_PARAMS', 'uri required');
@@ -3730,7 +3823,9 @@ async function bootDaemon(
 	};
 
 	// Serialized once: the route needs no credential, and the spec is 155 kB.
-	const openApiJson = Buffer.from(JSON.stringify(getOpenApiSpec()));
+	const openApiJson = Buffer.from(
+		JSON.stringify(withExtensionOperations(getOpenApiSpec(), extensions))
+	);
 
 	const corsOrigin =
 		opts.cors === true ? '*' : typeof opts.cors === 'string' ? opts.cors : null;
@@ -3903,7 +3998,10 @@ async function bootDaemon(
 					res.statusCode = 403;
 					res.end(
 						JSON.stringify(
-							failure('FORBIDDEN', insufficientScopeMessage(auth, routeKey))
+							failure(
+								'FORBIDDEN',
+								insufficientScopeMessage(auth, getRouteScopes(routeKey))
+							)
 						)
 					);
 					return;
@@ -3974,11 +4072,14 @@ async function bootDaemon(
 				);
 				return;
 			}
-			if (!scopesAllowRoute(auth.scopes, routeKey)) {
+			if (!scopesAllow(auth.scopes, routeKey)) {
 				res.statusCode = 403;
 				res.end(
 					JSON.stringify(
-						failure('FORBIDDEN', insufficientScopeMessage(auth, routeKey))
+						failure(
+							'FORBIDDEN',
+							insufficientScopeMessage(auth, acceptedScopes(routeKey))
+						)
 					)
 				);
 				return;
@@ -4080,7 +4181,40 @@ async function bootDaemon(
 			return;
 		}
 
-		const handler = routes.get(routeKey);
+		// A route of a host extension (docs/EXTENSIONS.md) runs through the
+		// same parking, body parsing, idempotency and error mapping as the
+		// daemon's own. Its handler is looked up per request: an in-process
+		// rebuild attaches the extension again, and one that is not running
+		// answers EXTENSION_UNAVAILABLE.
+		const extensionRoute = extensionRoutes.get(routeKey);
+		const idempotentRoute =
+			IDEMPOTENT_ROUTES.has(routeKey) ||
+			extensionRoute?.route.idempotent === true;
+		const handler: RouteHandler | undefined = extensionRoute
+			? async (requestBody): Promise<unknown> => {
+					const { extension, route } = extensionRoute;
+					const extensionHost = node.extensionHost;
+					if (!extensionHost) {
+						throw new BeignetError(
+							'EXTENSION_UNAVAILABLE',
+							`Extension "${extension.id}" is not loaded`
+						);
+					}
+					const run = extensionHost.handler(
+						extension.id,
+						`${route.method} ${route.path}`
+					);
+					const key = req.headers['x-idempotency-key'];
+					const result = await run({
+						body: requestBody as Record<string, unknown>,
+						query,
+						...(route.idempotent && typeof key === 'string'
+							? { idempotencyKey: key }
+							: {})
+					});
+					return success(result ?? null);
+			  }
+			: routes.get(routeKey);
 		if (!handler) {
 			res.statusCode = 404;
 			res.end(JSON.stringify(failure('NOT_FOUND', `No route: ${routeKey}`)));
@@ -4106,7 +4240,7 @@ async function bootDaemon(
 		}
 
 		try {
-			const body = await parseBody(req);
+			const body = await parseBody(req, extensionRoute?.route.maxBodyBytes);
 
 			// ── Idempotency key support ──
 			const idempotencyKey = req.headers['x-idempotency-key'] as
@@ -4115,11 +4249,7 @@ async function bootDaemon(
 			// A key the route would drop leaves the caller believing a retry is
 			// safe when it is not, so refuse before the handler runs. GET and
 			// DELETE are idempotent by method, where a key misleads no one.
-			if (
-				idempotencyKey &&
-				req.method === 'POST' &&
-				!IDEMPOTENT_ROUTES.has(routeKey)
-			) {
+			if (idempotencyKey && req.method === 'POST' && !idempotentRoute) {
 				endWithResult(
 					res,
 					failure(
@@ -4130,7 +4260,7 @@ async function bootDaemon(
 				);
 				return;
 			}
-			if (idempotencyKey && IDEMPOTENT_ROUTES.has(routeKey)) {
+			if (idempotencyKey && idempotentRoute) {
 				const cacheKey = `${routeKey}:${idempotencyKey}`;
 				// A digest, so a stored timeout marker stays small whatever the body.
 				const bodyHash = createHash('sha256')
@@ -4232,7 +4362,13 @@ async function bootDaemon(
 			const result = await handler(body, query);
 			endWithResult(res, result);
 		} catch (err: unknown) {
-			if (err instanceof BeignetError) {
+			// Read only for an extension's route: nothing the daemon's own
+			// handlers throw is taken for an extension's refusal.
+			const refusal = extensionRoute ? extensionRefusal(err) : null;
+			if (refusal && extensionRoute) {
+				res.statusCode = refusal.status;
+				res.end(extensionFailureJson(extensionRoute.extension.id, refusal));
+			} else if (err instanceof BeignetError) {
 				res.statusCode = statusForFailure(err.code, err.failureCode);
 				// toJSON carries failureCode, which the caller needs to tell a
 				// permanent BOLT 4 failure from one worth retrying.
@@ -4362,6 +4498,17 @@ async function bootDaemon(
 			webhookManager.dispatch(eventName, data);
 		});
 	}
+
+	// Events of host extensions, named `<id>:<event>`, go to the same
+	// subscribers. The host outlives a rebuild, so this is wired once.
+	node.extensionHost?.onEvent((eventName, data) => {
+		webhookManager.dispatch(eventName, data);
+		if (sseClients.size === 0) return;
+		const message = formatSseFrame(eventName, data);
+		for (const client of sseClients.keys()) {
+			sseWrite(client, message);
+		}
+	});
 
 	return new Promise((resolve, reject) => {
 		server.on('error', reject);

@@ -82,6 +82,13 @@ import { ensurePrivateDir, writeFileAtomic } from './fs-utils';
 import { holdDbRestoredChannels } from './restore';
 import { deriveBackupMacKey, writeBackupMac } from './backup-mac';
 import { nodeStorageView } from './node-storage-view';
+import {
+	ENGINE_VERSION,
+	ExtensionHost,
+	carryExtensionRows,
+	validateExtensions
+} from './extension';
+import type { IBeignetExtension, IExtensionInfo } from './extension';
 import { EProtocol } from '../types/electrum';
 import { LightningNode } from '../lightning/node/lightning-node';
 import { CommitmentType, OutputType } from '../lightning/chain/types';
@@ -659,6 +666,14 @@ export interface BeignetNodeOptions
 	 * wallet keeps its default console output.
 	 */
 	logger?: ILogger;
+	/**
+	 * Host extensions to run inside this node (docs/EXTENSIONS.md). Each is
+	 * attached once the on-chain wallet exists and again after every
+	 * in-process rebuild; the daemon serves its routes under `/x/<id>`. A
+	 * malformed entry refuses create() with INVALID_PARAMS, and one that
+	 * throws while running is reported by `GET /extensions` and left out.
+	 */
+	extensions?: readonly IBeignetExtension[];
 	/** Multiple Electrum servers for failover redundancy */
 	electrumServers?: Array<{ host: string; port: number; tls?: boolean }>;
 	/** Path for automated periodic backups (enables backup scheduling) */
@@ -2423,6 +2438,8 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	 * throws before its close.
 	 */
 	private _nodeStorageView?: IStorageBackend & IWalletDataStorage;
+	/** The host of options.extensions; absent when none were given. */
+	private _extensionHost?: ExtensionHost;
 	/** Wallet-owned output script that force-close sweeps pay into. */
 	private sweepDestinationScript?: Buffer;
 	/** Background timer retrying wallet sweep-address resolution (see scheduleSweepAddressRefresh). */
@@ -2838,6 +2855,9 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 				`unknown network '${opts.network}': expected 'mainnet', 'testnet', 'signet' or 'regtest'`
 			);
 		}
+		// Before the lock and the database: a description the node cannot
+		// serve is refused with nothing held.
+		if (opts.extensions !== undefined) validateExtensions(opts.extensions);
 		if (opts.storage !== undefined) {
 			const refusal = injectedStorageRefusal(opts.storage);
 			if (refusal !== null) throw new BeignetError('INVALID_PARAMS', refusal);
@@ -2967,6 +2987,12 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	private async init(opts: BeignetNodeOptions): Promise<void> {
 		if (opts.logLevel) this.logLevel = opts.logLevel;
 		if (opts.logger) this.logger = opts.logger;
+		if (opts.extensions && opts.extensions.length > 0) {
+			this._extensionHost = new ExtensionHost(opts.extensions, {
+				engineVersion: ENGINE_VERSION,
+				log: (level, message, data): void => this.log(level, message, data)
+			});
+		}
 		this.autoGossipSync = opts.autoGossipSync ?? true;
 		this.peerStorageEnabled = opts.peerStorageEnabled ?? true;
 		this.rapidGossipSync = opts.rapidGossipSync ?? true;
@@ -3206,7 +3232,21 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 			return;
 		}
 
-		await this.initNode(opts);
+		await this.buildNode(opts);
+	}
+
+	/**
+	 * initNode, releasing the extensions when the build fails part-way: one
+	 * attached to a wallet whose node never came up is fenced and stopped,
+	 * and a later build attaches it again.
+	 */
+	private async buildNode(opts: BeignetNodeOptions): Promise<void> {
+		try {
+			await this.initNode(opts);
+		} catch (err) {
+			this._extensionHost?.fenceForRebuild();
+			throw err;
+		}
 	}
 
 	/**
@@ -3331,6 +3371,17 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 			);
 		}
 		this.wallet = walletResult.value;
+
+		// 3b. Host extensions (docs/EXTENSIONS.md): attached to the wallet
+		// before anything can spend from it, and before the node is built so
+		// an extension can stand between the two. attach() contains every
+		// failure: an extension that throws is reported and left out.
+		await this._extensionHost?.attach({
+			network: this.networkName,
+			dataDir: this.dataDir,
+			wallet: this.wallet,
+			storage: () => this.storage
+		});
 
 		// 4. Create funding provider from wallet
 		const fundingProvider = new WalletFundingProvider(this.wallet);
@@ -4613,6 +4664,10 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 		// the rehydrated ledger; needs the chain source and the node up.
 		await this.node.startSwapProvider();
 
+		// 12d. Host extensions: start() runs in the background, so a slow or
+		// hung extension never holds the node's boot.
+		this._extensionHost?.startInBackground();
+
 		// 13. Recover any funds stranded at the funding-key fallback address from
 		// past force-close sweeps (sessions where no wallet address was available).
 		// No-op when the fallback address is empty. Runs in the background, but
@@ -5815,7 +5870,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 				);
 				this.storage.open();
 				await this.prepareRecovery(opts);
-				await this.initNode(opts);
+				await this.buildNode(opts);
 				// Every row the journal carried is now a live channel; what the
 				// SCB names beyond them the journal could not carry (the inline
 				// ceiling, or a checkpoint older than the channel).
@@ -6191,6 +6246,9 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	 * operator can read the status route and stop the daemon cleanly.
 	 */
 	private teardownNodeForRestart(): void {
+		// Before the database closes: nothing an extension writes from here on
+		// would reach the installed database, so its view is fenced first.
+		this._extensionHost?.fenceForRebuild();
 		if (this.backupTimer) {
 			clearInterval(this.backupTimer);
 			this.backupTimer = undefined;
@@ -6251,6 +6309,10 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	 */
 	private carryDaemonState(from: SqliteStorage, to: SqliteStorage): void {
 		this.onchainSweeps().carryTo(to);
+		// Mandatory, like the auth override: an extension's rows can be the
+		// only record of funds it holds (docs/EXTENSIONS.md), and the restore
+		// rebuilds channel state alone.
+		carryExtensionRows(from, to);
 		const overrides = from.loadWalletData(AUTH_KEY_OVERRIDES_STORAGE_KEY);
 		if (overrides !== null) {
 			to.saveWalletData(AUTH_KEY_OVERRIDES_STORAGE_KEY, overrides);
@@ -6919,7 +6981,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 						'runnable recovery state'
 				);
 			}
-			await this.initNode(opts);
+			await this.buildNode(opts);
 			this._restorePending = false;
 			const info = {
 				exact: result.wireSafetyProof !== undefined,
@@ -17508,6 +17570,16 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 		return this.node;
 	}
 
+	/** The host of options.extensions, for the daemon; absent without any. */
+	get extensionHost(): ExtensionHost | undefined {
+		return this._extensionHost;
+	}
+
+	/** One entry per extension with its state, as GET /extensions answers. */
+	describeExtensions(): IExtensionInfo[] {
+		return this._extensionHost?.describe() ?? [];
+	}
+
 	/**
 	 * The node's current SqliteStorage. An in-process capsule resume closes
 	 * it and installs a new one, so anything that persists through it reads
@@ -17589,6 +17661,9 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 				/* best-effort: backup errors already surface via backup:failed */
 			});
 		}
+		// Extensions stop while the wallet and the database still work. No
+		// await without one, so the shutdown keeps its timing.
+		if (this._extensionHost) await this._extensionHost.shutdown();
 		// A restore-pending daemon never built the node or the wallet. The
 		// node closes only its view of the database: the wallet writes
 		// through the database too, and its stop() waits for a refresh in
@@ -17642,7 +17717,9 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 		// A restore-pending daemon never built the node or the wallet; the
 		// definite-assignment assertions on the fields do not change that.
 		// The node closes only its view of the database, as in
-		// gracefulShutdown (issue #958).
+		// gracefulShutdown (issue #958). Extensions are fenced without a wait:
+		// destroy() reaches wallet.stop() before its first await.
+		this._extensionHost?.abort();
 		try {
 			(this.node as LightningNode | undefined)?.destroy();
 		} finally {

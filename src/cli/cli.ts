@@ -24,6 +24,7 @@ import {
 } from './config';
 import { AUTH_OFF_WARNING, startDaemon } from './daemon';
 import { daemonOptions } from './daemon-options';
+import { extensionPathsFromEnv, loadExtensions } from './extension-loader';
 import { unpatchedNodeWarning } from '../utils/node-version';
 import { BeignetNode, defaultDataDirForMnemonic } from './beignet-node';
 import { BeignetError } from './errors';
@@ -315,6 +316,8 @@ async function main(): Promise<void> {
 			);
 		case 'watchtower':
 			return handleWatchtower();
+		case 'extensions':
+			return outputResult(await httpRequest('GET', '/extensions'));
 		case 'route':
 			return handleRoute();
 		case 'rebalance':
@@ -571,9 +574,25 @@ async function handleStart(): Promise<void> {
 	const isDaemon = hasFlag('--daemon');
 
 	try {
-		const { stop, logger } = await startDaemon(
-			daemonOptions(config, daemonPort)
-		);
+		// Host extensions (docs/EXTENSIONS.md) are named only here, by the
+		// flag or the environment of the process that starts the daemon:
+		// never by config.json, which an API caller can reach.
+		const extensionFiles = [
+			...parseRepeatedFlag('--extension'),
+			...extensionPathsFromEnv(process.env.BEIGNET_EXTENSIONS)
+		];
+		// Without a network the start is refused below, for that reason.
+		const extensions =
+			extensionFiles.length > 0 && config.network
+				? await loadExtensions(extensionFiles, {
+						network: config.network,
+						env: process.env
+				  })
+				: undefined;
+		const { stop, logger } = await startDaemon({
+			...daemonOptions(config, daemonPort),
+			...(extensions ? { extensions } : {})
+		});
 
 		// No credential at all (issue #1005): the daemon logs this at warn
 		// level, which the default silent log level swallows, so the CLI says
@@ -3581,6 +3600,10 @@ Watchtowers:
   watchtower list                        Per-tower session + backlog health
   watchtower add <pubkey@host:port>      Add an LND altruist watchtower
   watchtower remove <pubkey@host:port>   Remove a watchtower
+
+Extensions:
+  extensions                             Host extensions running in the daemon,
+                                         their state and the routes they serve
 
 BOLT 12 Offers:
   offer create <description> [amountSats]  Create reusable offer

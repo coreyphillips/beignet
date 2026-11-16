@@ -274,6 +274,34 @@ export function getOpenApiSpec(): Record<string, unknown> {
 					}
 				}
 			},
+			'/extensions': {
+				get: {
+					summary:
+						'Host extensions running in this daemon (docs/EXTENSIONS.md): the state of each and the routes it serves under /x/<id>. Those routes appear in this document only as served by a daemon that runs the extension',
+					tags: ['Node'],
+					responses: {
+						'200': {
+							description:
+								'The extension contract this engine provides, and one entry per extension named at start',
+							content: jsonContent({
+								type: 'object',
+								required: ['api', 'extensions'],
+								properties: {
+									api: {
+										type: 'string',
+										description:
+											"The contract version, 'beignet-extension-api/1'"
+									},
+									extensions: {
+										type: 'array',
+										items: { $ref: '#/components/schemas/ExtensionInfo' }
+									}
+								}
+							})
+						}
+					}
+				}
+			},
 			'/watchtower/add': {
 				post: {
 					summary: 'Add a watchtower (pubkey@host:port, LND altruist tower)',
@@ -5729,6 +5757,72 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						sessions: { type: 'integer' },
 						pendingBacklog: { type: 'integer' },
 						lastAck: { type: 'integer', nullable: true }
+					}
+				},
+				ExtensionInfo: {
+					type: 'object',
+					required: [
+						'id',
+						'version',
+						'state',
+						'generation',
+						'routes',
+						'events'
+					],
+					properties: {
+						id: {
+							type: 'string',
+							description:
+								'Its route prefix (/x/<id>), event prefix and storage namespace'
+						},
+						version: { type: 'string' },
+						state: {
+							type: 'string',
+							enum: ['pending', 'attached', 'ready', 'failed', 'stopped'],
+							description:
+								'pending before the node is built, attached once its routes are served, ready once its start() returned, failed when attach() or start() threw (the node runs without it), stopped across a rebuild or a shutdown'
+						},
+						generation: {
+							type: 'integer',
+							description:
+								'The node build it is attached to: 1 at boot, one more for each in-process rebuild, 0 before the first'
+						},
+						error: {
+							type: 'string',
+							description: 'Why it failed, when state is failed'
+						},
+						routes: {
+							type: 'array',
+							items: {
+								type: 'object',
+								required: ['method', 'path', 'scopes', 'idempotent'],
+								properties: {
+									method: { type: 'string', enum: ['GET', 'POST', 'DELETE'] },
+									path: {
+										type: 'string',
+										description: 'As served: /x/<id>/...'
+									},
+									scopes: {
+										type: 'array',
+										items: { type: 'string' },
+										description: 'The API key scopes the route accepts'
+									},
+									idempotent: {
+										type: 'boolean',
+										description: 'Whether it honours X-Idempotency-Key'
+									}
+								}
+							}
+						},
+						events: {
+							type: 'array',
+							items: { type: 'string' },
+							description: 'Event names as relayed on GET /events: <id>:<name>'
+						},
+						status: {
+							description:
+								'The summary the extension reports about itself, when it is running and has one'
+						}
 					}
 				},
 				HealthInfo: {
