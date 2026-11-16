@@ -9,6 +9,7 @@
 import type { IRoutingHintHop, Network } from '../invoice/types';
 import type { IBolt12Invoice } from '../offer/types';
 import type { IChannelConfig, ChannelState } from '../channel/types';
+import type { IAuxiliaryChannelConfig } from '../channel/auxiliary-funding';
 import type { ChannelErrorCode } from '../channel/channel-actions';
 import { CodedError } from '../../utils/errors';
 import type { IChannelBasepoints } from '../keys/derivation';
@@ -722,6 +723,18 @@ export interface INodeConfig {
 	 * mainnet balances yet.
 	 */
 	preferTaproot?: boolean;
+	/**
+	 * Asset channels (Taproot Assets, as LND and tapd deploy them): a provider
+	 * that commits a second asset to taproot channels, and the callbacks that
+	 * tie funding, payment and forwarding to the host's asset protocol. Setting
+	 * it advertises the taproot overlay feature (optional bit 2025) with the
+	 * simple taproot bit it depends on (181), which takes option_simple_close
+	 * off the advertisement like any taproot advertisement does, and makes
+	 * the node read the custom records (TLV types at or above 65536) of a
+	 * peer's init. Unset, the default, the node sets none of those bits and
+	 * rejects an unknown even init record as before.
+	 */
+	auxiliaryChannels?: IAuxiliaryChannelConfig;
 	/**
 	 * Liquidity ads (bLIP-0051) SELLER policy: when set, an inbound
 	 * open_channel2 carrying request_funds is answered with a signed will_fund

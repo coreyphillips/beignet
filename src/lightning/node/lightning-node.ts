@@ -2038,6 +2038,28 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			localFeatures.clearBit(Feature.DUAL_FUND);
 			localFeatures.clearBit(Feature.DUAL_FUND + 1);
 		}
+		// Asset channels (issue #2093): a node with an auxiliary channel
+		// provider advertises the taproot overlay pair as LND and tapd deploy
+		// it (optional bit 2025) and the simple taproot bit the overlay
+		// depends on in the init of both peers. This sits above the simple
+		// close strip below on purpose: advertising taproot costs this node
+		// option_simple_close like any other taproot advertisement does
+		// (issue #1929). Fixed asset HTLC outputs (450) and child custody
+		// (452) are not offered yet, so a caller-supplied set cannot advertise
+		// them. dual_fund stays advertised: an asset open asks for v1
+		// negotiation itself. A node without a provider is left exactly as
+		// it was, nothing here sets or clears a bit for it.
+		if (config.auxiliaryChannels) {
+			localFeatures.setOptional(Feature.OPTION_TAPROOT);
+			localFeatures.setOptional(Feature.OPTION_TAPROOT_OVERLAY);
+			for (const feature of [
+				Feature.OPTION_ASSET_FIXED_HTLC_OUTPUTS,
+				Feature.OPTION_ASSET_CHILD_CUSTODY
+			]) {
+				localFeatures.clearBit(feature);
+				localFeatures.clearBit(feature + 1);
+			}
+		}
 		// Taproot channels only close through closing_signed here (MuSig2
 		// partial signature in TLV 6), while LND 0.21 runs its RBF close
 		// (closing_complete / closing_sig, partial signatures in TLVs 5 to 7)
@@ -2596,6 +2618,11 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			this.peerManager = new PeerManager({
 				isKnownCustomMessageType: (type): boolean =>
 					this.rawCustomMessageTypes.has(type),
+				// Init custom records are sent and read only with an auxiliary
+				// channel provider. Without one both are off and the init codec
+				// is the standard one.
+				initCustomRecords: config.auxiliaryChannels?.initCustomRecords,
+				readInitCustomRecords: !!config.auxiliaryChannels,
 				localPrivateKey: config.nodePrivateKey,
 				localFeatures,
 				networks: config.chainHashes,
@@ -28578,6 +28605,21 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 
 		// Route channel messages to ChannelManager
 		this.channelManager.handleMessage(pubkey, type, payload);
+	}
+
+	/**
+	 * The custom records (TLV types at or above 65536) of a connected peer's
+	 * init, each value copied. Empty when the peer is not connected, sent
+	 * none, or this node has no auxiliary channel provider and so did not
+	 * read them. The identity is the Noise-authenticated one.
+	 */
+	getPeerCustomRecords(peerPubkey: string): Map<bigint, Buffer> {
+		peerPubkey = normalizeHexPubkey(peerPubkey);
+		const records = this.peerManager?.getPeer(peerPubkey)?.getRemoteInit()
+			?.customRecords;
+		return new Map(
+			[...(records ?? [])].map(([type, value]) => [type, Buffer.from(value)])
+		);
 	}
 
 	/**

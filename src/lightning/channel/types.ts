@@ -33,6 +33,22 @@ export function isTaprootChannel(channelType: Buffer | null): boolean {
 }
 
 /**
+ * Whether a channel_type carries the taproot asset overlay bit (2026), which
+ * marks an auxiliary (asset) channel.
+ */
+export function isOverlayChannel(
+	channelType: Buffer | null | undefined
+): boolean {
+	return (
+		!!channelType &&
+		channelType.length > 0 &&
+		FeatureFlags.fromBuffer(channelType).hasFeature(
+			Feature.OPTION_TAPROOT_OVERLAY
+		)
+	);
+}
+
+/**
  * Check whether a negotiated channel_type includes option_scid_alias.
  *
  * BOLT 2 conditions the "MUST NOT allow incoming HTLCs using the real

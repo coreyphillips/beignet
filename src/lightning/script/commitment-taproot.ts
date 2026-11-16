@@ -30,6 +30,16 @@ type Tapleaf = { output: Buffer; version?: number };
 type Taptree = [Taptree | Tapleaf, Taptree | Tapleaf] | Tapleaf;
 
 /**
+ * A tapscript leaf an auxiliary channel provider commits beside the ordinary
+ * Bitcoin spend tree of a commitment output (an asset commitment). The leaf
+ * version defaults to the tapscript version, 0xc0.
+ */
+export interface ITaprootAuxLeaf {
+	script: Buffer;
+	leafVersion?: number;
+}
+
+/**
  * NUMS point (x-only) used as the taproot internal key for the to_local/to_remote
  * commitment outputs so key-path spends are impossible.
  *

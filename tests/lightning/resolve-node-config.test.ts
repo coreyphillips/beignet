@@ -14,6 +14,7 @@ import type {
 } from '../../src/lightning/node/types';
 import type { IChannelBasepoints } from '../../src/lightning/keys/derivation';
 import type { IChannelConfig } from '../../src/lightning/channel/types';
+import type { IChannelAuxiliaryProvider } from '../../src/lightning/channel/auxiliary';
 import { Network } from '../../src/lightning/invoice/types';
 import { Feature } from '../../src/lightning/features/flags';
 import {
@@ -333,6 +334,7 @@ describe('LightningNode.fromMnemonic options', () => {
 			preferAnchors: undefined,
 			largeChannels: undefined,
 			preferTaproot: undefined,
+			auxiliaryChannels: undefined,
 			leaseRates: undefined,
 			peerStorageEnabled: undefined,
 			feeEstimator: undefined,
@@ -438,6 +440,21 @@ describe('LightningNode.fromMnemonic options', () => {
 		// Without the option there is no host key to derive.
 		expect(() => LightningNode.fromMnemonic(MNEMONIC, {})).to.throw('captured');
 		expect(seen[1]).to.have.property('porch', undefined);
+	});
+
+	it('advertises the required simple Taproot dependency for asset overlays', () => {
+		const node = LightningNode.fromMnemonic(MNEMONIC, {
+			auxiliaryChannels: {
+				provider: {} as IChannelAuxiliaryProvider,
+				resolveIncoming: () => undefined
+			}
+		});
+		nodes.push(node);
+		const flags = node.getLocalFeatures();
+		expect(flags.listSetBits()).to.include(181);
+		expect(flags.listSetBits()).to.include(2025);
+		expect(flags.hasFeature(Feature.STATIC_REMOTE_KEY)).to.equal(true);
+		expect(flags.hasFeature(Feature.ANCHOR_ZERO_FEE_HTLC)).to.equal(true);
 	});
 
 	it('applies the options it used to drop', () => {

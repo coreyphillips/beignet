@@ -72,7 +72,9 @@ const FOREIGN_PAIRS: ReadonlyArray<{
 /** Foreign pairs beignet takes on purpose, for the same feature. */
 const SHARED_ON_PURPOSE = new Map<number, Feature>([
 	// LND's staging taproot bit, which is what LND actually advertises.
-	[180, Feature.OPTION_TAPROOT]
+	[180, Feature.OPTION_TAPROOT],
+	// The taproot asset overlay as LND and tapd deploy it (issue #2093).
+	[2026, Feature.OPTION_TAPROOT_OVERLAY]
 ]);
 
 function foreignOwner(bit: number): string | null {
@@ -88,6 +90,8 @@ function collisions(bits: number[]): string[] {
 		const owner = foreignOwner(bit);
 		if (!owner) continue;
 		if (SHARED_ON_PURPOSE.get(bit - (bit % 2)) !== undefined) continue;
+		// The overlay's optional bit is 2025, on the pair below its own.
+		if (bit === 2025 && SHARED_ON_PURPOSE.has(2026)) continue;
 		out.push(`${bit}: ${owner}`);
 	}
 	return out;
@@ -162,6 +166,23 @@ describe('Feature bit collisions with other implementations (issue #1886)', () =
 		expect(Feature.ASYNC_RECEIVE_SERVICE).to.equal(444);
 		// 446-453 are left for the taproot asset channel work.
 		expect(Feature.OPTION_COMPOSITE_SPLICE_INPUTS).to.equal(454);
+	});
+
+	it('the asset channel bits are 450 and 452, inside the block left for them', () => {
+		expect(Feature.OPTION_ASSET_FIXED_HTLC_OUTPUTS).to.equal(450);
+		expect(Feature.OPTION_ASSET_CHILD_CUSTODY).to.equal(452);
+	});
+
+	it('shares the deployed overlay required bit and its nonadjacent optional partner', () => {
+		const flags = FeatureFlags.empty();
+		flags.setOptional(Feature.OPTION_TAPROOT_OVERLAY);
+		expect(flags.listSetBits()).to.deep.equal([2025]);
+		expect(collisions(flags.listSetBits())).to.deep.equal([]);
+		flags.setCompulsory(Feature.OPTION_TAPROOT_OVERLAY);
+		expect(flags.hasBit(2026)).to.equal(true);
+		expect(collisions(flags.listSetBits())).to.deep.equal([]);
+		// The other bit of the 2024 pair is still foreign.
+		expect(collisions([2024])).to.have.length(1);
 	});
 
 	it('a node with every beignet feature on puts no foreign bit in init or node_announcement', () => {

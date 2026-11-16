@@ -135,7 +135,36 @@ export enum Feature {
 	 * tx_complete, so the bit is what makes the selection safe, not what makes
 	 * the input acceptable.
 	 */
-	OPTION_COMPOSITE_SPLICE_INPUTS = 454
+	OPTION_COMPOSITE_SPLICE_INPUTS = 454,
+	/**
+	 * Taproot asset channel overlay, the pair LND and tapd deploy: the required
+	 * bit is 2026 and its optional partner is 2025, the bit below it rather
+	 * than the bit above. setOptional(), hasFeature() and isOptional() map
+	 * this one feature to 2025. Advertised only by a node configured with
+	 * `auxiliaryChannels`; a node without it neither sets nor understands
+	 * the pair.
+	 */
+	OPTION_TAPROOT_OVERLAY = 2026,
+	/**
+	 * Asset channel HTLC signatures that bind the complete second-level
+	 * output set (bits 450/451, in the block reserved for asset channels).
+	 * Meaningful only on an overlay channel.
+	 */
+	OPTION_ASSET_FIXED_HTLC_OUTPUTS = 450,
+	/**
+	 * Optional scoped custody for the asset HTLC children of a revoked
+	 * commitment (bits 452/453). Requires fixed asset HTLC outputs.
+	 */
+	OPTION_ASSET_CHILD_CUSTODY = 452
+}
+
+/**
+ * The optional bit of a feature. Every feature pairs its even bit with the
+ * odd bit above it except the deployed taproot overlay, whose optional bit
+ * is 2025.
+ */
+function optionalBit(feature: number): number {
+	return feature === Feature.OPTION_TAPROOT_OVERLAY ? 2025 : feature + 1;
 }
 
 /**
@@ -231,7 +260,7 @@ export class FeatureFlags {
 	 * @param feature - Feature enum value (even bit position)
 	 */
 	setOptional(feature: Feature): void {
-		this.setBit(feature + 1);
+		this.setBit(optionalBit(feature));
 	}
 
 	/**
@@ -240,7 +269,7 @@ export class FeatureFlags {
 	 * @returns True if either the even or odd bit is set
 	 */
 	hasFeature(feature: Feature): boolean {
-		return this.hasBit(feature) || this.hasBit(feature + 1);
+		return this.hasBit(feature) || this.hasBit(optionalBit(feature));
 	}
 
 	/**
@@ -256,7 +285,7 @@ export class FeatureFlags {
 	 * @param feature - Feature enum value (even bit position)
 	 */
 	isOptional(feature: Feature): boolean {
-		return this.hasBit(feature + 1);
+		return this.hasBit(optionalBit(feature));
 	}
 
 	/**
@@ -330,6 +359,16 @@ export class FeatureFlags {
 	}
 }
 
+/** What the required-feature check may assume about the local node. */
+export interface IRequiredFeatureOptions {
+	/**
+	 * The node runs asset channels (an auxiliary channel provider is
+	 * configured), so the optional bit of the taproot overlay is 2025, as
+	 * deployed. Unset, bit 2026 is paired like any other feature.
+	 */
+	taprootOverlay?: boolean;
+}
+
 /**
  * Check if a remote peer requires features we don't support (BOLT 1).
  *
@@ -340,7 +379,8 @@ export class FeatureFlags {
  */
 export function hasUnsupportedRequiredFeatures(
 	localFeatures: FeatureFlags,
-	remoteFeatures: FeatureFlags
+	remoteFeatures: FeatureFlags,
+	options: IRequiredFeatureOptions = {}
 ): number[] {
 	const unsupported: number[] = [];
 	const maxBit = remoteFeatures.maxBit();
@@ -364,10 +404,14 @@ export function hasUnsupportedRequiredFeatures(
 				unsupported.push(bit);
 				continue;
 			}
-			// We support this feature if we have either the even or odd bit set
+			// We support this feature if we have either the even or odd bit set.
+			// The overlay's optional bit is 2025 only for a node that runs
+			// asset channels. For every other node bit 2026 pairs with 2027,
+			// as any feature does, so its handshakes end as they always did.
+			const partner = options.taprootOverlay ? optionalBit(bit) : bit + 1;
 			if (
 				!localFeatures.hasBit(bit) &&
-				!localFeatures.hasBit(bit + 1) &&
+				!localFeatures.hasBit(partner) &&
 				!implemented.hasBit(bit) &&
 				!implemented.hasBit(bit + 1)
 			) {
