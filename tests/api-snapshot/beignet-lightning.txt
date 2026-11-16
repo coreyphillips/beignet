@@ -1,6 +1,9 @@
 # The exported API of beignet/lightning. Regenerate with npm run api:snapshot; do not edit.
 unexported type DeprecatedNodeConfigKey = 'forwardingEnabled' | 'forwardingCltvDelta' | 'forwardingFeeBaseMsat' | 'forwardingFeePropMillionths' | 'forwardingPolicyGraceMs' | 'fforSettle' | 'fforConcurrent' | 'fforWitness' | 'fforIssuer'
 unexported type EventMap<E> = { [K in keyof E]: (...args: any[]) => void; }
+unexported interface IAuxiliaryFeeFunding
+method IAuxiliaryFeeFunding.finalize(funded: bitcoinjs-lib#Transaction, prevouts: { scripts: Buffer[]; values: bigint[]; }): { ok: true; data?: Buffer; } | { ok: false; refusal: string; }
+property IAuxiliaryFeeFunding.prevout: { script: Buffer; value: bigint; }
 unexported interface ICompactHtlcHistory
 property ICompactHtlcHistory.entries: IHistoryEntry[]
 property ICompactHtlcHistory.snapshots: { commitmentNumber: string; prefix: number; remove: number; add: number[]; }[]
@@ -603,6 +606,9 @@ class chain.ChainMonitor
 constructor chain.ChainMonitor(channelState: channel.IChannelState, destinationScript: Buffer, feeRatePerVbyte: number, revocationBasepointSecret: Buffer, paymentPrivkey: Buffer, network?: bitcoinjs-lib#Network, delayedPaymentBasepointSecret?: Buffer, htlcBasepointSecret?: Buffer)
 method chain.ChainMonitor.addPreimage(paymentHash: Buffer, preimage: Buffer): chain.ChainAction[]
 method chain.ChainMonitor.dropUnusedPreimages(heldElsewhere: ReadonlyMap<string, Buffer>): number
+method chain.ChainMonitor.fixedOutputFeeRaise(output: chain.ITrackedOutput, feeRatePerVbyte: number): chain.IFeeBumpAndBroadcastChainAction | undefined
+method chain.ChainMonitor.fixedOutputFeeResolved(txid: string, outputIndex: number, evenIfNotOpen?: boolean): { spendingTransaction?: Buffer; } | undefined
+method chain.ChainMonitor.fundFixedOutputSpend(txid: string, outputIndex: number, feeRatePerVbyte: number, feeInputs: ReadonlyArray<{ hash: Buffer; index: number; sequence: number; script: Buffer; value: bigint; }>, signFeeInputs: (transaction: bitcoinjs-lib#Transaction, prevouts: { scripts: Buffer[]; values: bigint[]; }) => void): { ok: true; transaction: Buffer; broadcast: boolean; } | { ok: false; refusal?: string; }
 method chain.ChainMonitor.getChannelState(): channel.IChannelState
 method chain.ChainMonitor.getFullState(): chain.IChainMonitorState
 method chain.ChainMonitor.getKnownPreimages(): ReadonlyMap<string, Buffer>
@@ -617,6 +623,8 @@ method chain.ChainMonitor.handleSpendUnconfirmed(txid: string, outputIndex: numb
 method chain.ChainMonitor.isCommitmentConfirmed(): boolean
 method chain.ChainMonitor.isCommitmentReverifyPending(): boolean
 method chain.ChainMonitor.isFullyResolved(): boolean
+method chain.ChainMonitor.noteFixedOutputFeeRetired(txid: string, outputIndex: number): void
+method chain.ChainMonitor.noteFixedOutputFeeWait(txid: string, outputIndex: number, wait: { code: string; remedy?: string; message?: string; }, height?: number): void
 method chain.ChainMonitor.offerAuxiliarySweep(transaction: Buffer): boolean
 method chain.ChainMonitor.rebuildSweep(output: chain.ITrackedOutput, feeRatePerVbyte: number): bitcoinjs-lib#Transaction | null
 method chain.ChainMonitor.rebuildSweeps(output: chain.ITrackedOutput, feeRatePerVbyte: number): bitcoinjs-lib#Transaction[]
@@ -787,7 +795,8 @@ property chain.IFeeBumpAndBroadcastChainAction.anchorWitnessScript?: Buffer
 property chain.IFeeBumpAndBroadcastChainAction.commitmentTxid?: string
 property chain.IFeeBumpAndBroadcastChainAction.description: string
 property chain.IFeeBumpAndBroadcastChainAction.feeratePerVbyte: number
-property chain.IFeeBumpAndBroadcastChainAction.kind: 'htlc-fee-attach' | 'anchor-cpfp'
+property chain.IFeeBumpAndBroadcastChainAction.fixedOutput?: { txid: string; outputIndex: number; }
+property chain.IFeeBumpAndBroadcastChainAction.kind: 'htlc-fee-attach' | 'anchor-cpfp' | 'fixed-output-fee'
 property chain.IFeeBumpAndBroadcastChainAction.parentFeeSats?: bigint
 property chain.IFeeBumpAndBroadcastChainAction.parentVbytes?: number
 property chain.IFeeBumpAndBroadcastChainAction.taprootAnchorKeyRole?: 'delayed' | 'payment'
@@ -826,6 +835,7 @@ property chain.IRemoteHtlcPreimageClaimParams.outputIndex: number
 property chain.IRemoteHtlcPreimageClaimParams.witnessScript: Buffer
 interface chain.IResolvedOutput
 property chain.IResolvedOutput.auxiliaryData?: Buffer
+property chain.IResolvedOutput.auxiliaryFunding?: IAuxiliaryFeeFunding
 property chain.IResolvedOutput.cltvExpiry?: number
 property chain.IResolvedOutput.csvDelay?: number
 property chain.IResolvedOutput.declinedAsUneconomic?: boolean
@@ -885,7 +895,13 @@ interface chain.ITrackedOutput
 property chain.ITrackedOutput.amount: bigint
 property chain.ITrackedOutput.auxiliaryCommitmentNumber?: bigint
 property chain.ITrackedOutput.auxiliaryData?: Buffer
+property chain.ITrackedOutput.auxiliaryFeeActionOpen?: true
 property chain.ITrackedOutput.auxiliaryFeeFunding?: boolean
+property chain.ITrackedOutput.auxiliaryFeeRate?: number
+property chain.ITrackedOutput.auxiliaryFeeWait?: { code: string; remedy?: string; message?: string; sinceHeight: number; deadlineHeight?: number; }
+property chain.ITrackedOutput.auxiliaryHtlc?: { id: bigint; direction: channel.HtlcDirection; }
+property chain.ITrackedOutput.auxiliaryParentData?: Buffer
+property chain.ITrackedOutput.auxiliaryParentTxHex?: string
 property chain.ITrackedOutput.auxiliaryRefusal?: string
 property chain.ITrackedOutput.auxiliarySweepAttempts?: Record<string, { transaction: string; auxiliaryData?: Buffer; offered?: true; }>
 property chain.ITrackedOutput.broadcastHeight?: number
@@ -982,7 +998,7 @@ function chain.parseFixedOutputHtlcFeeActionId(value: string): { channelId: Buff
 function chain.resolveOurCommitmentOutputs(state: channel.IChannelState, trackedOutputs: chain.ITrackedOutput[], commitmentNumber: bigint, destinationScript: Buffer, feeRatePerVbyte: number, knownPreimages: Map<string, Buffer>, delayedPaymentBasepointSecret?: Buffer, htlcBasepointSecret?: Buffer, remoteHtlcSignatures?: Buffer[]): chain.IResolvedOutput[]
 function chain.resolveRevokedCommitmentOutputs(state: channel.IChannelState, trackedOutputs: chain.ITrackedOutput[], commitmentNumber: bigint, revokedTx: bitcoinjs-lib#Transaction, destinationScript: Buffer, feeRatePerVbyte: number, revocationBasepointSecret: Buffer, paymentPrivkey: Buffer, network?: bitcoinjs-lib#Network, currentHeight?: number, claimedOutputIndices?: chain.ClaimedOutputIndices): chain.IResolvedOutput[]
 function chain.resolveRevokedSecondLevelOutput(state: channel.IChannelState, spendingTx: bitcoinjs-lib#Transaction, confirmationHeight: number, commitmentNumber: bigint, destinationScript: Buffer, feeRatePerVbyte: number, revocationBasepointSecret: Buffer, network?: bitcoinjs-lib#Network): chain.IResolvedOutput[]
-function chain.resolveSecondLevelHtlcOutput(state: channel.IChannelState, htlcTx: bitcoinjs-lib#Transaction, confirmationHeight: number, commitmentNumber: bigint, destinationScript: Buffer, feeRatePerVbyte: number, delayedPaymentBasepointSecret: Buffer | undefined, network?: bitcoinjs-lib#Network): chain.IResolvedOutput | null
+function chain.resolveSecondLevelHtlcOutput(state: channel.IChannelState, htlcTx: bitcoinjs-lib#Transaction, confirmationHeight: number, commitmentNumber: bigint, destinationScript: Buffer, feeRatePerVbyte: number, delayedPaymentBasepointSecret: Buffer | undefined, network?: bitcoinjs-lib#Network, htlcOutput?: chain.ITrackedOutput): chain.IResolvedOutput | null
 function chain.resolveTheirCurrentCommitmentOutputs(state: channel.IChannelState, trackedOutputs: chain.ITrackedOutput[], destinationScript: Buffer, feeRatePerVbyte: number, knownPreimages: Map<string, Buffer>, paymentPrivkey: Buffer, htlcBasepointSecret?: Buffer, remotePerCommitmentPoint?: Buffer): chain.IResolvedOutput[]
 function chain.satPerKwToSatPerVbyte(satPerKw: number): number
 function chain.satPerVbyteToSatPerKw(satPerVbyte: number): number

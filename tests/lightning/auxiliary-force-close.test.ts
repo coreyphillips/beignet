@@ -539,8 +539,15 @@ describe('an asset channel with a commitment on the chain (issue #2093)', functi
 		expect(poor.auxiliaryCommitmentNumber).to.be.a('bigint');
 		expect(poor.status).to.equal(OutputStatus.CONFIRMED);
 		expect(poor.auxiliaryFeeFunding).to.equal(true);
-		expect(poor.sweepTxHex).to.equal(undefined);
-		// The provider is not asked about a sweep that cannot be made.
+
+		// Its spend is held with no fee input, and its row says what it waits
+		// for: this node was given no wallet to take one from.
+		expect(bitcoin.Transaction.fromHex(poor.sweepTxHex!).ins).to.have.length(1);
+		expect(poor.auxiliaryFeeWait).to.deep.include({
+			code: 'FEE_WALLET_UNAVAILABLE'
+		});
+		// The provider is not asked about a spend that cannot go out.
+
 		expect(pair.sweeps.bob).to.deep.equal([]);
 		expect(pair.backends.bob.published).to.deep.equal([]);
 	});

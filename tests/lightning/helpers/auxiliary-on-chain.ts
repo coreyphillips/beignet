@@ -34,6 +34,9 @@ import {
 } from './auxiliary-pair';
 import { makeSeed } from './loopback-nodes';
 
+import { chainWallet, type IChainWallet } from './auxiliary-fee-wallet';
+import type { IFixedOutputFeePolicy } from '../../../src/lightning/wallet/fixed-output-fees';
+
 export const settle = async (): Promise<void> => {
 	for (let i = 0; i < 40; i++) {
 		await new Promise<void>((resolve) => setImmediate(resolve));
@@ -115,7 +118,19 @@ export function sweepingProvider(
 				return signature;
 			});
 			const right: IAuxiliarySweepResult = {
-				outputScripts: new Map([[0, Buffer.from(ASSET_SWEEP_SCRIPT)]]),
+				// A second-level HTLC transaction keeps the output the peer
+				// signed for; every other sweep sends the units to one script.
+				outputScripts: new Map([
+					[
+						0,
+						context.inputs.some((input) =>
+							input.kind.startsWith('htlc_second_level')
+						)
+							? Buffer.from(context.transaction.outs[0].script)
+							: Buffer.from(ASSET_SWEEP_SCRIPT)
+					]
+				]),
+
 				customData: Buffer.concat([Buffer.from(sweepData(call)), ...signatures])
 			};
 			return control.answer
@@ -132,6 +147,10 @@ export interface IAssetChainPair {
 	backends: { alice: TestChainBackend; bob: TestChainBackend };
 	/** Every time either provider was asked for the asset side of a sweep. */
 	sweeps: { alice: ISweepCall[]; bob: ISweepCall[] };
+
+	/** The wallet whose coins pay the fees of a host's fixed-output spends. */
+	wallets: { alice?: IChainWallet; bob?: IChainWallet };
+
 	/** The database file of Alice, who can be restarted from it. */
 	alicePath: string;
 	channelId: Buffer;
@@ -144,6 +163,13 @@ export interface IAssetChainOptions {
 	fundingSatoshis?: bigint;
 	pushMsat?: bigint;
 	control?: { alice?: ISweepControl; bob?: ISweepControl };
+
+	/** Give a host a wallet on the chain and the real fee pool over it. */
+	feeWallet?: {
+		alice?: Partial<IFixedOutputFeePolicy> | true;
+		bob?: Partial<IFixedOutputFeePolicy> | true;
+	};
+
 	hooks?: {
 		alice?: Partial<IAuxiliaryChannelConfig>;
 		bob?: Partial<IAuxiliaryChannelConfig>;
@@ -198,6 +224,89 @@ export async function payUnits(
 	}
 }
 
+/**
+ * Alice offers Bob `units` against a hold invoice, and the HTLC stays in
+ * flight on both sides: Bob holds the preimage and has not used it. Bob's
+ * host needs the `valueIncomingHtlc` hook.
+ */
+export async function holdUnits(
+	pair: IAssetChainPair,
+	units: bigint,
+	tag: string,
+	expiryDelta = 60
+): Promise<{ paymentHash: Buffer; preimage: Buffer; cltvExpiry: number }> {
+	const { alice, bob, channelId, chain } = pair;
+	const preimage = hash(`held preimage ${tag}`);
+	const paymentHash = crypto.createHash('sha256').update(preimage).digest();
+	const invoice = bob.node.createInvoice({
+		amountMsat: units * 1000n,
+		description: `held ${tag}`,
+		hold: true,
+		paymentHash
+	});
+
+	const asked = chain.height + expiryDelta;
+	alice.node.sendPaymentToRoute(
+		{
+			hops: [
+				{
+					pubkey: Buffer.from(bob.node.getNodeId(), 'hex'),
+					shortChannelId: Buffer.alloc(8, 9),
+
+					amountToForwardMsat: units * 1000n,
+					outgoingCltvValue: asked
+				}
+			]
+		},
+		invoice.paymentHash,
+		expiryDelta,
+
+		invoice.paymentSecret,
+		undefined,
+		undefined,
+		undefined,
+		undefined,
+		{
+			assetPayment: {
+				channelId,
+				wireAmountMsat: 354_000n,
+				customRecords: amountRecord(units)
+			}
+		}
+	);
+	await settle();
+
+	const entries = [
+		...(bob.node
+			.getChannelManager()
+			.getChannel(channelId)
+			?.getFullState()
+			.htlcs.values() ?? [])
+	].filter((entry) => entry.paymentHash.equals(paymentHash));
+	// The expiry the HTLC has in the channel, which is what the chain goes by.
+	const cltvExpiry = entries[0]?.cltvExpiry ?? 0;
+	if (entries.length !== 1) {
+		throw new Error(
+			`the held HTLC of ${tag} is not in flight: ${alice.errors
+				.concat(bob.errors)
+				.join('; ')}`
+		);
+	}
+	return { paymentHash, preimage, cltvExpiry };
+}
+
+/** The two hosts of a pair stop hearing each other, as when a connection drops. */
+export function disconnect(pair: IAssetChainPair): void {
+	pair.alice.node.removeAllListeners('message:outbound');
+	pair.bob.node.removeAllListeners('message:outbound');
+	pair.alice.node
+		.getChannelManager()
+		.handlePeerDisconnected(pair.bob.node.getNodeId());
+	pair.bob.node
+		.getChannelManager()
+		.handlePeerDisconnected(pair.alice.node.getNodeId());
+}
+
 /** The outputs a host's monitor tracks for a channel, through the host's read. */
 export const trackedOutputs = (
 	host: IAssetHost,
@@ -240,10 +349,14 @@ export function assetChainWorld(): {
 		calls: ISweepCall[],
 		control: ISweepControl | undefined,
 		hooks: Partial<IAuxiliaryChannelConfig> | undefined,
-		sqlitePath: string | undefined
+
+		sqlitePath: string | undefined,
+		wallet?: IChainWallet
 	): Promise<{ host: IAssetHost; backend: TestChainBackend }> => {
 		const backend = new TestChainBackend(chain);
 		backends.push(backend);
+		wallet?.attach(backend);
+
 		// The secrets of the basepoints a loopback node is made with: what it
 		// signs a sweep or a penalty with.
 		const secret = (index: number): Buffer =>
@@ -260,7 +373,9 @@ export function assetChainWorld(): {
 				...(sqlitePath ? { sqlitePath } : { sqlite: true }),
 				extra: {
 					chainBackend: backend,
+					...(wallet ? { fundingProvider: wallet.provider() } : {}),
 					revocationBasepointSecret: secret(1),
+
 					paymentBasepointSecret: secret(2),
 					delayedPaymentBasepointSecret: secret(3)
 				}
@@ -288,6 +403,15 @@ export function assetChainWorld(): {
 			);
 			files.push(alicePath, `${alicePath}-wal`, `${alicePath}-shm`);
 			const sweeps = { alice: [] as ISweepCall[], bob: [] as ISweepCall[] };
+
+			const walletOf = (who: 'alice' | 'bob'): IChainWallet | undefined => {
+				const asked = options.feeWallet?.[who];
+				return asked
+					? chainWallet(chain, `${tag} ${who}`, asked === true ? {} : asked)
+					: undefined;
+			};
+			const wallets = { alice: walletOf('alice'), bob: walletOf('bob') };
+
 			const { host: alice, backend: aliceBackend } = await onChain(
 				tag,
 				1,
@@ -295,7 +419,8 @@ export function assetChainWorld(): {
 				sweeps.alice,
 				options.control?.alice,
 				options.hooks?.alice,
-				alicePath
+				alicePath,
+				wallets.alice
 			);
 			const { host: bob, backend: bobBackend } = await onChain(
 				tag,
@@ -304,7 +429,8 @@ export function assetChainWorld(): {
 				sweeps.bob,
 				options.control?.bob,
 				options.hooks?.bob,
-				undefined
+				undefined,
+				wallets.bob
 			);
 			connectHosts(alice, bob);
 			const openerUnits = options.openerUnits ?? 9000n;
@@ -363,6 +489,7 @@ export function assetChainWorld(): {
 				bob,
 				backends: { alice: aliceBackend, bob: bobBackend },
 				sweeps,
+				wallets,
 				alicePath,
 				channelId,
 				funding
@@ -397,7 +524,8 @@ export function assetChainWorld(): {
 				pair.sweeps.alice,
 				control,
 				undefined,
-				pair.alicePath
+				pair.alicePath,
+				pair.wallets.alice
 			);
 			pair.alice = host;
 			pair.backends.alice = backend;

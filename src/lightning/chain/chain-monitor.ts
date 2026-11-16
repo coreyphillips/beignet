@@ -8,12 +8,17 @@
 import * as bitcoin from 'bitcoinjs-lib';
 import { ecc } from '../../utils/ecc';
 import { sha256 } from '../crypto/provider';
+
 import type {
 	ChainAction,
+	IFeeBumpAndBroadcastChainAction,
 	ITrackedOutput,
 	ICommitmentBroadcast,
 	IFundingSpendScan
 } from './types';
+import type { IResolvedOutput } from './output-resolver';
+import type { IAuxiliaryFeeFunding } from './auxiliary-sweep';
+
 import {
 	ChainActionType,
 	MonitorState,
@@ -182,8 +187,13 @@ export class ChainMonitor {
 				o.status === OutputStatus.CONFIRMED &&
 				o.sweepTxHex !== undefined &&
 				// Skip sweeps already paying the current destination.
-				!this._sweepPaysDestination(o.sweepTxHex)
+
+				!this._sweepPaysDestination(o.sweepTxHex) &&
+				// A spend of an asset channel that wallet inputs pay for is kept
+				// as it is: its inputs are pledged to it.
+				!(this._channelState.auxiliaryState && o.auxiliaryFeeFunding)
 		);
+
 		if (held.length === 0) return;
 
 		try {
@@ -900,7 +910,8 @@ export class ChainMonitor {
 				output.status === OutputStatus.CONFIRMED &&
 				output.sweepTxHex !== undefined &&
 				output.maturityHeight !== undefined &&
-				blockHeight >= output.maturityHeight
+				blockHeight >= output.maturityHeight &&
+				!this._awaitsFeeInput(output)
 			) {
 				actions.push(
 					this._broadcastSweepAction(
@@ -1064,6 +1075,7 @@ export class ChainMonitor {
 		this._retryUnsweptRevokedSweeps(actions);
 		this._retryUnsweptPeerCommitmentClaims(actions);
 		this._retryUnsweptOurCommitmentSweeps(actions);
+		this._retryFixedOutputFees(actions);
 
 		// A retry can adopt a snapshot-reconstructed output after the scan above.
 		// Recompute from the current tracked set so a new in-flight claim cannot be
@@ -1249,6 +1261,17 @@ export class ChainMonitor {
 			} catch {
 				isOurSecondLevel = false;
 			}
+
+			if (
+				!isOurSecondLevel &&
+				this._channelState.auxiliaryState &&
+				output.auxiliarySweepAttempts?.[spendingTx.getId()]
+			) {
+				// One of the spends this node signed for the output, with wallet
+				// inputs other than those of the spend it holds now.
+				isOurSecondLevel = true;
+			}
+
 			if (isOurSecondLevel) {
 				const already = this._trackedOutputs.some(
 					(o) => o.txid === spendingTx.getId() && o.outputIndex === 0
@@ -1261,11 +1284,14 @@ export class ChainMonitor {
 						this._commitmentBroadcast.commitmentNumber,
 						this._destinationScript,
 						this._feeRatePerVbyte,
+
 						this._delayedPaymentBasepointSecret,
-						this._network
+						this._network,
+						this._channelState.auxiliaryState ? output : undefined
 					);
 					if (r) {
 						this._trackedOutputs.push(r.trackedOutput);
+
 						actions.push({
 							type: ChainActionType.WATCH_OUTPUT,
 							txid: r.trackedOutput.txid,
@@ -1276,6 +1302,7 @@ export class ChainMonitor {
 							r,
 							'second-level HTLC sweep (CSV delayed)'
 						);
+						this._reportAuxiliaryRefusals(actions, [r]);
 						if (r.declinedAsUneconomic) {
 							this._reportDeclinedClaims(actions, [r.trackedOutput]);
 						}
@@ -1850,6 +1877,16 @@ export class ChainMonitor {
 					r.trackedOutput.broadcastHeight = this._currentBlockHeight;
 					r.trackedOutput.originalFeeRate = this._feeRatePerVbyte;
 					r.trackedOutput.sweepTxHex = txBuf.toString('hex');
+
+					if (this._awaitsFeeInput(r.trackedOutput)) {
+						// Nothing has left yet: the spend goes out when the
+						// wallet input that pays for it is attached.
+						r.trackedOutput.status = OutputStatus.CONFIRMED;
+						r.trackedOutput.broadcastHeight = undefined;
+						if (r.trackedOutput.maturityHeight === undefined) {
+							r.trackedOutput.maturityHeight = this._currentBlockHeight;
+						}
+					}
 				}
 			}
 		} else if (commitmentType === CommitmentType.THEIR_CURRENT_COMMITMENT) {
@@ -1919,6 +1956,29 @@ export class ChainMonitor {
 		description: string
 	): ChainAction {
 		const carriesUnits = noteAuxiliarySweepOffered(output, txBuf);
+
+		if (this._channelState.auxiliaryState && output.auxiliaryFeeFunding) {
+			// A spend whose fee wallet inputs bring. Without them, or when the
+			// fee rate asked for is above the one it was made at, the fee pool
+			// is asked; otherwise it goes out again as it is.
+			let funded = false;
+			try {
+				funded = bitcoin.Transaction.fromBuffer(txBuf).ins.length > 1;
+			} catch {
+				funded = false;
+			}
+			const rate = output.currentFeeRate || this._feeRatePerVbyte;
+			if (!funded || rate > (output.auxiliaryFeeRate ?? 0)) {
+				return this._fixedOutputFeeAction(output, description);
+			}
+			return {
+				type: ChainActionType.BROADCAST_TX,
+				tx: txBuf,
+				description,
+				requiresMonitorPersistence: true
+			};
+		}
+
 		// Only our OWN commitment's second-level HTLC txs are the pre-signed
 		// zero-fee variant that needs a fee attached. HTLC claims on the remote's
 		// commitment are direct spends that already deduct a fee, and penalty
@@ -1946,6 +2006,331 @@ export class ChainMonitor {
 			description,
 			...(carriesUnits ? { requiresMonitorPersistence: true } : {})
 		};
+	}
+
+	/**
+	 * The action that asks the fee pool for the inputs of a spend of an
+	 * asset channel whose outputs are fixed.
+	 */
+	private _fixedOutputFeeAction(
+		output: ITrackedOutput,
+		description: string
+	): IFeeBumpAndBroadcastChainAction {
+		output.auxiliaryFeeActionOpen = true;
+		return {
+			type: ChainActionType.FEE_BUMP_AND_BROADCAST,
+			kind: 'fixed-output-fee',
+			tx: Buffer.from(output.sweepTxHex ?? '', 'hex'),
+			description,
+			feeratePerVbyte: output.currentFeeRate || this._feeRatePerVbyte,
+			fixedOutput: { txid: output.txid, outputIndex: output.outputIndex }
+		};
+	}
+
+	/**
+	 * The spend with wallet inputs that an output holds already, when it is
+	 * the given spend with such inputs attached.
+	 */
+	private _fundedSpendOf(
+		output: ITrackedOutput,
+		template: bitcoin.Transaction
+	): Buffer | undefined {
+		if (!output.sweepTxHex) return undefined;
+		try {
+			const present = bitcoin.Transaction.fromHex(output.sweepTxHex);
+			if (
+				present.ins.length < 2 ||
+				present.locktime !== template.locktime ||
+				present.outs.length !== template.outs.length ||
+				!Buffer.from(present.ins[0].hash).equals(
+					Buffer.from(template.ins[0].hash)
+				) ||
+				present.ins[0].index !== template.ins[0].index ||
+				present.ins[0].sequence !== template.ins[0].sequence ||
+				present.outs.some((out, at) => out.value !== template.outs[at].value) ||
+				present.ins.some((input) => input.witness.length === 0)
+			) {
+				return undefined;
+			}
+			return present.toBuffer();
+		} catch {
+			return undefined;
+		}
+	}
+
+	/**
+	 * Whether the stored spend of an output of an asset channel still lacks
+	 * the wallet input that pays for it: such a spend has not left this node
+	 * and its output is not said to be spent. False for any other channel.
+	 */
+	private _awaitsFeeInput(output: ITrackedOutput): boolean {
+		if (!this._channelState.auxiliaryState) return false;
+		if (!output.auxiliaryFeeFunding || !output.sweepTxHex) return false;
+		try {
+			return bitcoin.Transaction.fromHex(output.sweepTxHex).ins.length < 2;
+		} catch {
+			return true;
+		}
+	}
+
+	/**
+	 * Ask again, on every block, for the inputs of each spend of an asset
+	 * channel that still has none. Nothing for any other channel.
+	 */
+	private _retryFixedOutputFees(actions: ChainAction[]): void {
+		if (!this._channelState.auxiliaryState) return;
+		for (const output of this._trackedOutputs) {
+			if (!output.auxiliaryFeeFunding || !output.sweepTxHex) continue;
+			if (
+				output.status !== OutputStatus.CONFIRMED &&
+				output.status !== OutputStatus.SPEND_BROADCAST
+			) {
+				continue;
+			}
+			if (
+				actions.some(
+					(action) =>
+						action.type === ChainActionType.FEE_BUMP_AND_BROADCAST &&
+						action.fixedOutput?.txid === output.txid &&
+						action.fixedOutput.outputIndex === output.outputIndex
+				)
+			) {
+				continue;
+			}
+			let funded = false;
+			try {
+				funded = bitcoin.Transaction.fromHex(output.sweepTxHex).ins.length > 1;
+			} catch {
+				funded = false;
+			}
+			if (funded) continue;
+			actions.push(
+				this._fixedOutputFeeAction(
+					output,
+					`${output.outputType.toLowerCase()} spend (waiting for a fee input)`
+				)
+			);
+		}
+	}
+
+	/** The output of an asset channel whose spend wallet inputs pay for, while it is unspent. */
+	private _fixedOutput(
+		txid: string,
+		outputIndex: number
+	): ITrackedOutput | undefined {
+		if (!this._channelState.auxiliaryState) return undefined;
+		const output = this._trackedOutputs.find(
+			(o) => o.txid === txid && o.outputIndex === outputIndex
+		);
+		return output &&
+			output.auxiliaryFeeFunding &&
+			(output.status === OutputStatus.CONFIRMED ||
+				output.status === OutputStatus.SPEND_BROADCAST)
+			? output
+			: undefined;
+	}
+
+	/** Make the spend of one output again, as its resolver makes it. */
+	private _resolveFixedOutputSpend(
+		output: ITrackedOutput,
+		feeRatePerVbyte: number
+	): IResolvedOutput | undefined {
+		if (!this._commitmentBroadcast) return undefined;
+		try {
+			switch (this._commitmentBroadcast.commitmentType) {
+				case CommitmentType.OUR_COMMITMENT:
+					return resolveOurCommitmentOutputs(
+						this._channelState,
+						[output],
+						this._commitmentBroadcast.commitmentNumber,
+						this._destinationScript,
+						feeRatePerVbyte,
+						this._knownPreimages,
+						this._delayedPaymentBasepointSecret,
+						this._htlcBasepointSecret,
+						this._channelState.remoteHtlcSignatures
+					)[0];
+				case CommitmentType.THEIR_CURRENT_COMMITMENT:
+					return resolveTheirCurrentCommitmentOutputs(
+						this._channelState,
+						[output],
+						this._destinationScript,
+						feeRatePerVbyte,
+						this._knownPreimages,
+						this._paymentPrivkey,
+						this._htlcBasepointSecret,
+						this._theirCurrentPoint()
+					)[0];
+				default:
+					return undefined;
+			}
+		} catch {
+			return undefined;
+		}
+	}
+
+	/**
+	 * A sweep of an asset channel that wallet inputs pay for is asked to pay
+	 * more: the action that asks the fee pool again, at the higher rate, in
+	 * place of a rebuild. Undefined for every other sweep.
+	 */
+	fixedOutputFeeRaise(
+		output: ITrackedOutput,
+		feeRatePerVbyte: number
+	): IFeeBumpAndBroadcastChainAction | undefined {
+		const tracked = this._fixedOutput(output.txid, output.outputIndex);
+		if (!tracked || !tracked.sweepTxHex) return undefined;
+		tracked.currentFeeRate = feeRatePerVbyte;
+		tracked.broadcastHeight = this._currentBlockHeight;
+		return this._fixedOutputFeeAction(
+			tracked,
+			`${tracked.outputType.toLowerCase()} spend (fee raise)`
+		);
+	}
+
+	/**
+	 * Keep on the output that its spend waits for a fee input, with what the
+	 * fee pool said. The height the wait began at is kept through changes of
+	 * the reason; a claim by preimage also says by when it has to confirm.
+	 */
+	noteFixedOutputFeeWait(
+		txid: string,
+		outputIndex: number,
+
+		wait: { code: string; remedy?: string; message?: string },
+		// The height of the chain as the caller knows it: this monitor has
+		// none while the commitment is only in the mempool.
+		height?: number
+	): void {
+		const output = this._fixedOutput(txid, outputIndex);
+
+		if (!output) return;
+		output.auxiliaryFeeWait = {
+			code: wait.code,
+			...(wait.remedy ? { remedy: wait.remedy } : {}),
+			...(wait.message ? { message: wait.message } : {}),
+			sinceHeight:
+				output.auxiliaryFeeWait?.sinceHeight ??
+				Math.max(height ?? 0, this._currentBlockHeight),
+			...(output.outputType === OutputType.RECEIVED_HTLC && output.cltvExpiry
+				? { deadlineHeight: output.cltvExpiry }
+				: {})
+		};
+	}
+
+	/**
+	 * Attach the wallet inputs the fee pool gave to the spend of an output of
+	 * an asset channel. The spend is made again as its resolver makes it,
+	 * the inputs go after its own with no output added, the provider makes
+	 * the asset side of that very transaction, and `signFeeInputs` signs the
+	 * wallet inputs last. The whole is kept as the spend of the output;
+	 * `broadcast` says whether it may go out now. The caller stores the
+	 * monitor before it lets the transaction leave.
+	 */
+	fundFixedOutputSpend(
+		txid: string,
+		outputIndex: number,
+		feeRatePerVbyte: number,
+		feeInputs: ReadonlyArray<{
+			hash: Buffer;
+			index: number;
+			sequence: number;
+			script: Buffer;
+			value: bigint;
+		}>,
+		signFeeInputs: (
+			transaction: bitcoin.Transaction,
+			prevouts: { scripts: Buffer[]; values: bigint[] }
+		) => void
+	):
+		| { ok: true; transaction: Buffer; broadcast: boolean }
+		| { ok: false; refusal?: string } {
+		const output = this._fixedOutput(txid, outputIndex);
+		if (!output || feeInputs.length === 0) return { ok: false };
+		const again = this._resolveFixedOutputSpend(output, feeRatePerVbyte);
+		if (!again?.spendTx || !again.auxiliaryFunding) {
+			return {
+				ok: false,
+				...(output.auxiliaryRefusal ? { refusal: output.auxiliaryRefusal } : {})
+			};
+		}
+
+		// The inputs are here: whatever follows, the wait for them is over.
+		delete output.auxiliaryFeeWait;
+
+		const funded = again.spendTx.clone();
+		if (again.witness) funded.setWitness(0, again.witness);
+		for (const input of feeInputs) {
+			funded.addInput(Buffer.from(input.hash), input.index, input.sequence);
+		}
+		const prevouts = {
+			scripts: [
+				again.auxiliaryFunding.prevout.script,
+				...feeInputs.map((input) => input.script)
+			],
+			values: [
+				again.auxiliaryFunding.prevout.value,
+				...feeInputs.map((input) => input.value)
+			]
+		};
+		const made = again.auxiliaryFunding.finalize(funded, prevouts);
+		if (!made.ok) {
+			output.auxiliaryRefusal = made.refusal;
+			return { ok: false, refusal: made.refusal };
+		}
+		signFeeInputs(funded, prevouts);
+		output.sweepTxHex = funded.toHex();
+		delete output.auxiliaryRefusal;
+		noteAuxiliarySweep(output, made.data);
+		output.auxiliaryFeeFunding = true;
+		output.auxiliaryFeeRate = feeRatePerVbyte;
+		delete output.auxiliaryFeeWait;
+		const raw = funded.toBuffer();
+		const broadcast =
+			output.status === OutputStatus.SPEND_BROADCAST ||
+			(output.maturityHeight !== undefined &&
+				this._currentBlockHeight >= output.maturityHeight);
+		if (broadcast) {
+			output.status = OutputStatus.SPEND_BROADCAST;
+			output.broadcastHeight = this._currentBlockHeight;
+			noteAuxiliarySweepOffered(output, raw);
+		}
+		return { ok: true, transaction: raw, broadcast };
+	}
+
+	/**
+	 * What settled an output of an asset channel for good, for retiring the
+	 * action the fee pool keeps for it: the transaction that spent it, this
+	 * node's or the peer's. Undefined while the output is not settled for
+	 * good, and for one the fee pool was never asked about unless
+	 * `evenIfNotOpen`.
+	 */
+	fixedOutputFeeResolved(
+		txid: string,
+		outputIndex: number,
+		evenIfNotOpen = false
+	): { spendingTransaction?: Buffer } | undefined {
+		if (!this._channelState.auxiliaryState) return undefined;
+		const output = this._trackedOutputs.find(
+			(o) => o.txid === txid && o.outputIndex === outputIndex
+		);
+		if (!output || output.status !== OutputStatus.IRREVOCABLY_RESOLVED) {
+			return undefined;
+		}
+		if (!output.auxiliaryFeeActionOpen && !evenIfNotOpen) return undefined;
+		return output.resolutionTxHex
+			? { spendingTransaction: Buffer.from(output.resolutionTxHex, 'hex') }
+			: {};
+	}
+
+	/** The fee pool retired the action it kept for an output. */
+	noteFixedOutputFeeRetired(txid: string, outputIndex: number): void {
+		const output = this._trackedOutputs.find(
+			(o) => o.txid === txid && o.outputIndex === outputIndex
+		);
+		if (!output) return;
+		delete output.auxiliaryFeeActionOpen;
+		delete output.auxiliaryFeeWait;
 	}
 
 	private _handleCooperativeClose(actions: ChainAction[]): ChainAction[] {
@@ -2323,6 +2708,7 @@ export class ChainMonitor {
 			spendTx?: bitcoin.Transaction;
 			witness?: Buffer[];
 			auxiliaryData?: Buffer;
+			auxiliaryFunding?: IAuxiliaryFeeFunding;
 		},
 		description: string
 	): void {
@@ -2333,7 +2719,14 @@ export class ChainMonitor {
 			r.spendTx.setWitness(0, r.witness);
 		}
 
-		const txBuf = r.spendTx.toBuffer();
+		// A spend of an asset channel whose fee wallet inputs bring. One that
+		// has its inputs already is kept: they are pledged to it.
+		const fixed = !!this._channelState.auxiliaryState && !!r.auxiliaryFunding;
+		const kept = fixed
+			? this._fundedSpendOf(r.trackedOutput, r.spendTx)
+			: undefined;
+		const txBuf = kept ?? r.spendTx.toBuffer();
+
 		const maturityHeight = this._computeMaturityHeight(
 			r.spendTx,
 			r.trackedOutput.confirmationHeight
@@ -2343,6 +2736,7 @@ export class ChainMonitor {
 		noteAuxiliarySweep(r.trackedOutput, r.auxiliaryData);
 		r.trackedOutput.originalFeeRate = this._feeRatePerVbyte;
 		r.trackedOutput.maturityHeight = maturityHeight;
+		if (fixed) r.trackedOutput.auxiliaryFeeFunding = true;
 
 		if (this._currentBlockHeight >= maturityHeight) {
 			// Already spendable — broadcast immediately.
@@ -2354,6 +2748,12 @@ export class ChainMonitor {
 		} else {
 			// Timelock not yet matured — hold; handleNewBlock releases it.
 			r.trackedOutput.status = OutputStatus.CONFIRMED;
+
+			if (fixed && !kept) {
+				// The fee input is asked for at once, so that it is there by
+				// the time the spend may go out.
+				actions.push(this._fixedOutputFeeAction(r.trackedOutput, description));
+			}
 		}
 	}
 

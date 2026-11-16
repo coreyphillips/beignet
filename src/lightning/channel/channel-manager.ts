@@ -92,8 +92,11 @@ import {
 	CommitmentType,
 	IRREVOCABLE_DEPTH,
 	OutputType,
+	fixedOutputHtlcFeeActionId,
+	parseFixedOutputHtlcFeeActionId,
 	satPerVbyteToSatPerKw
 } from '../chain/types';
+
 import {
 	attachFeeInputsToZeroFeeHtlcTx,
 	buildAnchorCpfpTx
@@ -4275,6 +4278,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			if (this.auxiliarySpendsHeld.size > 0) {
 				this.releaseHeldAuxiliarySpends(channelIdHex);
 			}
+			this.reconcileFixedOutputFees(channelIdHex);
 			if (actions.length > 0) {
 				const channelId = Buffer.from(channelIdHex, 'hex');
 				this.processChainActions(channelId, actions);
@@ -12678,6 +12682,255 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		for (const tx of held) this.emit('broadcast:tx', tx);
 	}
 
+	/** Fee actions of the fee pool being worked on, one at a time each. */
+	private fixedOutputFeesBusy = new Set<string>();
+	/** What was last said about a fee action, so that it is said once. */
+	private fixedOutputFeesSaid = new Map<string, string>();
+	/** Channels whose open fee actions were looked through since the start. */
+	private fixedOutputFeesReconciled = new Set<string>();
+
+	/**
+	 * Bring the fee of a spend of an asset channel whose outputs are fixed:
+	 * a second-level HTLC transaction, or a claim that cannot pay for
+	 * itself. The fee pool is asked for inputs under the identity of the
+	 * output spent; they are attached with no output added; the monitor has
+	 * the provider make the asset side of that very transaction and keeps
+	 * it; and only once the monitor is stored does the transaction leave.
+	 * A pool that cannot give inputs yet is asked again on every block: the
+	 * wait is kept on the output for a host to show, and said once per
+	 * reason. A raise that cannot be had leaves the spend as it was.
+	 */
+	private async handleFixedOutputFee(
+		channelId: Buffer,
+		action: IFeeBumpAndBroadcastChainAction
+	): Promise<void> {
+		const channelIdHex = channelId.toString('hex');
+		const monitor = this.monitors.get(channelIdHex);
+		const spent = action.fixedOutput;
+		if (
+			!monitor ||
+			!spent ||
+			typeof monitor.fundFixedOutputSpend !== 'function'
+		) {
+			return;
+		}
+		const feeActionId = fixedOutputHtlcFeeActionId(
+			channelId,
+			spent.txid,
+			spent.outputIndex
+		);
+		if (this.fixedOutputFeesBusy.has(feeActionId)) return;
+		const present = bitcoin.Transaction.fromBuffer(action.tx);
+		const replaced = present.ins.slice(1).map((input) => ({
+			txid: Buffer.from(input.hash).reverse().toString('hex'),
+			vout: input.index,
+			sequence: input.sequence
+		}));
+		const say = (key: string, message: string): void => {
+			if (this.fixedOutputFeesSaid.get(feeActionId) === key) return;
+			this.fixedOutputFeesSaid.set(feeActionId, key);
+			this.emitContained('error', channelId, message);
+		};
+		const waits = (
+			code: string,
+			remedy: string | undefined,
+			message: string
+		): void => {
+			if (replaced.length > 0) {
+				// A raise that cannot be had: the spend as it is goes out again.
+				say(
+					`raise:${code}`,
+					`The fee of the spend of output ${spent.txid}:${spent.outputIndex} of an asset channel could not be raised (${code}): ${message} (channel ${channelIdHex})`
+				);
+				this.broadcastAuxiliarySpend(channelId, action.tx);
+				return;
+			}
+
+			monitor.noteFixedOutputFeeWait(
+				spent.txid,
+				spent.outputIndex,
+				{ code, remedy, message },
+				this._currentBlockHeight
+			);
+
+			this.emit('monitor:updated', channelIdHex, monitor);
+			say(
+				code,
+				`The spend of output ${spent.txid}:${spent.outputIndex} of an asset channel waits for a fee input (${code}): ${message} (channel ${channelIdHex})`
+			);
+		};
+		const fp = this.fundingProvider;
+		if (!fp?.selectFeeBumpInputs) {
+			waits(
+				'FEE_WALLET_UNAVAILABLE',
+				'operator',
+				'the node has no wallet that prepares fee inputs'
+			);
+			return;
+		}
+		this.fixedOutputFeesBusy.add(feeActionId);
+		try {
+			// The fee the spend has to pay for itself: the pool adds what its
+			// own inputs cost. A spend this node has yet to sign is counted
+			// with the witness it will get.
+			const own = new bitcoin.Transaction();
+			own.version = present.version;
+			own.locktime = present.locktime;
+			own.addInput(
+				Buffer.from(present.ins[0].hash),
+				present.ins[0].index,
+				present.ins[0].sequence
+			);
+			for (const out of present.outs) own.addOutput(out.script, out.value);
+			const signed = present.ins[0].witness.length > 0;
+			if (signed) own.setWitness(0, present.ins[0].witness);
+			const ownVbytes = own.virtualSize() + (signed ? 0 : 56);
+			const selected = await fp.selectFeeBumpInputs(
+				BigInt(Math.ceil(ownVbytes * action.feeratePerVbyte)),
+				satPerVbyteToSatPerKw(action.feeratePerVbyte),
+				{
+					fixedOutputs: true,
+					feeActionId,
+					confirmedOnly: true,
+					...(replaced.length > 0 ? { replacementInputs: replaced } : {})
+				}
+			);
+			const feeInputs = selected.inputs.map((input) => {
+				const previous = bitcoin.Transaction.fromBuffer(input.prevTx);
+				return {
+					hash: previous.getHash(),
+					index: input.prevOutputIndex,
+					sequence: input.sequence,
+					script: previous.outs[input.prevOutputIndex].script,
+					value: input.value,
+					input
+				};
+			});
+			const made = monitor.fundFixedOutputSpend(
+				spent.txid,
+				spent.outputIndex,
+				action.feeratePerVbyte,
+				feeInputs,
+				(transaction, prevouts) => {
+					feeInputs.forEach((fee, at) => {
+						transaction.setWitness(
+							1 + at,
+							fee.input.signWitness(transaction, 1 + at, fee.value, prevouts)
+						);
+					});
+				}
+			);
+			if (!made.ok) {
+				if (made.refusal) say(`refused:${made.refusal}`, made.refusal);
+				if (replaced.length > 0) {
+					this.broadcastAuxiliarySpend(channelId, action.tx);
+				}
+				return;
+			}
+			this.fixedOutputFeesSaid.delete(feeActionId);
+			if (made.broadcast) {
+				this.broadcastAuxiliarySpend(channelId, made.transaction);
+			} else {
+				this.emit('monitor:updated', channelIdHex, monitor);
+			}
+		} catch (error) {
+			const told = error as { code?: unknown; remedy?: unknown };
+			waits(
+				typeof told.code === 'string' ? told.code : 'FEE_INPUT_FAILED',
+				typeof told.remedy === 'string' ? told.remedy : undefined,
+				(error as Error).message
+			);
+		} finally {
+			this.fixedOutputFeesBusy.delete(feeActionId);
+		}
+	}
+
+	/**
+	 * An output of an asset channel is settled for good: the action the fee
+	 * pool keeps for it is retired, naming the transaction that spent the
+	 * output, so that the pool charges only what that transaction took.
+	 */
+	private retireFixedOutputFee(
+		channelId: Buffer,
+		txid: string,
+		outputIndex: number,
+		evenIfNotOpen = false
+	): void {
+		const channelIdHex = channelId.toString('hex');
+		const monitor = this.monitors.get(channelIdHex);
+		const fp = this.fundingProvider;
+		if (
+			!monitor ||
+			typeof monitor.fixedOutputFeeResolved !== 'function' ||
+			!fp?.retireFixedOutputFeeAction
+		) {
+			return;
+		}
+		const resolved = monitor.fixedOutputFeeResolved(
+			txid,
+			outputIndex,
+			evenIfNotOpen
+		);
+		if (!resolved) return;
+		const feeActionId = fixedOutputHtlcFeeActionId(
+			channelId,
+			txid,
+			outputIndex
+		);
+		void fp
+			.retireFixedOutputFeeAction(
+				feeActionId,
+				resolved.spendingTransaction
+					? { spendingTransaction: resolved.spendingTransaction }
+					: undefined
+			)
+			.then(() => {
+				monitor.noteFixedOutputFeeRetired(txid, outputIndex);
+				this.fixedOutputFeesSaid.delete(feeActionId);
+				this.emit('monitor:updated', channelIdHex, monitor);
+			})
+			.catch((error: unknown) => {
+				this.emitContained(
+					'error',
+					channelId,
+					`The fee action of output ${txid}:${outputIndex} of an asset channel could not be retired: ${
+						(error as Error).message
+					} (channel ${channelIdHex})`
+				);
+			});
+	}
+
+	/**
+	 * Once after a start, per asset channel: retire the fee actions the pool
+	 * still keeps for outputs that were settled for good while the node was
+	 * not running.
+	 */
+	private reconcileFixedOutputFees(channelIdHex: string): void {
+		if (this.fixedOutputFeesReconciled.has(channelIdHex)) return;
+		const monitor = this.monitors.get(channelIdHex);
+		const fp = this.fundingProvider;
+		if (
+			!monitor ||
+			typeof monitor.getChannelState !== 'function' ||
+			!monitor.getChannelState().auxiliaryState ||
+			!fp?.getFixedOutputFeeActionIds
+		) {
+			return;
+		}
+		this.fixedOutputFeesReconciled.add(channelIdHex);
+		const channelId = Buffer.from(channelIdHex, 'hex');
+		for (const feeActionId of fp.getFixedOutputFeeActionIds(channelId)) {
+			const parsed = parseFixedOutputHtlcFeeActionId(feeActionId);
+			if (!parsed) continue;
+			this.retireFixedOutputFee(
+				channelId,
+				parsed.txid,
+				parsed.outputIndex,
+				true
+			);
+		}
+	}
+
 	private processChainActions(channelId: Buffer, actions: ChainAction[]): void {
 		for (const action of actions) {
 			switch (action.type) {
@@ -12702,9 +12955,12 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 				case ChainActionType.WATCH_TX:
 					this.emit('watch:tx', action.txid);
 					break;
+
 				case ChainActionType.OUTPUT_RESOLVED:
+					this.retireFixedOutputFee(channelId, action.txid, action.outputIndex);
 					this.emit(
 						'output:resolved',
+
 						action.txid,
 						action.outputIndex,
 						action.channelId,
@@ -12723,7 +12979,18 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 					// A previously-broadcast sweep has not confirmed; re-resolve it at
 					// the bumped feerate and rebroadcast (RBF). Critical for penalty
 					// txs that must confirm before the cheater's to_self_delay matures.
+
 					const mon = this.monitors.get(channelId.toString('hex'));
+					// A spend of an asset channel that wallet inputs pay for is
+					// not rebuilt: the fee pool is asked again at the higher rate.
+					const raised =
+						mon && typeof mon.fixedOutputFeeRaise === 'function'
+							? mon.fixedOutputFeeRaise(action.output, action.feeRatePerVbyte)
+							: undefined;
+					if (raised) {
+						void this._handleFeeBumpAndBroadcast(channelId, raised);
+						break;
+					}
 					const rebuilt =
 						mon && typeof mon.rebuildSweeps === 'function'
 							? mon.rebuildSweeps(action.output, action.feeRatePerVbyte)
@@ -12775,6 +13042,11 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		channelId: Buffer,
 		action: IFeeBumpAndBroadcastChainAction
 	): Promise<void> {
+		if (action.kind === 'fixed-output-fee') {
+			await this.handleFixedOutputFee(channelId, action);
+			return;
+		}
+
 		const fp = this.fundingProvider;
 		const feeratePerVbyte = action.feeratePerVbyte;
 		const feeratePerKw = satPerVbyteToSatPerKw(feeratePerVbyte);

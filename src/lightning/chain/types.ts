@@ -97,6 +97,40 @@ export interface ITrackedOutput {
 	auxiliaryFeeFunding?: boolean;
 	/** Why the provider would not make the asset side of a sweep, last time. */
 	auxiliaryRefusal?: string;
+
+	/**
+	 * Set on the second-level output of an HTLC of an asset channel that
+	 * carries units: the HTLC it came from, by which the asset leaf of the
+	 * output is found again.
+	 */
+	auxiliaryHtlc?: {
+		id: bigint;
+		direction: import('../channel/types').HtlcDirection;
+	};
+	/** The second-level HTLC transaction whose output this is. */
+	auxiliaryParentTxHex?: string;
+	/** The asset side of that transaction, which the sweep of its output builds on. */
+	auxiliaryParentData?: Buffer;
+	/** The fee rate the spend that wallet inputs pay for was last made at. */
+	auxiliaryFeeRate?: number;
+	/**
+	 * The fee pool was asked for inputs under the identity of this output,
+	 * and the action it keeps for it has not been retired yet.
+	 */
+	auxiliaryFeeActionOpen?: true;
+	/**
+	 * The spend of this output waits for a fee input: the code and the
+	 * remedy the fee pool gave, the height at which the wait began, and,
+	 * for a claim by preimage, the height by which it has to confirm.
+	 */
+	auxiliaryFeeWait?: {
+		code: string;
+		remedy?: string;
+		message?: string;
+		sinceHeight: number;
+		deadlineHeight?: number;
+	};
+
 	txid: string;
 	outputIndex: number;
 	amount: bigint;
@@ -303,7 +337,15 @@ export interface IBroadcastTxChainAction {
  */
 export interface IFeeBumpAndBroadcastChainAction {
 	type: ChainActionType.FEE_BUMP_AND_BROADCAST;
-	kind: 'htlc-fee-attach' | 'anchor-cpfp';
+
+	kind: 'htlc-fee-attach' | 'anchor-cpfp' | 'fixed-output-fee';
+	/**
+	 * fixed-output-fee only: the output of an asset channel that `tx`
+	 * spends. The outputs of `tx` stay as they are, wallet inputs bring the
+	 * whole fee, and the fee pool is asked under the identity of this output.
+	 */
+	fixedOutput?: { txid: string; outputIndex: number };
+
 	tx: Buffer;
 	description: string;
 	/** Target fee rate in sat/vByte for the bumped transaction/package. */

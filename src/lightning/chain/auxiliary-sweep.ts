@@ -12,6 +12,7 @@
 
 import * as bitcoin from 'bitcoinjs-lib';
 import { ecc } from '../../utils/ecc';
+import { secondLevelRevocationKey } from '../channel/child-revocation';
 import {
 	auxiliaryProviderError,
 	type IAuxiliaryCommitmentData,
@@ -162,8 +163,13 @@ export function prepareAuxiliarySweep(
 	state: IChannelState,
 	isOurs: boolean,
 	transaction: bitcoin.Transaction,
+
 	sources: IAuxiliarySweepSource[],
-	destinationScript: Buffer
+	destinationScript: Buffer,
+	options?: {
+		/** The outputs are signed for already: no script of theirs may change. */
+		fixedOutputs?: boolean;
+	}
 ): AuxiliarySweepPreparation {
 	if (!state.auxiliaryState) return { assets: false };
 	const carrying = sources.filter(
@@ -303,6 +309,15 @@ export function prepareAuxiliarySweep(
 					'it named an output that holds less than an output of units may'
 				);
 			}
+
+			if (
+				options?.fixedOutputs &&
+				!transaction.outs[index].script.equals(script)
+			) {
+				throw new Error(
+					'it named another script for an output whose script is signed for already'
+				);
+			}
 		}
 		data = Buffer.from(result.customData);
 	} catch (cause) {
@@ -392,4 +407,115 @@ export function noteAuxiliarySweepOffered(
 	if (!attempt) return false;
 	attempt.offered = true;
 	return true;
+}
+
+/**
+ * What finishes a spend of an output of an asset channel whose fee wallet
+ * inputs bring: a second-level HTLC transaction, whose outputs the peer
+ * signed for, or a claim that cannot pay its own fee and leave what an
+ * output of units must hold.
+ */
+export interface IAuxiliaryFeeFunding {
+	/** The script and the value of the output the spend's own input spends. */
+	prevout: { script: Buffer; value: bigint };
+	/**
+	 * `funded` is the spend with the wallet inputs after its own input and
+	 * its outputs as they were; `prevouts` is aligned with its inputs. The
+	 * provider makes the asset side of that very transaction, and the
+	 * witness of its first input is set. Never throws for what the provider
+	 * does.
+	 */
+	finalize(
+		funded: bitcoin.Transaction,
+		prevouts: { scripts: Buffer[]; values: bigint[] }
+	): { ok: true; data?: Buffer } | { ok: false; refusal: string };
+}
+
+/** What the second-level output of an HTLC that carries units is found by. */
+export interface IAuxiliarySecondLevelSource {
+	auxiliaryCommitmentNumber: bigint;
+	auxiliaryHtlc: { id: bigint; direction: HtlcDirection };
+	auxiliaryParentData?: Buffer;
+}
+
+/**
+ * The HTLC a second-level transaction belongs to, read from the HTLC output
+ * it spends or from its own output once that is tracked. Undefined for an
+ * output without units and for a channel that is not an asset channel.
+ */
+export function auxiliarySecondLevelSource(
+	state: IChannelState,
+	output: ITrackedOutput | undefined
+): IAuxiliarySecondLevelSource | undefined {
+	if (
+		!state.auxiliaryState ||
+		output?.auxiliaryCommitmentNumber === undefined
+	) {
+		return undefined;
+	}
+	if (output.isSecondLevelHtlc) {
+		if (!output.auxiliaryHtlc) return undefined;
+		return {
+			auxiliaryCommitmentNumber: output.auxiliaryCommitmentNumber,
+			auxiliaryHtlc: { ...output.auxiliaryHtlc },
+			...(output.auxiliaryParentData
+				? { auxiliaryParentData: Buffer.from(output.auxiliaryParentData) }
+				: {})
+		};
+	}
+	if (
+		output.htlcId === undefined ||
+		(output.outputType !== OutputType.OFFERED_HTLC &&
+			output.outputType !== OutputType.RECEIVED_HTLC)
+	) {
+		return undefined;
+	}
+	return {
+		auxiliaryCommitmentNumber: output.auxiliaryCommitmentNumber,
+		auxiliaryHtlc: {
+			id: output.htlcId,
+			direction:
+				output.outputType === OutputType.OFFERED_HTLC
+					? HtlcDirection.OFFERED
+					: HtlcDirection.RECEIVED
+		},
+		...(output.auxiliaryData
+			? { auxiliaryParentData: Buffer.from(output.auxiliaryData) }
+			: {})
+	};
+}
+
+/**
+ * The key and the asset leaf of the second-level output of an HTLC, as the
+ * commitment round signed them. Without a source, the key given and no
+ * leaf: the second-level output is the ordinary one. Throws, naming the
+ * channel, when the view of the commitment is not held.
+ */
+export function auxiliarySecondLevel(
+	state: IChannelState,
+	isOurs: boolean,
+	source: IAuxiliarySecondLevelSource | undefined,
+	revocationPubkey: Buffer
+): { revocationKey: Buffer; leaf?: ITaprootAuxLeaf } {
+	if (!source) return { revocationKey: revocationPubkey };
+	const view = auxiliaryCommitmentView(
+		state,
+		isOurs,
+		source.auxiliaryCommitmentNumber
+	);
+	if (!view) {
+		throw new Error(
+			`The asset side of commitment ${
+				source.auxiliaryCommitmentNumber
+			} is not held: the second-level transaction of HTLC ${
+				source.auxiliaryHtlc.id
+			} cannot be made (channel ${channelOf(state)})`
+		);
+	}
+	return {
+		revocationKey: secondLevelRevocationKey(state, view, revocationPubkey, 1n),
+		leaf: view.secondLevelLeaves.get(
+			`${source.auxiliaryHtlc.direction}:${source.auxiliaryHtlc.id}`
+		)
+	};
 }
