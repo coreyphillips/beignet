@@ -1502,6 +1502,9 @@ not repeat a 4xx unchanged.
 | `NOT_BOOSTABLE` | Wallet | 409 | Transaction cannot be fee-bumped (unknown, confirmed, or not RBF/CPFP-able) |
 | `NOTHING_TO_CONSOLIDATE` | Wallet | 409 | Consolidation needs at least two spendable UTXOs |
 | `INSTANCE_ALREADY_RUNNING` | Wallet | n/a | Another instance holds the data-dir lock (startup only, never over HTTP) |
+| `ASSET_PROVIDER_REQUIRED` | Node | 409 | The database holds asset channels and no attached extension supplies the provider that runs them; the node is not started and no row is changed ([docs/EXTENSIONS.md](../../docs/EXTENSIONS.md)) |
+| `ASSET_PROVIDER_CONFLICT` | Node | 409 | Two attached extensions both supply an asset channel provider; the node is not started |
+| `ASSET_PROVIDER_FAILED` | Node | 409 | The extension whose asset channel provider the node was built with refused the node in `bind()`; the node is stopped again. All three refuse a start, and reach HTTP only from a route that rebuilds the node |
 | `PAYMENT_FAILED` | Payments | 502 | Lightning payment failed |
 | `FEE_EXCEEDS_MAX` | Payments | 409 | Every route costs more than the caller's `maxFeeSats` / `maxFeeMsat`; nothing was sent (permanent: the same request meets the same cap) |
 | `PAYMENT_TIMEOUT` | Payments | 504 | Payment did not settle within timeout. The payment is failed only when no HTLC is out for it; with one still in flight the record stays `PENDING` until it resolves, no further route is tried, and the record is failed when the HTLC fails or its on-chain timeout resolves; the message says so (issue #976). The error carries the payment's `paymentHash` (issue #1094) |

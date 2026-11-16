@@ -88,7 +88,12 @@ import {
 	carryExtensionRows,
 	validateExtensions
 } from './extension';
-import type { IBeignetExtension, IExtensionInfo } from './extension';
+import type {
+	ExtensionFixedOutputFees,
+	IBeignetExtension,
+	IExtensionAuxiliarySupply,
+	IExtensionInfo
+} from './extension';
 import { EProtocol } from '../types/electrum';
 import { LightningNode } from '../lightning/node/lightning-node';
 import { CommitmentType, OutputType } from '../lightning/chain/types';
@@ -290,6 +295,7 @@ import type {
 	IRebalanceResult
 } from '../lightning/node/types';
 import {
+	AuxiliaryProviderRequiredError,
 	InvalidRequestError,
 	ChannelFundingUnavailableError,
 	ChannelFundingUnavailableCode,
@@ -3244,8 +3250,93 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 		try {
 			await this.initNode(opts);
 		} catch (err) {
+			// Read before the fence below settles every extension as stopped.
+			const refusal = this.assetProviderRequired(err);
 			this._extensionHost?.fenceForRebuild();
-			throw err;
+			throw refusal ?? err;
+		}
+	}
+
+	/**
+	 * The engine's refusal to run stored asset channels without their
+	 * provider (issue #2093), as the daemon's own: a stable code and a
+	 * sentence an operator can act on. Anything else comes back undefined.
+	 * The engine threw before it rewrote a row, so the same database starts
+	 * once the extension that supplies the provider is attached.
+	 */
+	private assetProviderRequired(err: unknown): BeignetError | undefined {
+		if (!(err instanceof AuxiliaryProviderRequiredError)) return undefined;
+		const count = err.channelIds.length;
+		const failed = (this._extensionHost?.describe() ?? []).filter(
+			(extension) => extension.state === 'failed'
+		);
+		this.log('error', 'Asset channels are stored and nothing can run them', {
+			channelIds: [...err.channelIds]
+		});
+		return new BeignetError(
+			'ASSET_PROVIDER_REQUIRED',
+			`This wallet has ${count} asset channel${count === 1 ? '' : 's'} and ` +
+				'no extension attached to it can run them, so it was not started ' +
+				'and nothing was changed. Start it with the extension that ' +
+				'opened them.' +
+				failed
+					.map(
+						(extension) =>
+							` Extension "${extension.id}" failed: ` +
+							`${extension.error ?? 'unknown error'}.`
+					)
+					.join('')
+		);
+	}
+
+	/**
+	 * The wallet's funding provider for one build. With a fee policy from the
+	 * extension that supplies asset channels, it also prepares the fee coins
+	 * of their fixed-output transactions, journalled in the node's own
+	 * database under the wallet's identity. A policy the wallet refuses
+	 * fails that extension: the provider is built as it always was, and the
+	 * answer says the supply is not to be used.
+	 */
+	private walletFundingProvider(
+		supply: IExtensionAuxiliarySupply | undefined
+	): {
+		fundingProvider: WalletFundingProvider;
+		refused: boolean;
+	} {
+		const fees: ExtensionFixedOutputFees | undefined = supply?.fixedOutputFees;
+		if (supply === undefined || fees === undefined) {
+			return {
+				fundingProvider: new WalletFundingProvider(this.wallet),
+				refused: false
+			};
+		}
+		try {
+			return {
+				fundingProvider: new WalletFundingProvider(this.wallet, {
+					fixedOutputFees: {
+						storage: this.storage,
+						maxFeeSatoshis: fees.maxFeeSatoshis,
+						maxTotalFeeSatoshis: fees.maxTotalFeeSatoshis,
+						maxPreparationFeeSatoshis: fees.maxPreparationFeeSatoshis,
+						...(fees.feeCoinCount !== undefined
+							? { feeCoinCount: fees.feeCoinCount }
+							: {}),
+						...(fees.preparationFeeRatePerVbyte !== undefined
+							? { preparationFeeRatePerVbyte: fees.preparationFeeRatePerVbyte }
+							: {})
+					}
+				}),
+				refused: false
+			};
+		} catch (err) {
+			this._extensionHost?.refuseSupply(
+				supply.id,
+				new Error(`fixedOutputFees: ${(err as Error).message}`)
+			);
+			return {
+				fundingProvider: new WalletFundingProvider(this.wallet),
+				refused: true
+			};
 		}
 	}
 
@@ -3383,8 +3474,15 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 			storage: () => this.storage
 		});
 
+		// 3c. Asset channels (issue #2093): what the attached extensions supply
+		// for the node about to be built. Two providers are refused here,
+		// before anything is built on either. Without one, everything below
+		// is as it was before the members existed.
+		const supplied = this._extensionHost?.auxiliarySupply();
+
 		// 4. Create funding provider from wallet
-		const fundingProvider = new WalletFundingProvider(this.wallet);
+		const { fundingProvider, refused } = this.walletFundingProvider(supplied);
+		const auxiliary = refused ? undefined : supplied;
 
 		// 5. Create electrum backend for chain monitoring
 		const electrumBackend = new ElectrumBackend(this.wallet.electrum);
@@ -3759,6 +3857,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 			alias: opts.alias,
 			announcedAddresses,
 			fundingProvider,
+			...(auxiliary ? { auxiliaryChannels: auxiliary.auxiliaryChannels } : {}),
 			preferAnchors: opts.preferAnchors,
 			largeChannels: opts.largeChannels,
 			chainBackend: electrumBackend,
@@ -3806,6 +3905,17 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 			recovery: this.recoveryNodeConfig
 		});
 		this._nodeConstructMs = Date.now() - constructStarted;
+		// Extensions that asked for the node are given it in the turn that
+		// built it: outside any storage transaction, before a peer can be
+		// heard and before any start(). The one whose asset channel provider
+		// this node was built with has to take it; a node whose provider was
+		// never bound would hold channels it cannot run, so it is stopped.
+		try {
+			this._extensionHost?.bindNode(this.node, auxiliary?.id);
+		} catch (err) {
+			this.node.destroy();
+			throw err;
+		}
 		// A deferred restore of the stored network map reports when it ends.
 		this.node.on('graph:restored', () => {
 			const stats = this.getGraphRestoreStats();

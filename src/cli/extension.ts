@@ -21,6 +21,9 @@
 
 import type { ILogger } from '../logger';
 import type { Wallet } from '../wallet';
+import type { IAuxiliaryChannelConfig } from '../lightning/channel/auxiliary-funding';
+import type { LightningNode } from '../lightning/node/lightning-node';
+import type { IFixedOutputFeePolicy } from '../lightning/wallet/fixed-output-fees';
 import type {
 	IMetadataScanStorage,
 	IStorageBackend
@@ -154,9 +157,41 @@ export interface IExtensionContext {
 	emit(event: string, data: unknown): void;
 }
 
+/**
+ * What the node may spend on the fees of an asset channel's transactions
+ * whose outputs are fixed: WalletFundingProvider's fee policy without the
+ * two members the daemon supplies itself, the journal's storage (the node's
+ * own database) and the wallet's identity.
+ */
+export type ExtensionFixedOutputFees = Omit<
+	IFixedOutputFeePolicy,
+	'storage' | 'walletId'
+>;
+
 export interface IExtensionAttachment {
 	/** One handler per declared route, keyed '<METHOD> <path>'. */
 	handlers?: Record<string, ExtensionHandler>;
+	/**
+	 * Asset channel support for the node this build creates (issue #2093):
+	 * handed to the node as its `auxiliaryChannels`, as it is. At most one
+	 * attached extension may supply it. The node keeps it for the life of
+	 * the build, whatever becomes of the extension afterwards, so it has to
+	 * work whether or not start() has run. An engine that predates this
+	 * member ignores it.
+	 */
+	auxiliaryChannels?: IAuxiliaryChannelConfig;
+	/**
+	 * What the node may spend on the fees of the fixed-output transactions
+	 * of asset channels. Read only beside `auxiliaryChannels`; without it
+	 * the wallet prepares no fee coins.
+	 */
+	fixedOutputFees?: ExtensionFixedOutputFees;
+	/**
+	 * Called with the node of this build once it exists: in the turn that
+	 * built it, outside any storage transaction and before any start().
+	 * Synchronous; a promise it returns is not waited for.
+	 */
+	bind?(node: LightningNode): void;
 	/** Runs once the node is built and serving. */
 	start?(): void | Promise<void>;
 	/**
@@ -189,6 +224,14 @@ export interface IBeignetExtension {
 	attach(
 		context: IExtensionContext
 	): IExtensionAttachment | Promise<IExtensionAttachment>;
+}
+
+/** What one attached extension supplies for the node's asset channels. */
+export interface IExtensionAuxiliarySupply {
+	/** The extension that supplies it. */
+	id: string;
+	auxiliaryChannels: IAuxiliaryChannelConfig;
+	fixedOutputFees?: ExtensionFixedOutputFees;
 }
 
 /** What GET /extensions reports for one extension. */
@@ -572,6 +615,11 @@ interface IExtensionSlot {
 	state: ExtensionState;
 	error?: string;
 	attachment?: IExtensionAttachment;
+	/**
+	 * What the attachment asked of the node, read once when it was taken:
+	 * unset for an attachment that names none of the three members.
+	 */
+	nodeMembers?: IExtensionNodeMembers;
 	handlers: Map<string, ExtensionHandler>;
 	/** The attach() pass that last took the slot (ExtensionHost.pass). */
 	pass: number;
@@ -579,6 +627,13 @@ interface IExtensionSlot {
 	fence?: () => void;
 	/** Holds or releases the writes of the current generation's view. */
 	holdWrites?: (held: boolean) => void;
+}
+
+/** The members of an attachment that reach the node it is attached to. */
+interface IExtensionNodeMembers {
+	auxiliaryChannels?: IAuxiliaryChannelConfig;
+	fixedOutputFees?: ExtensionFixedOutputFees;
+	bind?: (node: LightningNode) => void;
 }
 
 function errorMessage(err: unknown): string {
@@ -672,6 +727,7 @@ export class ExtensionHost {
 			slot.state = 'pending';
 			slot.error = undefined;
 			slot.attachment = undefined;
+			slot.nodeMembers = undefined;
 			slot.handlers = new Map();
 			const view = extensionStorageView(extension.id, build.storage);
 			let open = true;
@@ -716,7 +772,9 @@ export class ExtensionHost {
 					if (slot.pass === pass) slot.state = 'stopped';
 					continue;
 				}
-				slot.handlers = this.bindHandlers(extension, attachment);
+				const handlers = this.bindHandlers(extension, attachment);
+				slot.nodeMembers = this.readNodeMembers(attachment);
+				slot.handlers = handlers;
 				slot.attachment = attachment;
 				slot.state = 'attached';
 			} catch (err) {
@@ -733,6 +791,94 @@ export class ExtensionHost {
 						extension: extension.id,
 						error: errorMessage(err)
 					});
+				}
+			}
+		}
+	}
+
+	/**
+	 * What the attached extensions supply for the asset channels of the node
+	 * about to be built, or undefined when none supplies any. Two that both
+	 * supply a provider are refused: a node runs one, and choosing between
+	 * them here would leave the channels of the other unenforced.
+	 */
+	auxiliarySupply(): IExtensionAuxiliarySupply | undefined {
+		const suppliers = this.slots.filter(
+			(slot) =>
+				slot.state === 'attached' &&
+				slot.nodeMembers?.auxiliaryChannels !== undefined
+		);
+		if (suppliers.length > 1) {
+			const ids = suppliers
+				.map((slot) => `"${slot.extension.id}"`)
+				.join(' and ');
+			throw new BeignetError(
+				'ASSET_PROVIDER_CONFLICT',
+				`Extensions ${ids} both supply asset channels. A node runs one ` +
+					'asset channel provider, so it was not started: load one of them.'
+			);
+		}
+		const supplier = suppliers[0];
+		const members = supplier?.nodeMembers;
+		if (!supplier || members?.auxiliaryChannels === undefined) return undefined;
+		return {
+			id: supplier.extension.id,
+			auxiliaryChannels: members.auxiliaryChannels,
+			...(members.fixedOutputFees !== undefined
+				? { fixedOutputFees: members.fixedOutputFees }
+				: {})
+		};
+	}
+
+	/**
+	 * The node cannot use what extension `id` supplied for it (the wallet
+	 * refused its fee policy). Called before the node is built: the
+	 * extension is failed and stopped like one whose attach() threw, and the
+	 * node is built without it.
+	 */
+	refuseSupply(id: string, err: unknown): void {
+		const slot = this.slots.find((s) => s.extension.id === id);
+		if (slot && slot.state === 'attached') this.drop(slot, 'attach', err);
+	}
+
+	/**
+	 * Give the node of this build to every attached extension that asked for
+	 * it. Called in the turn that built the node, outside any storage
+	 * transaction, and before start().
+	 *
+	 * An extension whose bind() throws is failed and stopped, and the node
+	 * runs without it, with one exception: `provider`, the extension whose
+	 * asset channel provider the node was built with. That provider is in
+	 * the node already and was never given it, so the throw is passed on as
+	 * ASSET_PROVIDER_FAILED for the caller to stop the node.
+	 */
+	bindNode(node: LightningNode, provider?: string): void {
+		for (const slot of this.slots) {
+			if (slot.state !== 'attached') continue;
+			const bind = slot.nodeMembers?.bind;
+			if (!bind) continue;
+			const { id } = slot.extension;
+			try {
+				const pending: unknown = bind.call(slot.attachment, node);
+				if (isRecord(pending) && typeof pending.then === 'function') {
+					// Not waited for. A rejection is logged, so it is not an
+					// unhandled one.
+					(pending as unknown as Promise<unknown>).then(undefined, (err) =>
+						this.opts.log('warn', 'Extension bind rejected', {
+							extension: id,
+							error: errorMessage(err)
+						})
+					);
+				}
+			} catch (err) {
+				this.drop(slot, 'bind', err);
+				if (id === provider) {
+					throw new BeignetError(
+						'ASSET_PROVIDER_FAILED',
+						`Extension "${id}" supplies this node's asset channels and ` +
+							`refused the node it was built for: ${errorMessage(err)}. ` +
+							'The node was stopped.'
+					);
 				}
 			}
 		}
@@ -975,6 +1121,26 @@ export class ExtensionHost {
 	}
 
 	/**
+	 * Give up on an attached extension the node cannot use: failed, its
+	 * routes closed at once, its stop hook run and waited for by the next
+	 * attach(), and only then its storage fenced, as for a start() that
+	 * throws.
+	 */
+	private drop(slot: IExtensionSlot, phase: string, err: unknown): void {
+		const attachment = slot.attachment;
+		const fence = slot.fence;
+		slot.handlers = new Map();
+		slot.nodeMembers = undefined;
+		this.fail(slot, phase, err);
+		void this.settle(
+			this.runStop(slot.extension.id, attachment, 'shutdown')
+		).then(() => {
+			fence?.();
+			if (slot.fence === fence) slot.fence = undefined;
+		});
+	}
+
+	/**
 	 * attach(), bounded: the node is built without an extension that does
 	 * not answer. One that answers after the bound is stopped again.
 	 */
@@ -1081,6 +1247,53 @@ export class ExtensionHost {
 		return new Map(
 			declared.map((key) => [key, given[key] as ExtensionHandler])
 		);
+	}
+
+	/**
+	 * The members of an attachment that reach the node, each read once. An
+	 * attachment that names none of them reads as undefined, and nothing
+	 * about it is different from before these members existed.
+	 */
+	private readNodeMembers(
+		attachment: IExtensionAttachment
+	): IExtensionNodeMembers | undefined {
+		const { auxiliaryChannels, fixedOutputFees, bind } = attachment;
+		if (
+			auxiliaryChannels === undefined &&
+			fixedOutputFees === undefined &&
+			bind === undefined
+		) {
+			return undefined;
+		}
+		if (auxiliaryChannels !== undefined) {
+			if (
+				!isRecord(auxiliaryChannels) ||
+				!isRecord(auxiliaryChannels.provider) ||
+				typeof auxiliaryChannels.resolveIncoming !== 'function'
+			) {
+				throw new Error(
+					'auxiliaryChannels must carry a provider and resolveIncoming'
+				);
+			}
+		}
+		if (fixedOutputFees !== undefined) {
+			if (auxiliaryChannels === undefined) {
+				throw new Error(
+					'fixedOutputFees is read only beside auxiliaryChannels'
+				);
+			}
+			if (!isRecord(fixedOutputFees)) {
+				throw new Error('fixedOutputFees must be an object');
+			}
+		}
+		if (bind !== undefined && typeof bind !== 'function') {
+			throw new Error('bind must be a function');
+		}
+		return {
+			...(auxiliaryChannels !== undefined ? { auxiliaryChannels } : {}),
+			...(fixedOutputFees !== undefined ? { fixedOutputFees } : {}),
+			...(bind !== undefined ? { bind } : {})
+		};
 	}
 
 	private loggerFor(id: string): ILogger {

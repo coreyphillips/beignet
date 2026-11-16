@@ -235,6 +235,22 @@ export enum BeignetErrorCode {
 	OFFER_DECLINED = 'OFFER_DECLINED',
 	SIGN_REQUEST_REFUSED = 'SIGN_REQUEST_REFUSED',
 	EXCHANGE_TIMEOUT = 'EXCHANGE_TIMEOUT',
+	// Asset channels (issue #2093). All three refuse a start; none is an
+	// answer to a request.
+	/**
+	 * The database holds asset channels and no attached extension supplies
+	 * the provider that runs them. The node was not started and no stored row
+	 * was changed: start it with that extension and it runs.
+	 */
+	ASSET_PROVIDER_REQUIRED = 'ASSET_PROVIDER_REQUIRED',
+	/** Two attached extensions both supply an asset channel provider. */
+	ASSET_PROVIDER_CONFLICT = 'ASSET_PROVIDER_CONFLICT',
+	/**
+	 * The extension whose provider the node was built with refused the node
+	 * in bind(). A provider that was never given its node cannot run a
+	 * channel, so the node was stopped again.
+	 */
+	ASSET_PROVIDER_FAILED = 'ASSET_PROVIDER_FAILED',
 	// Host extensions (docs/EXTENSIONS.md).
 	/**
 	 * A refusal from an extension's route. The envelope carries the

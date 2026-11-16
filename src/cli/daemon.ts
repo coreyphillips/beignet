@@ -576,7 +576,14 @@ const STATUS_BY_ERROR_CODE: Partial<Record<BeignetErrorCodeValue, number>> = {
 	// Host extensions (docs/EXTENSIONS.md). An extension's refusal carries
 	// its own status, and this is the one it gets when it names none.
 	EXTENSION_ERROR: 400,
-	EXTENSION_UNAVAILABLE: 503
+	EXTENSION_UNAVAILABLE: 503,
+	// Asset channels (issue #2093). Refusals to start a node: they end a
+	// boot, and reach HTTP only from a route that rebuilds the node. 409,
+	// not 503: the same request meets the same refusal until the operator
+	// changes which extensions the daemon is started with.
+	ASSET_PROVIDER_REQUIRED: 409,
+	ASSET_PROVIDER_CONFLICT: 409,
+	ASSET_PROVIDER_FAILED: 409
 	// Left unmapped on purpose, so they keep the 500 default:
 	// WALLET_CREATE_FAILED, ADDRESS_FAILED, REFRESH_FAILED and
 	// DESCRIPTOR_EXPORT_FAILED are node faults, and SEND_FAILED, CLOSE_FAILED,

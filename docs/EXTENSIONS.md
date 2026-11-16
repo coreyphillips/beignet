@@ -73,15 +73,16 @@ The factory's argument carries `network`, the daemon's `env`, the engine's packa
 
 1. **Start refused or not.** Descriptions are checked before the instance lock and the database are taken.
 2. **`attach(context)`** runs once the on-chain wallet exists and before the Lightning node is created, so nothing has spent from the wallet yet. It has 30 seconds. `context.generation` is 1.
-3. **`start()`** runs in the background once the node is built. The daemon does not wait for it, so a slow extension never delays the node, and the extensions are started together, so one never delays another. It has no time limit: an extension stays `attached` until its `start()` returns, and is `ready` after. Routes are served from `attach` on: an extension that is not ready yet says so in its own answers.
-4. **`stop('shutdown')`** runs when the daemon stops, before the node and the wallet do. On a graceful stop the storage still takes writes while it runs. The hooks of all extensions run together under one limit: 5 seconds, or half the time the shutdown was given when that is less. That wait is part of the shutdown's time, not added to it, so an extension that hangs shortens the node's wait for payments in flight and never delays the wallet's stop or the database's close. A node destroyed without a graceful stop (`BeignetNode.destroy()`, the fallback when the graceful one fails) fences the storage first and does not wait for the hook.
+3. **`bind(node)`**, for an attachment that has one, runs in the turn that built the Lightning node: before a peer can be heard and before any `start()` ([Asset channels](#asset-channels)).
+4. **`start()`** runs in the background once the node is built. The daemon does not wait for it, so a slow extension never delays the node, and the extensions are started together, so one never delays another. It has no time limit: an extension stays `attached` until its `start()` returns, and is `ready` after. Routes are served from `attach` on: an extension that is not ready yet says so in its own answers.
+5. **`stop('shutdown')`** runs when the daemon stops, before the node and the wallet do. On a graceful stop the storage still takes writes while it runs. The hooks of all extensions run together under one limit: 5 seconds, or half the time the shutdown was given when that is less. That wait is part of the shutdown's time, not added to it, so an extension that hangs shortens the node's wait for payments in flight and never delays the wallet's stop or the database's close. A node destroyed without a graceful stop (`BeignetNode.destroy()`, the fallback when the graceful one fails) fences the storage first and does not wait for the hook.
 
 An in-process rebuild replaces the node and the database under a running daemon (a capsule restore, [RECOVERY-PROTOCOL.md](RECOVERY-PROTOCOL.md)). Then:
 
 1. The extension's rows are copied into the database being installed, with the rest of the daemon's own state. From that copy on, `set` and `delete` through the running generation's storage throw: a write the installed database would not have is refused, not acknowledged and lost. Should the install give up before it replaces the database, they work again.
 2. The storage view and the emitter of the running generation are fenced, synchronously, in the same turn as that copy. From that point every storage call through the old context throws `The database connection is not open`, and `emit` does nothing. Nothing the old generation does can reach the installed database.
 3. `stop('rebuild')` runs, bounded. It must not expect to write.
-4. `attach` runs again on the new wallet and database, with `generation` one higher, once the previous `stop` has returned or timed out. Then `start`.
+4. `attach` runs again on the new wallet and database, with `generation` one higher, once the previous `stop` has returned or timed out. Then `bind` with the new node, then `start`.
 
 Keep nothing from one generation for the next. Everything an extension needs after a rebuild is in its rows.
 
@@ -94,7 +95,10 @@ A daemon holding for a guardian restore has no node, so no extension is attached
 | The path, the module, or the description | The daemon does not start |
 | `attach()` throws or does not answer in 30 seconds | The extension is `failed`. The node is built without it and the wallet runs. An attachment that arrives after the 30 seconds is stopped with `stop('shutdown')` |
 | `attach()` returns handlers that do not match the routes | The extension is `failed`, and the `stop('shutdown')` of what it returned runs, so whatever `attach()` opened can be closed |
-| `start()` throws | It is `failed` and its routes close at once; then its `stop('shutdown')` runs |
+| The attachment's `auxiliaryChannels`, `fixedOutputFees` or `bind` is malformed, or the wallet refuses the fee policy | The extension is `failed` and its `stop('shutdown')` runs. The node is built without its provider, which refuses the start when asset channels are stored (`ASSET_PROVIDER_REQUIRED`) |
+| Two extensions both supply `auxiliaryChannels` | The start is refused: `ASSET_PROVIDER_CONFLICT` |
+| `bind()` throws | The extension is `failed` and its `stop('shutdown')` runs. If the node was built with its provider, the node is stopped and the start refused: `ASSET_PROVIDER_FAILED` |
+| `start()` throws | It is `failed` and its routes close at once; then its `stop('shutdown')` runs. A provider it supplied stays with the node |
 | `start()` never returns | It stays `attached`. The other extensions start, and the node runs |
 | `stop()` throws or hangs | Logged; the node moves on after 5 seconds |
 | `status()` throws, or returns something that is not JSON | Logged; `GET /extensions` reports the extension without `status` |
@@ -179,9 +183,35 @@ The view needs a backend with `loadMetadataByPrefix` and `deleteMetadata`. SQLit
 - **Coins.** Anything the extension must keep out of ordinary coin selection (an output that carries something other than bitcoin) has to be frozen with the wallet's own freeze, which is persisted with the wallet's data. Do it in `attach`, before the node can spend.
 - **Fees and broadcasts** go through the wallet's API. The daemon's spending limits (`maxPaymentSats`, `dailySpendLimitSats`) apply to the daemon's own routes, not to what an extension spends through the wallet directly. An extension that spends states its own limits.
 
-The Lightning node is not part of version 1 of the contract.
+The Lightning node is not in the context. An attachment that needs it asks for it with `bind(node)`.
+
+## Asset channels
+
+Three optional members of the attachment reach the Lightning node. They were added to version 1 without a new contract number, because an engine that predates them reads an attachment by the members it knows and ignores the rest: the extension attaches there as before, its `bind` is never called, and the node runs no asset channels. An extension tells the two apart by whether `bind` ran before its `start()`.
+
+```ts
+interface IExtensionAttachment {
+	// ...handlers, start, stop, status
+	auxiliaryChannels?: IAuxiliaryChannelConfig;
+	fixedOutputFees?: {
+		maxFeeSatoshis: bigint;
+		maxTotalFeeSatoshis: bigint;
+		maxPreparationFeeSatoshis: bigint;
+		feeCoinCount?: number; // 1 to 16, 4 when left out
+		preparationFeeRatePerVbyte?: number; // 1 to 10000, 1 when left out
+	};
+	bind?(node: LightningNode): void;
+}
+```
+
+- **`auxiliaryChannels`** is handed to the node as its `auxiliaryChannels`, untouched: the provider that extends the channel state machine and the hooks that tie funding, payments and forwards to the extension's protocol. One extension may supply it. The node holds it for the life of the build, whatever becomes of the extension afterwards: an attachment with no handlers and no `start`, one whose `start()` has not returned, and one whose `start()` threw all leave their provider with the node. So the provider has to answer from the moment the node is bound, and an extension should report a fault of its own service through `status()` instead of throwing from `start()`: a failed extension is stopped and its storage fenced while its provider is still called.
+- **`fixedOutputFees`** bounds what the wallet may spend on the fees of an asset channel's transactions whose outputs are fixed, which cannot pay a fee from change. With it the wallet splits a coin into `feeCoinCount` equal fee coins, keeps them frozen, and spends one whole per transaction. `maxFeeSatoshis` is the most one transaction may burn and the size of a fee coin, `maxPreparationFeeSatoshis` the most one split may pay in its own fee, and `maxTotalFeeSatoshis` the most all of them together may ever commit. That last one is a lifetime budget kept in a journal in the node's database: it is never refunded, and a policy lowered below what the journal already holds is refused. It is read only beside `auxiliaryChannels`, and without it the wallet prepares no fee coins and chooses coins exactly as it does on a node with no extension.
+- **`bind(node)`** is called once per build with that build's `LightningNode`, in the turn that built it, outside any storage transaction, and before any `start()`. It is synchronous: a promise it returns is not waited for. An in-process rebuild attaches again and binds the new node to the new attachment, so keep no node from one generation for the next. The node's stored channels are restored while it is built, which is before `bind`: a hook the node calls during that restore runs unbound.
+
+A daemon whose database holds asset channels does not start without the provider that runs them. It answers `ASSET_PROVIDER_REQUIRED` and changes no stored row, so the same database starts once the extension is named again. Signing for such a channel as an ordinary one would leave the asset out of the commitment.
 
 ## Feature detection
 
 - `GET /extensions` (scope `readonly`; CLI `beignet extensions`) answers `{ api, extensions }`. An engine without the contract answers `404`.
 - A supervisor that decides whether to name an extension before it starts the daemon can look for the literal `beignet-extension-api/1` in the installed `dist/cli/extension.js`.
+- The asset channel members have no marker of their own. An extension that supplies them finds out at run time: `bind` is called before `start()` on an engine that reads them, and never on one that does not.

@@ -94,6 +94,9 @@ member BeignetErrorCode.ADDRESS_FAILED = "ADDRESS_FAILED"
 member BeignetErrorCode.AMOUNT_MISMATCH = "AMOUNT_MISMATCH"
 member BeignetErrorCode.AMOUNT_REQUIRED = "AMOUNT_REQUIRED"
 member BeignetErrorCode.AMOUNT_TOO_SMALL = "AMOUNT_TOO_SMALL"
+member BeignetErrorCode.ASSET_PROVIDER_CONFLICT = "ASSET_PROVIDER_CONFLICT"
+member BeignetErrorCode.ASSET_PROVIDER_FAILED = "ASSET_PROVIDER_FAILED"
+member BeignetErrorCode.ASSET_PROVIDER_REQUIRED = "ASSET_PROVIDER_REQUIRED"
 member BeignetErrorCode.BODY_TOO_LARGE = "BODY_TOO_LARGE"
 member BeignetErrorCode.CAPSULE_RESTORE_FAILED = "CAPSULE_RESTORE_FAILED"
 member BeignetErrorCode.CAPSULE_RESTORE_GUARDIAN_BACKED = "CAPSULE_RESTORE_GUARDIAN_BACKED"
@@ -826,17 +829,21 @@ readonly property ExtensionError.details?: unknown
 readonly property ExtensionError.extensionCode: string
 readonly property ExtensionError.status: number
 unexported type ExtensionEventListener = (event: string, data: unknown) => void
+unexported type ExtensionFixedOutputFees = Omit<beignet/lightning#wallet.IFixedOutputFeePolicy, 'storage' | 'walletId'>
 type ExtensionHandler = (request: IExtensionRequest) => unknown | Promise<unknown>
 unexported class ExtensionHost
 constructor ExtensionHost(extensions: readonly IBeignetExtension[], opts: IExtensionHostOptions)
 method ExtensionHost.abort(): void
 method ExtensionHost.attach(build: IExtensionBuild): Promise<void>
+method ExtensionHost.auxiliarySupply(): IExtensionAuxiliarySupply | undefined
+method ExtensionHost.bindNode(node: beignet/lightning#node.LightningNode, provider?: string): void
 method ExtensionHost.describe(): IExtensionInfo[]
 get ExtensionHost.extensions(): readonly IBeignetExtension[]
 method ExtensionHost.fenceForRebuild(): void
 method ExtensionHost.handler(id: string, key: string): ExtensionHandler
 method ExtensionHost.holdWrites(): () => void
 method ExtensionHost.onEvent(listener: ExtensionEventListener): () => void
+method ExtensionHost.refuseSupply(id: string, err: unknown): void
 method ExtensionHost.shutdown(limitMs?: number): Promise<void>
 method ExtensionHost.start(): Promise<void>
 method ExtensionHost.startInBackground(): void
@@ -971,10 +978,17 @@ property IChannelHealth.remoteBalancePct: number
 property IChannelHealth.state: string
 property IChannelHealth.warnings: string[]
 interface IExtensionAttachment
+property IExtensionAttachment.auxiliaryChannels?: beignet/lightning#channel.IAuxiliaryChannelConfig
+method IExtensionAttachment.bind?(node: beignet/lightning#node.LightningNode): void
+property IExtensionAttachment.fixedOutputFees?: ExtensionFixedOutputFees
 property IExtensionAttachment.handlers?: Record<string, ExtensionHandler>
 method IExtensionAttachment.start?(): void | Promise<void>
 method IExtensionAttachment.status?(): unknown
 method IExtensionAttachment.stop?(reason: ExtensionStopReason): void | Promise<void>
+unexported interface IExtensionAuxiliarySupply
+property IExtensionAuxiliarySupply.auxiliaryChannels: beignet/lightning#channel.IAuxiliaryChannelConfig
+property IExtensionAuxiliarySupply.fixedOutputFees?: ExtensionFixedOutputFees
+property IExtensionAuxiliarySupply.id: string
 unexported interface IExtensionBuild
 property IExtensionBuild.dataDir: string | undefined
 property IExtensionBuild.network: ExtensionNetwork
