@@ -31,6 +31,12 @@ property ILeaseQuote.requestedSats: bigint
 unexported interface ILedgerCodec<R extends ILedgerRecord>
 method ILedgerCodec.decode(raw: string): R | null
 method ILedgerCodec.encode(record: R): string
+unexported interface ILedgerKeyValueStorage
+method ILedgerKeyValueStorage.deleteMetadata?(key: string): void
+method ILedgerKeyValueStorage.loadMetadata(key: string): string | null
+method ILedgerKeyValueStorage.loadMetadataByPrefix?(prefix: string): Array<{ key: string; value: string; }>
+method ILedgerKeyValueStorage.saveMetadata(key: string, value: string): void
+method ILedgerKeyValueStorage.transaction<T>(fn: () => T): T
 unexported interface ILedgerRecord
 property ILedgerRecord.id: string
 property ILedgerRecord.state: string
@@ -964,10 +970,12 @@ function chain.estimateSimpleCloseFee(feeratePerKw: number, closerScriptLen: num
 function chain.estimateSweepVbytes(outputType: chain.OutputType, leased?: boolean): number
 function chain.extractCommitmentNumber(tx: bitcoinjs-lib#Transaction, openPaymentBasepoint: Buffer, acceptPaymentBasepoint: Buffer): bigint
 function chain.extractPreimageFromWitness(witness: Buffer[]): Buffer | null
+function chain.fixedOutputHtlcFeeActionId(channelId: Buffer, txid: string, outputIndex: number): string
 function chain.isDustOutput(scriptPubkey: Buffer, amountSat: bigint): boolean
 function chain.isOpReturnScript(scriptPubkey: Buffer): boolean
 function chain.matchRevokedHtlcSnapshotOutputs(state: channel.IChannelState, commitmentNumber: bigint, revokedTx: bitcoinjs-lib#Transaction, network?: bitcoinjs-lib#Network): Map<number, chain.IRevokedHtlcSnapshotOutput>
 function chain.minRelayFeeForWeight(weightUnits: number | bigint): bigint
+function chain.parseFixedOutputHtlcFeeActionId(value: string): { channelId: Buffer; txid: string; outputIndex: number; } | undefined
 function chain.resolveOurCommitmentOutputs(state: channel.IChannelState, trackedOutputs: chain.ITrackedOutput[], commitmentNumber: bigint, destinationScript: Buffer, feeRatePerVbyte: number, knownPreimages: Map<string, Buffer>, delayedPaymentBasepointSecret?: Buffer, htlcBasepointSecret?: Buffer, remoteHtlcSignatures?: Buffer[]): chain.IResolvedOutput[]
 function chain.resolveRevokedCommitmentOutputs(state: channel.IChannelState, trackedOutputs: chain.ITrackedOutput[], commitmentNumber: bigint, revokedTx: bitcoinjs-lib#Transaction, destinationScript: Buffer, feeRatePerVbyte: number, revocationBasepointSecret: Buffer, paymentPrivkey: Buffer, network?: bitcoinjs-lib#Network, currentHeight?: number, claimedOutputIndices?: chain.ClaimedOutputIndices): chain.IResolvedOutput[]
 function chain.resolveRevokedSecondLevelOutput(state: channel.IChannelState, spendingTx: bitcoinjs-lib#Transaction, confirmationHeight: number, commitmentNumber: bigint, destinationScript: Buffer, feeRatePerVbyte: number, revocationBasepointSecret: Buffer, network?: bitcoinjs-lib#Network): chain.IResolvedOutput[]
@@ -5696,6 +5704,13 @@ property node.IDirectFundingPolicy.maxAmountSat?: number
 property node.IDirectFundingPolicy.minAmountSat?: number
 property node.IDirectFundingPolicy.targetInboundSat?: number
 property node.IDirectFundingPolicy.unpairedSpliceDepth?: number
+interface node.IFeeBumpSelectionOpts
+property node.IFeeBumpSelectionOpts.confirmedOnly?: boolean
+property node.IFeeBumpSelectionOpts.excludeTxids?: readonly string[]
+property node.IFeeBumpSelectionOpts.feeActionId?: string
+property node.IFeeBumpSelectionOpts.fixedOutputs?: boolean
+property node.IFeeBumpSelectionOpts.maxFeeSatoshis?: bigint
+property node.IFeeBumpSelectionOpts.replacementInputs?: readonly { txid: string; vout: number; sequence: number; }[]
 interface node.IFeeEstimator
 method node.IFeeEstimator.estimateFee(targetBlocks: number): Promise<number>
 interface node.IForwardablePart
@@ -5713,12 +5728,16 @@ property node.IForwardablePart.skimmedFeeMsat?: bigint
 interface node.IFundingProvider
 method node.IFundingProvider.broadcastTransaction(txHex: string): Promise<string>
 method node.IFundingProvider.buildFundingTransaction(address: string, amountSats: bigint, satsPerByte?: number, max?: boolean): Promise<{ txHex: string; txid: Buffer; outputIndex: number; }>
+method node.IFundingProvider.getFixedOutputFeeActionIds?(channelId: Buffer): readonly string[]
+method node.IFundingProvider.getFixedOutputFeeBudget?(): wallet.IFixedOutputFeeBudget | undefined
 method node.IFundingProvider.pledgeTransactionInputs?(txHex: string): Promise<void>
 method node.IFundingProvider.quoteDualFundingMax?(feeratePerKw: number): { fundingSatoshis: bigint; spendableSats: bigint; feeSats: bigint; inputCount: number; }
 method node.IFundingProvider.quoteSpliceIn?(feeratePerKw: number): { spendableSats: bigint; feeSats: bigint; maxAmountSats: bigint; inputCount: number; }
 method node.IFundingProvider.releaseInputPledges?(outpoints: Array<{ txid: string; vout: number; }>): Promise<void>
+method node.IFundingProvider.restoreFeeBumpInputs?(inputs: readonly { prevTx: Buffer; prevOutputIndex: number; sequence: number; }[]): Promise<channel.ISpliceWalletInput[]>
+method node.IFundingProvider.retireFixedOutputFeeAction?(feeActionId: string, resolution?: wallet.IFixedOutputFeeResolution): Promise<void>
 method node.IFundingProvider.selectDualFundingInputs?(amountSats: bigint, feeratePerKw: number, initiator: boolean, topUp?: boolean, opts?: node.IUtxoSelectionOpts): Promise<{ inputs: channel.ISpliceWalletInput[]; changeScript: Buffer; }>
-method node.IFundingProvider.selectFeeBumpInputs?(targetFeeSats: bigint, feeratePerKw: number): Promise<{ inputs: channel.ISpliceWalletInput[]; changeScript: Buffer; }>
+method node.IFundingProvider.selectFeeBumpInputs?(targetFeeSats: bigint, feeratePerKw: number, opts?: node.IFeeBumpSelectionOpts): Promise<{ inputs: channel.ISpliceWalletInput[]; changeScript: Buffer; maxFeeSatoshis?: bigint; }>
 method node.IFundingProvider.selectMaxDualFundingInputs?(): Promise<{ inputs: channel.ISpliceWalletInput[]; changeScript: Buffer; }>
 method node.IFundingProvider.selectSpliceInputs?(amountSats: bigint, feeratePerKw: number, opts?: node.IUtxoSelectionOpts): Promise<{ inputs: channel.ISpliceWalletInput[]; changeScript: Buffer; }>
 method node.IFundingProvider.supportsFixedOutputFees?(): boolean
@@ -9832,32 +9851,72 @@ function validation.validatePositiveBigint(value: bigint, name: string): string 
 function validation.validateU32(value: number, name: string, { min, max }?: { min?: number; max?: number; }): string | null
 unexported const verifiedRecoveryChain: unique symbol
 namespace wallet
+class wallet.FixedOutputFeeBudgetExhaustedError extends wallet.FixedOutputFeeError
+constructor wallet.FixedOutputFeeBudgetExhaustedError(budget: wallet.IFixedOutputFeeBudget, neededSatoshis: bigint)
+readonly property wallet.FixedOutputFeeBudgetExhaustedError.budget: wallet.IFixedOutputFeeBudget
+readonly property wallet.FixedOutputFeeBudgetExhaustedError.neededSatoshis: bigint
+class wallet.FixedOutputFeeError extends Error
+constructor wallet.FixedOutputFeeError(code: wallet.FixedOutputFeeErrorCode, remedy: wallet.FixedOutputFeeRemedy, message: string)
+readonly property wallet.FixedOutputFeeError.code: wallet.FixedOutputFeeErrorCode
+readonly property wallet.FixedOutputFeeError.remedy: wallet.FixedOutputFeeRemedy
+type wallet.FixedOutputFeeErrorCode = 'FEE_PREPARATION_PENDING' | 'FEE_PREPARATION_NOT_PUBLISHED' | 'FEE_WALLET_TIMEOUT' | 'FEE_WALLET_UNAVAILABLE' | 'FEE_RESERVATION_REFUSED' | 'FEE_BUDGET_EXHAUSTED' | 'FEE_FUNDS_UNAVAILABLE' | 'FEE_ACTION_CAP_EXHAUSTED' | 'FEE_PREPARATION_FEE_EXCEEDS_CAP' | 'FEE_PREPARATION_SIGNING_FAILED' | 'FEE_ACTION_RETIRED' | 'FEE_INPUT_UNAVAILABLE'
+class wallet.FixedOutputFeePreparationPendingError extends wallet.FixedOutputFeeError
+constructor wallet.FixedOutputFeePreparationPendingError(transactionId: string)
+readonly property wallet.FixedOutputFeePreparationPendingError.transactionId: string
+type wallet.FixedOutputFeeRemedy = 'wait' | 'operator' | 'none'
+interface wallet.IFixedOutputFeeBudget
+property wallet.IFixedOutputFeeBudget.remainingSatoshis: bigint
+property wallet.IFixedOutputFeeBudget.reservedSatoshis: bigint
+property wallet.IFixedOutputFeeBudget.spentSatoshis: bigint
+property wallet.IFixedOutputFeeBudget.totalSatoshis: bigint
+interface wallet.IFixedOutputFeePolicy
+property wallet.IFixedOutputFeePolicy.feeCoinCount?: number
+property wallet.IFixedOutputFeePolicy.maxFeeSatoshis: bigint
+property wallet.IFixedOutputFeePolicy.maxPreparationFeeSatoshis: bigint
+property wallet.IFixedOutputFeePolicy.maxTotalFeeSatoshis: bigint
+property wallet.IFixedOutputFeePolicy.preparationFeeRatePerVbyte?: number
+property wallet.IFixedOutputFeePolicy.storage: ILedgerKeyValueStorage
+property wallet.IFixedOutputFeePolicy.walletCallTimeoutMs?: number
+property wallet.IFixedOutputFeePolicy.walletId?: string
+interface wallet.IFixedOutputFeeResolution
+property wallet.IFixedOutputFeeResolution.spendingTransaction: Buffer
 interface wallet.IWalletLike
 property wallet.IWalletLike.electrum: { broadcastTransaction(params: { rawTx: string; subscribeToOutputAddress?: boolean; }): Promise<IResult>; getTransactions?(params: { txHashes: Array<{ tx_hash: string; }>; }): Promise<IResult>; }
 method wallet.IWalletLike.freezeUtxo?(params: { txid: string; index: number; tag?: string; }): Promise<IResult>
 method wallet.IWalletLike.freezeUtxoIfUnfrozen?(params: { txid: string; index: number; tag?: string; }): Promise<IResult>
-method wallet.IWalletLike.getChangeAddress?(): Promise<IResult>
+method wallet.IWalletLike.getAddressFromScriptHash?(hash: string): { address: string; path: string; publicKey: string; } | undefined
+method wallet.IWalletLike.getChangeAddress?(addressType?: beignet#EAddressType): Promise<IResult>
 method wallet.IWalletLike.getPrivateKey?(path: string): string
+property wallet.IWalletLike.id?: string
+method wallet.IWalletLike.importSignedPsbt?(signed: string, unsigned?: string): IResult
 method wallet.IWalletLike.isUtxoFrozen?(txid: string, index: number): boolean
 method wallet.IWalletLike.listFrozenUtxos?(): Array<{ tx_hash: string; tx_pos: number; freezeTag?: string; frozenAt?: number; }>
 method wallet.IWalletLike.listUtxos?(): ISpliceUtxo[]
 property wallet.IWalletLike.network?: string
+method wallet.IWalletLike.refreshWallet?(options: Record<string, never>): Promise<IResult>
 method wallet.IWalletLike.send(params: { address: string; amount: number; satsPerByte?: number; broadcast?: boolean; shuffleOutputs?: boolean; }): Promise<IResult>
 method wallet.IWalletLike.sendMax?(params: { address: string; satsPerByte?: number; broadcast?: boolean; }): Promise<IResult>
+method wallet.IWalletLike.signPsbtWithOurKey?(psbt: string): IResult
 method wallet.IWalletLike.unfreezeUtxo?(params: { txid: string; index: number; }): Promise<IResult>
 method wallet.IWalletLike.unfreezeUtxoIfTagged?(params: { txid: string; index: number; tag: string; }): Promise<IResult>
+method wallet.IWalletLike.withSendLock?<T>(fn: () => Promise<T>): Promise<T>
 class wallet.WalletFundingProvider implements node.IFundingProvider
-constructor wallet.WalletFundingProvider(wallet: wallet.IWalletLike)
+constructor wallet.WalletFundingProvider(wallet: wallet.IWalletLike, options?: { fixedOutputFees?: wallet.IFixedOutputFeePolicy; })
 method wallet.WalletFundingProvider.broadcastTransaction(txHex: string): Promise<string>
 method wallet.WalletFundingProvider.buildFundingTransaction(address: string, amountSats: bigint, satsPerByte?: number, max?: boolean): Promise<{ txHex: string; txid: Buffer; outputIndex: number; }>
+method wallet.WalletFundingProvider.getFixedOutputFeeActionIds(channelId: Buffer): readonly string[]
+method wallet.WalletFundingProvider.getFixedOutputFeeBudget(): wallet.IFixedOutputFeeBudget | undefined
 method wallet.WalletFundingProvider.pledgeTransactionInputs(txHex: string): Promise<void>
 method wallet.WalletFundingProvider.quoteDualFundingMax(feeratePerKw: number): { fundingSatoshis: bigint; spendableSats: bigint; feeSats: bigint; inputCount: number; }
 method wallet.WalletFundingProvider.quoteSpliceIn(feeratePerKw: number): { spendableSats: bigint; feeSats: bigint; maxAmountSats: bigint; inputCount: number; }
 method wallet.WalletFundingProvider.releaseInputPledges(outpoints: Array<{ txid: string; vout: number; }>): Promise<void>
+method wallet.WalletFundingProvider.restoreFeeBumpInputs(inputs: readonly { prevTx: Buffer; prevOutputIndex: number; sequence: number; }[]): Promise<channel.ISpliceWalletInput[]>
+method wallet.WalletFundingProvider.retireFixedOutputFeeAction(feeActionId: string, resolution?: wallet.IFixedOutputFeeResolution): Promise<void>
 method wallet.WalletFundingProvider.selectDualFundingInputs(amountSats: bigint, feeratePerKw: number, initiator: boolean, topUp?: boolean, opts?: node.IUtxoSelectionOpts): Promise<{ inputs: channel.ISpliceWalletInput[]; changeScript: Buffer; }>
-method wallet.WalletFundingProvider.selectFeeBumpInputs(targetFeeSats: bigint, feeratePerKw: number): Promise<{ inputs: channel.ISpliceWalletInput[]; changeScript: Buffer; }>
+method wallet.WalletFundingProvider.selectFeeBumpInputs(targetFeeSats: bigint, feeratePerKw: number, opts?: node.IFeeBumpSelectionOpts): Promise<{ inputs: channel.ISpliceWalletInput[]; changeScript: Buffer; maxFeeSatoshis?: bigint; }>
 method wallet.WalletFundingProvider.selectMaxDualFundingInputs(): Promise<{ inputs: channel.ISpliceWalletInput[]; changeScript: Buffer; }>
 method wallet.WalletFundingProvider.selectSpliceInputs(amountSats: bigint, feeratePerKw: number, opts?: node.IUtxoSelectionOpts): Promise<{ inputs: channel.ISpliceWalletInput[]; changeScript: Buffer; }>
+method wallet.WalletFundingProvider.supportsFixedOutputFees(): boolean
 namespace watchtower
 const watchtower.BREACH_HINT_SIZE = 16
 enum watchtower.BlobFlag

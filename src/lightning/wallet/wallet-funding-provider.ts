@@ -1,3 +1,10 @@
+import { EAddressType } from '../../types';
+import { FixedOutputFeePool } from './fixed-output-fees';
+import type {
+	IFixedOutputFeeBudget,
+	IFixedOutputFeePolicy,
+	IFixedOutputFeeResolution
+} from './fixed-output-fees';
 /**
  * Wallet funding provider adapter.
  *
@@ -8,7 +15,11 @@
 import * as bitcoin from 'bitcoinjs-lib';
 import { ecc } from '../../utils/ecc';
 import { getECPair } from '../../utils/ecc-apis';
-import type { IFundingProvider, IUtxoSelectionOpts } from '../node/types';
+import type {
+	IFundingProvider,
+	IUtxoSelectionOpts,
+	IFeeBumpSelectionOpts
+} from '../node/types';
 import type { ISpliceWalletInput } from '../channel/channel';
 import {
 	estimateSpliceTxWeight,
@@ -95,6 +106,11 @@ export interface ISpliceUtxo {
  * them, and selectSpliceInputs throws a descriptive error if they are missing.
  */
 export interface IWalletLike {
+	id?: string;
+	signPsbtWithOurKey?(psbt: string): IResult;
+	importSignedPsbt?(signed: string, unsigned?: string): IResult;
+	/** Run an explicit preparation without racing ordinary wallet sends. */
+	withSendLock?<T>(fn: () => Promise<T>): Promise<T>;
 	send(params: {
 		address: string;
 		amount: number;
@@ -124,10 +140,16 @@ export interface IWalletLike {
 		}): Promise<IResult>;
 	};
 	listUtxos?(): ISpliceUtxo[];
+	/** Refresh Bitcoin change after another fee transaction consumes the available coin. */
+	refreshWallet?(options: Record<string, never>): Promise<IResult>;
 	/** Returns the WIF-encoded private key for a derivation path. */
 	getPrivateKey?(path: string): string;
+	/** Public derivation metadata survives spent-UTXO removal and wallet restart. */
+	getAddressFromScriptHash?(
+		hash: string
+	): { address: string; path: string; publicKey: string } | undefined;
 	/** Returns Result<{ address: string }>. */
-	getChangeAddress?(): Promise<IResult>;
+	getChangeAddress?(addressType?: EAddressType): Promise<IResult>;
 	/** A beignet `Network` value: 'bitcoin' | 'testnet' | 'regtest' | 'signet'. */
 	network?: string;
 	/** UTXO freeze API, used to pledge inputs to in-flight fundings so two
@@ -179,6 +201,7 @@ export interface IWalletLike {
  */
 export class WalletFundingProvider implements IFundingProvider {
 	private wallet: IWalletLike;
+	private fixedOutputFeePool?: FixedOutputFeePool;
 
 	/**
 	 * Outpoints pledged to an in-flight funding, keyed txid:vout with the
@@ -228,15 +251,134 @@ export class WalletFundingProvider implements IFundingProvider {
 	 * select-and-pledge critical section runs under one lock.
 	 */
 	private selectionLock: Promise<unknown> = Promise.resolve();
+	/**
+	 * With fixed-output fees configured, a fee coin is prepared, reserved and
+	 * spent across several wallet calls, and a second provider over the same
+	 * wallet (a rebuilt node in the same process) must not select a coin in
+	 * between. Those providers share one lock per wallet identity. A provider
+	 * without the option never touches this map.
+	 */
+	private static readonly walletLocks = new Map<
+		string | IWalletLike,
+		Promise<unknown>
+	>();
+	/** Which of those locks this provider takes, settled when it is built. */
+	private walletLockKey?: string | IWalletLike;
 
-	constructor(wallet: IWalletLike) {
+	constructor(
+		wallet: IWalletLike,
+		options: { fixedOutputFees?: IFixedOutputFeePolicy } = {}
+	) {
 		this.wallet = wallet;
+		if (options.fixedOutputFees)
+			this.walletLockKey = wallet.id
+				? `${wallet.network ?? 'bitcoin'}:${wallet.id}`
+				: wallet;
+		if (options.fixedOutputFees)
+			this.fixedOutputFeePool = new FixedOutputFeePool(
+				wallet,
+				options.fixedOutputFees,
+				{
+					previousTransactions: (ids): Promise<Map<string, string>> =>
+						this.previousTransactions(ids),
+					input: (coin, raw): ISpliceWalletInput =>
+						this.walletInput(coin, raw, 'fixed-output fee'),
+					pledge: async (txid, index, tag): Promise<void> => {
+						this.adoptStalePledges();
+						const existing = this.wallet
+							.listFrozenUtxos?.()
+							.find((coin) => coin.tx_hash === txid && coin.tx_pos === index);
+						if (existing && existing.freezeTag !== tag)
+							throw new Error(
+								'Fixed-output fee coin is reserved by another owner'
+							);
+						const refusal = await this.renewRetainedPledge(txid, index);
+						if (refusal || !this.ownedFreezes.has(`${txid}:${index}`))
+							throw new Error(
+								'Fixed-output fee pledge was refused or belongs to another owner'
+							);
+					},
+					release: async (txid, index, tag): Promise<void> => {
+						const result = await this.wallet.unfreezeUtxoIfTagged!({
+							txid,
+							index,
+							tag
+						});
+						if (result.isErr())
+							throw new Error(
+								'Fixed-output retired reservation release failed'
+							);
+						if ((result as IResultOk<{ unfrozen: boolean }>).value.unfrozen) {
+							const key = `${txid}:${index}`;
+							this.ownedFreezes.delete(key);
+							this.pledged.delete(key);
+							this.renewedPledges.delete(key);
+						}
+					}
+				}
+			);
+		// A freeze under the pool's tags that its journal does not own, as a
+		// restore that did not carry the journal leaves behind, is released
+		// now and not at the first fee selection, which may never come.
+		if (this.fixedOutputFeePool)
+			void this.runSelection(() =>
+				this.fixedOutputFeePool!.releaseOrphanFreezes()
+			).catch(() => undefined);
+	}
+	supportsFixedOutputFees(): boolean {
+		return this.fixedOutputFeePool !== undefined;
+	}
+
+	/**
+	 * What the lifetime budget for fixed-output fees stands at: its total,
+	 * what is reserved, what was spent and what a new action may still take.
+	 * A host reads it to warn before new fee actions are refused. Undefined
+	 * without a fee policy.
+	 */
+	getFixedOutputFeeBudget(): IFixedOutputFeeBudget | undefined {
+		return this.fixedOutputFeePool?.budget();
+	}
+
+	/**
+	 * Retire a fee action after the host establishes irrevocable resolution.
+	 * Name the transaction that settled it and the action is charged only the
+	 * coins of its own that the transaction spent, the others going back to
+	 * the pool. Without one it is charged its whole cap.
+	 */
+	retireFixedOutputFeeAction(
+		feeActionId: string,
+		resolution?: IFixedOutputFeeResolution
+	): Promise<void> {
+		return this.runSelection(async () => {
+			await this.fixedOutputFeePool?.retire(feeActionId, resolution);
+		});
+	}
+
+	/** Retained native HTLC actions for one exact channel, excluding fully retired entries. */
+	getFixedOutputFeeActionIds(channelId: Buffer): readonly string[] {
+		return this.fixedOutputFeePool?.actionIds(channelId) ?? [];
 	}
 
 	/** Run fn after every previously queued selection has finished. */
 	private runSelection<T>(fn: () => Promise<T>): Promise<T> {
-		const run = this.selectionLock.then(fn, fn);
-		this.selectionLock = run.catch(() => undefined);
+		if (!this.fixedOutputFeePool) {
+			const run = this.selectionLock.then(fn, fn);
+			this.selectionLock = run.catch(() => undefined);
+			return run;
+		}
+		const key = this.walletLockKey!;
+		const prior =
+			WalletFundingProvider.walletLocks.get(key) ?? Promise.resolve();
+		const run = prior.then(fn, fn);
+		const settled = run.then(
+			() => undefined,
+			() => undefined
+		);
+		WalletFundingProvider.walletLocks.set(key, settled);
+		void settled.then(() => {
+			if (WalletFundingProvider.walletLocks.get(key) === settled)
+				WalletFundingProvider.walletLocks.delete(key);
+		});
 		return run;
 	}
 
@@ -258,7 +400,13 @@ export class WalletFundingProvider implements IFundingProvider {
 		renewed = false
 	): Promise<string | null> {
 		const key = `${txid}:${vout}`;
-		const params = { txid, index: vout, tag: WalletFundingProvider.PLEDGE_TAG };
+		const params = {
+			txid,
+			index: vout,
+			tag:
+				this.fixedOutputFeePool?.reservationTag(txid, vout) ??
+				WalletFundingProvider.PLEDGE_TAG
+		};
 		let res: IResult | undefined;
 		let owned: boolean;
 		if (this.wallet.freezeUtxoIfUnfrozen) {
@@ -297,8 +445,7 @@ export class WalletFundingProvider implements IFundingProvider {
 						.listFrozenUtxos?.()
 						.some(
 							(f) =>
-								`${f.tx_hash}:${f.tx_pos}` === key &&
-								f.freezeTag === WalletFundingProvider.PLEDGE_TAG
+								`${f.tx_hash}:${f.tx_pos}` === key && f.freezeTag === params.tag
 						) === true
 				: res !== undefined && !res.isErr();
 		}
@@ -315,6 +462,44 @@ export class WalletFundingProvider implements IFundingProvider {
 			if (renewed) this.renewedPledges.add(key);
 		}
 		return refusal;
+	}
+
+	/**
+	 * Renew a pledge on a fee coin that a published replacement may already
+	 * have spent. The wallet refuses to freeze a coin it no longer lists, yet
+	 * the freeze this provider placed earlier is durable and must keep
+	 * standing across that spend and a possible reorg. So when the wallet no
+	 * longer lists the coin and the standing freeze carries this provider's
+	 * own tag, the renewal is recorded without asking the wallet to freeze
+	 * again. Every other case is an ordinary renewal, refusals included.
+	 */
+	private async renewRetainedPledge(
+		txid: string,
+		vout: number
+	): Promise<string | null> {
+		const key = `${txid}:${vout}`;
+		const listed =
+			this.wallet
+				.listUtxos?.()
+				.some((u) => u.tx_hash === txid && u.tx_pos === vout) === true;
+		if (
+			!listed &&
+			this.ownedFreezes.has(key) &&
+			this.wallet.isUtxoFrozen?.(txid, vout) === true
+		) {
+			const tag =
+				this.fixedOutputFeePool?.reservationTag(txid, vout) ??
+				WalletFundingProvider.PLEDGE_TAG;
+			const standing = this.wallet
+				.listFrozenUtxos?.()
+				.find((f) => f.tx_hash === txid && f.tx_pos === vout);
+			if (standing && standing.freezeTag === tag) {
+				this.pledged.set(key, Date.now());
+				this.renewedPledges.add(key);
+				return null;
+			}
+		}
+		return this.pledge(txid, vout, true);
 	}
 
 	/** pledge() for a fresh selection, which must abort on a refusal. */
@@ -431,7 +616,11 @@ export class WalletFundingProvider implements IFundingProvider {
 		this.adoptedStale = true;
 		const frozen = this.wallet.listFrozenUtxos?.() ?? [];
 		for (const f of frozen) {
-			if (f.freezeTag !== WalletFundingProvider.PLEDGE_TAG) continue;
+			if (
+				f.freezeTag !== WalletFundingProvider.PLEDGE_TAG &&
+				!this.fixedOutputFeePool?.ownsFreeze(f.tx_hash, f.tx_pos, f.freezeTag)
+			)
+				continue;
 			const key = `${f.tx_hash}:${f.tx_pos}`;
 			this.ownedFreezes.add(key);
 			if (this.pledged.has(key)) continue;
@@ -440,7 +629,13 @@ export class WalletFundingProvider implements IFundingProvider {
 	}
 
 	/** Unfreeze pledges whose funding tx spent them or that timed out. */
-	private async prunePledges(): Promise<void> {
+	private async prunePledges(
+		protectedInputs?: ReadonlySet<string>
+	): Promise<void> {
+		protectedInputs = new Set([
+			...(protectedInputs ?? []),
+			...(this.fixedOutputFeePool?.reservedOutpoints() ?? [])
+		]);
 		this.adoptStalePledges();
 		if (this.pledged.size === 0 || !this.wallet.listUtxos) return;
 		const utxos = this.wallet.listUtxos();
@@ -452,6 +647,7 @@ export class WalletFundingProvider implements IFundingProvider {
 		const live = new Set(utxos.map((u) => `${u.tx_hash}:${u.tx_pos}`));
 		const now = Date.now();
 		for (const key of [...this.pledged.keys()]) {
+			if (protectedInputs?.has(key)) continue;
 			// Read the timestamp live: a renewal can land between this snapshot
 			// and the unfreeze below, and expiring it on the stale one would drop
 			// the reservation the renewal just made.
@@ -499,7 +695,11 @@ export class WalletFundingProvider implements IFundingProvider {
 			this.adoptStalePledges();
 			for (const { txid, vout } of outpoints) {
 				const key = `${txid}:${vout}`;
-				if (!this.pledged.has(key)) continue;
+				if (
+					!this.pledged.has(key) ||
+					this.fixedOutputFeePool?.isReserved(txid, vout)
+				)
+					continue;
 				if (await this.releasePledge(txid, vout)) {
 					this.pledged.delete(key);
 					this.renewedPledges.delete(key);
@@ -687,8 +887,20 @@ export class WalletFundingProvider implements IFundingProvider {
 	 */
 	async selectFeeBumpInputs(
 		targetFeeSats: bigint,
-		feeratePerKw: number
-	): Promise<{ inputs: ISpliceWalletInput[]; changeScript: Buffer }> {
+		feeratePerKw: number,
+		opts?: IFeeBumpSelectionOpts
+	): Promise<{
+		inputs: ISpliceWalletInput[];
+		changeScript: Buffer;
+		maxFeeSatoshis?: bigint;
+	}> {
+		if (opts?.fixedOutputs) {
+			if (!this.fixedOutputFeePool)
+				throw new Error('Fixed-output fee preparation is not configured');
+			return this.runSelection(() =>
+				this.fixedOutputFeePool!.select(targetFeeSats, feeratePerKw, opts)
+			);
+		}
 		// P2WPKH only: the fee-bump attach paths (sweep.ts) sign wallet inputs
 		// with (tx, index, value) and cannot supply the full prevout set a
 		// P2TR input's BIP 341 sighash commits to.
@@ -701,7 +913,9 @@ export class WalletFundingProvider implements IFundingProvider {
 					feeratePerKw
 				) +
 				P2WPKH_DUST_LIMIT,
-			true
+			true,
+			undefined,
+			opts
 		);
 	}
 
@@ -720,6 +934,8 @@ export class WalletFundingProvider implements IFundingProvider {
 	private spendableP2wpkhUtxos(p2wpkhOnly = false): ISpliceUtxo[] {
 		if (!this.wallet.listUtxos) return [];
 		const network = this.bitcoinJsNetwork();
+		// Read once for the whole selection, not once for every coin.
+		const feeCoins = this.fixedOutputFeePool?.reservedOutpoints();
 		const candidates = this.wallet.listUtxos().filter((u) => {
 			// Frozen coins (pledged to an in-flight funding, or frozen by the
 			// user) are excluded from selection; listUtxos itself does not
@@ -729,6 +945,7 @@ export class WalletFundingProvider implements IFundingProvider {
 			// failed.
 			if (this.wallet.isUtxoFrozen?.(u.tx_hash, u.tx_pos)) return false;
 			if (this.pledged.has(`${u.tx_hash}:${u.tx_pos}`)) return false;
+			if (feeCoins?.has(`${u.tx_hash.toLowerCase()}:${u.tx_pos}`)) return false;
 			try {
 				const kind = scriptKind(
 					bitcoin.address.toOutputScript(u.address, network)
@@ -880,10 +1097,17 @@ export class WalletFundingProvider implements IFundingProvider {
 		purpose: string,
 		computeTarget: (selectedCount: number) => bigint,
 		p2wpkhOnly = false,
-		opts?: IUtxoSelectionOpts
+		opts?: IUtxoSelectionOpts,
+		feeOpts?: IFeeBumpSelectionOpts
 	): Promise<{ inputs: ISpliceWalletInput[]; changeScript: Buffer }> {
 		return this.runSelection(() =>
-			this.gatherWalletInputsLocked(purpose, computeTarget, p2wpkhOnly, opts)
+			this.gatherWalletInputsLocked(
+				purpose,
+				computeTarget,
+				p2wpkhOnly,
+				opts,
+				feeOpts
+			)
 		);
 	}
 
@@ -891,7 +1115,8 @@ export class WalletFundingProvider implements IFundingProvider {
 		purpose: string,
 		computeTarget: (selectedCount: number) => bigint,
 		p2wpkhOnly = false,
-		opts?: IUtxoSelectionOpts
+		opts?: IUtxoSelectionOpts,
+		feeOpts?: IFeeBumpSelectionOpts
 	): Promise<{ inputs: ISpliceWalletInput[]; changeScript: Buffer }> {
 		const wallet = this.wallet;
 		if (
@@ -905,13 +1130,79 @@ export class WalletFundingProvider implements IFundingProvider {
 			);
 		}
 
-		await this.prunePledges();
-		let candidates = this.spendableP2wpkhUtxos(p2wpkhOnly);
+		const excluded = new Set(
+			(feeOpts?.excludeTxids ?? []).map((value) => {
+				if (!/^[a-f0-9]{64}$/i.test(value))
+					throw new Error('Invalid excluded fee transaction');
+				return value.toLowerCase();
+			})
+		);
+		const specs = feeOpts?.replacementInputs ?? [],
+			protectedInputs = new Set<string>();
+		for (const input of specs) {
+			if (
+				!/^[a-f0-9]{64}$/i.test(input.txid) ||
+				excluded.has(input.txid.toLowerCase())
+			)
+				throw new Error('Forbidden replacement fee input');
+			protectedInputs.add(`${input.txid.toLowerCase()}:${input.vout}`);
+		}
+		const previous = specs.length
+			? await this.previousTransactions(
+					specs.map((input) => input.txid.toLowerCase())
+			  )
+			: new Map<string, string>();
+		const reused = specs.length
+			? await this.restoreFeeBumpInputsLocked(
+					specs.map((input) => {
+						const raw = previous.get(input.txid.toLowerCase());
+						if (!raw)
+							throw new Error('Replacement fee previous transaction missing');
+						return {
+							prevTx: Buffer.from(raw, 'hex'),
+							prevOutputIndex: input.vout,
+							sequence: input.sequence
+						};
+					})
+			  )
+			: [];
+		const reusedSum = reused.reduce((sum, input) => sum + input.value, 0n);
+		const eligible = (): ISpliceUtxo[] =>
+			this.spendableP2wpkhUtxos(p2wpkhOnly).filter(
+				(input) =>
+					!excluded.has(input.tx_hash.toLowerCase()) &&
+					!protectedInputs.has(`${input.tx_hash}:${input.tx_pos}`) &&
+					(!(feeOpts?.confirmedOnly || specs.length > 0) || input.height > 0)
+			);
+		await this.prunePledges(protectedInputs);
+		let candidates = eligible();
+		if (
+			feeOpts !== undefined &&
+			purpose === 'fee-bump' &&
+			wallet.refreshWallet &&
+			reusedSum +
+				candidates.reduce((sum, coin) => sum + BigInt(coin.value), 0n) <
+				computeTarget(Math.max(candidates.length + reused.length, 1))
+		) {
+			const refreshed = await wallet.refreshWallet({});
+			if (refreshed.isErr())
+				throw new Error(
+					`wallet refresh for fee-bump failed: ${
+						(refreshed as IResultErr).error.message
+					}`
+				);
+			await this.prunePledges(protectedInputs);
+			candidates = eligible();
+		}
+
 		const network = this.bitcoinJsNetwork();
 
 		const selected: ISpliceUtxo[] = [];
-		let selectedSum = 0n;
-		let target = 0n;
+		let selectedSum = reusedSum;
+		// Without fee options nothing is reused and the target starts at zero,
+		// as it always has, so a refusal reads the same.
+		let target =
+			feeOpts !== undefined ? computeTarget(Math.max(reused.length, 1)) : 0n;
 		// An empty directed list must not degrade into unrestricted greedy
 		// selection (issue #572 review): direct provider callers get the same
 		// refusal the shared selection entry enforces.
@@ -941,7 +1232,7 @@ export class WalletFundingProvider implements IFundingProvider {
 				selected.push(match);
 				selectedSum += BigInt(match.value);
 			}
-			target = computeTarget(selected.length);
+			target = computeTarget(selected.length + reused.length);
 			// Without allowTopUp the named coins must carry the whole target;
 			// the shared shortfall error below reports the deficit.
 			candidates = opts.allowTopUp
@@ -949,14 +1240,14 @@ export class WalletFundingProvider implements IFundingProvider {
 				: [];
 		}
 		for (const utxo of candidates) {
-			if (selectedSum >= target && selected.length > 0) break;
+			if (selectedSum >= target && selected.length + reused.length > 0) break;
 			selected.push(utxo);
 			selectedSum += BigInt(utxo.value);
 			// Each added input grows the tx (and thus the fee) — recompute.
-			target = computeTarget(selected.length);
+			target = computeTarget(selected.length + reused.length);
 			if (selectedSum >= target) break;
 		}
-		if (selectedSum < target || selected.length === 0) {
+		if (selectedSum < target || selected.length + reused.length === 0) {
 			// Directed selections filtered the seeded coins out of candidates,
 			// so the spendable total is the seeded sum plus what remains.
 			const have =
@@ -970,9 +1261,15 @@ export class WalletFundingProvider implements IFundingProvider {
 		}
 
 		// Fetch the raw previous transactions in one batch.
-		const txResult = await wallet.electrum.getTransactions({
-			txHashes: selected.map((u) => ({ tx_hash: u.tx_hash }))
-		});
+		const txResult: IResult = selected.length
+			? await wallet.electrum.getTransactions({
+					txHashes: selected.map((u) => ({ tx_hash: u.tx_hash }))
+			  })
+			: ({
+					isErr: () => false,
+					isOk: () => true,
+					value: { data: [] }
+			  } as IResultOk<{ data: [] }>);
 		if (txResult.isErr()) {
 			throw new Error(
 				`failed to fetch ${purpose} prev txs: ${
@@ -994,98 +1291,25 @@ export class WalletFundingProvider implements IFundingProvider {
 			if (txid && entry.result?.hex) hexByTxid.set(txid, entry.result.hex);
 		}
 
-		const inputs: ISpliceWalletInput[] = selected.map((utxo) => {
-			const hex = hexByTxid.get(utxo.tx_hash);
-			if (!hex) {
-				throw new Error(`missing raw tx for ${purpose} input ${utxo.tx_hash}`);
-			}
-			const keyPair = getECPair().fromWIF(
-				wallet.getPrivateKey!(utxo.path),
-				network
-			);
-			const pubkey = Buffer.from(keyPair.publicKey);
-			if (pubkey.toString('hex') !== utxo.publicKey) {
-				throw new Error(
-					`derived key mismatch for ${purpose} input ${utxo.tx_hash}:${utxo.tx_pos}`
-				);
-			}
-			const privKey = Buffer.from(keyPair.privateKey!);
-			const outputScript = bitcoin.address.toOutputScript(
-				utxo.address,
-				network
-			);
-			const kind = scriptKind(outputScript);
-
-			const base = {
-				prevTx: Buffer.from(hex, 'hex'),
-				prevOutputIndex: utxo.tx_pos,
-				value: BigInt(utxo.value),
-				sequence: 0xfffffffd,
-				confirmed: utxo.height > 0
-			};
-
-			if (kind === 'p2tr') {
-				// BIP 86 key-path spend: sign with the taproot-tweaked key over
-				// the BIP 341 sighash, which commits to every input's prevout.
-				// BOLT 2 requires SIGHASH_ALL on every tx_signatures signature,
-				// so the explicit 65-byte form is emitted rather than the
-				// 64-byte SIGHASH_DEFAULT shorthand (identical coverage, but
-				// the interactive-tx rule names ALL and peers may enforce it).
-				const tweakedPriv = taprootTweakPrivateKey(privKey, pubkey);
-				return {
-					...base,
-					signWitness: (
-						tx: bitcoin.Transaction,
-						inputIndex: number,
-						_value: bigint,
-						prevouts?: { scripts: Buffer[]; values: bigint[] }
-					): Buffer[] => {
-						if (!prevouts) {
-							throw new Error(
-								'P2TR input needs the full prevout set to sign (BIP 341)'
-							);
-						}
-						const sighash = tx.hashForWitnessV1(
-							inputIndex,
-							prevouts.scripts,
-							prevouts.values.map((v) => Number(v)),
-							bitcoin.Transaction.SIGHASH_ALL
-						);
-						return [
-							Buffer.concat([
-								Buffer.from(ecc.signSchnorr(sighash, tweakedPriv)),
-								Buffer.from([bitcoin.Transaction.SIGHASH_ALL])
-							])
-						];
-					}
-				};
-			}
-
-			const scriptCode = bitcoin.payments.p2pkh({ pubkey, network }).output!;
-			return {
-				...base,
-				signWitness: (
-					tx: bitcoin.Transaction,
-					inputIndex: number,
-					value: bigint
-				): Buffer[] => {
-					const sighash = tx.hashForWitnessV0(
-						inputIndex,
-						scriptCode,
-						Number(value),
-						bitcoin.Transaction.SIGHASH_ALL
+		const inputs: ISpliceWalletInput[] = [
+			...reused,
+			...selected.map((utxo) => {
+				const hex = hexByTxid.get(utxo.tx_hash);
+				if (!hex) {
+					throw new Error(
+						`missing raw tx for ${purpose} input ${utxo.tx_hash}`
 					);
-					const sig64 = Buffer.from(ecc.sign(sighash, privKey));
-					const der = bitcoin.script.signature.encode(
-						sig64,
-						bitcoin.Transaction.SIGHASH_ALL
-					);
-					return [der, pubkey];
 				}
-			};
-		});
+				return this.walletInput(utxo, hex, purpose);
+			})
+		];
 
-		const changeRes = await wallet.getChangeAddress();
+		// A sweep that passed fee options spends P2WPKH fee coins and takes its
+		// change the same way. Every other caller asks as it always has.
+		const changeRes =
+			feeOpts !== undefined && p2wpkhOnly
+				? await wallet.getChangeAddress(EAddressType.p2wpkh)
+				: await wallet.getChangeAddress();
 		if (changeRes.isErr()) {
 			throw new Error(
 				`failed to get change address: ${
@@ -1105,6 +1329,230 @@ export class WalletFundingProvider implements IFundingProvider {
 		}
 
 		return { inputs, changeScript };
+	}
+
+	private walletInput(
+		utxo: ISpliceUtxo,
+		hex: string,
+		purpose: string,
+		sequence = 0xfffffffd
+	): ISpliceWalletInput {
+		const wallet = this.wallet,
+			network = this.bitcoinJsNetwork();
+		const keyPair = getECPair().fromWIF(
+			wallet.getPrivateKey!(utxo.path),
+			network
+		);
+		const pubkey = Buffer.from(keyPair.publicKey);
+		if (pubkey.toString('hex') !== utxo.publicKey) {
+			throw new Error(
+				`derived key mismatch for ${purpose} input ${utxo.tx_hash}:${utxo.tx_pos}`
+			);
+		}
+		const privKey = Buffer.from(keyPair.privateKey!);
+		const outputScript = bitcoin.address.toOutputScript(utxo.address, network);
+		const kind = scriptKind(outputScript);
+
+		const base = {
+			prevTx: Buffer.from(hex, 'hex'),
+			prevOutputIndex: utxo.tx_pos,
+			value: BigInt(utxo.value),
+			sequence,
+			confirmed: utxo.height > 0
+		};
+
+		if (kind === 'p2tr') {
+			// BIP 86 key-path spend: sign with the taproot-tweaked key over
+			// the BIP 341 sighash, which commits to every input's prevout.
+			// BOLT 2 requires SIGHASH_ALL on every tx_signatures signature,
+			// so the explicit 65-byte form is emitted rather than the
+			// 64-byte SIGHASH_DEFAULT shorthand (identical coverage, but
+			// the interactive-tx rule names ALL and peers may enforce it).
+			const tweakedPriv = taprootTweakPrivateKey(privKey, pubkey);
+			return {
+				...base,
+				signWitness: (
+					tx: bitcoin.Transaction,
+					inputIndex: number,
+					_value: bigint,
+					prevouts?: { scripts: Buffer[]; values: bigint[] }
+				): Buffer[] => {
+					if (!prevouts) {
+						throw new Error(
+							'P2TR input needs the full prevout set to sign (BIP 341)'
+						);
+					}
+					const sighash = tx.hashForWitnessV1(
+						inputIndex,
+						prevouts.scripts,
+						prevouts.values.map((v) => Number(v)),
+						bitcoin.Transaction.SIGHASH_ALL
+					);
+					return [
+						Buffer.concat([
+							Buffer.from(ecc.signSchnorr(sighash, tweakedPriv)),
+							Buffer.from([bitcoin.Transaction.SIGHASH_ALL])
+						])
+					];
+				}
+			};
+		}
+
+		const scriptCode = bitcoin.payments.p2pkh({ pubkey, network }).output!;
+		return {
+			...base,
+			signWitness: (
+				tx: bitcoin.Transaction,
+				inputIndex: number,
+				value: bigint
+			): Buffer[] => {
+				const sighash = tx.hashForWitnessV0(
+					inputIndex,
+					scriptCode,
+					Number(value),
+					bitcoin.Transaction.SIGHASH_ALL
+				);
+				const sig64 = Buffer.from(ecc.sign(sighash, privKey));
+				const der = bitcoin.script.signature.encode(
+					sig64,
+					bitcoin.Transaction.SIGHASH_ALL
+				);
+				return [der, pubkey];
+			}
+		};
+	}
+
+	private async previousTransactions(
+		txids: readonly string[]
+	): Promise<Map<string, string>> {
+		if (!this.wallet.electrum.getTransactions)
+			throw new Error('Fee input transaction lookup is unavailable');
+		const result = await this.wallet.electrum.getTransactions({
+			txHashes: [...new Set(txids)].map((tx_hash) => ({ tx_hash }))
+		});
+		if (result.isErr())
+			throw new Error('Failed to fetch replacement fee input transactions');
+		const entries =
+			(
+				result as IResultOk<{
+					data: Array<{
+						data?: { tx_hash?: string };
+						result?: { hex?: string; txid?: string };
+					}>;
+				}>
+			).value.data ?? [];
+		const transactions = new Map<string, string>();
+		for (const entry of entries) {
+			const hex = entry.result?.hex;
+			if (!hex) continue;
+			const transaction = bitcoin.Transaction.fromHex(hex);
+			const identity = entry.result?.txid ?? entry.data?.tx_hash;
+			if (identity && transaction.getId() !== identity.toLowerCase())
+				throw new Error('Replacement fee transaction identity mismatch');
+			transactions.set(transaction.getId(), hex);
+		}
+		return transactions;
+	}
+
+	async restoreFeeBumpInputs(
+		inputs: readonly {
+			prevTx: Buffer;
+			prevOutputIndex: number;
+			sequence: number;
+		}[]
+	): Promise<ISpliceWalletInput[]> {
+		return this.runSelection(() => this.restoreFeeBumpInputsLocked(inputs));
+	}
+
+	private async restoreFeeBumpInputsLocked(
+		inputs: readonly {
+			prevTx: Buffer;
+			prevOutputIndex: number;
+			sequence: number;
+		}[]
+	): Promise<ISpliceWalletInput[]> {
+		if (!this.wallet.getAddressFromScriptHash || !this.wallet.getPrivateKey)
+			throw new Error('Wallet fee input restoration is unavailable');
+		this.adoptStalePledges();
+		const unique = new Set<string>();
+		const restored = inputs.map((input) => {
+			if (
+				!Number.isInteger(input.prevOutputIndex) ||
+				input.prevOutputIndex < 0 ||
+				!Number.isInteger(input.sequence) ||
+				input.sequence < 0 ||
+				input.sequence > 0xffffffff
+			)
+				throw new Error('Invalid replacement fee input');
+			const transaction = bitcoin.Transaction.fromBuffer(input.prevTx),
+				txid = transaction.getId(),
+				key = `${txid}:${input.prevOutputIndex}`,
+				previous = transaction.outs[input.prevOutputIndex];
+			if (unique.has(key)) throw new Error('Duplicate replacement fee input');
+			unique.add(key);
+			if (!previous || scriptKind(previous.script) !== 'p2wpkh')
+				throw new Error('Replacement fee input is not P2WPKH');
+			const frozen = this.wallet
+				.listFrozenUtxos?.()
+				.find(
+					(coin) =>
+						coin.tx_hash === txid && coin.tx_pos === input.prevOutputIndex
+				);
+			if (
+				!this.pledged.has(key) ||
+				!this.ownedFreezes.has(key) ||
+				this.wallet.isUtxoFrozen?.(txid, input.prevOutputIndex) !== true ||
+				(frozen &&
+					frozen.freezeTag !==
+						(this.fixedOutputFeePool?.reservationTag(
+							txid,
+							input.prevOutputIndex
+						) ?? WalletFundingProvider.PLEDGE_TAG))
+			)
+				throw new Error('Replacement fee input is not an owned pledge');
+			const descriptor = this.wallet.getAddressFromScriptHash!(
+				Buffer.from(bitcoin.crypto.sha256(previous.script))
+					.reverse()
+					.toString('hex')
+			);
+			if (
+				!descriptor ||
+				!bitcoin.address
+					.toOutputScript(descriptor.address, this.bitcoinJsNetwork())
+					.equals(previous.script)
+			)
+				throw new Error('Replacement fee input has no owned derivation');
+			const utxo: ISpliceUtxo = {
+				...descriptor,
+				tx_hash: txid,
+				tx_pos: input.prevOutputIndex,
+				value: previous.value,
+				height: 0
+			};
+			const signer = this.walletInput(
+				utxo,
+				transaction.toHex(),
+				'replacement fee',
+				input.sequence
+			);
+			if (
+				!bitcoin.payments
+					.p2wpkh({ pubkey: Buffer.from(descriptor.publicKey, 'hex') })
+					.output!.equals(previous.script)
+			)
+				throw new Error('Replacement fee input key does not match its prevout');
+			return signer;
+		});
+		for (const input of inputs) {
+			const txid = bitcoin.Transaction.fromBuffer(input.prevTx).getId();
+			const refused = await this.renewRetainedPledge(
+				txid,
+				input.prevOutputIndex
+			);
+			if (refused)
+				throw new Error(`Replacement fee pledge renewal failed: ${refused}`);
+		}
+		return restored;
 	}
 
 	/**

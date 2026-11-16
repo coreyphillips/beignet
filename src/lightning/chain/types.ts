@@ -1,3 +1,38 @@
+/** Stable identity for a bounded fee reservation attached to one channel HTLC source. */
+export function fixedOutputHtlcFeeActionId(
+	channelId: Buffer,
+	txid: string,
+	outputIndex: number
+): string {
+	if (
+		channelId.length !== 32 ||
+		!/^[0-9a-f]{64}$/i.test(txid) ||
+		!Number.isInteger(outputIndex) ||
+		outputIndex < 0 ||
+		outputIndex > 0xffffffff
+	)
+		throw new Error('Invalid fixed-output HTLC fee identity');
+	return `asset-htlc:${channelId.toString(
+		'hex'
+	)}:${txid.toLowerCase()}:${outputIndex}`;
+}
+
+/** Parse only a complete canonical HTLC fee identity, never a namespace prefix. */
+export function parseFixedOutputHtlcFeeActionId(
+	value: string
+): { channelId: Buffer; txid: string; outputIndex: number } | undefined {
+	const match =
+		/^asset-htlc:([0-9a-f]{64}):([0-9a-f]{64}):(0|[1-9][0-9]*)$/.exec(value);
+	if (!match) return undefined;
+	const outputIndex = Number(match[3]);
+	if (!Number.isSafeInteger(outputIndex) || outputIndex > 0xffffffff)
+		return undefined;
+	return {
+		channelId: Buffer.from(match[1], 'hex'),
+		txid: match[2],
+		outputIndex
+	};
+}
 /**
  * BOLT 5: Chain monitor types.
  *
