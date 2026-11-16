@@ -61,6 +61,7 @@ export interface ISerializedAuxiliaryState {
 	remoteShutdownRecords?: SerializedCustomRecords;
 	closeTransactions?: [string, string][];
 	acceptedClosingSigned?: string;
+	fundingSignedDelivered?: true;
 	localCommitments: [string, ISerializedAuxiliaryCommitment][];
 	remoteCommitments: [string, ISerializedAuxiliaryCommitment][];
 	revokedCommitments?: [string, ISerializedAuxiliaryCommitment][];
@@ -343,6 +344,9 @@ function encodeAuxiliaryState(
 		...(state.acceptedClosingSigned
 			? { acceptedClosingSigned: state.acceptedClosingSigned.toString('hex') }
 			: {}),
+		...(state.fundingSignedDelivered === true
+			? { fundingSignedDelivered: true as const }
+			: {}),
 		localCommitments: [...state.localCommitments].map(([number, value]) => [
 			number.toString(),
 			encodeCommitment(value)
@@ -462,6 +466,9 @@ export function deserializeAuxiliaryState(
 		...(state.acceptedClosingSigned !== undefined
 			? { acceptedClosingSigned: bytes(state.acceptedClosingSigned) }
 			: {}),
+		...(state.fundingSignedDelivered !== undefined
+			? { fundingSignedDelivered: delivered(state.fundingSignedDelivered) }
+			: {}),
 		localCommitments: uniqueMap(
 			state.localCommitments.map(
 				([number, value]): [bigint, IAuxiliaryCommitmentData] => [
@@ -493,6 +500,11 @@ export function deserializeAuxiliaryState(
 	};
 }
 
+function delivered(value: unknown): true {
+	if (value !== true)
+		throw new Error('Malformed serialized asset funding marker');
+	return true;
+}
 function childPoint(value: string): Buffer {
 	const point = bytes(value);
 	if (point.length !== 33 || !ecc.isPoint(point))

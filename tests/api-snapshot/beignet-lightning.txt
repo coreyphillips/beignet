@@ -97,6 +97,7 @@ property ISerializedAuxiliaryState.acceptedClosingSigned?: string
 property ISerializedAuxiliaryState.channelData: string
 property ISerializedAuxiliaryState.childRevocationBasepoints?: [ string, string ][]
 property ISerializedAuxiliaryState.closeTransactions?: [ string, string ][]
+property ISerializedAuxiliaryState.fundingSignedDelivered?: true
 property ISerializedAuxiliaryState.localBalance: string
 property ISerializedAuxiliaryState.localCommitments: [ string, ISerializedAuxiliaryCommitment ][]
 property ISerializedAuxiliaryState.localShutdownRecords?: SerializedCustomRecords
@@ -1843,6 +1844,7 @@ property channel.IChannelAuxiliaryState.acceptedClosingSigned?: Buffer
 property channel.IChannelAuxiliaryState.channelData: Buffer
 property channel.IChannelAuxiliaryState.childRevocationBasepoints?: Map<string, Buffer>
 property channel.IChannelAuxiliaryState.closeTransactions?: Map<string, Buffer>
+property channel.IChannelAuxiliaryState.fundingSignedDelivered?: true
 property channel.IChannelAuxiliaryState.localBalance: bigint
 property channel.IChannelAuxiliaryState.localCommitments: Map<bigint, channel.IAuxiliaryCommitmentData>
 property channel.IChannelAuxiliaryState.localShutdownRecords?: Map<bigint, Buffer>

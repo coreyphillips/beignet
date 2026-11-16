@@ -201,8 +201,13 @@ export interface IAuxiliaryChannelConfig {
 	 * it is called the host can abandon the opening
 	 * (`abandonAuxiliaryOpen`); from it on the opening is irrevocable and the
 	 * funding transaction may be signed and published. Idempotent by
-	 * contract: after a restart it can be called again for the same channel.
-	 * A throw is reported and changes nothing.
+	 * contract: it is called for the same channel again, when the channel
+	 * is restored and after the next write of it that commits, until one
+	 * call has returned without throwing and the channel's row says so. A
+	 * throw is reported and changes nothing else: the opening is irrevocable
+	 * all the same. "Irrevocable" follows the written row: a funding_signed
+	 * that was verified while the row could not be written has told the
+	 * host nothing, and that opening can still be abandoned.
 	 */
 	onFundingSigned?(context: IAuxiliaryFundingSigned): void;
 	/** Complete local asset negotiation durably before accept_channel is sent. */

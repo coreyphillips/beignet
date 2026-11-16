@@ -1735,26 +1735,93 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 	}
 
 	/**
+	 * Asset openings of this node whose row holds the peer's funding_signed,
+	 * by channel id hex: set when a write of the channel past funding_signed
+	 * commits, and for every such channel restored from its row. An opening
+	 * is irrevocable exactly when it is in here, whatever memory says.
+	 */
+	private readonly auxiliaryOpensCommitted = new Set<string>();
+	private readonly _auxiliaryFundingSignedInFlight = new Set<string>();
+
+	/** An asset channel this node opened, with the peer's funding_signed taken in. */
+	private _isAuxiliaryOpenPastFundingSigned(channel: Channel): boolean {
+		const state = channel.getFullState();
+		return (
+			state.auxiliaryState !== undefined &&
+			state.role === ChannelRole.OPENER &&
+			state.channelId !== undefined &&
+			state.channelId !== null &&
+			!!state.fundingTxid &&
+			state.fundingOutputIndex !== undefined &&
+			state.state !== ChannelState.SENT_OPEN &&
+			state.state !== ChannelState.SENT_ACCEPT &&
+			state.state !== ChannelState.SENT_FUNDING_CREATED
+		);
+	}
+
+	/**
+	 * A write of the channel has committed. If it is an asset opening past
+	 * funding_signed, its row now holds the peer's signature: the opening
+	 * is irrevocable, and a host that has not been told is told. The batch
+	 * that carries funding_signed tells it at its
+	 * AUTHORIZE_FUNDING_BROADCAST, in the order it always has.
+	 */
+	private _auxiliaryOpenRowCommitted(ctx: IDispatchContext): void {
+		const { channel } = ctx;
+		if (!channel.getFullState().auxiliaryState) return;
+		if (!this._isAuxiliaryOpenPastFundingSigned(channel)) return;
+		this.auxiliaryOpensCommitted.add(channel.getChannelId()!.toString('hex'));
+		if (
+			ctx.actions.some(
+				(action) =>
+					action.type === ChannelActionType.AUTHORIZE_FUNDING_BROADCAST
+			)
+		) {
+			return;
+		}
+		this._notifyAuxiliaryFundingSigned(ctx.peerPubkey, channel);
+	}
+
+	/**
 	 * Tell the host that an asset opening is past its point of no return
 	 * (onFundingSigned): the peer's funding_signed is verified and the row
 	 * that holds it has committed. A throw is reported, never propagated:
 	 * the opening is irrevocable whatever the host does with the news.
+	 *
+	 * The host is told until it has taken the news. Once the callback
+	 * returns, the channel's asset state is marked and written, and nothing
+	 * more is delivered. Without the mark (the callback threw, the process
+	 * died before or in it, or the row could not be written at the time) it
+	 * is called again: when the channel is restored, and after the next
+	 * write of the channel that commits. The callback is idempotent by
+	 * contract. Never called inside a storage transaction.
 	 */
 	private _notifyAuxiliaryFundingSigned(
 		peerPubkey: string,
-		channel: Channel
+		channel: Channel,
+		options: { persist?: boolean } = {}
 	): void {
 		const callback = this.config.auxiliaryChannels?.onFundingSigned;
 		const state = channel.getFullState();
+		const auxiliary = state.auxiliaryState;
 		if (
 			!callback ||
-			!state.auxiliaryState ||
+			!auxiliary ||
 			!state.channelId ||
 			!state.fundingTxid ||
 			state.fundingOutputIndex === undefined
 		) {
 			return;
 		}
+		const hex = state.channelId.toString('hex');
+		if (
+			auxiliary.fundingSignedDelivered === true ||
+			!this.auxiliaryOpensCommitted.has(hex) ||
+			this._auxiliaryFundingSignedInFlight.has(hex)
+		) {
+			return;
+		}
+		this._auxiliaryFundingSignedInFlight.add(hex);
 		try {
 			callback({
 				channelId: Buffer.from(state.channelId),
@@ -1767,9 +1834,31 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			this.emitContained(
 				'error',
 				state.channelId,
-				`Asset funding callback failed (channel ${state.channelId.toString(
-					'hex'
-				)}): ${error instanceof Error ? error.message : String(error)}`
+				`Asset funding callback failed (channel ${hex}): ${
+					error instanceof Error ? error.message : String(error)
+				}`
+			);
+			return;
+		} finally {
+			this._auxiliaryFundingSignedInFlight.delete(hex);
+		}
+		auxiliary.fundingSignedDelivered = true;
+		if (options.persist === false) return;
+		// Written now, so that a restart does not tell the host again. A
+		// write that does not commit leaves the mark to the next one.
+		try {
+			this.persistence.persist({
+				channel,
+				peerPubkey,
+				channelId: state.channelId
+			});
+		} catch (error) {
+			this.emitContained(
+				'error',
+				state.channelId,
+				`Asset funding marker was not written (channel ${hex}): ${
+					error instanceof Error ? error.message : String(error)
+				}`
 			);
 		}
 	}
@@ -1785,10 +1874,13 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 	 * id when funding_created had been sent, for the caller to drop what it
 	 * kept for it.
 	 *
-	 * Throws an AuxiliaryOpenError once funding_signed is verified
-	 * (ASSET_OPEN_IRREVOCABLE: the funding may already be on its way to the
-	 * chain), and for an id that is not an asset opening of this node
-	 * (ASSET_OPEN_UNKNOWN).
+	 * Throws an AuxiliaryOpenError once the row that holds the peer's
+	 * funding_signed has committed (ASSET_OPEN_IRREVOCABLE: the funding may
+	 * already be on its way to the chain), and for an id that is not an
+	 * asset opening of this node (ASSET_OPEN_UNKNOWN). The committed row
+	 * decides, not memory: a funding_signed that was verified and could not
+	 * be written authorized nothing, the host was not told of it, and the
+	 * opening can still be given up.
 	 */
 	abandonAuxiliaryOpen(id: Buffer, reason: string): Buffer | undefined {
 		const named = (channel: Channel): boolean =>
@@ -1817,7 +1909,12 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			ChannelState.SENT_ACCEPT,
 			ChannelState.SENT_FUNDING_CREATED
 		]);
-		if (!abandonable.has(channel.getState())) {
+		const committedHex = channel.getChannelId()?.toString('hex');
+		if (
+			!abandonable.has(channel.getState()) &&
+			committedHex !== undefined &&
+			this.auxiliaryOpensCommitted.has(committedHex)
+		) {
 			throw new AuxiliaryOpenError(
 				'ASSET_OPEN_IRREVOCABLE',
 				id,
@@ -1843,6 +1940,9 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			this.channelPeers.get(temporaryChannelId.toString('hex'));
 		channel.failOpenOnDisconnect();
 		this.auxiliaryFundingGates.delete(temporaryChannelId.toString('hex'));
+		// A write of it that was refused leaves nothing owed.
+		this.persistFailed.delete(channelId.toString('hex'));
+		this.sendsWithheldOnConnection.delete(channelId.toString('hex'));
 		if (peerPubkey) this.removeCurrentChannelLifecycle(peerPubkey, channel);
 		try {
 			const wire = peerPubkey && wireErrorPayloadFor(channelId, reason);
@@ -3249,6 +3349,16 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			this.channels.set(channelId.toString('hex'), channel);
 			this.channelPeers.set(channelId.toString('hex'), peerPubkey);
 			this._notifyAuxiliaryResolutions(channel);
+			// A row exists only from funding_signed on: an asset opening that
+			// is restored is irrevocable, and a host that was never told, or
+			// whose callback threw, is told now. The mark rides the next
+			// write of the row.
+			if (this._isAuxiliaryOpenPastFundingSigned(channel)) {
+				this.auxiliaryOpensCommitted.add(channelId.toString('hex'));
+				this._notifyAuxiliaryFundingSigned(peerPubkey, channel, {
+					persist: false
+				});
+			}
 			// After registering: the listener looks the channel up.
 			this._handOffRevokedCommitments(
 				channelId,
@@ -11563,7 +11673,10 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		}
 		// Only now is an outcome recorded by this batch on disk, and only
 		// then is the host told of it.
-		if (result?.committed === true) this._notifyAuxiliaryResolutions(channel);
+		if (result?.committed === true) {
+			this._notifyAuxiliaryResolutions(channel);
+			this._auxiliaryOpenRowCommitted(ctx);
+		}
 		return true;
 	}
 

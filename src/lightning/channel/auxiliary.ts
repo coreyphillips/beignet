@@ -133,6 +133,12 @@ export interface IChannelAuxiliaryState {
 	closeTransactions?: Map<string, Buffer>;
 	/** Exact authenticated closing_signed accepted before the signed close was saved. */
 	acceptedClosingSigned?: Buffer;
+	/**
+	 * The opener's host has been told that the peer signed the first
+	 * commitment: onFundingSigned returned without throwing. Absent until
+	 * then, so the news is delivered again after a restart or a throw.
+	 */
+	fundingSignedDelivered?: true;
 	/** Signed views retained for force-close and revoked-commitment recovery. */
 	localCommitments: Map<bigint, IAuxiliaryCommitmentData>;
 	remoteCommitments: Map<bigint, IAuxiliaryCommitmentData>;

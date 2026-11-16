@@ -11,6 +11,9 @@
 
 import { expect } from 'chai';
 import crypto from 'crypto';
+import fs from 'fs';
+import os from 'os';
+import path from 'path';
 import * as bitcoin from 'bitcoinjs-lib';
 import type {
 	IAuxiliaryFundingDescriptor,
@@ -339,6 +342,191 @@ describe('the point of no return of an asset opening (issue #2093, step 7)', fun
 			expect(alice.node.listChannels()).to.deep.equal([]);
 		});
 	}
+
+	it('a host whose callback threw is told again when the channel is restored, and no more once a call has returned and the row says so', async () => {
+		const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'aux-fs-'));
+		try {
+			const file = path.join(directory, 'alice.sqlite');
+			const calls: string[][] = [[], [], []];
+			const start = (run: number, fail: boolean): IAssetHost =>
+				assetHost(
+					'aux-fs-again',
+					1,
+					{
+						onFundingSigned: (context) => {
+							calls[run].push(context.channelId.toString('hex'));
+							if (fail) throw new Error('host store is down');
+						}
+					},
+					{ sqlitePath: file }
+				);
+			const stop = (host: IAssetHost): void => {
+				host.node.destroy();
+				host.storage!.close();
+			};
+			const first = start(0, true);
+			const bob = assetHost('aux-fs-again', 2, {}, { sqlite: true });
+			hosts.push(bob);
+			connectHosts(first, bob);
+			const { channel, descriptor } = await accepted(first, bob, 'again');
+			const channelId = fund(
+				first,
+				bob,
+				descriptor,
+				fundingTx(channel, 'again', false),
+				[P2WPKH]
+			);
+			const hex = channelId.toString('hex');
+			await settle();
+			// The peer signed, the row is written, the host was called and
+			// threw: irrevocable, and not marked as told.
+			expect(calls[0]).to.deep.equal([hex]);
+			expect(first.storage!.loadChannel(hex)).to.not.equal(null);
+			expect(first.errors.join('\n')).to.include(
+				`Asset funding callback failed (channel ${hex}): host store is down`
+			);
+			expect(
+				refusal(() => first.node.abandonAuxiliaryOpen(channelId)).code
+			).to.equal('ASSET_OPEN_IRREVOCABLE');
+			expect(
+				channel.getFullState().auxiliaryState!.fundingSignedDelivered
+			).to.equal(undefined);
+			stop(first);
+
+			// Restored from its row: told again, and this call returns.
+			const second = start(1, false);
+			await settle();
+			expect(calls[1]).to.deep.equal([hex]);
+			expect(
+				refusal(() => second.node.abandonAuxiliaryOpen(channelId)).code
+			).to.equal('ASSET_OPEN_IRREVOCABLE');
+			// The mark rides the next write of the row.
+			second.node.handleFundingConfirmed(channelId);
+			await settle();
+			expect(calls[1]).to.deep.equal([hex]);
+			stop(second);
+
+			const third = start(2, false);
+			hosts.push(third);
+			await settle();
+			expect(calls[2]).to.deep.equal([]);
+			expect(
+				third.node.getChannelManager().getChannel(channelId)!.getFullState()
+					.auxiliaryState!.fundingSignedDelivered
+			).to.equal(true);
+		} finally {
+			for (const host of hosts.splice(0)) {
+				host.node.destroy();
+				host.storage?.close();
+			}
+			fs.rmSync(directory, { recursive: true, force: true });
+		}
+	});
+
+	describe('a funding_signed whose row could not be written', () => {
+		/** Alice's storage refuses the write that funding_signed asks for. */
+		async function unwritten(tag: string): Promise<{
+			alice: IAssetHost;
+			bob: IAssetHost;
+			told: ITold[];
+			sent: number[];
+			channelId: Buffer;
+			refused: () => number;
+		}> {
+			const { alice, bob, told, sent } = pair(tag);
+			const { channel, descriptor } = await accepted(alice, bob, tag);
+			const persistence = (
+				alice.node.getChannelManager() as unknown as {
+					persistence: { persist: (...args: unknown[]) => unknown };
+				}
+			).persistence;
+			const persist = persistence.persist.bind(persistence);
+			const failing = { on: false, refused: 0 };
+			persistence.persist = (...args: unknown[]): unknown => {
+				if (failing.on) {
+					failing.refused++;
+					return { committed: false, outboxIds: [] };
+				}
+				return persist(...args);
+			};
+			const deliver = alice.node.handlePeerMessage.bind(alice.node);
+			alice.node.handlePeerMessage = ((
+				peer: string,
+				type: number,
+				payload: Buffer
+			) => {
+				if (type === MessageType.FUNDING_SIGNED) failing.on = true;
+				try {
+					return deliver(peer, type, payload);
+				} finally {
+					if (type === MessageType.FUNDING_SIGNED) failing.on = false;
+				}
+			}) as typeof alice.node.handlePeerMessage;
+			const channelId = fund(
+				alice,
+				bob,
+				descriptor,
+				fundingTx(channel, tag, false),
+				[P2WPKH]
+			);
+			await settle();
+			// Verified in memory, refused by the disk: no row, nothing told.
+			expect(failing.refused).to.be.at.least(1);
+			expect(channel.getState()).to.not.equal(
+				ChannelState.SENT_FUNDING_CREATED
+			);
+			expect(alice.storage!.loadChannel(channelId.toString('hex'))).to.equal(
+				null
+			);
+			expect(told).to.deep.equal([]);
+			return {
+				alice,
+				bob,
+				told,
+				sent,
+				channelId,
+				refused: () => failing.refused
+			};
+		}
+
+		it('can still be abandoned: the row decides, not memory', async () => {
+			const { alice, told, sent, channelId } = await unwritten('aux-fs-norow');
+			const before = sent.length;
+			alice.node.abandonAuxiliaryOpen(channelId, 'the host cancelled');
+			await settle();
+			expect(sent.slice(before)).to.deep.equal([MessageType.ERROR]);
+			expect(alice.node.getChannelManager().getChannel(channelId)).to.equal(
+				undefined
+			);
+			expect(alice.storage!.loadAllChannels()).to.deep.equal([]);
+			expect(told).to.deep.equal([]);
+			expect(alice.broadcasts).to.deep.equal([]);
+			expect(
+				refusal(() => alice.node.abandonAuxiliaryOpen(channelId)).code
+			).to.equal('ASSET_OPEN_UNKNOWN');
+		});
+
+		it('tells the host once, after the next write of the channel that commits, and is irrevocable from then on', async () => {
+			const { alice, told, channelId } = await unwritten('aux-fs-later');
+			alice.node.handleFundingConfirmed(channelId);
+			await settle();
+			expect(
+				alice.storage!.loadChannel(channelId.toString('hex'))
+			).to.not.equal(null);
+			expect(told).to.have.length(1);
+			expect(told[0].inTransaction).to.equal(false);
+			expect(told[0].context.channelId.equals(channelId)).to.equal(true);
+			expect(
+				refusal(() => alice.node.abandonAuxiliaryOpen(channelId)).code
+			).to.equal('ASSET_OPEN_IRREVOCABLE');
+			// Told once: further writes deliver nothing more.
+			alice.node
+				.getChannelManager()
+				.handlePeerDisconnected(told[0].context.peerPubkey);
+			await settle();
+			expect(told).to.have.length(1);
+		});
+	});
 
 	it('an id that is not an asset opening of this node is refused by name', async () => {
 		const { alice, bob } = pair('aux-abandon-unknown');
