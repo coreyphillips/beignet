@@ -10,6 +10,7 @@
  * `INodeConfig.auxiliaryChannels` runs none of it.
  */
 
+import { CodedError } from '../../utils/errors';
 import { Feature, FeatureFlags } from '../features/flags';
 import { isOverlayChannel } from './types';
 import type * as bitcoin from 'bitcoinjs-lib';
@@ -422,4 +423,44 @@ export function validateAuxiliaryChannelType(
 		return 'Asset channel funding context or provider is unavailable';
 	}
 	return null;
+}
+
+/**
+ * The asset provider, or the commitment builder on its behalf, could not
+ * answer for a commitment of an asset channel. Whatever asked is refused
+ * with this, before anything it would have sent or stored.
+ */
+export class AuxiliaryProviderError extends CodedError<'ASSET_PROVIDER_REFUSED'> {
+	/** The channel id, or the temporary id of a channel that has none yet, hex. */
+	readonly channelId: string;
+	/** What was being done, in a few words. */
+	readonly operation: string;
+
+	constructor(channelId: string, operation: string, cause: unknown) {
+		super(
+			'ASSET_PROVIDER_REFUSED',
+			`The asset provider refused ${operation} (channel ${channelId}): ${
+				cause instanceof Error ? cause.message : String(cause)
+			}`,
+			{ cause }
+		);
+		this.name = 'AuxiliaryProviderError';
+		this.channelId = channelId;
+		this.operation = operation;
+	}
+}
+
+/** The typed refusal of `operation` on the channel `state` describes. */
+export function auxiliaryProviderError(
+	state: Pick<IChannelState, 'channelId' | 'temporaryChannelId'>,
+	operation: string,
+	cause: unknown
+): AuxiliaryProviderError {
+	return cause instanceof AuxiliaryProviderError
+		? cause
+		: new AuxiliaryProviderError(
+				(state.channelId ?? state.temporaryChannelId).toString('hex'),
+				operation,
+				cause
+		  );
 }

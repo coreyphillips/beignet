@@ -130,6 +130,7 @@ import type {
 } from './auxiliary';
 import {
 	MAX_AUXILIARY_HTLCS_PER_PARTY,
+	auxiliaryProviderError,
 	copyAuxiliaryCommitment,
 	requireAuxiliaryProvider,
 	validateAuxiliaryChannelType
@@ -138,6 +139,8 @@ import { auxiliaryCsvPolicyError } from './auxiliary-csv';
 import { auxiliaryCarrierError } from './auxiliary-funding';
 import type { AuxiliaryUnsupportedOperation } from './auxiliary-guard';
 import { auxiliaryUnsupported } from './auxiliary-guard';
+import type { IAuxiliaryRoundUpdate } from './auxiliary-preflight';
+import { auxiliaryRoundRefusal } from './auxiliary-preflight';
 import {
 	acceptChildRevocationRecord,
 	addChildRevocationRecord
@@ -2194,6 +2197,17 @@ export class Channel {
 			for (const number of [...views.keys()]) {
 				if (number < commitmentNumber - 1n) views.delete(number);
 			}
+			// The peer's child custody points are kept for the commitments
+			// whose views are kept, and go with the views that went.
+			const points = this._state.auxiliaryState.childRevocationBasepoints;
+			if (points) {
+				const held = new Set(
+					[...views.values()].map((kept) => kept.secondLevelCommitmentTxid)
+				);
+				for (const txid of [...points.keys()]) {
+					if (!held.has(txid)) points.delete(txid);
+				}
+			}
 		}
 		this._state.remoteCommitmentSignature = theirPartial;
 		this._state.remoteSigningNonce = theirSigningNonce;
@@ -3931,7 +3945,7 @@ export class Channel {
 		}
 		const refusal = this.validateOutgoingHtlc(amountMsat, cltvExpiry);
 		if (refusal.length > 0) return refusal;
-		const htlcId = this._state.localHtlcCounter++;
+		const htlcId = this._state.localHtlcCounter;
 
 		const entry: IHtlcEntry = {
 			id: htlcId,
@@ -3950,6 +3964,15 @@ export class Channel {
 			...(blindingPoint ? { blindingPoint } : {})
 		};
 
+		// Asset channels: the provider is asked about the commitment this add
+		// leads to before the add exists anywhere.
+		const assetRefusal = this._auxiliaryRoundRefusal('an HTLC', {
+			localBalanceMsat: this._state.localBalanceMsat - amountMsat,
+			htlc: { key: `offered-${htlcId}`, entry }
+		});
+		if (assetRefusal) return assetRefusal;
+
+		this._state.localHtlcCounter++;
 		this._state.htlcs.set(`offered-${htlcId}`, entry);
 
 		// Deduct from local balance provisionally
@@ -4545,6 +4568,21 @@ export class Channel {
 			return repeat;
 		}
 
+		const assetRefusal = this._auxiliaryRoundRefusal(
+			'the settlement of an HTLC',
+			{
+				htlc: {
+					key,
+					entry: {
+						...entry,
+						state: HtlcState.FULFILLED,
+						removalRemoteCommitted: false
+					}
+				}
+			}
+		);
+		if (assetRefusal) return assetRefusal;
+
 		entry.state = HtlcState.FULFILLED;
 		// Two-phase: the peer's signatures still include this HTLC until it
 		// revokes for our removal — buildLocalCommitment keeps it present.
@@ -4811,6 +4849,18 @@ export class Channel {
 			return repeat;
 		}
 
+		const assetRefusal = this._auxiliaryRoundRefusal('the failure of an HTLC', {
+			htlc: {
+				key,
+				entry: {
+					...entry,
+					state: HtlcState.FAILED,
+					removalRemoteCommitted: false
+				}
+			}
+		});
+		if (assetRefusal) return assetRefusal;
+
 		entry.state = HtlcState.FAILED;
 		// Two-phase: the peer's signatures still include this HTLC until it
 		// revokes for our removal — buildLocalCommitment keeps it present.
@@ -4912,6 +4962,18 @@ export class Channel {
 		if (repeat) {
 			return repeat;
 		}
+
+		const assetRefusal = this._auxiliaryRoundRefusal('the failure of an HTLC', {
+			htlc: {
+				key,
+				entry: {
+					...entry,
+					state: HtlcState.FAILED,
+					removalRemoteCommitted: false
+				}
+			}
+		});
+		if (assetRefusal) return assetRefusal;
 
 		entry.state = HtlcState.FAILED;
 		// Two-phase removal, exactly as failHtlc.
@@ -5213,6 +5275,31 @@ export class Channel {
 	}
 
 	/**
+	 * Asset channels: the refusal of an update whose commitment the provider
+	 * cannot answer for, as the actions of a refusal, or null. Asked of a
+	 * copy of the state, so a refusal leaves nothing behind; any other
+	 * channel is not looked at. See auxiliary-preflight.
+	 */
+	private _auxiliaryRoundRefusal(
+		operation: string,
+		update: IAuxiliaryRoundUpdate
+	): ChannelAction[] | null {
+		if (!this._state.auxiliaryState) return null;
+		// The answers are kept on the live state, which the copy shares, so
+		// the signature that follows finds what was answered here.
+		this._state.auxiliaryAnswers ??= new Map();
+		const refusal = auxiliaryRoundRefusal(this._state, operation, update);
+		if (!refusal) return null;
+		return [
+			{
+				type: ChannelActionType.ERROR,
+				message: refusal.message,
+				code: ChannelErrorCode.ASSET_PROVIDER_REFUSED
+			}
+		];
+	}
+
+	/**
 	 * Asset channels: have the provider sign the asset side of the peer's
 	 * next commitment. Returns the custom records for commitment_signed and
 	 * the asset view they sign, or the reason the round cannot be signed.
@@ -5270,7 +5357,7 @@ export class Channel {
 			};
 		} catch (err) {
 			return {
-				error: `Cannot sign asset commitment: ${(err as Error).message}`
+				error: auxiliaryProviderError(this._state, 'a commitment', err).message
 			};
 		}
 	}
@@ -5481,10 +5568,20 @@ export class Channel {
 			} else {
 				delete this._state.lastSentAuxiliaryRecords;
 			}
-			this._state.auxiliaryState!.remoteCommitments.set(
+			// The row holds the asset side of the peer's current commitment and
+			// of the one this signature puts in flight. The one before is
+			// revoked by now, or this signature would not be made; what a
+			// penalty needs of a revoked commitment is not kept in the row.
+			const remoteViews = this._state.auxiliaryState!.remoteCommitments;
+			remoteViews.set(
 				this._state.remoteCommitmentNumber + 1n,
 				copyAuxiliaryCommitment(auxiliarySigned.view)
 			);
+			for (const number of [...remoteViews.keys()]) {
+				if (number < this._state.remoteCommitmentNumber) {
+					remoteViews.delete(number);
+				}
+			}
 		}
 
 		// Cache for retransmission on reestablish. For taproot we cache the
@@ -6627,6 +6724,11 @@ export class Channel {
 					code: ChannelErrorCode.INSUFFICIENT_BALANCE
 				}
 			];
+
+		const assetRefusal = this._auxiliaryRoundRefusal('a fee update', {
+			pendingFeeratePerKw: feeratePerKw
+		});
+		if (assetRefusal) return assetRefusal;
 
 		// Stage the new feerate as pending — do NOT apply it to the committed
 		// config yet. It is used for the commitment built in this round and only

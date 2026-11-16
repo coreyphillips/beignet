@@ -559,6 +559,9 @@ describe('commitments with auxiliary leaves', function () {
 				data.secondLevelLeaves.set('RECEIVED:0', leafFor('another child'));
 				return data;
 			};
+			// A provider is asked once about a commitment, so this is a peer
+			// that answers so from the start.
+			delete bobState.auxiliaryAnswers;
 			expect(
 				verifyRemoteHtlcSignaturesTaproot(bobState, point, signatures, number)
 			).to.equal(false);
@@ -683,13 +686,14 @@ describe('commitments with auxiliary leaves', function () {
 					.auxiliaryState!.remoteCommitments.get(1n)!.outputLeaves
 			);
 
-			// A second round keeps the view of the commitment before it and
-			// drops nothing it could still need.
+			// Later rounds keep, on each side, the views of the two commitments
+			// that can still be broadcast: the current one and the one before
+			// it until that is revoked.
 			expect(pair.alice.updateChannelFee(pair.id, 800).ok).to.equal(true);
 			expect(pair.alice.updateChannelFee(pair.id, 900).ok).to.equal(true);
 			const bob = pair.bobChannel.getFullState().auxiliaryState!;
 			expect([...bob.localCommitments.keys()]).to.deep.equal([2n, 3n]);
-			expect([...bob.remoteCommitments.keys()]).to.deep.equal([1n, 2n, 3n]);
+			expect([...bob.remoteCommitments.keys()]).to.deep.equal([2n, 3n]);
 		});
 
 		it('fails the channel on an invalid asset signature before revoking', () => {

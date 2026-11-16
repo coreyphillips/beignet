@@ -11,6 +11,7 @@ import type { IChannelBasepoints } from '../keys/derivation';
 import type { IFforEpochRecord } from '../ffor/types';
 import type { IChannelConfig, IHtlcEntry, IHtlcSnapshotEntry } from './types';
 import type {
+	IAuxiliaryCommitmentData,
 	IChannelAuxiliaryProvider,
 	IChannelAuxiliaryState
 } from './auxiliary';
@@ -308,6 +309,17 @@ export interface IChannelState {
 	auxiliaryState?: IChannelAuxiliaryState;
 	/** Runtime only, never stored: the provider, reattached on every restore. */
 	auxiliaryProvider?: IChannelAuxiliaryProvider;
+	/**
+	 * Runtime only, never stored: the provider's last answer for a commitment
+	 * of each side, with a digest of everything it was asked. The same
+	 * commitment asked about again gets the same answer without a second
+	 * call, so the view a signature was made or verified against is the view
+	 * that is stored. See applyAuxiliaryCommitment.
+	 */
+	auxiliaryAnswers?: Map<
+		'local' | 'remote',
+		{ asked: string; answer: IAuxiliaryCommitmentData }
+	>;
 	/**
 	 * Asset channels only: the custom records of the last commitment_signed
 	 * sent, so a retransmission carries the same asset signatures.

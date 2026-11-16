@@ -6,6 +6,7 @@
  * Channel state machine to the actual transport layer.
  */
 
+import { auxiliaryProviderError } from './auxiliary';
 import { auxiliaryUnsupported } from './auxiliary-guard';
 import { auxiliaryChannelOpens } from './auxiliary-switch';
 import { TypedEmitter } from '../../utils/typed-emitter';
@@ -2239,7 +2240,38 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		const nextCommitNum = state.remoteCommitmentNumber + 1n;
 
 		let actions: ChannelAction[];
-		if (isTaprootChannel(state.channelType)) {
+		if (state.auxiliaryState) {
+			// Asset channels: the commitment is built with the provider's
+			// answer. If that cannot be had, nothing of this round is signed,
+			// sent or stored, and the caller is told so by name; the updates
+			// stay owed a commitment and the next trigger tries again.
+			let partial: Buffer;
+			let htlcSigs: Buffer[];
+			try {
+				partial = this.signCommitmentPartial(
+					state,
+					signer,
+					perCommitPoint,
+					nextCommitNum
+				);
+				htlcSigs = signRemoteHtlcSignaturesTaproot(
+					state,
+					signer,
+					perCommitPoint,
+					nextCommitNum
+				);
+			} catch (err) {
+				const error = auxiliaryProviderError(state, 'a commitment', err);
+				this.emitContained('error', channelId, error.message);
+				return {
+					ok: false,
+					actions: [],
+					error: error.message,
+					code: ChannelErrorCode.ASSET_PROVIDER_REFUSED
+				};
+			}
+			actions = channel.signCommitment(Buffer.alloc(64), htlcSigs, partial);
+		} else if (isTaprootChannel(state.channelType)) {
 			// option_taproot: co-sign the peer's next commitment with a MuSig2 partial
 			// (fresh single-use signing nonce + peer's verification nonce), plus a
 			// BIP340 Schnorr signature per HTLC second-level tx.
@@ -2290,6 +2322,15 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			}
 		}
 		this.processActions(peerPubkey, channel, actions);
+		if (state.auxiliaryState) {
+			// A refused signature is an answer, not a success.
+			const refused = actions.find(
+				(a): a is IErrorAction => a.type === ChannelActionType.ERROR
+			);
+			if (refused) {
+				return { ok: false, actions, ...refusalFields(refused) };
+			}
+		}
 		return { ok: true, actions };
 	}
 
@@ -2425,7 +2466,10 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		// peer — producing "invalid commitment signature" on the next HTLC.
 		// autoSignAndSendCommitment is a no-op unless we owe a commitment.
 		if (channel.getChannelId()) {
-			this.autoSignAndSendCommitment(channel.getChannelId()!);
+			const signed = this.autoSignAndSendCommitment(channel.getChannelId()!);
+			if (!signed.ok && channel.getFullState().auxiliaryState) {
+				return { ...signed, actions };
+			}
 		}
 		return { ok: true, actions };
 	}

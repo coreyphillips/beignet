@@ -975,6 +975,10 @@ class channel.AuxiliaryChannelUnsupportedError extends beignet#CodedError<'ASSET
 constructor channel.AuxiliaryChannelUnsupportedError(channelId: string, operation: channel.AuxiliaryUnsupportedOperation)
 readonly property channel.AuxiliaryChannelUnsupportedError.channelId: string
 readonly property channel.AuxiliaryChannelUnsupportedError.operation: channel.AuxiliaryUnsupportedOperation
+class channel.AuxiliaryProviderError extends beignet#CodedError<'ASSET_PROVIDER_REFUSED'>
+constructor channel.AuxiliaryProviderError(channelId: string, operation: string, cause: unknown)
+readonly property channel.AuxiliaryProviderError.channelId: string
+readonly property channel.AuxiliaryProviderError.operation: string
 type channel.AuxiliarySpendKind = 'to_local_delayed' | 'to_local_revocation' | 'to_remote' | 'htlc_timeout' | 'htlc_success' | 'htlc_second_level_timeout' | 'htlc_second_level_success' | 'htlc_revocation' | 'second_level_delayed' | 'second_level_revocation'
 type channel.AuxiliaryUnsupportedOperation = 'a cooperative close' | 'a force close' | 'on-chain resolution' | 'a splice' | 'quiescence' | 'a delegated settlement epoch'
 const channel.BITCOIN_CHAIN_HASH: Buffer
@@ -1283,6 +1287,7 @@ member channel.ChannelActionType.WATCH_OUTPUT = "WATCH_OUTPUT"
 member channel.ChannelActionType.WATCH_PRESPLICE_SPEND = "WATCH_PRESPLICE_SPEND"
 type channel.ChannelCloseReason = 'user' | 'REESTABLISH_TIMEOUT_FORCE_CLOSED' | 'ERRORED_TIMEOUT_FORCE_CLOSED' | 'STUCK_CHANNEL_FORCE_CLOSED' | 'CHANNEL_FAILED_FORCE_CLOSED' | 'HTLC_CLAIM_FORCE_CLOSE' | 'FORWARD_TIMEOUT_FORCE_CLOSE' | 'HTLC_EXPIRY_FORCE_CLOSE'
 enum channel.ChannelErrorCode
+member channel.ChannelErrorCode.ASSET_PROVIDER_REFUSED = "ASSET_PROVIDER_REFUSED"
 member channel.ChannelErrorCode.BUSY = "BUSY"
 member channel.ChannelErrorCode.FFOR_REFUSED = "FFOR_REFUSED"
 member channel.ChannelErrorCode.HELD = "HELD"
@@ -1875,6 +1880,7 @@ interface channel.IChannelState
 property channel.IChannelState.announceChannel: boolean
 property channel.IChannelState.announcementSigsReceived: boolean
 property channel.IChannelState.announcementSigsSent: boolean
+property channel.IChannelState.auxiliaryAnswers?: Map<'local' | 'remote', { asked: string; answer: channel.IAuxiliaryCommitmentData; }>
 property channel.IChannelState.auxiliaryProvider?: channel.IChannelAuxiliaryProvider
 property channel.IChannelState.auxiliaryState?: channel.IChannelAuxiliaryState
 property channel.IChannelState.awaitingClosingSig?: boolean
@@ -2423,6 +2429,7 @@ function channel.applyAuxiliaryFunding(state: channel.IChannelState, descriptor:
 function channel.assetHtlcSighashType(channelType: Buffer | null | undefined): 0x81 | 0x83
 function channel.auxiliaryCarrierError(opening: channel.IAuxiliaryCarrier): string | undefined
 function channel.auxiliaryDustLimit(configured: bigint): bigint
+function channel.auxiliaryProviderError(state: Pick<channel.IChannelState, 'channelId' | 'temporaryChannelId'>, operation: string, cause: unknown): channel.AuxiliaryProviderError
 function channel.auxiliaryUnsupported(state: channel.IChannelState, operation: channel.AuxiliaryUnsupportedOperation): channel.AuxiliaryChannelUnsupportedError | undefined
 function channel.buildLocalCommitment(state: channel.IChannelState, perCommitmentPoint: Buffer, commitmentNumber?: bigint, signedLocal?: boolean): channel.IBuiltCommitment
 function channel.buildRemoteCommitment(state: channel.IChannelState, remotePerCommitmentPoint: Buffer, commitmentNumber?: bigint): channel.IBuiltCommitment

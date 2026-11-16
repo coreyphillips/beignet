@@ -10,6 +10,8 @@
  * line with its transaction untouched.
  */
 
+import { sha256 } from '../crypto/provider';
+import { serializeAuxiliaryState } from '../storage/auxiliary-serialization';
 import { resolveChildRevocationKey } from './child-revocation';
 import type { ICommitmentTxResult } from '../script/commitment';
 import {
@@ -33,6 +35,95 @@ import {
 	isOverlayChannel,
 	isRevokedChildCustodyChannel
 } from './types';
+
+/**
+ * A digest of everything the provider is asked about one commitment: the
+ * side, the number and point, the Bitcoin transaction before any leaf (which
+ * holds every output, key and amount), the asset balances, what each HTLC
+ * carries, and the channel's own asset data.
+ */
+function auxiliaryQuestion(
+	state: IChannelState,
+	side: 'local' | 'remote',
+	commitmentNumber: bigint,
+	perCommitmentPoint: Buffer,
+	baseTransaction: ICommitmentTxResult['tx'],
+	localAssetBalance: bigint,
+	remoteAssetBalance: bigint,
+	signedLocal: boolean,
+	htlcs: IHtlcOutputWithMeta[]
+): string {
+	const parts: string[] = [
+		side,
+		commitmentNumber.toString(),
+		perCommitmentPoint.toString('hex'),
+		baseTransaction.toBuffer().toString('hex'),
+		localAssetBalance.toString(),
+		remoteAssetBalance.toString(),
+		signedLocal ? 'signed' : 'unsigned',
+		state.auxiliaryState?.channelData.toString('hex') ?? ''
+	];
+	for (const htlc of htlcs) {
+		parts.push(
+			[
+				htlc.direction,
+				htlc.htlcId.toString(),
+				htlc.amountMsat.toString(),
+				htlc.paymentHash.toString('hex'),
+				htlc.cltvExpiry,
+				htlc.auxiliaryAmount?.toString() ?? '',
+				...[...(htlc.customRecords ?? new Map<bigint, Buffer>())]
+					.sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+					.map(([type, value]) => `${type}=${value.toString('hex')}`)
+			].join(':')
+		);
+	}
+	return sha256(Buffer.from(parts.join('|'))).toString('hex');
+}
+
+/**
+ * Check what the provider answered where it comes in, before anything is
+ * signed or sent on it, by the rules the stored form is read back with: the
+ * answer is put through the writer, which runs the reader over its result.
+ * An answer that could not be read back from the channel row is refused
+ * here and never reaches it. A second-level leaf also has to belong to an
+ * HTLC output of this commitment.
+ */
+function validateAuxiliaryAnswer(
+	answer: IAuxiliaryCommitmentData,
+	commitmentNumber: bigint,
+	htlcOutputIndexes: Map<string, number>
+): void {
+	if (
+		!answer ||
+		typeof answer !== 'object' ||
+		!Buffer.isBuffer(answer.customData) ||
+		!(answer.outputLeaves instanceof Map) ||
+		!(answer.secondLevelLeaves instanceof Map)
+	) {
+		throw new Error('Malformed asset commitment from the provider');
+	}
+	try {
+		serializeAuxiliaryState({
+			channelData: Buffer.from([0]),
+			localBalance: 0n,
+			remoteBalance: 0n,
+			localCommitments: new Map([[commitmentNumber, answer]]),
+			remoteCommitments: new Map()
+		});
+	} catch (err) {
+		throw new Error(
+			`Malformed asset commitment from the provider: ${(err as Error).message}`
+		);
+	}
+	for (const key of answer.secondLevelLeaves.keys()) {
+		if (!htlcOutputIndexes.has(key)) {
+			throw new Error(
+				'Asset commitment from the provider has a second-level leaf for no HTLC output of the commitment'
+			);
+		}
+	}
+}
 
 /**
  * Commit the asset side of a commitment into `result.tx` and return it, or
@@ -176,29 +267,51 @@ export function applyAuxiliaryCommitment(
 				'Persisted asset commitment does not match the rebuilt transaction'
 			);
 	}
-	const prepared = copyAuxiliaryCommitment(
-		previous ??
-			provider.buildCommitment({
-				resolveSecondLevelRevocationKey: (transaction) =>
-					resolveChildRevocationKey(
-						state,
-						side,
-						perCommitmentPoint,
-						transaction
-					)?.publicKey,
+	// The provider is asked once about a commitment. Its answer is kept, in
+	// memory only, with a digest of everything it was asked, and the same
+	// commitment built again gets that answer: the view a signature is made
+	// or verified against is then the view that is stored, and a round that
+	// asked before it sent anything does not ask again when it signs.
+	const asked = previous
+		? undefined
+		: auxiliaryQuestion(
 				state,
 				side,
 				commitmentNumber,
+				perCommitmentPoint,
+				result.tx,
 				localAssetBalance,
 				remoteAssetBalance,
 				signedLocal,
-				perCommitmentPoint: Buffer.from(perCommitmentPoint),
-				keys,
-				baseTransaction: result.tx.clone(),
-				outputs,
 				htlcs
-			})
-	);
+		  );
+	const kept = asked ? state.auxiliaryAnswers?.get(side) : undefined;
+	let answer =
+		previous ?? (kept && kept.asked === asked ? kept.answer : undefined);
+	if (!answer) {
+		answer = provider.buildCommitment({
+			resolveSecondLevelRevocationKey: (transaction) =>
+				resolveChildRevocationKey(state, side, perCommitmentPoint, transaction)
+					?.publicKey,
+			state,
+			side,
+			commitmentNumber,
+			localAssetBalance,
+			remoteAssetBalance,
+			signedLocal,
+			perCommitmentPoint: Buffer.from(perCommitmentPoint),
+			keys,
+			baseTransaction: result.tx.clone(),
+			outputs,
+			htlcs
+		});
+		validateAuxiliaryAnswer(answer, commitmentNumber, htlcOutputIndexes);
+		(state.auxiliaryAnswers ??= new Map()).set(side, {
+			asked: asked!,
+			answer: copyAuxiliaryCommitment(answer)
+		});
+	}
+	const prepared = copyAuxiliaryCommitment(answer);
 	prepared.htlcOutputIndexes = htlcOutputIndexes;
 	if (
 		(holderBalance > 0n &&

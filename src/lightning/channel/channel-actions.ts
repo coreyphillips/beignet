@@ -181,7 +181,12 @@ export enum ChannelErrorCode {
 	/** The channel type or negotiated features do not support the request. */
 	UNSUPPORTED = 'UNSUPPORTED',
 	/** A v2 open the opener's wallet could not fund. */
-	OPEN_NOT_FUNDED = 'OPEN_NOT_FUNDED'
+	OPEN_NOT_FUNDED = 'OPEN_NOT_FUNDED',
+	/**
+	 * Asset channels: the asset provider could not answer for the commitment
+	 * an update would lead to, so the update was not made.
+	 */
+	ASSET_PROVIDER_REFUSED = 'ASSET_PROVIDER_REFUSED'
 }
 
 export interface IErrorAction {
