@@ -3208,7 +3208,8 @@ export function getOpenApiSpec(): Record<string, unknown> {
 					tags: ['Node'],
 					requestBody: bodyContent({
 						confirm: 'boolean',
-						unfenced: 'boolean?'
+						unfenced: 'boolean?',
+						omitAssetChannels: 'boolean?'
 					}),
 					responses: {
 						'200': {
@@ -3256,6 +3257,20 @@ export function getOpenApiSpec(): Record<string, unknown> {
 										type: 'object',
 										properties: {
 											guardians: { type: 'array', items: { type: 'object' } }
+										}
+									},
+									omittedAssetChannels: {
+										type: 'array',
+										description:
+											'With omitAssetChannels: the asset channels the capsule held, which were left out of the restore. Present only when there was one',
+										items: {
+											type: 'object',
+											required: ['channelId', 'peerPubkey', 'capacitySats'],
+											properties: {
+												channelId: { type: 'string' },
+												peerPubkey: { type: 'string' },
+												capacitySats: { type: 'integer' }
+											}
 										}
 									}
 								}

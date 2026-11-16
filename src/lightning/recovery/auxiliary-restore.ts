@@ -104,6 +104,16 @@ export class AuxiliaryGuardianRestoreError extends CodedError<'AUXILIARY_GUARDIA
 	}
 }
 
+/** An asset channel a restore holds, as a caller shows it. */
+export interface IAuxiliaryRestoreChannel {
+	/** Channel id, hex. */
+	channelId: string;
+	/** The peer's node id, hex. */
+	peerPubkey: string;
+	/** The capacity of the channel's funding output. */
+	capacitySatoshis: bigint;
+}
+
 /**
  * A restore holds asset channels and the provider did not say it can restore
  * them. Nothing of the restore was installed.
@@ -111,6 +121,11 @@ export class AuxiliaryGuardianRestoreError extends CodedError<'AUXILIARY_GUARDIA
 export class AuxiliaryRestoreRefusedError extends CodedError<'AUXILIARY_RESTORE_REFUSED'> {
 	/** The asset channels the restore holds, as channel id hex. */
 	readonly channelIds: readonly string[];
+	/**
+	 * The same channels with their peer and capacity, on the refusal of a
+	 * capsule restore (read it through refusedAuxiliaryChannels).
+	 */
+	channels?: readonly IAuxiliaryRestoreChannel[];
 	/** What the provider threw in place of an answer, when it did. */
 	readonly detail?: string;
 
@@ -224,9 +239,49 @@ export function auxiliaryRestoreRefusal(
 		: new AuxiliaryRestoreRefusedError(channelIds);
 }
 
+/** The asset channels among the rows a restore is about to install. */
+export function auxiliaryRestoreChannels(
+	channels: ReadonlyArray<{
+		channelId: string;
+		state: IChannelState;
+		peerPubkey: string;
+	}>
+): IAuxiliaryRestoreChannel[] {
+	return channels
+		.filter((row) => carriesAssetState(row.state))
+		.map((row) => ({
+			channelId: row.channelId,
+			peerPubkey: row.peerPubkey,
+			capacitySatoshis: row.state.fundingSatoshis
+		}));
+}
+
+/**
+ * The asset channels a refused capsule restore holds, with their peer and
+ * capacity: what the restore would leave out were it run again with
+ * `omitAuxiliaryChannels`. Undefined for any other error, and for a refusal
+ * that was not a capsule restore's.
+ */
+export function refusedAuxiliaryChannels(
+	err: unknown
+): readonly IAuxiliaryRestoreChannel[] | undefined {
+	if (
+		!(err instanceof AuxiliaryRestoreRefusedError) &&
+		!(err instanceof AuxiliaryProviderRequiredError)
+	) {
+		return undefined;
+	}
+	const channels = (err as { channels?: unknown }).channels;
+	return Array.isArray(channels)
+		? (channels as IAuxiliaryRestoreChannel[])
+		: undefined;
+}
+
 /**
  * Throw unless the asset channels among `channels`, the rows a restore is
  * about to install, may be restored. Returns their ids, as channel id hex.
+ * The refusal carries the channels with their peer and capacity
+ * (refusedAuxiliaryChannels).
  *
  * Called BEFORE the transaction that installs the restore opens, with the
  * rows read from the decoded frames (channelsAfterReplay): `canRestore` is
@@ -257,7 +312,11 @@ export function assertAuxiliaryRestore(
 		),
 		auxiliaryChannels
 	);
-	if (refusal) throw refusal;
+	if (refusal) {
+		throw Object.assign(refusal, {
+			channels: auxiliaryRestoreChannels(held)
+		});
+	}
 	return held.map((row) => row.channelId);
 }
 

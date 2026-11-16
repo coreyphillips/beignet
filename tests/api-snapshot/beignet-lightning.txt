@@ -6955,6 +6955,7 @@ readonly property recovery.AuxiliaryGuardianStartError.channelIds: readonly stri
 class recovery.AuxiliaryRestoreRefusedError extends beignet#CodedError<'AUXILIARY_RESTORE_REFUSED'>
 constructor recovery.AuxiliaryRestoreRefusedError(channelIds: readonly string[], detail?: string)
 readonly property recovery.AuxiliaryRestoreRefusedError.channelIds: readonly string[]
+property recovery.AuxiliaryRestoreRefusedError.channels?: readonly recovery.IAuxiliaryRestoreChannel[]
 readonly property recovery.AuxiliaryRestoreRefusedError.detail?: string
 type recovery.BarrierOutcome = { released: true; reason: 'not-required' | 'durable'; } | { released: false; reason: 'timeout' | 'fenced' | 'stopped' | 'missing-frame' | 'backfill-lost'; }
 class recovery.Bolt8GuardianSession
@@ -7176,6 +7177,10 @@ constructor recovery.GuardianTransportError(message: string, httpStatus?: number
 readonly property recovery.GuardianTransportError.httpStatus?: number
 type recovery.GuardianTransportType = 'onion-http' | 'https' | 'local-http' | 'bolt8'
 type recovery.GuardianVerbName = 'register_node' | 'put_state' | 'get_head' | 'get_state' | 'acquire_epoch' | 'sync_record' | 'sync_epoch' | 'rotate_set'
+interface recovery.IAuxiliaryRestoreChannel
+property recovery.IAuxiliaryRestoreChannel.capacitySatoshis: bigint
+property recovery.IAuxiliaryRestoreChannel.channelId: string
+property recovery.IAuxiliaryRestoreChannel.peerPubkey: string
 interface recovery.IBarrierLatency
 property recovery.IBarrierLatency.lastMs: number | null
 property recovery.IBarrierLatency.maxMs: number | null
@@ -7219,9 +7224,11 @@ property recovery.IBoundGuardianClient.client: recovery.GuardianClient
 property recovery.IBoundGuardianClient.expectedGuardianId: Buffer
 interface recovery.ICapsuleRestoreOptions
 property recovery.ICapsuleRestoreOptions.auxiliaryChannels?: channel.IAuxiliaryChannelConfig
+property recovery.ICapsuleRestoreOptions.omitAuxiliaryChannels?: boolean
 property recovery.ICapsuleRestoreOptions.scratchStorage?: () => storage.IStorageBackend
 interface recovery.ICapsuleRestoreResult
 property recovery.ICapsuleRestoreResult.framesApplied: number
+property recovery.ICapsuleRestoreResult.omittedAuxiliaryChannels?: recovery.IAuxiliaryRestoreChannel[]
 property recovery.ICapsuleRestoreResult.scb: backup.IStaticChannelBackup
 property recovery.ICapsuleRestoreResult.tier: 1 | 2
 interface recovery.IComposeCapsuleOptions
@@ -7901,6 +7908,7 @@ function recovery.assertGuardianDescriptors(value: unknown): recovery.GuardianDe
 function recovery.assertGuardianJournalHoldsNoAuxiliaryChannels(target: storage.IStorageBackend): void
 function recovery.assertMutationEncodable(mutation: recovery.RecoveryMutation): void
 function recovery.assertNoJournalResidue(target: storage.IStorageBackend): void
+function recovery.auxiliaryRestoreChannels(channels: ReadonlyArray<{ channelId: string; state: channel.IChannelState; peerPubkey: string; }>): recovery.IAuxiliaryRestoreChannel[]
 function recovery.auxiliaryRestoreRefusal(channels: readonly channel.IAuxiliaryRestoredChannel[], auxiliaryChannels: channel.IAuxiliaryChannelConfig | undefined, unreadableChannelIds?: readonly string[]): node.AuxiliaryProviderRequiredError | recovery.AuxiliaryRestoreRefusedError | undefined
 function recovery.bearerAuthenticator(token: string): (request: http#IncomingMessage) => boolean
 function recovery.bindGuardianSet(guardians: recovery.IParsedGuardian[], options: Pick<recovery.IGuardianAssemblyConfig, 'transportFor' | 'allowUnencryptedAuth'>): { setId: Buffer; context: recovery.IGuardianSetContext; bound: recovery.IBoundGuardianClient[]; }
@@ -7982,6 +7990,7 @@ function recovery.encryptRecoveryCapsule(capsule: recovery.RecoveryCapsule, node
 function recovery.entryOf(parsed: recovery.IParsedGuardian): recovery.IGuardianConfigEntry
 function recovery.frameAad(nodeId: Buffer, writerEpoch: bigint, sequence: bigint, previousFrameHash: Buffer): Buffer
 function recovery.frameVersionForContent(frame: recovery.RecoveryFrame): recovery.RecoveryFrame['version']
+function recovery.framesWithoutChannels(frames: recovery.RecoveryFrame[], channelIds: ReadonlySet<string>): recovery.RecoveryFrame[]
 function recovery.generateWriterKey(): { secret: Buffer; publicKey: Buffer; }
 function recovery.genesisLogHead(): recovery.LogHead
 function recovery.guardianBolt8VerbCode(name: string): recovery.GuardianBolt8Verb | null
@@ -8018,6 +8027,7 @@ function recovery.readU64be(buf: Buffer): bigint
 function recovery.receiptTranscriptHash(guardianSetId: Buffer, guardianId: Buffer, state: recovery.GuardianState, issuedAt: bigint): Buffer
 function recovery.reconstructFromFrames(target: storage.IStorageBackend, frames: recovery.RecoveryFrame[], options?: { maxOutboxRowsPerChannel?: number; }): void
 function recovery.recordTranscriptHash(guardianSetId: Buffer, record: recovery.RecordFields): Buffer
+function recovery.refusedAuxiliaryChannels(err: unknown): readonly recovery.IAuxiliaryRestoreChannel[] | undefined
 function recovery.registerTranscriptHash(guardianSetId: Buffer, initialState: recovery.GuardianState, generation: bigint): Buffer
 function recovery.registrationAdmissionProblem(guardianId: Buffer, guardianSetId: Buffer, request: recovery.IGuardianRegisterNodeRequest): recovery.IGuardianRefusal | null
 function recovery.requireEncryptedSecretStorage(storage: storage.IStorageBackend, allowUnencryptedSecrets?: boolean): void

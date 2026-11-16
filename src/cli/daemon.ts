@@ -3679,9 +3679,10 @@ async function bootDaemon(
 			// peers returned (spec 5.4). Local durability has no fencing, so
 			// an old device still running would keep acting on the same
 			// channels; a bare POST must not start that by accident.
-			const { confirm, unfenced } = body as {
+			const { confirm, unfenced, omitAssetChannels } = body as {
 				confirm?: boolean;
 				unfenced?: boolean;
+				omitAssetChannels?: boolean;
 			};
 			if (confirm !== true) {
 				return failure(
@@ -3694,7 +3695,18 @@ async function bootDaemon(
 			if (unfenced !== undefined && typeof unfenced !== 'boolean') {
 				return failure('INVALID_PARAMS', 'unfenced must be a boolean');
 			}
-			return success(await node.restoreFromCapsules({ unfenced }));
+			if (
+				omitAssetChannels !== undefined &&
+				typeof omitAssetChannels !== 'boolean'
+			) {
+				return failure('INVALID_PARAMS', 'omitAssetChannels must be a boolean');
+			}
+			return success(
+				await node.restoreFromCapsules({
+					unfenced,
+					...(omitAssetChannels !== undefined ? { omitAssetChannels } : {})
+				})
+			);
 		},
 		'POST /recovery/capsule-guardians': (body) => {
 			// The one place a retrieved capsule's guardian credentials leave

@@ -22,13 +22,19 @@ import { AddressInfo } from 'net';
 import * as os from 'os';
 import * as path from 'path';
 import { IStartedDaemon, startDaemon } from '../../src/cli/daemon';
-import { BeignetNode, BeignetNodeOptions } from '../../src/cli/beignet-node';
+import {
+	BeignetNode,
+	BeignetNodeOptions,
+	restoreOmittedAssetChannels
+} from '../../src/cli/beignet-node';
 import { BeignetError } from '../../src/cli/errors';
 import {
 	EXTENSION_API_VERSION,
 	IBeignetExtension
 } from '../../src/cli/extension';
+import type { IStaticChannelBackup } from '../../src/lightning/backup/scb';
 import type { IAuxiliaryChannelConfig } from '../../src/lightning/channel/auxiliary-funding';
+import { Feature, FeatureFlags } from '../../src/lightning/features/flags';
 import { AuxiliaryProviderRequiredError } from '../../src/lightning/node/types';
 import {
 	AuxiliaryGuardianModeError,
@@ -306,6 +312,154 @@ describe('Recovery modes and asset channels, over the daemon', function () {
 
 		// Any other failure of a restore is left to the code it had.
 		expect(refusalFor(new Error('disk full'))).to.equal(undefined);
+
+		// Neither says more than it did: a refusal that names no channel
+		// has no details, in the object or in the answer.
+		expect(refused).to.not.have.property('details');
+		expect(refused?.toJSON()).to.deep.equal({
+			code: 'ASSET_RESTORE_REFUSED',
+			message: new AuxiliaryRestoreRefusedError([id]).message
+		});
+		expect(required?.toJSON()).to.not.have.property('details');
+	});
+
+	it('answers a refused capsule restore with the asset channels it holds, and takes omitAssetChannels only as a boolean', async () => {
+		const daemon = await boot('omit', {
+			mnemonic: MNEMONICS[0],
+			recoveryMode: 'peer-storage'
+		});
+		const refusalFor = (
+			daemon.node as unknown as {
+				assetRestoreRefusal(err: unknown): BeignetError | undefined;
+			}
+		).assetRestoreRefusal.bind(daemon.node);
+		const id = 'ab'.repeat(32);
+		const held = [
+			{ channelId: id, peerPubkey: PEER, capacitySatoshis: 2_000_000n }
+		];
+		const assetChannels = [
+			{ channelId: id, peerPubkey: PEER, capacitySats: 2_000_000 }
+		];
+		// As the engine's capsule restore throws them.
+		const required = refusalFor(
+			Object.assign(new AuxiliaryProviderRequiredError([id]), {
+				channels: held
+			})
+		);
+		expect(required?.code).to.equal('ASSET_PROVIDER_REQUIRED');
+		expect(required?.toJSON()).to.deep.equal({
+			code: 'ASSET_PROVIDER_REQUIRED',
+			message:
+				'This restore holds 1 asset channel and no extension attached to ' +
+				'this wallet can run them, so nothing was restored. Restore it ' +
+				'with the extension that opened them.',
+			details: { assetChannels }
+		});
+		const refused = refusalFor(
+			Object.assign(new AuxiliaryRestoreRefusedError([id]), { channels: held })
+		);
+		expect(refused?.code).to.equal('ASSET_RESTORE_REFUSED');
+		expect(refused?.details).to.deep.equal({ assetChannels });
+		// The answer is JSON as it stands.
+		expect(JSON.parse(JSON.stringify(refused?.toJSON())).details).to.deep.equal(
+			{ assetChannels }
+		);
+
+		// The option, on the route and on the call.
+		const port = portOf(daemon);
+		for (const given of ['true', 1, null]) {
+			const answer = await request(port, 'POST', '/recovery/restore-capsule', {
+				confirm: true,
+				omitAssetChannels: given
+			});
+			expect(answer.status, String(given)).to.equal(400);
+			expect(answer.body.error).to.deep.equal({
+				code: 'INVALID_PARAMS',
+				message: 'omitAssetChannels must be a boolean'
+			});
+		}
+		let thrown: unknown;
+		try {
+			await daemon.node.restoreFromCapsules({
+				omitAssetChannels: 'true' as unknown as boolean
+			});
+		} catch (err) {
+			thrown = err;
+		}
+		expect((thrown as BeignetError).code).to.equal('INVALID_PARAMS');
+		expect((thrown as BeignetError).message).to.equal(
+			'omitAssetChannels must be a boolean'
+		);
+		// A boolean passes the check and reaches the restore itself, which
+		// has no capsule here: the same answer with the option and without.
+		const without = await request(port, 'POST', '/recovery/restore-capsule', {
+			confirm: true
+		});
+		for (const given of [true, false]) {
+			const answer = await request(port, 'POST', '/recovery/restore-capsule', {
+				confirm: true,
+				omitAssetChannels: given
+			});
+			expect(answer.status).to.equal(without.status);
+			expect(answer.body).to.deep.equal(without.body);
+			expect((answer.body.error as { code: string }).code).to.not.equal(
+				'INVALID_PARAMS'
+			);
+		}
+	});
+
+	it('lists what a restore left out: the channels the engine skipped at Tier 2, and the asset entries of the backup at Tier 1', () => {
+		const overlay = new FeatureFlags();
+		overlay.setCompulsory(Feature.OPTION_TAPROOT_OVERLAY);
+		const taproot = new FeatureFlags();
+		taproot.setCompulsory(Feature.OPTION_TAPROOT);
+		const entry = (
+			channelId: string,
+			channelType: string
+		): IStaticChannelBackup['channels'][number] =>
+			({
+				channelId,
+				peerNodeId: PEER,
+				peerAddresses: [],
+				fundingTxid: '00'.repeat(32),
+				fundingOutputIndex: 0,
+				fundingSatoshis: '250000',
+				channelKeyIndex: 1,
+				channelType
+			}) as unknown as IStaticChannelBackup['channels'][number];
+		const asset = 'aa'.repeat(32);
+		const scb = {
+			version: 1,
+			network: 'regtest',
+			createdAt: 1,
+			channels: [
+				entry(asset, overlay.toBuffer().toString('hex')),
+				entry('bb'.repeat(32), taproot.toBuffer().toString('hex')),
+				entry('cc'.repeat(32), ''),
+				entry('dd'.repeat(32), 'not hex')
+			]
+		} as unknown as IStaticChannelBackup;
+
+		expect(restoreOmittedAssetChannels({ tier: 1, scb })).to.deep.equal([
+			{ channelId: asset, peerPubkey: PEER, capacitySats: 250_000 }
+		]);
+		// At Tier 2 the engine's word is the list, whatever the backup names.
+		expect(restoreOmittedAssetChannels({ tier: 2, scb })).to.deep.equal([]);
+		expect(
+			restoreOmittedAssetChannels({
+				tier: 2,
+				scb,
+				omittedAuxiliaryChannels: [
+					{
+						channelId: 'ee'.repeat(32),
+						peerPubkey: PEER,
+						capacitySatoshis: 1_000_000n
+					}
+				]
+			})
+		).to.deep.equal([
+			{ channelId: 'ee'.repeat(32), peerPubkey: PEER, capacitySats: 1_000_000 }
+		]);
 	});
 
 	it('hands a guardian restore no provider, and gives a journal that holds an asset channel the refusal of one this build never replicates', async () => {

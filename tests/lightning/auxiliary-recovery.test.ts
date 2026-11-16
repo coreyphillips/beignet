@@ -29,10 +29,13 @@ import {
 	composeRecoveryCapsule,
 	encryptRecoveryCapsule,
 	GuardianDescriptor,
+	framesWithoutChannels,
 	isGuardianRecoveryMode,
 	RecoveryCapsule,
+	refusedAuxiliaryChannels,
 	restoreBestRecoveryCapsule,
-	restoreFromRecoveryCapsule
+	restoreFromRecoveryCapsule,
+	storedAuxiliaryChannelIds
 } from '../../src/lightning/recovery';
 import { SqliteStorage } from '../../src/lightning/storage/sqlite-storage';
 import { isStorageTransactionActive } from '../../src/lightning/storage/transaction';
@@ -345,10 +348,16 @@ describe('a restore that holds asset channels', () => {
 			SECRET
 		);
 
-	/** A journaled node with one asset channel, and the capsule of its journal. */
-	const journaled = async (): Promise<{
+	/**
+	 * A journaled node with one asset channel, and the capsule of its
+	 * journal. With `ordinary`, an ordinary channel with the same peer too.
+	 */
+	const journaled = async (
+		ordinary = false
+	): Promise<{
 		alice: IAssetHost;
 		channelId: Buffer;
+		ordinaryId?: Buffer;
 		capsule: RecoveryCapsule;
 	}> => {
 		const storage = openStorage();
@@ -366,13 +375,19 @@ describe('a restore that holds asset channels', () => {
 			openerUnits: 900n,
 			acceptorUnits: 100n
 		});
+		const ordinaryId = ordinary
+			? openReadyChannel(alice.node, bob.node)
+			: undefined;
 		const { capsule, inline, inlineError } = composeRecoveryCapsule({
 			storage,
 			encryptedScb: scb(),
-			nodeSecret: SECRET
+			nodeSecret: SECRET,
+			// Two channels' journal is more than a peer stores: the restore
+			// is handed the capsule itself here.
+			...(ordinary ? { maxBytes: 1_000_000 } : {})
 		});
 		expect(inline, String(inlineError)).to.equal(true);
-		return { alice, channelId, capsule };
+		return { alice, channelId, ...(ordinaryId ? { ordinaryId } : {}), capsule };
 	};
 
 	const provider = (
@@ -611,5 +626,389 @@ describe('a restore that holds asset channels', () => {
 		expect(
 			agreed.filter((entry) => /AUXILIARY_/.test(entry.reason))
 		).to.deep.equal([]);
+	});
+
+	describe('and the list of them', () => {
+		it("is carried by the refusal, with each channel's peer and capacity, whether a provider is missing or said no", async () => {
+			const { channelId, capsule } = await journaled();
+			const whole = target();
+			restoreFromRecoveryCapsule(capsule, whole, SECRET, {
+				auxiliaryChannels: provider(() => true)
+			});
+			const held = [
+				{
+					channelId: channelId.toString('hex'),
+					peerPubkey: hosts[1].node.getNodeId(),
+					capacitySatoshis: whole.loadChannel(channelId.toString('hex'))!.state
+						.fundingSatoshis
+				}
+			];
+			expect(held[0].capacitySatoshis > 0n).to.equal(true);
+			const missing = thrownBy(() =>
+				restoreFromRecoveryCapsule(capsule, target(), SECRET)
+			);
+			expect(missing).to.be.instanceOf(AuxiliaryProviderRequiredError);
+			expect(refusedAuxiliaryChannels(missing)).to.deep.equal(held);
+			const refused = thrownBy(() =>
+				restoreFromRecoveryCapsule(capsule, target(), SECRET, {
+					auxiliaryChannels: provider(() => false)
+				})
+			);
+			expect(refused).to.be.instanceOf(AuxiliaryRestoreRefusedError);
+			expect(refusedAuxiliaryChannels(refused)).to.deep.equal(held);
+			expect((refused as AuxiliaryRestoreRefusedError).channels).to.deep.equal(
+				held
+			);
+			// A refusal that was not a capsule restore's has no list, and
+			// neither has any other error.
+			expect(
+				refusedAuxiliaryChannels(
+					new AuxiliaryProviderRequiredError([held[0].channelId])
+				)
+			).to.equal(undefined);
+			expect(refusedAuxiliaryChannels(new Error('disk full'))).to.equal(
+				undefined
+			);
+			expect(refusedAuxiliaryChannels(undefined)).to.equal(undefined);
+		});
+	});
+
+	describe('run with omitAuxiliaryChannels', () => {
+		it('leaves every asset channel out, writes no row of it, asks no provider, restores the rest as it would have been and says what was left out', async () => {
+			const { channelId, ordinaryId, capsule } = await journaled(true);
+			const id = channelId.toString('hex');
+			const ordinary = ordinaryId!.toString('hex');
+			const peer = hosts[1].node.getNodeId();
+
+			// The same capsule restored whole, by a provider that agrees.
+			const whole = target();
+			restoreFromRecoveryCapsule(capsule, whole, SECRET, {
+				auxiliaryChannels: provider(() => true)
+			});
+			expect(whole.loadChannel(id)).to.not.equal(null);
+
+			let asked = 0;
+			const into = target();
+			const result = restoreFromRecoveryCapsule(capsule, into, SECRET, {
+				omitAuxiliaryChannels: true,
+				auxiliaryChannels: provider(() => {
+					asked++;
+					return true;
+				})
+			});
+			expect(asked).to.equal(0);
+			expect(result.tier).to.equal(2);
+			expect(result.omittedAuxiliaryChannels).to.deep.equal([
+				{
+					channelId: id,
+					peerPubkey: peer,
+					capacitySatoshis: whole.loadChannel(id)!.state.fundingSatoshis
+				}
+			]);
+			// No row of the asset channel.
+			expect(into.loadChannel(id)).to.equal(null);
+			expect(storedAuxiliaryChannelIds(into)).to.deep.equal([]);
+			expect(
+				into.loadAllChainMonitors().map((row) => row.channelId)
+			).to.not.include(id);
+			expect(into.loadOutboxMessages!(id)).to.deep.equal([]);
+			expect(
+				into
+					.loadAllHtlcPaymentMappings()
+					.filter((row) => row.key.startsWith(id))
+			).to.deep.equal([]);
+			// Its key index stays, so its keys are never derived again.
+			expect(into.loadChannelKeyIndex(id)).to.equal(
+				whole.loadChannelKeyIndex(id)
+			);
+			expect(into.loadChannelKeyIndex(id)).to.not.equal(null);
+			// The ordinary channel, its monitor and its messages are what the
+			// whole restore installed.
+			expect(into.loadChannel(ordinary)).to.deep.equal(
+				whole.loadChannel(ordinary)
+			);
+			expect(into.loadChannel(ordinary)?.state.restoreRecencyUnproven).to.equal(
+				true
+			);
+			expect(
+				into.loadAllChainMonitors().filter((row) => row.channelId === ordinary)
+			).to.deep.equal(
+				whole.loadAllChainMonitors().filter((row) => row.channelId === ordinary)
+			);
+			expect(
+				into.loadOutboxMessages!(ordinary).map((row) => row.wireMessage)
+			).to.deep.equal(
+				whole.loadOutboxMessages!(ordinary).map((row) => row.wireMessage)
+			);
+			expect(into.loadAllChannelKeyIndices()).to.deep.equal(
+				whole.loadAllChannelKeyIndices()
+			);
+			// The journal is installed whole, as the capsule carried it.
+			expect(into.loadRecoveryFrames!(0)).to.deep.equal(
+				whole.loadRecoveryFrames!(0)
+			);
+
+			// A node with no provider starts on it, and runs the ordinary
+			// channel alone.
+			const node = createNode(TAG, 1, into, { recovery: { enabled: true } });
+			nodes.push(node);
+			node.on('node:error', () => undefined);
+			expect(
+				node.listChannels().map((channel) => channel.channelId.toString('hex'))
+			).to.deep.equal([ordinary]);
+		});
+
+		it('is the default restore, to the row, for a capsule that holds no asset channel', () => {
+			const storage = openStorage();
+			storages.push(storage);
+			const alice = createNode(TAG, 1, storage, {
+				recovery: { enabled: true }
+			});
+			const bob = createNode(TAG, 2);
+			nodes.push(alice, bob);
+			alice.on('node:error', () => undefined);
+			bob.on('node:error', () => undefined);
+			const connect = (from: LightningNode, to: LightningNode): void => {
+				from.on('message:outbound', (pubkey: string, type: number, payload) => {
+					if (pubkey === to.getNodeId()) {
+						to.handlePeerMessage(from.getNodeId(), type, payload as Buffer);
+					}
+				});
+			};
+			connect(alice, bob);
+			connect(bob, alice);
+			const id = openReadyChannel(alice, bob).toString('hex');
+			const { capsule, inline } = composeRecoveryCapsule({
+				storage,
+				encryptedScb: scb(),
+				nodeSecret: SECRET
+			});
+			expect(inline).to.equal(true);
+			const plain = target();
+			const omitting = target();
+			const expected = restoreFromRecoveryCapsule(capsule, plain, SECRET);
+			const result = restoreFromRecoveryCapsule(capsule, omitting, SECRET, {
+				omitAuxiliaryChannels: true
+			});
+			expect(result).to.not.have.property('omittedAuxiliaryChannels');
+			expect(result.framesApplied).to.equal(expected.framesApplied);
+			expect(omitting.loadChannel(id)).to.deep.equal(plain.loadChannel(id));
+			expect(omitting.loadAllChainMonitors()).to.deep.equal(
+				plain.loadAllChainMonitors()
+			);
+			expect(omitting.loadOutboxMessages!()).to.deep.equal(
+				plain.loadOutboxMessages!()
+			);
+			expect(omitting.loadRecoveryFrames!(0)).to.deep.equal(
+				plain.loadRecoveryFrames!(0)
+			);
+		});
+
+		it('takes only the exact true for the option, and refuses as before for anything else', async () => {
+			const { capsule } = await journaled();
+			for (const given of [false, undefined, 'true', 1]) {
+				const into = target();
+				const refusal = thrownBy(() =>
+					restoreFromRecoveryCapsule(capsule, into, SECRET, {
+						omitAuxiliaryChannels: given as boolean | undefined
+					})
+				);
+				expect(refusal, String(given)).to.be.instanceOf(
+					AuxiliaryProviderRequiredError
+				);
+				expectUntouched(into);
+			}
+		});
+
+		it('is carried through the best-capsule restore, with the list', async () => {
+			const { channelId, capsule } = await journaled();
+			const into = target();
+			const result = restoreBestRecoveryCapsule(
+				[encryptRecoveryCapsule(capsule, SECRET)],
+				into,
+				SECRET,
+				{ scratchStorage: openStorage, omitAuxiliaryChannels: true }
+			);
+			expect(result.tier).to.equal(2);
+			expect(
+				result.omittedAuxiliaryChannels?.map((channel) => channel.channelId)
+			).to.deep.equal([channelId.toString('hex')]);
+			expect(into.loadAllChannels()).to.deep.equal([]);
+			expect(into.loadRecoveryFrames!(0).length).to.be.greaterThan(0);
+		});
+
+		it('drops what is keyed by a channel left out, in the snapshot and in the frames after it, and keeps its key index and the history of the wallet', () => {
+			type Frames = Parameters<typeof framesWithoutChannels>[0];
+			const out = 'aa'.repeat(32);
+			const kept = 'bb'.repeat(32);
+			const secret = Buffer.alloc(32, 1);
+			const message = (channelId?: string): Record<string, unknown> => ({
+				peerId: '02' + '11'.repeat(32),
+				...(channelId ? { channelId } : {}),
+				messageType: 132,
+				wireMessage: Buffer.from('signed')
+			});
+			const frame = (
+				over: Record<string, unknown>
+			): Record<string, unknown> => ({
+				version: 5,
+				writerEpoch: 1n,
+				sequence: 1n,
+				previousFrameHash: Buffer.alloc(32),
+				timestamp: 1,
+				mutations: [],
+				outboundMessages: [],
+				...over
+			});
+			const snapshot = {
+				schemaVersion: '2',
+				channels: [
+					{ channelId: out, state: { n: 1 }, peerPubkey: 'peer' },
+					{ channelId: kept, state: { n: 2 }, peerPubkey: 'peer' }
+				],
+				keyIndices: [
+					{ channelId: out, channelIndex: 4 },
+					{ channelId: kept, channelIndex: 5 }
+				],
+				chainMonitors: [
+					{ channelId: out, state: { n: 1 } },
+					{ channelId: kept, state: { n: 2 } }
+				],
+				preimages: [{ paymentHash: 'h1', preimage: secret }],
+				payments: [{ paymentHash: 'h1', payment: { status: 'pending' } }],
+				htlcPaymentMappings: [
+					{ key: `${out}:offered-1`, paymentHash: 'h1' },
+					{ key: `${kept}:offered-2`, paymentHash: 'h2' }
+				],
+				forwardedHtlcs: [
+					{
+						outKey: `${out}:3`,
+						inChannelId: Buffer.from(kept, 'hex'),
+						inHtlcId: 1n
+					},
+					{
+						outKey: `${kept}:4`,
+						inChannelId: Buffer.from(out, 'hex'),
+						inHtlcId: 2n
+					},
+					{
+						outKey: `${kept}:5`,
+						inChannelId: Buffer.from(kept, 'hex'),
+						inHtlcId: 3n
+					}
+				],
+				htlcSharedSecrets: [
+					{ key: `${out}:1`, secret },
+					{ key: `${kept}:2`, secret }
+				],
+				outbox: [
+					{ ...message(out), frameSequence: 1 },
+					{ ...message(kept), frameSequence: 1 },
+					{ ...message(), frameSequence: null }
+				]
+			};
+			const mutations = [
+				{
+					type: 'channel_state',
+					channelId: out,
+					state: { n: 3 },
+					peerPubkey: 'peer'
+				},
+				{
+					type: 'channel_state',
+					channelId: kept,
+					state: { n: 4 },
+					peerPubkey: 'peer'
+				},
+				{ type: 'channel_key_index', channelId: out, channelIndex: 4 },
+				{ type: 'chain_monitor', channelId: out, state: { n: 3 } },
+				{ type: 'chain_monitor', channelId: kept, state: { n: 4 } },
+				{
+					type: 'htlc_payment_mapping',
+					htlcKey: `${out}:offered-7`,
+					paymentHash: 'h3'
+				},
+				{
+					type: 'htlc_payment_mapping',
+					htlcKey: `${kept}:offered-8`,
+					paymentHash: 'h4'
+				},
+				{ type: 'delete_htlc_payment_mapping', htlcKey: `${out}:offered-1` },
+				{ type: 'htlc_shared_secret', key: `${out}:7`, secret },
+				{ type: 'delete_htlc_shared_secret', key: `${out}:1` },
+				{
+					type: 'forwarded_htlc',
+					outKey: `${kept}:9`,
+					inChannelId: Buffer.from(out, 'hex'),
+					inHtlcId: 4n
+				},
+				{ type: 'delete_forwarded_htlc', outKey: `${out}:3` },
+				{ type: 'outbox_supersede', channelId: out },
+				{ type: 'outbox_supersede', channelId: kept },
+				{ type: 'channel_closed', channelId: out },
+				{ type: 'payment_preimage', paymentHash: 'h3', preimage: secret },
+				{
+					type: 'payment_state',
+					paymentHash: 'h3',
+					payment: { status: 'pending' }
+				}
+			];
+			const frames = [
+				frame({ snapshot }),
+				frame({
+					sequence: 2n,
+					mutations,
+					outboundMessages: [message(out), message(kept), message()]
+				})
+			] as unknown as Frames;
+			const before = JSON.stringify(frames, (_key, value) =>
+				typeof value === 'bigint' ? `${value}n` : value
+			);
+			// The set is read without regard to case.
+			const left = framesWithoutChannels(frames, new Set([out.toUpperCase()]));
+			expect(
+				JSON.stringify(frames, (_key, value) =>
+					typeof value === 'bigint' ? `${value}n` : value
+				)
+			).to.equal(before);
+			const base = left[0].snapshot! as unknown as typeof snapshot;
+			expect(base.channels.map((row) => row.channelId)).to.deep.equal([kept]);
+			expect(base.chainMonitors.map((row) => row.channelId)).to.deep.equal([
+				kept
+			]);
+			expect(base.keyIndices).to.deep.equal(snapshot.keyIndices);
+			expect(base.preimages).to.deep.equal(snapshot.preimages);
+			expect(base.payments).to.deep.equal(snapshot.payments);
+			expect(base.htlcPaymentMappings.map((row) => row.key)).to.deep.equal([
+				`${kept}:offered-2`
+			]);
+			expect(base.forwardedHtlcs.map((row) => row.outKey)).to.deep.equal([
+				`${kept}:5`
+			]);
+			expect(base.htlcSharedSecrets.map((row) => row.key)).to.deep.equal([
+				`${kept}:2`
+			]);
+			expect(base.outbox).to.deep.equal([
+				snapshot.outbox[1],
+				snapshot.outbox[2]
+			]);
+			expect(base.schemaVersion).to.equal('2');
+			expect(left[1].sequence).to.equal(2n);
+			expect(left[1].mutations).to.deep.equal([
+				mutations[1],
+				mutations[2],
+				mutations[4],
+				mutations[6],
+				mutations[13],
+				mutations[15],
+				mutations[16]
+			]);
+			expect(left[1].outboundMessages).to.deep.equal([
+				message(kept),
+				message()
+			]);
+			// No channel named: the frames themselves.
+			expect(framesWithoutChannels(frames, new Set())).to.equal(frames);
+		});
 	});
 });

@@ -116,9 +116,10 @@ property BeignetConfig.websocketPort?: number
 property BeignetConfig.wireTrace?: boolean | string[]
 class BeignetError extends CodedError<BeignetErrorCodeValue>
 constructor BeignetError(code: BeignetErrorCodeValue, message: string, failureCode?: number)
+property BeignetError.details?: Record<string, unknown>
 property BeignetError.failureCode?: number
 property BeignetError.paymentHash?: string
-method BeignetError.toJSON(): { code: string; message: string; failureCode?: number; paymentHash?: string; }
+method BeignetError.toJSON(): { code: string; message: string; failureCode?: number; paymentHash?: string; details?: Record<string, unknown>; }
 enum BeignetErrorCode
 member BeignetErrorCode.ADDRESS_FAILED = "ADDRESS_FAILED"
 member BeignetErrorCode.AMOUNT_MISMATCH = "AMOUNT_MISMATCH"
@@ -450,7 +451,7 @@ method BeignetNode.reorderPrimaries(pubkeys: string[]): PrimariesInfo
 method BeignetNode.resolveGuardianUri(uri: string): Promise<{ guardianId: string; url: string; entry: string; guardianSetIds: string[]; maxCiphertextBytes: number; }>
 method BeignetNode.resolveInterruptedPayment(bolt11: string): Promise<InterruptedPaymentOutcome>
 get BeignetNode.restartRequired(): boolean
-method BeignetNode.restoreFromCapsules(options?: { unfenced?: boolean; resume?: boolean; }): Promise<{ tier: 1 | 2; channelCount: number; framesApplied: number; head: { writerEpoch: string; latestSequence: string; }; newestSeenHead: { writerEpoch: string; latestSequence: string; }; rejectedCandidates: number; restartRequired: boolean; resumed?: boolean; uncovered?: string[]; unfenced?: { guardians: IReportedGuardian[]; }; recovering?: string[]; skipped?: Array<{ channelId: ChannelIdHex; reason: string; }>; }>
+method BeignetNode.restoreFromCapsules(options?: { unfenced?: boolean; resume?: boolean; omitAssetChannels?: boolean; }): Promise<{ tier: 1 | 2; channelCount: number; framesApplied: number; head: { writerEpoch: string; latestSequence: string; }; newestSeenHead: { writerEpoch: string; latestSequence: string; }; rejectedCandidates: number; restartRequired: boolean; resumed?: boolean; uncovered?: string[]; unfenced?: { guardians: IReportedGuardian[]; }; recovering?: string[]; skipped?: Array<{ channelId: ChannelIdHex; reason: string; }>; omittedAssetChannels?: IRestoreAssetChannel[]; }>
 method BeignetNode.restoreFromGuardians(): Promise<{ exact: boolean; framesApplied: number; guardiansRepaired: number; epoch: string; }>
 method BeignetNode.restoreFromScb(encoded: string): Promise<{ recovering: string[]; skipped: Array<{ channelId: ChannelIdHex; reason: string; }>; channelCount: number; }>
 get BeignetNode.restorePending(): boolean
@@ -1156,6 +1157,10 @@ method IPaymentQueueStorage.updateQueueEntryStatus(id: string, status: string, e
 unexported interface IReportedGuardian
 property IReportedGuardian.guardianId: string
 property IReportedGuardian.transports: Array<{ type: beignet/lightning#recovery.GuardianTransportType; url: string; }>
+unexported interface IRestoreAssetChannel
+property IRestoreAssetChannel.capacitySats: number
+property IRestoreAssetChannel.channelId: ChannelIdHex
+property IRestoreAssetChannel.peerPubkey: string
 interface IStartedDaemon
 property IStartedDaemon.logger?: beignet#ILogger
 property IStartedDaemon.node: BeignetNode

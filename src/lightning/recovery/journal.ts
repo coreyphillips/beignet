@@ -2486,6 +2486,82 @@ export function channelsAfterReplay(frames: RecoveryFrame[]): Array<{
 }
 
 /**
+ * The frames as reconstructFromFrames is to replay them when the channels
+ * named are left out of a restore: no row of theirs is written. Gone are
+ * their channel rows, chain monitors, outbox messages, and the HTLC rows
+ * keyed by them, in the base snapshot and in every later frame. Their key
+ * indices stay, so no key of theirs is ever derived for another channel,
+ * and so do payments and invoices, which are the wallet's history and not a
+ * channel's. The frames given are not changed, and a set that names no
+ * channel is answered as it is.
+ */
+export function framesWithoutChannels(
+	frames: RecoveryFrame[],
+	channelIds: ReadonlySet<string>
+): RecoveryFrame[] {
+	if (channelIds.size === 0) return frames;
+	const left = new Set([...channelIds].map((id) => id.toLowerCase()));
+	const out = (channelId: string | undefined): boolean =>
+		channelId !== undefined && left.has(channelId.toLowerCase());
+	// HTLC rows are keyed by '<channel id hex>:<htlc>'.
+	const keyed = (key: string): boolean => out(key.split(':')[0]);
+	const keep = (mutation: RecoveryMutation): boolean => {
+		switch (mutation.type) {
+			case 'channel_state':
+			case 'chain_monitor':
+			case 'channel_closed':
+			case 'outbox_supersede':
+				return !out(mutation.channelId);
+			case 'htlc_payment_mapping':
+			case 'delete_htlc_payment_mapping':
+				return !keyed(mutation.htlcKey);
+			case 'htlc_shared_secret':
+			case 'delete_htlc_shared_secret':
+				return !keyed(mutation.key);
+			case 'forwarded_htlc':
+				return (
+					!keyed(mutation.outKey) && !out(mutation.inChannelId.toString('hex'))
+				);
+			case 'delete_forwarded_htlc':
+				return !keyed(mutation.outKey);
+			default:
+				return true;
+		}
+	};
+	return frames.map((frame) => ({
+		...frame,
+		mutations: frame.mutations.filter(keep),
+		outboundMessages: frame.outboundMessages.filter(
+			(message) => !out(message.channelId)
+		),
+		...(frame.snapshot
+			? {
+					snapshot: {
+						...frame.snapshot,
+						channels: frame.snapshot.channels.filter(
+							(row) => !out(row.channelId)
+						),
+						chainMonitors: frame.snapshot.chainMonitors.filter(
+							(row) => !out(row.channelId)
+						),
+						htlcPaymentMappings: frame.snapshot.htlcPaymentMappings.filter(
+							(row) => !keyed(row.key)
+						),
+						forwardedHtlcs: frame.snapshot.forwardedHtlcs.filter(
+							(row) =>
+								!keyed(row.outKey) && !out(row.inChannelId.toString('hex'))
+						),
+						htlcSharedSecrets: frame.snapshot.htlcSharedSecrets.filter(
+							(row) => !keyed(row.key)
+						),
+						outbox: frame.snapshot.outbox.filter((row) => !out(row.channelId))
+					}
+			  }
+			: {})
+	}));
+}
+
+/**
  * Index of the last frame reconstructFromFrames applies: the head, or the
  * frame before a later snapshot cut off before its last page.
  */

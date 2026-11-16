@@ -201,11 +201,13 @@ import type {
 	IGuardianHostEvent,
 	IGuardianHostStatus,
 	IRotationEvent,
-	IGuardianReplicationEvent
+	IGuardianReplicationEvent,
+	IAuxiliaryRestoreChannel
 } from '../lightning/recovery';
 import {
 	AuxiliaryGuardianRestoreError,
 	AuxiliaryRestoreRefusedError,
+	refusedAuxiliaryChannels,
 	RestoreRefusedError,
 	storedAuxiliaryChannelIds,
 	RestoreRotatedError,
@@ -309,7 +311,11 @@ import {
 	PaymentStatus,
 	PaymentWaitTimeoutError
 } from '../lightning/node/types';
-import { isAnchorChannel, ChannelState } from '../lightning/channel/types';
+import {
+	isAnchorChannel,
+	isOverlayChannel,
+	ChannelState
+} from '../lightning/channel/types';
 import type { ChannelErrorCode } from '../lightning/channel/channel-actions';
 import { isRecencyUnproven } from '../lightning/channel/channel-state';
 import type { Channel } from '../lightning/channel/channel';
@@ -2409,6 +2415,51 @@ function listenerLabel(kind: ListenerKind): string {
 /** How long `connectPeer` waits for a dial unless `connectTimeoutMs` says otherwise. */
 const DEFAULT_CONNECT_TIMEOUT_MS = 15_000;
 
+/** An asset channel a capsule restore holds, as the daemon answers it. */
+export interface IRestoreAssetChannel {
+	channelId: ChannelIdHex;
+	/** The peer's node id, hex. */
+	peerPubkey: string;
+	/** The capacity of the channel's funding output. */
+	capacitySats: number;
+}
+
+function restoreAssetChannel(
+	channel: IAuxiliaryRestoreChannel
+): IRestoreAssetChannel {
+	return {
+		channelId: channel.channelId as ChannelIdHex,
+		peerPubkey: channel.peerPubkey,
+		capacitySats: Number(channel.capacitySatoshis)
+	};
+}
+
+/**
+ * The asset channels a capsule restore run with omitAssetChannels left out:
+ * at Tier 2 the ones the engine skipped, and at Tier 1, where the backup is
+ * all there is, its entries with an asset channel type.
+ */
+export function restoreOmittedAssetChannels(result: {
+	tier: 1 | 2;
+	scb: IStaticChannelBackup;
+	omittedAuxiliaryChannels?: IAuxiliaryRestoreChannel[];
+}): IRestoreAssetChannel[] {
+	if (result.tier === 2) {
+		return (result.omittedAuxiliaryChannels ?? []).map(restoreAssetChannel);
+	}
+	return result.scb.channels
+		.filter(
+			(entry) =>
+				/^([0-9a-f]{2})+$/i.test(entry.channelType) &&
+				isOverlayChannel(Buffer.from(entry.channelType, 'hex'))
+		)
+		.map((entry) => ({
+			channelId: entry.channelId as ChannelIdHex,
+			peerPubkey: entry.peerNodeId,
+			capacitySats: Number(entry.fundingSatoshis)
+		}));
+}
+
 export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	private fforReceiveService?: FforReceiveService;
 	private offlineReceive?: OfflineReceive;
@@ -3274,23 +3325,38 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	 * that supplies the node's asset channels did not say it can restore
 	 * them, and ASSET_PROVIDER_REQUIRED when no extension supplies any.
 	 * Nothing of the restore was installed either way. Undefined for any
-	 * other failure.
+	 * other failure. The refusal of a capsule restore carries the channels
+	 * under `details.assetChannels`: what the same restore would leave out
+	 * were it run with omitAssetChannels.
 	 */
 	private assetRestoreRefusal(err: unknown): BeignetError | undefined {
+		const held = refusedAuxiliaryChannels(err);
+		const withChannels = (refusal: BeignetError): BeignetError => {
+			if (held) {
+				refusal.details = { assetChannels: held.map(restoreAssetChannel) };
+			}
+			return refusal;
+		};
 		if (
 			err instanceof AuxiliaryRestoreRefusedError ||
 			err instanceof AuxiliaryGuardianRestoreError
 		) {
-			return new BeignetError('ASSET_RESTORE_REFUSED', err.message);
+			return withChannels(
+				new BeignetError('ASSET_RESTORE_REFUSED', err.message)
+			);
 		}
 		if (err instanceof AuxiliaryProviderRequiredError) {
 			const count = err.channelIds.length;
-			return new BeignetError(
-				'ASSET_PROVIDER_REQUIRED',
-				`This restore holds ${count} asset channel${count === 1 ? '' : 's'} ` +
-					'and no extension attached to this wallet can run them, so ' +
-					'nothing was restored. Restore it with the extension that ' +
-					'opened them.'
+			return withChannels(
+				new BeignetError(
+					'ASSET_PROVIDER_REQUIRED',
+					`This restore holds ${count} asset channel${
+						count === 1 ? '' : 's'
+					} ` +
+						'and no extension attached to this wallet can run them, so ' +
+						'nothing was restored. Restore it with the extension that ' +
+						'opened them.'
+				)
 			);
 		}
 		return undefined;
@@ -5662,7 +5728,16 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	 * through its guardians or the SCB route.
 	 */
 	async restoreFromCapsules(
-		options: { unfenced?: boolean; resume?: boolean } = {}
+		options: {
+			unfenced?: boolean;
+			resume?: boolean;
+			/**
+			 * Leave the asset channels the capsule holds out of the restore,
+			 * in place of refusing it (issue #2093): nothing of them is
+			 * written, and the answer lists them in `omittedAssetChannels`.
+			 */
+			omitAssetChannels?: boolean;
+		} = {}
 	): Promise<{
 		tier: 1 | 2;
 		channelCount: number;
@@ -5686,6 +5761,11 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 		unfenced?: { guardians: IReportedGuardian[] };
 		recovering?: string[];
 		skipped?: Array<{ channelId: ChannelIdHex; reason: string }>;
+		/**
+		 * With omitAssetChannels: the asset channels the capsule held, which
+		 * were left out. Present only when there was one.
+		 */
+		omittedAssetChannels?: IRestoreAssetChannel[];
 	}> {
 		if (this._restoreInFlight) {
 			throw new BeignetError(
@@ -5702,6 +5782,18 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 			throw new BeignetError('INVALID_PARAMS', 'unfenced must be a boolean');
 		}
 		const unfencedRequested = options.unfenced === true;
+		// Leaving channels out is the caller's own word, so only the exact
+		// boolean counts here too.
+		if (
+			options.omitAssetChannels !== undefined &&
+			typeof options.omitAssetChannels !== 'boolean'
+		) {
+			throw new BeignetError(
+				'INVALID_PARAMS',
+				'omitAssetChannels must be a boolean'
+			);
+		}
+		const omitAssetChannels = options.omitAssetChannels === true;
 		if (options.resume !== undefined && typeof options.resume !== 'boolean') {
 			throw new BeignetError('INVALID_PARAMS', 'resume must be a boolean');
 		}
@@ -5819,7 +5911,8 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 					},
 					...(this._restoreAuxiliaryChannels
 						? { auxiliaryChannels: this._restoreAuxiliaryChannels }
-						: {})
+						: {}),
+					...(omitAssetChannels ? { omitAuxiliaryChannels: true } : {})
 				});
 				// Retrieval already refuses wrong-network capsules; this is the
 				// belt on those braces, and a candidate defect if it ever fires.
@@ -5917,13 +6010,24 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 					`restoring a guardian-backed capsule without fencing: the previous writer is NOT fenced (${locators.length} guardian(s) named)`
 				);
 			}
+			const omittedAssetChannels = omitAssetChannels
+				? restoreOmittedAssetChannels(result)
+				: [];
+			const omittedIds = new Set(
+				omittedAssetChannels.map((channel) => channel.channelId.toLowerCase())
+			);
+			// What the backup names and the restore did not leave out.
+			const backedUp = result.scb.channels.filter(
+				(entry) => !omittedIds.has(entry.channelId.toLowerCase())
+			);
 			const common = {
 				channelCount: result.scb.channels.length,
 				framesApplied: result.framesApplied,
 				head,
 				newestSeenHead,
 				rejectedCandidates: result.rejectedCandidates,
-				...(unfenced ? { unfenced } : {})
+				...(unfenced ? { unfenced } : {}),
+				...(omittedAssetChannels.length > 0 ? { omittedAssetChannels } : {})
 			};
 
 			if (result.tier === 1) {
@@ -5933,10 +6037,10 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 				dropStaged();
 				progress(
 					'capsule:tier1',
-					`no inline journal validated; recovering ${common.channelCount} channel(s) from the embedded SCB`
+					`no inline journal validated; recovering ${backedUp.length} channel(s) from the embedded SCB`
 				);
 				const { recovering, skipped } =
-					await this.node.recoverFromStaticChannelBackup(result.scb.channels);
+					await this.node.recoverFromStaticChannelBackup(backedUp);
 				this._bootTargetEmpty = false;
 				const info = {
 					tier: 1 as const,
@@ -6044,7 +6148,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 					'restore:complete',
 					`restored database installed (previous kept at ${path.basename(
 						keptPath
-					)}); restart the daemon to resume ${common.channelCount} channel(s)`
+					)}); restart the daemon to resume ${backedUp.length} channel(s)`
 				);
 				this.emit('recovery:restored', {
 					exact: true,
@@ -6093,7 +6197,8 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 				const restoredIds = new Set(
 					this.storage.loadAllChannels().map((c) => c.channelId.toLowerCase())
 				);
-				uncoveredEntries = result.scb.channels.filter(
+				// A channel left out is not recovered through its peer either.
+				uncoveredEntries = backedUp.filter(
 					(entry) => !restoredIds.has(entry.channelId.toLowerCase())
 				);
 			} catch (err) {
@@ -6168,7 +6273,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 				`restored database installed (previous kept at ${path.basename(
 					keptPath
 				)}); node rebuilt in-process, ${
-					common.channelCount - uncovered.length
+					backedUp.length - uncovered.length
 				} channel(s) resuming` +
 					(uncovered.length > 0
 						? `, ${uncovered.length} closing safely through the peer`

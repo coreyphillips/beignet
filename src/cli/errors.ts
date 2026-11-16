@@ -302,6 +302,13 @@ export class BeignetError extends CodedError<BeignetErrorCodeValue> {
 	 * deciding to pay again (issue #1094).
 	 */
 	paymentHash?: string;
+	/**
+	 * What the refusal is about, for a caller that shows it. Set only where
+	 * the code documents it: ASSET_RESTORE_REFUSED and ASSET_PROVIDER_REQUIRED
+	 * of a capsule restore carry `assetChannels`, the asset channels the
+	 * restore holds.
+	 */
+	details?: Record<string, unknown>;
 
 	constructor(
 		code: BeignetErrorCodeValue,
@@ -318,18 +325,21 @@ export class BeignetError extends CodedError<BeignetErrorCodeValue> {
 		message: string;
 		failureCode?: number;
 		paymentHash?: string;
+		details?: Record<string, unknown>;
 	} {
 		const json: {
 			code: string;
 			message: string;
 			failureCode?: number;
 			paymentHash?: string;
+			details?: Record<string, unknown>;
 		} = {
 			code: this.code,
 			message: this.message
 		};
 		if (this.failureCode !== undefined) json.failureCode = this.failureCode;
 		if (this.paymentHash !== undefined) json.paymentHash = this.paymentHash;
+		if (this.details !== undefined) json.details = this.details;
 		return json;
 	}
 }
