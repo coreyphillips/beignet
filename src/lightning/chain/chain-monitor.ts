@@ -2333,6 +2333,67 @@ export class ChainMonitor {
 		delete output.auxiliaryFeeWait;
 	}
 
+	/**
+	 * Asset channels: how each HTLC with units ended on the chain, once the
+	 * spend of its output is irrevocable. An HTLC this node offered has
+	 * failed when this node's own spend took the output back (the timeout)
+	 * and is fulfilled when the peer's did (it showed the preimage); one it
+	 * received is fulfilled when its own spend took it (the preimage) and
+	 * has failed when the peer's did. Nothing for a revoked commitment,
+	 * whose HTLCs are not the channel's, and nothing for any other channel.
+	 */
+	auxiliaryHtlcEndings(): Array<{
+		txid: string;
+		outputIndex: number;
+		htlcId: bigint;
+		offered: boolean;
+		outcome: 'fulfilled' | 'failed';
+		recorded: boolean;
+	}> {
+		const type = this._commitmentBroadcast?.commitmentType;
+		if (
+			!this._channelState.auxiliaryState ||
+			(type !== CommitmentType.OUR_COMMITMENT &&
+				type !== CommitmentType.THEIR_CURRENT_COMMITMENT)
+		) {
+			return [];
+		}
+		const endings: ReturnType<ChainMonitor['auxiliaryHtlcEndings']> = [];
+		for (const output of this._trackedOutputs) {
+			if (
+				output.status !== OutputStatus.IRREVOCABLY_RESOLVED ||
+				output.isSecondLevelHtlc ||
+				output.auxiliaryCommitmentNumber === undefined ||
+				output.htlcId === undefined ||
+				output.resolutionTxid === undefined ||
+				(output.outputType !== OutputType.OFFERED_HTLC &&
+					output.outputType !== OutputType.RECEIVED_HTLC)
+			) {
+				continue;
+			}
+			const offered = output.outputType === OutputType.OFFERED_HTLC;
+			const ours =
+				output.auxiliarySweepAttempts?.[output.resolutionTxid] !== undefined;
+			endings.push({
+				txid: output.txid,
+				outputIndex: output.outputIndex,
+				htlcId: output.htlcId,
+				offered,
+				outcome: offered === ours ? 'failed' : 'fulfilled',
+				recorded: output.auxiliaryOutcomeRecorded === true
+			});
+		}
+		return endings;
+	}
+
+	/** The ending of an HTLC of an asset channel is in the channel's row. */
+	noteAuxiliaryHtlcEndingRecorded(txid: string, outputIndex: number): void {
+		const output = this._trackedOutputs.find(
+			(o) => o.txid === txid && o.outputIndex === outputIndex
+		);
+		if (output) output.auxiliaryOutcomeRecorded = true;
+	}
+
 	private _handleCooperativeClose(actions: ChainAction[]): ChainAction[] {
 		// A cooperative close has nothing to sweep, but it is NOT resolved until
 		// the close tx is buried IRREVOCABLE_DEPTH deep (issue 338). Resolving

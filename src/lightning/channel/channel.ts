@@ -4103,6 +4103,40 @@ export class Channel {
 		});
 	}
 
+	/**
+	 * Asset channels: keep the ending an HTLC had on the chain, for the
+	 * host, in the list the endings off chain are kept in. False for a
+	 * channel without asset state and for an HTLC it does not hold or that
+	 * carries no units.
+	 */
+	recordAuxiliaryChainResolution(
+		direction: HtlcDirection,
+		htlcId: bigint,
+		outcome: 'fulfilled' | 'failed'
+	): boolean {
+		const auxiliary = this._state.auxiliaryState;
+		const entry = this._state.htlcs.get(
+			`${
+				direction === HtlcDirection.OFFERED ? 'offered' : 'received'
+			}-${htlcId}`
+		);
+		if (!auxiliary || !entry || entry.auxiliaryAmount === undefined) {
+			return false;
+		}
+		auxiliary.resolvedHtlcs ??= new Map();
+		auxiliary.resolvedHtlcs.set(`${entry.direction}:${entry.id}`, {
+			htlcId: entry.id,
+			direction: entry.direction,
+			paymentHash: Buffer.from(entry.paymentHash),
+			auxiliaryAmount: entry.auxiliaryAmount,
+			...(entry.customRecords !== undefined
+				? { customRecords: copyCustomRecords(entry.customRecords) }
+				: {}),
+			outcome
+		});
+		return true;
+	}
+
 	addHtlc(
 		amountMsat: bigint,
 		paymentHash: Buffer,

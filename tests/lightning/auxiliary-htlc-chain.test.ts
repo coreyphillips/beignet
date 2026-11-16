@@ -11,7 +11,12 @@
 
 import * as bitcoin from 'bitcoinjs-lib';
 import { expect } from 'chai';
-import { OutputStatus, OutputType } from '../../src/lightning/chain/types';
+import {
+	IRREVOCABLE_DEPTH,
+	OutputStatus,
+	OutputType
+} from '../../src/lightning/chain/types';
+import { ChannelState } from '../../src/lightning/channel/types';
 import type { ITrackedOutput } from '../../src/lightning/chain/types';
 import { PaymentStatus } from '../../src/lightning/node/types';
 import { withAssetOpens, type IAssetHost } from './helpers/auxiliary-nodes';
@@ -28,17 +33,40 @@ import {
 } from './helpers/auxiliary-on-chain';
 
 /** What Bob takes an HTLC of units to be worth. */
+const outcomes: { alice: string[]; bob: string[] } = { alice: [], bob: [] };
+const told =
+	(who: 'alice' | 'bob') =>
+	(context: {
+		direction: string;
+		outcome: string;
+		auxiliaryAmount: bigint;
+	}): void => {
+		outcomes[who].push(
+			`${context.direction}:${context.outcome}:${context.auxiliaryAmount}`
+		);
+	};
 const hooks = {
+	alice: { onHtlcResolved: told('alice') },
 	bob: {
 		valueIncomingHtlc: (context: { auxiliaryAmount?: bigint }): bigint =>
-			context.auxiliaryAmount! * 1000n
+			context.auxiliaryAmount! * 1000n,
+		onHtlcResolved: told('bob')
 	}
 };
+/** The parts of a hold invoice a node still has parked. */
+const parkedOf = (host: IAssetHost, paymentHash: Buffer): number =>
+	(host.node as unknown as { heldHtlcs: Map<string, unknown[]> }).heldHtlcs.get(
+		paymentHash.toString('hex')
+	)?.length ?? 0;
 
 describe('the HTLCs of an asset channel on the chain (issue #2093 step 10)', function () {
 	this.timeout(120000);
 	withAssetOpens();
 	const world = assetChainWorld();
+	beforeEach(() => {
+		outcomes.alice = [];
+		outcomes.bob = [];
+	});
 	afterEach(() => world.dispose());
 
 	const until = async (
@@ -386,12 +414,44 @@ describe('the HTLCs of an asset channel on the chain (issue #2093 step 10)', fun
 			PaymentStatus.COMPLETED
 		);
 		expect(claim.tx.virtualSize()).to.be.closeTo(228, 1);
+
+		// The ending is told at irrevocable depth, to the host of each side,
+		// and the hold invoice ends paid with nothing parked.
+		expect(parkedOf(pair.bob, held.paymentHash)).to.equal(1);
+		expect(outcomes).to.deep.equal({ alice: [], bob: [] });
+		await passTo(pair, pair.chain.height + IRREVOCABLE_DEPTH);
+		await world.mine(pair, 2);
+		await settle();
+		expect(outcomes.bob).to.deep.equal(['RECEIVED:fulfilled:5000']);
+		expect(outcomes.alice).to.deep.equal(['OFFERED:fulfilled:5000']);
+		expect(parkedOf(pair.bob, held.paymentHash)).to.equal(0);
+		expect(pair.bob.node.getPayment(held.paymentHash)!.status).to.equal(
+			PaymentStatus.COMPLETED
+		);
+		for (const host of [pair.alice, pair.bob]) {
+			expect(
+				host.node.getAuxiliaryChannelInfo(pair.channelId)
+					?.undeliveredOutcomes ?? 0
+			).to.equal(0);
+		}
+		// Told once: later blocks bring nothing more.
+		await world.mine(pair, 3);
+		expect(outcomes.bob).to.have.length(1);
+		expect(outcomes.alice).to.have.length(1);
 	});
 
 	it('claims by preimage, on the commitment of its peer, an HTLC whose hold invoice was settled before the force close: first heard of in block h, the split is in block h+1 and the claim in block h+2', async () => {
 		const pair = await opened('aux-htlc-claim-before');
 		const held = await holdUnits(pair, 5000n, 'claim before');
 		disconnect(pair);
+		// A channel whose peer is gone is not in its normal state: the
+		// force close at the claim deadline is not held back for it.
+		expect(
+			pair.bob.node
+				.getChannelManager()
+				.getChannel(pair.channelId)!
+				.getFullState().state
+		).to.not.equal(ChannelState.NORMAL);
 		expect(
 			pair.bob.node.settleHeldHtlc(held.paymentHash, held.preimage)
 		).to.equal(false);
@@ -470,6 +530,22 @@ describe('the HTLCs of an asset channel on the chain (issue #2093 step 10)', fun
 			console.log(`[size] htlc_timeout ${claim.tx.virtualSize()}`);
 		}
 		expect(claim.tx.virtualSize()).to.be.closeTo(215, 1);
+
+		// The HTLC failed for both: each host is told at irrevocable depth,
+		// the payment ends failed and the hold invoice cancelled.
+		expect(outcomes).to.deep.equal({ alice: [], bob: [] });
+		await passTo(pair, pair.chain.height + IRREVOCABLE_DEPTH);
+		await world.mine(pair, 2);
+		await settle();
+		expect(outcomes.alice).to.deep.equal(['OFFERED:failed:5000']);
+		expect(outcomes.bob).to.deep.equal(['RECEIVED:failed:5000']);
+		expect(pair.alice.node.getPayment(held.paymentHash)!.status).to.equal(
+			PaymentStatus.FAILED
+		);
+		expect(parkedOf(pair.bob, held.paymentHash)).to.equal(0);
+		expect(pair.bob.node.getPayment(held.paymentHash)?.status).to.not.equal(
+			PaymentStatus.COMPLETED
+		);
 	});
 
 	it('says what its claim waits for while its wallet has no coin, goes on when one arrives, and finishes after a restart between the split and the claim', async () => {

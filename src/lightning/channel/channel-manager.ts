@@ -4282,6 +4282,9 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 				this.releaseHeldAuxiliarySpends(channelIdHex);
 			}
 			this.reconcileFixedOutputFees(channelIdHex);
+
+			this.recordAuxiliaryChainEndings(channelIdHex);
+
 			if (actions.length > 0) {
 				const channelId = Buffer.from(channelIdHex, 'hex');
 				this.processChainActions(channelId, actions);
@@ -11786,6 +11789,76 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 	private readonly _auxiliaryResolutionsInFlight = new Set<string>();
 
 	/**
+	 * Asset channels: put the ending of every HTLC that ended on the chain
+	 * in its channel's row and tell the host (onHtlcResolved), as for an
+	 * HTLC that left the channel off chain: the same list, the same count,
+	 * the same delivery. The channel's row is written before the output is
+	 * marked, so a crash between the two records the ending again and the
+	 * host, whose callback is idempotent by contract, is told twice and
+	 * never not at all. Called when an output is resolved for good and on
+	 * every block, which covers a restart.
+	 */
+	private recordAuxiliaryChainEndings(channelIdHex: string): void {
+		const monitor = this.monitors.get(channelIdHex);
+		const channel = this.channels.get(channelIdHex);
+		if (
+			!monitor ||
+			!channel ||
+			typeof monitor.auxiliaryHtlcEndings !== 'function' ||
+			!channel.getFullState().auxiliaryState
+		) {
+			return;
+		}
+		const channelId = Buffer.from(channelIdHex, 'hex');
+		const peerPubkey = this.getPeerForChannel(channelId);
+		let recorded = 0;
+		for (const ending of monitor.auxiliaryHtlcEndings()) {
+			if (ending.recorded) continue;
+			const kept = channel.recordAuxiliaryChainResolution(
+				ending.offered ? HtlcDirection.OFFERED : HtlcDirection.RECEIVED,
+				ending.htlcId,
+				ending.outcome
+			);
+			if (kept) {
+				if (!peerPubkey) continue;
+				try {
+					this.persistence.persist({ channel, peerPubkey, channelId });
+				} catch {
+					// Left unmarked: the next block records it again.
+					continue;
+				}
+			}
+			monitor.noteAuxiliaryHtlcEndingRecorded(ending.txid, ending.outputIndex);
+			recorded++;
+		}
+		if (recorded === 0) return;
+		this.emit('monitor:updated', channelIdHex, monitor);
+		this._notifyAuxiliaryResolutions(channel);
+	}
+
+	/**
+	 * Asset channels: how an HTLC ended on the chain, or undefined while it
+	 * has not, for a caller that keeps a record of its own for the HTLC.
+	 */
+	auxiliaryHtlcChainEnding(
+		channelId: Buffer,
+		direction: HtlcDirection,
+		htlcId: bigint
+	): 'fulfilled' | 'failed' | undefined {
+		const monitor = this.monitors.get(channelId.toString('hex'));
+		if (!monitor || typeof monitor.auxiliaryHtlcEndings !== 'function') {
+			return undefined;
+		}
+		return monitor
+			.auxiliaryHtlcEndings()
+			.find(
+				(ending) =>
+					ending.htlcId === htlcId &&
+					ending.offered === (direction === HtlcDirection.OFFERED)
+			)?.outcome;
+	}
+
+	/**
 	 * Tell the host of every asset HTLC that has left a channel
 	 * (onHtlcResolved). An outcome stays in the channel's row until the
 	 * callback returns for it, so one that throws, or a crash before it ran,
@@ -13000,6 +13073,9 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 
 				case ChainActionType.OUTPUT_RESOLVED:
 					this.retireFixedOutputFee(channelId, action.txid, action.outputIndex);
+
+					this.recordAuxiliaryChainEndings(channelId.toString('hex'));
+
 					this.emit(
 						'output:resolved',
 

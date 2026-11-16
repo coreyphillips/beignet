@@ -605,6 +605,7 @@ constructor chain.ChainBackendUnavailableError(message: string)
 class chain.ChainMonitor
 constructor chain.ChainMonitor(channelState: channel.IChannelState, destinationScript: Buffer, feeRatePerVbyte: number, revocationBasepointSecret: Buffer, paymentPrivkey: Buffer, network?: bitcoinjs-lib#Network, delayedPaymentBasepointSecret?: Buffer, htlcBasepointSecret?: Buffer)
 method chain.ChainMonitor.addPreimage(paymentHash: Buffer, preimage: Buffer): chain.ChainAction[]
+method chain.ChainMonitor.auxiliaryHtlcEndings(): Array<{ txid: string; outputIndex: number; htlcId: bigint; offered: boolean; outcome: 'fulfilled' | 'failed'; recorded: boolean; }>
 method chain.ChainMonitor.dropUnusedPreimages(heldElsewhere: ReadonlyMap<string, Buffer>): number
 method chain.ChainMonitor.fixedOutputFeeRaise(output: chain.ITrackedOutput, feeRatePerVbyte: number): chain.IFeeBumpAndBroadcastChainAction | undefined
 method chain.ChainMonitor.fixedOutputFeeResolved(txid: string, outputIndex: number, evenIfNotOpen?: boolean): { spendingTransaction?: Buffer; } | undefined
@@ -623,6 +624,7 @@ method chain.ChainMonitor.handleSpendUnconfirmed(txid: string, outputIndex: numb
 method chain.ChainMonitor.isCommitmentConfirmed(): boolean
 method chain.ChainMonitor.isCommitmentReverifyPending(): boolean
 method chain.ChainMonitor.isFullyResolved(): boolean
+method chain.ChainMonitor.noteAuxiliaryHtlcEndingRecorded(txid: string, outputIndex: number): void
 method chain.ChainMonitor.noteFixedOutputFeeRetired(txid: string, outputIndex: number): void
 method chain.ChainMonitor.noteFixedOutputFeeWait(txid: string, outputIndex: number, wait: { code: string; remedy?: string; message?: string; }, height?: number): void
 method chain.ChainMonitor.offerAuxiliarySweep(transaction: Buffer): boolean
@@ -900,6 +902,7 @@ property chain.ITrackedOutput.auxiliaryFeeFunding?: boolean
 property chain.ITrackedOutput.auxiliaryFeeRate?: number
 property chain.ITrackedOutput.auxiliaryFeeWait?: { code: string; remedy?: string; message?: string; sinceHeight: number; deadlineHeight?: number; }
 property chain.ITrackedOutput.auxiliaryHtlc?: { id: bigint; direction: channel.HtlcDirection; }
+property chain.ITrackedOutput.auxiliaryOutcomeRecorded?: true
 property chain.ITrackedOutput.auxiliaryParentData?: Buffer
 property chain.ITrackedOutput.auxiliaryParentTxHex?: string
 property chain.ITrackedOutput.auxiliaryRefusal?: string
@@ -1237,6 +1240,7 @@ method channel.Channel.rebuildAnnouncement(localNodeId: Buffer, remoteNodeId: Bu
 method channel.Channel.receivedHtlcExceedsDustExposure(htlcId: bigint): boolean
 method channel.Channel.receivedHtlcExceedsFunderFee(htlcId: bigint): boolean
 method channel.Channel.receivedHtlcExpiredOnArrival(htlcId: bigint): boolean
+method channel.Channel.recordAuxiliaryChainResolution(direction: channel.HtlcDirection, htlcId: bigint, outcome: 'fulfilled' | 'failed'): boolean
 method channel.Channel.recordAuxiliaryCloseCandidate(txid: string, customData: Buffer): void
 method channel.Channel.recordCloseReason(reason: channel.ChannelCloseReason): boolean
 method channel.Channel.recordCooperativeCloseTx(txHex: string, localFeeSats?: bigint): void
@@ -1359,6 +1363,7 @@ method channel.ChannelManager.addTrustedPeer(pubkeyHex: string): void
 method channel.ChannelManager.armChannelIndexTipFloor(knownTipHeight?: number): void
 method channel.ChannelManager.attachToPeerManager(peerManager: transport.PeerManager): void
 method channel.ChannelManager.autoSignAndSendCommitment(channelId: Buffer): channel.ChannelResult
+method channel.ChannelManager.auxiliaryHtlcChainEnding(channelId: Buffer, direction: channel.HtlcDirection, htlcId: bigint): 'fulfilled' | 'failed' | undefined
 method channel.ChannelManager.bumpCloseFee(channelId: Buffer, feeSatoshis: bigint): channel.ChannelResult
 method channel.ChannelManager.canOpenZeroConfTo(pubkeyHex: string): boolean
 get channel.ChannelManager.channelIndexTipFloorArmed(): boolean

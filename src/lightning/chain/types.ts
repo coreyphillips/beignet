@@ -118,6 +118,13 @@ export interface ITrackedOutput {
 	 * and the action it keeps for it has not been retired yet.
 	 */
 	auxiliaryFeeActionOpen?: true;
+
+	/**
+	 * Asset channels: the ending of this HTLC on the chain was put in the
+	 * channel's row for its host (onHtlcResolved).
+	 */
+	auxiliaryOutcomeRecorded?: true;
+
 	/**
 	 * The spend of this output waits for a fee input: the code and the
 	 * remedy the fee pool gave, the height at which the wait began, and,

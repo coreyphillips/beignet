@@ -24388,6 +24388,9 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	 */
 	private scanExpiringHeldHtlcs(height: number): void {
 		if (height <= 0) return;
+
+		this.endAssetHoldsEndedOnChain();
+
 		this.resolveAssetHoldsLeftBehind(height);
 		// A set with an outcome already chosen retries that outcome instead:
 		// the expiry cancel would fail back parts whose preimage is out.
@@ -32983,6 +32986,96 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	}
 
 	/**
+	 * Asset channels: a held HTLC whose channel went on chain has ended
+	 * there (issue #2093 step 10). Claimed with the preimage, its invoice
+	 * ends paid as a settled hold does; taken back by the payer, it ends
+	 * cancelled. Nothing stays parked. Read from the chain monitor on every
+	 * block, so a restart loses none.
+	 */
+	private endAssetHoldsEndedOnChain(): void {
+		for (const [hashHex, held] of [...this.heldHtlcs]) {
+			if (held.length === 0 || this.resolvingHeldHtlcs.has(hashHex)) continue;
+			const ended = held
+				.map((h) => ({
+					h,
+					outcome: this.channelManager.auxiliaryHtlcChainEnding(
+						h.channelId,
+						HtlcDirection.RECEIVED,
+						h.htlcId
+					)
+				}))
+				.filter((part) => part.outcome !== undefined);
+			if (ended.length === 0) continue;
+			const gone = ended.map((part) => part.h);
+			const remaining = held.filter((h) => !gone.includes(h));
+			if (remaining.length > 0) {
+				this.heldHtlcs.set(hashHex, remaining);
+				this.persistHeldHtlcs();
+				continue;
+			}
+			this.heldHtlcs.delete(hashHex);
+			this.heldResolutions.delete(hashHex);
+			this.heldInvoiceHashes.delete(hashHex);
+			this.persistHeldHtlcs();
+			const paymentHash = Buffer.from(hashHex, 'hex');
+			const amountMsat = gone.reduce((sum, h) => sum + h.amountMsat, 0n);
+			const paid = ended.every((part) => part.outcome === 'fulfilled');
+			this.emitStructuredLog('htlc', 'held_asset_htlc_ended_on_chain', {
+				paymentHash: hashHex,
+				outcome: paid ? 'fulfilled' : 'failed'
+			});
+			if (!paid) {
+				this.markHoldInvoiceCancelled(
+					hashHex,
+					'expiry-scan',
+					gone.length,
+					amountMsat,
+					gone
+				);
+				continue;
+			}
+			const payment = this.payments.get(hashHex);
+			if (payment && payment.status !== PaymentStatus.COMPLETED) {
+				payment.status = PaymentStatus.COMPLETED;
+				const preimage = this.preimages.get(hashHex);
+				if (preimage) payment.preimage = preimage;
+				payment.completedAt = Date.now();
+				payment.settledHtlcs = gone.map(
+					(h) => `${h.channelId.toString('hex')}:${h.htlcId}`
+				);
+				if (payment.amountMsat === 0n) payment.amountMsat = amountMsat;
+				recordReceivedMsat(payment, amountMsat);
+				payment.auxiliary = true;
+				const invoice = this.invoices.get(hashHex);
+				if (invoice && invoice.auxiliary !== true) {
+					invoice.auxiliary = true;
+					this.commitMutations(
+						'markAuxiliaryInvoice',
+						[{ type: 'invoice_state', paymentHash: hashHex, invoice }],
+						RecoveryCriticality.Important
+					);
+				}
+				this.safeStorage(
+					() => this.persistPayment(paymentHash),
+					'persistPayment'
+				);
+				this.emit('payment:received', payment);
+				this.emitInvoiceSettled(paymentHash, payment);
+			}
+			this.emitHoldInvoiceEvent({
+				name: 'hold:settled',
+				event: {
+					paymentHash,
+					state: 'SETTLED',
+					heldAmountMsat: amountMsat,
+					htlcCount: gone.length,
+					...this.heldSetExpiry(hashHex, gone)
+				}
+			});
+		}
+	}
+
+	/**
 	 * Scan all channels for received HTLCs that are close to expiry.
 	 * Auto-fail any that are within the safety margin. Separately, force-close to
 	 * claim any inbound HTLC we already hold the preimage for (or that is
@@ -33102,6 +33195,29 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				// walks were signed in by construction, and absent reads as
 				// signed in.
 				const notInOurCommitment = htlc.addLocallyRevoked === false;
+
+				// Asset channels: an HTLC with units whose preimage this node
+				// holds and whose fulfil it has not made, on a channel whose
+				// peer is connected, is one its own asset provider refused to
+				// settle. That is not the peer's doing, and a claim on the
+				// chain would ask the same provider. The settlement is retried
+				// on every block and given up at the HTLC's expiry
+				// (retryAuxiliaryOwed, resolveAssetHoldsLeftBehind), and
+				// neither arm below acts on it: the channel is kept. A fulfil
+				// the peer does not take, and a peer that is not there, are
+				// closed on as on any other channel.
+				if (
+					state.auxiliaryState !== undefined &&
+					htlc.auxiliaryAmount !== undefined &&
+					htlc.state !== HtlcState.FULFILLED &&
+					state.state === ChannelState.NORMAL &&
+					!parkedHold &&
+					paymentHashHex !== undefined &&
+					this.preimages.has(paymentHashHex)
+				) {
+					continue;
+				}
+
 				const haveClaim =
 					!notInOurCommitment &&
 					!parkedHold &&
