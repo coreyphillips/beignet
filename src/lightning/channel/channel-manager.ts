@@ -6,6 +6,8 @@
  * Channel state machine to the actual transport layer.
  */
 
+import { auxiliaryUnsupported } from './auxiliary-guard';
+import { auxiliaryChannelOpens } from './auxiliary-switch';
 import { TypedEmitter } from '../../utils/typed-emitter';
 import type { TxidHex } from '../../utils/identifiers';
 import type { ChannelManagerEvents } from './events';
@@ -126,6 +128,22 @@ import { buildTaprootAnchorOutput } from '../script/commitment-taproot';
 import { ecc } from '../../utils/ecc';
 import type { ISpliceWalletInput, ITaprootClosingCache } from './channel';
 import { Channel } from './channel';
+import type { IAuxiliaryOpeningCsvState } from './auxiliary';
+import {
+	auxiliaryCsvPolicyError,
+	createAuxiliaryOpeningCsvPolicy
+} from './auxiliary-csv';
+import type {
+	IAuxiliaryChannelConfig,
+	IAuxiliaryFundingDescriptor
+} from './auxiliary-funding';
+import {
+	MAX_AUXILIARY_FUNDING_DATA_BYTES,
+	applyAuxiliaryFunding,
+	auxiliaryCarrierError,
+	auxiliaryDustLimit,
+	validateAuxiliaryFunding
+} from './auxiliary-funding';
 import type { IChannelState } from './channel-state';
 import { createOpenerState, createAcceptorState } from './channel-state';
 import {
@@ -147,7 +165,9 @@ import {
 	scidAliasAnnounceRefusal,
 	validateV2ChannelType,
 	MAX_FUNDING_SATOSHIS,
-	MAX_WUMBO_FUNDING_SATOSHIS
+	MAX_WUMBO_FUNDING_SATOSHIS,
+	isOverlayChannel,
+	isFixedAssetHtlcChannel
 } from './types';
 import type { IChannelBasepoints } from '../keys/derivation';
 import {
@@ -345,6 +365,32 @@ interface IBarrierQueue {
 	batches: IHeldBatch[];
 }
 
+/** How long the host may take to validate one step of an asset opening. */
+const AUXILIARY_FUNDING_GATE_TIMEOUT_MS = 120_000;
+/** The most asset opening steps that may wait on the host at once. */
+const MAX_AUXILIARY_FUNDING_GATES = 64;
+
+/**
+ * A failure of the host's own callbacks, or of what they returned, while an
+ * inbound asset opening is judged. Kept apart from the node's own refusals
+ * because its text is never sent to a peer.
+ */
+class AuxiliaryHostError extends Error {
+	constructor(cause: unknown) {
+		super(cause instanceof Error ? cause.message : String(cause));
+		this.name = 'AuxiliaryHostError';
+	}
+}
+
+/** Run one host callback, marking whatever it throws as the host's. */
+function askAuxiliaryHost<T>(ask: () => T): T {
+	try {
+		return ask();
+	} catch (err) {
+		throw err instanceof AuxiliaryHostError ? err : new AuxiliaryHostError(err);
+	}
+}
+
 export interface IChannelManagerConfig {
 	/**
 	 * Where each batch's PERSIST_STATE commits before the sends it authorizes
@@ -353,6 +399,20 @@ export interface IChannelManagerConfig {
 	 * those sends. LightningNode supplies one backed by its storage.
 	 */
 	persistence: IChannelPersistence;
+	/**
+	 * Asset channel support (issue #2093). Unset, the manager opens and
+	 * accepts ordinary channels only and none of the asset code runs.
+	 */
+	auxiliaryChannels?: IAuxiliaryChannelConfig;
+	/**
+	 * What a peer advertised in its init, for the asset channel checks. A
+	 * node always supplies this, and with it an asset opening is refused
+	 * whenever the peer's features, or this node's own, cannot be read. A
+	 * manager driven without a node falls back to its peer manager, and
+	 * with neither (tests and in-process harnesses that exchange no init)
+	 * has nothing to consult.
+	 */
+	auxiliaryPeerFeatures?(peerPubkey: string): FeatureFlags | undefined;
 	zeroReserve?: import('./zero-reserve').IZeroReserveConfig;
 	/** Durable book lookup supplied by the node's voucher custody index. */
 	fforVoucherLookup?: (paymentHash: string) => IFforVoucherArchive | undefined;
@@ -1139,6 +1199,25 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		);
 		const refused = actions.some((a) => a.type === ChannelActionType.ERROR);
 		if (refused && !accepted) this._releaseUnusedChannelIndex(channelIndex);
+		// An asset opening is answered only once the host has finished its
+		// own side of it; the accept waits, and is dropped if that fails.
+		const beforeAccept = this.config.auxiliaryChannels?.beforeAccept;
+		if (
+			accepted &&
+			!refused &&
+			beforeAccept &&
+			channel.getFullState().auxiliaryState
+		) {
+			this.gateAuxiliaryFunding(
+				peerPubkey,
+				channel,
+				'accept',
+				Buffer.alloc(0),
+				() => beforeAccept(channel, peerPubkey),
+				() => this.processActions(peerPubkey, channel, actions)
+			);
+			return;
+		}
 		this.processActions(peerPubkey, channel, actions);
 	}
 
@@ -1304,6 +1383,9 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 	 * Detach from the PeerManager.
 	 */
 	detachFromPeerManager(): void {
+		for (const timer of this.auxiliaryFundingTimers) clearTimeout(timer);
+		this.auxiliaryFundingTimers.clear();
+		this.auxiliaryFundingGates.clear();
 		this.peerManager = null;
 		for (const timer of this.quiescenceTimers.values()) {
 			clearTimeout(timer);
@@ -1460,7 +1542,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		fundingSatoshis: bigint,
 		pushMsat?: bigint,
 		beforeNegotiate?: (temporaryChannelId: Buffer) => void,
-		opts?: { trusted?: boolean }
+		opts?: { trusted?: boolean; auxiliary?: IAuxiliaryFundingDescriptor }
 	): Channel {
 		peerPubkey = normalizeHexPubkey(peerPubkey);
 		// Verify peer is connected before creating channel state
@@ -1477,15 +1559,38 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			);
 		}
 
+		// An asset opening is settled first: its descriptor, the HTLC mode
+		// agreed with the peer and its CSV policy can each refuse it, and a
+		// refusal here has not spent a key index.
+		const auxiliaryOpen = opts?.auxiliary
+			? this.prepareAuxiliaryOpen(
+					peerPubkey,
+					opts.auxiliary,
+					fundingSatoshis,
+					pushMsat || 0n
+			  )
+			: undefined;
+		const baseConfig = this.config.localConfig || DEFAULT_CHANNEL_CONFIG;
+
 		const chKeys = this.deriveKeysForNewChannel();
 		const state = createOpenerState({
-			temporaryChannelId: randomBytes(32),
+			temporaryChannelId: opts?.auxiliary
+				? Buffer.from(opts.auxiliary.temporaryChannelId)
+				: randomBytes(32),
 			fundingSatoshis,
 			pushMsat: pushMsat || 0n,
-			localConfig: this.config.localConfig || DEFAULT_CHANNEL_CONFIG,
+			localConfig: auxiliaryOpen?.csvPolicy
+				? { ...baseConfig, toSelfDelay: auxiliaryOpen.csvPolicy.localDelay }
+				: baseConfig,
 			localBasepoints: chKeys.basepoints,
 			localPerCommitmentSeed: chKeys.perCommitmentSeed
 		});
+		if (opts?.auxiliary) {
+			applyAuxiliaryFunding(state, opts.auxiliary);
+			if (auxiliaryOpen?.csvPolicy) {
+				state.auxiliaryState!.openingCsvPolicy = auxiliaryOpen.csvPolicy;
+			}
+		}
 
 		if (opts?.trusted) {
 			state.zeroConfEnabled = true;
@@ -1498,7 +1603,11 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			chKeys.fundingPrivkey,
 			chKeys.htlcBasepointSecret
 		);
-		const channel = new Channel(state, signer);
+		const channel = new Channel(
+			state,
+			signer,
+			this.config.auxiliaryChannels?.provider
+		);
 		channel.setBlockHeight(this._currentBlockHeight);
 		if (this.config.chainHash) {
 			channel.announcementChainHash = this.config.chainHash;
@@ -1522,7 +1631,13 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		const actions = channel.initiateOpen(
 			this.config.chainHash,
 			this.config.preferAnchors,
-			this.config.preferTaproot
+			this.config.preferTaproot,
+			auxiliaryOpen
+				? {
+						fixedHtlcOutputs: auxiliaryOpen.fixed,
+						childCustody: auxiliaryOpen.childCustody
+				  }
+				: undefined
 		);
 		this.processActions(peerPubkey, channel, actions);
 
@@ -1600,6 +1715,16 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 	): Buffer | null {
 		const peerPubkey = this.findPeerForChannel(channel);
 		if (!peerPubkey) return null;
+		const csvState = channel.getFullState();
+		const csvError = auxiliaryCsvPolicyError(
+			csvState.auxiliaryState?.openingCsvPolicy,
+			csvState.localConfig.toSelfDelay,
+			csvState.remoteConfig.toSelfDelay
+		);
+		if (csvError) {
+			this.abortPendingOpen(channel, csvError);
+			return null;
+		}
 		const proposedChannelId = deriveChannelId(fundingTxid, fundingOutputIndex);
 		if (
 			!this.channelIdAvailableForLifecycle(
@@ -1630,11 +1755,24 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			if (isTaprootChannel(fundingState.channelType)) {
 				// option_taproot: co-sign the acceptor's commitment #0 with a MuSig2
 				// partial signature instead of ECDSA.
-				partialSignatureWithNonce = this.signFundingPartial(
-					fundingState,
-					signer,
-					fundingState.remoteCurrentPerCommitmentPoint
-				);
+				try {
+					partialSignatureWithNonce = this.signFundingPartial(
+						fundingState,
+						signer,
+						fundingState.remoteCurrentPerCommitmentPoint
+					);
+				} catch (err) {
+					// The provider of an asset channel can refuse its first
+					// commitment. Nothing has been sent for this funding, so the
+					// opening ends here, by name, instead of staying half open.
+					if (!fundingState.auxiliaryState) throw err;
+					const detail = err instanceof Error ? err.message : String(err);
+					const temporaryId = channel.getTemporaryChannelId().toString('hex');
+					this.abortPendingOpen(channel, 'Asset channel funding failed');
+					throw new Error(
+						`Asset channel funding failed (channel ${temporaryId}): ${detail}`
+					);
+				}
 			} else {
 				const signed = signRemoteCommitment(
 					fundingState,
@@ -3333,6 +3471,15 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		const channelIdHex = channelId.toString('hex');
 		let monitor = this.monitors.get(channelIdHex);
 		const owner = this.channels.get(channelIdHex);
+		// An asset channel's commitment is not read with an ordinary
+		// channel's eyes: nothing here would find its outputs.
+		const assetRefusal =
+			owner &&
+			auxiliaryUnsupported(owner.getFullState(), 'on-chain resolution');
+		if (assetRefusal) {
+			this.emitContained('error', channelId, assetRefusal.message);
+			return [];
+		}
 
 		// Which funding the spend consumed decides the view the monitor
 		// classifies it against (issue #764): the peer's second-level HTLC
@@ -4021,7 +4168,11 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 					this.handleAcceptChannel(peerPubkey, payload);
 					break;
 				case MessageType.FUNDING_CREATED:
-					this.handleFundingCreated(peerPubkey, payload);
+					if (this.config.auxiliaryChannels?.beforeFundingCreated) {
+						this.handleAuxiliaryFundingCreated(peerPubkey, payload);
+					} else {
+						this.handleFundingCreated(peerPubkey, payload);
+					}
 					break;
 				case MessageType.FUNDING_SIGNED:
 					this.handleFundingSigned(peerPubkey, payload);
@@ -4250,6 +4401,30 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			);
 			return;
 		}
+		// Asset channels (issue #2093). Only a node with a provider looks:
+		// without one this does not run, and an open of the overlay type is
+		// refused by the channel like any type this node cannot build.
+		let auxiliaryOpen:
+			| ReturnType<ChannelManager['resolveIncomingAuxiliaryOpen']>
+			| undefined;
+		if (this.config.auxiliaryChannels) {
+			try {
+				auxiliaryOpen = this.resolveIncomingAuxiliaryOpen(peerPubkey, msg);
+			} catch (err) {
+				// What the host threw, or described wrongly, is this node's to
+				// know and never the peer's to read.
+				const detail = err instanceof Error ? err.message : String(err);
+				this.refuseInboundOpen(
+					peerPubkey,
+					msg.temporaryChannelId,
+					`open_channel refused: ${detail}`,
+					err instanceof AuxiliaryHostError
+						? 'open_channel refused: the asset channel could not be accepted'
+						: `open_channel refused: ${detail}`
+				);
+				return;
+			}
+		}
 		// Issue #906: the index is consumed HERE, ahead of the parameter
 		// validation the channel does below (amount, reserve, dust, feerate,
 		// channel_type), so an open that never becomes a channel must give
@@ -4266,7 +4441,12 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 				temporaryChannelId: msg.temporaryChannelId,
 				fundingSatoshis: msg.fundingSatoshis,
 				pushMsat: msg.pushMsat,
-				localConfig: this.config.localConfig || DEFAULT_CHANNEL_CONFIG,
+				localConfig: auxiliaryOpen?.csvPolicy
+					? {
+							...(this.config.localConfig || DEFAULT_CHANNEL_CONFIG),
+							toSelfDelay: auxiliaryOpen.csvPolicy.localDelay
+					  }
+					: this.config.localConfig || DEFAULT_CHANNEL_CONFIG,
 				localBasepoints: chKeys.basepoints,
 				localPerCommitmentSeed: chKeys.perCommitmentSeed,
 				remoteBasepoints: {
@@ -4293,7 +4473,17 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 				chKeys.fundingPrivkey,
 				chKeys.htlcBasepointSecret
 			);
-			channel = new Channel(state, signer);
+			if (auxiliaryOpen) {
+				applyAuxiliaryFunding(state, auxiliaryOpen.descriptor);
+				if (auxiliaryOpen.csvPolicy) {
+					state.auxiliaryState!.openingCsvPolicy = auxiliaryOpen.csvPolicy;
+				}
+			}
+			channel = new Channel(
+				state,
+				signer,
+				this.config.auxiliaryChannels?.provider
+			);
 			channel.setBlockHeight(this._currentBlockHeight);
 			if (this.config.chainHash) {
 				channel.announcementChainHash = this.config.chainHash;
@@ -4367,6 +4557,390 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		}
 	}
 
+	// ─────────────── Asset channel opening (issue #2093) ───────────────
+
+	/**
+	 * The asset HTLC mode a new asset channel with this peer would have,
+	 * without opening anything: for a host to check before its wallet
+	 * prepares funding. Throws where the opening itself would be refused.
+	 */
+	getAuxiliaryHtlcMode(peerPubkey: string): 'fixed' | 'legacy' {
+		peerPubkey = normalizeHexPubkey(peerPubkey);
+		const config = this.config.auxiliaryChannels;
+		if (!config) throw new Error('Asset channel provider is required');
+		if (this.peerManager && !this.peerManager.getPeer(peerPubkey)) {
+			throw new PeerError(
+				PeerErrorCode.NOT_CONNECTED,
+				`Not connected to peer ${peerPubkey}`
+			);
+		}
+		const mode = this.negotiateAuxiliaryHtlcMode(peerPubkey);
+		createAuxiliaryOpeningCsvPolicy(
+			config.openingCsvPolicy?.(peerPubkey),
+			(this.config.localConfig || DEFAULT_CHANNEL_CONFIG).toSelfDelay
+		);
+		return mode.fixed ? 'fixed' : 'legacy';
+	}
+
+	/**
+	 * Replace the asset funding data of an opening that has not signed
+	 * anything yet, once the host holds the proofs it could only assemble
+	 * after the peer accepted. Refused from the first signature on.
+	 */
+	setAuxiliaryFundingData(
+		peerPubkey: string,
+		temporaryChannelId: Buffer,
+		data: Buffer
+	): void {
+		peerPubkey = normalizeHexPubkey(peerPubkey);
+		const channel = this.tempChannels.get(temporaryChannelId.toString('hex'));
+		if (!channel || this.findPeerForChannel(channel) !== peerPubkey) {
+			throw new Error('Asset funding peer or channel mismatch');
+		}
+		const state = channel.getFullState();
+		if (
+			!state.auxiliaryState ||
+			state.fundingTxid ||
+			(state.state !== ChannelState.SENT_OPEN &&
+				state.state !== ChannelState.SENT_ACCEPT) ||
+			state.auxiliaryState.localCommitments.size > 0 ||
+			state.auxiliaryState.remoteCommitments.size > 0
+		) {
+			throw new Error('Asset funding data is already committed');
+		}
+		if (
+			!Buffer.isBuffer(data) ||
+			data.length === 0 ||
+			data.length > MAX_AUXILIARY_FUNDING_DATA_BYTES
+		) {
+			throw new Error('Invalid asset funding data size');
+		}
+		// Kept in memory only: a channel has no row before it has a channel
+		// id, and this one gets its id, and its first write, at funding.
+		state.auxiliaryState.channelData = Buffer.from(data);
+	}
+
+	/**
+	 * The asset HTLC mode of a new asset channel with this peer, or a throw
+	 * that refuses the opening. Both sides have to advertise the overlay.
+	 * Fixed HTLC outputs are used when both advertise them, and then need a
+	 * funding provider that can prepare their fees; otherwise the host has
+	 * to allow the older signatures for this peer. Child custody rides on
+	 * fixed outputs only. A proposed type has to say exactly what was
+	 * agreed: neither mode is taken from, or given up to, the peer's word.
+	 */
+	private negotiateAuxiliaryHtlcMode(
+		peerPubkey: string,
+		proposed?: Buffer
+	): { fixed: boolean; childCustody: boolean } {
+		const config = this.config.auxiliaryChannels;
+		if (!config) throw new Error('Asset channel provider is required');
+		const local = this.config.localFeatures;
+		let remote: FeatureFlags | undefined;
+		if (this.config.auxiliaryPeerFeatures) {
+			// Driven by a node: both feature sets have to be there to read.
+			remote = this.config.auxiliaryPeerFeatures(peerPubkey);
+			if (!local || !remote) {
+				throw new Error('Asset channel peer features cannot be read');
+			}
+		} else if (this.peerManager) {
+			remote = this.peerManager.getPeer(peerPubkey)?.getRemoteInit()?.features;
+			if (!remote) {
+				throw new Error('Asset channel peer feature negotiation is incomplete');
+			}
+		}
+		// Otherwise this manager is driven directly, with no node and no peer
+		// manager: the path of tests and in-process harnesses, which exchange
+		// no init. There is nothing to consult, and only what is known is
+		// checked. A node never takes this path (auxiliaryPeerFeatures).
+		if (local && !local.hasFeature(Feature.OPTION_TAPROOT_OVERLAY)) {
+			throw new Error('This node does not advertise asset channels');
+		}
+		if (remote && !remote.hasFeature(Feature.OPTION_TAPROOT_OVERLAY)) {
+			throw new Error('Peer did not advertise asset channels');
+		}
+		const both = (feature: Feature): boolean =>
+			local?.hasFeature(feature) === true &&
+			remote?.hasFeature(feature) === true;
+		const fixed = both(Feature.OPTION_ASSET_FIXED_HTLC_OUTPUTS);
+		const childCustody =
+			fixed &&
+			config.allowRevokedChildCustody === true &&
+			both(Feature.OPTION_ASSET_CHILD_CUSTODY);
+		if (childCustody && !config.provider.prepareRevokedChild) {
+			throw new Error(
+				'Child custody requires an asset recovery capsule provider'
+			);
+		}
+		if (proposed) {
+			if (isFixedAssetHtlcChannel(proposed) !== fixed) {
+				throw new Error(
+					fixed
+						? 'Fixed asset HTLC outputs cannot be downgraded'
+						: 'Fixed asset HTLC outputs were not mutually negotiated'
+				);
+			}
+			if (
+				FeatureFlags.fromBuffer(proposed).hasFeature(
+					Feature.OPTION_ASSET_CHILD_CUSTODY
+				) !== childCustody
+			) {
+				throw new Error('Asset child custody mode was not mutually selected');
+			}
+		}
+		if (fixed) {
+			if (this.fundingProvider?.supportsFixedOutputFees?.() !== true) {
+				throw new Error(
+					'Fixed asset HTLC outputs require durable bounded fee preparation'
+				);
+			}
+		} else if (
+			askAuxiliaryHost(() => config.allowLegacyHtlcSignatures?.(peerPubkey)) !==
+			true
+		) {
+			throw new Error(
+				'New asset channels require fixed HTLC outputs or explicit peer compatibility'
+			);
+		}
+		return { fixed, childCustody };
+	}
+
+	/** Everything that can refuse an asset opening of ours, before any key is derived. */
+	private prepareAuxiliaryOpen(
+		peerPubkey: string,
+		descriptor: IAuxiliaryFundingDescriptor,
+		fundingSatoshis: bigint,
+		pushMsat: bigint
+	): {
+		fixed: boolean;
+		childCustody: boolean;
+		csvPolicy: IAuxiliaryOpeningCsvState | undefined;
+	} {
+		const config = this.config.auxiliaryChannels;
+		if (!config) throw new Error('Asset channel provider is required');
+		if (!auxiliaryChannelOpens.enabled) {
+			throw new Error('Asset channels are not enabled in this build');
+		}
+		validateAuxiliaryFunding(descriptor);
+		if (this.channelIdInUse(descriptor.temporaryChannelId.toString('hex'))) {
+			throw new Error('Temporary channel id is already in use');
+		}
+		// The peer's dust limit is not known before it answers; the channel
+		// asks again with it when the accept arrives.
+		const baseConfig = this.config.localConfig || DEFAULT_CHANNEL_CONFIG;
+		const carrierError = auxiliaryCarrierError({
+			fundingSatoshis,
+			pushMsat,
+			feeratePerKw: baseConfig.feeratePerKw,
+			openerAssetBalance: descriptor.localBalance,
+			acceptorAssetBalance: descriptor.remoteBalance,
+			dustLimitSatoshis: auxiliaryDustLimit(baseConfig.dustLimitSatoshis)
+		});
+		if (carrierError) throw new Error(carrierError);
+		const mode = this.negotiateAuxiliaryHtlcMode(peerPubkey);
+		const csvPolicy = createAuxiliaryOpeningCsvPolicy(
+			config.openingCsvPolicy?.(peerPubkey),
+			(this.config.localConfig || DEFAULT_CHANNEL_CONFIG).toSelfDelay
+		);
+		return { ...mode, csvPolicy };
+	}
+
+	/**
+	 * The asset funding of an inbound open_channel, undefined for an
+	 * ordinary open, or a throw that refuses it. An open that does not
+	 * propose the overlay type is an ordinary open and nothing more is asked
+	 * about it: the host is not consulted, so nothing a host does can touch
+	 * an ordinary channel. An open that does propose it is an asset opening,
+	 * and is refused unless the host's asset protocol announced one for this
+	 * peer and temporary id, so an overlay channel never opens without its
+	 * funding.
+	 */
+	private resolveIncomingAuxiliaryOpen(
+		peerPubkey: string,
+		msg: ReturnType<typeof decodeOpenChannelMessage>
+	):
+		| {
+				descriptor: IAuxiliaryFundingDescriptor;
+				csvPolicy: IAuxiliaryOpeningCsvState | undefined;
+		  }
+		| undefined {
+		if (!isOverlayChannel(msg.channelType)) return undefined;
+		if (!auxiliaryChannelOpens.enabled) {
+			throw new Error('asset channels are not enabled');
+		}
+		const config = this.config.auxiliaryChannels!;
+		const descriptor = askAuxiliaryHost(() => {
+			const answer = config.resolveIncoming(
+				peerPubkey,
+				Buffer.from(msg.temporaryChannelId)
+			);
+			if (answer) validateAuxiliaryFunding(answer);
+			return answer;
+		});
+		if (!descriptor) {
+			throw new Error('no asset funding was negotiated for this channel');
+		}
+		if (!descriptor.temporaryChannelId.equals(msg.temporaryChannelId)) {
+			throw new AuxiliaryHostError(new Error('Invalid asset funding identity'));
+		}
+		const baseConfig = this.config.localConfig || DEFAULT_CHANNEL_CONFIG;
+		const localDust = auxiliaryDustLimit(baseConfig.dustLimitSatoshis);
+		const carrierError = auxiliaryCarrierError({
+			fundingSatoshis: msg.fundingSatoshis,
+			pushMsat: msg.pushMsat,
+			feeratePerKw: msg.feeratePerKw,
+			openerAssetBalance: descriptor.remoteBalance,
+			acceptorAssetBalance: descriptor.localBalance,
+			dustLimitSatoshis:
+				msg.dustLimitSatoshis > localDust ? msg.dustLimitSatoshis : localDust
+		});
+		if (carrierError) throw new Error(carrierError);
+		this.negotiateAuxiliaryHtlcMode(peerPubkey, msg.channelType);
+		const csvPolicy = createAuxiliaryOpeningCsvPolicy(
+			askAuxiliaryHost(() => config.openingCsvPolicy?.(peerPubkey)),
+			baseConfig.toSelfDelay,
+			msg.toSelfDelay
+		);
+		return { descriptor, csvPolicy };
+	}
+
+	/** Host validations in flight, by peer, temporary channel id and stage. */
+	private readonly auxiliaryFundingGates = new Map<
+		string,
+		{ payload: Buffer; channel: Channel }
+	>();
+	private readonly auxiliaryFundingTimers = new Set<
+		ReturnType<typeof setTimeout>
+	>();
+
+	/**
+	 * Hold one step of an asset opening until the host's validation
+	 * settles, then run it, or abort the opening if the validation fails or
+	 * takes longer than two minutes. The same message arriving again while
+	 * it waits is ignored; a different one for the same step aborts the
+	 * opening. Nothing runs if the channel was replaced or removed meanwhile.
+	 */
+	private gateAuxiliaryFunding(
+		peerPubkey: string,
+		channel: Channel,
+		stage: string,
+		payload: Buffer,
+		prepare: () => Promise<void>,
+		proceed: () => void
+	): void {
+		const id = channel.getTemporaryChannelId().toString('hex');
+		const key = `${peerPubkey}:${id}:${stage}`;
+		const prior = this.auxiliaryFundingGates.get(key);
+		// A gate left by an opening this one replaced (the peer reconnected
+		// and proposed it again while the host was still looking at the
+		// first) is not this opening's: it is superseded below, and its
+		// outcome, when it comes, finds it is no longer current.
+		if (prior && prior.channel === channel) {
+			if (!prior.payload.equals(payload)) {
+				this.abortPendingOpen(channel, 'Conflicting asset funding message');
+			}
+			return;
+		}
+		if (
+			!prior &&
+			this.auxiliaryFundingGates.size >= MAX_AUXILIARY_FUNDING_GATES
+		) {
+			this.abortPendingOpen(
+				channel,
+				'Asset funding validation capacity exceeded'
+			);
+			return;
+		}
+		const copy = { payload: Buffer.from(payload), channel };
+		this.auxiliaryFundingGates.set(key, copy);
+		let timeout: ReturnType<typeof setTimeout> | undefined;
+		const expired = new Promise<never>((_, reject) => {
+			timeout = setTimeout(
+				() => reject(new Error('Asset funding validation timed out')),
+				AUXILIARY_FUNDING_GATE_TIMEOUT_MS
+			);
+			timeout.unref?.();
+			this.auxiliaryFundingTimers.add(timeout);
+		});
+		void Promise.race([Promise.resolve().then(prepare), expired])
+			.then(
+				() => true,
+				() => false
+			)
+			.then((validated) => {
+				if (timeout) {
+					clearTimeout(timeout);
+					this.auxiliaryFundingTimers.delete(timeout);
+				}
+				const current =
+					this.auxiliaryFundingGates.get(key) === copy &&
+					this.tempChannels.get(id) === channel &&
+					this.findPeerForChannel(channel) === peerPubkey;
+				if (this.auxiliaryFundingGates.get(key) === copy) {
+					this.auxiliaryFundingGates.delete(key);
+				}
+				if (!current) return;
+				if (!validated) {
+					this.abortPendingOpen(channel, 'Asset funding validation failed');
+					return;
+				}
+				try {
+					proceed();
+				} catch (err) {
+					// This runs outside handleMessage, so its catch is repeated.
+					const message = err instanceof Error ? err.message : String(err);
+					this.emitContained(
+						'error',
+						null,
+						`Error completing asset channel ${stage}: ${message}`
+					);
+					if (this.tempChannels.get(id) === channel) {
+						this.abortPendingOpen(channel, 'Asset funding could not proceed');
+					}
+				}
+			});
+	}
+
+	/**
+	 * funding_created for an asset opening waits for the host to validate
+	 * the funding proofs it was sent, before this node signs the opener's
+	 * first commitment. Any other funding_created goes straight on.
+	 */
+	private handleAuxiliaryFundingCreated(
+		peerPubkey: string,
+		payload: Buffer
+	): void {
+		const beforeFundingCreated =
+			this.config.auxiliaryChannels?.beforeFundingCreated;
+		let temporaryChannelId: Buffer | undefined;
+		try {
+			temporaryChannelId =
+				decodeFundingCreatedMessage(payload).temporaryChannelId;
+		} catch {
+			// handleFundingCreated reports an undecodable payload itself.
+		}
+		const channel = temporaryChannelId
+			? this.tempChannels.get(temporaryChannelId.toString('hex'))
+			: undefined;
+		if (
+			!beforeFundingCreated ||
+			!channel?.getFullState().auxiliaryState ||
+			this.findPeerForChannel(channel) !== peerPubkey
+		) {
+			this.handleFundingCreated(peerPubkey, payload);
+			return;
+		}
+		const held = Buffer.from(payload);
+		this.gateAuxiliaryFunding(
+			peerPubkey,
+			channel,
+			'funding-created',
+			held,
+			() => beforeFundingCreated(channel, peerPubkey),
+			() => this.handleFundingCreated(peerPubkey, held)
+		);
+	}
+
 	private handleFundingCreated(peerPubkey: string, payload: Buffer): void {
 		let msg: ReturnType<typeof decodeFundingCreatedMessage>;
 		try {
@@ -4423,11 +4997,26 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		if (isTaprootChannel(channelState.channelType)) {
 			// option_taproot: co-sign the opener's commitment #0 with a MuSig2
 			// partial signature instead of ECDSA.
-			partialSignatureWithNonce = this.signFundingPartial(
-				channelState,
-				signer,
-				channelState.remoteCurrentPerCommitmentPoint!
-			);
+			try {
+				partialSignatureWithNonce = this.signFundingPartial(
+					channelState,
+					signer,
+					channelState.remoteCurrentPerCommitmentPoint!
+				);
+			} catch (err) {
+				// As for the opener: an asset channel whose provider refuses its
+				// first commitment ends here, by name, and the peer is told.
+				if (!channelState.auxiliaryState) throw err;
+				const detail = err instanceof Error ? err.message : String(err);
+				const temporaryId = msg.temporaryChannelId.toString('hex');
+				this.abortPendingOpen(channel, 'Asset channel funding failed');
+				this.emitContained(
+					'error',
+					msg.temporaryChannelId,
+					`Asset channel funding failed (channel ${temporaryId}): ${detail}`
+				);
+				return;
+			}
 		} else {
 			signature = signRemoteCommitment(
 				channelState,

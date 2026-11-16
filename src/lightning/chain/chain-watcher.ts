@@ -1714,7 +1714,9 @@ export class ChainWatcher extends EventEmitter {
 		const fundingScript = isTaprootChannel(state.channelType)
 			? createTaprootFundingScript(
 					state.localBasepoints.fundingPubkey,
-					state.remoteBasepoints.fundingPubkey
+					state.remoteBasepoints.fundingPubkey,
+					undefined,
+					state.fundingTaprootMerkleRoot
 			  ).p2trOutput
 			: createFundingScript(
 					state.localBasepoints.fundingPubkey,

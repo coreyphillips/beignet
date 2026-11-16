@@ -10,6 +10,8 @@
  * `INodeConfig.auxiliaryChannels` runs none of it.
  */
 
+import { Feature, FeatureFlags } from '../features/flags';
+import { isOverlayChannel } from './types';
 import type * as bitcoin from 'bitcoinjs-lib';
 import type { ISigner } from '../keys/signer';
 import type { CustomRecords } from '../message/custom-records';
@@ -366,4 +368,58 @@ export function requireAuxiliaryProvider(
 		);
 	}
 	return state.auxiliaryProvider;
+}
+
+/**
+ * The most HTLCs either side of an asset channel may hold open. Every asset
+ * HTLC adds its proofs to what a commitment carries, and this is the count
+ * LND holds its asset channels to.
+ */
+export const MAX_AUXILIARY_HTLCS_PER_PARTY = 83;
+/** The dust limit of an asset channel: the 354 satoshi carrier of an asset HTLC. */
+export const AUXILIARY_CHANNEL_DUST_LIMIT = 354n;
+
+/**
+ * Why `channelType` cannot be the type of this channel's asset opening, or
+ * null when it can. Only for a channel that holds asset funding: the type
+ * has to be the overlay, with nothing beside it but the asset HTLC modes,
+ * scid_alias and zero_conf, and the channel has to be runnable as an asset
+ * channel. A channel without asset funding is not this function's to judge.
+ */
+export function validateAuxiliaryChannelType(
+	state: IChannelState,
+	channelType: Buffer | null | undefined
+): string | null {
+	if (!state.auxiliaryState && !state.fundingTaprootMerkleRoot) return null;
+	if (
+		!channelType ||
+		channelType.length === 0 ||
+		channelType[0] === 0 ||
+		!isOverlayChannel(channelType)
+	) {
+		return 'Asset channel requires the Taproot overlay channel type';
+	}
+	const allowed = new Set<number>([
+		Feature.OPTION_TAPROOT_OVERLAY,
+		Feature.OPTION_ASSET_FIXED_HTLC_OUTPUTS,
+		Feature.OPTION_ASSET_CHILD_CUSTODY,
+		Feature.SCID_ALIAS,
+		Feature.ZERO_CONF
+	]);
+	const flags = FeatureFlags.fromBuffer(channelType);
+	if (flags.listSetBits().some((bit) => !allowed.has(bit))) {
+		return 'Invalid Taproot overlay channel type';
+	}
+	if (
+		flags.hasBit(Feature.OPTION_ASSET_CHILD_CUSTODY) &&
+		!flags.hasBit(Feature.OPTION_ASSET_FIXED_HTLC_OUTPUTS)
+	) {
+		return 'Child custody requires fixed asset HTLC outputs';
+	}
+	try {
+		requireAuxiliaryProvider(state);
+	} catch {
+		return 'Asset channel funding context or provider is unavailable';
+	}
+	return null;
 }

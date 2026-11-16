@@ -128,7 +128,16 @@ import type {
 	IAuxiliaryCommitmentData,
 	IChannelAuxiliaryProvider
 } from './auxiliary';
-import { copyAuxiliaryCommitment, requireAuxiliaryProvider } from './auxiliary';
+import {
+	MAX_AUXILIARY_HTLCS_PER_PARTY,
+	copyAuxiliaryCommitment,
+	requireAuxiliaryProvider,
+	validateAuxiliaryChannelType
+} from './auxiliary';
+import { auxiliaryCsvPolicyError } from './auxiliary-csv';
+import { auxiliaryCarrierError } from './auxiliary-funding';
+import type { AuxiliaryUnsupportedOperation } from './auxiliary-guard';
+import { auxiliaryUnsupported } from './auxiliary-guard';
 import {
 	acceptChildRevocationRecord,
 	addChildRevocationRecord
@@ -1733,14 +1742,91 @@ export class Channel {
 	// ─────────────── Opening (Opener) ───────────────
 
 	/**
+	 * The refusal of something an asset channel does not do, as the actions
+	 * of a refusal, or null for any other channel. See auxiliary-guard.
+	 */
+	private _refuseForAssetChannel(
+		operation: AuxiliaryUnsupportedOperation
+	): ChannelAction[] | null {
+		const refusal = auxiliaryUnsupported(this._state, operation);
+		if (!refusal) return null;
+		return [
+			{
+				type: ChannelActionType.ERROR,
+				message: refusal.message,
+				code: ChannelErrorCode.UNSUPPORTED
+			}
+		];
+	}
+
+	/**
+	 * Why the peer's half of an asset channel opening is refused, or null:
+	 * the channel type, the delay it asks of us against the opening's CSV
+	 * policy, and the HTLC count it would hold us to accepting.
+	 */
+	private _auxiliaryOpeningError(
+		channelType: Buffer | null | undefined,
+		remoteToSelfDelay: number,
+		remoteMaxAcceptedHtlcs: number,
+		carrier: {
+			fundingSatoshis: bigint;
+			pushMsat: bigint;
+			feeratePerKw: number;
+			remoteDustLimitSatoshis: bigint;
+		}
+	): string | null {
+		const typeError = validateAuxiliaryChannelType(this._state, channelType);
+		if (typeError) return typeError;
+		const auxiliary = this._state.auxiliaryState;
+		if (auxiliary) {
+			// With both dust limits known, whether each side that holds asset
+			// units keeps an output on both first commitments: asked here, so an
+			// opening that cannot be committed to ends before its funding.
+			const weOpen = this._state.role === ChannelRole.OPENER;
+			const localDust = this._state.localConfig.dustLimitSatoshis;
+			const carrierError = auxiliaryCarrierError({
+				fundingSatoshis: carrier.fundingSatoshis,
+				pushMsat: carrier.pushMsat,
+				feeratePerKw: carrier.feeratePerKw,
+				openerAssetBalance: weOpen
+					? auxiliary.localBalance
+					: auxiliary.remoteBalance,
+				acceptorAssetBalance: weOpen
+					? auxiliary.remoteBalance
+					: auxiliary.localBalance,
+				dustLimitSatoshis:
+					carrier.remoteDustLimitSatoshis > localDust
+						? carrier.remoteDustLimitSatoshis
+						: localDust
+			});
+			if (carrierError) return carrierError;
+		}
+		const csvError = auxiliaryCsvPolicyError(
+			this._state.auxiliaryState?.openingCsvPolicy,
+			this._state.localConfig.toSelfDelay,
+			remoteToSelfDelay
+		);
+		if (csvError) return csvError;
+		if (remoteMaxAcceptedHtlcs > MAX_AUXILIARY_HTLCS_PER_PARTY) {
+			return `Asset channel max accepted HTLCs exceeds ${MAX_AUXILIARY_HTLCS_PER_PARTY}`;
+		}
+		return null;
+	}
+
+	/**
 	 * Initiate opening a channel. Sends open_channel.
 	 * @param chainHash - Optional chain hash (defaults to Bitcoin mainnet)
 	 * @param preferAnchors - If true, negotiate option_anchors_zero_fee_htlc_tx
+	 * @param preferTaproot - If true, negotiate simple taproot commitments
+	 * @param auxiliary - The asset HTLC modes agreed with the peer, for a
+	 *   channel that holds asset funding. Such a channel always opens as a
+	 *   taproot overlay channel, whatever the two preferences say.
 	 */
 	initiateOpen(
 		chainHash?: Buffer,
 		preferAnchors?: boolean,
-		preferTaproot?: boolean
+		preferTaproot?: boolean,
+		auxiliary: { fixedHtlcOutputs?: boolean; childCustody?: boolean } = {}
 	): ChannelAction[] {
 		if (this._state.state !== ChannelState.NONE) {
 			return [
@@ -1781,7 +1867,19 @@ export class Channel {
 		// lnd v0.20). Non-taproot keeps static_remotekey (bit 12) +
 		// option_anchors_zero_fee_htlc_tx (bit 22) when requested.
 		const channelTypeFlags = FeatureFlags.empty();
-		if (preferTaproot) {
+		if (this._state.auxiliaryState) {
+			// An asset channel is a taproot channel of a type of its own: the
+			// overlay bit alone, with the asset HTLC modes beside it. It is
+			// chosen by the channel, never by what the node prefers.
+			preferTaproot = true;
+			channelTypeFlags.setCompulsory(Feature.OPTION_TAPROOT_OVERLAY);
+			if (auxiliary.fixedHtlcOutputs) {
+				channelTypeFlags.setCompulsory(Feature.OPTION_ASSET_FIXED_HTLC_OUTPUTS);
+				if (auxiliary.childCustody) {
+					channelTypeFlags.setCompulsory(Feature.OPTION_ASSET_CHILD_CUSTODY);
+				}
+			}
+		} else if (preferTaproot) {
 			channelTypeFlags.setCompulsory(Feature.OPTION_TAPROOT);
 		} else {
 			channelTypeFlags.setCompulsory(Feature.STATIC_REMOTE_KEY);
@@ -2177,6 +2275,21 @@ export class Channel {
 		// ChannelManager keys tempChannels by.
 		const refuse = (reason: string): ChannelAction[] =>
 			refuseWithWireError(this._state.temporaryChannelId, reason);
+		if (this._state.auxiliaryState || this._state.fundingTaprootMerkleRoot) {
+			// A missing type is left to the check every channel gets below.
+			const auxiliaryError = this._auxiliaryOpeningError(
+				msg.channelType ?? this._state.channelType,
+				msg.toSelfDelay,
+				msg.maxAcceptedHtlcs,
+				{
+					fundingSatoshis: this._state.fundingSatoshis,
+					pushMsat: this._state.pushMsat,
+					feeratePerKw: this._state.localConfig.feeratePerKw,
+					remoteDustLimitSatoshis: msg.dustLimitSatoshis
+				}
+			);
+			if (auxiliaryError) return refuse(auxiliaryError);
+		}
 
 		// Validate the acceptor's parameters against what WE proposed in
 		// open_channel BEFORE adopting them. Without this an adversarial acceptor
@@ -2322,6 +2435,15 @@ export class Channel {
 					message: 'Cannot create funding: wrong state'
 				}
 			];
+		}
+
+		const csvError = auxiliaryCsvPolicyError(
+			this._state.auxiliaryState?.openingCsvPolicy,
+			this._state.localConfig.toSelfDelay,
+			this._state.remoteConfig.toSelfDelay
+		);
+		if (csvError) {
+			return refuseWithWireError(this._state.temporaryChannelId, csvError);
 		}
 
 		this._state.fundingTxid = fundingTxid;
@@ -2586,6 +2708,20 @@ export class Channel {
 		// demands, having been sliced from the wire by decodeOpenChannelMessage.
 		const refuse = (reason: string): ChannelAction[] =>
 			refuseWithWireError(msg.temporaryChannelId, reason);
+		if (this._state.auxiliaryState || this._state.fundingTaprootMerkleRoot) {
+			const auxiliaryError = this._auxiliaryOpeningError(
+				msg.channelType,
+				msg.toSelfDelay,
+				msg.maxAcceptedHtlcs,
+				{
+					fundingSatoshis: msg.fundingSatoshis,
+					pushMsat: msg.pushMsat,
+					feeratePerKw: msg.feeratePerKw,
+					remoteDustLimitSatoshis: msg.dustLimitSatoshis
+				}
+			);
+			if (auxiliaryError) return refuse(auxiliaryError);
+		}
 
 		// Peer-supplied, so the bounds that only apply to a value we did not
 		// choose run too. ChannelManager.handleOpenChannel has already seeded
@@ -2651,9 +2787,14 @@ export class Channel {
 			const proposedFlags = FeatureFlags.fromBuffer(msg.channelType);
 			// Simple taproot channels carry ONLY the taproot bit (static_remotekey is
 			// implied), so accept either an explicit static_remotekey or taproot.
+			// An asset channel has a type of its own, and only for an opening
+			// that brought asset funding with it, which was validated above.
+			// Without that funding the overlay type is refused like any type
+			// this node cannot build.
 			if (
 				!proposedFlags.hasFeature(Feature.STATIC_REMOTE_KEY) &&
-				!proposedFlags.hasFeature(Feature.OPTION_TAPROOT)
+				!proposedFlags.hasFeature(Feature.OPTION_TAPROOT) &&
+				!(this._state.auxiliaryState && isOverlayChannel(msg.channelType))
 			) {
 				return refuse('Proposed channel type must include static_remotekey');
 			}
@@ -2846,6 +2987,12 @@ export class Channel {
 		// above and cannot be steered.
 		const refuse = (reason: string): ChannelAction[] =>
 			refuseWithWireError(msg.temporaryChannelId, reason);
+		const csvError = auxiliaryCsvPolicyError(
+			this._state.auxiliaryState?.openingCsvPolicy,
+			this._state.localConfig.toSelfDelay,
+			this._state.remoteConfig.toSelfDelay
+		);
+		if (csvError) return refuse(csvError);
 
 		this._state.fundingTxid = msg.fundingTxid;
 		this._state.fundingOutputIndex = msg.fundingOutputIndex;
@@ -7539,6 +7686,8 @@ export class Channel {
 	 * the live channel moves, which is the whole reason the two halves exist.
 	 */
 	forceClose(signer: ISigner, chain?: IForceCloseChainFacts): ChannelAction[] {
+		const assetRefusal = this._refuseForAssetChannel('a force close');
+		if (assetRefusal) return assetRefusal;
 		const plan = this.prepareForceClose(signer, chain);
 		if (!plan.ok) {
 			return [{ type: ChannelActionType.ERROR, message: plan.error }];
@@ -7619,6 +7768,8 @@ export class Channel {
 		signer: ISigner,
 		chain?: IForceCloseChainFacts
 	): ForceClosePlan {
+		const assetRefusal = auxiliaryUnsupported(this._state, 'a force close');
+		if (assetRefusal) return { ok: false, error: assetRefusal.message };
 		// The recovery never-broadcast invariant (5.6): proven stale
 		// (dataLossDetected), unprovable (stateUncertain), or with
 		// the peer having shown it holds the revocation (restoreRevokedRisk,
@@ -8259,6 +8410,11 @@ export class Channel {
 		liveFeeratePerKw = 0,
 		acceptStaleStateRisk = false
 	): ICooperativeCloseQuote {
+		const assetRefusal = auxiliaryUnsupported(
+			this._state,
+			'a cooperative close'
+		);
+		if (assetRefusal) throw assetRefusal;
 		const state = this._state;
 		if (state.state !== ChannelState.NORMAL || this.isQuiescing()) {
 			throw new Error('Cannot close cooperatively: channel is not ready');
@@ -8371,6 +8527,8 @@ export class Channel {
 		acceptStaleStateRisk = false,
 		externalDestination = false
 	): ChannelAction[] {
+		const assetRefusal = this._refuseForAssetChannel('a cooperative close');
+		if (assetRefusal) return assetRefusal;
 		// A mutual close needs no revocation, which is why the hold allows the
 		// channel to resume - but it pays out the balances THIS row carries,
 		// and a stale capsule's allocation can only ever be the peer-favourable
@@ -8578,6 +8736,8 @@ export class Channel {
 	 *   a real script derived from the funding pubkey.
 	 */
 	handleShutdown(msg: IShutdownMessage, localScript?: Buffer): ChannelAction[] {
+		const assetRefusal = this._refuseForAssetChannel('a cooperative close');
+		if (assetRefusal) return assetRefusal;
 		// Lifecycle first, so the wire-visible content arms below can only ever
 		// fire on a live channel: outside these states the peer may simply not
 		// have seen our terminal transition yet, and a wire error here would
@@ -8751,6 +8911,8 @@ export class Channel {
 	proposeClosingFee(
 		signatureOrFn: Buffer | ((feeSatoshis: bigint) => Buffer)
 	): ChannelAction[] {
+		const assetRefusal = this._refuseForAssetChannel('a cooperative close');
+		if (assetRefusal) return assetRefusal;
 		if (
 			this._state.state !== ChannelState.NEGOTIATING_CLOSING &&
 			this._state.state !== ChannelState.SHUTTING_DOWN
@@ -8862,6 +9024,8 @@ export class Channel {
 		signClosingFn: (feeSatoshis: bigint) => Buffer,
 		verifyClosingFn?: (feeSatoshis: bigint, signature: Buffer) => boolean
 	): ChannelAction[] {
+		const assetRefusal = this._refuseForAssetChannel('a cooperative close');
+		if (assetRefusal) return assetRefusal;
 		if (
 			this._state.state !== ChannelState.NEGOTIATING_CLOSING &&
 			this._state.state !== ChannelState.SHUTTING_DOWN
@@ -9496,6 +9660,8 @@ export class Channel {
 			closeeScriptPubkey: Buffer
 		) => Buffer
 	): ChannelAction[] {
+		const assetRefusal = this._refuseForAssetChannel('a cooperative close');
+		if (assetRefusal) return assetRefusal;
 		const err = (message: string): ChannelAction[] => [
 			{ type: ChannelActionType.ERROR, message }
 		];
@@ -9640,6 +9806,8 @@ export class Channel {
 			closeeScriptPubkey: Buffer
 		) => Buffer
 	): ChannelAction[] {
+		const assetRefusal = this._refuseForAssetChannel('a cooperative close');
+		if (assetRefusal) return assetRefusal;
 		// A closing_complete that does not fit the channel's state (or arrives
 		// while something is still unresolved) is refused locally. One refused
 		// for its content, by the spec or by our own fee, locktime and payout
@@ -9855,6 +10023,8 @@ export class Channel {
 			signature: Buffer
 		) => boolean
 	): ChannelAction[] {
+		const assetRefusal = this._refuseForAssetChannel('a cooperative close');
+		if (assetRefusal) return assetRefusal;
 		// State refusals stay local; a closing_sig refused for its content gets
 		// a warning and a disconnect, as in handleClosingComplete.
 		const err = (message: string): ChannelAction[] => [
@@ -12901,6 +13071,8 @@ export class Channel {
 	 * Cannot quiesce with pending HTLCs.
 	 */
 	initiateQuiescence(): ChannelAction[] {
+		const assetRefusal = this._refuseForAssetChannel('quiescence');
+		if (assetRefusal) return assetRefusal;
 		if (this._state.state !== ChannelState.NORMAL) {
 			return [
 				{
@@ -12988,6 +13160,8 @@ export class Channel {
 	}
 
 	handleStfuMessage(msg: IStfuMessage): ChannelAction[] {
+		const assetRefusal = this._refuseForAssetChannel('quiescence');
+		if (assetRefusal) return assetRefusal;
 		if (this._fforStfuReplyStale && !msg.initiator) {
 			// The reply to a stfu whose session an ff_abort already ended.
 			this._fforStfuReplyStale = false;
@@ -13267,6 +13441,8 @@ export class Channel {
 		fundingFeeratePerkw: number,
 		locktime = 0
 	): ChannelAction[] {
+		const assetRefusal = this._refuseForAssetChannel('a splice');
+		if (assetRefusal) return assetRefusal;
 		// FFOR section 7.5.5: no splice while the epoch is live.
 		const fforSpliceRefusal = this._fforUpdateRefusal('splice', {
 			origin: 'local'
@@ -13662,6 +13838,8 @@ export class Channel {
 		msg: ISpliceMessage,
 		localRelativeSatoshis = 0n
 	): ChannelAction[] {
+		const assetRefusal = this._refuseForAssetChannel('a splice');
+		if (assetRefusal) return assetRefusal;
 		if (this._state.state !== ChannelState.NORMAL) {
 			return [
 				{
@@ -24660,6 +24838,10 @@ export class Channel {
 		/** Exact signed profile request. Version 2 retains unresolved reserves. */
 		concurrentVersion?: 1 | 2;
 	}): ChannelAction[] {
+		const assetRefusal = this._refuseForAssetChannel(
+			'a delegated settlement epoch'
+		);
+		if (assetRefusal) return assetRefusal;
 		const pre = this._fforSetupPreconditionError();
 		if (pre) {
 			return [
@@ -24888,6 +25070,10 @@ export class Channel {
 	 * HTLCs (step 3). The manager signs the covering commitment afterwards.
 	 */
 	handleFforInit(payload: Buffer): ChannelAction[] {
+		const assetRefusal = this._refuseForAssetChannel(
+			'a delegated settlement epoch'
+		);
+		if (assetRefusal) return assetRefusal;
 		let msg: IFforInitMessage;
 		try {
 			msg = decodeFforInitMessage(payload);

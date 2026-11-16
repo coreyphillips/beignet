@@ -195,6 +195,12 @@ export interface IFundingProvider {
 	};
 
 	/**
+	 * Whether this provider can prepare, durably and within a bound, the fee
+	 * inputs a fixed asset HTLC output set needs. An asset channel is opened
+	 * with fixed HTLC outputs only when this answers true.
+	 */
+	supportsFixedOutputFees?(): boolean;
+	/**
 	 * Price a max (sweep-everything) dual-funded v2 open (optional; required,
 	 * with selectMaxDualFundingInputs, for openChannel with fundMax toward a
 	 * dual-fund peer). Synchronous because open_channel2 commits

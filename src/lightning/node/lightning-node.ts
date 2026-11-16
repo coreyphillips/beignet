@@ -84,7 +84,11 @@ import {
 import type { IPerChannelKeys } from '../channel/channel-manager';
 import { ChannelManager, txInputOutpoints } from '../channel/channel-manager';
 import type { ChannelResult } from '../channel/types';
-import type { IAuxiliaryChannelConfig } from '../channel/auxiliary-funding';
+import type {
+	IAuxiliaryChannelConfig,
+	IAuxiliaryChannelInfo,
+	IAuxiliaryFundingDescriptor
+} from '../channel/auxiliary-funding';
 import type { ISpliceWalletInput } from '../channel/channel';
 import { Channel } from '../channel/channel';
 import { isValidShutdownScript } from '../channel/validation';
@@ -2127,6 +2131,16 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 					? undefined
 					: (hash) => this.fforVoucherIndex.get(hash),
 			localFeatures,
+			// With a provider the manager is always told what a peer
+			// advertised, so an asset opening this node drives or answers is
+			// refused when that cannot be read.
+			...(config.auxiliaryChannels
+				? {
+						auxiliaryChannels: config.auxiliaryChannels,
+						auxiliaryPeerFeatures: (peerPubkey: string) =>
+							this.peerInitFeatures(peerPubkey)
+				  }
+				: {}),
 			zeroReserve: { ...config.zeroReserve },
 			localConfig: config.channelConfig,
 			localBasepoints: config.channelBasepoints,
@@ -6140,6 +6154,23 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		this.channelManager.on(
 			'channel:accepted',
 			(channel: Channel, peerPubkey: string) => {
+				// An asset channel is funded by the host, which assembles the
+				// funding transaction with its assets (fundAuxiliaryChannel).
+				if (channel.getFullState().auxiliaryState) {
+					try {
+						this.auxiliaryChannels?.onAccepted?.(channel, peerPubkey);
+					} catch {
+						// The host could not take the accepted channel on, so
+						// nobody will fund it. End the opening, which tells the
+						// peer and the host (channel:aborted), instead of leaving
+						// it half open.
+						this.channelManager.abortPendingOpen(
+							channel,
+							'Asset channel funding failed'
+						);
+					}
+					return;
+				}
 				if (!this.fundingProvider) return;
 				if (channel.getFullState().dualFundingSession) return;
 				this.handleAutoFunding(channel, peerPubkey);
@@ -8101,7 +8132,8 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			? createTaprootFundingScript(
 					state.localBasepoints.fundingPubkey,
 					state.remoteBasepoints.fundingPubkey,
-					btcNetwork
+					btcNetwork,
+					state.fundingTaprootMerkleRoot
 			  )
 			: createFundingScript(
 					state.localBasepoints.fundingPubkey,
@@ -8759,7 +8791,23 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	 */
 	private broadcastPendingFundingTx(txidHex: string): void {
 		const entry = this.pendingFundingTxs.get(txidHex);
-		if (!entry || !this.fundingProvider) return;
+		// An asset channel's funding is built by the host, so a node with no
+		// funding provider can still owe its broadcast: the chain backend
+		// carries it, for that channel only.
+		const broadcaster =
+			this.fundingProvider ??
+			(entry &&
+			this.auxiliaryChannels &&
+			this.channelManager.listChannels().some((channel) => {
+				const state = channel.getFullState();
+				return (
+					state.auxiliaryState !== undefined &&
+					state.fundingTxid?.toString('hex') === txidHex
+				);
+			})
+				? this._chainBackend
+				: null);
+		if (!entry || !broadcaster) return;
 		// Covers all three routes that reach here: the funding:authorized emit,
 		// the per-block sweep and the startup sweep.
 		if (!this.owesFundingBroadcast(txidHex)) return;
@@ -8767,7 +8815,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		// Covers all three routes that reach here: the watch:funding emit, the
 		// per-block sweep and the startup sweep.
 		if (!this.owesFundingBroadcast(txidHex)) return;
-		this.fundingProvider
+		broadcaster
 			.broadcastTransaction(txHex)
 			.then(() => {
 				// The parent exists on the network now: closes built on top of
@@ -11254,7 +11302,8 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				? createTaprootFundingScript(
 						state.localBasepoints.fundingPubkey,
 						state.remoteBasepoints.fundingPubkey,
-						btcNetwork
+						btcNetwork,
+						state.fundingTaprootMerkleRoot
 				  ).p2trOutput
 				: createFundingScript(
 						state.localBasepoints.fundingPubkey,
@@ -11586,7 +11635,8 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				? createTaprootFundingScript(
 						state.localBasepoints.fundingPubkey,
 						state.remoteBasepoints.fundingPubkey,
-						btcNetwork
+						btcNetwork,
+						state.fundingTaprootMerkleRoot
 				  ).p2trOutput
 				: createFundingScript(
 						state.localBasepoints.fundingPubkey,
@@ -12316,6 +12366,15 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	 * advertises it), the peer's from the init it sent on connect. A peer we
 	 * hold no init for counts as not negotiated.
 	 */
+	/**
+	 * The features a connected peer advertised in its init, or undefined
+	 * when there is no init to read: the peer is not connected, or this
+	 * node runs without its own networking.
+	 */
+	private peerInitFeatures(peerPubkey: string): FeatureFlags | undefined {
+		return this.peerManager?.getPeer(peerPubkey)?.getRemoteInit()?.features;
+	}
+
 	private peerNegotiatedDualFund(peerPubkey: string): boolean {
 		if (!this.localFeatures.hasFeature(Feature.DUAL_FUND)) return false;
 		const init = this.peerManager?.getPeer(peerPubkey)?.getRemoteInit();
@@ -28700,6 +28759,242 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		return new Map(
 			[...(records ?? [])].map(([type, value]) => [type, Buffer.from(value)])
 		);
+	}
+
+	/**
+	 * The balances and identity of an asset channel, without key material,
+	 * or undefined for a channel that is not one.
+	 */
+	getAuxiliaryChannelInfo(
+		channelId: Buffer
+	): IAuxiliaryChannelInfo | undefined {
+		const channel = this.channelManager.getChannel(channelId);
+		const state = channel?.getFullState();
+		const auxiliary = state?.auxiliaryState;
+		const peerPubkey = this.channelManager.getPeerForChannel(channelId);
+		if (!state || !auxiliary || !peerPubkey || !state.channelId) {
+			return undefined;
+		}
+		const scid = state.shortChannelId ?? state.scidAlias;
+		return {
+			channelId: Buffer.from(state.channelId),
+			temporaryChannelId: Buffer.from(state.temporaryChannelId),
+			peerPubkey,
+			state: state.state,
+			channelData: Buffer.from(auxiliary.channelData),
+			localAssetBalance: auxiliary.localBalance,
+			remoteAssetBalance: auxiliary.remoteBalance,
+			nextLocalHtlcId: state.localHtlcCounter,
+			localBalanceMsat: state.localBalanceMsat,
+			remoteBalanceMsat: state.remoteBalanceMsat,
+			dustLimitSatoshis:
+				state.localConfig.dustLimitSatoshis >
+				state.remoteConfig.dustLimitSatoshis
+					? state.localConfig.dustLimitSatoshis
+					: state.remoteConfig.dustLimitSatoshis,
+			...(scid ? { shortChannelId: Buffer.from(scid) } : {})
+		};
+	}
+
+	/**
+	 * The asset HTLC mode a new asset channel with this peer would have,
+	 * for the host to check before its wallet prepares funding. Throws where
+	 * the opening itself would be refused.
+	 */
+	getAuxiliaryHtlcMode(peerPubkey: string): 'fixed' | 'legacy' {
+		const error = validateHexPubkey(peerPubkey, 'peerPubkey');
+		if (error) throw new InvalidChannelOpenError(error);
+		return this.channelManager.getAuxiliaryHtlcMode(peerPubkey);
+	}
+
+	/**
+	 * Open an asset channel with a connected peer, once the host's asset
+	 * protocol has settled the funding with it. This is always a v1
+	 * open_channel of the taproot overlay type, whatever kind of channel the
+	 * node and this peer would otherwise open with each other: it does not
+	 * depend on the node preferring taproot, and a peer that negotiated dual
+	 * funding is still sent open_channel. The peer's accept reaches the host
+	 * as onAccepted, which funds the channel with fundAuxiliaryChannel.
+	 */
+	openAuxiliaryChannel(
+		peerPubkey: string,
+		fundingSatoshis: bigint,
+		descriptor: IAuxiliaryFundingDescriptor,
+		pushMsat = 0n
+	): Channel {
+		const error =
+			validateHexPubkey(peerPubkey, 'peerPubkey') ||
+			validatePositiveBigint(fundingSatoshis, 'fundingSatoshis');
+		if (error) throw new InvalidChannelOpenError(error);
+		peerPubkey = normalizeHexPubkey(peerPubkey);
+		if (!this.auxiliaryChannels) {
+			throw new InvalidChannelOpenError(
+				'An auxiliary channel provider is required to open an asset channel'
+			);
+		}
+		if (!this.fundingProvider && !this._chainBackend) {
+			throw new InvalidChannelOpenError(
+				'Asset channel funding requires a transaction broadcaster'
+			);
+		}
+		if (
+			typeof pushMsat !== 'bigint' ||
+			pushMsat < 0n ||
+			pushMsat > fundingSatoshis * 1000n
+		) {
+			throw new InvalidChannelOpenError(
+				`pushMsat (${pushMsat}) must be between 0 and fundingSatoshis * 1000 (${
+					fundingSatoshis * 1000n
+				})`
+			);
+		}
+		return this.channelManager.openChannel(
+			peerPubkey,
+			fundingSatoshis,
+			pushMsat,
+			undefined,
+			{ auxiliary: descriptor }
+		);
+	}
+
+	/**
+	 * Replace the asset funding data of an opening that has signed nothing
+	 * yet (see ChannelManager.setAuxiliaryFundingData).
+	 */
+	setAuxiliaryFundingData(
+		peerPubkey: string,
+		temporaryChannelId: Buffer,
+		channelData: Buffer
+	): void {
+		this.channelManager.setAuxiliaryFundingData(
+			peerPubkey,
+			temporaryChannelId,
+			channelData
+		);
+	}
+
+	/**
+	 * Fund an accepted asset channel with the transaction the host built and
+	 * fully signed, and send funding_created. The transaction has to pay the
+	 * negotiated amount to the channel's funding key, tweaked by its asset
+	 * root, at `outputIndex`. It is kept and broadcast once the peer's
+	 * funding_signed is durable, like the funding of any channel this node
+	 * opens. Returns the channel id.
+	 */
+	fundAuxiliaryChannel(
+		peerPubkey: string,
+		temporaryChannelId: Buffer,
+		txHex: string,
+		outputIndex: number,
+		channelData: Buffer
+	): Buffer {
+		peerPubkey = normalizeHexPubkey(peerPubkey);
+		const named = (reason: string): Error =>
+			new Error(
+				`${reason} (channel ${
+					Buffer.isBuffer(temporaryChannelId)
+						? temporaryChannelId.toString('hex')
+						: 'unknown'
+				})`
+			);
+		const channel = this.channelManager.getTempChannel(temporaryChannelId);
+		if (
+			!channel ||
+			this.channelManager.getPeerForChannel(temporaryChannelId) !== peerPubkey
+		) {
+			throw named('Asset funding peer or channel mismatch');
+		}
+		const state = channel.getFullState();
+		if (
+			!state.auxiliaryState ||
+			!state.fundingTaprootMerkleRoot ||
+			!state.remoteBasepoints ||
+			state.role !== ChannelRole.OPENER ||
+			state.state !== ChannelState.SENT_ACCEPT
+		) {
+			throw named('Asset channel is not ready for funding');
+		}
+		if (!this.fundingProvider && !this._chainBackend) {
+			throw named('Asset channel funding requires a transaction broadcaster');
+		}
+		let tx: bitcoin.Transaction;
+		try {
+			tx = bitcoin.Transaction.fromHex(txHex);
+		} catch {
+			throw named('Asset funding transaction cannot be parsed');
+		}
+		const output = Number.isInteger(outputIndex)
+			? tx.outs[outputIndex]
+			: undefined;
+		const expected = createTaprootFundingScript(
+			state.localBasepoints.fundingPubkey,
+			state.remoteBasepoints.fundingPubkey,
+			undefined,
+			state.fundingTaprootMerkleRoot
+		);
+		if (
+			!output ||
+			outputIndex < 0 ||
+			outputIndex > 65535 ||
+			BigInt(output.value) !== state.fundingSatoshis ||
+			!output.script.equals(expected.p2trOutput)
+		) {
+			throw named(
+				'Asset funding transaction does not match the negotiated output'
+			);
+		}
+		if (
+			tx.ins.length === 0 ||
+			tx.ins.some(
+				(input) => input.witness.length === 0 && input.script.length === 0
+			)
+		) {
+			throw named('Asset funding transaction is not fully signed');
+		}
+		// The channel is built on this transaction's id before it confirms,
+		// so nothing outside its witnesses may be open to change: every input
+		// spends a witness program, natively (an empty scriptSig) or nested
+		// in P2SH (a scriptSig that is the one push of the program).
+		const nestedProgram = (script: Buffer): boolean =>
+			(script.length === 23 &&
+				script[0] === 0x16 &&
+				script[1] === 0x00 &&
+				script[2] === 0x14) ||
+			(script.length === 35 &&
+				script[0] === 0x22 &&
+				script[1] === 0x00 &&
+				script[2] === 0x20);
+		if (
+			tx.ins.some(
+				(input) =>
+					input.witness.length === 0 ||
+					(input.script.length > 0 && !nestedProgram(input.script))
+			)
+		) {
+			throw named('Asset funding transaction has an input that is not segwit');
+		}
+		this.channelManager.setAuxiliaryFundingData(
+			peerPubkey,
+			temporaryChannelId,
+			channelData
+		);
+		const txid = Buffer.from(tx.getHash());
+		channel.retainFundingPayload(txHex);
+		this.setPendingFundingTx(txid.toString('hex'), txHex);
+		let channelId: Buffer | null = null;
+		try {
+			channelId = this.channelManager.createFunding(
+				channel,
+				txid,
+				outputIndex,
+				Buffer.alloc(64)
+			);
+		} finally {
+			// A funding the peer was never sent is not owed to the network.
+			if (!channelId) this.deletePendingFundingTx(txid.toString('hex'));
+		}
+		if (!channelId) throw named('Asset channel funding transition failed');
+		return channelId;
 	}
 
 	/**

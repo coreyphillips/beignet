@@ -26,7 +26,6 @@ import {
 } from '../../src/lightning/channel/commitment-builder';
 import { getPerCommitmentPoint } from '../../src/lightning/channel/channel-helpers';
 import { taprootCommitmentSighash } from '../../src/lightning/channel/commitment-musig';
-import { ChannelActionType } from '../../src/lightning/channel/channel-actions';
 import type { IChannelState } from '../../src/lightning/channel/channel-state';
 import type { ITaprootAuxLeaf } from '../../src/lightning/channel/auxiliary';
 import {
@@ -777,7 +776,7 @@ describe('commitments with auxiliary leaves', function () {
 			);
 		});
 
-		it('rebuilds its signed commitment from the stored view and force closes on the rooted funding key', () => {
+		it('rebuilds its signed commitment from the stored view, and its witness spends the rooted funding key', () => {
 			const pair = taprootPair(66);
 			expect(pair.alice.updateChannelFee(pair.id, 700).ok).to.equal(true);
 
@@ -821,18 +820,48 @@ describe('commitments with auxiliary leaves', function () {
 				'Persisted asset commitment does not match the rebuilt transaction'
 			);
 
-			// The live channel force closes with a key spend that verifies
-			// under the funding key tweaked by the asset root.
+			// The live channel's own witness for that commitment is a key
+			// spend that verifies under the funding key tweaked by the asset
+			// root. The force close itself is refused until the outputs of an
+			// asset commitment can be swept, so the witness is taken from the
+			// step that makes it.
 			pair.bobProvider.buildCommitment = inner;
-			const broadcast = pair.bobChannel
-				.forceClose(pair.bobChannel.getSigner()!)
-				.find((action) => action.type === ChannelActionType.BROADCAST_TX);
-			if (broadcast?.type !== ChannelActionType.BROADCAST_TX) {
-				throw new Error('Missing force close transaction');
-			}
-			const tx = bitcoin.Transaction.fromBuffer(broadcast.tx);
+			const live = writableState(pair.bobChannel);
+			const signer = pair.bobChannel.getSigner()!;
+			expect(pair.bobChannel.prepareForceClose(signer)).to.deep.equal({
+				ok: false,
+				error: `An asset channel does not support a force close (channel ${pair.id.toString(
+					'hex'
+				)})`
+			});
+			const internals = pair.bobChannel as unknown as {
+				_deriveVerificationNonce(commitmentNumber: bigint): Uint8Array;
+				_witnessForceCloseCommitment(
+					view: typeof live,
+					built: ReturnType<typeof buildLocalCommitment>,
+					witnessSigner: typeof signer,
+					perCommitmentPoint: Buffer,
+					taprootNonce: Uint8Array | null
+				): bitcoin.Transaction | null;
+			};
+			const livePoint = getPerCommitmentPoint(
+				live.localPerCommitmentSeed,
+				live.localCommitmentNumber
+			);
+			const nonce = internals._deriveVerificationNonce(
+				live.localCommitmentNumber
+			);
+			live.localNonce = nonce;
+			const tx = internals._witnessForceCloseCommitment(
+				live,
+				buildLocalCommitment(live, livePoint, undefined, true),
+				signer,
+				livePoint,
+				nonce
+			);
+			if (!tx) throw new Error('Missing witnessed commitment');
 			expect(tx.getId()).to.equal(signedTxid);
-			verifyFundingSpend(tx, pair.bobChannel.getFullState());
+			verifyFundingSpend(tx, live);
 		});
 	});
 
