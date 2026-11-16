@@ -581,6 +581,28 @@ describe('host extensions: the members that reach the node, in a node', function
 		expect(info.error).to.match(/^attach: fixedOutputFees: /);
 	});
 
+	it("hands the wallet the extension's bound on a wallet call with the rest of its fee policy", async () => {
+		const taken = await boot([
+			extension('assets', () => ({
+				auxiliaryChannels: auxiliaryChannels(),
+				fixedOutputFees: { ...FEES, walletCallTimeoutMs: 5_000 }
+			}))
+		]);
+		expect(infoOf(taken).state).to.equal('ready');
+		expect(fundingProviderOf().supportsFixedOutputFees?.()).to.equal(true);
+	});
+
+	it('has the wallet refuse a bound on a wallet call that is not a time', async () => {
+		const node = await boot([
+			extension('assets', () => ({
+				auxiliaryChannels: auxiliaryChannels(),
+				fixedOutputFees: { ...FEES, walletCallTimeoutMs: 0 }
+			}))
+		]);
+		// The wallet saw the bound: it is what it refused.
+		expect(infoOf(node).error).to.match(/^attach: fixedOutputFees: /);
+	});
+
 	describe('with an asset channel in the database', () => {
 		let others: LightningNode[];
 

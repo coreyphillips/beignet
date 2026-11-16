@@ -3361,6 +3361,9 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 							: {}),
 						...(fees.preparationFeeRatePerVbyte !== undefined
 							? { preparationFeeRatePerVbyte: fees.preparationFeeRatePerVbyte }
+							: {}),
+						...(fees.walletCallTimeoutMs !== undefined
+							? { walletCallTimeoutMs: fees.walletCallTimeoutMs }
 							: {})
 					}
 				}),
