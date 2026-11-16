@@ -9,6 +9,9 @@
  */
 
 import { expect } from 'chai';
+import * as fs from 'fs';
+import * as os from 'os';
+import * as path from 'path';
 import { encodeScb } from '../../src/lightning/backup/scb';
 import type {
 	IAuxiliaryChannelConfig,
@@ -19,6 +22,7 @@ import type { LightningNode } from '../../src/lightning/node/lightning-node';
 import { AuxiliaryProviderRequiredError } from '../../src/lightning/node/types';
 import {
 	AuxiliaryGuardianModeError,
+	AuxiliaryGuardianStartError,
 	AuxiliaryRestoreRefusedError,
 	composeRecoveryCapsule,
 	encryptRecoveryCapsule,
@@ -189,6 +193,79 @@ describe('asset channels in a guardian recovery mode', () => {
 		expect(alice.node.getAuxiliaryChannelInfo(channelId)).to.equal(undefined);
 		expect(alice.node.listChannels()).to.have.length(1);
 		expect(bob.node.listChannels()).to.have.length(1);
+	});
+
+	it('does not start over a stored asset channel, with a provider or without one, and changes nothing', async () => {
+		const tag = 'guardian start';
+		const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'aux-guardian-'));
+		try {
+			const file = path.join(directory, 'alice.sqlite');
+			const alice = assetHost(tag, 1, {}, { sqlitePath: file });
+			const bob = host(tag, 2, false);
+			connectHosts(alice, bob);
+			const channelId = await openAssetChannel(alice, bob, {
+				tag,
+				openerUnits: 700n,
+				acceptorUnits: 300n
+			});
+			const hex = channelId.toString('hex');
+			alice.node.destroy();
+			const stored = (): unknown => {
+				const storage = new SqliteStorage(file);
+				storage.open();
+				const row = storage.loadChannel(hex);
+				storage.close();
+				return row;
+			};
+			const before = stored();
+			expect(before).to.not.equal(null);
+
+			for (const provider of [true, false]) {
+				const storage = new SqliteStorage(file);
+				storage.open();
+				const refusal = thrownBy(() =>
+					createNode(tag, 1, storage, {
+						recovery: { guardians: [GUARDIAN] },
+						...(provider
+							? {
+									auxiliaryChannels: {
+										provider: referenceProvider(),
+										resolveIncoming: (): undefined => undefined
+									}
+							  }
+							: {})
+					})
+				);
+				try {
+					storage.close();
+				} catch {
+					// The node that did not start had closed it.
+				}
+				expect(refusal).to.be.instanceOf(AuxiliaryGuardianStartError);
+				const typed = refusal as AuxiliaryGuardianStartError;
+				expect(typed.code).to.equal('AUXILIARY_GUARDIAN_START_REFUSED');
+				expect(typed.channelIds).to.deep.equal([hex]);
+				expect(typed.message).to.equal(
+					`This wallet holds 1 asset channel (${hex}) and is set to back up ` +
+						'to guardians, which cannot restore an asset channel, so it ' +
+						'was not started (AUXILIARY_GUARDIAN_START_REFUSED). Close ' +
+						'the asset channel, or start without the guardian backup.'
+				);
+				expect(stored()).to.deep.equal(before);
+			}
+
+			// Without guardians the same storage starts, with the channel.
+			const again = assetHost(tag, 1, {}, { sqlitePath: file });
+			hosts.push(again);
+			expect(
+				again.node
+					.listChannels()
+					.map((row) => [row.channelId.toString('hex'), row.auxiliary])
+			).to.deep.equal([[hex, true]]);
+		} finally {
+			for (const made of hosts.splice(0)) made.node.destroy();
+			fs.rmSync(directory, { recursive: true, force: true });
+		}
 	});
 });
 

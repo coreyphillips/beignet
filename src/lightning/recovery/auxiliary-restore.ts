@@ -44,6 +44,36 @@ export class AuxiliaryGuardianModeError extends CodedError<'AUXILIARY_GUARDIAN_M
 }
 
 /**
+ * A node set to replicate its recovery journal to guardians was started
+ * over stored asset channels. Nothing was started, replicated or changed:
+ * the same storage starts in a recovery mode without guardians.
+ *
+ * A guardian restore puts the journal's rows on another device, where
+ * nothing can answer for an asset channel, and it can only be refused
+ * there after the takeover has fenced this device. So the channel is kept
+ * out of a guardian journal from the start.
+ */
+export class AuxiliaryGuardianStartError extends CodedError<'AUXILIARY_GUARDIAN_START_REFUSED'> {
+	/** The stored asset channels, as channel id hex. */
+	readonly channelIds: readonly string[];
+
+	constructor(channelIds: readonly string[]) {
+		const one = channelIds.length === 1;
+		super(
+			'AUXILIARY_GUARDIAN_START_REFUSED',
+			`This wallet holds ${channelIds.length} asset channel${one ? '' : 's'} ` +
+				`(${channelIds.join(', ')}) and is set to back up to guardians, ` +
+				`which cannot restore an asset channel, so it was not started ` +
+				`(AUXILIARY_GUARDIAN_START_REFUSED). Close the asset channel${
+					one ? '' : 's'
+				}, or start without the guardian backup.`
+		);
+		this.name = 'AuxiliaryGuardianStartError';
+		this.channelIds = [...channelIds];
+	}
+}
+
+/**
  * A restore holds asset channels and the provider did not say it can restore
  * them. Nothing of the restore was installed.
  */
@@ -101,6 +131,18 @@ function carriesAssetState(state: IChannelState): boolean {
 		state.fundingTaprootMerkleRoot !== undefined ||
 		isOverlayChannel(state.channelType)
 	);
+}
+
+/**
+ * The asset channels a storage holds, as channel id hex: the rows that
+ * carry asset state and the asset rows that could not be read. Only reads.
+ */
+export function storedAuxiliaryChannelIds(storage: IStorageBackend): string[] {
+	const readable = storage
+		.loadAllChannels()
+		.filter((row) => carriesAssetState(row.state))
+		.map((row) => row.channelId);
+	return [...readable, ...(storage.unreadableAssetChannelIds?.() ?? [])];
 }
 
 /**

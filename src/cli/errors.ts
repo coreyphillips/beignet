@@ -257,6 +257,13 @@ export enum BeignetErrorCode {
 	 * restore was installed.
 	 */
 	ASSET_RESTORE_REFUSED = 'ASSET_RESTORE_REFUSED',
+	/**
+	 * The wallet holds asset channels and was started in a guardian
+	 * recovery mode (`async-remote` or `quorum`). Nothing was started and
+	 * nothing reached a guardian: close the asset channels, or start
+	 * without the guardian backup.
+	 */
+	ASSET_GUARDIAN_START_REFUSED = 'ASSET_GUARDIAN_START_REFUSED',
 	// Host extensions (docs/EXTENSIONS.md).
 	/**
 	 * A refusal from an extension's route. The envelope carries the

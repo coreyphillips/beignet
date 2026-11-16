@@ -205,6 +205,7 @@ import type {
 import {
 	AuxiliaryRestoreRefusedError,
 	RestoreRefusedError,
+	storedAuxiliaryChannelIds,
 	RestoreRotatedError,
 	buildGuardianRecovery,
 	parseGuardianEntry,
@@ -4959,6 +4960,30 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	 * no quorum to decide ownership with, which a fresh boot cannot proceed
 	 * past; a restarting daemon self-heals when the guardians return).
 	 */
+	/**
+	 * Refuse to start in a guardian recovery mode over stored asset
+	 * channels. A guardian restore puts the journal's rows on another
+	 * device, where nothing can answer for an asset channel, and there it
+	 * can only be refused after the takeover has fenced this one: the
+	 * channel would be lost between the two. So no journal that holds one
+	 * is ever replicated. Only reads the database.
+	 */
+	private refuseGuardianModeOverAssetChannels(mode: RecoveryMode): void {
+		const held = storedAuxiliaryChannelIds(this.storage);
+		if (held.length === 0) return;
+		const one = held.length === 1;
+		throw new BeignetError(
+			'ASSET_GUARDIAN_START_REFUSED',
+			`This wallet holds ${held.length} asset channel${one ? '' : 's'} ` +
+				`(${held.join(', ')}) and its recovery mode is ${mode}, which ` +
+				`backs it up to guardians. A guardian backup cannot restore an ` +
+				`asset channel, so the wallet was not started and nothing was ` +
+				`sent to a guardian. Close the asset channel${one ? '' : 's'}, ` +
+				`or start without the guardian backup (recovery mode ` +
+				`peer-storage or off).`
+		);
+	}
+
 	private async prepareRecovery(opts: BeignetNodeOptions): Promise<void> {
 		const mode = parseRecoveryMode(opts.recoveryMode);
 		this.recoveryMode = mode;
@@ -4986,6 +5011,10 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 			};
 			return;
 		}
+		// A guardian-backed mode does not start over asset channels (issue
+		// #2093): refused here, before a guardian is asked anything, before
+		// the node is built and before a frame of the journal can leave.
+		this.refuseGuardianModeOverAssetChannels(mode);
 		// Guardian-backed modes. The daemon validates the guardian set before
 		// create; parsing again here gives library callers the same refusals.
 		let guardians = (opts.recoveryGuardians ?? []).map(parseGuardianEntry);

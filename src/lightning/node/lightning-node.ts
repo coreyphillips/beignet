@@ -97,6 +97,7 @@ import type {
 import { copyCustomRecords } from '../message/custom-records';
 import {
 	AuxiliaryGuardianModeError,
+	AuxiliaryGuardianStartError,
 	auxiliaryRestoreRefusal,
 	isGuardianRecoveryMode
 } from '../recovery/auxiliary-restore';
@@ -2884,6 +2885,25 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		// those channels neither run nor watched.
 		const unreadableAssetChannels =
 			this.storage.unreadableAssetChannelIds?.() ?? [];
+		// A node that replicates its journal to guardians does not start
+		// over asset channels: a guardian restore cannot bring one back, and
+		// can only be refused after the takeover has fenced this device.
+		// Refused with or without a provider, and before the first write.
+		if (
+			isGuardianRecoveryMode({
+				barrier: this.recoveryBarrier,
+				startupGate: this.recoveryGate,
+				guardians: this.recoveryGuardians
+			})
+		) {
+			const held = [
+				...storedChannels
+					.filter((row) => isAssetRow(row.state))
+					.map((row) => row.channelId),
+				...unreadableAssetChannels
+			];
+			if (held.length > 0) throw new AuxiliaryGuardianStartError(held);
+		}
 		if (!this.auxiliaryChannels) {
 			const assetChannels = [
 				...storedChannels

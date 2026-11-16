@@ -6944,6 +6944,9 @@ function onionMessage.processOnionMessage(onionPacketBuf: Buffer, nodePrivkey: B
 namespace recovery
 class recovery.AuxiliaryGuardianModeError extends beignet#CodedError<'AUXILIARY_GUARDIAN_MODE'>
 constructor recovery.AuxiliaryGuardianModeError()
+class recovery.AuxiliaryGuardianStartError extends beignet#CodedError<'AUXILIARY_GUARDIAN_START_REFUSED'>
+constructor recovery.AuxiliaryGuardianStartError(channelIds: readonly string[])
+readonly property recovery.AuxiliaryGuardianStartError.channelIds: readonly string[]
 class recovery.AuxiliaryRestoreRefusedError extends beignet#CodedError<'AUXILIARY_RESTORE_REFUSED'>
 constructor recovery.AuxiliaryRestoreRefusedError(channelIds: readonly string[], detail?: string)
 readonly property recovery.AuxiliaryRestoreRefusedError.channelIds: readonly string[]
@@ -8029,6 +8032,7 @@ function recovery.signTranscript(hash: Buffer, secret: Buffer): Buffer
 function recovery.singleGuardianResolver(guardian: recovery.ReferenceGuardian): recovery.IGuardianResolver
 function recovery.stateBytes(state: recovery.GuardianState): Buffer
 function recovery.statesEqual(a: recovery.GuardianState, b: recovery.GuardianState): boolean
+function recovery.storedAuxiliaryChannelIds(storage: storage.IStorageBackend): string[]
 function recovery.storedTipSequence(storage: storage.IStorageBackend): bigint | null
 function recovery.takeoverTranscriptHash(guardianSetId: Buffer, guardianId: Buffer, supersededState: recovery.GuardianState, newEpoch: bigint, newWriterPublicKey: Buffer, issuedAt: bigint): Buffer
 function recovery.u64be(value: bigint): Buffer

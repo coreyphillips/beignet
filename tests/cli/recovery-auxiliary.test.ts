@@ -12,6 +12,7 @@
  * Electrum).
  */
 
+import Database from 'better-sqlite3';
 import { expect } from 'chai';
 import * as bip39 from 'bip39';
 import * as fs from 'fs';
@@ -32,7 +33,13 @@ import {
 	AuxiliaryGuardianModeError,
 	AuxiliaryRestoreRefusedError
 } from '../../src/lightning/recovery';
-import { withAssetOpens } from '../lightning/helpers/auxiliary-nodes';
+import { SqliteStorage } from '../../src/lightning/storage/sqlite-storage';
+import {
+	assetHost,
+	connectHosts,
+	openAssetChannel,
+	withAssetOpens
+} from '../lightning/helpers/auxiliary-nodes';
 import {
 	ASSET_FUNDING_ROOT,
 	referenceProvider
@@ -62,6 +69,28 @@ function tmpDir(tag: string): string {
 	return fs.mkdtempSync(
 		path.join(os.tmpdir(), `beignet-recovery-auxiliary-${tag}-`)
 	);
+}
+
+/** Every row of every table of a database file, as text, by table. */
+function tables(file: string): Map<string, string[]> {
+	const db = new Database(file, { readonly: true });
+	const out = new Map<string, string[]>();
+	const names = db
+		.prepare("SELECT name FROM sqlite_master WHERE type = 'table'")
+		.all() as Array<{ name: string }>;
+	for (const { name } of names) {
+		const rows = db.prepare(`SELECT * FROM "${name}"`).all() as object[];
+		out.set(
+			name,
+			rows.map((row) =>
+				JSON.stringify(row, (_key, value: unknown) =>
+					Buffer.isBuffer(value) ? value.toString('hex') : value
+				)
+			)
+		);
+	}
+	db.close();
+	return out;
 }
 
 function portOf(daemon: IStartedDaemon): number {
@@ -275,5 +304,140 @@ describe('Recovery modes and asset channels, over the daemon', function () {
 
 		// Any other failure of a restore is left to the code it had.
 		expect(refusalFor(new Error('disk full'))).to.equal(undefined);
+	});
+
+	it('does not start in a guardian mode over a stored asset channel: nothing is built, no guardian hears of it, and the database is as it was', async () => {
+		// Three guardians to pin, resolved while their daemons run.
+		const ports: number[] = [];
+		const entries: string[] = [];
+		const guardians: IStartedDaemon[] = [];
+		for (let index = 0; index < 3; index++) {
+			const listenPort = await freePort();
+			ports.push(listenPort);
+			guardians.push(
+				await boot(`start-host-${index}`, {
+					mnemonic: MNEMONICS[index],
+					listenPort,
+					guardianServe: true
+				})
+			);
+		}
+		for (let index = 0; index < 3; index++) {
+			const info = await request(portOf(guardians[index]), 'GET', '/info');
+			const nodeId = (info.body.result as { nodeId: string }).nodeId;
+			const resolved = await request(
+				portOf(guardians[0]),
+				'POST',
+				'/recovery/resolve-guardian',
+				{ uri: `${nodeId}@127.0.0.1:${ports[index]}` }
+			);
+			expect(resolved.status, JSON.stringify(resolved.body)).to.equal(200);
+			entries.push((resolved.body.result as { entry: string }).entry);
+		}
+		// In their place, listeners that count whoever reaches them.
+		for (const guardian of guardians) await guardian.stop();
+		let contacts = 0;
+		const listeners: net.Server[] = [];
+		for (const port of ports) {
+			const listener = net.createServer((socket) => {
+				contacts++;
+				socket.destroy();
+			});
+			await new Promise<void>((resolve) =>
+				listener.listen(port, '127.0.0.1', resolve)
+			);
+			listeners.push(listener);
+		}
+
+		try {
+			// A wallet's database that holds an asset channel.
+			const tag = 'guardian-start';
+			const alice = assetHost(tag, 1, {}, { sqlite: true });
+			const bob = assetHost(tag, 2);
+			connectHosts(alice, bob);
+			const channelId = await openAssetChannel(alice, bob, {
+				tag,
+				openerUnits: 700n,
+				acceptorUnits: 300n
+			});
+			const hex = channelId.toString('hex');
+			const row = alice.storage!.loadChannel(hex)!;
+			alice.node.destroy();
+			bob.node.destroy();
+			const dataDir = tmpDir('guardian-start');
+			dirs.push(dataDir);
+			const file = path.join(dataDir, 'regtest.db');
+			const seeded = new SqliteStorage(file);
+			seeded.open();
+			seeded.saveChannel(hex, row.state, row.peerPubkey);
+			seeded.close();
+			// The wallet runs with it while it has no guardian backup, and
+			// stores it as the daemon stores every row.
+			const listsIt = async (): Promise<void> => {
+				const plain = await startDaemon({
+					...OFFLINE,
+					dataDir,
+					mnemonic: MNEMONICS[3],
+					recoveryMode: 'off',
+					extensions: [assets(auxiliaryChannels())]
+				});
+				daemons.push(plain);
+				const listed = await request(portOf(plain), 'GET', '/channels');
+				expect(
+					(
+						listed.body.result as Array<{
+							channelId: string;
+							auxiliary?: boolean;
+						}>
+					).map((channel) => [channel.channelId, channel.auxiliary])
+				).to.deep.equal([[hex, true]]);
+				await plain.stop();
+			};
+			await listsIt();
+			const before = Object.fromEntries(tables(file));
+			expect(before.channels).to.have.length(1);
+
+			for (const recoveryMode of ['quorum', 'async-remote']) {
+				let refusal: unknown;
+				try {
+					daemons.push(
+						await startDaemon({
+							...OFFLINE,
+							dataDir,
+							mnemonic: MNEMONICS[3],
+							recoveryMode,
+							recoveryGuardians: entries,
+							extensions: [assets(auxiliaryChannels())]
+						})
+					);
+				} catch (err) {
+					refusal = err;
+				}
+				expect(refusal, recoveryMode).to.be.instanceOf(BeignetError);
+				expect((refusal as BeignetError).code).to.equal(
+					'ASSET_GUARDIAN_START_REFUSED'
+				);
+				expect((refusal as BeignetError).message).to.equal(
+					`This wallet holds 1 asset channel (${hex}) and its recovery ` +
+						`mode is ${recoveryMode}, which backs it up to guardians. A ` +
+						'guardian backup cannot restore an asset channel, so the ' +
+						'wallet was not started and nothing was sent to a guardian. ' +
+						'Close the asset channel, or start without the guardian ' +
+						'backup (recovery mode peer-storage or off).'
+				);
+				// Nothing reached a guardian, and nothing was written: no
+				// journal, no frame, and the channel's row as it was.
+				expect(contacts, recoveryMode).to.equal(0);
+				expect(Object.fromEntries(tables(file))).to.deep.equal(before);
+			}
+
+			// Without the guardian backup the same database starts again, and
+			// the channel is there to be closed.
+			await listsIt();
+		} finally {
+			for (const listener of listeners) {
+				await new Promise<void>((resolve) => listener.close(() => resolve()));
+			}
+		}
 	});
 });
