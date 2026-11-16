@@ -29756,6 +29756,9 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		) {
 			throw named('Asset funding transaction has an input that is not segwit');
 		}
+		// The final funding data replaces what the opening proposed only if
+		// the funding goes out: what was proposed is put back otherwise.
+		const proposedData = Buffer.from(state.auxiliaryState.channelData);
 		this.channelManager.setAuxiliaryFundingData(
 			peerPubkey,
 			temporaryChannelId,
@@ -29777,8 +29780,14 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				Buffer.alloc(64)
 			);
 		} finally {
-			// A funding the peer was never sent is not owed to the network.
-			if (!channelId) this.deletePendingFundingTx(txid.toString('hex'));
+			// A funding the peer was never sent is not owed to the network,
+			// and the channel does not keep the data that came with it.
+			if (!channelId) {
+				this.deletePendingFundingTx(txid.toString('hex'));
+				if (state.auxiliaryState) {
+					state.auxiliaryState.channelData = proposedData;
+				}
+			}
 		}
 		if (!channelId) throw named('Asset channel funding transition failed');
 		return channelId;

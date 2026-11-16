@@ -24,7 +24,10 @@ import type { Channel } from '../../src/lightning/channel/channel';
 import { ChannelState } from '../../src/lightning/channel/types';
 import { MessageType } from '../../src/lightning/message/types';
 import { createTaprootFundingScript } from '../../src/lightning/script/funding-taproot';
-import { ASSET_FUNDING_ROOT } from './helpers/auxiliary-pair';
+import {
+	ASSET_FUNDING_ROOT,
+	referenceProvider
+} from './helpers/auxiliary-pair';
 import {
 	assetHost,
 	connectHosts,
@@ -421,6 +424,51 @@ describe('the point of no return of an asset opening (issue #2093, step 7)', fun
 			}
 			fs.rmSync(directory, { recursive: true, force: true });
 		}
+	});
+
+	it('a funding that fails before it is sent leaves the opening with the funding data it proposed', async () => {
+		const arm = { on: false };
+		const inner = referenceProvider();
+		const alice = assetHost(
+			'aux-fund-undo',
+			1,
+			{
+				provider: {
+					...inner,
+					buildCommitment: (context) => {
+						if (arm.on) throw new Error('asset store is down');
+						return inner.buildCommitment(context);
+					}
+				}
+			},
+			{ sqlite: true }
+		);
+		const bob = assetHost('aux-fund-undo', 2, {}, { sqlite: true });
+		hosts.push(alice, bob);
+		connectHosts(alice, bob);
+		const sent: number[] = [];
+		alice.node.on('message:outbound', (_peer: string, type: number) => {
+			sent.push(type);
+		});
+		const { channel, descriptor } = await accepted(alice, bob, 'undo');
+		const proposed = Buffer.from(
+			channel.getFullState().auxiliaryState!.channelData
+		);
+		expect(proposed.toString()).to.equal('proposed asset funding');
+		const before = sent.length;
+		arm.on = true;
+		expect(() =>
+			fund(alice, bob, descriptor, fundingTx(channel, 'undo', false), [P2WPKH])
+		).to.throw(/Asset channel funding failed/);
+		await settle();
+		// No funding_created left, and the channel does not carry the final
+		// data of a funding that was never made.
+		expect(sent.slice(before)).to.not.include(MessageType.FUNDING_CREATED);
+		expect(
+			channel.getFullState().auxiliaryState!.channelData.equals(proposed)
+		).to.equal(true);
+		expect(alice.storage!.loadAllChannels()).to.deep.equal([]);
+		expect(alice.broadcasts).to.deep.equal([]);
 	});
 
 	describe('a funding_signed whose row could not be written', () => {
