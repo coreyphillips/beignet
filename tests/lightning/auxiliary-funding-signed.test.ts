@@ -574,6 +574,82 @@ describe('the point of no return of an asset opening (issue #2093, step 7)', fun
 			await settle();
 			expect(told).to.have.length(1);
 		});
+
+		/**
+		 * A write of the channel that the node makes itself, outside any
+		 * dispatch of the channel manager: every one of them goes through
+		 * this method.
+		 */
+		const nodeWrites = (host: IAssetHost, channelId: Buffer): unknown =>
+			(
+				host.node as unknown as { persistChannel(id: Buffer): unknown }
+			).persistChannel(channelId);
+		const tick = (): Promise<void> =>
+			new Promise<void>((resolve) => setImmediate(resolve));
+
+		it('tells the host within one tick of a write of the row that the node makes itself, outside a dispatch, and is irrevocable from that write on', async () => {
+			const { alice, told, channelId } = await unwritten('aux-fs-direct');
+			nodeWrites(alice, channelId);
+			expect(
+				alice.storage!.loadChannel(channelId.toString('hex'))
+			).to.not.equal(null);
+			// The row is on disk: the opening cannot be abandoned any more,
+			// and the host is not called inside the node's write.
+			expect(told).to.deep.equal([]);
+			expect(
+				refusal(() => alice.node.abandonAuxiliaryOpen(channelId)).code
+			).to.equal('ASSET_OPEN_IRREVOCABLE');
+			await tick();
+			expect(told).to.have.length(1);
+			expect(told[0].inTransaction).to.equal(false);
+			expect(told[0].context.channelId.equals(channelId)).to.equal(true);
+			// Told once: the row says so, and no later write tells again.
+			nodeWrites(alice, channelId);
+			await tick();
+			alice.node
+				.getChannelManager()
+				.handlePeerDisconnected(told[0].context.peerPubkey);
+			await settle();
+			expect(told).to.have.length(1);
+		});
+
+		it('asks a host that threw again within one tick of each write of the row the node makes, and no more once a call has returned', async () => {
+			const { alice, told, channelId } = await unwritten('aux-fs-direct-threw');
+			const hooks = (
+				alice.node.getChannelManager() as unknown as {
+					config: {
+						auxiliaryChannels: {
+							onFundingSigned: (context: IAuxiliaryFundingSigned) => void;
+						};
+					};
+				}
+			).config.auxiliaryChannels;
+			const tell = hooks.onFundingSigned;
+			const host = { down: true, asked: 0 };
+			hooks.onFundingSigned = (context): void => {
+				host.asked++;
+				if (host.down) throw new Error('the host store is down');
+				tell(context);
+			};
+			nodeWrites(alice, channelId);
+			await tick();
+			expect(host.asked).to.equal(1);
+			// No write of the row, no call.
+			await settle();
+			expect(host.asked).to.equal(1);
+			nodeWrites(alice, channelId);
+			await tick();
+			expect(host.asked).to.equal(2);
+			expect(told).to.deep.equal([]);
+			host.down = false;
+			nodeWrites(alice, channelId);
+			await tick();
+			expect(host.asked).to.equal(3);
+			expect(told).to.have.length(1);
+			nodeWrites(alice, channelId);
+			await settle();
+			expect(host.asked).to.equal(3);
+		});
 	});
 
 	it('an id that is not an asset opening of this node is refused by name', async () => {

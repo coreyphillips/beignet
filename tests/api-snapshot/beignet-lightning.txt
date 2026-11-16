@@ -1364,6 +1364,7 @@ method channel.ChannelManager.armChannelIndexTipFloor(knownTipHeight?: number): 
 method channel.ChannelManager.attachToPeerManager(peerManager: transport.PeerManager): void
 method channel.ChannelManager.autoSignAndSendCommitment(channelId: Buffer): channel.ChannelResult
 method channel.ChannelManager.auxiliaryHtlcChainEnding(channelId: Buffer, direction: channel.HtlcDirection, htlcId: bigint): 'fulfilled' | 'failed' | undefined
+method channel.ChannelManager.auxiliaryRowWritten(channel: channel.Channel): void
 method channel.ChannelManager.bumpCloseFee(channelId: Buffer, feeSatoshis: bigint): channel.ChannelResult
 method channel.ChannelManager.canOpenZeroConfTo(pubkeyHex: string): boolean
 get channel.ChannelManager.channelIndexTipFloorArmed(): boolean

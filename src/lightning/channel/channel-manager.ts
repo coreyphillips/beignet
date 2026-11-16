@@ -1745,6 +1745,10 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 	 */
 	private readonly auxiliaryOpensCommitted = new Set<string>();
 	private readonly _auxiliaryFundingSignedInFlight = new Set<string>();
+	/** Openers whose host is told on the next tick (auxiliaryRowWritten). */
+	private readonly _auxiliaryFundingSignedDue = new Set<string>();
+	/** The channel whose row a dispatch is writing: it tells the host itself. */
+	private _auxiliaryDispatchWrite: Channel | undefined;
 
 	/** An asset channel this node opened, with the peer's funding_signed taken in. */
 	private _isAuxiliaryOpenPastFundingSigned(channel: Channel): boolean {
@@ -1783,6 +1787,41 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			return;
 		}
 		this._notifyAuxiliaryFundingSigned(ctx.peerPubkey, channel);
+	}
+
+	/**
+	 * A write of this channel's row has committed outside a dispatch of its
+	 * own: the node wrote the channel itself, or the manager did beside a
+	 * batch. For an asset opener past funding_signed whose host has not
+	 * been told, the row that makes the opening irrevocable is on disk
+	 * whichever write put it there: the opening counts as committed from
+	 * here, as it would when restored, and the host is told on the next
+	 * tick, outside the operation the write sits in. A host that threw is
+	 * asked again the same way. A dispatch tells the host itself
+	 * (_auxiliaryOpenRowCommitted) and is left to it. Nothing is looked at
+	 * for a channel without asset state.
+	 */
+	auxiliaryRowWritten(channel: Channel): void {
+		if (this._auxiliaryDispatchWrite === channel) return;
+		const auxiliary = channel.getFullState().auxiliaryState;
+		if (!auxiliary || auxiliary.fundingSignedDelivered === true) return;
+		if (!this._isAuxiliaryOpenPastFundingSigned(channel)) return;
+		const hex = channel.getChannelId()!.toString('hex');
+		if (this.channels.get(hex) !== channel) return;
+		this.auxiliaryOpensCommitted.add(hex);
+		if (
+			!this.config.auxiliaryChannels?.onFundingSigned ||
+			this._auxiliaryFundingSignedDue.has(hex)
+		) {
+			return;
+		}
+		this._auxiliaryFundingSignedDue.add(hex);
+		setImmediate(() => {
+			this._auxiliaryFundingSignedDue.delete(hex);
+			const peerPubkey = this.channelPeers.get(hex);
+			if (this.channels.get(hex) !== channel || !peerPubkey) return;
+			this._notifyAuxiliaryFundingSigned(peerPubkey, channel);
+		});
 	}
 
 	/**
@@ -12011,6 +12050,8 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		const { channel, outbox } = ctx;
 		let result: IChannelPersistResult | undefined;
 		let thrown: string | undefined;
+		const dispatchWrite = this._auxiliaryDispatchWrite;
+		this._auxiliaryDispatchWrite = channel;
 		try {
 			result = this.persistence.persist({
 				channel,
@@ -12025,6 +12066,8 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			// nothing, so its throw still goes up.
 			if (!outbox) throw err;
 			thrown = err instanceof Error ? err.message : String(err);
+		} finally {
+			this._auxiliaryDispatchWrite = dispatchWrite;
 		}
 		if (outbox) {
 			ctx.persisted = {

@@ -4300,7 +4300,31 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		if (!channel) return null;
 		const peer = this.channelManager.getPeerForChannel(channelId);
 		if (!peer) return null;
-		return this.persistChannelState(channel, peer, channelId);
+		return this.auxiliaryRowWritten(
+			channel,
+			this.persistChannelState(channel, peer, channelId)
+		);
+	}
+
+	/**
+	 * Asset channels: a write of a channel's row that committed is made
+	 * known to the channel manager, whichever path made it, so that an
+	 * opener past funding_signed whose host has not been told is told
+	 * (ChannelManager.auxiliaryRowWritten). A channel without asset state is
+	 * not looked at.
+	 */
+	private auxiliaryRowWritten<T extends IChannelPersistResult | null>(
+		channel: Channel,
+		result: T
+	): T {
+		if (
+			result?.committed === true &&
+			!this._destroyed &&
+			channel.getFullState().auxiliaryState !== undefined
+		) {
+			this.channelManager.auxiliaryRowWritten(channel);
+		}
+		return result;
 	}
 
 	/**
@@ -4329,11 +4353,14 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		) {
 			return { committed: true, outboxIds: [] };
 		}
-		return this.persistChannelState(
+		return this.auxiliaryRowWritten(
 			request.channel,
-			request.peerPubkey,
-			request.channelId,
-			request.outbox
+			this.persistChannelState(
+				request.channel,
+				request.peerPubkey,
+				request.channelId,
+				request.outbox
+			)
 		);
 	}
 
