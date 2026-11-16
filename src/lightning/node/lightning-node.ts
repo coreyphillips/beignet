@@ -84,6 +84,7 @@ import {
 import type { IPerChannelKeys } from '../channel/channel-manager';
 import { ChannelManager, txInputOutpoints } from '../channel/channel-manager';
 import type { ChannelResult } from '../channel/types';
+import type { IAuxiliaryChannelConfig } from '../channel/auxiliary-funding';
 import type { ISpliceWalletInput } from '../channel/channel';
 import { Channel } from '../channel/channel';
 import { isValidShutdownScript } from '../channel/validation';
@@ -112,7 +113,8 @@ import {
 	BITCOIN_CHAIN_HASH,
 	TESTNET_CHAIN_HASH,
 	REGTEST_CHAIN_HASH,
-	SIGNET_CHAIN_HASH
+	SIGNET_CHAIN_HASH,
+	isOverlayChannel
 } from '../channel/types';
 import type {
 	IPeerDialOptions,
@@ -389,6 +391,8 @@ import {
 	PaymentWaitTimeoutError,
 	InvalidChannelOpenError,
 	ChannelFundingUnavailableError,
+	AuxiliaryChannelRowError,
+	AuxiliaryProviderRequiredError,
 	ChannelFundingUnavailableCode,
 	InvalidSpliceError,
 	SpliceRefusalCode,
@@ -1385,6 +1389,8 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	> = new Map();
 	private fundingPubkey: Buffer;
 	private fundingProvider: IFundingProvider | null = null;
+	/** Asset channel support, when this node is configured with a provider. */
+	private readonly auxiliaryChannels: IAuxiliaryChannelConfig | undefined;
 	private fundingPrivkey: Buffer;
 	/** Custom channel-signer factory (see INodeConfig.signerFactory). */
 	private signerFactory: SignerFactory | undefined;
@@ -1958,6 +1964,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		this.announcedAddresses = config.announcedAddresses;
 		this.fundingPubkey = config.channelBasepoints.fundingPubkey;
 		this.fundingProvider = config.fundingProvider || null;
+		this.auxiliaryChannels = config.auxiliaryChannels;
 		this.fundingPrivkey = config.fundingPrivkey;
 		this.signerFactory = config.signerFactory;
 		this.sweepDestinationScript = config.sweepDestinationScript;
@@ -2757,6 +2764,59 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		// HTLC history included. Nothing writes a channel row before
 		// restore's main loop has walked them.
 		const storedChannels = this.storage.loadAllChannels();
+		// Asset channels (issue #2093): a stored channel with asset state
+		// cannot be run without the provider that reads it. Signing for it as
+		// an ordinary channel would commit to outputs without their asset
+		// leaves, so refuse here, before restore rewrites or deletes any row
+		// and before the node says anything to a peer. Nothing is changed:
+		// the same database starts once the provider is configured.
+		const isAssetRow = (state: IChannelState): boolean =>
+			state.auxiliaryState !== undefined ||
+			state.fundingTaprootMerkleRoot !== undefined ||
+			isOverlayChannel(state.channelType);
+		// Asset rows the backend skipped because they did not decode. They
+		// are not in storedChannels, and going on without them would leave
+		// those channels neither run nor watched.
+		const unreadableAssetChannels =
+			this.storage.unreadableAssetChannelIds?.() ?? [];
+		if (!this.auxiliaryChannels) {
+			const assetChannels = [
+				...storedChannels
+					.filter((row) => isAssetRow(row.state))
+					.map((row) => row.channelId),
+				...unreadableAssetChannels
+			];
+			if (assetChannels.length > 0) {
+				throw new AuxiliaryProviderRequiredError(assetChannels);
+			}
+		} else {
+			// With the provider configured, every stored asset channel has
+			// to be one it can run: readable, and whole. A row with the
+			// overlay type or a funding root but no asset state would fail
+			// in the middle of the loop below, after earlier rows were
+			// already rewritten, so it is refused here, by name.
+			const invalid = [
+				...unreadableAssetChannels.map((channelId) => ({
+					channelId,
+					reason: 'the stored row cannot be read'
+				})),
+				...storedChannels
+					.filter(
+						(row) =>
+							isAssetRow(row.state) &&
+							!(
+								row.state.auxiliaryState &&
+								row.state.fundingTaprootMerkleRoot?.length === 32
+							)
+					)
+					.map((row) => ({
+						channelId: row.channelId,
+						reason:
+							'the stored row has an asset channel type or funding root without its asset state'
+					}))
+			];
+			if (invalid.length > 0) throw new AuxiliaryChannelRowError(invalid);
+		}
 		// The quorum eligibility preflight runs BEFORE restoration touches
 		// anything: restore deletes record-less DUAL_FUNDING_V2 rows
 		// durably (RBF residue) and can journal the first quorum frame
@@ -3377,7 +3437,11 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				}
 				continue;
 			}
-			const channel = new Channel(state);
+			const channel = new Channel(
+				state,
+				undefined,
+				this.auxiliaryChannels?.provider
+			);
 			// Before restoreChainWatches or a resumed exchange can arm a funding
 			// watch from the stored depth (issue #1197).
 			const depthRaised = channel.repairLegacyV2OpenerDepth();
@@ -5564,7 +5628,11 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 								row.state.v2InFlight
 							);
 						}
-						const channel = new Channel(row.state);
+						const channel = new Channel(
+							row.state,
+							undefined,
+							this.auxiliaryChannels?.provider
+						);
 						// The startup write of the raised depth may not have landed.
 						channel.repairLegacyV2OpenerDepth();
 						const keyIndex = this.storage!.loadChannelKeyIndex(idHex);
@@ -5608,7 +5676,11 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 						// failed-persist arm, so this removal re-runs
 						// against a store that answers.
 						try {
-							const channel = new Channel(row!.state);
+							const channel = new Channel(
+								row!.state,
+								undefined,
+								this.auxiliaryChannels?.provider
+							);
 							const keyIndex = this.storage!.loadChannelKeyIndex(idHex);
 							this.channelManager.restoreChannel(
 								channel,
@@ -8283,7 +8355,11 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			if (row.state.state === ChannelState.DUAL_FUNDING_V2) {
 				row.state.state = this.v2RetainedAttemptState(row.state.v2InFlight);
 			}
-			const channel = new Channel(row.state);
+			const channel = new Channel(
+				row.state,
+				undefined,
+				this.auxiliaryChannels?.provider
+			);
 			// The startup write of the raised depth may not have landed.
 			channel.repairLegacyV2OpenerDepth();
 			const keyIndex = this.storage.loadChannelKeyIndex(idHex);
@@ -9187,7 +9263,11 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				const built = this.buildRecoveryChannelState(entry, channelId);
 				state = built.state;
 				perChannelKeys = built.perChannelKeys;
-				channel = new Channel(state);
+				channel = new Channel(
+					state,
+					undefined,
+					this.auxiliaryChannels?.provider
+				);
 				channel.channelKeyIndex = entry.channelKeyIndex;
 			} catch (err) {
 				const message = err instanceof Error ? err.message : String(err);

@@ -3,6 +3,7 @@
  */
 
 import { FeatureFlags, Feature } from '../features/flags';
+import type { CustomRecords } from '../message/custom-records';
 
 /**
  * Check whether a negotiated channel_type includes option_anchors_zero_fee_htlc_tx.
@@ -33,18 +34,26 @@ export function isTaprootChannel(channelType: Buffer | null): boolean {
 }
 
 /**
- * Whether a channel_type carries the taproot asset overlay bit (2026), which
- * marks an auxiliary (asset) channel.
+ * Whether a channel_type is the taproot asset overlay, which marks an
+ * auxiliary (asset) channel: the overlay bit (2026) with neither
+ * static_remotekey nor option_taproot beside it, which is how LND and tapd
+ * write the type.
+ *
+ * The exclusion is what keeps this false for every channel a node could hold
+ * from before asset channels existed. An open was only ever accepted with
+ * static_remotekey or option_taproot in its type, so a stored type that
+ * carries one of them is that kind of channel whatever else a peer added,
+ * and stays that kind of channel.
  */
 export function isOverlayChannel(
 	channelType: Buffer | null | undefined
 ): boolean {
+	if (!channelType || channelType.length === 0) return false;
+	const flags = FeatureFlags.fromBuffer(channelType);
 	return (
-		!!channelType &&
-		channelType.length > 0 &&
-		FeatureFlags.fromBuffer(channelType).hasFeature(
-			Feature.OPTION_TAPROOT_OVERLAY
-		)
+		flags.hasFeature(Feature.OPTION_TAPROOT_OVERLAY) &&
+		!flags.hasFeature(Feature.STATIC_REMOTE_KEY) &&
+		!flags.hasFeature(Feature.OPTION_TAPROOT)
 	);
 }
 
@@ -446,6 +455,14 @@ export interface IHtlcEntry {
 	 * so the refusal survives a crash between the commit and the fail-back.
 	 */
 	addedWhileFundingUnaccounted?: boolean;
+	/**
+	 * Custom records (TLV types at or above 65536) that came with the add,
+	 * kept until the HTLC resolves. Only ever present on a channel with
+	 * auxiliary state, where they carry the asset side of the HTLC.
+	 */
+	customRecords?: CustomRecords;
+	/** The asset amount of this HTLC, as the auxiliary provider read it from the records. */
+	auxiliaryAmount?: bigint;
 }
 
 /**

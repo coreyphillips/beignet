@@ -74,6 +74,31 @@ property IResolvedNodeDefaults.zeroReserve: Readonly<IZeroReserveConfig & Requir
 unexported interface IResult
 method IResult.isErr(): boolean
 method IResult.isOk(): boolean
+unexported interface ISerializedAuxiliaryCommitment
+property ISerializedAuxiliaryCommitment.customData: string
+property ISerializedAuxiliaryCommitment.htlcOutputIndexes?: [ string, number ][]
+property ISerializedAuxiliaryCommitment.outputLeaves: [ number, ISerializedAuxiliaryLeaf ][]
+property ISerializedAuxiliaryCommitment.peerSignatures?: SerializedCustomRecords
+property ISerializedAuxiliaryCommitment.secondLevelCommitmentTxid?: string
+property ISerializedAuxiliaryCommitment.secondLevelLeaves: [ string, ISerializedAuxiliaryLeaf ][]
+property ISerializedAuxiliaryCommitment.secondLevelRevocationBasepoint?: string
+property ISerializedAuxiliaryCommitment.secondLevelRevocationKey?: string
+unexported interface ISerializedAuxiliaryLeaf
+property ISerializedAuxiliaryLeaf.leafVersion?: number
+property ISerializedAuxiliaryLeaf.script: string
+unexported interface ISerializedAuxiliaryState
+property ISerializedAuxiliaryState.acceptedClosingSigned?: string
+property ISerializedAuxiliaryState.channelData: string
+property ISerializedAuxiliaryState.childRevocationBasepoints?: [ string, string ][]
+property ISerializedAuxiliaryState.closeTransactions?: [ string, string ][]
+property ISerializedAuxiliaryState.localBalance: string
+property ISerializedAuxiliaryState.localCommitments: [ string, ISerializedAuxiliaryCommitment ][]
+property ISerializedAuxiliaryState.localShutdownRecords?: SerializedCustomRecords
+property ISerializedAuxiliaryState.openingCsvPolicy?: channel.IChannelAuxiliaryState['openingCsvPolicy']
+property ISerializedAuxiliaryState.remoteBalance: string
+property ISerializedAuxiliaryState.remoteCommitments: [ string, ISerializedAuxiliaryCommitment ][]
+property ISerializedAuxiliaryState.remoteShutdownRecords?: SerializedCustomRecords
+property ISerializedAuxiliaryState.resolvedHtlcs?: [ string, { htlcId: string; direction: channel.HtlcDirection; paymentHash: string; auxiliaryAmount: string; customRecords?: SerializedCustomRecords; outcome: 'fulfilled' | 'failed'; } ][]
 unexported interface ISpliceUtxo
 property ISpliceUtxo.address: string
 property ISpliceUtxo.height: number
@@ -101,6 +126,7 @@ unexported type LedgerTransitionOutcome = 'applied' | 'stale' | 'missing' | 'sto
 unexported type MessageHandler = (pubkey: string, type: number, payload: Buffer) => void
 unexported type PeerState = 'disconnected' | 'connecting' | 'handshaking' | 'init' | 'ready' | 'closing'
 unexported type SeedDerivedNodeConfigKey = 'nodePrivateKey' | 'channelBasepoints' | 'perCommitmentSeed' | 'fundingPrivkey' | 'htlcBasepointSecret' | 'revocationBasepointSecret' | 'paymentBasepointSecret' | 'delayedPaymentBasepointSecret'
+unexported type SerializedCustomRecords = [ string, string ][]
 unexported type SubmarineSwapEventName = 'swap:created' | 'swap:funding-seen' | 'swap:funded' | 'swap:funding-lost' | 'swap:paying' | 'swap:payment-unresolved' | 'swap:preimage' | 'swap:claim-broadcast' | 'swap:claim-confirmed' | 'swap:payment-failed' | 'swap:exposed' | 'swap:cancelled' | 'swap:failed'
 unexported type SwapEventName = 'swap:created' | 'swap:held' | 'swap:funding' | 'swap:funded' | 'swap:claimed' | 'swap:settled' | 'swap:refund-broadcast' | 'swap:refunded' | 'swap:hold-cancelled' | 'swap:exposed' | 'swap:failed'
 unexported type SyncSnapshot = Pick<ffor.IFforSyncReplyMessage, 'numSlots' | 'settled' | 'preimages'>
@@ -950,7 +976,7 @@ const channel.CHANNEL_INDEX_FLOOR_MAX: number
 const channel.CHANNEL_INDEX_FLOOR_STRIDE = 128
 const channel.COMPOSITE_SPLICE_STAGES: readonly channel.CompositeSpliceStage[]
 class channel.Channel
-constructor channel.Channel(state: channel.IChannelState, signer?: keys.ISigner)
+constructor channel.Channel(state: channel.IChannelState, signer?: keys.ISigner, auxiliaryProvider?: channel.IChannelAuxiliaryProvider)
 static readonly property channel.Channel.MAX_DUST_HTLC_EXPOSURE_MSAT = 5000000n
 static readonly property channel.Channel.MAX_HTLC_CLTV_EXPIRY_DELTA = 5040
 method channel.Channel.abandonSpliceConflictRequest(): channel.ChannelAction[]
@@ -1831,6 +1857,8 @@ interface channel.IChannelState
 property channel.IChannelState.announceChannel: boolean
 property channel.IChannelState.announcementSigsReceived: boolean
 property channel.IChannelState.announcementSigsSent: boolean
+property channel.IChannelState.auxiliaryProvider?: channel.IChannelAuxiliaryProvider
+property channel.IChannelState.auxiliaryState?: channel.IChannelAuxiliaryState
 property channel.IChannelState.awaitingClosingSig?: boolean
 property channel.IChannelState.awaitingLocalFeeCommitment?: boolean
 property channel.IChannelState.channelId: Buffer | null
@@ -1857,6 +1885,7 @@ property channel.IChannelState.fundingLocktime: number
 property channel.IChannelState.fundingMissingSinceHeight?: number
 property channel.IChannelState.fundingOutputIndex: number
 property channel.IChannelState.fundingSatoshis: bigint
+property channel.IChannelState.fundingTaprootMerkleRoot?: Buffer
 property channel.IChannelState.fundingTxHex?: string
 property channel.IChannelState.fundingTxIndex: number
 property channel.IChannelState.fundingTxid: Buffer | null
@@ -1868,6 +1897,7 @@ property channel.IChannelState.isLessor?: boolean
 property channel.IChannelState.lastCooperativeCloseTxHex?: string
 property channel.IChannelState.lastLocalClosingComplete?: { feeSatoshis: bigint; locktime: number; closerScript: Buffer; closeeScript: Buffer; sentVariants: number[]; } | null
 property channel.IChannelState.lastProposedClosingFeeSat: bigint | null
+property channel.IChannelState.lastSentAuxiliaryRecords?: ReadonlyMap<bigint, Buffer>
 property channel.IChannelState.lastSentCommitmentSigned: Buffer | null
 property channel.IChannelState.lastSentHtlcSignatures: Buffer[]
 property channel.IChannelState.lastSentPartialSignatureWithNonce: Buffer | null
@@ -2059,9 +2089,11 @@ property channel.IHtlcEntry.addRemotelyRevoked?: boolean
 property channel.IHtlcEntry.addedWhileFundingUnaccounted?: boolean
 property channel.IHtlcEntry.addedWhileRestoreUnproven?: boolean
 property channel.IHtlcEntry.amountMsat: bigint
+property channel.IHtlcEntry.auxiliaryAmount?: bigint
 property channel.IHtlcEntry.blindingPoint?: Buffer
 property channel.IHtlcEntry.cltvExpiry: number
 property channel.IHtlcEntry.commitCoverPending?: boolean
+property channel.IHtlcEntry.customRecords?: message.CustomRecords
 property channel.IHtlcEntry.direction: channel.HtlcDirection
 property channel.IHtlcEntry.dustExposureFailback?: boolean
 property channel.IHtlcEntry.expiredOnArrival?: boolean
@@ -2370,6 +2402,7 @@ function channel.buildRemoteCommitment(state: channel.IChannelState, remotePerCo
 function channel.calculateCommitmentFee(feeratePerKw: number, numUntrimmedHtlcs: number, isAnchor?: boolean, isTaproot?: boolean): bigint
 function channel.compositeSpliceStageAtLeast(stage: channel.CompositeSpliceStage, floor: channel.CompositeSpliceStage): boolean
 function channel.compositeSpliceStageIsTerminal(stage: channel.CompositeSpliceStage): boolean
+function channel.copyAuxiliaryCommitment(data: channel.IAuxiliaryCommitmentData): channel.IAuxiliaryCommitmentData
 function channel.createAcceptorChannel(params: { temporaryChannelId: Buffer; localConfig?: channel.IChannelConfig; localBasepoints: keys.IChannelBasepoints; localPerCommitmentSeed: Buffer; }): channel.Channel
 function channel.createAcceptorState(params: { temporaryChannelId: Buffer; fundingSatoshis: bigint; pushMsat: bigint; localConfig: channel.IChannelConfig; localBasepoints: keys.IChannelBasepoints; localPerCommitmentSeed: Buffer; remoteBasepoints: keys.IChannelBasepoints; remoteConfig: channel.IChannelConfig; }): channel.IChannelState
 function channel.createOpenerChannel(params: { fundingSatoshis: bigint; pushMsat?: bigint; localConfig?: channel.IChannelConfig; localBasepoints: keys.IChannelBasepoints; localPerCommitmentSeed: Buffer; }): channel.Channel
@@ -2400,6 +2433,7 @@ function channel.outputWeight(scriptLen: number): number
 function channel.rbfFeerateFloor(previousFeeratePerkw: number): number
 function channel.receivedAddIrrevocablyCommitted(entry: channel.IHtlcEntry): boolean
 function channel.recencyHoldOrigin(state: { restoreRecencyUnproven?: boolean; reestablishRecencyUnproven?: boolean; reestablishSecretMissing?: boolean; }): channel.RecencyHoldOrigin | null
+function channel.requireAuxiliaryProvider(state: channel.IChannelState): channel.IChannelAuxiliaryProvider
 function channel.scidAliasAnnounceRefusal(channelType: Buffer | null | undefined, announceChannel: boolean): string | null
 function channel.signRemoteCommitment(state: channel.IChannelState, signer: keys.ISigner, remotePerCommitmentPoint: Buffer, commitmentNumber?: bigint): { signature: Buffer; htlcSignatures: Buffer[]; }
 function channel.signRemoteCommitmentPartial(state: channel.IChannelState, signer: keys.ISigner, ourPublicNonce: Uint8Array, theirPublicNonce: Buffer, remotePerCommitmentPoint: Buffer, commitmentNumber?: bigint): Buffer
@@ -5354,6 +5388,13 @@ function message.isRequiredMessageType(type: number): boolean
 function message.messageTypeName(type: number): string
 function message.readBigSizeParts(data: Buffer, offset: number, out: { hi: number; lo: number; }): number
 namespace node
+class node.AuxiliaryChannelRowError extends beignet#CodedError<'AUXILIARY_CHANNEL_ROW_INVALID'>
+constructor node.AuxiliaryChannelRowError(rows: ReadonlyArray<{ channelId: string; reason: string; }>)
+readonly property node.AuxiliaryChannelRowError.channelIds: readonly string[]
+readonly property node.AuxiliaryChannelRowError.reasons: ReadonlyMap<string, string>
+class node.AuxiliaryProviderRequiredError extends beignet#CodedError<'AUXILIARY_PROVIDER_REQUIRED'>
+constructor node.AuxiliaryProviderRequiredError(channelIds: readonly string[])
+readonly property node.AuxiliaryProviderRequiredError.channelIds: readonly string[]
 const node.COMPOSITE_SPLICE_RETENTION_MS: number
 enum node.ChannelFundingUnavailableCode
 member node.ChannelFundingUnavailableCode.CHANNEL_NOT_FOUND = "CHANNEL_NOT_FOUND"
@@ -7544,7 +7585,7 @@ property recovery.RecoveryFrame.previousFrameHash: Buffer
 property recovery.RecoveryFrame.sequence: bigint
 property recovery.RecoveryFrame.snapshot?: recovery.RecoverySnapshot
 property recovery.RecoveryFrame.timestamp: number
-property recovery.RecoveryFrame.version: 1 | 2 | 3 | 4
+property recovery.RecoveryFrame.version: 1 | 2 | 3 | 4 | 5
 property recovery.RecoveryFrame.writerEpoch: bigint
 class recovery.RecoveryJournal implements recovery.IRecoveryJournalSink
 constructor recovery.RecoveryJournal(storage: storage.IStorageBackend, masterKey: Buffer, nodeId: Buffer, recoveryId: Buffer, options?: recovery.IRecoveryJournalOptions)
@@ -8030,6 +8071,7 @@ interface storage.ISerializedChannelState
 property storage.ISerializedChannelState.announceChannel: boolean
 property storage.ISerializedChannelState.announcementSigsReceived: boolean
 property storage.ISerializedChannelState.announcementSigsSent: boolean
+property storage.ISerializedChannelState.auxiliaryState?: ISerializedAuxiliaryState
 property storage.ISerializedChannelState.awaitingLocalFeeCommitment?: boolean
 property storage.ISerializedChannelState.channelId: string | null
 property storage.ISerializedChannelState.channelReserveVersion?: number
@@ -8054,6 +8096,7 @@ property storage.ISerializedChannelState.fundingLocktime?: number
 property storage.ISerializedChannelState.fundingMissingSinceHeight?: number
 property storage.ISerializedChannelState.fundingOutputIndex: number
 property storage.ISerializedChannelState.fundingSatoshis: string
+property storage.ISerializedChannelState.fundingTaprootMerkleRoot?: string
 property storage.ISerializedChannelState.fundingTxHex?: string
 property storage.ISerializedChannelState.fundingTxIndex: number
 property storage.ISerializedChannelState.fundingTxid: string | null
@@ -8069,6 +8112,7 @@ property storage.ISerializedChannelState.lastCloseLocktime?: number | null
 property storage.ISerializedChannelState.lastCloseSentVariants?: number[] | null
 property storage.ISerializedChannelState.lastCooperativeCloseTxHex?: string
 property storage.ISerializedChannelState.lastProposedClosingFeeSat: string | null
+property storage.ISerializedChannelState.lastSentAuxiliaryRecords?: SerializedCustomRecords
 property storage.ISerializedChannelState.lastSentCommitmentSigned: string | null
 property storage.ISerializedChannelState.lastSentHtlcSignatures: string[]
 property storage.ISerializedChannelState.lastSentPartialSignatureWithNonce: string | null
@@ -8208,9 +8252,11 @@ property storage.ISerializedHtlcEntry.addRemotelyRevoked?: boolean
 property storage.ISerializedHtlcEntry.addedWhileFundingUnaccounted?: boolean
 property storage.ISerializedHtlcEntry.addedWhileRestoreUnproven?: boolean
 property storage.ISerializedHtlcEntry.amountMsat: string
+property storage.ISerializedHtlcEntry.auxiliaryAmount?: string
 property storage.ISerializedHtlcEntry.blindingPoint?: string
 property storage.ISerializedHtlcEntry.cltvExpiry: number
 property storage.ISerializedHtlcEntry.commitCoverPending?: boolean
+property storage.ISerializedHtlcEntry.customRecords?: SerializedCustomRecords
 property storage.ISerializedHtlcEntry.direction: string
 property storage.ISerializedHtlcEntry.dustExposureFailback?: boolean
 property storage.ISerializedHtlcEntry.expiredOnArrival?: boolean
@@ -8321,6 +8367,7 @@ method storage.IStorageBackend.corruptRowCount?(): number
 method storage.IStorageBackend.inTransaction?(): boolean
 method storage.IStorageBackend.revokedHtlcSnapshotStore?(): object
 method storage.IStorageBackend.secretsEncryptedAtRest?(): boolean
+method storage.IStorageBackend.unreadableAssetChannelIds?(): string[]
 interface storage.IStorageCapabilities
 property storage.IStorageCapabilities.actionLog: storage.IActionLogStorage
 property storage.IStorageCapabilities.announcedPeerAddresses: storage.IAnnouncedPeerAddressStorage
@@ -8394,6 +8441,9 @@ method storage.IStorageCore.savePeerAddress(pubkey: string, host: string, port: 
 method storage.IStorageCore.savePreimage(paymentHash: string, preimage: Buffer): void
 method storage.IStorageCore.saveScidMapping(scidHex: string, channelId: Buffer): void
 method storage.IStorageCore.transaction<T>(fn: () => T): T
+interface storage.IStoredAssetChannelRow
+property storage.IStoredAssetChannelRow.assetChannelRow: 1
+property storage.IStoredAssetChannelRow.channel: storage.ISerializedChannelState
 interface storage.IStoredPaymentRef
 property storage.IStoredPaymentRef.createdAt: number
 method storage.IStoredPaymentRef.load(): node.IPaymentInfo | null
@@ -8541,6 +8591,8 @@ class storage.StorageEncryptedError extends Error
 constructor storage.StorageEncryptedError()
 function storage.bigintToStr(val: bigint): string
 function storage.bufToHex(buf: Buffer | null | undefined): string | null
+function storage.channelRowFromStore(stored: unknown): storage.ISerializedChannelState
+function storage.channelRowToStore(row: storage.ISerializedChannelState): storage.ISerializedChannelState | storage.IStoredAssetChannelRow
 function storage.decryptValue(key: Uint8Array, value: string): string
 function storage.decryptWithPrefix(key: Uint8Array, value: string, prefix: string): string
 function storage.deriveStorageKey(secret: Uint8Array): Buffer
@@ -8581,6 +8633,7 @@ function storage.serializePaymentInfo(p: node.IPaymentInfo): storage.ISerialized
 function storage.serializeShaChainEntries(store: keys.ShaChainStore): { entries: storage.ISerializedShaChainEntry[]; knownCount: string; }
 function storage.serializeSpliceInFlight(f: channel.ISpliceInFlight): storage.ISerializedSpliceInFlight
 function storage.serializeV2InFlight(f: channel.IV2InFlight): storage.ISerializedV2InFlight
+function storage.serializedChannelCarriesAssetState(row: unknown): boolean
 function storage.storageCapabilityMembers(capability: storage.StorageCapability): string[]
 function storage.storageConformanceChecks(factory: () => storage.IStorageBackend): storage.IStorageConformanceCheck[]
 function storage.strToBigint(val: string): bigint

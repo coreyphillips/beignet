@@ -239,4 +239,5 @@ method SqliteStorage.setOutboxFrameSequence(ids: number[], frameSequence: number
 method SqliteStorage.setRecoveryMeta(key: string, value: string): void
 method SqliteStorage.setWatchtowerSessionProgress(sessionId: string, seqNum: number, lastApplied: number): void
 method SqliteStorage.transaction<T>(fn: () => T): T
+method SqliteStorage.unreadableAssetChannelIds(): string[]
 method SqliteStorage.updateQueueEntryStatus(id: string, status: string, error?: string, completedAt?: number): void

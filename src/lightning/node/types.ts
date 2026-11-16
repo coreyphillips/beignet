@@ -733,6 +733,11 @@ export interface INodeConfig {
 	 * the node read the custom records (TLV types at or above 65536) of a
 	 * peer's init. Unset, the default, the node sets none of those bits and
 	 * rejects an unknown even init record as before.
+	 *
+	 * The provider is never stored: it is attached again to every asset
+	 * channel on restore. A node started without it over storage that holds
+	 * asset channels throws `AuxiliaryProviderRequiredError` before it
+	 * rewrites any row, rather than run those channels as ordinary ones.
 	 */
 	auxiliaryChannels?: IAuxiliaryChannelConfig;
 	/**
@@ -1965,6 +1970,55 @@ export interface ISpliceRefusal {
  */
 export interface ISpliceRequestResult extends Partial<ISpliceRefusal> {
 	ok: boolean;
+}
+
+/**
+ * Startup found stored asset channels and no `auxiliaryChannels` provider to
+ * run them. Thrown before any stored row is rewritten, so nothing has
+ * changed: configure the provider and start again. Running such a channel
+ * without its provider would sign commitments that leave out the asset.
+ */
+export class AuxiliaryProviderRequiredError extends CodedError<'AUXILIARY_PROVIDER_REQUIRED'> {
+	/** The stored channels that carry asset state, as channel id hex. */
+	readonly channelIds: readonly string[];
+
+	constructor(channelIds: readonly string[]) {
+		super(
+			'AUXILIARY_PROVIDER_REQUIRED',
+			`Storage holds ${channelIds.length} asset channel(s) ` +
+				`(${channelIds.join(', ')}) and no auxiliaryChannels provider is ` +
+				`configured; refusing to start without it`
+		);
+		this.name = 'AuxiliaryProviderRequiredError';
+		this.channelIds = [...channelIds];
+	}
+}
+
+/**
+ * Startup found a stored asset channel that cannot be run although a
+ * provider is configured: its row could not be read, or it carries an asset
+ * channel type or funding root without the asset state that goes with them.
+ * Thrown before any stored row is rewritten, so nothing has changed. The
+ * node does not start without the channel, because a channel it does not
+ * load is a channel it does not watch.
+ */
+export class AuxiliaryChannelRowError extends CodedError<'AUXILIARY_CHANNEL_ROW_INVALID'> {
+	/** The stored channels that cannot be run, as channel id hex. */
+	readonly channelIds: readonly string[];
+	/** Why each one cannot be run, by channel id hex. */
+	readonly reasons: ReadonlyMap<string, string>;
+
+	constructor(rows: ReadonlyArray<{ channelId: string; reason: string }>) {
+		super(
+			'AUXILIARY_CHANNEL_ROW_INVALID',
+			`Storage holds ${rows.length} asset channel(s) that cannot be run: ` +
+				rows.map((row) => `${row.channelId} (${row.reason})`).join(', ') +
+				'; refusing to start without them'
+		);
+		this.name = 'AuxiliaryChannelRowError';
+		this.channelIds = rows.map((row) => row.channelId);
+		this.reasons = new Map(rows.map((row) => [row.channelId, row.reason]));
+	}
 }
 
 /**

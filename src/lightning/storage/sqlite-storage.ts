@@ -55,6 +55,8 @@ import type { ISerializedChannelState } from './serialization';
 import {
 	serializeChannelState,
 	deserializeChannelState,
+	channelRowFromStore,
+	channelRowToStore,
 	serializeHtlcSnapshotEntries,
 	deserializeHtlcSnapshotEntries,
 	serializePaymentInfo,
@@ -66,7 +68,8 @@ import {
 	serializeGraphNode,
 	deserializeGraphNode,
 	serializeInvoiceInfo,
-	deserializeInvoiceInfo
+	deserializeInvoiceInfo,
+	serializedChannelCarriesAssetState
 } from './serialization';
 import {
 	ENC_PREFIX,
@@ -250,6 +253,7 @@ export class SqliteStorage implements IStorageBackend {
 	private db: Database.Database;
 	private readonly dbPath: string;
 	private onCorruptRow?: (error: unknown) => void;
+	private unreadableAssetChannels: string[] = [];
 	private encryptionKey?: Buffer;
 	/**
 	 * Without a storage key the payment rows are plaintext anyway, so a fixed
@@ -337,6 +341,16 @@ export class SqliteStorage implements IStorageBackend {
 	/** Rows skipped by the forgiving loaders since open (issue #317). */
 	corruptRowCount(): number {
 		return this.corruptRowsSeen;
+	}
+
+	/**
+	 * The asset channel rows the last loadAllChannels skipped because they
+	 * did not decode, as channel id hex. A skipped asset channel is neither
+	 * run nor watched, so startup reads this and refuses instead of going on
+	 * without it.
+	 */
+	unreadableAssetChannelIds(): string[] {
+		return [...this.unreadableAssetChannels];
 	}
 
 	/**
@@ -1153,7 +1167,7 @@ export class SqliteStorage implements IStorageBackend {
 
 	saveChannel(id: string, state: IChannelState, peerPubkey: string): void {
 		const json = JSON.stringify(
-			serializeChannelState(state, { htlcHistory: 'none' })
+			channelRowToStore(serializeChannelState(state, { htlcHistory: 'none' }))
 		);
 		const history = unsavedRevokedHtlcSnapshots(state, this);
 		this.db.transaction(() => {
@@ -1188,7 +1202,7 @@ export class SqliteStorage implements IStorageBackend {
 		).get(id) as { state_json: string; peer_pubkey: string } | undefined;
 		if (!row) return null;
 		const state = deserializeChannelState(
-			JSON.parse(this._dec(row.state_json))
+			channelRowFromStore(JSON.parse(this._dec(row.state_json)))
 		);
 		const history = this._readRevokedHtlcSnapshots(
 			this._stmt(
@@ -1225,11 +1239,12 @@ export class SqliteStorage implements IStorageBackend {
 			state: IChannelState;
 			peerPubkey: string;
 		}> = [];
+		const unreadableAssetChannels: string[] = [];
 		for (const row of rows) {
+			let parsed: unknown;
 			try {
-				const state = deserializeChannelState(
-					JSON.parse(this._dec(row.state_json))
-				);
+				parsed = JSON.parse(this._dec(row.state_json));
+				const state = deserializeChannelState(channelRowFromStore(parsed));
 				this._attachRevokedHtlcSnapshots(state, history.get(row.channel_id));
 				results.push({
 					channelId: row.channel_id,
@@ -1237,10 +1252,17 @@ export class SqliteStorage implements IStorageBackend {
 					peerPubkey: row.peer_pubkey
 				});
 			} catch (err) {
+				// An asset channel row that parses but does not decode is
+				// remembered by id before it is skipped: startup refuses to
+				// run without it (see unreadableAssetChannelIds).
+				if (serializedChannelCarriesAssetState(parsed)) {
+					unreadableAssetChannels.push(row.channel_id);
+				}
 				// Skip corrupted row — node still starts with remaining data
 				this.reportCorruptRow(err);
 			}
 		}
+		this.unreadableAssetChannels = unreadableAssetChannels;
 		return results;
 	}
 

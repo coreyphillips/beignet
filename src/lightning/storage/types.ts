@@ -611,6 +611,13 @@ export interface IStorageBackend
 	 * state they act on.
 	 */
 	corruptRowCount?(): number;
+	/**
+	 * Channel ids of the asset channel rows the last loadAllChannels skipped
+	 * because they did not decode. Only a backend that skips undecodable
+	 * rows has anything to report; one that throws on them needs no answer
+	 * here.
+	 */
+	unreadableAssetChannelIds?(): string[];
 }
 
 /**

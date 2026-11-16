@@ -4,6 +4,11 @@
 
 import type { IHtlcEntry, HtlcDirection, HtlcState } from '../channel/types';
 import { bigintToStr, strToBigint } from './serialization-primitives';
+import {
+	serializeCustomRecords,
+	deserializeCustomRecords
+} from './auxiliary-serialization';
+import type { SerializedCustomRecords } from './auxiliary-serialization';
 
 export interface ISerializedHtlcEntry {
 	key: string;
@@ -46,6 +51,13 @@ export interface ISerializedHtlcEntry {
 	addedWhileRestoreUnproven?: boolean;
 	/** Admitted while the funding-missing quarantine stood (see IHtlcEntry). */
 	addedWhileFundingUnaccounted?: boolean;
+	/**
+	 * Asset channels only (see IHtlcEntry): the custom records of the add and
+	 * the asset amount read from them. Written only when present, so an HTLC
+	 * of any other channel serializes to the bytes it always did.
+	 */
+	customRecords?: SerializedCustomRecords;
+	auxiliaryAmount?: string;
 }
 
 export function serializeHtlcEntry(
@@ -110,6 +122,12 @@ export function serializeHtlcEntry(
 			: {}),
 		...(e.addedWhileFundingUnaccounted !== undefined
 			? { addedWhileFundingUnaccounted: e.addedWhileFundingUnaccounted }
+			: {}),
+		...(e.customRecords !== undefined
+			? { customRecords: serializeCustomRecords(e.customRecords) }
+			: {}),
+		...(e.auxiliaryAmount !== undefined
+			? { auxiliaryAmount: serializeAuxiliaryAmount(e.auxiliaryAmount) }
 			: {})
 	};
 }
@@ -177,7 +195,35 @@ export function deserializeHtlcEntry(s: ISerializedHtlcEntry): {
 				: {}),
 			...(s.addedWhileFundingUnaccounted !== undefined
 				? { addedWhileFundingUnaccounted: s.addedWhileFundingUnaccounted }
+				: {}),
+			...(s.customRecords !== undefined
+				? { customRecords: deserializeCustomRecords(s.customRecords) }
+				: {}),
+			...(s.auxiliaryAmount !== undefined
+				? { auxiliaryAmount: deserializeAuxiliaryAmount(s.auxiliaryAmount) }
 				: {})
 		}
 	};
+}
+
+/** A stored asset amount: a canonical u64 decimal, or a throw. */
+/** Written through the reader's own checks, so a save refuses what a read would. */
+function serializeAuxiliaryAmount(value: bigint): string {
+	if (typeof value !== 'bigint') {
+		throw new Error('Malformed asset amount');
+	}
+	const serialized = value.toString();
+	deserializeAuxiliaryAmount(serialized);
+	return serialized;
+}
+
+function deserializeAuxiliaryAmount(value: string): bigint {
+	if (typeof value !== 'string' || !/^(0|[1-9][0-9]*)$/.test(value)) {
+		throw new Error('Malformed serialized asset amount');
+	}
+	const amount = strToBigint(value);
+	if (amount > 0xffffffffffffffffn) {
+		throw new Error('Serialized asset amount is out of range');
+	}
+	return amount;
 }

@@ -33,7 +33,7 @@ import type {
 	IHtlcSnapshotEntry,
 	HtlcDirection
 } from '../channel/types';
-import { DEFAULT_CHANNEL_CONFIG } from '../channel/types';
+import { DEFAULT_CHANNEL_CONFIG, isOverlayChannel } from '../channel/types';
 import type {
 	IPaymentInfo,
 	PaymentStatus,
@@ -58,6 +58,16 @@ import {
 } from './serialization-primitives';
 import { serializeHtlcEntry, deserializeHtlcEntry } from './htlc-serialization';
 import type { ISerializedHtlcEntry } from './htlc-serialization';
+import {
+	serializeAuxiliaryState,
+	deserializeAuxiliaryState,
+	serializeCustomRecords,
+	deserializeCustomRecords
+} from './auxiliary-serialization';
+import type {
+	ISerializedAuxiliaryState,
+	SerializedCustomRecords
+} from './auxiliary-serialization';
 
 // ─── Primitive helpers ───
 
@@ -506,6 +516,14 @@ export interface ISerializedChannelState {
 	/** FFOR Variant D epoch record (see IChannelState.ffor). */
 	ffor?: ISerializedFforEpoch | null;
 	fforUsedEpochIds?: string[];
+	/**
+	 * Asset channels only (see IChannelState). Each key is written only when
+	 * the channel has the value, so the row of every other channel is the
+	 * bytes it always was.
+	 */
+	fundingTaprootMerkleRoot?: string;
+	auxiliaryState?: ISerializedAuxiliaryState;
+	lastSentAuxiliaryRecords?: SerializedCustomRecords;
 }
 
 export interface ISerializedSpliceInFlight {
@@ -1026,7 +1044,18 @@ export function serializeChannelState(
 		ffor: s.ffor ? serializeFforEpoch(s.ffor) : null,
 		fforUsedEpochIds: s.fforUsedEpochIds?.length
 			? [...s.fforUsedEpochIds]
-			: undefined
+			: undefined,
+		// Asset channels only. Conditional on purpose: a row without asset
+		// state gains no key, so it and every recovery frame that carries it
+		// hash as they did before asset channels existed.
+		...serializeAssetChannelFields(s),
+		...(s.lastSentAuxiliaryRecords
+			? {
+					lastSentAuxiliaryRecords: serializeCustomRecords(
+						s.lastSentAuxiliaryRecords
+					)
+			  }
+			: {})
 	};
 }
 
@@ -1681,8 +1710,158 @@ export function deserializeChannelState(
 		ffor: s.ffor ? deserializeFforEpoch(s.ffor) : null,
 		fforUsedEpochIds: s.fforUsedEpochIds?.length
 			? [...s.fforUsedEpochIds]
-			: undefined
+			: undefined,
+		...(s.fundingTaprootMerkleRoot !== undefined
+			? {
+					fundingTaprootMerkleRoot: deserializeFundingTaprootMerkleRoot(
+						s.fundingTaprootMerkleRoot
+					)
+			  }
+			: {}),
+		...(s.auxiliaryState !== undefined
+			? { auxiliaryState: deserializeAuxiliaryState(s.auxiliaryState) }
+			: {}),
+		...(s.lastSentAuxiliaryRecords !== undefined
+			? {
+					lastSentAuxiliaryRecords: deserializeCustomRecords(
+						s.lastSentAuxiliaryRecords
+					)
+			  }
+			: {})
 	};
+}
+
+/** A stored asset funding root: exactly 32 bytes of lowercase hex, or a throw. */
+/**
+ * The funding root and asset state of an asset channel, and no key at all
+ * for any other channel. An asset channel is stored whole or not at all:
+ * the overlay channel type, the funding root and the asset state are only
+ * runnable together, so a state that has one without the others is refused
+ * here, at the save, where the fault is, and not at the next start. Each
+ * value goes through the reader's own checks for the same reason.
+ */
+function serializeAssetChannelFields(
+	s: IChannelState
+): Pick<
+	ISerializedChannelState,
+	'fundingTaprootMerkleRoot' | 'auxiliaryState'
+> {
+	if (
+		s.auxiliaryState === undefined &&
+		s.fundingTaprootMerkleRoot === undefined &&
+		!isOverlayChannel(s.channelType)
+	) {
+		return {};
+	}
+	const id = (s.channelId ?? s.temporaryChannelId).toString('hex');
+	if (!s.auxiliaryState || !s.fundingTaprootMerkleRoot) {
+		throw new Error(
+			`Refusing to store an incomplete asset channel (${id}): the overlay channel type, the funding root and the asset state go together`
+		);
+	}
+	if (!Buffer.isBuffer(s.fundingTaprootMerkleRoot)) {
+		throw new Error('Malformed asset funding root');
+	}
+	const fundingTaprootMerkleRoot = s.fundingTaprootMerkleRoot.toString('hex');
+	deserializeFundingTaprootMerkleRoot(fundingTaprootMerkleRoot);
+	return {
+		fundingTaprootMerkleRoot,
+		auxiliaryState: serializeAuxiliaryState(s.auxiliaryState)
+	};
+}
+
+/** Whether a channel row, as the codec writes it, carries any mark of an asset channel. */
+function channelRowCarriesAssetState(row: unknown): boolean {
+	if (!row || typeof row !== 'object' || Array.isArray(row)) return false;
+	const fields = row as Record<string, unknown>;
+	if (
+		fields.auxiliaryState !== undefined ||
+		fields.fundingTaprootMerkleRoot !== undefined
+	) {
+		return true;
+	}
+	return (
+		typeof fields.channelType === 'string' &&
+		/^(?:[0-9a-f]{2})+$/i.test(fields.channelType) &&
+		isOverlayChannel(Buffer.from(fields.channelType, 'hex'))
+	);
+}
+
+/**
+ * The stored form of an asset channel's row: the row inside an envelope.
+ *
+ * A release from before asset channels reads a channel row field by field
+ * and ignores keys it does not know, so it would load an asset channel as
+ * an ordinary one and write it back without its asset state. It cannot
+ * decode this envelope at all: it skips the row as corrupt, reports it and
+ * leaves it as it is, and the channel is whole again under a release that
+ * knows it.
+ */
+export interface IStoredAssetChannelRow {
+	assetChannelRow: 1;
+	channel: ISerializedChannelState;
+}
+
+/**
+ * The form a channel row is stored in. A channel without asset state is
+ * stored as the row it always was, byte for byte; an asset channel is
+ * stored in its envelope (IStoredAssetChannelRow).
+ */
+export function channelRowToStore(
+	row: ISerializedChannelState
+): ISerializedChannelState | IStoredAssetChannelRow {
+	return channelRowCarriesAssetState(row)
+		? { assetChannelRow: 1, channel: row }
+		: row;
+}
+
+/**
+ * The channel row inside its stored form, or a throw. The reader takes
+ * exactly what the writer makes: an envelope of this version around a row
+ * of an asset channel, or a bare row of a channel that is not one. An
+ * asset channel's row outside its envelope was written by nothing that
+ * knows asset channels, and is refused.
+ */
+export function channelRowFromStore(stored: unknown): ISerializedChannelState {
+	if (
+		stored &&
+		typeof stored === 'object' &&
+		!Array.isArray(stored) &&
+		'assetChannelRow' in stored
+	) {
+		const envelope = stored as Record<string, unknown>;
+		if (
+			envelope.assetChannelRow !== 1 ||
+			Object.keys(envelope).length !== 2 ||
+			!channelRowCarriesAssetState(envelope.channel)
+		) {
+			throw new Error('Malformed stored asset channel row');
+		}
+		return envelope.channel as ISerializedChannelState;
+	}
+	if (channelRowCarriesAssetState(stored)) {
+		throw new Error('An asset channel row is stored without its envelope');
+	}
+	return stored as ISerializedChannelState;
+}
+
+/**
+ * Whether a parsed channel row, stored or bare, belongs to an asset
+ * channel, told from its keys alone and without decoding it. A loader that
+ * skips rows it cannot decode uses this to tell an unreadable asset row
+ * from any other, because an asset channel that is silently left out is
+ * neither run nor watched.
+ */
+export function serializedChannelCarriesAssetState(row: unknown): boolean {
+	if (!row || typeof row !== 'object' || Array.isArray(row)) return false;
+	return 'assetChannelRow' in row || channelRowCarriesAssetState(row);
+}
+
+function deserializeFundingTaprootMerkleRoot(hex: string): Buffer {
+	if (typeof hex !== 'string' || !/^[0-9a-f]{64}$/.test(hex)) {
+		throw new Error('Malformed serialized asset funding root');
+	}
+	return Buffer.from(hex, 'hex');
 }
 
 // ─── IPaymentInfo ───

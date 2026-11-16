@@ -10,6 +10,10 @@ import { ShaChainStore } from '../keys/shachain';
 import type { IChannelBasepoints } from '../keys/derivation';
 import type { IFforEpochRecord } from '../ffor/types';
 import type { IChannelConfig, IHtlcEntry, IHtlcSnapshotEntry } from './types';
+import type {
+	IChannelAuxiliaryProvider,
+	IChannelAuxiliaryState
+} from './auxiliary';
 import {
 	ChannelState,
 	ChannelRole,
@@ -290,6 +294,25 @@ export interface IChannelState {
 	state: ChannelState;
 
 	/** Funding */
+	/**
+	 * Asset channels only: the asset commitment root the 2-of-2 taproot
+	 * funding key commits to. Absent on every other channel, where the
+	 * funding key has no script path.
+	 */
+	fundingTaprootMerkleRoot?: Buffer;
+	/**
+	 * Asset channels only: the asset state, journaled with the Bitcoin
+	 * commitment and revocation state in the same row. Its presence is what
+	 * makes a channel an asset channel.
+	 */
+	auxiliaryState?: IChannelAuxiliaryState;
+	/** Runtime only, never stored: the provider, reattached on every restore. */
+	auxiliaryProvider?: IChannelAuxiliaryProvider;
+	/**
+	 * Asset channels only: the custom records of the last commitment_signed
+	 * sent, so a retransmission carries the same asset signatures.
+	 */
+	lastSentAuxiliaryRecords?: ReadonlyMap<bigint, Buffer>;
 	fundingSatoshis: bigint;
 	pushMsat: bigint;
 	fundingTxid: Buffer | null;

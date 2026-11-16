@@ -6,8 +6,8 @@
  * The engine knows nothing of the asset itself. It keeps the Bitcoin
  * channel, asks the provider for one extra tapscript leaf per commitment
  * output, carries the provider's opaque bytes through storage and the wire,
- * and never hands the provider a private key. Everything here is a type; a
- * node without `INodeConfig.auxiliaryChannels` runs none of it.
+ * and never hands the provider a private key. A node without
+ * `INodeConfig.auxiliaryChannels` runs none of it.
  */
 
 import type * as bitcoin from 'bitcoinjs-lib';
@@ -295,4 +295,75 @@ export interface IChannelAuxiliaryProvider {
 	prepareSweep?(context: IAuxiliarySweepContext): IAuxiliarySweepResult;
 	/** Pre-sign only the first-level virtual transition before delegating a revoked child. */
 	prepareRevokedChild?(context: IAuxiliaryRevokedChildContext): Buffer;
+}
+
+/** An independent deep copy of the asset side of one commitment. */
+export function copyAuxiliaryCommitment(
+	data: IAuxiliaryCommitmentData
+): IAuxiliaryCommitmentData {
+	const copyLeaf = (leaf: ITaprootAuxLeaf): ITaprootAuxLeaf => ({
+		script: Buffer.from(leaf.script),
+		...(leaf.leafVersion !== undefined ? { leafVersion: leaf.leafVersion } : {})
+	});
+	return {
+		customData: Buffer.from(data.customData),
+		...(data.secondLevelRevocationKey
+			? {
+					secondLevelRevocationKey: Buffer.from(data.secondLevelRevocationKey)
+			  }
+			: {}),
+		...(data.secondLevelRevocationBasepoint
+			? {
+					secondLevelRevocationBasepoint: Buffer.from(
+						data.secondLevelRevocationBasepoint
+					)
+			  }
+			: {}),
+		...(data.secondLevelCommitmentTxid !== undefined
+			? { secondLevelCommitmentTxid: data.secondLevelCommitmentTxid }
+			: {}),
+		...(data.htlcOutputIndexes
+			? { htlcOutputIndexes: new Map(data.htlcOutputIndexes) }
+			: {}),
+		outputLeaves: new Map(
+			[...data.outputLeaves].map(([index, leaf]) => [index, copyLeaf(leaf)])
+		),
+		secondLevelLeaves: new Map(
+			[...data.secondLevelLeaves].map(([id, leaf]) => [id, copyLeaf(leaf)])
+		),
+		...(data.peerSignatures
+			? {
+					peerSignatures: new Map(
+						[...data.peerSignatures].map(([type, bytes]) => [
+							type,
+							Buffer.from(bytes)
+						])
+					)
+			  }
+			: {})
+	};
+}
+
+/**
+ * The provider of an asset channel, or a throw. A channel is run as an asset
+ * channel only with all three: its asset state, the provider that reads it,
+ * and the 32-byte root its funding key commits to. Anything less stops the
+ * transition that asked, so an asset channel is never signed for as an
+ * ordinary one.
+ */
+export function requireAuxiliaryProvider(
+	state: IChannelState
+): IChannelAuxiliaryProvider {
+	if (
+		!state.auxiliaryState ||
+		!state.auxiliaryProvider ||
+		!state.fundingTaprootMerkleRoot ||
+		state.fundingTaprootMerkleRoot.length !== 32
+	) {
+		const id = (state.channelId ?? state.temporaryChannelId).toString('hex');
+		throw new Error(
+			`Asset channel state or auxiliary provider is unavailable (channel ${id})`
+		);
+	}
+	return state.auxiliaryProvider;
 }

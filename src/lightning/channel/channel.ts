@@ -124,6 +124,8 @@ import {
 	recencyHoldOrigin
 } from './channel-state';
 import { recordRevokedHtlcSnapshot } from './htlc-snapshots';
+import type { IChannelAuxiliaryProvider } from './auxiliary';
+import { requireAuxiliaryProvider } from './auxiliary';
 import {
 	bigIntMax,
 	bigIntMin,
@@ -198,6 +200,7 @@ import {
 	hasScidAliasChannelType,
 	isAnchorChannel,
 	isTaprootChannel,
+	isOverlayChannel,
 	receivedAddIrrevocablyCommitted,
 	scidAliasAnnounceRefusal,
 	validateV2ChannelType
@@ -1424,8 +1427,30 @@ export class Channel {
 		setScid: (field, scid): void => this._setScid(field, scid)
 	});
 
-	constructor(state: IChannelState, signer?: ISigner) {
+	/**
+	 * @param auxiliaryProvider - The node's auxiliary channel provider, if it
+	 *   has one. Attached only when `state` is an asset channel; a restore
+	 *   passes it at every site because no provider is ever stored.
+	 */
+	constructor(
+		state: IChannelState,
+		signer?: ISigner,
+		auxiliaryProvider?: IChannelAuxiliaryProvider
+	) {
 		this._state = state;
+		// Asset channels (issue #2093). A channel with asset state, an asset
+		// funding root or the overlay channel type is never built without
+		// its provider: this throws instead, so no caller can go on to sign
+		// for it as an ordinary channel. Any other channel does not see the
+		// provider at all.
+		if (
+			state.auxiliaryState ||
+			state.fundingTaprootMerkleRoot ||
+			isOverlayChannel(state.channelType)
+		) {
+			if (auxiliaryProvider) state.auxiliaryProvider = auxiliaryProvider;
+			requireAuxiliaryProvider(state);
+		}
 		this._signer = signer || null;
 		const f = state.ffor;
 		this._fforActivateAckUnsent =
