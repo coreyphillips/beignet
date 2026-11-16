@@ -265,8 +265,11 @@ describe('a provider that cannot answer for a message of the peer (issue #2093 s
 		payAssetUnits(alice, bob, channelId, invoice, 5_000_000n, 5000n);
 		await turns(200);
 		expect(blame).to.deep.equal(['Invalid asset HTLC signature']);
+		// The provider answered that the peer's data is bad: the channel
+		// fails, and since step 10 a failed asset channel is force closed
+		// like any other, where before it could only be left in error.
 		expect(bob.node.getAuxiliaryChannelInfo(channelId)!.state).to.equal(
-			ChannelState.ERRORED
+			ChannelState.FORCE_CLOSED
 		);
 	});
 
