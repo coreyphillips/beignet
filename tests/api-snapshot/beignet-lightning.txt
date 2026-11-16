@@ -970,11 +970,17 @@ function chain.selectTheirPerCommitmentPoint(tx: bitcoinjs-lib#Transaction, stat
 function chain.signP2wpkhInput(tx: bitcoinjs-lib#Transaction, inputIndex: number, pubkey: Buffer, value: number, privateKey: Buffer): Buffer
 function chain.signSweepInput(tx: bitcoinjs-lib#Transaction, inputIndex: number, witnessScript: Buffer, value: number, privateKey: Buffer, sighashType?: number): Buffer
 namespace channel
+const channel.AUXILIARY_CHANNELS_API: Readonly<{ version: 0; surfaces: readonly [ "valueIncomingHtlc:three-outcome", "sendPaymentToRoute:assetPayment", "getAuxiliaryPaymentHtlcs", "onHtlcResolved:htlcId", "queryAuxiliaryRoute", "fundAuxiliaryChannel:unsigned", "onFundingSigned", "abandonAuxiliaryOpen", "IChannelInfo.auxiliary" ]; }>
 const channel.AUXILIARY_CHANNEL_DUST_LIMIT = 354n
 class channel.AuxiliaryChannelUnsupportedError extends beignet#CodedError<'ASSET_CHANNEL_UNSUPPORTED'>
 constructor channel.AuxiliaryChannelUnsupportedError(channelId: string, operation: channel.AuxiliaryUnsupportedOperation)
 readonly property channel.AuxiliaryChannelUnsupportedError.channelId: string
 readonly property channel.AuxiliaryChannelUnsupportedError.operation: channel.AuxiliaryUnsupportedOperation
+type channel.AuxiliaryChannelsSurface = (typeof channel.AUXILIARY_CHANNELS_API.surfaces)[number]
+class channel.AuxiliaryOpenError extends beignet#CodedError<channel.AuxiliaryOpenErrorCode>
+constructor channel.AuxiliaryOpenError(code: channel.AuxiliaryOpenErrorCode, channelId: Buffer, message: string)
+readonly property channel.AuxiliaryOpenError.channelId: string
+type channel.AuxiliaryOpenErrorCode = 'ASSET_OPEN_IRREVOCABLE' | 'ASSET_OPEN_UNKNOWN'
 class channel.AuxiliaryProviderError extends beignet#CodedError<'ASSET_PROVIDER_REFUSED'>
 constructor channel.AuxiliaryProviderError(channelId: string, operation: string, cause: unknown)
 readonly property channel.AuxiliaryProviderError.channelId: string
@@ -1300,6 +1306,7 @@ member channel.ChannelErrorCode.UNSUPPORTED = "UNSUPPORTED"
 member channel.ChannelErrorCode.WRONG_STATE = "WRONG_STATE"
 class channel.ChannelManager extends TypedEmitter<channel.ChannelManagerEvents>
 constructor channel.ChannelManager(config: channel.IChannelManagerConfig)
+method channel.ChannelManager.abandonAuxiliaryOpen(id: Buffer, reason: string): Buffer | undefined
 method channel.ChannelManager.abandonSpliceConflictRequest(channelId: Buffer): channel.ChannelResult
 method channel.ChannelManager.abortDualFundedOpen(channelId: Buffer, reason?: string): { ok: boolean; error?: string; pending?: boolean; }
 method channel.ChannelManager.abortFforEpoch(channelId: Buffer, reason?: ffor.FforAbortReason, text?: string): channel.ChannelResult
@@ -1602,6 +1609,7 @@ method channel.IAuxiliaryChannelConfig.beforeFundingCreated?(channel: channel.Ch
 property channel.IAuxiliaryChannelConfig.initCustomRecords?: message.CustomRecords
 method channel.IAuxiliaryChannelConfig.onAccepted?(channel: channel.Channel, peerPubkey: string): void
 method channel.IAuxiliaryChannelConfig.onForwardAdmissionFailed?(context: channel.IAuxiliaryForwardPlacement & { customRecords?: message.CustomRecords; }): void
+method channel.IAuxiliaryChannelConfig.onFundingSigned?(context: channel.IAuxiliaryFundingSigned): void
 method channel.IAuxiliaryChannelConfig.onHtlcResolved?(context: channel.IAuxiliaryHtlcResolution & { state: channel.IChannelState; peerPubkey: string; channelId: Buffer; }): void
 method channel.IAuxiliaryChannelConfig.openingCsvPolicy?(peerPubkey: string): channel.IAuxiliaryOpeningCsvPolicy | undefined
 method channel.IAuxiliaryChannelConfig.prepareForwardHtlc?(context: channel.IAuxiliaryForwardPlacement): channel.IAuxiliaryPayment
@@ -1685,6 +1693,14 @@ property channel.IAuxiliaryFundingDescriptor.fundingTaprootMerkleRoot: Buffer
 property channel.IAuxiliaryFundingDescriptor.localBalance: bigint
 property channel.IAuxiliaryFundingDescriptor.remoteBalance: bigint
 property channel.IAuxiliaryFundingDescriptor.temporaryChannelId: Buffer
+interface channel.IAuxiliaryFundingOptions
+property channel.IAuxiliaryFundingOptions.prevoutScripts?: Buffer[]
+interface channel.IAuxiliaryFundingSigned
+property channel.IAuxiliaryFundingSigned.channelId: Buffer
+property channel.IAuxiliaryFundingSigned.fundingOutputIndex: number
+property channel.IAuxiliaryFundingSigned.fundingTxid: Buffer
+property channel.IAuxiliaryFundingSigned.peerPubkey: string
+property channel.IAuxiliaryFundingSigned.temporaryChannelId: Buffer
 interface channel.IAuxiliaryHtlcResolution
 property channel.IAuxiliaryHtlcResolution.auxiliaryAmount: bigint
 property channel.IAuxiliaryHtlcResolution.customRecords?: message.CustomRecords
@@ -6075,6 +6091,7 @@ constructor node.LightningNode(nodeConfig: node.INodeConfig)
 static property node.LightningNode.AFTER_GRAPH_RESTORE_MAX: number
 static property node.LightningNode.GRAPH_RESTORE_SLICE_MS: number
 static property node.LightningNode.RAPID_GOSSIP_SLICE_MS: number
+method node.LightningNode.abandonAuxiliaryOpen(id: Buffer, reason?: string): void
 method node.LightningNode.abortCompositeSplice(id: Buffer, reason?: string): { ok: boolean; error?: string; code?: node.CompositeSpliceRefusalCode; }
 method node.LightningNode.abortDualFundedOpen(channelId: Buffer, reason?: string): { ok: boolean; error?: string; pending?: boolean; }
 method node.LightningNode.abortFforEpoch(channelIdHex: string, reason?: ffor.FforAbortReason, text?: string): channel.ChannelResult
@@ -6121,7 +6138,7 @@ method node.LightningNode.flushGossip(): Promise<void>
 method node.LightningNode.forceCloseChannel(channelId: Buffer, destinationScript: Buffer): { ok: boolean; error?: string; commitmentTxid?: string; }
 method node.LightningNode.forgetAsyncReceiveGrant(lspNodeIdHex: string): boolean
 static method node.LightningNode.fromMnemonic(mnemonic: string, options?: node.LightningNodeSeedOptions): node.LightningNode
-method node.LightningNode.fundAuxiliaryChannel(peerPubkey: string, temporaryChannelId: Buffer, txHex: string, outputIndex: number, channelData: Buffer): Buffer
+method node.LightningNode.fundAuxiliaryChannel(peerPubkey: string, temporaryChannelId: Buffer, txHex: string, outputIndex: number, channelData: Buffer, options?: channel.IAuxiliaryFundingOptions): Buffer
 method node.LightningNode.getActionLog(options?: { category?: string; since?: number; limit?: number; }): node.IStructuredLog[]
 method node.LightningNode.getAsyncPaymentManager(): asyncPayments.AsyncPaymentManager
 method node.LightningNode.getAsyncReceiveService(): asyncPayments.AsyncReceiveService

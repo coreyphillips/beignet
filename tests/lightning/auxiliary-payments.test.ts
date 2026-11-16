@@ -19,6 +19,7 @@ import {
 	PaymentStatus
 } from '../../src/lightning/node/types';
 import type { IAuxiliaryChannelConfig } from '../../src/lightning/channel/auxiliary-funding';
+import { channel as lightningChannel } from '../../src/lightning';
 import { HtlcDirection } from '../../src/lightning/channel/types';
 import {
 	constructOnionPacket,
@@ -1249,6 +1250,40 @@ describe('Asset payments (issue #2093, step 8)', function () {
 				expect(made.bobChannel.getFullState().htlcs.size).to.equal(0);
 			});
 		}
+	});
+
+	describe('what the build says it offers a host', () => {
+		it('is one constant at the lightning entry, with a version and the surfaces present', () => {
+			const api = lightningChannel.AUXILIARY_CHANNELS_API;
+			// 0 until the build can also close and defend an asset channel:
+			// asset openings are off in it, and a host treats it as unsupported.
+			expect(api.version).to.equal(0);
+			expect([...api.surfaces]).to.deep.equal([
+				'valueIncomingHtlc:three-outcome',
+				'sendPaymentToRoute:assetPayment',
+				'getAuxiliaryPaymentHtlcs',
+				'onHtlcResolved:htlcId',
+				'queryAuxiliaryRoute',
+				'fundAuxiliaryChannel:unsigned',
+				'onFundingSigned',
+				'abandonAuxiliaryOpen',
+				'IChannelInfo.auxiliary'
+			]);
+			expect(Object.isFrozen(api)).to.equal(true);
+			expect(Object.isFrozen(api.surfaces)).to.equal(true);
+			// Each named member is there to be called.
+			const node = assetHost('aux-api', 1);
+			hosts.push(node);
+			for (const member of [
+				'getAuxiliaryPaymentHtlcs',
+				'queryAuxiliaryRoute',
+				'abandonAuxiliaryOpen',
+				'fundAuxiliaryChannel',
+				'getAuxiliaryChannelInfo'
+			] as const) {
+				expect(typeof node.node[member]).to.equal('function');
+			}
+		});
 	});
 
 	describe('update_add_htlc', () => {

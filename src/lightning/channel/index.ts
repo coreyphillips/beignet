@@ -15,3 +15,4 @@ export * from './dual-funding';
 export * from './auxiliary';
 export * from './auxiliary-funding';
 export * from './auxiliary-guard';
+export * from './auxiliary-api';
