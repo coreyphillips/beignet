@@ -4486,6 +4486,49 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 	}
 
 	/**
+	 * Forget a recorded preimage that was never used: that of a hold invoice
+	 * whose settle was given up before any HTLC took it. `held` names the
+	 * HTLCs the settle was for. Refused, with nothing forgotten, while a
+	 * chain monitor wants or holds a preimage for the hash (a claim on chain
+	 * may carry it), or while another received HTLC of the hash is in a
+	 * channel (its claim may still need it).
+	 */
+	forgetPreimage(
+		paymentHash: Buffer,
+		held: ReadonlyArray<{ channelId: Buffer; htlcId: bigint }>
+	): boolean {
+		const hashHex = paymentHash.toString('hex');
+		for (const monitor of this.monitors.values()) {
+			if (
+				typeof monitor.wantsPreimage !== 'function' ||
+				monitor.wantsPreimage(paymentHash) ||
+				(typeof monitor.getKnownPreimages === 'function' &&
+					monitor.getKnownPreimages().has(hashHex))
+			) {
+				return false;
+			}
+		}
+		for (const [idHex, channel] of this.channels) {
+			for (const [key, htlc] of channel.getFullState().htlcs) {
+				if (
+					!key.startsWith('received-') ||
+					!htlc.paymentHash?.equals(paymentHash)
+				) {
+					continue;
+				}
+				const settleWasForIt = held.some(
+					(h) =>
+						h.channelId.toString('hex') === idHex &&
+						`received-${h.htlcId}` === key
+				);
+				if (!settleWasForIt) return false;
+			}
+		}
+		this._knownPreimages.delete(hashHex);
+		return true;
+	}
+
+	/**
 	 * Seed a freshly created/restored monitor with the known preimages it
 	 * wants (ChainMonitor.wantsPreimage).
 	 *

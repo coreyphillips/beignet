@@ -18,6 +18,7 @@ import { createHash } from 'crypto';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
+import { HELD_HTLC_EXPIRY_MARGIN } from '../../src/lightning/node/config';
 import {
 	AuxiliaryPaymentError,
 	PaymentStatus
@@ -91,13 +92,15 @@ describe('a hold invoice paid over an asset channel (issue #2093 step 8)', funct
 	async function held(
 		tag: string,
 		arm: { down: boolean; thrown: number },
-		bobHooks: Parameters<typeof assetHost>[2] = {}
+		bobHooks: Parameters<typeof assetHost>[2] = {},
+		bobFile?: string
 	): Promise<{
 		alice: IAssetHost;
 		bob: IAssetHost;
 		channelId: Buffer;
 		paymentHash: Buffer;
 		preimage: Buffer;
+		invoice: { paymentHash: Buffer; paymentSecret?: Buffer };
 	}> {
 		const alice = assetHost(tag, 1, {}, { sqlite: true });
 		const bob = assetHost(
@@ -113,7 +116,7 @@ describe('a hold invoice paid over an asset channel (issue #2093 step 8)', funct
 				valueIncomingHtlc: (context) => context.auxiliaryAmount! * 1000n,
 				...bobHooks
 			},
-			{ sqlite: true }
+			bobFile ? { sqlitePath: bobFile } : { sqlite: true }
 		);
 		hosts.push(alice, bob);
 		connectHosts(alice, bob);
@@ -133,8 +136,28 @@ describe('a hold invoice paid over an asset channel (issue #2093 step 8)', funct
 		payAssetUnits(alice, bob, channelId, invoice, 5_000_000n, 5000n);
 		await turns(200);
 		expect(inFlight(bob, channelId)).to.have.length(1);
-		return { alice, bob, channelId, paymentHash, preimage };
+		return { alice, bob, channelId, paymentHash, preimage, invoice };
 	}
+
+	/** Where a node keeps the preimage of a hash: its own copy, the channel manager's, the stored row. */
+	const preimageKept = (
+		host: IAssetHost,
+		hashHex: string
+	): { node: boolean; manager: boolean; stored: boolean } => ({
+		node: (
+			host.node as unknown as { preimages: Map<string, Buffer> }
+		).preimages.has(hashHex),
+		manager: (
+			host.node.getChannelManager() as unknown as {
+				_knownPreimages: Map<string, Buffer>;
+			}
+		)._knownPreimages.has(hashHex),
+		stored: host
+			.storage!.loadAllPreimages()
+			.some((row) => row.paymentHash === hashHex)
+	});
+	const everywhere = { node: true, manager: true, stored: true };
+	const nowhere = { node: false, manager: false, stored: false };
 
 	it('is valued once, at its acceptance, is listed in flight, and is settled after a restart for what it was valued at', async () => {
 		const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'aux-hold-'));
@@ -309,14 +332,21 @@ describe('a hold invoice paid over an asset channel (issue #2093 step 8)', funct
 		await turns(50);
 		const expiry =
 			bob.node.getAuxiliaryChannelInfo(channelId)!.htlcs[0].cltvExpiry;
-		bob.node.handleNewBlock(expiry);
-		await turns(100);
-		// The provider answers again, too late: the peer can already take
-		// the HTLC back on chain, and the preimage is not given to it.
+		// The node is at the HTLC's expiry and its block work has not given
+		// the settle up (it was away): the provider answers again, too late.
+		// The peer can already take the HTLC back on chain, and the preimage
+		// is not given to it.
+		(bob.node as unknown as { currentBlockHeight: number }).currentBlockHeight =
+			expiry;
 		arm.down = false;
 		periodicWork(bob);
+		await turns(100);
+		expect(inFlight(bob, channelId)).to.have.length(1);
+		expect(received).to.deep.equal([]);
+		// Its next block gives the settle up and fails the HTLC back.
 		bob.node.handleNewBlock(expiry + 1);
 		await turns(200);
+		expect(inFlight(bob, channelId)).to.deep.equal([]);
 		expect(received).to.deep.equal([]);
 		expect(bob.node.getPayment(paymentHash)!.status).to.not.equal(
 			PaymentStatus.COMPLETED
@@ -326,7 +356,7 @@ describe('a hold invoice paid over an asset channel (issue #2093 step 8)', funct
 		);
 	});
 
-	it('a settle the asset provider refused is given up when the held HTLC has expired: the HTLC is failed back, the invoice ends cancelled, the host is told, and nothing stays parked', async () => {
+	it('a settle the asset provider refused is given up 18 blocks before the held HTLC expires, where a hold nobody settled is cancelled: the HTLC is failed back, the invoice ends cancelled, the host is told, and nothing stays parked', async () => {
 		const arm = { down: false, thrown: 0 };
 		const outcomes: string[] = [];
 		const { alice, bob, channelId, paymentHash, preimage } = await held(
@@ -344,23 +374,32 @@ describe('a hold invoice paid over an asset channel (issue #2093 step 8)', funct
 		const received = paid(bob);
 		const parked = bob.node as unknown as {
 			heldHtlcs: Map<string, unknown[]>;
-			heldResolutions: Map<string, unknown>;
+			heldResolutions: Map<string, { outcome: string }>;
 		};
 		arm.down = true;
 		expect(bob.node.settleHeldHtlc(paymentHash, preimage)).to.equal(false);
 		await turns(50);
 		const expiry =
 			bob.node.getAuxiliaryChannelInfo(channelId)!.htlcs[0].cltvExpiry;
-		// The provider is still down as the HTLC expires: the settle is
-		// given up, and the fail back it is turned into is refused and owed.
-		bob.node.handleNewBlock(expiry);
+		expect(HELD_HTLC_EXPIRY_MARGIN).to.equal(18);
+		// One block before the margin the settle is still chosen and asked
+		// for, with its preimage kept.
+		bob.node.handleNewBlock(expiry - HELD_HTLC_EXPIRY_MARGIN - 1);
 		await turns(100);
+		expect(parked.heldResolutions.get(hashHex)!.outcome).to.equal('settle');
+		expect(preimageKept(bob, hashHex)).to.deep.equal(everywhere);
+		// At the margin the provider is still down: the settle is given up,
+		// and the fail back it is turned into is refused and owed.
+		bob.node.handleNewBlock(expiry - HELD_HTLC_EXPIRY_MARGIN);
+		await turns(100);
+		expect(parked.heldResolutions.get(hashHex)!.outcome).to.equal('cancel');
 		expect(inFlight(bob, channelId)).to.have.length(1);
 		expect(parked.heldHtlcs.get(hashHex)).to.have.length(1);
 		expect(outcomes).to.deep.equal([]);
 
+		// The payer is failed back with blocks to spare.
 		arm.down = false;
-		bob.node.handleNewBlock(expiry + 1);
+		bob.node.handleNewBlock(expiry - HELD_HTLC_EXPIRY_MARGIN + 1);
 		await turns(200);
 		expect(inFlight(bob, channelId)).to.deep.equal([]);
 		expect(alice.node.getPayment(paymentHash)!.status).to.equal(
@@ -379,6 +418,85 @@ describe('a hold invoice paid over an asset channel (issue #2093 step 8)', funct
 		expect(parked.heldHtlcs.size).to.equal(0);
 		expect(parked.heldResolutions.size).to.equal(0);
 		expect(bob.node.settleHeldHtlc(paymentHash, preimage)).to.equal(false);
+	});
+
+	it('a hold invoice cancelled after its settle was given up is never settled: the preimage the refused settle stored is forgotten, and a later HTLC of the hash is failed back, also after a restart', async () => {
+		const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'aux-hold-'));
+		directories.push(directory);
+		const file = path.join(directory, 'bob.sqlite');
+		const arm = { down: false, thrown: 0 };
+		const { alice, bob, channelId, paymentHash, preimage, invoice } =
+			await held('aux-hold-forgotten', arm, {}, file);
+		const hashHex = paymentHash.toString('hex');
+		expect(preimageKept(bob, hashHex)).to.deep.equal(nowhere);
+		arm.down = true;
+		expect(bob.node.settleHeldHtlc(paymentHash, preimage)).to.equal(false);
+		await turns(50);
+		// The refused settle stored the preimage: it is asked for again, and
+		// a channel that went to chain would claim the HTLC with it.
+		expect(preimageKept(bob, hashHex)).to.deep.equal(everywhere);
+
+		// Given up with the provider still down: the preimage, which no HTLC
+		// took, is forgotten before the fail back is made.
+		const expiry =
+			bob.node.getAuxiliaryChannelInfo(channelId)!.htlcs[0].cltvExpiry;
+		bob.node.handleNewBlock(expiry - HELD_HTLC_EXPIRY_MARGIN);
+		await turns(100);
+		expect(inFlight(bob, channelId)).to.have.length(1);
+		expect(preimageKept(bob, hashHex)).to.deep.equal(nowhere);
+		arm.down = false;
+		periodicWork(bob);
+		await turns(200);
+		expect(inFlight(bob, channelId)).to.deep.equal([]);
+		expect(bob.node.getInvoice(hashHex)!.cancelledAt).to.be.a('number');
+		expect(alice.node.getPayment(paymentHash)!.status).to.equal(
+			PaymentStatus.FAILED
+		);
+
+		// The host offers the preimage again: nothing takes it or keeps it.
+		expect(bob.node.settleHeldHtlc(paymentHash, preimage)).to.equal(false);
+		expect(preimageKept(bob, hashHex)).to.deep.equal(nowhere);
+
+		// A later HTLC of the hash is failed back.
+		const received = paid(bob);
+		payAssetUnits(alice, bob, channelId, invoice, 5_000_000n, 5000n);
+		await turns(200);
+		expect(received).to.deep.equal([]);
+		expect(inFlight(bob, channelId)).to.deep.equal([]);
+		expect(alice.node.getPayment(paymentHash)!.status).to.equal(
+			PaymentStatus.FAILED
+		);
+		expect(units(alice, channelId)).to.equal(9000n);
+		expect(units(bob, channelId)).to.equal(1000n);
+
+		// And after a restart, which reads every stored preimage back.
+		bob.node.destroy();
+		bob.storage!.close();
+		const restarted = assetHost(
+			'aux-hold-forgotten',
+			2,
+			{ valueIncomingHtlc: (context) => context.auxiliaryAmount! * 1000n },
+			{ sqlitePath: file }
+		);
+		hosts.push(restarted);
+		const later = paid(restarted);
+		connectHosts(alice, restarted);
+		await reconnectHosts(alice, restarted);
+		await turns(100);
+		expect(preimageKept(restarted, hashHex)).to.deep.equal(nowhere);
+		expect(restarted.node.getInvoice(hashHex)!.cancelledAt).to.be.a('number');
+		payAssetUnits(alice, restarted, channelId, invoice, 5_000_000n, 5000n);
+		await turns(200);
+		expect(later).to.deep.equal([]);
+		expect(inFlight(restarted, channelId)).to.deep.equal([]);
+		expect(alice.node.getPayment(paymentHash)!.status).to.equal(
+			PaymentStatus.FAILED
+		);
+		expect(restarted.node.getPayment(paymentHash)!.status).to.equal(
+			PaymentStatus.FAILED
+		);
+		expect(units(alice, channelId)).to.equal(9000n);
+		expect(units(restarted, channelId)).to.equal(1000n);
 	});
 
 	it('a held asset HTLC that has left its channel another way is not kept parked, and its invoice ends cancelled', async () => {

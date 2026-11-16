@@ -24287,12 +24287,19 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	 * parked for ever.
 	 *
 	 * A settle the asset provider refused stays chosen (settleHeldHtlc) and
-	 * is not made once the HTLC has expired. When every HTLC of such a set
-	 * has expired and none was settled, the settle is given up and the set
-	 * is cancelled: the HTLC is failed back, the invoice ends cancelled and
-	 * its payment FAILED, and the host hears of the HTLC through
+	 * is not made once the HTLC has expired. When an HTLC of such a set
+	 * comes within HELD_HTLC_EXPIRY_MARGIN blocks of its expiry and none was
+	 * settled, the settle is given up and the set is cancelled, at the
+	 * height a hold nobody chose an outcome for is cancelled at: the payer
+	 * is failed back in time and has no reason to go to chain. No HTLC took
+	 * the settle, so the preimage was never sent, and it is forgotten
+	 * before the cancel (forgetPreimageNeverSent): a cancelled hold invoice
+	 * is never settled. The HTLC is failed back, the invoice ends cancelled
+	 * and its payment FAILED, and the host hears of the HTLC through
 	 * onHtlcResolved when it has left the channel. A fail back that is
-	 * refused stays chosen in its turn and is asked for again.
+	 * refused stays chosen in its turn and is asked for again. A set with
+	 * an HTLC whose channel is on chain keeps its settle: the claim on
+	 * chain may already carry the preimage.
 	 *
 	 * A parked asset HTLC that is no longer in its channel (the chain or
 	 * the peer took it, or the channel is gone) is taken out of its set,
@@ -24364,7 +24371,11 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			if (
 				resolution?.outcome === 'settle' &&
 				resolution.resolved.length === 0 &&
-				remaining.every((h) => h.cltvExpiry > 0 && h.cltvExpiry <= height)
+				remaining.some(
+					(h) =>
+						h.cltvExpiry > 0 && h.cltvExpiry - height <= HELD_HTLC_EXPIRY_MARGIN
+				) &&
+				this.forgetPreimageNeverSent(paymentHash, remaining)
 			) {
 				this.heldResolutions.delete(hashHex);
 				this.emitStructuredLog('htlc', 'held_asset_settle_given_up', {
@@ -24379,6 +24390,36 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				);
 			}
 		}
+	}
+
+	/**
+	 * The preimage of a hold settle that is given up before any HTLC took it
+	 * is forgotten everywhere it was put when the settle was asked for: its
+	 * stored row, this node's copy and the channel manager's, from which a
+	 * channel that goes to chain claims its received HTLCs. No later HTLC
+	 * of the hash, in a channel or on chain, is then claimed with it. False,
+	 * with nothing forgotten, when a claim on chain may already carry it or
+	 * its row could not be deleted: the settle then stays chosen.
+	 */
+	private forgetPreimageNeverSent(
+		paymentHash: Buffer,
+		held: ReadonlyArray<{ channelId: Buffer; htlcId: bigint }>
+	): boolean {
+		const hashHex = paymentHash.toString('hex');
+		const preimage = this.preimages.get(hashHex);
+		if (!this.channelManager.forgetPreimage(paymentHash, held)) return false;
+		if (
+			!this.commitMutations(
+				'forget the preimage of a hold settle given up',
+				[{ type: 'delete_preimage', paymentHash: hashHex }],
+				RecoveryCriticality.SafetyCritical
+			)
+		) {
+			if (preimage) this.channelManager.recordPreimage(paymentHash, preimage);
+			return false;
+		}
+		this.preimages.delete(hashHex);
+		return true;
 	}
 
 	/**
