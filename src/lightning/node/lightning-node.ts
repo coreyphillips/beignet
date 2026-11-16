@@ -86,6 +86,7 @@ import { ChannelManager, txInputOutpoints } from '../channel/channel-manager';
 import type { ChannelResult } from '../channel/types';
 import type {
 	IAuxiliaryChannelConfig,
+	IAuxiliaryFundingOptions,
 	IAuxiliaryChannelHtlc,
 	IAuxiliaryChannelInfo,
 	IAuxiliaryPaymentHtlc,
@@ -29592,20 +29593,104 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	}
 
 	/**
-	 * Fund an accepted asset channel with the transaction the host built and
-	 * fully signed, and send funding_created. The transaction has to pay the
-	 * negotiated amount to the channel's funding key, tweaked by its asset
-	 * root, at `outputIndex`. It is kept and broadcast once the peer's
-	 * funding_signed is durable, like the funding of any channel this node
-	 * opens. Returns the channel id.
+	 * An unsigned asset funding transaction has to be one whose id cannot
+	 * change when it is signed: no input carries a witness yet, and every
+	 * input spends a witness program, natively (an empty scriptSig) or
+	 * nested in P2SH (a scriptSig that is already the one push of the
+	 * program the output commits to).
+	 */
+	private requireUnsignedSegwitFunding(
+		tx: bitcoin.Transaction,
+		prevoutScripts: Buffer[],
+		named: (reason: string) => Error
+	): void {
+		if (
+			tx.ins.length === 0 ||
+			!Array.isArray(prevoutScripts) ||
+			prevoutScripts.length !== tx.ins.length ||
+			prevoutScripts.some((script) => !Buffer.isBuffer(script))
+		) {
+			throw named(
+				'Asset funding transaction needs the script each of its inputs spends'
+			);
+		}
+		if (tx.ins.some((input) => input.witness.length > 0)) {
+			throw named(
+				'Asset funding transaction given with the scripts it spends has to be unsigned'
+			);
+		}
+		const witnessProgram = (script: Buffer): boolean =>
+			script.length >= 4 &&
+			script.length <= 42 &&
+			(script[0] === 0x00 || (script[0] >= 0x51 && script[0] <= 0x60)) &&
+			script[1] === script.length - 2;
+		tx.ins.forEach((input, index) => {
+			const spent = prevoutScripts[index];
+			const native = witnessProgram(spent) && input.script.length === 0;
+			const nested =
+				spent.length === 23 &&
+				spent[0] === 0xa9 &&
+				spent[1] === 0x14 &&
+				spent[22] === 0x87 &&
+				input.script.length > 1 &&
+				input.script[0] === input.script.length - 1 &&
+				witnessProgram(input.script.subarray(1)) &&
+				bitcoin.crypto
+					.hash160(input.script.subarray(1))
+					.equals(spent.subarray(2, 22));
+			if (!native && !nested) {
+				throw named(
+					'Asset funding transaction has an input that is not segwit'
+				);
+			}
+		});
+	}
+
+	/**
+	 * Give up an asset opening this node began, before the peer's
+	 * funding_signed is verified. `id` is the opening's temporary channel id
+	 * or its channel id. The peer is told to forget the channel, nothing of
+	 * the opening stays in this node or its storage, a funding transaction
+	 * it was given signed is dropped unbroadcast, and the channel's key
+	 * index goes the way it does for any opening that fails before it is
+	 * funded. Throws an AuxiliaryOpenError with code ASSET_OPEN_IRREVOCABLE
+	 * once funding_signed is verified, and ASSET_OPEN_UNKNOWN for an id that
+	 * is not an asset opening of this node.
+	 */
+	abandonAuxiliaryOpen(
+		id: Buffer,
+		reason = 'The asset channel opening was abandoned'
+	): void {
+		const fundingTxid = this.channelManager.abandonAuxiliaryOpen(id, reason);
+		if (fundingTxid) this.deletePendingFundingTx(fundingTxid.toString('hex'));
+	}
+
+	/**
+	 * Fund an accepted asset channel with the transaction the host built,
+	 * and send funding_created. The transaction has to pay the negotiated
+	 * amount to the channel's funding key, tweaked by its asset root, at
+	 * `outputIndex`. Returns the channel id.
+	 *
+	 * Two forms. With `options.prevoutScripts` the transaction is unsigned:
+	 * no input carries a witness, and the script each input spends is given
+	 * so that the node can see every input is segwit and the transaction id
+	 * final. The node keeps nothing of it and broadcasts nothing: the host
+	 * signs and publishes it once `onFundingSigned` says the peer has signed
+	 * this node's first commitment, and until then can abandon the opening
+	 * (`abandonAuxiliaryOpen`). Without the option the transaction is fully
+	 * signed: it is kept, in this node's own storage, and broadcast once the
+	 * peer's funding_signed is durable, like the funding of any channel
+	 * this node opens.
 	 */
 	fundAuxiliaryChannel(
 		peerPubkey: string,
 		temporaryChannelId: Buffer,
 		txHex: string,
 		outputIndex: number,
-		channelData: Buffer
+		channelData: Buffer,
+		options?: IAuxiliaryFundingOptions
 	): Buffer {
+		const unsigned = options?.prevoutScripts !== undefined;
 		peerPubkey = normalizeHexPubkey(peerPubkey);
 		const named = (reason: string): Error =>
 			new Error(
@@ -29632,7 +29717,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		) {
 			throw named('Asset channel is not ready for funding');
 		}
-		if (!this.fundingProvider && !this._chainBackend) {
+		if (!unsigned && !this.fundingProvider && !this._chainBackend) {
 			throw named('Asset channel funding requires a transaction broadcaster');
 		}
 		let tx: bitcoin.Transaction;
@@ -29661,7 +29746,9 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				'Asset funding transaction does not match the negotiated output'
 			);
 		}
-		if (
+		if (unsigned) {
+			this.requireUnsignedSegwitFunding(tx, options.prevoutScripts!, named);
+		} else if (
 			tx.ins.length === 0 ||
 			tx.ins.some(
 				(input) => input.witness.length === 0 && input.script.length === 0
@@ -29683,6 +29770,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				script[1] === 0x00 &&
 				script[2] === 0x20);
 		if (
+			!unsigned &&
 			tx.ins.some(
 				(input) =>
 					input.witness.length === 0 ||
@@ -29697,8 +29785,12 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			channelData
 		);
 		const txid = Buffer.from(tx.getHash());
-		channel.retainFundingPayload(txHex);
-		this.setPendingFundingTx(txid.toString('hex'), txHex);
+		// An unsigned funding is the host's to sign and publish: nothing of
+		// it is kept here, and nothing is owed to the network by this node.
+		if (!unsigned) {
+			channel.retainFundingPayload(txHex);
+			this.setPendingFundingTx(txid.toString('hex'), txHex);
+		}
 		let channelId: Buffer | null = null;
 		try {
 			channelId = this.channelManager.createFunding(

@@ -7,7 +7,7 @@
  */
 
 import { auxiliaryProviderError } from './auxiliary';
-import { auxiliaryUnsupported } from './auxiliary-guard';
+import { AuxiliaryOpenError, auxiliaryUnsupported } from './auxiliary-guard';
 import { auxiliaryChannelOpens } from './auxiliary-switch';
 import type { CustomRecords } from '../message/custom-records';
 import { TypedEmitter } from '../../utils/typed-emitter';
@@ -1703,6 +1703,127 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 				this.emitContained('channel:aborted', tempIdBuf, reason);
 			}
 		}
+	}
+
+	/**
+	 * Tell the host that an asset opening is past its point of no return
+	 * (onFundingSigned): the peer's funding_signed is verified and the row
+	 * that holds it has committed. A throw is reported, never propagated:
+	 * the opening is irrevocable whatever the host does with the news.
+	 */
+	private _notifyAuxiliaryFundingSigned(
+		peerPubkey: string,
+		channel: Channel
+	): void {
+		const callback = this.config.auxiliaryChannels?.onFundingSigned;
+		const state = channel.getFullState();
+		if (
+			!callback ||
+			!state.auxiliaryState ||
+			!state.channelId ||
+			!state.fundingTxid ||
+			state.fundingOutputIndex === undefined
+		) {
+			return;
+		}
+		try {
+			callback({
+				channelId: Buffer.from(state.channelId),
+				temporaryChannelId: Buffer.from(state.temporaryChannelId),
+				peerPubkey,
+				fundingTxid: Buffer.from(state.fundingTxid),
+				fundingOutputIndex: state.fundingOutputIndex
+			});
+		} catch (error) {
+			this.emitContained(
+				'error',
+				state.channelId,
+				`Asset funding callback failed (channel ${state.channelId.toString(
+					'hex'
+				)}): ${error instanceof Error ? error.message : String(error)}`
+			);
+		}
+	}
+
+	/**
+	 * Give up an asset opening this node began, at the host's request, while
+	 * it can still be undone: any time before the peer's funding_signed is
+	 * verified. `id` is the opening's temporary channel id or, once
+	 * funding_created went out, its channel id. The peer is sent an error
+	 * for the channel so it forgets it, the opening leaves this node like an
+	 * opening that died with its connection does, and it has no row: none
+	 * is written before funding_signed. Returns the funding transaction's
+	 * id when funding_created had been sent, for the caller to drop what it
+	 * kept for it.
+	 *
+	 * Throws an AuxiliaryOpenError once funding_signed is verified
+	 * (ASSET_OPEN_IRREVOCABLE: the funding may already be on its way to the
+	 * chain), and for an id that is not an asset opening of this node
+	 * (ASSET_OPEN_UNKNOWN).
+	 */
+	abandonAuxiliaryOpen(id: Buffer, reason: string): Buffer | undefined {
+		const named = (channel: Channel): boolean =>
+			channel.getTemporaryChannelId().equals(id) ||
+			channel.getChannelId()?.equals(id) === true;
+		const isAssetOpening = (channel: Channel): boolean => {
+			const state = channel.getFullState();
+			return (
+				state.role === ChannelRole.OPENER &&
+				(state.auxiliaryState !== undefined ||
+					state.fundingTaprootMerkleRoot !== undefined)
+			);
+		};
+		const channel =
+			[...this.tempChannels.values()].find(named) ??
+			[...this.channels.values()].find(named);
+		if (!channel || !isAssetOpening(channel)) {
+			throw new AuxiliaryOpenError(
+				'ASSET_OPEN_UNKNOWN',
+				id,
+				'No asset opening of this node has that id'
+			);
+		}
+		const abandonable = new Set([
+			ChannelState.SENT_OPEN,
+			ChannelState.SENT_ACCEPT,
+			ChannelState.SENT_FUNDING_CREATED
+		]);
+		if (!abandonable.has(channel.getState())) {
+			throw new AuxiliaryOpenError(
+				'ASSET_OPEN_IRREVOCABLE',
+				id,
+				channel.getFullState().remoteCommitmentSignature
+					? "The peer's funding_signed is verified: the asset opening can no longer be abandoned"
+					: `An asset opening in state ${channel.getState()} can no longer be abandoned`
+			);
+		}
+		const channelId = channel.getChannelId();
+		if (!channelId) {
+			// funding_created has not gone out: the path of a funding that
+			// failed locally.
+			this.abortPendingOpen(channel, reason);
+			return undefined;
+		}
+		// funding_created is out and funding_signed is not in. BOLT 2 has the
+		// channel under its permanent id already, so that is the id the
+		// peer is told to forget.
+		const fundingTxid = channel.getFullState().fundingTxid;
+		const temporaryChannelId = channel.getTemporaryChannelId();
+		const peerPubkey =
+			this.channelPeers.get(channelId.toString('hex')) ??
+			this.channelPeers.get(temporaryChannelId.toString('hex'));
+		channel.failOpenOnDisconnect();
+		this.auxiliaryFundingGates.delete(temporaryChannelId.toString('hex'));
+		if (peerPubkey) this.removeCurrentChannelLifecycle(peerPubkey, channel);
+		try {
+			const wire = peerPubkey && wireErrorPayloadFor(channelId, reason);
+			if (peerPubkey && wire) {
+				this.sendMessage(peerPubkey, MessageType.ERROR, wire);
+			}
+		} finally {
+			this.emitContained('channel:aborted', temporaryChannelId, reason);
+		}
+		return fundingTxid ? Buffer.from(fundingTxid) : undefined;
 	}
 
 	/**
@@ -11072,6 +11193,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 					if (persistSeen && ctx.sendsBlocked) {
 						break;
 					}
+					this._notifyAuxiliaryFundingSigned(peerPubkey, channel);
 					this.emit('funding:authorized', action.fundingTxid);
 					break;
 				case ChannelActionType.BROADCAST_TX:

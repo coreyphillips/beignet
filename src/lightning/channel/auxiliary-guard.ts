@@ -62,3 +62,29 @@ export function auxiliaryUnsupported(
 		operation
 	);
 }
+
+/** Why an asset opening could not be abandoned. */
+export type AuxiliaryOpenErrorCode =
+	/** The peer's funding_signed is verified: the opening can no longer be undone. */
+	| 'ASSET_OPEN_IRREVOCABLE'
+	/** No asset opening this node began is known by that id. */
+	| 'ASSET_OPEN_UNKNOWN';
+
+/**
+ * An asset opening the host asked to abandon was not abandoned. Carries the
+ * reason as a code and names the channel.
+ */
+export class AuxiliaryOpenError extends CodedError<AuxiliaryOpenErrorCode> {
+	/** The id the host named, hex. */
+	readonly channelId: string;
+
+	constructor(
+		code: AuxiliaryOpenErrorCode,
+		channelId: Buffer,
+		message: string
+	) {
+		super(code, `${message} (channel ${channelId.toString('hex')})`);
+		this.name = 'AuxiliaryOpenError';
+		this.channelId = channelId.toString('hex');
+	}
+}

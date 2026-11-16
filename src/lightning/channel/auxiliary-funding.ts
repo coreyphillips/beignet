@@ -84,6 +84,26 @@ export interface IAuxiliaryPaymentHtlc {
 	htlc?: IAuxiliaryChannelHtlc;
 }
 
+/** How fundAuxiliaryChannel is given the funding transaction. */
+export interface IAuxiliaryFundingOptions {
+	/**
+	 * The script each input of the transaction spends, in input order. Given,
+	 * the transaction is unsigned: the node keeps and broadcasts nothing of
+	 * it, and the host signs and publishes it after `onFundingSigned`.
+	 */
+	prevoutScripts?: Buffer[];
+}
+
+/** An asset opening at its point of no return. */
+export interface IAuxiliaryFundingSigned {
+	channelId: Buffer;
+	temporaryChannelId: Buffer;
+	peerPubkey: string;
+	/** The funding transaction's id, in the byte order of the wire. */
+	fundingTxid: Buffer;
+	fundingOutputIndex: number;
+}
+
 /** The asset side of one outgoing HTLC. */
 export interface IAuxiliaryPayment {
 	/** Exact circuit whose quote was reserved before native admission. */
@@ -199,6 +219,18 @@ export interface IAuxiliaryChannelConfig {
 			channelId: Buffer;
 		}
 	): void;
+	/**
+	 * The point of no return of an asset opening this node began: the peer's
+	 * funding_signed is verified and the channel's row is written. Called
+	 * outside any storage transaction, before the node broadcasts a funding
+	 * transaction it was given signed, and never before that moment. Until
+	 * it is called the host can abandon the opening
+	 * (`abandonAuxiliaryOpen`); from it on the opening is irrevocable and the
+	 * funding transaction may be signed and published. Idempotent by
+	 * contract: after a restart it can be called again for the same channel.
+	 * A throw is reported and changes nothing.
+	 */
+	onFundingSigned?(context: IAuxiliaryFundingSigned): void;
 	/** Complete local asset negotiation durably before accept_channel is sent. */
 	beforeAccept?(channel: Channel, peerPubkey: string): Promise<void>;
 	/** Wait for validation of custom funding proofs before the initial signature. */
