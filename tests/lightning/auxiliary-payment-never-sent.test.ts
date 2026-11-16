@@ -25,6 +25,7 @@ import {
 import {
 	assetHost,
 	connectHosts,
+	failingProvider,
 	openAssetChannel,
 	payAssetUnits,
 	reconnectHosts,
@@ -325,5 +326,104 @@ describe('an outgoing asset payment that was recorded and never sent (issue #209
 		const last = assetHost(tag, 1, telling(third), { sqlitePath: file });
 		hosts.push(last);
 		expect(third).to.deep.equal([]);
+	});
+
+	it('an asset HTLC the channel refuses to take leaves the payment record in the step that refuses it: the payment lists no HTLC, and the id, which the next HTLC takes, is listed for that payment alone', async () => {
+		const tag = 'aux-never-sent-refused';
+		const arm = { down: false };
+		const told: ITold[] = [];
+		const alice = assetHost(
+			tag,
+			1,
+			{
+				// Alice's provider cannot answer for an HTLC while `arm.down`.
+				provider: failingProvider(
+					(method) => arm.down && method === 'validateHtlc'
+				),
+				...telling(told)
+			},
+			{ sqlite: true }
+		);
+		const bob = assetHost(
+			tag,
+			2,
+			{ valueIncomingHtlc: (context) => context.auxiliaryAmount! * 1000n },
+			{ sqlite: true }
+		);
+		hosts.push(alice, bob);
+		connectHosts(alice, bob);
+		const channelId = await openAssetChannel(alice, bob, {
+			tag,
+			openerUnits: 9000n,
+			acceptorUnits: 1000n
+		});
+		const failed = failures(alice);
+		const refused = bob.node.createInvoice({
+			amountMsat: 5_000_000n,
+			description: 'refused at the channel'
+		});
+		const refusedHex = refused.paymentHash.toString('hex');
+		arm.down = true;
+		payAssetUnits(alice, bob, channelId, refused, 5_000_000n, 5000n);
+		arm.down = false;
+
+		// The send ends at once, as before: it answers the FAILED record and
+		// says payment:failed, with nothing in the channel.
+		const record = alice.node.getPayment(refused.paymentHash)!;
+		expect(record.status).to.equal(PaymentStatus.FAILED);
+		expect(failed).to.deep.equal([refusedHex]);
+		expect(record.metadata!._auxiliaryAdmissionRejected).to.equal('true');
+		expect(alice.node.getAuxiliaryChannelInfo(channelId)!.htlcs).to.deep.equal(
+			[]
+		);
+		// The part is off the record in that same step, in memory and in
+		// the stored row, with its mapping.
+		expect(
+			alice.node.getAuxiliaryPaymentHtlcs(refused.paymentHash)
+		).to.deep.equal([]);
+		expect('_auxiliaryPartAmounts' in record.metadata!).to.equal(false);
+		const stored = alice
+			.storage!.loadAllPayments()
+			.find((row) => row.paymentHash === refusedHex)!;
+		expect(stored.payment.status).to.equal(PaymentStatus.FAILED);
+		expect(stored.payment.metadata!._auxiliaryAdmissionRejected).to.equal(
+			'true'
+		);
+		expect('_auxiliaryPartAmounts' in stored.payment.metadata!).to.equal(false);
+		expect(alice.storage!.loadAllHtlcPaymentMappings()).to.deep.equal([]);
+
+		// The channel gives the id to the next HTLC: it is listed for its
+		// own payment, and for no other.
+		const next = bob.node.createInvoice({
+			amountMsat: 2_000_000n,
+			description: 'the next HTLC'
+		});
+		payAssetUnits(alice, bob, channelId, next, 2_000_000n, 2000n);
+		const listed = alice.node.getAuxiliaryPaymentHtlcs(next.paymentHash);
+		expect(listed.map((part) => part.htlcId)).to.deep.equal([0n]);
+		expect(listed[0].amountMsat).to.equal(2_000_000n);
+		expect(
+			alice.node.getAuxiliaryPaymentHtlcs(refused.paymentHash)
+		).to.deep.equal([]);
+		await turns(200);
+		expect(alice.node.getPayment(next.paymentHash)!.status).to.equal(
+			PaymentStatus.COMPLETED
+		);
+		expect(
+			alice.node.getAuxiliaryPaymentHtlcs(refused.paymentHash)
+		).to.deep.equal([]);
+		expect(alice.node.getPayment(refused.paymentHash)!.status).to.equal(
+			PaymentStatus.FAILED
+		);
+		// No outcome is owed for the HTLC that never left: the host hears of
+		// the one that did, once.
+		expect(
+			told.map(
+				(entry) =>
+					`${entry.direction}:${entry.htlcId}:${entry.outcome}:${entry.units}:${
+						entry.hash === next.paymentHash.toString('hex')
+					}`
+			)
+		).to.deep.equal(['OFFERED:0:fulfilled:2000:true']);
 	});
 });

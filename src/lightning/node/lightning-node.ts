@@ -19649,11 +19649,22 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		if (!result.ok) {
 			if (assetPayment && result.admissionRejected) {
 				// Nothing entered the channel: what the host reserved for this
-				// HTLC id is free again.
-				payment.metadata = {
-					...payment.metadata,
-					_auxiliaryAdmissionRejected: 'true'
+				// HTLC id is free again, and the channel will give the id to
+				// another HTLC. The part leaves the record here, in the write
+				// that drops its mapping below, so the payment never lists an
+				// HTLC that never left under an id that is another's.
+				const refusedMetadata: Record<string, string> = {
+					...payment.metadata
 				};
+				const parts = this.auxiliaryPartAmounts(payment);
+				delete parts[htlcKey];
+				if (Object.keys(parts).length > 0) {
+					refusedMetadata._auxiliaryPartAmounts = JSON.stringify(parts);
+				} else {
+					delete refusedMetadata._auxiliaryPartAmounts;
+				}
+				refusedMetadata._auxiliaryAdmissionRejected = 'true';
+				payment.metadata = refusedMetadata;
 			}
 			payment.status = PaymentStatus.FAILED;
 			payment.completedAt = Date.now();
