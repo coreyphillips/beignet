@@ -466,6 +466,15 @@ export interface PaymentInfo {
 	preimage?: string;
 	amountSats: number;
 	feeSats?: number;
+	/**
+	 * True on a payment that asset HTLCs carried (issue #2093), and absent
+	 * on every other. On an outgoing one `amountSats` and `feeSats` are the
+	 * bitcoin that carried the asset and not what was paid, which is
+	 * `auxiliaryValueSats`. No bitcoin total counts a marked payment.
+	 */
+	auxiliary?: true;
+	/** An outgoing asset payment: what it was worth to the payee, in sats. */
+	auxiliaryValueSats?: number;
 	status: 'PENDING' | 'COMPLETED' | 'FAILED';
 	direction: 'OUTGOING' | 'INCOMING';
 	failureCode?: number;
@@ -502,6 +511,11 @@ export interface InvoiceInfo {
 	expiry?: number;
 	createdAt?: number;
 	status?: 'PENDING' | 'PAID' | 'EXPIRED';
+	/**
+	 * True on an invoice that asset HTLCs paid (issue #2093), and absent on
+	 * every other.
+	 */
+	auxiliary?: true;
 }
 
 /**
@@ -1764,6 +1778,8 @@ export interface BeignetNodeEvents {
 		paymentHash: PaymentHashHex;
 		bolt11: string;
 		amountSats: number;
+		/** True when asset HTLCs paid it (issue #2093); absent otherwise. */
+		auxiliary?: true;
 	}) => void;
 	/**
 	 * A part joined a hold invoice's parked set (issue #746), fired for each
@@ -1803,32 +1819,55 @@ export interface BeignetNodeEvents {
 	'channel:opening': (data: {
 		channelId: ChannelIdHex;
 		fundingTxid: TxidHex;
+		auxiliary?: true;
 	}) => void;
+	/**
+	 * Every channel event carries `auxiliary: true` when its channel is an
+	 * asset channel the node still holds (issue #2093), and no such key
+	 * otherwise.
+	 */
 	/** The channel reached NORMAL state. */
-	'channel:ready': (data: { channelId: ChannelIdHex }) => void;
+	'channel:ready': (data: {
+		channelId: ChannelIdHex;
+		auxiliary?: true;
+	}) => void;
 	/**
 	 * The channel can take a new HTLC again: it reached NORMAL on
 	 * channel_ready, finished reestablishing on a reconnect, a splice locked
 	 * or unwound, or its funding quarantine lifted. Fires on every reconnect.
 	 * The payment queues start and retry on it (issue #967).
 	 */
-	'channel:usable': (data: { channelId: ChannelIdHex }) => void;
+	'channel:usable': (data: {
+		channelId: ChannelIdHex;
+		auxiliary?: true;
+	}) => void;
 	/** A cooperative close started, by this node (`local`) or the peer (`remote`). */
 	'channel:pending-close': (data: {
 		channelId: ChannelIdHex;
 		initiator: 'local' | 'remote';
+		auxiliary?: true;
 	}) => void;
 	/** A force close started: this node broadcast its commitment (`local`) or the peer's appeared on chain (`remote`). */
 	'channel:force-closing': (data: {
 		channelId: ChannelIdHex;
 		initiator: 'local' | 'remote';
+		auxiliary?: true;
 	}) => void;
 	/** The funding output was spent and the spend classified. Outputs may still be unswept: `channel:resolved` is the terminal event. */
-	'channel:closed': (data: { channelId: ChannelIdHex }) => void;
+	'channel:closed': (data: {
+		channelId: ChannelIdHex;
+		auxiliary?: true;
+	}) => void;
 	/** The true terminal event of a close: every on-chain output of the channel is irrevocably swept or claimed and the channel state becomes CLOSED. */
-	'channel:resolved': (data: { channelId: ChannelIdHex }) => void;
+	'channel:resolved': (data: {
+		channelId: ChannelIdHex;
+		auxiliary?: true;
+	}) => void;
 	/** The channel was removed with nothing to close on chain, and its persisted state was durably deleted: its unconfirmed funding tx vanished from mempool and chain, or the open was aborted or abandoned before any funding existed. */
-	'channel:voided': (data: { channelId: ChannelIdHex }) => void;
+	'channel:voided': (data: {
+		channelId: ChannelIdHex;
+		auxiliary?: true;
+	}) => void;
 	/** splice_locked exchanged both ways: the channel runs on the new funding (fundingTxid, display order). */
 	'splice:complete': (data: {
 		channelId: ChannelIdHex;

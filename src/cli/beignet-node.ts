@@ -4152,7 +4152,10 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 			const channelId = data.channelId.toString('hex');
 			this.log('info', 'Channel ready', { channelId });
 			this.refreshStaticChannelBackup();
-			this.emit('channel:ready', { channelId });
+			this.emit('channel:ready', {
+				channelId,
+				...this.assetChannelMark(data.channelId)
+			});
 		});
 		// A channel that can take a new HTLC again (issue #967): it reached
 		// NORMAL on channel_ready, or finished reestablishing on a reconnect.
@@ -4185,7 +4188,10 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 			deferEmit(() => {
 				const channel = usableNode.getChannelManager().getChannel(channelId);
 				if (!channel?.acceptsNewHtlcs()) return;
-				this.emit('channel:usable', { channelId: channelId.toString('hex') });
+				this.emit('channel:usable', {
+					channelId: channelId.toString('hex'),
+					...this.assetChannelMark(channelId)
+				});
 			});
 		this.node.on('channel:ready', (data: { channelId: Buffer }) =>
 			announceUsable(data.channelId)
@@ -4232,7 +4238,10 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 			const channelId = data.channelId.toString('hex');
 			this.log('info', 'Channel closed', { channelId });
 			this.refreshStaticChannelBackup();
-			this.emit('channel:closed', { channelId });
+			this.emit('channel:closed', {
+				channelId,
+				...this.assetChannelMark(data.channelId)
+			});
 		});
 		this.node.on('channel:voided', (data: { channelId: Buffer }) => {
 			const channelId = data.channelId.toString('hex');
@@ -4244,7 +4253,10 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 				}
 			);
 			this.refreshStaticChannelBackup();
-			this.emit('channel:voided', { channelId });
+			this.emit('channel:voided', {
+				channelId,
+				...this.assetChannelMark(data.channelId)
+			});
 		});
 		// A resolved channel leaves the SCB channel set (state becomes CLOSED),
 		// so refresh here. Also relay the event: it is the true terminal event
@@ -4266,7 +4278,10 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 				return;
 			}
 			this.log('info', 'Channel resolved', { channelId });
-			this.emit('channel:resolved', { channelId });
+			this.emit('channel:resolved', {
+				channelId,
+				...this.assetChannelMark(data.channelId)
+			});
 		});
 		// Refresh the SCB when a splice LOCKS, not when it is initiated: only now
 		// does fundingTxid hold the new post-splice outpoint, so the backup encodes
@@ -4370,7 +4385,11 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 				// see on screen found nothing (issue #681).
 				const fundingTxid = txidToDisplayHex(data.fundingTxid);
 				this.log('info', 'Channel opening', { channelId, fundingTxid });
-				this.emit('channel:opening', { channelId, fundingTxid });
+				this.emit('channel:opening', {
+					channelId,
+					fundingTxid,
+					...this.assetChannelMark(data.channelId)
+				});
 			}
 		);
 		this.node.on(
@@ -4383,7 +4402,8 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 				});
 				this.emit('channel:pending-close', {
 					channelId,
-					initiator: data.initiator
+					initiator: data.initiator,
+					...this.assetChannelMark(data.channelId)
 				});
 			}
 		);
@@ -4397,7 +4417,8 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 				});
 				this.emit('channel:force-closing', {
 					channelId,
-					initiator: data.initiator
+					initiator: data.initiator,
+					...this.assetChannelMark(data.channelId)
 				});
 			}
 		);
@@ -4406,12 +4427,13 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 		// only payment:received).
 		this.node.on(
 			'invoice:settled',
-			(data: { paymentHash: Buffer; bolt11: string; amountMsat: bigint }) => {
-				const info = {
-					paymentHash: data.paymentHash.toString('hex'),
-					bolt11: data.bolt11,
-					amountSats: Number(data.amountMsat / 1000n)
-				};
+			(data: {
+				paymentHash: Buffer;
+				bolt11: string;
+				amountMsat: bigint;
+				auxiliary?: true;
+			}) => {
+				const info = this.invoiceSettledInfo(data);
 				this.log('info', 'Invoice settled', {
 					paymentHash: info.paymentHash,
 					amountSats: info.amountSats
@@ -14211,6 +14233,42 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	 * The amount and fee come from paymentAmountSats and paymentFeeMsat, which
 	 * the proof and the stats share, so every surface reports one figure.
 	 */
+	/**
+	 * `{ auxiliary: true }` for an asset channel the node holds, and nothing
+	 * for any other channel: what a channel event carries beside its id
+	 * (issue #2093). A node without a provider holds none, so its events are
+	 * the bytes they were.
+	 */
+	private assetChannelMark(channelId: Buffer): { auxiliary?: true } {
+		try {
+			return this.node.getAuxiliaryChannelInfo(channelId) !== undefined
+				? { auxiliary: true }
+				: {};
+		} catch {
+			return {};
+		}
+	}
+
+	/** The daemon's invoice:settled data, from the node's. */
+	private invoiceSettledInfo(data: {
+		paymentHash: Buffer;
+		bolt11: string;
+		amountMsat: bigint;
+		auxiliary?: true;
+	}): {
+		paymentHash: string;
+		bolt11: string;
+		amountSats: number;
+		auxiliary?: true;
+	} {
+		return {
+			paymentHash: data.paymentHash.toString('hex'),
+			bolt11: data.bolt11,
+			amountSats: Number(data.amountMsat / 1000n),
+			...(data.auxiliary ? { auxiliary: true as const } : {})
+		};
+	}
+
 	private toPaymentInfo(p: IPaymentInfo): PaymentInfo {
 		const info: PaymentInfo = {
 			...(p.payAll
@@ -14230,6 +14288,14 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 			direction: p.direction,
 			createdAt: p.createdAt
 		};
+		// An asset payment says so, and what it was worth: its amount and
+		// fee here are the bitcoin that carried it (issue #2093).
+		if (p.auxiliary) {
+			info.auxiliary = true;
+			if (p.auxiliaryValueMsat !== undefined) {
+				info.auxiliaryValueSats = spendLimitSats(p.auxiliaryValueMsat);
+			}
+		}
 		if (p.preimage) info.preimage = p.preimage.toString('hex');
 		if (p.completedAt !== undefined) info.completedAt = p.completedAt;
 		if (p.failureCode !== undefined) {
@@ -15593,6 +15659,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 		if (inv.description) info.description = inv.description;
 		if (inv.expiry !== undefined) info.expiry = inv.expiry;
 		if (inv.createdAt !== undefined) info.createdAt = inv.createdAt;
+		if (inv.auxiliary) info.auxiliary = true;
 		if (paid) {
 			info.status = 'PAID';
 		} else if (
@@ -16918,7 +16985,12 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	// ─────────────── Statistics ───────────────
 
 	getStats(windowMs?: number): NodeStats {
-		const payments = this.node.listPayments();
+		// A payment that asset HTLCs carried is in no bitcoin total: its
+		// amount and its fee are not what was paid (issue #2093). The daily
+		// spending limit still charges it.
+		const payments = this.node
+			.listPayments()
+			.filter((payment) => !payment.auxiliary);
 		const now = Date.now();
 		let sent = 0;
 		let received = 0;

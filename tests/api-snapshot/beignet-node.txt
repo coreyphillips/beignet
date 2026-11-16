@@ -468,14 +468,14 @@ interface BeignetNodeEvents
 property BeignetNodeEvents.'backup:completed': (data: { path: string; timestamp: number; }) => void
 property BeignetNodeEvents.'backup:failed': (data: { path: string; error: string; timestamp: number; }) => void
 property BeignetNodeEvents.'channel-send:stage': (data: { id: string; compositeId?: string; stage: ChannelSendStage; txid?: TxidHex; reason?: string; }) => void
-property BeignetNodeEvents.'channel:closed': (data: { channelId: ChannelIdHex; }) => void
-property BeignetNodeEvents.'channel:force-closing': (data: { channelId: ChannelIdHex; initiator: 'local' | 'remote'; }) => void
-property BeignetNodeEvents.'channel:opening': (data: { channelId: ChannelIdHex; fundingTxid: TxidHex; }) => void
-property BeignetNodeEvents.'channel:pending-close': (data: { channelId: ChannelIdHex; initiator: 'local' | 'remote'; }) => void
-property BeignetNodeEvents.'channel:ready': (data: { channelId: ChannelIdHex; }) => void
-property BeignetNodeEvents.'channel:resolved': (data: { channelId: ChannelIdHex; }) => void
-property BeignetNodeEvents.'channel:usable': (data: { channelId: ChannelIdHex; }) => void
-property BeignetNodeEvents.'channel:voided': (data: { channelId: ChannelIdHex; }) => void
+property BeignetNodeEvents.'channel:closed': (data: { channelId: ChannelIdHex; auxiliary?: true; }) => void
+property BeignetNodeEvents.'channel:force-closing': (data: { channelId: ChannelIdHex; initiator: 'local' | 'remote'; auxiliary?: true; }) => void
+property BeignetNodeEvents.'channel:opening': (data: { channelId: ChannelIdHex; fundingTxid: TxidHex; auxiliary?: true; }) => void
+property BeignetNodeEvents.'channel:pending-close': (data: { channelId: ChannelIdHex; initiator: 'local' | 'remote'; auxiliary?: true; }) => void
+property BeignetNodeEvents.'channel:ready': (data: { channelId: ChannelIdHex; auxiliary?: true; }) => void
+property BeignetNodeEvents.'channel:resolved': (data: { channelId: ChannelIdHex; auxiliary?: true; }) => void
+property BeignetNodeEvents.'channel:usable': (data: { channelId: ChannelIdHex; auxiliary?: true; }) => void
+property BeignetNodeEvents.'channel:voided': (data: { channelId: ChannelIdHex; auxiliary?: true; }) => void
 property BeignetNodeEvents.'direct-funding:offer:accepted': (data: { offerId: string; paired: boolean; resumed?: boolean; }) => void
 property BeignetNodeEvents.'direct-funding:offer:completed': (data: { offerId: string; }) => void
 property BeignetNodeEvents.'direct-funding:offer:declined': (data: { offerId: string; reason: string; }) => void
@@ -508,7 +508,7 @@ property BeignetNodeEvents.'htlc:failed': (data: { channelId: ChannelIdHex; htlc
 property BeignetNodeEvents.'htlc:forward-refused': (data: { inChannelId: ChannelIdHex; outChannelId: ChannelIdHex; amountMsat: string; paymentHash: PaymentHashHex; reason: string; channelErrorCode?: beignet/lightning#channel.ChannelErrorCode; }) => void
 property BeignetNodeEvents.'htlc:forwarded': (data: { inChannelId: ChannelIdHex; outChannelId: ChannelIdHex; amountInMsat: string; amountOutMsat: string; feeMsat: string; }) => void
 property BeignetNodeEvents.'htlc:fulfilled': (data: { channelId: ChannelIdHex; htlcId: string; }) => void
-property BeignetNodeEvents.'invoice:settled': (data: { paymentHash: PaymentHashHex; bolt11: string; amountSats: number; }) => void
+property BeignetNodeEvents.'invoice:settled': (data: { paymentHash: PaymentHashHex; bolt11: string; amountSats: number; auxiliary?: true; }) => void
 property BeignetNodeEvents.'jit:failed': (data: { scidHex?: string; channelIdHex?: string; parts: number; reason: string; }) => void
 property BeignetNodeEvents.'jit:forwarded': (data: { scidHex?: string; channelIdHex?: string; parts: number; }) => void
 property BeignetNodeEvents.'jit:funding': (data: { scidHex?: string; channelIdHex?: string; fundingSats: string; }) => void
@@ -1120,6 +1120,7 @@ class InvalidSpliceError extends beignet/lightning#node.InvalidRequestError
 constructor InvalidSpliceError(message: string)
 interface InvoiceInfo
 property InvoiceInfo.amountSats?: number
+property InvoiceInfo.auxiliary?: true
 property InvoiceInfo.bolt11: string
 property InvoiceInfo.createdAt?: number
 property InvoiceInfo.description?: string
@@ -1323,6 +1324,8 @@ property PaymentFilter.status?: 'PENDING' | 'COMPLETED' | 'FAILED'
 type PaymentHashHex = string
 interface PaymentInfo
 property PaymentInfo.amountSats: number
+property PaymentInfo.auxiliary?: true
+property PaymentInfo.auxiliaryValueSats?: number
 property PaymentInfo.completedAt?: number
 property PaymentInfo.createdAt: number
 property PaymentInfo.direction: 'OUTGOING' | 'INCOMING'
