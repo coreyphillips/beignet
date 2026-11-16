@@ -29,7 +29,9 @@ export const AUXILIARY_CHANNELS_API = Object.freeze({
 		'onFundingSigned',
 		'abandonAuxiliaryOpen',
 		// A channel row of listChannels carries auxiliary: true.
-		'IChannelInfo.auxiliary'
+		'IChannelInfo.auxiliary',
+		// The node's wrapper can refuse an asset payment: ASSET_PAYMENT_REFUSED.
+		'setAuxiliaryPaymentGate'
 	] as const)
 });
 

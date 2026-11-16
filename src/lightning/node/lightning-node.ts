@@ -154,7 +154,8 @@ import { findPayAllRoute } from '../gossip/pay-all';
 import type {
 	IPayAllBudget,
 	IPayAllQuote,
-	IAuxiliaryAdvertisement
+	IAuxiliaryAdvertisement,
+	AuxiliaryPaymentGate
 } from './types';
 import type { IRapidGossipResult } from '../gossip/rapid-sync';
 import {
@@ -1044,6 +1045,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	private acceptableChainHashes: Buffer[];
 	private nodeId: string;
 	private network: Network;
+	private auxiliaryPaymentGate: AuxiliaryPaymentGate | undefined;
 	private auxiliaryAdvertisement: IAuxiliaryAdvertisement = {
 		advertised: false,
 		reason: 'No auxiliary channel provider is configured'
@@ -19180,6 +19182,31 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				channelId: Buffer.from(assetPayment.channelId),
 				customRecords: records
 			};
+			// Whoever runs this node may refuse asset payments altogether, or
+			// one at a time (a wallet whose spending limits cannot count an
+			// asset payment yet). Asked before anything is recorded or sent.
+			const gate = this.auxiliaryPaymentGate;
+			if (gate) {
+				let refusal: string | undefined;
+				try {
+					refusal = gate({
+						paymentHash: Buffer.from(paymentHash),
+						channelId: Buffer.from(assetPayment.channelId),
+						amountMsat: route.hops[route.hops.length - 1].amountToForwardMsat,
+						wireAmountMsat: assetPayment.wireAmountMsat
+					});
+				} catch (err) {
+					// A gate that cannot answer has not let the payment through.
+					refusal = err instanceof Error ? err.message : String(err);
+				}
+				if (refusal !== undefined) {
+					throw new AuxiliaryPaymentError(
+						'ASSET_PAYMENT_REFUSED',
+						assetPayment.channelId,
+						String(refusal) || 'The asset payment was refused'
+					);
+				}
+			}
 			metadata = {
 				...metadata,
 				_auxiliaryChannelId: assetPayment.channelId.toString('hex'),
@@ -29476,6 +29503,20 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				: {}),
 			customRecords: copyCustomRecords(entry.customRecords) ?? new Map()
 		};
+	}
+
+	/**
+	 * Set, or with undefined remove, the gate every outgoing asset payment
+	 * of this node passes before anything of it is recorded or sent. The
+	 * gate answers undefined to let the payment through, or the reason it
+	 * is refused; the send then throws an AuxiliaryPaymentError with code
+	 * ASSET_PAYMENT_REFUSED naming the channel. A gate that throws refuses.
+	 * It judges payments this node originates through sendPaymentToRoute,
+	 * not HTLCs it forwards. For whoever wraps the node and holds a policy
+	 * the node does not know, such as a wallet's spending limits.
+	 */
+	setAuxiliaryPaymentGate(gate: AuxiliaryPaymentGate | undefined): void {
+		this.auxiliaryPaymentGate = gate;
 	}
 
 	/**

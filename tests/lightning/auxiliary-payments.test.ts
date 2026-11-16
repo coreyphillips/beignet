@@ -827,6 +827,99 @@ describe('Asset payments (issue #2093, step 8)', function () {
 		});
 	});
 
+	describe('a gate set on the node', () => {
+		it('refuses an asset payment by name before anything is recorded or sent, and lets ordinary payments be', async () => {
+			const { alice, bob, channelId } = await pair('aux-gate', {
+				bob: () => ({
+					valueIncomingHtlc: (context) =>
+						context.auxiliaryAmount === undefined
+							? undefined
+							: context.auxiliaryAmount * 1000n
+				})
+			});
+			const invoice = bob.node.createInvoice({
+				amountMsat: 5_000_000n,
+				description: 'gated'
+			});
+			const sent: number[] = [];
+			alice.node.on('message:outbound', (_peer: string, type: number) => {
+				sent.push(type);
+			});
+			const seen: Array<Record<string, unknown>> = [];
+			const refusing: Array<[string, () => string | undefined, string]> = [
+				[
+					'a reason',
+					() => 'Asset payments are refused while a spending limit is set',
+					'Asset payments are refused while a spending limit is set'
+				],
+				[
+					'a throw',
+					(): never => {
+						throw new Error('the limits could not be read');
+					},
+					'the limits could not be read'
+				]
+			];
+			for (const [what, answer, reason] of refusing) {
+				alice.node.setAuxiliaryPaymentGate((payment) => {
+					seen.push(payment);
+					return answer();
+				});
+				let error: unknown;
+				try {
+					payUnits(alice, bob, channelId, invoice, 5_000_000n, 5000n);
+				} catch (err) {
+					error = err;
+				}
+				expect(error, what).to.be.instanceOf(AuxiliaryPaymentError);
+				const typed = error as AuxiliaryPaymentError;
+				expect(typed.code).to.equal('ASSET_PAYMENT_REFUSED');
+				expect(typed.channelId).to.equal(channelId.toString('hex'));
+				expect(typed.message).to.equal(
+					`${reason} (channel ${channelId.toString('hex')})`
+				);
+			}
+			expect(seen).to.have.length(2);
+			expect(seen[0].amountMsat).to.equal(5_000_000n);
+			expect(seen[0].wireAmountMsat).to.equal(354_000n);
+			expect(same(seen[0].channelId, channelId)).to.equal(true);
+			expect(same(seen[0].paymentHash, invoice.paymentHash)).to.equal(true);
+			expect(sent).to.deep.equal([]);
+			expect(alice.node.getPayment(invoice.paymentHash)).to.equal(undefined);
+			expect(units(alice, channelId)).to.deep.equal([9000n, 1000n]);
+
+			// The gate is not asked about an ordinary payment.
+			const ordinary = bob.node.createInvoice({
+				amountMsat: 1_000_000n,
+				description: 'ordinary'
+			});
+			payBitcoin(alice, bob, ordinary, 1_000_000n);
+			await settle();
+			expect(alice.node.getPayment(ordinary.paymentHash)!.status).to.equal(
+				PaymentStatus.COMPLETED
+			);
+			expect(seen).to.have.length(2);
+
+			// Letting it through, and removing the gate, both pay.
+			alice.node.setAuxiliaryPaymentGate(() => undefined);
+			payUnits(alice, bob, channelId, invoice, 5_000_000n, 5000n);
+			await settle();
+			expect(alice.node.getPayment(invoice.paymentHash)!.status).to.equal(
+				PaymentStatus.COMPLETED
+			);
+			alice.node.setAuxiliaryPaymentGate(undefined);
+			const second = bob.node.createInvoice({
+				amountMsat: 1_000_000n,
+				description: 'ungated'
+			});
+			payUnits(alice, bob, channelId, second, 1_000_000n, 1000n);
+			await settle();
+			expect(alice.node.getPayment(second.paymentHash)!.status).to.equal(
+				PaymentStatus.COMPLETED
+			);
+		});
+	});
+
 	describe('an ordinary payment whose route names an asset channel', () => {
 		it('leaves over the ordinary channel to that peer, and the asset channel carries nothing', async () => {
 			const { alice, bob, channelId, ordinaryId } =
@@ -1287,7 +1380,8 @@ describe('Asset payments (issue #2093, step 8)', function () {
 				'fundAuxiliaryChannel:unsigned',
 				'onFundingSigned',
 				'abandonAuxiliaryOpen',
-				'IChannelInfo.auxiliary'
+				'IChannelInfo.auxiliary',
+				'setAuxiliaryPaymentGate'
 			]);
 			expect(Object.isFrozen(api)).to.equal(true);
 			expect(Object.isFrozen(api.surfaces)).to.equal(true);
@@ -1299,7 +1393,8 @@ describe('Asset payments (issue #2093, step 8)', function () {
 				'queryAuxiliaryRoute',
 				'abandonAuxiliaryOpen',
 				'fundAuxiliaryChannel',
-				'getAuxiliaryChannelInfo'
+				'getAuxiliaryChannelInfo',
+				'setAuxiliaryPaymentGate'
 			] as const) {
 				expect(typeof node.node[member]).to.equal('function');
 			}

@@ -1904,7 +1904,23 @@ export type AuxiliaryPaymentErrorCode =
 	/** The payment could not be recorded. Nothing was sent. */
 	| 'ASSET_PAYMENT_NOT_RECORDED'
 	/** An ordinary payment was directed over an asset channel. */
-	| 'ASSET_CHANNEL_NEEDS_ASSET_PAYMENT';
+	| 'ASSET_CHANNEL_NEEDS_ASSET_PAYMENT'
+	/** The gate set on the node (setAuxiliaryPaymentGate) refused the payment. Nothing was sent. */
+	| 'ASSET_PAYMENT_REFUSED';
+
+/**
+ * Judges an outgoing asset payment before anything of it is recorded or
+ * sent: undefined lets it through, a string is the reason it is refused.
+ */
+export type AuxiliaryPaymentGate = (payment: {
+	paymentHash: Buffer;
+	/** The asset channel the payment leaves over. */
+	channelId: Buffer;
+	/** What the payment is worth at its destination, as the route carries it. */
+	amountMsat: bigint;
+	/** The bitcoin its HTLC carries on the wire. */
+	wireAmountMsat: bigint;
+}) => string | undefined;
 
 /**
  * An asset payment refused before anything left this node, or an ordinary
