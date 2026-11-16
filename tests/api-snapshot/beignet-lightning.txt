@@ -2524,7 +2524,7 @@ function channel.recordAuxiliaryClose(state: channel.IChannelState, txid: string
 function channel.requireAuxiliaryProvider(state: channel.IChannelState): channel.IChannelAuxiliaryProvider
 function channel.scidAliasAnnounceRefusal(channelType: Buffer | null | undefined, announceChannel: boolean): string | null
 function channel.signRemoteCommitment(state: channel.IChannelState, signer: keys.ISigner, remotePerCommitmentPoint: Buffer, commitmentNumber?: bigint): { signature: Buffer; htlcSignatures: Buffer[]; }
-function channel.signRemoteCommitmentPartial(state: channel.IChannelState, signer: keys.ISigner, ourPublicNonce: Uint8Array, theirPublicNonce: Buffer, remotePerCommitmentPoint: Buffer, commitmentNumber?: bigint): Buffer
+function channel.signRemoteCommitmentPartial(state: channel.IChannelState, signer: keys.ISigner, ourPublicNonce: Uint8Array, theirPublicNonce: Buffer, remotePerCommitmentPoint: Buffer, commitmentNumber?: bigint, signed?: { auxiliary?: channel.IAuxiliaryCommitmentData; }): Buffer
 function channel.signRemoteHtlcSignaturesTaproot(state: channel.IChannelState, signer: keys.ISigner, remotePerCommitmentPoint: Buffer, commitmentNumber?: bigint): Buffer[]
 function channel.spliceFeeSats(weight: number, feeratePerKw: number): bigint
 function channel.txInputOutpoints(txHex: string): Array<{ txid: string; vout: number; }>

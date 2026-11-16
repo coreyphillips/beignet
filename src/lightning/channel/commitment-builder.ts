@@ -10,7 +10,6 @@ import * as bitcoin from 'bitcoinjs-lib';
 import { secondLevelRevocationKey } from './child-revocation';
 import type { ITaprootAuxLeaf } from '../script/commitment-taproot';
 import type { IAuxiliaryCommitmentData } from './auxiliary';
-import { copyAuxiliaryCommitment } from './auxiliary';
 import { applyAuxiliaryCommitment } from './auxiliary-builder';
 import type { CustomRecords } from '../message/custom-records';
 import { derivePublicKey, deriveRevocationPubkey } from '../keys/derivation';
@@ -1268,6 +1267,10 @@ function taprootFundingSpk(state: IChannelState): Buffer {
  * Produce OUR MuSig2 partial signature over the REMOTE commitment (sent to the
  * peer in commitment_signed). `ourPublicNonce` MUST be the single-use object from
  * generateNonce; `theirPublicNonce` is the peer's nonce for this commitment.
+ *
+ * Writes nothing. On an asset channel the asset view of the commitment it
+ * signed is handed back in `signed`, for the caller to keep once every
+ * signature of the commitment is in hand, the provider's among them.
  */
 export function signRemoteCommitmentPartial(
 	state: IChannelState,
@@ -1275,7 +1278,8 @@ export function signRemoteCommitmentPartial(
 	ourPublicNonce: Uint8Array,
 	theirPublicNonce: Buffer,
 	remotePerCommitmentPoint: Buffer,
-	commitmentNumber?: bigint
+	commitmentNumber?: bigint,
+	signed?: { auxiliary?: IAuxiliaryCommitmentData }
 ): Buffer {
 	const built = buildRemoteCommitment(
 		state,
@@ -1296,11 +1300,7 @@ export function signRemoteCommitmentPartial(
 		state.fundingTaprootMerkleRoot
 	);
 	const partial = signer.signCommitmentPartial(session, ourPublicNonce);
-	if (built.auxiliary)
-		state.auxiliaryState!.remoteCommitments.set(
-			commitmentNumber ?? state.remoteCommitmentNumber,
-			copyAuxiliaryCommitment(built.auxiliary)
-		);
+	if (signed && built.auxiliary) signed.auxiliary = built.auxiliary;
 	return partial;
 }
 

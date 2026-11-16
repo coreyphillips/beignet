@@ -292,6 +292,39 @@ describe('the asset provider at the edge of a commitment round (issue #2093 step
 		expect(pair.aliceChannel.getFullState().needsCommitment).to.equal(false);
 	});
 
+	it('keeps the asset view of a commitment out of the channel until the provider has signed for it', () => {
+		const pair = taprootPair(7055);
+		const views = (): string[] =>
+			[
+				...pair.aliceChannel.getFullState().auxiliaryState!.remoteCommitments
+			].map(([number, view]) => `${number}:${view.customData.toString('hex')}`);
+		const before = views();
+		const sign = pair.aliceProvider.signHtlcs;
+		let thrown = 0;
+		pair.aliceProvider.signHtlcs = () => {
+			thrown++;
+			throw new Error('asset signer down');
+		};
+		const sent = pair.wire.length;
+		const refused = pair.alice.updateChannelFee(pair.id, 700);
+		expect(thrown).to.equal(1);
+		expect(refused.ok).to.equal(false);
+		// No commitment_signed left, and the view of the commitment that
+		// was not signed is not in the state a later write would store.
+		expect(kinds(pair, sent)).to.not.include(
+			`:${MessageType.COMMITMENT_SIGNED}`
+		);
+		expect(views()).to.deep.equal(before);
+
+		// The provider is back: the round is signed, and only now is its
+		// view kept, beside the one of the commitment the peer holds.
+		pair.aliceProvider.signHtlcs = sign;
+		expect(pair.alice.autoSignAndSendCommitment(pair.id).ok).to.equal(true);
+		expect(views()).to.have.length(before.length + 1);
+		expect(pair.aliceChannel.getState()).to.equal(ChannelState.NORMAL);
+		expect(pair.bobChannel.getState()).to.equal(ChannelState.NORMAL);
+	});
+
 	describe('what the provider answers is checked before anything is signed on it', () => {
 		const cases: Array<
 			[

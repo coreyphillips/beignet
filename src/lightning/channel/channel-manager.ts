@@ -6,7 +6,7 @@
  * Channel state machine to the actual transport layer.
  */
 
-import { auxiliaryProviderError } from './auxiliary';
+import { auxiliaryProviderError, copyAuxiliaryCommitment } from './auxiliary';
 import { AuxiliaryOpenError } from './auxiliary-guard';
 import { holdAuxiliaryRevokedView } from './auxiliary-revoked';
 import { classifyCommitmentTx } from '../chain/output-resolver';
@@ -1986,12 +1986,25 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		signer: ISigner,
 		remotePerCommitmentPoint: Buffer
 	): Buffer {
-		return this.signCommitmentPartial(
+		const signed: { auxiliary?: IAuxiliaryCommitmentData } = {};
+		const partial = this.signCommitmentPartial(
 			state,
 			signer,
 			remotePerCommitmentPoint,
-			0n
+			0n,
+			signed
 		);
+		// Asset channels: the first commitment has no HTLC, so this partial
+		// is every signature it carries, and its asset view is kept now. A
+		// later commitment's view is kept by Channel.signCommitment, once
+		// the provider has signed for its HTLCs.
+		if (signed.auxiliary && state.auxiliaryState) {
+			state.auxiliaryState.remoteCommitments.set(
+				0n,
+				copyAuxiliaryCommitment(signed.auxiliary)
+			);
+		}
+		return partial;
 	}
 
 	/**
@@ -2006,7 +2019,8 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		state: IChannelState,
 		signer: ISigner,
 		remotePerCommitmentPoint: Buffer,
-		commitmentNumber: bigint
+		commitmentNumber: bigint,
+		signed?: { auxiliary?: IAuxiliaryCommitmentData }
 	): Buffer {
 		if (!state.remoteNonce || state.remoteNonce.length !== 66) {
 			throw new Error(
@@ -2023,7 +2037,8 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			signingNonce,
 			state.remoteNonce,
 			remotePerCommitmentPoint,
-			commitmentNumber
+			commitmentNumber,
+			signed
 		);
 		return Buffer.concat([partial, Buffer.from(signingNonce)]);
 	}
