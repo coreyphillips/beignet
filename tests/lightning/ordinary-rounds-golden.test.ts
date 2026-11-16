@@ -14,6 +14,8 @@
 import { expect } from 'chai';
 import { ChannelManager } from '../../src/lightning/channel/channel-manager';
 import type { IChannelManagerConfig } from '../../src/lightning/channel/channel-manager';
+import type { IChannelAuxiliaryProvider } from '../../src/lightning/channel/auxiliary';
+import type { IAuxiliaryChannelConfig } from '../../src/lightning/channel/auxiliary-funding';
 import { signRemoteCommitment } from '../../src/lightning/channel/commitment-builder';
 import { isTaprootChannel } from '../../src/lightning/channel/types';
 import { randomBytes } from '../../src/lightning/crypto/provider';
@@ -93,9 +95,39 @@ const GOLDEN: Record<
 	}
 };
 
-/** Who runs the life, beside two nodes configured as before. */
+/** Fails the test that touched it: an ordinary channel asks a provider nothing. */
+const untouchable = (what: string): never => {
+	throw new Error(`${what} was consulted for an ordinary channel`);
+};
+/**
+ * An asset provider and host of which every member throws when read or
+ * called. A node configured with it has to run an ordinary channel without
+ * ever reaching for it.
+ */
+const THROWING: IAuxiliaryChannelConfig = {
+	provider: new Proxy({} as IChannelAuxiliaryProvider, {
+		get: (_target, name) => untouchable(`provider.${String(name)}`)
+	}),
+	resolveIncoming: () => untouchable('resolveIncoming'),
+	openingCsvPolicy: () => untouchable('openingCsvPolicy'),
+	allowLegacyHtlcSignatures: () => untouchable('allowLegacyHtlcSignatures'),
+	valueIncomingHtlc: () => untouchable('valueIncomingHtlc'),
+	resolveForwardChannel: () => untouchable('resolveForwardChannel'),
+	prepareForwardHtlc: () => untouchable('prepareForwardHtlc'),
+	onForwardAdmissionFailed: () => untouchable('onForwardAdmissionFailed'),
+	onHtlcResolved: () => untouchable('onHtlcResolved'),
+	beforeAccept: () => untouchable('beforeAccept'),
+	beforeFundingCreated: () => untouchable('beforeFundingCreated'),
+	onAccepted: () => untouchable('onAccepted')
+};
+
+/** Who runs the life: two nodes configured as before, then two provider nodes. */
 const NODES: Array<[string, Partial<IChannelManagerConfig>]> = [
-	['two nodes without a provider', {}]
+	['two nodes without a provider', {}],
+	[
+		'two provider nodes whose provider throws if touched',
+		{ auxiliaryChannels: THROWING }
+	]
 ];
 
 describe('an ordinary channel lives the life it did before (issue #2093)', function () {
