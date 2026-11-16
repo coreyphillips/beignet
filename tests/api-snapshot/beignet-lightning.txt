@@ -1328,6 +1328,8 @@ member channel.ChannelErrorCode.UNSUPPORTED = "UNSUPPORTED"
 member channel.ChannelErrorCode.WRONG_STATE = "WRONG_STATE"
 class channel.ChannelManager extends TypedEmitter<channel.ChannelManagerEvents>
 constructor channel.ChannelManager(config: channel.IChannelManagerConfig)
+static readonly property channel.ChannelManager.AUXILIARY_RETRY_ATTEMPTS_PER_INTERVAL = 3
+static readonly property channel.ChannelManager.AUXILIARY_RETRY_INTERVAL_MS = 60000
 method channel.ChannelManager.abandonAuxiliaryOpen(id: Buffer, reason: string): Buffer | undefined
 method channel.ChannelManager.abandonSpliceConflictRequest(channelId: Buffer): channel.ChannelResult
 method channel.ChannelManager.abortDualFundedOpen(channelId: Buffer, reason?: string): { ok: boolean; error?: string; pending?: boolean; }
@@ -1404,6 +1406,7 @@ get channel.ChannelManager.nextChannelIndex(): number
 set channel.ChannelManager.nextChannelIndex(value: number)
 method channel.ChannelManager.openChannel(peerPubkey: string, fundingSatoshis: bigint, pushMsat?: bigint, beforeNegotiate?: (temporaryChannelId: Buffer) => void, opts?: { trusted?: boolean; auxiliary?: channel.IAuxiliaryFundingDescriptor; }): channel.Channel
 method channel.ChannelManager.openZeroConfChannel(peerPubkey: string, fundingSatoshis: bigint, pushMsat?: bigint): channel.Channel | null
+method channel.ChannelManager.owesAuxiliaryRemoval(channelId: Buffer, htlcId: bigint): boolean
 method channel.ChannelManager.peerNegotiatedFforConcurrent(peerPubkey: string): boolean
 method channel.ChannelManager.proposeClosingFee(channelId: Buffer, signature: Buffer): channel.ChannelResult
 method channel.ChannelManager.provideSpliceExternalWitness(channelId: Buffer, prevTxid: Buffer, prevOutputIndex: number, witness: Buffer[]): channel.ChannelResult
@@ -1423,6 +1426,7 @@ method channel.ChannelManager.requestSpliceConflictRevert(channelId: Buffer): ch
 method channel.ChannelManager.resendAnnouncementSignatures(channelId: Buffer): boolean
 method channel.ChannelManager.restoreChannel(channel: channel.Channel, peerPubkey: string, keyIndex?: number | null, perChannelKeys?: channel.IPerChannelKeys | null): void
 method channel.ChannelManager.restoreMonitor(channelId: string, monitor: chain.ChainMonitor): void
+method channel.ChannelManager.retryAuxiliaryOwed(settle?: (channelId: Buffer, htlcId: bigint) => channel.ChannelResult | undefined, now?: number): Array<{ channelId: Buffer; htlcId: bigint; kind: 'fulfill' | 'fail'; }>
 method channel.ChannelManager.revertConflictedSplice(channelId: Buffer): channel.ChannelResult
 method channel.ChannelManager.sendRecoveryCloseRequest(channelId: Buffer): boolean
 method channel.ChannelManager.sendSpliceLocked(channelId: Buffer): channel.ChannelResult

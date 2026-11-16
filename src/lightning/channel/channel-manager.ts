@@ -2324,7 +2324,176 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		// caller settles exactly as it always has.
 		if (progress.sendsWithheld) result.sendsWithheld = true;
 		if (progress.sendsHeld) result.sendsHeld = true;
+		this._noteAuxiliaryRemoval(channel, result, {
+			channelId,
+			htlcId,
+			kind: 'fulfill',
+			preimage
+		});
 		return result;
+	}
+
+	/**
+	 * Asset channels: the settlements and failures of received HTLCs that
+	 * the asset provider refused, by `<channel id hex>:<HTLC id>`. Each is
+	 * owed until the channel takes it or no longer holds the HTLC. In
+	 * memory only: after a restart the HTLC is still committed and
+	 * unresolved in the channel's row, and its replay asks again.
+	 */
+	private readonly _auxiliaryRemovalsOwed = new Map<
+		string,
+		{
+			channelId: Buffer;
+			htlcId: bigint;
+			kind: 'fulfill' | 'fail';
+			preimage?: Buffer;
+			reason?: Buffer;
+		}
+	>();
+	/** Retry attempts made per asset channel in the current interval. */
+	private readonly _auxiliaryRetryWindows = new Map<
+		string,
+		{ since: number; attempts: number }
+	>();
+	/** The interval the retry attempts of one asset channel are counted in. */
+	static readonly AUXILIARY_RETRY_INTERVAL_MS = 60_000;
+	/** The most retry attempts made on one asset channel per interval. */
+	static readonly AUXILIARY_RETRY_ATTEMPTS_PER_INTERVAL = 3;
+
+	/** Record or clear what fulfillHtlc or failHtlc left owed on an asset channel. */
+	private _noteAuxiliaryRemoval(
+		channel: Channel,
+		result: ChannelResult,
+		removal: {
+			channelId: Buffer;
+			htlcId: bigint;
+			kind: 'fulfill' | 'fail';
+			preimage?: Buffer;
+			reason?: Buffer;
+		}
+	): void {
+		if (!channel.getFullState().auxiliaryState) return;
+		const key = `${removal.channelId.toString('hex')}:${removal.htlcId}`;
+		if (result.ok) {
+			this._auxiliaryRemovalsOwed.delete(key);
+		} else if (result.code === ChannelErrorCode.ASSET_PROVIDER_REFUSED) {
+			this._auxiliaryRemovalsOwed.set(key, removal);
+		}
+	}
+
+	/** True when a settlement or a failure of this received HTLC is owed. */
+	owesAuxiliaryRemoval(channelId: Buffer, htlcId: bigint): boolean {
+		return this._auxiliaryRemovalsOwed.has(
+			`${channelId.toString('hex')}:${htlcId}`
+		);
+	}
+
+	/**
+	 * Take up again what a refusal of the asset provider left owed on the
+	 * asset channels: the settlement or the failure of an HTLC, and the
+	 * commitment that covers updates already made. Called from the node's
+	 * periodic work and on each block. Nothing is owed by a channel without
+	 * asset state, and a channel that is not connected is left to its
+	 * reestablish, which asks again.
+	 *
+	 * At most AUXILIARY_RETRY_ATTEMPTS_PER_INTERVAL attempts are made on one
+	 * channel per AUXILIARY_RETRY_INTERVAL_MS, however often it is called.
+	 * Every attempt the provider refuses raises the one 'error' the refusal
+	 * raised the first time. A settlement is given up once its HTLC has
+	 * expired: the preimage is not revealed for an HTLC the peer can already
+	 * take back on chain.
+	 *
+	 * `settle`, when given, makes the settlement of an HTLC the caller keeps
+	 * a record for, and answers undefined for one it does not. Returns what
+	 * the channels took.
+	 */
+	retryAuxiliaryOwed(
+		settle?: (channelId: Buffer, htlcId: bigint) => ChannelResult | undefined,
+		now: number = Date.now()
+	): Array<{ channelId: Buffer; htlcId: bigint; kind: 'fulfill' | 'fail' }> {
+		const taken: Array<{
+			channelId: Buffer;
+			htlcId: bigint;
+			kind: 'fulfill' | 'fail';
+		}> = [];
+		if (!this.config.auxiliaryChannels) return taken;
+		for (const [hex, channel] of [...this.channels]) {
+			const state = channel.getFullState();
+			if (!state.auxiliaryState || !state.channelId) continue;
+			const owed: Array<{
+				channelId: Buffer;
+				htlcId: bigint;
+				kind: 'fulfill' | 'fail';
+				preimage?: Buffer;
+				reason?: Buffer;
+			}> = [];
+			for (const [key, removal] of [...this._auxiliaryRemovalsOwed]) {
+				if (!key.startsWith(`${hex}:`)) continue;
+				const htlc = state.htlcs.get(`received-${removal.htlcId}`);
+				if (!htlc || htlc.state !== HtlcState.COMMITTED) {
+					this._auxiliaryRemovalsOwed.delete(key);
+					continue;
+				}
+				if (
+					removal.kind === 'fulfill' &&
+					this._currentBlockHeight > 0 &&
+					htlc.cltvExpiry <= this._currentBlockHeight
+				) {
+					this._auxiliaryRemovalsOwed.delete(key);
+					this.emitContained(
+						'error',
+						state.channelId,
+						`The settlement of HTLC ${removal.htlcId} that the asset provider refused is given up at its expiry ${htlc.cltvExpiry} (channel ${hex})`
+					);
+					continue;
+				}
+				owed.push(removal);
+			}
+			if (
+				state.state !== ChannelState.NORMAL &&
+				state.state !== ChannelState.SHUTTING_DOWN
+			) {
+				continue;
+			}
+			const owesRound =
+				channel.needsCommitment() && !channel.isAwaitingRemoteRevocation();
+			if (owed.length === 0 && !owesRound) continue;
+			const window = this._auxiliaryRetryWindows.get(hex);
+			if (
+				!window ||
+				now - window.since >= ChannelManager.AUXILIARY_RETRY_INTERVAL_MS
+			) {
+				this._auxiliaryRetryWindows.set(hex, { since: now, attempts: 1 });
+			} else if (
+				window.attempts >= ChannelManager.AUXILIARY_RETRY_ATTEMPTS_PER_INTERVAL
+			) {
+				continue;
+			} else {
+				window.attempts++;
+			}
+			for (const removal of owed) {
+				const result =
+					removal.kind === 'fulfill'
+						? settle?.(removal.channelId, removal.htlcId) ??
+						  this.fulfillHtlc(
+								removal.channelId,
+								removal.htlcId,
+								removal.preimage!
+						  )
+						: this.failHtlc(removal.channelId, removal.htlcId, removal.reason!);
+				if (result.ok) {
+					taken.push({
+						channelId: removal.channelId,
+						htlcId: removal.htlcId,
+						kind: removal.kind
+					});
+				}
+			}
+			if (channel.needsCommitment()) {
+				this.autoSignAndSendCommitment(state.channelId);
+			}
+		}
+		return taken;
 	}
 
 	/**
@@ -2380,6 +2549,14 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		}
 		const result = this.resultFromActions(actions);
 		if (this.persistFailed.has(idHex)) result.sendsWithheld = true;
+		if (direction === HtlcDirection.RECEIVED) {
+			this._noteAuxiliaryRemoval(channel, result, {
+				channelId,
+				htlcId,
+				kind: 'fail',
+				reason
+			});
+		}
 		return result;
 	}
 
@@ -2533,7 +2710,8 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			// Asset channels: the commitment is built with the provider's
 			// answer. If that cannot be had, nothing of this round is signed,
 			// sent or stored, and the caller is told so by name; the updates
-			// stay owed a commitment and the next trigger tries again.
+			// stay owed a commitment, which retryAuxiliaryOwed signs from the
+			// node's periodic work and on each block.
 			let partial: Buffer;
 			let htlcSigs: Buffer[];
 			try {

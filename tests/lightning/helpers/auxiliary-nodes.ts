@@ -7,6 +7,7 @@
 
 import crypto from 'crypto';
 import * as bitcoin from 'bitcoinjs-lib';
+import type { IChannelAuxiliaryProvider } from '../../../src/lightning/channel/auxiliary';
 import type {
 	IAuxiliaryChannelConfig,
 	IAuxiliaryFundingDescriptor
@@ -317,6 +318,27 @@ export function payAssetUnits(
 			}
 		}
 	);
+}
+
+/**
+ * The reference provider, with a throw wherever `fail` says so: a provider
+ * that cannot answer, as one whose asset store is down.
+ */
+export function failingProvider(
+	fail: (method: string, args: unknown[]) => boolean
+): IChannelAuxiliaryProvider {
+	const inner = referenceProvider() as unknown as Record<
+		string,
+		(...args: unknown[]) => unknown
+	>;
+	const out: Record<string, unknown> = {};
+	for (const method of Object.keys(inner)) {
+		out[method] = (...args: unknown[]): unknown => {
+			if (fail(method, args)) throw new Error(`provider down in ${method}`);
+			return inner[method](...args);
+		};
+	}
+	return out as unknown as IChannelAuxiliaryProvider;
 }
 
 const realRandomBytes = crypto.randomBytes;

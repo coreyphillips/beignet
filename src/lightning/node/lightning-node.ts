@@ -3175,6 +3175,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		if (this.localFeatures.hasFeature(Feature.BASIC_MPP)) {
 			this.mppCleanupTimer = setInterval(() => {
 				this.failTimedOutMppPayments();
+				this.retryAuxiliaryOwed();
 			}, 30_000);
 			if (this.mppCleanupTimer.unref) {
 				this.mppCleanupTimer.unref();
@@ -12247,6 +12248,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		if (interval <= 0) return;
 		this.cleanupTimer = setInterval(() => {
 			this.pruneCompletedPayments();
+			this.retryAuxiliaryOwed();
 		}, interval);
 		if (this.cleanupTimer.unref) {
 			this.cleanupTimer.unref(); // won't block process exit
@@ -25960,6 +25962,22 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		declaredMsat: bigint,
 		htlcMsat: bigint
 	): void {
+		// An asset channel's provider can refuse the settlement: there the
+		// invoice is paid only once the channel has taken the fulfil.
+		if (
+			this.channelManager.getChannel(channelId)?.getFullState()
+				.auxiliaryState !== undefined
+		) {
+			this.settleAuxiliaryPayment(
+				channelId,
+				htlcId,
+				paymentHash,
+				preimage,
+				declaredMsat,
+				htlcMsat
+			);
+			return;
+		}
 		const hashHex = paymentHash.toString('hex');
 		// Clean up shared secret on fulfillment
 		this.cleanupHtlcSharedSecret(`${channelId.toString('hex')}:${htlcId}`);
@@ -26026,6 +26044,163 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				amountMsat: Number(payment.amountMsat),
 				status: payment.status
 			});
+		}
+	}
+
+	/**
+	 * Asset channels: invoice settlements the provider refused, by
+	 * `<channel id hex>:<HTLC id>`, each as the call that makes it again.
+	 */
+	private readonly auxiliarySettlementsOwed = new Map<
+		string,
+		() => ChannelResult
+	>();
+
+	/**
+	 * fulfillPayment for an HTLC of an asset channel. The provider is asked
+	 * before the channel takes a settlement and can refuse it, so the order
+	 * of an ordinary channel (record the payment as received, then fulfil)
+	 * would report an invoice paid whose units this node does not hold.
+	 * Here the invoice is COMPLETED and payment:received emitted only once
+	 * fulfillHtlc has returned ok. The completed record still commits with
+	 * the fulfil, in one transition, as for an ordinary channel.
+	 *
+	 * A refusal writes nothing: the payment stays PENDING, the HTLC stays
+	 * committed, and the settlement is owed. It is made again from the
+	 * node's periodic work and on each block (retryAuxiliaryOwed), and by
+	 * the replay of the HTLC after a reconnect or a restart, until the
+	 * channel takes it or the HTLC expires.
+	 */
+	private settleAuxiliaryPayment(
+		channelId: Buffer,
+		htlcId: bigint,
+		paymentHash: Buffer,
+		preimage: Buffer,
+		declaredMsat: bigint,
+		htlcMsat: bigint
+	): ChannelResult {
+		const hashHex = paymentHash.toString('hex');
+		const key = `${channelId.toString('hex')}:${htlcId}`;
+		// The chain monitors learn the preimage whatever the provider says.
+		this.channelManager.recordPreimage(paymentHash, preimage);
+		const payment = this.payments.get(hashHex);
+		const completed = payment
+			? {
+					...payment,
+					status: PaymentStatus.COMPLETED,
+					completedAt: Date.now(),
+					settledHtlcs: [key]
+			  }
+			: undefined;
+		if (completed) {
+			if (completed.amountMsat === 0n) completed.amountMsat = declaredMsat;
+			recordReceivedMsat(completed, htlcMsat);
+		}
+		const staged: RecoveryMutation[] = [
+			{ type: 'delete_payment_secret', paymentHash: hashHex },
+			...(completed
+				? [
+						{
+							type: 'payment_state' as const,
+							paymentHash: hashHex,
+							payment: completed
+						}
+				  ]
+				: [])
+		];
+		let result: ChannelResult | undefined;
+		if (this.recovery) this.stagedMutations.push(...staged);
+		try {
+			result = this.channelManager.fulfillHtlc(channelId, htlcId, preimage);
+		} finally {
+			if (this.recovery) {
+				if (!result?.ok) {
+					// Nothing of a settlement that was not made is written.
+					for (const mutation of staged) {
+						const at = this.stagedMutations.indexOf(mutation);
+						if (at !== -1) this.stagedMutations.splice(at, 1);
+					}
+				}
+				this.flushStagedMutations();
+			}
+		}
+		if (!result.ok) {
+			this.auxiliarySettlementsOwed.set(key, () =>
+				this.settleAuxiliaryPayment(
+					channelId,
+					htlcId,
+					paymentHash,
+					preimage,
+					declaredMsat,
+					htlcMsat
+				)
+			);
+			this.emitStructuredLog('payment', 'asset_settlement_refused', {
+				paymentHash: hashHex,
+				channelId: channelId.toString('hex'),
+				htlcId: htlcId.toString(),
+				reason: result.error ?? 'refused'
+			});
+			return result;
+		}
+		this.auxiliarySettlementsOwed.delete(key);
+		this.cleanupHtlcSharedSecret(key);
+		this.clearJitSkim(hashHex);
+		this.paymentSecrets.delete(hashHex);
+		if (payment && completed) Object.assign(payment, completed);
+		if (this.storage) {
+			try {
+				this.persistChannel(channelId);
+			} catch {
+				/* best-effort */
+			}
+		}
+		if (payment) {
+			this.emit('payment:received', payment);
+			this.emitInvoiceSettled(paymentHash, payment);
+			this.emitStructuredLog('payment', 'received', {
+				paymentHash: hashHex,
+				amountMsat: Number(payment.amountMsat),
+				status: payment.status
+			});
+		}
+		return result;
+	}
+
+	/**
+	 * Asset channels: take up again what a refusal of the provider left
+	 * owed (see ChannelManager.retryAuxiliaryOwed). A node without a
+	 * provider returns at the first line.
+	 */
+	private retryAuxiliaryOwed(): void {
+		if (!this.auxiliaryChannels) return;
+		try {
+			this.channelManager.retryAuxiliaryOwed(
+				(channelId, htlcId) =>
+					this.auxiliarySettlementsOwed.get(
+						`${channelId.toString('hex')}:${htlcId}`
+					)?.()
+			);
+		} catch (err) {
+			this.emit('node:error', {
+				code: 'CHANNEL_ERROR',
+				message: `Asset channel retry failed: ${
+					err instanceof Error ? err.message : String(err)
+				}`,
+				timestamp: Date.now()
+			});
+		}
+		// A settlement whose HTLC the channel no longer owes is forgotten.
+		for (const key of [...this.auxiliarySettlementsOwed.keys()]) {
+			const [channelHex, id] = key.split(':');
+			if (
+				!this.channelManager.owesAuxiliaryRemoval(
+					Buffer.from(channelHex, 'hex'),
+					BigInt(id)
+				)
+			) {
+				this.auxiliarySettlementsOwed.delete(key);
+			}
 		}
 	}
 
@@ -31716,6 +31891,9 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		// and retries failing the parts held across a restart.
 		this.jitReceiveManager?.scanExpiringHolds();
 		this.jitReceiveManager?.sweep();
+		// Asset channels: what a provider refusal left owed is taken up
+		// before the expiry scan judges the same HTLCs.
+		this.retryAuxiliaryOwed();
 		this.scanExpiringHtlcs(blockHeight);
 		// Invariant keeper for HTLC dispatches parked during quiescence: the
 		// terminal quiescence exits (disconnect, errored, force close) emit no
