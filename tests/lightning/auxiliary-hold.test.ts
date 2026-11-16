@@ -90,7 +90,8 @@ describe('a hold invoice paid over an asset channel (issue #2093 step 8)', funct
 	/** Alice has paid 5000 units to a hold invoice of Bob, who holds the HTLC. */
 	async function held(
 		tag: string,
-		arm: { down: boolean; thrown: number }
+		arm: { down: boolean; thrown: number },
+		bobHooks: Parameters<typeof assetHost>[2] = {}
 	): Promise<{
 		alice: IAssetHost;
 		bob: IAssetHost;
@@ -109,7 +110,8 @@ describe('a hold invoice paid over an asset channel (issue #2093 step 8)', funct
 					arm.thrown++;
 					return true;
 				}),
-				valueIncomingHtlc: (context) => context.auxiliaryAmount! * 1000n
+				valueIncomingHtlc: (context) => context.auxiliaryAmount! * 1000n,
+				...bobHooks
 			},
 			{ sqlite: true }
 		);
@@ -321,6 +323,99 @@ describe('a hold invoice paid over an asset channel (issue #2093 step 8)', funct
 		);
 		expect(alice.node.getPayment(paymentHash)!.status).to.not.equal(
 			PaymentStatus.COMPLETED
+		);
+	});
+
+	it('a settle the asset provider refused is given up when the held HTLC has expired: the HTLC is failed back, the invoice ends cancelled, the host is told, and nothing stays parked', async () => {
+		const arm = { down: false, thrown: 0 };
+		const outcomes: string[] = [];
+		const { alice, bob, channelId, paymentHash, preimage } = await held(
+			'aux-hold-given-up',
+			arm,
+			{
+				onHtlcResolved: (context) => {
+					outcomes.push(
+						`${context.direction}:${context.htlcId}:${context.outcome}:${context.auxiliaryAmount}`
+					);
+				}
+			}
+		);
+		const hashHex = paymentHash.toString('hex');
+		const received = paid(bob);
+		const parked = bob.node as unknown as {
+			heldHtlcs: Map<string, unknown[]>;
+			heldResolutions: Map<string, unknown>;
+		};
+		arm.down = true;
+		expect(bob.node.settleHeldHtlc(paymentHash, preimage)).to.equal(false);
+		await turns(50);
+		const expiry =
+			bob.node.getAuxiliaryChannelInfo(channelId)!.htlcs[0].cltvExpiry;
+		// The provider is still down as the HTLC expires: the settle is
+		// given up, and the fail back it is turned into is refused and owed.
+		bob.node.handleNewBlock(expiry);
+		await turns(100);
+		expect(inFlight(bob, channelId)).to.have.length(1);
+		expect(parked.heldHtlcs.get(hashHex)).to.have.length(1);
+		expect(outcomes).to.deep.equal([]);
+
+		arm.down = false;
+		bob.node.handleNewBlock(expiry + 1);
+		await turns(200);
+		expect(inFlight(bob, channelId)).to.deep.equal([]);
+		expect(alice.node.getPayment(paymentHash)!.status).to.equal(
+			PaymentStatus.FAILED
+		);
+		expect(units(alice, channelId)).to.equal(9000n);
+		expect(units(bob, channelId)).to.equal(1000n);
+		// Never paid: cancelled, with nothing parked and the host told.
+		expect(received).to.deep.equal([]);
+		expect(bob.node.getPayment(paymentHash)!.status).to.equal(
+			PaymentStatus.FAILED
+		);
+		expect(bob.node.getInvoice(hashHex)!.cancelledAt).to.be.a('number');
+		expect('auxiliary' in bob.node.getInvoice(hashHex)!).to.equal(false);
+		expect(outcomes).to.deep.equal(['RECEIVED:0:failed:5000']);
+		expect(parked.heldHtlcs.size).to.equal(0);
+		expect(parked.heldResolutions.size).to.equal(0);
+		expect(bob.node.settleHeldHtlc(paymentHash, preimage)).to.equal(false);
+	});
+
+	it('a held asset HTLC that has left its channel another way is not kept parked, and its invoice ends cancelled', async () => {
+		const arm = { down: false, thrown: 0 };
+		const { bob, channelId, paymentHash, preimage } = await held(
+			'aux-hold-left',
+			arm
+		);
+		const hashHex = paymentHash.toString('hex');
+		const parked = bob.node as unknown as {
+			heldHtlcs: Map<string, unknown[]>;
+			heldResolutions: Map<string, unknown>;
+		};
+		expect(parked.heldHtlcs.get(hashHex)).to.have.length(1);
+		// The parked HTLC is known, also in what is stored, as an asset HTLC.
+		const stored = JSON.parse(
+			bob.storage!.loadMetadata('held_htlcs')!
+		) as Array<{
+			htlcs: Array<{ auxiliary?: boolean }>;
+		}>;
+		expect(stored[0].htlcs[0].auxiliary).to.equal(true);
+		// As the chain leaves it: the HTLC is no longer in the channel.
+		(
+			bob.node.getChannelManager().getChannel(channelId)!.getFullState()
+				.htlcs as Map<string, unknown>
+		).delete('received-0');
+		bob.node.handleNewBlock(1);
+		await turns(20);
+		expect(parked.heldHtlcs.size).to.equal(0);
+		expect(parked.heldResolutions.size).to.equal(0);
+		expect(bob.node.getInvoice(hashHex)!.cancelledAt).to.be.a('number');
+		expect(bob.node.getPayment(paymentHash)!.status).to.equal(
+			PaymentStatus.FAILED
+		);
+		expect(bob.node.settleHeldHtlc(paymentHash, preimage)).to.equal(false);
+		expect(JSON.parse(bob.storage!.loadMetadata('held_htlcs')!)).to.deep.equal(
+			[]
 		);
 	});
 

@@ -1373,6 +1373,8 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			htlcId: bigint;
 			amountMsat: bigint;
 			cltvExpiry: number;
+			/** Asset channels: the HTLC carries asset units. Present only then. */
+			auxiliary?: true;
 		}>
 	> = new Map();
 	// Payment hashes whose parked set is mid-dispatch in settleHeldHtlc or
@@ -3728,7 +3730,10 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 							channelId: Buffer.from(h.channelId, 'hex'),
 							htlcId: BigInt(h.htlcId),
 							amountMsat: BigInt(h.amountMsat),
-							cltvExpiry: h.cltvExpiry
+							cltvExpiry: h.cltvExpiry,
+							...((h as { auxiliary?: unknown }).auxiliary === true
+								? { auxiliary: true as const }
+								: {})
 						}))
 					);
 					const r = entry.resolution;
@@ -23537,7 +23542,8 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				htlcId,
 				paymentHash,
 				amountMsat,
-				incomingCltvExpiry ?? 0
+				incomingCltvExpiry ?? 0,
+				assetCredit
 			);
 			return;
 		}
@@ -23667,7 +23673,8 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		htlcId: bigint,
 		paymentHash: Buffer,
 		amountMsat: bigint,
-		cltvExpiry: number
+		cltvExpiry: number,
+		carriesUnits = false
 	): void {
 		const hashHex = paymentHash.toString('hex');
 		const list = this.heldHtlcs.get(hashHex) ?? [];
@@ -23679,7 +23686,13 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		// on reestablish reports the same set twice, which a consumer treating
 		// the event as the OPEN -> ACCEPTED edge would read as a second payment.
 		if (joined) {
-			list.push({ channelId, htlcId, amountMsat, cltvExpiry });
+			list.push({
+				channelId,
+				htlcId,
+				amountMsat,
+				cltvExpiry,
+				...(carriesUnits ? { auxiliary: true as const } : {})
+			});
 			this.heldHtlcs.set(hashHex, list);
 			this.persistHeldHtlcs();
 			// Ahead of the log and 'htlc:held' below: a listener on either can
@@ -24270,12 +24283,112 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	}
 
 	/**
+	 * Asset channels, at each block: nothing of a held asset HTLC stays
+	 * parked for ever.
+	 *
+	 * A settle the asset provider refused stays chosen (settleHeldHtlc) and
+	 * is not made once the HTLC has expired. When every HTLC of such a set
+	 * has expired and none was settled, the settle is given up and the set
+	 * is cancelled: the HTLC is failed back, the invoice ends cancelled and
+	 * its payment FAILED, and the host hears of the HTLC through
+	 * onHtlcResolved when it has left the channel. A fail back that is
+	 * refused stays chosen in its turn and is asked for again.
+	 *
+	 * A parked asset HTLC that is no longer in its channel (the chain or
+	 * the peer took it, or the channel is gone) is taken out of its set,
+	 * and a set emptied that way ends cancelled unless the HTLC was
+	 * fulfilled. Until then the HTLC of a channel that is on chain is the
+	 * on-chain resolver's.
+	 *
+	 * Only sets whose every HTLC carries asset units, or is parked on an
+	 * asset channel, are looked at.
+	 */
+	private resolveAssetHoldsLeftBehind(height: number): void {
+		for (const [hashHex, held] of [...this.heldHtlcs]) {
+			if (held.length === 0 || this.resolvingHeldHtlcs.has(hashHex)) continue;
+			const paymentHash = Buffer.from(hashHex, 'hex');
+			const parts = held.map((h) => {
+				const state = this.channelManager
+					.getChannel(h.channelId)
+					?.getFullState();
+				const entry = state?.htlcs.get(`received-${h.htlcId}`);
+				const same =
+					entry !== undefined && entry.paymentHash.equals(paymentHash);
+				return {
+					h,
+					asset: h.auxiliary === true || state?.auxiliaryState !== undefined,
+					fulfilled: same && entry.state === HtlcState.FULFILLED,
+					present:
+						same &&
+						entry.state !== HtlcState.FULFILLED &&
+						entry.state !== HtlcState.FAILED
+				};
+			});
+			if (!parts.every((part) => part.asset)) continue;
+			const resolution = this.heldResolutions.get(hashHex);
+			const remaining = parts
+				.filter((part) => part.present)
+				.map((part) => part.h);
+			if (remaining.length < held.length) {
+				const gone = held.filter((h) => !remaining.includes(h));
+				this.emitStructuredLog('htlc', 'held_asset_htlc_left_channel', {
+					paymentHash: hashHex,
+					gone: gone.length,
+					remaining: remaining.length
+				});
+				if (remaining.length > 0) {
+					this.heldHtlcs.set(hashHex, remaining);
+					this.persistHeldHtlcs();
+				} else {
+					this.heldHtlcs.delete(hashHex);
+					this.heldResolutions.delete(hashHex);
+					this.heldInvoiceHashes.delete(hashHex);
+					this.persistHeldHtlcs();
+					const paid =
+						parts.some((part) => part.fulfilled) ||
+						(resolution?.outcome === 'settle' &&
+							resolution.resolved.length > 0) ||
+						this.payments.get(hashHex)?.status === PaymentStatus.COMPLETED;
+					if (!paid) {
+						this.markHoldInvoiceCancelled(
+							hashHex,
+							'expiry-scan',
+							gone.length,
+							gone.reduce((sum, h) => sum + h.amountMsat, 0n),
+							gone
+						);
+					}
+					continue;
+				}
+			}
+			if (
+				resolution?.outcome === 'settle' &&
+				resolution.resolved.length === 0 &&
+				remaining.every((h) => h.cltvExpiry > 0 && h.cltvExpiry <= height)
+			) {
+				this.heldResolutions.delete(hashHex);
+				this.emitStructuredLog('htlc', 'held_asset_settle_given_up', {
+					paymentHash: hashHex,
+					height
+				});
+				this.cancelHeldHtlc(
+					paymentHash,
+					INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS,
+					'expiry-scan',
+					true
+				);
+			}
+		}
+	}
+
+	/**
 	 * Fail parked HTLCs approaching their CLTV expiry, so we resolve them
 	 * off-chain rather than forcing an on-chain timeout (which closes the
 	 * channel and risks the payer reclaiming after we may have leaked a preimage).
 	 */
 	private scanExpiringHeldHtlcs(height: number): void {
 		if (height <= 0) return;
+		this.resolveAssetHoldsLeftBehind(height);
 		// A set with an outcome already chosen retries that outcome instead:
 		// the expiry cancel would fail back parts whose preimage is out.
 		this.retryHeldResolutions();
@@ -24321,7 +24434,8 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 					channelId: h.channelId.toString('hex'),
 					htlcId: h.htlcId.toString(),
 					amountMsat: h.amountMsat.toString(),
-					cltvExpiry: h.cltvExpiry
+					cltvExpiry: h.cltvExpiry,
+					...(h.auxiliary === true ? { auxiliary: true as const } : {})
 				})),
 				...(r && {
 					resolution: {
