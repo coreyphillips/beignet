@@ -37,8 +37,10 @@ import { csvFromToLocalScript } from '../script/commitment';
 import type { IChannelState } from '../channel/channel-state';
 import { isAnchorChannel } from '../channel/types';
 import {
+	auxiliarySweepDataOf,
 	noteAuxiliarySweep,
-	noteAuxiliarySweepOffered
+	noteAuxiliarySweepOffered,
+	selectAuxiliarySweep
 } from './auxiliary-sweep';
 
 /** Number of blocks before re-broadcasting unconfirmed sweeps */
@@ -124,6 +126,11 @@ export class ChainMonitor {
 	 * second-level HTLC signatures are what make the difference: they are
 	 * per-funding, and an HTLC claim built with the other funding's is invalid.
 	 */
+	/** The channel state this monitor resolves with. */
+	getChannelState(): IChannelState {
+		return this._channelState;
+	}
+
 	setChannelState(channelState: IChannelState): void {
 		this._channelState = channelState;
 	}
@@ -1174,6 +1181,7 @@ export class ChainMonitor {
 		output.resolutionTxid = spendingTx.getId();
 		if (this._channelState.auxiliaryState) {
 			output.resolutionTxHex = spendingTx.toHex();
+			selectAuxiliarySweep(output, spendingTx.getId());
 		}
 		output.confirmationHeight = blockHeight;
 		// A spend we had not recorded is live evidence as much as a re-report of
@@ -1366,6 +1374,7 @@ export class ChainMonitor {
 			spentTrackedOutput.resolutionTxid = spendingTx.getId();
 			if (this._channelState.auxiliaryState) {
 				spentTrackedOutput.resolutionTxHex = spendingTx.toHex();
+				selectAuxiliarySweep(spentTrackedOutput, spendingTx.getId());
 			}
 			spentTrackedOutput.confirmationHeight = blockHeight;
 			delete spentTrackedOutput.spendReverifyPending;
@@ -3022,6 +3031,7 @@ export class ChainMonitor {
 			if (replacement) {
 				candidate.status = OutputStatus.SPEND_BROADCAST;
 				candidate.sweepTxHex = replacement.toHex();
+				noteAuxiliarySweep(candidate, auxiliarySweepDataOf(replacement));
 				candidate.originalFeeRate ??= appliedFeeRate;
 				candidate.currentFeeRate = appliedFeeRate;
 				candidate.broadcastHeight = this._currentBlockHeight;
@@ -3081,6 +3091,7 @@ export class ChainMonitor {
 			resolved,
 			'penalty sweep (revoked commitment)'
 		);
+		this._reportAuxiliaryRefusals(actions, resolved);
 		// Report anything this first pass declined. Waiting for the first retry to
 		// report would lose the decline entirely whenever the very next fee
 		// estimate recovers the claim.
@@ -3138,13 +3149,18 @@ export class ChainMonitor {
 				actions.push({
 					type: ChainActionType.BROADCAST_TX,
 					tx: txBuf,
-					description
+					description,
+					...(r.auxiliaryData ? { requiresMonitorPersistence: true } : {})
 				});
 			}
 			r.trackedOutput.status = OutputStatus.SPEND_BROADCAST;
 			r.trackedOutput.broadcastHeight = this._currentBlockHeight;
 			r.trackedOutput.originalFeeRate = this._feeRatePerVbyte;
 			r.trackedOutput.sweepTxHex = txBuf.toString('hex');
+			if (r.auxiliaryData) {
+				noteAuxiliarySweep(r.trackedOutput, r.auxiliaryData);
+				noteAuxiliarySweepOffered(r.trackedOutput, txBuf);
+			}
 		}
 	}
 
@@ -3460,6 +3476,7 @@ export class ChainMonitor {
 			resolved,
 			'penalty sweep (revoked commitment, retried after skip)'
 		);
+		this._reportAuxiliaryRefusals(actions, resolved);
 		// Over the tracked set rather than over `retryable`: the pass above adopts
 		// snapshot-reconstructed outputs, and a claim declined for one of those is
 		// otherwise the one decline nothing can report.

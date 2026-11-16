@@ -8,6 +8,8 @@
 
 import { auxiliaryProviderError } from './auxiliary';
 import { AuxiliaryOpenError } from './auxiliary-guard';
+import { holdAuxiliaryRevokedView } from './auxiliary-revoked';
+import { classifyCommitmentTx } from '../chain/output-resolver';
 import { applyAuxiliaryClose } from './auxiliary-close';
 import { auxiliaryChannelOpens } from './auxiliary-switch';
 import type { CustomRecords } from '../message/custom-records';
@@ -131,7 +133,10 @@ import { buildTaprootAnchorOutput } from '../script/commitment-taproot';
 import { ecc } from '../../utils/ecc';
 import type { ISpliceWalletInput, ITaprootClosingCache } from './channel';
 import { Channel } from './channel';
-import type { IAuxiliaryOpeningCsvState } from './auxiliary';
+import type {
+	IAuxiliaryCommitmentData,
+	IAuxiliaryOpeningCsvState
+} from './auxiliary';
 import {
 	auxiliaryCsvPolicyError,
 	createAuxiliaryOpeningCsvPolicy
@@ -409,6 +414,16 @@ export interface IChannelManagerConfig {
 	 * spend does not leave. LightningNode supplies one backed by its storage.
 	 */
 	isMonitorPersisted?: (channelIdHex: string) => boolean;
+	/**
+	 * The view of one revoked commitment of an asset channel, from the
+	 * storage's store of revoked views. Asked when a revoked commitment of
+	 * an asset channel is seen on the chain and its view has left memory.
+	 * LightningNode supplies one backed by its storage.
+	 */
+	loadAuxiliaryRevokedCommitment?: (
+		channelIdHex: string,
+		commitmentNumber: bigint
+	) => IAuxiliaryCommitmentData | null | undefined;
 	/**
 	 * Asset channel support (issue #2093). Unset, the manager opens and
 	 * accepts ordinary channels only and none of the asset code runs.
@@ -3740,6 +3755,23 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		// Captured BEFORE the report so a DEMOTION (a confirmed spend pushed back
 		// to the mempool by a reorg, or its clock stopped by a valid competing
 		// mempool spend) can be told from an ordinary mempool-first sighting.
+		// A revoked commitment of an asset channel: the asset side of that
+		// commitment is read back before its outputs are told apart.
+		const monitorState =
+			typeof monitor.getChannelState === 'function'
+				? monitor.getChannelState()
+				: undefined;
+		if (monitorState?.auxiliaryState) {
+			const seen = classifyCommitmentTx(spendingTx, monitorState);
+			if (seen.type === CommitmentType.THEIR_REVOKED_COMMITMENT) {
+				this.holdRevokedAuxiliaryView(
+					channelIdHex,
+					monitorState,
+					seen.commitmentNumber
+				);
+			}
+		}
+
 		const wasCommitmentConfirmed = monitor.isCommitmentConfirmed();
 		const chainActions = monitor.handleFundingSpent(
 			spendingTx,
@@ -4040,6 +4072,20 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 	 */
 	restoreMonitor(channelId: string, monitor: ChainMonitor): void {
 		this.monitors.set(channelId, monitor);
+		if (typeof monitor.getChannelState === 'function') {
+			const monitorState = monitor.getChannelState();
+			const broadcast = monitor.getFullState().commitmentBroadcast;
+			if (
+				monitorState?.auxiliaryState &&
+				broadcast?.commitmentType === CommitmentType.THEIR_REVOKED_COMMITMENT
+			) {
+				this.holdRevokedAuxiliaryView(
+					channelId,
+					monitorState,
+					broadcast.commitmentNumber
+				);
+			}
+		}
 		// Before the harvest, so the only preimages dropped are ones the node
 		// read back from its own store, never one durable only in this monitor.
 		const trimmed =
@@ -12209,12 +12255,66 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 	}
 
 	/**
+	 * Hold the asset side of a revoked commitment that is on the chain, read
+	 * back from the store of revoked views when it had left memory. Without
+	 * it the outputs of that commitment that carry units are not found, and
+	 * only the others are punished: said as an error naming the channel and
+	 * the commitment.
+	 */
+	private holdRevokedAuxiliaryView(
+		channelIdHex: string,
+		state: IChannelState,
+		commitmentNumber: bigint
+	): void {
+		let cause = '';
+		let held = false;
+		try {
+			held = holdAuxiliaryRevokedView(
+				state,
+				commitmentNumber,
+				() =>
+					this.config.loadAuxiliaryRevokedCommitment?.(
+						channelIdHex,
+						commitmentNumber
+					)
+			);
+		} catch (error) {
+			cause = `: ${(error as Error).message}`;
+		}
+		if (held) return;
+		this.emitContained(
+			'error',
+			Buffer.from(channelIdHex, 'hex'),
+			`The asset side of revoked commitment ${commitmentNumber} is not held, so its outputs that carry units cannot be punished (channel ${channelIdHex})${cause}`
+		);
+	}
+
+	/**
+	 * Whether a transaction a monitor is about to have broadcast is a sweep
+	 * of units it signed, by whichever path it was built. The monitor marks
+	 * it as offered, so its asset side stays in the row. Always false for a
+	 * channel without asset state.
+	 */
+	private offersAuxiliarySweep(channelId: Buffer, tx: Buffer): boolean {
+		const monitor = this.monitors.get(channelId.toString('hex'));
+		return (
+			!!monitor &&
+			typeof monitor.offerAuxiliarySweep === 'function' &&
+			monitor.offerAuxiliarySweep(tx)
+		);
+	}
+
+	/**
 	 * Broadcast a spend of the units of an asset channel, once the monitor
 	 * row that holds its asset side is stored. Until then it is held, said
 	 * as an error naming the channel, and released on a later block.
 	 */
 	private broadcastAuxiliarySpend(channelId: Buffer, tx: Buffer): void {
 		const channelIdHex = channelId.toString('hex');
+		// The monitor as it is now is announced first, so that the answer is
+		// about the row that holds this spend's asset side.
+		const monitor = this.monitors.get(channelIdHex);
+		if (monitor) this.emit('monitor:updated', channelIdHex, monitor);
 		if (this.config.isMonitorPersisted?.(channelIdHex) === true) {
 			this.emit('broadcast:tx', tx);
 			return;
@@ -12244,7 +12344,10 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		for (const action of actions) {
 			switch (action.type) {
 				case ChainActionType.BROADCAST_TX:
-					if (action.requiresMonitorPersistence) {
+					if (
+						action.requiresMonitorPersistence ||
+						this.offersAuxiliarySweep(channelId, action.tx)
+					) {
 						this.broadcastAuxiliarySpend(channelId, action.tx);
 						break;
 					}
@@ -12295,14 +12398,9 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 						// Sweep rebuilds return bitcoin.Transaction objects; every
 						// broadcast listener expects a raw Buffer.
 						const raw = tx.toBuffer();
-						if (
-							mon &&
-							typeof mon.offerAuxiliarySweep === 'function' &&
-							mon.offerAuxiliarySweep(raw)
-						) {
+						if (this.offersAuxiliarySweep(channelId, raw)) {
 							// A rebuilt sweep of units: the row with its new asset
 							// side is stored before it leaves.
-							this.emit('monitor:updated', channelId.toString('hex'), mon);
 							this.broadcastAuxiliarySpend(channelId, raw);
 							continue;
 						}

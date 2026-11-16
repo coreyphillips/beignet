@@ -46,11 +46,14 @@ export function auxiliaryCommitmentView(
 	commitmentNumber: bigint | undefined
 ): IAuxiliaryCommitmentData | undefined {
 	if (!state.auxiliaryState || commitmentNumber === undefined) return undefined;
+	if (isOurs)
+		return state.auxiliaryState.localCommitments.get(commitmentNumber);
+	// A revoked commitment of the peer that is on the chain: its view was
+	// read back from the store of revoked views when it was seen.
 	return (
-		isOurs
-			? state.auxiliaryState.localCommitments
-			: state.auxiliaryState.remoteCommitments
-	).get(commitmentNumber);
+		state.auxiliaryState.remoteCommitments.get(commitmentNumber) ??
+		state.auxiliaryState.revokedCommitments?.get(commitmentNumber)
+	);
 }
 
 /**
@@ -308,7 +311,34 @@ export function prepareAuxiliarySweep(
 	for (const [index, script] of scripts) {
 		transaction.outs[index].script = Buffer.from(script);
 	}
+	madeFor.set(transaction, data);
 	return { assets: true, ok: true, data };
+}
+
+/** The asset side the provider made for each transaction built here. */
+const madeFor = new WeakMap<bitcoin.Transaction, Buffer>();
+
+/**
+ * The asset side the provider made for a transaction, for a path that is
+ * handed the transaction without what was resolved with it. Undefined for
+ * a transaction without one.
+ */
+export function auxiliarySweepDataOf(
+	transaction: bitcoin.Transaction
+): Buffer | undefined {
+	return madeFor.get(transaction);
+}
+
+/**
+ * A spend of the output confirmed: the asset side of that very transaction
+ * is the one the output holds from here on, whichever was signed last.
+ */
+export function selectAuxiliarySweep(
+	output: ITrackedOutput,
+	txid: string
+): void {
+	const confirmed = output.auxiliarySweepAttempts?.[txid]?.auxiliaryData;
+	if (confirmed) output.auxiliaryData = Buffer.from(confirmed);
 }
 
 /**

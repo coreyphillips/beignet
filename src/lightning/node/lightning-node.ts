@@ -2176,6 +2176,11 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			// A node without storage has nothing to wait for. One with storage
 			// has stored a monitor once it is no longer dirty, is not held back
 			// for its channel's row, and no transition of its channel is open.
+			loadAuxiliaryRevokedCommitment: (channelIdHex, commitmentNumber) =>
+				this.storage?.loadAuxiliaryRevokedCommitment?.(
+					channelIdHex,
+					commitmentNumber
+				),
 			isMonitorPersisted: (channelIdHex) =>
 				!this.recovery ||
 				(!this.dirtyMonitors.has(channelIdHex) &&

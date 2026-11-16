@@ -602,6 +602,7 @@ class chain.ChainMonitor
 constructor chain.ChainMonitor(channelState: channel.IChannelState, destinationScript: Buffer, feeRatePerVbyte: number, revocationBasepointSecret: Buffer, paymentPrivkey: Buffer, network?: bitcoinjs-lib#Network, delayedPaymentBasepointSecret?: Buffer, htlcBasepointSecret?: Buffer)
 method chain.ChainMonitor.addPreimage(paymentHash: Buffer, preimage: Buffer): chain.ChainAction[]
 method chain.ChainMonitor.dropUnusedPreimages(heldElsewhere: ReadonlyMap<string, Buffer>): number
+method chain.ChainMonitor.getChannelState(): channel.IChannelState
 method chain.ChainMonitor.getFullState(): chain.IChainMonitorState
 method chain.ChainMonitor.getKnownPreimages(): ReadonlyMap<string, Buffer>
 method chain.ChainMonitor.getState(): chain.MonitorState
@@ -1880,6 +1881,7 @@ property channel.IChannelManagerConfig.htlcBasepointSecret?: Buffer
 property channel.IChannelManagerConfig.isMonitorPersisted?: (channelIdHex: string) => boolean
 property channel.IChannelManagerConfig.largeChannels?: boolean
 property channel.IChannelManagerConfig.leaseRates?: gossip.ILeaseRates
+property channel.IChannelManagerConfig.loadAuxiliaryRevokedCommitment?: (channelIdHex: string, commitmentNumber: bigint) => channel.IAuxiliaryCommitmentData | null | undefined
 property channel.IChannelManagerConfig.localBasepoints: keys.IChannelBasepoints
 property channel.IChannelManagerConfig.localConfig?: channel.IChannelConfig
 property channel.IChannelManagerConfig.localFeatures?: features.FeatureFlags

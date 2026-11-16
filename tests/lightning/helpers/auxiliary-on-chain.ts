@@ -21,11 +21,17 @@ import type {
 } from '../../../src/lightning/channel/auxiliary-funding';
 import type { ITrackedOutput } from '../../../src/lightning/chain/types';
 import { ChannelState } from '../../../src/lightning/channel/types';
+import { PaymentStatus } from '../../../src/lightning/node/types';
 import { createTaprootFundingScript } from '../../../src/lightning/script/funding-taproot';
 import { ecc } from '../../../src/utils/ecc';
 import { TestChain, TestChainBackend } from './auxiliary-chain';
 import { assetHost, connectHosts, type IAssetHost } from './auxiliary-nodes';
-import { ASSET_FUNDING_ROOT, hash, referenceProvider } from './auxiliary-pair';
+import {
+	ASSET_FUNDING_ROOT,
+	amountRecord,
+	hash,
+	referenceProvider
+} from './auxiliary-pair';
 import { makeSeed } from './loopback-nodes';
 
 export const settle = async (): Promise<void> => {
@@ -144,6 +150,54 @@ export interface IAssetChainOptions {
 	};
 }
 
+/** Alice pays Bob `units` over the asset channel of a pair, and it settles. */
+export async function payUnits(
+	pair: IAssetChainPair,
+	units: bigint
+): Promise<void> {
+	const { alice, bob, channelId, chain } = pair;
+	const invoice = bob.node.createInvoice({
+		amountMsat: units * 1000n,
+		description: 'units'
+	});
+	const expiry = chain.height + 60;
+	alice.node.sendPaymentToRoute(
+		{
+			hops: [
+				{
+					pubkey: Buffer.from(bob.node.getNodeId(), 'hex'),
+					shortChannelId: Buffer.alloc(8, 9),
+					amountToForwardMsat: units * 1000n,
+					outgoingCltvValue: expiry
+				}
+			]
+		},
+		invoice.paymentHash,
+		expiry,
+		invoice.paymentSecret,
+		undefined,
+		undefined,
+		undefined,
+		undefined,
+		{
+			assetPayment: {
+				channelId,
+				wireAmountMsat: 354_000n,
+				customRecords: amountRecord(units)
+			}
+		}
+	);
+	await settle();
+	const status = alice.node.getPayment(invoice.paymentHash)?.status;
+	if (status !== PaymentStatus.COMPLETED) {
+		throw new Error(
+			`a payment of ${units} units is ${status}: ${alice.errors
+				.concat(bob.errors)
+				.join('; ')}`
+		);
+	}
+}
+
 /** The outputs a host's monitor tracks for a channel, through the host's read. */
 export const trackedOutputs = (
 	host: IAssetHost,
@@ -156,6 +210,7 @@ export const errorsOf = (host: IAssetHost): string[] =>
 	host.errors.filter(
 		(error) =>
 			!error.startsWith('AUTO_FUNDING_FAILED') &&
+			!error.startsWith('NO_ROUTING_HINTS') &&
 			!error.includes('anchor fee bump')
 	);
 

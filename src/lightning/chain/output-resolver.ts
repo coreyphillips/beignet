@@ -3619,12 +3619,26 @@ function resolveRevokedTaprootCommitmentOutputs(
 
 	for (const o of trackedOutputs) {
 		if (alreadyClaimed.has(o.outputIndex)) continue;
+		// An HTLC output of an asset channel is tracked and left unspent here.
+		if (auxiliaryHtlcOutputWaits(state, o)) continue;
+		// An output that carries units is spent with the leaf of its view. A
+		// view that is gone is a refusal kept on the output, never a throw
+		// through the resolution of the other outputs.
+		let auxiliaryLeaf: ITaprootAuxLeaf | undefined;
+		try {
+			auxiliaryLeaf = trackedAuxiliaryLeaf(state, false, o);
+		} catch (error) {
+			o.auxiliaryRefusal = (error as Error).message;
+			resolved.push({ trackedOutput: o });
+			continue;
+		}
 		if (o.outputType === OutputType.TO_LOCAL) {
 			const tl = buildTaprootToLocalOutput(
 				keys.revocationPubkey,
 				keys.delayedPubkey,
 				keys.toSelfDelay,
-				network
+				network,
+				auxiliaryLeaf
 			);
 			penaltyIns.push({
 				output: o,
@@ -3664,9 +3678,19 @@ function resolveRevokedTaprootCommitmentOutputs(
 			});
 		} else if (o.outputType === OutputType.TO_REMOTE) {
 			// Our balance — claim the 1-block-CSV to_remote leaf with our payment key.
-			const tr = buildTaprootToRemoteOutput(keys.paymentPubkey, network);
+			const tr = buildTaprootToRemoteOutput(
+				keys.paymentPubkey,
+				network,
+				auxiliaryLeaf
+			);
 			const feeSatoshis = BigInt(
-				Math.ceil(feeRatePerVbyte * estimateSweepVbytes(OutputType.TO_REMOTE))
+				Math.ceil(
+					feeRatePerVbyte *
+						(estimateSweepVbytes(OutputType.TO_REMOTE) +
+							(o.auxiliaryCommitmentNumber !== undefined
+								? auxiliarySweepVbytes(destinationScript)
+								: 0))
+				)
 			);
 			const claimValue = sweepOutputValue(
 				o.amount,
@@ -3675,7 +3699,9 @@ function resolveRevokedTaprootCommitmentOutputs(
 			);
 			// Not economical to claim. Skip it rather than abandoning the penalty
 			// spends for the remaining outputs of this revoked commitment.
-			if (claimValue === null) continue;
+			if (auxiliarySweepNeedsFee(o, claimValue) || claimValue === null) {
+				continue;
+			}
 			const claimTx = new bitcoin.Transaction();
 			claimTx.version = 2;
 			claimTx.addInput(
@@ -3684,6 +3710,28 @@ function resolveRevokedTaprootCommitmentOutputs(
 				1 // 1-block CSV
 			);
 			claimTx.addOutput(destinationScript, claimValue);
+			const claimAssets = prepareAuxiliarySweep(
+				state,
+				false,
+				claimTx,
+				[
+					{
+						output: o,
+						commitmentOutputIndex: o.outputIndex,
+						kind: 'to_remote',
+						privateKey: paymentPrivkey,
+						leafScript: tr.spend.script,
+						leafVersion: tr.spend.leafVersion,
+						controlBlock: tr.spend.controlBlock
+					}
+				],
+				destinationScript
+			);
+			if (claimAssets.assets && !claimAssets.ok) {
+				o.auxiliaryRefusal = claimAssets.refusal;
+				resolved.push({ trackedOutput: o });
+				continue;
+			}
 			const sighash = claimTx.hashForWitnessV1(
 				0,
 				[tr.output],
@@ -3697,7 +3745,8 @@ function resolveRevokedTaprootCommitmentOutputs(
 				trackedOutput: o,
 				spendTx: claimTx,
 				witness: claimTx.ins[0].witness,
-				csvDelay: 1
+				csvDelay: 1,
+				...(claimAssets.assets ? { auxiliaryData: claimAssets.data } : {})
 			});
 		}
 	}
@@ -3777,13 +3826,23 @@ function resolveRevokedTaprootCommitmentOutputs(
 			);
 			totalIn += BigInt(pin.value);
 		}
+		// An output that carries units is punished in a transaction of its
+		// own, whose asset side its provider makes.
+		const carrying =
+			ins.length === 1 && ins[0].output.auxiliaryCommitmentNumber !== undefined
+				? ins[0]
+				: undefined;
 		const estVbytes =
 			TAPROOT_PENALTY_BASE_VBYTES +
 			ins.length * TAPROOT_PENALTY_PER_INPUT_VBYTES +
-			TAPROOT_PENALTY_OUTPUT_VBYTES;
+			TAPROOT_PENALTY_OUTPUT_VBYTES +
+			(carrying ? auxiliarySweepVbytes(destinationScript) : 0);
 		const fee = BigInt(Math.ceil(feeRatePerVbyte * estVbytes));
 		const penaltyValue = sweepOutputValue(totalIn, fee, destinationScript);
-		if (penaltyValue === null) {
+		if (
+			(carrying && auxiliarySweepNeedsFee(carrying.output, penaltyValue)) ||
+			penaltyValue === null
+		) {
 			// This batch cannot pay for itself. Return rather than handing
 			// addOutput a negative value: the caller splits urgent inputs into
 			// their own batch, and a throw here would abandon the remaining
@@ -3794,6 +3853,32 @@ function resolveRevokedTaprootCommitmentOutputs(
 			return;
 		}
 		penaltyTx.addOutput(destinationScript, penaltyValue);
+		let penaltyData: Buffer | undefined;
+		if (carrying) {
+			const assets = prepareAuxiliarySweep(
+				state,
+				false,
+				penaltyTx,
+				[
+					{
+						output: carrying.output,
+						commitmentOutputIndex: carrying.output.outputIndex,
+						kind: 'to_local_revocation',
+						privateKey: revocationPrivkey,
+						leafScript: carrying.leafScript,
+						leafVersion: TAPLEAF_VERSION,
+						controlBlock: carrying.controlBlock
+					}
+				],
+				destinationScript
+			);
+			if (assets.assets && !assets.ok) {
+				carrying.output.auxiliaryRefusal = assets.refusal;
+				resolved.push({ trackedOutput: carrying.output });
+				return;
+			}
+			if (assets.assets) penaltyData = assets.data;
+		}
 
 		const prevScripts = ins.map((p) => p.spk);
 		const values = ins.map((p) => p.value);
@@ -3833,7 +3918,8 @@ function resolveRevokedTaprootCommitmentOutputs(
 			resolved.push({
 				trackedOutput: pin.output,
 				spendTx: penaltyTx,
-				witness
+				witness,
+				...(penaltyData ? { auxiliaryData: penaltyData } : {})
 			});
 		}
 	};
@@ -3852,9 +3938,20 @@ function resolveRevokedTaprootCommitmentOutputs(
 								PENALTY_SPLIT_DEADLINE_BLOCKS
 				  )
 				: [];
-		const batched = penaltyIns.filter((pin) => !urgent.includes(pin));
+		// Never an output of a channel without asset state.
+		const withUnits = penaltyIns.filter(
+			(pin) =>
+				pin.output.auxiliaryCommitmentNumber !== undefined &&
+				!urgent.includes(pin)
+		);
+		const batched = penaltyIns.filter(
+			(pin) => !urgent.includes(pin) && !withUnits.includes(pin)
+		);
 
 		for (const pin of urgent) {
+			buildAndSignPenalty([pin]);
+		}
+		for (const pin of withUnits) {
 			buildAndSignPenalty([pin]);
 		}
 		if (batched.length > 0) {
