@@ -990,7 +990,7 @@ function chain.selectTheirPerCommitmentPoint(tx: bitcoinjs-lib#Transaction, stat
 function chain.signP2wpkhInput(tx: bitcoinjs-lib#Transaction, inputIndex: number, pubkey: Buffer, value: number, privateKey: Buffer): Buffer
 function chain.signSweepInput(tx: bitcoinjs-lib#Transaction, inputIndex: number, witnessScript: Buffer, value: number, privateKey: Buffer, sighashType?: number): Buffer
 namespace channel
-const channel.AUXILIARY_CHANNELS_API: Readonly<{ version: 0; surfaces: readonly [ "valueIncomingHtlc:three-outcome", "sendPaymentToRoute:assetPayment", "getAuxiliaryPaymentHtlcs", "onHtlcResolved:htlcId", "queryAuxiliaryRoute", "fundAuxiliaryChannel:unsigned", "onFundingSigned", "abandonAuxiliaryOpen", "IChannelInfo.auxiliary", "setAuxiliaryPaymentGate", "getChannelMonitorState" ]; }>
+const channel.AUXILIARY_CHANNELS_API: Readonly<{ version: 0; surfaces: readonly [ "valueIncomingHtlc:three-outcome", "sendPaymentToRoute:assetPayment", "getAuxiliaryPaymentHtlcs", "onHtlcResolved:htlcId", "queryAuxiliaryRoute", "fundAuxiliaryChannel:unsigned", "onFundingSigned", "abandonAuxiliaryOpen", "IChannelInfo.auxiliary", "setAuxiliaryPaymentGate", "getChannelMonitorState", "IPaymentInfo.auxiliary", "IPaymentInfo.auxiliaryValueMsat", "IInvoiceInfo.auxiliary" ]; }>
 const channel.AUXILIARY_CHANNEL_DUST_LIMIT = 354n
 const channel.AUXILIARY_CLOSE_ASSET_OUTPUT_MINIMUM = 330n
 class channel.AuxiliaryChannelUnsupportedError extends beignet#CodedError<'ASSET_CHANNEL_UNSUPPORTED'>
@@ -5812,6 +5812,7 @@ property node.IHoldInvoiceStateEvent.paymentHash: Buffer
 property node.IHoldInvoiceStateEvent.state: node.HoldInvoiceState
 interface node.IInvoiceInfo
 property node.IInvoiceInfo.amountMsat?: bigint
+property node.IInvoiceInfo.auxiliary?: true
 property node.IInvoiceInfo.bolt11: string
 property node.IInvoiceInfo.bolt12?: boolean
 property node.IInvoiceInfo.cancelledAt?: number
@@ -5990,6 +5991,8 @@ property node.IPaymentHtlcResolvedEvent.paymentHash: Buffer
 property node.IPaymentHtlcResolvedEvent.state: node.OutgoingHtlcState
 interface node.IPaymentInfo
 property node.IPaymentInfo.amountMsat: bigint
+property node.IPaymentInfo.auxiliary?: true
+property node.IPaymentInfo.auxiliaryValueMsat?: bigint
 property node.IPaymentInfo.cltvBaseHeight?: number
 property node.IPaymentInfo.completedAt?: number
 property node.IPaymentInfo.createdAt: number
@@ -6412,7 +6415,7 @@ property node.LightningNodeEvents.'htlc:held': (data: { paymentHash: Buffer; amo
 property node.LightningNodeEvents.'htlc:held-forward': (data: { holdId: Buffer; paymentHash: Buffer; amountMsat: bigint; cutoffHeight: number; }) => void
 property node.LightningNodeEvents.'htlc:held-forward-failed': (record: asyncPayments.IHeldForwardRecord) => void
 property node.LightningNodeEvents.'htlc:held-forward-released': (record: asyncPayments.IHeldForwardRecord) => void
-property node.LightningNodeEvents.'invoice:settled': (data: { paymentHash: Buffer; bolt11: string; amountMsat: bigint; }) => void
+property node.LightningNodeEvents.'invoice:settled': (data: { paymentHash: Buffer; bolt11: string; amountMsat: bigint; auxiliary?: true; }) => void
 property node.LightningNodeEvents.'message:outbound': (peerPubkey: string, type: number, payload: Buffer) => void
 property node.LightningNodeEvents.'node:error': (error: node.ILightningError<node.NodeErrorCode>) => void
 property node.LightningNodeEvents.'node:ready': () => void
@@ -8118,6 +8121,7 @@ property storage.IGossipRowPage.done: boolean
 property storage.IGossipRowPage.rows: T[]
 interface storage.IInvoiceInfo
 property storage.IInvoiceInfo.amountMsat?: bigint
+property storage.IInvoiceInfo.auxiliary?: true
 property storage.IInvoiceInfo.bolt11: string
 property storage.IInvoiceInfo.bolt12?: boolean
 property storage.IInvoiceInfo.cancelledAt?: number
@@ -8420,6 +8424,7 @@ property storage.ISerializedHtlcSnapshot.commitmentNumber: string
 property storage.ISerializedHtlcSnapshot.htlcs: Array<{ paymentHash: string; amountMsat: string; cltvExpiry: number; direction: string; }>
 interface storage.ISerializedInvoiceInfo
 property storage.ISerializedInvoiceInfo.amountMsat?: string
+property storage.ISerializedInvoiceInfo.auxiliary?: true
 property storage.ISerializedInvoiceInfo.bolt11: string
 property storage.ISerializedInvoiceInfo.bolt12?: boolean
 property storage.ISerializedInvoiceInfo.cancelledAt?: number
@@ -8433,6 +8438,8 @@ property storage.ISerializedInvoiceInfo.paymentHash: string
 property storage.ISerializedInvoiceInfo.paymentMetadata?: string
 interface storage.ISerializedPaymentInfo
 property storage.ISerializedPaymentInfo.amountMsat: string
+property storage.ISerializedPaymentInfo.auxiliary?: true
+property storage.ISerializedPaymentInfo.auxiliaryValueMsat?: string
 property storage.ISerializedPaymentInfo.completedAt?: number
 property storage.ISerializedPaymentInfo.createdAt: number
 property storage.ISerializedPaymentInfo.direction: string

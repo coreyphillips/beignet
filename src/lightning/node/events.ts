@@ -116,6 +116,8 @@ export interface LightningNodeEvents
 		paymentHash: Buffer;
 		bolt11: string;
 		amountMsat: bigint;
+		/** Paid by asset HTLCs; present, and true, only then. */
+		auxiliary?: true;
 	}) => void;
 
 	// ─── Hold invoices ───

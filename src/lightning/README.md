@@ -1372,7 +1372,7 @@ const result = await node.recoverFromStaticChannelBackup(scb.channels);
 | `payment:htlc-resolved` | `(event: IPaymentHtlcResolvedEvent)` | One offered HTLC of an outgoing payment reached a terminal state (fulfilled, irrevocably failed, or resolved on chain). A fulfilled HTLC is reported once, as `htlc:fulfilled` is. |
 | `payment:preimage` | `(event: IPaymentPreimageEvent)` | An outgoing payment's preimage became known, from update_fulfill_htlc or an on-chain claim, whatever the record's status was. From update_fulfill_htlc it is raised once per HTLC, as `htlc:fulfilled` is. |
 | `preimage:learned` | `(paymentHash: Buffer, preimage: Buffer)` | Preimage recorded (forwarding and settlement chokepoint). |
-| `invoice:settled` | `(data: { paymentHash: Buffer; bolt11: string; amountMsat: bigint })` | Invoice this node issued was settled. |
+| `invoice:settled` | `(data: { paymentHash: Buffer; bolt11: string; amountMsat: bigint; auxiliary?: true })` | Invoice this node issued was settled. |
 | `htlc:held` | `(data: { paymentHash: Buffer; amountMsat: bigint })` | HTLC parked by a hold invoice (one part; read `getHeldInvoiceSnapshot` for the committed set). |
 | `hold:accepted` | `(event: IHoldInvoiceStateEvent)` | A part joined a hold invoice's parked set, with the set's running total. A re-park on reestablish does not fire. Acceptance can be a partial MPP payment: compare `heldAmountMsat` with the full expected amount before committing funds. |
 | `hold:settled` | `(event: IHoldInvoiceStateEvent)` | A hold invoice's preimage was revealed and every parked part fulfilled. |

@@ -1881,6 +1881,10 @@ export interface ISerializedPaymentInfo {
 	sentMsat?: string;
 	/** Msat an incoming payment's settled HTLCs paid, when amountMsat is not that. */
 	receivedMsat?: string;
+	/** Carried by asset HTLCs; present only then. */
+	auxiliary?: true;
+	/** OUTGOING asset payment: what it is worth to the payee. */
+	auxiliaryValueMsat?: string;
 	status: string;
 	direction: string;
 	route?: string; // JSON string
@@ -1913,6 +1917,10 @@ export function serializePaymentInfo(p: IPaymentInfo): ISerializedPaymentInfo {
 		...(p.sentMsat !== undefined ? { sentMsat: bigintToStr(p.sentMsat) } : {}),
 		...(p.receivedMsat !== undefined
 			? { receivedMsat: bigintToStr(p.receivedMsat) }
+			: {}),
+		...(p.auxiliary === true ? { auxiliary: true as const } : {}),
+		...(p.auxiliaryValueMsat !== undefined
+			? { auxiliaryValueMsat: bigintToStr(p.auxiliaryValueMsat) }
 			: {}),
 		status: p.status,
 		direction: p.direction,
@@ -1971,6 +1979,10 @@ export function deserializePaymentInfo(
 		...(s.sentMsat !== undefined ? { sentMsat: strToBigint(s.sentMsat) } : {}),
 		...(s.receivedMsat !== undefined
 			? { receivedMsat: strToBigint(s.receivedMsat) }
+			: {}),
+		...(s.auxiliary === true ? { auxiliary: true as const } : {}),
+		...(s.auxiliaryValueMsat !== undefined
+			? { auxiliaryValueMsat: strToBigint(s.auxiliaryValueMsat) }
 			: {}),
 		status: s.status as PaymentStatus,
 		direction: s.direction as PaymentDirection,
@@ -2120,6 +2132,8 @@ export interface ISerializedInvoiceInfo {
 	jitFee?: { flatFeeSat: number; feePpm: number };
 	minFinalCltvExpiry?: number;
 	paymentMetadata?: string;
+	/** Paid by asset HTLCs; present only then. */
+	auxiliary?: true;
 }
 
 export function serializeInvoiceInfo(
@@ -2140,7 +2154,8 @@ export function serializeInvoiceInfo(
 		cancelledAt: invoice.cancelledAt,
 		jitFee: invoice.jitFee,
 		minFinalCltvExpiry: invoice.minFinalCltvExpiry,
-		paymentMetadata: invoice.paymentMetadata
+		paymentMetadata: invoice.paymentMetadata,
+		...(invoice.auxiliary === true ? { auxiliary: true as const } : {})
 	};
 }
 
@@ -2163,6 +2178,7 @@ export function deserializeInvoiceInfo(
 		// A row written before #770 has none: the final hop then enforces
 		// the node default, which is what it advertised.
 		minFinalCltvExpiry: s.minFinalCltvExpiry,
-		paymentMetadata: s.paymentMetadata
+		paymentMetadata: s.paymentMetadata,
+		...(s.auxiliary === true ? { auxiliary: true as const } : {})
 	};
 }

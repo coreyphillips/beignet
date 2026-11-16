@@ -1514,7 +1514,10 @@ describe('Asset payments (issue #2093, step 8)', function () {
 				'abandonAuxiliaryOpen',
 				'IChannelInfo.auxiliary',
 				'setAuxiliaryPaymentGate',
-				'getChannelMonitorState'
+				'getChannelMonitorState',
+				'IPaymentInfo.auxiliary',
+				'IPaymentInfo.auxiliaryValueMsat',
+				'IInvoiceInfo.auxiliary'
 			]);
 			expect(Object.isFrozen(api)).to.equal(true);
 			expect(Object.isFrozen(api.surfaces)).to.equal(true);

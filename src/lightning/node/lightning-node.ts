@@ -19512,6 +19512,13 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			parts[htlcKey] = finalAmountMsat.toString();
 			metadata = { ...metadata, _auxiliaryPartAmounts: JSON.stringify(parts) };
 			payment.metadata = { ...metadata };
+			// The record says that asset HTLCs carry it, and what it is worth
+			// to the payee: amountMsat stays the bitcoin of its carriers.
+			payment.auxiliary = true;
+			payment.auxiliaryValueMsat = Object.values(parts).reduce(
+				(sum, value) => sum + BigInt(value),
+				0n
+			);
 		}
 		// The labelled row has to fit a frame with the route it now carries,
 		// both beside its HTLC mapping and as settlement will journal it.
@@ -23838,7 +23845,8 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		this.emit('invoice:settled', {
 			paymentHash,
 			bolt11: invoice.bolt11,
-			amountMsat: payment.amountMsat
+			amountMsat: payment.amountMsat,
+			...(payment.auxiliary === true ? { auxiliary: true as const } : {})
 		});
 		this.emitStructuredLog('payment', 'invoice_settled', {
 			paymentHash: paymentHash.toString('hex'),
@@ -26084,19 +26092,41 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		// The chain monitors learn the preimage whatever the provider says.
 		this.channelManager.recordPreimage(paymentHash, preimage);
 		const payment = this.payments.get(hashHex);
-		const completed = payment
+		// An HTLC that holds units marks the records it pays; a plain
+		// bitcoin HTLC an asset channel took from its peer does not.
+		const carriesUnits =
+			this.channelManager
+				.getChannel(channelId)
+				?.getFullState()
+				.htlcs.get(`received-${htlcId}`)?.auxiliaryAmount !== undefined;
+		const completed: IPaymentInfo | undefined = payment
 			? {
 					...payment,
 					status: PaymentStatus.COMPLETED,
 					completedAt: Date.now(),
-					settledHtlcs: [key]
+					settledHtlcs: [key],
+					...(carriesUnits ? { auxiliary: true as const } : {})
 			  }
 			: undefined;
 		if (completed) {
 			if (completed.amountMsat === 0n) completed.amountMsat = declaredMsat;
 			recordReceivedMsat(completed, htlcMsat);
 		}
+		const invoice = this.invoices.get(hashHex);
+		const markedInvoice: IInvoiceInfo | undefined =
+			carriesUnits && invoice && invoice.auxiliary !== true
+				? { ...invoice, auxiliary: true }
+				: undefined;
 		const staged: RecoveryMutation[] = [
+			...(markedInvoice
+				? [
+						{
+							type: 'invoice_state' as const,
+							paymentHash: hashHex,
+							invoice: markedInvoice
+						}
+				  ]
+				: []),
 			{ type: 'delete_payment_secret', paymentHash: hashHex },
 			...(completed
 				? [
@@ -26148,6 +26178,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		this.clearJitSkim(hashHex);
 		this.paymentSecrets.delete(hashHex);
 		if (payment && completed) Object.assign(payment, completed);
+		if (invoice && markedInvoice) invoice.auxiliary = true;
 		if (this.storage) {
 			try {
 				this.persistChannel(channelId);

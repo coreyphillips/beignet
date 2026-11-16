@@ -58,6 +58,18 @@ export interface IPaymentInfo {
 	 * and an overpaying sender's HTLCs exceed it.
 	 */
 	receivedMsat?: bigint;
+	/**
+	 * Asset channels: this payment was carried by HTLCs that hold asset
+	 * units, so its amounts are not bitcoin that moved and it does not
+	 * belong in a bitcoin total. Present, and true, only then.
+	 */
+	auxiliary?: true;
+	/**
+	 * Asset channels, OUTGOING: what the payment is worth to the payee, the
+	 * final amount of its route, which is what the payee's own record has
+	 * in amountMsat. amountMsat here stays the bitcoin the HTLCs carried.
+	 */
+	auxiliaryValueMsat?: bigint;
 	status: PaymentStatus;
 	direction: PaymentDirection;
 	route?: IRoute;

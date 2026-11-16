@@ -33,7 +33,15 @@ export const AUXILIARY_CHANNELS_API = Object.freeze({
 		// The node's wrapper can refuse an asset payment: ASSET_PAYMENT_REFUSED.
 		'setAuxiliaryPaymentGate',
 		// What the chain monitor of a channel recorded, as a copy.
-		'getChannelMonitorState'
+		'getChannelMonitorState',
+		// A payment record carried by asset HTLCs has auxiliary: true, and
+		// an outgoing one what it is worth to the payee beside the bitcoin
+		// its HTLCs carried.
+		'IPaymentInfo.auxiliary',
+		'IPaymentInfo.auxiliaryValueMsat',
+		// An invoice paid by asset HTLCs has auxiliary: true, in its record
+		// and in its invoice:settled event.
+		'IInvoiceInfo.auxiliary'
 	] as const)
 });
 

@@ -760,6 +760,11 @@ export interface IForwardingSummary {
 }
 
 export interface IInvoiceInfo {
+	/**
+	 * Asset channels: the invoice was paid by HTLCs that hold asset units,
+	 * so what it received is not bitcoin. Present, and true, only then.
+	 */
+	auxiliary?: true;
 	paymentHash: string;
 	bolt11: string;
 	amountMsat?: bigint;
