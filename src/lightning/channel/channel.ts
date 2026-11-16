@@ -10958,6 +10958,11 @@ export class Channel {
 				// offered HTLC.
 				this._state.localBalanceMsat += entry.amountMsat;
 				this._moveAuxiliaryBalance('local', entry, 1n);
+				// An asset HTLC that leaves the channel here has ended as
+				// failed, and its host is told so like of any other
+				// (onHtlcResolved): the units are back and nothing else
+				// would ever say what became of the HTLC.
+				this._recordAuxiliaryResolution(entry);
 			}
 			dropped.push({
 				htlcId: msg.id,

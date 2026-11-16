@@ -413,3 +413,90 @@ describe('what a refusal of the asset provider leaves owed (issue #2093 step 8)'
 		});
 	}
 });
+
+describe('an asset HTLC that is dropped unsigned on a held channel (issue #2093 step 8)', function () {
+	this.timeout(60_000);
+	withAssetOpens();
+	const hosts: IAssetHost[] = [];
+	afterEach(() => {
+		for (const host of hosts.splice(0)) {
+			host.node.destroy();
+			host.storage?.close();
+		}
+	});
+
+	it('is reported to the host as failed, with its units back', async () => {
+		const arm = { on: false };
+		const resolved: Array<{
+			htlcId: bigint;
+			direction: string;
+			outcome: string;
+			auxiliaryAmount: bigint;
+			paymentHash: string;
+		}> = [];
+		const alice = assetHost(
+			'aux-drop-held',
+			1,
+			{
+				// The add is made and its commitment cannot be signed: it
+				// stays in the channel, unsigned.
+				provider: failingProvider((method) => method === 'signHtlcs' && arm.on),
+				onHtlcResolved: (context) => {
+					resolved.push({
+						htlcId: context.htlcId,
+						direction: context.direction,
+						outcome: context.outcome,
+						auxiliaryAmount: context.auxiliaryAmount,
+						paymentHash: context.paymentHash.toString('hex')
+					});
+				}
+			},
+			{ sqlite: true }
+		);
+		const bob = assetHost(
+			'aux-drop-held',
+			2,
+			{ valueIncomingHtlc: (context) => context.auxiliaryAmount! * 1000n },
+			{ sqlite: true }
+		);
+		hosts.push(alice, bob);
+		connectHosts(alice, bob);
+		const channelId = await openAssetChannel(alice, bob, {
+			tag: 'aux-drop-held',
+			openerUnits: 9000n,
+			acceptorUnits: 1000n
+		});
+		const invoice = bob.node.createInvoice({
+			amountMsat: 5_000_000n,
+			description: 'never signed'
+		});
+		arm.on = true;
+		payAssetUnits(alice, bob, channelId, invoice, 5_000_000n, 5000n);
+		await turns(100);
+		const manager = alice.node.getChannelManager();
+		const state = manager.getChannel(channelId)!.getFullState();
+		expect(state.htlcs.size).to.equal(1);
+		expect(state.auxiliaryState!.localBalance).to.equal(4000n);
+		expect(resolved).to.deep.equal([]);
+
+		// The channel becomes one whose restore could not prove its
+		// recency: on the disconnect it drops the add no commitment covers.
+		(state as { restoreRecencyUnproven?: boolean }).restoreRecencyUnproven =
+			true;
+		manager.handlePeerDisconnected(bob.node.getNodeId());
+		await turns(50);
+		expect(state.htlcs.size).to.equal(0);
+		expect(state.auxiliaryState!.localBalance).to.equal(9000n);
+		expect(resolved).to.deep.equal([
+			{
+				htlcId: 0n,
+				direction: 'OFFERED',
+				outcome: 'failed',
+				auxiliaryAmount: 5000n,
+				paymentHash: invoice.paymentHash.toString('hex')
+			}
+		]);
+		// Told once: the outcome is not kept for a host that has taken it.
+		expect(state.auxiliaryState!.resolvedHtlcs?.size ?? 0).to.equal(0);
+	});
+});

@@ -3397,7 +3397,16 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		if (abandoned.length === 0) return;
 		const channelId = channel.getChannelId() ?? channel.getTemporaryChannelId();
 		setImmediate(() => {
-			this.emit('htlc:local-add-abandoned', channelId, abandoned);
+			try {
+				this.emit('htlc:local-add-abandoned', channelId, abandoned);
+			} finally {
+				// Asset channels: an abandoned add that carried units left a
+				// failed outcome in the channel's asset state. The host is
+				// told now, and again from the row until it has taken it.
+				if (channel.getFullState().auxiliaryState) {
+					this._notifyAuxiliaryResolutions(channel);
+				}
+			}
 		});
 	}
 
