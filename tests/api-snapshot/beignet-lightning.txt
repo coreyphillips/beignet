@@ -1610,13 +1610,10 @@ method channel.IAuxiliaryChannelConfig.beforeAccept?(channel: channel.Channel, p
 method channel.IAuxiliaryChannelConfig.beforeFundingCreated?(channel: channel.Channel, peerPubkey: string): Promise<void>
 property channel.IAuxiliaryChannelConfig.initCustomRecords?: message.CustomRecords
 method channel.IAuxiliaryChannelConfig.onAccepted?(channel: channel.Channel, peerPubkey: string): void
-method channel.IAuxiliaryChannelConfig.onForwardAdmissionFailed?(context: channel.IAuxiliaryForwardPlacement & { customRecords?: message.CustomRecords; }): void
 method channel.IAuxiliaryChannelConfig.onFundingSigned?(context: channel.IAuxiliaryFundingSigned): void
 method channel.IAuxiliaryChannelConfig.onHtlcResolved?(context: channel.IAuxiliaryHtlcResolution & { state: channel.IChannelState; peerPubkey: string; channelId: Buffer; }): void
 method channel.IAuxiliaryChannelConfig.openingCsvPolicy?(peerPubkey: string): channel.IAuxiliaryOpeningCsvPolicy | undefined
-method channel.IAuxiliaryChannelConfig.prepareForwardHtlc?(context: channel.IAuxiliaryForwardPlacement): channel.IAuxiliaryPayment
 property channel.IAuxiliaryChannelConfig.provider: channel.IChannelAuxiliaryProvider
-method channel.IAuxiliaryChannelConfig.resolveForwardChannel?(context: channel.IAuxiliaryForwardContext): { channelId: Buffer; peerPubkey: string; } | undefined
 method channel.IAuxiliaryChannelConfig.resolveIncoming(peerPubkey: string, temporaryChannelId: Buffer): channel.IAuxiliaryFundingDescriptor | undefined
 method channel.IAuxiliaryChannelConfig.valueIncomingHtlc?(context: channel.IAuxiliaryIncomingHtlc): bigint | undefined
 interface channel.IAuxiliaryChannelHtlc
@@ -1677,18 +1674,6 @@ property channel.IAuxiliaryCommitmentData.secondLevelCommitmentTxid?: string
 property channel.IAuxiliaryCommitmentData.secondLevelLeaves: Map<string, channel.ITaprootAuxLeaf>
 property channel.IAuxiliaryCommitmentData.secondLevelRevocationBasepoint?: Buffer
 property channel.IAuxiliaryCommitmentData.secondLevelRevocationKey?: Buffer
-interface channel.IAuxiliaryForwardContext
-property channel.IAuxiliaryForwardContext.amountToForwardMsat: bigint
-property channel.IAuxiliaryForwardContext.incomingChannelId: Buffer
-property channel.IAuxiliaryForwardContext.incomingHtlcId: bigint
-property channel.IAuxiliaryForwardContext.outgoingCltvExpiry: number
-property channel.IAuxiliaryForwardContext.paymentHash: Buffer
-property channel.IAuxiliaryForwardContext.shortChannelId: Buffer
-interface channel.IAuxiliaryForwardPlacement extends channel.IAuxiliaryForwardContext
-property channel.IAuxiliaryForwardPlacement.outgoingChannelId: Buffer
-property channel.IAuxiliaryForwardPlacement.outgoingHtlcId: bigint
-property channel.IAuxiliaryForwardPlacement.peerPubkey: string
-property channel.IAuxiliaryForwardPlacement.state: channel.IChannelState
 interface channel.IAuxiliaryFundingDescriptor
 property channel.IAuxiliaryFundingDescriptor.channelData: Buffer
 property channel.IAuxiliaryFundingDescriptor.fundingTaprootMerkleRoot: Buffer

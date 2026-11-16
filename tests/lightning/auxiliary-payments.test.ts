@@ -696,6 +696,67 @@ describe('Asset payments (issue #2093, step 8)', function () {
 			expect(units(alice, channelId)).to.deep.equal([9000n, 1000n]);
 			expect(units(bob, channelId)).to.deep.equal([1000n, 9000n]);
 		});
+
+		it('that the host does not know is failed back over an asset channel all the same: nothing of an asset channel is an ordinary payment', async () => {
+			const asked: IAsked[] = [];
+			const { alice, bob, channelId } = await pair('aux-unknown-asset', {
+				bob: (holder) =>
+					// "Not mine": on an ordinary channel the node would go on
+					// to its own invoice logic and settle.
+					noting(asked, holder, () => undefined)
+			});
+			const invoice = bob.node.createInvoice({
+				amountMsat: 5_000_000n,
+				description: 'an asset invoice with a nominal face'
+			});
+			// This node never offers a plain HTLC on an asset channel, but a
+			// peer may. Alice's channel is made to, as such a peer would.
+			const manager = alice.node.getChannelManager();
+			const channel = manager.getChannel(channelId)!;
+			(
+				channel as unknown as { _prepareAuxiliaryHtlc: () => void }
+			)._prepareAuxiliaryHtlc = () => undefined;
+			const packet = constructOnionPacket(
+				sha256('unknown over an asset channel'),
+				[
+					{
+						pubkey: Buffer.from(bob.node.getNodeId(), 'hex'),
+						payload: {
+							amountToForwardMsat: 5_000_000n,
+							outgoingCltvValue: 40,
+							paymentSecret: invoice.paymentSecret,
+							totalMsat: 5_000_000n
+						}
+					}
+				],
+				invoice.paymentHash
+			);
+			const added = manager.addHtlc(
+				channelId,
+				5_000_000n,
+				invoice.paymentHash,
+				40,
+				encodeOnionPacket(packet)
+			);
+			expect(added.ok, added.error).to.equal(true);
+			await settle();
+
+			expect(asked.map((a) => a.hook)).to.deep.equal(['valueIncomingHtlc']);
+			expect('auxiliaryAmount' in asked[0].context).to.equal(false);
+			expect(same(asked[0].context.channelId, channelId)).to.equal(true);
+			expect(asked[0].context.wireAmountMsat).to.equal(5_000_000n);
+			expect(bob.node.getPayment(invoice.paymentHash)?.status).to.not.equal(
+				PaymentStatus.COMPLETED
+			);
+			// Failed back and gone from both sides, with every balance where it was.
+			expect(channel.getFullState().htlcs.size).to.equal(0);
+			expect(
+				bob.node.getChannelManager().getChannel(channelId)!.getFullState().htlcs
+					.size
+			).to.equal(0);
+			expect(units(alice, channelId)).to.deep.equal([9000n, 1000n]);
+			expect(units(bob, channelId)).to.deep.equal([1000n, 9000n]);
+		});
 	});
 
 	describe('a host that does not accept an asset HTLC', () => {
@@ -1032,7 +1093,6 @@ describe('Asset payments (issue #2093, step 8)', function () {
 	});
 
 	describe('a node between an asset channel and an ordinary one', () => {
-		const ALIAS = Buffer.alloc(8, 0xaa);
 		const noted =
 			(asked: IAsked[], holder: IHolder) =>
 			(hook: string, context: unknown): void => {
@@ -1079,171 +1139,132 @@ describe('Asset payments (issue #2093, step 8)', function () {
 			]
 		});
 
-		for (const accepts of [true, false]) {
-			it(`${
-				accepts
-					? 'forwards an asset HTLC it values as bitcoin over the ordinary channel'
-					: 'fails back an asset HTLC its host will not forward'
-			}`, async () => {
-				const asked: IAsked[] = [];
-				const { alice, bob, carol } = trio(
-					`aux-forward-out-${accepts}`,
-					(holder) => ({
-						valueIncomingHtlc: (context) => {
-							noted(asked, holder)('valueIncomingHtlc', context);
-							if (!accepts) throw new Error('no quote for this forward');
-							return context.auxiliaryAmount! * 1000n;
-						},
-						onHtlcResolved: (context) =>
-							noted(asked, holder)('onHtlcResolved', context)
-					})
-				);
-				const channelId = await openAssetChannel(alice, bob, {
-					tag: `forward out ${accepts}`,
-					openerUnits: 9000n,
-					acceptorUnits: 1000n
-				});
-				const ordinaryId = openReadyChannel(bob.node, carol.node);
-				const ordinary = bob.node
-					.getChannelManager()
-					.getChannel(ordinaryId)!
-					.getFullState();
-				const invoice = carol.node.createInvoice({
-					amountMsat: 5_000_000n,
-					description: 'paid in units, received in bitcoin'
-				});
-				alice.node.sendPaymentToRoute(
-					through(bob, carol, (ordinary.shortChannelId ?? ordinary.scidAlias)!),
-					invoice.paymentHash,
-					40,
-					invoice.paymentSecret,
-					undefined,
-					undefined,
-					undefined,
-					undefined,
-					{
-						assetPayment: {
-							channelId,
-							wireAmountMsat: 354_000n,
-							customRecords: amountRecord(5010n)
-						}
+		it('fails back an asset HTLC that is not for it, without asking its host, and forwards nothing', async () => {
+			const asked: IAsked[] = [];
+			const { alice, bob, carol } = trio('aux-forward-out', (holder) => ({
+				// A host that would take the forward: it is not asked.
+				valueIncomingHtlc: (context) => {
+					noted(asked, holder)('valueIncomingHtlc', context);
+					return context.auxiliaryAmount! * 1000n;
+				},
+				onHtlcResolved: (context) =>
+					noted(asked, holder)('onHtlcResolved', context)
+			}));
+			const channelId = await openAssetChannel(alice, bob, {
+				tag: 'forward out',
+				openerUnits: 9000n,
+				acceptorUnits: 1000n
+			});
+			const ordinaryId = openReadyChannel(bob.node, carol.node);
+			const ordinaryChannel = bob.node
+				.getChannelManager()
+				.getChannel(ordinaryId)!;
+			const invoice = carol.node.createInvoice({
+				amountMsat: 5_000_000n,
+				description: 'paid in units, received in bitcoin'
+			});
+			alice.node.sendPaymentToRoute(
+				through(
+					bob,
+					carol,
+					(ordinaryChannel.getFullState().shortChannelId ??
+						ordinaryChannel.getFullState().scidAlias)!
+				),
+				invoice.paymentHash,
+				40,
+				invoice.paymentSecret,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				{
+					assetPayment: {
+						channelId,
+						wireAmountMsat: 354_000n,
+						customRecords: amountRecord(5010n)
 					}
-				);
-				await settle();
-
-				const valued = asked.filter((a) => a.hook === 'valueIncomingHtlc');
-				expect(valued).to.have.length(1);
-				expect(valued[0].inTransaction).to.equal(false);
-				expect(valued[0].context.isFinalHop).to.equal(false);
-				expect(valued[0].context.auxiliaryAmount).to.equal(5010n);
-				expect(alice.node.getPayment(invoice.paymentHash)!.status).to.equal(
-					accepts ? PaymentStatus.COMPLETED : PaymentStatus.FAILED
-				);
-				expect(
-					carol.node.getPayment(invoice.paymentHash)?.status ===
-						PaymentStatus.COMPLETED
-				).to.equal(accepts);
-				expect(units(alice, channelId)).to.deep.equal(
-					accepts ? [3990n, 6010n] : [9000n, 1000n]
-				);
-				const resolved = asked.filter((a) => a.hook === 'onHtlcResolved');
-				expect(resolved).to.have.length(1);
-				expect(resolved[0].inTransaction).to.equal(false);
-				expect(resolved[0].context.direction).to.equal(HtlcDirection.RECEIVED);
-				expect(resolved[0].context.outcome).to.equal(
-					accepts ? 'fulfilled' : 'failed'
-				);
-			});
-		}
-
-		for (const accepts of [true, false]) {
-			it(`${
-				accepts
-					? 'forwards a bitcoin HTLC as asset units over the asset channel its host names'
-					: 'fails back a bitcoin HTLC its host will not carry as asset units'
-			}`, async () => {
-				const asked: IAsked[] = [];
-				const names: { channelId?: Buffer; carol?: string } = {};
-				const { alice, bob, carol } = trio(
-					`aux-forward-in-${accepts}`,
-					(holder) => ({
-						resolveForwardChannel: (context) => {
-							noted(asked, holder)('resolveForwardChannel', context);
-							return context.shortChannelId.equals(ALIAS)
-								? { channelId: names.channelId!, peerPubkey: names.carol! }
-								: undefined;
-						},
-						prepareForwardHtlc: (context) => {
-							noted(asked, holder)('prepareForwardHtlc', context);
-							if (!accepts) throw new Error('the quote has run out');
-							return {
-								channelId: context.outgoingChannelId,
-								expectedHtlcId: context.outgoingHtlcId,
-								wireAmountMsat: 354_000n,
-								customRecords: amountRecord(5000n)
-							};
-						},
-						onHtlcResolved: (context) =>
-							noted(asked, holder)('onHtlcResolved', context)
-					}),
-					{ valueIncomingHtlc: (context) => context.auxiliaryAmount! * 1000n }
-				);
-				const ordinaryId = openReadyChannel(alice.node, bob.node);
-				const channelId = await openAssetChannel(bob, carol, {
-					tag: `forward in ${accepts}`,
-					openerUnits: 9000n,
-					acceptorUnits: 1000n
-				});
-				names.channelId = channelId;
-				names.carol = carol.node.getNodeId();
-				const invoice = carol.node.createInvoice({
-					amountMsat: 5_000_000n,
-					description: 'paid in bitcoin, received in units'
-				});
-				const before = bob.node.getChannel(ordinaryId)!.localBalanceMsat;
-				alice.node.sendPaymentToRoute(
-					through(bob, carol, ALIAS),
-					invoice.paymentHash,
-					40,
-					invoice.paymentSecret
-				);
-				await settle();
-
-				expect(asked.map((a) => a.hook)).to.deep.equal(
-					accepts
-						? ['resolveForwardChannel', 'prepareForwardHtlc', 'onHtlcResolved']
-						: ['resolveForwardChannel', 'prepareForwardHtlc']
-				);
-				for (const call of asked) expect(call.inTransaction).to.equal(false);
-				expect(same(asked[1].context.outgoingChannelId, channelId)).to.equal(
-					true
-				);
-				expect(asked[1].context.outgoingHtlcId).to.equal(0n);
-				expect(asked[1].context.amountToForwardMsat).to.equal(5_000_000n);
-				expect(alice.node.getPayment(invoice.paymentHash)!.status).to.equal(
-					accepts ? PaymentStatus.COMPLETED : PaymentStatus.FAILED
-				);
-				expect(
-					carol.node.getPayment(invoice.paymentHash)?.status ===
-						PaymentStatus.COMPLETED
-				).to.equal(accepts);
-				expect(units(bob, channelId)).to.deep.equal(
-					accepts ? [4000n, 6000n] : [9000n, 1000n]
-				);
-				expect(bob.node.getChannel(ordinaryId)!.localBalanceMsat).to.equal(
-					accepts ? before + 5_010_000n : before
-				);
-				expect(
-					bob.node.getChannelManager().getChannel(channelId)!.getFullState()
-						.localHtlcCounter
-				).to.equal(accepts ? 1n : 0n);
-				if (accepts) {
-					expect(asked[2].context.direction).to.equal(HtlcDirection.OFFERED);
-					expect(asked[2].context.outcome).to.equal('fulfilled');
-					expect(asked[2].context.htlcId).to.equal(0n);
 				}
+			);
+			await settle();
+
+			expect(asked.filter((a) => a.hook === 'valueIncomingHtlc')).to.deep.equal(
+				[]
+			);
+			expect(alice.node.getPayment(invoice.paymentHash)!.status).to.equal(
+				PaymentStatus.FAILED
+			);
+			expect(carol.node.getPayment(invoice.paymentHash)?.status).to.not.equal(
+				PaymentStatus.COMPLETED
+			);
+			expect(units(alice, channelId)).to.deep.equal([9000n, 1000n]);
+			// Nothing went out over the ordinary channel, and the forwarding
+			// ledger has no row.
+			expect(ordinaryChannel.getFullState().localHtlcCounter).to.equal(0n);
+			expect(bob.storage!.listForwardingEvents()).to.deep.equal([]);
+			const resolved = asked.filter((a) => a.hook === 'onHtlcResolved');
+			expect(resolved).to.have.length(1);
+			expect(resolved[0].inTransaction).to.equal(false);
+			expect(resolved[0].context.direction).to.equal(HtlcDirection.RECEIVED);
+			expect(resolved[0].context.outcome).to.equal('failed');
+		});
+
+		it('forwards nothing out over an asset channel that a route names', async () => {
+			const asked: IAsked[] = [];
+			const { alice, bob, carol } = trio(
+				'aux-forward-in',
+				(holder) => ({
+					valueIncomingHtlc: (context) => {
+						noted(asked, holder)('valueIncomingHtlc', context);
+						return undefined;
+					},
+					onHtlcResolved: (context) =>
+						noted(asked, holder)('onHtlcResolved', context)
+				}),
+				{ valueIncomingHtlc: () => 5_000_000n }
+			);
+			const ordinaryId = openReadyChannel(alice.node, bob.node);
+			const channelId = await openAssetChannel(bob, carol, {
+				tag: 'forward in',
+				openerUnits: 9000n,
+				acceptorUnits: 1000n
 			});
-		}
+			const invoice = carol.node.createInvoice({
+				amountMsat: 5_000_000n,
+				description: 'paid in bitcoin over an asset channel'
+			});
+			const before = bob.node.getChannel(ordinaryId)!.localBalanceMsat;
+			alice.node.sendPaymentToRoute(
+				through(
+					bob,
+					carol,
+					bob.node.getAuxiliaryChannelInfo(channelId)!.shortChannelId!
+				),
+				invoice.paymentHash,
+				40,
+				invoice.paymentSecret
+			);
+			await settle();
+
+			// The HTLC came in over an ordinary channel and does not end here:
+			// the host is asked nothing, and nothing is placed on the asset
+			// channel.
+			expect(asked).to.deep.equal([]);
+			expect(alice.node.getPayment(invoice.paymentHash)!.status).to.equal(
+				PaymentStatus.FAILED
+			);
+			expect(carol.node.getPayment(invoice.paymentHash)?.status).to.not.equal(
+				PaymentStatus.COMPLETED
+			);
+			expect(
+				bob.node.getChannelManager().getChannel(channelId)!.getFullState()
+					.localHtlcCounter
+			).to.equal(0n);
+			expect(units(bob, channelId)).to.deep.equal([9000n, 1000n]);
+			expect(bob.node.getChannel(ordinaryId)!.localBalanceMsat).to.equal(
+				before
+			);
+			expect(bob.storage!.listForwardingEvents()).to.deep.equal([]);
+		});
 	});
 
 	describe('a route for an asset payment', () => {

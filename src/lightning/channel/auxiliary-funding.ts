@@ -139,28 +139,12 @@ export interface IAuxiliaryIncomingHtlc {
 	invoice?: IInvoiceInfo;
 }
 
-/** A forward whose outgoing channel the host may resolve from a quote alias. */
-export interface IAuxiliaryForwardContext {
-	shortChannelId: Buffer;
-	paymentHash: Buffer;
-	amountToForwardMsat: bigint;
-	outgoingCltvExpiry: number;
-	incomingChannelId: Buffer;
-	incomingHtlcId: bigint;
-}
-
-/** A forward placed on its outgoing channel, before the add is sent. */
-export interface IAuxiliaryForwardPlacement extends IAuxiliaryForwardContext {
-	state: IChannelState;
-	outgoingChannelId: Buffer;
-	outgoingHtlcId: bigint;
-	peerPubkey: string;
-}
-
 /**
  * Asset channel support, set as `INodeConfig.auxiliaryChannels`. The
- * provider extends the channel state machine; the callbacks tie funding,
- * payment and forwarding to the host's asset protocol.
+ * provider extends the channel state machine; the callbacks tie funding
+ * and payment to the host's asset protocol. A node with asset channels is
+ * only ever an endpoint of an asset payment: nothing that arrives on an
+ * asset channel is forwarded, and nothing is forwarded out over one.
  */
 export interface IAuxiliaryChannelConfig {
 	/** Standard-wire CSV compatibility for new channels only. Does not authorize legacy signatures. */
@@ -171,23 +155,23 @@ export interface IAuxiliaryChannelConfig {
 	allowLegacyHtlcSignatures?(peerPubkey: string): boolean;
 	provider: IChannelAuxiliaryProvider;
 	/**
-	 * Asked, before the node settles or forwards it and outside any storage
+	 * Asked, before the node settles it and outside any storage
 	 * transaction, about every incoming HTLC that ends at this node, whatever
-	 * channel it arrived on, and about every HTLC that carries asset units
-	 * or arrives on an asset channel. Only the host knows that a payment
-	 * hash belongs to an asset invoice, so it sees each of them and can
-	 * refuse. One of three answers:
+	 * channel it arrived on. Only the host knows that a payment hash belongs
+	 * to an asset invoice, so it sees each of them and can refuse. An HTLC
+	 * that arrived on an asset channel or carries asset units and does not
+	 * end at this node is failed back without asking. One of three answers:
 	 *
 	 * - A value in millisatoshis, above zero and within a u64: the HTLC is
 	 *   the host's and is worth that much. The node goes on with that value
 	 *   in place of the bitcoin amount on the wire: an invoice is judged paid
-	 *   against it, and a forward judged funded.
+	 *   against it.
 	 * - `undefined`: the HTLC is not the host's. It carries no asset units
 	 *   and its payment hash is not one the host issued an asset invoice or
 	 *   holds a quote for. The node goes on exactly as a node without asset
 	 *   channels would, on the bitcoin amount the HTLC carries. Given for an
-	 *   HTLC that does carry asset units it is a refusal, because such an
-	 *   HTLC is always the host's to value.
+	 *   HTLC that carries asset units or arrived on an asset channel it is a
+	 *   refusal, because such an HTLC is always the host's to value.
 	 * - A throw: the HTLC is failed back. It is never settled, and the
 	 *   node's own invoice logic never sees it. This is the answer for a
 	 *   plain HTLC whose payment hash belongs to an invoice issued for asset
@@ -201,16 +185,6 @@ export interface IAuxiliaryChannelConfig {
 	 * about.
 	 */
 	valueIncomingHtlc?(context: IAuxiliaryIncomingHtlc): bigint | undefined;
-	/** Read-only lookup of a peer-bound RFQ alias before Bitcoin forwarding checks. */
-	resolveForwardChannel?(
-		context: IAuxiliaryForwardContext
-	): { channelId: Buffer; peerPubkey: string } | undefined;
-	/** Durably reserve a quote using the exact outgoing circuit before the add. */
-	prepareForwardHtlc?(context: IAuxiliaryForwardPlacement): IAuxiliaryPayment;
-	/** Called only when admission did not consume the outgoing HTLC ID. */
-	onForwardAdmissionFailed?(
-		context: IAuxiliaryForwardPlacement & { customRecords?: CustomRecords }
-	): void;
 	/** Idempotent durable callback, delivered again after a crash until acknowledged. */
 	onHtlcResolved?(
 		context: IAuxiliaryHtlcResolution & {
