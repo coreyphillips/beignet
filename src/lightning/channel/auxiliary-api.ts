@@ -31,7 +31,9 @@ export const AUXILIARY_CHANNELS_API = Object.freeze({
 		// A channel row of listChannels carries auxiliary: true.
 		'IChannelInfo.auxiliary',
 		// The node's wrapper can refuse an asset payment: ASSET_PAYMENT_REFUSED.
-		'setAuxiliaryPaymentGate'
+		'setAuxiliaryPaymentGate',
+		// What the chain monitor of a channel recorded, as a copy.
+		'getChannelMonitorState'
 	] as const)
 });
 

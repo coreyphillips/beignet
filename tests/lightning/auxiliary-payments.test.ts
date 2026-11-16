@@ -1420,7 +1420,8 @@ describe('Asset payments (issue #2093, step 8)', function () {
 				'onFundingSigned',
 				'abandonAuxiliaryOpen',
 				'IChannelInfo.auxiliary',
-				'setAuxiliaryPaymentGate'
+				'setAuxiliaryPaymentGate',
+				'getChannelMonitorState'
 			]);
 			expect(Object.isFrozen(api)).to.equal(true);
 			expect(Object.isFrozen(api.surfaces)).to.equal(true);

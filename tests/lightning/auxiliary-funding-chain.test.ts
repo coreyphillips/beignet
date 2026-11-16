@@ -19,6 +19,7 @@ import type {
 	IAuxiliaryFundingDescriptor,
 	IAuxiliaryFundingSigned
 } from '../../src/lightning/channel/auxiliary-funding';
+import { CommitmentType } from '../../src/lightning/chain/types';
 import { ChannelState } from '../../src/lightning/channel/types';
 import { createTaprootFundingScript } from '../../src/lightning/script/funding-taproot';
 import { ASSET_FUNDING_ROOT } from './helpers/auxiliary-pair';
@@ -341,5 +342,63 @@ describe('an asset channel funded by a transaction its host publishes (issue #20
 		expect(fundingHex(made)).to.deep.equal([]);
 		expect(made.aliceBackend.published).to.deep.equal([]);
 		expect(alice.broadcasts).to.deep.equal([]);
+	});
+
+	it('closed cooperatively, both nodes find the close on the chain and a host can read it', async () => {
+		const made = await opened('aux-chain-close');
+		const { alice, bob, channelId, chain } = made;
+		await confirm(made, 6);
+		expect(stateOf(alice, channelId)).to.equal(ChannelState.NORMAL);
+
+		expect(
+			alice.node.closeChannel(
+				channelId,
+				Buffer.concat([Buffer.from('0014', 'hex'), Buffer.alloc(20, 0x42)])
+			)
+		).to.deep.equal({ ok: true });
+		await settle();
+		// Each node handed the same closing transaction to its chain backend,
+		// and the chain took it: it is signed by the key in the funding
+		// output, pays a fee that relays and leaves no dust.
+		expect(made.aliceBackend.published).to.have.length(1);
+		expect(made.bobBackend.published).to.deep.equal(
+			made.aliceBackend.published
+		);
+		expect(made.aliceBackend.refused).to.deep.equal([]);
+		expect(made.bobBackend.refused).to.deep.equal([]);
+		const closing = bitcoin.Transaction.fromHex(made.aliceBackend.published[0]);
+		const txid = closing.getId();
+		expect(chain.mempool.has(txid)).to.equal(true);
+
+		for (let i = 0; i < 3; i++) {
+			chain.mine();
+			await settle();
+		}
+		expect(chain.spender(made.funding.getId(), 1)).to.equal(txid);
+		for (const host of [alice, bob]) {
+			expect(errorsOf(host)).to.deep.equal([]);
+			const state = host.node
+				.getChannelManager()
+				.getChannel(channelId)!
+				.getFullState();
+			expect(state.state).to.equal(ChannelState.CLOSED);
+			// What a host reads to bring the assets of the close into its
+			// own books: the spend its node found, and the provider's
+			// payload for that transaction.
+			const broadcast =
+				host.node.getChannelMonitorState(channelId)!.commitmentBroadcast!;
+			expect(broadcast.commitmentType).to.equal(
+				CommitmentType.COOPERATIVE_CLOSE
+			);
+			expect(broadcast.txid).to.equal(txid);
+			expect(broadcast.spentOutpoint).to.deep.equal({
+				txid: made.funding.getId(),
+				outputIndex: 1
+			});
+			expect(broadcast.blockHeight).to.be.greaterThan(0);
+			expect(
+				state.auxiliaryState!.closeTransactions!.get(txid)!.toString()
+			).to.equal('signed close assets');
+		}
 	});
 });

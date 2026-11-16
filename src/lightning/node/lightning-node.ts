@@ -29,7 +29,9 @@ import {
 import { archiveFforChainEvidence } from '../ffor/voucher-chain';
 import { FforVoucherIndex } from '../ffor/voucher-index';
 import {
+	deserializeChainMonitorState,
 	deserializeChannelState,
+	serializeChainMonitorState,
 	serializeChannelState
 } from '../storage/serialization';
 import { SPLICE_LOCK_DEPTH_ACCEPT_MAX } from '../message/splice';
@@ -29525,6 +29527,30 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	 */
 	setAuxiliaryPaymentGate(gate: AuxiliaryPaymentGate | undefined): void {
 		this.auxiliaryPaymentGate = gate;
+	}
+
+	/**
+	 * What the chain monitor of a channel has recorded, as a copy: the
+	 * transaction that spent the funding output and what kind of spend it
+	 * is, and the outputs being followed with the transactions that spend
+	 * them. A host reads the closing transaction of an asset channel here,
+	 * to bring the assets it carries into its own books. Undefined for a
+	 * channel that has no monitor: one that is not known, or whose funding
+	 * output nothing has spent and nothing is watching for. Changing what
+	 * is returned changes nothing in the node.
+	 */
+	getChannelMonitorState(
+		channelId: Buffer
+	): import('../chain/chain-monitor').IChainMonitorState | undefined {
+		if (!Buffer.isBuffer(channelId) || channelId.length !== 32) {
+			throw new InvalidRequestError('channelId must be a 32-byte Buffer');
+		}
+		const monitor = this.channelManager.getMonitor(channelId);
+		return monitor
+			? deserializeChainMonitorState(
+					serializeChainMonitorState(monitor.getFullState())
+			  )
+			: undefined;
 	}
 
 	/**

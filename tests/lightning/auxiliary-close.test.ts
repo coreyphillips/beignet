@@ -481,14 +481,28 @@ describe('the cooperative close of an asset channel (issue #2093)', function () 
 		await settle();
 		for (const host of [alice, bob]) {
 			expect(errorsOf(host)).to.deep.equal([]);
-			const broadcast = host.node
-				.getChannelManager()
-				.getMonitor(channelId)!
-				.getFullState().commitmentBroadcast!;
+			// What a host reads to bring the assets of the close into its own
+			// books: the spend of the funding output, as a copy, and the
+			// provider's payload for that transaction in the channel's row.
+			const monitor = host.node.getChannelMonitorState(channelId)!;
+			const broadcast = monitor.commitmentBroadcast!;
 			expect(broadcast.commitmentType).to.equal(
 				CommitmentType.COOPERATIVE_CLOSE
 			);
 			expect(broadcast.txid).to.equal(txid);
+			expect(
+				stateOf(host, channelId).auxiliaryState!.closeTransactions!.has(txid)
+			).to.equal(true);
+			broadcast.txid = 'changed by the reader';
+			expect(
+				host.node.getChannelMonitorState(channelId)!.commitmentBroadcast!.txid
+			).to.equal(txid);
+			expect(host.node.getChannelMonitorState(Buffer.alloc(32, 9))).to.equal(
+				undefined
+			);
+			expect(() => host.node.getChannelMonitorState(Buffer.alloc(31))).to.throw(
+				'channelId must be a 32-byte Buffer'
+			);
 			expect(stateOf(host, channelId).state).to.equal(ChannelState.CLOSED);
 		}
 		// A node that sees the close again signs nothing and publishes nothing.
