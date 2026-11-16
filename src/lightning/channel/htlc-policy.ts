@@ -423,7 +423,9 @@ export function localCommitmentEmptyRefusal(
 		remoteBalanceMsat?: bigint;
 		pendingFeeratePerKw?: number;
 		addedHtlc?: { key: string; entry: IHtlcEntry };
-	}
+	},
+	/** Given what the builder threw, when the refusal is that it could not build. */
+	report?: { buildError?: unknown }
 ): string | null {
 	const ourDust = state.localConfig.dustLimitSatoshis;
 	const waived = state.localReserveWaived || state.remoteReserveWaived;
@@ -467,7 +469,8 @@ export function localCommitmentEmptyRefusal(
 				if (remote.result.tx.outs.length === 0)
 					return `Update would trim every output of the remote ${what}`;
 			}
-		} catch {
+		} catch (err) {
+			if (report) report.buildError = err;
 			// A commitment we cannot build is strictly worse than one we can,
 			// so this refuses rather than admitting on the builder's behalf.
 			// It needs remoteBasepoints and fundingTxid, which any channel

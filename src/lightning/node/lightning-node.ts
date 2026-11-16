@@ -20906,6 +20906,20 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			policyCode = finalHop
 				? INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS
 				: TEMPORARY_CHANNEL_FAILURE;
+		} else if (htlcEntry.auxiliaryRefused === true) {
+			// Asset channels: the host's provider refused this HTLC when it
+			// was admitted (validateHtlc threw). The stamp is stored with the
+			// HTLC, so a replay after a restart answers the same: the HTLC is
+			// failed back, its units return to the peer, the channel stays.
+			this.emitStructuredLog('htlc', 'refused_by_asset_provider', {
+				channelId: channelId.toString('hex'),
+				htlcId: htlcId.toString(),
+				finalHop,
+				reason: 'the provider refused the HTLC at admission'
+			});
+			policyCode = finalHop
+				? INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS
+				: TEMPORARY_CHANNEL_FAILURE;
 		} else if (
 			this.currentBlockHeight > 0 &&
 			htlcEntry.cltvExpiry >

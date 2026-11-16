@@ -490,6 +490,13 @@ export interface IHtlcEntry {
 	 */
 	funderFeeFailback?: boolean;
 	/**
+	 * Asset channels: the host's provider refused this HTLC of the peer
+	 * (validateHtlc threw). Stamped at admission and stored, like the stamps
+	 * above, so that a restart gives the same answer: the node fails the
+	 * HTLC back once it is committed and never settles it.
+	 */
+	auxiliaryRefused?: boolean;
+	/**
 	 * Admission-time provenance (issue #469): this received HTLC entered the
 	 * channel while a restriction that disarms its on-chain enforcement was
 	 * already standing: the recency hold (restoreRecencyUnproven, or the

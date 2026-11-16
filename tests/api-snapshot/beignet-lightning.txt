@@ -2156,6 +2156,7 @@ property channel.IHtlcEntry.addedWhileFundingUnaccounted?: boolean
 property channel.IHtlcEntry.addedWhileRestoreUnproven?: boolean
 property channel.IHtlcEntry.amountMsat: bigint
 property channel.IHtlcEntry.auxiliaryAmount?: bigint
+property channel.IHtlcEntry.auxiliaryRefused?: boolean
 property channel.IHtlcEntry.blindingPoint?: Buffer
 property channel.IHtlcEntry.cltvExpiry: number
 property channel.IHtlcEntry.commitCoverPending?: boolean
@@ -8388,6 +8389,7 @@ property storage.ISerializedHtlcEntry.addedWhileFundingUnaccounted?: boolean
 property storage.ISerializedHtlcEntry.addedWhileRestoreUnproven?: boolean
 property storage.ISerializedHtlcEntry.amountMsat: string
 property storage.ISerializedHtlcEntry.auxiliaryAmount?: string
+property storage.ISerializedHtlcEntry.auxiliaryRefused?: boolean
 property storage.ISerializedHtlcEntry.blindingPoint?: string
 property storage.ISerializedHtlcEntry.cltvExpiry: number
 property storage.ISerializedHtlcEntry.commitCoverPending?: boolean

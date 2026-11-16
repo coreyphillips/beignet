@@ -58,6 +58,7 @@ export interface ISerializedHtlcEntry {
 	 */
 	customRecords?: SerializedCustomRecords;
 	auxiliaryAmount?: string;
+	auxiliaryRefused?: boolean;
 }
 
 export function serializeHtlcEntry(
@@ -128,7 +129,8 @@ export function serializeHtlcEntry(
 			: {}),
 		...(e.auxiliaryAmount !== undefined
 			? { auxiliaryAmount: serializeAuxiliaryAmount(e.auxiliaryAmount) }
-			: {})
+			: {}),
+		...(e.auxiliaryRefused === true ? { auxiliaryRefused: true } : {})
 	};
 }
 
@@ -201,7 +203,8 @@ export function deserializeHtlcEntry(s: ISerializedHtlcEntry): {
 				: {}),
 			...(s.auxiliaryAmount !== undefined
 				? { auxiliaryAmount: deserializeAuxiliaryAmount(s.auxiliaryAmount) }
-				: {})
+				: {}),
+			...(s.auxiliaryRefused === true ? { auxiliaryRefused: true } : {})
 		}
 	};
 }

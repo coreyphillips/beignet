@@ -946,6 +946,15 @@ interface IFforUpdateContext {
 	settle?: { id: bigint; direction: HtlcDirection; op: 'fulfill' | 'fail' };
 }
 
+/**
+ * An HTLC the peer offered on an asset channel that the provider's own
+ * answer shows to be bad: units its sender does not hold, or a carrier too
+ * small to keep an output. The one refusal of an asset HTLC that is the
+ * peer's violation; anything else thrown while one is judged is the
+ * provider failing to answer.
+ */
+class AuxiliaryHtlcFault extends Error {}
+
 export class Channel {
 	private _state: IChannelState;
 	private _signer: ISigner | null = null;
@@ -3958,7 +3967,16 @@ export class Channel {
 		if (!auxiliary) return;
 		const offered = entry.direction === HtlcDirection.OFFERED;
 		const provider = requireAuxiliaryProvider(this._state);
-		provider.validateHtlc(this._state, entry);
+		try {
+			provider.validateHtlc(this._state, entry);
+		} catch (err) {
+			// Our own HTLC is refused where it is made. The peer's is the
+			// host's to reject, one HTLC at a time: it is admitted with the
+			// units the provider reads from it, so both commitments agree,
+			// and the node fails it back once it is committed.
+			if (offered) throw err;
+			entry.auxiliaryRefused = true;
+		}
 		const amount = provider.getHtlcAmount(this._state, entry);
 		if (
 			typeof amount !== 'bigint' ||
@@ -3972,7 +3990,7 @@ export class Channel {
 			return;
 		}
 		if (amount > (offered ? auxiliary.localBalance : auxiliary.remoteBalance)) {
-			throw new Error('insufficient asset balance');
+			throw new AuxiliaryHtlcFault('insufficient asset balance');
 		}
 		const dust =
 			this._state.localConfig.dustLimitSatoshis >
@@ -3980,10 +3998,45 @@ export class Channel {
 				? this._state.localConfig.dustLimitSatoshis
 				: this._state.remoteConfig.dustLimitSatoshis;
 		if (entry.amountMsat / 1000n < dust) {
-			throw new Error('asset HTLC carrier is below the negotiated dust limit');
+			throw new AuxiliaryHtlcFault(
+				'asset HTLC carrier is below the negotiated dust limit'
+			);
 		}
 		entry.auxiliaryAmount = amount;
 	}
+
+	/**
+	 * The provider of an asset channel could not answer while a message of
+	 * the peer was being taken in. That is a failure of this node, not of the
+	 * peer: nothing is sent that blames it and the channel is not failed. The
+	 * message is dropped, the node says so with a typed local error, and the
+	 * connection is closed, so that the reestablish of the next one has the
+	 * peer send the round again. Until the connection has gone, a
+	 * commitment_signed is not read: it would be judged against a state that
+	 * lacks what was just dropped.
+	 */
+	private _auxiliaryLocalFailure(
+		operation: string,
+		cause: unknown
+	): ChannelAction[] {
+		const message = auxiliaryProviderError(
+			this._state,
+			operation,
+			cause
+		).message;
+		this._auxiliaryAwaitingDisconnect = true;
+		return [
+			{
+				type: ChannelActionType.ERROR,
+				message,
+				code: ChannelErrorCode.ASSET_PROVIDER_REFUSED
+			},
+			{ type: ChannelActionType.DISCONNECT_PEER, reason: message }
+		];
+	}
+
+	/** Set by _auxiliaryLocalFailure, cleared when the connection has gone. */
+	private _auxiliaryAwaitingDisconnect = false;
 
 	/**
 	 * Move an HTLC's asset units with its bitcoin: every place that debits
@@ -4532,12 +4585,18 @@ export class Channel {
 		// refuses, units its sender does not hold, or a carrier too small to
 		// keep an output cannot be committed to, and BOLT 2 gives no way to
 		// refuse an add on the wire.
+		// The channel is failed only on an answer of the provider that shows
+		// the peer's HTLC to be bad (units it does not hold, a carrier below
+		// dust). A provider that could not answer is this node's failure.
 		try {
 			this._prepareAuxiliaryHtlc(entry);
-		} catch {
-			return this._failChannelWithWireError(
-				'Invalid asset HTLC metadata or balance'
-			);
+		} catch (err) {
+			if (err instanceof AuxiliaryHtlcFault) {
+				return this._failChannelWithWireError(
+					'Invalid asset HTLC metadata or balance'
+				);
+			}
+			return this._auxiliaryLocalFailure('an HTLC of the peer', err);
 		}
 
 		// The reserve check above is measured against the reserve WE enforce,
@@ -4546,15 +4605,25 @@ export class Channel {
 		// too, and the commitment we hold ends up with nothing to broadcast
 		// (issue #386). Asked of a candidate rather than of live state, so a
 		// refusal leaves nothing behind.
+		const addBuild: { buildError?: unknown } = {};
 		const wouldEmpty = localCommitmentEmptyRefusal(
 			this._state,
 			this._pendingSpliceView,
 			{
 				remoteBalanceMsat: this._state.remoteBalanceMsat - msg.amountMsat,
 				addedHtlc: { key: `received-${msg.id}`, entry }
-			}
+			},
+			addBuild
 		);
 		if (wouldEmpty) {
+			// An asset channel's commitment that could not be built is the
+			// provider's refusal, not the peer's violation.
+			if (this._state.auxiliaryState && 'buildError' in addBuild) {
+				return this._auxiliaryLocalFailure(
+					'an HTLC of the peer',
+					addBuild.buildError
+				);
+			}
 			return this._failChannelWithWireError(wouldEmpty);
 		}
 
@@ -5518,13 +5587,17 @@ export class Channel {
 
 	/**
 	 * Asset channels: check the asset side of a commitment_signed against
-	 * our next commitment. Returns the reason to fail the channel, or null.
-	 * The one thing it writes is the peer's child custody basepoint for this
-	 * commitment, which the check itself needs; it is taken back on failure.
+	 * our next commitment. Returns null when it verifies. Otherwise it says
+	 * whose failure it is: the peer's, with the reason to fail the channel,
+	 * when its own record is bad or the provider answers that its signatures
+	 * are; this node's, with what the provider or the builder threw, when
+	 * the question could not be answered at all. The one thing it writes is
+	 * the peer's child custody basepoint for this commitment, which the
+	 * check itself needs; it is taken back on either failure.
 	 */
 	private _verifyAuxiliaryCommitment(
 		msg: ICommitmentSignedMessage
-	): string | null {
+	): { peer: string } | { local: unknown } | null {
 		const auxiliary = this._state.auxiliaryState!;
 		const commitmentNumber = this._state.localCommitmentNumber + 1n;
 		const point = getPerCommitmentPoint(
@@ -5543,39 +5616,53 @@ export class Channel {
 		};
 		try {
 			acceptChildRevocationRecord(this._state, msg.customRecords);
-			const commitment = buildLocalCommitment(
-				this._state,
-				point,
-				commitmentNumber
-			);
+		} catch {
+			restore();
+			return { peer: 'Invalid asset commitment metadata' };
+		}
+		let commitment: ReturnType<typeof buildLocalCommitment>;
+		try {
+			commitment = buildLocalCommitment(this._state, point, commitmentNumber);
+			if (!commitment.auxiliary) {
+				throw new Error('the commitment has no asset view');
+			}
+		} catch (err) {
+			restore();
+			return { local: err };
+		}
+		try {
 			acceptChildRevocationRecord(
 				this._state,
 				msg.customRecords,
 				commitment.result.tx
 			);
-			// Only the answer true verifies: a provider that answers anything
-			// else, a promise among them, has not said the signatures are good.
-			if (
-				!commitment.auxiliary ||
-				requireAuxiliaryProvider(this._state).verifyHtlcs(
-					{
-						state: this._state,
-						side: 'local',
-						commitmentNumber,
-						perCommitmentPoint: point,
-						commitment
-					},
-					msg.customRecords ?? new Map()
-				) !== true
-			) {
-				restore();
-				return 'Invalid asset HTLC signature';
-			}
-			return null;
 		} catch {
 			restore();
-			return 'Invalid asset commitment metadata';
+			return { peer: 'Invalid asset commitment metadata' };
 		}
+		let verified: unknown;
+		try {
+			verified = requireAuxiliaryProvider(this._state).verifyHtlcs(
+				{
+					state: this._state,
+					side: 'local',
+					commitmentNumber,
+					perCommitmentPoint: point,
+					commitment
+				},
+				msg.customRecords ?? new Map()
+			);
+		} catch (err) {
+			restore();
+			return { local: err };
+		}
+		// Only the answer true verifies: a provider that answers anything
+		// else, a promise among them, has not said the signatures are good.
+		if (verified !== true) {
+			restore();
+			return { peer: 'Invalid asset HTLC signature' };
+		}
+		return null;
 	}
 
 	/**
@@ -6096,9 +6183,20 @@ export class Channel {
 		// Asset channels (issue #2093): the asset side is verified before
 		// either Bitcoin arm, so an invalid asset signature fails the channel
 		// with our current commitment and its secret still unrevealed.
+		// A provider that could not answer is this node's failure: nothing
+		// is written, nothing blames the peer, and the connection is dropped
+		// so that the peer sends the round again.
 		if (this._state.auxiliaryState) {
+			if (this._auxiliaryAwaitingDisconnect) return [];
 			const refusal = this._verifyAuxiliaryCommitment(msg);
-			if (refusal) return this._failChannelWithWireError(refusal);
+			if (refusal) {
+				return 'peer' in refusal
+					? this._failChannelWithWireError(refusal.peer)
+					: this._auxiliaryLocalFailure(
+							'the verification of a commitment',
+							refusal.local
+					  );
+			}
 		}
 
 		if (isTaprootChannel(this._state.channelType)) {
@@ -7061,14 +7159,24 @@ export class Channel {
 		// since our local commitment builds at the staged rate from the moment
 		// it is accepted, so this must run BEFORE anything below is written or a
 		// refusal would promote a rate for a round that never happens.
+		const feeBuild: { buildError?: unknown } = {};
 		const wouldEmpty = localCommitmentEmptyRefusal(
 			this._state,
 			this._pendingSpliceView,
 			{
 				pendingFeeratePerKw: msg.feeratePerKw
-			}
+			},
+			feeBuild
 		);
 		if (wouldEmpty) {
+			// As in handleUpdateAddHtlc: the provider's refusal is not the
+			// peer's violation.
+			if (this._state.auxiliaryState && 'buildError' in feeBuild) {
+				return this._auxiliaryLocalFailure(
+					'a fee update of the peer',
+					feeBuild.buildError
+				);
+			}
 			return this._failChannelWithWireError(wouldEmpty);
 		}
 
@@ -11066,6 +11174,7 @@ export class Channel {
 		// reestablish, and appending post-reconnect commitments to a stale
 		// half-collected batch would pair signatures across two deliveries.
 		this._pendingBatch = null;
+		this._auxiliaryAwaitingDisconnect = false;
 
 		// Quiescence never survives a disconnect (BOLT 2 quiescence).
 		this._quiescence.reset();

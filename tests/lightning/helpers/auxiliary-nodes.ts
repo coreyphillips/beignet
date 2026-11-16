@@ -236,6 +236,89 @@ export async function openAssetChannel(
 	return channelId;
 }
 
+/** Let queued work run: `rounds` turns of the event loop. */
+export async function turns(rounds = 60): Promise<void> {
+	for (let i = 0; i < rounds; i++) {
+		await new Promise<void>((resolve) => setImmediate(resolve));
+	}
+}
+
+/**
+ * Drop the connection between two hosts and bring it back, so that both
+ * send channel_reestablish. Both sides learn of the new connection before
+ * either reads a message of it.
+ */
+export async function reconnectHosts(
+	a: IAssetHost,
+	b: IAssetHost
+): Promise<void> {
+	a.node.getChannelManager().handlePeerDisconnected(b.node.getNodeId());
+	b.node.getChannelManager().handlePeerDisconnected(a.node.getNodeId());
+	await turns(20);
+	const held: Array<() => void> = [];
+	const originals = [a, b].map((host) => host.node.handlePeerMessage);
+	for (const host of [a, b]) {
+		const deliver = host.node.handlePeerMessage.bind(host.node);
+		host.node.handlePeerMessage = ((
+			peer: string,
+			type: number,
+			payload: Buffer
+		) => {
+			held.push(() => deliver(peer, type, payload));
+		}) as typeof host.node.handlePeerMessage;
+	}
+	a.node.getChannelManager().handlePeerReconnected(b.node.getNodeId());
+	b.node.getChannelManager().handlePeerReconnected(a.node.getNodeId());
+	// Drained in the order sent, with later messages queued behind them.
+	while (held.length > 0) held.shift()!();
+	a.node.handlePeerMessage = originals[0];
+	b.node.handlePeerMessage = originals[1];
+	await turns(200);
+}
+
+/**
+ * Pay `units` over the asset channel `channelId` from `payer` to `payee`,
+ * for an invoice of `amountMsat`, as a host does: one hop, a 354 sat
+ * carrier, the units in a custom record.
+ */
+export function payAssetUnits(
+	payer: IAssetHost,
+	payee: IAssetHost,
+	channelId: Buffer,
+	invoice: { paymentHash: Buffer; paymentSecret?: Buffer },
+	amountMsat: bigint,
+	units: bigint
+): void {
+	const amount = Buffer.alloc(8);
+	amount.writeBigUInt64BE(units);
+	payer.node.sendPaymentToRoute(
+		{
+			hops: [
+				{
+					pubkey: Buffer.from(payee.node.getNodeId(), 'hex'),
+					shortChannelId: Buffer.alloc(8, 9),
+					amountToForwardMsat: amountMsat,
+					outgoingCltvValue: 40
+				}
+			]
+		},
+		invoice.paymentHash,
+		40,
+		invoice.paymentSecret,
+		undefined,
+		undefined,
+		undefined,
+		undefined,
+		{
+			assetPayment: {
+				channelId,
+				wireAmountMsat: 354_000n,
+				customRecords: new Map([[65536n, amount]])
+			}
+		}
+	);
+}
+
 const realRandomBytes = crypto.randomBytes;
 
 /**

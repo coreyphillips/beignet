@@ -355,7 +355,7 @@ describe('the asset provider at the edge of a commitment round (issue #2093 step
 			});
 		}
 
-		it('and what the peer provider answers wrongly fails the commitment it was asked about, not a later write', () => {
+		it('and what the provider answers wrongly while the commitment of the peer is verified is this node failing, at that commitment and not at a later write', () => {
 			const pair = taprootPair(7070);
 			const inner = pair.bobProvider.buildCommitment;
 			pair.bobProvider.buildCommitment = (context) => {
@@ -364,9 +364,14 @@ describe('the asset provider at the edge of a commitment round (issue #2093 step
 				return data;
 			};
 			pair.alice.updateChannelFee(pair.id, 700);
+			// Its own provider's answer, so nothing blames the peer for it.
 			expect(pair.errors.join('\n')).to.include(
+				'The asset provider refused the verification of a commitment'
+			);
+			expect(pair.errors.join('\n')).to.not.include(
 				'Invalid asset commitment metadata'
 			);
+			expect(pair.bobChannel.getState()).to.not.equal(ChannelState.ERRORED);
 			expect(() => row(pair.bobChannel)).not.to.throw();
 			expect(
 				pair.bobChannel.getFullState().auxiliaryState!.localCommitments.size
