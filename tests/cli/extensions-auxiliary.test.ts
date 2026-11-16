@@ -500,8 +500,8 @@ describe('host extensions: the members that reach the node, in a node', function
 		const node = await boot([
 			extension('assets', () => ({
 				auxiliaryChannels: auxiliaryChannels(),
-				// All of them together may not be less than one of them.
-				fixedOutputFees: { ...FEES, maxTotalFeeSatoshis: 1n }
+				// A split into no coins is not a policy.
+				fixedOutputFees: { ...FEES, feeCoinCount: 0 }
 			}))
 		]);
 		expect(built[0].options).to.not.have.property('auxiliaryChannels');
@@ -575,7 +575,7 @@ describe('host extensions: the members that reach the node, in a node', function
 					[
 						watching('assets', () => ({
 							auxiliaryChannels: auxiliaryChannels(),
-							fixedOutputFees: { ...FEES, maxTotalFeeSatoshis: 1n }
+							fixedOutputFees: { ...FEES, feeCoinCount: 0 }
 						}))
 					],
 					storage
