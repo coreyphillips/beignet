@@ -1762,10 +1762,11 @@ property channel.IBroadcastTxAction.fundingCritical?: true
 property channel.IBroadcastTxAction.tx: Buffer
 property channel.IBroadcastTxAction.type: channel.ChannelActionType.BROADCAST_TX
 interface channel.IBuiltCommitment
+property channel.IBuiltCommitment.auxiliary?: channel.IAuxiliaryCommitmentData
 property channel.IBuiltCommitment.funderBalanceMsat: bigint
 property channel.IBuiltCommitment.fundingAmount: number
 property channel.IBuiltCommitment.fundingWitnessScript: Buffer
-property channel.IBuiltCommitment.htlcOutputs: (script.IHtlcOutput & { direction: channel.HtlcDirection; })[]
+property channel.IBuiltCommitment.htlcOutputs: channel.IHtlcOutputWithMeta[]
 property channel.IBuiltCommitment.result: script.ICommitmentTxResult
 interface channel.IChannelAuxiliaryProvider
 method channel.IChannelAuxiliaryProvider.buildClose(context: channel.IAuxiliaryCloseContext): channel.IAuxiliaryCloseResult
@@ -2125,6 +2126,8 @@ property channel.IHtlcFulfilledAction.replay?: true
 property channel.IHtlcFulfilledAction.type: channel.ChannelActionType.HTLC_FULFILLED
 interface channel.IHtlcOutputWithMeta extends script.IHtlcOutput
 property channel.IHtlcOutputWithMeta.amountMsat: bigint
+property channel.IHtlcOutputWithMeta.auxiliaryAmount?: bigint
+property channel.IHtlcOutputWithMeta.customRecords?: message.CustomRecords
 property channel.IHtlcOutputWithMeta.direction: channel.HtlcDirection
 property channel.IHtlcOutputWithMeta.htlcId: bigint
 interface channel.IHtlcSnapshotEntry
@@ -2397,6 +2400,7 @@ method channel.ZeroConfManager.setFforFundingClient(peer: string, enabled: boole
 method channel.ZeroConfManager.setJitClients(pubkeyHexes: Iterable<string>): void
 method channel.ZeroConfManager.shouldUseZeroConf(peerPubkeyHex: string, requestedZeroConf: boolean): boolean
 function channel.aggregateLocalCommitmentSig(state: channel.IChannelState, signer: keys.ISigner, ourPublicNonce: Uint8Array, theirPublicNonce: Buffer, theirPartialSig: Buffer, localPerCommitmentPoint: Buffer, commitmentNumber?: bigint): Buffer
+function channel.assetHtlcSighashType(channelType: Buffer | null | undefined): 0x81 | 0x83
 function channel.buildLocalCommitment(state: channel.IChannelState, perCommitmentPoint: Buffer, commitmentNumber?: bigint, signedLocal?: boolean): channel.IBuiltCommitment
 function channel.buildRemoteCommitment(state: channel.IChannelState, remotePerCommitmentPoint: Buffer, commitmentNumber?: bigint): channel.IBuiltCommitment
 function channel.calculateCommitmentFee(feeratePerKw: number, numUntrimmedHtlcs: number, isAnchor?: boolean, isTaproot?: boolean): bigint
@@ -2414,7 +2418,7 @@ function channel.deriveV2TemporaryChannelId(openerRevocationBasepoint: Buffer): 
 function channel.dualFundingContributionWeight(inputCount: number, initiator: boolean): number
 function channel.dualFundingTopUpWeight(inputCount: number): number
 function channel.estimateSpliceTxWeight(opts: { walletInputCount: number; fundingInputCount?: number; fundingOutputCount?: number; fundingScriptLen?: number; changeScriptLen?: number; destinationScriptLen?: number; }): number
-function channel.filterUntrimmedHtlcs<T extends { amount: bigint; direction: channel.HtlcDirection; }>(htlcOutputs: T[], dustLimitSat: bigint, feeratePerKw: number, isAnchor: boolean): T[]
+function channel.filterUntrimmedHtlcs<T extends { amount: bigint; direction: channel.HtlcDirection; auxiliaryAmount?: bigint; }>(htlcOutputs: T[], dustLimitSat: bigint, feeratePerKw: number, isAnchor: boolean): T[]
 function channel.funderCommitmentCostSats(feeratePerKw: number, numUntrimmedHtlcs: number, channelType: Buffer | null): bigint
 function channel.generateTemporaryChannelId(): Buffer
 function channel.getCommitmentFeeRate(state: channel.IChannelState, signedLocal?: boolean): number
@@ -2423,9 +2427,12 @@ function channel.getLocalCommitmentLeaseBlockheight(state: channel.IChannelState
 function channel.getRemoteCommitmentFeeRate(state: channel.IChannelState): number
 function channel.getRemoteCommitmentLeaseBlockheight(state: channel.IChannelState): number | undefined
 function channel.hasScidAliasChannelType(channelType: Buffer | null): boolean
+function channel.hasSimpleTaprootBit(channelType: Buffer | null | undefined): boolean
 function channel.isAnchorChannel(channelType: Buffer | null): boolean
+function channel.isFixedAssetHtlcChannel(channelType: Buffer | null | undefined): boolean
 function channel.isOverlayChannel(channelType: Buffer | null | undefined): boolean
 function channel.isRecencyUnproven(state: { restoreRecencyUnproven?: boolean; reestablishRecencyUnproven?: boolean; reestablishSecretMissing?: boolean; }): boolean
+function channel.isRevokedChildCustodyChannel(channelType: Buffer | null | undefined): boolean
 function channel.isTaprootChannel(channelType: Buffer | null): boolean
 function channel.isValidShutdownScript(script: Buffer, allowAnySegwit?: boolean, allowOpReturn?: boolean): boolean
 function channel.mustNotBroadcastCommitment(state: { dataLossDetected?: boolean; stateUncertain?: boolean; restoreRevokedRisk?: boolean; }): boolean
@@ -5007,8 +5014,11 @@ property message.IClosingSignedMessage.channelId: Buffer
 property message.IClosingSignedMessage.feeSatoshis: bigint
 property message.IClosingSignedMessage.partialSignature?: Buffer
 property message.IClosingSignedMessage.signature: Buffer
+interface message.ICommitmentSignedDecodeOptions
+property message.ICommitmentSignedDecodeOptions.customRecords?: boolean
 interface message.ICommitmentSignedMessage
 property message.ICommitmentSignedMessage.channelId: Buffer
+property message.ICommitmentSignedMessage.customRecords?: message.CustomRecords
 property message.ICommitmentSignedMessage.fundingTxid?: Buffer
 property message.ICommitmentSignedMessage.htlcSignatures: Buffer[]
 property message.ICommitmentSignedMessage.partialSignatureWithNonce?: Buffer
@@ -5299,7 +5309,7 @@ function message.decodeChannelReestablishMessage(payload: Buffer): message.IChan
 function message.decodeClosingCompleteMessage(payload: Buffer): message.IClosingCompleteMessage
 function message.decodeClosingSigMessage(payload: Buffer): message.IClosingSigMessage
 function message.decodeClosingSignedMessage(payload: Buffer): message.IClosingSignedMessage
-function message.decodeCommitmentSignedMessage(payload: Buffer): message.ICommitmentSignedMessage
+function message.decodeCommitmentSignedMessage(payload: Buffer, options?: message.ICommitmentSignedDecodeOptions): message.ICommitmentSignedMessage
 function message.decodeCustomMessage(data: Buffer): message.ICustomMessage
 function message.decodeErrorMessage(payload: Buffer): message.IErrorMessage
 function message.decodeFundingCreatedMessage(payload: Buffer): message.IFundingCreatedMessage
@@ -7846,6 +7856,7 @@ const script.ANCHOR_TOTAL_COST: bigint
 const script.DUST_LIMIT_P2WPKH = 294
 const script.DUST_LIMIT_P2WSH = 546
 interface script.ICommitmentTxParams
+property script.ICommitmentTxParams.auxiliaryHtlcOrder?: boolean
 property script.ICommitmentTxParams.dustLimitSatoshis?: bigint
 property script.ICommitmentTxParams.feeRatePerKw?: bigint
 property script.ICommitmentTxParams.fundingAmount: bigint
@@ -7880,6 +7891,7 @@ property script.IFundingScript.witnessScript: Buffer
 interface script.IHtlcOutput
 property script.IHtlcOutput.amount: bigint
 property script.IHtlcOutput.cltvExpiry: number
+property script.IHtlcOutput.htlcId?: bigint
 property script.IHtlcOutput.paymentHash: Buffer
 property script.IHtlcOutput.script: Buffer
 property script.IHtlcOutput.taprootScript?: Buffer

@@ -9,7 +9,7 @@
  *
  * Channel usage: the funding output is a 2-of-2 MuSig2 key-spend P2TR. Both
  * parties aggregate their funding pubkeys, apply the BIP341 taproot key-spend
- * tweak (empty merkle root), and co-sign the commitment/closing sighash with
+ * tweak (with an optional asset merkle root), and co-sign the commitment/closing sighash with
  * fresh per-signature nonces.
  *
  * SAFETY: a MuSig2 secret nonce MUST be used for exactly one partial signature
@@ -130,25 +130,34 @@ export interface ITaprootFundingKey {
 	internalKey: Buffer;
 	/** 32-byte x-only OUTPUT key (goes in the P2TR scriptPubKey). */
 	outputKey: Buffer;
-	/** The BIP341 taproot tweak scalar (taggedHash("TapTweak", internalKey)). */
+	/** The BIP341 tweak scalar over the internal key and optional merkle root. */
 	tweak: Buffer;
 }
 
 /**
  * Derive the 2-of-2 MuSig2 key-spend taproot funding key from both funding
- * pubkeys. Applies the BIP341 key-spend taproot tweak with an EMPTY merkle root
- * (no script path) — i.e. tweak = taggedHash("TapTweak", internalKey).
+ * pubkeys. Applies the BIP341 key-spend tweak, including the optional asset
+ * merkle root when the funding output carries an overlay commitment.
  */
 export function deriveTaprootFundingKey(
 	localFundingPubkey: Buffer,
-	remoteFundingPubkey: Buffer
+	remoteFundingPubkey: Buffer,
+	merkleRoot?: Buffer
 ): ITaprootFundingKey {
 	const baseCtx = aggregateFundingPubkeys(
 		localFundingPubkey,
 		remoteFundingPubkey
 	);
 	const internalKey = Buffer.from(musig.getXOnlyPubkey(baseCtx));
-	const tweak = taggedHash('TapTweak', internalKey);
+	if (merkleRoot !== undefined && merkleRoot.length !== 32) {
+		throw new Error('Funding Taproot merkle root must be 32 bytes');
+	}
+	const tweak = taggedHash(
+		'TapTweak',
+		merkleRoot === undefined
+			? internalKey
+			: Buffer.concat([internalKey, merkleRoot])
+	);
 	const tweakedCtx = musig.addTweaks(baseCtx, { tweak, xOnly: true });
 	const outputKey = Buffer.from(musig.getXOnlyPubkey(tweakedCtx));
 	return { tweakedCtx, internalKey, outputKey, tweak };

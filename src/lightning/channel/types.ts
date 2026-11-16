@@ -16,17 +16,33 @@ export function isAnchorChannel(channelType: Buffer | null): boolean {
 	// channel_type contains ONLY the taproot bit (not the anchor bit), so treat
 	// taproot as implying anchors here — every internal anchor branch (to_remote
 	// 1-CSV, anchor outputs, zero-fee HTLC, CSV sweep sequence) must still fire.
+	// The asset overlay is a taproot commitment as well, and its type carries
+	// neither bit (see isOverlayChannel).
 	return (
 		flags.hasFeature(Feature.ANCHOR_ZERO_FEE_HTLC) ||
-		flags.hasFeature(Feature.OPTION_TAPROOT)
+		flags.hasFeature(Feature.OPTION_TAPROOT) ||
+		isOverlayChannel(channelType)
 	);
 }
 
 /**
- * Check whether a negotiated channel_type includes option_taproot (simple
- * taproot channels). Returns true if bit 80/81 (OPTION_TAPROOT) is set.
+ * Check whether a negotiated channel_type has taproot commitments: simple
+ * taproot channels (bit 80/81, OPTION_TAPROOT) and the asset overlay, which
+ * is the same commitment format with auxiliary leaves.
  */
 export function isTaprootChannel(channelType: Buffer | null): boolean {
+	if (!channelType || channelType.length === 0) return false;
+	return hasSimpleTaprootBit(channelType) || isOverlayChannel(channelType);
+}
+
+/**
+ * Whether a channel_type carries the simple taproot bit itself. For code
+ * that reads a type a peer has only proposed, where the overlay must not be
+ * taken for an ordinary taproot channel.
+ */
+export function hasSimpleTaprootBit(
+	channelType: Buffer | null | undefined
+): boolean {
 	if (!channelType || channelType.length === 0) return false;
 	return FeatureFlags.fromBuffer(channelType).hasFeature(
 		Feature.OPTION_TAPROOT
@@ -55,6 +71,48 @@ export function isOverlayChannel(
 		!flags.hasFeature(Feature.STATIC_REMOTE_KEY) &&
 		!flags.hasFeature(Feature.OPTION_TAPROOT)
 	);
+}
+
+/**
+ * Whether an asset channel fixed its HTLC outputs when it opened (bit 450
+ * in its type). The mode never changes for the life of the channel.
+ */
+export function isFixedAssetHtlcChannel(
+	channelType: Buffer | null | undefined
+): boolean {
+	return (
+		isOverlayChannel(channelType) &&
+		FeatureFlags.fromBuffer(channelType!).hasBit(
+			Feature.OPTION_ASSET_FIXED_HTLC_OUTPUTS
+		)
+	);
+}
+
+/**
+ * Whether an asset channel gives the asset-bearing children of a revoked
+ * commitment their own revocation key (bit 452 in its type, which requires
+ * bit 450).
+ */
+export function isRevokedChildCustodyChannel(
+	channelType: Buffer | null | undefined
+): boolean {
+	return (
+		isFixedAssetHtlcChannel(channelType) &&
+		FeatureFlags.fromBuffer(channelType!).hasBit(
+			Feature.OPTION_ASSET_CHILD_CUSTODY
+		)
+	);
+}
+
+/**
+ * The sighash type of the second-level HTLC signatures a channel exchanges:
+ * SINGLE|ANYONECANPAY (0x83) for every channel, except an asset channel with
+ * fixed HTLC outputs, which signs ALL|ANYONECANPAY (0x81).
+ */
+export function assetHtlcSighashType(
+	channelType: Buffer | null | undefined
+): 0x81 | 0x83 {
+	return isFixedAssetHtlcChannel(channelType) ? 0x81 : 0x83;
 }
 
 /**

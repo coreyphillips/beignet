@@ -149,6 +149,8 @@ export function csvFromToLocalScript(
  * Parameters for building a commitment transaction.
  */
 export interface ICommitmentTxParams {
+	/** Auxiliary channels distinguish identical HTLC outputs by their channel ID. */
+	auxiliaryHtlcOrder?: boolean;
 	/** Funding transaction outpoint */
 	fundingTxid: string;
 	fundingOutputIndex: number;
@@ -215,6 +217,7 @@ export interface ICommitmentTxParams {
 }
 
 export interface IHtlcOutput {
+	htlcId?: bigint;
 	script: Buffer; // The HTLC witness script
 	amount: bigint; // Amount in satoshis
 	cltvExpiry: number; // CLTV expiry (for sorting)
@@ -296,6 +299,7 @@ export function buildCommitmentTx(
 		sortKey: Buffer;
 		type: OutputKind;
 		htlcIndex?: number;
+		htlcId?: bigint;
 		cltvExpiry?: number;
 	}
 	const outputs: IOutputEntry[] = [];
@@ -392,6 +396,7 @@ export function buildCommitmentTx(
 					sortKey: spk,
 					type: 'htlc',
 					htlcIndex: i,
+					htlcId: htlc.htlcId,
 					cltvExpiry: htlc.cltvExpiry
 				});
 			}
@@ -450,7 +455,16 @@ export function buildCommitmentTx(
 			a.cltvExpiry !== undefined &&
 			b.cltvExpiry !== undefined
 		) {
-			return a.cltvExpiry - b.cltvExpiry;
+			const byCltv = a.cltvExpiry - b.cltvExpiry;
+			if (byCltv !== 0) return byCltv;
+			if (
+				params.auxiliaryHtlcOrder &&
+				a.htlcId !== undefined &&
+				b.htlcId !== undefined &&
+				a.htlcId !== b.htlcId
+			)
+				return a.htlcId < b.htlcId ? -1 : 1;
+			return 0;
 		}
 		return 0;
 	});

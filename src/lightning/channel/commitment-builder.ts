@@ -7,6 +7,12 @@
  */
 
 import * as bitcoin from 'bitcoinjs-lib';
+import { secondLevelRevocationKey } from './child-revocation';
+import type { ITaprootAuxLeaf } from '../script/commitment-taproot';
+import type { IAuxiliaryCommitmentData } from './auxiliary';
+import { copyAuxiliaryCommitment } from './auxiliary';
+import { applyAuxiliaryCommitment } from './auxiliary-builder';
+import type { CustomRecords } from '../message/custom-records';
 import { derivePublicKey, deriveRevocationPubkey } from '../keys/derivation';
 import { verify } from '../crypto/ecdh';
 import type { ISigner } from '../keys/signer';
@@ -35,7 +41,8 @@ import {
 	HtlcDirection,
 	HtlcState,
 	isAnchorChannel,
-	isTaprootChannel
+	isTaprootChannel,
+	assetHtlcSighashType
 } from './types';
 import {
 	buildTaprootToLocalOutput,
@@ -227,7 +234,11 @@ export function funderCommitmentCostSats(
  * the two never diverge (a divergence builds a commitment the peer rejects).
  */
 export function filterUntrimmedHtlcs<
-	T extends { amount: bigint; direction: HtlcDirection }
+	T extends {
+		amount: bigint;
+		direction: HtlcDirection;
+		auxiliaryAmount?: bigint;
+	}
 >(
 	htlcOutputs: T[],
 	dustLimitSat: bigint,
@@ -243,7 +254,10 @@ export function filterUntrimmedHtlcs<
 					: HTLC_SUCCESS_WEIGHT;
 			htlcFeeSat = BigInt(Math.floor((weight * feeratePerKw) / 1000));
 		}
-		return h.amount >= dustLimitSat + htlcFeeSat;
+		const included = h.amount >= dustLimitSat + htlcFeeSat;
+		if (!included && h.auxiliaryAmount && h.auxiliaryAmount > 0n)
+			throw new Error('Asset-bearing HTLC would be trimmed as dust');
+		return included;
 	});
 }
 
@@ -532,6 +546,11 @@ export function deriveCommitmentKeys(
  * Result of building a commitment transaction.
  */
 export interface IBuiltCommitment {
+	/**
+	 * Asset channels only: the asset side of this commitment, whose leaves
+	 * are already in `result.tx`. Absent for every other channel.
+	 */
+	auxiliary?: IAuxiliaryCommitmentData;
 	/** Opener balance in this commitment view, before its fee and anchor cost. */
 	funderBalanceMsat: bigint;
 	result: ICommitmentTxResult;
@@ -546,7 +565,7 @@ export interface IBuiltCommitment {
 	 * trimmed HTLC ordered before a surviving one would shift every subsequent
 	 * index and bind the counterparty signature to the wrong output.
 	 */
-	htlcOutputs: (IHtlcOutput & { direction: HtlcDirection })[];
+	htlcOutputs: IHtlcOutputWithMeta[];
 }
 
 /**
@@ -689,6 +708,8 @@ export function buildLocalCommitment(
 	// skew made the two sides of a removal round sign different commitments.
 	let localMsat = state.localBalanceMsat;
 	let remoteMsat = state.remoteBalanceMsat;
+	let localAsset = state.auxiliaryState?.localBalance ?? 0n;
+	let remoteAsset = state.auxiliaryState?.remoteBalance ?? 0n;
 	for (const entry of state.htlcs.values()) {
 		if (signedLocalCarriesRemoval(entry, signedLocal)) {
 			// This rebuild still carries the HTLC output (the stored signature
@@ -703,6 +724,7 @@ export function buildLocalCommitment(
 			// excluded below), and no removal of it has anything to settle
 			// (issue #1295).
 			remoteMsat += entry.amountMsat;
+			remoteAsset += entry.auxiliaryAmount ?? 0n;
 			continue;
 		}
 		if (entry.state === HtlcState.FULFILLED) {
@@ -712,16 +734,19 @@ export function buildLocalCommitment(
 				// this commitment; see buildHtlcOutputsForLocal).
 				if (entry.removalRemoteCommitted !== false) {
 					localMsat += entry.amountMsat;
+					localAsset += entry.auxiliaryAmount ?? 0n;
 				}
 			} else if (localCommitmentCarriesAdd(entry, signedLocal)) {
 				// We offered and remote fulfilled: credit their balance.
 				remoteMsat += entry.amountMsat;
+				remoteAsset += entry.auxiliaryAmount ?? 0n;
 			} else {
 				// The peer revealed the preimage for an add this commitment
 				// never carried. It holds neither the HTLC output nor the
 				// credit, so our provisional deduction comes back instead of
 				// the peer being paid (issue #643).
 				localMsat += entry.amountMsat;
+				localAsset += entry.auxiliaryAmount ?? 0n;
 			}
 		} else if (entry.state === HtlcState.FAILED) {
 			if (entry.direction === HtlcDirection.RECEIVED) {
@@ -729,10 +754,12 @@ export function buildLocalCommitment(
 				// removal is not committed by the peer yet (output still present).
 				if (entry.removalRemoteCommitted !== false) {
 					remoteMsat += entry.amountMsat;
+					remoteAsset += entry.auxiliaryAmount ?? 0n;
 				}
 			} else {
 				// We offered but failed: refund our balance
 				localMsat += entry.amountMsat;
+				localAsset += entry.auxiliaryAmount ?? 0n;
 			}
 		} else if (
 			entry.direction === HtlcDirection.OFFERED &&
@@ -742,6 +769,7 @@ export function buildLocalCommitment(
 			// balance deduction from addHtlc is not in the peer's signature over
 			// it — return it for this build (the output is excluded above).
 			localMsat += entry.amountMsat;
+			localAsset += entry.auxiliaryAmount ?? 0n;
 		}
 	}
 	for (const entry of signedLocalRetainedRemovals(state, signedLocal)) {
@@ -750,8 +778,10 @@ export function buildLocalCommitment(
 		// the HTLC output, so the amount is in neither balance yet.
 		if (entry.state === HtlcState.FULFILLED) {
 			localMsat -= entry.amountMsat;
+			localAsset -= entry.auxiliaryAmount ?? 0n;
 		} else {
 			remoteMsat -= entry.amountMsat;
+			remoteAsset -= entry.auxiliaryAmount ?? 0n;
 		}
 	}
 	let localAmount = localMsat / 1000n;
@@ -780,6 +810,7 @@ export function buildLocalCommitment(
 	);
 
 	const params: ICommitmentTxParams = {
+		auxiliaryHtlcOrder: !!state.auxiliaryState,
 		fundingTxid: state.fundingTxid.toString('hex'),
 		fundingOutputIndex: state.fundingOutputIndex,
 		fundingAmount: state.fundingSatoshis,
@@ -826,8 +857,21 @@ export function buildLocalCommitment(
 
 	applyTaprootCommitOverrides(params, state.channelType);
 	const result = buildCommitmentTx(params);
+	const auxiliary = applyAuxiliaryCommitment(
+		state,
+		'local',
+		commitNum,
+		perCommitmentPoint,
+		keys,
+		result,
+		htlcOutputs,
+		localAsset,
+		remoteAsset,
+		signedLocal
+	);
 
 	return {
+		...(auxiliary ? { auxiliary } : {}),
 		funderBalanceMsat: isOpener ? localMsat : remoteMsat,
 		result,
 		fundingWitnessScript: funding.witnessScript,
@@ -909,28 +953,34 @@ export function buildRemoteCommitment(
 	// separately desyncs the two sides of a removal round by 1 sat.
 	let localMsat = state.remoteBalanceMsat;
 	let remoteMsat = state.localBalanceMsat;
+	let localAsset = state.auxiliaryState?.remoteBalance ?? 0n;
+	let remoteAsset = state.auxiliaryState?.localBalance ?? 0n;
 	for (const entry of state.htlcs.values()) {
 		if (entry.state === HtlcState.FULFILLED) {
 			if (entry.direction === HtlcDirection.RECEIVED) {
 				// We received and fulfilled: credit our balance
 				remoteMsat += entry.amountMsat;
+				remoteAsset += entry.auxiliaryAmount ?? 0n;
 			} else {
 				// We offered and remote fulfilled: credit their balance — unless
 				// we have not revoked for the peer's removal yet (the HTLC output
 				// is still in this commitment; see buildHtlcOutputsForRemote).
 				if (entry.removalLocallyRevoked !== false) {
 					localMsat += entry.amountMsat;
+					localAsset += entry.auxiliaryAmount ?? 0n;
 				}
 			}
 		} else if (entry.state === HtlcState.FAILED) {
 			if (entry.direction === HtlcDirection.RECEIVED) {
 				// We received but failed: refund their balance
 				localMsat += entry.amountMsat;
+				localAsset += entry.auxiliaryAmount ?? 0n;
 			} else {
 				// We offered but failed: refund our balance — unless we have not
 				// revoked for the peer's removal yet (output still present).
 				if (entry.removalLocallyRevoked !== false) {
 					remoteMsat += entry.amountMsat;
+					remoteAsset += entry.auxiliaryAmount ?? 0n;
 				}
 			}
 		} else if (
@@ -941,6 +991,7 @@ export function buildRemoteCommitment(
 			// provisional balance deduction is not in its own view of this
 			// commitment yet — return it for this build (output excluded above).
 			localMsat += entry.amountMsat;
+			localAsset += entry.auxiliaryAmount ?? 0n;
 		}
 	}
 	let localAmount = localMsat / 1000n;
@@ -970,6 +1021,7 @@ export function buildRemoteCommitment(
 	// For remote commitment: "local" from tx perspective = remote party, "remote" = us
 	// localFundingPubkey/remoteFundingPubkey are from the tx holder's perspective
 	const params: ICommitmentTxParams = {
+		auxiliaryHtlcOrder: !!state.auxiliaryState,
 		fundingTxid: state.fundingTxid.toString('hex'),
 		fundingOutputIndex: state.fundingOutputIndex,
 		fundingAmount: state.fundingSatoshis,
@@ -1018,8 +1070,21 @@ export function buildRemoteCommitment(
 
 	applyTaprootCommitOverrides(params, state.channelType);
 	const result = buildCommitmentTx(params);
+	const auxiliary = applyAuxiliaryCommitment(
+		state,
+		'remote',
+		commitNum,
+		remotePerCommitmentPoint,
+		keys,
+		result,
+		htlcOutputs,
+		remoteAsset,
+		localAsset,
+		false
+	);
 
 	return {
+		...(auxiliary ? { auxiliary } : {}),
 		funderBalanceMsat: isOpener ? remoteMsat : localMsat,
 		result,
 		fundingWitnessScript: funding.witnessScript,
@@ -1193,7 +1258,9 @@ export function verifyRemoteCommitmentSig(
 function taprootFundingSpk(state: IChannelState): Buffer {
 	return createTaprootFundingScript(
 		state.localBasepoints.fundingPubkey,
-		state.remoteBasepoints!.fundingPubkey
+		state.remoteBasepoints!.fundingPubkey,
+		undefined,
+		state.fundingTaprootMerkleRoot
 	).p2trOutput;
 }
 
@@ -1225,9 +1292,16 @@ export function signRemoteCommitmentPartial(
 		state.localBasepoints.fundingPubkey,
 		state.remoteBasepoints!.fundingPubkey,
 		ourPublicNonce,
-		theirPublicNonce
+		theirPublicNonce,
+		state.fundingTaprootMerkleRoot
 	);
-	return signer.signCommitmentPartial(session, ourPublicNonce);
+	const partial = signer.signCommitmentPartial(session, ourPublicNonce);
+	if (built.auxiliary)
+		state.auxiliaryState!.remoteCommitments.set(
+			commitmentNumber ?? state.remoteCommitmentNumber,
+			copyAuxiliaryCommitment(built.auxiliary)
+		);
+	return partial;
 }
 
 /**
@@ -1262,7 +1336,8 @@ export function verifyRemoteCommitmentPartial(
 			state.localBasepoints.fundingPubkey,
 			state.remoteBasepoints!.fundingPubkey,
 			ourPublicNonce,
-			theirPublicNonce
+			theirPublicNonce,
+			state.fundingTaprootMerkleRoot
 		);
 		return verifyPartialCommitmentSig(
 			session,
@@ -1307,7 +1382,8 @@ export function aggregateLocalCommitmentSig(
 		state.localBasepoints.fundingPubkey,
 		state.remoteBasepoints!.fundingPubkey,
 		ourPublicNonce,
-		theirPublicNonce
+		theirPublicNonce,
+		state.fundingTaprootMerkleRoot
 	);
 	const ourPartial = signer.signCommitmentPartial(session, ourPublicNonce);
 	return aggregateCommitmentSig(session, ourPartial, theirPartialSig);
@@ -1326,7 +1402,8 @@ function taprootHtlcOutputAndLeaf(
 	kind: 'offered' | 'received',
 	keys: ICommitmentKeys,
 	paymentHash: Buffer,
-	cltvExpiry: number
+	cltvExpiry: number,
+	auxiliaryLeaf?: ITaprootAuxLeaf
 ): { output: Buffer; leafScript: Buffer; leafVersion: number } {
 	if (kind === 'received') {
 		const o = buildTaprootReceivedHtlcOutput(
@@ -1334,7 +1411,9 @@ function taprootHtlcOutputAndLeaf(
 			keys.localHtlcPubkey,
 			keys.remoteHtlcPubkey,
 			paymentHash,
-			cltvExpiry
+			cltvExpiry,
+			undefined,
+			auxiliaryLeaf
 		);
 		// HTLC-success spends the preimage/2-of-2 success leaf.
 		return {
@@ -1347,7 +1426,9 @@ function taprootHtlcOutputAndLeaf(
 		keys.revocationPubkey,
 		keys.localHtlcPubkey,
 		keys.remoteHtlcPubkey,
-		paymentHash
+		paymentHash,
+		undefined,
+		auxiliaryLeaf
 	);
 	// HTLC-timeout spends the 2-of-2 timeout leaf.
 	return {
@@ -1403,7 +1484,15 @@ export function signRemoteHtlcSignaturesTaproot(
 			kind,
 			keys,
 			meta.paymentHash,
-			meta.cltvExpiry
+			meta.cltvExpiry,
+			built.auxiliary?.outputLeaves.get(outputIndex)
+		);
+		const childKey = secondLevelRevocationKey(
+			state,
+			built.auxiliary,
+			keys.revocationPubkey,
+			meta.auxiliaryAmount,
+			built.result.tx
 		);
 		const htlcTx =
 			kind === 'received'
@@ -1411,25 +1500,34 @@ export function signRemoteHtlcSignaturesTaproot(
 						commitTxid,
 						outputIndex,
 						meta.amount,
-						keys.revocationPubkey,
+						childKey,
 						keys.localDelayedPubkey,
-						state.localConfig.toSelfDelay
+						state.localConfig.toSelfDelay,
+						undefined,
+						built.auxiliary?.secondLevelLeaves.get(
+							`${meta.direction}:${meta.htlcId}`
+						)
 				  )
 				: buildTaprootHtlcTimeoutTx(
 						commitTxid,
 						outputIndex,
 						meta.amount,
 						meta.cltvExpiry,
-						keys.revocationPubkey,
+						childKey,
 						keys.localDelayedPubkey,
-						state.localConfig.toSelfDelay
+						state.localConfig.toSelfDelay,
+						undefined,
+						built.auxiliary?.secondLevelLeaves.get(
+							`${meta.direction}:${meta.htlcId}`
+						)
 				  );
 		const sighash = taprootHtlcLeafSighash(
 			htlcTx,
 			output,
 			Number(meta.amount),
 			leafScript,
-			leafVersion
+			leafVersion,
+			assetHtlcSighashType(state.channelType)
 		);
 		// The signer derives our per-commitment HTLC privkey internally (same
 		// derivation as the ECDSA path in signRemoteCommitment).
@@ -1487,7 +1585,15 @@ export function verifyRemoteHtlcSignaturesTaproot(
 			kind,
 			keys,
 			meta.paymentHash,
-			meta.cltvExpiry
+			meta.cltvExpiry,
+			built.auxiliary?.outputLeaves.get(outputIndex)
+		);
+		const childKey = secondLevelRevocationKey(
+			state,
+			built.auxiliary,
+			keys.revocationPubkey,
+			meta.auxiliaryAmount,
+			built.result.tx
 		);
 		const htlcTx =
 			kind === 'received'
@@ -1495,25 +1601,34 @@ export function verifyRemoteHtlcSignaturesTaproot(
 						commitTxid,
 						outputIndex,
 						meta.amount,
-						keys.revocationPubkey,
+						childKey,
 						keys.localDelayedPubkey,
-						state.remoteConfig.toSelfDelay
+						state.remoteConfig.toSelfDelay,
+						undefined,
+						built.auxiliary?.secondLevelLeaves.get(
+							`${meta.direction}:${meta.htlcId}`
+						)
 				  )
 				: buildTaprootHtlcTimeoutTx(
 						commitTxid,
 						outputIndex,
 						meta.amount,
 						meta.cltvExpiry,
-						keys.revocationPubkey,
+						childKey,
 						keys.localDelayedPubkey,
-						state.remoteConfig.toSelfDelay
+						state.remoteConfig.toSelfDelay,
+						undefined,
+						built.auxiliary?.secondLevelLeaves.get(
+							`${meta.direction}:${meta.htlcId}`
+						)
 				  );
 		const sighash = taprootHtlcLeafSighash(
 			htlcTx,
 			output,
 			Number(meta.amount),
 			leafScript,
-			leafVersion
+			leafVersion,
+			assetHtlcSighashType(state.channelType)
 		);
 		if (
 			!verifyTaprootHtlcLeaf(sighash, keys.remoteHtlcPubkey, htlcSignatures[k])
@@ -1650,11 +1765,8 @@ function buildHtlcOutputsForLocal(
 	state: IChannelState,
 	keys: ICommitmentKeys,
 	signedLocal = false
-): (IHtlcOutput & { direction: HtlcDirection; amountMsat: bigint })[] {
-	const outputs: (IHtlcOutput & {
-		direction: HtlcDirection;
-		amountMsat: bigint;
-	})[] = [];
+): IHtlcOutputWithMeta[] {
+	const outputs: IHtlcOutputWithMeta[] = [];
 
 	for (const entry of state.htlcs.values()) {
 		// An add of the PEER's that the stored signature has never covered is
@@ -1721,7 +1833,7 @@ function buildLocalHtlcOutput(
 	state: IChannelState,
 	keys: ICommitmentKeys,
 	entry: IHtlcEntry
-): IHtlcOutput & { direction: HtlcDirection; amountMsat: bigint } {
+): IHtlcOutputWithMeta {
 	const useAnchors = isAnchorChannel(state.channelType);
 	const isTaproot = isTaprootChannel(state.channelType);
 	if (entry.direction === HtlcDirection.OFFERED) {
@@ -1736,6 +1848,8 @@ function buildLocalHtlcOutput(
 			script,
 			amount: entry.amountMsat / 1000n,
 			amountMsat: entry.amountMsat,
+			htlcId: entry.id,
+			...auxiliaryHtlcFields(entry),
 			cltvExpiry: entry.cltvExpiry,
 			paymentHash: entry.paymentHash,
 			direction: HtlcDirection.OFFERED,
@@ -1760,6 +1874,8 @@ function buildLocalHtlcOutput(
 		script,
 		amount: entry.amountMsat / 1000n,
 		amountMsat: entry.amountMsat,
+		htlcId: entry.id,
+		...auxiliaryHtlcFields(entry),
 		cltvExpiry: entry.cltvExpiry,
 		paymentHash: entry.paymentHash,
 		direction: HtlcDirection.RECEIVED,
@@ -1774,9 +1890,30 @@ function buildLocalHtlcOutput(
 }
 
 /**
+ * The asset side of an HTLC, carried to its commitment output. Empty for an
+ * HTLC without one, so the output of an ordinary HTLC gains no key.
+ */
+function auxiliaryHtlcFields(
+	entry: IHtlcEntry
+): Pick<IHtlcOutputWithMeta, 'customRecords' | 'auxiliaryAmount'> {
+	return {
+		...(entry.customRecords !== undefined
+			? { customRecords: entry.customRecords }
+			: {}),
+		...(entry.auxiliaryAmount !== undefined
+			? { auxiliaryAmount: entry.auxiliaryAmount }
+			: {})
+	};
+}
+
+/**
  * HTLC output with metadata for signing second-level transactions.
  */
 export interface IHtlcOutputWithMeta extends IHtlcOutput {
+	/** Asset channels only: the custom records of the add. */
+	customRecords?: CustomRecords;
+	/** Asset channels only: the asset amount this HTLC carries. */
+	auxiliaryAmount?: bigint;
 	htlcId: bigint;
 	direction: HtlcDirection;
 	amountMsat: bigint;
@@ -1845,9 +1982,10 @@ function buildHtlcOutputsForRemote(
 				script,
 				amount: entry.amountMsat / 1000n,
 				amountMsat: entry.amountMsat,
+				htlcId: entry.id,
+				...auxiliaryHtlcFields(entry),
 				cltvExpiry: entry.cltvExpiry,
 				paymentHash: entry.paymentHash,
-				htlcId: entry.id,
 				direction: entry.direction,
 				taprootScript: taprootHtlcScript(
 					isTaproot,
@@ -1870,9 +2008,10 @@ function buildHtlcOutputsForRemote(
 				script,
 				amount: entry.amountMsat / 1000n,
 				amountMsat: entry.amountMsat,
+				htlcId: entry.id,
+				...auxiliaryHtlcFields(entry),
 				cltvExpiry: entry.cltvExpiry,
 				paymentHash: entry.paymentHash,
-				htlcId: entry.id,
 				direction: entry.direction,
 				taprootScript: taprootHtlcScript(
 					isTaproot,

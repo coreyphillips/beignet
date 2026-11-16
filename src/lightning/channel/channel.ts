@@ -124,8 +124,17 @@ import {
 	recencyHoldOrigin
 } from './channel-state';
 import { recordRevokedHtlcSnapshot } from './htlc-snapshots';
-import type { IChannelAuxiliaryProvider } from './auxiliary';
-import { requireAuxiliaryProvider } from './auxiliary';
+import type {
+	IAuxiliaryCommitmentData,
+	IChannelAuxiliaryProvider
+} from './auxiliary';
+import { copyAuxiliaryCommitment, requireAuxiliaryProvider } from './auxiliary';
+import {
+	acceptChildRevocationRecord,
+	addChildRevocationRecord
+} from './child-revocation';
+import type { CustomRecords } from '../message/custom-records';
+import { copyCustomRecords } from '../message/custom-records';
 import {
 	bigIntMax,
 	bigIntMin,
@@ -2064,6 +2073,29 @@ export class Channel {
 		}
 		if (!valid) {
 			return 'Invalid taproot partial signature';
+		}
+		if (this._state.auxiliaryState) {
+			// Asset channels: keep the asset side of the commitment this
+			// signature covers, so a force close after a restart commits to
+			// the same leaves without asking the provider again. The view of
+			// the commitment before it stays until this one is revoked; older
+			// ones are ours, revoked, and never broadcast.
+			const views = this._state.auxiliaryState.localCommitments;
+			let view: IAuxiliaryCommitmentData | undefined;
+			try {
+				view = buildLocalCommitment(
+					this._state,
+					localPerCommitmentPoint,
+					commitmentNumber
+				).auxiliary;
+			} catch {
+				view = undefined;
+			}
+			if (!view) return 'Invalid asset commitment metadata';
+			views.set(commitmentNumber, copyAuxiliaryCommitment(view));
+			for (const number of [...views.keys()]) {
+				if (number < commitmentNumber - 1n) views.delete(number);
+			}
 		}
 		this._state.remoteCommitmentSignature = theirPartial;
 		this._state.remoteSigningNonce = theirSigningNonce;
@@ -5034,6 +5066,129 @@ export class Channel {
 	}
 
 	/**
+	 * Asset channels: have the provider sign the asset side of the peer's
+	 * next commitment. Returns the custom records for commitment_signed and
+	 * the asset view they sign, or the reason the round cannot be signed.
+	 * Writes nothing.
+	 */
+	private _signAuxiliaryCommitment(
+		spliceBatch: boolean
+	):
+		| { records?: CustomRecords; view: IAuxiliaryCommitmentData }
+		| { error: string } {
+		if (spliceBatch) {
+			return {
+				error: 'Cannot sign commitment: an asset channel has no splice'
+			};
+		}
+		const point =
+			this._state.remoteNextPerCommitmentPoint ??
+			this._state.remoteCurrentPerCommitmentPoint;
+		if (!this._signer || !point) {
+			return {
+				error:
+					'Cannot sign asset commitment: no signer or peer commitment point'
+			};
+		}
+		const commitmentNumber = this._state.remoteCommitmentNumber + 1n;
+		try {
+			const commitment = buildRemoteCommitment(
+				this._state,
+				point,
+				commitmentNumber
+			);
+			if (!commitment.auxiliary) {
+				return { error: 'Cannot sign asset commitment: no asset view' };
+			}
+			const records = addChildRevocationRecord(
+				this._state,
+				commitment.result.tx,
+				commitment.auxiliary,
+				copyCustomRecords(
+					requireAuxiliaryProvider(this._state).signHtlcs(
+						{
+							state: this._state,
+							side: 'remote',
+							commitmentNumber,
+							perCommitmentPoint: point,
+							commitment
+						},
+						this._signer
+					)
+				)
+			);
+			return {
+				...(records && records.size > 0 ? { records } : {}),
+				view: commitment.auxiliary
+			};
+		} catch (err) {
+			return {
+				error: `Cannot sign asset commitment: ${(err as Error).message}`
+			};
+		}
+	}
+
+	/**
+	 * Asset channels: check the asset side of a commitment_signed against
+	 * our next commitment. Returns the reason to fail the channel, or null.
+	 * The one thing it writes is the peer's child custody basepoint for this
+	 * commitment, which the check itself needs; it is taken back on failure.
+	 */
+	private _verifyAuxiliaryCommitment(
+		msg: ICommitmentSignedMessage
+	): string | null {
+		const auxiliary = this._state.auxiliaryState!;
+		const commitmentNumber = this._state.localCommitmentNumber + 1n;
+		const point = getPerCommitmentPoint(
+			this._state.localPerCommitmentSeed,
+			commitmentNumber
+		);
+		const basepointsBefore = auxiliary.childRevocationBasepoints
+			? new Map(auxiliary.childRevocationBasepoints)
+			: undefined;
+		const restore = (): void => {
+			if (basepointsBefore) {
+				auxiliary.childRevocationBasepoints = basepointsBefore;
+			} else {
+				delete auxiliary.childRevocationBasepoints;
+			}
+		};
+		try {
+			acceptChildRevocationRecord(this._state, msg.customRecords);
+			const commitment = buildLocalCommitment(
+				this._state,
+				point,
+				commitmentNumber
+			);
+			acceptChildRevocationRecord(
+				this._state,
+				msg.customRecords,
+				commitment.result.tx
+			);
+			if (
+				!commitment.auxiliary ||
+				!requireAuxiliaryProvider(this._state).verifyHtlcs(
+					{
+						state: this._state,
+						side: 'local',
+						commitmentNumber,
+						perCommitmentPoint: point,
+						commitment
+					},
+					msg.customRecords ?? new Map()
+				)
+			) {
+				restore();
+				return 'Invalid asset HTLC signature';
+			}
+			return null;
+		} catch {
+			restore();
+			return 'Invalid asset commitment metadata';
+		}
+	}
+
+	/**
 	 * Sign and send commitment_signed.
 	 * The caller provides the signature and HTLC signatures (from commitment-builder).
 	 */
@@ -5129,15 +5284,60 @@ export class Channel {
 			}
 		}
 
+		// Asset channels (issue #2093): the provider signs the asset side of
+		// the same commitment and its records travel in this message. A
+		// failure refuses the round before anything below is written.
+		let auxiliarySigned:
+			| { records?: CustomRecords; view: IAuxiliaryCommitmentData }
+			| undefined;
+		if (this._state.auxiliaryState) {
+			const signed = this._signAuxiliaryCommitment(!!spliceBatch);
+			if ('error' in signed) {
+				return [{ type: ChannelActionType.ERROR, message: signed.error }];
+			}
+			auxiliarySigned = signed;
+		}
+
 		const msg: ICommitmentSignedMessage = {
 			channelId: this._state.channelId!,
 			signature: taproot ? Buffer.alloc(64) : signature,
 			htlcSignatures,
-			partialSignatureWithNonce: taproot ? partialSignatureWithNonce : undefined
+			partialSignatureWithNonce: taproot
+				? partialSignatureWithNonce
+				: undefined,
+			...(auxiliarySigned?.records
+				? { customRecords: auxiliarySigned.records }
+				: {})
 		};
 		if (spliceBatch && this._state.fundingTxid) {
 			// Batched commitments are routed by their funding_txid TLV.
 			msg.fundingTxid = Buffer.from(this._state.fundingTxid);
+		}
+		if (auxiliarySigned) {
+			try {
+				// Custom records have no fixed size: find out now, not at send.
+				encodeCommitmentSignedMessage(msg);
+			} catch (err) {
+				return [
+					{
+						type: ChannelActionType.ERROR,
+						message: `Cannot sign asset commitment: ${(err as Error).message}`
+					}
+				];
+			}
+			// Kept with the signature they belong to, for the retransmission
+			// and for the day this commitment is seen on chain.
+			if (auxiliarySigned.records) {
+				this._state.lastSentAuxiliaryRecords = copyCustomRecords(
+					auxiliarySigned.records
+				);
+			} else {
+				delete this._state.lastSentAuxiliaryRecords;
+			}
+			this._state.auxiliaryState!.remoteCommitments.set(
+				this._state.remoteCommitmentNumber + 1n,
+				copyAuxiliaryCommitment(auxiliarySigned.view)
+			);
 		}
 
 		// Cache for retransmission on reestablish. For taproot we cache the
@@ -5491,6 +5691,14 @@ export class Channel {
 			if (trimmed) return this._failChannelWithWireError(trimmed);
 		}
 
+		// Asset channels (issue #2093): the asset side is verified before
+		// either Bitcoin arm, so an invalid asset signature fails the channel
+		// with our current commitment and its secret still unrevealed.
+		if (this._state.auxiliaryState) {
+			const refusal = this._verifyAuxiliaryCommitment(msg);
+			if (refusal) return this._failChannelWithWireError(refusal);
+		}
+
 		if (isTaprootChannel(this._state.channelType)) {
 			// Cannot verify -> must not adopt, the taproot twin of the ECDSA arm
 			// below. A plain ERROR, not a wire error: the missing pieces are a
@@ -5544,6 +5752,13 @@ export class Channel {
 				// unreachable past the pre-check above, so err is always a
 				// peer-fault reason here.
 				return this._failChannelWithWireError(err);
+			}
+			const auxiliaryView = this._state.auxiliaryState?.localCommitments.get(
+				this._state.localCommitmentNumber + 1n
+			);
+			if (auxiliaryView) {
+				const peerSignatures = copyCustomRecords(msg.customRecords);
+				if (peerSignatures) auxiliaryView.peerSignatures = peerSignatures;
 			}
 			this._state.remoteHtlcSignatures = msg.htlcSignatures;
 		} else {
@@ -7774,9 +7989,13 @@ export class Channel {
 			// THROW rather than return false, and that is the same answer here:
 			// no witness this rebuild can carry.
 			try {
+				// An asset channel's funding key also commits to its asset
+				// root; for every other channel the root is absent.
 				const { p2trOutput, outputKey } = createTaprootFundingScript(
 					view.localBasepoints.fundingPubkey,
-					remoteFundingPubkey
+					remoteFundingPubkey,
+					undefined,
+					view.fundingTaprootMerkleRoot
 				);
 				const sighash = taprootCommitmentSighash(
 					tx,
@@ -7788,7 +8007,8 @@ export class Channel {
 					view.localBasepoints.fundingPubkey,
 					remoteFundingPubkey,
 					taprootNonce,
-					view.remoteSigningNonce!
+					view.remoteSigningNonce!,
+					view.fundingTaprootMerkleRoot
 				);
 				if (
 					!verifyPartialCommitmentSig(
@@ -12214,7 +12434,11 @@ export class Channel {
 					htlcSignatures: this._state.lastSentHtlcSignatures,
 					partialSignatureWithNonce: taprootReest
 						? this._state.lastSentPartialSignatureWithNonce!
-						: undefined
+						: undefined,
+					// Asset channels: the same asset signatures as the first time.
+					...(this._state.lastSentAuxiliaryRecords
+						? { customRecords: this._state.lastSentAuxiliaryRecords }
+						: {})
 				};
 				actions.push(
 					replayMsg(

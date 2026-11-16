@@ -3,7 +3,7 @@
  *
  * The funding output is a 2-of-2 MuSig2 key-spend P2TR. Both parties aggregate
  * their funding pubkeys (BIP327), apply the BIP341 key-spend taproot tweak with
- * an empty merkle root, and the resulting x-only output key becomes the P2TR
+ * an optional asset merkle root, and the resulting x-only output key becomes the P2TR
  * scriptPubKey. Spending requires a single co-signed BIP340 Schnorr signature.
  */
 
@@ -35,14 +35,16 @@ export interface ITaprootFundingScript {
 export function createTaprootFundingScript(
 	localFundingPubkey: Buffer,
 	remoteFundingPubkey: Buffer,
-	network: bitcoin.Network = bitcoin.networks.bitcoin
+	network: bitcoin.Network = bitcoin.networks.bitcoin,
+	merkleRoot?: Buffer
 ): ITaprootFundingScript {
 	if (localFundingPubkey.length !== 33 || remoteFundingPubkey.length !== 33) {
 		throw new Error('Funding pubkeys must be 33 bytes compressed');
 	}
 	const { internalKey, outputKey, tweak } = deriveTaprootFundingKey(
 		localFundingPubkey,
-		remoteFundingPubkey
+		remoteFundingPubkey,
+		merkleRoot
 	);
 	// P2TR scriptPubKey: OP_1 (0x51) PUSH_32 (0x20) <output key>.
 	const p2trOutput = Buffer.concat([Buffer.from([0x51, 0x20]), outputKey]);

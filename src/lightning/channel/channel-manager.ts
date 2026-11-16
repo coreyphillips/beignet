@@ -143,6 +143,7 @@ import {
 	hasScidAliasChannelType,
 	isAnchorChannel,
 	isTaprootChannel,
+	hasSimpleTaprootBit,
 	scidAliasAnnounceRefusal,
 	validateV2ChannelType,
 	MAX_FUNDING_SATOSHIS,
@@ -4635,10 +4636,27 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		this.processActions(peerPubkey, channel, actions);
 	}
 
+	/**
+	 * Whether a channel message is for a channel with asset state, read from
+	 * the channel_id every such message starts with. Only those channels read
+	 * custom records (TLV types at or above 65536); a message for any other
+	 * channel is decoded as it always was, an unknown even type refused.
+	 */
+	private readsCustomRecords(payload: Buffer): boolean {
+		if (payload.length < 32) return false;
+		const channelId = payload.subarray(0, 32);
+		const channel =
+			this.findChannelByChannelId(channelId) ||
+			this.findChannelByChannelIdInTemp(channelId);
+		return channel?.getFullState().auxiliaryState !== undefined;
+	}
+
 	private handleCommitmentSigned(peerPubkey: string, payload: Buffer): void {
 		let msg: ReturnType<typeof decodeCommitmentSignedMessage>;
 		try {
-			msg = decodeCommitmentSignedMessage(payload);
+			msg = decodeCommitmentSignedMessage(payload, {
+				customRecords: this.readsCustomRecords(payload)
+			});
 		} catch (err) {
 			this.failChannelForUndecodablePayload(
 				peerPubkey,
@@ -8042,7 +8060,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			msg.requestFunds.requestedSats > 0n &&
 			this.config.leaseRates &&
 			this.config.nodePrivateKey &&
-			!isTaprootChannel(msg.channelType ?? null)
+			!hasSimpleTaprootBit(msg.channelType)
 		) {
 			const bh = msg.requestFunds.blockheight;
 			if (
@@ -8176,7 +8194,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 				msg.requestFunds.requestedSats > 0n &&
 				this.config.leaseRates &&
 				this.config.nodePrivateKey &&
-				!isTaprootChannel(msg.channelType ?? null)
+				!hasSimpleTaprootBit(msg.channelType)
 			) {
 				const signature = signWillFund(
 					chKeys.basepoints.fundingPubkey,
