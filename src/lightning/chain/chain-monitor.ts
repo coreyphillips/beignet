@@ -36,6 +36,10 @@ import {
 import { csvFromToLocalScript } from '../script/commitment';
 import type { IChannelState } from '../channel/channel-state';
 import { isAnchorChannel } from '../channel/types';
+import {
+	noteAuxiliarySweep,
+	noteAuxiliarySweepOffered
+} from './auxiliary-sweep';
 
 /** Number of blocks before re-broadcasting unconfirmed sweeps */
 const REBROADCAST_INTERVAL = 6;
@@ -75,6 +79,8 @@ export class ChainMonitor {
 
 	private _commitmentBroadcast: ICommitmentBroadcast | null = null;
 	private _trackedOutputs: ITrackedOutput[] = [];
+	/** Refusals of an asset provider already said, by outpoint. Not stored. */
+	private _auxiliaryRefusalsSaid?: Map<string, string>;
 	private _currentBlockHeight = 0;
 	private _knownPreimages: Map<string, Buffer> = new Map();
 	/**
@@ -231,6 +237,7 @@ export class ChainMonitor {
 				if (!r.witness) continue;
 				r.spendTx.setWitness(0, r.witness);
 				r.trackedOutput.sweepTxHex = r.spendTx.toBuffer().toString('hex');
+				noteAuxiliarySweep(r.trackedOutput, r.auxiliaryData);
 			}
 		} catch {
 			// Keep the existing held sweeps; they are still valid spends.
@@ -1165,6 +1172,9 @@ export class ChainMonitor {
 
 		output.status = OutputStatus.SPEND_CONFIRMED;
 		output.resolutionTxid = spendingTx.getId();
+		if (this._channelState.auxiliaryState) {
+			output.resolutionTxHex = spendingTx.toHex();
+		}
 		output.confirmationHeight = blockHeight;
 		// A spend we had not recorded is live evidence as much as a re-report of
 		// one we had, so it releases a parked finality clock (issue #576). A
@@ -1354,6 +1364,9 @@ export class ChainMonitor {
 		for (const spentTrackedOutput of spentTrackedOutputs) {
 			spentTrackedOutput.status = OutputStatus.SPEND_CONFIRMED;
 			spentTrackedOutput.resolutionTxid = spendingTx.getId();
+			if (this._channelState.auxiliaryState) {
+				spentTrackedOutput.resolutionTxHex = spendingTx.toHex();
+			}
 			spentTrackedOutput.confirmationHeight = blockHeight;
 			delete spentTrackedOutput.spendReverifyPending;
 		}
@@ -1435,6 +1448,8 @@ export class ChainMonitor {
 				survivor.currentFeeRate = undefined;
 				survivor.maturityHeight = undefined;
 				survivor.resolutionTxid = undefined;
+				if (survivor.resolutionTxHex !== undefined)
+					delete survivor.resolutionTxHex;
 			}
 		}
 		if (hasSurvivors) {
@@ -1530,6 +1545,8 @@ export class ChainMonitor {
 			: [output];
 		for (const candidate of reorgedOutputs) {
 			candidate.resolutionTxid = undefined;
+			if (candidate.resolutionTxHex !== undefined)
+				delete candidate.resolutionTxHex;
 		}
 		// If the monitor had declared the channel fully resolved on the strength of
 		// this spend, resume resolving so handleNewBlock keeps working the output.
@@ -1607,6 +1624,8 @@ export class ChainMonitor {
 					) {
 						candidate.status = OutputStatus.SPEND_BROADCAST;
 						candidate.resolutionTxid = undefined;
+						if (candidate.resolutionTxHex !== undefined)
+							delete candidate.resolutionTxHex;
 						candidate.confirmationHeight = revokedBroadcast.blockHeight;
 						candidate.sweepTxHex = retainedHex;
 						candidate.originalFeeRate = reorgedOutput.originalFeeRate;
@@ -1871,11 +1890,26 @@ export class ChainMonitor {
 	 * so they are routed through FEE_BUMP_AND_BROADCAST to have a wallet fee input
 	 * attached before broadcast. Every other sweep broadcasts directly.
 	 */
+	/**
+	 * Whether a transaction is a sweep of units this monitor signed. It is
+	 * marked as offered for broadcast, so its asset side stays in the row.
+	 * Always false for a channel that is not an asset channel.
+	 */
+	offerAuxiliarySweep(transaction: Buffer): boolean {
+		if (!this._channelState.auxiliaryState) return false;
+		let carriesUnits = false;
+		for (const output of this._trackedOutputs) {
+			if (noteAuxiliarySweepOffered(output, transaction)) carriesUnits = true;
+		}
+		return carriesUnits;
+	}
+
 	private _broadcastSweepAction(
 		output: ITrackedOutput,
 		txBuf: Buffer,
 		description: string
 	): ChainAction {
+		const carriesUnits = noteAuxiliarySweepOffered(output, txBuf);
 		// Only our OWN commitment's second-level HTLC txs are the pre-signed
 		// zero-fee variant that needs a fee attached. HTLC claims on the remote's
 		// commitment are direct spends that already deduct a fee, and penalty
@@ -1897,7 +1931,12 @@ export class ChainMonitor {
 				feeratePerVbyte: output.currentFeeRate || this._feeRatePerVbyte
 			};
 		}
-		return { type: ChainActionType.BROADCAST_TX, tx: txBuf, description };
+		return {
+			type: ChainActionType.BROADCAST_TX,
+			tx: txBuf,
+			description,
+			...(carriesUnits ? { requiresMonitorPersistence: true } : {})
+		};
 	}
 
 	private _handleCooperativeClose(actions: ChainAction[]): ChainAction[] {
@@ -2274,6 +2313,7 @@ export class ChainMonitor {
 			trackedOutput: ITrackedOutput;
 			spendTx?: bitcoin.Transaction;
 			witness?: Buffer[];
+			auxiliaryData?: Buffer;
 		},
 		description: string
 	): void {
@@ -2291,6 +2331,7 @@ export class ChainMonitor {
 		);
 
 		r.trackedOutput.sweepTxHex = txBuf.toString('hex');
+		noteAuxiliarySweep(r.trackedOutput, r.auxiliaryData);
 		r.trackedOutput.originalFeeRate = this._feeRatePerVbyte;
 		r.trackedOutput.maturityHeight = maturityHeight;
 
@@ -2338,6 +2379,7 @@ export class ChainMonitor {
 				this._scheduleSweep(actions, r, desc);
 			}
 		}
+		this._reportAuxiliaryRefusals(actions, resolved);
 
 		this._reportDeclinedClaims(
 			actions,
@@ -2372,6 +2414,7 @@ export class ChainMonitor {
 				);
 			}
 		}
+		this._reportAuxiliaryRefusals(actions, resolved);
 
 		this._reportDeclinedClaims(
 			actions,
@@ -2713,6 +2756,7 @@ export class ChainMonitor {
 				if (spentOutpoints.has(`${candidate.txid}:${candidate.outputIndex}`)) {
 					candidate.status = OutputStatus.SPEND_BROADCAST;
 					candidate.sweepTxHex = rebuiltHex;
+					noteAuxiliarySweep(candidate, match.auxiliaryData);
 					candidate.currentFeeRate = feeRatePerVbyte;
 					candidate.broadcastHeight = this._currentBlockHeight;
 				}
@@ -2982,6 +3026,8 @@ export class ChainMonitor {
 				candidate.currentFeeRate = appliedFeeRate;
 				candidate.broadcastHeight = this._currentBlockHeight;
 				candidate.resolutionTxid = undefined;
+				if (candidate.resolutionTxHex !== undefined)
+					delete candidate.resolutionTxHex;
 				continue;
 			}
 			// The old batch no longer manages this member. Return it to the retry
@@ -2993,6 +3039,8 @@ export class ChainMonitor {
 			candidate.currentFeeRate = undefined;
 			candidate.maturityHeight = undefined;
 			candidate.resolutionTxid = undefined;
+			if (candidate.resolutionTxHex !== undefined)
+				delete candidate.resolutionTxHex;
 		}
 
 		return replacements;
@@ -3262,6 +3310,29 @@ export class ChainMonitor {
 		return claimed;
 	}
 
+	/**
+	 * Say why the provider of an asset channel would not make the asset side
+	 * of a sweep, once for each output and reason. The output stays tracked
+	 * without a spend and is tried again on every block.
+	 */
+	private _reportAuxiliaryRefusals(
+		actions: ChainAction[],
+		resolved: Array<{ trackedOutput: ITrackedOutput; spendTx?: unknown }>
+	): void {
+		for (const { trackedOutput, spendTx } of resolved) {
+			const key = `${trackedOutput.txid}:${trackedOutput.outputIndex}`;
+			const refusal = spendTx ? undefined : trackedOutput.auxiliaryRefusal;
+			if (!refusal) {
+				this._auxiliaryRefusalsSaid?.delete(key);
+				continue;
+			}
+			this._auxiliaryRefusalsSaid ??= new Map();
+			if (this._auxiliaryRefusalsSaid.get(key) === refusal) continue;
+			this._auxiliaryRefusalsSaid.set(key, refusal);
+			actions.push({ type: ChainActionType.ERROR, message: refusal });
+		}
+	}
+
 	private _uneconomicAction(
 		output: ITrackedOutput,
 		reason: 'skipped' | 'contested'
@@ -3512,6 +3583,7 @@ export class ChainMonitor {
 					: 'HTLC preimage claim (retried after skip)';
 			this._scheduleSweep(actions, entry, description);
 		}
+		this._reportAuxiliaryRefusals(actions, resolved);
 		this._reportDeclinedClaims(
 			actions,
 			resolved
@@ -3572,6 +3644,7 @@ export class ChainMonitor {
 				'to_local sweep (retried after skip)'
 			);
 		}
+		this._reportAuxiliaryRefusals(actions, resolved);
 		this._reportDeclinedClaims(
 			actions,
 			resolved

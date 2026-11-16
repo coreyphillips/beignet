@@ -6,7 +6,6 @@
  */
 
 import { expect } from 'chai';
-import * as bitcoin from 'bitcoinjs-lib';
 import type { Channel } from '../../src/lightning/channel/channel';
 import type { ChannelAction } from '../../src/lightning/channel/channel-actions';
 import {
@@ -131,11 +130,9 @@ describe('an asset channel refuses what it has no asset handling for (issue #209
 			channel.handleClosingSig({ channelId } as never, never),
 			'a simple close'
 		);
-		refusal(channel.forceClose(signer), 'a force close');
-		expect(channel.prepareForceClose(signer)).to.deep.equal({
-			ok: false,
-			error: `An asset channel does not support a force close (channel ${hex})`
-		});
+		// A force close is not refused: an asset channel ends on the chain
+		// like any other (step 10, auxiliary-force-close.test.ts).
+		expect(channel.prepareForceClose(signer).ok).to.equal(true);
 		refusal(channel.initiateSplice(10_000n, 253), 'a splice');
 		refusal(channel.handleSplice({ channelId } as never), 'a splice');
 		refusal(channel.initiateQuiescence(), 'quiescence');
@@ -179,11 +176,6 @@ describe('an asset channel refuses what it has no asset handling for (issue #209
 		expect(JSON.stringify(close)).to.include(
 			`An asset channel does not support a close to an address of the caller (channel ${hex})`
 		);
-		const force = alice.node.forceCloseChannel(channelId, SCRIPT);
-		expect(force.ok).to.equal(false);
-		expect(force.error).to.include(
-			`An asset channel does not support a force close (channel ${hex})`
-		);
 		const splice = alice.node
 			.getChannelManager()
 			.initiateSplice(channelId, 10_000n, 253);
@@ -193,39 +185,9 @@ describe('an asset channel refuses what it has no asset handling for (issue #209
 		);
 		expect(errors).to.deep.equal([
 			`An asset channel does not support a close to an address of the caller (channel ${hex})`,
-			`An asset channel does not support a force close (channel ${hex})`,
 			`An asset channel does not support a splice (channel ${hex})`
 		]);
 		untouched(0, sent);
-	});
-
-	it('does not read a spend of its funding output as an ordinary commitment', () => {
-		const manager = alice.node.getChannelManager();
-		const errors: string[] = [];
-		manager.on('error', (_id: unknown, message: unknown) => {
-			errors.push(String(message));
-		});
-		const state = channel.getFullState();
-		const spend = new bitcoin.Transaction();
-		spend.version = 2;
-		// A commitment carries the BOLT 3 stamp in its locktime and sequence;
-		// a spend without it is a cooperative close, which the channel now
-		// follows (step 9).
-		spend.locktime = 0x20000001;
-		spend.addInput(
-			Buffer.from(state.fundingTxid!).reverse(),
-			state.fundingOutputIndex!,
-			0x80000001
-		);
-		spend.addOutput(SCRIPT, 1_000);
-		expect(
-			manager.handleFundingSpent(channelId, spend, 100, SCRIPT)
-		).to.deep.equal([]);
-		expect(errors).to.deep.equal([
-			`An asset channel does not support on-chain resolution (channel ${hex})`
-		]);
-		expect(manager.getMonitor(channelId)).to.equal(undefined);
-		expect(channel.getFullState().state).to.equal(ChannelState.NORMAL);
 	});
 
 	it('asks nothing of a channel without asset state, on a node with a provider', async () => {
@@ -239,8 +201,6 @@ describe('an asset channel refuses what it has no asset handling for (issue #209
 			for (const operation of [
 				'a simple close',
 				'a close to an address of the caller',
-				'a force close',
-				'on-chain resolution',
 				'a splice',
 				'quiescence',
 				'a delegated settlement epoch'

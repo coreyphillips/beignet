@@ -826,44 +826,14 @@ describe('commitments with auxiliary leaves', function () {
 
 			// The live channel's own witness for that commitment is a key
 			// spend that verifies under the funding key tweaked by the asset
-			// root. The force close itself is refused until the outputs of an
-			// asset commitment can be swept, so the witness is taken from the
-			// step that makes it.
+			// root: it is what a force close would publish.
 			pair.bobProvider.buildCommitment = inner;
 			const live = writableState(pair.bobChannel);
-			const signer = pair.bobChannel.getSigner()!;
-			expect(pair.bobChannel.prepareForceClose(signer)).to.deep.equal({
-				ok: false,
-				error: `An asset channel does not support a force close (channel ${pair.id.toString(
-					'hex'
-				)})`
-			});
-			const internals = pair.bobChannel as unknown as {
-				_deriveVerificationNonce(commitmentNumber: bigint): Uint8Array;
-				_witnessForceCloseCommitment(
-					view: typeof live,
-					built: ReturnType<typeof buildLocalCommitment>,
-					witnessSigner: typeof signer,
-					perCommitmentPoint: Buffer,
-					taprootNonce: Uint8Array | null
-				): bitcoin.Transaction | null;
-			};
-			const livePoint = getPerCommitmentPoint(
-				live.localPerCommitmentSeed,
-				live.localCommitmentNumber
+			const plan = pair.bobChannel.prepareForceClose(
+				pair.bobChannel.getSigner()!
 			);
-			const nonce = internals._deriveVerificationNonce(
-				live.localCommitmentNumber
-			);
-			live.localNonce = nonce;
-			const tx = internals._witnessForceCloseCommitment(
-				live,
-				buildLocalCommitment(live, livePoint, undefined, true),
-				signer,
-				livePoint,
-				nonce
-			);
-			if (!tx) throw new Error('Missing witnessed commitment');
+			if (!plan.ok) throw new Error(plan.error);
+			const tx = bitcoin.Transaction.fromBuffer(plan.commitmentTx);
 			expect(tx.getId()).to.equal(signedTxid);
 			verifyFundingSpend(tx, live);
 		});

@@ -7949,8 +7949,6 @@ export class Channel {
 	 * the live channel moves, which is the whole reason the two halves exist.
 	 */
 	forceClose(signer: ISigner, chain?: IForceCloseChainFacts): ChannelAction[] {
-		const assetRefusal = this._refuseForAssetChannel('a force close');
-		if (assetRefusal) return assetRefusal;
 		const plan = this.prepareForceClose(signer, chain);
 		if (!plan.ok) {
 			return [{ type: ChannelActionType.ERROR, message: plan.error }];
@@ -8031,8 +8029,6 @@ export class Channel {
 		signer: ISigner,
 		chain?: IForceCloseChainFacts
 	): ForceClosePlan {
-		const assetRefusal = auxiliaryUnsupported(this._state, 'a force close');
-		if (assetRefusal) return { ok: false, error: assetRefusal.message };
 		// The recovery never-broadcast invariant (5.6): proven stale
 		// (dataLossDetected), unprovable (stateUncertain), or with
 		// the peer having shown it holds the revocation (restoreRevokedRisk,

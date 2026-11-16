@@ -7,9 +7,8 @@
  */
 
 import { auxiliaryProviderError } from './auxiliary';
-import { AuxiliaryOpenError, auxiliaryUnsupported } from './auxiliary-guard';
+import { AuxiliaryOpenError } from './auxiliary-guard';
 import { applyAuxiliaryClose } from './auxiliary-close';
-import { classifyCommitmentTx } from '../chain/output-resolver';
 import { auxiliaryChannelOpens } from './auxiliary-switch';
 import type { CustomRecords } from '../message/custom-records';
 import { TypedEmitter } from '../../utils/typed-emitter';
@@ -403,6 +402,13 @@ export interface IChannelManagerConfig {
 	 * those sends. LightningNode supplies one backed by its storage.
 	 */
 	persistence: IChannelPersistence;
+	/**
+	 * Whether the monitor row of a channel, as the last `monitor:updated`
+	 * announced it, is stored. Asked before a spend of the units of an asset
+	 * channel is broadcast, and only then: without an answer of true such a
+	 * spend does not leave. LightningNode supplies one backed by its storage.
+	 */
+	isMonitorPersisted?: (channelIdHex: string) => boolean;
 	/**
 	 * Asset channel support (issue #2093). Unset, the manager opens and
 	 * accepts ordinary channels only and none of the asset code runs.
@@ -866,6 +872,12 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 	> = new Map();
 	private peerManager: PeerManager | null = null;
 	private monitors: Map<string, ChainMonitor> = new Map();
+	/**
+	 * Spends of the units of an asset channel that wait for the monitor row
+	 * with their asset side to be stored, by channel. Empty on a node
+	 * without asset channels.
+	 */
+	private auxiliarySpendsHeld: Map<string, Buffer[]> = new Map();
 	// Latest block height seen (for stamping when a force-close CPFP was broadcast).
 	private _currentBlockHeight = 0;
 	// Channels whose channel_announcement is signed by both sides but whose
@@ -3663,20 +3675,6 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		const channelIdHex = channelId.toString('hex');
 		let monitor = this.monitors.get(channelIdHex);
 		const owner = this.channels.get(channelIdHex);
-		// An asset channel's commitment is not read with an ordinary
-		// channel's eyes: nothing here would find its outputs. Its
-		// cooperative close has no output for this node to resolve, and is
-		// followed to its confirmation like any other.
-		const assetRefusal =
-			owner &&
-			classifyCommitmentTx(spendingTx, owner.getFullState()).type !==
-				CommitmentType.COOPERATIVE_CLOSE &&
-			auxiliaryUnsupported(owner.getFullState(), 'on-chain resolution');
-		if (assetRefusal) {
-			this.emitContained('error', channelId, assetRefusal.message);
-			return [];
-		}
-
 		// Which funding the spend consumed decides the view the monitor
 		// classifies it against (issue #764): the peer's second-level HTLC
 		// signatures are per-funding, so a commitment on the splice output is
@@ -3922,6 +3920,9 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			// actions. A channel:resolved listener can close the channel immediately,
 			// so the monitor must already be marked dirty at that boundary.
 			this.emit('monitor:updated', channelIdHex, monitor);
+			if (this.auxiliarySpendsHeld.size > 0) {
+				this.releaseHeldAuxiliarySpends(channelIdHex);
+			}
 			if (actions.length > 0) {
 				const channelId = Buffer.from(channelIdHex, 'hex');
 				this.processChainActions(channelId, actions);
@@ -10202,6 +10203,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		// The void retires the funding watch that fed it, and startup restores
 		// no monitor without its channel, so it goes with the channel.
 		this.monitors.delete(idHex);
+		this.auxiliarySpendsHeld.delete(idHex);
 		return true;
 	}
 
@@ -12206,10 +12208,46 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		}
 	}
 
+	/**
+	 * Broadcast a spend of the units of an asset channel, once the monitor
+	 * row that holds its asset side is stored. Until then it is held, said
+	 * as an error naming the channel, and released on a later block.
+	 */
+	private broadcastAuxiliarySpend(channelId: Buffer, tx: Buffer): void {
+		const channelIdHex = channelId.toString('hex');
+		if (this.config.isMonitorPersisted?.(channelIdHex) === true) {
+			this.emit('broadcast:tx', tx);
+			return;
+		}
+		const held = this.auxiliarySpendsHeld.get(channelIdHex) ?? [];
+		if (!held.some((other) => other.equals(tx))) held.push(Buffer.from(tx));
+		// The newest few are enough: an older one was replaced many times over.
+		this.auxiliarySpendsHeld.set(channelIdHex, held.slice(-16));
+		this.emitContained(
+			'error',
+			channelId,
+			`A spend of the units of an asset channel waits for its monitor to be stored (channel ${channelIdHex})`
+		);
+	}
+
+	/** Release the held spends of a channel whose monitor row is now stored. */
+	private releaseHeldAuxiliarySpends(channelIdHex: string): void {
+		const held = this.auxiliarySpendsHeld.get(channelIdHex);
+		if (!held || this.config.isMonitorPersisted?.(channelIdHex) !== true) {
+			return;
+		}
+		this.auxiliarySpendsHeld.delete(channelIdHex);
+		for (const tx of held) this.emit('broadcast:tx', tx);
+	}
+
 	private processChainActions(channelId: Buffer, actions: ChainAction[]): void {
 		for (const action of actions) {
 			switch (action.type) {
 				case ChainActionType.BROADCAST_TX:
+					if (action.requiresMonitorPersistence) {
+						this.broadcastAuxiliarySpend(channelId, action.tx);
+						break;
+					}
 					this.emit('broadcast:tx', action.tx);
 					break;
 				case ChainActionType.FEE_BUMP_AND_BROADCAST:
@@ -12256,7 +12294,19 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 					for (const tx of rebuilt) {
 						// Sweep rebuilds return bitcoin.Transaction objects; every
 						// broadcast listener expects a raw Buffer.
-						this.emit('broadcast:tx', tx.toBuffer());
+						const raw = tx.toBuffer();
+						if (
+							mon &&
+							typeof mon.offerAuxiliarySweep === 'function' &&
+							mon.offerAuxiliarySweep(raw)
+						) {
+							// A rebuilt sweep of units: the row with its new asset
+							// side is stored before it leaves.
+							this.emit('monitor:updated', channelId.toString('hex'), mon);
+							this.broadcastAuxiliarySpend(channelId, raw);
+							continue;
+						}
+						this.emit('broadcast:tx', raw);
 					}
 					break;
 				}

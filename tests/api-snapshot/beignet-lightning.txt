@@ -608,6 +608,7 @@ method chain.ChainMonitor.handleSpendUnconfirmed(txid: string, outputIndex: numb
 method chain.ChainMonitor.isCommitmentConfirmed(): boolean
 method chain.ChainMonitor.isCommitmentReverifyPending(): boolean
 method chain.ChainMonitor.isFullyResolved(): boolean
+method chain.ChainMonitor.offerAuxiliarySweep(transaction: Buffer): boolean
 method chain.ChainMonitor.rebuildSweep(output: chain.ITrackedOutput, feeRatePerVbyte: number): bitcoinjs-lib#Transaction | null
 method chain.ChainMonitor.rebuildSweeps(output: chain.ITrackedOutput, feeRatePerVbyte: number): bitcoinjs-lib#Transaction[]
 static method chain.ChainMonitor.restore(saved: chain.IChainMonitorState, channelState: channel.IChannelState, destinationScript: Buffer, feeRatePerVbyte: number, revocationBasepointSecret: Buffer, paymentPrivkey: Buffer, network?: bitcoinjs-lib#Network, delayedPaymentBasepointSecret?: Buffer, htlcBasepointSecret?: Buffer): chain.ChainMonitor
@@ -686,6 +687,7 @@ property chain.IAttachFeeInputsParams.htlcWitness: Buffer[]
 property chain.IAttachFeeInputsParams.walletInputs: channel.ISpliceWalletInput[]
 interface chain.IBroadcastTxChainAction
 property chain.IBroadcastTxChainAction.description: string
+property chain.IBroadcastTxChainAction.requiresMonitorPersistence?: true
 property chain.IBroadcastTxChainAction.tx: Buffer
 property chain.IBroadcastTxChainAction.type: chain.ChainActionType.BROADCAST_TX
 interface chain.IChainBackend
@@ -814,6 +816,7 @@ property chain.IRemoteHtlcPreimageClaimParams.inputSequence?: number
 property chain.IRemoteHtlcPreimageClaimParams.outputIndex: number
 property chain.IRemoteHtlcPreimageClaimParams.witnessScript: Buffer
 interface chain.IResolvedOutput
+property chain.IResolvedOutput.auxiliaryData?: Buffer
 property chain.IResolvedOutput.cltvExpiry?: number
 property chain.IResolvedOutput.csvDelay?: number
 property chain.IResolvedOutput.declinedAsUneconomic?: boolean
@@ -871,6 +874,11 @@ property chain.IToRemoteClaimParams.feeSatoshis: bigint
 property chain.IToRemoteClaimParams.outputIndex: number
 interface chain.ITrackedOutput
 property chain.ITrackedOutput.amount: bigint
+property chain.ITrackedOutput.auxiliaryCommitmentNumber?: bigint
+property chain.ITrackedOutput.auxiliaryData?: Buffer
+property chain.ITrackedOutput.auxiliaryFeeFunding?: boolean
+property chain.ITrackedOutput.auxiliaryRefusal?: string
+property chain.ITrackedOutput.auxiliarySweepAttempts?: Record<string, { transaction: string; auxiliaryData?: Buffer; offered?: true; }>
 property chain.ITrackedOutput.broadcastHeight?: number
 property chain.ITrackedOutput.cltvExpiry?: number
 property chain.ITrackedOutput.confirmationHeight: number
@@ -884,6 +892,7 @@ property chain.ITrackedOutput.outputIndex: number
 property chain.ITrackedOutput.outputType: chain.OutputType
 property chain.ITrackedOutput.paymentHash?: Buffer
 property chain.ITrackedOutput.receivedHtlcSpend?: { txid: string; preimage?: string; }
+property chain.ITrackedOutput.resolutionTxHex?: string
 property chain.ITrackedOutput.resolutionTxid?: string
 property chain.ITrackedOutput.secondLevelTxHex?: string
 property chain.ITrackedOutput.spendReverifyPending?: boolean
@@ -987,7 +996,7 @@ constructor channel.AuxiliaryProviderError(channelId: string, operation: string,
 readonly property channel.AuxiliaryProviderError.channelId: string
 readonly property channel.AuxiliaryProviderError.operation: string
 type channel.AuxiliarySpendKind = 'to_local_delayed' | 'to_local_revocation' | 'to_remote' | 'htlc_timeout' | 'htlc_success' | 'htlc_second_level_timeout' | 'htlc_second_level_success' | 'htlc_revocation' | 'second_level_delayed' | 'second_level_revocation'
-type channel.AuxiliaryUnsupportedOperation = 'a simple close' | 'a close to an address of the caller' | 'a force close' | 'on-chain resolution' | 'a splice' | 'quiescence' | 'a delegated settlement epoch'
+type channel.AuxiliaryUnsupportedOperation = 'a simple close' | 'a close to an address of the caller' | 'a splice' | 'quiescence' | 'a delegated settlement epoch'
 const channel.BITCOIN_CHAIN_HASH: Buffer
 const channel.CHANNEL_INDEX_FLOOR_MAX: number
 const channel.CHANNEL_INDEX_FLOOR_STRIDE = 128
@@ -1857,6 +1866,7 @@ property channel.IChannelManagerConfig.fforVoucherLookup?: (paymentHash: string)
 property channel.IChannelManagerConfig.getClosingFeeratePerKw?: () => number | undefined
 property channel.IChannelManagerConfig.hasResumableChannelRow?: (channelId: Buffer) => boolean
 property channel.IChannelManagerConfig.htlcBasepointSecret?: Buffer
+property channel.IChannelManagerConfig.isMonitorPersisted?: (channelIdHex: string) => boolean
 property channel.IChannelManagerConfig.largeChannels?: boolean
 property channel.IChannelManagerConfig.leaseRates?: gossip.ILeaseRates
 property channel.IChannelManagerConfig.localBasepoints: keys.IChannelBasepoints

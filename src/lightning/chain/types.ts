@@ -39,6 +39,29 @@ export enum OutputType {
 
 /** A tracked on-chain output */
 export interface ITrackedOutput {
+	/**
+	 * Set on an output of an asset channel that carries units: the number of
+	 * the commitment whose asset view names its leaf.
+	 */
+	auxiliaryCommitmentNumber?: bigint;
+	/** The asset side of `sweepTxHex`, as the provider made it. */
+	auxiliaryData?: Buffer;
+	/**
+	 * The sweeps signed for an output that carries units, by transaction id,
+	 * each with its asset side: the present one, and every one that was
+	 * offered for broadcast (`offered`), since any of those may confirm.
+	 */
+	auxiliarySweepAttempts?: Record<
+		string,
+		{ transaction: string; auxiliaryData?: Buffer; offered?: true }
+	>;
+	/**
+	 * A sweep of the units of this output cannot pay its own fee and leave
+	 * what an output of units must hold: it waits for a fee from elsewhere.
+	 */
+	auxiliaryFeeFunding?: boolean;
+	/** Why the provider would not make the asset side of a sweep, last time. */
+	auxiliaryRefusal?: string;
 	txid: string;
 	outputIndex: number;
 	amount: bigint;
@@ -59,6 +82,8 @@ export interface ITrackedOutput {
 	cltvExpiry?: number;
 	witnessScript?: Buffer;
 	resolutionTxid?: string;
+	/** The transaction that spent an output of an asset channel, as seen on chain. */
+	resolutionTxHex?: string;
 	/** Witness evidence bound to a spend of our received HTLC on a current commitment. */
 	receivedHtlcSpend?: {
 		txid: string;
@@ -219,6 +244,11 @@ export enum ChainActionType {
 }
 
 export interface IBroadcastTxChainAction {
+	/**
+	 * Set on a transaction that spends units of an asset channel: the
+	 * monitor row that holds its asset side is stored before it leaves.
+	 */
+	requiresMonitorPersistence?: true;
 	type: ChainActionType.BROADCAST_TX;
 	tx: Buffer;
 	description: string;

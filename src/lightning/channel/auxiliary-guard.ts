@@ -21,8 +21,6 @@ import { isOverlayChannel } from './types';
 export type AuxiliaryUnsupportedOperation =
 	| 'a simple close'
 	| 'a close to an address of the caller'
-	| 'a force close'
-	| 'on-chain resolution'
 	| 'a splice'
 	| 'quiescence'
 	| 'a delegated settlement epoch';

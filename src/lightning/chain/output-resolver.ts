@@ -88,6 +88,16 @@ import {
 	HTLC_TIMEOUT_WEIGHT
 } from '../channel/commitment-builder';
 
+import {
+	AUXILIARY_SWEEP_OUTPUT_MINIMUM,
+	auxiliaryLeafCandidates,
+	auxiliaryOutputLeaf,
+	auxiliarySweepVbytes,
+	prepareAuxiliarySweep,
+	trackedAuxiliaryLeaf
+} from './auxiliary-sweep';
+import type { ITaprootAuxLeaf } from '../script/commitment-taproot';
+
 const SIGHASH_ALL = bitcoin.Transaction.SIGHASH_ALL;
 const SIGHASH_ANCHOR =
 	bitcoin.Transaction.SIGHASH_SINGLE | bitcoin.Transaction.SIGHASH_ANYONECANPAY;
@@ -126,6 +136,8 @@ export interface IResolvedOutput {
 	witness?: Buffer[];
 	/** The spend was fully constructible but could not cover its fee and dust. */
 	declinedAsUneconomic?: boolean;
+	/** The asset side of the spend, for a spend of an output that carries units. */
+	auxiliaryData?: Buffer;
 	/** CSV delay before this output can be spent */
 	csvDelay?: number;
 	/** CLTV expiry before this output can be spent */
@@ -407,7 +419,11 @@ function candidateTheirPerCommitmentPoints(
  * derivation disambiguateCommitmentTx and classifyTheirCommitmentOutputs
  * apply (taproot-aware, lease CLTV when the peer is the lessor).
  */
-function theirToLocalSpksFor(state: IChannelState, point: Buffer): Buffer[] {
+function theirToLocalSpksFor(
+	state: IChannelState,
+	point: Buffer,
+	commitmentNumber?: bigint
+): Buffer[] {
 	if (!state.remoteBasepoints) return [];
 	const theirRevocationPubkey = deriveRevocationPubkey(
 		state.localBasepoints.revocationBasepoint,
@@ -423,6 +439,23 @@ function theirToLocalSpksFor(state: IChannelState, point: Buffer): Buffer[] {
 			theirDelayedPubkey,
 			state.localConfig.toSelfDelay
 		).output;
+		if (state.auxiliaryState) {
+			// Their balance output may carry units: one more script for each
+			// asset leaf the view of that commitment names.
+			return [
+				spk,
+				...auxiliaryLeafCandidates(state, false, commitmentNumber).map(
+					(leaf) =>
+						buildTaprootToLocalOutput(
+							theirRevocationPubkey,
+							theirDelayedPubkey,
+							state.localConfig.toSelfDelay,
+							undefined,
+							leaf
+						).output
+				)
+			];
+		}
 		return spk ? [spk] : [];
 	}
 	const spks: Buffer[] = [];
@@ -449,14 +482,15 @@ function theirToLocalSpksFor(state: IChannelState, point: Buffer): Buffer[] {
 function countTheirHtlcMatches(
 	tx: bitcoin.Transaction,
 	state: IChannelState,
-	point: Buffer
+	point: Buffer,
+	commitmentNumber?: bigint
 ): number {
 	if (!state.remoteBasepoints) return 0;
 	const claimedKeys = new Set<string>();
 	let matches = 0;
 	if (isTaprootChannel(state.channelType)) {
 		const keys = deriveTaprootCommitKeys(state, point, false);
-		for (const out of tx.outs) {
+		for (const [outputIndex, out] of tx.outs.entries()) {
 			if (
 				matchTaprootHtlcOutput(
 					Buffer.from(out.script),
@@ -464,7 +498,8 @@ function countTheirHtlcMatches(
 					state,
 					keys,
 					false,
-					claimedKeys
+					claimedKeys,
+					auxiliaryOutputLeaf(state, false, commitmentNumber, outputIndex)
 				)
 			) {
 				matches++;
@@ -520,7 +555,7 @@ export function selectTheirPerCommitmentPoint(
 	const candidates = candidateTheirPerCommitmentPoints(state, commitmentNumber);
 	if (candidates.length <= 1) return candidates[0];
 	for (const point of candidates) {
-		const spks = theirToLocalSpksFor(state, point);
+		const spks = theirToLocalSpksFor(state, point, commitmentNumber);
 		for (const out of tx.outs) {
 			if (spks.some((spk) => Buffer.from(out.script).equals(spk))) {
 				return point;
@@ -530,7 +565,7 @@ export function selectTheirPerCommitmentPoint(
 	let bestHtlcPoint: Buffer | undefined;
 	let bestHtlcMatches = 0;
 	for (const point of candidates) {
-		const matches = countTheirHtlcMatches(tx, state, point);
+		const matches = countTheirHtlcMatches(tx, state, point, commitmentNumber);
 		if (matches > bestHtlcMatches) {
 			bestHtlcPoint = point;
 			bestHtlcMatches = matches;
@@ -604,6 +639,19 @@ function disambiguateCommitmentTx(
 			state.remoteConfig.toSelfDelay
 		).output;
 		if (out) ourToLocalSpks.push(out);
+		// Our balance output may carry units (no leaf to try for a channel
+		// that is not an asset channel).
+		for (const leaf of auxiliaryLeafCandidates(state, true, commitmentNumber)) {
+			ourToLocalSpks.push(
+				buildTaprootToLocalOutput(
+					ourRevocationPubkey,
+					ourDelayedPubkey,
+					state.remoteConfig.toSelfDelay,
+					undefined,
+					leaf
+				).output
+			);
+		}
 	} else {
 		const csvVariants: (number | undefined)[] =
 			state.isLessor && state.leaseExpiry
@@ -678,6 +726,16 @@ function disambiguateCommitmentTx(
 			  }).output;
 		for (const out of tx.outs) {
 			if (theirToLocalSpk && Buffer.from(out.script).equals(theirToLocalSpk)) {
+				return CommitmentType.THEIR_CURRENT_COMMITMENT;
+			}
+			if (
+				state.auxiliaryState &&
+				theirToLocalSpksFor(
+					state,
+					theirPerCommitmentPoint,
+					commitmentNumber
+				).some((spk) => Buffer.from(out.script).equals(spk))
+			) {
 				return CommitmentType.THEIR_CURRENT_COMMITMENT;
 			}
 		}
@@ -1512,6 +1570,39 @@ function sweepOutputValue(
 	return Number(value);
 }
 
+/**
+ * Whether a sweep of an output that carries units would leave less than an
+ * output of units may hold: such a sweep needs its fee from elsewhere, and
+ * is not built until it has one. Never for an output without units.
+ */
+function auxiliarySweepNeedsFee(
+	output: ITrackedOutput,
+	sweepValue: number | null
+): boolean {
+	if (output.auxiliaryCommitmentNumber === undefined) return false;
+	if (sweepValue !== null && sweepValue >= AUXILIARY_SWEEP_OUTPUT_MINIMUM) {
+		return false;
+	}
+	output.auxiliaryFeeFunding = true;
+	return true;
+}
+
+/**
+ * Whether an output is an HTLC output of an asset channel, which is tracked
+ * and left unspent here. Never for a channel that is not an asset channel.
+ */
+function auxiliaryHtlcOutputWaits(
+	state: IChannelState,
+	output: ITrackedOutput
+): boolean {
+	return (
+		!!state.auxiliaryState &&
+		(output.outputType === OutputType.OFFERED_HTLC ||
+			output.outputType === OutputType.RECEIVED_HTLC ||
+			!!output.isSecondLevelHtlc)
+	);
+}
+
 interface ITaprootCommitKeys {
 	revocationPubkey: Buffer;
 	delayedPubkey: Buffer;
@@ -1577,7 +1668,9 @@ function matchTaprootHtlcOutput(
 	isOurs: boolean,
 	// Same one-to-one attribution as matchHtlcOutput: identical same-hash
 	// scripts must each claim a DISTINCT entry.
-	claimedKeys?: Set<string>
+	claimedKeys?: Set<string>,
+	// The asset leaf of the output, for an HTLC that carries units.
+	auxiliaryLeaf?: ITaprootAuxLeaf
 ): IHtlcMatch | null {
 	for (const [entryKey, entry] of htlcMatchOrder(state, outAmount, isOurs)) {
 		if (claimedKeys?.has(entryKey)) {
@@ -1602,14 +1695,18 @@ function matchTaprootHtlcOutput(
 					keys.revocationPubkey,
 					keys.localHtlcPubkey,
 					keys.remoteHtlcPubkey,
-					entry.paymentHash
+					entry.paymentHash,
+					undefined,
+					auxiliaryLeaf
 			  )
 			: buildTaprootReceivedHtlcOutput(
 					keys.revocationPubkey,
 					keys.localHtlcPubkey,
 					keys.remoteHtlcPubkey,
 					entry.paymentHash,
-					entry.cltvExpiry
+					entry.cltvExpiry,
+					undefined,
+					auxiliaryLeaf
 			  );
 
 		if (outScript.equals(built.output)) {
@@ -1670,6 +1767,72 @@ function classifyTaprootCommitmentOutputs(
 			status: OutputStatus.CONFIRMED,
 			confirmationHeight: 0
 		};
+
+		// An output that carries units has the asset leaf its commitment
+		// view names in its script tree, and is tracked with the number of
+		// that commitment. Never set for a channel that is not an asset
+		// channel.
+		const auxiliaryLeaf = auxiliaryOutputLeaf(
+			state,
+			isOurs,
+			commitmentNumber,
+			i
+		);
+		if (auxiliaryLeaf) {
+			const carrying = {
+				...base,
+				auxiliaryCommitmentNumber: commitmentNumber
+			};
+			if (
+				outScript.equals(
+					buildTaprootToLocalOutput(
+						keys.revocationPubkey,
+						keys.delayedPubkey,
+						keys.toSelfDelay,
+						undefined,
+						auxiliaryLeaf
+					).output
+				)
+			) {
+				outputs.push({ ...carrying, outputType: OutputType.TO_LOCAL });
+				continue;
+			}
+			if (
+				outScript.equals(
+					buildTaprootToRemoteOutput(
+						keys.paymentPubkey,
+						undefined,
+						auxiliaryLeaf
+					).output
+				)
+			) {
+				outputs.push({ ...carrying, outputType: OutputType.TO_REMOTE });
+				continue;
+			}
+			const carried = matchTaprootHtlcOutput(
+				outScript,
+				base.amount,
+				state,
+				keys,
+				isOurs,
+				claimedHtlcKeys,
+				auxiliaryLeaf
+			);
+			if (carried) {
+				outputs.push({
+					...carrying,
+					outputType:
+						carried.direction === HtlcDirection.OFFERED
+							? OutputType.OFFERED_HTLC
+							: OutputType.RECEIVED_HTLC,
+					paymentHash: carried.paymentHash,
+					htlcId: carried.htlcId,
+					cltvExpiry: carried.cltvExpiry,
+					htlcSigIndex: htlcSigCounter++
+				});
+				continue;
+			}
+		}
 
 		if (outScript.equals(toLocalSpk)) {
 			outputs.push({ ...base, outputType: OutputType.TO_LOCAL });
@@ -2175,6 +2338,10 @@ function resolveOurTaprootCommitmentOutputs(
 
 	const resolved: IResolvedOutput[] = [];
 	for (const output of trackedOutputs) {
+		if (auxiliaryHtlcOutputWaits(state, output)) {
+			resolved.push({ trackedOutput: output });
+			continue;
+		}
 		if (output.outputType === OutputType.TO_LOCAL) {
 			// A second-level-derived output uses the TaprootSecondLevelScriptTree
 			// (revocation-key internal + single delay leaf), NOT the commitment
@@ -2190,17 +2357,25 @@ function resolveOurTaprootCommitmentOutputs(
 				: buildTaprootToLocalOutput(
 						keys.revocationPubkey,
 						keys.delayedPubkey,
-						toSelfDelay
+						toSelfDelay,
+						undefined,
+						trackedAuxiliaryLeaf(state, true, output)
 				  );
 			const feeSatoshis = BigInt(
-				Math.ceil(feeRatePerVbyte * estimateSweepVbytes(output.outputType))
+				Math.ceil(
+					feeRatePerVbyte *
+						(estimateSweepVbytes(output.outputType) +
+							(output.auxiliaryCommitmentNumber !== undefined
+								? auxiliarySweepVbytes(destinationScript)
+								: 0))
+				)
 			);
 			const sweepValue = sweepOutputValue(
 				output.amount,
 				feeSatoshis,
 				destinationScript
 			);
-			if (sweepValue === null) {
+			if (auxiliarySweepNeedsFee(output, sweepValue) || sweepValue === null) {
 				// Not economical to sweep. Track it without a spend so the rest of
 				// this commitment's outputs still resolve.
 				resolved.push({ trackedOutput: output, declinedAsUneconomic: true });
@@ -2221,6 +2396,28 @@ function resolveOurTaprootCommitmentOutputs(
 				perCommitmentPoint,
 				state.localBasepoints.delayedPaymentBasepoint
 			);
+			const assets = prepareAuxiliarySweep(
+				state,
+				true,
+				sweepTx,
+				[
+					{
+						output,
+						commitmentOutputIndex: output.outputIndex,
+						kind: 'to_local_delayed',
+						privateKey: delayedPrivkey,
+						leafScript: toLocal.delay.script,
+						leafVersion: toLocal.delay.leafVersion,
+						controlBlock: toLocal.delay.controlBlock
+					}
+				],
+				destinationScript
+			);
+			if (assets.assets && !assets.ok) {
+				output.auxiliaryRefusal = assets.refusal;
+				resolved.push({ trackedOutput: output });
+				continue;
+			}
 			const sighash = sweepTx.hashForWitnessV1(
 				0,
 				[toLocal.output],
@@ -2233,7 +2430,8 @@ function resolveOurTaprootCommitmentOutputs(
 				trackedOutput: output,
 				spendTx: sweepTx,
 				witness: [sig, toLocal.delay.script, toLocal.delay.controlBlock],
-				csvDelay: toSelfDelay
+				csvDelay: toSelfDelay,
+				...(assets.assets ? { auxiliaryData: assets.data } : {})
 			});
 		} else if (output.outputType === OutputType.TO_REMOTE) {
 			// On our commitment to_remote belongs to the peer — nothing to do.
@@ -2388,6 +2586,8 @@ function resolveTheirCurrentTaprootCommitmentOutputs(
 			  )
 			: undefined;
 	const resolved: IResolvedOutput[] = [];
+	// The asset side of a spend built below, for a spend of units.
+	const auxiliaryDataOf = new Map<bitcoin.Transaction, Buffer>();
 
 	const spendLeaf = (
 		output: ITrackedOutput,
@@ -2401,7 +2601,13 @@ function resolveTheirCurrentTaprootCommitmentOutputs(
 		nSequence: number
 	): bitcoin.Transaction | null => {
 		const feeSatoshis = BigInt(
-			Math.ceil(feeRatePerVbyte * estimateSweepVbytes(output.outputType))
+			Math.ceil(
+				feeRatePerVbyte *
+					(estimateSweepVbytes(output.outputType) +
+						(output.auxiliaryCommitmentNumber !== undefined
+							? auxiliarySweepVbytes(destinationScript)
+							: 0))
+			)
 		);
 		const sweepValue = sweepOutputValue(
 			output.amount,
@@ -2409,7 +2615,9 @@ function resolveTheirCurrentTaprootCommitmentOutputs(
 			destinationScript
 		);
 		// Not economical to spend; the caller tracks the output without a spend.
-		if (sweepValue === null) return null;
+		if (auxiliarySweepNeedsFee(output, sweepValue) || sweepValue === null) {
+			return null;
+		}
 		const tx = new bitcoin.Transaction();
 		tx.version = 2;
 		tx.locktime = nLockTime;
@@ -2419,6 +2627,36 @@ function resolveTheirCurrentTaprootCommitmentOutputs(
 			nSequence
 		);
 		tx.addOutput(destinationScript, sweepValue);
+		const assets = prepareAuxiliarySweep(
+			state,
+			false,
+			tx,
+			[
+				{
+					output,
+					commitmentOutputIndex: output.outputIndex,
+					kind:
+						output.outputType === OutputType.TO_REMOTE
+							? 'to_remote'
+							: extraWitness.length
+							? 'htlc_success'
+							: 'htlc_timeout',
+					privateKey: privkey,
+					leafScript,
+					leafVersion,
+					controlBlock,
+					...(extraWitness.length ? { preimage: extraWitness[0] } : {})
+				}
+			],
+			destinationScript
+		);
+		if (assets.assets) {
+			if (!assets.ok) {
+				output.auxiliaryRefusal = assets.refusal;
+				return null;
+			}
+			auxiliaryDataOf.set(tx, assets.data);
+		}
 		const sighash = tx.hashForWitnessV1(
 			0,
 			[spk],
@@ -2432,13 +2670,19 @@ function resolveTheirCurrentTaprootCommitmentOutputs(
 	};
 
 	for (const output of trackedOutputs) {
+		if (auxiliaryHtlcOutputWaits(state, output)) {
+			resolved.push({ trackedOutput: output });
+			continue;
+		}
 		if (output.outputType === OutputType.TO_REMOTE) {
 			// Static key: identical to keys.paymentPubkey when keys are derivable,
 			// but also available on an SCB-recovery state (paymentPrivkey is its
 			// secret in both cases - the monitor supplies the per-channel
 			// paymentBasepointSecret located by the SCB's channelKeyIndex).
 			const tr = buildTaprootToRemoteOutput(
-				state.localBasepoints.paymentBasepoint
+				state.localBasepoints.paymentBasepoint,
+				undefined,
+				trackedAuxiliaryLeaf(state, false, output)
 			);
 			const tx = spendLeaf(
 				output,
@@ -2454,7 +2698,7 @@ function resolveTheirCurrentTaprootCommitmentOutputs(
 			if (!tx) {
 				resolved.push({
 					trackedOutput: output,
-					declinedAsUneconomic: true
+					declinedAsUneconomic: !output.auxiliaryRefusal
 				});
 				continue;
 			}
@@ -2462,7 +2706,10 @@ function resolveTheirCurrentTaprootCommitmentOutputs(
 				trackedOutput: output,
 				spendTx: tx,
 				witness: tx.ins[0].witness,
-				csvDelay: 1
+				csvDelay: 1,
+				...(auxiliaryDataOf.has(tx)
+					? { auxiliaryData: auxiliaryDataOf.get(tx) }
+					: {})
 			});
 		} else if (output.outputType === OutputType.TO_LOCAL) {
 			// Their to_local — not ours unless revoked (handled elsewhere).
