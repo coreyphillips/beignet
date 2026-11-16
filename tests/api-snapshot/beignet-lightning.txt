@@ -1012,7 +1012,7 @@ function chain.selectTheirPerCommitmentPoint(tx: bitcoinjs-lib#Transaction, stat
 function chain.signP2wpkhInput(tx: bitcoinjs-lib#Transaction, inputIndex: number, pubkey: Buffer, value: number, privateKey: Buffer): Buffer
 function chain.signSweepInput(tx: bitcoinjs-lib#Transaction, inputIndex: number, witnessScript: Buffer, value: number, privateKey: Buffer, sighashType?: number): Buffer
 namespace channel
-const channel.AUXILIARY_CHANNELS_API: Readonly<{ version: 1; surfaces: readonly [ "valueIncomingHtlc:three-outcome", "sendPaymentToRoute:assetPayment", "getAuxiliaryPaymentHtlcs", "onHtlcResolved:htlcId", "queryAuxiliaryRoute", "fundAuxiliaryChannel:unsigned", "onFundingSigned", "abandonAuxiliaryOpen", "IChannelInfo.auxiliary", "setAuxiliaryPaymentGate", "getChannelMonitorState", "IPaymentInfo.auxiliary", "IPaymentInfo.auxiliaryValueMsat", "IInvoiceInfo.auxiliary", "IAuxiliaryChannelInfo.undeliveredOutcomes", "onHtlcResolved:never-sent" ]; }>
+const channel.AUXILIARY_CHANNELS_API: Readonly<{ version: 1; surfaces: readonly [ "valueIncomingHtlc:three-outcome", "sendPaymentToRoute:assetPayment", "getAuxiliaryPaymentHtlcs", "onHtlcResolved:htlcId", "queryAuxiliaryRoute", "fundAuxiliaryChannel:unsigned", "onFundingSigned", "abandonAuxiliaryOpen", "IChannelInfo.auxiliary", "setAuxiliaryPaymentGate", "getChannelMonitorState", "IPaymentInfo.auxiliary", "IPaymentInfo.auxiliaryValueMsat", "IInvoiceInfo.auxiliary", "IAuxiliaryChannelInfo.undeliveredOutcomes", "onHtlcResolved:never-sent", "getFixedOutputFeeStatus" ]; }>
 const channel.AUXILIARY_CHANNEL_DUST_LIMIT = 354n
 const channel.AUXILIARY_CLOSE_ASSET_OUTPUT_MINIMUM = 330n
 class channel.AuxiliaryChannelUnsupportedError extends beignet#CodedError<'ASSET_CHANNEL_UNSUPPORTED'>

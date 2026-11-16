@@ -47,7 +47,10 @@ export const AUXILIARY_CHANNELS_API = Object.freeze({
 		'IAuxiliaryChannelInfo.undeliveredOutcomes',
 		// onHtlcResolved also reports, with the outcome 'never-sent', a part
 		// of an outgoing asset payment whose HTLC never entered its channel.
-		'onHtlcResolved:never-sent'
+		'onHtlcResolved:never-sent',
+		// The node answers the state of its wallet's fee coin pool, and says
+		// when a fee policy was refused and there is none.
+		'getFixedOutputFeeStatus'
 	] as const)
 });
 
