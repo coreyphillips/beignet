@@ -5796,6 +5796,30 @@ export function getOpenApiSpec(): Record<string, unknown> {
 							type: 'string',
 							description: 'Why it failed, when state is failed'
 						},
+						fixedOutputFees: {
+							type: 'object',
+							description:
+								'Present only when the wallet refused the fee policy the extension supplied with its asset channel provider: the node holds the provider and has no fee coin pool, so it opens and accepts no asset channel and whatever needs a fee coin fails with this error',
+							required: ['available', 'error'],
+							properties: {
+								available: { type: 'boolean', enum: [false] },
+								error: {
+									type: 'object',
+									required: ['code', 'remedy', 'message'],
+									properties: {
+										code: {
+											type: 'string',
+											description: 'FEE_POLICY_REFUSED'
+										},
+										remedy: {
+											type: 'string',
+											description: 'operator'
+										},
+										message: { type: 'string' }
+									}
+								}
+							}
+						},
 						routes: {
 							type: 'array',
 							items: {

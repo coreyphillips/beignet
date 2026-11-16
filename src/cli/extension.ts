@@ -255,6 +255,20 @@ export interface IExtensionInfo {
 	events: string[];
 	/** The attachment's status(), when it has one and is running. */
 	status?: unknown;
+	/**
+	 * Present only when the wallet refused the fee policy the extension
+	 * supplied with its asset channel provider. The node holds the provider
+	 * and has no fee coin pool: it opens and accepts no asset channel, and
+	 * whatever needs a fee coin fails with this error.
+	 */
+	fixedOutputFees?: IExtensionFeePoolUnavailable;
+}
+
+/** The fee coin pool of an extension's node is unavailable, and why. */
+export interface IExtensionFeePoolUnavailable {
+	available: false;
+	/** The code and remedy of the engine's FixedOutputFeeError. */
+	error: { code: string; remedy: string; message: string };
 }
 
 /**
@@ -623,6 +637,8 @@ interface IExtensionSlot {
 	 * unset for an attachment that names none of the three members.
 	 */
 	nodeMembers?: IExtensionNodeMembers;
+	/** Why the wallet refused the fee policy of the current generation. */
+	feePolicyRefusal?: IExtensionFeePoolUnavailable['error'];
 	/**
 	 * An attachment whose start() threw while the node holds its asset
 	 * channel provider: failed, and kept unstopped with its storage open
@@ -746,6 +762,7 @@ export class ExtensionHost {
 			slot.error = undefined;
 			slot.attachment = undefined;
 			slot.nodeMembers = undefined;
+			slot.feePolicyRefusal = undefined;
 			slot.handlers = new Map();
 			const view = extensionStorageView(extension.id, build.storage);
 			let open = true;
@@ -849,14 +866,23 @@ export class ExtensionHost {
 	}
 
 	/**
-	 * The node cannot use what extension `id` supplied for it (the wallet
-	 * refused its fee policy). Called before the node is built: the
-	 * extension is failed and stopped like one whose attach() threw, and the
-	 * node is built without it.
+	 * The wallet refused the fee policy extension `id` supplied. Called
+	 * before the node is built. The extension is kept, and its provider with
+	 * it, so a wallet that holds asset channels starts: GET /extensions says
+	 * that its fee coin pool is unavailable, and why, until the next build.
 	 */
-	refuseSupply(id: string, err: unknown): void {
+	feePolicyRefused(
+		id: string,
+		error: IExtensionFeePoolUnavailable['error']
+	): void {
 		const slot = this.slots.find((s) => s.extension.id === id);
-		if (slot && slot.state === 'attached') this.drop(slot, 'attach', err);
+		if (slot && slot.state === 'attached') {
+			slot.feePolicyRefusal = {
+				code: error.code,
+				remedy: error.remedy,
+				message: error.message
+			};
+		}
 	}
 
 	/**
@@ -1182,6 +1208,12 @@ export class ExtensionHost {
 				)
 			};
 			if (slot.error !== undefined) info.error = slot.error;
+			if (slot.feePolicyRefusal !== undefined) {
+				info.fixedOutputFees = {
+					available: false,
+					error: { ...slot.feePolicyRefusal }
+				};
+			}
 			if (this.isRunning(slot) && slot.attachment?.status) {
 				try {
 					// Through JSON here, where a value that does not serialize (a

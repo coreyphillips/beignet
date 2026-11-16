@@ -27,6 +27,10 @@ import type { IChannelAuxiliaryState } from '../../src/lightning/channel/auxilia
 import type { IAuxiliaryChannelConfig } from '../../src/lightning/channel/auxiliary-funding';
 import { LightningNode } from '../../src/lightning/node/lightning-node';
 import type { IFundingProvider } from '../../src/lightning/node/types';
+import {
+	FixedOutputFeeError,
+	IFixedOutputFeePoolUnavailable
+} from '../../src/lightning/wallet/fixed-output-fees';
 import { MemoryStorage } from '../../src/lightning/storage/memory-storage';
 import { SqliteStorage } from '../../src/lightning/storage/sqlite-storage';
 import {
@@ -371,11 +375,12 @@ describe('host extensions: the members that reach the node, in the host', () => 
 		});
 	}
 
-	it('drops a supply the node refuses, as if attach had thrown', async () => {
+	it('keeps an extension whose fee policy the wallet refused, with its supply, and says its fee coin pool is unavailable until the next build', async () => {
 		let stops = 0;
+		const given = auxiliaryChannels();
 		const h = host([
 			extension('assets', () => ({
-				auxiliaryChannels: auxiliaryChannels(),
+				auxiliaryChannels: given,
 				fixedOutputFees: FEES,
 				stop: (): void => {
 					stops++;
@@ -383,12 +388,27 @@ describe('host extensions: the members that reach the node, in the host', () => 
 			}))
 		]);
 		await h.attach(build());
-		h.refuseSupply('assets', new Error('fixedOutputFees: too small'));
-		expect(only(h).state).to.equal('failed');
-		expect(only(h).error).to.equal('attach: fixedOutputFees: too small');
-		expect(h.auxiliarySupply()).to.equal(undefined);
+		expect(only(h)).to.not.have.property('fixedOutputFees');
+		const refusal = {
+			code: 'FEE_POLICY_REFUSED',
+			remedy: 'operator',
+			message: 'too small'
+		};
+		h.feePolicyRefused('assets', refusal);
+		// An extension the host does not hold is not an error.
+		h.feePolicyRefused('tokens', refusal);
+		expect(only(h).state).to.equal('attached');
+		expect(only(h)).to.not.have.property('error');
+		expect(only(h).fixedOutputFees).to.deep.equal({
+			available: false,
+			error: refusal
+		});
+		expect(h.auxiliarySupply()?.auxiliaryChannels).to.equal(given);
+		expect(stops).to.equal(0);
+		// The next build asks the wallet again.
+		await h.attach(build());
+		expect(only(h)).to.not.have.property('fixedOutputFees');
 		await h.shutdown();
-		expect(stops).to.equal(1);
 	});
 });
 
@@ -566,19 +586,93 @@ describe('host extensions: the members that reach the node, in a node', function
 		}
 	});
 
-	it('builds the node without the provider of an extension whose fee policy the wallet refuses', async () => {
+	/** What a build whose fee policy the wallet refused is expected to say. */
+	const expectPoolUnavailable = async (
+		node: BeignetNode,
+		given: IAuxiliaryChannelConfig,
+		reason: RegExp
+	): Promise<FixedOutputFeeError> => {
+		// The node was built with the provider, and the extension runs.
+		expect(built[0].options.auxiliaryChannels).to.equal(given);
+		expect(built[0].node).to.have.property('auxiliaryChannels', given);
+		const provider = fundingProviderOf();
+		expect(provider.supportsFixedOutputFees?.()).to.equal(false);
+		expect(provider.getFixedOutputFeeBudget?.()).to.equal(undefined);
+		const status = built[0].node!.getFixedOutputFeeStatus();
+		expect(status?.available).to.equal(false);
+		const error = (status as IFixedOutputFeePoolUnavailable).error;
+		expect(error).to.be.instanceOf(FixedOutputFeeError);
+		expect(error.code).to.equal('FEE_POLICY_REFUSED');
+		expect(error.remedy).to.equal('operator');
+		expect(error.message).to.match(
+			/^The wallet refused the fixed-output fee policy of extension "assets": /
+		);
+		expect(error.message).to.match(reason);
+		// Whatever needs a fee coin ends with that error, and so does a new
+		// asset channel.
+		let selection: unknown;
+		try {
+			await provider.selectFeeBumpInputs!(500n, 250, {
+				fixedOutputs: true,
+				feeActionId: 'asset-htlc:channel:original:0'
+			});
+		} catch (err) {
+			selection = err;
+		}
+		expect(selection).to.equal(error);
+		let opening: unknown;
+		try {
+			built[0].node!.openAuxiliaryChannel('02' + '11'.repeat(32), 100_000n, {
+				temporaryChannelId: Buffer.alloc(32, 7),
+				fundingTaprootMerkleRoot: Buffer.alloc(32, 0xa7),
+				channelData: Buffer.from('proposed asset funding'),
+				localBalance: 900n,
+				remoteBalance: 100n
+			});
+		} catch (err) {
+			opening = err;
+		}
+		expect(opening).to.equal(error);
+		const info = infoOf(node);
+		expect(info.state).to.equal('ready');
+		expect(info).to.not.have.property('error');
+		expect(info.fixedOutputFees).to.deep.equal({
+			available: false,
+			error: {
+				code: 'FEE_POLICY_REFUSED',
+				remedy: 'operator',
+				message: error.message
+			}
+		});
+		return error;
+	};
+
+	it('keeps the provider of an extension whose fee policy the wallet refuses, and reports its fee coin pool unavailable by a typed error', async () => {
+		const given = auxiliaryChannels();
 		const node = await boot([
 			extension('assets', () => ({
-				auxiliaryChannels: auxiliaryChannels(),
+				auxiliaryChannels: given,
 				// A split into no coins is not a policy.
 				fixedOutputFees: { ...FEES, feeCoinCount: 0 }
 			}))
 		]);
-		expect(built[0].options).to.not.have.property('auxiliaryChannels');
-		expect(fundingProviderOf().supportsFixedOutputFees?.()).to.equal(false);
-		const info = infoOf(node);
-		expect(info.state).to.equal('failed');
-		expect(info.error).to.match(/^attach: fixedOutputFees: /);
+		await expectPoolUnavailable(node, given, /durable bounded policy/);
+	});
+
+	it('says nothing of a fee coin pool for an extension whose policy the wallet took, or that supplied none', async () => {
+		const taken = await boot([
+			extension('assets', () => ({
+				auxiliaryChannels: auxiliaryChannels(),
+				fixedOutputFees: FEES
+			}))
+		]);
+		expect(infoOf(taken)).to.not.have.property('fixedOutputFees');
+		expect(built[0].node!.getFixedOutputFeeStatus()?.available).to.equal(true);
+		const none = await boot([
+			extension('assets', () => ({ auxiliaryChannels: auxiliaryChannels() }))
+		]);
+		expect(infoOf(none)).to.not.have.property('fixedOutputFees');
+		expect(built[1].node!.getFixedOutputFeeStatus()).to.equal(undefined);
 	});
 
 	it("hands the wallet the extension's bound on a wallet call with the rest of its fee policy", async () => {
@@ -593,14 +687,15 @@ describe('host extensions: the members that reach the node, in a node', function
 	});
 
 	it('has the wallet refuse a bound on a wallet call that is not a time', async () => {
+		const given = auxiliaryChannels();
 		const node = await boot([
 			extension('assets', () => ({
-				auxiliaryChannels: auxiliaryChannels(),
+				auxiliaryChannels: given,
 				fixedOutputFees: { ...FEES, walletCallTimeoutMs: 0 }
 			}))
 		]);
 		// The wallet saw the bound: it is what it refused.
-		expect(infoOf(node).error).to.match(/^attach: fixedOutputFees: /);
+		await expectPoolUnavailable(node, given, /durable bounded policy/);
 	});
 
 	describe('with an asset channel in the database', () => {
@@ -722,18 +817,37 @@ describe('host extensions: the members that reach the node, in a node', function
 			const refusal = await refusalOf(
 				boot(
 					[
-						watching('assets', () => ({
-							auxiliaryChannels: auxiliaryChannels(),
-							fixedOutputFees: { ...FEES, feeCoinCount: 0 }
-						}))
+						watching('assets', () => {
+							throw new Error('the asset service is down');
+						})
 					],
 					storage
 				)
 			);
 			expect(refusal.code).to.equal('ASSET_PROVIDER_REQUIRED');
 			expect(refusal.message).to.match(
-				/Start it with the extension that opened them\. Extension "assets" failed: attach: fixedOutputFees: /
+				/Start it with the extension that opened them\. Extension "assets" failed: attach: the asset service is down\./
 			);
+		});
+
+		it('starts a wallet with stored asset channels whose fee policy the wallet refuses: the provider is kept, the channel is restored and the fee coin pool is unavailable', async () => {
+			const { storage, id } = storageWithAssetChannel();
+			const given = auxiliaryChannels();
+			const node = await boot(
+				[
+					watching('assets', () => ({
+						auxiliaryChannels: given,
+						fixedOutputFees: { ...FEES, feeCoinCount: 0 }
+					}))
+				],
+				storage
+			);
+			await node.extensionHost?.started;
+			await expectPoolUnavailable(node, given, /./);
+			// The stored asset channel is the node's again, with the provider.
+			expect(
+				built[0].node?.getAuxiliaryChannelInfo(Buffer.from(id, 'hex'))
+			).to.not.equal(undefined);
 		});
 	});
 

@@ -842,13 +842,13 @@ method ExtensionHost.bindNode(node: beignet/lightning#node.LightningNode, provid
 method ExtensionHost.binds(): boolean
 method ExtensionHost.describe(): IExtensionInfo[]
 get ExtensionHost.extensions(): readonly IBeignetExtension[]
+method ExtensionHost.feePolicyRefused(id: string, error: IExtensionFeePoolUnavailable['error']): void
 method ExtensionHost.fenceForRebuild(): void
 method ExtensionHost.finishShutdown(limitMs?: number): Promise<void>
 method ExtensionHost.handler(id: string, key: string): ExtensionHandler
 method ExtensionHost.holdWrites(): () => void
 method ExtensionHost.keepUntilDrained(id: string | undefined): void
 method ExtensionHost.onEvent(listener: ExtensionEventListener): () => void
-method ExtensionHost.refuseSupply(id: string, err: unknown): void
 method ExtensionHost.shutdown(limitMs?: number): Promise<void>
 method ExtensionHost.start(): Promise<void>
 method ExtensionHost.startInBackground(): void
@@ -1008,6 +1008,9 @@ property IExtensionContext.logger: beignet#ILogger
 property IExtensionContext.network: ExtensionNetwork
 property IExtensionContext.storage: IExtensionStorage
 property IExtensionContext.wallet: beignet#Wallet
+unexported interface IExtensionFeePoolUnavailable
+property IExtensionFeePoolUnavailable.available: false
+property IExtensionFeePoolUnavailable.error: { code: string; remedy: string; message: string; }
 unexported interface IExtensionHostOptions
 property IExtensionHostOptions.attachTimeoutMs?: number
 property IExtensionHostOptions.engineVersion: string
@@ -1016,6 +1019,7 @@ property IExtensionHostOptions.stopTimeoutMs?: number
 interface IExtensionInfo
 property IExtensionInfo.error?: string
 property IExtensionInfo.events: string[]
+property IExtensionInfo.fixedOutputFees?: IExtensionFeePoolUnavailable
 property IExtensionInfo.generation: number
 property IExtensionInfo.id: string
 property IExtensionInfo.routes: Array<{ method: ExtensionMethod; path: string; scopes: string[]; idempotent: boolean; }>

@@ -142,6 +142,7 @@ import type { ILightningError, IPaymentInfo } from '../lightning/node/types';
 import type { IInvoiceInfo } from '../lightning/storage/types';
 import type { IPeerTransportOptions } from '../lightning/transport/duplex-transport';
 import { normalizeHexPubkey } from '../lightning/validation';
+import { FixedOutputFeeError } from '../lightning/wallet/fixed-output-fees';
 import { WalletFundingProvider } from '../lightning/wallet/wallet-funding-provider';
 import type {
 	IStoredPaymentRef,
@@ -3332,52 +3333,52 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	 * extension that supplies asset channels, it also prepares the fee coins
 	 * of their fixed-output transactions, journalled in the node's own
 	 * database under the wallet's identity. A policy the wallet refuses
-	 * fails that extension: the provider is built as it always was, and the
-	 * answer says the supply is not to be used.
+	 * leaves the extension and its provider in place, so a wallet that holds
+	 * asset channels starts: the provider is an ordinary one that reports
+	 * its fee coin pool unavailable, by the typed error everything that
+	 * needs a fee coin then fails with, and the node opens and accepts no
+	 * asset channel while it is.
 	 */
 	private walletFundingProvider(
 		supply: IExtensionAuxiliarySupply | undefined
-	): {
-		fundingProvider: WalletFundingProvider;
-		refused: boolean;
-	} {
+	): WalletFundingProvider {
 		const fees: ExtensionFixedOutputFees | undefined = supply?.fixedOutputFees;
 		if (supply === undefined || fees === undefined) {
-			return {
-				fundingProvider: new WalletFundingProvider(this.wallet),
-				refused: false
-			};
+			return new WalletFundingProvider(this.wallet);
 		}
 		try {
-			return {
-				fundingProvider: new WalletFundingProvider(this.wallet, {
-					fixedOutputFees: {
-						storage: this.storage,
-						maxFeeSatoshis: fees.maxFeeSatoshis,
-						maxTotalFeeSatoshis: fees.maxTotalFeeSatoshis,
-						maxPreparationFeeSatoshis: fees.maxPreparationFeeSatoshis,
-						...(fees.feeCoinCount !== undefined
-							? { feeCoinCount: fees.feeCoinCount }
-							: {}),
-						...(fees.preparationFeeRatePerVbyte !== undefined
-							? { preparationFeeRatePerVbyte: fees.preparationFeeRatePerVbyte }
-							: {}),
-						...(fees.walletCallTimeoutMs !== undefined
-							? { walletCallTimeoutMs: fees.walletCallTimeoutMs }
-							: {})
-					}
-				}),
-				refused: false
-			};
+			return new WalletFundingProvider(this.wallet, {
+				fixedOutputFees: {
+					storage: this.storage,
+					maxFeeSatoshis: fees.maxFeeSatoshis,
+					maxTotalFeeSatoshis: fees.maxTotalFeeSatoshis,
+					maxPreparationFeeSatoshis: fees.maxPreparationFeeSatoshis,
+					...(fees.feeCoinCount !== undefined
+						? { feeCoinCount: fees.feeCoinCount }
+						: {}),
+					...(fees.preparationFeeRatePerVbyte !== undefined
+						? { preparationFeeRatePerVbyte: fees.preparationFeeRatePerVbyte }
+						: {}),
+					...(fees.walletCallTimeoutMs !== undefined
+						? { walletCallTimeoutMs: fees.walletCallTimeoutMs }
+						: {})
+				}
+			});
 		} catch (err) {
-			this._extensionHost?.refuseSupply(
-				supply.id,
-				new Error(`fixedOutputFees: ${(err as Error).message}`)
+			const refusal = new FixedOutputFeeError(
+				'FEE_POLICY_REFUSED',
+				'operator',
+				'The wallet refused the fixed-output fee policy of extension ' +
+					`"${supply.id}": ${(err as Error).message}`
 			);
-			return {
-				fundingProvider: new WalletFundingProvider(this.wallet),
-				refused: true
-			};
+			this._extensionHost?.feePolicyRefused(supply.id, refusal);
+			this.log('warn', refusal.message, {
+				extension: supply.id,
+				code: refusal.code
+			});
+			return new WalletFundingProvider(this.wallet, {
+				fixedOutputFeeRefusal: refusal
+			});
 		}
 	}
 
@@ -3522,8 +3523,8 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 		const supplied = this._extensionHost?.auxiliarySupply();
 
 		// 4. Create funding provider from wallet
-		const { fundingProvider, refused } = this.walletFundingProvider(supplied);
-		const auxiliary = refused ? undefined : supplied;
+		const fundingProvider = this.walletFundingProvider(supplied);
+		const auxiliary = supplied;
 		// Kept for a restore this process runs later: it is refused when it
 		// holds asset channels this provider does not say it can restore.
 		this._restoreAuxiliaryChannels = auxiliary?.auxiliaryChannels;
