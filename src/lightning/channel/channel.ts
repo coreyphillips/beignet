@@ -3967,6 +3967,16 @@ export class Channel {
 		if (!auxiliary) return;
 		const offered = entry.direction === HtlcDirection.OFFERED;
 		const provider = requireAuxiliaryProvider(this._state);
+		if (
+			!offered &&
+			(auxiliary.resolvedHtlcs?.size ?? 0) >
+				Channel.AUXILIARY_MAX_UNDELIVERED_OUTCOMES
+		) {
+			// The host is not taking the outcomes of this channel's asset
+			// HTLCs. The peer's next one is admitted, so that both
+			// commitments agree, and is failed back once it is committed.
+			entry.auxiliaryRefused = true;
+		}
 		try {
 			provider.validateHtlc(this._state, entry);
 		} catch (err) {
@@ -4057,6 +4067,13 @@ export class Channel {
 	}
 
 	/**
+	 * Asset channels: with more outcomes than this that the host has not
+	 * taken (onHtlcResolved), the channel takes no further asset HTLC. The
+	 * row then grows no more, however many HTLCs the peer offers.
+	 */
+	static readonly AUXILIARY_MAX_UNDELIVERED_OUTCOMES = 1000;
+
+	/**
 	 * Keep the outcome of an asset HTLC that has left the channel, in the
 	 * channel's own row, until the host has been told (onHtlcResolved).
 	 */
@@ -4064,6 +4081,16 @@ export class Channel {
 		const auxiliary = this._state.auxiliaryState;
 		if (!auxiliary || entry.auxiliaryAmount === undefined) return;
 		auxiliary.resolvedHtlcs ??= new Map();
+		// A received HTLC that was refused while the host is not taking
+		// outcomes was never put to the host and leaves none, so the peer
+		// cannot grow the row past the bound.
+		if (
+			entry.auxiliaryRefused === true &&
+			entry.direction === HtlcDirection.RECEIVED &&
+			auxiliary.resolvedHtlcs.size > Channel.AUXILIARY_MAX_UNDELIVERED_OUTCOMES
+		) {
+			return;
+		}
 		auxiliary.resolvedHtlcs.set(`${entry.direction}:${entry.id}`, {
 			htlcId: entry.id,
 			direction: entry.direction,

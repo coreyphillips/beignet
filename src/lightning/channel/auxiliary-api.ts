@@ -41,7 +41,10 @@ export const AUXILIARY_CHANNELS_API = Object.freeze({
 		'IPaymentInfo.auxiliaryValueMsat',
 		// An invoice paid by asset HTLCs has auxiliary: true, in its record
 		// and in its invoice:settled event.
-		'IInvoiceInfo.auxiliary'
+		'IInvoiceInfo.auxiliary',
+		// How many outcomes of a channel's asset HTLCs its host has not
+		// taken, beside the channel's other figures.
+		'IAuxiliaryChannelInfo.undeliveredOutcomes'
 	] as const)
 });
 

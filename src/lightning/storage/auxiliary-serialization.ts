@@ -85,6 +85,19 @@ function unsigned(value: string, maximum = 0xffffffffffffffffn): bigint {
 		throw new Error('Serialized asset integer is out of range');
 	return result;
 }
+/**
+ * A list of pairs as it is read from disk. Anything else in its place is
+ * refused by name, before a reader takes it apart.
+ */
+function pairs<T extends unknown[]>(value: T[], what: string): T[] {
+	if (
+		!Array.isArray(value) ||
+		value.some((entry) => !Array.isArray(entry) || entry.length !== 2)
+	) {
+		throw new Error(`Malformed serialized asset ${what}`);
+	}
+	return value;
+}
 function uniqueMap<K, V>(entries: Array<[K, V]>): Map<K, V> {
 	const result = new Map(entries);
 	if (result.size !== entries.length)
@@ -129,7 +142,10 @@ export function deserializeCustomRecords(
 		throw new Error('Malformed serialized custom records');
 	}
 	const result = new Map(
-		records.map(([type, value]) => [unsigned(type), bytes(value)])
+		pairs(records, 'custom records').map(([type, value]) => [
+			unsigned(type),
+			bytes(value)
+		])
 	);
 	if (result.size !== records.length)
 		throw new Error('Duplicate serialized custom record');
@@ -221,24 +237,24 @@ const decodeCommitment = (
 	...(value.htlcOutputIndexes !== undefined
 		? {
 				htlcOutputIndexes: uniqueMap(
-					value.htlcOutputIndexes.map(([id, index]): [string, number] => [
-						htlcKey(id),
-						outputIndex(index)
-					])
+					pairs(value.htlcOutputIndexes, 'HTLC output indexes').map(
+						([id, index]): [string, number] => [htlcKey(id), outputIndex(index)]
+					)
 				)
 		  }
 		: {}),
 	outputLeaves: uniqueMap(
-		value.outputLeaves.map(([index, item]): [number, ITaprootAuxLeaf] => [
-			outputIndex(index),
-			decodeLeaf(item)
-		])
+		pairs(value.outputLeaves, 'output leaves').map(
+			([index, item]): [number, ITaprootAuxLeaf] => [
+				outputIndex(index),
+				decodeLeaf(item)
+			]
+		)
 	),
 	secondLevelLeaves: uniqueMap(
-		value.secondLevelLeaves.map(([id, item]): [string, ITaprootAuxLeaf] => [
-			htlcKey(id),
-			decodeLeaf(item)
-		])
+		pairs(value.secondLevelLeaves, 'second level leaves').map(
+			([id, item]): [string, ITaprootAuxLeaf] => [htlcKey(id), decodeLeaf(item)]
+		)
 	),
 	...(value.peerSignatures !== undefined
 		? { peerSignatures: deserializeCustomRecords(value.peerSignatures) }
@@ -390,19 +406,20 @@ export function deserializeAuxiliaryState(
 		...(state.childRevocationBasepoints !== undefined
 			? {
 					childRevocationBasepoints: uniqueMap(
-						state.childRevocationBasepoints.map(
-							([id, point]): [string, Buffer] => [
-								childTxid(id),
-								childPoint(point)
-							]
-						)
+						pairs(
+							state.childRevocationBasepoints,
+							'child revocation basepoints'
+						).map(([id, point]): [string, Buffer] => [
+							childTxid(id),
+							childPoint(point)
+						])
 					)
 			  }
 			: {}),
 		...(state.resolvedHtlcs !== undefined
 			? {
 					resolvedHtlcs: uniqueMap(
-						state.resolvedHtlcs.map(
+						pairs(state.resolvedHtlcs, 'HTLC outcomes').map(
 							([key, value]): [string, IAuxiliaryHtlcResolution] => {
 								const htlcId = unsigned(value.htlcId);
 								const auxiliaryAmount = unsigned(value.auxiliaryAmount);
@@ -455,11 +472,13 @@ export function deserializeAuxiliaryState(
 		...(state.closeTransactions !== undefined
 			? {
 					closeTransactions: uniqueMap(
-						state.closeTransactions.map(([txid, data]): [string, Buffer] => {
-							if (!/^[a-f0-9]{64}$/.test(txid))
-								throw new Error('Malformed serialized asset close identity');
-							return [txid, bytes(data)];
-						})
+						pairs(state.closeTransactions, 'close transactions').map(
+							([txid, data]): [string, Buffer] => {
+								if (!/^[a-f0-9]{64}$/.test(txid))
+									throw new Error('Malformed serialized asset close identity');
+								return [txid, bytes(data)];
+							}
+						)
 					)
 			  }
 			: {}),
@@ -470,7 +489,7 @@ export function deserializeAuxiliaryState(
 			? { fundingSignedDelivered: delivered(state.fundingSignedDelivered) }
 			: {}),
 		localCommitments: uniqueMap(
-			state.localCommitments.map(
+			pairs(state.localCommitments, 'commitments').map(
 				([number, value]): [bigint, IAuxiliaryCommitmentData] => [
 					unsigned(number, 0xffffffffffffn),
 					decodeCommitment(value)
@@ -478,7 +497,7 @@ export function deserializeAuxiliaryState(
 			)
 		),
 		remoteCommitments: uniqueMap(
-			state.remoteCommitments.map(
+			pairs(state.remoteCommitments, 'commitments').map(
 				([number, value]): [bigint, IAuxiliaryCommitmentData] => [
 					unsigned(number, 0xffffffffffffn),
 					decodeCommitment(value)

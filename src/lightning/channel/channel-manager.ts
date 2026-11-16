@@ -2360,6 +2360,9 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 	>();
 	/** The interval the retry attempts of one asset channel are counted in. */
 	static readonly AUXILIARY_RETRY_INTERVAL_MS = 60_000;
+	/** See Channel.AUXILIARY_MAX_UNDELIVERED_OUTCOMES. */
+	static readonly AUXILIARY_MAX_UNDELIVERED_OUTCOMES =
+		Channel.AUXILIARY_MAX_UNDELIVERED_OUTCOMES;
 	/** The most retry attempts made on one asset channel per interval. */
 	static readonly AUXILIARY_RETRY_ATTEMPTS_PER_INTERVAL = 3;
 
@@ -3546,7 +3549,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			}
 			this.channels.set(channelId.toString('hex'), channel);
 			this.channelPeers.set(channelId.toString('hex'), peerPubkey);
-			this._notifyAuxiliaryResolutions(channel);
+			this._notifyAuxiliaryResolutions(channel, { deferWrite: true });
 			// A row exists only from funding_signed on: an asset opening that
 			// is restored is irrevocable, and a host that was never told, or
 			// whose callback threw, is told now. The mark rides the next
@@ -11789,8 +11792,17 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 	 * is delivered again; the callback is idempotent by contract. Called
 	 * once the write that holds the outcome has committed, so never inside
 	 * a storage transaction, and again when the channel is restored.
+	 *
+	 * What the host has taken leaves the row with a write of its own, made
+	 * at once (after the restore, when called from it), so a restart does
+	 * not deliver it again. A host that throws is told again at the next
+	 * pass: one line says so for a pass, with the number of outcomes held,
+	 * and a pass stops after a few refusals.
 	 */
-	private _notifyAuxiliaryResolutions(channel: Channel): void {
+	private _notifyAuxiliaryResolutions(
+		channel: Channel,
+		options: { deferWrite?: boolean } = {}
+	): void {
 		const callback = this.config.auxiliaryChannels?.onHtlcResolved;
 		const state = channel.getFullState();
 		const channelId = channel.getChannelId();
@@ -11803,24 +11815,54 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			records.clear();
 			return;
 		}
+		let delivered = 0;
+		let refused = 0;
+		let firstRefusal = '';
 		for (const [key, resolution] of [...records]) {
 			const identity = `${channelId.toString('hex')}:${key}`;
 			if (this._auxiliaryResolutionsInFlight.has(identity)) continue;
 			this._auxiliaryResolutionsInFlight.add(identity);
 			try {
 				callback({ ...resolution, state, channelId, peerPubkey });
-				if (records.get(key) === resolution) records.delete(key);
+				if (records.get(key) === resolution) {
+					records.delete(key);
+					delivered++;
+				}
 			} catch (error) {
-				this.emitContained(
-					'error',
-					channelId,
-					`Asset resolution callback failed (channel ${channelId.toString(
-						'hex'
-					)}): ${error instanceof Error ? error.message : String(error)}`
-				);
+				if (refused++ === 0) {
+					firstRefusal = error instanceof Error ? error.message : String(error);
+				}
 			} finally {
 				this._auxiliaryResolutionsInFlight.delete(identity);
 			}
+			// A host that keeps throwing is not asked for every outcome it
+			// holds at every write of the channel.
+			if (refused >= 8) break;
+		}
+		if (refused > 0) {
+			this.emitContained(
+				'error',
+				channelId,
+				`Asset resolution callback failed (channel ${channelId.toString(
+					'hex'
+				)}): ${firstRefusal}; ${
+					records.size
+				} outcome(s) of the channel are held undelivered`
+			);
+		}
+		if (delivered > 0) {
+			const hex = channelId.toString('hex');
+			const write = (): void => {
+				try {
+					if (this.channels.get(hex) !== channel) return;
+					this.persistence.persist({ channel, peerPubkey, channelId });
+				} catch {
+					// The removal rides the next write of the channel; a restart
+					// before one delivers the outcome again, as the contract allows.
+				}
+			};
+			if (options.deferWrite === true) setImmediate(write);
+			else write();
 		}
 	}
 

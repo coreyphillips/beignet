@@ -19230,6 +19230,16 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 					);
 				}
 			}
+			const undelivered =
+				this.channelManager.getChannel(assetPayment.channelId)?.getFullState()
+					.auxiliaryState?.resolvedHtlcs?.size ?? 0;
+			if (undelivered > ChannelManager.AUXILIARY_MAX_UNDELIVERED_OUTCOMES) {
+				throw new AuxiliaryPaymentError(
+					'ASSET_OUTCOMES_UNDELIVERED',
+					assetPayment.channelId,
+					`The channel holds ${undelivered} outcomes of asset HTLCs that its host has not taken (onHtlcResolved), and offers no further asset HTLC until it has`
+				);
+			}
 			metadata = {
 				...metadata,
 				_auxiliaryChannelId: assetPayment.channelId.toString('hex'),
@@ -29749,6 +29759,9 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 					? state.localConfig.dustLimitSatoshis
 					: state.remoteConfig.dustLimitSatoshis,
 			...(scid ? { shortChannelId: Buffer.from(scid) } : {}),
+			...(auxiliary.resolvedHtlcs && auxiliary.resolvedHtlcs.size > 0
+				? { undeliveredOutcomes: auxiliary.resolvedHtlcs.size }
+				: {}),
 			htlcs: [...state.htlcs.values()]
 				.filter(
 					(entry) =>

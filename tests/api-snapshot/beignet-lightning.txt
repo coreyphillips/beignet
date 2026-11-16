@@ -1006,7 +1006,7 @@ function chain.selectTheirPerCommitmentPoint(tx: bitcoinjs-lib#Transaction, stat
 function chain.signP2wpkhInput(tx: bitcoinjs-lib#Transaction, inputIndex: number, pubkey: Buffer, value: number, privateKey: Buffer): Buffer
 function chain.signSweepInput(tx: bitcoinjs-lib#Transaction, inputIndex: number, witnessScript: Buffer, value: number, privateKey: Buffer, sighashType?: number): Buffer
 namespace channel
-const channel.AUXILIARY_CHANNELS_API: Readonly<{ version: 0; surfaces: readonly [ "valueIncomingHtlc:three-outcome", "sendPaymentToRoute:assetPayment", "getAuxiliaryPaymentHtlcs", "onHtlcResolved:htlcId", "queryAuxiliaryRoute", "fundAuxiliaryChannel:unsigned", "onFundingSigned", "abandonAuxiliaryOpen", "IChannelInfo.auxiliary", "setAuxiliaryPaymentGate", "getChannelMonitorState", "IPaymentInfo.auxiliary", "IPaymentInfo.auxiliaryValueMsat", "IInvoiceInfo.auxiliary" ]; }>
+const channel.AUXILIARY_CHANNELS_API: Readonly<{ version: 0; surfaces: readonly [ "valueIncomingHtlc:three-outcome", "sendPaymentToRoute:assetPayment", "getAuxiliaryPaymentHtlcs", "onHtlcResolved:htlcId", "queryAuxiliaryRoute", "fundAuxiliaryChannel:unsigned", "onFundingSigned", "abandonAuxiliaryOpen", "IChannelInfo.auxiliary", "setAuxiliaryPaymentGate", "getChannelMonitorState", "IPaymentInfo.auxiliary", "IPaymentInfo.auxiliaryValueMsat", "IInvoiceInfo.auxiliary", "IAuxiliaryChannelInfo.undeliveredOutcomes" ]; }>
 const channel.AUXILIARY_CHANNEL_DUST_LIMIT = 354n
 const channel.AUXILIARY_CLOSE_ASSET_OUTPUT_MINIMUM = 330n
 class channel.AuxiliaryChannelUnsupportedError extends beignet#CodedError<'ASSET_CHANNEL_UNSUPPORTED'>
@@ -1030,6 +1030,7 @@ const channel.CHANNEL_INDEX_FLOOR_STRIDE = 128
 const channel.COMPOSITE_SPLICE_STAGES: readonly channel.CompositeSpliceStage[]
 class channel.Channel
 constructor channel.Channel(state: channel.IChannelState, signer?: keys.ISigner, auxiliaryProvider?: channel.IChannelAuxiliaryProvider)
+static readonly property channel.Channel.AUXILIARY_MAX_UNDELIVERED_OUTCOMES = 1000
 static readonly property channel.Channel.MAX_DUST_HTLC_EXPOSURE_MSAT = 5000000n
 static readonly property channel.Channel.MAX_HTLC_CLTV_EXPIRY_DELTA = 5040
 method channel.Channel.abandonSpliceConflictRequest(): channel.ChannelAction[]
@@ -1344,6 +1345,7 @@ member channel.ChannelErrorCode.UNSUPPORTED = "UNSUPPORTED"
 member channel.ChannelErrorCode.WRONG_STATE = "WRONG_STATE"
 class channel.ChannelManager extends TypedEmitter<channel.ChannelManagerEvents>
 constructor channel.ChannelManager(config: channel.IChannelManagerConfig)
+static readonly property channel.ChannelManager.AUXILIARY_MAX_UNDELIVERED_OUTCOMES = 1000
 static readonly property channel.ChannelManager.AUXILIARY_RETRY_ATTEMPTS_PER_INTERVAL = 3
 static readonly property channel.ChannelManager.AUXILIARY_RETRY_INTERVAL_MS = 60000
 method channel.ChannelManager.abandonAuxiliaryOpen(id: Buffer, reason: string): Buffer | undefined
@@ -1678,6 +1680,7 @@ property channel.IAuxiliaryChannelInfo.remoteBalanceMsat: bigint
 property channel.IAuxiliaryChannelInfo.shortChannelId?: Buffer
 property channel.IAuxiliaryChannelInfo.state: channel.ChannelState
 property channel.IAuxiliaryChannelInfo.temporaryChannelId: Buffer
+property channel.IAuxiliaryChannelInfo.undeliveredOutcomes?: number
 interface channel.IAuxiliaryCloseContext
 property channel.IAuxiliaryCloseContext.feeSatoshis: bigint
 property channel.IAuxiliaryCloseContext.localAmount: bigint
@@ -5518,7 +5521,7 @@ readonly property node.AuxiliaryChannelRowError.reasons: ReadonlyMap<string, str
 class node.AuxiliaryPaymentError extends beignet#CodedError<node.AuxiliaryPaymentErrorCode>
 constructor node.AuxiliaryPaymentError(code: node.AuxiliaryPaymentErrorCode, channelId: Buffer | string, message: string)
 readonly property node.AuxiliaryPaymentError.channelId: string
-type node.AuxiliaryPaymentErrorCode = 'ASSET_PAYMENT_INVALID' | 'ASSET_PAYMENT_CHANNEL_MISMATCH' | 'ASSET_PAYMENT_ROUTE_REQUIRED' | 'ASSET_PAYMENT_UNSUPPORTED' | 'ASSET_PAYMENT_CIRCUIT_CHANGED' | 'ASSET_PAYMENT_NOT_RECORDED' | 'ASSET_CHANNEL_NEEDS_ASSET_PAYMENT' | 'ASSET_PAYMENT_REFUSED'
+type node.AuxiliaryPaymentErrorCode = 'ASSET_PAYMENT_INVALID' | 'ASSET_PAYMENT_CHANNEL_MISMATCH' | 'ASSET_PAYMENT_ROUTE_REQUIRED' | 'ASSET_PAYMENT_UNSUPPORTED' | 'ASSET_PAYMENT_CIRCUIT_CHANGED' | 'ASSET_PAYMENT_NOT_RECORDED' | 'ASSET_CHANNEL_NEEDS_ASSET_PAYMENT' | 'ASSET_PAYMENT_REFUSED' | 'ASSET_OUTCOMES_UNDELIVERED'
 type node.AuxiliaryPaymentGate = (payment: { paymentHash: Buffer; channelId: Buffer; amountMsat: bigint; wireAmountMsat: bigint; }) => string | undefined
 class node.AuxiliaryProviderRequiredError extends beignet#CodedError<'AUXILIARY_PROVIDER_REQUIRED'>
 constructor node.AuxiliaryProviderRequiredError(channelIds: readonly string[])

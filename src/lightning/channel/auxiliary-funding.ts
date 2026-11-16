@@ -55,6 +55,13 @@ export interface IAuxiliaryChannelInfo {
 	remoteBalanceMsat: bigint;
 	dustLimitSatoshis: bigint;
 	shortChannelId?: Buffer;
+	/**
+	 * How many outcomes of the channel's asset HTLCs the host has not taken
+	 * yet (onHtlcResolved has not returned for them). Present only when
+	 * there are some. Above ChannelManager.AUXILIARY_MAX_UNDELIVERED_OUTCOMES
+	 * the channel takes no further asset HTLC.
+	 */
+	undeliveredOutcomes?: number;
 	/** The HTLCs in flight on the channel, each side's, with what they carry. */
 	htlcs: IAuxiliaryChannelHtlc[];
 }

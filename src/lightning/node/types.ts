@@ -1949,7 +1949,9 @@ export type AuxiliaryPaymentErrorCode =
 	/** An ordinary payment was directed over an asset channel. */
 	| 'ASSET_CHANNEL_NEEDS_ASSET_PAYMENT'
 	/** The gate set on the node (setAuxiliaryPaymentGate) refused the payment. Nothing was sent. */
-	| 'ASSET_PAYMENT_REFUSED';
+	| 'ASSET_PAYMENT_REFUSED'
+	/** The channel holds more outcomes its host has not taken (onHtlcResolved) than it keeps. Nothing was sent. */
+	| 'ASSET_OUTCOMES_UNDELIVERED';
 
 /**
  * Judges an outgoing asset payment before anything of it is recorded or
