@@ -22,8 +22,10 @@ import { getPublicKey } from '../../src/lightning/crypto/ecdh';
 import {
 	Feature,
 	FeatureFlags,
+	TAPROOT_OVERLAY_DEPENDENCIES,
 	hasUnsupportedRequiredFeatures
 } from '../../src/lightning/features/flags';
+import type { ILogger } from '../../src/logger';
 import {
 	encodeInitMessage,
 	decodeInitMessage
@@ -242,6 +244,187 @@ describe('Asset channel feature bits and init custom records', function () {
 		const bits = node.getLocalFeatures().listSetBits();
 		expect(bits).to.include(2025);
 		for (const bit of [450, 451, 452, 453]) expect(bits).to.not.include(bit);
+	});
+
+	describe('what a peer requires beside the overlay', () => {
+		/**
+		 * LND drops a connection whose init sets a feature without the
+		 * features it depends on (feature/deps.go). For the overlay that is
+		 * simple taproot, TLV onion and scid alias, then zero-fee-HTLC
+		 * anchors and explicit channel type for simple taproot, then
+		 * static_remotekey for the anchors.
+		 */
+		const CLOSURE = [
+			Feature.OPTION_TAPROOT,
+			Feature.TLV_ONION,
+			Feature.SCID_ALIAS,
+			Feature.ANCHOR_ZERO_FEE_HTLC,
+			Feature.CHANNEL_TYPE,
+			Feature.STATIC_REMOTE_KEY
+		];
+		/** Either the overlay with its whole closure, or no overlay at all. */
+		const expectWholeOrAbsent = (node: LightningNode): boolean => {
+			const features = node.getLocalFeatures();
+			const advertised = features.hasFeature(Feature.OPTION_TAPROOT_OVERLAY);
+			expect(node.getAuxiliaryAdvertisement().advertised).to.equal(advertised);
+			if (advertised) {
+				for (const feature of CLOSURE) {
+					expect(features.hasFeature(feature), `feature ${feature}`).to.equal(
+						true
+					);
+				}
+			} else {
+				expect(features.listSetBits()).to.not.include(2025);
+				expect(features.listSetBits()).to.not.include(2026);
+			}
+			return advertised;
+		};
+		const warnings = (): { logger: ILogger; lines: string[] } => {
+			const lines: string[] = [];
+			return {
+				lines,
+				logger: {
+					debug: () => undefined,
+					info: () => undefined,
+					warn: (message: string) => lines.push(message),
+					error: () => undefined
+				}
+			};
+		};
+
+		it('names the closure LND checks', () => {
+			expect(
+				TAPROOT_OVERLAY_DEPENDENCIES.map(([feature]) => feature)
+			).to.deep.equal(CLOSURE);
+			expect(
+				TAPROOT_OVERLAY_DEPENDENCIES.map(([feature]) => feature)
+			).to.deep.equal([180, 8, 46, 22, 44, 12]);
+		});
+
+		it('a provider node advertises the overlay with its whole closure', () => {
+			const node = track(makeNode({ auxiliaryChannels: auxiliary() }));
+			expect(expectWholeOrAbsent(node)).to.equal(true);
+			expect(node.getAuxiliaryAdvertisement()).to.deep.equal({
+				advertised: true
+			});
+			const bits = node.getLocalFeatures().listSetBits();
+			for (const bit of [8, 13, 23, 45, 47, 181, 2025]) {
+				expect(bits).to.include(bit);
+			}
+		});
+
+		it('no configuration switch takes a dependency away and leaves the overlay', () => {
+			const switches: Array<Partial<INodeConfig>> = [
+				{ preferAnchors: false },
+				{ preferAnchors: true },
+				{ preferTaproot: true },
+				{ preferTaproot: false },
+				{ largeChannels: false },
+				{ largeChannels: true },
+				{ peerStorageEnabled: false },
+				{ peerStorageEnabled: true },
+				{ asyncReceiveService: { enabled: true } },
+				{ preferAnchors: false, preferTaproot: true, largeChannels: false }
+			];
+			for (const extra of switches) {
+				const node = track(
+					makeNode({ ...extra, auxiliaryChannels: auxiliary() })
+				);
+				expect(expectWholeOrAbsent(node), JSON.stringify(extra)).to.equal(true);
+			}
+		});
+
+		it('a supplied set that lacks a dependency advertises no overlay, and says why', () => {
+			const cases: Array<[Feature, string, Partial<INodeConfig>]> = [
+				[Feature.TLV_ONION, 'var_onion_optin (8/9)', {}],
+				[Feature.SCID_ALIAS, 'option_scid_alias (46/47)', {}],
+				[
+					Feature.ANCHOR_ZERO_FEE_HTLC,
+					'option_anchors_zero_fee_htlc_tx (22/23)',
+					// The node adds anchors back to any set while it prefers them.
+					{ preferAnchors: false }
+				],
+				[Feature.CHANNEL_TYPE, 'option_channel_type (44/45)', {}],
+				[Feature.STATIC_REMOTE_KEY, 'option_static_remotekey (12/13)', {}]
+			];
+			for (const [feature, name, extra] of cases) {
+				const supplied = (): FeatureFlags => {
+					const flags = LightningNode.defaultFeatures();
+					flags.clearBit(feature);
+					flags.clearBit(feature + 1);
+					return flags;
+				};
+				const plain = track(makeNode({ ...extra, localFeatures: supplied() }));
+				const log = warnings();
+				const node = track(
+					makeNode({
+						...extra,
+						localFeatures: supplied(),
+						auxiliaryChannels: auxiliary({
+							initCustomRecords: new Map([[65539n, Buffer.from('aa', 'hex')]])
+						}),
+						logger: log.logger
+					})
+				);
+				expect(expectWholeOrAbsent(node), name).to.equal(false);
+				// On the wire it is the node its configuration asked for: the
+				// bits of the same set without a provider, so no simple
+				// taproot either, and simple close stays.
+				expect(node.getLocalFeatures().listSetBits(), name).to.deep.equal(
+					plain.getLocalFeatures().listSetBits()
+				);
+				expect(node.getLocalFeatures().listSetBits()).to.not.include(181);
+				const advertisement = node.getAuxiliaryAdvertisement();
+				expect(advertisement.advertised).to.equal(false);
+				const reason = advertisement.advertised ? '' : advertisement.reason;
+				expect(reason).to.equal(
+					`Asset channels are not advertised: the configured feature set lacks ${name}, which a peer requires of a node that advertises the taproot overlay`
+				);
+				expect(log.lines).to.deep.equal([reason]);
+			}
+		});
+
+		it('names every missing dependency, and takes a hand-set overlay bit off', () => {
+			const supplied = FeatureFlags.empty();
+			supplied.setCompulsory(Feature.TLV_ONION);
+			supplied.setOptional(Feature.STATIC_REMOTE_KEY);
+			supplied.setBit(2025);
+			supplied.setOptional(Feature.OPTION_TAPROOT);
+			const node = track(
+				makeNode({
+					preferAnchors: false,
+					localFeatures: supplied,
+					auxiliaryChannels: auxiliary()
+				})
+			);
+			expect(expectWholeOrAbsent(node)).to.equal(false);
+			const advertisement = node.getAuxiliaryAdvertisement();
+			expect(advertisement.advertised ? '' : advertisement.reason).to.equal(
+				'Asset channels are not advertised: the configured feature set lacks option_scid_alias (46/47), option_anchors_zero_fee_htlc_tx (22/23), option_channel_type (44/45), which a peer requires of a node that advertises the taproot overlay'
+			);
+		});
+
+		it('a node without a provider reports that, logs nothing and keeps its bits', () => {
+			const log = warnings();
+			const node = track(makeNode({ logger: log.logger }));
+			expect(node.getAuxiliaryAdvertisement()).to.deep.equal({
+				advertised: false,
+				reason: 'No auxiliary channel provider is configured'
+			});
+			expect(node.getLocalFeatures().listSetBits()).to.deep.equal(DEFAULT_BITS);
+			expect(log.lines).to.deep.equal([]);
+			// A supplied set with the overlay bit and nothing beside it stays
+			// as supplied without a provider, as it did before.
+			const supplied = FeatureFlags.empty();
+			supplied.setOptional(Feature.STATIC_REMOTE_KEY);
+			supplied.setBit(2025);
+			const bare = track(
+				makeNode({ localFeatures: supplied, preferAnchors: false })
+			);
+			expect(bare.getLocalFeatures().listSetBits()).to.deep.equal([
+				13, 19, 65, 2025
+			]);
+		});
 	});
 
 	it('orders chain hashes before init custom records', () => {

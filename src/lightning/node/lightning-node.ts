@@ -145,7 +145,11 @@ import {
 } from '../gossip/pathfinding';
 import type { IPayAllRouteResult } from '../gossip/pay-all';
 import { findPayAllRoute } from '../gossip/pay-all';
-import type { IPayAllBudget, IPayAllQuote } from './types';
+import type {
+	IPayAllBudget,
+	IPayAllQuote,
+	IAuxiliaryAdvertisement
+} from './types';
 import type { IRapidGossipResult } from '../gossip/rapid-sync';
 import {
 	applyRapidGossipSnapshot,
@@ -465,7 +469,11 @@ import type {
 	IChannelPersistResult
 } from '../channel/channel-actions';
 import { ChannelErrorCode } from '../channel/channel-actions';
-import { FeatureFlags, Feature } from '../features/flags';
+import {
+	FeatureFlags,
+	Feature,
+	TAPROOT_OVERLAY_DEPENDENCIES
+} from '../features/flags';
 import {
 	ChainWatcher,
 	classifyAnnouncedChannelFunding,
@@ -1028,6 +1036,10 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	private acceptableChainHashes: Buffer[];
 	private nodeId: string;
 	private network: Network;
+	private auxiliaryAdvertisement: IAuxiliaryAdvertisement = {
+		advertised: false,
+		reason: 'No auxiliary channel provider is configured'
+	};
 	private channelManager: ChannelManager;
 	private graph: NetworkGraph;
 	private peerManager: PeerManager | null = null;
@@ -2060,15 +2072,40 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		// them. dual_fund stays advertised: an asset open asks for v1
 		// negotiation itself. A node without a provider is left exactly as
 		// it was, nothing here sets or clears a bit for it.
+		//
+		// A peer may check what the overlay depends on and drop a connection
+		// whose init sets it without the rest (LND does). Simple taproot is
+		// set here; everything else in TAPROOT_OVERLAY_DEPENDENCIES is in the
+		// default set, so only a caller-supplied set can lack one. Such a
+		// node does not advertise the overlay at all: its init is the one its
+		// configuration asked for, it opens and accepts no asset channel, and
+		// the reason is logged and kept for getAuxiliaryAdvertisement().
 		if (config.auxiliaryChannels) {
-			localFeatures.setOptional(Feature.OPTION_TAPROOT);
-			localFeatures.setOptional(Feature.OPTION_TAPROOT_OVERLAY);
 			for (const feature of [
 				Feature.OPTION_ASSET_FIXED_HTLC_OUTPUTS,
 				Feature.OPTION_ASSET_CHILD_CUSTODY
 			]) {
 				localFeatures.clearBit(feature);
 				localFeatures.clearBit(feature + 1);
+			}
+			const missing = TAPROOT_OVERLAY_DEPENDENCIES.filter(
+				([feature]) =>
+					feature !== Feature.OPTION_TAPROOT &&
+					!localFeatures.hasFeature(feature)
+			).map(([, name]) => name);
+			if (missing.length === 0) {
+				localFeatures.setOptional(Feature.OPTION_TAPROOT);
+				localFeatures.setOptional(Feature.OPTION_TAPROOT_OVERLAY);
+				this.auxiliaryAdvertisement = { advertised: true };
+			} else {
+				localFeatures.clearBit(Feature.OPTION_TAPROOT_OVERLAY);
+				// The overlay's optional bit, as deployed.
+				localFeatures.clearBit(2025);
+				const reason = `Asset channels are not advertised: the configured feature set lacks ${missing.join(
+					', '
+				)}, which a peer requires of a node that advertises the taproot overlay`;
+				this.auxiliaryAdvertisement = { advertised: false, reason };
+				this.logger.warn(reason);
 			}
 		}
 		// Taproot channels only close through closing_signed here (MuSig2
@@ -2642,8 +2679,12 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				// Init custom records are sent and read only with an auxiliary
 				// channel provider. Without one both are off and the init codec
 				// is the standard one.
-				initCustomRecords: config.auxiliaryChannels?.initCustomRecords,
-				readInitCustomRecords: !!config.auxiliaryChannels,
+				// A provider node that could not advertise the overlay is,
+				// on the wire, a node without a provider.
+				initCustomRecords: this.auxiliaryAdvertisement.advertised
+					? config.auxiliaryChannels?.initCustomRecords
+					: undefined,
+				readInitCustomRecords: this.auxiliaryAdvertisement.advertised,
 				localPrivateKey: config.nodePrivateKey,
 				localFeatures,
 				networks: config.chainHashes,
@@ -23849,6 +23890,16 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	/** The feature set this node advertises in init and node_announcement. */
 	getLocalFeatures(): FeatureFlags {
 		return this.localFeatures;
+	}
+
+	/**
+	 * Whether this node advertises asset channels (the taproot overlay with
+	 * everything it depends on), and why not when it does not: no provider
+	 * is configured, or the configured feature set lacks something a peer
+	 * requires beside the overlay.
+	 */
+	getAuxiliaryAdvertisement(): IAuxiliaryAdvertisement {
+		return { ...this.auxiliaryAdvertisement };
 	}
 
 	/** The LSP-side service (registrations, admission, metrics). */

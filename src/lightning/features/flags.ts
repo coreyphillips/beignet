@@ -359,6 +359,25 @@ export class FeatureFlags {
 	}
 }
 
+/**
+ * What a node has to advertise beside the taproot overlay, with the name
+ * each goes by. LND checks a peer's feature vector against its dependency
+ * map and drops the connection when a feature is set without what it
+ * depends on: the overlay needs simple taproot channels, the TLV onion and
+ * SCID aliases; simple taproot needs zero-fee-HTLC anchors and explicit
+ * channel types; and those anchors need static_remotekey.
+ */
+export const TAPROOT_OVERLAY_DEPENDENCIES: ReadonlyArray<
+	readonly [Feature, string]
+> = [
+	[Feature.OPTION_TAPROOT, 'option_simple_taproot (180/181)'],
+	[Feature.TLV_ONION, 'var_onion_optin (8/9)'],
+	[Feature.SCID_ALIAS, 'option_scid_alias (46/47)'],
+	[Feature.ANCHOR_ZERO_FEE_HTLC, 'option_anchors_zero_fee_htlc_tx (22/23)'],
+	[Feature.CHANNEL_TYPE, 'option_channel_type (44/45)'],
+	[Feature.STATIC_REMOTE_KEY, 'option_static_remotekey (12/13)']
+];
+
 /** What the required-feature check may assume about the local node. */
 export interface IRequiredFeatureOptions {
 	/**

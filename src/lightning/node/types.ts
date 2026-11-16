@@ -2155,3 +2155,8 @@ export interface IPaymentEstimate {
 	estimatedFeeMsat: bigint;
 	hopCount: number;
 }
+
+/** Whether a node advertises asset channels, and why not when it does not. */
+export type IAuxiliaryAdvertisement =
+	| { advertised: true }
+	| { advertised: false; reason: string };

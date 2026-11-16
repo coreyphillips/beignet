@@ -3384,6 +3384,7 @@ method features.FeatureFlags.setOptional(feature: features.Feature): void
 method features.FeatureFlags.toBuffer(): Buffer
 interface features.IRequiredFeatureOptions
 property features.IRequiredFeatureOptions.taprootOverlay?: boolean
+const features.TAPROOT_OVERLAY_DEPENDENCIES: ReadonlyArray<readonly [ features.Feature, string ]>
 function features.hasUnsupportedRequiredFeatures(localFeatures: features.FeatureFlags, remoteFeatures: features.FeatureFlags, options?: features.IRequiredFeatureOptions): number[]
 function features.implementedFeatures(): features.FeatureFlags
 namespace ffor
@@ -5485,6 +5486,7 @@ property node.IAutoTuneFeesConfig.ceilPpm?: number
 property node.IAutoTuneFeesConfig.enabled?: boolean
 property node.IAutoTuneFeesConfig.floorPpm?: number
 property node.IAutoTuneFeesConfig.intervalMs?: number
+type node.IAuxiliaryAdvertisement = { advertised: true; } | { advertised: false; reason: string; }
 interface node.IChannelHealth
 property node.IChannelHealth.capacitySats: number
 property node.IChannelHealth.channelId: string
@@ -6097,6 +6099,7 @@ method node.LightningNode.getActionLog(options?: { category?: string; since?: nu
 method node.LightningNode.getAsyncPaymentManager(): asyncPayments.AsyncPaymentManager
 method node.LightningNode.getAsyncReceiveService(): asyncPayments.AsyncReceiveService
 method node.LightningNode.getAsyncReceiveServiceMetrics(): asyncPayments.IAsyncReceiveServiceMetrics
+method node.LightningNode.getAuxiliaryAdvertisement(): node.IAuxiliaryAdvertisement
 method node.LightningNode.getAuxiliaryChannelInfo(channelId: Buffer): channel.IAuxiliaryChannelInfo | undefined
 method node.LightningNode.getAuxiliaryHtlcMode(peerPubkey: string): 'fixed' | 'legacy'
 method node.LightningNode.getBalance(): node.ILightningBalance
