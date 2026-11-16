@@ -662,6 +662,7 @@ class ChannelFundingUnavailableError extends CodedError<ChannelFundingUnavailabl
 constructor ChannelFundingUnavailableError(code: ChannelFundingUnavailableCode, message: string)
 type ChannelIdHex = string
 interface ChannelInfo
+property ChannelInfo.auxiliary?: true
 property ChannelInfo.capacitySats: number
 property ChannelInfo.channelId: ChannelIdHex
 property ChannelInfo.closeStatus?: CloseStatus

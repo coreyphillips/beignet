@@ -10029,6 +10029,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 		reestablishRecencyUnproven?: boolean;
 		reestablishSecretMissing?: boolean;
 		restoreRevokedRisk?: boolean;
+		auxiliary?: true;
 		fundingUnaccounted?: boolean;
 		payThroughSplice?: boolean;
 		revertedSplices?: Array<{
@@ -10140,6 +10141,8 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 		if (ch.reestablishSecretMissing)
 			info.reestablishSecretMissing = ch.reestablishSecretMissing;
 		if (ch.restoreRevokedRisk) info.restoreRevokedRisk = ch.restoreRevokedRisk;
+		// An asset channel says so, and no other row has the key.
+		if (ch.auxiliary) info.auxiliary = true;
 		if (ch.fundingUnaccounted) info.fundingUnaccounted = ch.fundingUnaccounted;
 		if (ch.payThroughSplice !== undefined)
 			info.payThroughSplice = ch.payThroughSplice;

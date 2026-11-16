@@ -361,6 +361,13 @@ export interface ChannelInfo {
 	 */
 	restoreRevokedRisk?: boolean;
 	/**
+	 * Present, and true, only on an asset channel: one whose commitments
+	 * carry asset outputs for an auxiliary channel provider. Its sats are not
+	 * spendable or receivable as bitcoin over Lightning, and no total counts
+	 * them. Absent on every other channel.
+	 */
+	auxiliary?: true;
+	/**
 	 * Neither mempool nor chain can account for the funding, so the channel is
 	 * quarantined: no new HTLCs, no router edge, no routing hint. Reversible
 	 * and not a close; it clears by itself when the funding is seen again.

@@ -5985,6 +5985,11 @@ export function getOpenApiSpec(): Record<string, unknown> {
 							description:
 								'This node could not produce the your_last_per_commitment_secret its OWN channel_reestablish owes the peer: the shachain store held no secret at the index its revocation counter names, and BOLT 2 permits all zeroes only at next_revocation_number 0, so nothing was sent. Local storage is damaged or incomplete. The channel is ERRORED under the same hold as restoreRecencyUnproven: no automatic close, no new HTLCs, no router edge, and the peer is asked to close on every reconnect. The exits are the peer closing or /channel/forceclose with acceptStaleStateRisk: true. Permanent, since the store cannot recover the secret'
 						},
+						auxiliary: {
+							type: 'boolean',
+							description:
+								'Present, and true, only on an asset channel. Its sats are not spendable or receivable as bitcoin over Lightning and no total counts them. Absent on every other channel.'
+						},
 						restoreRevokedRisk: {
 							type: 'boolean',
 							description:
