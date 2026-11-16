@@ -146,6 +146,7 @@ import { auxiliaryCsvPolicyError } from './auxiliary-csv';
 import { auxiliaryCarrierError } from './auxiliary-funding';
 import type { AuxiliaryUnsupportedOperation } from './auxiliary-guard';
 import { auxiliaryUnsupported } from './auxiliary-guard';
+import { recordAuxiliaryRevokedView } from './auxiliary-revoked';
 import type { IAuxiliaryRoundUpdate } from './auxiliary-preflight';
 import { auxiliaryRoundRefusal } from './auxiliary-preflight';
 import {
@@ -5725,15 +5726,17 @@ export class Channel {
 			}
 			// The row holds the asset side of the peer's current commitment and
 			// of the one this signature puts in flight. The one before is
-			// revoked by now, or this signature would not be made; what a
-			// penalty needs of a revoked commitment is not kept in the row.
+			// revoked by now, or this signature would not be made: its view
+			// goes to the store of revoked views with the row that drops it.
 			const remoteViews = this._state.auxiliaryState!.remoteCommitments;
 			remoteViews.set(
 				this._state.remoteCommitmentNumber + 1n,
 				copyAuxiliaryCommitment(auxiliarySigned.view)
 			);
-			for (const number of [...remoteViews.keys()]) {
+			for (const [number, view] of [...remoteViews]) {
 				if (number < this._state.remoteCommitmentNumber) {
+					// Kept for a penalty, in the store of revoked views.
+					recordAuxiliaryRevokedView(this._state, number, view);
 					remoteViews.delete(number);
 				}
 			}

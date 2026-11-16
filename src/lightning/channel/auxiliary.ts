@@ -136,6 +136,18 @@ export interface IChannelAuxiliaryState {
 	/** Signed views retained for force-close and revoked-commitment recovery. */
 	localCommitments: Map<bigint, IAuxiliaryCommitmentData>;
 	remoteCommitments: Map<bigint, IAuxiliaryCommitmentData>;
+	/**
+	 * Views of commitments of the peer that are revoked, held here until a
+	 * store of revoked views has them (channel/auxiliary-revoked.ts). With
+	 * such a store only the last few are here, and the one of a revoked
+	 * commitment seen on the chain. Without one they all stay, in the row.
+	 */
+	revokedCommitments?: Map<bigint, IAuxiliaryCommitmentData>;
+	/**
+	 * The revoked commitment of the peer that is on the chain, whose view
+	 * stays in `revokedCommitments`. Set while the node runs; never stored.
+	 */
+	revokedCommitmentHeld?: bigint;
 }
 
 /** What the provider is given to sign or verify the asset HTLC signatures. */

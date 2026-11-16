@@ -11,6 +11,7 @@
  */
 
 import { SUPERSEDES_OWN_KIND_MESSAGE_TYPES } from '../channel/channel-actions';
+import { markAuxiliaryRevokedViewsStored } from '../channel/auxiliary-revoked';
 import type { IChannelState } from '../channel/channel-state';
 import {
 	markRevokedHtlcSnapshotsSaved,
@@ -132,7 +133,11 @@ export class RecoveryManager {
 			return { committed: false, released: [], error, frameSequence: null };
 		}
 
-		let historyWritten: Array<{ state: IChannelState; keys: string[] }> = [];
+		let historyWritten: Array<{
+			state: IChannelState;
+			keys: string[];
+			revokedViews?: bigint[];
+		}> = [];
 		const outboxIds: Array<number | null> = [];
 		let journaled = false;
 		let frameSequence: bigint | null = null;
@@ -160,7 +165,18 @@ export class RecoveryManager {
 													mutation.state,
 													this.snapshotStore
 												)?.keys() ?? [])
-											]
+											],
+											// The views of revoked asset commitments this
+											// write puts in the backend's store of them.
+											...(mutation.state.auxiliaryState?.revokedCommitments &&
+											typeof this.storage.loadAuxiliaryRevokedCommitment ===
+												'function'
+												? {
+														revokedViews: [
+															...mutation.state.auxiliaryState.revokedCommitments.keys()
+														]
+												  }
+												: {})
 										}
 								  ]
 								: []
@@ -241,8 +257,9 @@ export class RecoveryManager {
 			this.options.journal?.onCommitCommitted?.();
 		}
 		if (journaled || !this.options.journal) {
-			for (const { state, keys } of historyWritten) {
+			for (const { state, keys, revokedViews } of historyWritten) {
 				markRevokedHtlcSnapshotsSaved(state, this.snapshotStore, keys);
+				if (revokedViews) markAuxiliaryRevokedViewsStored(state, revokedViews);
 			}
 		}
 

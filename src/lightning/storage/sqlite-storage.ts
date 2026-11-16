@@ -42,8 +42,14 @@ import type {
 	IWatchtowerSession,
 	IWatchtowerUpdate
 } from '../watchtower/types';
+import type { IAuxiliaryCommitmentData } from '../channel/auxiliary';
+import { auxiliaryRevokedViewsToStore } from '../channel/auxiliary-revoked';
 import type { IChannelState } from '../channel/channel-state';
 import type { IHtlcSnapshotEntry } from '../channel/types';
+import {
+	deserializeAuxiliaryCommitmentView,
+	serializeAuxiliaryCommitmentView
+} from './auxiliary-serialization';
 import {
 	attachStoredRevokedHtlcSnapshots,
 	unsavedRevokedHtlcSnapshots
@@ -568,6 +574,11 @@ export class SqliteStorage implements IStorageBackend {
 			'created_at'
 		],
 		revoked_htlc_snapshots: ['channel_id', 'commitment_number', 'htlcs_json'],
+		auxiliary_revoked_commitments: [
+			'channel_id',
+			'commitment_number',
+			'view_json'
+		],
 		schema_version: ['version'],
 		scid_mappings: ['scid_hex', 'channel_id'],
 		wallet_data: ['key', 'value'],
@@ -618,6 +629,11 @@ export class SqliteStorage implements IStorageBackend {
 	}> = [
 		{ table: 'channels', pk: 'channel_id', columns: ['state_json'] },
 		{ table: 'revoked_htlc_snapshots', pk: 'rowid', columns: ['htlcs_json'] },
+		{
+			table: 'auxiliary_revoked_commitments',
+			pk: 'rowid',
+			columns: ['view_json']
+		},
 		{ table: 'payments', pk: 'payment_hash', columns: ['payment_json'] },
 		{ table: 'ffor_vouchers', pk: 'id', columns: ['record_json'] },
 		{ table: 'composite_splices', pk: 'id', columns: ['record_json'] },
@@ -886,6 +902,16 @@ export class SqliteStorage implements IStorageBackend {
 				channel_id TEXT NOT NULL,
 				commitment_number TEXT NOT NULL,
 				htlcs_json TEXT NOT NULL,
+				PRIMARY KEY (channel_id, commitment_number)
+			);
+
+			-- The asset side of each revoked commitment of the peer on an asset
+			-- channel (issue #2093), which a penalty needs. Empty on a node
+			-- without asset channels.
+			CREATE TABLE IF NOT EXISTS auxiliary_revoked_commitments (
+				channel_id TEXT NOT NULL,
+				commitment_number TEXT NOT NULL,
+				view_json TEXT NOT NULL,
 				PRIMARY KEY (channel_id, commitment_number)
 			);
 
@@ -1170,10 +1196,24 @@ export class SqliteStorage implements IStorageBackend {
 			channelRowToStore(serializeChannelState(state, { htlcHistory: 'none' }))
 		);
 		const history = unsavedRevokedHtlcSnapshots(state, this);
+		const revokedViews = auxiliaryRevokedViewsToStore(state);
 		this.db.transaction(() => {
 			this._stmt(
 				'INSERT OR REPLACE INTO channels (channel_id, state_json, peer_pubkey) VALUES (?, ?, ?)'
 			).run(id, this._enc(json), peerPubkey);
+			if (revokedViews) {
+				const keep = this._stmt(
+					'INSERT OR REPLACE INTO auxiliary_revoked_commitments ' +
+						'(channel_id, commitment_number, view_json) VALUES (?, ?, ?)'
+				);
+				for (const [commitmentNumber, view] of revokedViews) {
+					keep.run(
+						id,
+						commitmentNumber.toString(),
+						this._enc(serializeAuxiliaryCommitmentView(view))
+					);
+				}
+			}
 			if (!history?.size) return;
 			const insert = this._stmt(
 				'INSERT OR REPLACE INTO revoked_htlc_snapshots ' +
@@ -1188,6 +1228,21 @@ export class SqliteStorage implements IStorageBackend {
 				);
 			}
 		})();
+	}
+
+	loadAuxiliaryRevokedCommitment(
+		channelId: string,
+		commitmentNumber: bigint
+	): IAuxiliaryCommitmentData | null {
+		const row = this._stmt(
+			'SELECT view_json FROM auxiliary_revoked_commitments ' +
+				'WHERE channel_id = ? AND commitment_number = ?'
+		).get(channelId, commitmentNumber.toString()) as
+			| { view_json: string }
+			| undefined;
+		return row
+			? deserializeAuxiliaryCommitmentView(this._dec(row.view_json))
+			: null;
 	}
 
 	revokedHtlcSnapshotStore(): object {
@@ -1319,6 +1374,9 @@ export class SqliteStorage implements IStorageBackend {
 			this._stmt('DELETE FROM revoked_htlc_snapshots WHERE channel_id = ?').run(
 				id
 			);
+			this._stmt(
+				'DELETE FROM auxiliary_revoked_commitments WHERE channel_id = ?'
+			).run(id);
 			this._stmt('DELETE FROM recovery_outbox WHERE channel_id = ?').run(id);
 		})();
 	}

@@ -8,6 +8,7 @@
 import type { IPeerTransportOptions } from '../transport/duplex-transport';
 import type { IFforVoucherArchive } from '../ffor/voucher-archive';
 import type { ICompositeSpliceRecord } from '../channel/composite-splice-record';
+import type { IAuxiliaryCommitmentData } from '../channel/auxiliary';
 import type { IChannelState } from '../channel/channel-state';
 import type { IPaymentInfo } from '../node/payment-types';
 import type { IChainMonitorState } from '../chain/chain-monitor';
@@ -591,6 +592,18 @@ export interface IStorageBackend
 	 * backend is its own identity.
 	 */
 	revokedHtlcSnapshotStore?(): object;
+	/**
+	 * The view of one revoked commitment of an asset channel, from the store
+	 * of revoked views, or null. A backend that has this method writes the
+	 * views in `state.auxiliaryState.revokedCommitments` to that store in
+	 * the transaction of `saveChannel`, and drops them with the channel: the
+	 * engine then lets them go from memory and from later rows. A backend
+	 * without it keeps every view in the channel row.
+	 */
+	loadAuxiliaryRevokedCommitment?(
+		channelId: string,
+		commitmentNumber: bigint
+	): IAuxiliaryCommitmentData | null;
 	/** True while any transaction is open on this backend, however opened. */
 	inTransaction?(): boolean;
 	/** Checkpoint the WAL file, flushing pending writes to the main database. */

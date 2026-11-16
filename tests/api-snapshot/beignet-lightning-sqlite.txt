@@ -172,6 +172,7 @@ method SqliteStorage.loadAllPreimages(): Array<{ paymentHash: string; preimage: 
 method SqliteStorage.loadAllQueueEntries(): IQueueEntryRow[]
 method SqliteStorage.loadAllScidMappings(): Array<{ scidHex: string; channelId: Buffer; }>
 method SqliteStorage.loadAllWebhooks(): Array<{ id: string; url: string; events: string[]; secretHash?: string; createdAt: number; }>
+method SqliteStorage.loadAuxiliaryRevokedCommitment(channelId: string, commitmentNumber: bigint): beignet/lightning#channel.IAuxiliaryCommitmentData | null
 method SqliteStorage.loadChainMonitor(channelId: string): beignet/lightning#chain.IChainMonitorState | null
 method SqliteStorage.loadChannel(id: string): { state: beignet/lightning#channel.IChannelState; peerPubkey: string; } | null
 method SqliteStorage.loadChannelKeyIndex(channelId: string): number | null

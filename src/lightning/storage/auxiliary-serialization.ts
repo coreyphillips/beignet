@@ -63,6 +63,7 @@ export interface ISerializedAuxiliaryState {
 	acceptedClosingSigned?: string;
 	localCommitments: [string, ISerializedAuxiliaryCommitment][];
 	remoteCommitments: [string, ISerializedAuxiliaryCommitment][];
+	revokedCommitments?: [string, ISerializedAuxiliaryCommitment][];
 }
 
 function bytes(hex: string): Buffer {
@@ -141,6 +142,133 @@ export function deserializeCustomRecords(
  * makes is made at the save and state that could not be read back is never
  * written.
  */
+const encodeLeaf = (value: ITaprootAuxLeaf): ISerializedAuxiliaryLeaf => ({
+	script: value.script.toString('hex'),
+	...(value.leafVersion !== undefined ? { leafVersion: value.leafVersion } : {})
+});
+const encodeCommitment = (
+	value: IAuxiliaryCommitmentData
+): ISerializedAuxiliaryCommitment => ({
+	customData: value.customData.toString('hex'),
+	...(value.secondLevelRevocationKey
+		? {
+				secondLevelRevocationKey: value.secondLevelRevocationKey.toString('hex')
+		  }
+		: {}),
+	...(value.secondLevelRevocationBasepoint
+		? {
+				secondLevelRevocationBasepoint:
+					value.secondLevelRevocationBasepoint.toString('hex')
+		  }
+		: {}),
+	...(value.secondLevelCommitmentTxid !== undefined
+		? { secondLevelCommitmentTxid: value.secondLevelCommitmentTxid }
+		: {}),
+	...(value.htlcOutputIndexes
+		? { htlcOutputIndexes: [...value.htlcOutputIndexes] }
+		: {}),
+	outputLeaves: [...value.outputLeaves].map(([index, item]) => [
+		index,
+		encodeLeaf(item)
+	]),
+	secondLevelLeaves: [...value.secondLevelLeaves].map(([id, item]) => [
+		id,
+		encodeLeaf(item)
+	]),
+	...(value.peerSignatures
+		? { peerSignatures: encodeCustomRecords(value.peerSignatures) }
+		: {})
+});
+
+const decodeLeaf = (value: ISerializedAuxiliaryLeaf): ITaprootAuxLeaf => {
+	const script = bytes(value.script);
+	const version = value.leafVersion ?? 0xc0;
+	if (
+		script.length > 10000 ||
+		!Number.isInteger(version) ||
+		version < 0 ||
+		version > 254 ||
+		version & 1
+	)
+		throw new Error('Malformed serialized auxiliary leaf');
+	return {
+		script,
+		...(value.leafVersion !== undefined
+			? { leafVersion: value.leafVersion }
+			: {})
+	};
+};
+const decodeCommitment = (
+	value: ISerializedAuxiliaryCommitment
+): IAuxiliaryCommitmentData => ({
+	customData: bytes(value.customData),
+	...(value.secondLevelRevocationKey !== undefined
+		? { secondLevelRevocationKey: childPoint(value.secondLevelRevocationKey) }
+		: {}),
+	...(value.secondLevelRevocationBasepoint !== undefined
+		? {
+				secondLevelRevocationBasepoint: childPoint(
+					value.secondLevelRevocationBasepoint
+				)
+		  }
+		: {}),
+	...(value.secondLevelCommitmentTxid !== undefined
+		? {
+				secondLevelCommitmentTxid: childTxid(value.secondLevelCommitmentTxid)
+		  }
+		: {}),
+	...(value.htlcOutputIndexes !== undefined
+		? {
+				htlcOutputIndexes: uniqueMap(
+					value.htlcOutputIndexes.map(([id, index]): [string, number] => [
+						htlcKey(id),
+						outputIndex(index)
+					])
+				)
+		  }
+		: {}),
+	outputLeaves: uniqueMap(
+		value.outputLeaves.map(([index, item]): [number, ITaprootAuxLeaf] => [
+			outputIndex(index),
+			decodeLeaf(item)
+		])
+	),
+	secondLevelLeaves: uniqueMap(
+		value.secondLevelLeaves.map(([id, item]): [string, ITaprootAuxLeaf] => [
+			htlcKey(id),
+			decodeLeaf(item)
+		])
+	),
+	...(value.peerSignatures !== undefined
+		? { peerSignatures: deserializeCustomRecords(value.peerSignatures) }
+		: {})
+});
+
+/** One commitment view as text, for the store of revoked views. */
+export function serializeAuxiliaryCommitmentView(
+	view: IAuxiliaryCommitmentData
+): string {
+	const serialized = JSON.stringify(encodeCommitment(view));
+	deserializeAuxiliaryCommitmentView(serialized);
+	return serialized;
+}
+
+/** Read one commitment view back by the rules the channel row is read by. */
+export function deserializeAuxiliaryCommitmentView(
+	serialized: string
+): IAuxiliaryCommitmentData {
+	const value = JSON.parse(serialized) as ISerializedAuxiliaryCommitment;
+	if (
+		!value ||
+		typeof value !== 'object' ||
+		!Array.isArray(value.outputLeaves) ||
+		!Array.isArray(value.secondLevelLeaves)
+	) {
+		throw new Error('Malformed serialized asset commitment view');
+	}
+	return decodeCommitment(value);
+}
+
 export function serializeAuxiliaryState(
 	state: IChannelAuxiliaryState
 ): ISerializedAuxiliaryState {
@@ -152,46 +280,6 @@ export function serializeAuxiliaryState(
 function encodeAuxiliaryState(
 	state: IChannelAuxiliaryState
 ): ISerializedAuxiliaryState {
-	const leaf = (value: ITaprootAuxLeaf): ISerializedAuxiliaryLeaf => ({
-		script: value.script.toString('hex'),
-		...(value.leafVersion !== undefined
-			? { leafVersion: value.leafVersion }
-			: {})
-	});
-	const commitment = (
-		value: IAuxiliaryCommitmentData
-	): ISerializedAuxiliaryCommitment => ({
-		customData: value.customData.toString('hex'),
-		...(value.secondLevelRevocationKey
-			? {
-					secondLevelRevocationKey:
-						value.secondLevelRevocationKey.toString('hex')
-			  }
-			: {}),
-		...(value.secondLevelRevocationBasepoint
-			? {
-					secondLevelRevocationBasepoint:
-						value.secondLevelRevocationBasepoint.toString('hex')
-			  }
-			: {}),
-		...(value.secondLevelCommitmentTxid !== undefined
-			? { secondLevelCommitmentTxid: value.secondLevelCommitmentTxid }
-			: {}),
-		...(value.htlcOutputIndexes
-			? { htlcOutputIndexes: [...value.htlcOutputIndexes] }
-			: {}),
-		outputLeaves: [...value.outputLeaves].map(([index, item]) => [
-			index,
-			leaf(item)
-		]),
-		secondLevelLeaves: [...value.secondLevelLeaves].map(([id, item]) => [
-			id,
-			leaf(item)
-		]),
-		...(value.peerSignatures
-			? { peerSignatures: encodeCustomRecords(value.peerSignatures) }
-			: {})
-	});
 	return {
 		...(state.openingCsvPolicy
 			? {
@@ -257,12 +345,22 @@ function encodeAuxiliaryState(
 			: {}),
 		localCommitments: [...state.localCommitments].map(([number, value]) => [
 			number.toString(),
-			commitment(value)
+			encodeCommitment(value)
 		]),
 		remoteCommitments: [...state.remoteCommitments].map(([number, value]) => [
 			number.toString(),
-			commitment(value)
-		])
+			encodeCommitment(value)
+		]),
+		...(state.revokedCommitments?.size
+			? {
+					revokedCommitments: [...state.revokedCommitments].map(
+						([number, value]): [string, ISerializedAuxiliaryCommitment] => [
+							number.toString(),
+							encodeCommitment(value)
+						]
+					)
+			  }
+			: {})
 	};
 }
 
@@ -272,69 +370,6 @@ export function deserializeAuxiliaryState(
 	if (!state || typeof state !== 'object') {
 		throw new Error('Malformed serialized asset channel state');
 	}
-	const leaf = (value: ISerializedAuxiliaryLeaf): ITaprootAuxLeaf => {
-		const script = bytes(value.script);
-		const version = value.leafVersion ?? 0xc0;
-		if (
-			script.length > 10000 ||
-			!Number.isInteger(version) ||
-			version < 0 ||
-			version > 254 ||
-			version & 1
-		)
-			throw new Error('Malformed serialized auxiliary leaf');
-		return {
-			script,
-			...(value.leafVersion !== undefined
-				? { leafVersion: value.leafVersion }
-				: {})
-		};
-	};
-	const commitment = (
-		value: ISerializedAuxiliaryCommitment
-	): IAuxiliaryCommitmentData => ({
-		customData: bytes(value.customData),
-		...(value.secondLevelRevocationKey !== undefined
-			? { secondLevelRevocationKey: childPoint(value.secondLevelRevocationKey) }
-			: {}),
-		...(value.secondLevelRevocationBasepoint !== undefined
-			? {
-					secondLevelRevocationBasepoint: childPoint(
-						value.secondLevelRevocationBasepoint
-					)
-			  }
-			: {}),
-		...(value.secondLevelCommitmentTxid !== undefined
-			? {
-					secondLevelCommitmentTxid: childTxid(value.secondLevelCommitmentTxid)
-			  }
-			: {}),
-		...(value.htlcOutputIndexes !== undefined
-			? {
-					htlcOutputIndexes: uniqueMap(
-						value.htlcOutputIndexes.map(([id, index]): [string, number] => [
-							htlcKey(id),
-							outputIndex(index)
-						])
-					)
-			  }
-			: {}),
-		outputLeaves: uniqueMap(
-			value.outputLeaves.map(([index, item]): [number, ITaprootAuxLeaf] => [
-				outputIndex(index),
-				leaf(item)
-			])
-		),
-		secondLevelLeaves: uniqueMap(
-			value.secondLevelLeaves.map(([id, item]): [string, ITaprootAuxLeaf] => [
-				htlcKey(id),
-				leaf(item)
-			])
-		),
-		...(value.peerSignatures !== undefined
-			? { peerSignatures: deserializeCustomRecords(value.peerSignatures) }
-			: {})
-	});
 	const localBalance = unsigned(state.localBalance);
 	const remoteBalance = unsigned(state.remoteBalance);
 	if (localBalance + remoteBalance > 0xffffffffffffffffn)
@@ -431,7 +466,7 @@ export function deserializeAuxiliaryState(
 			state.localCommitments.map(
 				([number, value]): [bigint, IAuxiliaryCommitmentData] => [
 					unsigned(number, 0xffffffffffffn),
-					commitment(value)
+					decodeCommitment(value)
 				]
 			)
 		),
@@ -439,10 +474,22 @@ export function deserializeAuxiliaryState(
 			state.remoteCommitments.map(
 				([number, value]): [bigint, IAuxiliaryCommitmentData] => [
 					unsigned(number, 0xffffffffffffn),
-					commitment(value)
+					decodeCommitment(value)
 				]
 			)
-		)
+		),
+		...(state.revokedCommitments !== undefined
+			? {
+					revokedCommitments: uniqueMap(
+						state.revokedCommitments.map(
+							([number, value]): [bigint, IAuxiliaryCommitmentData] => [
+								unsigned(number, 0xffffffffffffn),
+								decodeCommitment(value)
+							]
+						)
+					)
+			  }
+			: {})
 	};
 }
 

@@ -7,6 +7,8 @@
  * the commitments that can still be broadcast, not of every one it signed.
  */
 
+import { markAuxiliaryRevokedViewsStored } from '../../src/lightning/channel/auxiliary-revoked';
+import { serializeAuxiliaryCommitmentView } from '../../src/lightning/storage/auxiliary-serialization';
 import { expect } from 'chai';
 import type { Channel } from '../../src/lightning/channel/channel';
 import type { IChannelAuxiliaryProvider } from '../../src/lightning/channel/auxiliary';
@@ -413,13 +415,34 @@ describe('the asset provider at the edge of a commitment round (issue #2093 step
 			plainAlice: sizes(plain.aliceChannel),
 			plainBob: sizes(plain.bobChannel)
 		});
+		// The view of each revoked commitment of the peer leaves the row for
+		// the store of revoked views, which the storage of a node writes with
+		// the row and from which it is let go once that has committed
+		// (auxiliary-revoked-store.test.ts). Here the store is a list of the
+		// sizes of what it was handed.
+		const store: Record<'Alice' | 'Bob', number[]> = { Alice: [], Bob: [] };
+		const keep = (): void => {
+			for (const who of ['Alice', 'Bob'] as const) {
+				const state = (
+					who === 'Alice' ? asset.aliceChannel : asset.bobChannel
+				).getFullState();
+				const views = state.auxiliaryState!.revokedCommitments;
+				if (!views) continue;
+				for (const view of views.values()) {
+					store[who].push(serializeAuxiliaryCommitmentView(view).length);
+				}
+				markAuxiliaryRevokedViewsStored(state, [...views.keys()]);
+			}
+		};
 		for (let index = 0; index < 9; index++) {
 			round(asset, index);
+			keep();
 			round(plain, index);
 		}
 		const early = measure();
 		for (let index = 9; index < 42; index++) {
 			round(asset, index);
+			keep();
 			round(plain, index);
 		}
 		const late = measure();
@@ -431,6 +454,25 @@ describe('the asset provider at the edge of a commitment round (issue #2093 step
 			).getFullState().auxiliaryState!;
 			expect(auxiliary.localCommitments.size).to.be.at.most(2);
 			expect(auxiliary.remoteCommitments.size).to.be.at.most(2);
+			// The store was handed one view for each revoked commitment whose
+			// view left the row, each of a size that does not grow: the life
+			// repeats every three rounds, so eighteen entries early weigh
+			// what eighteen entries late do, give or take the digits of the
+			// counters in each.
+			expect(auxiliary.revokedCommitments).to.equal(undefined);
+			const entries = store[who];
+			const revoked = Number(
+				(who === 'Alice' ? asset.aliceChannel : asset.bobChannel).getFullState()
+					.remoteCommitmentNumber
+			);
+			expect(revoked - entries.length).to.be.within(0, 3);
+			expect(entries.length).to.be.greaterThan(60);
+			const weigh = (part: number[]): number =>
+				part.reduce((sum, bytes) => sum + bytes, 0);
+			expect(
+				Math.abs(weigh(entries.slice(6, 24)) - weigh(entries.slice(-18)))
+			).to.be.below(18 * 16);
+			expect(Math.max(...entries)).to.be.below(2048);
 			const a = `asset${who}`;
 			const p = `plain${who}`;
 			// The asset state itself is the size it was thirty rounds earlier,

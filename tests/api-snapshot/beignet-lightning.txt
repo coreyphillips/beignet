@@ -105,6 +105,7 @@ property ISerializedAuxiliaryState.remoteBalance: string
 property ISerializedAuxiliaryState.remoteCommitments: [ string, ISerializedAuxiliaryCommitment ][]
 property ISerializedAuxiliaryState.remoteShutdownRecords?: SerializedCustomRecords
 property ISerializedAuxiliaryState.resolvedHtlcs?: [ string, { htlcId: string; direction: channel.HtlcDirection; paymentHash: string; auxiliaryAmount: string; customRecords?: SerializedCustomRecords; outcome: 'fulfilled' | 'failed'; } ][]
+property ISerializedAuxiliaryState.revokedCommitments?: [ string, ISerializedAuxiliaryCommitment ][]
 unexported interface ISpliceUtxo
 property ISpliceUtxo.address: string
 property ISpliceUtxo.height: number
@@ -1849,6 +1850,8 @@ property channel.IChannelAuxiliaryState.remoteBalance: bigint
 property channel.IChannelAuxiliaryState.remoteCommitments: Map<bigint, channel.IAuxiliaryCommitmentData>
 property channel.IChannelAuxiliaryState.remoteShutdownRecords?: Map<bigint, Buffer>
 property channel.IChannelAuxiliaryState.resolvedHtlcs?: Map<string, channel.IAuxiliaryHtlcResolution>
+property channel.IChannelAuxiliaryState.revokedCommitmentHeld?: bigint
+property channel.IChannelAuxiliaryState.revokedCommitments?: Map<bigint, channel.IAuxiliaryCommitmentData>
 interface channel.IChannelClosedAction
 property channel.IChannelClosedAction.channelId: Buffer
 property channel.IChannelClosedAction.type: channel.ChannelActionType.CHANNEL_CLOSED
@@ -8495,6 +8498,7 @@ interface storage.IStorageBackend extends storage.IStorageCore, Partial<storage.
 method storage.IStorageBackend.checkpoint?(): void
 method storage.IStorageBackend.corruptRowCount?(): number
 method storage.IStorageBackend.inTransaction?(): boolean
+method storage.IStorageBackend.loadAuxiliaryRevokedCommitment?(channelId: string, commitmentNumber: bigint): channel.IAuxiliaryCommitmentData | null
 method storage.IStorageBackend.revokedHtlcSnapshotStore?(): object
 method storage.IStorageBackend.secretsEncryptedAtRest?(): boolean
 method storage.IStorageBackend.unreadableAssetChannelIds?(): string[]
