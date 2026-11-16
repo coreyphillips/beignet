@@ -2,9 +2,12 @@
  * What an asset channel (issue #2093) cannot do, said once and by name.
  *
  * An asset channel's funding key commits to an asset root and its
- * commitments carry asset leaves, so the code that closes, sweeps, punishes,
- * splices or re-shapes an ordinary channel builds the wrong transaction for
- * it. Every such path asks here first and refuses with an error that names
+ * commitments carry asset leaves, so the code that force closes, sweeps,
+ * punishes, splices or re-shapes an ordinary channel builds the wrong
+ * transaction for it. Its cooperative close is taught about asset state
+ * (see auxiliary-close): what stays refused of it is a close to an address
+ * the caller chose, since the provider names the script, and
+ * option_simple_close, whose taproot form the node does not speak. Every such path asks here first and refuses with an error that names
  * the channel and what was asked of it, instead of running the ordinary
  * logic. A path leaves this list in the step that teaches it about asset
  * state, and only then.
@@ -16,7 +19,8 @@ import { isOverlayChannel } from './types';
 
 /** What a caller asked of an asset channel that it does not do. */
 export type AuxiliaryUnsupportedOperation =
-	| 'a cooperative close'
+	| 'a simple close'
+	| 'a close to an address of the caller'
 	| 'a force close'
 	| 'on-chain resolution'
 	| 'a splice'

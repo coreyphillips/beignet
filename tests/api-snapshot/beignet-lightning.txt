@@ -972,6 +972,7 @@ function chain.signSweepInput(tx: bitcoinjs-lib#Transaction, inputIndex: number,
 namespace channel
 const channel.AUXILIARY_CHANNELS_API: Readonly<{ version: 0; surfaces: readonly [ "valueIncomingHtlc:three-outcome", "sendPaymentToRoute:assetPayment", "getAuxiliaryPaymentHtlcs", "onHtlcResolved:htlcId", "queryAuxiliaryRoute", "fundAuxiliaryChannel:unsigned", "onFundingSigned", "abandonAuxiliaryOpen", "IChannelInfo.auxiliary", "setAuxiliaryPaymentGate" ]; }>
 const channel.AUXILIARY_CHANNEL_DUST_LIMIT = 354n
+const channel.AUXILIARY_CLOSE_ASSET_OUTPUT_MINIMUM = 330n
 class channel.AuxiliaryChannelUnsupportedError extends beignet#CodedError<'ASSET_CHANNEL_UNSUPPORTED'>
 constructor channel.AuxiliaryChannelUnsupportedError(channelId: string, operation: channel.AuxiliaryUnsupportedOperation)
 readonly property channel.AuxiliaryChannelUnsupportedError.channelId: string
@@ -986,7 +987,7 @@ constructor channel.AuxiliaryProviderError(channelId: string, operation: string,
 readonly property channel.AuxiliaryProviderError.channelId: string
 readonly property channel.AuxiliaryProviderError.operation: string
 type channel.AuxiliarySpendKind = 'to_local_delayed' | 'to_local_revocation' | 'to_remote' | 'htlc_timeout' | 'htlc_success' | 'htlc_second_level_timeout' | 'htlc_second_level_success' | 'htlc_revocation' | 'second_level_delayed' | 'second_level_revocation'
-type channel.AuxiliaryUnsupportedOperation = 'a cooperative close' | 'a force close' | 'on-chain resolution' | 'a splice' | 'quiescence' | 'a delegated settlement epoch'
+type channel.AuxiliaryUnsupportedOperation = 'a simple close' | 'a close to an address of the caller' | 'a force close' | 'on-chain resolution' | 'a splice' | 'quiescence' | 'a delegated settlement epoch'
 const channel.BITCOIN_CHAIN_HASH: Buffer
 const channel.CHANNEL_INDEX_FLOOR_MAX: number
 const channel.CHANNEL_INDEX_FLOOR_STRIDE = 128
@@ -1199,6 +1200,7 @@ method channel.Channel.rebuildAnnouncement(localNodeId: Buffer, remoteNodeId: Bu
 method channel.Channel.receivedHtlcExceedsDustExposure(htlcId: bigint): boolean
 method channel.Channel.receivedHtlcExceedsFunderFee(htlcId: bigint): boolean
 method channel.Channel.receivedHtlcExpiredOnArrival(htlcId: bigint): boolean
+method channel.Channel.recordAuxiliaryCloseCandidate(txid: string, customData: Buffer): void
 method channel.Channel.recordCloseReason(reason: channel.ChannelCloseReason): boolean
 method channel.Channel.recordCooperativeCloseTx(txHex: string, localFeeSats?: bigint): void
 method channel.Channel.recordExternalCloseCandidate(txHex: string, localFeeSats: bigint): void
@@ -2301,6 +2303,7 @@ interface channel.ITaprootAuxLeaf
 property channel.ITaprootAuxLeaf.leafVersion?: number
 property channel.ITaprootAuxLeaf.script: Buffer
 interface channel.ITaprootClosingCache
+property channel.ITaprootClosingCache.auxiliaryCloseData?: Buffer
 property channel.ITaprootClosingCache.feeSatoshis: bigint
 property channel.ITaprootClosingCache.ourPartialSig: Buffer | null
 property channel.ITaprootClosingCache.session: unknown
@@ -2355,6 +2358,8 @@ method channel.IWireDurabilityBarrier.isReleased(sequence: bigint | null): boole
 readonly property channel.IWireDurabilityBarrier.namespaceLost?: boolean
 method channel.IWireDurabilityBarrier.whenReleased(sequence: bigint | null): Promise<{ released: boolean; reason: string; }>
 const channel.MAX_ACCEPTED_HTLCS = 483
+const channel.MAX_AUXILIARY_CLOSE_CANDIDATES = 32
+const channel.MAX_AUXILIARY_CLOSE_OUTPUTS = 64
 const channel.MAX_AUXILIARY_FUNDING_DATA_BYTES: number
 const channel.MAX_AUXILIARY_HTLCS_PER_PARTY = 83
 const channel.MAX_DUST_LIMIT_SATOSHIS = 1062n
@@ -2457,9 +2462,12 @@ method channel.ZeroConfManager.setFforFundingClient(peer: string, enabled: boole
 method channel.ZeroConfManager.setJitClients(pubkeyHexes: Iterable<string>): void
 method channel.ZeroConfManager.shouldUseZeroConf(peerPubkeyHex: string, requestedZeroConf: boolean): boolean
 function channel.aggregateLocalCommitmentSig(state: channel.IChannelState, signer: keys.ISigner, ourPublicNonce: Uint8Array, theirPublicNonce: Buffer, theirPartialSig: Buffer, localPerCommitmentPoint: Buffer, commitmentNumber?: bigint): Buffer
+function channel.applyAuxiliaryClose(state: channel.IChannelState, transaction: bitcoinjs-lib#Transaction, feeSatoshis: bigint): Buffer | undefined
 function channel.applyAuxiliaryFunding(state: channel.IChannelState, descriptor: channel.IAuxiliaryFundingDescriptor): void
 function channel.assetHtlcSighashType(channelType: Buffer | null | undefined): 0x81 | 0x83
 function channel.auxiliaryCarrierError(opening: channel.IAuxiliaryCarrier): string | undefined
+function channel.auxiliaryClosingRelayProfile(state: channel.IChannelState, feeSatoshis: bigint): { weight: number; feePaid: bigint; }
+function channel.auxiliaryClosingWeight(state: channel.IChannelState, baseWeight: number): number
 function channel.auxiliaryDustLimit(configured: bigint): bigint
 function channel.auxiliaryProviderError(state: Pick<channel.IChannelState, 'channelId' | 'temporaryChannelId'>, operation: string, cause: unknown): channel.AuxiliaryProviderError
 function channel.auxiliaryUnsupported(state: channel.IChannelState, operation: channel.AuxiliaryUnsupportedOperation): channel.AuxiliaryChannelUnsupportedError | undefined
@@ -2503,6 +2511,7 @@ function channel.outputWeight(scriptLen: number): number
 function channel.rbfFeerateFloor(previousFeeratePerkw: number): number
 function channel.receivedAddIrrevocablyCommitted(entry: channel.IHtlcEntry): boolean
 function channel.recencyHoldOrigin(state: { restoreRecencyUnproven?: boolean; reestablishRecencyUnproven?: boolean; reestablishSecretMissing?: boolean; }): channel.RecencyHoldOrigin | null
+function channel.recordAuxiliaryClose(state: channel.IChannelState, txid: string, customData: Buffer): void
 function channel.requireAuxiliaryProvider(state: channel.IChannelState): channel.IChannelAuxiliaryProvider
 function channel.scidAliasAnnounceRefusal(channelType: Buffer | null | undefined, announceChannel: boolean): string | null
 function channel.signRemoteCommitment(state: channel.IChannelState, signer: keys.ISigner, remotePerCommitmentPoint: Buffer, commitmentNumber?: bigint): { signature: Buffer; htlcSignatures: Buffer[]; }
@@ -5178,8 +5187,11 @@ property message.IRevokeAndAckMessage.channelId: Buffer
 property message.IRevokeAndAckMessage.nextLocalNonce?: Buffer
 property message.IRevokeAndAckMessage.nextPerCommitmentPoint: Buffer
 property message.IRevokeAndAckMessage.perCommitmentSecret: Buffer
+interface message.IShutdownDecodeOptions
+property message.IShutdownDecodeOptions.customRecords?: boolean
 interface message.IShutdownMessage
 property message.IShutdownMessage.channelId: Buffer
+property message.IShutdownMessage.customRecords?: message.CustomRecords
 property message.IShutdownMessage.scriptPubkey: Buffer
 property message.IShutdownMessage.shutdownNonce?: Buffer
 interface message.ISpliceAckMessage
@@ -5392,7 +5404,7 @@ function message.decodePeerStorageRetrievalMessage(payload: Buffer): message.IPe
 function message.decodePingMessage(payload: Buffer): message.IPingMessage
 function message.decodePongMessage(payload: Buffer): message.IPongMessage
 function message.decodeRevokeAndAckMessage(payload: Buffer): message.IRevokeAndAckMessage
-function message.decodeShutdownMessage(payload: Buffer): message.IShutdownMessage
+function message.decodeShutdownMessage(payload: Buffer, options?: message.IShutdownDecodeOptions): message.IShutdownMessage
 function message.decodeSpliceAckMessage(payload: Buffer): message.ISpliceAckMessage
 function message.decodeSpliceLockedMessage(payload: Buffer): message.ISpliceLockedMessage
 function message.decodeSpliceMessage(payload: Buffer): message.ISpliceMessage

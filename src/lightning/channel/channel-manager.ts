@@ -8,6 +8,8 @@
 
 import { auxiliaryProviderError } from './auxiliary';
 import { AuxiliaryOpenError, auxiliaryUnsupported } from './auxiliary-guard';
+import { applyAuxiliaryClose } from './auxiliary-close';
+import { classifyCommitmentTx } from '../chain/output-resolver';
 import { auxiliaryChannelOpens } from './auxiliary-switch';
 import type { CustomRecords } from '../message/custom-records';
 import { TypedEmitter } from '../../utils/typed-emitter';
@@ -3662,9 +3664,13 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		let monitor = this.monitors.get(channelIdHex);
 		const owner = this.channels.get(channelIdHex);
 		// An asset channel's commitment is not read with an ordinary
-		// channel's eyes: nothing here would find its outputs.
+		// channel's eyes: nothing here would find its outputs. Its
+		// cooperative close has no output for this node to resolve, and is
+		// followed to its confirmation like any other.
 		const assetRefusal =
 			owner &&
+			classifyCommitmentTx(spendingTx, owner.getFullState()).type !==
+				CommitmentType.COOPERATIVE_CLOSE &&
 			auxiliaryUnsupported(owner.getFullState(), 'on-chain resolution');
 		if (assetRefusal) {
 			this.emitContained('error', channelId, assetRefusal.message);
@@ -5747,7 +5753,9 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 	private handleShutdownMsg(peerPubkey: string, payload: Buffer): void {
 		let msg: ReturnType<typeof decodeShutdownMessage>;
 		try {
-			msg = decodeShutdownMessage(payload);
+			msg = decodeShutdownMessage(payload, {
+				customRecords: this.readsCustomRecords(payload)
+			});
 		} catch (err) {
 			this.failChannelForUndecodablePayload(
 				peerPubkey,
@@ -5906,7 +5914,12 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 						? msg.feeSatoshis
 						: 0n
 				);
-				if (channel.getFullState().externalClose) {
+				// An asset channel's close is written, with the provider's payload
+				// for it, before the transaction leaves.
+				if (
+					channel.getFullState().externalClose ||
+					channel.getFullState().auxiliaryState
+				) {
 					actions.unshift(
 						{ type: ChannelActionType.PERSIST_STATE },
 						{ type: ChannelActionType.BROADCAST_TX, tx: closeTx }
@@ -6025,6 +6038,8 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		fundingSatoshis: bigint;
 		localFundingPubkey: Buffer;
 		remoteFundingPubkey: Buffer;
+		/** An asset channel: the provider's payload for this transaction. */
+		auxiliaryCloseData?: Buffer;
 	} {
 		const { buildClosingTx } = require('../chain/closing');
 		const { createFundingScript } = require('../script/funding');
@@ -6062,6 +6077,11 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			sequence: isTaprootChannel(state.channelType) ? 0xfffffffd : 0xffffffff
 		});
 
+		// An asset channel: its provider lays the asset outputs over the
+		// payouts before anything is signed or verified. Nothing is touched
+		// for any other channel.
+		const auxiliaryCloseData = applyAuxiliaryClose(state, tx, feeSatoshis);
+
 		const { witnessScript } = createFundingScript(
 			state.localBasepoints.fundingPubkey,
 			state.remoteBasepoints!.fundingPubkey
@@ -6072,7 +6092,8 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			witnessScript,
 			fundingSatoshis: state.fundingSatoshis,
 			localFundingPubkey: state.localBasepoints.fundingPubkey,
-			remoteFundingPubkey: state.remoteBasepoints!.fundingPubkey
+			remoteFundingPubkey: state.remoteBasepoints!.fundingPubkey,
+			...(auxiliaryCloseData ? { auxiliaryCloseData } : {})
 		};
 	}
 
@@ -6119,13 +6140,15 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 
 		const state = channel.getFullState();
 		if (!state.remoteBasepoints) return null;
-		const { tx, fundingSatoshis } = this.buildClosingTxAndScript(
-			channel,
-			feeSatoshis
-		);
+		const { tx, fundingSatoshis, auxiliaryCloseData } =
+			this.buildClosingTxAndScript(channel, feeSatoshis);
+		// An asset channel's funding key commits to its asset root, and the
+		// close spends that key.
 		const { p2trOutput } = createTaprootFundingScript(
 			state.localBasepoints.fundingPubkey,
-			state.remoteBasepoints.fundingPubkey
+			state.remoteBasepoints.fundingPubkey,
+			undefined,
+			state.fundingTaprootMerkleRoot
 		);
 		const sighash = taprootCommitmentSighash(
 			tx,
@@ -6137,13 +6160,15 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			state.localBasepoints.fundingPubkey,
 			state.remoteBasepoints.fundingPubkey,
 			nonces.local,
-			nonces.remote
+			nonces.remote,
+			state.fundingTaprootMerkleRoot
 		);
 		const cache: ITaprootClosingCache = {
 			feeSatoshis,
 			session,
 			tx,
-			ourPartialSig: null
+			ourPartialSig: null,
+			...(auxiliaryCloseData ? { auxiliaryCloseData } : {})
 		};
 		channel.setTaprootClosingCache(cache);
 		return cache;
@@ -6170,6 +6195,14 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			cache.tx.toHex(),
 			channel.getFullState().role === ChannelRole.OPENER ? feeSatoshis : 0n
 		);
+		// An asset channel: the provider's payload for the transaction is
+		// kept from the moment a signature of ours can exist for it.
+		if (cache.auxiliaryCloseData) {
+			channel.recordAuxiliaryCloseCandidate(
+				cache.tx.getId(),
+				cache.auxiliaryCloseData
+			);
+		}
 		const nonces = channel.getClosingNonces();
 		const signer = this.signerFor(channel, false);
 		const partial = signer.signCommitmentPartial(
@@ -6285,7 +6318,9 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 
 		const { p2trOutput, outputKey } = createTaprootFundingScript(
 			state.localBasepoints.fundingPubkey,
-			state.remoteBasepoints.fundingPubkey
+			state.remoteBasepoints.fundingPubkey,
+			undefined,
+			state.fundingTaprootMerkleRoot
 		);
 		const sighash = taprootCommitmentSighash(
 			cache.tx,
@@ -10756,7 +10791,8 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		// Retain its candidate identity before any external-close signature
 		// leaves, including proposals and alternative simple-close variants.
 		if (
-			channel.getFullState().externalClose &&
+			(channel.getFullState().externalClose ||
+				channel.getFullState().auxiliaryState) &&
 			produced.some(
 				(action) =>
 					action.type === ChannelActionType.SEND_MESSAGE &&

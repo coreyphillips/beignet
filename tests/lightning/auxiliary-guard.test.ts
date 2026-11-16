@@ -19,8 +19,6 @@ import {
 	isAuxiliaryChannelState
 } from '../../src/lightning/channel/auxiliary-guard';
 import { ChannelState } from '../../src/lightning/channel/types';
-import { encodeShutdownMessage } from '../../src/lightning/message/channel-close';
-import { MessageType } from '../../src/lightning/message/types';
 import type { IAssetHost } from './helpers/auxiliary-nodes';
 import {
 	assetHost,
@@ -98,7 +96,7 @@ describe('an asset channel refuses what it has no asset handling for (issue #209
 		);
 	});
 
-	it('refuses, in the channel, every close, force close, splice, quiescence and delegated epoch', () => {
+	it('refuses, in the channel, a simple close, a close to an address of the caller, every force close, splice, quiescence and delegated epoch', () => {
 		const sent: number[] = [];
 		alice.node.on('message:outbound', (_peer: string, type: number) => {
 			sent.push(type);
@@ -107,20 +105,14 @@ describe('an asset channel refuses what it has no asset handling for (issue #209
 		const never = (): never => {
 			throw new Error('an asset channel was signed for as an ordinary one');
 		};
-		refusal(channel.initiateShutdown(SCRIPT), 'a cooperative close');
+		// An asset channel closes cooperatively to the script its provider
+		// names (step 9), so not to one the caller chose, and never by
+		// option_simple_close.
 		refusal(
-			channel.handleShutdown({ channelId, scriptPubkey: SCRIPT }),
-			'a cooperative close'
+			channel.initiateShutdown(SCRIPT, false, true),
+			'a close to an address of the caller'
 		);
-		refusal(channel.proposeClosingFee(never), 'a cooperative close');
-		refusal(
-			channel.handleClosingSigned(
-				{ channelId, feeSatoshis: 500n, signature: Buffer.alloc(64, 1) },
-				never
-			),
-			'a cooperative close'
-		);
-		refusal(channel.sendClosingComplete(500n, 0, never), 'a cooperative close');
+		refusal(channel.sendClosingComplete(500n, 0, never), 'a simple close');
 		refusal(
 			channel.handleClosingComplete(
 				{
@@ -133,18 +125,12 @@ describe('an asset channel refuses what it has no asset handling for (issue #209
 				never,
 				never
 			),
-			'a cooperative close'
+			'a simple close'
 		);
 		refusal(
 			channel.handleClosingSig({ channelId } as never, never),
-			'a cooperative close'
+			'a simple close'
 		);
-		expect(() => channel.quoteCooperativeClose(SCRIPT, false))
-			.to.throw(AuxiliaryChannelUnsupportedError)
-			.with.property(
-				'message',
-				`An asset channel does not support a cooperative close (channel ${hex})`
-			);
 		refusal(channel.forceClose(signer), 'a force close');
 		expect(channel.prepareForceClose(signer)).to.deep.equal({
 			ok: false,
@@ -175,7 +161,7 @@ describe('an asset channel refuses what it has no asset handling for (issue #209
 		untouched(0, sent);
 	});
 
-	it('refuses through the node and its manager, and a peer that asks is not answered as an ordinary channel would be', () => {
+	it('refuses through the node and its manager', () => {
 		const sent: number[] = [];
 		for (const host of [alice, bob]) {
 			host.node.on('message:outbound', (_peer: string, type: number) => {
@@ -188,9 +174,10 @@ describe('an asset channel refuses what it has no asset handling for (issue #209
 			.on('error', (_id: unknown, message: unknown) => {
 				errors.push(String(message));
 			});
-		const close = alice.node.closeChannel(channelId, SCRIPT);
+		const close = alice.node.closeChannel(channelId, SCRIPT, false, true);
+		expect(close.ok).to.equal(false);
 		expect(JSON.stringify(close)).to.include(
-			`An asset channel does not support a cooperative close (channel ${hex})`
+			`An asset channel does not support a close to an address of the caller (channel ${hex})`
 		);
 		const force = alice.node.forceCloseChannel(channelId, SCRIPT);
 		expect(force.ok).to.equal(false);
@@ -204,17 +191,11 @@ describe('an asset channel refuses what it has no asset handling for (issue #209
 		expect(splice.error).to.equal(
 			`An asset channel does not support a splice (channel ${hex})`
 		);
-		// The peer asks to close.
-		alice.node
-			.getChannelManager()
-			.handleMessage(
-				bob.node.getNodeId(),
-				MessageType.SHUTDOWN,
-				encodeShutdownMessage({ channelId, scriptPubkey: SCRIPT })
-			);
-		expect(errors).to.include(
-			`An asset channel does not support a cooperative close (channel ${hex})`
-		);
+		expect(errors).to.deep.equal([
+			`An asset channel does not support a close to an address of the caller (channel ${hex})`,
+			`An asset channel does not support a force close (channel ${hex})`,
+			`An asset channel does not support a splice (channel ${hex})`
+		]);
 		untouched(0, sent);
 	});
 
@@ -227,9 +208,14 @@ describe('an asset channel refuses what it has no asset handling for (issue #209
 		const state = channel.getFullState();
 		const spend = new bitcoin.Transaction();
 		spend.version = 2;
+		// A commitment carries the BOLT 3 stamp in its locktime and sequence;
+		// a spend without it is a cooperative close, which the channel now
+		// follows (step 9).
+		spend.locktime = 0x20000001;
 		spend.addInput(
 			Buffer.from(state.fundingTxid!).reverse(),
-			state.fundingOutputIndex!
+			state.fundingOutputIndex!,
+			0x80000001
 		);
 		spend.addOutput(SCRIPT, 1_000);
 		expect(
@@ -251,7 +237,8 @@ describe('an asset channel refuses what it has no asset handling for (issue #209
 			const plain = carol.node.getChannelManager().getChannel(ordinary)!;
 			expect(isAuxiliaryChannelState(plain.getFullState())).to.equal(false);
 			for (const operation of [
-				'a cooperative close',
+				'a simple close',
+				'a close to an address of the caller',
 				'a force close',
 				'on-chain resolution',
 				'a splice',

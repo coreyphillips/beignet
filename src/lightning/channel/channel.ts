@@ -65,6 +65,7 @@ import type {
 	IClosingSigMessage
 } from '../message/channel-close';
 import {
+	decodeShutdownMessage,
 	encodeShutdownMessage,
 	encodeClosingSignedMessage,
 	ClosingSigVariant,
@@ -135,6 +136,12 @@ import {
 	requireAuxiliaryProvider,
 	validateAuxiliaryChannelType
 } from './auxiliary';
+import {
+	auxiliaryClosingRelayProfile,
+	auxiliaryClosingWeight,
+	recordAuxiliaryClose,
+	AUXILIARY_CLOSE_ASSET_OUTPUT_MINIMUM
+} from './auxiliary-close';
 import { auxiliaryCsvPolicyError } from './auxiliary-csv';
 import { auxiliaryCarrierError } from './auxiliary-funding';
 import type { AuxiliaryUnsupportedOperation } from './auxiliary-guard';
@@ -884,6 +891,8 @@ export interface ITaprootClosingCache {
 	tx: import('bitcoinjs-lib').Transaction;
 	/** Our 32-byte MuSig2 partial signature over the closing tx, once made. */
 	ourPartialSig: Buffer | null;
+	/** An asset channel: the provider's payload for this closing transaction. */
+	auxiliaryCloseData?: Buffer;
 }
 
 /**
@@ -8662,11 +8671,6 @@ export class Channel {
 		liveFeeratePerKw = 0,
 		acceptStaleStateRisk = false
 	): ICooperativeCloseQuote {
-		const assetRefusal = auxiliaryUnsupported(
-			this._state,
-			'a cooperative close'
-		);
-		if (assetRefusal) throw assetRefusal;
 		const state = this._state;
 		if (state.state !== ChannelState.NORMAL || this.isQuiescing()) {
 			throw new Error('Cannot close cooperatively: channel is not ready');
@@ -8690,25 +8694,33 @@ export class Channel {
 		// The peer chooses its shutdown script later. Price a P2TR/P2WSH
 		// output until that script is known and label every quote estimated.
 		const remoteLength = state.remoteShutdownScript?.length ?? 34;
-		const weight = closingTxWeight(scriptPubkey.length, remoteLength, taproot);
-		const calculated = calculateClosingFee(
-			rate,
-			scriptPubkey.length,
-			remoteLength,
-			taproot
+		// An asset channel closes to a taproot script its provider names,
+		// whatever script was asked for, and may add outputs of its own.
+		const weight = this._closingWeight(
+			closingTxWeight(
+				state.auxiliaryState ? 34 : scriptPubkey.length,
+				remoteLength,
+				taproot
+			)
 		);
+		const calculated = state.auxiliaryState
+			? BigInt(Math.ceil((weight * rate) / 1000))
+			: calculateClosingFee(rate, scriptPubkey.length, remoteLength, taproot);
 		const floor = minRelayFeeForWeight(weight);
 		const fee = calculated > floor ? calculated : floor;
 		const localPays = simple || state.role === ChannelRole.OPENER;
 		const localFee = localPays ? fee : 0n;
 		const amount = state.localBalanceMsat / 1000n - localFee;
-		const dust = simple
-			? isDustOutput(scriptPubkey, amount)
-			: amount <
-			  closingOutputDustLimit(
-					scriptPubkey,
-					state.localConfig.dustLimitSatoshis
-			  );
+		const dust =
+			(state.auxiliaryState?.localBalance ?? 0n) > 0n
+				? amount < AUXILIARY_CLOSE_ASSET_OUTPUT_MINIMUM
+				: simple
+				? isDustOutput(scriptPubkey, amount)
+				: amount <
+				  closingOutputDustLimit(
+						scriptPubkey,
+						state.localConfig.dustLimitSatoshis
+				  );
 		if (amount <= 0n || dust)
 			throw new Error('Cannot close cooperatively: our payout would be dust');
 		const profile = closingTxRelayProfile({
@@ -8779,8 +8791,14 @@ export class Channel {
 		acceptStaleStateRisk = false,
 		externalDestination = false
 	): ChannelAction[] {
-		const assetRefusal = this._refuseForAssetChannel('a cooperative close');
-		if (assetRefusal) return assetRefusal;
+		// An asset channel closes to the script its provider names, so it
+		// cannot be closed to an address the caller chose.
+		if (externalDestination) {
+			const assetRefusal = this._refuseForAssetChannel(
+				'a close to an address of the caller'
+			);
+			if (assetRefusal) return assetRefusal;
+		}
 		// A mutual close needs no revocation, which is why the hold allows the
 		// channel to resume - but it pays out the balances THIS row carries,
 		// and a stale capsule's allocation can only ever be the peer-favourable
@@ -8890,6 +8908,130 @@ export class Channel {
 		return actions;
 	}
 
+	/** What stopped the provider from building the close last judged for relay. */
+	private _auxiliaryCloseFailure: unknown;
+
+	/** The refusal of a close step an asset channel's provider could not answer. */
+	private _auxiliaryCloseRefused(
+		cause: unknown,
+		operation = 'a cooperative close'
+	): ChannelAction[] {
+		return [
+			{
+				type: ChannelActionType.ERROR,
+				message: auxiliaryProviderError(this._state, operation, cause).message,
+				code: ChannelErrorCode.ASSET_PROVIDER_REFUSED
+			}
+		];
+	}
+
+	/**
+	 * The closing weight with the outputs an asset close adds. Throws the
+	 * typed provider error when the provider cannot say; the entry points of
+	 * a close ask _auxiliaryCloseShapeRefusal first.
+	 */
+	private _closingWeight(baseWeight: number): number {
+		if (!this._state.auxiliaryState) return baseWeight;
+		try {
+			return auxiliaryClosingWeight(this._state, baseWeight);
+		} catch (err) {
+			throw auxiliaryProviderError(this._state, 'a cooperative close', err);
+		}
+	}
+
+	/** Null when the provider can say what outputs its close adds, else the refusal. */
+	private _auxiliaryCloseShapeRefusal(): ChannelAction[] | null {
+		if (!this._state.auxiliaryState) return null;
+		try {
+			auxiliaryClosingWeight(this._state, 0);
+			return null;
+		} catch (err) {
+			return this._auxiliaryCloseRefused(err);
+		}
+	}
+
+	/**
+	 * Null when the provider can build the asset side of the close at this
+	 * fee, or for any other channel; else the refusal. Signs and stores
+	 * nothing.
+	 */
+	private _auxiliaryCloseRefusal(feeSatoshis: bigint): ChannelAction[] | null {
+		if (!this._state.auxiliaryState) return null;
+		try {
+			auxiliaryClosingRelayProfile(this._state, feeSatoshis);
+			return null;
+		} catch (err) {
+			return this._auxiliaryCloseRefused(err);
+		}
+	}
+
+	/**
+	 * Keep the provider's payload for a closing transaction this node is
+	 * about to sign. The manager calls it before our signature exists, and
+	 * the row is written before that signature leaves.
+	 */
+	recordAuxiliaryCloseCandidate(txid: string, customData: Buffer): void {
+		recordAuxiliaryClose(this._state, txid, customData);
+	}
+
+	/**
+	 * The script an asset channel closes to and the asset records that
+	 * travel beside it, as its provider names them, or the refusal. What was
+	 * sent once stays: the peer holds it. Stores nothing; the caller does,
+	 * once nothing else can refuse the shutdown.
+	 */
+	private _prepareAuxiliaryShutdown(
+		destinationScript: Buffer
+	):
+		| { scriptPubkey: Buffer; customRecords: Map<bigint, Buffer> }
+		| { refusal: ChannelAction[] } {
+		const auxiliary = this._state.auxiliaryState!;
+		const sentScript = this._state.localShutdownScript;
+		if (auxiliary.localShutdownRecords && sentScript && sentScript.length > 0) {
+			return {
+				scriptPubkey: sentScript,
+				customRecords: auxiliary.localShutdownRecords
+			};
+		}
+		try {
+			if (!this._signer) throw new Error('Asset shutdown requires a signer');
+			const prepared = requireAuxiliaryProvider(this._state).prepareShutdown(
+				this._state,
+				destinationScript,
+				this._signer
+			);
+			if (
+				!prepared ||
+				!Buffer.isBuffer(prepared.scriptPubkey) ||
+				!isValidShutdownScript(prepared.scriptPubkey, true, false)
+			) {
+				throw new Error('Invalid asset shutdown script');
+			}
+			const scriptPubkey = Buffer.from(prepared.scriptPubkey);
+			const customRecords =
+				copyCustomRecords(prepared.customRecords) ?? new Map<bigint, Buffer>();
+			// The reader's rules, before anything is sent: what leaves is what
+			// the peer reads, and what this node reads back from its row.
+			const read = decodeShutdownMessage(
+				encodeShutdownMessage({
+					channelId: this._state.channelId!,
+					scriptPubkey,
+					customRecords
+				}),
+				{ customRecords: true }
+			);
+			if (
+				!read.scriptPubkey.equals(scriptPubkey) ||
+				!sameCustomRecords(read.customRecords, customRecords)
+			) {
+				throw new Error('Asset shutdown records do not survive the wire');
+			}
+			return { scriptPubkey, customRecords };
+		} catch (err) {
+			return { refusal: this._auxiliaryCloseRefused(err, 'a shutdown') };
+		}
+	}
+
 	private _initiateShutdown(scriptPubkey: Buffer): ChannelAction[] {
 		// option_simple_close allows re-sending shutdown to update the local
 		// script mid-negotiation (restarting the signing flow); legacy close
@@ -8916,6 +9058,19 @@ export class Channel {
 			];
 		}
 
+		// An asset channel closes to the script its provider names, with the
+		// asset records that travel beside it. Asked before anything of the
+		// shutdown is stored or sent.
+		let assetShutdown:
+			| { scriptPubkey: Buffer; customRecords: Map<bigint, Buffer> }
+			| undefined;
+		if (this._state.auxiliaryState) {
+			const prepared = this._prepareAuxiliaryShutdown(scriptPubkey);
+			if ('refusal' in prepared) return prepared.refusal;
+			assetShutdown = prepared;
+			scriptPubkey = prepared.scriptPubkey;
+		}
+
 		// Guard against a misconfigured local close script — never broadcast a
 		// shutdown whose output we could not spend.
 		if (
@@ -8935,6 +9090,10 @@ export class Channel {
 		}
 
 		this._state.localShutdownScript = scriptPubkey;
+		if (assetShutdown) {
+			this._state.auxiliaryState!.localShutdownRecords =
+				assetShutdown.customRecords;
+		}
 		if (this._state.state === ChannelState.NORMAL) {
 			this._state.state = ChannelState.SHUTTING_DOWN;
 		} else {
@@ -8945,7 +9104,8 @@ export class Channel {
 
 		const msg: IShutdownMessage = {
 			channelId: this._state.channelId!,
-			scriptPubkey
+			scriptPubkey,
+			...(assetShutdown ? { customRecords: assetShutdown.customRecords } : {})
 		};
 		if (isTaprootChannel(this._state.channelType)) {
 			// Simple-taproot close: every shutdown we send starts a fresh MuSig2
@@ -8963,9 +9123,11 @@ export class Channel {
 	 * should retransmit the plain shutdown directly.
 	 */
 	buildShutdownRetransmit(): IShutdownMessage {
+		const assetRecords = this._state.auxiliaryState?.localShutdownRecords;
 		const msg: IShutdownMessage = {
 			channelId: this._state.channelId!,
-			scriptPubkey: this._state.localShutdownScript ?? Buffer.alloc(0)
+			scriptPubkey: this._state.localShutdownScript ?? Buffer.alloc(0),
+			...(assetRecords ? { customRecords: assetRecords } : {})
 		};
 		if (isTaprootChannel(this._state.channelType)) {
 			msg.shutdownNonce = this._refreshOurClosingNonce();
@@ -8988,8 +9150,6 @@ export class Channel {
 	 *   a real script derived from the funding pubkey.
 	 */
 	handleShutdown(msg: IShutdownMessage, localScript?: Buffer): ChannelAction[] {
-		const assetRefusal = this._refuseForAssetChannel('a cooperative close');
-		if (assetRefusal) return assetRefusal;
 		// Lifecycle first, so the wire-visible content arms below can only ever
 		// fire on a live channel: outside these states the peer may simply not
 		// have seen our terminal transition yet, and a wire error here would
@@ -9065,6 +9225,53 @@ export class Channel {
 			return this._failChannelWithWireError('Invalid shutdown scriptPubkey');
 		}
 
+		// An asset channel: the provider judges the asset records beside the
+		// peer's script, and our own answer is prepared, before anything of
+		// this shutdown is stored.
+		let ownAssetShutdown:
+			| { scriptPubkey: Buffer; customRecords: Map<bigint, Buffer> }
+			| undefined;
+		if (this._state.auxiliaryState) {
+			const auxiliary = this._state.auxiliaryState;
+			let records = new Map<bigint, Buffer>();
+			let valid: boolean;
+			try {
+				records = copyCustomRecords(msg.customRecords) ?? records;
+				valid =
+					requireAuxiliaryProvider(this._state).verifyShutdown(this._state, {
+						scriptPubkey: Buffer.from(msg.scriptPubkey),
+						customRecords: records
+					}) === true;
+			} catch (err) {
+				// A provider that cannot judge is not the peer's fault: refuse
+				// here, by name, and leave the channel as it was.
+				return this._auxiliaryCloseRefused(err, 'a shutdown');
+			}
+			if (!valid) {
+				return this._failChannelWithWireError(
+					'Invalid asset shutdown descriptor'
+				);
+			}
+			const previous = auxiliary.remoteShutdownRecords;
+			if (
+				previous &&
+				(!sameCustomRecords(previous, records) ||
+					!this._state.remoteShutdownScript?.equals(msg.scriptPubkey))
+			) {
+				return this._failChannelWithWireError(
+					'Asset shutdown descriptor changed during negotiation'
+				);
+			}
+			if (this._state.state === ChannelState.NORMAL) {
+				const prepared = this._prepareAuxiliaryShutdown(
+					localScript ?? this._state.localShutdownScript ?? Buffer.alloc(0)
+				);
+				if ('refusal' in prepared) return prepared.refusal;
+				ownAssetShutdown = prepared;
+			}
+			auxiliary.remoteShutdownRecords = records;
+		}
+
 		// Accept shutdown in NEGOTIATING_CLOSING — peer retransmits after
 		// reestablish, or (simple close) updates its script mid-negotiation,
 		// which abandons our in-flight closing_complete round.
@@ -9097,6 +9304,11 @@ export class Channel {
 
 		// If we haven't sent shutdown yet, send our shutdown response
 		if (this._state.state === ChannelState.NORMAL) {
+			if (ownAssetShutdown) {
+				localScript = ownAssetShutdown.scriptPubkey;
+				this._state.auxiliaryState!.localShutdownRecords =
+					ownAssetShutdown.customRecords;
+			}
 			if (localScript) {
 				this._state.localShutdownScript = localScript;
 			}
@@ -9108,7 +9320,10 @@ export class Channel {
 			if (this._state.localShutdownScript.length > 0) {
 				const response: IShutdownMessage = {
 					channelId: this._state.channelId!,
-					scriptPubkey: this._state.localShutdownScript
+					scriptPubkey: this._state.localShutdownScript,
+					...(ownAssetShutdown
+						? { customRecords: ownAssetShutdown.customRecords }
+						: {})
 				};
 				if (isTaprootChannel(this._state.channelType)) {
 					response.shutdownNonce = this._refreshOurClosingNonce();
@@ -9163,8 +9378,6 @@ export class Channel {
 	proposeClosingFee(
 		signatureOrFn: Buffer | ((feeSatoshis: bigint) => Buffer)
 	): ChannelAction[] {
-		const assetRefusal = this._refuseForAssetChannel('a cooperative close');
-		if (assetRefusal) return assetRefusal;
 		if (
 			this._state.state !== ChannelState.NEGOTIATING_CLOSING &&
 			this._state.state !== ChannelState.SHUTTING_DOWN
@@ -9218,15 +9431,27 @@ export class Channel {
 				// this connection yet; the proposal fires when it does.
 				return [];
 			}
+			const assetShapeRefusal = this._auxiliaryCloseShapeRefusal();
+			if (assetShapeRefusal) return assetShapeRefusal;
 			const idealFee = this.calculateIdealClosingFee();
 			if (!this.closingFeeRelays(idealFee)) {
 				return this.refuseUnrelayableClosingFee('Cannot propose closing fee');
 			}
+			const previousProposal = this._state.lastProposedClosingFeeSat;
 			this._state.lastProposedClosingFeeSat = idealFee;
-			const partial =
-				typeof signatureOrFn === 'function'
-					? signatureOrFn(idealFee)
-					: signatureOrFn;
+			let partial: Buffer;
+			try {
+				partial =
+					typeof signatureOrFn === 'function'
+						? signatureOrFn(idealFee)
+						: signatureOrFn;
+			} catch (err) {
+				// Only an asset channel has a provider that can fail here: it
+				// refuses by name, nothing is sent and no offer is held.
+				if (!this._state.auxiliaryState) throw err;
+				this._state.lastProposedClosingFeeSat = previousProposal;
+				return this._auxiliaryCloseRefused(err);
+			}
 			this._hasSignedClosing = true;
 			const taprootMsg: IClosingSignedMessage = {
 				channelId: this._state.channelId!,
@@ -9276,8 +9501,18 @@ export class Channel {
 		signClosingFn: (feeSatoshis: bigint) => Buffer,
 		verifyClosingFn?: (feeSatoshis: bigint, signature: Buffer) => boolean
 	): ChannelAction[] {
-		const assetRefusal = this._refuseForAssetChannel('a cooperative close');
-		if (assetRefusal) return assetRefusal;
+		// An asset channel: the peer can send the close this node already
+		// accepted once more, after our reply crossed it. Only that exact
+		// message is taken, also after a restart, and nothing is signed for it.
+		if (
+			this._state.state === ChannelState.CLOSED &&
+			this._state.lastCooperativeCloseTxHex &&
+			this._state.auxiliaryState?.acceptedClosingSigned?.equals(
+				encodeClosingSignedMessage(msg)
+			)
+		) {
+			return [];
+		}
 		if (
 			this._state.state !== ChannelState.NEGOTIATING_CLOSING &&
 			this._state.state !== ChannelState.SHUTTING_DOWN
@@ -9330,11 +9565,21 @@ export class Channel {
 
 		// Simple-taproot close: single-round MuSig2 negotiation.
 		if (isTaprootChannel(this._state.channelType)) {
-			return this._handleTaprootClosingSigned(
+			const actions = this._handleTaprootClosingSigned(
 				msg,
 				signClosingFn,
 				verifyClosingFn
 			);
+			if (
+				this._state.auxiliaryState &&
+				actions.some(
+					(action) => action.type === ChannelActionType.CHANNEL_CLOSED
+				)
+			) {
+				this._state.auxiliaryState.acceptedClosingSigned =
+					encodeClosingSignedMessage(msg);
+			}
+			return actions;
 		}
 
 		// Initialize our fee range if not done yet
@@ -9514,6 +9759,8 @@ export class Channel {
 
 		const peerSigValid = (feeSatoshis: bigint): boolean =>
 			!verifyClosingFn || verifyClosingFn(feeSatoshis, msg.partialSignature!);
+		const assetShapeRefusal = this._auxiliaryCloseShapeRefusal();
+		if (assetShapeRefusal) return assetShapeRefusal;
 
 		// Initiator: we already made our (only) offer.
 		if (this._state.lastProposedClosingFeeSat !== null) {
@@ -9526,6 +9773,8 @@ export class Channel {
 						`got ${msg.feeSatoshis}`
 				);
 			}
+			const assetCloseRefusal = this._auxiliaryCloseRefusal(msg.feeSatoshis);
+			if (assetCloseRefusal) return assetCloseRefusal;
 			if (!peerSigValid(msg.feeSatoshis)) {
 				return this._failChannelWithWireError(
 					'Coop-close: peer closing partial signature failed to verify'
@@ -9568,7 +9817,7 @@ export class Channel {
 		const bandLocalLen = this._state.localShutdownScript?.length ?? 22;
 		const bandRemoteLen = this._state.remoteShutdownScript?.length ?? 22;
 		const bandWeight = BigInt(
-			closingTxWeight(bandLocalLen, bandRemoteLen, true)
+			this._closingWeight(closingTxWeight(bandLocalLen, bandRemoteLen, true))
 		);
 		const idealFee = (bandWeight * bandFeeRate + 999n) / 1000n;
 		// The lenient interop floor, but never below what the tx needs to relay:
@@ -9624,6 +9873,12 @@ export class Channel {
 				`Taproot closing fee ${msg.feeSatoshis} exceeds opener balance ${openerBalanceSat}`
 			);
 		}
+		// An asset channel: the provider builds the asset side of the close
+		// this message asks for before its signature is judged, so a provider
+		// that cannot answer refuses here, by name, and is not taken for a bad
+		// signature of the peer.
+		const assetCloseRefusal = this._auxiliaryCloseRefusal(msg.feeSatoshis);
+		if (assetCloseRefusal) return assetCloseRefusal;
 		if (!peerSigValid(msg.feeSatoshis)) {
 			return this._failChannelWithWireError(
 				'Coop-close: peer closing partial signature failed to verify'
@@ -9633,7 +9888,15 @@ export class Channel {
 			// Duplicate closing_signed in the same session — our reply is out.
 			return [];
 		}
-		const partial = signClosingFn(msg.feeSatoshis);
+		let partial: Buffer;
+		try {
+			partial = signClosingFn(msg.feeSatoshis);
+		} catch (err) {
+			// Only an asset channel has a provider that can fail here: it
+			// refuses by name, with nothing signed, sent or stored.
+			if (!this._state.auxiliaryState) throw err;
+			return this._auxiliaryCloseRefused(err);
+		}
 		this._hasSignedClosing = true;
 		this._state.lastProposedClosingFeeSat = msg.feeSatoshis;
 		this._state.state = ChannelState.CLOSED;
@@ -9680,12 +9943,20 @@ export class Channel {
 		// real weight.
 		const localLen = this._state.localShutdownScript?.length ?? 22;
 		const remoteLen = this._state.remoteShutdownScript?.length ?? 22;
-		const fee = calculateClosingFee(
-			feeRate,
-			localLen,
-			remoteLen,
-			isTaprootChannel(this._state.channelType)
-		);
+		const fee = this._state.auxiliaryState
+			? BigInt(
+					Math.ceil(
+						(this._closingWeight(closingTxWeight(localLen, remoteLen, true)) *
+							feeRate) /
+							1000
+					)
+			  )
+			: calculateClosingFee(
+					feeRate,
+					localLen,
+					remoteLen,
+					isTaprootChannel(this._state.channelType)
+			  );
 		// A feerate below ~1 sat/vB (a stale or lowballed commitment feerate on a
 		// non-anchor channel) prices a tx nothing will relay, and the acceptance
 		// range and counter clamp are both fractions of this one fee.
@@ -9706,10 +9977,12 @@ export class Channel {
 		const localLen = this._state.localShutdownScript?.length ?? 22;
 		const remoteLen = this._state.remoteShutdownScript?.length ?? 22;
 		return minRelayFeeForWeight(
-			closingTxWeight(
-				localLen,
-				remoteLen,
-				isTaprootChannel(this._state.channelType)
+			this._closingWeight(
+				closingTxWeight(
+					localLen,
+					remoteLen,
+					isTaprootChannel(this._state.channelType)
+				)
 			)
 		);
 	}
@@ -9721,6 +9994,13 @@ export class Channel {
 	 * to pay a miner with.
 	 */
 	private refuseUnrelayableClosingFee(prefix: string): ChannelAction[] {
+		// An asset channel whose provider could not build the close is
+		// refused for that, by name, and not for a fee.
+		const assetFailure = this._auxiliaryCloseFailure;
+		if (assetFailure !== undefined) {
+			this._auxiliaryCloseFailure = undefined;
+			return this._auxiliaryCloseRefused(assetFailure);
+		}
 		return [
 			{
 				type: ChannelActionType.ERROR,
@@ -9755,6 +10035,22 @@ export class Channel {
 				this.ownClosingOutputDustLimit()
 		)
 			return false;
+		if (
+			this._state.auxiliaryState &&
+			this._state.localShutdownScript &&
+			this._state.remoteShutdownScript
+		) {
+			// Judged on the exact layout the provider answers, which is the
+			// transaction that would be signed.
+			this._auxiliaryCloseFailure = undefined;
+			try {
+				const profile = auxiliaryClosingRelayProfile(this._state, feeSatoshis);
+				return profile.feePaid >= minRelayFeeForWeight(profile.weight);
+			} catch (err) {
+				this._auxiliaryCloseFailure = err;
+				return false;
+			}
+		}
 		const { feePaid, weight } = closingTxRelayProfile({
 			fundingAmount: this._state.fundingSatoshis,
 			localScriptPubkey:
@@ -9912,7 +10208,7 @@ export class Channel {
 			closeeScriptPubkey: Buffer
 		) => Buffer
 	): ChannelAction[] {
-		const assetRefusal = this._refuseForAssetChannel('a cooperative close');
+		const assetRefusal = this._refuseForAssetChannel('a simple close');
 		if (assetRefusal) return assetRefusal;
 		const err = (message: string): ChannelAction[] => [
 			{ type: ChannelActionType.ERROR, message }
@@ -10058,7 +10354,7 @@ export class Channel {
 			closeeScriptPubkey: Buffer
 		) => Buffer
 	): ChannelAction[] {
-		const assetRefusal = this._refuseForAssetChannel('a cooperative close');
+		const assetRefusal = this._refuseForAssetChannel('a simple close');
 		if (assetRefusal) return assetRefusal;
 		// A closing_complete that does not fit the channel's state (or arrives
 		// while something is still unresolved) is refused locally. One refused
@@ -10275,7 +10571,7 @@ export class Channel {
 			signature: Buffer
 		) => boolean
 	): ChannelAction[] {
-		const assetRefusal = this._refuseForAssetChannel('a cooperative close');
+		const assetRefusal = this._refuseForAssetChannel('a simple close');
 		if (assetRefusal) return assetRefusal;
 		// State refusals stay local; a closing_sig refused for its content gets
 		// a warning and a disconnect, as in handleClosingComplete.
