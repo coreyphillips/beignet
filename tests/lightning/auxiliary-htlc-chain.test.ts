@@ -898,6 +898,11 @@ describe('the HTLCs of an asset channel on the chain (issue #2093 step 10)', fun
 		].filter((entry) => entry.paymentHash.equals(held.paymentHash));
 		expect(later).to.have.length(1);
 		expect(later[0].id).to.equal(1n);
+		// The record is for this HTLC, by its id: failed, whatever
+		// preimage the store holds for its payment hash.
+		expect(store.auxiliaryHtlcDecision(pair.channelId, 1n)).to.deep.equal({
+			outcome: 'fail'
+		});
 		expect(parkedOf(pair.bob, held.paymentHash)).to.equal(0);
 		store.recordPreimage(held.paymentHash, held.preimage);
 

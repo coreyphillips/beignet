@@ -31,6 +31,7 @@ import {
 	assetChainWorld,
 	gateMessages,
 	holdUnits,
+	monitorRoundTrips,
 	settle,
 	trackedOutputs,
 	type IAssetChainPair
@@ -163,6 +164,9 @@ describe('a claim of an asset HTLC that lost on the chain is said as a loss (iss
 		expect(late(bob)).to.have.length(1);
 		expect(late(bob)[0]).to.include(channelId.toString('hex'));
 		expect(late(bob)[0]).to.include(`${held.cltvExpiry}`);
+		// The mark that it was said is in the monitor's row, which reads
+		// back as it was written.
+		monitorRoundTrips(bob, channelId, ['auxiliaryClaimLateNoted']);
 
 		// The payer's timeout takes the output.
 		for (let i = 0; i < 8 && !isSpent(htlcOf(bob, pair)); i++) {

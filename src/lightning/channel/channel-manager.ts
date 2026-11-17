@@ -4364,6 +4364,10 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			this._drainDeferredSettles(channelIdHex);
 		}
 
+		// Asset channels: what the host's callback has not taken is offered
+		// again, whatever the state of the channel's monitor.
+		this._redeliverAuxiliaryResolutions();
+
 		const allActions: ChainAction[] = [];
 
 		for (const [channelIdHex, monitor] of this.monitors) {
@@ -12028,6 +12032,51 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		Channel,
 		string
 	>();
+
+	/**
+	 * Per channel, the passes the redelivery on a block has made in the
+	 * current interval.
+	 */
+	private readonly _auxiliaryDeliveryWindows = new Map<
+		string,
+		{ since: number; attempts: number }
+	>();
+
+	/**
+	 * Asset channels: offer the host again, on a new block, every outcome
+	 * its callback has not taken (onHtlcResolved). A delivery pass is
+	 * otherwise started by a write of the channel, and a channel that is on
+	 * the chain has none: an outcome the callback threw for once would stay
+	 * held until a restart. At most AUXILIARY_RETRY_ATTEMPTS_PER_INTERVAL
+	 * passes are started here for one channel per
+	 * AUXILIARY_RETRY_INTERVAL_MS, the limit of the other retries of an
+	 * asset channel; a pass stops at eight refusals, and what a channel
+	 * holds undelivered is bounded where it is recorded.
+	 */
+	private _redeliverAuxiliaryResolutions(now: number = Date.now()): void {
+		if (!this.config.auxiliaryChannels?.onHtlcResolved) return;
+		for (const [hex, channel] of [...this.channels]) {
+			const held = channel.getFullState().auxiliaryState?.resolvedHtlcs;
+			if (!held || held.size === 0) {
+				this._auxiliaryDeliveryWindows.delete(hex);
+				continue;
+			}
+			const window = this._auxiliaryDeliveryWindows.get(hex);
+			if (
+				!window ||
+				now - window.since >= ChannelManager.AUXILIARY_RETRY_INTERVAL_MS
+			) {
+				this._auxiliaryDeliveryWindows.set(hex, { since: now, attempts: 1 });
+			} else if (
+				window.attempts >= ChannelManager.AUXILIARY_RETRY_ATTEMPTS_PER_INTERVAL
+			) {
+				continue;
+			} else {
+				window.attempts++;
+			}
+			this._notifyAuxiliaryResolutions(channel);
+		}
+	}
 
 	/**
 	 * Asset channels: put the ending of every HTLC that ended on the chain
