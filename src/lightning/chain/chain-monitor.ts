@@ -1852,29 +1852,26 @@ export class ChainMonitor {
 	}
 
 	/**
-	 * Asset channels: says whether this node decided to settle the HTLCs
-	 * of a payment hash. Given by the channel manager.
-	 */
-	private _auxiliarySettleDecided?: (paymentHash: Buffer) => boolean;
-
-	setAuxiliarySettleDecided(decided: (paymentHash: Buffer) => boolean): void {
-		this._auxiliarySettleDecided = decided;
-	}
-
-	/**
 	 * Whether a claim may be made with the preimage of a payment hash. On
 	 * an asset channel a stored preimage is not a decision to settle: the
-	 * node must have decided (an ordinary invoice it holds the preimage
-	 * for, a hold invoice whose settle was chosen), and while nobody can
-	 * say, the answer is no. Always yes for any other channel.
+	 * channel's row must hold a decision to settle for an HTLC of that
+	 * hash (IChannelAuxiliaryState.htlcDecisions), and the claim of each
+	 * HTLC output is then made by the decision for that very HTLC
+	 * (claimPreimage in the output resolver). Always yes for any other
+	 * channel.
 	 */
 	private _settleDecided(paymentHash: Buffer): boolean {
-		if (!this._channelState.auxiliaryState) return true;
-		try {
-			return this._auxiliarySettleDecided?.(paymentHash) === true;
-		} catch {
-			return false;
+		const auxiliary = this._channelState.auxiliaryState;
+		if (!auxiliary) return true;
+		for (const decision of auxiliary.htlcDecisions?.values() ?? []) {
+			if (
+				decision.outcome === 'settle' &&
+				sha256(decision.preimage).equals(paymentHash)
+			) {
+				return true;
+			}
 		}
+		return false;
 	}
 
 	/**

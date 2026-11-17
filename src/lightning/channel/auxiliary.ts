@@ -114,6 +114,27 @@ export interface IAuxiliaryOpeningCsvState {
 }
 
 /**
+ * What the node decided for one HTLC it received on an asset channel: to
+ * settle it, with the preimage it settles with, or to fail it. A claim by
+ * preimage on the chain is made for an HTLC with a decision to settle and
+ * for no other; a preimage that is merely stored for the payment hash
+ * decides nothing.
+ */
+export type IAuxiliaryHtlcDecision =
+	| { outcome: 'settle'; preimage: Buffer }
+	| { outcome: 'fail' };
+
+/** What the node decided for an HTLC it received, by the HTLC's id. */
+export function auxiliaryHtlcDecisionOf(
+	state: { auxiliaryState?: IChannelAuxiliaryState },
+	htlcId: bigint | undefined
+): IAuxiliaryHtlcDecision | undefined {
+	return htlcId === undefined
+		? undefined
+		: state.auxiliaryState?.htlcDecisions?.get(htlcId.toString());
+}
+
+/**
  * The asset state of one channel. Journaled with the Bitcoin commitment and
  * revocation state, in the same channel row.
  */
@@ -126,6 +147,15 @@ export interface IChannelAuxiliaryState {
 	channelData: Buffer;
 	/** Durable terminal notifications retained until the host acknowledges them. */
 	resolvedHtlcs?: Map<string, IAuxiliaryHtlcResolution>;
+	/**
+	 * What the node decided for each HTLC it received, by the id of the
+	 * HTLC in decimal. Written when the node decides (a fulfil or a fail it
+	 * makes in the channel, a hold settled or cancelled while no message
+	 * can carry it) and kept for as long as a commitment the node holds
+	 * carries the HTLC, and from then on once the channel is on chain. Two
+	 * HTLCs of one payment hash have a decision each.
+	 */
+	htlcDecisions?: Map<string, IAuxiliaryHtlcDecision>;
 	localBalance: bigint;
 	remoteBalance: bigint;
 	localShutdownRecords?: Map<bigint, Buffer>;

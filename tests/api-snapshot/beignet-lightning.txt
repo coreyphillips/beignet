@@ -102,6 +102,7 @@ property ISerializedAuxiliaryState.channelData: string
 property ISerializedAuxiliaryState.childRevocationBasepoints?: [ string, string ][]
 property ISerializedAuxiliaryState.closeTransactions?: [ string, string ][]
 property ISerializedAuxiliaryState.fundingSignedDelivered?: true
+property ISerializedAuxiliaryState.htlcDecisions?: [ string, string ][]
 property ISerializedAuxiliaryState.localBalance: string
 property ISerializedAuxiliaryState.localCommitments: [ string, ISerializedAuxiliaryCommitment ][]
 property ISerializedAuxiliaryState.localShutdownRecords?: SerializedCustomRecords
@@ -635,7 +636,6 @@ method chain.ChainMonitor.offerAuxiliarySweep(transaction: Buffer): boolean
 method chain.ChainMonitor.rebuildSweep(output: chain.ITrackedOutput, feeRatePerVbyte: number): bitcoinjs-lib#Transaction | null
 method chain.ChainMonitor.rebuildSweeps(output: chain.ITrackedOutput, feeRatePerVbyte: number): bitcoinjs-lib#Transaction[]
 static method chain.ChainMonitor.restore(saved: chain.IChainMonitorState, channelState: channel.IChannelState, destinationScript: Buffer, feeRatePerVbyte: number, revocationBasepointSecret: Buffer, paymentPrivkey: Buffer, network?: bitcoinjs-lib#Network, delayedPaymentBasepointSecret?: Buffer, htlcBasepointSecret?: Buffer): chain.ChainMonitor
-method chain.ChainMonitor.setAuxiliarySettleDecided(decided: (paymentHash: Buffer) => boolean): void
 method chain.ChainMonitor.setChannelState(channelState: channel.IChannelState): void
 method chain.ChainMonitor.setDestinationScript(destinationScript: Buffer): void
 method chain.ChainMonitor.updateFeeRate(feeRatePerKw: number): chain.ChainAction[]
@@ -1059,6 +1059,7 @@ method channel.Channel.adoptRemoteForwardingPolicy(policy: channel.IRemoteForwar
 property channel.Channel.announcementChainHash: Buffer
 method channel.Channel.applyForceClosePlan(plan: channel.IForceClosePlanReady): channel.ChannelAction[]
 method channel.Channel.applyPeerSpliceSignature(remoteSig: Buffer, peerWalletWitnesses?: Buffer[][]): bitcoinjs-lib#Transaction | null
+method channel.Channel.auxiliaryHtlcDecision(htlcId: bigint): channel.IAuxiliaryHtlcDecision | undefined
 method channel.Channel.backfillLockedFundingTxids(): boolean
 method channel.Channel.beginClosingNegotiationIfReady(): boolean
 method channel.Channel.beginDualFundingContribution(): channel.ChannelAction[]
@@ -1087,6 +1088,7 @@ method channel.Channel.closeViewForSpentOutpoint(outpoint: { txid: string; outpu
 method channel.Channel.closingBlockedBy(): 'pending HTLCs' | 'pending updates' | null
 method channel.Channel.createFundingCreated(fundingTxid: Buffer, fundingOutputIndex: number, signature: Buffer, partialSignatureWithNonce?: Buffer): channel.ChannelAction[]
 method channel.Channel.createReestablish(): channel.ChannelAction[]
+method channel.Channel.dropAuxiliaryHtlcDecision(htlcId: bigint): void
 method channel.Channel.dropUnsignedHeldAdds(): channel.IAbandonedLocalAdd[]
 method channel.Channel.exitQuiescence(): channel.ChannelAction[]
 method channel.Channel.failFromMalformedPeerMessage(reason: string): channel.ChannelAction[]
@@ -1254,6 +1256,7 @@ method channel.Channel.receivedHtlcExceedsFunderFee(htlcId: bigint): boolean
 method channel.Channel.receivedHtlcExpiredOnArrival(htlcId: bigint): boolean
 method channel.Channel.recordAuxiliaryChainResolution(direction: channel.HtlcDirection, htlcId: bigint, outcome: 'fulfilled' | 'failed'): boolean
 method channel.Channel.recordAuxiliaryCloseCandidate(txid: string, customData: Buffer): void
+method channel.Channel.recordAuxiliaryHtlcDecision(htlcId: bigint, outcome: 'settle' | 'fail', preimage?: Buffer): boolean
 method channel.Channel.recordCloseReason(reason: channel.ChannelCloseReason): boolean
 method channel.Channel.recordCooperativeCloseTx(txHex: string, localFeeSats?: bigint): void
 method channel.Channel.recordExternalCloseCandidate(txHex: string, localFeeSats: bigint): void
@@ -1377,6 +1380,7 @@ method channel.ChannelManager.attachToPeerManager(peerManager: transport.PeerMan
 method channel.ChannelManager.autoSignAndSendCommitment(channelId: Buffer): channel.ChannelResult
 method channel.ChannelManager.auxiliaryChannelOnChain(channelId: Buffer): boolean
 method channel.ChannelManager.auxiliaryHtlcChainEnding(channelId: Buffer, direction: channel.HtlcDirection, htlcId: bigint): 'fulfilled' | 'failed' | undefined
+method channel.ChannelManager.auxiliaryHtlcDecision(channelId: Buffer, htlcId: bigint): channel.IAuxiliaryHtlcDecision | undefined
 method channel.ChannelManager.auxiliaryRowWritten(channel: channel.Channel): void
 method channel.ChannelManager.bumpCloseFee(channelId: Buffer, feeSatoshis: bigint): channel.ChannelResult
 method channel.ChannelManager.canOpenZeroConfTo(pubkeyHex: string): boolean
@@ -1457,6 +1461,7 @@ method channel.ChannelManager.rearmCommitmentCpfp(channelId: Buffer, feeRatePerV
 method channel.ChannelManager.reauthorizeFundingBroadcast(channelId: Buffer): boolean
 method channel.ChannelManager.reauthorizeSpliceBroadcast(channelId: Buffer): boolean
 method channel.ChannelManager.rebuildForceCloseCommitment(channelId: Buffer, feeRatePerVbyte: number): { ok: boolean; tx?: Buffer; error?: string; retryable?: boolean; }
+method channel.ChannelManager.recordAuxiliaryHtlcDecision(channelId: Buffer, htlcId: bigint, outcome: 'settle' | 'fail', preimage?: Buffer): boolean
 method channel.ChannelManager.recordPreimage(paymentHash: Buffer, preimage: Buffer): void
 method channel.ChannelManager.releaseCompositeSpliceCommitment(channelId: Buffer): channel.ChannelResult
 method channel.ChannelManager.removeTrustedPeer(pubkeyHex: string): void
@@ -1469,7 +1474,6 @@ method channel.ChannelManager.revertConflictedSplice(channelId: Buffer): channel
 method channel.ChannelManager.sendRecoveryCloseRequest(channelId: Buffer): boolean
 method channel.ChannelManager.sendSpliceLocked(channelId: Buffer): channel.ChannelResult
 method channel.ChannelManager.setAuxiliaryFundingData(peerPubkey: string, temporaryChannelId: Buffer, data: Buffer): void
-method channel.ChannelManager.setAuxiliarySettleDecision(decision: (channelId: Buffer, paymentHash: Buffer) => boolean): void
 method channel.ChannelManager.setFforFundingClient(peer: string, enabled: boolean): void
 method channel.ChannelManager.setFforPeerFeatureSource(source: ((peerPubkey: string) => features.FeatureFlags | null) | null): void
 method channel.ChannelManager.setFforSettlePolicy(policy: ffor.IFforSettlePolicy | null): void
@@ -1756,6 +1760,7 @@ property channel.IAuxiliaryFundingSigned.fundingOutputIndex: number
 property channel.IAuxiliaryFundingSigned.fundingTxid: Buffer
 property channel.IAuxiliaryFundingSigned.peerPubkey: string
 property channel.IAuxiliaryFundingSigned.temporaryChannelId: Buffer
+type channel.IAuxiliaryHtlcDecision = { outcome: 'settle'; preimage: Buffer; } | { outcome: 'fail'; }
 interface channel.IAuxiliaryHtlcResolution
 property channel.IAuxiliaryHtlcResolution.auxiliaryAmount: bigint
 property channel.IAuxiliaryHtlcResolution.customRecords?: message.CustomRecords
@@ -1898,6 +1903,7 @@ property channel.IChannelAuxiliaryState.channelData: Buffer
 property channel.IChannelAuxiliaryState.childRevocationBasepoints?: Map<string, Buffer>
 property channel.IChannelAuxiliaryState.closeTransactions?: Map<string, Buffer>
 property channel.IChannelAuxiliaryState.fundingSignedDelivered?: true
+property channel.IChannelAuxiliaryState.htlcDecisions?: Map<string, channel.IAuxiliaryHtlcDecision>
 property channel.IChannelAuxiliaryState.localBalance: bigint
 property channel.IChannelAuxiliaryState.localCommitments: Map<bigint, channel.IAuxiliaryCommitmentData>
 property channel.IChannelAuxiliaryState.localShutdownRecords?: Map<bigint, Buffer>
@@ -2535,6 +2541,7 @@ function channel.auxiliaryCarrierError(opening: channel.IAuxiliaryCarrier): stri
 function channel.auxiliaryClosingRelayProfile(state: channel.IChannelState, feeSatoshis: bigint): { weight: number; feePaid: bigint; }
 function channel.auxiliaryClosingWeight(state: channel.IChannelState, baseWeight: number): number
 function channel.auxiliaryDustLimit(configured: bigint): bigint
+function channel.auxiliaryHtlcDecisionOf(state: { auxiliaryState?: channel.IChannelAuxiliaryState; }, htlcId: bigint | undefined): channel.IAuxiliaryHtlcDecision | undefined
 function channel.auxiliaryMaxHtlcs(configured: number | undefined): number
 function channel.auxiliaryProviderError(state: Pick<channel.IChannelState, 'channelId' | 'temporaryChannelId'>, operation: string, cause: unknown): channel.AuxiliaryProviderError
 function channel.auxiliaryUnsupported(state: channel.IChannelState, operation: channel.AuxiliaryUnsupportedOperation): channel.AuxiliaryChannelUnsupportedError | undefined

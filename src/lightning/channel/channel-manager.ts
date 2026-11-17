@@ -11,6 +11,7 @@ import {
 	auxiliaryProviderError,
 	copyAuxiliaryCommitment
 } from './auxiliary';
+import type { IAuxiliaryHtlcDecision } from './auxiliary';
 import { AuxiliaryOpenError } from './auxiliary-guard';
 import { holdAuxiliaryRevokedView } from './auxiliary-revoked';
 import { classifyCommitmentTx } from '../chain/output-resolver';
@@ -4380,8 +4381,6 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 
 			this.recordAuxiliaryChainEndings(channelIdHex);
 
-			this._installSettleDecision(channelIdHex, monitor);
-
 			if (actions.length > 0) {
 				const channelId = Buffer.from(channelIdHex, 'hex');
 				this.processChainActions(channelId, actions);
@@ -4562,8 +4561,6 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 	recordPreimage(paymentHash: Buffer, preimage: Buffer): void {
 		this._knownPreimages.set(paymentHash.toString('hex'), preimage);
 		for (const [channelIdHex, monitor] of this.monitors) {
-			this._installSettleDecision(channelIdHex, monitor);
-
 			// A monitor that does not want it stores and builds nothing, so it
 			// is not saved either. A stub that cannot answer is fed as before.
 			if (
@@ -4643,7 +4640,6 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 
 		changed = false
 	): void {
-		this._installSettleDecision(channelIdHex, monitor);
 		if (this._knownPreimages.size === 0) return;
 
 		const channelId = Buffer.from(channelIdHex, 'hex');
@@ -11964,32 +11960,55 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 	private readonly _auxiliaryResolutionsInFlight = new Set<string>();
 
 	/**
-	 * Asset channels: says whether the node decided to settle the HTLCs of
-	 * a payment hash on a channel. Given by the node; without it no claim
-	 * by preimage is made on an asset channel that is on chain.
+	 * Asset channels: what the node decided for an HTLC it received on a
+	 * channel, or undefined while it has decided nothing.
 	 */
-	private _auxiliarySettleDecision?: (
+	auxiliaryHtlcDecision(
 		channelId: Buffer,
-		paymentHash: Buffer
-	) => boolean;
-
-	setAuxiliarySettleDecision(
-		decision: (channelId: Buffer, paymentHash: Buffer) => boolean
-	): void {
-		this._auxiliarySettleDecision = decision;
+		htlcId: bigint
+	): IAuxiliaryHtlcDecision | undefined {
+		return this.channels
+			.get(channelId.toString('hex'))
+			?.auxiliaryHtlcDecision(htlcId);
 	}
 
-	/** Give a monitor the way to ask whether a settle was decided. */
-	private _installSettleDecision(
-		channelIdHex: string,
-		monitor: ChainMonitor
-	): void {
-		if (typeof monitor.setAuxiliarySettleDecided !== 'function') return;
-		const channelId = Buffer.from(channelIdHex, 'hex');
-		monitor.setAuxiliarySettleDecided(
-			(paymentHash) =>
-				this._auxiliarySettleDecision?.(channelId, paymentHash) === true
-		);
+	/**
+	 * Asset channels: write down, with the channel's row, what the node
+	 * decided for an HTLC it received, when no message of the channel
+	 * carries the decision: a hold settled or cancelled while the channel
+	 * is on chain, or settled while the fulfil cannot leave. A fulfil or a
+	 * fail the channel makes writes its own, with the update itself. A
+	 * claim by preimage on the chain is made by this record and by nothing
+	 * else. False, with nothing kept, when the channel does not hold the
+	 * HTLC, when the other decision stands, and when the row could not be
+	 * written.
+	 *
+	 * The row is written here and now, with whatever the node has staged
+	 * for its next write, so this is not for a caller that stages records
+	 * it may still take back.
+	 */
+	recordAuxiliaryHtlcDecision(
+		channelId: Buffer,
+		htlcId: bigint,
+		outcome: 'settle' | 'fail',
+		preimage?: Buffer
+	): boolean {
+		const hex = channelId.toString('hex');
+		const channel = this.channels.get(hex);
+		const peerPubkey = this.channelPeers.get(hex);
+		if (!channel || !peerPubkey) return false;
+		const standing = channel.auxiliaryHtlcDecision(htlcId);
+		if (!channel.recordAuxiliaryHtlcDecision(htlcId, outcome, preimage)) {
+			return false;
+		}
+		if (standing) return true;
+		try {
+			this.persistence.persist({ channel, peerPubkey, channelId });
+		} catch {
+			channel.dropAuxiliaryHtlcDecision(htlcId);
+			return false;
+		}
+		return true;
 	}
 
 	/** Whether an asset channel has a commitment on the chain, or is closing there. */

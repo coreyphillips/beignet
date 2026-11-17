@@ -19,6 +19,7 @@ import type {
 	IAuxiliaryHtlcResolution,
 	IChannelAuxiliaryState
 } from '../channel/auxiliary';
+import type { IAuxiliaryHtlcDecision } from '../channel/auxiliary';
 import type { CustomRecords } from '../message/custom-records';
 import { copyCustomRecords } from '../message/custom-records';
 import type { ITaprootAuxLeaf } from '../script/commitment-taproot';
@@ -60,6 +61,8 @@ export interface ISerializedAuxiliaryState {
 	localShutdownRecords?: SerializedCustomRecords;
 	remoteShutdownRecords?: SerializedCustomRecords;
 	closeTransactions?: [string, string][];
+	/** Each as the HTLC id and the preimage in hex, empty for a fail. */
+	htlcDecisions?: [string, string][];
 	acceptedClosingSigned?: string;
 	unrecordedCloseTxid?: string;
 	fundingSignedDelivered?: true;
@@ -351,6 +354,18 @@ function encodeAuxiliaryState(
 					)
 			  }
 			: {}),
+		...(state.htlcDecisions
+			? {
+					htlcDecisions: [...state.htlcDecisions].map(
+						([id, decision]): [string, string] => [
+							id,
+							decision.outcome === 'settle'
+								? decision.preimage.toString('hex')
+								: ''
+						]
+					)
+			  }
+			: {}),
 		...(state.closeTransactions
 			? {
 					closeTransactions: [...state.closeTransactions].map(
@@ -470,6 +485,33 @@ export function deserializeAuxiliaryState(
 			? {
 					remoteShutdownRecords: deserializeCustomRecords(
 						state.remoteShutdownRecords
+					)
+			  }
+			: {}),
+		...(state.htlcDecisions !== undefined
+			? {
+					htlcDecisions: uniqueMap(
+						pairs(state.htlcDecisions, 'HTLC decisions').map(
+							([id, preimage]): [string, IAuxiliaryHtlcDecision] => {
+								if (
+									typeof id !== 'string' ||
+									!/^(0|[1-9][0-9]*)$/.test(id) ||
+									typeof preimage !== 'string' ||
+									!/^([a-f0-9]{64})?$/.test(preimage)
+								) {
+									throw new Error('Malformed serialized asset HTLC decision');
+								}
+								return [
+									id,
+									preimage === ''
+										? { outcome: 'fail' }
+										: {
+												outcome: 'settle',
+												preimage: Buffer.from(preimage, 'hex')
+										  }
+								];
+							}
+						)
 					)
 			  }
 			: {}),

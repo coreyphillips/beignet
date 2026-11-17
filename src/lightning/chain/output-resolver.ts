@@ -76,6 +76,7 @@ import {
 } from '../keys/derivation';
 import { generateFromSeed, MAX_INDEX } from '../keys/shachain';
 import type { IChannelState } from '../channel/channel-state';
+import { auxiliaryHtlcDecisionOf } from '../channel/auxiliary';
 import { leaseCsvBlocks } from '../channel/liquidity-ads';
 import type { IHtlcEntry } from '../channel/types';
 import {
@@ -2170,7 +2171,11 @@ export function resolveOurCommitmentOutputs(
 		) {
 			// We received this HTLC — claim via HTLC-success with preimage
 			const hashHex = output.paymentHash?.toString('hex');
-			const preimage = hashHex ? knownPreimages.get(hashHex) : undefined;
+			const preimage = claimPreimage(
+				state,
+				output,
+				hashHex ? knownPreimages.get(hashHex) : undefined
+			);
 
 			if (preimage) {
 				const htlcSuccessTx = buildHtlcSuccessTx(
@@ -2244,6 +2249,27 @@ export function resolveOurCommitmentOutputs(
  * (TaprootSecondLevelScriptTree delay leaf). Returns null if `htlcTx.outs[0]` is
  * not our expected second-level output.
  */
+/**
+ * The preimage a claim of an HTLC this node received is made with. On an
+ * asset channel it is the one the node wrote down when it decided to
+ * settle that very HTLC (IChannelAuxiliaryState.htlcDecisions), and never
+ * one that is merely stored for the payment hash: an HTLC the node failed,
+ * or decided nothing for, is not claimed. On any other channel it is the
+ * stored one.
+ */
+function claimPreimage(
+	state: IChannelState,
+	output: ITrackedOutput,
+	stored: Buffer | undefined
+): Buffer | undefined {
+	if (!state.auxiliaryState) return stored;
+	const decision = auxiliaryHtlcDecisionOf(
+		state,
+		output.auxiliaryHtlc?.id ?? output.htlcId
+	);
+	return decision?.outcome === 'settle' ? decision.preimage : undefined;
+}
+
 export function resolveSecondLevelHtlcOutput(
 	state: IChannelState,
 	htlcTx: bitcoin.Transaction,
@@ -2856,7 +2882,11 @@ function resolveOurTaprootCommitmentOutputs(
 			});
 		} else if (output.outputType === OutputType.RECEIVED_HTLC) {
 			const hashHex = output.paymentHash?.toString('hex');
-			const preimage = hashHex ? knownPreimages.get(hashHex) : undefined;
+			const preimage = claimPreimage(
+				state,
+				output,
+				hashHex ? knownPreimages.get(hashHex) : undefined
+			);
 			if (!preimage) {
 				resolved.push({ trackedOutput: output });
 				continue;
@@ -3218,7 +3248,11 @@ function resolveTheirCurrentTaprootCommitmentOutputs(
 		) {
 			// Our received = their offered output → claim via the preimage success leaf.
 			const hashHex = output.paymentHash?.toString('hex');
-			const preimage = hashHex ? knownPreimages.get(hashHex) : undefined;
+			const preimage = claimPreimage(
+				state,
+				output,
+				hashHex ? knownPreimages.get(hashHex) : undefined
+			);
 			if (!preimage) {
 				resolved.push({ trackedOutput: output });
 				continue;
@@ -3478,7 +3512,11 @@ export function resolveTheirCurrentCommitmentOutputs(
 			// is their offered-HTLC script, which we sweep immediately with the
 			// payment preimage using our HTLC key.
 			const hashHex = output.paymentHash.toString('hex');
-			const preimage = knownPreimages.get(hashHex);
+			const preimage = claimPreimage(
+				state,
+				output,
+				knownPreimages.get(hashHex)
+			);
 
 			if (
 				preimage &&

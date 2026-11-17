@@ -129,6 +129,7 @@ import type {
 	IAuxiliaryCommitmentData,
 	IChannelAuxiliaryProvider
 } from './auxiliary';
+import type { IAuxiliaryHtlcDecision } from './auxiliary';
 import {
 	MAX_AUXILIARY_HTLCS_PER_PARTY,
 	auxiliaryProviderError,
@@ -4114,6 +4115,105 @@ export class Channel {
 	}
 
 	/**
+	 * Asset channels: what this node decided for an HTLC it received, or
+	 * undefined while it has decided nothing.
+	 */
+	auxiliaryHtlcDecision(htlcId: bigint): IAuxiliaryHtlcDecision | undefined {
+		return this._state.auxiliaryState?.htlcDecisions?.get(htlcId.toString());
+	}
+
+	/**
+	 * Asset channels: write down what the node decided for an HTLC it
+	 * received, for a decision no message of the channel carries yet: a
+	 * settle or a cancel made while the channel is on chain or its peer is
+	 * away. The HTLC is looked for wherever a commitment this node holds
+	 * still carries it: in the channel, or among the removals its own
+	 * commitment keeps. False for a channel without asset state, for an
+	 * HTLC it does not hold, for a preimage that is not the HTLC's, and
+	 * when the other decision stands already.
+	 */
+	recordAuxiliaryHtlcDecision(
+		htlcId: bigint,
+		outcome: 'settle' | 'fail',
+		preimage?: Buffer
+	): boolean {
+		const entry =
+			this._state.htlcs.get(`received-${htlcId}`) ??
+			(this._state.signedLocalRemovals ?? []).find(
+				(kept) =>
+					kept.direction === HtlcDirection.RECEIVED && kept.id === htlcId
+			);
+		if (!this._state.auxiliaryState || !entry) return false;
+		if (outcome === 'fail') {
+			return this._decideAuxiliaryHtlc(entry, { outcome: 'fail' });
+		}
+		if (!preimage || !sha256(preimage).equals(entry.paymentHash)) return false;
+		return this._decideAuxiliaryHtlc(entry, {
+			outcome: 'settle',
+			preimage: Buffer.from(preimage)
+		});
+	}
+
+	/** Take back a decision whose row could not be written. */
+	dropAuxiliaryHtlcDecision(htlcId: bigint): void {
+		this._state.auxiliaryState?.htlcDecisions?.delete(htlcId.toString());
+	}
+
+	/**
+	 * The first decision for an HTLC stands. The one exception is a fulfil
+	 * this node has made in the channel: the preimage is with the peer
+	 * from then on, and the record says what was done.
+	 */
+	private _decideAuxiliaryHtlc(
+		entry: IHtlcEntry,
+		decision: IAuxiliaryHtlcDecision
+	): boolean {
+		const auxiliary = this._state.auxiliaryState;
+		if (!auxiliary || entry.direction !== HtlcDirection.RECEIVED) return false;
+		const key = entry.id.toString();
+		const standing = auxiliary.htlcDecisions?.get(key);
+		if (standing) {
+			if (standing.outcome === decision.outcome) return true;
+			if (
+				decision.outcome !== 'settle' ||
+				entry.state !== HtlcState.FULFILLED
+			) {
+				return false;
+			}
+		}
+		auxiliary.htlcDecisions ??= new Map();
+		auxiliary.htlcDecisions.set(key, decision);
+		return true;
+	}
+
+	/**
+	 * A decision is kept for as long as a commitment this node holds
+	 * carries its HTLC: in the channel, or among the removals its own
+	 * commitment keeps until the peer signs the next one. Called when that
+	 * signature arrives. A channel that is on chain signs nothing more, so
+	 * what it held then stays.
+	 */
+	private _pruneAuxiliaryHtlcDecisions(): void {
+		const auxiliary = this._state.auxiliaryState;
+		const decisions = auxiliary?.htlcDecisions;
+		if (!auxiliary || !decisions) return;
+		for (const key of [...decisions.keys()]) {
+			if (
+				this._state.htlcs.has(`received-${key}`) ||
+				(this._state.signedLocalRemovals ?? []).some(
+					(kept) =>
+						kept.direction === HtlcDirection.RECEIVED &&
+						kept.id.toString() === key
+				)
+			) {
+				continue;
+			}
+			decisions.delete(key);
+		}
+		if (decisions.size === 0) delete auxiliary.htlcDecisions;
+	}
+
+	/**
 	 * Asset channels: keep the ending an HTLC had on the chain, for the
 	 * host, in the list the endings off chain are kept in. False for a
 	 * channel without asset state and for an HTLC it does not hold or that
@@ -4878,6 +4978,10 @@ export class Channel {
 		if (assetRefusal) return assetRefusal;
 
 		entry.state = HtlcState.FULFILLED;
+		this._decideAuxiliaryHtlc(entry, {
+			outcome: 'settle',
+			preimage: Buffer.from(paymentPreimage)
+		});
 		// Two-phase: the peer's signatures still include this HTLC until it
 		// revokes for our removal — buildLocalCommitment keeps it present.
 		entry.removalRemoteCommitted = false;
@@ -5156,6 +5260,7 @@ export class Channel {
 		if (assetRefusal) return assetRefusal;
 
 		entry.state = HtlcState.FAILED;
+		this._decideAuxiliaryHtlc(entry, { outcome: 'fail' });
 		// Two-phase: the peer's signatures still include this HTLC until it
 		// revokes for our removal — buildLocalCommitment keeps it present.
 		entry.removalRemoteCommitted = false;
@@ -5270,6 +5375,7 @@ export class Channel {
 		if (assetRefusal) return assetRefusal;
 
 		entry.state = HtlcState.FAILED;
+		this._decideAuxiliaryHtlc(entry, { outcome: 'fail' });
 		// Two-phase removal, exactly as failHtlc.
 		entry.removalRemoteCommitted = false;
 		this._state.needsCommitment = true;
@@ -6426,6 +6532,7 @@ export class Channel {
 		// previous signature are not in the commitment we now hold.
 		this._fforRecordVoucherOutcomes();
 		this._state.signedLocalRemovals = undefined;
+		this._pruneAuxiliaryHtlcDecisions();
 
 		// Two-phase update_fee, acceptor side: this commitment_signed from the
 		// opener covers its staged update_fee (the update always precedes its
