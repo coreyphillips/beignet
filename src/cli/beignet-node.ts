@@ -9297,8 +9297,10 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	): Promise<ChannelInfo[]> {
 		// The peers suggested come from the graph, so all of it first.
 		if (this.isGraphRestoring()) await this.whenGraphRestored();
-		// Check existing ready channels
-		const existing = this.getReadyChannels();
+		// Check existing ready channels. The minimum is of channels to pay
+		// and be paid over: an asset channel carries no ordinary payment, so
+		// it is not one of them.
+		const existing = this.getReadyChannels().filter((ch) => !ch.auxiliary);
 		if (existing.length >= count) return existing;
 
 		const needed = count - existing.length;
@@ -12971,8 +12973,9 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 			});
 		}
 
-		// 9. Active channels check
-		const readyChannels = this.getReadyChannels();
+		// 9. Active channels check. An asset channel is no channel for the
+		// payment of an invoice.
+		const readyChannels = this.getReadyChannels().filter((ch) => !ch.auxiliary);
 		if (readyChannels.length === 0) {
 			checks.push({
 				name: 'CHANNELS',
@@ -15925,7 +15928,11 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 
 		// 3. AUTO_RECONNECT_ENABLED (WARNING)
 		const nodeInfo = this.node.getNodeInfo();
-		const channels = this.node.listChannels();
+		// The channel checks below are about sending and receiving bitcoin.
+		// An asset channel is no second channel for that, and its bitcoin
+		// only carries asset outputs, so it says nothing about depletion:
+		// none of them reads it.
+		const channels = this.node.listChannels().filter((ch) => !ch.auxiliary);
 		const readyChannels = channels.filter(
 			(ch) => ch.state === 'NORMAL' && !isHeldRestore(ch)
 		);
@@ -16971,10 +16978,13 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	 * terms (issue #967).
 	 */
 	private canCarryHtlc(): boolean {
+		// What waits on this is the payment of invoices, and none goes over
+		// an asset channel: it is neither the channel that can carry one
+		// nor a channel worth waiting for.
 		const live = this.node
 			.getChannelManager()
 			.listChannels()
-			.filter(canBecomeUsable);
+			.filter((ch) => canBecomeUsable(ch) && !ch.getFullState().auxiliaryState);
 		return live.length === 0 || live.some((ch) => ch.acceptsNewHtlcs());
 	}
 
