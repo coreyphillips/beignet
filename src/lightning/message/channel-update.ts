@@ -31,7 +31,13 @@
  *   [4: feerate_per_kw]
  */
 
-import { decodeTlvStream, encodeTlvRecord } from './tlv';
+import type { CustomRecords } from './custom-records';
+import {
+	boundedLightningPayload,
+	customRecordEntries,
+	decodeWithCustomRecords
+} from './custom-records';
+import { decodeTlvStream, encodeTlvRecord, encodeTlvStream } from './tlv';
 
 export interface IUpdateAddHtlcMessage {
 	channelId: Buffer;
@@ -48,6 +54,22 @@ export interface IUpdateAddHtlcMessage {
 	blindingPoint?: Buffer;
 	/** Agreed liquidity fee withheld from this HTLC, in millisatoshis. */
 	skimmedFeeMsat?: bigint;
+	/**
+	 * Records of the custom range carried beside the HTLC, apart from its
+	 * onion. Only an asset channel sends or reads them.
+	 */
+	customRecords?: CustomRecords;
+}
+
+/** How an `update_add_htlc` payload is read. */
+export interface IUpdateAddHtlcDecodeOptions {
+	/**
+	 * Read records of the custom range (type 65536 and above) into
+	 * `customRecords`, whatever their parity. Off by default: the standard
+	 * reader, which fails on an unknown even type and ignores an unknown odd
+	 * one.
+	 */
+	customRecords?: boolean;
 }
 
 export interface IUpdateFulfillHtlcMessage {
@@ -133,6 +155,27 @@ export function encodeUpdateAddHtlcMessage(msg: IUpdateAddHtlcMessage): Buffer {
 		value.writeBigUInt64BE(msg.skimmedFeeMsat);
 		parts.push(encodeTlvRecord({ type: TLV_SKIMMED_FEE_MSAT, value }));
 	}
+	if (msg.customRecords?.size) {
+		// With custom records the trailing stream is written whole, in type
+		// order, and has to fit one frame. A custom record may not take the
+		// type of a field this message defines.
+		const records = customRecordEntries(
+			msg.customRecords,
+			UPDATE_ADD_HTLC_TLV_TYPES
+		);
+		if (msg.blindingPoint) {
+			records.push({ type: TLV_BLINDING_POINT, value: msg.blindingPoint });
+		}
+		if (msg.skimmedFeeMsat !== undefined) {
+			const value = Buffer.alloc(8);
+			value.writeBigUInt64BE(msg.skimmedFeeMsat);
+			records.push({ type: TLV_SKIMMED_FEE_MSAT, value });
+		}
+		records.sort((a, b) => (a.type < b.type ? -1 : 1));
+		return boundedLightningPayload(
+			Buffer.concat([buf, encodeTlvStream(records)])
+		);
+	}
 	return Buffer.concat(parts);
 }
 
@@ -140,7 +183,8 @@ export function encodeUpdateAddHtlcMessage(msg: IUpdateAddHtlcMessage): Buffer {
  * Decode an `update_add_htlc` message payload.
  */
 export function decodeUpdateAddHtlcMessage(
-	payload: Buffer
+	payload: Buffer,
+	options: IUpdateAddHtlcDecodeOptions = {}
 ): IUpdateAddHtlcMessage {
 	if (payload.length < UPDATE_ADD_HTLC_LENGTH) {
 		throw new Error(
@@ -173,12 +217,11 @@ export function decodeUpdateAddHtlcMessage(
 	// invalid_onion_blinding (BOLT 2).
 	let blindingPoint: Buffer | undefined;
 	let skimmedFeeMsat: bigint | undefined;
+	const customRecords = new Map<bigint, Buffer>();
 	if (offset < payload.length) {
-		const { records } = decodeTlvStream(
-			payload,
-			offset,
-			UPDATE_ADD_HTLC_TLV_TYPES
-		);
+		const records = options.customRecords
+			? decodeWithCustomRecords(payload, offset, UPDATE_ADD_HTLC_TLV_TYPES)
+			: decodeTlvStream(payload, offset, UPDATE_ADD_HTLC_TLV_TYPES).records;
 		for (const record of records) {
 			if (record.type === TLV_BLINDING_POINT) {
 				if (record.value.length !== 33) {
@@ -192,6 +235,8 @@ export function decodeUpdateAddHtlcMessage(
 					throw new Error('update_add_htlc: skimmed_fee_msat must be 8 bytes');
 				}
 				skimmedFeeMsat = record.value.readBigUInt64BE();
+			} else if (options.customRecords && record.type >= 65536n) {
+				customRecords.set(record.type, Buffer.from(record.value));
 			}
 		}
 	}
@@ -208,6 +253,7 @@ export function decodeUpdateAddHtlcMessage(
 		result.blindingPoint = blindingPoint;
 	}
 	if (skimmedFeeMsat !== undefined) result.skimmedFeeMsat = skimmedFeeMsat;
+	if (customRecords.size) result.customRecords = customRecords;
 	return result;
 }
 

@@ -31,10 +31,9 @@ import type {
 	IChannelConfig,
 	IHtlcEntry,
 	IHtlcSnapshotEntry,
-	HtlcDirection,
-	HtlcState
+	HtlcDirection
 } from '../channel/types';
-import { DEFAULT_CHANNEL_CONFIG } from '../channel/types';
+import { DEFAULT_CHANNEL_CONFIG, isOverlayChannel } from '../channel/types';
 import type {
 	IPaymentInfo,
 	PaymentStatus,
@@ -51,24 +50,33 @@ import {
 } from './htlc-history';
 import { unsavedRevokedHtlcSnapshots } from '../channel/htlc-snapshots';
 import { addWithoutOnion, restoreAddOnion } from './add-onion';
+import {
+	bufToHex,
+	hexToBuf,
+	bigintToStr,
+	strToBigint
+} from './serialization-primitives';
+import { serializeHtlcEntry, deserializeHtlcEntry } from './htlc-serialization';
+import type { ISerializedHtlcEntry } from './htlc-serialization';
+import {
+	serializeAuxiliaryState,
+	deserializeAuxiliaryState,
+	serializeCustomRecords,
+	deserializeCustomRecords
+} from './auxiliary-serialization';
+import type {
+	ISerializedAuxiliaryState,
+	SerializedCustomRecords
+} from './auxiliary-serialization';
 
 // ─── Primitive helpers ───
 
-export function bufToHex(buf: Buffer | null | undefined): string | null {
-	return buf ? buf.toString('hex') : null;
-}
-
-export function hexToBuf(hex: string | null | undefined): Buffer | null {
-	return hex ? Buffer.from(hex, 'hex') : null;
-}
-
-export function bigintToStr(val: bigint): string {
-	return val.toString();
-}
-
-export function strToBigint(val: string): bigint {
-	return BigInt(val);
-}
+export {
+	bufToHex,
+	hexToBuf,
+	bigintToStr,
+	strToBigint
+} from './serialization-primitives';
 
 // ─── IChannelConfig ───
 
@@ -149,48 +157,8 @@ export function deserializeBasepoints(
 
 // ─── IHtlcEntry ───
 
-export interface ISerializedHtlcEntry {
-	key: string;
-	id: string;
-	amountMsat: string;
-	paymentHash: string;
-	cltvExpiry: number;
-	onionRoutingPacket: string;
-	direction: string;
-	state: string;
-	/** Route blinding: blinding_point (hex) so an in-flight blinded receive
-	 * survives restart and can still peel its onion with the blinded key. */
-	blindingPoint?: string;
-	/** The preimage the peer's fulfil revealed (hex; see
-	 * IHtlcEntry.paymentPreimage). Absent on rows written before it existed. */
-	paymentPreimage?: string;
-	/** Two-phase update flags (see IHtlcEntry). Optional for compatibility. */
-	addRemoteCommitted?: boolean;
-	removalRemoteCommitted?: boolean;
-	commitCoverPending?: boolean;
-	addLocallyRevoked?: boolean;
-	removalLocallyRevoked?: boolean;
-	addRemotelyRevoked?: boolean;
-	addCoverPending?: boolean;
-	/** FFOR Variant D voucher marker (see IHtlcEntry.fforVoucher). */
-	fforVoucher?: boolean;
-	/** FFOR Variant D mismatching-add marker (see IHtlcEntry.fforMismatch). */
-	fforMismatch?: boolean;
-	/** Whether the stored remote signature covers this add (see IHtlcEntry). */
-	addRemoteSigned?: boolean;
-	/** Edge-trigger marker for HTLC_FORWARDED dispatch (see IHtlcEntry). */
-	forwardEmitted?: boolean;
-	/** Admission-time dust-exposure classification (see IHtlcEntry). */
-	dustExposureFailback?: boolean;
-	/** Admission-time expired-at-our-tip classification (see IHtlcEntry). */
-	expiredOnArrival?: boolean;
-	/** Admission-time funder-fee band classification (see IHtlcEntry). */
-	funderFeeFailback?: boolean;
-	/** Admitted while the capsule-restore hold stood (see IHtlcEntry). */
-	addedWhileRestoreUnproven?: boolean;
-	/** Admitted while the funding-missing quarantine stood (see IHtlcEntry). */
-	addedWhileFundingUnaccounted?: boolean;
-}
+export { serializeHtlcEntry, deserializeHtlcEntry } from './htlc-serialization';
+export type { ISerializedHtlcEntry } from './htlc-serialization';
 
 export interface ISerializedHtlcSnapshot {
 	commitmentNumber: string;
@@ -222,140 +190,6 @@ export function deserializeHtlcSnapshotEntries(
 		cltvExpiry: e.cltvExpiry,
 		direction: e.direction as HtlcDirection
 	}));
-}
-
-export function serializeHtlcEntry(
-	key: string,
-	e: IHtlcEntry
-): ISerializedHtlcEntry {
-	return {
-		key,
-		id: bigintToStr(e.id),
-		amountMsat: bigintToStr(e.amountMsat),
-		paymentHash: e.paymentHash.toString('hex'),
-		cltvExpiry: e.cltvExpiry,
-		onionRoutingPacket: e.onionRoutingPacket.toString('hex'),
-		direction: e.direction,
-		state: e.state,
-		...(e.fforVoucher === true ? { fforVoucher: true } : {}),
-		...(e.fforMismatch === true ? { fforMismatch: true } : {}),
-		...(e.blindingPoint
-			? { blindingPoint: e.blindingPoint.toString('hex') }
-			: {}),
-		...(e.paymentPreimage
-			? { paymentPreimage: e.paymentPreimage.toString('hex') }
-			: {}),
-		...(e.addRemoteCommitted !== undefined
-			? { addRemoteCommitted: e.addRemoteCommitted }
-			: {}),
-		...(e.removalRemoteCommitted !== undefined
-			? { removalRemoteCommitted: e.removalRemoteCommitted }
-			: {}),
-		...(e.commitCoverPending !== undefined
-			? { commitCoverPending: e.commitCoverPending }
-			: {}),
-		...(e.addLocallyRevoked !== undefined
-			? { addLocallyRevoked: e.addLocallyRevoked }
-			: {}),
-		...(e.removalLocallyRevoked !== undefined
-			? { removalLocallyRevoked: e.removalLocallyRevoked }
-			: {}),
-		...(e.addRemotelyRevoked !== undefined
-			? { addRemotelyRevoked: e.addRemotelyRevoked }
-			: {}),
-		...(e.addCoverPending !== undefined
-			? { addCoverPending: e.addCoverPending }
-			: {}),
-		...(e.addRemoteSigned !== undefined
-			? { addRemoteSigned: e.addRemoteSigned }
-			: {}),
-		...(e.forwardEmitted !== undefined
-			? { forwardEmitted: e.forwardEmitted }
-			: {}),
-		...(e.dustExposureFailback !== undefined
-			? { dustExposureFailback: e.dustExposureFailback }
-			: {}),
-		...(e.expiredOnArrival !== undefined
-			? { expiredOnArrival: e.expiredOnArrival }
-			: {}),
-		...(e.funderFeeFailback !== undefined
-			? { funderFeeFailback: e.funderFeeFailback }
-			: {}),
-		...(e.addedWhileRestoreUnproven !== undefined
-			? { addedWhileRestoreUnproven: e.addedWhileRestoreUnproven }
-			: {}),
-		...(e.addedWhileFundingUnaccounted !== undefined
-			? { addedWhileFundingUnaccounted: e.addedWhileFundingUnaccounted }
-			: {})
-	};
-}
-
-export function deserializeHtlcEntry(s: ISerializedHtlcEntry): {
-	key: string;
-	entry: IHtlcEntry;
-} {
-	return {
-		key: s.key,
-		entry: {
-			id: strToBigint(s.id),
-			amountMsat: strToBigint(s.amountMsat),
-			paymentHash: Buffer.from(s.paymentHash, 'hex'),
-			cltvExpiry: s.cltvExpiry,
-			onionRoutingPacket: Buffer.from(s.onionRoutingPacket, 'hex'),
-			direction: s.direction as HtlcDirection,
-			state: s.state as HtlcState,
-			...(s.fforVoucher === true ? { fforVoucher: true } : {}),
-			...(s.fforMismatch === true ? { fforMismatch: true } : {}),
-			...(s.blindingPoint
-				? { blindingPoint: Buffer.from(s.blindingPoint, 'hex') }
-				: {}),
-			...(s.paymentPreimage
-				? { paymentPreimage: Buffer.from(s.paymentPreimage, 'hex') }
-				: {}),
-			...(s.addRemoteCommitted !== undefined
-				? { addRemoteCommitted: s.addRemoteCommitted }
-				: {}),
-			...(s.removalRemoteCommitted !== undefined
-				? { removalRemoteCommitted: s.removalRemoteCommitted }
-				: {}),
-			...(s.commitCoverPending !== undefined
-				? { commitCoverPending: s.commitCoverPending }
-				: {}),
-			...(s.addLocallyRevoked !== undefined
-				? { addLocallyRevoked: s.addLocallyRevoked }
-				: {}),
-			...(s.removalLocallyRevoked !== undefined
-				? { removalLocallyRevoked: s.removalLocallyRevoked }
-				: {}),
-			...(s.addRemotelyRevoked !== undefined
-				? { addRemotelyRevoked: s.addRemotelyRevoked }
-				: {}),
-			...(s.addCoverPending !== undefined
-				? { addCoverPending: s.addCoverPending }
-				: {}),
-			...(s.addRemoteSigned !== undefined
-				? { addRemoteSigned: s.addRemoteSigned }
-				: {}),
-			...(s.forwardEmitted !== undefined
-				? { forwardEmitted: s.forwardEmitted }
-				: {}),
-			...(s.dustExposureFailback !== undefined
-				? { dustExposureFailback: s.dustExposureFailback }
-				: {}),
-			...(s.expiredOnArrival !== undefined
-				? { expiredOnArrival: s.expiredOnArrival }
-				: {}),
-			...(s.funderFeeFailback !== undefined
-				? { funderFeeFailback: s.funderFeeFailback }
-				: {}),
-			...(s.addedWhileRestoreUnproven !== undefined
-				? { addedWhileRestoreUnproven: s.addedWhileRestoreUnproven }
-				: {}),
-			...(s.addedWhileFundingUnaccounted !== undefined
-				? { addedWhileFundingUnaccounted: s.addedWhileFundingUnaccounted }
-				: {})
-		}
-	};
 }
 
 // ─── ShaChainStore ───
@@ -682,6 +516,14 @@ export interface ISerializedChannelState {
 	/** FFOR Variant D epoch record (see IChannelState.ffor). */
 	ffor?: ISerializedFforEpoch | null;
 	fforUsedEpochIds?: string[];
+	/**
+	 * Asset channels only (see IChannelState). Each key is written only when
+	 * the channel has the value, so the row of every other channel is the
+	 * bytes it always was.
+	 */
+	fundingTaprootMerkleRoot?: string;
+	auxiliaryState?: ISerializedAuxiliaryState;
+	lastSentAuxiliaryRecords?: SerializedCustomRecords;
 }
 
 export interface ISerializedSpliceInFlight {
@@ -1202,7 +1044,18 @@ export function serializeChannelState(
 		ffor: s.ffor ? serializeFforEpoch(s.ffor) : null,
 		fforUsedEpochIds: s.fforUsedEpochIds?.length
 			? [...s.fforUsedEpochIds]
-			: undefined
+			: undefined,
+		// Asset channels only. Conditional on purpose: a row without asset
+		// state gains no key, so it and every recovery frame that carries it
+		// hash as they did before asset channels existed.
+		...serializeAssetChannelFields(s),
+		...(s.lastSentAuxiliaryRecords
+			? {
+					lastSentAuxiliaryRecords: serializeCustomRecords(
+						s.lastSentAuxiliaryRecords
+					)
+			  }
+			: {})
 	};
 }
 
@@ -1857,8 +1710,158 @@ export function deserializeChannelState(
 		ffor: s.ffor ? deserializeFforEpoch(s.ffor) : null,
 		fforUsedEpochIds: s.fforUsedEpochIds?.length
 			? [...s.fforUsedEpochIds]
-			: undefined
+			: undefined,
+		...(s.fundingTaprootMerkleRoot !== undefined
+			? {
+					fundingTaprootMerkleRoot: deserializeFundingTaprootMerkleRoot(
+						s.fundingTaprootMerkleRoot
+					)
+			  }
+			: {}),
+		...(s.auxiliaryState !== undefined
+			? { auxiliaryState: deserializeAuxiliaryState(s.auxiliaryState) }
+			: {}),
+		...(s.lastSentAuxiliaryRecords !== undefined
+			? {
+					lastSentAuxiliaryRecords: deserializeCustomRecords(
+						s.lastSentAuxiliaryRecords
+					)
+			  }
+			: {})
 	};
+}
+
+/** A stored asset funding root: exactly 32 bytes of lowercase hex, or a throw. */
+/**
+ * The funding root and asset state of an asset channel, and no key at all
+ * for any other channel. An asset channel is stored whole or not at all:
+ * the overlay channel type, the funding root and the asset state are only
+ * runnable together, so a state that has one without the others is refused
+ * here, at the save, where the fault is, and not at the next start. Each
+ * value goes through the reader's own checks for the same reason.
+ */
+function serializeAssetChannelFields(
+	s: IChannelState
+): Pick<
+	ISerializedChannelState,
+	'fundingTaprootMerkleRoot' | 'auxiliaryState'
+> {
+	if (
+		s.auxiliaryState === undefined &&
+		s.fundingTaprootMerkleRoot === undefined &&
+		!isOverlayChannel(s.channelType)
+	) {
+		return {};
+	}
+	const id = (s.channelId ?? s.temporaryChannelId).toString('hex');
+	if (!s.auxiliaryState || !s.fundingTaprootMerkleRoot) {
+		throw new Error(
+			`Refusing to store an incomplete asset channel (${id}): the overlay channel type, the funding root and the asset state go together`
+		);
+	}
+	if (!Buffer.isBuffer(s.fundingTaprootMerkleRoot)) {
+		throw new Error('Malformed asset funding root');
+	}
+	const fundingTaprootMerkleRoot = s.fundingTaprootMerkleRoot.toString('hex');
+	deserializeFundingTaprootMerkleRoot(fundingTaprootMerkleRoot);
+	return {
+		fundingTaprootMerkleRoot,
+		auxiliaryState: serializeAuxiliaryState(s.auxiliaryState)
+	};
+}
+
+/** Whether a channel row, as the codec writes it, carries any mark of an asset channel. */
+function channelRowCarriesAssetState(row: unknown): boolean {
+	if (!row || typeof row !== 'object' || Array.isArray(row)) return false;
+	const fields = row as Record<string, unknown>;
+	if (
+		fields.auxiliaryState !== undefined ||
+		fields.fundingTaprootMerkleRoot !== undefined
+	) {
+		return true;
+	}
+	return (
+		typeof fields.channelType === 'string' &&
+		/^(?:[0-9a-f]{2})+$/i.test(fields.channelType) &&
+		isOverlayChannel(Buffer.from(fields.channelType, 'hex'))
+	);
+}
+
+/**
+ * The stored form of an asset channel's row: the row inside an envelope.
+ *
+ * A release from before asset channels reads a channel row field by field
+ * and ignores keys it does not know, so it would load an asset channel as
+ * an ordinary one and write it back without its asset state. It cannot
+ * decode this envelope at all: it skips the row as corrupt, reports it and
+ * leaves it as it is, and the channel is whole again under a release that
+ * knows it.
+ */
+export interface IStoredAssetChannelRow {
+	assetChannelRow: 1;
+	channel: ISerializedChannelState;
+}
+
+/**
+ * The form a channel row is stored in. A channel without asset state is
+ * stored as the row it always was, byte for byte; an asset channel is
+ * stored in its envelope (IStoredAssetChannelRow).
+ */
+export function channelRowToStore(
+	row: ISerializedChannelState
+): ISerializedChannelState | IStoredAssetChannelRow {
+	return channelRowCarriesAssetState(row)
+		? { assetChannelRow: 1, channel: row }
+		: row;
+}
+
+/**
+ * The channel row inside its stored form, or a throw. The reader takes
+ * exactly what the writer makes: an envelope of this version around a row
+ * of an asset channel, or a bare row of a channel that is not one. An
+ * asset channel's row outside its envelope was written by nothing that
+ * knows asset channels, and is refused.
+ */
+export function channelRowFromStore(stored: unknown): ISerializedChannelState {
+	if (
+		stored &&
+		typeof stored === 'object' &&
+		!Array.isArray(stored) &&
+		'assetChannelRow' in stored
+	) {
+		const envelope = stored as Record<string, unknown>;
+		if (
+			envelope.assetChannelRow !== 1 ||
+			Object.keys(envelope).length !== 2 ||
+			!channelRowCarriesAssetState(envelope.channel)
+		) {
+			throw new Error('Malformed stored asset channel row');
+		}
+		return envelope.channel as ISerializedChannelState;
+	}
+	if (channelRowCarriesAssetState(stored)) {
+		throw new Error('An asset channel row is stored without its envelope');
+	}
+	return stored as ISerializedChannelState;
+}
+
+/**
+ * Whether a parsed channel row, stored or bare, belongs to an asset
+ * channel, told from its keys alone and without decoding it. A loader that
+ * skips rows it cannot decode uses this to tell an unreadable asset row
+ * from any other, because an asset channel that is silently left out is
+ * neither run nor watched.
+ */
+export function serializedChannelCarriesAssetState(row: unknown): boolean {
+	if (!row || typeof row !== 'object' || Array.isArray(row)) return false;
+	return 'assetChannelRow' in row || channelRowCarriesAssetState(row);
+}
+
+function deserializeFundingTaprootMerkleRoot(hex: string): Buffer {
+	if (typeof hex !== 'string' || !/^[0-9a-f]{64}$/.test(hex)) {
+		throw new Error('Malformed serialized asset funding root');
+	}
+	return Buffer.from(hex, 'hex');
 }
 
 // ─── IPaymentInfo ───
@@ -1878,6 +1881,12 @@ export interface ISerializedPaymentInfo {
 	sentMsat?: string;
 	/** Msat an incoming payment's settled HTLCs paid, when amountMsat is not that. */
 	receivedMsat?: string;
+	/** Carried by asset HTLCs; present only then. */
+	auxiliary?: true;
+	/** OUTGOING asset payment: what it is worth to the payee. */
+	auxiliaryValueMsat?: string;
+	/** A PENDING record a restore left without its channel; present only then. */
+	unresolved?: { code: string; channelIds: string[] };
 	status: string;
 	direction: string;
 	route?: string; // JSON string
@@ -1910,6 +1919,20 @@ export function serializePaymentInfo(p: IPaymentInfo): ISerializedPaymentInfo {
 		...(p.sentMsat !== undefined ? { sentMsat: bigintToStr(p.sentMsat) } : {}),
 		...(p.receivedMsat !== undefined
 			? { receivedMsat: bigintToStr(p.receivedMsat) }
+			: {}),
+		...(p.auxiliary === true ? { auxiliary: true as const } : {}),
+		...(p.auxiliaryValueMsat !== undefined
+			? { auxiliaryValueMsat: bigintToStr(p.auxiliaryValueMsat) }
+			: {}),
+		// Only a PENDING record is unresolved: one that has an outcome is
+		// written without the mark, whatever its object still carries.
+		...(p.unresolved && (p.status as string) === 'PENDING'
+			? {
+					unresolved: {
+						code: p.unresolved.code,
+						channelIds: [...p.unresolved.channelIds]
+					}
+			  }
 			: {}),
 		status: p.status,
 		direction: p.direction,
@@ -1968,6 +1991,18 @@ export function deserializePaymentInfo(
 		...(s.sentMsat !== undefined ? { sentMsat: strToBigint(s.sentMsat) } : {}),
 		...(s.receivedMsat !== undefined
 			? { receivedMsat: strToBigint(s.receivedMsat) }
+			: {}),
+		...(s.auxiliary === true ? { auxiliary: true as const } : {}),
+		...(s.auxiliaryValueMsat !== undefined
+			? { auxiliaryValueMsat: strToBigint(s.auxiliaryValueMsat) }
+			: {}),
+		...(s.unresolved && s.status === 'PENDING'
+			? {
+					unresolved: {
+						code: s.unresolved.code as 'CHANNEL_OMITTED_AT_RESTORE',
+						channelIds: [...s.unresolved.channelIds]
+					}
+			  }
 			: {}),
 		status: s.status as PaymentStatus,
 		direction: s.direction as PaymentDirection,
@@ -2117,6 +2152,8 @@ export interface ISerializedInvoiceInfo {
 	jitFee?: { flatFeeSat: number; feePpm: number };
 	minFinalCltvExpiry?: number;
 	paymentMetadata?: string;
+	/** Paid by asset HTLCs; present only then. */
+	auxiliary?: true;
 }
 
 export function serializeInvoiceInfo(
@@ -2137,7 +2174,8 @@ export function serializeInvoiceInfo(
 		cancelledAt: invoice.cancelledAt,
 		jitFee: invoice.jitFee,
 		minFinalCltvExpiry: invoice.minFinalCltvExpiry,
-		paymentMetadata: invoice.paymentMetadata
+		paymentMetadata: invoice.paymentMetadata,
+		...(invoice.auxiliary === true ? { auxiliary: true as const } : {})
 	};
 }
 
@@ -2160,6 +2198,7 @@ export function deserializeInvoiceInfo(
 		// A row written before #770 has none: the final hop then enforces
 		// the node default, which is what it advertised.
 		minFinalCltvExpiry: s.minFinalCltvExpiry,
-		paymentMetadata: s.paymentMetadata
+		paymentMetadata: s.paymentMetadata,
+		...(s.auxiliary === true ? { auxiliary: true as const } : {})
 	};
 }

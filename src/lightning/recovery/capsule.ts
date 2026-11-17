@@ -53,6 +53,8 @@ import {
 	decodeStoredHashHex,
 	deriveRecoveryMasterKey,
 	journalSupported,
+	channelsAfterReplay,
+	framesWithoutChannels,
 	reconstructFromFrames,
 	verifyFrameChain
 } from './journal';
@@ -64,7 +66,15 @@ import type {
 	VerifiedRecoveryChain
 } from './types';
 import type { IChannelState } from '../channel/channel-state';
+import type { IAuxiliaryChannelConfig } from '../channel/auxiliary-funding';
 import { createOpenerState } from '../channel/channel-state';
+import {
+	assertAuxiliaryRestore,
+	assertAuxiliaryRestoreInstalled,
+	auxiliaryRestoreChannels,
+	markPaymentsOfOmittedChannels
+} from './auxiliary-restore';
+import type { IAuxiliaryRestoreChannel } from './auxiliary-restore';
 import {
 	ChannelState,
 	DEFAULT_CHANNEL_CONFIG,
@@ -124,6 +134,27 @@ export interface ICapsuleRestoreOptions {
 	 * on the real target cannot be told apart from a broken database.
 	 */
 	scratchStorage?: () => IStorageBackend;
+	/**
+	 * The node's asset channel support, when it has any. A Tier 2 restore
+	 * that holds asset channels is refused, and nothing of it installed,
+	 * unless its `canRestore` says yes; without it the refusal is
+	 * `AuxiliaryProviderRequiredError` (issue #2093). Never read by a
+	 * restore that holds no asset channel.
+	 */
+	auxiliaryChannels?: IAuxiliaryChannelConfig;
+	/**
+	 * Leave the asset channels of a Tier 2 restore out, in place of
+	 * refusing it (issue #2093). Only the exact `true` counts. Every asset
+	 * channel the restore holds is then skipped, whether or not a provider
+	 * could have restored it, and nobody is asked: no row of such a channel
+	 * is written (its key index is, so its keys are never derived again),
+	 * everything else is installed as it would have been, and the result
+	 * lists what was left out in `omittedAuxiliaryChannels`. A channel left
+	 * out is not watched and not closed by this wallet, and whatever it
+	 * held stays where the capsule and the peer have it. A restore that
+	 * holds no asset channel is not changed by the option.
+	 */
+	omitAuxiliaryChannels?: boolean;
 }
 
 /**
@@ -1147,6 +1178,17 @@ export interface ICapsuleRestoreResult {
 	scb: IStaticChannelBackup;
 	/** Tier 2: frames verified and replayed into the target. */
 	framesApplied: number;
+	/**
+	 * Tier 2 with `omitAuxiliaryChannels`: the asset channels the restore
+	 * held and left out. Present only when there was one.
+	 */
+	omittedAuxiliaryChannels?: IAuxiliaryRestoreChannel[];
+	/**
+	 * Tier 2 with `omitAuxiliaryChannels`: the payment hashes of the
+	 * PENDING records that had an HTLC on a channel left out, each now
+	 * marked `unresolved`. Present only when there was one.
+	 */
+	unresolvedPayments?: string[];
 }
 
 /**
@@ -1404,6 +1446,29 @@ export function restoreFromRecoveryCapsule(
 		? verifyInlineJournal(capsule, nodeSecret)
 		: validated;
 	assertNoJournalResidue(target);
+	// Asked here, before the install opens, from the decoded frames: a
+	// provider hook does not run inside the storage transaction. Refused
+	// when the restore holds an asset channel nobody said can be restored:
+	// the throw is not a defect of the capsule, so no older candidate and
+	// no Tier 1 fallback is tried.
+	const replayed = channelsAfterReplay(frames);
+	// Left out by the caller's own word: nobody is asked about a channel
+	// that is not going to be restored.
+	const omitted =
+		options.omitAuxiliaryChannels === true
+			? auxiliaryRestoreChannels(replayed)
+			: [];
+	const auxiliaryChannelIds =
+		omitted.length > 0
+			? []
+			: assertAuxiliaryRestore(replayed, options.auxiliaryChannels);
+	const installed =
+		omitted.length > 0
+			? framesWithoutChannels(
+					frames,
+					new Set(omitted.map((channel) => channel.channelId))
+			  )
+			: frames;
 
 	// ONE shared transaction for the frames, the metadata AND the replay:
 	// the inner reconstruction units (applySnapshot, the per-frame
@@ -1413,6 +1478,7 @@ export function restoreFromRecoveryCapsule(
 	// content was already proven (or, without a scratch, is at least never
 	// silently degraded), so a failure here means the TARGET is broken,
 	// not the capsule.
+	let unresolvedPayments: string[] = [];
 	withStorageTransaction(target, () => {
 		for (const row of rows) {
 			target.saveRecoveryFrame!(row);
@@ -1442,10 +1508,28 @@ export function restoreFromRecoveryCapsule(
 				encoded.meta.backfillLost
 			);
 		}
-		reconstructFromFrames(target, frames);
+		reconstructFromFrames(target, installed);
+		// A payment in flight on a channel left out is not followed from
+		// here on: its record says so, and keeps PENDING.
+		if (omitted.length > 0) {
+			const left = new Set(omitted.map((channel) => channel.channelId));
+			unresolvedPayments = markPaymentsOfOmittedChannels(
+				target,
+				replayed.filter((row) => left.has(row.channelId))
+			);
+		}
+		// Only reads: what was installed is what was asked about above, and
+		// no asset channel at all when they were left out.
+		assertAuxiliaryRestoreInstalled(target, auxiliaryChannelIds);
 		markCapsuleRestoredChannels(target);
 	});
-	return { tier: 2, scb, framesApplied: frames.length };
+	return {
+		tier: 2,
+		scb,
+		framesApplied: frames.length,
+		...(omitted.length > 0 ? { omittedAuxiliaryChannels: omitted } : {}),
+		...(unresolvedPayments.length > 0 ? { unresolvedPayments } : {})
+	};
 }
 
 /**

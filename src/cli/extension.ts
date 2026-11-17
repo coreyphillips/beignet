@@ -21,6 +21,9 @@
 
 import type { ILogger } from '../logger';
 import type { Wallet } from '../wallet';
+import type { IAuxiliaryChannelConfig } from '../lightning/channel/auxiliary-funding';
+import type { LightningNode } from '../lightning/node/lightning-node';
+import type { IFixedOutputFeePolicy } from '../lightning/wallet/fixed-output-fees';
 import type {
 	IMetadataScanStorage,
 	IStorageBackend
@@ -154,9 +157,44 @@ export interface IExtensionContext {
 	emit(event: string, data: unknown): void;
 }
 
+/**
+ * What the node may spend on the fees of an asset channel's transactions
+ * whose outputs are fixed: WalletFundingProvider's fee policy without the
+ * two members the daemon supplies itself, the journal's storage (the node's
+ * own database) and the wallet's identity.
+ */
+export type ExtensionFixedOutputFees = Omit<
+	IFixedOutputFeePolicy,
+	'storage' | 'walletId'
+>;
+
 export interface IExtensionAttachment {
 	/** One handler per declared route, keyed '<METHOD> <path>'. */
 	handlers?: Record<string, ExtensionHandler>;
+	/**
+	 * Asset channel support for the node this build creates (issue #2093):
+	 * handed to the node as its `auxiliaryChannels`, as it is. At most one
+	 * attached extension may supply it. The node keeps it for the life of
+	 * the build, whatever becomes of the extension afterwards, so it has to
+	 * work whether or not start() has run. An engine that predates this
+	 * member ignores it.
+	 */
+	auxiliaryChannels?: IAuxiliaryChannelConfig;
+	/**
+	 * What the node may spend on the fees of the fixed-output transactions
+	 * of asset channels. Read only beside `auxiliaryChannels`; without it
+	 * the wallet prepares no fee coins.
+	 */
+	fixedOutputFees?: ExtensionFixedOutputFees;
+	/**
+	 * Called with the node of this build as soon as it is constructed:
+	 * before it restores its stored channels, so before any hook of
+	 * `auxiliaryChannels` can be called, outside any storage transaction and
+	 * before any start(). The node has restored and started nothing yet, so
+	 * keep it and ask nothing of it here. Synchronous; a promise it returns
+	 * is not waited for.
+	 */
+	bind?(node: LightningNode): void;
 	/** Runs once the node is built and serving. */
 	start?(): void | Promise<void>;
 	/**
@@ -191,6 +229,14 @@ export interface IBeignetExtension {
 	): IExtensionAttachment | Promise<IExtensionAttachment>;
 }
 
+/** What one attached extension supplies for the node's asset channels. */
+export interface IExtensionAuxiliarySupply {
+	/** The extension that supplies it. */
+	id: string;
+	auxiliaryChannels: IAuxiliaryChannelConfig;
+	fixedOutputFees?: ExtensionFixedOutputFees;
+}
+
 /** What GET /extensions reports for one extension. */
 export interface IExtensionInfo {
 	id: string;
@@ -209,6 +255,34 @@ export interface IExtensionInfo {
 	events: string[];
 	/** The attachment's status(), when it has one and is running. */
 	status?: unknown;
+	/**
+	 * Present only when the node holds the asset channel provider of this
+	 * extension and has no fee coin pool. With `error`: the wallet refused
+	 * the fee policy the extension supplied; the node opens and accepts no
+	 * asset channel, and whatever needs a fee coin fails with this error.
+	 * With `supplied: false`: the attachment gave no `fixedOutputFees`; the
+	 * node does not offer fixed HTLC outputs (feature bit 451), and opens
+	 * or accepts an asset channel only with a peer the provider's
+	 * `allowLegacyHtlcSignatures` hook allows.
+	 */
+	fixedOutputFees?: IExtensionFeePoolUnavailable | IExtensionFeePoolAbsent;
+}
+
+/**
+ * An extension supplies the node's asset channels and gave no fee policy
+ * for them: its node keeps no fee coin pool.
+ */
+export interface IExtensionFeePoolAbsent {
+	available: false;
+	/** No `fixedOutputFees` came beside `auxiliaryChannels`. */
+	supplied: false;
+}
+
+/** The fee coin pool of an extension's node is unavailable, and why. */
+export interface IExtensionFeePoolUnavailable {
+	available: false;
+	/** The code and remedy of the engine's FixedOutputFeeError. */
+	error: { code: string; remedy: string; message: string };
 }
 
 /**
@@ -572,6 +646,19 @@ interface IExtensionSlot {
 	state: ExtensionState;
 	error?: string;
 	attachment?: IExtensionAttachment;
+	/**
+	 * What the attachment asked of the node, read once when it was taken:
+	 * unset for an attachment that names none of the three members.
+	 */
+	nodeMembers?: IExtensionNodeMembers;
+	/** Why the wallet refused the fee policy of the current generation. */
+	feePolicyRefusal?: IExtensionFeePoolUnavailable['error'];
+	/**
+	 * An attachment whose start() threw while the node holds its asset
+	 * channel provider: failed, and kept unstopped with its storage open
+	 * until the node itself stops or is rebuilt.
+	 */
+	retained?: IExtensionAttachment;
 	handlers: Map<string, ExtensionHandler>;
 	/** The attach() pass that last took the slot (ExtensionHost.pass). */
 	pass: number;
@@ -579,6 +666,13 @@ interface IExtensionSlot {
 	fence?: () => void;
 	/** Holds or releases the writes of the current generation's view. */
 	holdWrites?: (held: boolean) => void;
+}
+
+/** The members of an attachment that reach the node it is attached to. */
+interface IExtensionNodeMembers {
+	auxiliaryChannels?: IAuxiliaryChannelConfig;
+	fixedOutputFees?: ExtensionFixedOutputFees;
+	bind?: (node: LightningNode) => void;
 }
 
 function errorMessage(err: unknown): string {
@@ -614,6 +708,14 @@ export class ExtensionHost {
 	 */
 	private settling: Promise<void> = Promise.resolve();
 	private shutDown = false;
+	/**
+	 * The slot shutdown() left running for the node's drain, and whether it
+	 * is there by a retained attachment (a failed start that supplied the
+	 * provider). finishShutdown() stops and fences it.
+	 */
+	private deferred?: { slot: IExtensionSlot; retained: boolean };
+	/** The extension that supplies the node's asset channels (keepUntilDrained). */
+	private keptUntilDrained?: string;
 	/**
 	 * Moves on every attach() and on every teardown. An attach() that finds
 	 * it moved was overtaken: its build is gone, and it attaches nothing more.
@@ -661,6 +763,7 @@ export class ExtensionHost {
 		if (pass !== this.pass) return;
 		// Anything still attached belongs to a build that is gone.
 		this.fenceAll();
+		for (const stop of this.stopRetained('rebuild')) void this.settle(stop);
 		const generation = ++this.generation;
 		for (const slot of this.slots) {
 			// Torn down while an earlier extension was attaching: the rest are
@@ -672,6 +775,8 @@ export class ExtensionHost {
 			slot.state = 'pending';
 			slot.error = undefined;
 			slot.attachment = undefined;
+			slot.nodeMembers = undefined;
+			slot.feePolicyRefusal = undefined;
 			slot.handlers = new Map();
 			const view = extensionStorageView(extension.id, build.storage);
 			let open = true;
@@ -716,7 +821,9 @@ export class ExtensionHost {
 					if (slot.pass === pass) slot.state = 'stopped';
 					continue;
 				}
-				slot.handlers = this.bindHandlers(extension, attachment);
+				const handlers = this.bindHandlers(extension, attachment);
+				slot.nodeMembers = this.readNodeMembers(attachment);
+				slot.handlers = handlers;
 				slot.attachment = attachment;
 				slot.state = 'attached';
 			} catch (err) {
@@ -733,6 +840,118 @@ export class ExtensionHost {
 						extension: extension.id,
 						error: errorMessage(err)
 					});
+				}
+			}
+		}
+	}
+
+	/**
+	 * What the attached extensions supply for the asset channels of the node
+	 * about to be built, or undefined when none supplies any. Two that both
+	 * supply a provider are refused: a node runs one, and choosing between
+	 * them here would leave the channels of the other unenforced.
+	 */
+	auxiliarySupply(): IExtensionAuxiliarySupply | undefined {
+		const suppliers = this.slots.filter(
+			(slot) =>
+				slot.state === 'attached' &&
+				slot.nodeMembers?.auxiliaryChannels !== undefined
+		);
+		if (suppliers.length > 1) {
+			const ids = suppliers
+				.map((slot) => `"${slot.extension.id}"`)
+				.join(' and ');
+			throw new BeignetError(
+				'ASSET_PROVIDER_CONFLICT',
+				`Extensions ${ids} both supply asset channels. A node runs one ` +
+					'asset channel provider, so it was not started: load one of them.'
+			);
+		}
+		const supplier = suppliers[0];
+		const members = supplier?.nodeMembers;
+		if (!supplier || members?.auxiliaryChannels === undefined) return undefined;
+		return {
+			id: supplier.extension.id,
+			auxiliaryChannels: members.auxiliaryChannels,
+			...(members.fixedOutputFees !== undefined
+				? { fixedOutputFees: members.fixedOutputFees }
+				: {})
+		};
+	}
+
+	/**
+	 * The wallet refused the fee policy extension `id` supplied. Called
+	 * before the node is built. The extension is kept, and its provider with
+	 * it, so a wallet that holds asset channels starts: GET /extensions says
+	 * that its fee coin pool is unavailable, and why, until the next build.
+	 */
+	feePolicyRefused(
+		id: string,
+		error: IExtensionFeePoolUnavailable['error']
+	): void {
+		const slot = this.slots.find((s) => s.extension.id === id);
+		if (slot && slot.state === 'attached') {
+			slot.feePolicyRefusal = {
+				code: error.code,
+				remedy: error.remedy,
+				message: error.message
+			};
+		}
+	}
+
+	/**
+	 * Whether an attached extension asked for the node of this build. The
+	 * node is given the binding callback only then, so a build with no such
+	 * extension is configured exactly as one with no extension.
+	 */
+	binds(): boolean {
+		return this.slots.some(
+			(slot) =>
+				slot.state === 'attached' && slot.nodeMembers?.bind !== undefined
+		);
+	}
+
+	/**
+	 * Give the node of this build to every attached extension that asked for
+	 * it. Called by the node itself as soon as it is constructed and before
+	 * it restores from storage (INodeConfig.beforeRestore), so no stored
+	 * channel calls a hook of an unbound provider. Outside any storage
+	 * transaction, and before start().
+	 *
+	 * An extension whose bind() throws is failed and stopped, and the node
+	 * runs without it, with one exception: `provider`, the extension whose
+	 * asset channel provider the node is being built with. A provider that
+	 * was never given its node cannot run a channel, so the throw is passed
+	 * on as ASSET_PROVIDER_FAILED and ends the construction before anything
+	 * is restored.
+	 */
+	bindNode(node: LightningNode, provider?: string): void {
+		for (const slot of this.slots) {
+			if (slot.state !== 'attached') continue;
+			const bind = slot.nodeMembers?.bind;
+			if (!bind) continue;
+			const { id } = slot.extension;
+			try {
+				const pending: unknown = bind.call(slot.attachment, node);
+				if (isRecord(pending) && typeof pending.then === 'function') {
+					// Not waited for. A rejection is logged, so it is not an
+					// unhandled one.
+					(pending as unknown as Promise<unknown>).then(undefined, (err) =>
+						this.opts.log('warn', 'Extension bind rejected', {
+							extension: id,
+							error: errorMessage(err)
+						})
+					);
+				}
+			} catch (err) {
+				this.drop(slot, 'bind', err);
+				if (id === provider) {
+					throw new BeignetError(
+						'ASSET_PROVIDER_FAILED',
+						`Extension "${id}" supplies this node's asset channels and ` +
+							`refused the node it was built for: ${errorMessage(err)}. ` +
+							'The node was not started.'
+					);
 				}
 			}
 		}
@@ -777,6 +996,18 @@ export class ExtensionHost {
 			}
 		} catch (err) {
 			if (slot.attachment !== attachment || slot.state !== 'attached') return;
+			if (slot.nodeMembers?.auxiliaryChannels !== undefined) {
+				// The node was built with this extension's asset channel
+				// provider and goes on calling it for the channels that exist,
+				// which it may have to defend on chain. So only the routes
+				// close: the attachment is kept, unstopped and with its storage
+				// open, and is stopped when the node stops or is rebuilt. New
+				// activity is the extension's own to refuse.
+				slot.handlers = new Map();
+				this.fail(slot, 'start', err);
+				slot.retained = attachment;
+				return;
+			}
 			// Settled before the stop hook is waited for. The slot can change
 			// hands during that wait: a teardown finds nothing running here
 			// and does not stop the attachment a second time, and a rebuild
@@ -828,6 +1059,7 @@ export class ExtensionHost {
 			slot.state = 'stopped';
 			slot.handlers = new Map();
 		}
+		for (const stop of this.stopRetained('rebuild')) void this.settle(stop);
 	}
 
 	/**
@@ -838,8 +1070,15 @@ export class ExtensionHost {
 	 * is shorter: the hooks of this generation run together, alongside
 	 * whatever an earlier one left running, and none adds its wait to
 	 * another's. The node passes a share of its own shutdown budget.
+	 *
+	 * The extension named to keepUntilDrained() is the exception. Its
+	 * routes close with the others, but it is neither stopped nor fenced
+	 * here: the node calls its provider for every commitment while it
+	 * drains its in-flight HTLCs, so the extension and its storage stay as
+	 * they are until finishShutdown(), after the drain.
 	 */
 	async shutdown(limitMs?: number): Promise<void> {
+		const provider = this.keptUntilDrained;
 		if (this.shutDown) return;
 		this.shutDown = true;
 		this.pass++;
@@ -850,15 +1089,67 @@ export class ExtensionHost {
 		const running = this.slots.filter((slot) => this.isRunning(slot));
 		// Routes close first, so a hook does not race a new request.
 		for (const slot of running) slot.handlers = new Map();
+		const kept =
+			provider === undefined
+				? undefined
+				: this.slots.find(
+						(slot) =>
+							slot.extension.id === provider &&
+							(this.isRunning(slot) || slot.retained !== undefined)
+				  );
+		if (kept) {
+			this.deferred = { slot: kept, retained: kept.retained !== undefined };
+		}
 		await Promise.all([
 			within(this.settling, limit),
-			...running.map((slot) =>
-				this.runStop(slot.extension.id, slot.attachment, 'shutdown', limit)
-			)
+			...running
+				.filter((slot) => slot !== kept)
+				.map((slot) =>
+					this.runStop(slot.extension.id, slot.attachment, 'shutdown', limit)
+				),
+			...this.stopRetained('shutdown', limit, kept)
 		]);
-		this.fenceAll();
-		for (const slot of running) slot.state = 'stopped';
+		this.fenceAll(kept);
+		for (const slot of running) {
+			if (slot !== kept) slot.state = 'stopped';
+		}
 		this.listeners.clear();
+	}
+
+	/**
+	 * Name the extension that supplies the asset channels of the node being
+	 * built, or undefined when none does. A graceful shutdown leaves that
+	 * one running, with its storage open, until finishShutdown().
+	 */
+	keepUntilDrained(id: string | undefined): void {
+		this.keptUntilDrained = id;
+	}
+
+	/**
+	 * The node has drained: stop and fence the provider's extension that
+	 * shutdown() left running. The wallet and the storage still work. The
+	 * wait is bounded like every stop hook's. Nothing to do when shutdown()
+	 * kept no extension.
+	 */
+	async finishShutdown(limitMs?: number): Promise<void> {
+		const deferred = this.deferred;
+		if (!deferred) return;
+		this.deferred = undefined;
+		const { slot } = deferred;
+		const limit = Math.max(
+			0,
+			Math.min(this.stopTimeoutMs(), limitMs ?? Infinity)
+		);
+		const attachment = deferred.retained ? slot.retained : slot.attachment;
+		slot.retained = undefined;
+		try {
+			await this.runStop(slot.extension.id, attachment, 'shutdown', limit);
+		} finally {
+			slot.fence?.();
+			slot.fence = undefined;
+			slot.holdWrites = undefined;
+			if (!deferred.retained) slot.state = 'stopped';
+		}
 	}
 
 	/**
@@ -867,6 +1158,20 @@ export class ExtensionHost {
 	 * everything is fenced at once, and the stop hooks run on unwaited.
 	 */
 	abort(): void {
+		// A graceful shutdown that was cut short may still hold the
+		// provider's extension open: it is fenced here with the rest.
+		const deferred = this.deferred;
+		this.deferred = undefined;
+		if (deferred) {
+			const { slot } = deferred;
+			const attachment = deferred.retained ? slot.retained : slot.attachment;
+			slot.retained = undefined;
+			slot.fence?.();
+			slot.fence = undefined;
+			slot.holdWrites = undefined;
+			void this.runStop(slot.extension.id, attachment, 'shutdown');
+			if (!deferred.retained) slot.state = 'stopped';
+		}
 		if (this.shutDown) return;
 		this.shutDown = true;
 		this.pass++;
@@ -877,6 +1182,7 @@ export class ExtensionHost {
 			slot.state = 'stopped';
 			slot.handlers = new Map();
 		}
+		for (const stop of this.stopRetained('shutdown')) void stop;
 		this.listeners.clear();
 	}
 
@@ -916,6 +1222,20 @@ export class ExtensionHost {
 				)
 			};
 			if (slot.error !== undefined) info.error = slot.error;
+			if (slot.feePolicyRefusal !== undefined) {
+				info.fixedOutputFees = {
+					available: false,
+					error: { ...slot.feePolicyRefusal }
+				};
+			} else if (
+				slot.nodeMembers?.auxiliaryChannels !== undefined &&
+				slot.nodeMembers.fixedOutputFees === undefined
+			) {
+				// Asset channels with no fee policy: the row of an extension
+				// whose policy the wallet took says nothing, so without this
+				// a reader could not tell the two apart.
+				info.fixedOutputFees = { available: false, supplied: false };
+			}
 			if (this.isRunning(slot) && slot.attachment?.status) {
 				try {
 					// Through JSON here, where a value that does not serialize (a
@@ -935,12 +1255,33 @@ export class ExtensionHost {
 		});
 	}
 
+	/**
+	 * Run the stop hook of every attachment that was kept for its provider
+	 * after a failed start(), now that the node it served is going away.
+	 */
+	private stopRetained(
+		reason: ExtensionStopReason,
+		limitMs?: number,
+		except?: IExtensionSlot
+	): Promise<void>[] {
+		const stops: Promise<void>[] = [];
+		for (const slot of this.slots) {
+			if (slot.retained === undefined || slot === except) continue;
+			stops.push(
+				this.runStop(slot.extension.id, slot.retained, reason, limitMs)
+			);
+			slot.retained = undefined;
+		}
+		return stops;
+	}
+
 	private isRunning(slot: IExtensionSlot): boolean {
 		return slot.state === 'attached' || slot.state === 'ready';
 	}
 
-	private fenceAll(): void {
+	private fenceAll(except?: IExtensionSlot): void {
 		for (const slot of this.slots) {
+			if (slot === except) continue;
 			slot.fence?.();
 			slot.fence = undefined;
 			slot.holdWrites = undefined;
@@ -972,6 +1313,26 @@ export class ExtensionHost {
 				error: errorMessage(err)
 			}
 		);
+	}
+
+	/**
+	 * Give up on an attached extension the node cannot use: failed, its
+	 * routes closed at once, its stop hook run and waited for by the next
+	 * attach(), and only then its storage fenced, as for a start() that
+	 * throws.
+	 */
+	private drop(slot: IExtensionSlot, phase: string, err: unknown): void {
+		const attachment = slot.attachment;
+		const fence = slot.fence;
+		slot.handlers = new Map();
+		slot.nodeMembers = undefined;
+		this.fail(slot, phase, err);
+		void this.settle(
+			this.runStop(slot.extension.id, attachment, 'shutdown')
+		).then(() => {
+			fence?.();
+			if (slot.fence === fence) slot.fence = undefined;
+		});
 	}
 
 	/**
@@ -1081,6 +1442,53 @@ export class ExtensionHost {
 		return new Map(
 			declared.map((key) => [key, given[key] as ExtensionHandler])
 		);
+	}
+
+	/**
+	 * The members of an attachment that reach the node, each read once. An
+	 * attachment that names none of them reads as undefined, and nothing
+	 * about it is different from before these members existed.
+	 */
+	private readNodeMembers(
+		attachment: IExtensionAttachment
+	): IExtensionNodeMembers | undefined {
+		const { auxiliaryChannels, fixedOutputFees, bind } = attachment;
+		if (
+			auxiliaryChannels === undefined &&
+			fixedOutputFees === undefined &&
+			bind === undefined
+		) {
+			return undefined;
+		}
+		if (auxiliaryChannels !== undefined) {
+			if (
+				!isRecord(auxiliaryChannels) ||
+				!isRecord(auxiliaryChannels.provider) ||
+				typeof auxiliaryChannels.resolveIncoming !== 'function'
+			) {
+				throw new Error(
+					'auxiliaryChannels must carry a provider and resolveIncoming'
+				);
+			}
+		}
+		if (fixedOutputFees !== undefined) {
+			if (auxiliaryChannels === undefined) {
+				throw new Error(
+					'fixedOutputFees is read only beside auxiliaryChannels'
+				);
+			}
+			if (!isRecord(fixedOutputFees)) {
+				throw new Error('fixedOutputFees must be an object');
+			}
+		}
+		if (bind !== undefined && typeof bind !== 'function') {
+			throw new Error('bind must be a function');
+		}
+		return {
+			...(auxiliaryChannels !== undefined ? { auxiliaryChannels } : {}),
+			...(fixedOutputFees !== undefined ? { fixedOutputFees } : {}),
+			...(bind !== undefined ? { bind } : {})
+		};
 	}
 
 	private loggerFor(id: string): ILogger {

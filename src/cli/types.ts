@@ -361,6 +361,13 @@ export interface ChannelInfo {
 	 */
 	restoreRevokedRisk?: boolean;
 	/**
+	 * Present, and true, only on an asset channel: one whose commitments
+	 * carry asset outputs for an auxiliary channel provider. Its sats are not
+	 * spendable or receivable as bitcoin over Lightning, and no total counts
+	 * them. Absent on every other channel.
+	 */
+	auxiliary?: true;
+	/**
 	 * Neither mempool nor chain can account for the funding, so the channel is
 	 * quarantined: no new HTLCs, no router edge, no routing hint. Reversible
 	 * and not a close; it clears by itself when the funding is seen again.
@@ -453,12 +460,39 @@ export interface PayAllPayment {
 	remainderMsat: string;
 }
 
+/**
+ * Why a PENDING payment can no longer be followed by this wallet (issue
+ * #2093): an HTLC of it was on a channel a capsule restore left out.
+ */
+export interface PaymentUnresolved {
+	code: 'CHANNEL_OMITTED_AT_RESTORE';
+	/** The channels left out that carried an HTLC of it. */
+	channelIds: ChannelIdHex[];
+}
+
 export interface PaymentInfo {
 	payAll?: PayAllPayment;
 	paymentHash: PaymentHashHex;
 	preimage?: string;
 	amountSats: number;
 	feeSats?: number;
+	/**
+	 * True on a payment that asset HTLCs carried (issue #2093), and absent
+	 * on every other. On an outgoing one `amountSats` and `feeSats` are the
+	 * bitcoin that carried the asset and not what was paid, which is
+	 * `auxiliaryValueSats`. No bitcoin total counts a marked payment.
+	 */
+	auxiliary?: true;
+	/** An outgoing asset payment: what it was worth to the payee, in sats. */
+	auxiliaryValueSats?: number;
+	/**
+	 * Present on a PENDING payment whose outcome this wallet cannot learn:
+	 * an HTLC of it was on an asset channel a capsule restore left out
+	 * (`omitAssetChannels`), and the peer may have settled or failed it
+	 * since. Such a payment stays PENDING. It is never reported as paid or
+	 * as failed, cannot be cancelled and is not sent again.
+	 */
+	unresolved?: PaymentUnresolved;
 	status: 'PENDING' | 'COMPLETED' | 'FAILED';
 	direction: 'OUTGOING' | 'INCOMING';
 	failureCode?: number;
@@ -478,6 +512,14 @@ export interface PaymentProof {
 	invoice?: string;
 	hopCount?: number;
 	feeSats?: number;
+	/**
+	 * True on the proof of a payment that asset HTLCs carried (issue
+	 * #2093), and absent on every other: `amountSats` and `feeSats` are then
+	 * the bitcoin that carried the asset, and `auxiliaryValueSats` is what
+	 * the payment was worth to the payee.
+	 */
+	auxiliary?: true;
+	auxiliaryValueSats?: number;
 }
 
 export interface PaymentProofVerification {
@@ -495,6 +537,17 @@ export interface InvoiceInfo {
 	expiry?: number;
 	createdAt?: number;
 	status?: 'PENDING' | 'PAID' | 'EXPIRED';
+	/**
+	 * True on an invoice that asset HTLCs paid (issue #2093), and absent on
+	 * every other.
+	 */
+	auxiliary?: true;
+	/**
+	 * Present on an invoice that is not PAID and had an HTLC on an asset
+	 * channel a capsule restore left out: whether that HTLC paid it is not
+	 * known to this wallet. The mark of its payment record.
+	 */
+	unresolved?: PaymentUnresolved;
 }
 
 /**
@@ -743,6 +796,31 @@ export interface HoldInvoiceInfo {
 	earliestExpiry: number | null;
 	cancelMarginBlocks: number;
 	cancelHeight: number | null;
+	/**
+	 * True while a parked part of the set is an asset HTLC and after such a
+	 * set settled (issue #2093), and absent on every other row.
+	 * `heldAmountMsat` is then what the node holds for those HTLCs: what the
+	 * asset provider said they are worth, not bitcoin to be received.
+	 */
+	auxiliary?: true;
+}
+
+/**
+ * The refusal of a capsule restore for the asset channels the capsule holds
+ * (issue #2093), where nobody called to be answered: the automatic apply.
+ * `code` is the code `POST /recovery/restore-capsule` answers the same
+ * capsule with, and `assetChannels` is its `error.details.assetChannels`:
+ * what the restore would leave out were it run with `omitAssetChannels`.
+ */
+export interface AssetRestoreRefusal {
+	code: 'ASSET_RESTORE_REFUSED' | 'ASSET_PROVIDER_REQUIRED';
+	assetChannels: Array<{
+		channelId: ChannelIdHex;
+		/** The peer's node id, hex. */
+		peerPubkey: string;
+		/** The capacity of the channel's funding output. */
+		capacitySats: number;
+	}>;
 }
 
 /**
@@ -761,6 +839,11 @@ export interface HoldInvoiceEvent {
 	earliestExpiry: number | null;
 	cancelMarginBlocks: number;
 	cancelHeight: number | null;
+	/**
+	 * True when a part of the set the transition acted on is an asset HTLC
+	 * (issue #2093), and absent on every other event.
+	 */
+	auxiliary?: true;
 }
 
 export interface DecodedInvoice {
@@ -962,6 +1045,32 @@ export interface BalanceInfo {
 	 * lightning at splice_locked.
 	 */
 	splicingSats?: number;
+	/**
+	 * The sats on this wallet's side of its asset channels that are neither
+	 * closing nor over, whatever their state: still opening (from the
+	 * broadcast of its funding transaction for a channel this wallet funds,
+	 * from the confirmation of it for one the peer funds), open, waiting for
+	 * the peer, or failed and not yet closed. An opening whose funding
+	 * transaction has not been broadcast is not counted: its coins are still
+	 * in `onchain`. Present only while it has one. They carry asset
+	 * outputs and cannot be sent or received as bitcoin over Lightning, so
+	 * they are in neither `lightning` nor `total`. Every asset channel that
+	 * is not over is in this figure or in `assetChannelClosingSats`, never
+	 * in both.
+	 */
+	assetChannelSats?: number;
+	/**
+	 * The sats on this wallet's side of its asset channels that are closing:
+	 * shutting down, negotiating a close, or force closed with its balance
+	 * output not yet spent in a block. Present only while it has one. A
+	 * closing asset channel is in no other figure: not `assetChannelSats`,
+	 * which counts those that are not closing, and not
+	 * `pendingCloseBalanceSats`, since
+	 * this bitcoin does not come back to the wallet but stays under the asset
+	 * outputs the close or the sweep pays. In neither `lightning` nor
+	 * `total`.
+	 */
+	assetChannelClosingSats?: number;
 }
 
 export interface OfferInfo {
@@ -1750,6 +1859,8 @@ export interface BeignetNodeEvents {
 		paymentHash: PaymentHashHex;
 		bolt11: string;
 		amountSats: number;
+		/** True when asset HTLCs paid it (issue #2093); absent otherwise. */
+		auxiliary?: true;
 	}) => void;
 	/**
 	 * A part joined a hold invoice's parked set (issue #746), fired for each
@@ -1789,32 +1900,55 @@ export interface BeignetNodeEvents {
 	'channel:opening': (data: {
 		channelId: ChannelIdHex;
 		fundingTxid: TxidHex;
+		auxiliary?: true;
 	}) => void;
+	/**
+	 * Every channel event carries `auxiliary: true` when its channel is an
+	 * asset channel the node still holds (issue #2093), and no such key
+	 * otherwise.
+	 */
 	/** The channel reached NORMAL state. */
-	'channel:ready': (data: { channelId: ChannelIdHex }) => void;
+	'channel:ready': (data: {
+		channelId: ChannelIdHex;
+		auxiliary?: true;
+	}) => void;
 	/**
 	 * The channel can take a new HTLC again: it reached NORMAL on
 	 * channel_ready, finished reestablishing on a reconnect, a splice locked
 	 * or unwound, or its funding quarantine lifted. Fires on every reconnect.
 	 * The payment queues start and retry on it (issue #967).
 	 */
-	'channel:usable': (data: { channelId: ChannelIdHex }) => void;
+	'channel:usable': (data: {
+		channelId: ChannelIdHex;
+		auxiliary?: true;
+	}) => void;
 	/** A cooperative close started, by this node (`local`) or the peer (`remote`). */
 	'channel:pending-close': (data: {
 		channelId: ChannelIdHex;
 		initiator: 'local' | 'remote';
+		auxiliary?: true;
 	}) => void;
 	/** A force close started: this node broadcast its commitment (`local`) or the peer's appeared on chain (`remote`). */
 	'channel:force-closing': (data: {
 		channelId: ChannelIdHex;
 		initiator: 'local' | 'remote';
+		auxiliary?: true;
 	}) => void;
 	/** The funding output was spent and the spend classified. Outputs may still be unswept: `channel:resolved` is the terminal event. */
-	'channel:closed': (data: { channelId: ChannelIdHex }) => void;
+	'channel:closed': (data: {
+		channelId: ChannelIdHex;
+		auxiliary?: true;
+	}) => void;
 	/** The true terminal event of a close: every on-chain output of the channel is irrevocably swept or claimed and the channel state becomes CLOSED. */
-	'channel:resolved': (data: { channelId: ChannelIdHex }) => void;
+	'channel:resolved': (data: {
+		channelId: ChannelIdHex;
+		auxiliary?: true;
+	}) => void;
 	/** The channel was removed with nothing to close on chain, and its persisted state was durably deleted: its unconfirmed funding tx vanished from mempool and chain, or the open was aborted or abandoned before any funding existed. */
-	'channel:voided': (data: { channelId: ChannelIdHex }) => void;
+	'channel:voided': (data: {
+		channelId: ChannelIdHex;
+		auxiliary?: true;
+	}) => void;
 	/** splice_locked exchanged both ways: the channel runs on the new funding (fundingTxid, display order). */
 	'splice:complete': (data: {
 		channelId: ChannelIdHex;
@@ -1999,8 +2133,16 @@ export interface BeignetNodeEvents {
 		channelCount: number;
 		candidates: number;
 	}) => void;
-	/** A step of a guardian or capsule restore. */
-	'recovery:restore-progress': (data: { type: string; detail: string }) => void;
+	/**
+	 * A step of a guardian or capsule restore. The `capsule:auto-refused`
+	 * step of an automatic apply refused for the asset channels the capsule
+	 * holds also carries `refusal`, with the code and the channels.
+	 */
+	'recovery:restore-progress': (data: {
+		type: string;
+		detail: string;
+		refusal?: AssetRestoreRefusal;
+	}) => void;
 	/** A guardian or capsule restore finished. */
 	'recovery:restored': (data: {
 		exact: boolean;

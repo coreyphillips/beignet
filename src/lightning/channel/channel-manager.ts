@@ -6,6 +6,18 @@
  * Channel state machine to the actual transport layer.
  */
 
+import {
+	auxiliaryMaxHtlcs,
+	auxiliaryProviderError,
+	copyAuxiliaryCommitment
+} from './auxiliary';
+import type { IAuxiliaryHtlcDecision } from './auxiliary';
+import { AuxiliaryOpenError } from './auxiliary-guard';
+import { holdAuxiliaryRevokedView } from './auxiliary-revoked';
+import { classifyCommitmentTx } from '../chain/output-resolver';
+import { applyAuxiliaryClose } from './auxiliary-close';
+import { auxiliaryChannelOpens } from './auxiliary-switch';
+import type { CustomRecords } from '../message/custom-records';
 import { TypedEmitter } from '../../utils/typed-emitter';
 import type { TxidHex } from '../../utils/identifiers';
 import type { ChannelManagerEvents } from './events';
@@ -85,8 +97,13 @@ import {
 	CommitmentType,
 	IRREVOCABLE_DEPTH,
 	OutputType,
+	FIXED_OUTPUT_FEE_TIMING,
+	fixedOutputFeeWaitMakesDeadline,
+	fixedOutputHtlcFeeActionId,
+	parseFixedOutputHtlcFeeActionId,
 	satPerVbyteToSatPerKw
 } from '../chain/types';
+
 import {
 	attachFeeInputsToZeroFeeHtlcTx,
 	buildAnchorCpfpTx
@@ -126,6 +143,25 @@ import { buildTaprootAnchorOutput } from '../script/commitment-taproot';
 import { ecc } from '../../utils/ecc';
 import type { ISpliceWalletInput, ITaprootClosingCache } from './channel';
 import { Channel } from './channel';
+import type {
+	IAuxiliaryCommitmentData,
+	IAuxiliaryOpeningCsvState
+} from './auxiliary';
+import {
+	auxiliaryCsvPolicyError,
+	createAuxiliaryOpeningCsvPolicy
+} from './auxiliary-csv';
+import type {
+	IAuxiliaryChannelConfig,
+	IAuxiliaryFundingDescriptor
+} from './auxiliary-funding';
+import {
+	MAX_AUXILIARY_FUNDING_DATA_BYTES,
+	applyAuxiliaryFunding,
+	auxiliaryCarrierError,
+	auxiliaryDustLimit,
+	validateAuxiliaryFunding
+} from './auxiliary-funding';
 import type { IChannelState } from './channel-state';
 import { createOpenerState, createAcceptorState } from './channel-state';
 import {
@@ -143,10 +179,13 @@ import {
 	hasScidAliasChannelType,
 	isAnchorChannel,
 	isTaprootChannel,
+	hasSimpleTaprootBit,
 	scidAliasAnnounceRefusal,
 	validateV2ChannelType,
 	MAX_FUNDING_SATOSHIS,
-	MAX_WUMBO_FUNDING_SATOSHIS
+	MAX_WUMBO_FUNDING_SATOSHIS,
+	isOverlayChannel,
+	isFixedAssetHtlcChannel
 } from './types';
 import type { IChannelBasepoints } from '../keys/derivation';
 import {
@@ -344,6 +383,32 @@ interface IBarrierQueue {
 	batches: IHeldBatch[];
 }
 
+/** How long the host may take to validate one step of an asset opening. */
+const AUXILIARY_FUNDING_GATE_TIMEOUT_MS = 120_000;
+/** The most asset opening steps that may wait on the host at once. */
+const MAX_AUXILIARY_FUNDING_GATES = 64;
+
+/**
+ * A failure of the host's own callbacks, or of what they returned, while an
+ * inbound asset opening is judged. Kept apart from the node's own refusals
+ * because its text is never sent to a peer.
+ */
+class AuxiliaryHostError extends Error {
+	constructor(cause: unknown) {
+		super(cause instanceof Error ? cause.message : String(cause));
+		this.name = 'AuxiliaryHostError';
+	}
+}
+
+/** Run one host callback, marking whatever it throws as the host's. */
+function askAuxiliaryHost<T>(ask: () => T): T {
+	try {
+		return ask();
+	} catch (err) {
+		throw err instanceof AuxiliaryHostError ? err : new AuxiliaryHostError(err);
+	}
+}
+
 export interface IChannelManagerConfig {
 	/**
 	 * Where each batch's PERSIST_STATE commits before the sends it authorizes
@@ -352,6 +417,42 @@ export interface IChannelManagerConfig {
 	 * those sends. LightningNode supplies one backed by its storage.
 	 */
 	persistence: IChannelPersistence;
+	/**
+	 * Whether the monitor row of a channel, as the last `monitor:updated`
+	 * announced it, is stored. Asked before a spend of the units of an asset
+	 * channel is broadcast, and only then: without an answer of true such a
+	 * spend does not leave. LightningNode supplies one backed by its storage.
+	 */
+	isMonitorPersisted?: (channelIdHex: string) => boolean;
+	/**
+	 * The view of one revoked commitment of an asset channel, from the
+	 * storage's store of revoked views. Asked when a revoked commitment of
+	 * an asset channel is seen on the chain and its view has left memory.
+	 * LightningNode supplies one backed by its storage.
+	 */
+	loadAuxiliaryRevokedCommitment?: (
+		channelIdHex: string,
+		commitmentNumber: bigint
+	) => IAuxiliaryCommitmentData | null | undefined;
+	/**
+	 * Asset channel support (issue #2093). Unset, the manager opens and
+	 * accepts ordinary channels only and none of the asset code runs.
+	 */
+	auxiliaryChannels?: IAuxiliaryChannelConfig;
+	/**
+	 * Set while this node accepts no asset channel (issue #2093): an
+	 * incoming asset open is refused with it before the host is asked.
+	 */
+	auxiliaryOpenRefusal?: Error;
+	/**
+	 * What a peer advertised in its init, for the asset channel checks. A
+	 * node always supplies this, and with it an asset opening is refused
+	 * whenever the peer's features, or this node's own, cannot be read. A
+	 * manager driven without a node falls back to its peer manager, and
+	 * with neither (tests and in-process harnesses that exchange no init)
+	 * has nothing to consult.
+	 */
+	auxiliaryPeerFeatures?(peerPubkey: string): FeatureFlags | undefined;
 	zeroReserve?: import('./zero-reserve').IZeroReserveConfig;
 	/** Durable book lookup supplied by the node's voucher custody index. */
 	fforVoucherLookup?: (paymentHash: string) => IFforVoucherArchive | undefined;
@@ -801,6 +902,12 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 	> = new Map();
 	private peerManager: PeerManager | null = null;
 	private monitors: Map<string, ChainMonitor> = new Map();
+	/**
+	 * Spends of the units of an asset channel that wait for the monitor row
+	 * with their asset side to be stored, by channel. Empty on a node
+	 * without asset channels.
+	 */
+	private auxiliarySpendsHeld: Map<string, Buffer[]> = new Map();
 	// Latest block height seen (for stamping when a force-close CPFP was broadcast).
 	private _currentBlockHeight = 0;
 	// Channels whose channel_announcement is signed by both sides but whose
@@ -835,6 +942,13 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			// by the re-CPFP pass and by a report that demotes the record itself,
 			// since a confirmation and its demotion can land between two passes.
 			sawConfirmation?: boolean;
+			// An asset channel: the children built for this commitment and
+			// the wallet coins they took, so that both can be let go once the
+			// funding output is spent in a block.
+			children?: {
+				txids: string[];
+				inputs: Array<{ txid: string; vout: number }>;
+			};
 		}
 	> = new Map();
 	// Learned payment preimages, retained so monitors created later (on
@@ -1138,6 +1252,25 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		);
 		const refused = actions.some((a) => a.type === ChannelActionType.ERROR);
 		if (refused && !accepted) this._releaseUnusedChannelIndex(channelIndex);
+		// An asset opening is answered only once the host has finished its
+		// own side of it; the accept waits, and is dropped if that fails.
+		const beforeAccept = this.config.auxiliaryChannels?.beforeAccept;
+		if (
+			accepted &&
+			!refused &&
+			beforeAccept &&
+			channel.getFullState().auxiliaryState
+		) {
+			this.gateAuxiliaryFunding(
+				peerPubkey,
+				channel,
+				'accept',
+				Buffer.alloc(0),
+				() => beforeAccept(channel, peerPubkey),
+				() => this.processActions(peerPubkey, channel, actions)
+			);
+			return;
+		}
 		this.processActions(peerPubkey, channel, actions);
 	}
 
@@ -1303,6 +1436,9 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 	 * Detach from the PeerManager.
 	 */
 	detachFromPeerManager(): void {
+		for (const timer of this.auxiliaryFundingTimers) clearTimeout(timer);
+		this.auxiliaryFundingTimers.clear();
+		this.auxiliaryFundingGates.clear();
 		this.peerManager = null;
 		for (const timer of this.quiescenceTimers.values()) {
 			clearTimeout(timer);
@@ -1459,7 +1595,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		fundingSatoshis: bigint,
 		pushMsat?: bigint,
 		beforeNegotiate?: (temporaryChannelId: Buffer) => void,
-		opts?: { trusted?: boolean }
+		opts?: { trusted?: boolean; auxiliary?: IAuxiliaryFundingDescriptor }
 	): Channel {
 		peerPubkey = normalizeHexPubkey(peerPubkey);
 		// Verify peer is connected before creating channel state
@@ -1476,15 +1612,42 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			);
 		}
 
+		// An asset opening is settled first: its descriptor, the HTLC mode
+		// agreed with the peer and its CSV policy can each refuse it, and a
+		// refusal here has not spent a key index.
+		const auxiliaryOpen = opts?.auxiliary
+			? this.prepareAuxiliaryOpen(
+					peerPubkey,
+					opts.auxiliary,
+					fundingSatoshis,
+					pushMsat || 0n
+			  )
+			: undefined;
+		const baseConfig = this.config.localConfig || DEFAULT_CHANNEL_CONFIG;
+
 		const chKeys = this.deriveKeysForNewChannel();
 		const state = createOpenerState({
-			temporaryChannelId: randomBytes(32),
+			temporaryChannelId: opts?.auxiliary
+				? Buffer.from(opts.auxiliary.temporaryChannelId)
+				: randomBytes(32),
 			fundingSatoshis,
 			pushMsat: pushMsat || 0n,
-			localConfig: this.config.localConfig || DEFAULT_CHANNEL_CONFIG,
+			localConfig: auxiliaryOpen?.csvPolicy
+				? { ...baseConfig, toSelfDelay: auxiliaryOpen.csvPolicy.localDelay }
+				: baseConfig,
 			localBasepoints: chKeys.basepoints,
 			localPerCommitmentSeed: chKeys.perCommitmentSeed
 		});
+		if (opts?.auxiliary) {
+			applyAuxiliaryFunding(
+				state,
+				opts.auxiliary,
+				auxiliaryMaxHtlcs(this.config.auxiliaryChannels?.maxHtlcs)
+			);
+			if (auxiliaryOpen?.csvPolicy) {
+				state.auxiliaryState!.openingCsvPolicy = auxiliaryOpen.csvPolicy;
+			}
+		}
 
 		if (opts?.trusted) {
 			state.zeroConfEnabled = true;
@@ -1497,7 +1660,11 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			chKeys.fundingPrivkey,
 			chKeys.htlcBasepointSecret
 		);
-		const channel = new Channel(state, signer);
+		const channel = new Channel(
+			state,
+			signer,
+			this.config.auxiliaryChannels?.provider
+		);
 		channel.setBlockHeight(this._currentBlockHeight);
 		if (this.config.chainHash) {
 			channel.announcementChainHash = this.config.chainHash;
@@ -1521,7 +1688,13 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		const actions = channel.initiateOpen(
 			this.config.chainHash,
 			this.config.preferAnchors,
-			this.config.preferTaproot
+			this.config.preferTaproot,
+			auxiliaryOpen
+				? {
+						fixedHtlcOutputs: auxiliaryOpen.fixed,
+						childCustody: auxiliaryOpen.childCustody
+				  }
+				: undefined
 		);
 		this.processActions(peerPubkey, channel, actions);
 
@@ -1588,6 +1761,266 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 	}
 
 	/**
+	 * Asset openings of this node whose row holds the peer's funding_signed,
+	 * by channel id hex: set when a write of the channel past funding_signed
+	 * commits, and for every such channel restored from its row. An opening
+	 * is irrevocable exactly when it is in here, whatever memory says.
+	 */
+	private readonly auxiliaryOpensCommitted = new Set<string>();
+	private readonly _auxiliaryFundingSignedInFlight = new Set<string>();
+	/** Openers whose host is told on the next tick (auxiliaryRowWritten). */
+	private readonly _auxiliaryFundingSignedDue = new Set<string>();
+	/** The channel whose row a dispatch is writing: it tells the host itself. */
+	private _auxiliaryDispatchWrite: Channel | undefined;
+
+	/** An asset channel this node opened, with the peer's funding_signed taken in. */
+	private _isAuxiliaryOpenPastFundingSigned(channel: Channel): boolean {
+		const state = channel.getFullState();
+		return (
+			state.auxiliaryState !== undefined &&
+			state.role === ChannelRole.OPENER &&
+			state.channelId !== undefined &&
+			state.channelId !== null &&
+			!!state.fundingTxid &&
+			state.fundingOutputIndex !== undefined &&
+			state.state !== ChannelState.SENT_OPEN &&
+			state.state !== ChannelState.SENT_ACCEPT &&
+			state.state !== ChannelState.SENT_FUNDING_CREATED
+		);
+	}
+
+	/**
+	 * A write of the channel has committed. If it is an asset opening past
+	 * funding_signed, its row now holds the peer's signature: the opening
+	 * is irrevocable, and a host that has not been told is told. The batch
+	 * that carries funding_signed tells it at its
+	 * AUTHORIZE_FUNDING_BROADCAST, in the order it always has.
+	 */
+	private _auxiliaryOpenRowCommitted(ctx: IDispatchContext): void {
+		const { channel } = ctx;
+		if (!channel.getFullState().auxiliaryState) return;
+		if (!this._isAuxiliaryOpenPastFundingSigned(channel)) return;
+		this.auxiliaryOpensCommitted.add(channel.getChannelId()!.toString('hex'));
+		if (
+			ctx.actions.some(
+				(action) =>
+					action.type === ChannelActionType.AUTHORIZE_FUNDING_BROADCAST
+			)
+		) {
+			return;
+		}
+		this._notifyAuxiliaryFundingSigned(ctx.peerPubkey, channel);
+	}
+
+	/**
+	 * A write of this channel's row has committed outside a dispatch of its
+	 * own: the node wrote the channel itself, or the manager did beside a
+	 * batch. For an asset opener past funding_signed whose host has not
+	 * been told, the row that makes the opening irrevocable is on disk
+	 * whichever write put it there: the opening counts as committed from
+	 * here, as it would when restored, and the host is told on the next
+	 * tick, outside the operation the write sits in. A host that threw is
+	 * asked again the same way. A dispatch tells the host itself
+	 * (_auxiliaryOpenRowCommitted) and is left to it. Nothing is looked at
+	 * for a channel without asset state.
+	 */
+	auxiliaryRowWritten(channel: Channel): void {
+		if (this._auxiliaryDispatchWrite === channel) return;
+		const auxiliary = channel.getFullState().auxiliaryState;
+		if (!auxiliary || auxiliary.fundingSignedDelivered === true) return;
+		if (!this._isAuxiliaryOpenPastFundingSigned(channel)) return;
+		const hex = channel.getChannelId()!.toString('hex');
+		if (this.channels.get(hex) !== channel) return;
+		this.auxiliaryOpensCommitted.add(hex);
+		if (
+			!this.config.auxiliaryChannels?.onFundingSigned ||
+			this._auxiliaryFundingSignedDue.has(hex)
+		) {
+			return;
+		}
+		this._auxiliaryFundingSignedDue.add(hex);
+		setImmediate(() => {
+			this._auxiliaryFundingSignedDue.delete(hex);
+			const peerPubkey = this.channelPeers.get(hex);
+			if (this.channels.get(hex) !== channel || !peerPubkey) return;
+			this._notifyAuxiliaryFundingSigned(peerPubkey, channel);
+		});
+	}
+
+	/**
+	 * Tell the host that an asset opening is past its point of no return
+	 * (onFundingSigned): the peer's funding_signed is verified and the row
+	 * that holds it has committed. A throw is reported, never propagated:
+	 * the opening is irrevocable whatever the host does with the news.
+	 *
+	 * The host is told until it has taken the news. Once the callback
+	 * returns, the channel's asset state is marked and written, and nothing
+	 * more is delivered. Without the mark (the callback threw, the process
+	 * died before or in it, or the row could not be written at the time) it
+	 * is called again: when the channel is restored, and after the next
+	 * write of the channel that commits. The callback is idempotent by
+	 * contract. Never called inside a storage transaction.
+	 */
+	private _notifyAuxiliaryFundingSigned(
+		peerPubkey: string,
+		channel: Channel,
+		options: { persist?: boolean } = {}
+	): void {
+		const callback = this.config.auxiliaryChannels?.onFundingSigned;
+		const state = channel.getFullState();
+		const auxiliary = state.auxiliaryState;
+		if (
+			!callback ||
+			!auxiliary ||
+			!state.channelId ||
+			!state.fundingTxid ||
+			state.fundingOutputIndex === undefined
+		) {
+			return;
+		}
+		const hex = state.channelId.toString('hex');
+		if (
+			auxiliary.fundingSignedDelivered === true ||
+			!this.auxiliaryOpensCommitted.has(hex) ||
+			this._auxiliaryFundingSignedInFlight.has(hex)
+		) {
+			return;
+		}
+		this._auxiliaryFundingSignedInFlight.add(hex);
+		try {
+			callback({
+				channelId: Buffer.from(state.channelId),
+				temporaryChannelId: Buffer.from(state.temporaryChannelId),
+				peerPubkey,
+				fundingTxid: Buffer.from(state.fundingTxid),
+				fundingOutputIndex: state.fundingOutputIndex
+			});
+		} catch (error) {
+			this.emitContained(
+				'error',
+				state.channelId,
+				`Asset funding callback failed (channel ${hex}): ${
+					error instanceof Error ? error.message : String(error)
+				}`
+			);
+			return;
+		} finally {
+			this._auxiliaryFundingSignedInFlight.delete(hex);
+		}
+		auxiliary.fundingSignedDelivered = true;
+		if (options.persist === false) return;
+		// Written now, so that a restart does not tell the host again. A
+		// write that does not commit leaves the mark to the next one.
+		try {
+			this.persistence.persist({
+				channel,
+				peerPubkey,
+				channelId: state.channelId
+			});
+		} catch (error) {
+			this.emitContained(
+				'error',
+				state.channelId,
+				`Asset funding marker was not written (channel ${hex}): ${
+					error instanceof Error ? error.message : String(error)
+				}`
+			);
+		}
+	}
+
+	/**
+	 * Give up an asset opening this node began, at the host's request, while
+	 * it can still be undone: any time before the peer's funding_signed is
+	 * verified. `id` is the opening's temporary channel id or, once
+	 * funding_created went out, its channel id. The peer is sent an error
+	 * for the channel so it forgets it, the opening leaves this node like an
+	 * opening that died with its connection does, and it has no row: none
+	 * is written before funding_signed. Returns the funding transaction's
+	 * id when funding_created had been sent, for the caller to drop what it
+	 * kept for it.
+	 *
+	 * Throws an AuxiliaryOpenError once the row that holds the peer's
+	 * funding_signed has committed (ASSET_OPEN_IRREVOCABLE: the funding may
+	 * already be on its way to the chain), and for an id that is not an
+	 * asset opening of this node (ASSET_OPEN_UNKNOWN). The committed row
+	 * decides, not memory: a funding_signed that was verified and could not
+	 * be written authorized nothing, the host was not told of it, and the
+	 * opening can still be given up.
+	 */
+	abandonAuxiliaryOpen(id: Buffer, reason: string): Buffer | undefined {
+		const named = (channel: Channel): boolean =>
+			channel.getTemporaryChannelId().equals(id) ||
+			channel.getChannelId()?.equals(id) === true;
+		const isAssetOpening = (channel: Channel): boolean => {
+			const state = channel.getFullState();
+			return (
+				state.role === ChannelRole.OPENER &&
+				(state.auxiliaryState !== undefined ||
+					state.fundingTaprootMerkleRoot !== undefined)
+			);
+		};
+		const channel =
+			[...this.tempChannels.values()].find(named) ??
+			[...this.channels.values()].find(named);
+		if (!channel || !isAssetOpening(channel)) {
+			throw new AuxiliaryOpenError(
+				'ASSET_OPEN_UNKNOWN',
+				id,
+				'No asset opening of this node has that id'
+			);
+		}
+		const abandonable = new Set([
+			ChannelState.SENT_OPEN,
+			ChannelState.SENT_ACCEPT,
+			ChannelState.SENT_FUNDING_CREATED
+		]);
+		const committedHex = channel.getChannelId()?.toString('hex');
+		if (
+			!abandonable.has(channel.getState()) &&
+			committedHex !== undefined &&
+			this.auxiliaryOpensCommitted.has(committedHex)
+		) {
+			throw new AuxiliaryOpenError(
+				'ASSET_OPEN_IRREVOCABLE',
+				id,
+				channel.getFullState().remoteCommitmentSignature
+					? "The peer's funding_signed is verified: the asset opening can no longer be abandoned"
+					: `An asset opening in state ${channel.getState()} can no longer be abandoned`
+			);
+		}
+		const channelId = channel.getChannelId();
+		if (!channelId) {
+			// funding_created has not gone out: the path of a funding that
+			// failed locally.
+			this.abortPendingOpen(channel, reason);
+			return undefined;
+		}
+		// funding_created is out and funding_signed is not in. BOLT 2 has the
+		// channel under its permanent id already, so that is the id the
+		// peer is told to forget.
+		const fundingTxid = channel.getFullState().fundingTxid;
+		const temporaryChannelId = channel.getTemporaryChannelId();
+		const peerPubkey =
+			this.channelPeers.get(channelId.toString('hex')) ??
+			this.channelPeers.get(temporaryChannelId.toString('hex'));
+		channel.failOpenOnDisconnect();
+		this.auxiliaryFundingGates.delete(temporaryChannelId.toString('hex'));
+		// A write of it that was refused leaves nothing owed.
+		this.persistFailed.delete(channelId.toString('hex'));
+		this.sendsWithheldOnConnection.delete(channelId.toString('hex'));
+		if (peerPubkey) this.removeCurrentChannelLifecycle(peerPubkey, channel);
+		try {
+			const wire = peerPubkey && wireErrorPayloadFor(channelId, reason);
+			if (peerPubkey && wire) {
+				this.sendMessage(peerPubkey, MessageType.ERROR, wire);
+			}
+		} finally {
+			this.emitContained('channel:aborted', temporaryChannelId, reason);
+		}
+		return fundingTxid ? Buffer.from(fundingTxid) : undefined;
+	}
+
+	/**
 	 * Create funding for a channel and send funding_created.
 	 * Returns the permanent channel ID.
 	 */
@@ -1599,6 +2032,16 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 	): Buffer | null {
 		const peerPubkey = this.findPeerForChannel(channel);
 		if (!peerPubkey) return null;
+		const csvState = channel.getFullState();
+		const csvError = auxiliaryCsvPolicyError(
+			csvState.auxiliaryState?.openingCsvPolicy,
+			csvState.localConfig.toSelfDelay,
+			csvState.remoteConfig.toSelfDelay
+		);
+		if (csvError) {
+			this.abortPendingOpen(channel, csvError);
+			return null;
+		}
 		const proposedChannelId = deriveChannelId(fundingTxid, fundingOutputIndex);
 		if (
 			!this.channelIdAvailableForLifecycle(
@@ -1629,11 +2072,24 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			if (isTaprootChannel(fundingState.channelType)) {
 				// option_taproot: co-sign the acceptor's commitment #0 with a MuSig2
 				// partial signature instead of ECDSA.
-				partialSignatureWithNonce = this.signFundingPartial(
-					fundingState,
-					signer,
-					fundingState.remoteCurrentPerCommitmentPoint
-				);
+				try {
+					partialSignatureWithNonce = this.signFundingPartial(
+						fundingState,
+						signer,
+						fundingState.remoteCurrentPerCommitmentPoint
+					);
+				} catch (err) {
+					// The provider of an asset channel can refuse its first
+					// commitment. Nothing has been sent for this funding, so the
+					// opening ends here, by name, instead of staying half open.
+					if (!fundingState.auxiliaryState) throw err;
+					const detail = err instanceof Error ? err.message : String(err);
+					const temporaryId = channel.getTemporaryChannelId().toString('hex');
+					this.abortPendingOpen(channel, 'Asset channel funding failed');
+					throw new Error(
+						`Asset channel funding failed (channel ${temporaryId}): ${detail}`
+					);
+				}
 			} else {
 				const signed = signRemoteCommitment(
 					fundingState,
@@ -1695,12 +2151,25 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		signer: ISigner,
 		remotePerCommitmentPoint: Buffer
 	): Buffer {
-		return this.signCommitmentPartial(
+		const signed: { auxiliary?: IAuxiliaryCommitmentData } = {};
+		const partial = this.signCommitmentPartial(
 			state,
 			signer,
 			remotePerCommitmentPoint,
-			0n
+			0n,
+			signed
 		);
+		// Asset channels: the first commitment has no HTLC, so this partial
+		// is every signature it carries, and its asset view is kept now. A
+		// later commitment's view is kept by Channel.signCommitment, once
+		// the provider has signed for its HTLCs.
+		if (signed.auxiliary && state.auxiliaryState) {
+			state.auxiliaryState.remoteCommitments.set(
+				0n,
+				copyAuxiliaryCommitment(signed.auxiliary)
+			);
+		}
+		return partial;
 	}
 
 	/**
@@ -1715,7 +2184,8 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		state: IChannelState,
 		signer: ISigner,
 		remotePerCommitmentPoint: Buffer,
-		commitmentNumber: bigint
+		commitmentNumber: bigint,
+		signed?: { auxiliary?: IAuxiliaryCommitmentData }
 	): Buffer {
 		if (!state.remoteNonce || state.remoteNonce.length !== 66) {
 			throw new Error(
@@ -1732,7 +2202,8 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			signingNonce,
 			state.remoteNonce,
 			remotePerCommitmentPoint,
-			commitmentNumber
+			commitmentNumber,
+			signed
 		);
 		return Buffer.concat([partial, Buffer.from(signingNonce)]);
 	}
@@ -1776,7 +2247,16 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		onionRoutingPacket: Buffer,
 		blindingPoint?: Buffer,
 		skimmedFeeMsat?: bigint,
-		options?: { emitRefusal?: boolean }
+		options?: {
+			emitRefusal?: boolean;
+			/** The asset side of the HTLC. Only an asset channel takes them. */
+			customRecords?: CustomRecords;
+			/**
+			 * The HTLC id the caller prepared this add for. When the channel's
+			 * next id is another, nothing is added.
+			 */
+			expectedHtlcId?: bigint;
+		}
 	): ChannelResult {
 		const emitRefusal = options?.emitRefusal !== false;
 		const idHex = channelId.toString('hex');
@@ -1784,22 +2264,32 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		if (!channel) {
 			const error = `Channel not found: ${idHex}`;
 			if (emitRefusal) this.emit('error', channelId, error);
-			return { ok: false, actions: [], error };
+			return { ok: false, actions: [], error, admissionRejected: true };
 		}
 		const peerPubkey = this.channelPeers.get(idHex);
 		if (!peerPubkey) {
 			const error = `Peer not found for channel: ${idHex}`;
 			if (emitRefusal) this.emit('error', channelId, error);
-			return { ok: false, actions: [], error };
+			return { ok: false, actions: [], error, admissionRejected: true };
 		}
 
+		const nextHtlcId = channel.getFullState().localHtlcCounter;
+		if (
+			options?.expectedHtlcId !== undefined &&
+			options.expectedHtlcId !== nextHtlcId
+		) {
+			const error = `Asset HTLC circuit changed before admission (channel ${idHex})`;
+			if (emitRefusal) this.emit('error', channelId, error);
+			return { ok: false, actions: [], error, admissionRejected: true };
+		}
 		const actions = channel.addHtlc(
 			amountMsat,
 			paymentHash,
 			cltvExpiry,
 			onionRoutingPacket,
 			blindingPoint,
-			skimmedFeeMsat
+			skimmedFeeMsat,
+			options?.customRecords
 		);
 		// A refused add changed nothing in the channel and its ERROR carries no
 		// cleanup, so dropping it from the dispatch only drops the event.
@@ -1818,7 +2308,11 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		if (channel.getChannelId()) {
 			this.autoSignAndSendCommitment(channel.getChannelId()!);
 		}
-		return this.resultFromActions(actions);
+		const result = this.resultFromActions(actions);
+		// A refused add that spent no HTLC id admitted nothing.
+		return !result.ok && channel.getFullState().localHtlcCounter === nextHtlcId
+			? { ...result, admissionRejected: true }
+			: result;
 	}
 
 	/**
@@ -1895,7 +2389,187 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		// caller settles exactly as it always has.
 		if (progress.sendsWithheld) result.sendsWithheld = true;
 		if (progress.sendsHeld) result.sendsHeld = true;
+		this._noteAuxiliaryRemoval(channel, result, {
+			channelId,
+			htlcId,
+			kind: 'fulfill',
+			preimage
+		});
 		return result;
+	}
+
+	/**
+	 * Asset channels: the settlements and failures of received HTLCs that
+	 * the asset provider refused, by `<channel id hex>:<HTLC id>`. Each is
+	 * owed until the channel takes it or no longer holds the HTLC. In
+	 * memory only: after a restart the HTLC is still committed and
+	 * unresolved in the channel's row, and its replay asks again.
+	 */
+	private readonly _auxiliaryRemovalsOwed = new Map<
+		string,
+		{
+			channelId: Buffer;
+			htlcId: bigint;
+			kind: 'fulfill' | 'fail';
+			preimage?: Buffer;
+			reason?: Buffer;
+		}
+	>();
+	/** Retry attempts made per asset channel in the current interval. */
+	private readonly _auxiliaryRetryWindows = new Map<
+		string,
+		{ since: number; attempts: number }
+	>();
+	/** The interval the retry attempts of one asset channel are counted in. */
+	static readonly AUXILIARY_RETRY_INTERVAL_MS = 60_000;
+	/** See Channel.AUXILIARY_MAX_UNDELIVERED_OUTCOMES. */
+	static readonly AUXILIARY_MAX_UNDELIVERED_OUTCOMES =
+		Channel.AUXILIARY_MAX_UNDELIVERED_OUTCOMES;
+	/** The most retry attempts made on one asset channel per interval. */
+	static readonly AUXILIARY_RETRY_ATTEMPTS_PER_INTERVAL = 3;
+
+	/** Record or clear what fulfillHtlc or failHtlc left owed on an asset channel. */
+	private _noteAuxiliaryRemoval(
+		channel: Channel,
+		result: ChannelResult,
+		removal: {
+			channelId: Buffer;
+			htlcId: bigint;
+			kind: 'fulfill' | 'fail';
+			preimage?: Buffer;
+			reason?: Buffer;
+		}
+	): void {
+		if (!channel.getFullState().auxiliaryState) return;
+		const key = `${removal.channelId.toString('hex')}:${removal.htlcId}`;
+		if (result.ok) {
+			this._auxiliaryRemovalsOwed.delete(key);
+		} else if (result.code === ChannelErrorCode.ASSET_PROVIDER_REFUSED) {
+			this._auxiliaryRemovalsOwed.set(key, removal);
+		}
+	}
+
+	/** True when a settlement or a failure of this received HTLC is owed. */
+	owesAuxiliaryRemoval(channelId: Buffer, htlcId: bigint): boolean {
+		return this._auxiliaryRemovalsOwed.has(
+			`${channelId.toString('hex')}:${htlcId}`
+		);
+	}
+
+	/**
+	 * Take up again what a refusal of the asset provider left owed on the
+	 * asset channels: the settlement or the failure of an HTLC, and the
+	 * commitment that covers updates already made. Called from the node's
+	 * periodic work and on each block. Nothing is owed by a channel without
+	 * asset state, and a channel that is not connected is left to its
+	 * reestablish, which asks again.
+	 *
+	 * At most AUXILIARY_RETRY_ATTEMPTS_PER_INTERVAL attempts are made on one
+	 * channel per AUXILIARY_RETRY_INTERVAL_MS, however often it is called.
+	 * Every attempt the provider refuses raises the one 'error' the refusal
+	 * raised the first time. A settlement is given up once its HTLC has
+	 * expired: the preimage is not revealed for an HTLC the peer can already
+	 * take back on chain.
+	 *
+	 * `settle`, when given, makes the settlement of an HTLC the caller keeps
+	 * a record for, and answers undefined for one it does not. Returns what
+	 * the channels took.
+	 */
+	retryAuxiliaryOwed(
+		settle?: (
+			channelId: Buffer,
+			htlcId: bigint,
+			kind: 'fulfill' | 'fail'
+		) => ChannelResult | undefined,
+		now: number = Date.now()
+	): Array<{ channelId: Buffer; htlcId: bigint; kind: 'fulfill' | 'fail' }> {
+		const taken: Array<{
+			channelId: Buffer;
+			htlcId: bigint;
+			kind: 'fulfill' | 'fail';
+		}> = [];
+		if (!this.config.auxiliaryChannels) return taken;
+		for (const [hex, channel] of [...this.channels]) {
+			const state = channel.getFullState();
+			if (!state.auxiliaryState || !state.channelId) continue;
+			const owed: Array<{
+				channelId: Buffer;
+				htlcId: bigint;
+				kind: 'fulfill' | 'fail';
+				preimage?: Buffer;
+				reason?: Buffer;
+			}> = [];
+			for (const [key, removal] of [...this._auxiliaryRemovalsOwed]) {
+				if (!key.startsWith(`${hex}:`)) continue;
+				const htlc = state.htlcs.get(`received-${removal.htlcId}`);
+				if (!htlc || htlc.state !== HtlcState.COMMITTED) {
+					this._auxiliaryRemovalsOwed.delete(key);
+					continue;
+				}
+				if (
+					removal.kind === 'fulfill' &&
+					this._currentBlockHeight > 0 &&
+					htlc.cltvExpiry <= this._currentBlockHeight
+				) {
+					this._auxiliaryRemovalsOwed.delete(key);
+					this.emitContained(
+						'error',
+						state.channelId,
+						`The settlement of HTLC ${removal.htlcId} that the asset provider refused is given up at its expiry ${htlc.cltvExpiry} (channel ${hex})`
+					);
+					continue;
+				}
+				owed.push(removal);
+			}
+			if (
+				state.state !== ChannelState.NORMAL &&
+				state.state !== ChannelState.SHUTTING_DOWN
+			) {
+				continue;
+			}
+			const owesRound =
+				channel.needsCommitment() && !channel.isAwaitingRemoteRevocation();
+			if (owed.length === 0 && !owesRound) continue;
+			const window = this._auxiliaryRetryWindows.get(hex);
+			if (
+				!window ||
+				now - window.since >= ChannelManager.AUXILIARY_RETRY_INTERVAL_MS
+			) {
+				this._auxiliaryRetryWindows.set(hex, { since: now, attempts: 1 });
+			} else if (
+				window.attempts >= ChannelManager.AUXILIARY_RETRY_ATTEMPTS_PER_INTERVAL
+			) {
+				continue;
+			} else {
+				window.attempts++;
+			}
+			for (const removal of owed) {
+				const result =
+					settle?.(removal.channelId, removal.htlcId, removal.kind) ??
+					(removal.kind === 'fulfill'
+						? this.fulfillHtlc(
+								removal.channelId,
+								removal.htlcId,
+								removal.preimage!
+						  )
+						: this.failHtlc(
+								removal.channelId,
+								removal.htlcId,
+								removal.reason!
+						  ));
+				if (result.ok) {
+					taken.push({
+						channelId: removal.channelId,
+						htlcId: removal.htlcId,
+						kind: removal.kind
+					});
+				}
+			}
+			if (channel.needsCommitment()) {
+				this.autoSignAndSendCommitment(state.channelId);
+			}
+		}
+		return taken;
 	}
 
 	/**
@@ -1951,6 +2625,14 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		}
 		const result = this.resultFromActions(actions);
 		if (this.persistFailed.has(idHex)) result.sendsWithheld = true;
+		if (direction === HtlcDirection.RECEIVED) {
+			this._noteAuxiliaryRemoval(channel, result, {
+				channelId,
+				htlcId,
+				kind: 'fail',
+				reason
+			});
+		}
 		return result;
 	}
 
@@ -2100,7 +2782,39 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		const nextCommitNum = state.remoteCommitmentNumber + 1n;
 
 		let actions: ChannelAction[];
-		if (isTaprootChannel(state.channelType)) {
+		if (state.auxiliaryState) {
+			// Asset channels: the commitment is built with the provider's
+			// answer. If that cannot be had, nothing of this round is signed,
+			// sent or stored, and the caller is told so by name; the updates
+			// stay owed a commitment, which retryAuxiliaryOwed signs from the
+			// node's periodic work and on each block.
+			let partial: Buffer;
+			let htlcSigs: Buffer[];
+			try {
+				partial = this.signCommitmentPartial(
+					state,
+					signer,
+					perCommitPoint,
+					nextCommitNum
+				);
+				htlcSigs = signRemoteHtlcSignaturesTaproot(
+					state,
+					signer,
+					perCommitPoint,
+					nextCommitNum
+				);
+			} catch (err) {
+				const error = auxiliaryProviderError(state, 'a commitment', err);
+				this.emitContained('error', channelId, error.message);
+				return {
+					ok: false,
+					actions: [],
+					error: error.message,
+					code: ChannelErrorCode.ASSET_PROVIDER_REFUSED
+				};
+			}
+			actions = channel.signCommitment(Buffer.alloc(64), htlcSigs, partial);
+		} else if (isTaprootChannel(state.channelType)) {
 			// option_taproot: co-sign the peer's next commitment with a MuSig2 partial
 			// (fresh single-use signing nonce + peer's verification nonce), plus a
 			// BIP340 Schnorr signature per HTLC second-level tx.
@@ -2151,6 +2865,15 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			}
 		}
 		this.processActions(peerPubkey, channel, actions);
+		if (state.auxiliaryState) {
+			// A refused signature is an answer, not a success.
+			const refused = actions.find(
+				(a): a is IErrorAction => a.type === ChannelActionType.ERROR
+			);
+			if (refused) {
+				return { ok: false, actions, ...refusalFields(refused) };
+			}
+		}
 		return { ok: true, actions };
 	}
 
@@ -2286,7 +3009,10 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		// peer — producing "invalid commitment signature" on the next HTLC.
 		// autoSignAndSendCommitment is a no-op unless we owe a commitment.
 		if (channel.getChannelId()) {
-			this.autoSignAndSendCommitment(channel.getChannelId()!);
+			const signed = this.autoSignAndSendCommitment(channel.getChannelId()!);
+			if (!signed.ok && channel.getFullState().auxiliaryState) {
+				return { ...signed, actions };
+			}
 		}
 		return { ok: true, actions };
 	}
@@ -2747,7 +3473,16 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		if (abandoned.length === 0) return;
 		const channelId = channel.getChannelId() ?? channel.getTemporaryChannelId();
 		setImmediate(() => {
-			this.emit('htlc:local-add-abandoned', channelId, abandoned);
+			try {
+				this.emit('htlc:local-add-abandoned', channelId, abandoned);
+			} finally {
+				// Asset channels: an abandoned add that carried units left a
+				// failed outcome in the channel's asset state. The host is
+				// told now, and again from the row until it has taken it.
+				if (channel.getFullState().auxiliaryState) {
+					this._notifyAuxiliaryResolutions(channel);
+				}
+			}
 		});
 	}
 
@@ -2876,6 +3611,17 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			}
 			this.channels.set(channelId.toString('hex'), channel);
 			this.channelPeers.set(channelId.toString('hex'), peerPubkey);
+			this._notifyAuxiliaryResolutions(channel, { deferWrite: true });
+			// A row exists only from funding_signed on: an asset opening that
+			// is restored is irrevocable, and a host that was never told, or
+			// whose callback threw, is told now. The mark rides the next
+			// write of the row.
+			if (this._isAuxiliaryOpenPastFundingSigned(channel)) {
+				this.auxiliaryOpensCommitted.add(channelId.toString('hex'));
+				this._notifyAuxiliaryFundingSigned(peerPubkey, channel, {
+					persist: false
+				});
+			}
 			// After registering: the listener looks the channel up.
 			this._handOffRevokedCommitments(
 				channelId,
@@ -3332,7 +4078,6 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		const channelIdHex = channelId.toString('hex');
 		let monitor = this.monitors.get(channelIdHex);
 		const owner = this.channels.get(channelIdHex);
-
 		// Which funding the spend consumed decides the view the monitor
 		// classifies it against (issue #764): the peer's second-level HTLC
 		// signatures are per-funding, so a commitment on the splice output is
@@ -3398,6 +4143,23 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		// Captured BEFORE the report so a DEMOTION (a confirmed spend pushed back
 		// to the mempool by a reorg, or its clock stopped by a valid competing
 		// mempool spend) can be told from an ordinary mempool-first sighting.
+		// A revoked commitment of an asset channel: the asset side of that
+		// commitment is read back before its outputs are told apart.
+		const monitorState =
+			typeof monitor.getChannelState === 'function'
+				? monitor.getChannelState()
+				: undefined;
+		if (monitorState?.auxiliaryState) {
+			const seen = classifyCommitmentTx(spendingTx, monitorState);
+			if (seen.type === CommitmentType.THEIR_REVOKED_COMMITMENT) {
+				this.holdRevokedAuxiliaryView(
+					channelIdHex,
+					monitorState,
+					seen.commitmentNumber
+				);
+			}
+		}
+
 		const wasCommitmentConfirmed = monitor.isCommitmentConfirmed();
 		const chainActions = monitor.handleFundingSpent(
 			spendingTx,
@@ -3410,11 +4172,44 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		// listChannels() reflects reality after an offline close is detected on
 		// restart. The monitor records the classified commitment for us.
 		const broadcast = monitor.getFullState().commitmentBroadcast;
+		// An asset channel whose funding output is spent in a block: the
+		// coins the children of a commitment took are free again, and a
+		// commitment that is not the one in the block is given up with them.
+		if (
+			broadcast &&
+			monitorState?.auxiliaryState &&
+			monitor.isCommitmentConfirmed()
+		) {
+			this.settleCommitmentCpfp(channelIdHex, broadcast.txid);
+		}
 		if (broadcast) {
 			const channel = this.channels.get(channelIdHex);
 			if (channel) {
 				const isCoop =
 					broadcast.commitmentType === CommitmentType.COOPERATIVE_CLOSE;
+				// An asset channel: every spend of the funding output that is
+				// no commitment is taken for the cooperative close, also one
+				// this node never signed and holds no close payload for. The
+				// channel ends as it does, and the row says which transaction
+				// that was, so that the host is told with the close, once, and
+				// can still read it after a restart.
+				const assetClose = channel.getFullState().auxiliaryState;
+				const unrecordedChanged = assetClose
+					? channel.markUnrecordedAuxiliaryClose(
+							isCoop && !assetClose.closeTransactions?.has(broadcast.txid)
+								? broadcast.txid
+								: null
+					  )
+					: false;
+				let closedNow = false;
+				// An asset channel the host was already told the end of: a
+				// force close of this node's own, and then the cooperative
+				// transaction it had signed confirms (the last closing_signed
+				// was lost), or the other way round.
+				const endedBefore =
+					assetClose !== undefined &&
+					(channel.getState() === ChannelState.CLOSED ||
+						channel.getState() === ChannelState.FORCE_CLOSED);
 				// A peer commitment seen only in the MEMPOOL must not close the
 				// channel yet (issue #559): flipping to FORCE_CLOSED here disarms
 				// the scanExpiringHtlcs deadline backstop, so a peer parking a
@@ -3446,6 +4241,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 						);
 					}
 				} else if (channel.markClosedOnChain(!isCoop)) {
+					closedNow = true;
 					// A non-coop spend of a channel we did not already force-close
 					// is the peer's unilateral close (current, future, or revoked
 					// commitment). Our own broadcast emits at forceClose() time.
@@ -3455,7 +4251,24 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 					) {
 						this.emit('channel:force-closing', channelId, 'remote');
 					}
-					this.emit('channel:closed', channelId);
+					if (endedBefore && !unrecordedChanged) {
+						// The move between the two closed states is written, and
+						// the end of the channel is not told a second time.
+						const peerPubkey = this.findPeerForChannel(channel);
+						if (peerPubkey) {
+							this.persistence.persist({ channel, peerPubkey, channelId });
+						}
+					} else {
+						this.emit('channel:closed', channelId);
+					}
+				}
+				if (unrecordedChanged && !closedNow) {
+					// The mark moved on a channel that was closed already: the
+					// write cannot ride 'channel:closed'.
+					const peerPubkey = this.findPeerForChannel(channel);
+					if (peerPubkey) {
+						this.persistence.persist({ channel, peerPubkey, channelId });
+					}
 				}
 				this._maybeRearmDemotedOurCommitment(
 					channelId,
@@ -3568,9 +4381,17 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			this._drainDeferredSettles(channelIdHex);
 		}
 
+		// Asset channels: what the host's callback has not taken is offered
+		// again, whatever the state of the channel's monitor.
+		this._redeliverAuxiliaryResolutions();
+
 		const allActions: ChainAction[] = [];
 
 		for (const [channelIdHex, monitor] of this.monitors) {
+			// Before the skip: a fee action can outlive everything else of
+			// its channel, when its retirement failed or the node was not
+			// running when its output was settled for good.
+			this.reconcileFixedOutputFees(channelIdHex);
 			if (monitor.isFullyResolved()) continue;
 
 			const actions = monitor.handleNewBlock(blockHeight);
@@ -3578,6 +4399,11 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			// actions. A channel:resolved listener can close the channel immediately,
 			// so the monitor must already be marked dirty at that boundary.
 			this.emit('monitor:updated', channelIdHex, monitor);
+			if (this.auxiliarySpendsHeld.size > 0) {
+				this.releaseHeldAuxiliarySpends(channelIdHex);
+			}
+			this.recordAuxiliaryChainEndings(channelIdHex);
+
 			if (actions.length > 0) {
 				const channelId = Buffer.from(channelIdHex, 'hex');
 				this.processChainActions(channelId, actions);
@@ -3695,6 +4521,20 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 	 */
 	restoreMonitor(channelId: string, monitor: ChainMonitor): void {
 		this.monitors.set(channelId, monitor);
+		if (typeof monitor.getChannelState === 'function') {
+			const monitorState = monitor.getChannelState();
+			const broadcast = monitor.getFullState().commitmentBroadcast;
+			if (
+				monitorState?.auxiliaryState &&
+				broadcast?.commitmentType === CommitmentType.THEIR_REVOKED_COMMITMENT
+			) {
+				this.holdRevokedAuxiliaryView(
+					channelId,
+					monitorState,
+					broadcast.commitmentNumber
+				);
+			}
+		}
 		// Before the harvest, so the only preimages dropped are ones the node
 		// read back from its own store, never one durable only in this monitor.
 		const trimmed =
@@ -3765,6 +4605,49 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 	}
 
 	/**
+	 * Forget a recorded preimage that was never used: that of a hold invoice
+	 * whose settle was given up before any HTLC took it. `held` names the
+	 * HTLCs the settle was for. Refused, with nothing forgotten, while a
+	 * chain monitor wants or holds a preimage for the hash (a claim on chain
+	 * may carry it), or while another received HTLC of the hash is in a
+	 * channel (its claim may still need it).
+	 */
+	forgetPreimage(
+		paymentHash: Buffer,
+		held: ReadonlyArray<{ channelId: Buffer; htlcId: bigint }>
+	): boolean {
+		const hashHex = paymentHash.toString('hex');
+		for (const monitor of this.monitors.values()) {
+			if (
+				typeof monitor.wantsPreimage !== 'function' ||
+				monitor.wantsPreimage(paymentHash) ||
+				(typeof monitor.getKnownPreimages === 'function' &&
+					monitor.getKnownPreimages().has(hashHex))
+			) {
+				return false;
+			}
+		}
+		for (const [idHex, channel] of this.channels) {
+			for (const [key, htlc] of channel.getFullState().htlcs) {
+				if (
+					!key.startsWith('received-') ||
+					!htlc.paymentHash?.equals(paymentHash)
+				) {
+					continue;
+				}
+				const settleWasForIt = held.some(
+					(h) =>
+						h.channelId.toString('hex') === idHex &&
+						`received-${h.htlcId}` === key
+				);
+				if (!settleWasForIt) return false;
+			}
+		}
+		this._knownPreimages.delete(hashHex);
+		return true;
+	}
+
+	/**
 	 * Seed a freshly created/restored monitor with the known preimages it
 	 * wants (ChainMonitor.wantsPreimage).
 	 *
@@ -3777,9 +4660,11 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 	private _seedMonitorPreimages(
 		channelIdHex: string,
 		monitor: ChainMonitor,
+
 		changed = false
 	): void {
 		if (this._knownPreimages.size === 0) return;
+
 		const channelId = Buffer.from(channelIdHex, 'hex');
 		const pendingActions: ChainAction[] = [];
 		const fullyResolved =
@@ -4020,7 +4905,11 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 					this.handleAcceptChannel(peerPubkey, payload);
 					break;
 				case MessageType.FUNDING_CREATED:
-					this.handleFundingCreated(peerPubkey, payload);
+					if (this.config.auxiliaryChannels?.beforeFundingCreated) {
+						this.handleAuxiliaryFundingCreated(peerPubkey, payload);
+					} else {
+						this.handleFundingCreated(peerPubkey, payload);
+					}
 					break;
 				case MessageType.FUNDING_SIGNED:
 					this.handleFundingSigned(peerPubkey, payload);
@@ -4249,6 +5138,30 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			);
 			return;
 		}
+		// Asset channels (issue #2093). Only a node with a provider looks:
+		// without one this does not run, and an open of the overlay type is
+		// refused by the channel like any type this node cannot build.
+		let auxiliaryOpen:
+			| ReturnType<ChannelManager['resolveIncomingAuxiliaryOpen']>
+			| undefined;
+		if (this.config.auxiliaryChannels) {
+			try {
+				auxiliaryOpen = this.resolveIncomingAuxiliaryOpen(peerPubkey, msg);
+			} catch (err) {
+				// What the host threw, or described wrongly, is this node's to
+				// know and never the peer's to read.
+				const detail = err instanceof Error ? err.message : String(err);
+				this.refuseInboundOpen(
+					peerPubkey,
+					msg.temporaryChannelId,
+					`open_channel refused: ${detail}`,
+					err instanceof AuxiliaryHostError
+						? 'open_channel refused: the asset channel could not be accepted'
+						: `open_channel refused: ${detail}`
+				);
+				return;
+			}
+		}
 		// Issue #906: the index is consumed HERE, ahead of the parameter
 		// validation the channel does below (amount, reserve, dust, feerate,
 		// channel_type), so an open that never becomes a channel must give
@@ -4265,7 +5178,12 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 				temporaryChannelId: msg.temporaryChannelId,
 				fundingSatoshis: msg.fundingSatoshis,
 				pushMsat: msg.pushMsat,
-				localConfig: this.config.localConfig || DEFAULT_CHANNEL_CONFIG,
+				localConfig: auxiliaryOpen?.csvPolicy
+					? {
+							...(this.config.localConfig || DEFAULT_CHANNEL_CONFIG),
+							toSelfDelay: auxiliaryOpen.csvPolicy.localDelay
+					  }
+					: this.config.localConfig || DEFAULT_CHANNEL_CONFIG,
 				localBasepoints: chKeys.basepoints,
 				localPerCommitmentSeed: chKeys.perCommitmentSeed,
 				remoteBasepoints: {
@@ -4292,7 +5210,21 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 				chKeys.fundingPrivkey,
 				chKeys.htlcBasepointSecret
 			);
-			channel = new Channel(state, signer);
+			if (auxiliaryOpen) {
+				applyAuxiliaryFunding(
+					state,
+					auxiliaryOpen.descriptor,
+					auxiliaryMaxHtlcs(this.config.auxiliaryChannels?.maxHtlcs)
+				);
+				if (auxiliaryOpen.csvPolicy) {
+					state.auxiliaryState!.openingCsvPolicy = auxiliaryOpen.csvPolicy;
+				}
+			}
+			channel = new Channel(
+				state,
+				signer,
+				this.config.auxiliaryChannels?.provider
+			);
 			channel.setBlockHeight(this._currentBlockHeight);
 			if (this.config.chainHash) {
 				channel.announcementChainHash = this.config.chainHash;
@@ -4366,6 +5298,408 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		}
 	}
 
+	// ─────────────── Asset channel opening (issue #2093) ───────────────
+
+	/** Peers whose opening CSV policy a mode read is consulting right now. */
+	private readonly _auxiliaryModeReads = new Set<string>();
+
+	/**
+	 * The asset HTLC mode a new asset channel with this peer would have,
+	 * without opening anything: for a host to check before its wallet
+	 * prepares funding. Throws where the opening itself would be refused.
+	 *
+	 * The host's openingCsvPolicy is consulted for that, and may itself ask
+	 * for the mode. A read made from inside the policy answers the mode
+	 * without consulting the policy again, so the two cannot call each
+	 * other without end.
+	 */
+	getAuxiliaryHtlcMode(peerPubkey: string): 'fixed' | 'legacy' {
+		peerPubkey = normalizeHexPubkey(peerPubkey);
+		const config = this.config.auxiliaryChannels;
+		if (!config) throw new Error('Asset channel provider is required');
+		if (this.peerManager && !this.peerManager.getPeer(peerPubkey)) {
+			throw new PeerError(
+				PeerErrorCode.NOT_CONNECTED,
+				`Not connected to peer ${peerPubkey}`
+			);
+		}
+		const mode = this.negotiateAuxiliaryHtlcMode(peerPubkey);
+		if (!this._auxiliaryModeReads.has(peerPubkey)) {
+			this._auxiliaryModeReads.add(peerPubkey);
+			try {
+				createAuxiliaryOpeningCsvPolicy(
+					config.openingCsvPolicy?.(peerPubkey),
+					(this.config.localConfig || DEFAULT_CHANNEL_CONFIG).toSelfDelay
+				);
+			} finally {
+				this._auxiliaryModeReads.delete(peerPubkey);
+			}
+		}
+		return mode.fixed ? 'fixed' : 'legacy';
+	}
+
+	/**
+	 * Replace the asset funding data of an opening that has not signed
+	 * anything yet, once the host holds the proofs it could only assemble
+	 * after the peer accepted. Refused from the first signature on.
+	 */
+	setAuxiliaryFundingData(
+		peerPubkey: string,
+		temporaryChannelId: Buffer,
+		data: Buffer
+	): void {
+		peerPubkey = normalizeHexPubkey(peerPubkey);
+		const channel = this.tempChannels.get(temporaryChannelId.toString('hex'));
+		if (!channel || this.findPeerForChannel(channel) !== peerPubkey) {
+			throw new Error('Asset funding peer or channel mismatch');
+		}
+		const state = channel.getFullState();
+		if (
+			!state.auxiliaryState ||
+			state.fundingTxid ||
+			(state.state !== ChannelState.SENT_OPEN &&
+				state.state !== ChannelState.SENT_ACCEPT) ||
+			state.auxiliaryState.localCommitments.size > 0 ||
+			state.auxiliaryState.remoteCommitments.size > 0
+		) {
+			throw new Error('Asset funding data is already committed');
+		}
+		if (
+			!Buffer.isBuffer(data) ||
+			data.length === 0 ||
+			data.length > MAX_AUXILIARY_FUNDING_DATA_BYTES
+		) {
+			throw new Error('Invalid asset funding data size');
+		}
+		// Kept in memory only: a channel has no row before it has a channel
+		// id, and this one gets its id, and its first write, at funding.
+		state.auxiliaryState.channelData = Buffer.from(data);
+	}
+
+	/**
+	 * The asset HTLC mode of a new asset channel with this peer, or a throw
+	 * that refuses the opening. Both sides have to advertise the overlay.
+	 * Fixed HTLC outputs are used when both advertise them, and then need a
+	 * funding provider that can prepare their fees; otherwise the host has
+	 * to allow the older signatures for this peer. Child custody rides on
+	 * fixed outputs only. A proposed type has to say exactly what was
+	 * agreed: neither mode is taken from, or given up to, the peer's word.
+	 */
+	private negotiateAuxiliaryHtlcMode(
+		peerPubkey: string,
+		proposed?: Buffer
+	): { fixed: boolean; childCustody: boolean } {
+		const config = this.config.auxiliaryChannels;
+		if (!config) throw new Error('Asset channel provider is required');
+		const local = this.config.localFeatures;
+		let remote: FeatureFlags | undefined;
+		if (this.config.auxiliaryPeerFeatures) {
+			// Driven by a node: both feature sets have to be there to read.
+			remote = this.config.auxiliaryPeerFeatures(peerPubkey);
+			if (!local || !remote) {
+				throw new Error('Asset channel peer features cannot be read');
+			}
+		} else if (this.peerManager) {
+			remote = this.peerManager.getPeer(peerPubkey)?.getRemoteInit()?.features;
+			if (!remote) {
+				throw new Error('Asset channel peer feature negotiation is incomplete');
+			}
+		}
+		// Otherwise this manager is driven directly, with no node and no peer
+		// manager: the path of tests and in-process harnesses, which exchange
+		// no init. There is nothing to consult, and only what is known is
+		// checked. A node never takes this path (auxiliaryPeerFeatures).
+		if (local && !local.hasFeature(Feature.OPTION_TAPROOT_OVERLAY)) {
+			throw new Error('This node does not advertise asset channels');
+		}
+		if (remote && !remote.hasFeature(Feature.OPTION_TAPROOT_OVERLAY)) {
+			throw new Error('Peer did not advertise asset channels');
+		}
+		const both = (feature: Feature): boolean =>
+			local?.hasFeature(feature) === true &&
+			remote?.hasFeature(feature) === true;
+		const fixed = both(Feature.OPTION_ASSET_FIXED_HTLC_OUTPUTS);
+		const childCustody =
+			fixed &&
+			config.allowRevokedChildCustody === true &&
+			both(Feature.OPTION_ASSET_CHILD_CUSTODY);
+		if (childCustody && !config.provider.prepareRevokedChild) {
+			throw new Error(
+				'Child custody requires an asset recovery capsule provider'
+			);
+		}
+		if (proposed) {
+			if (isFixedAssetHtlcChannel(proposed) !== fixed) {
+				throw new Error(
+					fixed
+						? 'Fixed asset HTLC outputs cannot be downgraded'
+						: 'Fixed asset HTLC outputs were not mutually negotiated'
+				);
+			}
+			if (
+				FeatureFlags.fromBuffer(proposed).hasFeature(
+					Feature.OPTION_ASSET_CHILD_CUSTODY
+				) !== childCustody
+			) {
+				throw new Error('Asset child custody mode was not mutually selected');
+			}
+		}
+		if (fixed) {
+			if (this.fundingProvider?.supportsFixedOutputFees?.() !== true) {
+				throw new Error(
+					'Fixed asset HTLC outputs require durable bounded fee preparation'
+				);
+			}
+		} else if (
+			askAuxiliaryHost(() => config.allowLegacyHtlcSignatures?.(peerPubkey)) !==
+			true
+		) {
+			throw new Error(
+				'New asset channels require fixed HTLC outputs or explicit peer compatibility'
+			);
+		}
+		return { fixed, childCustody };
+	}
+
+	/** Everything that can refuse an asset opening of ours, before any key is derived. */
+	private prepareAuxiliaryOpen(
+		peerPubkey: string,
+		descriptor: IAuxiliaryFundingDescriptor,
+		fundingSatoshis: bigint,
+		pushMsat: bigint
+	): {
+		fixed: boolean;
+		childCustody: boolean;
+		csvPolicy: IAuxiliaryOpeningCsvState | undefined;
+	} {
+		const config = this.config.auxiliaryChannels;
+		if (!config) throw new Error('Asset channel provider is required');
+		if (!auxiliaryChannelOpens.enabled) {
+			throw new Error('Asset channels are not enabled in this build');
+		}
+		validateAuxiliaryFunding(descriptor);
+		if (this.channelIdInUse(descriptor.temporaryChannelId.toString('hex'))) {
+			throw new Error('Temporary channel id is already in use');
+		}
+		// The peer's dust limit is not known before it answers; the channel
+		// asks again with it when the accept arrives.
+		const baseConfig = this.config.localConfig || DEFAULT_CHANNEL_CONFIG;
+		const carrierError = auxiliaryCarrierError({
+			fundingSatoshis,
+			pushMsat,
+			feeratePerKw: baseConfig.feeratePerKw,
+			openerAssetBalance: descriptor.localBalance,
+			acceptorAssetBalance: descriptor.remoteBalance,
+			dustLimitSatoshis: auxiliaryDustLimit(baseConfig.dustLimitSatoshis)
+		});
+		if (carrierError) throw new Error(carrierError);
+		const mode = this.negotiateAuxiliaryHtlcMode(peerPubkey);
+		const csvPolicy = createAuxiliaryOpeningCsvPolicy(
+			config.openingCsvPolicy?.(peerPubkey),
+			(this.config.localConfig || DEFAULT_CHANNEL_CONFIG).toSelfDelay
+		);
+		return { ...mode, csvPolicy };
+	}
+
+	/**
+	 * The asset funding of an inbound open_channel, undefined for an
+	 * ordinary open, or a throw that refuses it. An open that does not
+	 * propose the overlay type is an ordinary open and nothing more is asked
+	 * about it: the host is not consulted, so nothing a host does can touch
+	 * an ordinary channel. An open that does propose it is an asset opening,
+	 * and is refused unless the host's asset protocol announced one for this
+	 * peer and temporary id, so an overlay channel never opens without its
+	 * funding.
+	 */
+	private resolveIncomingAuxiliaryOpen(
+		peerPubkey: string,
+		msg: ReturnType<typeof decodeOpenChannelMessage>
+	):
+		| {
+				descriptor: IAuxiliaryFundingDescriptor;
+				csvPolicy: IAuxiliaryOpeningCsvState | undefined;
+		  }
+		| undefined {
+		if (!isOverlayChannel(msg.channelType)) return undefined;
+		if (!auxiliaryChannelOpens.enabled) {
+			throw new Error('asset channels are not enabled');
+		}
+		if (this.config.auxiliaryOpenRefusal) {
+			throw new AuxiliaryHostError(this.config.auxiliaryOpenRefusal);
+		}
+		const config = this.config.auxiliaryChannels!;
+		const descriptor = askAuxiliaryHost(() => {
+			const answer = config.resolveIncoming(
+				peerPubkey,
+				Buffer.from(msg.temporaryChannelId)
+			);
+			if (answer) validateAuxiliaryFunding(answer);
+			return answer;
+		});
+		if (!descriptor) {
+			throw new Error('no asset funding was negotiated for this channel');
+		}
+		if (!descriptor.temporaryChannelId.equals(msg.temporaryChannelId)) {
+			throw new AuxiliaryHostError(new Error('Invalid asset funding identity'));
+		}
+		const baseConfig = this.config.localConfig || DEFAULT_CHANNEL_CONFIG;
+		const localDust = auxiliaryDustLimit(baseConfig.dustLimitSatoshis);
+		const carrierError = auxiliaryCarrierError({
+			fundingSatoshis: msg.fundingSatoshis,
+			pushMsat: msg.pushMsat,
+			feeratePerKw: msg.feeratePerKw,
+			openerAssetBalance: descriptor.remoteBalance,
+			acceptorAssetBalance: descriptor.localBalance,
+			dustLimitSatoshis:
+				msg.dustLimitSatoshis > localDust ? msg.dustLimitSatoshis : localDust
+		});
+		if (carrierError) throw new Error(carrierError);
+		this.negotiateAuxiliaryHtlcMode(peerPubkey, msg.channelType);
+		const csvPolicy = createAuxiliaryOpeningCsvPolicy(
+			askAuxiliaryHost(() => config.openingCsvPolicy?.(peerPubkey)),
+			baseConfig.toSelfDelay,
+			msg.toSelfDelay
+		);
+		return { descriptor, csvPolicy };
+	}
+
+	/** Host validations in flight, by peer, temporary channel id and stage. */
+	private readonly auxiliaryFundingGates = new Map<
+		string,
+		{ payload: Buffer; channel: Channel }
+	>();
+	private readonly auxiliaryFundingTimers = new Set<
+		ReturnType<typeof setTimeout>
+	>();
+
+	/**
+	 * Hold one step of an asset opening until the host's validation
+	 * settles, then run it, or abort the opening if the validation fails or
+	 * takes longer than two minutes. The same message arriving again while
+	 * it waits is ignored; a different one for the same step aborts the
+	 * opening. Nothing runs if the channel was replaced or removed meanwhile.
+	 */
+	private gateAuxiliaryFunding(
+		peerPubkey: string,
+		channel: Channel,
+		stage: string,
+		payload: Buffer,
+		prepare: () => Promise<void>,
+		proceed: () => void
+	): void {
+		const id = channel.getTemporaryChannelId().toString('hex');
+		const key = `${peerPubkey}:${id}:${stage}`;
+		const prior = this.auxiliaryFundingGates.get(key);
+		// A gate left by an opening this one replaced (the peer reconnected
+		// and proposed it again while the host was still looking at the
+		// first) is not this opening's: it is superseded below, and its
+		// outcome, when it comes, finds it is no longer current.
+		if (prior && prior.channel === channel) {
+			if (!prior.payload.equals(payload)) {
+				this.abortPendingOpen(channel, 'Conflicting asset funding message');
+			}
+			return;
+		}
+		if (
+			!prior &&
+			this.auxiliaryFundingGates.size >= MAX_AUXILIARY_FUNDING_GATES
+		) {
+			this.abortPendingOpen(
+				channel,
+				'Asset funding validation capacity exceeded'
+			);
+			return;
+		}
+		const copy = { payload: Buffer.from(payload), channel };
+		this.auxiliaryFundingGates.set(key, copy);
+		let timeout: ReturnType<typeof setTimeout> | undefined;
+		const expired = new Promise<never>((_, reject) => {
+			timeout = setTimeout(
+				() => reject(new Error('Asset funding validation timed out')),
+				AUXILIARY_FUNDING_GATE_TIMEOUT_MS
+			);
+			timeout.unref?.();
+			this.auxiliaryFundingTimers.add(timeout);
+		});
+		void Promise.race([Promise.resolve().then(prepare), expired])
+			.then(
+				() => true,
+				() => false
+			)
+			.then((validated) => {
+				if (timeout) {
+					clearTimeout(timeout);
+					this.auxiliaryFundingTimers.delete(timeout);
+				}
+				const current =
+					this.auxiliaryFundingGates.get(key) === copy &&
+					this.tempChannels.get(id) === channel &&
+					this.findPeerForChannel(channel) === peerPubkey;
+				if (this.auxiliaryFundingGates.get(key) === copy) {
+					this.auxiliaryFundingGates.delete(key);
+				}
+				if (!current) return;
+				if (!validated) {
+					this.abortPendingOpen(channel, 'Asset funding validation failed');
+					return;
+				}
+				try {
+					proceed();
+				} catch (err) {
+					// This runs outside handleMessage, so its catch is repeated.
+					const message = err instanceof Error ? err.message : String(err);
+					this.emitContained(
+						'error',
+						null,
+						`Error completing asset channel ${stage}: ${message}`
+					);
+					if (this.tempChannels.get(id) === channel) {
+						this.abortPendingOpen(channel, 'Asset funding could not proceed');
+					}
+				}
+			});
+	}
+
+	/**
+	 * funding_created for an asset opening waits for the host to validate
+	 * the funding proofs it was sent, before this node signs the opener's
+	 * first commitment. Any other funding_created goes straight on.
+	 */
+	private handleAuxiliaryFundingCreated(
+		peerPubkey: string,
+		payload: Buffer
+	): void {
+		const beforeFundingCreated =
+			this.config.auxiliaryChannels?.beforeFundingCreated;
+		let temporaryChannelId: Buffer | undefined;
+		try {
+			temporaryChannelId =
+				decodeFundingCreatedMessage(payload).temporaryChannelId;
+		} catch {
+			// handleFundingCreated reports an undecodable payload itself.
+		}
+		const channel = temporaryChannelId
+			? this.tempChannels.get(temporaryChannelId.toString('hex'))
+			: undefined;
+		if (
+			!beforeFundingCreated ||
+			!channel?.getFullState().auxiliaryState ||
+			this.findPeerForChannel(channel) !== peerPubkey
+		) {
+			this.handleFundingCreated(peerPubkey, payload);
+			return;
+		}
+		const held = Buffer.from(payload);
+		this.gateAuxiliaryFunding(
+			peerPubkey,
+			channel,
+			'funding-created',
+			held,
+			() => beforeFundingCreated(channel, peerPubkey),
+			() => this.handleFundingCreated(peerPubkey, held)
+		);
+	}
+
 	private handleFundingCreated(peerPubkey: string, payload: Buffer): void {
 		let msg: ReturnType<typeof decodeFundingCreatedMessage>;
 		try {
@@ -4422,11 +5756,26 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		if (isTaprootChannel(channelState.channelType)) {
 			// option_taproot: co-sign the opener's commitment #0 with a MuSig2
 			// partial signature instead of ECDSA.
-			partialSignatureWithNonce = this.signFundingPartial(
-				channelState,
-				signer,
-				channelState.remoteCurrentPerCommitmentPoint!
-			);
+			try {
+				partialSignatureWithNonce = this.signFundingPartial(
+					channelState,
+					signer,
+					channelState.remoteCurrentPerCommitmentPoint!
+				);
+			} catch (err) {
+				// As for the opener: an asset channel whose provider refuses its
+				// first commitment ends here, by name, and the peer is told.
+				if (!channelState.auxiliaryState) throw err;
+				const detail = err instanceof Error ? err.message : String(err);
+				const temporaryId = msg.temporaryChannelId.toString('hex');
+				this.abortPendingOpen(channel, 'Asset channel funding failed');
+				this.emitContained(
+					'error',
+					msg.temporaryChannelId,
+					`Asset channel funding failed (channel ${temporaryId}): ${detail}`
+				);
+				return;
+			}
 		} else {
 			signature = signRemoteCommitment(
 				channelState,
@@ -4555,7 +5904,11 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 	private handleUpdateAddHtlc(peerPubkey: string, payload: Buffer): void {
 		let msg: ReturnType<typeof decodeUpdateAddHtlcMessage>;
 		try {
-			msg = decodeUpdateAddHtlcMessage(payload);
+			// Custom records are read on an asset channel only; for any other
+			// the standard reader stands.
+			msg = decodeUpdateAddHtlcMessage(payload, {
+				customRecords: this.readsCustomRecords(payload)
+			});
 		} catch (err) {
 			this.failChannelForUndecodablePayload(
 				peerPubkey,
@@ -4635,10 +5988,27 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		this.processActions(peerPubkey, channel, actions);
 	}
 
+	/**
+	 * Whether a channel message is for a channel with asset state, read from
+	 * the channel_id every such message starts with. Only those channels read
+	 * custom records (TLV types at or above 65536); a message for any other
+	 * channel is decoded as it always was, an unknown even type refused.
+	 */
+	private readsCustomRecords(payload: Buffer): boolean {
+		if (payload.length < 32) return false;
+		const channelId = payload.subarray(0, 32);
+		const channel =
+			this.findChannelByChannelId(channelId) ||
+			this.findChannelByChannelIdInTemp(channelId);
+		return channel?.getFullState().auxiliaryState !== undefined;
+	}
+
 	private handleCommitmentSigned(peerPubkey: string, payload: Buffer): void {
 		let msg: ReturnType<typeof decodeCommitmentSignedMessage>;
 		try {
-			msg = decodeCommitmentSignedMessage(payload);
+			msg = decodeCommitmentSignedMessage(payload, {
+				customRecords: this.readsCustomRecords(payload)
+			});
 		} catch (err) {
 			this.failChannelForUndecodablePayload(
 				peerPubkey,
@@ -4946,7 +6316,9 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 	private handleShutdownMsg(peerPubkey: string, payload: Buffer): void {
 		let msg: ReturnType<typeof decodeShutdownMessage>;
 		try {
-			msg = decodeShutdownMessage(payload);
+			msg = decodeShutdownMessage(payload, {
+				customRecords: this.readsCustomRecords(payload)
+			});
 		} catch (err) {
 			this.failChannelForUndecodablePayload(
 				peerPubkey,
@@ -5105,7 +6477,12 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 						? msg.feeSatoshis
 						: 0n
 				);
-				if (channel.getFullState().externalClose) {
+				// An asset channel's close is written, with the provider's payload
+				// for it, before the transaction leaves.
+				if (
+					channel.getFullState().externalClose ||
+					channel.getFullState().auxiliaryState
+				) {
 					actions.unshift(
 						{ type: ChannelActionType.PERSIST_STATE },
 						{ type: ChannelActionType.BROADCAST_TX, tx: closeTx }
@@ -5150,12 +6527,29 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		feeSatoshis: bigint,
 		theirSig: Buffer
 	): boolean {
-		try {
-			if (isTaprootChannel(channel.getFullState().channelType)) {
-				const cache = this.getOrCreateTaprootClosingSession(
+		// An asset channel: the session the signature is judged over is built
+		// first and on its own. That it could not be built is this node's
+		// failure, its provider's refusal, and is thrown to the channel under
+		// the typed error. Only a signature that does not verify over a
+		// session that was built is the peer's.
+		let assetSession: ITaprootClosingCache | null | undefined;
+		const assetState = channel.getFullState();
+		if (assetState.auxiliaryState) {
+			try {
+				assetSession = this.getOrCreateTaprootClosingSession(
 					channel,
 					feeSatoshis
 				);
+			} catch (err) {
+				throw auxiliaryProviderError(assetState, 'a cooperative close', err);
+			}
+		}
+		try {
+			if (isTaprootChannel(channel.getFullState().channelType)) {
+				const cache =
+					assetSession !== undefined
+						? assetSession
+						: this.getOrCreateTaprootClosingSession(channel, feeSatoshis);
 				if (!cache) return false;
 				const remoteNonce = channel.getClosingNonces().remote;
 				if (!remoteNonce) return false;
@@ -5224,6 +6618,8 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		fundingSatoshis: bigint;
 		localFundingPubkey: Buffer;
 		remoteFundingPubkey: Buffer;
+		/** An asset channel: the provider's payload for this transaction. */
+		auxiliaryCloseData?: Buffer;
 	} {
 		const { buildClosingTx } = require('../chain/closing');
 		const { createFundingScript } = require('../script/funding');
@@ -5245,7 +6641,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			? remoteBalanceSat
 			: remoteBalanceSat - feeSatoshis;
 
-		const { tx } = buildClosingTx({
+		const { tx, outputMap } = buildClosingTx({
 			fundingTxid: state.fundingTxid!.toString('hex'),
 			fundingOutputIndex: state.fundingOutputIndex!,
 			fundingAmount: state.fundingSatoshis,
@@ -5261,6 +6657,17 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			sequence: isTaprootChannel(state.channelType) ? 0xfffffffd : 0xffffffff
 		});
 
+		// An asset channel: its provider lays the asset outputs over the
+		// payouts before anything is signed or verified. Nothing is touched
+		// for any other channel. Which output is whose comes from the
+		// builder's own map, never from a search for a script.
+		const auxiliaryCloseData = applyAuxiliaryClose(
+			state,
+			tx,
+			feeSatoshis,
+			outputMap
+		);
+
 		const { witnessScript } = createFundingScript(
 			state.localBasepoints.fundingPubkey,
 			state.remoteBasepoints!.fundingPubkey
@@ -5271,7 +6678,8 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			witnessScript,
 			fundingSatoshis: state.fundingSatoshis,
 			localFundingPubkey: state.localBasepoints.fundingPubkey,
-			remoteFundingPubkey: state.remoteBasepoints!.fundingPubkey
+			remoteFundingPubkey: state.remoteBasepoints!.fundingPubkey,
+			...(auxiliaryCloseData ? { auxiliaryCloseData } : {})
 		};
 	}
 
@@ -5318,13 +6726,15 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 
 		const state = channel.getFullState();
 		if (!state.remoteBasepoints) return null;
-		const { tx, fundingSatoshis } = this.buildClosingTxAndScript(
-			channel,
-			feeSatoshis
-		);
+		const { tx, fundingSatoshis, auxiliaryCloseData } =
+			this.buildClosingTxAndScript(channel, feeSatoshis);
+		// An asset channel's funding key commits to its asset root, and the
+		// close spends that key.
 		const { p2trOutput } = createTaprootFundingScript(
 			state.localBasepoints.fundingPubkey,
-			state.remoteBasepoints.fundingPubkey
+			state.remoteBasepoints.fundingPubkey,
+			undefined,
+			state.fundingTaprootMerkleRoot
 		);
 		const sighash = taprootCommitmentSighash(
 			tx,
@@ -5336,13 +6746,15 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			state.localBasepoints.fundingPubkey,
 			state.remoteBasepoints.fundingPubkey,
 			nonces.local,
-			nonces.remote
+			nonces.remote,
+			state.fundingTaprootMerkleRoot
 		);
 		const cache: ITaprootClosingCache = {
 			feeSatoshis,
 			session,
 			tx,
-			ourPartialSig: null
+			ourPartialSig: null,
+			...(auxiliaryCloseData ? { auxiliaryCloseData } : {})
 		};
 		channel.setTaprootClosingCache(cache);
 		return cache;
@@ -5369,6 +6781,14 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			cache.tx.toHex(),
 			channel.getFullState().role === ChannelRole.OPENER ? feeSatoshis : 0n
 		);
+		// An asset channel: the provider's payload for the transaction is
+		// kept from the moment a signature of ours can exist for it.
+		if (cache.auxiliaryCloseData) {
+			channel.recordAuxiliaryCloseCandidate(
+				cache.tx.getId(),
+				cache.auxiliaryCloseData
+			);
+		}
 		const nonces = channel.getClosingNonces();
 		const signer = this.signerFor(channel, false);
 		const partial = signer.signCommitmentPartial(
@@ -5484,7 +6904,9 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 
 		const { p2trOutput, outputKey } = createTaprootFundingScript(
 			state.localBasepoints.fundingPubkey,
-			state.remoteBasepoints.fundingPubkey
+			state.remoteBasepoints.fundingPubkey,
+			undefined,
+			state.fundingTaprootMerkleRoot
 		);
 		const sighash = taprootCommitmentSighash(
 			cache.tx,
@@ -8042,7 +9464,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			msg.requestFunds.requestedSats > 0n &&
 			this.config.leaseRates &&
 			this.config.nodePrivateKey &&
-			!isTaprootChannel(msg.channelType ?? null)
+			!hasSimpleTaprootBit(msg.channelType)
 		) {
 			const bh = msg.requestFunds.blockheight;
 			if (
@@ -8176,7 +9598,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 				msg.requestFunds.requestedSats > 0n &&
 				this.config.leaseRates &&
 				this.config.nodePrivateKey &&
-				!isTaprootChannel(msg.channelType ?? null)
+				!hasSimpleTaprootBit(msg.channelType)
 			) {
 				const signature = signWillFund(
 					chKeys.basepoints.fundingPubkey,
@@ -9366,6 +10788,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		// The void retires the funding watch that fed it, and startup restores
 		// no monitor without its channel, so it goes with the channel.
 		this.monitors.delete(idHex);
+		this.auxiliarySpendsHeld.delete(idHex);
 		return true;
 	}
 
@@ -9955,7 +11378,8 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		// Retain its candidate identity before any external-close signature
 		// leaves, including proposals and alternative simple-close variants.
 		if (
-			channel.getFullState().externalClose &&
+			(channel.getFullState().externalClose ||
+				channel.getFullState().auxiliaryState) &&
 			produced.some(
 				(action) =>
 					action.type === ChannelActionType.SEND_MESSAGE &&
@@ -10392,6 +11816,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 					if (persistSeen && ctx.sendsBlocked) {
 						break;
 					}
+					this._notifyAuxiliaryFundingSigned(peerPubkey, channel);
 					this.emit('funding:authorized', action.fundingTxid);
 					break;
 				case ChannelActionType.BROADCAST_TX:
@@ -10555,10 +11980,358 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 	 * explicit `committed: true` releases them, so an implementation that
 	 * answers nothing, or throws, has written nothing.
 	 */
+	private readonly _auxiliaryResolutionsInFlight = new Set<string>();
+
+	/**
+	 * Asset channels: what the node decided for an HTLC it received on a
+	 * channel, or undefined while it has decided nothing.
+	 */
+	auxiliaryHtlcDecision(
+		channelId: Buffer,
+		htlcId: bigint
+	): IAuxiliaryHtlcDecision | undefined {
+		return this.channels
+			.get(channelId.toString('hex'))
+			?.auxiliaryHtlcDecision(htlcId);
+	}
+
+	/**
+	 * Asset channels: write down, with the channel's row, what the node
+	 * decided for an HTLC it received, when no message of the channel
+	 * carries the decision: a hold settled or cancelled while the channel
+	 * is on chain, or settled while the fulfil cannot leave. A fulfil or a
+	 * fail the channel makes writes its own, with the update itself. A
+	 * claim by preimage on the chain is made by this record and by nothing
+	 * else. False, with nothing kept, when the channel does not hold the
+	 * HTLC, when the other decision stands, and when the row could not be
+	 * written.
+	 *
+	 * The row is written here and now, with whatever the node has staged
+	 * for its next write, so this is not for a caller that stages records
+	 * it may still take back.
+	 */
+	recordAuxiliaryHtlcDecision(
+		channelId: Buffer,
+		htlcId: bigint,
+		outcome: 'settle' | 'fail',
+		preimage?: Buffer
+	): boolean {
+		const hex = channelId.toString('hex');
+		const channel = this.channels.get(hex);
+		const peerPubkey = this.channelPeers.get(hex);
+		if (!channel || !peerPubkey) return false;
+		const standing = channel.auxiliaryHtlcDecision(htlcId);
+		if (!channel.recordAuxiliaryHtlcDecision(htlcId, outcome, preimage)) {
+			return false;
+		}
+		if (standing) return true;
+		try {
+			this.persistence.persist({ channel, peerPubkey, channelId });
+		} catch {
+			channel.dropAuxiliaryHtlcDecision(htlcId);
+			return false;
+		}
+		return true;
+	}
+
+	/** Whether an asset channel has a commitment on the chain, or is closing there. */
+	auxiliaryChannelOnChain(channelId: Buffer): boolean {
+		const hex = channelId.toString('hex');
+		return (
+			this.monitors.has(hex) &&
+			this.channels.get(hex)?.getFullState().auxiliaryState !== undefined
+		);
+	}
+
+	/**
+	 * Per channel, the last outcome a pass tried when the host's refusals
+	 * stopped it: the next pass starts behind it.
+	 */
+	private readonly _auxiliaryResolutionsTriedLast = new WeakMap<
+		Channel,
+		string
+	>();
+
+	/**
+	 * Per channel, the passes the redelivery on a block has made in the
+	 * current interval.
+	 */
+	private readonly _auxiliaryDeliveryWindows = new Map<
+		string,
+		{ since: number; attempts: number }
+	>();
+
+	/**
+	 * Asset channels: offer the host again, on a new block, every outcome
+	 * its callback has not taken (onHtlcResolved). A delivery pass is
+	 * otherwise started by a write of the channel, and a channel that is on
+	 * the chain has none: an outcome the callback threw for once would stay
+	 * held until a restart. At most AUXILIARY_RETRY_ATTEMPTS_PER_INTERVAL
+	 * passes are started here for one channel per
+	 * AUXILIARY_RETRY_INTERVAL_MS, the limit of the other retries of an
+	 * asset channel; a pass stops at eight refusals, and what a channel
+	 * holds undelivered is bounded where it is recorded.
+	 */
+	private _redeliverAuxiliaryResolutions(now: number = Date.now()): void {
+		if (!this.config.auxiliaryChannels?.onHtlcResolved) return;
+		for (const [hex, channel] of [...this.channels]) {
+			const held = channel.getFullState().auxiliaryState?.resolvedHtlcs;
+			if (!held || held.size === 0) {
+				this._auxiliaryDeliveryWindows.delete(hex);
+				continue;
+			}
+			const window = this._auxiliaryDeliveryWindows.get(hex);
+			if (
+				!window ||
+				now - window.since >= ChannelManager.AUXILIARY_RETRY_INTERVAL_MS
+			) {
+				this._auxiliaryDeliveryWindows.set(hex, { since: now, attempts: 1 });
+			} else if (
+				window.attempts >= ChannelManager.AUXILIARY_RETRY_ATTEMPTS_PER_INTERVAL
+			) {
+				continue;
+			} else {
+				window.attempts++;
+			}
+			this._notifyAuxiliaryResolutions(channel);
+		}
+	}
+
+	/**
+	 * Asset channels: put the ending of every HTLC that ended on the chain
+	 * in its channel's row and tell the host (onHtlcResolved), as for an
+	 * HTLC that left the channel off chain: the same list, the same count,
+	 * the same delivery. The channel's row is written before the output is
+	 * marked, so a crash between the two records the ending again and the
+	 * host, whose callback is idempotent by contract, is told twice and
+	 * never not at all. Called when an output is resolved for good and on
+	 * every block, which covers a restart.
+	 */
+	private recordAuxiliaryChainEndings(channelIdHex: string): void {
+		const monitor = this.monitors.get(channelIdHex);
+		const channel = this.channels.get(channelIdHex);
+		if (
+			!monitor ||
+			!channel ||
+			typeof monitor.auxiliaryHtlcEndings !== 'function' ||
+			!channel.getFullState().auxiliaryState
+		) {
+			return;
+		}
+		const channelId = Buffer.from(channelIdHex, 'hex');
+		const peerPubkey = this.getPeerForChannel(channelId);
+		let recorded = 0;
+		for (const ending of monitor.auxiliaryHtlcEndings()) {
+			if (ending.recorded) continue;
+			const kept = channel.recordAuxiliaryChainResolution(
+				ending.offered ? HtlcDirection.OFFERED : HtlcDirection.RECEIVED,
+				ending.htlcId,
+				ending.outcome,
+				ending.claimSigned === true
+			);
+			if (kept) {
+				if (!peerPubkey) continue;
+				try {
+					this.persistence.persist({ channel, peerPubkey, channelId });
+				} catch {
+					// Left unmarked: the next block records it again.
+					continue;
+				}
+			}
+			if (ending.absent) {
+				monitor.noteAuxiliaryAbsentHtlcRecorded(ending.offered, ending.htlcId);
+			} else {
+				monitor.noteAuxiliaryHtlcEndingRecorded(
+					ending.txid,
+					ending.outputIndex
+				);
+			}
+			recorded++;
+		}
+		if (recorded === 0) return;
+		this.emit('monitor:updated', channelIdHex, monitor);
+		this._notifyAuxiliaryResolutions(channel);
+	}
+
+	/**
+	 * Asset channels: the HTLCs this node received and decided to settle
+	 * whose expiry has passed with no claim of the node in a block, each
+	 * given once (ChainMonitor.takeAuxiliaryClaimsPastExpiry). The monitor
+	 * that marked one is stored.
+	 */
+	takeAuxiliaryClaimsPastExpiry(): Array<{
+		channelId: Buffer;
+		htlcId: bigint;
+		cltvExpiry: number;
+	}> {
+		const late: ReturnType<ChannelManager['takeAuxiliaryClaimsPastExpiry']> =
+			[];
+		for (const [hex, monitor] of this.monitors) {
+			if (typeof monitor.takeAuxiliaryClaimsPastExpiry !== 'function') continue;
+			const taken = monitor.takeAuxiliaryClaimsPastExpiry();
+			if (taken.length === 0) continue;
+			this.emit('monitor:updated', hex, monitor);
+			const channelId = Buffer.from(hex, 'hex');
+			for (const one of taken) late.push({ channelId, ...one });
+		}
+		return late;
+	}
+
+	/**
+	 * Asset channels: the HTLCs this node received and decided to settle
+	 * that the payer took back on the chain for good, with the payment
+	 * hash of each, for a caller that keeps a record of the payment.
+	 */
+	auxiliaryClaimsLost(): Array<{
+		channelId: Buffer;
+		htlcId: bigint;
+		paymentHash: Buffer;
+	}> {
+		const lost: ReturnType<ChannelManager['auxiliaryClaimsLost']> = [];
+		for (const [hex, monitor] of this.monitors) {
+			const channel = this.channels.get(hex);
+			if (!channel || typeof monitor.auxiliaryHtlcEndings !== 'function') {
+				continue;
+			}
+			for (const ending of monitor.auxiliaryHtlcEndings()) {
+				if (!ending.lost) continue;
+				const decision = channel.auxiliaryHtlcDecision(ending.htlcId);
+				if (decision?.outcome !== 'settle') continue;
+				lost.push({
+					channelId: Buffer.from(hex, 'hex'),
+					htlcId: ending.htlcId,
+					paymentHash: sha256(decision.preimage)
+				});
+			}
+		}
+		return lost;
+	}
+
+	/**
+	 * Asset channels: how an HTLC ended on the chain, or undefined while it
+	 * has not, for a caller that keeps a record of its own for the HTLC.
+	 */
+	auxiliaryHtlcChainEnding(
+		channelId: Buffer,
+		direction: HtlcDirection,
+		htlcId: bigint
+	): 'fulfilled' | 'failed' | undefined {
+		const monitor = this.monitors.get(channelId.toString('hex'));
+		if (!monitor || typeof monitor.auxiliaryHtlcEndings !== 'function') {
+			return undefined;
+		}
+		return monitor
+			.auxiliaryHtlcEndings()
+			.find(
+				(ending) =>
+					ending.htlcId === htlcId &&
+					ending.offered === (direction === HtlcDirection.OFFERED)
+			)?.outcome;
+	}
+
+	/**
+	 * Tell the host of every asset HTLC that has left a channel
+	 * (onHtlcResolved). An outcome stays in the channel's row until the
+	 * callback returns for it, so one that throws, or a crash before it ran,
+	 * is delivered again; the callback is idempotent by contract. Called
+	 * once the write that holds the outcome has committed, so never inside
+	 * a storage transaction, and again when the channel is restored.
+	 *
+	 * What the host has taken leaves the row with a write of its own, made
+	 * at once (after the restore, when called from it), so a restart does
+	 * not deliver it again. A host that throws is told again at the next
+	 * pass: one line says so for a pass, with the number of outcomes held,
+	 * and a pass stops at eight refusals. The next pass starts behind the
+	 * last outcome that one tried and goes round, so outcomes the host
+	 * cannot take never keep a pass from the ones behind them.
+	 */
+	private _notifyAuxiliaryResolutions(
+		channel: Channel,
+		options: { deferWrite?: boolean } = {}
+	): void {
+		const callback = this.config.auxiliaryChannels?.onHtlcResolved;
+		const state = channel.getFullState();
+		const channelId = channel.getChannelId();
+		const peerPubkey = channelId && this.getPeerForChannel(channelId);
+		const records = state.auxiliaryState?.resolvedHtlcs;
+		if (!channelId || !peerPubkey || !records) return;
+		if (!callback) {
+			// A host that asks for no outcomes is owed none: nothing is kept
+			// for it, so the row does not grow by an entry per HTLC.
+			records.clear();
+			return;
+		}
+		let delivered = 0;
+		let refused = 0;
+		let firstRefusal = '';
+		const hex = channelId.toString('hex');
+		const pending = [...records];
+		const triedLast = this._auxiliaryResolutionsTriedLast.get(channel);
+		const start =
+			triedLast === undefined
+				? 0
+				: pending.findIndex(([key]) => key === triedLast) + 1;
+		this._auxiliaryResolutionsTriedLast.delete(channel);
+		for (let tried = 0; tried < pending.length; tried++) {
+			const [key, resolution] = pending[(start + tried) % pending.length];
+			const identity = `${hex}:${key}`;
+			if (this._auxiliaryResolutionsInFlight.has(identity)) continue;
+			this._auxiliaryResolutionsInFlight.add(identity);
+			try {
+				callback({ ...resolution, state, channelId, peerPubkey });
+				if (records.get(key) === resolution) {
+					records.delete(key);
+					delivered++;
+				}
+			} catch (error) {
+				if (refused++ === 0) {
+					firstRefusal = error instanceof Error ? error.message : String(error);
+				}
+			} finally {
+				this._auxiliaryResolutionsInFlight.delete(identity);
+			}
+			// A host that keeps throwing is not asked for every outcome it
+			// holds at every write of the channel, and the next pass goes on
+			// from here.
+			if (refused >= 8) {
+				if (tried + 1 < pending.length) {
+					this._auxiliaryResolutionsTriedLast.set(channel, key);
+				}
+				break;
+			}
+		}
+		if (refused > 0) {
+			this.emitContained(
+				'error',
+				channelId,
+				`Asset resolution callback failed (channel ${channelId.toString(
+					'hex'
+				)}): ${firstRefusal}; ${
+					records.size
+				} outcome(s) of the channel are held undelivered`
+			);
+		}
+		if (delivered > 0) {
+			const write = (): void => {
+				try {
+					if (this.channels.get(hex) !== channel) return;
+					this.persistence.persist({ channel, peerPubkey, channelId });
+				} catch {
+					// The removal rides the next write of the channel; a restart
+					// before one delivers the outcome again, as the contract allows.
+				}
+			};
+			if (options.deferWrite === true) setImmediate(write);
+			else write();
+		}
+	}
+
 	private _persistBatch(ctx: IDispatchContext): boolean {
 		const { channel, outbox } = ctx;
 		let result: IChannelPersistResult | undefined;
 		let thrown: string | undefined;
+		const dispatchWrite = this._auxiliaryDispatchWrite;
+		this._auxiliaryDispatchWrite = channel;
 		try {
 			result = this.persistence.persist({
 				channel,
@@ -10573,6 +12346,8 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			// nothing, so its throw still goes up.
 			if (!outbox) throw err;
 			thrown = err instanceof Error ? err.message : String(err);
+		} finally {
+			this._auxiliaryDispatchWrite = dispatchWrite;
 		}
 		if (outbox) {
 			ctx.persisted = {
@@ -10615,6 +12390,12 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 				durableId.toString('hex'),
 				channel.getFforEpoch()?.state ?? null
 			);
+		}
+		// Only now is an outcome recorded by this batch on disk, and only
+		// then is the host told of it.
+		if (result?.committed === true) {
+			this._notifyAuxiliaryResolutions(channel);
+			this._auxiliaryOpenRowCommitted(ctx);
 		}
 		return true;
 	}
@@ -11321,10 +13102,423 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		}
 	}
 
+	/**
+	 * Hold the asset side of a revoked commitment that is on the chain, read
+	 * back from the store of revoked views when it had left memory. Without
+	 * it the outputs of that commitment that carry units are not found, and
+	 * only the others are punished: said as an error naming the channel and
+	 * the commitment.
+	 */
+	private holdRevokedAuxiliaryView(
+		channelIdHex: string,
+		state: IChannelState,
+		commitmentNumber: bigint
+	): void {
+		let cause = '';
+		let held = false;
+		try {
+			held = holdAuxiliaryRevokedView(
+				state,
+				commitmentNumber,
+				() =>
+					this.config.loadAuxiliaryRevokedCommitment?.(
+						channelIdHex,
+						commitmentNumber
+					)
+			);
+		} catch (error) {
+			cause = `: ${(error as Error).message}`;
+		}
+		if (held) return;
+		this.emitContained(
+			'error',
+			Buffer.from(channelIdHex, 'hex'),
+			`The asset side of revoked commitment ${commitmentNumber} is not held, so its outputs that carry units cannot be punished (channel ${channelIdHex})${cause}`
+		);
+	}
+
+	/**
+	 * Whether a transaction a monitor is about to have broadcast is a sweep
+	 * of units it signed, by whichever path it was built. The monitor marks
+	 * it as offered, so its asset side stays in the row. Always false for a
+	 * channel without asset state.
+	 */
+	private offersAuxiliarySweep(channelId: Buffer, tx: Buffer): boolean {
+		const monitor = this.monitors.get(channelId.toString('hex'));
+		return (
+			!!monitor &&
+			typeof monitor.offerAuxiliarySweep === 'function' &&
+			monitor.offerAuxiliarySweep(tx)
+		);
+	}
+
+	/**
+	 * Broadcast a spend of the units of an asset channel, once the monitor
+	 * row that holds its asset side is stored. Until then it is held, said
+	 * as an error naming the channel, and released on a later block.
+	 */
+	private broadcastAuxiliarySpend(channelId: Buffer, tx: Buffer): void {
+		const channelIdHex = channelId.toString('hex');
+		// The monitor as it is now is announced first, so that the answer is
+		// about the row that holds this spend's asset side.
+		const monitor = this.monitors.get(channelIdHex);
+		if (monitor) this.emit('monitor:updated', channelIdHex, monitor);
+		if (this.config.isMonitorPersisted?.(channelIdHex) === true) {
+			this.emit('broadcast:tx', tx);
+			return;
+		}
+		const held = this.auxiliarySpendsHeld.get(channelIdHex) ?? [];
+		if (!held.some((other) => other.equals(tx))) held.push(Buffer.from(tx));
+		// The newest few are enough: an older one was replaced many times over.
+		this.auxiliarySpendsHeld.set(channelIdHex, held.slice(-16));
+		this.emitContained(
+			'error',
+			channelId,
+			`A spend of the units of an asset channel waits for its monitor to be stored (channel ${channelIdHex})`
+		);
+	}
+
+	/** Release the held spends of a channel whose monitor row is now stored. */
+	private releaseHeldAuxiliarySpends(channelIdHex: string): void {
+		const held = this.auxiliarySpendsHeld.get(channelIdHex);
+		if (!held || this.config.isMonitorPersisted?.(channelIdHex) !== true) {
+			return;
+		}
+		this.auxiliarySpendsHeld.delete(channelIdHex);
+		for (const tx of held) this.emit('broadcast:tx', tx);
+	}
+
+	/** Fee actions of the fee pool being worked on, one at a time each. */
+	private fixedOutputFeesBusy = new Set<string>();
+	/** The fee actions whose retirement the wallet is being asked for now. */
+	private fixedOutputFeesRetiring = new Set<string>();
+	/** What was last said about a fee action, so that it is said once. */
+	private fixedOutputFeesSaid = new Map<string, string>();
+	/** Channels whose open fee actions were looked through since the start. */
+	private fixedOutputFeesReconciled = new Set<string>();
+
+	/**
+	 * Bring the fee of a spend of an asset channel whose outputs are fixed:
+	 * a second-level HTLC transaction, or a claim that cannot pay for
+	 * itself. The fee pool is asked for inputs under the identity of the
+	 * output spent; they are attached with no output added; the monitor has
+	 * the provider make the asset side of that very transaction and keeps
+	 * it; and only once the monitor is stored does the transaction leave.
+	 * A pool that cannot give inputs yet is asked again on every block: the
+	 * wait is kept on the output for a host to show, and said once per
+	 * reason. A raise that cannot be had leaves the spend as it was.
+	 */
+	private async handleFixedOutputFee(
+		channelId: Buffer,
+		action: IFeeBumpAndBroadcastChainAction
+	): Promise<void> {
+		const channelIdHex = channelId.toString('hex');
+		const monitor = this.monitors.get(channelIdHex);
+		const spent = action.fixedOutput;
+		if (
+			!monitor ||
+			!spent ||
+			typeof monitor.fundFixedOutputSpend !== 'function'
+		) {
+			return;
+		}
+		const feeActionId = fixedOutputHtlcFeeActionId(
+			channelId,
+			spent.txid,
+			spent.outputIndex
+		);
+		if (this.fixedOutputFeesBusy.has(feeActionId)) return;
+		const present = bitcoin.Transaction.fromBuffer(action.tx);
+		const replaced = present.ins.slice(1).map((input) => ({
+			txid: Buffer.from(input.hash).reverse().toString('hex'),
+			vout: input.index,
+			sequence: input.sequence
+		}));
+		const say = (key: string, message: string): void => {
+			if (this.fixedOutputFeesSaid.get(feeActionId) === key) return;
+			this.fixedOutputFeesSaid.set(feeActionId, key);
+			this.emitContained('error', channelId, message);
+		};
+		const waits = (
+			code: string,
+			remedy: string | undefined,
+			message: string
+		): void => {
+			if (replaced.length > 0) {
+				// A raise that cannot be had: the spend as it is goes out again.
+				say(
+					`raise:${code}`,
+					`The fee of the spend of output ${spent.txid}:${spent.outputIndex} of an asset channel could not be raised (${code}): ${message} (channel ${channelIdHex})`
+				);
+				this.broadcastAuxiliarySpend(channelId, action.tx);
+				return;
+			}
+
+			// Waiting is no remedy once it cannot make the deadline, and the
+			// node says so once.
+			const late =
+				remedy === 'wait' &&
+				spent.deadlineHeight !== undefined &&
+				!fixedOutputFeeWaitMakesDeadline(
+					this._currentBlockHeight,
+					spent.deadlineHeight
+				);
+			monitor.noteFixedOutputFeeWait(
+				spent.txid,
+				spent.outputIndex,
+				{
+					code,
+					remedy: late ? 'none' : remedy,
+					message: late
+						? `${message} (the deadline at height ${spent.deadlineHeight} was reached while it waited)`
+						: message
+				},
+				this._currentBlockHeight
+			);
+
+			this.emit('monitor:updated', channelIdHex, monitor);
+			if (late) {
+				say(
+					`late:${code}`,
+					`The spend of output ${spent.txid}:${spent.outputIndex} of an asset channel still has no fee input (${code}) and its deadline at height ${spent.deadlineHeight} was reached: the peer can now take the output back. The spend goes out as soon as a fee input is there.`
+				);
+				return;
+			}
+			say(
+				code,
+				`The spend of output ${spent.txid}:${spent.outputIndex} of an asset channel waits for a fee input (${code}): ${message} (channel ${channelIdHex})`
+			);
+		};
+		const fp = this.fundingProvider;
+		if (!fp?.selectFeeBumpInputs) {
+			waits(
+				'FEE_WALLET_UNAVAILABLE',
+				'operator',
+				'the node has no wallet that prepares fee inputs'
+			);
+			return;
+		}
+		this.fixedOutputFeesBusy.add(feeActionId);
+		try {
+			// The fee the spend has to pay for itself: the pool adds what its
+			// own inputs cost. A spend this node has yet to sign is counted
+			// with the witness it will get.
+			const own = new bitcoin.Transaction();
+			own.version = present.version;
+			own.locktime = present.locktime;
+			own.addInput(
+				Buffer.from(present.ins[0].hash),
+				present.ins[0].index,
+				present.ins[0].sequence
+			);
+			for (const out of present.outs) own.addOutput(out.script, out.value);
+			const signed = present.ins[0].witness.length > 0;
+			if (signed) own.setWitness(0, present.ins[0].witness);
+			// A spend that is signed only with its inputs is counted at the
+			// size its monitor says it will have: its witness, and the output
+			// script the provider puts in place of the destination. A flat
+			// allowance for the witness fell short of the penalty of a
+			// balance output by 15 vbytes.
+			const measured = signed
+				? undefined
+				: monitor.fixedOutputSpendVbytes?.(
+						spent.txid,
+						spent.outputIndex,
+						action.feeratePerVbyte
+				  );
+			const ownVbytes = measured ?? own.virtualSize() + (signed ? 0 : 56);
+			const selected = await fp.selectFeeBumpInputs(
+				BigInt(Math.ceil(ownVbytes * action.feeratePerVbyte)),
+				satPerVbyteToSatPerKw(action.feeratePerVbyte),
+				{
+					fixedOutputs: true,
+					feeActionId,
+					// Near its deadline a spend may take a coin of the pool's
+					// own split before the split has confirmed.
+					confirmedOnly: !(
+						spent.deadlineHeight !== undefined &&
+						spent.deadlineHeight - this._currentBlockHeight <=
+							FIXED_OUTPUT_FEE_TIMING.unconfirmedCoinBlocks
+					),
+					...(this._currentBlockHeight > 0
+						? { blockHeight: this._currentBlockHeight }
+						: {}),
+					...(spent.deadlineHeight !== undefined
+						? { deadlineHeight: spent.deadlineHeight }
+						: {}),
+					...(replaced.length > 0
+						? { replacementInputs: replaced, replacedTxid: present.getId() }
+						: {})
+				}
+			);
+			const feeInputs = selected.inputs.map((input) => {
+				const previous = bitcoin.Transaction.fromBuffer(input.prevTx);
+				return {
+					hash: previous.getHash(),
+					index: input.prevOutputIndex,
+					sequence: input.sequence,
+					script: previous.outs[input.prevOutputIndex].script,
+					value: input.value,
+					input
+				};
+			});
+			const made = monitor.fundFixedOutputSpend(
+				spent.txid,
+				spent.outputIndex,
+				action.feeratePerVbyte,
+				feeInputs,
+				(transaction, prevouts) => {
+					feeInputs.forEach((fee, at) => {
+						transaction.setWitness(
+							1 + at,
+							fee.input.signWitness(transaction, 1 + at, fee.value, prevouts)
+						);
+					});
+				}
+			);
+			if (!made.ok) {
+				// A spend that does not go out always says why. Only an output
+				// that was spent while its input was fetched has nothing to
+				// say: no spend of it waits any more.
+				if (!made.gone) {
+					say(`refused:${made.refusal}`, made.refusal);
+					this.emit('monitor:updated', channelIdHex, monitor);
+				}
+				if (replaced.length > 0) {
+					this.broadcastAuxiliarySpend(channelId, action.tx);
+				}
+				return;
+			}
+			this.fixedOutputFeesSaid.delete(feeActionId);
+			if (made.broadcast) {
+				this.broadcastAuxiliarySpend(channelId, made.transaction);
+			} else {
+				this.emit('monitor:updated', channelIdHex, monitor);
+			}
+		} catch (error) {
+			const told = error as { code?: unknown; remedy?: unknown };
+			waits(
+				typeof told.code === 'string' ? told.code : 'FEE_INPUT_FAILED',
+				typeof told.remedy === 'string' ? told.remedy : undefined,
+				(error as Error).message
+			);
+		} finally {
+			this.fixedOutputFeesBusy.delete(feeActionId);
+		}
+	}
+
+	/**
+	 * An output of an asset channel is settled for good: the action the fee
+	 * pool keeps for it is retired, naming the transaction that spent the
+	 * output, so that the pool charges only what that transaction took.
+	 */
+	private retireFixedOutputFee(
+		channelId: Buffer,
+		txid: string,
+		outputIndex: number,
+		evenIfNotOpen = false
+	): void {
+		const channelIdHex = channelId.toString('hex');
+		const monitor = this.monitors.get(channelIdHex);
+		const fp = this.fundingProvider;
+		if (
+			!monitor ||
+			typeof monitor.fixedOutputFeeResolved !== 'function' ||
+			!fp?.retireFixedOutputFeeAction
+		) {
+			return;
+		}
+		const resolved = monitor.fixedOutputFeeResolved(
+			txid,
+			outputIndex,
+			evenIfNotOpen
+		);
+		if (!resolved) return;
+		const feeActionId = fixedOutputHtlcFeeActionId(
+			channelId,
+			txid,
+			outputIndex
+		);
+		if (this.fixedOutputFeesRetiring.has(feeActionId)) return;
+		this.fixedOutputFeesRetiring.add(feeActionId);
+		void fp
+			.retireFixedOutputFeeAction(
+				feeActionId,
+				resolved.spendingTransaction
+					? { spendingTransaction: resolved.spendingTransaction }
+					: resolved.impossible
+					? { impossible: true }
+					: undefined
+			)
+			.then(() => {
+				monitor.noteFixedOutputFeeRetired(txid, outputIndex);
+				this.fixedOutputFeesSaid.delete(feeActionId);
+				this.emit('monitor:updated', channelIdHex, monitor);
+			})
+			.catch((error: unknown) => {
+				// The action stays open in the pool, its cap charged and its
+				// coins frozen: the channel is gone over again on the next
+				// block, and after a start. The refusal is said once.
+				this.fixedOutputFeesReconciled.delete(channelIdHex);
+				const said = `retire:${(error as Error).message}`;
+				if (this.fixedOutputFeesSaid.get(feeActionId) === said) return;
+				this.fixedOutputFeesSaid.set(feeActionId, said);
+				this.emitContained(
+					'error',
+					channelId,
+					`The fee action of output ${txid}:${outputIndex} of an asset channel could not be retired and will be tried again on the next block: ${
+						(error as Error).message
+					} (channel ${channelIdHex})`
+				);
+			})
+			.finally(() => {
+				this.fixedOutputFeesRetiring.delete(feeActionId);
+			});
+	}
+
+	/**
+	 * Once after a start, per asset channel, and again after a retirement
+	 * that failed: retire the fee actions the pool still keeps for outputs
+	 * that are settled for good. Also for a channel whose monitor has
+	 * nothing else left to do.
+	 */
+	private reconcileFixedOutputFees(channelIdHex: string): void {
+		if (this.fixedOutputFeesReconciled.has(channelIdHex)) return;
+		const monitor = this.monitors.get(channelIdHex);
+		const fp = this.fundingProvider;
+		if (
+			!monitor ||
+			typeof monitor.getChannelState !== 'function' ||
+			!monitor.getChannelState().auxiliaryState ||
+			!fp?.getFixedOutputFeeActionIds
+		) {
+			return;
+		}
+		this.fixedOutputFeesReconciled.add(channelIdHex);
+		const channelId = Buffer.from(channelIdHex, 'hex');
+		for (const feeActionId of fp.getFixedOutputFeeActionIds(channelId)) {
+			const parsed = parseFixedOutputHtlcFeeActionId(feeActionId);
+			if (!parsed) continue;
+			this.retireFixedOutputFee(
+				channelId,
+				parsed.txid,
+				parsed.outputIndex,
+				true
+			);
+		}
+	}
+
 	private processChainActions(channelId: Buffer, actions: ChainAction[]): void {
 		for (const action of actions) {
 			switch (action.type) {
 				case ChainActionType.BROADCAST_TX:
+					if (
+						action.requiresMonitorPersistence ||
+						this.offersAuxiliarySweep(channelId, action.tx)
+					) {
+						this.broadcastAuxiliarySpend(channelId, action.tx);
+						break;
+					}
 					this.emit('broadcast:tx', action.tx);
 					break;
 				case ChainActionType.FEE_BUMP_AND_BROADCAST:
@@ -11338,9 +13532,19 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 				case ChainActionType.WATCH_TX:
 					this.emit('watch:tx', action.txid);
 					break;
+
 				case ChainActionType.OUTPUT_RESOLVED:
+					this.retireFixedOutputFee(channelId, action.txid, action.outputIndex);
+					// An output settled for good: the pool's actions for the
+					// channel are gone over on the next block, for one opened
+					// for a commitment that did not confirm.
+					this.fixedOutputFeesReconciled.delete(channelId.toString('hex'));
+
+					this.recordAuxiliaryChainEndings(channelId.toString('hex'));
+
 					this.emit(
 						'output:resolved',
+
 						action.txid,
 						action.outputIndex,
 						action.channelId,
@@ -11359,7 +13563,18 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 					// A previously-broadcast sweep has not confirmed; re-resolve it at
 					// the bumped feerate and rebroadcast (RBF). Critical for penalty
 					// txs that must confirm before the cheater's to_self_delay matures.
+
 					const mon = this.monitors.get(channelId.toString('hex'));
+					// A spend of an asset channel that wallet inputs pay for is
+					// not rebuilt: the fee pool is asked again at the higher rate.
+					const raised =
+						mon && typeof mon.fixedOutputFeeRaise === 'function'
+							? mon.fixedOutputFeeRaise(action.output, action.feeRatePerVbyte)
+							: undefined;
+					if (raised) {
+						void this._handleFeeBumpAndBroadcast(channelId, raised);
+						break;
+					}
 					const rebuilt =
 						mon && typeof mon.rebuildSweeps === 'function'
 							? mon.rebuildSweeps(action.output, action.feeRatePerVbyte)
@@ -11371,7 +13586,14 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 					for (const tx of rebuilt) {
 						// Sweep rebuilds return bitcoin.Transaction objects; every
 						// broadcast listener expects a raw Buffer.
-						this.emit('broadcast:tx', tx.toBuffer());
+						const raw = tx.toBuffer();
+						if (this.offersAuxiliarySweep(channelId, raw)) {
+							// A rebuilt sweep of units: the row with its new asset
+							// side is stored before it leaves.
+							this.broadcastAuxiliarySpend(channelId, raw);
+							continue;
+						}
+						this.emit('broadcast:tx', raw);
 					}
 					break;
 				}
@@ -11404,6 +13626,11 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		channelId: Buffer,
 		action: IFeeBumpAndBroadcastChainAction
 	): Promise<void> {
+		if (action.kind === 'fixed-output-fee') {
+			await this.handleFixedOutputFee(channelId, action);
+			return;
+		}
+
 		const fp = this.fundingProvider;
 		const feeratePerVbyte = action.feeratePerVbyte;
 		const feeratePerKw = satPerVbyteToSatPerKw(feeratePerVbyte);
@@ -11483,6 +13710,22 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 				targetFeeSats,
 				feeratePerKw
 			);
+			// An asset channel: the coins this child takes are remembered with
+			// the commitment it bumps. Where that commitment was given up
+			// while the wallet chose them, they are free again and no child
+			// is built.
+			const children = this.commitmentCpfpChildren(channelId, action);
+			if (children) {
+				const taken = inputs.map((input) => ({
+					txid: bitcoin.Transaction.fromBuffer(input.prevTx).getId(),
+					vout: input.prevOutputIndex
+				}));
+				if (children === 'void') {
+					releaseInputPledgesBestEffort(fp, taken);
+					return;
+				}
+				children.inputs.push(...taken);
+			}
 			const { tx } = buildAnchorCpfpTx({
 				commitmentTxid: action.commitmentTxid,
 				anchorOutputIndex: action.anchorOutputIndex,
@@ -11506,6 +13749,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			});
 			// The commitment (parent) is broadcast by the force-close path; emit only
 			// the fee-bearing child so the 1-parent-1-child package clears the target.
+			if (children) children.txids.push(tx.getId());
 			this.emit('broadcast:tx', tx.toBuffer());
 			// The child was actually emitted: record the paid feerate + height and
 			// clear any prior failure flag, so the retry gate reflects real progress.
@@ -11544,6 +13788,58 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 				}
 			}
 		}
+	}
+
+	/**
+	 * An asset channel: where the children of the commitment an anchor child
+	 * is for are remembered, `void` when that commitment is no longer the
+	 * one this node bumps, and nothing for any other channel.
+	 */
+	private commitmentCpfpChildren(
+		channelId: Buffer,
+		action: IFeeBumpAndBroadcastChainAction
+	):
+		| { txids: string[]; inputs: Array<{ txid: string; vout: number }> }
+		| 'void'
+		| undefined {
+		const idHex = channelId.toString('hex');
+		if (!this.channels.get(idHex)?.getFullState().auxiliaryState) {
+			return undefined;
+		}
+		const entry = this._pendingCommitmentCpfp.get(idHex);
+		if (!entry || entry.action.commitmentTxid !== action.commitmentTxid) {
+			return 'void';
+		}
+		return (entry.children ??= { txids: [], inputs: [] });
+	}
+
+	/**
+	 * An asset channel whose funding output `confirmedTxid` spent in a block.
+	 * The wallet coins the children of the bumped commitment took are free
+	 * again: a child of the commitment in the block has spent its coin or
+	 * needs it no longer, and a child of any other commitment can never
+	 * confirm. That other commitment and its children are no longer offered
+	 * to the network either.
+	 */
+	private settleCommitmentCpfp(
+		channelIdHex: string,
+		confirmedTxid: string
+	): void {
+		const entry = this._pendingCommitmentCpfp.get(channelIdHex);
+		if (!entry) return;
+		const children = entry.children;
+		if (children && children.inputs.length > 0) {
+			releaseInputPledgesBestEffort(
+				this.fundingProvider,
+				children.inputs.splice(0)
+			);
+		}
+		if (entry.action.commitmentTxid === confirmedTxid) return;
+		this._pendingCommitmentCpfp.delete(channelIdHex);
+		this.emit('broadcast:void', [
+			...(entry.action.commitmentTxid ? [entry.action.commitmentTxid] : []),
+			...(children?.txids ?? [])
+		]);
 	}
 
 	/**

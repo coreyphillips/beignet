@@ -28,12 +28,25 @@
  * machine, not the codec).
  */
 
+import type { CustomRecords } from './custom-records';
+import {
+	CUSTOM_RECORD_START,
+	boundedLightningPayload,
+	customRecordEntries,
+	decodeWithCustomRecords
+} from './custom-records';
 import type { ITlvRecord } from './tlv';
 import { decodeTlvStream, encodeTlvStream } from './tlv';
 
 export interface IShutdownMessage {
 	channelId: Buffer;
 	scriptPubkey: Buffer;
+	/**
+	 * Records of the custom range (type 65536 and above) that travel beside
+	 * the script on an asset channel. Absent on every other channel, whose
+	 * encoding is unchanged.
+	 */
+	customRecords?: CustomRecords;
 	/**
 	 * MuSig2 closing pubnonce (66 bytes) for simple-taproot channels, carried
 	 * as TLV type 8 (LND shutdown_nonce convention). Absent on non-taproot
@@ -76,6 +89,24 @@ export function encodeShutdownMessage(msg: IShutdownMessage): Buffer {
 	offset += 2;
 	msg.scriptPubkey.copy(buf, offset);
 
+	if (msg.customRecords !== undefined && msg.customRecords.size > 0) {
+		// The asset records of a shutdown travel beside the nonce, in type
+		// order, and have to fit one frame. A custom record may not take the
+		// type of a field this message defines.
+		const records = customRecordEntries(msg.customRecords, SHUTDOWN_TLV_TYPES);
+		if (msg.shutdownNonce !== undefined) {
+			if (msg.shutdownNonce.length !== SHUTDOWN_NONCE_LENGTH) {
+				throw new Error(
+					`shutdown_nonce must be ${SHUTDOWN_NONCE_LENGTH} bytes, got ${msg.shutdownNonce.length}`
+				);
+			}
+			records.push({ type: SHUTDOWN_NONCE_TLV, value: msg.shutdownNonce });
+		}
+		records.sort((a, b) => (a.type < b.type ? -1 : 1));
+		return boundedLightningPayload(
+			Buffer.concat([buf, encodeTlvStream(records)])
+		);
+	}
 	if (msg.shutdownNonce === undefined) return buf;
 	if (msg.shutdownNonce.length !== SHUTDOWN_NONCE_LENGTH) {
 		throw new Error(
@@ -88,10 +119,24 @@ export function encodeShutdownMessage(msg: IShutdownMessage): Buffer {
 	return Buffer.concat([buf, tlvs]);
 }
 
+/** How a `shutdown` payload is read. */
+export interface IShutdownDecodeOptions {
+	/**
+	 * Read records of the custom range (type 65536 and above) into
+	 * `customRecords`, whatever their parity. Off by default: the standard
+	 * reader, which fails on an unknown even type and ignores an unknown odd
+	 * one.
+	 */
+	customRecords?: boolean;
+}
+
 /**
  * Decode a `shutdown` message payload.
  */
-export function decodeShutdownMessage(payload: Buffer): IShutdownMessage {
+export function decodeShutdownMessage(
+	payload: Buffer,
+	options: IShutdownDecodeOptions = {}
+): IShutdownMessage {
 	if (payload.length < SHUTDOWN_FIXED_LENGTH) {
 		throw new Error(
 			`shutdown too short: need ${SHUTDOWN_FIXED_LENGTH} bytes, got ${payload.length}`
@@ -115,7 +160,10 @@ export function decodeShutdownMessage(payload: Buffer): IShutdownMessage {
 	const msg: IShutdownMessage = { channelId, scriptPubkey };
 	if (offset < payload.length) {
 		// Unknown even TLV types are rejected; unknown odd types are ignored.
-		const { records } = decodeTlvStream(payload, offset, SHUTDOWN_TLV_TYPES);
+		const records = options.customRecords
+			? decodeWithCustomRecords(payload, offset, SHUTDOWN_TLV_TYPES)
+			: decodeTlvStream(payload, offset, SHUTDOWN_TLV_TYPES).records;
+		const custom = new Map<bigint, Buffer>();
 		for (const r of records) {
 			if (r.type === SHUTDOWN_NONCE_TLV) {
 				if (r.value.length !== SHUTDOWN_NONCE_LENGTH) {
@@ -124,8 +172,11 @@ export function decodeShutdownMessage(payload: Buffer): IShutdownMessage {
 					);
 				}
 				msg.shutdownNonce = Buffer.from(r.value);
+			} else if (options.customRecords && r.type >= CUSTOM_RECORD_START) {
+				custom.set(r.type, Buffer.from(r.value));
 			}
 		}
+		if (custom.size > 0) msg.customRecords = custom;
 	}
 	return msg;
 }

@@ -29,7 +29,9 @@ import {
 import { archiveFforChainEvidence } from '../ffor/voucher-chain';
 import { FforVoucherIndex } from '../ffor/voucher-index';
 import {
+	deserializeChainMonitorState,
 	deserializeChannelState,
+	serializeChainMonitorState,
 	serializeChannelState
 } from '../storage/serialization';
 import { SPLICE_LOCK_DEPTH_ACCEPT_MAX } from '../message/splice';
@@ -81,11 +83,31 @@ import {
 	payInfoRequiresUnknownFeature,
 	resolveIntroductionNode
 } from '../onion/blinded-path';
+import { auxiliaryUnsupported } from '../channel/auxiliary-guard';
 import type { IPerChannelKeys } from '../channel/channel-manager';
+import { auxiliaryHtlcDecisionOf } from '../channel/auxiliary';
 import { ChannelManager, txInputOutpoints } from '../channel/channel-manager';
 import type { ChannelResult } from '../channel/types';
+import type {
+	IAuxiliaryChannelConfig,
+	IAuxiliaryFundingOptions,
+	IAuxiliaryChannelHtlc,
+	IAuxiliaryChannelInfo,
+	IAuxiliaryPaymentHtlc,
+	IAuxiliaryFundingDescriptor
+} from '../channel/auxiliary-funding';
+import { copyCustomRecords } from '../message/custom-records';
+import {
+	AuxiliaryGuardianModeError,
+	AuxiliaryGuardianStartError,
+	auxiliaryRestoreRefusal,
+	isGuardianRecoveryMode
+} from '../recovery/auxiliary-restore';
+import { fixedOutputFeePolicyRefusal } from '../wallet/fixed-output-fees';
 import type { ISpliceWalletInput } from '../channel/channel';
 import { Channel } from '../channel/channel';
+import { auxiliaryMaxHtlcs } from '../channel/auxiliary';
+import { countPendingHtlcs } from '../channel/htlc-policy';
 import { isValidShutdownScript } from '../channel/validation';
 import {
 	estimateSpliceTxWeight,
@@ -112,7 +134,8 @@ import {
 	BITCOIN_CHAIN_HASH,
 	TESTNET_CHAIN_HASH,
 	REGTEST_CHAIN_HASH,
-	SIGNET_CHAIN_HASH
+	SIGNET_CHAIN_HASH,
+	isOverlayChannel
 } from '../channel/types';
 import type {
 	IPeerDialOptions,
@@ -139,7 +162,12 @@ import {
 } from '../gossip/pathfinding';
 import type { IPayAllRouteResult } from '../gossip/pay-all';
 import { findPayAllRoute } from '../gossip/pay-all';
-import type { IPayAllBudget, IPayAllQuote } from './types';
+import type {
+	IPayAllBudget,
+	IPayAllQuote,
+	IAuxiliaryAdvertisement,
+	AuxiliaryPaymentGate
+} from './types';
 import type { IRapidGossipResult } from '../gossip/rapid-sync';
 import {
 	applyRapidGossipSnapshot,
@@ -359,6 +387,7 @@ import type {
 	HoldCancelReason,
 	HoldInvoiceState,
 	ISendPaymentOptions,
+	ISendToRouteOptions,
 	IOutgoingPaymentResolution,
 	IOutgoingHtlcView,
 	OutgoingHtlcState,
@@ -388,7 +417,11 @@ import {
 	LightningPaymentError,
 	PaymentWaitTimeoutError,
 	InvalidChannelOpenError,
+	AuxiliaryPaymentError,
+	PaymentUnresolvedError,
 	ChannelFundingUnavailableError,
+	AuxiliaryChannelRowError,
+	AuxiliaryProviderRequiredError,
 	ChannelFundingUnavailableCode,
 	InvalidSpliceError,
 	SpliceRefusalCode,
@@ -457,7 +490,11 @@ import type {
 	IChannelPersistResult
 } from '../channel/channel-actions';
 import { ChannelErrorCode } from '../channel/channel-actions';
-import { FeatureFlags, Feature } from '../features/flags';
+import {
+	FeatureFlags,
+	Feature,
+	TAPROOT_OVERLAY_DEPENDENCIES
+} from '../features/flags';
 import {
 	ChainWatcher,
 	classifyAnnouncedChannelFunding,
@@ -1020,9 +1057,15 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	private acceptableChainHashes: Buffer[];
 	private nodeId: string;
 	private network: Network;
+	private auxiliaryPaymentGate: AuxiliaryPaymentGate | undefined;
+	private auxiliaryAdvertisement: IAuxiliaryAdvertisement = {
+		advertised: false,
+		reason: 'No auxiliary channel provider is configured'
+	};
 	private channelManager: ChannelManager;
 	private graph: NetworkGraph;
 	private peerManager: PeerManager | null = null;
+	private readonly rawCustomMessageTypes = new Map<number, number>();
 	private payments: Map<string, IPaymentInfo> = new Map();
 	private prunedPayAllBudgets = new Map<string, IPayAllBudget>();
 	/**
@@ -1342,6 +1385,8 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			htlcId: bigint;
 			amountMsat: bigint;
 			cltvExpiry: number;
+			/** Asset channels: the HTLC carries asset units. Present only then. */
+			auxiliary?: true;
 		}>
 	> = new Map();
 	// Payment hashes whose parked set is mid-dispatch in settleHeldHtlc or
@@ -1366,7 +1411,11 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 					failureCode: number;
 					reason: HoldCancelReason;
 			  }
-		) & { resolved: Array<{ amountMsat: bigint; cltvExpiry: number }> }
+		) & {
+			resolved: Array<{ amountMsat: bigint; cltvExpiry: number }>;
+			/** Asset channels: a part of the set, resolved or parked, holds units. */
+			auxiliary?: true;
+		}
 	> = new Map();
 	private holdInvoiceEventQueue: THoldInvoiceEvent[] = [];
 	private emittingHoldInvoiceEvent = false;
@@ -1384,6 +1433,8 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	> = new Map();
 	private fundingPubkey: Buffer;
 	private fundingProvider: IFundingProvider | null = null;
+	/** Asset channel support, when this node is configured with a provider. */
+	private readonly auxiliaryChannels: IAuxiliaryChannelConfig | undefined;
 	private fundingPrivkey: Buffer;
 	/** Custom channel-signer factory (see INodeConfig.signerFactory). */
 	private signerFactory: SignerFactory | undefined;
@@ -1957,6 +2008,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		this.announcedAddresses = config.announcedAddresses;
 		this.fundingPubkey = config.channelBasepoints.fundingPubkey;
 		this.fundingProvider = config.fundingProvider || null;
+		this.auxiliaryChannels = config.auxiliaryChannels;
 		this.fundingPrivkey = config.fundingPrivkey;
 		this.signerFactory = config.signerFactory;
 		this.sweepDestinationScript = config.sweepDestinationScript;
@@ -2037,6 +2089,69 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			localFeatures.clearBit(Feature.DUAL_FUND);
 			localFeatures.clearBit(Feature.DUAL_FUND + 1);
 		}
+		// Asset channels (issue #2093): a node with an auxiliary channel
+		// provider advertises the taproot overlay pair as LND and tapd deploy
+		// it (optional bit 2025) and the simple taproot bit the overlay
+		// depends on in the init of both peers. This sits above the simple
+		// close strip below on purpose: advertising taproot costs this node
+		// option_simple_close like any other taproot advertisement does
+		// (issue #1929). Fixed asset HTLC outputs (450) are offered, by the
+		// optional bit, when the node's funding provider keeps the fee pool
+		// their spends take their fee from; without one the node could not
+		// open such a channel, so it does not say it can. Child custody (452)
+		// is offered only when the host allows it and the provider can make
+		// what it needs. A caller-supplied set cannot advertise either
+		// otherwise. dual_fund stays advertised: an asset open asks for v1
+		// negotiation itself. A node without a provider is left exactly as
+		// it was, nothing here sets or clears a bit for it.
+		//
+		// A peer may check what the overlay depends on and drop a connection
+		// whose init sets it without the rest (LND does). Simple taproot is
+		// set here; everything else in TAPROOT_OVERLAY_DEPENDENCIES is in the
+		// default set, so only a caller-supplied set can lack one. Such a
+		// node does not advertise the overlay at all: its init is the one its
+		// configuration asked for, it opens and accepts no asset channel, and
+		// the reason is logged and kept for getAuxiliaryAdvertisement().
+		if (config.auxiliaryChannels) {
+			// A number for the HTLCs of an asset channel that cannot be one
+			// is refused here, not at the first open or payment.
+			auxiliaryMaxHtlcs(config.auxiliaryChannels.maxHtlcs);
+			for (const feature of [
+				Feature.OPTION_ASSET_FIXED_HTLC_OUTPUTS,
+				Feature.OPTION_ASSET_CHILD_CUSTODY
+			]) {
+				localFeatures.clearBit(feature);
+				localFeatures.clearBit(feature + 1);
+			}
+			const missing = TAPROOT_OVERLAY_DEPENDENCIES.filter(
+				([feature]) =>
+					feature !== Feature.OPTION_TAPROOT &&
+					!localFeatures.hasFeature(feature)
+			).map(([, name]) => name);
+			if (missing.length === 0) {
+				localFeatures.setOptional(Feature.OPTION_TAPROOT);
+				localFeatures.setOptional(Feature.OPTION_TAPROOT_OVERLAY);
+				if (config.fundingProvider?.supportsFixedOutputFees?.() === true) {
+					localFeatures.setOptional(Feature.OPTION_ASSET_FIXED_HTLC_OUTPUTS);
+					if (
+						config.auxiliaryChannels.allowRevokedChildCustody === true &&
+						config.auxiliaryChannels.provider.prepareRevokedChild
+					) {
+						localFeatures.setOptional(Feature.OPTION_ASSET_CHILD_CUSTODY);
+					}
+				}
+				this.auxiliaryAdvertisement = { advertised: true };
+			} else {
+				localFeatures.clearBit(Feature.OPTION_TAPROOT_OVERLAY);
+				// The overlay's optional bit, as deployed.
+				localFeatures.clearBit(2025);
+				const reason = `Asset channels are not advertised: the configured feature set lacks ${missing.join(
+					', '
+				)}, which a peer requires of a node that advertises the taproot overlay`;
+				this.auxiliaryAdvertisement = { advertised: false, reason };
+				this.logger.warn(reason);
+			}
+		}
 		// Taproot channels only close through closing_signed here (MuSig2
 		// partial signature in TLV 6), while LND 0.21 runs its RBF close
 		// (closing_complete / closing_sig, partial signatures in TLVs 5 to 7)
@@ -2087,16 +2202,49 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		}
 		this.localFeatures = localFeatures;
 
+		// An asset channel is not accepted by a node whose wallet refused the
+		// fee policy its transactions need.
+		const feePolicyRefusal = config.auxiliaryChannels
+			? fixedOutputFeePolicyRefusal(config.fundingProvider)
+			: undefined;
 		this.channelManager = new ChannelManager({
 			persistence: {
 				persist: (request: IChannelPersistRequest): IChannelPersistResult =>
 					this.persistForChannelManager(request)
 			},
+			// A node without storage has nothing to wait for. One with storage
+			// has stored a monitor once it is no longer dirty, is not held back
+			// for its channel's row, and no transition of its channel is open.
+			loadAuxiliaryRevokedCommitment: (channelIdHex, commitmentNumber) =>
+				this.storage?.loadAuxiliaryRevokedCommitment?.(
+					channelIdHex,
+					commitmentNumber
+				),
+			isMonitorPersisted: (channelIdHex) =>
+				!this.recovery ||
+				(!this.dirtyMonitors.has(channelIdHex) &&
+					!this.monitorsAwaitingChannel.has(channelIdHex) &&
+					!this.openTransitions.includes(channelIdHex)),
 			fforVoucherLookup:
 				this.storage && !this.storage.loadAllFforVouchers
 					? undefined
 					: (hash) => this.fforVoucherIndex.get(hash),
 			localFeatures,
+			// With a provider the manager is always told what a peer
+			// advertised, so an asset opening this node drives or answers is
+			// refused when that cannot be read.
+			...(config.auxiliaryChannels
+				? {
+						auxiliaryChannels: config.auxiliaryChannels,
+						auxiliaryPeerFeatures: (peerPubkey: string) =>
+							this.peerInitFeatures(peerPubkey),
+						...(isGuardianRecoveryMode(config.recovery)
+							? { auxiliaryOpenRefusal: new AuxiliaryGuardianModeError() }
+							: feePolicyRefusal
+							? { auxiliaryOpenRefusal: feePolicyRefusal }
+							: {})
+				  }
+				: {}),
 			zeroReserve: { ...config.zeroReserve },
 			localConfig: config.channelConfig,
 			localBasepoints: config.channelBasepoints,
@@ -2593,6 +2741,17 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 
 		if (config.enableNetworking) {
 			this.peerManager = new PeerManager({
+				isKnownCustomMessageType: (type): boolean =>
+					this.rawCustomMessageTypes.has(type),
+				// Init custom records are sent and read only with an auxiliary
+				// channel provider. Without one both are off and the init codec
+				// is the standard one.
+				// A provider node that could not advertise the overlay is,
+				// on the wire, a node without a provider.
+				initCustomRecords: this.auxiliaryAdvertisement.advertised
+					? config.auxiliaryChannels?.initCustomRecords
+					: undefined,
+				readInitCustomRecords: this.auxiliaryAdvertisement.advertised,
 				localPrivateKey: config.nodePrivateKey,
 				localFeatures,
 				networks: config.chainHashes,
@@ -2708,6 +2867,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		this.wireChannelManagerEvents();
 
 		if (leaveLifecycleToCreate) return;
+		nodeConfig.beforeRestore?.(this);
 		this.restore();
 		this.start();
 	}
@@ -2727,6 +2887,78 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		// HTLC history included. Nothing writes a channel row before
 		// restore's main loop has walked them.
 		const storedChannels = this.storage.loadAllChannels();
+		// Asset channels (issue #2093): a stored channel with asset state
+		// cannot be run without the provider that reads it. Signing for it as
+		// an ordinary channel would commit to outputs without their asset
+		// leaves, so refuse here, before restore rewrites or deletes any row
+		// and before the node says anything to a peer. Nothing is changed:
+		// the same database starts once the provider is configured.
+		const isAssetRow = (state: IChannelState): boolean =>
+			state.auxiliaryState !== undefined ||
+			state.fundingTaprootMerkleRoot !== undefined ||
+			isOverlayChannel(state.channelType);
+		// Asset rows the backend skipped because they did not decode. They
+		// are not in storedChannels, and going on without them would leave
+		// those channels neither run nor watched.
+		const unreadableAssetChannels =
+			this.storage.unreadableAssetChannelIds?.() ?? [];
+		// A node that replicates its journal to guardians does not start
+		// over asset channels: a guardian restore cannot bring one back, and
+		// can only be refused after the takeover has fenced this device.
+		// Refused with or without a provider, and before the first write.
+		if (
+			isGuardianRecoveryMode({
+				barrier: this.recoveryBarrier,
+				startupGate: this.recoveryGate,
+				guardians: this.recoveryGuardians
+			})
+		) {
+			const held = [
+				...storedChannels
+					.filter((row) => isAssetRow(row.state))
+					.map((row) => row.channelId),
+				...unreadableAssetChannels
+			];
+			if (held.length > 0) throw new AuxiliaryGuardianStartError(held);
+		}
+		if (!this.auxiliaryChannels) {
+			const assetChannels = [
+				...storedChannels
+					.filter((row) => isAssetRow(row.state))
+					.map((row) => row.channelId),
+				...unreadableAssetChannels
+			];
+			if (assetChannels.length > 0) {
+				throw new AuxiliaryProviderRequiredError(assetChannels);
+			}
+		} else {
+			// With the provider configured, every stored asset channel has
+			// to be one it can run: readable, and whole. A row with the
+			// overlay type or a funding root but no asset state would fail
+			// in the middle of the loop below, after earlier rows were
+			// already rewritten, so it is refused here, by name.
+			const invalid = [
+				...unreadableAssetChannels.map((channelId) => ({
+					channelId,
+					reason: 'the stored row cannot be read'
+				})),
+				...storedChannels
+					.filter(
+						(row) =>
+							isAssetRow(row.state) &&
+							!(
+								row.state.auxiliaryState &&
+								row.state.fundingTaprootMerkleRoot?.length === 32
+							)
+					)
+					.map((row) => ({
+						channelId: row.channelId,
+						reason:
+							'the stored row has an asset channel type or funding root without its asset state'
+					}))
+			];
+			if (invalid.length > 0) throw new AuxiliaryChannelRowError(invalid);
+		}
 		// The quorum eligibility preflight runs BEFORE restoration touches
 		// anything: restore deletes record-less DUAL_FUNDING_V2 rows
 		// durably (RBF residue) and can journal the first quorum frame
@@ -3007,6 +3239,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		if (this.localFeatures.hasFeature(Feature.BASIC_MPP)) {
 			this.mppCleanupTimer = setInterval(() => {
 				this.failTimedOutMppPayments();
+				this.retryAuxiliaryOwed();
 			}, 30_000);
 			if (this.mppCleanupTimer.unref) {
 				this.mppCleanupTimer.unref();
@@ -3347,7 +3580,11 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				}
 				continue;
 			}
-			const channel = new Channel(state);
+			const channel = new Channel(
+				state,
+				undefined,
+				this.auxiliaryChannels?.provider
+			);
 			// Before restoreChainWatches or a resumed exchange can arm a funding
 			// watch from the stored depth (issue #1197).
 			const depthRaised = channel.repairLegacyV2OpenerDepth();
@@ -3419,6 +3656,10 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		} of this.storage.loadAllHtlcPaymentMappings()) {
 			this.htlcPaymentMap.set(key, paymentHashHex);
 		}
+
+		// Asset channels: an outgoing asset payment whose HTLC never entered
+		// its channel is ended here, before the node takes new work.
+		this.endAuxiliaryPaymentsNeverSent();
 
 		// Restore forwarded HTLCs
 		for (const {
@@ -3542,6 +3783,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 						failureCode?: number;
 						reason?: HoldCancelReason;
 						resolved: Array<{ amountMsat: string; cltvExpiry: number }>;
+						auxiliary?: true;
 					};
 				}>;
 				for (const entry of parsed) {
@@ -3551,7 +3793,10 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 							channelId: Buffer.from(h.channelId, 'hex'),
 							htlcId: BigInt(h.htlcId),
 							amountMsat: BigInt(h.amountMsat),
-							cltvExpiry: h.cltvExpiry
+							cltvExpiry: h.cltvExpiry,
+							...((h as { auxiliary?: unknown }).auxiliary === true
+								? { auxiliary: true as const }
+								: {})
 						}))
 					);
 					const r = entry.resolution;
@@ -3560,16 +3805,18 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 						amountMsat: BigInt(h.amountMsat),
 						cltvExpiry: h.cltvExpiry
 					}));
+					const mark = r.auxiliary === true ? { auxiliary: true as const } : {};
 					this.heldResolutions.set(
 						entry.hashHex,
 						r.outcome === 'settle'
-							? { outcome: 'settle', resolved }
+							? { outcome: 'settle', resolved, ...mark }
 							: {
 									outcome: 'cancel',
 									failureCode:
 										r.failureCode ?? INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS,
 									reason: r.reason ?? 'api',
-									resolved
+									resolved,
+									...mark
 							  }
 					);
 				}
@@ -4118,7 +4365,31 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		if (!channel) return null;
 		const peer = this.channelManager.getPeerForChannel(channelId);
 		if (!peer) return null;
-		return this.persistChannelState(channel, peer, channelId);
+		return this.auxiliaryRowWritten(
+			channel,
+			this.persistChannelState(channel, peer, channelId)
+		);
+	}
+
+	/**
+	 * Asset channels: a write of a channel's row that committed is made
+	 * known to the channel manager, whichever path made it, so that an
+	 * opener past funding_signed whose host has not been told is told
+	 * (ChannelManager.auxiliaryRowWritten). A channel without asset state is
+	 * not looked at.
+	 */
+	private auxiliaryRowWritten<T extends IChannelPersistResult | null>(
+		channel: Channel,
+		result: T
+	): T {
+		if (
+			result?.committed === true &&
+			!this._destroyed &&
+			channel.getFullState().auxiliaryState !== undefined
+		) {
+			this.channelManager.auxiliaryRowWritten(channel);
+		}
+		return result;
 	}
 
 	/**
@@ -4147,11 +4418,14 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		) {
 			return { committed: true, outboxIds: [] };
 		}
-		return this.persistChannelState(
+		return this.auxiliaryRowWritten(
 			request.channel,
-			request.peerPubkey,
-			request.channelId,
-			request.outbox
+			this.persistChannelState(
+				request.channel,
+				request.peerPubkey,
+				request.channelId,
+				request.outbox
+			)
 		);
 	}
 
@@ -5292,9 +5566,18 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			// commitment-swap handling needs the watch alive to see the
 			// replacement; the watcher retires spends itself at IRREVOCABLE_DEPTH,
 			// and 'channel:resolved' cleans up below.
-			this.emit('channel:closed', { channelId });
+			// An asset channel that ended on a transaction this node holds no
+			// close payload for: the host is told with the close.
+			const unrecordedCloseTxid = this.channelManager
+				.getChannel(channelId)
+				?.getFullState().auxiliaryState?.unrecordedCloseTxid;
+			this.emit('channel:closed', {
+				channelId,
+				...(unrecordedCloseTxid ? { unrecordedCloseTxid } : {})
+			});
 			this.emitStructuredLog('channel', 'closed', {
-				channelId: channelId.toString('hex')
+				channelId: channelId.toString('hex'),
+				...(unrecordedCloseTxid ? { unrecordedCloseTxid } : {})
 			});
 		});
 
@@ -5534,7 +5817,11 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 								row.state.v2InFlight
 							);
 						}
-						const channel = new Channel(row.state);
+						const channel = new Channel(
+							row.state,
+							undefined,
+							this.auxiliaryChannels?.provider
+						);
 						// The startup write of the raised depth may not have landed.
 						channel.repairLegacyV2OpenerDepth();
 						const keyIndex = this.storage!.loadChannelKeyIndex(idHex);
@@ -5578,7 +5865,11 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 						// failed-persist arm, so this removal re-runs
 						// against a store that answers.
 						try {
-							const channel = new Channel(row!.state);
+							const channel = new Channel(
+								row!.state,
+								undefined,
+								this.auxiliaryChannels?.provider
+							);
 							const keyIndex = this.storage!.loadChannelKeyIndex(idHex);
 							this.channelManager.restoreChannel(
 								channel,
@@ -6038,6 +6329,23 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		this.channelManager.on(
 			'channel:accepted',
 			(channel: Channel, peerPubkey: string) => {
+				// An asset channel is funded by the host, which assembles the
+				// funding transaction with its assets (fundAuxiliaryChannel).
+				if (channel.getFullState().auxiliaryState) {
+					try {
+						this.auxiliaryChannels?.onAccepted?.(channel, peerPubkey);
+					} catch {
+						// The host could not take the accepted channel on, so
+						// nobody will fund it. End the opening, which tells the
+						// peer and the host (channel:aborted), instead of leaving
+						// it half open.
+						this.channelManager.abortPendingOpen(
+							channel,
+							'Asset channel funding failed'
+						);
+					}
+					return;
+				}
 				if (!this.fundingProvider) return;
 				if (channel.getFullState().dualFundingSession) return;
 				this.handleAutoFunding(channel, peerPubkey);
@@ -7999,7 +8307,8 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			? createTaprootFundingScript(
 					state.localBasepoints.fundingPubkey,
 					state.remoteBasepoints.fundingPubkey,
-					btcNetwork
+					btcNetwork,
+					state.fundingTaprootMerkleRoot
 			  )
 			: createFundingScript(
 					state.localBasepoints.fundingPubkey,
@@ -8253,7 +8562,11 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			if (row.state.state === ChannelState.DUAL_FUNDING_V2) {
 				row.state.state = this.v2RetainedAttemptState(row.state.v2InFlight);
 			}
-			const channel = new Channel(row.state);
+			const channel = new Channel(
+				row.state,
+				undefined,
+				this.auxiliaryChannels?.provider
+			);
 			// The startup write of the raised depth may not have landed.
 			channel.repairLegacyV2OpenerDepth();
 			const keyIndex = this.storage.loadChannelKeyIndex(idHex);
@@ -8653,7 +8966,23 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	 */
 	private broadcastPendingFundingTx(txidHex: string): void {
 		const entry = this.pendingFundingTxs.get(txidHex);
-		if (!entry || !this.fundingProvider) return;
+		// An asset channel's funding is built by the host, so a node with no
+		// funding provider can still owe its broadcast: the chain backend
+		// carries it, for that channel only.
+		const broadcaster =
+			this.fundingProvider ??
+			(entry &&
+			this.auxiliaryChannels &&
+			this.channelManager.listChannels().some((channel) => {
+				const state = channel.getFullState();
+				return (
+					state.auxiliaryState !== undefined &&
+					state.fundingTxid?.toString('hex') === txidHex
+				);
+			})
+				? this._chainBackend
+				: null);
+		if (!entry || !broadcaster) return;
 		// Covers all three routes that reach here: the funding:authorized emit,
 		// the per-block sweep and the startup sweep.
 		if (!this.owesFundingBroadcast(txidHex)) return;
@@ -8661,7 +8990,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		// Covers all three routes that reach here: the watch:funding emit, the
 		// per-block sweep and the startup sweep.
 		if (!this.owesFundingBroadcast(txidHex)) return;
-		this.fundingProvider
+		broadcaster
 			.broadcastTransaction(txHex)
 			.then(() => {
 				// The parent exists on the network now: closes built on top of
@@ -9144,6 +9473,29 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				});
 				continue;
 			}
+			// A backup carries nothing of an asset channel's asset state, so
+			// one is recovered only where the provider says it can restore it.
+			const assetRefusal = isOverlayChannel(
+				Buffer.from(entry.channelType, 'hex')
+			)
+				? auxiliaryRestoreRefusal(
+						[
+							{
+								channelId,
+								peerPubkey: entry.peerNodeId,
+								source: 'static-backup'
+							}
+						],
+						this.auxiliaryChannels
+				  )
+				: undefined;
+			if (assetRefusal) {
+				skipped.push({
+					channelId: entry.channelId,
+					reason: assetRefusal.message
+				});
+				continue;
+			}
 
 			// Key derivation and channel construction happen behind a per-entry
 			// boundary. Structural validation cannot promise that a configured
@@ -9157,7 +9509,11 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				const built = this.buildRecoveryChannelState(entry, channelId);
 				state = built.state;
 				perChannelKeys = built.perChannelKeys;
-				channel = new Channel(state);
+				channel = new Channel(
+					state,
+					undefined,
+					this.auxiliaryChannels?.provider
+				);
 				channel.channelKeyIndex = entry.channelKeyIndex;
 			} catch (err) {
 				const message = err instanceof Error ? err.message : String(err);
@@ -11144,7 +11500,8 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				? createTaprootFundingScript(
 						state.localBasepoints.fundingPubkey,
 						state.remoteBasepoints.fundingPubkey,
-						btcNetwork
+						btcNetwork,
+						state.fundingTaprootMerkleRoot
 				  ).p2trOutput
 				: createFundingScript(
 						state.localBasepoints.fundingPubkey,
@@ -11476,7 +11833,8 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				? createTaprootFundingScript(
 						state.localBasepoints.fundingPubkey,
 						state.remoteBasepoints.fundingPubkey,
-						btcNetwork
+						btcNetwork,
+						state.fundingTaprootMerkleRoot
 				  ).p2trOutput
 				: createFundingScript(
 						state.localBasepoints.fundingPubkey,
@@ -12023,6 +12381,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		if (interval <= 0) return;
 		this.cleanupTimer = setInterval(() => {
 			this.pruneCompletedPayments();
+			this.retryAuxiliaryOwed();
 		}, interval);
 		if (this.cleanupTimer.unref) {
 			this.cleanupTimer.unref(); // won't block process exit
@@ -12206,6 +12565,15 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	 * advertises it), the peer's from the init it sent on connect. A peer we
 	 * hold no init for counts as not negotiated.
 	 */
+	/**
+	 * The features a connected peer advertised in its init, or undefined
+	 * when there is no init to read: the peer is not connected, or this
+	 * node runs without its own networking.
+	 */
+	private peerInitFeatures(peerPubkey: string): FeatureFlags | undefined {
+		return this.peerManager?.getPeer(peerPubkey)?.getRemoteInit()?.features;
+	}
+
 	private peerNegotiatedDualFund(peerPubkey: string): boolean {
 		if (!this.localFeatures.hasFeature(Feature.DUAL_FUND)) return false;
 		const init = this.peerManager?.getPeer(peerPubkey)?.getRemoteInit();
@@ -14901,6 +15269,14 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				`Channel not found: ${channelId.toString('hex')}`
 			);
 		}
+		// An asset channel is never spliced, so it is quoted no amount: its
+		// bitcoin only carries asset outputs and none of it could be taken
+		// out or added to.
+		const assetRefusal = auxiliaryUnsupported(
+			channel.getFullState(),
+			'a splice'
+		);
+		if (assetRefusal) throw new InvalidSpliceError(assetRefusal.message);
 
 		if (direction === 'out') {
 			const destination = this._spliceOutDestination(destinationScript);
@@ -15381,7 +15757,11 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		// held one does not do is count as ACTIVE, and the advisor decides
 		// that from htlcUsable, which already answers false for it (issue
 		// #469).
-		const channels = this.listChannels();
+		//
+		// An asset channel is left out: its bitcoin only carries asset
+		// outputs, so it is neither liquidity to send or receive with nor a
+		// channel the advisor may recommend anything for.
+		const channels = this.listChannels().filter((ch) => !ch.auxiliary);
 		const snapshots: IChannelSnapshot[] = channels.map((ch) => {
 			const channelIdHex = ch.channelId.toString('hex');
 			const reestablishKey = `reestablish:${channelIdHex}`;
@@ -15439,28 +15819,32 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	 * sized toward 50/50. Pure planning -- nothing is executed.
 	 */
 	planRebalanceRecommendations(minImbalancePct?: number): IRebalancePlan[] {
-		const snapshots: IChannelSnapshot[] = this.listChannels().map((ch) => ({
-			channelId: ch.channelId.toString('hex'),
-			state: ch.state as string,
-			localBalanceMsat: ch.localBalanceMsat,
-			remoteBalanceMsat: ch.remoteBalanceMsat,
-			capacitySats: Number(ch.fundingSatoshis),
-			peerPubkey: ch.peerPubkey,
-			// A rebalance is two new HTLCs, so a channel that refuses them
-			// cannot be either leg. The planner reads this rather than the
-			// state, for the same reason the advisor does (issue #469).
-			htlcUsable: ch.htlcUsable,
-			...(ch.restoreRecencyUnproven === true
-				? { restoreRecencyUnproven: true }
-				: {}),
-			...(ch.reestablishRecencyUnproven === true
-				? { reestablishRecencyUnproven: true }
-				: {}),
-			...(ch.reestablishSecretMissing === true
-				? { reestablishSecretMissing: true }
-				: {}),
-			...(ch.restoreRevokedRisk === true ? { restoreRevokedRisk: true } : {})
-		}));
+		// An asset channel is never a leg of a rebalance: it carries no
+		// bitcoin payment.
+		const snapshots: IChannelSnapshot[] = this.listChannels()
+			.filter((ch) => !ch.auxiliary)
+			.map((ch) => ({
+				channelId: ch.channelId.toString('hex'),
+				state: ch.state as string,
+				localBalanceMsat: ch.localBalanceMsat,
+				remoteBalanceMsat: ch.remoteBalanceMsat,
+				capacitySats: Number(ch.fundingSatoshis),
+				peerPubkey: ch.peerPubkey,
+				// A rebalance is two new HTLCs, so a channel that refuses them
+				// cannot be either leg. The planner reads this rather than the
+				// state, for the same reason the advisor does (issue #469).
+				htlcUsable: ch.htlcUsable,
+				...(ch.restoreRecencyUnproven === true
+					? { restoreRecencyUnproven: true }
+					: {}),
+				...(ch.reestablishRecencyUnproven === true
+					? { reestablishRecencyUnproven: true }
+					: {}),
+				...(ch.reestablishSecretMissing === true
+					? { reestablishSecretMissing: true }
+					: {}),
+				...(ch.restoreRevokedRisk === true ? { restoreRevokedRisk: true } : {})
+			}));
 		const plans = planRebalances(snapshots, {
 			minImbalancePct:
 				minImbalancePct ?? this.autoRebalanceConfig.minImbalancePct
@@ -15535,6 +15919,21 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			throw new Error(
 				`to channel not found or not usable: ${toChannelId.toString('hex')}`
 			);
+		}
+		// A rebalance pays bitcoin out over one channel and back in over
+		// the other, and the bitcoin of an asset channel only carries its
+		// units: an asset channel is neither of the two.
+		for (const [leg, channel, id] of [
+			['from', fromChannel, fromChannelId],
+			['to', toChannel, toChannelId]
+		] as const) {
+			if (channel.getFullState().auxiliaryState) {
+				throw new AuxiliaryPaymentError(
+					'ASSET_PAYMENT_UNSUPPORTED',
+					id,
+					`An asset channel cannot be the ${leg} channel of a rebalance`
+				);
+			}
 		}
 
 		const amountMsat = amountSats * 1000n;
@@ -15938,6 +16337,8 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			const policy = this.getChannelPolicy(channelId);
 			if (!policy) continue;
 			const st = channel.getFullState();
+			// An asset channel forwards no bitcoin payment: no fee to tune.
+			if (st.auxiliaryState) continue;
 			const capacityMsat = st.fundingSatoshis * 1000n;
 			if (capacityMsat <= 0n) continue;
 			const forwards = this.listForwards({ since, until: now, channelId: hex });
@@ -16149,6 +16550,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		}
 		const closeStatus = this._buildCloseStatus(state, channelId);
 		if (closeStatus) info.closeStatus = closeStatus;
+		if (state.auxiliaryState !== undefined) info.auxiliary = true;
 		return info;
 	}
 
@@ -16665,6 +17067,11 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		reservationHint = false
 	): IRoutingHintHop | null {
 		const state = channel.getFullState();
+		// An asset channel is no way in for an ordinary payment. Said here
+		// and not by each caller, so that nothing built on a hint (an
+		// invoice, a rebalance leg, the inbound a JIT payment is measured
+		// against) can take one for bitcoin liquidity.
+		if (state.auxiliaryState) return null;
 		// Look through a reconnect (SCID and peer info stay valid for hints),
 		// and admit a usable mid-splice channel: it receives fine, still under
 		// its pre-splice scid until the lock.
@@ -16801,6 +17208,8 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		for (const channel of this.channelManager.listChannels()) {
 			const state = channel.getFullState();
 			if (!channel.acceptsNewHtlcs(true)) continue;
+			// An asset channel is no blinded way in either.
+			if (state.auxiliaryState) continue;
 
 			const channelId = channel.getChannelId();
 			if (!channelId) continue;
@@ -17040,6 +17449,10 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			const st = channel.getFullState();
 			return (
 				st.announceChannel === true &&
+				// An asset channel is never announced, whatever its record
+				// says, so it is never the public channel that takes the
+				// private paths away.
+				!st.auxiliaryState &&
 				st.announcementSigsSent &&
 				st.announcementSigsReceived &&
 				!(
@@ -18004,8 +18417,9 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		// (e.g. missing SCID/alias, or relying on gossip that hasn't propagated).
 		const allChannels = this.channelManager.listChannels();
 		if (routingHints.length === 0) {
-			const receivableNormal = allChannels.some((ch) =>
-				ch.acceptsNewHtlcs(true)
+			// An asset channel has no hint and is owed none.
+			const receivableNormal = allChannels.some(
+				(ch) => ch.acceptsNewHtlcs(true) && !ch.getFullState().auxiliaryState
 			);
 			if (receivableNormal) {
 				this.emit('node:error', {
@@ -18145,7 +18559,10 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	private getLocalChannelEdges(): ILocalChannelEdge[] {
 		const edges: ILocalChannelEdge[] = [];
 		for (const channel of this.channelManager.listChannels()) {
-			if (!channel.acceptsNewHtlcs()) continue;
+			// An asset channel is no first hop for an ordinary payment.
+			if (!channel.acceptsNewHtlcs() || channel.getFullState().auxiliaryState) {
+				continue;
+			}
 			const channelId = channel.getChannelId();
 			if (!channelId) continue;
 			const peerHex = this.channelManager.getPeerForChannel(channelId);
@@ -18188,12 +18605,25 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		return edges;
 	}
 
+	/**
+	 * Decode a BOLT 11 invoice this node is asked to pay or to price. LND's
+	 * blinded payment path field (tag 20) is read only on a node with asset
+	 * channels configured (issue #2093). On every other node it stays the
+	 * unknown field it has always been, so no invoice reads differently
+	 * there.
+	 */
+	private decodeBolt11(invoiceStr: string): ReturnType<typeof decodeInvoice> {
+		return this.auxiliaryChannels
+			? decodeInvoice(invoiceStr, { lndBlindedPaths: true })
+			: decodeInvoice(invoiceStr);
+	}
+
 	private decodePayAllInvoice(
 		invoiceStr: string
 	): ReturnType<typeof decodeInvoice> {
 		let invoice: ReturnType<typeof decodeInvoice>;
 		try {
-			invoice = decodeInvoice(invoiceStr);
+			invoice = this.decodeBolt11(invoiceStr);
 		} catch {
 			throw new LightningPaymentError(
 				LightningErrorCode.INVALID_INVOICE,
@@ -18409,7 +18839,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		// this call is not mistaken for the retry.
 		const redispatching = this.redispatchingRetryContext;
 		this.redispatchingRetryContext = undefined;
-		const invoice = decodeInvoice(invoiceStr);
+		const invoice = this.decodeBolt11(invoiceStr);
 		// The payee is found by node id alone, so an invoice for another chain
 		// would pay whichever node holds that key on ours.
 		if (invoice.network !== this.network) {
@@ -18882,10 +19312,144 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		totalMsat?: bigint,
 		metadata?: Record<string, string>,
 		payAll?: IPayAllBudget,
-		paymentMetadata?: Buffer
+		paymentMetadata?: Buffer,
+		options?: ISendToRouteOptions
 	): IPaymentInfo {
 		if (route.hops.length === 0) {
 			throw new Error('Route must have at least one hop');
+		}
+
+		// An asset payment leaves over the asset channel it names, and every
+		// attempt of one names it again: the node chooses no channel for it
+		// and retries nothing.
+		let assetPayment = options?.assetPayment;
+		const priorAssetChannel = this.payments.get(paymentHash.toString('hex'))
+			?.metadata?._auxiliaryChannelId;
+		if (
+			priorAssetChannel &&
+			(!assetPayment ||
+				!Buffer.isBuffer(assetPayment.channelId) ||
+				priorAssetChannel !== assetPayment.channelId.toString('hex'))
+		) {
+			throw new AuxiliaryPaymentError(
+				'ASSET_PAYMENT_ROUTE_REQUIRED',
+				priorAssetChannel,
+				'Every attempt of an asset payment names its asset channel'
+			);
+		}
+		if (assetPayment) {
+			if (
+				!Buffer.isBuffer(assetPayment.channelId) ||
+				assetPayment.channelId.length !== 32
+			) {
+				throw new InvalidRequestError('Invalid asset payment channel id');
+			}
+			if (
+				typeof assetPayment.wireAmountMsat !== 'bigint' ||
+				assetPayment.wireAmountMsat <= 0n ||
+				assetPayment.wireAmountMsat > U64_MAX ||
+				!(assetPayment.customRecords instanceof Map) ||
+				assetPayment.customRecords.size === 0
+			) {
+				throw new AuxiliaryPaymentError(
+					'ASSET_PAYMENT_INVALID',
+					assetPayment.channelId,
+					'An asset payment carries custom records and a bitcoin amount above zero'
+				);
+			}
+			if (payAll) {
+				throw new AuxiliaryPaymentError(
+					'ASSET_PAYMENT_UNSUPPORTED',
+					assetPayment.channelId,
+					'An asset payment cannot be a pay-all'
+				);
+			}
+			if (this.paymentRetryContexts.has(paymentHash.toString('hex'))) {
+				throw new AuxiliaryPaymentError(
+					'ASSET_PAYMENT_UNSUPPORTED',
+					assetPayment.channelId,
+					'An asset payment cannot join a payment the node retries on its own'
+				);
+			}
+			let records: Map<bigint, Buffer>;
+			try {
+				records = copyCustomRecords(assetPayment.customRecords)!;
+			} catch (err) {
+				throw new AuxiliaryPaymentError(
+					'ASSET_PAYMENT_INVALID',
+					assetPayment.channelId,
+					err instanceof Error ? err.message : String(err)
+				);
+			}
+			assetPayment = {
+				...assetPayment,
+				channelId: Buffer.from(assetPayment.channelId),
+				customRecords: records
+			};
+			// Whoever runs this node may refuse asset payments altogether, or
+			// one at a time (a wallet whose spending limits cannot count an
+			// asset payment yet). Asked before anything is recorded or sent.
+			const gate = this.auxiliaryPaymentGate;
+			if (gate) {
+				let refusal: ReturnType<AuxiliaryPaymentGate>;
+				try {
+					refusal = gate({
+						paymentHash: Buffer.from(paymentHash),
+						channelId: Buffer.from(assetPayment.channelId),
+						amountMsat: route.hops[route.hops.length - 1].amountToForwardMsat,
+						wireAmountMsat: assetPayment.wireAmountMsat,
+						routeAmountMsat: route.hops[0].amountToForwardMsat
+					});
+				} catch (err) {
+					// A gate that cannot answer has not let the payment through.
+					refusal = err instanceof Error ? err.message : String(err);
+				}
+				if (refusal !== undefined) {
+					const said =
+						typeof refusal === 'object' && refusal !== null
+							? refusal
+							: { message: String(refusal), reason: undefined };
+					throw new AuxiliaryPaymentError(
+						'ASSET_PAYMENT_REFUSED',
+						assetPayment.channelId,
+						String(said.message ?? '') || 'The asset payment was refused',
+						typeof said.reason === 'string' ? said.reason : undefined
+					);
+				}
+			}
+			const assetChannelState = this.channelManager
+				.getChannel(assetPayment.channelId)
+				?.getFullState();
+			// The node offers no more asset HTLCs at once than it accepts,
+			// whatever the peer would take: each one open is an output to
+			// spend in time, with a fee input of its own, if the channel goes
+			// to the chain. Counted as the channel counts them, and asked
+			// before anything is recorded or sent.
+			const offeredNow = assetChannelState
+				? countPendingHtlcs(assetChannelState, HtlcDirection.OFFERED)
+				: 0;
+			const offeredMost = auxiliaryMaxHtlcs(this.auxiliaryChannels?.maxHtlcs);
+			if (offeredNow >= offeredMost) {
+				throw new AuxiliaryPaymentError(
+					'ASSET_HTLC_LIMIT_REACHED',
+					assetPayment.channelId,
+					`This node has ${offeredNow} asset HTLCs of its own open on the channel and offers no more than ${offeredMost} at once: the payment can be sent once one of them has ended`
+				);
+			}
+			const undelivered =
+				assetChannelState?.auxiliaryState?.resolvedHtlcs?.size ?? 0;
+			if (undelivered > ChannelManager.AUXILIARY_MAX_UNDELIVERED_OUTCOMES) {
+				throw new AuxiliaryPaymentError(
+					'ASSET_OUTCOMES_UNDELIVERED',
+					assetPayment.channelId,
+					`The channel holds ${undelivered} outcomes of asset HTLCs that its host has not taken (onHtlcResolved), and offers no further asset HTLC until it has`
+				);
+			}
+			metadata = {
+				...metadata,
+				_auxiliaryChannelId: assetPayment.channelId.toString('hex'),
+				_auxiliaryWireAmountMsat: assetPayment.wireAmountMsat.toString()
+			};
 		}
 
 		// The guarantee behind the senders' early refusal, and the only check
@@ -18900,6 +19464,17 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		// part all the same.
 		const finalAmountMsat =
 			route.hops[route.hops.length - 1].amountToForwardMsat;
+		if (
+			assetPayment &&
+			totalMsat !== undefined &&
+			totalMsat !== finalAmountMsat
+		) {
+			throw new AuxiliaryPaymentError(
+				'ASSET_PAYMENT_UNSUPPORTED',
+				assetPayment.channelId,
+				'An asset payment is made by one HTLC and cannot be a part of a multi-part payment'
+			);
+		}
 		const priorPayAll = this.persistedPayAllBudget(paymentHash.toString('hex'));
 		if (
 			priorPayAll &&
@@ -18931,7 +19506,8 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			totalMsat !== undefined && totalMsat > finalAmountMsat
 				? 'mpp-part'
 				: 'outgoing-pending',
-			totalMsat
+			totalMsat,
+			assetPayment !== undefined
 		);
 
 		// BOLT 4 self-introduction (issue #550): a blinded path can name US as
@@ -18947,6 +19523,13 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		// attribution and the height-skew retry read the hop that actually
 		// erred (issue #550 review).
 		const selfIntro = this.prepareSelfIntroSend(route);
+		if (selfIntro && assetPayment) {
+			throw new AuxiliaryPaymentError(
+				'ASSET_PAYMENT_UNSUPPORTED',
+				assetPayment.channelId,
+				'An asset payment cannot start a blinded path at this node'
+			);
+		}
 		const hops = selfIntro ? selfIntro.wireRoute.hops : route.hops;
 
 		// Route CLTV values are RELATIVE deltas (from pathfinding). Each hop's
@@ -19031,12 +19614,37 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		// the first remaining hop's pubkey is a BLINDED id, which no peer
 		// lookup can resolve.
 		const firstHopPubkey = hops[0].pubkey.toString('hex');
-		const outChannel =
-			selfIntro?.outChannel ??
-			this.findLocalChannelByScid(hops[0].shortChannelId, firstHopPubkey) ??
-			(payAll
-				? undefined
-				: this.findChannelForPeer(firstHopPubkey, hops[0].amountToForwardMsat));
+		const outChannel = assetPayment
+			? this.channelManager.getChannel(assetPayment.channelId)
+			: selfIntro?.outChannel ??
+			  this.findLocalChannelByScid(hops[0].shortChannelId, firstHopPubkey) ??
+			  (payAll
+					? undefined
+					: this.findChannelForPeer(
+							firstHopPubkey,
+							hops[0].amountToForwardMsat
+					  ));
+		if (assetPayment) {
+			if (
+				!outChannel?.getFullState().auxiliaryState ||
+				this.channelManager.getPeerForChannel(assetPayment.channelId) !==
+					firstHopPubkey
+			) {
+				throw new AuxiliaryPaymentError(
+					'ASSET_PAYMENT_CHANNEL_MISMATCH',
+					assetPayment.channelId,
+					"The asset payment's channel is not an asset channel to the route's first hop"
+				);
+			}
+		} else if (outChannel?.getFullState().auxiliaryState) {
+			// The choosers above leave asset channels out. A blinded path that
+			// names one of ours as its way on is the case that reaches here.
+			throw new AuxiliaryPaymentError(
+				'ASSET_CHANNEL_NEEDS_ASSET_PAYMENT',
+				outChannel.getChannelId()!,
+				'An asset channel carries only asset payments'
+			);
+		}
 		if (!outChannel) {
 			throw new LightningPaymentError(
 				LightningErrorCode.NO_CHANNEL_TO_HOP,
@@ -19047,7 +19655,13 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		const channelId = outChannel.getChannelId()!;
 		const cltvExpiry =
 			(selfIntro?.wireCltvRel ?? hops[0].outgoingCltvValue) + baseHeight;
-		const amount = selfIntro?.wireAmountMsat ?? hops[0].amountToForwardMsat;
+		// The HTLC of an asset payment carries its units in custom records and
+		// only a carrier amount of bitcoin. The route and the onion keep what
+		// the payment is worth.
+		const amount =
+			assetPayment?.wireAmountMsat ??
+			selfIntro?.wireAmountMsat ??
+			hops[0].amountToForwardMsat;
 		if (
 			payAll &&
 			outChannel.validateOutgoingHtlc(amount, cltvExpiry).length > 0
@@ -19103,7 +19717,35 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			...(metadata && { metadata: { ...metadata } })
 		};
 		const htlcId = outChannel.getFullState().localHtlcCounter;
+		if (
+			assetPayment?.expectedHtlcId !== undefined &&
+			assetPayment.expectedHtlcId !== htlcId
+		) {
+			throw new AuxiliaryPaymentError(
+				'ASSET_PAYMENT_CIRCUIT_CHANGED',
+				channelId,
+				`The asset payment was prepared for HTLC ${assetPayment.expectedHtlcId} and the channel's next is ${htlcId}`
+			);
+		}
 		const htlcKey = `${channelId.toString('hex')}:offered-${htlcId}`;
+		if (assetPayment) {
+			// What each HTLC of an asset payment is worth is kept beside the
+			// payment: the HTLC's own amount is only its carrier, so the parts
+			// out for the hash cannot be summed from the channels.
+			const parts = this.auxiliaryPartAmounts(
+				this.payments.get(paymentHash.toString('hex'))
+			);
+			parts[htlcKey] = finalAmountMsat.toString();
+			metadata = { ...metadata, _auxiliaryPartAmounts: JSON.stringify(parts) };
+			payment.metadata = { ...metadata };
+			// The record says that asset HTLCs carry it, and what it is worth
+			// to the payee: amountMsat stays the bitcoin of its carriers.
+			payment.auxiliary = true;
+			payment.auxiliaryValueMsat = Object.values(parts).reduce(
+				(sum, value) => sum + BigInt(value),
+				0n
+			);
+		}
 		// The labelled row has to fit a frame with the route it now carries,
 		// both beside its HTLC mapping and as settlement will journal it.
 		if (
@@ -19152,13 +19794,21 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				mutations,
 				RecoveryCriticality.SafetyCritical
 			);
-			if (payAll && !committed) {
-				// No HTLC may leave without the frozen contract. The failed
+			if ((payAll || assetPayment) && !committed) {
+				// No HTLC may leave without the frozen contract, and no asset
+				// HTLC without the record that says what it is worth. The failed
 				// transition is atomic; undo its provisional memory entries too.
 				this.htlcPaymentMap.delete(htlcKey);
 				if (priorPayment)
 					this.payments.set(paymentHash.toString('hex'), priorPayment);
 				else this.payments.delete(paymentHash.toString('hex'));
+				if (assetPayment) {
+					throw new AuxiliaryPaymentError(
+						'ASSET_PAYMENT_NOT_RECORDED',
+						channelId,
+						'Could not persist the asset payment and its HTLC mapping; nothing was sent'
+					);
+				}
 				throw new Error(
 					'Could not persist pay-all budget and HTLC mapping; nothing was sent'
 				);
@@ -19166,18 +19816,52 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		}
 
 		// Add HTLC to channel (may trigger synchronous fulfillment via loopback)
-		const result = this.channelManager.addHtlc(
-			channelId,
-			amount,
-			paymentHash,
-			cltvExpiry,
-			onionBuf,
-			// Self-introduction send (issue #550): the peer inside the blinded
-			// segment derives its key from this point, delivered on
-			// update_add_htlc exactly as a relaying forward delivers it.
-			selfIntro?.blindingPoint
-		);
+		const result = assetPayment
+			? this.channelManager.addHtlc(
+					channelId,
+					amount,
+					paymentHash,
+					cltvExpiry,
+					onionBuf,
+					undefined,
+					undefined,
+					{
+						customRecords: assetPayment.customRecords,
+						expectedHtlcId: htlcId
+					}
+			  )
+			: this.channelManager.addHtlc(
+					channelId,
+					amount,
+					paymentHash,
+					cltvExpiry,
+					onionBuf,
+					// Self-introduction send (issue #550): the peer inside the
+					// blinded segment derives its key from this point, delivered
+					// on update_add_htlc exactly as a relaying forward delivers
+					// it.
+					selfIntro?.blindingPoint
+			  );
 		if (!result.ok) {
+			if (assetPayment && result.admissionRejected) {
+				// Nothing entered the channel: what the host reserved for this
+				// HTLC id is free again, and the channel will give the id to
+				// another HTLC. The part leaves the record here, in the write
+				// that drops its mapping below, so the payment never lists an
+				// HTLC that never left under an id that is another's.
+				const refusedMetadata: Record<string, string> = {
+					...payment.metadata
+				};
+				const parts = this.auxiliaryPartAmounts(payment);
+				delete parts[htlcKey];
+				if (Object.keys(parts).length > 0) {
+					refusedMetadata._auxiliaryPartAmounts = JSON.stringify(parts);
+				} else {
+					delete refusedMetadata._auxiliaryPartAmounts;
+				}
+				refusedMetadata._auxiliaryAdmissionRejected = 'true';
+				payment.metadata = refusedMetadata;
+			}
 			payment.status = PaymentStatus.FAILED;
 			payment.completedAt = Date.now();
 			// The HTLC never left this node, so there is no onion failure to
@@ -19406,7 +20090,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		if (ctx.bolt12Invoice) return ctx.bolt12Invoice.paths?.length ?? 0;
 		if (!ctx.invoiceStr) return 0;
 		try {
-			return decodeInvoice(ctx.invoiceStr).blindedPaths?.length ?? 0;
+			return this.decodeBolt11(ctx.invoiceStr).blindedPaths?.length ?? 0;
 		} catch {
 			return 0;
 		}
@@ -20468,6 +21152,20 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			policyCode = finalHop
 				? INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS
 				: TEMPORARY_CHANNEL_FAILURE;
+		} else if (htlcEntry.auxiliaryRefused === true) {
+			// Asset channels: the host's provider refused this HTLC when it
+			// was admitted (validateHtlc threw). The stamp is stored with the
+			// HTLC, so a replay after a restart answers the same: the HTLC is
+			// failed back, its units return to the peer, the channel stays.
+			this.emitStructuredLog('htlc', 'refused_by_asset_provider', {
+				channelId: channelId.toString('hex'),
+				htlcId: htlcId.toString(),
+				finalHop,
+				reason: 'the provider refused the HTLC at admission'
+			});
+			policyCode = finalHop
+				? INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS
+				: TEMPORARY_CHANNEL_FAILURE;
 		} else if (
 			this.currentBlockHeight > 0 &&
 			htlcEntry.cltvExpiry >
@@ -20510,6 +21208,118 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			return;
 		}
 
+		// Asset channels. With a provider, the host is asked about every HTLC
+		// that ends here, whatever channel it arrived on (see
+		// IAuxiliaryChannelConfig.valueIncomingHtlc). Only the host knows that
+		// a hash belongs to an asset invoice, so a plain HTLC paying one is
+		// failed here and never reaches the invoice logic below. "Not the
+		// host's" leaves everything below exactly as it is without a provider,
+		// for an HTLC of an ordinary channel; a node without one asks nothing.
+		//
+		// A node with asset channels is only ever an endpoint of an asset
+		// payment. An HTLC that arrived on an asset channel or carries asset
+		// units and is not for this node is failed back without asking
+		// anybody, and one that is for this node and the host does not know is
+		// failed back too: nothing of an asset channel takes the ordinary
+		// final-hop or forwarding path.
+		const carriesAssets = htlcEntry.auxiliaryAmount !== undefined;
+		const onAssetChannel = channel.getFullState().auxiliaryState !== undefined;
+		if (
+			this.auxiliaryChannels &&
+			(finalHop || carriesAssets || onAssetChannel)
+		) {
+			const ask = this.auxiliaryChannels.valueIncomingHtlc;
+			// A held HTLC was valued when it was accepted, and it is worth
+			// that for as long as it is held: when it is gone through again
+			// (a reestablish, a restart) the host is not asked a second time.
+			const parkedValue = this.heldHtlcs
+				.get(paymentHash.toString('hex'))
+				?.find((h) => h.htlcId === htlcId && h.channelId.equals(channelId))
+				?.amountMsat;
+			let refusal: string | undefined;
+			try {
+				if (!finalHop) {
+					throw new Error('an HTLC of an asset channel is never forwarded');
+				}
+				if (parkedValue !== undefined) {
+					amountMsat = parkedValue;
+				} else if (ask) {
+					if (!peerPubkey) throw new Error('the channel has no peer');
+					const valued = LightningNode.auxiliaryIncomingValue(
+						ask({
+							state: channel.getFullState(),
+							peerPubkey,
+							channelId,
+							htlcId,
+							paymentHash,
+							wireAmountMsat: amountMsat,
+							...(carriesAssets
+								? { auxiliaryAmount: htlcEntry.auxiliaryAmount }
+								: {}),
+							customRecords: htlcEntry.customRecords ?? new Map(),
+							hopPayload: processed.hopPayload,
+							isFinalHop: finalHop,
+							acceptedHtlcs: this.acceptedAuxiliaryHtlcs(
+								paymentHash,
+								channelId,
+								htlcId
+							),
+							invoice: this.invoices.get(paymentHash.toString('hex'))
+						}),
+						carriesAssets
+					);
+					if (valued === undefined && onAssetChannel) {
+						throw new Error(
+							'an HTLC of an asset channel is not one the host knows'
+						);
+					}
+					if (valued !== undefined) amountMsat = valued;
+				} else if (carriesAssets || onAssetChannel) {
+					throw new Error('asset payment valuation is unavailable');
+				}
+			} catch (err) {
+				refusal = err instanceof Error ? err.message : String(err);
+			}
+			if (refusal !== undefined) {
+				this.emitStructuredLog('htlc', 'refused_by_asset_provider', {
+					channelId: channelId.toString('hex'),
+					htlcId: htlcId.toString(),
+					finalHop,
+					reason: refusal
+				});
+				const role: 'intro' | 'mid' | undefined = processed.hopPayload
+					.blindingPoint
+					? 'intro'
+					: htlcEntry.blindingPoint
+					? 'mid'
+					: undefined;
+				if (role) {
+					this.failBlindedIncomingHtlc(
+						channelId,
+						htlcId,
+						role,
+						processed.sharedSecret
+					);
+					return;
+				}
+				this.cleanupHtlcSharedSecret(htlcSecretKey);
+				this.channelManager.failHtlc(
+					channelId,
+					htlcId,
+					createFailureMessage(
+						processed.sharedSecret,
+						finalHop
+							? INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS
+							: TEMPORARY_CHANNEL_FAILURE,
+						finalHop
+							? this.incorrectPaymentDetailsData(amountMsat)
+							: this.updateFlaggedFailureData(TEMPORARY_CHANNEL_FAILURE)
+					)
+				);
+				return;
+			}
+		}
+
 		// FFOR Variant D (section 9.5.1 "Settlement"): a hash in a live voucher
 		// book of ours is settled here with the slot's preimage, or failed; it
 		// never takes the forward or final-hop path, and nothing is sent to R.
@@ -20539,7 +21349,8 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				paymentHash,
 				processed.hopPayload,
 				htlcEntry.cltvExpiry,
-				htlcEntry.blindingPoint
+				htlcEntry.blindingPoint,
+				carriesAssets
 			);
 		} else {
 			// Forward to next hop — pass incoming HTLC details for CLTV/fee enforcement.
@@ -20556,6 +21367,93 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				htlcEntry.blindingPoint
 			);
 		}
+	}
+
+	/**
+	 * What a host's answer makes an incoming HTLC worth, or undefined for
+	 * "not the host's" (see IAuxiliaryChannelConfig.valueIncomingHtlc).
+	 * Throws for anything that is neither, and for "not the host's" given to
+	 * an HTLC that carries asset units.
+	 */
+	private static auxiliaryIncomingValue(
+		answer: unknown,
+		carriesAssets: boolean
+	): bigint | undefined {
+		if (answer === undefined) {
+			if (carriesAssets) {
+				throw new Error('an HTLC that carries asset units was not valued');
+			}
+			return undefined;
+		}
+		if (typeof answer !== 'bigint' || answer <= 0n || answer > U64_MAX) {
+			throw new Error('invalid asset payment valuation');
+		}
+		return answer;
+	}
+
+	/**
+	 * The HTLCs already held for a payment hash and what each was credited,
+	 * for the host to value a further part against. Each is checked against
+	 * its channel again before it is counted.
+	 */
+	private acceptedAuxiliaryHtlcs(
+		paymentHash: Buffer,
+		currentChannelId: Buffer,
+		currentHtlcId: bigint
+	): Array<{ channelId: Buffer; htlcId: bigint; amountMsat: bigint }> {
+		const hashHex = paymentHash.toString('hex');
+		if (
+			this.payments.get(hashHex)?.status !== PaymentStatus.PENDING ||
+			this.heldResolutions.has(hashHex)
+		) {
+			return [];
+		}
+		const candidates = [
+			...(this.pendingMppPayments.get(hashHex)?.receivedParts ?? [])
+				.filter((part) => part.status === PaymentStatus.PENDING)
+				.map((part) => ({
+					channelId: part.channelId,
+					htlcId: part.htlcId,
+					amountMsat: part.htlcAmountMsat
+				})),
+			...(this.heldHtlcs.get(hashHex) ?? [])
+		];
+		const accepted = new Map<
+			string,
+			{ channelId: Buffer; htlcId: bigint; amountMsat: bigint }
+		>();
+		for (const part of candidates) {
+			if (
+				part.htlcId === currentHtlcId &&
+				part.channelId.equals(currentChannelId)
+			) {
+				continue;
+			}
+			const entry = this.channelManager
+				.getChannel(part.channelId)
+				?.getFullState()
+				.htlcs.get(`received-${part.htlcId}`);
+			if (
+				!entry ||
+				entry.state !== HtlcState.COMMITTED ||
+				entry.direction !== HtlcDirection.RECEIVED ||
+				!entry.paymentHash.equals(paymentHash) ||
+				part.amountMsat <= 0n
+			) {
+				continue;
+			}
+			const key = `${part.channelId.toString('hex')}:${part.htlcId}`;
+			const previous = accepted.get(key);
+			if (previous && previous.amountMsat !== part.amountMsat) {
+				throw new Error('Conflicting accepted invoice credit');
+			}
+			accepted.set(key, {
+				channelId: Buffer.from(part.channelId),
+				htlcId: part.htlcId,
+				amountMsat: part.amountMsat
+			});
+		}
+		return [...accepted.values()];
 	}
 
 	// ─────────── FFOR Variant D (docs/specs/ffor-offline-receive.md) ───────────
@@ -21913,6 +22811,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			completedAt: Date.now(),
 			amountMsat: credit.amountMsat
 		};
+		delete completed.unresolved;
 		const mutations: RecoveryMutation[] = [];
 		const archived = this.fforArchivedVouchers.get(credit.id);
 		let creditedArchive: IFforVoucherArchive | undefined;
@@ -22202,7 +23101,8 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		incomingCltvExpiry: number | undefined,
 		amountMsat: bigint,
 		hashHex: string,
-		htlcKey: string
+		htlcKey: string,
+		assetCredit = false
 	): Buffer | null {
 		const fail = (code: number): Buffer =>
 			sharedSecret
@@ -22273,7 +23173,11 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		// admitJitSkim accepts it only up to the fee quoted on the declared
 		// total, counted across the whole HTLC set. With no allowance
 		// registered nothing below changes, which is every other invoice.
+		// An asset HTLC is credited what the host valued it at, and the host
+		// has judged that value against its own quote: rounding between units
+		// and millisatoshis can leave it just under the onion's amount.
 		if (
+			!assetCredit &&
 			hopPayload?.amountToForwardMsat !== undefined &&
 			amountMsat < hopPayload.amountToForwardMsat
 		) {
@@ -22308,7 +23212,8 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		paymentHash: Buffer,
 		hopPayload?: IHopPayload,
 		incomingCltvExpiry?: number,
-		incomingBlindingPoint?: Buffer
+		incomingBlindingPoint?: Buffer,
+		assetCredit = false
 	): void {
 		const hashHex = paymentHash.toString('hex');
 		const htlcSecretKey = `${channelId.toString('hex')}:${htlcId}`;
@@ -22325,7 +23230,8 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			incomingCltvExpiry,
 			amountMsat,
 			hashHex,
-			htlcSecretKey
+			htlcSecretKey,
+			assetCredit
 		);
 		if (safetyReason) {
 			this.cleanupHtlcSharedSecret(htlcSecretKey);
@@ -22651,7 +23557,10 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		// classifying or accumulating by the incoming amount would count HTLC
 		// overfunding as payment progress and could settle a set whose onion
 		// amounts never reached the declared total.
-		const partAmountMsat = hopPayload?.amountToForwardMsat ?? amountMsat;
+		// An asset HTLC counts for what the host valued it at.
+		const partAmountMsat = assetCredit
+			? amountMsat
+			: hopPayload?.amountToForwardMsat ?? amountMsat;
 
 		// The sender-declared multi-part total. BOLT 11 payment_data carries it
 		// in total_msat; a blinded final hop carries no payment_data at all and
@@ -22712,6 +23621,43 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 					paymentHash: hashHex,
 					received: claimedTotal.toString(),
 					invoiced: finalInvoice.amountMsat.toString()
+				});
+				const reason = sharedSecret
+					? createFailureMessage(
+							sharedSecret,
+							INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS,
+							this.incorrectPaymentDetailsData(amountMsat)
+					  )
+					: Buffer.alloc(FAILURE_MESSAGE_LENGTH);
+				this.cleanupHtlcSharedSecret(htlcSecretKey);
+				this.channelManager.failHtlc(channelId, htlcId, reason);
+				return;
+			}
+		}
+
+		// Asset channels: an asset invoice is paid by one HTLC in this build.
+		// An HTLC that carries units and is a part of a set (its onion
+		// declares a total above what it was valued at, or another HTLC is
+		// already kept for the hash) is failed back and never collected.
+		if (assetCredit) {
+			const others = [
+				...(this.heldHtlcs.get(hashHex) ?? []),
+				...(this.pendingMppPayments.get(hashHex)?.receivedParts ?? [])
+			].some(
+				(part) => !(part.htlcId === htlcId && part.channelId.equals(channelId))
+			);
+			if (
+				others ||
+				(declaredTotalMsat !== undefined && declaredTotalMsat > partAmountMsat)
+			) {
+				this.emitStructuredLog('htlc', 'asset_multi_part_refused', {
+					paymentHash: hashHex,
+					channelId: channelId.toString('hex'),
+					htlcId: htlcId.toString(),
+					valuedMsat: partAmountMsat.toString(),
+					...(declaredTotalMsat !== undefined
+						? { declaredTotalMsat: declaredTotalMsat.toString() }
+						: {})
 				});
 				const reason = sharedSecret
 					? createFailureMessage(
@@ -22804,7 +23750,8 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				htlcId,
 				paymentHash,
 				amountMsat,
-				incomingCltvExpiry ?? 0
+				incomingCltvExpiry ?? 0,
+				assetCredit
 			);
 			return;
 		}
@@ -22812,7 +23759,13 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		// MPP: a declared total above this part's amount marks a multi-part
 		// payment, whether declared via payment_data (BOLT 11) or
 		// total_amount_msat on a blinded final hop (BOLT 12).
-		if (declaredTotalMsat !== undefined && declaredTotalMsat > partAmountMsat) {
+		if (
+			declaredTotalMsat !== undefined &&
+			(declaredTotalMsat > partAmountMsat ||
+				// A valued part can reach the total alone while earlier parts of
+				// its set are held: it joins them.
+				(assetCredit && this.pendingMppPayments.has(hashHex)))
+		) {
 			this.handleMppPart(
 				channelId,
 				htlcId,
@@ -22919,6 +23872,37 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	}
 
 	/**
+	 * Asset channels: the held set of a swap's invoice as the swap provider
+	 * reads it. A swap pays out bitcoin for the bitcoin it holds, and a set
+	 * with an HTLC that holds units is worth what a host said of them. Such
+	 * a set is never complete for a swap, so nothing is funded against it,
+	 * and it is failed back with the invoice like any set that fell short.
+	 */
+	private swapHeldSnapshot(paymentHash: Buffer): IHeldInvoiceSnapshot | null {
+		const snapshot = this.getHeldInvoiceSnapshot(paymentHash);
+		return snapshot?.complete && this.heldSetCarriesUnits(snapshot.parts)
+			? { ...snapshot, complete: false }
+			: snapshot;
+	}
+
+	/**
+	 * Asset channels: whether a part of a parked set is an HTLC that holds
+	 * units. Read from the channel, which is where the units of an HTLC are
+	 * kept, so nothing is stored beside the set to say it.
+	 */
+	private heldSetCarriesUnits(
+		held: ReadonlyArray<{ channelId: Buffer; htlcId: bigint }>
+	): boolean {
+		return held.some(
+			(h) =>
+				this.channelManager
+					.getChannel(h.channelId)
+					?.getFullState()
+					.htlcs.get(`received-${h.htlcId}`)?.auxiliaryAmount !== undefined
+		);
+	}
+
+	/**
 	 * Park a validated incoming HTLC for a hold invoice. It awaits release via
 	 * settleHeldHtlc / cancelHeldHtlc (or the CLTV sweeper). Emits 'htlc:held',
 	 * and 'hold:accepted' when the part actually joined the set.
@@ -22928,7 +23912,8 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		htlcId: bigint,
 		paymentHash: Buffer,
 		amountMsat: bigint,
-		cltvExpiry: number
+		cltvExpiry: number,
+		carriesUnits = false
 	): void {
 		const hashHex = paymentHash.toString('hex');
 		const list = this.heldHtlcs.get(hashHex) ?? [];
@@ -22940,7 +23925,13 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		// on reestablish reports the same set twice, which a consumer treating
 		// the event as the OPEN -> ACCEPTED edge would read as a second payment.
 		if (joined) {
-			list.push({ channelId, htlcId, amountMsat, cltvExpiry });
+			list.push({
+				channelId,
+				htlcId,
+				amountMsat,
+				cltvExpiry,
+				...(carriesUnits ? { auxiliary: true as const } : {})
+			});
 			this.heldHtlcs.set(hashHex, list);
 			this.persistHeldHtlcs();
 			// Ahead of the log and 'htlc:held' below: a listener on either can
@@ -22956,7 +23947,10 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 					state: 'ACCEPTED',
 					heldAmountMsat: parked.reduce((sum, h) => sum + h.amountMsat, 0n),
 					htlcCount: parked.length,
-					...this.heldSetExpiry(hashHex, parked)
+					...this.heldSetExpiry(hashHex, parked),
+					...(this.heldSetCarriesUnits(parked)
+						? { auxiliary: true as const }
+						: {})
 				};
 				this.emitHoldInvoiceEvent({ name: 'hold:accepted', event });
 			}
@@ -23014,22 +24008,89 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		// not reveal the preimage or report settlement for a set they removed.
 		if (this.heldHtlcs.get(hashHex) !== held) return false;
 		this.preimages.set(hashHex, pre);
+
 		this.channelManager.recordPreimage(paymentHash, pre);
 
 		this.resolvingHeldHtlcs.add(hashHex);
 		const prior = this.heldResolutions.get(hashHex);
 		const refused: typeof held = [];
+		let takenOnChain = 0;
+		// Asset channels: a part the asset provider refused, and whether the
+		// set is paid in asset units.
+		let providerRefused = false;
+		const carriesUnits =
+			prior?.auxiliary === true || this.heldSetCarriesUnits(held);
 		try {
 			// Bound before the first fulfil leaves: a block handled on this stack,
 			// or a restart after it, must not fail back a part still to come.
 			this.heldResolutions.set(hashHex, {
 				outcome: 'settle',
-				resolved: prior?.resolved ?? []
+				resolved: prior?.resolved ?? [],
+				...(carriesUnits ? { auxiliary: true as const } : {})
 			});
 			this.persistHeldHtlcs();
 			for (const h of held) {
 				const key = `${h.channelId.toString('hex')}:${h.htlcId}`;
-				if (!this.channelManager.fulfillHtlc(h.channelId, h.htlcId, pre).ok) {
+				// Asset channels: no fulfil is made for an HTLC that has expired
+				// (the rule of ChannelManager.retryAuxiliaryOwed). The preimage
+				// is not revealed for an HTLC the peer can already take back
+				// on chain.
+				if (
+					this.currentBlockHeight > 0 &&
+					h.cltvExpiry > 0 &&
+					h.cltvExpiry <= this.currentBlockHeight &&
+					this.channelManager.getChannel(h.channelId)?.getFullState()
+						.auxiliaryState !== undefined
+				) {
+					refused.push(h);
+					continue;
+				}
+
+				if (this.channelManager.auxiliaryChannelOnChain(h.channelId)) {
+					// On chain no fulfil can be made, and a hold follows the
+					// clock it follows in an open channel: a settle is taken
+					// while the expiry is more than the cancel margin away, so
+					// that the claim has the blocks it needs. Taken, the
+					// decision written down here, for this HTLC, is what the
+					// claim is made by, and the part stays parked until the
+					// chain has ended it. Refused, nothing is written and
+					// nothing is published.
+					if (
+						h.cltvExpiry - this.currentBlockHeight > HELD_HTLC_EXPIRY_MARGIN &&
+						this.channelManager.recordAuxiliaryHtlcDecision(
+							h.channelId,
+							h.htlcId,
+							'settle',
+							pre
+						)
+					) {
+						takenOnChain++;
+					}
+					refused.push(h);
+					continue;
+				}
+
+				const result = this.channelManager.fulfillHtlc(
+					h.channelId,
+					h.htlcId,
+					pre
+				);
+				if (!result.ok) {
+					if (result.code === ChannelErrorCode.ASSET_PROVIDER_REFUSED) {
+						providerRefused = true;
+					}
+					// Asset channels: the settle of a hold is the host's
+					// decision whether or not the fulfil can leave now (a peer
+					// that is away, a provider that refuses for the moment).
+					// It is written down for the HTLC, and a claim on the
+					// chain is made by it should the channel close before the
+					// fulfil is made. A fulfil that leaves writes its own.
+					this.channelManager.recordAuxiliaryHtlcDecision(
+						h.channelId,
+						h.htlcId,
+						'settle',
+						pre
+					);
 					refused.push(h);
 					continue;
 				}
@@ -23041,13 +24102,42 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		} finally {
 			this.resolvingHeldHtlcs.delete(hashHex);
 		}
+		// A decision written for a channel on chain: its monitor is told now
+		// that a claim can be made.
+		if (takenOnChain > 0) this.channelManager.recordPreimage(paymentHash, pre);
 		// Nothing reached the payer (a channel awaiting reestablish refuses every
 		// fulfil, for one). Report the refusal and leave the set parked rather
 		// than closing the invoice SETTLED over HTLCs the payer still holds. The
 		// preimage stays recorded: the monitors need it to claim on-chain if the
 		// channel closes before a retry lands.
 		if (refused.length === held.length) {
-			if (!prior) {
+			// Asset channels: a settle the asset provider refused stays
+			// chosen. The preimage is stored and the channel owes the
+			// fulfil, which the node asks for again from its periodic work
+			// and at each block, so the set is not open to a cancel.
+			// On chain the answer and the record are the same thing. Every
+			// part had its settle taken: the answer is yes, and the set
+			// stays parked, bound to its settle, until the chain has ended
+			// it (endAssetHoldsEndedOnChain).
+			if (takenOnChain === held.length) {
+				this.emitStructuredLog('htlc', 'held_settle_taken_on_chain', {
+					paymentHash: hashHex,
+					htlcCount: held.length
+				});
+				return true;
+			}
+			// A set paid in units stays bound to its settle exactly when a
+			// decision to settle is written for one of its HTLCs: a refusal
+			// that wrote none (an HTLC past its expiry, a channel on chain
+			// inside the cancel margin) leaves the set open to a cancel.
+			const decided =
+				carriesUnits &&
+				held.some(
+					(h) =>
+						this.channelManager.auxiliaryHtlcDecision(h.channelId, h.htlcId)
+							?.outcome === 'settle'
+				);
+			if (!prior && !providerRefused && !decided) {
 				this.heldResolutions.delete(hashHex);
 				this.persistHeldHtlcs();
 			}
@@ -23058,7 +24148,8 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			return false;
 		}
 		const settledSet = this.advanceHeldResolution(hashHex, held, refused, {
-			outcome: 'settle'
+			outcome: 'settle',
+			...(carriesUnits ? { auxiliary: true as const } : {})
 		});
 		if (!settledSet) return false;
 		const settledMsat = settledSet.reduce((sum, h) => sum + h.amountMsat, 0n);
@@ -23066,6 +24157,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		const payment = this.payments.get(hashHex);
 		if (payment) {
 			payment.status = PaymentStatus.COMPLETED;
+			delete payment.unresolved;
 			payment.preimage = pre;
 			payment.completedAt = Date.now();
 			payment.settledHtlcs = held.map(
@@ -23074,6 +24166,19 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			// 0n is an any-amount invoice that had no payment until now.
 			if (payment.amountMsat === 0n) payment.amountMsat = settledMsat;
 			recordReceivedMsat(payment, settledMsat);
+			if (carriesUnits) {
+				// Asset channels: the records of what asset HTLCs paid say so.
+				payment.auxiliary = true;
+				const invoice = this.invoices.get(hashHex);
+				if (invoice && invoice.auxiliary !== true) {
+					invoice.auxiliary = true;
+					this.commitMutations(
+						'markAuxiliaryInvoice',
+						[{ type: 'invoice_state', paymentHash: hashHex, invoice }],
+						RecoveryCriticality.Important
+					);
+				}
+			}
 			this.safeStorage(
 				() => this.persistPayment(paymentHash),
 				'persistPayment'
@@ -23090,7 +24195,8 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			state: 'SETTLED',
 			heldAmountMsat: settledMsat,
 			htlcCount: settledSet.length,
-			...this.heldSetExpiry(hashHex, settledSet)
+			...this.heldSetExpiry(hashHex, settledSet),
+			...(carriesUnits ? { auxiliary: true as const } : {})
 		};
 		this.emitHoldInvoiceEvent({ name: 'hold:settled', event });
 		return true;
@@ -23112,9 +24218,10 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			cltvExpiry: number;
 		}>,
 		refused: typeof held,
-		chosen:
+		chosen: (
 			| { outcome: 'settle' }
 			| { outcome: 'cancel'; failureCode: number; reason: HoldCancelReason }
+		) & { auxiliary?: true }
 	): Array<{ amountMsat: bigint; cltvExpiry: number }> | null {
 		const resolved = [
 			...(this.heldResolutions.get(hashHex)?.resolved ?? []),
@@ -23150,6 +24257,25 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			if (channelId && !held.some((h) => h.channelId.equals(channelId))) {
 				continue;
 			}
+			// Parts that carry units keep their settle or cancel bound. While
+			// each of their channels waits for its peer, is on chain or is
+			// gone, a new block has nothing to drive again: the reestablish
+			// drives it, by its channel, and the chain ends what is on chain.
+			if (
+				!channelId &&
+				held.length > 0 &&
+				held.every((h) => {
+					if (h.auxiliary !== true) return false;
+					const channel = this.channelManager.getChannel(h.channelId);
+					return (
+						!channel ||
+						channel.getState() === ChannelState.AWAITING_REESTABLISH ||
+						this.channelManager.auxiliaryChannelOnChain(h.channelId)
+					);
+				})
+			) {
+				continue;
+			}
 			const paymentHash = Buffer.from(hashHex, 'hex');
 			// Contained: on reestablish a throw would skip the commitment that
 			// carries this retry's own fulfil or fail.
@@ -23177,7 +24303,8 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		this.emit('invoice:settled', {
 			paymentHash,
 			bolt11: invoice.bolt11,
-			amountMsat: payment.amountMsat
+			amountMsat: payment.amountMsat,
+			...(payment.auxiliary === true ? { auxiliary: true as const } : {})
 		});
 		this.emitStructuredLog('payment', 'invoice_settled', {
 			paymentHash: paymentHash.toString('hex'),
@@ -23194,7 +24321,9 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	 * failure code and reason, on reestablish and on every block; true only
 	 * once every part was failed back. A cancel refused for every part is
 	 * retried only with `bindWhenRefused`; otherwise nothing reached the
-	 * payer and the caller may still settle instead.
+	 * payer and the caller may still settle instead. On an asset channel, a
+	 * part the asset provider refused binds the cancel all the same: the
+	 * node asks again from its periodic work and at each block.
 	 */
 	cancelHeldHtlc(
 		paymentHash: Buffer,
@@ -23218,17 +24347,41 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 
 		this.resolvingHeldHtlcs.add(hashHex);
 		const refused: typeof held = [];
+		let providerRefused = false;
+		// Asset channels: read before a fail leaves, as the settle reads it.
+		const carriesUnits =
+			chosen?.auxiliary === true || this.heldSetCarriesUnits(held);
 		try {
 			// Bound before the first fail leaves, as in settleHeldHtlc.
 			this.heldResolutions.set(hashHex, {
 				outcome: 'cancel',
 				failureCode,
 				reason: cancelReason,
-				resolved: chosen?.resolved ?? []
+				resolved: chosen?.resolved ?? [],
+				...(carriesUnits ? { auxiliary: true as const } : {})
 			});
 			this.persistHeldHtlcs();
 			for (const h of held) {
 				const key = `${h.channelId.toString('hex')}:${h.htlcId}`;
+				// Asset channels: a channel that is on chain takes no fail
+				// back. The decision is written down for the HTLC, by which it
+				// is never claimed, and the part ends here; the payer takes
+				// its output back on the chain at the expiry. A part whose
+				// settle stands is not cancelled.
+				if (this.channelManager.auxiliaryChannelOnChain(h.channelId)) {
+					if (
+						!this.channelManager.recordAuxiliaryHtlcDecision(
+							h.channelId,
+							h.htlcId,
+							'fail'
+						)
+					) {
+						refused.push(h);
+						continue;
+					}
+					this.cleanupHtlcSharedSecret(key);
+					continue;
+				}
 				const ss = this.receivedHtlcSharedSecrets.get(key);
 				// This path defaults to incorrect_or_unknown_payment_details, and the
 				// CLTV sweeper cancels through it with that default, so it needs the
@@ -23242,7 +24395,15 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 								: undefined
 					  )
 					: Buffer.alloc(FAILURE_MESSAGE_LENGTH);
-				if (!this.channelManager.failHtlc(h.channelId, h.htlcId, reason).ok) {
+				const result = this.channelManager.failHtlc(
+					h.channelId,
+					h.htlcId,
+					reason
+				);
+				if (!result.ok) {
+					if (result.code === ChannelErrorCode.ASSET_PROVIDER_REFUSED) {
+						providerRefused = true;
+					}
 					refused.push(h);
 					continue;
 				}
@@ -23258,7 +24419,9 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		// fail, for one). Report the refusal and leave the set parked rather than
 		// closing the invoice CANCELLED over HTLCs the payer still holds.
 		if (refused.length === held.length) {
-			if (!chosen && !bindWhenRefused) {
+			// Asset channels: a cancel the asset provider refused stays
+			// chosen, as a settle does, and is asked for again.
+			if (!chosen && !bindWhenRefused && !providerRefused) {
 				this.heldResolutions.delete(hashHex);
 				this.persistHeldHtlcs();
 			}
@@ -23272,7 +24435,8 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		const failedSet = this.advanceHeldResolution(hashHex, held, refused, {
 			outcome: 'cancel',
 			failureCode,
-			reason: cancelReason
+			reason: cancelReason,
+			...(carriesUnits ? { auxiliary: true as const } : {})
 		});
 		if (!failedSet) return false;
 
@@ -23281,7 +24445,8 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			cancelReason,
 			failedSet.length,
 			failedSet.reduce((sum, h) => sum + h.amountMsat, 0n),
-			failedSet
+			failedSet,
+			carriesUnits
 		);
 		this.emitStructuredLog('htlc', 'held_cancelled', {
 			paymentHash: hashHex,
@@ -23300,7 +24465,8 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		reason: HoldCancelReason,
 		htlcsFailed: number,
 		heldAmountMsat: bigint,
-		failedSet: ReadonlyArray<{ cltvExpiry: number }> = []
+		failedSet: ReadonlyArray<{ cltvExpiry: number }> = [],
+		carriesUnits = false
 	): void {
 		// Read before the invoice's delta record is touched: the event names
 		// the set the cancel acted on, expiry included.
@@ -23324,7 +24490,10 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		if (
 			payment &&
 			payment.direction === PaymentDirection.INCOMING &&
-			payment.status !== PaymentStatus.COMPLETED
+			payment.status !== PaymentStatus.COMPLETED &&
+			// Unresolved stays unresolved: a capsule can be older than a
+			// settle, so the HTLC on the channel left out may have paid.
+			!payment.unresolved
 		) {
 			payment.status = PaymentStatus.FAILED;
 			const paymentMutation = this.paymentMutation(Buffer.from(hashHex, 'hex'));
@@ -23345,7 +24514,8 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			reason,
 			htlcsFailed,
 			heldAmountMsat,
-			...expiry
+			...expiry,
+			...(carriesUnits ? { auxiliary: true as const } : {})
 		};
 		this.emitHoldInvoiceEvent({ name: 'hold:cancelled', event });
 	}
@@ -23439,6 +24609,11 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		earliestExpiry: number | null;
 		cancelMarginBlocks: number;
 		cancelHeight: number | null;
+		/**
+		 * Asset channels: true while a parked part of the set is an HTLC
+		 * that holds units and after such a set settled; absent otherwise.
+		 */
+		auxiliary?: true;
 	}> {
 		const out: ReturnType<LightningNode['listHoldInvoices']> = [];
 		for (const [hashHex, invoice] of this.invoices) {
@@ -23461,10 +24636,153 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				minFinalCltvExpiry: this.minFinalCltvExpiryFor(hashHex),
 				earliestExpiry: snapshot?.earliestExpiry ?? null,
 				cancelMarginBlocks: HELD_HTLC_EXPIRY_MARGIN,
-				cancelHeight: snapshot?.cancelHeight ?? null
+				cancelHeight: snapshot?.cancelHeight ?? null,
+				...(invoice.auxiliary === true || this.heldSetCarriesUnits(held)
+					? { auxiliary: true as const }
+					: {})
 			});
 		}
 		return out;
+	}
+
+	/**
+	 * Asset channels, at each block: nothing of a held asset HTLC stays
+	 * parked for ever.
+	 *
+	 * A settle the asset provider refused stays chosen (settleHeldHtlc) and
+	 * is not made once the HTLC has expired. When an HTLC of such a set
+	 * comes within HELD_HTLC_EXPIRY_MARGIN blocks of its expiry and none was
+	 * settled, the settle is given up and the set is cancelled, at the
+	 * height a hold nobody chose an outcome for is cancelled at: the payer
+	 * is failed back in time and has no reason to go to chain. No HTLC took
+	 * the settle, so the preimage was never sent, and it is forgotten
+	 * before the cancel (forgetPreimageNeverSent): a cancelled hold invoice
+	 * is never settled. The HTLC is failed back, the invoice ends cancelled
+	 * and its payment FAILED, and the host hears of the HTLC through
+	 * onHtlcResolved when it has left the channel. A fail back that is
+	 * refused stays chosen in its turn and is asked for again. A set with
+	 * an HTLC whose channel is on chain keeps its settle: the claim on
+	 * chain may already carry the preimage.
+	 *
+	 * A parked asset HTLC that is no longer in its channel (the chain or
+	 * the peer took it, or the channel is gone) is taken out of its set,
+	 * and a set emptied that way ends cancelled unless the HTLC was
+	 * fulfilled. Until then the HTLC of a channel that is on chain is the
+	 * on-chain resolver's.
+	 *
+	 * Only sets whose every HTLC carries asset units, or is parked on an
+	 * asset channel, are looked at.
+	 */
+	private resolveAssetHoldsLeftBehind(height: number): void {
+		for (const [hashHex, held] of [...this.heldHtlcs]) {
+			if (held.length === 0 || this.resolvingHeldHtlcs.has(hashHex)) continue;
+			const paymentHash = Buffer.from(hashHex, 'hex');
+			const parts = held.map((h) => {
+				const state = this.channelManager
+					.getChannel(h.channelId)
+					?.getFullState();
+				const entry = state?.htlcs.get(`received-${h.htlcId}`);
+				const same =
+					entry !== undefined && entry.paymentHash.equals(paymentHash);
+				return {
+					h,
+					asset: h.auxiliary === true || state?.auxiliaryState !== undefined,
+					fulfilled: same && entry.state === HtlcState.FULFILLED,
+					present:
+						same &&
+						entry.state !== HtlcState.FULFILLED &&
+						entry.state !== HtlcState.FAILED
+				};
+			});
+			if (!parts.every((part) => part.asset)) continue;
+			const resolution = this.heldResolutions.get(hashHex);
+			const remaining = parts
+				.filter((part) => part.present)
+				.map((part) => part.h);
+			if (remaining.length < held.length) {
+				const gone = held.filter((h) => !remaining.includes(h));
+				this.emitStructuredLog('htlc', 'held_asset_htlc_left_channel', {
+					paymentHash: hashHex,
+					gone: gone.length,
+					remaining: remaining.length
+				});
+				if (remaining.length > 0) {
+					this.heldHtlcs.set(hashHex, remaining);
+					this.persistHeldHtlcs();
+				} else {
+					this.heldHtlcs.delete(hashHex);
+					this.heldResolutions.delete(hashHex);
+					this.heldInvoiceHashes.delete(hashHex);
+					this.persistHeldHtlcs();
+					const paid =
+						parts.some((part) => part.fulfilled) ||
+						(resolution?.outcome === 'settle' &&
+							resolution.resolved.length > 0) ||
+						this.payments.get(hashHex)?.status === PaymentStatus.COMPLETED;
+					if (!paid) {
+						this.markHoldInvoiceCancelled(
+							hashHex,
+							'expiry-scan',
+							gone.length,
+							gone.reduce((sum, h) => sum + h.amountMsat, 0n),
+							gone
+						);
+					}
+					continue;
+				}
+			}
+			if (
+				resolution?.outcome === 'settle' &&
+				resolution.resolved.length === 0 &&
+				remaining.some(
+					(h) =>
+						h.cltvExpiry > 0 && h.cltvExpiry - height <= HELD_HTLC_EXPIRY_MARGIN
+				) &&
+				this.forgetPreimageNeverSent(paymentHash, remaining)
+			) {
+				this.heldResolutions.delete(hashHex);
+				this.emitStructuredLog('htlc', 'held_asset_settle_given_up', {
+					paymentHash: hashHex,
+					height
+				});
+				this.cancelHeldHtlc(
+					paymentHash,
+					INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS,
+					'expiry-scan',
+					true
+				);
+			}
+		}
+	}
+
+	/**
+	 * The preimage of a hold settle that is given up before any HTLC took it
+	 * is forgotten everywhere it was put when the settle was asked for: its
+	 * stored row, this node's copy and the channel manager's, from which a
+	 * channel that goes to chain claims its received HTLCs. No later HTLC
+	 * of the hash, in a channel or on chain, is then claimed with it. False,
+	 * with nothing forgotten, when a claim on chain may already carry it or
+	 * its row could not be deleted: the settle then stays chosen.
+	 */
+	private forgetPreimageNeverSent(
+		paymentHash: Buffer,
+		held: ReadonlyArray<{ channelId: Buffer; htlcId: bigint }>
+	): boolean {
+		const hashHex = paymentHash.toString('hex');
+		const preimage = this.preimages.get(hashHex);
+		if (!this.channelManager.forgetPreimage(paymentHash, held)) return false;
+		if (
+			!this.commitMutations(
+				'forget the preimage of a hold settle given up',
+				[{ type: 'delete_preimage', paymentHash: hashHex }],
+				RecoveryCriticality.SafetyCritical
+			)
+		) {
+			if (preimage) this.channelManager.recordPreimage(paymentHash, preimage);
+			return false;
+		}
+		this.preimages.delete(hashHex);
+		return true;
 	}
 
 	/**
@@ -23474,11 +24792,23 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	 */
 	private scanExpiringHeldHtlcs(height: number): void {
 		if (height <= 0) return;
+
+		this.endAssetHoldsEndedOnChain();
+		this.failAssetPaymentsEndedOnChain();
+		this.noteAssetClaimsPastExpiry();
+		this.failAssetReceiptsLostOnChain();
+
+		this.resolveAssetHoldsLeftBehind(height);
 		// A set with an outcome already chosen retries that outcome instead:
 		// the expiry cancel would fail back parts whose preimage is out.
 		this.retryHeldResolutions();
 		for (const [hashHex, held] of this.heldHtlcs) {
 			if (this.heldResolutions.has(hashHex)) continue;
+			// Asset channels: a hold whose channel is on chain follows the
+			// same clock. At the margin the node ends it itself: the decision
+			// not to claim its HTLC is written down and the invoice ends
+			// cancelled (cancelHeldHtlc), so a settle can no longer be asked
+			// for when a claim could not be in a block in time.
 			const soon = held.some(
 				(h) =>
 					h.cltvExpiry > 0 && h.cltvExpiry - height <= HELD_HTLC_EXPIRY_MARGIN
@@ -23509,6 +24839,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				failureCode?: number;
 				reason?: HoldCancelReason;
 				resolved: Array<{ amountMsat: string; cltvExpiry: number }>;
+				auxiliary?: true;
 			};
 		}> = [];
 		for (const [hashHex, held] of this.heldHtlcs) {
@@ -23519,7 +24850,8 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 					channelId: h.channelId.toString('hex'),
 					htlcId: h.htlcId.toString(),
 					amountMsat: h.amountMsat.toString(),
-					cltvExpiry: h.cltvExpiry
+					cltvExpiry: h.cltvExpiry,
+					...(h.auxiliary === true ? { auxiliary: true as const } : {})
 				})),
 				...(r && {
 					resolution: {
@@ -23543,19 +24875,18 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		paymentHash: Buffer;
 		amountMsat: bigint;
 		htlcCount: number;
+		/** Asset channels: true when a parked part holds units. */
+		auxiliary?: true;
 	}> {
-		const out: Array<{
-			paymentHash: Buffer;
-			amountMsat: bigint;
-			htlcCount: number;
-		}> = [];
+		const out: ReturnType<LightningNode['listHeldHtlcs']> = [];
 		for (const [hashHex, held] of this.heldHtlcs) {
 			let total = 0n;
 			for (const h of held) total += h.amountMsat;
 			out.push({
 				paymentHash: Buffer.from(hashHex, 'hex'),
 				amountMsat: total,
-				htlcCount: held.length
+				htlcCount: held.length,
+				...(this.heldSetCarriesUnits(held) ? { auxiliary: true as const } : {})
 			});
 		}
 		return out;
@@ -23680,6 +25011,16 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	/** The feature set this node advertises in init and node_announcement. */
 	getLocalFeatures(): FeatureFlags {
 		return this.localFeatures;
+	}
+
+	/**
+	 * Whether this node advertises asset channels (the taproot overlay with
+	 * everything it depends on), and why not when it does not: no provider
+	 * is configured, or the configured feature set lacks something a peer
+	 * requires beside the overlay.
+	 */
+	getAuxiliaryAdvertisement(): IAuxiliaryAdvertisement {
+		return { ...this.auxiliaryAdvertisement };
 	}
 
 	/** The LSP-side service (registrations, admission, metrics). */
@@ -23873,6 +25214,8 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			if (!channelId) continue;
 			if (this.channelManager.getPeerForChannel(channelId) !== peerHex)
 				continue;
+			// A held payment is not delivered over an asset channel.
+			if (channel.getFullState().auxiliaryState) continue;
 			const scid = this.getPeerAddressableScid(channel.getFullState());
 			if (scid) return scid;
 		}
@@ -25137,6 +26480,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			const payment = this.payments.get(hashHex);
 			if (payment) {
 				payment.status = PaymentStatus.COMPLETED;
+				delete payment.unresolved;
 				payment.completedAt = Date.now();
 				payment.settledHtlcs = pending.receivedParts.map(
 					(p) => `${p.channelId.toString('hex')}:${p.htlcId}`
@@ -25291,6 +26635,22 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		declaredMsat: bigint,
 		htlcMsat: bigint
 	): void {
+		// An asset channel's provider can refuse the settlement: there the
+		// invoice is paid only once the channel has taken the fulfil.
+		if (
+			this.channelManager.getChannel(channelId)?.getFullState()
+				.auxiliaryState !== undefined
+		) {
+			this.settleAuxiliaryPayment(
+				channelId,
+				htlcId,
+				paymentHash,
+				preimage,
+				declaredMsat,
+				htlcMsat
+			);
+			return;
+		}
 		const hashHex = paymentHash.toString('hex');
 		// Clean up shared secret on fulfillment
 		this.cleanupHtlcSharedSecret(`${channelId.toString('hex')}:${htlcId}`);
@@ -25308,6 +26668,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		const payment = this.payments.get(hashHex);
 		if (payment) {
 			payment.status = PaymentStatus.COMPLETED;
+			delete payment.unresolved;
 			payment.completedAt = Date.now();
 			payment.settledHtlcs = [`${channelId.toString('hex')}:${htlcId}`];
 			if (payment.amountMsat === 0n) payment.amountMsat = declaredMsat;
@@ -25358,6 +26719,432 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				status: payment.status
 			});
 		}
+	}
+
+	/**
+	 * Asset channels: invoice settlements the provider refused, by
+	 * `<channel id hex>:<HTLC id>`, each as the call that makes it again.
+	 */
+	private readonly auxiliarySettlementsOwed = new Map<
+		string,
+		() => ChannelResult
+	>();
+
+	/**
+	 * fulfillPayment for an HTLC of an asset channel. The provider is asked
+	 * before the channel takes a settlement and can refuse it, so the order
+	 * of an ordinary channel (record the payment as received, then fulfil)
+	 * would report an invoice paid whose units this node does not hold.
+	 * Here the invoice is COMPLETED and payment:received emitted only once
+	 * fulfillHtlc has returned ok. The completed record still commits with
+	 * the fulfil, in one transition, as for an ordinary channel.
+	 *
+	 * A refusal writes nothing: the payment stays PENDING, the HTLC stays
+	 * committed, and the settlement is owed. It is made again from the
+	 * node's periodic work and on each block (retryAuxiliaryOwed), and by
+	 * the replay of the HTLC after a reconnect or a restart, until the
+	 * channel takes it or the HTLC expires.
+	 */
+	private settleAuxiliaryPayment(
+		channelId: Buffer,
+		htlcId: bigint,
+		paymentHash: Buffer,
+		preimage: Buffer,
+		declaredMsat: bigint,
+		htlcMsat: bigint
+	): ChannelResult {
+		const hashHex = paymentHash.toString('hex');
+		const key = `${channelId.toString('hex')}:${htlcId}`;
+		// The chain monitors learn the preimage whatever the provider says.
+		this.channelManager.recordPreimage(paymentHash, preimage);
+		const payment = this.payments.get(hashHex);
+		// An HTLC that holds units marks the records it pays; a plain
+		// bitcoin HTLC an asset channel took from its peer does not.
+		const carriesUnits =
+			this.channelManager
+				.getChannel(channelId)
+				?.getFullState()
+				.htlcs.get(`received-${htlcId}`)?.auxiliaryAmount !== undefined;
+		const completed: IPaymentInfo | undefined = payment
+			? {
+					...payment,
+					status: PaymentStatus.COMPLETED,
+					completedAt: Date.now(),
+					settledHtlcs: [key],
+					...(carriesUnits ? { auxiliary: true as const } : {})
+			  }
+			: undefined;
+		if (completed) {
+			if (completed.amountMsat === 0n) completed.amountMsat = declaredMsat;
+			recordReceivedMsat(completed, htlcMsat);
+		}
+		const invoice = this.invoices.get(hashHex);
+		const markedInvoice: IInvoiceInfo | undefined =
+			carriesUnits && invoice && invoice.auxiliary !== true
+				? { ...invoice, auxiliary: true }
+				: undefined;
+		const staged: RecoveryMutation[] = [
+			...(markedInvoice
+				? [
+						{
+							type: 'invoice_state' as const,
+							paymentHash: hashHex,
+							invoice: markedInvoice
+						}
+				  ]
+				: []),
+			{ type: 'delete_payment_secret', paymentHash: hashHex },
+			...(completed
+				? [
+						{
+							type: 'payment_state' as const,
+							paymentHash: hashHex,
+							payment: completed
+						}
+				  ]
+				: [])
+		];
+		let result: ChannelResult | undefined;
+		if (this.recovery) this.stagedMutations.push(...staged);
+		try {
+			result = this.channelManager.fulfillHtlc(channelId, htlcId, preimage);
+		} finally {
+			if (this.recovery) {
+				if (!result?.ok) {
+					// Nothing of a settlement that was not made is written.
+					for (const mutation of staged) {
+						const at = this.stagedMutations.indexOf(mutation);
+						if (at !== -1) this.stagedMutations.splice(at, 1);
+					}
+				}
+				this.flushStagedMutations();
+			}
+		}
+		if (!result.ok) {
+			this.auxiliarySettlementsOwed.set(key, () =>
+				this.settleAuxiliaryPayment(
+					channelId,
+					htlcId,
+					paymentHash,
+					preimage,
+					declaredMsat,
+					htlcMsat
+				)
+			);
+			this.emitStructuredLog('payment', 'asset_settlement_refused', {
+				paymentHash: hashHex,
+				channelId: channelId.toString('hex'),
+				htlcId: htlcId.toString(),
+				reason: result.error ?? 'refused'
+			});
+			return result;
+		}
+		this.auxiliarySettlementsOwed.delete(key);
+		this.cleanupHtlcSharedSecret(key);
+		this.clearJitSkim(hashHex);
+		this.paymentSecrets.delete(hashHex);
+		if (payment && completed) {
+			Object.assign(payment, completed);
+			// Settled by an HTLC this wallet holds: no longer unresolved.
+			delete payment.unresolved;
+		}
+		if (invoice && markedInvoice) invoice.auxiliary = true;
+		if (this.storage) {
+			try {
+				this.persistChannel(channelId);
+			} catch {
+				/* best-effort */
+			}
+		}
+		if (payment) {
+			this.emit('payment:received', payment);
+			this.emitInvoiceSettled(paymentHash, payment);
+			this.emitStructuredLog('payment', 'received', {
+				paymentHash: hashHex,
+				amountMsat: Number(payment.amountMsat),
+				status: payment.status
+			});
+		}
+		return result;
+	}
+
+	/**
+	 * Asset channels: take up again what a refusal of the provider left
+	 * owed (see ChannelManager.retryAuxiliaryOwed). A node without a
+	 * provider returns at the first line.
+	 */
+	private retryAuxiliaryOwed(): void {
+		if (!this.auxiliaryChannels) return;
+		try {
+			this.channelManager.retryAuxiliaryOwed((channelId, htlcId, kind) => {
+				// A held HTLC is settled or cancelled as its set, by the hold
+				// logic, so that the invoice and its records follow the outcome.
+				const heldHash = this.heldHashOf(channelId, htlcId);
+				if (heldHash !== undefined) {
+					const paymentHash = Buffer.from(heldHash, 'hex');
+					let done = false;
+					try {
+						done =
+							kind === 'fail'
+								? this.cancelHeldHtlc(paymentHash)
+								: this.settleHeldHtlc(paymentHash);
+					} catch {
+						// Nothing was done: it stays owed.
+					}
+					return {
+						ok: done,
+						actions: [],
+						...(done ? {} : { error: 'The held HTLC is still owed' })
+					};
+				}
+				return kind === 'fulfill'
+					? this.auxiliarySettlementsOwed.get(
+							`${channelId.toString('hex')}:${htlcId}`
+					  )?.()
+					: undefined;
+			});
+		} catch (err) {
+			this.emit('node:error', {
+				code: 'CHANNEL_ERROR',
+				message: `Asset channel retry failed: ${
+					err instanceof Error ? err.message : String(err)
+				}`,
+				timestamp: Date.now()
+			});
+		}
+		// A settlement whose HTLC the channel no longer owes is forgotten.
+		for (const key of [...this.auxiliarySettlementsOwed.keys()]) {
+			const [channelHex, id] = key.split(':');
+			if (
+				!this.channelManager.owesAuxiliaryRemoval(
+					Buffer.from(channelHex, 'hex'),
+					BigInt(id)
+				)
+			) {
+				this.auxiliarySettlementsOwed.delete(key);
+			}
+		}
+	}
+
+	/**
+	 * Asset channels, when the node is restored and before it takes new
+	 * work. An outgoing asset payment is recorded, with the HTLC id it was
+	 * prepared for, before its HTLC enters the channel. A stop between the
+	 * two leaves a PENDING record for an HTLC that never existed, under an
+	 * id the channel gives to its next HTLC. Such a part is in neither the
+	 * channel's HTLCs nor the outcomes the channel keeps, and the channel
+	 * has not handed its id out. It is taken off the record with its HTLC
+	 * mapping, a payment left with no HTLC in a channel ends FAILED in the
+	 * same write, and the host is told through onHtlcResolved with the
+	 * outcome 'never-sent', again at every restore until the callback has
+	 * returned.
+	 *
+	 * A part whose id the channel has handed out is left alone: it entered
+	 * the channel, and what became of it was reported as its outcome. An
+	 * ordinary payment is not looked at.
+	 */
+	private endAuxiliaryPaymentsNeverSent(): void {
+		if (!this.auxiliaryChannels) return;
+		for (const [hashHex, payment] of [...this.payments]) {
+			if (
+				payment.direction !== PaymentDirection.OUTGOING ||
+				(payment.auxiliary !== true && !payment.metadata?._auxiliaryChannelId)
+			) {
+				continue;
+			}
+			const paymentHash = Buffer.from(hashHex, 'hex');
+			try {
+				if (payment.status === PaymentStatus.PENDING) {
+					this.dropAuxiliaryPartsNeverSent(paymentHash, payment);
+				}
+				this.reportAuxiliaryPartsNeverSent(paymentHash, payment);
+			} catch (err) {
+				this.emitStructuredLog('payment', 'asset_never_sent_pass_failed', {
+					paymentHash: hashHex,
+					error: err instanceof Error ? err.message : String(err)
+				});
+			}
+		}
+	}
+
+	/** The first half of endAuxiliaryPaymentsNeverSent, for one PENDING record. */
+	private dropAuxiliaryPartsNeverSent(
+		paymentHash: Buffer,
+		payment: IPaymentInfo
+	): void {
+		const hashHex = paymentHash.toString('hex');
+		const neverSent: Record<string, string> = {};
+		const kept: Record<string, string> = {};
+		let live = false;
+		for (const [key, amount] of Object.entries(
+			this.auxiliaryPartAmounts(payment)
+		)) {
+			const [channelHex, htlcKey] = key.split(':');
+			const id = BigInt(htlcKey.slice('offered-'.length));
+			const state = this.channelManager
+				.getChannel(Buffer.from(channelHex, 'hex'))
+				?.getFullState();
+			const entry = state?.htlcs.get(htlcKey);
+			const inChannel =
+				entry !== undefined && entry.paymentHash.equals(paymentHash);
+			const outcome = state?.auxiliaryState?.resolvedHtlcs?.get(
+				`${HtlcDirection.OFFERED}:${id}`
+			);
+			const reported =
+				outcome !== undefined && outcome.paymentHash.equals(paymentHash);
+			if (
+				state?.auxiliaryState &&
+				!inChannel &&
+				!reported &&
+				state.localHtlcCounter <= id
+			) {
+				neverSent[key] = amount;
+				continue;
+			}
+			kept[key] = amount;
+			if (
+				inChannel &&
+				entry.state !== HtlcState.FULFILLED &&
+				entry.state !== HtlcState.FAILED
+			) {
+				live = true;
+			}
+		}
+		const dropped = Object.keys(neverSent);
+		if (dropped.length === 0) return;
+		const metadata: Record<string, string> = { ...payment.metadata };
+		if (Object.keys(kept).length > 0) {
+			metadata._auxiliaryPartAmounts = JSON.stringify(kept);
+		} else {
+			delete metadata._auxiliaryPartAmounts;
+		}
+		if (this.auxiliaryChannels?.onHtlcResolved) {
+			// Kept beside the payment until the host has been told.
+			metadata._auxiliaryNeverSent = JSON.stringify({
+				...this.auxiliaryNeverSentParts(payment),
+				...neverSent
+			});
+		}
+		payment.metadata = metadata;
+		const mutations: RecoveryMutation[] = [];
+		for (const key of dropped) {
+			if (this.htlcPaymentMap.get(key) !== hashHex) continue;
+			this.htlcPaymentMap.delete(key);
+			mutations.push({ type: 'delete_htlc_payment_mapping', htlcKey: key });
+		}
+		if (!live) {
+			payment.status = PaymentStatus.FAILED;
+			payment.completedAt = Date.now();
+			payment.failureReason = boundedFailureReason(
+				'The asset payment was recorded and never sent: its HTLC did not enter the channel'
+			);
+		}
+		mutations.push({ type: 'payment_state', paymentHash: hashHex, payment });
+		this.commitMutations(
+			'end an asset payment that never left',
+			mutations,
+			RecoveryCriticality.SafetyCritical
+		);
+		this.emitStructuredLog('payment', 'asset_payment_never_sent', {
+			paymentHash: hashHex,
+			parts: dropped.join(','),
+			status: payment.status
+		});
+		if (!live) {
+			// Nobody listens while the node is being built: the event is for
+			// whoever subscribes as soon as it is.
+			setImmediate(() => {
+				if (!this._destroyed) this.emit('payment:failed', payment);
+			});
+		}
+	}
+
+	/** The second half: tell the host of the parts it has not been told of. */
+	private reportAuxiliaryPartsNeverSent(
+		paymentHash: Buffer,
+		payment: IPaymentInfo
+	): void {
+		const callback = this.auxiliaryChannels?.onHtlcResolved;
+		if (!callback || !payment.metadata?._auxiliaryNeverSent) return;
+		const owed = this.auxiliaryNeverSentParts(payment);
+		let told = 0;
+		for (const key of Object.keys(owed)) {
+			const [channelHex, htlcKey] = key.split(':');
+			const channelId = Buffer.from(channelHex, 'hex');
+			const state = this.channelManager.getChannel(channelId)?.getFullState();
+			const peerPubkey = this.channelManager.getPeerForChannel(channelId);
+			if (!state || !peerPubkey) continue;
+			try {
+				callback({
+					htlcId: BigInt(htlcKey.slice('offered-'.length)),
+					direction: HtlcDirection.OFFERED,
+					paymentHash: Buffer.from(paymentHash),
+					auxiliaryAmount: 0n,
+					outcome: 'never-sent',
+					state,
+					peerPubkey,
+					channelId
+				});
+			} catch (err) {
+				this.emit('node:error', {
+					code: 'CHANNEL_ERROR',
+					message: `Asset resolution callback failed for a payment that never left (channel ${channelHex}): ${
+						err instanceof Error ? err.message : String(err)
+					}`,
+					timestamp: Date.now()
+				});
+				continue;
+			}
+			delete owed[key];
+			told++;
+		}
+		if (told === 0) return;
+		const metadata: Record<string, string> = { ...payment.metadata };
+		if (Object.keys(owed).length > 0) {
+			metadata._auxiliaryNeverSent = JSON.stringify(owed);
+		} else {
+			delete metadata._auxiliaryNeverSent;
+		}
+		payment.metadata = metadata;
+		this.persistPayment(paymentHash);
+	}
+
+	/** The parts of a payment that never left and the host has not been told of. */
+	private auxiliaryNeverSentParts(
+		payment: IPaymentInfo
+	): Record<string, string> {
+		const raw = payment.metadata?._auxiliaryNeverSent;
+		const parts: Record<string, string> = {};
+		if (!raw) return parts;
+		try {
+			const parsed: unknown = JSON.parse(raw);
+			if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+				return parts;
+			}
+			for (const [key, value] of Object.entries(parsed)) {
+				if (
+					/^[0-9a-f]{64}:offered-(0|[1-9][0-9]*)$/.test(key) &&
+					typeof value === 'string'
+				) {
+					parts[key] = value;
+				}
+			}
+		} catch {
+			// Nothing readable is owed.
+		}
+		return parts;
+	}
+
+	/** The hash a received HTLC is held for, when it is a part of a held set. */
+	private heldHashOf(channelId: Buffer, htlcId: bigint): string | undefined {
+		for (const [hashHex, parts] of this.heldHtlcs) {
+			if (
+				parts.some((h) => h.htlcId === htlcId && h.channelId.equals(channelId))
+			) {
+				return hashHex;
+			}
+		}
+		return undefined;
 	}
 
 	private handleForwardHtlc(
@@ -26121,6 +27908,30 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		const outHtlcId = outChannel
 			? outChannel.getFullState().localHtlcCounter
 			: 0n;
+
+		// Asset channels. Nothing is forwarded out over an asset channel, and
+		// nothing that arrived on one is forwarded: a node with asset channels
+		// is only ever an endpoint of an asset payment. A node without a
+		// provider has no asset channel and takes none of this.
+		if (
+			outChannel?.getFullState().auxiliaryState ||
+			this.channelManager.getChannel(part.inChannelId)?.getFullState()
+				.auxiliaryState
+		) {
+			this.emitStructuredLog('htlc', 'asset_forward_declined', {
+				paymentHash: part.paymentHash.toString('hex'),
+				outChannelId: outChannelId.toString('hex'),
+				reason: 'nothing is forwarded over an asset channel'
+			});
+			if (
+				!part.failIncoming(TEMPORARY_CHANNEL_FAILURE) &&
+				refundOwner === 'engine'
+			) {
+				this.jitReceiveManager?.owedUpstreamFailure(part);
+			}
+			return 'refused';
+		}
+
 		const outKey = `${outChannelId.toString('hex')}:offered-${outHtlcId}`;
 		this.forwardedHtlcs.set(outKey, {
 			inChannelId: part.inChannelId,
@@ -26540,6 +28351,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				payment.status === PaymentStatus.FAILED)
 		) {
 			payment.status = PaymentStatus.COMPLETED;
+			delete payment.unresolved;
 			payment.preimage = preimage;
 			payment.completedAt = Date.now();
 			// Preserve invoice string for payment proof before deleting retry context
@@ -26641,6 +28453,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			payment.status === PaymentStatus.FAILED
 		) {
 			payment.status = PaymentStatus.COMPLETED;
+			delete payment.unresolved;
 			payment.preimage = preimage;
 			payment.completedAt = Date.now();
 			const retryCtx = this.paymentRetryContexts.get(hashHex);
@@ -27641,6 +29454,8 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		// exclusion set still serves manual re-sends.
 		if (
 			retryCtx &&
+			// An asset payment is never retried by the node.
+			!payment.metadata?._auxiliaryChannelId &&
 			!mppState &&
 			retryCtx.retryCount < maxRetries &&
 			(heightSkew ||
@@ -28116,7 +29931,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	} | null {
 		this.requireGraph('estimateRouteFee');
 		try {
-			const decoded = decodeInvoice(bolt11);
+			const decoded = this.decodeBolt11(bolt11);
 			// Same precedence sendPayment applies (see estimatePayment).
 			const amountMsat =
 				decoded.amountMsat ??
@@ -28171,7 +29986,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	): IPaymentEstimate | null {
 		this.requireGraph('estimatePayment');
 		try {
-			const decoded = decodeInvoice(bolt11);
+			const decoded = this.decodeBolt11(bolt11);
 			// The precedence sendPayment applies: a fixed invoice is paid for its
 			// ENCODED amount and the override serves an amountless one, so an
 			// estimate built on the override describes a payment that will never
@@ -28433,6 +30248,78 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		);
 	}
 
+	/**
+	 * A route for an asset payment: over the named asset channel first, and
+	 * from its peer on through the graph. Asset channels are left out of
+	 * every other route this node finds. `amountMsat` is what the payment is
+	 * worth at its destination and `maxFirstHopMsat` the most the first hop
+	 * may be asked to carry, fees included. Null when the channel is not an
+	 * asset channel that takes HTLCs, cannot keep an HTLC output of its own,
+	 * or no path is found.
+	 */
+	queryAuxiliaryRoute(
+		channelId: Buffer,
+		destination: Buffer,
+		amountMsat: bigint,
+		maxFirstHopMsat: bigint,
+		finalCltvExpiry: number = DEFAULT_MIN_FINAL_CLTV_EXPIRY,
+		routingHints?: IRoutingHintHop[][]
+	): IRoute | null {
+		this.requireGraph('queryAuxiliaryRoute');
+		const channel = this.channelManager.getChannel(channelId);
+		const state = channel?.getFullState();
+		const peer = this.channelManager.getPeerForChannel(channelId);
+		const scid = state?.shortChannelId ?? state?.scidAlias;
+		if (
+			!channel ||
+			!channel.acceptsNewHtlcs() ||
+			!state?.auxiliaryState ||
+			!peer ||
+			!scid
+		) {
+			return null;
+		}
+		if (
+			typeof amountMsat !== 'bigint' ||
+			typeof maxFirstHopMsat !== 'bigint' ||
+			amountMsat <= 0n ||
+			maxFirstHopMsat < amountMsat ||
+			maxFirstHopMsat > U64_MAX
+		) {
+			throw new AuxiliaryPaymentError(
+				'ASSET_PAYMENT_INVALID',
+				channelId,
+				'Invalid quoted route amount'
+			);
+		}
+		const dust =
+			state.localConfig.dustLimitSatoshis > state.remoteConfig.dustLimitSatoshis
+				? state.localConfig.dustLimitSatoshis
+				: state.remoteConfig.dustLimitSatoshis;
+		if (channel.getSpendableOutboundMsat() < (dust + 1n) * 1000n) return null;
+		return findRoute(
+			this.graph,
+			Buffer.from(this.nodeId, 'hex'),
+			destination,
+			amountMsat,
+			finalCltvExpiry,
+			undefined,
+			undefined,
+			this.missionControl,
+			undefined, // maxCltvExpiry
+			routingHints,
+			undefined, // currentTimestamp
+			[
+				{
+					shortChannelId: scid,
+					peer: Buffer.from(peer, 'hex'),
+					outboundMsat: maxFirstHopMsat,
+					htlcMinimumMsat: 1n
+				}
+			]
+		);
+	}
+
 	// ─────────────── Message Handling (testing support) ───────────────
 
 	handlePeerMessage(pubkey: string, type: number, payload: Buffer): void {
@@ -28453,6 +30340,38 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				message: `Message payload ${payload.length} bytes exceeds maximum ${MAX_MESSAGE_SIZE}`,
 				timestamp: Date.now()
 			});
+			return;
+		}
+		if (this.rawCustomMessageTypes.has(type)) {
+			if (!Buffer.isBuffer(payload) || payload.length > 65533) return;
+			if (validateHexPubkey(pubkey, 'peerPubkey')) return;
+			pubkey = normalizeHexPubkey(pubkey);
+			const snapshot = Buffer.from(payload);
+			// Isolate each subscriber, including once wrappers, so one protocol
+			// cannot corrupt another subscriber's bytes or interrupt delivery.
+			for (const listener of this.rawListeners('raw-custom-message')) {
+				try {
+					listener.call(this, {
+						peerPubkey: pubkey,
+						type,
+						payload: Buffer.from(snapshot)
+					});
+				} catch (err) {
+					try {
+						this.emitStructuredLog(
+							'peer',
+							'raw_custom_message_listener_failed',
+							{
+								pubkey,
+								type,
+								error: err instanceof Error ? err.message : String(err)
+							}
+						);
+					} catch {
+						// An observer must not disconnect an authenticated peer.
+					}
+				}
+			}
 			return;
 		}
 		// Route gossip messages (including query types 261-265)
@@ -28543,6 +30462,574 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 
 		// Route channel messages to ChannelManager
 		this.channelManager.handleMessage(pubkey, type, payload);
+	}
+
+	/**
+	 * The custom records (TLV types at or above 65536) of a connected peer's
+	 * init, each value copied. Empty when the peer is not connected, sent
+	 * none, or this node has no auxiliary channel provider and so did not
+	 * read them. The identity is the Noise-authenticated one.
+	 */
+	getPeerCustomRecords(peerPubkey: string): Map<bigint, Buffer> {
+		peerPubkey = normalizeHexPubkey(peerPubkey);
+		const records = this.peerManager?.getPeer(peerPubkey)?.getRemoteInit()
+			?.customRecords;
+		return new Map(
+			[...(records ?? [])].map(([type, value]) => [type, Buffer.from(value)])
+		);
+	}
+
+	/**
+	 * The balances and identity of an asset channel, without key material,
+	 * or undefined for a channel that is not one.
+	 */
+	getAuxiliaryChannelInfo(
+		channelId: Buffer
+	): IAuxiliaryChannelInfo | undefined {
+		const channel = this.channelManager.getChannel(channelId);
+		const state = channel?.getFullState();
+		const auxiliary = state?.auxiliaryState;
+		const peerPubkey = this.channelManager.getPeerForChannel(channelId);
+		if (!state || !auxiliary || !peerPubkey || !state.channelId) {
+			return undefined;
+		}
+		const scid = state.shortChannelId ?? state.scidAlias;
+		// How large the store of revoked views has grown, where the storage
+		// keeps one. A storage that cannot say leaves the field out.
+		let revokedViews: { rows: number; bytes: number } | undefined;
+		try {
+			revokedViews = this.storage?.auxiliaryRevokedCommitmentsSize?.(
+				state.channelId.toString('hex')
+			);
+		} catch {
+			revokedViews = undefined;
+		}
+		return {
+			channelId: Buffer.from(state.channelId),
+			temporaryChannelId: Buffer.from(state.temporaryChannelId),
+			peerPubkey,
+			state: state.state,
+			channelData: Buffer.from(auxiliary.channelData),
+			localAssetBalance: auxiliary.localBalance,
+			remoteAssetBalance: auxiliary.remoteBalance,
+			nextLocalHtlcId: state.localHtlcCounter,
+			localBalanceMsat: state.localBalanceMsat,
+			remoteBalanceMsat: state.remoteBalanceMsat,
+			dustLimitSatoshis:
+				state.localConfig.dustLimitSatoshis >
+				state.remoteConfig.dustLimitSatoshis
+					? state.localConfig.dustLimitSatoshis
+					: state.remoteConfig.dustLimitSatoshis,
+			...(scid ? { shortChannelId: Buffer.from(scid) } : {}),
+			...(auxiliary.resolvedHtlcs && auxiliary.resolvedHtlcs.size > 0
+				? { undeliveredOutcomes: auxiliary.resolvedHtlcs.size }
+				: {}),
+			...(revokedViews
+				? {
+						revokedViews: {
+							rows: revokedViews.rows,
+							bytes: revokedViews.bytes
+						}
+				  }
+				: {}),
+			htlcs: [...state.htlcs.values()]
+				.filter(
+					(entry) =>
+						entry.state !== HtlcState.FULFILLED &&
+						entry.state !== HtlcState.FAILED
+				)
+				.map((entry) => LightningNode.auxiliaryHtlcView(entry))
+		};
+	}
+
+	/** One HTLC of an asset channel as its host reads it: copies, never the entry. */
+	private static auxiliaryHtlcView(entry: IHtlcEntry): IAuxiliaryChannelHtlc {
+		return {
+			htlcId: entry.id,
+			direction:
+				entry.direction === HtlcDirection.OFFERED ? 'offered' : 'received',
+			paymentHash: Buffer.from(entry.paymentHash),
+			wireAmountMsat: entry.amountMsat,
+			cltvExpiry: entry.cltvExpiry,
+			...(entry.auxiliaryAmount !== undefined
+				? { auxiliaryAmount: entry.auxiliaryAmount }
+				: {}),
+			customRecords: copyCustomRecords(entry.customRecords) ?? new Map()
+		};
+	}
+
+	/**
+	 * Set, or with undefined remove, the gate every outgoing asset payment
+	 * of this node passes before anything of it is recorded or sent. The
+	 * gate answers undefined to let the payment through, or the reason it
+	 * is refused; the send then throws an AuxiliaryPaymentError with code
+	 * ASSET_PAYMENT_REFUSED naming the channel. A gate that throws refuses.
+	 * It judges payments this node originates through sendPaymentToRoute,
+	 * not HTLCs it forwards. For whoever wraps the node and holds a policy
+	 * the node does not know, such as a wallet's spending limits.
+	 */
+	setAuxiliaryPaymentGate(gate: AuxiliaryPaymentGate | undefined): void {
+		this.auxiliaryPaymentGate = gate;
+	}
+
+	/**
+	 * What the chain monitor of a channel has recorded, as a copy: the
+	 * transaction that spent the funding output and what kind of spend it
+	 * is, and the outputs being followed with the transactions that spend
+	 * them. A host reads the closing transaction of an asset channel here,
+	 * to bring the assets it carries into its own books. Undefined for a
+	 * channel that has no monitor: one that is not known, or whose funding
+	 * output nothing has spent and nothing is watching for. Changing what
+	 * is returned changes nothing in the node.
+	 */
+	getChannelMonitorState(
+		channelId: Buffer
+	): import('../chain/chain-monitor').IChainMonitorState | undefined {
+		if (!Buffer.isBuffer(channelId) || channelId.length !== 32) {
+			throw new InvalidRequestError('channelId must be a 32-byte Buffer');
+		}
+		const monitor = this.channelManager.getMonitor(channelId);
+		return monitor
+			? deserializeChainMonitorState(
+					serializeChainMonitorState(monitor.getFullState())
+			  )
+			: undefined;
+	}
+
+	/**
+	 * The HTLCs an asset payment went out as, in the order they were sent:
+	 * the channel and HTLC id of each, what it is worth to the payment, and,
+	 * while it is still in its channel, what it carries there. A caller
+	 * confirms from `customRecords` that an HTLC left with the records it
+	 * was sent with, and matches `onHtlcResolved` to one attempt by channel
+	 * and HTLC id. Empty for a hash that is not an asset payment of this
+	 * node, and for one whose record has been pruned. A part whose HTLC never
+	 * entered its channel is not listed: it is reported through
+	 * `onHtlcResolved` with the outcome 'never-sent' when the node is
+	 * restored.
+	 */
+	getAuxiliaryPaymentHtlcs(paymentHash: Buffer): IAuxiliaryPaymentHtlc[] {
+		const payment = this.payments.get(paymentHash.toString('hex'));
+		if (!payment || payment.direction !== PaymentDirection.OUTGOING) return [];
+		return Object.entries(this.auxiliaryPartAmounts(payment)).map(
+			([key, amount]) => {
+				const [channelHex, htlcKey] = key.split(':');
+				const channelId = Buffer.from(channelHex, 'hex');
+				const entry = this.channelManager
+					.getChannel(channelId)
+					?.getFullState()
+					.htlcs.get(htlcKey);
+				const live =
+					entry &&
+					entry.paymentHash.equals(paymentHash) &&
+					entry.state !== HtlcState.FULFILLED &&
+					entry.state !== HtlcState.FAILED
+						? entry
+						: undefined;
+				return {
+					channelId,
+					htlcId: BigInt(htlcKey.slice('offered-'.length)),
+					amountMsat: BigInt(amount),
+					...(live ? { htlc: LightningNode.auxiliaryHtlcView(live) } : {})
+				};
+			}
+		);
+	}
+
+	/**
+	 * The asset HTLC mode a new asset channel with this peer would have,
+	 * for the host to check before its wallet prepares funding. Throws where
+	 * the opening itself would be refused.
+	 */
+	getAuxiliaryHtlcMode(peerPubkey: string): 'fixed' | 'legacy' {
+		const error = validateHexPubkey(peerPubkey, 'peerPubkey');
+		if (error) throw new InvalidChannelOpenError(error);
+		return this.channelManager.getAuxiliaryHtlcMode(peerPubkey);
+	}
+
+	/**
+	 * The state of the wallet's fee coin pool, which pays the fees of an
+	 * asset channel's transactions whose outputs are fixed: its lifetime
+	 * budget, the fee coins ready, the open fee actions, the splits on their
+	 * way, the last refusal a fee selection ended with, and whether a split
+	 * for a fee coin of `forFeeSatoshis` (the policy's cap when left out)
+	 * could be made now. Nothing is made or changed by asking. Undefined on
+	 * a node whose funding provider has no fee policy. When a policy was
+	 * supplied and the wallet refused it, the answer is that the pool is
+	 * unavailable, with the refusal: such a node neither opens nor accepts
+	 * an asset channel.
+	 */
+	getFixedOutputFeeStatus(
+		forFeeSatoshis?: bigint
+	): import('../wallet/fixed-output-fees').IFixedOutputFeeStatus | undefined {
+		return this.fundingProvider?.getFixedOutputFeeStatus?.(forFeeSatoshis);
+	}
+
+	/**
+	 * Open an asset channel with a connected peer, once the host's asset
+	 * protocol has settled the funding with it. This is always a v1
+	 * open_channel of the taproot overlay type, whatever kind of channel the
+	 * node and this peer would otherwise open with each other: it does not
+	 * depend on the node preferring taproot, and a peer that negotiated dual
+	 * funding is still sent open_channel. The peer's accept reaches the host
+	 * as onAccepted, which funds the channel with fundAuxiliaryChannel.
+	 */
+	openAuxiliaryChannel(
+		peerPubkey: string,
+		fundingSatoshis: bigint,
+		descriptor: IAuxiliaryFundingDescriptor,
+		pushMsat = 0n
+	): Channel {
+		const error =
+			validateHexPubkey(peerPubkey, 'peerPubkey') ||
+			validatePositiveBigint(fundingSatoshis, 'fundingSatoshis');
+		if (error) throw new InvalidChannelOpenError(error);
+		peerPubkey = normalizeHexPubkey(peerPubkey);
+		if (!this.auxiliaryChannels) {
+			throw new InvalidChannelOpenError(
+				'An auxiliary channel provider is required to open an asset channel'
+			);
+		}
+		if (
+			isGuardianRecoveryMode({
+				barrier: this.recoveryBarrier,
+				startupGate: this.recoveryGate,
+				guardians: this.recoveryGuardians
+			})
+		) {
+			throw new AuxiliaryGuardianModeError();
+		}
+		const feePolicyRefusal = fixedOutputFeePolicyRefusal(this.fundingProvider);
+		if (feePolicyRefusal) throw feePolicyRefusal;
+		if (!this.fundingProvider && !this._chainBackend) {
+			throw new InvalidChannelOpenError(
+				'Asset channel funding requires a transaction broadcaster'
+			);
+		}
+		if (
+			typeof pushMsat !== 'bigint' ||
+			pushMsat < 0n ||
+			pushMsat > fundingSatoshis * 1000n
+		) {
+			throw new InvalidChannelOpenError(
+				`pushMsat (${pushMsat}) must be between 0 and fundingSatoshis * 1000 (${
+					fundingSatoshis * 1000n
+				})`
+			);
+		}
+		return this.channelManager.openChannel(
+			peerPubkey,
+			fundingSatoshis,
+			pushMsat,
+			undefined,
+			{ auxiliary: descriptor }
+		);
+	}
+
+	/**
+	 * Replace the asset funding data of an opening that has signed nothing
+	 * yet (see ChannelManager.setAuxiliaryFundingData).
+	 */
+	setAuxiliaryFundingData(
+		peerPubkey: string,
+		temporaryChannelId: Buffer,
+		channelData: Buffer
+	): void {
+		this.channelManager.setAuxiliaryFundingData(
+			peerPubkey,
+			temporaryChannelId,
+			channelData
+		);
+	}
+
+	/**
+	 * An unsigned asset funding transaction has to be one whose id cannot
+	 * change when it is signed: no input carries a witness yet, and every
+	 * input spends a witness program, natively (an empty scriptSig) or
+	 * nested in P2SH (a scriptSig that is already the one push of the
+	 * program the output commits to).
+	 */
+	private requireUnsignedSegwitFunding(
+		tx: bitcoin.Transaction,
+		prevoutScripts: Buffer[],
+		named: (reason: string) => Error
+	): void {
+		if (
+			tx.ins.length === 0 ||
+			!Array.isArray(prevoutScripts) ||
+			prevoutScripts.length !== tx.ins.length ||
+			prevoutScripts.some((script) => !Buffer.isBuffer(script))
+		) {
+			throw named(
+				'Asset funding transaction needs the script each of its inputs spends'
+			);
+		}
+		if (tx.ins.some((input) => input.witness.length > 0)) {
+			throw named(
+				'Asset funding transaction given with the scripts it spends has to be unsigned'
+			);
+		}
+		const witnessProgram = (script: Buffer): boolean =>
+			script.length >= 4 &&
+			script.length <= 42 &&
+			(script[0] === 0x00 || (script[0] >= 0x51 && script[0] <= 0x60)) &&
+			script[1] === script.length - 2;
+		tx.ins.forEach((input, index) => {
+			const spent = prevoutScripts[index];
+			const native = witnessProgram(spent) && input.script.length === 0;
+			const nested =
+				spent.length === 23 &&
+				spent[0] === 0xa9 &&
+				spent[1] === 0x14 &&
+				spent[22] === 0x87 &&
+				input.script.length > 1 &&
+				input.script[0] === input.script.length - 1 &&
+				witnessProgram(input.script.subarray(1)) &&
+				bitcoin.crypto
+					.hash160(input.script.subarray(1))
+					.equals(spent.subarray(2, 22));
+			if (!native && !nested) {
+				throw named(
+					'Asset funding transaction has an input that is not segwit'
+				);
+			}
+		});
+	}
+
+	/**
+	 * Give up an asset opening this node began, before the peer's
+	 * funding_signed is verified. `id` is the opening's temporary channel id
+	 * or its channel id. The peer is told to forget the channel, nothing of
+	 * the opening stays in this node or its storage, a funding transaction
+	 * it was given signed is dropped unbroadcast, and the channel's key
+	 * index goes the way it does for any opening that fails before it is
+	 * funded. Throws an AuxiliaryOpenError with code ASSET_OPEN_IRREVOCABLE
+	 * once funding_signed is verified, and ASSET_OPEN_UNKNOWN for an id that
+	 * is not an asset opening of this node.
+	 */
+	abandonAuxiliaryOpen(
+		id: Buffer,
+		reason = 'The asset channel opening was abandoned'
+	): void {
+		const fundingTxid = this.channelManager.abandonAuxiliaryOpen(id, reason);
+		if (fundingTxid) this.deletePendingFundingTx(fundingTxid.toString('hex'));
+	}
+
+	/**
+	 * Fund an accepted asset channel with the transaction the host built,
+	 * and send funding_created. The transaction has to pay the negotiated
+	 * amount to the channel's funding key, tweaked by its asset root, at
+	 * `outputIndex`. Returns the channel id.
+	 *
+	 * Two forms. With `options.prevoutScripts` the transaction is unsigned:
+	 * no input carries a witness, and the script each input spends is given
+	 * so that the node can see every input is segwit and the transaction id
+	 * final. The node keeps nothing of it and broadcasts nothing: the host
+	 * signs and publishes it once `onFundingSigned` says the peer has signed
+	 * this node's first commitment, and until then can abandon the opening
+	 * (`abandonAuxiliaryOpen`). Without the option the transaction is fully
+	 * signed: it is kept, in this node's own storage, and broadcast once the
+	 * peer's funding_signed is durable, like the funding of any channel
+	 * this node opens.
+	 */
+	fundAuxiliaryChannel(
+		peerPubkey: string,
+		temporaryChannelId: Buffer,
+		txHex: string,
+		outputIndex: number,
+		channelData: Buffer,
+		options?: IAuxiliaryFundingOptions
+	): Buffer {
+		const unsigned = options?.prevoutScripts !== undefined;
+		peerPubkey = normalizeHexPubkey(peerPubkey);
+		const named = (reason: string): Error =>
+			new Error(
+				`${reason} (channel ${
+					Buffer.isBuffer(temporaryChannelId)
+						? temporaryChannelId.toString('hex')
+						: 'unknown'
+				})`
+			);
+		const channel = this.channelManager.getTempChannel(temporaryChannelId);
+		if (
+			!channel ||
+			this.channelManager.getPeerForChannel(temporaryChannelId) !== peerPubkey
+		) {
+			throw named('Asset funding peer or channel mismatch');
+		}
+		const state = channel.getFullState();
+		if (
+			!state.auxiliaryState ||
+			!state.fundingTaprootMerkleRoot ||
+			!state.remoteBasepoints ||
+			state.role !== ChannelRole.OPENER ||
+			state.state !== ChannelState.SENT_ACCEPT
+		) {
+			throw named('Asset channel is not ready for funding');
+		}
+		if (!unsigned && !this.fundingProvider && !this._chainBackend) {
+			throw named('Asset channel funding requires a transaction broadcaster');
+		}
+		let tx: bitcoin.Transaction;
+		try {
+			tx = bitcoin.Transaction.fromHex(txHex);
+		} catch {
+			throw named('Asset funding transaction cannot be parsed');
+		}
+		const output = Number.isInteger(outputIndex)
+			? tx.outs[outputIndex]
+			: undefined;
+		const expected = createTaprootFundingScript(
+			state.localBasepoints.fundingPubkey,
+			state.remoteBasepoints.fundingPubkey,
+			undefined,
+			state.fundingTaprootMerkleRoot
+		);
+		if (
+			!output ||
+			outputIndex < 0 ||
+			outputIndex > 65535 ||
+			BigInt(output.value) !== state.fundingSatoshis ||
+			!output.script.equals(expected.p2trOutput)
+		) {
+			throw named(
+				'Asset funding transaction does not match the negotiated output'
+			);
+		}
+		if (unsigned) {
+			this.requireUnsignedSegwitFunding(tx, options.prevoutScripts!, named);
+		} else if (
+			tx.ins.length === 0 ||
+			tx.ins.some(
+				(input) => input.witness.length === 0 && input.script.length === 0
+			)
+		) {
+			throw named('Asset funding transaction is not fully signed');
+		}
+		// The channel is built on this transaction's id before it confirms,
+		// so nothing outside its witnesses may be open to change: every input
+		// spends a witness program, natively (an empty scriptSig) or nested
+		// in P2SH (a scriptSig that is the one push of the program).
+		const nestedProgram = (script: Buffer): boolean =>
+			(script.length === 23 &&
+				script[0] === 0x16 &&
+				script[1] === 0x00 &&
+				script[2] === 0x14) ||
+			(script.length === 35 &&
+				script[0] === 0x22 &&
+				script[1] === 0x00 &&
+				script[2] === 0x20);
+		if (
+			!unsigned &&
+			tx.ins.some(
+				(input) =>
+					input.witness.length === 0 ||
+					(input.script.length > 0 && !nestedProgram(input.script))
+			)
+		) {
+			throw named('Asset funding transaction has an input that is not segwit');
+		}
+		// The final funding data replaces what the opening proposed only if
+		// the funding goes out: what was proposed is put back otherwise.
+		const proposedData = Buffer.from(state.auxiliaryState.channelData);
+		this.channelManager.setAuxiliaryFundingData(
+			peerPubkey,
+			temporaryChannelId,
+			channelData
+		);
+		const txid = Buffer.from(tx.getHash());
+		// An unsigned funding is the host's to sign and publish: nothing of
+		// it is kept here, and nothing is owed to the network by this node.
+		if (!unsigned) {
+			channel.retainFundingPayload(txHex);
+			this.setPendingFundingTx(txid.toString('hex'), txHex);
+		}
+		let channelId: Buffer | null = null;
+		try {
+			channelId = this.channelManager.createFunding(
+				channel,
+				txid,
+				outputIndex,
+				Buffer.alloc(64)
+			);
+		} finally {
+			// A funding the peer was never sent is not owed to the network,
+			// and the channel does not keep the data that came with it.
+			if (!channelId) {
+				this.deletePendingFundingTx(txid.toString('hex'));
+				if (state.auxiliaryState) {
+					state.auxiliaryState.channelData = proposedData;
+				}
+			}
+		}
+		if (!channelId) throw named('Asset channel funding transition failed');
+		return channelId;
+	}
+
+	/**
+	 * Register experimental wire types before connecting to peers that use them.
+	 * Registration accepts required even types only for these explicit handlers.
+	 * It neither advertises features nor enables a channel protocol. The host
+	 * owns protocol negotiation and must authenticate external-transport input.
+	 * Registrations are reference counted; the returned release is idempotent.
+	 */
+	registerRawCustomMessageTypes(types: readonly number[]): () => void {
+		const unique = [...new Set(types)];
+		for (const type of unique) {
+			if (
+				!Number.isInteger(type) ||
+				type < 32768 ||
+				type > 65535 ||
+				type === BEIGNET_CUSTOM_MESSAGE_TYPE ||
+				Object.values(MessageType).includes(type)
+			) {
+				throw new Error(
+					'Raw custom message type must be an unused uint16 >= 32768'
+				);
+			}
+		}
+		for (const type of unique) {
+			this.rawCustomMessageTypes.set(
+				type,
+				(this.rawCustomMessageTypes.get(type) ?? 0) + 1
+			);
+		}
+		let released = false;
+		return (): void => {
+			if (released) return;
+			released = true;
+			for (const type of unique) {
+				const count = this.rawCustomMessageTypes.get(type)! - 1;
+				if (count === 0) this.rawCustomMessageTypes.delete(type);
+				else this.rawCustomMessageTypes.set(type, count);
+			}
+		};
+	}
+
+	/** Send an explicitly registered wire type and exact payload over an authenticated peer connection. */
+	sendRawCustomMessage(
+		peerPubkeyHex: string,
+		type: number,
+		payload: Buffer
+	): void {
+		if (!this.rawCustomMessageTypes.has(type)) {
+			throw new Error('Raw custom message type is not registered');
+		}
+		if (!Buffer.isBuffer(payload) || payload.length > 65533) {
+			throw new Error(
+				'Raw custom message payload must be a Buffer of at most 65533 bytes'
+			);
+		}
+		const invalidPeer = validateHexPubkey(peerPubkeyHex, 'peerPubkey');
+		if (invalidPeer) throw new Error(invalidPeer);
+		if (!this.peerManager) {
+			throw new Error('Networking is not enabled on this node');
+		}
+		this.peerManager.sendToPeer(
+			normalizeHexPubkey(peerPubkeyHex),
+			type,
+			Buffer.from(payload)
+		);
 	}
 
 	/**
@@ -29950,7 +32437,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 						description: options.description
 					}).bolt11
 				}),
-				heldSnapshot: (paymentHash) => this.getHeldInvoiceSnapshot(paymentHash),
+				heldSnapshot: (paymentHash) => this.swapHeldSnapshot(paymentHash),
 				hashInUse: (paymentHash) => this.paymentHashInUse(paymentHash),
 				settleHeld: (paymentHash, preimage) =>
 					this.settleHeldHtlc(paymentHash, preimage),
@@ -30079,16 +32566,9 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 					};
 				},
 				hashInUse: (paymentHash) => this.paymentHashInUse(paymentHash),
-				spendableOutboundMsat: () =>
-					this.channelManager
-						.listChannels()
-						.filter((ch) => ch.acceptsNewHtlcs())
-						.reduce((sum, ch) => sum + ch.getSpendableOutboundMsat(), 0n),
+				spendableOutboundMsat: () => this.swapSpendableOutboundMsat(),
 				ownNodeId: Buffer.from(this.getNodeId(), 'hex'),
-				hasUsableChannelWith: (nodeId) =>
-					this.channelManager
-						.getChannelsByPeer(nodeId.toString('hex'))
-						.some((ch) => ch.acceptsNewHtlcs()),
+				hasUsableChannelWith: (nodeId) => this.swapHasUsableChannelWith(nodeId),
 				broadcast,
 				estimateFee,
 				currentHeight: () => this.currentBlockHeight,
@@ -30127,6 +32607,8 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	private usableChannelWith(peerHex: string): Buffer | null {
 		for (const channel of this.listChannels()) {
 			if (channel.peerPubkey !== peerHex) continue;
+			// An asset channel is not spliced and carries no bitcoin payment.
+			if (channel.auxiliary) continue;
 			if (channel.state !== ChannelState.NORMAL) continue;
 			return channel.channelId;
 		}
@@ -30144,6 +32626,9 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	private liveChannelWith(peerHex: string): Buffer | null {
 		for (const channel of this.listChannels()) {
 			if (channel.peerPubkey !== peerHex) continue;
+			// An asset channel receives no bitcoin payment: a wallet that has
+			// only that one with its LSP still needs a channel of its own.
+			if (channel.auxiliary) continue;
 			if (
 				channel.state !== ChannelState.NORMAL &&
 				channel.state !== ChannelState.SPLICING
@@ -30397,6 +32882,9 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		// and retries failing the parts held across a restart.
 		this.jitReceiveManager?.scanExpiringHolds();
 		this.jitReceiveManager?.sweep();
+		// Asset channels: what a provider refusal left owed is taken up
+		// before the expiry scan judges the same HTLCs.
+		this.retryAuxiliaryOwed();
 		this.scanExpiringHtlcs(blockHeight);
 		// Invariant keeper for HTLC dispatches parked during quiescence: the
 		// terminal quiescence exits (disconnect, errored, force close) emit no
@@ -30697,6 +33185,26 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	}
 
 	/**
+	 * Whether this node holds its own evidence that a channel's funding
+	 * transaction is out of this process: its watcher saw the transaction
+	 * confirmed, or, for a funding this node broadcasts itself, the backend
+	 * took it (or already knew it) at least once in this run. A funding that
+	 * only exists, signed or not, answers false, and so does one the peer or
+	 * the host publishes until it is confirmed. The broadcast half is known
+	 * to the running process alone: after a restart it answers false until
+	 * the retained transaction has been handed over again, which the node
+	 * does when it starts and on every block. False for a channel this node
+	 * does not hold.
+	 */
+	isFundingBroadcastOrConfirmed(channelId: Buffer): boolean {
+		const channel = this.channelManager.getChannel(channelId);
+		if (!channel) return false;
+		const state = channel.getFullState();
+		if (!state.fundingTxid) return false;
+		return this.fundingKnownOnChain(channel, state);
+	}
+
+	/**
 	 * The other shared guard every AUTOMATIC force-close path runs before
 	 * broadcasting a commitment (issue #469): this channel was restored from a
 	 * Recovery Capsule and no `channel_reestablish` has confirmed it against
@@ -30960,6 +33468,223 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	}
 
 	/**
+	 * Asset channels: one error for each HTLC this node decided to settle
+	 * whose expiry passes with no claim of the node in a block (issue
+	 * #2093 step 10). From that height the payer can take the output back,
+	 * and the host should know now, not when a spend is 100 blocks deep.
+	 * The claim is still tried after it: this is not yet the loss.
+	 */
+	private noteAssetClaimsPastExpiry(): void {
+		for (const late of this.channelManager.takeAuxiliaryClaimsPastExpiry()) {
+			this.emit('node:error', {
+				code: 'ASSET_HTLC_CLAIM_UNCONFIRMED_AT_EXPIRY',
+				channelId: late.channelId,
+				message: `HTLC ${
+					late.htlcId
+				} of asset channel ${late.channelId.toString(
+					'hex'
+				)}, which this node decided to settle, passed its expiry ${
+					late.cltvExpiry
+				} with no claim of this node in a block: the payer can take its output back from here on`,
+				timestamp: Date.now()
+			});
+		}
+	}
+
+	/**
+	 * Asset channels: the record of a payment this node counted as
+	 * received follows the chain (issue #2093 step 10). The node fulfilled
+	 * the HTLC in the channel, so the record is COMPLETED, and the payer
+	 * then took the output back on the chain: the units were not received.
+	 * The record goes FAILED and payment:failed says so; the host is told
+	 * of the HTLC itself through onHtlcResolved, failed with
+	 * preimageRevealed. Read from the chain monitor on every block, so a
+	 * restart loses none.
+	 */
+	private failAssetReceiptsLostOnChain(): void {
+		for (const lost of this.channelManager.auxiliaryClaimsLost()) {
+			const hashHex = lost.paymentHash.toString('hex');
+			const payment = this.payments.get(hashHex);
+			if (
+				!payment ||
+				payment.direction !== PaymentDirection.INCOMING ||
+				payment.status !== PaymentStatus.COMPLETED ||
+				!payment.settledHtlcs?.includes(
+					`${lost.channelId.toString('hex')}:${lost.htlcId}`
+				)
+			) {
+				continue;
+			}
+			payment.status = PaymentStatus.FAILED;
+			this.safeStorage(
+				() => this.persistPayment(lost.paymentHash),
+				'persistPayment'
+			);
+			this.emitStructuredLog('htlc', 'asset_htlc_claim_lost', {
+				paymentHash: hashHex,
+				channelId: lost.channelId.toString('hex'),
+				htlcId: lost.htlcId.toString()
+			});
+			this.emit('payment:failed', payment);
+		}
+	}
+
+	/**
+	 * Asset channels: an HTLC this node offered for a payment of its own
+	 * that is on no output of the commitment that confirmed has failed once
+	 * that commitment is there for good (issue #2093 step 10). No output
+	 * resolves for it, so nothing else would end the record of the payment
+	 * before every other output of the channel is swept, which can wait on
+	 * a fee coin for as long as the wallet has none. Read from the chain
+	 * monitor on every block, so a restart loses none.
+	 */
+	private failAssetPaymentsEndedOnChain(): void {
+		for (const [key, hashHex] of [...this.htlcPaymentMap]) {
+			const payment = this.payments.get(hashHex);
+			if (
+				!payment ||
+				payment.direction !== PaymentDirection.OUTGOING ||
+				payment.status !== PaymentStatus.PENDING ||
+				this.preimages.has(hashHex)
+			) {
+				continue;
+			}
+			const [channelIdHex, rest] = key.split(':offered-');
+			if (!channelIdHex || rest === undefined) continue;
+			const channelId = Buffer.from(channelIdHex, 'hex');
+			if (!this.channelManager.auxiliaryChannelOnChain(channelId)) continue;
+			let htlcId: bigint;
+			try {
+				htlcId = BigInt(rest);
+			} catch {
+				continue;
+			}
+			// An HTLC with an output is ended by the spend of that output
+			// (handleOnChainOutputResolved).
+			if (
+				this.channelManager
+					.getMonitor(channelId)
+					?.getTrackedOutputs()
+					.some(
+						(o) =>
+							o.outputType === OutputType.OFFERED_HTLC && o.htlcId === htlcId
+					) ||
+				this.channelManager.auxiliaryHtlcChainEnding(
+					channelId,
+					HtlcDirection.OFFERED,
+					htlcId
+				) !== 'failed'
+			) {
+				continue;
+			}
+			const paymentHash = Buffer.from(hashHex, 'hex');
+			if (
+				this.failPaymentUnlessInFlight(
+					paymentHash,
+					'HTLC was not in the commitment that confirmed'
+				)
+			) {
+				this.emitHtlcResolved(
+					paymentHash,
+					channelId,
+					htlcId,
+					'onchain-resolved'
+				);
+			}
+		}
+	}
+
+	/**
+	 * Asset channels: a held HTLC whose channel went on chain has ended
+	 * there (issue #2093 step 10). Claimed with the preimage, its invoice
+	 * ends paid as a settled hold does; taken back by the payer, it ends
+	 * cancelled. Nothing stays parked. Read from the chain monitor on every
+	 * block, so a restart loses none.
+	 */
+	private endAssetHoldsEndedOnChain(): void {
+		for (const [hashHex, held] of [...this.heldHtlcs]) {
+			if (held.length === 0 || this.resolvingHeldHtlcs.has(hashHex)) continue;
+			const ended = held
+				.map((h) => ({
+					h,
+					outcome: this.channelManager.auxiliaryHtlcChainEnding(
+						h.channelId,
+						HtlcDirection.RECEIVED,
+						h.htlcId
+					)
+				}))
+				.filter((part) => part.outcome !== undefined);
+			if (ended.length === 0) continue;
+			const gone = ended.map((part) => part.h);
+			const remaining = held.filter((h) => !gone.includes(h));
+			if (remaining.length > 0) {
+				this.heldHtlcs.set(hashHex, remaining);
+				this.persistHeldHtlcs();
+				continue;
+			}
+			this.heldHtlcs.delete(hashHex);
+			this.heldResolutions.delete(hashHex);
+			this.heldInvoiceHashes.delete(hashHex);
+			this.persistHeldHtlcs();
+			const paymentHash = Buffer.from(hashHex, 'hex');
+			const amountMsat = gone.reduce((sum, h) => sum + h.amountMsat, 0n);
+			const paid = ended.every((part) => part.outcome === 'fulfilled');
+			this.emitStructuredLog('htlc', 'held_asset_htlc_ended_on_chain', {
+				paymentHash: hashHex,
+				outcome: paid ? 'fulfilled' : 'failed'
+			});
+			if (!paid) {
+				this.markHoldInvoiceCancelled(
+					hashHex,
+					'expiry-scan',
+					gone.length,
+					amountMsat,
+					gone
+				);
+				continue;
+			}
+			const payment = this.payments.get(hashHex);
+			if (payment && payment.status !== PaymentStatus.COMPLETED) {
+				payment.status = PaymentStatus.COMPLETED;
+				const preimage = this.preimages.get(hashHex);
+				if (preimage) payment.preimage = preimage;
+				payment.completedAt = Date.now();
+				payment.settledHtlcs = gone.map(
+					(h) => `${h.channelId.toString('hex')}:${h.htlcId}`
+				);
+				if (payment.amountMsat === 0n) payment.amountMsat = amountMsat;
+				recordReceivedMsat(payment, amountMsat);
+				payment.auxiliary = true;
+				const invoice = this.invoices.get(hashHex);
+				if (invoice && invoice.auxiliary !== true) {
+					invoice.auxiliary = true;
+					this.commitMutations(
+						'markAuxiliaryInvoice',
+						[{ type: 'invoice_state', paymentHash: hashHex, invoice }],
+						RecoveryCriticality.Important
+					);
+				}
+				this.safeStorage(
+					() => this.persistPayment(paymentHash),
+					'persistPayment'
+				);
+				this.emit('payment:received', payment);
+				this.emitInvoiceSettled(paymentHash, payment);
+			}
+			this.emitHoldInvoiceEvent({
+				name: 'hold:settled',
+				event: {
+					paymentHash,
+					state: 'SETTLED',
+					heldAmountMsat: amountMsat,
+					htlcCount: gone.length,
+					...this.heldSetExpiry(hashHex, gone)
+				}
+			});
+		}
+	}
+
+	/**
 	 * Scan all channels for received HTLCs that are close to expiry.
 	 * Auto-fail any that are within the safety margin. Separately, force-close to
 	 * claim any inbound HTLC we already hold the preimage for (or that is
@@ -31079,13 +33804,42 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				// walks were signed in by construction, and absent reads as
 				// signed in.
 				const notInOurCommitment = htlc.addLocallyRevoked === false;
+
+				// Asset channels: an HTLC with units whose preimage this node
+				// holds and whose fulfil it has not made, on a channel whose
+				// peer is connected, is one its own asset provider refused to
+				// settle. That is not the peer's doing, and a claim on the
+				// chain would ask the same provider. The settlement is retried
+				// on every block and given up at the HTLC's expiry
+				// (retryAuxiliaryOwed, resolveAssetHoldsLeftBehind), and
+				// neither arm below acts on it: the channel is kept. A fulfil
+				// the peer does not take, and a peer that is not there, are
+				// closed on as on any other channel.
+				if (
+					state.auxiliaryState !== undefined &&
+					htlc.auxiliaryAmount !== undefined &&
+					htlc.state !== HtlcState.FULFILLED &&
+					state.state === ChannelState.NORMAL &&
+					!parkedHold &&
+					paymentHashHex !== undefined &&
+					this.preimages.has(paymentHashHex)
+				) {
+					continue;
+				}
+
+				// Asset channels: the node has a claim on the HTLC it decided
+				// to settle, by the record of that decision for the HTLC, and
+				// on no other: the stored preimage of an invoice is there for
+				// an HTLC the node failed back too.
 				const haveClaim =
 					!notInOurCommitment &&
-					!parkedHold &&
-					!expiredUnclaimed &&
-					(htlc.state === HtlcState.FULFILLED ||
-						(paymentHashHex !== undefined &&
-							this.preimages.has(paymentHashHex)));
+					(state.auxiliaryState !== undefined
+						? auxiliaryHtlcDecisionOf(state, htlc.id)?.outcome === 'settle'
+						: !parkedHold &&
+						  !expiredUnclaimed &&
+						  (htlc.state === HtlcState.FULFILLED ||
+								(paymentHashHex !== undefined &&
+									this.preimages.has(paymentHashHex))));
 				if (haveClaim && htlc.cltvExpiry - blockHeight <= claimBuffer) {
 					const channelId = state.channelId || state.temporaryChannelId;
 					// Without the funding parent on chain the HTLC-success claim
@@ -31595,6 +34349,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		}
 		// Synchronous for now, so nothing runs between the steps, as in the
 		// constructor. Async so that restore() can become async later.
+		config.beforeRestore?.(node);
 		node.restore();
 		node.start();
 		return node;
@@ -32085,6 +34840,14 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 
 	private registerCustomMessageHandler(): void {
 		if (!this.peerManager) return;
+		this.peerManager.on(
+			'message',
+			(pubkey: string, type: number, payload: Buffer) => {
+				if (this.rawCustomMessageTypes.has(type)) {
+					this.handlePeerMessage(pubkey, type, payload);
+				}
+			}
+		);
 		// Beignet-to-beignet custom traffic rides one odd type (issue #546);
 		// route it through handlePeerMessage so it sits behind the same
 		// startup-quarantine gate as every other inbound message (the
@@ -32662,6 +35425,9 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			) {
 				continue;
 			}
+			// Kept: the record is all that says an HTLC of it was on a
+			// channel a restore left out.
+			if (payment.unresolved) continue;
 			if (
 				nowSec >=
 				inv.createdAt + inv.expiry + ISSUED_INVOICE_SWEEP_GRACE_SECONDS
@@ -32912,6 +35678,9 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		const hashHex = paymentHash.toString('hex');
 		const payment = this.payments.get(hashHex);
 		if (!payment || payment.status !== PaymentStatus.PENDING) return;
+		// An HTLC of it is on a channel a restore left out. The peer may have
+		// settled it, so this wallet never says it failed.
+		if (payment.unresolved) return;
 
 		payment.status = PaymentStatus.FAILED;
 		payment.completedAt = Date.now();
@@ -32987,7 +35756,10 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	private static viewHasHtlcInFlight(
 		view: IOutgoingPaymentResolution
 	): boolean {
-		return view.htlcs.some(LightningNode.htlcViewInFlight);
+		return (
+			view.unresolved !== undefined ||
+			view.htlcs.some(LightningNode.htlcViewInFlight)
+		);
 	}
 
 	/**
@@ -33077,10 +35849,59 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	 *
 	 * `totalMsat` is read for 'mpp-part' only.
 	 */
+	/**
+	 * What each HTLC of an asset payment is worth, by `channel:offered-id`,
+	 * as the sender recorded it beside the payment. Read as strictly as it
+	 * is written: anything else in its place is refused.
+	 */
+	private auxiliaryPartAmounts(payment?: IPaymentInfo): Record<string, string> {
+		const raw = payment?.metadata?._auxiliaryPartAmounts;
+		if (!raw) return {};
+		let parts: unknown;
+		try {
+			parts = JSON.parse(raw);
+		} catch {
+			throw new Error('Invalid asset payment circuit amounts');
+		}
+		if (!parts || typeof parts !== 'object' || Array.isArray(parts)) {
+			throw new Error('Invalid asset payment circuit amounts');
+		}
+		for (const [key, value] of Object.entries(parts)) {
+			if (
+				!/^[0-9a-f]{64}:offered-(0|[1-9][0-9]*)$/.test(key) ||
+				typeof value !== 'string' ||
+				!/^[1-9][0-9]*$/.test(value) ||
+				BigInt(value) > U64_MAX
+			) {
+				throw new Error('Invalid asset payment circuit amount');
+			}
+		}
+		return { ...(parts as Record<string, string>) };
+	}
+
+	/** What the HTLCs of an asset payment still out are worth, together. */
+	private auxiliaryAmountInFlight(
+		view: IOutgoingPaymentResolution,
+		payment?: IPaymentInfo
+	): bigint {
+		const parts = this.auxiliaryPartAmounts(payment);
+		return view.htlcs
+			.filter(LightningNode.htlcViewInFlight)
+			.reduce((sum, entry) => {
+				const amount =
+					parts[`${entry.channelId.toString('hex')}:offered-${entry.htlcId}`];
+				if (!amount) {
+					throw new Error('Quoted asset circuit amount is unavailable');
+				}
+				return sum + BigInt(amount);
+			}, 0n);
+	}
+
 	private assertHashUnpaid(
 		paymentHash: Buffer,
 		inFlight: 'any-pending' | 'outgoing-pending' | 'mpp-part',
-		totalMsat?: bigint
+		totalMsat?: bigint,
+		assetParts = false
 	): void {
 		const hashHex = paymentHash.toString('hex');
 		const completed = (): LightningPaymentError =>
@@ -33109,10 +35930,20 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				'Payment already in flight for this invoice'
 			);
 		}
+		// A part is not added to a payment with an HTLC on a channel a
+		// restore left out: what that HTLC carried and did is not known here.
+		if (inFlight === 'mpp-part' && view.unresolved) {
+			throw new LightningPaymentError(
+				LightningErrorCode.DUPLICATE_PAYMENT,
+				'Payment already in flight for this invoice'
+			);
+		}
 		if (
 			inFlight === 'mpp-part' &&
 			totalMsat !== undefined &&
-			LightningNode.viewAmountInFlight(view) >= totalMsat
+			(assetParts
+				? this.auxiliaryAmountInFlight(view, existingPayment)
+				: LightningNode.viewAmountInFlight(view)) >= totalMsat
 		) {
 			throw new LightningPaymentError(
 				LightningErrorCode.DUPLICATE_PAYMENT,
@@ -33212,7 +36043,17 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 					// revocation never comes, and the commitment that went to
 					// chain carries no output for it. A CLOSED channel has
 					// nothing left to resolve.
-					terminal = channelState === ChannelState.CLOSED;
+					//
+					// Asset channels: the monitor says such an HTLC has ended
+					// once the commitment that confirmed is there for good,
+					// whatever the other outputs of the channel still wait for.
+					terminal =
+						channelState === ChannelState.CLOSED ||
+						this.channelManager.auxiliaryHtlcChainEnding(
+							channelId,
+							HtlcDirection.OFFERED,
+							htlc.id
+						) !== undefined;
 					state = terminal ? 'onchain-resolved' : 'onchain-pending';
 				} else if (htlc.state === HtlcState.FULFILLED) {
 					state = 'fulfilled';
@@ -33315,7 +36156,12 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			resolved:
 				status !== PaymentStatus.PENDING && htlcs.every((h) => h.terminal),
 			latestOutstandingExpiry,
-			preimage
+			preimage,
+			// A restore left the channel of its HTLC out: the peer still has
+			// it, and what it did with it is not known to this wallet.
+			...(status === PaymentStatus.PENDING && payment?.unresolved
+				? { unresolved: payment.unresolved }
+				: {})
 		};
 	}
 
@@ -33333,6 +36179,13 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		if (this._destroyed) return Promise.reject(new Error('Node destroyed'));
 		const first = this.getOutgoingHtlcs(paymentHash);
 		if (first.resolved) return Promise.resolve(first);
+		// Nothing this wallet holds will ever resolve it: said now, in place
+		// of a wait that cannot end.
+		if (first.unresolved) {
+			return Promise.reject(
+				new PaymentUnresolvedError(paymentHash, first.unresolved, first)
+			);
+		}
 		const hashHex = paymentHash.toString('hex');
 
 		return new Promise<IOutgoingPaymentResolution>((resolve, reject) => {
@@ -33576,7 +36429,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		amountMsat?: bigint,
 		maxCltvExpiryHeight?: number
 	): Promise<IPaymentInfo> {
-		const invoice = decodeInvoice(invoiceStr);
+		const invoice = this.decodeBolt11(invoiceStr);
 		const paymentHashHex = invoice.paymentHash.toString('hex');
 
 		return new Promise<IPaymentInfo>((resolve, reject) => {
@@ -33796,9 +36649,25 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		let localBalanceMsat = 0n;
 		let remoteBalanceMsat = 0n;
 		let unsettledBalanceMsat = 0n;
+		// What this node has on its side of asset channels. That bitcoin only
+		// carries asset outputs: it cannot be sent or received over Lightning,
+		// so it is counted apart from every figure above, and reported only
+		// by a node that has such a channel.
+		let auxiliaryBalanceMsat: bigint | undefined;
 
 		for (const channel of this.channelManager.listChannels()) {
 			const state = channel.getFullState();
+			if (state.auxiliaryState !== undefined) {
+				const effective =
+					state.state === ChannelState.AWAITING_REESTABLISH
+						? state.preReestablishState ?? state.state
+						: state.state;
+				if (effective === ChannelState.NORMAL) {
+					auxiliaryBalanceMsat =
+						(auxiliaryBalanceMsat ?? 0n) + state.localBalanceMsat;
+				}
+				continue;
+			}
 			// Accounting classifies by EFFECTIVE state: the splice's accounting
 			// phase survives a disconnect (AWAITING_REESTABLISH wrapping
 			// SPLICING), or a splice-out would bounce back to its full
@@ -33835,7 +36704,12 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			}
 		}
 
-		return { localBalanceMsat, remoteBalanceMsat, unsettledBalanceMsat };
+		return {
+			localBalanceMsat,
+			remoteBalanceMsat,
+			unsettledBalanceMsat,
+			...(auxiliaryBalanceMsat !== undefined ? { auxiliaryBalanceMsat } : {})
+		};
 	}
 
 	// ─────────────── Phase 6: Timeout Safety Nets ───────────────
@@ -34485,7 +37359,9 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		for (const channel of this.channelManager.getChannelsByPeer(
 			peerPubkeyHex
 		)) {
-			if (!channel.acceptsNewHtlcs()) continue;
+			if (!channel.acceptsNewHtlcs() || channel.getFullState().auxiliaryState) {
+				continue;
+			}
 			const st = channel.getFullState();
 			if (
 				(st.shortChannelId && st.shortChannelId.equals(scid)) ||
@@ -34498,12 +37374,37 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		return undefined;
 	}
 
+	/**
+	 * What this node could send right now to pay a swap's invoice: the
+	 * spendable outbound of every channel that takes an HTLC. An asset
+	 * channel is left out, since its bitcoin only carries asset outputs and
+	 * no ordinary payment goes over it.
+	 */
+	private swapSpendableOutboundMsat(): bigint {
+		return this.channelManager
+			.listChannels()
+			.filter((ch) => ch.acceptsNewHtlcs() && !ch.getFullState().auxiliaryState)
+			.reduce((sum, ch) => sum + ch.getSpendableOutboundMsat(), 0n);
+	}
+
+	/**
+	 * Whether a channel with this peer can carry a swap's payment now. An
+	 * asset channel with it is not one.
+	 */
+	private swapHasUsableChannelWith(nodeId: Buffer): boolean {
+		return this.channelManager
+			.getChannelsByPeer(nodeId.toString('hex'))
+			.some((ch) => ch.acceptsNewHtlcs() && !ch.getFullState().auxiliaryState);
+	}
+
 	private findChannelForPeer(
 		peerPubkeyHex: string,
 		amountMsat?: bigint
 	): Channel | undefined {
 		const channels = this.channelManager.getChannelsByPeer(peerPubkeyHex);
-		const normalChannels = channels.filter((ch) => ch.acceptsNewHtlcs());
+		const normalChannels = channels.filter(
+			(ch) => ch.acceptsNewHtlcs() && !ch.getFullState().auxiliaryState
+		);
 
 		if (normalChannels.length === 0) return undefined;
 		if (normalChannels.length === 1) return normalChannels[0];

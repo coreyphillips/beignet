@@ -174,20 +174,21 @@ export class OfflineReceive {
 		concurrent = false
 	): string | undefined {
 		const reserved = this.reservedIds();
-		return this.node
-			.listChannels()
-			.find(
-				(c) =>
-					c.peerPubkey === peer &&
-					c.state === 'NORMAL' &&
-					c.htlcUsable &&
-					(concurrent || c.localBalanceSats === 0) &&
-					c.remoteBalanceSats >= amountSats + 50000 &&
-					!reserved.has(c.channelId) &&
-					!live(
-						this.node.fforEpochs('R').find((e) => e.channelId === c.channelId)
-					)
-			)?.channelId;
+		return this.node.listChannels().find(
+			(c) =>
+				c.peerPubkey === peer &&
+				// An asset channel takes no ordinary payment, and the bitcoin
+				// on its far side is not inbound: never the receive's channel.
+				!c.auxiliary &&
+				c.state === 'NORMAL' &&
+				c.htlcUsable &&
+				(concurrent || c.localBalanceSats === 0) &&
+				c.remoteBalanceSats >= amountSats + 50000 &&
+				!reserved.has(c.channelId) &&
+				!live(
+					this.node.fforEpochs('R').find((e) => e.channelId === c.channelId)
+				)
+		)?.channelId;
 	}
 	/** The smallest direct-funded amount this node serves, never below 5000. */
 	private directFundingMinimum(): number {

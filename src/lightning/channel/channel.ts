@@ -65,6 +65,7 @@ import type {
 	IClosingSigMessage
 } from '../message/channel-close';
 import {
+	decodeShutdownMessage,
 	encodeShutdownMessage,
 	encodeClosingSignedMessage,
 	ClosingSigVariant,
@@ -124,6 +125,40 @@ import {
 	recencyHoldOrigin
 } from './channel-state';
 import { recordRevokedHtlcSnapshot } from './htlc-snapshots';
+import type {
+	IAuxiliaryCommitmentData,
+	IChannelAuxiliaryProvider
+} from './auxiliary';
+import type { IAuxiliaryHtlcDecision } from './auxiliary';
+import {
+	MAX_AUXILIARY_HTLCS_PER_PARTY,
+	auxiliaryProviderError,
+	copyAuxiliaryCommitment,
+	requireAuxiliaryProvider,
+	validateAuxiliaryChannelType
+} from './auxiliary';
+import {
+	auxiliaryClosingRelayProfile,
+	auxiliaryClosingWeight,
+	recordAuxiliaryClose,
+	AUXILIARY_CLOSE_ASSET_OUTPUT_MINIMUM
+} from './auxiliary-close';
+import { auxiliaryCsvPolicyError } from './auxiliary-csv';
+import { auxiliaryCarrierError } from './auxiliary-funding';
+import type { AuxiliaryUnsupportedOperation } from './auxiliary-guard';
+import { auxiliaryUnsupported } from './auxiliary-guard';
+import { recordAuxiliaryRevokedView } from './auxiliary-revoked';
+import type { IAuxiliaryRoundUpdate } from './auxiliary-preflight';
+import { auxiliaryRoundRefusal } from './auxiliary-preflight';
+import {
+	acceptChildRevocationRecord,
+	addChildRevocationRecord
+} from './child-revocation';
+import type { CustomRecords } from '../message/custom-records';
+import {
+	copyCustomRecords,
+	sameCustomRecords
+} from '../message/custom-records';
 import {
 	bigIntMax,
 	bigIntMin,
@@ -198,6 +233,7 @@ import {
 	hasScidAliasChannelType,
 	isAnchorChannel,
 	isTaprootChannel,
+	isOverlayChannel,
 	receivedAddIrrevocablyCommitted,
 	scidAliasAnnounceRefusal,
 	validateV2ChannelType
@@ -857,6 +893,8 @@ export interface ITaprootClosingCache {
 	tx: import('bitcoinjs-lib').Transaction;
 	/** Our 32-byte MuSig2 partial signature over the closing tx, once made. */
 	ourPartialSig: Buffer | null;
+	/** An asset channel: the provider's payload for this closing transaction. */
+	auxiliaryCloseData?: Buffer;
 }
 
 /**
@@ -908,6 +946,15 @@ interface IFforUpdateContext {
 	 */
 	settle?: { id: bigint; direction: HtlcDirection; op: 'fulfill' | 'fail' };
 }
+
+/**
+ * An HTLC the peer offered on an asset channel that the provider's own
+ * answer shows to be bad: units its sender does not hold, or a carrier too
+ * small to keep an output. The one refusal of an asset HTLC that is the
+ * peer's violation; anything else thrown while one is judged is the
+ * provider failing to answer.
+ */
+class AuxiliaryHtlcFault extends Error {}
 
 export class Channel {
 	private _state: IChannelState;
@@ -1424,8 +1471,30 @@ export class Channel {
 		setScid: (field, scid): void => this._setScid(field, scid)
 	});
 
-	constructor(state: IChannelState, signer?: ISigner) {
+	/**
+	 * @param auxiliaryProvider - The node's auxiliary channel provider, if it
+	 *   has one. Attached only when `state` is an asset channel; a restore
+	 *   passes it at every site because no provider is ever stored.
+	 */
+	constructor(
+		state: IChannelState,
+		signer?: ISigner,
+		auxiliaryProvider?: IChannelAuxiliaryProvider
+	) {
 		this._state = state;
+		// Asset channels (issue #2093). A channel with asset state, an asset
+		// funding root or the overlay channel type is never built without
+		// its provider: this throws instead, so no caller can go on to sign
+		// for it as an ordinary channel. Any other channel does not see the
+		// provider at all.
+		if (
+			state.auxiliaryState ||
+			state.fundingTaprootMerkleRoot ||
+			isOverlayChannel(state.channelType)
+		) {
+			if (auxiliaryProvider) state.auxiliaryProvider = auxiliaryProvider;
+			requireAuxiliaryProvider(state);
+		}
 		this._signer = signer || null;
 		const f = state.ffor;
 		this._fforActivateAckUnsent =
@@ -1699,14 +1768,91 @@ export class Channel {
 	// ─────────────── Opening (Opener) ───────────────
 
 	/**
+	 * The refusal of something an asset channel does not do, as the actions
+	 * of a refusal, or null for any other channel. See auxiliary-guard.
+	 */
+	private _refuseForAssetChannel(
+		operation: AuxiliaryUnsupportedOperation
+	): ChannelAction[] | null {
+		const refusal = auxiliaryUnsupported(this._state, operation);
+		if (!refusal) return null;
+		return [
+			{
+				type: ChannelActionType.ERROR,
+				message: refusal.message,
+				code: ChannelErrorCode.UNSUPPORTED
+			}
+		];
+	}
+
+	/**
+	 * Why the peer's half of an asset channel opening is refused, or null:
+	 * the channel type, the delay it asks of us against the opening's CSV
+	 * policy, and the HTLC count it would hold us to accepting.
+	 */
+	private _auxiliaryOpeningError(
+		channelType: Buffer | null | undefined,
+		remoteToSelfDelay: number,
+		remoteMaxAcceptedHtlcs: number,
+		carrier: {
+			fundingSatoshis: bigint;
+			pushMsat: bigint;
+			feeratePerKw: number;
+			remoteDustLimitSatoshis: bigint;
+		}
+	): string | null {
+		const typeError = validateAuxiliaryChannelType(this._state, channelType);
+		if (typeError) return typeError;
+		const auxiliary = this._state.auxiliaryState;
+		if (auxiliary) {
+			// With both dust limits known, whether each side that holds asset
+			// units keeps an output on both first commitments: asked here, so an
+			// opening that cannot be committed to ends before its funding.
+			const weOpen = this._state.role === ChannelRole.OPENER;
+			const localDust = this._state.localConfig.dustLimitSatoshis;
+			const carrierError = auxiliaryCarrierError({
+				fundingSatoshis: carrier.fundingSatoshis,
+				pushMsat: carrier.pushMsat,
+				feeratePerKw: carrier.feeratePerKw,
+				openerAssetBalance: weOpen
+					? auxiliary.localBalance
+					: auxiliary.remoteBalance,
+				acceptorAssetBalance: weOpen
+					? auxiliary.remoteBalance
+					: auxiliary.localBalance,
+				dustLimitSatoshis:
+					carrier.remoteDustLimitSatoshis > localDust
+						? carrier.remoteDustLimitSatoshis
+						: localDust
+			});
+			if (carrierError) return carrierError;
+		}
+		const csvError = auxiliaryCsvPolicyError(
+			this._state.auxiliaryState?.openingCsvPolicy,
+			this._state.localConfig.toSelfDelay,
+			remoteToSelfDelay
+		);
+		if (csvError) return csvError;
+		if (remoteMaxAcceptedHtlcs > MAX_AUXILIARY_HTLCS_PER_PARTY) {
+			return `Asset channel max accepted HTLCs exceeds ${MAX_AUXILIARY_HTLCS_PER_PARTY}`;
+		}
+		return null;
+	}
+
+	/**
 	 * Initiate opening a channel. Sends open_channel.
 	 * @param chainHash - Optional chain hash (defaults to Bitcoin mainnet)
 	 * @param preferAnchors - If true, negotiate option_anchors_zero_fee_htlc_tx
+	 * @param preferTaproot - If true, negotiate simple taproot commitments
+	 * @param auxiliary - The asset HTLC modes agreed with the peer, for a
+	 *   channel that holds asset funding. Such a channel always opens as a
+	 *   taproot overlay channel, whatever the two preferences say.
 	 */
 	initiateOpen(
 		chainHash?: Buffer,
 		preferAnchors?: boolean,
-		preferTaproot?: boolean
+		preferTaproot?: boolean,
+		auxiliary: { fixedHtlcOutputs?: boolean; childCustody?: boolean } = {}
 	): ChannelAction[] {
 		if (this._state.state !== ChannelState.NONE) {
 			return [
@@ -1747,7 +1893,19 @@ export class Channel {
 		// lnd v0.20). Non-taproot keeps static_remotekey (bit 12) +
 		// option_anchors_zero_fee_htlc_tx (bit 22) when requested.
 		const channelTypeFlags = FeatureFlags.empty();
-		if (preferTaproot) {
+		if (this._state.auxiliaryState) {
+			// An asset channel is a taproot channel of a type of its own: the
+			// overlay bit alone, with the asset HTLC modes beside it. It is
+			// chosen by the channel, never by what the node prefers.
+			preferTaproot = true;
+			channelTypeFlags.setCompulsory(Feature.OPTION_TAPROOT_OVERLAY);
+			if (auxiliary.fixedHtlcOutputs) {
+				channelTypeFlags.setCompulsory(Feature.OPTION_ASSET_FIXED_HTLC_OUTPUTS);
+				if (auxiliary.childCustody) {
+					channelTypeFlags.setCompulsory(Feature.OPTION_ASSET_CHILD_CUSTODY);
+				}
+			}
+		} else if (preferTaproot) {
 			channelTypeFlags.setCompulsory(Feature.OPTION_TAPROOT);
 		} else {
 			channelTypeFlags.setCompulsory(Feature.STATIC_REMOTE_KEY);
@@ -2040,6 +2198,40 @@ export class Channel {
 		if (!valid) {
 			return 'Invalid taproot partial signature';
 		}
+		if (this._state.auxiliaryState) {
+			// Asset channels: keep the asset side of the commitment this
+			// signature covers, so a force close after a restart commits to
+			// the same leaves without asking the provider again. The view of
+			// the commitment before it stays until this one is revoked; older
+			// ones are ours, revoked, and never broadcast.
+			const views = this._state.auxiliaryState.localCommitments;
+			let view: IAuxiliaryCommitmentData | undefined;
+			try {
+				view = buildLocalCommitment(
+					this._state,
+					localPerCommitmentPoint,
+					commitmentNumber
+				).auxiliary;
+			} catch {
+				view = undefined;
+			}
+			if (!view) return 'Invalid asset commitment metadata';
+			views.set(commitmentNumber, copyAuxiliaryCommitment(view));
+			for (const number of [...views.keys()]) {
+				if (number < commitmentNumber - 1n) views.delete(number);
+			}
+			// The peer's child custody points are kept for the commitments
+			// whose views are kept, and go with the views that went.
+			const points = this._state.auxiliaryState.childRevocationBasepoints;
+			if (points) {
+				const held = new Set(
+					[...views.values()].map((kept) => kept.secondLevelCommitmentTxid)
+				);
+				for (const txid of [...points.keys()]) {
+					if (!held.has(txid)) points.delete(txid);
+				}
+			}
+		}
 		this._state.remoteCommitmentSignature = theirPartial;
 		this._state.remoteSigningNonce = theirSigningNonce;
 		return null;
@@ -2120,6 +2312,21 @@ export class Channel {
 		// ChannelManager keys tempChannels by.
 		const refuse = (reason: string): ChannelAction[] =>
 			refuseWithWireError(this._state.temporaryChannelId, reason);
+		if (this._state.auxiliaryState || this._state.fundingTaprootMerkleRoot) {
+			// A missing type is left to the check every channel gets below.
+			const auxiliaryError = this._auxiliaryOpeningError(
+				msg.channelType ?? this._state.channelType,
+				msg.toSelfDelay,
+				msg.maxAcceptedHtlcs,
+				{
+					fundingSatoshis: this._state.fundingSatoshis,
+					pushMsat: this._state.pushMsat,
+					feeratePerKw: this._state.localConfig.feeratePerKw,
+					remoteDustLimitSatoshis: msg.dustLimitSatoshis
+				}
+			);
+			if (auxiliaryError) return refuse(auxiliaryError);
+		}
 
 		// Validate the acceptor's parameters against what WE proposed in
 		// open_channel BEFORE adopting them. Without this an adversarial acceptor
@@ -2265,6 +2472,15 @@ export class Channel {
 					message: 'Cannot create funding: wrong state'
 				}
 			];
+		}
+
+		const csvError = auxiliaryCsvPolicyError(
+			this._state.auxiliaryState?.openingCsvPolicy,
+			this._state.localConfig.toSelfDelay,
+			this._state.remoteConfig.toSelfDelay
+		);
+		if (csvError) {
+			return refuseWithWireError(this._state.temporaryChannelId, csvError);
 		}
 
 		this._state.fundingTxid = fundingTxid;
@@ -2529,6 +2745,30 @@ export class Channel {
 		// demands, having been sliced from the wire by decodeOpenChannelMessage.
 		const refuse = (reason: string): ChannelAction[] =>
 			refuseWithWireError(msg.temporaryChannelId, reason);
+		if (this._state.auxiliaryState || this._state.fundingTaprootMerkleRoot) {
+			const auxiliaryError = this._auxiliaryOpeningError(
+				msg.channelType,
+				msg.toSelfDelay,
+				msg.maxAcceptedHtlcs,
+				{
+					fundingSatoshis: msg.fundingSatoshis,
+					pushMsat: msg.pushMsat,
+					feeratePerKw: msg.feeratePerKw,
+					remoteDustLimitSatoshis: msg.dustLimitSatoshis
+				}
+			);
+			if (auxiliaryError) return refuse(auxiliaryError);
+			// An asset channel is never announced: its capacity is not bitcoin
+			// that a payment could be routed over. Our own opening never sets
+			// the bit, so only a peer's can, and the peer is told why.
+			const announced =
+				(msg.channelFlags & 0x01) !== 0
+					? auxiliaryUnsupported(this._state, 'an announcement')
+					: undefined;
+			if (announced) {
+				return refuse(`open_channel refused: ${announced.message}`);
+			}
+		}
 
 		// Peer-supplied, so the bounds that only apply to a value we did not
 		// choose run too. ChannelManager.handleOpenChannel has already seeded
@@ -2594,9 +2834,14 @@ export class Channel {
 			const proposedFlags = FeatureFlags.fromBuffer(msg.channelType);
 			// Simple taproot channels carry ONLY the taproot bit (static_remotekey is
 			// implied), so accept either an explicit static_remotekey or taproot.
+			// An asset channel has a type of its own, and only for an opening
+			// that brought asset funding with it, which was validated above.
+			// Without that funding the overlay type is refused like any type
+			// this node cannot build.
 			if (
 				!proposedFlags.hasFeature(Feature.STATIC_REMOTE_KEY) &&
-				!proposedFlags.hasFeature(Feature.OPTION_TAPROOT)
+				!proposedFlags.hasFeature(Feature.OPTION_TAPROOT) &&
+				!(this._state.auxiliaryState && isOverlayChannel(msg.channelType))
 			) {
 				return refuse('Proposed channel type must include static_remotekey');
 			}
@@ -2789,6 +3034,12 @@ export class Channel {
 		// above and cannot be steered.
 		const refuse = (reason: string): ChannelAction[] =>
 			refuseWithWireError(msg.temporaryChannelId, reason);
+		const csvError = auxiliaryCsvPolicyError(
+			this._state.auxiliaryState?.openingCsvPolicy,
+			this._state.localConfig.toSelfDelay,
+			this._state.remoteConfig.toSelfDelay
+		);
+		if (csvError) return refuse(csvError);
 
 		this._state.fundingTxid = msg.fundingTxid;
 		this._state.fundingOutputIndex = msg.fundingOutputIndex;
@@ -3711,13 +3962,327 @@ export class Channel {
 		return [];
 	}
 
+	/**
+	 * Judge one HTLC of an asset channel before it enters the channel, and
+	 * note on it the asset units it carries. A channel without asset state
+	 * returns at once.
+	 *
+	 * The provider validates the HTLC and says how many units it carries.
+	 * None marks a plain bitcoin HTLC, which an asset channel takes from its
+	 * peer and never offers. An HTLC that carries units must come from a
+	 * side that holds them, and be large enough in bitcoin to keep an output
+	 * of its own on both commitments. Throws on anything else.
+	 */
+	private _prepareAuxiliaryHtlc(entry: IHtlcEntry): void {
+		const auxiliary = this._state.auxiliaryState;
+		if (!auxiliary) return;
+		const offered = entry.direction === HtlcDirection.OFFERED;
+		const provider = requireAuxiliaryProvider(this._state);
+		if (
+			!offered &&
+			(auxiliary.resolvedHtlcs?.size ?? 0) >
+				Channel.AUXILIARY_MAX_UNDELIVERED_OUTCOMES
+		) {
+			// The host is not taking the outcomes of this channel's asset
+			// HTLCs. The peer's next one is admitted, so that both
+			// commitments agree, and is failed back once it is committed.
+			entry.auxiliaryRefused = true;
+		}
+		try {
+			provider.validateHtlc(this._state, entry);
+		} catch (err) {
+			// Our own HTLC is refused where it is made. The peer's is the
+			// host's to reject, one HTLC at a time: it is admitted with the
+			// units the provider reads from it, so both commitments agree,
+			// and the node fails it back once it is committed.
+			if (offered) throw err;
+			entry.auxiliaryRefused = true;
+		}
+		const amount = provider.getHtlcAmount(this._state, entry);
+		if (
+			typeof amount !== 'bigint' ||
+			amount < 0n ||
+			amount > 0xffffffffffffffffn
+		) {
+			throw new Error('invalid asset HTLC amount');
+		}
+		if (amount === 0n) {
+			if (offered) throw new Error('an asset channel offers only asset HTLCs');
+			return;
+		}
+		if (amount > (offered ? auxiliary.localBalance : auxiliary.remoteBalance)) {
+			throw new AuxiliaryHtlcFault('insufficient asset balance');
+		}
+		const dust =
+			this._state.localConfig.dustLimitSatoshis >
+			this._state.remoteConfig.dustLimitSatoshis
+				? this._state.localConfig.dustLimitSatoshis
+				: this._state.remoteConfig.dustLimitSatoshis;
+		if (entry.amountMsat / 1000n < dust) {
+			throw new AuxiliaryHtlcFault(
+				'asset HTLC carrier is below the negotiated dust limit'
+			);
+		}
+		entry.auxiliaryAmount = amount;
+	}
+
+	/**
+	 * The provider of an asset channel could not answer while a message of
+	 * the peer was being taken in. That is a failure of this node, not of the
+	 * peer: nothing is sent that blames it and the channel is not failed. The
+	 * message is dropped, the node says so with a typed local error, and the
+	 * connection is closed, so that the reestablish of the next one has the
+	 * peer send the round again. Until the connection has gone, a
+	 * commitment_signed is not read: it would be judged against a state that
+	 * lacks what was just dropped.
+	 */
+	private _auxiliaryLocalFailure(
+		operation: string,
+		cause: unknown
+	): ChannelAction[] {
+		const message = auxiliaryProviderError(
+			this._state,
+			operation,
+			cause
+		).message;
+		this._auxiliaryAwaitingDisconnect = true;
+		return [
+			{
+				type: ChannelActionType.ERROR,
+				message,
+				code: ChannelErrorCode.ASSET_PROVIDER_REFUSED
+			},
+			{ type: ChannelActionType.DISCONNECT_PEER, reason: message }
+		];
+	}
+
+	/** Set by _auxiliaryLocalFailure, cleared when the connection has gone. */
+	private _auxiliaryAwaitingDisconnect = false;
+
+	/**
+	 * Move an HTLC's asset units with its bitcoin: every place that debits
+	 * or credits a balance by an HTLC's amount calls this for the same side
+	 * with the same sign. Nothing moves for a channel without asset state or
+	 * an HTLC that carries no units.
+	 */
+	private _moveAuxiliaryBalance(
+		side: 'local' | 'remote',
+		entry: IHtlcEntry,
+		sign: 1n | -1n
+	): void {
+		const auxiliary = this._state.auxiliaryState;
+		if (!auxiliary || entry.auxiliaryAmount === undefined) return;
+		if (side === 'local')
+			auxiliary.localBalance += sign * entry.auxiliaryAmount;
+		else auxiliary.remoteBalance += sign * entry.auxiliaryAmount;
+	}
+
+	/**
+	 * Asset channels: with more outcomes than this that the host has not
+	 * taken (onHtlcResolved), the channel takes no further asset HTLC. The
+	 * row then grows no more, however many HTLCs the peer offers.
+	 */
+	static readonly AUXILIARY_MAX_UNDELIVERED_OUTCOMES = 1000;
+
+	/**
+	 * Keep the outcome of an asset HTLC that has left the channel, in the
+	 * channel's own row, until the host has been told (onHtlcResolved).
+	 */
+	private _recordAuxiliaryResolution(entry: IHtlcEntry): void {
+		const auxiliary = this._state.auxiliaryState;
+		if (!auxiliary || entry.auxiliaryAmount === undefined) return;
+		auxiliary.resolvedHtlcs ??= new Map();
+		// A received HTLC that was refused while the host is not taking
+		// outcomes was never put to the host and leaves none, so the peer
+		// cannot grow the row past the bound.
+		if (
+			entry.auxiliaryRefused === true &&
+			entry.direction === HtlcDirection.RECEIVED &&
+			auxiliary.resolvedHtlcs.size > Channel.AUXILIARY_MAX_UNDELIVERED_OUTCOMES
+		) {
+			return;
+		}
+		auxiliary.resolvedHtlcs.set(`${entry.direction}:${entry.id}`, {
+			htlcId: entry.id,
+			direction: entry.direction,
+			paymentHash: Buffer.from(entry.paymentHash),
+			auxiliaryAmount: entry.auxiliaryAmount,
+			...(entry.customRecords !== undefined
+				? { customRecords: copyCustomRecords(entry.customRecords) }
+				: {}),
+			outcome: entry.state === HtlcState.FULFILLED ? 'fulfilled' : 'failed'
+		});
+	}
+
+	/**
+	 * Asset channels: what this node decided for an HTLC it received, or
+	 * undefined while it has decided nothing.
+	 */
+	auxiliaryHtlcDecision(htlcId: bigint): IAuxiliaryHtlcDecision | undefined {
+		return this._state.auxiliaryState?.htlcDecisions?.get(htlcId.toString());
+	}
+
+	/**
+	 * Asset channels: write down what the node decided for an HTLC it
+	 * received, for a decision no message of the channel carries yet: a
+	 * settle or a cancel made while the channel is on chain or its peer is
+	 * away. The HTLC is looked for wherever a commitment this node holds
+	 * still carries it: in the channel, or among the removals its own
+	 * commitment keeps. False for a channel without asset state, for an
+	 * HTLC it does not hold, for a preimage that is not the HTLC's, and
+	 * when the other decision stands already.
+	 */
+	recordAuxiliaryHtlcDecision(
+		htlcId: bigint,
+		outcome: 'settle' | 'fail',
+		preimage?: Buffer
+	): boolean {
+		const entry =
+			this._state.htlcs.get(`received-${htlcId}`) ??
+			(this._state.signedLocalRemovals ?? []).find(
+				(kept) =>
+					kept.direction === HtlcDirection.RECEIVED && kept.id === htlcId
+			);
+		if (!this._state.auxiliaryState || !entry) return false;
+		if (outcome === 'fail') {
+			return this._decideAuxiliaryHtlc(entry, { outcome: 'fail' });
+		}
+		if (!preimage || !sha256(preimage).equals(entry.paymentHash)) return false;
+		return this._decideAuxiliaryHtlc(entry, {
+			outcome: 'settle',
+			preimage: Buffer.from(preimage)
+		});
+	}
+
+	/** Take back a decision whose row could not be written. */
+	dropAuxiliaryHtlcDecision(htlcId: bigint): void {
+		this._state.auxiliaryState?.htlcDecisions?.delete(htlcId.toString());
+	}
+
+	/**
+	 * The first decision for an HTLC stands. The one exception is a fulfil
+	 * this node has made in the channel: the preimage is with the peer
+	 * from then on, and the record says what was done.
+	 */
+	private _decideAuxiliaryHtlc(
+		entry: IHtlcEntry,
+		decision: IAuxiliaryHtlcDecision
+	): boolean {
+		const auxiliary = this._state.auxiliaryState;
+		if (!auxiliary || entry.direction !== HtlcDirection.RECEIVED) return false;
+		const key = entry.id.toString();
+		const standing = auxiliary.htlcDecisions?.get(key);
+		if (standing) {
+			if (standing.outcome === decision.outcome) return true;
+			if (
+				decision.outcome !== 'settle' ||
+				entry.state !== HtlcState.FULFILLED
+			) {
+				return false;
+			}
+		}
+		auxiliary.htlcDecisions ??= new Map();
+		auxiliary.htlcDecisions.set(key, decision);
+		return true;
+	}
+
+	/**
+	 * A decision is kept for as long as a commitment this node holds
+	 * carries its HTLC: in the channel, or among the removals its own
+	 * commitment keeps until the peer signs the next one. Called when that
+	 * signature arrives. A channel that is on chain signs nothing more, so
+	 * what it held then stays.
+	 */
+	private _pruneAuxiliaryHtlcDecisions(): void {
+		const auxiliary = this._state.auxiliaryState;
+		const decisions = auxiliary?.htlcDecisions;
+		if (!auxiliary || !decisions) return;
+		for (const key of [...decisions.keys()]) {
+			if (
+				this._state.htlcs.has(`received-${key}`) ||
+				(this._state.signedLocalRemovals ?? []).some(
+					(kept) =>
+						kept.direction === HtlcDirection.RECEIVED &&
+						kept.id.toString() === key
+				)
+			) {
+				continue;
+			}
+			decisions.delete(key);
+		}
+		if (decisions.size === 0) delete auxiliary.htlcDecisions;
+	}
+
+	/**
+	 * Asset channels: keep the ending an HTLC had on the chain, for the
+	 * host, in the list the endings off chain are kept in. False for a
+	 * channel without asset state and for an HTLC it does not hold or that
+	 * carries no units. `claimSigned` says that the node signed a claim of
+	 * the HTLC for the chain; with it, or with a fulfil made in the
+	 * channel, a failed ending of an HTLC the node decided to settle
+	 * carries preimageRevealed.
+	 */
+	recordAuxiliaryChainResolution(
+		direction: HtlcDirection,
+		htlcId: bigint,
+		outcome: 'fulfilled' | 'failed',
+		claimSigned = false
+	): boolean {
+		const auxiliary = this._state.auxiliaryState;
+		const held = this._state.htlcs.get(
+			`${
+				direction === HtlcDirection.OFFERED ? 'offered' : 'received'
+			}-${htlcId}`
+		);
+		// A removal this node's own commitment keeps left the map when the
+		// peer revoked for it, and was told then: fulfilled, or failed. The
+		// chain adds to that only when it says otherwise, which it can for
+		// one alone: the HTLC this node fulfilled and the payer took back.
+		const kept =
+			held === undefined && direction === HtlcDirection.RECEIVED
+				? (this._state.signedLocalRemovals ?? []).find(
+						(removal) =>
+							removal.direction === HtlcDirection.RECEIVED &&
+							removal.id === htlcId
+				  )
+				: undefined;
+		const entry = held ?? kept;
+		if (!auxiliary || !entry || entry.auxiliaryAmount === undefined) {
+			return false;
+		}
+		if (kept && !(outcome === 'failed' && kept.state === HtlcState.FULFILLED)) {
+			return false;
+		}
+		// The preimage left the node: in the fulfil it made, or in a claim
+		// it signed for the chain.
+		const revealed =
+			direction === HtlcDirection.RECEIVED &&
+			outcome === 'failed' &&
+			auxiliary.htlcDecisions?.get(htlcId.toString())?.outcome === 'settle' &&
+			(entry.state === HtlcState.FULFILLED || claimSigned);
+		auxiliary.resolvedHtlcs ??= new Map();
+		auxiliary.resolvedHtlcs.set(`${entry.direction}:${entry.id}`, {
+			htlcId: entry.id,
+			direction: entry.direction,
+			paymentHash: Buffer.from(entry.paymentHash),
+			auxiliaryAmount: entry.auxiliaryAmount,
+			...(entry.customRecords !== undefined
+				? { customRecords: copyCustomRecords(entry.customRecords) }
+				: {}),
+			outcome,
+			...(revealed ? { preimageRevealed: true as const } : {})
+		});
+		return true;
+	}
+
 	addHtlc(
 		amountMsat: bigint,
 		paymentHash: Buffer,
 		cltvExpiry: number,
 		onionRoutingPacket: Buffer,
 		blindingPoint?: Buffer,
-		skimmedFeeMsat?: bigint
+		skimmedFeeMsat?: bigint,
+		customRecords?: CustomRecords
 	): ChannelAction[] {
 		if (
 			skimmedFeeMsat !== undefined &&
@@ -3727,7 +4292,9 @@ export class Channel {
 		}
 		const refusal = this.validateOutgoingHtlc(amountMsat, cltvExpiry);
 		if (refusal.length > 0) return refusal;
-		const htlcId = this._state.localHtlcCounter++;
+		const htlcId = this._state.localHtlcCounter;
+		const carriesAssets =
+			this._state.auxiliaryState !== undefined || customRecords !== undefined;
 
 		const entry: IHtlcEntry = {
 			id: htlcId,
@@ -3746,11 +4313,6 @@ export class Channel {
 			...(blindingPoint ? { blindingPoint } : {})
 		};
 
-		this._state.htlcs.set(`offered-${htlcId}`, entry);
-
-		// Deduct from local balance provisionally
-		this._state.localBalanceMsat -= amountMsat;
-
 		const msg: IUpdateAddHtlcMessage = {
 			channelId: this._state.channelId!,
 			id: htlcId,
@@ -3761,6 +4323,58 @@ export class Channel {
 			...(blindingPoint ? { blindingPoint } : {})
 		};
 		if (skimmedFeeMsat !== undefined) msg.skimmedFeeMsat = skimmedFeeMsat;
+
+		if (carriesAssets) {
+			// An asset channel offers only HTLCs that carry asset units, and
+			// only an asset channel carries custom records. Judged before the
+			// HTLC enters the channel, so a refusal spends no HTLC id and
+			// leaves nothing behind.
+			try {
+				if (!this._state.auxiliaryState) {
+					throw new Error('custom records need an asset channel');
+				}
+				if (customRecords !== undefined) {
+					entry.customRecords = copyCustomRecords(customRecords);
+					msg.customRecords = entry.customRecords;
+				}
+				this._prepareAuxiliaryHtlc(entry);
+				encodeUpdateAddHtlcMessage(msg);
+			} catch (error) {
+				return [
+					{
+						type: ChannelActionType.ERROR,
+						message: `Cannot add asset HTLC (channel ${this._state.channelId!.toString(
+							'hex'
+						)}): ${error instanceof Error ? error.message : String(error)}`
+					}
+				];
+			}
+		}
+
+		// Asset channels: the provider is asked about the commitment this add
+		// leads to before the add exists anywhere, so a refusal spends no HTLC
+		// id and leaves nothing behind.
+		const auxiliary = this._state.auxiliaryState;
+		const assetRefusal = this._auxiliaryRoundRefusal('an HTLC', {
+			localBalanceMsat: this._state.localBalanceMsat - amountMsat,
+			htlc: { key: `offered-${htlcId}`, entry },
+			...(auxiliary && entry.auxiliaryAmount !== undefined
+				? {
+						auxiliaryBalances: {
+							local: auxiliary.localBalance - entry.auxiliaryAmount,
+							remote: auxiliary.remoteBalance
+						}
+				  }
+				: {})
+		});
+		if (assetRefusal) return assetRefusal;
+
+		this._state.localHtlcCounter++;
+		this._state.htlcs.set(`offered-${htlcId}`, entry);
+
+		// Deduct from local balance provisionally
+		this._state.localBalanceMsat -= amountMsat;
+		this._moveAuxiliaryBalance('local', entry, -1n);
 
 		// We added an offered HTLC — we owe the remote a commitment_signed.
 		this._state.needsCommitment = true;
@@ -3845,7 +4459,8 @@ export class Channel {
 				existing.amountMsat === msg.amountMsat &&
 				existing.paymentHash.equals(msg.paymentHash) &&
 				existing.cltvExpiry === msg.cltvExpiry &&
-				existing.onionRoutingPacket.equals(msg.onionRoutingPacket)
+				existing.onionRoutingPacket.equals(msg.onionRoutingPacket) &&
+				sameCustomRecords(existing.customRecords, msg.customRecords)
 			) {
 				return [];
 			}
@@ -4157,8 +4772,31 @@ export class Channel {
 			// commitment and the node fails it back once committed.
 			...(this._state.fundingUnaccounted === true
 				? { addedWhileFundingUnaccounted: true }
+				: {}),
+			// Read only on an asset channel (the manager reads no custom
+			// records for any other).
+			...(msg.customRecords !== undefined
+				? { customRecords: copyCustomRecords(msg.customRecords) }
 				: {})
 		};
+
+		// An asset channel's HTLC is the provider's to validate: records it
+		// refuses, units its sender does not hold, or a carrier too small to
+		// keep an output cannot be committed to, and BOLT 2 gives no way to
+		// refuse an add on the wire.
+		// The channel is failed only on an answer of the provider that shows
+		// the peer's HTLC to be bad (units it does not hold, a carrier below
+		// dust). A provider that could not answer is this node's failure.
+		try {
+			this._prepareAuxiliaryHtlc(entry);
+		} catch (err) {
+			if (err instanceof AuxiliaryHtlcFault) {
+				return this._failChannelWithWireError(
+					'Invalid asset HTLC metadata or balance'
+				);
+			}
+			return this._auxiliaryLocalFailure('an HTLC of the peer', err);
+		}
 
 		// The reserve check above is measured against the reserve WE enforce,
 		// which on an asymmetric-dust channel can sit below our own dust limit.
@@ -4166,15 +4804,25 @@ export class Channel {
 		// too, and the commitment we hold ends up with nothing to broadcast
 		// (issue #386). Asked of a candidate rather than of live state, so a
 		// refusal leaves nothing behind.
+		const addBuild: { buildError?: unknown } = {};
 		const wouldEmpty = localCommitmentEmptyRefusal(
 			this._state,
 			this._pendingSpliceView,
 			{
 				remoteBalanceMsat: this._state.remoteBalanceMsat - msg.amountMsat,
 				addedHtlc: { key: `received-${msg.id}`, entry }
-			}
+			},
+			addBuild
 		);
 		if (wouldEmpty) {
+			// An asset channel's commitment that could not be built is the
+			// provider's refusal, not the peer's violation.
+			if (this._state.auxiliaryState && 'buildError' in addBuild) {
+				return this._auxiliaryLocalFailure(
+					'an HTLC of the peer',
+					addBuild.buildError
+				);
+			}
 			return this._failChannelWithWireError(wouldEmpty);
 		}
 
@@ -4196,6 +4844,7 @@ export class Channel {
 
 		// Deduct from remote balance provisionally
 		this._state.remoteBalanceMsat -= msg.amountMsat;
+		this._moveAuxiliaryBalance('remote', entry, -1n);
 
 		// Note: HTLC_FORWARDED is NOT emitted here — per BOLT 2, HTLCs should
 		// only be processed after commitment_signed is verified and revoke_and_ack
@@ -4341,7 +4990,26 @@ export class Channel {
 			return repeat;
 		}
 
+		const assetRefusal = this._auxiliaryRoundRefusal(
+			'the settlement of an HTLC',
+			{
+				htlc: {
+					key,
+					entry: {
+						...entry,
+						state: HtlcState.FULFILLED,
+						removalRemoteCommitted: false
+					}
+				}
+			}
+		);
+		if (assetRefusal) return assetRefusal;
+
 		entry.state = HtlcState.FULFILLED;
+		this._decideAuxiliaryHtlc(entry, {
+			outcome: 'settle',
+			preimage: Buffer.from(paymentPreimage)
+		});
 		// Two-phase: the peer's signatures still include this HTLC until it
 		// revokes for our removal — buildLocalCommitment keeps it present.
 		entry.removalRemoteCommitted = false;
@@ -4607,7 +5275,20 @@ export class Channel {
 			return repeat;
 		}
 
+		const assetRefusal = this._auxiliaryRoundRefusal('the failure of an HTLC', {
+			htlc: {
+				key,
+				entry: {
+					...entry,
+					state: HtlcState.FAILED,
+					removalRemoteCommitted: false
+				}
+			}
+		});
+		if (assetRefusal) return assetRefusal;
+
 		entry.state = HtlcState.FAILED;
+		this._decideAuxiliaryHtlc(entry, { outcome: 'fail' });
 		// Two-phase: the peer's signatures still include this HTLC until it
 		// revokes for our removal — buildLocalCommitment keeps it present.
 		entry.removalRemoteCommitted = false;
@@ -4709,7 +5390,20 @@ export class Channel {
 			return repeat;
 		}
 
+		const assetRefusal = this._auxiliaryRoundRefusal('the failure of an HTLC', {
+			htlc: {
+				key,
+				entry: {
+					...entry,
+					state: HtlcState.FAILED,
+					removalRemoteCommitted: false
+				}
+			}
+		});
+		if (assetRefusal) return assetRefusal;
+
 		entry.state = HtlcState.FAILED;
+		this._decideAuxiliaryHtlc(entry, { outcome: 'fail' });
 		// Two-phase removal, exactly as failHtlc.
 		entry.removalRemoteCommitted = false;
 		this._state.needsCommitment = true;
@@ -5009,6 +5703,174 @@ export class Channel {
 	}
 
 	/**
+	 * Asset channels: the refusal of an update whose commitment the provider
+	 * cannot answer for, as the actions of a refusal, or null. Asked of a
+	 * copy of the state, so a refusal leaves nothing behind; any other
+	 * channel is not looked at. See auxiliary-preflight.
+	 */
+	private _auxiliaryRoundRefusal(
+		operation: string,
+		update: IAuxiliaryRoundUpdate
+	): ChannelAction[] | null {
+		if (!this._state.auxiliaryState) return null;
+		// The answers are kept on the live state, which the copy shares, so
+		// the signature that follows finds what was answered here.
+		this._state.auxiliaryAnswers ??= new Map();
+		const refusal = auxiliaryRoundRefusal(this._state, operation, update);
+		if (!refusal) return null;
+		return [
+			{
+				type: ChannelActionType.ERROR,
+				message: refusal.message,
+				code: ChannelErrorCode.ASSET_PROVIDER_REFUSED
+			}
+		];
+	}
+
+	/**
+	 * Asset channels: have the provider sign the asset side of the peer's
+	 * next commitment. Returns the custom records for commitment_signed and
+	 * the asset view they sign, or the reason the round cannot be signed.
+	 * Writes nothing.
+	 */
+	private _signAuxiliaryCommitment(
+		spliceBatch: boolean
+	):
+		| { records?: CustomRecords; view: IAuxiliaryCommitmentData }
+		| { error: string } {
+		if (spliceBatch) {
+			return {
+				error: 'Cannot sign commitment: an asset channel has no splice'
+			};
+		}
+		const point =
+			this._state.remoteNextPerCommitmentPoint ??
+			this._state.remoteCurrentPerCommitmentPoint;
+		if (!this._signer || !point) {
+			return {
+				error:
+					'Cannot sign asset commitment: no signer or peer commitment point'
+			};
+		}
+		const commitmentNumber = this._state.remoteCommitmentNumber + 1n;
+		try {
+			const commitment = buildRemoteCommitment(
+				this._state,
+				point,
+				commitmentNumber
+			);
+			if (!commitment.auxiliary) {
+				return { error: 'Cannot sign asset commitment: no asset view' };
+			}
+			const records = addChildRevocationRecord(
+				this._state,
+				commitment.result.tx,
+				commitment.auxiliary,
+				copyCustomRecords(
+					requireAuxiliaryProvider(this._state).signHtlcs(
+						{
+							state: this._state,
+							side: 'remote',
+							commitmentNumber,
+							perCommitmentPoint: point,
+							commitment
+						},
+						this._signer
+					)
+				)
+			);
+			return {
+				...(records && records.size > 0 ? { records } : {}),
+				view: commitment.auxiliary
+			};
+		} catch (err) {
+			return {
+				error: auxiliaryProviderError(this._state, 'a commitment', err).message
+			};
+		}
+	}
+
+	/**
+	 * Asset channels: check the asset side of a commitment_signed against
+	 * our next commitment. Returns null when it verifies. Otherwise it says
+	 * whose failure it is: the peer's, with the reason to fail the channel,
+	 * when its own record is bad or the provider answers that its signatures
+	 * are; this node's, with what the provider or the builder threw, when
+	 * the question could not be answered at all. The one thing it writes is
+	 * the peer's child custody basepoint for this commitment, which the
+	 * check itself needs; it is taken back on either failure.
+	 */
+	private _verifyAuxiliaryCommitment(
+		msg: ICommitmentSignedMessage
+	): { peer: string } | { local: unknown } | null {
+		const auxiliary = this._state.auxiliaryState!;
+		const commitmentNumber = this._state.localCommitmentNumber + 1n;
+		const point = getPerCommitmentPoint(
+			this._state.localPerCommitmentSeed,
+			commitmentNumber
+		);
+		const basepointsBefore = auxiliary.childRevocationBasepoints
+			? new Map(auxiliary.childRevocationBasepoints)
+			: undefined;
+		const restore = (): void => {
+			if (basepointsBefore) {
+				auxiliary.childRevocationBasepoints = basepointsBefore;
+			} else {
+				delete auxiliary.childRevocationBasepoints;
+			}
+		};
+		try {
+			acceptChildRevocationRecord(this._state, msg.customRecords);
+		} catch {
+			restore();
+			return { peer: 'Invalid asset commitment metadata' };
+		}
+		let commitment: ReturnType<typeof buildLocalCommitment>;
+		try {
+			commitment = buildLocalCommitment(this._state, point, commitmentNumber);
+			if (!commitment.auxiliary) {
+				throw new Error('the commitment has no asset view');
+			}
+		} catch (err) {
+			restore();
+			return { local: err };
+		}
+		try {
+			acceptChildRevocationRecord(
+				this._state,
+				msg.customRecords,
+				commitment.result.tx
+			);
+		} catch {
+			restore();
+			return { peer: 'Invalid asset commitment metadata' };
+		}
+		let verified: unknown;
+		try {
+			verified = requireAuxiliaryProvider(this._state).verifyHtlcs(
+				{
+					state: this._state,
+					side: 'local',
+					commitmentNumber,
+					perCommitmentPoint: point,
+					commitment
+				},
+				msg.customRecords ?? new Map()
+			);
+		} catch (err) {
+			restore();
+			return { local: err };
+		}
+		// Only the answer true verifies: a provider that answers anything
+		// else, a promise among them, has not said the signatures are good.
+		if (verified !== true) {
+			restore();
+			return { peer: 'Invalid asset HTLC signature' };
+		}
+		return null;
+	}
+
+	/**
 	 * Sign and send commitment_signed.
 	 * The caller provides the signature and HTLC signatures (from commitment-builder).
 	 */
@@ -5104,15 +5966,72 @@ export class Channel {
 			}
 		}
 
+		// Asset channels (issue #2093): the provider signs the asset side of
+		// the same commitment and its records travel in this message. A
+		// failure refuses the round before anything below is written.
+		let auxiliarySigned:
+			| { records?: CustomRecords; view: IAuxiliaryCommitmentData }
+			| undefined;
+		if (this._state.auxiliaryState) {
+			const signed = this._signAuxiliaryCommitment(!!spliceBatch);
+			if ('error' in signed) {
+				return [{ type: ChannelActionType.ERROR, message: signed.error }];
+			}
+			auxiliarySigned = signed;
+		}
+
 		const msg: ICommitmentSignedMessage = {
 			channelId: this._state.channelId!,
 			signature: taproot ? Buffer.alloc(64) : signature,
 			htlcSignatures,
-			partialSignatureWithNonce: taproot ? partialSignatureWithNonce : undefined
+			partialSignatureWithNonce: taproot
+				? partialSignatureWithNonce
+				: undefined,
+			...(auxiliarySigned?.records
+				? { customRecords: auxiliarySigned.records }
+				: {})
 		};
 		if (spliceBatch && this._state.fundingTxid) {
 			// Batched commitments are routed by their funding_txid TLV.
 			msg.fundingTxid = Buffer.from(this._state.fundingTxid);
+		}
+		if (auxiliarySigned) {
+			try {
+				// Custom records have no fixed size: find out now, not at send.
+				encodeCommitmentSignedMessage(msg);
+			} catch (err) {
+				return [
+					{
+						type: ChannelActionType.ERROR,
+						message: `Cannot sign asset commitment: ${(err as Error).message}`
+					}
+				];
+			}
+			// Kept with the signature they belong to, for the retransmission
+			// and for the day this commitment is seen on chain.
+			if (auxiliarySigned.records) {
+				this._state.lastSentAuxiliaryRecords = copyCustomRecords(
+					auxiliarySigned.records
+				);
+			} else {
+				delete this._state.lastSentAuxiliaryRecords;
+			}
+			// The row holds the asset side of the peer's current commitment and
+			// of the one this signature puts in flight. The one before is
+			// revoked by now, or this signature would not be made: its view
+			// goes to the store of revoked views with the row that drops it.
+			const remoteViews = this._state.auxiliaryState!.remoteCommitments;
+			remoteViews.set(
+				this._state.remoteCommitmentNumber + 1n,
+				copyAuxiliaryCommitment(auxiliarySigned.view)
+			);
+			for (const [number, view] of [...remoteViews]) {
+				if (number < this._state.remoteCommitmentNumber) {
+					// Kept for a penalty, in the store of revoked views.
+					recordAuxiliaryRevokedView(this._state, number, view);
+					remoteViews.delete(number);
+				}
+			}
 		}
 
 		// Cache for retransmission on reestablish. For taproot we cache the
@@ -5466,6 +6385,25 @@ export class Channel {
 			if (trimmed) return this._failChannelWithWireError(trimmed);
 		}
 
+		// Asset channels (issue #2093): the asset side is verified before
+		// either Bitcoin arm, so an invalid asset signature fails the channel
+		// with our current commitment and its secret still unrevealed.
+		// A provider that could not answer is this node's failure: nothing
+		// is written, nothing blames the peer, and the connection is dropped
+		// so that the peer sends the round again.
+		if (this._state.auxiliaryState) {
+			if (this._auxiliaryAwaitingDisconnect) return [];
+			const refusal = this._verifyAuxiliaryCommitment(msg);
+			if (refusal) {
+				return 'peer' in refusal
+					? this._failChannelWithWireError(refusal.peer)
+					: this._auxiliaryLocalFailure(
+							'the verification of a commitment',
+							refusal.local
+					  );
+			}
+		}
+
 		if (isTaprootChannel(this._state.channelType)) {
 			// Cannot verify -> must not adopt, the taproot twin of the ECDSA arm
 			// below. A plain ERROR, not a wire error: the missing pieces are a
@@ -5519,6 +6457,13 @@ export class Channel {
 				// unreachable past the pre-check above, so err is always a
 				// peer-fault reason here.
 				return this._failChannelWithWireError(err);
+			}
+			const auxiliaryView = this._state.auxiliaryState?.localCommitments.get(
+				this._state.localCommitmentNumber + 1n
+			);
+			if (auxiliaryView) {
+				const peerSignatures = copyCustomRecords(msg.customRecords);
+				if (peerSignatures) auxiliaryView.peerSignatures = peerSignatures;
 			}
 			this._state.remoteHtlcSignatures = msg.htlcSignatures;
 		} else {
@@ -5615,6 +6560,7 @@ export class Channel {
 		// previous signature are not in the commitment we now hold.
 		this._fforRecordVoucherOutcomes();
 		this._state.signedLocalRemovals = undefined;
+		this._pruneAuxiliaryHtlcDecisions();
 
 		// Two-phase update_fee, acceptor side: this commitment_signed from the
 		// opener covers its staged update_fee (the update always precedes its
@@ -5972,21 +6918,27 @@ export class Channel {
 				if (entry.direction === HtlcDirection.RECEIVED) {
 					// We received and fulfilled: credit our balance
 					this._state.localBalanceMsat += entry.amountMsat;
+					this._moveAuxiliaryBalance('local', entry, 1n);
 					this._retainSignedLocalRemoval(entry);
 				} else {
 					// We offered and remote fulfilled: credit remote balance
 					this._state.remoteBalanceMsat += entry.amountMsat;
+					this._moveAuxiliaryBalance('remote', entry, 1n);
 				}
+				this._recordAuxiliaryResolution(entry);
 				this._state.htlcs.delete(key);
 			} else if (entry.state === HtlcState.FAILED) {
 				if (entry.direction === HtlcDirection.RECEIVED) {
 					// We received but failed: refund remote balance
 					this._state.remoteBalanceMsat += entry.amountMsat;
+					this._moveAuxiliaryBalance('remote', entry, 1n);
 					this._retainSignedLocalRemoval(entry);
 				} else {
 					// We offered but it failed: refund our balance
 					this._state.localBalanceMsat += entry.amountMsat;
+					this._moveAuxiliaryBalance('local', entry, 1n);
 				}
+				this._recordAuxiliaryResolution(entry);
 				this._state.htlcs.delete(key);
 			}
 		}
@@ -6241,6 +7193,11 @@ export class Channel {
 				}
 			];
 
+		const assetRefusal = this._auxiliaryRoundRefusal('a fee update', {
+			pendingFeeratePerKw: feeratePerKw
+		});
+		if (assetRefusal) return assetRefusal;
+
 		// Stage the new feerate as pending — do NOT apply it to the committed
 		// config yet. It is used for the commitment built in this round and only
 		// promoted to localConfig.feeratePerKw once the round irrevocably commits
@@ -6408,14 +7365,24 @@ export class Channel {
 		// since our local commitment builds at the staged rate from the moment
 		// it is accepted, so this must run BEFORE anything below is written or a
 		// refusal would promote a rate for a round that never happens.
+		const feeBuild: { buildError?: unknown } = {};
 		const wouldEmpty = localCommitmentEmptyRefusal(
 			this._state,
 			this._pendingSpliceView,
 			{
 				pendingFeeratePerKw: msg.feeratePerKw
-			}
+			},
+			feeBuild
 		);
 		if (wouldEmpty) {
+			// As in handleUpdateAddHtlc: the provider's refusal is not the
+			// peer's violation.
+			if (this._state.auxiliaryState && 'buildError' in feeBuild) {
+				return this._auxiliaryLocalFailure(
+					'a fee update of the peer',
+					feeBuild.buildError
+				);
+			}
 			return this._failChannelWithWireError(wouldEmpty);
 		}
 
@@ -7749,9 +8716,13 @@ export class Channel {
 			// THROW rather than return false, and that is the same answer here:
 			// no witness this rebuild can carry.
 			try {
+				// An asset channel's funding key also commits to its asset
+				// root; for every other channel the root is absent.
 				const { p2trOutput, outputKey } = createTaprootFundingScript(
 					view.localBasepoints.fundingPubkey,
-					remoteFundingPubkey
+					remoteFundingPubkey,
+					undefined,
+					view.fundingTaprootMerkleRoot
 				);
 				const sighash = taprootCommitmentSighash(
 					tx,
@@ -7763,7 +8734,8 @@ export class Channel {
 					view.localBasepoints.fundingPubkey,
 					remoteFundingPubkey,
 					taprootNonce,
-					view.remoteSigningNonce!
+					view.remoteSigningNonce!,
+					view.fundingTaprootMerkleRoot
 				);
 				if (
 					!verifyPartialCommitmentSig(
@@ -8037,25 +9009,33 @@ export class Channel {
 		// The peer chooses its shutdown script later. Price a P2TR/P2WSH
 		// output until that script is known and label every quote estimated.
 		const remoteLength = state.remoteShutdownScript?.length ?? 34;
-		const weight = closingTxWeight(scriptPubkey.length, remoteLength, taproot);
-		const calculated = calculateClosingFee(
-			rate,
-			scriptPubkey.length,
-			remoteLength,
-			taproot
+		// An asset channel closes to a taproot script its provider names,
+		// whatever script was asked for, and may add outputs of its own.
+		const weight = this._closingWeight(
+			closingTxWeight(
+				state.auxiliaryState ? 34 : scriptPubkey.length,
+				remoteLength,
+				taproot
+			)
 		);
+		const calculated = state.auxiliaryState
+			? BigInt(Math.ceil((weight * rate) / 1000))
+			: calculateClosingFee(rate, scriptPubkey.length, remoteLength, taproot);
 		const floor = minRelayFeeForWeight(weight);
 		const fee = calculated > floor ? calculated : floor;
 		const localPays = simple || state.role === ChannelRole.OPENER;
 		const localFee = localPays ? fee : 0n;
 		const amount = state.localBalanceMsat / 1000n - localFee;
-		const dust = simple
-			? isDustOutput(scriptPubkey, amount)
-			: amount <
-			  closingOutputDustLimit(
-					scriptPubkey,
-					state.localConfig.dustLimitSatoshis
-			  );
+		const dust =
+			(state.auxiliaryState?.localBalance ?? 0n) > 0n
+				? amount < AUXILIARY_CLOSE_ASSET_OUTPUT_MINIMUM
+				: simple
+				? isDustOutput(scriptPubkey, amount)
+				: amount <
+				  closingOutputDustLimit(
+						scriptPubkey,
+						state.localConfig.dustLimitSatoshis
+				  );
 		if (amount <= 0n || dust)
 			throw new Error('Cannot close cooperatively: our payout would be dust');
 		const profile = closingTxRelayProfile({
@@ -8126,6 +9106,14 @@ export class Channel {
 		acceptStaleStateRisk = false,
 		externalDestination = false
 	): ChannelAction[] {
+		// An asset channel closes to the script its provider names, so it
+		// cannot be closed to an address the caller chose.
+		if (externalDestination) {
+			const assetRefusal = this._refuseForAssetChannel(
+				'a close to an address of the caller'
+			);
+			if (assetRefusal) return assetRefusal;
+		}
 		// A mutual close needs no revocation, which is why the hold allows the
 		// channel to resume - but it pays out the balances THIS row carries,
 		// and a stale capsule's allocation can only ever be the peer-favourable
@@ -8235,6 +9223,205 @@ export class Channel {
 		return actions;
 	}
 
+	/** What stopped the provider from building the close last judged for relay. */
+	private _auxiliaryCloseFailure: unknown;
+
+	/**
+	 * The refusal of a close step an asset channel's provider could not
+	 * answer. As on the commitment path (_auxiliaryLocalFailure) that is a
+	 * failure of this node: a typed local error, nothing that blames the
+	 * peer, and the connection dropped, because a close moves only when a
+	 * message arrives and the reestablish of the next connection is what
+	 * has both nodes send the shutdowns and the proposal again. Without the
+	 * drop the close hangs on a live connection until the stuck scan force
+	 * closes the channel. `drop` is false only where the refusal answers a
+	 * call of this node's own operator, who is told directly and whose peer
+	 * waits for nothing.
+	 */
+	private _auxiliaryCloseRefused(
+		cause: unknown,
+		operation = 'a cooperative close',
+		drop = true
+	): ChannelAction[] {
+		const message = auxiliaryProviderError(
+			this._state,
+			operation,
+			cause
+		).message;
+		const refused: ChannelAction[] = [
+			{
+				type: ChannelActionType.ERROR,
+				message,
+				code: ChannelErrorCode.ASSET_PROVIDER_REFUSED
+			}
+		];
+		if (drop) {
+			refused.push({
+				type: ChannelActionType.DISCONNECT_PEER,
+				reason: message
+			});
+		}
+		return refused;
+	}
+
+	/**
+	 * The closing weight with the outputs an asset close adds. Throws the
+	 * typed provider error when the provider cannot say; the entry points of
+	 * a close ask _auxiliaryCloseShapeRefusal first.
+	 */
+	private _closingWeight(baseWeight: number): number {
+		if (!this._state.auxiliaryState) return baseWeight;
+		// A round of the close asks once: see _auxiliaryCloseShapeRefusal.
+		if (this._auxiliaryCloseExtraWeight !== undefined) {
+			return baseWeight + this._auxiliaryCloseExtraWeight;
+		}
+		try {
+			return auxiliaryClosingWeight(this._state, baseWeight);
+		} catch (err) {
+			throw auxiliaryProviderError(this._state, 'a cooperative close', err);
+		}
+	}
+
+	/**
+	 * The weight the provider's outputs add to the close, as it said at the
+	 * start of the round of the negotiation now being handled. Kept so that
+	 * the fee, the band and the relay floor of one round are priced from one
+	 * answer, and so that no later ask of the same round can fail in the
+	 * middle of a handler. Asked again at every round, forgotten with the
+	 * connection.
+	 */
+	private _auxiliaryCloseExtraWeight: number | undefined;
+
+	/**
+	 * Null when the provider can say what outputs its close adds, else the
+	 * refusal. Called first at each entry point of the negotiation: the one
+	 * ask of the round.
+	 */
+	private _auxiliaryCloseShapeRefusal(): ChannelAction[] | null {
+		if (!this._state.auxiliaryState) return null;
+		this._auxiliaryCloseExtraWeight = undefined;
+		try {
+			this._auxiliaryCloseExtraWeight = auxiliaryClosingWeight(this._state, 0);
+			return null;
+		} catch (err) {
+			return this._auxiliaryCloseRefused(err);
+		}
+	}
+
+	/**
+	 * Null when the provider can build the asset side of the close at this
+	 * fee, or for any other channel; else the refusal. Signs and stores
+	 * nothing.
+	 */
+	private _auxiliaryCloseRefusal(feeSatoshis: bigint): ChannelAction[] | null {
+		if (!this._state.auxiliaryState) return null;
+		try {
+			auxiliaryClosingRelayProfile(this._state, feeSatoshis);
+			return null;
+		} catch (err) {
+			return this._auxiliaryCloseRefused(err);
+		}
+	}
+
+	/**
+	 * Mark the spend of the funding output this node took for the
+	 * cooperative close as one it holds no close payload for, or take the
+	 * mark away with null. Returns whether the durable state changed: the
+	 * caller writes the row and tells the host only then. Nothing for a
+	 * channel without asset state.
+	 */
+	markUnrecordedAuxiliaryClose(txid: string | null): boolean {
+		const auxiliary = this._state.auxiliaryState;
+		if (!auxiliary) return false;
+		if ((auxiliary.unrecordedCloseTxid ?? null) === txid) return false;
+		if (txid === null) delete auxiliary.unrecordedCloseTxid;
+		else auxiliary.unrecordedCloseTxid = txid;
+		return true;
+	}
+
+	/**
+	 * Keep the provider's payload for a closing transaction this node is
+	 * about to sign. The manager calls it before our signature exists, and
+	 * the row is written before that signature leaves.
+	 */
+	recordAuxiliaryCloseCandidate(txid: string, customData: Buffer): void {
+		recordAuxiliaryClose(this._state, txid, customData);
+	}
+
+	/**
+	 * The script an asset channel closes to and the asset records that
+	 * travel beside it, as its provider names them, or the refusal. What was
+	 * sent once stays: the peer holds it. Stores nothing; the caller does,
+	 * once nothing else can refuse the shutdown.
+	 */
+	private _prepareAuxiliaryShutdown(
+		destinationScript: Buffer,
+		peerScript: Buffer | null = this._state.remoteShutdownScript,
+		answering = false
+	):
+		| { scriptPubkey: Buffer; customRecords: Map<bigint, Buffer> }
+		| { refusal: ChannelAction[] } {
+		const auxiliary = this._state.auxiliaryState!;
+		const sentScript = this._state.localShutdownScript;
+		if (auxiliary.localShutdownRecords && sentScript && sentScript.length > 0) {
+			return {
+				scriptPubkey: sentScript,
+				customRecords: auxiliary.localShutdownRecords
+			};
+		}
+		try {
+			if (!this._signer) throw new Error('Asset shutdown requires a signer');
+			const prepared = requireAuxiliaryProvider(this._state).prepareShutdown(
+				this._state,
+				destinationScript,
+				this._signer
+			);
+			if (
+				!prepared ||
+				!Buffer.isBuffer(prepared.scriptPubkey) ||
+				!isValidShutdownScript(prepared.scriptPubkey, true, false)
+			) {
+				throw new Error('Invalid asset shutdown script');
+			}
+			const scriptPubkey = Buffer.from(prepared.scriptPubkey);
+			// One script is never named by both parties: the closing
+			// transaction would hold two outputs nothing but their values
+			// tells apart.
+			if (
+				peerScript &&
+				peerScript.length > 0 &&
+				scriptPubkey.equals(peerScript)
+			) {
+				throw new Error(
+					'Asset shutdown script is the script the peer closes to'
+				);
+			}
+			const customRecords =
+				copyCustomRecords(prepared.customRecords) ?? new Map<bigint, Buffer>();
+			// The reader's rules, before anything is sent: what leaves is what
+			// the peer reads, and what this node reads back from its row.
+			const read = decodeShutdownMessage(
+				encodeShutdownMessage({
+					channelId: this._state.channelId!,
+					scriptPubkey,
+					customRecords
+				}),
+				{ customRecords: true }
+			);
+			if (
+				!read.scriptPubkey.equals(scriptPubkey) ||
+				!sameCustomRecords(read.customRecords, customRecords)
+			) {
+				throw new Error('Asset shutdown records do not survive the wire');
+			}
+			return { scriptPubkey, customRecords };
+		} catch (err) {
+			return {
+				refusal: this._auxiliaryCloseRefused(err, 'a shutdown', answering)
+			};
+		}
+	}
+
 	private _initiateShutdown(scriptPubkey: Buffer): ChannelAction[] {
 		// option_simple_close allows re-sending shutdown to update the local
 		// script mid-negotiation (restarting the signing flow); legacy close
@@ -8261,6 +9448,19 @@ export class Channel {
 			];
 		}
 
+		// An asset channel closes to the script its provider names, with the
+		// asset records that travel beside it. Asked before anything of the
+		// shutdown is stored or sent.
+		let assetShutdown:
+			| { scriptPubkey: Buffer; customRecords: Map<bigint, Buffer> }
+			| undefined;
+		if (this._state.auxiliaryState) {
+			const prepared = this._prepareAuxiliaryShutdown(scriptPubkey);
+			if ('refusal' in prepared) return prepared.refusal;
+			assetShutdown = prepared;
+			scriptPubkey = prepared.scriptPubkey;
+		}
+
 		// Guard against a misconfigured local close script — never broadcast a
 		// shutdown whose output we could not spend.
 		if (
@@ -8280,6 +9480,10 @@ export class Channel {
 		}
 
 		this._state.localShutdownScript = scriptPubkey;
+		if (assetShutdown) {
+			this._state.auxiliaryState!.localShutdownRecords =
+				assetShutdown.customRecords;
+		}
 		if (this._state.state === ChannelState.NORMAL) {
 			this._state.state = ChannelState.SHUTTING_DOWN;
 		} else {
@@ -8290,7 +9494,8 @@ export class Channel {
 
 		const msg: IShutdownMessage = {
 			channelId: this._state.channelId!,
-			scriptPubkey
+			scriptPubkey,
+			...(assetShutdown ? { customRecords: assetShutdown.customRecords } : {})
 		};
 		if (isTaprootChannel(this._state.channelType)) {
 			// Simple-taproot close: every shutdown we send starts a fresh MuSig2
@@ -8298,7 +9503,17 @@ export class Channel {
 			msg.shutdownNonce = this._refreshOurClosingNonce();
 		}
 
-		return [sendMsg(MessageType.SHUTDOWN, encodeShutdownMessage(msg))];
+		// An asset channel: the row (the state, our script and the records
+		// beside it) is written before the shutdown leaves. A node that
+		// stops right after it sent then sends again what the row holds and
+		// does not ask its provider anew: the peer holds the descriptor and
+		// refuses another.
+		return [
+			...(assetShutdown
+				? [{ type: ChannelActionType.PERSIST_STATE } as ChannelAction]
+				: []),
+			sendMsg(MessageType.SHUTDOWN, encodeShutdownMessage(msg))
+		];
 	}
 
 	/**
@@ -8308,9 +9523,11 @@ export class Channel {
 	 * should retransmit the plain shutdown directly.
 	 */
 	buildShutdownRetransmit(): IShutdownMessage {
+		const assetRecords = this._state.auxiliaryState?.localShutdownRecords;
 		const msg: IShutdownMessage = {
 			channelId: this._state.channelId!,
-			scriptPubkey: this._state.localShutdownScript ?? Buffer.alloc(0)
+			scriptPubkey: this._state.localShutdownScript ?? Buffer.alloc(0),
+			...(assetRecords ? { customRecords: assetRecords } : {})
 		};
 		if (isTaprootChannel(this._state.channelType)) {
 			msg.shutdownNonce = this._refreshOurClosingNonce();
@@ -8408,6 +9625,68 @@ export class Channel {
 			return this._failChannelWithWireError('Invalid shutdown scriptPubkey');
 		}
 
+		// An asset channel: the provider judges the asset records beside the
+		// peer's script, and our own answer is prepared, before anything of
+		// this shutdown is stored.
+		let ownAssetShutdown:
+			| { scriptPubkey: Buffer; customRecords: Map<bigint, Buffer> }
+			| undefined;
+		if (this._state.auxiliaryState) {
+			const auxiliary = this._state.auxiliaryState;
+			let records = new Map<bigint, Buffer>();
+			let valid: boolean;
+			try {
+				records = copyCustomRecords(msg.customRecords) ?? records;
+				valid =
+					requireAuxiliaryProvider(this._state).verifyShutdown(this._state, {
+						scriptPubkey: Buffer.from(msg.scriptPubkey),
+						customRecords: records
+					}) === true;
+			} catch (err) {
+				// A provider that cannot judge is not the peer's fault: refuse
+				// here, by name, and leave the channel as it was.
+				return this._auxiliaryCloseRefused(err, 'a shutdown');
+			}
+			if (!valid) {
+				return this._failChannelWithWireError(
+					'Invalid asset shutdown descriptor'
+				);
+			}
+			// The peer chooses its script, and it may not choose ours: the
+			// two payouts of the close would be told apart by nothing but
+			// their values. It knew ours when it sent this, so it is told.
+			const ownScript = this._state.localShutdownScript;
+			if (
+				ownScript &&
+				ownScript.length > 0 &&
+				ownScript.equals(msg.scriptPubkey)
+			) {
+				return this._failChannelWithWireError(
+					'Asset shutdown script is the script this node closes to'
+				);
+			}
+			const previous = auxiliary.remoteShutdownRecords;
+			if (
+				previous &&
+				(!sameCustomRecords(previous, records) ||
+					!this._state.remoteShutdownScript?.equals(msg.scriptPubkey))
+			) {
+				return this._failChannelWithWireError(
+					'Asset shutdown descriptor changed during negotiation'
+				);
+			}
+			if (this._state.state === ChannelState.NORMAL) {
+				const prepared = this._prepareAuxiliaryShutdown(
+					localScript ?? this._state.localShutdownScript ?? Buffer.alloc(0),
+					msg.scriptPubkey,
+					true
+				);
+				if ('refusal' in prepared) return prepared.refusal;
+				ownAssetShutdown = prepared;
+			}
+			auxiliary.remoteShutdownRecords = records;
+		}
+
 		// Accept shutdown in NEGOTIATING_CLOSING — peer retransmits after
 		// reestablish, or (simple close) updates its script mid-negotiation,
 		// which abandons our in-flight closing_complete round.
@@ -8440,6 +9719,11 @@ export class Channel {
 
 		// If we haven't sent shutdown yet, send our shutdown response
 		if (this._state.state === ChannelState.NORMAL) {
+			if (ownAssetShutdown) {
+				localScript = ownAssetShutdown.scriptPubkey;
+				this._state.auxiliaryState!.localShutdownRecords =
+					ownAssetShutdown.customRecords;
+			}
 			if (localScript) {
 				this._state.localShutdownScript = localScript;
 			}
@@ -8451,10 +9735,20 @@ export class Channel {
 			if (this._state.localShutdownScript.length > 0) {
 				const response: IShutdownMessage = {
 					channelId: this._state.channelId!,
-					scriptPubkey: this._state.localShutdownScript
+					scriptPubkey: this._state.localShutdownScript,
+					...(ownAssetShutdown
+						? { customRecords: ownAssetShutdown.customRecords }
+						: {})
 				};
 				if (isTaprootChannel(this._state.channelType)) {
 					response.shutdownNonce = this._refreshOurClosingNonce();
+				}
+				// An asset channel: the row is written before our answer leaves,
+				// as on the side that starts the close (_initiateShutdown). It
+				// holds the state this handler ends in, our script, and the
+				// records of both parties.
+				if (ownAssetShutdown) {
+					actions.push({ type: ChannelActionType.PERSIST_STATE });
 				}
 				actions.push(
 					sendMsg(MessageType.SHUTDOWN, encodeShutdownMessage(response))
@@ -8559,15 +9853,27 @@ export class Channel {
 				// this connection yet; the proposal fires when it does.
 				return [];
 			}
+			const assetShapeRefusal = this._auxiliaryCloseShapeRefusal();
+			if (assetShapeRefusal) return assetShapeRefusal;
 			const idealFee = this.calculateIdealClosingFee();
 			if (!this.closingFeeRelays(idealFee)) {
 				return this.refuseUnrelayableClosingFee('Cannot propose closing fee');
 			}
+			const previousProposal = this._state.lastProposedClosingFeeSat;
 			this._state.lastProposedClosingFeeSat = idealFee;
-			const partial =
-				typeof signatureOrFn === 'function'
-					? signatureOrFn(idealFee)
-					: signatureOrFn;
+			let partial: Buffer;
+			try {
+				partial =
+					typeof signatureOrFn === 'function'
+						? signatureOrFn(idealFee)
+						: signatureOrFn;
+			} catch (err) {
+				// Only an asset channel has a provider that can fail here: it
+				// refuses by name, nothing is sent and no offer is held.
+				if (!this._state.auxiliaryState) throw err;
+				this._state.lastProposedClosingFeeSat = previousProposal;
+				return this._auxiliaryCloseRefused(err);
+			}
 			this._hasSignedClosing = true;
 			const taprootMsg: IClosingSignedMessage = {
 				channelId: this._state.channelId!,
@@ -8617,6 +9923,18 @@ export class Channel {
 		signClosingFn: (feeSatoshis: bigint) => Buffer,
 		verifyClosingFn?: (feeSatoshis: bigint, signature: Buffer) => boolean
 	): ChannelAction[] {
+		// An asset channel: the peer can send the close this node already
+		// accepted once more, after our reply crossed it. Only that exact
+		// message is taken, also after a restart, and nothing is signed for it.
+		if (
+			this._state.state === ChannelState.CLOSED &&
+			this._state.lastCooperativeCloseTxHex &&
+			this._state.auxiliaryState?.acceptedClosingSigned?.equals(
+				encodeClosingSignedMessage(msg)
+			)
+		) {
+			return [];
+		}
 		if (
 			this._state.state !== ChannelState.NEGOTIATING_CLOSING &&
 			this._state.state !== ChannelState.SHUTTING_DOWN
@@ -8669,11 +9987,21 @@ export class Channel {
 
 		// Simple-taproot close: single-round MuSig2 negotiation.
 		if (isTaprootChannel(this._state.channelType)) {
-			return this._handleTaprootClosingSigned(
+			const actions = this._handleTaprootClosingSigned(
 				msg,
 				signClosingFn,
 				verifyClosingFn
 			);
+			if (
+				this._state.auxiliaryState &&
+				actions.some(
+					(action) => action.type === ChannelActionType.CHANNEL_CLOSED
+				)
+			) {
+				this._state.auxiliaryState.acceptedClosingSigned =
+					encodeClosingSignedMessage(msg);
+			}
+			return actions;
 		}
 
 		// Initialize our fee range if not done yet
@@ -8851,8 +10179,25 @@ export class Channel {
 			];
 		}
 
-		const peerSigValid = (feeSatoshis: bigint): boolean =>
-			!verifyClosingFn || verifyClosingFn(feeSatoshis, msg.partialSignature!);
+		// An asset channel: the close is built before the signature can be
+		// judged over it, and the judge throws when it could not be built.
+		// That is this node's failure (its provider's refusal) and never a
+		// bad signature of the peer, whatever the answer below would be.
+		const judged: { refusal?: ChannelAction[] } = {};
+		const peerSigValid = (feeSatoshis: bigint): boolean => {
+			if (!verifyClosingFn) return true;
+			if (!this._state.auxiliaryState) {
+				return verifyClosingFn(feeSatoshis, msg.partialSignature!);
+			}
+			try {
+				return verifyClosingFn(feeSatoshis, msg.partialSignature!);
+			} catch (err) {
+				judged.refusal = this._auxiliaryCloseRefused(err);
+				return false;
+			}
+		};
+		const assetShapeRefusal = this._auxiliaryCloseShapeRefusal();
+		if (assetShapeRefusal) return assetShapeRefusal;
 
 		// Initiator: we already made our (only) offer.
 		if (this._state.lastProposedClosingFeeSat !== null) {
@@ -8865,7 +10210,10 @@ export class Channel {
 						`got ${msg.feeSatoshis}`
 				);
 			}
+			const assetCloseRefusal = this._auxiliaryCloseRefusal(msg.feeSatoshis);
+			if (assetCloseRefusal) return assetCloseRefusal;
 			if (!peerSigValid(msg.feeSatoshis)) {
+				if (judged.refusal) return judged.refusal;
 				return this._failChannelWithWireError(
 					'Coop-close: peer closing partial signature failed to verify'
 				);
@@ -8897,17 +10245,26 @@ export class Channel {
 		// of the two sides' committed rates): the initiator picks its own
 		// closing feerate, which may exceed our stale local config, so a band
 		// keyed only to our local feerate would reject legitimate offers.
+		//
+		// An asset channel is a taproot channel, whose two commitment feerates
+		// are pinned at the 253 sat/kw floor, while the proposer prices the
+		// close at its live feerate: a band built from the committed rates
+		// refuses every honest proposal above a few sat/vB. For an asset
+		// channel the band is built from this node's own live closing
+		// feerate, the estimate it would propose with itself.
+		const liveBand = !!this._state.auxiliaryState;
 		const bandFeeRate = BigInt(
 			Math.max(
 				this._state.localConfig.feeratePerKw || 253,
 				this._state.remoteConfig.feeratePerKw || 253,
-				253
+				253,
+				liveBand ? Math.ceil(this.getClosingFeeratePerKw()) : 0
 			)
 		);
 		const bandLocalLen = this._state.localShutdownScript?.length ?? 22;
 		const bandRemoteLen = this._state.remoteShutdownScript?.length ?? 22;
 		const bandWeight = BigInt(
-			closingTxWeight(bandLocalLen, bandRemoteLen, true)
+			this._closingWeight(closingTxWeight(bandLocalLen, bandRemoteLen, true))
 		);
 		const idealFee = (bandWeight * bandFeeRate + 999n) / 1000n;
 		// The lenient interop floor, but never below what the tx needs to relay:
@@ -8915,7 +10272,9 @@ export class Channel {
 		// close leaves CLOSED with a tx no mempool takes and no RBF to replace
 		// it (issue #579).
 		const relayFloor = minRelayFeeForWeight(bandWeight);
-		const bandFloor = idealFee / 5n;
+		// An asset channel takes any fee that relays: a fee below this node's
+		// estimate is slow, and either party can still bump its own output.
+		const bandFloor = liveBand ? 0n : idealFee / 5n;
 		const minAcceptableFee = bandFloor > relayFloor ? bandFloor : relayFloor;
 		// The fee comes out of the OPENER's output only. When WE are the opener the
 		// fee is paid from OUR balance, so bound it tightly (the legacy 2x cap) and
@@ -8928,7 +10287,13 @@ export class Channel {
 		const openerBalanceSat = isOpener
 			? this._state.localBalanceMsat / 1000n
 			: this._state.remoteBalanceMsat / 1000n;
-		const maxAcceptableFee = isOpener ? idealFee * 2n : idealFee * 5n;
+		// An asset channel, where the estimate is live and two honest nodes
+		// read the mempool apart: a fee the peer pays is taken up to ten times
+		// this node's estimate. A fee this node pays keeps the 2x cap, and
+		// the arms below keep what the node must keep of its balance.
+		const maxAcceptableFee = isOpener
+			? idealFee * 2n
+			: idealFee * (liveBand ? 10n : 5n);
 		if (
 			msg.feeSatoshis > maxAcceptableFee ||
 			msg.feeSatoshis < minAcceptableFee
@@ -8963,7 +10328,14 @@ export class Channel {
 				`Taproot closing fee ${msg.feeSatoshis} exceeds opener balance ${openerBalanceSat}`
 			);
 		}
+		// An asset channel: the provider builds the asset side of the close
+		// this message asks for before its signature is judged, so a provider
+		// that cannot answer refuses here, by name, and is not taken for a bad
+		// signature of the peer.
+		const assetCloseRefusal = this._auxiliaryCloseRefusal(msg.feeSatoshis);
+		if (assetCloseRefusal) return assetCloseRefusal;
 		if (!peerSigValid(msg.feeSatoshis)) {
+			if (judged.refusal) return judged.refusal;
 			return this._failChannelWithWireError(
 				'Coop-close: peer closing partial signature failed to verify'
 			);
@@ -8972,7 +10344,15 @@ export class Channel {
 			// Duplicate closing_signed in the same session — our reply is out.
 			return [];
 		}
-		const partial = signClosingFn(msg.feeSatoshis);
+		let partial: Buffer;
+		try {
+			partial = signClosingFn(msg.feeSatoshis);
+		} catch (err) {
+			// Only an asset channel has a provider that can fail here: it
+			// refuses by name, with nothing signed, sent or stored.
+			if (!this._state.auxiliaryState) throw err;
+			return this._auxiliaryCloseRefused(err);
+		}
 		this._hasSignedClosing = true;
 		this._state.lastProposedClosingFeeSat = msg.feeSatoshis;
 		this._state.state = ChannelState.CLOSED;
@@ -9019,12 +10399,20 @@ export class Channel {
 		// real weight.
 		const localLen = this._state.localShutdownScript?.length ?? 22;
 		const remoteLen = this._state.remoteShutdownScript?.length ?? 22;
-		const fee = calculateClosingFee(
-			feeRate,
-			localLen,
-			remoteLen,
-			isTaprootChannel(this._state.channelType)
-		);
+		const fee = this._state.auxiliaryState
+			? BigInt(
+					Math.ceil(
+						(this._closingWeight(closingTxWeight(localLen, remoteLen, true)) *
+							feeRate) /
+							1000
+					)
+			  )
+			: calculateClosingFee(
+					feeRate,
+					localLen,
+					remoteLen,
+					isTaprootChannel(this._state.channelType)
+			  );
 		// A feerate below ~1 sat/vB (a stale or lowballed commitment feerate on a
 		// non-anchor channel) prices a tx nothing will relay, and the acceptance
 		// range and counter clamp are both fractions of this one fee.
@@ -9045,10 +10433,12 @@ export class Channel {
 		const localLen = this._state.localShutdownScript?.length ?? 22;
 		const remoteLen = this._state.remoteShutdownScript?.length ?? 22;
 		return minRelayFeeForWeight(
-			closingTxWeight(
-				localLen,
-				remoteLen,
-				isTaprootChannel(this._state.channelType)
+			this._closingWeight(
+				closingTxWeight(
+					localLen,
+					remoteLen,
+					isTaprootChannel(this._state.channelType)
+				)
 			)
 		);
 	}
@@ -9060,6 +10450,13 @@ export class Channel {
 	 * to pay a miner with.
 	 */
 	private refuseUnrelayableClosingFee(prefix: string): ChannelAction[] {
+		// An asset channel whose provider could not build the close is
+		// refused for that, by name, and not for a fee.
+		const assetFailure = this._auxiliaryCloseFailure;
+		if (assetFailure !== undefined) {
+			this._auxiliaryCloseFailure = undefined;
+			return this._auxiliaryCloseRefused(assetFailure);
+		}
 		return [
 			{
 				type: ChannelActionType.ERROR,
@@ -9094,6 +10491,22 @@ export class Channel {
 				this.ownClosingOutputDustLimit()
 		)
 			return false;
+		if (
+			this._state.auxiliaryState &&
+			this._state.localShutdownScript &&
+			this._state.remoteShutdownScript
+		) {
+			// Judged on the exact layout the provider answers, which is the
+			// transaction that would be signed.
+			this._auxiliaryCloseFailure = undefined;
+			try {
+				const profile = auxiliaryClosingRelayProfile(this._state, feeSatoshis);
+				return profile.feePaid >= minRelayFeeForWeight(profile.weight);
+			} catch (err) {
+				this._auxiliaryCloseFailure = err;
+				return false;
+			}
+		}
 		const { feePaid, weight } = closingTxRelayProfile({
 			fundingAmount: this._state.fundingSatoshis,
 			localScriptPubkey:
@@ -9251,6 +10664,8 @@ export class Channel {
 			closeeScriptPubkey: Buffer
 		) => Buffer
 	): ChannelAction[] {
+		const assetRefusal = this._refuseForAssetChannel('a simple close');
+		if (assetRefusal) return assetRefusal;
 		const err = (message: string): ChannelAction[] => [
 			{ type: ChannelActionType.ERROR, message }
 		];
@@ -9395,6 +10810,8 @@ export class Channel {
 			closeeScriptPubkey: Buffer
 		) => Buffer
 	): ChannelAction[] {
+		const assetRefusal = this._refuseForAssetChannel('a simple close');
+		if (assetRefusal) return assetRefusal;
 		// A closing_complete that does not fit the channel's state (or arrives
 		// while something is still unresolved) is refused locally. One refused
 		// for its content, by the spec or by our own fee, locktime and payout
@@ -9610,6 +11027,8 @@ export class Channel {
 			signature: Buffer
 		) => boolean
 	): ChannelAction[] {
+		const assetRefusal = this._refuseForAssetChannel('a simple close');
+		if (assetRefusal) return assetRefusal;
 		// State refusals stay local; a closing_sig refused for its content gets
 		// a warning and a disconnect, as in handleClosingComplete.
 		const err = (message: string): ChannelAction[] => [
@@ -9857,7 +11276,9 @@ export class Channel {
 			}
 			let msg: IUpdateAddHtlcMessage;
 			try {
-				msg = decodeUpdateAddHtlcMessage(update.payload);
+				msg = decodeUpdateAddHtlcMessage(update.payload, {
+					customRecords: this._state.auxiliaryState !== undefined
+				});
 			} catch {
 				// Undecodable: leave it exactly as it was rather than guess.
 				kept.push(update);
@@ -9883,6 +11304,12 @@ export class Channel {
 				// arithmetic handleRevokeAndAck applies to a terminally failed
 				// offered HTLC.
 				this._state.localBalanceMsat += entry.amountMsat;
+				this._moveAuxiliaryBalance('local', entry, 1n);
+				// An asset HTLC that leaves the channel here has ended as
+				// failed, and its host is told so like of any other
+				// (onHtlcResolved): the units are back and nothing else
+				// would ever say what became of the HTLC.
+				this._recordAuxiliaryResolution(entry);
 			}
 			dropped.push({
 				htlcId: msg.id,
@@ -10099,6 +11526,8 @@ export class Channel {
 		// reestablish, and appending post-reconnect commitments to a stale
 		// half-collected batch would pair signatures across two deliveries.
 		this._pendingBatch = null;
+		this._auxiliaryAwaitingDisconnect = false;
+		this._auxiliaryCloseExtraWeight = undefined;
 
 		// Quiescence never survives a disconnect (BOLT 2 quiescence).
 		this._quiescence.reset();
@@ -10134,6 +11563,7 @@ export class Channel {
 			) {
 				this._state.htlcs.delete(key);
 				this._state.remoteBalanceMsat += entry.amountMsat;
+				this._moveAuxiliaryBalance('remote', entry, 1n);
 				continue;
 			}
 			// A peer fulfill/fail of our offered HTLC never covered by the
@@ -12189,7 +13619,11 @@ export class Channel {
 					htlcSignatures: this._state.lastSentHtlcSignatures,
 					partialSignatureWithNonce: taprootReest
 						? this._state.lastSentPartialSignatureWithNonce!
-						: undefined
+						: undefined,
+					// Asset channels: the same asset signatures as the first time.
+					...(this._state.lastSentAuxiliaryRecords
+						? { customRecords: this._state.lastSentAuxiliaryRecords }
+						: {})
 				};
 				actions.push(
 					replayMsg(
@@ -12652,6 +14086,8 @@ export class Channel {
 	 * Cannot quiesce with pending HTLCs.
 	 */
 	initiateQuiescence(): ChannelAction[] {
+		const assetRefusal = this._refuseForAssetChannel('quiescence');
+		if (assetRefusal) return assetRefusal;
 		if (this._state.state !== ChannelState.NORMAL) {
 			return [
 				{
@@ -12739,6 +14175,8 @@ export class Channel {
 	}
 
 	handleStfuMessage(msg: IStfuMessage): ChannelAction[] {
+		const assetRefusal = this._refuseForAssetChannel('quiescence');
+		if (assetRefusal) return assetRefusal;
 		if (this._fforStfuReplyStale && !msg.initiator) {
 			// The reply to a stfu whose session an ff_abort already ended.
 			this._fforStfuReplyStale = false;
@@ -13018,6 +14456,8 @@ export class Channel {
 		fundingFeeratePerkw: number,
 		locktime = 0
 	): ChannelAction[] {
+		const assetRefusal = this._refuseForAssetChannel('a splice');
+		if (assetRefusal) return assetRefusal;
 		// FFOR section 7.5.5: no splice while the epoch is live.
 		const fforSpliceRefusal = this._fforUpdateRefusal('splice', {
 			origin: 'local'
@@ -13413,6 +14853,8 @@ export class Channel {
 		msg: ISpliceMessage,
 		localRelativeSatoshis = 0n
 	): ChannelAction[] {
+		const assetRefusal = this._refuseForAssetChannel('a splice');
+		if (assetRefusal) return assetRefusal;
 		if (this._state.state !== ChannelState.NORMAL) {
 			return [
 				{
@@ -24411,6 +25853,10 @@ export class Channel {
 		/** Exact signed profile request. Version 2 retains unresolved reserves. */
 		concurrentVersion?: 1 | 2;
 	}): ChannelAction[] {
+		const assetRefusal = this._refuseForAssetChannel(
+			'a delegated settlement epoch'
+		);
+		if (assetRefusal) return assetRefusal;
 		const pre = this._fforSetupPreconditionError();
 		if (pre) {
 			return [
@@ -24639,6 +26085,10 @@ export class Channel {
 	 * HTLCs (step 3). The manager signs the covering commitment afterwards.
 	 */
 	handleFforInit(payload: Buffer): ChannelAction[] {
+		const assetRefusal = this._refuseForAssetChannel(
+			'a delegated settlement epoch'
+		);
+		if (assetRefusal) return assetRefusal;
 		let msg: IFforInitMessage;
 		try {
 			msg = decodeFforInitMessage(payload);

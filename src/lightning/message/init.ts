@@ -18,6 +18,13 @@
 import { FeatureFlags } from '../features/flags';
 import type { ITlvRecord } from './tlv';
 import { decodeTlvStream, encodeTlvStream } from './tlv';
+import type { CustomRecords } from './custom-records';
+import {
+	CUSTOM_RECORD_START,
+	boundedLightningPayload,
+	customRecordEntries,
+	decodeWithCustomRecords
+} from './custom-records';
 
 /** Well-known TLV types in init message */
 const INIT_TLV_NETWORKS = 1n;
@@ -25,6 +32,11 @@ const INIT_TLV_TYPES = new Set<bigint>([INIT_TLV_NETWORKS]);
 
 export interface IInitMessage {
 	features: FeatureFlags;
+	/**
+	 * Records at or above 65536. Sent only when given, and read only when the
+	 * decoder is asked for them (see IInitDecodeOptions).
+	 */
+	customRecords?: CustomRecords;
 	/** Optional: chain hashes the node is interested in (32 bytes each) */
 	networks?: Buffer[];
 }
@@ -55,11 +67,31 @@ export function encodeInitMessage(msg: IInitMessage): Buffer {
 		tlvRecords.push({ type: INIT_TLV_NETWORKS, value: networksBuf });
 	}
 
+	// Custom records follow the standard ones: every custom type is above
+	// every standard type.
+	const customRecords = customRecordEntries(msg.customRecords, INIT_TLV_TYPES);
+	customRecords.sort((left, right) =>
+		left.type < right.type ? -1 : left.type > right.type ? 1 : 0
+	);
+	tlvRecords.push(...customRecords);
+
 	if (tlvRecords.length > 0) {
 		parts.push(encodeTlvStream(tlvRecords));
 	}
 
-	return Buffer.concat(parts);
+	const payload = Buffer.concat(parts);
+	return customRecords.length > 0 ? boundedLightningPayload(payload) : payload;
+}
+
+/** How to read an init message. */
+export interface IInitDecodeOptions {
+	/**
+	 * Keep the records at or above 65536, whatever their parity. Off by
+	 * default, where an unknown even record of any type is an error. A node
+	 * turns it on only when it has an auxiliary channel provider to read
+	 * them.
+	 */
+	customRecords?: boolean;
 }
 
 /**
@@ -67,7 +99,10 @@ export function encodeInitMessage(msg: IInitMessage): Buffer {
  * @param payload - Raw payload bytes (after the 2-byte type)
  * @returns Decoded init message
  */
-export function decodeInitMessage(payload: Buffer): IInitMessage {
+export function decodeInitMessage(
+	payload: Buffer,
+	options: IInitDecodeOptions = {}
+): IInitMessage {
 	let offset = 0;
 
 	if (payload.length < 4) {
@@ -112,7 +147,10 @@ export function decodeInitMessage(payload: Buffer): IInitMessage {
 
 	// Parse TLV records if there's remaining data
 	if (offset < payload.length) {
-		const { records } = decodeTlvStream(payload, offset, INIT_TLV_TYPES);
+		const records = options.customRecords
+			? decodeWithCustomRecords(payload, offset, INIT_TLV_TYPES)
+			: decodeTlvStream(payload, offset, INIT_TLV_TYPES).records;
+		const customRecords = new Map<bigint, Buffer>();
 		for (const record of records) {
 			if (record.type === INIT_TLV_NETWORKS) {
 				const networks: Buffer[] = [];
@@ -120,8 +158,11 @@ export function decodeInitMessage(payload: Buffer): IInitMessage {
 					networks.push(Buffer.from(record.value.subarray(i, i + 32)));
 				}
 				result.networks = networks;
+			} else if (options.customRecords && record.type >= CUSTOM_RECORD_START) {
+				customRecords.set(record.type, Buffer.from(record.value));
 			}
 		}
+		if (customRecords.size > 0) result.customRecords = customRecords;
 	}
 
 	return result;

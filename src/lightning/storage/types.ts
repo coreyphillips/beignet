@@ -8,6 +8,7 @@
 import type { IPeerTransportOptions } from '../transport/duplex-transport';
 import type { IFforVoucherArchive } from '../ffor/voucher-archive';
 import type { ICompositeSpliceRecord } from '../channel/composite-splice-record';
+import type { IAuxiliaryCommitmentData } from '../channel/auxiliary';
 import type { IChannelState } from '../channel/channel-state';
 import type { IPaymentInfo } from '../node/payment-types';
 import type { IChainMonitorState } from '../chain/chain-monitor';
@@ -591,6 +592,31 @@ export interface IStorageBackend
 	 * backend is its own identity.
 	 */
 	revokedHtlcSnapshotStore?(): object;
+	/**
+	 * The view of one revoked commitment of an asset channel, from the store
+	 * of revoked views, or null. A backend that has this method writes the
+	 * views in `state.auxiliaryState.revokedCommitments` to that store in
+	 * the transaction of `saveChannel`, and drops them with the channel: the
+	 * engine then lets them go from memory and from later rows. A backend
+	 * without it keeps every view in the channel row.
+	 */
+	loadAuxiliaryRevokedCommitment?(
+		channelId: string,
+		commitmentNumber: bigint
+	): IAuxiliaryCommitmentData | null;
+	/**
+	 * How large the store of revoked views of one channel is: the rows it
+	 * holds, one for each commitment of the peer whose asset side is kept,
+	 * and the bytes their values take in the database. The store grows by
+	 * a row with every commitment the peer revokes and is never trimmed
+	 * while the channel lives, since any of those commitments may still be
+	 * published and has to stay punishable. Only on a backend that has
+	 * `loadAuxiliaryRevokedCommitment`.
+	 */
+	auxiliaryRevokedCommitmentsSize?(channelId: string): {
+		rows: number;
+		bytes: number;
+	};
 	/** True while any transaction is open on this backend, however opened. */
 	inTransaction?(): boolean;
 	/** Checkpoint the WAL file, flushing pending writes to the main database. */
@@ -611,6 +637,13 @@ export interface IStorageBackend
 	 * state they act on.
 	 */
 	corruptRowCount?(): number;
+	/**
+	 * Channel ids of the asset channel rows the last loadAllChannels skipped
+	 * because they did not decode. Only a backend that skips undecodable
+	 * rows has anything to report; one that throws on them needs no answer
+	 * here.
+	 */
+	unreadableAssetChannelIds?(): string[];
 }
 
 /**
@@ -740,6 +773,11 @@ export interface IForwardingSummary {
 }
 
 export interface IInvoiceInfo {
+	/**
+	 * Asset channels: the invoice was paid by HTLCs that hold asset units,
+	 * so what it received is not bitcoin. Present, and true, only then.
+	 */
+	auxiliary?: true;
 	paymentHash: string;
 	bolt11: string;
 	amountMsat?: bigint;

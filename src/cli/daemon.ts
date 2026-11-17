@@ -576,7 +576,17 @@ const STATUS_BY_ERROR_CODE: Partial<Record<BeignetErrorCodeValue, number>> = {
 	// Host extensions (docs/EXTENSIONS.md). An extension's refusal carries
 	// its own status, and this is the one it gets when it names none.
 	EXTENSION_ERROR: 400,
-	EXTENSION_UNAVAILABLE: 503
+	EXTENSION_UNAVAILABLE: 503,
+	// Asset channels (issue #2093). Refusals to start a node: they end a
+	// boot, and reach HTTP only from a route that rebuilds the node. 409,
+	// not 503: the same request meets the same refusal until the operator
+	// changes which extensions the daemon is started with.
+	ASSET_PROVIDER_REQUIRED: 409,
+	ASSET_PROVIDER_CONFLICT: 409,
+	ASSET_PROVIDER_FAILED: 409,
+	ASSET_RESTORE_REFUSED: 409,
+	PAYMENT_UNRESOLVED: 409,
+	ASSET_GUARDIAN_START_REFUSED: 409
 	// Left unmapped on purpose, so they keep the 500 default:
 	// WALLET_CREATE_FAILED, ADDRESS_FAILED, REFRESH_FAILED and
 	// DESCRIPTOR_EXPORT_FAILED are node faults, and SEND_FAILED, CLOSE_FAILED,
@@ -3670,9 +3680,10 @@ async function bootDaemon(
 			// peers returned (spec 5.4). Local durability has no fencing, so
 			// an old device still running would keep acting on the same
 			// channels; a bare POST must not start that by accident.
-			const { confirm, unfenced } = body as {
+			const { confirm, unfenced, omitAssetChannels } = body as {
 				confirm?: boolean;
 				unfenced?: boolean;
+				omitAssetChannels?: boolean;
 			};
 			if (confirm !== true) {
 				return failure(
@@ -3685,7 +3696,18 @@ async function bootDaemon(
 			if (unfenced !== undefined && typeof unfenced !== 'boolean') {
 				return failure('INVALID_PARAMS', 'unfenced must be a boolean');
 			}
-			return success(await node.restoreFromCapsules({ unfenced }));
+			if (
+				omitAssetChannels !== undefined &&
+				typeof omitAssetChannels !== 'boolean'
+			) {
+				return failure('INVALID_PARAMS', 'omitAssetChannels must be a boolean');
+			}
+			return success(
+				await node.restoreFromCapsules({
+					unfenced,
+					...(omitAssetChannels !== undefined ? { omitAssetChannels } : {})
+				})
+			);
 		},
 		'POST /recovery/capsule-guardians': (body) => {
 			// The one place a retrieved capsule's guardian credentials leave

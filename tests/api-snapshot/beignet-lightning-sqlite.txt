@@ -111,6 +111,7 @@ class SqliteStorage implements beignet/lightning#storage.IStorageBackend
 constructor SqliteStorage(dbPath: string, onCorruptRow?: (error: unknown) => void, opts?: { encryptionKey?: Buffer; })
 static readonly property SqliteStorage.CURRENT_SCHEMA_VERSION = 20
 method SqliteStorage.addWatchtowerUpdate(update: beignet/lightning#watchtower.IWatchtowerUpdate): number
+method SqliteStorage.auxiliaryRevokedCommitmentsSize(channelId: string): { rows: number; bytes: number; }
 method SqliteStorage.backup(destPath: string): Promise<void>
 method SqliteStorage.checkpoint(): void
 method SqliteStorage.close(): void
@@ -172,6 +173,7 @@ method SqliteStorage.loadAllPreimages(): Array<{ paymentHash: string; preimage: 
 method SqliteStorage.loadAllQueueEntries(): IQueueEntryRow[]
 method SqliteStorage.loadAllScidMappings(): Array<{ scidHex: string; channelId: Buffer; }>
 method SqliteStorage.loadAllWebhooks(): Array<{ id: string; url: string; events: string[]; secretHash?: string; createdAt: number; }>
+method SqliteStorage.loadAuxiliaryRevokedCommitment(channelId: string, commitmentNumber: bigint): beignet/lightning#channel.IAuxiliaryCommitmentData | null
 method SqliteStorage.loadChainMonitor(channelId: string): beignet/lightning#chain.IChainMonitorState | null
 method SqliteStorage.loadChannel(id: string): { state: beignet/lightning#channel.IChannelState; peerPubkey: string; } | null
 method SqliteStorage.loadChannelKeyIndex(channelId: string): number | null
@@ -239,4 +241,5 @@ method SqliteStorage.setOutboxFrameSequence(ids: number[], frameSequence: number
 method SqliteStorage.setRecoveryMeta(key: string, value: string): void
 method SqliteStorage.setWatchtowerSessionProgress(sessionId: string, seqNum: number, lastApplied: number): void
 method SqliteStorage.transaction<T>(fn: () => T): T
+method SqliteStorage.unreadableAssetChannelIds(): string[]
 method SqliteStorage.updateQueueEntryStatus(id: string, status: string, error?: string, completedAt?: number): void

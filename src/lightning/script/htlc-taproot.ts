@@ -21,6 +21,7 @@
  */
 
 import * as bitcoin from 'bitcoinjs-lib';
+import type { ITaprootAuxLeaf } from './commitment-taproot';
 import { tapleafHash as bip341TapleafHash } from 'bitcoinjs-lib/src/payments/bip341';
 import { ecc } from '../../utils/ecc';
 import {
@@ -31,9 +32,10 @@ import {
 bitcoin.initEccLib(ecc);
 
 /**
- * BIP342 sighash type for taproot HTLC second-level signatures: SIGHASH_SINGLE
+ * Compatibility sighash type for Taproot HTLC second-level signatures: SIGHASH_SINGLE
  * (0x03) | SIGHASH_ANYONECANPAY (0x80) = 0x83. The byte is implicit on the wire
  * (sigs are 64 bytes) and appended only when assembling the spend witness.
+ * Native asset channel mode 450 instead selects ALL|ANYONECANPAY (0x81).
  */
 export const TAPROOT_HTLC_SIGHASH_TYPE =
 	bitcoin.Transaction.SIGHASH_SINGLE | bitcoin.Transaction.SIGHASH_ANYONECANPAY;
@@ -58,13 +60,14 @@ export function taprootHtlcLeafSighash(
 	htlcOutputScript: Buffer,
 	htlcAmountSat: number,
 	leafScript: Buffer,
-	leafVersion: number = TAPLEAF_VERSION
+	leafVersion: number = TAPLEAF_VERSION,
+	hashType: 0x81 | 0x83 = 0x83
 ): Buffer {
 	return tx.hashForWitnessV1(
 		0,
 		[htlcOutputScript],
 		[htlcAmountSat],
-		TAPROOT_HTLC_SIGHASH_TYPE,
+		hashType,
 		tapleafHash(leafScript, leafVersion)
 	);
 }
@@ -81,7 +84,8 @@ export function buildTaprootHtlcSuccessTx(
 	revocationPubkey: Buffer,
 	localDelayedPubkey: Buffer,
 	toSelfDelay: number,
-	network: bitcoin.Network = bitcoin.networks.bitcoin
+	network: bitcoin.Network = bitcoin.networks.bitcoin,
+	auxiliaryLeaf?: ITaprootAuxLeaf
 ): bitcoin.Transaction {
 	return buildSecondLevel(
 		htlcTxid,
@@ -91,7 +95,8 @@ export function buildTaprootHtlcSuccessTx(
 		localDelayedPubkey,
 		toSelfDelay,
 		0,
-		network
+		network,
+		auxiliaryLeaf
 	);
 }
 
@@ -108,7 +113,8 @@ export function buildTaprootHtlcTimeoutTx(
 	revocationPubkey: Buffer,
 	localDelayedPubkey: Buffer,
 	toSelfDelay: number,
-	network: bitcoin.Network = bitcoin.networks.bitcoin
+	network: bitcoin.Network = bitcoin.networks.bitcoin,
+	auxiliaryLeaf?: ITaprootAuxLeaf
 ): bitcoin.Transaction {
 	return buildSecondLevel(
 		htlcTxid,
@@ -118,7 +124,8 @@ export function buildTaprootHtlcTimeoutTx(
 		localDelayedPubkey,
 		toSelfDelay,
 		cltvExpiry,
-		network
+		network,
+		auxiliaryLeaf
 	);
 }
 
@@ -130,7 +137,8 @@ function buildSecondLevel(
 	localDelayedPubkey: Buffer,
 	toSelfDelay: number,
 	nLockTime: number,
-	network: bitcoin.Network
+	network: bitcoin.Network,
+	auxiliaryLeaf?: ITaprootAuxLeaf
 ): bitcoin.Transaction {
 	const tx = new bitcoin.Transaction();
 	tx.version = 2;
@@ -147,7 +155,8 @@ function buildSecondLevel(
 		revocationPubkey,
 		localDelayedPubkey,
 		toSelfDelay,
-		network
+		network,
+		auxiliaryLeaf
 	);
 	// Zero-fee: the whole HTLC amount carries over (fee comes from CPFP/anchor).
 	tx.addOutput(out.output, Number(htlcAmount));

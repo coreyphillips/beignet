@@ -87,7 +87,7 @@ export class ChannelAnnouncements {
 		this._state.fundingConfirmationHeight = blockHeight;
 		this._state.fundingTxIndex = txIndex;
 
-		if (!this._state.announceChannel) {
+		if (!this._state.announceChannel || this._state.auxiliaryState) {
 			return []; // Private channel — no announcement, but SCID is set for routing hints
 		}
 		if (this._state.announcementSigsSent) {

@@ -24,6 +24,8 @@ import type { TransportCipher } from './cipher';
 import { encodeMessage, decodeMessage } from '../message/codec';
 import type { IInitMessage } from '../message/init';
 import { encodeInitMessage, decodeInitMessage } from '../message/init';
+import type { CustomRecords } from '../message/custom-records';
+import { copyCustomRecords } from '../message/custom-records';
 import { MessageType, isRequiredMessageType } from '../message/types';
 import {
 	FeatureFlags,
@@ -62,6 +64,20 @@ export interface IPeerOptions {
 	port: number;
 	/** Local feature flags to advertise */
 	localFeatures?: FeatureFlags;
+	/** Explicitly supported experimental wire types, including required even types. */
+	isKnownCustomMessageType?: (type: number) => boolean;
+	/**
+	 * Custom records (types at or above 65536) to send in our init. Set only
+	 * by a node with an auxiliary channel provider.
+	 */
+	initCustomRecords?: CustomRecords;
+	/**
+	 * Keep the custom records of the peer's init, whatever their parity,
+	 * instead of applying the unknown-even rule to them. Set only by a node
+	 * with an auxiliary channel provider; off, an unknown even record of any
+	 * type fails the handshake as before.
+	 */
+	readInitCustomRecords?: boolean;
 	/**
 	 * Hold post-init inbound messages until releaseHeldMessages() is
 	 * called. The post-handshake drain can surface coalesced traffic (an
@@ -113,6 +129,9 @@ export class Peer extends EventEmitter {
 
 	private localPrivateKey: Buffer;
 	private localFeatures: FeatureFlags;
+	private readonly isKnownCustomMessageType?: (type: number) => boolean;
+	private readonly initCustomRecords?: CustomRecords;
+	private readonly readInitCustomRecords: boolean;
 	private networks?: Buffer[];
 	private state: PeerState = 'disconnected';
 	/** Non-null while messages are held (see holdMessagesUntilRelease). */
@@ -179,6 +198,9 @@ export class Peer extends EventEmitter {
 
 	constructor(options: IPeerOptions) {
 		super();
+		this.isKnownCustomMessageType = options.isKnownCustomMessageType;
+		this.initCustomRecords = copyCustomRecords(options.initCustomRecords);
+		this.readInitCustomRecords = options.readInitCustomRecords === true;
 		this.localPrivateKey = options.localPrivateKey;
 		this.remotePublicKey = options.remotePublicKey;
 		this.host = options.host;
@@ -676,7 +698,10 @@ export class Peer extends EventEmitter {
 		// Send our init message
 		const initPayload = encodeInitMessage({
 			features: this.localFeatures,
-			networks: this.networks
+			networks: this.networks,
+			...(this.initCustomRecords
+				? { customRecords: this.initCustomRecords }
+				: {})
 		});
 		const initMsg = encodeMessage(MessageType.INIT, initPayload);
 		const encrypted = this.transport!.encryptPacket(initMsg);
@@ -692,12 +717,17 @@ export class Peer extends EventEmitter {
 			);
 		}
 
-		this.remoteInit = decodeInitMessage(decoded.payload);
+		this.remoteInit = this.readInitCustomRecords
+			? decodeInitMessage(decoded.payload, { customRecords: true })
+			: decodeInitMessage(decoded.payload);
 
 		// BOLT 1: Disconnect if peer requires features we don't support (Fix 3.2)
+		// A node reads init custom records exactly when it runs asset
+		// channels, and only such a node pairs the overlay bit with 2025.
 		const unsupported = hasUnsupportedRequiredFeatures(
 			this.localFeatures,
-			this.remoteInit.features
+			this.remoteInit.features,
+			{ taprootOverlay: this.readInitCustomRecords }
 		);
 		if (unsupported.length > 0) {
 			throw new Error(
@@ -871,7 +901,11 @@ export class Peer extends EventEmitter {
 		}
 
 		// BOLT 1: Unknown even (required) message types must trigger disconnect
-		const isKnown = Object.values(MessageType).includes(type);
+		const isKnown =
+			Object.values(MessageType).includes(type) ||
+			(type >= 32768 &&
+				type <= 65535 &&
+				this.isKnownCustomMessageType?.(type) === true);
 		if (!isKnown && isRequiredMessageType(type)) {
 			this.emit('error', new Error(`Unknown required message type ${type}`));
 			this.disconnect();

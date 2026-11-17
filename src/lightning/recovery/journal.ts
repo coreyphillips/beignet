@@ -24,6 +24,7 @@
  * originals, which is what makes the rebuilt tables byte-identical.
  */
 
+import type { IChannelState } from '../channel/channel-state';
 import { aes256GcmDecrypt, aes256GcmEncrypt } from '../crypto/provider';
 import { WIRE_SAFETY_POLICY_VERSION } from '../channel/channel-actions';
 import { deriveFrameIv } from './guardian-wire';
@@ -2440,6 +2441,124 @@ function baseSnapshotIndex(frames: RecoveryFrame[]): number {
 		}
 	}
 	return -1;
+}
+
+/**
+ * The channels reconstructFromFrames would leave in an empty target, read
+ * from the decoded frames alone: the base snapshot's rows, then every
+ * channel_state and channel_closed of the frames it replays, in order.
+ * Nothing is written and no backend is touched, so a restore can be judged
+ * by what it holds before its install transaction opens.
+ */
+export function channelsAfterReplay(frames: RecoveryFrame[]): Array<{
+	channelId: string;
+	state: IChannelState;
+	peerPubkey: string;
+}> {
+	const base = baseSnapshotIndex(frames);
+	if (base < 0) return [];
+	const channels = new Map<
+		string,
+		{ channelId: string; state: IChannelState; peerPubkey: string }
+	>();
+	for (const row of frames[base].snapshot!.channels) {
+		channels.set(row.channelId, {
+			channelId: row.channelId,
+			state: row.state,
+			peerPubkey: row.peerPubkey
+		});
+	}
+	const end = lastAppliedFrameIndex(frames);
+	for (let i = base + 1; i <= end; i++) {
+		for (const mutation of frames[i].mutations) {
+			if (mutation.type === 'channel_state') {
+				channels.set(mutation.channelId, {
+					channelId: mutation.channelId,
+					state: mutation.state,
+					peerPubkey: mutation.peerPubkey
+				});
+			} else if (mutation.type === 'channel_closed') {
+				channels.delete(mutation.channelId);
+			}
+		}
+	}
+	return [...channels.values()];
+}
+
+/**
+ * The frames as reconstructFromFrames is to replay them when the channels
+ * named are left out of a restore: no row of theirs is written. Gone are
+ * their channel rows, chain monitors, outbox messages, and the HTLC rows
+ * keyed by them, in the base snapshot and in every later frame. Their key
+ * indices stay, so no key of theirs is ever derived for another channel,
+ * and so do payments and invoices, which are the wallet's history and not a
+ * channel's. The frames given are not changed, and a set that names no
+ * channel is answered as it is.
+ */
+export function framesWithoutChannels(
+	frames: RecoveryFrame[],
+	channelIds: ReadonlySet<string>
+): RecoveryFrame[] {
+	if (channelIds.size === 0) return frames;
+	const left = new Set([...channelIds].map((id) => id.toLowerCase()));
+	const out = (channelId: string | undefined): boolean =>
+		channelId !== undefined && left.has(channelId.toLowerCase());
+	// HTLC rows are keyed by '<channel id hex>:<htlc>'.
+	const keyed = (key: string): boolean => out(key.split(':')[0]);
+	const keep = (mutation: RecoveryMutation): boolean => {
+		switch (mutation.type) {
+			case 'channel_state':
+			case 'chain_monitor':
+			case 'channel_closed':
+			case 'outbox_supersede':
+				return !out(mutation.channelId);
+			case 'htlc_payment_mapping':
+			case 'delete_htlc_payment_mapping':
+				return !keyed(mutation.htlcKey);
+			case 'htlc_shared_secret':
+			case 'delete_htlc_shared_secret':
+				return !keyed(mutation.key);
+			case 'forwarded_htlc':
+				return (
+					!keyed(mutation.outKey) && !out(mutation.inChannelId.toString('hex'))
+				);
+			case 'delete_forwarded_htlc':
+				return !keyed(mutation.outKey);
+			default:
+				return true;
+		}
+	};
+	return frames.map((frame) => ({
+		...frame,
+		mutations: frame.mutations.filter(keep),
+		outboundMessages: frame.outboundMessages.filter(
+			(message) => !out(message.channelId)
+		),
+		...(frame.snapshot
+			? {
+					snapshot: {
+						...frame.snapshot,
+						channels: frame.snapshot.channels.filter(
+							(row) => !out(row.channelId)
+						),
+						chainMonitors: frame.snapshot.chainMonitors.filter(
+							(row) => !out(row.channelId)
+						),
+						htlcPaymentMappings: frame.snapshot.htlcPaymentMappings.filter(
+							(row) => !keyed(row.key)
+						),
+						forwardedHtlcs: frame.snapshot.forwardedHtlcs.filter(
+							(row) =>
+								!keyed(row.outKey) && !out(row.inChannelId.toString('hex'))
+						),
+						htlcSharedSecrets: frame.snapshot.htlcSharedSecrets.filter(
+							(row) => !keyed(row.key)
+						),
+						outbox: frame.snapshot.outbox.filter((row) => !out(row.channelId))
+					}
+			  }
+			: {})
+	}));
 }
 
 /**

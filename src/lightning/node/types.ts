@@ -9,6 +9,10 @@
 import type { IRoutingHintHop, Network } from '../invoice/types';
 import type { IBolt12Invoice } from '../offer/types';
 import type { IChannelConfig, ChannelState } from '../channel/types';
+import type {
+	IAuxiliaryChannelConfig,
+	IAuxiliaryPayment
+} from '../channel/auxiliary-funding';
 import type { ChannelErrorCode } from '../channel/channel-actions';
 import { CodedError } from '../../utils/errors';
 import type { IChannelBasepoints } from '../keys/derivation';
@@ -111,7 +115,59 @@ export interface IUtxoSelectionOpts {
 	allowTopUp?: boolean;
 }
 
+/** Limits new fee coins and identifies original pledged inputs for a replacement. */
+export interface IFeeBumpSelectionOpts {
+	/** Keep every HTLC output fixed and burn only bounded prepared wallet inputs. */
+	fixedOutputs?: boolean;
+	/** Stable channel and original HTLC outpoint identity across replacements. */
+	feeActionId?: string;
+	/** Optional stricter fixed-output action cap, also retained across retries. */
+	maxFeeSatoshis?: bigint;
+	excludeTxids?: readonly string[];
+	confirmedOnly?: boolean;
+	/** The height of the chain as the caller knows it: the clock a split that does not confirm is replaced by. */
+	blockHeight?: number;
+	/** The height by which the spend has to be confirmed, when it has one. */
+	deadlineHeight?: number;
+	replacementInputs?: readonly {
+		txid: string;
+		vout: number;
+		sequence: number;
+	}[];
+	/**
+	 * The id of the transaction whose fee inputs `replacementInputs` names.
+	 * A named input that the wallet no longer lists is kept only while the
+	 * wallet's server knows that transaction: one that was refused, or never
+	 * sent, spends nothing, so the input went elsewhere and leaves the
+	 * action.
+	 */
+	replacedTxid?: string;
+}
+
 export interface IFundingProvider {
+	/**
+	 * Retire one fee action only after irrevocable resolution. With the
+	 * transaction that settled it named, the action is charged the fee coins
+	 * that transaction spent; without one it is charged its whole cap.
+	 */
+	retireFixedOutputFeeAction?(
+		feeActionId: string,
+		resolution?: import('../wallet/fixed-output-fees').IFixedOutputFeeResolution
+	): Promise<void>;
+	/** Exact canonical native HTLC actions retained for this channel, including abandoned sources. */
+	getFixedOutputFeeActionIds?(channelId: Buffer): readonly string[];
+	/** The lifetime budget for fixed-output fees; undefined when none is configured. */
+	getFixedOutputFeeBudget?():
+		| import('../wallet/fixed-output-fees').IFixedOutputFeeBudget
+		| undefined;
+	/**
+	 * What the fee coin pool holds and can do, and whether a split for a fee
+	 * coin of `forFeeSatoshis` could be made now. Reads only. Undefined when
+	 * no fee policy is configured.
+	 */
+	getFixedOutputFeeStatus?(
+		forFeeSatoshis?: bigint
+	): import('../wallet/fixed-output-fees').IFixedOutputFeeStatus | undefined;
 	/**
 	 * Build (but do not broadcast) the channel funding transaction.
 	 * @param max When true, sweep the whole balance into the funding output (no
@@ -194,6 +250,12 @@ export interface IFundingProvider {
 	};
 
 	/**
+	 * Whether this provider can prepare, durably and within a bound, the fee
+	 * inputs a fixed asset HTLC output set needs. An asset channel is opened
+	 * with fixed HTLC outputs only when this answers true.
+	 */
+	supportsFixedOutputFees?(): boolean;
+	/**
 	 * Price a max (sweep-everything) dual-funded v2 open (optional; required,
 	 * with selectMaxDualFundingInputs, for openChannel with fundMax toward a
 	 * dual-fund peer). Synchronous because open_channel2 commits
@@ -272,11 +334,22 @@ export interface IFundingProvider {
 	 */
 	selectFeeBumpInputs?(
 		targetFeeSats: bigint,
-		feeratePerKw: number
+		feeratePerKw: number,
+		opts?: IFeeBumpSelectionOpts
 	): Promise<{
 		inputs: import('../channel/channel').ISpliceWalletInput[];
 		changeScript: Buffer;
+		/** Required independent no-change fee cap for fixed-output HTLCs. */
+		maxFeeSatoshis?: bigint;
 	}>;
+	/** Restore owned, still-pledged P2WPKH signers without releasing their reservations. */
+	restoreFeeBumpInputs?(
+		inputs: readonly {
+			prevTx: Buffer;
+			prevOutputIndex: number;
+			sequence: number;
+		}[]
+	): Promise<import('../channel/channel').ISpliceWalletInput[]>;
 }
 
 /**
@@ -722,6 +795,31 @@ export interface INodeConfig {
 	 * mainnet balances yet.
 	 */
 	preferTaproot?: boolean;
+	/**
+	 * Asset channels (Taproot Assets, as LND and tapd deploy them): a provider
+	 * that commits a second asset to taproot channels, and the callbacks that
+	 * tie funding, payment and forwarding to the host's asset protocol. Setting
+	 * it advertises the taproot overlay feature (optional bit 2025) with the
+	 * simple taproot bit it depends on (181), which takes option_simple_close
+	 * off the advertisement like any taproot advertisement does, and makes
+	 * the node read the custom records (TLV types at or above 65536) of a
+	 * peer's init. Unset, the default, the node sets none of those bits and
+	 * rejects an unknown even init record as before.
+	 *
+	 * The provider is never stored: it is attached again to every asset
+	 * channel on restore. A node started without it over storage that holds
+	 * asset channels throws `AuxiliaryProviderRequiredError` before it
+	 * rewrites any row, rather than run those channels as ordinary ones.
+	 */
+	auxiliaryChannels?: IAuxiliaryChannelConfig;
+	/**
+	 * Called once with the node when it is built, before it restores from
+	 * storage: so before any stored channel can call a hook of
+	 * `auxiliaryChannels`. A host whose hooks need the node binds it here
+	 * (issue #2093). Synchronous. A throw ends the construction before a
+	 * stored row is read or rewritten. Unset, the default, nothing is called.
+	 */
+	beforeRestore?: (node: import('./lightning-node').LightningNode) => void;
 	/**
 	 * Liquidity ads (bLIP-0051) SELLER policy: when set, an inbound
 	 * open_channel2 carrying request_funds is answered with a signed will_fund
@@ -1340,6 +1438,14 @@ export interface IChannelInfo {
 	 * with an on-chain funding output).
 	 */
 	closeStatus?: ICloseStatus;
+	/**
+	 * True on an asset channel, and absent on every other channel. The
+	 * bitcoin on an asset channel only carries its asset outputs: it is not
+	 * spendable or receivable as bitcoin over Lightning, and no total that a
+	 * spending or receiving decision is made from counts it. The asset side
+	 * is read with `getAuxiliaryChannelInfo`.
+	 */
+	auxiliary?: true;
 }
 
 /**
@@ -1509,6 +1615,12 @@ export interface ILightningBalance {
 	localBalanceMsat: bigint;
 	remoteBalanceMsat: bigint;
 	unsettledBalanceMsat: bigint;
+	/**
+	 * The bitcoin on this node's side of its open asset channels, present
+	 * only when it has one. It carries asset outputs and cannot be sent or
+	 * received over Lightning, so it is in none of the figures above.
+	 */
+	auxiliaryBalanceMsat?: bigint;
 }
 
 /**
@@ -1664,6 +1776,41 @@ export interface IOutgoingPaymentResolution {
 	latestOutstandingExpiry: number | null;
 	/** The preimage, from whichever source revealed it, when known. */
 	preimage?: Buffer;
+	/**
+	 * Set while the record is PENDING and marked unresolved: an HTLC of it
+	 * is on a channel a capsule restore left out, so no view of it is here
+	 * and `resolved` never turns true. Counts as an HTLC in flight.
+	 */
+	unresolved?: import('./payment-types').IPaymentUnresolved;
+}
+
+/**
+ * A wait on an outgoing payment that this wallet cannot resolve: an HTLC
+ * of it is on a channel a capsule restore left out. Carries the mark of the
+ * record and the view the wait began with.
+ */
+export class PaymentUnresolvedError extends CodedError<'PAYMENT_UNRESOLVED'> {
+	/** The payment, as payment hash hex. */
+	readonly paymentHash: string;
+	readonly unresolved: import('./payment-types').IPaymentUnresolved;
+	readonly resolution?: IOutgoingPaymentResolution;
+
+	constructor(
+		paymentHash: Buffer,
+		unresolved: import('./payment-types').IPaymentUnresolved,
+		resolution?: IOutgoingPaymentResolution
+	) {
+		super(
+			'PAYMENT_UNRESOLVED',
+			`Payment ${paymentHash.toString('hex')} cannot be resolved by this ` +
+				`wallet: it has an HTLC on a channel a restore left out ` +
+				`(${unresolved.channelIds.join(', ')})`
+		);
+		this.name = 'PaymentUnresolvedError';
+		this.paymentHash = paymentHash.toString('hex');
+		this.unresolved = unresolved;
+		if (resolution !== undefined) this.resolution = resolution;
+	}
 }
 
 /** Payload of 'payment:htlc-resolved'. */
@@ -1758,6 +1905,12 @@ export interface IHoldInvoiceStateEvent {
 	earliestExpiry: number | null;
 	cancelMarginBlocks: number;
 	cancelHeight: number | null;
+	/**
+	 * Asset channels (issue #2093): true when a part of the set the
+	 * transition acted on is an HTLC that holds units, and absent on every
+	 * other. heldAmountMsat is then what the node has for those HTLCs.
+	 */
+	auxiliary?: true;
 }
 
 /** Payload of the 'hold:cancelled' node event. */
@@ -1772,6 +1925,8 @@ export interface IHoldCancelledEvent {
 	earliestExpiry: number | null;
 	cancelMarginBlocks: number;
 	cancelHeight: number | null;
+	/** Asset channels: true when a part failed back held units; absent otherwise. */
+	auxiliary?: true;
 }
 
 // ─── Typed Payment Errors ───
@@ -1846,6 +2001,98 @@ export class InvalidRequestError extends Error {
 		super(message);
 		this.name = 'InvalidRequestError';
 	}
+}
+
+/** Why an asset payment, or a payment over an asset channel, was refused. */
+export type AuxiliaryPaymentErrorCode =
+	/** The asset side of the payment is malformed. */
+	| 'ASSET_PAYMENT_INVALID'
+	/** The named channel is not an asset channel to the route's first hop. */
+	| 'ASSET_PAYMENT_CHANNEL_MISMATCH'
+	/** A further attempt of an asset payment did not name its asset channel. */
+	| 'ASSET_PAYMENT_ROUTE_REQUIRED'
+	/** The payment asks for something an asset payment cannot do. */
+	| 'ASSET_PAYMENT_UNSUPPORTED'
+	/** The channel's next HTLC id is no longer the one the payment was prepared for. Nothing was sent. */
+	| 'ASSET_PAYMENT_CIRCUIT_CHANGED'
+	/** The payment could not be recorded. Nothing was sent. */
+	| 'ASSET_PAYMENT_NOT_RECORDED'
+	/** An ordinary payment was directed over an asset channel. */
+	| 'ASSET_CHANNEL_NEEDS_ASSET_PAYMENT'
+	/** The gate set on the node (setAuxiliaryPaymentGate) refused the payment. Nothing was sent. */
+	| 'ASSET_PAYMENT_REFUSED'
+	/** The channel holds more outcomes its host has not taken (onHtlcResolved) than it keeps. Nothing was sent. */
+	| 'ASSET_OUTCOMES_UNDELIVERED'
+	/** This node already has as many asset HTLCs of its own open on the channel as it offers at once (IAuxiliaryChannelConfig.maxHtlcs, 8 by default). Nothing was sent. */
+	| 'ASSET_HTLC_LIMIT_REACHED';
+
+/** A gate's refusal that names its own stable reason beside the sentence. */
+export interface IAuxiliaryPaymentRefusal {
+	/** The gate's own code for the refusal, for a caller to branch on. */
+	reason: string;
+	message: string;
+}
+
+/**
+ * Judges an outgoing asset payment before anything of it is recorded or
+ * sent: undefined lets it through, a string is the reason it is refused,
+ * and an IAuxiliaryPaymentRefusal is that with the gate's own stable code,
+ * which the refusal then carries as `AuxiliaryPaymentError.reason`.
+ */
+export type AuxiliaryPaymentGate = (payment: {
+	paymentHash: Buffer;
+	/** The asset channel the payment leaves over. */
+	channelId: Buffer;
+	/** What the payment is worth at its destination, as the route carries it. */
+	amountMsat: bigint;
+	/** The bitcoin its HTLC carries on the wire. */
+	wireAmountMsat: bigint;
+	/**
+	 * What the route asks its first hop to carry: the payment's worth and
+	 * every routing fee, which is what leaves this node for it.
+	 */
+	routeAmountMsat: bigint;
+}) => string | IAuxiliaryPaymentRefusal | undefined;
+
+/**
+ * An asset payment refused before anything left this node, or an ordinary
+ * payment refused because its route leaves over an asset channel. Carries
+ * the reason as a code and the channel it concerns.
+ */
+export class AuxiliaryPaymentError extends CodedError<AuxiliaryPaymentErrorCode> {
+	/** The asset channel the refusal concerns, as channel id hex. */
+	readonly channelId: string;
+	/**
+	 * With ASSET_PAYMENT_REFUSED, the refusing gate's own stable code for
+	 * it, when the gate gave one.
+	 */
+	readonly reason?: string;
+
+	constructor(
+		code: AuxiliaryPaymentErrorCode,
+		channelId: Buffer | string,
+		message: string,
+		reason?: string
+	) {
+		const hex = Buffer.isBuffer(channelId)
+			? channelId.toString('hex')
+			: channelId;
+		super(code, `${message} (channel ${hex})`);
+		this.name = 'AuxiliaryPaymentError';
+		this.channelId = hex;
+		if (reason !== undefined) this.reason = reason;
+	}
+}
+
+/** What sendPaymentToRoute takes beyond its positional arguments. */
+export interface ISendToRouteOptions {
+	/**
+	 * The asset side of the payment. The HTLC leaves over this asset channel
+	 * carrying these records and this much bitcoin, while the route and the
+	 * onion keep the amounts the payment is worth. Never retried by the
+	 * node: each attempt names its channel and brings its own records.
+	 */
+	assetPayment?: IAuxiliaryPayment;
 }
 
 /** A channel open refused for the caller's own arguments. */
@@ -1952,6 +2199,55 @@ export interface ISpliceRefusal {
  */
 export interface ISpliceRequestResult extends Partial<ISpliceRefusal> {
 	ok: boolean;
+}
+
+/**
+ * Startup found stored asset channels and no `auxiliaryChannels` provider to
+ * run them. Thrown before any stored row is rewritten, so nothing has
+ * changed: configure the provider and start again. Running such a channel
+ * without its provider would sign commitments that leave out the asset.
+ */
+export class AuxiliaryProviderRequiredError extends CodedError<'AUXILIARY_PROVIDER_REQUIRED'> {
+	/** The stored channels that carry asset state, as channel id hex. */
+	readonly channelIds: readonly string[];
+
+	constructor(channelIds: readonly string[]) {
+		super(
+			'AUXILIARY_PROVIDER_REQUIRED',
+			`Storage holds ${channelIds.length} asset channel(s) ` +
+				`(${channelIds.join(', ')}) and no auxiliaryChannels provider is ` +
+				`configured; refusing to start without it`
+		);
+		this.name = 'AuxiliaryProviderRequiredError';
+		this.channelIds = [...channelIds];
+	}
+}
+
+/**
+ * Startup found a stored asset channel that cannot be run although a
+ * provider is configured: its row could not be read, or it carries an asset
+ * channel type or funding root without the asset state that goes with them.
+ * Thrown before any stored row is rewritten, so nothing has changed. The
+ * node does not start without the channel, because a channel it does not
+ * load is a channel it does not watch.
+ */
+export class AuxiliaryChannelRowError extends CodedError<'AUXILIARY_CHANNEL_ROW_INVALID'> {
+	/** The stored channels that cannot be run, as channel id hex. */
+	readonly channelIds: readonly string[];
+	/** Why each one cannot be run, by channel id hex. */
+	readonly reasons: ReadonlyMap<string, string>;
+
+	constructor(rows: ReadonlyArray<{ channelId: string; reason: string }>) {
+		super(
+			'AUXILIARY_CHANNEL_ROW_INVALID',
+			`Storage holds ${rows.length} asset channel(s) that cannot be run: ` +
+				rows.map((row) => `${row.channelId} (${row.reason})`).join(', ') +
+				'; refusing to start without them'
+		);
+		this.name = 'AuxiliaryChannelRowError';
+		this.channelIds = rows.map((row) => row.channelId);
+		this.reasons = new Map(rows.map((row) => [row.channelId, row.reason]));
+	}
 }
 
 /**
@@ -2082,3 +2378,8 @@ export interface IPaymentEstimate {
 	estimatedFeeMsat: bigint;
 	hopCount: number;
 }
+
+/** Whether a node advertises asset channels, and why not when it does not. */
+export type IAuxiliaryAdvertisement =
+	| { advertised: true }
+	| { advertised: false; reason: string };

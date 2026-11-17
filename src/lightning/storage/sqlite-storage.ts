@@ -42,8 +42,14 @@ import type {
 	IWatchtowerSession,
 	IWatchtowerUpdate
 } from '../watchtower/types';
+import type { IAuxiliaryCommitmentData } from '../channel/auxiliary';
+import { auxiliaryRevokedViewsToStore } from '../channel/auxiliary-revoked';
 import type { IChannelState } from '../channel/channel-state';
 import type { IHtlcSnapshotEntry } from '../channel/types';
+import {
+	deserializeAuxiliaryCommitmentView,
+	serializeAuxiliaryCommitmentView
+} from './auxiliary-serialization';
 import {
 	attachStoredRevokedHtlcSnapshots,
 	unsavedRevokedHtlcSnapshots
@@ -55,6 +61,8 @@ import type { ISerializedChannelState } from './serialization';
 import {
 	serializeChannelState,
 	deserializeChannelState,
+	channelRowFromStore,
+	channelRowToStore,
 	serializeHtlcSnapshotEntries,
 	deserializeHtlcSnapshotEntries,
 	serializePaymentInfo,
@@ -66,7 +74,8 @@ import {
 	serializeGraphNode,
 	deserializeGraphNode,
 	serializeInvoiceInfo,
-	deserializeInvoiceInfo
+	deserializeInvoiceInfo,
+	serializedChannelCarriesAssetState
 } from './serialization';
 import {
 	ENC_PREFIX,
@@ -250,6 +259,7 @@ export class SqliteStorage implements IStorageBackend {
 	private db: Database.Database;
 	private readonly dbPath: string;
 	private onCorruptRow?: (error: unknown) => void;
+	private unreadableAssetChannels: string[] = [];
 	private encryptionKey?: Buffer;
 	/**
 	 * Without a storage key the payment rows are plaintext anyway, so a fixed
@@ -337,6 +347,16 @@ export class SqliteStorage implements IStorageBackend {
 	/** Rows skipped by the forgiving loaders since open (issue #317). */
 	corruptRowCount(): number {
 		return this.corruptRowsSeen;
+	}
+
+	/**
+	 * The asset channel rows the last loadAllChannels skipped because they
+	 * did not decode, as channel id hex. A skipped asset channel is neither
+	 * run nor watched, so startup reads this and refuses instead of going on
+	 * without it.
+	 */
+	unreadableAssetChannelIds(): string[] {
+		return [...this.unreadableAssetChannels];
 	}
 
 	/**
@@ -554,6 +574,11 @@ export class SqliteStorage implements IStorageBackend {
 			'created_at'
 		],
 		revoked_htlc_snapshots: ['channel_id', 'commitment_number', 'htlcs_json'],
+		auxiliary_revoked_commitments: [
+			'channel_id',
+			'commitment_number',
+			'view_json'
+		],
 		schema_version: ['version'],
 		scid_mappings: ['scid_hex', 'channel_id'],
 		wallet_data: ['key', 'value'],
@@ -604,6 +629,11 @@ export class SqliteStorage implements IStorageBackend {
 	}> = [
 		{ table: 'channels', pk: 'channel_id', columns: ['state_json'] },
 		{ table: 'revoked_htlc_snapshots', pk: 'rowid', columns: ['htlcs_json'] },
+		{
+			table: 'auxiliary_revoked_commitments',
+			pk: 'rowid',
+			columns: ['view_json']
+		},
 		{ table: 'payments', pk: 'payment_hash', columns: ['payment_json'] },
 		{ table: 'ffor_vouchers', pk: 'id', columns: ['record_json'] },
 		{ table: 'composite_splices', pk: 'id', columns: ['record_json'] },
@@ -872,6 +902,16 @@ export class SqliteStorage implements IStorageBackend {
 				channel_id TEXT NOT NULL,
 				commitment_number TEXT NOT NULL,
 				htlcs_json TEXT NOT NULL,
+				PRIMARY KEY (channel_id, commitment_number)
+			);
+
+			-- The asset side of each revoked commitment of the peer on an asset
+			-- channel (issue #2093), which a penalty needs. Empty on a node
+			-- without asset channels.
+			CREATE TABLE IF NOT EXISTS auxiliary_revoked_commitments (
+				channel_id TEXT NOT NULL,
+				commitment_number TEXT NOT NULL,
+				view_json TEXT NOT NULL,
 				PRIMARY KEY (channel_id, commitment_number)
 			);
 
@@ -1153,13 +1193,47 @@ export class SqliteStorage implements IStorageBackend {
 
 	saveChannel(id: string, state: IChannelState, peerPubkey: string): void {
 		const json = JSON.stringify(
-			serializeChannelState(state, { htlcHistory: 'none' })
+			channelRowToStore(serializeChannelState(state, { htlcHistory: 'none' }))
 		);
 		const history = unsavedRevokedHtlcSnapshots(state, this);
+		const revokedViews = auxiliaryRevokedViewsToStore(state);
+		// The size of the store of revoked views, where a host has asked for
+		// it, is kept current by what this write adds. A write inside a
+		// transaction of the caller may yet be rolled back, so there the
+		// size is let go and counted again when it is next asked for.
+		let sized = revokedViews ? this._auxiliaryRevokedSizes.get(id) : undefined;
+		if (sized && this.db.inTransaction) {
+			this._auxiliaryRevokedSizes.delete(id);
+			sized = undefined;
+		}
+		let addedRows = 0;
+		let addedBytes = 0;
 		this.db.transaction(() => {
 			this._stmt(
 				'INSERT OR REPLACE INTO channels (channel_id, state_json, peer_pubkey) VALUES (?, ?, ?)'
 			).run(id, this._enc(json), peerPubkey);
+			if (revokedViews) {
+				const keep = this._stmt(
+					'INSERT OR REPLACE INTO auxiliary_revoked_commitments ' +
+						'(channel_id, commitment_number, view_json) VALUES (?, ?, ?)'
+				);
+				const present = this._stmt(
+					'SELECT LENGTH(CAST(view_json AS BLOB)) AS bytes ' +
+						'FROM auxiliary_revoked_commitments ' +
+						'WHERE channel_id = ? AND commitment_number = ?'
+				);
+				for (const [commitmentNumber, view] of revokedViews) {
+					const value = this._enc(serializeAuxiliaryCommitmentView(view));
+					if (sized) {
+						const replaced = present.get(id, commitmentNumber.toString()) as
+							| { bytes: number }
+							| undefined;
+						addedRows += replaced ? 0 : 1;
+						addedBytes += Buffer.byteLength(value) - (replaced?.bytes ?? 0);
+					}
+					keep.run(id, commitmentNumber.toString(), value);
+				}
+			}
 			if (!history?.size) return;
 			const insert = this._stmt(
 				'INSERT OR REPLACE INTO revoked_htlc_snapshots ' +
@@ -1174,6 +1248,57 @@ export class SqliteStorage implements IStorageBackend {
 				);
 			}
 		})();
+		if (sized) {
+			sized.rows += addedRows;
+			sized.bytes += addedBytes;
+		}
+	}
+
+	/** The size of the store of revoked views of each channel a host asked about. */
+	private _auxiliaryRevokedSizes = new Map<
+		string,
+		{ rows: number; bytes: number }
+	>();
+
+	/**
+	 * The rows and the bytes of the store of revoked views of one channel.
+	 * The table is counted the first time a channel is asked about; from
+	 * then on each write of a view keeps the answer current, so asking
+	 * costs nothing however large the store has grown.
+	 */
+	auxiliaryRevokedCommitmentsSize(channelId: string): {
+		rows: number;
+		bytes: number;
+	} {
+		let size = this._auxiliaryRevokedSizes.get(channelId);
+		if (!size) {
+			const counted = this._stmt(
+				'SELECT COUNT(*) AS n, ' +
+					'COALESCE(SUM(LENGTH(CAST(view_json AS BLOB))), 0) AS bytes ' +
+					'FROM auxiliary_revoked_commitments WHERE channel_id = ?'
+			).get(channelId) as { n: number; bytes: number };
+			size = { rows: counted.n, bytes: counted.bytes };
+			// What is counted inside a transaction may yet be rolled back.
+			if (!this.db.inTransaction) {
+				this._auxiliaryRevokedSizes.set(channelId, size);
+			}
+		}
+		return { rows: size.rows, bytes: size.bytes };
+	}
+
+	loadAuxiliaryRevokedCommitment(
+		channelId: string,
+		commitmentNumber: bigint
+	): IAuxiliaryCommitmentData | null {
+		const row = this._stmt(
+			'SELECT view_json FROM auxiliary_revoked_commitments ' +
+				'WHERE channel_id = ? AND commitment_number = ?'
+		).get(channelId, commitmentNumber.toString()) as
+			| { view_json: string }
+			| undefined;
+		return row
+			? deserializeAuxiliaryCommitmentView(this._dec(row.view_json))
+			: null;
 	}
 
 	revokedHtlcSnapshotStore(): object {
@@ -1188,7 +1313,7 @@ export class SqliteStorage implements IStorageBackend {
 		).get(id) as { state_json: string; peer_pubkey: string } | undefined;
 		if (!row) return null;
 		const state = deserializeChannelState(
-			JSON.parse(this._dec(row.state_json))
+			channelRowFromStore(JSON.parse(this._dec(row.state_json)))
 		);
 		const history = this._readRevokedHtlcSnapshots(
 			this._stmt(
@@ -1225,11 +1350,12 @@ export class SqliteStorage implements IStorageBackend {
 			state: IChannelState;
 			peerPubkey: string;
 		}> = [];
+		const unreadableAssetChannels: string[] = [];
 		for (const row of rows) {
+			let parsed: unknown;
 			try {
-				const state = deserializeChannelState(
-					JSON.parse(this._dec(row.state_json))
-				);
+				parsed = JSON.parse(this._dec(row.state_json));
+				const state = deserializeChannelState(channelRowFromStore(parsed));
 				this._attachRevokedHtlcSnapshots(state, history.get(row.channel_id));
 				results.push({
 					channelId: row.channel_id,
@@ -1237,10 +1363,17 @@ export class SqliteStorage implements IStorageBackend {
 					peerPubkey: row.peer_pubkey
 				});
 			} catch (err) {
+				// An asset channel row that parses but does not decode is
+				// remembered by id before it is skipped: startup refuses to
+				// run without it (see unreadableAssetChannelIds).
+				if (serializedChannelCarriesAssetState(parsed)) {
+					unreadableAssetChannels.push(row.channel_id);
+				}
 				// Skip corrupted row — node still starts with remaining data
 				this.reportCorruptRow(err);
 			}
 		}
+		this.unreadableAssetChannels = unreadableAssetChannels;
 		return results;
 	}
 
@@ -1297,8 +1430,12 @@ export class SqliteStorage implements IStorageBackend {
 			this._stmt('DELETE FROM revoked_htlc_snapshots WHERE channel_id = ?').run(
 				id
 			);
+			this._stmt(
+				'DELETE FROM auxiliary_revoked_commitments WHERE channel_id = ?'
+			).run(id);
 			this._stmt('DELETE FROM recovery_outbox WHERE channel_id = ?').run(id);
 		})();
+		this._auxiliaryRevokedSizes.delete(id);
 	}
 
 	// ─── Composite splice records (issue #1922) ───

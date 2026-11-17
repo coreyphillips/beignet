@@ -235,6 +235,41 @@ export enum BeignetErrorCode {
 	OFFER_DECLINED = 'OFFER_DECLINED',
 	SIGN_REQUEST_REFUSED = 'SIGN_REQUEST_REFUSED',
 	EXCHANGE_TIMEOUT = 'EXCHANGE_TIMEOUT',
+	// Asset channels (issue #2093). All three refuse a start; none is an
+	// answer to a request.
+	/**
+	 * The database holds asset channels and no attached extension supplies
+	 * the provider that runs them. The node was not started and no stored row
+	 * was changed: start it with that extension and it runs.
+	 */
+	ASSET_PROVIDER_REQUIRED = 'ASSET_PROVIDER_REQUIRED',
+	/** Two attached extensions both supply an asset channel provider. */
+	ASSET_PROVIDER_CONFLICT = 'ASSET_PROVIDER_CONFLICT',
+	/**
+	 * The extension whose provider the node was being built with refused the
+	 * node in bind(). A provider that was never given its node cannot run a
+	 * channel, so the node was not started.
+	 */
+	ASSET_PROVIDER_FAILED = 'ASSET_PROVIDER_FAILED',
+	/**
+	 * A restore holds asset channels and the extension that supplies the
+	 * node's asset channels did not say it can restore them. Nothing of the
+	 * restore was installed.
+	 */
+	ASSET_RESTORE_REFUSED = 'ASSET_RESTORE_REFUSED',
+	/**
+	 * The payment has an HTLC on a channel a capsule restore left out, so
+	 * this wallet cannot know what became of it. It may have been paid: it
+	 * is not cancelled, and it stays PENDING with `unresolved` on its row.
+	 */
+	PAYMENT_UNRESOLVED = 'PAYMENT_UNRESOLVED',
+	/**
+	 * The wallet holds asset channels and was started in a guardian
+	 * recovery mode (`async-remote` or `quorum`). Nothing was started and
+	 * nothing reached a guardian: close the asset channels, or start
+	 * without the guardian backup.
+	 */
+	ASSET_GUARDIAN_START_REFUSED = 'ASSET_GUARDIAN_START_REFUSED',
 	// Host extensions (docs/EXTENSIONS.md).
 	/**
 	 * A refusal from an extension's route. The envelope carries the
@@ -273,6 +308,13 @@ export class BeignetError extends CodedError<BeignetErrorCodeValue> {
 	 * deciding to pay again (issue #1094).
 	 */
 	paymentHash?: string;
+	/**
+	 * What the refusal is about, for a caller that shows it. Set only where
+	 * the code documents it: ASSET_RESTORE_REFUSED and ASSET_PROVIDER_REQUIRED
+	 * of a capsule restore carry `assetChannels`, the asset channels the
+	 * restore holds.
+	 */
+	details?: Record<string, unknown>;
 
 	constructor(
 		code: BeignetErrorCodeValue,
@@ -289,18 +331,21 @@ export class BeignetError extends CodedError<BeignetErrorCodeValue> {
 		message: string;
 		failureCode?: number;
 		paymentHash?: string;
+		details?: Record<string, unknown>;
 	} {
 		const json: {
 			code: string;
 			message: string;
 			failureCode?: number;
 			paymentHash?: string;
+			details?: Record<string, unknown>;
 		} = {
 			code: this.code,
 			message: this.message
 		};
 		if (this.failureCode !== undefined) json.failureCode = this.failureCode;
 		if (this.paymentHash !== undefined) json.paymentHash = this.paymentHash;
+		if (this.details !== undefined) json.details = this.details;
 		return json;
 	}
 }

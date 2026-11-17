@@ -316,6 +316,8 @@ Generated from `node/types.ts` by `npm run docs:tables`; edit the doc comments t
 | `preferAnchors?` | `boolean` | Prefer anchor channels (option_anchors_zero_fee_htlc_tx) when opening channels |
 | `largeChannels?` | `boolean` | option_wumbo (large_channels, bit 18, default false): advertise the bit and lift the BOLT 2 2^24 sat funding cap to MAX_WUMBO_FUNDING_SATOSHIS (10 BTC) for peers that also advertise it. Opens/accepts/splices with non-wumbo peers keep the 2^24 cap. |
 | `preferTaproot?` | `boolean` | Propose simple taproot channels (option_taproot) when opening channels. MuSig2 funding and commitment signing (deterministic verification nonces) are fully wired into the live state machine; the complete lifecycle (open, payments both directions, reestablish, cooperative close, force close) is validated against LND on regtest. Off by default because the feature bit is still in staging upstream (180/181); not recommended for mainnet balances yet. |
+| `auxiliaryChannels?` | `IAuxiliaryChannelConfig` | Asset channels (Taproot Assets, as LND and tapd deploy them): a provider that commits a second asset to taproot channels, and the callbacks that tie funding, payment and forwarding to the host's asset protocol. Setting it advertises the taproot overlay feature (optional bit 2025) with the simple taproot bit it depends on (181), which takes option_simple_close off the advertisement like any taproot advertisement does, and makes the node read the custom records (TLV types at or above 65536) of a peer's init. Unset, the default, the node sets none of those bits and rejects an unknown even init record as before. |
+| `beforeRestore?` | `(node: LightningNode) => void` | Called once with the node when it is built, before it restores from storage: so before any stored channel can call a hook of `auxiliaryChannels`. A host whose hooks need the node binds it here (issue #2093). Synchronous. A throw ends the construction before a stored row is read or rewritten. Unset, the default, nothing is called. |
 | `leaseRates?` | `ILeaseRates` | Liquidity ads (bLIP-0051) SELLER policy: when set, an inbound open_channel2 carrying request_funds is answered with a signed will_fund at these rates and the requested contribution is funded from the node's on-chain wallet (fundingProvider). Leave unset to never sell leases. |
 | `peerStorageEnabled?` | `boolean` | BOLT 1 peer storage (option_provide_storage, default true): store the latest peer_storage blob per channel/trusted peer and return it on reconnect, and push our own blob (set via distributePeerStorage) to capable peers. When false the feature bit is not advertised and both directions are disabled. |
 | `feeEstimator?` | `IFeeEstimator` | Fee estimator for dynamic fee rates |
@@ -1371,7 +1373,7 @@ const result = await node.recoverFromStaticChannelBackup(scb.channels);
 | `payment:htlc-resolved` | `(event: IPaymentHtlcResolvedEvent)` | One offered HTLC of an outgoing payment reached a terminal state (fulfilled, irrevocably failed, or resolved on chain). A fulfilled HTLC is reported once, as `htlc:fulfilled` is. |
 | `payment:preimage` | `(event: IPaymentPreimageEvent)` | An outgoing payment's preimage became known, from update_fulfill_htlc or an on-chain claim, whatever the record's status was. From update_fulfill_htlc it is raised once per HTLC, as `htlc:fulfilled` is. |
 | `preimage:learned` | `(paymentHash: Buffer, preimage: Buffer)` | Preimage recorded (forwarding and settlement chokepoint). |
-| `invoice:settled` | `(data: { paymentHash: Buffer; bolt11: string; amountMsat: bigint })` | Invoice this node issued was settled. |
+| `invoice:settled` | `(data: { paymentHash: Buffer; bolt11: string; amountMsat: bigint; auxiliary?: true })` | Invoice this node issued was settled. |
 | `htlc:held` | `(data: { paymentHash: Buffer; amountMsat: bigint })` | HTLC parked by a hold invoice (one part; read `getHeldInvoiceSnapshot` for the committed set). |
 | `hold:accepted` | `(event: IHoldInvoiceStateEvent)` | A part joined a hold invoice's parked set, with the set's running total. A re-park on reestablish does not fire. Acceptance can be a partial MPP payment: compare `heldAmountMsat` with the full expected amount before committing funds. |
 | `hold:settled` | `(event: IHoldInvoiceStateEvent)` | A hold invoice's preimage was revealed and every parked part fulfilled. |
@@ -1388,7 +1390,7 @@ const result = await node.recoverFromStaticChannelBackup(scb.channels);
 | `channel:splice-txsigs-needed` | `(data: { channelId: Buffer; spliceTxid: Buffer; newFundingOutputIndex: number; externalInputIndices: number[] })` | A splice is withholding its tx_signatures on external inputs whose witnesses a third party owes: collect them and answer with `provideSpliceExternalWitness`. Re-armed per connection cycle. |
 | `channel:pending-close` | `(data: { channelId: Buffer; initiator: 'local' \| 'remote' })` | A cooperative close started. |
 | `channel:force-closing` | `(data: { channelId: Buffer; initiator: 'local' \| 'remote' })` | A force close started: this node broadcast its commitment (`local`) or the peer's appeared on chain (`remote`). |
-| `channel:closed` | `(data: { channelId: Buffer })` | Channel closed. |
+| `channel:closed` | `(data: { channelId: Buffer; unrecordedCloseTxid?: string })` | Channel closed. `unrecordedCloseTxid` is present only for an asset channel whose funding output was spent by a transaction the node took for the cooperative close and holds no close payload for. |
 | `channel:resolved` | `(data: { channelId: Buffer })` | All on-chain outputs of the close resolved. |
 | `channel:aborted` | `(temporaryChannelId: Buffer, reason: string)` | A negotiated but unfunded open was torn down. |
 | `channel:voided` | `(data: { channelId: Buffer })` | Unfunded or abandoned channel discarded. |
@@ -1414,6 +1416,7 @@ const result = await node.recoverFromStaticChannelBackup(scb.channels);
 | `peer:error` | `(pubkey: string, error: Error)` | Peer error (networking mode). |
 | `porch:status` | `(status: IPorchHostStatus)` | A Porch relay's standbys changed: the relay became reachable, was lost or refused the node, or a visitor connected or left. Carries that relay's whole status; `state: 'ready'` means links through it work. |
 | `peer:warning` | `(warning: { pubkey: string; channelId: Buffer \| null; text: string })` | A peer sent a BOLT 1 warning, which leaves the connection and its channels as they were, so it is not a `node:error`. `channelId` is null for a connection-level warning (the all-zero id); `text` is the peer's text as printable ASCII. |
+| `raw-custom-message` | `(message: { peerPubkey: string; type: number; payload: Buffer })` | A registered experimental wire message, without an envelope. Networking supplies the authenticated Noise peer identity; external transports must authenticate handlePeerMessage's peer argument. |
 | `custom-message` | `(message: { peerPubkey: string; version: number; subtype: number; payload: Buffer })` | A beignet custom message (type 44069) arrived from a peer. |
 | `peer_storage:retrieved` | `(peerPubkey: string, blob: Buffer)` | A peer returned the blob it stores for this node (BOLT 1 peer storage), unpadded. |
 | `onion:received` | `(payload: IOnionMessagePayload)` | Onion message received (type 513). |
@@ -1475,6 +1478,34 @@ const result = await node.recoverFromStaticChannelBackup(scb.channels);
 | `ffor:issuer-issued` | `(data: { mailboxId: Buffer; k: number; payerId: Buffer })` | Issuer role: an invoice was issued against slot `k` to a payer. |
 | `ffor:issuer-retired` | `(data: { mailboxId: Buffer; reason: string })` | Issuer role: a delegated offer stopped issuing, with the reason. |
 <!-- events:LightningNodeEvents:end -->
+
+### Raw experimental peer messages
+
+Protocols with their own wire types can register those types and exchange exact
+payload bytes through the authenticated Noise connection:
+
+```ts
+const releaseTypes = node.registerRawCustomMessageTypes([32768, 32769]);
+node.on('raw-custom-message', ({ peerPubkey, type, payload }) => {
+  // Decode and validate the protocol message before acting on it.
+});
+node.sendRawCustomMessage(peerPubkey, 32768, encodedPayload);
+// Release this registration when the protocol integration is stopped.
+releaseTypes();
+```
+
+Register before connecting. Types must be unused integers from 32768 through
+65535; built-in Beignet types cannot be intercepted. Required even types are
+accepted only while registered. Registrations can overlap and each release
+function is idempotent. Payloads are limited to 65533 bytes, leaving two bytes
+for the BOLT 8 message type. Each subscriber receives its own payload copy.
+
+Sending requires a connected peer and preserves the existing recovery and lane
+gates. Network events identify the Noise-authenticated sender. Hosts that call
+`handlePeerMessage` through their own transport must authenticate that sender
+themselves. Registration does not negotiate or advertise protocol features and
+does not add asset-channel support. The host owns negotiation and protocol
+validation. The `sendCustomMessage` API below retains its envelope format.
 
 ### Beignet custom messages (type 44069)
 

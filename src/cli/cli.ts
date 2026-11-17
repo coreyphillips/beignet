@@ -3048,10 +3048,13 @@ async function handleRecovery(): Promise<void> {
 		// Tier 2 result asks for a daemon restart. --unfenced is the labelled
 		// escape hatch for a capsule that names a guardian set whose
 		// guardians are gone: it cannot fence the previous writer.
+		// --omit-asset-channels restores without the asset channels the
+		// capsule holds, where the restore would otherwise be refused.
 		return outputResult(
 			await httpRequest('POST', '/recovery/restore-capsule', {
 				confirm: true,
-				...(hasFlag('--unfenced') ? { unfenced: true } : {})
+				...(hasFlag('--unfenced') ? { unfenced: true } : {}),
+				...(hasFlag('--omit-asset-channels') ? { omitAssetChannels: true } : {})
 			})
 		);
 	}
@@ -3394,6 +3397,8 @@ On-chain:
                                          --unfenced restores a capsule that names
                                          guardians WITHOUT fencing the old writer
                                          (guardian set gone; never for quorum)
+                                         --omit-asset-channels leaves the asset
+                                         channels the capsule holds out
   recovery capsule-guardians             The guardian set the best retrieved
                                          capsule names, credentials included, as
                                          config entries for recoveryGuardians

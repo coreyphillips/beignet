@@ -1,3 +1,38 @@
+/** Stable identity for a bounded fee reservation attached to one channel HTLC source. */
+export function fixedOutputHtlcFeeActionId(
+	channelId: Buffer,
+	txid: string,
+	outputIndex: number
+): string {
+	if (
+		channelId.length !== 32 ||
+		!/^[0-9a-f]{64}$/i.test(txid) ||
+		!Number.isInteger(outputIndex) ||
+		outputIndex < 0 ||
+		outputIndex > 0xffffffff
+	)
+		throw new Error('Invalid fixed-output HTLC fee identity');
+	return `asset-htlc:${channelId.toString(
+		'hex'
+	)}:${txid.toLowerCase()}:${outputIndex}`;
+}
+
+/** Parse only a complete canonical HTLC fee identity, never a namespace prefix. */
+export function parseFixedOutputHtlcFeeActionId(
+	value: string
+): { channelId: Buffer; txid: string; outputIndex: number } | undefined {
+	const match =
+		/^asset-htlc:([0-9a-f]{64}):([0-9a-f]{64}):(0|[1-9][0-9]*)$/.exec(value);
+	if (!match) return undefined;
+	const outputIndex = Number(match[3]);
+	if (!Number.isSafeInteger(outputIndex) || outputIndex > 0xffffffff)
+		return undefined;
+	return {
+		channelId: Buffer.from(match[1], 'hex'),
+		txid: match[2],
+		outputIndex
+	};
+}
 /**
  * BOLT 5: Chain monitor types.
  *
@@ -39,6 +74,76 @@ export enum OutputType {
 
 /** A tracked on-chain output */
 export interface ITrackedOutput {
+	/**
+	 * Set on an output of an asset channel that carries units: the number of
+	 * the commitment whose asset view names its leaf.
+	 */
+	auxiliaryCommitmentNumber?: bigint;
+	/** The asset side of `sweepTxHex`, as the provider made it. */
+	auxiliaryData?: Buffer;
+	/**
+	 * The sweeps signed for an output that carries units, by transaction id,
+	 * each with its asset side: the present one, and every one that was
+	 * offered for broadcast (`offered`), since any of those may confirm.
+	 */
+	auxiliarySweepAttempts?: Record<
+		string,
+		{ transaction: string; auxiliaryData?: Buffer; offered?: true }
+	>;
+	/**
+	 * A sweep of the units of this output cannot pay its own fee and leave
+	 * what an output of units must hold: it waits for a fee from elsewhere.
+	 */
+	auxiliaryFeeFunding?: boolean;
+	/** Why the provider would not make the asset side of a sweep, last time. */
+	auxiliaryRefusal?: string;
+
+	/**
+	 * Set on the second-level output of an HTLC of an asset channel that
+	 * carries units: the HTLC it came from, by which the asset leaf of the
+	 * output is found again.
+	 */
+	auxiliaryHtlc?: {
+		id: bigint;
+		direction: import('../channel/types').HtlcDirection;
+	};
+	/** The second-level HTLC transaction whose output this is. */
+	auxiliaryParentTxHex?: string;
+	/** The asset side of that transaction, which the sweep of its output builds on. */
+	auxiliaryParentData?: Buffer;
+	/** The fee rate the spend that wallet inputs pay for was last made at. */
+	auxiliaryFeeRate?: number;
+	/**
+	 * The fee pool was asked for inputs under the identity of this output,
+	 * and the action it keeps for it has not been retired yet.
+	 */
+	auxiliaryFeeActionOpen?: true;
+
+	/**
+	 * Asset channels: the ending of this HTLC on the chain was put in the
+	 * channel's row for its host (onHtlcResolved).
+	 */
+	auxiliaryOutcomeRecorded?: true;
+	/**
+	 * Asset channels: the expiry of this HTLC, which the node decided to
+	 * settle, passed with no claim of the node in a block, and that was
+	 * said (ChainMonitor.takeAuxiliaryClaimsPastExpiry).
+	 */
+	auxiliaryClaimLateNoted?: true;
+
+	/**
+	 * The spend of this output waits for a fee input: the code and the
+	 * remedy the fee pool gave, the height at which the wait began, and,
+	 * for a claim by preimage, the height by which it has to confirm.
+	 */
+	auxiliaryFeeWait?: {
+		code: string;
+		remedy?: string;
+		message?: string;
+		sinceHeight: number;
+		deadlineHeight?: number;
+	};
+
 	txid: string;
 	outputIndex: number;
 	amount: bigint;
@@ -59,6 +164,8 @@ export interface ITrackedOutput {
 	cltvExpiry?: number;
 	witnessScript?: Buffer;
 	resolutionTxid?: string;
+	/** The transaction that spent an output of an asset channel, as seen on chain. */
+	resolutionTxHex?: string;
 	/** Witness evidence bound to a spend of our received HTLC on a current commitment. */
 	receivedHtlcSpend?: {
 		txid: string;
@@ -147,6 +254,15 @@ export interface ICommitmentBroadcast {
 	/** Observed cooperative transaction, retained for external payout history. */
 	cooperativeTxHex?: string;
 	/**
+	 * Asset channels: the transaction is recorded as the cooperative close
+	 * because it carries no commitment stamp, and the channel's asset state
+	 * holds no close payload for it, so it is no close this node signed and
+	 * the node cannot say where the asset went. Present only then; the row
+	 * of the channel names the same transaction in
+	 * auxiliaryState.unrecordedCloseTxid.
+	 */
+	unrecordedClose?: true;
+	/**
 	 * The funding outpoint this transaction was reported as spending (issue
 	 * #479).
 	 *
@@ -185,6 +301,12 @@ export interface ICommitmentBroadcast {
 	 * transaction that conflicts with a live claim of our own.
 	 */
 	claimedOutputIndices?: number[];
+	/**
+	 * Asset channels: the HTLCs with units that are on no output of this
+	 * commitment and whose ending was put in the channel's row for its host
+	 * (onHtlcResolved), each as `DIRECTION:id`.
+	 */
+	auxiliaryAbsentHtlcsRecorded?: string[];
 }
 
 /**
@@ -219,6 +341,11 @@ export enum ChainActionType {
 }
 
 export interface IBroadcastTxChainAction {
+	/**
+	 * Set on a transaction that spends units of an asset channel: the
+	 * monitor row that holds its asset side is stored before it leaves.
+	 */
+	requiresMonitorPersistence?: true;
 	type: ChainActionType.BROADCAST_TX;
 	tx: Buffer;
 	description: string;
@@ -238,7 +365,20 @@ export interface IBroadcastTxChainAction {
  */
 export interface IFeeBumpAndBroadcastChainAction {
 	type: ChainActionType.FEE_BUMP_AND_BROADCAST;
-	kind: 'htlc-fee-attach' | 'anchor-cpfp';
+
+	kind: 'htlc-fee-attach' | 'anchor-cpfp' | 'fixed-output-fee';
+	/**
+	 * fixed-output-fee only: the output of an asset channel that `tx`
+	 * spends. The outputs of `tx` stay as they are, wallet inputs bring the
+	 * whole fee, and the fee pool is asked under the identity of this output.
+	 */
+	fixedOutput?: {
+		txid: string;
+		outputIndex: number;
+		/** The height by which the spend has to be confirmed, when it has one. */
+		deadlineHeight?: number;
+	};
+
 	tx: Buffer;
 	description: string;
 	/** Target fee rate in sat/vByte for the bumped transaction/package. */
@@ -388,3 +528,32 @@ export function satPerVbyteToSatPerKw(satPerVbyte: number): number {
 export function satPerKwToSatPerVbyte(satPerKw: number): number {
 	return Math.ceil((satPerKw * 4) / 1000);
 }
+
+/**
+ * When the fee coin pool and the chain code act for a spend of an asset
+ * channel that waits on a split, in blocks.
+ */
+export const FIXED_OUTPUT_FEE_TIMING = {
+	/** A split that has not confirmed is replaced by one that pays more this many blocks after it went out. */
+	splitRaiseBlocks: 6,
+	/** The same, when the spend that waits has a deadline within nearDeadlineBlocks. */
+	splitRaiseBlocksNearDeadline: 2,
+	/** A deadline is near from this many blocks before it. */
+	nearDeadlineBlocks: 18,
+	/**
+	 * A spend whose deadline is within this many blocks may take a coin of
+	 * the pool's own split before the split has confirmed.
+	 */
+	unconfirmedCoinBlocks: 6
+} as const;
+
+/**
+ * Whether waiting can still have a spend confirmed by its deadline, with
+ * the chain at `blockHeight`: the next block is the first the spend can be
+ * in, and the block after the deadline is the first that can take the
+ * transaction of the other side.
+ */
+export const fixedOutputFeeWaitMakesDeadline = (
+	blockHeight: number,
+	deadlineHeight: number
+): boolean => blockHeight < deadlineHeight;

@@ -30,6 +30,37 @@ type Tapleaf = { output: Buffer; version?: number };
 type Taptree = [Taptree | Tapleaf, Taptree | Tapleaf] | Tapleaf;
 
 /**
+ * A tapscript leaf an auxiliary channel provider commits beside the ordinary
+ * Bitcoin spend tree of a commitment output (an asset commitment). The leaf
+ * version defaults to the tapscript version, 0xc0.
+ */
+export interface ITaprootAuxLeaf {
+	script: Buffer;
+	leafVersion?: number;
+}
+
+/**
+ * `tree` with the auxiliary leaf committed beside it, as the right child of
+ * a new root. Without a leaf the tree is returned as it is, so an output
+ * built without one has the key it always had.
+ */
+function withAuxLeaf(tree: Taptree, leaf?: ITaprootAuxLeaf): Taptree {
+	if (!leaf) return tree;
+	const version = leaf.leafVersion ?? TAPLEAF_VERSION;
+	if (
+		!Buffer.isBuffer(leaf.script) ||
+		leaf.script.length > 10000 ||
+		!Number.isInteger(version) ||
+		version < 0 ||
+		version > 254 ||
+		version % 2 !== 0
+	) {
+		throw new Error('Invalid auxiliary Taproot leaf');
+	}
+	return [tree, { output: Buffer.from(leaf.script), version }];
+}
+
+/**
  * NUMS point (x-only) used as the taproot internal key for the to_local/to_remote
  * commitment outputs so key-path spends are impossible.
  *
@@ -173,7 +204,8 @@ export function buildTaprootToLocalOutput(
 	revocationPubkey: Buffer,
 	localDelayedPubkey: Buffer,
 	toSelfDelay: number,
-	network: bitcoin.Network = bitcoin.networks.bitcoin
+	network: bitcoin.Network = bitcoin.networks.bitcoin,
+	auxiliaryLeaf?: ITaprootAuxLeaf
 ): ITaprootCommitOutput & {
 	delay: ITaprootLeafSpend;
 	revoke: ITaprootLeafSpend;
@@ -187,10 +219,10 @@ export function buildTaprootToLocalOutput(
 		localDelayedPubkey
 	);
 	// Leaf order: [delay, revoke]. (Document for LND byte-diff at interop.)
-	const scriptTree: Taptree = [
-		{ output: delayScript },
-		{ output: revokeScript }
-	];
+	const scriptTree = withAuxLeaf(
+		[{ output: delayScript }, { output: revokeScript }],
+		auxiliaryLeaf
+	);
 	const base = bitcoin.payments.p2tr({
 		internalPubkey: TAPROOT_NUMS_KEY,
 		scriptTree,
@@ -235,16 +267,18 @@ export function buildTaprootSecondLevelOutput(
 	revocationPubkey: Buffer,
 	localDelayedPubkey: Buffer,
 	toSelfDelay: number,
-	network: bitcoin.Network = bitcoin.networks.bitcoin
-): ITaprootCommitOutput & { delay: ITaprootLeafSpend } {
+	network: bitcoin.Network = bitcoin.networks.bitcoin,
+	auxiliaryLeaf?: ITaprootAuxLeaf
+): ITaprootCommitOutput & { merkleRoot: Buffer; delay: ITaprootLeafSpend } {
 	const delayScript = buildTaprootToLocalDelayScript(
 		localDelayedPubkey,
 		toSelfDelay
 	);
 	const internalPubkey = toXOnly(revocationPubkey);
-	const scriptTree: Taptree = { output: delayScript };
+	const scriptTree = withAuxLeaf({ output: delayScript }, auxiliaryLeaf);
 	const base = bitcoin.payments.p2tr({ internalPubkey, scriptTree, network });
 	return {
+		merkleRoot: base.hash!,
 		output: base.output!,
 		outputKey: base.pubkey!,
 		address: base.address!,
@@ -267,10 +301,11 @@ export function buildTaprootSecondLevelOutput(
  */
 export function buildTaprootToRemoteOutput(
 	remotePubkey: Buffer,
-	network: bitcoin.Network = bitcoin.networks.bitcoin
+	network: bitcoin.Network = bitcoin.networks.bitcoin,
+	auxiliaryLeaf?: ITaprootAuxLeaf
 ): ITaprootCommitOutput & { spend: ITaprootLeafSpend } {
 	const leaf = buildTaprootToRemoteScript(remotePubkey);
-	const scriptTree: Taptree = { output: leaf };
+	const scriptTree = withAuxLeaf({ output: leaf }, auxiliaryLeaf);
 	const base = bitcoin.payments.p2tr({
 		internalPubkey: TAPROOT_NUMS_KEY,
 		scriptTree,
@@ -406,13 +441,14 @@ function assembleHtlcOutput(
 	revocationPubkey: Buffer,
 	successScript: Buffer,
 	timeoutScript: Buffer,
-	network: bitcoin.Network
+	network: bitcoin.Network,
+	auxiliaryLeaf?: ITaprootAuxLeaf
 ): ITaprootHtlcOutput {
 	const internalPubkey = toXOnly(revocationPubkey);
-	const scriptTree: Taptree = [
-		{ output: successScript },
-		{ output: timeoutScript }
-	];
+	const scriptTree = withAuxLeaf(
+		[{ output: successScript }, { output: timeoutScript }],
+		auxiliaryLeaf
+	);
 	const base = bitcoin.payments.p2tr({ internalPubkey, scriptTree, network });
 	return {
 		output: base.output!,
@@ -449,13 +485,15 @@ export function buildTaprootOfferedHtlcOutput(
 	localHtlcPubkey: Buffer,
 	remoteHtlcPubkey: Buffer,
 	paymentHash: Buffer,
-	network: bitcoin.Network = bitcoin.networks.bitcoin
+	network: bitcoin.Network = bitcoin.networks.bitcoin,
+	auxiliaryLeaf?: ITaprootAuxLeaf
 ): ITaprootHtlcOutput {
 	return assembleHtlcOutput(
 		revocationPubkey,
 		buildTaprootOfferedHtlcSuccessLeaf(remoteHtlcPubkey, paymentHash),
 		buildTaprootOfferedHtlcTimeoutLeaf(localHtlcPubkey, remoteHtlcPubkey),
-		network
+		network,
+		auxiliaryLeaf
 	);
 }
 
@@ -507,7 +545,8 @@ export function buildTaprootReceivedHtlcOutput(
 	remoteHtlcPubkey: Buffer,
 	paymentHash: Buffer,
 	cltvExpiry: number,
-	network: bitcoin.Network = bitcoin.networks.bitcoin
+	network: bitcoin.Network = bitcoin.networks.bitcoin,
+	auxiliaryLeaf?: ITaprootAuxLeaf
 ): ITaprootHtlcOutput {
 	return assembleHtlcOutput(
 		revocationPubkey,
@@ -517,6 +556,7 @@ export function buildTaprootReceivedHtlcOutput(
 			paymentHash
 		),
 		buildTaprootReceivedHtlcTimeoutLeaf(remoteHtlcPubkey, cltvExpiry),
-		network
+		network,
+		auxiliaryLeaf
 	);
 }

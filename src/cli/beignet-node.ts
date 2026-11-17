@@ -88,10 +88,20 @@ import {
 	carryExtensionRows,
 	validateExtensions
 } from './extension';
-import type { IBeignetExtension, IExtensionInfo } from './extension';
+import type {
+	ExtensionFixedOutputFees,
+	IBeignetExtension,
+	IExtensionAuxiliarySupply,
+	IExtensionInfo
+} from './extension';
 import { EProtocol } from '../types/electrum';
 import { LightningNode } from '../lightning/node/lightning-node';
-import { CommitmentType, OutputType } from '../lightning/chain/types';
+import {
+	CommitmentType,
+	OutputStatus,
+	OutputType
+} from '../lightning/chain/types';
+import type { ITrackedOutput } from '../lightning/chain/types';
 import { DF_DEFAULT_UNPAIRED_SPLICE_DEPTH } from '../lightning/direct-funding/receiver/types';
 import { SPLICE_LOCK_DEPTH_ACCEPT_MAX as DF_UNPAIRED_SPLICE_DEPTH_MAX } from '../lightning/message/splice';
 import { assertBolt1String } from '../lightning/message/field-rules';
@@ -137,6 +147,7 @@ import type { ILightningError, IPaymentInfo } from '../lightning/node/types';
 import type { IInvoiceInfo } from '../lightning/storage/types';
 import type { IPeerTransportOptions } from '../lightning/transport/duplex-transport';
 import { normalizeHexPubkey } from '../lightning/validation';
+import { FixedOutputFeeError } from '../lightning/wallet/fixed-output-fees';
 import { WalletFundingProvider } from '../lightning/wallet/wallet-funding-provider';
 import type {
 	IStoredPaymentRef,
@@ -195,10 +206,15 @@ import type {
 	IGuardianHostEvent,
 	IGuardianHostStatus,
 	IRotationEvent,
-	IGuardianReplicationEvent
+	IGuardianReplicationEvent,
+	IAuxiliaryRestoreChannel
 } from '../lightning/recovery';
 import {
+	AuxiliaryGuardianRestoreError,
+	AuxiliaryRestoreRefusedError,
+	refusedAuxiliaryChannels,
 	RestoreRefusedError,
+	storedAuxiliaryChannelIds,
 	RestoreRotatedError,
 	buildGuardianRecovery,
 	parseGuardianEntry,
@@ -289,7 +305,9 @@ import type {
 	IRebalanceExecutionSummary,
 	IRebalanceResult
 } from '../lightning/node/types';
+import type { AuxiliaryPaymentGate } from '../lightning/node/types';
 import {
+	AuxiliaryProviderRequiredError,
 	InvalidRequestError,
 	ChannelFundingUnavailableError,
 	ChannelFundingUnavailableCode,
@@ -298,7 +316,11 @@ import {
 	PaymentStatus,
 	PaymentWaitTimeoutError
 } from '../lightning/node/types';
-import { isAnchorChannel, ChannelState } from '../lightning/channel/types';
+import {
+	isAnchorChannel,
+	isOverlayChannel,
+	ChannelState
+} from '../lightning/channel/types';
 import type { ChannelErrorCode } from '../lightning/channel/channel-actions';
 import { isRecencyUnproven } from '../lightning/channel/channel-state';
 import type { Channel } from '../lightning/channel/channel';
@@ -327,6 +349,7 @@ import type {
 	PorchRelayInfo,
 	ChannelInfo,
 	PaymentInfo,
+	PaymentUnresolved,
 	PayAllQuote,
 	InvoiceInfo,
 	DecodedInvoice,
@@ -373,6 +396,7 @@ import type {
 	ChannelPolicyUpdateParams,
 	HoldInvoiceInfo,
 	HoldInvoiceEvent,
+	AssetRestoreRefusal,
 	GraphInfo,
 	GraphChannelInfo,
 	GraphChannelPolicy,
@@ -2166,7 +2190,8 @@ export function holdInvoiceEvent(e: IHoldInvoiceStateEvent): HoldInvoiceEvent {
 		minFinalCltvExpiry: e.minFinalCltvExpiry,
 		earliestExpiry: e.earliestExpiry,
 		cancelMarginBlocks: e.cancelMarginBlocks,
-		cancelHeight: e.cancelHeight
+		cancelHeight: e.cancelHeight,
+		...(e.auxiliary === true ? { auxiliary: true as const } : {})
 	};
 }
 
@@ -2398,6 +2423,93 @@ function listenerLabel(kind: ListenerKind): string {
 /** How long `connectPeer` waits for a dial unless `connectTimeoutMs` says otherwise. */
 const DEFAULT_CONNECT_TIMEOUT_MS = 15_000;
 
+/** An asset channel a capsule restore holds, as the daemon answers it. */
+export interface IRestoreAssetChannel {
+	channelId: ChannelIdHex;
+	/** The peer's node id, hex. */
+	peerPubkey: string;
+	/** The capacity of the channel's funding output. */
+	capacitySats: number;
+}
+
+/**
+ * The mark of a PENDING payment record that a capsule restore left without
+ * the channel of its HTLC, as a row carries it. Undefined for every other
+ * record, and for a marked one that has since got an outcome.
+ */
+function paymentUnresolved(
+	record: IPaymentInfo
+): PaymentUnresolved | undefined {
+	if (record.status !== PaymentStatus.PENDING || !record.unresolved) {
+		return undefined;
+	}
+	return {
+		code: record.unresolved.code,
+		channelIds: record.unresolved.channelIds.map((id) => id as ChannelIdHex)
+	};
+}
+
+function restoreAssetChannel(
+	channel: IAuxiliaryRestoreChannel
+): IRestoreAssetChannel {
+	return {
+		channelId: channel.channelId as ChannelIdHex,
+		peerPubkey: channel.peerPubkey,
+		capacitySats: Number(channel.capacitySatoshis)
+	};
+}
+
+/**
+ * What a refused capsule restore says of the asset channels it was refused
+ * for: the code and the list of `error.details.assetChannels`. Undefined
+ * for any other error.
+ */
+export function assetRestoreRefusalOf(
+	err: unknown
+): AssetRestoreRefusal | undefined {
+	if (
+		!(err instanceof BeignetError) ||
+		(err.code !== 'ASSET_RESTORE_REFUSED' &&
+			err.code !== 'ASSET_PROVIDER_REQUIRED')
+	) {
+		return undefined;
+	}
+	const listed = (
+		err.details as { assetChannels?: IRestoreAssetChannel[] } | undefined
+	)?.assetChannels;
+	if (!Array.isArray(listed)) return undefined;
+	return {
+		code: err.code,
+		assetChannels: listed.map((channel) => ({ ...channel }))
+	};
+}
+
+/**
+ * The asset channels a capsule restore run with omitAssetChannels left out:
+ * at Tier 2 the ones the engine skipped, and at Tier 1, where the backup is
+ * all there is, its entries with an asset channel type.
+ */
+export function restoreOmittedAssetChannels(result: {
+	tier: 1 | 2;
+	scb: IStaticChannelBackup;
+	omittedAuxiliaryChannels?: IAuxiliaryRestoreChannel[];
+}): IRestoreAssetChannel[] {
+	if (result.tier === 2) {
+		return (result.omittedAuxiliaryChannels ?? []).map(restoreAssetChannel);
+	}
+	return result.scb.channels
+		.filter(
+			(entry) =>
+				/^([0-9a-f]{2})+$/i.test(entry.channelType) &&
+				isOverlayChannel(Buffer.from(entry.channelType, 'hex'))
+		)
+		.map((entry) => ({
+			channelId: entry.channelId as ChannelIdHex,
+			peerPubkey: entry.peerNodeId,
+			capacitySats: Number(entry.fundingSatoshis)
+		}));
+}
+
 export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	private fforReceiveService?: FforReceiveService;
 	private offlineReceive?: OfflineReceive;
@@ -2467,6 +2579,12 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	private recoveryGuardianSet: IParsedGuardian[] = [];
 	/** The node-level recovery config fragment initNode passes at construction. */
 	private recoveryNodeConfig?: INodeConfig['recovery'];
+	/** The asset channel support of the node last built, for a restore to ask. */
+	private _restoreAuxiliaryChannels?: INodeConfig['auxiliaryChannels'];
+	/** Whether the node being built runs asset channels, and so gets the gate. */
+	private _gatesAssetPayments = false;
+	/** The extension that supplies the node's asset channels, when one does. */
+	private _assetProviderId?: string;
 	/** The assembled run decision (guardian modes only). */
 	private _recoveryRun?: Extract<GuardianBootDecision, { kind: 'run' }>;
 	/** The env named a guardian set the journal has since rotated away from. */
@@ -2550,6 +2668,11 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 		firstArrivalAt?: number;
 		settleUntil?: number;
 		lastReason?: string;
+		/** Asset channels: set when the apply was refused for the ones the
+		 *  capsule holds, with the list the route would answer. */
+		refusal?: AssetRestoreRefusal;
+		/** Asset channels: the asset entries a Tier 1 apply skipped. */
+		skippedAssetChannels?: IRestoreAssetChannel[];
 		settleTimer?: ReturnType<typeof setTimeout>;
 		ceilingTimer?: ReturnType<typeof setTimeout>;
 	} = { phase: 'idle' };
@@ -3244,8 +3367,139 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 		try {
 			await this.initNode(opts);
 		} catch (err) {
+			// Read before the fence below settles every extension as stopped.
+			const refusal = this.assetProviderRequired(err);
 			this._extensionHost?.fenceForRebuild();
-			throw err;
+			throw refusal ?? err;
+		}
+	}
+
+	/**
+	 * The engine's refusal of a restore that holds asset channels (issue
+	 * #2093), as the daemon's own: ASSET_RESTORE_REFUSED when the extension
+	 * that supplies the node's asset channels did not say it can restore
+	 * them, and ASSET_PROVIDER_REQUIRED when no extension supplies any.
+	 * Nothing of the restore was installed either way. Undefined for any
+	 * other failure. The refusal of a capsule restore carries the channels
+	 * under `details.assetChannels`: what the same restore would leave out
+	 * were it run with omitAssetChannels.
+	 */
+	private assetRestoreRefusal(err: unknown): BeignetError | undefined {
+		const held = refusedAuxiliaryChannels(err);
+		const withChannels = (refusal: BeignetError): BeignetError => {
+			if (held) {
+				refusal.details = { assetChannels: held.map(restoreAssetChannel) };
+			}
+			return refusal;
+		};
+		if (
+			err instanceof AuxiliaryRestoreRefusedError ||
+			err instanceof AuxiliaryGuardianRestoreError
+		) {
+			return withChannels(
+				new BeignetError('ASSET_RESTORE_REFUSED', err.message)
+			);
+		}
+		if (err instanceof AuxiliaryProviderRequiredError) {
+			const count = err.channelIds.length;
+			return withChannels(
+				new BeignetError(
+					'ASSET_PROVIDER_REQUIRED',
+					`This restore holds ${count} asset channel${
+						count === 1 ? '' : 's'
+					} ` +
+						'and no extension attached to this wallet can run them, so ' +
+						'nothing was restored. Restore it with the extension that ' +
+						'opened them.'
+				)
+			);
+		}
+		return undefined;
+	}
+
+	/**
+	 * The engine's refusal to run stored asset channels without their
+	 * provider (issue #2093), as the daemon's own: a stable code and a
+	 * sentence an operator can act on. Anything else comes back undefined.
+	 * The engine threw before it rewrote a row, so the same database starts
+	 * once the extension that supplies the provider is attached.
+	 */
+	private assetProviderRequired(err: unknown): BeignetError | undefined {
+		if (!(err instanceof AuxiliaryProviderRequiredError)) return undefined;
+		const count = err.channelIds.length;
+		const failed = (this._extensionHost?.describe() ?? []).filter(
+			(extension) => extension.state === 'failed'
+		);
+		this.log('error', 'Asset channels are stored and nothing can run them', {
+			channelIds: [...err.channelIds]
+		});
+		return new BeignetError(
+			'ASSET_PROVIDER_REQUIRED',
+			`This wallet has ${count} asset channel${count === 1 ? '' : 's'} and ` +
+				'no extension attached to it can run them, so it was not started ' +
+				'and nothing was changed. Start it with the extension that ' +
+				'opened them.' +
+				failed
+					.map(
+						(extension) =>
+							` Extension "${extension.id}" failed: ` +
+							`${extension.error ?? 'unknown error'}.`
+					)
+					.join('')
+		);
+	}
+
+	/**
+	 * The wallet's funding provider for one build. With a fee policy from the
+	 * extension that supplies asset channels, it also prepares the fee coins
+	 * of their fixed-output transactions, journalled in the node's own
+	 * database under the wallet's identity. A policy the wallet refuses
+	 * leaves the extension and its provider in place, so a wallet that holds
+	 * asset channels starts: the provider is an ordinary one that reports
+	 * its fee coin pool unavailable, by the typed error everything that
+	 * needs a fee coin then fails with, and the node opens and accepts no
+	 * asset channel while it is.
+	 */
+	private walletFundingProvider(
+		supply: IExtensionAuxiliarySupply | undefined
+	): WalletFundingProvider {
+		const fees: ExtensionFixedOutputFees | undefined = supply?.fixedOutputFees;
+		if (supply === undefined || fees === undefined) {
+			return new WalletFundingProvider(this.wallet);
+		}
+		try {
+			return new WalletFundingProvider(this.wallet, {
+				fixedOutputFees: {
+					storage: this.storage,
+					maxFeeSatoshis: fees.maxFeeSatoshis,
+					maxTotalFeeSatoshis: fees.maxTotalFeeSatoshis,
+					maxPreparationFeeSatoshis: fees.maxPreparationFeeSatoshis,
+					...(fees.feeCoinCount !== undefined
+						? { feeCoinCount: fees.feeCoinCount }
+						: {}),
+					...(fees.preparationFeeRatePerVbyte !== undefined
+						? { preparationFeeRatePerVbyte: fees.preparationFeeRatePerVbyte }
+						: {}),
+					...(fees.walletCallTimeoutMs !== undefined
+						? { walletCallTimeoutMs: fees.walletCallTimeoutMs }
+						: {})
+				}
+			});
+		} catch (err) {
+			const refusal = new FixedOutputFeeError(
+				'FEE_POLICY_REFUSED',
+				'operator',
+				'The wallet refused the fixed-output fee policy of extension ' +
+					`"${supply.id}": ${(err as Error).message}`
+			);
+			this._extensionHost?.feePolicyRefused(supply.id, refusal);
+			this.log('warn', refusal.message, {
+				extension: supply.id,
+				code: refusal.code
+			});
+			return new WalletFundingProvider(this.wallet, {
+				fixedOutputFeeRefusal: refusal
+			});
 		}
 	}
 
@@ -3383,8 +3637,21 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 			storage: () => this.storage
 		});
 
+		// 3c. Asset channels (issue #2093): what the attached extensions supply
+		// for the node about to be built. Two providers are refused here,
+		// before anything is built on either. Without one, everything below
+		// is as it was before the members existed.
+		const supplied = this._extensionHost?.auxiliarySupply();
+
 		// 4. Create funding provider from wallet
-		const fundingProvider = new WalletFundingProvider(this.wallet);
+		const fundingProvider = this.walletFundingProvider(supplied);
+		const auxiliary = supplied;
+		// Kept for a restore this process runs later: it is refused when it
+		// holds asset channels this provider does not say it can restore.
+		this._restoreAuxiliaryChannels = auxiliary?.auxiliaryChannels;
+		this._gatesAssetPayments = auxiliary !== undefined;
+		this._assetProviderId = auxiliary?.id;
+		this._extensionHost?.keepUntilDrained(auxiliary?.id);
 
 		// 5. Create electrum backend for chain monitoring
 		const electrumBackend = new ElectrumBackend(this.wallet.electrum);
@@ -3759,6 +4026,25 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 			alias: opts.alias,
 			announcedAddresses,
 			fundingProvider,
+			...(auxiliary ? { auxiliaryChannels: auxiliary.auxiliaryChannels } : {}),
+			// Extensions that asked for the node are given it by the node
+			// itself, as soon as it is constructed and before it restores a
+			// stored channel: no hook of a provider runs unbound. The one
+			// whose provider this node is built with has to take it, or the
+			// construction ends there (ASSET_PROVIDER_FAILED) with nothing
+			// restored and the half-built node taken down.
+			...(this._extensionHost?.binds()
+				? {
+						beforeRestore: (node: LightningNode): void => {
+							try {
+								this._extensionHost?.bindNode(node, auxiliary?.id);
+							} catch (err) {
+								node.destroy();
+								throw err;
+							}
+						}
+				  }
+				: {}),
 			preferAnchors: opts.preferAnchors,
 			largeChannels: opts.largeChannels,
 			chainBackend: electrumBackend,
@@ -3806,6 +4092,15 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 			recovery: this.recoveryNodeConfig
 		});
 		this._nodeConstructMs = Date.now() - constructStarted;
+		// An asset payment leaves through the extension that holds the node,
+		// not through a route of this daemon, so the node itself asks the
+		// wallet's limits about it (issue #2093). Only a node that runs asset
+		// channels can send one.
+		if (this._gatesAssetPayments) {
+			this.node.setAuxiliaryPaymentGate((payment) =>
+				this.admitAssetPayment(payment)
+			);
+		}
 		// A deferred restore of the stored network map reports when it ends.
 		this.node.on('graph:restored', () => {
 			const stats = this.getGraphRestoreStats();
@@ -3912,7 +4207,10 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 			const channelId = data.channelId.toString('hex');
 			this.log('info', 'Channel ready', { channelId });
 			this.refreshStaticChannelBackup();
-			this.emit('channel:ready', { channelId });
+			this.emit('channel:ready', {
+				channelId,
+				...this.assetChannelMark(data.channelId)
+			});
 		});
 		// A channel that can take a new HTLC again (issue #967): it reached
 		// NORMAL on channel_ready, or finished reestablishing on a reconnect.
@@ -3945,7 +4243,10 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 			deferEmit(() => {
 				const channel = usableNode.getChannelManager().getChannel(channelId);
 				if (!channel?.acceptsNewHtlcs()) return;
-				this.emit('channel:usable', { channelId: channelId.toString('hex') });
+				this.emit('channel:usable', {
+					channelId: channelId.toString('hex'),
+					...this.assetChannelMark(channelId)
+				});
 			});
 		this.node.on('channel:ready', (data: { channelId: Buffer }) =>
 			announceUsable(data.channelId)
@@ -3992,7 +4293,10 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 			const channelId = data.channelId.toString('hex');
 			this.log('info', 'Channel closed', { channelId });
 			this.refreshStaticChannelBackup();
-			this.emit('channel:closed', { channelId });
+			this.emit('channel:closed', {
+				channelId,
+				...this.assetChannelMark(data.channelId)
+			});
 		});
 		this.node.on('channel:voided', (data: { channelId: Buffer }) => {
 			const channelId = data.channelId.toString('hex');
@@ -4004,7 +4308,10 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 				}
 			);
 			this.refreshStaticChannelBackup();
-			this.emit('channel:voided', { channelId });
+			this.emit('channel:voided', {
+				channelId,
+				...this.assetChannelMark(data.channelId)
+			});
 		});
 		// A resolved channel leaves the SCB channel set (state becomes CLOSED),
 		// so refresh here. Also relay the event: it is the true terminal event
@@ -4026,7 +4333,10 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 				return;
 			}
 			this.log('info', 'Channel resolved', { channelId });
-			this.emit('channel:resolved', { channelId });
+			this.emit('channel:resolved', {
+				channelId,
+				...this.assetChannelMark(data.channelId)
+			});
 		});
 		// Refresh the SCB when a splice LOCKS, not when it is initiated: only now
 		// does fundingTxid hold the new post-splice outpoint, so the backup encodes
@@ -4130,7 +4440,11 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 				// see on screen found nothing (issue #681).
 				const fundingTxid = txidToDisplayHex(data.fundingTxid);
 				this.log('info', 'Channel opening', { channelId, fundingTxid });
-				this.emit('channel:opening', { channelId, fundingTxid });
+				this.emit('channel:opening', {
+					channelId,
+					fundingTxid,
+					...this.assetChannelMark(data.channelId)
+				});
 			}
 		);
 		this.node.on(
@@ -4143,7 +4457,8 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 				});
 				this.emit('channel:pending-close', {
 					channelId,
-					initiator: data.initiator
+					initiator: data.initiator,
+					...this.assetChannelMark(data.channelId)
 				});
 			}
 		);
@@ -4157,7 +4472,8 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 				});
 				this.emit('channel:force-closing', {
 					channelId,
-					initiator: data.initiator
+					initiator: data.initiator,
+					...this.assetChannelMark(data.channelId)
 				});
 			}
 		);
@@ -4166,12 +4482,13 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 		// only payment:received).
 		this.node.on(
 			'invoice:settled',
-			(data: { paymentHash: Buffer; bolt11: string; amountMsat: bigint }) => {
-				const info = {
-					paymentHash: data.paymentHash.toString('hex'),
-					bolt11: data.bolt11,
-					amountSats: Number(data.amountMsat / 1000n)
-				};
+			(data: {
+				paymentHash: Buffer;
+				bolt11: string;
+				amountMsat: bigint;
+				auxiliary?: true;
+			}) => {
+				const info = this.invoiceSettledInfo(data);
 				this.log('info', 'Invoice settled', {
 					paymentHash: info.paymentHash,
 					amountSats: info.amountSats
@@ -4207,7 +4524,8 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 					minFinalCltvExpiry: e.minFinalCltvExpiry,
 					earliestExpiry: e.earliestExpiry,
 					cancelMarginBlocks: e.cancelMarginBlocks,
-					cancelHeight: e.cancelHeight
+					cancelHeight: e.cancelHeight,
+					...(e.auxiliary === true ? { auxiliary: true as const } : {})
 				}),
 				reason: e.reason
 			});
@@ -4798,6 +5116,30 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	 * no quorum to decide ownership with, which a fresh boot cannot proceed
 	 * past; a restarting daemon self-heals when the guardians return).
 	 */
+	/**
+	 * Refuse to start in a guardian recovery mode over stored asset
+	 * channels. A guardian restore puts the journal's rows on another
+	 * device, where nothing can answer for an asset channel, and there it
+	 * can only be refused after the takeover has fenced this one: the
+	 * channel would be lost between the two. So no journal that holds one
+	 * is ever replicated. Only reads the database.
+	 */
+	private refuseGuardianModeOverAssetChannels(mode: RecoveryMode): void {
+		const held = storedAuxiliaryChannelIds(this.storage);
+		if (held.length === 0) return;
+		const one = held.length === 1;
+		throw new BeignetError(
+			'ASSET_GUARDIAN_START_REFUSED',
+			`This wallet holds ${held.length} asset channel${one ? '' : 's'} ` +
+				`(${held.join(', ')}) and its recovery mode is ${mode}, which ` +
+				`backs it up to guardians. A guardian backup cannot restore an ` +
+				`asset channel, so the wallet was not started and nothing was ` +
+				`sent to a guardian. Close the asset channel${one ? '' : 's'}, ` +
+				`or start without the guardian backup (recovery mode ` +
+				`peer-storage or off).`
+		);
+	}
+
 	private async prepareRecovery(opts: BeignetNodeOptions): Promise<void> {
 		const mode = parseRecoveryMode(opts.recoveryMode);
 		this.recoveryMode = mode;
@@ -4825,6 +5167,10 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 			};
 			return;
 		}
+		// A guardian-backed mode does not start over asset channels (issue
+		// #2093): refused here, before a guardian is asked anything, before
+		// the node is built and before a frame of the journal can leave.
+		this.refuseGuardianModeOverAssetChannels(mode);
 		// Guardian-backed modes. The daemon validates the guardian set before
 		// create; parsing again here gives library callers the same refusals.
 		let guardians = (opts.recoveryGuardians ?? []).map(parseGuardianEntry);
@@ -5260,6 +5606,11 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 			 *  then the ceiling while storage peers are still owed). */
 			settleUntil: number | null;
 			lastReason: string | null;
+			/** Asset channels: the refusal of the apply for the ones the
+			 *  capsule holds, while that capsule still waits. */
+			refusal?: AssetRestoreRefusal;
+			/** Asset channels: the asset entries a Tier 1 apply skipped. */
+			skippedAssetChannels?: IRestoreAssetChannel[];
 		};
 	} {
 		const autoApply = this.describeAutoApply();
@@ -5460,7 +5811,16 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	 * through its guardians or the SCB route.
 	 */
 	async restoreFromCapsules(
-		options: { unfenced?: boolean; resume?: boolean } = {}
+		options: {
+			unfenced?: boolean;
+			resume?: boolean;
+			/**
+			 * Leave the asset channels the capsule holds out of the restore,
+			 * in place of refusing it (issue #2093): nothing of them is
+			 * written, and the answer lists them in `omittedAssetChannels`.
+			 */
+			omitAssetChannels?: boolean;
+		} = {}
 	): Promise<{
 		tier: 1 | 2;
 		channelCount: number;
@@ -5484,6 +5844,23 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 		unfenced?: { guardians: IReportedGuardian[] };
 		recovering?: string[];
 		skipped?: Array<{ channelId: ChannelIdHex; reason: string }>;
+		/**
+		 * With omitAssetChannels: the asset channels the capsule held, which
+		 * were left out. Present only when there was one.
+		 */
+		omittedAssetChannels?: IRestoreAssetChannel[];
+		/**
+		 * Tier 1 without omitAssetChannels: the asset entries of the backup
+		 * that the recovery skipped, each of them also in `skipped` with its
+		 * reason. Present only when there was one.
+		 */
+		skippedAssetChannels?: IRestoreAssetChannel[];
+		/**
+		 * With omitAssetChannels: the payments that were in flight on a
+		 * channel left out, by payment hash. Each stays PENDING and carries
+		 * `unresolved` on its row. Present only when there was one.
+		 */
+		unresolvedPayments?: PaymentHashHex[];
 	}> {
 		if (this._restoreInFlight) {
 			throw new BeignetError(
@@ -5500,6 +5877,18 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 			throw new BeignetError('INVALID_PARAMS', 'unfenced must be a boolean');
 		}
 		const unfencedRequested = options.unfenced === true;
+		// Leaving channels out is the caller's own word, so only the exact
+		// boolean counts here too.
+		if (
+			options.omitAssetChannels !== undefined &&
+			typeof options.omitAssetChannels !== 'boolean'
+		) {
+			throw new BeignetError(
+				'INVALID_PARAMS',
+				'omitAssetChannels must be a boolean'
+			);
+		}
+		const omitAssetChannels = options.omitAssetChannels === true;
 		if (options.resume !== undefined && typeof options.resume !== 'boolean') {
 			throw new BeignetError('INVALID_PARAMS', 'resume must be a boolean');
 		}
@@ -5579,7 +5968,8 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 			// candidate validated); a staged file that cannot be opened or
 			// written is an operational fault and is reported as one.
 			const installFailure = (err: unknown): BeignetError =>
-				err instanceof CapsuleCandidateError
+				this.assetRestoreRefusal(err) ??
+				(err instanceof CapsuleCandidateError
 					? new BeignetError(
 							'CAPSULE_RESTORE_FAILED',
 							`No retrieved capsule could be restored: ${err.message}`
@@ -5589,7 +5979,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 							`Could not write the restored database: ${
 								err instanceof Error ? err.message : String(err)
 							}`
-					  );
+					  ));
 			let staged: SqliteStorage;
 			try {
 				staged = new Sqlite(
@@ -5613,7 +6003,11 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 						const scratch = new Sqlite(':memory:');
 						scratch.open();
 						return scratch;
-					}
+					},
+					...(this._restoreAuxiliaryChannels
+						? { auxiliaryChannels: this._restoreAuxiliaryChannels }
+						: {}),
+					...(omitAssetChannels ? { omitAuxiliaryChannels: true } : {})
 				});
 				// Retrieval already refuses wrong-network capsules; this is the
 				// belt on those braces, and a candidate defect if it ever fires.
@@ -5711,13 +6105,31 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 					`restoring a guardian-backed capsule without fencing: the previous writer is NOT fenced (${locators.length} guardian(s) named)`
 				);
 			}
+			const omittedAssetChannels = omitAssetChannels
+				? restoreOmittedAssetChannels(result)
+				: [];
+			const omittedIds = new Set(
+				omittedAssetChannels.map((channel) => channel.channelId.toLowerCase())
+			);
+			// What the backup names and the restore did not leave out.
+			const backedUp = result.scb.channels.filter(
+				(entry) => !omittedIds.has(entry.channelId.toLowerCase())
+			);
 			const common = {
 				channelCount: result.scb.channels.length,
 				framesApplied: result.framesApplied,
 				head,
 				newestSeenHead,
 				rejectedCandidates: result.rejectedCandidates,
-				...(unfenced ? { unfenced } : {})
+				...(unfenced ? { unfenced } : {}),
+				...(omittedAssetChannels.length > 0 ? { omittedAssetChannels } : {}),
+				...(result.tier === 2 && result.unresolvedPayments
+					? {
+							unresolvedPayments: result.unresolvedPayments.map(
+								(hash) => hash as PaymentHashHex
+							)
+					  }
+					: {})
 			};
 
 			if (result.tier === 1) {
@@ -5727,17 +6139,29 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 				dropStaged();
 				progress(
 					'capsule:tier1',
-					`no inline journal validated; recovering ${common.channelCount} channel(s) from the embedded SCB`
+					`no inline journal validated; recovering ${backedUp.length} channel(s) from the embedded SCB`
 				);
 				const { recovering, skipped } =
-					await this.node.recoverFromStaticChannelBackup(result.scb.channels);
+					await this.node.recoverFromStaticChannelBackup(backedUp);
 				this._bootTargetEmpty = false;
+				// Asset channels: a backup holds nothing of an asset channel's
+				// asset state, so its entry is skipped unless the provider said
+				// it can restore it. The ones skipped are listed as a refusal
+				// lists them, beside the reasons in `skipped`.
+				const skippedIds = new Set(
+					skipped.map((entry) => entry.channelId.toLowerCase())
+				);
+				const skippedAssetChannels = restoreOmittedAssetChannels({
+					tier: 1,
+					scb: { ...result.scb, channels: backedUp }
+				}).filter((channel) => skippedIds.has(channel.channelId.toLowerCase()));
 				const info = {
 					tier: 1 as const,
 					...common,
 					restartRequired: false,
 					recovering,
-					skipped
+					skipped,
+					...(skippedAssetChannels.length > 0 ? { skippedAssetChannels } : {})
 				};
 				progress(
 					'restore:complete',
@@ -5838,7 +6262,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 					'restore:complete',
 					`restored database installed (previous kept at ${path.basename(
 						keptPath
-					)}); restart the daemon to resume ${common.channelCount} channel(s)`
+					)}); restart the daemon to resume ${backedUp.length} channel(s)`
 				);
 				this.emit('recovery:restored', {
 					exact: true,
@@ -5887,7 +6311,8 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 				const restoredIds = new Set(
 					this.storage.loadAllChannels().map((c) => c.channelId.toLowerCase())
 				);
-				uncoveredEntries = result.scb.channels.filter(
+				// A channel left out is not recovered through its peer either.
+				uncoveredEntries = backedUp.filter(
 					(entry) => !restoredIds.has(entry.channelId.toLowerCase())
 				);
 			} catch (err) {
@@ -5962,7 +6387,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 				`restored database installed (previous kept at ${path.basename(
 					keptPath
 				)}); node rebuilt in-process, ${
-					common.channelCount - uncovered.length
+					backedUp.length - uncovered.length
 				} channel(s) resuming` +
 					(uncovered.length > 0
 						? `, ${uncovered.length} closing safely through the peer`
@@ -6102,6 +6527,11 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 		try {
 			const info = await this.restoreFromCapsules({ resume: true });
 			a.phase = 'applied';
+			// Asset channels: nobody reads this answer, so what it says of the
+			// asset entries a Tier 1 apply skipped is kept for the status.
+			if (info.skippedAssetChannels) {
+				a.skippedAssetChannels = info.skippedAssetChannels;
+			}
 			this.log('info', 'Recovery auto-apply: complete', {
 				tier: info.tier,
 				channelCount: info.channelCount,
@@ -6112,6 +6542,12 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 			const code = err instanceof BeignetError ? err.code : 'ERROR';
 			const message = err instanceof Error ? err.message : String(err);
 			a.lastReason = `${code}: ${message}`;
+			// Asset channels: the refusal is the route's, and so is its list.
+			// Nobody called, so it is kept for GET /recovery/status and sent
+			// with the event, where a client reads which channels the same
+			// restore would leave out if it were asked to.
+			const refusal = assetRestoreRefusalOf(err);
+			if (refusal) a.refusal = refusal;
 			this._lastRestoreEvent = {
 				type: 'capsule:auto-refused',
 				detail: a.lastReason
@@ -6126,7 +6562,8 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 			);
 			this.emit('recovery:restore-progress', {
 				type: 'capsule:auto-refused',
-				detail: a.lastReason
+				detail: a.lastReason,
+				...(refusal ? { refusal } : {})
 			});
 		}
 	}
@@ -6137,13 +6574,27 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 		phase: 'idle' | 'settling' | 'applying' | 'applied' | 'refused';
 		settleUntil: number | null;
 		lastReason: string | null;
+		refusal?: AssetRestoreRefusal;
+		skippedAssetChannels?: IRestoreAssetChannel[];
 	} {
 		const a = this._autoApply;
 		return {
 			enabled: this._recoveryAutoApply,
 			phase: a.phase,
 			settleUntil: a.settleUntil ?? null,
-			lastReason: a.lastReason ?? null
+			lastReason: a.lastReason ?? null,
+			// Asset channels: while the capsule still waits on the empty
+			// database it was refused for. A restore that was installed since
+			// (the confirmed call) ends it.
+			...(a.phase === 'refused' &&
+			a.refusal &&
+			this._bootTargetEmpty &&
+			!this._restartRequired
+				? { refusal: a.refusal }
+				: {}),
+			...(a.phase === 'applied' && a.skippedAssetChannels
+				? { skippedAssetChannels: a.skippedAssetChannels }
+				: {})
 		};
 	}
 
@@ -6977,7 +7428,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 							err.message
 						);
 					}
-					throw err;
+					throw this.assetRestoreRefusal(err) ?? err;
 				}
 			}
 			// The lease is durably installed, so re-running the boot decision
@@ -7191,13 +7642,98 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 		const lightning = Number(lnBalance.localBalanceMsat / 1000n);
 		const unsettledSats = Number(lnBalance.unsettledBalanceMsat / 1000n);
 		const splicingSats = this.getSplicingBalanceSats();
+		const assetChannelSats = this.sumAssetChannelFigure('assetChannelSats');
+		const assetChannelClosingSats = this.sumAssetChannelFigure(
+			'assetChannelClosingSats'
+		);
 		return {
 			onchain,
 			lightning,
 			total: onchain + lightning,
 			unsettledSats,
-			splicingSats
+			splicingSats,
+			...(assetChannelSats !== undefined ? { assetChannelSats } : {}),
+			...(assetChannelClosingSats !== undefined
+				? { assetChannelClosingSats }
+				: {})
 		};
+	}
+
+	/**
+	 * Which of the two asset figures of the balance holds the bitcoin on this
+	 * wallet's side of a channel. Every asset channel that is not over is in
+	 * exactly one of them, and no other channel is in either.
+	 *
+	 * assetChannelClosingSats: SHUTTING_DOWN, NEGOTIATING_CLOSING, or
+	 * FORCE_CLOSED with this wallet's balance output not yet spent in a
+	 * block. assetChannelSats: every other one that is not over, whatever
+	 * its state: still opening, open, waiting for its peer, or failed and
+	 * not yet closed. Over, and in neither: CLOSED, and FORCE_CLOSED with the
+	 * balance output spent. A channel whose peer is away is read by the
+	 * state it was in.
+	 *
+	 * A channel is counted once its funding transaction is out, and until
+	 * then is in neither, whatever its state and whatever became of it. One
+	 * this node funds: once the node has broadcast the transaction and the
+	 * network took it, or its watcher has seen it confirmed. One the peer
+	 * funds: once the watcher has seen it confirmed. A funding transaction
+	 * that only exists spends coins that are still in the wallet's on-chain
+	 * balance, so an opening given up between funding_created and the
+	 * broadcast is never counted.
+	 *
+	 * The closing figure is the counterpart of getPendingCloseBalanceSats,
+	 * which leaves asset channels out: their bitcoin does not come back to
+	 * the wallet, it stays under the asset outputs the provider closes or
+	 * sweeps to. A cooperative close ends the count when the channel is
+	 * CLOSED; a force close when the chain monitor has seen the balance
+	 * output spent in a block, by the sweep the provider made the asset side
+	 * of or by anything else. Before that (no monitor, no classified
+	 * commitment, a sweep that is only broadcast) the channel is counted.
+	 */
+	private assetChannelFigureOf(
+		ch: ReturnType<LightningNode['listChannels']>[number]
+	): 'assetChannelSats' | 'assetChannelClosingSats' | undefined {
+		if (!ch.auxiliary || ch.fundingTxid === undefined) return undefined;
+		if (!this.node.isFundingBroadcastOrConfirmed(ch.channelId)) {
+			return undefined;
+		}
+		const effectiveState =
+			ch.state === ChannelState.AWAITING_REESTABLISH
+				? this.node.getChannelManager().getChannel(ch.channelId)?.getFullState()
+						.preReestablishState ?? ch.state
+				: ch.state;
+		switch (effectiveState) {
+			case ChannelState.CLOSED:
+				return undefined;
+			case ChannelState.SHUTTING_DOWN:
+			case ChannelState.NEGOTIATING_CLOSING:
+				return 'assetChannelClosingSats';
+			case ChannelState.FORCE_CLOSED: {
+				const status = this.forceCloseBalanceOutput(ch.channelId)?.status;
+				return status === OutputStatus.SPEND_CONFIRMED ||
+					status === OutputStatus.IRREVOCABLY_RESOLVED
+					? undefined
+					: 'assetChannelClosingSats';
+			}
+			default:
+				return 'assetChannelSats';
+		}
+	}
+
+	/**
+	 * Sum of the local balances of the channels one asset figure holds.
+	 * Undefined when it holds none, so that the balance of a wallet without
+	 * such a channel has the keys it always had.
+	 */
+	private sumAssetChannelFigure(
+		figure: 'assetChannelSats' | 'assetChannelClosingSats'
+	): number | undefined {
+		let totalMsat: bigint | undefined;
+		for (const ch of this.node.listChannels()) {
+			if (this.assetChannelFigureOf(ch) !== figure) continue;
+			totalMsat = (totalMsat ?? 0n) + ch.localBalanceMsat;
+		}
+		return totalMsat === undefined ? undefined : Number(totalMsat / 1000n);
 	}
 
 	/**
@@ -7226,6 +7762,9 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 		]);
 		let totalMsat = 0n;
 		for (const ch of this.node.listChannels()) {
+			// An asset channel's bitcoin only carries asset outputs: it is
+			// not a Lightning balance on its way back to the wallet.
+			if (ch.auxiliary) continue;
 			const effectiveState =
 				ch.state === ChannelState.AWAITING_REESTABLISH
 					? this.node
@@ -7260,30 +7799,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	 * still pending close.
 	 */
 	private isForceCloseBalanceInWallet(channelId: Buffer): boolean {
-		const monitor = this.node.getChannelManager().getMonitor(channelId);
-		const broadcast = monitor?.getFullState().commitmentBroadcast;
-		if (!monitor || !broadcast) return false;
-		let balanceOutputType: OutputType;
-		switch (broadcast.commitmentType) {
-			case CommitmentType.OUR_COMMITMENT:
-				balanceOutputType = OutputType.TO_LOCAL;
-				break;
-			case CommitmentType.THEIR_CURRENT_COMMITMENT:
-			case CommitmentType.THEIR_REVOKED_COMMITMENT:
-			case CommitmentType.THEIR_FUTURE_COMMITMENT:
-				balanceOutputType = OutputType.TO_REMOTE;
-				break;
-			default:
-				return false;
-		}
-		const balanceOutput = monitor
-			.getTrackedOutputs()
-			.find(
-				(o) =>
-					o.txid === broadcast.txid &&
-					o.outputType === balanceOutputType &&
-					!o.isSecondLevelHtlc
-			);
+		const balanceOutput = this.forceCloseBalanceOutput(channelId);
 		if (!balanceOutput) return false;
 		let sweepTxid = balanceOutput.resolutionTxid;
 		if (!sweepTxid && balanceOutput.sweepTxHex) {
@@ -7302,6 +7818,41 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	}
 
 	/**
+	 * Our balance output on the force-close commitment the monitor
+	 * classified, as the monitor tracks it: our to_remote on any of the
+	 * peer's commitments, our commitment to_local on ours. Undefined with no
+	 * monitor, no classified commitment or no balance output.
+	 */
+	private forceCloseBalanceOutput(
+		channelId: Buffer
+	): ITrackedOutput | undefined {
+		const monitor = this.node.getChannelManager().getMonitor(channelId);
+		const broadcast = monitor?.getFullState().commitmentBroadcast;
+		if (!monitor || !broadcast) return undefined;
+		let balanceOutputType: OutputType;
+		switch (broadcast.commitmentType) {
+			case CommitmentType.OUR_COMMITMENT:
+				balanceOutputType = OutputType.TO_LOCAL;
+				break;
+			case CommitmentType.THEIR_CURRENT_COMMITMENT:
+			case CommitmentType.THEIR_REVOKED_COMMITMENT:
+			case CommitmentType.THEIR_FUTURE_COMMITMENT:
+				balanceOutputType = OutputType.TO_REMOTE;
+				break;
+			default:
+				return undefined;
+		}
+		return monitor
+			.getTrackedOutputs()
+			.find(
+				(o) =>
+					o.txid === broadcast.txid &&
+					o.outputType === balanceOutputType &&
+					!o.isSecondLevelHtlc
+			);
+	}
+
+	/**
 	 * Sum of local balances in ERRORED channels — funds stuck after a channel
 	 * failure with no close in progress. Counted in neither the live lightning
 	 * balance nor the pending-close balance; surfaced so they aren't invisible.
@@ -7310,6 +7861,9 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	private getErroredBalanceSats(): number {
 		let totalMsat = 0n;
 		for (const ch of this.node.listChannels()) {
+			// An asset channel's bitcoin only carries asset outputs: it is
+			// not a Lightning balance, errored or not.
+			if (ch.auxiliary) continue;
 			if (ch.state === ChannelState.ERRORED) {
 				totalMsat += ch.localBalanceMsat;
 			}
@@ -8840,8 +9394,10 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	): Promise<ChannelInfo[]> {
 		// The peers suggested come from the graph, so all of it first.
 		if (this.isGraphRestoring()) await this.whenGraphRestored();
-		// Check existing ready channels
-		const existing = this.getReadyChannels();
+		// Check existing ready channels. The minimum is of channels to pay
+		// and be paid over: an asset channel carries no ordinary payment, so
+		// it is not one of them.
+		const existing = this.getReadyChannels().filter((ch) => !ch.auxiliary);
 		if (existing.length >= count) return existing;
 
 		const needed = count - existing.length;
@@ -10024,6 +10580,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 		reestablishRecencyUnproven?: boolean;
 		reestablishSecretMissing?: boolean;
 		restoreRevokedRisk?: boolean;
+		auxiliary?: true;
 		fundingUnaccounted?: boolean;
 		payThroughSplice?: boolean;
 		revertedSplices?: Array<{
@@ -10135,6 +10692,8 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 		if (ch.reestablishSecretMissing)
 			info.reestablishSecretMissing = ch.reestablishSecretMissing;
 		if (ch.restoreRevokedRisk) info.restoreRevokedRisk = ch.restoreRevokedRisk;
+		// An asset channel says so, and no other row has the key.
+		if (ch.auxiliary) info.auxiliary = true;
 		if (ch.fundingUnaccounted) info.fundingUnaccounted = ch.fundingUnaccounted;
 		if (ch.payThroughSplice !== undefined)
 			info.payThroughSplice = ch.payThroughSplice;
@@ -10856,6 +11415,10 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 		const manager = this.node.getChannelManager();
 		for (const channel of manager.listChannels()) {
 			if (!channel.acceptsNewHtlcs(true)) continue;
+			// An asset channel's bitcoin only carries asset outputs: it is no
+			// balance held with a primary, and no channel a bitcoin receive
+			// could fill.
+			if (channel.getFullState().auxiliaryState) continue;
 			const channelId = channel.getChannelId();
 			const peer = channelId ? manager.getPeerForChannel(channelId) : null;
 			if (!peer) continue;
@@ -11461,6 +12024,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 				info.amountSats = Number(inv.amountMsat / 1000n);
 			}
 			if (inv.description) info.description = inv.description;
+			if (inv.auxiliary === true) info.auxiliary = true;
 			return info;
 		});
 	}
@@ -12506,8 +13070,9 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 			});
 		}
 
-		// 9. Active channels check
-		const readyChannels = this.getReadyChannels();
+		// 9. Active channels check. An asset channel is no channel for the
+		// payment of an invoice.
+		const readyChannels = this.getReadyChannels().filter((ch) => !ch.auxiliary);
 		if (readyChannels.length === 0) {
 			checks.push({
 				name: 'CHANNELS',
@@ -13717,7 +14282,19 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 			completedAt: proof.completedAt,
 			invoice: proof.invoice,
 			hopCount: proof.route?.hops.length,
-			feeSats: feeMsat !== undefined ? spendLimitSats(feeMsat) : undefined
+			feeSats: feeMsat !== undefined ? spendLimitSats(feeMsat) : undefined,
+			// The amount and the fee of an asset payment are the bitcoin that
+			// carried it: the proof says so, and what it was worth.
+			...(record.auxiliary
+				? {
+						auxiliary: true as const,
+						...(record.auxiliaryValueMsat !== undefined
+							? {
+									auxiliaryValueSats: spendLimitSats(record.auxiliaryValueMsat)
+							  }
+							: {})
+				  }
+				: {})
 		};
 	}
 
@@ -13844,7 +14421,21 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	 * the failure envelope and a status to match.
 	 */
 	cancelPayment(paymentHash: PaymentHashHex): { ok: true } {
-		this.node.failPayment(requirePaymentHashHex(paymentHash));
+		const hash = requirePaymentHashHex(paymentHash);
+		// The engine does not fail a payment it cannot follow, and an
+		// `ok` here would say it had.
+		const record = this.node.getPayment(hash);
+		if (record?.status === PaymentStatus.PENDING && record.unresolved) {
+			const err = new BeignetError(
+				'PAYMENT_UNRESOLVED',
+				'The payment has an HTLC on a channel a restore left out ' +
+					`(${record.unresolved.channelIds.join(', ')}); it may have ` +
+					'been paid, so it is not cancelled'
+			);
+			err.paymentHash = hash.toString('hex');
+			throw err;
+		}
+		this.node.failPayment(hash);
 		return { ok: true };
 	}
 
@@ -13889,6 +14480,42 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	 * The amount and fee come from paymentAmountSats and paymentFeeMsat, which
 	 * the proof and the stats share, so every surface reports one figure.
 	 */
+	/**
+	 * `{ auxiliary: true }` for an asset channel the node holds, and nothing
+	 * for any other channel: what a channel event carries beside its id
+	 * (issue #2093). A node without a provider holds none, so its events are
+	 * the bytes they were.
+	 */
+	private assetChannelMark(channelId: Buffer): { auxiliary?: true } {
+		try {
+			return this.node.getAuxiliaryChannelInfo(channelId) !== undefined
+				? { auxiliary: true }
+				: {};
+		} catch {
+			return {};
+		}
+	}
+
+	/** The daemon's invoice:settled data, from the node's. */
+	private invoiceSettledInfo(data: {
+		paymentHash: Buffer;
+		bolt11: string;
+		amountMsat: bigint;
+		auxiliary?: true;
+	}): {
+		paymentHash: string;
+		bolt11: string;
+		amountSats: number;
+		auxiliary?: true;
+	} {
+		return {
+			paymentHash: data.paymentHash.toString('hex'),
+			bolt11: data.bolt11,
+			amountSats: Number(data.amountMsat / 1000n),
+			...(data.auxiliary ? { auxiliary: true as const } : {})
+		};
+	}
+
 	private toPaymentInfo(p: IPaymentInfo): PaymentInfo {
 		const info: PaymentInfo = {
 			...(p.payAll
@@ -13908,6 +14535,16 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 			direction: p.direction,
 			createdAt: p.createdAt
 		};
+		// An asset payment says so, and what it was worth: its amount and
+		// fee here are the bitcoin that carried it (issue #2093).
+		if (p.auxiliary) {
+			info.auxiliary = true;
+			if (p.auxiliaryValueMsat !== undefined) {
+				info.auxiliaryValueSats = spendLimitSats(p.auxiliaryValueMsat);
+			}
+		}
+		const unresolved = paymentUnresolved(p);
+		if (unresolved) info.unresolved = unresolved;
 		if (p.preimage) info.preimage = p.preimage.toString('hex');
 		if (p.completedAt !== undefined) info.completedAt = p.completedAt;
 		if (p.failureCode !== undefined) {
@@ -14424,6 +15061,9 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 			const channelId = channel.getChannelId();
 			if (!channelId) continue;
 			if (channel.getState() !== ChannelState.NORMAL) continue;
+			// An asset channel is never spliced, and its bitcoin only carries
+			// asset outputs: it is no channel a send could be taken from.
+			if (channel.getFullState().auxiliaryState) continue;
 			if (channel.spliceBusyReason()) continue;
 			if (channel.getFullState().spliceInFlight) continue;
 			const peer = manager.getPeerForChannel(channelId);
@@ -15220,7 +15860,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 		const paid = live
 			? settlesInvoice(live)
 			: settlesInvoice(this.storage.loadPayment(inv.paymentHash));
-		return this.toInvoiceInfo(inv, paid);
+		return this.toInvoiceInfo(inv, paid, live);
 	}
 
 	/**
@@ -15256,11 +15896,15 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 				}
 				paid = durablePaid.has(inv.paymentHash);
 			}
-			return this.toInvoiceInfo(inv, paid);
+			return this.toInvoiceInfo(inv, paid, live);
 		});
 	}
 
-	private toInvoiceInfo(inv: IInvoiceInfo, paid: boolean): InvoiceInfo {
+	private toInvoiceInfo(
+		inv: IInvoiceInfo,
+		paid: boolean,
+		record?: IPaymentInfo
+	): InvoiceInfo {
 		const info: InvoiceInfo = {
 			bolt11: inv.bolt11,
 			paymentHash: inv.paymentHash
@@ -15271,6 +15915,12 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 		if (inv.description) info.description = inv.description;
 		if (inv.expiry !== undefined) info.expiry = inv.expiry;
 		if (inv.createdAt !== undefined) info.createdAt = inv.createdAt;
+		if (inv.auxiliary) info.auxiliary = true;
+		// An HTLC of it was on a channel a restore left out: the invoice
+		// says what its payment record says. A pruned record is a settled
+		// one, and carries no mark.
+		const unresolved = !paid && record ? paymentUnresolved(record) : undefined;
+		if (unresolved) info.unresolved = unresolved;
 		if (paid) {
 			info.status = 'PAID';
 		} else if (
@@ -15375,10 +16025,33 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 
 		// 3. AUTO_RECONNECT_ENABLED (WARNING)
 		const nodeInfo = this.node.getNodeInfo();
-		const channels = this.node.listChannels();
+		// The channel checks below are about sending and receiving bitcoin.
+		// An asset channel is no second channel for that, and its bitcoin
+		// only carries asset outputs, so it says nothing about depletion:
+		// none of them reads it.
+		const listed = this.node.listChannels();
+		const channels = listed.filter((ch) => !ch.auxiliary);
 		const readyChannels = channels.filter(
 			(ch) => ch.state === 'NORMAL' && !isHeldRestore(ch)
 		);
+		// A wallet whose only channels are asset channels has channels, and
+		// none that these checks count. The four checks that tell a wallet
+		// with no channel that it has none, or none that is active, say what
+		// they left out then, in words that no wallet without an asset
+		// channel is ever told. Status and score are untouched.
+		const assetOnly =
+			channels.length === 0 && listed.some((ch) => ch.auxiliary);
+		const noChannels = assetOnly
+			? {
+					anchor:
+						'No ordinary Lightning channel yet (anchor will be used by default); asset channels are not counted here',
+					sufficient:
+						'No ordinary Lightning channel yet; asset channels are not counted here'
+			  }
+			: {
+					anchor: 'No channels yet (anchor will be used by default)',
+					sufficient: 'No channels yet'
+			  };
 
 		checks.push({
 			name: 'AUTO_RECONNECT_ENABLED',
@@ -15400,7 +16073,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 			message: hasAnchor
 				? 'Anchor channels in use (recommended for fee bumping)'
 				: channels.length === 0
-				? 'No channels yet (anchor will be used by default)'
+				? noChannels.anchor
 				: 'No anchor channels — consider opening anchor channels for improved fee management'
 		});
 
@@ -15412,6 +16085,8 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 			message:
 				readyChannels.length > 0
 					? `${readyChannels.length} active channel(s)`
+					: assetOnly
+					? 'No active ordinary Lightning channel: open one to send and receive bitcoin over Lightning; asset channels are not counted here'
 					: 'No active channels — open a channel to send/receive payments'
 		});
 
@@ -15470,7 +16145,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 				readyChannels.length >= 2
 					? `${readyChannels.length} ready channels (redundancy OK)`
 					: channels.length === 0
-					? 'No channels yet'
+					? noChannels.sufficient
 					: `Only ${readyChannels.length} ready channel — single channel is a point of failure`
 		});
 
@@ -15493,7 +16168,9 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 			severity: 'INFO',
 			message:
 				readyChannels.length === 0
-					? 'No active channels to assess'
+					? assetOnly
+						? 'No active ordinary Lightning channel to assess; asset channels are not counted here'
+						: 'No active channels to assess'
 					: depletedChannels.length < readyChannels.length
 					? 'Channel balances are healthy'
 					: `All ${readyChannels.length} channel(s) are >90% depleted in one direction`
@@ -15607,6 +16284,9 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 		let sendableMsat = 0n;
 		let maxSendableMsat = 0n;
 		for (const ch of this.node.listChannels()) {
+			// An asset channel is left out, as the engine's snapshot leaves
+			// it out: its bitcoin cannot be sent as a Lightning payment.
+			if (ch.auxiliary) continue;
 			maxSendableMsat += ch.spendableOutboundMsat ?? 0n;
 			// A held restore is NORMAL with htlcUsable false, so this two-clause
 			// test admitted it on the first clause alone (issue #469). Its
@@ -15680,6 +16360,19 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 				BeignetErrorCode.INVALID_PARAMS,
 				'maxFeeSats must be a non-negative integer'
 			);
+		// Refused before the fee cap is charged: a rebalance moves bitcoin,
+		// and the bitcoin of an asset channel only carries its units.
+		for (const [name, id] of [
+			['fromChannelId', fromIdBuf],
+			['toChannelId', toIdBuf]
+		] as const) {
+			if (this.assetChannelMark(id).auxiliary) {
+				throw new BeignetError(
+					BeignetErrorCode.INVALID_PARAMS,
+					`${name} is an asset channel, and an asset channel is not rebalanced`
+				);
+			}
+		}
 		this._checkDraining();
 		// A shutdown waits on any backup in flight before the engine learns of
 		// it, so the engine would still send.
@@ -16164,6 +16857,64 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 		return this.toPaymentInfo(payment);
 	}
 
+	/**
+	 * The gate on every asset payment this node originates (issue #2093,
+	 * step 13): admitted exactly as sendToRoute admits a route. Drain mode,
+	 * the per-payment and daily limits, and a claim on the daily budget
+	 * under the payment hash, all on what the route asks the first hop to
+	 * carry, in sats: the payment's worth and every routing fee, and never
+	 * less than the bitcoin its HTLC carries. The settlement is charged by
+	 * the payment:sent handler in create(), which finds the claim under the
+	 * hash as it does for every other pay path.
+	 *
+	 * A refusal is returned with its own code (SPENDING_LIMIT_EXCEEDED,
+	 * SERVICE_DRAINING) and its sentence, and reaches whoever sent the
+	 * payment as AuxiliaryPaymentError ASSET_PAYMENT_REFUSED with that code
+	 * in `reason`. Nothing was recorded or sent, and nothing is claimed.
+	 */
+	private admitAssetPayment(
+		payment: Parameters<AuxiliaryPaymentGate>[0]
+	): ReturnType<AuxiliaryPaymentGate> {
+		const sentMsat =
+			payment.routeAmountMsat > payment.wireAmountMsat
+				? payment.routeAmountMsat
+				: payment.wireAmountMsat;
+		let claim: AsyncSpendClaim | undefined;
+		try {
+			this._checkDraining();
+			claim = this._admitLightningSpend(
+				payment.paymentHash.toString('hex'),
+				sentMsat,
+				0n
+			);
+		} catch (err) {
+			if (err instanceof BeignetError) {
+				return { reason: err.code, message: err.message };
+			}
+			throw err;
+		}
+		if (claim) {
+			// The send that asked is synchronous and is not this daemon's to
+			// wrap. Once it has returned or thrown, a claim whose payment
+			// dispatched nothing holds no budget (issue #474): the engine
+			// refused it after the gate, with no record or a failed one.
+			const held = claim;
+			const paymentHash = Buffer.from(payment.paymentHash);
+			queueMicrotask(() => {
+				if (!held.reserved) return;
+				try {
+					if (this.node.hasHtlcInFlight(paymentHash)) return;
+					const record = this.node.getPayment(paymentHash);
+					if (record?.status === PaymentStatus.PENDING) return;
+				} catch {
+					// A node that cannot answer is one that sends nothing.
+				}
+				this._releaseAsyncSpendClaim(held);
+			});
+		}
+		return undefined;
+	}
+
 	// ─────────────── Channel Readiness Helpers ───────────────
 
 	getReadyChannels(): ChannelInfo[] {
@@ -16188,6 +16939,8 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 
 		for (const ch of this.node.listChannels()) {
 			if (ch.state !== ChannelState.NORMAL || isHeldRestore(ch)) continue;
+			// An asset channel sends no bitcoin payment.
+			if (ch.auxiliary) continue;
 			// Subtract channel reserve — we must maintain this minimum balance
 			const reserveMsat = ch.localReserveMsat ?? 0n;
 			const available =
@@ -16223,6 +16976,8 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 
 		for (const ch of this.node.listChannels()) {
 			if (ch.state !== ChannelState.NORMAL || isHeldRestore(ch)) continue;
+			// An asset channel receives no bitcoin payment.
+			if (ch.auxiliary) continue;
 			// Subtract channel reserve — remote must maintain this minimum balance
 			const reserveMsat = ch.remoteReserveMsat ?? 0n;
 			const available =
@@ -16343,10 +17098,13 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	 * terms (issue #967).
 	 */
 	private canCarryHtlc(): boolean {
+		// What waits on this is the payment of invoices, and none goes over
+		// an asset channel: it is neither the channel that can carry one
+		// nor a channel worth waiting for.
 		const live = this.node
 			.getChannelManager()
 			.listChannels()
-			.filter(canBecomeUsable);
+			.filter((ch) => canBecomeUsable(ch) && !ch.getFullState().auxiliaryState);
 		return live.length === 0 || live.some((ch) => ch.acceptsNewHtlcs());
 	}
 
@@ -16531,7 +17289,12 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	// ─────────────── Statistics ───────────────
 
 	getStats(windowMs?: number): NodeStats {
-		const payments = this.node.listPayments();
+		// A payment that asset HTLCs carried is in no bitcoin total: its
+		// amount and its fee are not what was paid (issue #2093). The daily
+		// spending limit still charges it.
+		const payments = this.node
+			.listPayments()
+			.filter((payment) => !payment.auxiliary);
 		const now = Date.now();
 		let sent = 0;
 		let received = 0;
@@ -17679,11 +18442,20 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 		// push the wallet's stop and the database's close past that exit
 		// (issue #958). No await without an extension, so the shutdown keeps
 		// its timing.
+		//
+		// The extension that supplies the node's asset channels is the
+		// exception: the node calls its provider for every commitment while
+		// it drains its in-flight HTLCs, so that extension is left running,
+		// with its storage open, and is stopped and fenced after the drain.
+		// The drain then gets three quarters of what is left, and the
+		// extension's stop the rest.
 		let drainMs = timeoutMs;
+		const began = Date.now();
+		const provider = this._assetProviderId;
 		if (this._extensionHost) {
-			const began = Date.now();
 			await this._extensionHost.shutdown(timeoutMs / 2);
 			drainMs = Math.max(0, timeoutMs - (Date.now() - began));
+			if (provider !== undefined) drainMs = Math.floor((drainMs * 3) / 4);
 		}
 		// A restore-pending daemon never built the node or the wallet. The
 		// node closes only its view of the database: the wallet writes
@@ -17693,7 +18465,16 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 		try {
 			await (this.node as LightningNode | undefined)?.gracefulShutdown(drainMs);
 		} finally {
-			await this.stopWalletAndCloseStorage();
+			try {
+				// No await without a provider's extension to stop.
+				if (provider !== undefined) {
+					await this._extensionHost?.finishShutdown(
+						Math.max(0, timeoutMs - (Date.now() - began))
+					);
+				}
+			} finally {
+				await this.stopWalletAndCloseStorage();
+			}
 		}
 	}
 

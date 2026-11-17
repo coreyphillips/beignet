@@ -3,6 +3,7 @@
  */
 
 import { FeatureFlags, Feature } from '../features/flags';
+import type { CustomRecords } from '../message/custom-records';
 
 /**
  * Check whether a negotiated channel_type includes option_anchors_zero_fee_htlc_tx.
@@ -15,21 +16,103 @@ export function isAnchorChannel(channelType: Buffer | null): boolean {
 	// channel_type contains ONLY the taproot bit (not the anchor bit), so treat
 	// taproot as implying anchors here — every internal anchor branch (to_remote
 	// 1-CSV, anchor outputs, zero-fee HTLC, CSV sweep sequence) must still fire.
+	// The asset overlay is a taproot commitment as well, and its type carries
+	// neither bit (see isOverlayChannel).
 	return (
 		flags.hasFeature(Feature.ANCHOR_ZERO_FEE_HTLC) ||
-		flags.hasFeature(Feature.OPTION_TAPROOT)
+		flags.hasFeature(Feature.OPTION_TAPROOT) ||
+		isOverlayChannel(channelType)
 	);
 }
 
 /**
- * Check whether a negotiated channel_type includes option_taproot (simple
- * taproot channels). Returns true if bit 80/81 (OPTION_TAPROOT) is set.
+ * Check whether a negotiated channel_type has taproot commitments: simple
+ * taproot channels (bit 80/81, OPTION_TAPROOT) and the asset overlay, which
+ * is the same commitment format with auxiliary leaves.
  */
 export function isTaprootChannel(channelType: Buffer | null): boolean {
+	if (!channelType || channelType.length === 0) return false;
+	return hasSimpleTaprootBit(channelType) || isOverlayChannel(channelType);
+}
+
+/**
+ * Whether a channel_type carries the simple taproot bit itself. For code
+ * that reads a type a peer has only proposed, where the overlay must not be
+ * taken for an ordinary taproot channel.
+ */
+export function hasSimpleTaprootBit(
+	channelType: Buffer | null | undefined
+): boolean {
 	if (!channelType || channelType.length === 0) return false;
 	return FeatureFlags.fromBuffer(channelType).hasFeature(
 		Feature.OPTION_TAPROOT
 	);
+}
+
+/**
+ * Whether a channel_type is the taproot asset overlay, which marks an
+ * auxiliary (asset) channel: the overlay bit (2026) with neither
+ * static_remotekey nor option_taproot beside it, which is how LND and tapd
+ * write the type.
+ *
+ * The exclusion is what keeps this false for every channel a node could hold
+ * from before asset channels existed. An open was only ever accepted with
+ * static_remotekey or option_taproot in its type, so a stored type that
+ * carries one of them is that kind of channel whatever else a peer added,
+ * and stays that kind of channel.
+ */
+export function isOverlayChannel(
+	channelType: Buffer | null | undefined
+): boolean {
+	if (!channelType || channelType.length === 0) return false;
+	const flags = FeatureFlags.fromBuffer(channelType);
+	return (
+		flags.hasFeature(Feature.OPTION_TAPROOT_OVERLAY) &&
+		!flags.hasFeature(Feature.STATIC_REMOTE_KEY) &&
+		!flags.hasFeature(Feature.OPTION_TAPROOT)
+	);
+}
+
+/**
+ * Whether an asset channel fixed its HTLC outputs when it opened (bit 450
+ * in its type). The mode never changes for the life of the channel.
+ */
+export function isFixedAssetHtlcChannel(
+	channelType: Buffer | null | undefined
+): boolean {
+	return (
+		isOverlayChannel(channelType) &&
+		FeatureFlags.fromBuffer(channelType!).hasBit(
+			Feature.OPTION_ASSET_FIXED_HTLC_OUTPUTS
+		)
+	);
+}
+
+/**
+ * Whether an asset channel gives the asset-bearing children of a revoked
+ * commitment their own revocation key (bit 452 in its type, which requires
+ * bit 450).
+ */
+export function isRevokedChildCustodyChannel(
+	channelType: Buffer | null | undefined
+): boolean {
+	return (
+		isFixedAssetHtlcChannel(channelType) &&
+		FeatureFlags.fromBuffer(channelType!).hasBit(
+			Feature.OPTION_ASSET_CHILD_CUSTODY
+		)
+	);
+}
+
+/**
+ * The sighash type of the second-level HTLC signatures a channel exchanges:
+ * SINGLE|ANYONECANPAY (0x83) for every channel, except an asset channel with
+ * fixed HTLC outputs, which signs ALL|ANYONECANPAY (0x81).
+ */
+export function assetHtlcSighashType(
+	channelType: Buffer | null | undefined
+): 0x81 | 0x83 {
+	return isFixedAssetHtlcChannel(channelType) ? 0x81 : 0x83;
 }
 
 /**
@@ -407,6 +490,13 @@ export interface IHtlcEntry {
 	 */
 	funderFeeFailback?: boolean;
 	/**
+	 * Asset channels: the host's provider refused this HTLC of the peer
+	 * (validateHtlc threw). Stamped at admission and stored, like the stamps
+	 * above, so that a restart gives the same answer: the node fails the
+	 * HTLC back once it is committed and never settles it.
+	 */
+	auxiliaryRefused?: boolean;
+	/**
 	 * Admission-time provenance (issue #469): this received HTLC entered the
 	 * channel while a restriction that disarms its on-chain enforcement was
 	 * already standing: the recency hold (restoreRecencyUnproven, or the
@@ -430,6 +520,14 @@ export interface IHtlcEntry {
 	 * so the refusal survives a crash between the commit and the fail-back.
 	 */
 	addedWhileFundingUnaccounted?: boolean;
+	/**
+	 * Custom records (TLV types at or above 65536) that came with the add,
+	 * kept until the HTLC resolves. Only ever present on a channel with
+	 * auxiliary state, where they carry the asset side of the HTLC.
+	 */
+	customRecords?: CustomRecords;
+	/** The asset amount of this HTLC, as the auxiliary provider read it from the records. */
+	auxiliaryAmount?: bigint;
 }
 
 /**
@@ -534,6 +632,12 @@ export interface ChannelResult {
 	ok: boolean;
 	actions: import('./channel-actions').ChannelAction[];
 	error?: string;
+	/**
+	 * Set on a refused addHtlc that admitted nothing: no HTLC id was spent
+	 * and the channel is as it was. A caller that reserved something for the
+	 * exact HTLC id it expected releases it on this.
+	 */
+	admissionRejected?: boolean;
 	/**
 	 * The batch's messages did not reach the wire. Either a failed persist
 	 * withheld them, which only a reconnect retries, or the quorum durability

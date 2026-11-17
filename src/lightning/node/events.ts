@@ -29,6 +29,7 @@ import type {
  * LISTEN_FAILED, which BeignetNode raises through the node's own funnel.
  */
 export type NodeErrorCode =
+	| 'ASSET_HTLC_CLAIM_UNCONFIRMED_AT_EXPIRY'
 	| 'AUTO_FUNDING_FAILED'
 	| 'AUTO_RECONNECT_FAILED'
 	| 'BARRIER_DISPATCH_FAILED'
@@ -116,6 +117,8 @@ export interface LightningNodeEvents
 		paymentHash: Buffer;
 		bolt11: string;
 		amountMsat: bigint;
+		/** Paid by asset HTLCs; present, and true, only then. */
+		auxiliary?: true;
 	}) => void;
 
 	// ─── Hold invoices ───
@@ -183,8 +186,15 @@ export interface LightningNodeEvents
 		channelId: Buffer;
 		initiator: 'local' | 'remote';
 	}) => void;
-	/** Channel closed. */
-	'channel:closed': (data: { channelId: Buffer }) => void;
+	/**
+	 * Channel closed. `unrecordedCloseTxid` is present only for an asset
+	 * channel whose funding output was spent by a transaction the node took
+	 * for the cooperative close and holds no close payload for.
+	 */
+	'channel:closed': (data: {
+		channelId: Buffer;
+		unrecordedCloseTxid?: string;
+	}) => void;
 	/** All on-chain outputs of the close resolved. */
 	'channel:resolved': (data: { channelId: Buffer }) => void;
 	/** A negotiated but unfunded open was torn down. */
@@ -293,6 +303,12 @@ export interface LightningNodeEvents
 		pubkey: string;
 		channelId: Buffer | null;
 		text: string;
+	}) => void;
+	/** A registered experimental wire message, without an envelope. Networking supplies the authenticated Noise peer identity; external transports must authenticate handlePeerMessage's peer argument. */
+	'raw-custom-message': (message: {
+		peerPubkey: string;
+		type: number;
+		payload: Buffer;
 	}) => void;
 	/** A beignet custom message (type 44069) arrived from a peer. */
 	'custom-message': (message: {

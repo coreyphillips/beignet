@@ -27,6 +27,8 @@ import { getPublicKey } from '../crypto/ecdh';
 import { Peer } from './peer';
 import { FeatureFlags } from '../features/flags';
 import type { IInitMessage } from '../message/init';
+import type { CustomRecords } from '../message/custom-records';
+import { copyCustomRecords } from '../message/custom-records';
 import { captureWireMessage, captureWireEvent } from './wire-capture';
 import type {
 	IDuplexTransport,
@@ -319,6 +321,12 @@ export interface IPeerManagerOptions {
 	localPrivateKey: Buffer;
 	/** Local feature flags to advertise */
 	localFeatures?: FeatureFlags;
+	/** Explicitly supported experimental wire types. Consulted on every message. */
+	isKnownCustomMessageType?: (type: number) => boolean;
+	/** Custom records to send in every init (see IPeerOptions.initCustomRecords). */
+	initCustomRecords?: CustomRecords;
+	/** Keep the custom records of each peer's init (see IPeerOptions.readInitCustomRecords). */
+	readInitCustomRecords?: boolean;
 	/** Chain hashes to advertise */
 	networks?: Buffer[];
 	/** Enable auto-reconnect (default false) */
@@ -545,6 +553,9 @@ export class PeerManager extends EventEmitter {
 		Array<{ host: string; port: number }>
 	> = new Map();
 	private messageHandlers: Map<number, MessageHandler[]> = new Map();
+	private readonly isKnownCustomMessageType?: (type: number) => boolean;
+	private readonly initCustomRecords?: CustomRecords;
+	private readonly readInitCustomRecords: boolean;
 	/** In-flight dials keyed by peer and address; see dialPeer. */
 	private inflightDials: Map<string, Promise<void>> = new Map();
 	private reconnectTimers: Map<string, ReturnType<typeof setTimeout>> =
@@ -639,6 +650,9 @@ export class PeerManager extends EventEmitter {
 
 	constructor(options: IPeerManagerOptions) {
 		super();
+		this.isKnownCustomMessageType = options.isKnownCustomMessageType;
+		this.initCustomRecords = copyCustomRecords(options.initCustomRecords);
+		this.readInitCustomRecords = options.readInitCustomRecords === true;
 		this.localPrivateKey = options.localPrivateKey;
 		this.localPubkeyHex = getPublicKey(options.localPrivateKey).toString('hex');
 		this.localFeatures = options.localFeatures || FeatureFlags.empty();
@@ -973,6 +987,9 @@ export class PeerManager extends EventEmitter {
 
 		const peer = new Peer({
 			localPrivateKey: this.localPrivateKey,
+			isKnownCustomMessageType: this.isKnownCustomMessageType,
+			initCustomRecords: this.initCustomRecords,
+			readInitCustomRecords: this.readInitCustomRecords,
 			remotePublicKey: Buffer.from(pubkey, 'hex'),
 			host,
 			port,
@@ -2307,6 +2324,9 @@ export class PeerManager extends EventEmitter {
 		// Create peer with placeholder pubkey — discovered during Noise handshake
 		const peer = new Peer({
 			localPrivateKey: this.localPrivateKey,
+			isKnownCustomMessageType: this.isKnownCustomMessageType,
+			initCustomRecords: this.initCustomRecords,
+			readInitCustomRecords: this.readInitCustomRecords,
 			remotePublicKey: Buffer.alloc(33, 0),
 			host: socket.remoteAddress || 'unknown',
 			port: socket.remotePort || 0,

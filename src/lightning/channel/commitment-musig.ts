@@ -56,11 +56,13 @@ export function startCommitmentSigningSession(
 	localFundingPubkey: Buffer,
 	remoteFundingPubkey: Buffer,
 	ourPublicNonce: Uint8Array,
-	theirPublicNonce: Buffer
+	theirPublicNonce: Buffer,
+	fundingMerkleRoot?: Buffer
 ): SessionKey {
 	const { tweak } = deriveTaprootFundingKey(
 		localFundingPubkey,
-		remoteFundingPubkey
+		remoteFundingPubkey,
+		fundingMerkleRoot
 	);
 	// Nonce aggregation is commutative (point sum), so the order is irrelevant.
 	const aggNonce = aggregateNonces([

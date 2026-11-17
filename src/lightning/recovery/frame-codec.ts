@@ -28,8 +28,10 @@ import {
 	serializeChainMonitorState,
 	deserializeChainMonitorState,
 	serializePaymentInfo,
-	deserializePaymentInfo
+	deserializePaymentInfo,
+	serializedChannelCarriesAssetState
 } from '../storage/serialization';
+import { isOverlayChannel } from '../channel/types';
 import {
 	addWithoutOnion,
 	hasReferencedAddOnions,
@@ -190,7 +192,7 @@ function encodeMutation(
 				state: serializeChannelState(mutation.state, {
 					legacyHtlcHistory: version === 1,
 					htlcHistory: 'unsaved',
-					addOnionsByReference: version === 4
+					addOnionsByReference: version >= 4
 				}),
 				peerPubkey: mutation.peerPubkey
 			};
@@ -443,7 +445,7 @@ function encodeSnapshot(
 			channelId: c.channelId,
 			state: serializeChannelState(c.state, {
 				legacyHtlcHistory: version === 1,
-				addOnionsByReference: version === 4
+				addOnionsByReference: version >= 4
 			}),
 			peerPubkey: c.peerPubkey
 		})),
@@ -484,7 +486,7 @@ function encodeSnapshot(
 		})),
 		forwardingEvents: snapshot.forwardingEvents.map(encodeForwardingEvent),
 		outbox: snapshot.outbox.map((row) => {
-			const rest = version === 4 ? outboxAddWithoutOnion(snapshot, row) : null;
+			const rest = version >= 4 ? outboxAddWithoutOnion(snapshot, row) : null;
 			return {
 				...encodeOutboundMessage(row),
 				...(rest
@@ -650,6 +652,21 @@ export function frameVersionForContent(
 		),
 		...(frame.snapshot?.channels.map((channel) => channel.state) ?? [])
 	];
+	// Version 5 is a version 4 frame that carries the state of an asset
+	// channel. A release before it reads a channel state without its asset
+	// keys and would restore the channel as an ordinary one, so it must
+	// refuse the version. A frame with no asset channel in it keeps the
+	// version it always had.
+	if (
+		states.some(
+			(state) =>
+				state.auxiliaryState !== undefined ||
+				state.fundingTaprootMerkleRoot !== undefined ||
+				isOverlayChannel(state.channelType)
+		)
+	) {
+		return 5;
+	}
 	if (
 		states.some(hasReferencedAddOnions) ||
 		frame.snapshot?.outbox.some(
@@ -709,20 +726,29 @@ export function decodeFrame(plaintext: Buffer): RecoveryFrame {
 		encoded.version !== 1 &&
 		encoded.version !== 2 &&
 		encoded.version !== 3 &&
-		encoded.version !== 4
+		encoded.version !== 4 &&
+		encoded.version !== 5
 	) {
 		throw new Error(`Unsupported recovery frame version: ${encoded.version}`);
 	}
+	const encodedStates = [
+		...encoded.mutations.flatMap((mutation) =>
+			mutation.type === 'channel_state'
+				? [mutation.state as ISerializedChannelState]
+				: []
+		),
+		...(encoded.snapshot?.channels.map((channel) => channel.state) ?? [])
+	];
+	// The writer marks every frame that carries asset channel state as
+	// version 5, so the reader holds a frame to the same rule.
 	if (
-		encoded.version !== 4 &&
-		([
-			...encoded.mutations.flatMap((mutation) =>
-				mutation.type === 'channel_state'
-					? [mutation.state as ISerializedChannelState]
-					: []
-			),
-			...(encoded.snapshot?.channels.map((channel) => channel.state) ?? [])
-		].some((state) =>
+		encoded.version !== 5 &&
+		encodedStates.some(serializedChannelCarriesAssetState)
+	)
+		throw new Error('Asset channel state requires recovery frame version 5');
+	if (
+		encoded.version < 4 &&
+		(encodedStates.some((state) =>
 			(state.pendingLocalUpdates ?? []).some((u) => u.onionFromHtlc === true)
 		) ||
 			encoded.snapshot?.outbox.some((row) => row.onionFromHtlc === true))

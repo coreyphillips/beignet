@@ -50,6 +50,8 @@ import type {
 import {
 	serializeChannelState,
 	deserializeChannelState,
+	channelRowFromStore,
+	channelRowToStore,
 	serializeHtlcSnapshotEntries,
 	deserializeHtlcSnapshotEntries,
 	serializePaymentInfo,
@@ -376,7 +378,7 @@ export class MemoryStorage implements IStorageBackend {
 
 	saveChannel(id: string, state: IChannelState, peerPubkey: string): void {
 		const json = JSON.stringify(
-			serializeChannelState(state, { htlcHistory: 'none' })
+			channelRowToStore(serializeChannelState(state, { htlcHistory: 'none' }))
 		);
 		const history = unsavedRevokedHtlcSnapshots(state, this);
 		const snapshots: Array<[string, string]> = [];
@@ -428,7 +430,9 @@ export class MemoryStorage implements IStorageBackend {
 		row: IChannelRow,
 		stored: Map<string, IHtlcSnapshotEntry[]> | undefined
 	): IChannelState {
-		const state = deserializeChannelState(JSON.parse(row.json));
+		const state = deserializeChannelState(
+			channelRowFromStore(JSON.parse(row.json))
+		);
 		attachStoredRevokedHtlcSnapshots(
 			state,
 			stored,

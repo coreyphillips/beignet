@@ -210,7 +210,7 @@ export interface IRecoveryCommitResult {
  * frame's mutations list is empty; the snapshot IS the state.
  */
 export interface RecoveryFrame {
-	version: 1 | 2 | 3 | 4;
+	version: 1 | 2 | 3 | 4 | 5;
 	/** Changes only when a restored device takes ownership (Phase 5). */
 	writerEpoch: bigint;
 	/** Globally monotonic across the node, starting at 1. */

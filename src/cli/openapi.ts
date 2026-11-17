@@ -3145,7 +3145,45 @@ export function getOpenApiSpec(): Record<string, unknown> {
 												]
 											},
 											settleUntil: { type: 'integer', nullable: true },
-											lastReason: { type: 'string', nullable: true }
+											lastReason: { type: 'string', nullable: true },
+											refusal: {
+												type: 'object',
+												description:
+													'Present only when the automatic apply was refused for the asset channels the capsule holds, and until a restore is installed. The capsule still waits: POST /recovery/restore-capsule with omitAssetChannels restores without the channels listed',
+												properties: {
+													code: {
+														type: 'string',
+														enum: [
+															'ASSET_RESTORE_REFUSED',
+															'ASSET_PROVIDER_REQUIRED'
+														]
+													},
+													assetChannels: {
+														type: 'array',
+														items: {
+															type: 'object',
+															properties: {
+																channelId: { type: 'string' },
+																peerPubkey: { type: 'string' },
+																capacitySats: { type: 'integer' }
+															}
+														}
+													}
+												}
+											},
+											skippedAssetChannels: {
+												type: 'array',
+												description:
+													'Present only after an automatic apply at Tier 1 that skipped asset entries of the backup: the entries skipped, which were not recovered',
+												items: {
+													type: 'object',
+													properties: {
+														channelId: { type: 'string' },
+														peerPubkey: { type: 'string' },
+														capacitySats: { type: 'integer' }
+													}
+												}
+											}
 										}
 									}
 								}
@@ -3208,7 +3246,8 @@ export function getOpenApiSpec(): Record<string, unknown> {
 					tags: ['Node'],
 					requestBody: bodyContent({
 						confirm: 'boolean',
-						unfenced: 'boolean?'
+						unfenced: 'boolean?',
+						omitAssetChannels: 'boolean?'
 					}),
 					responses: {
 						'200': {
@@ -3257,6 +3296,39 @@ export function getOpenApiSpec(): Record<string, unknown> {
 										properties: {
 											guardians: { type: 'array', items: { type: 'object' } }
 										}
+									},
+									skippedAssetChannels: {
+										type: 'array',
+										description:
+											'Tier 1 without omitAssetChannels: the asset entries of the backup that the recovery skipped, each also in skipped with its reason. Present only when there was one',
+										items: {
+											type: 'object',
+											properties: {
+												channelId: { type: 'string' },
+												peerPubkey: { type: 'string' },
+												capacitySats: { type: 'integer' }
+											}
+										}
+									},
+									omittedAssetChannels: {
+										type: 'array',
+										description:
+											'With omitAssetChannels: the asset channels the capsule held, which were left out of the restore. Present only when there was one',
+										items: {
+											type: 'object',
+											required: ['channelId', 'peerPubkey', 'capacitySats'],
+											properties: {
+												channelId: { type: 'string' },
+												peerPubkey: { type: 'string' },
+												capacitySats: { type: 'integer' }
+											}
+										}
+									},
+									unresolvedPayments: {
+										type: 'array',
+										description:
+											'With omitAssetChannels: the payment hashes of the payments that were in flight on a channel left out. Each stays PENDING and carries `unresolved` on its row. Present only when there was one',
+										items: { type: 'string' }
 									}
 								}
 							})
@@ -5639,6 +5711,16 @@ export function getOpenApiSpec(): Record<string, unknown> {
 							type: 'integer',
 							description:
 								'Splice-in-transit funds (see splicingBalanceSats); rejoins lightning at splice_locked. Excluded from total, which counts only currently spendable funds'
+						},
+						assetChannelSats: {
+							type: 'integer',
+							description:
+								"The sats on this wallet's side of its asset channels that are neither closing nor over, whatever their state: still opening (from the broadcast of its funding transaction for a channel this wallet funds, from the confirmation of it for one the peer funds), open, waiting for the peer, or failed and not yet closed. An opening whose funding transaction has not been broadcast is not counted: its coins are still in onchain. Present only while it has one. They carry asset outputs and cannot be sent or received as bitcoin over Lightning. Excluded from lightning and from total. Every asset channel that is not over is in this figure or in assetChannelClosingSats, never in both"
+						},
+						assetChannelClosingSats: {
+							type: 'integer',
+							description:
+								"The sats on this wallet's side of its asset channels that are closing: shutting down, negotiating a close, or force closed with its balance output not yet spent in a block. Present only while it has one. A closing asset channel is in no other figure, pendingCloseBalanceSats included: its bitcoin stays under the asset outputs the close or the sweep pays. Excluded from lightning and from total"
 						}
 					}
 				},
@@ -5790,6 +5872,36 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						error: {
 							type: 'string',
 							description: 'Why it failed, when state is failed'
+						},
+						fixedOutputFees: {
+							type: 'object',
+							description:
+								'Present only when the node holds the asset channel provider of this extension and has no fee coin pool. With error: the wallet refused the fee policy the extension supplied, so the node opens and accepts no asset channel and whatever needs a fee coin fails with this error. With supplied false: the attachment gave no fixedOutputFees, so the node does not offer fixed HTLC outputs (feature bit 451) and opens or accepts an asset channel only with a peer the provider allows the older HTLC signatures for',
+							required: ['available'],
+							properties: {
+								available: { type: 'boolean', enum: [false] },
+								supplied: {
+									type: 'boolean',
+									enum: [false],
+									description:
+										'Present, and false, when the attachment supplied auxiliaryChannels without fixedOutputFees'
+								},
+								error: {
+									type: 'object',
+									required: ['code', 'remedy', 'message'],
+									properties: {
+										code: {
+											type: 'string',
+											description: 'FEE_POLICY_REFUSED'
+										},
+										remedy: {
+											type: 'string',
+											description: 'operator'
+										},
+										message: { type: 'string' }
+									}
+								}
+							}
 						},
 						routes: {
 							type: 'array',
@@ -5979,6 +6091,11 @@ export function getOpenApiSpec(): Record<string, unknown> {
 							type: 'boolean',
 							description:
 								'This node could not produce the your_last_per_commitment_secret its OWN channel_reestablish owes the peer: the shachain store held no secret at the index its revocation counter names, and BOLT 2 permits all zeroes only at next_revocation_number 0, so nothing was sent. Local storage is damaged or incomplete. The channel is ERRORED under the same hold as restoreRecencyUnproven: no automatic close, no new HTLCs, no router edge, and the peer is asked to close on every reconnect. The exits are the peer closing or /channel/forceclose with acceptStaleStateRisk: true. Permanent, since the store cannot recover the secret'
+						},
+						auxiliary: {
+							type: 'boolean',
+							description:
+								'Present, and true, only on an asset channel. Its sats are not spendable or receivable as bitcoin over Lightning and no total counts them. Absent on every other channel.'
 						},
 						restoreRevokedRisk: {
 							type: 'boolean',
@@ -6221,6 +6338,11 @@ export function getOpenApiSpec(): Record<string, unknown> {
 							nullable: true,
 							description:
 								'earliestExpiry minus cancelMarginBlocks: the first height the sweeper fails the parked parts back; null before any part is committed'
+						},
+						auxiliary: {
+							type: 'boolean',
+							description:
+								'Present, and true, only while a parked part of the set is an asset HTLC and after such a set settled. heldAmountMsat is then what the node holds for those HTLCs, which is what the asset provider said they are worth. Absent on every other row.'
 						}
 					}
 				},

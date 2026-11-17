@@ -30,6 +30,9 @@ property ApiResponse.error?: { code: string; message: string; paymentHash?: Paym
 property ApiResponse.ok: boolean
 property ApiResponse.result?: T
 type ApiScope = 'readonly' | 'invoice' | 'admin'
+interface AssetRestoreRefusal
+property AssetRestoreRefusal.assetChannels: Array<{ channelId: ChannelIdHex; peerPubkey: string; capacitySats: number; }>
+property AssetRestoreRefusal.code: 'ASSET_RESTORE_REFUSED' | 'ASSET_PROVIDER_REQUIRED'
 unexported interface AuthFailure
 property AuthFailure.ok: false
 unexported interface AuthOverrideStore
@@ -41,6 +44,8 @@ property AuthSuccess.keyName: string | null
 property AuthSuccess.ok: true
 property AuthSuccess.scopes: ReadonlySet<ApiScope>
 interface BalanceInfo
+property BalanceInfo.assetChannelClosingSats?: number
+property BalanceInfo.assetChannelSats?: number
 property BalanceInfo.lightning: number
 property BalanceInfo.onchain: number
 property BalanceInfo.splicingSats?: number
@@ -115,14 +120,20 @@ property BeignetConfig.websocketPort?: number
 property BeignetConfig.wireTrace?: boolean | string[]
 class BeignetError extends CodedError<BeignetErrorCodeValue>
 constructor BeignetError(code: BeignetErrorCodeValue, message: string, failureCode?: number)
+property BeignetError.details?: Record<string, unknown>
 property BeignetError.failureCode?: number
 property BeignetError.paymentHash?: string
-method BeignetError.toJSON(): { code: string; message: string; failureCode?: number; paymentHash?: string; }
+method BeignetError.toJSON(): { code: string; message: string; failureCode?: number; paymentHash?: string; details?: Record<string, unknown>; }
 enum BeignetErrorCode
 member BeignetErrorCode.ADDRESS_FAILED = "ADDRESS_FAILED"
 member BeignetErrorCode.AMOUNT_MISMATCH = "AMOUNT_MISMATCH"
 member BeignetErrorCode.AMOUNT_REQUIRED = "AMOUNT_REQUIRED"
 member BeignetErrorCode.AMOUNT_TOO_SMALL = "AMOUNT_TOO_SMALL"
+member BeignetErrorCode.ASSET_GUARDIAN_START_REFUSED = "ASSET_GUARDIAN_START_REFUSED"
+member BeignetErrorCode.ASSET_PROVIDER_CONFLICT = "ASSET_PROVIDER_CONFLICT"
+member BeignetErrorCode.ASSET_PROVIDER_FAILED = "ASSET_PROVIDER_FAILED"
+member BeignetErrorCode.ASSET_PROVIDER_REQUIRED = "ASSET_PROVIDER_REQUIRED"
+member BeignetErrorCode.ASSET_RESTORE_REFUSED = "ASSET_RESTORE_REFUSED"
 member BeignetErrorCode.BODY_TOO_LARGE = "BODY_TOO_LARGE"
 member BeignetErrorCode.CAPSULE_RESTORE_FAILED = "CAPSULE_RESTORE_FAILED"
 member BeignetErrorCode.CAPSULE_RESTORE_GUARDIAN_BACKED = "CAPSULE_RESTORE_GUARDIAN_BACKED"
@@ -202,6 +213,7 @@ member BeignetErrorCode.OFFER_DECLINED = "OFFER_DECLINED"
 member BeignetErrorCode.OPEN_FAILED = "OPEN_FAILED"
 member BeignetErrorCode.PAYMENT_FAILED = "PAYMENT_FAILED"
 member BeignetErrorCode.PAYMENT_TIMEOUT = "PAYMENT_TIMEOUT"
+member BeignetErrorCode.PAYMENT_UNRESOLVED = "PAYMENT_UNRESOLVED"
 member BeignetErrorCode.PAY_ALL_BUDGET_MISMATCH = "PAY_ALL_BUDGET_MISMATCH"
 member BeignetErrorCode.PAY_ALL_REMAINDER = "PAY_ALL_REMAINDER"
 member BeignetErrorCode.PAY_ALL_REVIEW_EXPIRED = "PAY_ALL_REVIEW_EXPIRED"
@@ -375,7 +387,7 @@ method BeignetNode.getPeerRetrievedBackup(): { encoded: string; createdAt: numbe
 method BeignetNode.getPorchLinks(): PorchLinksInfo
 method BeignetNode.getQueuedPayment(id: string): QueuedPayment | undefined
 method BeignetNode.getReadyChannels(): ChannelInfo[]
-method BeignetNode.getRecoverySurfaceStatus(): { mode: RecoveryMode; profile: 'crash-v1' | null; generation: string; configuredSetStale: boolean; rotation: { inProgress: boolean; pending: boolean; retirePending: boolean; lastEvent: { type: string; detail: string; } | null; followed: { generation: string; from: string[]; to: string[]; } | null; }; guardians: Array<{ guardianId: string; url: string; }>; state: 'disabled' | 'running' | 'restore-required' | 'restoring' | 'restart-required' | 'fenced'; node: ReturnType<beignet/lightning#node.LightningNode['getRecoveryStatus']> | null; capsules: { candidates: number; best: { writerEpoch: string; latestSequence: string; inline: boolean; channelCount: number; guardians: IReportedGuardian[]; fromPeer: string; receivedAt: number; } | null; }; restore?: { inProgress: boolean; lastEvent?: { type: string; detail: string; }; }; autoApply: { enabled: boolean; phase: 'idle' | 'settling' | 'applying' | 'applied' | 'refused'; settleUntil: number | null; lastReason: string | null; }; }
+method BeignetNode.getRecoverySurfaceStatus(): { mode: RecoveryMode; profile: 'crash-v1' | null; generation: string; configuredSetStale: boolean; rotation: { inProgress: boolean; pending: boolean; retirePending: boolean; lastEvent: { type: string; detail: string; } | null; followed: { generation: string; from: string[]; to: string[]; } | null; }; guardians: Array<{ guardianId: string; url: string; }>; state: 'disabled' | 'running' | 'restore-required' | 'restoring' | 'restart-required' | 'fenced'; node: ReturnType<beignet/lightning#node.LightningNode['getRecoveryStatus']> | null; capsules: { candidates: number; best: { writerEpoch: string; latestSequence: string; inline: boolean; channelCount: number; guardians: IReportedGuardian[]; fromPeer: string; receivedAt: number; } | null; }; restore?: { inProgress: boolean; lastEvent?: { type: string; detail: string; }; }; autoApply: { enabled: boolean; phase: 'idle' | 'settling' | 'applying' | 'applied' | 'refused'; settleUntil: number | null; lastReason: string | null; refusal?: AssetRestoreRefusal; skippedAssetChannels?: IRestoreAssetChannel[]; }; }
 method BeignetNode.getStats(windowMs?: number): NodeStats
 method BeignetNode.getStorage(): beignet/lightning/sqlite#SqliteStorage
 method BeignetNode.getStorageBackend(): beignet/lightning#storage.IStorageBackend & beignet/lightning#storage.IWalletDataStorage
@@ -444,7 +456,7 @@ method BeignetNode.reorderPrimaries(pubkeys: string[]): PrimariesInfo
 method BeignetNode.resolveGuardianUri(uri: string): Promise<{ guardianId: string; url: string; entry: string; guardianSetIds: string[]; maxCiphertextBytes: number; }>
 method BeignetNode.resolveInterruptedPayment(bolt11: string): Promise<InterruptedPaymentOutcome>
 get BeignetNode.restartRequired(): boolean
-method BeignetNode.restoreFromCapsules(options?: { unfenced?: boolean; resume?: boolean; }): Promise<{ tier: 1 | 2; channelCount: number; framesApplied: number; head: { writerEpoch: string; latestSequence: string; }; newestSeenHead: { writerEpoch: string; latestSequence: string; }; rejectedCandidates: number; restartRequired: boolean; resumed?: boolean; uncovered?: string[]; unfenced?: { guardians: IReportedGuardian[]; }; recovering?: string[]; skipped?: Array<{ channelId: ChannelIdHex; reason: string; }>; }>
+method BeignetNode.restoreFromCapsules(options?: { unfenced?: boolean; resume?: boolean; omitAssetChannels?: boolean; }): Promise<{ tier: 1 | 2; channelCount: number; framesApplied: number; head: { writerEpoch: string; latestSequence: string; }; newestSeenHead: { writerEpoch: string; latestSequence: string; }; rejectedCandidates: number; restartRequired: boolean; resumed?: boolean; uncovered?: string[]; unfenced?: { guardians: IReportedGuardian[]; }; recovering?: string[]; skipped?: Array<{ channelId: ChannelIdHex; reason: string; }>; omittedAssetChannels?: IRestoreAssetChannel[]; skippedAssetChannels?: IRestoreAssetChannel[]; unresolvedPayments?: PaymentHashHex[]; }>
 method BeignetNode.restoreFromGuardians(): Promise<{ exact: boolean; framesApplied: number; guardiansRepaired: number; epoch: string; }>
 method BeignetNode.restoreFromScb(encoded: string): Promise<{ recovering: string[]; skipped: Array<{ channelId: ChannelIdHex; reason: string; }>; channelCount: number; }>
 get BeignetNode.restorePending(): boolean
@@ -491,14 +503,14 @@ interface BeignetNodeEvents
 property BeignetNodeEvents.'backup:completed': (data: { path: string; timestamp: number; }) => void
 property BeignetNodeEvents.'backup:failed': (data: { path: string; error: string; timestamp: number; }) => void
 property BeignetNodeEvents.'channel-send:stage': (data: { id: string; compositeId?: string; stage: ChannelSendStage; txid?: TxidHex; reason?: string; }) => void
-property BeignetNodeEvents.'channel:closed': (data: { channelId: ChannelIdHex; }) => void
-property BeignetNodeEvents.'channel:force-closing': (data: { channelId: ChannelIdHex; initiator: 'local' | 'remote'; }) => void
-property BeignetNodeEvents.'channel:opening': (data: { channelId: ChannelIdHex; fundingTxid: TxidHex; }) => void
-property BeignetNodeEvents.'channel:pending-close': (data: { channelId: ChannelIdHex; initiator: 'local' | 'remote'; }) => void
-property BeignetNodeEvents.'channel:ready': (data: { channelId: ChannelIdHex; }) => void
-property BeignetNodeEvents.'channel:resolved': (data: { channelId: ChannelIdHex; }) => void
-property BeignetNodeEvents.'channel:usable': (data: { channelId: ChannelIdHex; }) => void
-property BeignetNodeEvents.'channel:voided': (data: { channelId: ChannelIdHex; }) => void
+property BeignetNodeEvents.'channel:closed': (data: { channelId: ChannelIdHex; auxiliary?: true; }) => void
+property BeignetNodeEvents.'channel:force-closing': (data: { channelId: ChannelIdHex; initiator: 'local' | 'remote'; auxiliary?: true; }) => void
+property BeignetNodeEvents.'channel:opening': (data: { channelId: ChannelIdHex; fundingTxid: TxidHex; auxiliary?: true; }) => void
+property BeignetNodeEvents.'channel:pending-close': (data: { channelId: ChannelIdHex; initiator: 'local' | 'remote'; auxiliary?: true; }) => void
+property BeignetNodeEvents.'channel:ready': (data: { channelId: ChannelIdHex; auxiliary?: true; }) => void
+property BeignetNodeEvents.'channel:resolved': (data: { channelId: ChannelIdHex; auxiliary?: true; }) => void
+property BeignetNodeEvents.'channel:usable': (data: { channelId: ChannelIdHex; auxiliary?: true; }) => void
+property BeignetNodeEvents.'channel:voided': (data: { channelId: ChannelIdHex; auxiliary?: true; }) => void
 property BeignetNodeEvents.'direct-funding:offer:accepted': (data: { offerId: string; paired: boolean; resumed?: boolean; }) => void
 property BeignetNodeEvents.'direct-funding:offer:completed': (data: { offerId: string; }) => void
 property BeignetNodeEvents.'direct-funding:offer:declined': (data: { offerId: string; reason: string; }) => void
@@ -531,7 +543,7 @@ property BeignetNodeEvents.'htlc:failed': (data: { channelId: ChannelIdHex; htlc
 property BeignetNodeEvents.'htlc:forward-refused': (data: { inChannelId: ChannelIdHex; outChannelId: ChannelIdHex; amountMsat: string; paymentHash: PaymentHashHex; reason: string; channelErrorCode?: beignet/lightning#channel.ChannelErrorCode; }) => void
 property BeignetNodeEvents.'htlc:forwarded': (data: { inChannelId: ChannelIdHex; outChannelId: ChannelIdHex; amountInMsat: string; amountOutMsat: string; feeMsat: string; }) => void
 property BeignetNodeEvents.'htlc:fulfilled': (data: { channelId: ChannelIdHex; htlcId: string; }) => void
-property BeignetNodeEvents.'invoice:settled': (data: { paymentHash: PaymentHashHex; bolt11: string; amountSats: number; }) => void
+property BeignetNodeEvents.'invoice:settled': (data: { paymentHash: PaymentHashHex; bolt11: string; amountSats: number; auxiliary?: true; }) => void
 property BeignetNodeEvents.'jit:failed': (data: { scidHex?: string; channelIdHex?: string; parts: number; reason: string; }) => void
 property BeignetNodeEvents.'jit:forwarded': (data: { scidHex?: string; channelIdHex?: string; parts: number; }) => void
 property BeignetNodeEvents.'jit:funding': (data: { scidHex?: string; channelIdHex?: string; fundingSats: string; }) => void
@@ -555,7 +567,7 @@ property BeignetNodeEvents.'recovery:durable': (data: { through: string; }) => v
 property BeignetNodeEvents.'recovery:fenced': (data: { supersededBy: { epoch: string; writerPublicKey: string; sequence: string; frameHash: string; } | null; }) => void
 property BeignetNodeEvents.'recovery:guardian_unreachable': (data: { detail: string; sequence?: string; }) => void
 property BeignetNodeEvents.'recovery:reestablish-held': (data: { peerPubkey: string; channelId: ChannelIdHex; expiresAt: number; }) => void
-property BeignetNodeEvents.'recovery:restore-progress': (data: { type: string; detail: string; }) => void
+property BeignetNodeEvents.'recovery:restore-progress': (data: { type: string; detail: string; refusal?: AssetRestoreRefusal; }) => void
 property BeignetNodeEvents.'recovery:restored': (data: { exact: boolean; framesApplied: number; guardiansRepaired: number; epoch: string; tier?: 1 | 2; restartRequired?: boolean; resumed?: boolean; }) => void
 property BeignetNodeEvents.'recovery:rotated': (data: { generation: string; guardians: Array<{ guardianId: string; url: string; }>; }) => void
 property BeignetNodeEvents.'recovery:rotation-followed': (data: { generation: string; from: string[]; to: string[]; }) => void
@@ -691,6 +703,7 @@ class ChannelFundingUnavailableError extends CodedError<ChannelFundingUnavailabl
 constructor ChannelFundingUnavailableError(code: ChannelFundingUnavailableCode, message: string)
 type ChannelIdHex = string
 interface ChannelInfo
+property ChannelInfo.auxiliary?: true
 property ChannelInfo.capacitySats: number
 property ChannelInfo.channelId: ChannelIdHex
 property ChannelInfo.closeStatus?: CloseStatus
@@ -866,16 +879,23 @@ readonly property ExtensionError.details?: unknown
 readonly property ExtensionError.extensionCode: string
 readonly property ExtensionError.status: number
 unexported type ExtensionEventListener = (event: string, data: unknown) => void
+unexported type ExtensionFixedOutputFees = Omit<beignet/lightning#wallet.IFixedOutputFeePolicy, 'storage' | 'walletId'>
 type ExtensionHandler = (request: IExtensionRequest) => unknown | Promise<unknown>
 unexported class ExtensionHost
 constructor ExtensionHost(extensions: readonly IBeignetExtension[], opts: IExtensionHostOptions)
 method ExtensionHost.abort(): void
 method ExtensionHost.attach(build: IExtensionBuild): Promise<void>
+method ExtensionHost.auxiliarySupply(): IExtensionAuxiliarySupply | undefined
+method ExtensionHost.bindNode(node: beignet/lightning#node.LightningNode, provider?: string): void
+method ExtensionHost.binds(): boolean
 method ExtensionHost.describe(): IExtensionInfo[]
 get ExtensionHost.extensions(): readonly IBeignetExtension[]
+method ExtensionHost.feePolicyRefused(id: string, error: IExtensionFeePoolUnavailable['error']): void
 method ExtensionHost.fenceForRebuild(): void
+method ExtensionHost.finishShutdown(limitMs?: number): Promise<void>
 method ExtensionHost.handler(id: string, key: string): ExtensionHandler
 method ExtensionHost.holdWrites(): () => void
+method ExtensionHost.keepUntilDrained(id: string | undefined): void
 method ExtensionHost.onEvent(listener: ExtensionEventListener): () => void
 method ExtensionHost.shutdown(limitMs?: number): Promise<void>
 method ExtensionHost.start(): Promise<void>
@@ -972,6 +992,7 @@ property HealthInfo.readyChannelCount: number
 property HealthInfo.status: 'ready' | 'syncing' | 'degraded'
 property HealthInfo.uptime: number
 interface HoldInvoiceEvent
+property HoldInvoiceEvent.auxiliary?: true
 property HoldInvoiceEvent.cancelHeight: number | null
 property HoldInvoiceEvent.cancelMarginBlocks: number
 property HoldInvoiceEvent.earliestExpiry: number | null
@@ -982,6 +1003,7 @@ property HoldInvoiceEvent.paymentHash: PaymentHashHex
 property HoldInvoiceEvent.state: HoldInvoiceInfo['state']
 interface HoldInvoiceInfo
 property HoldInvoiceInfo.amountSats?: number
+property HoldInvoiceInfo.auxiliary?: true
 property HoldInvoiceInfo.bolt11: string
 property HoldInvoiceInfo.cancelHeight: number | null
 property HoldInvoiceInfo.cancelMarginBlocks: number
@@ -1017,10 +1039,17 @@ property IChannelHealth.remoteBalancePct: number
 property IChannelHealth.state: string
 property IChannelHealth.warnings: string[]
 interface IExtensionAttachment
+property IExtensionAttachment.auxiliaryChannels?: beignet/lightning#channel.IAuxiliaryChannelConfig
+method IExtensionAttachment.bind?(node: beignet/lightning#node.LightningNode): void
+property IExtensionAttachment.fixedOutputFees?: ExtensionFixedOutputFees
 property IExtensionAttachment.handlers?: Record<string, ExtensionHandler>
 method IExtensionAttachment.start?(): void | Promise<void>
 method IExtensionAttachment.status?(): unknown
 method IExtensionAttachment.stop?(reason: ExtensionStopReason): void | Promise<void>
+unexported interface IExtensionAuxiliarySupply
+property IExtensionAuxiliarySupply.auxiliaryChannels: beignet/lightning#channel.IAuxiliaryChannelConfig
+property IExtensionAuxiliarySupply.fixedOutputFees?: ExtensionFixedOutputFees
+property IExtensionAuxiliarySupply.id: string
 unexported interface IExtensionBuild
 property IExtensionBuild.dataDir: string | undefined
 property IExtensionBuild.network: ExtensionNetwork
@@ -1035,6 +1064,12 @@ property IExtensionContext.logger: beignet#ILogger
 property IExtensionContext.network: ExtensionNetwork
 property IExtensionContext.storage: IExtensionStorage
 property IExtensionContext.wallet: beignet#Wallet
+unexported interface IExtensionFeePoolAbsent
+property IExtensionFeePoolAbsent.available: false
+property IExtensionFeePoolAbsent.supplied: false
+unexported interface IExtensionFeePoolUnavailable
+property IExtensionFeePoolUnavailable.available: false
+property IExtensionFeePoolUnavailable.error: { code: string; remedy: string; message: string; }
 unexported interface IExtensionHostOptions
 property IExtensionHostOptions.attachTimeoutMs?: number
 property IExtensionHostOptions.engineVersion: string
@@ -1043,6 +1078,7 @@ property IExtensionHostOptions.stopTimeoutMs?: number
 interface IExtensionInfo
 property IExtensionInfo.error?: string
 property IExtensionInfo.events: string[]
+property IExtensionInfo.fixedOutputFees?: IExtensionFeePoolUnavailable | IExtensionFeePoolAbsent
 property IExtensionInfo.generation: number
 property IExtensionInfo.id: string
 property IExtensionInfo.routes: Array<{ method: ExtensionMethod; path: string; scopes: string[]; idempotent: boolean; }>
@@ -1131,6 +1167,10 @@ method IPaymentQueueStorage.updateQueueEntryStatus(id: string, status: string, e
 unexported interface IReportedGuardian
 property IReportedGuardian.guardianId: string
 property IReportedGuardian.transports: Array<{ type: beignet/lightning#recovery.GuardianTransportType; url: string; }>
+unexported interface IRestoreAssetChannel
+property IRestoreAssetChannel.capacitySats: number
+property IRestoreAssetChannel.channelId: ChannelIdHex
+property IRestoreAssetChannel.peerPubkey: string
 interface IStartedDaemon
 property IStartedDaemon.logger?: beignet#ILogger
 property IStartedDaemon.node: BeignetNode
@@ -1155,6 +1195,7 @@ class InvalidSpliceError extends beignet/lightning#node.InvalidRequestError
 constructor InvalidSpliceError(message: string)
 interface InvoiceInfo
 property InvoiceInfo.amountSats?: number
+property InvoiceInfo.auxiliary?: true
 property InvoiceInfo.bolt11: string
 property InvoiceInfo.createdAt?: number
 property InvoiceInfo.description?: string
@@ -1162,6 +1203,7 @@ property InvoiceInfo.expiry?: number
 property InvoiceInfo.paymentHash: PaymentHashHex
 property InvoiceInfo.paymentSecret?: string
 property InvoiceInfo.status?: 'PENDING' | 'PAID' | 'EXPIRED'
+property InvoiceInfo.unresolved?: PaymentUnresolved
 unexported interface IrohDaemonConfig
 property IrohDaemonConfig.iroh?: boolean
 property IrohDaemonConfig.irohDiscovery?: boolean
@@ -1358,6 +1400,8 @@ property PaymentFilter.status?: 'PENDING' | 'COMPLETED' | 'FAILED'
 type PaymentHashHex = string
 interface PaymentInfo
 property PaymentInfo.amountSats: number
+property PaymentInfo.auxiliary?: true
+property PaymentInfo.auxiliaryValueSats?: number
 property PaymentInfo.completedAt?: number
 property PaymentInfo.createdAt: number
 property PaymentInfo.direction: 'OUTGOING' | 'INCOMING'
@@ -1370,8 +1414,11 @@ property PaymentInfo.paymentHash: PaymentHashHex
 property PaymentInfo.preimage?: string
 property PaymentInfo.route?: PaymentRoute
 property PaymentInfo.status: 'PENDING' | 'COMPLETED' | 'FAILED'
+property PaymentInfo.unresolved?: PaymentUnresolved
 interface PaymentProof
 property PaymentProof.amountSats: number
+property PaymentProof.auxiliary?: true
+property PaymentProof.auxiliaryValueSats?: number
 property PaymentProof.completedAt: number
 property PaymentProof.feeSats?: number
 property PaymentProof.hopCount?: number
@@ -1422,6 +1469,9 @@ interface PaymentRouteHop
 property PaymentRouteHop.feeMsat: number
 property PaymentRouteHop.pubkey: string
 property PaymentRouteHop.shortChannelId: string
+interface PaymentUnresolved
+property PaymentUnresolved.channelIds: ChannelIdHex[]
+property PaymentUnresolved.code: 'CHANNEL_OMITTED_AT_RESTORE'
 interface PaymentValidation
 property PaymentValidation.checks: PaymentValidationCheck[]
 property PaymentValidation.invoice?: DecodedInvoice

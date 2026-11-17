@@ -12,3 +12,8 @@ export * from './splice';
 export * from './splice-weight';
 export * from './composite-splice-record';
 export * from './dual-funding';
+export * from './auxiliary';
+export * from './auxiliary-funding';
+export * from './auxiliary-guard';
+export * from './auxiliary-close';
+export * from './auxiliary-api';

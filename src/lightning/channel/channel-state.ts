@@ -10,6 +10,11 @@ import { ShaChainStore } from '../keys/shachain';
 import type { IChannelBasepoints } from '../keys/derivation';
 import type { IFforEpochRecord } from '../ffor/types';
 import type { IChannelConfig, IHtlcEntry, IHtlcSnapshotEntry } from './types';
+import type {
+	IAuxiliaryCommitmentData,
+	IChannelAuxiliaryProvider,
+	IChannelAuxiliaryState
+} from './auxiliary';
 import {
 	ChannelState,
 	ChannelRole,
@@ -290,6 +295,36 @@ export interface IChannelState {
 	state: ChannelState;
 
 	/** Funding */
+	/**
+	 * Asset channels only: the asset commitment root the 2-of-2 taproot
+	 * funding key commits to. Absent on every other channel, where the
+	 * funding key has no script path.
+	 */
+	fundingTaprootMerkleRoot?: Buffer;
+	/**
+	 * Asset channels only: the asset state, journaled with the Bitcoin
+	 * commitment and revocation state in the same row. Its presence is what
+	 * makes a channel an asset channel.
+	 */
+	auxiliaryState?: IChannelAuxiliaryState;
+	/** Runtime only, never stored: the provider, reattached on every restore. */
+	auxiliaryProvider?: IChannelAuxiliaryProvider;
+	/**
+	 * Runtime only, never stored: the provider's last answer for a commitment
+	 * of each side, with a digest of everything it was asked. The same
+	 * commitment asked about again gets the same answer without a second
+	 * call, so the view a signature was made or verified against is the view
+	 * that is stored. See applyAuxiliaryCommitment.
+	 */
+	auxiliaryAnswers?: Map<
+		'local' | 'remote',
+		{ asked: string; answer: IAuxiliaryCommitmentData }
+	>;
+	/**
+	 * Asset channels only: the custom records of the last commitment_signed
+	 * sent, so a retransmission carries the same asset signatures.
+	 */
+	lastSentAuxiliaryRecords?: ReadonlyMap<bigint, Buffer>;
 	fundingSatoshis: bigint;
 	pushMsat: bigint;
 	fundingTxid: Buffer | null;

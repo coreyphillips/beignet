@@ -47,6 +47,7 @@
  */
 
 import { sha256 } from '../crypto/provider';
+import { assertGuardianJournalHoldsNoAuxiliaryChannels } from './auxiliary-restore';
 import type { IStorageBackend, IStoredRecoveryFrame } from '../storage/types';
 import { withStorageTransaction } from '../storage/transaction';
 import type { GuardianState } from './guardian-wire';
@@ -1590,6 +1591,10 @@ export class RestoreDriver {
 				);
 			}
 			reconstructFromFrames(targetStorage, frames);
+			// No build replicates an asset channel to guardians (issue
+			// #2093), so a journal that holds one is refused whole, and no
+			// provider is asked: AuxiliaryGuardianRestoreError.
+			assertGuardianJournalHoldsNoAuxiliaryChannels(targetStorage);
 			// StateUncertain (5.6), unless the restore can PROVE it is exact.
 			//
 			// Without a proof the certified head can trail what the old device
