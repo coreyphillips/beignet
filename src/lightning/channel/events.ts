@@ -119,6 +119,12 @@ export interface ChannelManagerEvents {
 	'watch:tx': (txid: string) => void;
 	/** Transaction to broadcast on chain. */
 	'broadcast:tx': (tx: Buffer) => void;
+	/**
+	 * Transactions that can no longer confirm and are no longer offered: the
+	 * commitment of an asset channel and its children, once another
+	 * transaction spent the funding output in a block.
+	 */
+	'broadcast:void': (txids: string[]) => void;
 	/** A force close's commitment transaction. */
 	'force:close': (channelId: Buffer, commitmentTx: Buffer) => void;
 	/** A tracked output resolved irrevocably on chain. */

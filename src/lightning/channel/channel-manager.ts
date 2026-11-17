@@ -942,6 +942,13 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			// by the re-CPFP pass and by a report that demotes the record itself,
 			// since a confirmation and its demotion can land between two passes.
 			sawConfirmation?: boolean;
+			// An asset channel: the children built for this commitment and
+			// the wallet coins they took, so that both can be let go once the
+			// funding output is spent in a block.
+			children?: {
+				txids: string[];
+				inputs: Array<{ txid: string; vout: number }>;
+			};
 		}
 	> = new Map();
 	// Learned payment preimages, retained so monitors created later (on
@@ -4165,6 +4172,16 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		// listChannels() reflects reality after an offline close is detected on
 		// restart. The monitor records the classified commitment for us.
 		const broadcast = monitor.getFullState().commitmentBroadcast;
+		// An asset channel whose funding output is spent in a block: the
+		// coins the children of a commitment took are free again, and a
+		// commitment that is not the one in the block is given up with them.
+		if (
+			broadcast &&
+			monitorState?.auxiliaryState &&
+			monitor.isCommitmentConfirmed()
+		) {
+			this.settleCommitmentCpfp(channelIdHex, broadcast.txid);
+		}
 		if (broadcast) {
 			const channel = this.channels.get(channelIdHex);
 			if (channel) {
@@ -13693,6 +13710,22 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 				targetFeeSats,
 				feeratePerKw
 			);
+			// An asset channel: the coins this child takes are remembered with
+			// the commitment it bumps. Where that commitment was given up
+			// while the wallet chose them, they are free again and no child
+			// is built.
+			const children = this.commitmentCpfpChildren(channelId, action);
+			if (children) {
+				const taken = inputs.map((input) => ({
+					txid: bitcoin.Transaction.fromBuffer(input.prevTx).getId(),
+					vout: input.prevOutputIndex
+				}));
+				if (children === 'void') {
+					releaseInputPledgesBestEffort(fp, taken);
+					return;
+				}
+				children.inputs.push(...taken);
+			}
 			const { tx } = buildAnchorCpfpTx({
 				commitmentTxid: action.commitmentTxid,
 				anchorOutputIndex: action.anchorOutputIndex,
@@ -13716,6 +13749,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			});
 			// The commitment (parent) is broadcast by the force-close path; emit only
 			// the fee-bearing child so the 1-parent-1-child package clears the target.
+			if (children) children.txids.push(tx.getId());
 			this.emit('broadcast:tx', tx.toBuffer());
 			// The child was actually emitted: record the paid feerate + height and
 			// clear any prior failure flag, so the retry gate reflects real progress.
@@ -13754,6 +13788,58 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 				}
 			}
 		}
+	}
+
+	/**
+	 * An asset channel: where the children of the commitment an anchor child
+	 * is for are remembered, `void` when that commitment is no longer the
+	 * one this node bumps, and nothing for any other channel.
+	 */
+	private commitmentCpfpChildren(
+		channelId: Buffer,
+		action: IFeeBumpAndBroadcastChainAction
+	):
+		| { txids: string[]; inputs: Array<{ txid: string; vout: number }> }
+		| 'void'
+		| undefined {
+		const idHex = channelId.toString('hex');
+		if (!this.channels.get(idHex)?.getFullState().auxiliaryState) {
+			return undefined;
+		}
+		const entry = this._pendingCommitmentCpfp.get(idHex);
+		if (!entry || entry.action.commitmentTxid !== action.commitmentTxid) {
+			return 'void';
+		}
+		return (entry.children ??= { txids: [], inputs: [] });
+	}
+
+	/**
+	 * An asset channel whose funding output `confirmedTxid` spent in a block.
+	 * The wallet coins the children of the bumped commitment took are free
+	 * again: a child of the commitment in the block has spent its coin or
+	 * needs it no longer, and a child of any other commitment can never
+	 * confirm. That other commitment and its children are no longer offered
+	 * to the network either.
+	 */
+	private settleCommitmentCpfp(
+		channelIdHex: string,
+		confirmedTxid: string
+	): void {
+		const entry = this._pendingCommitmentCpfp.get(channelIdHex);
+		if (!entry) return;
+		const children = entry.children;
+		if (children && children.inputs.length > 0) {
+			releaseInputPledgesBestEffort(
+				this.fundingProvider,
+				children.inputs.splice(0)
+			);
+		}
+		if (entry.action.commitmentTxid === confirmedTxid) return;
+		this._pendingCommitmentCpfp.delete(channelIdHex);
+		this.emit('broadcast:void', [
+			...(entry.action.commitmentTxid ? [entry.action.commitmentTxid] : []),
+			...(children?.txids ?? [])
+		]);
 	}
 
 	/**

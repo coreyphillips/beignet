@@ -741,8 +741,8 @@ method chain.IChainWatcherChannelManager.handleNewBlock(blockHeight: number): vo
 method chain.IChainWatcherChannelManager.handleOutputSpent(txid: string, outputIndex: number, spendingTx: bitcoinjs-lib#Transaction, blockHeight: number): void
 method chain.IChainWatcherChannelManager.handleOutputUnspent(txid: string, outputIndex: number): void
 method chain.IChainWatcherChannelManager.listChannels(): channel.Channel[]
-method chain.IChainWatcherChannelManager.off<K extends 'watch:funding' | 'broadcast:tx' | 'watch:output'>(event: K, listener: channel.ChannelManagerEvents[K]): void
-method chain.IChainWatcherChannelManager.on<K extends 'watch:funding' | 'broadcast:tx' | 'watch:output'>(event: K, listener: channel.ChannelManagerEvents[K]): void
+method chain.IChainWatcherChannelManager.off<K extends 'watch:funding' | 'broadcast:tx' | 'broadcast:void' | 'watch:output'>(event: K, listener: channel.ChannelManagerEvents[K]): void
+method chain.IChainWatcherChannelManager.on<K extends 'watch:funding' | 'broadcast:tx' | 'broadcast:void' | 'watch:output'>(event: K, listener: channel.ChannelManagerEvents[K]): void
 interface chain.IChainWatcherConfig
 property chain.IChainWatcherConfig.backend: chain.IChainBackend
 property chain.IChainWatcherConfig.channelManager: chain.IChainWatcherChannelManager
@@ -1494,6 +1494,7 @@ interface channel.ChannelManagerEvents
 property channel.ChannelManagerEvents.'announcement:needs-signing': (channelId: Buffer, shortChannelId: Buffer) => void
 property channel.ChannelManagerEvents.'announcement:ready': (channelId: Buffer, channelAnnouncement: Buffer, channelUpdate: Buffer) => void
 property channel.ChannelManagerEvents.'broadcast:tx': (tx: Buffer) => void
+property channel.ChannelManagerEvents.'broadcast:void': (txids: string[]) => void
 property channel.ChannelManagerEvents.'channel:abandoned': (channelId: Buffer, reason: string) => void
 property channel.ChannelManagerEvents.'channel:aborted': (temporaryChannelId: Buffer, reason: string) => void
 property channel.ChannelManagerEvents.'channel:accepted': (channel: channel.Channel, peerPubkey: string) => void

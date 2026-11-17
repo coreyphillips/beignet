@@ -344,11 +344,23 @@ function spliceInputWatchKey(
  * depend on the concrete manager. ChannelManager satisfies it.
  */
 export interface IChainWatcherChannelManager {
-	on<K extends 'watch:funding' | 'broadcast:tx' | 'watch:output'>(
+	on<
+		K extends
+			| 'watch:funding'
+			| 'broadcast:tx'
+			| 'broadcast:void'
+			| 'watch:output'
+	>(
 		event: K,
 		listener: ChannelManagerEvents[K]
 	): void;
-	off<K extends 'watch:funding' | 'broadcast:tx' | 'watch:output'>(
+	off<
+		K extends
+			| 'watch:funding'
+			| 'broadcast:tx'
+			| 'broadcast:void'
+			| 'watch:output'
+	>(
 		event: K,
 		listener: ChannelManagerEvents[K]
 	): void;
@@ -766,6 +778,10 @@ export class ChainWatcher extends EventEmitter {
 	private failedFundingWatches: IFailedFundingWatch[] = [];
 	private failedOutputWatches: IFailedOutputWatch[] = [];
 	private failedBroadcasts: IFailedBroadcast[] = [];
+	// Transactions the channel manager gave up, which are not retried: the
+	// commitment of an asset channel and its children, once another
+	// transaction spent the funding output in a block.
+	private voidBroadcasts = new Set<string>();
 	private currentBlockHeight = 0;
 	private started = false;
 	/**
@@ -1000,6 +1016,7 @@ export class ChainWatcher extends EventEmitter {
 		this.failedFundingWatches.length = 0;
 		this.failedOutputWatches.length = 0;
 		this.failedBroadcasts.length = 0;
+		this.voidBroadcasts.clear();
 
 		// Detach from the ChannelManager, so a stopped watcher stops acting on
 		// channel events. It used to keep broadcasting after node.destroy().
@@ -1750,6 +1767,14 @@ export class ChainWatcher extends EventEmitter {
 		});
 	};
 
+	/** The channel manager gave these transactions up: they are not retried. */
+	private onBroadcastVoid = (txids: string[]): void => {
+		for (const txid of txids) this.voidBroadcasts.add(txid);
+		this.failedBroadcasts = this.failedBroadcasts.filter(
+			(fb) => !this.voidBroadcasts.has(fb.txidHex)
+		);
+	};
+
 	private onBroadcastTx = (tx: Buffer): void => {
 		if (!Buffer.isBuffer(tx)) {
 			// A non-Buffer payload (e.g. a bitcoin.Transaction emitted by mistake)
@@ -1761,6 +1786,14 @@ export class ChainWatcher extends EventEmitter {
 				new Error('broadcast:tx received a non-Buffer payload; dropped')
 			);
 			return;
+		}
+		// A transaction that was given up and is offered again counts again.
+		if (this.voidBroadcasts.size > 0) {
+			try {
+				this.voidBroadcasts.delete(bitcoin.Transaction.fromBuffer(tx).getId());
+			} catch {
+				// Not a decodable transaction: the failure path below says so.
+			}
 		}
 		const generation = this.lifecycleGeneration;
 		this.broadcastTransaction(tx).catch((err) => {
@@ -1786,6 +1819,7 @@ export class ChainWatcher extends EventEmitter {
 			// Queue for retry on next block, deduped by txid.
 			if (
 				txidHex !== undefined &&
+				!this.voidBroadcasts.has(txidHex) &&
 				!this.failedBroadcasts.some((fb) => fb.txidHex === txidHex)
 			) {
 				this.failedBroadcasts.push({
@@ -1813,6 +1847,7 @@ export class ChainWatcher extends EventEmitter {
 		this.channelManager.on('watch:funding', this.onWatchFunding);
 		// Broadcast transactions (closing/sweep txs)
 		this.channelManager.on('broadcast:tx', this.onBroadcastTx);
+		this.channelManager.on('broadcast:void', this.onBroadcastVoid);
 		// Watch outputs (from chain monitor)
 		this.channelManager.on('watch:output', this.onWatchOutput);
 	}
@@ -1820,6 +1855,7 @@ export class ChainWatcher extends EventEmitter {
 	private unwireChannelManagerEvents(): void {
 		this.channelManager.off('watch:funding', this.onWatchFunding);
 		this.channelManager.off('broadcast:tx', this.onBroadcastTx);
+		this.channelManager.off('broadcast:void', this.onBroadcastVoid);
 		this.channelManager.off('watch:output', this.onWatchOutput);
 	}
 
@@ -1876,6 +1912,7 @@ export class ChainWatcher extends EventEmitter {
 					}
 					// Still failing — re-queue with dedup
 					if (
+						!this.voidBroadcasts.has(fb.txidHex) &&
 						!this.failedBroadcasts.some(
 							(existing) => existing.txidHex === fb.txidHex
 						)
