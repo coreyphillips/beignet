@@ -995,6 +995,11 @@ export class ChainMonitor {
 		// Re-broadcast unconfirmed sweeps stuck in SPEND_BROADCAST
 		const handledSharedSweeps = new Set<string>();
 		for (const output of this._trackedOutputs) {
+			// A spend of an asset channel that still waits for its fee input
+			// never left this node: there is nothing to raise or to send
+			// again, and the rate it will be asked at is left alone. The
+			// blocks to a raise count from the block it really goes out in.
+			if (this._awaitsFeeInput(output)) continue;
 			// HTLC output handling splits by WHOSE commitment confirmed:
 			//
 			// OUR commitment — HTLC resolution uses pre-signed second-level txs
