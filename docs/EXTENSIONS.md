@@ -250,7 +250,7 @@ A fee outside the band is refused locally: nothing is signed, the peer is not se
 
 **A close the node did not sign.** Every spend of the funding output that is not a commitment transaction ends the channel as a cooperative close, also a transaction this node never signed and so holds no asset payload for (`closeTransactions` has no entry for its txid). The channel still ends as `CLOSED`, and the node says which transaction that was: `auxiliaryState.unrecordedCloseTxid` holds its txid in the channel's row, and the `channel:closed` event carries `unrecordedCloseTxid` beside `channelId`. The event fires once, at the close; after a restart the row still holds the txid and the event is not repeated. For a close the node signed, the field is absent from both. The chain monitor's record of the spend says the same: `getChannelMonitorState(channelId).commitmentBroadcast` is a `COOPERATIVE_CLOSE` record with `unrecordedClose: true`, on the running node and after a restart, and the record of a close the node signed has no such key.
 
-## Asset channels
+## Asset channels in a program that embeds the engine
 
 A program that embeds the engine can give its Lightning node an auxiliary channel provider (`INodeConfig.auxiliaryChannels`, an `IAuxiliaryChannelConfig`), and the node then holds asset channels: channels that carry asset units beside bitcoin. That is set where the node is made, not through the extension contract above, whose version 1 does not include the Lightning node. The options a host sets beside the provider are fields of the same object. This section lists the ones that bound what a channel holds, and what a host should watch.
 
