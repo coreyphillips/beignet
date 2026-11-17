@@ -34,6 +34,9 @@ import {
 } from './helpers/auxiliary-on-chain';
 
 /** What Bob takes an HTLC of units to be worth. */
+/** Measured: the block of the commitment after the claim deadline, and the blocks left before the expiry once the claim is in a block. */
+const DEADLINE_COMMITMENT = 1;
+const DEADLINE_SPARE = 15;
 const outcomes: { alice: string[]; bob: string[] } = { alice: [], bob: [] };
 const told =
 	(who: 'alice' | 'bob') =>
@@ -841,4 +844,46 @@ describe('the HTLCs of an asset channel on the chain (issue #2093 step 10)', fun
 			);
 		});
 	}
+	it('closes by itself 18 blocks before the expiry of an HTLC whose settlement could not leave, and has its claim in a block with blocks to spare', async () => {
+		const pair = await opened('aux-htlc-deadline');
+		const held = await holdUnits(pair, 5000n, 'deadline');
+		disconnect(pair);
+		expect(
+			pair.bob.node.settleHeldHtlc(held.paymentHash, held.preimage)
+		).to.equal(false);
+		await settle();
+		// The node force closes on its own 18 blocks before the expiry.
+		const deadline = held.cltvExpiry - 18;
+		await passTo(pair, deadline - 2);
+		await world.mine(pair, 1);
+		expect(pair.chain.height).to.equal(deadline - 1);
+		expect(htlcOf(pair.bob, pair), 'still open').to.equal(undefined);
+		await until(
+			'bob closes the channel by itself',
+			pair,
+			() => htlcOf(pair.bob, pair)?.status !== undefined,
+			6
+		);
+		const tracked = htlcOf(pair.bob, pair)!;
+		await until(
+			'the claim in a block',
+			pair,
+			() => htlcOf(pair.bob, pair)!.status === OutputStatus.SPEND_CONFIRMED,
+			10
+		);
+		const commitment = confirmed(pair, tracked.txid);
+		const claim = confirmed(pair, htlcOf(pair.bob, pair)!.resolutionTxid);
+		if (process.env.AUX_TRACE) {
+			console.log(
+				`deadline case: expiry ${held.cltvExpiry}, deadline ${deadline}, commitment in ${commitment.height}, claim in ${claim.height}`
+			);
+		}
+		expect(commitment.height).to.equal(DEADLINE_COMMITMENT + deadline);
+		expect(claim.height).to.equal(commitment.height + 2);
+		expect(held.cltvExpiry - claim.height).to.equal(DEADLINE_SPARE);
+		expect(claim.tx.ins.length).to.equal(2);
+		expect(htlcOf(pair.bob, pair)!.auxiliaryData!.toString()).to.match(
+			/^sweep:local:\d+:htlc_second_level_success:/
+		);
+	});
 });
