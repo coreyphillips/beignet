@@ -23829,6 +23829,20 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	}
 
 	/**
+	 * Asset channels: the held set of a swap's invoice as the swap provider
+	 * reads it. A swap pays out bitcoin for the bitcoin it holds, and a set
+	 * with an HTLC that holds units is worth what a host said of them. Such
+	 * a set is never complete for a swap, so nothing is funded against it,
+	 * and it is failed back with the invoice like any set that fell short.
+	 */
+	private swapHeldSnapshot(paymentHash: Buffer): IHeldInvoiceSnapshot | null {
+		const snapshot = this.getHeldInvoiceSnapshot(paymentHash);
+		return snapshot?.complete && this.heldSetCarriesUnits(snapshot.parts)
+			? { ...snapshot, complete: false }
+			: snapshot;
+	}
+
+	/**
 	 * Asset channels: whether a part of a parked set is an HTLC that holds
 	 * units. Read from the channel, which is where the units of an HTLC are
 	 * kept, so nothing is stored beside the set to say it.
@@ -32298,7 +32312,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 						description: options.description
 					}).bolt11
 				}),
-				heldSnapshot: (paymentHash) => this.getHeldInvoiceSnapshot(paymentHash),
+				heldSnapshot: (paymentHash) => this.swapHeldSnapshot(paymentHash),
 				hashInUse: (paymentHash) => this.paymentHashInUse(paymentHash),
 				settleHeld: (paymentHash, preimage) =>
 					this.settleHeldHtlc(paymentHash, preimage),
