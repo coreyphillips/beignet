@@ -756,4 +756,69 @@ describe('the HTLCs of an asset channel on the chain (issue #2093 step 10)', fun
 			PaymentStatus.COMPLETED
 		);
 	});
+
+	for (const scenario of [
+		{
+			name: 'a hold invoice the host never decided',
+			tag: 'undecided',
+			cancel: false
+		},
+		{
+			name: 'a hold invoice the host cancelled while the fail back could not leave',
+			tag: 'cancelled',
+			cancel: true
+		}
+	]) {
+		it(`does not claim an HTLC of ${scenario.name}, though a preimage for its hash is stored: the payer takes it back and the host is told it failed`, async () => {
+			const pair = await opened(`aux-htlc-${scenario.tag}`);
+			const held = await holdUnits(pair, 5000n, scenario.tag);
+			if (scenario.cancel) {
+				disconnect(pair);
+				pair.bob.node.cancelHoldInvoice(held.paymentHash);
+				await settle();
+			}
+			// A preimage in the store is not a decision to settle: one that
+			// an earlier settle left behind, say.
+			pair.bob.node
+				.getChannelManager()
+				.recordPreimage(held.paymentHash, held.preimage);
+			const closed = pair.alice.node.forceCloseChannel(
+				pair.channelId,
+				SWEEP_DESTINATION
+			);
+			expect(closed.ok, closed.error).to.equal(true);
+			await settle();
+			await world.mine(pair, 3);
+			trace(pair, 'bob', scenario.tag);
+			const kept = htlcOf(pair.bob, pair)!;
+			expect(kept.outputType).to.equal(OutputType.RECEIVED_HTLC);
+			expect(kept.status).to.equal(OutputStatus.CONFIRMED);
+			expect(kept.sweepTxHex).to.equal(undefined);
+			expect(kept.auxiliaryFeeWait).to.equal(undefined);
+			// No fee input was asked for: nothing left Bob's wallet.
+			expect(pair.wallets.bob!.sent).to.have.length(0);
+
+			await passTo(pair, held.cltvExpiry - 1);
+			await until('the HTLC-timeout of the payer in a block', pair, () =>
+				isSpent(htlcOf(pair.alice, pair))
+			);
+			const taken = htlcOf(pair.bob, pair)!;
+			expect(taken.resolutionTxid).to.equal(
+				htlcOf(pair.alice, pair)!.resolutionTxid
+			);
+			expect(pair.wallets.bob!.sent).to.have.length(0);
+			await passTo(pair, pair.chain.height + IRREVOCABLE_DEPTH);
+			await world.mine(pair, 2);
+			await settle();
+			expect(outcomes.bob).to.deep.equal(['RECEIVED:failed:5000']);
+			expect(outcomes.alice).to.deep.equal(['OFFERED:failed:5000']);
+			expect(parkedOf(pair.bob, held.paymentHash)).to.equal(0);
+			expect(pair.bob.node.getPayment(held.paymentHash)?.status).to.not.equal(
+				PaymentStatus.COMPLETED
+			);
+			expect(pair.alice.node.getPayment(held.paymentHash)!.status).to.equal(
+				PaymentStatus.FAILED
+			);
+		});
+	}
 });

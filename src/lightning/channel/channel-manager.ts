@@ -4324,6 +4324,8 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 
 			this.recordAuxiliaryChainEndings(channelIdHex);
 
+			this._installSettleDecision(channelIdHex, monitor);
+
 			if (actions.length > 0) {
 				const channelId = Buffer.from(channelIdHex, 'hex');
 				this.processChainActions(channelId, actions);
@@ -4504,6 +4506,8 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 	recordPreimage(paymentHash: Buffer, preimage: Buffer): void {
 		this._knownPreimages.set(paymentHash.toString('hex'), preimage);
 		for (const [channelIdHex, monitor] of this.monitors) {
+			this._installSettleDecision(channelIdHex, monitor);
+
 			// A monitor that does not want it stores and builds nothing, so it
 			// is not saved either. A stub that cannot answer is fed as before.
 			if (
@@ -4580,9 +4584,12 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 	private _seedMonitorPreimages(
 		channelIdHex: string,
 		monitor: ChainMonitor,
+
 		changed = false
 	): void {
+		this._installSettleDecision(channelIdHex, monitor);
 		if (this._knownPreimages.size === 0) return;
+
 		const channelId = Buffer.from(channelIdHex, 'hex');
 		const pendingActions: ChainAction[] = [];
 		const fullyResolved =
@@ -11869,6 +11876,44 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 	 * answers nothing, or throws, has written nothing.
 	 */
 	private readonly _auxiliaryResolutionsInFlight = new Set<string>();
+
+	/**
+	 * Asset channels: says whether the node decided to settle the HTLCs of
+	 * a payment hash on a channel. Given by the node; without it no claim
+	 * by preimage is made on an asset channel that is on chain.
+	 */
+	private _auxiliarySettleDecision?: (
+		channelId: Buffer,
+		paymentHash: Buffer
+	) => boolean;
+
+	setAuxiliarySettleDecision(
+		decision: (channelId: Buffer, paymentHash: Buffer) => boolean
+	): void {
+		this._auxiliarySettleDecision = decision;
+	}
+
+	/** Give a monitor the way to ask whether a settle was decided. */
+	private _installSettleDecision(
+		channelIdHex: string,
+		monitor: ChainMonitor
+	): void {
+		if (typeof monitor.setAuxiliarySettleDecided !== 'function') return;
+		const channelId = Buffer.from(channelIdHex, 'hex');
+		monitor.setAuxiliarySettleDecided(
+			(paymentHash) =>
+				this._auxiliarySettleDecision?.(channelId, paymentHash) === true
+		);
+	}
+
+	/** Whether an asset channel has a commitment on the chain, or is closing there. */
+	auxiliaryChannelOnChain(channelId: Buffer): boolean {
+		const hex = channelId.toString('hex');
+		return (
+			this.monitors.has(hex) &&
+			this.channels.get(hex)?.getFullState().auxiliaryState !== undefined
+		);
+	}
 
 	/**
 	 * Per channel, the last outcome a pass tried when the host's refusals

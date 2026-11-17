@@ -2302,6 +2302,9 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				}
 			}
 		});
+		this.channelManager.setAuxiliarySettleDecision((channelId, paymentHash) =>
+			this.auxiliarySettleDecided(channelId, paymentHash)
+		);
 		// Let the channel manager attach wallet inputs for anchor fee bumps
 		// (zero-fee second-level HTLC txs and commitment CPFP).
 		this.channelManager.setFundingProvider(this.fundingProvider);
@@ -23804,7 +23807,15 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		// not reveal the preimage or report settlement for a set they removed.
 		if (this.heldHtlcs.get(hashHex) !== held) return false;
 		this.preimages.set(hashHex, pre);
-		this.channelManager.recordPreimage(paymentHash, pre);
+
+		// The settle is chosen from here on, for whoever asks while the
+		// preimage is handed over (auxiliarySettleDecided).
+		this.auxiliarySettleChosen.add(hashHex);
+		try {
+			this.channelManager.recordPreimage(paymentHash, pre);
+		} finally {
+			this.auxiliarySettleChosen.delete(hashHex);
+		}
 
 		this.resolvingHeldHtlcs.add(hashHex);
 		const prior = this.heldResolutions.get(hashHex);
@@ -23843,6 +23854,14 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 					refused.push(h);
 					continue;
 				}
+
+				if (this.channelManager.auxiliaryChannelOnChain(h.channelId)) {
+					// On chain no fulfil can be made: the settle chosen here
+					// is what the claim there waits for.
+					refused.push(h);
+					continue;
+				}
+
 				const result = this.channelManager.fulfillHtlc(
 					h.channelId,
 					h.htlcId,
@@ -23873,7 +23892,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			// chosen. The preimage is stored and the channel owes the
 			// fulfil, which the node asks for again from its periodic work
 			// and at each block, so the set is not open to a cancel.
-			if (!prior && !providerRefused) {
+			if (!prior && !providerRefused && !carriesUnits) {
 				this.heldResolutions.delete(hashHex);
 				this.persistHeldHtlcs();
 			}
@@ -33062,6 +33081,54 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				clamped
 			});
 		});
+	}
+
+	/** Hold invoices whose settle is being chosen in this very call. */
+	private readonly auxiliarySettleChosen = new Set<string>();
+
+	/**
+	 * Asset channels: whether this node decided to settle the HTLCs of a
+	 * payment hash on a channel that is on chain (issue #2093 step 10). A
+	 * stored preimage is not a decision. A part parked for a hold invoice
+	 * is decided when the host chose to settle the hold, and not while the
+	 * hold is undecided or cancelled. Without a parked part, a payment is
+	 * decided where its fulfil was made in the channel; otherwise a hold
+	 * invoice is not, and any other payment is when the node holds its
+	 * preimage.
+	 */
+	private auxiliarySettleDecided(
+		channelId: Buffer,
+		paymentHash: Buffer
+	): boolean {
+		const hashHex = paymentHash.toString('hex');
+		const parked = (this.heldHtlcs.get(hashHex) ?? []).some((h) =>
+			h.channelId.equals(channelId)
+		);
+		if (parked) {
+			return (
+				this.auxiliarySettleChosen.has(hashHex) ||
+				this.heldResolutions.get(hashHex)?.outcome === 'settle'
+			);
+		}
+		const state = this.channelManager.getChannel(channelId)?.getFullState();
+		if (
+			state &&
+			[...state.htlcs.values()].some(
+				(entry) =>
+					entry.direction === HtlcDirection.RECEIVED &&
+					entry.state === HtlcState.FULFILLED &&
+					entry.paymentHash.equals(paymentHash)
+			)
+		) {
+			return true;
+		}
+		const invoice = this.invoices.get(hashHex) as
+			| { hold?: boolean }
+			| undefined;
+		if (this.heldInvoiceHashes.has(hashHex) || invoice?.hold === true) {
+			return false;
+		}
+		return this.preimages.has(hashHex);
 	}
 
 	/**

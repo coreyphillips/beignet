@@ -206,7 +206,7 @@ export class ChainMonitor {
 						this._commitmentBroadcast.commitmentNumber,
 						this._destinationScript,
 						this._feeRatePerVbyte,
-						this._knownPreimages,
+						this._claimPreimages(),
 						this._delayedPaymentBasepointSecret,
 						this._htlcBasepointSecret,
 						this._channelState.remoteHtlcSignatures
@@ -218,7 +218,7 @@ export class ChainMonitor {
 						held,
 						this._destinationScript,
 						this._feeRatePerVbyte,
-						this._knownPreimages,
+						this._claimPreimages(),
 						this._paymentPrivkey,
 						this._htlcBasepointSecret,
 						this._theirCurrentPoint()
@@ -232,7 +232,7 @@ export class ChainMonitor {
 						held.filter((o) => o.outputType === OutputType.TO_REMOTE),
 						this._destinationScript,
 						this._feeRatePerVbyte,
-						this._knownPreimages,
+						this._claimPreimages(),
 						this._paymentPrivkey,
 						this._htlcBasepointSecret,
 						this._channelState.dlpRemotePerCommitmentPoint ??
@@ -1756,10 +1756,55 @@ export class ChainMonitor {
 	 */
 	wantsPreimage(paymentHash: Buffer): boolean {
 		if (this._state === MonitorState.FULLY_RESOLVED) return false;
+
+		if (!this._settleDecided(paymentHash)) return false;
+
 		for (const hash of this._ownPaymentHashes()) {
 			if (hash.equals(paymentHash)) return true;
 		}
 		return false;
+	}
+
+	/**
+	 * Asset channels: says whether this node decided to settle the HTLCs
+	 * of a payment hash. Given by the channel manager.
+	 */
+	private _auxiliarySettleDecided?: (paymentHash: Buffer) => boolean;
+
+	setAuxiliarySettleDecided(decided: (paymentHash: Buffer) => boolean): void {
+		this._auxiliarySettleDecided = decided;
+	}
+
+	/**
+	 * Whether a claim may be made with the preimage of a payment hash. On
+	 * an asset channel a stored preimage is not a decision to settle: the
+	 * node must have decided (an ordinary invoice it holds the preimage
+	 * for, a hold invoice whose settle was chosen), and while nobody can
+	 * say, the answer is no. Always yes for any other channel.
+	 */
+	private _settleDecided(paymentHash: Buffer): boolean {
+		if (!this._channelState.auxiliaryState) return true;
+		try {
+			return this._auxiliarySettleDecided?.(paymentHash) === true;
+		} catch {
+			return false;
+		}
+	}
+
+	/**
+	 * The preimages a claim may be made with: every one this monitor knows,
+	 * and on an asset channel only those of payments this node decided to
+	 * settle.
+	 */
+	private _claimPreimages(): Map<string, Buffer> {
+		if (!this._channelState.auxiliaryState) return this._knownPreimages;
+		const allowed = new Map<string, Buffer>();
+		for (const [hashHex, preimage] of this._knownPreimages) {
+			if (this._settleDecided(Buffer.from(hashHex, 'hex'))) {
+				allowed.set(hashHex, preimage);
+			}
+		}
+		return allowed;
 	}
 
 	/** Hex payment hashes wantsPreimage answers true for. */
@@ -1847,7 +1892,7 @@ export class ChainMonitor {
 				this._commitmentBroadcast!.commitmentNumber,
 				this._destinationScript,
 				this._feeRatePerVbyte,
-				this._knownPreimages,
+				this._claimPreimages(),
 				this._delayedPaymentBasepointSecret,
 				// HTLC-success on our own commitment is a second-level tx that
 				// needs OUR htlc signature plus the peer's pre-supplied htlc
@@ -1886,6 +1931,16 @@ export class ChainMonitor {
 						if (r.trackedOutput.maturityHeight === undefined) {
 							r.trackedOutput.maturityHeight = this._currentBlockHeight;
 						}
+
+						// The action above was made before the spend was stored:
+						// it is made again, with the spend in it.
+						actions.pop();
+						actions.push(
+							this._fixedOutputFeeAction(
+								r.trackedOutput,
+								'HTLC-success (preimage learned)'
+							)
+						);
 					}
 				}
 			}
@@ -1902,7 +1957,7 @@ export class ChainMonitor {
 				htlcOutputs,
 				this._destinationScript,
 				this._feeRatePerVbyte,
-				this._knownPreimages,
+				this._claimPreimages(),
 				this._paymentPrivkey,
 				this._htlcBasepointSecret,
 				this._theirCurrentPoint()
@@ -2145,7 +2200,7 @@ export class ChainMonitor {
 						this._commitmentBroadcast.commitmentNumber,
 						this._destinationScript,
 						feeRatePerVbyte,
-						this._knownPreimages,
+						this._claimPreimages(),
 						this._delayedPaymentBasepointSecret,
 						this._htlcBasepointSecret,
 						this._channelState.remoteHtlcSignatures
@@ -2156,7 +2211,7 @@ export class ChainMonitor {
 						[output],
 						this._destinationScript,
 						feeRatePerVbyte,
-						this._knownPreimages,
+						this._claimPreimages(),
 						this._paymentPrivkey,
 						this._htlcBasepointSecret,
 						this._theirCurrentPoint()
@@ -2830,7 +2885,7 @@ export class ChainMonitor {
 			commitmentNumber,
 			this._destinationScript,
 			this._feeRatePerVbyte,
-			this._knownPreimages,
+			this._claimPreimages(),
 			this._delayedPaymentBasepointSecret,
 			this._htlcBasepointSecret,
 			this._channelState.remoteHtlcSignatures
@@ -2867,7 +2922,7 @@ export class ChainMonitor {
 			this._trackedOutputs,
 			this._destinationScript,
 			this._feeRatePerVbyte,
-			this._knownPreimages,
+			this._claimPreimages(),
 			this._paymentPrivkey,
 			this._htlcBasepointSecret,
 			this._theirCurrentPoint()
@@ -2913,7 +2968,7 @@ export class ChainMonitor {
 			toRemoteOutputs,
 			this._destinationScript,
 			this._feeRatePerVbyte,
-			this._knownPreimages,
+			this._claimPreimages(),
 			this._paymentPrivkey,
 			this._htlcBasepointSecret,
 			// The reestablish-supplied point (kept for legacy completeness). The
@@ -3042,7 +3097,7 @@ export class ChainMonitor {
 						this._commitmentBroadcast.commitmentNumber,
 						this._destinationScript,
 						feeRatePerVbyte,
-						this._knownPreimages,
+						this._claimPreimages(),
 						this._delayedPaymentBasepointSecret,
 						this._htlcBasepointSecret,
 						this._channelState.remoteHtlcSignatures
@@ -3054,7 +3109,7 @@ export class ChainMonitor {
 						[output],
 						this._destinationScript,
 						feeRatePerVbyte,
-						this._knownPreimages,
+						this._claimPreimages(),
 						this._paymentPrivkey,
 						this._htlcBasepointSecret,
 						this._theirCurrentPoint()
@@ -3069,7 +3124,7 @@ export class ChainMonitor {
 						[output],
 						this._destinationScript,
 						feeRatePerVbyte,
-						this._knownPreimages,
+						this._claimPreimages(),
 						this._paymentPrivkey,
 						this._htlcBasepointSecret,
 						this._channelState.dlpRemotePerCommitmentPoint ??
@@ -4037,7 +4092,7 @@ export class ChainMonitor {
 				retryable,
 				this._destinationScript,
 				this._feeRatePerVbyte,
-				this._knownPreimages,
+				this._claimPreimages(),
 				this._paymentPrivkey,
 				this._htlcBasepointSecret,
 				currentCommitment
@@ -4104,7 +4159,7 @@ export class ChainMonitor {
 				broadcast.commitmentNumber,
 				this._destinationScript,
 				this._feeRatePerVbyte,
-				this._knownPreimages,
+				this._claimPreimages(),
 				this._delayedPaymentBasepointSecret,
 				this._htlcBasepointSecret,
 				this._channelState.remoteHtlcSignatures
