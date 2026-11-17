@@ -9161,7 +9161,8 @@ export class Channel {
 	 * once nothing else can refuse the shutdown.
 	 */
 	private _prepareAuxiliaryShutdown(
-		destinationScript: Buffer
+		destinationScript: Buffer,
+		peerScript: Buffer | null = this._state.remoteShutdownScript
 	):
 		| { scriptPubkey: Buffer; customRecords: Map<bigint, Buffer> }
 		| { refusal: ChannelAction[] } {
@@ -9188,6 +9189,18 @@ export class Channel {
 				throw new Error('Invalid asset shutdown script');
 			}
 			const scriptPubkey = Buffer.from(prepared.scriptPubkey);
+			// One script is never named by both parties: the closing
+			// transaction would hold two outputs nothing but their values
+			// tells apart.
+			if (
+				peerScript &&
+				peerScript.length > 0 &&
+				scriptPubkey.equals(peerScript)
+			) {
+				throw new Error(
+					'Asset shutdown script is the script the peer closes to'
+				);
+			}
 			const customRecords =
 				copyCustomRecords(prepared.customRecords) ?? new Map<bigint, Buffer>();
 			// The reader's rules, before anything is sent: what leaves is what
@@ -9432,6 +9445,19 @@ export class Channel {
 					'Invalid asset shutdown descriptor'
 				);
 			}
+			// The peer chooses its script, and it may not choose ours: the
+			// two payouts of the close would be told apart by nothing but
+			// their values. It knew ours when it sent this, so it is told.
+			const ownScript = this._state.localShutdownScript;
+			if (
+				ownScript &&
+				ownScript.length > 0 &&
+				ownScript.equals(msg.scriptPubkey)
+			) {
+				return this._failChannelWithWireError(
+					'Asset shutdown script is the script this node closes to'
+				);
+			}
 			const previous = auxiliary.remoteShutdownRecords;
 			if (
 				previous &&
@@ -9444,7 +9470,8 @@ export class Channel {
 			}
 			if (this._state.state === ChannelState.NORMAL) {
 				const prepared = this._prepareAuxiliaryShutdown(
-					localScript ?? this._state.localShutdownScript ?? Buffer.alloc(0)
+					localScript ?? this._state.localShutdownScript ?? Buffer.alloc(0),
+					msg.scriptPubkey
 				);
 				if ('refusal' in prepared) return prepared.refusal;
 				ownAssetShutdown = prepared;

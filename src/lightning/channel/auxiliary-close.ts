@@ -40,11 +40,17 @@ const isTaprootScript = (script: unknown): script is Buffer =>
  * nothing, for a channel without asset state. Throws when the provider
  * cannot answer or its answer would lose either party's funds. Stores
  * nothing: see recordAuxiliaryClose.
+ *
+ * `outputMap` is the builder's own account of which output it made for
+ * which party (buildClosingTx). It is the only source of the two indexes
+ * the provider is handed: two outputs are never told apart by their
+ * scripts, which a peer chooses.
  */
 export function applyAuxiliaryClose(
 	state: IChannelState,
 	transaction: bitcoin.Transaction,
-	feeSatoshis: bigint
+	feeSatoshis: bigint,
+	outputMap: { local?: number; remote?: number }
 ): Buffer | undefined {
 	const auxiliary = state.auxiliaryState;
 	if (!auxiliary) {
@@ -57,17 +63,17 @@ export function applyAuxiliaryClose(
 	if (!auxiliary.localShutdownRecords || !auxiliary.remoteShutdownRecords) {
 		throw new Error('Asset close requires both shutdown descriptors');
 	}
-	const taken = new Set<number>();
-	const find = (script: Buffer | null): number | undefined => {
-		const index = transaction.outs.findIndex(
-			(out, candidate) => !taken.has(candidate) && script?.equals(out.script)
-		);
-		if (index < 0) return undefined;
-		taken.add(index);
-		return index;
-	};
-	const localOutputIndex = find(state.localShutdownScript);
-	const remoteOutputIndex = find(state.remoteShutdownScript);
+	if (
+		!state.localShutdownScript ||
+		!state.remoteShutdownScript ||
+		state.localShutdownScript.equals(state.remoteShutdownScript)
+	) {
+		// The shutdown exchange refuses a script named by both parties. A
+		// row that holds one all the same closes on chain, not here.
+		throw new Error('Asset close requires two different payout scripts');
+	}
+	const localOutputIndex = outputMap.local;
+	const remoteOutputIndex = outputMap.remote;
 	const opener = state.role === ChannelRole.OPENER;
 	const localAmount =
 		state.localBalanceMsat / 1000n - (opener ? feeSatoshis : 0n);
@@ -75,6 +81,30 @@ export function applyAuxiliaryClose(
 		state.remoteBalanceMsat / 1000n - (opener ? 0n : feeSatoshis);
 	if (localAmount < 0n || remoteAmount < 0n) {
 		throw new Error('Asset close fee exceeds balance');
+	}
+	// Each index has to hold its party's amount, and every output has to be
+	// one party's, before the provider is told which is whose: an asset
+	// commitment laid over the wrong output pays one party's bitcoin to the
+	// other.
+	const mapped = [
+		[localOutputIndex, localAmount],
+		[remoteOutputIndex, remoteAmount]
+	] as const;
+	for (const [index, amount] of mapped) {
+		if (index === undefined) continue;
+		const output = Number.isSafeInteger(index)
+			? transaction.outs[index]
+			: undefined;
+		if (!output || BigInt(output.value) !== amount) {
+			throw new Error('Asset close payout index does not hold its amount');
+		}
+	}
+	if (
+		localOutputIndex === remoteOutputIndex ||
+		transaction.outs.length !==
+			mapped.filter(([index]) => index !== undefined).length
+	) {
+		throw new Error('Asset close payout index does not hold its amount');
 	}
 	const result = provider.buildClose({
 		state,
@@ -241,7 +271,7 @@ export function auxiliaryClosingRelayProfile(
 	feeSatoshis: bigint
 ): { weight: number; feePaid: bigint } {
 	const opener = state.role === ChannelRole.OPENER;
-	const { tx } = buildClosingTx({
+	const { tx, outputMap } = buildClosingTx({
 		fundingTxid: state.fundingTxid!.toString('hex'),
 		fundingOutputIndex: state.fundingOutputIndex!,
 		fundingAmount: state.fundingSatoshis,
@@ -254,7 +284,7 @@ export function auxiliaryClosingRelayProfile(
 		remoteDustLimit: state.remoteConfig.dustLimitSatoshis,
 		sequence: 0xfffffffd
 	});
-	applyAuxiliaryClose(state, tx, feeSatoshis);
+	applyAuxiliaryClose(state, tx, feeSatoshis, outputMap);
 	tx.setWitness(0, [Buffer.alloc(64)]);
 	return {
 		weight: tx.weight(),

@@ -6550,7 +6550,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			? remoteBalanceSat
 			: remoteBalanceSat - feeSatoshis;
 
-		const { tx } = buildClosingTx({
+		const { tx, outputMap } = buildClosingTx({
 			fundingTxid: state.fundingTxid!.toString('hex'),
 			fundingOutputIndex: state.fundingOutputIndex!,
 			fundingAmount: state.fundingSatoshis,
@@ -6568,8 +6568,14 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 
 		// An asset channel: its provider lays the asset outputs over the
 		// payouts before anything is signed or verified. Nothing is touched
-		// for any other channel.
-		const auxiliaryCloseData = applyAuxiliaryClose(state, tx, feeSatoshis);
+		// for any other channel. Which output is whose comes from the
+		// builder's own map, never from a search for a script.
+		const auxiliaryCloseData = applyAuxiliaryClose(
+			state,
+			tx,
+			feeSatoshis,
+			outputMap
+		);
 
 		const { witnessScript } = createFundingScript(
 			state.localBasepoints.fundingPubkey,
