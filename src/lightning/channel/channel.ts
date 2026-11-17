@@ -10014,11 +10014,20 @@ export class Channel {
 		// of the two sides' committed rates): the initiator picks its own
 		// closing feerate, which may exceed our stale local config, so a band
 		// keyed only to our local feerate would reject legitimate offers.
+		//
+		// An asset channel is a taproot channel, whose two commitment feerates
+		// are pinned at the 253 sat/kw floor, while the proposer prices the
+		// close at its live feerate: a band built from the committed rates
+		// refuses every honest proposal above a few sat/vB. For an asset
+		// channel the band is built from this node's own live closing
+		// feerate, the estimate it would propose with itself.
+		const liveBand = !!this._state.auxiliaryState;
 		const bandFeeRate = BigInt(
 			Math.max(
 				this._state.localConfig.feeratePerKw || 253,
 				this._state.remoteConfig.feeratePerKw || 253,
-				253
+				253,
+				liveBand ? Math.ceil(this.getClosingFeeratePerKw()) : 0
 			)
 		);
 		const bandLocalLen = this._state.localShutdownScript?.length ?? 22;
@@ -10032,7 +10041,9 @@ export class Channel {
 		// close leaves CLOSED with a tx no mempool takes and no RBF to replace
 		// it (issue #579).
 		const relayFloor = minRelayFeeForWeight(bandWeight);
-		const bandFloor = idealFee / 5n;
+		// An asset channel takes any fee that relays: a fee below this node's
+		// estimate is slow, and either party can still bump its own output.
+		const bandFloor = liveBand ? 0n : idealFee / 5n;
 		const minAcceptableFee = bandFloor > relayFloor ? bandFloor : relayFloor;
 		// The fee comes out of the OPENER's output only. When WE are the opener the
 		// fee is paid from OUR balance, so bound it tightly (the legacy 2x cap) and
@@ -10045,7 +10056,13 @@ export class Channel {
 		const openerBalanceSat = isOpener
 			? this._state.localBalanceMsat / 1000n
 			: this._state.remoteBalanceMsat / 1000n;
-		const maxAcceptableFee = isOpener ? idealFee * 2n : idealFee * 5n;
+		// An asset channel, where the estimate is live and two honest nodes
+		// read the mempool apart: a fee the peer pays is taken up to ten times
+		// this node's estimate. A fee this node pays keeps the 2x cap, and
+		// the arms below keep what the node must keep of its balance.
+		const maxAcceptableFee = isOpener
+			? idealFee * 2n
+			: idealFee * (liveBand ? 10n : 5n);
 		if (
 			msg.feeSatoshis > maxAcceptableFee ||
 			msg.feeSatoshis < minAcceptableFee

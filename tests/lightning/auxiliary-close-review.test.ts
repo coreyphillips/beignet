@@ -497,4 +497,82 @@ describe('The cooperative close of an asset channel under review (#2093)', funct
 			ChannelState.NEGOTIATING_CLOSING
 		);
 	});
+
+	// The live closing feerate of a node, as its fee estimate would set it.
+	const atRate = (host: IAssetHost, satPerKw: number): void => {
+		(
+			host.node.getChannelManager() as unknown as {
+				config: { getClosingFeeratePerKw?: () => number };
+			}
+		).config.getClosingFeeratePerKw = () => satPerKw;
+	};
+	for (const [proposer, responder] of [
+		[4000, 4000],
+		[20_000, 20_000],
+		// Two honest nodes that read the mempool apart.
+		[20_000, 4000],
+		[1000, 20_000]
+	] as const) {
+		it(`closes at the live feerate: proposed at ${proposer} sat/kw to a node that estimates ${responder}`, async () => {
+			const made = await pair(`review9-rate-${proposer}-${responder}`);
+			const { alice, bob, channelId } = made;
+			atRate(alice, proposer);
+			atRate(bob, responder);
+			expect(alice.node.closeChannel(channelId, DESTINATION)).to.deep.equal({
+				ok: true
+			});
+			await settle();
+			expect(
+				made.managerErrors.alice.concat(made.managerErrors.bob)
+			).to.deep.equal([]);
+			for (const host of [alice, bob]) {
+				expect(stateOf(host, channelId).state).to.equal(ChannelState.CLOSED);
+			}
+			expect(made.published.alice).to.have.length(1);
+			const tx = bitcoin.Transaction.fromHex(made.published.alice[0]);
+			const fee =
+				Number(stateOf(alice, channelId).fundingSatoshis) -
+				tx.outs.reduce((sum, out) => sum + out.value, 0);
+			expect(BigInt(fee)).to.equal(
+				stateOf(alice, channelId).lastProposedClosingFeeSat
+			);
+			// The fee is the proposer's feerate for the transaction, far
+			// above what the pinned commitment feerate of 253 sat/kw gives.
+			expect((fee * 1000) / tx.weight()).to.be.within(
+				proposer * 0.9,
+				proposer * 1.15
+			);
+		});
+	}
+
+	it('still refuses a fee far above its own estimate, as a local matter that leaves the channel whole', async () => {
+		const made = await pair('review9-rate-absurd');
+		const { alice, bob, channelId } = made;
+		atRate(alice, 200_000);
+		atRate(bob, 4000);
+		expect(alice.node.closeChannel(channelId, DESTINATION)).to.deep.equal({
+			ok: true
+		});
+		await settle();
+		expect(made.managerErrors.bob).to.have.length(1);
+		const refusal =
+			/Taproot closing fee (\d+) outside acceptable range \[(\d+), (\d+)\]/.exec(
+				made.managerErrors.bob[0]
+			)!;
+		expect(refusal, made.managerErrors.bob[0]).to.not.equal(null);
+		const [fee, floor, ceiling] = refusal.slice(1).map(Number);
+		expect(fee).to.be.above(ceiling);
+		// Ten times this node's own estimate at 4000 sat/kw, and down to the
+		// relay floor of 253 sat/kw.
+		expect(ceiling / floor).to.be.within(150, 165);
+		// Nothing is signed, and the peer is not blamed for our estimate.
+		expect(sent(made, 'bob')).to.not.include(MessageType.CLOSING_SIGNED);
+		expect(sent(made, 'bob')).to.not.include(MessageType.ERROR);
+		expect(made.published).to.deep.equal({ alice: [], bob: [] });
+		for (const host of [alice, bob]) {
+			expect(stateOf(host, channelId).state).to.equal(
+				ChannelState.NEGOTIATING_CLOSING
+			);
+		}
+	});
 });

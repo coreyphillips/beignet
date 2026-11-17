@@ -232,3 +232,17 @@ A daemon whose database holds asset channels does not start without the provider
 - `GET /extensions` (scope `readonly`; CLI `beignet extensions`) answers `{ api, extensions }`. An engine without the contract answers `404`.
 - A supervisor that decides whether to name an extension before it starts the daemon can look for the literal `beignet-extension-api/1` in the installed `dist/cli/extension.js`.
 - The asset channel members have no marker of their own. An extension that supplies them finds out at run time: `bind` is called before `start()` on an engine that reads them, and never on one that does not.
+
+## The cooperative close of an asset channel
+
+An asset channel is a channel a host's asset provider keeps state for. Its cooperative close is the engine's taproot close in one round: the opener proposes a fee, and the other node signs the same transaction or refuses.
+
+**The fee a node accepts.** The node that answers a proposal accepts a fee inside a band it builds from its own live closing feerate (the fee estimate it would propose with itself, never below the channel's commitment feerate) and the weight of the closing transaction with the provider's outputs:
+
+| Bound | Value |
+| --- | --- |
+| Lowest fee | the relay floor for the transaction's weight (253 sat/kw) |
+| Highest fee, paid by the peer | ten times the node's own estimate |
+| Highest fee, paid by this node | twice the node's own estimate, and never more than its balance less the dust limit of its own output |
+
+A fee outside the band is refused locally: nothing is signed, the peer is not sent an error, the channel stays in `NEGOTIATING_CLOSING`, and a reconnect starts a new round with a new proposal. A fee that would take this node's output below its dust limit, or that the opener's balance cannot pay, fails the channel as on any other taproot channel. An ordinary channel keeps the engine's own band, built from the commitment feerates.
