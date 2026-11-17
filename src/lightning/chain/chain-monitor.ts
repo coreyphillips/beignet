@@ -2106,7 +2106,13 @@ export class ChainMonitor {
 			tx: Buffer.from(output.sweepTxHex ?? '', 'hex'),
 			description,
 			feeratePerVbyte: output.currentFeeRate || this._feeRatePerVbyte,
-			fixedOutput: { txid: output.txid, outputIndex: output.outputIndex }
+			fixedOutput: {
+				txid: output.txid,
+				outputIndex: output.outputIndex,
+				...(output.outputType === OutputType.RECEIVED_HTLC && output.cltvExpiry
+					? { deadlineHeight: output.cltvExpiry }
+					: {})
+			}
 		};
 	}
 

@@ -92,6 +92,8 @@ import {
 	CommitmentType,
 	IRREVOCABLE_DEPTH,
 	OutputType,
+	FIXED_OUTPUT_FEE_TIMING,
+	fixedOutputFeeWaitMakesDeadline,
 	fixedOutputHtlcFeeActionId,
 	parseFixedOutputHtlcFeeActionId,
 	satPerVbyteToSatPerKw
@@ -13089,14 +13091,36 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 				return;
 			}
 
+			// Waiting is no remedy once it cannot make the deadline, and the
+			// node says so once.
+			const late =
+				remedy === 'wait' &&
+				spent.deadlineHeight !== undefined &&
+				!fixedOutputFeeWaitMakesDeadline(
+					this._currentBlockHeight,
+					spent.deadlineHeight
+				);
 			monitor.noteFixedOutputFeeWait(
 				spent.txid,
 				spent.outputIndex,
-				{ code, remedy, message },
+				{
+					code,
+					remedy: late ? 'none' : remedy,
+					message: late
+						? `${message} (the deadline at height ${spent.deadlineHeight} was reached while it waited)`
+						: message
+				},
 				this._currentBlockHeight
 			);
 
 			this.emit('monitor:updated', channelIdHex, monitor);
+			if (late) {
+				say(
+					`late:${code}`,
+					`The spend of output ${spent.txid}:${spent.outputIndex} of an asset channel still has no fee input (${code}) and its deadline at height ${spent.deadlineHeight} was reached: the peer can now take the output back. The spend goes out as soon as a fee input is there.`
+				);
+				return;
+			}
 			say(
 				code,
 				`The spend of output ${spent.txid}:${spent.outputIndex} of an asset channel waits for a fee input (${code}): ${message} (channel ${channelIdHex})`
@@ -13134,7 +13158,19 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 				{
 					fixedOutputs: true,
 					feeActionId,
-					confirmedOnly: true,
+					// Near its deadline a spend may take a coin of the pool's
+					// own split before the split has confirmed.
+					confirmedOnly: !(
+						spent.deadlineHeight !== undefined &&
+						spent.deadlineHeight - this._currentBlockHeight <=
+							FIXED_OUTPUT_FEE_TIMING.unconfirmedCoinBlocks
+					),
+					...(this._currentBlockHeight > 0
+						? { blockHeight: this._currentBlockHeight }
+						: {}),
+					...(spent.deadlineHeight !== undefined
+						? { deadlineHeight: spent.deadlineHeight }
+						: {}),
 					...(replaced.length > 0 ? { replacementInputs: replaced } : {})
 				}
 			);

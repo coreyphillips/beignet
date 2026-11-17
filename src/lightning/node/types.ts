@@ -125,6 +125,10 @@ export interface IFeeBumpSelectionOpts {
 	maxFeeSatoshis?: bigint;
 	excludeTxids?: readonly string[];
 	confirmedOnly?: boolean;
+	/** The height of the chain as the caller knows it: the clock a split that does not confirm is replaced by. */
+	blockHeight?: number;
+	/** The height by which the spend has to be confirmed, when it has one. */
+	deadlineHeight?: number;
 	replacementInputs?: readonly {
 		txid: string;
 		vout: number;

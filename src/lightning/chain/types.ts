@@ -360,7 +360,12 @@ export interface IFeeBumpAndBroadcastChainAction {
 	 * spends. The outputs of `tx` stay as they are, wallet inputs bring the
 	 * whole fee, and the fee pool is asked under the identity of this output.
 	 */
-	fixedOutput?: { txid: string; outputIndex: number };
+	fixedOutput?: {
+		txid: string;
+		outputIndex: number;
+		/** The height by which the spend has to be confirmed, when it has one. */
+		deadlineHeight?: number;
+	};
 
 	tx: Buffer;
 	description: string;
@@ -511,3 +516,32 @@ export function satPerVbyteToSatPerKw(satPerVbyte: number): number {
 export function satPerKwToSatPerVbyte(satPerKw: number): number {
 	return Math.ceil((satPerKw * 4) / 1000);
 }
+
+/**
+ * When the fee coin pool and the chain code act for a spend of an asset
+ * channel that waits on a split, in blocks.
+ */
+export const FIXED_OUTPUT_FEE_TIMING = {
+	/** A split that has not confirmed is replaced by one that pays more this many blocks after it went out. */
+	splitRaiseBlocks: 6,
+	/** The same, when the spend that waits has a deadline within nearDeadlineBlocks. */
+	splitRaiseBlocksNearDeadline: 2,
+	/** A deadline is near from this many blocks before it. */
+	nearDeadlineBlocks: 18,
+	/**
+	 * A spend whose deadline is within this many blocks may take a coin of
+	 * the pool's own split before the split has confirmed.
+	 */
+	unconfirmedCoinBlocks: 6
+} as const;
+
+/**
+ * Whether waiting can still have a spend confirmed by its deadline, with
+ * the chain at `blockHeight`: the next block is the first the spend can be
+ * in, and the block after the deadline is the first that can take the
+ * transaction of the other side.
+ */
+export const fixedOutputFeeWaitMakesDeadline = (
+	blockHeight: number,
+	deadlineHeight: number
+): boolean => blockHeight < deadlineHeight;

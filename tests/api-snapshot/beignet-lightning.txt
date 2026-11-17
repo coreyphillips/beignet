@@ -687,6 +687,7 @@ method chain.ElectrumBackend.stopReconnectMonitor(): void
 method chain.ElectrumBackend.subscribeToHeaders(onNewBlock: (height: number) => void): Promise<void>
 method chain.ElectrumBackend.subscribeToScriptHash(scriptHash: string, onChange: () => void): Promise<void>
 method chain.ElectrumBackend.unsubscribeScriptHash(scriptHash: string): boolean
+const chain.FIXED_OUTPUT_FEE_TIMING: { readonly splitRaiseBlocks: 6; readonly splitRaiseBlocksNearDeadline: 2; readonly nearDeadlineBlocks: 18; readonly unconfirmedCoinBlocks: 6; }
 interface chain.IAnchorCpfpParams
 property chain.IAnchorCpfpParams.anchorAmount: bigint
 property chain.IAnchorCpfpParams.anchorOutputIndex: number
@@ -800,7 +801,7 @@ property chain.IFeeBumpAndBroadcastChainAction.anchorWitnessScript?: Buffer
 property chain.IFeeBumpAndBroadcastChainAction.commitmentTxid?: string
 property chain.IFeeBumpAndBroadcastChainAction.description: string
 property chain.IFeeBumpAndBroadcastChainAction.feeratePerVbyte: number
-property chain.IFeeBumpAndBroadcastChainAction.fixedOutput?: { txid: string; outputIndex: number; }
+property chain.IFeeBumpAndBroadcastChainAction.fixedOutput?: { txid: string; outputIndex: number; deadlineHeight?: number; }
 property chain.IFeeBumpAndBroadcastChainAction.kind: 'htlc-fee-attach' | 'anchor-cpfp' | 'fixed-output-fee'
 property chain.IFeeBumpAndBroadcastChainAction.parentFeeSats?: bigint
 property chain.IFeeBumpAndBroadcastChainAction.parentVbytes?: number
@@ -997,6 +998,7 @@ function chain.estimateSimpleCloseFee(feeratePerKw: number, closerScriptLen: num
 function chain.estimateSweepVbytes(outputType: chain.OutputType, leased?: boolean): number
 function chain.extractCommitmentNumber(tx: bitcoinjs-lib#Transaction, openPaymentBasepoint: Buffer, acceptPaymentBasepoint: Buffer): bigint
 function chain.extractPreimageFromWitness(witness: Buffer[]): Buffer | null
+const chain.fixedOutputFeeWaitMakesDeadline: (blockHeight: number, deadlineHeight: number) => boolean
 function chain.fixedOutputHtlcFeeActionId(channelId: Buffer, txid: string, outputIndex: number): string
 function chain.isDustOutput(scriptPubkey: Buffer, amountSat: bigint): boolean
 function chain.isOpReturnScript(scriptPubkey: Buffer): boolean
@@ -5764,7 +5766,9 @@ property node.IDirectFundingPolicy.minAmountSat?: number
 property node.IDirectFundingPolicy.targetInboundSat?: number
 property node.IDirectFundingPolicy.unpairedSpliceDepth?: number
 interface node.IFeeBumpSelectionOpts
+property node.IFeeBumpSelectionOpts.blockHeight?: number
 property node.IFeeBumpSelectionOpts.confirmedOnly?: boolean
+property node.IFeeBumpSelectionOpts.deadlineHeight?: number
 property node.IFeeBumpSelectionOpts.excludeTxids?: readonly string[]
 property node.IFeeBumpSelectionOpts.feeActionId?: string
 property node.IFeeBumpSelectionOpts.fixedOutputs?: boolean
@@ -10027,7 +10031,7 @@ property wallet.IFixedOutputFeePoolState.actions: Array<{ feeActionId?: string; 
 property wallet.IFixedOutputFeePoolState.available: true
 property wallet.IFixedOutputFeePoolState.budget: wallet.IFixedOutputFeeBudget
 property wallet.IFixedOutputFeePoolState.feeCoins: { ready: number; readySatoshis: bigint; unconfirmed: number; }
-property wallet.IFixedOutputFeePoolState.lastRefusal?: { code: wallet.FixedOutputFeeErrorCode; remedy: wallet.FixedOutputFeeRemedy; at: number; }
+property wallet.IFixedOutputFeePoolState.lastRefusal?: { code: wallet.FixedOutputFeeErrorCode; remedy: wallet.FixedOutputFeeRemedy; at: number; deadlineHeight?: number; }
 property wallet.IFixedOutputFeePoolState.preparation: { possible: boolean; forFeeSatoshis: bigint; neededSatoshis: bigint; largestConfirmedSatoshis: bigint; reason?: 'FEE_FUNDS_UNAVAILABLE' | 'FEE_BUDGET_EXHAUSTED'; }
 property wallet.IFixedOutputFeePoolState.splits: Array<{ state: 'unsigned' | 'signed' | 'published'; transactionId?: string; feeSatoshis: bigint; feeCoins: number; feeCoinSatoshis: bigint; }>
 interface wallet.IFixedOutputFeePoolUnavailable
