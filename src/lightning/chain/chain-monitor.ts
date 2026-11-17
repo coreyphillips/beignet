@@ -736,6 +736,14 @@ export class ChainMonitor {
 			...(classified.type === CommitmentType.COOPERATIVE_CLOSE
 				? { cooperativeTxHex: spendingTx.toHex() }
 				: {}),
+			// An asset channel: a spend with no commitment stamp that the
+			// channel holds no close payload for is no close this node
+			// signed. The record says so, as the channel's row does.
+			...(classified.type === CommitmentType.COOPERATIVE_CLOSE &&
+			this._channelState.auxiliaryState &&
+			!this._channelState.auxiliaryState.closeTransactions?.has(txid)
+				? { unrecordedClose: true as const }
+				: {}),
 			txid,
 			blockHeight,
 			commitmentNumber: classified.commitmentNumber,

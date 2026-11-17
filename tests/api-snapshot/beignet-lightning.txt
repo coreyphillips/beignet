@@ -786,6 +786,7 @@ property chain.ICommitmentBroadcast.revokedTxHex?: string
 property chain.ICommitmentBroadcast.spentOutpoint?: { txid: string; outputIndex: number; }
 property chain.ICommitmentBroadcast.trackedOutputs: chain.ITrackedOutput[]
 property chain.ICommitmentBroadcast.txid: string
+property chain.ICommitmentBroadcast.unrecordedClose?: true
 interface chain.ICooperativeCloseQuote
 property chain.ICooperativeCloseQuote.amountSats: number
 property chain.ICooperativeCloseQuote.feeEstimated: true

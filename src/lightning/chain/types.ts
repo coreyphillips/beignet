@@ -248,6 +248,15 @@ export interface ICommitmentBroadcast {
 	/** Observed cooperative transaction, retained for external payout history. */
 	cooperativeTxHex?: string;
 	/**
+	 * Asset channels: the transaction is recorded as the cooperative close
+	 * because it carries no commitment stamp, and the channel's asset state
+	 * holds no close payload for it, so it is no close this node signed and
+	 * the node cannot say where the asset went. Present only then; the row
+	 * of the channel names the same transaction in
+	 * auxiliaryState.unrecordedCloseTxid.
+	 */
+	unrecordedClose?: true;
+	/**
 	 * The funding outpoint this transaction was reported as spending (issue
 	 * #479).
 	 *
