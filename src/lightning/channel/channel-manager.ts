@@ -13151,7 +13151,19 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			for (const out of present.outs) own.addOutput(out.script, out.value);
 			const signed = present.ins[0].witness.length > 0;
 			if (signed) own.setWitness(0, present.ins[0].witness);
-			const ownVbytes = own.virtualSize() + (signed ? 0 : 56);
+			// A spend that is signed only with its inputs is counted at the
+			// size its monitor says it will have: its witness, and the output
+			// script the provider puts in place of the destination. A flat
+			// allowance for the witness fell short of the penalty of a
+			// balance output by 15 vbytes.
+			const measured = signed
+				? undefined
+				: monitor.fixedOutputSpendVbytes?.(
+						spent.txid,
+						spent.outputIndex,
+						action.feeratePerVbyte
+				  );
+			const ownVbytes = measured ?? own.virtualSize() + (signed ? 0 : 56);
 			const selected = await fp.selectFeeBumpInputs(
 				BigInt(Math.ceil(ownVbytes * action.feeratePerVbyte)),
 				satPerVbyteToSatPerKw(action.feeratePerVbyte),

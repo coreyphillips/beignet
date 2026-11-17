@@ -133,6 +133,34 @@ export function auxiliarySweepVbytes(destinationScript: Buffer): number {
 	return 8 + Math.max(0, 34 - destinationScript.length);
 }
 
+/** A BIP340 signature under SIGHASH_DEFAULT, as every spend here signs. */
+export const AUXILIARY_SPEND_SIGNATURE_BYTES = 64;
+
+/**
+ * The virtual size of a spend of one output that carries units, once it is
+ * signed: one input whose witness has items of the given sizes, and one
+ * output, which holds the script of 34 bytes the provider puts in place of
+ * the destination. Wallet inputs that bring a fee are not counted.
+ *
+ * The fee of every such spend is computed from this, the size it really
+ * has. An estimate by the type of the output fell short of it (133 vbytes
+ * for a to_local of 146, 130 for a to_remote of 137), and a sweep signed at
+ * the floor rate was below the relay floor and refused.
+ */
+export function auxiliarySpendVbytes(
+	witnessItemSizes: readonly number[],
+	destinationScript: Buffer
+): number {
+	const varint = (n: number): number => (n < 0xfd ? 1 : n <= 0xffff ? 3 : 5);
+	const script = Math.max(34, destinationScript.length);
+	const base = 4 + 1 + 41 + 1 + 8 + varint(script) + script + 4;
+	const witness =
+		2 +
+		varint(witnessItemSizes.length) +
+		witnessItemSizes.reduce((sum, size) => sum + varint(size) + size, 0);
+	return Math.ceil((base * 4 + witness) / 4);
+}
+
 /** One input of a sweep, with the key that signs its Bitcoin witness. */
 export interface IAuxiliarySweepSource
 	extends Omit<IAuxiliarySweepInput, 'transactionInputIndex' | 'publicKey'> {
@@ -432,6 +460,13 @@ export function noteAuxiliarySweepOffered(
 export interface IAuxiliaryFeeFunding {
 	/** The script and the value of the output the spend's own input spends. */
 	prevout: { script: Buffer; value: bigint };
+	/**
+	 * The virtual size the spend has without its wallet inputs once it is
+	 * finished, for a spend that is signed only then: what the fee pool is
+	 * asked to pay for beside its own inputs. Not set on a spend that is
+	 * signed already, whose size is read from it.
+	 */
+	ownVbytes?: number;
 	/**
 	 * `funded` is the spend with the wallet inputs after its own input and
 	 * its outputs as they were; `prevouts` is aligned with its inputs. The

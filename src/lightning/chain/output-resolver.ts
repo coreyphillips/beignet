@@ -100,6 +100,8 @@ import {
 	auxiliarySecondLevel,
 	auxiliarySecondLevelSource,
 	auxiliarySweepVbytes,
+	auxiliarySpendVbytes,
+	AUXILIARY_SPEND_SIGNATURE_BYTES,
 	prepareAuxiliarySweep,
 	trackedAuxiliaryLeaf
 } from './auxiliary-sweep';
@@ -1615,6 +1617,28 @@ function auxiliarySweepNeedsFee(
 }
 
 /**
+ * The virtual size of a spend of an output that carries units by one leaf
+ * this node signs alone: its signature, what the leaf asks for beside it,
+ * the leaf and its proof.
+ */
+function auxiliaryLeafSpendVbytes(
+	leafScript: Buffer,
+	controlBlock: Buffer,
+	extraWitness: Buffer[],
+	destinationScript: Buffer
+): number {
+	return auxiliarySpendVbytes(
+		[
+			AUXILIARY_SPEND_SIGNATURE_BYTES,
+			...extraWitness.map((item) => item.length),
+			leafScript.length,
+			controlBlock.length
+		],
+		destinationScript
+	);
+}
+
+/**
  * A spend, by one leaf this node signs alone, of an output that carries
  * units and cannot pay its own fee: the transaction with the whole amount
  * in its output and no witness, and what finishes it once wallet inputs
@@ -1656,6 +1680,12 @@ function auxiliaryFundedLeafSpend(
 		spendTx,
 		auxiliaryFunding: {
 			prevout: { script: Buffer.from(prevoutScript), value: output.amount },
+			ownVbytes: auxiliaryLeafSpendVbytes(
+				leafScript,
+				controlBlock,
+				extraWitness,
+				destinationScript
+			),
 			finalize: (funded, prevouts) => {
 				const assets = prepareAuxiliarySweep(
 					state,
@@ -2279,8 +2309,14 @@ export function resolveSecondLevelHtlcOutput(
 		const feeSatoshis = BigInt(
 			Math.ceil(
 				feeRatePerVbyte *
-					(estimateSweepVbytes(OutputType.TO_LOCAL) +
-						(source ? auxiliarySweepVbytes(destinationScript) : 0))
+					(source
+						? auxiliaryLeafSpendVbytes(
+								sl.delay.script,
+								sl.delay.controlBlock,
+								[],
+								destinationScript
+						  )
+						: estimateSweepVbytes(OutputType.TO_LOCAL))
 			)
 		);
 
@@ -2638,10 +2674,14 @@ function resolveOurTaprootCommitmentOutputs(
 			const feeSatoshis = BigInt(
 				Math.ceil(
 					feeRatePerVbyte *
-						(estimateSweepVbytes(output.outputType) +
-							(output.auxiliaryCommitmentNumber !== undefined
-								? auxiliarySweepVbytes(destinationScript)
-								: 0))
+						(output.auxiliaryCommitmentNumber !== undefined
+							? auxiliaryLeafSpendVbytes(
+									toLocal.delay.script,
+									toLocal.delay.controlBlock,
+									[],
+									destinationScript
+							  )
+							: estimateSweepVbytes(output.outputType))
 				)
 			);
 			const sweepValue = sweepOutputValue(
@@ -2971,10 +3011,14 @@ function resolveTheirCurrentTaprootCommitmentOutputs(
 		const feeSatoshis = BigInt(
 			Math.ceil(
 				feeRatePerVbyte *
-					(estimateSweepVbytes(output.outputType) +
-						(output.auxiliaryCommitmentNumber !== undefined
-							? auxiliarySweepVbytes(destinationScript)
-							: 0))
+					(output.auxiliaryCommitmentNumber !== undefined
+						? auxiliaryLeafSpendVbytes(
+								leafScript,
+								controlBlock,
+								extraWitness,
+								destinationScript
+						  )
+						: estimateSweepVbytes(output.outputType))
 			)
 		);
 		const sweepValue = sweepOutputValue(
@@ -4166,10 +4210,14 @@ function resolveRevokedTaprootCommitmentOutputs(
 			const feeSatoshis = BigInt(
 				Math.ceil(
 					feeRatePerVbyte *
-						(estimateSweepVbytes(OutputType.TO_REMOTE) +
-							(o.auxiliaryCommitmentNumber !== undefined
-								? auxiliarySweepVbytes(destinationScript)
-								: 0))
+						(o.auxiliaryCommitmentNumber !== undefined
+							? auxiliaryLeafSpendVbytes(
+									tr.spend.script,
+									tr.spend.controlBlock,
+									[],
+									destinationScript
+							  )
+							: estimateSweepVbytes(OutputType.TO_REMOTE))
 				)
 			);
 			const claimValue = sweepOutputValue(
@@ -4374,6 +4422,19 @@ function resolveRevokedTaprootCommitmentOutputs(
 			spendTx,
 			auxiliaryFunding: {
 				prevout: { script: Buffer.from(pin.spk), value: BigInt(pin.value) },
+				// An HTLC output is taken by its key, with one signature; the
+				// cheater's balance by the revocation leaf and its proof.
+				ownVbytes: pin.merkleRoot
+					? auxiliarySpendVbytes(
+							[AUXILIARY_SPEND_SIGNATURE_BYTES],
+							destinationScript
+					  )
+					: auxiliaryLeafSpendVbytes(
+							pin.leafScript!,
+							pin.controlBlock!,
+							[],
+							destinationScript
+					  ),
 				finalize: (funded, prevouts) => {
 					const assets = prepareAuxiliarySweep(
 						state,
@@ -4706,6 +4767,10 @@ export function resolveRevokedSecondLevelOutput(
 							spendTx: claimTx,
 							auxiliaryFunding: {
 								prevout: { script: Buffer.from(tree.output), value: amount },
+								ownVbytes: auxiliarySpendVbytes(
+									[AUXILIARY_SPEND_SIGNATURE_BYTES],
+									destinationScript
+								),
 								finalize: (funded, prevouts) => {
 									const assets = prepareAuxiliarySweep(
 										state,

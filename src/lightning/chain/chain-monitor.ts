@@ -2328,6 +2328,28 @@ export class ChainMonitor {
 	}
 
 	/**
+	 * The virtual size the spend of an output of an asset channel has
+	 * without its wallet inputs once it is finished, when that spend is
+	 * signed only with them: what the fee pool has to pay for beside its
+	 * own inputs. Undefined for a spend that is signed already, whose size
+	 * is read from it, and for an output that has no such spend.
+	 */
+	fixedOutputSpendVbytes(
+		txid: string,
+		outputIndex: number,
+		feeRatePerVbyte: number
+	): number | undefined {
+		const output = this._fixedOutput(txid, outputIndex);
+		if (!output) return undefined;
+		// A question: what it found out about the output is not kept.
+		const refusal = output.auxiliaryRefusal;
+		const again = this._resolveFixedOutputSpend(output, feeRatePerVbyte);
+		if (refusal === undefined) delete output.auxiliaryRefusal;
+		else output.auxiliaryRefusal = refusal;
+		return again?.auxiliaryFunding?.ownVbytes;
+	}
+
+	/**
 	 * A sweep of an asset channel that wallet inputs pay for is asked to pay
 	 * more: the action that asks the fee pool again, at the higher rate, in
 	 * place of a rebuild. Undefined for every other sweep.

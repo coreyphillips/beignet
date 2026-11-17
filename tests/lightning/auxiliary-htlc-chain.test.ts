@@ -71,7 +71,15 @@ describe('the HTLCs of an asset channel on the chain (issue #2093 step 10)', fun
 		outcomes.alice = [];
 		outcomes.bob = [];
 	});
-	afterEach(() => world.dispose());
+	afterEach(function () {
+		// Every spend either node made in a test that passed paid, for the
+		// size it really has, the rate its output was first given a spend
+		// at, and none was refused as below the relay floor.
+		const underpaid =
+			this.currentTest?.state === 'passed' ? world.underpaid() : [];
+		world.dispose();
+		expect(underpaid).to.deep.equal([]);
+	});
 
 	const until = async (
 		what: string,

@@ -25,9 +25,11 @@ import {
 	SWEEP_DESTINATION,
 	assetChainWorld,
 	errorsOf,
+	ownSpends,
 	payUnits,
 	settle,
 	trackedOutputs,
+	underpaidSpends,
 	type IAssetChainPair
 } from './helpers/auxiliary-on-chain';
 
@@ -204,6 +206,14 @@ describe('asset channels: the own balance output on chain', function () {
 			expect(
 				pair.sweeps.bob.map((call) => `${call.side}:${call.kinds.join()}`)
 			).to.include('local:to_local_delayed');
+			// The wallet input pays for the size the sweep really has: 146
+			// vbytes of its own and 68 of the input.
+			const [paid] = ownSpends(pair, bob).filter(
+				(own) => own.output.outputType === OutputType.TO_LOCAL
+			);
+			expect(paid.vbytes).to.equal(214);
+			expect(paid.fee).to.be.at.least(214 * feeRate);
+			expect(underpaidSpends(pair)).to.deep.equal([]);
 			// Units are never said to be uneconomic to sweep.
 			expect(uneconomic).to.deep.equal([]);
 			expect(
@@ -343,6 +353,17 @@ describe('asset channels: the own balance output on chain', function () {
 			expect(spend.outs[0].script.equals(ASSET_SWEEP_SCRIPT)).to.equal(true);
 			expect(spend.outs[0].value).to.be.at.least(330);
 			expect(mine.auxiliaryFeeWait).to.equal(undefined);
+			// The sweep that was held is the one a block took, in the block
+			// after the one that ended the delay: it was signed for the size
+			// it has, so the network took it at the floor rate.
+			expect(mine.resolutionTxid).to.equal(signed.getId());
+			expect(pair.chain.confirmed.get(mine.resolutionTxid!)!.height).to.equal(
+				held.maturityHeight! + 1
+			);
+			expect(signed.virtualSize()).to.equal(146);
+			expect(Number(held.amount) - signed.outs[0].value).to.equal(146);
+			expect(mine.auxiliaryFeeFunding).to.equal(undefined);
+			expect(underpaidSpends(pair)).to.deep.equal([]);
 		});
 	}
 

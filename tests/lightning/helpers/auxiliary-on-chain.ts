@@ -324,6 +324,80 @@ export const trackedOutputs = (
 ): ITrackedOutput[] =>
 	host.node.getChannelMonitorState(channelId)?.trackedOutputs ?? [];
 
+/** A spend a host signed for an output of its asset channel, as a block has it. */
+export interface IOwnSpend {
+	output: ITrackedOutput;
+	transaction: bitcoin.Transaction;
+	height: number;
+	vbytes: number;
+	fee: number;
+}
+
+/**
+ * Every spend of a tracked output that is in a block and is one the host
+ * signed itself, with the size it really has and the fee it really pays:
+ * all it spends less all it pays out.
+ */
+export function ownSpends(
+	pair: IAssetChainPair,
+	host: IAssetHost
+): IOwnSpend[] {
+	const spends: IOwnSpend[] = [];
+	for (const output of trackedOutputs(host, pair.channelId)) {
+		if (!output.resolutionTxid) continue;
+		const signed = new Set(Object.keys(output.auxiliarySweepAttempts ?? {}));
+		if (output.sweepTxHex) {
+			signed.add(bitcoin.Transaction.fromHex(output.sweepTxHex).getId());
+		}
+		const entry = pair.chain.confirmed.get(output.resolutionTxid);
+		if (!entry || !signed.has(output.resolutionTxid)) continue;
+		let paidIn = 0;
+		for (const input of entry.tx.ins) {
+			const previous = pair.chain.confirmed.get(
+				Buffer.from(input.hash).reverse().toString('hex')
+			);
+			if (!previous) throw new Error('a spend of an unknown output');
+			paidIn += previous.tx.outs[input.index].value;
+		}
+		spends.push({
+			output,
+			transaction: entry.tx,
+			height: entry.height,
+			vbytes: entry.tx.virtualSize(),
+			fee: paidIn - entry.tx.outs.reduce((sum, out) => sum + out.value, 0)
+		});
+	}
+	return spends;
+}
+
+/**
+ * The spends of either host of a pair that pay less than the rate their
+ * output was first given a spend at, for the size they really have, and
+ * every transaction the chain refused as below the relay floor.
+ */
+export function underpaidSpends(pair: IAssetChainPair): string[] {
+	const found: string[] = [];
+	for (const [name, host] of [
+		['alice', pair.alice],
+		['bob', pair.bob]
+	] as const) {
+		for (const spend of ownSpends(pair, host)) {
+			const rate = spend.output.originalFeeRate ?? 1;
+			if (spend.fee < Math.ceil(spend.vbytes * rate)) {
+				found.push(
+					`${name}: the spend of ${spend.output.outputType} ${spend.output.txid}:${spend.output.outputIndex} pays ${spend.fee} sat for ${spend.vbytes} vB with ${spend.transaction.ins.length} inputs, asked at ${rate} sat/vB`
+				);
+			}
+		}
+		for (const refusal of pair.backends[name].refused) {
+			if (refusal.reason.includes('minimum relay fee')) {
+				found.push(`${name}: ${refusal.reason}`);
+			}
+		}
+	}
+	return found;
+}
+
 /** What a host said went wrong, without what a node with no wallet always says. */
 export const errorsOf = (host: IAssetHost): string[] =>
 	host.errors.filter(
@@ -348,9 +422,15 @@ export function assetChainWorld(): {
 		whileDown?: () => void
 	): Promise<void>;
 	mine(pair: IAssetChainPair, blocks: number): Promise<void>;
+	/**
+	 * What `underpaidSpends` finds on every pair opened since the last
+	 * `dispose`: asked before it, at the end of a test that passed.
+	 */
+	underpaid(): string[];
 	dispose(): void;
 } {
 	const hosts: IAssetHost[] = [];
+	const pairs: IAssetChainPair[] = [];
 	const backends: TestChainBackend[] = [];
 	const files: string[] = [];
 
@@ -407,6 +487,7 @@ export function assetChainWorld(): {
 
 	return {
 		mine,
+		underpaid: (): string[] => pairs.flatMap((pair) => underpaidSpends(pair)),
 		async open(tag, options = {}): Promise<IAssetChainPair> {
 			const chain = new TestChain();
 			const alicePath = path.join(
@@ -515,6 +596,7 @@ export function assetChainWorld(): {
 				channelId,
 				funding
 			};
+			pairs.push(pair);
 			await mine(pair, 6);
 			for (const host of [alice, bob]) {
 				const now = host.node
@@ -555,6 +637,7 @@ export function assetChainWorld(): {
 			await settle();
 		},
 		dispose(): void {
+			pairs.splice(0);
 			for (const host of hosts.splice(0)) {
 				try {
 					host.node.destroy();

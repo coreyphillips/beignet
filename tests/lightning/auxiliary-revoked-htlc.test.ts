@@ -44,9 +44,15 @@ describe('the HTLC outputs of a revoked commitment of an asset channel (issue #2
 	withAssetOpens();
 	const world = assetChainWorld();
 	const kept: string[] = [];
-	afterEach(() => {
+	afterEach(function () {
+		// Every spend either node made in a test that passed paid, for the
+		// size it really has, the rate its output was first given a spend
+		// at, and none was refused as below the relay floor.
+		const underpaid =
+			this.currentTest?.state === 'passed' ? world.underpaid() : [];
 		world.dispose();
 		for (const file of kept.splice(0)) fs.rmSync(file, { force: true });
+		expect(underpaid).to.deep.equal([]);
 	});
 
 	const done = [

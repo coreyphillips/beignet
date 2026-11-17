@@ -3,6 +3,7 @@ unexported type DeprecatedNodeConfigKey = 'forwardingEnabled' | 'forwardingCltvD
 unexported type EventMap<E> = { [K in keyof E]: (...args: any[]) => void; }
 unexported interface IAuxiliaryFeeFunding
 method IAuxiliaryFeeFunding.finalize(funded: bitcoinjs-lib#Transaction, prevouts: { scripts: Buffer[]; values: bigint[]; }): { ok: true; data?: Buffer; } | { ok: false; refusal: string; }
+property IAuxiliaryFeeFunding.ownVbytes?: number
 property IAuxiliaryFeeFunding.prevout: { script: Buffer; value: bigint; }
 unexported interface ICompactHtlcHistory
 property ICompactHtlcHistory.entries: IHistoryEntry[]
@@ -610,6 +611,7 @@ method chain.ChainMonitor.auxiliaryHtlcEndings(): Array<{ txid: string; outputIn
 method chain.ChainMonitor.dropUnusedPreimages(heldElsewhere: ReadonlyMap<string, Buffer>): number
 method chain.ChainMonitor.fixedOutputFeeRaise(output: chain.ITrackedOutput, feeRatePerVbyte: number): chain.IFeeBumpAndBroadcastChainAction | undefined
 method chain.ChainMonitor.fixedOutputFeeResolved(txid: string, outputIndex: number, evenIfNotOpen?: boolean): { spendingTransaction?: Buffer; } | undefined
+method chain.ChainMonitor.fixedOutputSpendVbytes(txid: string, outputIndex: number, feeRatePerVbyte: number): number | undefined
 method chain.ChainMonitor.fundFixedOutputSpend(txid: string, outputIndex: number, feeRatePerVbyte: number, feeInputs: ReadonlyArray<{ hash: Buffer; index: number; sequence: number; script: Buffer; value: bigint; }>, signFeeInputs: (transaction: bitcoinjs-lib#Transaction, prevouts: { scripts: Buffer[]; values: bigint[]; }) => void): { ok: true; transaction: Buffer; broadcast: boolean; } | { ok: false; refusal: string; gone?: true; }
 method chain.ChainMonitor.getChannelState(): channel.IChannelState
 method chain.ChainMonitor.getFullState(): chain.IChainMonitorState
