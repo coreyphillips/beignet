@@ -24495,6 +24495,17 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		this.retryHeldResolutions();
 		for (const [hashHex, held] of this.heldHtlcs) {
 			if (this.heldResolutions.has(hashHex)) continue;
+			// Asset channels: a held HTLC whose channel is on chain is ended
+			// there (endAssetHoldsEndedOnChain). Nothing is asked of the
+			// channel, which can take neither a fail back nor a fulfil.
+			if (
+				held.length > 0 &&
+				held.every((h) =>
+					this.channelManager.auxiliaryChannelOnChain(h.channelId)
+				)
+			) {
+				continue;
+			}
 			const soon = held.some(
 				(h) =>
 					h.cltvExpiry > 0 && h.cltvExpiry - height <= HELD_HTLC_EXPIRY_MARGIN

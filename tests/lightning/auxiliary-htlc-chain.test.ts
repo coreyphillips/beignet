@@ -798,7 +798,11 @@ describe('the HTLCs of an asset channel on the chain (issue #2093 step 10)', fun
 			// No fee input was asked for: nothing left Bob's wallet.
 			expect(pair.wallets.bob!.sent).to.have.length(0);
 
-			await passTo(pair, held.cltvExpiry - 1);
+			// Block by block through the margin at which a hold is given up
+			// and past the expiry: once the channel is on chain nothing is
+			// asked of it, neither a fail back nor a fulfil.
+			await passTo(pair, held.cltvExpiry - 30);
+			await world.mine(pair, 29);
 			await until('the HTLC-timeout of the payer in a block', pair, () =>
 				isSpent(htlcOf(pair.alice, pair))
 			);
@@ -810,6 +814,14 @@ describe('the HTLCs of an asset channel on the chain (issue #2093 step 10)', fun
 			await passTo(pair, pair.chain.height + IRREVOCABLE_DEPTH);
 			await world.mine(pair, 2);
 			await settle();
+			// The one refusal is the host's own cancel, made before the channel
+			// was on chain while the peer was gone.
+			const asked = errorsOf(pair.bob).filter((e) =>
+				/Cannot (fail|fulfill) HTLC/.test(e)
+			);
+			expect(asked.length, asked.slice(0, 3).join(' | ')).to.equal(
+				scenario.cancel ? 1 : 0
+			);
 			expect(outcomes.bob).to.deep.equal(['RECEIVED:failed:5000']);
 			expect(outcomes.alice).to.deep.equal(['OFFERED:failed:5000']);
 			expect(parkedOf(pair.bob, held.paymentHash)).to.equal(0);
