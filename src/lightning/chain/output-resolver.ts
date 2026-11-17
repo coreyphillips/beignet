@@ -2634,7 +2634,55 @@ function resolveOurTaprootCommitmentOutputs(
 				feeSatoshis,
 				destinationScript
 			);
-			if (auxiliarySweepNeedsFee(output, sweepValue) || sweepValue === null) {
+			const delayedBasepointSecret =
+				delayedPaymentBasepointSecret || state.localPerCommitmentSeed;
+			const delayedPrivkey = derivePrivateKey(
+				delayedBasepointSecret,
+				perCommitmentPoint,
+				state.localBasepoints.delayedPaymentBasepoint
+			);
+			if (auxiliarySweepNeedsFee(output, sweepValue)) {
+				// The balance carries units and cannot pay for its own sweep:
+				// the fee comes from wallet inputs and the output keeps its
+				// amount, as the to_remote of the peer's commitment does. Units
+				// are never declined as uneconomic.
+				const funded = auxiliaryFundedLeafSpend(
+					state,
+					true,
+					{
+						output,
+						commitmentOutputIndex: output.outputIndex,
+						kind: 'to_local_delayed',
+						privateKey: delayedPrivkey,
+						leafScript: toLocal.delay.script,
+						leafVersion: toLocal.delay.leafVersion,
+						controlBlock: toLocal.delay.controlBlock
+					},
+					toLocal.output,
+					destinationScript,
+					0,
+					toSelfDelay,
+					[]
+				);
+				if (!funded) {
+					output.auxiliaryRefusal = `Output ${output.txid}:${
+						output.outputIndex
+					} carries units and holds ${
+						output.amount
+					} sat, less than the ${AUXILIARY_SWEEP_OUTPUT_MINIMUM} sat an output of units must hold: no sweep of it can be made (channel ${
+						state.channelId?.toString('hex') ?? 'unknown'
+					})`;
+					resolved.push({ trackedOutput: output });
+					continue;
+				}
+				resolved.push({
+					trackedOutput: output,
+					...funded,
+					csvDelay: toSelfDelay
+				});
+				continue;
+			}
+			if (sweepValue === null) {
 				// Not economical to sweep. Track it without a spend so the rest of
 				// this commitment's outputs still resolve.
 				resolved.push({ trackedOutput: output, declinedAsUneconomic: true });
@@ -2648,13 +2696,6 @@ function resolveOurTaprootCommitmentOutputs(
 				toSelfDelay // CSV: the to_local delay leaf requires this relative timelock
 			);
 			sweepTx.addOutput(destinationScript, sweepValue);
-			const delayedBasepointSecret =
-				delayedPaymentBasepointSecret || state.localPerCommitmentSeed;
-			const delayedPrivkey = derivePrivateKey(
-				delayedBasepointSecret,
-				perCommitmentPoint,
-				state.localBasepoints.delayedPaymentBasepoint
-			);
 			const assets = prepareAuxiliarySweep(
 				state,
 				true,
