@@ -24014,7 +24014,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		this.resolvingHeldHtlcs.add(hashHex);
 		const prior = this.heldResolutions.get(hashHex);
 		const refused: typeof held = [];
-		let decidedOnChain = false;
+		let takenOnChain = 0;
 		// Asset channels: a part the asset provider refused, and whether the
 		// set is paid in asset units.
 		let providerRefused = false;
@@ -24047,10 +24047,16 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				}
 
 				if (this.channelManager.auxiliaryChannelOnChain(h.channelId)) {
-					// On chain no fulfil can be made: the decision written
-					// down here, for this HTLC, is what the claim there is
-					// made by.
+					// On chain no fulfil can be made, and a hold follows the
+					// clock it follows in an open channel: a settle is taken
+					// while the expiry is more than the cancel margin away, so
+					// that the claim has the blocks it needs. Taken, the
+					// decision written down here, for this HTLC, is what the
+					// claim is made by, and the part stays parked until the
+					// chain has ended it. Refused, nothing is written and
+					// nothing is published.
 					if (
+						h.cltvExpiry - this.currentBlockHeight > HELD_HTLC_EXPIRY_MARGIN &&
 						this.channelManager.recordAuxiliaryHtlcDecision(
 							h.channelId,
 							h.htlcId,
@@ -24058,7 +24064,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 							pre
 						)
 					) {
-						decidedOnChain = true;
+						takenOnChain++;
 					}
 					refused.push(h);
 					continue;
@@ -24098,7 +24104,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		}
 		// A decision written for a channel on chain: its monitor is told now
 		// that a claim can be made.
-		if (decidedOnChain) this.channelManager.recordPreimage(paymentHash, pre);
+		if (takenOnChain > 0) this.channelManager.recordPreimage(paymentHash, pre);
 		// Nothing reached the payer (a channel awaiting reestablish refuses every
 		// fulfil, for one). Report the refusal and leave the set parked rather
 		// than closing the invoice SETTLED over HTLCs the payer still holds. The
@@ -24109,7 +24115,29 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			// chosen. The preimage is stored and the channel owes the
 			// fulfil, which the node asks for again from its periodic work
 			// and at each block, so the set is not open to a cancel.
-			if (!prior && !providerRefused && !carriesUnits) {
+			// On chain the answer and the record are the same thing. Every
+			// part had its settle taken: the answer is yes, and the set
+			// stays parked, bound to its settle, until the chain has ended
+			// it (endAssetHoldsEndedOnChain).
+			if (takenOnChain === held.length) {
+				this.emitStructuredLog('htlc', 'held_settle_taken_on_chain', {
+					paymentHash: hashHex,
+					htlcCount: held.length
+				});
+				return true;
+			}
+			// A set paid in units stays bound to its settle exactly when a
+			// decision to settle is written for one of its HTLCs: a refusal
+			// that wrote none (an HTLC past its expiry, a channel on chain
+			// inside the cancel margin) leaves the set open to a cancel.
+			const decided =
+				carriesUnits &&
+				held.some(
+					(h) =>
+						this.channelManager.auxiliaryHtlcDecision(h.channelId, h.htlcId)
+							?.outcome === 'settle'
+				);
+			if (!prior && !providerRefused && !decided) {
 				this.heldResolutions.delete(hashHex);
 				this.persistHeldHtlcs();
 			}
@@ -24335,6 +24363,25 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			this.persistHeldHtlcs();
 			for (const h of held) {
 				const key = `${h.channelId.toString('hex')}:${h.htlcId}`;
+				// Asset channels: a channel that is on chain takes no fail
+				// back. The decision is written down for the HTLC, by which it
+				// is never claimed, and the part ends here; the payer takes
+				// its output back on the chain at the expiry. A part whose
+				// settle stands is not cancelled.
+				if (this.channelManager.auxiliaryChannelOnChain(h.channelId)) {
+					if (
+						!this.channelManager.recordAuxiliaryHtlcDecision(
+							h.channelId,
+							h.htlcId,
+							'fail'
+						)
+					) {
+						refused.push(h);
+						continue;
+					}
+					this.cleanupHtlcSharedSecret(key);
+					continue;
+				}
 				const ss = this.receivedHtlcSharedSecrets.get(key);
 				// This path defaults to incorrect_or_unknown_payment_details, and the
 				// CLTV sweeper cancels through it with that default, so it needs the
@@ -24755,17 +24802,11 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		this.retryHeldResolutions();
 		for (const [hashHex, held] of this.heldHtlcs) {
 			if (this.heldResolutions.has(hashHex)) continue;
-			// Asset channels: a held HTLC whose channel is on chain is ended
-			// there (endAssetHoldsEndedOnChain). Nothing is asked of the
-			// channel, which can take neither a fail back nor a fulfil.
-			if (
-				held.length > 0 &&
-				held.every((h) =>
-					this.channelManager.auxiliaryChannelOnChain(h.channelId)
-				)
-			) {
-				continue;
-			}
+			// Asset channels: a hold whose channel is on chain follows the
+			// same clock. At the margin the node ends it itself: the decision
+			// not to claim its HTLC is written down and the invoice ends
+			// cancelled (cancelHeldHtlc), so a settle can no longer be asked
+			// for when a claim could not be in a block in time.
 			const soon = held.some(
 				(h) =>
 					h.cltvExpiry > 0 && h.cltvExpiry - height <= HELD_HTLC_EXPIRY_MARGIN

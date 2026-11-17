@@ -555,9 +555,14 @@ describe('the HTLCs of an asset channel on the chain (issue #2093 step 10)', fun
 		}
 		expect(claim.tx.virtualSize()).to.be.closeTo(215, 1);
 
-		// The HTLC failed for both: each host is told at irrevocable depth,
-		// the payment ends failed and the hold invoice cancelled.
-		expect(outcomes).to.deep.equal({ alice: [], bob: [] });
+		// The HTLC failed for both. The payee, who decided nothing and so
+		// will not claim, was told when the expiry passed: its commitment
+		// was there for good by then. The payer is told when its timeout
+		// is. The payment ends failed and the hold invoice cancelled.
+		expect(outcomes).to.deep.equal({
+			alice: [],
+			bob: ['RECEIVED:failed:5000']
+		});
 		await passTo(pair, pair.chain.height + IRREVOCABLE_DEPTH);
 		await world.mine(pair, 2);
 		await settle();

@@ -18,6 +18,7 @@ import type {
 } from './types';
 import type { IResolvedOutput } from './output-resolver';
 import type { IAuxiliaryFeeFunding } from './auxiliary-sweep';
+import { auxiliaryHtlcDecisionOf } from '../channel/auxiliary';
 
 import {
 	ChainActionType,
@@ -2579,6 +2580,10 @@ export class ChainMonitor {
 	 * a revoked commitment, whose HTLCs are not the channel's, and nothing
 	 * for any other channel.
 	 *
+	 * An HTLC this node received and will not claim is in the list as
+	 * failed before any spend of its output: once its expiry has passed and
+	 * the commitment is there for good.
+	 *
 	 * An HTLC the channel holds that is on no output of the commitment that
 	 * confirmed is in the list too, marked absent, once that commitment is
 	 * there for good; with a revoked commitment that is every HTLC the
@@ -2606,19 +2611,49 @@ export class ChainMonitor {
 			return [];
 		}
 		const endings: ReturnType<ChainMonitor['auxiliaryHtlcEndings']> = [];
+		const irrevocable =
+			broadcast.blockHeight > 0 &&
+			this._currentBlockHeight - broadcast.blockHeight >= IRREVOCABLE_DEPTH;
 		for (const output of this._trackedOutputs) {
 			if (
-				output.status !== OutputStatus.IRREVOCABLY_RESOLVED ||
 				output.isSecondLevelHtlc ||
 				output.auxiliaryCommitmentNumber === undefined ||
 				output.htlcId === undefined ||
-				output.resolutionTxid === undefined ||
 				(output.outputType !== OutputType.OFFERED_HTLC &&
 					output.outputType !== OutputType.RECEIVED_HTLC)
 			) {
 				continue;
 			}
 			const offered = output.outputType === OutputType.OFFERED_HTLC;
+			if (
+				output.status !== OutputStatus.IRREVOCABLY_RESOLVED ||
+				output.resolutionTxid === undefined
+			) {
+				// An HTLC this node received and will not claim (it decided
+				// to fail it, or decided nothing) has failed once its expiry
+				// has passed and the commitment is there for good: nothing
+				// can make the node claim it any more, and whether the payer
+				// ever takes the output back changes nothing for this node.
+				if (
+					!offered &&
+					irrevocable &&
+					output.cltvExpiry !== undefined &&
+					output.cltvExpiry > 0 &&
+					this._currentBlockHeight >= output.cltvExpiry &&
+					auxiliaryHtlcDecisionOf(this._channelState, output.htlcId)
+						?.outcome !== 'settle'
+				) {
+					endings.push({
+						txid: output.txid,
+						outputIndex: output.outputIndex,
+						htlcId: output.htlcId,
+						offered,
+						outcome: 'failed',
+						recorded: output.auxiliaryOutcomeRecorded === true
+					});
+				}
+				continue;
+			}
 			const ours =
 				output.auxiliarySweepAttempts?.[output.resolutionTxid] !== undefined;
 			endings.push({
