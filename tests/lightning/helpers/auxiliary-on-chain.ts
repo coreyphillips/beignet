@@ -246,7 +246,12 @@ export async function holdUnits(
 	expiryDelta = 60,
 	/** False for an offer that is not to reach the peer, or not to stay. */
 	inFlight = true
-): Promise<{ paymentHash: Buffer; preimage: Buffer; cltvExpiry: number }> {
+): Promise<{
+	paymentHash: Buffer;
+	preimage: Buffer;
+	cltvExpiry: number;
+	paymentSecret: Buffer;
+}> {
 	const { alice, bob, channelId, chain } = pair;
 	const preimage = hash(`held preimage ${tag}`);
 	const paymentHash = crypto.createHash('sha256').update(preimage).digest();
@@ -304,7 +309,12 @@ export async function holdUnits(
 				.join('; ')}`
 		);
 	}
-	return { paymentHash, preimage, cltvExpiry };
+	return {
+		paymentHash,
+		preimage,
+		cltvExpiry,
+		paymentSecret: invoice.paymentSecret
+	};
 }
 
 /** The two hosts of a pair stop hearing each other, as when a connection drops. */
@@ -317,6 +327,47 @@ export function disconnect(pair: IAssetChainPair): void {
 	pair.bob.node
 		.getChannelManager()
 		.handlePeerDisconnected(pair.alice.node.getNodeId());
+}
+
+/**
+ * Alice offers Bob `units` once more for a payment hash Bob has an invoice
+ * for already, whatever has become of that invoice since.
+ */
+export async function offerUnitsAgain(
+	pair: IAssetChainPair,
+	units: bigint,
+	paymentHash: Buffer,
+	paymentSecret: Buffer,
+	expiryDelta = 60
+): Promise<void> {
+	const { alice, bob, channelId, chain } = pair;
+	alice.node.sendPaymentToRoute(
+		{
+			hops: [
+				{
+					pubkey: Buffer.from(bob.node.getNodeId(), 'hex'),
+					shortChannelId: Buffer.alloc(8, 9),
+					amountToForwardMsat: units * 1000n,
+					outgoingCltvValue: chain.height + expiryDelta
+				}
+			]
+		},
+		paymentHash,
+		expiryDelta,
+		paymentSecret,
+		undefined,
+		undefined,
+		undefined,
+		undefined,
+		{
+			assetPayment: {
+				channelId,
+				wireAmountMsat: 354_000n,
+				customRecords: amountRecord(units)
+			}
+		}
+	);
+	await settle();
 }
 
 /**

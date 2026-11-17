@@ -26,8 +26,10 @@ import {
 	assetChainWorld,
 	disconnect,
 	errorsOf,
+	gateMessages,
 	holdUnits,
 	monitorRoundTrips,
+	offerUnitsAgain,
 	settle,
 	trackedOutputs,
 	type IAssetChainPair
@@ -36,6 +38,9 @@ import {
 /** What Bob takes an HTLC of units to be worth. */
 /** Measured: the block of the commitment after the claim deadline, and the blocks left before the expiry once the claim is in a block. */
 const DEADLINE_COMMITMENT = 1;
+/** The message types by which a node fails an HTLC back. */
+const UPDATE_FAIL_HTLC = 131;
+const UPDATE_FAIL_MALFORMED_HTLC = 135;
 const DEADLINE_SPARE = 15;
 const outcomes: { alice: string[]; bob: string[] } = { alice: [], bob: [] };
 const told =
@@ -852,6 +857,87 @@ describe('the HTLCs of an asset channel on the chain (issue #2093 step 10)', fun
 			);
 		});
 	}
+	it('does not claim a later HTLC of the payment hash of a hold invoice that was cancelled, though a preimage for the hash is stored: the payer takes it back and both hosts are told it failed', async function () {
+		const pair = await opened('aux-htlc-later');
+		const held = await holdUnits(pair, 5000n, 'later');
+		// A preimage in the store is not a decision to settle: here it is
+		// there from the time of the hold, which is then cancelled. Its
+		// HTLC fails back, all of it, and both hosts are told.
+		const store = pair.bob.node.getChannelManager();
+		store.recordPreimage(held.paymentHash, held.preimage);
+		pair.bob.node.cancelHoldInvoice(held.paymentHash);
+		await settle();
+		expect(outcomes).to.deep.equal({
+			alice: ['OFFERED:failed:5000'],
+			bob: ['RECEIVED:failed:5000']
+		});
+		expect(parkedOf(pair.bob, held.paymentHash)).to.equal(0);
+
+		// A second HTLC of the same payment hash. Bob refuses it, and his
+		// fail back is kept from Alice, so it stays in both commitments.
+		let failing = false;
+		const gate = gateMessages(pair, 'bob', (type) => {
+			if (type === UPDATE_FAIL_HTLC || type === UPDATE_FAIL_MALFORMED_HTLC) {
+				failing = true;
+			}
+			return failing;
+		});
+		await offerUnitsAgain(pair, 5000n, held.paymentHash, held.paymentSecret);
+		expect(gate.kept.length, 'the fail back was kept').to.be.greaterThan(0);
+		const later = [
+			...pair.bob.node
+				.getChannelManager()
+				.getChannel(pair.channelId)!
+				.getFullState()
+				.htlcs.values()
+		].filter((entry) => entry.paymentHash.equals(held.paymentHash));
+		expect(later).to.have.length(1);
+		expect(later[0].id).to.equal(1n);
+		expect(parkedOf(pair.bob, held.paymentHash)).to.equal(0);
+		store.recordPreimage(held.paymentHash, held.preimage);
+
+		gateMessages(pair, 'alice', () => true);
+		const closed = pair.alice.node.forceCloseChannel(
+			pair.channelId,
+			SWEEP_DESTINATION
+		);
+		expect(closed.ok, closed.error).to.equal(true);
+		await settle();
+		await world.mine(pair, 3);
+		trace(pair, 'bob', 'later');
+		const kept = htlcOf(pair.bob, pair)!;
+		expect(kept.outputType).to.equal(OutputType.RECEIVED_HTLC);
+		expect(kept.htlcId).to.equal(1n);
+		expect(kept.status).to.equal(OutputStatus.CONFIRMED);
+		expect(kept.sweepTxHex).to.equal(undefined);
+		expect(kept.auxiliaryFeeWait).to.equal(undefined);
+		// No fee input was asked for: nothing left Bob's wallet.
+		expect(pair.wallets.bob!.sent).to.have.length(0);
+
+		await passTo(pair, later[0].cltvExpiry - 30);
+		await world.mine(pair, 29);
+		await until('the HTLC-timeout of the payer in a block', pair, () =>
+			isSpent(htlcOf(pair.alice, pair))
+		);
+		expect(htlcOf(pair.bob, pair)!.resolutionTxid).to.equal(
+			htlcOf(pair.alice, pair)!.resolutionTxid
+		);
+		expect(pair.wallets.bob!.sent).to.have.length(0);
+		await passTo(pair, pair.chain.height + IRREVOCABLE_DEPTH);
+		await world.mine(pair, 2);
+		await settle();
+		expect(outcomes).to.deep.equal({
+			alice: ['OFFERED:failed:5000', 'OFFERED:failed:5000'],
+			bob: ['RECEIVED:failed:5000', 'RECEIVED:failed:5000']
+		});
+		expect(pair.bob.node.getPayment(held.paymentHash)?.status).to.not.equal(
+			PaymentStatus.COMPLETED
+		);
+		expect(pair.alice.node.getPayment(held.paymentHash)!.status).to.equal(
+			PaymentStatus.FAILED
+		);
+	});
+
 	it('closes by itself 18 blocks before the expiry of an HTLC whose settlement could not leave, and has its claim in a block with blocks to spare', async () => {
 		const pair = await opened('aux-htlc-deadline');
 		const held = await holdUnits(pair, 5000n, 'deadline');
