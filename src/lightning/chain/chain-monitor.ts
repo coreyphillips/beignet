@@ -594,7 +594,38 @@ export class ChainMonitor {
 				(output) =>
 					output.status === OutputStatus.IRREVOCABLY_RESOLVED ||
 					this._isPeerOnlyUnspentOutput(output)
-			)
+			) &&
+			!this._auxiliaryEndingsOwed()
+		);
+	}
+
+	/**
+	 * Asset channels: an HTLC the channel holds is on no output of the
+	 * commitment on the chain, and its ending is not in the channel's row
+	 * yet. The monitor is not done before that. A node with nothing of its
+	 * own to sweep on that commitment would otherwise be done with the
+	 * channel, and drop it, before the commitment is there for good, and
+	 * the HTLC would never be told. Held through the block in which the
+	 * commitment reaches that depth, in which the manager records the
+	 * ending, and not a block longer, so that nothing can keep the monitor
+	 * from being done.
+	 */
+	private _auxiliaryEndingsOwed(): boolean {
+		const broadcast = this._commitmentBroadcast;
+		const type = broadcast?.commitmentType;
+		if (
+			!broadcast ||
+			!this._channelState.auxiliaryState ||
+			(type !== CommitmentType.OUR_COMMITMENT &&
+				type !== CommitmentType.THEIR_CURRENT_COMMITMENT &&
+				type !== CommitmentType.THEIR_REVOKED_COMMITMENT) ||
+			(broadcast.blockHeight > 0 &&
+				this._currentBlockHeight - broadcast.blockHeight > IRREVOCABLE_DEPTH)
+		) {
+			return false;
+		}
+		return this._auxiliaryAbsentHtlcEndings(broadcast, true).some(
+			(ending) => !ending.recorded
 		);
 	}
 
@@ -2634,11 +2665,14 @@ export class ChainMonitor {
 	 * unsaid for that.
 	 */
 	private _auxiliaryAbsentHtlcEndings(
-		broadcast: ICommitmentBroadcast
+		broadcast: ICommitmentBroadcast,
+		/** What the list will be at that depth, for what is still owed. */
+		beforeDepth = false
 	): ReturnType<ChainMonitor['auxiliaryHtlcEndings']> {
 		if (
-			broadcast.blockHeight <= 0 ||
-			this._currentBlockHeight - broadcast.blockHeight < IRREVOCABLE_DEPTH
+			!beforeDepth &&
+			(broadcast.blockHeight <= 0 ||
+				this._currentBlockHeight - broadcast.blockHeight < IRREVOCABLE_DEPTH)
 		) {
 			return [];
 		}

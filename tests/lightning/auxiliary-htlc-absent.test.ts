@@ -11,7 +11,7 @@
  */
 
 import { expect } from 'chai';
-import { IRREVOCABLE_DEPTH } from '../../src/lightning/chain/types';
+import { IRREVOCABLE_DEPTH, OutputType } from '../../src/lightning/chain/types';
 import { PaymentStatus } from '../../src/lightning/node/types';
 import { withAssetOpens, type IAssetHost } from './helpers/auxiliary-nodes';
 import {
@@ -226,5 +226,50 @@ describe('the HTLCs of an asset channel that the confirmed commitment does not c
 		await world.mine(pair, 3);
 		expect(outcomes.alice).to.have.length(1);
 		expect(outcomes.bob).to.have.length(1);
+	});
+
+	it('says an HTLC has failed to a node that has no output of its own on the commitment that confirmed, and only then is done with the channel', async function () {
+		// Bob holds neither units nor bitcoin in the channel: the commitment
+		// of Alice pays him nothing, and he has nothing to sweep.
+		const pair = await world.open('aux-absent-no-output', {
+			acceptorUnits: 0n,
+			pushMsat: 0n,
+			feeWallet: { alice: true, bob: true },
+			hooks
+		});
+		for (const wallet of [pair.wallets.alice!, pair.wallets.bob!]) {
+			wallet.fund(100_000);
+			wallet.fund(100_000);
+		}
+		await world.mine(pair, 1);
+		gateMessages(pair, 'bob', () => true);
+		await holdUnits(pair, 5000n, 'no-output', 60, false);
+		expect(htlcsOf(pair.bob, pair)).to.have.length(1);
+
+		await closedAndAlmostBuried(pair, 'alice');
+		const monitorOf = (): { monitorState: string; own: number } => {
+			const state = pair.bob.node.getChannelMonitorState(pair.channelId);
+			return {
+				monitorState: String(state?.monitorState),
+				own: (state?.trackedOutputs ?? []).filter(
+					(output) => output.outputType !== OutputType.TO_LOCAL
+				).length
+			};
+		};
+		const short = monitorOf();
+		expect(outcomes.bob, 'one block short of the depth').to.deep.equal([]);
+		await world.mine(pair, 1);
+		expect(outcomes.bob).to.deep.equal(['RECEIVED:failed:5000']);
+		// Nothing on the commitment is Bob's, and his monitor was not done
+		// with the channel before that.
+		expect(short).to.deep.equal({ monitorState: 'RESOLVING', own: 0 });
+		await world.mine(pair, 2);
+		expect(outcomes.bob).to.deep.equal(['RECEIVED:failed:5000']);
+		expect(
+			String(
+				pair.bob.node.getChannelMonitorState(pair.channelId)?.monitorState ??
+					'FULLY_RESOLVED'
+			)
+		).to.equal('FULLY_RESOLVED');
 	});
 });
