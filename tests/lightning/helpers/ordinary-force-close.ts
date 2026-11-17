@@ -27,6 +27,7 @@ import type { IChannelState } from '../../../src/lightning/channel/channel-state
 import type { IFundingProvider } from '../../../src/lightning/node/types';
 import { ecc } from '../../../src/utils/ecc';
 import type { IOrdinaryRoundsEngine, OrdinaryKind } from './ordinary-rounds';
+import { AsyncLocalStorage } from 'async_hooks';
 import { TestChain, TestChainBackend } from './auxiliary-chain';
 
 export interface IOrdinaryForceCloseEngine extends IOrdinaryRoundsEngine {
@@ -173,19 +174,51 @@ function feeWallet(chain: TestChain, label: string): IFundingProvider {
 	return wallet as unknown as IFundingProvider;
 }
 
-export async function ordinaryForceClose(
+/**
+ * Marks what a scenario itself runs, through every await and callback of
+ * it, so that the counter in place of randomness serves the scenario alone.
+ */
+const scenarioScope = new AsyncLocalStorage<object>();
+
+export function ordinaryForceClose(
 	engine: IOrdinaryForceCloseEngine,
 	kind: OrdinaryKind,
 	scenario: 'current' | 'revoked',
 	actor: 'alice' | 'bob',
 	extraConfig: Partial<IChannelManagerConfig> = {}
 ): Promise<IOrdinaryForceCloseDigests> {
+	const scope = {};
+	return scenarioScope.run(scope, () =>
+		runOrdinaryForceClose(scope, engine, kind, scenario, actor, extraConfig)
+	);
+}
+
+async function runOrdinaryForceClose(
+	scope: object,
+	engine: IOrdinaryForceCloseEngine,
+	kind: OrdinaryKind,
+	scenario: 'current' | 'revoked',
+	actor: 'alice' | 'bob',
+	extraConfig: Partial<IChannelManagerConfig>
+): Promise<IOrdinaryForceCloseDigests> {
 	const realRandomBytes = crypto.randomBytes;
 	engine.randomBytes(1);
 	let counter = 0;
 	(crypto as unknown as { randomBytes: unknown }).randomBytes = (
-		size: number
+		size: number,
+		...rest: unknown[]
 	): Buffer => {
+		// A draw by anything else in the process, such as a timer another
+		// test file left behind, gets real randomness and does not move the
+		// counter: the scenario's draws depend on the scenario alone.
+		if (scenarioScope.getStore() !== scope) {
+			return (
+				realRandomBytes as unknown as (
+					size: number,
+					...rest: unknown[]
+				) => Buffer
+			)(size, ...rest);
+		}
 		const out = Buffer.alloc(size);
 		const n = counter++;
 		for (let i = 0; i < size; i += 32) {

@@ -545,6 +545,35 @@ const GOLDEN: Record<string, IGolden> = {
 describe('an ordinary channel ends on chain as it did before (issue #2093)', function () {
 	this.timeout(120_000);
 
+	it('a taproot channel with a revoked commitment of bob put on the chain, while something else in the process draws randomness', async () => {
+		// What made this file fail once in a full run. The counter that
+		// stands in for randomness was one for the whole process, so a draw
+		// by anything else while the scenario waited, such as a timer another
+		// test file left behind, moved every later draw of the scenario by
+		// one. The MuSig2 nonces of the commitment signatures are such draws.
+		// The revoked commitment is kept with its witness in the monitor's
+		// row, and nothing else that is compared here holds that witness.
+		let drawing = true;
+		const draw = (): void => {
+			if (!drawing) return;
+			crypto.randomBytes(32);
+			setImmediate(draw);
+		};
+		setImmediate(draw);
+		try {
+			const ended = await ordinaryForceClose(
+				ENGINE,
+				'taproot',
+				'revoked',
+				'bob'
+			);
+			expect(ended.errors).to.deep.equal([]);
+			expect(reduce(ended)).to.deep.equal(GOLDEN['taproot:revoked:bob']);
+		} finally {
+			drawing = false;
+		}
+	});
+
 	for (const [who, extra] of ORDINARY_NODES) {
 		for (const kind of ['static_remotekey', 'anchors', 'taproot'] as const) {
 			for (const scenario of ['current', 'revoked'] as const) {
