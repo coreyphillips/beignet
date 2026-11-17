@@ -157,10 +157,26 @@ describe('The daemon and an asset channel: channels counted for ordinary payment
 		expect(mixed.HAS_ACTIVE_CHANNEL.message).to.equal('1 active channel(s)');
 		expect(mixed.SCORE.score).to.be.lessThan(two.SCORE.score as number);
 
-		// An asset channel alone reads as a node with no channel yet.
-		expect(readiness([channel(500_000n, { auxiliary: true })])).to.deep.equal(
-			readiness([])
-		);
+		// An asset channel alone reads as a node with no ordinary channel
+		// yet: every status and the score are those of a node with no
+		// channel, and the two checks that say it has none say what they
+		// left out (tests/cli/asset-readiness-wording.test.ts has the words).
+		const none = readiness([]);
+		const assetOnly = readiness([channel(500_000n, { auxiliary: true })]);
+		expect(Object.keys(assetOnly)).to.deep.equal(Object.keys(none));
+		for (const name of Object.keys(none)) {
+			if (
+				name === 'ANCHOR_CHANNELS_PREFERRED' ||
+				name === 'SUFFICIENT_CHANNELS'
+			) {
+				expect(assetOnly[name].status, name).to.equal(none[name].status);
+				expect(assetOnly[name].message, name).to.match(
+					/^No ordinary Lightning channel yet.*; asset channels are not counted here$/
+				);
+			} else {
+				expect(assetOnly[name], name).to.deep.equal(none[name]);
+			}
+		}
 	});
 
 	it('holds the payment queues for an ordinary channel, and does not wait for an asset channel', () => {

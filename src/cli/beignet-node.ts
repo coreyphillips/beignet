@@ -16019,10 +16019,27 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 		// An asset channel is no second channel for that, and its bitcoin
 		// only carries asset outputs, so it says nothing about depletion:
 		// none of them reads it.
-		const channels = this.node.listChannels().filter((ch) => !ch.auxiliary);
+		const listed = this.node.listChannels();
+		const channels = listed.filter((ch) => !ch.auxiliary);
 		const readyChannels = channels.filter(
 			(ch) => ch.state === 'NORMAL' && !isHeldRestore(ch)
 		);
+		// A wallet whose only channels are asset channels has channels, and
+		// none that these checks count. The two checks that tell a wallet
+		// with no channel that it has none say what they left out then, in
+		// words that no wallet without an asset channel is ever told.
+		const noChannels =
+			channels.length === 0 && listed.some((ch) => ch.auxiliary)
+				? {
+						anchor:
+							'No ordinary Lightning channel yet (anchor will be used by default); asset channels are not counted here',
+						sufficient:
+							'No ordinary Lightning channel yet; asset channels are not counted here'
+				  }
+				: {
+						anchor: 'No channels yet (anchor will be used by default)',
+						sufficient: 'No channels yet'
+				  };
 
 		checks.push({
 			name: 'AUTO_RECONNECT_ENABLED',
@@ -16044,7 +16061,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 			message: hasAnchor
 				? 'Anchor channels in use (recommended for fee bumping)'
 				: channels.length === 0
-				? 'No channels yet (anchor will be used by default)'
+				? noChannels.anchor
 				: 'No anchor channels — consider opening anchor channels for improved fee management'
 		});
 
@@ -16114,7 +16131,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 				readyChannels.length >= 2
 					? `${readyChannels.length} ready channels (redundancy OK)`
 					: channels.length === 0
-					? 'No channels yet'
+					? noChannels.sufficient
 					: `Only ${readyChannels.length} ready channel — single channel is a point of failure`
 		});
 
