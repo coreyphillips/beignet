@@ -359,4 +359,74 @@ describe('the store of revoked asset views (issue #2093)', function () {
 			expect(() => deserializeAuxiliaryCommitmentView(text), text).to.throw();
 		}
 	});
+
+	it('tells its host how large the store of revoked views of a channel is, in rows and in bytes, and it grows with every commitment the peer revokes', async () => {
+		const { alice, bob, channelId } = await pair('aux-revoked-store-size');
+		const sizeOf = (
+			host: IAssetHost
+		): { rows: number; bytes: number } | undefined =>
+			host.node.getAuxiliaryChannelInfo(channelId)!.revokedViews;
+		// Asked before anything was revoked, and after every payment: what
+		// the host reads is what the table holds, kept current by the write
+		// of each row and never by reading every view again.
+		let last = sizeOf(alice)!;
+		expect(last).to.deep.equal(stored(alice, channelId));
+		for (let i = 0; i < 5; i++) {
+			await pay(alice, bob, channelId, 10n);
+			for (const host of [alice, bob]) {
+				expect(sizeOf(host)).to.deep.equal(stored(host, channelId));
+			}
+			const now = sizeOf(alice)!;
+			// Every payment revokes commitments of the peer, and each one
+			// revoked is a row more.
+			expect(now.rows).to.be.greaterThan(last.rows);
+			expect(now.bytes).to.be.greaterThan(last.bytes);
+			last = now;
+		}
+		expect(last.rows).to.be.greaterThan(inMemory(alice, channelId));
+		// What is handed out is a copy.
+		sizeOf(alice)!.rows = 0;
+		expect(sizeOf(alice)).to.deep.equal(last);
+
+		// A write of the channel row inside a transaction that is rolled
+		// back leaves the answer as it was.
+		const storage = alice.storage!;
+		const before = stored(alice, channelId);
+		expect(() =>
+			database(alice).transaction(() => {
+				const state = stateOf(alice, channelId);
+				const [number, view] = [
+					...state.auxiliaryState!.remoteCommitments.entries()
+				][0];
+				state.auxiliaryState!.revokedCommitments = new Map([
+					[number + 1_000_000n, view]
+				]);
+				storage.saveChannel(
+					channelId.toString('hex'),
+					state,
+					bob.node.getNodeId()
+				);
+				expect(sizeOf(alice)!.rows).to.equal(before.rows + 1);
+				throw new Error('rolled back');
+			})()
+		).to.throw('rolled back');
+		expect(sizeOf(alice)).to.deep.equal(before);
+		expect(stored(alice, channelId)).to.deep.equal(before);
+
+		// A storage asked for the first time, as after a restart, counts the
+		// table once.
+		const again = (
+			storage as unknown as {
+				_auxiliaryRevokedSizes: Map<string, unknown>;
+			}
+		)._auxiliaryRevokedSizes;
+		again.clear();
+		expect(sizeOf(alice)).to.deep.equal(before);
+
+		// The store goes with the channel.
+		storage.deleteChannel(channelId.toString('hex'));
+		expect(
+			storage.auxiliaryRevokedCommitmentsSize(channelId.toString('hex'))
+		).to.deep.equal({ rows: 0, bytes: 0 });
+	});
 });

@@ -265,3 +265,9 @@ A program that embeds the engine can give its Lightning node an auxiliary channe
 The reason for a small number: when a channel goes to the chain, every HTLC that is open is an output the node has to spend before a deadline, and each of those spends takes its fee from a wallet input of its own that the fee pool has to prepare, a few per preparation and a block each. A node with asset channels is an endpoint that makes and receives single payments, so a handful at once is all it needs. Raise the number only as far as the fee pool can pay for in the time the HTLCs leave.
 
 Ordinary channels are not touched by this setting.
+
+### The store of revoked views grows for as long as the channel lives
+
+For every commitment of the peer that the peer has revoked, the node keeps the asset side of that commitment (its view) in a store of its own, so that it can punish that commitment should it ever be published. Nothing in this store is ever trimmed while the channel lives: any revoked commitment may still reach the chain, and each has to stay punishable. The store therefore grows by one row with every commitment the peer revokes, which is every payment over the channel, in either direction, and it is dropped only with the channel.
+
+A host reads how large it has grown from `getAuxiliaryChannelInfo(channelId).revokedViews`, which answers `{ rows, bytes }`: the number of views kept for the channel and the bytes their values take in the database. The field is present when the node's storage keeps this store, which the SQLite backend does. The table is counted once, the first time a channel is asked about; after that every write of a view keeps the answer current, so reading it is cheap however large the store is. A host that plans its disk, or that wants to tell its user when a long-lived channel is worth closing and opening again, goes by this number.

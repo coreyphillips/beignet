@@ -1197,6 +1197,17 @@ export class SqliteStorage implements IStorageBackend {
 		);
 		const history = unsavedRevokedHtlcSnapshots(state, this);
 		const revokedViews = auxiliaryRevokedViewsToStore(state);
+		// The size of the store of revoked views, where a host has asked for
+		// it, is kept current by what this write adds. A write inside a
+		// transaction of the caller may yet be rolled back, so there the
+		// size is let go and counted again when it is next asked for.
+		let sized = revokedViews ? this._auxiliaryRevokedSizes.get(id) : undefined;
+		if (sized && this.db.inTransaction) {
+			this._auxiliaryRevokedSizes.delete(id);
+			sized = undefined;
+		}
+		let addedRows = 0;
+		let addedBytes = 0;
 		this.db.transaction(() => {
 			this._stmt(
 				'INSERT OR REPLACE INTO channels (channel_id, state_json, peer_pubkey) VALUES (?, ?, ?)'
@@ -1206,12 +1217,21 @@ export class SqliteStorage implements IStorageBackend {
 					'INSERT OR REPLACE INTO auxiliary_revoked_commitments ' +
 						'(channel_id, commitment_number, view_json) VALUES (?, ?, ?)'
 				);
+				const present = this._stmt(
+					'SELECT LENGTH(CAST(view_json AS BLOB)) AS bytes ' +
+						'FROM auxiliary_revoked_commitments ' +
+						'WHERE channel_id = ? AND commitment_number = ?'
+				);
 				for (const [commitmentNumber, view] of revokedViews) {
-					keep.run(
-						id,
-						commitmentNumber.toString(),
-						this._enc(serializeAuxiliaryCommitmentView(view))
-					);
+					const value = this._enc(serializeAuxiliaryCommitmentView(view));
+					if (sized) {
+						const replaced = present.get(id, commitmentNumber.toString()) as
+							| { bytes: number }
+							| undefined;
+						addedRows += replaced ? 0 : 1;
+						addedBytes += Buffer.byteLength(value) - (replaced?.bytes ?? 0);
+					}
+					keep.run(id, commitmentNumber.toString(), value);
 				}
 			}
 			if (!history?.size) return;
@@ -1228,6 +1248,42 @@ export class SqliteStorage implements IStorageBackend {
 				);
 			}
 		})();
+		if (sized) {
+			sized.rows += addedRows;
+			sized.bytes += addedBytes;
+		}
+	}
+
+	/** The size of the store of revoked views of each channel a host asked about. */
+	private _auxiliaryRevokedSizes = new Map<
+		string,
+		{ rows: number; bytes: number }
+	>();
+
+	/**
+	 * The rows and the bytes of the store of revoked views of one channel.
+	 * The table is counted the first time a channel is asked about; from
+	 * then on each write of a view keeps the answer current, so asking
+	 * costs nothing however large the store has grown.
+	 */
+	auxiliaryRevokedCommitmentsSize(channelId: string): {
+		rows: number;
+		bytes: number;
+	} {
+		let size = this._auxiliaryRevokedSizes.get(channelId);
+		if (!size) {
+			const counted = this._stmt(
+				'SELECT COUNT(*) AS n, ' +
+					'COALESCE(SUM(LENGTH(CAST(view_json AS BLOB))), 0) AS bytes ' +
+					'FROM auxiliary_revoked_commitments WHERE channel_id = ?'
+			).get(channelId) as { n: number; bytes: number };
+			size = { rows: counted.n, bytes: counted.bytes };
+			// What is counted inside a transaction may yet be rolled back.
+			if (!this.db.inTransaction) {
+				this._auxiliaryRevokedSizes.set(channelId, size);
+			}
+		}
+		return { rows: size.rows, bytes: size.bytes };
 	}
 
 	loadAuxiliaryRevokedCommitment(
@@ -1379,6 +1435,7 @@ export class SqliteStorage implements IStorageBackend {
 			).run(id);
 			this._stmt('DELETE FROM recovery_outbox WHERE channel_id = ?').run(id);
 		})();
+		this._auxiliaryRevokedSizes.delete(id);
 	}
 
 	// ─── Composite splice records (issue #1922) ───

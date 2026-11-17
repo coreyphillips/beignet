@@ -1699,6 +1699,7 @@ property channel.IAuxiliaryChannelInfo.nextLocalHtlcId: bigint
 property channel.IAuxiliaryChannelInfo.peerPubkey: string
 property channel.IAuxiliaryChannelInfo.remoteAssetBalance: bigint
 property channel.IAuxiliaryChannelInfo.remoteBalanceMsat: bigint
+property channel.IAuxiliaryChannelInfo.revokedViews?: { rows: number; bytes: number; }
 property channel.IAuxiliaryChannelInfo.shortChannelId?: Buffer
 property channel.IAuxiliaryChannelInfo.state: channel.ChannelState
 property channel.IAuxiliaryChannelInfo.temporaryChannelId: Buffer
@@ -8644,6 +8645,7 @@ property storage.ISerializedV2InFlight.remoteContributionSats: string
 property storage.ISerializedV2InFlight.sentTxSignatures: boolean
 property storage.ISerializedV2InFlight.weSignFirst: boolean
 interface storage.IStorageBackend extends storage.IStorageCore, Partial<storage.IFforStorage>, Partial<storage.ICompositeSpliceStorage>, Partial<storage.IInvoicePathIdStorage>, Partial<storage.IAnnouncedPeerAddressStorage>, Partial<storage.IChannelKeyIndexHistoryStorage>, Partial<storage.IMetadataScanStorage>, Partial<storage.IWalletDataStorage>, Partial<storage.IGossipPagingStorage>, Partial<storage.IGossipPruningStorage>, Partial<storage.IChannelPolicyStorage>, Partial<storage.IPeerStorageBlobStorage>, Partial<storage.IForwardingStorage>, Partial<storage.IActionLogStorage>, Partial<storage.IWatchtowerStorage>, Partial<storage.IRecoveryOutboxStorage>, Partial<storage.IRecoveryJournalStorage>, Partial<storage.IOfferStorage>
+method storage.IStorageBackend.auxiliaryRevokedCommitmentsSize?(channelId: string): { rows: number; bytes: number; }
 method storage.IStorageBackend.checkpoint?(): void
 method storage.IStorageBackend.corruptRowCount?(): number
 method storage.IStorageBackend.inTransaction?(): boolean

@@ -30432,6 +30432,16 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			return undefined;
 		}
 		const scid = state.shortChannelId ?? state.scidAlias;
+		// How large the store of revoked views has grown, where the storage
+		// keeps one. A storage that cannot say leaves the field out.
+		let revokedViews: { rows: number; bytes: number } | undefined;
+		try {
+			revokedViews = this.storage?.auxiliaryRevokedCommitmentsSize?.(
+				state.channelId.toString('hex')
+			);
+		} catch {
+			revokedViews = undefined;
+		}
 		return {
 			channelId: Buffer.from(state.channelId),
 			temporaryChannelId: Buffer.from(state.temporaryChannelId),
@@ -30451,6 +30461,14 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			...(scid ? { shortChannelId: Buffer.from(scid) } : {}),
 			...(auxiliary.resolvedHtlcs && auxiliary.resolvedHtlcs.size > 0
 				? { undeliveredOutcomes: auxiliary.resolvedHtlcs.size }
+				: {}),
+			...(revokedViews
+				? {
+						revokedViews: {
+							rows: revokedViews.rows,
+							bytes: revokedViews.bytes
+						}
+				  }
 				: {}),
 			htlcs: [...state.htlcs.values()]
 				.filter(

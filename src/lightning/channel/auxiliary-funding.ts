@@ -63,6 +63,16 @@ export interface IAuxiliaryChannelInfo {
 	 * the channel takes no further asset HTLC.
 	 */
 	undeliveredOutcomes?: number;
+	/**
+	 * How large the store of revoked views of the channel is: `rows`, one
+	 * for each commitment of the peer whose asset side the node keeps so
+	 * that it can punish that commitment, and `bytes`, what their values
+	 * take in the database. It grows by a row with every commitment the
+	 * peer revokes (two for a payment that settles) and is not trimmed
+	 * while the channel lives; it is dropped with the channel. Present when
+	 * the node's storage keeps that store, which the SQLite backend does.
+	 */
+	revokedViews?: { rows: number; bytes: number };
 	/** The HTLCs in flight on the channel, each side's, with what they carry. */
 	htlcs: IAuxiliaryChannelHtlc[];
 }

@@ -604,6 +604,19 @@ export interface IStorageBackend
 		channelId: string,
 		commitmentNumber: bigint
 	): IAuxiliaryCommitmentData | null;
+	/**
+	 * How large the store of revoked views of one channel is: the rows it
+	 * holds, one for each commitment of the peer whose asset side is kept,
+	 * and the bytes their values take in the database. The store grows by
+	 * a row with every commitment the peer revokes and is never trimmed
+	 * while the channel lives, since any of those commitments may still be
+	 * published and has to stay punishable. Only on a backend that has
+	 * `loadAuxiliaryRevokedCommitment`.
+	 */
+	auxiliaryRevokedCommitmentsSize?(channelId: string): {
+		rows: number;
+		bytes: number;
+	};
 	/** True while any transaction is open on this backend, however opened. */
 	inTransaction?(): boolean;
 	/** Checkpoint the WAL file, flushing pending writes to the main database. */
