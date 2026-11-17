@@ -1029,7 +1029,7 @@ constructor channel.AuxiliaryProviderError(channelId: string, operation: string,
 readonly property channel.AuxiliaryProviderError.channelId: string
 readonly property channel.AuxiliaryProviderError.operation: string
 type channel.AuxiliarySpendKind = 'to_local_delayed' | 'to_local_revocation' | 'to_remote' | 'htlc_timeout' | 'htlc_success' | 'htlc_second_level_timeout' | 'htlc_second_level_success' | 'htlc_revocation' | 'second_level_delayed' | 'second_level_revocation'
-type channel.AuxiliaryUnsupportedOperation = 'a simple close' | 'a close to an address of the caller' | 'a splice' | 'quiescence' | 'a delegated settlement epoch'
+type channel.AuxiliaryUnsupportedOperation = 'a simple close' | 'a close to an address of the caller' | 'a splice' | 'quiescence' | 'a delegated settlement epoch' | 'an announcement'
 const channel.BITCOIN_CHAIN_HASH: Buffer
 const channel.CHANNEL_INDEX_FLOOR_MAX: number
 const channel.CHANNEL_INDEX_FLOOR_STRIDE = 128

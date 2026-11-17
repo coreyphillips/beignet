@@ -17437,6 +17437,10 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			const st = channel.getFullState();
 			return (
 				st.announceChannel === true &&
+				// An asset channel is never announced, whatever its record
+				// says, so it is never the public channel that takes the
+				// private paths away.
+				!st.auxiliaryState &&
 				st.announcementSigsSent &&
 				st.announcementSigsReceived &&
 				!(

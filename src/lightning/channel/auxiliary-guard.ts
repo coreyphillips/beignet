@@ -23,7 +23,8 @@ export type AuxiliaryUnsupportedOperation =
 	| 'a close to an address of the caller'
 	| 'a splice'
 	| 'quiescence'
-	| 'a delegated settlement epoch';
+	| 'a delegated settlement epoch'
+	| 'an announcement';
 
 export class AuxiliaryChannelUnsupportedError extends CodedError<'ASSET_CHANNEL_UNSUPPORTED'> {
 	/** The channel id, or the temporary id of a channel that has none yet, hex. */

@@ -2757,6 +2757,16 @@ export class Channel {
 				}
 			);
 			if (auxiliaryError) return refuse(auxiliaryError);
+			// An asset channel is never announced: its capacity is not bitcoin
+			// that a payment could be routed over. Our own opening never sets
+			// the bit, so only a peer's can, and the peer is told why.
+			const announced =
+				(msg.channelFlags & 0x01) !== 0
+					? auxiliaryUnsupported(this._state, 'an announcement')
+					: undefined;
+			if (announced) {
+				return refuse(`open_channel refused: ${announced.message}`);
+			}
 		}
 
 		// Peer-supplied, so the bounds that only apply to a value we did not

@@ -923,6 +923,26 @@ describe('an asset channel opens over open_channel (issue #2093 step 7)', functi
 			expect(p.bob.nextChannelIndex).to.equal(before);
 		});
 
+		it('an opening that asks for the asset channel to be announced', () => {
+			const p = opening(8233);
+			const before = p.bob.nextChannelIndex;
+			// Alice's own opening never sets announce_channel, so it is put to
+			// Bob as a peer that sets it would send it.
+			rewriteOpen(p, (message) => ({
+				channelFlags: message.channelFlags | 0x01
+			}));
+			p.alice.openChannel(p.bobPubkey, FUNDING, PUSH, undefined, {
+				auxiliary: p.descriptor
+			});
+			refused(
+				p,
+				`open_channel refused: An asset channel does not support an announcement (channel ${p.descriptor.temporaryChannelId.toString(
+					'hex'
+				)})`
+			);
+			expect(p.bob.nextChannelIndex).to.equal(before);
+		});
+
 		it('an opening that pushes it no bitcoin to carry its asset units', () => {
 			const p = opening(8227);
 			const before = p.bob.nextChannelIndex;
