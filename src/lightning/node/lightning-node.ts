@@ -24729,6 +24729,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		if (height <= 0) return;
 
 		this.endAssetHoldsEndedOnChain();
+		this.failAssetPaymentsEndedOnChain();
 
 		this.resolveAssetHoldsLeftBehind(height);
 		// A set with an outcome already chosen retries that outcome instead:
@@ -33454,6 +33455,71 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	}
 
 	/**
+	 * Asset channels: an HTLC this node offered for a payment of its own
+	 * that is on no output of the commitment that confirmed has failed once
+	 * that commitment is there for good (issue #2093 step 10). No output
+	 * resolves for it, so nothing else would end the record of the payment
+	 * before every other output of the channel is swept, which can wait on
+	 * a fee coin for as long as the wallet has none. Read from the chain
+	 * monitor on every block, so a restart loses none.
+	 */
+	private failAssetPaymentsEndedOnChain(): void {
+		for (const [key, hashHex] of [...this.htlcPaymentMap]) {
+			const payment = this.payments.get(hashHex);
+			if (
+				!payment ||
+				payment.direction !== PaymentDirection.OUTGOING ||
+				payment.status !== PaymentStatus.PENDING ||
+				this.preimages.has(hashHex)
+			) {
+				continue;
+			}
+			const [channelIdHex, rest] = key.split(':offered-');
+			if (!channelIdHex || rest === undefined) continue;
+			const channelId = Buffer.from(channelIdHex, 'hex');
+			if (!this.channelManager.auxiliaryChannelOnChain(channelId)) continue;
+			let htlcId: bigint;
+			try {
+				htlcId = BigInt(rest);
+			} catch {
+				continue;
+			}
+			// An HTLC with an output is ended by the spend of that output
+			// (handleOnChainOutputResolved).
+			if (
+				this.channelManager
+					.getMonitor(channelId)
+					?.getTrackedOutputs()
+					.some(
+						(o) =>
+							o.outputType === OutputType.OFFERED_HTLC && o.htlcId === htlcId
+					) ||
+				this.channelManager.auxiliaryHtlcChainEnding(
+					channelId,
+					HtlcDirection.OFFERED,
+					htlcId
+				) !== 'failed'
+			) {
+				continue;
+			}
+			const paymentHash = Buffer.from(hashHex, 'hex');
+			if (
+				this.failPaymentUnlessInFlight(
+					paymentHash,
+					'HTLC was not in the commitment that confirmed'
+				)
+			) {
+				this.emitHtlcResolved(
+					paymentHash,
+					channelId,
+					htlcId,
+					'onchain-resolved'
+				);
+			}
+		}
+	}
+
+	/**
 	 * Asset channels: a held HTLC whose channel went on chain has ended
 	 * there (issue #2093 step 10). Claimed with the preimage, its invoice
 	 * ends paid as a settled hold does; taken back by the payer, it ends
@@ -35896,7 +35962,17 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 					// revocation never comes, and the commitment that went to
 					// chain carries no output for it. A CLOSED channel has
 					// nothing left to resolve.
-					terminal = channelState === ChannelState.CLOSED;
+					//
+					// Asset channels: the monitor says such an HTLC has ended
+					// once the commitment that confirmed is there for good,
+					// whatever the other outputs of the channel still wait for.
+					terminal =
+						channelState === ChannelState.CLOSED ||
+						this.channelManager.auxiliaryHtlcChainEnding(
+							channelId,
+							HtlcDirection.OFFERED,
+							htlc.id
+						) !== undefined;
 					state = terminal ? 'onchain-resolved' : 'onchain-pending';
 				} else if (htlc.state === HtlcState.FULFILLED) {
 					state = 'fulfilled';

@@ -40,8 +40,9 @@ import {
 } from './output-resolver';
 import { csvFromToLocalScript } from '../script/commitment';
 import type { IChannelState } from '../channel/channel-state';
-import { isAnchorChannel } from '../channel/types';
+import { HtlcDirection, HtlcState, isAnchorChannel } from '../channel/types';
 import {
+	auxiliaryCommitmentView,
 	auxiliarySweepDataOf,
 	noteAuxiliarySweep,
 	noteAuxiliarySweepOffered,
@@ -2548,6 +2549,10 @@ export class ChainMonitor {
 	 * received is fulfilled when its own spend took it (the preimage) and
 	 * has failed when the peer's did. Nothing for a revoked commitment,
 	 * whose HTLCs are not the channel's, and nothing for any other channel.
+	 *
+	 * An HTLC the channel holds that is on no output of the commitment that
+	 * confirmed is in the list too, marked absent, once that commitment is
+	 * there for good (_auxiliaryAbsentHtlcEndings).
 	 */
 	auxiliaryHtlcEndings(): Array<{
 		txid: string;
@@ -2556,9 +2561,12 @@ export class ChainMonitor {
 		offered: boolean;
 		outcome: 'fulfilled' | 'failed';
 		recorded: boolean;
+		absent?: true;
 	}> {
-		const type = this._commitmentBroadcast?.commitmentType;
+		const broadcast = this._commitmentBroadcast;
+		const type = broadcast?.commitmentType;
 		if (
+			!broadcast ||
 			!this._channelState.auxiliaryState ||
 			(type !== CommitmentType.OUR_COMMITMENT &&
 				type !== CommitmentType.THEIR_CURRENT_COMMITMENT)
@@ -2590,6 +2598,70 @@ export class ChainMonitor {
 				recorded: output.auxiliaryOutcomeRecorded === true
 			});
 		}
+		endings.push(...this._auxiliaryAbsentHtlcEndings(broadcast));
+		return endings;
+	}
+
+	/**
+	 * Asset channels: the HTLCs with units the channel still holds that are
+	 * on no output of the commitment that confirmed, once that commitment
+	 * is there for good. Such an HTLC was not yet in the commitment, or had
+	 * left it with the revocation for that still owed, and nothing on the
+	 * chain will ever say how it ended. It is fulfilled when the preimage
+	 * had been given for it: it left the commitment by that, and its units
+	 * are on the balance output of the side that was paid. It has failed
+	 * otherwise: its units are on the balance output of the side that
+	 * offered it. An HTLC that left the channel before the commitment was
+	 * made is not held any more, was told then, and is not in this list.
+	 *
+	 * Nothing while the view of the commitment is not held, by which alone
+	 * the node knows what the commitment carries, and nothing for an HTLC
+	 * the view names: that one has an output, whose spend says its ending.
+	 */
+	private _auxiliaryAbsentHtlcEndings(
+		broadcast: ICommitmentBroadcast
+	): ReturnType<ChainMonitor['auxiliaryHtlcEndings']> {
+		if (
+			broadcast.blockHeight <= 0 ||
+			this._currentBlockHeight - broadcast.blockHeight < IRREVOCABLE_DEPTH
+		) {
+			return [];
+		}
+		const view = auxiliaryCommitmentView(
+			this._channelState,
+			broadcast.commitmentType === CommitmentType.OUR_COMMITMENT,
+			broadcast.commitmentNumber
+		);
+		if (!view) return [];
+		const endings: ReturnType<ChainMonitor['auxiliaryHtlcEndings']> = [];
+		for (const entry of this._channelState.htlcs.values()) {
+			if (entry.auxiliaryAmount === undefined) continue;
+			const offered = entry.direction === HtlcDirection.OFFERED;
+			const key = `${entry.direction}:${entry.id}`;
+			const type = offered ? OutputType.OFFERED_HTLC : OutputType.RECEIVED_HTLC;
+			if (
+				view.htlcOutputIndexes?.has(key) ||
+				this._trackedOutputs.some(
+					(output) =>
+						output.txid === broadcast.txid &&
+						!output.isSecondLevelHtlc &&
+						output.outputType === type &&
+						output.htlcId === entry.id
+				)
+			) {
+				continue;
+			}
+			endings.push({
+				txid: broadcast.txid,
+				outputIndex: -1,
+				htlcId: entry.id,
+				offered,
+				outcome: entry.state === HtlcState.FULFILLED ? 'fulfilled' : 'failed',
+				recorded:
+					broadcast.auxiliaryAbsentHtlcsRecorded?.includes(key) === true,
+				absent: true
+			});
+		}
 		return endings;
 	}
 
@@ -2599,6 +2671,23 @@ export class ChainMonitor {
 			(o) => o.txid === txid && o.outputIndex === outputIndex
 		);
 		if (output) output.auxiliaryOutcomeRecorded = true;
+	}
+
+	/**
+	 * The ending of an HTLC that is on no output of the commitment that
+	 * confirmed is in the channel's row.
+	 */
+	noteAuxiliaryAbsentHtlcRecorded(offered: boolean, htlcId: bigint): void {
+		const broadcast = this._commitmentBroadcast;
+		if (!broadcast) return;
+		const key = `${
+			offered ? HtlcDirection.OFFERED : HtlcDirection.RECEIVED
+		}:${htlcId}`;
+		if (broadcast.auxiliaryAbsentHtlcsRecorded?.includes(key)) return;
+		broadcast.auxiliaryAbsentHtlcsRecorded = [
+			...(broadcast.auxiliaryAbsentHtlcsRecorded ?? []),
+			key
+		];
 	}
 
 	private _handleCooperativeClose(actions: ChainAction[]): ChainAction[] {

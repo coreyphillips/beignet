@@ -12050,7 +12050,14 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 					continue;
 				}
 			}
-			monitor.noteAuxiliaryHtlcEndingRecorded(ending.txid, ending.outputIndex);
+			if (ending.absent) {
+				monitor.noteAuxiliaryAbsentHtlcRecorded(ending.offered, ending.htlcId);
+			} else {
+				monitor.noteAuxiliaryHtlcEndingRecorded(
+					ending.txid,
+					ending.outputIndex
+				);
+			}
 			recorded++;
 		}
 		if (recorded === 0) return;

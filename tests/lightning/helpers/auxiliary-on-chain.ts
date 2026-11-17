@@ -243,7 +243,9 @@ export async function holdUnits(
 	pair: IAssetChainPair,
 	units: bigint,
 	tag: string,
-	expiryDelta = 60
+	expiryDelta = 60,
+	/** False for an offer that is not to reach the peer, or not to stay. */
+	inFlight = true
 ): Promise<{ paymentHash: Buffer; preimage: Buffer; cltvExpiry: number }> {
 	const { alice, bob, channelId, chain } = pair;
 	const preimage = hash(`held preimage ${tag}`);
@@ -295,7 +297,7 @@ export async function holdUnits(
 	].filter((entry) => entry.paymentHash.equals(paymentHash));
 	// The expiry the HTLC has in the channel, which is what the chain goes by.
 	const cltvExpiry = entries[0]?.cltvExpiry ?? 0;
-	if (entries.length !== 1) {
+	if (inFlight && entries.length !== 1) {
 		throw new Error(
 			`the held HTLC of ${tag} is not in flight: ${alice.errors
 				.concat(bob.errors)
@@ -315,6 +317,41 @@ export function disconnect(pair: IAssetChainPair): void {
 	pair.bob.node
 		.getChannelManager()
 		.handlePeerDisconnected(pair.alice.node.getNodeId());
+}
+
+/**
+ * Test only: stand between one node and the other. What the gate refuses
+ * is kept, in order, and `release()` hands it over; everything else that
+ * node sends passes as before, and so does all the other node sends.
+ */
+export function gateMessages(
+	pair: IAssetChainPair,
+	from: 'alice' | 'bob',
+	refuse: (type: number, payload: Buffer) => boolean
+): { kept: Array<{ type: number; payload: Buffer }>; release: () => void } {
+	const sender = pair[from].node;
+	const receiver = pair[from === 'alice' ? 'bob' : 'alice'].node;
+	const kept: Array<{ type: number; payload: Buffer }> = [];
+	const deliver = (type: number, payload: Buffer): void => {
+		receiver.handlePeerMessage(sender.getNodeId(), type, payload);
+	};
+	sender.removeAllListeners('message:outbound');
+	sender.on(
+		'message:outbound',
+		(pubkey: string, type: number, payload: Buffer) => {
+			if (pubkey !== receiver.getNodeId()) return;
+			if (refuse(type, payload)) kept.push({ type, payload });
+			else deliver(type, payload);
+		}
+	);
+	return {
+		kept,
+		release: (): void => {
+			for (const message of kept.splice(0)) {
+				deliver(message.type, message.payload);
+			}
+		}
+	};
 }
 
 /** The outputs a host's monitor tracks for a channel, through the host's read. */
@@ -419,7 +456,9 @@ export function assetChainWorld(): {
 		tag: string,
 		control?: ISweepControl,
 		/** Runs while Alice is down, as what puts another copy of her store in place. */
-		whileDown?: () => void
+		whileDown?: () => void,
+		/** The hooks her host has again once she is back. */
+		hooks?: Partial<IAuxiliaryChannelConfig>
 	): Promise<void>;
 	mine(pair: IAssetChainPair, blocks: number): Promise<void>;
 	/**
@@ -611,7 +650,7 @@ export function assetChainWorld(): {
 			}
 			return pair;
 		},
-		async restartAlice(pair, tag, control, whileDown): Promise<void> {
+		async restartAlice(pair, tag, control, whileDown, hooks): Promise<void> {
 			pair.alice.node.destroy();
 			pair.alice.storage?.close();
 			pair.backends.alice.close();
@@ -628,7 +667,7 @@ export function assetChainWorld(): {
 				pair.chain,
 				pair.sweeps.alice,
 				control,
-				undefined,
+				hooks,
 				pair.alicePath,
 				pair.wallets.alice
 			);

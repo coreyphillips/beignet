@@ -295,6 +295,12 @@ export interface ICommitmentBroadcast {
 	 * transaction that conflicts with a live claim of our own.
 	 */
 	claimedOutputIndices?: number[];
+	/**
+	 * Asset channels: the HTLCs with units that are on no output of this
+	 * commitment and whose ending was put in the channel's row for its host
+	 * (onHtlcResolved), each as `DIRECTION:id`.
+	 */
+	auxiliaryAbsentHtlcsRecorded?: string[];
 }
 
 /**

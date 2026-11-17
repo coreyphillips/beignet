@@ -607,7 +607,7 @@ constructor chain.ChainBackendUnavailableError(message: string)
 class chain.ChainMonitor
 constructor chain.ChainMonitor(channelState: channel.IChannelState, destinationScript: Buffer, feeRatePerVbyte: number, revocationBasepointSecret: Buffer, paymentPrivkey: Buffer, network?: bitcoinjs-lib#Network, delayedPaymentBasepointSecret?: Buffer, htlcBasepointSecret?: Buffer)
 method chain.ChainMonitor.addPreimage(paymentHash: Buffer, preimage: Buffer): chain.ChainAction[]
-method chain.ChainMonitor.auxiliaryHtlcEndings(): Array<{ txid: string; outputIndex: number; htlcId: bigint; offered: boolean; outcome: 'fulfilled' | 'failed'; recorded: boolean; }>
+method chain.ChainMonitor.auxiliaryHtlcEndings(): Array<{ txid: string; outputIndex: number; htlcId: bigint; offered: boolean; outcome: 'fulfilled' | 'failed'; recorded: boolean; absent?: true; }>
 method chain.ChainMonitor.dropUnusedPreimages(heldElsewhere: ReadonlyMap<string, Buffer>): number
 method chain.ChainMonitor.fixedOutputFeeRaise(output: chain.ITrackedOutput, feeRatePerVbyte: number): chain.IFeeBumpAndBroadcastChainAction | undefined
 method chain.ChainMonitor.fixedOutputFeeResolved(txid: string, outputIndex: number, evenIfNotOpen?: boolean): { spendingTransaction?: Buffer; } | undefined
@@ -627,6 +627,7 @@ method chain.ChainMonitor.handleSpendUnconfirmed(txid: string, outputIndex: numb
 method chain.ChainMonitor.isCommitmentConfirmed(): boolean
 method chain.ChainMonitor.isCommitmentReverifyPending(): boolean
 method chain.ChainMonitor.isFullyResolved(): boolean
+method chain.ChainMonitor.noteAuxiliaryAbsentHtlcRecorded(offered: boolean, htlcId: bigint): void
 method chain.ChainMonitor.noteAuxiliaryHtlcEndingRecorded(txid: string, outputIndex: number): void
 method chain.ChainMonitor.noteFixedOutputFeeRetired(txid: string, outputIndex: number): void
 method chain.ChainMonitor.noteFixedOutputFeeWait(txid: string, outputIndex: number, wait: { code: string; remedy?: string; message?: string; }, height?: number): void
@@ -779,6 +780,7 @@ interface chain.IClosingTxResult
 property chain.IClosingTxResult.outputMap: { local?: number; remote?: number; }
 property chain.IClosingTxResult.tx: bitcoinjs-lib#Transaction
 interface chain.ICommitmentBroadcast
+property chain.ICommitmentBroadcast.auxiliaryAbsentHtlcsRecorded?: string[]
 property chain.ICommitmentBroadcast.blockHeight: number
 property chain.ICommitmentBroadcast.claimedOutputIndices?: number[]
 property chain.ICommitmentBroadcast.commitmentNumber: bigint
