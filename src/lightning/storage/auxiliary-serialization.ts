@@ -61,6 +61,7 @@ export interface ISerializedAuxiliaryState {
 	remoteShutdownRecords?: SerializedCustomRecords;
 	closeTransactions?: [string, string][];
 	acceptedClosingSigned?: string;
+	unrecordedCloseTxid?: string;
 	fundingSignedDelivered?: true;
 	localCommitments: [string, ISerializedAuxiliaryCommitment][];
 	remoteCommitments: [string, ISerializedAuxiliaryCommitment][];
@@ -360,6 +361,9 @@ function encodeAuxiliaryState(
 		...(state.acceptedClosingSigned
 			? { acceptedClosingSigned: state.acceptedClosingSigned.toString('hex') }
 			: {}),
+		...(state.unrecordedCloseTxid !== undefined
+			? { unrecordedCloseTxid: state.unrecordedCloseTxid }
+			: {}),
 		...(state.fundingSignedDelivered === true
 			? { fundingSignedDelivered: true as const }
 			: {}),
@@ -485,6 +489,9 @@ export function deserializeAuxiliaryState(
 		...(state.acceptedClosingSigned !== undefined
 			? { acceptedClosingSigned: bytes(state.acceptedClosingSigned) }
 			: {}),
+		...(state.unrecordedCloseTxid !== undefined
+			? { unrecordedCloseTxid: closeIdentity(state.unrecordedCloseTxid) }
+			: {}),
 		...(state.fundingSignedDelivered !== undefined
 			? { fundingSignedDelivered: delivered(state.fundingSignedDelivered) }
 			: {}),
@@ -533,5 +540,13 @@ function childPoint(value: string): Buffer {
 function childTxid(value: string): string {
 	if (!/^[0-9a-f]{64}$/.test(value))
 		throw new Error('Malformed child custody transaction');
+	return value;
+}
+
+/** The txid of a closing transaction, as a row holds it. */
+function closeIdentity(value: unknown): string {
+	if (typeof value !== 'string' || !/^[a-f0-9]{64}$/.test(value)) {
+		throw new Error('Malformed serialized asset close identity');
+	}
 	return value;
 }

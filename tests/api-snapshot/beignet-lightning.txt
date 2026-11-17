@@ -110,6 +110,7 @@ property ISerializedAuxiliaryState.remoteCommitments: [ string, ISerializedAuxil
 property ISerializedAuxiliaryState.remoteShutdownRecords?: SerializedCustomRecords
 property ISerializedAuxiliaryState.resolvedHtlcs?: [ string, { htlcId: string; direction: channel.HtlcDirection; paymentHash: string; auxiliaryAmount: string; customRecords?: SerializedCustomRecords; outcome: 'fulfilled' | 'failed'; } ][]
 property ISerializedAuxiliaryState.revokedCommitments?: [ string, ISerializedAuxiliaryCommitment ][]
+property ISerializedAuxiliaryState.unrecordedCloseTxid?: string
 unexported interface ISpliceUtxo
 property ISpliceUtxo.address: string
 property ISpliceUtxo.height: number
@@ -1230,6 +1231,7 @@ method channel.Channel.markResolved(): boolean
 method channel.Channel.markSpliceConfirmed(): void
 method channel.Channel.markSpliceConflicted(conflict: { txid: string; height: number; inputIndex: number; }): boolean
 method channel.Channel.markSpliceSeenOnChain(height: number): boolean
+method channel.Channel.markUnrecordedAuxiliaryClose(txid: string | null): boolean
 method channel.Channel.needsCommitment(): boolean
 method channel.Channel.noteSpliceConflictRequest(at: number): void
 method channel.Channel.oweWatchtowerBackup(perCommitmentSecret: Buffer, tx: Buffer): void
@@ -1896,6 +1898,7 @@ property channel.IChannelAuxiliaryState.remoteShutdownRecords?: Map<bigint, Buff
 property channel.IChannelAuxiliaryState.resolvedHtlcs?: Map<string, channel.IAuxiliaryHtlcResolution>
 property channel.IChannelAuxiliaryState.revokedCommitmentHeld?: bigint
 property channel.IChannelAuxiliaryState.revokedCommitments?: Map<bigint, channel.IAuxiliaryCommitmentData>
+property channel.IChannelAuxiliaryState.unrecordedCloseTxid?: string
 interface channel.IChannelClosedAction
 property channel.IChannelClosedAction.channelId: Buffer
 property channel.IChannelClosedAction.type: channel.ChannelActionType.CHANNEL_CLOSED
@@ -6434,7 +6437,7 @@ property node.LightningNodeEvents.'bolt12:invoice:issued': (invoice: offer.IBolt
 property node.LightningNodeEvents.'bolt12:invoice:received': (invoice: offer.IBolt12Invoice) => void
 property node.LightningNodeEvents.'broadcast:tx': (tx: Buffer) => void
 property node.LightningNodeEvents.'channel:aborted': (temporaryChannelId: Buffer, reason: string) => void
-property node.LightningNodeEvents.'channel:closed': (data: { channelId: Buffer; }) => void
+property node.LightningNodeEvents.'channel:closed': (data: { channelId: Buffer; unrecordedCloseTxid?: string; }) => void
 property node.LightningNodeEvents.'channel:force-closing': (data: { channelId: Buffer; initiator: 'local' | 'remote'; }) => void
 property node.LightningNodeEvents.'channel:opening': (data: { channelId: Buffer; fundingTxid: Buffer; }) => void
 property node.LightningNodeEvents.'channel:pending-close': (data: { channelId: Buffer; initiator: 'local' | 'remote'; }) => void

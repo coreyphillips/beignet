@@ -5563,9 +5563,18 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			// commitment-swap handling needs the watch alive to see the
 			// replacement; the watcher retires spends itself at IRREVOCABLE_DEPTH,
 			// and 'channel:resolved' cleans up below.
-			this.emit('channel:closed', { channelId });
+			// An asset channel that ended on a transaction this node holds no
+			// close payload for: the host is told with the close.
+			const unrecordedCloseTxid = this.channelManager
+				.getChannel(channelId)
+				?.getFullState().auxiliaryState?.unrecordedCloseTxid;
+			this.emit('channel:closed', {
+				channelId,
+				...(unrecordedCloseTxid ? { unrecordedCloseTxid } : {})
+			});
 			this.emitStructuredLog('channel', 'closed', {
-				channelId: channelId.toString('hex')
+				channelId: channelId.toString('hex'),
+				...(unrecordedCloseTxid ? { unrecordedCloseTxid } : {})
 			});
 		});
 

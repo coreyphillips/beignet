@@ -9189,6 +9189,22 @@ export class Channel {
 	}
 
 	/**
+	 * Mark the spend of the funding output this node took for the
+	 * cooperative close as one it holds no close payload for, or take the
+	 * mark away with null. Returns whether the durable state changed: the
+	 * caller writes the row and tells the host only then. Nothing for a
+	 * channel without asset state.
+	 */
+	markUnrecordedAuxiliaryClose(txid: string | null): boolean {
+		const auxiliary = this._state.auxiliaryState;
+		if (!auxiliary) return false;
+		if ((auxiliary.unrecordedCloseTxid ?? null) === txid) return false;
+		if (txid === null) delete auxiliary.unrecordedCloseTxid;
+		else auxiliary.unrecordedCloseTxid = txid;
+		return true;
+	}
+
+	/**
 	 * Keep the provider's payload for a closing transaction this node is
 	 * about to sign. The manager calls it before our signature exists, and
 	 * the row is written before that signature leaves.

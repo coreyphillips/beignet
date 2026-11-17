@@ -185,8 +185,15 @@ export interface LightningNodeEvents
 		channelId: Buffer;
 		initiator: 'local' | 'remote';
 	}) => void;
-	/** Channel closed. */
-	'channel:closed': (data: { channelId: Buffer }) => void;
+	/**
+	 * Channel closed. `unrecordedCloseTxid` is present only for an asset
+	 * channel whose funding output was spent by a transaction the node took
+	 * for the cooperative close and holds no close payload for.
+	 */
+	'channel:closed': (data: {
+		channelId: Buffer;
+		unrecordedCloseTxid?: string;
+	}) => void;
 	/** All on-chain outputs of the close resolved. */
 	'channel:resolved': (data: { channelId: Buffer }) => void;
 	/** A negotiated but unfunded open was torn down. */

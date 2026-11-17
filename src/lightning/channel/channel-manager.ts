@@ -4159,6 +4159,21 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			if (channel) {
 				const isCoop =
 					broadcast.commitmentType === CommitmentType.COOPERATIVE_CLOSE;
+				// An asset channel: every spend of the funding output that is
+				// no commitment is taken for the cooperative close, also one
+				// this node never signed and holds no close payload for. The
+				// channel ends as it does, and the row says which transaction
+				// that was, so that the host is told with the close, once, and
+				// can still read it after a restart.
+				const assetClose = channel.getFullState().auxiliaryState;
+				const unrecordedChanged = assetClose
+					? channel.markUnrecordedAuxiliaryClose(
+							isCoop && !assetClose.closeTransactions?.has(broadcast.txid)
+								? broadcast.txid
+								: null
+					  )
+					: false;
+				let closedNow = false;
 				// A peer commitment seen only in the MEMPOOL must not close the
 				// channel yet (issue #559): flipping to FORCE_CLOSED here disarms
 				// the scanExpiringHtlcs deadline backstop, so a peer parking a
@@ -4190,6 +4205,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 						);
 					}
 				} else if (channel.markClosedOnChain(!isCoop)) {
+					closedNow = true;
 					// A non-coop spend of a channel we did not already force-close
 					// is the peer's unilateral close (current, future, or revoked
 					// commitment). Our own broadcast emits at forceClose() time.
@@ -4200,6 +4216,14 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 						this.emit('channel:force-closing', channelId, 'remote');
 					}
 					this.emit('channel:closed', channelId);
+				}
+				if (unrecordedChanged && !closedNow) {
+					// The mark moved on a channel that was closed already: the
+					// write cannot ride 'channel:closed'.
+					const peerPubkey = this.findPeerForChannel(channel);
+					if (peerPubkey) {
+						this.persistence.persist({ channel, peerPubkey, channelId });
+					}
 				}
 				this._maybeRearmDemotedOurCommitment(
 					channelId,

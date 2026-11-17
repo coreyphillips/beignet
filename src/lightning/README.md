@@ -1390,7 +1390,7 @@ const result = await node.recoverFromStaticChannelBackup(scb.channels);
 | `channel:splice-txsigs-needed` | `(data: { channelId: Buffer; spliceTxid: Buffer; newFundingOutputIndex: number; externalInputIndices: number[] })` | A splice is withholding its tx_signatures on external inputs whose witnesses a third party owes: collect them and answer with `provideSpliceExternalWitness`. Re-armed per connection cycle. |
 | `channel:pending-close` | `(data: { channelId: Buffer; initiator: 'local' \| 'remote' })` | A cooperative close started. |
 | `channel:force-closing` | `(data: { channelId: Buffer; initiator: 'local' \| 'remote' })` | A force close started: this node broadcast its commitment (`local`) or the peer's appeared on chain (`remote`). |
-| `channel:closed` | `(data: { channelId: Buffer })` | Channel closed. |
+| `channel:closed` | `(data: { channelId: Buffer; unrecordedCloseTxid?: string })` | Channel closed. `unrecordedCloseTxid` is present only for an asset channel whose funding output was spent by a transaction the node took for the cooperative close and holds no close payload for. |
 | `channel:resolved` | `(data: { channelId: Buffer })` | All on-chain outputs of the close resolved. |
 | `channel:aborted` | `(temporaryChannelId: Buffer, reason: string)` | A negotiated but unfunded open was torn down. |
 | `channel:voided` | `(data: { channelId: Buffer })` | Unfunded or abandoned channel discarded. |

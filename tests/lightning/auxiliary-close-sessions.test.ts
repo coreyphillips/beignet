@@ -251,4 +251,145 @@ describe('The close of an asset channel across a restart (#2093)', function () {
 			fs.rmSync(directory, { recursive: true, force: true });
 		}
 	});
+
+	it('tells the host with the close, once and across a restart, that the spend of the funding output is one it holds no asset payload for', async () => {
+		const directory = fs.mkdtempSync(
+			path.join(os.tmpdir(), 'aux-close-spend-')
+		);
+		const tag = 'aux-close-unrecorded';
+		const alicePath = path.join(directory, 'alice.sqlite');
+		const open: IAssetHost[] = [];
+		try {
+			let alice = assetHost(tag, 1, {}, { sqlitePath: alicePath });
+			const bob = assetHost(tag, 2, {}, { sqlite: true });
+			open.push(alice, bob);
+			wire(alice, bob, { delivered: 0, limit: Infinity, log: [] });
+			const channelId = await openAssetChannel(alice, bob, {
+				tag,
+				openerUnits: 9000n,
+				acceptorUnits: 1000n
+			});
+			const hex = channelId.toString('hex');
+			const before = alice.node
+				.getChannelManager()
+				.getChannel(channelId)!
+				.getFullState();
+			// A spend of the funding output that is no commitment and that
+			// Alice never signed.
+			const tx = new bitcoin.Transaction();
+			tx.version = 2;
+			tx.addInput(
+				Buffer.from(before.fundingTxid!),
+				before.fundingOutputIndex!,
+				0xfffffffd
+			);
+			tx.addOutput(
+				bitcoin.payments.p2tr({
+					internalPubkey: before.localBasepoints.fundingPubkey.subarray(1)
+				}).output!,
+				Number(before.fundingSatoshis) - 1000
+			);
+			tx.setWitness(0, [Buffer.alloc(64, 1)]);
+			const listen = (
+				host: IAssetHost
+			): Array<{ channelId: Buffer; unrecordedCloseTxid?: string }> => {
+				const told: Array<{
+					channelId: Buffer;
+					unrecordedCloseTxid?: string;
+				}> = [];
+				host.node.on('channel:closed', (data) => told.push(data));
+				return told;
+			};
+			const told = listen(alice);
+			alice.node.handleFundingSpent(channelId, tx, 700_000, DESTINATION);
+			alice.node.handleNewBlock(700_000);
+			await settle();
+			// The channel ends as it does, and the host is told what it ended
+			// on.
+			const closed = alice.node.getChannelManager().getChannel(channelId)!;
+			expect(closed.getState()).to.equal(ChannelState.CLOSED);
+			expect(told).to.deep.equal([
+				{ channelId, unrecordedCloseTxid: tx.getId() }
+			]);
+			expect(closed.getFullState().auxiliaryState!.closeTransactions).to.equal(
+				undefined
+			);
+			expect(
+				alice.storage!.loadChannel(hex)!.state.auxiliaryState!
+					.unrecordedCloseTxid
+			).to.equal(tx.getId());
+			// The watch reports the spend again at every block: nothing more.
+			alice.node.handleFundingSpent(channelId, tx, 700_000, DESTINATION);
+			alice.node.handleNewBlock(700_001);
+			await settle();
+			expect(told).to.have.length(1);
+
+			// After a restart the row still says so, and the same report tells
+			// the host nothing a second time.
+			alice.node.destroy();
+			alice = assetHost(tag, 1, {}, { sqlitePath: alicePath });
+			open.push(alice);
+			const again = listen(alice);
+			const restored = alice.node.getChannelManager().getChannel(channelId)!;
+			expect(restored.getState()).to.equal(ChannelState.CLOSED);
+			expect(
+				restored.getFullState().auxiliaryState!.unrecordedCloseTxid
+			).to.equal(tx.getId());
+			alice.node.handleFundingSpent(channelId, tx, 700_000, DESTINATION);
+			alice.node.handleNewBlock(700_002);
+			await settle();
+			expect(again).to.deep.equal([]);
+			expect(
+				restored.getFullState().auxiliaryState!.unrecordedCloseTxid
+			).to.equal(tx.getId());
+		} finally {
+			for (const host of open) {
+				try {
+					host.node.destroy();
+				} catch {
+					// already destroyed
+				}
+			}
+			fs.rmSync(directory, { recursive: true, force: true });
+		}
+	});
+
+	it('says nothing of the kind for the close this node signed', async () => {
+		const tag = 'aux-close-recorded';
+		const alice = assetHost(tag, 1, {}, { sqlite: true });
+		const bob = assetHost(tag, 2, {}, { sqlite: true });
+		try {
+			wire(alice, bob, { delivered: 0, limit: Infinity, log: [] });
+			const channelId = await openAssetChannel(alice, bob, {
+				tag,
+				openerUnits: 9000n,
+				acceptorUnits: 1000n
+			});
+			const told: unknown[] = [];
+			alice.node.on('channel:closed', (data) => told.push(data));
+			const published: Buffer[] = [];
+			alice.node.on('broadcast:tx', (tx: Buffer) => published.push(tx));
+			expect(alice.node.closeChannel(channelId, DESTINATION).ok).to.equal(true);
+			await settle();
+			expect(published).to.have.length(1);
+			const close = bitcoin.Transaction.fromBuffer(published[0]);
+			alice.node.handleFundingSpent(channelId, close, 700_000, DESTINATION);
+			alice.node.handleNewBlock(700_000);
+			await settle();
+			const state = alice.node
+				.getChannelManager()
+				.getChannel(channelId)!
+				.getFullState();
+			expect(state.state).to.equal(ChannelState.CLOSED);
+			expect(
+				state.auxiliaryState!.closeTransactions!.has(close.getId())
+			).to.equal(true);
+			expect('unrecordedCloseTxid' in state.auxiliaryState!).to.equal(false);
+			// One close, told with the channel id and nothing else.
+			expect(told).to.deep.equal([{ channelId }]);
+		} finally {
+			alice.node.destroy();
+			bob.node.destroy();
+		}
+	});
 });

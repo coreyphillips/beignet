@@ -134,6 +134,15 @@ export interface IChannelAuxiliaryState {
 	/** Exact authenticated closing_signed accepted before the signed close was saved. */
 	acceptedClosingSigned?: Buffer;
 	/**
+	 * The txid of a spend of the funding output that this node took for the
+	 * cooperative close while it holds no close payload for it: the
+	 * transaction is in no entry of closeTransactions, so the node cannot
+	 * say where the units went. Set when the spend is seen, kept with the
+	 * row, and told to the host with the close ('channel:closed'), once.
+	 * Absent for a close the node signed.
+	 */
+	unrecordedCloseTxid?: string;
+	/**
 	 * The opener's host has been told that the peer signed the first
 	 * commitment: onFundingSigned returned without throwing. Absent until
 	 * then, so the news is delivered again after a restart or a throw.
