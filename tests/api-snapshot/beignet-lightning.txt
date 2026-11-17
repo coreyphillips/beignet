@@ -611,7 +611,7 @@ method chain.ChainMonitor.addPreimage(paymentHash: Buffer, preimage: Buffer): ch
 method chain.ChainMonitor.auxiliaryHtlcEndings(): Array<{ txid: string; outputIndex: number; htlcId: bigint; offered: boolean; outcome: 'fulfilled' | 'failed'; recorded: boolean; absent?: true; lost?: true; claimSigned?: true; }>
 method chain.ChainMonitor.dropUnusedPreimages(heldElsewhere: ReadonlyMap<string, Buffer>): number
 method chain.ChainMonitor.fixedOutputFeeRaise(output: chain.ITrackedOutput, feeRatePerVbyte: number): chain.IFeeBumpAndBroadcastChainAction | undefined
-method chain.ChainMonitor.fixedOutputFeeResolved(txid: string, outputIndex: number, evenIfNotOpen?: boolean): { spendingTransaction?: Buffer; } | undefined
+method chain.ChainMonitor.fixedOutputFeeResolved(txid: string, outputIndex: number, evenIfNotOpen?: boolean): { spendingTransaction?: Buffer; impossible?: true; } | undefined
 method chain.ChainMonitor.fixedOutputSpendVbytes(txid: string, outputIndex: number, feeRatePerVbyte: number): number | undefined
 method chain.ChainMonitor.fundFixedOutputSpend(txid: string, outputIndex: number, feeRatePerVbyte: number, feeInputs: ReadonlyArray<{ hash: Buffer; index: number; sequence: number; script: Buffer; value: bigint; }>, signFeeInputs: (transaction: bitcoinjs-lib#Transaction, prevouts: { scripts: Buffer[]; values: bigint[]; }) => void): { ok: true; transaction: Buffer; broadcast: boolean; } | { ok: false; refusal: string; gone?: true; }
 method chain.ChainMonitor.getChannelState(): channel.IChannelState
@@ -10060,7 +10060,8 @@ interface wallet.IFixedOutputFeePoolUnavailable
 property wallet.IFixedOutputFeePoolUnavailable.available: false
 property wallet.IFixedOutputFeePoolUnavailable.error: wallet.FixedOutputFeeError
 interface wallet.IFixedOutputFeeResolution
-property wallet.IFixedOutputFeeResolution.spendingTransaction: Buffer
+property wallet.IFixedOutputFeeResolution.impossible?: true
+property wallet.IFixedOutputFeeResolution.spendingTransaction?: Buffer
 type wallet.IFixedOutputFeeStatus = wallet.IFixedOutputFeePoolState | wallet.IFixedOutputFeePoolUnavailable
 interface wallet.IWalletLike
 property wallet.IWalletLike.electrum: { broadcastTransaction(params: { rawTx: string; subscribeToOutputAddress?: boolean; }): Promise<IResult>; getTransactions?(params: { txHashes: Array<{ tx_hash: string; }>; }): Promise<IResult>; }

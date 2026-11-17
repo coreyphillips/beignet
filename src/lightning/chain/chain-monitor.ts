@@ -2551,12 +2551,28 @@ export class ChainMonitor {
 		txid: string,
 		outputIndex: number,
 		evenIfNotOpen = false
-	): { spendingTransaction?: Buffer } | undefined {
+	): { spendingTransaction?: Buffer; impossible?: true } | undefined {
 		if (!this._channelState.auxiliaryState) return undefined;
 		const output = this._trackedOutputs.find(
 			(o) => o.txid === txid && o.outputIndex === outputIndex
 		);
-		if (!output || output.status !== OutputStatus.IRREVOCABLY_RESOLVED) {
+		if (!output) {
+			// An output this monitor does not follow, asked about when the
+			// pool's actions are gone over: an output of a commitment that
+			// was seen while another was confirmed in its place. Once the
+			// one that confirmed is settled for good, that output can never
+			// come to exist.
+			const confirmed = this._commitmentBroadcast;
+			return evenIfNotOpen &&
+				!!confirmed &&
+				confirmed.blockHeight > 0 &&
+				this._currentBlockHeight - confirmed.blockHeight >= IRREVOCABLE_DEPTH &&
+				confirmed.txid !== txid &&
+				!this._trackedOutputs.some((o) => o.txid === txid)
+				? { impossible: true }
+				: undefined;
+		}
+		if (output.status !== OutputStatus.IRREVOCABLY_RESOLVED) {
 			return undefined;
 		}
 		if (!output.auxiliaryFeeActionOpen && !evenIfNotOpen) return undefined;

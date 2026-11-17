@@ -152,7 +152,15 @@ export interface IFixedOutputFeeResolution {
 	 * its own that this transaction spends, and every other coin goes back to
 	 * the pool for another action.
 	 */
-	spendingTransaction: Buffer;
+	spendingTransaction?: Buffer;
+	/**
+	 * The output the action was opened for never came to exist and never
+	 * can: its commitment was seen, and another was confirmed in its place
+	 * for good. No form of the action's spend can confirm, so the action is
+	 * charged nothing and every coin of it goes back to the pool. Read only
+	 * when no transaction is named.
+	 */
+	impossible?: true;
 }
 
 /**
@@ -879,16 +887,24 @@ export class FixedOutputFeePool {
 			throw new Error('Invalid fixed-output fee action');
 		let spent: Set<string> | undefined;
 		if (resolution !== undefined) {
-			if (!Buffer.isBuffer(resolution?.spendingTransaction))
-				throw new Error('Invalid fixed-output fee resolution');
-			spent = new Set(
-				bitcoin.Transaction.fromBuffer(resolution.spendingTransaction).ins.map(
-					(input) =>
-						`${Buffer.from(input.hash).reverse().toString('hex')}:${
-							input.index
-						}`
-				)
-			);
+			if (Buffer.isBuffer(resolution?.spendingTransaction)) {
+				spent = new Set(
+					bitcoin.Transaction.fromBuffer(
+						resolution.spendingTransaction
+					).ins.map(
+						(input) =>
+							`${Buffer.from(input.hash).reverse().toString('hex')}:${
+								input.index
+							}`
+					)
+				);
+			} else if (
+				resolution?.spendingTransaction === undefined &&
+				resolution?.impossible === true
+			) {
+				// Nothing of the action can have been spent.
+				spent = new Set();
+			} else throw new Error('Invalid fixed-output fee resolution');
 		}
 		await this.locked(async () => {
 			this.reload();

@@ -13429,6 +13429,8 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 				feeActionId,
 				resolved.spendingTransaction
 					? { spendingTransaction: resolved.spendingTransaction }
+					: resolved.impossible
+					? { impossible: true }
 					: undefined
 			)
 			.then(() => {
@@ -13516,6 +13518,10 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 
 				case ChainActionType.OUTPUT_RESOLVED:
 					this.retireFixedOutputFee(channelId, action.txid, action.outputIndex);
+					// An output settled for good: the pool's actions for the
+					// channel are gone over on the next block, for one opened
+					// for a commitment that did not confirm.
+					this.fixedOutputFeesReconciled.delete(channelId.toString('hex'));
 
 					this.recordAuxiliaryChainEndings(channelId.toString('hex'));
 
