@@ -14,6 +14,7 @@ interface AssetRestoreRefusal
 property AssetRestoreRefusal.assetChannels: Array<{ channelId: ChannelIdHex; peerPubkey: string; capacitySats: number; }>
 property AssetRestoreRefusal.code: 'ASSET_RESTORE_REFUSED' | 'ASSET_PROVIDER_REQUIRED'
 interface BalanceInfo
+property BalanceInfo.assetChannelClosingSats?: number
 property BalanceInfo.assetChannelSats?: number
 property BalanceInfo.lightning: number
 property BalanceInfo.onchain: number

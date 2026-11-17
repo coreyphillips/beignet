@@ -96,7 +96,12 @@ import type {
 } from './extension';
 import { EProtocol } from '../types/electrum';
 import { LightningNode } from '../lightning/node/lightning-node';
-import { CommitmentType, OutputType } from '../lightning/chain/types';
+import {
+	CommitmentType,
+	OutputStatus,
+	OutputType
+} from '../lightning/chain/types';
+import type { ITrackedOutput } from '../lightning/chain/types';
 import { DF_DEFAULT_UNPAIRED_SPLICE_DEPTH } from '../lightning/direct-funding/receiver/types';
 import { SPLICE_LOCK_DEPTH_ACCEPT_MAX as DF_UNPAIRED_SPLICE_DEPTH_MAX } from '../lightning/message/splice';
 import { assertBolt1String } from '../lightning/message/field-rules';
@@ -7637,6 +7642,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 		const lightning = Number(lnBalance.localBalanceMsat / 1000n);
 		const unsettledSats = Number(lnBalance.unsettledBalanceMsat / 1000n);
 		const splicingSats = this.getSplicingBalanceSats();
+		const assetChannelClosingSats = this.getAssetChannelClosingSats();
 		return {
 			onchain,
 			lightning,
@@ -7647,8 +7653,60 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 				? {
 						assetChannelSats: Number(lnBalance.auxiliaryBalanceMsat / 1000n)
 				  }
+				: {}),
+			...(assetChannelClosingSats !== undefined
+				? { assetChannelClosingSats }
 				: {})
 		};
+	}
+
+	/**
+	 * Sum of the local balances of the asset channels that are closing:
+	 * SHUTTING_DOWN, NEGOTIATING_CLOSING, or FORCE_CLOSED with this wallet's
+	 * balance output not yet spent in a block. Undefined when the wallet has
+	 * no such channel, so that the balance of a wallet without one has the
+	 * keys it always had.
+	 *
+	 * It is the counterpart of getPendingCloseBalanceSats, which leaves asset
+	 * channels out: their bitcoin does not come back to the wallet, it stays
+	 * under the asset outputs the provider closes or sweeps to. While the
+	 * channel closes it is in no other figure (assetChannelSats counts open
+	 * channels), which after a force close is the whole of the closer's
+	 * delay. A cooperative close ends the count when the channel is CLOSED;
+	 * a force close when the chain monitor has seen the balance output spent
+	 * in a block, by the sweep the provider made the asset side of or by
+	 * anything else. Before that (no monitor, no classified commitment, a
+	 * sweep that is only broadcast) the channel is counted.
+	 */
+	private getAssetChannelClosingSats(): number | undefined {
+		const closing = new Set<ChannelState>([
+			ChannelState.FORCE_CLOSED,
+			ChannelState.SHUTTING_DOWN,
+			ChannelState.NEGOTIATING_CLOSING
+		]);
+		let totalMsat: bigint | undefined;
+		for (const ch of this.node.listChannels()) {
+			if (!ch.auxiliary) continue;
+			const effectiveState =
+				ch.state === ChannelState.AWAITING_REESTABLISH
+					? this.node
+							.getChannelManager()
+							.getChannel(ch.channelId)
+							?.getFullState().preReestablishState ?? ch.state
+					: ch.state;
+			if (!closing.has(effectiveState)) continue;
+			if (effectiveState === ChannelState.FORCE_CLOSED) {
+				const status = this.forceCloseBalanceOutput(ch.channelId)?.status;
+				if (
+					status === OutputStatus.SPEND_CONFIRMED ||
+					status === OutputStatus.IRREVOCABLY_RESOLVED
+				) {
+					continue;
+				}
+			}
+			totalMsat = (totalMsat ?? 0n) + ch.localBalanceMsat;
+		}
+		return totalMsat === undefined ? undefined : Number(totalMsat / 1000n);
 	}
 
 	/**
@@ -7714,30 +7772,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	 * still pending close.
 	 */
 	private isForceCloseBalanceInWallet(channelId: Buffer): boolean {
-		const monitor = this.node.getChannelManager().getMonitor(channelId);
-		const broadcast = monitor?.getFullState().commitmentBroadcast;
-		if (!monitor || !broadcast) return false;
-		let balanceOutputType: OutputType;
-		switch (broadcast.commitmentType) {
-			case CommitmentType.OUR_COMMITMENT:
-				balanceOutputType = OutputType.TO_LOCAL;
-				break;
-			case CommitmentType.THEIR_CURRENT_COMMITMENT:
-			case CommitmentType.THEIR_REVOKED_COMMITMENT:
-			case CommitmentType.THEIR_FUTURE_COMMITMENT:
-				balanceOutputType = OutputType.TO_REMOTE;
-				break;
-			default:
-				return false;
-		}
-		const balanceOutput = monitor
-			.getTrackedOutputs()
-			.find(
-				(o) =>
-					o.txid === broadcast.txid &&
-					o.outputType === balanceOutputType &&
-					!o.isSecondLevelHtlc
-			);
+		const balanceOutput = this.forceCloseBalanceOutput(channelId);
 		if (!balanceOutput) return false;
 		let sweepTxid = balanceOutput.resolutionTxid;
 		if (!sweepTxid && balanceOutput.sweepTxHex) {
@@ -7753,6 +7788,41 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 		if (!sweepTxid) return false;
 		const entry = this.wallet.transactions[sweepTxid];
 		return entry !== undefined && entry.exists !== false;
+	}
+
+	/**
+	 * Our balance output on the force-close commitment the monitor
+	 * classified, as the monitor tracks it: our to_remote on any of the
+	 * peer's commitments, our commitment to_local on ours. Undefined with no
+	 * monitor, no classified commitment or no balance output.
+	 */
+	private forceCloseBalanceOutput(
+		channelId: Buffer
+	): ITrackedOutput | undefined {
+		const monitor = this.node.getChannelManager().getMonitor(channelId);
+		const broadcast = monitor?.getFullState().commitmentBroadcast;
+		if (!monitor || !broadcast) return undefined;
+		let balanceOutputType: OutputType;
+		switch (broadcast.commitmentType) {
+			case CommitmentType.OUR_COMMITMENT:
+				balanceOutputType = OutputType.TO_LOCAL;
+				break;
+			case CommitmentType.THEIR_CURRENT_COMMITMENT:
+			case CommitmentType.THEIR_REVOKED_COMMITMENT:
+			case CommitmentType.THEIR_FUTURE_COMMITMENT:
+				balanceOutputType = OutputType.TO_REMOTE;
+				break;
+			default:
+				return undefined;
+		}
+		return monitor
+			.getTrackedOutputs()
+			.find(
+				(o) =>
+					o.txid === broadcast.txid &&
+					o.outputType === balanceOutputType &&
+					!o.isSecondLevelHtlc
+			);
 	}
 
 	/**

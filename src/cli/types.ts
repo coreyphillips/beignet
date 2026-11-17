@@ -1052,6 +1052,17 @@ export interface BalanceInfo {
 	 * nor `total`.
 	 */
 	assetChannelSats?: number;
+	/**
+	 * The sats on this wallet's side of its asset channels that are closing:
+	 * shutting down, negotiating a close, or force closed with its balance
+	 * output not yet spent in a block. Present only while it has one. A
+	 * closing asset channel is in no other figure: not `assetChannelSats`,
+	 * which counts open channels, and not `pendingCloseBalanceSats`, since
+	 * this bitcoin does not come back to the wallet but stays under the asset
+	 * outputs the close or the sweep pays. In neither `lightning` nor
+	 * `total`.
+	 */
+	assetChannelClosingSats?: number;
 }
 
 export interface OfferInfo {
