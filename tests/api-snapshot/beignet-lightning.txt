@@ -5793,6 +5793,7 @@ property node.IFeeBumpSelectionOpts.excludeTxids?: readonly string[]
 property node.IFeeBumpSelectionOpts.feeActionId?: string
 property node.IFeeBumpSelectionOpts.fixedOutputs?: boolean
 property node.IFeeBumpSelectionOpts.maxFeeSatoshis?: bigint
+property node.IFeeBumpSelectionOpts.replacedTxid?: string
 property node.IFeeBumpSelectionOpts.replacementInputs?: readonly { txid: string; vout: number; sequence: number; }[]
 interface node.IFeeEstimator
 method node.IFeeEstimator.estimateFee(targetBlocks: number): Promise<number>

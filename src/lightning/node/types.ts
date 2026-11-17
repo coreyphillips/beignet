@@ -134,6 +134,14 @@ export interface IFeeBumpSelectionOpts {
 		vout: number;
 		sequence: number;
 	}[];
+	/**
+	 * The id of the transaction whose fee inputs `replacementInputs` names.
+	 * A named input that the wallet no longer lists is kept only while the
+	 * wallet's server knows that transaction: one that was refused, or never
+	 * sent, spends nothing, so the input went elsewhere and leaves the
+	 * action.
+	 */
+	replacedTxid?: string;
 }
 
 export interface IFundingProvider {

@@ -13325,7 +13325,9 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 					...(spent.deadlineHeight !== undefined
 						? { deadlineHeight: spent.deadlineHeight }
 						: {}),
-					...(replaced.length > 0 ? { replacementInputs: replaced } : {})
+					...(replaced.length > 0
+						? { replacementInputs: replaced, replacedTxid: present.getId() }
+						: {})
 				}
 			);
 			const feeInputs = selected.inputs.map((input) => {

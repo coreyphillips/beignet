@@ -1838,6 +1838,11 @@ export class FixedOutputFeePool {
 			(opts.excludeTxids ?? []).some((value) => !/^[a-f0-9]{64}$/i.test(value))
 		)
 			throw new Error('Invalid excluded fee transaction');
+		if (
+			opts.replacedTxid !== undefined &&
+			!/^[a-f0-9]{64}$/i.test(opts.replacedTxid)
+		)
+			throw new Error('Invalid replaced fee transaction');
 		this.reload();
 		await this.completeRetirements();
 		if (this.isRetired(id))
@@ -1913,6 +1918,14 @@ export class FixedOutputFeePool {
 			)
 		);
 		const confirmed = opts.confirmedOnly === true || replacementKeys.size > 0;
+		// The transaction a caller replaces holds its fee inputs only while
+		// the wallet's server knows it. One that was refused, or was never
+		// sent, spends nothing: an input of it that the wallet no longer
+		// lists went elsewhere.
+		const replacedUnknown =
+			opts.replacedTxid !== undefined &&
+			replacementKeys.size > 0 &&
+			(await this.known(opts.replacedTxid.toLowerCase())) === false;
 		const kept: Coin[] = [],
 			gone = [...(action.gone ?? [])];
 		for (const coin of action.inputs) {
@@ -1923,14 +1936,22 @@ export class FixedOutputFeePool {
 					'none',
 					'Reserved fixed-output fee input is unavailable'
 				);
-			if (stays(coin) || replacementKeys.has(key(coin.utxo))) kept.push(coin);
-			// A reserved coin the wallet no longer lists, that the caller does
-			// not name as an input of the transaction it replaces, is gone:
-			// the action lets go of it and is funded from another.
+			if (
+				stays(coin) ||
+				(replacementKeys.has(key(coin.utxo)) && !replacedUnknown)
+			)
+				kept.push(coin);
+			// A reserved coin the wallet no longer lists is gone, unless it
+			// is an input of a transaction the caller replaces that the
+			// wallet's server knows: the action lets go of it and is funded
+			// from another.
 			else gone.push({ outpoint: key(coin.utxo), value: coin.utxo.value });
 		}
 		for (const wanted of replacementKeys)
-			if (!kept.some((coin) => key(coin.utxo) === wanted))
+			if (
+				!kept.some((coin) => key(coin.utxo) === wanted) &&
+				!(replacedUnknown && gone.some((coin) => coin.outpoint === wanted))
+			)
 				throw new FixedOutputFeeError(
 					'FEE_INPUT_UNAVAILABLE',
 					'none',
