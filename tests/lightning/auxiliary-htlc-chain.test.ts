@@ -854,6 +854,17 @@ describe('the HTLCs of an asset channel on the chain (issue #2093 step 10)', fun
 		await settle();
 		// The node force closes on its own 18 blocks before the expiry.
 		const deadline = held.cltvExpiry - 18;
+		// While the payer is away the bound settle is not tried again on
+		// every block: what the first try said is all that is said.
+		const refusals = (): number =>
+			errorsOf(pair.bob).filter((error) =>
+				/Cannot (fail|fulfill) HTLC/.test(error)
+			).length;
+		const saidOnce = refusals();
+		expect(saidOnce).to.be.at.most(1);
+		await world.mine(pair, 8);
+		expect(refusals()).to.equal(saidOnce);
+		expect(parkedOf(pair.bob, held.paymentHash)).to.equal(1);
 		await passTo(pair, deadline - 2);
 		await world.mine(pair, 1);
 		expect(pair.chain.height).to.equal(deadline - 1);

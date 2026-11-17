@@ -24021,6 +24021,25 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			if (channelId && !held.some((h) => h.channelId.equals(channelId))) {
 				continue;
 			}
+			// Parts that carry units keep their settle or cancel bound. While
+			// each of their channels waits for its peer, is on chain or is
+			// gone, a new block has nothing to drive again: the reestablish
+			// drives it, by its channel, and the chain ends what is on chain.
+			if (
+				!channelId &&
+				held.length > 0 &&
+				held.every((h) => {
+					if (h.auxiliary !== true) return false;
+					const channel = this.channelManager.getChannel(h.channelId);
+					return (
+						!channel ||
+						channel.getState() === ChannelState.AWAITING_REESTABLISH ||
+						this.channelManager.auxiliaryChannelOnChain(h.channelId)
+					);
+				})
+			) {
+				continue;
+			}
 			const paymentHash = Buffer.from(hashHex, 'hex');
 			// Contained: on reestablish a throw would skip the commitment that
 			// carries this retry's own fulfil or fail.
