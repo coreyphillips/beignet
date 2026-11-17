@@ -15892,6 +15892,21 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				`to channel not found or not usable: ${toChannelId.toString('hex')}`
 			);
 		}
+		// A rebalance pays bitcoin out over one channel and back in over
+		// the other, and the bitcoin of an asset channel only carries its
+		// units: an asset channel is neither of the two.
+		for (const [leg, channel, id] of [
+			['from', fromChannel, fromChannelId],
+			['to', toChannel, toChannelId]
+		] as const) {
+			if (channel.getFullState().auxiliaryState) {
+				throw new AuxiliaryPaymentError(
+					'ASSET_PAYMENT_UNSUPPORTED',
+					id,
+					`An asset channel cannot be the ${leg} channel of a rebalance`
+				);
+			}
+		}
 
 		const amountMsat = amountSats * 1000n;
 		const maxFeeMsat = maxFeeSats * 1000n;

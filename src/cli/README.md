@@ -382,7 +382,7 @@ verify the Lightning leg outlives its on-chain refund before funding.
 
 | Method | Returns | Description |
 |--------|---------|-------------|
-| `getPaymentProof(paymentHash)` | `PaymentProof \| null` | Cryptographic proof of a completed payment (preimage, invoice, route info) |
+| `getPaymentProof(paymentHash)` | `PaymentProof \| null` | Cryptographic proof of a completed payment (preimage, invoice, route info) The proof of a payment that asset HTLCs carried has `auxiliary: true` and `auxiliaryValueSats`, since its `amountSats` and `feeSats` are the bitcoin that carried the asset. |
 | `verifyPaymentProof(paymentHash)` | `PaymentProofVerification` | Verify proof cryptographically: `sha256(preimage) === paymentHash`. Returns `{ valid, proof?, error? }` |
 
 #### Payment Queue
@@ -407,7 +407,7 @@ Entries survive a restart. The queue dispatches the restored ones once some chan
 | `getChannelSuggestions(count?)` | `ChannelSuggestion[]` | Graph-based channel open suggestions scored by connectivity, capacity, freshness, relevance |
 | `getFeeSnapshot()` | `FeeSnapshot \| null` | On-chain fee trend analysis with open/wait recommendation |
 | `getAdvisorRecommendations()` | `AdvisorRecommendations` | Liquidity analysis plus the concrete circular-rebalance plan (read-only) |
-| `rebalanceChannel(fromId, toId, amountSats, maxFeeSats)` | `Promise<RebalanceResult>` | Circular rebalance (self-payment out fromId, back in toId). Aborts without paying if the route fee exceeds `maxFeeSats`. The fee counts against `dailySpendLimitSats` |
+| `rebalanceChannel(fromId, toId, amountSats, maxFeeSats)` | `Promise<RebalanceResult>` | Circular rebalance (self-payment out fromId, back in toId). Aborts without paying if the route fee exceeds `maxFeeSats`. The fee counts against `dailySpendLimitSats` A rebalance that names an asset channel, from or to, is refused with `INVALID_PARAMS` before the fee cap is charged. |
 | `executeRebalances(budgetSatsPerDay?)` | `Promise<RebalanceExecutionSummary>` | Run the advisor's rebalance plan under a per-UTC-day fee budget (persisted; restarts never overspend the day). The fees count against `dailySpendLimitSats` |
 | `listPrimaries()` | `PrimariesInfo` | The ranked receive primaries (issue #1922): each one's `rank`, address, `thresholdSat`, `balanceSat` (our local balance summed over our usable channels with it), `channelCount`, `belowThreshold`, `isReceiveTarget` and `selectionOrder`, plus `fillThresholdSat` and `receiveTarget`. The target is the first primary in rank order below the threshold; when every one is at or above it, the lowest balance, ties to the higher rank. `createJitInvoice`, `getJitQuote`, `createDirectFundingRequest` and the `/receive/*` routes walk `selectionOrder` when the caller names no peer |
 | `addPrimary({ pubkey, host?, port?, uri?, rank? })` | `PrimariesInfo` | Add a primary at `rank` (1-based, default last), reached by `host`/`port` or by a `uri` (`pubkey@address`, ws://, wss:// and iroh: included). Refuses a malformed pubkey, a duplicate, a bad port, a host without a port, an out-of-range rank or a 33rd entry with `INVALID_PARAMS`. Persisted |

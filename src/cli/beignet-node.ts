@@ -14092,7 +14092,19 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 			completedAt: proof.completedAt,
 			invoice: proof.invoice,
 			hopCount: proof.route?.hops.length,
-			feeSats: feeMsat !== undefined ? spendLimitSats(feeMsat) : undefined
+			feeSats: feeMsat !== undefined ? spendLimitSats(feeMsat) : undefined,
+			// The amount and the fee of an asset payment are the bitcoin that
+			// carried it: the proof says so, and what it was worth.
+			...(record.auxiliary
+				? {
+						auxiliary: true as const,
+						...(record.auxiliaryValueMsat !== undefined
+							? {
+									auxiliaryValueSats: spendLimitSats(record.auxiliaryValueMsat)
+							  }
+							: {})
+				  }
+				: {})
 		};
 	}
 
@@ -16128,6 +16140,19 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 				BeignetErrorCode.INVALID_PARAMS,
 				'maxFeeSats must be a non-negative integer'
 			);
+		// Refused before the fee cap is charged: a rebalance moves bitcoin,
+		// and the bitcoin of an asset channel only carries its units.
+		for (const [name, id] of [
+			['fromChannelId', fromIdBuf],
+			['toChannelId', toIdBuf]
+		] as const) {
+			if (this.assetChannelMark(id).auxiliary) {
+				throw new BeignetError(
+					BeignetErrorCode.INVALID_PARAMS,
+					`${name} is an asset channel, and an asset channel is not rebalanced`
+				);
+			}
+		}
 		this._checkDraining();
 		// A shutdown waits on any backup in flight before the engine learns of
 		// it, so the engine would still send.

@@ -1408,6 +1408,8 @@ property PaymentInfo.status: 'PENDING' | 'COMPLETED' | 'FAILED'
 property PaymentInfo.unresolved?: PaymentUnresolved
 interface PaymentProof
 property PaymentProof.amountSats: number
+property PaymentProof.auxiliary?: true
+property PaymentProof.auxiliaryValueSats?: number
 property PaymentProof.completedAt: number
 property PaymentProof.feeSats?: number
 property PaymentProof.hopCount?: number

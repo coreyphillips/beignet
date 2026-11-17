@@ -512,6 +512,14 @@ export interface PaymentProof {
 	invoice?: string;
 	hopCount?: number;
 	feeSats?: number;
+	/**
+	 * True on the proof of a payment that asset HTLCs carried (issue
+	 * #2093), and absent on every other: `amountSats` and `feeSats` are then
+	 * the bitcoin that carried the asset, and `auxiliaryValueSats` is what
+	 * the payment was worth to the payee.
+	 */
+	auxiliary?: true;
+	auxiliaryValueSats?: number;
 }
 
 export interface PaymentProofVerification {
