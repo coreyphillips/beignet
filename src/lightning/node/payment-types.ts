@@ -36,6 +36,19 @@ export interface IPayAllPayment extends IPayAllBudget {
 	remainderMsat: bigint;
 }
 
+/**
+ * Why a payment that is still PENDING has an outcome this wallet cannot
+ * learn. Written by a capsule restore that left out the channel of one of
+ * its HTLCs (`omitAuxiliaryChannels`): the peer still has that channel, so
+ * the HTLC may have been settled or failed since, and nothing this wallet
+ * holds will say which.
+ */
+export interface IPaymentUnresolved {
+	code: 'CHANNEL_OMITTED_AT_RESTORE';
+	/** The channels left out that carried an HTLC of it, as channel id hex. */
+	channelIds: string[];
+}
+
 export interface IPaymentInfo {
 	payAll?: IPayAllPayment;
 	paymentHash: Buffer;
@@ -70,6 +83,13 @@ export interface IPaymentInfo {
 	 * in amountMsat. amountMsat here stays the bitcoin the HTLCs carried.
 	 */
 	auxiliaryValueMsat?: bigint;
+	/**
+	 * Present only on a PENDING record that this wallet can no longer
+	 * follow. Such a record is never failed by a clock or by a call, is
+	 * never reported as paid, and is not sent for again; it leaves the
+	 * mark only by an HTLC on a channel the wallet holds settling it.
+	 */
+	unresolved?: IPaymentUnresolved;
 	status: PaymentStatus;
 	direction: PaymentDirection;
 	route?: IRoute;

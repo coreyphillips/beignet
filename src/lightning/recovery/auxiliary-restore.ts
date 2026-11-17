@@ -22,6 +22,7 @@ import type {
 } from '../channel/auxiliary-funding';
 import { isOverlayChannel } from '../channel/types';
 import type { IChannelState } from '../channel/channel-state';
+import { PaymentStatus } from '../node/payment-types';
 import { AuxiliaryProviderRequiredError } from '../node/types';
 import type { IStorageBackend } from '../storage/types';
 import { CodedError } from '../../utils/errors';
@@ -237,6 +238,45 @@ export function auxiliaryRestoreRefusal(
 	return answer === true
 		? undefined
 		: new AuxiliaryRestoreRefusedError(channelIds);
+}
+
+/**
+ * Mark what a restore that leaves channels out can no longer follow: every
+ * PENDING payment record, incoming or outgoing, with an HTLC still in the
+ * state of a channel left out. The peer has that channel yet, and a capsule
+ * can be older than the wallet's last word on it, so the HTLC may have been
+ * settled or failed and nothing installed here will say which. The record
+ * stays PENDING and carries `unresolved`, with the channels. A record that
+ * already has an outcome is left as it is. Returns the payment hashes
+ * marked, sorted. Run inside the install's transaction, after the replay.
+ */
+export function markPaymentsOfOmittedChannels(
+	target: IStorageBackend,
+	channels: ReadonlyArray<{ channelId: string; state: IChannelState }>
+): string[] {
+	const channelsOf = new Map<string, Set<string>>();
+	for (const row of channels) {
+		for (const htlc of row.state.htlcs.values()) {
+			const hash = htlc.paymentHash.toString('hex');
+			const ids = channelsOf.get(hash) ?? new Set<string>();
+			ids.add(row.channelId.toLowerCase());
+			channelsOf.set(hash, ids);
+		}
+	}
+	const marked: string[] = [];
+	for (const [hash, ids] of channelsOf) {
+		const payment = target.loadPayment(hash);
+		if (!payment || payment.status !== PaymentStatus.PENDING) continue;
+		target.savePayment(hash, {
+			...payment,
+			unresolved: {
+				code: 'CHANNEL_OMITTED_AT_RESTORE',
+				channelIds: [...ids].sort()
+			}
+		});
+		marked.push(hash);
+	}
+	return marked.sort();
 }
 
 /** The asset channels among the rows a restore is about to install. */

@@ -50,7 +50,10 @@ export const AUXILIARY_CHANNELS_API = Object.freeze({
 		'onHtlcResolved:never-sent',
 		// The node answers the state of its wallet's fee coin pool, and says
 		// when a fee policy was refused and there is none.
-		'getFixedOutputFeeStatus'
+		'getFixedOutputFeeStatus',
+		// A PENDING payment record that had an HTLC on an asset channel a
+		// capsule restore left out carries unresolved, and stays PENDING.
+		'IPaymentInfo.unresolved'
 	] as const)
 });
 

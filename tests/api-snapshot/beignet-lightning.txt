@@ -1012,7 +1012,7 @@ function chain.selectTheirPerCommitmentPoint(tx: bitcoinjs-lib#Transaction, stat
 function chain.signP2wpkhInput(tx: bitcoinjs-lib#Transaction, inputIndex: number, pubkey: Buffer, value: number, privateKey: Buffer): Buffer
 function chain.signSweepInput(tx: bitcoinjs-lib#Transaction, inputIndex: number, witnessScript: Buffer, value: number, privateKey: Buffer, sighashType?: number): Buffer
 namespace channel
-const channel.AUXILIARY_CHANNELS_API: Readonly<{ version: 1; surfaces: readonly [ "valueIncomingHtlc:three-outcome", "sendPaymentToRoute:assetPayment", "getAuxiliaryPaymentHtlcs", "onHtlcResolved:htlcId", "queryAuxiliaryRoute", "fundAuxiliaryChannel:unsigned", "onFundingSigned", "abandonAuxiliaryOpen", "IChannelInfo.auxiliary", "setAuxiliaryPaymentGate", "getChannelMonitorState", "IPaymentInfo.auxiliary", "IPaymentInfo.auxiliaryValueMsat", "IInvoiceInfo.auxiliary", "IAuxiliaryChannelInfo.undeliveredOutcomes", "onHtlcResolved:never-sent", "getFixedOutputFeeStatus" ]; }>
+const channel.AUXILIARY_CHANNELS_API: Readonly<{ version: 1; surfaces: readonly [ "valueIncomingHtlc:three-outcome", "sendPaymentToRoute:assetPayment", "getAuxiliaryPaymentHtlcs", "onHtlcResolved:htlcId", "queryAuxiliaryRoute", "fundAuxiliaryChannel:unsigned", "onFundingSigned", "abandonAuxiliaryOpen", "IChannelInfo.auxiliary", "setAuxiliaryPaymentGate", "getChannelMonitorState", "IPaymentInfo.auxiliary", "IPaymentInfo.auxiliaryValueMsat", "IInvoiceInfo.auxiliary", "IAuxiliaryChannelInfo.undeliveredOutcomes", "onHtlcResolved:never-sent", "getFixedOutputFeeStatus", "IPaymentInfo.unresolved" ]; }>
 const channel.AUXILIARY_CHANNEL_DUST_LIMIT = 354n
 const channel.AUXILIARY_CLOSE_ASSET_OUTPUT_MINIMUM = 330n
 class channel.AuxiliaryChannelUnsupportedError extends beignet#CodedError<'ASSET_CHANNEL_UNSUPPORTED'>
@@ -6008,6 +6008,7 @@ property node.IOutgoingPaymentResolution.paymentHash: Buffer
 property node.IOutgoingPaymentResolution.preimage?: Buffer
 property node.IOutgoingPaymentResolution.resolved: boolean
 property node.IOutgoingPaymentResolution.status: node.PaymentStatus | null
+property node.IOutgoingPaymentResolution.unresolved?: node.IPaymentUnresolved
 interface node.IPayAllBudget
 property node.IPayAllBudget.debitMsat: bigint
 property node.IPayAllBudget.maxFeeMsat: bigint
@@ -6056,6 +6057,7 @@ property node.IPaymentInfo.sentMsat?: bigint
 property node.IPaymentInfo.settledHtlcs?: string[]
 property node.IPaymentInfo.sharedSecrets?: Buffer[]
 property node.IPaymentInfo.status: node.PaymentStatus
+property node.IPaymentInfo.unresolved?: node.IPaymentUnresolved
 interface node.IPaymentPart
 property node.IPaymentPart.amountMsat: bigint
 property node.IPaymentPart.channelId: Buffer
@@ -6090,6 +6092,9 @@ property node.IPaymentRetryContext.metadata?: Record<string, string>
 property node.IPaymentRetryContext.payAll?: node.IPayAllBudget
 property node.IPaymentRetryContext.policyOverrides?: Map<string, gossip.IChannelUpdateMessage>
 property node.IPaymentRetryContext.retryCount: number
+interface node.IPaymentUnresolved
+property node.IPaymentUnresolved.channelIds: string[]
+property node.IPaymentUnresolved.code: 'CHANNEL_OMITTED_AT_RESTORE'
 interface node.IPendingMppPayment
 property node.IPendingMppPayment.createdAt: number
 property node.IPendingMppPayment.paymentSecret?: Buffer
@@ -6528,6 +6533,11 @@ enum node.PaymentStatus
 member node.PaymentStatus.COMPLETED = "COMPLETED"
 member node.PaymentStatus.FAILED = "FAILED"
 member node.PaymentStatus.PENDING = "PENDING"
+class node.PaymentUnresolvedError extends beignet#CodedError<'PAYMENT_UNRESOLVED'>
+constructor node.PaymentUnresolvedError(paymentHash: Buffer, unresolved: node.IPaymentUnresolved, resolution?: node.IOutgoingPaymentResolution)
+readonly property node.PaymentUnresolvedError.paymentHash: string
+readonly property node.PaymentUnresolvedError.resolution?: node.IOutgoingPaymentResolution
+readonly property node.PaymentUnresolvedError.unresolved: node.IPaymentUnresolved
 class node.PaymentWaitTimeoutError extends Error
 class node.PeerRateLimiter
 constructor node.PeerRateLimiter(config?: node.IRateLimitConfig)
@@ -7231,6 +7241,7 @@ property recovery.ICapsuleRestoreResult.framesApplied: number
 property recovery.ICapsuleRestoreResult.omittedAuxiliaryChannels?: recovery.IAuxiliaryRestoreChannel[]
 property recovery.ICapsuleRestoreResult.scb: backup.IStaticChannelBackup
 property recovery.ICapsuleRestoreResult.tier: 1 | 2
+property recovery.ICapsuleRestoreResult.unresolvedPayments?: string[]
 interface recovery.IComposeCapsuleOptions
 property recovery.IComposeCapsuleOptions.allowInline?: boolean
 property recovery.IComposeCapsuleOptions.encryptedScb: string
@@ -8010,6 +8021,7 @@ function recovery.lastAppliedFrameIndex(frames: recovery.RecoveryFrame[]): numbe
 function recovery.leaseStorageSupported(storage: storage.IStorageBackend): boolean
 function recovery.loadWriterLease(storage: storage.IStorageBackend): recovery.WriterLeaseLoad
 function recovery.markLeaseConfirmed(storage: storage.IStorageBackend, expected: recovery.IWriterLeaseIdentity, confirmedAt: bigint): void
+function recovery.markPaymentsOfOmittedChannels(target: storage.IStorageBackend, channels: ReadonlyArray<{ channelId: string; state: channel.IChannelState; }>): string[]
 function recovery.nodeGuardianTransport(): recovery.GuardianHttpTransport
 function recovery.parseBolt8GuardianUrl(url: string): recovery.IBolt8GuardianTarget
 function recovery.parseGuardianEntry(entry: string | recovery.IGuardianConfigEntry): recovery.IParsedGuardian
@@ -8559,6 +8571,7 @@ property storage.ISerializedPaymentInfo.sentMsat?: string
 property storage.ISerializedPaymentInfo.settledHtlcs?: string[]
 property storage.ISerializedPaymentInfo.sharedSecrets?: string[]
 property storage.ISerializedPaymentInfo.status: string
+property storage.ISerializedPaymentInfo.unresolved?: { code: string; channelIds: string[]; }
 interface storage.ISerializedShaChainEntry
 property storage.ISerializedShaChainEntry.index: string
 property storage.ISerializedShaChainEntry.secret: string

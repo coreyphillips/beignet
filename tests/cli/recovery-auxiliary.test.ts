@@ -14,6 +14,7 @@
 
 import Database from 'better-sqlite3';
 import { expect } from 'chai';
+import { createHash } from 'crypto';
 import * as bip39 from 'bip39';
 import * as fs from 'fs';
 import * as http from 'http';
@@ -35,17 +36,25 @@ import {
 import type { IStaticChannelBackup } from '../../src/lightning/backup/scb';
 import type { IAuxiliaryChannelConfig } from '../../src/lightning/channel/auxiliary-funding';
 import { Feature, FeatureFlags } from '../../src/lightning/features/flags';
+import {
+	LnCoinType,
+	deriveLightningKeysFromMnemonic
+} from '../../src/lightning/keys/wallet-keys';
+import { PaymentStatus } from '../../src/lightning/node/payment-types';
 import { AuxiliaryProviderRequiredError } from '../../src/lightning/node/types';
 import {
 	AuxiliaryGuardianModeError,
 	AuxiliaryGuardianRestoreError,
-	AuxiliaryRestoreRefusedError
+	AuxiliaryRestoreRefusedError,
+	decodeRecoveryCapsuleBlob
 } from '../../src/lightning/recovery';
 import { SqliteStorage } from '../../src/lightning/storage/sqlite-storage';
 import {
 	assetHost,
 	connectHosts,
 	openAssetChannel,
+	payAssetUnits,
+	turns,
 	withAssetOpens
 } from '../lightning/helpers/auxiliary-nodes';
 import {
@@ -406,6 +415,170 @@ describe('Recovery modes and asset channels, over the daemon', function () {
 				'INVALID_PARAMS'
 			);
 		}
+	});
+
+	it('restores a real capsule that holds an asset channel, over HTTP: refused by default with the channels listed and nothing installed, and with omitAssetChannels restored without them, the payment in flight left unresolved', async () => {
+		// The wallet that was lost: a node with this daemon's own key, an
+		// asset channel, a payment its payee holds, and the capsule it
+		// handed its peers.
+		const secret = deriveLightningKeysFromMnemonic(
+			MNEMONICS[0],
+			undefined,
+			LnCoinType.REGTEST
+		).nodePrivateKey;
+		const journal = new SqliteStorage(':memory:');
+		journal.open();
+		const valued: Partial<IAuxiliaryChannelConfig> = {
+			valueIncomingHtlc: (context) => context.auxiliaryAmount! * 1000n
+		};
+		const lost = assetHost('capsule over http', 1, valued, {
+			extra: {
+				nodePrivateKey: secret,
+				storage: journal,
+				recovery: { enabled: true }
+			}
+		});
+		const peer = assetHost('capsule over http', 2, valued);
+		let blob: Buffer | null;
+		let id: string;
+		let peerId: string;
+		const hash = createHash('sha256').update('held by the payee').digest();
+		try {
+			connectHosts(lost, peer);
+			const channelId = await openAssetChannel(lost, peer, {
+				tag: 'capsule over http',
+				openerUnits: 9000n,
+				acceptorUnits: 1000n
+			});
+			id = channelId.toString('hex');
+			peerId = peer.node.getNodeId();
+			const invoice = peer.node.createInvoice({
+				amountMsat: 3_000_000n,
+				description: 'held by the payee',
+				hold: true,
+				paymentHash: hash
+			});
+			payAssetUnits(lost, peer, channelId, invoice, 3_000_000n, 3000n);
+			await turns(200);
+			expect(lost.node.getPayment(hash)!.status).to.equal(
+				PaymentStatus.PENDING
+			);
+			// As after a restart of that wallet: the first capsule of a run
+			// follows a snapshot of the tables, which is what keeps the
+			// journal small enough for a peer to store.
+			const node = lost.node as unknown as {
+				recoveryJournal: { rebasedThisRun: boolean };
+				composeRecoveryCapsuleBlob: () => Buffer | null;
+			};
+			node.recoveryJournal.rebasedThisRun = false;
+			blob = node.composeRecoveryCapsuleBlob();
+		} finally {
+			lost.node.destroy();
+			peer.node.destroy();
+			try {
+				journal.close();
+			} catch {
+				// Closed with its node.
+			}
+		}
+		expect(blob).to.not.equal(null);
+		const capsule = decodeRecoveryCapsuleBlob(blob!, secret);
+		expect(capsule, "the capsule is this wallet's").to.not.equal(null);
+		expect(
+			capsule!.inlineRecoveryState,
+			'the journal is inline: a Tier 2 restore'
+		).to.not.equal(undefined);
+
+		// The same seed on a fresh database, with no extension attached.
+		const daemon = await boot('capsule-http', {
+			mnemonic: MNEMONICS[0],
+			recoveryMode: 'peer-storage'
+		});
+		const dataDir = dirs[dirs.length - 1];
+		const port = portOf(daemon);
+		daemon.node.getNode().emit('peer_storage:retrieved', PEER, blob!);
+		const listed = [
+			{ channelId: id, peerPubkey: peerId, capacitySats: 2_000_000 }
+		];
+
+		// By default it is refused, with the channels, and nothing is
+		// installed: the daemon answers on as the empty wallet it was.
+		const refused = await request(port, 'POST', '/recovery/restore-capsule', {
+			confirm: true
+		});
+		expect(refused.status, JSON.stringify(refused.body)).to.equal(409);
+		expect(refused.body.ok).to.equal(false);
+		const error = refused.body.error as {
+			code: string;
+			message: string;
+			details?: unknown;
+		};
+		expect(error.code).to.equal('ASSET_PROVIDER_REQUIRED');
+		expect(error.details).to.deep.equal({ assetChannels: listed });
+		expect((await request(port, 'GET', '/info')).status).to.equal(200);
+		expect((await request(port, 'GET', '/channels')).body.result).to.deep.equal(
+			[]
+		);
+		expect((await request(port, 'GET', '/payments')).body.result).to.deep.equal(
+			[]
+		);
+
+		// Asked to leave them out, it restores the rest and says what it
+		// left out and which payment it can no longer follow.
+		const restored = await request(port, 'POST', '/recovery/restore-capsule', {
+			confirm: true,
+			omitAssetChannels: true
+		});
+		expect(restored.status, JSON.stringify(restored.body)).to.equal(200);
+		expect(restored.body.ok).to.equal(true);
+		const result = restored.body.result as {
+			tier: number;
+			restartRequired?: boolean;
+			omittedAssetChannels?: unknown;
+			unresolvedPayments?: unknown;
+		};
+		expect(result.tier).to.equal(2);
+		expect(result.omittedAssetChannels).to.deep.equal(listed);
+		expect(result.unresolvedPayments).to.deep.equal([hash.toString('hex')]);
+		expect(result.restartRequired).to.equal(true);
+		await daemon.stop();
+
+		// After the restart the wallet runs with no asset channel and no
+		// extension, and shows the payment as it is: PENDING, unresolved.
+		const again = await boot('capsule-http-again', {
+			dataDir,
+			mnemonic: MNEMONICS[0],
+			recoveryMode: 'peer-storage'
+		});
+		const portAgain = portOf(again);
+		expect((await request(portAgain, 'GET', '/info')).status).to.equal(200);
+		expect(
+			(await request(portAgain, 'GET', '/channels')).body.result
+		).to.deep.equal([]);
+		const rows = (await request(portAgain, 'GET', '/payments')).body
+			.result as Array<Record<string, unknown>>;
+		expect(rows.map((row) => row.paymentHash)).to.deep.equal([
+			hash.toString('hex')
+		]);
+		expect(rows[0].status).to.equal('PENDING');
+		expect(rows[0].direction).to.equal('OUTGOING');
+		expect(rows[0].auxiliary).to.equal(true);
+		expect(rows[0].unresolved).to.deep.equal({
+			code: 'CHANNEL_OMITTED_AT_RESTORE',
+			channelIds: [id]
+		});
+		expect(rows[0]).to.not.have.property('preimage');
+		expect(rows[0]).to.not.have.property('failureDescription');
+		const cancel = await request(portAgain, 'POST', '/payment/cancel', {
+			paymentHash: hash.toString('hex')
+		});
+		expect(cancel.status).to.equal(409);
+		expect((cancel.body.error as { code: string }).code).to.equal(
+			'PAYMENT_UNRESOLVED'
+		);
+		const after = (await request(portAgain, 'GET', '/payments')).body
+			.result as Array<Record<string, unknown>>;
+		expect(after[0].status).to.equal('PENDING');
 	});
 
 	it('lists what a restore left out: the channels the engine skipped at Tier 2, and the asset entries of the backup at Tier 1', () => {

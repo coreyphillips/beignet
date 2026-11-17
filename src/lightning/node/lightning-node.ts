@@ -414,6 +414,7 @@ import {
 	PaymentWaitTimeoutError,
 	InvalidChannelOpenError,
 	AuxiliaryPaymentError,
+	PaymentUnresolvedError,
 	ChannelFundingUnavailableError,
 	AuxiliaryChannelRowError,
 	AuxiliaryProviderRequiredError,
@@ -22745,6 +22746,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			completedAt: Date.now(),
 			amountMsat: credit.amountMsat
 		};
+		delete completed.unresolved;
 		const mutations: RecoveryMutation[] = [];
 		const archived = this.fforArchivedVouchers.get(credit.id);
 		let creditedArchive: IFforVoucherArchive | undefined;
@@ -24011,6 +24013,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		const payment = this.payments.get(hashHex);
 		if (payment) {
 			payment.status = PaymentStatus.COMPLETED;
+			delete payment.unresolved;
 			payment.preimage = pre;
 			payment.completedAt = Date.now();
 			payment.settledHtlcs = held.map(
@@ -24315,7 +24318,10 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		if (
 			payment &&
 			payment.direction === PaymentDirection.INCOMING &&
-			payment.status !== PaymentStatus.COMPLETED
+			payment.status !== PaymentStatus.COMPLETED &&
+			// Unresolved stays unresolved: a capsule can be older than a
+			// settle, so the HTLC on the channel left out may have paid.
+			!payment.unresolved
 		) {
 			payment.status = PaymentStatus.FAILED;
 			const paymentMutation = this.paymentMutation(Buffer.from(hashHex, 'hex'));
@@ -26296,6 +26302,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			const payment = this.payments.get(hashHex);
 			if (payment) {
 				payment.status = PaymentStatus.COMPLETED;
+				delete payment.unresolved;
 				payment.completedAt = Date.now();
 				payment.settledHtlcs = pending.receivedParts.map(
 					(p) => `${p.channelId.toString('hex')}:${p.htlcId}`
@@ -26483,6 +26490,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		const payment = this.payments.get(hashHex);
 		if (payment) {
 			payment.status = PaymentStatus.COMPLETED;
+			delete payment.unresolved;
 			payment.completedAt = Date.now();
 			payment.settledHtlcs = [`${channelId.toString('hex')}:${htlcId}`];
 			if (payment.amountMsat === 0n) payment.amountMsat = declaredMsat;
@@ -26657,7 +26665,11 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		this.cleanupHtlcSharedSecret(key);
 		this.clearJitSkim(hashHex);
 		this.paymentSecrets.delete(hashHex);
-		if (payment && completed) Object.assign(payment, completed);
+		if (payment && completed) {
+			Object.assign(payment, completed);
+			// Settled by an HTLC this wallet holds: no longer unresolved.
+			delete payment.unresolved;
+		}
 		if (invoice && markedInvoice) invoice.auxiliary = true;
 		if (this.storage) {
 			try {
@@ -28161,6 +28173,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				payment.status === PaymentStatus.FAILED)
 		) {
 			payment.status = PaymentStatus.COMPLETED;
+			delete payment.unresolved;
 			payment.preimage = preimage;
 			payment.completedAt = Date.now();
 			// Preserve invoice string for payment proof before deleting retry context
@@ -28262,6 +28275,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			payment.status === PaymentStatus.FAILED
 		) {
 			payment.status = PaymentStatus.COMPLETED;
+			delete payment.unresolved;
 			payment.preimage = preimage;
 			payment.completedAt = Date.now();
 			const retryCtx = this.paymentRetryContexts.get(hashHex);
@@ -35117,6 +35131,9 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			) {
 				continue;
 			}
+			// Kept: the record is all that says an HTLC of it was on a
+			// channel a restore left out.
+			if (payment.unresolved) continue;
 			if (
 				nowSec >=
 				inv.createdAt + inv.expiry + ISSUED_INVOICE_SWEEP_GRACE_SECONDS
@@ -35367,6 +35384,9 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		const hashHex = paymentHash.toString('hex');
 		const payment = this.payments.get(hashHex);
 		if (!payment || payment.status !== PaymentStatus.PENDING) return;
+		// An HTLC of it is on a channel a restore left out. The peer may have
+		// settled it, so this wallet never says it failed.
+		if (payment.unresolved) return;
 
 		payment.status = PaymentStatus.FAILED;
 		payment.completedAt = Date.now();
@@ -35442,7 +35462,10 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	private static viewHasHtlcInFlight(
 		view: IOutgoingPaymentResolution
 	): boolean {
-		return view.htlcs.some(LightningNode.htlcViewInFlight);
+		return (
+			view.unresolved !== undefined ||
+			view.htlcs.some(LightningNode.htlcViewInFlight)
+		);
 	}
 
 	/**
@@ -35608,6 +35631,14 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 					(inFlight === 'any-pending' ||
 						existingPayment.direction === PaymentDirection.OUTGOING)))
 		) {
+			throw new LightningPaymentError(
+				LightningErrorCode.DUPLICATE_PAYMENT,
+				'Payment already in flight for this invoice'
+			);
+		}
+		// A part is not added to a payment with an HTLC on a channel a
+		// restore left out: what that HTLC carried and did is not known here.
+		if (inFlight === 'mpp-part' && view.unresolved) {
 			throw new LightningPaymentError(
 				LightningErrorCode.DUPLICATE_PAYMENT,
 				'Payment already in flight for this invoice'
@@ -35821,7 +35852,12 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			resolved:
 				status !== PaymentStatus.PENDING && htlcs.every((h) => h.terminal),
 			latestOutstandingExpiry,
-			preimage
+			preimage,
+			// A restore left the channel of its HTLC out: the peer still has
+			// it, and what it did with it is not known to this wallet.
+			...(status === PaymentStatus.PENDING && payment?.unresolved
+				? { unresolved: payment.unresolved }
+				: {})
 		};
 	}
 
@@ -35839,6 +35875,13 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		if (this._destroyed) return Promise.reject(new Error('Node destroyed'));
 		const first = this.getOutgoingHtlcs(paymentHash);
 		if (first.resolved) return Promise.resolve(first);
+		// Nothing this wallet holds will ever resolve it: said now, in place
+		// of a wait that cannot end.
+		if (first.unresolved) {
+			return Promise.reject(
+				new PaymentUnresolvedError(paymentHash, first.unresolved, first)
+			);
+		}
 		const hashHex = paymentHash.toString('hex');
 
 		return new Promise<IOutgoingPaymentResolution>((resolve, reject) => {

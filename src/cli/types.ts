@@ -460,6 +460,16 @@ export interface PayAllPayment {
 	remainderMsat: string;
 }
 
+/**
+ * Why a PENDING payment can no longer be followed by this wallet (issue
+ * #2093): an HTLC of it was on a channel a capsule restore left out.
+ */
+export interface PaymentUnresolved {
+	code: 'CHANNEL_OMITTED_AT_RESTORE';
+	/** The channels left out that carried an HTLC of it. */
+	channelIds: ChannelIdHex[];
+}
+
 export interface PaymentInfo {
 	payAll?: PayAllPayment;
 	paymentHash: PaymentHashHex;
@@ -475,6 +485,14 @@ export interface PaymentInfo {
 	auxiliary?: true;
 	/** An outgoing asset payment: what it was worth to the payee, in sats. */
 	auxiliaryValueSats?: number;
+	/**
+	 * Present on a PENDING payment whose outcome this wallet cannot learn:
+	 * an HTLC of it was on an asset channel a capsule restore left out
+	 * (`omitAssetChannels`), and the peer may have settled or failed it
+	 * since. Such a payment stays PENDING. It is never reported as paid or
+	 * as failed, cannot be cancelled and is not sent again.
+	 */
+	unresolved?: PaymentUnresolved;
 	status: 'PENDING' | 'COMPLETED' | 'FAILED';
 	direction: 'OUTGOING' | 'INCOMING';
 	failureCode?: number;
@@ -516,6 +534,12 @@ export interface InvoiceInfo {
 	 * every other.
 	 */
 	auxiliary?: true;
+	/**
+	 * Present on an invoice that is not PAID and had an HTLC on an asset
+	 * channel a capsule restore left out: whether that HTLC paid it is not
+	 * known to this wallet. The mark of its payment record.
+	 */
+	unresolved?: PaymentUnresolved;
 }
 
 /**

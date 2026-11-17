@@ -71,7 +71,8 @@ import { createOpenerState } from '../channel/channel-state';
 import {
 	assertAuxiliaryRestore,
 	assertAuxiliaryRestoreInstalled,
-	auxiliaryRestoreChannels
+	auxiliaryRestoreChannels,
+	markPaymentsOfOmittedChannels
 } from './auxiliary-restore';
 import type { IAuxiliaryRestoreChannel } from './auxiliary-restore';
 import {
@@ -1182,6 +1183,12 @@ export interface ICapsuleRestoreResult {
 	 * held and left out. Present only when there was one.
 	 */
 	omittedAuxiliaryChannels?: IAuxiliaryRestoreChannel[];
+	/**
+	 * Tier 2 with `omitAuxiliaryChannels`: the payment hashes of the
+	 * PENDING records that had an HTLC on a channel left out, each now
+	 * marked `unresolved`. Present only when there was one.
+	 */
+	unresolvedPayments?: string[];
 }
 
 /**
@@ -1471,6 +1478,7 @@ export function restoreFromRecoveryCapsule(
 	// content was already proven (or, without a scratch, is at least never
 	// silently degraded), so a failure here means the TARGET is broken,
 	// not the capsule.
+	let unresolvedPayments: string[] = [];
 	withStorageTransaction(target, () => {
 		for (const row of rows) {
 			target.saveRecoveryFrame!(row);
@@ -1501,6 +1509,15 @@ export function restoreFromRecoveryCapsule(
 			);
 		}
 		reconstructFromFrames(target, installed);
+		// A payment in flight on a channel left out is not followed from
+		// here on: its record says so, and keeps PENDING.
+		if (omitted.length > 0) {
+			const left = new Set(omitted.map((channel) => channel.channelId));
+			unresolvedPayments = markPaymentsOfOmittedChannels(
+				target,
+				replayed.filter((row) => left.has(row.channelId))
+			);
+		}
 		// Only reads: what was installed is what was asked about above, and
 		// no asset channel at all when they were left out.
 		assertAuxiliaryRestoreInstalled(target, auxiliaryChannelIds);
@@ -1510,7 +1527,8 @@ export function restoreFromRecoveryCapsule(
 		tier: 2,
 		scb,
 		framesApplied: frames.length,
-		...(omitted.length > 0 ? { omittedAuxiliaryChannels: omitted } : {})
+		...(omitted.length > 0 ? { omittedAuxiliaryChannels: omitted } : {}),
+		...(unresolvedPayments.length > 0 ? { unresolvedPayments } : {})
 	};
 }
 

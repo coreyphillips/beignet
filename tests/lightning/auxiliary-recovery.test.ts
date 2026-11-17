@@ -9,6 +9,7 @@
  */
 
 import { expect } from 'chai';
+import { createHash } from 'crypto';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
@@ -19,23 +20,34 @@ import type {
 } from '../../src/lightning/channel/auxiliary-funding';
 import { MessageType } from '../../src/lightning/message/types';
 import type { LightningNode } from '../../src/lightning/node/lightning-node';
-import { AuxiliaryProviderRequiredError } from '../../src/lightning/node/types';
+import {
+	AuxiliaryPaymentError,
+	AuxiliaryProviderRequiredError,
+	LightningPaymentError,
+	PaymentStatus,
+	PaymentUnresolvedError
+} from '../../src/lightning/node/types';
 import {
 	assertGuardianJournalHoldsNoAuxiliaryChannels,
 	AuxiliaryGuardianModeError,
 	AuxiliaryGuardianRestoreError,
 	AuxiliaryGuardianStartError,
 	AuxiliaryRestoreRefusedError,
+	channelsAfterReplay,
 	composeRecoveryCapsule,
+	decodeRecoveryCapsuleBlob,
+	deriveRecoveryMasterKey,
 	encryptRecoveryCapsule,
 	GuardianDescriptor,
 	framesWithoutChannels,
 	isGuardianRecoveryMode,
+	JOURNAL_META_KEYS,
 	RecoveryCapsule,
 	refusedAuxiliaryChannels,
 	restoreBestRecoveryCapsule,
 	restoreFromRecoveryCapsule,
-	storedAuxiliaryChannelIds
+	storedAuxiliaryChannelIds,
+	verifyFrameChain
 } from '../../src/lightning/recovery';
 import { SqliteStorage } from '../../src/lightning/storage/sqlite-storage';
 import { isStorageTransactionActive } from '../../src/lightning/storage/transaction';
@@ -44,6 +56,8 @@ import {
 	connectHosts,
 	IAssetHost,
 	openAssetChannel,
+	payAssetUnits,
+	turns,
 	withAssetOpens
 } from './helpers/auxiliary-nodes';
 import {
@@ -1009,6 +1023,521 @@ describe('a restore that holds asset channels', () => {
 			]);
 			// No channel named: the frames themselves.
 			expect(framesWithoutChannels(frames, new Set())).to.equal(frames);
+		});
+
+		describe('with payments in flight on a channel left out', () => {
+			const sha = (data: Buffer | string): Buffer =>
+				createHash('sha256').update(data).digest();
+			const valued: Partial<IAuxiliaryChannelConfig> = {
+				valueIncomingHtlc: (context) => context.auxiliaryAmount! * 1000n
+			};
+			const hex = (hash: Buffer): string => hash.toString('hex');
+
+			/**
+			 * A journaled node with an asset channel on which one payment out
+			 * has completed, one payment out is held by its payee and one
+			 * payment in is held by the node, and the capsule of its journal.
+			 * With `ordinary`, an ordinary channel with the same peer too.
+			 */
+			const inFlight = async (
+				ordinary = false
+			): Promise<{
+				channelId: Buffer;
+				ordinaryId?: Buffer;
+				done: Buffer;
+				out: Buffer;
+				incoming: Buffer;
+				incomingPreimage: Buffer;
+				outSecret?: Buffer;
+				capsule: RecoveryCapsule;
+			}> => {
+				const storage = openStorage();
+				const alice = assetHost(TAG, 1, valued, {
+					extra: { storage, recovery: { enabled: true } }
+				});
+				const bob = assetHost(TAG, 2, valued);
+				hosts.push(alice, bob);
+				connectHosts(alice, bob);
+				const channelId = await openAssetChannel(alice, bob, {
+					tag: TAG,
+					openerUnits: 9000n,
+					acceptorUnits: 1000n
+				});
+				const ordinaryId = ordinary
+					? openReadyChannel(alice.node, bob.node)
+					: undefined;
+
+				const paid = bob.node.createInvoice({
+					amountMsat: 1_000_000n,
+					description: 'paid and done'
+				});
+				payAssetUnits(alice, bob, channelId, paid, 1_000_000n, 1000n);
+				await turns(200);
+				expect(alice.node.getPayment(paid.paymentHash)!.status).to.equal(
+					PaymentStatus.COMPLETED
+				);
+
+				const out = sha(sha('held by the payee'));
+				const outInvoice = bob.node.createInvoice({
+					amountMsat: 3_000_000n,
+					description: 'held by the payee',
+					hold: true,
+					paymentHash: out
+				});
+				payAssetUnits(alice, bob, channelId, outInvoice, 3_000_000n, 3000n);
+				await turns(200);
+
+				const incomingPreimage = sha('held by the node');
+				const incoming = sha(incomingPreimage);
+				const incomingInvoice = alice.node.createInvoice({
+					amountMsat: 500_000n,
+					description: 'held by the node',
+					hold: true,
+					paymentHash: incoming
+				});
+				payAssetUnits(bob, alice, channelId, incomingInvoice, 500_000n, 500n);
+				await turns(200);
+
+				expect(
+					alice.node
+						.getAuxiliaryChannelInfo(channelId)!
+						.htlcs.map((htlc) => [htlc.direction, htlc.auxiliaryAmount])
+				).to.deep.equal([
+					['offered', 3000n],
+					['received', 500n]
+				]);
+				for (const hash of [out, incoming]) {
+					expect(alice.node.getPayment(hash)!.status).to.equal(
+						PaymentStatus.PENDING
+					);
+				}
+				// The helper that opens the ordinary channel funds it itself, and
+				// the host's refusal to fund is the one error there is.
+				expect(
+					alice.errors.filter(
+						(error) => !error.startsWith('AUTO_FUNDING_FAILED')
+					)
+				).to.deep.equal([]);
+
+				const { capsule, inline, inlineError } = composeRecoveryCapsule({
+					storage,
+					encryptedScb: scb(),
+					nodeSecret: SECRET,
+					maxBytes: 1_000_000
+				});
+				expect(inline, String(inlineError)).to.equal(true);
+				return {
+					channelId,
+					...(ordinaryId ? { ordinaryId } : {}),
+					done: paid.paymentHash,
+					out,
+					incoming,
+					incomingPreimage,
+					...(outInvoice.paymentSecret
+						? { outSecret: outInvoice.paymentSecret }
+						: {}),
+					capsule
+				};
+			};
+
+			const markOf = (
+				channelId: Buffer
+			): { code: string; channelIds: string[] } => ({
+				code: 'CHANNEL_OMITTED_AT_RESTORE',
+				channelIds: [hex(channelId)]
+			});
+
+			it('marks each PENDING record unresolved with the channel, leaves a finished one as it was, and lists the marked in the answer', async () => {
+				const { channelId, done, out, incoming, capsule } = await inFlight();
+
+				// Restored whole, nothing is marked and the answer says nothing.
+				const whole = target();
+				const all = restoreFromRecoveryCapsule(capsule, whole, SECRET, {
+					auxiliaryChannels: provider(() => true)
+				});
+				expect('unresolvedPayments' in all).to.equal(false);
+				for (const row of whole.loadAllPayments()) {
+					expect('unresolved' in row.payment, row.paymentHash).to.equal(false);
+				}
+
+				const into = target();
+				const result = restoreFromRecoveryCapsule(capsule, into, SECRET, {
+					omitAuxiliaryChannels: true
+				});
+				expect(result.unresolvedPayments).to.deep.equal(
+					[hex(out), hex(incoming)].sort()
+				);
+				for (const hash of [out, incoming]) {
+					const stored = into.loadPayment(hex(hash))!;
+					expect(stored.status).to.equal(PaymentStatus.PENDING);
+					expect(stored).to.deep.equal({
+						...whole.loadPayment(hex(hash))!,
+						unresolved: markOf(channelId)
+					});
+				}
+				expect(into.loadPayment(hex(done))).to.deep.equal(
+					whole.loadPayment(hex(done))
+				);
+				expect(into.loadPayment(hex(done))!.status).to.equal(
+					PaymentStatus.COMPLETED
+				);
+				expect(into.loadAllPayments().length).to.equal(
+					whole.loadAllPayments().length
+				);
+			});
+
+			it('a node started on it keeps both PENDING and unresolved whatever the clock or a caller says, sends for neither again, acts on no channel and announces nothing', async () => {
+				const {
+					channelId,
+					out,
+					incoming,
+					incomingPreimage,
+					outSecret,
+					capsule
+				} = await inFlight();
+				const into = target();
+				restoreFromRecoveryCapsule(capsule, into, SECRET, {
+					omitAuxiliaryChannels: true
+				});
+				const node = createNode(TAG, 1, into, { recovery: { enabled: true } });
+				nodes.push(node);
+				const errors: string[] = [];
+				node.on('node:error', (error: { code?: string; message?: string }) => {
+					errors.push(`${error.code ?? ''}: ${error.message ?? ''}`);
+				});
+				const announced: string[] = [];
+				for (const name of [
+					'payment:failed',
+					'payment:sent',
+					'payment:received',
+					'invoice:settled'
+				]) {
+					(
+						node as unknown as {
+							on: (event: string, listener: () => void) => void;
+						}
+					).on(name, () => announced.push(name));
+				}
+				const mark = markOf(channelId);
+				const expectUnresolved = (when: string): void => {
+					for (const hash of [out, incoming]) {
+						const record = node.getPayment(hash)!;
+						expect(record.status, when).to.equal(PaymentStatus.PENDING);
+						expect(record.unresolved, when).to.deep.equal(mark);
+						expect(into.loadPayment(hex(hash))!.status, when).to.equal(
+							PaymentStatus.PENDING
+						);
+						expect(into.loadPayment(hex(hash))!.unresolved, when).to.deep.equal(
+							mark
+						);
+					}
+				};
+				expectUnresolved('at the start');
+				expect(node.listChannels()).to.deep.equal([]);
+
+				// The HTLC out is nowhere this wallet can see, and it counts as
+				// in flight all the same.
+				const view = node.getOutgoingHtlcs(out);
+				expect(view.htlcs).to.deep.equal([]);
+				expect(view.resolved).to.equal(false);
+				expect(view.unresolved).to.deep.equal(mark);
+				expect(node.hasHtlcInFlight(out)).to.equal(true);
+
+				// Eleven minutes on, the sweeps of stuck and expired payments
+				// and of expired invoices leave both.
+				const sweeps = node as unknown as {
+					scanStuckPayments: () => void;
+					scanExpiredPendingPayments: () => void;
+					sweepExpiredIssuedInvoices: () => void;
+				};
+				const realNow = Date.now;
+				Date.now = (): number => realNow() + 11 * 60 * 1000;
+				try {
+					sweeps.scanStuckPayments();
+					sweeps.scanExpiredPendingPayments();
+					sweeps.sweepExpiredIssuedInvoices();
+				} finally {
+					Date.now = realNow;
+				}
+				expectUnresolved('after the sweeps');
+
+				// A caller cannot fail it either: it may have been paid.
+				node.failPayment(out, 'given up');
+				expect(node.failPaymentUnlessInFlight(out, 'given up')).to.equal(false);
+				expectUnresolved('after a caller failed it');
+
+				// Nothing is sent for the hash again.
+				const again = thrownBy(() =>
+					node.sendPaymentToRoute(
+						{
+							hops: [
+								{
+									pubkey: Buffer.from(hosts[1].node.getNodeId(), 'hex'),
+									shortChannelId: Buffer.alloc(8, 9),
+									amountToForwardMsat: 3_000_000n,
+									outgoingCltvValue: 40
+								}
+							]
+						},
+						out,
+						40,
+						outSecret
+					)
+				);
+				// The route names no asset channel, and that is refused first.
+				expect(again).to.be.instanceOf(AuxiliaryPaymentError);
+				// The check every send makes of its hash says it is in flight,
+				// for a whole payment and for a part of one.
+				for (const mode of ['outgoing-pending', 'any-pending', 'mpp-part']) {
+					const refused = thrownBy(() =>
+						(
+							node as unknown as {
+								assertHashUnpaid: (
+									hash: Buffer,
+									mode: string,
+									totalMsat?: bigint
+								) => void;
+							}
+						).assertHashUnpaid(out, mode, 3_000_000n)
+					);
+					expect(refused, mode).to.be.instanceOf(LightningPaymentError);
+					expect((refused as LightningPaymentError).code, mode).to.equal(
+						'DUPLICATE_PAYMENT'
+					);
+				}
+				expectUnresolved('after a second send');
+
+				// A wait on it ends at once, with the reason.
+				const waited = await node.awaitPaymentResolution(out).then(
+					() => undefined,
+					(err: unknown) => err
+				);
+				expect(waited).to.be.instanceOf(PaymentUnresolvedError);
+				expect((waited as PaymentUnresolvedError).code).to.equal(
+					'PAYMENT_UNRESOLVED'
+				);
+				expect((waited as PaymentUnresolvedError).unresolved).to.deep.equal(
+					mark
+				);
+				expect((waited as PaymentUnresolvedError).message).to.include(
+					hex(channelId)
+				);
+
+				// The payment in: no HTLC is held here, a settle moves nothing,
+				// and cancelling the invoice leaves the record as it is.
+				expect(node.listHeldHtlcs()).to.deep.equal([]);
+				expect(node.settleHeldHtlc(incoming, incomingPreimage)).to.equal(false);
+				node.cancelHoldInvoice(incoming);
+				expectUnresolved('after a settle and a cancel');
+
+				await turns(50);
+				expect(announced).to.deep.equal([]);
+				expect(errors).to.deep.equal([]);
+			});
+
+			it('a marked record that an HTLC on a channel the wallet holds settles is COMPLETED and loses the mark, sent and received', async () => {
+				const alice = assetHost(TAG, 1, valued, { sqlite: true });
+				const bob = assetHost(TAG, 2, valued, { sqlite: true });
+				hosts.push(alice, bob);
+				connectHosts(alice, bob);
+				const channelId = await openAssetChannel(alice, bob, {
+					tag: TAG,
+					openerUnits: 9000n,
+					acceptorUnits: 1000n
+				});
+				const mark = {
+					code: 'CHANNEL_OMITTED_AT_RESTORE' as const,
+					channelIds: ['5c'.repeat(32)]
+				};
+				const settled = (
+					host: IAssetHost,
+					hash: Buffer,
+					when: string
+				): void => {
+					const record = host.node.getPayment(hash)!;
+					expect(record.status, when).to.equal(PaymentStatus.COMPLETED);
+					expect('unresolved' in record, when).to.equal(false);
+					const stored = host.storage!.loadPayment(hex(hash))!;
+					expect(stored.status, when).to.equal(PaymentStatus.COMPLETED);
+					expect('unresolved' in stored, when).to.equal(false);
+				};
+
+				// A held invoice: marked on both sides while it is held.
+				const preimage = sha('settled after all');
+				const held = sha(preimage);
+				const invoice = bob.node.createInvoice({
+					amountMsat: 2_000_000n,
+					description: 'settled after all',
+					hold: true,
+					paymentHash: held
+				});
+				payAssetUnits(alice, bob, channelId, invoice, 2_000_000n, 2000n);
+				await turns(200);
+				for (const host of [alice, bob]) {
+					const record = host.node.getPayment(held)!;
+					expect(record.status).to.equal(PaymentStatus.PENDING);
+					record.unresolved = mark;
+				}
+				expect(bob.node.settleHeldHtlc(held, preimage)).to.equal(true);
+				await turns(200);
+				settled(bob, held, 'the held payment in');
+				settled(alice, held, 'the payment out');
+
+				// An invoice that settles as its HTLC arrives.
+				const plain = bob.node.createInvoice({
+					amountMsat: 1_000_000n,
+					description: 'paid at once'
+				});
+				bob.node.getPayment(plain.paymentHash)!.unresolved = mark;
+				payAssetUnits(alice, bob, channelId, plain, 1_000_000n, 1000n);
+				await turns(200);
+				settled(bob, plain.paymentHash, 'the payment in');
+			});
+
+			it('the first capsule the restored wallet makes holds nothing of the channel left out and carries the marks: a second restore from it is not refused, brings no channel back and keeps the payments unresolved', async () => {
+				const { channelId, ordinaryId, out, incoming, capsule } =
+					await inFlight(true);
+				const id = hex(channelId);
+				const ordinary = hex(ordinaryId!);
+				const into = target();
+				restoreFromRecoveryCapsule(capsule, into, SECRET, {
+					omitAuxiliaryChannels: true
+				});
+				// As installed, the journal is the capsule's own and still
+				// names the channel.
+				const installedTip = into.getRecoveryMeta!(
+					JOURNAL_META_KEYS.tipSequence
+				);
+
+				const node = createNode(TAG, 1, into, { recovery: { enabled: true } });
+				nodes.push(node);
+				node.on('node:error', () => undefined);
+				// What the node hands its peers: it takes a snapshot of its
+				// tables before the first capsule of a run.
+				const blob = (
+					node as unknown as { composeRecoveryCapsuleBlob: () => Buffer | null }
+				).composeRecoveryCapsuleBlob();
+				expect(blob).to.not.equal(null);
+				const next = decodeRecoveryCapsuleBlob(blob!, SECRET)!;
+				expect(next.inlineRecoveryState, 'the journal is inline').to.not.equal(
+					undefined
+				);
+				expect(
+					BigInt(into.getRecoveryMeta!(JOURNAL_META_KEYS.tipSequence)!) >
+						BigInt(installedTip!)
+				).to.equal(true);
+
+				// A second restore, with no option and no provider.
+				const second = target();
+				const result = restoreFromRecoveryCapsule(next, second, SECRET);
+				expect(result.tier).to.equal(2);
+				expect('omittedAuxiliaryChannels' in result).to.equal(false);
+				expect('unresolvedPayments' in result).to.equal(false);
+				expect(
+					second.loadAllChannels().map((row) => row.channelId)
+				).to.deep.equal([ordinary]);
+				expect(second.loadChannel(id)).to.equal(null);
+				expect(storedAuxiliaryChannelIds(second)).to.deep.equal([]);
+				expect(
+					second.loadAllChainMonitors().map((row) => row.channelId)
+				).to.not.include(id);
+				expect(second.loadOutboxMessages!(id)).to.deep.equal([]);
+				expect(
+					second
+						.loadAllHtlcPaymentMappings()
+						.filter((row) => row.key.startsWith(id))
+				).to.deep.equal([]);
+				// Its keys are still never derived again.
+				expect(second.loadChannelKeyIndex(id)).to.equal(
+					into.loadChannelKeyIndex(id)
+				);
+				expect(second.loadChannelKeyIndex(id)).to.not.equal(null);
+				// The marks came with it.
+				for (const hash of [out, incoming]) {
+					expect(second.loadPayment(hex(hash))!.unresolved).to.deep.equal(
+						markOf(channelId)
+					);
+					expect(second.loadPayment(hex(hash))).to.deep.equal(
+						into.loadPayment(hex(hash))
+					);
+				}
+
+				// No frame the second wallet holds names the channel in a row
+				// of its own: leaving it out again finds nothing to leave.
+				const frames = verifyFrameChain(
+					second.loadRecoveryFrames!(),
+					{
+						tipSequence: second.getRecoveryMeta!(JOURNAL_META_KEYS.tipSequence),
+						tipHash: second.getRecoveryMeta!(JOURNAL_META_KEYS.tipHash),
+						lastSnapshotSequence: second.getRecoveryMeta!(
+							JOURNAL_META_KEYS.lastSnapshot
+						)
+					},
+					deriveRecoveryMasterKey(SECRET),
+					Buffer.from(node.getNodeId(), 'hex')
+				);
+				expect(
+					channelsAfterReplay(frames).map((row) => row.channelId)
+				).to.deep.equal([ordinary]);
+				expect(framesWithoutChannels(frames, new Set([id]))).to.deep.equal(
+					frames
+				);
+
+				// Among the capsule the peers had before and the one made
+				// since, the restore takes the newer: it is not refused.
+				const third = target();
+				const best = restoreBestRecoveryCapsule(
+					[encryptRecoveryCapsule(capsule, SECRET), blob!],
+					third,
+					SECRET,
+					{ scratchStorage: openStorage }
+				);
+				expect(best.tier).to.equal(2);
+				expect(
+					third.loadAllChannels().map((row) => row.channelId)
+				).to.deep.equal([ordinary]);
+			});
+
+			it('a capsule composed from the journal as the restore installed it, before any node ran on it, still holds the channel: a restore from it is refused as the first was, and leaves the channel out again when asked', async () => {
+				const { channelId, out, incoming, capsule } = await inFlight();
+				const id = hex(channelId);
+				const into = target();
+				restoreFromRecoveryCapsule(capsule, into, SECRET, {
+					omitAuxiliaryChannels: true
+				});
+				const composed = composeRecoveryCapsule({
+					storage: into,
+					encryptedScb: scb(),
+					nodeSecret: SECRET,
+					maxBytes: 1_000_000
+				});
+				expect(composed.inline, String(composed.inlineError)).to.equal(true);
+
+				const refused = target();
+				const refusal = thrownBy(() =>
+					restoreFromRecoveryCapsule(composed.capsule, refused, SECRET)
+				);
+				expect(refusal).to.be.instanceOf(AuxiliaryProviderRequiredError);
+				expect(
+					refusedAuxiliaryChannels(refusal)?.map((channel) => channel.channelId)
+				).to.deep.equal([id]);
+				expectUntouched(refused);
+
+				const again = target();
+				const result = restoreFromRecoveryCapsule(
+					composed.capsule,
+					again,
+					SECRET,
+					{ omitAuxiliaryChannels: true }
+				);
+				expect(
+					result.omittedAuxiliaryChannels?.map((channel) => channel.channelId)
+				).to.deep.equal([id]);
+				expect(result.unresolvedPayments).to.deep.equal(
+					[hex(out), hex(incoming)].sort()
+				);
+				expect(again.loadAllChannels()).to.deep.equal([]);
+			});
 		});
 	});
 });

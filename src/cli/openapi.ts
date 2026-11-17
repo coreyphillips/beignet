@@ -3272,6 +3272,12 @@ export function getOpenApiSpec(): Record<string, unknown> {
 												capacitySats: { type: 'integer' }
 											}
 										}
+									},
+									unresolvedPayments: {
+										type: 'array',
+										description:
+											'With omitAssetChannels: the payment hashes of the payments that were in flight on a channel left out. Each stays PENDING and carries `unresolved` on its row. Present only when there was one',
+										items: { type: 'string' }
 									}
 								}
 							})

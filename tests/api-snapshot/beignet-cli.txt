@@ -209,6 +209,7 @@ member BeignetErrorCode.OFFER_DECLINED = "OFFER_DECLINED"
 member BeignetErrorCode.OPEN_FAILED = "OPEN_FAILED"
 member BeignetErrorCode.PAYMENT_FAILED = "PAYMENT_FAILED"
 member BeignetErrorCode.PAYMENT_TIMEOUT = "PAYMENT_TIMEOUT"
+member BeignetErrorCode.PAYMENT_UNRESOLVED = "PAYMENT_UNRESOLVED"
 member BeignetErrorCode.PAY_ALL_BUDGET_MISMATCH = "PAY_ALL_BUDGET_MISMATCH"
 member BeignetErrorCode.PAY_ALL_REMAINDER = "PAY_ALL_REMAINDER"
 member BeignetErrorCode.PAY_ALL_REVIEW_EXPIRED = "PAY_ALL_REVIEW_EXPIRED"
@@ -451,7 +452,7 @@ method BeignetNode.reorderPrimaries(pubkeys: string[]): PrimariesInfo
 method BeignetNode.resolveGuardianUri(uri: string): Promise<{ guardianId: string; url: string; entry: string; guardianSetIds: string[]; maxCiphertextBytes: number; }>
 method BeignetNode.resolveInterruptedPayment(bolt11: string): Promise<InterruptedPaymentOutcome>
 get BeignetNode.restartRequired(): boolean
-method BeignetNode.restoreFromCapsules(options?: { unfenced?: boolean; resume?: boolean; omitAssetChannels?: boolean; }): Promise<{ tier: 1 | 2; channelCount: number; framesApplied: number; head: { writerEpoch: string; latestSequence: string; }; newestSeenHead: { writerEpoch: string; latestSequence: string; }; rejectedCandidates: number; restartRequired: boolean; resumed?: boolean; uncovered?: string[]; unfenced?: { guardians: IReportedGuardian[]; }; recovering?: string[]; skipped?: Array<{ channelId: ChannelIdHex; reason: string; }>; omittedAssetChannels?: IRestoreAssetChannel[]; }>
+method BeignetNode.restoreFromCapsules(options?: { unfenced?: boolean; resume?: boolean; omitAssetChannels?: boolean; }): Promise<{ tier: 1 | 2; channelCount: number; framesApplied: number; head: { writerEpoch: string; latestSequence: string; }; newestSeenHead: { writerEpoch: string; latestSequence: string; }; rejectedCandidates: number; restartRequired: boolean; resumed?: boolean; uncovered?: string[]; unfenced?: { guardians: IReportedGuardian[]; }; recovering?: string[]; skipped?: Array<{ channelId: ChannelIdHex; reason: string; }>; omittedAssetChannels?: IRestoreAssetChannel[]; unresolvedPayments?: PaymentHashHex[]; }>
 method BeignetNode.restoreFromGuardians(): Promise<{ exact: boolean; framesApplied: number; guardiansRepaired: number; epoch: string; }>
 method BeignetNode.restoreFromScb(encoded: string): Promise<{ recovering: string[]; skipped: Array<{ channelId: ChannelIdHex; reason: string; }>; channelCount: number; }>
 get BeignetNode.restorePending(): boolean
@@ -1193,6 +1194,7 @@ property InvoiceInfo.expiry?: number
 property InvoiceInfo.paymentHash: PaymentHashHex
 property InvoiceInfo.paymentSecret?: string
 property InvoiceInfo.status?: 'PENDING' | 'PAID' | 'EXPIRED'
+property InvoiceInfo.unresolved?: PaymentUnresolved
 unexported interface IrohDaemonConfig
 property IrohDaemonConfig.iroh?: boolean
 property IrohDaemonConfig.irohDiscovery?: boolean
@@ -1403,6 +1405,7 @@ property PaymentInfo.paymentHash: PaymentHashHex
 property PaymentInfo.preimage?: string
 property PaymentInfo.route?: PaymentRoute
 property PaymentInfo.status: 'PENDING' | 'COMPLETED' | 'FAILED'
+property PaymentInfo.unresolved?: PaymentUnresolved
 interface PaymentProof
 property PaymentProof.amountSats: number
 property PaymentProof.completedAt: number
@@ -1455,6 +1458,9 @@ interface PaymentRouteHop
 property PaymentRouteHop.feeMsat: number
 property PaymentRouteHop.pubkey: string
 property PaymentRouteHop.shortChannelId: string
+interface PaymentUnresolved
+property PaymentUnresolved.channelIds: ChannelIdHex[]
+property PaymentUnresolved.code: 'CHANNEL_OMITTED_AT_RESTORE'
 interface PaymentValidation
 property PaymentValidation.checks: PaymentValidationCheck[]
 property PaymentValidation.invoice?: DecodedInvoice

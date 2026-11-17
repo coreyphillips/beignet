@@ -1885,6 +1885,8 @@ export interface ISerializedPaymentInfo {
 	auxiliary?: true;
 	/** OUTGOING asset payment: what it is worth to the payee. */
 	auxiliaryValueMsat?: string;
+	/** A PENDING record a restore left without its channel; present only then. */
+	unresolved?: { code: string; channelIds: string[] };
 	status: string;
 	direction: string;
 	route?: string; // JSON string
@@ -1921,6 +1923,16 @@ export function serializePaymentInfo(p: IPaymentInfo): ISerializedPaymentInfo {
 		...(p.auxiliary === true ? { auxiliary: true as const } : {}),
 		...(p.auxiliaryValueMsat !== undefined
 			? { auxiliaryValueMsat: bigintToStr(p.auxiliaryValueMsat) }
+			: {}),
+		// Only a PENDING record is unresolved: one that has an outcome is
+		// written without the mark, whatever its object still carries.
+		...(p.unresolved && (p.status as string) === 'PENDING'
+			? {
+					unresolved: {
+						code: p.unresolved.code,
+						channelIds: [...p.unresolved.channelIds]
+					}
+			  }
 			: {}),
 		status: p.status,
 		direction: p.direction,
@@ -1983,6 +1995,14 @@ export function deserializePaymentInfo(
 		...(s.auxiliary === true ? { auxiliary: true as const } : {}),
 		...(s.auxiliaryValueMsat !== undefined
 			? { auxiliaryValueMsat: strToBigint(s.auxiliaryValueMsat) }
+			: {}),
+		...(s.unresolved && s.status === 'PENDING'
+			? {
+					unresolved: {
+						code: s.unresolved.code as 'CHANNEL_OMITTED_AT_RESTORE',
+						channelIds: [...s.unresolved.channelIds]
+					}
+			  }
 			: {}),
 		status: s.status as PaymentStatus,
 		direction: s.direction as PaymentDirection,

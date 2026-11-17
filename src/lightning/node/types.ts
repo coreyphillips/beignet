@@ -1764,6 +1764,41 @@ export interface IOutgoingPaymentResolution {
 	latestOutstandingExpiry: number | null;
 	/** The preimage, from whichever source revealed it, when known. */
 	preimage?: Buffer;
+	/**
+	 * Set while the record is PENDING and marked unresolved: an HTLC of it
+	 * is on a channel a capsule restore left out, so no view of it is here
+	 * and `resolved` never turns true. Counts as an HTLC in flight.
+	 */
+	unresolved?: import('./payment-types').IPaymentUnresolved;
+}
+
+/**
+ * A wait on an outgoing payment that this wallet cannot resolve: an HTLC
+ * of it is on a channel a capsule restore left out. Carries the mark of the
+ * record and the view the wait began with.
+ */
+export class PaymentUnresolvedError extends CodedError<'PAYMENT_UNRESOLVED'> {
+	/** The payment, as payment hash hex. */
+	readonly paymentHash: string;
+	readonly unresolved: import('./payment-types').IPaymentUnresolved;
+	readonly resolution?: IOutgoingPaymentResolution;
+
+	constructor(
+		paymentHash: Buffer,
+		unresolved: import('./payment-types').IPaymentUnresolved,
+		resolution?: IOutgoingPaymentResolution
+	) {
+		super(
+			'PAYMENT_UNRESOLVED',
+			`Payment ${paymentHash.toString('hex')} cannot be resolved by this ` +
+				`wallet: it has an HTLC on a channel a restore left out ` +
+				`(${unresolved.channelIds.join(', ')})`
+		);
+		this.name = 'PaymentUnresolvedError';
+		this.paymentHash = paymentHash.toString('hex');
+		this.unresolved = unresolved;
+		if (resolution !== undefined) this.resolution = resolution;
+	}
 }
 
 /** Payload of 'payment:htlc-resolved'. */

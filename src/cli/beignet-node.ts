@@ -344,6 +344,7 @@ import type {
 	PorchRelayInfo,
 	ChannelInfo,
 	PaymentInfo,
+	PaymentUnresolved,
 	PayAllQuote,
 	InvoiceInfo,
 	DecodedInvoice,
@@ -2422,6 +2423,23 @@ export interface IRestoreAssetChannel {
 	peerPubkey: string;
 	/** The capacity of the channel's funding output. */
 	capacitySats: number;
+}
+
+/**
+ * The mark of a PENDING payment record that a capsule restore left without
+ * the channel of its HTLC, as a row carries it. Undefined for every other
+ * record, and for a marked one that has since got an outcome.
+ */
+function paymentUnresolved(
+	record: IPaymentInfo
+): PaymentUnresolved | undefined {
+	if (record.status !== PaymentStatus.PENDING || !record.unresolved) {
+		return undefined;
+	}
+	return {
+		code: record.unresolved.code,
+		channelIds: record.unresolved.channelIds.map((id) => id as ChannelIdHex)
+	};
 }
 
 function restoreAssetChannel(
@@ -5788,6 +5806,12 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 		 * were left out. Present only when there was one.
 		 */
 		omittedAssetChannels?: IRestoreAssetChannel[];
+		/**
+		 * With omitAssetChannels: the payments that were in flight on a
+		 * channel left out, by payment hash. Each stays PENDING and carries
+		 * `unresolved` on its row. Present only when there was one.
+		 */
+		unresolvedPayments?: PaymentHashHex[];
 	}> {
 		if (this._restoreInFlight) {
 			throw new BeignetError(
@@ -6049,7 +6073,14 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 				newestSeenHead,
 				rejectedCandidates: result.rejectedCandidates,
 				...(unfenced ? { unfenced } : {}),
-				...(omittedAssetChannels.length > 0 ? { omittedAssetChannels } : {})
+				...(omittedAssetChannels.length > 0 ? { omittedAssetChannels } : {}),
+				...(result.tier === 2 && result.unresolvedPayments
+					? {
+							unresolvedPayments: result.unresolvedPayments.map(
+								(hash) => hash as PaymentHashHex
+							)
+					  }
+					: {})
 			};
 
 			if (result.tier === 1) {
@@ -14188,7 +14219,21 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	 * the failure envelope and a status to match.
 	 */
 	cancelPayment(paymentHash: PaymentHashHex): { ok: true } {
-		this.node.failPayment(requirePaymentHashHex(paymentHash));
+		const hash = requirePaymentHashHex(paymentHash);
+		// The engine does not fail a payment it cannot follow, and an
+		// `ok` here would say it had.
+		const record = this.node.getPayment(hash);
+		if (record?.status === PaymentStatus.PENDING && record.unresolved) {
+			const err = new BeignetError(
+				'PAYMENT_UNRESOLVED',
+				'The payment has an HTLC on a channel a restore left out ' +
+					`(${record.unresolved.channelIds.join(', ')}); it may have ` +
+					'been paid, so it is not cancelled'
+			);
+			err.paymentHash = hash.toString('hex');
+			throw err;
+		}
+		this.node.failPayment(hash);
 		return { ok: true };
 	}
 
@@ -14296,6 +14341,8 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 				info.auxiliaryValueSats = spendLimitSats(p.auxiliaryValueMsat);
 			}
 		}
+		const unresolved = paymentUnresolved(p);
+		if (unresolved) info.unresolved = unresolved;
 		if (p.preimage) info.preimage = p.preimage.toString('hex');
 		if (p.completedAt !== undefined) info.completedAt = p.completedAt;
 		if (p.failureCode !== undefined) {
@@ -15608,7 +15655,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 		const paid = live
 			? settlesInvoice(live)
 			: settlesInvoice(this.storage.loadPayment(inv.paymentHash));
-		return this.toInvoiceInfo(inv, paid);
+		return this.toInvoiceInfo(inv, paid, live);
 	}
 
 	/**
@@ -15644,11 +15691,15 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 				}
 				paid = durablePaid.has(inv.paymentHash);
 			}
-			return this.toInvoiceInfo(inv, paid);
+			return this.toInvoiceInfo(inv, paid, live);
 		});
 	}
 
-	private toInvoiceInfo(inv: IInvoiceInfo, paid: boolean): InvoiceInfo {
+	private toInvoiceInfo(
+		inv: IInvoiceInfo,
+		paid: boolean,
+		record?: IPaymentInfo
+	): InvoiceInfo {
 		const info: InvoiceInfo = {
 			bolt11: inv.bolt11,
 			paymentHash: inv.paymentHash
@@ -15660,6 +15711,11 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 		if (inv.expiry !== undefined) info.expiry = inv.expiry;
 		if (inv.createdAt !== undefined) info.createdAt = inv.createdAt;
 		if (inv.auxiliary) info.auxiliary = true;
+		// An HTLC of it was on a channel a restore left out: the invoice
+		// says what its payment record says. A pruned record is a settled
+		// one, and carries no mark.
+		const unresolved = !paid && record ? paymentUnresolved(record) : undefined;
+		if (unresolved) info.unresolved = unresolved;
 		if (paid) {
 			info.status = 'PAID';
 		} else if (

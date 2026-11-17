@@ -258,6 +258,12 @@ export enum BeignetErrorCode {
 	 */
 	ASSET_RESTORE_REFUSED = 'ASSET_RESTORE_REFUSED',
 	/**
+	 * The payment has an HTLC on a channel a capsule restore left out, so
+	 * this wallet cannot know what became of it. It may have been paid: it
+	 * is not cancelled, and it stays PENDING with `unresolved` on its row.
+	 */
+	PAYMENT_UNRESOLVED = 'PAYMENT_UNRESOLVED',
+	/**
 	 * The wallet holds asset channels and was started in a guardian
 	 * recovery mode (`async-remote` or `quorum`). Nothing was started and
 	 * nothing reached a guardian: close the asset channels, or start
