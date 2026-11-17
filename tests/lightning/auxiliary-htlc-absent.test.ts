@@ -14,13 +14,16 @@ import { expect } from 'chai';
 import { IRREVOCABLE_DEPTH, OutputType } from '../../src/lightning/chain/types';
 import { PaymentStatus } from '../../src/lightning/node/types';
 import { withAssetOpens, type IAssetHost } from './helpers/auxiliary-nodes';
+import { amountRecord } from './helpers/auxiliary-pair';
 import {
 	SWEEP_DESTINATION,
 	assetChainWorld,
+	disconnect,
 	gateMessages,
 	holdUnits,
 	payUnits,
 	settle,
+	trackedOutputs,
 	type IAssetChainPair
 } from './helpers/auxiliary-on-chain';
 
@@ -271,5 +274,107 @@ describe('the HTLCs of an asset channel that the confirmed commitment does not c
 					'FULLY_RESOLVED'
 			)
 		).to.equal('FULLY_RESOLVED');
+	});
+
+	it('tells the payer of a plain invoice, whose add the payee took and whose signature it never did, that the HTLC failed when the payee closes with the commitment it holds: the staging of the review of step 10', async () => {
+		const pair = await opened('aux-absent-review');
+		const { alice, bob, chain, channelId } = pair;
+		const invoice = bob.node.createInvoice({
+			amountMsat: 5_000_000n,
+			description: 'an HTLC with no output'
+		});
+		// Bob takes the add and never the signature that commits it.
+		let dropped = false;
+		gateMessages(pair, 'alice', (type) => {
+			if (type === 132) dropped = true;
+			return dropped;
+		});
+		const expiry = chain.height + 60;
+		alice.node.sendPaymentToRoute(
+			{
+				hops: [
+					{
+						pubkey: Buffer.from(bob.node.getNodeId(), 'hex'),
+						shortChannelId: Buffer.alloc(8, 9),
+						amountToForwardMsat: 5000n * 1000n,
+						outgoingCltvValue: expiry
+					}
+				]
+			},
+			invoice.paymentHash,
+			60,
+			invoice.paymentSecret,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			{
+				assetPayment: {
+					channelId,
+					wireAmountMsat: 354_000n,
+					customRecords: amountRecord(5000n)
+				}
+			}
+		);
+		await settle();
+		expect(dropped, 'alice signed for the HTLC').to.equal(true);
+		const offered = [
+			...alice.node
+				.getChannelManager()
+				.getChannel(channelId)!
+				.getFullState()
+				.htlcs.values()
+		].filter((entry) => entry.paymentHash.equals(invoice.paymentHash));
+		expect(offered).to.have.length(1);
+		expect(offered[0].auxiliaryAmount).to.equal(5000n);
+		disconnect(pair);
+		await settle();
+
+		// Bob closes with the commitment he holds: the HTLC is not in it.
+		const closed = bob.node.forceCloseChannel(channelId, SWEEP_DESTINATION);
+		expect(closed.ok, closed.error).to.equal(true);
+		await settle();
+		await world.mine(pair, 3);
+		const tracked = trackedOutputs(alice, channelId);
+		expect(tracked.length).to.be.greaterThan(0);
+		expect(
+			tracked.filter(
+				(output) =>
+					output.outputType === OutputType.OFFERED_HTLC ||
+					output.outputType === OutputType.RECEIVED_HTLC
+			)
+		).to.have.length(0);
+
+		// One block short of the depth at which the commitment is there for
+		// good nothing is said; at that depth the host is told and the
+		// payment ends.
+		const depth = commitmentHeight(pair) + IRREVOCABLE_DEPTH;
+		chain.advance(depth - 1 - chain.height);
+		await settle();
+		expect(outcomes.alice).to.deep.equal([]);
+		expect(alice.node.getPayment(invoice.paymentHash)!.status).to.equal(
+			PaymentStatus.PENDING
+		);
+		await world.mine(pair, 1);
+		await settle();
+		expect(outcomes.alice).to.deep.equal(['OFFERED:failed:5000']);
+		expect(alice.node.getPayment(invoice.paymentHash)!.status).to.equal(
+			PaymentStatus.FAILED
+		);
+
+		// Past the expiry of the HTLC and four times the depth again, as the
+		// review went: nothing more is said.
+		chain.advance(Math.max(0, expiry + 10 - chain.height));
+		await settle();
+		for (let i = 0; i < 4; i++) {
+			chain.advance(IRREVOCABLE_DEPTH);
+			await settle();
+			await world.mine(pair, 3);
+		}
+		await settle();
+		expect(outcomes.alice).to.deep.equal(['OFFERED:failed:5000']);
+		expect(alice.node.getPayment(invoice.paymentHash)!.status).to.equal(
+			PaymentStatus.FAILED
+		);
 	});
 });
