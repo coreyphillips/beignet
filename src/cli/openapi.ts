@@ -5715,7 +5715,7 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						assetChannelSats: {
 							type: 'integer',
 							description:
-								"The sats on this wallet's side of its asset channels that are neither closing nor over, whatever their state: still opening (from the moment the funding transaction exists), open, waiting for the peer, or failed and not yet closed. Present only while it has one. They carry asset outputs and cannot be sent or received as bitcoin over Lightning. Excluded from lightning and from total. Every asset channel that is not over is in this figure or in assetChannelClosingSats, never in both"
+								"The sats on this wallet's side of its asset channels that are neither closing nor over, whatever their state: still opening (from the broadcast of its funding transaction for a channel this wallet funds, from the confirmation of it for one the peer funds), open, waiting for the peer, or failed and not yet closed. An opening whose funding transaction has not been broadcast is not counted: its coins are still in onchain. Present only while it has one. They carry asset outputs and cannot be sent or received as bitcoin over Lightning. Excluded from lightning and from total. Every asset channel that is not over is in this figure or in assetChannelClosingSats, never in both"
 						},
 						assetChannelClosingSats: {
 							type: 'integer',

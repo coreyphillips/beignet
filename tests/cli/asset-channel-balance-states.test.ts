@@ -5,17 +5,24 @@
  * `assetChannelClosingSats` holds an asset channel that is shutting down,
  * negotiating its close, or force closed with the wallet's balance output
  * not yet spent in a block. `assetChannelSats` holds every other one that
- * is not over, whatever its state: still opening, from the moment its
- * funding transaction exists; open; waiting for its peer; failed and not
- * yet closed. A closed channel and one whose opening never had a funding
- * transaction are in neither, and so is every ordinary channel, whose
- * balance of a wallet without an asset channel is the keys it always was.
+ * is not over, whatever its state: still opening; open; waiting for its
+ * peer; failed and not yet closed. A closed channel is in neither, and so
+ * is every ordinary channel, whose balance of a wallet without an asset
+ * channel is the keys it always was.
+ *
+ * A channel is counted once its funding transaction is out. One this node
+ * funds: once the node has broadcast the transaction and the network took
+ * it. One the peer funds: once the node has seen it confirmed. Until then
+ * it is in neither, whatever its state: the coins a funding transaction
+ * spends are still in the wallet while the transaction only exists, so an
+ * opening given up between funding_created and the broadcast is never
+ * counted.
  *
  * The table below is a Record over the engine's state type, so a state
  * the engine gains does not compile until it has a row, and the cases run
- * over the values of that type. Two real nodes then show the two states
- * that were in no figure: an asset channel that is still opening, and one
- * that has failed.
+ * over the values of that type. Two real nodes then show when each side
+ * of an opening begins to count it, and that a channel that has failed is
+ * still counted.
  */
 
 import { expect } from 'chai';
@@ -30,6 +37,20 @@ import {
 } from '../lightning/helpers/auxiliary-nodes';
 import { writableState } from '../lightning/helpers/writable-state';
 
+/** Let queued work run. */
+const turns = async (rounds = 40): Promise<void> => {
+	for (let i = 0; i < rounds; i++) {
+		await new Promise<void>((resolve) => setImmediate(resolve));
+	}
+};
+
+/** The broadcaster a loopback host's node hands its funding to. */
+interface IBroadcaster {
+	broadcastTransaction: (txHex: string) => Promise<string>;
+}
+const broadcasterOf = (host: IAssetHost): IBroadcaster =>
+	(host.node as unknown as { fundingProvider: IBroadcaster }).fundingProvider;
+
 const methods = BeignetNode.prototype as unknown as Record<
 	string,
 	(this: unknown, ...args: unknown[]) => unknown
@@ -40,7 +61,8 @@ type Figure = 'assetChannelSats' | 'assetChannelClosingSats' | 'neither';
 
 /**
  * The figure that holds the local balance of an asset channel whose
- * funding transaction exists, by the state the channel is in.
+ * funding transaction is out (broadcast by this node, or seen confirmed),
+ * by the state the channel is in.
  */
 const FUNDED: Record<ChannelState, Figure> = {
 	[ChannelState.NONE]: 'assetChannelSats',
@@ -76,18 +98,29 @@ const NOTHING = {
 
 const TXID = 'f0'.repeat(32);
 
-/** A channel row as the node lists one, with 1,500,000 sats on this side. */
+/** The rows whose funding transaction the node says is out. */
+const OUT = new WeakSet<Row>();
+
+/**
+ * A channel row as the node lists one, with 1,500,000 sats on this side.
+ * `funded`: its funding transaction exists. `out`: the node broadcast that
+ * transaction or saw it confirmed, which a funded row is unless said not.
+ */
 const row = (
 	fill: number,
 	state: ChannelState,
-	given: { asset: boolean; funded: boolean; sats?: number }
-): Row => ({
-	channelId: Buffer.alloc(32, fill),
-	state,
-	localBalanceMsat: BigInt(given.sats ?? 1_500_000) * 1000n,
-	...(given.asset ? { auxiliary: true } : {}),
-	...(given.funded ? { fundingTxid: TXID, fundingOutputIndex: 0 } : {})
-});
+	given: { asset: boolean; funded: boolean; out?: boolean; sats?: number }
+): Row => {
+	const made: Row = {
+		channelId: Buffer.alloc(32, fill),
+		state,
+		localBalanceMsat: BigInt(given.sats ?? 1_500_000) * 1000n,
+		...(given.asset ? { auxiliary: true } : {}),
+		...(given.funded ? { fundingTxid: TXID, fundingOutputIndex: 0 } : {})
+	};
+	if (given.out ?? given.funded) OUT.add(made);
+	return made;
+};
 
 /**
  * What the daemon answers `GET /balance` over a node that lists `rows`.
@@ -108,6 +141,10 @@ const balanceOver = (
 					unsettledBalanceMsat: 0n
 				}),
 				listChannels: (): Row[] => rows,
+				isFundingBroadcastOrConfirmed: (channelId: Buffer): boolean =>
+					rows.some(
+						(one) => OUT.has(one) && (one.channelId as Buffer).equals(channelId)
+					),
 				getChannelManager: (): unknown => ({
 					getChannel: (channelId: Buffer): unknown =>
 						was[channelId[0]]
@@ -196,6 +233,27 @@ describe('The daemon and an asset channel in each state: the two asset figures (
 		}
 	});
 
+	it('holds an asset channel whose funding transaction exists and is not out in neither, in every state', () => {
+		const notOut = (state: ChannelState): Row =>
+			row(7, state, { asset: true, funded: true, out: false });
+		for (const state of STATES) {
+			expect(balanceOver([notOut(state)]), state).to.deep.equal(NOTHING);
+			// Beside one whose funding is out, only that one is counted.
+			expect(
+				balanceOver([
+					notOut(state),
+					row(8, state, { asset: true, funded: true })
+				]),
+				`${state}, beside one that is out`
+			).to.deep.equal(holding(FUNDED[state]));
+		}
+		// Whatever state its peer's absence found it in.
+		const away = [notOut(ChannelState.AWAITING_REESTABLISH)];
+		for (const was of STATES) {
+			expect(balanceOver(away, { 7: was }), was).to.deep.equal(NOTHING);
+		}
+	});
+
 	it('reads an asset channel whose peer is away by the state it was in, for every state', () => {
 		const away = [
 			row(7, ChannelState.AWAITING_REESTABLISH, { asset: true, funded: true })
@@ -234,6 +292,26 @@ describe('The daemon and an asset channel in each state: the two asset figures (
 				asset: false,
 				funded: true,
 				sats: 5_000_000
+			}),
+			// Funded and not out: given up before the broadcast, waiting
+			// for the peer's funding to confirm, failed before either.
+			row(11, ChannelState.SENT_FUNDING_CREATED, {
+				asset: true,
+				funded: true,
+				out: false,
+				sats: 777_000
+			}),
+			row(12, ChannelState.AWAITING_FUNDING_CONFIRMED, {
+				asset: true,
+				funded: true,
+				out: false,
+				sats: 666_000
+			}),
+			row(13, ChannelState.ERRORED, {
+				asset: true,
+				funded: true,
+				out: false,
+				sats: 555_000
 			})
 		];
 		expect(balanceOver(rows)).to.deep.equal({
@@ -257,57 +335,89 @@ describe('The daemon and an asset channel in each state: the two asset figures (
 		}
 	});
 
-	it('counts a real asset channel while it is still opening, and after it has failed', async () => {
+	/** What both wallets answer, and the state each holds the channel in. */
+	const read = (
+		alice: IAssetHost,
+		bob: IAssetHost,
+		channelId: Buffer
+	): { alice: Row; bob: Row; states: ChannelState[] } => ({
+		alice: balanceOf(alice),
+		bob: balanceOf(bob),
+		states: [alice, bob].map(
+			(host) =>
+				host.node.getChannelManager().getChannel(channelId)!.getFullState()
+					.state
+		)
+	});
+
+	it('counts a real asset channel on the opener from its broadcast and on the acceptor from its confirmation, and after it has failed', async () => {
 		const alice = assetHost('asset-states', 1, {}, { sqlite: true });
 		const bob = assetHost('asset-states', 2, {}, { sqlite: true });
 		hosts.push(alice, bob);
 		connectHosts(alice, bob);
 
-		// What each wallet answers at the moment its node says the channel
-		// is opening: the funding transaction exists and nothing confirmed.
-		const opening: Array<{ who: string; state: ChannelState; balance: Row }> =
-			[];
-		for (const [who, host] of [
-			['alice', alice],
-			['bob', bob]
-		] as const) {
-			host.node.on('channel:opening', ({ channelId }) => {
-				opening.push({
-					who,
-					state: host.node
-						.getChannelManager()
-						.getChannel(channelId)!
-						.getFullState().state,
-					balance: balanceOf(host)
-				});
-			});
-		}
+		// The network takes alice's funding transaction when the test says.
+		let release = (): void => undefined;
+		const taken = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		const broadcaster = broadcasterOf(alice);
+		const hand = broadcaster.broadcastTransaction.bind(broadcaster);
+		let asked = 0;
+		broadcaster.broadcastTransaction = async (txHex): Promise<string> => {
+			asked++;
+			await taken;
+			return hand(txHex);
+		};
+
+		let signed: ReturnType<typeof read> | undefined;
+		let broadcast: ReturnType<typeof read> | undefined;
 		const channelId = await openAssetChannel(alice, bob, {
 			tag: 'asset-states',
 			openerUnits: 9000n,
-			acceptorUnits: 1000n
+			acceptorUnits: 1000n,
+			beforeConfirmation: async (id) => {
+				// Both have signed. The funding transaction exists, the node
+				// has handed it to the network and the network has not
+				// answered: its coins are still in the wallet.
+				signed = read(alice, bob, id);
+				expect(asked).to.equal(1);
+				expect(alice.broadcasts).to.deep.equal([]);
+				release();
+				await turns();
+				// Taken by the network, and confirmed for neither.
+				broadcast = read(alice, bob, id);
+				expect(alice.broadcasts).to.have.length(1);
+			}
 		});
-		expect(opening.map((seen) => seen.who).sort()).to.deep.equal([
-			'alice',
-			'bob'
-		]);
-		for (const seen of opening) {
-			expect(seen.state, seen.who).to.be.oneOf([
-				ChannelState.SENT_FUNDING_CREATED,
+		for (const seen of [signed!, broadcast!]) {
+			expect(seen.states).to.deep.equal([
 				ChannelState.AWAITING_FUNDING_CONFIRMED,
-				ChannelState.AWAITING_CHANNEL_READY
+				ChannelState.AWAITING_FUNDING_CONFIRMED
 			]);
-			expect(seen.balance, seen.who).to.deep.equal({
-				...NOTHING,
-				assetChannelSats: seen.who === 'alice' ? 1_500_000 : 500_000
-			});
 		}
+		// Before the broadcast neither counts it.
+		expect(signed!.alice).to.deep.equal(NOTHING);
+		expect(signed!.bob).to.deep.equal(NOTHING);
+		// From the broadcast the opener does, and the acceptor does not: the
+		// funding is the peer's, and nothing of it is confirmed.
+		expect(broadcast!.alice).to.deep.equal({
+			...NOTHING,
+			assetChannelSats: 1_500_000
+		});
+		expect(broadcast!.bob).to.deep.equal(NOTHING);
+		expect(alice.node.isFundingBroadcastOrConfirmed(channelId)).to.equal(true);
 
-		// Open, then failed and not yet closed: the same figure holds it.
+		// Confirmed and open: both count it.
 		expect(balanceOf(alice)).to.deep.equal({
 			...NOTHING,
 			assetChannelSats: 1_500_000
 		});
+		expect(balanceOf(bob)).to.deep.equal({
+			...NOTHING,
+			assetChannelSats: 500_000
+		});
+		// Failed and not yet closed: the same figure holds it.
 		const channel = alice.node.getChannelManager().getChannel(channelId)!;
 		writableState(channel).state = ChannelState.ERRORED;
 		expect(alice.node.getChannel(channelId)!.state).to.equal(
@@ -316,6 +426,65 @@ describe('The daemon and an asset channel in each state: the two asset figures (
 		expect(balanceOf(alice)).to.deep.equal({
 			...NOTHING,
 			assetChannelSats: 1_500_000
+		});
+	});
+
+	it('never counts a real asset channel whose funding the network did not take, whatever becomes of it, until the funding is seen confirmed', async () => {
+		const alice = assetHost('asset-states-refused', 1, {}, { sqlite: true });
+		const bob = assetHost('asset-states-refused', 2, {}, { sqlite: true });
+		hosts.push(alice, bob);
+		connectHosts(alice, bob);
+		let asked = 0;
+		broadcasterOf(alice).broadcastTransaction = async (): Promise<string> => {
+			asked++;
+			throw new Error('the network is away');
+		};
+
+		// The open stops with both signatures and nothing confirmed.
+		const channelId = await openAssetChannel(alice, bob, {
+			tag: 'asset-states-refused',
+			openerUnits: 9000n,
+			acceptorUnits: 1000n,
+			beforeConfirmation: () => false
+		});
+		await turns();
+		expect(asked).to.be.greaterThan(0);
+		expect(
+			alice.errors.filter((error) =>
+				error.startsWith('FUNDING_BROADCAST_FAILED')
+			)
+		).to.have.length(asked);
+		const waiting = read(alice, bob, channelId);
+		expect(waiting.states).to.deep.equal([
+			ChannelState.AWAITING_FUNDING_CONFIRMED,
+			ChannelState.AWAITING_FUNDING_CONFIRMED
+		]);
+		// The transaction exists and has gone nowhere: the row has its
+		// funding, and neither wallet counts the channel.
+		expect(alice.node.getChannel(channelId)!.fundingTxid).to.be.a('string');
+		expect(alice.node.isFundingBroadcastOrConfirmed(channelId)).to.equal(false);
+		expect(waiting.alice).to.deep.equal(NOTHING);
+		expect(waiting.bob).to.deep.equal(NOTHING);
+
+		// Given up there: failed, and still not counted.
+		const channel = alice.node.getChannelManager().getChannel(channelId)!;
+		writableState(channel).state = ChannelState.ERRORED;
+		expect(balanceOf(alice)).to.deep.equal(NOTHING);
+		writableState(channel).state = ChannelState.AWAITING_FUNDING_CONFIRMED;
+
+		// The funding reached the chain some other way and the node's
+		// watcher sees it confirmed: from then on it is counted.
+		alice.node.handleFundingConfirmed(channelId);
+		bob.node.handleFundingConfirmed(channelId);
+		await turns();
+		expect(alice.node.isFundingBroadcastOrConfirmed(channelId)).to.equal(true);
+		expect(balanceOf(alice)).to.deep.equal({
+			...NOTHING,
+			assetChannelSats: 1_500_000
+		});
+		expect(balanceOf(bob)).to.deep.equal({
+			...NOTHING,
+			assetChannelSats: 500_000
 		});
 	});
 });

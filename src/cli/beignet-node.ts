@@ -7669,10 +7669,17 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	 * block. assetChannelSats: every other one that is not over, whatever
 	 * its state: still opening, open, waiting for its peer, or failed and
 	 * not yet closed. Over, and in neither: CLOSED, and FORCE_CLOSED with the
-	 * balance output spent. A channel with no funding transaction holds no
-	 * bitcoin and is in neither, whatever became of it: that is an opening
-	 * before its funding exists, and one given up before it did. A channel
-	 * whose peer is away is read by the state it was in.
+	 * balance output spent. A channel whose peer is away is read by the
+	 * state it was in.
+	 *
+	 * A channel is counted once its funding transaction is out, and until
+	 * then is in neither, whatever its state and whatever became of it. One
+	 * this node funds: once the node has broadcast the transaction and the
+	 * network took it, or its watcher has seen it confirmed. One the peer
+	 * funds: once the watcher has seen it confirmed. A funding transaction
+	 * that only exists spends coins that are still in the wallet's on-chain
+	 * balance, so an opening given up between funding_created and the
+	 * broadcast is never counted.
 	 *
 	 * The closing figure is the counterpart of getPendingCloseBalanceSats,
 	 * which leaves asset channels out: their bitcoin does not come back to
@@ -7687,6 +7694,9 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 		ch: ReturnType<LightningNode['listChannels']>[number]
 	): 'assetChannelSats' | 'assetChannelClosingSats' | undefined {
 		if (!ch.auxiliary || ch.fundingTxid === undefined) return undefined;
+		if (!this.node.isFundingBroadcastOrConfirmed(ch.channelId)) {
+			return undefined;
+		}
 		const effectiveState =
 			ch.state === ChannelState.AWAITING_REESTABLISH
 				? this.node.getChannelManager().getChannel(ch.channelId)?.getFullState()

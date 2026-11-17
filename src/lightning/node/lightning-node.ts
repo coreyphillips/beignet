@@ -33073,6 +33073,26 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	}
 
 	/**
+	 * Whether this node holds its own evidence that a channel's funding
+	 * transaction is out of this process: its watcher saw the transaction
+	 * confirmed, or, for a funding this node broadcasts itself, the backend
+	 * took it (or already knew it) at least once in this run. A funding that
+	 * only exists, signed or not, answers false, and so does one the peer or
+	 * the host publishes until it is confirmed. The broadcast half is known
+	 * to the running process alone: after a restart it answers false until
+	 * the retained transaction has been handed over again, which the node
+	 * does when it starts and on every block. False for a channel this node
+	 * does not hold.
+	 */
+	isFundingBroadcastOrConfirmed(channelId: Buffer): boolean {
+		const channel = this.channelManager.getChannel(channelId);
+		if (!channel) return false;
+		const state = channel.getFullState();
+		if (!state.fundingTxid) return false;
+		return this.fundingKnownOnChain(channel, state);
+	}
+
+	/**
 	 * The other shared guard every AUTOMATIC force-close path runs before
 	 * broadcasting a commitment (issue #469): this channel was restored from a
 	 * Recovery Capsule and no `channel_reestablish` has confirmed it against

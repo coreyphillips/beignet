@@ -6313,6 +6313,7 @@ method node.LightningNode.handlePeerMessage(pubkey: string, type: number, payloa
 method node.LightningNode.hasHtlcInFlight(paymentHash: Buffer): boolean
 method node.LightningNode.importAsyncReceiveGrant(wire: Buffer): asyncPayments.IReceiverGrant
 method node.LightningNode.initiateGossipSync(pubkey: string): void
+method node.LightningNode.isFundingBroadcastOrConfirmed(channelId: Buffer): boolean
 method node.LightningNode.isGraphRestoring(): boolean
 static method node.LightningNode.isGuardianLaneMessage(type: number, payload: Buffer): boolean
 method node.LightningNode.isListening(): boolean

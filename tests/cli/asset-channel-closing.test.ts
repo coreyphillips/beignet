@@ -282,6 +282,8 @@ describe('The daemon and an asset channel that is closing: its bitcoin (#2093)',
 		): unknown =>
 			daemonOver({
 				listChannels: (): Row[] => rows,
+				// The funding of each of them is confirmed.
+				isFundingBroadcastOrConfirmed: (): boolean => true,
 				getChannelManager: (): unknown => ({
 					getChannel: (channelId: Buffer): unknown =>
 						wrapped[channelId[0]]

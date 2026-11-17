@@ -165,6 +165,14 @@ export async function openAssetChannel(
 		acceptorUnits: bigint;
 		fundingSatoshis?: bigint;
 		pushMsat?: bigint;
+		/**
+		 * Called when both have signed and the opener has handed its funding
+		 * transaction to its broadcaster, before either is told the funding
+		 * is confirmed. Answering false stops the open there, unconfirmed.
+		 */
+		beforeConfirmation?: (
+			channelId: Buffer
+		) => void | boolean | Promise<void | boolean>;
 	}
 ): Promise<Buffer> {
 	const funding = options.fundingSatoshis ?? 2_000_000n;
@@ -220,6 +228,9 @@ export async function openAssetChannel(
 		Buffer.from('final funding proofs')
 	);
 	await settle();
+	if ((await options.beforeConfirmation?.(channelId)) === false) {
+		return channelId;
+	}
 	opener.node.handleFundingConfirmed(channelId);
 	acceptor.node.handleFundingConfirmed(channelId);
 	await settle();
