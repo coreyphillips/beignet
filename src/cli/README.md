@@ -814,7 +814,15 @@ Operational notes:
   (at seed import) rather than defaulting it on. Refusals are the manual
   route's, made once and reported under `autoApply.lastReason` on
   `GET /recovery/status` (phases `idle`, `settling`, `applying`, `applied`,
-  `refused`); a database that already holds state is never a target.
+  `refused`); a database that already holds state is never a target. A
+  capsule that holds asset channels is refused as the route refuses it and
+  no channel is left out without being asked: `autoApply.refusal` then
+  holds the route's code and its `assetChannels` list, the
+  `capsule:auto-refused` progress event carries the same `refusal`, and
+  the capsule stays a candidate for the confirmed call with
+  `omitAssetChannels`. At Tier 1, where an asset entry of the backup is
+  skipped and the rest recovered, the entries skipped are listed under
+  `autoApply.skippedAssetChannels`.
 - Recovery events relayed over SSE and webhooks (always on):
   `recovery:durable`, `recovery:fenced`, `recovery:backfill-lost`,
   `recovery:reestablish-held`, `recovery:capsule-retrieved`,
@@ -1003,7 +1011,7 @@ The table is generated from `BeignetNodeEvents` by `npm run docs:tables`. The SS
 | `recovery:reestablish-held` | `(data: { peerPubkey: string; channelId: ChannelIdHex; expiresAt: number })` | yes | peer-storage mode: a peer's channel_reestablish for a channel this node has no record of was held instead of failed (issue #462). Apply a Recovery Capsule before expiresAt or the peer force-closes. |
 | `recovery:guardian_unreachable` | `(data: { detail: string; sequence?: string })` | yes | A durability barrier could not reach a guardian. |
 | `recovery:capsule-retrieved` | `(data: { fromPeer: string; writerEpoch: string; latestSequence: string; inline: boolean; channelCount: number; candidates: number })` | yes | A storage peer returned a Recovery Capsule that became (or replaced) this node's best candidate from that peer (issue #690). Only newer heads are announced, so an equal-head re-send after a reconnect is silent. candidates counts the peers holding a valid capsule. |
-| `recovery:restore-progress` | `(data: { type: string; detail: string })` | yes | A step of a guardian or capsule restore. |
+| `recovery:restore-progress` | `(data: { type: string; detail: string; refusal?: AssetRestoreRefusal })` | yes | A step of a guardian or capsule restore. The `capsule:auto-refused` step of an automatic apply refused for the asset channels the capsule holds also carries `refusal`, with the code and the channels. |
 | `recovery:restored` | `(data: { exact: boolean; framesApplied: number; guardiansRepaired: number; epoch: string; tier?: 1 \| 2; restartRequired?: boolean; resumed?: boolean })` | yes | A guardian or capsule restore finished. |
 | `guardian:set-registered` | `(data: { detail: string; setId?: string })` | yes | Guardian hosting (issue #699): this node started serving a guardian set. |
 | `guardian:quota-refused` | `(data: { detail: string; setId?: string })` | yes | Guardian hosting: a quota refused a registration or a write. |
@@ -2992,7 +3000,7 @@ The matching commands are `wallet sweep-prepare <requestJson|requestFile>`, `wal
 | GET | `/auth/keys` | -- | List named API keys: names, scopes, revoked/expired flags, expiresAt/rotatedAt (never secrets; admin scope) |
 | POST | `/auth/keys/revoke` | `{ name }` | Disable a named API key immediately (admin scope; persisted, survives restarts) |
 | POST | `/auth/keys/rotate` | `{ name }` | Mint a new random secret for a named key; returned once, old secret dies immediately (admin scope; persisted) |
-| GET | `/recovery/status` | -- | Recovery Protocol status: mode, guardian set, daemon state (`disabled`/`running`/`restore-required`/`restoring`/`restart-required`/`fenced`), the node view (startup gate, durability, last durable sequence, per-channel recovery status), and the Recovery Capsules storage peers returned this session (`capsules`, whose `best` names the guardian locators the capsule carries, credentials redacted), plus `autoApply` (the automatic capsule application: enabled, phase, settleUntil, lastReason). 404 on an older daemon = predates the feature; 200 with `disabled` = supported but off |
+| GET | `/recovery/status` | -- | Recovery Protocol status: mode, guardian set, daemon state (`disabled`/`running`/`restore-required`/`restoring`/`restart-required`/`fenced`), the node view (startup gate, durability, last durable sequence, per-channel recovery status), and the Recovery Capsules storage peers returned this session (`capsules`, whose `best` names the guardian locators the capsule carries, credentials redacted), plus `autoApply` (the automatic capsule application: enabled, phase, settleUntil, lastReason, `refusal: { code, assetChannels }` when it was refused for the asset channels the capsule holds, and `skippedAssetChannels` when it applied a backup at Tier 1 and skipped asset entries of it). 404 on an older daemon = predates the feature; 200 with `disabled` = supported but off |
 | POST | `/recovery/restore` | `{ confirm: true }` | Restore from guardian replicas and start the node on the restored state (restore-pending daemons only; channels RESUME instead of force-closing; the takeover permanently fences the previous writer). Progress streams over SSE as `recovery:restore-progress` |
 | POST | `/recovery/restore-capsule` | `{ confirm: true, unfenced?: boolean, omitAssetChannels?: boolean }` | Peer-storage mode: restore from the Recovery Capsules storage peers returned this session. Tier 2 installs the exact state into a fresh database and holds the daemon until a restart (503 `NODE_RESTART_REQUIRED` elsewhere); Tier 1 recovers the embedded SCB on the live node. A capsule that holds asset channels the wallet cannot restore is refused with the channels under `error.details.assetChannels`; `omitAssetChannels: true` leaves them out and answers them under `omittedAssetChannels`, with the payments that were in flight on one under `unresolvedPayments`. Progress streams over SSE as `recovery:restore-progress` |
 | GET | `/guardian/status` | -- | The guardian this node serves to others: `{ serving }` plus guardian id, token requirement, sessions, served sets (members, namespaces, bytes) and limits whenever hosting is on. `serving` is false when hosting is off, and also while the Lightning listener guardians dial is not bound, when `listenError` says why (issue #861) |

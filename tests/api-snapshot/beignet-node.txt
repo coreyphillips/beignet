@@ -10,6 +10,9 @@ interface ApiResponse<T>
 property ApiResponse.error?: { code: string; message: string; paymentHash?: PaymentHashHex; }
 property ApiResponse.ok: boolean
 property ApiResponse.result?: T
+interface AssetRestoreRefusal
+property AssetRestoreRefusal.assetChannels: Array<{ channelId: ChannelIdHex; peerPubkey: string; capacitySats: number; }>
+property AssetRestoreRefusal.code: 'ASSET_RESTORE_REFUSED' | 'ASSET_PROVIDER_REQUIRED'
 interface BalanceInfo
 property BalanceInfo.assetChannelSats?: number
 property BalanceInfo.lightning: number
@@ -353,7 +356,7 @@ method BeignetNode.getPeerRetrievedBackup(): { encoded: string; createdAt: numbe
 method BeignetNode.getPorchLinks(): PorchLinksInfo
 method BeignetNode.getQueuedPayment(id: string): QueuedPayment | undefined
 method BeignetNode.getReadyChannels(): ChannelInfo[]
-method BeignetNode.getRecoverySurfaceStatus(): { mode: RecoveryMode; profile: 'crash-v1' | null; generation: string; configuredSetStale: boolean; rotation: { inProgress: boolean; pending: boolean; retirePending: boolean; lastEvent: { type: string; detail: string; } | null; followed: { generation: string; from: string[]; to: string[]; } | null; }; guardians: Array<{ guardianId: string; url: string; }>; state: 'disabled' | 'running' | 'restore-required' | 'restoring' | 'restart-required' | 'fenced'; node: ReturnType<beignet/lightning#node.LightningNode['getRecoveryStatus']> | null; capsules: { candidates: number; best: { writerEpoch: string; latestSequence: string; inline: boolean; channelCount: number; guardians: IReportedGuardian[]; fromPeer: string; receivedAt: number; } | null; }; restore?: { inProgress: boolean; lastEvent?: { type: string; detail: string; }; }; autoApply: { enabled: boolean; phase: 'idle' | 'settling' | 'applying' | 'applied' | 'refused'; settleUntil: number | null; lastReason: string | null; }; }
+method BeignetNode.getRecoverySurfaceStatus(): { mode: RecoveryMode; profile: 'crash-v1' | null; generation: string; configuredSetStale: boolean; rotation: { inProgress: boolean; pending: boolean; retirePending: boolean; lastEvent: { type: string; detail: string; } | null; followed: { generation: string; from: string[]; to: string[]; } | null; }; guardians: Array<{ guardianId: string; url: string; }>; state: 'disabled' | 'running' | 'restore-required' | 'restoring' | 'restart-required' | 'fenced'; node: ReturnType<beignet/lightning#node.LightningNode['getRecoveryStatus']> | null; capsules: { candidates: number; best: { writerEpoch: string; latestSequence: string; inline: boolean; channelCount: number; guardians: IReportedGuardian[]; fromPeer: string; receivedAt: number; } | null; }; restore?: { inProgress: boolean; lastEvent?: { type: string; detail: string; }; }; autoApply: { enabled: boolean; phase: 'idle' | 'settling' | 'applying' | 'applied' | 'refused'; settleUntil: number | null; lastReason: string | null; refusal?: AssetRestoreRefusal; skippedAssetChannels?: IRestoreAssetChannel[]; }; }
 method BeignetNode.getStats(windowMs?: number): NodeStats
 method BeignetNode.getStorage(): beignet/lightning/sqlite#SqliteStorage
 method BeignetNode.getStorageBackend(): beignet/lightning#storage.IStorageBackend & beignet/lightning#storage.IWalletDataStorage
@@ -422,7 +425,7 @@ method BeignetNode.reorderPrimaries(pubkeys: string[]): PrimariesInfo
 method BeignetNode.resolveGuardianUri(uri: string): Promise<{ guardianId: string; url: string; entry: string; guardianSetIds: string[]; maxCiphertextBytes: number; }>
 method BeignetNode.resolveInterruptedPayment(bolt11: string): Promise<InterruptedPaymentOutcome>
 get BeignetNode.restartRequired(): boolean
-method BeignetNode.restoreFromCapsules(options?: { unfenced?: boolean; resume?: boolean; omitAssetChannels?: boolean; }): Promise<{ tier: 1 | 2; channelCount: number; framesApplied: number; head: { writerEpoch: string; latestSequence: string; }; newestSeenHead: { writerEpoch: string; latestSequence: string; }; rejectedCandidates: number; restartRequired: boolean; resumed?: boolean; uncovered?: string[]; unfenced?: { guardians: IReportedGuardian[]; }; recovering?: string[]; skipped?: Array<{ channelId: ChannelIdHex; reason: string; }>; omittedAssetChannels?: IRestoreAssetChannel[]; unresolvedPayments?: PaymentHashHex[]; }>
+method BeignetNode.restoreFromCapsules(options?: { unfenced?: boolean; resume?: boolean; omitAssetChannels?: boolean; }): Promise<{ tier: 1 | 2; channelCount: number; framesApplied: number; head: { writerEpoch: string; latestSequence: string; }; newestSeenHead: { writerEpoch: string; latestSequence: string; }; rejectedCandidates: number; restartRequired: boolean; resumed?: boolean; uncovered?: string[]; unfenced?: { guardians: IReportedGuardian[]; }; recovering?: string[]; skipped?: Array<{ channelId: ChannelIdHex; reason: string; }>; omittedAssetChannels?: IRestoreAssetChannel[]; skippedAssetChannels?: IRestoreAssetChannel[]; unresolvedPayments?: PaymentHashHex[]; }>
 method BeignetNode.restoreFromGuardians(): Promise<{ exact: boolean; framesApplied: number; guardiansRepaired: number; epoch: string; }>
 method BeignetNode.restoreFromScb(encoded: string): Promise<{ recovering: string[]; skipped: Array<{ channelId: ChannelIdHex; reason: string; }>; channelCount: number; }>
 get BeignetNode.restorePending(): boolean
@@ -533,7 +536,7 @@ property BeignetNodeEvents.'recovery:durable': (data: { through: string; }) => v
 property BeignetNodeEvents.'recovery:fenced': (data: { supersededBy: { epoch: string; writerPublicKey: string; sequence: string; frameHash: string; } | null; }) => void
 property BeignetNodeEvents.'recovery:guardian_unreachable': (data: { detail: string; sequence?: string; }) => void
 property BeignetNodeEvents.'recovery:reestablish-held': (data: { peerPubkey: string; channelId: ChannelIdHex; expiresAt: number; }) => void
-property BeignetNodeEvents.'recovery:restore-progress': (data: { type: string; detail: string; }) => void
+property BeignetNodeEvents.'recovery:restore-progress': (data: { type: string; detail: string; refusal?: AssetRestoreRefusal; }) => void
 property BeignetNodeEvents.'recovery:restored': (data: { exact: boolean; framesApplied: number; guardiansRepaired: number; epoch: string; tier?: 1 | 2; restartRequired?: boolean; resumed?: boolean; }) => void
 property BeignetNodeEvents.'recovery:rotated': (data: { generation: string; guardians: Array<{ guardianId: string; url: string; }>; }) => void
 property BeignetNodeEvents.'recovery:rotation-followed': (data: { generation: string; from: string[]; to: string[]; }) => void

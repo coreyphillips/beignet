@@ -417,7 +417,18 @@ describe('Recovery modes and asset channels, over the daemon', function () {
 		}
 	});
 
-	it('restores a real capsule that holds an asset channel, over HTTP: refused by default with the channels listed and nothing installed, and with omitAssetChannels restored without them, the payment in flight left unresolved', async () => {
+	/**
+	 * The wallet that was lost and the capsule it handed its peers: a node
+	 * with the key of MNEMONICS[0], an asset channel and a payment its payee
+	 * holds. Answers the capsule, the channel, its peer and the payment.
+	 * Without `inline` the capsule is the one of a run that took no snapshot
+	 * since the channel opened: its journal is too large for a peer to
+	 * store, so it holds the backup only and restores at Tier 1.
+	 */
+	const lostWallet = async (
+		tag: string,
+		inline = true
+	): Promise<{ blob: Buffer; id: string; peerId: string; hash: Buffer }> => {
 		// The wallet that was lost: a node with this daemon's own key, an
 		// asset channel, a payment its payee holds, and the capsule it
 		// handed its peers.
@@ -431,22 +442,24 @@ describe('Recovery modes and asset channels, over the daemon', function () {
 		const valued: Partial<IAuxiliaryChannelConfig> = {
 			valueIncomingHtlc: (context) => context.auxiliaryAmount! * 1000n
 		};
-		const lost = assetHost('capsule over http', 1, valued, {
+		const lost = assetHost(tag, 1, valued, {
 			extra: {
 				nodePrivateKey: secret,
 				storage: journal,
 				recovery: { enabled: true }
 			}
 		});
-		const peer = assetHost('capsule over http', 2, valued);
+		const peer = assetHost(tag, 2, valued);
 		let blob: Buffer | null;
 		let id: string;
 		let peerId: string;
-		const hash = createHash('sha256').update('held by the payee').digest();
+		const hash = createHash('sha256')
+			.update(`${tag} held by the payee`)
+			.digest();
 		try {
 			connectHosts(lost, peer);
 			const channelId = await openAssetChannel(lost, peer, {
-				tag: 'capsule over http',
+				tag: tag,
 				openerUnits: 9000n,
 				acceptorUnits: 1000n
 			});
@@ -470,7 +483,7 @@ describe('Recovery modes and asset channels, over the daemon', function () {
 				recoveryJournal: { rebasedThisRun: boolean };
 				composeRecoveryCapsuleBlob: () => Buffer | null;
 			};
-			node.recoveryJournal.rebasedThisRun = false;
+			if (inline) node.recoveryJournal.rebasedThisRun = false;
 			blob = node.composeRecoveryCapsuleBlob();
 		} finally {
 			lost.node.destroy();
@@ -485,9 +498,14 @@ describe('Recovery modes and asset channels, over the daemon', function () {
 		const capsule = decodeRecoveryCapsuleBlob(blob!, secret);
 		expect(capsule, "the capsule is this wallet's").to.not.equal(null);
 		expect(
-			capsule!.inlineRecoveryState,
-			'the journal is inline: a Tier 2 restore'
-		).to.not.equal(undefined);
+			capsule!.inlineRecoveryState !== undefined,
+			'the journal is inline for a Tier 2 restore, and left out for Tier 1'
+		).to.equal(inline);
+		return { blob: blob!, id, peerId, hash };
+	};
+
+	it('restores a real capsule that holds an asset channel, over HTTP: refused by default with the channels listed and nothing installed, and with omitAssetChannels restored without them, the payment in flight left unresolved', async () => {
+		const { blob, id, peerId, hash } = await lostWallet('capsule over http');
 
 		// The same seed on a fresh database, with no extension attached.
 		const daemon = await boot('capsule-http', {
@@ -496,7 +514,7 @@ describe('Recovery modes and asset channels, over the daemon', function () {
 		});
 		const dataDir = dirs[dirs.length - 1];
 		const port = portOf(daemon);
-		daemon.node.getNode().emit('peer_storage:retrieved', PEER, blob!);
+		daemon.node.getNode().emit('peer_storage:retrieved', PEER, blob);
 		const listed = [
 			{ channelId: id, peerPubkey: peerId, capacitySats: 2_000_000 }
 		];
@@ -579,6 +597,300 @@ describe('Recovery modes and asset channels, over the daemon', function () {
 		const after = (await request(portAgain, 'GET', '/payments')).body
 			.result as Array<Record<string, unknown>>;
 		expect(after[0].status).to.equal('PENDING');
+	});
+
+	/** A wallet set to apply a peer's checkpoint without asking. */
+	const AUTO = {
+		recoveryMode: 'peer-storage' as const,
+		recoveryAutoApply: true,
+		recoveryAutoApplySettleMs: 300,
+		recoveryAutoApplyMaxWaitMs: 3000
+	};
+
+	interface IAutoStatus {
+		state: string;
+		capsules: { candidates: number; best: unknown };
+		restore?: { inProgress: boolean; lastEvent?: { type: string } };
+		autoApply: {
+			enabled: boolean;
+			phase: string;
+			settleUntil: number | null;
+			lastReason: string | null;
+			refusal?: { code: string; assetChannels: unknown[] };
+			skippedAssetChannels?: unknown[];
+		};
+	}
+
+	const statusOf = async (port: number): Promise<IAutoStatus> => {
+		const res = await request(port, 'GET', '/recovery/status');
+		expect(res.status).to.equal(200);
+		return res.body.result as unknown as IAutoStatus;
+	};
+
+	/** The automatic apply has decided: what the status then says. */
+	const decided = async (port: number): Promise<IAutoStatus> => {
+		const deadline = Date.now() + 20_000;
+		for (;;) {
+			const status = await statusOf(port);
+			const phase = status.autoApply.phase;
+			if (phase === 'applied' || phase === 'refused') return status;
+			if (Date.now() > deadline) {
+				throw new Error(`the automatic apply stayed ${phase}`);
+			}
+			await new Promise((resolve) => setTimeout(resolve, 50));
+		}
+	};
+
+	it('refuses the automatic apply of a capsule that holds an asset channel as the route does: nothing is installed, no channel is left out, GET /recovery/status says so with the channels, and the confirmed call then leaves them out', async () => {
+		const { blob, id, peerId, hash } = await lostWallet('capsule applied');
+		const daemon = await boot('capsule-auto', {
+			mnemonic: MNEMONICS[0],
+			...AUTO
+		});
+		const dataDir = dirs[dirs.length - 1];
+		const port = portOf(daemon);
+		const listed = [
+			{ channelId: id, peerPubkey: peerId, capacitySats: 2_000_000 }
+		];
+		const progress: Array<Record<string, unknown>> = [];
+		daemon.node.on('recovery:restore-progress', (data) => {
+			progress.push(data as Record<string, unknown>);
+		});
+		expect((await statusOf(port)).autoApply).to.deep.equal({
+			enabled: true,
+			phase: 'idle',
+			settleUntil: null,
+			lastReason: null
+		});
+		daemon.node.getNode().emit('peer_storage:retrieved', PEER, blob);
+
+		// Refused, by the code the route answers with, and the wallet runs
+		// on as the empty wallet it was, with the checkpoint still waiting.
+		const status = await decided(port);
+		expect(status.autoApply.phase).to.equal('refused');
+		expect(status.autoApply.lastReason).to.match(/^ASSET_PROVIDER_REQUIRED: /);
+		expect(status.state).to.equal('running');
+		expect(status.capsules.candidates).to.equal(1);
+		expect(status.capsules.best).to.not.equal(null);
+		expect(status.restore?.lastEvent?.type).to.equal('capsule:auto-refused');
+		expect((await request(port, 'GET', '/info')).status).to.equal(200);
+		expect((await request(port, 'GET', '/channels')).body.result).to.deep.equal(
+			[]
+		);
+		expect((await request(port, 'GET', '/payments')).body.result).to.deep.equal(
+			[]
+		);
+		expect(
+			fs.readdirSync(dataDir).filter((name) => name.includes('capsule-restore'))
+		).to.deep.equal([]);
+
+		// The status and the event name the channels, which is what a client
+		// shows before it asks for them to be left out.
+		expect(status.autoApply.refusal).to.deep.equal({
+			code: 'ASSET_PROVIDER_REQUIRED',
+			assetChannels: listed
+		});
+		const event = progress.find(
+			(entry) => entry.type === 'capsule:auto-refused'
+		);
+		expect(event).to.not.equal(undefined);
+		expect(event!.detail).to.equal(status.autoApply.lastReason);
+		expect(event!.refusal).to.deep.equal(status.autoApply.refusal);
+
+		// A second capsule arrival does not run it again, and nothing was
+		// left out by the wallet itself.
+		daemon.node.getNode().emit('peer_storage:retrieved', PEER, blob);
+		await new Promise((resolve) => setTimeout(resolve, 600));
+		expect((await statusOf(port)).autoApply).to.deep.equal(status.autoApply);
+		expect(
+			progress.filter((entry) => entry.type === 'capsule:auto-refused')
+		).to.have.length(1);
+
+		// The route answers the same refusal, and the confirmed call with
+		// omitAssetChannels restores the rest.
+		const refused = await request(port, 'POST', '/recovery/restore-capsule', {
+			confirm: true
+		});
+		expect(refused.status, JSON.stringify(refused.body)).to.equal(409);
+		expect(refused.body.error).to.include({ code: 'ASSET_PROVIDER_REQUIRED' });
+		expect((refused.body.error as { details?: unknown }).details).to.deep.equal(
+			{ assetChannels: listed }
+		);
+		const restored = await request(port, 'POST', '/recovery/restore-capsule', {
+			confirm: true,
+			omitAssetChannels: true
+		});
+		expect(restored.status, JSON.stringify(restored.body)).to.equal(200);
+		const result = restored.body.result as Record<string, unknown>;
+		expect(result.tier).to.equal(2);
+		expect(result.omittedAssetChannels).to.deep.equal(listed);
+		expect(result.unresolvedPayments).to.deep.equal([hash.toString('hex')]);
+		expect(result.restartRequired).to.equal(true);
+
+		// Restored, the refusal is no longer what the status says.
+		const after = await statusOf(port);
+		expect(after.state).to.equal('restart-required');
+		expect(after.autoApply).to.not.have.property('refusal');
+	});
+
+	it('refuses the automatic apply by the code of a provider that cannot restore, and applies a capsule its provider can restore with its channels', async () => {
+		const { blob, id, peerId } = await lostWallet('capsule with a provider');
+		const listed = [
+			{ channelId: id, peerPubkey: peerId, capacitySats: 2_000_000 }
+		];
+
+		// An extension is attached, and its provider does not say it can
+		// restore these channels.
+		const unable = await boot('capsule-auto-unable', {
+			mnemonic: MNEMONICS[0],
+			...AUTO,
+			extensions: [assets(auxiliaryChannels())]
+		});
+		unable.node.getNode().emit('peer_storage:retrieved', PEER, blob);
+		const refused = await decided(portOf(unable));
+		expect(refused.autoApply.phase).to.equal('refused');
+		expect(refused.autoApply.lastReason).to.match(/^ASSET_RESTORE_REFUSED: /);
+		expect(refused.autoApply.refusal).to.deep.equal({
+			code: 'ASSET_RESTORE_REFUSED',
+			assetChannels: listed
+		});
+		expect(
+			(await request(portOf(unable), 'GET', '/channels')).body.result
+		).to.deep.equal([]);
+		await unable.stop();
+
+		// One that says it can: the capsule is applied, with its channel,
+		// and there is no refusal to read.
+		const able = await boot('capsule-auto-able', {
+			mnemonic: MNEMONICS[0],
+			...AUTO,
+			extensions: [
+				assets({ ...auxiliaryChannels(), canRestore: (): boolean => true })
+			]
+		});
+		able.node.getNode().emit('peer_storage:retrieved', PEER, blob);
+		const applied = await decided(portOf(able));
+		expect(
+			applied.autoApply.phase,
+			String(applied.autoApply.lastReason)
+		).to.equal('applied');
+		expect(applied.autoApply).to.not.have.property('refusal');
+		const channels = (await request(portOf(able), 'GET', '/channels')).body
+			.result as Array<Record<string, unknown>>;
+		expect(channels.map((channel) => channel.channelId)).to.deep.equal([id]);
+		expect(channels[0].auxiliary).to.equal(true);
+	});
+
+	it('skips the asset entry of a capsule that is a backup only, by the route and by the automatic apply alike, and lists it where each is read', async () => {
+		const { blob, id, peerId } = await lostWallet('capsule backup only', false);
+		const listed = [
+			{ channelId: id, peerPubkey: peerId, capacitySats: 2_000_000 }
+		];
+
+		// The route: Tier 1 refuses nothing. The entry is skipped with its
+		// reason, and listed as an asset channel beside it.
+		const manual = await boot('capsule-tier1', {
+			mnemonic: MNEMONICS[0],
+			recoveryMode: 'peer-storage'
+		});
+		manual.node.getNode().emit('peer_storage:retrieved', PEER, blob);
+		const answer = await request(
+			portOf(manual),
+			'POST',
+			'/recovery/restore-capsule',
+			{ confirm: true }
+		);
+		expect(answer.status, JSON.stringify(answer.body)).to.equal(200);
+		const result = answer.body.result as {
+			tier: number;
+			recovering: string[];
+			skipped: Array<{ channelId: string; reason: string }>;
+			skippedAssetChannels?: unknown;
+		};
+		expect(result.tier).to.equal(1);
+		expect(result.recovering).to.deep.equal([]);
+		expect(result.skipped.map((entry) => entry.channelId)).to.deep.equal([id]);
+		expect(result.skippedAssetChannels).to.deep.equal(listed);
+		expect(result).to.not.have.property('omittedAssetChannels');
+		expect(
+			(await request(portOf(manual), 'GET', '/channels')).body.result
+		).to.deep.equal([]);
+		await manual.stop();
+
+		// The automatic apply does the same, and the status keeps the list
+		// nobody was there to be answered with.
+		const auto = await boot('capsule-tier1-auto', {
+			mnemonic: MNEMONICS[0],
+			...AUTO
+		});
+		auto.node.getNode().emit('peer_storage:retrieved', PEER, blob);
+		const status = await decided(portOf(auto));
+		expect(
+			status.autoApply.phase,
+			String(status.autoApply.lastReason)
+		).to.equal('applied');
+		expect(status.autoApply.skippedAssetChannels).to.deep.equal(listed);
+		expect(status.autoApply).to.not.have.property('refusal');
+		expect(
+			(await request(portOf(auto), 'GET', '/channels')).body.result
+		).to.deep.equal([]);
+	});
+
+	it('says nothing of asset channels on a refusal that is not about them: the status and the event are the bytes they were', async () => {
+		const methods = BeignetNode.prototype as unknown as Record<
+			string,
+			(this: unknown, ...args: unknown[]) => unknown
+		>;
+		expect(
+			JSON.stringify(
+				methods.describeAutoApply.call({
+					_recoveryAutoApply: true,
+					_bootTargetEmpty: true,
+					_restartRequired: false,
+					_autoApply: {
+						phase: 'refused',
+						lastReason: 'CAPSULE_RESTORE_TARGET_DIRTY: holds state'
+					}
+				})
+			)
+		).to.equal(
+			'{"enabled":true,"phase":"refused","settleUntil":null,' +
+				'"lastReason":"CAPSULE_RESTORE_TARGET_DIRTY: holds state"}'
+		);
+
+		// A database that is not empty when the capsule comes: refused as
+		// the route refuses it, with no word of asset channels.
+		const { blob } = await lostWallet('capsule on a wallet in use');
+		const daemon = await boot('capsule-auto-dirty', {
+			mnemonic: MNEMONICS[0],
+			...AUTO
+		});
+		const port = portOf(daemon);
+		const progress: Array<Record<string, unknown>> = [];
+		daemon.node.on('recovery:restore-progress', (data) => {
+			progress.push(data as Record<string, unknown>);
+		});
+		const own = await request(port, 'POST', '/invoice/create', {
+			amountSats: 1,
+			description: 'local state'
+		});
+		expect(own.body.ok).to.equal(true);
+		daemon.node.getNode().emit('peer_storage:retrieved', PEER, blob);
+		const status = await decided(port);
+		expect(status.autoApply.phase).to.equal('refused');
+		expect(status.autoApply.lastReason).to.match(
+			/^CAPSULE_RESTORE_TARGET_DIRTY: /
+		);
+		expect(Object.keys(status.autoApply)).to.deep.equal([
+			'enabled',
+			'phase',
+			'settleUntil',
+			'lastReason'
+		]);
+		const event = progress.find(
+			(entry) => entry.type === 'capsule:auto-refused'
+		);
+		expect(Object.keys(event!)).to.deep.equal(['type', 'detail']);
 	});
 
 	it('lists what a restore left out: the channels the engine skipped at Tier 2, and the asset entries of the backup at Tier 1', () => {

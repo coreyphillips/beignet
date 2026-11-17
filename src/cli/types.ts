@@ -806,6 +806,24 @@ export interface HoldInvoiceInfo {
 }
 
 /**
+ * The refusal of a capsule restore for the asset channels the capsule holds
+ * (issue #2093), where nobody called to be answered: the automatic apply.
+ * `code` is the code `POST /recovery/restore-capsule` answers the same
+ * capsule with, and `assetChannels` is its `error.details.assetChannels`:
+ * what the restore would leave out were it run with `omitAssetChannels`.
+ */
+export interface AssetRestoreRefusal {
+	code: 'ASSET_RESTORE_REFUSED' | 'ASSET_PROVIDER_REQUIRED';
+	assetChannels: Array<{
+		channelId: ChannelIdHex;
+		/** The peer's node id, hex. */
+		peerPubkey: string;
+		/** The capacity of the channel's funding output. */
+		capacitySats: number;
+	}>;
+}
+
+/**
  * A hold invoice's transition, relayed over SSE and webhooks (issue #746).
  * Uses the field names of a `GET /invoices/held` row. `heldAmountMsat`,
  * `htlcCount` and the expiry fields describe the parked set the transition
@@ -2096,8 +2114,16 @@ export interface BeignetNodeEvents {
 		channelCount: number;
 		candidates: number;
 	}) => void;
-	/** A step of a guardian or capsule restore. */
-	'recovery:restore-progress': (data: { type: string; detail: string }) => void;
+	/**
+	 * A step of a guardian or capsule restore. The `capsule:auto-refused`
+	 * step of an automatic apply refused for the asset channels the capsule
+	 * holds also carries `refusal`, with the code and the channels.
+	 */
+	'recovery:restore-progress': (data: {
+		type: string;
+		detail: string;
+		refusal?: AssetRestoreRefusal;
+	}) => void;
 	/** A guardian or capsule restore finished. */
 	'recovery:restored': (data: {
 		exact: boolean;

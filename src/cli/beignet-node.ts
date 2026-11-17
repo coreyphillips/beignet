@@ -391,6 +391,7 @@ import type {
 	ChannelPolicyUpdateParams,
 	HoldInvoiceInfo,
 	HoldInvoiceEvent,
+	AssetRestoreRefusal,
 	GraphInfo,
 	GraphChannelInfo,
 	GraphChannelPolicy,
@@ -2454,6 +2455,31 @@ function restoreAssetChannel(
 }
 
 /**
+ * What a refused capsule restore says of the asset channels it was refused
+ * for: the code and the list of `error.details.assetChannels`. Undefined
+ * for any other error.
+ */
+export function assetRestoreRefusalOf(
+	err: unknown
+): AssetRestoreRefusal | undefined {
+	if (
+		!(err instanceof BeignetError) ||
+		(err.code !== 'ASSET_RESTORE_REFUSED' &&
+			err.code !== 'ASSET_PROVIDER_REQUIRED')
+	) {
+		return undefined;
+	}
+	const listed = (
+		err.details as { assetChannels?: IRestoreAssetChannel[] } | undefined
+	)?.assetChannels;
+	if (!Array.isArray(listed)) return undefined;
+	return {
+		code: err.code,
+		assetChannels: listed.map((channel) => ({ ...channel }))
+	};
+}
+
+/**
  * The asset channels a capsule restore run with omitAssetChannels left out:
  * at Tier 2 the ones the engine skipped, and at Tier 1, where the backup is
  * all there is, its entries with an asset channel type.
@@ -2637,6 +2663,11 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 		firstArrivalAt?: number;
 		settleUntil?: number;
 		lastReason?: string;
+		/** Asset channels: set when the apply was refused for the ones the
+		 *  capsule holds, with the list the route would answer. */
+		refusal?: AssetRestoreRefusal;
+		/** Asset channels: the asset entries a Tier 1 apply skipped. */
+		skippedAssetChannels?: IRestoreAssetChannel[];
 		settleTimer?: ReturnType<typeof setTimeout>;
 		ceilingTimer?: ReturnType<typeof setTimeout>;
 	} = { phase: 'idle' };
@@ -5570,6 +5601,11 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 			 *  then the ceiling while storage peers are still owed). */
 			settleUntil: number | null;
 			lastReason: string | null;
+			/** Asset channels: the refusal of the apply for the ones the
+			 *  capsule holds, while that capsule still waits. */
+			refusal?: AssetRestoreRefusal;
+			/** Asset channels: the asset entries a Tier 1 apply skipped. */
+			skippedAssetChannels?: IRestoreAssetChannel[];
 		};
 	} {
 		const autoApply = this.describeAutoApply();
@@ -5808,6 +5844,12 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 		 * were left out. Present only when there was one.
 		 */
 		omittedAssetChannels?: IRestoreAssetChannel[];
+		/**
+		 * Tier 1 without omitAssetChannels: the asset entries of the backup
+		 * that the recovery skipped, each of them also in `skipped` with its
+		 * reason. Present only when there was one.
+		 */
+		skippedAssetChannels?: IRestoreAssetChannel[];
 		/**
 		 * With omitAssetChannels: the payments that were in flight on a
 		 * channel left out, by payment hash. Each stays PENDING and carries
@@ -6097,12 +6139,24 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 				const { recovering, skipped } =
 					await this.node.recoverFromStaticChannelBackup(backedUp);
 				this._bootTargetEmpty = false;
+				// Asset channels: a backup holds nothing of an asset channel's
+				// asset state, so its entry is skipped unless the provider said
+				// it can restore it. The ones skipped are listed as a refusal
+				// lists them, beside the reasons in `skipped`.
+				const skippedIds = new Set(
+					skipped.map((entry) => entry.channelId.toLowerCase())
+				);
+				const skippedAssetChannels = restoreOmittedAssetChannels({
+					tier: 1,
+					scb: { ...result.scb, channels: backedUp }
+				}).filter((channel) => skippedIds.has(channel.channelId.toLowerCase()));
 				const info = {
 					tier: 1 as const,
 					...common,
 					restartRequired: false,
 					recovering,
-					skipped
+					skipped,
+					...(skippedAssetChannels.length > 0 ? { skippedAssetChannels } : {})
 				};
 				progress(
 					'restore:complete',
@@ -6468,6 +6522,11 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 		try {
 			const info = await this.restoreFromCapsules({ resume: true });
 			a.phase = 'applied';
+			// Asset channels: nobody reads this answer, so what it says of the
+			// asset entries a Tier 1 apply skipped is kept for the status.
+			if (info.skippedAssetChannels) {
+				a.skippedAssetChannels = info.skippedAssetChannels;
+			}
 			this.log('info', 'Recovery auto-apply: complete', {
 				tier: info.tier,
 				channelCount: info.channelCount,
@@ -6478,6 +6537,12 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 			const code = err instanceof BeignetError ? err.code : 'ERROR';
 			const message = err instanceof Error ? err.message : String(err);
 			a.lastReason = `${code}: ${message}`;
+			// Asset channels: the refusal is the route's, and so is its list.
+			// Nobody called, so it is kept for GET /recovery/status and sent
+			// with the event, where a client reads which channels the same
+			// restore would leave out if it were asked to.
+			const refusal = assetRestoreRefusalOf(err);
+			if (refusal) a.refusal = refusal;
 			this._lastRestoreEvent = {
 				type: 'capsule:auto-refused',
 				detail: a.lastReason
@@ -6492,7 +6557,8 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 			);
 			this.emit('recovery:restore-progress', {
 				type: 'capsule:auto-refused',
-				detail: a.lastReason
+				detail: a.lastReason,
+				...(refusal ? { refusal } : {})
 			});
 		}
 	}
@@ -6503,13 +6569,27 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 		phase: 'idle' | 'settling' | 'applying' | 'applied' | 'refused';
 		settleUntil: number | null;
 		lastReason: string | null;
+		refusal?: AssetRestoreRefusal;
+		skippedAssetChannels?: IRestoreAssetChannel[];
 	} {
 		const a = this._autoApply;
 		return {
 			enabled: this._recoveryAutoApply,
 			phase: a.phase,
 			settleUntil: a.settleUntil ?? null,
-			lastReason: a.lastReason ?? null
+			lastReason: a.lastReason ?? null,
+			// Asset channels: while the capsule still waits on the empty
+			// database it was refused for. A restore that was installed since
+			// (the confirmed call) ends it.
+			...(a.phase === 'refused' &&
+			a.refusal &&
+			this._bootTargetEmpty &&
+			!this._restartRequired
+				? { refusal: a.refusal }
+				: {}),
+			...(a.phase === 'applied' && a.skippedAssetChannels
+				? { skippedAssetChannels: a.skippedAssetChannels }
+				: {})
 		};
 	}
 

@@ -3145,7 +3145,45 @@ export function getOpenApiSpec(): Record<string, unknown> {
 												]
 											},
 											settleUntil: { type: 'integer', nullable: true },
-											lastReason: { type: 'string', nullable: true }
+											lastReason: { type: 'string', nullable: true },
+											refusal: {
+												type: 'object',
+												description:
+													'Present only when the automatic apply was refused for the asset channels the capsule holds, and until a restore is installed. The capsule still waits: POST /recovery/restore-capsule with omitAssetChannels restores without the channels listed',
+												properties: {
+													code: {
+														type: 'string',
+														enum: [
+															'ASSET_RESTORE_REFUSED',
+															'ASSET_PROVIDER_REQUIRED'
+														]
+													},
+													assetChannels: {
+														type: 'array',
+														items: {
+															type: 'object',
+															properties: {
+																channelId: { type: 'string' },
+																peerPubkey: { type: 'string' },
+																capacitySats: { type: 'integer' }
+															}
+														}
+													}
+												}
+											},
+											skippedAssetChannels: {
+												type: 'array',
+												description:
+													'Present only after an automatic apply at Tier 1 that skipped asset entries of the backup: the entries skipped, which were not recovered',
+												items: {
+													type: 'object',
+													properties: {
+														channelId: { type: 'string' },
+														peerPubkey: { type: 'string' },
+														capacitySats: { type: 'integer' }
+													}
+												}
+											}
 										}
 									}
 								}
@@ -3257,6 +3295,19 @@ export function getOpenApiSpec(): Record<string, unknown> {
 										type: 'object',
 										properties: {
 											guardians: { type: 'array', items: { type: 'object' } }
+										}
+									},
+									skippedAssetChannels: {
+										type: 'array',
+										description:
+											'Tier 1 without omitAssetChannels: the asset entries of the backup that the recovery skipped, each also in skipped with its reason. Present only when there was one',
+										items: {
+											type: 'object',
+											properties: {
+												channelId: { type: 'string' },
+												peerPubkey: { type: 'string' },
+												capacitySats: { type: 'integer' }
+											}
 										}
 									},
 									omittedAssetChannels: {
