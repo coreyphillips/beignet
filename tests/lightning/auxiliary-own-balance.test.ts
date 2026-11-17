@@ -25,6 +25,7 @@ import {
 	SWEEP_DESTINATION,
 	assetChainWorld,
 	errorsOf,
+	payUnits,
 	settle,
 	trackedOutputs,
 	type IAssetChainPair
@@ -256,5 +257,200 @@ describe('asset channels: the own balance output on chain', function () {
 		expect(
 			errorsOf(bob).filter((error) => error.includes('FEE_WALLET_UNAVAILABLE'))
 		).to.have.length(1);
+	});
+
+	for (const restart of [false, true]) {
+		it(`an own balance output of about 1 000 sat, whose sweep is signed at 1 sat/vB and held for its delay, is swept ${
+			restart
+				? 'when the node restarts during the delay, by the sweep it held'
+				: 'when the node keeps running'
+		}`, async () => {
+			const tag = `aux-own-held-${restart}`;
+			// Alice, the opener, keeps about 1 000 sat beside her units.
+			const pair = await world.open(tag, {
+				pushMsat: 1_998_096_000n,
+				feeWallet: { alice: true, bob: true }
+			});
+			atRate(pair.alice, 1);
+			pair.wallets.alice!.fund(100_000);
+			pair.wallets.alice!.fund(100_000);
+			await world.mine(pair, 1);
+			const { channelId } = pair;
+			const closed = pair.alice.node.forceCloseChannel(
+				channelId,
+				SWEEP_DESTINATION
+			);
+			expect(closed.ok, closed.error).to.equal(true);
+			await settle();
+			await world.mine(pair, 2);
+			const held = output(pair.alice, pair, OutputType.TO_LOCAL)!;
+			expect(held.auxiliaryCommitmentNumber).to.not.equal(undefined);
+			expect(held.sweepTxHex, 'a signed sweep is held').to.be.a('string');
+			const signed = bitcoin.Transaction.fromHex(held.sweepTxHex!);
+			expect(signed.ins.length).to.equal(1);
+			expect(signed.ins[0].witness.length).to.equal(3);
+			expect(held.auxiliaryFeeFunding).to.equal(undefined);
+			expect(held.status).to.equal(OutputStatus.CONFIRMED);
+
+			if (restart) {
+				// The node comes back at another fee rate than the one the sweep
+				// was signed at, one at which the output could not pay for its
+				// sweep. The sweep it holds is signed and stored: it is kept as
+				// it was, nothing is said to wait, and no fee action is opened.
+				await world.restartAlice(pair, tag);
+				await world.mine(pair, 1);
+				const after = output(pair.alice, pair, OutputType.TO_LOCAL)!;
+				expect(after.sweepTxHex).to.equal(held.sweepTxHex);
+				expect(after.auxiliaryData).to.deep.equal(held.auxiliaryData);
+				expect(after.status).to.equal(OutputStatus.CONFIRMED);
+				expect(after.auxiliaryFeeFunding).to.equal(undefined);
+				expect(after.auxiliaryFeeWait).to.equal(undefined);
+				expect(after.auxiliaryRefusal).to.equal(undefined);
+				expect(
+					poolOf(pair.alice).getFixedOutputFeeActionIds(channelId)
+				).to.deep.equal([]);
+				atRate(pair.alice, 1);
+			}
+			// Block by block, so that a split of the fee pool would confirm and
+			// be seen as it would be on a real chain.
+			while (pair.chain.height < held.maturityHeight! - 1) {
+				await world.mine(pair, 1);
+			}
+			expect(pair.chain.spender(held.txid, held.outputIndex)).to.equal(
+				undefined
+			);
+			const until = held.maturityHeight! + 30;
+			while (pair.chain.height < until) await world.mine(pair, 1);
+			const mine = output(pair.alice, pair, OutputType.TO_LOCAL)!;
+			say(
+				`[${tag}] to_local ${mine.status}, feeFunding=${
+					mine.auxiliaryFeeFunding
+				}, wait=${JSON.stringify(
+					mine.auxiliaryFeeWait
+				)}, spent in block maturity +${
+					mine.resolutionTxid
+						? pair.chain.confirmed.get(mine.resolutionTxid)!.height -
+						  held.maturityHeight!
+						: 'never'
+				} by ${
+					mine.resolutionTxid === signed.getId() ? 'the held sweep' : 'another'
+				}; errors ${errorsOf(pair.alice)
+					.filter((e) => !e.startsWith('BROADCAST_FAILED'))
+					.join(' | ')}`
+			);
+			expect(done.includes(mine.status)).to.equal(true);
+			const spend = pair.chain.confirmed.get(mine.resolutionTxid!)!.tx;
+			expect(spend.outs[0].script.equals(ASSET_SWEEP_SCRIPT)).to.equal(true);
+			expect(spend.outs[0].value).to.be.at.least(330);
+			expect(mine.auxiliaryFeeWait).to.equal(undefined);
+		});
+	}
+
+	it('after a restart the fee pool still brings a fee input (a penalty of a 354 sat output)', async () => {
+		const tag = 'aux-own-control';
+		const pair = await world.open(tag, {
+			pushMsat: 354_000n,
+			feeWallet: { alice: true },
+			hooks: {
+				bob: {
+					valueIncomingHtlc: (context: { auxiliaryAmount?: bigint }) =>
+						(context.auxiliaryAmount ?? 0n) * 1000n
+				}
+			}
+		});
+		pair.wallets.alice!.fund(100_000);
+		pair.wallets.alice!.fund(100_000);
+		await world.mine(pair, 1);
+		const channel = pair.bob.node
+			.getChannelManager()
+			.getChannel(pair.channelId)!;
+		const plan = channel.prepareForceClose(channel.getSigner()!);
+		if (!plan.ok) throw new Error(plan.error);
+		await payUnits(pair, 100n);
+		await payUnits(pair, 100n);
+		await world.restartAlice(pair, tag);
+		await world.mine(pair, 1);
+		await pair.backends.bob.broadcastTransaction(
+			bitcoin.Transaction.fromBuffer(plan.commitmentTx).toHex()
+		);
+		await settle();
+		for (let i = 0; i < 8; i++) await world.mine(pair, 1);
+		const theirs = output(pair.alice, pair, OutputType.TO_LOCAL)!;
+		expect(done.includes(theirs.status)).to.equal(true);
+	});
+
+	it('a spend that has its fee input and cannot be made again says why, once, and its row reads the reason in place of a wait for the pool', async () => {
+		const tag = 'aux-own-not-made';
+		// Bob has a wallet with no coin in it yet.
+		const pair = await world.open(tag, {
+			pushMsat: 354_000n,
+			acceptorUnits: 1000n,
+			feeWallet: { alice: true, bob: true }
+		});
+		const { bob, channelId } = pair;
+		atRate(bob, 1);
+		await world.mine(pair, 1);
+		const closed = bob.node.forceCloseChannel(channelId, SWEEP_DESTINATION);
+		expect(closed.ok, closed.error).to.equal(true);
+		await settle();
+		await world.mine(pair, 2);
+		const waiting = output(bob, pair, OutputType.TO_LOCAL)!;
+		expect(waiting.auxiliaryFeeFunding).to.equal(true);
+		expect(waiting.auxiliaryFeeWait?.code).to.be.a('string');
+		expect(waiting.auxiliaryFeeWait!.code).to.not.equal(
+			'FEE_SPEND_UNAVAILABLE'
+		);
+		const since = waiting.auxiliaryFeeWait!.sinceHeight;
+
+		// What stands in for a spend that cannot be made again: the asset
+		// side of the commitment is gone from what the monitor holds.
+		const monitor = bob.node.getChannelManager().getMonitor(channelId)!;
+		const number = waiting.auxiliaryCommitmentNumber!;
+		const lost = (state: {
+			auxiliaryState?: { localCommitments: Map<bigint, unknown> };
+		}): void => {
+			state.auxiliaryState!.localCommitments.delete(number);
+		};
+		lost(
+			(monitor as unknown as { _channelState: Parameters<typeof lost>[0] })
+				._channelState
+		);
+
+		// A monitor asked about an output it holds no fee-funded spend for
+		// answers with a reason too, and says the output is not waiting.
+		const none = monitor.fundFixedOutputSpend('00'.repeat(32), 0, 1, [], () => {
+			throw new Error('nothing to sign');
+		});
+		expect(none.ok).to.equal(false);
+		expect(none).to.include({ gone: true });
+		expect((none as { refusal: string }).refusal).to.be.a('string');
+
+		// Coins arrive, the pool splits one, and the input is there.
+		pair.wallets.bob!.fund(100_000);
+		pair.wallets.bob!.fund(100_000);
+		for (let i = 0; i < 6; i++) await world.mine(pair, 1);
+		const stuck = output(bob, pair, OutputType.TO_LOCAL)!;
+		say(
+			`[${tag}] ${stuck.status} wait=${JSON.stringify(
+				stuck.auxiliaryFeeWait
+			)}; errors ${errorsOf(bob).join(' | ')}`
+		);
+		expect(stuck.status).to.equal(OutputStatus.CONFIRMED);
+		expect(stuck.auxiliaryFeeWait).to.deep.include({
+			code: 'FEE_SPEND_UNAVAILABLE',
+			remedy: 'operator',
+			sinceHeight: since
+		});
+		expect(stuck.auxiliaryFeeWait!.message).to.include(
+			`The asset side of commitment ${number} is not held`
+		);
+		const said = errorsOf(bob).filter((error) =>
+			error.includes('has its fee input and cannot go out')
+		);
+		expect(said).to.have.length(1);
+		expect(said[0]).to.include(`${stuck.txid}:${stuck.outputIndex}`);
+		expect(said[0]).to.include(
+			`The asset side of commitment ${number} is not held`
+		);
 	});
 });

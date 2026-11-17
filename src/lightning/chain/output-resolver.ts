@@ -1591,20 +1591,27 @@ function sweepOutputValue(
 }
 
 /**
- * Whether a sweep of an output that carries units would leave less than an
- * output of units may hold: such a sweep needs its fee from elsewhere, and
- * is not built until it has one. Never for an output without units.
+ * Whether a sweep of an output that carries units takes its fee from wallet
+ * inputs. It does when it would leave less than an output of units may
+ * hold, and it does when the monitor already holds such a spend for the
+ * output (`decided`): wallet inputs are pledged to that spend, so it stays
+ * of that form whatever the fee rate is now. Never for an output without
+ * units.
+ *
+ * This is a question and writes nothing: the monitor marks an output as
+ * taking its fee from wallet inputs when it stores a spend of that form,
+ * and only then. An answer written on the output by the question itself
+ * once marked an output whose signed sweep paid its own fee, and that
+ * sweep was then withheld for good.
  */
 function auxiliarySweepNeedsFee(
 	output: ITrackedOutput,
-	sweepValue: number | null
+	sweepValue: number | null,
+	decided: boolean = output.auxiliaryFeeFunding === true
 ): boolean {
 	if (output.auxiliaryCommitmentNumber === undefined) return false;
-	if (sweepValue !== null && sweepValue >= AUXILIARY_SWEEP_OUTPUT_MINIMUM) {
-		return false;
-	}
-	output.auxiliaryFeeFunding = true;
-	return true;
+	if (decided) return true;
+	return sweepValue === null || sweepValue < AUXILIARY_SWEEP_OUTPUT_MINIMUM;
 }
 
 /**
@@ -2317,7 +2324,18 @@ export function resolveSecondLevelHtlcOutput(
 				: {})
 		};
 		const sweepValue = sweepOutputValue(amount, feeSatoshis, destinationScript);
-		if (auxiliarySweepNeedsFee(trackedOutput, sweepValue)) {
+		// Asked again about a second-level output the monitor tracks already,
+		// what was decided for that output stands. The first time the output
+		// handed in is the HTLC output of the commitment, whose own spend is
+		// another matter.
+		if (
+			auxiliarySweepNeedsFee(
+				trackedOutput,
+				sweepValue,
+				htlcOutput?.isSecondLevelHtlc === true &&
+					htlcOutput.auxiliaryFeeFunding === true
+			)
+		) {
 			const funded = auxiliaryFundedLeafSpend(
 				state,
 				true,
@@ -2567,9 +2585,6 @@ function resolveOurTaprootCommitmentOutputs(
 			if (!again) {
 				resolved.push({ trackedOutput: output });
 				continue;
-			}
-			if (again.trackedOutput.auxiliaryFeeFunding) {
-				output.auxiliaryFeeFunding = true;
 			}
 			if (again.trackedOutput.auxiliaryRefusal) {
 				output.auxiliaryRefusal = again.trackedOutput.auxiliaryRefusal;

@@ -610,7 +610,7 @@ method chain.ChainMonitor.auxiliaryHtlcEndings(): Array<{ txid: string; outputIn
 method chain.ChainMonitor.dropUnusedPreimages(heldElsewhere: ReadonlyMap<string, Buffer>): number
 method chain.ChainMonitor.fixedOutputFeeRaise(output: chain.ITrackedOutput, feeRatePerVbyte: number): chain.IFeeBumpAndBroadcastChainAction | undefined
 method chain.ChainMonitor.fixedOutputFeeResolved(txid: string, outputIndex: number, evenIfNotOpen?: boolean): { spendingTransaction?: Buffer; } | undefined
-method chain.ChainMonitor.fundFixedOutputSpend(txid: string, outputIndex: number, feeRatePerVbyte: number, feeInputs: ReadonlyArray<{ hash: Buffer; index: number; sequence: number; script: Buffer; value: bigint; }>, signFeeInputs: (transaction: bitcoinjs-lib#Transaction, prevouts: { scripts: Buffer[]; values: bigint[]; }) => void): { ok: true; transaction: Buffer; broadcast: boolean; } | { ok: false; refusal?: string; }
+method chain.ChainMonitor.fundFixedOutputSpend(txid: string, outputIndex: number, feeRatePerVbyte: number, feeInputs: ReadonlyArray<{ hash: Buffer; index: number; sequence: number; script: Buffer; value: bigint; }>, signFeeInputs: (transaction: bitcoinjs-lib#Transaction, prevouts: { scripts: Buffer[]; values: bigint[]; }) => void): { ok: true; transaction: Buffer; broadcast: boolean; } | { ok: false; refusal: string; gone?: true; }
 method chain.ChainMonitor.getChannelState(): channel.IChannelState
 method chain.ChainMonitor.getFullState(): chain.IChainMonitorState
 method chain.ChainMonitor.getKnownPreimages(): ReadonlyMap<string, Buffer>

@@ -13200,7 +13200,13 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 				}
 			);
 			if (!made.ok) {
-				if (made.refusal) say(`refused:${made.refusal}`, made.refusal);
+				// A spend that does not go out always says why. Only an output
+				// that was spent while its input was fetched has nothing to
+				// say: no spend of it waits any more.
+				if (!made.gone) {
+					say(`refused:${made.refusal}`, made.refusal);
+					this.emit('monitor:updated', channelIdHex, monitor);
+				}
 				if (replaced.length > 0) {
 					this.broadcastAuxiliarySpend(channelId, action.tx);
 				}

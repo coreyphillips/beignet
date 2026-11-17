@@ -196,6 +196,17 @@ export class ChainMonitor {
 
 		if (held.length === 0) return;
 
+		// A sweep that is signed and stored is kept exactly as it was when
+		// the rebuild does not put another signed sweep in its place: it is
+		// released at maturity as before, and nothing the attempt found out
+		// (a provider that would not, an output that could not pay for its
+		// sweep at the rate of this session) is left on its output.
+		const before = held.map((output) => ({
+			output,
+			sweepTxHex: output.sweepTxHex,
+			auxiliaryRefusal: output.auxiliaryRefusal
+		}));
+
 		try {
 			let resolved: ReturnType<typeof resolveOurCommitmentOutputs> = [];
 			switch (this._commitmentBroadcast.commitmentType) {
@@ -252,12 +263,27 @@ export class ChainMonitor {
 				// signature) — don't persist an unsigned tx that would be rejected on
 				// broadcast; it stays held and is rebuilt once the signature exists.
 				if (!r.witness) continue;
+				// Asset channels: at the rate of this session the output would
+				// take its fee from a wallet input. The sweep it holds pays for
+				// itself and is signed, so it stays; should it not confirm once
+				// it is out, the raise of its fee turns to the fee pool.
+				if (this._channelState.auxiliaryState && r.auxiliaryFunding) continue;
 				r.spendTx.setWitness(0, r.witness);
 				r.trackedOutput.sweepTxHex = r.spendTx.toBuffer().toString('hex');
 				noteAuxiliarySweep(r.trackedOutput, r.auxiliaryData);
 			}
 		} catch {
 			// Keep the existing held sweeps; they are still valid spends.
+		}
+		if (this._channelState.auxiliaryState) {
+			for (const kept of before) {
+				if (kept.output.sweepTxHex !== kept.sweepTxHex) continue;
+				if (kept.auxiliaryRefusal === undefined) {
+					delete kept.output.auxiliaryRefusal;
+				} else {
+					kept.output.auxiliaryRefusal = kept.auxiliaryRefusal;
+				}
+			}
 		}
 	}
 
@@ -2294,7 +2320,9 @@ export class ChainMonitor {
 				default:
 					return undefined;
 			}
-		} catch {
+		} catch (cause) {
+			// Why the spend could not be made stays on the output.
+			output.auxiliaryRefusal = (cause as Error).message;
 			return undefined;
 		}
 	}
@@ -2374,15 +2402,42 @@ export class ChainMonitor {
 		) => void
 	):
 		| { ok: true; transaction: Buffer; broadcast: boolean }
-		| { ok: false; refusal?: string } {
+		| { ok: false; refusal: string; gone?: true } {
+		const channel = (
+			this._channelState.channelId ?? this._channelState.temporaryChannelId
+		).toString('hex');
 		const output = this._fixedOutput(txid, outputIndex);
-		if (!output || feeInputs.length === 0) return { ok: false };
-		const again = this._resolveFixedOutputSpend(output, feeRatePerVbyte);
-		if (!again?.spendTx || !again.auxiliaryFunding) {
+		if (!output) {
+			// Spent meanwhile, or never an output whose spend takes a fee
+			// input: no spend of it waits to go out.
 			return {
 				ok: false,
-				...(output.auxiliaryRefusal ? { refusal: output.auxiliaryRefusal } : {})
+				gone: true,
+				refusal: `Output ${txid}:${outputIndex} is not an unspent output whose spend takes a fee input (channel ${channel})`
 			};
+		}
+		// A spend that has its fee input and still cannot go out says why,
+		// and the reason takes the place of the wait for the fee pool on its
+		// output: that wait is over, and another has begun.
+		const notMade = (reason: string): { ok: false; refusal: string } => {
+			this.noteFixedOutputFeeWait(txid, outputIndex, {
+				code: 'FEE_SPEND_UNAVAILABLE',
+				remedy: 'operator',
+				message: reason
+			});
+			return {
+				ok: false,
+				refusal: `The spend of output ${txid}:${outputIndex} of an asset channel has its fee input and cannot go out: ${reason} (channel ${channel})`
+			};
+		};
+		if (feeInputs.length === 0) return notMade('the fee pool gave no input');
+		delete output.auxiliaryRefusal;
+		const again = this._resolveFixedOutputSpend(output, feeRatePerVbyte);
+		if (!again?.spendTx || !again.auxiliaryFunding) {
+			return notMade(
+				output.auxiliaryRefusal ??
+					'the spend could not be made again in the form that takes a fee input'
+			);
 		}
 
 		// The inputs are here: whatever follows, the wait for them is over.
@@ -3280,6 +3335,28 @@ export class ChainMonitor {
 					r.trackedOutput.txid === output.txid &&
 					r.trackedOutput.outputIndex === output.outputIndex
 			) ?? (resolved.length === 1 ? resolved[0] : undefined);
+		if (
+			this._channelState.auxiliaryState &&
+			match?.spendTx &&
+			match.auxiliaryFunding
+		) {
+			// Asset channels: at this rate the output cannot pay for its own
+			// spend and keep what an output of units must hold. From here on
+			// its spend takes its fee from a wallet input: the output is marked
+			// so, the fee pool is asked on the next block, and the signed
+			// spend it has stays the one held, and goes out again, until the
+			// input is attached. Without a signed spend there is nothing to
+			// send, and the unsigned form is never stored as one.
+			if (!previousSweep) return null;
+			const tracked =
+				this._trackedOutputs.find(
+					(o) => o.txid === output.txid && o.outputIndex === output.outputIndex
+				) ?? output;
+			tracked.auxiliaryFeeFunding = true;
+			tracked.currentFeeRate = feeRatePerVbyte;
+			tracked.broadcastHeight = this._currentBlockHeight;
+			return previousSweep;
+		}
 		if (match?.spendTx) {
 			// Penalty txs come back with witnesses already set; others carry a
 			// separate witness to attach.
