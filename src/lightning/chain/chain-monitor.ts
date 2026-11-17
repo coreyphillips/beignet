@@ -2547,12 +2547,14 @@ export class ChainMonitor {
 	 * failed when this node's own spend took the output back (the timeout)
 	 * and is fulfilled when the peer's did (it showed the preimage); one it
 	 * received is fulfilled when its own spend took it (the preimage) and
-	 * has failed when the peer's did. Nothing for a revoked commitment,
-	 * whose HTLCs are not the channel's, and nothing for any other channel.
+	 * has failed when the peer's did. Nothing is read from the outputs of
+	 * a revoked commitment, whose HTLCs are not the channel's, and nothing
+	 * for any other channel.
 	 *
 	 * An HTLC the channel holds that is on no output of the commitment that
 	 * confirmed is in the list too, marked absent, once that commitment is
-	 * there for good (_auxiliaryAbsentHtlcEndings).
+	 * there for good; with a revoked commitment that is every HTLC the
+	 * channel holds (_auxiliaryAbsentHtlcEndings).
 	 */
 	auxiliaryHtlcEndings(): Array<{
 		txid: string;
@@ -2565,11 +2567,13 @@ export class ChainMonitor {
 	}> {
 		const broadcast = this._commitmentBroadcast;
 		const type = broadcast?.commitmentType;
+		if (!broadcast || !this._channelState.auxiliaryState) return [];
+		if (type === CommitmentType.THEIR_REVOKED_COMMITMENT) {
+			return this._auxiliaryAbsentHtlcEndings(broadcast);
+		}
 		if (
-			!broadcast ||
-			!this._channelState.auxiliaryState ||
-			(type !== CommitmentType.OUR_COMMITMENT &&
-				type !== CommitmentType.THEIR_CURRENT_COMMITMENT)
+			type !== CommitmentType.OUR_COMMITMENT &&
+			type !== CommitmentType.THEIR_CURRENT_COMMITMENT
 		) {
 			return [];
 		}
@@ -2617,6 +2621,17 @@ export class ChainMonitor {
 	 * Nothing while the view of the commitment is not held, by which alone
 	 * the node knows what the commitment carries, and nothing for an HTLC
 	 * the view names: that one has an output, whose spend says its ending.
+	 *
+	 * A revoked commitment of the peer that is there for good ends the
+	 * state the channel was in: no HTLC of that state can come to pass any
+	 * more, whatever the revoked commitment itself carries, and the node
+	 * takes the funds of the channel with the revocation key. Every HTLC
+	 * with units the channel holds is then listed, by the same rule: one
+	 * whose preimage had been given already is fulfilled, as the record of
+	 * its payment says since then, and every other has failed. The depth
+	 * is that of the commitment and not of the penalty, which waits on a
+	 * fee coin for as long as the wallet has none: an HTLC is never left
+	 * unsaid for that.
 	 */
 	private _auxiliaryAbsentHtlcEndings(
 		broadcast: ICommitmentBroadcast
@@ -2627,12 +2642,16 @@ export class ChainMonitor {
 		) {
 			return [];
 		}
-		const view = auxiliaryCommitmentView(
-			this._channelState,
-			broadcast.commitmentType === CommitmentType.OUR_COMMITMENT,
-			broadcast.commitmentNumber
-		);
-		if (!view) return [];
+		const revoked =
+			broadcast.commitmentType === CommitmentType.THEIR_REVOKED_COMMITMENT;
+		const view = revoked
+			? undefined
+			: auxiliaryCommitmentView(
+					this._channelState,
+					broadcast.commitmentType === CommitmentType.OUR_COMMITMENT,
+					broadcast.commitmentNumber
+			  );
+		if (!revoked && !view) return [];
 		const endings: ReturnType<ChainMonitor['auxiliaryHtlcEndings']> = [];
 		for (const entry of this._channelState.htlcs.values()) {
 			if (entry.auxiliaryAmount === undefined) continue;
@@ -2640,14 +2659,15 @@ export class ChainMonitor {
 			const key = `${entry.direction}:${entry.id}`;
 			const type = offered ? OutputType.OFFERED_HTLC : OutputType.RECEIVED_HTLC;
 			if (
-				view.htlcOutputIndexes?.has(key) ||
-				this._trackedOutputs.some(
-					(output) =>
-						output.txid === broadcast.txid &&
-						!output.isSecondLevelHtlc &&
-						output.outputType === type &&
-						output.htlcId === entry.id
-				)
+				!revoked &&
+				(view?.htlcOutputIndexes?.has(key) ||
+					this._trackedOutputs.some(
+						(output) =>
+							output.txid === broadcast.txid &&
+							!output.isSecondLevelHtlc &&
+							output.outputType === type &&
+							output.htlcId === entry.id
+					))
 			) {
 				continue;
 			}

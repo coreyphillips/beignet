@@ -21,6 +21,7 @@ import {
 	OutputType,
 	type ITrackedOutput
 } from '../../src/lightning/chain/types';
+import { PaymentStatus } from '../../src/lightning/node/types';
 import type { WalletFundingProvider } from '../../src/lightning/wallet/wallet-funding-provider';
 import { withAssetOpens, type IAssetHost } from './helpers/auxiliary-nodes';
 import {
@@ -34,6 +35,12 @@ import {
 	trackedOutputs,
 	type IAssetChainPair
 } from './helpers/auxiliary-on-chain';
+
+/** The parts of a hold invoice a node still has parked. */
+const parkedOf = (host: IAssetHost, paymentHash: Buffer): number =>
+	(host.node as unknown as { heldHtlcs: Map<string, unknown[]> }).heldHtlcs.get(
+		paymentHash.toString('hex')
+	)?.length ?? 0;
 
 /** One input by the key of the output, one wallet input, one output. */
 const PENALTY_VBYTES = 179;
@@ -380,5 +387,122 @@ describe('the HTLC outputs of a revoked commitment of an asset channel (issue #2
 		expect(poolOf(bob).getFixedOutputFeeBudget()!.reservedSatoshis).to.equal(
 			0n
 		);
+	});
+
+	it('tells the host of every HTLC that was in flight when a revoked commitment confirmed, once that commitment is there for good: each has failed, the payment is ended and the hold invoice cancelled', async function () {
+		const tag = 'aux-revoked-in-flight';
+		const outcomes: string[] = [];
+		const value = (context: { auxiliaryAmount?: bigint }): bigint =>
+			(context.auxiliaryAmount ?? 0n) * 1000n;
+		const pair = await world.open(tag, {
+			feeWallet: { alice: true, bob: true },
+			hooks: {
+				alice: { valueIncomingHtlc: value },
+				bob: {
+					valueIncomingHtlc: value,
+					onHtlcResolved: (context: {
+						direction: string;
+						outcome: string;
+						auxiliaryAmount: bigint;
+					}): void => {
+						outcomes.push(
+							`${context.direction}:${context.outcome}:${context.auxiliaryAmount}`
+						);
+					}
+				}
+			}
+		});
+		const { bob, channelId } = pair;
+		for (const wallet of [pair.wallets.alice!, pair.wallets.bob!]) {
+			wallet.fund(100_000);
+			wallet.fund(100_000);
+		}
+		await world.mine(pair, 1);
+		const stateOf = (): { localCommitmentNumber: bigint } =>
+			pair.alice.node.getChannelManager().getChannel(channelId)!.getFullState();
+		const number = stateOf().localCommitmentNumber;
+		// The copy Alice cheats with: no HTLC is in the channel yet.
+		const copy = `${pair.alicePath}.kept`;
+		kept.push(copy);
+		(pair.alice.storage as unknown as { db: Database.Database }).db.exec(
+			`VACUUM INTO '${copy}'`
+		);
+		// One HTLC each way, both in flight in the latest state of the channel.
+		const received = await holdUnits(pair, 5000n, `${tag}-in`);
+		const offered = await holdUnits(
+			{ ...pair, alice: pair.bob, bob: pair.alice },
+			300n,
+			`${tag}-out`
+		);
+		expect(stateOf().localCommitmentNumber > number).to.equal(true);
+		expect(parkedOf(bob, received.paymentHash)).to.equal(1);
+		expect(bob.node.getPayment(offered.paymentHash)?.status).to.equal(
+			PaymentStatus.PENDING
+		);
+
+		await world.restartAlice(pair, tag, undefined, () => {
+			for (const suffix of ['', '-wal', '-shm']) {
+				fs.rmSync(`${pair.alicePath}${suffix}`, { force: true });
+			}
+			fs.copyFileSync(copy, pair.alicePath);
+		});
+		expect(stateOf().localCommitmentNumber).to.equal(number);
+		const closed = pair.alice.node.forceCloseChannel(
+			channelId,
+			SWEEP_DESTINATION
+		);
+		expect(closed.ok, closed.error).to.equal(true);
+		await settle();
+		await world.mine(pair, 1);
+		const h = confirmed(pair, closed.commitmentTxid).height;
+		expect(
+			bob.node.getChannelMonitorState(channelId)!.commitmentBroadcast
+		).to.include({
+			txid: closed.commitmentTxid,
+			commitmentType: CommitmentType.THEIR_REVOKED_COMMITMENT,
+			commitmentNumber: number
+		});
+		// The revoked commitment carries neither HTLC: Bob takes the balance
+		// of the cheater and his own, and nothing on the chain names an HTLC.
+		expect(
+			trackedOutputs(bob, channelId).filter(
+				(output) =>
+					output.outputType === OutputType.OFFERED_HTLC ||
+					output.outputType === OutputType.RECEIVED_HTLC
+			)
+		).to.deep.equal([]);
+		await until('both balance outputs spent', pair, () =>
+			trackedOutputs(bob, channelId).every((output) =>
+				done.includes(output.status)
+			)
+		);
+		trace(pair, 'penalties in');
+
+		// One block short of the depth nothing is said and nothing has ended.
+		pair.chain.advance(h + IRREVOCABLE_DEPTH - 1 - pair.chain.height);
+		await settle();
+		expect(outcomes).to.deep.equal([]);
+		expect(parkedOf(bob, received.paymentHash)).to.equal(1);
+		expect(bob.node.getPayment(offered.paymentHash)?.status).to.equal(
+			PaymentStatus.PENDING
+		);
+
+		await world.mine(pair, 1);
+		expect([...outcomes].sort()).to.deep.equal([
+			'OFFERED:failed:300',
+			'RECEIVED:failed:5000'
+		]);
+		// The hold ends cancelled: its preimage was never given.
+		expect(parkedOf(bob, received.paymentHash)).to.equal(0);
+		expect(bob.node.getPayment(received.paymentHash)?.status).to.not.equal(
+			PaymentStatus.COMPLETED
+		);
+		expect(bob.node.getPayment(offered.paymentHash)?.status).to.equal(
+			PaymentStatus.FAILED
+		);
+		// Told once: the blocks that follow say nothing more.
+		await world.mine(pair, 3);
+		expect(outcomes).to.have.length(2);
+		expect(unexpectedRefusals(pair)).to.deep.equal([]);
 	});
 });
