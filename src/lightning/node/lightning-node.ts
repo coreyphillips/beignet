@@ -150,6 +150,7 @@ import { GossipGraphRestore } from '../gossip/graph-restore';
 import type {
 	IChannelAnnouncementMessage,
 	IChannelUpdateMessage,
+	IGraphChannel,
 	INodeAnnouncementMessage,
 	INodeAddress,
 	IQueryChannelRangeMessage,
@@ -164,6 +165,7 @@ import {
 	DEFAULT_PRUNE_MAX_AGE,
 	CHANNEL_FLAG_DIRECTION,
 	CHANNEL_FLAG_DISABLED,
+	SPENT_CHANNEL_FORGET_DEPTH,
 	gossipTimestampTooFarFuture
 } from '../gossip/types';
 import {
@@ -462,7 +464,8 @@ import {
 	ChainWatcher,
 	classifyAnnouncedChannelFunding,
 	classifyRemoteFundingInput,
-	computeScriptHash
+	computeScriptHash,
+	findAnnouncedChannelSpend
 } from '../chain/chain-watcher';
 import { signP2wpkhInput } from '../chain/sweep';
 import { isDuplicateBroadcastRejection } from '../chain/broadcast-rejection';
@@ -1243,6 +1246,19 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	 */
 	private static readonly GOSSIP_QUERIES_PER_PEER = 2;
 	/**
+	 * Graph channels on a chosen route whose funding is re-checked before
+	 * their first use (issue #2048). Each check is at most
+	 * MAX_FUNDING_SPEND_LOOKUPS backend calls, so a route costs at most this
+	 * times that, and a failed attempt one check more.
+	 */
+	private static readonly GRAPH_SPEND_CHECKS_PER_ROUTE = 3;
+	/** Blocks a channel found unspent goes before a route re-checks it. */
+	private static readonly GRAPH_SPEND_RECHECK_BLOCKS = 144;
+	/** Spend checks waiting at once; a request past this is dropped. */
+	private static readonly GRAPH_SPEND_QUEUE_MAX = 64;
+	/** Channels whose last check height is remembered. */
+	private static readonly GRAPH_SPEND_CHECKED_MAX = 4096;
+	/**
 	 * Waiting queries by peer. Served one per turn from the front peer, which
 	 * then moves to the back, so a flooding peer cannot delay the others by
 	 * more than one query each.
@@ -1313,6 +1329,28 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	 */
 	private gossipFundingQueue: Set<string> = new Set();
 	private gossipFundingChecking = false;
+	/**
+	 * Graph channels a payment gave reason to check for a funding spend
+	 * (issue #2048), oldest first, with what asked and for which payment.
+	 */
+	private graphSpendQueue: Map<
+		string,
+		{ reason: 'failure' | 'selection'; paymentHash: string }
+	> = new Map();
+	private graphSpendChecking = false;
+	/**
+	 * Height each graph channel was last checked and not found spent, oldest
+	 * first, so a route does not re-check it every payment, and how many
+	 * checks in a row settled nothing, so the next one looks further.
+	 */
+	private graphSpendCheckedAt: Map<string, { height: number; misses: number }> =
+		new Map();
+	/**
+	 * Channels a payment failed at, held out of new routes until their spend
+	 * check answers. A failure does not always penalize a channel in mission
+	 * control, so without this the next payment would fail there too.
+	 */
+	private graphSpendHeld: Set<string> = new Set();
 	/** Our own node_announcement (cached so we can re-broadcast it for propagation). */
 	private _ownNodeAnnouncement?: Buffer;
 	/** Our own channel_announcement + channel_update per channel, cached for re-broadcast. */
@@ -2232,6 +2270,9 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			// rows re-inflate the graph on the next restore.
 			onChannelEvicted: (scidHex) => {
 				this.gossipFundingQueue.delete(scidHex);
+				this.graphSpendQueue.delete(scidHex);
+				this.graphSpendCheckedAt.delete(scidHex);
+				this.graphSpendHeld.delete(scidHex);
 				if (typeof this.storage?.deleteGossipChannel === 'function') {
 					this.writeGossipRow(
 						`channel:${scidHex}`,
@@ -15601,7 +15642,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			amountMsat + toPeerFeeMsat,
 			finalCltvExpiry + toHint.cltvExpiryDelta,
 			undefined,
-			excluded,
+			this.withHeldGraphChannels(excluded),
 			this.missionControl,
 			undefined,
 			undefined,
@@ -16748,6 +16789,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		this.requireGraph('findBlindedIntroExtension');
 		const ourNodeId = this.ownNodeId();
 		for (const edge of this.graph.getNodeChannels(peerPubkey)) {
+			if (edge.fundingSpentHeight !== undefined) continue;
 			const introIsNode1 = edge.nodeId2.equals(peerPubkey);
 			const introPubkey = introIsNode1 ? edge.nodeId1 : edge.nodeId2;
 			if (introPubkey.equals(ourNodeId) || introPubkey.equals(peerPubkey)) {
@@ -17457,7 +17499,8 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			if (
 				!channel ||
 				channel.announcementVerified !== true ||
-				channel.fundingVerified === true
+				channel.fundingVerified === true ||
+				channel.fundingSpentHeight !== undefined
 			) {
 				this.gossipFundingQueue.delete(scidHex);
 				continue;
@@ -17484,6 +17527,22 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 					);
 				}
 			} else if (verdict === 'refuted') {
+				// BOLT 7 keeps a channel 72 blocks past its funding spend, so a
+				// splice learned before its new announcement is not refused.
+				const spend = await findAnnouncedChannelSpend(
+					backend,
+					channel.announcement
+				);
+				if (this._destroyed) return;
+				if (this.graph.getChannel(scid) !== channel) continue;
+				if (spend.verdict === 'unavailable') {
+					this.gossipFundingQueue.add(scidHex);
+					return;
+				}
+				if (spend.verdict === 'spent') {
+					this.applyGraphFundingSpend(scidHex, channel, spend.height);
+					continue;
+				}
 				this.graph.removeChannel(scid);
 				if (typeof this.storage?.deleteGossipChannel === 'function') {
 					this.safeStorage(
@@ -17493,6 +17552,168 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				}
 			}
 		}
+	}
+
+	/**
+	 * Ask for a chain check of a graph channel's funding output, the
+	 * channel a payment attempt just failed at or one a route is about to
+	 * use (issue #2048). Watching every gossiped output is out of reach over
+	 * Electrum, so a closed third-party channel is found where it costs a
+	 * payment. A spent one stops being routed over at once.
+	 */
+	private requestGraphSpendCheck(
+		scidHex: string,
+		reason: 'failure' | 'selection',
+		paymentHash: string
+	): boolean {
+		const backend = this._chainBackend;
+		if (!backend?.listUnspent || !backend.getTransactionMerkleProof) {
+			return false;
+		}
+		if (this.graphSpendQueue.has(scidHex)) {
+			// The queued check answers this failure too.
+			if (reason === 'failure') this.graphSpendHeld.add(scidHex);
+			return false;
+		}
+		if (this.graphSpendQueue.size >= LightningNode.GRAPH_SPEND_QUEUE_MAX) {
+			return false;
+		}
+		const channel = this.graph.getChannel(Buffer.from(scidHex, 'hex'));
+		if (!channel || channel.fundingSpentHeight !== undefined) return false;
+		// Our own channels are watched on chain already.
+		const own = this.ownNodeId();
+		if (channel.nodeId1.equals(own) || channel.nodeId2.equals(own)) {
+			return false;
+		}
+		const checkedAt = this.graphSpendCheckedAt.get(scidHex)?.height;
+		if (
+			reason === 'selection' &&
+			checkedAt !== undefined &&
+			this.currentBlockHeight - checkedAt <
+				LightningNode.GRAPH_SPEND_RECHECK_BLOCKS
+		) {
+			return false;
+		}
+		this.graphSpendQueue.set(scidHex, { reason, paymentHash });
+		if (reason === 'failure') this.graphSpendHeld.add(scidHex);
+		if (!this.graphSpendChecking) {
+			this.graphSpendChecking = true;
+			void this.runGraphSpendChecks().finally(() => {
+				this.graphSpendChecking = false;
+			});
+		}
+		return true;
+	}
+
+	/**
+	 * Re-check the graph channels a route is about to use: the hops past
+	 * our own first one, at most GRAPH_SPEND_CHECKS_PER_ROUTE of them.
+	 */
+	private requestRouteSpendChecks(
+		route: { hops: Array<{ shortChannelId: Buffer }> },
+		paymentHash: Buffer
+	): void {
+		const hashHex = paymentHash.toString('hex');
+		let requested = 0;
+		for (let i = 1; i < route.hops.length; i++) {
+			if (requested >= LightningNode.GRAPH_SPEND_CHECKS_PER_ROUTE) return;
+			const scidHex = route.hops[i].shortChannelId.toString('hex');
+			if (this.requestGraphSpendCheck(scidHex, 'selection', hashHex)) {
+				requested++;
+			}
+		}
+	}
+
+	/** `excluded` plus the channels held out by graphSpendHeld. */
+	private withHeldGraphChannels(
+		excluded?: Set<string>
+	): Set<string> | undefined {
+		if (this.graphSpendHeld.size === 0) return excluded;
+		return new Set([...(excluded ?? []), ...this.graphSpendHeld]);
+	}
+
+	private async runGraphSpendChecks(): Promise<void> {
+		while (!this._destroyed) {
+			const backend = this._chainBackend;
+			const next = this.graphSpendQueue.entries().next();
+			if (!backend || next.done) return;
+			const [scidHex, request] = next.value;
+			this.graphSpendQueue.delete(scidHex);
+			const scid = Buffer.from(scidHex, 'hex');
+			const channel = this.graph.getChannel(scid);
+			if (!channel || channel.fundingSpentHeight !== undefined) {
+				this.graphSpendHeld.delete(scidHex);
+				continue;
+			}
+			const misses = this.graphSpendCheckedAt.get(scidHex)?.misses ?? 0;
+			const spend = await findAnnouncedChannelSpend(
+				backend,
+				channel.announcement,
+				misses
+			);
+			// A failure that came in meanwhile queued its own check, and the
+			// hold waits for that one.
+			if (!this.graphSpendQueue.has(scidHex)) {
+				this.graphSpendHeld.delete(scidHex);
+			}
+			if (this._destroyed) return;
+			this.emitStructuredLog('payment', 'graph_funding_check', {
+				shortChannelId: scidHex,
+				reason: request.reason,
+				paymentHash: request.paymentHash,
+				verdict: spend.verdict,
+				lookups: spend.lookups,
+				...(spend.verdict === 'spent' ? { spentHeight: spend.height } : {})
+			});
+			if (this.graph.getChannel(scid) !== channel) continue;
+			if (spend.verdict === 'spent') {
+				this.applyGraphFundingSpend(scidHex, channel, spend.height);
+			} else if (spend.verdict !== 'unavailable') {
+				this.graphSpendCheckedAt.delete(scidHex);
+				this.graphSpendCheckedAt.set(scidHex, {
+					height: this.currentBlockHeight,
+					misses: spend.verdict === 'unknown' ? misses + 1 : 0
+				});
+				if (
+					this.graphSpendCheckedAt.size > LightningNode.GRAPH_SPEND_CHECKED_MAX
+				) {
+					const oldest = this.graphSpendCheckedAt.keys().next();
+					if (!oldest.done) this.graphSpendCheckedAt.delete(oldest.value);
+				}
+			}
+		}
+	}
+
+	/**
+	 * Mark a graph channel spent at `height` and keep the row, or forget it
+	 * now when the BOLT 7 delay has already run out.
+	 */
+	private applyGraphFundingSpend(
+		scidHex: string,
+		channel: IGraphChannel,
+		height: number
+	): void {
+		const scid = channel.shortChannelId;
+		this.graphSpendCheckedAt.delete(scidHex);
+		if (this.currentBlockHeight - height >= SPENT_CHANNEL_FORGET_DEPTH) {
+			this.graph.removeChannel(scid);
+			if (typeof this.storage?.deleteGossipChannel === 'function') {
+				this.writeGossipRow(
+					`channel:${scidHex}`,
+					() => this.storage!.deleteGossipChannel!(scidHex),
+					'deleteGossipChannel'
+				);
+			}
+			return;
+		}
+		this.graph.markChannelFundingSpent(scid, height);
+		// A held splice of it replaced it, and the eviction report took the row.
+		if (this.graph.getChannel(scid) !== channel) return;
+		this.writeGossipRow(
+			`channel:${scidHex}`,
+			() => this.storage!.saveGossipChannel(scidHex, channel),
+			'saveGossipChannel'
+		);
 	}
 
 	private getOrCreateSyncManager(pubkey: string): GossipSyncManager {
@@ -18273,7 +18494,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			finalCltvExpiry: this.paddedFinalCltvExpiry(invoice.minFinalCltvExpiry),
 			localChannels: this.payAllLocalEdges(),
 			routingHints: invoice.routingHints,
-			excludedChannels: context?.excludedChannels,
+			excludedChannels: this.withHeldGraphChannels(context?.excludedChannels),
 			policyOverrides: context?.policyOverrides,
 			maxCltvExpiry: this.cltvBudgetFor(
 				invoice.paymentHash,
@@ -18562,7 +18783,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 					paymentAmountMsat,
 					finalCltvExpiry,
 					undefined,
-					excludedChannels,
+					this.withHeldGraphChannels(excludedChannels),
 					this.missionControl,
 					this.getLocalChannelEdges(),
 					cltvBudget,
@@ -18647,7 +18868,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			paymentAmountMsat,
 			finalCltvExpiry,
 			undefined,
-			excludedChannels,
+			this.withHeldGraphChannels(excludedChannels),
 			this.missionControl,
 			cltvBudget,
 			invoice.routingHints,
@@ -18695,7 +18916,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				invoice.routingHints,
 				undefined,
 				localChannels,
-				excludedChannels,
+				this.withHeldGraphChannels(excludedChannels),
 				cltvBudget,
 				overrides
 			);
@@ -19165,6 +19386,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			}
 		}
 
+		this.requestRouteSpendChecks(route, paymentHash);
 		// Add HTLC to channel (may trigger synchronous fulfillment via loopback)
 		const result = this.channelManager.addHtlc(
 			channelId,
@@ -19667,7 +19889,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			amountMsat,
 			finalCltvExpiry,
 			undefined,
-			excludedChannels,
+			this.withHeldGraphChannels(excludedChannels),
 			this.missionControl,
 			undefined,
 			undefined,
@@ -19797,6 +20019,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			RecoveryCriticality.SafetyCritical
 		);
 
+		this.requestRouteSpendChecks(route, paymentHash);
 		const result = this.channelManager.addHtlc(
 			channelId,
 			amount,
@@ -20095,6 +20318,9 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				status: PaymentStatus.PENDING,
 				sharedSecrets
 			});
+			if (ceilingProblem === undefined) {
+				this.requestRouteSpendChecks(partRoute, paymentHash);
+			}
 
 			const result =
 				ceilingProblem === undefined
@@ -27612,6 +27838,15 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		if (culpableScid && !heightSkew && !repriced) {
 			this.missionControl.recordFailure(culpableScid, payment.amountMsat);
 		}
+		// A permanent channel failure (unknown_next_peer among them) is what a
+		// closed channel answers, so ask the chain (issue #2048).
+		if (
+			culpableScid &&
+			payment.failureCode !== undefined &&
+			(payment.failureCode & 0x4000) !== 0
+		) {
+			this.requestGraphSpendCheck(culpableScid, 'failure', hashHex);
+		}
 
 		// Attempt payment retry for temporary failures, plus the height-skew case
 		// detected above.
@@ -30384,6 +30619,8 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		this.retryPendingOutputWatches();
 		// Funding checks a backend outage paused (issue #1105).
 		this.checkGossipFunding();
+		// BOLT 7: spent channels go 72 blocks after the spend (issue #2048).
+		this.graph.forgetSpentChannels(blockHeight);
 		// Re-CPFP any stuck anchor force-close commitment at the current live feerate
 		// so a fee spike after the original broadcast cannot pin the package (M1).
 		this.channelManager.reCpfpStuckCommitments(
@@ -32334,7 +32571,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 					amountMsat,
 					finalCltvExpiry,
 					undefined,
-					excludedChannels,
+					this.withHeldGraphChannels(excludedChannels),
 					this.missionControl,
 					// Our own channels: a direct channel to the introduction node must
 					// be routable even when it never entered the public gossip graph
@@ -32412,7 +32649,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			amountMsat,
 			finalCltvExpiry,
 			undefined,
-			excludedChannels,
+			this.withHeldGraphChannels(excludedChannels),
 			this.missionControl,
 			undefined,
 			undefined,

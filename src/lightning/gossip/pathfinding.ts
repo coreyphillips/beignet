@@ -656,6 +656,8 @@ function searchCheapestRoute(
 			if (excludedChannels && excludedChannels.has(scidHex)) {
 				continue;
 			}
+			// Its funding output is spent, so no hop can forward over it.
+			if (channel.fundingSpentHeight !== undefined) continue;
 
 			// For synthetic hint channels, resolve the upstream node from the hint map
 			const hintDest = hintDestMap.get(scidHex);

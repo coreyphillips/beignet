@@ -187,6 +187,7 @@ export function findPayAllRoute(options: {
 			node2Hex: node2
 		} of adjacent) {
 			if (excludedChannels?.has(scid)) continue;
+			if (channel.fundingSpentHeight !== undefined) continue;
 			const hintDest = hintDestMap.get(scid);
 			if (hintDest !== undefined && hintDest !== candidate.node) continue;
 			const from =

@@ -260,6 +260,33 @@ describe('createInvoice blinded paths (M1.2)', function () {
 		node.destroy();
 	});
 
+	it('does not extend over a graph channel whose funding is spent', function () {
+		const node = makeNode();
+		const { peerPubkey } = injectNormalChannel(node);
+		injectIntroEdge(node, peerPubkey);
+		const edgeScid = encodeShortChannelId({
+			block: 799_000,
+			txIndex: 7,
+			outputIndex: 0
+		});
+		expect(node.getGraph().markChannelFundingSpent(edgeScid, 800_100)).to.equal(
+			true
+		);
+
+		const inv = decode(
+			node.createInvoice({
+				description: 'blinded-spent-intro',
+				amountMsat: 100_000n,
+				useBlindedPaths: true
+			}).bolt11
+		);
+		const bp = inv.blindedPaths![0];
+		expect(bp.path.introductionNodeId).to.deep.equal(peerPubkey);
+		expect(bp.path.blindedHops).to.have.length(2);
+
+		node.destroy();
+	});
+
 	it('stays a 2-node path when the graph has no upstream candidate', function () {
 		const node = makeNode();
 		const { peerPubkey } = injectNormalChannel(node);

@@ -22,8 +22,10 @@ import type {
 } from './types';
 import {
 	CHANNEL_FLAG_DIRECTION,
+	CHANNEL_FLAG_DISABLED,
 	DEFAULT_PRUNE_MAX_AGE,
 	MESSAGE_FLAG_DONT_FORWARD,
+	SPENT_CHANNEL_FORGET_DEPTH,
 	gossipTimestampTooFarFuture,
 	decodeShortChannelId
 } from './types';
@@ -81,6 +83,20 @@ function isSignatureless(sig: Buffer): boolean {
  */
 function isDontForward(msg: IChannelUpdateMessage): boolean {
 	return (msg.messageFlags & MESSAGE_FLAG_DONT_FORWARD) !== 0;
+}
+
+/**
+ * BOLT 7: a channel whose funding output has been spent takes no
+ * channel_update unless it sets the disable bit (issue #2048).
+ */
+function spentRefuses(
+	channel: IGraphChannel,
+	msg: IChannelUpdateMessage
+): boolean {
+	return (
+		channel.fundingSpentHeight !== undefined &&
+		(msg.channelFlags & CHANNEL_FLAG_DISABLED) === 0
+	);
 }
 
 /** Whether two channel_announcements carry the same signed content. */
@@ -214,6 +230,12 @@ export class NetworkGraph {
 	 * fundingVerified !== true, maintained alongside _unverifiedChannels.
 	 */
 	private _unfundedChannels: Set<string> = new Set();
+	/**
+	 * fundingSpentHeight of every held channel that has one, by scidHex, so
+	 * the per-block forget pass and the splice match at admission never scan
+	 * the whole graph.
+	 */
+	private _spentChannels: Map<string, number> = new Map();
 	/** Start of the current serve-verification budget window (epoch ms). */
 	private _serveVerifyWindowStart = 0;
 	/** Verification time spent in the current window across all queries. */
@@ -229,8 +251,9 @@ export class NetworkGraph {
 	// gossip query asks for the entry (issue #443).
 	private readonly _eagerVerify: boolean;
 	// Fired with the scidHex of every channel dropped by ceiling eviction
-	// (including restore-time trims), so the owner can delete the persisted
-	// row; the graph itself never touches storage.
+	// (including restore-time trims), or forgotten after its funding spend
+	// (issue #2048), so the owner can delete the persisted row; the graph
+	// itself never touches storage.
 	private readonly _onChannelEvicted?: (scidHex: string) => void;
 	// Fired with the nodeIdHex of every node garbage-collected because its
 	// last graph channel went away (prune or ceiling eviction), so the owner
@@ -289,6 +312,8 @@ export class NetworkGraph {
 			this._unfundedChannels.delete(scidHex);
 		} else if (!this._unfundedChannels.has(scidHex)) {
 			this._unfundedChannels.add(scidHex);
+			// A spent channel's funding is already settled.
+			if (channel.fundingSpentHeight !== undefined) return;
 			// Fires mid-admission, before the endpoints are linked: a throwing
 			// owner must not leave the channel half inserted.
 			try {
@@ -440,6 +465,14 @@ export class NetworkGraph {
 				existing.nodeId2.equals(msg.nodeId2)
 			) {
 				const pair = provenancePair(verified);
+				// The spend was found for the old announcement's funding script.
+				if (
+					!existing.announcement.bitcoinKey1.equals(msg.bitcoinKey1) ||
+					!existing.announcement.bitcoinKey2.equals(msg.bitcoinKey2)
+				) {
+					existing.fundingSpentHeight = undefined;
+					this._spentChannels.delete(scidHex);
+				}
 				existing.announcement = msg;
 				existing.features = Buffer.from(msg.features);
 				existing.announcementVerified = pair.verified;
@@ -559,7 +592,57 @@ export class NetworkGraph {
 		}
 		node2.channels.add(scidHex);
 
+		// After the links, so the spliced-away entry's removal cannot collect
+		// the endpoints the two share.
+		if (this._spentChannels.size > 0) {
+			this._forgetSplicedAway(scidHex, channel);
+		}
+
 		this._flushDeferredNodeEvictions();
+	}
+
+	/**
+	 * Whether `replacement` is the splice of the spent channel `scidHex`:
+	 * the same two nodes, with its funding transaction in the block that
+	 * spent the old funding output. A splice's new SCID always names that
+	 * block, and an unrelated channel between the pair opened in the same
+	 * block would only cost the spent entry the rest of its delay.
+	 */
+	private _isSplicedAway(
+		scidHex: string,
+		spentHeight: number,
+		replacement: IGraphChannel
+	): boolean {
+		if (scidBlock(replacement.shortChannelId) !== spentHeight) return false;
+		const spent = this._channels.get(scidHex);
+		return (
+			spent !== undefined &&
+			spent !== replacement &&
+			spent.nodeId1.equals(replacement.nodeId1) &&
+			spent.nodeId2.equals(replacement.nodeId2)
+		);
+	}
+
+	/** Forget every spent channel the newly admitted one is the splice of. */
+	private _forgetSplicedAway(scidHex: string, channel: IGraphChannel): void {
+		const replaced: string[] = [];
+		for (const [spentHex, height] of this._spentChannels) {
+			if (
+				spentHex !== scidHex &&
+				this._isSplicedAway(spentHex, height, channel)
+			) {
+				replaced.push(spentHex);
+			}
+		}
+		for (const spentHex of replaced) this._forgetChannel(spentHex);
+	}
+
+	/** Drop a held channel and report it, so its stored row goes too. */
+	private _forgetChannel(scidHex: string): void {
+		const channel = this._channels.get(scidHex);
+		if (!channel) return;
+		this.removeChannel(channel.shortChannelId);
+		this._onChannelEvicted?.(scidHex);
 	}
 
 	/**
@@ -616,6 +699,8 @@ export class NetworkGraph {
 		if (!channel) {
 			return false;
 		}
+		// BOLT 7: once the funding output is spent, only a disabling update.
+		if (spentRefuses(channel, msg)) return false;
 
 		const direction = msg.channelFlags & CHANNEL_FLAG_DIRECTION;
 		const existing = direction === 0 ? channel.update1 : channel.update2;
@@ -752,6 +837,7 @@ export class NetworkGraph {
 		if (isDontForward(msg)) return false;
 		const channel = this._channels.get(msg.shortChannelId.toString('hex'));
 		if (!channel) return false;
+		if (spentRefuses(channel, msg)) return false;
 		const direction = msg.channelFlags & CHANNEL_FLAG_DIRECTION;
 		const existing = direction === 0 ? channel.update1 : channel.update2;
 		const existingVerified =
@@ -854,6 +940,60 @@ export class NetworkGraph {
 	}
 
 	/**
+	 * Record that a held channel's funding output was spent at `height`
+	 * (issue #2048). From then on it is not routed over and takes only
+	 * disabling updates; forgetSpentChannels drops it
+	 * SPENT_CHANNEL_FORGET_DEPTH blocks after the spend. A channel already
+	 * held as its splice replaces it at once. False when the SCID is not held.
+	 */
+	markChannelFundingSpent(shortChannelId: Buffer, height: number): boolean {
+		const scidHex = shortChannelId.toString('hex');
+		const channel = this._channels.get(scidHex);
+		if (!channel || !Number.isSafeInteger(height) || height < 0) return false;
+		const node = this._nodes.get(channel.nodeId1.toString('hex'));
+		if (node) {
+			for (const otherHex of node.channels) {
+				const other = this._channels.get(otherHex);
+				if (
+					other &&
+					other.fundingSpentHeight === undefined &&
+					scidBlock(other.shortChannelId) === height &&
+					other.nodeId2.equals(channel.nodeId2) &&
+					otherHex !== scidHex
+				) {
+					this._forgetChannel(scidHex);
+					return true;
+				}
+			}
+		}
+		channel.fundingSpentHeight = height;
+		channel.fundingVerified = undefined;
+		this._spentChannels.set(scidHex, height);
+		this._syncUnverifiedIndex(scidHex, channel);
+		return true;
+	}
+
+	/**
+	 * Forget every channel spent at least SPENT_CHANNEL_FORGET_DEPTH blocks
+	 * before `height` (BOLT 7). Each is reported through onChannelEvicted.
+	 * Returns how many went.
+	 */
+	forgetSpentChannels(height: number): number {
+		const due: string[] = [];
+		for (const [scidHex, spentHeight] of this._spentChannels) {
+			if (height - spentHeight >= SPENT_CHANNEL_FORGET_DEPTH) due.push(scidHex);
+		}
+		for (const scidHex of due) {
+			if (this._channels.has(scidHex)) {
+				this._forgetChannel(scidHex);
+			} else {
+				this._spentChannels.delete(scidHex);
+			}
+		}
+		return due.length;
+	}
+
+	/**
 	 * Get all channels that a node is part of.
 	 */
 	getNodeChannels(nodeId: Buffer): IGraphChannel[] {
@@ -895,6 +1035,7 @@ export class NetworkGraph {
 		this._edges.delete(scidHex);
 		this._unverifiedChannels.delete(scidHex);
 		this._unfundedChannels.delete(scidHex);
+		this._spentChannels.delete(scidHex);
 
 		// Remove from endpoint nodes' channel sets
 		const node1Hex = channel.nodeId1.toString('hex');
@@ -1071,8 +1212,17 @@ export class NetworkGraph {
 		}
 		// A funding proof only means anything for the announcement it was
 		// checked against.
+		const spentHeight = channel.fundingSpentHeight;
+		channel.fundingSpentHeight =
+			typeof spentHeight === 'number' &&
+			Number.isSafeInteger(spentHeight) &&
+			spentHeight >= 0
+				? spentHeight
+				: undefined;
 		channel.fundingVerified =
-			channel.announcementVerified === true && channel.fundingVerified === true
+			channel.announcementVerified === true &&
+			channel.fundingVerified === true &&
+			channel.fundingSpentHeight === undefined
 				? true
 				: undefined;
 
@@ -1105,6 +1255,11 @@ export class NetworkGraph {
 		const node1Hex = channel.nodeId1.toString('hex');
 		const node2Hex = channel.nodeId2.toString('hex');
 		this._setChannel(scidHex, channel, node1Hex, node2Hex);
+		if (channel.fundingSpentHeight !== undefined) {
+			this._spentChannels.set(scidHex, channel.fundingSpentHeight);
+		} else {
+			this._spentChannels.delete(scidHex);
+		}
 		this._syncUnverifiedIndex(scidHex, channel);
 
 		// Ensure node entries exist and link channel

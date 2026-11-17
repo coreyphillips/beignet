@@ -550,6 +550,7 @@ function bootstrap.resolveARecords(hostname: string): Promise<string[]>
 function bootstrap.resolveDnsSeed(seed: bootstrap.IDnsSeedConfig, timeoutMs?: number): Promise<bootstrap.IPeerAddress[]>
 function bootstrap.resolveSrvRecords(hostname: string): Promise<Array<{ name: string; port: number; priority: number; weight: number; }>>
 namespace chain
+type chain.AnnouncedFundingSpend = { verdict: 'spent'; height: number; lookups: number; } | { verdict: 'unspent' | 'unknown' | 'unavailable'; lookups: number; }
 type chain.AnnouncedFundingVerdict = 'proven' | 'refuted' | 'unknown' | 'unavailable'
 type chain.ChainAction = chain.IBroadcastTxChainAction | chain.IFeeBumpAndBroadcastChainAction | chain.IWatchOutputChainAction | chain.IWatchTxChainAction | chain.IOutputResolvedChainAction | chain.IChannelFullyResolvedChainAction | chain.IPreimageLearnedChainAction | chain.IRebuildSweepChainAction | chain.ISweepUneconomicChainAction | chain.IChainErrorAction
 enum chain.ChainActionType
@@ -874,6 +875,7 @@ property chain.IWatchOutputChainAction.type: chain.ChainActionType.WATCH_OUTPUT
 interface chain.IWatchTxChainAction
 property chain.IWatchTxChainAction.txid: string
 property chain.IWatchTxChainAction.type: chain.ChainActionType.WATCH_TX
+const chain.MAX_FUNDING_SPEND_LOOKUPS: number
 const chain.MIN_FEERATE_PER_KW = 253
 const chain.MIN_RELAY_FEERATE_SAT_PER_KVB = 1000n
 enum chain.MonitorState
@@ -929,6 +931,7 @@ function chain.estimateSimpleCloseFee(feeratePerKw: number, closerScriptLen: num
 function chain.estimateSweepVbytes(outputType: chain.OutputType, leased?: boolean): number
 function chain.extractCommitmentNumber(tx: bitcoinjs-lib#Transaction, openPaymentBasepoint: Buffer, acceptPaymentBasepoint: Buffer): bigint
 function chain.extractPreimageFromWitness(witness: Buffer[]): Buffer | null
+function chain.findAnnouncedChannelSpend(backend: chain.IChainBackend, announcement: { shortChannelId: Buffer; bitcoinKey1: Buffer; bitcoinKey2: Buffer; }, attempt?: number): Promise<chain.AnnouncedFundingSpend>
 function chain.isDustOutput(scriptPubkey: Buffer, amountSat: bigint): boolean
 function chain.isOpReturnScript(scriptPubkey: Buffer): boolean
 function chain.matchRevokedHtlcSnapshotOutputs(state: channel.IChannelState, commitmentNumber: bigint, revokedTx: bitcoinjs-lib#Transaction, network?: bitcoinjs-lib#Network): Map<number, chain.IRevokedHtlcSnapshotOutput>
@@ -3945,6 +3948,7 @@ property gossip.IGraphChannel.announcement: gossip.IChannelAnnouncementMessage
 property gossip.IGraphChannel.announcementVerified?: boolean
 property gossip.IGraphChannel.announcementVerifyDeferred?: boolean
 property gossip.IGraphChannel.features: Buffer
+property gossip.IGraphChannel.fundingSpentHeight?: number
 property gossip.IGraphChannel.fundingVerified?: boolean
 property gossip.IGraphChannel.nodeId1: Buffer
 property gossip.IGraphChannel.nodeId2: Buffer
@@ -4071,6 +4075,7 @@ method gossip.NetworkGraph.addRapidGossipChannel(msg: gossip.IChannelAnnouncemen
 method gossip.NetworkGraph.applyChannelUpdate(msg: gossip.IChannelUpdateMessage, opts?: { verified?: gossip.TGossipVerified; }): boolean
 method gossip.NetworkGraph.applyNodeAnnouncement(msg: gossip.INodeAnnouncementMessage, opts?: { verified?: gossip.TGossipVerified; }): boolean
 method gossip.NetworkGraph.applyRapidGossipUpdate(msg: gossip.IChannelUpdateMessage, scidHex: string): boolean
+method gossip.NetworkGraph.forgetSpentChannels(height: number): number
 method gossip.NetworkGraph.getAllChannelIds(): Buffer[]
 method gossip.NetworkGraph.getAllChannels(): gossip.IGraphChannel[]
 method gossip.NetworkGraph.getAllNodeIds(): Buffer[]
@@ -4088,6 +4093,7 @@ method gossip.NetworkGraph.getNodeEdges(nodeIdHex: string): gossip.IGraphEdge[]
 method gossip.NetworkGraph.getVerifiedChannelAnnouncement(shortChannelId: Buffer): gossip.IChannelAnnouncementMessage | undefined
 method gossip.NetworkGraph.getVerifiedNodeAnnouncement(nodeId: Buffer): gossip.INodeAnnouncementMessage | undefined
 method gossip.NetworkGraph.markChannelFundingProven(shortChannelId: Buffer): boolean
+method gossip.NetworkGraph.markChannelFundingSpent(shortChannelId: Buffer, height: number): boolean
 method gossip.NetworkGraph.pruneStaleChannels(currentTimestamp: number, maxAge?: number): number
 method gossip.NetworkGraph.removeChannel(shortChannelId: Buffer): boolean
 method gossip.NetworkGraph.restoreChannel(channel: gossip.IGraphChannel): void
@@ -4097,6 +4103,7 @@ method gossip.NetworkGraph.wouldAcceptChannelUpdate(msg: gossip.IChannelUpdateMe
 method gossip.NetworkGraph.wouldAcceptNodeAnnouncement(msg: gossip.INodeAnnouncementMessage): boolean
 class gossip.RapidGossipCancelledError extends Error
 constructor gossip.RapidGossipCancelledError()
+const gossip.SPENT_CHANNEL_FORGET_DEPTH = 72
 type gossip.TGossipVerified = boolean | 'deferred'
 type gossip.TPolicyOverrides = Map<string, gossip.IChannelUpdateMessage>
 function gossip.announcedDialableAddresses(addresses: gossip.INodeAddress[]): Array<{ host: string; port: number; }>

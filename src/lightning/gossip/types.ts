@@ -223,6 +223,11 @@ export interface IGraphChannel {
 	// carries, so only a channel with this set is kept when the graph is at
 	// its ceiling. Meaningful only while announcementVerified is true.
 	fundingVerified?: boolean;
+	// Height of the block that spent the funding output, once a chain check
+	// found it spent (issue #2048). The channel is not routed over, takes
+	// only disabling updates, and is forgotten SPENT_CHANNEL_FORGET_DEPTH
+	// blocks later, or as soon as a splice's announcement replaces it.
+	fundingSpentHeight?: number;
 }
 
 /**
@@ -293,6 +298,12 @@ export const ANNOUNCEMENT_SIGNATURES_LENGTH = 168;
 
 /** BOLT 7: Maximum age for channel updates before pruning (2 weeks). */
 export const DEFAULT_PRUNE_MAX_AGE = 1_209_600;
+
+/**
+ * BOLT 7: blocks after its funding spend that a channel is forgotten. A
+ * spliced channel's new announcement needs at least 6 of them to arrive.
+ */
+export const SPENT_CHANNEL_FORGET_DEPTH = 72;
 
 /**
  * BOLT 7: ignore gossip timestamped unreasonably far in the future. One hour
