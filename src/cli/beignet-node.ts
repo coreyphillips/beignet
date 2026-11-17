@@ -7677,6 +7677,9 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 		]);
 		let totalMsat = 0n;
 		for (const ch of this.node.listChannels()) {
+			// An asset channel's bitcoin only carries asset outputs: it is
+			// not a Lightning balance on its way back to the wallet.
+			if (ch.auxiliary) continue;
 			const effectiveState =
 				ch.state === ChannelState.AWAITING_REESTABLISH
 					? this.node
@@ -11313,6 +11316,10 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 		const manager = this.node.getChannelManager();
 		for (const channel of manager.listChannels()) {
 			if (!channel.acceptsNewHtlcs(true)) continue;
+			// An asset channel's bitcoin only carries asset outputs: it is no
+			// balance held with a primary, and no channel a bitcoin receive
+			// could fill.
+			if (channel.getFullState().auxiliaryState) continue;
 			const channelId = channel.getChannelId();
 			const peer = channelId ? manager.getPeerForChannel(channelId) : null;
 			if (!peer) continue;
