@@ -9091,18 +9091,42 @@ export class Channel {
 	/** What stopped the provider from building the close last judged for relay. */
 	private _auxiliaryCloseFailure: unknown;
 
-	/** The refusal of a close step an asset channel's provider could not answer. */
+	/**
+	 * The refusal of a close step an asset channel's provider could not
+	 * answer. As on the commitment path (_auxiliaryLocalFailure) that is a
+	 * failure of this node: a typed local error, nothing that blames the
+	 * peer, and the connection dropped, because a close moves only when a
+	 * message arrives and the reestablish of the next connection is what
+	 * has both nodes send the shutdowns and the proposal again. Without the
+	 * drop the close hangs on a live connection until the stuck scan force
+	 * closes the channel. `drop` is false only where the refusal answers a
+	 * call of this node's own operator, who is told directly and whose peer
+	 * waits for nothing.
+	 */
 	private _auxiliaryCloseRefused(
 		cause: unknown,
-		operation = 'a cooperative close'
+		operation = 'a cooperative close',
+		drop = true
 	): ChannelAction[] {
-		return [
+		const message = auxiliaryProviderError(
+			this._state,
+			operation,
+			cause
+		).message;
+		const refused: ChannelAction[] = [
 			{
 				type: ChannelActionType.ERROR,
-				message: auxiliaryProviderError(this._state, operation, cause).message,
+				message,
 				code: ChannelErrorCode.ASSET_PROVIDER_REFUSED
 			}
 		];
+		if (drop) {
+			refused.push({
+				type: ChannelActionType.DISCONNECT_PEER,
+				reason: message
+			});
+		}
+		return refused;
 	}
 
 	/**
@@ -9162,7 +9186,8 @@ export class Channel {
 	 */
 	private _prepareAuxiliaryShutdown(
 		destinationScript: Buffer,
-		peerScript: Buffer | null = this._state.remoteShutdownScript
+		peerScript: Buffer | null = this._state.remoteShutdownScript,
+		answering = false
 	):
 		| { scriptPubkey: Buffer; customRecords: Map<bigint, Buffer> }
 		| { refusal: ChannelAction[] } {
@@ -9221,7 +9246,9 @@ export class Channel {
 			}
 			return { scriptPubkey, customRecords };
 		} catch (err) {
-			return { refusal: this._auxiliaryCloseRefused(err, 'a shutdown') };
+			return {
+				refusal: this._auxiliaryCloseRefused(err, 'a shutdown', answering)
+			};
 		}
 	}
 
@@ -9471,7 +9498,8 @@ export class Channel {
 			if (this._state.state === ChannelState.NORMAL) {
 				const prepared = this._prepareAuxiliaryShutdown(
 					localScript ?? this._state.localShutdownScript ?? Buffer.alloc(0),
-					msg.scriptPubkey
+					msg.scriptPubkey,
+					true
 				);
 				if ('refusal' in prepared) return prepared.refusal;
 				ownAssetShutdown = prepared;

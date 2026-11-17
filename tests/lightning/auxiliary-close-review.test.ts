@@ -27,6 +27,7 @@ import {
 	assetHost,
 	connectHosts,
 	openAssetChannel,
+	reconnectHosts,
 	withAssetOpens,
 	type IAssetHost
 } from './helpers/auxiliary-nodes';
@@ -301,7 +302,12 @@ describe('The cooperative close of an asset channel under review (#2093)', funct
 			`The asset provider refused a shutdown (channel ${hex}): Asset shutdown script is the script the peer closes to`
 		]);
 		expect(sent(made, 'bob')).to.deep.equal([]);
-		expect(stateOf(bob, channelId).state).to.equal(ChannelState.NORMAL);
+		// A failure of his own provider: the connection is dropped and the
+		// channel waits, whole, for the next one.
+		expect(made.disconnects.bob).to.deep.equal([alice.node.getNodeId()]);
+		expect(stateOf(bob, channelId).state).to.equal(
+			ChannelState.AWAITING_REESTABLISH
+		);
 		expect(stateOf(bob, channelId).localShutdownScript).to.equal(null);
 	});
 
@@ -422,10 +428,19 @@ describe('The cooperative close of an asset channel under review (#2093)', funct
 			expect(sent(made, 'alice')).to.not.include(MessageType.CLOSING_SIGNED);
 			expect(sent(made, 'bob')).to.not.include(MessageType.CLOSING_SIGNED);
 			expect(made.published).to.deep.equal({ alice: [], bob: [] });
+			// Alice drops the connection for her provider's answer, and her
+			// channel waits for the next one with nothing kept for a close.
+			expect(made.disconnects.alice).to.deep.equal([bob.node.getNodeId()]);
+			expect(stateOf(alice, channelId).state).to.equal(
+				ChannelState.AWAITING_REESTABLISH
+			);
+			expect(stateOf(bob, channelId).state).to.equal(
+				ChannelState.NEGOTIATING_CLOSING
+			);
 			for (const host of [alice, bob]) {
-				const state = stateOf(host, channelId);
-				expect(state.state).to.equal(ChannelState.NEGOTIATING_CLOSING);
-				expect(state.auxiliaryState!.closeTransactions).to.equal(undefined);
+				expect(
+					stateOf(host, channelId).auxiliaryState!.closeTransactions
+				).to.equal(undefined);
 			}
 			// The unilateral exit is still there.
 			expect(alice.node.forceCloseChannel(channelId, DESTINATION).ok).to.equal(
@@ -488,7 +503,7 @@ describe('The cooperative close of an asset channel under review (#2093)', funct
 			},
 			acceptorUnits: 0n
 		});
-		const { alice, channelId, hex } = made;
+		const { alice, bob, channelId, hex } = made;
 		expect(alice.node.closeChannel(channelId, DESTINATION)).to.deep.equal({
 			ok: true
 		});
@@ -497,8 +512,9 @@ describe('The cooperative close of an asset channel under review (#2093)', funct
 			`The asset provider refused a cooperative close (channel ${hex}): Bitcoin close payout changed`
 		]);
 		expect(sent(made, 'alice')).to.not.include(MessageType.CLOSING_SIGNED);
+		expect(made.disconnects.alice).to.deep.equal([bob.node.getNodeId()]);
 		expect(stateOf(alice, channelId).state).to.equal(
-			ChannelState.NEGOTIATING_CLOSING
+			ChannelState.AWAITING_REESTABLISH
 		);
 	});
 
@@ -670,7 +686,7 @@ describe('The cooperative close of an asset channel under review (#2093)', funct
 				},
 				bob: { provider: withSeparateAnchors(referenceProvider()) }
 			});
-			const { alice, channelId, hex } = made;
+			const { alice, bob, channelId, hex } = made;
 			expect(alice.node.closeChannel(channelId, DESTINATION)).to.deep.equal({
 				ok: true
 			});
@@ -679,9 +695,151 @@ describe('The cooperative close of an asset channel under review (#2093)', funct
 				`The asset provider refused a cooperative close (channel ${hex}): Invalid asset close payout`
 			]);
 			expect(sent(made, 'alice')).to.not.include(MessageType.CLOSING_SIGNED);
+			expect(made.disconnects.alice).to.deep.equal([bob.node.getNodeId()]);
 			expect(stateOf(alice, channelId).state).to.equal(
-				ChannelState.NEGOTIATING_CLOSING
+				ChannelState.AWAITING_REESTABLISH
 			);
+		});
+	}
+
+	// What a host does with the connections its node asked it to drop: it
+	// drops them, and the two nodes meet again.
+	const honourDrops = async (made: Awaited<ReturnType<typeof pair>>) => {
+		let honoured = 0;
+		const asked = (): number =>
+			made.disconnects.alice.length + made.disconnects.bob.length;
+		while (asked() > honoured) {
+			honoured = asked();
+			await reconnectHosts(made.alice, made.bob);
+		}
+	};
+	const refusedBy = (hex: string, operation: string, cause: string): string =>
+		`The asset provider refused ${operation} (channel ${hex}): ${cause}`;
+
+	it('drops the connection when its provider cannot judge the shutdown of the peer, and the close is carried on at the reconnect', async () => {
+		const reference = referenceProvider();
+		let down = true;
+		const made = await pair('review9-drop', {
+			bob: {
+				provider: {
+					...reference,
+					verifyShutdown(state, shutdown) {
+						if (down) throw new Error('proofs unavailable');
+						return reference.verifyShutdown(state, shutdown);
+					}
+				}
+			}
+		});
+		const { alice, bob, channelId, hex } = made;
+		const refusal = refusedBy(hex, 'a shutdown', 'proofs unavailable');
+		expect(alice.node.closeChannel(channelId, DESTINATION)).to.deep.equal({
+			ok: true
+		});
+		await settle();
+		// A local refusal, nothing to the peer, and the connection is to go.
+		expect(made.managerErrors.bob).to.deep.equal([refusal]);
+		expect(made.disconnects.bob).to.deep.equal([alice.node.getNodeId()]);
+		expect(sent(made, 'bob')).to.deep.equal([]);
+		expect(stateOf(alice, channelId).state).to.equal(
+			ChannelState.SHUTTING_DOWN
+		);
+		expect(stateOf(bob, channelId).state).to.equal(
+			ChannelState.AWAITING_REESTABLISH
+		);
+		// The provider is still down at the next connection: the same again,
+		// and the channel is as whole as before.
+		await reconnectHosts(alice, bob);
+		expect(made.managerErrors.bob).to.deep.equal([refusal, refusal]);
+		expect(made.disconnects.bob).to.have.length(2);
+		expect(sent(made, 'bob')).to.not.include(MessageType.ERROR);
+		expect(sent(made, 'bob')).to.not.include(MessageType.SHUTDOWN);
+		expect(stateOf(bob, channelId).state).to.equal(
+			ChannelState.AWAITING_REESTABLISH
+		);
+		expect(stateOf(bob, channelId).localShutdownScript).to.equal(null);
+		// It is back at the one after: the close completes.
+		down = false;
+		await reconnectHosts(alice, bob);
+		expect(made.managerErrors.bob).to.deep.equal([refusal, refusal]);
+		expect(made.managerErrors.alice).to.deep.equal([]);
+		for (const host of [alice, bob]) {
+			expect(stateOf(host, channelId).state).to.equal(ChannelState.CLOSED);
+		}
+	});
+
+	it('is not force closed by the stuck channel scan for one ask its provider failed', async () => {
+		const reference = referenceProvider();
+		let down = true;
+		const made = await pair('review9-drop-blocks', {
+			bob: {
+				provider: {
+					...reference,
+					verifyShutdown(state, shutdown) {
+						if (down) throw new Error('proofs unavailable');
+						return reference.verifyShutdown(state, shutdown);
+					}
+				}
+			}
+		});
+		const { alice, bob, channelId } = made;
+		expect(alice.node.closeChannel(channelId, DESTINATION)).to.deep.equal({
+			ok: true
+		});
+		await settle();
+		// The provider was down for one message only.
+		down = false;
+		await honourDrops(made);
+		for (let height = 900_000; height <= 900_012; height++) {
+			for (const host of [alice, bob]) host.node.handleNewBlock(height);
+			await settle(10);
+		}
+		for (const host of [alice, bob]) {
+			expect(stateOf(host, channelId).state).to.equal(ChannelState.CLOSED);
+		}
+		expect(made.published.alice).to.have.length(1);
+		expect(
+			alice.errors.concat(bob.errors).filter((e) => e.includes('STUCK'))
+		).to.deep.equal([]);
+	});
+
+	for (const who of ['proposer', 'responder'] as const) {
+		it(`drops the connection when the provider of the ${who} cannot build the close, and closes at the reconnect`, async () => {
+			const reference = referenceProvider();
+			let down = true;
+			const failing = (): Hooks => ({
+				provider: {
+					...reference,
+					buildClose(context) {
+						if (down) throw new Error('asset store busy');
+						return reference.buildClose(context);
+					}
+				}
+			});
+			const made = await pair(`review9-drop-build-${who}`, {
+				alice: who === 'proposer' ? failing() : {},
+				bob: who === 'responder' ? failing() : {}
+			});
+			const { alice, bob, channelId, hex } = made;
+			const [name, peer] =
+				who === 'proposer'
+					? (['alice', bob] as const)
+					: (['bob', alice] as const);
+			expect(alice.node.closeChannel(channelId, DESTINATION)).to.deep.equal({
+				ok: true
+			});
+			await settle();
+			expect(made.managerErrors[name]).to.deep.equal([
+				refusedBy(hex, 'a cooperative close', 'asset store busy')
+			]);
+			expect(made.disconnects[name]).to.deep.equal([peer.node.getNodeId()]);
+			expect(sent(made, name)).to.not.include(MessageType.ERROR);
+			expect(made.published).to.deep.equal({ alice: [], bob: [] });
+			down = false;
+			await honourDrops(made);
+			expect(made.managerErrors[name]).to.have.length(1);
+			for (const host of [alice, bob]) {
+				expect(stateOf(host, channelId).state).to.equal(ChannelState.CLOSED);
+			}
 		});
 	}
 });

@@ -244,6 +244,14 @@ describe('the cooperative close of an asset channel (issue #2093)', function () 
 		made.wire
 			.filter((message) => from === undefined || message.from === from)
 			.map((message) => message.type);
+	/** The peers `host` asks its carrier to drop the connection of, from now on. */
+	const dropsOf = (host: IAssetHost): string[] => {
+		const dropped: string[] = [];
+		host.node.on('peer:disconnect-requested', (peer: string) => {
+			dropped.push(peer);
+		});
+		return dropped;
+	};
 	const storedRow = (host: IAssetHost, hex: string): string =>
 		JSON.stringify(
 			serializeChannelState(host.storage!.loadChannel(hex)!.state)
@@ -590,8 +598,12 @@ describe('the cooperative close of an asset channel (issue #2093)', function () 
 			});
 			const { alice, bob, channelId, hex } = made;
 			const before = storedRow(alice, hex);
+			const drops = dropsOf(alice);
 			const closed = alice.node.closeChannel(channelId, DESTINATION);
 			await settle();
+			// The operator is told directly, and the peer waits for nothing:
+			// the connection stays.
+			expect(drops).to.deep.equal([]);
 			expect(closed).to.deep.equal({
 				ok: false,
 				error: refused(hex, 'a shutdown', 'no destination yet'),
@@ -618,6 +630,7 @@ describe('the cooperative close of an asset channel (issue #2093)', function () 
 			});
 			const { alice, bob, channelId, hex } = made;
 			const before = storedRow(bob, hex);
+			const drops = dropsOf(bob);
 			const errors: string[] = [];
 			bob.node
 				.getChannelManager()
@@ -631,9 +644,13 @@ describe('the cooperative close of an asset channel (issue #2093)', function () 
 			expect(errors).to.deep.equal([
 				refused(hex, 'a shutdown', 'no destination yet')
 			]);
+			// The connection is dropped: the next one has the peer ask again.
+			expect(drops).to.deep.equal([alice.node.getNodeId()]);
 			// The peer is told nothing and the channel is not failed for it.
 			expect(sentTypes(made, 'bob')).to.deep.equal([]);
-			expect(stateOf(bob, channelId).state).to.equal(ChannelState.NORMAL);
+			expect(stateOf(bob, channelId).state).to.equal(
+				ChannelState.AWAITING_REESTABLISH
+			);
 			expect(storedRow(bob, hex)).to.equal(before);
 			expect(
 				stateOf(bob, channelId).auxiliaryState!.remoteShutdownRecords
@@ -657,6 +674,7 @@ describe('the cooperative close of an asset channel (issue #2093)', function () 
 					}
 				});
 				const { alice, bob, channelId, hex } = made;
+				const drops = dropsOf(bob);
 				const errors: string[] = [];
 				bob.node
 					.getChannelManager()
@@ -671,8 +689,11 @@ describe('the cooperative close of an asset channel (issue #2093)', function () 
 					expect(errors).to.deep.equal([
 						refused(hex, 'a shutdown', 'proofs unavailable')
 					]);
+					expect(drops).to.deep.equal([alice.node.getNodeId()]);
 					expect(sentTypes(made, 'bob')).to.deep.equal([]);
-					expect(stateOf(bob, channelId).state).to.equal(ChannelState.NORMAL);
+					expect(stateOf(bob, channelId).state).to.equal(
+						ChannelState.AWAITING_REESTABLISH
+					);
 				} else {
 					expect(errors.join('; ')).to.include(
 						'Invalid asset shutdown descriptor'
@@ -702,6 +723,7 @@ describe('the cooperative close of an asset channel (issue #2093)', function () 
 				});
 				const { alice, bob, channelId, hex } = made;
 				const host = who === 'proposer' ? alice : bob;
+				const drops = dropsOf(host);
 				const errors: string[] = [];
 				host.node
 					.getChannelManager()
@@ -715,6 +737,9 @@ describe('the cooperative close of an asset channel (issue #2093)', function () 
 				await settle();
 				expect(errors).to.deep.equal([
 					refused(hex, 'a cooperative close', 'no proof for the close')
+				]);
+				expect(drops).to.deep.equal([
+					(host === alice ? bob : alice).node.getNodeId()
 				]);
 				// The shutdowns went, and then: the proposer sent no offer, or
 				// the responder answered the offer with nothing at all.
@@ -731,7 +756,7 @@ describe('the cooperative close of an asset channel (issue #2093)', function () 
 					sentTypes(made, host === alice ? 'alice' : 'bob')
 				).to.not.include(MessageType.ERROR);
 				expect(stateOf(host, channelId).state).to.equal(
-					ChannelState.NEGOTIATING_CLOSING
+					ChannelState.AWAITING_REESTABLISH
 				);
 				expect(
 					stateOf(host, channelId).auxiliaryState!.closeTransactions
@@ -844,7 +869,8 @@ describe('the cooperative close of an asset channel (issue #2093)', function () 
 						alice: { provider: wrap(referenceProvider()) }
 					}
 				);
-				const { alice, channelId, hex } = made;
+				const { alice, bob, channelId, hex } = made;
+				const drops = dropsOf(alice);
 				const errors: string[] = [];
 				alice.node
 					.getChannelManager()
@@ -858,6 +884,7 @@ describe('the cooperative close of an asset channel (issue #2093)', function () 
 				expect(errors).to.deep.equal([
 					`The asset provider refused a cooperative close (channel ${hex}): ${cause}`
 				]);
+				expect(drops).to.deep.equal([bob.node.getNodeId()]);
 				expect(sentTypes(made)).to.not.include(MessageType.CLOSING_SIGNED);
 				expect(
 					stateOf(alice, channelId).auxiliaryState!.closeTransactions
