@@ -842,4 +842,126 @@ describe('The cooperative close of an asset channel under review (#2093)', funct
 			}
 		});
 	}
+
+	it('takes a provider that fails while the signature of the peer is judged for its own failure, not for a bad signature', async () => {
+		// Bob answers the first buildClose of the round and fails the second,
+		// the one made to judge Alice's partial signature.
+		const reference = referenceProvider();
+		let calls = 0;
+		const made = await pair('review9-verify-throw', {
+			bob: {
+				provider: {
+					...reference,
+					buildClose(context) {
+						calls++;
+						if (calls === 2) throw new Error('asset store busy');
+						return reference.buildClose(context);
+					}
+				}
+			}
+		});
+		const { alice, bob, channelId, hex } = made;
+		expect(alice.node.closeChannel(channelId, DESTINATION)).to.deep.equal({
+			ok: true
+		});
+		await settle();
+		expect(calls).to.equal(2);
+		// A local refusal and a dropped connection: the peer is not blamed,
+		// the channel is not failed, nothing is signed.
+		expect(made.managerErrors.bob).to.deep.equal([
+			refusedBy(hex, 'a cooperative close', 'asset store busy')
+		]);
+		expect(made.managerErrors.alice).to.deep.equal([]);
+		expect(sent(made, 'bob')).to.not.include(MessageType.ERROR);
+		expect(sent(made, 'bob')).to.not.include(MessageType.CLOSING_SIGNED);
+		expect(made.disconnects.bob).to.deep.equal([alice.node.getNodeId()]);
+		expect(made.published).to.deep.equal({ alice: [], bob: [] });
+		expect(stateOf(bob, channelId).auxiliaryState!.closeTransactions).to.equal(
+			undefined
+		);
+		// The close completes at the next connection.
+		await honourDrops(made);
+		expect(made.managerErrors.bob).to.have.length(1);
+		for (const host of [alice, bob]) {
+			expect(stateOf(host, channelId).state).to.equal(ChannelState.CLOSED);
+		}
+	});
+
+	it('still fails the channel for a signature of the peer that does not verify', async () => {
+		const made = await pair('review9-verify-bad');
+		const { alice, bob, channelId } = made;
+		// The last byte of Alice's partial signature is changed on the way.
+		const deliver = bob.node.handlePeerMessage.bind(bob.node);
+		bob.node.handlePeerMessage = ((
+			peer: string,
+			type: number,
+			payload: Buffer
+		) => {
+			if (type !== MessageType.CLOSING_SIGNED) {
+				return deliver(peer, type, payload);
+			}
+			const changed = Buffer.from(payload);
+			changed[changed.length - 1] ^= 1;
+			return deliver(peer, type, changed);
+		}) as typeof bob.node.handlePeerMessage;
+		expect(alice.node.closeChannel(channelId, DESTINATION)).to.deep.equal({
+			ok: true
+		});
+		await settle();
+		expect(made.managerErrors.bob.join('; ')).to.include(
+			'Coop-close: peer closing partial signature failed to verify'
+		);
+		expect(made.managerErrors.bob.join('; ')).to.not.include(
+			'The asset provider refused'
+		);
+		expect(sent(made, 'bob')).to.include(MessageType.ERROR);
+		expect(sent(made, 'bob')).to.not.include(MessageType.CLOSING_SIGNED);
+		expect(stateOf(bob, channelId).state).to.not.equal(ChannelState.CLOSED);
+	});
+
+	it('asks what outputs the close adds once in a round, so that a later ask cannot fail in the middle of it', async () => {
+		// Bob's provider answers the first ask and fails every later one.
+		const split = withSeparateAnchors(referenceProvider());
+		let asks = 0;
+		const made = await pair('review9-shape-once', {
+			alice: { provider: withSeparateAnchors(referenceProvider()) },
+			bob: {
+				provider: {
+					...split,
+					extraCloseOutputScriptLengths(state) {
+						asks++;
+						if (asks > 1) throw new Error('asset store busy');
+						return split.extraCloseOutputScriptLengths!(state);
+					}
+				}
+			}
+		});
+		const { alice, bob, channelId } = made;
+		const thrown: string[] = [];
+		const deliver = bob.node.handlePeerMessage.bind(bob.node);
+		bob.node.handlePeerMessage = ((
+			peer: string,
+			type: number,
+			payload: Buffer
+		) => {
+			try {
+				return deliver(peer, type, payload);
+			} catch (err) {
+				thrown.push(String(err));
+			}
+		}) as typeof bob.node.handlePeerMessage;
+		expect(alice.node.closeChannel(channelId, DESTINATION)).to.deep.equal({
+			ok: true
+		});
+		await settle();
+		// The responder has one round, the proposal it answers: one ask.
+		expect(asks).to.equal(1);
+		expect(thrown).to.deep.equal([]);
+		expect(
+			made.managerErrors.alice.concat(made.managerErrors.bob)
+		).to.deep.equal([]);
+		for (const host of [alice, bob]) {
+			expect(stateOf(host, channelId).state).to.equal(ChannelState.CLOSED);
+		}
+	});
 });

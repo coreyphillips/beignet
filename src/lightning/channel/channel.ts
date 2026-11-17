@@ -9136,6 +9136,10 @@ export class Channel {
 	 */
 	private _closingWeight(baseWeight: number): number {
 		if (!this._state.auxiliaryState) return baseWeight;
+		// A round of the close asks once: see _auxiliaryCloseShapeRefusal.
+		if (this._auxiliaryCloseExtraWeight !== undefined) {
+			return baseWeight + this._auxiliaryCloseExtraWeight;
+		}
 		try {
 			return auxiliaryClosingWeight(this._state, baseWeight);
 		} catch (err) {
@@ -9143,11 +9147,26 @@ export class Channel {
 		}
 	}
 
-	/** Null when the provider can say what outputs its close adds, else the refusal. */
+	/**
+	 * The weight the provider's outputs add to the close, as it said at the
+	 * start of the round of the negotiation now being handled. Kept so that
+	 * the fee, the band and the relay floor of one round are priced from one
+	 * answer, and so that no later ask of the same round can fail in the
+	 * middle of a handler. Asked again at every round, forgotten with the
+	 * connection.
+	 */
+	private _auxiliaryCloseExtraWeight: number | undefined;
+
+	/**
+	 * Null when the provider can say what outputs its close adds, else the
+	 * refusal. Called first at each entry point of the negotiation: the one
+	 * ask of the round.
+	 */
 	private _auxiliaryCloseShapeRefusal(): ChannelAction[] | null {
 		if (!this._state.auxiliaryState) return null;
+		this._auxiliaryCloseExtraWeight = undefined;
 		try {
-			auxiliaryClosingWeight(this._state, 0);
+			this._auxiliaryCloseExtraWeight = auxiliaryClosingWeight(this._state, 0);
 			return null;
 		} catch (err) {
 			return this._auxiliaryCloseRefused(err);
@@ -9992,8 +10011,23 @@ export class Channel {
 			];
 		}
 
-		const peerSigValid = (feeSatoshis: bigint): boolean =>
-			!verifyClosingFn || verifyClosingFn(feeSatoshis, msg.partialSignature!);
+		// An asset channel: the close is built before the signature can be
+		// judged over it, and the judge throws when it could not be built.
+		// That is this node's failure (its provider's refusal) and never a
+		// bad signature of the peer, whatever the answer below would be.
+		const judged: { refusal?: ChannelAction[] } = {};
+		const peerSigValid = (feeSatoshis: bigint): boolean => {
+			if (!verifyClosingFn) return true;
+			if (!this._state.auxiliaryState) {
+				return verifyClosingFn(feeSatoshis, msg.partialSignature!);
+			}
+			try {
+				return verifyClosingFn(feeSatoshis, msg.partialSignature!);
+			} catch (err) {
+				judged.refusal = this._auxiliaryCloseRefused(err);
+				return false;
+			}
+		};
 		const assetShapeRefusal = this._auxiliaryCloseShapeRefusal();
 		if (assetShapeRefusal) return assetShapeRefusal;
 
@@ -10011,6 +10045,7 @@ export class Channel {
 			const assetCloseRefusal = this._auxiliaryCloseRefusal(msg.feeSatoshis);
 			if (assetCloseRefusal) return assetCloseRefusal;
 			if (!peerSigValid(msg.feeSatoshis)) {
+				if (judged.refusal) return judged.refusal;
 				return this._failChannelWithWireError(
 					'Coop-close: peer closing partial signature failed to verify'
 				);
@@ -10132,6 +10167,7 @@ export class Channel {
 		const assetCloseRefusal = this._auxiliaryCloseRefusal(msg.feeSatoshis);
 		if (assetCloseRefusal) return assetCloseRefusal;
 		if (!peerSigValid(msg.feeSatoshis)) {
+			if (judged.refusal) return judged.refusal;
 			return this._failChannelWithWireError(
 				'Coop-close: peer closing partial signature failed to verify'
 			);
@@ -11323,6 +11359,7 @@ export class Channel {
 		// half-collected batch would pair signatures across two deliveries.
 		this._pendingBatch = null;
 		this._auxiliaryAwaitingDisconnect = false;
+		this._auxiliaryCloseExtraWeight = undefined;
 
 		// Quiescence never survives a disconnect (BOLT 2 quiescence).
 		this._quiescence.reset();

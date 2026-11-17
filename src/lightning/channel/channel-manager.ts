@@ -6453,12 +6453,29 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		feeSatoshis: bigint,
 		theirSig: Buffer
 	): boolean {
-		try {
-			if (isTaprootChannel(channel.getFullState().channelType)) {
-				const cache = this.getOrCreateTaprootClosingSession(
+		// An asset channel: the session the signature is judged over is built
+		// first and on its own. That it could not be built is this node's
+		// failure, its provider's refusal, and is thrown to the channel under
+		// the typed error. Only a signature that does not verify over a
+		// session that was built is the peer's.
+		let assetSession: ITaprootClosingCache | null | undefined;
+		const assetState = channel.getFullState();
+		if (assetState.auxiliaryState) {
+			try {
+				assetSession = this.getOrCreateTaprootClosingSession(
 					channel,
 					feeSatoshis
 				);
+			} catch (err) {
+				throw auxiliaryProviderError(assetState, 'a cooperative close', err);
+			}
+		}
+		try {
+			if (isTaprootChannel(channel.getFullState().channelType)) {
+				const cache =
+					assetSession !== undefined
+						? assetSession
+						: this.getOrCreateTaprootClosingSession(channel, feeSatoshis);
 				if (!cache) return false;
 				const remoteNonce = channel.getClosingNonces().remote;
 				if (!remoteNonce) return false;
