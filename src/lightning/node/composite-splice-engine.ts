@@ -794,6 +794,9 @@ export class CompositeSpliceEngine {
 	): Promise<string | null> {
 		const channelId = channel.getChannelId()!;
 		const state = channel.getFullState();
+		// An asset channel is never spliced: its funding output carries the
+		// asset commitment, and its bitcoin is not there to be paid out.
+		if (state.auxiliaryState) return 'an asset channel is not spliced';
 		if (this.isChannelReserved(channelId)) {
 			return 'reserved by a live composite splice';
 		}

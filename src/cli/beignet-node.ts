@@ -14961,6 +14961,9 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 			const channelId = channel.getChannelId();
 			if (!channelId) continue;
 			if (channel.getState() !== ChannelState.NORMAL) continue;
+			// An asset channel is never spliced, and its bitcoin only carries
+			// asset outputs: it is no channel a send could be taken from.
+			if (channel.getFullState().auxiliaryState) continue;
 			if (channel.spliceBusyReason()) continue;
 			if (channel.getFullState().spliceInFlight) continue;
 			const peer = manager.getPeerForChannel(channelId);

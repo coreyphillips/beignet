@@ -83,6 +83,7 @@ import {
 	payInfoRequiresUnknownFeature,
 	resolveIntroductionNode
 } from '../onion/blinded-path';
+import { auxiliaryUnsupported } from '../channel/auxiliary-guard';
 import type { IPerChannelKeys } from '../channel/channel-manager';
 import { ChannelManager, txInputOutpoints } from '../channel/channel-manager';
 import type { ChannelResult } from '../channel/types';
@@ -15256,6 +15257,14 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				`Channel not found: ${channelId.toString('hex')}`
 			);
 		}
+		// An asset channel is never spliced, so it is quoted no amount: its
+		// bitcoin only carries asset outputs and none of it could be taken
+		// out or added to.
+		const assetRefusal = auxiliaryUnsupported(
+			channel.getFullState(),
+			'a splice'
+		);
+		if (assetRefusal) throw new InvalidSpliceError(assetRefusal.message);
 
 		if (direction === 'out') {
 			const destination = this._spliceOutDestination(destinationScript);
