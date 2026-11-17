@@ -2591,7 +2591,7 @@ function resolveOurTaprootCommitmentOutputs(
 		return {
 			auxiliaryFunding: {
 				prevout: { script: Buffer.from(prevoutScript), value: output.amount },
-				finalize: (funded) => {
+				finalize: (funded, prevouts) => {
 					const assets = prepareAuxiliarySweep(
 						state,
 						true,
@@ -2610,7 +2610,26 @@ function resolveOurTaprootCommitmentOutputs(
 					if (assets.assets && !assets.ok) {
 						return { ok: false, refusal: assets.refusal };
 					}
-					funded.setWitness(0, witness);
+					// The node's own signature is made here, over the whole
+					// transaction with its fee inputs (SIGHASH_DEFAULT), and so
+					// again for every transaction a fee raise makes. The one
+					// made over the bare spend allows added inputs, as the
+					// peer's must, and with both of that kind anybody could
+					// put this input and its witness into a transaction of
+					// their own, under another transaction id. The peer's
+					// stays as the commitment round gave it; only this node
+					// can make the other.
+					const own = signTaprootHtlcLeaf(
+						funded.hashForWitnessV1(
+							0,
+							prevouts.scripts,
+							prevouts.values.map(Number),
+							bitcoin.Transaction.SIGHASH_DEFAULT,
+							tapleafHash(witness[witness.length - 2], described.leafVersion)
+						),
+						privateKey
+					);
+					funded.setWitness(0, [witness[0], own, ...witness.slice(2)]);
 					return {
 						ok: true,
 						...(assets.assets ? { data: assets.data } : {})

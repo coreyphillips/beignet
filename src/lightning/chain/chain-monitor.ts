@@ -2572,13 +2572,14 @@ export class ChainMonitor {
 
 	/**
 	 * Asset channels: how each HTLC with units ended on the chain, once the
-	 * spend of its output is irrevocable. An HTLC this node offered has
-	 * failed when this node's own spend took the output back (the timeout)
-	 * and is fulfilled when the peer's did (it showed the preimage); one it
-	 * received is fulfilled when its own spend took it (the preimage) and
-	 * has failed when the peer's did. Nothing is read from the outputs of
-	 * a revoked commitment, whose HTLCs are not the channel's, and nothing
-	 * for any other channel.
+	 * spend of its output is irrevocable. An HTLC is fulfilled when the
+	 * witness of the input that spent its output shows the preimage of its
+	 * payment hash, and has failed when it shows none (the timeout). The
+	 * ending is not read from whether the transaction that confirmed is
+	 * one this node made: a transaction id cannot say that for a spend
+	 * whose signatures let anybody add inputs (_spendShowsPreimage).
+	 * Nothing is read from the outputs of a revoked commitment, whose
+	 * HTLCs are not the channel's, and nothing for any other channel.
 	 *
 	 * An HTLC this node received and will not claim is in the list as
 	 * failed before any spend of its output: once its expiry has passed and
@@ -2654,6 +2655,10 @@ export class ChainMonitor {
 				}
 				continue;
 			}
+			// What the spend shows says how the HTLC ended. Only while the
+			// spend itself is not held is it read from whose transaction it
+			// was, by the list of this node's own.
+			const shown = this._spendShowsPreimage(output);
 			const ours =
 				output.auxiliarySweepAttempts?.[output.resolutionTxid] !== undefined;
 			endings.push({
@@ -2661,12 +2666,47 @@ export class ChainMonitor {
 				outputIndex: output.outputIndex,
 				htlcId: output.htlcId,
 				offered,
-				outcome: offered === ours ? 'failed' : 'fulfilled',
+				outcome:
+					shown === undefined
+						? offered === ours
+							? 'failed'
+							: 'fulfilled'
+						: shown
+						? 'fulfilled'
+						: 'failed',
 				recorded: output.auxiliaryOutcomeRecorded === true
 			});
 		}
 		endings.push(...this._auxiliaryAbsentHtlcEndings(broadcast));
 		return endings;
+	}
+
+	/**
+	 * Whether the spend of an HTLC output shows the preimage of the
+	 * HTLC's payment hash: an element of 32 bytes that hashes to it, in the
+	 * witness of the input that spends the output. Undefined while the
+	 * spend is not held, or is not the transaction the output was spent
+	 * by.
+	 */
+	private _spendShowsPreimage(output: ITrackedOutput): boolean | undefined {
+		const paymentHash = output.paymentHash;
+		if (!output.resolutionTxHex || !paymentHash) return undefined;
+		try {
+			const spend = bitcoin.Transaction.fromHex(output.resolutionTxHex);
+			if (spend.getId() !== output.resolutionTxid) return undefined;
+			const input = spend.ins.find(
+				(candidate) =>
+					candidate.index === output.outputIndex &&
+					Buffer.from(candidate.hash).reverse().toString('hex') === output.txid
+			);
+			if (!input) return undefined;
+			return input.witness.some(
+				(element) =>
+					element.length === 32 && sha256(element).equals(paymentHash)
+			);
+		} catch {
+			return undefined;
+		}
 	}
 
 	/**
