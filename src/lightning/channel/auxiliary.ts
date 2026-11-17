@@ -92,6 +92,15 @@ export interface IAuxiliaryHtlcResolution {
 	auxiliaryAmount: bigint;
 	customRecords?: CustomRecords;
 	outcome: 'fulfilled' | 'failed';
+	/**
+	 * Only on a failed outcome of an HTLC this node received: the node had
+	 * decided to settle it and its preimage left the node, in a fulfil made
+	 * in the channel or in a claim it signed for the chain, and the payer
+	 * took the output back all the same. The payer may hold the preimage,
+	 * and the HTLC was not received. An ordinary failure does not carry
+	 * it.
+	 */
+	preimageRevealed?: true;
 }
 
 /** Optional peer-specific compatibility using standard BOLT 2 CSV fields. */

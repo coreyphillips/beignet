@@ -4217,22 +4217,49 @@ export class Channel {
 	 * Asset channels: keep the ending an HTLC had on the chain, for the
 	 * host, in the list the endings off chain are kept in. False for a
 	 * channel without asset state and for an HTLC it does not hold or that
-	 * carries no units.
+	 * carries no units. `claimSigned` says that the node signed a claim of
+	 * the HTLC for the chain; with it, or with a fulfil made in the
+	 * channel, a failed ending of an HTLC the node decided to settle
+	 * carries preimageRevealed.
 	 */
 	recordAuxiliaryChainResolution(
 		direction: HtlcDirection,
 		htlcId: bigint,
-		outcome: 'fulfilled' | 'failed'
+		outcome: 'fulfilled' | 'failed',
+		claimSigned = false
 	): boolean {
 		const auxiliary = this._state.auxiliaryState;
-		const entry = this._state.htlcs.get(
+		const held = this._state.htlcs.get(
 			`${
 				direction === HtlcDirection.OFFERED ? 'offered' : 'received'
 			}-${htlcId}`
 		);
+		// A removal this node's own commitment keeps left the map when the
+		// peer revoked for it, and was told then: fulfilled, or failed. The
+		// chain adds to that only when it says otherwise, which it can for
+		// one alone: the HTLC this node fulfilled and the payer took back.
+		const kept =
+			held === undefined && direction === HtlcDirection.RECEIVED
+				? (this._state.signedLocalRemovals ?? []).find(
+						(removal) =>
+							removal.direction === HtlcDirection.RECEIVED &&
+							removal.id === htlcId
+				  )
+				: undefined;
+		const entry = held ?? kept;
 		if (!auxiliary || !entry || entry.auxiliaryAmount === undefined) {
 			return false;
 		}
+		if (kept && !(outcome === 'failed' && kept.state === HtlcState.FULFILLED)) {
+			return false;
+		}
+		// The preimage left the node: in the fulfil it made, or in a claim
+		// it signed for the chain.
+		const revealed =
+			direction === HtlcDirection.RECEIVED &&
+			outcome === 'failed' &&
+			auxiliary.htlcDecisions?.get(htlcId.toString())?.outcome === 'settle' &&
+			(entry.state === HtlcState.FULFILLED || claimSigned);
 		auxiliary.resolvedHtlcs ??= new Map();
 		auxiliary.resolvedHtlcs.set(`${entry.direction}:${entry.id}`, {
 			htlcId: entry.id,
@@ -4242,7 +4269,8 @@ export class Channel {
 			...(entry.customRecords !== undefined
 				? { customRecords: copyCustomRecords(entry.customRecords) }
 				: {}),
-			outcome
+			outcome,
+			...(revealed ? { preimageRevealed: true as const } : {})
 		});
 		return true;
 	}

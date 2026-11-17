@@ -12058,7 +12058,8 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			const kept = channel.recordAuxiliaryChainResolution(
 				ending.offered ? HtlcDirection.OFFERED : HtlcDirection.RECEIVED,
 				ending.htlcId,
-				ending.outcome
+				ending.outcome,
+				ending.claimSigned === true
 			);
 			if (kept) {
 				if (!peerPubkey) continue;
@@ -12082,6 +12083,60 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		if (recorded === 0) return;
 		this.emit('monitor:updated', channelIdHex, monitor);
 		this._notifyAuxiliaryResolutions(channel);
+	}
+
+	/**
+	 * Asset channels: the HTLCs this node received and decided to settle
+	 * whose expiry has passed with no claim of the node in a block, each
+	 * given once (ChainMonitor.takeAuxiliaryClaimsPastExpiry). The monitor
+	 * that marked one is stored.
+	 */
+	takeAuxiliaryClaimsPastExpiry(): Array<{
+		channelId: Buffer;
+		htlcId: bigint;
+		cltvExpiry: number;
+	}> {
+		const late: ReturnType<ChannelManager['takeAuxiliaryClaimsPastExpiry']> =
+			[];
+		for (const [hex, monitor] of this.monitors) {
+			if (typeof monitor.takeAuxiliaryClaimsPastExpiry !== 'function') continue;
+			const taken = monitor.takeAuxiliaryClaimsPastExpiry();
+			if (taken.length === 0) continue;
+			this.emit('monitor:updated', hex, monitor);
+			const channelId = Buffer.from(hex, 'hex');
+			for (const one of taken) late.push({ channelId, ...one });
+		}
+		return late;
+	}
+
+	/**
+	 * Asset channels: the HTLCs this node received and decided to settle
+	 * that the payer took back on the chain for good, with the payment
+	 * hash of each, for a caller that keeps a record of the payment.
+	 */
+	auxiliaryClaimsLost(): Array<{
+		channelId: Buffer;
+		htlcId: bigint;
+		paymentHash: Buffer;
+	}> {
+		const lost: ReturnType<ChannelManager['auxiliaryClaimsLost']> = [];
+		for (const [hex, monitor] of this.monitors) {
+			const channel = this.channels.get(hex);
+			if (!channel || typeof monitor.auxiliaryHtlcEndings !== 'function') {
+				continue;
+			}
+			for (const ending of monitor.auxiliaryHtlcEndings()) {
+				if (!ending.lost) continue;
+				const decision = channel.auxiliaryHtlcDecision(ending.htlcId);
+				if (decision?.outcome !== 'settle') continue;
+				lost.push({
+					channelId: Buffer.from(hex, 'hex'),
+					htlcId: ending.htlcId,
+					paymentHash: sha256(decision.preimage)
+				});
+			}
+		}
+		return lost;
 	}
 
 	/**

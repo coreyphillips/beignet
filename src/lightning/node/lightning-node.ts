@@ -24795,6 +24795,8 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 
 		this.endAssetHoldsEndedOnChain();
 		this.failAssetPaymentsEndedOnChain();
+		this.noteAssetClaimsPastExpiry();
+		this.failAssetReceiptsLostOnChain();
 
 		this.resolveAssetHoldsLeftBehind(height);
 		// A set with an outcome already chosen retries that outcome instead:
@@ -33463,6 +33465,68 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				clamped
 			});
 		});
+	}
+
+	/**
+	 * Asset channels: one error for each HTLC this node decided to settle
+	 * whose expiry passes with no claim of the node in a block (issue
+	 * #2093 step 10). From that height the payer can take the output back,
+	 * and the host should know now, not when a spend is 100 blocks deep.
+	 * The claim is still tried after it: this is not yet the loss.
+	 */
+	private noteAssetClaimsPastExpiry(): void {
+		for (const late of this.channelManager.takeAuxiliaryClaimsPastExpiry()) {
+			this.emit('node:error', {
+				code: 'ASSET_HTLC_CLAIM_UNCONFIRMED_AT_EXPIRY',
+				channelId: late.channelId,
+				message: `HTLC ${
+					late.htlcId
+				} of asset channel ${late.channelId.toString(
+					'hex'
+				)}, which this node decided to settle, passed its expiry ${
+					late.cltvExpiry
+				} with no claim of this node in a block: the payer can take its output back from here on`,
+				timestamp: Date.now()
+			});
+		}
+	}
+
+	/**
+	 * Asset channels: the record of a payment this node counted as
+	 * received follows the chain (issue #2093 step 10). The node fulfilled
+	 * the HTLC in the channel, so the record is COMPLETED, and the payer
+	 * then took the output back on the chain: the units were not received.
+	 * The record goes FAILED and payment:failed says so; the host is told
+	 * of the HTLC itself through onHtlcResolved, failed with
+	 * preimageRevealed. Read from the chain monitor on every block, so a
+	 * restart loses none.
+	 */
+	private failAssetReceiptsLostOnChain(): void {
+		for (const lost of this.channelManager.auxiliaryClaimsLost()) {
+			const hashHex = lost.paymentHash.toString('hex');
+			const payment = this.payments.get(hashHex);
+			if (
+				!payment ||
+				payment.direction !== PaymentDirection.INCOMING ||
+				payment.status !== PaymentStatus.COMPLETED ||
+				!payment.settledHtlcs?.includes(
+					`${lost.channelId.toString('hex')}:${lost.htlcId}`
+				)
+			) {
+				continue;
+			}
+			payment.status = PaymentStatus.FAILED;
+			this.safeStorage(
+				() => this.persistPayment(lost.paymentHash),
+				'persistPayment'
+			);
+			this.emitStructuredLog('htlc', 'asset_htlc_claim_lost', {
+				paymentHash: hashHex,
+				channelId: lost.channelId.toString('hex'),
+				htlcId: lost.htlcId.toString()
+			});
+			this.emit('payment:failed', payment);
+		}
 	}
 
 	/**

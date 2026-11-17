@@ -2598,6 +2598,8 @@ export class ChainMonitor {
 		outcome: 'fulfilled' | 'failed';
 		recorded: boolean;
 		absent?: true;
+		lost?: true;
+		claimSigned?: true;
 	}> {
 		const broadcast = this._commitmentBroadcast;
 		const type = broadcast?.commitmentType;
@@ -2661,24 +2663,79 @@ export class ChainMonitor {
 			const shown = this._spendShowsPreimage(output);
 			const ours =
 				output.auxiliarySweepAttempts?.[output.resolutionTxid] !== undefined;
+			const fulfilled = shown === undefined ? offered !== ours : shown;
+			// An HTLC this node received and decided to settle, whose output
+			// the payer took back: a claim that lost. Said with whether a
+			// claim that carries the preimage was ever signed.
+			const lost =
+				!offered &&
+				!fulfilled &&
+				auxiliaryHtlcDecisionOf(this._channelState, output.htlcId)?.outcome ===
+					'settle';
 			endings.push({
 				txid: output.txid,
 				outputIndex: output.outputIndex,
 				htlcId: output.htlcId,
 				offered,
-				outcome:
-					shown === undefined
-						? offered === ours
-							? 'failed'
-							: 'fulfilled'
-						: shown
-						? 'fulfilled'
-						: 'failed',
-				recorded: output.auxiliaryOutcomeRecorded === true
+				outcome: fulfilled ? 'fulfilled' : 'failed',
+				recorded: output.auxiliaryOutcomeRecorded === true,
+				...(lost ? { lost: true as const } : {}),
+				// Signed and funded: an unfunded spend is kept without a witness.
+				...(lost && Object.keys(output.auxiliarySweepAttempts ?? {}).length > 0
+					? { claimSigned: true as const }
+					: {})
 			});
 		}
 		endings.push(...this._auxiliaryAbsentHtlcEndings(broadcast));
 		return endings;
+	}
+
+	/**
+	 * Asset channels: the HTLCs this node received and decided to settle
+	 * whose expiry has passed with no claim of the node in a block. From
+	 * that height on the payer can take the output back, so this is when
+	 * a claim is late, whatever becomes of it after. Each is given once:
+	 * the output is marked, and the caller stores the monitor.
+	 */
+	takeAuxiliaryClaimsPastExpiry(): Array<{
+		htlcId: bigint;
+		cltvExpiry: number;
+	}> {
+		const type = this._commitmentBroadcast?.commitmentType;
+		if (
+			!this._channelState.auxiliaryState ||
+			(type !== CommitmentType.OUR_COMMITMENT &&
+				type !== CommitmentType.THEIR_CURRENT_COMMITMENT)
+		) {
+			return [];
+		}
+		const late: ReturnType<ChainMonitor['takeAuxiliaryClaimsPastExpiry']> = [];
+		for (const output of this._trackedOutputs) {
+			if (
+				output.isSecondLevelHtlc ||
+				output.outputType !== OutputType.RECEIVED_HTLC ||
+				output.auxiliaryCommitmentNumber === undefined ||
+				output.htlcId === undefined ||
+				output.auxiliaryClaimLateNoted === true ||
+				output.cltvExpiry === undefined ||
+				output.cltvExpiry <= 0 ||
+				this._currentBlockHeight < output.cltvExpiry ||
+				auxiliaryHtlcDecisionOf(this._channelState, output.htlcId)?.outcome !==
+					'settle'
+			) {
+				continue;
+			}
+			// A claim of the node in a block shows the preimage.
+			if (
+				output.resolutionTxid !== undefined &&
+				this._spendShowsPreimage(output) === true
+			) {
+				continue;
+			}
+			output.auxiliaryClaimLateNoted = true;
+			late.push({ htlcId: output.htlcId, cltvExpiry: output.cltvExpiry });
+		}
+		return late;
 	}
 
 	/**

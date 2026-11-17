@@ -124,6 +124,12 @@ export interface ITrackedOutput {
 	 * channel's row for its host (onHtlcResolved).
 	 */
 	auxiliaryOutcomeRecorded?: true;
+	/**
+	 * Asset channels: the expiry of this HTLC, which the node decided to
+	 * settle, passed with no claim of the node in a block, and that was
+	 * said (ChainMonitor.takeAuxiliaryClaimsPastExpiry).
+	 */
+	auxiliaryClaimLateNoted?: true;
 
 	/**
 	 * The spend of this output waits for a fee input: the code and the

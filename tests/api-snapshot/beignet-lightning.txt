@@ -110,7 +110,7 @@ property ISerializedAuxiliaryState.openingCsvPolicy?: channel.IChannelAuxiliaryS
 property ISerializedAuxiliaryState.remoteBalance: string
 property ISerializedAuxiliaryState.remoteCommitments: [ string, ISerializedAuxiliaryCommitment ][]
 property ISerializedAuxiliaryState.remoteShutdownRecords?: SerializedCustomRecords
-property ISerializedAuxiliaryState.resolvedHtlcs?: [ string, { htlcId: string; direction: channel.HtlcDirection; paymentHash: string; auxiliaryAmount: string; customRecords?: SerializedCustomRecords; outcome: 'fulfilled' | 'failed'; } ][]
+property ISerializedAuxiliaryState.resolvedHtlcs?: [ string, { htlcId: string; direction: channel.HtlcDirection; paymentHash: string; auxiliaryAmount: string; customRecords?: SerializedCustomRecords; outcome: 'fulfilled' | 'failed'; preimageRevealed?: true; } ][]
 property ISerializedAuxiliaryState.revokedCommitments?: [ string, ISerializedAuxiliaryCommitment ][]
 property ISerializedAuxiliaryState.unrecordedCloseTxid?: string
 unexported interface ISpliceUtxo
@@ -608,7 +608,7 @@ constructor chain.ChainBackendUnavailableError(message: string)
 class chain.ChainMonitor
 constructor chain.ChainMonitor(channelState: channel.IChannelState, destinationScript: Buffer, feeRatePerVbyte: number, revocationBasepointSecret: Buffer, paymentPrivkey: Buffer, network?: bitcoinjs-lib#Network, delayedPaymentBasepointSecret?: Buffer, htlcBasepointSecret?: Buffer)
 method chain.ChainMonitor.addPreimage(paymentHash: Buffer, preimage: Buffer): chain.ChainAction[]
-method chain.ChainMonitor.auxiliaryHtlcEndings(): Array<{ txid: string; outputIndex: number; htlcId: bigint; offered: boolean; outcome: 'fulfilled' | 'failed'; recorded: boolean; absent?: true; }>
+method chain.ChainMonitor.auxiliaryHtlcEndings(): Array<{ txid: string; outputIndex: number; htlcId: bigint; offered: boolean; outcome: 'fulfilled' | 'failed'; recorded: boolean; absent?: true; lost?: true; claimSigned?: true; }>
 method chain.ChainMonitor.dropUnusedPreimages(heldElsewhere: ReadonlyMap<string, Buffer>): number
 method chain.ChainMonitor.fixedOutputFeeRaise(output: chain.ITrackedOutput, feeRatePerVbyte: number): chain.IFeeBumpAndBroadcastChainAction | undefined
 method chain.ChainMonitor.fixedOutputFeeResolved(txid: string, outputIndex: number, evenIfNotOpen?: boolean): { spendingTransaction?: Buffer; } | undefined
@@ -638,6 +638,7 @@ method chain.ChainMonitor.rebuildSweeps(output: chain.ITrackedOutput, feeRatePer
 static method chain.ChainMonitor.restore(saved: chain.IChainMonitorState, channelState: channel.IChannelState, destinationScript: Buffer, feeRatePerVbyte: number, revocationBasepointSecret: Buffer, paymentPrivkey: Buffer, network?: bitcoinjs-lib#Network, delayedPaymentBasepointSecret?: Buffer, htlcBasepointSecret?: Buffer): chain.ChainMonitor
 method chain.ChainMonitor.setChannelState(channelState: channel.IChannelState): void
 method chain.ChainMonitor.setDestinationScript(destinationScript: Buffer): void
+method chain.ChainMonitor.takeAuxiliaryClaimsPastExpiry(): Array<{ htlcId: bigint; cltvExpiry: number; }>
 method chain.ChainMonitor.updateFeeRate(feeRatePerKw: number): chain.ChainAction[]
 method chain.ChainMonitor.wantsPreimage(paymentHash: Buffer): boolean
 class chain.ChainWatcher extends EventEmitter
@@ -905,6 +906,7 @@ property chain.IToRemoteClaimParams.feeSatoshis: bigint
 property chain.IToRemoteClaimParams.outputIndex: number
 interface chain.ITrackedOutput
 property chain.ITrackedOutput.amount: bigint
+property chain.ITrackedOutput.auxiliaryClaimLateNoted?: true
 property chain.ITrackedOutput.auxiliaryCommitmentNumber?: bigint
 property chain.ITrackedOutput.auxiliaryData?: Buffer
 property chain.ITrackedOutput.auxiliaryFeeActionOpen?: true
@@ -1254,7 +1256,7 @@ method channel.Channel.rebuildAnnouncement(localNodeId: Buffer, remoteNodeId: Bu
 method channel.Channel.receivedHtlcExceedsDustExposure(htlcId: bigint): boolean
 method channel.Channel.receivedHtlcExceedsFunderFee(htlcId: bigint): boolean
 method channel.Channel.receivedHtlcExpiredOnArrival(htlcId: bigint): boolean
-method channel.Channel.recordAuxiliaryChainResolution(direction: channel.HtlcDirection, htlcId: bigint, outcome: 'fulfilled' | 'failed'): boolean
+method channel.Channel.recordAuxiliaryChainResolution(direction: channel.HtlcDirection, htlcId: bigint, outcome: 'fulfilled' | 'failed', claimSigned?: boolean): boolean
 method channel.Channel.recordAuxiliaryCloseCandidate(txid: string, customData: Buffer): void
 method channel.Channel.recordAuxiliaryHtlcDecision(htlcId: bigint, outcome: 'settle' | 'fail', preimage?: Buffer): boolean
 method channel.Channel.recordCloseReason(reason: channel.ChannelCloseReason): boolean
@@ -1379,6 +1381,7 @@ method channel.ChannelManager.armChannelIndexTipFloor(knownTipHeight?: number): 
 method channel.ChannelManager.attachToPeerManager(peerManager: transport.PeerManager): void
 method channel.ChannelManager.autoSignAndSendCommitment(channelId: Buffer): channel.ChannelResult
 method channel.ChannelManager.auxiliaryChannelOnChain(channelId: Buffer): boolean
+method channel.ChannelManager.auxiliaryClaimsLost(): Array<{ channelId: Buffer; htlcId: bigint; paymentHash: Buffer; }>
 method channel.ChannelManager.auxiliaryHtlcChainEnding(channelId: Buffer, direction: channel.HtlcDirection, htlcId: bigint): 'fulfilled' | 'failed' | undefined
 method channel.ChannelManager.auxiliaryHtlcDecision(channelId: Buffer, htlcId: bigint): channel.IAuxiliaryHtlcDecision | undefined
 method channel.ChannelManager.auxiliaryRowWritten(channel: channel.Channel): void
@@ -1481,6 +1484,7 @@ method channel.ChannelManager.setFundingProvider(fundingProvider: node.IFundingP
 method channel.ChannelManager.setJitClients(pubkeyHexes: Iterable<string>): void
 method channel.ChannelManager.setMonitorDestinationScript(destinationScript: Buffer): void
 method channel.ChannelManager.signCommitment(channelId: Buffer, signature: Buffer, htlcSignatures: Buffer[]): channel.ChannelResult
+method channel.ChannelManager.takeAuxiliaryClaimsPastExpiry(): Array<{ channelId: Buffer; htlcId: bigint; cltvExpiry: number; }>
 method channel.ChannelManager.triggerAnnouncementDepth(channelId: Buffer, blockHeight: number, txIndex: number, localNodeId: Buffer, signAnnouncement: (data: Buffer) => { nodeSig: Buffer; bitcoinSig: Buffer; }): void
 method channel.ChannelManager.txSignaturesStillHeld(channel: channel.Channel): boolean
 method channel.ChannelManager.updateChannelFee(channelId: Buffer, feeratePerKw: number): channel.ChannelResult
@@ -1768,6 +1772,7 @@ property channel.IAuxiliaryHtlcResolution.direction: channel.HtlcDirection
 property channel.IAuxiliaryHtlcResolution.htlcId: bigint
 property channel.IAuxiliaryHtlcResolution.outcome: 'fulfilled' | 'failed'
 property channel.IAuxiliaryHtlcResolution.paymentHash: Buffer
+property channel.IAuxiliaryHtlcResolution.preimageRevealed?: true
 interface channel.IAuxiliaryIncomingHtlc
 property channel.IAuxiliaryIncomingHtlc.acceptedHtlcs: readonly { channelId: Buffer; htlcId: bigint; amountMsat: bigint; }[]
 property channel.IAuxiliaryIncomingHtlc.auxiliaryAmount?: bigint
@@ -6549,7 +6554,7 @@ class node.LightningPaymentError extends beignet#CodedError<node.LightningErrorC
 constructor node.LightningPaymentError(code: node.LightningErrorCode, message: string)
 const node.MAX_FEE_RATE_SAT_PER_VBYTE = 5000
 const node.MAX_HELD_PARTS_PER_HASH = 64
-type node.NodeErrorCode = 'AUTO_FUNDING_FAILED' | 'AUTO_RECONNECT_FAILED' | 'BARRIER_DISPATCH_FAILED' | 'BLOCK_WORK_FAILED' | 'BOLT12_INVOICE_ERROR' | 'BROADCAST_FAILED' | 'BROADCAST_PERMANENT_FAILURE' | 'CHAIN_RESTORE_WATCH_FAILED' | 'CHAIN_WATCHER_ERROR' | 'CHAIN_WATCHER_START_FAILED' | 'CHANNEL_ERROR' | 'CHANNEL_FAILED_FORCE_CLOSED' | 'CHANNEL_FAILED_FORCE_CLOSE_FAILED' | 'CLOSE_CHANNEL_FAILED' | 'DURABILITY_BARRIER_TIMEOUT' | 'ERRORED_TIMEOUT_FORCE_CLOSED' | 'FORCE_CLOSE_FAILED' | 'FORCE_CLOSE_REVOKED' | 'FORWARD_TIMEOUT_FORCE_CLOSE' | 'FUNDING_BROADCAST_FAILED' | 'FUNDING_MISSING' | 'GRAPH_RESTORE_FAILED' | 'HTLC_CLAIM_FORCE_CLOSE' | 'HTLC_DEADLINE_HELD' | 'HTLC_EXPIRY_FORCE_CLOSE' | 'IROH_RELAY_ONLY_VIOLATED' | 'LISTEN_FAILED' | 'MESSAGE_TOO_LARGE' | 'NO_ROUTING_HINTS' | 'ONION_MESSAGE_ERROR' | 'ONION_PROCESSING_FAILED' | 'PERSISTENCE_ERROR' | 'PRESPLICE_WATCH_FAILED' | 'PROVIDE_EXTERNAL_WITNESS_FAILED' | 'RBF_OPEN_FAILED' | 'RECOVERY_WATCH_FAILED' | 'REESTABLISH_SECRET_MISSING' | 'REESTABLISH_TIMEOUT_FORCE_CLOSED' | 'SEND_TX_SIGNATURES_FAILED' | 'SPLICE_BROADCAST_REFUSED' | 'SPLICE_INPUT_CONFLICT' | 'SPLICE_IN_FAILED' | 'SPLICE_OUT_FAILED' | 'COMPOSITE_SPLICE_ABORTED' | 'COMPOSITE_SPLICE_RESTORE_FAILED' | 'STARTUP_RECONNECT_FAILED' | 'STARTUP_REPAIR_COMPLETION_FAILED' | 'STARTUP_REPAIR_UNRECEIPTED' | 'STUCK_CHANNEL' | 'STUCK_CHANNEL_FORCE_CLOSED' | 'UPDATE_FEE_FAILED' | 'WAL_CHECKPOINT_FAILED' | 'WATCH_OUTPUT_FAILED'
+type node.NodeErrorCode = 'ASSET_HTLC_CLAIM_UNCONFIRMED_AT_EXPIRY' | 'AUTO_FUNDING_FAILED' | 'AUTO_RECONNECT_FAILED' | 'BARRIER_DISPATCH_FAILED' | 'BLOCK_WORK_FAILED' | 'BOLT12_INVOICE_ERROR' | 'BROADCAST_FAILED' | 'BROADCAST_PERMANENT_FAILURE' | 'CHAIN_RESTORE_WATCH_FAILED' | 'CHAIN_WATCHER_ERROR' | 'CHAIN_WATCHER_START_FAILED' | 'CHANNEL_ERROR' | 'CHANNEL_FAILED_FORCE_CLOSED' | 'CHANNEL_FAILED_FORCE_CLOSE_FAILED' | 'CLOSE_CHANNEL_FAILED' | 'DURABILITY_BARRIER_TIMEOUT' | 'ERRORED_TIMEOUT_FORCE_CLOSED' | 'FORCE_CLOSE_FAILED' | 'FORCE_CLOSE_REVOKED' | 'FORWARD_TIMEOUT_FORCE_CLOSE' | 'FUNDING_BROADCAST_FAILED' | 'FUNDING_MISSING' | 'GRAPH_RESTORE_FAILED' | 'HTLC_CLAIM_FORCE_CLOSE' | 'HTLC_DEADLINE_HELD' | 'HTLC_EXPIRY_FORCE_CLOSE' | 'IROH_RELAY_ONLY_VIOLATED' | 'LISTEN_FAILED' | 'MESSAGE_TOO_LARGE' | 'NO_ROUTING_HINTS' | 'ONION_MESSAGE_ERROR' | 'ONION_PROCESSING_FAILED' | 'PERSISTENCE_ERROR' | 'PRESPLICE_WATCH_FAILED' | 'PROVIDE_EXTERNAL_WITNESS_FAILED' | 'RBF_OPEN_FAILED' | 'RECOVERY_WATCH_FAILED' | 'REESTABLISH_SECRET_MISSING' | 'REESTABLISH_TIMEOUT_FORCE_CLOSED' | 'SEND_TX_SIGNATURES_FAILED' | 'SPLICE_BROADCAST_REFUSED' | 'SPLICE_INPUT_CONFLICT' | 'SPLICE_IN_FAILED' | 'SPLICE_OUT_FAILED' | 'COMPOSITE_SPLICE_ABORTED' | 'COMPOSITE_SPLICE_RESTORE_FAILED' | 'STARTUP_RECONNECT_FAILED' | 'STARTUP_REPAIR_COMPLETION_FAILED' | 'STARTUP_REPAIR_UNRECEIPTED' | 'STUCK_CHANNEL' | 'STUCK_CHANNEL_FORCE_CLOSED' | 'UPDATE_FEE_FAILED' | 'WAL_CHECKPOINT_FAILED' | 'WATCH_OUTPUT_FAILED'
 const node.OUTGOING_CLTV_REJECT_DELTA = 3
 type node.OutgoingHtlcState = 'offered' | 'fulfilled' | 'failed' | 'onchain-pending' | 'onchain-resolved'
 enum node.PaymentDirection

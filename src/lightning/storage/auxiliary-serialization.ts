@@ -13,7 +13,7 @@
 
 import { copyAuxiliaryOpeningCsvPolicy } from '../channel/auxiliary-csv';
 import { ecc } from '../../utils/ecc';
-import type { HtlcDirection } from '../channel/types';
+import { HtlcDirection } from '../channel/types';
 import type {
 	IAuxiliaryCommitmentData,
 	IAuxiliaryHtlcResolution,
@@ -54,6 +54,7 @@ export interface ISerializedAuxiliaryState {
 			auxiliaryAmount: string;
 			customRecords?: SerializedCustomRecords;
 			outcome: 'fulfilled' | 'failed';
+			preimageRevealed?: true;
 		}
 	][];
 	localBalance: string;
@@ -334,7 +335,10 @@ function encodeAuxiliaryState(
 											customRecords: encodeCustomRecords(value.customRecords)
 									  }
 									: {}),
-								outcome: value.outcome
+								outcome: value.outcome,
+								...(value.preimageRevealed === true
+									? { preimageRevealed: true as const }
+									: {})
 							}
 						]
 					)
@@ -447,7 +451,11 @@ export function deserializeAuxiliaryState(
 									htlcKey(key) !== `${value.direction}:${htlcId}` ||
 									!auxiliaryAmount ||
 									paymentHash.length !== 32 ||
-									!['fulfilled', 'failed'].includes(value.outcome)
+									!['fulfilled', 'failed'].includes(value.outcome) ||
+									(value.preimageRevealed !== undefined &&
+										(value.preimageRevealed !== true ||
+											value.outcome !== 'failed' ||
+											value.direction !== HtlcDirection.RECEIVED))
 								)
 									throw new Error('Malformed serialized asset resolution');
 								return [
@@ -464,7 +472,10 @@ export function deserializeAuxiliaryState(
 													)
 											  }
 											: {}),
-										outcome: value.outcome
+										outcome: value.outcome,
+										...(value.preimageRevealed === true
+											? { preimageRevealed: true as const }
+											: {})
 									}
 								];
 							}
