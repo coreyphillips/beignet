@@ -964,4 +964,55 @@ describe('The cooperative close of an asset channel under review (#2093)', funct
 			expect(stateOf(host, channelId).state).to.equal(ChannelState.CLOSED);
 		}
 	});
+
+	it('tells the host the end of the channel once when the cooperative transaction confirms after a force close of its own', async () => {
+		const made = await pair('review9-closed-once');
+		const { alice, bob, channelId, hex } = made;
+		// Bob's closing_signed, the last message of the close, is lost.
+		const deliver = alice.node.handlePeerMessage.bind(alice.node);
+		alice.node.handlePeerMessage = ((
+			peer: string,
+			type: number,
+			payload: Buffer
+		) => {
+			if (type === MessageType.CLOSING_SIGNED) return;
+			return deliver(peer, type, payload);
+		}) as typeof alice.node.handlePeerMessage;
+		const told: unknown[] = [];
+		alice.node.on('channel:closed', (data) => told.push(data));
+		expect(alice.node.closeChannel(channelId, DESTINATION)).to.deep.equal({
+			ok: true
+		});
+		await settle();
+		expect(stateOf(bob, channelId).state).to.equal(ChannelState.CLOSED);
+		expect(made.published.bob).to.have.length(1);
+		expect(stateOf(alice, channelId).state).to.equal(
+			ChannelState.NEGOTIATING_CLOSING
+		);
+		expect(told).to.deep.equal([]);
+		// Alice hears nothing more and closes on her own.
+		expect(alice.node.forceCloseChannel(channelId, DESTINATION).ok).to.equal(
+			true
+		);
+		await settle();
+		expect(stateOf(alice, channelId).state).to.equal(ChannelState.FORCE_CLOSED);
+		expect(told).to.deep.equal([{ channelId }]);
+		// The transaction that confirms is Bob's, which Alice signed too.
+		const close = bitcoin.Transaction.fromHex(made.published.bob[0]);
+		expect(
+			stateOf(alice, channelId).auxiliaryState!.closeTransactions!.has(
+				close.getId()
+			)
+		).to.equal(true);
+		alice.node.handleFundingSpent(channelId, close, 700_000, DESTINATION);
+		alice.node.handleNewBlock(700_000);
+		await settle();
+		// The channel is the cooperative close it turned out to be, in memory
+		// and in the row, and the host was told its end once.
+		expect(stateOf(alice, channelId).state).to.equal(ChannelState.CLOSED);
+		expect(alice.storage!.loadChannel(hex)!.state.state).to.equal(
+			ChannelState.CLOSED
+		);
+		expect(told).to.deep.equal([{ channelId }]);
+	});
 });

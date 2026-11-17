@@ -4174,6 +4174,14 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 					  )
 					: false;
 				let closedNow = false;
+				// An asset channel the host was already told the end of: a
+				// force close of this node's own, and then the cooperative
+				// transaction it had signed confirms (the last closing_signed
+				// was lost), or the other way round.
+				const endedBefore =
+					assetClose !== undefined &&
+					(channel.getState() === ChannelState.CLOSED ||
+						channel.getState() === ChannelState.FORCE_CLOSED);
 				// A peer commitment seen only in the MEMPOOL must not close the
 				// channel yet (issue #559): flipping to FORCE_CLOSED here disarms
 				// the scanExpiringHtlcs deadline backstop, so a peer parking a
@@ -4215,7 +4223,16 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 					) {
 						this.emit('channel:force-closing', channelId, 'remote');
 					}
-					this.emit('channel:closed', channelId);
+					if (endedBefore && !unrecordedChanged) {
+						// The move between the two closed states is written, and
+						// the end of the channel is not told a second time.
+						const peerPubkey = this.findPeerForChannel(channel);
+						if (peerPubkey) {
+							this.persistence.persist({ channel, peerPubkey, channelId });
+						}
+					} else {
+						this.emit('channel:closed', channelId);
+					}
 				}
 				if (unrecordedChanged && !closedNow) {
 					// The mark moved on a channel that was closed already: the
