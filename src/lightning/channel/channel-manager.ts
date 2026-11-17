@@ -4371,6 +4371,10 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		const allActions: ChainAction[] = [];
 
 		for (const [channelIdHex, monitor] of this.monitors) {
+			// Before the skip: a fee action can outlive everything else of
+			// its channel, when its retirement failed or the node was not
+			// running when its output was settled for good.
+			this.reconcileFixedOutputFees(channelIdHex);
 			if (monitor.isFullyResolved()) continue;
 
 			const actions = monitor.handleNewBlock(blockHeight);
@@ -4381,8 +4385,6 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			if (this.auxiliarySpendsHeld.size > 0) {
 				this.releaseHeldAuxiliarySpends(channelIdHex);
 			}
-			this.reconcileFixedOutputFees(channelIdHex);
-
 			this.recordAuxiliaryChainEndings(channelIdHex);
 
 			if (actions.length > 0) {
@@ -13171,6 +13173,8 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 
 	/** Fee actions of the fee pool being worked on, one at a time each. */
 	private fixedOutputFeesBusy = new Set<string>();
+	/** The fee actions whose retirement the wallet is being asked for now. */
+	private fixedOutputFeesRetiring = new Set<string>();
 	/** What was last said about a fee action, so that it is said once. */
 	private fixedOutputFeesSaid = new Map<string, string>();
 	/** Channels whose open fee actions were looked through since the start. */
@@ -13418,6 +13422,8 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			txid,
 			outputIndex
 		);
+		if (this.fixedOutputFeesRetiring.has(feeActionId)) return;
+		this.fixedOutputFeesRetiring.add(feeActionId);
 		void fp
 			.retireFixedOutputFeeAction(
 				feeActionId,
@@ -13431,20 +13437,31 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 				this.emit('monitor:updated', channelIdHex, monitor);
 			})
 			.catch((error: unknown) => {
+				// The action stays open in the pool, its cap charged and its
+				// coins frozen: the channel is gone over again on the next
+				// block, and after a start. The refusal is said once.
+				this.fixedOutputFeesReconciled.delete(channelIdHex);
+				const said = `retire:${(error as Error).message}`;
+				if (this.fixedOutputFeesSaid.get(feeActionId) === said) return;
+				this.fixedOutputFeesSaid.set(feeActionId, said);
 				this.emitContained(
 					'error',
 					channelId,
-					`The fee action of output ${txid}:${outputIndex} of an asset channel could not be retired: ${
+					`The fee action of output ${txid}:${outputIndex} of an asset channel could not be retired and will be tried again on the next block: ${
 						(error as Error).message
 					} (channel ${channelIdHex})`
 				);
+			})
+			.finally(() => {
+				this.fixedOutputFeesRetiring.delete(feeActionId);
 			});
 	}
 
 	/**
-	 * Once after a start, per asset channel: retire the fee actions the pool
-	 * still keeps for outputs that were settled for good while the node was
-	 * not running.
+	 * Once after a start, per asset channel, and again after a retirement
+	 * that failed: retire the fee actions the pool still keeps for outputs
+	 * that are settled for good. Also for a channel whose monitor has
+	 * nothing else left to do.
 	 */
 	private reconcileFixedOutputFees(channelIdHex: string): void {
 		if (this.fixedOutputFeesReconciled.has(channelIdHex)) return;
