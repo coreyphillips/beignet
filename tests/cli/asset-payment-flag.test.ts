@@ -192,9 +192,13 @@ describe('The daemon carries the mark of an asset payment, invoice and channel (
 		const figures = (
 			stats: Record<string, unknown>
 		): Record<string, unknown> => {
-			const { uptimeSeconds: _uptime, ...rest } = stats;
+			// The one figure that is a clock reading: two answers a
+			// millisecond apart differ in it and in nothing else.
+			const { uptimeMs: _uptime, ...rest } = stats;
 			return rest;
 		};
+		expect(ordinary.uptimeMs).to.be.a('number');
+		expect(figures(ordinary)).to.not.have.property('uptimeMs');
 		expect(figures(beside)).to.deep.equal(figures(ordinary));
 		// Asset payments alone: nothing sent, received or paid in fees.
 		const alone = methods.getStats.call(daemonOf([assetSent, assetReceived]));
