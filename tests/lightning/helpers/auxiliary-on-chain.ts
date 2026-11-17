@@ -167,6 +167,11 @@ export interface IAssetChainOptions {
 	acceptorUnits?: bigint;
 	fundingSatoshis?: bigint;
 	pushMsat?: bigint;
+	/**
+	 * Each node reads the features the other really advertises, in place
+	 * of the fixed set the hosts of these tests are otherwise told.
+	 */
+	realInit?: boolean;
 	control?: { alice?: ISweepControl; bob?: ISweepControl };
 
 	/** Give a host a wallet on the chain and the real fee pool over it. */
@@ -439,6 +444,15 @@ export function assetChainWorld(): {
 				undefined,
 				wallets.bob
 			);
+			if (options.realInit) {
+				const reads = (host: IAssetHost, peer: IAssetHost): void => {
+					(
+						host.node as unknown as { peerInitFeatures: () => unknown }
+					).peerInitFeatures = (): unknown => peer.node.getLocalFeatures();
+				};
+				reads(alice, bob);
+				reads(bob, alice);
+			}
 			connectHosts(alice, bob);
 			const openerUnits = options.openerUnits ?? 9000n;
 			const acceptorUnits = options.acceptorUnits ?? 1000n;

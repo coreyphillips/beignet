@@ -27,9 +27,9 @@ import { ASSET_FUNDING_ROOT, hash, referenceProvider } from './auxiliary-pair';
 import { connectNodes, createNode } from './loopback-nodes';
 
 /**
- * Turn asset openings on for the tests of the describe block this is called
- * in, and back to what they were after it. The build keeps them off until
- * an asset channel can be closed and defended on chain.
+ * Set asset openings on, or off, for the tests of the describe block this
+ * is called in, and back to what they were after it. The build has them
+ * on; a block that calls this says that it depends on them.
  */
 export function withAssetOpens(enabled = true): void {
 	let prior = false;

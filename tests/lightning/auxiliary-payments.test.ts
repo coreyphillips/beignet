@@ -1502,7 +1502,7 @@ describe('Asset payments (issue #2093, step 8)', function () {
 			const api = lightningChannel.AUXILIARY_CHANNELS_API;
 			// 0 until the build can also close and defend an asset channel:
 			// asset openings are off in it, and a host treats it as unsupported.
-			expect(api.version).to.equal(0);
+			expect(api.version).to.equal(1);
 			expect([...api.surfaces]).to.deep.equal([
 				'valueIncomingHtlc:three-outcome',
 				'sendPaymentToRoute:assetPayment',

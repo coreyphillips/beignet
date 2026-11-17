@@ -234,7 +234,7 @@ describe('Asset channel feature bits and init custom records', function () {
 		expect(bits).to.include(Feature.DUAL_FUND + 1);
 	});
 
-	it('does not advertise fixed HTLC outputs or child custody from a caller-supplied set', () => {
+	it('does not advertise fixed HTLC outputs or child custody, even from a caller-supplied set, when its funding provider keeps no fee pool', () => {
 		const supplied = LightningNode.defaultFeatures();
 		supplied.setBit(451);
 		supplied.setBit(453);
@@ -244,6 +244,67 @@ describe('Asset channel feature bits and init custom records', function () {
 		const bits = node.getLocalFeatures().listSetBits();
 		expect(bits).to.include(2025);
 		for (const bit of [450, 451, 452, 453]) expect(bits).to.not.include(bit);
+	});
+
+	it('offers fixed HTLC outputs by the optional bit when its funding provider keeps a fee pool, and child custody only when the host allows it and the provider can make what it needs', () => {
+		const pool = { supportsFixedOutputFees: (): boolean => true } as never;
+		const asset = (bits: number[]): number[] =>
+			bits.filter((bit) => bit >= 450 && bit <= 453);
+		// The default feature set.
+		const plain = track(
+			makeNode({ fundingProvider: pool, auxiliaryChannels: auxiliary() })
+		);
+		expect(asset(plain.getLocalFeatures().listSetBits())).to.deep.equal([451]);
+		// A caller-supplied set cannot require the one or add the other.
+		const supplied = LightningNode.defaultFeatures();
+		supplied.setBit(450);
+		supplied.setBit(453);
+		const fromSet = track(
+			makeNode({
+				localFeatures: supplied,
+				fundingProvider: pool,
+				auxiliaryChannels: auxiliary()
+			})
+		);
+		expect(asset(fromSet.getLocalFeatures().listSetBits())).to.deep.equal([
+			451
+		]);
+		// Child custody: allowed by the host, and the provider has the member.
+		const custody = auxiliary();
+		const allowed = track(
+			makeNode({
+				fundingProvider: pool,
+				auxiliaryChannels: {
+					...custody,
+					allowRevokedChildCustody: true,
+					provider: {
+						...custody.provider,
+						prepareRevokedChild: (): Buffer => Buffer.alloc(1)
+					}
+				}
+			})
+		);
+		expect(asset(allowed.getLocalFeatures().listSetBits())).to.deep.equal([
+			451, 453
+		]);
+		const notAllowed = track(
+			makeNode({
+				fundingProvider: pool,
+				auxiliaryChannels: {
+					...custody,
+					provider: {
+						...custody.provider,
+						prepareRevokedChild: (): Buffer => Buffer.alloc(1)
+					}
+				}
+			})
+		);
+		expect(asset(notAllowed.getLocalFeatures().listSetBits())).to.deep.equal([
+			451
+		]);
+		// A node without a provider is as it was, fee pool or not.
+		const none = track(makeNode({ fundingProvider: pool }));
+		expect(none.getLocalFeatures().listSetBits()).to.deep.equal(DEFAULT_BITS);
 	});
 
 	describe('what a peer requires beside the overlay', () => {

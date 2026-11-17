@@ -2079,9 +2079,13 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		// depends on in the init of both peers. This sits above the simple
 		// close strip below on purpose: advertising taproot costs this node
 		// option_simple_close like any other taproot advertisement does
-		// (issue #1929). Fixed asset HTLC outputs (450) and child custody
-		// (452) are not offered yet, so a caller-supplied set cannot advertise
-		// them. dual_fund stays advertised: an asset open asks for v1
+		// (issue #1929). Fixed asset HTLC outputs (450) are offered, by the
+		// optional bit, when the node's funding provider keeps the fee pool
+		// their spends take their fee from; without one the node could not
+		// open such a channel, so it does not say it can. Child custody (452)
+		// is offered only when the host allows it and the provider can make
+		// what it needs. A caller-supplied set cannot advertise either
+		// otherwise. dual_fund stays advertised: an asset open asks for v1
 		// negotiation itself. A node without a provider is left exactly as
 		// it was, nothing here sets or clears a bit for it.
 		//
@@ -2108,6 +2112,15 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			if (missing.length === 0) {
 				localFeatures.setOptional(Feature.OPTION_TAPROOT);
 				localFeatures.setOptional(Feature.OPTION_TAPROOT_OVERLAY);
+				if (config.fundingProvider?.supportsFixedOutputFees?.() === true) {
+					localFeatures.setOptional(Feature.OPTION_ASSET_FIXED_HTLC_OUTPUTS);
+					if (
+						config.auxiliaryChannels.allowRevokedChildCustody === true &&
+						config.auxiliaryChannels.provider.prepareRevokedChild
+					) {
+						localFeatures.setOptional(Feature.OPTION_ASSET_CHILD_CUSTODY);
+					}
+				}
 				this.auxiliaryAdvertisement = { advertised: true };
 			} else {
 				localFeatures.clearBit(Feature.OPTION_TAPROOT_OVERLAY);

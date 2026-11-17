@@ -1014,8 +1014,8 @@ describe('an asset channel opens over open_channel (issue #2093 step 7)', functi
 	describe('while asset openings are switched off', () => {
 		withAssetOpens(false);
 
-		it('is how this build ships', () => {
-			expect(OPENS_AS_SHIPPED).to.equal(false);
+		it('is no longer how this build ships: openings are on', () => {
+			expect(OPENS_AS_SHIPPED).to.equal(true);
 		});
 
 		it('refuses to open an asset channel before it derives a key or sends anything, and opens any other', () => {

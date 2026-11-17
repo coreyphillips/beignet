@@ -12,7 +12,7 @@
  * are present, each by the member a host would otherwise have to probe.
  */
 export const AUXILIARY_CHANNELS_API = Object.freeze({
-	version: 0,
+	version: 1,
 	surfaces: Object.freeze([
 		// valueIncomingHtlc answers a value, undefined ("not mine") or throws.
 		'valueIncomingHtlc:three-outcome',
