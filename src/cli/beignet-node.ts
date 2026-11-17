@@ -16035,21 +16035,23 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 			(ch) => ch.state === 'NORMAL' && !isHeldRestore(ch)
 		);
 		// A wallet whose only channels are asset channels has channels, and
-		// none that these checks count. The two checks that tell a wallet
-		// with no channel that it has none say what they left out then, in
-		// words that no wallet without an asset channel is ever told.
-		const noChannels =
-			channels.length === 0 && listed.some((ch) => ch.auxiliary)
-				? {
-						anchor:
-							'No ordinary Lightning channel yet (anchor will be used by default); asset channels are not counted here',
-						sufficient:
-							'No ordinary Lightning channel yet; asset channels are not counted here'
-				  }
-				: {
-						anchor: 'No channels yet (anchor will be used by default)',
-						sufficient: 'No channels yet'
-				  };
+		// none that these checks count. The four checks that tell a wallet
+		// with no channel that it has none, or none that is active, say what
+		// they left out then, in words that no wallet without an asset
+		// channel is ever told. Status and score are untouched.
+		const assetOnly =
+			channels.length === 0 && listed.some((ch) => ch.auxiliary);
+		const noChannels = assetOnly
+			? {
+					anchor:
+						'No ordinary Lightning channel yet (anchor will be used by default); asset channels are not counted here',
+					sufficient:
+						'No ordinary Lightning channel yet; asset channels are not counted here'
+			  }
+			: {
+					anchor: 'No channels yet (anchor will be used by default)',
+					sufficient: 'No channels yet'
+			  };
 
 		checks.push({
 			name: 'AUTO_RECONNECT_ENABLED',
@@ -16083,6 +16085,8 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 			message:
 				readyChannels.length > 0
 					? `${readyChannels.length} active channel(s)`
+					: assetOnly
+					? 'No active ordinary Lightning channel: open one to send and receive bitcoin over Lightning; asset channels are not counted here'
 					: 'No active channels — open a channel to send/receive payments'
 		});
 
@@ -16164,7 +16168,9 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 			severity: 'INFO',
 			message:
 				readyChannels.length === 0
-					? 'No active channels to assess'
+					? assetOnly
+						? 'No active ordinary Lightning channel to assess; asset channels are not counted here'
+						: 'No active channels to assess'
 					: depletedChannels.length < readyChannels.length
 					? 'Channel balances are healthy'
 					: `All ${readyChannels.length} channel(s) are >90% depleted in one direction`
