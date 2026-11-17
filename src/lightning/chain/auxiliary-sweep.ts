@@ -138,6 +138,12 @@ export interface IAuxiliarySweepSource
 	extends Omit<IAuxiliarySweepInput, 'transactionInputIndex' | 'publicKey'> {
 	output: ITrackedOutput;
 	privateKey: Buffer;
+	/**
+	 * Other keys of this node the asset side of this input is signed with:
+	 * the channel's revocation key, when the output itself is spent with a
+	 * key scoped to one commitment. Never given to the provider.
+	 */
+	additionalPrivateKeys?: Buffer[];
 }
 
 /** What the asset side of a sweep came to. */
@@ -195,9 +201,13 @@ export function prepareAuxiliarySweep(
 			new Error('the provider cannot spend an output that carries units')
 		);
 	}
+	const signers: Buffer[][] = [];
+
 	const inputs: IAuxiliarySweepInput[] = sources.map(
 		(source, transactionInputIndex) => {
-			const { output, privateKey, ...described } = source;
+			const { output, privateKey, additionalPrivateKeys, ...described } =
+				source;
+			signers.push([privateKey, ...(additionalPrivateKeys ?? [])]);
 			return {
 				...described,
 				transactionInputIndex,
@@ -217,11 +227,15 @@ export function prepareAuxiliarySweep(
 	);
 	const sign = (request: IAuxiliarySweepSigningRequest): Buffer => {
 		const source = sources[request.transactionInputIndex];
-		const input = inputs[request.transactionInputIndex];
+		const signer = Buffer.isBuffer(request.publicKey)
+			? signers[request.transactionInputIndex]?.find((key) =>
+					Buffer.from(ecc.pointFromScalar(key, true)!).equals(request.publicKey)
+			  )
+			: undefined;
 		if (
 			!source ||
 			!Buffer.isBuffer(request.publicKey) ||
-			!input.publicKey.equals(request.publicKey) ||
+			!signer ||
 			!Buffer.isBuffer(request.sigHash) ||
 			request.sigHash.length !== 32
 		) {
@@ -229,7 +243,7 @@ export function prepareAuxiliarySweep(
 				'An asset sweep asked for a signature by another key than the one of its input, or over what is not a digest'
 			);
 		}
-		let privateKey = Buffer.from(source.privateKey);
+		let privateKey = Buffer.from(signer);
 		if (request.singleTweak !== undefined) {
 			if (
 				!Buffer.isBuffer(request.singleTweak) ||

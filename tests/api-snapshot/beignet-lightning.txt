@@ -846,7 +846,9 @@ property chain.IResolvedOutput.spendTx?: bitcoinjs-lib#Transaction
 property chain.IResolvedOutput.trackedOutput: chain.ITrackedOutput
 property chain.IResolvedOutput.witness?: Buffer[]
 interface chain.IRevokedHtlcSnapshotOutput
+property chain.IRevokedHtlcSnapshotOutput.auxiliaryCommitmentNumber?: bigint
 property chain.IRevokedHtlcSnapshotOutput.cltvExpiry: number
+property chain.IRevokedHtlcSnapshotOutput.htlcId?: bigint
 property chain.IRevokedHtlcSnapshotOutput.outputType: chain.OutputType.OFFERED_HTLC | chain.OutputType.RECEIVED_HTLC
 property chain.IRevokedHtlcSnapshotOutput.paymentHash: Buffer
 property chain.IRevokedHtlcSnapshotOutput.witnessScript?: Buffer

@@ -5,6 +5,11 @@
  * asset side of a sweep and remembers what it was asked.
  */
 
+import assert from 'assert';
+import {
+	deserializeChainMonitorState,
+	serializeChainMonitorState
+} from '../../../src/lightning/storage/serialization';
 import crypto from 'crypto';
 import fs from 'fs';
 import os from 'os';
@@ -333,7 +338,9 @@ export function assetChainWorld(): {
 	restartAlice(
 		pair: IAssetChainPair,
 		tag: string,
-		control?: ISweepControl
+		control?: ISweepControl,
+		/** Runs while Alice is down, as what puts another copy of her store in place. */
+		whileDown?: () => void
 	): Promise<void>;
 	mine(pair: IAssetChainPair, blocks: number): Promise<void>;
 	dispose(): void;
@@ -508,7 +515,7 @@ export function assetChainWorld(): {
 			}
 			return pair;
 		},
-		async restartAlice(pair, tag, control): Promise<void> {
+		async restartAlice(pair, tag, control, whileDown): Promise<void> {
 			pair.alice.node.destroy();
 			pair.alice.storage?.close();
 			pair.backends.alice.close();
@@ -517,6 +524,8 @@ export function assetChainWorld(): {
 				.getChannelManager()
 				.handlePeerDisconnected(pair.alice.node.getNodeId());
 			pair.sweeps.alice = [];
+
+			whileDown?.();
 			const { host, backend } = await onChain(
 				tag,
 				1,
@@ -548,4 +557,35 @@ export function assetChainWorld(): {
 			for (const file of files.splice(0)) fs.rmSync(file, { force: true });
 		}
 	};
+}
+
+/**
+ * The monitor's row reads back as it was written: what the reader makes of
+ * the row writes the same row again, and each named field, which some
+ * tracked output must carry, comes back with the value it had.
+ */
+export function monitorRoundTrips(
+	host: IAssetHost,
+	channelId: Buffer,
+	fields: string[]
+): void {
+	const state = host.node.getChannelMonitorState(channelId)!;
+	const row = serializeChainMonitorState(state);
+	const back = deserializeChainMonitorState(row);
+	assert.strictEqual(serializeChainMonitorState(back), row);
+	const read = (output: unknown, field: string): unknown =>
+		(output as Record<string, unknown>)[field];
+	for (const field of fields) {
+		assert.ok(
+			state.trackedOutputs.some((output) => read(output, field) !== undefined),
+			`no tracked output carries ${field}`
+		);
+		state.trackedOutputs.forEach((output, at) => {
+			assert.deepStrictEqual(
+				read(back.trackedOutputs[at], field),
+				read(output, field),
+				field
+			);
+		});
+	}
 }

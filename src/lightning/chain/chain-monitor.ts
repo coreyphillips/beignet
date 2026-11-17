@@ -1363,6 +1363,25 @@ export class ChainMonitor {
 							o.outputIndex === r.trackedOutput.outputIndex
 					);
 					if (already) continue;
+
+					if (this._channelState.auxiliaryState && r.auxiliaryFunding) {
+						r.trackedOutput.secondLevelTxHex = spendingTx
+							.toBuffer()
+							.toString('hex');
+						this._trackedOutputs.push(r.trackedOutput);
+						actions.push({
+							type: ChainActionType.WATCH_OUTPUT,
+							txid: r.trackedOutput.txid,
+							outputIndex: r.trackedOutput.outputIndex
+						});
+						this._holdFundedPenalty(
+							actions,
+							r.trackedOutput,
+							r.spendTx,
+							'penalty sweep (revoked second-level HTLC)'
+						);
+						continue;
+					}
 					// The revocation path has no timelock — broadcast immediately
 					// (mirrors _handleRevokedCommitment; witness already set by the
 					// resolver). The claim races the cheater's to_self_delay.
@@ -1402,6 +1421,7 @@ export class ChainMonitor {
 			if (this._channelState.auxiliaryState) {
 				spentTrackedOutput.resolutionTxHex = spendingTx.toHex();
 				selectAuxiliarySweep(spentTrackedOutput, spendingTx.getId());
+				delete spentTrackedOutput.auxiliaryFeeWait;
 			}
 			spentTrackedOutput.confirmationHeight = blockHeight;
 			delete spentTrackedOutput.spendReverifyPending;
@@ -2216,6 +2236,47 @@ export class ChainMonitor {
 						this._htlcBasepointSecret,
 						this._theirCurrentPoint()
 					)[0];
+				case CommitmentType.THEIR_REVOKED_COMMITMENT: {
+					const number = this._commitmentBroadcast.commitmentNumber;
+					const same = (r: IResolvedOutput): boolean =>
+						r.trackedOutput.txid === output.txid &&
+						r.trackedOutput.outputIndex === output.outputIndex;
+					if (output.secondLevelTxHex) {
+						return resolveRevokedSecondLevelOutput(
+							this._channelState,
+							bitcoin.Transaction.fromHex(output.secondLevelTxHex),
+							output.confirmationHeight,
+							number,
+							this._destinationScript,
+							feeRatePerVbyte,
+							this._revocationBasepointSecret,
+							this._network
+						).find(same);
+					}
+					if (!this._commitmentBroadcast.revokedTxHex) return undefined;
+					const revokedTx = bitcoin.Transaction.fromHex(
+						this._commitmentBroadcast.revokedTxHex
+					);
+					if (output.txid !== revokedTx.getId()) return undefined;
+					const others = new Set<number>();
+					for (let i = 0; i < revokedTx.outs.length; i++) {
+						if (i !== output.outputIndex) others.add(i);
+					}
+					return resolveRevokedCommitmentOutputs(
+						this._channelState,
+						[output],
+						number,
+						revokedTx,
+						this._destinationScript,
+						feeRatePerVbyte,
+						this._revocationBasepointSecret,
+						this._paymentPrivkey,
+						this._network,
+						this._currentBlockHeight,
+						others
+					).find(same);
+				}
+
 				default:
 					return undefined;
 			}
@@ -3622,6 +3683,30 @@ export class ChainMonitor {
 	}
 
 	/**
+	 * A penalty of an asset channel that takes its fee from a wallet input:
+	 * the spend is kept without that input and the fee pool is asked for
+	 * one. Nothing is sent until the input is attached.
+	 */
+	private _holdFundedPenalty(
+		actions: ChainAction[],
+		output: ITrackedOutput,
+		spendTx: bitcoin.Transaction,
+		description: string
+	): void {
+		if (this._fundedSpendOf(output, spendTx)) return;
+		this._recordClaimedOutpoints(spendTx);
+		output.sweepTxHex = spendTx.toHex();
+		output.originalFeeRate = this._feeRatePerVbyte;
+		output.maturityHeight = this._computeMaturityHeight(
+			spendTx,
+			output.confirmationHeight
+		);
+		output.auxiliaryFeeFunding = true;
+		output.status = OutputStatus.CONFIRMED;
+		actions.push(this._fixedOutputFeeAction(output, description));
+	}
+
+	/**
 	 * Broadcast the spends a revoked-commitment resolution produced and record
 	 * each against its output. A batched penalty produces one resolved entry PER
 	 * INPUT sharing the same tx, and the deadline split can yield several distinct
@@ -3649,6 +3734,16 @@ export class ChainMonitor {
 				continue;
 			}
 			if (!r.spendTx) continue;
+
+			if (this._channelState.auxiliaryState && r.auxiliaryFunding) {
+				this._holdFundedPenalty(
+					actions,
+					r.trackedOutput,
+					r.spendTx,
+					description
+				);
+				continue;
+			}
 			// Penalty txs come back with every input's witness already attached; a
 			// to_remote claim (our own balance on their revoked commitment) comes
 			// back with its witness alongside the tx instead, and broadcasting it

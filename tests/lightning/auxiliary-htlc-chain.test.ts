@@ -27,6 +27,7 @@ import {
 	disconnect,
 	errorsOf,
 	holdUnits,
+	monitorRoundTrips,
 	settle,
 	trackedOutputs,
 	type IAssetChainPair
@@ -248,6 +249,12 @@ describe('the HTLCs of an asset channel on the chain (issue #2093 step 10)', fun
 		const kinds = pair.sweeps.alice.map((call) => call.kinds.join());
 		expect(kinds).to.include('htlc_second_level_timeout');
 		expect(kinds).to.include('second_level_delayed');
+		monitorRoundTrips(pair.alice, pair.channelId, [
+			'auxiliaryHtlc',
+			'auxiliaryParentData',
+			'auxiliaryFeeRate',
+			'auxiliaryFeeActionOpen'
+		]);
 		expect(pair.backends.alice.refused).to.deep.equal([]);
 		expect(
 			errorsOf(pair.alice).filter((e) => !e.includes('waits for'))
@@ -424,6 +431,7 @@ describe('the HTLCs of an asset channel on the chain (issue #2093 step 10)', fun
 		await settle();
 		expect(outcomes.bob).to.deep.equal(['RECEIVED:fulfilled:5000']);
 		expect(outcomes.alice).to.deep.equal(['OFFERED:fulfilled:5000']);
+		monitorRoundTrips(pair.bob, pair.channelId, ['auxiliaryOutcomeRecorded']);
 		expect(parkedOf(pair.bob, held.paymentHash)).to.equal(0);
 		expect(pair.bob.node.getPayment(held.paymentHash)!.status).to.equal(
 			PaymentStatus.COMPLETED

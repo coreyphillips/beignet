@@ -6,6 +6,10 @@
  */
 
 import * as bitcoin from 'bitcoinjs-lib';
+import {
+	revokedChildPrivateKey,
+	secondLevelRevocationKey
+} from '../channel/child-revocation';
 import { ecc } from '../../utils/ecc';
 import { sha256 } from '../crypto/provider';
 import type { ITrackedOutput } from './types';
@@ -91,6 +95,7 @@ import {
 import {
 	AUXILIARY_SWEEP_OUTPUT_MINIMUM,
 	auxiliaryLeafCandidates,
+	auxiliaryCommitmentView,
 	auxiliaryOutputLeaf,
 	auxiliarySecondLevel,
 	auxiliarySecondLevelSource,
@@ -1600,22 +1605,6 @@ function auxiliarySweepNeedsFee(
 	}
 	output.auxiliaryFeeFunding = true;
 	return true;
-}
-
-/**
- * Whether an output is an HTLC output of an asset channel, which is tracked
- * and left unspent here. Never for a channel that is not an asset channel.
- */
-function auxiliaryHtlcOutputWaits(
-	state: IChannelState,
-	output: ITrackedOutput
-): boolean {
-	return (
-		!!state.auxiliaryState &&
-		(output.outputType === OutputType.OFFERED_HTLC ||
-			output.outputType === OutputType.RECEIVED_HTLC ||
-			!!output.isSecondLevelHtlc)
-	);
 }
 
 /**
@@ -3487,6 +3476,9 @@ export interface IRevokedHtlcSnapshotOutput {
 	paymentHash: Buffer;
 	cltvExpiry: number;
 	witnessScript?: Buffer;
+	/** Set for an HTLC output that carries units, with the HTLC's id. */
+	htlcId?: bigint;
+	auxiliaryCommitmentNumber?: bigint;
 }
 
 /**
@@ -3616,6 +3608,51 @@ export function matchRevokedHtlcSnapshotOutputs(
 		}
 		for (let i = 0; i < candidates.length && i < outputIndices.length; i++) {
 			matched.set(outputIndices[i], candidates[i].metadata);
+		}
+	}
+
+	// An HTLC output that carries units has the asset leaf of its commitment
+	// in its script tree and sits where the asset side of that commitment
+	// says. Never for a channel that is not an asset channel.
+	const view = auxiliaryCommitmentView(state, false, commitmentNumber);
+	if (taprootKeys && view?.htlcOutputIndexes) {
+		for (const [key, index] of view.htlcOutputIndexes) {
+			const leaf = auxiliaryOutputLeaf(state, false, commitmentNumber, index);
+			const out = revokedTx.outs[index];
+			if (!leaf || !out) continue;
+			for (const entry of snapshot) {
+				const built =
+					entry.direction === HtlcDirection.RECEIVED
+						? buildTaprootOfferedHtlcOutput(
+								taprootKeys.revocationPubkey,
+								taprootKeys.localHtlcPubkey,
+								taprootKeys.remoteHtlcPubkey,
+								entry.paymentHash,
+								network,
+								leaf
+						  )
+						: buildTaprootReceivedHtlcOutput(
+								taprootKeys.revocationPubkey,
+								taprootKeys.localHtlcPubkey,
+								taprootKeys.remoteHtlcPubkey,
+								entry.paymentHash,
+								entry.cltvExpiry,
+								network,
+								leaf
+						  );
+				if (!built.output.equals(out.script)) continue;
+				matched.set(index, {
+					outputType:
+						entry.direction === HtlcDirection.OFFERED
+							? OutputType.OFFERED_HTLC
+							: OutputType.RECEIVED_HTLC,
+					paymentHash: entry.paymentHash,
+					cltvExpiry: entry.cltvExpiry,
+					htlcId: BigInt(key.slice(key.indexOf(':') + 1)),
+					auxiliaryCommitmentNumber: commitmentNumber
+				});
+				break;
+			}
 		}
 	}
 
@@ -3998,7 +4035,14 @@ function resolveRevokedTaprootCommitmentOutputs(
 	for (const o of trackedOutputs) {
 		if (alreadyClaimed.has(o.outputIndex)) continue;
 		// An HTLC output of an asset channel is tracked and left unspent here.
-		if (auxiliaryHtlcOutputWaits(state, o)) continue;
+		// The second-level outputs of an asset channel are punished by the
+		// resolver of the transaction that made them.
+		if (
+			state.auxiliaryState &&
+			(o.isSecondLevelHtlc || o.txid !== revokedTx.getId())
+		) {
+			continue;
+		}
 		// An output that carries units is spent with the leaf of its view. A
 		// view that is gone is a refusal kept on the output, never a throw
 		// through the resolution of the other outputs.
@@ -4038,7 +4082,8 @@ function resolveRevokedTaprootCommitmentOutputs(
 						keys.localHtlcPubkey,
 						keys.remoteHtlcPubkey,
 						o.paymentHash!,
-						network
+						network,
+						auxiliaryLeaf
 				  )
 				: buildTaprootReceivedHtlcOutput(
 						keys.revocationPubkey,
@@ -4046,7 +4091,8 @@ function resolveRevokedTaprootCommitmentOutputs(
 						keys.remoteHtlcPubkey,
 						o.paymentHash!,
 						o.cltvExpiry || 0,
-						network
+						network,
+						auxiliaryLeaf
 				  );
 			penaltyIns.push({
 				output: o,
@@ -4077,7 +4123,38 @@ function resolveRevokedTaprootCommitmentOutputs(
 			);
 			// Not economical to claim. Skip it rather than abandoning the penalty
 			// spends for the remaining outputs of this revoked commitment.
-			if (auxiliarySweepNeedsFee(o, claimValue) || claimValue === null) {
+			if (auxiliarySweepNeedsFee(o, claimValue)) {
+				// The node's own units in an output that cannot pay its own
+				// fee: the whole amount stays, a wallet input brings the fee.
+				const funded = auxiliaryFundedLeafSpend(
+					state,
+					false,
+					{
+						output: o,
+						commitmentOutputIndex: o.outputIndex,
+						kind: 'to_remote',
+						privateKey: paymentPrivkey,
+						leafScript: tr.spend.script,
+						leafVersion: tr.spend.leafVersion,
+						controlBlock: tr.spend.controlBlock
+					},
+					tr.output,
+					destinationScript,
+					0,
+					1,
+					[]
+				);
+				if (funded) {
+					resolved.push({
+						trackedOutput: o,
+						spendTx: funded.spendTx,
+						auxiliaryFunding: funded.auxiliaryFunding,
+						csvDelay: 1
+					});
+				}
+				continue;
+			}
+			if (claimValue === null) {
 				continue;
 			}
 			const claimTx = new bitcoin.Transaction();
@@ -4151,6 +4228,11 @@ function resolveRevokedTaprootCommitmentOutputs(
 			// outputType/direction reflect OUR perspective; on THEIR commitment our
 			// received HTLC is their offered output and vice-versa (the same swap the
 			// tracked-output loop above and matchTaprootHtlcOutput use).
+			const snapshotLeaf =
+				metadata.auxiliaryCommitmentNumber !== undefined
+					? auxiliaryOutputLeaf(state, false, commitmentNumber, outputIndex)
+					: undefined;
+
 			const asOffered = metadata.outputType === OutputType.RECEIVED_HTLC;
 			const h = asOffered
 				? buildTaprootOfferedHtlcOutput(
@@ -4158,7 +4240,8 @@ function resolveRevokedTaprootCommitmentOutputs(
 						keys.localHtlcPubkey,
 						keys.remoteHtlcPubkey,
 						metadata.paymentHash,
-						network
+						network,
+						snapshotLeaf
 				  )
 				: buildTaprootReceivedHtlcOutput(
 						keys.revocationPubkey,
@@ -4166,7 +4249,8 @@ function resolveRevokedTaprootCommitmentOutputs(
 						keys.remoteHtlcPubkey,
 						metadata.paymentHash,
 						metadata.cltvExpiry,
-						network
+						network,
+						snapshotLeaf
 				  );
 			handled.add(outputIndex);
 			penaltyIns.push({
@@ -4178,7 +4262,13 @@ function resolveRevokedTaprootCommitmentOutputs(
 					status: OutputStatus.CONFIRMED,
 					confirmationHeight: 0,
 					paymentHash: metadata.paymentHash,
-					cltvExpiry: metadata.cltvExpiry
+					cltvExpiry: metadata.cltvExpiry,
+					...(metadata.htlcId !== undefined ? { htlcId: metadata.htlcId } : {}),
+					...(metadata.auxiliaryCommitmentNumber !== undefined
+						? {
+								auxiliaryCommitmentNumber: metadata.auxiliaryCommitmentNumber
+						  }
+						: {})
 				},
 				spk: h.output,
 				value: revokedTx.outs[outputIndex].value,
@@ -4189,6 +4279,90 @@ function resolveRevokedTaprootCommitmentOutputs(
 
 	// Build ONE taproot penalty tx over the given inputs, sign, and push a
 	// resolved entry per input (all sharing that tx).
+	// What the provider is told of the one input of a penalty that carries
+	// units: an HTLC output is taken by its key, the cheater's balance by
+	// the revocation leaf.
+	const penaltySource = (pin: IPenaltyIn): IAuxiliarySweepSource => ({
+		output: pin.output,
+		commitmentOutputIndex: pin.output.outputIndex,
+		kind: pin.merkleRoot ? 'htlc_revocation' : 'to_local_revocation',
+		privateKey: revocationPrivkey,
+		...(pin.leafScript
+			? {
+					leafScript: pin.leafScript,
+					leafVersion: TAPLEAF_VERSION,
+					controlBlock: pin.controlBlock
+			  }
+			: {})
+	});
+
+	// A penalty of one output that carries units and cannot pay its own
+	// fee: the whole amount stays in its output, and what finishes it once
+	// wallet inputs that bring the fee are attached. Undefined when the
+	// output holds less than an output of units may.
+	const fundedPenalty = (
+		pin: IPenaltyIn
+	): Pick<IResolvedOutput, 'spendTx' | 'auxiliaryFunding'> | undefined => {
+		if (pin.output.amount < BigInt(AUXILIARY_SWEEP_OUTPUT_MINIMUM)) {
+			return undefined;
+		}
+		const spendTx = new bitcoin.Transaction();
+		spendTx.version = 2;
+		spendTx.addInput(
+			Buffer.from(pin.output.txid, 'hex').reverse(),
+			pin.output.outputIndex,
+			0xfffffffd
+		);
+		spendTx.addOutput(destinationScript, pin.value);
+		return {
+			spendTx,
+			auxiliaryFunding: {
+				prevout: { script: Buffer.from(pin.spk), value: BigInt(pin.value) },
+				finalize: (funded, prevouts) => {
+					const assets = prepareAuxiliarySweep(
+						state,
+						false,
+						funded,
+						[penaltySource(pin)],
+						destinationScript
+					);
+					if (assets.assets && !assets.ok) {
+						return { ok: false, refusal: assets.refusal };
+					}
+					const values = prevouts.values.map(Number);
+					if (pin.merkleRoot) {
+						const sighash = funded.hashForWitnessV1(
+							0,
+							prevouts.scripts,
+							values,
+							bitcoin.Transaction.SIGHASH_DEFAULT
+						);
+						funded.setWitness(0, [
+							signTaprootHtlcLeaf(
+								sighash,
+								tweakTaprootKeyPathPrivkey(revocationPrivkey, pin.merkleRoot)
+							)
+						]);
+					} else {
+						const sighash = funded.hashForWitnessV1(
+							0,
+							prevouts.scripts,
+							values,
+							bitcoin.Transaction.SIGHASH_DEFAULT,
+							tapleafHash(pin.leafScript!, TAPLEAF_VERSION)
+						);
+						funded.setWitness(0, [
+							signTaprootHtlcLeaf(sighash, revocationPrivkey),
+							pin.leafScript!,
+							pin.controlBlock!
+						]);
+					}
+					return { ok: true, ...(assets.assets ? { data: assets.data } : {}) };
+				}
+			}
+		};
+	};
+
 	const buildAndSignPenalty = (ins: IPenaltyIn[]): void => {
 		const penaltyTx = new bitcoin.Transaction();
 		penaltyTx.version = 2;
@@ -4217,10 +4391,14 @@ function resolveRevokedTaprootCommitmentOutputs(
 			(carrying ? auxiliarySweepVbytes(destinationScript) : 0);
 		const fee = BigInt(Math.ceil(feeRatePerVbyte * estVbytes));
 		const penaltyValue = sweepOutputValue(totalIn, fee, destinationScript);
-		if (
-			(carrying && auxiliarySweepNeedsFee(carrying.output, penaltyValue)) ||
-			penaltyValue === null
-		) {
+		if (carrying && auxiliarySweepNeedsFee(carrying.output, penaltyValue)) {
+			resolved.push({
+				trackedOutput: carrying.output,
+				...fundedPenalty(carrying)
+			});
+			return;
+		}
+		if (penaltyValue === null) {
 			// This batch cannot pay for itself. Return rather than handing
 			// addOutput a negative value: the caller splits urgent inputs into
 			// their own batch, and a throw here would abandon the remaining
@@ -4237,17 +4415,7 @@ function resolveRevokedTaprootCommitmentOutputs(
 				state,
 				false,
 				penaltyTx,
-				[
-					{
-						output: carrying.output,
-						commitmentOutputIndex: carrying.output.outputIndex,
-						kind: 'to_local_revocation',
-						privateKey: revocationPrivkey,
-						leafScript: carrying.leafScript,
-						leafVersion: TAPLEAF_VERSION,
-						controlBlock: carrying.controlBlock
-					}
-				],
+				[penaltySource(carrying)],
 				destinationScript
 			);
 			if (assets.assets && !assets.ok) {
@@ -4395,10 +4563,135 @@ export function resolveRevokedSecondLevelOutput(
 			keys.toSelfDelay,
 			network
 		);
+		// The second-level outputs of HTLCs that carry units: each has the
+		// asset leaf its commitment names and, under child custody, the key
+		// scoped to that commitment, and takes its fee from a wallet input.
+		// Never for a channel that is not an asset channel.
+		const carried = new Set<number>();
+		const view = auxiliaryCommitmentView(state, false, commitmentNumber);
+		if (view) {
+			try {
+				const scopedKey = secondLevelRevocationKey(
+					state,
+					view,
+					keys.revocationPubkey,
+					1n
+				);
+				const scopedPrivkey = scopedKey.equals(keys.revocationPubkey)
+					? revocationPrivkey
+					: revokedChildPrivateKey(
+							state.localPerCommitmentSeed,
+							view.secondLevelCommitmentTxid ?? '',
+							perCommitmentSecret
+					  );
+				if (
+					!Buffer.from(ecc.pointFromScalar(scopedPrivkey, true)!).equals(
+						scopedKey
+					)
+				) {
+					throw new Error('The scoped key is not the one signed for');
+				}
+				for (const [key, leaf] of view.secondLevelLeaves) {
+					const tree = buildTaprootSecondLevelOutput(
+						scopedKey,
+						keys.delayedPubkey,
+						keys.toSelfDelay,
+						network,
+						leaf
+					);
+					for (let i = 0; i < spendingTx.outs.length; i++) {
+						if (
+							carried.has(i) ||
+							!tree.output.equals(spendingTx.outs[i].script)
+						) {
+							continue;
+						}
+						carried.add(i);
+						const amount = BigInt(spendingTx.outs[i].value);
+						if (amount < BigInt(AUXILIARY_SWEEP_OUTPUT_MINIMUM)) continue;
+						const separator = key.indexOf(':');
+						const htlcId = BigInt(key.slice(separator + 1));
+						const direction = key.slice(0, separator) as HtlcDirection;
+						const trackedOutput: ITrackedOutput = {
+							txid: spendingTxid,
+							outputIndex: i,
+							amount,
+							outputType: OutputType.TO_LOCAL,
+							status: OutputStatus.CONFIRMED,
+							confirmationHeight,
+							witnessScript: tree.output,
+							htlcId,
+							auxiliaryHtlc: { id: htlcId, direction },
+							auxiliaryCommitmentNumber: commitmentNumber,
+							auxiliaryFeeFunding: true
+						};
+						const source: IAuxiliarySweepSource = {
+							output: trackedOutput,
+							commitmentOutputIndex: i,
+							kind: 'second_level_revocation',
+							privateKey: scopedPrivkey,
+							...(scopedPrivkey.equals(revocationPrivkey)
+								? {}
+								: { additionalPrivateKeys: [revocationPrivkey] }),
+							sourceTransaction: spendingTx,
+							htlcId,
+							direction
+						};
+						const claimTx = new bitcoin.Transaction();
+						claimTx.version = 2;
+						claimTx.addInput(
+							Buffer.from(spendingTxid, 'hex').reverse(),
+							i,
+							0xfffffffd
+						);
+						claimTx.addOutput(destinationScript, Number(amount));
+						resolved.push({
+							trackedOutput,
+							spendTx: claimTx,
+							auxiliaryFunding: {
+								prevout: { script: Buffer.from(tree.output), value: amount },
+								finalize: (funded, prevouts) => {
+									const assets = prepareAuxiliarySweep(
+										state,
+										false,
+										funded,
+										[source],
+										destinationScript
+									);
+									if (assets.assets && !assets.ok) {
+										return { ok: false, refusal: assets.refusal };
+									}
+									const sighash = funded.hashForWitnessV1(
+										0,
+										prevouts.scripts,
+										prevouts.values.map(Number),
+										bitcoin.Transaction.SIGHASH_DEFAULT
+									);
+									funded.setWitness(0, [
+										signTaprootHtlcLeaf(
+											sighash,
+											tweakTaprootKeyPathPrivkey(scopedPrivkey, tree.merkleRoot)
+										)
+									]);
+									return {
+										ok: true,
+										...(assets.assets ? { data: assets.data } : {})
+									};
+								}
+							}
+						});
+					}
+				}
+			} catch {
+				// The asset side of the commitment does not hold what the key
+				// is made from: its second-level outputs are left.
+			}
+		}
+
 		const merkleRoot = tapleafHash(sl.delay.script, sl.delay.leafVersion);
 		for (let i = 0; i < spendingTx.outs.length; i++) {
 			const out = spendingTx.outs[i];
-			if (!sl.output.equals(out.script)) continue;
+			if (carried.has(i) || !sl.output.equals(out.script)) continue;
 			const amount = BigInt(out.value);
 			const claimValue = sweepOutputValue(
 				amount,
