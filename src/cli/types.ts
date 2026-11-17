@@ -1046,10 +1046,14 @@ export interface BalanceInfo {
 	 */
 	splicingSats?: number;
 	/**
-	 * The sats on this wallet's side of its open asset channels, present
-	 * only when it has one. They carry asset outputs and cannot be sent or
-	 * received as bitcoin over Lightning, so they are in neither `lightning`
-	 * nor `total`.
+	 * The sats on this wallet's side of its asset channels that are neither
+	 * closing nor over, whatever their state: still opening (from the moment
+	 * the funding transaction exists), open, waiting for the peer, or failed
+	 * and not yet closed. Present only while it has one. They carry asset
+	 * outputs and cannot be sent or received as bitcoin over Lightning, so
+	 * they are in neither `lightning` nor `total`. Every asset channel that
+	 * is not over is in this figure or in `assetChannelClosingSats`, never
+	 * in both.
 	 */
 	assetChannelSats?: number;
 	/**
@@ -1057,7 +1061,8 @@ export interface BalanceInfo {
 	 * shutting down, negotiating a close, or force closed with its balance
 	 * output not yet spent in a block. Present only while it has one. A
 	 * closing asset channel is in no other figure: not `assetChannelSats`,
-	 * which counts open channels, and not `pendingCloseBalanceSats`, since
+	 * which counts those that are not closing, and not
+	 * `pendingCloseBalanceSats`, since
 	 * this bitcoin does not come back to the wallet but stays under the asset
 	 * outputs the close or the sweep pays. In neither `lightning` nor
 	 * `total`.

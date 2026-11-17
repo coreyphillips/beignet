@@ -7642,18 +7642,17 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 		const lightning = Number(lnBalance.localBalanceMsat / 1000n);
 		const unsettledSats = Number(lnBalance.unsettledBalanceMsat / 1000n);
 		const splicingSats = this.getSplicingBalanceSats();
-		const assetChannelClosingSats = this.getAssetChannelClosingSats();
+		const assetChannelSats = this.sumAssetChannelFigure('assetChannelSats');
+		const assetChannelClosingSats = this.sumAssetChannelFigure(
+			'assetChannelClosingSats'
+		);
 		return {
 			onchain,
 			lightning,
 			total: onchain + lightning,
 			unsettledSats,
 			splicingSats,
-			...(lnBalance.auxiliaryBalanceMsat !== undefined
-				? {
-						assetChannelSats: Number(lnBalance.auxiliaryBalanceMsat / 1000n)
-				  }
-				: {}),
+			...(assetChannelSats !== undefined ? { assetChannelSats } : {}),
 			...(assetChannelClosingSats !== undefined
 				? { assetChannelClosingSats }
 				: {})
@@ -7661,49 +7660,67 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	}
 
 	/**
-	 * Sum of the local balances of the asset channels that are closing:
-	 * SHUTTING_DOWN, NEGOTIATING_CLOSING, or FORCE_CLOSED with this wallet's
-	 * balance output not yet spent in a block. Undefined when the wallet has
-	 * no such channel, so that the balance of a wallet without one has the
-	 * keys it always had.
+	 * Which of the two asset figures of the balance holds the bitcoin on this
+	 * wallet's side of a channel. Every asset channel that is not over is in
+	 * exactly one of them, and no other channel is in either.
 	 *
-	 * It is the counterpart of getPendingCloseBalanceSats, which leaves asset
-	 * channels out: their bitcoin does not come back to the wallet, it stays
-	 * under the asset outputs the provider closes or sweeps to. While the
-	 * channel closes it is in no other figure (assetChannelSats counts open
-	 * channels), which after a force close is the whole of the closer's
-	 * delay. A cooperative close ends the count when the channel is CLOSED;
-	 * a force close when the chain monitor has seen the balance output spent
-	 * in a block, by the sweep the provider made the asset side of or by
-	 * anything else. Before that (no monitor, no classified commitment, a
-	 * sweep that is only broadcast) the channel is counted.
+	 * assetChannelClosingSats: SHUTTING_DOWN, NEGOTIATING_CLOSING, or
+	 * FORCE_CLOSED with this wallet's balance output not yet spent in a
+	 * block. assetChannelSats: every other one that is not over, whatever
+	 * its state: still opening, open, waiting for its peer, or failed and
+	 * not yet closed. Over, and in neither: CLOSED, and FORCE_CLOSED with the
+	 * balance output spent. A channel with no funding transaction holds no
+	 * bitcoin and is in neither, whatever became of it: that is an opening
+	 * before its funding exists, and one given up before it did. A channel
+	 * whose peer is away is read by the state it was in.
+	 *
+	 * The closing figure is the counterpart of getPendingCloseBalanceSats,
+	 * which leaves asset channels out: their bitcoin does not come back to
+	 * the wallet, it stays under the asset outputs the provider closes or
+	 * sweeps to. A cooperative close ends the count when the channel is
+	 * CLOSED; a force close when the chain monitor has seen the balance
+	 * output spent in a block, by the sweep the provider made the asset side
+	 * of or by anything else. Before that (no monitor, no classified
+	 * commitment, a sweep that is only broadcast) the channel is counted.
 	 */
-	private getAssetChannelClosingSats(): number | undefined {
-		const closing = new Set<ChannelState>([
-			ChannelState.FORCE_CLOSED,
-			ChannelState.SHUTTING_DOWN,
-			ChannelState.NEGOTIATING_CLOSING
-		]);
+	private assetChannelFigureOf(
+		ch: ReturnType<LightningNode['listChannels']>[number]
+	): 'assetChannelSats' | 'assetChannelClosingSats' | undefined {
+		if (!ch.auxiliary || ch.fundingTxid === undefined) return undefined;
+		const effectiveState =
+			ch.state === ChannelState.AWAITING_REESTABLISH
+				? this.node.getChannelManager().getChannel(ch.channelId)?.getFullState()
+						.preReestablishState ?? ch.state
+				: ch.state;
+		switch (effectiveState) {
+			case ChannelState.CLOSED:
+				return undefined;
+			case ChannelState.SHUTTING_DOWN:
+			case ChannelState.NEGOTIATING_CLOSING:
+				return 'assetChannelClosingSats';
+			case ChannelState.FORCE_CLOSED: {
+				const status = this.forceCloseBalanceOutput(ch.channelId)?.status;
+				return status === OutputStatus.SPEND_CONFIRMED ||
+					status === OutputStatus.IRREVOCABLY_RESOLVED
+					? undefined
+					: 'assetChannelClosingSats';
+			}
+			default:
+				return 'assetChannelSats';
+		}
+	}
+
+	/**
+	 * Sum of the local balances of the channels one asset figure holds.
+	 * Undefined when it holds none, so that the balance of a wallet without
+	 * such a channel has the keys it always had.
+	 */
+	private sumAssetChannelFigure(
+		figure: 'assetChannelSats' | 'assetChannelClosingSats'
+	): number | undefined {
 		let totalMsat: bigint | undefined;
 		for (const ch of this.node.listChannels()) {
-			if (!ch.auxiliary) continue;
-			const effectiveState =
-				ch.state === ChannelState.AWAITING_REESTABLISH
-					? this.node
-							.getChannelManager()
-							.getChannel(ch.channelId)
-							?.getFullState().preReestablishState ?? ch.state
-					: ch.state;
-			if (!closing.has(effectiveState)) continue;
-			if (effectiveState === ChannelState.FORCE_CLOSED) {
-				const status = this.forceCloseBalanceOutput(ch.channelId)?.status;
-				if (
-					status === OutputStatus.SPEND_CONFIRMED ||
-					status === OutputStatus.IRREVOCABLY_RESOLVED
-				) {
-					continue;
-				}
-			}
+			if (this.assetChannelFigureOf(ch) !== figure) continue;
 			totalMsat = (totalMsat ?? 0n) + ch.localBalanceMsat;
 		}
 		return totalMsat === undefined ? undefined : Number(totalMsat / 1000n);

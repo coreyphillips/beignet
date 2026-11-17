@@ -309,16 +309,18 @@ describe('The daemon and an asset channel that is closing: its bitcoin (#2093)',
 				})
 			});
 		const closing = (...given: Parameters<typeof over>): number | undefined =>
-			methods.getAssetChannelClosingSats.call(over(...given)) as
-				| number
-				| undefined;
+			methods.sumAssetChannelFigure.call(
+				over(...given),
+				'assetChannelClosingSats'
+			) as number | undefined;
 		const pending = (...given: Parameters<typeof over>): number =>
 			methods.getPendingCloseBalanceSats.call(over(...given)) as number;
 		const asset = (fill: number, state: ChannelState, msat: bigint): Row => ({
 			channelId: id(fill),
 			state,
 			localBalanceMsat: msat,
-			auxiliary: true
+			auxiliary: true,
+			fundingTxid: 'f0'.repeat(32)
 		});
 		const ordinary = (
 			fill: number,

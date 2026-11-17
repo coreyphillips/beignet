@@ -5715,7 +5715,7 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						assetChannelSats: {
 							type: 'integer',
 							description:
-								"The sats on this wallet's side of its open asset channels, present only when it has one. They carry asset outputs and cannot be sent or received as bitcoin over Lightning. Excluded from lightning and from total"
+								"The sats on this wallet's side of its asset channels that are neither closing nor over, whatever their state: still opening (from the moment the funding transaction exists), open, waiting for the peer, or failed and not yet closed. Present only while it has one. They carry asset outputs and cannot be sent or received as bitcoin over Lightning. Excluded from lightning and from total. Every asset channel that is not over is in this figure or in assetChannelClosingSats, never in both"
 						},
 						assetChannelClosingSats: {
 							type: 'integer',

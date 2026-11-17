@@ -1124,7 +1124,7 @@ interface BalanceInfo {
   lightning: number;        // sats
   total: number;            // sats
   unsettledSats?: number;   // sats locked in in-flight HTLCs
-  assetChannelSats?: number;        // sats on this side of open asset channels; only with one, in neither lightning nor total
+  assetChannelSats?: number;        // sats on this side of asset channels that are not closing and not over (opening, open, peer away, failed); only with one, in neither lightning nor total
   assetChannelClosingSats?: number; // sats on this side of asset channels that are closing (see below); only with one
 }
 
@@ -1452,7 +1452,7 @@ interface LogEntry {
 }
 ```
 
-`assetChannelClosingSats` (on `getBalance()` and `GET /balance`) is the local balance of every asset channel that is SHUTTING_DOWN, NEGOTIATING_CLOSING, or FORCE_CLOSED with this wallet's balance output not yet spent in a block. An asset channel is in no figure for bitcoin on its way back to the wallet, `pendingCloseBalanceSats` included, because its bitcoin stays under the asset outputs that the close or the sweep pays; this figure is where it is read while the channel closes, which after a force close is the whole of the closer's delay. It is absent from the answer of a wallet with no such channel.
+`assetChannelClosingSats` (on `getBalance()` and `GET /balance`) is the local balance of every asset channel that is SHUTTING_DOWN, NEGOTIATING_CLOSING, or FORCE_CLOSED with this wallet's balance output not yet spent in a block. An asset channel is in no figure for bitcoin on its way back to the wallet, `pendingCloseBalanceSats` included, because its bitcoin stays under the asset outputs that the close or the sweep pays; this figure is where it is read while the channel closes, which after a force close is the whole of the closer's delay. It is absent from the answer of a wallet with no such channel. Every asset channel that is not over is in exactly one of the two figures: `assetChannelSats` holds each one that is not closing, whatever its state (still opening, from the moment its funding transaction exists; open; waiting for its peer; failed and not yet closed), and `assetChannelClosingSats` each one that is. An opening that was given up before any funding transaction existed, a closed channel and a force closed one whose balance output has been spent are in neither.
 
 `pendingCloseBalanceSats` is the local balance of every SHUTTING_DOWN, NEGOTIATING_CLOSING and FORCE_CLOSED channel whose funds the wallet does not count yet. A FORCE_CLOSED channel leaves the figure in the same read in which the wallet history first holds the sweep of its balance output (our to_remote on the peer's commitment, our to_local on ours), which the wallet counts from the mempool on, so a sat of the channel is in `onchainBalanceSats` or in `pendingCloseBalanceSats`, never both. If the wallet drops the sweep again (evicted, replaced, a restart before its first sync), the channel is back in the figure in that read.
 
