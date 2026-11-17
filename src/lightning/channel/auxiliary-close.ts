@@ -157,7 +157,11 @@ export function applyAuxiliaryClose(
 				typeof output.value !== 'bigint' ||
 				output.value <= 0n ||
 				output.value > BigInt(Number.MAX_SAFE_INTEGER) ||
-				!isTaprootScript(output.script) ||
+				!Buffer.isBuffer(output.script) ||
+				// An output that carries units is a taproot output of the
+				// provider's. A plain bitcoin payout may be of any form: see
+				// below.
+				(output.asset && !isTaprootScript(output.script)) ||
 				(output.asset && output.value < AUXILIARY_CLOSE_ASSET_OUTPUT_MINIMUM)
 			) {
 				throw new Error('Invalid asset close payout');
@@ -197,9 +201,19 @@ export function applyAuxiliaryClose(
 				throw new Error('Bitcoin close payout changed');
 			}
 		}
+		// A plain bitcoin payout goes where its party said in its shutdown
+		// and nowhere else, in whatever form that script passed the shutdown
+		// checks: the wallet's own destination is P2WPKH.
 		// Every output is one a node relays: a layout that keeps a payout
 		// below dust is a close neither party could ever confirm.
 		for (const output of result.outputs) {
+			const named =
+				output.side === 'local'
+					? state.localShutdownScript
+					: state.remoteShutdownScript;
+			if (!output.asset && !named.equals(output.script)) {
+				throw new Error('Invalid asset close payout');
+			}
 			if (
 				output.value <
 				payoutFloor(

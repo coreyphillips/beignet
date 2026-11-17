@@ -41,6 +41,10 @@ const DESTINATION = Buffer.from('0014' + '11'.repeat(20), 'hex');
 
 type Hooks = Partial<IAuxiliaryChannelConfig>;
 type Provider = IChannelAuxiliaryProvider;
+type CloseContext = Parameters<Provider['buildClose']>[0];
+type LayoutOutput = NonNullable<
+	ReturnType<Provider['buildClose']>['outputs']
+>[number];
 
 const p2tr = (key: Buffer, leaf?: string): Buffer =>
 	bitcoin.payments.p2tr({
@@ -575,4 +579,109 @@ describe('The cooperative close of an asset channel under review (#2093)', funct
 			);
 		}
 	});
+
+	// The whole-layout provider that pays each party's bitcoin to the
+	// script the engine handed prepareShutdown: the wallet's, P2WPKH.
+	const honouring = (): Provider => {
+		const split = withSeparateAnchors(referenceProvider());
+		return {
+			...split,
+			prepareShutdown(state, destinationScript) {
+				return {
+					scriptPubkey: Buffer.from(destinationScript),
+					customRecords: new Map([
+						[65539n, state.localBasepoints.fundingPubkey]
+					])
+				};
+			},
+			verifyShutdown: (_state, shutdown) =>
+				shutdown.customRecords.get(65539n)?.length === 33
+		};
+	};
+
+	it('closes a whole layout whose bitcoin payouts go to scripts that are not taproot', async () => {
+		const made = await pair('review9-p2wpkh', {
+			alice: { provider: honouring() },
+			bob: { provider: honouring() }
+		});
+		const { alice, bob, channelId } = made;
+		expect(alice.node.closeChannel(channelId, DESTINATION)).to.deep.equal({
+			ok: true
+		});
+		await settle();
+		const bobScript = stateOf(bob, channelId).localShutdownScript!;
+		expect(stateOf(alice, channelId).localShutdownScript).to.deep.equal(
+			DESTINATION
+		);
+		expect(bobScript.length).to.equal(22);
+		expect(
+			made.managerErrors.alice.concat(made.managerErrors.bob)
+		).to.deep.equal([]);
+		for (const host of [alice, bob]) {
+			expect(stateOf(host, channelId).state).to.equal(ChannelState.CLOSED);
+		}
+		expect(made.published.alice).to.have.length(1);
+		const tx = bitcoin.Transaction.fromHex(made.published.alice[0]);
+		const fee = Number(stateOf(alice, channelId).lastProposedClosingFeeSat);
+		const paid = (script: Buffer): number[] =>
+			tx.outs.filter((out) => out.script.equals(script)).map((o) => o.value);
+		// Each party's bitcoin, less the 330 sat its units ride on, is at the
+		// P2WPKH script it named; the units are on taproot outputs.
+		expect(paid(DESTINATION)).to.deep.equal([1_500_000 - fee - 330]);
+		expect(paid(bobScript)).to.deep.equal([500_000 - 330]);
+		const aliceKey = stateOf(alice, channelId).localBasepoints.fundingPubkey;
+		const bobKey = stateOf(bob, channelId).localBasepoints.fundingPubkey;
+		expect(paid(p2tr(aliceKey, 'anchor:9000'))).to.deep.equal([330]);
+		expect(paid(p2tr(bobKey, 'anchor:1000'))).to.deep.equal([330]);
+		expect(tx.outs).to.have.length(4);
+	});
+
+	for (const [what, redirect] of [
+		[
+			'a plain payout that goes to a script its party did not name',
+			(context: CloseContext, output: LayoutOutput): Buffer | undefined =>
+				output.side === 'remote' && !output.asset
+					? p2tr(context.state.localBasepoints.fundingPubkey, 'not theirs')
+					: undefined
+		],
+		[
+			'units on an output that is not taproot',
+			(_context: CloseContext, output: LayoutOutput): Buffer | undefined =>
+				output.side === 'local' && output.asset ? DESTINATION : undefined
+		]
+	] as const) {
+		it(`refuses a whole layout with ${what}`, async () => {
+			const split = withSeparateAnchors(referenceProvider());
+			const made = await pair(`review9-layout-${what.length}`, {
+				alice: {
+					provider: {
+						...split,
+						buildClose(context) {
+							const answer = split.buildClose(context);
+							return {
+								...answer,
+								outputs: answer.outputs!.map((output) => ({
+									...output,
+									script: redirect(context, output) ?? output.script
+								}))
+							};
+						}
+					}
+				},
+				bob: { provider: withSeparateAnchors(referenceProvider()) }
+			});
+			const { alice, channelId, hex } = made;
+			expect(alice.node.closeChannel(channelId, DESTINATION)).to.deep.equal({
+				ok: true
+			});
+			await settle();
+			expect(made.managerErrors.alice).to.deep.equal([
+				`The asset provider refused a cooperative close (channel ${hex}): Invalid asset close payout`
+			]);
+			expect(sent(made, 'alice')).to.not.include(MessageType.CLOSING_SIGNED);
+			expect(stateOf(alice, channelId).state).to.equal(
+				ChannelState.NEGOTIATING_CLOSING
+			);
+		});
+	}
 });
