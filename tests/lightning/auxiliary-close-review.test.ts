@@ -61,7 +61,9 @@ function withSeparateAnchors(provider: Provider): Provider {
 			[state.auxiliaryState!.localBalance, state.auxiliaryState!.remoteBalance]
 				.filter((units) => units > 0n)
 				.map(() => 34),
-		buildClose(context) {
+		buildClose(
+			context
+		): ReturnType<NonNullable<IChannelAuxiliaryProvider['buildClose']>> {
 			const auxiliary = context.state.auxiliaryState!;
 			const outputs: Array<{
 				value: bigint;
@@ -197,8 +199,16 @@ describe('The cooperative close of an asset channel under review (#2093)', funct
 		return made;
 	}
 
-	const stateOf = (host: IAssetHost, channelId: Buffer) =>
-		host.node.getChannelManager().getChannel(channelId)!.getFullState();
+	const stateOf = (
+		host: IAssetHost,
+		channelId: Buffer
+	): ReturnType<
+		NonNullable<
+			ReturnType<
+				ReturnType<IAssetHost['node']['getChannelManager']>['getChannel']
+			>
+		>['getFullState']
+	> => host.node.getChannelManager().getChannel(channelId)!.getFullState();
 	const sent = (made: IPair, from: 'alice' | 'bob'): number[] =>
 		made.wire.filter((m) => m.from === from).map((m) => m.type);
 
@@ -381,7 +391,9 @@ describe('The cooperative close of an asset channel under review (#2093)', funct
 		const split = withSeparateAnchors(referenceProvider());
 		return {
 			...split,
-			buildClose(context) {
+			buildClose(
+				context
+			): ReturnType<NonNullable<IChannelAuxiliaryProvider['buildClose']>> {
 				return split.buildClose({
 					...context,
 					localDustLimit: 0n,
@@ -524,7 +536,7 @@ describe('The cooperative close of an asset channel under review (#2093)', funct
 			host.node.getChannelManager() as unknown as {
 				config: { getClosingFeeratePerKw?: () => number };
 			}
-		).config.getClosingFeeratePerKw = () => satPerKw;
+		).config.getClosingFeeratePerKw = (): number => satPerKw;
 	};
 	for (const [proposer, responder] of [
 		[4000, 4000],
@@ -602,7 +614,10 @@ describe('The cooperative close of an asset channel under review (#2093)', funct
 		const split = withSeparateAnchors(referenceProvider());
 		return {
 			...split,
-			prepareShutdown(state, destinationScript) {
+			prepareShutdown(
+				state,
+				destinationScript
+			): ReturnType<NonNullable<IChannelAuxiliaryProvider['prepareShutdown']>> {
 				return {
 					scriptPubkey: Buffer.from(destinationScript),
 					customRecords: new Map([
@@ -704,7 +719,9 @@ describe('The cooperative close of an asset channel under review (#2093)', funct
 
 	// What a host does with the connections its node asked it to drop: it
 	// drops them, and the two nodes meet again.
-	const honourDrops = async (made: Awaited<ReturnType<typeof pair>>) => {
+	const honourDrops = async (
+		made: Awaited<ReturnType<typeof pair>>
+	): Promise<void> => {
 		let honoured = 0;
 		const asked = (): number =>
 			made.disconnects.alice.length + made.disconnects.bob.length;
@@ -809,7 +826,9 @@ describe('The cooperative close of an asset channel under review (#2093)', funct
 			const failing = (): Hooks => ({
 				provider: {
 					...reference,
-					buildClose(context) {
+					buildClose(
+						context
+					): ReturnType<NonNullable<IChannelAuxiliaryProvider['buildClose']>> {
 						if (down) throw new Error('asset store busy');
 						return reference.buildClose(context);
 					}

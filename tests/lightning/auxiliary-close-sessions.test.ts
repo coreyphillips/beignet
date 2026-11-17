@@ -4,6 +4,7 @@
  * again.
  */
 
+import type { IChannelAuxiliaryProvider } from '../../src/lightning/channel/auxiliary';
 import { expect } from 'chai';
 import * as bitcoin from 'bitcoinjs-lib';
 import * as fs from 'fs';
@@ -115,7 +116,9 @@ describe('The close of an asset channel across a restart (#2093)', function () {
 		let asked = 0;
 		const walletProvider = {
 			...reference,
-			prepareShutdown() {
+			prepareShutdown(): ReturnType<
+				NonNullable<IChannelAuxiliaryProvider['prepareShutdown']>
+			> {
 				asked++;
 				const key = getPublicKey(
 					crypto.createHash('sha256').update(`review9 key ${asked}`).digest()

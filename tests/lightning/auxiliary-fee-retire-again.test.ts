@@ -75,7 +75,7 @@ describe('asset channels: the retirement of a fee action that failed', function 
 			pool as unknown as {
 				retireFixedOutputFeeAction: typeof pool.retireFixedOutputFeeAction;
 			}
-		).retireFixedOutputFeeAction = (...args) => {
+		).retireFixedOutputFeeAction = (...args): Promise<void> => {
 			if (asked++ < refusals) {
 				return Promise.reject(new Error('the wallet is busy'));
 			}
