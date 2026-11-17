@@ -659,7 +659,7 @@ describe('host extensions: the members that reach the node, in a node', function
 		await expectPoolUnavailable(node, given, /durable bounded policy/);
 	});
 
-	it('says nothing of a fee coin pool for an extension whose policy the wallet took, or that supplied none', async () => {
+	it('says nothing of a fee coin pool for an extension whose policy the wallet took, and says of one that supplied none that it has none', async () => {
 		const taken = await boot([
 			extension('assets', () => ({
 				auxiliaryChannels: auxiliaryChannels(),
@@ -671,8 +671,14 @@ describe('host extensions: the members that reach the node, in a node', function
 		const none = await boot([
 			extension('assets', () => ({ auxiliaryChannels: auxiliaryChannels() }))
 		]);
-		expect(infoOf(none)).to.not.have.property('fixedOutputFees');
+		expect(infoOf(none).fixedOutputFees).to.deep.equal({
+			available: false,
+			supplied: false
+		});
 		expect(built[1].node!.getFixedOutputFeeStatus()).to.equal(undefined);
+		// An extension that supplies no asset channels says nothing of it.
+		const plain = await boot([extension('plain', () => ({}))]);
+		expect(infoOf(plain)).to.not.have.property('fixedOutputFees');
 	});
 
 	it("hands the wallet the extension's bound on a wallet call with the rest of its fee policy", async () => {

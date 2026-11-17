@@ -1016,6 +1016,9 @@ property IExtensionContext.logger: beignet#ILogger
 property IExtensionContext.network: ExtensionNetwork
 property IExtensionContext.storage: IExtensionStorage
 property IExtensionContext.wallet: beignet#Wallet
+unexported interface IExtensionFeePoolAbsent
+property IExtensionFeePoolAbsent.available: false
+property IExtensionFeePoolAbsent.supplied: false
 unexported interface IExtensionFeePoolUnavailable
 property IExtensionFeePoolUnavailable.available: false
 property IExtensionFeePoolUnavailable.error: { code: string; remedy: string; message: string; }
@@ -1027,7 +1030,7 @@ property IExtensionHostOptions.stopTimeoutMs?: number
 interface IExtensionInfo
 property IExtensionInfo.error?: string
 property IExtensionInfo.events: string[]
-property IExtensionInfo.fixedOutputFees?: IExtensionFeePoolUnavailable
+property IExtensionInfo.fixedOutputFees?: IExtensionFeePoolUnavailable | IExtensionFeePoolAbsent
 property IExtensionInfo.generation: number
 property IExtensionInfo.id: string
 property IExtensionInfo.routes: Array<{ method: ExtensionMethod; path: string; scopes: string[]; idempotent: boolean; }>

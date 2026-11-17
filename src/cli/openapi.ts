@@ -5876,10 +5876,16 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						fixedOutputFees: {
 							type: 'object',
 							description:
-								'Present only when the wallet refused the fee policy the extension supplied with its asset channel provider: the node holds the provider and has no fee coin pool, so it opens and accepts no asset channel and whatever needs a fee coin fails with this error',
-							required: ['available', 'error'],
+								'Present only when the node holds the asset channel provider of this extension and has no fee coin pool. With error: the wallet refused the fee policy the extension supplied, so the node opens and accepts no asset channel and whatever needs a fee coin fails with this error. With supplied false: the attachment gave no fixedOutputFees, so the node does not offer fixed HTLC outputs (feature bit 451) and opens or accepts an asset channel only with a peer the provider allows the older HTLC signatures for',
+							required: ['available'],
 							properties: {
 								available: { type: 'boolean', enum: [false] },
+								supplied: {
+									type: 'boolean',
+									enum: [false],
+									description:
+										'Present, and false, when the attachment supplied auxiliaryChannels without fixedOutputFees'
+								},
 								error: {
 									type: 'object',
 									required: ['code', 'remedy', 'message'],

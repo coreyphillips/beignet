@@ -256,12 +256,26 @@ export interface IExtensionInfo {
 	/** The attachment's status(), when it has one and is running. */
 	status?: unknown;
 	/**
-	 * Present only when the wallet refused the fee policy the extension
-	 * supplied with its asset channel provider. The node holds the provider
-	 * and has no fee coin pool: it opens and accepts no asset channel, and
-	 * whatever needs a fee coin fails with this error.
+	 * Present only when the node holds the asset channel provider of this
+	 * extension and has no fee coin pool. With `error`: the wallet refused
+	 * the fee policy the extension supplied; the node opens and accepts no
+	 * asset channel, and whatever needs a fee coin fails with this error.
+	 * With `supplied: false`: the attachment gave no `fixedOutputFees`; the
+	 * node does not offer fixed HTLC outputs (feature bit 451), and opens
+	 * or accepts an asset channel only with a peer the provider's
+	 * `allowLegacyHtlcSignatures` hook allows.
 	 */
-	fixedOutputFees?: IExtensionFeePoolUnavailable;
+	fixedOutputFees?: IExtensionFeePoolUnavailable | IExtensionFeePoolAbsent;
+}
+
+/**
+ * An extension supplies the node's asset channels and gave no fee policy
+ * for them: its node keeps no fee coin pool.
+ */
+export interface IExtensionFeePoolAbsent {
+	available: false;
+	/** No `fixedOutputFees` came beside `auxiliaryChannels`. */
+	supplied: false;
 }
 
 /** The fee coin pool of an extension's node is unavailable, and why. */
@@ -1213,6 +1227,14 @@ export class ExtensionHost {
 					available: false,
 					error: { ...slot.feePolicyRefusal }
 				};
+			} else if (
+				slot.nodeMembers?.auxiliaryChannels !== undefined &&
+				slot.nodeMembers.fixedOutputFees === undefined
+			) {
+				// Asset channels with no fee policy: the row of an extension
+				// whose policy the wallet took says nothing, so without this
+				// a reader could not tell the two apart.
+				info.fixedOutputFees = { available: false, supplied: false };
 			}
 			if (this.isRunning(slot) && slot.attachment?.status) {
 				try {
