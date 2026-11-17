@@ -249,3 +249,19 @@ An asset channel is a channel a host's asset provider keeps state for. Its coope
 A fee outside the band is refused locally: nothing is signed, the peer is not sent an error, the channel stays in `NEGOTIATING_CLOSING`, and a reconnect starts a new round with a new proposal. A fee that would take this node's output below its dust limit, or that the opener's balance cannot pay, fails the channel as on any other taproot channel. An ordinary channel keeps the engine's own band, built from the commitment feerates.
 
 **A close the node did not sign.** Every spend of the funding output that is not a commitment transaction ends the channel as a cooperative close, also a transaction this node never signed and so holds no asset payload for (`closeTransactions` has no entry for its txid). The channel still ends as `CLOSED`, and the node says which transaction that was: `auxiliaryState.unrecordedCloseTxid` holds its txid in the channel's row, and the `channel:closed` event carries `unrecordedCloseTxid` beside `channelId`. The event fires once, at the close; after a restart the row still holds the txid and the event is not repeated. For a close the node signed, the field is absent from both. The chain monitor's record of the spend says the same: `getChannelMonitorState(channelId).commitmentBroadcast` is a `COOPERATIVE_CLOSE` record with `unrecordedClose: true`, on the running node and after a restart, and the record of a close the node signed has no such key.
+
+## Asset channels
+
+A program that embeds the engine can give its Lightning node an auxiliary channel provider (`INodeConfig.auxiliaryChannels`, an `IAuxiliaryChannelConfig`), and the node then holds asset channels: channels that carry asset units beside bitcoin. That is set where the node is made, not through the extension contract above, whose version 1 does not include the Lightning node. The options a host sets beside the provider are fields of the same object. This section lists the ones that bound what a channel holds, and what a host should watch.
+
+### How many HTLCs an asset channel carries at once
+
+`auxiliaryChannels.maxHtlcs` is the most HTLCs the node holds open at once on an asset channel, each way. It is a whole number from 1 to 83 and is 8 when the host does not set it; a node given any other value refuses to start.
+
+- **What the node accepts.** On every asset channel it opens or accepts, the node announces this number as its `max_accepted_htlcs`. A peer that adds one HTLC more has broken the protocol and the channel fails, as on any channel.
+- **What the node offers.** The node never has more than this many asset HTLCs of its own open on one asset channel, whatever the peer announced it would accept. The next asset payment is refused before anything is recorded or sent, with an `AuxiliaryPaymentError` whose code is `ASSET_HTLC_LIMIT_REACHED`; send it again once one of the open HTLCs has ended.
+- **Channels that exist already.** What a channel announced when it was opened cannot be taken back, so a channel opened under another number still accepts what it announced then. The bound on what the node offers is read from the present setting and applies to every asset channel at once.
+
+The reason for a small number: when a channel goes to the chain, every HTLC that is open is an output the node has to spend before a deadline, and each of those spends takes its fee from a wallet input of its own that the fee pool has to prepare, a few per preparation and a block each. A node with asset channels is an endpoint that makes and receives single payments, so a handful at once is all it needs. Raise the number only as far as the fee pool can pay for in the time the HTLCs leave.
+
+Ordinary channels are not touched by this setting.

@@ -20,6 +20,7 @@ import type {
 import type { ChannelState } from './types';
 import {
 	AUXILIARY_CHANNEL_DUST_LIMIT,
+	DEFAULT_AUXILIARY_MAX_HTLCS,
 	MAX_AUXILIARY_HTLCS_PER_PARTY
 } from './auxiliary';
 
@@ -175,6 +176,20 @@ export interface IAuxiliaryChannelConfig {
 	allowRevokedChildCustody?: boolean;
 	/** Explicit new-channel compatibility for peers lacking native fixed-output HTLCs. */
 	allowLegacyHtlcSignatures?(peerPubkey: string): boolean;
+	/**
+	 * The most HTLCs this node holds open at once on an asset channel, each
+	 * way: a whole number from 1 to 83, 8 when not set. The node announces
+	 * it as its max_accepted_htlcs on every asset channel it opens or
+	 * accepts from then on, and offers no more than this many asset HTLCs
+	 * at once on any asset channel, whatever the peer would accept and
+	 * whatever the channel announced when it was opened: the next asset
+	 * payment is refused with `ASSET_HTLC_LIMIT_REACHED` before anything is
+	 * sent. Each open HTLC is an output the node must spend in time, with a
+	 * fee input of its own, if the channel goes to the chain, so keep it
+	 * within what the fee pool can pay for. Ordinary channels are not
+	 * touched.
+	 */
+	maxHtlcs?: number;
 	provider: IChannelAuxiliaryProvider;
 	/**
 	 * Asked, before the node settles it and outside any storage
@@ -373,10 +388,13 @@ export function auxiliaryCarrierError(
  * channel: the root its funding key commits to, the asset balances, and the
  * dust limit and HTLC count of an asset channel where the configured ones
  * are looser. The descriptor has to be for this channel's temporary id.
+ * `maxHtlcs` is the most HTLCs this node accepts at once on the channel,
+ * which it announces to its peer: the host's number, or the default.
  */
 export function applyAuxiliaryFunding(
 	state: IChannelState,
-	descriptor: IAuxiliaryFundingDescriptor
+	descriptor: IAuxiliaryFundingDescriptor,
+	maxHtlcs: number = DEFAULT_AUXILIARY_MAX_HTLCS
 ): void {
 	validateAuxiliaryFunding(descriptor);
 	if (!descriptor.temporaryChannelId.equals(state.temporaryChannelId)) {
@@ -387,7 +405,8 @@ export function applyAuxiliaryFunding(
 		dustLimitSatoshis: auxiliaryDustLimit(state.localConfig.dustLimitSatoshis),
 		maxAcceptedHtlcs: Math.min(
 			state.localConfig.maxAcceptedHtlcs,
-			MAX_AUXILIARY_HTLCS_PER_PARTY
+			MAX_AUXILIARY_HTLCS_PER_PARTY,
+			maxHtlcs
 		)
 	};
 	state.fundingTaprootMerkleRoot = Buffer.from(

@@ -1577,6 +1577,7 @@ member channel.ChannelState.SENT_OPEN = "SENT_OPEN"
 member channel.ChannelState.SHUTTING_DOWN = "SHUTTING_DOWN"
 member channel.ChannelState.SPLICING = "SPLICING"
 type channel.CompositeSpliceStage = 'PLANNED' | 'NEGOTIATING' | 'COMMITTED' | 'PEERS_SIGNED' | 'RELEASED' | 'BROADCAST' | 'LOCKED' | 'ABORTED' | 'CONFLICTED'
+const channel.DEFAULT_AUXILIARY_MAX_HTLCS = 8
 const channel.DEFAULT_CHANNEL_CONFIG: channel.IChannelConfig
 const channel.DEFAULT_MINIMUM_DEPTH = 3
 const channel.DUAL_FUNDING_INPUT_WEIGHT = 320
@@ -1671,6 +1672,7 @@ method channel.IAuxiliaryChannelConfig.beforeAccept?(channel: channel.Channel, p
 method channel.IAuxiliaryChannelConfig.beforeFundingCreated?(channel: channel.Channel, peerPubkey: string): Promise<void>
 method channel.IAuxiliaryChannelConfig.canRestore?(channels: readonly channel.IAuxiliaryRestoredChannel[]): boolean
 property channel.IAuxiliaryChannelConfig.initCustomRecords?: message.CustomRecords
+property channel.IAuxiliaryChannelConfig.maxHtlcs?: number
 method channel.IAuxiliaryChannelConfig.onAccepted?(channel: channel.Channel, peerPubkey: string): void
 method channel.IAuxiliaryChannelConfig.onFundingSigned?(context: channel.IAuxiliaryFundingSigned): void
 method channel.IAuxiliaryChannelConfig.onHtlcResolved?(context: Omit<channel.IAuxiliaryHtlcResolution, 'outcome'> & { outcome: channel.IAuxiliaryHtlcResolution['outcome'] | 'never-sent'; state: channel.IChannelState; peerPubkey: string; channelId: Buffer; }): void
@@ -2524,12 +2526,13 @@ method channel.ZeroConfManager.setJitClients(pubkeyHexes: Iterable<string>): voi
 method channel.ZeroConfManager.shouldUseZeroConf(peerPubkeyHex: string, requestedZeroConf: boolean): boolean
 function channel.aggregateLocalCommitmentSig(state: channel.IChannelState, signer: keys.ISigner, ourPublicNonce: Uint8Array, theirPublicNonce: Buffer, theirPartialSig: Buffer, localPerCommitmentPoint: Buffer, commitmentNumber?: bigint): Buffer
 function channel.applyAuxiliaryClose(state: channel.IChannelState, transaction: bitcoinjs-lib#Transaction, feeSatoshis: bigint, outputMap: { local?: number; remote?: number; }): Buffer | undefined
-function channel.applyAuxiliaryFunding(state: channel.IChannelState, descriptor: channel.IAuxiliaryFundingDescriptor): void
+function channel.applyAuxiliaryFunding(state: channel.IChannelState, descriptor: channel.IAuxiliaryFundingDescriptor, maxHtlcs?: number): void
 function channel.assetHtlcSighashType(channelType: Buffer | null | undefined): 0x81 | 0x83
 function channel.auxiliaryCarrierError(opening: channel.IAuxiliaryCarrier): string | undefined
 function channel.auxiliaryClosingRelayProfile(state: channel.IChannelState, feeSatoshis: bigint): { weight: number; feePaid: bigint; }
 function channel.auxiliaryClosingWeight(state: channel.IChannelState, baseWeight: number): number
 function channel.auxiliaryDustLimit(configured: bigint): bigint
+function channel.auxiliaryMaxHtlcs(configured: number | undefined): number
 function channel.auxiliaryProviderError(state: Pick<channel.IChannelState, 'channelId' | 'temporaryChannelId'>, operation: string, cause: unknown): channel.AuxiliaryProviderError
 function channel.auxiliaryUnsupported(state: channel.IChannelState, operation: channel.AuxiliaryUnsupportedOperation): channel.AuxiliaryChannelUnsupportedError | undefined
 function channel.buildLocalCommitment(state: channel.IChannelState, perCommitmentPoint: Buffer, commitmentNumber?: bigint, signedLocal?: boolean): channel.IBuiltCommitment
@@ -5550,7 +5553,7 @@ class node.AuxiliaryPaymentError extends beignet#CodedError<node.AuxiliaryPaymen
 constructor node.AuxiliaryPaymentError(code: node.AuxiliaryPaymentErrorCode, channelId: Buffer | string, message: string, reason?: string)
 readonly property node.AuxiliaryPaymentError.channelId: string
 readonly property node.AuxiliaryPaymentError.reason?: string
-type node.AuxiliaryPaymentErrorCode = 'ASSET_PAYMENT_INVALID' | 'ASSET_PAYMENT_CHANNEL_MISMATCH' | 'ASSET_PAYMENT_ROUTE_REQUIRED' | 'ASSET_PAYMENT_UNSUPPORTED' | 'ASSET_PAYMENT_CIRCUIT_CHANGED' | 'ASSET_PAYMENT_NOT_RECORDED' | 'ASSET_CHANNEL_NEEDS_ASSET_PAYMENT' | 'ASSET_PAYMENT_REFUSED' | 'ASSET_OUTCOMES_UNDELIVERED'
+type node.AuxiliaryPaymentErrorCode = 'ASSET_PAYMENT_INVALID' | 'ASSET_PAYMENT_CHANNEL_MISMATCH' | 'ASSET_PAYMENT_ROUTE_REQUIRED' | 'ASSET_PAYMENT_UNSUPPORTED' | 'ASSET_PAYMENT_CIRCUIT_CHANGED' | 'ASSET_PAYMENT_NOT_RECORDED' | 'ASSET_CHANNEL_NEEDS_ASSET_PAYMENT' | 'ASSET_PAYMENT_REFUSED' | 'ASSET_OUTCOMES_UNDELIVERED' | 'ASSET_HTLC_LIMIT_REACHED'
 type node.AuxiliaryPaymentGate = (payment: { paymentHash: Buffer; channelId: Buffer; amountMsat: bigint; wireAmountMsat: bigint; routeAmountMsat: bigint; }) => string | node.IAuxiliaryPaymentRefusal | undefined
 class node.AuxiliaryProviderRequiredError extends beignet#CodedError<'AUXILIARY_PROVIDER_REQUIRED'>
 constructor node.AuxiliaryProviderRequiredError(channelIds: readonly string[])

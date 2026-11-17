@@ -2014,7 +2014,9 @@ export type AuxiliaryPaymentErrorCode =
 	/** The gate set on the node (setAuxiliaryPaymentGate) refused the payment. Nothing was sent. */
 	| 'ASSET_PAYMENT_REFUSED'
 	/** The channel holds more outcomes its host has not taken (onHtlcResolved) than it keeps. Nothing was sent. */
-	| 'ASSET_OUTCOMES_UNDELIVERED';
+	| 'ASSET_OUTCOMES_UNDELIVERED'
+	/** This node already has as many asset HTLCs of its own open on the channel as it offers at once (IAuxiliaryChannelConfig.maxHtlcs, 8 by default). Nothing was sent. */
+	| 'ASSET_HTLC_LIMIT_REACHED';
 
 /** A gate's refusal that names its own stable reason beside the sentence. */
 export interface IAuxiliaryPaymentRefusal {

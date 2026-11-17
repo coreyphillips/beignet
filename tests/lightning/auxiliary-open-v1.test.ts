@@ -22,7 +22,7 @@ import type { Channel } from '../../src/lightning/channel/channel';
 import type { IChannelAuxiliaryProvider } from '../../src/lightning/channel/auxiliary';
 import {
 	AUXILIARY_CHANNEL_DUST_LIMIT,
-	MAX_AUXILIARY_HTLCS_PER_PARTY,
+	DEFAULT_AUXILIARY_MAX_HTLCS,
 	validateAuxiliaryChannelType
 } from '../../src/lightning/channel/auxiliary';
 import {
@@ -475,9 +475,10 @@ describe('an asset channel opens over open_channel (issue #2093 step 7)', functi
 				expect(message.dustLimitSatoshis).to.equal(
 					AUXILIARY_CHANNEL_DUST_LIMIT
 				);
-				expect(message.maxAcceptedHtlcs).to.equal(
-					MAX_AUXILIARY_HTLCS_PER_PARTY
-				);
+				// The few a node with asset channels holds at once, not the
+				// most an asset channel may carry.
+				expect(message.maxAcceptedHtlcs).to.equal(DEFAULT_AUXILIARY_MAX_HTLCS);
+				expect(message.maxAcceptedHtlcs).to.equal(8);
 			}
 			expect(channel.getFullState().localConfig.dustLimitSatoshis).to.equal(
 				354n
@@ -490,13 +491,13 @@ describe('an asset channel opens over open_channel (issue #2093 step 7)', functi
 				...DEFAULT_CHANNEL_CONFIG,
 				feeratePerKw: 2500,
 				dustLimitSatoshis: 354n,
-				maxAcceptedHtlcs: 30
+				maxAcceptedHtlcs: 5
 			};
 			const p = opening(8120, { alice: { config: { localConfig: tight } } });
 			propose(p);
 			const proposed = decodeOpenChannelMessage(p.wire[0].payload);
 			expect(proposed.dustLimitSatoshis).to.equal(354n);
-			expect(proposed.maxAcceptedHtlcs).to.equal(30);
+			expect(proposed.maxAcceptedHtlcs).to.equal(5);
 		});
 
 		it('funds the output of the funding key tweaked by the asset root', () => {

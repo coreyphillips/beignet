@@ -105,6 +105,8 @@ import {
 import { fixedOutputFeePolicyRefusal } from '../wallet/fixed-output-fees';
 import type { ISpliceWalletInput } from '../channel/channel';
 import { Channel } from '../channel/channel';
+import { auxiliaryMaxHtlcs } from '../channel/auxiliary';
+import { countPendingHtlcs } from '../channel/htlc-policy';
 import { isValidShutdownScript } from '../channel/validation';
 import {
 	estimateSpliceTxWeight,
@@ -2110,6 +2112,9 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		// configuration asked for, it opens and accepts no asset channel, and
 		// the reason is logged and kept for getAuxiliaryAdvertisement().
 		if (config.auxiliaryChannels) {
+			// A number for the HTLCs of an asset channel that cannot be one
+			// is refused here, not at the first open or payment.
+			auxiliaryMaxHtlcs(config.auxiliaryChannels.maxHtlcs);
 			for (const feature of [
 				Feature.OPTION_ASSET_FIXED_HTLC_OUTPUTS,
 				Feature.OPTION_ASSET_CHILD_CUSTODY
@@ -19414,9 +19419,27 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 					);
 				}
 			}
+			const assetChannelState = this.channelManager
+				.getChannel(assetPayment.channelId)
+				?.getFullState();
+			// The node offers no more asset HTLCs at once than it accepts,
+			// whatever the peer would take: each one open is an output to
+			// spend in time, with a fee input of its own, if the channel goes
+			// to the chain. Counted as the channel counts them, and asked
+			// before anything is recorded or sent.
+			const offeredNow = assetChannelState
+				? countPendingHtlcs(assetChannelState, HtlcDirection.OFFERED)
+				: 0;
+			const offeredMost = auxiliaryMaxHtlcs(this.auxiliaryChannels?.maxHtlcs);
+			if (offeredNow >= offeredMost) {
+				throw new AuxiliaryPaymentError(
+					'ASSET_HTLC_LIMIT_REACHED',
+					assetPayment.channelId,
+					`This node has ${offeredNow} asset HTLCs of its own open on the channel and offers no more than ${offeredMost} at once: the payment can be sent once one of them has ended`
+				);
+			}
 			const undelivered =
-				this.channelManager.getChannel(assetPayment.channelId)?.getFullState()
-					.auxiliaryState?.resolvedHtlcs?.size ?? 0;
+				assetChannelState?.auxiliaryState?.resolvedHtlcs?.size ?? 0;
 			if (undelivered > ChannelManager.AUXILIARY_MAX_UNDELIVERED_OUTCOMES) {
 				throw new AuxiliaryPaymentError(
 					'ASSET_OUTCOMES_UNDELIVERED',

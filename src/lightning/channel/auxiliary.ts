@@ -412,6 +412,39 @@ export function requireAuxiliaryProvider(
  * LND holds its asset channels to.
  */
 export const MAX_AUXILIARY_HTLCS_PER_PARTY = 83;
+
+/**
+ * The most HTLCs a node holds open at once on an asset channel, each way,
+ * when its host sets no other number (`IAuxiliaryChannelConfig.maxHtlcs`).
+ *
+ * Every HTLC that is open when a channel goes to the chain is an output
+ * the node has to spend in time, each with a fee input of its own from the
+ * fee pool, which makes a few fee coins per preparation and a block each.
+ * A commitment could carry far more HTLC outputs than a pool can pay for
+ * before they expire. A node with asset channels is an endpoint that makes
+ * and receives single payments, so it announces this number as its
+ * max_accepted_htlcs and offers no more than the same number at once.
+ */
+export const DEFAULT_AUXILIARY_MAX_HTLCS = 8;
+
+/**
+ * The number a host set for the HTLCs its asset channels hold at once, or
+ * the default. Throws for a number that cannot be one: it has to be whole,
+ * at least 1 and no more than an asset channel may carry at all.
+ */
+export function auxiliaryMaxHtlcs(configured: number | undefined): number {
+	if (configured === undefined) return DEFAULT_AUXILIARY_MAX_HTLCS;
+	if (
+		!Number.isInteger(configured) ||
+		configured < 1 ||
+		configured > MAX_AUXILIARY_HTLCS_PER_PARTY
+	) {
+		throw new Error(
+			`The most HTLCs an asset channel holds at once (maxHtlcs) has to be a whole number from 1 to ${MAX_AUXILIARY_HTLCS_PER_PARTY}`
+		);
+	}
+	return configured;
+}
 /** The dust limit of an asset channel: the 354 satoshi carrier of an asset HTLC. */
 export const AUXILIARY_CHANNEL_DUST_LIMIT = 354n;
 

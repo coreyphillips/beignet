@@ -6,7 +6,11 @@
  * Channel state machine to the actual transport layer.
  */
 
-import { auxiliaryProviderError, copyAuxiliaryCommitment } from './auxiliary';
+import {
+	auxiliaryMaxHtlcs,
+	auxiliaryProviderError,
+	copyAuxiliaryCommitment
+} from './auxiliary';
 import { AuxiliaryOpenError } from './auxiliary-guard';
 import { holdAuxiliaryRevokedView } from './auxiliary-revoked';
 import { classifyCommitmentTx } from '../chain/output-resolver';
@@ -1627,7 +1631,11 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			localPerCommitmentSeed: chKeys.perCommitmentSeed
 		});
 		if (opts?.auxiliary) {
-			applyAuxiliaryFunding(state, opts.auxiliary);
+			applyAuxiliaryFunding(
+				state,
+				opts.auxiliary,
+				auxiliaryMaxHtlcs(this.config.auxiliaryChannels?.maxHtlcs)
+			);
 			if (auxiliaryOpen?.csvPolicy) {
 				state.auxiliaryState!.openingCsvPolicy = auxiliaryOpen.csvPolicy;
 			}
@@ -5184,7 +5192,11 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 				chKeys.htlcBasepointSecret
 			);
 			if (auxiliaryOpen) {
-				applyAuxiliaryFunding(state, auxiliaryOpen.descriptor);
+				applyAuxiliaryFunding(
+					state,
+					auxiliaryOpen.descriptor,
+					auxiliaryMaxHtlcs(this.config.auxiliaryChannels?.maxHtlcs)
+				);
 				if (auxiliaryOpen.csvPolicy) {
 					state.auxiliaryState!.openingCsvPolicy = auxiliaryOpen.csvPolicy;
 				}
