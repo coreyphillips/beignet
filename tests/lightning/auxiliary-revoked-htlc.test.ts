@@ -29,6 +29,7 @@ import {
 	SWEEP_DESTINATION,
 	assetChainWorld,
 	errorsOf,
+	gateMessages,
 	holdUnits,
 	monitorRoundTrips,
 	settle,
@@ -504,5 +505,103 @@ describe('the HTLC outputs of a revoked commitment of an asset channel (issue #2
 		await world.mine(pair, 3);
 		expect(outcomes).to.have.length(2);
 		expect(unexpectedRefusals(pair)).to.deep.equal([]);
+	});
+
+	it('says an HTLC whose preimage had been given is fulfilled when a revoked commitment confirms, as the record of its payment says already', async function () {
+		const tag = 'aux-revoked-settled';
+		const outcomes: string[] = [];
+		const pair = await world.open(tag, {
+			feeWallet: { alice: true, bob: true },
+			hooks: {
+				bob: {
+					valueIncomingHtlc: (context: { auxiliaryAmount?: bigint }): bigint =>
+						(context.auxiliaryAmount ?? 0n) * 1000n,
+					onHtlcResolved: (context: {
+						direction: string;
+						outcome: string;
+						auxiliaryAmount: bigint;
+					}): void => {
+						outcomes.push(
+							`${context.direction}:${context.outcome}:${context.auxiliaryAmount}`
+						);
+					}
+				}
+			}
+		});
+		const { bob, channelId } = pair;
+		for (const wallet of [pair.wallets.alice!, pair.wallets.bob!]) {
+			wallet.fund(100_000);
+			wallet.fund(100_000);
+		}
+		await world.mine(pair, 1);
+		const stateOf = (): { localCommitmentNumber: bigint } =>
+			pair.alice.node.getChannelManager().getChannel(channelId)!.getFullState();
+		const number = stateOf().localCommitmentNumber;
+		const copy = `${pair.alicePath}.kept`;
+		kept.push(copy);
+		(pair.alice.storage as unknown as { db: Database.Database }).db.exec(
+			`VACUUM INTO '${copy}'`
+		);
+		// Bob settles a hold: the preimage is with Alice, whose revocation
+		// for the commitment without the HTLC never reaches him.
+		const held = await holdUnits(pair, 5000n, tag);
+		gateMessages(pair, 'alice', () => true);
+		expect(bob.node.settleHeldHtlc(held.paymentHash, held.preimage)).to.equal(
+			true
+		);
+		await settle();
+		const entries = [
+			...bob.node
+				.getChannelManager()
+				.getChannel(channelId)!
+				.getFullState()
+				.htlcs.values()
+		].map((entry) => `${entry.direction}:${entry.state}`);
+		expect(entries).to.deep.equal(['RECEIVED:FULFILLED']);
+		expect(pair.alice.node.getPayment(held.paymentHash)?.status).to.equal(
+			PaymentStatus.COMPLETED
+		);
+		const settled = {
+			status: bob.node.getPayment(held.paymentHash)?.status,
+			parked: parkedOf(bob, held.paymentHash)
+		};
+		expect(settled).to.deep.equal({
+			status: PaymentStatus.COMPLETED,
+			parked: 0
+		});
+		expect(outcomes).to.deep.equal([]);
+
+		await world.restartAlice(pair, tag, undefined, () => {
+			for (const suffix of ['', '-wal', '-shm']) {
+				fs.rmSync(`${pair.alicePath}${suffix}`, { force: true });
+			}
+			fs.copyFileSync(copy, pair.alicePath);
+		});
+		expect(stateOf().localCommitmentNumber).to.equal(number);
+		const closed = pair.alice.node.forceCloseChannel(
+			channelId,
+			SWEEP_DESTINATION
+		);
+		expect(closed.ok, closed.error).to.equal(true);
+		await settle();
+		await world.mine(pair, 1);
+		const h = confirmed(pair, closed.commitmentTxid).height;
+		expect(
+			bob.node.getChannelMonitorState(channelId)!.commitmentBroadcast
+		).to.include({
+			txid: closed.commitmentTxid,
+			commitmentType: CommitmentType.THEIR_REVOKED_COMMITMENT
+		});
+		pair.chain.advance(h + IRREVOCABLE_DEPTH - 1 - pair.chain.height);
+		await settle();
+		expect(outcomes, 'one block short of the depth').to.deep.equal([]);
+		await world.mine(pair, 1);
+		expect(outcomes).to.deep.equal(['RECEIVED:fulfilled:5000']);
+		expect({
+			status: bob.node.getPayment(held.paymentHash)?.status,
+			parked: parkedOf(bob, held.paymentHash)
+		}).to.deep.equal(settled);
+		await world.mine(pair, 3);
+		expect(outcomes).to.have.length(1);
 	});
 });
