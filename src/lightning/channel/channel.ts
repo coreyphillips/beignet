@@ -9352,7 +9352,17 @@ export class Channel {
 			msg.shutdownNonce = this._refreshOurClosingNonce();
 		}
 
-		return [sendMsg(MessageType.SHUTDOWN, encodeShutdownMessage(msg))];
+		// An asset channel: the row (the state, our script and the records
+		// beside it) is written before the shutdown leaves. A node that
+		// stops right after it sent then sends again what the row holds and
+		// does not ask its provider anew: the peer holds the descriptor and
+		// refuses another.
+		return [
+			...(assetShutdown
+				? [{ type: ChannelActionType.PERSIST_STATE } as ChannelAction]
+				: []),
+			sendMsg(MessageType.SHUTDOWN, encodeShutdownMessage(msg))
+		];
 	}
 
 	/**
@@ -9581,6 +9591,13 @@ export class Channel {
 				};
 				if (isTaprootChannel(this._state.channelType)) {
 					response.shutdownNonce = this._refreshOurClosingNonce();
+				}
+				// An asset channel: the row is written before our answer leaves,
+				// as on the side that starts the close (_initiateShutdown). It
+				// holds the state this handler ends in, our script, and the
+				// records of both parties.
+				if (ownAssetShutdown) {
+					actions.push({ type: ChannelActionType.PERSIST_STATE });
 				}
 				actions.push(
 					sendMsg(MessageType.SHUTDOWN, encodeShutdownMessage(response))
