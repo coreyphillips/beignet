@@ -10,7 +10,7 @@
 
 import type * as bitcoin from 'bitcoinjs-lib';
 import { ChannelRole } from './types';
-import { buildClosingTx } from '../chain/closing';
+import { buildClosingTx, closingOutputDustLimit } from '../chain/closing';
 import type { IChannelState } from './channel-state';
 import { requireAuxiliaryProvider } from './auxiliary';
 
@@ -27,6 +27,23 @@ export const MAX_AUXILIARY_CLOSE_OUTPUTS = 64;
  * unilateral exit is what is left then.
  */
 export const MAX_AUXILIARY_CLOSE_CANDIDATES = 32;
+
+/**
+ * The least an output of an asset close may hold: nothing is signed that
+ * no node would relay. A plain bitcoin payout is held to what the ordinary
+ * closing transaction keeps (closingOutputDustLimit: its owner's dust
+ * limit, and never less than its script needs to be relayed). An output
+ * that carries units is a taproot output of the provider's and holds at
+ * least the asset minimum, which is what such an output needs.
+ */
+const payoutFloor = (
+	script: Buffer,
+	ownerDustLimit: bigint,
+	asset: boolean
+): bigint =>
+	asset
+		? AUXILIARY_CLOSE_ASSET_OUTPUT_MINIMUM
+		: closingOutputDustLimit(script, ownerDustLimit);
 
 const isTaprootScript = (script: unknown): script is Buffer =>
 	Buffer.isBuffer(script) &&
@@ -146,18 +163,20 @@ export function applyAuxiliaryClose(
 				throw new Error('Invalid asset close payout');
 			}
 		}
-		for (const [side, amount, units, dust] of [
+		for (const [side, amount, units, dust, script] of [
 			[
 				'local',
 				localAmount,
 				auxiliary.localBalance,
-				state.localConfig.dustLimitSatoshis
+				state.localConfig.dustLimitSatoshis,
+				state.localShutdownScript
 			],
 			[
 				'remote',
 				remoteAmount,
 				auxiliary.remoteBalance,
-				state.remoteConfig.dustLimitSatoshis
+				state.remoteConfig.dustLimitSatoshis,
+				state.remoteShutdownScript
 			]
 		] as const) {
 			const outputs = result.outputs.filter((output) => output.side === side);
@@ -170,11 +189,28 @@ export function applyAuxiliaryClose(
 				}
 			} else if (
 				outputs.some((output) => output.asset) ||
-				(total !== amount && !(total === 0n && amount <= dust))
+				total !== (amount >= closingOutputDustLimit(script, dust) ? amount : 0n)
 			) {
-				// A party without units is paid as in any close: its amount, or
-				// nothing when that is dust.
+				// A party without units is paid as in any close: exactly its
+				// amount, or nothing when that is below the dust limit of the
+				// script it closes to. The trim is required, not allowed.
 				throw new Error('Bitcoin close payout changed');
+			}
+		}
+		// Every output is one a node relays: a layout that keeps a payout
+		// below dust is a close neither party could ever confirm.
+		for (const output of result.outputs) {
+			if (
+				output.value <
+				payoutFloor(
+					output.script,
+					output.side === 'local'
+						? state.localConfig.dustLimitSatoshis
+						: state.remoteConfig.dustLimitSatoshis,
+					output.asset
+				)
+			) {
+				throw new Error('Asset close payout is below dust');
 			}
 		}
 		transaction.outs = result.outputs.map((output) => ({
@@ -198,9 +234,17 @@ export function applyAuxiliaryClose(
 			}
 			transaction.outs[index].script = Buffer.from(script);
 		}
-		for (const [units, index] of [
-			[auxiliary.localBalance, localOutputIndex],
-			[auxiliary.remoteBalance, remoteOutputIndex]
+		for (const [units, index, dust] of [
+			[
+				auxiliary.localBalance,
+				localOutputIndex,
+				state.localConfig.dustLimitSatoshis
+			],
+			[
+				auxiliary.remoteBalance,
+				remoteOutputIndex,
+				state.remoteConfig.dustLimitSatoshis
+			]
 		] as const) {
 			// A party that holds units and has no output, or whose output the
 			// provider left alone, would lose them.
@@ -209,6 +253,18 @@ export function applyAuxiliaryClose(
 				(index === undefined || !result.outputScripts.has(index))
 			) {
 				throw new Error('Missing asset close commitment');
+			}
+			if (index === undefined) continue;
+			// A party without units keeps the script it named.
+			if (units === 0n && result.outputScripts.has(index)) {
+				throw new Error('Bitcoin close payout changed');
+			}
+			// The builder trimmed each payout for the script the party named.
+			// Under the script the provider laid over it, it still has to be
+			// one a node relays.
+			const output = transaction.outs[index];
+			if (BigInt(output.value) < payoutFloor(output.script, dust, units > 0n)) {
+				throw new Error('Asset close payout is below dust');
 			}
 		}
 	}
