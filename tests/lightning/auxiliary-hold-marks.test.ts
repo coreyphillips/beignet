@@ -199,8 +199,15 @@ describe('the marks of a held asset HTLC (issue #2093 step 8)', function () {
 		expect(bob.node.listHeldHtlcs()).to.deep.equal([
 			{ paymentHash, amountMsat: 5_000_000n, htlcCount: 1, auxiliary: true }
 		]);
-		// The parked set itself is stored as it always was.
-		expect(stored(bob)).to.not.include('auxiliary');
+		// The parked HTLC is stored with the mark of an HTLC that carries
+		// units, which the node keeps for the time its channel may be gone.
+		expect(
+			(
+				JSON.parse(stored(bob)) as Array<{
+					htlcs: Array<{ auxiliary?: true }>;
+				}>
+			)[0].htlcs.map((parked) => parked.auxiliary)
+		).to.deep.equal([true]);
 
 		expect(bob.node.settleHeldHtlc(paymentHash, preimage)).to.equal(true);
 		await turns(200);
