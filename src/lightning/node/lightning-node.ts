@@ -32450,16 +32450,9 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 					};
 				},
 				hashInUse: (paymentHash) => this.paymentHashInUse(paymentHash),
-				spendableOutboundMsat: () =>
-					this.channelManager
-						.listChannels()
-						.filter((ch) => ch.acceptsNewHtlcs())
-						.reduce((sum, ch) => sum + ch.getSpendableOutboundMsat(), 0n),
+				spendableOutboundMsat: () => this.swapSpendableOutboundMsat(),
 				ownNodeId: Buffer.from(this.getNodeId(), 'hex'),
-				hasUsableChannelWith: (nodeId) =>
-					this.channelManager
-						.getChannelsByPeer(nodeId.toString('hex'))
-						.some((ch) => ch.acceptsNewHtlcs()),
+				hasUsableChannelWith: (nodeId) => this.swapHasUsableChannelWith(nodeId),
 				broadcast,
 				estimateFee,
 				currentHeight: () => this.currentBlockHeight,
@@ -37148,6 +37141,29 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			}
 		}
 		return undefined;
+	}
+
+	/**
+	 * What this node could send right now to pay a swap's invoice: the
+	 * spendable outbound of every channel that takes an HTLC. An asset
+	 * channel is left out, since its bitcoin only carries asset outputs and
+	 * no ordinary payment goes over it.
+	 */
+	private swapSpendableOutboundMsat(): bigint {
+		return this.channelManager
+			.listChannels()
+			.filter((ch) => ch.acceptsNewHtlcs() && !ch.getFullState().auxiliaryState)
+			.reduce((sum, ch) => sum + ch.getSpendableOutboundMsat(), 0n);
+	}
+
+	/**
+	 * Whether a channel with this peer can carry a swap's payment now. An
+	 * asset channel with it is not one.
+	 */
+	private swapHasUsableChannelWith(nodeId: Buffer): boolean {
+		return this.channelManager
+			.getChannelsByPeer(nodeId.toString('hex'))
+			.some((ch) => ch.acceptsNewHtlcs() && !ch.getFullState().auxiliaryState);
 	}
 
 	private findChannelForPeer(

@@ -693,6 +693,22 @@ describe('receive route selection', () => {
 		);
 	});
 
+	it('never routes a receive over an asset channel with the peer (#2093)', async () => {
+		// The spare channel is the only candidate, and it qualifies on every
+		// other count. As an asset channel the bitcoin on its far side is not
+		// inbound, so the receive is funded directly and nothing is priced
+		// at the peer.
+		const f = fixture({}, { spare: true, jobs: [] });
+		const rows = (f.node.listChannels as () => Channel[])();
+		f.node.listChannels = (): unknown[] =>
+			rows.map((c) =>
+				c.channelId === spareId ? { ...c, auxiliary: true } : c
+			);
+		const quote = await f.coordinator.quote(peer, 20000);
+		assert.equal(quote.mode, 'direct-funding');
+		assert.equal(f.sent.length, 0);
+	});
+
 	it('refuses either mode while the peer is not connected', async () => {
 		for (const peers of [
 			[],
