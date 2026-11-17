@@ -466,9 +466,11 @@ describe('durable fixed-output fee preparation', () => {
 			'asset-anchor'
 		);
 	});
-	it('counts pending action caps and preparation fees toward the lifetime budget', async () => {
+	it('counts the cap of an action that has no fee coin, the coins of one that has, and preparation fees toward the lifetime budget', async () => {
 		const f = fixture();
-		f.policy.maxTotalFeeSatoshis = 4250n;
+		// Room for one cap beside a preparation, and for one cap beside an
+		// action that holds its coin, and not for one beside two of those.
+		f.policy.maxTotalFeeSatoshis = 3100n;
 		const p = f.provider();
 		await prepare(p);
 		await p.selectFeeBumpInputs(500n, 250, opts);
@@ -933,8 +935,9 @@ describe('durable fixed-output fee preparation', () => {
 			'FEE_ACTION_RETIRED',
 			'none'
 		);
-		// So the retired action is charged nothing, and two more actions fit
-		// where one did.
+		// So the retired action is charged nothing. An action that has its
+		// coin holds the coin, not its cap, so four more fit, and a fifth,
+		// which would hold a cap beside them, does not.
 		expect(f.provider().getFixedOutputFeeBudget()).deep.equal({
 			totalSatoshis: 4250n,
 			reservedSatoshis: 0n,
@@ -947,10 +950,16 @@ describe('durable fixed-output fee preparation', () => {
 		await f
 			.provider()
 			.selectFeeBumpInputs(500n, 250, { ...opts, feeActionId: 'third' });
+		await f
+			.provider()
+			.selectFeeBumpInputs(500n, 250, { ...opts, feeActionId: 'fourth' });
+		await f
+			.provider()
+			.selectFeeBumpInputs(500n, 250, { ...opts, feeActionId: 'fifth' });
 		await reject(
 			f
 				.provider()
-				.selectFeeBumpInputs(500n, 250, { ...opts, feeActionId: 'fourth' }),
+				.selectFeeBumpInputs(500n, 250, { ...opts, feeActionId: 'sixth' }),
 			'lifetime fee budget'
 		);
 	});
@@ -1129,17 +1138,19 @@ describe('a fixed-output fee policy lowered below what the journal holds', () =>
 			sequence: i.sequence
 		}));
 
-	it('builds with a total below what is reserved, serves every recorded action and refuses only a new one, by name', async () => {
+	it('builds with a total below what is held, serves every recorded action with what it holds and refuses what needs more of the budget, by name', async () => {
 		const f = fixture(),
 			p = f.provider();
 		await prepare(p);
 		const first = await p.selectFeeBumpInputs(500n, 250, opts);
 		const fee = splitFee(f);
+		// The action has its coin: it holds the coin, not its cap.
+		const held = first.inputs[0].value;
 		expect(p.getFixedOutputFeeBudget()).deep.equal({
 			totalSatoshis: 20000n,
-			reservedSatoshis: 2000n,
+			reservedSatoshis: held,
 			spentSatoshis: fee,
-			remainingSatoshis: 18000n - fee
+			remainingSatoshis: 20000n - held - fee
 		});
 
 		// The setting goes down, and the wallet restarts.
@@ -1148,25 +1159,33 @@ describe('a fixed-output fee policy lowered below what the journal holds', () =>
 		expect(q.supportsFixedOutputFees()).equal(true);
 		expect(q.getFixedOutputFeeBudget()).deep.equal({
 			totalSatoshis: 100n,
-			reservedSatoshis: 2000n,
+			reservedSatoshis: held,
 			spentSatoshis: fee,
 			remainingSatoshis: 0n
 		});
-		// The recorded action is restored with the coins and the cap it had,
-		// replaced with a second coin, and listed for its channel as before.
+		// The recorded action is restored with the coins and the cap it had
+		// and listed for its channel as before.
 		const again = await q.selectFeeBumpInputs(500n, 250, opts);
 		expect(outpoints(again)).deep.equal(outpoints(first));
 		expect(again.maxFeeSatoshis).equal(2000n);
 		f.confirm();
-		const replaced = await q.selectFeeBumpInputs(900n, 250, {
-			...opts,
-			replacementInputs: replacementOf(again)
-		});
-		expect(replaced.inputs).length(2);
+		// A raise that takes a second coin asks the budget for that coin,
+		// and the budget as it is now set has no room: the action keeps the
+		// coin it has.
+		const raise = await exhausted(
+			q.selectFeeBumpInputs(900n, 250, {
+				...opts,
+				replacementInputs: replacementOf(again)
+			})
+		);
+		expect(raise.code).equal('FEE_BUDGET_EXHAUSTED');
+		expect(raise.neededSatoshis).equal(held);
+		const replaced = await q.selectFeeBumpInputs(500n, 250, opts);
+		expect(outpoints(replaced)).deep.equal(outpoints(first));
 		const restored = await q.restoreFeeBumpInputs(replaced.inputs);
-		expect(restored).length(2);
+		expect(restored).length(1);
 
-		// Only new spending is refused, with the figures.
+		// New spending is refused, with the figures.
 		const refusal = await exhausted(
 			q.selectFeeBumpInputs(500n, 250, { ...opts, feeActionId: 'second' })
 		);
@@ -1175,7 +1194,7 @@ describe('a fixed-output fee policy lowered below what the journal holds', () =>
 		expect(refusal.budget).deep.equal(q.getFixedOutputFeeBudget());
 		expect(refusal.message).equal(
 			'Fixed-output lifetime fee budget is used up: 2000 sats are needed and ' +
-				`0 of 100 remain (2000 reserved, ${fee} spent)`
+				`0 of 100 remain (${held} reserved, ${fee} spent)`
 		);
 		expect(Object.keys(f.journal().actions)).length(1);
 
@@ -1318,7 +1337,10 @@ describe('a fixed-output fee policy lowered below what the journal holds', () =>
 			feeActionId: 'second'
 		});
 		const fee = splitFee(f);
-		expect(p.getFixedOutputFeeBudget()?.reservedSatoshis).equal(4000n);
+		// Each holds its coin.
+		expect(p.getFixedOutputFeeBudget()?.reservedSatoshis).equal(
+			first.inputs[0].value + second.inputs[0].value
+		);
 
 		// The first action's transaction spent its coin, and is named.
 		await p.retireFixedOutputFeeAction(opts.feeActionId, {
@@ -1326,9 +1348,10 @@ describe('a fixed-output fee policy lowered below what the journal holds', () =>
 		});
 		expect(p.getFixedOutputFeeBudget()).deep.equal({
 			totalSatoshis: 20000n,
-			reservedSatoshis: 2000n,
+			reservedSatoshis: second.inputs[0].value,
 			spentSatoshis: fee + first.inputs[0].value,
-			remainingSatoshis: 18000n - fee - first.inputs[0].value
+			remainingSatoshis:
+				20000n - second.inputs[0].value - fee - first.inputs[0].value
 		});
 
 		// The second is retired with nothing named. The wallet still lists
@@ -1543,8 +1566,9 @@ describe('a fee coin pool that one split cannot stop', () => {
 			.coins()
 			.find((c) => c.tx_hash === split && c.value > 40000)!;
 		expect(f.frozen.has(`${split}:${change.tx_pos}`)).equal(false);
+		// The action holds the coin it took, not its cap of 60000.
 		expect(f.provider().getFixedOutputFeeBudget()!.reservedSatoshis).equal(
-			60000n
+			568n
 		);
 	});
 
@@ -1873,7 +1897,7 @@ describe('the fee journal, its size and a restore without it', function () {
 		// source of the split that made them.
 		expect(ownTags(f).filter((tag) => tag.includes(':action:'))).length(1);
 		expect(ownTags(f).filter((tag) => tag.endsWith(':coin'))).length(3);
-		expect(p.getFixedOutputFeeBudget()!.reservedSatoshis).equal(2000n);
+		expect(p.getFixedOutputFeeBudget()!.reservedSatoshis).equal(568n);
 		// A restore puts the node's database back without the fee journal,
 		// and the wallet keeps its freezes.
 		f.store.rows.clear();

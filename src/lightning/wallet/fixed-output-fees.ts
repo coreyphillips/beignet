@@ -107,7 +107,11 @@ export class FixedOutputFeePreparationPendingError extends FixedOutputFeeError {
 export interface IFixedOutputFeeBudget {
 	/** The policy's maxTotalFeeSatoshis. */
 	totalSatoshis: bigint;
-	/** The caps of the actions still open, and of the splits not yet signed. */
+	/**
+	 * What the actions still open can still spend (the cap of one that has
+	 * no fee coin yet, the fee coins of one that has), and the fees of the
+	 * splits not yet signed.
+	 */
 	reservedSatoshis: bigint;
 	/** What retired actions were charged, and the fees of the splits that were signed. */
 	spentSatoshis: bigint;
@@ -488,6 +492,20 @@ export class FixedOutputFeePool {
 			throw new Error('Invalid fixed-output fee charge');
 	}
 	/** What a journal charges the lifetime budget, by what it is charged for. */
+	/**
+	 * What an open action can still spend, which is what it holds against
+	 * the budget: its cap until it has fee coins, and from then on the coins
+	 * it holds with those it let go of (an earlier form of its spend may
+	 * still be the one a block takes), never more than its cap.
+	 */
+	private held(action: Action): bigint {
+		const cap = BigInt(action.cap);
+		if (!action.inputs.length) return cap;
+		let sum = 0n;
+		for (const coin of action.inputs) sum += BigInt(coin.utxo.value);
+		for (const coin of action.gone ?? []) sum += BigInt(coin.value);
+		return sum < cap ? sum : cap;
+	}
 	private usage(data: Journal): { reserved: bigint; spent: bigint } {
 		let reserved = 0n,
 			spent = BigInt(data.spent ?? '0');
@@ -495,7 +513,7 @@ export class FixedOutputFeePool {
 			// A retired action is charged what its retirement recorded. One
 			// retired before that was recorded is charged its whole cap.
 			if (action.retired) spent += BigInt(action.paid ?? action.cap);
-			else reserved += BigInt(action.cap);
+			else reserved += this.held(action);
 		}
 		for (const preparation of data.preparations) {
 			// A signed split has its exact fee and may be on the wire.
@@ -2122,8 +2140,13 @@ export class FixedOutputFeePool {
 			);
 		const next = copy(this.journal),
 			taken = new Set(selected.map((coin) => key(coin.utxo)));
+		const before = this.held(next.actions[id]);
 		next.actions[id].inputs = selected;
 		if (gone.length) next.actions[id].gone = gone;
+		// An action that takes more than it held, as a raise does, needs
+		// room in the budget for the difference.
+		const more = this.held(next.actions[id]) - before;
+		if (more > 0n) this.assertRoom(more);
 		if (next.coins)
 			next.coins = next.coins.filter((coin) => !taken.has(key(coin.utxo)));
 		this.save(next);
