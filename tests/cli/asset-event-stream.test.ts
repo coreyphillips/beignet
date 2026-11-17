@@ -8,7 +8,9 @@
  * each daemon relays of it is read twice, as its SSE stream and as the
  * bodies its webhook delivers, and every event of the asset channel, of
  * its payments, of the invoices they paid and of its holds says
- * `auxiliary: true`.
+ * `auxiliary: true`. Each asset payment is sent over the route the node
+ * itself finds for the asset channel (`queryAuxiliaryRoute`), as a host
+ * sends one, and its event carries the fee of that route as a number.
  *
  * The same is then done over an ordinary channel between the same two
  * wallets, which by then hold the asset channel and its payments. What
@@ -29,11 +31,13 @@ import type {
 import { Feature, FeatureFlags } from '../../src/lightning/features/flags';
 import {
 	openAssetChannel,
-	payAssetUnits,
 	withAssetOpens,
 	type IAssetHost
 } from '../lightning/helpers/auxiliary-nodes';
-import { referenceProvider } from '../lightning/helpers/auxiliary-pair';
+import {
+	amountRecord,
+	referenceProvider
+} from '../lightning/helpers/auxiliary-pair';
 import { createHash } from 'crypto';
 import {
 	asWebhookSends,
@@ -103,6 +107,47 @@ const dataOf = (frames: TFrame[], event: string): Record<string, unknown>[] =>
 	frames
 		.filter(([name]) => name === event)
 		.map(([, data]) => JSON.parse(data) as Record<string, unknown>);
+
+/**
+ * An asset payment as a host sends one: over the route the node itself
+ * finds for the asset channel, with the units in the record the provider
+ * reads. A route written by hand has no totals, and an event of a payment
+ * sent over one has no fee to say.
+ */
+const payUnits = (
+	payer: IAssetHost,
+	payee: IAssetHost,
+	channelId: Buffer,
+	invoice: { paymentHash: Buffer; paymentSecret?: Buffer },
+	units: bigint
+): void => {
+	const route = payer.node.queryAuxiliaryRoute(
+		channelId,
+		Buffer.from(payee.node.getNodeId(), 'hex'),
+		units * 1000n,
+		units * 1000n
+	);
+	expect(route, 'a route over the asset channel').to.not.equal(null);
+	expect(route!.hops).to.have.length(1);
+	expect(route!.totalFeeMsat).to.equal(0n);
+	payer.node.sendPaymentToRoute(
+		route!,
+		invoice.paymentHash,
+		40,
+		invoice.paymentSecret,
+		undefined,
+		undefined,
+		undefined,
+		undefined,
+		{
+			assetPayment: {
+				channelId,
+				wireAmountMsat: 354_000n,
+				customRecords: amountRecord(units)
+			}
+		}
+	);
+};
 
 /** The frames as a webhook sends them, in an order two lists can share. */
 const sorted = (frames: TFrame[]): string[] =>
@@ -179,13 +224,13 @@ describe('What two daemons stream of an asset channel and of an ordinary one (is
 			amountMsat: 1_000_000n,
 			description: 'units there'
 		});
-		payAssetUnits(aliceHost, bobHost, channelId, there, 1_000_000n, 1000n);
+		payUnits(aliceHost, bobHost, channelId, there, 1000n);
 		await streamTurns();
 		const back = alice.node.createInvoice({
 			amountMsat: 500_000n,
 			description: 'units back'
 		});
-		payAssetUnits(bobHost, aliceHost, channelId, back, 500_000n, 500n);
+		payUnits(bobHost, aliceHost, channelId, back, 500n);
 		await streamTurns();
 		const preimage = sha('units held and settled');
 		const held = bob.node.createInvoice({
@@ -194,7 +239,7 @@ describe('What two daemons stream of an asset channel and of an ordinary one (is
 			hold: true,
 			paymentHash: sha(preimage)
 		});
-		payAssetUnits(aliceHost, bobHost, channelId, held, 2_000_000n, 2000n);
+		payUnits(aliceHost, bobHost, channelId, held, 2000n);
 		await streamTurns();
 		expect(bob.node.settleHeldHtlc(sha(preimage), preimage)).to.equal(true);
 		await streamTurns();
@@ -205,7 +250,7 @@ describe('What two daemons stream of an asset channel and of an ordinary one (is
 			hold: true,
 			paymentHash: refused
 		});
-		payAssetUnits(aliceHost, bobHost, channelId, failed, 1_500_000n, 1500n);
+		payUnits(aliceHost, bobHost, channelId, failed, 1500n);
 		await streamTurns();
 		expect(bob.node.cancelHoldInvoice(refused)?.htlcsFailed).to.equal(1);
 		await streamTurns();
@@ -276,6 +321,25 @@ describe('What two daemons stream of an asset channel and of an ordinary one (is
 				(data) => data.auxiliaryValueSats
 			)
 		).to.deep.equal([500]);
+		// Each went out over the route the node found for it, so its event
+		// says what the route cost as a number: nothing, over a channel
+		// with the payee itself.
+		for (const [who, stream] of Object.entries(asset)) {
+			for (const frames of [stream.sse, stream.hooks]) {
+				const out = [
+					...dataOf(frames, 'payment:sent'),
+					...dataOf(frames, 'payment:failed')
+				];
+				expect(out, who).to.have.length(who === 'alice' ? 3 : 1);
+				for (const data of out) {
+					expect(data.feeSats, who).to.equal(0);
+					expect(data.route, who).to.include({
+						totalFeeMsat: 0,
+						hopCount: 1
+					});
+				}
+			}
+		}
 		// A hold says what the node holds for the HTLC.
 		expect(
 			[
