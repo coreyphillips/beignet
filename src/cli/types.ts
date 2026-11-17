@@ -796,6 +796,13 @@ export interface HoldInvoiceInfo {
 	earliestExpiry: number | null;
 	cancelMarginBlocks: number;
 	cancelHeight: number | null;
+	/**
+	 * True while a parked part of the set is an asset HTLC and after such a
+	 * set settled (issue #2093), and absent on every other row.
+	 * `heldAmountMsat` is then what the node holds for those HTLCs: what the
+	 * asset provider said they are worth, not bitcoin to be received.
+	 */
+	auxiliary?: true;
 }
 
 /**
@@ -814,6 +821,11 @@ export interface HoldInvoiceEvent {
 	earliestExpiry: number | null;
 	cancelMarginBlocks: number;
 	cancelHeight: number | null;
+	/**
+	 * True when a part of the set the transition acted on is an asset HTLC
+	 * (issue #2093), and absent on every other event.
+	 */
+	auxiliary?: true;
 }
 
 export interface DecodedInvoice {

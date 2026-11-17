@@ -1521,7 +1521,8 @@ describe('Asset payments (issue #2093, step 8)', function () {
 				'IAuxiliaryChannelInfo.undeliveredOutcomes',
 				'onHtlcResolved:never-sent',
 				'getFixedOutputFeeStatus',
-				'IPaymentInfo.unresolved'
+				'IPaymentInfo.unresolved',
+				'IHoldInvoiceStateEvent.auxiliary'
 			]);
 			expect(Object.isFrozen(api)).to.equal(true);
 			expect(Object.isFrozen(api.surfaces)).to.equal(true);

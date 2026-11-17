@@ -1893,6 +1893,12 @@ export interface IHoldInvoiceStateEvent {
 	earliestExpiry: number | null;
 	cancelMarginBlocks: number;
 	cancelHeight: number | null;
+	/**
+	 * Asset channels (issue #2093): true when a part of the set the
+	 * transition acted on is an HTLC that holds units, and absent on every
+	 * other. heldAmountMsat is then what the node has for those HTLCs.
+	 */
+	auxiliary?: true;
 }
 
 /** Payload of the 'hold:cancelled' node event. */
@@ -1907,6 +1913,8 @@ export interface IHoldCancelledEvent {
 	earliestExpiry: number | null;
 	cancelMarginBlocks: number;
 	cancelHeight: number | null;
+	/** Asset channels: true when a part failed back held units; absent otherwise. */
+	auxiliary?: true;
 }
 
 // ─── Typed Payment Errors ───

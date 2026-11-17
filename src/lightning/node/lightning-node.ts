@@ -1407,7 +1407,11 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 					failureCode: number;
 					reason: HoldCancelReason;
 			  }
-		) & { resolved: Array<{ amountMsat: bigint; cltvExpiry: number }> }
+		) & {
+			resolved: Array<{ amountMsat: bigint; cltvExpiry: number }>;
+			/** Asset channels: a part of the set, resolved or parked, holds units. */
+			auxiliary?: true;
+		}
 	> = new Map();
 	private holdInvoiceEventQueue: THoldInvoiceEvent[] = [];
 	private emittingHoldInvoiceEvent = false;
@@ -3775,6 +3779,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 						failureCode?: number;
 						reason?: HoldCancelReason;
 						resolved: Array<{ amountMsat: string; cltvExpiry: number }>;
+						auxiliary?: true;
 					};
 				}>;
 				for (const entry of parsed) {
@@ -3796,16 +3801,18 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 						amountMsat: BigInt(h.amountMsat),
 						cltvExpiry: h.cltvExpiry
 					}));
+					const mark = r.auxiliary === true ? { auxiliary: true as const } : {};
 					this.heldResolutions.set(
 						entry.hashHex,
 						r.outcome === 'settle'
-							? { outcome: 'settle', resolved }
+							? { outcome: 'settle', resolved, ...mark }
 							: {
 									outcome: 'cancel',
 									failureCode:
 										r.failureCode ?? INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS,
 									reason: r.reason ?? 'api',
-									resolved
+									resolved,
+									...mark
 							  }
 					);
 				}
@@ -23822,6 +23829,23 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	}
 
 	/**
+	 * Asset channels: whether a part of a parked set is an HTLC that holds
+	 * units. Read from the channel, which is where the units of an HTLC are
+	 * kept, so nothing is stored beside the set to say it.
+	 */
+	private heldSetCarriesUnits(
+		held: ReadonlyArray<{ channelId: Buffer; htlcId: bigint }>
+	): boolean {
+		return held.some(
+			(h) =>
+				this.channelManager
+					.getChannel(h.channelId)
+					?.getFullState()
+					.htlcs.get(`received-${h.htlcId}`)?.auxiliaryAmount !== undefined
+		);
+	}
+
+	/**
 	 * Park a validated incoming HTLC for a hold invoice. It awaits release via
 	 * settleHeldHtlc / cancelHeldHtlc (or the CLTV sweeper). Emits 'htlc:held',
 	 * and 'hold:accepted' when the part actually joined the set.
@@ -23866,7 +23890,10 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 					state: 'ACCEPTED',
 					heldAmountMsat: parked.reduce((sum, h) => sum + h.amountMsat, 0n),
 					htlcCount: parked.length,
-					...this.heldSetExpiry(hashHex, parked)
+					...this.heldSetExpiry(hashHex, parked),
+					...(this.heldSetCarriesUnits(parked)
+						? { auxiliary: true as const }
+						: {})
 				};
 				this.emitHoldInvoiceEvent({ name: 'hold:accepted', event });
 			}
@@ -23940,19 +23967,15 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		// Asset channels: a part the asset provider refused, and whether the
 		// set is paid in asset units.
 		let providerRefused = false;
-		const carriesUnits = held.some(
-			(h) =>
-				this.channelManager
-					.getChannel(h.channelId)
-					?.getFullState()
-					.htlcs.get(`received-${h.htlcId}`)?.auxiliaryAmount !== undefined
-		);
+		const carriesUnits =
+			prior?.auxiliary === true || this.heldSetCarriesUnits(held);
 		try {
 			// Bound before the first fulfil leaves: a block handled on this stack,
 			// or a restart after it, must not fail back a part still to come.
 			this.heldResolutions.set(hashHex, {
 				outcome: 'settle',
-				resolved: prior?.resolved ?? []
+				resolved: prior?.resolved ?? [],
+				...(carriesUnits ? { auxiliary: true as const } : {})
 			});
 			this.persistHeldHtlcs();
 			for (const h of held) {
@@ -24020,7 +24043,8 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			return false;
 		}
 		const settledSet = this.advanceHeldResolution(hashHex, held, refused, {
-			outcome: 'settle'
+			outcome: 'settle',
+			...(carriesUnits ? { auxiliary: true as const } : {})
 		});
 		if (!settledSet) return false;
 		const settledMsat = settledSet.reduce((sum, h) => sum + h.amountMsat, 0n);
@@ -24066,7 +24090,8 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			state: 'SETTLED',
 			heldAmountMsat: settledMsat,
 			htlcCount: settledSet.length,
-			...this.heldSetExpiry(hashHex, settledSet)
+			...this.heldSetExpiry(hashHex, settledSet),
+			...(carriesUnits ? { auxiliary: true as const } : {})
 		};
 		this.emitHoldInvoiceEvent({ name: 'hold:settled', event });
 		return true;
@@ -24088,9 +24113,10 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			cltvExpiry: number;
 		}>,
 		refused: typeof held,
-		chosen:
+		chosen: (
 			| { outcome: 'settle' }
 			| { outcome: 'cancel'; failureCode: number; reason: HoldCancelReason }
+		) & { auxiliary?: true }
 	): Array<{ amountMsat: bigint; cltvExpiry: number }> | null {
 		const resolved = [
 			...(this.heldResolutions.get(hashHex)?.resolved ?? []),
@@ -24217,13 +24243,17 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		this.resolvingHeldHtlcs.add(hashHex);
 		const refused: typeof held = [];
 		let providerRefused = false;
+		// Asset channels: read before a fail leaves, as the settle reads it.
+		const carriesUnits =
+			chosen?.auxiliary === true || this.heldSetCarriesUnits(held);
 		try {
 			// Bound before the first fail leaves, as in settleHeldHtlc.
 			this.heldResolutions.set(hashHex, {
 				outcome: 'cancel',
 				failureCode,
 				reason: cancelReason,
-				resolved: chosen?.resolved ?? []
+				resolved: chosen?.resolved ?? [],
+				...(carriesUnits ? { auxiliary: true as const } : {})
 			});
 			this.persistHeldHtlcs();
 			for (const h of held) {
@@ -24281,7 +24311,8 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		const failedSet = this.advanceHeldResolution(hashHex, held, refused, {
 			outcome: 'cancel',
 			failureCode,
-			reason: cancelReason
+			reason: cancelReason,
+			...(carriesUnits ? { auxiliary: true as const } : {})
 		});
 		if (!failedSet) return false;
 
@@ -24290,7 +24321,8 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			cancelReason,
 			failedSet.length,
 			failedSet.reduce((sum, h) => sum + h.amountMsat, 0n),
-			failedSet
+			failedSet,
+			carriesUnits
 		);
 		this.emitStructuredLog('htlc', 'held_cancelled', {
 			paymentHash: hashHex,
@@ -24309,7 +24341,8 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		reason: HoldCancelReason,
 		htlcsFailed: number,
 		heldAmountMsat: bigint,
-		failedSet: ReadonlyArray<{ cltvExpiry: number }> = []
+		failedSet: ReadonlyArray<{ cltvExpiry: number }> = [],
+		carriesUnits = false
 	): void {
 		// Read before the invoice's delta record is touched: the event names
 		// the set the cancel acted on, expiry included.
@@ -24357,7 +24390,8 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			reason,
 			htlcsFailed,
 			heldAmountMsat,
-			...expiry
+			...expiry,
+			...(carriesUnits ? { auxiliary: true as const } : {})
 		};
 		this.emitHoldInvoiceEvent({ name: 'hold:cancelled', event });
 	}
@@ -24451,6 +24485,11 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		earliestExpiry: number | null;
 		cancelMarginBlocks: number;
 		cancelHeight: number | null;
+		/**
+		 * Asset channels: true while a parked part of the set is an HTLC
+		 * that holds units and after such a set settled; absent otherwise.
+		 */
+		auxiliary?: true;
 	}> {
 		const out: ReturnType<LightningNode['listHoldInvoices']> = [];
 		for (const [hashHex, invoice] of this.invoices) {
@@ -24473,7 +24512,10 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				minFinalCltvExpiry: this.minFinalCltvExpiryFor(hashHex),
 				earliestExpiry: snapshot?.earliestExpiry ?? null,
 				cancelMarginBlocks: HELD_HTLC_EXPIRY_MARGIN,
-				cancelHeight: snapshot?.cancelHeight ?? null
+				cancelHeight: snapshot?.cancelHeight ?? null,
+				...(invoice.auxiliary === true || this.heldSetCarriesUnits(held)
+					? { auxiliary: true as const }
+					: {})
 			});
 		}
 		return out;
@@ -24676,6 +24718,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				failureCode?: number;
 				reason?: HoldCancelReason;
 				resolved: Array<{ amountMsat: string; cltvExpiry: number }>;
+				auxiliary?: true;
 			};
 		}> = [];
 		for (const [hashHex, held] of this.heldHtlcs) {
@@ -24711,19 +24754,18 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		paymentHash: Buffer;
 		amountMsat: bigint;
 		htlcCount: number;
+		/** Asset channels: true when a parked part holds units. */
+		auxiliary?: true;
 	}> {
-		const out: Array<{
-			paymentHash: Buffer;
-			amountMsat: bigint;
-			htlcCount: number;
-		}> = [];
+		const out: ReturnType<LightningNode['listHeldHtlcs']> = [];
 		for (const [hashHex, held] of this.heldHtlcs) {
 			let total = 0n;
 			for (const h of held) total += h.amountMsat;
 			out.push({
 				paymentHash: Buffer.from(hashHex, 'hex'),
 				amountMsat: total,
-				htlcCount: held.length
+				htlcCount: held.length,
+				...(this.heldSetCarriesUnits(held) ? { auxiliary: true as const } : {})
 			});
 		}
 		return out;

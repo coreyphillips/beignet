@@ -6276,6 +6276,11 @@ export function getOpenApiSpec(): Record<string, unknown> {
 							nullable: true,
 							description:
 								'earliestExpiry minus cancelMarginBlocks: the first height the sweeper fails the parked parts back; null before any part is committed'
+						},
+						auxiliary: {
+							type: 'boolean',
+							description:
+								'Present, and true, only while a parked part of the set is an asset HTLC and after such a set settled. heldAmountMsat is then what the node holds for those HTLCs, which is what the asset provider said they are worth. Absent on every other row.'
 						}
 					}
 				},

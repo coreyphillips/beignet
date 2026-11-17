@@ -53,7 +53,10 @@ export const AUXILIARY_CHANNELS_API = Object.freeze({
 		'getFixedOutputFeeStatus',
 		// A PENDING payment record that had an HTLC on an asset channel a
 		// capsule restore left out carries unresolved, and stays PENDING.
-		'IPaymentInfo.unresolved'
+		'IPaymentInfo.unresolved',
+		// The hold:* events and the rows of listHoldInvoices and listHeldHtlcs
+		// carry auxiliary: true for a set with an HTLC that holds units.
+		'IHoldInvoiceStateEvent.auxiliary'
 	] as const)
 });
 

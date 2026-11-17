@@ -1012,7 +1012,7 @@ function chain.selectTheirPerCommitmentPoint(tx: bitcoinjs-lib#Transaction, stat
 function chain.signP2wpkhInput(tx: bitcoinjs-lib#Transaction, inputIndex: number, pubkey: Buffer, value: number, privateKey: Buffer): Buffer
 function chain.signSweepInput(tx: bitcoinjs-lib#Transaction, inputIndex: number, witnessScript: Buffer, value: number, privateKey: Buffer, sighashType?: number): Buffer
 namespace channel
-const channel.AUXILIARY_CHANNELS_API: Readonly<{ version: 1; surfaces: readonly [ "valueIncomingHtlc:three-outcome", "sendPaymentToRoute:assetPayment", "getAuxiliaryPaymentHtlcs", "onHtlcResolved:htlcId", "queryAuxiliaryRoute", "fundAuxiliaryChannel:unsigned", "onFundingSigned", "abandonAuxiliaryOpen", "IChannelInfo.auxiliary", "setAuxiliaryPaymentGate", "getChannelMonitorState", "IPaymentInfo.auxiliary", "IPaymentInfo.auxiliaryValueMsat", "IInvoiceInfo.auxiliary", "IAuxiliaryChannelInfo.undeliveredOutcomes", "onHtlcResolved:never-sent", "getFixedOutputFeeStatus", "IPaymentInfo.unresolved" ]; }>
+const channel.AUXILIARY_CHANNELS_API: Readonly<{ version: 1; surfaces: readonly [ "valueIncomingHtlc:three-outcome", "sendPaymentToRoute:assetPayment", "getAuxiliaryPaymentHtlcs", "onHtlcResolved:htlcId", "queryAuxiliaryRoute", "fundAuxiliaryChannel:unsigned", "onFundingSigned", "abandonAuxiliaryOpen", "IChannelInfo.auxiliary", "setAuxiliaryPaymentGate", "getChannelMonitorState", "IPaymentInfo.auxiliary", "IPaymentInfo.auxiliaryValueMsat", "IInvoiceInfo.auxiliary", "IAuxiliaryChannelInfo.undeliveredOutcomes", "onHtlcResolved:never-sent", "getFixedOutputFeeStatus", "IPaymentInfo.unresolved", "IHoldInvoiceStateEvent.auxiliary" ]; }>
 const channel.AUXILIARY_CHANNEL_DUST_LIMIT = 354n
 const channel.AUXILIARY_CLOSE_ASSET_OUTPUT_MINIMUM = 330n
 class channel.AuxiliaryChannelUnsupportedError extends beignet#CodedError<'ASSET_CHANNEL_UNSUPPORTED'>
@@ -5837,6 +5837,7 @@ property node.IHeldInvoiceSnapshot.parts: node.IHeldInvoicePart[]
 property node.IHeldInvoiceSnapshot.paymentHash: Buffer
 property node.IHeldInvoiceSnapshot.state: node.HoldInvoiceState
 interface node.IHoldCancelledEvent
+property node.IHoldCancelledEvent.auxiliary?: true
 property node.IHoldCancelledEvent.cancelHeight: number | null
 property node.IHoldCancelledEvent.cancelMarginBlocks: number
 property node.IHoldCancelledEvent.earliestExpiry: number | null
@@ -5846,6 +5847,7 @@ property node.IHoldCancelledEvent.minFinalCltvExpiry: number
 property node.IHoldCancelledEvent.paymentHash: Buffer
 property node.IHoldCancelledEvent.reason: node.HoldCancelReason
 interface node.IHoldInvoiceStateEvent
+property node.IHoldInvoiceStateEvent.auxiliary?: true
 property node.IHoldInvoiceStateEvent.cancelHeight: number | null
 property node.IHoldInvoiceStateEvent.cancelMarginBlocks: number
 property node.IHoldInvoiceStateEvent.earliestExpiry: number | null
@@ -6322,8 +6324,8 @@ method node.LightningNode.listCompositeSplices(): channel.ICompositeSpliceRecord
 method node.LightningNode.listExternalClosePayments(): Array<{ channelId: string; txid: string; scriptHex: string; amountSats: number; feeSats: number; networkFeeSats: number; satsPerVbyte: number; timestamp: number; confirmationHeight: number; }>
 method node.LightningNode.listForwards(filter?: storage.IForwardingEventFilter): storage.IForwardingEvent[]
 method node.LightningNode.listHeldForwards(): asyncPayments.IHeldForwardRecord[]
-method node.LightningNode.listHeldHtlcs(): Array<{ paymentHash: Buffer; amountMsat: bigint; htlcCount: number; }>
-method node.LightningNode.listHoldInvoices(): Array<{ paymentHash: string; bolt11: string; amountMsat?: bigint; description?: string; expiry: number; createdAt: number; state: node.HoldInvoiceState; heldAmountMsat: bigint; htlcCount: number; minFinalCltvExpiry: number; earliestExpiry: number | null; cancelMarginBlocks: number; cancelHeight: number | null; }>
+method node.LightningNode.listHeldHtlcs(): Array<{ paymentHash: Buffer; amountMsat: bigint; htlcCount: number; auxiliary?: true; }>
+method node.LightningNode.listHoldInvoices(): Array<{ paymentHash: string; bolt11: string; amountMsat?: bigint; description?: string; expiry: number; createdAt: number; state: node.HoldInvoiceState; heldAmountMsat: bigint; htlcCount: number; minFinalCltvExpiry: number; earliestExpiry: number | null; cancelMarginBlocks: number; cancelHeight: number | null; auxiliary?: true; }>
 method node.LightningNode.listInvoices(): node.IInvoiceInfo[]
 method node.LightningNode.listPayments(): node.IPaymentInfo[]
 method node.LightningNode.listPeers(): transport.IPeerInfo[]

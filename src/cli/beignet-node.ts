@@ -2184,7 +2184,8 @@ export function holdInvoiceEvent(e: IHoldInvoiceStateEvent): HoldInvoiceEvent {
 		minFinalCltvExpiry: e.minFinalCltvExpiry,
 		earliestExpiry: e.earliestExpiry,
 		cancelMarginBlocks: e.cancelMarginBlocks,
-		cancelHeight: e.cancelHeight
+		cancelHeight: e.cancelHeight,
+		...(e.auxiliary === true ? { auxiliary: true as const } : {})
 	};
 }
 
@@ -4487,7 +4488,8 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 					minFinalCltvExpiry: e.minFinalCltvExpiry,
 					earliestExpiry: e.earliestExpiry,
 					cancelMarginBlocks: e.cancelMarginBlocks,
-					cancelHeight: e.cancelHeight
+					cancelHeight: e.cancelHeight,
+					...(e.auxiliary === true ? { auxiliary: true as const } : {})
 				}),
 				reason: e.reason
 			});
@@ -11836,6 +11838,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 				info.amountSats = Number(inv.amountMsat / 1000n);
 			}
 			if (inv.description) info.description = inv.description;
+			if (inv.auxiliary === true) info.auxiliary = true;
 			return info;
 		});
 	}

@@ -988,6 +988,7 @@ property HealthInfo.readyChannelCount: number
 property HealthInfo.status: 'ready' | 'syncing' | 'degraded'
 property HealthInfo.uptime: number
 interface HoldInvoiceEvent
+property HoldInvoiceEvent.auxiliary?: true
 property HoldInvoiceEvent.cancelHeight: number | null
 property HoldInvoiceEvent.cancelMarginBlocks: number
 property HoldInvoiceEvent.earliestExpiry: number | null
@@ -998,6 +999,7 @@ property HoldInvoiceEvent.paymentHash: PaymentHashHex
 property HoldInvoiceEvent.state: HoldInvoiceInfo['state']
 interface HoldInvoiceInfo
 property HoldInvoiceInfo.amountSats?: number
+property HoldInvoiceInfo.auxiliary?: true
 property HoldInvoiceInfo.bolt11: string
 property HoldInvoiceInfo.cancelHeight: number | null
 property HoldInvoiceInfo.cancelMarginBlocks: number
