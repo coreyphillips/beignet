@@ -820,14 +820,17 @@ const FINAL_CLTV_EXPIRY_PADDING = 3;
 /**
  * Fallback sat/vB feerate for a force-close package when we have no live fee data
  * at all (no fee estimator / no samples). Matches the historical default so nodes
- * without a fee estimator behave exactly as before.
+ * without a fee estimator behave exactly as before. It is also the least a
+ * package with an HTLC on its commitment bids (resolveForceCloseFeeRatePerVbyte);
+ * a package with none bids the live rate (resolveNoDeadlineFeeRatePerVbyte).
  */
 const FORCE_CLOSE_DEFAULT_SAT_PER_VBYTE = 10;
 
 /**
- * Urgency multiplier applied to the freshest live fee sample when force-closing.
- * The commitment CPFP child and the second-level HTLC txs MUST confirm before an
- * HTLC's cltv_expiry, so we bid above the current going rate rather than at it.
+ * Urgency multiplier applied to the freshest live fee sample when force-closing
+ * with an HTLC on the commitment. The commitment CPFP child and the second-level
+ * HTLC txs MUST confirm before an HTLC's cltv_expiry, so we bid above the current
+ * going rate rather than at it.
  */
 const FORCE_CLOSE_FEE_MULTIPLIER = 1.5;
 
@@ -3985,7 +3988,8 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				for (const { channelId: monitorChannelId } of monitors) {
 					this.channelManager.rearmCommitmentCpfp(
 						Buffer.from(monitorChannelId, 'hex'),
-						this.resolveForceCloseFeeRatePerVbyte()
+						this.resolveForceCloseFeeRatePerVbyte(),
+						this.resolveNoDeadlineFeeRatePerVbyte()
 					);
 				}
 			};
@@ -14162,10 +14166,14 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		}
 		const prevReason = channel?.getFullState().closeReason;
 		const stamped = channel?.recordCloseReason(reason) ?? false;
+		// feeRatePerVbyte prices a commitment with an HTLC on it; one with none
+		// bids the live rate, since nothing on it has a deadline.
 		const result = this.channelManager.forceClose(
 			channelId,
 			destinationScript,
-			feeRatePerVbyte
+			feeRatePerVbyte,
+			undefined,
+			this.resolveNoDeadlineFeeRatePerVbyte()
 		);
 		if (!result.ok) {
 			// A refused close must not leave this attempt's label behind, but
@@ -14319,7 +14327,8 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		if (state === ChannelState.FORCE_CLOSED) {
 			const rebuilt = this.channelManager.rebuildForceCloseCommitment(
 				channelId,
-				this.resolveForceCloseFeeRatePerVbyte()
+				this.resolveForceCloseFeeRatePerVbyte(),
+				this.resolveNoDeadlineFeeRatePerVbyte()
 			);
 			if (!rebuilt.ok || !rebuilt.tx) {
 				return { ok: false, error: rebuilt.error };
@@ -14449,7 +14458,8 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		try {
 			const rebuilt = this.channelManager.rebuildForceCloseCommitment(
 				channelId,
-				this.resolveForceCloseFeeRatePerVbyte()
+				this.resolveForceCloseFeeRatePerVbyte(),
+				this.resolveNoDeadlineFeeRatePerVbyte()
 			);
 			if (!rebuilt.ok || !rebuilt.tx) {
 				// A monitor-state refusal can be STALE: the splice that just
@@ -22253,7 +22263,8 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				channelId,
 				opts.destinationScript,
 				this.resolveForceCloseFeeRatePerVbyte(),
-				this.getBitcoinNetwork()
+				this.getBitcoinNetwork(),
+				this.resolveNoDeadlineFeeRatePerVbyte()
 			);
 			if (res.ok) return { preimagesKnown, witnesses, action: 'force-closed' };
 			return {
@@ -32871,9 +32882,11 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		this.checkGossipFunding();
 		// Re-CPFP any stuck anchor force-close commitment at the current live feerate
 		// so a fee spike after the original broadcast cannot pin the package (M1).
+		// A package with no HTLC on its commitment re-bids the live rate itself.
 		this.channelManager.reCpfpStuckCommitments(
 			blockHeight,
-			this.resolveForceCloseFeeRatePerVbyte()
+			this.resolveForceCloseFeeRatePerVbyte(),
+			this.resolveNoDeadlineFeeRatePerVbyte()
 		);
 		// JIT holds are revoked BEFORE the generic expiring-HTLC scan below: a
 		// held part has no outgoing leg yet, so that scan would refund it
@@ -32979,13 +32992,15 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	}
 
 	/**
-	 * Resolve a conservative sat/vB feerate for a force-close package — the commitment
-	 * CPFP child and the time-sensitive second-level HTLC txs, which must confirm
-	 * before an HTLC's cltv_expiry. Uses the freshest live fee sample (kept warm in
-	 * handleNewBlock / the monitor-restore loop) with an urgency multiplier, and falls
-	 * back to the historical default ONLY when we have no fee data at all — so a node
-	 * with a fee estimator never force-closes at a fee a routine mempool spike would
-	 * strand (H2), while nodes without one behave exactly as before.
+	 * Resolve a conservative sat/vB feerate for a force-close package with an HTLC
+	 * on its commitment: the commitment CPFP child and the time-sensitive
+	 * second-level HTLC txs, which must confirm before an HTLC's cltv_expiry. Uses
+	 * the freshest live fee sample (kept warm in handleNewBlock / the
+	 * monitor-restore loop) with an urgency multiplier, never bids below the
+	 * historical default, and falls back to it when we have no fee data at all. So
+	 * a node with a fee estimator never force-closes at a fee a routine mempool
+	 * spike would strand (H2), while nodes without one behave exactly as before. A
+	 * package with no HTLC on its commitment bids resolveNoDeadlineFeeRatePerVbyte.
 	 */
 	private resolveForceCloseFeeRatePerVbyte(): number {
 		const live = this.feeAdvisor.getCurrentRate();
@@ -32994,6 +33009,20 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			Math.ceil(live * FORCE_CLOSE_FEE_MULTIPLIER),
 			FORCE_CLOSE_DEFAULT_SAT_PER_VBYTE
 		);
+	}
+
+	/**
+	 * Resolve the sat/vB feerate for a force-close package with no HTLC on its
+	 * commitment. Nothing in it has to confirm by a deadline: our to_local output
+	 * waits out its delay from whenever the commitment confirms, and the other
+	 * outputs are the peer's. So it bids the freshest live fee sample as it is,
+	 * with no urgency multiplier and no floor, and falls back to the historical
+	 * default only when we have no fee data at all.
+	 */
+	private resolveNoDeadlineFeeRatePerVbyte(): number {
+		const live = this.feeAdvisor.getCurrentRate();
+		if (live <= 0) return FORCE_CLOSE_DEFAULT_SAT_PER_VBYTE;
+		return Math.ceil(live);
 	}
 
 	/**

@@ -36,12 +36,15 @@ describe('asset channels: the size a spend of units is signed for', function () 
 	const world = assetChainWorld();
 	afterEach(() => world.dispose());
 
+	// Every force close of the host at one rate, with an HTLC on the
+	// commitment or none.
 	const atRate = (host: IAssetHost, feeRate: number): void => {
-		(
-			host.node as unknown as {
-				resolveForceCloseFeeRatePerVbyte: () => number;
-			}
-		).resolveForceCloseFeeRatePerVbyte = (): number => feeRate;
+		const node = host.node as unknown as {
+			resolveForceCloseFeeRatePerVbyte: () => number;
+			resolveNoDeadlineFeeRatePerVbyte: () => number;
+		};
+		node.resolveForceCloseFeeRatePerVbyte = (): number => feeRate;
+		node.resolveNoDeadlineFeeRatePerVbyte = (): number => feeRate;
 	};
 	const spendOf = (
 		pair: IAssetChainPair,

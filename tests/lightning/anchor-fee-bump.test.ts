@@ -714,6 +714,75 @@ describe('anchor fee bumping', () => {
 				expect((cm as any)._pendingCommitmentCpfp.has(channelIdHex)).to.be
 					.false;
 			});
+
+			describe('a package with no HTLC on its commitment', () => {
+				/** The manager's pending CPFP entry for one channel. */
+				function pendingOf(
+					cm: ChannelManager,
+					channelIdHex: string
+				): { lastFeeRate: number; noDeadline?: boolean } {
+					const pending = (
+						cm as unknown as {
+							_pendingCommitmentCpfp: Map<
+								string,
+								{ lastFeeRate: number; noDeadline?: boolean }
+							>;
+						}
+					)._pendingCommitmentCpfp.get(channelIdHex);
+					if (!pending) throw new Error('no pending CPFP entry');
+					return pending;
+				}
+
+				/** The harness entry, marked as our commitment with no HTLC on it. */
+				function noDeadlineEntry(
+					lastFeeRate: number
+				): ReturnType<typeof managerWithPendingCpfp> {
+					const made = managerWithPendingCpfp({
+						fullyResolved: false,
+						commitmentConfirmed: false
+					});
+					const entry = pendingOf(made.cm, made.channelIdHex);
+					entry.noDeadline = true;
+					entry.lastFeeRate = lastFeeRate;
+					return made;
+				}
+
+				it('re-bids at the no-deadline rate, not the deadline rate', () => {
+					const { cm, channelIdHex, calls } = noDeadlineEntry(1);
+					// The deadline rate is at its floor of 10; the market moved to 3.
+					cm.reCpfpStuckCommitments(106, 10, 3);
+					expect(calls.length).to.equal(1);
+					expect(calls[0].feeratePerVbyte).to.equal(3);
+					const entry = pendingOf(cm, channelIdHex);
+					expect(entry.lastFeeRate).to.equal(3);
+					expect(entry.noDeadline).to.equal(true);
+				});
+
+				it('is not re-bid while the live rate has not risen, whatever the deadline rate', () => {
+					const { cm, calls } = noDeadlineEntry(3);
+					cm.reCpfpStuckCommitments(110, 30, 3);
+					expect(calls.length).to.equal(0);
+				});
+
+				it('re-bids at the deadline rate when no no-deadline rate is given', () => {
+					// A caller that predates the second rate prices every package as
+					// before.
+					const { cm, calls } = noDeadlineEntry(1);
+					cm.reCpfpStuckCommitments(106, 30);
+					expect(calls.length).to.equal(1);
+					expect(calls[0].feeratePerVbyte).to.equal(30);
+				});
+
+				it('leaves a package with an HTLC on the deadline rate', () => {
+					const { cm, calls } = managerWithPendingCpfp({
+						fullyResolved: false,
+						commitmentConfirmed: false
+					});
+					cm.reCpfpStuckCommitments(106, 30, 3);
+					expect(calls.length).to.equal(1);
+					expect(calls[0].feeratePerVbyte).to.equal(30);
+				});
+			});
 		});
 	});
 });
