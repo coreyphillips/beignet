@@ -17,6 +17,11 @@ import type {
 	IAuxiliaryOpeningCsvPolicy,
 	IChannelAuxiliaryProvider
 } from './auxiliary';
+import type {
+	IAuxiliaryForwardLegResolution,
+	IAuxiliaryForwardRequest,
+	IAuxiliaryForwardTerms
+} from './auxiliary-forward';
 import type { ChannelState } from './types';
 import {
 	AUXILIARY_CHANNEL_DUST_LIMIT,
@@ -177,7 +182,9 @@ export interface IAuxiliaryRestoredChannel {
  * provider extends the channel state machine; the callbacks tie funding
  * and payment to the host's asset protocol. A node with asset channels is
  * only ever an endpoint of an asset payment: nothing that arrives on an
- * asset channel is forwarded, and nothing is forwarded out over one.
+ * asset channel is forwarded, and nothing is forwarded out over one. The
+ * hooks of a forward with an asset leg (`prepareForward`,
+ * `onForwardLegResolved`) are declared and not called yet.
  */
 export interface IAuxiliaryChannelConfig {
 	/** Standard-wire CSV compatibility for new channels only. Does not authorize legacy signatures. */
@@ -232,6 +239,46 @@ export interface IAuxiliaryChannelConfig {
 	 * about.
 	 */
 	valueIncomingHtlc?(context: IAuxiliaryIncomingHtlc): bigint | undefined;
+	/**
+	 * Declared and not called by this build: every forward with an asset leg
+	 * is refused before anything is offered, whatever this would answer. The
+	 * contract it will be called under is in docs/EXTENSIONS.md ("Forwards
+	 * with an asset leg"), and `AUXILIARY_CHANNELS_API` lists it in
+	 * `surfaces` from the build that calls it.
+	 *
+	 * Asked about an HTLC the node is to forward when either leg is an asset
+	 * leg, or when its next hop is a short channel id the node has no channel
+	 * for, once the incoming HTLC is irrevocably committed. Asked once for
+	 * each incoming HTLC, synchronously, outside any storage transaction and
+	 * before anything is offered; the answer is kept with the forward and is
+	 * not asked again on a reestablish or after a restart, except when the
+	 * node stopped before it was kept, so the host answers a second ask about
+	 * an HTLC as it answered the first. One of three answers:
+	 *
+	 * - The host's terms: the forward goes on if every check of the node's
+	 *   own passes, and is failed back otherwise.
+	 * - `undefined`: not the host's. Only for a forward without an asset leg,
+	 *   which goes on as on a node without asset channels; for one with an
+	 *   asset leg it refuses.
+	 * - A throw: the incoming HTLC is failed back and nothing is offered.
+	 *
+	 * Anything else refuses as a throw does. Without this hook every forward
+	 * with an asset leg is refused, and no other forward is asked about.
+	 * `valueIncomingHtlc` is never asked about a forward.
+	 */
+	prepareForward?(
+		request: IAuxiliaryForwardRequest
+	): IAuxiliaryForwardTerms | undefined;
+	/**
+	 * Declared and not called by this build. The end of each leg of a
+	 * forward the host took on, in its channel or on the chain, told once
+	 * the leg's HTLC has left its channel for good or the chain has resolved
+	 * it. Idempotent durable callback, delivered again after a crash until it
+	 * returns without throwing, outside any storage transaction.
+	 * `onHtlcResolved` is still called for every asset HTLC, a leg of a
+	 * forward or not.
+	 */
+	onForwardLegResolved?(resolution: IAuxiliaryForwardLegResolution): void;
 	/**
 	 * Idempotent durable callback, delivered again after a crash until
 	 * acknowledged.

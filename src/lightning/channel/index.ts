@@ -17,3 +17,4 @@ export * from './auxiliary-funding';
 export * from './auxiliary-guard';
 export * from './auxiliary-close';
 export * from './auxiliary-api';
+export * from './auxiliary-forward';
