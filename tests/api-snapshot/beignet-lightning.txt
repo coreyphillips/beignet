@@ -5819,6 +5819,7 @@ method node.IFundingProvider.getFixedOutputFeeStatus?(forFeeSatoshis?: bigint): 
 method node.IFundingProvider.pledgeTransactionInputs?(txHex: string): Promise<void>
 method node.IFundingProvider.quoteDualFundingMax?(feeratePerKw: number): { fundingSatoshis: bigint; spendableSats: bigint; feeSats: bigint; inputCount: number; }
 method node.IFundingProvider.quoteSpliceIn?(feeratePerKw: number): { spendableSats: bigint; feeSats: bigint; maxAmountSats: bigint; inputCount: number; }
+method node.IFundingProvider.releaseFixedOutputFeeCoins?(): Promise<boolean>
 method node.IFundingProvider.releaseInputPledges?(outpoints: Array<{ txid: string; vout: number; }>): Promise<void>
 method node.IFundingProvider.restoreFeeBumpInputs?(inputs: readonly { prevTx: Buffer; prevOutputIndex: number; sequence: number; }[]): Promise<channel.ISpliceWalletInput[]>
 method node.IFundingProvider.retireFixedOutputFeeAction?(feeActionId: string, resolution?: wallet.IFixedOutputFeeResolution): Promise<void>
@@ -10094,6 +10095,7 @@ method wallet.WalletFundingProvider.getFixedOutputFeeStatus(forFeeSatoshis?: big
 method wallet.WalletFundingProvider.pledgeTransactionInputs(txHex: string): Promise<void>
 method wallet.WalletFundingProvider.quoteDualFundingMax(feeratePerKw: number): { fundingSatoshis: bigint; spendableSats: bigint; feeSats: bigint; inputCount: number; }
 method wallet.WalletFundingProvider.quoteSpliceIn(feeratePerKw: number): { spendableSats: bigint; feeSats: bigint; maxAmountSats: bigint; inputCount: number; }
+method wallet.WalletFundingProvider.releaseFixedOutputFeeCoins(): Promise<boolean>
 method wallet.WalletFundingProvider.releaseInputPledges(outpoints: Array<{ txid: string; vout: number; }>): Promise<void>
 method wallet.WalletFundingProvider.restoreFeeBumpInputs(inputs: readonly { prevTx: Buffer; prevOutputIndex: number; sequence: number; }[]): Promise<channel.ISpliceWalletInput[]>
 method wallet.WalletFundingProvider.retireFixedOutputFeeAction(feeActionId: string, resolution?: wallet.IFixedOutputFeeResolution): Promise<void>

@@ -282,6 +282,14 @@ type Preparation = {
 	listed?: true;
 	/** The splits it replaced: any of them may still be the one a block takes. */
 	prior?: Array<{ txid: string; signed: string; fee: string }>;
+	/**
+	 * Its replacement, signed, recorded before it is sent. Until it is
+	 * settled, the journal's charges hold what it pays over the split it was
+	 * recorded for. It takes the split's place once it is out, its charge
+	 * then added to what was spent, and is dropped with its charge once it
+	 * is refused.
+	 */
+	replacement?: Preparation;
 };
 type Action = {
 	cap: string;
@@ -296,6 +304,12 @@ type Action = {
 	gone?: { outpoint: string; value: number }[];
 	/** The coins a named resolution did not spend: they go back to the pool. */
 	kept?: string[];
+	/**
+	 * Where coins of the action were before a split replacement, or a block
+	 * that took the split a replacement replaced, moved them, each with the
+	 * outpoint the coin has now.
+	 */
+	moved?: Record<string, string>;
 };
 type Journal = {
 	version: 1;
@@ -317,6 +331,14 @@ type Journal = {
 	next?: number;
 	/** The actions retired most recently, so a late selection for one is still refused. */
 	retiredIds?: string[];
+	/**
+	 * Each split replacement recorded and not yet settled, with the split it
+	 * replaces and what it pays over that split: spent, for the budget, until
+	 * it is settled. A release that does not know these keeps them when it
+	 * drops the row of the split; they are then settled by what the wallet
+	 * lists and the server knows.
+	 */
+	charges?: Array<{ txid: string; split: string; over: string }>;
 };
 type View = {
 	encoded: string | null;
@@ -326,6 +348,11 @@ type View = {
 };
 interface Host {
 	previousTransactions(ids: readonly string[]): Promise<Map<string, string>>;
+	/**
+	 * For each transaction the wallet's server answered about, whether it
+	 * knows it. One it gave no answer for is left out.
+	 */
+	knownTransactions?(ids: readonly string[]): Promise<Map<string, boolean>>;
 	input(coin: ISpliceUtxo, previous: string): ISpliceWalletInput;
 	pledge(txid: string, index: number, tag: string): Promise<void>;
 	release(txid: string, index: number, tag: string): Promise<void>;
@@ -461,7 +488,8 @@ export class FixedOutputFeePool {
 			!Array.isArray(data.preparations) ||
 			(data.coins !== undefined && !Array.isArray(data.coins)) ||
 			(data.unconfirmed !== undefined && !Array.isArray(data.unconfirmed)) ||
-			(data.retiredIds !== undefined && !Array.isArray(data.retiredIds))
+			(data.retiredIds !== undefined && !Array.isArray(data.retiredIds)) ||
+			(data.charges !== undefined && !Array.isArray(data.charges))
 		)
 			throw new Error('Invalid fixed-output fee journal');
 		return data;
@@ -496,7 +524,10 @@ export class FixedOutputFeePool {
 			)
 				throw new Error('Invalid fixed-output preparation reservation');
 		}
-		if (data.spent !== undefined && BigInt(data.spent) < 0n)
+		if (
+			(data.spent !== undefined && BigInt(data.spent) < 0n) ||
+			(data.charges ?? []).some((charge) => BigInt(charge.over) < 0n)
+		)
 			throw new Error('Invalid fixed-output fee charge');
 	}
 	/** What a journal charges the lifetime budget, by what it is charged for. */
@@ -529,6 +560,8 @@ export class FixedOutputFeePool {
 				spent += BigInt(preparation.fee);
 			else reserved += BigInt(preparation.fee);
 		}
+		// So may a split replacement recorded and not yet settled.
+		for (const charge of data.charges ?? []) spent += BigInt(charge.over);
 		return { reserved, spent };
 	}
 	private budgetOf(data: Journal): IFixedOutputFeeBudget {
@@ -784,6 +817,12 @@ export class FixedOutputFeePool {
 	/** Whether the wallet's server knows a transaction. Undefined when it cannot say. */
 	private async known(txid: string): Promise<boolean | undefined> {
 		try {
+			if (this.host.knownTransactions)
+				return (
+					await this.bounded('a transaction lookup', () =>
+						this.host.knownTransactions!([txid])
+					)
+				).get(txid);
 			return (
 				await this.bounded('a transaction lookup', () =>
 					this.host.previousTransactions([txid])
@@ -874,6 +913,9 @@ export class FixedOutputFeePool {
 	 * the others go back to the pool. Without one the action is charged its
 	 * whole cap and its coins are given up to the wallet: that a wallet still
 	 * lists a coin does not show it unspent, so nothing is refunded on it.
+	 * Every freeze under the pool's tags that the journal no longer owns is
+	 * released then, one under the action's tag on a coin a raise let go of
+	 * included.
 	 */
 	async retire(
 		feeActionId: string,
@@ -913,12 +955,22 @@ export class FixedOutputFeePool {
 					.toString('hex'),
 				action = this.journal.actions[id];
 			if (action && !action.retired) {
-				const next = copy(this.journal),
-					row = next.actions[id],
+				const next = copy(this.journal);
+				// Where the unconfirmed splits say the coins were, before a
+				// selection settles those splits.
+				this.recordMoves(next);
+				const row = next.actions[id],
 					cap = BigInt(row.cap);
 				row.retired = true;
 				row.feeActionId = feeActionId;
 				if (spent) {
+					// The transaction names a coin where it was when it was made:
+					// a split replacement, or a block that took the split a
+					// replacement replaced, may have moved it since. It is
+					// charged, and not handed back, wherever the action holds it.
+					const taken = new Set(
+						[...spent].map((outpoint) => this.locate(row, outpoint))
+					);
 					const burned = [
 						...row.inputs.map((coin) => ({
 							outpoint: key(coin.utxo),
@@ -926,16 +978,17 @@ export class FixedOutputFeePool {
 						})),
 						...(row.gone ?? [])
 					]
-						.filter((coin) => spent!.has(coin.outpoint))
+						.filter((coin) => taken.has(coin.outpoint))
 						.reduce((sum, coin) => sum + BigInt(coin.value), 0n);
 					row.paid = (burned > cap ? cap : burned).toString();
 					row.kept = row.inputs
 						.map((coin) => key(coin.utxo))
-						.filter((outpoint) => !spent!.has(outpoint));
+						.filter((outpoint) => !taken.has(outpoint));
 				} else row.paid = row.cap;
 				this.save(next);
 			}
 			await this.completeRetirements();
+			await this.releaseOrphans();
 			await this.freezeCoins();
 		});
 	}
@@ -949,41 +1002,144 @@ export class FixedOutputFeePool {
 			this.reload();
 			await this.completeRetirements();
 			await this.releaseOrphans();
+			await this.freezeCoins();
 		});
 	}
-	private async releaseOrphans(): Promise<void> {
+	/** Answers whether a freeze was released. */
+	private async releaseOrphans(): Promise<boolean> {
 		const owned = new Map(this.latest().tags);
 		for (const row of this.journal.preparations)
 			owned.set(key(row.source.utxo), this.prefix + ':source:' + row.id);
 		for (const coin of this.journal.coins ?? [])
 			owned.set(key(coin.utxo), this.coinTag);
+		// A coin a split replacement moved is where it was again once a block
+		// takes the split replaced, until a selection moves it back: the
+		// freeze it had there is kept while the pool holds the coin.
+		const before = new Set<string>();
+		for (const row of this.journal.unconfirmed ?? []) {
+			const txid = this.txidOf(row);
+			for (let i = 0; txid && i < row.count; i++)
+				if (owned.has(`${txid}:${i}`))
+					for (const old of row.prior ?? []) before.add(`${old.txid}:${i}`);
+		}
+		let released = false;
 		for (const coin of this.wallet.listFrozenUtxos!()) {
 			const tag = coin.freezeTag;
 			if (!tag?.startsWith(this.prefix + ':')) continue;
-			if (owned.get(key(coin)) === tag) continue;
+			if (owned.get(key(coin)) === tag || before.has(key(coin))) continue;
 			if (tag.startsWith(this.prefix + ':action:'))
 				await this.bounded('a release', () =>
 					this.host.release(coin.tx_hash, coin.tx_pos, tag)
 				);
 			else await this.unfreeze(coin.tx_hash, coin.tx_pos, tag);
+			released = true;
 		}
+		return released;
 	}
-	/** Freeze the fee coins no action holds, as soon as the wallet lists them. */
+	/**
+	 * Freeze every coin the pool holds as soon as the wallet lists it: a fee
+	 * coin no action holds under the pool's tag, and a coin of an open
+	 * action under the action's own. A split replacement, or a block that
+	 * takes the split a replacement replaced, moves coins to outpoints no
+	 * freeze covers, and the wallet's own sends pass over frozen coins only.
+	 */
 	private async freezeCoins(): Promise<void> {
 		const listed = new Set(this.wallet.listUtxos!().map((coin) => key(coin)));
+		const loose = (coin: Coin): boolean =>
+			listed.has(key(coin.utxo)) &&
+			!this.wallet.isUtxoFrozen!(coin.utxo.tx_hash, coin.utxo.tx_pos);
 		for (const coin of this.journal.coins ?? []) {
-			const { tx_hash, tx_pos } = coin.utxo;
-			if (
-				!listed.has(key(coin.utxo)) ||
-				this.wallet.isUtxoFrozen!(tx_hash, tx_pos)
-			)
-				continue;
+			if (!loose(coin)) continue;
 			try {
-				await this.freeze(tx_hash, tx_pos, this.coinTag);
+				await this.freeze(coin.utxo.tx_hash, coin.utxo.tx_pos, this.coinTag);
 			} catch (error) {
 				if (timedOut(error)) throw error;
 			}
 		}
+		for (const [id, action] of Object.entries(this.journal.actions)) {
+			if (action.retired || action.released) continue;
+			for (const coin of action.inputs) {
+				if (!loose(coin)) continue;
+				try {
+					await this.bounded('a fee coin pledge', () =>
+						this.host.pledge(
+							coin.utxo.tx_hash,
+							coin.utxo.tx_pos,
+							this.prefix + ':action:' + id
+						)
+					);
+				} catch (error) {
+					if (timedOut(error)) throw error;
+				}
+			}
+		}
+	}
+	/**
+	 * Hand the free fee coins back to the wallet once no action can need
+	 * them: every action is retired, and no split is unsigned or on its way.
+	 * Otherwise nothing changes. A split replacement the journal records is
+	 * settled first, after a refresh, as a selection settles it, but never
+	 * sent again: no action needs the split to pay more. One the server
+	 * cannot say of stays recorded, with its split. The journal lets go of the coins first, with the unconfirmed
+	 * splits they came from, and only then is every freeze under the pool's
+	 * tags released: the journal owns none any more, and one under the tag
+	 * of a retired action, on a coin a raise let go of, goes with the rest.
+	 * A stop in between leaves freezes the journal does not own: the release
+	 * of those at the next start, or the next call of this, lets go of them,
+	 * and nothing freezes them again. A later selection makes a split of its
+	 * own. Answers whether a coin or a freeze was let go of.
+	 */
+	async releaseFreeCoins(): Promise<boolean> {
+		// With no free coin and no freeze under a tag of the pool there is
+		// nothing to hand back, and the wallet's send lock is not taken.
+		if (
+			!this.latest().journal.coins?.length &&
+			!this.wallet.listFrozenUtxos!().some(
+				(coin) => coin.freezeTag?.startsWith(this.prefix + ':')
+			)
+		)
+			return false;
+		return this.locked(async () => {
+			this.reload();
+			await this.completeRetirements();
+			if (
+				Object.keys(this.journal.actions).length > 0 ||
+				this.journal.preparations.length > 0
+			)
+				return false;
+			if (
+				(this.journal.unconfirmed ?? []).some((row) => row.replacement) ||
+				(this.journal.charges ?? []).length > 0
+			) {
+				await this.refresh();
+				await this.settleReplacements(false);
+			}
+			const journal = this.journal;
+			const coins = journal.coins ?? [];
+			if (coins.length) {
+				const from = new Set(
+					coins.map((coin) => coin.utxo.tx_hash.toLowerCase())
+				);
+				const next = copy(journal);
+				delete next.coins;
+				// The rows of the splits whose coins go back go with them, a
+				// recorded replacement included: no coin of the pool is left to
+				// move, and its charge stays in charges until the listing or the
+				// server settles it. It is never sent again.
+				const rows = (next.unconfirmed ?? []).filter(
+					(row) => !from.has(this.txidOf(row)!)
+				);
+				if (rows.length) next.unconfirmed = rows;
+				else delete next.unconfirmed;
+				this.save(next);
+			}
+			// The journal owns no freeze now: one at a place a split
+			// replacement moved a coin from, and one under the tag of a
+			// retired action on a coin a raise let go of, are released with
+			// the rest.
+			const released = await this.releaseOrphans();
+			return coins.length > 0 || released;
+		});
 	}
 	private owner(script: Buffer): {
 		address: string;
@@ -1231,6 +1387,96 @@ export class FixedOutputFeePool {
 			});
 		this.save(next);
 	}
+	/**
+	 * The coins of split `from` that the pool or an action holds become the
+	 * coins at the same positions of `to`. An action keeps where each of its
+	 * coins was, since the node's spend may still name it there.
+	 */
+	private move(
+		next: Journal,
+		from: string,
+		to: { txid: string; signed: string },
+		unconfirmed: boolean
+	): void {
+		const moved = (coin: Coin): Coin =>
+			coin.utxo.tx_hash.toLowerCase() === from
+				? {
+						utxo: {
+							...coin.utxo,
+							tx_hash: to.txid,
+							...(unconfirmed ? { height: 0 } : {})
+						},
+						previous: to.signed
+				  }
+				: coin;
+		if (next.coins) next.coins = next.coins.map(moved);
+		for (const action of Object.values(next.actions))
+			action.inputs = action.inputs.map((coin) => {
+				const now = moved(coin);
+				if (now === coin) return coin;
+				const was = key(coin.utxo),
+					is = key(now.utxo),
+					map = (action.moved ??= {});
+				for (const earlier of Object.keys(map))
+					if (map[earlier] === was) map[earlier] = is;
+				map[was] = is;
+				delete map[is];
+				return now;
+			});
+	}
+	/** Whether the action holds the coin at `outpoint`, or let go of it. */
+	private has(action: Action, outpoint: string): boolean {
+		return (
+			action.inputs.some((coin) => key(coin.utxo) === outpoint) ||
+			(action.gone ?? []).some((coin) => coin.outpoint === outpoint)
+		);
+	}
+	/**
+	 * The outpoint of the action's coin that a transaction names at
+	 * `named`. A spend made before a split replacement, or before a block
+	 * that took the split a replacement replaced, names the coin where it
+	 * was. The action's moved record says where it went, and is followed only
+	 * while the action holds the coin it points to, or let go of it: a
+	 * release that does not keep the record may have moved the coin since.
+	 * Anything else is answered as named.
+	 */
+	private locate(action: Action, named: string): string {
+		if (this.has(action, named)) return named;
+		const recorded = action.moved?.[named];
+		return recorded !== undefined && this.has(action, recorded)
+			? recorded
+			: named;
+	}
+	/**
+	 * Add to the moved record of each open action what the unconfirmed
+	 * splits say of the coins it holds: a coin at a position of a split that
+	 * replaced others was at the same position of each of those (its prior
+	 * field). A journal of a release that kept no moved record still has
+	 * this while the split has not confirmed, so it is read before the split
+	 * can leave. Answers whether anything was added.
+	 */
+	private recordMoves(journal: Journal): boolean {
+		let added = false;
+		for (const row of journal.unconfirmed ?? []) {
+			const txid = this.txidOf(row),
+				prior: Array<{ txid: string }> = row.prior ?? [];
+			if (!txid || !prior.length) continue;
+			for (const action of Object.values(journal.actions)) {
+				if (action.retired || action.released) continue;
+				for (const coin of action.inputs) {
+					if (coin.utxo.tx_hash.toLowerCase() !== txid) continue;
+					for (const earlier of prior) {
+						const was = `${earlier.txid}:${coin.utxo.tx_pos}`;
+						if (action.moved?.[was] !== undefined || this.has(action, was))
+							continue;
+						(action.moved ??= {})[was] = key(coin.utxo);
+						added = true;
+					}
+				}
+			}
+		}
+		return added;
+	}
 	/** The rate a split is made at for a spend asked at `feeratePerKw`. */
 	private splitRate(feeratePerKw: number): number {
 		return Math.min(
@@ -1279,6 +1525,115 @@ export class FixedOutputFeePool {
 		}
 	}
 	/**
+	 * Settle every split replacement the journal records. One whose answer
+	 * never came went out when the wallet lists a coin of it, or when the
+	 * wallet lists no fee coin of the split and the server knows the
+	 * replacement. It did not when the wallet lists a confirmed output of
+	 * the split or of a split it replaced. While the wallet lists every fee
+	 * coin of the split, unconfirmed, it is sent again when `resend` is set,
+	 * and dropped when refused, or when the wallet lists only some of them: a
+	 * spend took one, which the replacement would throw out. Not sent again,
+	 * it went out when the server knows it, the wallet's listing lagging.
+	 */
+	private async settleReplacements(resend: boolean): Promise<void> {
+		let resent = false;
+		for (const row of [...(this.journal.unconfirmed ?? [])]) {
+			const replacement = row.replacement;
+			if (!replacement) continue;
+			const txid = this.txidOf(row)!,
+				listed = this.wallet.listUtxos!();
+			// A replacement belongs to the split it was recorded for, the last
+			// of the splits it replaced. One that the row of another split
+			// carries was copied there by a release that does not know the
+			// record, when it replaced the split itself: it does not replace
+			// the split that stands, and it is not sent again.
+			const own =
+				replacement.prior?.[replacement.prior.length - 1]?.txid === txid;
+			let out: boolean | undefined;
+			if (listed.some((c) => c.tx_hash.toLowerCase() === replacement.txid))
+				out = true;
+			// A block took the split, or a split it replaced: the replacement
+			// spends the same source, so it is not out.
+			else if (
+				[txid, ...(row.prior ?? []).map((old) => old.txid)].some((id) =>
+					listed.some((c) => c.tx_hash.toLowerCase() === id && c.height > 0)
+				)
+			)
+				out = false;
+			else if (
+				resend &&
+				listed.some(
+					(c) => c.tx_hash.toLowerCase() === txid && c.tx_pos < row.count
+				)
+			) {
+				out =
+					own &&
+					this.replaceable(txid) &&
+					!(
+						await this.bounded('a broadcast', () =>
+							this.wallet.electrum.broadcastTransaction({
+								rawTx: replacement.signed!
+							})
+						)
+					).isErr();
+				resent ||= out;
+			} else {
+				// Not sent again, or the wallet lists no fee coin of the split:
+				// whether it went out is the server's to say, for the wallet's
+				// listing may lag behind it.
+				out = await this.known(replacement.txid!);
+			}
+			// The server cannot say, as one without a txindex answers of every
+			// transaction not in its mempool: the record stays, with its split,
+			// and the selection goes on.
+			if (out === undefined) continue;
+			this.settleReplacement(txid, out);
+		}
+		// The wallet lists the coins of a replacement it took only once it is
+		// refreshed; until then they are not frozen, and a send of the wallet
+		// that refreshes on its own could take one.
+		if (resent) await this.refresh();
+		// A charge whose split's row a release that does not know charges
+		// dropped. The replacement went out when the wallet lists a confirmed
+		// output of it, and did not when it lists a confirmed output of the
+		// split it replaces, or the server does not know it. Until one of
+		// those it stays charged.
+		const carried = new Set(
+			(this.journal.unconfirmed ?? []).flatMap((row) =>
+				row.replacement?.txid ? [row.replacement.txid] : []
+			)
+		);
+		const loose = (this.journal.charges ?? []).filter(
+			(charge) => !carried.has(charge.txid)
+		);
+		if (!loose.length) return;
+		const listed = this.wallet.listUtxos!();
+		const confirmedIn = (txid: string): boolean =>
+			listed.some((c) => c.tx_hash.toLowerCase() === txid && c.height > 0);
+		const settled = new Map<string, boolean>();
+		for (const charge of loose) {
+			if (confirmedIn(charge.txid)) settled.set(charge.txid, true);
+			else if (
+				confirmedIn(charge.split) ||
+				(await this.known(charge.txid)) === false
+			)
+				settled.set(charge.txid, false);
+		}
+		if (!settled.size) return;
+		const next = copy(this.journal);
+		for (const charge of loose)
+			if (settled.get(charge.txid))
+				next.spent = (
+					BigInt(next.spent ?? '0') + BigInt(charge.over)
+				).toString();
+		const rest = (next.charges ?? []).filter(
+			(charge) => !settled.has(charge.txid)
+		);
+		if (rest.length) next.charges = rest;
+		else delete next.charges;
+		this.save(next);
+	}
+	/**
 	 * Forget the unconfirmed splits that need no replacement any more: one
 	 * the wallet lists a confirmed output of, one whose fee coins the wallet
 	 * listed and lists no longer, and one the wallet has yet to list that
@@ -1287,6 +1642,7 @@ export class FixedOutputFeePool {
 	 * are the same outputs of that split and are held under its id again.
 	 */
 	private async settleUnconfirmed(): Promise<void> {
+		await this.settleReplacements(true);
 		const rows = this.journal.unconfirmed ?? [];
 		if (!rows.length) return;
 		const live = this.wallet.listUtxos!();
@@ -1298,6 +1654,12 @@ export class FixedOutputFeePool {
 			fee: string;
 		}> = [];
 		for (const row of rows) {
+			// A split whose replacement the server could not say of stays as it
+			// is until that replacement is settled.
+			if (row.replacement) {
+				keep.push(row);
+				continue;
+			}
 			const txid = this.txidOf(row)!;
 			const of = (id: string): ISpliceUtxo[] =>
 				live.filter((c) => c.tx_hash.toLowerCase() === id);
@@ -1327,13 +1689,7 @@ export class FixedOutputFeePool {
 		if (keep.length === rows.length && !marked) return;
 		const next = copy(this.journal);
 		for (const { from, to, fee } of back) {
-			const moved = (coin: Coin): Coin =>
-				coin.utxo.tx_hash.toLowerCase() === from
-					? { utxo: { ...coin.utxo, tx_hash: to.txid }, previous: to.signed }
-					: coin;
-			if (next.coins) next.coins = next.coins.map(moved);
-			for (const action of Object.values(next.actions))
-				action.inputs = action.inputs.map(moved);
+			this.move(next, from, to, false);
 			// Charged what the split a block took paid, not its replacement.
 			next.spent = (
 				BigInt(next.spent ?? '0') -
@@ -1343,6 +1699,109 @@ export class FixedOutputFeePool {
 		if (keep.length) next.unconfirmed = keep;
 		else delete next.unconfirmed;
 		this.save(next);
+	}
+	/**
+	 * Whether the unconfirmed split `txid` can be replaced by one that pays
+	 * more: the pool follows it, the wallet lists every fee coin of it, none
+	 * confirmed, and lists its change, when it has one, unfrozen. With a fee
+	 * coin spent, the spend that took it would be thrown out with it; with
+	 * the change spent or pledged, a payment, funding or splice of the
+	 * wallet would be.
+	 */
+	private replaceable(txid: string): boolean {
+		const entry = (this.journal.unconfirmed ?? []).find(
+			(row) => this.txidOf(row) === txid
+		);
+		if (!entry) return false;
+		const listed = this.wallet.listUtxos!().filter(
+			(c) => c.tx_hash.toLowerCase() === txid
+		);
+		const outputs = listed.filter((c) => c.tx_pos < entry.count);
+		if (outputs.length !== entry.count || outputs.some((c) => c.height > 0))
+			return false;
+		const change = entry.signed
+			? bitcoin.Transaction.fromHex(entry.signed).outs.length > entry.count
+			: true;
+		return (
+			!change ||
+			listed.some(
+				(c) =>
+					c.tx_pos === entry.count &&
+					!this.wallet.isUtxoFrozen!(c.tx_hash, c.tx_pos)
+			)
+		);
+	}
+	/**
+	 * Whether a selection that asks `rate` and wants confirmed coins may wait
+	 * for the unconfirmed split `txid`: the split pays that rate, or can be
+	 * replaced by one that does within the cap of a split. Where that cap
+	 * holds every split below the rate, the most a split of the pool's own
+	 * could pay stands for the rate: a split of one fee coin is the smallest
+	 * and pays the most, so a split of more coins that the cap holds lower is
+	 * passed by one of fewer coins and is not waited on.
+	 */
+	private awaitable(txid: string, rate: number): boolean {
+		const entry = (this.journal.unconfirmed ?? []).find(
+			(row) => this.txidOf(row) === txid
+		);
+		if (entry === undefined) return false;
+		const cap = Number(this.policy.maxPreparationFeeSatoshis);
+		// The highest rate a split of `count` such fee coins pays within it.
+		const reach = (count: number): number => {
+			const size = this.buildSplit(
+				entry.source,
+				entry.address,
+				entry.amount,
+				count,
+				1
+			);
+			return size ? Math.floor(cap / size.fee) : 0;
+		};
+		const goal = Math.min(
+			rate,
+			Math.max(reach(1), this.policy.preparationFeeRatePerVbyte ?? 1)
+		);
+		return (
+			(entry.rate ?? 1) >= goal ||
+			(this.replaceable(txid) && reach(entry.count) >= goal)
+		);
+	}
+	/**
+	 * Whether a raise asked at `rate` lets go of the action's `coin`: its
+	 * split has not confirmed, cannot be replaced by one that pays that rate,
+	 * and pays less. The pool follows its own unconfirmed splits. One a
+	 * reorganisation put back in the mempool after the pool let it go is
+	 * known by the wallet's listing of its outputs, and what it pays is read
+	 * from its transaction and that of its source; when that cannot be read,
+	 * the coin is let go of.
+	 */
+	private async stuck(
+		coin: Coin,
+		rate: number,
+		live: ISpliceUtxo[]
+	): Promise<boolean> {
+		const txid = coin.utxo.tx_hash.toLowerCase();
+		if (
+			(this.journal.unconfirmed ?? []).some((row) => this.txidOf(row) === txid)
+		)
+			return !this.awaitable(txid, rate);
+		const outputs = live.filter((c) => c.tx_hash.toLowerCase() === txid);
+		if (!outputs.length || outputs.some((c) => c.height > 0)) return false;
+		try {
+			const split = bitcoin.Transaction.fromHex(coin.previous);
+			let fee = 0n;
+			for (const input of split.ins) {
+				const source = bitcoin.Transaction.fromHex(
+					await this.previous(Buffer.from(input.hash).reverse().toString('hex'))
+				);
+				fee += BigInt(source.outs[input.index].value);
+			}
+			for (const output of split.outs) fee -= BigInt(output.value);
+			return fee < BigInt(Math.ceil(split.virtualSize() * rate));
+		} catch (error) {
+			if (timedOut(error)) throw error;
+			return true;
+		}
 	}
 	/**
 	 * Replace a split that has not confirmed by one that pays more, when one
@@ -1371,27 +1830,80 @@ export class FixedOutputFeePool {
 			this.save(next);
 			return txid;
 		}
+		if (!this.due(entry, wanted, opts) || !this.replaceable(txid)) return txid;
+		const replaced = await this.raiseSplit(entry, wanted, height);
+		if (!replaced) return txid;
+		await this.refresh();
+		await this.freezeCoins();
+		return replaced;
+	}
+	/**
+	 * Whether the replacement of the unconfirmed split `entry` is due for a
+	 * spend asked at `wanted`: in the next block when the spend is asked at a
+	 * higher rate than the split pays, and otherwise as many blocks after it
+	 * went out as FIXED_OUTPUT_FEE_TIMING says (fewer when the deadline of
+	 * the spend is near), never twice in a block.
+	 */
+	private due(
+		entry: Preparation,
+		wanted: number,
+		opts: IFeeBumpSelectionOpts
+	): boolean {
+		const height = opts.blockHeight;
+		if (height === undefined || entry.at === undefined) return false;
 		const near =
 			opts.deadlineHeight !== undefined &&
 			opts.deadlineHeight - height <=
 				FIXED_OUTPUT_FEE_TIMING.nearDeadlineBlocks;
-		const due =
+		return (
 			height > entry.at &&
 			(wanted > (entry.rate ?? 1) ||
 				height - entry.at >=
 					(near
 						? FIXED_OUTPUT_FEE_TIMING.splitRaiseBlocksNearDeadline
-						: FIXED_OUTPUT_FEE_TIMING.splitRaiseBlocks));
-		if (!due) return txid;
-		const outputs = this.wallet.listUtxos!().filter(
-			(c) => c.tx_hash.toLowerCase() === txid && c.tx_pos < entry.count
+						: FIXED_OUTPUT_FEE_TIMING.splitRaiseBlocks))
 		);
-		if (outputs.length !== entry.count || outputs.some((c) => c.height > 0))
-			return txid;
-		const replaced = await this.raiseSplit(entry, wanted, height);
-		if (!replaced) return txid;
-		await this.refresh();
-		return replaced;
+	}
+	/**
+	 * The replacement of the unconfirmed split `entry` for a spend asked at
+	 * `wanted`, unsigned: the same source and fee coins, at the rate asked or
+	 * the least a replacement must add, whichever is more, or at the highest
+	 * rate the cap of a split pays for when that is less. Undefined when no
+	 * replacement within that cap pays enough more to replace the split.
+	 */
+	private raisePlan(
+		entry: Preparation,
+		wanted: number
+	): { unsigned: string; fee: number; rate: number } | undefined {
+		const cap = this.policy.maxPreparationFeeSatoshis,
+			was = entry.rate ?? 1;
+		const at = (rate: number): { unsigned: string; fee: number } | undefined =>
+			this.buildSplit(
+				entry.source,
+				entry.address,
+				entry.amount,
+				entry.count,
+				rate
+			);
+		let rate = Math.max(
+			wanted,
+			was + 1,
+			Math.ceil((was * SPLIT_RAISE_NUMERATOR) / SPLIT_RAISE_DENOMINATOR)
+		);
+		let built = at(rate);
+		if (built && BigInt(built.fee) > cap) {
+			// The highest rate the cap of a split still pays for.
+			const size = at(1);
+			rate = size ? Math.floor(Number(cap) / size.fee) : 0;
+			built = rate > was ? at(rate) : undefined;
+		}
+		if (!built || BigInt(built.fee) > cap) return undefined;
+		if (
+			BigInt(built.fee) <
+			BigInt(entry.fee) + BigInt(Math.ceil(built.fee / rate))
+		)
+			return undefined;
+		return { ...built, rate };
 	}
 	/**
 	 * Build, sign and send the replacement of an unconfirmed split: the same
@@ -1411,33 +1923,12 @@ export class FixedOutputFeePool {
 		const cap = this.policy.maxPreparationFeeSatoshis;
 		const before = {
 			fee: BigInt(entry.fee),
-			rate: entry.rate ?? 1,
 			txid: this.txidOf(entry)!
 		};
-		const at = (rate: number): { unsigned: string; fee: number } | undefined =>
-			this.buildSplit(
-				entry.source,
-				entry.address,
-				entry.amount,
-				entry.count,
-				rate
-			);
-		let rate = Math.max(
-			wanted,
-			before.rate + 1,
-			Math.ceil((before.rate * SPLIT_RAISE_NUMERATOR) / SPLIT_RAISE_DENOMINATOR)
-		);
-		let built = at(rate);
-		if (built && BigInt(built.fee) > cap) {
-			// The highest rate the cap of a split still pays for.
-			const size = at(1);
-			rate = size ? Math.floor(Number(cap) / size.fee) : 0;
-			built = rate > before.rate ? at(rate) : undefined;
-		}
-		if (!built || BigInt(built.fee) > cap) return undefined;
-		const fee = BigInt(built.fee);
-		if (fee < before.fee + BigInt(Math.ceil(built.fee / rate)))
-			return undefined;
+		const built = this.raisePlan(entry, wanted);
+		if (!built) return undefined;
+		const { rate } = built,
+			fee = BigInt(built.fee);
 		try {
 			this.assertRoom(fee - before.fee);
 		} catch (error) {
@@ -1455,6 +1946,7 @@ export class FixedOutputFeePool {
 		delete candidate.signed;
 		delete candidate.txid;
 		delete candidate.listed;
+		delete candidate.replacement;
 		this.validateUnsigned(candidate);
 		const result = this.wallet.signPsbtWithOurKey!(built.unsigned);
 		if (result.isErr()) return undefined;
@@ -1471,40 +1963,92 @@ export class FixedOutputFeePool {
 			}
 		).value.txHex;
 		this.validateSigned(candidate, signed);
-		const sent = await this.bounded('a broadcast', () =>
-			this.wallet.electrum.broadcastTransaction({ rawTx: signed })
-		);
-		if (sent.isErr()) return undefined;
 		const txid = bitcoin.Transaction.fromHex(signed).getId();
-		const moved = (coin: Coin): Coin =>
-			coin.utxo.tx_hash.toLowerCase() === before.txid
-				? { utxo: { ...coin.utxo, tx_hash: txid, height: 0 }, previous: signed }
-				: coin;
+		// Recorded before it is sent, as the first form of a split is: a
+		// wallet that answers past the bound, or a stop, leaves it in the
+		// journal for the next selection to settle. The split was charged its
+		// fee when it was closed: the replacement is charged what it pays over
+		// that, in the journal's charges, until it is settled.
 		const next = copy(this.journal);
-		if (next.coins) next.coins = next.coins.map(moved);
-		for (const action of Object.values(next.actions))
-			action.inputs = action.inputs.map(moved);
-		next.unconfirmed = (next.unconfirmed ?? []).map((row) =>
+		next.unconfirmed = next.unconfirmed!.map((row) =>
 			this.txidOf(row) === before.txid
 				? {
-						...candidate,
-						state: 'published' as const,
-						signed,
-						txid,
-						at: height,
-						raises: (entry.raises ?? 0) + 1,
-						prior: [
-							...(entry.prior ?? []),
-							{ txid: before.txid, signed: entry.signed!, fee: entry.fee }
-						]
+						...row,
+						replacement: {
+							...candidate,
+							state: 'published' as const,
+							signed,
+							txid,
+							at: height,
+							raises: (entry.raises ?? 0) + 1,
+							prior: [
+								...(entry.prior ?? []),
+								{ txid: before.txid, signed: entry.signed!, fee: entry.fee }
+							]
+						}
 				  }
 				: row
 		);
-		// The split was charged its fee when it was closed: the replacement
-		// is charged what it pays over that.
-		next.spent = (BigInt(next.spent ?? '0') + fee - before.fee).toString();
+		next.charges = [
+			...(next.charges ?? []).filter((charge) => charge.txid !== txid),
+			{ txid, split: before.txid, over: (fee - before.fee).toString() }
+		];
 		this.save(next);
-		return txid;
+		const sent = await this.bounded('a broadcast', () =>
+			this.wallet.electrum.broadcastTransaction({ rawTx: signed })
+		);
+		this.settleReplacement(before.txid, !sent.isErr());
+		return sent.isErr() ? undefined : txid;
+	}
+	/**
+	 * The replacement recorded for the unconfirmed split `txid` went out, or
+	 * did not. Once out, the coins of the split are its coins at the same
+	 * positions, it stands in the split's place, and what it paid is spent;
+	 * otherwise it is dropped, and the charge its record carried with it.
+	 */
+	private settleReplacement(txid: string, out: boolean): void {
+		const next = copy(this.journal),
+			row = next.unconfirmed?.find((r) => this.txidOf(r) === txid),
+			replacement = row?.replacement;
+		if (!row || !replacement) return;
+		const charges = (next.charges ?? []).filter(
+			(charge) => charge.txid !== replacement.txid
+		);
+		if (charges.length) next.charges = charges;
+		else delete next.charges;
+		const recorded = replacement.prior?.[replacement.prior.length - 1];
+		if (out) {
+			// It stands in the place of this split, which it replaced with
+			// every split this one replaced.
+			const stands: Preparation =
+				recorded?.txid === txid
+					? replacement
+					: {
+							...replacement,
+							prior: [
+								...(row.prior ?? []),
+								{ txid, signed: row.signed!, fee: row.fee }
+							]
+					  };
+			delete stands.replacement;
+			this.move(
+				next,
+				txid,
+				{ txid: replacement.txid!, signed: replacement.signed! },
+				true
+			);
+			next.unconfirmed = next.unconfirmed!.map((r) => (r === row ? stands : r));
+			// What was spent holds the fee of this split. The replacement paid
+			// its own in its place: the charge its record carried, and what this
+			// split paid over the split that record was made for, when another
+			// release replaced it, are both in that.
+			next.spent = (
+				BigInt(next.spent ?? '0') +
+				BigInt(replacement.fee) -
+				BigInt(row.fee)
+			).toString();
+		} else delete row.replacement;
+		this.save(next);
 	}
 	/**
 	 * A signed split the network refused, that the wallet's server never
@@ -1698,9 +2242,27 @@ export class FixedOutputFeePool {
 		opts: IFeeBumpSelectionOpts
 	): Promise<Selection> {
 		try {
-			return await this.locked(() =>
-				this.selectLocked(targetFeeSats, feeratePerKw, opts)
-			);
+			return await this.locked(async () => {
+				// Near its deadline a claim passes over a coin of a split that
+				// cannot pay its rate for a split of the pool's own. When that
+				// split cannot be had, a wallet that does not answer in time
+				// included, the selection is made again without passing over: a
+				// spend that waits on a slow parent can still confirm, and one
+				// with no fee input cannot go out at all.
+				const prefer = { over: false };
+				try {
+					return await this.selectLocked(
+						targetFeeSats,
+						feeratePerKw,
+						opts,
+						undefined,
+						prefer
+					);
+				} catch (error) {
+					if (!prefer.over) throw error;
+					return this.selectLocked(targetFeeSats, feeratePerKw, opts);
+				}
+			});
 		} catch (error) {
 			if (error instanceof FixedOutputFeeError)
 				this.lastRefusal = {
@@ -1824,7 +2386,10 @@ export class FixedOutputFeePool {
 		feeratePerKw: number,
 		opts: IFeeBumpSelectionOpts,
 		// The split this same request just sent, on its second pass.
-		sent?: string
+		sent?: string,
+		// Given when a split of the pool's own may be preferred to a coin of a
+		// split that cannot pay the rate; `over` is set when it was.
+		prefer?: { over: boolean }
 	): Promise<Selection> {
 		const actionId = opts.feeActionId;
 		if (
@@ -1868,9 +2433,19 @@ export class FixedOutputFeePool {
 				'Fixed-output fee action is retired'
 			);
 		await this.releaseOrphans();
+		const failures = new Map<string, Error>();
+		await this.refresh();
+		await this.each((row) => this.resume(row), failures);
+		await this.refresh();
+		await this.each((row) => this.observe(row), failures);
+		const derived = copy(this.journal);
+		if (this.recordMoves(derived)) this.save(derived);
+		await this.settleUnconfirmed();
 		if (!Object.prototype.hasOwnProperty.call(this.journal.actions, id)) {
 			// A new action: the only place the policy's budget and its
-			// per-transaction cap are applied.
+			// per-transaction cap are applied. It is measured once the splits
+			// are settled, so that a split replacement that was recorded and
+			// refused is no longer charged.
 			this.assertRoom(requestedCap);
 			const next = copy(this.journal);
 			next.actions[id] = {
@@ -1880,22 +2455,7 @@ export class FixedOutputFeePool {
 			};
 			this.save(next);
 		}
-		const failures = new Map<string, Error>();
-		await this.refresh();
-		await this.each((row) => this.resume(row), failures);
-		await this.refresh();
-		await this.each((row) => this.observe(row), failures);
-		await this.settleUnconfirmed();
 		const splitAt = this.splitRate(feeratePerKw);
-		// A selection that may take a coin of a split still unconfirmed has
-		// the split pay the rate of its own spend first, so that the two can
-		// confirm in one block.
-		if (
-			opts.confirmedOnly !== true &&
-			(opts.replacementInputs ?? []).length === 0
-		)
-			for (const row of [...(this.journal.unconfirmed ?? [])])
-				await this.raiseIfDue(this.txidOf(row)!, splitAt, opts);
 		// The coins of a split that replaced another are on their way until
 		// the wallet has listed them.
 		const onTheWay = (): Set<string> =>
@@ -1928,12 +2488,24 @@ export class FixedOutputFeePool {
 			opts.maxFeeSatoshis < BigInt(action.cap)
 				? opts.maxFeeSatoshis
 				: BigInt(action.cap);
+		// A spend made before a coin of the action moved names the coin where
+		// it was. It is served with the coin where it is now, so that its next
+		// form spends a coin that exists: the action keeps its place in a
+		// split that follows the rate, and a raise is never refused for it.
 		const replacementKeys = new Set(
-			(opts.replacementInputs ?? []).map(
-				(i) => `${i.txid.toLowerCase()}:${i.vout}`
+			(opts.replacementInputs ?? []).map((i) =>
+				this.locate(action, `${i.txid.toLowerCase()}:${i.vout}`)
 			)
 		);
-		const confirmed = opts.confirmedOnly === true || replacementKeys.size > 0;
+		// A request that names the transaction it replaces takes confirmed
+		// coins only, whether or not it names that transaction's fee coins (the
+		// node's second request after a raise refused for good names none): a
+		// replacement may spend an unconfirmed coin only when a transaction it
+		// replaces spent it (BIP 125 rule 2).
+		const confirmed =
+			opts.confirmedOnly === true ||
+			replacementKeys.size > 0 ||
+			opts.replacedTxid !== undefined;
 		// The transaction a caller replaces holds its fee inputs only while
 		// the wallet's server knows it. One that was refused, or was never
 		// sent, spends nothing: an input of it that the wallet no longer
@@ -1946,13 +2518,24 @@ export class FixedOutputFeePool {
 			gone = [...(action.gone ?? [])];
 		for (const coin of action.inputs) {
 			this.checkCoin(coin);
-			if (excluded.has(coin.utxo.tx_hash.toLowerCase()))
+			const txid = coin.utxo.tx_hash.toLowerCase();
+			if (excluded.has(txid))
 				throw new FixedOutputFeeError(
 					'FEE_INPUT_UNAVAILABLE',
 					'none',
 					'Reserved fixed-output fee input is unavailable'
 				);
-			if (
+			if (replacementKeys.size > 0 && (await this.stuck(coin, splitAt, live))) {
+				// A raise lets go of a coin of a split that has not confirmed,
+				// cannot be replaced, and pays less than the rate asked: a spend
+				// that kept it would wait on that split. That holds as well for
+				// a split a reorganisation put back in the mempool after the
+				// pool let it go, which the pool no longer follows. The raise still
+				// replaces the spend through the output both spend, and is
+				// funded from confirmed coins. The spend it replaces may still
+				// be the one a block takes, so the coin is counted as gone.
+				gone.push({ outpoint: key(coin.utxo), value: coin.utxo.value });
+			} else if (
 				stays(coin) ||
 				(replacementKeys.has(key(coin.utxo)) && !replacedUnknown)
 			)
@@ -1963,10 +2546,17 @@ export class FixedOutputFeePool {
 			// from another.
 			else gone.push({ outpoint: key(coin.utxo), value: coin.utxo.value });
 		}
+		// A named coin the action no longer holds is served without: one it
+		// let go of, in this selection or an earlier one whose answer the node
+		// may not have taken up, is still spent by the transaction replaced,
+		// and the raise replaces that transaction through the output both
+		// spend; and a transaction the wallet's server does not know spends
+		// nothing. Only a coin the action never held is refused.
 		for (const wanted of replacementKeys)
 			if (
 				!kept.some((coin) => key(coin.utxo) === wanted) &&
-				!(replacedUnknown && gone.some((coin) => coin.outpoint === wanted))
+				!gone.some((coin) => coin.outpoint === wanted) &&
+				!replacedUnknown
 			)
 				throw new FixedOutputFeeError(
 					'FEE_INPUT_UNAVAILABLE',
@@ -1975,8 +2565,86 @@ export class FixedOutputFeePool {
 				);
 		const selected = [...kept];
 		let sum = selected.reduce((total, c) => total + BigInt(c.utxo.value), 0n);
-		const target = (count: number): bigint =>
-			targetFeeSats + spliceFeeSats(count * P2WPKH_INPUT_WEIGHT, feeratePerKw);
+		// A raise of a transaction it names, that the wallet's server may
+		// know, pays more than that transaction by the relay rate of 1 sat/vB
+		// on its own size (BIP 125), or the network keeps the transaction it
+		// replaces. That transaction burned whole the fee coins it names:
+		// those the action keeps, and those it let go of.
+		const values = new Map<string, bigint>([
+			...gone.map((coin): [string, bigint] => [
+				coin.outpoint,
+				BigInt(coin.value)
+			]),
+			...action.inputs.map((coin): [string, bigint] => [
+				key(coin.utxo),
+				BigInt(coin.utxo.value)
+			])
+		]);
+		// A request that names the transaction it replaces and none of its fee
+		// coins, as the node's second request after a raise refused for good,
+		// reads those coins from that transaction, when the wallet's server
+		// has it. One the server does not know spends nothing, and there is
+		// nothing to pay over. One it cannot give and may know, as a server
+		// without a txindex answers of every spend not in its mempool, is
+		// reckoned to have paid every coin the action holds or let go of: the
+		// most a spend of the action's coins can have paid, so that a raise
+		// never pays less than it, and never waits on the server. Coins that
+		// spend never spent together may pass the action's cap: the raise is
+		// then served with what fits within the cap (below).
+		let paidKeys = replacementKeys,
+			reckoned = false;
+		if (!replacementKeys.size && opts.replacedTxid !== undefined) {
+			const replaced = opts.replacedTxid.toLowerCase();
+			let raw: string | undefined;
+			try {
+				raw = (
+					await this.bounded('a transaction lookup', () =>
+						this.host.previousTransactions([replaced])
+					)
+				).get(replaced);
+			} catch (error) {
+				if (timedOut(error)) throw error;
+			}
+			if (raw)
+				paidKeys = new Set(
+					bitcoin.Transaction.fromHex(raw).ins.map((input) =>
+						this.locate(
+							action,
+							`${Buffer.from(input.hash).reverse().toString('hex')}:${
+								input.index
+							}`
+						)
+					)
+				);
+			else if ((await this.known(replaced)) !== false) {
+				paidKeys = new Set(values.keys());
+				reckoned = true;
+			}
+		}
+		const replacedPaid =
+			opts.replacedTxid === undefined || replacedUnknown
+				? 0n
+				: [...paidKeys].reduce(
+						(total, outpoint) => total + (values.get(outpoint) ?? 0n),
+						0n
+				  );
+		// The size of the spend on its own, from the fee it is asked to pay at
+		// its rate. A rate in sat/kw is a rate in sat/vB rounded up (as
+		// satPerVbyteToSatPerKw has it), so the size is reckoned at the least
+		// rate that rounds to it: it may come out a little long, never short.
+		const ownVbytes = Math.ceil(
+			(Number(targetFeeSats) * 250) / Math.max(1, feeratePerKw - 1)
+		);
+		const target = (count: number): bigint => {
+			const asked =
+				targetFeeSats +
+				spliceFeeSats(count * P2WPKH_INPUT_WEIGHT, feeratePerKw);
+			if (replacedPaid === 0n) return asked;
+			const relayed =
+				replacedPaid +
+				BigInt(ownVbytes + Math.ceil((count * P2WPKH_INPUT_WEIGHT) / 4));
+			return relayed > asked ? relayed : asked;
+		};
 		const frozen = new Map(
 			this.wallet.listFrozenUtxos!().map((coin) => [key(coin), coin.freezeTag])
 		);
@@ -1997,37 +2665,202 @@ export class FixedOutputFeePool {
 		const remaining = free.filter(
 			({ current }) => !confirmed || current.height > 0
 		);
-		while (
-			remaining.length &&
-			(sum < target(selected.length) || !selected.length)
-		) {
-			const adequate = remaining.findIndex(
+		const worth = (coins: typeof remaining): bigint =>
+			coins.reduce((total, { current }) => total + BigInt(current.value), 0n);
+		// The coins of `coins` that cover the target: at each step the
+		// smallest that covers it alone, or, while none does, the largest
+		// that fits the cap.
+		const cover = (coins: typeof remaining): typeof remaining => {
+			const left = [...coins],
+				taken: typeof remaining = [];
+			const count = (): number => selected.length + taken.length;
+			while (
+				left.length &&
+				(sum + worth(taken) < target(count()) || !count())
+			) {
+				const total = sum + worth(taken);
+				const adequate = left.findIndex(
+					({ current }) =>
+						total + BigInt(current.value) >= target(count() + 1) &&
+						total + BigInt(current.value) <= cap
+				);
+				const index =
+					adequate >= 0
+						? adequate
+						: left
+								.map((entry, position) => ({ entry, index: position }))
+								.reverse()
+								.find(({ entry }) => total + BigInt(entry.current.value) <= cap)
+								?.index;
+				if (index === undefined) break;
+				taken.push(left.splice(index, 1)[0]);
+			}
+			return taken;
+		};
+		// What a coin of a split that has not confirmed costs beyond itself,
+		// by split: nothing when the split pays the rate asked, and what its
+		// replacement pays over it when one is due now and pays that rate.
+		// Undefined when the split cannot pay that rate now: a spend that took
+		// the coin would wait on it.
+		const parents = new Map<string, bigint | undefined>();
+		const extra = (txid: string): bigint | undefined => {
+			if (!parents.has(txid)) {
+				const entry = (this.journal.unconfirmed ?? []).find(
+					(row) => this.txidOf(row) === txid
+				);
+				let cost: bigint | undefined;
+				if (entry && (entry.rate ?? 1) >= splitAt) cost = 0n;
+				else if (
+					entry &&
+					this.due(entry, splitAt, opts) &&
+					this.replaceable(txid)
+				) {
+					const plan = this.raisePlan(entry, splitAt);
+					if (plan && plan.rate >= splitAt)
+						cost = BigInt(plan.fee) - BigInt(entry.fee);
+				}
+				parents.set(txid, cost);
+			}
+			return parents.get(txid);
+		};
+		const parentOf = ({
+			current
+		}: {
+			current: ISpliceUtxo;
+		}): string | undefined =>
+			current.height > 0 ? undefined : current.tx_hash.toLowerCase();
+		// Fee coins are burned whole, so what is taken is the fee, with what
+		// the replacement of a split its coins set off pays.
+		const costOf = (coins: typeof remaining): bigint => {
+			let total = worth(coins);
+			for (const txid of new Set(coins.map(parentOf)))
+				if (txid !== undefined) total += extra(txid) ?? 0n;
+			return total;
+		};
+		const enough = (coins: typeof remaining): boolean =>
+			selected.length + coins.length > 0 &&
+			sum + worth(coins) >= target(selected.length + coins.length);
+		// The coin that covers the target alone for least, or the coins each
+		// too small to cover it alone when together they cover it for less.
+		const choose = (coins: typeof remaining): typeof remaining => {
+			if (enough([])) return [];
+			const fits = coins.filter(
 				({ current }) =>
 					sum + BigInt(current.value) >= target(selected.length + 1) &&
 					sum + BigInt(current.value) <= cap
 			);
-			const index =
-				adequate >= 0
-					? adequate
-					: remaining
-							.map((entry, position) => ({ entry, index: position }))
-							.reverse()
-							.find(({ entry }) => sum + BigInt(entry.current.value) <= cap)
-							?.index;
-			if (index === undefined) break;
-			const { coin, current } = remaining.splice(index, 1)[0];
+			if (!fits.length) return cover(coins);
+			const single = fits.reduce((best, coin) =>
+				costOf([coin]) < costOf([best]) ? coin : best
+			);
+			const first = coins.indexOf(fits[0]);
+			const smaller = first > 0 ? cover(coins.slice(0, first)) : [];
+			return smaller.length > 0 &&
+				enough(smaller) &&
+				costOf(smaller) < costOf([single])
+				? smaller
+				: [single];
+		};
+		// What a split of the pool's own is made for when no free coin covers
+		// the target, and the coins of the wallet it may be made from.
+		const retained = kept.reduce(
+			(total, c) => total + BigInt(c.utxo.value),
+			0n
+		);
+		const needed = target(kept.length + 1) - retained;
+		const amount = needed > BigInt(DUST) ? needed : BigInt(DUST);
+		const ordinaryCoins = (): ISpliceUtxo[] => {
+			const reserved = this.latest().reserved;
+			return live.filter(
+				(coin) =>
+					!excluded.has(coin.tx_hash.toLowerCase()) &&
+					this.ordinary(coin, reserved)
+			);
+		};
+		const large = (coin: ISpliceUtxo): boolean =>
+			BigInt(coin.value) >= amount + this.policy.maxPreparationFeeSatoshis;
+		const sourceOf = (coins: ISpliceUtxo[]): ISpliceUtxo | undefined =>
+			coins
+				.filter((coin) => coin.height > 0 && large(coin))
+				.sort((a, b) => b.value - a.value)[0];
+		// A spend with a deadline that may take a coin of the pool's own split
+		// before the split confirmed takes it at once (below).
+		const atOnce = !confirmed && opts.deadlineHeight !== undefined;
+		// Whether such a split can be made now and its coin taken at once:
+		// nothing it would wait on first, room for it in the action's cap and
+		// in the budget, and a confirmed coin of the wallet to make it from.
+		const splitNow = (): boolean => {
+			if (
+				!prefer ||
+				!atOnce ||
+				sent !== undefined ||
+				failures.size > 0 ||
+				this.journal.preparations.some(
+					(p) => p.state === 'signed' || p.state === 'published'
+				) ||
+				(this.journal.coins ?? []).some((c) => !listed.has(key(c.utxo))) ||
+				retained + amount > cap
+			)
+				return false;
+			try {
+				this.assertRoom(this.policy.maxPreparationFeeSatoshis);
+			} catch (error) {
+				if (error instanceof FixedOutputFeeError) return false;
+				throw error;
+			}
+			return sourceOf(ordinaryCoins()) !== undefined;
+		};
+		// A coin of a split the pool follows that pays less than a split of its
+		// own could, and cannot be replaced by one that pays that. What a split
+		// the pool no longer follows pays is not known without its source.
+		const stuckSplit = (coin: (typeof remaining)[number]): boolean => {
+			const txid = parentOf(coin);
+			return (
+				txid !== undefined &&
+				(this.journal.unconfirmed ?? []).some(
+					(row) => this.txidOf(row) === txid
+				) &&
+				!this.awaitable(txid, splitAt)
+			);
+		};
+		// A coin of a split that cannot pay the rate now is taken only when
+		// the other coins do not cover the target: a spend that took it would
+		// wait on that split. For a spend that takes the coin of a split of
+		// the pool's own at once, a coin of a split that cannot be brought to
+		// pay what a split of the pool's own would is taken only after the
+		// others, and never while such a split can be made now: that split
+		// pays the rate asked, or the most the cap of a split allows, and the
+		// two can confirm together.
+		let chosen = choose(
+			remaining.filter((coin) => {
+				const txid = parentOf(coin);
+				return txid === undefined || extra(txid) !== undefined;
+			})
+		);
+		if (!enough(chosen) && atOnce)
+			chosen = choose(remaining.filter((coin) => !stuckSplit(coin)));
+		if (!enough(chosen)) {
+			const all = choose(remaining);
+			if (prefer && enough(all) && splitNow()) prefer.over = true;
+			else chosen = all;
+		}
+		for (const { coin, current } of chosen) {
 			const entry = { utxo: { ...current }, previous: coin.previous };
 			this.checkCoin(entry);
 			selected.push(entry);
 			sum += BigInt(current.value);
 		}
-		if (sum < target(selected.length) || !selected.length) {
-			const retained = kept.reduce(
-				(total, c) => total + BigInt(c.utxo.value),
-				0n
-			);
-			const needed = target(kept.length + 1) - retained;
-			const amount = needed > BigInt(DUST) ? needed : BigInt(DUST);
+		// A pay-over reckoned for a spend the server could not give is served
+		// with the coins taken when they fit the cap and pay the rate asked,
+		// though they fall short of it.
+		const fits =
+			reckoned &&
+			selected.length > 0 &&
+			sum <= cap &&
+			sum >=
+				targetFeeSats +
+					spliceFeeSats(selected.length * P2WPKH_INPUT_WEIGHT, feeratePerKw);
+		if (!fits && (sum < target(selected.length) || !selected.length)) {
 			if (retained + amount > cap)
 				throw new FixedOutputFeeError(
 					'FEE_ACTION_CAP_EXHAUSTED',
@@ -2042,16 +2875,40 @@ export class FixedOutputFeePool {
 			);
 			if (unseen)
 				throw new FixedOutputFeePreparationPendingError(this.txidOf(unseen)!);
-			const unconfirmed = free.find(({ current }) => current.height <= 0);
-			if (unconfirmed && confirmed)
-				// It waits on a split that has not confirmed: one that is
-				// due is replaced by one that pays more.
+			// It waits on a split that has not confirmed only while that split
+			// pays the rate asked, or can be replaced by one that does: one
+			// that is due is replaced now. A split a spend took a coin of
+			// cannot be replaced, nor one a reorganisation put back after the
+			// pool let it go. A claim that waited on it could pass its
+			// deadline, so a split of its own is made instead.
+			// It waits only when the coins it would have once those splits
+			// confirm could cover it within its cap: the coins it keeps, and
+			// every free coin, taken largest first.
+			const later = free.filter(
+				({ current }) =>
+					current.height <= 0 &&
+					this.awaitable(current.tx_hash.toLowerCase(), splitAt)
+			);
+			const couldCover = (coins: typeof free): boolean => {
+				let total = retained,
+					count = kept.length;
+				for (const { current } of [...coins].sort(
+					(a, b) => b.current.value - a.current.value
+				)) {
+					if (count > 0 && total >= target(count)) break;
+					if (total + BigInt(current.value) > cap) continue;
+					total += BigInt(current.value);
+					count++;
+				}
+				return count > 0 && total >= target(count);
+			};
+			const awaited =
+				confirmed && later.length && couldCover([...remaining, ...later])
+					? later[0].current.tx_hash.toLowerCase()
+					: undefined;
+			if (awaited)
 				throw new FixedOutputFeePreparationPendingError(
-					await this.raiseIfDue(
-						unconfirmed.current.tx_hash.toLowerCase(),
-						splitAt,
-						opts
-					)
+					await this.raiseIfDue(awaited, splitAt, opts)
 				);
 			// A coin of a split that was replaced, until the wallet lists it.
 			const coming = (this.journal.coins ?? []).find(
@@ -2060,17 +2917,8 @@ export class FixedOutputFeePool {
 			if (coming)
 				throw new FixedOutputFeePreparationPendingError(coming.utxo.tx_hash);
 			if (sent) throw new FixedOutputFeePreparationPendingError(sent);
-			const reserved = this.latest().reserved;
-			const ordinary = live.filter(
-				(coin) =>
-					!excluded.has(coin.tx_hash.toLowerCase()) &&
-					this.ordinary(coin, reserved)
-			);
-			const large = (coin: ISpliceUtxo): boolean =>
-				BigInt(coin.value) >= amount + this.policy.maxPreparationFeeSatoshis;
-			const source = ordinary
-				.filter((coin) => coin.height > 0 && large(coin))
-				.sort((a, b) => b.value - a.value)[0];
+			const ordinary = ordinaryCoins();
+			const source = sourceOf(ordinary);
 			if (!source) {
 				// The only fee coin may have just funded anchor CPFP. Its owned
 				// change can prepare the HTLC fee after confirmation, so defer
@@ -2166,9 +3014,36 @@ export class FixedOutputFeePool {
 			// split before the split confirmed takes it at once, so that the
 			// two can be in one block.
 			if (!confirmed && !sent && opts.deadlineHeight !== undefined)
-				return this.selectLocked(targetFeeSats, feeratePerKw, opts, made);
+				return this.selectLocked(
+					targetFeeSats,
+					feeratePerKw,
+					opts,
+					made,
+					prefer
+				);
 			throw new FixedOutputFeePreparationPendingError(made);
 		}
+		// A coin it takes or keeps of a split still unconfirmed has that split
+		// pay the rate of its own spend first, when a replacement is due, so
+		// that the two can confirm in one block. A coin it keeps counts as one
+		// it takes: a raise keeps the coins of the spend it replaces, and a
+		// request whose spend never went out keeps the coins of its action. A
+		// split it takes no coin of is left as it is. Once a split is replaced
+		// its coins are those of the replacement, and the selection is made
+		// again.
+		for (const txid of new Set(
+			selected
+				.filter((coin) => (listed.get(key(coin.utxo))?.height ?? 0) <= 0)
+				.map((coin) => coin.utxo.tx_hash.toLowerCase())
+		))
+			if ((await this.raiseIfDue(txid, splitAt, opts)) !== txid)
+				return this.selectLocked(
+					targetFeeSats,
+					feeratePerKw,
+					opts,
+					sent,
+					prefer
+				);
 		if (sum > cap)
 			throw new FixedOutputFeeError(
 				'FEE_ACTION_CAP_EXHAUSTED',
@@ -2180,6 +3055,15 @@ export class FixedOutputFeePool {
 		const before = this.held(next.actions[id]);
 		next.actions[id].inputs = selected;
 		if (gone.length) next.actions[id].gone = gone;
+		// A moved record whose coin the action neither holds nor let go of is
+		// out of date: a release that does not keep the record moved the coin
+		// since. It is dropped with the row's next write.
+		const moved = next.actions[id].moved;
+		if (moved) {
+			for (const [was, is] of Object.entries(moved))
+				if (!this.has(next.actions[id], is)) delete moved[was];
+			if (!Object.keys(moved).length) delete next.actions[id].moved;
+		}
 		// An action that takes more than it held, as a raise does, needs
 		// room in the budget for the difference.
 		const more = this.held(next.actions[id]) - before;
