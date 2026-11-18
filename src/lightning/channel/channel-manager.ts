@@ -4414,6 +4414,10 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			}
 		}
 
+		// Once the monitors have taken the block: the fee pool's free coins go
+		// back to the wallet when no asset channel can need them any more.
+		this.releaseFreeFixedOutputFeeCoins();
+
 		return allActions;
 	}
 
@@ -13196,6 +13200,8 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 	private fixedOutputFeesSaid = new Map<string, string>();
 	/** Channels whose open fee actions were looked through since the start. */
 	private fixedOutputFeesReconciled = new Set<string>();
+	/** The wallet is being asked to take the fee pool's free coins back. */
+	private fixedOutputFeeCoinsReleasing = false;
 
 	/**
 	 * Bring the fee of a spend of an asset channel whose outputs are fixed:
@@ -13327,30 +13333,52 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 						action.feeratePerVbyte
 				  );
 			const ownVbytes = measured ?? own.virtualSize() + (signed ? 0 : 56);
-			const selected = await fp.selectFeeBumpInputs(
-				BigInt(Math.ceil(ownVbytes * action.feeratePerVbyte)),
-				satPerVbyteToSatPerKw(action.feeratePerVbyte),
-				{
-					fixedOutputs: true,
-					feeActionId,
-					// Near its deadline a spend may take a coin of the pool's
-					// own split before the split has confirmed.
-					confirmedOnly: !(
-						spent.deadlineHeight !== undefined &&
-						spent.deadlineHeight - this._currentBlockHeight <=
-							FIXED_OUTPUT_FEE_TIMING.unconfirmedCoinBlocks
-					),
-					...(this._currentBlockHeight > 0
-						? { blockHeight: this._currentBlockHeight }
-						: {}),
-					...(spent.deadlineHeight !== undefined
-						? { deadlineHeight: spent.deadlineHeight }
-						: {}),
-					...(replaced.length > 0
-						? { replacementInputs: replaced, replacedTxid: present.getId() }
-						: {})
-				}
-			);
+			const select = fp.selectFeeBumpInputs.bind(fp);
+			const ask = (named: boolean): ReturnType<typeof select> =>
+				select(
+					BigInt(Math.ceil(ownVbytes * action.feeratePerVbyte)),
+					satPerVbyteToSatPerKw(action.feeratePerVbyte),
+					{
+						fixedOutputs: true,
+						feeActionId,
+						// Near its deadline a spend may take a coin of the pool's
+						// own split before the split has confirmed.
+						confirmedOnly: !(
+							spent.deadlineHeight !== undefined &&
+							spent.deadlineHeight - this._currentBlockHeight <=
+								FIXED_OUTPUT_FEE_TIMING.unconfirmedCoinBlocks
+						),
+						...(this._currentBlockHeight > 0
+							? { blockHeight: this._currentBlockHeight }
+							: {}),
+						...(spent.deadlineHeight !== undefined
+							? { deadlineHeight: spent.deadlineHeight }
+							: {}),
+						...(replaced.length > 0
+							? {
+									...(named ? { replacementInputs: replaced } : {}),
+									replacedTxid: present.getId()
+							  }
+							: {})
+					}
+				);
+			// A raise refused for good, of an action that is not over: the fee
+			// coins the spend held names are no longer the action's to name.
+			// The pool is asked once more without them. It serves the raise with
+			// the coins the action holds, or with others, and the spend made of
+			// them still replaces the one held, through the output both spend.
+			// The request still names the spend held, so that the new one pays
+			// what it paid with the relay rate on its own size over that.
+			const selected = await ask(true).catch((error: unknown) => {
+				const refused = error as { code?: unknown; remedy?: unknown };
+				if (
+					replaced.length === 0 ||
+					refused.remedy !== 'none' ||
+					refused.code === 'FEE_ACTION_RETIRED'
+				)
+					throw error;
+				return ask(false);
+			});
 			const feeInputs = selected.inputs.map((input) => {
 				const previous = bitcoin.Transaction.fromBuffer(input.prevTx);
 				return {
@@ -13506,6 +13534,68 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 				true
 			);
 		}
+	}
+
+	/**
+	 * On a block after which no asset channel can need a fee coin, the
+	 * wallet is asked to take the fee pool's free coins back: no asset
+	 * channel is open, opening or errored, each is closed with a monitor
+	 * that has nothing left to resolve (as the block skips it), no monitor
+	 * of an asset channel has anything left to resolve, no fee action is
+	 * being worked on or retired, and no spend of an asset channel is held.
+	 * Anything else keeps the coins until a later block. The pool keeps
+	 * every coin while any of its fee actions is open, and makes fee coins
+	 * again for a later asset channel when asked.
+	 */
+	private releaseFreeFixedOutputFeeCoins(): void {
+		const fp = this.fundingProvider;
+		if (
+			!fp?.releaseFixedOutputFeeCoins ||
+			this.fixedOutputFeeCoinsReleasing ||
+			this.fixedOutputFeesBusy.size > 0 ||
+			this.fixedOutputFeesRetiring.size > 0 ||
+			this.auxiliarySpendsHeld.size > 0
+		) {
+			return;
+		}
+		for (const channel of [
+			...this.channels.values(),
+			...this.tempChannels.values()
+		]) {
+			if (!channel.getFullState().auxiliaryState) continue;
+			const state = channel.getState();
+			const idHex = channel.getChannelId()?.toString('hex');
+			const monitor = idHex ? this.monitors.get(idHex) : undefined;
+			if (
+				(state !== ChannelState.CLOSED &&
+					state !== ChannelState.FORCE_CLOSED) ||
+				!monitor?.isFullyResolved()
+			) {
+				return;
+			}
+		}
+		for (const monitor of this.monitors.values()) {
+			if (monitor.isFullyResolved()) continue;
+			// A monitor that cannot say whose it is counts as an asset
+			// channel's.
+			if (
+				typeof monitor.getChannelState !== 'function' ||
+				monitor.getChannelState().auxiliaryState
+			) {
+				return;
+			}
+		}
+		const release = fp.releaseFixedOutputFeeCoins.bind(fp);
+		this.fixedOutputFeeCoinsReleasing = true;
+		// A provider that throws at once is taken as one that refused: the
+		// block is handled whole either way.
+		void new Promise<boolean>((resolve) => resolve(release()))
+			// Refused or not answered: the coins stay, and the next block asks
+			// again.
+			.catch(() => false)
+			.finally(() => {
+				this.fixedOutputFeeCoinsReleasing = false;
+			});
 	}
 
 	private processChainActions(channelId: Buffer, actions: ChainAction[]): void {

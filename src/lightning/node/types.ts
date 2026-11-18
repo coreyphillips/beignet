@@ -156,6 +156,14 @@ export interface IFundingProvider {
 	): Promise<void>;
 	/** Exact canonical native HTLC actions retained for this channel, including abandoned sources. */
 	getFixedOutputFeeActionIds?(channelId: Buffer): readonly string[];
+	/**
+	 * Hand the free fee coins of the fee pool back to the wallet. Called only
+	 * once no asset channel is open or opening and none has anything left to
+	 * resolve; the pool keeps them while any of its fee actions is open, and
+	 * makes a split of its own when asked again. Resolves to whether anything
+	 * was handed back.
+	 */
+	releaseFixedOutputFeeCoins?(): Promise<boolean>;
 	/** The lifetime budget for fixed-output fees; undefined when none is configured. */
 	getFixedOutputFeeBudget?():
 		| import('../wallet/fixed-output-fees').IFixedOutputFeeBudget

@@ -295,6 +295,8 @@ export class WalletFundingProvider implements IFundingProvider {
 				{
 					previousTransactions: (ids): Promise<Map<string, string>> =>
 						this.previousTransactions(ids),
+					knownTransactions: (ids): Promise<Map<string, boolean>> =>
+						this.knownTransactions(ids),
 					input: (coin, raw): ISpliceWalletInput =>
 						this.walletInput(coin, raw, 'fixed-output fee'),
 					pledge: async (txid, index, tag): Promise<void> => {
@@ -390,6 +392,19 @@ export class WalletFundingProvider implements IFundingProvider {
 	/** Retained native HTLC actions for one exact channel, excluding fully retired entries. */
 	getFixedOutputFeeActionIds(channelId: Buffer): readonly string[] {
 		return this.fixedOutputFeePool?.actionIds(channelId) ?? [];
+	}
+
+	/**
+	 * Hand the free fee coins of the pool back to the wallet, for a host
+	 * that has established that no asset channel can need them. The pool
+	 * keeps them while any fee action is open, or any split is unsigned or
+	 * on its way. A split replacement it recorded is settled first, and not
+	 * sent again. A later selection makes a split of its own. Answers whether anything was handed back; false
+	 * without a fee policy.
+	 */
+	releaseFixedOutputFeeCoins(): Promise<boolean> {
+		if (!this.fixedOutputFeePool) return Promise.resolve(false);
+		return this.runSelection(() => this.fixedOutputFeePool!.releaseFreeCoins());
 	}
 
 	/** Run fn after every previously queued selection has finished. */
@@ -1488,6 +1503,53 @@ export class WalletFundingProvider implements IFundingProvider {
 			transactions.set(transaction.getId(), hex);
 		}
 		return transactions;
+	}
+
+	/**
+	 * Whether the wallet's server knows each transaction it answered about:
+	 * it sent the transaction, or said it has no such transaction. One of a
+	 * batch whose answer failed, which the wallet drops from what it
+	 * returns, is left out, since the server did not say.
+	 */
+	private async knownTransactions(
+		txids: readonly string[]
+	): Promise<Map<string, boolean>> {
+		if (!this.wallet.electrum.getTransactions)
+			throw new Error('Fee input transaction lookup is unavailable');
+		const result = await this.wallet.electrum.getTransactions({
+			txHashes: [...new Set(txids)].map((tx_hash) => ({ tx_hash }))
+		});
+		if (result.isErr()) throw new Error('Failed to look up fee transactions');
+		const entries =
+			(
+				result as IResultOk<{
+					data: Array<{
+						data?: { tx_hash?: string };
+						result?: { hex?: string; txid?: string };
+						error?: { message?: string };
+					}>;
+				}>
+			).value.data ?? [];
+		const known = new Map<string, boolean>();
+		for (const entry of entries) {
+			const identity = (
+				entry.result?.txid ?? entry.data?.tx_hash
+			)?.toLowerCase();
+			if (!identity) continue;
+			const hex = entry.result?.hex;
+			if (hex) {
+				if (bitcoin.Transaction.fromHex(hex).getId() !== identity)
+					throw new Error('Fee transaction identity mismatch');
+				known.set(identity, true);
+			} else if (
+				!entry.error ||
+				/No such mempool or blockchain transaction|Invalid tx hash/.test(
+					entry.error.message ?? ''
+				)
+			)
+				known.set(identity, false);
+		}
+		return known;
 	}
 
 	async restoreFeeBumpInputs(
