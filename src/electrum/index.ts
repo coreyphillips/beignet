@@ -1,4 +1,9 @@
-import { Block } from 'bitcoinjs-lib';
+import {
+	Block,
+	Transaction,
+	crypto as bitcoinCrypto,
+	script as bitcoinScript
+} from 'bitcoinjs-lib';
 import * as electrum from 'rn-electrum-client/helpers';
 
 import type {
@@ -14,6 +19,7 @@ import type {
 	IGetTransactions,
 	IGetTransactionsFromInputs,
 	IGetUtxosResponse,
+	ICoinbaseVin,
 	IHeader,
 	INewBlock,
 	IPeerData,
@@ -22,6 +28,8 @@ import type {
 	ITransaction,
 	ITxHash,
 	IUtxo,
+	IVin,
+	IVout,
 	Net,
 	TAddressTypeContent,
 	TConnectToElectrumRes,
@@ -29,6 +37,7 @@ import type {
 	TOnMessage,
 	TServer,
 	TSubscribedReceive,
+	TTxDetails,
 	TTxResponse,
 	TTxResult,
 	TUnspentAddressScriptHashData,
@@ -67,6 +76,15 @@ const DISCONNECTED_ERROR = 'Electrum instance is disconnected.';
 
 /** Answer of every call that needs a server, for a wallet created offline. */
 const OFFLINE_ERROR = 'The wallet was created with remainOffline.';
+
+/** A script in the ASM form bitcoind prints, or '' for one it cannot read. */
+const bitcoinScriptAsm = (script: Buffer): string => {
+	try {
+		return bitcoinScript.toASM(script);
+	} catch {
+		return '';
+	}
+};
 
 /**
  * The constructor and connectToElectrum both accept one server or a list of
@@ -575,6 +593,15 @@ export class Electrum {
 	// helpers silently dial a peer when disconnect() has cleared the client.
 	// Check again between batches, which yield while a wallet can stop.
 	private _disconnected = false;
+	/**
+	 * The servers found to answer a transaction only in raw form, by peer key.
+	 * electrs-esplora refuses `blockchain.transaction.get` with `verbose: true`
+	 * ("verbose transactions are currently unsupported"). A server lands here
+	 * once it refused a verbose lookup and then answered the same transaction
+	 * raw; from then on it is asked for raw transactions at once, and each one
+	 * is decoded here into the verbose shape the callers read.
+	 */
+	private _rawOnlyServers = new Set<string>();
 	/** The last status of each script hash disconnect(), or the rollback of a
 	 *  failed subscribe, withdrew this instance from. Withdrawing the last
 	 *  subscriber deletes the router's own record, so without this an explicit
@@ -1862,30 +1889,23 @@ export class Electrum {
 
 			const result: ITransaction<IUtxo>[] = [];
 			const promises: Promise<IGetTransactions>[] = [];
+			// A server known to answer only raw is asked raw at once.
+			const server = this.peerKey();
+			const raw = !!server && this._rawOnlyServers.has(server);
 
 			// split payload in chunks of 10 transactions per-request
 			for (let i = 0; i < txHashes.length; i += this.batchLimit) {
 				if (i > 0) await sleep(this.batchDelay);
 				if (this._disconnected) return err(DISCONNECTED_ERROR);
 				const chunk = txHashes.slice(i, i + this.batchLimit);
-
-				const data = {
-					key: 'tx_hash',
-					data: chunk
-				};
-
-				promises.push(
-					electrum.getTransactions({
-						txHashes: data,
-						network: this.electrumNetwork
-					})
-				);
+				promises.push(this.requestTransactionBatch(chunk, raw));
 			}
 			const responses = await Promise.all(promises);
 			responses.forEach((response) => {
 				this.noteAnswer(response);
 				if (!response.error) result.push(...response.data);
 			});
+			await this.settleTransactionAnswers(result, server, raw);
 			return ok({
 				error: false,
 				id: 0,
@@ -1903,6 +1923,290 @@ export class Electrum {
 	 * @param {ITransaction<IUtxo>} txData
 	 * @returns {boolean}
 	 */
+	/** The server this process's client for our network is connected to, as a key; '' when there is none. */
+	private peerKey(): string {
+		const peer = electrum.getConnectedPeer(this.electrumNetwork);
+		return peer?.host ? `${peer.host}|${peer.protocol}|${peer.port}` : '';
+	}
+
+	/**
+	 * Asks for one batch of transactions: in verbose form, or in raw form from
+	 * a server known to answer only that. A raw answer carries the hex as its
+	 * `result` until settleTransactionAnswers decodes it.
+	 */
+	private async requestTransactionBatch(
+		items: ITxHash[],
+		raw: boolean
+	): Promise<IGetTransactions> {
+		if (!raw) {
+			return electrum.getTransactions({
+				txHashes: { key: 'tx_hash', data: items },
+				network: this.electrumNetwork
+			});
+		}
+		const answer = (error: boolean, data: unknown): IGetTransactions =>
+			({
+				error,
+				id: 0,
+				method: 'getTransactions',
+				network: this.electrumNetwork,
+				data
+			}) as IGetTransactions;
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		try {
+			const client = await electrum.getClient({
+				network: this.electrumNetwork
+			});
+			const peer = client?.data;
+			if (
+				client?.error ||
+				!peer ||
+				typeof peer.blockchainTransaction_getBatch !== 'function'
+			) {
+				return answer(true, 'No Electrum client to ask for raw transactions.');
+			}
+			const timedOut = new Promise<'timeout'>((resolve) => {
+				timer = setTimeout(
+					() => resolve('timeout'),
+					Math.max(5000, items.length * 1000)
+				);
+			});
+			const data = await Promise.race([
+				peer.blockchainTransaction_getBatch(
+					{ key: 'tx_hash', data: items },
+					false
+				),
+				timedOut
+			]);
+			if (data === 'timeout') return answer(true, 'Timed Out.');
+			if (!Array.isArray(data)) return answer(true, data);
+			return answer(false, data);
+		} catch (e) {
+			return answer(true, e);
+		} finally {
+			if (timer) clearTimeout(timer);
+		}
+	}
+
+	/**
+	 * Settles what a server answered for a batch of transactions. A raw batch
+	 * is decoded entry by entry. In a verbose batch, an entry the server
+	 * refused that is not a miss (transactionExists, and not the answer of a
+	 * node without a txindex) is asked for again in raw form. When the server
+	 * answers raw what it refused verbose, it is a server that answers only
+	 * raw: it is remembered, and those entries are decoded. A server that
+	 * answers verbose lookups is never asked twice.
+	 */
+	private async settleTransactionAnswers(
+		entries: ITransaction<IUtxo>[],
+		server: string,
+		raw: boolean
+	): Promise<void> {
+		if (raw) {
+			for (const entry of entries) {
+				const hex: unknown = entry.result;
+				if (typeof hex === 'string') await this.decodeRawEntry(entry, hex);
+			}
+			return;
+		}
+		const refused = entries.filter(
+			(entry) =>
+				!entry.result &&
+				!!entry.error &&
+				this.transactionExists(entry) &&
+				!this.transactionMissingWithoutTxindex(entry)
+		);
+		if (!refused.length || this._disconnected) return;
+		const retried = await this.requestTransactionBatch(
+			refused.map((entry) => entry.data),
+			true
+		);
+		if (retried.error || !Array.isArray(retried.data)) return;
+		const answers = new Map<string, ITransaction<IUtxo>>();
+		for (const entry of retried.data) {
+			const txid = entry?.data?.tx_hash;
+			if (typeof txid === 'string') answers.set(txid, entry);
+		}
+		const hexOf = (entry?: ITransaction<IUtxo>): string => {
+			const hex: unknown = entry?.result;
+			return typeof hex === 'string' ? hex : '';
+		};
+		// Only a server that answers raw what it refused verbose is known to
+		// answer only raw; raw errors alone say nothing about verbose lookups.
+		if (server && [...answers.values()].some((entry) => hexOf(entry))) {
+			this._rawOnlyServers.add(server);
+		}
+		for (const entry of refused) {
+			const answer = answers.get(entry.data.tx_hash);
+			const hex = hexOf(answer);
+			if (hex) {
+				await this.decodeRawEntry(entry, hex);
+			} else if (answer?.error) {
+				// The raw answer is the one that speaks of the transaction: a
+				// server that does not have it says so there.
+				entry.error = answer.error;
+			}
+		}
+	}
+
+	/**
+	 * Puts the verbose shape of a raw answer in its entry. One whose place in
+	 * the chain cannot be read is left as an answer that says nothing (an
+	 * error that is not a miss), so that no caller reads it as unconfirmed.
+	 */
+	private async decodeRawEntry(
+		entry: ITransaction<IUtxo>,
+		hex: string
+	): Promise<void> {
+		const details = await this.verboseFromRaw(hex, entry.data);
+		if (details) {
+			entry.result = details;
+			delete entry.error;
+			return;
+		}
+		delete (entry as { result?: unknown }).result;
+		entry.error = {
+			code: -32603,
+			message:
+				'The server answered this transaction only in raw form, and its place in the chain could not be read.'
+		};
+	}
+
+	/**
+	 * The verbose shape (as bitcoind's getrawtransaction gives it) of a raw
+	 * transaction: inputs, outputs with values in BTC, sizes, and, once its
+	 * height is read, its block hash, block time and confirmations. Undefined
+	 * when the hex does not parse or the height cannot be read.
+	 */
+	private async verboseFromRaw(
+		hex: string,
+		data: { tx_hash?: string; scriptHash?: string } | undefined
+	): Promise<TTxDetails | undefined> {
+		let tx: Transaction;
+		try {
+			tx = Transaction.fromHex(hex);
+		} catch {
+			return undefined;
+		}
+		const txid = tx.getId();
+		if (data?.tx_hash && data.tx_hash !== txid) return undefined;
+		const witness = (stack: Buffer[]): string[] =>
+			stack.map((item) => item.toString('hex'));
+		const vin: Array<IVin | ICoinbaseVin> = tx.isCoinbase()
+			? [
+					{
+						coinbase: tx.ins[0].script.toString('hex'),
+						sequence: tx.ins[0].sequence,
+						...(tx.ins[0].witness.length
+							? { txinwitness: witness(tx.ins[0].witness) }
+							: {})
+					}
+			  ]
+			: tx.ins.map((input) => ({
+					txid: Buffer.from(input.hash).reverse().toString('hex'),
+					vout: input.index,
+					scriptSig: {
+						asm: bitcoinScriptAsm(input.script),
+						hex: input.script.toString('hex')
+					},
+					txinwitness: witness(input.witness),
+					sequence: input.sequence
+			  }));
+		const vout: IVout[] = tx.outs.map((output, n) => {
+			let address: string | undefined;
+			try {
+				address = getAddressFromScriptPubKey(
+					output.script.toString('hex'),
+					this.network
+				);
+			} catch {
+				address = undefined;
+			}
+			return {
+				value: Number((Number(output.value) / 1e8).toFixed(8)),
+				n,
+				scriptPubKey: {
+					asm: bitcoinScriptAsm(output.script),
+					hex: output.script.toString('hex'),
+					...(address ? { address } : {})
+				}
+			};
+		});
+		const details: TTxDetails = {
+			txid,
+			hash: Buffer.from(tx.getHash(true)).reverse().toString('hex'),
+			hex,
+			size: tx.byteLength(),
+			vsize: tx.virtualSize(),
+			weight: tx.weight(),
+			version: tx.version,
+			locktime: tx.locktime,
+			vin,
+			vout
+		};
+		const height = await this.placeTransaction(
+			txid,
+			data?.scriptHash,
+			tx.outs.map((output) => output.script)
+		);
+		if (height === undefined) return undefined;
+		if (height > 0) {
+			const header = await electrum.getHeader({
+				height,
+				network: this.electrumNetwork
+			});
+			if (header?.error || typeof header?.data !== 'string') return undefined;
+			let block: Block;
+			try {
+				block = Block.fromHex(header.data);
+			} catch {
+				return undefined;
+			}
+			const tip = this.getBlockHeader()?.height ?? 0;
+			details.blockhash = block.getId();
+			details.blocktime = block.timestamp;
+			details.time = block.timestamp;
+			details.confirmations = Math.max(1, tip - height + 1);
+		}
+		return details;
+	}
+
+	/**
+	 * The height a transaction is at, read from the history of a script it
+	 * pays or that the caller named: 0 in the mempool, undefined when no
+	 * history this asks for lists it.
+	 */
+	private async placeTransaction(
+		txid: string,
+		scriptHash: string | undefined,
+		scripts: Buffer[]
+	): Promise<number | undefined> {
+		const candidates: string[] = [];
+		if (typeof scriptHash === 'string' && scriptHash)
+			candidates.push(scriptHash);
+		for (const script of scripts) {
+			const hash = Buffer.from(bitcoinCrypto.sha256(script))
+				.reverse()
+				.toString('hex');
+			if (!candidates.includes(hash)) candidates.push(hash);
+		}
+		for (const candidate of candidates.slice(0, 8)) {
+			if (this._disconnected) return undefined;
+			const response = await electrum.getAddressScriptHashesHistory({
+				scriptHashes: [candidate],
+				network: this.electrumNetwork
+			});
+			if (response?.error || !Array.isArray(response?.data)) continue;
+			for (const entry of response.data) {
+				const found = Array.isArray(entry?.result)
+					? (entry.result as TTxResult[]).find((item) => item?.tx_hash === txid)
+					: undefined;
+				if (found) return Math.max(0, Number(found.height) || 0);
+			}
+		}
+		return undefined;
+	}
+
 	public transactionExists(txData: ITransaction<IUtxo>): boolean {
 		if (
 			// @ts-ignore
@@ -2041,19 +2345,25 @@ export class Electrum {
 	}): Promise<Result<IGetTransactionsFromInputs>> {
 		try {
 			if (this._disconnected) return err(DISCONNECTED_ERROR);
-			const data = {
-				key: 'tx_hash',
-				data: txHashes
-			};
-			const response = await electrum.getTransactions({
-				txHashes: data,
-				network: this.electrumNetwork
-			});
+			const server = this.peerKey();
+			const raw = !!server && this._rawOnlyServers.has(server);
+			const response = await this.requestTransactionBatch(txHashes, raw);
 			if (response && !response.error) {
-				return ok(response);
+				await this.settleTransactionAnswers(
+					response.data as unknown as ITransaction<IUtxo>[],
+					server,
+					raw
+				);
+				return ok(response as unknown as IGetTransactionsFromInputs);
 			} else {
-				if (response?.error?.message) return err(response.error);
-				return err(response ?? 'Unable to get transactions from inputs.');
+				// The answer as the client gives it, as before: its error, or itself.
+				const failed = response as unknown as { error?: { message?: string } };
+				if (failed?.error?.message)
+					return err(failed.error as unknown as Error);
+				return err(
+					(response as unknown as Error) ??
+						'Unable to get transactions from inputs.'
+				);
 			}
 		} catch (e) {
 			return err(e);

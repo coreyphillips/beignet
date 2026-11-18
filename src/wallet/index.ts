@@ -3631,8 +3631,14 @@ export class Wallet {
 		}
 		const unknown = [...young].filter((txid) => !this._coinbaseTxids.has(txid));
 		if (unknown.length) {
+			const scriptHashes = new Map(
+				confirmed.map((utxo) => [utxo.tx_hash, utxo.scriptHash])
+			);
 			const res = await electrum.getTransactions({
-				txHashes: unknown.map((tx_hash) => ({ tx_hash }))
+				txHashes: unknown.map((tx_hash) => ({
+					tx_hash,
+					scriptHash: scriptHashes.get(tx_hash)
+				}))
 			});
 			if (res.isErr()) return err(res.error);
 			for (const { result } of res.value.data) {
@@ -4767,7 +4773,10 @@ export class Wallet {
 			//Use electrum to check if the transaction was removed/bumped from the mempool or if it still exists.
 			const tx_hashes: ITxHash[] = Object.values(oldUnconfirmedTxs).map(
 				(transaction: IFormattedTransaction) => {
-					return { tx_hash: transaction.txid };
+					return {
+						tx_hash: transaction.txid,
+						scriptHash: transaction.scriptHash
+					};
 				}
 			);
 			// A header that lands while the lookup is in flight is newer than the

@@ -575,6 +575,12 @@ export interface IIndexes {
 
 export interface ITxHash {
 	tx_hash: string;
+	/**
+	 * The script hash of an output of the transaction, when the caller knows
+	 * one. A server that answers transactions only in raw form gives no
+	 * height, which is then read from that script's history first.
+	 */
+	scriptHash?: string;
 }
 
 export interface IGetTransactions {
