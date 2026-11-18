@@ -536,6 +536,7 @@ property ITransaction.jsonrpc: string
 property ITransaction.param: string
 property ITransaction.result: TTxDetails
 interface ITxHash
+property ITxHash.scriptHash?: string
 property ITxHash.tx_hash: string
 interface ITxHashes extends TTxResult
 property ITxHashes.scriptHash: string
