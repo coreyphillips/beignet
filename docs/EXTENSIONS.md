@@ -272,3 +272,71 @@ Ordinary channels are not touched by this setting.
 For every commitment of the peer that the peer has revoked, the node keeps the asset side of that commitment (its view) in a store of its own, so that it can punish that commitment should it ever be published. Nothing in this store is ever trimmed while the channel lives: any revoked commitment may still reach the chain, and each has to stay punishable. The store therefore grows by one row with every commitment the peer revokes, which is every payment over the channel, in either direction, and it is dropped only with the channel.
 
 A host reads how large it has grown from `getAuxiliaryChannelInfo(channelId).revokedViews`, which answers `{ rows, bytes }`: the number of views kept for the channel and the bytes their values take in the database. The field is present when the node's storage keeps this store, which the SQLite backend does. The table is counted once, the first time a channel is asked about; after that every write of a view keeps the answer current, so reading it is cheap however large the store is. A host that plans its disk, or that wants to tell its user when a long-lived channel is worth closing and opening again, goes by this number.
+
+## Forwards with an asset leg
+
+This part of the contract is declared and not active yet. Its types are exported and documented so that a host, and the steps of issue #2098 that make the node run it, can be written against them, but no build calls its hooks yet: a node refuses every forward with an asset leg before anything is offered, exactly as it does without them, whatever its host supplies. `AUXILIARY_CHANNELS_API.declared` names the part as `prepareForward`. The build that runs it lists the name in `surfaces` instead, and a host relies on it only from that build on.
+
+A forward has an asset leg when either of its HTLCs belongs to an asset channel. The incoming leg is an asset leg when its HTLC carries units or came in on an asset channel. The outgoing leg is an asset leg when it leaves over an asset channel, which offers no HTLC without units. A leg that is not an asset leg is a bitcoin leg. That makes three directions: bitcoin in and asset out (a wallet behind the node is paid), asset in and bitcoin out (a wallet behind the node pays), and asset in and asset out (two wallets behind the node that hold the same asset).
+
+Two optional members of `IAuxiliaryChannelConfig` carry it, with the types of `src/lightning/channel/auxiliary-forward.ts`:
+
+```ts
+prepareForward?(request: IAuxiliaryForwardRequest): IAuxiliaryForwardTerms | undefined;
+onForwardLegResolved?(resolution: IAuxiliaryForwardLegResolution): void;
+```
+
+A host takes part by supplying `prepareForward`. A node whose host does not supply it asks nothing and refuses every forward with an asset leg, as it does today, in every build. `valueIncomingHtlc` stays the hook of an HTLC that ends at the node: a forward is never put to it.
+
+### Which HTLCs the host is asked about
+
+An HTLC the node received and is not the final hop of, once it is irrevocably committed and has passed the checks the node makes of every forward before it looks for the next hop (the limits on HTLCs in flight and on a peer's rate, the onion, the expiry against the tip, forwarding being on), when either:
+
+- one of its legs is an asset leg: it carries units or came in on an asset channel, or the short channel id the onion names is one of an asset channel of the node, by an alias or, when the channel's type lacks `option_scid_alias`, by its real id; or
+- the short channel id the onion names is not one the node knows: no channel of the node has it, and the node's JIT receive did not mint it. The hint of an asset invoice names a short channel id made from a quote's id, and only the host that gave the quote can recognise it, so the host is asked about every such id, also for an HTLC that carries no units.
+
+A forward inside a blinded path is not asked about: one with an asset leg is refused, and one whose short channel id the node has no channel for fails as it does today. Neither is a forward with an asset leg that the onion asks the node to hold for an offline receiver, which is refused. Nor is an HTLC that came in on an asset channel and carries no units. It holds nothing but bitcoin, so it is refused rather than valued by the host, whose value could then overstate what the node received. Nor is a forward to the real id of a channel whose type has `option_scid_alias`. BOLT 2 forbids forwarding over such a channel by that id, so the node fails it with `unknown_next_peer` as it does today, and a host's hint names one of the channel's aliases. Nor is a forward to a short channel id the node's JIT receive minted, whether or not the receive takes the HTLC: one with an asset leg is refused, and one without goes to the JIT receive as today. The node's own payments are not forwards, and nothing here changes them.
+
+`IAuxiliaryForwardRequest` gives the payment hash; the incoming HTLC (`incoming`: its channel, peer and id, the bitcoin it carries on the wire, its expiry, its units and custom records when it has them, and whether its channel is an asset channel); what the onion asks (`shortChannelId`, `amountToForwardMsat`, `outgoingCltvExpiry`); and `outgoing`, the node's channel that the short channel id names, absent when the node has none. The host reads anything more about either channel through the node: `getChannel` for any channel, and `getAuxiliaryChannelInfo` for an asset channel.
+
+### What the host may answer
+
+- **Its terms** (`IAuxiliaryForwardTerms`), with exactly the fields the forward's legs call for and no other:
+  - `outgoingChannel`, when the request has no `outgoing`: the asset channel the short channel id stands for, and its peer.
+  - `incomingValueMsat`, when the incoming leg is an asset leg: what the incoming HTLC is worth, in millisatoshis, above zero and within a u64.
+  - `outgoingHtlc`, when the outgoing leg is an asset leg: the custom records of the outgoing HTLC (at least one, each of a type at or above 65536) and its carrier, the bitcoin it carries on the wire (`wireAmountMsat`). The host makes the records hold units worth `amountToForwardMsat` at its own rate. The engine cannot value them; the next hop judges them, as the wallet behind the node judges an HTLC against its quote.
+- **`undefined`**, "not mine": only for a forward with no asset leg, whose short channel id the host does not know. The node goes on exactly as without a provider and fails the HTLC back with `unknown_next_peer`. For a forward with an asset leg it refuses.
+- **A throw**: the incoming HTLC is failed back with `temporary_channel_failure`, and nothing is offered.
+
+Anything else refuses as a throw does: a field the forward does not call for, a missing one, a value out of range, records that are not custom records, a channel that is not an asset channel of this node with the peer named, and a promise. The hook is synchronous. A host that answered with terms is told how the forward ended in every case, also when the node refused the terms as malformed or a check below refused the forward, so that it can let go of what it reserved. A host that threw or answered `undefined` took nothing on and is told nothing, save after a stop (below).
+
+### Asked once
+
+The host is asked once for each incoming HTLC, synchronously, outside any storage transaction, and before anything is offered. The node keeps the answer with the forward, written before the outgoing HTLC is offered or with it, and when the forward is gone through again (a reestablish, a restart) it reads the answer back and does not ask again, as the value of a held HTLC is asked once. Before it asks, the node writes that it is asking about the HTLC. A node that stopped after that write and before the answer was written asks again when it comes back, with the same request, if the incoming channel can still settle the HTLC and the forward still passes the checks made before the ask. Otherwise it offers nothing and tells the host the outgoing leg was never offered, whatever the host answered before the stop. The tip may have passed the outgoing expiry meanwhile, and the HTLC is failed back. Or the incoming channel was closed on the chain while the node was down, and the chain resolves the HTLC. So a host keys what it reserves for a forward, a quote for instance, by the incoming HTLC (`incoming.channelId` and `incoming.htlcId`), and answers a second ask about an HTLC as it answered the first.
+
+A quote prices one payment. Each HTLC is a forward of its own, and whether a quote that priced one HTLC may serve another is the host's to decide.
+
+### What the engine checks whatever the host answers
+
+The answer lifts none of the node's checks of a forward. The node offers the outgoing HTLC only when all of these hold, and otherwise fails the incoming HTLC back. A check that needs no answer is made before the host is asked, so a forward it refuses is never put to the host; one refused after the host answered with terms is told to the host as an outgoing leg never offered.
+
+- **Both channels.** The incoming HTLC is irrevocably committed before the outgoing one is offered: the node neither asks nor offers before then. The outgoing channel takes a new HTLC, as for any forward: it is open and not quiescing, its state can be proven current and its funding is accounted for.
+- **The expiry deltas.** The outgoing expiry is more than 3 blocks above the tip, the incoming expiry is no earlier than the outgoing one plus the CLTV delta of the outgoing channel's policy, and the incoming expiry is no further ahead than the node accepts of any HTLC.
+- **The HTLC limits.** The peer's `max_accepted_htlcs`, `max_htlc_value_in_flight_msat` and `htlc_minimum_msat` on the outgoing channel; for an outgoing asset leg, the node's own bound on the asset HTLCs it offers at once (`maxHtlcs`) and on outcomes its host has not taken; and the node's bound on HTLCs in flight across its channels.
+- **The reserve.** The node's bitcoin on the outgoing channel covers what the HTLC carries on the wire, above the reserve its peer requires and the commitment fee the node pays as the funder.
+- **The carrier of an outgoing asset HTLC.** It is above zero and at least the larger of the channel's two dust limits, so that the HTLC has an output of its own on both commitments; the provider admits its records (`validateHtlc`) and reads units from them (`getHtlcAmount`); and the node holds those units on the channel.
+- **The fee.** What the incoming leg is worth covers the amount to forward and the node's fee on it, from the outgoing channel's policy, as for any forward. A bitcoin leg is worth what it carries. An incoming asset leg is worth the host's `incomingValueMsat`. The outgoing leg is worth `amountToForwardMsat`, whatever it carries on the wire.
+
+No check that compares what a leg is worth in millisatoshis applies to the wire amount of an asset leg as it stands: that amount is a carrier, the few hundred satoshis that keep the HTLC's output on the commitments, and not what the leg is worth. The carrier is held only to the rules of its channel's own bitcoin above (the dust limits, the reserve, the peer's minimum and its bound on value in flight), as any HTLC is. Where an ordinary forward answers with a failure that quotes the amount of the incoming HTLC (`fee_insufficient`), a forward whose incoming leg is an asset leg answers `temporary_channel_failure`, so that a carrier is never quoted as what an HTLC is worth.
+
+The fee and the CLTV delta are those of the outgoing channel's policy (`setChannelPolicy`, or the node's defaults), as for any forward. A host whose quotes advertise their own terms in a route hint, a zero fee and a CLTV delta of 40 for instance, sets them as the policy of the asset channels its quotes lead over. A quote cannot lower the delta below that policy.
+
+### When each leg ends
+
+A forward with an asset leg ends as any forward does, whichever of its legs holds units:
+
+- A preimage the outgoing leg gives up, in `update_fulfill_htlc` or in a spend on the chain, claims the incoming leg: by `update_fulfill_htlc` while the incoming channel can carry it, and on the chain otherwise. For an incoming asset leg the node writes its decision to settle with the incoming channel's row as soon as it learns the preimage, so that a claim on the chain is made for that HTLC: a decision that waits on another channel.
+- An outgoing leg that failed fails the incoming leg back: failed in its channel, timed out on the chain once that spend is irrevocable, or never offered. So does an outgoing leg on no output of the commitment that confirmed (a trimmed HTLC, for instance) once that commitment is irrevocable and no preimage has been learned. It ends `failed` on the chain.
+- An incoming HTLC whose expiry comes near while its outgoing leg is unresolved takes its channel to the chain, as for any forward, so that a preimage learned late still claims it.
+
+The host is told of each leg as it ends, through `onForwardLegResolved` (`IAuxiliaryForwardLegResolution`): the forward, by its incoming HTLC; which leg; its channel and its HTLC's id; how it ended (`fulfilled`, `failed`, or `never-offered` for an outgoing leg whose HTLC never entered its channel); whether it ended on the chain; and, for an asset leg, the units and the custom records its HTLC carried. A leg ends when its HTLC has left its channel for good, its removal irrevocably committed, or when the chain has resolved it. As with `onHtlcResolved`, an incoming leg told `fulfilled` is told again, as `failed` with `preimageRevealed: true`, when the payer took the output back on the chain after the node had claimed it. The call is synchronous and made outside any storage transaction, and it is durable: what it reports is kept with the node's rows and offered again, after a restart too, until a call returns without throwing. The two legs end in no promised order. `onHtlcResolved` keeps its own rules for asset HTLCs, the leg of a forward or not.

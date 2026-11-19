@@ -10,6 +10,11 @@
  * constant, and any version below the one it was written for, as
  * unsupported. `surfaces` names the optional parts of the contract that
  * are present, each by the member a host would otherwise have to probe.
+ * `declared` names the parts whose types and documentation the build
+ * already carries and which it does not run: a host may supply their
+ * hooks, and the node calls none of them and does what it does without
+ * them. A name leaves `declared` for `surfaces` in the build that runs its
+ * part, and a host relies on a part only once `surfaces` names it.
  */
 export const AUXILIARY_CHANNELS_API = Object.freeze({
 	version: 1,
@@ -57,9 +62,20 @@ export const AUXILIARY_CHANNELS_API = Object.freeze({
 		// The hold:* events and the rows of listHoldInvoices and listHeldHtlcs
 		// carry auxiliary: true for a set with an HTLC that holds units.
 		'IHoldInvoiceStateEvent.auxiliary'
+	] as const),
+	declared: Object.freeze([
+		// Forwards with an asset leg (issue #2098): prepareForward and
+		// onForwardLegResolved, with the types of auxiliary-forward.ts and
+		// the contract in docs/EXTENSIONS.md. Neither hook is called, and
+		// every forward with an asset leg is refused as before.
+		'prepareForward'
 	] as const)
 });
 
 /** A name in `AUXILIARY_CHANNELS_API.surfaces`. */
 export type AuxiliaryChannelsSurface =
 	(typeof AUXILIARY_CHANNELS_API.surfaces)[number];
+
+/** A name in `AUXILIARY_CHANNELS_API.declared`. */
+export type AuxiliaryChannelsDeclared =
+	(typeof AUXILIARY_CHANNELS_API.declared)[number];

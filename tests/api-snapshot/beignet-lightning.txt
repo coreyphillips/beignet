@@ -1022,13 +1022,14 @@ function chain.selectTheirPerCommitmentPoint(tx: bitcoinjs-lib#Transaction, stat
 function chain.signP2wpkhInput(tx: bitcoinjs-lib#Transaction, inputIndex: number, pubkey: Buffer, value: number, privateKey: Buffer): Buffer
 function chain.signSweepInput(tx: bitcoinjs-lib#Transaction, inputIndex: number, witnessScript: Buffer, value: number, privateKey: Buffer, sighashType?: number): Buffer
 namespace channel
-const channel.AUXILIARY_CHANNELS_API: Readonly<{ version: 1; surfaces: readonly [ "valueIncomingHtlc:three-outcome", "sendPaymentToRoute:assetPayment", "getAuxiliaryPaymentHtlcs", "onHtlcResolved:htlcId", "queryAuxiliaryRoute", "fundAuxiliaryChannel:unsigned", "onFundingSigned", "abandonAuxiliaryOpen", "IChannelInfo.auxiliary", "setAuxiliaryPaymentGate", "getChannelMonitorState", "IPaymentInfo.auxiliary", "IPaymentInfo.auxiliaryValueMsat", "IInvoiceInfo.auxiliary", "IAuxiliaryChannelInfo.undeliveredOutcomes", "onHtlcResolved:never-sent", "getFixedOutputFeeStatus", "IPaymentInfo.unresolved", "IHoldInvoiceStateEvent.auxiliary" ]; }>
+const channel.AUXILIARY_CHANNELS_API: Readonly<{ version: 1; surfaces: readonly [ "valueIncomingHtlc:three-outcome", "sendPaymentToRoute:assetPayment", "getAuxiliaryPaymentHtlcs", "onHtlcResolved:htlcId", "queryAuxiliaryRoute", "fundAuxiliaryChannel:unsigned", "onFundingSigned", "abandonAuxiliaryOpen", "IChannelInfo.auxiliary", "setAuxiliaryPaymentGate", "getChannelMonitorState", "IPaymentInfo.auxiliary", "IPaymentInfo.auxiliaryValueMsat", "IInvoiceInfo.auxiliary", "IAuxiliaryChannelInfo.undeliveredOutcomes", "onHtlcResolved:never-sent", "getFixedOutputFeeStatus", "IPaymentInfo.unresolved", "IHoldInvoiceStateEvent.auxiliary" ]; declared: readonly [ "prepareForward" ]; }>
 const channel.AUXILIARY_CHANNEL_DUST_LIMIT = 354n
 const channel.AUXILIARY_CLOSE_ASSET_OUTPUT_MINIMUM = 330n
 class channel.AuxiliaryChannelUnsupportedError extends beignet#CodedError<'ASSET_CHANNEL_UNSUPPORTED'>
 constructor channel.AuxiliaryChannelUnsupportedError(channelId: string, operation: channel.AuxiliaryUnsupportedOperation)
 readonly property channel.AuxiliaryChannelUnsupportedError.channelId: string
 readonly property channel.AuxiliaryChannelUnsupportedError.operation: channel.AuxiliaryUnsupportedOperation
+type channel.AuxiliaryChannelsDeclared = (typeof channel.AUXILIARY_CHANNELS_API.declared)[number]
 type channel.AuxiliaryChannelsSurface = (typeof channel.AUXILIARY_CHANNELS_API.surfaces)[number]
 class channel.AuxiliaryOpenError extends beignet#CodedError<channel.AuxiliaryOpenErrorCode>
 constructor channel.AuxiliaryOpenError(code: channel.AuxiliaryOpenErrorCode, channelId: Buffer, message: string)
@@ -1685,9 +1686,11 @@ method channel.IAuxiliaryChannelConfig.canRestore?(channels: readonly channel.IA
 property channel.IAuxiliaryChannelConfig.initCustomRecords?: message.CustomRecords
 property channel.IAuxiliaryChannelConfig.maxHtlcs?: number
 method channel.IAuxiliaryChannelConfig.onAccepted?(channel: channel.Channel, peerPubkey: string): void
+method channel.IAuxiliaryChannelConfig.onForwardLegResolved?(resolution: channel.IAuxiliaryForwardLegResolution): void
 method channel.IAuxiliaryChannelConfig.onFundingSigned?(context: channel.IAuxiliaryFundingSigned): void
 method channel.IAuxiliaryChannelConfig.onHtlcResolved?(context: Omit<channel.IAuxiliaryHtlcResolution, 'outcome'> & { outcome: channel.IAuxiliaryHtlcResolution['outcome'] | 'never-sent'; state: channel.IChannelState; peerPubkey: string; channelId: Buffer; }): void
 method channel.IAuxiliaryChannelConfig.openingCsvPolicy?(peerPubkey: string): channel.IAuxiliaryOpeningCsvPolicy | undefined
+method channel.IAuxiliaryChannelConfig.prepareForward?(request: channel.IAuxiliaryForwardRequest): channel.IAuxiliaryForwardTerms | undefined
 property channel.IAuxiliaryChannelConfig.provider: channel.IChannelAuxiliaryProvider
 method channel.IAuxiliaryChannelConfig.resolveIncoming(peerPubkey: string, temporaryChannelId: Buffer): channel.IAuxiliaryFundingDescriptor | undefined
 method channel.IAuxiliaryChannelConfig.valueIncomingHtlc?(context: channel.IAuxiliaryIncomingHtlc): bigint | undefined
@@ -1751,6 +1754,42 @@ property channel.IAuxiliaryCommitmentData.secondLevelCommitmentTxid?: string
 property channel.IAuxiliaryCommitmentData.secondLevelLeaves: Map<string, channel.ITaprootAuxLeaf>
 property channel.IAuxiliaryCommitmentData.secondLevelRevocationBasepoint?: Buffer
 property channel.IAuxiliaryCommitmentData.secondLevelRevocationKey?: Buffer
+interface channel.IAuxiliaryForwardChannel
+property channel.IAuxiliaryForwardChannel.auxiliaryChannel: boolean
+property channel.IAuxiliaryForwardChannel.channelId: Buffer
+property channel.IAuxiliaryForwardChannel.peerPubkey: string
+interface channel.IAuxiliaryForwardIncoming
+property channel.IAuxiliaryForwardIncoming.auxiliaryAmount?: bigint
+property channel.IAuxiliaryForwardIncoming.auxiliaryChannel: boolean
+property channel.IAuxiliaryForwardIncoming.channelId: Buffer
+property channel.IAuxiliaryForwardIncoming.cltvExpiry: number
+property channel.IAuxiliaryForwardIncoming.customRecords: message.CustomRecords
+property channel.IAuxiliaryForwardIncoming.htlcId: bigint
+property channel.IAuxiliaryForwardIncoming.peerPubkey: string
+property channel.IAuxiliaryForwardIncoming.wireAmountMsat: bigint
+interface channel.IAuxiliaryForwardLegResolution
+property channel.IAuxiliaryForwardLegResolution.auxiliaryAmount?: bigint
+property channel.IAuxiliaryForwardLegResolution.channelId?: Buffer
+property channel.IAuxiliaryForwardLegResolution.customRecords: message.CustomRecords
+property channel.IAuxiliaryForwardLegResolution.htlcId?: bigint
+property channel.IAuxiliaryForwardLegResolution.incomingChannelId: Buffer
+property channel.IAuxiliaryForwardLegResolution.incomingHtlcId: bigint
+property channel.IAuxiliaryForwardLegResolution.leg: 'incoming' | 'outgoing'
+property channel.IAuxiliaryForwardLegResolution.onChain: boolean
+property channel.IAuxiliaryForwardLegResolution.outcome: 'fulfilled' | 'failed' | 'never-offered'
+property channel.IAuxiliaryForwardLegResolution.paymentHash: Buffer
+property channel.IAuxiliaryForwardLegResolution.preimageRevealed?: true
+interface channel.IAuxiliaryForwardRequest
+property channel.IAuxiliaryForwardRequest.amountToForwardMsat: bigint
+property channel.IAuxiliaryForwardRequest.incoming: channel.IAuxiliaryForwardIncoming
+property channel.IAuxiliaryForwardRequest.outgoing?: channel.IAuxiliaryForwardChannel
+property channel.IAuxiliaryForwardRequest.outgoingCltvExpiry: number
+property channel.IAuxiliaryForwardRequest.paymentHash: Buffer
+property channel.IAuxiliaryForwardRequest.shortChannelId: Buffer
+interface channel.IAuxiliaryForwardTerms
+property channel.IAuxiliaryForwardTerms.incomingValueMsat?: bigint
+property channel.IAuxiliaryForwardTerms.outgoingChannel?: { channelId: Buffer; peerPubkey: string; }
+property channel.IAuxiliaryForwardTerms.outgoingHtlc?: { customRecords: message.CustomRecords; wireAmountMsat: bigint; }
 interface channel.IAuxiliaryFundingDescriptor
 property channel.IAuxiliaryFundingDescriptor.channelData: Buffer
 property channel.IAuxiliaryFundingDescriptor.fundingTaprootMerkleRoot: Buffer
