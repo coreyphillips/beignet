@@ -277,7 +277,9 @@ export interface IAuxiliaryChannelConfig {
 	 * forward the host took on, in its channel or on the chain, told once
 	 * the leg's HTLC has left its channel for good or the chain has resolved
 	 * it. Idempotent durable callback, delivered again after a crash until it
-	 * returns without throwing, outside any storage transaction.
+	 * returns without throwing, outside any storage transaction. A promise
+	 * it returns is not awaited: the leg counts as delivered when the call
+	 * returns, and a later rejection does not deliver it again.
 	 * `onHtlcResolved` keeps its own rules for asset HTLCs, a leg of a
 	 * forward or not.
 	 */
