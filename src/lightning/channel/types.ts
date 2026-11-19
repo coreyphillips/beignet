@@ -436,6 +436,17 @@ export interface IHtlcEntry {
 	 */
 	forwardEmitted?: boolean;
 	/**
+	 * Issue #2098: the node wrote that it is asking its host about forwarding
+	 * this received HTLC over an asset channel (prepareForward), before it
+	 * asked. Persisted with the channel's row, so a node that stopped before
+	 * it kept the host's answer knows it asked: it asks again only while the
+	 * forward still passes the checks made before the ask, and otherwise tells
+	 * the host that the outgoing leg was never offered. Only on a received
+	 * HTLC, and only while the switch for asset forwards is on. A build that
+	 * does not know the field drops it.
+	 */
+	forwardAsked?: boolean;
+	/**
 	 * FFOR Variant D (section 9.5.1 step 3): this HTLC is a voucher of the
 	 * channel's epoch, recognised from the book by (id, amount, hash, cltv).
 	 * On R it is parked: never dispatched to the node's onion path, never

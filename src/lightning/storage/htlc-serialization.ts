@@ -41,6 +41,8 @@ export interface ISerializedHtlcEntry {
 	addRemoteSigned?: boolean;
 	/** Edge-trigger marker for HTLC_FORWARDED dispatch (see IHtlcEntry). */
 	forwardEmitted?: boolean;
+	/** The node asked its host about forwarding it (see IHtlcEntry). */
+	forwardAsked?: boolean;
 	/** Admission-time dust-exposure classification (see IHtlcEntry). */
 	dustExposureFailback?: boolean;
 	/** Admission-time expired-at-our-tip classification (see IHtlcEntry). */
@@ -109,6 +111,7 @@ export function serializeHtlcEntry(
 		...(e.forwardEmitted !== undefined
 			? { forwardEmitted: e.forwardEmitted }
 			: {}),
+		...(e.forwardAsked !== undefined ? { forwardAsked: e.forwardAsked } : {}),
 		...(e.dustExposureFailback !== undefined
 			? { dustExposureFailback: e.dustExposureFailback }
 			: {}),
@@ -183,6 +186,7 @@ export function deserializeHtlcEntry(s: ISerializedHtlcEntry): {
 			...(s.forwardEmitted !== undefined
 				? { forwardEmitted: s.forwardEmitted }
 				: {}),
+			...(s.forwardAsked !== undefined ? { forwardAsked: s.forwardAsked } : {}),
 			...(s.dustExposureFailback !== undefined
 				? { dustExposureFailback: s.dustExposureFailback }
 				: {}),

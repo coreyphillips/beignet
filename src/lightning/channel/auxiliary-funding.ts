@@ -184,7 +184,8 @@ export interface IAuxiliaryRestoredChannel {
  * only ever an endpoint of an asset payment: nothing that arrives on an
  * asset channel is forwarded, and nothing is forwarded out over one. The
  * hooks of a forward with an asset leg (`prepareForward`,
- * `onForwardLegResolved`) are declared and not called yet.
+ * `onForwardLegResolved`) are declared, and this build calls them only
+ * while its switch for asset forwards is on, which it is not (issue #2098).
  */
 export interface IAuxiliaryChannelConfig {
 	/** Standard-wire CSV compatibility for new channels only. Does not authorize legacy signatures. */
@@ -240,10 +241,13 @@ export interface IAuxiliaryChannelConfig {
 	 */
 	valueIncomingHtlc?(context: IAuxiliaryIncomingHtlc): bigint | undefined;
 	/**
-	 * Declared and not called by this build: every forward with an asset leg
-	 * is refused before anything is offered, whatever this would answer. The
-	 * contract it will be called under is in docs/EXTENSIONS.md ("Forwards
-	 * with an asset leg"), and `AUXILIARY_CHANNELS_API` lists it in
+	 * Declared, and not called while this build's switch for asset forwards
+	 * is off, as it is: every forward with an asset leg is then refused before
+	 * anything is offered, whatever this would answer. With the switch on, the
+	 * build asks it about a bitcoin HTLC whose next hop is a short channel id
+	 * the node has no channel for, or an asset channel the onion names (issue
+	 * #2098, step 2). The contract it is called under is in docs/EXTENSIONS.md
+	 * ("Forwards with an asset leg"), and `AUXILIARY_CHANNELS_API` lists it in
 	 * `surfaces` from the build that calls it.
 	 *
 	 * Asked about an HTLC the node is to forward when either leg is an asset
@@ -273,8 +277,10 @@ export interface IAuxiliaryChannelConfig {
 		request: IAuxiliaryForwardRequest
 	): IAuxiliaryForwardTerms | undefined;
 	/**
-	 * Declared and not called by this build. The end of each leg of a
-	 * forward the host took on, in its channel or on the chain, told once
+	 * Declared. While this build's switch for asset forwards is on, it is
+	 * told only that an outgoing leg was never offered, once and not yet
+	 * durably; the rest comes with the steps of issue #2098 that take a
+	 * forward to the chain. The end of each leg of a forward the host took on, in its channel or on the chain, told once
 	 * the leg's HTLC has left its channel for good or the chain has resolved
 	 * it. Idempotent durable callback, delivered again after a crash until it
 	 * returns without throwing, outside any storage transaction. A promise

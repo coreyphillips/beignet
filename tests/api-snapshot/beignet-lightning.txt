@@ -1120,6 +1120,7 @@ method channel.Channel.fforTakeReconnectRequest(): boolean
 method channel.Channel.fforWitnessAcked(mailboxId: Buffer, retentionUntil: number): channel.ChannelAction[]
 method channel.Channel.forceClose(signer: keys.ISigner, chain?: channel.IForceCloseChainFacts): channel.ChannelAction[]
 method channel.Channel.forgetUnsentSplice(reason: string): channel.ChannelAction[]
+method channel.Channel.forwardAsked(htlcId: bigint): boolean
 method channel.Channel.fulfillHtlc(htlcId: bigint, paymentPreimage: Buffer): channel.ChannelAction[]
 method channel.Channel.fundingConfirmed(confirmedTxid?: Buffer): channel.ChannelAction[]
 method channel.Channel.fundingMissingSince(): number | undefined
@@ -1237,6 +1238,7 @@ method channel.Channel.isV2AttemptBroadcastable(): boolean
 method channel.Channel.markClosedOnChain(force: boolean): boolean
 method channel.Channel.markErrored(): boolean
 method channel.Channel.markForReestablish(): channel.IAbandonedLocalAdd[]
+method channel.Channel.markForwardAsked(htlcId: bigint): boolean
 method channel.Channel.markFundingUnaccounted(): boolean
 method channel.Channel.markNegotiatingClosing(): void
 method channel.Channel.markRecordRestoredFromDisk(): void
@@ -1322,6 +1324,7 @@ method channel.Channel.takeDanglingV2TopUpPledgeOutpoints(clear?: boolean): Arra
 method channel.Channel.takeOwedWatchtowerBackups(): Array<{ perCommitmentSecret: Buffer; tx: Buffer; }>
 method channel.Channel.takeReestablishSecretMissingNotice(): { revocationIndex: bigint; secretIndex: bigint; } | null
 method channel.Channel.takeRevokedCommitmentTxs(perCommitmentSecret: Buffer): Buffer[]
+method channel.Channel.unmarkForwardAsked(htlcId: bigint): void
 method channel.Channel.unregisteredV2TopUpInputs(inputs: channel.ISpliceWalletInput[]): channel.ISpliceWalletInput[]
 method channel.Channel.updateFee(feeratePerKw: number): channel.ChannelAction[]
 method channel.Channel.validateOutgoingHtlc(amountMsat: bigint, cltvExpiry: number): channel.ChannelAction[]
@@ -1411,6 +1414,7 @@ method channel.ChannelManager.fforWitnessAcked(channelId: Buffer, mailboxId: Buf
 method channel.ChannelManager.forceClose(channelId: Buffer, destinationScript: Buffer, feeRatePerVbyte?: number, network?: bitcoinjs-lib#Network, noDeadlineFeeRatePerVbyte?: number): channel.ChannelResult
 method channel.ChannelManager.forgetPreimage(paymentHash: Buffer, held: ReadonlyArray<{ channelId: Buffer; htlcId: bigint; }>): boolean
 method channel.ChannelManager.forgetUnsentSplice(channelId: Buffer, reason: string): channel.ChannelResult
+method channel.ChannelManager.forwardAsked(channelId: Buffer, htlcId: bigint): boolean
 method channel.ChannelManager.fulfillHtlc(channelId: Buffer, htlcId: bigint, preimage: Buffer): channel.ChannelResult
 method channel.ChannelManager.getAuxiliaryHtlcMode(peerPubkey: string): 'fixed' | 'legacy'
 method channel.ChannelManager.getChannel(channelId: Buffer): channel.Channel | undefined
@@ -1467,6 +1471,7 @@ method channel.ChannelManager.reauthorizeFundingBroadcast(channelId: Buffer): bo
 method channel.ChannelManager.reauthorizeSpliceBroadcast(channelId: Buffer): boolean
 method channel.ChannelManager.rebuildForceCloseCommitment(channelId: Buffer, feeRatePerVbyte: number, noDeadlineFeeRatePerVbyte?: number): { ok: boolean; tx?: Buffer; error?: string; retryable?: boolean; }
 method channel.ChannelManager.recordAuxiliaryHtlcDecision(channelId: Buffer, htlcId: bigint, outcome: 'settle' | 'fail', preimage?: Buffer): boolean
+method channel.ChannelManager.recordForwardAsk(channelId: Buffer, htlcId: bigint): boolean
 method channel.ChannelManager.recordPreimage(paymentHash: Buffer, preimage: Buffer): void
 method channel.ChannelManager.releaseCompositeSpliceCommitment(channelId: Buffer): channel.ChannelResult
 method channel.ChannelManager.removeTrustedPeer(pubkeyHex: string): void
@@ -2275,6 +2280,7 @@ property channel.IHtlcEntry.dustExposureFailback?: boolean
 property channel.IHtlcEntry.expiredOnArrival?: boolean
 property channel.IHtlcEntry.fforMismatch?: boolean
 property channel.IHtlcEntry.fforVoucher?: boolean
+property channel.IHtlcEntry.forwardAsked?: boolean
 property channel.IHtlcEntry.forwardEmitted?: boolean
 property channel.IHtlcEntry.funderFeeFailback?: boolean
 property channel.IHtlcEntry.id: bigint
@@ -5059,6 +5065,7 @@ method liquidity.JitReceiveManager.hasRestoredHold(inChannelIdHex: string, inHtl
 method liquidity.JitReceiveManager.heldTotalMsat(scidHex: string): bigint
 method liquidity.JitReceiveManager.holdsPart(inChannelIdHex: string, inHtlcId: bigint): boolean
 method liquidity.JitReceiveManager.listIntents(): liquidity.IJitIntent[]
+method liquidity.JitReceiveManager.mintedScid(scidHex: string): boolean
 method liquidity.JitReceiveManager.owedUpstreamFailure(part: liquidity.IHeldJitPart): void
 method liquidity.JitReceiveManager.quote(walletPubkeyHex: string, req: liquidity.IJitReceiveQuoteRequest): liquidity.IJitReceiveQuote
 method liquidity.JitReceiveManager.registerIntent(walletPubkeyHex: string, auth: liquidity.IJitReceiveAuthorization): liquidity.IJitReceiveAck
@@ -8598,6 +8605,7 @@ property storage.ISerializedHtlcEntry.dustExposureFailback?: boolean
 property storage.ISerializedHtlcEntry.expiredOnArrival?: boolean
 property storage.ISerializedHtlcEntry.fforMismatch?: boolean
 property storage.ISerializedHtlcEntry.fforVoucher?: boolean
+property storage.ISerializedHtlcEntry.forwardAsked?: boolean
 property storage.ISerializedHtlcEntry.forwardEmitted?: boolean
 property storage.ISerializedHtlcEntry.funderFeeFailback?: boolean
 property storage.ISerializedHtlcEntry.id: string
