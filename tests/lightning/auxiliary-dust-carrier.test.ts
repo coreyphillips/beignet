@@ -7,7 +7,10 @@
  * the lighter of BOLT 2's answers: a warning, and the connection closed. The
  * channel is not failed and nothing of the add is kept, a commitment_signed
  * that covers it is not read, and after the reconnect the channel carries
- * payments as before. Units the sender does not hold still fail the channel.
+ * payments as before. The peer did nothing to shun, so with a PeerManager
+ * the connection is recycled: the peer is dialed again on the backoff
+ * (PeerManager.recyclePeer, tests/lightning/peer-manager-recycle.test.ts).
+ * Units the sender does not hold still fail the channel.
  */
 
 import { expect } from 'chai';
@@ -202,6 +205,33 @@ describe('an asset HTLC of the peer with a carrier under the dust limit (issue #
 			PaymentStatus.COMPLETED
 		);
 		both(s);
+	});
+
+	it('with a PeerManager holding the peer, the connection is recycled, so the peer is dialed again', async () => {
+		const s = await scene('aux-dust-carrier-recycle');
+		const manager = s.bob.node.getChannelManager() as unknown as {
+			peerManager: unknown;
+		};
+		const calls: string[] = [];
+		manager.peerManager = {
+			getPeer: (): { getRemoteInit: () => undefined } => ({
+				getRemoteInit: (): undefined => undefined
+			}),
+			sendToPeer: (): void => undefined,
+			disconnectPeer: (pubkey: string, flushMs?: number): void => {
+				calls.push(`disconnect ${pubkey} ${flushMs}`);
+			},
+			recyclePeer: (pubkey: string, flushMs?: number): void => {
+				calls.push(`recycle ${pubkey} ${flushMs}`);
+			}
+		};
+		try {
+			s.peerAdds(297_029n, 300n);
+			await turns(10);
+			expect(calls).to.deep.equal([`recycle ${s.alice.node.getNodeId()} 2000`]);
+		} finally {
+			manager.peerManager = null;
+		}
 	});
 
 	it('still fails the channel for units its sender does not hold', async () => {

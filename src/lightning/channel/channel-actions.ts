@@ -428,6 +428,13 @@ export interface ISpliceTxNegotiatedAction {
 export interface IDisconnectPeerAction {
 	type: ChannelActionType.DISCONNECT_PEER;
 	reason: string;
+	/**
+	 * Dial the peer again once the connection has gone, on the backoff a
+	 * connection the peer closed gets (PeerManager.recyclePeer), where a
+	 * plain disconnect cancels any dial. For a refusal that blames no one,
+	 * after which only the next connection brings the channel back.
+	 */
+	recycle?: boolean;
 }
 
 /**

@@ -4810,10 +4810,13 @@ export class Channel {
 				// add is dropped and nothing of it enters the state, the peer is
 				// warned, and the connection is closed. A commitment_signed of
 				// the peer is not read until it has gone: one already in flight
-				// would cover the dropped add.
+				// would cover the dropped add. The peer did nothing to shun, so
+				// it is dialed again: the channel comes back with the next
+				// connection.
 				this._auxiliaryAwaitingDisconnect = true;
 				return this._warnAndDisconnect(
-					`update_add_htlc ${msg.id} carries asset units on ${msg.amountMsat} msat, under the channel's dust limit: no commitment can hold it`
+					`update_add_htlc ${msg.id} carries asset units on ${msg.amountMsat} msat, under the channel's dust limit: no commitment can hold it`,
+					true
 				);
 			}
 			if (err instanceof AuxiliaryHtlcFault) {
@@ -11882,11 +11885,18 @@ export class Channel {
 	 * broadcast a commitment over a disagreement a reconnect settles. Nothing
 	 * about the channel changes here, so there is nothing to persist.
 	 */
-	private _warnAndDisconnect(message: string): ChannelAction[] {
+	private _warnAndDisconnect(
+		message: string,
+		recycle = false
+	): ChannelAction[] {
 		return [
 			...this._wireWarning(message),
 			{ type: ChannelActionType.ERROR, message },
-			{ type: ChannelActionType.DISCONNECT_PEER, reason: message }
+			{
+				type: ChannelActionType.DISCONNECT_PEER,
+				reason: message,
+				...(recycle ? { recycle: true } : {})
+			}
 		];
 	}
 
