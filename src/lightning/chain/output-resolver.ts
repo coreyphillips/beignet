@@ -29,7 +29,7 @@ import {
 	buildHtlcTimeoutWitness,
 	signSweepInput,
 	signP2wpkhInput,
-	estimateSweepVbytes,
+	sweepVbytes,
 	encodeWitnessSignature
 } from './sweep';
 import { buildToLocalScript, csvFromToLocalScript } from '../script/commitment';
@@ -116,6 +116,45 @@ import type { ITaprootAuxLeaf } from '../script/commitment-taproot';
 const SIGHASH_ALL = bitcoin.Transaction.SIGHASH_ALL;
 const SIGHASH_ANCHOR =
 	bitcoin.Transaction.SIGHASH_SINGLE | bitcoin.Transaction.SIGHASH_ANYONECANPAY;
+
+/**
+ * Placeholders as long as the signatures a sweep is signed with, to size
+ * the sweep before it is signed: the longest low-S DER signature with its
+ * sighash byte, and a BIP340 signature under SIGHASH_DEFAULT.
+ */
+const SIZING_ECDSA_SIGNATURE = Buffer.alloc(72);
+const SIZING_SCHNORR_SIGNATURE = Buffer.alloc(64);
+
+/** The fee of a one-input sweep with `witness`, at the rate, rounded up. */
+function sweepFee(
+	feeRatePerVbyte: number,
+	witness: readonly Buffer[],
+	destinationScript: Buffer
+): bigint {
+	return BigInt(
+		Math.ceil(feeRatePerVbyte * sweepVbytes(witness, destinationScript))
+	);
+}
+
+/**
+ * The fee of a claim of our to_remote on the peer's commitment: a P2WSH
+ * spend of the 1-CSV script on an anchor channel (its witness script is
+ * known), a P2WPKH spend otherwise.
+ */
+function toRemoteClaimFee(
+	output: ITrackedOutput,
+	paymentPubkey: Buffer,
+	feeRatePerVbyte: number,
+	destinationScript: Buffer
+): bigint {
+	return sweepFee(
+		feeRatePerVbyte,
+		output.witnessScript
+			? buildToRemoteAnchorWitness(SIZING_ECDSA_SIGNATURE, output.witnessScript)
+			: buildToRemoteWitness(SIZING_ECDSA_SIGNATURE, paymentPubkey),
+		destinationScript
+	);
+}
 
 /**
  * The exact fee a pre-signed second-level HTLC transaction commits to. The
@@ -2040,11 +2079,15 @@ export function resolveOurCommitmentOutputs(
 	const resolved: IResolvedOutput[] = [];
 
 	for (const output of trackedOutputs) {
-		const feeSatoshis = BigInt(
-			Math.ceil(feeRatePerVbyte * estimateSweepVbytes(output.outputType))
-		);
-
 		if (output.outputType === OutputType.TO_LOCAL && output.witnessScript) {
+			const feeSatoshis = sweepFee(
+				feeRatePerVbyte,
+				buildToLocalDelayedWitness(
+					SIZING_ECDSA_SIGNATURE,
+					output.witnessScript
+				),
+				destinationScript
+			);
 			if (
 				sweepOutputValue(output.amount, feeSatoshis, destinationScript) === null
 			) {
@@ -2342,7 +2385,14 @@ export function resolveSecondLevelHtlcOutput(
 								[],
 								destinationScript
 						  )
-						: estimateSweepVbytes(OutputType.TO_LOCAL))
+						: sweepVbytes(
+								[
+									SIZING_SCHNORR_SIGNATURE,
+									sl.delay.script,
+									sl.delay.controlBlock
+								],
+								destinationScript
+						  ))
 			)
 		);
 
@@ -2484,8 +2534,10 @@ export function resolveSecondLevelHtlcOutput(
 	if (!p2wsh.output || !p2wsh.output.equals(out.script)) return null;
 
 	const amount = BigInt(out.value);
-	const feeSatoshis = BigInt(
-		Math.ceil(feeRatePerVbyte * estimateSweepVbytes(OutputType.TO_LOCAL))
+	const feeSatoshis = sweepFee(
+		feeRatePerVbyte,
+		buildToLocalDelayedWitness(SIZING_ECDSA_SIGNATURE, witnessScript),
+		destinationScript
 	);
 	const htlcTxid = htlcTx.getId();
 	const trackedOutput: ITrackedOutput = {
@@ -2726,7 +2778,14 @@ function resolveOurTaprootCommitmentOutputs(
 									[],
 									destinationScript
 							  )
-							: estimateSweepVbytes(output.outputType))
+							: sweepVbytes(
+									[
+										SIZING_SCHNORR_SIGNATURE,
+										toLocal.delay.script,
+										toLocal.delay.controlBlock
+									],
+									destinationScript
+							  ))
 				)
 			);
 			const sweepValue = sweepOutputValue(
@@ -3067,7 +3126,15 @@ function resolveTheirCurrentTaprootCommitmentOutputs(
 								extraWitness,
 								destinationScript
 						  )
-						: estimateSweepVbytes(output.outputType))
+						: sweepVbytes(
+								[
+									SIZING_SCHNORR_SIGNATURE,
+									...extraWitness,
+									leafScript,
+									controlBlock
+								],
+								destinationScript
+						  ))
 			)
 		);
 		const sweepValue = sweepOutputValue(
@@ -3369,16 +3436,16 @@ export function resolveTheirCurrentCommitmentOutputs(
 			output.outputType === OutputType.TO_REMOTE && output.witnessScript
 				? leaseCsvFromToRemoteScript(output.witnessScript)
 				: undefined;
-		const feeSatoshis = BigInt(
-			Math.ceil(
-				feeRatePerVbyte *
-					estimateSweepVbytes(output.outputType, toRemoteLeaseCsv !== undefined)
-			)
-		);
 
 		if (output.outputType === OutputType.TO_REMOTE) {
 			// This is our balance on their commitment — claim it with our payment key.
 			const paymentPubkey = state.localBasepoints.paymentBasepoint;
+			const feeSatoshis = toRemoteClaimFee(
+				output,
+				paymentPubkey,
+				feeRatePerVbyte,
+				destinationScript
+			);
 
 			// Both builders below throw when the fee exceeds the output (the guards
 			// inside buildToLocalSweepTx / buildToRemoteClaimTx), and this loop runs
@@ -3470,6 +3537,14 @@ export function resolveTheirCurrentCommitmentOutputs(
 				htlcBasepointSecret &&
 				remotePerCommitmentPoint
 			) {
+				const feeSatoshis = sweepFee(
+					feeRatePerVbyte,
+					buildRemoteHtlcTimeoutWitness(
+						SIZING_ECDSA_SIGNATURE,
+						output.witnessScript
+					),
+					destinationScript
+				);
 				if (
 					sweepOutputValue(output.amount, feeSatoshis, destinationScript) ===
 					null
@@ -3543,6 +3618,15 @@ export function resolveTheirCurrentCommitmentOutputs(
 				htlcBasepointSecret &&
 				remotePerCommitmentPoint
 			) {
+				const feeSatoshis = sweepFee(
+					feeRatePerVbyte,
+					buildRemoteHtlcPreimageWitness(
+						SIZING_ECDSA_SIGNATURE,
+						preimage,
+						output.witnessScript
+					),
+					destinationScript
+				);
 				if (
 					sweepOutputValue(output.amount, feeSatoshis, destinationScript) ===
 					null
@@ -3916,14 +4000,11 @@ export function resolveRevokedCommitmentOutputs(
 			const toRemoteLeaseCsv = output.witnessScript
 				? leaseCsvFromToRemoteScript(output.witnessScript)
 				: undefined;
-			const feeSatoshis = BigInt(
-				Math.ceil(
-					feeRatePerVbyte *
-						estimateSweepVbytes(
-							OutputType.TO_REMOTE,
-							toRemoteLeaseCsv !== undefined
-						)
-				)
+			const feeSatoshis = toRemoteClaimFee(
+				output,
+				state.localBasepoints.paymentBasepoint,
+				feeRatePerVbyte,
+				destinationScript
 			);
 			// Both builders below throw when the fee exceeds the output, and this
 			// runs BEFORE the penalty batch is built, so an uneconomic to_remote
@@ -4274,7 +4355,14 @@ function resolveRevokedTaprootCommitmentOutputs(
 									[],
 									destinationScript
 							  )
-							: estimateSweepVbytes(OutputType.TO_REMOTE))
+							: sweepVbytes(
+									[
+										SIZING_SCHNORR_SIGNATURE,
+										tr.spend.script,
+										tr.spend.controlBlock
+									],
+									destinationScript
+							  ))
 				)
 			);
 			const claimValue = sweepOutputValue(
@@ -4717,9 +4805,6 @@ export function resolveRevokedSecondLevelOutput(
 		state.localBasepoints.revocationBasepoint,
 		perCommitmentPoint
 	);
-	const feeSatoshis = BigInt(
-		Math.ceil(feeRatePerVbyte * estimateSweepVbytes(OutputType.TO_LOCAL))
-	);
 	const spendingTxid = spendingTx.getId();
 	const resolved: IResolvedOutput[] = [];
 
@@ -4867,6 +4952,12 @@ export function resolveRevokedSecondLevelOutput(
 		}
 
 		const merkleRoot = tapleafHash(sl.delay.script, sl.delay.leafVersion);
+		// A key-path spend: the witness is the signature alone.
+		const feeSatoshis = sweepFee(
+			feeRatePerVbyte,
+			[SIZING_SCHNORR_SIGNATURE],
+			destinationScript
+		);
 		for (let i = 0; i < spendingTx.outs.length; i++) {
 			const out = spendingTx.outs[i];
 			if (carried.has(i) || !sl.output.equals(out.script)) continue;
@@ -4938,6 +5029,11 @@ export function resolveRevokedSecondLevelOutput(
 		}
 		if (!witnessScript) continue;
 		const amount = BigInt(out.value);
+		const feeSatoshis = sweepFee(
+			feeRatePerVbyte,
+			buildToLocalPenaltyWitness(SIZING_ECDSA_SIGNATURE, witnessScript),
+			destinationScript
+		);
 		const claimValue = sweepOutputValue(amount, feeSatoshis, destinationScript);
 		if (claimValue === null) continue;
 		// Revocation branch: no CSV/CLTV. Opt in to replacement so a stalled

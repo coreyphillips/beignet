@@ -39,7 +39,6 @@ import {
 	OutputType
 } from '../../src/lightning/chain/types';
 import { resolveRevokedSecondLevelOutput } from '../../src/lightning/chain/output-resolver';
-import { estimateSweepVbytes } from '../../src/lightning/chain/sweep';
 import { ChannelActionType } from '../../src/lightning/channel/channel-actions';
 import { MAX_INDEX } from '../../src/lightning/keys/shachain';
 import {
@@ -336,10 +335,13 @@ describe('Revoked second-level HTLC justice (#8)', function () {
 			expect(r.witness![1].equals(Buffer.from([0x01]))).to.be.true;
 			expect(r.witness![2].equals(witnessScript)).to.be.true;
 
-			// Pays our destination with the sweep fee deducted.
-			const fee = Math.ceil(10 * estimateSweepVbytes(OutputType.TO_LOCAL));
+			// Pays our destination with the sweep fee deducted: 10 sat/vB on
+			// the signed size, sized with the longest signature.
+			const vsize = r.spendTx!.virtualSize();
 			expect(r.spendTx!.outs[0].script.equals(dest)).to.be.true;
-			expect(r.spendTx!.outs[0].value).to.equal(90_000 - fee);
+			expect(90_000 - r.spendTx!.outs[0].value)
+				.to.be.at.least(10 * vsize)
+				.and.at.most(10 * (vsize + 1));
 		});
 
 		it('returns an empty array when no output matches', function () {

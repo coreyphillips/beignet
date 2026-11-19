@@ -14,7 +14,6 @@ import { ECPairFactory } from 'ecpair';
 import { IChainBackend } from '../../src/lightning/chain/chain-watcher';
 import { LightningNode } from '../../src/lightning/node/lightning-node';
 import { OutputType } from '../../src/lightning/chain/types';
-import { estimateSweepVbytes } from '../../src/lightning/chain/sweep';
 import type { ISpliceWalletInput } from '../../src/lightning/channel/channel';
 import {
 	buildGraph,
@@ -291,13 +290,15 @@ describe('A force close bids by whether anything on the commitment has a deadlin
 				);
 			expect(toLocal, 'a to_local output').to.not.equal(undefined);
 			expect(toLocal.originalFeeRate).to.equal(1);
-			// The sweep is priced at 1 sat/vB for the size the resolver
-			// estimates for it, where the floor priced it at 10.
+			// The sweep pays 1 sat/vB on its signed size, where the floor
+			// priced it at 10. It is sized with the longest signature, so it
+			// may be a vbyte over.
 			const sweep = bitcoin.Transaction.fromHex(toLocal.sweepTxHex);
 			const swept = Number(commitment.outs[toLocal.outputIndex].value);
-			expect(swept - sumOuts(sweep)).to.equal(
-				Math.ceil(1 * estimateSweepVbytes(OutputType.TO_LOCAL))
-			);
+			expect(sweep.ins[0].witness.length, 'the sweep is signed').to.equal(3);
+			expect(swept - sumOuts(sweep))
+				.to.be.at.least(sweep.virtualSize())
+				.and.at.most(sweep.virtualSize() + 1);
 		} finally {
 			fx.destroy();
 		}

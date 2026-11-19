@@ -41,6 +41,7 @@ beignet: property Wallet.sendMany.broadcast?: boolean
 beignet: property Wallet.sendMax.broadcast?: boolean
 beignet: const getBitcoinJsNetwork: (network: Network | `${Network}`) => bitcoinjs-lib#Network
 beignet: const getElectrumNetwork: (network: Network) => EElectrumNetworks
+beignet/lightning: function chain.estimateSweepVbytes(outputType: chain.OutputType, leased?: boolean): number
 beignet/lightning: property node.INodeConfig.fforConcurrent?: { enabled: boolean; }
 beignet/lightning: property node.INodeConfig.fforIssuer?: ffor.IFforIssuerConfig
 beignet/lightning: property node.INodeConfig.fforSettle?: ffor.IFforSettlePolicy
