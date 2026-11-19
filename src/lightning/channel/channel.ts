@@ -4160,6 +4160,31 @@ export class Channel {
 	}
 
 	/**
+	 * Issue #2098: whether the node wrote that it asks its host about
+	 * forwarding the HTLC it received with this id (IHtlcEntry.forwardAsked).
+	 */
+	forwardAsked(htlcId: bigint): boolean {
+		return this._state.htlcs.get(`received-${htlcId}`)?.forwardAsked === true;
+	}
+
+	/**
+	 * Marks the received HTLC as one the node asks its host about forwarding.
+	 * False when the channel holds no such HTLC. The caller writes the row.
+	 */
+	markForwardAsked(htlcId: bigint): boolean {
+		const entry = this._state.htlcs.get(`received-${htlcId}`);
+		if (!entry) return false;
+		entry.forwardAsked = true;
+		return true;
+	}
+
+	/** Takes the mark back, when its row could not be written. */
+	unmarkForwardAsked(htlcId: bigint): void {
+		const entry = this._state.htlcs.get(`received-${htlcId}`);
+		if (entry) delete entry.forwardAsked;
+	}
+
+	/**
 	 * The first decision for an HTLC stands. The one exception is a fulfil
 	 * this node has made in the channel: the preimage is with the peer
 	 * from then on, and the record says what was done.

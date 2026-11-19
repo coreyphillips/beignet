@@ -1245,6 +1245,17 @@ export class JitReceiveManager extends TypedEmitter<JitReceiveEvents> {
 	// ─────────────── Interception ───────────────
 
 	/**
+	 * Whether this node minted the short channel id for a JIT receive and still
+	 * holds its intent, whatever the intent would answer an HTLC. Read before
+	 * tryInterceptUnknownScid, which drops an intent past its expiry: the
+	 * forwarding path asks its host about no short channel id this node minted
+	 * (issue #2098).
+	 */
+	mintedScid(scidHex: string): boolean {
+		return !this.destroyed && this.intents.has(scidHex);
+	}
+
+	/**
 	 * Called from the forwarding path when the outgoing SCID matched no channel
 	 * of ours. Returns true when the HTLC was intercepted and held, and the
 	 * caller must then NOT fail it; false falls through to unknown_next_peer.

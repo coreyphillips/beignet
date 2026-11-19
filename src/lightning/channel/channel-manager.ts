@@ -12076,6 +12076,37 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		return true;
 	}
 
+	/**
+	 * Issue #2098: write down, with the channel's row and before the host is
+	 * asked, that the node asks its host about forwarding an HTLC it received
+	 * on this channel (prepareForward). True once the row says so; false, with
+	 * nothing kept, when the channel does not hold the HTLC or the row could
+	 * not be written, and then the host must not be asked.
+	 */
+	recordForwardAsk(channelId: Buffer, htlcId: bigint): boolean {
+		const hex = channelId.toString('hex');
+		const channel = this.channels.get(hex);
+		const peerPubkey = this.channelPeers.get(hex);
+		if (!channel || !peerPubkey) return false;
+		if (channel.forwardAsked(htlcId)) return true;
+		if (!channel.markForwardAsked(htlcId)) return false;
+		try {
+			this.persistence.persist({ channel, peerPubkey, channelId });
+		} catch {
+			channel.unmarkForwardAsked(htlcId);
+			return false;
+		}
+		return true;
+	}
+
+	/** Whether the node wrote that it asks its host about forwarding this received HTLC. */
+	forwardAsked(channelId: Buffer, htlcId: bigint): boolean {
+		return (
+			this.channels.get(channelId.toString('hex'))?.forwardAsked(htlcId) ===
+			true
+		);
+	}
+
 	/** Whether an asset channel has a commitment on the chain, or is closing there. */
 	auxiliaryChannelOnChain(channelId: Buffer): boolean {
 		const hex = channelId.toString('hex');

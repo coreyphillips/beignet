@@ -11,3 +11,17 @@
  * no asset channel whatever this says.
  */
 export const auxiliaryChannelOpens = { enabled: true };
+
+/**
+ * Whether this build forwards an HTLC with an asset leg (issue #2098).
+ *
+ * Off until the step of that issue that defends such a forward on chain:
+ * with it off, a node refuses every forward with an asset leg before
+ * anything is offered, whatever its host supplies, and asks its host
+ * nothing. Step 2 of the issue runs behind it: a bitcoin HTLC whose next
+ * hop is a short channel id the host claims, or an asset channel the onion
+ * names, forwarded over that asset channel with the records the host made.
+ * Tests turn it on to reach that; nothing else may, and the package does
+ * not export it.
+ */
+export const auxiliaryForwards = { enabled: false };
