@@ -39,6 +39,10 @@ const SWEEP_VBYTES: Record<OutputType, number> = {
  * `leased` marks a lease-locked (liquidity ads) to_remote claim, whose
  * witness script carries a multi-byte CSV number instead of OP_1 (CLN lease
  * form): ~+4 WU, ~+1 vbyte (keep the old +2 vbyte cushion).
+ *
+ * @deprecated Use {@link sweepVbytes}. These figures ignore the witness
+ * script and the destination, and fall below the signed size of some
+ * sweeps (a to_local sweep to P2TR is 133 vbytes, not 113).
  */
 export function estimateSweepVbytes(
 	outputType: OutputType,
@@ -46,6 +50,23 @@ export function estimateSweepVbytes(
 ): number {
 	const base = SWEEP_VBYTES[outputType];
 	return leased && outputType === OutputType.TO_REMOTE ? base + 2 : base;
+}
+
+/**
+ * The virtual size of a sweep that spends one input with `witness` and pays
+ * one output to `destinationScript`. Signatures in `witness` must be as long
+ * as the ones the sweep is signed with: a placeholder of the right length is
+ * enough, since only the sizes count.
+ */
+export function sweepVbytes(
+	witness: readonly Buffer[],
+	destinationScript: Buffer
+): number {
+	const tx = new bitcoin.Transaction();
+	tx.addInput(Buffer.alloc(32), 0);
+	tx.addOutput(destinationScript, 0);
+	tx.setWitness(0, [...witness]);
+	return tx.virtualSize();
 }
 
 // ─────────────── To-Local Sweep ───────────────

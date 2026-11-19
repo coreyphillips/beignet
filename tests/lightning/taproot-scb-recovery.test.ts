@@ -37,7 +37,6 @@ import {
 	classifyOutputs,
 	resolveTheirCurrentCommitmentOutputs
 } from '../../src/lightning/chain/output-resolver';
-import { estimateSweepVbytes } from '../../src/lightning/chain/sweep';
 import {
 	CommitmentType,
 	ChainActionType,
@@ -212,10 +211,9 @@ function assertTaprootToRemoteSweep(
 	);
 	expect(sweep.ins[0].sequence).to.equal(1);
 
-	// Pays the sweep destination, fee computed like every other recovery sweep.
-	const feeSatoshis = BigInt(
-		Math.ceil(feeRatePerVbyte * estimateSweepVbytes(OutputType.TO_REMOTE))
-	);
+	// Pays the sweep destination, the fee at the rate on the signed size (a
+	// BIP340 signature is always 64 bytes, so the size is exact).
+	const feeSatoshis = BigInt(Math.ceil(feeRatePerVbyte * sweep.virtualSize()));
 	expect(sweep.outs.length).to.equal(1);
 	expect(sweep.outs[0].script.equals(destinationScript)).to.equal(true);
 	expect(BigInt(sweep.outs[0].value)).to.equal(trackedAmount - feeSatoshis);

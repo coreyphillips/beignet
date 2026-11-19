@@ -1021,6 +1021,7 @@ function chain.satPerVbyteToSatPerKw(satPerVbyte: number): number
 function chain.selectTheirPerCommitmentPoint(tx: bitcoinjs-lib#Transaction, state: channel.IChannelState, commitmentNumber: bigint): Buffer | undefined
 function chain.signP2wpkhInput(tx: bitcoinjs-lib#Transaction, inputIndex: number, pubkey: Buffer, value: number, privateKey: Buffer): Buffer
 function chain.signSweepInput(tx: bitcoinjs-lib#Transaction, inputIndex: number, witnessScript: Buffer, value: number, privateKey: Buffer, sighashType?: number): Buffer
+function chain.sweepVbytes(witness: readonly Buffer[], destinationScript: Buffer): number
 namespace channel
 const channel.AUXILIARY_CHANNELS_API: Readonly<{ version: 1; surfaces: readonly [ "valueIncomingHtlc:three-outcome", "sendPaymentToRoute:assetPayment", "getAuxiliaryPaymentHtlcs", "onHtlcResolved:htlcId", "queryAuxiliaryRoute", "fundAuxiliaryChannel:unsigned", "onFundingSigned", "abandonAuxiliaryOpen", "IChannelInfo.auxiliary", "setAuxiliaryPaymentGate", "getChannelMonitorState", "IPaymentInfo.auxiliary", "IPaymentInfo.auxiliaryValueMsat", "IInvoiceInfo.auxiliary", "IAuxiliaryChannelInfo.undeliveredOutcomes", "onHtlcResolved:never-sent", "getFixedOutputFeeStatus", "IPaymentInfo.unresolved", "IHoldInvoiceStateEvent.auxiliary" ]; declared: readonly [ "prepareForward" ]; }>
 const channel.AUXILIARY_CHANNEL_DUST_LIMIT = 354n
