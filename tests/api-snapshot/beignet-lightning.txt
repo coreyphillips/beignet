@@ -2209,6 +2209,7 @@ property channel.ICompositeSpliceRecord.txid?: string
 property channel.ICompositeSpliceRecord.updatedAt: number
 interface channel.IDisconnectPeerAction
 property channel.IDisconnectPeerAction.reason: string
+property channel.IDisconnectPeerAction.recycle?: boolean
 property channel.IDisconnectPeerAction.type: channel.ChannelActionType.DISCONNECT_PEER
 interface channel.IDualFundingParams
 property channel.IDualFundingParams.chainHash?: Buffer
@@ -9929,6 +9930,7 @@ method transport.PeerManager.listenIroh(): Promise<void>
 method transport.PeerManager.listenPorch(): void
 method transport.PeerManager.listenWebSocket(port: number, host?: string): Promise<void>
 method transport.PeerManager.onMessage(type: number, handler: MessageHandler): void
+method transport.PeerManager.recyclePeer(pubkey: string, flushMs?: number): void
 method transport.PeerManager.sendToPeer(pubkey: string, type: number, payload: Buffer): void
 method transport.PeerManager.setAnnouncedAddresses(pubkey: string, addresses: Array<{ host: string; port: number; }>): void
 method transport.PeerManager.setConnectionGate(gate: (() => boolean) | null): void

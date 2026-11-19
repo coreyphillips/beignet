@@ -6335,17 +6335,30 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 	/**
 	 * The DISCONNECT_PEER action: drop the connection after a warning, so the
 	 * channel_reestablish on the next one restarts what the violation broke.
-	 * A peer the PeerManager does not hold gets its messages through
-	 * 'message:outbound' (see sendMessage), so the host that carries them is
-	 * asked instead.
+	 * With `recycle` the PeerManager dials the peer again on its backoff
+	 * (recyclePeer); without it, the drop cancels any dial. A peer the
+	 * PeerManager does not hold gets its messages through 'message:outbound'
+	 * (see sendMessage), so the host that carries them is asked instead, and
+	 * whether to dial again is the host's.
 	 */
-	private disconnectPeerForViolation(peerPubkey: string, reason: string): void {
+	private disconnectPeerForViolation(
+		peerPubkey: string,
+		reason: string,
+		recycle = false
+	): void {
 		if (this.peerManager?.getPeer(peerPubkey)) {
 			try {
-				this.peerManager.disconnectPeer(
-					peerPubkey,
-					ChannelManager.VIOLATION_WARNING_FLUSH_MS
-				);
+				if (recycle) {
+					this.peerManager.recyclePeer(
+						peerPubkey,
+						ChannelManager.VIOLATION_WARNING_FLUSH_MS
+					);
+				} else {
+					this.peerManager.disconnectPeer(
+						peerPubkey,
+						ChannelManager.VIOLATION_WARNING_FLUSH_MS
+					);
+				}
 			} catch {
 				// Already gone, or the teardown raced: the warning and the local
 				// error have run, and nothing after this action depends on it.
@@ -12005,7 +12018,11 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 					);
 					break;
 				case ChannelActionType.DISCONNECT_PEER:
-					this.disconnectPeerForViolation(peerPubkey, action.reason);
+					this.disconnectPeerForViolation(
+						peerPubkey,
+						action.reason,
+						action.recycle === true
+					);
 					break;
 			}
 			if (progress) progress.completedIndex = index;
