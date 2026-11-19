@@ -952,9 +952,18 @@ interface IFforUpdateContext {
  * answer shows to be bad: units its sender does not hold, or a carrier too
  * small to keep an output. The one refusal of an asset HTLC that is the
  * peer's violation; anything else thrown while one is judged is the
- * provider failing to answer.
+ * provider failing to answer. `dustCarrier` marks the second: an HTLC no
+ * commitment of either side can hold, which is refused without failing the
+ * channel (issue #2111).
  */
-class AuxiliaryHtlcFault extends Error {}
+class AuxiliaryHtlcFault extends Error {
+	constructor(
+		message: string,
+		readonly dustCarrier = false
+	) {
+		super(message);
+	}
+}
 
 export class Channel {
 	private _state: IChannelState;
@@ -4020,7 +4029,8 @@ export class Channel {
 				: this._state.remoteConfig.dustLimitSatoshis;
 		if (entry.amountMsat / 1000n < dust) {
 			throw new AuxiliaryHtlcFault(
-				'asset HTLC carrier is below the negotiated dust limit'
+				'asset HTLC carrier is below the negotiated dust limit',
+				true
 			);
 		}
 		entry.auxiliaryAmount = amount;
@@ -4785,11 +4795,30 @@ export class Channel {
 		// keep an output cannot be committed to, and BOLT 2 gives no way to
 		// refuse an add on the wire.
 		// The channel is failed only on an answer of the provider that shows
-		// the peer's HTLC to be bad (units it does not hold, a carrier below
-		// dust). A provider that could not answer is this node's failure.
+		// the peer's HTLC to be bad (units it does not hold). A carrier below
+		// dust is refused with a warning and the connection closed, the
+		// channel kept. A provider that could not answer is this node's
+		// failure.
 		try {
 			this._prepareAuxiliaryHtlc(entry);
 		} catch (err) {
+			if (err instanceof AuxiliaryHtlcFault && err.dustCarrier) {
+				// Units on a carrier under the dust limit (issue #2111): no
+				// commitment of either side can hold them, so the HTLC can never
+				// be committed, and failing the channel over it would only close
+				// it by force. BOLT 2's lighter answer keeps the channel: the
+				// add is dropped and nothing of it enters the state, the peer is
+				// warned, and the connection is closed. A commitment_signed of
+				// the peer is not read until it has gone: one already in flight
+				// would cover the dropped add. The peer did nothing to shun, so
+				// it is dialed again: the channel comes back with the next
+				// connection.
+				this._auxiliaryAwaitingDisconnect = true;
+				return this._warnAndDisconnect(
+					`update_add_htlc ${msg.id} carries asset units on ${msg.amountMsat} msat, under the channel's dust limit: no commitment can hold it`,
+					true
+				);
+			}
 			if (err instanceof AuxiliaryHtlcFault) {
 				return this._failChannelWithWireError(
 					'Invalid asset HTLC metadata or balance'
@@ -11856,11 +11885,18 @@ export class Channel {
 	 * broadcast a commitment over a disagreement a reconnect settles. Nothing
 	 * about the channel changes here, so there is nothing to persist.
 	 */
-	private _warnAndDisconnect(message: string): ChannelAction[] {
+	private _warnAndDisconnect(
+		message: string,
+		recycle = false
+	): ChannelAction[] {
 		return [
 			...this._wireWarning(message),
 			{ type: ChannelActionType.ERROR, message },
-			{ type: ChannelActionType.DISCONNECT_PEER, reason: message }
+			{
+				type: ChannelActionType.DISCONNECT_PEER,
+				reason: message,
+				...(recycle ? { recycle: true } : {})
+			}
 		];
 	}
 

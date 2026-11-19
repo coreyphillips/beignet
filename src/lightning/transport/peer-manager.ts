@@ -1363,6 +1363,38 @@ export class PeerManager extends EventEmitter {
 	}
 
 	/**
+	 * Close a peer's connection so that it is made again: BOLT 2's "send a
+	 * `warning` and close the connection", after which the reestablish of
+	 * the next connection drops the updates neither side committed. The
+	 * teardown is disconnectPeer's, the peer's listeners removed first, so
+	 * nothing more it sent is read. Unlike disconnectPeer it cancels
+	 * nothing: the peer is dialed again on the backoff a connection the
+	 * peer closed gets, which keeps growing until a connection proves
+	 * stable. A later disconnectPeer cancels that dial as it cancels any
+	 * other. A lane peer is never dialed again: it is disconnected.
+	 */
+	recyclePeer(pubkey: string, flushMs?: number): void {
+		pubkey = normalizeHexPubkey(pubkey);
+		const peer = this.peers.get(pubkey);
+		if (!peer || this.lanePeers.has(pubkey)) {
+			this.disconnectPeer(pubkey, flushMs);
+			return;
+		}
+		// Snapshot before the teardown: a synchronous peer:disconnect
+		// observer may call disconnectPeer() to cancel this peer for good,
+		// and a dial scheduled after that would reverse it.
+		const generation = this.cancelGenerations.get(pubkey) ?? 0;
+		this.removeRegisteredPeer(pubkey, peer, 'connection recycled', flushMs);
+		if (
+			this.autoReconnect &&
+			!this.noReconnectPeers.has(pubkey) &&
+			(this.cancelGenerations.get(pubkey) ?? 0) === generation
+		) {
+			this.scheduleReconnect(pubkey);
+		}
+	}
+
+	/**
 	 * Install a gate consulted before every outbound wire message. This is
 	 * the socket boundary itself: ChannelManager, gossip, peer storage and
 	 * onion messages all converge here, so a closed gate holds them ALL,
