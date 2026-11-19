@@ -1472,6 +1472,7 @@ method channel.ChannelManager.reauthorizeSpliceBroadcast(channelId: Buffer): boo
 method channel.ChannelManager.rebuildForceCloseCommitment(channelId: Buffer, feeRatePerVbyte: number, noDeadlineFeeRatePerVbyte?: number): { ok: boolean; tx?: Buffer; error?: string; retryable?: boolean; }
 method channel.ChannelManager.recordAuxiliaryHtlcDecision(channelId: Buffer, htlcId: bigint, outcome: 'settle' | 'fail', preimage?: Buffer): boolean
 method channel.ChannelManager.recordForwardAsk(channelId: Buffer, htlcId: bigint): boolean
+method channel.ChannelManager.recordForwardDecision(channelId: Buffer, htlcId: bigint, outcome: 'settle' | 'fail', preimage?: Buffer): boolean
 method channel.ChannelManager.recordPreimage(paymentHash: Buffer, preimage: Buffer): void
 method channel.ChannelManager.releaseCompositeSpliceCommitment(channelId: Buffer): channel.ChannelResult
 method channel.ChannelManager.removeTrustedPeer(pubkeyHex: string): void

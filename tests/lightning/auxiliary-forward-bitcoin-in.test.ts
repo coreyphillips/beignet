@@ -119,6 +119,8 @@ interface IOptions {
 	markedBefore?: boolean;
 	/** The expiry the onion asks of Bob's outgoing HTLC. */
 	forwardCltv?: number;
+	/** Bob's bound on HTLCs in flight across his channels refuses the HTLC. */
+	inFlightCap?: boolean;
 }
 
 interface IResult {
@@ -238,6 +240,11 @@ describe('a bitcoin HTLC forwarded out over an asset channel (issue #2098, step 
 				).to.equal(true);
 				return dispatch(channelId, htlcId, ...rest);
 			};
+		}
+		if (options.inFlightCap) {
+			(
+				bob.node as unknown as { maxTotalInFlightHtlcs: number }
+			).maxTotalInFlightHtlcs = -1;
 		}
 		context.incomingChannel = openReadyChannel(alice.node, bob.node);
 		context.assetChannel = await openAssetChannel(bob, carol, {
@@ -655,6 +662,28 @@ describe('a bitcoin HTLC forwarded out over an asset channel (issue #2098, step 
 		expect(
 			result.told[0].channelId?.equals(result.context.assetChannel)
 		).to.equal(true);
+	});
+
+	it('tells the host the outgoing leg was never offered when the bound on HTLCs in flight refuses an HTLC it had marked as asked before a stop', async () => {
+		const result = await run('aux-fwd-btc-marked-cap', {
+			quote: false,
+			markedBefore: true,
+			inFlightCap: true,
+			answer: (request, context) => units(request, context)
+		});
+		expect(result.alice).to.equal(PaymentStatus.FAILED);
+		expect(result.offered).to.equal(0n);
+		expect(result.units).to.deep.equal([9000n, 1000n]);
+		expect(result.asked).to.deep.equal([]);
+		expect(result.told).to.have.length(1);
+		expect(result.told[0]).to.deep.include({
+			incomingHtlcId: 0n,
+			leg: 'outgoing',
+			outcome: 'never-offered',
+			onChain: false
+		});
+		// Refused before the node looked for the next hop: no channel is named.
+		expect(result.told[0].channelId).to.equal(undefined);
 	});
 
 	it('tells a host nothing about an HTLC it was never asked about, when a check before the ask refuses it', async () => {

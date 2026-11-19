@@ -215,7 +215,9 @@ export interface IAuxiliaryChannelConfig {
 	 * channel it arrived on. Only the host knows that a payment hash belongs
 	 * to an asset invoice, so it sees each of them and can refuse. An HTLC
 	 * that arrived on an asset channel or carries asset units and does not
-	 * end at this node is failed back without asking. One of three answers:
+	 * end at this node is never put to this hook: it is failed back, or,
+	 * with the switch for asset forwards on, put to `prepareForward`. One of
+	 * three answers:
 	 *
 	 * - A value in millisatoshis, above zero and within a u64: the HTLC is
 	 *   the host's and is worth that much. The node goes on with that value
@@ -246,7 +248,9 @@ export interface IAuxiliaryChannelConfig {
 	 * anything is offered, whatever this would answer. With the switch on, the
 	 * build asks it about a bitcoin HTLC whose next hop is a short channel id
 	 * the node has no channel for, or an asset channel the onion names (issue
-	 * #2098, step 2). The contract it is called under is in docs/EXTENSIONS.md
+	 * #2098, step 2), and about an HTLC that came in on an asset channel with
+	 * units and is to go on over an ordinary channel the onion names (step
+	 * 3). The contract it is called under is in docs/EXTENSIONS.md
 	 * ("Forwards with an asset leg"), and `AUXILIARY_CHANNELS_API` lists it in
 	 * `surfaces` from the build that calls it.
 	 *
