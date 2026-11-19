@@ -112,6 +112,8 @@ interface IRun {
 	offered: bigint;
 	/** Rows of Bob's forwarding history. */
 	forwards: number;
+	/** Bob's persisted links of an outgoing HTLC to the incoming one. */
+	links: number;
 }
 
 describe('a forward with an asset leg, under the declared contract (issue #2098, step 1)', function () {
@@ -358,7 +360,8 @@ describe('a forward with an asset leg, under the declared contract (issue #2098,
 				.getChannelManager()
 				.getChannel(outChannelId)!
 				.getFullState().localHtlcCounter,
-			forwards: bob.storage!.listForwardingEvents().length
+			forwards: bob.storage!.listForwardingEvents().length,
+			links: bob.storage!.loadAllForwardedHtlcs().length
 		};
 	}
 
@@ -387,6 +390,7 @@ describe('a forward with an asset leg, under the declared contract (issue #2098,
 				expect(result.carol).to.not.equal(PaymentStatus.COMPLETED);
 				expect(result.offered).to.equal(0n);
 				expect(result.forwards).to.equal(0);
+				expect(result.links).to.equal(0);
 			}
 			// The same messages, and the same hooks of Bob's host: neither
 			// forward hook is among them.

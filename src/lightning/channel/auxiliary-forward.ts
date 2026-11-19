@@ -118,9 +118,11 @@ export interface IAuxiliaryForwardLegResolution {
 	htlcId?: bigint;
 	/**
 	 * `fulfilled` or `failed`. `never-offered` is for an outgoing leg whose
-	 * HTLC never entered its channel: after the host had answered with
-	 * terms, the node refused them as malformed or a check of its own
-	 * refused the forward. Its incoming leg is then failed back.
+	 * HTLC never entered its channel. Either the host answered with terms and
+	 * the node refused them as malformed or a check of its own refused the
+	 * forward. Or the node stopped before it kept the host's answer and did
+	 * not ask again, because the forward no longer passed the checks made
+	 * before the ask or the incoming channel could no longer settle the HTLC.
 	 */
 	outcome: 'fulfilled' | 'failed' | 'never-offered';
 	/** It ended on the chain, and not by a message in its channel. */

@@ -254,9 +254,9 @@ export interface IAuxiliaryChannelConfig {
 	 * not asked again on a reestablish or after a restart, except when the
 	 * node stopped before it was kept, so the host answers a second ask about
 	 * an HTLC as it answered the first. When the forward no longer passes the
-	 * checks made before the ask, the node does not ask again and tells
-	 * `onForwardLegResolved` the outgoing leg was never offered. One of three
-	 * answers:
+	 * checks made before the ask, or the incoming channel can no longer settle
+	 * the HTLC, the node does not ask again and tells `onForwardLegResolved`
+	 * the outgoing leg was never offered. One of three answers:
 	 *
 	 * - The host's terms: the forward goes on if every check of the node's
 	 *   own passes, and is failed back otherwise.
@@ -278,7 +278,7 @@ export interface IAuxiliaryChannelConfig {
 	 * the leg's HTLC has left its channel for good or the chain has resolved
 	 * it. Idempotent durable callback, delivered again after a crash until it
 	 * returns without throwing, outside any storage transaction.
-	 * `onHtlcResolved` is still called for every asset HTLC, a leg of a
+	 * `onHtlcResolved` keeps its own rules for asset HTLCs, a leg of a
 	 * forward or not.
 	 */
 	onForwardLegResolved?(resolution: IAuxiliaryForwardLegResolution): void;
