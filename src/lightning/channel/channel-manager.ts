@@ -638,6 +638,16 @@ export interface IChannelManagerConfig {
  */
 const COMMITMENT_CPFP_REBUMP_INTERVAL = 6;
 
+/**
+ * Nothing on our commitment has to confirm by a deadline: no HTLC is on it.
+ * Every HTLC stays in `htlcs` until its removal is committed by both sides,
+ * so an empty map means none is on the commitment, and none can be added
+ * once the channel is force closed.
+ */
+function commitmentHasNoDeadline(state: Readonly<IChannelState>): boolean {
+	return state.htlcs.size === 0;
+}
+
 // BOLT 7: a channel_announcement is not sent before its funding has this
 // many confirmations.
 const ANNOUNCEMENT_MIN_CONFIRMATIONS = 6;
@@ -930,6 +940,12 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			action: IFeeBumpAndBroadcastChainAction;
 			broadcastHeight: number;
 			lastFeeRate: number;
+			// Our own commitment with no HTLC on it: nothing in the package has
+			// to confirm by a deadline, so each re-bid is at the no-deadline rate
+			// when the caller gives one. Absent for a commitment that carries an
+			// HTLC, and for the peer's commitment, which is only ever bumped for
+			// an HTLC we can claim.
+			noDeadline?: boolean;
 			// Set when the last CPFP-child build/broadcast actually failed (e.g. no
 			// confirmed wallet UTXOs). While true, reCpfpStuckCommitments retries next
 			// cycle even at an unchanged feerate, so a CPFP is re-attempted once wallet
@@ -3899,12 +3915,18 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 
 	/**
 	 * Force close a channel by broadcasting the latest local commitment.
+	 *
+	 * `feeRatePerVbyte` prices the anchor CPFP child and the monitor's first
+	 * sweeps. With `noDeadlineFeeRatePerVbyte`, a commitment that holds no
+	 * HTLC is priced at that rate instead: nothing on it has to confirm by a
+	 * deadline (see forceClosePackageRate).
 	 */
 	forceClose(
 		channelId: Buffer,
 		destinationScript: Buffer,
 		feeRatePerVbyte = 10,
-		network?: import('bitcoinjs-lib').Network
+		network?: import('bitcoinjs-lib').Network,
+		noDeadlineFeeRatePerVbyte?: number
 	): ChannelResult {
 		const idHex = channelId.toString('hex');
 		const channel = this.channels.get(idHex);
@@ -3986,10 +4008,26 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		// are broadcasting - the anchor CPFP child, the monitor's
 		// classification and sweeps - has to read the plan's view instead.
 		const state = plan.provisionalSpliceClose?.view ?? channel.getFullState();
+		// What this commitment's package bids: the deadline rate while an HTLC
+		// is on it, the no-deadline rate when none is. The monitor starts at
+		// the same rate, so a sweep it builds before the next fee estimate
+		// (the to_local sweep, built when the commitment is first seen) is
+		// priced like the package it belongs to.
+		const packageRate = this.forceClosePackageRate(
+			state,
+			feeRatePerVbyte,
+			noDeadlineFeeRatePerVbyte
+		);
 
 		// Anchor channels: the commitment is broadcast at a low feerate, so attach
 		// a wallet-funded CPFP child spending our local anchor to speed confirmation.
-		this._maybeCpfpAnchorCommitment(channelId, state, actions, feeRatePerVbyte);
+		this._maybeCpfpAnchorCommitment(
+			channelId,
+			state,
+			actions,
+			feeRatePerVbyte,
+			noDeadlineFeeRatePerVbyte
+		);
 
 		// A fresh monitor starts blank: no tracked outputs, no classification and
 		// no irrevocable-depth clock. Handing one to a channel whose funding spend
@@ -4028,7 +4066,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			monitor = new ChainMonitor(
 				state,
 				destinationScript,
-				feeRatePerVbyte,
+				packageRate,
 				perCh?.revocationBasepointSecret ||
 					this.config.revocationBasepointSecret ||
 					this.config.localFundingPrivkey,
@@ -13933,16 +13971,36 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 	}
 
 	/**
+	 * The rate a force-close package of our own commitment bids. An HTLC on
+	 * the commitment has to be claimed before its expiry, so such a package
+	 * bids `feeRatePerVbyte`, the caller's deadline rate. A commitment with no
+	 * HTLC on it has nothing that must confirm by a deadline, and its package
+	 * bids `noDeadlineFeeRatePerVbyte` when the caller gives one.
+	 */
+	private forceClosePackageRate(
+		state: Readonly<IChannelState>,
+		feeRatePerVbyte: number,
+		noDeadlineFeeRatePerVbyte?: number
+	): number {
+		return noDeadlineFeeRatePerVbyte !== undefined &&
+			commitmentHasNoDeadline(state)
+			? noDeadlineFeeRatePerVbyte
+			: feeRatePerVbyte;
+	}
+
+	/**
 	 * On an anchor force-close, build and broadcast a CPFP child that spends our
 	 * local anchor output to raise the commitment package's effective fee rate.
 	 * Best-effort: skipped silently when the channel is non-anchor, no funding
 	 * provider is set, or our local anchor was trimmed from the commitment.
+	 * The child bids the rate forceClosePackageRate picks for this commitment.
 	 */
 	private _maybeCpfpAnchorCommitment(
 		channelId: Buffer,
 		state: IChannelState,
 		actions: ChannelAction[],
-		feeRatePerVbyte: number
+		feeRatePerVbyte: number,
+		noDeadlineFeeRatePerVbyte?: number
 	): void {
 		if (!isAnchorChannel(state.channelType)) return;
 		if (!this.fundingProvider?.selectFeeBumpInputs) return;
@@ -13976,12 +14034,18 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			);
 			const parentFeeSats =
 				state.fundingSatoshis > outsSum ? state.fundingSatoshis - outsSum : 0n;
+			const noDeadline = commitmentHasNoDeadline(state);
+			const packageRate = this.forceClosePackageRate(
+				state,
+				feeRatePerVbyte,
+				noDeadlineFeeRatePerVbyte
+			);
 			const cpfpAction: IFeeBumpAndBroadcastChainAction = {
 				type: ChainActionType.FEE_BUMP_AND_BROADCAST,
 				kind: 'anchor-cpfp',
 				tx: fc.tx,
 				description: 'anchor commitment CPFP',
-				feeratePerVbyte: feeRatePerVbyte,
+				feeratePerVbyte: packageRate,
 				anchorOutputIndex,
 				anchorWitnessScript: taprootAnchor
 					? Buffer.alloc(0)
@@ -14002,7 +14066,8 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			this._pendingCommitmentCpfp.set(channelId.toString('hex'), {
 				action: cpfpAction,
 				broadcastHeight: this._currentBlockHeight,
-				lastFeeRate: feeRatePerVbyte
+				lastFeeRate: packageRate,
+				...(noDeadline ? { noDeadline: true } : {})
 			});
 		} catch (err) {
 			this.emit(
@@ -14127,11 +14192,23 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 	 * re-bid applies, and the parent re-broadcast re-inserts it if evicted.
 	 *
 	 * @param blockHeight - current chain tip
-	 * @param feeRatePerVbyte - live force-close feerate from the node's estimator
+	 * @param feeRatePerVbyte - live force-close feerate from the node's estimator,
+	 *   for a package that carries an HTLC
+	 * @param noDeadlineFeeRatePerVbyte - live feerate for a package of our own
+	 *   commitment with no HTLC on it; such a package bids `feeRatePerVbyte`
+	 *   when this is not given
 	 */
-	reCpfpStuckCommitments(blockHeight: number, feeRatePerVbyte: number): void {
+	reCpfpStuckCommitments(
+		blockHeight: number,
+		feeRatePerVbyte: number,
+		noDeadlineFeeRatePerVbyte?: number
+	): void {
 		this._currentBlockHeight = blockHeight;
 		for (const [channelIdHex, entry] of this._pendingCommitmentCpfp) {
+			const rate =
+				entry.noDeadline === true && noDeadlineFeeRatePerVbyte !== undefined
+					? noDeadlineFeeRatePerVbyte
+					: feeRatePerVbyte;
 			const monitor = this.monitors.get(channelIdHex);
 			// Stop CPFP only once the monitor is gone or fully resolved. Do NOT stop
 			// merely because the funding spend was DETECTED: the monitor leaves WATCHING
@@ -14200,7 +14277,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 				// attempt failed to emit a child at all (e.g. no confirmed UTXOs then).
 				// Without the failure escape a failed attempt still advanced lastFeeRate,
 				// so the `<=` gate blocked every retry even after wallet change confirmed.
-				if (feeRatePerVbyte <= entry.lastFeeRate && !entry.lastAttemptFailed) {
+				if (rate <= entry.lastFeeRate && !entry.lastAttemptFailed) {
 					continue;
 				}
 			}
@@ -14217,7 +14294,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			// failed attempt does not masquerade as a paid one.
 			void this._handleFeeBumpAndBroadcast(channelId, {
 				...entry.action,
-				feeratePerVbyte: feeRatePerVbyte,
+				feeratePerVbyte: rate,
 				description: 'anchor commitment CPFP (re-bump)'
 			});
 		}
@@ -14231,9 +14308,14 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 	 * forever — CSV/HTLC sweeps are all blocked behind the unconfirmed parent.
 	 * Safe to re-run: forceClose() rebuilds the byte-identical commitment
 	 * (deterministic signatures) and duplicate broadcasts are rejected
-	 * harmlessly by the network.
+	 * harmlessly by the network. The child is priced as forceClose prices it:
+	 * `noDeadlineFeeRatePerVbyte`, when given, for a commitment with no HTLC.
 	 */
-	rearmCommitmentCpfp(channelId: Buffer, feeRatePerVbyte: number): void {
+	rearmCommitmentCpfp(
+		channelId: Buffer,
+		feeRatePerVbyte: number,
+		noDeadlineFeeRatePerVbyte?: number
+	): void {
 		const idHex = channelId.toString('hex');
 		const channel = this.channels.get(idHex);
 		const monitor = this.monitors.get(idHex);
@@ -14278,7 +14360,8 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			channelId,
 			rebuiltView,
 			actions,
-			feeRatePerVbyte
+			feeRatePerVbyte,
+			noDeadlineFeeRatePerVbyte
 		);
 	}
 
@@ -14292,10 +14375,13 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 	 * its tracked outputs) and does NOT emit broadcast:tx: the caller
 	 * broadcasts exactly once, awaitably, so a duplicate does not land in the
 	 * watcher's failed-broadcast retry queue as a false BROADCAST_FAILED.
+	 * A CPFP child it attaches is priced as forceClose prices it:
+	 * `noDeadlineFeeRatePerVbyte`, when given, for a commitment with no HTLC.
 	 */
 	rebuildForceCloseCommitment(
 		channelId: Buffer,
-		feeRatePerVbyte: number
+		feeRatePerVbyte: number,
+		noDeadlineFeeRatePerVbyte?: number
 	): { ok: boolean; tx?: Buffer; error?: string; retryable?: boolean } {
 		const idHex = channelId.toString('hex');
 		const channel = this.channels.get(idHex);
@@ -14373,7 +14459,8 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 				channelId,
 				rebuiltView,
 				actions,
-				feeRatePerVbyte
+				feeRatePerVbyte,
+				noDeadlineFeeRatePerVbyte
 			);
 		}
 		return { ok: true, tx: txAction.tx };

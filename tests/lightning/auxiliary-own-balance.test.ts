@@ -66,12 +66,15 @@ describe('asset channels: the own balance output on chain', function () {
 				};
 			}
 		).fundingProvider;
+	// Every force close of the host at one rate, with an HTLC on the
+	// commitment or none.
 	const atRate = (host: IAssetHost, feeRate: number): void => {
-		(
-			host.node as unknown as {
-				resolveForceCloseFeeRatePerVbyte: () => number;
-			}
-		).resolveForceCloseFeeRatePerVbyte = (): number => feeRate;
+		const node = host.node as unknown as {
+			resolveForceCloseFeeRatePerVbyte: () => number;
+			resolveNoDeadlineFeeRatePerVbyte: () => number;
+		};
+		node.resolveForceCloseFeeRatePerVbyte = (): number => feeRate;
+		node.resolveNoDeadlineFeeRatePerVbyte = (): number => feeRate;
 	};
 	const uneconomicOf = (host: IAssetHost): unknown[] => {
 		const said: unknown[] = [];

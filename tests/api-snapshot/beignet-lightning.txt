@@ -1406,7 +1406,7 @@ method channel.ChannelManager.fforSetSlot(channelId: Buffer, k: number, state: f
 method channel.ChannelManager.fforSetupTimeout(channelId: Buffer): channel.ChannelResult
 method channel.ChannelManager.fforSync(channelId: Buffer): channel.ChannelResult
 method channel.ChannelManager.fforWitnessAcked(channelId: Buffer, mailboxId: Buffer, retentionUntil: number): channel.ChannelResult
-method channel.ChannelManager.forceClose(channelId: Buffer, destinationScript: Buffer, feeRatePerVbyte?: number, network?: bitcoinjs-lib#Network): channel.ChannelResult
+method channel.ChannelManager.forceClose(channelId: Buffer, destinationScript: Buffer, feeRatePerVbyte?: number, network?: bitcoinjs-lib#Network, noDeadlineFeeRatePerVbyte?: number): channel.ChannelResult
 method channel.ChannelManager.forgetPreimage(paymentHash: Buffer, held: ReadonlyArray<{ channelId: Buffer; htlcId: bigint; }>): boolean
 method channel.ChannelManager.forgetUnsentSplice(channelId: Buffer, reason: string): channel.ChannelResult
 method channel.ChannelManager.fulfillHtlc(channelId: Buffer, htlcId: bigint, preimage: Buffer): channel.ChannelResult
@@ -1458,12 +1458,12 @@ method channel.ChannelManager.provideSpliceExternalWitness(channelId: Buffer, pr
 method channel.ChannelManager.provideTxSignatures(channelId: Buffer, txid: Buffer, outputIndex: number, witnesses: Buffer[][]): channel.ChannelResult
 method channel.ChannelManager.provideV2ExternalWitness(channelId: Buffer, prevTxid: Buffer, prevOutputIndex: number, witness: Buffer[]): channel.ChannelResult
 method channel.ChannelManager.quoteCooperativeClose(channelId: Buffer, scriptPubkey: Buffer, acceptStaleStateRisk?: boolean): chain.ICooperativeCloseQuote
-method channel.ChannelManager.reCpfpStuckCommitments(blockHeight: number, feeRatePerVbyte: number): void
+method channel.ChannelManager.reCpfpStuckCommitments(blockHeight: number, feeRatePerVbyte: number, noDeadlineFeeRatePerVbyte?: number): void
 method channel.ChannelManager.reannounceChannel(channelId: Buffer): void
-method channel.ChannelManager.rearmCommitmentCpfp(channelId: Buffer, feeRatePerVbyte: number): void
+method channel.ChannelManager.rearmCommitmentCpfp(channelId: Buffer, feeRatePerVbyte: number, noDeadlineFeeRatePerVbyte?: number): void
 method channel.ChannelManager.reauthorizeFundingBroadcast(channelId: Buffer): boolean
 method channel.ChannelManager.reauthorizeSpliceBroadcast(channelId: Buffer): boolean
-method channel.ChannelManager.rebuildForceCloseCommitment(channelId: Buffer, feeRatePerVbyte: number): { ok: boolean; tx?: Buffer; error?: string; retryable?: boolean; }
+method channel.ChannelManager.rebuildForceCloseCommitment(channelId: Buffer, feeRatePerVbyte: number, noDeadlineFeeRatePerVbyte?: number): { ok: boolean; tx?: Buffer; error?: string; retryable?: boolean; }
 method channel.ChannelManager.recordAuxiliaryHtlcDecision(channelId: Buffer, htlcId: bigint, outcome: 'settle' | 'fail', preimage?: Buffer): boolean
 method channel.ChannelManager.recordPreimage(paymentHash: Buffer, preimage: Buffer): void
 method channel.ChannelManager.releaseCompositeSpliceCommitment(channelId: Buffer): channel.ChannelResult

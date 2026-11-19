@@ -2670,6 +2670,32 @@ describe('Lightning Node', function () {
 			expect((node2 as any).resolveForceCloseFeeRatePerVbyte()).to.equal(10);
 		});
 
+		it('resolves the live rate itself for a force close with no HTLC on the commitment', function () {
+			const node = createNode(3) as unknown as {
+				feeAdvisor: { recordSample(rate: number): void };
+				resolveForceCloseFeeRatePerVbyte(): number;
+				resolveNoDeadlineFeeRatePerVbyte(): number;
+			};
+			// No fee data: the same fallback as the deadline rate.
+			expect(node.resolveNoDeadlineFeeRatePerVbyte()).to.equal(10);
+
+			// Nothing has a deadline, so neither the urgency multiplier nor the
+			// floor applies: a quiet mempool's 1 sat/vB is bid as 1, while the
+			// deadline rate of the same node stays at its floor.
+			node.feeAdvisor.recordSample(1);
+			expect(node.resolveNoDeadlineFeeRatePerVbyte()).to.equal(1);
+			expect(node.resolveForceCloseFeeRatePerVbyte()).to.equal(10);
+
+			// A fractional sample is rounded up, never down.
+			node.feeAdvisor.recordSample(2.2);
+			expect(node.resolveNoDeadlineFeeRatePerVbyte()).to.equal(3);
+
+			// A spike is followed as it is, below the deadline rate's 1.5 times.
+			node.feeAdvisor.recordSample(50);
+			expect(node.resolveNoDeadlineFeeRatePerVbyte()).to.equal(50);
+			expect(node.resolveForceCloseFeeRatePerVbyte()).to.equal(75);
+		});
+
 		it('should re-emit ChannelManager errors as node:error', function () {
 			const node = createNode(1);
 			const errors: ILightningError[] = [];
