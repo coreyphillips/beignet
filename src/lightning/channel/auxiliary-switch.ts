@@ -21,6 +21,9 @@ export const auxiliaryChannelOpens = { enabled: true };
  * nothing. Step 2 of the issue runs behind it: a bitcoin HTLC whose next
  * hop is a short channel id the host claims, or an asset channel the onion
  * names, forwarded over that asset channel with the records the host made.
+ * So does step 3: an HTLC that came in on an asset channel with units,
+ * forwarded over the ordinary channel the onion names when the host's
+ * value for it covers the amount to forward and the node's fee.
  * Tests turn it on to reach that; nothing else may, and the package does
  * not export it.
  */

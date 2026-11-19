@@ -3,10 +3,13 @@
  * about when it is to forward one and either leg is an asset leg, what the
  * host may answer, and what the host is told when each leg ends.
  *
- * Declared and not run. This build calls neither `prepareForward` nor
- * `onForwardLegResolved`: a node refuses every forward with an asset leg
- * before anything is offered, whatever hooks its host supplies, and
- * `AUXILIARY_CHANNELS_API.declared` names the part. The contract in full,
+ * Declared, and run only behind a switch that stays off in every build
+ * (`auxiliaryForwards`, auxiliary-switch.ts): with it off, as it is, a node
+ * calls neither `prepareForward` nor `onForwardLegResolved` and refuses
+ * every forward with an asset leg before anything is offered, whatever
+ * hooks its host supplies, and `AUXILIARY_CHANNELS_API.declared` names the
+ * part. The steps of the issue run behind it until the one that turns it
+ * on. The contract in full,
  * with what the engine checks whatever the host answers, is in
  * docs/EXTENSIONS.md, under "Forwards with an asset leg".
  *

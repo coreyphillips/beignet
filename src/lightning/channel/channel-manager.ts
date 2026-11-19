@@ -12107,13 +12107,70 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		if (!channel || !peerPubkey) return false;
 		if (channel.forwardAsked(htlcId)) return true;
 		if (!channel.markForwardAsked(htlcId)) return false;
-		try {
-			this.persistence.persist({ channel, peerPubkey, channelId });
-		} catch {
+		if (!this._persistCommitted(channel, peerPubkey, channelId)) {
 			channel.unmarkForwardAsked(htlcId);
 			return false;
 		}
 		return true;
+	}
+
+	/**
+	 * Issue #2098: write down, with the row of the channel an asset HTLC came
+	 * in on, what the node decided for it as the incoming leg of a forward:
+	 * to settle it, with the preimage the outgoing leg gave up, or to fail
+	 * it. Written as soon as the node knows, and before the forward's link
+	 * goes, so that a claim on the chain is made by it (a monitor of an asset
+	 * channel takes a preimage only for an HTLC whose settle is decided) and
+	 * a restart drives the HTLC to it and never forwards it again. True once
+	 * the row says so, or when the same decision stands already; false, with
+	 * nothing kept, when the channel has no asset state or does not hold the
+	 * HTLC, when the preimage is not the HTLC's, when the other decision
+	 * stands, and when the row was not committed.
+	 *
+	 * The row is written here and now, with whatever the node has staged
+	 * for its next write, so this is not for a caller that stages records
+	 * it may still take back.
+	 */
+	recordForwardDecision(
+		channelId: Buffer,
+		htlcId: bigint,
+		outcome: 'settle' | 'fail',
+		preimage?: Buffer
+	): boolean {
+		const hex = channelId.toString('hex');
+		const channel = this.channels.get(hex);
+		const peerPubkey = this.channelPeers.get(hex);
+		if (!channel || !peerPubkey) return false;
+		const standing = channel.auxiliaryHtlcDecision(htlcId);
+		if (!channel.recordAuxiliaryHtlcDecision(htlcId, outcome, preimage)) {
+			return false;
+		}
+		if (standing) return true;
+		if (!this._persistCommitted(channel, peerPubkey, channelId)) {
+			channel.dropAuxiliaryHtlcDecision(htlcId);
+			return false;
+		}
+		return true;
+	}
+
+	/**
+	 * Write a channel's row and answer whether the write is durable: a
+	 * persistence that throws, and one that answers not committed, have kept
+	 * nothing.
+	 */
+	private _persistCommitted(
+		channel: Channel,
+		peerPubkey: string,
+		channelId: Buffer
+	): boolean {
+		try {
+			return (
+				this.persistence.persist({ channel, peerPubkey, channelId })
+					?.committed === true
+			);
+		} catch {
+			return false;
+		}
 	}
 
 	/** Whether the node wrote that it asks its host about forwarding this received HTLC. */
