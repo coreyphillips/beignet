@@ -253,7 +253,10 @@ export interface IAuxiliaryChannelConfig {
 	 * before anything is offered; the answer is kept with the forward and is
 	 * not asked again on a reestablish or after a restart, except when the
 	 * node stopped before it was kept, so the host answers a second ask about
-	 * an HTLC as it answered the first. One of three answers:
+	 * an HTLC as it answered the first. When the forward no longer passes the
+	 * checks made before the ask, the node does not ask again and tells
+	 * `onForwardLegResolved` the outgoing leg was never offered. One of three
+	 * answers:
 	 *
 	 * - The host's terms: the forward goes on if every check of the node's
 	 *   own passes, and is failed back otherwise.
