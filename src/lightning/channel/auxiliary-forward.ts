@@ -62,9 +62,10 @@ export interface IAuxiliaryForwardRequest {
 	/** The expiry the onion asks of the outgoing HTLC, a block height. */
 	outgoingCltvExpiry: number;
 	/**
-	 * The channel of the node that `shortChannelId` names, by its real id or
-	 * an alias. Absent when the node has none: the forward then goes on only
-	 * over an asset channel the host names for the id.
+	 * The channel of the node that `shortChannelId` names, by an alias or, when
+	 * its type lacks `option_scid_alias`, by its real id. Absent when the node
+	 * has none: the forward then goes on only over an asset channel the host
+	 * names for the id.
 	 */
 	outgoing?: IAuxiliaryForwardChannel;
 }
