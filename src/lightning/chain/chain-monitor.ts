@@ -98,6 +98,15 @@ export class ChainMonitor {
 	 * fresh chain evidence.
 	 */
 	private _commitmentReverifyPending = false;
+	/**
+	 * Issue #2098, step 5: a restored commitment record that is not final has
+	 * not been reported again by this session's funding watch. Its height is
+	 * kept, but it is not taken as depth for failing a forward back
+	 * (offeredAuxiliaryHtlcAbsent) until the chain says it again: a
+	 * reorganisation while the node was down may have put another commitment
+	 * in its place. Not persisted, for the same reason as the flag above.
+	 */
+	private _commitmentDepthUnverified = false;
 
 	constructor(
 		channelState: IChannelState,
@@ -518,6 +527,18 @@ export class ChainMonitor {
 			}
 			monitor._commitmentReverifyPending = true;
 		}
+		// Issue #2098, step 5: the height of any other commitment that is not
+		// final is kept as it is, and used for everything it was used for
+		// before; only a forward's fail back waits for this session's watch to
+		// say it again (offeredAuxiliaryHtlcAbsent).
+		if (
+			monitor._state !== MonitorState.FULLY_RESOLVED &&
+			monitor._commitmentBroadcast &&
+			monitor._commitmentBroadcast.commitmentType !==
+				CommitmentType.COOPERATIVE_CLOSE
+		) {
+			monitor._commitmentDepthUnverified = true;
+		}
 		// Restore known preimages if present
 		if (saved.knownPreimages) {
 			for (const [hash, preimage] of Object.entries(saved.knownPreimages)) {
@@ -703,6 +724,7 @@ export class ChainMonitor {
 		// window the restore reset opened: every arm below either binds a height,
 		// demotes on a competing spend, or replaces the record outright.
 		this._commitmentReverifyPending = false;
+		this._commitmentDepthUnverified = false;
 		if (this._state !== MonitorState.WATCHING) {
 			// Commitment SWAP: a DIFFERENT tx now spends the funding output. The
 			// funding outpoint can only be spent once per chain, so a confirmed
@@ -2892,6 +2914,57 @@ export class ChainMonitor {
 			...(broadcast.auxiliaryAbsentHtlcsRecorded ?? []),
 			key
 		];
+	}
+
+	/**
+	 * Issue #2098, step 5: whether the spend of a tracked HTLC output shows
+	 * the preimage of its payment hash. Undefined while the spending
+	 * transaction is not held, which only the monitor of an asset channel
+	 * keeps: an unknown answer proves nothing either way.
+	 */
+	spendShowsPreimage(output: ITrackedOutput): boolean | undefined {
+		const own = this._trackedOutputs.find(
+			(tracked) =>
+				tracked.txid === output.txid &&
+				tracked.outputIndex === output.outputIndex
+		);
+		return own ? this._spendShowsPreimage(own) : undefined;
+	}
+
+	/**
+	 * Issue #2098, step 5: whether an HTLC with units this node offered on an
+	 * asset channel is on no output of the commitment that confirmed, and not
+	 * fulfilled, that commitment at least `depth` blocks deep at a height
+	 * this session's watch has reported. The peer can never claim such an
+	 * HTLC while that commitment stands. With a revoked commitment of the
+	 * peer that is every such HTLC the channel holds
+	 * (_auxiliaryAbsentHtlcEndings).
+	 */
+	offeredAuxiliaryHtlcAbsent(htlcId: bigint, depth: number): boolean {
+		const broadcast = this._commitmentBroadcast;
+		if (
+			!broadcast ||
+			!this._channelState.auxiliaryState ||
+			this._commitmentDepthUnverified ||
+			broadcast.blockHeight <= 0 ||
+			this._currentBlockHeight - broadcast.blockHeight < depth
+		) {
+			return false;
+		}
+		const type = broadcast.commitmentType;
+		if (
+			type !== CommitmentType.OUR_COMMITMENT &&
+			type !== CommitmentType.THEIR_CURRENT_COMMITMENT &&
+			type !== CommitmentType.THEIR_REVOKED_COMMITMENT
+		) {
+			return false;
+		}
+		return this._auxiliaryAbsentHtlcEndings(broadcast, true).some(
+			(ending) =>
+				ending.offered &&
+				ending.htlcId === htlcId &&
+				ending.outcome === 'failed'
+		);
 	}
 
 	private _handleCooperativeClose(actions: ChainAction[]): ChainAction[] {

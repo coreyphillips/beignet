@@ -31,6 +31,7 @@ import {
 	HtlcDirection
 } from '../../src/lightning/channel/types';
 import { Feature, FeatureFlags } from '../../src/lightning/features/flags';
+import { ASSET_FORWARD_MIN_CLTV_DELTA } from '../../src/lightning/node/lightning-node';
 import { PaymentStatus } from '../../src/lightning/node/types';
 import {
 	INCORRECT_CLTV_EXPIRY,
@@ -145,6 +146,8 @@ interface IOptions {
 	switchOff?: boolean;
 	/** Carol announced that she accepts no HTLC on the outgoing channel. */
 	peerTakesNone?: boolean;
+	/** Bob's policy names this CLTV delta for the outgoing channel. */
+	outPolicyDelta?: number;
 }
 
 interface IResult {
@@ -317,6 +320,11 @@ describe('an asset HTLC forwarded out over another asset channel (issue #2098, s
 							: (): undefined => undefined
 				}
 			);
+		}
+		if (options.outPolicyDelta !== undefined) {
+			bob.node.setChannelPolicy(context.outChannel, {
+				cltvExpiryDelta: options.outPolicyDelta
+			});
 		}
 		if (options.peerTakesNone) {
 			(
@@ -887,8 +895,10 @@ describe('an asset HTLC forwarded out over another asset channel (issue #2098, s
 				{
 					next: refusal.next,
 					answer: refusal.answer,
+					// 50 blocks over the outgoing expiry: above the floor of a
+					// forward with an asset leg, under the policy's 60.
 					...(refusal.failure === INCORRECT_CLTV_EXPIRY
-						? { forwardCltv: 220 }
+						? { forwardCltv: 190, outPolicyDelta: 60 }
 						: {})
 				}
 			);
@@ -913,6 +923,21 @@ describe('an asset HTLC forwarded out over another asset channel (issue #2098, s
 			}
 		});
 	}
+
+	it(`refuses a forward with fewer than ${ASSET_FORWARD_MIN_CLTV_DELTA} blocks between its expiries with incorrect_cltv_expiry, named or by a quote, before the host is asked, whatever the policy allows (step 5)`, async () => {
+		for (const next of ['alias', 'quote'] as const) {
+			const result = await run(`aux-fwd-a2a-floor-${next}`, {
+				next,
+				forwardCltv: 220,
+				outPolicyDelta: 10,
+				answer: (request, context) => terms(request, context)
+			});
+			refused(result, INCORRECT_CLTV_EXPIRY);
+			expect(result.asked).to.deep.equal([]);
+			expect(result.told).to.deep.equal([]);
+			expect(result.offered).to.equal(0n);
+		}
+	});
 
 	it('asks again about an HTLC it had marked as asked before a stop, named or by a quote, while the forward passes the checks made before the ask', async () => {
 		forwarded(
