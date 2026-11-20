@@ -1497,15 +1497,50 @@ export interface ForwardingEventInfo {
 	outChannelId: ChannelIdHex;
 	inScid?: string;
 	outScid?: string;
+	/**
+	 * What the incoming leg was worth. For a forward with an asset leg the
+	 * host's value of an incoming asset leg, never its carrier.
+	 */
 	amountInMsat: string;
+	/**
+	 * What the outgoing leg was worth. For a forward with an asset leg the
+	 * amount the onion asked the node to forward, never a carrier.
+	 */
 	amountOutMsat: string;
 	feeMsat: string;
+	/**
+	 * True on a forward with an asset leg (issue #2098, step 7), and absent
+	 * on every other. Its amounts are then what its legs were worth, the
+	 * reverse of a payment's (whose amountSats is the carrier and
+	 * auxiliaryValueSats the worth), and no bitcoin total counts it.
+	 */
+	auxiliary?: true;
+	/** The units the incoming HTLC carried: an incoming asset leg only. */
+	inAuxiliaryAmount?: string;
+	/** The bitcoin the incoming HTLC carried on the wire, its carrier: an incoming asset leg only. */
+	inWireAmountMsat?: string;
+	/** The units the outgoing HTLC carried: an outgoing asset leg only. */
+	outAuxiliaryAmount?: string;
+	/** The bitcoin the outgoing HTLC carried on the wire, its carrier: an outgoing asset leg only. */
+	outWireAmountMsat?: string;
+	/** The next hop the onion named, hex: for a forward by a quote, the short channel id the host claimed. */
+	nextHopScid?: string;
 }
 
 export interface ForwardingSummaryInfo {
+	/** Ordinary forwards: a forward with an asset leg counts in `auxiliary`. */
 	count: number;
 	volumeOutMsat: string;
 	feesEarnedMsat: string;
+	/**
+	 * The same totals over the forwards with an asset leg (issue #2098,
+	 * step 7), at what their legs were worth. Present only when there is one.
+	 */
+	auxiliary?: {
+		count: number;
+		volumeOutMsat: string;
+		feesEarnedMsat: string;
+	};
 }
 
 export interface RouteEstimate {
@@ -1978,13 +2013,19 @@ export interface BeignetNodeEvents {
 		spliceTxid: TxidHex;
 		conflictTxid: TxidHex;
 	}) => void;
-	/** A forward through this node settled and earned feeMsat. Msat values are decimal strings. */
+	/** A forward through this node settled and earned feeMsat. Msat values are decimal strings. A forward with an asset leg (issue #2098, step 7) carries `auxiliary: true` and the fields of ForwardingEventInfo beside it, as strings. */
 	'htlc:forwarded': (data: {
 		inChannelId: ChannelIdHex;
 		outChannelId: ChannelIdHex;
 		amountInMsat: string;
 		amountOutMsat: string;
 		feeMsat: string;
+		auxiliary?: true;
+		inAuxiliaryAmount?: string;
+		inWireAmountMsat?: string;
+		outAuxiliaryAmount?: string;
+		outWireAmountMsat?: string;
+		nextHopScid?: string;
 	}) => void;
 	/** The outgoing channel refused to add a forward, so it was failed back to the sender with temporary_channel_failure. Someone else's payment was turned away, so it is not a `node:error`. `reason` is the channel's refusal text, `channelErrorCode` its code when it gave one (INSUFFICIENT_BALANCE, LIMIT_EXCEEDED, ...), `amountMsat` the amount it would have carried as a decimal string. */
 	'htlc:forward-refused': (data: {
@@ -1994,6 +2035,8 @@ export interface BeignetNodeEvents {
 		paymentHash: PaymentHashHex;
 		reason: string;
 		channelErrorCode?: ChannelErrorCode;
+		/** A forward with an asset leg (issue #2098, step 7). */
+		auxiliary?: true;
 	}) => void;
 	/** The peer fulfilled an HTLC this node offered: a part of its own payment or the outgoing leg of a forward. Raised once per HTLC: a reconnect or restart raises it again only when this node had not yet stored what the fulfil settled (the preimage, the forward or the payment record). */
 	'htlc:fulfilled': (data: { channelId: ChannelIdHex; htlcId: string }) => void;

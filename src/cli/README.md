@@ -940,7 +940,7 @@ and `remainingSats` subtracts it, so it is what the next payment can pass.
 |--------|---------|-------------|
 | `setDraining(enabled)` | `void` | Enable/disable drain mode. When enabled, every payment entry point (`payInvoice()`, `sendPaymentAsync()`, `sendKeysend()`, `payOffer()`) throws `SERVICE_DRAINING`. `payOffer()` re-checks after the invoice request, so a drain that starts during it still stops the payment. |
 | `isDraining()` | `boolean` | Whether the node is currently draining |
-| `hasPendingPayments()` | `boolean` | Whether there are in-flight payments |
+| `hasPendingPayments()` | `boolean` | Whether there are in-flight payments, or other work a drained stop waits for: a direct-funding send, a swap's funding, and on a node with asset channels a forward with an asset leg in flight or an end of one its host has not taken |
 
 #### Lifecycle
 
@@ -989,8 +989,8 @@ The table is generated from `BeignetNodeEvents` by `npm run docs:tables`. The SS
 | `channel-send:stage` | `(data: { id: string; compositeId?: string; stage: ChannelSendStage; txid?: TxidHex; reason?: string })` | yes | A channel send (issue #1922) reached a stage: a single-channel splice-out is STARTED, then LOCKED or ABORTED as its channel's splice completes or aborts; a composite reports its record's stage (PLANNED, NEGOTIATING, COMMITTED, PEERS_SIGNED, RELEASED, BROADCAST, LOCKED, ABORTED or CONFLICTED, with the reason), every stage from PLANNED on. `id` is the quote id the execute call returned, or the composite id for a composite restored without one; `txid` (display order) is the new funding transaction, for a composite from COMMITTED on. |
 | `splice:conflicted` | `(data: { channelId: ChannelIdHex; spliceTxid: TxidHex; conflictTxid: TxidHex; inputIndex: number; height: number })` | yes | An input of an in-flight splice that this node does not vouch for was spent by conflictTxid, confirmed six deep while the splice is not on chain: the splice can never confirm, and the peer is being asked to revert (issue #760). |
 | `splice:reverted` | `(data: { channelId: ChannelIdHex; spliceTxid: TxidHex; conflictTxid: TxidHex })` | yes | Both sides verified the conflict on their own chain view and returned to the pre-splice funding; the channel is NORMAL on the old outpoint (issue #760). |
-| `htlc:forwarded` | `(data: { inChannelId: ChannelIdHex; outChannelId: ChannelIdHex; amountInMsat: string; amountOutMsat: string; feeMsat: string })` | `htlcEvents` | A forward through this node settled and earned feeMsat. Msat values are decimal strings. |
-| `htlc:forward-refused` | `(data: { inChannelId: ChannelIdHex; outChannelId: ChannelIdHex; amountMsat: string; paymentHash: PaymentHashHex; reason: string; channelErrorCode?: ChannelErrorCode })` | yes | The outgoing channel refused to add a forward, so it was failed back to the sender with temporary_channel_failure. Someone else's payment was turned away, so it is not a `node:error`. `reason` is the channel's refusal text, `channelErrorCode` its code when it gave one (INSUFFICIENT_BALANCE, LIMIT_EXCEEDED, ...), `amountMsat` the amount it would have carried as a decimal string. |
+| `htlc:forwarded` | `(data: { inChannelId: ChannelIdHex; outChannelId: ChannelIdHex; amountInMsat: string; amountOutMsat: string; feeMsat: string; auxiliary?: true; inAuxiliaryAmount?: string; inWireAmountMsat?: string; outAuxiliaryAmount?: string; outWireAmountMsat?: string; nextHopScid?: string })` | `htlcEvents` | A forward through this node settled and earned feeMsat. Msat values are decimal strings. A forward with an asset leg (issue #2098, step 7) carries `auxiliary: true` and the fields of ForwardingEventInfo beside it, as strings. |
+| `htlc:forward-refused` | `(data: { inChannelId: ChannelIdHex; outChannelId: ChannelIdHex; amountMsat: string; paymentHash: PaymentHashHex; reason: string; channelErrorCode?: ChannelErrorCode; auxiliary?: true })` | yes | The outgoing channel refused to add a forward, so it was failed back to the sender with temporary_channel_failure. Someone else's payment was turned away, so it is not a `node:error`. `reason` is the channel's refusal text, `channelErrorCode` its code when it gave one (INSUFFICIENT_BALANCE, LIMIT_EXCEEDED, ...), `amountMsat` the amount it would have carried as a decimal string. |
 | `htlc:fulfilled` | `(data: { channelId: ChannelIdHex; htlcId: string })` | `htlcEvents` | The peer fulfilled an HTLC this node offered: a part of its own payment or the outgoing leg of a forward. Raised once per HTLC: a reconnect or restart raises it again only when this node had not yet stored what the fulfil settled (the preimage, the forward or the payment record). |
 | `htlc:failed` | `(data: { channelId: ChannelIdHex; htlcId: string })` | `htlcEvents` | The peer failed an HTLC this node offered: a part of its own payment or the outgoing leg of a forward. |
 | `peer:connect` | `(data: { pubkey: string })` | yes | A peer connected. |
@@ -2032,6 +2032,14 @@ fulfilled), with the fee earned per forward. Records persist in the node
 database (capped at 100k rows, oldest pruned first). Msat values are decimal
 strings. Failed forwards are not recorded.
 
+A forward with an asset leg (issue #2098) carries `"auxiliary":true`. Its
+amounts are what each leg was worth, never a carrier: the host's value of an
+incoming asset leg in, the amount the onion asked the node to forward out.
+`inAuxiliaryAmount` and `inWireAmountMsat`, `outAuxiliaryAmount` and
+`outWireAmountMsat` give the units and carrier of each asset leg, and
+`nextHopScid` the next hop the onion named. The summary counts such forwards
+apart, in `auxiliary`, so its bitcoin totals count ordinary forwards only.
+
 ```bash
 beignet forwards --since 1751000000000 --limit 50
 # {"ok":true,"result":[{"id":7,"settledAt":1751234567890,"inChannelId":"ab12...","outChannelId":"cd34...","amountInMsat":"5005000","amountOutMsat":"5000000","feeMsat":"5000"}]}
@@ -2868,8 +2876,8 @@ The matching commands are `wallet sweep-prepare <requestJson|requestFile>`, `wal
 | GET | `/can-send` | `?amountSats=<n>` | Check send capacity |
 | GET | `/can-receive` | `?amountSats=<n>` | Check receive capacity |
 | GET | `/payments` | `?status=&direction=&since=&limit=&offset=` | List payments (filterable), newest first. One page per call: `limit` defaults to and may not exceed 1000, so page with `offset`. Read through to the node database, so a completed or failed payment stays listed after the engine prunes its in-memory record (24 hours after completion); a database read that fails answers 500, never a shorter list. A PENDING row with `unresolved: { code: 'CHANNEL_OMITTED_AT_RESTORE', channelIds }` is a payment that had an HTLC on an asset channel a capsule restore left out: the wallet cannot learn whether it was paid, never reports it paid or failed, and does not send it again |
-| GET | `/forwards` | `?since=&until=&limit=&offset=&channelId=` | Settled forwards with fees earned (msat values as strings) |
-| GET | `/forwards/summary` | `?since=` | Forwarding totals: `{ count, volumeOutMsat, feesEarnedMsat }` |
+| GET | `/forwards` | `?since=&until=&limit=&offset=&channelId=` | Settled forwards with fees earned (msat values as strings); a forward with an asset leg is marked `auxiliary` |
+| GET | `/forwards/summary` | `?since=` | Forwarding totals over ordinary forwards: `{ count, volumeOutMsat, feesEarnedMsat }`, with `auxiliary` (the same totals over forwards with an asset leg) when there is one |
 | GET | `/invoices` | -- | List created invoices. `status` is `PAID` on a completed receive, from the in-memory record or the database row once the engine has pruned it, so a paid invoice never reads `EXPIRED` or `PENDING` later. An invoice that is not `PAID` carries the `unresolved` of its payment record when an HTLC of it was on an asset channel a capsule restore left out |
 | GET | `/channel` | `?channelId=<hex>` | Get channel (query param or body) |
 | GET | `/channel/health` | `?channelId=<hex>` | Channel health assessment with liquidity warnings |

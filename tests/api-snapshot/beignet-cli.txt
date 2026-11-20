@@ -540,8 +540,8 @@ property BeignetNodeEvents.'hold:accepted': (data: HoldInvoiceEvent) => void
 property BeignetNodeEvents.'hold:cancelled': (data: HoldInvoiceEvent & { reason: beignet/lightning#node.HoldCancelReason; }) => void
 property BeignetNodeEvents.'hold:settled': (data: HoldInvoiceEvent) => void
 property BeignetNodeEvents.'htlc:failed': (data: { channelId: ChannelIdHex; htlcId: string; }) => void
-property BeignetNodeEvents.'htlc:forward-refused': (data: { inChannelId: ChannelIdHex; outChannelId: ChannelIdHex; amountMsat: string; paymentHash: PaymentHashHex; reason: string; channelErrorCode?: beignet/lightning#channel.ChannelErrorCode; }) => void
-property BeignetNodeEvents.'htlc:forwarded': (data: { inChannelId: ChannelIdHex; outChannelId: ChannelIdHex; amountInMsat: string; amountOutMsat: string; feeMsat: string; }) => void
+property BeignetNodeEvents.'htlc:forward-refused': (data: { inChannelId: ChannelIdHex; outChannelId: ChannelIdHex; amountMsat: string; paymentHash: PaymentHashHex; reason: string; channelErrorCode?: beignet/lightning#channel.ChannelErrorCode; auxiliary?: true; }) => void
+property BeignetNodeEvents.'htlc:forwarded': (data: { inChannelId: ChannelIdHex; outChannelId: ChannelIdHex; amountInMsat: string; amountOutMsat: string; feeMsat: string; auxiliary?: true; inAuxiliaryAmount?: string; inWireAmountMsat?: string; outAuxiliaryAmount?: string; outWireAmountMsat?: string; nextHopScid?: string; }) => void
 property BeignetNodeEvents.'htlc:fulfilled': (data: { channelId: ChannelIdHex; htlcId: string; }) => void
 property BeignetNodeEvents.'invoice:settled': (data: { paymentHash: PaymentHashHex; bolt11: string; amountSats: number; auxiliary?: true; }) => void
 property BeignetNodeEvents.'jit:failed': (data: { scidHex?: string; channelIdHex?: string; parts: number; reason: string; }) => void
@@ -930,14 +930,21 @@ method FforReceiveService.stop(): void
 interface ForwardingEventInfo
 property ForwardingEventInfo.amountInMsat: string
 property ForwardingEventInfo.amountOutMsat: string
+property ForwardingEventInfo.auxiliary?: true
 property ForwardingEventInfo.feeMsat: string
 property ForwardingEventInfo.id: number
+property ForwardingEventInfo.inAuxiliaryAmount?: string
 property ForwardingEventInfo.inChannelId: ChannelIdHex
 property ForwardingEventInfo.inScid?: string
+property ForwardingEventInfo.inWireAmountMsat?: string
+property ForwardingEventInfo.nextHopScid?: string
+property ForwardingEventInfo.outAuxiliaryAmount?: string
 property ForwardingEventInfo.outChannelId: ChannelIdHex
 property ForwardingEventInfo.outScid?: string
+property ForwardingEventInfo.outWireAmountMsat?: string
 property ForwardingEventInfo.settledAt: number
 interface ForwardingSummaryInfo
+property ForwardingSummaryInfo.auxiliary?: { count: number; volumeOutMsat: string; feesEarnedMsat: string; }
 property ForwardingSummaryInfo.count: number
 property ForwardingSummaryInfo.feesEarnedMsat: string
 property ForwardingSummaryInfo.volumeOutMsat: string
