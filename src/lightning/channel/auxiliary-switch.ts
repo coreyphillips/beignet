@@ -23,7 +23,10 @@ export const auxiliaryChannelOpens = { enabled: true };
  * names, forwarded over that asset channel with the records the host made.
  * So does step 3: an HTLC that came in on an asset channel with units,
  * forwarded over the ordinary channel the onion names when the host's
- * value for it covers the amount to forward and the node's fee.
+ * value for it covers the amount to forward and the node's fee. And step
+ * 4: such an HTLC forwarded over another asset channel of the node, the
+ * one the onion names or the one the host names for a quote's short
+ * channel id, with the records the host made, on the same condition.
  * Tests turn it on to reach that; nothing else may, and the package does
  * not export it.
  */

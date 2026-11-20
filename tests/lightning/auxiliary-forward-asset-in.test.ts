@@ -27,11 +27,16 @@ import type {
 import type { IAuxiliaryChannelConfig } from '../../src/lightning/channel/auxiliary-funding';
 import { auxiliaryForwards } from '../../src/lightning/channel/auxiliary-switch';
 import { OutputType } from '../../src/lightning/chain/types';
-import { HtlcDirection } from '../../src/lightning/channel/types';
+import {
+	hasScidAliasChannelType,
+	HtlcDirection
+} from '../../src/lightning/channel/types';
+import { Feature, FeatureFlags } from '../../src/lightning/features/flags';
 import { PaymentStatus } from '../../src/lightning/node/types';
 import {
 	INCORRECT_CLTV_EXPIRY,
-	TEMPORARY_CHANNEL_FAILURE
+	TEMPORARY_CHANNEL_FAILURE,
+	UNKNOWN_NEXT_PEER
 } from '../../src/lightning/onion/types';
 import { amountRecord, hash } from './helpers/auxiliary-pair';
 import {
@@ -97,10 +102,12 @@ const valued = (
 /**
  * What the onion names as Bob's next hop: the ordinary channel by Bob's own
  * alias or by the one Carol gave it (the channel has no real id here, and
- * Bob's map holds both aliases), an id Bob has no channel for, or Bob's
- * asset channel with Alice.
+ * Bob's map holds both aliases), an id Bob has no channel for, Bob's asset
+ * channel with Alice (the one the HTLC came in on), an id the JIT receive
+ * minted, or the ordinary channel's real id once its type has
+ * option_scid_alias.
  */
-type Next = 'alias' | 'peer-alias' | 'unknown' | 'asset';
+type Next = 'alias' | 'peer-alias' | 'unknown' | 'asset' | 'jit' | 'real';
 
 interface IOptions {
 	/** Bob's host's prepareForward. Absent: the host supplies no forward hook. */
@@ -244,6 +251,38 @@ describe('an asset HTLC forwarded out over an ordinary channel (issue #2098, ste
 			.getFullState();
 		// The state is live: what it holds now is read now.
 		const outBalanceBefore = outBefore.localBalanceMsat;
+		if (options.next === 'real') {
+			// The ordinary channel's type with option_scid_alias, and the real
+			// short channel id a confirmed funding gives it: BOLT 2 forbids
+			// forwarding over such a channel by that id, so the node never put
+			// it in its map.
+			const state = outBefore as {
+				channelType: Buffer | null;
+				shortChannelId?: Buffer;
+			};
+			const type = FeatureFlags.fromBuffer(
+				state.channelType ?? Buffer.alloc(0)
+			);
+			type.setCompulsory(Feature.SCID_ALIAS);
+			state.channelType = type.toBuffer();
+			expect(hasScidAliasChannelType(state.channelType)).to.equal(true);
+			state.shortChannelId ??= Buffer.from('0dbba00000070000', 'hex');
+		}
+		if (options.next === 'jit') {
+			// A JIT receive that minted the short channel id the onion names.
+			const minted = QUOTE_SCID.toString('hex');
+			(
+				bob.node as unknown as { jitReceiveManager: unknown }
+			).jitReceiveManager = new Proxy(
+				{},
+				{
+					get: (_target, property): unknown =>
+						property === 'mintedScid'
+							? (scidHex: string): boolean => scidHex === minted
+							: (): undefined => undefined
+				}
+			);
+		}
 		const next = ((): Buffer => {
 			switch (options.next ?? 'alias') {
 				case 'alias':
@@ -259,10 +298,13 @@ describe('an asset HTLC forwarded out over an ordinary channel (issue #2098, ste
 					).to.not.equal(undefined);
 					return outBefore.remoteScidAlias!;
 				case 'unknown':
+				case 'jit':
 					return QUOTE_SCID;
 				case 'asset':
 					return bob.node.getAuxiliaryChannelInfo(context.assetChannel)!
 						.shortChannelId!;
+				case 'real':
+					return outBefore.shortChannelId!;
 			}
 		})();
 
@@ -527,14 +569,20 @@ describe('an asset HTLC forwarded out over an ordinary channel (issue #2098, ste
 
 	const NOT_ASKED: INotAsked[] = [
 		{
-			name: 'an asset channel of the node the onion names (asset in, asset out)',
+			// Asset in and asset out goes between two asset channels (step 4).
+			name: 'the asset channel the HTLC came in on',
 			options: { next: 'asset', answer: (request) => valued(request) },
 			failure: TEMPORARY_CHANNEL_FAILURE
 		},
 		{
-			name: 'a short channel id the node has no channel for',
-			options: { next: 'unknown', answer: (request) => valued(request) },
+			name: 'a short channel id the JIT receive minted',
+			options: { next: 'jit', answer: (request) => valued(request) },
 			failure: TEMPORARY_CHANNEL_FAILURE
+		},
+		{
+			name: 'the real short channel id of an ordinary channel whose type has option_scid_alias',
+			options: { next: 'real', answer: (request) => valued(request) },
+			failure: UNKNOWN_NEXT_PEER
 		},
 		{
 			name: 'a host without prepareForward',
@@ -666,6 +714,18 @@ describe('an asset HTLC forwarded out over an ordinary channel (issue #2098, ste
 			}
 		});
 	}
+
+	it("asks about a short channel id the node has no channel for, as a quote's that leads to an asset channel (step 4), and refuses terms that name none, telling the host", async () => {
+		const result = await run('aux-fwd-in-quote-terms', {
+			next: 'unknown',
+			answer: (request) => valued(request)
+		});
+		refused(result, TEMPORARY_CHANNEL_FAILURE);
+		expect(result.asked).to.have.length(1);
+		expect(result.asked[0].outgoing).to.equal(undefined);
+		toldNeverOffered(result);
+		expect(result.told[0].channelId).to.equal(undefined);
+	});
 
 	it('asks again about an HTLC it had marked as asked before a stop, while the forward passes the checks made before the ask', async () => {
 		const result = await run('aux-fwd-in-marked-asks', {

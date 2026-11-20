@@ -756,6 +756,21 @@ interface IAssetIncomingLeg {
 	/** The custom records it was added with. */
 	customRecords: Map<bigint, Buffer>;
 }
+
+/**
+ * Issue #2098: a host's terms for a forward as the node read them, or why
+ * they are refused (readForwardTerms).
+ */
+type IForwardTermsRead =
+	| {
+			outChannelId: Buffer;
+			outgoingHtlc?: {
+				customRecords: Map<bigint, Buffer>;
+				wireAmountMsat: bigint;
+			};
+			incomingValueMsat?: bigint;
+	  }
+	| { refused: string; channelId?: Buffer };
 /** Metadata key the receiver's async receive grants persist under. */
 const ASYNC_RECEIVE_GRANTS_KEY = 'async_receive_grants';
 /**
@@ -21274,10 +21289,11 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		// that is for this node and the host does not know is failed back too:
 		// nothing of an asset channel takes the ordinary final-hop path, and
 		// none takes the forwarding path but the one below. With the switch
-		// for asset forwards on (issue #2098, step 3), an HTLC that came in on
-		// an asset channel carrying units goes to handleForwardHtlc, which
-		// forwards it over an ordinary channel the onion names when the host's
-		// prepareForward values it; valueIncomingHtlc is never asked about it.
+		// for asset forwards on (issue #2098, steps 3 and 4), an HTLC that came
+		// in on an asset channel carrying units goes to handleForwardHtlc,
+		// which forwards it over an ordinary channel the onion names, or over
+		// another asset channel of the node, when the host's prepareForward
+		// values it; valueIncomingHtlc is never asked about it.
 		const carriesAssets = htlcEntry.auxiliaryAmount !== undefined;
 		const onAssetChannel = channel.getFullState().auxiliaryState !== undefined;
 		const assetForward =
@@ -27531,19 +27547,46 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		const scidHex = outgoingScid.toString('hex');
 		const outChannelId = peerChannelId ?? this.scidToChannelId.get(scidHex);
 		if (!outChannelId && assetIncoming) {
-			// Issue #2098, step 3: an incoming asset leg goes on only over an
-			// ordinary channel of this node that the onion names. A short
-			// channel id the node has no channel for, a JIT intercept id
-			// included, is refused before the intercept and without asking:
-			// one that stands for a quote of the host's leads to an asset
-			// channel (asset in, asset out), which is not forwarded yet.
-			this.emitStructuredLog('htlc', 'asset_forward_declined', {
-				paymentHash: paymentHash.toString('hex'),
-				inChannelId: inChannelId.toString('hex'),
-				inHtlcId: Number(inHtlcId),
-				reason: 'the onion names no channel of this node'
+			// Issue #2098, step 4: a short channel id no channel of this node
+			// has may be one its host gave a quote, in the hint of an asset
+			// invoice, standing for an asset channel (asset in, asset out). The
+			// host is asked. An incoming asset leg never goes to the JIT
+			// intercept: an id the JIT receive minted is refused, and the real
+			// id of a channel whose type has option_scid_alias fails
+			// unknown_next_peer as it always did, neither asked about.
+			if (this.jitReceiveManager?.mintedScid(scidHex) === true) {
+				this.emitStructuredLog('htlc', 'asset_forward_declined', {
+					paymentHash: paymentHash.toString('hex'),
+					inChannelId: inChannelId.toString('hex'),
+					inHtlcId: Number(inHtlcId),
+					reason: 'the onion names a short channel id of the JIT receive'
+				});
+				failIncoming(TEMPORARY_CHANNEL_FAILURE);
+				return;
+			}
+			if (this.isRealScidOfOwnChannel(outgoingScid)) {
+				failIncoming(UNKNOWN_NEXT_PEER);
+				return;
+			}
+			this.forwardAssetIntoAsset({
+				inChannelId,
+				inHtlcId,
+				paymentHash,
+				incomingAmountMsat,
+				incomingCltvExpiry,
+				incoming: assetIncoming,
+				forwardAmountMsat: forwardAmount,
+				forwardCltv,
+				shortChannelId: outgoingScid,
+				nextPacket,
+				failIncoming,
+				onMarked: () => {
+					marked = true;
+				},
+				onAsk: () => {
+					askSettled = true;
+				}
 			});
-			failIncoming(TEMPORARY_CHANNEL_FAILURE);
 			return;
 		}
 		if (!outChannelId) {
@@ -27606,26 +27649,32 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			failIncoming(UNKNOWN_NEXT_PEER);
 			return;
 		}
-		if (
+		const namesAssetChannel =
 			this.channelManager.getChannel(outChannelId)?.getFullState()
-				.auxiliaryState !== undefined
+				.auxiliaryState !== undefined;
+		if (
+			assetIncoming &&
+			namesAssetChannel &&
+			outChannelId.equals(inChannelId)
 		) {
-			assetChannelNamed = outChannelId;
-		}
-		if (assetIncoming && assetChannelNamed === undefined) {
-			ordinaryChannelNamed = outChannelId;
-		}
-		if (assetIncoming && assetChannelNamed !== undefined) {
-			// Issue #2098: asset in and asset out is not forwarded yet.
+			// Issue #2098, step 4: asset in and asset out goes between two asset
+			// channels of this node, never back over the channel the HTLC came
+			// in on.
 			this.emitStructuredLog('htlc', 'asset_forward_declined', {
 				paymentHash: paymentHash.toString('hex'),
 				inChannelId: inChannelId.toString('hex'),
 				inHtlcId: Number(inHtlcId),
 				outChannelId: outChannelId.toString('hex'),
-				reason: 'an asset HTLC is not forwarded over an asset channel'
+				reason: 'the onion names the asset channel the HTLC came in on'
 			});
 			failIncoming(TEMPORARY_CHANNEL_FAILURE);
 			return;
+		}
+		if (namesAssetChannel) {
+			assetChannelNamed = outChannelId;
+		}
+		if (assetIncoming && assetChannelNamed === undefined) {
+			ordinaryChannelNamed = outChannelId;
 		}
 		// The policy this forward must satisfy. A cleartext payer that is
 		// refused learns our current channel_update from the failure and
@@ -27703,6 +27752,36 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				failIncoming(FEE_INSUFFICIENT, { htlcMsat: incomingAmountMsat });
 				return;
 			}
+		}
+
+		// Issue #2098, step 4: an HTLC that came in on an asset channel with
+		// units, to go on over another asset channel the onion names. The
+		// checks that need no answer are made, the host is asked what the
+		// incoming HTLC is worth and for the records of the outgoing one, and
+		// the forward goes on when that value covers the amount to forward
+		// and the fee.
+		if (assetIncoming && assetChannelNamed !== undefined) {
+			this.forwardAssetIntoAsset({
+				inChannelId,
+				inHtlcId,
+				paymentHash,
+				incomingAmountMsat,
+				incomingCltvExpiry,
+				incoming: assetIncoming,
+				forwardAmountMsat: forwardAmount,
+				forwardCltv,
+				shortChannelId: outgoingScid,
+				named: outChannelId,
+				nextPacket,
+				failIncoming,
+				onMarked: () => {
+					marked = true;
+				},
+				onAsk: () => {
+					askSettled = true;
+				}
+			});
+			return;
 		}
 
 		// Issue #2098, step 3: an HTLC that came in on an asset channel with
@@ -28134,7 +28213,8 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	 * that came in on `inChannelId`. Only while the switch for asset forwards
 	 * is on, only of a host that supplies prepareForward, and only for an
 	 * HTLC that came in on a channel that is not an asset channel: a bitcoin
-	 * leg. An incoming asset leg is step 3's (assetInForwardable).
+	 * leg. An incoming asset leg takes its own path (assetInForwardable,
+	 * steps 3 and 4).
 	 */
 	private assetForwardAskable(inChannelId: Buffer): boolean {
 		return (
@@ -28339,10 +28419,19 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	 * undefined when it takes one: it takes new HTLCs, and the node offers no
 	 * more asset HTLCs on it than its own bound (maxHtlcs) and none while its
 	 * host has not taken the outcomes of earlier ones, as for the node's own
-	 * payments. The peer's limits, the reserve, the carrier and the units are
-	 * the channel's own checks of the add.
+	 * payments. With `forwardCltv`, the channel's own checks of an add that
+	 * need no answer are made too, at the least carrier the channel takes
+	 * (the larger dust limit, and the peer's minimum): whatever carrier the
+	 * host makes is at least that, and every other check of the amount only
+	 * tightens as it grows, so an HTLC refused here would be refused at the
+	 * add (the peer's max_accepted_htlcs, its bound on value in flight, the
+	 * reserve, the expiry). The carrier the host makes, its records and the
+	 * units are the channel's own checks of the add.
 	 */
-	private assetForwardChannelRefusal(channelId: Buffer): string | undefined {
+	private assetForwardChannelRefusal(
+		channelId: Buffer,
+		forwardCltv?: number
+	): string | undefined {
 		const channel = this.channelManager.getChannel(channelId);
 		const state = channel?.getFullState();
 		if (!channel || !state?.auxiliaryState) {
@@ -28359,6 +28448,27 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		const undelivered = state.auxiliaryState.resolvedHtlcs?.size ?? 0;
 		if (undelivered > ChannelManager.AUXILIARY_MAX_UNDELIVERED_OUTCOMES) {
 			return `the outgoing channel holds ${undelivered} outcomes of asset HTLCs that its host has not taken`;
+		}
+		if (forwardCltv !== undefined) {
+			const dustMsat =
+				(state.localConfig.dustLimitSatoshis >
+				state.remoteConfig.dustLimitSatoshis
+					? state.localConfig.dustLimitSatoshis
+					: state.remoteConfig.dustLimitSatoshis) * 1000n;
+			const leastCarrierMsat =
+				dustMsat > state.remoteConfig.htlcMinimumMsat
+					? dustMsat
+					: state.remoteConfig.htlcMinimumMsat;
+			const admission = channel.validateOutgoingHtlc(
+				leastCarrierMsat > 0n ? leastCarrierMsat : 1n,
+				forwardCltv
+			);
+			if (admission.length > 0) {
+				const first = admission[0] as { message?: string };
+				return `the outgoing asset channel does not take the HTLC: ${
+					first.message ?? 'refused'
+				}`;
+			}
 		}
 		return undefined;
 	}
@@ -28409,21 +28519,30 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	 * the request has no `outgoing` (`named`): an asset channel of this node
 	 * with the peer it names. A bitcoin leg calls for neither of its own.
 	 * Returns the outgoing channel with what the legs called for, or the
-	 * reason the terms are refused.
+	 * reason the terms are refused. An answer that throws while it is read
+	 * (a getter, a proxy) is terms the node cannot read, refused as any
+	 * malformed terms are: the host answered, so it is told.
 	 */
 	private readForwardTerms(
 		answer: IAuxiliaryForwardTerms,
 		legs: { named?: Buffer; incomingAsset: boolean; outgoingAsset: boolean }
-	):
-		| {
-				outChannelId: Buffer;
-				outgoingHtlc?: {
-					customRecords: Map<bigint, Buffer>;
-					wireAmountMsat: bigint;
-				};
-				incomingValueMsat?: bigint;
-		  }
-		| { refused: string; channelId?: Buffer } {
+	): IForwardTermsRead {
+		try {
+			return this.readForwardTermsOf(answer, legs);
+		} catch (err) {
+			return {
+				refused: `the terms could not be read: ${
+					err instanceof Error ? err.message : String(err)
+				}`,
+				channelId: legs.named
+			};
+		}
+	}
+
+	private readForwardTermsOf(
+		answer: IAuxiliaryForwardTerms,
+		legs: { named?: Buffer; incomingAsset: boolean; outgoingAsset: boolean }
+	): IForwardTermsRead {
 		const named = legs.named;
 		if (answer === null || typeof answer !== 'object') {
 			return { refused: 'the answer is not terms', channelId: named };
@@ -28564,7 +28683,10 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			});
 		};
 		if (ctx.named) {
-			const refusal = this.assetForwardChannelRefusal(ctx.named);
+			const refusal = this.assetForwardChannelRefusal(
+				ctx.named,
+				ctx.forwardCltv
+			);
 			if (refusal) {
 				log(refusal);
 				ctx.failIncoming(TEMPORARY_CHANNEL_FAILURE);
@@ -28673,7 +28795,10 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			// The policy of the channel the host named, as for any forward:
 			// a quote cannot lower the CLTV delta, and the incoming leg pays
 			// the node's fee on the amount to forward.
-			const refusal = this.assetForwardChannelRefusal(terms.outChannelId);
+			const refusal = this.assetForwardChannelRefusal(
+				terms.outChannelId,
+				ctx.forwardCltv
+			);
 			if (refusal) {
 				refuseAfterTerms(refusal, TEMPORARY_CHANNEL_FAILURE);
 				return;
@@ -28703,7 +28828,44 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				return;
 			}
 		}
+		this.addForwardOverAssetChannel(ctx, terms);
+	}
 
+	/**
+	 * Issue #2098: add the outgoing HTLC of a forward over an asset channel,
+	 * with the host's records and carrier and the link to the incoming HTLC,
+	 * once every check before it has passed (forwardOverAssetChannel, step
+	 * 2; forwardAssetIntoAsset, step 4).
+	 *
+	 * The link and the add are one write: the link is staged beside the add
+	 * and commits with it. A refused add takes the staged link back before
+	 * anything is flushed, so no link row is ever written for an HTLC id the
+	 * channel did not use, for a later HTLC of that id to inherit. Only when
+	 * a write inside the add took the link already is its delete staged with
+	 * the failure. Then the incoming HTLC fails back, and the host, which
+	 * answered with terms, is told the outgoing leg was never offered.
+	 */
+	private addForwardOverAssetChannel(
+		ctx: {
+			inChannelId: Buffer;
+			inHtlcId: bigint;
+			paymentHash: Buffer;
+			incomingAmountMsat: bigint;
+			incomingCltvExpiry: number;
+			forwardAmountMsat: bigint;
+			forwardCltv: number;
+			nextPacket: IHeldJitPart['nextPacket'];
+			failIncoming: (
+				failureCode: number,
+				fields?: { htlcMsat?: bigint; cltvExpiry?: number }
+			) => boolean;
+		},
+		terms: {
+			outChannelId: Buffer;
+			customRecords: Map<bigint, Buffer>;
+			wireAmountMsat: bigint;
+		}
+	): void {
 		const outChannelId = terms.outChannelId;
 		const outChannel = this.channelManager.getChannel(outChannelId)!;
 		const outHtlcId = outChannel.getFullState().localHtlcCounter;
@@ -28712,36 +28874,44 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			inChannelId: ctx.inChannelId,
 			inHtlcId: ctx.inHtlcId
 		});
+		// The host's records and carrier stay with the outgoing HTLC, which
+		// the link ties to the incoming one.
+		const link: RecoveryMutation = {
+			type: 'forwarded_htlc',
+			outKey,
+			inChannelId: ctx.inChannelId,
+			inHtlcId: ctx.inHtlcId
+		};
 		let result: ChannelResult | null = null;
-		// The link and the outgoing add are one staged write, as for every
-		// forward: the host's records and carrier stay with the outgoing HTLC,
-		// which the link ties to the incoming one.
-		this.withStagedMutations(
-			[
+		let linkWritten = !!this.recovery;
+		if (linkWritten) this.stagedMutations.push(link);
+		try {
+			result = this.channelManager.addHtlc(
+				outChannelId,
+				terms.wireAmountMsat,
+				ctx.paymentHash,
+				ctx.forwardCltv,
+				encodeOnionPacket(ctx.nextPacket),
+				undefined,
+				undefined,
 				{
-					type: 'forwarded_htlc',
-					outKey,
-					inChannelId: ctx.inChannelId,
-					inHtlcId: ctx.inHtlcId
+					emitRefusal: false,
+					customRecords: terms.customRecords,
+					expectedHtlcId: outHtlcId
 				}
-			],
-			() => {
-				result = this.channelManager.addHtlc(
-					outChannelId,
-					terms.wireAmountMsat,
-					ctx.paymentHash,
-					ctx.forwardCltv,
-					encodeOnionPacket(ctx.nextPacket),
-					undefined,
-					undefined,
-					{
-						emitRefusal: false,
-						customRecords: terms.customRecords,
-						expectedHtlcId: outHtlcId
+			);
+		} finally {
+			if (linkWritten) {
+				if (!result?.ok) {
+					const at = this.stagedMutations.indexOf(link);
+					if (at !== -1) {
+						this.stagedMutations.splice(at, 1);
+						linkWritten = false;
 					}
-				);
+				}
+				this.flushStagedMutations();
 			}
-		);
+		}
 		const part: IHeldJitPart = {
 			inChannelId: ctx.inChannelId,
 			inHtlcId: ctx.inHtlcId,
@@ -28757,14 +28927,19 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			// Refused by the channel: nothing was offered. The link goes with
 			// it, the incoming HTLC fails back, and the host hears of it.
 			this.forwardedHtlcs.delete(outKey);
-			this.withStagedMutations(
-				[{ type: 'delete_forwarded_htlc', outKey }],
-				() => {
-					if (!ctx.failIncoming(TEMPORARY_CHANNEL_FAILURE)) {
-						this.jitReceiveManager?.owedUpstreamFailure(part);
-					}
+			const failBack = (): void => {
+				if (!ctx.failIncoming(TEMPORARY_CHANNEL_FAILURE)) {
+					this.jitReceiveManager?.owedUpstreamFailure(part);
 				}
-			);
+			};
+			if (linkWritten) {
+				this.withStagedMutations(
+					[{ type: 'delete_forwarded_htlc', outKey }],
+					failBack
+				);
+			} else {
+				failBack();
+			}
 			this.reportForwardRefused(
 				outChannelId,
 				part,
@@ -28785,6 +28960,227 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			ctx.forwardAmountMsat,
 			ctx.paymentHash
 		);
+	}
+
+	/**
+	 * Issue #2098, step 4: forward an HTLC that came in on an asset channel
+	 * carrying units over another asset channel of this node, with the
+	 * records and carrier its host made, when the host values the incoming
+	 * HTLC at no less than the amount to forward and this node's fee on it.
+	 * `named` is the asset channel the onion names; absent, the onion names
+	 * a short channel id this node has no channel for, which the host may
+	 * claim as one of its quotes, naming the asset channel it stands for.
+	 * Neither carrier is taken for what its HTLC is worth: a value short of
+	 * the fee answers temporary_channel_failure, never fee_insufficient.
+	 *
+	 * The checks that need no answer come first (for a named channel, those
+	 * of assetForwardChannelRefusal; the CLTV delta was judged before). Then
+	 * the node writes that it asks, with the incoming asset channel's row,
+	 * asks once, outside any storage transaction, and reads the answer as the
+	 * contract says: exactly incomingValueMsat and outgoingHtlc, with
+	 * outgoingChannel for a quote. A quote may not lead back over the channel
+	 * the HTLC came in on. The outgoing HTLC is then added with the link to
+	 * the incoming one in one write (addForwardOverAssetChannel). A host that
+	 * answered with terms is told when the forward is refused after that; one
+	 * that threw or answered undefined is told nothing.
+	 */
+	private forwardAssetIntoAsset(ctx: {
+		inChannelId: Buffer;
+		inHtlcId: bigint;
+		paymentHash: Buffer;
+		/** The incoming HTLC's carrier. */
+		incomingAmountMsat: bigint;
+		incomingCltvExpiry: number;
+		incoming: IAssetIncomingLeg;
+		forwardAmountMsat: bigint;
+		forwardCltv: number;
+		shortChannelId: Buffer;
+		named?: Buffer;
+		nextPacket: IHeldJitPart['nextPacket'];
+		failIncoming: (
+			failureCode: number,
+			fields?: { htlcMsat?: bigint; cltvExpiry?: number }
+		) => boolean;
+		/** Called once the incoming HTLC's row says the node asks. */
+		onMarked: () => void;
+		/** Called as the host is asked: what happens after is the ask's own. */
+		onAsk: () => void;
+	}): void {
+		const log = (reason: string, outChannelId = ctx.named): void => {
+			this.emitStructuredLog('htlc', 'asset_forward_declined', {
+				paymentHash: ctx.paymentHash.toString('hex'),
+				inChannelId: ctx.inChannelId.toString('hex'),
+				inHtlcId: Number(ctx.inHtlcId),
+				...(outChannelId ? { outChannelId: outChannelId.toString('hex') } : {}),
+				reason
+			});
+		};
+		if (ctx.named) {
+			const refusal = this.assetForwardChannelRefusal(
+				ctx.named,
+				ctx.forwardCltv
+			);
+			if (refusal) {
+				log(refusal);
+				ctx.failIncoming(TEMPORARY_CHANNEL_FAILURE);
+				return;
+			}
+		}
+		if (!this.channelManager.recordForwardAsk(ctx.inChannelId, ctx.inHtlcId)) {
+			log('the incoming channel could not write that its host is asked');
+			ctx.failIncoming(TEMPORARY_CHANNEL_FAILURE);
+			return;
+		}
+		ctx.onMarked();
+		const request: IAuxiliaryForwardRequest = {
+			paymentHash: Buffer.from(ctx.paymentHash),
+			incoming: {
+				channelId: Buffer.from(ctx.inChannelId),
+				peerPubkey:
+					this.channelManager.getPeerForChannel(ctx.inChannelId) ?? '',
+				htlcId: ctx.inHtlcId,
+				wireAmountMsat: ctx.incomingAmountMsat,
+				cltvExpiry: ctx.incomingCltvExpiry,
+				auxiliaryAmount: ctx.incoming.auxiliaryAmount,
+				customRecords: copyCustomRecords(ctx.incoming.customRecords)!,
+				auxiliaryChannel: true
+			},
+			shortChannelId: Buffer.from(ctx.shortChannelId),
+			amountToForwardMsat: ctx.forwardAmountMsat,
+			outgoingCltvExpiry: ctx.forwardCltv,
+			...(ctx.named
+				? {
+						outgoing: {
+							channelId: Buffer.from(ctx.named),
+							peerPubkey:
+								this.channelManager.getPeerForChannel(ctx.named) ?? '',
+							auxiliaryChannel: true
+						}
+				  }
+				: {})
+		};
+		ctx.onAsk();
+		let answer: IAuxiliaryForwardTerms | undefined;
+		try {
+			answer = this.auxiliaryChannels!.prepareForward!(request);
+		} catch (err) {
+			log(
+				`the host refused the forward: ${
+					err instanceof Error ? err.message : String(err)
+				}`
+			);
+			ctx.failIncoming(TEMPORARY_CHANNEL_FAILURE);
+			return;
+		}
+		if (
+			answer !== undefined &&
+			answer !== null &&
+			typeof (answer as { then?: unknown }).then === 'function'
+		) {
+			// The hook is synchronous: a promise is refused as a throw is.
+			(answer as unknown as Promise<unknown>).catch?.(() => undefined);
+			log('the host answered with a promise');
+			ctx.failIncoming(TEMPORARY_CHANNEL_FAILURE);
+			return;
+		}
+		if (answer === undefined) {
+			// Not the host's: a forward with an asset leg is refused, also to
+			// a short channel id the host does not know.
+			log('the host does not take the forward');
+			ctx.failIncoming(TEMPORARY_CHANNEL_FAILURE);
+			return;
+		}
+		const read = this.readForwardTerms(answer, {
+			named: ctx.named,
+			incomingAsset: true,
+			outgoingAsset: true
+		});
+		if ('refused' in read) {
+			log(`the terms are refused: ${read.refused}`, read.channelId);
+			ctx.failIncoming(TEMPORARY_CHANNEL_FAILURE);
+			this.tellForwardNeverOffered(
+				ctx.paymentHash,
+				ctx.inChannelId,
+				ctx.inHtlcId,
+				read.channelId
+			);
+			return;
+		}
+		const outChannelId = read.outChannelId;
+		const refuseAfterTerms = (
+			reason: string,
+			failureCode: number,
+			fields?: { htlcMsat?: bigint; cltvExpiry?: number }
+		): void => {
+			log(reason, outChannelId);
+			ctx.failIncoming(failureCode, fields);
+			this.tellForwardNeverOffered(
+				ctx.paymentHash,
+				ctx.inChannelId,
+				ctx.inHtlcId,
+				outChannelId
+			);
+		};
+		const outPolicy = this.getForwardingPolicyForChannel(outChannelId);
+		if (!ctx.named) {
+			// A quote leads to another asset channel of this node, never back
+			// over the one the HTLC came in on, and the forward passes the
+			// policy of the channel the host named, as any forward does.
+			if (outChannelId.equals(ctx.inChannelId)) {
+				refuseAfterTerms(
+					'outgoingChannel is the asset channel the HTLC came in on',
+					TEMPORARY_CHANNEL_FAILURE
+				);
+				return;
+			}
+			const refusal = this.assetForwardChannelRefusal(
+				outChannelId,
+				ctx.forwardCltv
+			);
+			if (refusal) {
+				refuseAfterTerms(refusal, TEMPORARY_CHANNEL_FAILURE);
+				return;
+			}
+			if (
+				ctx.incomingCltvExpiry <
+				ctx.forwardCltv + outPolicy.cltvExpiryDelta
+			) {
+				refuseAfterTerms(
+					"the incoming expiry is short of the outgoing channel's CLTV delta",
+					INCORRECT_CLTV_EXPIRY,
+					{ cltvExpiry: ctx.forwardCltv }
+				);
+				return;
+			}
+		}
+		// The incoming leg is worth what its host values it at, never its
+		// carrier, and the outgoing leg the amount to forward, whatever it
+		// carries on the wire.
+		const requiredFee = LightningNode.requiredForwardingFeeMsat(
+			outPolicy,
+			ctx.forwardAmountMsat
+		);
+		if (
+			read.incomingValueMsat === undefined ||
+			read.incomingValueMsat < ctx.forwardAmountMsat + requiredFee
+		) {
+			refuseAfterTerms(
+				"the incoming HTLC's value does not cover the amount to forward and the outgoing channel's fee",
+				TEMPORARY_CHANNEL_FAILURE
+			);
+			return;
+		}
+		if (!read.outgoingHtlc) {
+			refuseAfterTerms(
+				'the terms carry no outgoing HTLC',
+				TEMPORARY_CHANNEL_FAILURE
+			);
+			return;
+		}
+		this.addForwardOverAssetChannel(ctx, {
+			outChannelId,
+			...read.outgoingHtlc
+		});
 	}
 
 	/**
@@ -29045,7 +29441,9 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		// on and the records its host made (issue #2098, step 2), never
 		// through here; an HTLC that came in on an asset channel comes here
 		// only from forwardAssetIntoBitcoin, with that switch on and its
-		// host's value of it covering the forward and the fee (step 3).
+		// host's value of it covering the forward and the fee (step 3). One
+		// that goes on over another asset channel takes
+		// addForwardOverAssetChannel, never this method (step 4).
 		if (
 			outChannel?.getFullState().auxiliaryState ||
 			(this.channelManager.getChannel(part.inChannelId)?.getFullState()
@@ -30097,8 +30495,23 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		// Issue #2098: an incoming leg that came in on an asset channel has its
 		// decision to fail written with that channel first, so a failure the
 		// channel does not take is driven from that record after a restart.
+		// The first decision stands: one to settle, written when a preimage
+		// of the hash was learned (on the chain, for another part of the same
+		// payment), is carried out instead, and the HTLC is never failed.
 		const assetIn = this.isAssetIncomingLeg(forward);
 		if (assetIn) {
+			const standing = this.channelManager.auxiliaryHtlcDecision(
+				forward.inChannelId,
+				forward.inHtlcId
+			);
+			if (standing?.outcome === 'settle') {
+				return this.settleForwardUpstream(
+					outKey,
+					forward,
+					standing.preimage,
+					sha256(standing.preimage)
+				);
+			}
 			this.channelManager.recordForwardDecision(
 				forward.inChannelId,
 				forward.inHtlcId,
@@ -35422,6 +35835,30 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				if (outgoingFailed && !errored) {
 					// Safe: complete the failure upstream off-chain.
 					const htlcSecretKey = `${channelId.toString('hex')}:${htlc.id}`;
+					// Issue #2098: the incoming leg of a forward that came in on an
+					// asset channel goes back through the forward's own path,
+					// which writes its decision first and lets the link go only
+					// with the failure the channel takes.
+					const forward = this.forwardedHtlcs.get(outKey);
+					if (state.auxiliaryState !== undefined && forward) {
+						const sharedSecret =
+							this.receivedHtlcSharedSecrets.get(htlcSecretKey);
+						this.failForwardUpstream(
+							outKey,
+							forward,
+							Buffer.from(outKey.split(':')[0], 'hex'),
+							BigInt(outKey.split(':offered-')[1]),
+							sharedSecret
+								? createFailureMessage(
+										sharedSecret,
+										EXPIRY_TOO_SOON,
+										this.updateFlaggedFailureData(EXPIRY_TOO_SOON)
+								  )
+								: Buffer.alloc(FAILURE_MESSAGE_LENGTH),
+							true
+						);
+						continue;
+					}
 					const blindedRole = this.blindedRoleFor(channelId, htlc.id);
 					if (blindedRole) {
 						this.failBlindedIncomingHtlc(channelId, htlc.id, blindedRole);
