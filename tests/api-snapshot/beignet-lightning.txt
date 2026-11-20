@@ -1428,6 +1428,7 @@ method channel.ChannelManager.fforSetupTimeout(channelId: Buffer): channel.Chann
 method channel.ChannelManager.fforSync(channelId: Buffer): channel.ChannelResult
 method channel.ChannelManager.fforWitnessAcked(channelId: Buffer, mailboxId: Buffer, retentionUntil: number): channel.ChannelResult
 method channel.ChannelManager.fixedOutputFeeNeed(): { spends: number; revoked: number; }
+method channel.ChannelManager.fixedOutputFeesWaiting(): boolean
 method channel.ChannelManager.forceClose(channelId: Buffer, destinationScript: Buffer, feeRatePerVbyte?: number, network?: bitcoinjs-lib#Network, noDeadlineFeeRatePerVbyte?: number): channel.ChannelResult
 method channel.ChannelManager.forgetPreimage(paymentHash: Buffer, held: ReadonlyArray<{ channelId: Buffer; htlcId: bigint; }>): boolean
 method channel.ChannelManager.forgetUnsentSplice(channelId: Buffer, reason: string): channel.ChannelResult
@@ -1722,6 +1723,7 @@ method channel.IAuxiliaryChannelConfig.onHtlcResolved?(context: Omit<channel.IAu
 method channel.IAuxiliaryChannelConfig.openingCsvPolicy?(peerPubkey: string): channel.IAuxiliaryOpeningCsvPolicy | undefined
 method channel.IAuxiliaryChannelConfig.prepareForward?(request: channel.IAuxiliaryForwardRequest): channel.IAuxiliaryForwardTerms | undefined
 property channel.IAuxiliaryChannelConfig.provider: channel.IChannelAuxiliaryProvider
+property channel.IAuxiliaryChannelConfig.requireFeeCoinsToSettle?: boolean
 method channel.IAuxiliaryChannelConfig.resolveIncoming(peerPubkey: string, temporaryChannelId: Buffer): channel.IAuxiliaryFundingDescriptor | undefined
 method channel.IAuxiliaryChannelConfig.valueIncomingHtlc?(context: channel.IAuxiliaryIncomingHtlc): bigint | undefined
 interface channel.IAuxiliaryChannelHtlc
@@ -10129,7 +10131,7 @@ class wallet.FixedOutputFeeError extends Error
 constructor wallet.FixedOutputFeeError(code: wallet.FixedOutputFeeErrorCode, remedy: wallet.FixedOutputFeeRemedy, message: string)
 readonly property wallet.FixedOutputFeeError.code: wallet.FixedOutputFeeErrorCode
 readonly property wallet.FixedOutputFeeError.remedy: wallet.FixedOutputFeeRemedy
-type wallet.FixedOutputFeeErrorCode = 'FEE_PREPARATION_PENDING' | 'FEE_PREPARATION_NOT_PUBLISHED' | 'FEE_WALLET_TIMEOUT' | 'FEE_WALLET_UNAVAILABLE' | 'FEE_RESERVATION_REFUSED' | 'FEE_BUDGET_EXHAUSTED' | 'FEE_FUNDS_UNAVAILABLE' | 'FEE_ACTION_CAP_EXHAUSTED' | 'FEE_PREPARATION_FEE_EXCEEDS_CAP' | 'FEE_PREPARATION_SIGNING_FAILED' | 'FEE_POLICY_REFUSED' | 'FEE_ACTION_RETIRED' | 'FEE_INPUT_UNAVAILABLE'
+type wallet.FixedOutputFeeErrorCode = 'FEE_PREPARATION_PENDING' | 'FEE_PREPARATION_NOT_PUBLISHED' | 'FEE_WALLET_TIMEOUT' | 'FEE_WALLET_UNAVAILABLE' | 'FEE_RESERVATION_REFUSED' | 'FEE_BUDGET_EXHAUSTED' | 'FEE_FUNDS_UNAVAILABLE' | 'FEE_ACTION_CAP_EXHAUSTED' | 'FEE_PREPARATION_FEE_EXCEEDS_CAP' | 'FEE_PREPARATION_SIGNING_FAILED' | 'FEE_POLICY_REFUSED' | 'FEE_ACTION_RETIRED' | 'FEE_INPUT_UNAVAILABLE' | 'FEE_COINS_SHORT'
 class wallet.FixedOutputFeePreparationPendingError extends wallet.FixedOutputFeeError
 constructor wallet.FixedOutputFeePreparationPendingError(transactionId: string)
 readonly property wallet.FixedOutputFeePreparationPendingError.transactionId: string
@@ -10156,6 +10158,7 @@ property wallet.IFixedOutputFeePoolState.feeCoins: { ready: number; readySatoshi
 property wallet.IFixedOutputFeePoolState.lastRefusal?: { code: wallet.FixedOutputFeeErrorCode; remedy: wallet.FixedOutputFeeRemedy; at: number; deadlineHeight?: number; }
 property wallet.IFixedOutputFeePoolState.policy?: { maxFeeSatoshis: bigint; maxTotalFeeSatoshis: bigint; maxPreparationFeeSatoshis: bigint; feeCoinCount: number; preparationFeeRatePerVbyte: number; }
 property wallet.IFixedOutputFeePoolState.preparation: { possible: boolean; forFeeSatoshis: bigint; neededSatoshis: bigint; largestConfirmedSatoshis: bigint; reason?: 'FEE_FUNDS_UNAVAILABLE' | 'FEE_BUDGET_EXHAUSTED'; splitCoins: number; }
+property wallet.IFixedOutputFeePoolState.reserve?: { coinSatoshis: bigint; ratePerVbyte: number; need: number; revoked: number; fundable: number; shortfall: number; }
 property wallet.IFixedOutputFeePoolState.splits: Array<{ state: 'unsigned' | 'signed' | 'published'; transactionId?: string; feeSatoshis: bigint; feeCoins: number; feeCoinSatoshis: bigint; }>
 interface wallet.IFixedOutputFeePoolUnavailable
 property wallet.IFixedOutputFeePoolUnavailable.available: false

@@ -189,7 +189,7 @@ describe('fee coins kept for spends with a deadline: on the chain (#2098 step 6)
 		);
 	});
 
-	it('a node that forwards asks for the fee input of an HTLC timeout only 6 blocks before it can confirm, and then waits while the coins ready are kept for its spends with a deadline', async () => {
+	it('a node that forwards asks for the fee input of an HTLC timeout only 6 blocks before it can confirm, and then pays it with coins it prepared ahead', async () => {
 		const { pair, asks, offered, settled, timeoutAt } = await staged(
 			'reserve-forwarding',
 			true
@@ -205,9 +205,46 @@ describe('fee coins kept for spends with a deadline: on the chain (#2098 step 6)
 		const near = timeoutAt - FIXED_OUTPUT_FEE_TIMING.noDeadlineAskBlocks;
 		while (pair.chain.height < near - 1) await world.mine(pair, 1);
 		expect(askedFor(offered)).to.deep.equal([]);
-		await world.mine(pair, 2);
-		// Near its height it would take a coin, while the two HTLCs Bob has
-		// not settled may still need theirs: it waits for more coins.
+		await world.mine(pair, 3);
+		expect(askedFor(offered).length).to.be.greaterThan(0);
+		const funded = trackedOutputs(pair.bob, pair.channelId).find(
+			(output) =>
+				output.txid === offered.txid &&
+				output.outputIndex === offered.outputIndex
+		)!;
+		expect(funded.auxiliaryFeeWait).to.equal(undefined);
+	});
+
+	it('a node that forwards keeps a spend without a deadline waiting while the coins ready, as its pool reports them, would not pay for its spends with a deadline', async () => {
+		const { pair, asks, offered, timeoutAt } = await staged(
+			'reserve-kept',
+			true
+		);
+		// The pool reports no coin ready, whatever it holds.
+		const provider = (
+			pair.bob.node as unknown as { fundingProvider: WalletFundingProvider }
+		).fundingProvider;
+		const status = provider.getFixedOutputFeeStatus.bind(provider);
+		provider.getFixedOutputFeeStatus = (
+			forFee?: bigint
+		): ReturnType<typeof status> => {
+			const real = status(forFee);
+			return real?.available
+				? {
+						...real,
+						feeCoins: {
+							...real.feeCoins,
+							ready: 0,
+							readySatoshis: 0n,
+							readyCoinSatoshis: []
+						}
+				  }
+				: real;
+		};
+		const near = timeoutAt - FIXED_OUTPUT_FEE_TIMING.noDeadlineAskBlocks;
+		while (pair.chain.height < near + 1) await world.mine(pair, 1);
+		// Two HTLCs Bob has not settled may still need a claim each: the
+		// timeout waits for coins beyond theirs, and asks the pool nothing.
 		const waiting = trackedOutputs(pair.bob, pair.channelId).find(
 			(output) =>
 				output.txid === offered.txid &&
@@ -215,5 +252,8 @@ describe('fee coins kept for spends with a deadline: on the chain (#2098 step 6)
 		)!;
 		expect(waiting.auxiliaryFeeWait?.code).to.equal('FEE_KEPT_FOR_DEADLINES');
 		expect(waiting.status).to.equal(OutputStatus.CONFIRMED);
+		expect(
+			asks.filter((ask) => ask.feeActionId === actionOf(pair, offered))
+		).to.deep.equal([]);
 	});
 });

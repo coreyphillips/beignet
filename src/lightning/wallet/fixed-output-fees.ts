@@ -72,7 +72,8 @@ export type FixedOutputFeeErrorCode =
 	| 'FEE_PREPARATION_SIGNING_FAILED'
 	| 'FEE_POLICY_REFUSED'
 	| 'FEE_ACTION_RETIRED'
-	| 'FEE_INPUT_UNAVAILABLE';
+	| 'FEE_INPUT_UNAVAILABLE'
+	| 'FEE_COINS_SHORT';
 
 /**
  * Every refusal of the pool that is not a fault. `code` is stable, and
@@ -229,6 +230,23 @@ export interface IFixedOutputFeePoolState {
 		 * at most); 0 when no split is possible.
 		 */
 		splitCoins: number;
+	};
+	/**
+	 * Given by a node that forwards asset HTLCs (issue #2098, step 6), not
+	 * by the pool: the fee coins it keeps for the spends of its asset
+	 * channels' outputs that have a deadline. `coinSatoshis` is the size of
+	 * such a coin at `ratePerVbyte`, `need` how many such spends the coins
+	 * must cover now (`revoked` of them penalties), `fundable` how many the
+	 * coins ready pay for with whole coins at that rate, and `shortfall` the
+	 * difference when the coins fall short.
+	 */
+	reserve?: {
+		coinSatoshis: bigint;
+		ratePerVbyte: number;
+		need: number;
+		revoked: number;
+		fundable: number;
+		shortfall: number;
 	};
 	/**
 	 * The refusal the most recent refused selection of this provider ended

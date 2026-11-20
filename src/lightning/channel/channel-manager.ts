@@ -97,6 +97,7 @@ import {
 	ChainActionType,
 	CommitmentType,
 	IRREVOCABLE_DEPTH,
+	OutputStatus,
 	OutputType,
 	FIXED_OUTPUT_FEE_TIMING,
 	fixedOutputFeeWaitMakesDeadline,
@@ -13737,6 +13738,33 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			need.spends += state.htlcs.size;
 		}
 		return need;
+	}
+
+	/**
+	 * Issue #2098, step 6: whether a spend of an asset channel's output is
+	 * being given fee coins now, or asked for them and waits for the pool
+	 * (a wait whose remedy is `wait`, such as a split on its way). A spend
+	 * that leaves the coins kept for the spends with a deadline alone
+	 * (FEE_KEPT_FOR_DEADLINES), and one whose wait is for the operator or
+	 * past its deadline, does not make the node's preparation wait.
+	 */
+	fixedOutputFeesWaiting(): boolean {
+		if (this.fixedOutputFeesBusy.size > 0) return true;
+		for (const monitor of this.monitors.values()) {
+			for (const output of monitor.getTrackedOutputs?.() ?? []) {
+				const wait = output.auxiliaryFeeWait;
+				if (
+					wait &&
+					wait.remedy === 'wait' &&
+					wait.code !== 'FEE_KEPT_FOR_DEADLINES' &&
+					output.status !== OutputStatus.SPEND_CONFIRMED &&
+					output.status !== OutputStatus.IRREVOCABLY_RESOLVED
+				) {
+					return true;
+				}
+			}
+		}
+		return false;
 	}
 
 	/**

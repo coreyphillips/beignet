@@ -235,7 +235,10 @@ describe('a forward with an asset leg on the chain (issue #2098, step 5)', funct
 				name === 'bob' ? options.bobCoinSatoshis ?? 100_000 : 100_000;
 			for (let i = 0; i < coins; i++) w.wallets[name]!.fund(value);
 		}
-		await world.mine(w, 1);
+		// Of the fixed mode, Bob prepares the fee coins he keeps for his spends
+		// with a deadline in a block, and they confirm in the next (#2098
+		// step 6): a forward goes on only once they are ready.
+		await world.mine(w, options.fixed ? 3 : 1);
 		if (options.policyDelta !== undefined) {
 			w.hosts.bob.node.setChannelPolicy(w.outChannel, {
 				cltvExpiryDelta: options.policyDelta
@@ -1180,7 +1183,8 @@ describe('a forward with an asset leg on the chain (issue #2098, step 5)', funct
 				).to.equal(true);
 			}
 			for (const value of options.bobCoins) w.wallets.bob!.fund(value);
-			await world.mine(w, 1);
+			// Bob prepares his fee coins in a block and they confirm in the next.
+			await world.mine(w, 3);
 			const s: IScene = {
 				w,
 				held: undefined as unknown as IForwardPayment,
@@ -1214,7 +1218,7 @@ describe('a forward with an asset leg on the chain (issue #2098, step 5)', funct
 		for (const shape of SHAPES) {
 			it(`${named(
 				shape
-			)}: with a wallet coin a split makes four fee coins of, the forward goes on`, async () => {
+			)}: with a wallet coin Bob prepares four fee coins from, the forward goes on`, async () => {
 				const s = await feeScene(`fwd-fee-ok-${shape.join('-')}`, shape, {
 					bobCoins: [100_000]
 				});
@@ -1224,7 +1228,7 @@ describe('a forward with an asset leg on the chain (issue #2098, step 5)', funct
 
 			it(`${named(
 				shape
-			)}: with no fee coin ready and none a split could make, the forward is refused with temporary_channel_failure before the host is asked`, async () => {
+			)}: with no wallet coin to prepare fee coins from, the forward is refused with temporary_channel_failure before the host is asked`, async () => {
 				const s = await feeScene(`fwd-fee-none-${shape.join('-')}`, shape, {
 					bobCoins: []
 				});
@@ -1235,16 +1239,20 @@ describe('a forward with an asset leg on the chain (issue #2098, step 5)', funct
 					s.logs.some(
 						(line) =>
 							line.startsWith('asset_forward_declined') &&
-							line.includes('the fee coin pool can pay for 0 spends')
+							line.includes('the fee coins ready pay for 0 spends')
 					),
 					s.logs.join(' | ')
 				).to.equal(true);
 			});
 		}
 
-		it('bitcoin in, asset out: with a wallet coin one split makes one fee coin of, the first forward goes on and a second one while it is in flight is refused before the host is asked', async () => {
+		// A coin Bob keeps for a spend with a deadline is 3080 sat at the
+		// node's fallback rate of 10 sat/vB ((240 + 68) vB), and a split may
+		// pay 5000 sat: a wallet coin of 9000 sat makes one of them, and one
+		// of 12000 sat makes two.
+		it('bitcoin in, asset out: with a wallet coin Bob prepares one fee coin from, the first forward goes on and a second one while it is in flight is refused before the host is asked', async () => {
 			const s = await feeScene('fwd-fee-one', ['ordinary', 'asset'], {
-				bobCoins: [30_000]
+				bobCoins: [9_000]
 			});
 			s.held = await send(s, 'fwd-fee-one-a');
 			expect(s.asked).to.have.length(1);
@@ -1257,14 +1265,14 @@ describe('a forward with an asset leg on the chain (issue #2098, step 5)', funct
 
 		it('asset in, asset out: a forward takes a fee coin for each of its asset HTLCs, so one coin refuses it and two let the first through and refuse a second while it is in flight', async () => {
 			const one = await feeScene('fwd-fee-two-of-one', ['asset', 'asset'], {
-				bobCoins: [30_000]
+				bobCoins: [9_000]
 			});
 			one.held = await send(one, 'fwd-fee-two-of-one', false);
 			expect(one.asked).to.deep.equal([]);
 			expect(paymentOf(one)).to.equal(PaymentStatus.FAILED);
 			world.dispose();
 			const two = await feeScene('fwd-fee-two', ['asset', 'asset'], {
-				bobCoins: [50_000]
+				bobCoins: [12_000]
 			});
 			two.held = await send(two, 'fwd-fee-two-a');
 			expect(two.asked).to.have.length(1);
@@ -1275,10 +1283,13 @@ describe('a forward with an asset leg on the chain (issue #2098, step 5)', funct
 			).to.equal(PaymentStatus.FAILED);
 		});
 
-		it('asset in, asset out: a fee budget without room for two spends at the cap refuses the forward before the host is asked', async () => {
+		// Two spends at the size of a kept coin (3080 sat) and one cap of
+		// 20000 sat: 26160 sat, over what a budget of 25000 sat has left once
+		// Bob's split is paid.
+		it('asset in, asset out: a fee budget without room for its spends at the size of a kept coin and one cap refuses the forward before the host is asked', async () => {
 			const s = await feeScene('fwd-fee-budget', ['asset', 'asset'], {
 				bobCoins: [100_000],
-				policy: { maxTotalFeeSatoshis: 40_000n }
+				policy: { maxTotalFeeSatoshis: 25_000n }
 			});
 			s.held = await send(s, 'fwd-fee-budget', false);
 			expect(s.asked).to.deep.equal([]);

@@ -222,6 +222,17 @@ export interface IAuxiliaryChannelConfig {
 	 * touched.
 	 */
 	maxHtlcs?: number;
+	/**
+	 * Issue #2098, step 6: on a node that forwards asset HTLCs, take an asset
+	 * HTLC that ends at this node only while the fee coins it keeps ready
+	 * would pay to claim it on the chain with every other spend with a
+	 * deadline it has. A payment of one HTLC is then failed back on arrival
+	 * with temporary_node_failure, and settleHeldHtlc refuses a hold invoice
+	 * with FEE_COINS_SHORT and keeps its parts held. Off when left out: such
+	 * an HTLC is taken as before, and a shortfall shows in
+	 * getFixedOutputFeeStatus().reserve.
+	 */
+	requireFeeCoinsToSettle?: boolean;
 	provider: IChannelAuxiliaryProvider;
 	/**
 	 * Asked, before the node settles it and outside any storage
