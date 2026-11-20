@@ -709,6 +709,7 @@ npm run test:cli           # 2400+ CLI + daemon unit tests (parallel), no infras
 npm run test:conformance   # 300+ official BOLT vector cases (subset of test:lightning)
 npm run test:chaos         # recovery kill matrices (parallel), split out of test:lightning
 npm run test:sigkill       # process-level SIGKILL chaos matrix (builds dist first)
+npm run test:full-channel  # an asset channel full of HTLCs on the chain, 20 each way (minutes a case), split out of test:lightning
 npm run test:api           # exported API vs tests/api-snapshot (npm run api:snapshot regenerates it)
 npm run test:direct-funding # standalone payer SDK, wallet adapters and packaging
 npm run test:direct-funding:regtest # real Core wallets and funding transactions (needs Docker)

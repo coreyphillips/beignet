@@ -1526,7 +1526,11 @@ describe('Asset payments (issue #2093, step 8)', function () {
 				// Issue #2098, step 5: forwards with an asset leg, and the coins
 				// a split of the fee coin pool would make.
 				'prepareForward',
-				'getFixedOutputFeeStatus:splitCoins'
+				'getFixedOutputFeeStatus:splitCoins',
+				// Issue #2098, step 6: what a node that forwards keeps for its
+				// spends with a deadline, and the host's opt-in at the settle.
+				'getFixedOutputFeeStatus:reserve',
+				'requireFeeCoinsToSettle'
 			]);
 			expect(Object.isFrozen(api)).to.equal(true);
 			expect(Object.isFrozen(api.surfaces)).to.equal(true);

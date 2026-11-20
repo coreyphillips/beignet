@@ -15,6 +15,10 @@ import type { IChannelState } from '../../src/lightning/channel/channel-state';
 import { ChannelState } from '../../src/lightning/channel/types';
 import { AuxiliaryPaymentError } from '../../src/lightning/node/types';
 import {
+	FixedOutputFeeBudgetExhaustedError,
+	FixedOutputFeeError
+} from '../../src/lightning/wallet/fixed-output-fees';
+import {
 	assetHost,
 	connectHosts,
 	reconnectHosts,
@@ -182,5 +186,96 @@ describe('asset channels: the HTLCs a channel carries at once', function () {
 			'ASSET_HTLC_LIMIT_REACHED'
 		);
 		expect(inFlight(pair.bob, pair)).to.equal(8);
+	});
+});
+
+describe('an asset channel whose bound above 8 the fee policy of a node that forwards cannot cover (#2098 step 6)', function () {
+	this.timeout(240_000);
+	withAssetOpens();
+	const world = assetChainWorld();
+	afterEach(() => world.dispose());
+	const valued = {
+		valueIncomingHtlc: (context: { auxiliaryAmount?: bigint }) =>
+			(context.auxiliaryAmount ?? 0n) * 1000n
+	} as Partial<IAuxiliaryChannelConfig>;
+	/** A host that takes forwards: one that supplies prepareForward. */
+	const forwarding = {
+		...valued,
+		prepareForward: (): undefined => undefined
+	} as Partial<IAuxiliaryChannelConfig>;
+	const refusal = (promise: Promise<unknown>): Promise<unknown> =>
+		promise.then(
+			() => undefined,
+			(error: unknown) => error
+		);
+
+	it('an open with maxHtlcs 20 is refused before anything is sent when the budget left cannot hold the channel full on the chain', async () => {
+		const error = await refusal(
+			world.open('aux-bound-budget', {
+				feeWallet: { alice: { maxTotalFeeSatoshis: 50_000n }, bob: true },
+				hooks: { alice: { ...forwarding, maxHtlcs: 20 }, bob: valued }
+			})
+		);
+		expect(error).to.be.instanceOf(FixedOutputFeeBudgetExhaustedError);
+		expect((error as FixedOutputFeeError).code).to.equal(
+			'FEE_BUDGET_EXHAUSTED'
+		);
+		expect((error as FixedOutputFeeError).remedy).to.equal('operator');
+	});
+
+	it('an open with maxHtlcs 20 is refused when a coin kept for a spend with a deadline is over the cap of one fee action', async () => {
+		const error = await refusal(
+			world.open('aux-bound-cap', {
+				feeWallet: { alice: { maxFeeSatoshis: 2_000n }, bob: true },
+				hooks: { alice: { ...forwarding, maxHtlcs: 20 }, bob: valued }
+			})
+		);
+		expect(error).to.be.instanceOf(FixedOutputFeeError);
+		expect((error as FixedOutputFeeError).code).to.equal(
+			'FEE_ACTION_CAP_EXHAUSTED'
+		);
+	});
+
+	it('a node that does not forward opens with maxHtlcs 10 as before, whatever its fee budget', async () => {
+		const pair = await world.open('aux-bound-wallet', {
+			feeWallet: { alice: { maxTotalFeeSatoshis: 50_000n }, bob: true },
+			hooks: { alice: { ...valued, maxHtlcs: 10 }, bob: valued }
+		});
+		expect(
+			pair.alice.node
+				.getChannelManager()
+				.getChannel(pair.channelId)!
+				.getFullState().localConfig.maxAcceptedHtlcs
+		).to.equal(10);
+	});
+
+	it('at 8 the same policy opens as before, and an accept above 8 is refused by the same rule before the host is asked', async () => {
+		const pair = await world.open('aux-bound-eight', {
+			feeWallet: { alice: true, bob: { maxTotalFeeSatoshis: 50_000n } },
+			hooks: { alice: valued, bob: forwarding }
+		});
+		const config = (
+			pair.bob.node.getChannelManager() as unknown as {
+				config: { auxiliaryOpenFeeRefusal?: () => Error | undefined };
+			}
+		).config;
+		expect(config.auxiliaryOpenFeeRefusal?.()).to.equal(undefined);
+		// Bob's host raises his bound: his next accept is refused.
+		(
+			pair.bob.node as unknown as {
+				auxiliaryChannels: Partial<IAuxiliaryChannelConfig>;
+			}
+		).auxiliaryChannels.maxHtlcs = 20;
+		const refused = config.auxiliaryOpenFeeRefusal?.();
+		expect(refused).to.be.instanceOf(FixedOutputFeeBudgetExhaustedError);
+		// And a node never refuses to start over it: it starts with its
+		// channel, which waits for its peer as any channel after a restart.
+		await world.restartAlice(pair, 'aux-bound-eight', undefined, undefined, {
+			...forwarding,
+			maxHtlcs: 20
+		});
+		expect(
+			pair.alice.node.getChannelManager().getChannel(pair.channelId)?.getState()
+		).to.equal(ChannelState.AWAITING_REESTABLISH);
 	});
 });

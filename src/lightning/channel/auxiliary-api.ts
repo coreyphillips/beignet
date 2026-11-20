@@ -68,7 +68,13 @@ export const AUXILIARY_CHANNELS_API = Object.freeze({
 		// forwardsInFlight and undeliveredForwardLegEnds.
 		'prepareForward',
 		// The pool's status says how many fee coins a split would make now.
-		'getFixedOutputFeeStatus:splitCoins'
+		'getFixedOutputFeeStatus:splitCoins',
+		// Issue #2098, step 6: a node that forwards keeps fee coins for its
+		// spends with a deadline and says so in getFixedOutputFeeStatus()
+		// .reserve; a host may have asset HTLCs that end at the node taken
+		// only while those coins would pay to claim them.
+		'getFixedOutputFeeStatus:reserve',
+		'requireFeeCoinsToSettle'
 	] as const),
 	// Nothing is declared and not run in this build.
 	declared: Object.freeze([] as const)

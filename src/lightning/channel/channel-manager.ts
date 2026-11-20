@@ -447,6 +447,12 @@ export interface IChannelManagerConfig {
 	 */
 	auxiliaryOpenRefusal?: Error;
 	/**
+	 * Issue #2098, step 6: asked at each incoming asset open, after
+	 * auxiliaryOpenRefusal: a refusal of the node's own when its fee policy
+	 * cannot cover the HTLCs a channel of its bound may hold on the chain.
+	 */
+	auxiliaryOpenFeeRefusal?: () => Error | undefined;
+	/**
 	 * What a peer advertised in its init, for the asset channel checks. A
 	 * node always supplies this, and with it an asset opening is refused
 	 * whenever the peer's features, or this node's own, cannot be read. A
@@ -5628,6 +5634,8 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		if (this.config.auxiliaryOpenRefusal) {
 			throw new AuxiliaryHostError(this.config.auxiliaryOpenRefusal);
 		}
+		const feeRefusal = this.config.auxiliaryOpenFeeRefusal?.();
+		if (feeRefusal) throw new AuxiliaryHostError(feeRefusal);
 		const config = this.config.auxiliaryChannels!;
 		const descriptor = askAuxiliaryHost(() => {
 			const answer = config.resolveIncoming(

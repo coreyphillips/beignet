@@ -109,12 +109,16 @@ import {
 	isGuardianRecoveryMode
 } from '../recovery/auxiliary-restore';
 import {
+	FixedOutputFeeBudgetExhaustedError,
 	FixedOutputFeeError,
 	fixedOutputFeePolicyRefusal
 } from '../wallet/fixed-output-fees';
 import type { ISpliceWalletInput } from '../channel/channel';
 import { Channel } from '../channel/channel';
-import { auxiliaryMaxHtlcs } from '../channel/auxiliary';
+import {
+	DEFAULT_AUXILIARY_MAX_HTLCS,
+	auxiliaryMaxHtlcs
+} from '../channel/auxiliary';
 import { countPendingHtlcs } from '../channel/htlc-policy';
 import { isValidShutdownScript } from '../channel/validation';
 import {
@@ -2305,6 +2309,8 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 						auxiliaryChannels: config.auxiliaryChannels,
 						auxiliaryPeerFeatures: (peerPubkey: string) =>
 							this.peerInitFeatures(peerPubkey),
+						auxiliaryOpenFeeRefusal: (): Error | undefined =>
+							this.auxiliaryOpenFeeRefusal(),
 						...(isGuardianRecoveryMode(config.recovery)
 							? { auxiliaryOpenRefusal: new AuxiliaryGuardianModeError() }
 							: feePolicyRefusal
@@ -29088,6 +29094,57 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		return !reserve || reserve.fundable < reserve.need;
 	}
 
+	/**
+	 * Issue #2098, step 6: on a node that forwards, the refusal of a new
+	 * asset channel, opened or accepted, whose HTLC bound the fee policy
+	 * cannot cover, for a host that set maxHtlcs above 8. A coin kept for a spend with a deadline must fit
+	 * the cap of one fee action, and the budget left must hold that channel
+	 * full on the chain: twice maxHtlcs such spends at the size of a kept
+	 * coin, and one action's cap. Undefined at 8 or below, and for a node
+	 * whose pool's status does not say its policy. Never asked at start: a
+	 * node that holds channels has to start to defend them.
+	 */
+	private auxiliaryOpenFeeRefusal(): FixedOutputFeeError | undefined {
+		// A node that does not forward opens and accepts as before.
+		if (!this.keepsFixedOutputFeeReserve()) return undefined;
+		let most: number;
+		try {
+			most = auxiliaryMaxHtlcs(this.auxiliaryChannels?.maxHtlcs);
+		} catch {
+			return undefined;
+		}
+		if (most <= DEFAULT_AUXILIARY_MAX_HTLCS) return undefined;
+		const provider = this.fundingProvider;
+		if (typeof provider?.getFixedOutputFeeStatus !== 'function')
+			return undefined;
+		let status: ReturnType<
+			NonNullable<IFundingProvider['getFixedOutputFeeStatus']>
+		>;
+		try {
+			status = provider.getFixedOutputFeeStatus();
+		} catch {
+			return undefined;
+		}
+		if (status?.available !== true || !status.policy) return undefined;
+		const ratePerVbyte = Math.max(
+			this.fixedOutputReserveRate(),
+			status.policy.preparationFeeRatePerVbyte
+		);
+		const coin = reserveCoinSatoshis(ratePerVbyte);
+		if (coin > status.policy.maxFeeSatoshis) {
+			return new FixedOutputFeeError(
+				'FEE_ACTION_CAP_EXHAUSTED',
+				'operator',
+				`An asset channel of ${most} HTLCs each way needs fee coins of ${coin} sats at ${ratePerVbyte} sat/vB, over maxFeeSatoshis (${status.policy.maxFeeSatoshis})`
+			);
+		}
+		const needed = BigInt(2 * most) * coin + status.policy.maxFeeSatoshis;
+		if (status.budget.remainingSatoshis < needed) {
+			return new FixedOutputFeeBudgetExhaustedError(status.budget, needed);
+		}
+		return undefined;
+	}
+
 	/** Issue #2098, step 6: a preparation of fee coins is under way. */
 	private feeCoinsPreparing = false;
 	/** What the last preparation said, so that a shortfall is said once. */
@@ -33230,6 +33287,9 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		}
 		const feePolicyRefusal = fixedOutputFeePolicyRefusal(this.fundingProvider);
 		if (feePolicyRefusal) throw feePolicyRefusal;
+		// Issue #2098, step 6: a bound above 8 the fee policy cannot cover.
+		const feeCoverRefusal = this.auxiliaryOpenFeeRefusal();
+		if (feeCoverRefusal) throw feeCoverRefusal;
 		if (!this.fundingProvider && !this._chainBackend) {
 			throw new InvalidChannelOpenError(
 				'Asset channel funding requires a transaction broadcaster'
