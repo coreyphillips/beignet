@@ -117,6 +117,12 @@ interface IOptions {
 	 * after a stop between that write and keeping the answer.
 	 */
 	markedBefore?: boolean;
+	/**
+	 * Bob cannot write the mark that his host took the forward
+	 * (ChannelManager.recordForwardTaken), as when the row of the incoming
+	 * channel cannot be written after the host answered.
+	 */
+	takenUnwritten?: boolean;
 	/** The expiry the onion asks of Bob's outgoing HTLC. */
 	forwardCltv?: number;
 	/** Bob's bound on HTLCs in flight across his channels refuses the HTLC. */
@@ -242,6 +248,13 @@ describe('a bitcoin HTLC forwarded out over an asset channel (issue #2098, step 
 				).to.equal(true);
 				return dispatch(channelId, htlcId, ...rest);
 			};
+		}
+		if (options.takenUnwritten) {
+			(
+				bob.node.getChannelManager() as unknown as {
+					recordForwardTaken: () => boolean;
+				}
+			).recordForwardTaken = (): boolean => false;
 		}
 		if (options.inFlightCap) {
 			(
@@ -739,6 +752,29 @@ describe('a bitcoin HTLC forwarded out over an asset channel (issue #2098, step 
 		expect(
 			result.told[0].channelId?.equals(result.context.assetChannel)
 		).to.equal(true);
+	});
+
+	it('tells the host the outgoing leg was never offered when the mark that it took the forward cannot be written', async () => {
+		const result = await run('aux-fwd-btc-taken-unwritten', {
+			quote: false,
+			takenUnwritten: true,
+			answer: (request, context) => units(request, context)
+		});
+		refused(result, TEMPORARY_CHANNEL_FAILURE);
+		expect(result.asked).to.have.length(1);
+		// Beside the incoming leg's own end: it was failed back.
+		expect(legEnds(result.told)).to.deep.equal([
+			'incoming:failed',
+			'outgoing:never-offered'
+		]);
+		const told = result.told.find((end) => end.outcome === 'never-offered')!;
+		expect(told).to.deep.include({
+			incomingHtlcId: 0n,
+			leg: 'outgoing',
+			outcome: 'never-offered',
+			onChain: false
+		});
+		expect(told.channelId?.equals(result.context.assetChannel)).to.equal(true);
 	});
 
 	it('tells the host the outgoing leg was never offered when the bound on HTLCs in flight refuses an HTLC it had marked as asked before a stop', async () => {

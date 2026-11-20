@@ -125,6 +125,12 @@ interface IOptions {
 	 * after a stop between that write and keeping the answer.
 	 */
 	markedBefore?: boolean;
+	/**
+	 * Bob cannot write the mark that his host took the forward
+	 * (ChannelManager.recordForwardTaken), as when the row of the incoming
+	 * channel cannot be written after the host answered.
+	 */
+	takenUnwritten?: boolean;
 	/** Bob's bound on HTLCs in flight across his channels refuses the HTLC. */
 	inFlightCap?: boolean;
 	/** A delegated settlement slot of Bob's holds the payment hash. */
@@ -328,6 +334,13 @@ describe('an asset HTLC forwarded out over an ordinary channel (issue #2098, ste
 				).to.equal(true);
 				return dispatch(channelId, htlcId, ...rest);
 			};
+		}
+		if (options.takenUnwritten) {
+			(
+				bob.node.getChannelManager() as unknown as {
+					recordForwardTaken: () => boolean;
+				}
+			).recordForwardTaken = (): boolean => false;
 		}
 		if (options.inFlightCap) {
 			(
@@ -775,6 +788,16 @@ describe('an asset HTLC forwarded out over an ordinary channel (issue #2098, ste
 		});
 		refused(result, INCORRECT_CLTV_EXPIRY);
 		expect(result.asked).to.deep.equal([]);
+		toldNeverOffered(result, result.context.outChannel);
+	});
+
+	it('tells the host the outgoing leg was never offered when the mark that it took the forward cannot be written', async () => {
+		const result = await run('aux-fwd-in-taken-unwritten', {
+			takenUnwritten: true,
+			answer: (request) => valued(request)
+		});
+		refused(result, TEMPORARY_CHANNEL_FAILURE);
+		expect(result.asked).to.have.length(1);
 		toldNeverOffered(result, result.context.outChannel);
 	});
 
