@@ -6,6 +6,8 @@ export {
 	IFixedOutputFeePoolState,
 	IFixedOutputFeePoolUnavailable,
 	IFixedOutputFeeStatus,
+	IFixedOutputFeePreparation,
+	IFixedOutputFeePreparationRequest,
 	fixedOutputFeePolicyRefusal,
 	IFixedOutputFeeResolution,
 	FixedOutputFeeError,

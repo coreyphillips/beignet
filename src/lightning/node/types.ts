@@ -164,6 +164,17 @@ export interface IFundingProvider {
 	 * was handed back.
 	 */
 	releaseFixedOutputFeeCoins?(): Promise<boolean>;
+	/**
+	 * Prepare fee coins ahead of any claim: up to `request.coins` free fee
+	 * coins of at least `request.coinSatoshis` each, by a split of the
+	 * wallet's own when fewer are there. Resolves to what it did, or why it
+	 * made no split; undefined when no fee policy is configured.
+	 */
+	prepareFixedOutputFees?(
+		request: import('../wallet/fixed-output-fees').IFixedOutputFeePreparationRequest
+	): Promise<
+		import('../wallet/fixed-output-fees').IFixedOutputFeePreparation | undefined
+	>;
 	/** The lifetime budget for fixed-output fees; undefined when none is configured. */
 	getFixedOutputFeeBudget?():
 		| import('../wallet/fixed-output-fees').IFixedOutputFeeBudget

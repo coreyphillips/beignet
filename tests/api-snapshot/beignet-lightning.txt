@@ -610,9 +610,11 @@ constructor chain.ChainMonitor(channelState: channel.IChannelState, destinationS
 method chain.ChainMonitor.addPreimage(paymentHash: Buffer, preimage: Buffer): chain.ChainAction[]
 method chain.ChainMonitor.auxiliaryHtlcEndings(): Array<{ txid: string; outputIndex: number; htlcId: bigint; offered: boolean; outcome: 'fulfilled' | 'failed'; recorded: boolean; absent?: true; lost?: true; claimSigned?: true; }>
 method chain.ChainMonitor.dropUnusedPreimages(heldElsewhere: ReadonlyMap<string, Buffer>): number
+method chain.ChainMonitor.fixedOutputFeeNeeds(): { spends: number; revoked: number; }
 method chain.ChainMonitor.fixedOutputFeeRaise(output: chain.ITrackedOutput, feeRatePerVbyte: number): chain.IFeeBumpAndBroadcastChainAction | undefined
 method chain.ChainMonitor.fixedOutputFeeResolved(txid: string, outputIndex: number, evenIfNotOpen?: boolean): { spendingTransaction?: Buffer; impossible?: true; } | undefined
 method chain.ChainMonitor.fixedOutputSpendVbytes(txid: string, outputIndex: number, feeRatePerVbyte: number): number | undefined
+method chain.ChainMonitor.fixedOutputSpendYieldsToDeadlines(txid: string, outputIndex: number): boolean
 method chain.ChainMonitor.forwardLegChainEndings(): Array<{ direction: channel.HtlcDirection; htlcId: bigint; outcome: 'fulfilled' | 'failed'; }>
 method chain.ChainMonitor.fundFixedOutputSpend(txid: string, outputIndex: number, feeRatePerVbyte: number, feeInputs: ReadonlyArray<{ hash: Buffer; index: number; sequence: number; script: Buffer; value: bigint; }>, signFeeInputs: (transaction: bitcoinjs-lib#Transaction, prevouts: { scripts: Buffer[]; values: bigint[]; }) => void): { ok: true; transaction: Buffer; broadcast: boolean; } | { ok: false; refusal: string; gone?: true; }
 method chain.ChainMonitor.getChannelState(): channel.IChannelState
@@ -630,6 +632,7 @@ method chain.ChainMonitor.htlcEndedOnChainForGood(direction: channel.HtlcDirecti
 method chain.ChainMonitor.isCommitmentConfirmed(): boolean
 method chain.ChainMonitor.isCommitmentReverifyPending(): boolean
 method chain.ChainMonitor.isFullyResolved(): boolean
+method chain.ChainMonitor.keepDeadlineFeeCoins(on: boolean): void
 method chain.ChainMonitor.noteAuxiliaryAbsentHtlcRecorded(offered: boolean, htlcId: bigint): void
 method chain.ChainMonitor.noteAuxiliaryHtlcEndingRecorded(txid: string, outputIndex: number): void
 method chain.ChainMonitor.noteFixedOutputFeeRetired(txid: string, outputIndex: number): void
@@ -641,6 +644,7 @@ method chain.ChainMonitor.rebuildSweeps(output: chain.ITrackedOutput, feeRatePer
 static method chain.ChainMonitor.restore(saved: chain.IChainMonitorState, channelState: channel.IChannelState, destinationScript: Buffer, feeRatePerVbyte: number, revocationBasepointSecret: Buffer, paymentPrivkey: Buffer, network?: bitcoinjs-lib#Network, delayedPaymentBasepointSecret?: Buffer, htlcBasepointSecret?: Buffer): chain.ChainMonitor
 method chain.ChainMonitor.setChannelState(channelState: channel.IChannelState): void
 method chain.ChainMonitor.setDestinationScript(destinationScript: Buffer): void
+method chain.ChainMonitor.setOfferedHtlcDeadlines(deadlines: ReadonlyMap<bigint, number>): void
 method chain.ChainMonitor.spendShowsPreimage(output: chain.ITrackedOutput): boolean | undefined
 method chain.ChainMonitor.takeAuxiliaryClaimsPastExpiry(): Array<{ htlcId: bigint; cltvExpiry: number; }>
 method chain.ChainMonitor.updateFeeRate(feeRatePerKw: number): chain.ChainAction[]
@@ -695,7 +699,7 @@ method chain.ElectrumBackend.stopReconnectMonitor(): void
 method chain.ElectrumBackend.subscribeToHeaders(onNewBlock: (height: number) => void): Promise<void>
 method chain.ElectrumBackend.subscribeToScriptHash(scriptHash: string, onChange: () => void): Promise<void>
 method chain.ElectrumBackend.unsubscribeScriptHash(scriptHash: string): boolean
-const chain.FIXED_OUTPUT_FEE_TIMING: { readonly splitRaiseBlocks: 6; readonly splitRaiseBlocksNearDeadline: 2; readonly nearDeadlineBlocks: 18; readonly unconfirmedCoinBlocks: 6; }
+const chain.FIXED_OUTPUT_FEE_TIMING: { readonly splitRaiseBlocks: 6; readonly splitRaiseBlocksNearDeadline: 2; readonly nearDeadlineBlocks: 18; readonly unconfirmedCoinBlocks: 6; readonly noDeadlineAskBlocks: 6; }
 interface chain.IAnchorCpfpParams
 property chain.IAnchorCpfpParams.anchorAmount: bigint
 property chain.IAnchorCpfpParams.anchorOutputIndex: number
@@ -1027,7 +1031,7 @@ function chain.signP2wpkhInput(tx: bitcoinjs-lib#Transaction, inputIndex: number
 function chain.signSweepInput(tx: bitcoinjs-lib#Transaction, inputIndex: number, witnessScript: Buffer, value: number, privateKey: Buffer, sighashType?: number): Buffer
 function chain.sweepVbytes(witness: readonly Buffer[], destinationScript: Buffer): number
 namespace channel
-const channel.AUXILIARY_CHANNELS_API: Readonly<{ version: 1; surfaces: readonly [ "valueIncomingHtlc:three-outcome", "sendPaymentToRoute:assetPayment", "getAuxiliaryPaymentHtlcs", "onHtlcResolved:htlcId", "queryAuxiliaryRoute", "fundAuxiliaryChannel:unsigned", "onFundingSigned", "abandonAuxiliaryOpen", "IChannelInfo.auxiliary", "setAuxiliaryPaymentGate", "getChannelMonitorState", "IPaymentInfo.auxiliary", "IPaymentInfo.auxiliaryValueMsat", "IInvoiceInfo.auxiliary", "IAuxiliaryChannelInfo.undeliveredOutcomes", "onHtlcResolved:never-sent", "getFixedOutputFeeStatus", "IPaymentInfo.unresolved", "IHoldInvoiceStateEvent.auxiliary", "prepareForward", "getFixedOutputFeeStatus:splitCoins" ]; declared: readonly [ ]; }>
+const channel.AUXILIARY_CHANNELS_API: Readonly<{ version: 1; surfaces: readonly [ "valueIncomingHtlc:three-outcome", "sendPaymentToRoute:assetPayment", "getAuxiliaryPaymentHtlcs", "onHtlcResolved:htlcId", "queryAuxiliaryRoute", "fundAuxiliaryChannel:unsigned", "onFundingSigned", "abandonAuxiliaryOpen", "IChannelInfo.auxiliary", "setAuxiliaryPaymentGate", "getChannelMonitorState", "IPaymentInfo.auxiliary", "IPaymentInfo.auxiliaryValueMsat", "IInvoiceInfo.auxiliary", "IAuxiliaryChannelInfo.undeliveredOutcomes", "onHtlcResolved:never-sent", "getFixedOutputFeeStatus", "IPaymentInfo.unresolved", "IHoldInvoiceStateEvent.auxiliary", "prepareForward", "getFixedOutputFeeStatus:splitCoins", "getFixedOutputFeeStatus:reserve", "requireFeeCoinsToSettle" ]; declared: readonly [ ]; }>
 const channel.AUXILIARY_CHANNEL_DUST_LIMIT = 354n
 const channel.AUXILIARY_CLOSE_ASSET_OUTPUT_MINIMUM = 330n
 class channel.AuxiliaryChannelUnsupportedError extends beignet#CodedError<'ASSET_CHANNEL_UNSUPPORTED'>
@@ -1423,6 +1427,8 @@ method channel.ChannelManager.fforSetSlot(channelId: Buffer, k: number, state: f
 method channel.ChannelManager.fforSetupTimeout(channelId: Buffer): channel.ChannelResult
 method channel.ChannelManager.fforSync(channelId: Buffer): channel.ChannelResult
 method channel.ChannelManager.fforWitnessAcked(channelId: Buffer, mailboxId: Buffer, retentionUntil: number): channel.ChannelResult
+method channel.ChannelManager.fixedOutputFeeNeed(): { spends: number; revoked: number; }
+method channel.ChannelManager.fixedOutputFeesWaiting(): boolean
 method channel.ChannelManager.forceClose(channelId: Buffer, destinationScript: Buffer, feeRatePerVbyte?: number, network?: bitcoinjs-lib#Network, noDeadlineFeeRatePerVbyte?: number): channel.ChannelResult
 method channel.ChannelManager.forgetPreimage(paymentHash: Buffer, held: ReadonlyArray<{ channelId: Buffer; htlcId: bigint; }>): boolean
 method channel.ChannelManager.forgetUnsentSplice(channelId: Buffer, reason: string): channel.ChannelResult
@@ -1503,9 +1509,11 @@ method channel.ChannelManager.setAuxiliaryFundingData(peerPubkey: string, tempor
 method channel.ChannelManager.setFforFundingClient(peer: string, enabled: boolean): void
 method channel.ChannelManager.setFforPeerFeatureSource(source: ((peerPubkey: string) => features.FeatureFlags | null) | null): void
 method channel.ChannelManager.setFforSettlePolicy(policy: ffor.IFforSettlePolicy | null): void
+method channel.ChannelManager.setFixedOutputFeeReserve(on: boolean): void
 method channel.ChannelManager.setFundingProvider(fundingProvider: node.IFundingProvider | null): void
 method channel.ChannelManager.setJitClients(pubkeyHexes: Iterable<string>): void
 method channel.ChannelManager.setMonitorDestinationScript(destinationScript: Buffer): void
+method channel.ChannelManager.setOfferedHtlcDeadlines(byChannel: ReadonlyMap<string, ReadonlyMap<bigint, number>>): void
 method channel.ChannelManager.signCommitment(channelId: Buffer, signature: Buffer, htlcSignatures: Buffer[]): channel.ChannelResult
 method channel.ChannelManager.takeAuxiliaryClaimsPastExpiry(): Array<{ channelId: Buffer; htlcId: bigint; cltvExpiry: number; }>
 method channel.ChannelManager.triggerAnnouncementDepth(channelId: Buffer, blockHeight: number, txIndex: number, localNodeId: Buffer, signAnnouncement: (data: Buffer) => { nodeSig: Buffer; bitcoinSig: Buffer; }): void
@@ -1715,6 +1723,7 @@ method channel.IAuxiliaryChannelConfig.onHtlcResolved?(context: Omit<channel.IAu
 method channel.IAuxiliaryChannelConfig.openingCsvPolicy?(peerPubkey: string): channel.IAuxiliaryOpeningCsvPolicy | undefined
 method channel.IAuxiliaryChannelConfig.prepareForward?(request: channel.IAuxiliaryForwardRequest): channel.IAuxiliaryForwardTerms | undefined
 property channel.IAuxiliaryChannelConfig.provider: channel.IChannelAuxiliaryProvider
+property channel.IAuxiliaryChannelConfig.requireFeeCoinsToSettle?: boolean
 method channel.IAuxiliaryChannelConfig.resolveIncoming(peerPubkey: string, temporaryChannelId: Buffer): channel.IAuxiliaryFundingDescriptor | undefined
 method channel.IAuxiliaryChannelConfig.valueIncomingHtlc?(context: channel.IAuxiliaryIncomingHtlc): bigint | undefined
 interface channel.IAuxiliaryChannelHtlc
@@ -2001,6 +2010,7 @@ property channel.IChannelFullyResolvedAction.channelId: Buffer
 property channel.IChannelFullyResolvedAction.type: channel.ChannelActionType.CHANNEL_FULLY_RESOLVED
 interface channel.IChannelManagerConfig
 property channel.IChannelManagerConfig.auxiliaryChannels?: channel.IAuxiliaryChannelConfig
+property channel.IChannelManagerConfig.auxiliaryOpenFeeRefusal?: () => Error | undefined
 property channel.IChannelManagerConfig.auxiliaryOpenRefusal?: Error
 method channel.IChannelManagerConfig.auxiliaryPeerFeatures?(peerPubkey: string): features.FeatureFlags | undefined
 property channel.IChannelManagerConfig.chainHash?: Buffer
@@ -5889,6 +5899,7 @@ method node.IFundingProvider.getFixedOutputFeeActionIds?(channelId: Buffer): rea
 method node.IFundingProvider.getFixedOutputFeeBudget?(): wallet.IFixedOutputFeeBudget | undefined
 method node.IFundingProvider.getFixedOutputFeeStatus?(forFeeSatoshis?: bigint): wallet.IFixedOutputFeeStatus | undefined
 method node.IFundingProvider.pledgeTransactionInputs?(txHex: string): Promise<void>
+method node.IFundingProvider.prepareFixedOutputFees?(request: wallet.IFixedOutputFeePreparationRequest): Promise<wallet.IFixedOutputFeePreparation | undefined>
 method node.IFundingProvider.quoteDualFundingMax?(feeratePerKw: number): { fundingSatoshis: bigint; spendableSats: bigint; feeSats: bigint; inputCount: number; }
 method node.IFundingProvider.quoteSpliceIn?(feeratePerKw: number): { spendableSats: bigint; feeSats: bigint; maxAmountSats: bigint; inputCount: number; }
 method node.IFundingProvider.releaseFixedOutputFeeCoins?(): Promise<boolean>
@@ -10121,7 +10132,7 @@ class wallet.FixedOutputFeeError extends Error
 constructor wallet.FixedOutputFeeError(code: wallet.FixedOutputFeeErrorCode, remedy: wallet.FixedOutputFeeRemedy, message: string)
 readonly property wallet.FixedOutputFeeError.code: wallet.FixedOutputFeeErrorCode
 readonly property wallet.FixedOutputFeeError.remedy: wallet.FixedOutputFeeRemedy
-type wallet.FixedOutputFeeErrorCode = 'FEE_PREPARATION_PENDING' | 'FEE_PREPARATION_NOT_PUBLISHED' | 'FEE_WALLET_TIMEOUT' | 'FEE_WALLET_UNAVAILABLE' | 'FEE_RESERVATION_REFUSED' | 'FEE_BUDGET_EXHAUSTED' | 'FEE_FUNDS_UNAVAILABLE' | 'FEE_ACTION_CAP_EXHAUSTED' | 'FEE_PREPARATION_FEE_EXCEEDS_CAP' | 'FEE_PREPARATION_SIGNING_FAILED' | 'FEE_POLICY_REFUSED' | 'FEE_ACTION_RETIRED' | 'FEE_INPUT_UNAVAILABLE'
+type wallet.FixedOutputFeeErrorCode = 'FEE_PREPARATION_PENDING' | 'FEE_PREPARATION_NOT_PUBLISHED' | 'FEE_WALLET_TIMEOUT' | 'FEE_WALLET_UNAVAILABLE' | 'FEE_RESERVATION_REFUSED' | 'FEE_BUDGET_EXHAUSTED' | 'FEE_FUNDS_UNAVAILABLE' | 'FEE_ACTION_CAP_EXHAUSTED' | 'FEE_PREPARATION_FEE_EXCEEDS_CAP' | 'FEE_PREPARATION_SIGNING_FAILED' | 'FEE_POLICY_REFUSED' | 'FEE_ACTION_RETIRED' | 'FEE_INPUT_UNAVAILABLE' | 'FEE_COINS_SHORT'
 class wallet.FixedOutputFeePreparationPendingError extends wallet.FixedOutputFeeError
 constructor wallet.FixedOutputFeePreparationPendingError(transactionId: string)
 readonly property wallet.FixedOutputFeePreparationPendingError.transactionId: string
@@ -10144,13 +10155,24 @@ interface wallet.IFixedOutputFeePoolState
 property wallet.IFixedOutputFeePoolState.actions: Array<{ feeActionId?: string; capSatoshis: bigint; inputs: number; heldSatoshis: bigint; }>
 property wallet.IFixedOutputFeePoolState.available: true
 property wallet.IFixedOutputFeePoolState.budget: wallet.IFixedOutputFeeBudget
-property wallet.IFixedOutputFeePoolState.feeCoins: { ready: number; readySatoshis: bigint; unconfirmed: number; }
+property wallet.IFixedOutputFeePoolState.feeCoins: { ready: number; readySatoshis: bigint; unconfirmed: number; readyCoinSatoshis?: bigint[]; }
 property wallet.IFixedOutputFeePoolState.lastRefusal?: { code: wallet.FixedOutputFeeErrorCode; remedy: wallet.FixedOutputFeeRemedy; at: number; deadlineHeight?: number; }
+property wallet.IFixedOutputFeePoolState.policy?: { maxFeeSatoshis: bigint; maxTotalFeeSatoshis: bigint; maxPreparationFeeSatoshis: bigint; feeCoinCount: number; preparationFeeRatePerVbyte: number; }
 property wallet.IFixedOutputFeePoolState.preparation: { possible: boolean; forFeeSatoshis: bigint; neededSatoshis: bigint; largestConfirmedSatoshis: bigint; reason?: 'FEE_FUNDS_UNAVAILABLE' | 'FEE_BUDGET_EXHAUSTED'; splitCoins: number; }
+property wallet.IFixedOutputFeePoolState.reserve?: { coinSatoshis: bigint; ratePerVbyte: number; need: number; revoked: number; fundable: number; shortfall: number; }
 property wallet.IFixedOutputFeePoolState.splits: Array<{ state: 'unsigned' | 'signed' | 'published'; transactionId?: string; feeSatoshis: bigint; feeCoins: number; feeCoinSatoshis: bigint; }>
 interface wallet.IFixedOutputFeePoolUnavailable
 property wallet.IFixedOutputFeePoolUnavailable.available: false
 property wallet.IFixedOutputFeePoolUnavailable.error: wallet.FixedOutputFeeError
+interface wallet.IFixedOutputFeePreparation
+property wallet.IFixedOutputFeePreparation.coins: number
+property wallet.IFixedOutputFeePreparation.split?: { transactionId: string; feeCoins: number; feeCoinSatoshis: bigint; feeSatoshis: bigint; }
+property wallet.IFixedOutputFeePreparation.waiting?: wallet.FixedOutputFeeErrorCode
+interface wallet.IFixedOutputFeePreparationRequest
+property wallet.IFixedOutputFeePreparationRequest.blockHeight?: number
+property wallet.IFixedOutputFeePreparationRequest.coinSatoshis: bigint
+property wallet.IFixedOutputFeePreparationRequest.coins: number
+property wallet.IFixedOutputFeePreparationRequest.feeratePerKw: number
 interface wallet.IFixedOutputFeeResolution
 property wallet.IFixedOutputFeeResolution.impossible?: true
 property wallet.IFixedOutputFeeResolution.spendingTransaction?: Buffer
@@ -10183,6 +10205,7 @@ method wallet.WalletFundingProvider.getFixedOutputFeeActionIds(channelId: Buffer
 method wallet.WalletFundingProvider.getFixedOutputFeeBudget(): wallet.IFixedOutputFeeBudget | undefined
 method wallet.WalletFundingProvider.getFixedOutputFeeStatus(forFeeSatoshis?: bigint): wallet.IFixedOutputFeeStatus | undefined
 method wallet.WalletFundingProvider.pledgeTransactionInputs(txHex: string): Promise<void>
+method wallet.WalletFundingProvider.prepareFixedOutputFees(request: wallet.IFixedOutputFeePreparationRequest): Promise<wallet.IFixedOutputFeePreparation | undefined>
 method wallet.WalletFundingProvider.quoteDualFundingMax(feeratePerKw: number): { fundingSatoshis: bigint; spendableSats: bigint; feeSats: bigint; inputCount: number; }
 method wallet.WalletFundingProvider.quoteSpliceIn(feeratePerKw: number): { spendableSats: bigint; feeSats: bigint; maxAmountSats: bigint; inputCount: number; }
 method wallet.WalletFundingProvider.releaseFixedOutputFeeCoins(): Promise<boolean>

@@ -108,10 +108,17 @@ import {
 	auxiliaryRestoreRefusal,
 	isGuardianRecoveryMode
 } from '../recovery/auxiliary-restore';
-import { fixedOutputFeePolicyRefusal } from '../wallet/fixed-output-fees';
+import {
+	FixedOutputFeeBudgetExhaustedError,
+	FixedOutputFeeError,
+	fixedOutputFeePolicyRefusal
+} from '../wallet/fixed-output-fees';
 import type { ISpliceWalletInput } from '../channel/channel';
 import { Channel } from '../channel/channel';
-import { auxiliaryMaxHtlcs } from '../channel/auxiliary';
+import {
+	DEFAULT_AUXILIARY_MAX_HTLCS,
+	auxiliaryMaxHtlcs
+} from '../channel/auxiliary';
 import { countPendingHtlcs } from '../channel/htlc-policy';
 import { isValidShutdownScript } from '../channel/validation';
 import {
@@ -455,6 +462,10 @@ import {
 	MAX_SCRIPT_SIZE
 } from '../validation';
 import * as bitcoin from 'bitcoinjs-lib';
+import {
+	fundableDeadlineSpends,
+	reserveCoinSatoshis
+} from '../channel/fixed-output-reserve';
 import { ecc } from '../../utils/ecc';
 import type {
 	IStorageBackend,
@@ -2298,6 +2309,8 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 						auxiliaryChannels: config.auxiliaryChannels,
 						auxiliaryPeerFeatures: (peerPubkey: string) =>
 							this.peerInitFeatures(peerPubkey),
+						auxiliaryOpenFeeRefusal: (): Error | undefined =>
+							this.auxiliaryOpenFeeRefusal(),
 						...(isGuardianRecoveryMode(config.recovery)
 							? { auxiliaryOpenRefusal: new AuxiliaryGuardianModeError() }
 							: feePolicyRefusal
@@ -2407,6 +2420,12 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		// Let the channel manager attach wallet inputs for anchor fee bumps
 		// (zero-fee second-level HTLC txs and commitment CPFP).
 		this.channelManager.setFundingProvider(this.fundingProvider);
+		// Issue #2098, step 6: a node whose host forwards asset HTLCs keeps
+		// fee coins for the spends of its asset channels that have a deadline.
+		// A node that does not forward funds its spends as before.
+		this.channelManager.setFixedOutputFeeReserve(
+			this.keepsFixedOutputFeeReserve()
+		);
 		this.compositeSplices = new CompositeSpliceEngine(
 			this.compositeSpliceDeps()
 		);
@@ -3078,6 +3097,9 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		const restoreStarted = Date.now();
 		this.restoreFromStorage(storedChannels);
 		this.storageRestoreMs = Date.now() - restoreStarted;
+		// Issue #2098, step 6: the monitors restored take the deadlines of the
+		// forwards' outgoing timeouts before they look at the chain again.
+		this.pushForwardTimeoutDeadlines();
 		// Inline, the network map is already back; in slices, it reports
 		// once it is.
 		if (this.graphRestoreStats) this.reportGraphRestore();
@@ -23899,6 +23921,22 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			return;
 		}
 
+		// Issue #2098, step 6: a host that asks for it takes an asset HTLC
+		// here only while the fee coins ready would pay to claim it on the
+		// chain with every other spend with a deadline.
+		if (this.feeCoinsShortForSettle(channelId)) {
+			this.emitStructuredLog('htlc', 'asset_settle_declined', {
+				paymentHash: hashHex,
+				reason: 'the fee coins ready would not pay to claim it on the chain'
+			});
+			const reason = sharedSecret
+				? createFailureMessage(sharedSecret, TEMPORARY_NODE_FAILURE)
+				: Buffer.alloc(FAILURE_MESSAGE_LENGTH);
+			this.cleanupHtlcSharedSecret(htlcSecretKey);
+			this.channelManager.failHtlc(channelId, htlcId, reason);
+			return;
+		}
+
 		// Single-part payment — fulfill immediately
 		this.emitStructuredLog('htlc', 'fulfilling', {
 			paymentHash: hashHex,
@@ -24115,6 +24153,16 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		const hash = sha256(pre);
 		if (!hash.equals(paymentHash)) {
 			throw new Error('settleHeldHtlc: preimage does not match payment hash');
+		}
+		// Issue #2098, step 6: a host that asks for it settles asset parts only
+		// while the fee coins ready would pay to claim them on the chain; the
+		// parts stay held and the settle may be asked again.
+		if (held.some((part) => this.feeCoinsShortForSettle(part.channelId))) {
+			throw new FixedOutputFeeError(
+				'FEE_COINS_SHORT',
+				'wait',
+				'settleHeldHtlc: the fee coins ready would not pay to claim the asset HTLCs on the chain; the parts stay held'
+			);
 		}
 
 		// Persist the preimage and deliver it to the chain monitors before
@@ -28517,6 +28565,19 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	 * leg. An incoming asset leg takes its own path (assetInForwardable,
 	 * steps 3 and 4).
 	 */
+	/**
+	 * Issue #2098, step 6: whether this node keeps fee coins for the spends
+	 * of its asset channels' outputs that have a deadline: a node that
+	 * forwards asset HTLCs, which is one whose host supplies prepareForward
+	 * while the switch for asset forwards is on.
+	 */
+	private keepsFixedOutputFeeReserve(): boolean {
+		return (
+			auxiliaryForwards.enabled &&
+			typeof this.auxiliaryChannels?.prepareForward === 'function'
+		);
+	}
+
 	private assetForwardAskable(inChannelId: Buffer): boolean {
 		return (
 			auxiliaryForwards.enabled &&
@@ -28860,22 +28921,21 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	}
 
 	/**
-	 * Issue #2098, step 5: a look at the fee coin pool before a forward with
-	 * an asset leg on a channel of the fixed mode pays out. Undefined when the
-	 * pool can pay to claim on the chain every asset HTLC the node holds on
-	 * its live channels of that mode (the forward's incoming HTLC among them
-	 * when it came in on one) and the `adding` ones the forward is about to
-	 * offer on such a channel, else why not:
-	 *  - there is no pool, or the wallet refused the policy, or its state
-	 *    cannot be read synchronously;
-	 *  - those HTLCs outnumber the fee coins that are ready and the ones a
-	 *    split of the largest confirmed coin would make now;
-	 *  - the budget has no room for two more spends at the policy's cap (an
-	 *    HTLC on the node's own commitment takes two: the second-level
-	 *    transaction and its sweep), and for a split's fee when no coin is
-	 *    ready.
-	 * It reads the pool as it is and reserves nothing; sizing the pool for a
-	 * channel that is full when it goes to the chain is step 6 of the issue.
+	 * Issue #2098, steps 5 and 6: a look at the fee coin pool before a
+	 * forward with an asset leg on a channel of the fixed mode pays out.
+	 * Undefined when the fee coins ready pay, each spend with whole coins at
+	 * the node's rate, for every spend with a deadline the node may have to
+	 * fund on the chain (ChannelManager.fixedOutputFeeNeed: each asset HTLC
+	 * of a channel of that mode, the forward's incoming HTLC among them when
+	 * it came in on one, and each such spend of a channel already on the
+	 * chain) and for the `adding` HTLCs the forward is about to offer on
+	 * such a channel, and when the budget has room for all of them at the
+	 * size of a kept coin plus one action's cap. Else why not, and when
+	 * there is no pool, the wallet refused the policy, or its state cannot be
+	 * read synchronously or does not say what its coins are worth. A split
+	 * not yet made counts for nothing: the node prepares its coins ahead
+	 * (prepareFixedOutputFeeCoins). It reads the pool and reserves nothing:
+	 * every path runs from this look to the add in one synchronous turn.
 	 */
 	private assetForwardFeeRefusal(adding: number): string | undefined {
 		const provider = this.fundingProvider;
@@ -28904,36 +28964,301 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		if (status.available !== true) {
 			return 'the wallet refused the fee policy, so there is no fee coin pool';
 		}
-		let held = 0;
-		for (const channel of this.channelManager.listChannels()) {
-			const state = channel.getFullState();
-			if (
-				state.auxiliaryState === undefined ||
-				!isFixedAssetHtlcChannel(state.channelType) ||
-				state.state === ChannelState.FORCE_CLOSED ||
-				state.state === ChannelState.CLOSED
-			) {
-				continue;
-			}
-			held += state.htlcs.size;
+		const reserve = this.fixedOutputReserveOf(status);
+		if (!reserve) {
+			return 'the fee coin pool does not say what its ready coins are worth';
 		}
-		const coins =
-			status.feeCoins.ready +
-			(status.preparation.possible ? status.preparation.splitCoins : 0);
-		if (held + adding > coins) {
-			return `the fee coin pool can pay for ${coins} spends on the chain and the forward would leave the node with ${
-				held + adding
-			} asset HTLCs`;
+		const covering = reserve.need + adding;
+		if (reserve.fundable < covering) {
+			return `the fee coins ready pay for ${reserve.fundable} spends on the chain and the forward would leave the node with ${covering} to pay for`;
 		}
-		const fee = status.preparation.forFeeSatoshis;
-		const dust = 330n;
-		const preparationFee =
-			status.preparation.neededSatoshis - (fee > dust ? fee : dust);
-		const room = 2n * fee + (status.feeCoins.ready === 0 ? preparationFee : 0n);
+		const room =
+			BigInt(covering + reserve.revoked) * reserve.coinSatoshis +
+			status.policy!.maxFeeSatoshis;
 		if (status.budget.remainingSatoshis < room) {
-			return `the fee budget has ${status.budget.remainingSatoshis} sat left, under the ${room} sat two more spends could take`;
+			return `the fee budget has ${status.budget.remainingSatoshis} sat left, under the ${room} sat its spends on the chain could take`;
 		}
 		return undefined;
+	}
+
+	/**
+	 * Issue #2098, step 6: the rate the fee coins kept for spends with a
+	 * deadline are sized and counted at: the node's latest fee estimate, the
+	 * one its monitors are given, or without one the rate they fall back to.
+	 */
+	private fixedOutputReserveRate(): number {
+		const live = this.feeAdvisor.getCurrentRate();
+		return live > 0 ? live : FORCE_CLOSE_DEFAULT_SAT_PER_VBYTE;
+	}
+
+	/**
+	 * Issue #2098, step 6: the fee coins kept for spends with a deadline as
+	 * they stand, from the pool's status: the size of such a coin at the
+	 * node's rate (never under the policy's own rate), what the coins must
+	 * cover, and how many of those spends the coins ready pay for. Undefined
+	 * for a status that does not say what its coins are worth.
+	 */
+	private fixedOutputReserveOf(
+		status: ReturnType<NonNullable<IFundingProvider['getFixedOutputFeeStatus']>>
+	):
+		| {
+				coinSatoshis: bigint;
+				ratePerVbyte: number;
+				need: number;
+				revoked: number;
+				fundable: number;
+				shortfall: number;
+		  }
+		| undefined {
+		if (
+			!status ||
+			status.available !== true ||
+			!status.policy ||
+			!status.feeCoins.readyCoinSatoshis
+		) {
+			return undefined;
+		}
+		const ratePerVbyte = Math.max(
+			this.fixedOutputReserveRate(),
+			status.policy.preparationFeeRatePerVbyte
+		);
+		const need = this.channelManager.fixedOutputFeeNeed();
+		let fundable: number;
+		try {
+			fundable = fundableDeadlineSpends(
+				status.feeCoins.readyCoinSatoshis.map((value) => BigInt(value)),
+				ratePerVbyte,
+				BigInt(status.policy.maxFeeSatoshis)
+			);
+		} catch {
+			// A provider's status this node cannot count with.
+			return undefined;
+		}
+		return {
+			coinSatoshis: reserveCoinSatoshis(ratePerVbyte),
+			ratePerVbyte,
+			need: need.spends,
+			revoked: need.revoked,
+			fundable,
+			shortfall: Math.max(0, need.spends - fundable)
+		};
+	}
+
+	/** Issue #2098, step 6: the fee coins kept for spends with a deadline, read now. */
+	private fixedOutputReserve():
+		| ReturnType<LightningNode['fixedOutputReserveOf']>
+		| undefined {
+		const provider = this.fundingProvider;
+		if (typeof provider?.getFixedOutputFeeStatus !== 'function')
+			return undefined;
+		try {
+			const status = provider.getFixedOutputFeeStatus();
+			if (
+				status !== undefined &&
+				status !== null &&
+				typeof (status as { then?: unknown }).then === 'function'
+			) {
+				(status as unknown as Promise<unknown>).catch?.(() => undefined);
+				return undefined;
+			}
+			return this.fixedOutputReserveOf(status);
+		} catch {
+			return undefined;
+		}
+	}
+
+	/**
+	 * Issue #2098, step 6: whether an asset HTLC that ends at this node on
+	 * `channelId` is refused at its settle, on a node that forwards whose
+	 * host asked for it (requireFeeCoinsToSettle): the channel is of the
+	 * fixed mode and the fee
+	 * coins ready do not pay to claim on the chain every spend with a
+	 * deadline the node may have to fund, this HTLC's among them. A pool
+	 * whose state cannot be read refuses.
+	 */
+	private feeCoinsShortForSettle(channelId: Buffer): boolean {
+		if (
+			!this.keepsFixedOutputFeeReserve() ||
+			this.auxiliaryChannels?.requireFeeCoinsToSettle !== true
+		) {
+			return false;
+		}
+		const state = this.channelManager.getChannel(channelId)?.getFullState();
+		if (
+			state?.auxiliaryState === undefined ||
+			!isFixedAssetHtlcChannel(state.channelType)
+		) {
+			return false;
+		}
+		const reserve = this.fixedOutputReserve();
+		return !reserve || reserve.fundable < reserve.need;
+	}
+
+	/**
+	 * Issue #2098, step 6: on a node that forwards, the refusal of a new
+	 * asset channel, opened or accepted, whose HTLC bound the fee policy
+	 * cannot cover, for a host that set maxHtlcs above 8. A coin kept for a spend with a deadline must fit
+	 * the cap of one fee action, and the budget left must hold that channel
+	 * full on the chain: twice maxHtlcs such spends at the size of a kept
+	 * coin, and one action's cap. Undefined at 8 or below, and for a node
+	 * whose pool's status does not say its policy. Never asked at start: a
+	 * node that holds channels has to start to defend them.
+	 */
+	private auxiliaryOpenFeeRefusal(): FixedOutputFeeError | undefined {
+		// A node that does not forward opens and accepts as before.
+		if (!this.keepsFixedOutputFeeReserve()) return undefined;
+		let most: number;
+		try {
+			most = auxiliaryMaxHtlcs(this.auxiliaryChannels?.maxHtlcs);
+		} catch {
+			return undefined;
+		}
+		if (most <= DEFAULT_AUXILIARY_MAX_HTLCS) return undefined;
+		const provider = this.fundingProvider;
+		if (typeof provider?.getFixedOutputFeeStatus !== 'function')
+			return undefined;
+		let status: ReturnType<
+			NonNullable<IFundingProvider['getFixedOutputFeeStatus']>
+		>;
+		try {
+			status = provider.getFixedOutputFeeStatus();
+		} catch {
+			return undefined;
+		}
+		if (status?.available !== true || !status.policy) return undefined;
+		const ratePerVbyte = Math.max(
+			this.fixedOutputReserveRate(),
+			status.policy.preparationFeeRatePerVbyte
+		);
+		const coin = reserveCoinSatoshis(ratePerVbyte);
+		if (coin > status.policy.maxFeeSatoshis) {
+			return new FixedOutputFeeError(
+				'FEE_ACTION_CAP_EXHAUSTED',
+				'operator',
+				`An asset channel of ${most} HTLCs each way needs fee coins of ${coin} sats at ${ratePerVbyte} sat/vB, over maxFeeSatoshis (${status.policy.maxFeeSatoshis})`
+			);
+		}
+		const needed = BigInt(2 * most) * coin + status.policy.maxFeeSatoshis;
+		if (status.budget.remainingSatoshis < needed) {
+			return new FixedOutputFeeBudgetExhaustedError(status.budget, needed);
+		}
+		return undefined;
+	}
+
+	/** Issue #2098, step 6: a preparation of fee coins is under way. */
+	private feeCoinsPreparing = false;
+	/** What the last preparation said, so that a shortfall is said once. */
+	private feeCoinsPreparationSaid?: string;
+
+	/**
+	 * Issue #2098, step 6: on a node that forwards asset HTLCs, prepare its
+	 * fee coins ahead of any claim, on each block: as many coins of the size
+	 * kept for a spend with a deadline as those spends need now, plus the
+	 * policy's feeCoinCount. Only while it has an asset channel of the fixed
+	 * mode or something of one on the chain, and never while a spend is
+	 * being given coins or waits for one: a claim near its deadline may need
+	 * a split of its own. While a kept coin would be over maxFeeSatoshis it
+	 * prepares none: no fee action could spend it. It logs what it made, and
+	 * once for each reason why it cannot keep up. It never throws into the
+	 * block's other work.
+	 */
+	private prepareFixedOutputFeeCoins(blockHeight: number): void {
+		try {
+			this.prepareFixedOutputFeeCoinsNow(blockHeight);
+		} catch (err) {
+			// Never in the way of the block's other work.
+			this.feeCoinsPreparing = false;
+			this.emitStructuredLog('fee', 'fee_coins_preparation_failed', {
+				message: err instanceof Error ? err.message : String(err)
+			});
+		}
+	}
+
+	private prepareFixedOutputFeeCoinsNow(blockHeight: number): void {
+		if (!this.keepsFixedOutputFeeReserve() || this.feeCoinsPreparing) return;
+		const provider = this.fundingProvider;
+		if (typeof provider?.prepareFixedOutputFees !== 'function') return;
+		if (this.channelManager.fixedOutputFeesWaiting()) return;
+		let status: ReturnType<
+			NonNullable<IFundingProvider['getFixedOutputFeeStatus']>
+		>;
+		try {
+			status = provider.getFixedOutputFeeStatus?.();
+		} catch {
+			return;
+		}
+		const reserve = this.fixedOutputReserveOf(status);
+		if (!reserve || status?.available !== true || !status.policy) return;
+		const fixedChannel = this.channelManager.listChannels().some((channel) => {
+			const state = channel.getFullState();
+			return (
+				state.auxiliaryState !== undefined &&
+				isFixedAssetHtlcChannel(state.channelType) &&
+				state.state !== ChannelState.CLOSED
+			);
+		});
+		if (!fixedChannel && reserve.need === 0) return;
+		const coins = reserve.need + status.policy.feeCoinCount;
+		const say = (
+			action: string,
+			reason: string,
+			data: Record<string, unknown>
+		): void => {
+			const said = `${action}:${reason}`;
+			if (this.feeCoinsPreparationSaid === said) return;
+			this.feeCoinsPreparationSaid = said;
+			this.emitStructuredLog('fee', action, data);
+		};
+		// A kept coin over the cap of one fee action could pay for no spend:
+		// none is prepared while the rate puts it there.
+		if (reserve.coinSatoshis > status.policy.maxFeeSatoshis) {
+			say('fee_coins_short', 'FEE_ACTION_CAP_EXHAUSTED', {
+				code: 'FEE_ACTION_CAP_EXHAUSTED',
+				coinSatoshis: reserve.coinSatoshis.toString(),
+				maxFeeSatoshis: status.policy.maxFeeSatoshis.toString()
+			});
+			return;
+		}
+		this.feeCoinsPreparing = true;
+		void Promise.resolve()
+			.then(() =>
+				provider.prepareFixedOutputFees!({
+					coinSatoshis: reserve.coinSatoshis,
+					coins,
+					feeratePerKw: satPerVbyteToSatPerKw(reserve.ratePerVbyte),
+					blockHeight
+				})
+			)
+			.then((answer) => {
+				if (!answer) return;
+				if (answer.split) {
+					this.feeCoinsPreparationSaid = undefined;
+					this.emitStructuredLog('fee', 'fee_coins_prepared', {
+						transactionId: answer.split.transactionId,
+						feeCoins: answer.split.feeCoins,
+						feeCoinSatoshis: answer.split.feeCoinSatoshis.toString(),
+						coins: answer.coins,
+						wanted: coins
+					});
+				} else if (
+					answer.waiting !== undefined &&
+					answer.waiting !== 'FEE_PREPARATION_PENDING'
+				) {
+					say('fee_coins_short', answer.waiting, {
+						code: answer.waiting,
+						coins: answer.coins,
+						wanted: coins,
+						coinSatoshis: reserve.coinSatoshis.toString()
+					});
+				}
+			})
+			.catch((err: unknown) => {
+				const message = err instanceof Error ? err.message : String(err);
+				say('fee_coins_preparation_failed', message, { message });
+			})
+			.finally(() => {
+				this.feeCoinsPreparing = false;
+			});
 	}
 
 	/**
@@ -29332,6 +29657,8 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			inChannelId: ctx.inChannelId,
 			inHtlcId: ctx.inHtlcId
 		});
+		// Issue #2098, step 6: its timeout has a deadline from now on.
+		this.pushForwardTimeoutDeadlines();
 		// The host's records and carrier stay with the outgoing HTLC, which
 		// the link ties to the incoming one.
 		const link: RecoveryMutation = {
@@ -32913,7 +33240,15 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	getFixedOutputFeeStatus(
 		forFeeSatoshis?: bigint
 	): import('../wallet/fixed-output-fees').IFixedOutputFeeStatus | undefined {
-		return this.fundingProvider?.getFixedOutputFeeStatus?.(forFeeSatoshis);
+		const status =
+			this.fundingProvider?.getFixedOutputFeeStatus?.(forFeeSatoshis);
+		// Issue #2098, step 6: a node that forwards says what it keeps for its
+		// spends with a deadline.
+		if (!this.keepsFixedOutputFeeReserve() || status?.available !== true) {
+			return status;
+		}
+		const reserve = this.fixedOutputReserveOf(status);
+		return reserve ? { ...status, reserve } : status;
 	}
 
 	/**
@@ -32952,6 +33287,9 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		}
 		const feePolicyRefusal = fixedOutputFeePolicyRefusal(this.fundingProvider);
 		if (feePolicyRefusal) throw feePolicyRefusal;
+		// Issue #2098, step 6: a bound above 8 the fee policy cannot cover.
+		const feeCoverRefusal = this.auxiliaryOpenFeeRefusal();
+		if (feeCoverRefusal) throw feeCoverRefusal;
 		if (!this.fundingProvider && !this._chainBackend) {
 			throw new InvalidChannelOpenError(
 				'Asset channel funding requires a transaction broadcaster'
@@ -35087,6 +35425,12 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	 * ChannelManager exactly once before calling it.
 	 */
 	private runPerBlockWork(blockHeight: number): void {
+		// Issue #2098, step 6: the deadlines of the forwards' outgoing
+		// timeouts, for the monitors' next look at the chain, and the fee
+		// coins of a node that forwards, prepared ahead (it yields to any
+		// spend the monitors just asked coins for).
+		this.pushForwardTimeoutDeadlines();
+		this.prepareFixedOutputFeeCoins(blockHeight);
 		// Witness retention (section 9.6.6): mailboxes past retention_until go.
 		this.fforWitness?.onBlock(blockHeight);
 		// Issuer retirement (section 9.7.7): issue_until reached.
@@ -36363,8 +36707,84 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	 * inbound HTLC-success/timeout is the authoritative spend) and RETAIN the
 	 * forward mapping until final resolution, instead of failing off-chain.
 	 */
-	private scanForwardTimeouts(blockHeight: number): void {
+	/**
+	 * How many blocks before the expiry of a forward's incoming HTLC the
+	 * node takes the incoming channel to the chain while the outgoing leg
+	 * is unresolved (scanForwardTimeouts): twice the safety margin, and for
+	 * an incoming asset channel at least INBOUND_HTLC_CLAIM_FORCE_CLOSE_BUFFER,
+	 * since its claim takes a fee coin.
+	 */
+	private forwardIncomingMargin(incoming: Readonly<IChannelState>): number {
 		const doubleMargin = this.htlcSafetyMargin * 2;
+		return incoming.auxiliaryState !== undefined
+			? Math.max(INBOUND_HTLC_CLAIM_FORCE_CLOSE_BUFFER, doubleMargin)
+			: doubleMargin;
+	}
+
+	/**
+	 * Issue #2098, step 6: on a node that keeps fee coins for its spends
+	 * with a deadline, give the monitor of each outgoing asset channel of the
+	 * fixed mode the height by which the timeout of a forward's outgoing
+	 * HTLC has to confirm: the incoming HTLC's expiry, less the distance at
+	 * which the incoming channel goes to the chain (forwardIncomingMargin),
+	 * less ASSET_FORWARD_FAIL_BACK_DEPTH, so that the incoming leg is failed
+	 * back in its channel before then. A forward whose incoming HTLC the
+	 * node no longer holds gets none.
+	 */
+	private pushForwardTimeoutDeadlines(): void {
+		try {
+			this.pushForwardTimeoutDeadlinesNow();
+		} catch (err) {
+			// Never in the way of the block's other work: the next block tries
+			// again, and a deadline not given leaves the spend asking as before.
+			this.emitStructuredLog('chain', 'forward_deadlines_failed', {
+				message: err instanceof Error ? err.message : String(err)
+			});
+		}
+	}
+
+	private pushForwardTimeoutDeadlinesNow(): void {
+		if (!this.keepsFixedOutputFeeReserve()) return;
+		const byChannel = new Map<string, Map<bigint, number>>();
+		for (const [outKey, link] of this.forwardedHtlcs) {
+			const at = outKey.indexOf(':offered-');
+			if (at < 0) continue;
+			const outHex = outKey.slice(0, at);
+			let outHtlcId: bigint;
+			try {
+				outHtlcId = BigInt(outKey.slice(at + ':offered-'.length));
+			} catch {
+				continue;
+			}
+			const outgoing = this.channelManager
+				.getChannel(Buffer.from(outHex, 'hex'))
+				?.getFullState();
+			if (
+				outgoing?.auxiliaryState === undefined ||
+				!isFixedAssetHtlcChannel(outgoing.channelType)
+			) {
+				continue;
+			}
+			const incoming = this.channelManager
+				.getChannel(link.inChannelId)
+				?.getFullState();
+			const htlc = incoming?.htlcs.get(`received-${link.inHtlcId}`);
+			if (!incoming || !htlc) continue;
+			const deadline =
+				htlc.cltvExpiry -
+				this.forwardIncomingMargin(incoming) -
+				ASSET_FORWARD_FAIL_BACK_DEPTH;
+			let deadlines = byChannel.get(outHex);
+			if (!deadlines) {
+				deadlines = new Map();
+				byChannel.set(outHex, deadlines);
+			}
+			deadlines.set(outHtlcId, deadline);
+		}
+		this.channelManager.setOfferedHtlcDeadlines(byChannel);
+	}
+
+	private scanForwardTimeouts(blockHeight: number): void {
 		const channels = this.channelManager.listChannels();
 
 		for (const channel of channels) {
@@ -36407,10 +36827,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			// Issue #2098, step 5: an asset leg's claim on the chain needs a fee
 			// coin and the blocks a coin may take, so its channel goes there at
 			// the claim buffer rather than at twice the safety margin.
-			const forwardMargin =
-				state.auxiliaryState !== undefined
-					? Math.max(INBOUND_HTLC_CLAIM_FORCE_CLOSE_BUFFER, doubleMargin)
-					: doubleMargin;
+			const forwardMargin = this.forwardIncomingMargin(state);
 
 			for (const [key, htlc] of state.htlcs) {
 				if (!key.startsWith('received-')) continue;

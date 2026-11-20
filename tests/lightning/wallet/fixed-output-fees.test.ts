@@ -17,6 +17,7 @@ import {
 	FixedOutputFeeBudgetExhaustedError,
 	FixedOutputFeePreparationPendingError,
 	IFixedOutputFeePoolState,
+	type IFixedOutputFeePreparation,
 	fixedOutputFeePolicyRefusal
 } from '../../../src/lightning/wallet/fixed-output-fees';
 import { ILedgerKeyValueStorage } from '../../../src/lightning/storage/durable-ledger';
@@ -1951,7 +1952,19 @@ describe('reading the state of the fee coin pool', () => {
 				spentSatoshis: 0n,
 				remainingSatoshis: 20000n
 			},
-			feeCoins: { ready: 0, readySatoshis: 0n, unconfirmed: 0 },
+			feeCoins: {
+				ready: 0,
+				readySatoshis: 0n,
+				unconfirmed: 0,
+				readyCoinSatoshis: []
+			},
+			policy: {
+				maxFeeSatoshis: 2000n,
+				maxTotalFeeSatoshis: 20000n,
+				maxPreparationFeeSatoshis: 1000n,
+				feeCoinCount: 4,
+				preparationFeeRatePerVbyte: 1
+			},
 			actions: [],
 			splits: [],
 			preparation: {
@@ -2010,14 +2023,16 @@ describe('reading the state of the fee coin pool', () => {
 		expect(poolState(p).feeCoins).deep.equal({
 			ready: 0,
 			readySatoshis: 0n,
-			unconfirmed: 3
+			unconfirmed: 3,
+			readyCoinSatoshis: []
 		});
 		f.confirm();
 		const after = poolState(p, 500n);
 		expect(after.feeCoins).deep.equal({
 			ready: 3,
 			readySatoshis: 1704n,
-			unconfirmed: 0
+			unconfirmed: 0,
+			readyCoinSatoshis: [568n, 568n, 568n]
 		});
 		expect(after.actions).deep.equal([
 			{
@@ -2151,5 +2166,266 @@ describe('a provider whose fee policy the wallet refused', () => {
 		expect(both.supportsFixedOutputFees()).equal(true);
 		expect(both.getFixedOutputFeeStatus()!.available).equal(true);
 		expect(fixedOutputFeePolicyRefusal(both)).equal(undefined);
+	});
+});
+
+describe('fee coins prepared ahead of any claim (#2098 step 6)', () => {
+	/** The state of a provider that has a pool. */
+	const stateOf = (
+		provider: WalletFundingProvider
+	): IFixedOutputFeePoolState => {
+		const status = provider.getFixedOutputFeeStatus();
+		if (!status?.available) throw new Error('the provider has no pool');
+		return status;
+	};
+	const ask = (
+		provider: WalletFundingProvider,
+		coins: number,
+		blockHeight = 100,
+		coinSatoshis = 2000n,
+		feeratePerKw = 250
+	): Promise<IFixedOutputFeePreparation | undefined> =>
+		provider.prepareFixedOutputFees({
+			coinSatoshis,
+			coins,
+			feeratePerKw,
+			blockHeight
+		});
+	/** The outputs of a broadcast split, by value. */
+	const outputsOf = (raw: string): number[] =>
+		bitcoin.Transaction.fromHex(raw).outs.map((out) => out.value);
+
+	it('answers nothing on a provider without a fee policy', async () => {
+		const f = fixture();
+		const plain = new WalletFundingProvider(f.wallet);
+		expect(
+			await plain.prepareFixedOutputFees({
+				coinSatoshis: 2000n,
+				coins: 4,
+				feeratePerKw: 250
+			})
+		).equal(undefined);
+	});
+
+	it('splits the largest confirmed coin into fee coins of the size asked, with no fee action and no cap held, and says what it made', async () => {
+		const f = fixture(),
+			p = f.provider();
+		await drain(p);
+		const made = await ask(p, 6);
+		expect(f.broadcasts).length(1);
+		const split = bitcoin.Transaction.fromHex(f.broadcasts[0]);
+		// At most feeCoinCount (4) fee coins of 2000, and the change.
+		expect(outputsOf(f.broadcasts[0]).slice(0, 4)).deep.equal([
+			2000, 2000, 2000, 2000
+		]);
+		expect(made).deep.equal({
+			coins: 4,
+			split: {
+				transactionId: split.getId(),
+				feeCoins: 4,
+				feeCoinSatoshis: 2000n,
+				feeSatoshis: feeOf(f.broadcasts[0])
+			}
+		});
+		const state = stateOf(p);
+		expect(state.actions).deep.equal([]);
+		expect(state.budget.reservedSatoshis).equal(0n);
+		expect(state.budget.spentSatoshis).equal(feeOf(f.broadcasts[0]));
+		// On its way until the next call takes its coins into the pool.
+		expect(state.splits).deep.equal([
+			{
+				state: 'published',
+				transactionId: split.getId(),
+				feeSatoshis: feeOf(f.broadcasts[0]),
+				feeCoins: 4,
+				feeCoinSatoshis: 2000n
+			}
+		]);
+		// Its source is the wallet's one coin of 50000; the asset anchor is
+		// never taken.
+		expect(Buffer.from(split.ins[0].hash).reverse().toString('hex')).equal(
+			f.parent.getId()
+		);
+	});
+
+	it('makes the rest from the change once it has confirmed, and no more than asked', async () => {
+		const f = fixture(),
+			p = f.provider();
+		await drain(p);
+		await ask(p, 6);
+		// The change has not confirmed: nothing to split yet.
+		expect(await ask(p, 6)).deep.equal({
+			coins: 4,
+			waiting: 'FEE_PREPARATION_PENDING'
+		});
+		expect(f.broadcasts).length(1);
+		f.confirm();
+		const second = await ask(p, 6, 101);
+		expect(second).to.deep.include({ coins: 6 });
+		expect(second!.split).to.deep.include({
+			feeCoins: 2,
+			feeCoinSatoshis: 2000n
+		});
+		f.confirm();
+		expect(await ask(p, 6, 102)).deep.equal({ coins: 6 });
+		expect(f.broadcasts).length(2);
+		const state = stateOf(p);
+		expect(state.feeCoins).deep.include({
+			ready: 6,
+			readySatoshis: 12000n,
+			unconfirmed: 0
+		});
+		expect(state.feeCoins.readyCoinSatoshis).deep.equal(
+			Array.from({ length: 6 }, () => 2000n)
+		);
+	});
+
+	it('makes no split while one it made is on its way and not yet listed, and counts its coins as coming, also after a restart', async () => {
+		const f = fixture();
+		const p = f.provider();
+		await drain(p);
+		f.failure('visibility');
+		const made = await ask(p, 8);
+		expect(made).to.deep.include({ coins: 4 });
+		// The wallet knows the split and lists none of its coins yet.
+		const restarted = f.provider();
+		await drain(restarted);
+		expect(await ask(restarted, 8)).deep.equal({
+			coins: 4,
+			waiting: 'FEE_PREPARATION_PENDING'
+		});
+		expect(
+			new Set(
+				f.broadcasts.map((raw) => bitcoin.Transaction.fromHex(raw).getId())
+			).size
+		).equal(1);
+	});
+
+	it("replaces a split it made that has not confirmed, on the claims' schedule, with one that pays more", async () => {
+		const f = fixture(),
+			p = f.provider();
+		await drain(p);
+		await ask(p, 4, 100);
+		// Before its time nothing is replaced, and the coins asked are there.
+		expect(await ask(p, 4, 103)).deep.equal({ coins: 4 });
+		expect(f.broadcasts).length(1);
+		await ask(p, 4, 106);
+		expect(f.broadcasts).length(2);
+		const [first, second] = f.broadcasts;
+		expect(feeOf(second) > feeOf(first)).equal(true);
+		// The same fee coins at the same positions.
+		expect(outputsOf(second).slice(0, 4)).deep.equal(
+			outputsOf(first).slice(0, 4)
+		);
+	});
+
+	it('holds a split to maxPreparationFeeSatoshis, at the highest rate it allows, and makes none when even one coin does not fit', async () => {
+		const f = fixture();
+		const p = f.provider();
+		await drain(p);
+		// 40 sat/vB asked: a split of four coins does not fit 1000 sats there.
+		const made = await ask(p, 4, 100, 2000n, 10_000);
+		expect(made!.split).to.not.equal(undefined);
+		expect(made!.split!.feeSatoshis <= 1000n).equal(true);
+
+		const g = fixture();
+		g.policy.maxPreparationFeeSatoshis = 50n;
+		const q = g.provider();
+		await drain(q);
+		expect(await ask(q, 4)).deep.equal({
+			coins: 0,
+			waiting: 'FEE_PREPARATION_FEE_EXCEEDS_CAP'
+		});
+		expect(g.broadcasts).length(0);
+		expect(stateOf(q).budget.spentSatoshis).equal(0n);
+	});
+
+	it('makes none when the budget has no room for a split, or the wallet no confirmed coin large enough', async () => {
+		const f = fixture();
+		f.policy.maxTotalFeeSatoshis = 999n;
+		const p = f.provider();
+		await drain(p);
+		expect(await ask(p, 4)).deep.equal({
+			coins: 0,
+			waiting: 'FEE_BUDGET_EXHAUSTED'
+		});
+		const g = fixture();
+		g.policy.maxFeeSatoshis = 100_000n;
+		const q = g.provider();
+		await drain(q);
+		// No coin of the wallet can hold four coins of 60000.
+		expect(await ask(q, 4, 100, 60_000n)).deep.equal({
+			coins: 0,
+			waiting: 'FEE_FUNDS_UNAVAILABLE'
+		});
+		expect(f.broadcasts.length + g.broadcasts.length).equal(0);
+	});
+
+	it('serves a claim from the coins it made, whole: the claim holds one coin and makes no split', async () => {
+		const f = fixture(),
+			p = f.provider();
+		await drain(p);
+		await ask(p, 4);
+		f.confirm();
+		const selection = await p.selectFeeBumpInputs(500n, 250, opts);
+		expect(selection.inputs).length(1);
+		expect(f.broadcasts).length(1);
+		const state = stateOf(p);
+		expect(state.actions).deep.equal([
+			{
+				feeActionId: opts.feeActionId,
+				capSatoshis: 2000n,
+				inputs: 1,
+				heldSatoshis: 2000n
+			}
+		]);
+		expect(state.feeCoins).deep.include({ ready: 3, readySatoshis: 6000n });
+	});
+
+	it('makes no fee coin over maxFeeSatoshis, which no fee action could spend, and does not count one it holds', async () => {
+		const f = fixture(),
+			p = f.provider();
+		await drain(p);
+		// A coin of 3000 sats is over the cap of 2000.
+		expect(await ask(p, 4, 100, 3000n)).deep.equal({
+			coins: 0,
+			waiting: 'FEE_ACTION_CAP_EXHAUSTED'
+		});
+		expect(f.broadcasts).length(0);
+		// Coins of 2000 made under a cap of 2000; under a lower cap they pay
+		// for nothing, and coins within it are made.
+		await ask(p, 4, 100);
+		f.confirm();
+		f.policy.maxFeeSatoshis = 1500n;
+		const lower = f.provider();
+		await drain(lower);
+		const made = await ask(lower, 4, 101, 1000n);
+		expect(made!.split, 'a split of coins within the cap').to.not.equal(
+			undefined
+		);
+		expect(made!.split!.feeCoinSatoshis).equal(1000n);
+	});
+
+	it('refuses a request it cannot read, and reports the policy it works under', async () => {
+		const f = fixture(),
+			p = f.provider();
+		await drain(p);
+		for (const bad of [
+			{ coinSatoshis: 329n, coins: 4, feeratePerKw: 250 },
+			{ coinSatoshis: 2000n, coins: 0, feeratePerKw: 250 },
+			{ coinSatoshis: 2000n, coins: 1.5, feeratePerKw: 250 },
+			{ coinSatoshis: 2000n, coins: 4, feeratePerKw: 0 }
+		])
+			await reject(
+				p.prepareFixedOutputFees(bad) as Promise<unknown>,
+				'Invalid fixed-output fee preparation'
+			);
+		expect(stateOf(p).policy).deep.equal({
+			maxFeeSatoshis: 2000n,
+			maxTotalFeeSatoshis: 20000n,
+			maxPreparationFeeSatoshis: 1000n,
+			feeCoinCount: 4,
+			preparationFeeRatePerVbyte: 1
+		});
 	});
 });

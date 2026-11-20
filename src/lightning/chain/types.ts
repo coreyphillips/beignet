@@ -544,7 +544,13 @@ export const FIXED_OUTPUT_FEE_TIMING = {
 	 * A spend whose deadline is within this many blocks may take a coin of
 	 * the pool's own split before the split has confirmed.
 	 */
-	unconfirmedCoinBlocks: 6
+	unconfirmedCoinBlocks: 6,
+	/**
+	 * On a node that keeps fee coins for its spends with a deadline (one
+	 * that forwards asset HTLCs), a spend without a deadline asks for its
+	 * fee input this many blocks before it can confirm, not before.
+	 */
+	noDeadlineAskBlocks: 6
 } as const;
 
 /**
