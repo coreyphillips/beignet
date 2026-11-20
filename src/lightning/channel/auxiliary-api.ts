@@ -74,7 +74,18 @@ export const AUXILIARY_CHANNELS_API = Object.freeze({
 		// .reserve; a host may have asset HTLCs that end at the node taken
 		// only while those coins would pay to claim them.
 		'getFixedOutputFeeStatus:reserve',
-		'requireFeeCoinsToSettle'
+		'requireFeeCoinsToSettle',
+		// Issue #2098, step 7: each leg's end tells the quote the forward was
+		// taken under: the next hop the onion named (shortChannelId) and what
+		// the leg was worth (valueMsat).
+		'onForwardLegResolved:quote',
+		// A forward with an asset leg is in the forwarding history and its
+		// htlc:forwarded event, marked auxiliary at what each leg was worth,
+		// and the summary counts it apart.
+		'IForwardingEvent.auxiliary',
+		// Whoever wraps the node can refuse a forward with an asset leg
+		// before anything of it is offered.
+		'setAuxiliaryForwardGate'
 	] as const),
 	// Nothing is declared and not run in this build.
 	declared: Object.freeze([] as const)

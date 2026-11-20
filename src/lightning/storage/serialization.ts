@@ -84,6 +84,10 @@ export interface ISerializedForwardLegEnd {
 	auxiliaryAmount?: string;
 	customRecords?: SerializedCustomRecords;
 	preimageRevealed?: true;
+	/** Issue #2098, step 7: the next hop the onion named, hex. */
+	shortChannelId?: string;
+	/** Issue #2098, step 7: what the leg was worth, msat. */
+	valueMsat?: string;
 }
 
 function serializeForwardLegEnd(
@@ -110,6 +114,12 @@ function serializeForwardLegEnd(
 			: {}),
 		...(end.preimageRevealed === true
 			? { preimageRevealed: true as const }
+			: {}),
+		...(end.shortChannelId !== undefined
+			? { shortChannelId: end.shortChannelId.toString('hex') }
+			: {}),
+		...(end.valueMsat !== undefined
+			? { valueMsat: end.valueMsat.toString() }
 			: {})
 	};
 }
@@ -148,7 +158,11 @@ function deserializeForwardLegEnd(
 					: new Map(),
 			...(s.preimageRevealed === true
 				? { preimageRevealed: true as const }
-				: {})
+				: {}),
+			...(s.shortChannelId !== undefined
+				? { shortChannelId: Buffer.from(s.shortChannelId, 'hex') }
+				: {}),
+			...(s.valueMsat !== undefined ? { valueMsat: BigInt(s.valueMsat) } : {})
 		}
 	];
 }

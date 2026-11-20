@@ -171,7 +171,7 @@ import {
 	deriveV2TemporaryChannelId,
 	isValidShutdownScript
 } from './validation';
-import type { IChannelConfig, ChannelResult } from './types';
+import type { IChannelConfig, ChannelResult, IHtlcForwardTerms } from './types';
 import {
 	DEFAULT_CHANNEL_CONFIG,
 	ChannelState,
@@ -187,7 +187,8 @@ import {
 	MAX_FUNDING_SATOSHIS,
 	MAX_WUMBO_FUNDING_SATOSHIS,
 	isOverlayChannel,
-	isFixedAssetHtlcChannel
+	isFixedAssetHtlcChannel,
+	sameForwardTerms
 } from './types';
 import type { IChannelBasepoints } from '../keys/derivation';
 import {
@@ -2307,6 +2308,12 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			 * host (IHtlcEntry.forwardOf).
 			 */
 			forwardOf?: { channelId: Buffer; htlcId: bigint };
+			/**
+			 * Issue #2098, step 7: the terms of the forward with an asset leg
+			 * this is the outgoing leg of, kept on the entry
+			 * (IHtlcEntry.forwardTerms).
+			 */
+			forwardTerms?: IHtlcForwardTerms;
 		}
 	): ChannelResult {
 		const emitRefusal = options?.emitRefusal !== false;
@@ -2341,7 +2348,8 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			blindingPoint,
 			skimmedFeeMsat,
 			options?.customRecords,
-			options?.forwardOf
+			options?.forwardOf,
+			options?.forwardTerms
 		);
 		// A refused add changed nothing in the channel and its ERROR carries no
 		// cleanup, so dropping it from the dispatch only drops the event.
@@ -12165,15 +12173,31 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 	 * nothing kept, when the channel does not hold the HTLC or the row could
 	 * not be written, and then the host must not be asked.
 	 */
-	recordForwardAsk(channelId: Buffer, htlcId: bigint): boolean {
+	recordForwardAsk(
+		channelId: Buffer,
+		htlcId: bigint,
+		/**
+		 * Issue #2098, step 7: the next hop the onion names and the amount it
+		 * asks the node to forward, kept with the mark (IHtlcEntry.forwardTerms).
+		 */
+		terms?: Pick<IHtlcForwardTerms, 'shortChannelId' | 'amountToForwardMsat'>
+	): boolean {
 		const hex = channelId.toString('hex');
 		const channel = this.channels.get(hex);
 		const peerPubkey = this.channelPeers.get(hex);
 		if (!channel || !peerPubkey) return false;
 		if (channel.forwardAsked(htlcId)) return true;
+		const before = channel.forwardTermsOf(htlcId);
 		if (!channel.markForwardAsked(htlcId)) return false;
+		if (terms) {
+			channel.setForwardTerms(htlcId, {
+				shortChannelId: terms.shortChannelId,
+				amountToForwardMsat: terms.amountToForwardMsat
+			});
+		}
 		if (!this._persistCommitted(channel, peerPubkey, channelId)) {
 			channel.unmarkForwardAsked(htlcId);
+			if (terms) channel.setForwardTerms(htlcId, before);
 			return false;
 		}
 		return true;
@@ -12188,16 +12212,32 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 	 * nothing kept, when the channel does not hold the HTLC or the row could
 	 * not be written.
 	 */
-	recordForwardTaken(channelId: Buffer, htlcId: bigint): boolean {
+	recordForwardTaken(
+		channelId: Buffer,
+		htlcId: bigint,
+		/**
+		 * Issue #2098, step 7: the forward's terms as the node read the
+		 * host's answer, kept with the mark (IHtlcEntry.forwardTerms) and
+		 * told with the leg's end. A second ask after a stop that answers
+		 * otherwise writes them again; the mark itself stays.
+		 */
+		terms?: IHtlcForwardTerms
+	): boolean {
 		if (!this.config.auxiliaryChannels?.onForwardLegResolved) return true;
 		const hex = channelId.toString('hex');
 		const channel = this.channels.get(hex);
 		const peerPubkey = this.channelPeers.get(hex);
 		if (!channel || !peerPubkey) return false;
-		if (channel.forwardTaken(htlcId)) return true;
-		if (!channel.markForwardTaken(htlcId)) return false;
+		const taken = channel.forwardTaken(htlcId);
+		const before = channel.forwardTermsOf(htlcId);
+		if (taken && (terms === undefined || sameForwardTerms(before, terms))) {
+			return true;
+		}
+		if (!taken && !channel.markForwardTaken(htlcId)) return false;
+		if (terms) channel.setForwardTerms(htlcId, terms);
 		if (!this._persistCommitted(channel, peerPubkey, channelId)) {
-			channel.unmarkForwardTaken(htlcId);
+			if (!taken) channel.unmarkForwardTaken(htlcId);
+			if (terms) channel.setForwardTerms(htlcId, before);
 			return false;
 		}
 		return true;
@@ -12215,14 +12255,23 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		inChannelId: Buffer,
 		inHtlcId: bigint,
 		paymentHash: Buffer,
-		channelId?: Buffer
+		channelId?: Buffer,
+		/** Issue #2098, step 7: see Channel.recordForwardNeverOffered. */
+		terms?: Pick<IHtlcForwardTerms, 'shortChannelId' | 'amountToForwardMsat'>
 	): void {
 		if (!this.config.auxiliaryChannels?.onForwardLegResolved) return;
 		const hex = inChannelId.toString('hex');
 		const channel = this.channels.get(hex);
 		const peerPubkey = this.channelPeers.get(hex);
 		if (!channel || !peerPubkey) return;
-		if (!channel.recordForwardNeverOffered(inHtlcId, paymentHash, channelId)) {
+		if (
+			!channel.recordForwardNeverOffered(
+				inHtlcId,
+				paymentHash,
+				channelId,
+				terms
+			)
+		) {
 			return;
 		}
 		if (this._persistCommitted(channel, peerPubkey, inChannelId)) {
@@ -12682,7 +12731,10 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 					paymentHash: Buffer.from(end.paymentHash),
 					incomingChannelId: Buffer.from(end.incomingChannelId),
 					...(end.channelId ? { channelId: Buffer.from(end.channelId) } : {}),
-					customRecords: new Map(end.customRecords)
+					customRecords: new Map(end.customRecords),
+					...(end.shortChannelId
+						? { shortChannelId: Buffer.from(end.shortChannelId) }
+						: {})
 				});
 				if (records.get(key) === end) {
 					records.delete(key);

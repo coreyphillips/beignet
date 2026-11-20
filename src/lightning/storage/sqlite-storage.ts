@@ -166,6 +166,58 @@ function columnNames(db: Database.Database, table: string): Set<string> {
 	return new Set(rows.map((row) => row.name));
 }
 
+/** Issue #2098, step 7: the fields that mark a forward with an asset leg. */
+type ForwardingAuxiliaryFields = Pick<
+	IForwardingEvent,
+	| 'auxiliary'
+	| 'inAuxiliaryAmount'
+	| 'inWireAmountMsat'
+	| 'outAuxiliaryAmount'
+	| 'outWireAmountMsat'
+	| 'nextHopScid'
+>;
+
+/**
+ * Issue #2098, step 7: what marks a forward with an asset leg, as the
+ * forwarding_events.auxiliary_json column holds it: bigints as decimal
+ * strings. Undefined, and the column NULL, for an ordinary forward.
+ */
+function forwardingAuxiliaryToJson(
+	event: Omit<IForwardingEvent, 'id'>
+): string | undefined {
+	if (event.auxiliary !== true) return undefined;
+	return JSON.stringify({
+		inAuxiliaryAmount: event.inAuxiliaryAmount?.toString(),
+		inWireAmountMsat: event.inWireAmountMsat?.toString(),
+		outAuxiliaryAmount: event.outAuxiliaryAmount?.toString(),
+		outWireAmountMsat: event.outWireAmountMsat?.toString(),
+		nextHopScid: event.nextHopScid
+	});
+}
+
+/** The fields forwardingAuxiliaryToJson stored, read back. */
+function forwardingAuxiliaryFromJson(
+	json: string | null
+): ForwardingAuxiliaryFields {
+	if (json === null) return {};
+	const stored = JSON.parse(json) as Record<string, unknown>;
+	const amount = (key: string): bigint | undefined =>
+		typeof stored[key] === 'string' ? BigInt(stored[key] as string) : undefined;
+	const fields: ForwardingAuxiliaryFields = { auxiliary: true };
+	const inUnits = amount('inAuxiliaryAmount');
+	if (inUnits !== undefined) fields.inAuxiliaryAmount = inUnits;
+	const inWire = amount('inWireAmountMsat');
+	if (inWire !== undefined) fields.inWireAmountMsat = inWire;
+	const outUnits = amount('outAuxiliaryAmount');
+	if (outUnits !== undefined) fields.outAuxiliaryAmount = outUnits;
+	const outWire = amount('outWireAmountMsat');
+	if (outWire !== undefined) fields.outWireAmountMsat = outWire;
+	if (typeof stored.nextHopScid === 'string') {
+		fields.nextHopScid = stored.nextHopScid;
+	}
+	return fields;
+}
+
 /**
  * Add a column an older release's table lacks. A fresh database already has
  * it (_createTables), so the ALTER runs only when it is missing, and any
@@ -477,7 +529,7 @@ export class SqliteStorage implements IStorageBackend {
 	 * Current schema version. Increment when adding migrations, and commit a
 	 * fixture of the schema before it (scripts/storage-fixture.ts).
 	 */
-	static readonly CURRENT_SCHEMA_VERSION = 20;
+	static readonly CURRENT_SCHEMA_VERSION = 21;
 
 	/**
 	 * The columns this class reads and writes, by table: a new database's,
@@ -513,7 +565,8 @@ export class SqliteStorage implements IStorageBackend {
 			'out_scid',
 			'amount_in_msat',
 			'amount_out_msat',
-			'fee_msat'
+			'fee_msat',
+			'auxiliary_json'
 		],
 		gossip_channels: ['scid_hex', 'channel_json'],
 		gossip_nodes: ['node_id_hex', 'node_json'],
@@ -1117,7 +1170,8 @@ export class SqliteStorage implements IStorageBackend {
 				out_scid TEXT,
 				amount_in_msat TEXT NOT NULL,
 				amount_out_msat TEXT NOT NULL,
-				fee_msat TEXT NOT NULL
+				fee_msat TEXT NOT NULL,
+				auxiliary_json TEXT
 			);
 			CREATE INDEX IF NOT EXISTS idx_forwarding_events_settled_at ON forwarding_events(settled_at);
 
@@ -2575,6 +2629,18 @@ export class SqliteStorage implements IStorageBackend {
 			// Migration 19->20: composite_splices (issue #1922) is created above.
 			(): void => {
 				// No-op
+			},
+			// Migration 20->21: forwarding_events.auxiliary_json, what marks a
+			// forward with an asset leg (issue #2098, step 7): NULL for every
+			// ordinary forward, so the rows before it read as they were. Kept
+			// plaintext, as the table is: units, carriers and a short channel
+			// id are figures of a settled relay like its amounts. A build
+			// before it opens the database (it runs no migration at or above
+			// its own version, and its required columns are all here), lists
+			// such a forward as an ordinary one at what its legs were worth,
+			// and writes its own rows with the column NULL.
+			(db): void => {
+				addColumnIfMissing(db, 'forwarding_events', 'auxiliary_json', 'TEXT');
 			}
 		];
 
@@ -3138,8 +3204,8 @@ export class SqliteStorage implements IStorageBackend {
 			this._stmt(
 				`INSERT INTO forwarding_events
 						(settled_at, in_channel_id, out_channel_id, in_scid, out_scid,
-						 amount_in_msat, amount_out_msat, fee_msat)
-					 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+						 amount_in_msat, amount_out_msat, fee_msat, auxiliary_json)
+					 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
 			).run(
 				event.settledAt,
 				event.inChannelId,
@@ -3148,7 +3214,8 @@ export class SqliteStorage implements IStorageBackend {
 				event.outScid ?? null,
 				event.amountInMsat.toString(),
 				event.amountOutMsat.toString(),
-				event.feeMsat.toString()
+				event.feeMsat.toString(),
+				forwardingAuxiliaryToJson(event) ?? null
 			);
 			// Cap the ledger (default 100k rows), pruning oldest first
 			this._pruneOldestRows('forwarding_events', this.forwardingEventsMaxRows);
@@ -3157,7 +3224,7 @@ export class SqliteStorage implements IStorageBackend {
 
 	listForwardingEvents(filter?: IForwardingEventFilter): IForwardingEvent[] {
 		let sql =
-			'SELECT id, settled_at, in_channel_id, out_channel_id, in_scid, out_scid, amount_in_msat, amount_out_msat, fee_msat FROM forwarding_events WHERE 1=1';
+			'SELECT id, settled_at, in_channel_id, out_channel_id, in_scid, out_scid, amount_in_msat, amount_out_msat, fee_msat, auxiliary_json FROM forwarding_events WHERE 1=1';
 		const params: unknown[] = [];
 		if (filter?.since !== undefined) {
 			sql += ' AND settled_at >= ?';
@@ -3192,6 +3259,7 @@ export class SqliteStorage implements IStorageBackend {
 			amount_in_msat: string;
 			amount_out_msat: string;
 			fee_msat: string;
+			auxiliary_json: string | null;
 		}>;
 		return rows.map((row) => ({
 			id: row.id,
@@ -3202,7 +3270,8 @@ export class SqliteStorage implements IStorageBackend {
 			outScid: row.out_scid ?? undefined,
 			amountInMsat: BigInt(row.amount_in_msat),
 			amountOutMsat: BigInt(row.amount_out_msat),
-			feeMsat: BigInt(row.fee_msat)
+			feeMsat: BigInt(row.fee_msat),
+			...forwardingAuxiliaryFromJson(row.auxiliary_json)
 		}));
 	}
 
@@ -3210,22 +3279,28 @@ export class SqliteStorage implements IStorageBackend {
 		// Accumulate in JS bigints: SQL SUM over the TEXT msat columns would
 		// coerce to floats and lose precision above 2^53
 		let sql =
-			'SELECT amount_out_msat, fee_msat FROM forwarding_events WHERE 1=1';
+			'SELECT amount_out_msat, fee_msat, auxiliary_json IS NOT NULL AS marked FROM forwarding_events WHERE 1=1';
 		const params: unknown[] = [];
 		if (options?.since !== undefined) {
 			sql += ' AND settled_at >= ?';
 			params.push(options.since);
 		}
-		let count = 0;
-		let volumeOutMsat = 0n;
-		let feesEarnedMsat = 0n;
+		// Issue #2098, step 7: a forward with an asset leg counts apart, at
+		// what its legs were worth; no bitcoin total counts it.
+		const totals = { count: 0, volumeOutMsat: 0n, feesEarnedMsat: 0n };
+		const marked = { count: 0, volumeOutMsat: 0n, feesEarnedMsat: 0n };
 		for (const row of this.db.prepare(sql).iterate(...params)) {
-			const r = row as { amount_out_msat: string; fee_msat: string };
-			count++;
-			volumeOutMsat += BigInt(r.amount_out_msat);
-			feesEarnedMsat += BigInt(r.fee_msat);
+			const r = row as {
+				amount_out_msat: string;
+				fee_msat: string;
+				marked: number;
+			};
+			const into = r.marked ? marked : totals;
+			into.count++;
+			into.volumeOutMsat += BigInt(r.amount_out_msat);
+			into.feesEarnedMsat += BigInt(r.fee_msat);
 		}
-		return { count, volumeOutMsat, feesEarnedMsat };
+		return marked.count > 0 ? { ...totals, auxiliary: marked } : totals;
 	}
 
 	// ─── Transaction ───

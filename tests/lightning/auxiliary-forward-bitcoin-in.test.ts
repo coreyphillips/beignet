@@ -14,6 +14,7 @@
  */
 
 import { expect } from 'chai';
+import type { IForwardingEvent } from '../../src/lightning/storage/types';
 import { createHash } from 'crypto';
 import fs from 'fs';
 import os from 'os';
@@ -153,6 +154,8 @@ interface IResult {
 	units: [bigint, bigint];
 	links: number;
 	forwards: number;
+	/** Bob's forwarding history (issue #2098, step 7). */
+	rows: IForwardingEvent[];
 }
 
 describe('a bitcoin HTLC forwarded out over an asset channel (issue #2098, step 2)', function () {
@@ -354,7 +357,8 @@ describe('a bitcoin HTLC forwarded out over an asset channel (issue #2098, step 
 				after.auxiliaryState!.remoteBalance
 			],
 			links: bob.storage!.loadAllForwardedHtlcs().length,
-			forwards: bob.storage!.listForwardingEvents().length
+			forwards: bob.storage!.listForwardingEvents().length,
+			rows: bob.storage!.listForwardingEvents()
 		};
 	}
 
@@ -406,10 +410,20 @@ describe('a bitcoin HTLC forwarded out over an asset channel (issue #2098, step 
 		expect(result.hooks).to.include(
 			`onHtlcResolved:${HtlcDirection.OFFERED}:fulfilled`
 		);
-		// The link went with the settle. An asset forward is not recorded in
-		// the forwarding history yet: its carrier is not what it was worth.
+		// The link went with the settle. Issue #2098, step 7: the forward is
+		// in Bob's forwarding history, marked auxiliary, at what each leg was
+		// worth (auxiliary-forward-history.test.ts checks each field).
 		expect(result.links).to.equal(0);
-		expect(result.forwards).to.equal(0);
+		expect(result.forwards).to.equal(1);
+		const row = result.rows[0];
+		expect(row.auxiliary).to.equal(true);
+		expect(row.amountOutMsat).to.equal(result.asked[0].amountToForwardMsat);
+		expect(row.feeMsat).to.equal(row.amountInMsat - row.amountOutMsat);
+		expect(row.nextHopScid).to.equal(
+			result.asked[0].shortChannelId.toString('hex')
+		);
+		expect(row.inAuxiliaryAmount !== undefined).to.equal(false);
+		expect(row.outAuxiliaryAmount !== undefined).to.equal(true);
 	}
 
 	/** The checks of a forward refused at Bob before anything was offered. */

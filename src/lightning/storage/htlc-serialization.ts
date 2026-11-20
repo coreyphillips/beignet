@@ -47,6 +47,12 @@ export interface ISerializedHtlcEntry {
 	forwardTaken?: boolean;
 	/** The incoming HTLC of the forward this offered HTLC is the outgoing leg of (see IHtlcEntry). */
 	forwardOf?: { channelId: string; htlcId: string };
+	/** What the node kept of the terms of the forward this HTLC is a leg of (see IHtlcEntry). */
+	forwardTerms?: {
+		shortChannelId: string;
+		amountToForwardMsat: string;
+		incomingValueMsat?: string;
+	};
 	/** Admission-time dust-exposure classification (see IHtlcEntry). */
 	dustExposureFailback?: boolean;
 	/** Admission-time expired-at-our-tip classification (see IHtlcEntry). */
@@ -122,6 +128,19 @@ export function serializeHtlcEntry(
 					forwardOf: {
 						channelId: e.forwardOf.channelId.toString('hex'),
 						htlcId: e.forwardOf.htlcId.toString()
+					}
+			  }
+			: {}),
+		...(e.forwardTerms !== undefined
+			? {
+					forwardTerms: {
+						shortChannelId: e.forwardTerms.shortChannelId.toString('hex'),
+						amountToForwardMsat: e.forwardTerms.amountToForwardMsat.toString(),
+						...(e.forwardTerms.incomingValueMsat !== undefined
+							? {
+									incomingValueMsat: e.forwardTerms.incomingValueMsat.toString()
+							  }
+							: {})
 					}
 			  }
 			: {}),
@@ -206,6 +225,19 @@ export function deserializeHtlcEntry(s: ISerializedHtlcEntry): {
 						forwardOf: {
 							channelId: Buffer.from(s.forwardOf.channelId, 'hex'),
 							htlcId: BigInt(s.forwardOf.htlcId)
+						}
+				  }
+				: {}),
+			...(s.forwardTerms !== undefined
+				? {
+						forwardTerms: {
+							shortChannelId: Buffer.from(s.forwardTerms.shortChannelId, 'hex'),
+							amountToForwardMsat: BigInt(s.forwardTerms.amountToForwardMsat),
+							...(s.forwardTerms.incomingValueMsat !== undefined
+								? {
+										incomingValueMsat: BigInt(s.forwardTerms.incomingValueMsat)
+								  }
+								: {})
 						}
 				  }
 				: {}),

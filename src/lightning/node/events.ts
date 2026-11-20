@@ -241,13 +241,25 @@ export interface LightningNodeEvents
 		amountMsat: bigint,
 		paymentHash: Buffer
 	) => void;
-	/** A forwarded HTLC settled: the fee was earned. */
+	/**
+	 * A forwarded HTLC settled: the fee was earned. For a forward with an
+	 * asset leg (issue #2098, step 7) it carries `auxiliary: true`, its
+	 * amounts are what each leg was worth and never a carrier, and the
+	 * fields beside them are those of IForwardingEvent, the next hop as a
+	 * Buffer.
+	 */
 	'htlc:forwarded': (data: {
 		inChannelId: Buffer;
 		outChannelId: Buffer;
 		amountInMsat: bigint;
 		amountOutMsat: bigint;
 		feeMsat: bigint;
+		auxiliary?: true;
+		inAuxiliaryAmount?: bigint;
+		inWireAmountMsat?: bigint;
+		outAuxiliaryAmount?: bigint;
+		outWireAmountMsat?: bigint;
+		nextHopScid?: Buffer;
 	}) => void;
 	/** A forwarded HTLC failed downstream. */
 	'htlc:forward-failed': (data: {
@@ -262,6 +274,8 @@ export interface LightningNodeEvents
 		paymentHash: Buffer;
 		reason: string;
 		channelErrorCode?: ChannelErrorCode;
+		/** Issue #2098, step 7: the forward has an asset leg. */
+		auxiliary?: true;
 	}) => void;
 	/** The peer fulfilled an HTLC this node offered: a part of its own payment or the outgoing leg of a forward. Raised once per HTLC: a reconnect or restart raises it again only when this node had not yet stored what the fulfil settled (the preimage, the forward or the payment record). */
 	'htlc:fulfilled': (data: { channelId: Buffer; htlcId: bigint }) => void;

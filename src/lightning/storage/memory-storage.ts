@@ -1284,7 +1284,28 @@ export class MemoryStorage implements IStorageBackend {
 					outScid: event.outScid,
 					amountInMsat: event.amountInMsat,
 					amountOutMsat: event.amountOutMsat,
-					feeMsat: event.feeMsat
+					feeMsat: event.feeMsat,
+					// Issue #2098, step 7: what marks a forward with an asset leg.
+					...(event.auxiliary === true
+						? {
+								auxiliary: true as const,
+								...(event.inAuxiliaryAmount !== undefined
+									? { inAuxiliaryAmount: event.inAuxiliaryAmount }
+									: {}),
+								...(event.inWireAmountMsat !== undefined
+									? { inWireAmountMsat: event.inWireAmountMsat }
+									: {}),
+								...(event.outAuxiliaryAmount !== undefined
+									? { outAuxiliaryAmount: event.outAuxiliaryAmount }
+									: {}),
+								...(event.outWireAmountMsat !== undefined
+									? { outWireAmountMsat: event.outWireAmountMsat }
+									: {}),
+								...(event.nextHopScid !== undefined
+									? { nextHopScid: event.nextHopScid }
+									: {})
+						  }
+						: {})
 				},
 				id
 			);
@@ -1315,17 +1336,19 @@ export class MemoryStorage implements IStorageBackend {
 	}
 
 	getForwardingSummary(options?: { since?: number }): IForwardingSummary {
-		let count = 0;
-		let volumeOutMsat = 0n;
-		let feesEarnedMsat = 0n;
+		// Issue #2098, step 7: a forward with an asset leg counts apart, at
+		// what its legs were worth; no bitcoin total counts it.
+		const totals = { count: 0, volumeOutMsat: 0n, feesEarnedMsat: 0n };
+		const marked = { count: 0, volumeOutMsat: 0n, feesEarnedMsat: 0n };
 		for (const event of this.forwardingEvents.values()) {
 			if (options?.since !== undefined && event.settledAt < options.since)
 				continue;
-			count++;
-			volumeOutMsat += event.amountOutMsat;
-			feesEarnedMsat += event.feeMsat;
+			const into = event.auxiliary === true ? marked : totals;
+			into.count++;
+			into.volumeOutMsat += event.amountOutMsat;
+			into.feesEarnedMsat += event.feeMsat;
 		}
-		return { count, volumeOutMsat, feesEarnedMsat };
+		return marked.count > 0 ? { ...totals, auxiliary: marked } : totals;
 	}
 
 	// ─── Action Log ───

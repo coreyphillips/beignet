@@ -305,7 +305,10 @@ import type {
 	IRebalanceExecutionSummary,
 	IRebalanceResult
 } from '../lightning/node/types';
-import type { AuxiliaryPaymentGate } from '../lightning/node/types';
+import type {
+	AuxiliaryForwardGate,
+	AuxiliaryPaymentGate
+} from '../lightning/node/types';
 import {
 	AuxiliaryProviderRequiredError,
 	InvalidRequestError,
@@ -1018,6 +1021,46 @@ export interface IReportedGuardian {
  * refuses credentials in guardian URLs, but a descriptor is data from a
  * capsule, and a readonly route must not be the place that leaks one.
  */
+/**
+ * Issue #2098, step 7: the fields that mark a forward with an asset leg, as
+ * the daemon shows them, amounts as decimal strings. Nothing for an
+ * ordinary forward, whose row and event keep exactly their old keys.
+ */
+function forwardMarks(f: {
+	auxiliary?: true;
+	inAuxiliaryAmount?: bigint;
+	inWireAmountMsat?: bigint;
+	outAuxiliaryAmount?: bigint;
+	outWireAmountMsat?: bigint;
+	nextHopScid?: string;
+}): Pick<
+	ForwardingEventInfo,
+	| 'auxiliary'
+	| 'inAuxiliaryAmount'
+	| 'inWireAmountMsat'
+	| 'outAuxiliaryAmount'
+	| 'outWireAmountMsat'
+	| 'nextHopScid'
+> {
+	if (f.auxiliary !== true) return {};
+	return {
+		auxiliary: true,
+		...(f.inAuxiliaryAmount !== undefined
+			? { inAuxiliaryAmount: f.inAuxiliaryAmount.toString() }
+			: {}),
+		...(f.inWireAmountMsat !== undefined
+			? { inWireAmountMsat: f.inWireAmountMsat.toString() }
+			: {}),
+		...(f.outAuxiliaryAmount !== undefined
+			? { outAuxiliaryAmount: f.outAuxiliaryAmount.toString() }
+			: {}),
+		...(f.outWireAmountMsat !== undefined
+			? { outWireAmountMsat: f.outWireAmountMsat.toString() }
+			: {}),
+		...(f.nextHopScid !== undefined ? { nextHopScid: f.nextHopScid } : {})
+	};
+}
+
 function redactUrl(url: string): string {
 	try {
 		const parsed = new URL(url);
@@ -4100,6 +4143,9 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 			this.node.setAuxiliaryPaymentGate((payment) =>
 				this.admitAssetPayment(payment)
 			);
+			// Issue #2098, step 7: and a forward with an asset leg, which
+			// drain mode refuses before anything of it is offered.
+			this.node.setAuxiliaryForwardGate(() => this.admitAssetForward());
 		}
 		// A deferred restore of the stored network map reports when it ends.
 		this.node.on('graph:restored', () => {
@@ -4561,20 +4607,36 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 				amountInMsat: bigint;
 				amountOutMsat: bigint;
 				feeMsat: bigint;
+				auxiliary?: true;
+				inAuxiliaryAmount?: bigint;
+				inWireAmountMsat?: bigint;
+				outAuxiliaryAmount?: bigint;
+				outWireAmountMsat?: bigint;
+				nextHopScid?: Buffer;
 			}) => {
+				// Issue #2098, step 7: a forward with an asset leg carries its
+				// marks, as strings, in the log and the event alike.
+				const marks = forwardMarks({
+					...data,
+					...(data.nextHopScid
+						? { nextHopScid: data.nextHopScid.toString('hex') }
+						: { nextHopScid: undefined })
+				});
 				this.log('info', 'HTLC forwarded', {
 					inChannelId: data.inChannelId.toString('hex'),
 					outChannelId: data.outChannelId.toString('hex'),
 					amountInSats: (data.amountInMsat / 1000n).toString(),
 					amountOutSats: (data.amountOutMsat / 1000n).toString(),
-					feeMsat: data.feeMsat.toString()
+					feeMsat: data.feeMsat.toString(),
+					...marks
 				});
 				this.emit('htlc:forwarded', {
 					inChannelId: data.inChannelId.toString('hex'),
 					outChannelId: data.outChannelId.toString('hex'),
 					amountInMsat: data.amountInMsat.toString(),
 					amountOutMsat: data.amountOutMsat.toString(),
-					feeMsat: data.feeMsat.toString()
+					feeMsat: data.feeMsat.toString(),
+					...marks
 				});
 			}
 		);
@@ -4596,7 +4658,9 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 				reason: data.reason,
 				...(data.channelErrorCode !== undefined
 					? { channelErrorCode: data.channelErrorCode }
-					: {})
+					: {}),
+				// Issue #2098, step 7: a forward with an asset leg, marked.
+				...(data.auxiliary === true ? { auxiliary: true as const } : {})
 			};
 			this.log('info', 'HTLC forward refused', info);
 			this.emit('htlc:forward-refused', info);
@@ -12832,8 +12896,34 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 		if ((this.directFundingSender?.inFlight() ?? 0) > 0) return true;
 		// A swap whose funding or refund is owed to the network must see it out.
 		if ((this.node.getSwapProvider()?.inFlightFundings() ?? 0) > 0) return true;
+		// Issue #2098, step 7: so must a forward with an asset leg, and the
+		// ends of its legs its host has not taken yet: a build without such
+		// forwards keeps none of them. Drain mode refuses new ones
+		// (admitAssetForward), so those in flight end.
+		if (this._gatesAssetPayments && this.assetForwardsInFlight()) return true;
 		const payments = this.node.listPayments();
 		return payments.some((p) => p.status === 'PENDING');
+	}
+
+	/**
+	 * Issue #2098, step 7: whether an asset channel of the node has a forward
+	 * with an asset leg in flight, or an end of one its host has not taken
+	 * (getAuxiliaryChannelInfo's forwardsInFlight and
+	 * undeliveredForwardLegEnds). A node that cannot answer has none.
+	 */
+	private assetForwardsInFlight(): boolean {
+		try {
+			return this.node.listChannels().some((channel) => {
+				if (channel.auxiliary !== true) return false;
+				const info = this.node.getAuxiliaryChannelInfo(channel.channelId);
+				return (
+					(info?.forwardsInFlight ?? 0) > 0 ||
+					(info?.undeliveredForwardLegEnds ?? 0) > 0
+				);
+			});
+		} catch {
+			return false;
+		}
 	}
 
 	private _checkDraining(): void {
@@ -14091,7 +14181,8 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 			outScid: f.outScid,
 			amountInMsat: f.amountInMsat.toString(),
 			amountOutMsat: f.amountOutMsat.toString(),
-			feeMsat: f.feeMsat.toString()
+			feeMsat: f.feeMsat.toString(),
+			...forwardMarks(f)
 		}));
 	}
 
@@ -14103,7 +14194,17 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 		return {
 			count: summary.count,
 			volumeOutMsat: summary.volumeOutMsat.toString(),
-			feesEarnedMsat: summary.feesEarnedMsat.toString()
+			feesEarnedMsat: summary.feesEarnedMsat.toString(),
+			// Issue #2098, step 7: the forwards with an asset leg, apart.
+			...(summary.auxiliary
+				? {
+						auxiliary: {
+							count: summary.auxiliary.count,
+							volumeOutMsat: summary.auxiliary.volumeOutMsat.toString(),
+							feesEarnedMsat: summary.auxiliary.feesEarnedMsat.toString()
+						}
+				  }
+				: {})
 		};
 	}
 
@@ -16911,6 +17012,25 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 				}
 				this._releaseAsyncSpendClaim(held);
 			});
+		}
+		return undefined;
+	}
+
+	/**
+	 * The gate on every forward with an asset leg through this node (issue
+	 * #2098, step 7). Drain mode, which stops this wallet's own payments,
+	 * also refuses such a forward before anything of it is offered, so that
+	 * a drain before a stop or a downgrade starts no new one and lets those
+	 * in flight end. Every other forward goes through: no limit of this
+	 * daemon's counts a forward, and an ordinary forward is not refused by
+	 * drain mode either. The refusal carries SERVICE_DRAINING as its code.
+	 */
+	private admitAssetForward(): ReturnType<AuxiliaryForwardGate> {
+		if (this._draining) {
+			return {
+				reason: 'SERVICE_DRAINING',
+				message: 'Node is draining: no new forwards with an asset leg'
+			};
 		}
 		return undefined;
 	}
