@@ -41,6 +41,12 @@ export interface ISerializedHtlcEntry {
 	addRemoteSigned?: boolean;
 	/** Edge-trigger marker for HTLC_FORWARDED dispatch (see IHtlcEntry). */
 	forwardEmitted?: boolean;
+	/** The node asked its host about forwarding it (see IHtlcEntry). */
+	forwardAsked?: boolean;
+	/** The host is to be told how this leg of a forward ends (see IHtlcEntry). */
+	forwardTaken?: boolean;
+	/** The incoming HTLC of the forward this offered HTLC is the outgoing leg of (see IHtlcEntry). */
+	forwardOf?: { channelId: string; htlcId: string };
 	/** Admission-time dust-exposure classification (see IHtlcEntry). */
 	dustExposureFailback?: boolean;
 	/** Admission-time expired-at-our-tip classification (see IHtlcEntry). */
@@ -108,6 +114,16 @@ export function serializeHtlcEntry(
 			: {}),
 		...(e.forwardEmitted !== undefined
 			? { forwardEmitted: e.forwardEmitted }
+			: {}),
+		...(e.forwardAsked !== undefined ? { forwardAsked: e.forwardAsked } : {}),
+		...(e.forwardTaken !== undefined ? { forwardTaken: e.forwardTaken } : {}),
+		...(e.forwardOf !== undefined
+			? {
+					forwardOf: {
+						channelId: e.forwardOf.channelId.toString('hex'),
+						htlcId: e.forwardOf.htlcId.toString()
+					}
+			  }
 			: {}),
 		...(e.dustExposureFailback !== undefined
 			? { dustExposureFailback: e.dustExposureFailback }
@@ -182,6 +198,16 @@ export function deserializeHtlcEntry(s: ISerializedHtlcEntry): {
 				: {}),
 			...(s.forwardEmitted !== undefined
 				? { forwardEmitted: s.forwardEmitted }
+				: {}),
+			...(s.forwardAsked !== undefined ? { forwardAsked: s.forwardAsked } : {}),
+			...(s.forwardTaken !== undefined ? { forwardTaken: s.forwardTaken } : {}),
+			...(s.forwardOf !== undefined
+				? {
+						forwardOf: {
+							channelId: Buffer.from(s.forwardOf.channelId, 'hex'),
+							htlcId: BigInt(s.forwardOf.htlcId)
+						}
+				  }
 				: {}),
 			...(s.dustExposureFailback !== undefined
 				? { dustExposureFailback: s.dustExposureFailback }

@@ -69,6 +69,22 @@ export interface IAuxiliaryChannelInfo {
 	 */
 	undeliveredOutcomes?: number;
 	/**
+	 * Issue #2098: how many forwards with an asset leg that hold this channel
+	 * at either end are not over yet (the node keeps a link for each).
+	 * Present only when there are some. A host that is to take the node back
+	 * to a build without asset forwards stops answering prepareForward and
+	 * waits until no asset channel reports any.
+	 */
+	forwardsInFlight?: number;
+	/**
+	 * Issue #2098: how many ends of forward legs the channel holds that the
+	 * host has not taken (onForwardLegResolved has not returned for them).
+	 * Present only when there are some. At
+	 * ChannelManager.AUXILIARY_MAX_UNDELIVERED_OUTCOMES the channel takes no
+	 * forward with an asset leg.
+	 */
+	undeliveredForwardLegEnds?: number;
+	/**
 	 * How large the store of revoked views of the channel is: `rows`, one
 	 * for each commitment of the peer whose asset side the node keeps so
 	 * that it can punish that commitment, and `bytes`, what their values
@@ -180,11 +196,10 @@ export interface IAuxiliaryRestoredChannel {
 /**
  * Asset channel support, set as `INodeConfig.auxiliaryChannels`. The
  * provider extends the channel state machine; the callbacks tie funding
- * and payment to the host's asset protocol. A node with asset channels is
- * only ever an endpoint of an asset payment: nothing that arrives on an
- * asset channel is forwarded, and nothing is forwarded out over one. The
- * hooks of a forward with an asset leg (`prepareForward`,
- * `onForwardLegResolved`) are declared and not called yet.
+ * and payment to the host's asset protocol. A node forwards an HTLC with an
+ * asset leg only for a host that supplies `prepareForward` (issue #2098),
+ * and tells it how each leg ends through `onForwardLegResolved`; without
+ * that hook the node is only ever an endpoint of an asset payment.
  */
 export interface IAuxiliaryChannelConfig {
 	/** Standard-wire CSV compatibility for new channels only. Does not authorize legacy signatures. */
@@ -214,7 +229,9 @@ export interface IAuxiliaryChannelConfig {
 	 * channel it arrived on. Only the host knows that a payment hash belongs
 	 * to an asset invoice, so it sees each of them and can refuse. An HTLC
 	 * that arrived on an asset channel or carries asset units and does not
-	 * end at this node is failed back without asking. One of three answers:
+	 * end at this node is never put to this hook: it is failed back, or,
+	 * with the switch for asset forwards on, put to `prepareForward`. One of
+	 * three answers:
 	 *
 	 * - A value in millisatoshis, above zero and within a u64: the HTLC is
 	 *   the host's and is worth that much. The node goes on with that value
@@ -240,11 +257,14 @@ export interface IAuxiliaryChannelConfig {
 	 */
 	valueIncomingHtlc?(context: IAuxiliaryIncomingHtlc): bigint | undefined;
 	/**
-	 * Declared and not called by this build: every forward with an asset leg
-	 * is refused before anything is offered, whatever this would answer. The
-	 * contract it will be called under is in docs/EXTENSIONS.md ("Forwards
-	 * with an asset leg"), and `AUXILIARY_CHANNELS_API` lists it in
-	 * `surfaces` from the build that calls it.
+	 * Issue #2098. The node asks it about a bitcoin HTLC whose next hop is a
+	 * short channel id the node has no channel for, or an asset channel the
+	 * onion names; about an HTLC that came in on an asset channel with units
+	 * and is to go on over an ordinary channel the onion names, or over
+	 * another asset channel, the one the onion names or the one a quote's
+	 * short channel id stands for. The contract it is called under is in
+	 * docs/EXTENSIONS.md ("Forwards with an asset leg"), and
+	 * `AUXILIARY_CHANNELS_API.surfaces` names it from the build that calls it.
 	 *
 	 * Asked about an HTLC the node is to forward when either leg is an asset
 	 * leg, or when its next hop is a short channel id the node has no channel
@@ -273,10 +293,10 @@ export interface IAuxiliaryChannelConfig {
 		request: IAuxiliaryForwardRequest
 	): IAuxiliaryForwardTerms | undefined;
 	/**
-	 * Declared and not called by this build. The end of each leg of a
-	 * forward the host took on, in its channel or on the chain, told once
-	 * the leg's HTLC has left its channel for good or the chain has resolved
-	 * it. Idempotent durable callback, delivered again after a crash until it
+	 * Issue #2098. The end of each leg of a forward the host took on, in its
+	 * channel or on the chain, told once the leg's HTLC has left its channel
+	 * for good or the chain has resolved it, and an outgoing leg never
+	 * offered. Kept with the leg's channel row until a call returns. Idempotent durable callback, delivered again after a crash until it
 	 * returns without throwing, outside any storage transaction. A promise
 	 * it returns is not awaited: the leg counts as delivered when the call
 	 * returns, and a later rejection does not deliver it again.

@@ -98,6 +98,15 @@ export class ChainMonitor {
 	 * fresh chain evidence.
 	 */
 	private _commitmentReverifyPending = false;
+	/**
+	 * Issue #2098, step 5: a restored commitment record that is not final has
+	 * not been reported again by this session's funding watch. Its height is
+	 * kept, but it is not taken as depth for failing a forward back
+	 * (offeredAuxiliaryHtlcAbsent) until the chain says it again: a
+	 * reorganisation while the node was down may have put another commitment
+	 * in its place. Not persisted, for the same reason as the flag above.
+	 */
+	private _commitmentDepthUnverified = false;
 
 	constructor(
 		channelState: IChannelState,
@@ -518,6 +527,18 @@ export class ChainMonitor {
 			}
 			monitor._commitmentReverifyPending = true;
 		}
+		// Issue #2098, step 5: the height of any other commitment that is not
+		// final is kept as it is, and used for everything it was used for
+		// before; only a forward's fail back waits for this session's watch to
+		// say it again (offeredAuxiliaryHtlcAbsent).
+		if (
+			monitor._state !== MonitorState.FULLY_RESOLVED &&
+			monitor._commitmentBroadcast &&
+			monitor._commitmentBroadcast.commitmentType !==
+				CommitmentType.COOPERATIVE_CLOSE
+		) {
+			monitor._commitmentDepthUnverified = true;
+		}
 		// Restore known preimages if present
 		if (saved.knownPreimages) {
 			for (const [hash, preimage] of Object.entries(saved.knownPreimages)) {
@@ -703,6 +724,7 @@ export class ChainMonitor {
 		// window the restore reset opened: every arm below either binds a height,
 		// demotes on a competing spend, or replaces the record outright.
 		this._commitmentReverifyPending = false;
+		this._commitmentDepthUnverified = false;
 		if (this._state !== MonitorState.WATCHING) {
 			// Commitment SWAP: a DIFFERENT tx now spends the funding output. The
 			// funding outpoint can only be spent once per chain, so a confirmed
@@ -1266,6 +1288,10 @@ export class ChainMonitor {
 		if (this._channelState.auxiliaryState) {
 			output.resolutionTxHex = spendingTx.toHex();
 			selectAuxiliarySweep(output, spendingTx.getId());
+		} else if (this._carriesForwardLeg(output)) {
+			// Issue #2098, step 5: whose spend it was says how a forward's leg
+			// on this ordinary channel ended (forwardLegChainEndings).
+			output.resolutionTxHex = spendingTx.toHex();
 		}
 		output.confirmationHeight = blockHeight;
 		// A spend we had not recorded is live evidence as much as a re-report of
@@ -1494,6 +1520,8 @@ export class ChainMonitor {
 				spentTrackedOutput.resolutionTxHex = spendingTx.toHex();
 				selectAuxiliarySweep(spentTrackedOutput, spendingTx.getId());
 				delete spentTrackedOutput.auxiliaryFeeWait;
+			} else if (this._carriesForwardLeg(spentTrackedOutput)) {
+				spentTrackedOutput.resolutionTxHex = spendingTx.toHex();
 			}
 			spentTrackedOutput.confirmationHeight = blockHeight;
 			delete spentTrackedOutput.spendReverifyPending;
@@ -2892,6 +2920,205 @@ export class ChainMonitor {
 			...(broadcast.auxiliaryAbsentHtlcsRecorded ?? []),
 			key
 		];
+	}
+
+	/**
+	 * Issue #2098, step 5: whether the spend of a tracked HTLC output shows
+	 * the preimage of its payment hash. Undefined while the spending
+	 * transaction is not held, which only the monitor of an asset channel
+	 * keeps: an unknown answer proves nothing either way.
+	 */
+	spendShowsPreimage(output: ITrackedOutput): boolean | undefined {
+		const own = this._trackedOutputs.find(
+			(tracked) =>
+				tracked.txid === output.txid &&
+				tracked.outputIndex === output.outputIndex
+		);
+		return own ? this._spendShowsPreimage(own) : undefined;
+	}
+
+	/**
+	 * Issue #2098, step 5: whether an HTLC with units this node offered on an
+	 * asset channel is on no output of the commitment that confirmed, and not
+	 * fulfilled, that commitment at least `depth` blocks deep at a height
+	 * this session's watch has reported. The peer can never claim such an
+	 * HTLC while that commitment stands. With a revoked commitment of the
+	 * peer that is every such HTLC the channel holds
+	 * (_auxiliaryAbsentHtlcEndings).
+	 */
+	offeredAuxiliaryHtlcAbsent(htlcId: bigint, depth: number): boolean {
+		const broadcast = this._commitmentBroadcast;
+		if (
+			!broadcast ||
+			!this._channelState.auxiliaryState ||
+			this._commitmentDepthUnverified ||
+			broadcast.blockHeight <= 0 ||
+			this._currentBlockHeight - broadcast.blockHeight < depth
+		) {
+			return false;
+		}
+		const type = broadcast.commitmentType;
+		if (
+			type !== CommitmentType.OUR_COMMITMENT &&
+			type !== CommitmentType.THEIR_CURRENT_COMMITMENT &&
+			type !== CommitmentType.THEIR_REVOKED_COMMITMENT
+		) {
+			return false;
+		}
+		return this._auxiliaryAbsentHtlcEndings(broadcast, true).some(
+			(ending) =>
+				ending.offered &&
+				ending.htlcId === htlcId &&
+				ending.outcome === 'failed'
+		);
+	}
+
+	/**
+	 * Issue #2098, step 5: whether an HTLC of this channel is settled on the
+	 * chain for good: the monitor has nothing left to resolve, or the
+	 * commitment that confirmed is irrevocable and the HTLC's first-level
+	 * output is resolved for good or there is none for it.
+	 */
+	htlcEndedOnChainForGood(direction: HtlcDirection, htlcId: bigint): boolean {
+		if (this._state === MonitorState.FULLY_RESOLVED) return true;
+		const broadcast = this._commitmentBroadcast;
+		if (
+			!broadcast ||
+			broadcast.blockHeight <= 0 ||
+			this._currentBlockHeight - broadcast.blockHeight < IRREVOCABLE_DEPTH
+		) {
+			return false;
+		}
+		const outputType =
+			direction === HtlcDirection.OFFERED
+				? OutputType.OFFERED_HTLC
+				: OutputType.RECEIVED_HTLC;
+		const output = this._trackedOutputs.find(
+			(tracked) =>
+				tracked.txid === broadcast.txid &&
+				!tracked.isSecondLevelHtlc &&
+				tracked.outputType === outputType &&
+				tracked.htlcId === htlcId
+		);
+		return (
+			output === undefined ||
+			output.status === OutputStatus.IRREVOCABLY_RESOLVED
+		);
+	}
+
+	/**
+	 * Issue #2098, step 5: whether a tracked first-level HTLC output of an
+	 * ordinary channel is a leg of a forward with an asset leg whose host is
+	 * to be told how it ends (IHtlcEntry.forwardOf, forwardTaken).
+	 */
+	private _carriesForwardLeg(output: ITrackedOutput): boolean {
+		if (output.htlcId === undefined || output.isSecondLevelHtlc) return false;
+		if (output.outputType === OutputType.OFFERED_HTLC) {
+			return (
+				this._channelState.htlcs.get(`offered-${output.htlcId}`)?.forwardOf !==
+				undefined
+			);
+		}
+		if (output.outputType === OutputType.RECEIVED_HTLC) {
+			return (
+				this._channelState.htlcs.get(`received-${output.htlcId}`)
+					?.forwardTaken === true
+			);
+		}
+		return false;
+	}
+
+	/**
+	 * Issue #2098, step 5: how each HTLC of an ordinary channel that is a leg
+	 * of a forward with an asset leg ended on the chain, once that is for
+	 * good. Asked on every block, so an ending is said again after a crash
+	 * until the caller has kept it (the HTLC then carries no mark).
+	 *
+	 * An output spent for good ended by whose spend it was: one that shows
+	 * the preimage paid the HTLC (the peer's claim of an HTLC this node
+	 * offered, this node's claim of one it received), any other did not. An
+	 * HTLC on no output of the commitment that confirmed, once that is for
+	 * good, ended as it stood in the channel: fulfilled when its preimage had
+	 * been given. An HTLC this node received and did not claim has failed
+	 * once its expiry has passed with the commitment there for good and no
+	 * preimage held for it. Nothing for a commitment whose HTLCs the node
+	 * cannot read off it.
+	 */
+	forwardLegChainEndings(): Array<{
+		direction: HtlcDirection;
+		htlcId: bigint;
+		outcome: 'fulfilled' | 'failed';
+	}> {
+		const broadcast = this._commitmentBroadcast;
+		if (
+			!broadcast ||
+			broadcast.blockHeight <= 0 ||
+			this._channelState.auxiliaryState
+		) {
+			return [];
+		}
+		const type = broadcast.commitmentType;
+		if (
+			type !== CommitmentType.OUR_COMMITMENT &&
+			type !== CommitmentType.THEIR_CURRENT_COMMITMENT &&
+			type !== CommitmentType.THEIR_REVOKED_COMMITMENT
+		) {
+			return [];
+		}
+		const irrevocable =
+			this._currentBlockHeight - broadcast.blockHeight >= IRREVOCABLE_DEPTH;
+		const endings: ReturnType<ChainMonitor['forwardLegChainEndings']> = [];
+		for (const entry of this._channelState.htlcs.values()) {
+			const offered = entry.direction === HtlcDirection.OFFERED;
+			if (
+				offered ? entry.forwardOf === undefined : entry.forwardTaken !== true
+			) {
+				continue;
+			}
+			const outputType = offered
+				? OutputType.OFFERED_HTLC
+				: OutputType.RECEIVED_HTLC;
+			const output = this._trackedOutputs.find(
+				(tracked) =>
+					tracked.txid === broadcast.txid &&
+					!tracked.isSecondLevelHtlc &&
+					tracked.outputType === outputType &&
+					tracked.htlcId === entry.id
+			);
+			if (output) {
+				if (output.status === OutputStatus.IRREVOCABLY_RESOLVED) {
+					const shown = this._spendShowsPreimage(output);
+					if (shown === undefined) continue;
+					endings.push({
+						direction: entry.direction,
+						htlcId: entry.id,
+						outcome: shown ? 'fulfilled' : 'failed'
+					});
+				} else if (
+					!offered &&
+					irrevocable &&
+					output.status !== OutputStatus.SPEND_CONFIRMED &&
+					output.cltvExpiry !== undefined &&
+					output.cltvExpiry > 0 &&
+					this._currentBlockHeight >= output.cltvExpiry &&
+					!this._knownPreimages.has(entry.paymentHash.toString('hex'))
+				) {
+					endings.push({
+						direction: entry.direction,
+						htlcId: entry.id,
+						outcome: 'failed'
+					});
+				}
+				continue;
+			}
+			if (!irrevocable) continue;
+			endings.push({
+				direction: entry.direction,
+				htlcId: entry.id,
+				outcome: entry.state === HtlcState.FULFILLED ? 'fulfilled' : 'failed'
+			});
+		}
+		return endings;
 	}
 
 	private _handleCooperativeClose(actions: ChainAction[]): ChainAction[] {

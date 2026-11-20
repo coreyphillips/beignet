@@ -4125,6 +4125,134 @@ export class Channel {
 	}
 
 	/**
+	 * Issue #2098, step 5: keep the end of a leg of a forward with an asset
+	 * leg that has left this channel, in the channel's own row, until the
+	 * host has been told (onForwardLegResolved): the incoming leg on a
+	 * received HTLC whose host took the forward on (forwardTaken), the
+	 * outgoing leg on an offered HTLC (forwardOf). The mark goes once the end
+	 * is kept, so an end is kept once; a retained removal keeps its own copy
+	 * of the mark, for the chain to say otherwise later. False for any other
+	 * HTLC.
+	 */
+	private _recordForwardLegEnd(
+		entry: IHtlcEntry,
+		end: {
+			onChain: boolean;
+			outcome?: 'fulfilled' | 'failed';
+			preimageRevealed?: boolean;
+		}
+	): boolean {
+		const own = this._state.channelId;
+		const incoming =
+			entry.direction === HtlcDirection.RECEIVED && entry.forwardTaken === true;
+		const outgoing =
+			entry.direction === HtlcDirection.OFFERED &&
+			entry.forwardOf !== undefined;
+		if (!own || (!incoming && !outgoing)) return false;
+		const leg = incoming ? 'incoming' : 'outgoing';
+		this._state.forwardLegEnds ??= new Map();
+		this._state.forwardLegEnds.set(`${leg}:${entry.id}`, {
+			paymentHash: Buffer.from(entry.paymentHash),
+			incomingChannelId: Buffer.from(
+				incoming ? own : entry.forwardOf!.channelId
+			),
+			incomingHtlcId: incoming ? entry.id : entry.forwardOf!.htlcId,
+			leg,
+			channelId: Buffer.from(own),
+			htlcId: entry.id,
+			outcome:
+				end.outcome ??
+				(entry.state === HtlcState.FULFILLED ? 'fulfilled' : 'failed'),
+			onChain: end.onChain,
+			...(entry.auxiliaryAmount !== undefined
+				? { auxiliaryAmount: entry.auxiliaryAmount }
+				: {}),
+			customRecords: copyCustomRecords(entry.customRecords) ?? new Map(),
+			...(end.preimageRevealed === true
+				? { preimageRevealed: true as const }
+				: {})
+		});
+		delete entry.forwardTaken;
+		delete entry.forwardOf;
+		return true;
+	}
+
+	/**
+	 * Issue #2098, step 5: whether the host is to be told how the leg of a
+	 * forward that this received HTLC is ends (IHtlcEntry.forwardTaken).
+	 */
+	forwardTaken(htlcId: bigint): boolean {
+		return this._state.htlcs.get(`received-${htlcId}`)?.forwardTaken === true;
+	}
+
+	/**
+	 * Marks the received HTLC as the incoming leg of a forward its host took
+	 * on. False when the channel holds no such HTLC. The caller writes the row.
+	 */
+	markForwardTaken(htlcId: bigint): boolean {
+		const entry = this._state.htlcs.get(`received-${htlcId}`);
+		if (!entry) return false;
+		entry.forwardTaken = true;
+		return true;
+	}
+
+	/** Takes the mark back, when its row could not be written. */
+	unmarkForwardTaken(htlcId: bigint): void {
+		const entry = this._state.htlcs.get(`received-${htlcId}`);
+		if (entry) delete entry.forwardTaken;
+	}
+
+	/**
+	 * Issue #2098, step 5: keep, in the row of the channel the HTLC came in
+	 * on, that the outgoing leg of its forward was never offered, and mark
+	 * the received HTLC so that its own end is kept too. `channelId` is the
+	 * channel the node found or the host named, when there was one. The
+	 * caller writes the row.
+	 */
+	recordForwardNeverOffered(
+		inHtlcId: bigint,
+		paymentHash: Buffer,
+		channelId?: Buffer
+	): boolean {
+		const own = this._state.channelId;
+		if (!own) return false;
+		this._state.forwardLegEnds ??= new Map();
+		this._state.forwardLegEnds.set(`never-offered:${inHtlcId}`, {
+			paymentHash: Buffer.from(paymentHash),
+			incomingChannelId: Buffer.from(own),
+			incomingHtlcId: inHtlcId,
+			leg: 'outgoing',
+			...(channelId ? { channelId: Buffer.from(channelId) } : {}),
+			outcome: 'never-offered',
+			onChain: false,
+			customRecords: new Map()
+		});
+		const entry = this._state.htlcs.get(`received-${inHtlcId}`);
+		if (entry) entry.forwardTaken = true;
+		return true;
+	}
+
+	/**
+	 * Issue #2098, step 5: an HTLC of this channel that is a leg of a forward
+	 * with an asset leg ended on the chain, for good. False when the channel
+	 * holds no such HTLC or it carries no forward's leg.
+	 */
+	recordForwardLegChainEnd(
+		direction: HtlcDirection,
+		htlcId: bigint,
+		outcome: 'fulfilled' | 'failed'
+	): boolean {
+		const entry = this._state.htlcs.get(
+			`${
+				direction === HtlcDirection.OFFERED ? 'offered' : 'received'
+			}-${htlcId}`
+		);
+		return entry
+			? this._recordForwardLegEnd(entry, { onChain: true, outcome })
+			: false;
+	}
+
+	/**
 	 * Asset channels: what this node decided for an HTLC it received, or
 	 * undefined while it has decided nothing.
 	 */
@@ -4167,6 +4295,31 @@ export class Channel {
 	/** Take back a decision whose row could not be written. */
 	dropAuxiliaryHtlcDecision(htlcId: bigint): void {
 		this._state.auxiliaryState?.htlcDecisions?.delete(htlcId.toString());
+	}
+
+	/**
+	 * Issue #2098: whether the node wrote that it asks its host about
+	 * forwarding the HTLC it received with this id (IHtlcEntry.forwardAsked).
+	 */
+	forwardAsked(htlcId: bigint): boolean {
+		return this._state.htlcs.get(`received-${htlcId}`)?.forwardAsked === true;
+	}
+
+	/**
+	 * Marks the received HTLC as one the node asks its host about forwarding.
+	 * False when the channel holds no such HTLC. The caller writes the row.
+	 */
+	markForwardAsked(htlcId: bigint): boolean {
+		const entry = this._state.htlcs.get(`received-${htlcId}`);
+		if (!entry) return false;
+		entry.forwardAsked = true;
+		return true;
+	}
+
+	/** Takes the mark back, when its row could not be written. */
+	unmarkForwardAsked(htlcId: bigint): void {
+		const entry = this._state.htlcs.get(`received-${htlcId}`);
+		if (entry) delete entry.forwardAsked;
 	}
 
 	/**
@@ -4333,6 +4486,13 @@ export class Channel {
 			outcome,
 			...(revealed ? { preimageRevealed: true as const } : {})
 		});
+		// Issue #2098, step 5: and the leg's end, when the HTLC is a leg of a
+		// forward whose host is to be told.
+		this._recordForwardLegEnd(entry, {
+			onChain: true,
+			outcome,
+			preimageRevealed: revealed
+		});
 		return true;
 	}
 
@@ -4343,7 +4503,9 @@ export class Channel {
 		onionRoutingPacket: Buffer,
 		blindingPoint?: Buffer,
 		skimmedFeeMsat?: bigint,
-		customRecords?: CustomRecords
+		customRecords?: CustomRecords,
+		/** Issue #2098, step 5: see IHtlcEntry.forwardOf. */
+		forwardOf?: { channelId: Buffer; htlcId: bigint }
 	): ChannelAction[] {
 		if (
 			skimmedFeeMsat !== undefined &&
@@ -4371,7 +4533,15 @@ export class Channel {
 			// ...and the signature we hold covers it only from the peer's next
 			// commitment_signed after that (see IHtlcEntry.addRemoteSigned).
 			addRemoteSigned: false,
-			...(blindingPoint ? { blindingPoint } : {})
+			...(blindingPoint ? { blindingPoint } : {}),
+			...(forwardOf
+				? {
+						forwardOf: {
+							channelId: Buffer.from(forwardOf.channelId),
+							htlcId: forwardOf.htlcId
+						}
+				  }
+				: {})
 		};
 
 		const msg: IUpdateAddHtlcMessage = {
@@ -7018,6 +7188,7 @@ export class Channel {
 					this._moveAuxiliaryBalance('remote', entry, 1n);
 				}
 				this._recordAuxiliaryResolution(entry);
+				this._recordForwardLegEnd(entry, { onChain: false });
 				this._state.htlcs.delete(key);
 			} else if (entry.state === HtlcState.FAILED) {
 				if (entry.direction === HtlcDirection.RECEIVED) {
@@ -7031,6 +7202,7 @@ export class Channel {
 					this._moveAuxiliaryBalance('local', entry, 1n);
 				}
 				this._recordAuxiliaryResolution(entry);
+				this._recordForwardLegEnd(entry, { onChain: false });
 				this._state.htlcs.delete(key);
 			}
 		}
@@ -11402,6 +11574,7 @@ export class Channel {
 				// (onHtlcResolved): the units are back and nothing else
 				// would ever say what became of the HTLC.
 				this._recordAuxiliaryResolution(entry);
+				this._recordForwardLegEnd(entry, { onChain: false });
 			}
 			dropped.push({
 				htlcId: msg.id,

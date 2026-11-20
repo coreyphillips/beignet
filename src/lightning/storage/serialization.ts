@@ -68,6 +68,90 @@ import type {
 	ISerializedAuxiliaryState,
 	SerializedCustomRecords
 } from './auxiliary-serialization';
+import type { IAuxiliaryForwardLegResolution } from '../channel/auxiliary-forward';
+
+/** Issue #2098, step 5: the end of a forward's leg, as a channel row keeps it. */
+export interface ISerializedForwardLegEnd {
+	key: string;
+	paymentHash: string;
+	incomingChannelId: string;
+	incomingHtlcId: string;
+	leg: 'incoming' | 'outgoing';
+	channelId?: string;
+	htlcId?: string;
+	outcome: 'fulfilled' | 'failed' | 'never-offered';
+	onChain: boolean;
+	auxiliaryAmount?: string;
+	customRecords?: SerializedCustomRecords;
+	preimageRevealed?: true;
+}
+
+function serializeForwardLegEnd(
+	key: string,
+	end: IAuxiliaryForwardLegResolution
+): ISerializedForwardLegEnd {
+	return {
+		key,
+		paymentHash: end.paymentHash.toString('hex'),
+		incomingChannelId: end.incomingChannelId.toString('hex'),
+		incomingHtlcId: end.incomingHtlcId.toString(),
+		leg: end.leg,
+		...(end.channelId !== undefined
+			? { channelId: end.channelId.toString('hex') }
+			: {}),
+		...(end.htlcId !== undefined ? { htlcId: end.htlcId.toString() } : {}),
+		outcome: end.outcome,
+		onChain: end.onChain,
+		...(end.auxiliaryAmount !== undefined
+			? { auxiliaryAmount: end.auxiliaryAmount.toString() }
+			: {}),
+		...(end.customRecords.size > 0
+			? { customRecords: serializeCustomRecords(end.customRecords) }
+			: {}),
+		...(end.preimageRevealed === true
+			? { preimageRevealed: true as const }
+			: {})
+	};
+}
+
+function deserializeForwardLegEnd(
+	s: ISerializedForwardLegEnd
+): [string, IAuxiliaryForwardLegResolution] {
+	if (
+		typeof s.key !== 'string' ||
+		(s.leg !== 'incoming' && s.leg !== 'outgoing') ||
+		(s.outcome !== 'fulfilled' &&
+			s.outcome !== 'failed' &&
+			s.outcome !== 'never-offered')
+	) {
+		throw new Error('Malformed serialized forward leg end');
+	}
+	return [
+		s.key,
+		{
+			paymentHash: Buffer.from(s.paymentHash, 'hex'),
+			incomingChannelId: Buffer.from(s.incomingChannelId, 'hex'),
+			incomingHtlcId: BigInt(s.incomingHtlcId),
+			leg: s.leg,
+			...(s.channelId !== undefined
+				? { channelId: Buffer.from(s.channelId, 'hex') }
+				: {}),
+			...(s.htlcId !== undefined ? { htlcId: BigInt(s.htlcId) } : {}),
+			outcome: s.outcome,
+			onChain: s.onChain === true,
+			...(s.auxiliaryAmount !== undefined
+				? { auxiliaryAmount: BigInt(s.auxiliaryAmount) }
+				: {}),
+			customRecords:
+				s.customRecords !== undefined
+					? deserializeCustomRecords(s.customRecords)
+					: new Map(),
+			...(s.preimageRevealed === true
+				? { preimageRevealed: true as const }
+				: {})
+		}
+	];
+}
 
 // ─── Primitive helpers ───
 
@@ -313,6 +397,12 @@ export interface ISerializedChannelState {
 	 * outside that window is byte for byte what it was.
 	 */
 	signedLocalRemovals?: ISerializedHtlcEntry[];
+	/**
+	 * Issue #2098, step 5: the ends of forward legs the host has not taken
+	 * (see IChannelState.forwardLegEnds). Absent when there are none, so a row
+	 * outside such a forward is byte for byte what it was.
+	 */
+	forwardLegEnds?: ISerializedForwardLegEnd[];
 	/** Per-remote-commitment HTLC snapshots for penalty completeness (H2). */
 	revokedHtlcSnapshots?: ISerializedHtlcSnapshot[];
 	compactHtlcHistory?: ICompactHtlcHistory;
@@ -882,6 +972,13 @@ export function serializeChannelState(
 					serializeHtlcEntry(`received-${e.id}`, e)
 			  )
 			: undefined,
+		...(s.forwardLegEnds?.size
+			? {
+					forwardLegEnds: [...s.forwardLegEnds].map(([key, end]) =>
+						serializeForwardLegEnd(key, end)
+					)
+			  }
+			: {}),
 		revokedHtlcSnapshots,
 		...(compactHistory
 			? { compactHtlcHistory: encodeHtlcHistory(history) }
@@ -1537,6 +1634,13 @@ export function deserializeChannelState(
 		signedLocalRemovals: s.signedLocalRemovals?.length
 			? s.signedLocalRemovals.map((h) => deserializeHtlcEntry(h).entry)
 			: undefined,
+		...(s.forwardLegEnds?.length
+			? {
+					forwardLegEnds: new Map(
+						s.forwardLegEnds.map((end) => deserializeForwardLegEnd(end))
+					)
+			  }
+			: {}),
 		revokedHtlcSnapshots,
 		...(s.compactHtlcHistory !== undefined ||
 		isFforConcurrentVersion(s.ffor?.concurrentVersion)

@@ -12,7 +12,10 @@ import type {
 	IAuxiliaryChannelConfig,
 	IAuxiliaryFundingDescriptor
 } from '../../../src/lightning/channel/auxiliary-funding';
-import { auxiliaryChannelOpens } from '../../../src/lightning/channel/auxiliary-switch';
+import {
+	auxiliaryChannelOpens,
+	auxiliaryForwards
+} from '../../../src/lightning/channel/auxiliary-switch';
 import { ChannelState } from '../../../src/lightning/channel/types';
 import { randomBytes as engineRandomBytes } from '../../../src/lightning/crypto/provider';
 import { Feature, FeatureFlags } from '../../../src/lightning/features/flags';
@@ -39,6 +42,24 @@ export function withAssetOpens(enabled = true): void {
 	});
 	after(() => {
 		auxiliaryChannelOpens.enabled = prior;
+	});
+}
+
+/**
+ * Set forwards with an asset leg on, or off, for the tests of the describe
+ * block this is called in, and back to what they were after it (issue
+ * #2098). The build has them on since step 5 of that issue; a block that
+ * calls this says that it depends on them, or with `false` on their
+ * absence.
+ */
+export function withAssetForwards(enabled = true): void {
+	let prior = false;
+	before(() => {
+		prior = auxiliaryForwards.enabled;
+		auxiliaryForwards.enabled = enabled;
+	});
+	after(() => {
+		auxiliaryForwards.enabled = prior;
 	});
 }
 
