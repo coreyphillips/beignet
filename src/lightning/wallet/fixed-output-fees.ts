@@ -204,6 +204,12 @@ export interface IFixedOutputFeePoolState {
 		neededSatoshis: bigint;
 		largestConfirmedSatoshis: bigint;
 		reason?: 'FEE_FUNDS_UNAVAILABLE' | 'FEE_BUDGET_EXHAUSTED';
+		/**
+		 * How many fee coins of `forFeeSatoshis` one split of the largest
+		 * confirmed ordinary coin would make now (the policy's feeCoinCount
+		 * at most); 0 when no split is possible.
+		 */
+		splitCoins: number;
 	};
 	/**
 	 * The refusal the most recent refused selection of this provider ended
@@ -2376,7 +2382,17 @@ export class FixedOutputFeePool {
 				forFeeSatoshis: fee,
 				neededSatoshis: needed,
 				largestConfirmedSatoshis: largest,
-				...(reason !== undefined ? { reason } : {})
+				...(reason !== undefined ? { reason } : {}),
+				splitCoins:
+					reason === undefined
+						? Math.min(
+								this.policy.feeCoinCount ?? 4,
+								Number(
+									(largest - this.policy.maxPreparationFeeSatoshis) /
+										(fee > BigInt(DUST) ? fee : BigInt(DUST))
+								)
+						  )
+						: 0
 			},
 			...(this.lastRefusal ? { lastRefusal: { ...this.lastRefusal } } : {})
 		};

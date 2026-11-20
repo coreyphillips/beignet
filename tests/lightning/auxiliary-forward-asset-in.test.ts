@@ -423,6 +423,15 @@ describe('an asset HTLC forwarded out over an ordinary channel (issue #2098, ste
 		};
 	}
 
+	/** The ends of the forward's legs the host was told, as `leg:outcome` (step 5). */
+	const legEnds = (told: IAuxiliaryForwardLegResolution[]): string[] =>
+		told.map((end) => `${end.leg}:${end.outcome}`).sort();
+	/** The never-offered end the host was told, beside its incoming leg's failure. */
+	const neverOfferedOf = (
+		told: IAuxiliaryForwardLegResolution[]
+	): IAuxiliaryForwardLegResolution =>
+		told.find((end) => end.outcome === 'never-offered')!;
+
 	/** The checks of a forward that went through. */
 	function forwarded(result: IResult): void {
 		expect(result.alice).to.equal(PaymentStatus.COMPLETED);
@@ -437,12 +446,27 @@ describe('an asset HTLC forwarded out over an ordinary channel (issue #2098, ste
 			9000n - INCOMING_UNITS
 		]);
 		// Asked once, after the node wrote that it asks, outside any storage
-		// transaction; told nothing, since nothing was refused. The hook of
-		// an HTLC that ends at the node is not asked about a forward.
+		// transaction; told how each leg ended (step 5): the asset leg it
+		// came in on, with its units and records, and the bitcoin leg. The
+		// hook of an HTLC that ends at the node is not asked about a forward.
 		expect(result.asked).to.have.length(1);
 		expect(result.inTransaction).to.deep.equal([false]);
 		expect(result.markedBeforeAsk).to.deep.equal([true]);
-		expect(result.told).to.deep.equal([]);
+		expect(legEnds(result.told)).to.deep.equal([
+			'incoming:fulfilled',
+			'outgoing:fulfilled'
+		]);
+		const incoming = result.told.find((end) => end.leg === 'incoming')!;
+		expect(incoming).to.deep.include({
+			incomingHtlcId: 0n,
+			htlcId: 0n,
+			auxiliaryAmount: INCOMING_UNITS,
+			onChain: false
+		});
+		expect(incoming.customRecords.size).to.equal(1);
+		const outgoing = result.told.find((end) => end.leg === 'outgoing')!;
+		expect(outgoing.auxiliaryAmount).to.equal(undefined);
+		expect(outgoing.customRecords.size).to.equal(0);
 		expect(result.valuedHere).to.equal(0);
 		expect(result.hooks).to.include(
 			`onHtlcResolved:${HtlcDirection.RECEIVED}:fulfilled`
@@ -469,8 +493,12 @@ describe('an asset HTLC forwarded out over an ordinary channel (issue #2098, ste
 
 	/** The one never-offered a host is told when it answered with terms. */
 	function toldNeverOffered(result: IResult, outChannel?: Buffer): void {
-		expect(result.told).to.have.length(1);
-		const [told] = result.told;
+		// Beside the incoming leg's own end: it was failed back (step 5).
+		expect(legEnds(result.told)).to.deep.equal([
+			'incoming:failed',
+			'outgoing:never-offered'
+		]);
+		const told = neverOfferedOf(result.told);
 		expect(told).to.deep.include({
 			incomingHtlcId: 0n,
 			leg: 'outgoing',
@@ -557,8 +585,12 @@ describe('an asset HTLC forwarded out over an ordinary channel (issue #2098, ste
 		expect(result.hooks).to.include(
 			`onHtlcResolved:${HtlcDirection.RECEIVED}:failed`
 		);
-		// It was offered, so the host is not told it never was.
-		expect(result.told).to.deep.equal([]);
+		// It was offered, so the host is not told it never was; each leg
+		// ended failed (step 5).
+		expect(legEnds(result.told)).to.deep.equal([
+			'incoming:failed',
+			'outgoing:failed'
+		]);
 	});
 
 	interface INotAsked {
@@ -708,7 +740,7 @@ describe('an asset HTLC forwarded out over an ordinary channel (issue #2098, ste
 			expect(result.asked).to.have.length(1);
 			if (refusal.told) {
 				toldNeverOffered(result, result.context.outChannel);
-				expect(result.told[0].customRecords.size).to.equal(0);
+				expect(neverOfferedOf(result.told).customRecords.size).to.equal(0);
 			} else {
 				expect(result.told).to.deep.equal([]);
 			}
@@ -724,7 +756,7 @@ describe('an asset HTLC forwarded out over an ordinary channel (issue #2098, ste
 		expect(result.asked).to.have.length(1);
 		expect(result.asked[0].outgoing).to.equal(undefined);
 		toldNeverOffered(result);
-		expect(result.told[0].channelId).to.equal(undefined);
+		expect(neverOfferedOf(result.told).channelId).to.equal(undefined);
 	});
 
 	it('asks again about an HTLC it had marked as asked before a stop, while the forward passes the checks made before the ask', async () => {
@@ -757,7 +789,7 @@ describe('an asset HTLC forwarded out over an ordinary channel (issue #2098, ste
 		expect(result.units).to.deep.equal([1000n, 9000n]);
 		expect(result.asked).to.deep.equal([]);
 		toldNeverOffered(result);
-		expect(result.told[0].channelId).to.equal(undefined);
+		expect(neverOfferedOf(result.told).channelId).to.equal(undefined);
 	});
 
 	it('tells a host nothing about an HTLC it was never asked about, when a check refuses it', async () => {
@@ -963,7 +995,10 @@ describe('an asset HTLC forwarded out over an ordinary channel (issue #2098, ste
 			state.auxiliaryState!.localBalance,
 			state.auxiliaryState!.remoteBalance
 		]).to.deep.equal([1000n + INCOMING_UNITS, 9000n - INCOMING_UNITS]);
-		expect(s.told).to.deep.equal([]);
+		expect(legEnds(s.told)).to.deep.equal([
+			'incoming:fulfilled',
+			'outgoing:fulfilled'
+		]);
 		fs.rmSync(s.directory, { recursive: true, force: true });
 	});
 
@@ -997,7 +1032,10 @@ describe('an asset HTLC forwarded out over an ordinary channel (issue #2098, ste
 		);
 		expect(s.bob.storage!.loadAllForwardedHtlcs()).to.have.length(0);
 		expect(s.asked).to.have.length(1);
-		expect(s.told).to.deep.equal([]);
+		expect(legEnds(s.told)).to.deep.equal([
+			'incoming:fulfilled',
+			'outgoing:fulfilled'
+		]);
 		fs.rmSync(s.directory, { recursive: true, force: true });
 	});
 
@@ -1037,7 +1075,10 @@ describe('an asset HTLC forwarded out over an ordinary channel (issue #2098, ste
 				.getFullState().localHtlcCounter
 		).to.equal(1n);
 		expect(s.asked).to.have.length(1);
-		expect(s.told).to.deep.equal([]);
+		expect(legEnds(s.told)).to.deep.equal([
+			'incoming:fulfilled',
+			'outgoing:fulfilled'
+		]);
 		fs.rmSync(s.directory, { recursive: true, force: true });
 	});
 
@@ -1154,7 +1195,9 @@ describe('an asset HTLC forwarded out over an ordinary channel (issue #2098, ste
 		);
 		expect(s.bob.storage!.loadAllForwardedHtlcs()).to.have.length(0);
 		expect(s.asked).to.have.length(1);
-		expect(s.told).to.deep.equal([]);
+		// The outgoing leg ends on the chain, which this test drives only as
+		// far as the event that fails the incoming leg back.
+		expect(legEnds(s.told)).to.deep.equal(['incoming:failed']);
 		fs.rmSync(s.directory, { recursive: true, force: true });
 	});
 
@@ -1274,7 +1317,9 @@ describe('an asset HTLC forwarded out over an ordinary channel (issue #2098, ste
 			PaymentStatus.FAILED
 		);
 		expect(asked).to.have.length(1);
-		expect(told).to.have.length(1);
+		expect(told.map((end) => `${end.leg}:${end.outcome}`).sort()).to.deep.equal(
+			['incoming:failed', 'outgoing:never-offered']
+		);
 		fs.rmSync(directory, { recursive: true, force: true });
 	});
 

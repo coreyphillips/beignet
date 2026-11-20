@@ -61,15 +61,17 @@ export const AUXILIARY_CHANNELS_API = Object.freeze({
 		'IPaymentInfo.unresolved',
 		// The hold:* events and the rows of listHoldInvoices and listHeldHtlcs
 		// carry auxiliary: true for a set with an HTLC that holds units.
-		'IHoldInvoiceStateEvent.auxiliary'
-	] as const),
-	declared: Object.freeze([
+		'IHoldInvoiceStateEvent.auxiliary',
 		// Forwards with an asset leg (issue #2098): prepareForward and
-		// onForwardLegResolved, with the types of auxiliary-forward.ts and
-		// the contract in docs/EXTENSIONS.md. Neither hook is called, and
-		// every forward with an asset leg is refused as before.
-		'prepareForward'
-	] as const)
+		// onForwardLegResolved, with the types of auxiliary-forward.ts and the
+		// contract in docs/EXTENSIONS.md, and IAuxiliaryChannelInfo's
+		// forwardsInFlight and undeliveredForwardLegEnds.
+		'prepareForward',
+		// The pool's status says how many fee coins a split would make now.
+		'getFixedOutputFeeStatus:splitCoins'
+	] as const),
+	// Nothing is declared and not run in this build.
+	declared: Object.freeze([] as const)
 });
 
 /** A name in `AUXILIARY_CHANNELS_API.surfaces`. */

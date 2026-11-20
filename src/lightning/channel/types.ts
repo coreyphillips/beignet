@@ -447,6 +447,24 @@ export interface IHtlcEntry {
 	 */
 	forwardAsked?: boolean;
 	/**
+	 * Issue #2098, step 5: on a received HTLC, its host took on forwarding it
+	 * (prepareForward answered with terms), or was told that the outgoing
+	 * leg was never offered, and is to be told how this leg ends
+	 * (onForwardLegResolved). Written only for a host that supplies that
+	 * hook, and taken away once the leg's end is kept in the channel's row
+	 * (IChannelState.forwardLegEnds). A build that does not know the field
+	 * drops it.
+	 */
+	forwardTaken?: boolean;
+	/**
+	 * Issue #2098, step 5: on an offered HTLC, the incoming HTLC of the
+	 * forward with an asset leg it is the outgoing leg of, for a host that is
+	 * to be told how this leg ends (onForwardLegResolved). Kept until that end
+	 * is kept in the channel's row. A build that does not know the field
+	 * drops it.
+	 */
+	forwardOf?: { channelId: Buffer; htlcId: bigint };
+	/**
 	 * FFOR Variant D (section 9.5.1 step 3): this HTLC is a voucher of the
 	 * channel's epoch, recognised from the book by (id, amount, hash, cltv).
 	 * On R it is parked: never dispatched to the node's onion path, never

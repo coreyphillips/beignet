@@ -85,7 +85,8 @@ describe('A node reads its fee coin pool (#2093)', function () {
 				forFeeSatoshis: 2000n,
 				neededSatoshis: 3000n,
 				largestConfirmedSatoshis: 0n,
-				reason: 'FEE_FUNDS_UNAVAILABLE'
+				reason: 'FEE_FUNDS_UNAVAILABLE',
+				splitCoins: 0
 			},
 			lastRefusal: { code: 'FEE_PREPARATION_PENDING', remedy: 'wait', at: 1 }
 		};

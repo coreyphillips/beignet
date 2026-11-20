@@ -1522,7 +1522,11 @@ describe('Asset payments (issue #2093, step 8)', function () {
 				'onHtlcResolved:never-sent',
 				'getFixedOutputFeeStatus',
 				'IPaymentInfo.unresolved',
-				'IHoldInvoiceStateEvent.auxiliary'
+				'IHoldInvoiceStateEvent.auxiliary',
+				// Issue #2098, step 5: forwards with an asset leg, and the coins
+				// a split of the fee coin pool would make.
+				'prepareForward',
+				'getFixedOutputFeeStatus:splitCoins'
 			]);
 			expect(Object.isFrozen(api)).to.equal(true);
 			expect(Object.isFrozen(api.surfaces)).to.equal(true);

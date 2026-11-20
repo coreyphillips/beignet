@@ -10,6 +10,7 @@ import { ShaChainStore } from '../keys/shachain';
 import type { IChannelBasepoints } from '../keys/derivation';
 import type { IFforEpochRecord } from '../ffor/types';
 import type { IChannelConfig, IHtlcEntry, IHtlcSnapshotEntry } from './types';
+import type { IAuxiliaryForwardLegResolution } from './auxiliary-forward';
 import type {
 	IAuxiliaryCommitmentData,
 	IChannelAuxiliaryProvider,
@@ -522,6 +523,17 @@ export interface IChannelState {
 	 * means none.
 	 */
 	signedLocalRemovals?: IHtlcEntry[];
+
+	/**
+	 * Issue #2098, step 5: the ends of the legs of forwards with an asset leg
+	 * that left this channel, or were never offered for an HTLC that came in
+	 * on it, kept until the host's onForwardLegResolved has taken them, after
+	 * a restart too. Keyed by `incoming:<HTLC id>`, `outgoing:<HTLC id>` or
+	 * `never-offered:<incoming HTLC id>`. Optional: absent means none, so a
+	 * row outside such a forward is byte for byte what it was. A build that
+	 * does not know the field drops it.
+	 */
+	forwardLegEnds?: Map<string, IAuxiliaryForwardLegResolution>;
 
 	/**
 	 * Per-remote-commitment HTLC snapshots, keyed by remote commitment number.

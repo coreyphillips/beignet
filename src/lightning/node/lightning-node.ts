@@ -140,6 +140,7 @@ import {
 	TESTNET_CHAIN_HASH,
 	REGTEST_CHAIN_HASH,
 	SIGNET_CHAIN_HASH,
+	isFixedAssetHtlcChannel,
 	isOverlayChannel
 } from '../channel/types';
 import type {
@@ -722,6 +723,31 @@ export const MAX_HELD_PARTS_PER_HASH = 64;
  * channel. LND's OutgoingCltvRejectDelta defaults to the same 3 blocks.
  */
 export const OUTGOING_CLTV_REJECT_DELTA = 3;
+/**
+ * Issue #2098: the fewest blocks a forward with an asset leg may have
+ * between its incoming expiry and its outgoing one, whatever the outgoing
+ * channel's policy allows. An outgoing HTLC that times out on the chain is
+ * spent there at the earliest a few blocks past its expiry, and the
+ * incoming leg is failed back once that spend is
+ * ASSET_FORWARD_FAIL_BACK_DEPTH deep: about 14 blocks past the outgoing
+ * expiry with a fee coin ready. An incoming asset leg whose outgoing leg is
+ * still unresolved goes to the chain INBOUND_HTLC_CLAIM_FORCE_CLOSE_BUFFER
+ * blocks before its own expiry. Below about 33 blocks the second comes
+ * first, and the incoming channel is closed for a forward that failed. The
+ * hint of a quote names 40, as lnd with tapd does.
+ */
+export const ASSET_FORWARD_MIN_CLTV_DELTA = 40;
+/**
+ * Issue #2098: how deep the spend that timed out the outgoing HTLC of a
+ * forward with an asset leg, or the commitment that confirmed without it,
+ * has to be before the incoming leg is failed back. An ordinary forward
+ * waits until the spend is irrevocable (IRREVOCABLE_DEPTH); with the
+ * expiry delta of a quote that comes after the incoming deadline, so the
+ * incoming channel would go to the chain. The risk taken is a reorganisation
+ * deeper than this that puts the peer's claim by preimage in the place of
+ * the timeout.
+ */
+export const ASSET_FORWARD_FAIL_BACK_DEPTH = 6;
 /** awaitPaymentResolution re-reads the HTLC view on this clock (#737). */
 const PAYMENT_RESOLUTION_POLL_MS = 250;
 /**
@@ -27624,7 +27650,9 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 					'fail'
 				);
 			}
-			const failed = failIncomingNow(failureCode, fields);
+			// Issue #2098, step 5: told before the failure, so that the incoming
+			// HTLC carries the mark by which its own end is kept, whenever its
+			// removal turns irrevocable.
 			if (askedBefore && !askSettled) {
 				askSettled = true;
 				this.tellForwardNeverOffered(
@@ -27634,7 +27662,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 					assetChannelNamed ?? ordinaryChannelNamed
 				);
 			}
-			return failed;
+			return failIncomingNow(failureCode, fields);
 		};
 
 		if (blindedCleartextFields) {
@@ -27714,6 +27742,61 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			return;
 		}
 
+		// Issue #2098, step 5: a forward with an asset leg needs room between
+		// its two expiries for an outgoing leg that times out on the chain to
+		// be failed back before the incoming deadline takes the incoming
+		// channel there too (ASSET_FORWARD_MIN_CLTV_DELTA). It needs no answer
+		// of the host's, so it is judged before the host is asked.
+		const assetDeltaShort =
+			incomingCltvExpiry - forwardCltv < ASSET_FORWARD_MIN_CLTV_DELTA;
+		// Issue #2098, step 5: a channel holding as many ends of forward legs
+		// as the node keeps for one, its host not taking them, takes no more.
+		const refuseLegEndsFull = (channelId: Buffer): boolean => {
+			if (!this.forwardLegEndsFull(channelId)) return false;
+			this.emitStructuredLog('htlc', 'asset_forward_declined', {
+				paymentHash: paymentHash.toString('hex'),
+				inChannelId: inChannelId.toString('hex'),
+				inHtlcId: Number(inHtlcId),
+				reason: `the channel ${channelId.toString(
+					'hex'
+				)} holds ends of forward legs that its host has not taken`
+			});
+			failIncoming(TEMPORARY_CHANNEL_FAILURE);
+			return true;
+		};
+		// Issue #2098, step 5: an incoming asset leg on a channel of the fixed
+		// mode is claimed on the chain with a fee coin, so the pool is looked
+		// at before the host is asked (assetForwardFeeRefusal).
+		const refuseIncomingFee = (): boolean => {
+			if (!assetIncoming) return false;
+			const inState = this.channelManager
+				.getChannel(inChannelId)
+				?.getFullState();
+			if (!isFixedAssetHtlcChannel(inState?.channelType)) return false;
+			const feeRefusal = this.assetForwardFeeRefusal(0);
+			if (!feeRefusal) return false;
+			this.emitStructuredLog('htlc', 'asset_forward_declined', {
+				paymentHash: paymentHash.toString('hex'),
+				inChannelId: inChannelId.toString('hex'),
+				inHtlcId: Number(inHtlcId),
+				reason: feeRefusal
+			});
+			failIncoming(TEMPORARY_CHANNEL_FAILURE);
+			return true;
+		};
+		const refuseAssetDelta = (): void => {
+			this.emitStructuredLog('htlc', 'asset_forward_declined', {
+				paymentHash: paymentHash.toString('hex'),
+				inChannelId: inChannelId.toString('hex'),
+				inHtlcId: Number(inHtlcId),
+				reason: `the expiry delta ${
+					incomingCltvExpiry - forwardCltv
+				} is under ${ASSET_FORWARD_MIN_CLTV_DELTA}`
+			});
+			// BOLT 4: the reported cltv_expiry is the outgoing HTLC's.
+			failIncoming(INCORRECT_CLTV_EXPIRY, { cltvExpiry: forwardCltv });
+		};
+
 		let peerChannelId: Buffer | undefined;
 		if (!outgoingScid && isBlindedForward && outgoingNodeId) {
 			const toPeer = this.findChannelForPeer(
@@ -27757,6 +27840,12 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				failIncoming(UNKNOWN_NEXT_PEER);
 				return;
 			}
+			if (assetDeltaShort) {
+				refuseAssetDelta();
+				return;
+			}
+			if (refuseLegEndsFull(inChannelId)) return;
+			if (refuseIncomingFee()) return;
 			this.forwardAssetIntoAsset({
 				inChannelId,
 				inHtlcId,
@@ -27818,6 +27907,11 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				this.assetForwardAskable(inChannelId) &&
 				!this.isRealScidOfOwnChannel(outgoingScid)
 			) {
+				if (assetDeltaShort) {
+					refuseAssetDelta();
+					return;
+				}
+				if (refuseLegEndsFull(inChannelId)) return;
 				this.forwardOverAssetChannel({
 					inChannelId,
 					inHtlcId,
@@ -27865,6 +27959,24 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		if (assetIncoming && assetChannelNamed === undefined) {
 			ordinaryChannelNamed = outChannelId;
 		}
+		if (
+			assetDeltaShort &&
+			(assetIncoming ||
+				(assetChannelNamed !== undefined &&
+					this.assetForwardAskable(inChannelId)))
+		) {
+			refuseAssetDelta();
+			return;
+		}
+		if (
+			(assetIncoming ||
+				(assetChannelNamed !== undefined &&
+					this.assetForwardAskable(inChannelId))) &&
+			(refuseLegEndsFull(inChannelId) || refuseLegEndsFull(outChannelId))
+		) {
+			return;
+		}
+		if (refuseIncomingFee()) return;
 		// The policy this forward must satisfy. A cleartext payer that is
 		// refused learns our current channel_update from the failure and
 		// retries, so the advertised terms bind at once. A blinded payer
@@ -28474,11 +28586,11 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	): void {
 		if (askedBefore) {
 			this.channelManager.recordForwardDecision(channelId, htlcId, 'fail');
-		}
-		fail();
-		if (askedBefore) {
+			// Issue #2098, step 5: told before the failure, so the incoming
+			// HTLC's own end is kept too.
 			this.tellForwardNeverOffered(paymentHash, channelId, htlcId);
 		}
+		fail();
 	}
 
 	/**
@@ -28524,6 +28636,47 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		);
 		if (failed.ok) this.cleanupHtlcSharedSecret(secretKey);
 		return true;
+	}
+
+	/**
+	 * Issue #2098, step 5: drop the link of every forward with an asset leg
+	 * whose incoming HTLC is settled on the chain for good, in a write of its
+	 * own: the chain decided that leg, and a preimage the outgoing leg gives
+	 * up later has nothing left to claim with. The outgoing leg's own end is
+	 * kept with its HTLC (IHtlcEntry.forwardOf), not with the link.
+	 */
+	private dropLinksEndedOnChain(): void {
+		for (const [outKey, forward] of [...this.forwardedHtlcs]) {
+			if (!this.forwardHasAssetLeg(outKey)) continue;
+			if (!this.channelOnChain(forward.inChannelId)) continue;
+			const monitor = this.channelManager.getMonitor(forward.inChannelId);
+			if (
+				!monitor?.htlcEndedOnChainForGood(
+					HtlcDirection.RECEIVED,
+					forward.inHtlcId
+				)
+			) {
+				continue;
+			}
+			this.forwardedHtlcs.delete(outKey);
+			this.withStagedMutations(
+				[{ type: 'delete_forwarded_htlc', outKey }],
+				() => undefined
+			);
+		}
+	}
+
+	/**
+	 * Issue #2098, step 5: whether a channel is gone to the chain, where no
+	 * message can resolve an HTLC of it any more.
+	 */
+	private channelOnChain(channelId: Buffer): boolean {
+		const state = this.channelManager.getChannel(channelId)?.getState();
+		return (
+			state === undefined ||
+			state === ChannelState.FORCE_CLOSED ||
+			state === ChannelState.CLOSED
+		);
 	}
 
 	/** Issue #2098: whether the incoming leg of a forward came in on an asset channel. */
@@ -28638,6 +28791,15 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		if (undelivered > ChannelManager.AUXILIARY_MAX_UNDELIVERED_OUTCOMES) {
 			return `the outgoing channel holds ${undelivered} outcomes of asset HTLCs that its host has not taken`;
 		}
+		if (this.forwardLegEndsFull(channelId)) {
+			return `the outgoing channel holds ${this.channelManager.undeliveredForwardLegEnds(
+				channelId
+			)} ends of forward legs that its host has not taken`;
+		}
+		if (isFixedAssetHtlcChannel(state.channelType)) {
+			const feeRefusal = this.assetForwardFeeRefusal(1);
+			if (feeRefusal) return feeRefusal;
+		}
 		if (forwardCltv !== undefined) {
 			const dustMsat =
 				(state.localConfig.dustLimitSatoshis >
@@ -28666,9 +28828,9 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	 * Issue #2098: tell the host that the outgoing leg of a forward it was
 	 * asked about was never offered (onForwardLegResolved), so that it can let
 	 * go of what it reserved for it. `channelId` is the channel the node found
-	 * or the host named, when there was one. The call is made once, here; its
-	 * durable store and redelivery come with the step of the issue that takes
-	 * the forward to the chain.
+	 * or the host named, when there was one. Step 5: the end is kept with the
+	 * row of the channel the HTLC came in on and told until a call returns,
+	 * after a restart too, and the incoming leg's own end is told as well.
 	 */
 	private tellForwardNeverOffered(
 		paymentHash: Buffer,
@@ -28676,28 +28838,114 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		inHtlcId: bigint,
 		channelId?: Buffer
 	): void {
-		const host = this.auxiliaryChannels;
-		if (typeof host?.onForwardLegResolved !== 'function') return;
-		try {
-			host.onForwardLegResolved({
-				paymentHash: Buffer.from(paymentHash),
-				incomingChannelId: Buffer.from(inChannelId),
-				incomingHtlcId: inHtlcId,
-				leg: 'outgoing',
-				...(channelId ? { channelId: Buffer.from(channelId) } : {}),
-				outcome: 'never-offered',
-				onChain: false,
-				customRecords: new Map()
-			});
-		} catch (err) {
-			this.emitStructuredLog('htlc', 'asset_forward_resolution_refused', {
-				paymentHash: paymentHash.toString('hex'),
-				inChannelId: inChannelId.toString('hex'),
-				inHtlcId: Number(inHtlcId),
-				outcome: 'never-offered',
-				error: err instanceof Error ? err.message : String(err)
-			});
+		this.channelManager.recordForwardNeverOffered(
+			inChannelId,
+			inHtlcId,
+			paymentHash,
+			channelId
+		);
+	}
+
+	/**
+	 * Issue #2098, step 5: the incoming HTLC a forward's outgoing leg is kept
+	 * with (IHtlcEntry.forwardOf), for a host that is told how each leg ends.
+	 */
+	private forwardOfFor(ctx: {
+		inChannelId: Buffer;
+		inHtlcId: bigint;
+	}): { channelId: Buffer; htlcId: bigint } | undefined {
+		return typeof this.auxiliaryChannels?.onForwardLegResolved === 'function'
+			? { channelId: Buffer.from(ctx.inChannelId), htlcId: ctx.inHtlcId }
+			: undefined;
+	}
+
+	/**
+	 * Issue #2098, step 5: a look at the fee coin pool before a forward with
+	 * an asset leg on a channel of the fixed mode pays out. Undefined when the
+	 * pool can pay to claim on the chain every asset HTLC the node holds on
+	 * its live channels of that mode (the forward's incoming HTLC among them
+	 * when it came in on one) and the `adding` ones the forward is about to
+	 * offer on such a channel, else why not:
+	 *  - there is no pool, or the wallet refused the policy, or its state
+	 *    cannot be read synchronously;
+	 *  - those HTLCs outnumber the fee coins that are ready and the ones a
+	 *    split of the largest confirmed coin would make now;
+	 *  - the budget has no room for two more spends at the policy's cap (an
+	 *    HTLC on the node's own commitment takes two: the second-level
+	 *    transaction and its sweep), and for a split's fee when no coin is
+	 *    ready.
+	 * It reads the pool as it is and reserves nothing; sizing the pool for a
+	 * channel that is full when it goes to the chain is step 6 of the issue.
+	 */
+	private assetForwardFeeRefusal(adding: number): string | undefined {
+		const provider = this.fundingProvider;
+		if (typeof provider?.getFixedOutputFeeStatus !== 'function') {
+			return 'the node keeps no fee coin pool';
 		}
+		let status: ReturnType<
+			NonNullable<IFundingProvider['getFixedOutputFeeStatus']>
+		>;
+		try {
+			status = provider.getFixedOutputFeeStatus();
+		} catch (err) {
+			return `the fee coin pool could not be read: ${
+				err instanceof Error ? err.message : String(err)
+			}`;
+		}
+		if (
+			status !== undefined &&
+			status !== null &&
+			typeof (status as { then?: unknown }).then === 'function'
+		) {
+			(status as unknown as Promise<unknown>).catch?.(() => undefined);
+			return 'the fee coin pool answered with a promise';
+		}
+		if (!status) return 'the node keeps no fee coin pool';
+		if (status.available !== true) {
+			return 'the wallet refused the fee policy, so there is no fee coin pool';
+		}
+		let held = 0;
+		for (const channel of this.channelManager.listChannels()) {
+			const state = channel.getFullState();
+			if (
+				state.auxiliaryState === undefined ||
+				!isFixedAssetHtlcChannel(state.channelType) ||
+				state.state === ChannelState.FORCE_CLOSED ||
+				state.state === ChannelState.CLOSED
+			) {
+				continue;
+			}
+			held += state.htlcs.size;
+		}
+		const coins =
+			status.feeCoins.ready +
+			(status.preparation.possible ? status.preparation.splitCoins : 0);
+		if (held + adding > coins) {
+			return `the fee coin pool can pay for ${coins} spends on the chain and the forward would leave the node with ${
+				held + adding
+			} asset HTLCs`;
+		}
+		const fee = status.preparation.forFeeSatoshis;
+		const dust = 330n;
+		const preparationFee =
+			status.preparation.neededSatoshis - (fee > dust ? fee : dust);
+		const room = 2n * fee + (status.feeCoins.ready === 0 ? preparationFee : 0n);
+		if (status.budget.remainingSatoshis < room) {
+			return `the fee budget has ${status.budget.remainingSatoshis} sat left, under the ${room} sat two more spends could take`;
+		}
+		return undefined;
+	}
+
+	/**
+	 * Issue #2098, step 5: whether a channel holds as many ends of forward
+	 * legs its host has not taken as the node keeps for one channel: a
+	 * forward with an asset leg over or from it is then refused.
+	 */
+	private forwardLegEndsFull(channelId: Buffer): boolean {
+		return (
+			this.channelManager.undeliveredForwardLegEnds(channelId) >=
+			ChannelManager.AUXILIARY_MAX_UNDELIVERED_OUTCOMES
+		);
 	}
 
 	/**
@@ -28949,6 +29197,16 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			}
 			return;
 		}
+		// Issue #2098, step 5: the host answered with terms, and is told how
+		// each leg of the forward ends from here on (onForwardLegResolved),
+		// also when the node refuses them. Written before anything is offered.
+		if (
+			!this.channelManager.recordForwardTaken(ctx.inChannelId, ctx.inHtlcId)
+		) {
+			log('the row of the incoming channel could not be written');
+			ctx.failIncoming(TEMPORARY_CHANNEL_FAILURE);
+			return;
+		}
 		const read = this.readForwardTerms(answer, {
 			named: ctx.named,
 			incomingAsset: false,
@@ -29086,7 +29344,8 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				{
 					emitRefusal: false,
 					customRecords: terms.customRecords,
-					expectedHtlcId: outHtlcId
+					expectedHtlcId: outHtlcId,
+					forwardOf: this.forwardOfFor(ctx)
 				}
 			);
 		} catch (err) {
@@ -29280,6 +29539,16 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			// Not the host's: a forward with an asset leg is refused, also to
 			// a short channel id the host does not know.
 			log('the host does not take the forward');
+			ctx.failIncoming(TEMPORARY_CHANNEL_FAILURE);
+			return;
+		}
+		// Issue #2098, step 5: the host answered with terms, and is told how
+		// each leg of the forward ends from here on (onForwardLegResolved),
+		// also when the node refuses them. Written before anything is offered.
+		if (
+			!this.channelManager.recordForwardTaken(ctx.inChannelId, ctx.inHtlcId)
+		) {
+			log('the row of the incoming channel could not be written');
 			ctx.failIncoming(TEMPORARY_CHANNEL_FAILURE);
 			return;
 		}
@@ -29513,6 +29782,16 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			ctx.failIncoming(TEMPORARY_CHANNEL_FAILURE);
 			return;
 		}
+		// Issue #2098, step 5: the host answered with terms, and is told how
+		// each leg of the forward ends from here on (onForwardLegResolved),
+		// also when the node refuses them. Written before anything is offered.
+		if (
+			!this.channelManager.recordForwardTaken(ctx.inChannelId, ctx.inHtlcId)
+		) {
+			log('the row of the incoming channel could not be written');
+			ctx.failIncoming(TEMPORARY_CHANNEL_FAILURE);
+			return;
+		}
 		const tell = (): void =>
 			this.tellForwardNeverOffered(
 				ctx.paymentHash,
@@ -29691,7 +29970,12 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				part.skimmedFeeMsat,
 				// Reported below as htlc:forward-refused. As a node:error it
 				// read exactly like a refused send of the user's own.
-				{ emitRefusal: false }
+				{
+					emitRefusal: false,
+					...(options.incomingAssetLeg
+						? { forwardOf: this.forwardOfFor(part) }
+						: {})
+				}
 			);
 		} catch (err) {
 			// Nothing was offered: the in-memory link goes too.
@@ -30537,7 +30821,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				outKey,
 				forward,
 				outChannelId,
-				forward.inHtlcId,
+				BigInt(outKey.split(':offered-')[1]),
 				reason,
 				held ? forward.failPreWrapped === true : true
 			);
@@ -30726,11 +31010,18 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 					sha256(standing.preimage)
 				);
 			}
-			this.channelManager.recordForwardDecision(
-				forward.inChannelId,
-				forward.inHtlcId,
-				'fail'
-			);
+			// Issue #2098, step 5: an incoming channel already on the chain can
+			// carry no fail, and the chain resolves the HTLC there: the payer
+			// takes it back once it expires. No decision to fail is written for
+			// it, so a preimage that a reorganisation deeper than the fail back
+			// brings to light still claims it, and the link stays for that.
+			if (!this.channelOnChain(forward.inChannelId)) {
+				this.channelManager.recordForwardDecision(
+					forward.inChannelId,
+					forward.inHtlcId,
+					'fail'
+				);
+			}
 		}
 		const inChannel = this.channelManager.getChannel(forward.inChannelId);
 		if (!inChannel || !inChannel.canFailHtlc(forward.inHtlcId)) {
@@ -32439,6 +32730,17 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			...(scid ? { shortChannelId: Buffer.from(scid) } : {}),
 			...(auxiliary.resolvedHtlcs && auxiliary.resolvedHtlcs.size > 0
 				? { undeliveredOutcomes: auxiliary.resolvedHtlcs.size }
+				: {}),
+			...((inFlight: number): { forwardsInFlight?: number } =>
+				inFlight > 0 ? { forwardsInFlight: inFlight } : {})(
+				[...this.forwardedHtlcs].filter(
+					([outKey, forward]) =>
+						forward.inChannelId.equals(channelId) ||
+						outKey.startsWith(`${channelId.toString('hex')}:`)
+				).length
+			),
+			...(state.forwardLegEnds && state.forwardLegEnds.size > 0
+				? { undeliveredForwardLegEnds: state.forwardLegEnds.size }
 				: {}),
 			...(revokedViews
 				? {
@@ -34824,6 +35126,9 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		for (const inChannelIdHex of owedInbound) {
 			this.settleForwardsOwedUpstream(Buffer.from(inChannelIdHex, 'hex'));
 		}
+		// Issue #2098, step 5: the link of a forward with an asset leg whose
+		// incoming leg ended on the chain for good has nothing left to drive.
+		this.dropLinksEndedOnChain();
 		this.scanExpiringOfferedHtlcs(blockHeight);
 		// The swap provider looks before the held sweeper: a claim seen this
 		// block settles its hold before the sweeper could judge it (#737).
@@ -35749,12 +36054,18 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				// neither arm below acts on it: the channel is kept. A fulfil
 				// the peer does not take, and a peer that is not there, are
 				// closed on as on any other channel.
+				//
+				// Issue #2098, step 5: not so the incoming leg of a forward. The
+				// node paid the outgoing leg, and nothing gives that up: an HTLC
+				// it decided to settle is claimed on the chain at the claim
+				// buffer below, as on any other channel.
 				if (
 					state.auxiliaryState !== undefined &&
 					htlc.auxiliaryAmount !== undefined &&
 					htlc.state !== HtlcState.FULFILLED &&
 					state.state === ChannelState.NORMAL &&
 					!parkedHold &&
+					htlc.forwardAsked !== true &&
 					paymentHashHex !== undefined &&
 					this.preimages.has(paymentHashHex)
 				) {
@@ -35945,6 +36256,33 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 						);
 						break; // channel is closing; stop scanning it
 					}
+					// Issue #2098, step 5: a forward with an asset leg whose
+					// outgoing leg has failed goes back through its own path, with
+					// its link, as scanForwardTimeouts sends it.
+					const assetForward =
+						outKey && this.forwardHasAssetLeg(outKey)
+							? this.forwardedHtlcs.get(outKey)
+							: undefined;
+					if (outKey && assetForward) {
+						const forwardSecret = this.receivedHtlcSharedSecrets.get(
+							`${channelId.toString('hex')}:${htlc.id}`
+						);
+						this.failForwardUpstream(
+							outKey,
+							assetForward,
+							Buffer.from(outKey.split(':')[0], 'hex'),
+							BigInt(outKey.split(':offered-')[1]),
+							forwardSecret
+								? createFailureMessage(
+										forwardSecret,
+										EXPIRY_TOO_SOON,
+										this.updateFlaggedFailureData(EXPIRY_TOO_SOON)
+								  )
+								: Buffer.alloc(FAILURE_MESSAGE_LENGTH),
+							true
+						);
+						continue;
+					}
 
 					// A part owed a recorded cancel is failed by retryHeldResolutions,
 					// which keeps the shared secret until the channel accepts the fail.
@@ -36010,9 +36348,36 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			const splicing =
 				state.state === ChannelState.SPLICING &&
 				!mustNotBroadcastCommitment(state);
-			if (state.state !== ChannelState.NORMAL && !errored && !splicing)
+			// Issue #2098, step 5: the incoming leg of a forward that came in on
+			// an asset channel goes to the chain also while its peer is away or
+			// a shutdown is under way, judged on the state the channel had
+			// before the reconnect it waits for, as scanExpiringHtlcs judges it.
+			// A payer that is away is the likeliest reason it has to.
+			const effectiveState =
+				state.state === ChannelState.AWAITING_REESTABLISH
+					? state.preReestablishState ?? state.state
+					: state.state;
+			const assetAway =
+				state.auxiliaryState !== undefined &&
+				!mustNotBroadcastCommitment(state) &&
+				(effectiveState === ChannelState.NORMAL ||
+					effectiveState === ChannelState.SPLICING ||
+					effectiveState === ChannelState.SHUTTING_DOWN);
+			if (
+				state.state !== ChannelState.NORMAL &&
+				!errored &&
+				!splicing &&
+				!assetAway
+			)
 				continue;
 			const channelId = state.channelId || state.temporaryChannelId;
+			// Issue #2098, step 5: an asset leg's claim on the chain needs a fee
+			// coin and the blocks a coin may take, so its channel goes there at
+			// the claim buffer rather than at twice the safety margin.
+			const forwardMargin =
+				state.auxiliaryState !== undefined
+					? Math.max(INBOUND_HTLC_CLAIM_FORCE_CLOSE_BUFFER, doubleMargin)
+					: doubleMargin;
 
 			for (const [key, htlc] of state.htlcs) {
 				if (!key.startsWith('received-')) continue;
@@ -36026,7 +36391,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				const outKey = this.findOutgoingLeg(channelId, htlc.id);
 				if (!outKey) continue;
 
-				if (htlc.cltvExpiry - blockHeight > doubleMargin) continue;
+				if (htlc.cltvExpiry - blockHeight > forwardMargin) continue;
 
 				// Only a durably failed outgoing leg is safe to refund upstream
 				// for; the shared predicate is the same one scanExpiringHtlcs and
@@ -36049,12 +36414,17 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				if (outgoingFailed && !errored) {
 					// Safe: complete the failure upstream off-chain.
 					const htlcSecretKey = `${channelId.toString('hex')}:${htlc.id}`;
-					// Issue #2098: the incoming leg of a forward that came in on an
-					// asset channel goes back through the forward's own path,
-					// which writes its decision first and lets the link go only
-					// with the failure the channel takes.
+					// Issue #2098: the incoming leg of a forward with an asset leg
+					// goes back through the forward's own path, which writes its
+					// decision first when it came in on an asset channel and lets
+					// the link go only with the failure the channel takes, in the
+					// same write.
 					const forward = this.forwardedHtlcs.get(outKey);
-					if (state.auxiliaryState !== undefined && forward) {
+					if (
+						forward &&
+						(state.auxiliaryState !== undefined ||
+							this.forwardHasAssetLeg(outKey))
+					) {
 						const sharedSecret =
 							this.receivedHtlcSharedSecrets.get(htlcSecretKey);
 						this.failForwardUpstream(
@@ -36235,7 +36605,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		// leg's output is still unresolved and claimable. A legacy record with
 		// no htlcId never matches.
 		const outHtlcId = BigInt(outEntryKey.slice('offered-'.length));
-		return (
+		if (
 			this.channelManager
 				.getMonitor(outChannelId)
 				?.getTrackedOutputs()
@@ -36246,6 +36616,86 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 						o.htlcId === outHtlcId &&
 						o.paymentHash?.equals(inboundPaymentHash) === true
 				) === true
+		) {
+			return true;
+		}
+		// Issue #2098, step 5: a forward with an asset leg takes the same fact
+		// at ASSET_FORWARD_FAIL_BACK_DEPTH rather than irrevocable depth.
+		return (
+			this.forwardHasAssetLeg(outKey) &&
+			this.assetForwardOutgoingFailedOnChain(
+				outChannelId,
+				outHtlcId,
+				inboundPaymentHash
+			)
+		);
+	}
+
+	/**
+	 * Issue #2098: whether a forward has an asset leg, by its link: the
+	 * channel its outgoing HTLC left on, or the one its incoming HTLC came in
+	 * on, is an asset channel.
+	 */
+	private forwardHasAssetLeg(outKey: string): boolean {
+		const outChannelId = Buffer.from(outKey.split(':')[0], 'hex');
+		const forward = this.forwardedHtlcs.get(outKey);
+		return (
+			this.channelManager.getChannel(outChannelId)?.getFullState()
+				.auxiliaryState !== undefined ||
+			(forward !== undefined && this.isAssetIncomingLeg(forward))
+		);
+	}
+
+	/**
+	 * Issue #2098, step 5: whether the outgoing HTLC of a forward with an
+	 * asset leg can no longer be claimed by the peer, read off the chain at
+	 * ASSET_FORWARD_FAIL_BACK_DEPTH. Either its output was spent, by a spend
+	 * at a height this session has seen and that deep, which on an asset
+	 * channel shows no preimage (an unknown answer proves nothing); or, on an
+	 * asset channel, the commitment that confirmed carries no output for it
+	 * (offeredAuxiliaryHtlcAbsent). The caller has made sure no preimage of
+	 * the hash is known: on an ordinary channel that is the whole proof of a
+	 * spend, since the monitor keeps every preimage a spend shows. A
+	 * reorganisation deeper than that depth is the risk this takes.
+	 */
+	private assetForwardOutgoingFailedOnChain(
+		outChannelId: Buffer,
+		outHtlcId: bigint,
+		paymentHash: Buffer
+	): boolean {
+		const monitor = this.channelManager.getMonitor(outChannelId);
+		if (!monitor) return false;
+		const assetChannel =
+			this.channelManager.getChannel(outChannelId)?.getFullState()
+				.auxiliaryState !== undefined;
+		const spent = monitor
+			.getTrackedOutputs()
+			.find(
+				(o) =>
+					o.outputType === OutputType.OFFERED_HTLC &&
+					!o.isSecondLevelHtlc &&
+					o.htlcId === outHtlcId &&
+					o.paymentHash?.equals(paymentHash) === true &&
+					o.resolutionTxid !== undefined &&
+					(o.status === OutputStatus.SPEND_CONFIRMED ||
+						o.status === OutputStatus.IRREVOCABLY_RESOLVED) &&
+					o.confirmationHeight > 0 &&
+					o.spendReverifyPending !== true &&
+					this.currentBlockHeight - o.confirmationHeight >=
+						ASSET_FORWARD_FAIL_BACK_DEPTH
+			);
+		if (
+			spent &&
+			(!assetChannel || monitor.spendShowsPreimage(spent) === false)
+		) {
+			return true;
+		}
+		return (
+			assetChannel &&
+			monitor.offeredAuxiliaryHtlcAbsent(
+				outHtlcId,
+				ASSET_FORWARD_FAIL_BACK_DEPTH
+			)
 		);
 	}
 

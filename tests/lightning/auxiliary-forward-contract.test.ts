@@ -1,14 +1,15 @@
 /**
- * Issue #2098, step 1: the contract of a forward with an asset leg is
- * declared and not run.
+ * Issue #2098, step 1: the contract of a forward with an asset leg, and
+ * step 5: the build that runs it.
  *
  * The types a host writes its forward hooks against are exported from the
- * lightning entry, and AUXILIARY_CHANNELS_API names the part as declared
- * and not among its surfaces. A node in the middle whose host supplies the
- * hooks refuses every forward with an asset leg exactly as one whose host
- * does not: the same messages on the wire, byte for byte, in each of the
- * three directions and for a next hop that is a short channel id the node
- * has no channel for. Neither hook is called.
+ * lightning entry, and AUXILIARY_CHANNELS_API names the part among its
+ * surfaces from step 5 on, with nothing left declared. With the switch for
+ * asset forwards off, a node in the middle whose host supplies the hooks
+ * refuses every forward with an asset leg exactly as one whose host does
+ * not: the same messages on the wire, byte for byte, in each of the three
+ * directions and for a next hop that is a short channel id the node has no
+ * channel for. Neither hook is called.
  */
 
 import { expect } from 'chai';
@@ -31,6 +32,7 @@ import {
 	fixRandomness,
 	openAssetChannel,
 	restoreRandomness,
+	withAssetForwards,
 	withAssetOpens,
 	type IAssetHost
 } from './helpers/auxiliary-nodes';
@@ -119,6 +121,9 @@ interface IRun {
 describe('a forward with an asset leg, under the declared contract (issue #2098, step 1)', function () {
 	this.timeout(120_000);
 	withAssetOpens();
+	// What the build did before step 5 turned the switch on, and does with
+	// it off.
+	withAssetForwards(false);
 	const hosts: IAssetHost[] = [];
 	afterEach(() => {
 		restoreRandomness();
@@ -183,15 +188,14 @@ describe('a forward with an asset leg, under the declared contract (issue #2098,
 		expect(ended).to.deep.equal([resolution]);
 	});
 
-	it('is named as declared by AUXILIARY_CHANNELS_API, and not among the surfaces the build runs', () => {
+	it('is named among the surfaces of AUXILIARY_CHANNELS_API from the build that runs it, with nothing left declared (step 5)', () => {
 		const api = lightningChannel.AUXILIARY_CHANNELS_API;
 		expect(api.version).to.equal(1);
-		expect([...api.declared]).to.deep.equal(['prepareForward']);
+		expect([...api.declared]).to.deep.equal([]);
 		expect(Object.isFrozen(api.declared)).to.equal(true);
-		const declared: lightningChannel.AuxiliaryChannelsDeclared =
-			'prepareForward';
-		expect((api.surfaces as readonly string[]).includes(declared)).to.equal(
-			false
+		const surface: lightningChannel.AuxiliaryChannelsSurface = 'prepareForward';
+		expect((api.surfaces as readonly string[]).includes(surface)).to.equal(
+			true
 		);
 	});
 
