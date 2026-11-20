@@ -1958,7 +1958,8 @@ describe('reading the state of the fee coin pool', () => {
 				possible: true,
 				forFeeSatoshis: 2000n,
 				neededSatoshis: 3000n,
-				largestConfirmedSatoshis: 50000n
+				largestConfirmedSatoshis: 50000n,
+				splitCoins: 4
 			}
 		});
 		expect(f.store.rows.size).equal(0);
@@ -1998,7 +1999,8 @@ describe('reading the state of the fee coin pool', () => {
 			forFeeSatoshis: 2000n,
 			neededSatoshis: 3000n,
 			largestConfirmedSatoshis: 0n,
-			reason: 'FEE_FUNDS_UNAVAILABLE'
+			reason: 'FEE_FUNDS_UNAVAILABLE',
+			splitCoins: 0
 		});
 		expect([...f.store.rows.values()][0]).equal(journal);
 		expect(JSON.stringify([...f.frozen])).equal(frozen);
@@ -2030,7 +2032,8 @@ describe('reading the state of the fee coin pool', () => {
 			possible: true,
 			forFeeSatoshis: 500n,
 			neededSatoshis: 1500n,
-			largestConfirmedSatoshis: 47494n
+			largestConfirmedSatoshis: 47494n,
+			splitCoins: 4
 		});
 		expect(after.budget).deep.equal(p.getFixedOutputFeeBudget());
 		// A selection that was served does not clear the last refusal: its
@@ -2050,7 +2053,8 @@ describe('reading the state of the fee coin pool', () => {
 			forFeeSatoshis: 2000n,
 			neededSatoshis: 3000n,
 			largestConfirmedSatoshis: 50000n,
-			reason: 'FEE_BUDGET_EXHAUSTED'
+			reason: 'FEE_BUDGET_EXHAUSTED',
+			splitCoins: 0
 		});
 		const g = fixture();
 		g.spendSource();
@@ -2061,14 +2065,16 @@ describe('reading the state of the fee coin pool', () => {
 			forFeeSatoshis: 2000n,
 			neededSatoshis: 3000n,
 			largestConfirmedSatoshis: 2500n,
-			reason: 'FEE_FUNDS_UNAVAILABLE'
+			reason: 'FEE_FUNDS_UNAVAILABLE',
+			splitCoins: 0
 		});
 		// The same wallet could pay for a smaller fee coin.
 		expect(poolState(p, 1000n).preparation).deep.equal({
 			possible: true,
 			forFeeSatoshis: 1000n,
 			neededSatoshis: 2000n,
-			largestConfirmedSatoshis: 2500n
+			largestConfirmedSatoshis: 2500n,
+			splitCoins: 1
 		});
 		// A fee coin is never smaller than dust.
 		expect(poolState(p, 1n).preparation.neededSatoshis).equal(1330n);

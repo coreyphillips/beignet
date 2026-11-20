@@ -18,7 +18,12 @@ import type {
 	IAuxiliaryForwardTerms
 } from '../../src/lightning/channel/auxiliary-forward';
 import type { IAuxiliaryChannelConfig } from '../../src/lightning/channel/auxiliary-funding';
-import { ChannelState, HtlcState } from '../../src/lightning/channel/types';
+import {
+	ChannelState,
+	HtlcState,
+	isFixedAssetHtlcChannel,
+	type IHtlcEntry
+} from '../../src/lightning/channel/types';
 import {
 	IRREVOCABLE_DEPTH,
 	OutputStatus,
@@ -47,6 +52,7 @@ import {
 	trackedOutputs
 } from './helpers/auxiliary-on-chain';
 import { amountRecord } from './helpers/auxiliary-pair';
+import type { IFixedOutputFeePolicy } from '../../src/lightning/wallet/fixed-output-fees';
 
 /** What Alice sends Bob over an asset channel, and what Bob's host values each unit at. */
 const INCOMING_UNITS = 5010n;
@@ -1069,6 +1075,180 @@ describe('a forward with an asset leg on the chain (issue #2098, step 5)', funct
 			expect(w.hosts.alice.node.getPayment(held.paymentHash)?.status).to.equal(
 				PaymentStatus.FAILED
 			);
+		});
+	});
+
+	describe('a look at the fee coin pool before a forward pays out', () => {
+		/**
+		 * The three in channels of the fixed mode: each node reads the features
+		 * the others advertise and none allows the older HTLC signatures. Bob's
+		 * wallet holds `bobCoins`, under `policy`.
+		 */
+		async function feeScene(
+			tag: string,
+			shape: Shape,
+			options: {
+				bobCoins: number[];
+				policy?: Partial<IFixedOutputFeePolicy>;
+				held?: boolean;
+				asked?: number;
+			}
+		): Promise<IScene> {
+			const asked: IAuxiliaryForwardRequest[] = [];
+			const told: IAuxiliaryForwardLegResolution[] = [];
+			const terms = termsOf(shape);
+			const w = await world.open(tag, {
+				kinds: { in: shape[0], out: shape[1] },
+				realInit: true,
+				feeWallet: {
+					alice: true,
+					bob: options.policy ?? true,
+					carol: true
+				},
+				hooks: {
+					alice: {
+						valueIncomingHtlc: valued,
+						allowLegacyHtlcSignatures: undefined
+					},
+					bob: {
+						prepareForward: (request): IAuxiliaryForwardTerms => {
+							asked.push(request);
+							return terms(request);
+						},
+						onForwardLegResolved: (resolution): void => {
+							told.push(resolution);
+						},
+						allowLegacyHtlcSignatures: undefined
+					},
+					carol: {
+						valueIncomingHtlc: valued,
+						allowLegacyHtlcSignatures: undefined
+					}
+				}
+			});
+			for (const [which, channelId] of [
+				['in', w.inChannel],
+				['out', w.outChannel]
+			] as const) {
+				if (w.kinds[which] !== 'asset') continue;
+				expect(
+					isFixedAssetHtlcChannel(
+						w.hosts.bob.node
+							.getChannelManager()
+							.getChannel(channelId)!
+							.getFullState().channelType
+					),
+					`the ${which} channel is of the fixed mode`
+				).to.equal(true);
+			}
+			for (const value of options.bobCoins) w.wallets.bob!.fund(value);
+			await world.mine(w, 1);
+			const s: IScene = {
+				w,
+				held: undefined as unknown as IForwardPayment,
+				asked,
+				told,
+				closed: [],
+				logs: []
+			};
+			listen(s);
+			return s;
+		}
+
+		const send = async (
+			s: IScene,
+			tag: string,
+			held = true
+		): Promise<IForwardPayment> =>
+			forwardHeld(s.w, tag, {
+				next: s.w.hosts.bob.node
+					.getChannelManager()
+					.getChannel(s.w.outChannel)!
+					.getFullState().scidAlias!,
+				forwardMsat: FORWARD_MSAT,
+				outgoingDelta: OUTGOING_DELTA,
+				cltvDelta: CLTV_DELTA,
+				units: INCOMING_UNITS,
+				incomingMsat: INCOMING_MSAT,
+				held
+			});
+
+		for (const shape of SHAPES) {
+			it(`${named(
+				shape
+			)}: with a wallet coin a split makes four fee coins of, the forward goes on`, async () => {
+				const s = await feeScene(`fwd-fee-ok-${shape.join('-')}`, shape, {
+					bobCoins: [100_000]
+				});
+				s.held = await send(s, 'fwd-fee-ok');
+				expect(s.asked).to.have.length(1);
+			});
+
+			it(`${named(
+				shape
+			)}: with no fee coin ready and none a split could make, the forward is refused with temporary_channel_failure before the host is asked`, async () => {
+				const s = await feeScene(`fwd-fee-none-${shape.join('-')}`, shape, {
+					bobCoins: []
+				});
+				s.held = await send(s, 'fwd-fee-none', false);
+				expect(s.asked).to.deep.equal([]);
+				expect(paymentOf(s)).to.equal(PaymentStatus.FAILED);
+				expect(
+					s.logs.some(
+						(line) =>
+							line.startsWith('asset_forward_declined') &&
+							line.includes('the fee coin pool can pay for 0 spends')
+					),
+					s.logs.join(' | ')
+				).to.equal(true);
+			});
+		}
+
+		it('bitcoin in, asset out: with a wallet coin one split makes one fee coin of, the first forward goes on and a second one while it is in flight is refused before the host is asked', async () => {
+			const s = await feeScene('fwd-fee-one', ['ordinary', 'asset'], {
+				bobCoins: [30_000]
+			});
+			s.held = await send(s, 'fwd-fee-one-a');
+			expect(s.asked).to.have.length(1);
+			const second = await send(s, 'fwd-fee-one-b', false);
+			expect(s.asked).to.have.length(1);
+			expect(
+				s.w.hosts.alice.node.getPayment(second.paymentHash)?.status
+			).to.equal(PaymentStatus.FAILED);
+		});
+
+		it('asset in, asset out: a forward takes a fee coin for each of its asset HTLCs, so one coin refuses it and two let the first through and refuse a second while it is in flight', async () => {
+			const one = await feeScene('fwd-fee-two-of-one', ['asset', 'asset'], {
+				bobCoins: [30_000]
+			});
+			one.held = await send(one, 'fwd-fee-two-of-one', false);
+			expect(one.asked).to.deep.equal([]);
+			expect(paymentOf(one)).to.equal(PaymentStatus.FAILED);
+			world.dispose();
+			const two = await feeScene('fwd-fee-two', ['asset', 'asset'], {
+				bobCoins: [50_000]
+			});
+			two.held = await send(two, 'fwd-fee-two-a');
+			expect(two.asked).to.have.length(1);
+			const second = await send(two, 'fwd-fee-two-b', false);
+			expect(two.asked).to.have.length(1);
+			expect(
+				two.w.hosts.alice.node.getPayment(second.paymentHash)?.status
+			).to.equal(PaymentStatus.FAILED);
+		});
+
+		it('asset in, asset out: a fee budget without room for two spends at the cap refuses the forward before the host is asked', async () => {
+			const s = await feeScene('fwd-fee-budget', ['asset', 'asset'], {
+				bobCoins: [100_000],
+				policy: { maxTotalFeeSatoshis: 40_000n }
+			});
+			s.held = await send(s, 'fwd-fee-budget', false);
+			expect(s.asked).to.deep.equal([]);
+			expect(paymentOf(s)).to.equal(PaymentStatus.FAILED);
+			expect(
+				s.logs.some((line) => line.includes('the fee budget has')),
+				s.logs.join(' | ')
+			).to.equal(true);
 		});
 	});
 });

@@ -140,6 +140,7 @@ import {
 	TESTNET_CHAIN_HASH,
 	REGTEST_CHAIN_HASH,
 	SIGNET_CHAIN_HASH,
+	isFixedAssetHtlcChannel,
 	isOverlayChannel
 } from '../channel/types';
 import type {
@@ -27763,6 +27764,26 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			failIncoming(TEMPORARY_CHANNEL_FAILURE);
 			return true;
 		};
+		// Issue #2098, step 5: an incoming asset leg on a channel of the fixed
+		// mode is claimed on the chain with a fee coin, so the pool is looked
+		// at before the host is asked (assetForwardFeeRefusal).
+		const refuseIncomingFee = (): boolean => {
+			if (!assetIncoming) return false;
+			const inState = this.channelManager
+				.getChannel(inChannelId)
+				?.getFullState();
+			if (!isFixedAssetHtlcChannel(inState?.channelType)) return false;
+			const feeRefusal = this.assetForwardFeeRefusal(0);
+			if (!feeRefusal) return false;
+			this.emitStructuredLog('htlc', 'asset_forward_declined', {
+				paymentHash: paymentHash.toString('hex'),
+				inChannelId: inChannelId.toString('hex'),
+				inHtlcId: Number(inHtlcId),
+				reason: feeRefusal
+			});
+			failIncoming(TEMPORARY_CHANNEL_FAILURE);
+			return true;
+		};
 		const refuseAssetDelta = (): void => {
 			this.emitStructuredLog('htlc', 'asset_forward_declined', {
 				paymentHash: paymentHash.toString('hex'),
@@ -27824,6 +27845,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				return;
 			}
 			if (refuseLegEndsFull(inChannelId)) return;
+			if (refuseIncomingFee()) return;
 			this.forwardAssetIntoAsset({
 				inChannelId,
 				inHtlcId,
@@ -27954,6 +27976,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		) {
 			return;
 		}
+		if (refuseIncomingFee()) return;
 		// The policy this forward must satisfy. A cleartext payer that is
 		// refused learns our current channel_update from the failure and
 		// retries, so the advertised terms bind at once. A blinded payer
@@ -28773,6 +28796,10 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				channelId
 			)} ends of forward legs that its host has not taken`;
 		}
+		if (isFixedAssetHtlcChannel(state.channelType)) {
+			const feeRefusal = this.assetForwardFeeRefusal(1);
+			if (feeRefusal) return feeRefusal;
+		}
 		if (forwardCltv !== undefined) {
 			const dustMsat =
 				(state.localConfig.dustLimitSatoshis >
@@ -28830,6 +28857,83 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		return typeof this.auxiliaryChannels?.onForwardLegResolved === 'function'
 			? { channelId: Buffer.from(ctx.inChannelId), htlcId: ctx.inHtlcId }
 			: undefined;
+	}
+
+	/**
+	 * Issue #2098, step 5: a look at the fee coin pool before a forward with
+	 * an asset leg on a channel of the fixed mode pays out. Undefined when the
+	 * pool can pay to claim on the chain every asset HTLC the node holds on
+	 * its live channels of that mode (the forward's incoming HTLC among them
+	 * when it came in on one) and the `adding` ones the forward is about to
+	 * offer on such a channel, else why not:
+	 *  - there is no pool, or the wallet refused the policy, or its state
+	 *    cannot be read synchronously;
+	 *  - those HTLCs outnumber the fee coins that are ready and the ones a
+	 *    split of the largest confirmed coin would make now;
+	 *  - the budget has no room for two more spends at the policy's cap (an
+	 *    HTLC on the node's own commitment takes two: the second-level
+	 *    transaction and its sweep), and for a split's fee when no coin is
+	 *    ready.
+	 * It reads the pool as it is and reserves nothing; sizing the pool for a
+	 * channel that is full when it goes to the chain is step 6 of the issue.
+	 */
+	private assetForwardFeeRefusal(adding: number): string | undefined {
+		const provider = this.fundingProvider;
+		if (typeof provider?.getFixedOutputFeeStatus !== 'function') {
+			return 'the node keeps no fee coin pool';
+		}
+		let status: ReturnType<
+			NonNullable<IFundingProvider['getFixedOutputFeeStatus']>
+		>;
+		try {
+			status = provider.getFixedOutputFeeStatus();
+		} catch (err) {
+			return `the fee coin pool could not be read: ${
+				err instanceof Error ? err.message : String(err)
+			}`;
+		}
+		if (
+			status !== undefined &&
+			status !== null &&
+			typeof (status as { then?: unknown }).then === 'function'
+		) {
+			(status as unknown as Promise<unknown>).catch?.(() => undefined);
+			return 'the fee coin pool answered with a promise';
+		}
+		if (!status) return 'the node keeps no fee coin pool';
+		if (status.available !== true) {
+			return 'the wallet refused the fee policy, so there is no fee coin pool';
+		}
+		let held = 0;
+		for (const channel of this.channelManager.listChannels()) {
+			const state = channel.getFullState();
+			if (
+				state.auxiliaryState === undefined ||
+				!isFixedAssetHtlcChannel(state.channelType) ||
+				state.state === ChannelState.FORCE_CLOSED ||
+				state.state === ChannelState.CLOSED
+			) {
+				continue;
+			}
+			held += state.htlcs.size;
+		}
+		const coins =
+			status.feeCoins.ready +
+			(status.preparation.possible ? status.preparation.splitCoins : 0);
+		if (held + adding > coins) {
+			return `the fee coin pool can pay for ${coins} spends on the chain and the forward would leave the node with ${
+				held + adding
+			} asset HTLCs`;
+		}
+		const fee = status.preparation.forFeeSatoshis;
+		const dust = 330n;
+		const preparationFee =
+			status.preparation.neededSatoshis - (fee > dust ? fee : dust);
+		const room = 2n * fee + (status.feeCoins.ready === 0 ? preparationFee : 0n);
+		if (status.budget.remainingSatoshis < room) {
+			return `the fee budget has ${status.budget.remainingSatoshis} sat left, under the ${room} sat two more spends could take`;
+		}
+		return undefined;
 	}
 
 	/**
