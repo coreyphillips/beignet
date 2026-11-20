@@ -29203,7 +29203,18 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		if (
 			!this.channelManager.recordForwardTaken(ctx.inChannelId, ctx.inHtlcId)
 		) {
+			// The host answered with terms, so it is told that the outgoing leg
+			// was never offered, as after any refusal of its answer. Told before
+			// the failure, so that the incoming HTLC carries the mark by which
+			// its own end is kept; a row that still cannot be written keeps the
+			// end in memory, to ride the channel's next write.
 			log('the row of the incoming channel could not be written');
+			this.tellForwardNeverOffered(
+				ctx.paymentHash,
+				ctx.inChannelId,
+				ctx.inHtlcId,
+				ctx.named
+			);
 			ctx.failIncoming(TEMPORARY_CHANNEL_FAILURE);
 			return;
 		}
@@ -29548,7 +29559,18 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		if (
 			!this.channelManager.recordForwardTaken(ctx.inChannelId, ctx.inHtlcId)
 		) {
+			// The host answered with terms, so it is told that the outgoing leg
+			// was never offered, as after any refusal of its answer. Told before
+			// the failure, so that the incoming HTLC carries the mark by which
+			// its own end is kept; a row that still cannot be written keeps the
+			// end in memory, to ride the channel's next write.
 			log('the row of the incoming channel could not be written');
+			this.tellForwardNeverOffered(
+				ctx.paymentHash,
+				ctx.inChannelId,
+				ctx.inHtlcId,
+				ctx.named
+			);
 			ctx.failIncoming(TEMPORARY_CHANNEL_FAILURE);
 			return;
 		}
@@ -29788,7 +29810,18 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		if (
 			!this.channelManager.recordForwardTaken(ctx.inChannelId, ctx.inHtlcId)
 		) {
+			// The host answered with terms, so it is told that the outgoing leg
+			// was never offered, as after any refusal of its answer. Told before
+			// the failure, so that the incoming HTLC carries the mark by which
+			// its own end is kept; a row that still cannot be written keeps the
+			// end in memory, to ride the channel's next write.
 			log('the row of the incoming channel could not be written');
+			this.tellForwardNeverOffered(
+				ctx.paymentHash,
+				ctx.inChannelId,
+				ctx.inHtlcId,
+				ctx.outChannelId
+			);
 			ctx.failIncoming(TEMPORARY_CHANNEL_FAILURE);
 			return;
 		}
