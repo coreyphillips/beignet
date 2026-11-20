@@ -52,7 +52,10 @@ import {
 	trackedOutputs
 } from './helpers/auxiliary-on-chain';
 import { amountRecord } from './helpers/auxiliary-pair';
-import type { IFixedOutputFeePolicy } from '../../src/lightning/wallet/fixed-output-fees';
+import {
+	FixedOutputFeePreparationPendingError,
+	type IFixedOutputFeePolicy
+} from '../../src/lightning/wallet/fixed-output-fees';
 
 /** What Alice sends Bob over an asset channel, and what Bob's host values each unit at. */
 const INCOMING_UNITS = 5010n;
@@ -168,17 +171,32 @@ describe('a forward with an asset leg on the chain (issue #2098, step 5)', funct
 			held?: boolean;
 			/** How many times Bob is asked; once unless said. */
 			asked?: number;
+			/** How many coins Bob's fee wallet gets; 2 when left out. */
+			bobCoins?: number;
+			/** The value of each of Bob's coins; 100000 sat when left out. */
+			bobCoinSatoshis?: number;
+			/** Bob's fee policy, the test wallet's own when left out. */
+			bobPolicy?: Partial<IFixedOutputFeePolicy>;
+			/**
+			 * The asset channels of the fixed mode: each node reads the features
+			 * the others advertise and none allows the older HTLC signatures.
+			 */
+			fixed?: boolean;
 		} = {}
 	): Promise<IScene> {
 		const asked: IAuxiliaryForwardRequest[] = [];
 		const told: IAuxiliaryForwardLegResolution[] = [];
 		const terms = termsOf(shape);
+		const fixed = options.fixed
+			? { allowLegacyHtlcSignatures: undefined }
+			: ({} as Partial<IAuxiliaryChannelConfig>);
 		const w = await world.open(tag, {
 			kinds: { in: shape[0], out: shape[1] },
-			feeWallet: { alice: true, bob: true, carol: true },
+			feeWallet: { alice: true, bob: options.bobPolicy ?? true, carol: true },
+			...(options.fixed ? { realInit: true } : {}),
 			...(options.wrapBob ? { wrapProvider: { bob: options.wrapBob } } : {}),
 			hooks: {
-				alice: { valueIncomingHtlc: valued },
+				alice: { valueIncomingHtlc: valued, ...fixed },
 				bob: {
 					prepareForward: (request): IAuxiliaryForwardTerms => {
 						asked.push(request);
@@ -187,15 +205,35 @@ describe('a forward with an asset leg on the chain (issue #2098, step 5)', funct
 					onForwardLegResolved: (resolution): void => {
 						told.push(resolution);
 					},
+					...fixed,
 					...options.bob
 				},
-				carol: { valueIncomingHtlc: valued }
+				carol: { valueIncomingHtlc: valued, ...fixed }
 			}
 		});
+		if (options.fixed) {
+			for (const [which, channelId] of [
+				['in', w.inChannel],
+				['out', w.outChannel]
+			] as const) {
+				if (w.kinds[which] !== 'asset') continue;
+				expect(
+					isFixedAssetHtlcChannel(
+						w.hosts.bob.node
+							.getChannelManager()
+							.getChannel(channelId)!
+							.getFullState().channelType
+					),
+					`the ${which} channel is of the fixed mode`
+				).to.equal(true);
+			}
+		}
 		// Two coins each: a commitment's child takes one, an HTLC spend another.
 		for (const name of ['alice', 'bob', 'carol'] as const) {
-			w.wallets[name]!.fund(100_000);
-			w.wallets[name]!.fund(100_000);
+			const coins = name === 'bob' ? options.bobCoins ?? 2 : 2;
+			const value =
+				name === 'bob' ? options.bobCoinSatoshis ?? 100_000 : 100_000;
+			for (let i = 0; i < coins; i++) w.wallets[name]!.fund(value);
 		}
 		await world.mine(w, 1);
 		if (options.policyDelta !== undefined) {
@@ -1249,6 +1287,247 @@ describe('a forward with an asset leg on the chain (issue #2098, step 5)', funct
 				s.logs.some((line) => line.includes('the fee budget has')),
 				s.logs.join(' | ')
 			).to.equal(true);
+		});
+	});
+	describe('the deadline of the timeout of an outgoing asset leg (#2098 step 6)', () => {
+		/** Each request of Bob's fee pool, with the deadline it was asked with. */
+		const asksOf = (
+			w: IForwardWorld
+		): Array<{
+			feeActionId: string;
+			deadlineHeight?: number;
+			height: number;
+		}> => {
+			const asks: Array<{
+				feeActionId: string;
+				deadlineHeight?: number;
+				height: number;
+			}> = [];
+			const provider = (
+				w.hosts.bob.node as unknown as {
+					fundingProvider: {
+						selectFeeBumpInputs: (
+							target: bigint,
+							rate: number,
+							opts?: { feeActionId?: string; deadlineHeight?: number }
+						) => Promise<unknown>;
+					};
+				}
+			).fundingProvider;
+			const select = provider.selectFeeBumpInputs.bind(provider);
+			provider.selectFeeBumpInputs = (target, rate, opts): Promise<unknown> => {
+				if (opts?.feeActionId) {
+					asks.push({
+						feeActionId: opts.feeActionId,
+						...(opts.deadlineHeight !== undefined
+							? { deadlineHeight: opts.deadlineHeight }
+							: {}),
+						height: w.chain.height
+					});
+				}
+				return select(target, rate, opts);
+			};
+			return asks;
+		};
+		/** The deadline Bob gives the timeout of the outgoing HTLC. */
+		const deadlineOf = (s: IScene, shape: Shape): number => {
+			const margin = (
+				s.w.hosts.bob.node as unknown as { htlcSafetyMargin: number }
+			).htlcSafetyMargin;
+			const incomingMargin =
+				shape[0] === 'asset'
+					? Math.max(ASSET_INCOMING_MARGIN, 2 * margin)
+					: 2 * margin;
+			return (
+				s.held.incomingExpiry - incomingMargin - ASSET_FORWARD_FAIL_BACK_DEPTH
+			);
+		};
+		const askedForOffered = (
+			s: IScene,
+			asks: Array<{ feeActionId: string; deadlineHeight?: number }>
+		): Array<{ feeActionId: string; deadlineHeight?: number }> => {
+			const offered = offeredOf(s.w)!;
+			return asks.filter((ask) =>
+				ask.feeActionId.endsWith(`:${offered.txid}:${offered.outputIndex}`)
+			);
+		};
+
+		for (const shape of ASSET_OUT) {
+			it(`${named(
+				shape
+			)}: Bob's timeout of the outgoing HTLC asks for its fee input with the deadline of the incoming leg, its expiry less the distance at which the incoming channel goes to the chain and less ${ASSET_FORWARD_FAIL_BACK_DEPTH}`, async () => {
+				const s = await scene(`fwd-deadline-${shape.join('-')}`, shape, {
+					fixed: true
+				});
+				const asks = asksOf(s.w);
+				const closedOut = s.w.hosts.bob.node.forceCloseChannel(
+					s.w.outChannel,
+					SWEEP_DESTINATION
+				);
+				expect(closedOut.ok, closedOut.error).to.equal(true);
+				await world.mine(s.w, 2);
+				const asked = askedForOffered(s, asks);
+				expect(asked.length, 'the timeout asked').to.be.greaterThan(0);
+				expect(asked[0].deadlineHeight).to.equal(deadlineOf(s, shape));
+				expect(deadlineOf(s, shape)).to.be.above(s.held.outgoingExpiry);
+			});
+		}
+
+		it('asset in, asset out: a host without onForwardLegResolved gives the timeout the same deadline, and so does Bob restarted from his database', async () => {
+			const shape: Shape = ['asset', 'asset'];
+			const s = await scene('fwd-deadline-no-hook', shape, {
+				bob: { onForwardLegResolved: undefined },
+				fixed: true
+			});
+			// Restarted with the hooks he had: prepareForward and no
+			// onForwardLegResolved.
+			await world.restartBob(s.w, 'fwd-deadline-no-hook');
+			listen(s);
+			const asks = asksOf(s.w);
+			const closedOut = s.w.hosts.bob.node.forceCloseChannel(
+				s.w.outChannel,
+				SWEEP_DESTINATION
+			);
+			expect(closedOut.ok, closedOut.error).to.equal(true);
+			await world.mine(s.w, 2);
+			const asked = askedForOffered(s, asks);
+			expect(asked.length, 'the timeout asked').to.be.greaterThan(0);
+			expect(asked[0].deadlineHeight).to.equal(deadlineOf(s, shape));
+		});
+
+		it('bitcoin in, asset out: near its deadline Bob raises his timeout spend every 2 blocks while it stays out of the blocks, not every 6', async () => {
+			const shape: Shape = ['ordinary', 'asset'];
+			const s = await scene('fwd-deadline-raise', shape, {
+				bobCoins: 6,
+				bobCoinSatoshis: 2_000_000,
+				bobPolicy: {
+					maxFeeSatoshis: 500_000n,
+					maxTotalFeeSatoshis: 20_000_000n,
+					maxPreparationFeeSatoshis: 20_000n,
+					feeCoinCount: 16
+				},
+				fixed: true
+			});
+			const { w, held } = s;
+			const closedOut = w.hosts.bob.node.forceCloseChannel(
+				w.outChannel,
+				SWEEP_DESTINATION
+			);
+			expect(closedOut.ok, closedOut.error).to.equal(true);
+			await world.mine(w, 1);
+			await world.passTo(w, held.outgoingExpiry - 1);
+			const deadline = deadlineOf(s, shape);
+			const offered = offeredOf(w)!;
+			// Every spend of the output Bob sends, held out of the blocks, with
+			// the height it was first seen at.
+			const seen = new Map<string, number>();
+			const spends = (): string[] =>
+				[...w.chain.mempool.keys()].filter((txid) =>
+					w.chain.mempool
+						.get(txid)!
+						.tx.ins.some(
+							(input) =>
+								Buffer.from(input.hash).reverse().toString('hex') ===
+									offered.txid && input.index === offered.outputIndex
+						)
+				);
+			// Each block leaves Bob's spend out: it stays in the mempool, where
+			// a raise replaces it, and only the block passes it over.
+			while (w.chain.height < deadline - 1) {
+				const kept = spends().map(
+					(txid) => [txid, w.chain.mempool.get(txid)!] as const
+				);
+				for (const [txid] of kept) {
+					if (!seen.has(txid)) seen.set(txid, w.chain.height);
+					w.chain.mempool.delete(txid);
+				}
+				w.chain.mine();
+				for (const [txid, entry] of kept) w.chain.mempool.set(txid, entry);
+				await settle();
+			}
+			const heights = [...new Set(seen.values())].sort((a, b) => a - b);
+			const near = heights.filter(
+				(height) => deadline - height <= 18 && height > heights[0]
+			);
+			expect(
+				heights.length,
+				`spends seen at ${heights}; deadline ${deadline}; bob out [${describeOutputs(
+					w,
+					'bob',
+					w.outChannel
+				)}]; bob: ${errorsOf(w.hosts.bob).slice(-6).join(' | ')}`
+			).to.be.greaterThan(1);
+			// Near the deadline a raise follows 2 blocks after the one before
+			// (a raise that waits on a split comes a block or two later), never
+			// sooner; further from it, 6 blocks apart.
+			const gaps = near.map((height, i) =>
+				i === 0 ? height - heights[0] : height - near[i - 1]
+			);
+			expect(Math.min(...gaps), `spends seen at ${heights}`).to.equal(2);
+
+			expect(
+				near.length,
+				`spends seen at ${heights}; bob out [${describeOutputs(
+					w,
+					'bob',
+					w.outChannel
+				)}]; bob: ${errorsOf(w.hosts.bob).slice(-8).join(' | ')}`
+			).to.be.at.least(3);
+		});
+
+		it('bitcoin in, asset out: a timeout that has no fee input when its deadline passes is said to put the incoming channel at risk, not to let the peer take the output', async () => {
+			const shape: Shape = ['ordinary', 'asset'];
+			const s = await scene('fwd-deadline-late', shape, { fixed: true });
+			const { w, held } = s;
+			const said: string[] = [];
+			w.hosts.bob.node
+				.getChannelManager()
+				.on('error', (_id: unknown, message: unknown) =>
+					said.push(String(message))
+				);
+			// The pool never has a coin for the timeout: it waits on a split.
+			const provider = (
+				w.hosts.bob.node as unknown as {
+					fundingProvider: {
+						selectFeeBumpInputs: (
+							target: bigint,
+							rate: number,
+							opts?: { feeActionId?: string }
+						) => Promise<unknown>;
+					};
+				}
+			).fundingProvider;
+			const select = provider.selectFeeBumpInputs.bind(provider);
+			provider.selectFeeBumpInputs = (target, rate, opts): Promise<unknown> => {
+				const offered = offeredOf(w);
+				if (
+					offered &&
+					opts?.feeActionId?.endsWith(`:${offered.txid}:${offered.outputIndex}`)
+				) {
+					return Promise.reject(
+						new FixedOutputFeePreparationPendingError('ab'.repeat(32))
+					);
+				}
+				return select(target, rate, opts);
+			};
+			const closedOut = w.hosts.bob.node.forceCloseChannel(
+				w.outChannel,
+				SWEEP_DESTINATION
+			);
+			expect(closedOut.ok, closedOut.error).to.equal(true);
+			await world.mine(w, 1);
+			await world.passTo(w, deadlineOf(s, shape) + 1);
+			await world.mine(w, 1);
+			const late = said.filter((message) =>
+				message.includes('deadline at height')
+			);
+			expect(late.length, said.join(' | ')).to.be.greaterThan(0);
+			expect(late[0]).to.include('the outgoing leg of a forward');
+			expect(late[0]).to.include(
+				"the forward's incoming channel goes to the chain"
+			);
+			expect(late[0]).to.not.include('the peer can now take the output back');
+			expect(held.outgoingExpiry).to.be.below(deadlineOf(s, shape));
 		});
 	});
 });

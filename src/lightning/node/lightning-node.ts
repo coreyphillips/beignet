@@ -2407,6 +2407,12 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		// Let the channel manager attach wallet inputs for anchor fee bumps
 		// (zero-fee second-level HTLC txs and commitment CPFP).
 		this.channelManager.setFundingProvider(this.fundingProvider);
+		// Issue #2098, step 6: a node whose host forwards asset HTLCs keeps
+		// fee coins for the spends of its asset channels that have a deadline.
+		// A node that does not forward funds its spends as before.
+		this.channelManager.setFixedOutputFeeReserve(
+			this.keepsFixedOutputFeeReserve()
+		);
 		this.compositeSplices = new CompositeSpliceEngine(
 			this.compositeSpliceDeps()
 		);
@@ -3078,6 +3084,9 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		const restoreStarted = Date.now();
 		this.restoreFromStorage(storedChannels);
 		this.storageRestoreMs = Date.now() - restoreStarted;
+		// Issue #2098, step 6: the monitors restored take the deadlines of the
+		// forwards' outgoing timeouts before they look at the chain again.
+		this.pushForwardTimeoutDeadlines();
 		// Inline, the network map is already back; in slices, it reports
 		// once it is.
 		if (this.graphRestoreStats) this.reportGraphRestore();
@@ -28517,6 +28526,19 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	 * leg. An incoming asset leg takes its own path (assetInForwardable,
 	 * steps 3 and 4).
 	 */
+	/**
+	 * Issue #2098, step 6: whether this node keeps fee coins for the spends
+	 * of its asset channels' outputs that have a deadline: a node that
+	 * forwards asset HTLCs, which is one whose host supplies prepareForward
+	 * while the switch for asset forwards is on.
+	 */
+	private keepsFixedOutputFeeReserve(): boolean {
+		return (
+			auxiliaryForwards.enabled &&
+			typeof this.auxiliaryChannels?.prepareForward === 'function'
+		);
+	}
+
 	private assetForwardAskable(inChannelId: Buffer): boolean {
 		return (
 			auxiliaryForwards.enabled &&
@@ -29332,6 +29354,8 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			inChannelId: ctx.inChannelId,
 			inHtlcId: ctx.inHtlcId
 		});
+		// Issue #2098, step 6: its timeout has a deadline from now on.
+		this.pushForwardTimeoutDeadlines();
 		// The host's records and carrier stay with the outgoing HTLC, which
 		// the link ties to the incoming one.
 		const link: RecoveryMutation = {
@@ -35087,6 +35111,9 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	 * ChannelManager exactly once before calling it.
 	 */
 	private runPerBlockWork(blockHeight: number): void {
+		// Issue #2098, step 6: the deadlines of the forwards' outgoing
+		// timeouts, for the monitors' next look at the chain.
+		this.pushForwardTimeoutDeadlines();
 		// Witness retention (section 9.6.6): mailboxes past retention_until go.
 		this.fforWitness?.onBlock(blockHeight);
 		// Issuer retirement (section 9.7.7): issue_until reached.
@@ -36363,8 +36390,84 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	 * inbound HTLC-success/timeout is the authoritative spend) and RETAIN the
 	 * forward mapping until final resolution, instead of failing off-chain.
 	 */
-	private scanForwardTimeouts(blockHeight: number): void {
+	/**
+	 * How many blocks before the expiry of a forward's incoming HTLC the
+	 * node takes the incoming channel to the chain while the outgoing leg
+	 * is unresolved (scanForwardTimeouts): twice the safety margin, and for
+	 * an incoming asset channel at least INBOUND_HTLC_CLAIM_FORCE_CLOSE_BUFFER,
+	 * since its claim takes a fee coin.
+	 */
+	private forwardIncomingMargin(incoming: Readonly<IChannelState>): number {
 		const doubleMargin = this.htlcSafetyMargin * 2;
+		return incoming.auxiliaryState !== undefined
+			? Math.max(INBOUND_HTLC_CLAIM_FORCE_CLOSE_BUFFER, doubleMargin)
+			: doubleMargin;
+	}
+
+	/**
+	 * Issue #2098, step 6: on a node that keeps fee coins for its spends
+	 * with a deadline, give the monitor of each outgoing asset channel of the
+	 * fixed mode the height by which the timeout of a forward's outgoing
+	 * HTLC has to confirm: the incoming HTLC's expiry, less the distance at
+	 * which the incoming channel goes to the chain (forwardIncomingMargin),
+	 * less ASSET_FORWARD_FAIL_BACK_DEPTH, so that the incoming leg is failed
+	 * back in its channel before then. A forward whose incoming HTLC the
+	 * node no longer holds gets none.
+	 */
+	private pushForwardTimeoutDeadlines(): void {
+		try {
+			this.pushForwardTimeoutDeadlinesNow();
+		} catch (err) {
+			// Never in the way of the block's other work: the next block tries
+			// again, and a deadline not given leaves the spend asking as before.
+			this.emitStructuredLog('chain', 'forward_deadlines_failed', {
+				message: err instanceof Error ? err.message : String(err)
+			});
+		}
+	}
+
+	private pushForwardTimeoutDeadlinesNow(): void {
+		if (!this.keepsFixedOutputFeeReserve()) return;
+		const byChannel = new Map<string, Map<bigint, number>>();
+		for (const [outKey, link] of this.forwardedHtlcs) {
+			const at = outKey.indexOf(':offered-');
+			if (at < 0) continue;
+			const outHex = outKey.slice(0, at);
+			let outHtlcId: bigint;
+			try {
+				outHtlcId = BigInt(outKey.slice(at + ':offered-'.length));
+			} catch {
+				continue;
+			}
+			const outgoing = this.channelManager
+				.getChannel(Buffer.from(outHex, 'hex'))
+				?.getFullState();
+			if (
+				outgoing?.auxiliaryState === undefined ||
+				!isFixedAssetHtlcChannel(outgoing.channelType)
+			) {
+				continue;
+			}
+			const incoming = this.channelManager
+				.getChannel(link.inChannelId)
+				?.getFullState();
+			const htlc = incoming?.htlcs.get(`received-${link.inHtlcId}`);
+			if (!incoming || !htlc) continue;
+			const deadline =
+				htlc.cltvExpiry -
+				this.forwardIncomingMargin(incoming) -
+				ASSET_FORWARD_FAIL_BACK_DEPTH;
+			let deadlines = byChannel.get(outHex);
+			if (!deadlines) {
+				deadlines = new Map();
+				byChannel.set(outHex, deadlines);
+			}
+			deadlines.set(outHtlcId, deadline);
+		}
+		this.channelManager.setOfferedHtlcDeadlines(byChannel);
+	}
+
+	private scanForwardTimeouts(blockHeight: number): void {
 		const channels = this.channelManager.listChannels();
 
 		for (const channel of channels) {
@@ -36407,10 +36510,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			// Issue #2098, step 5: an asset leg's claim on the chain needs a fee
 			// coin and the blocks a coin may take, so its channel goes there at
 			// the claim buffer rather than at twice the safety margin.
-			const forwardMargin =
-				state.auxiliaryState !== undefined
-					? Math.max(INBOUND_HTLC_CLAIM_FORCE_CLOSE_BUFFER, doubleMargin)
-					: doubleMargin;
+			const forwardMargin = this.forwardIncomingMargin(state);
 
 			for (const [key, htlc] of state.htlcs) {
 				if (!key.startsWith('received-')) continue;
