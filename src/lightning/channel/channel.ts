@@ -4170,6 +4170,57 @@ export class Channel {
 	}
 
 	/**
+	 * Asset channels: turn a standing decision to settle an HTLC this node
+	 * received into one to fail, for a settle given up before its preimage
+	 * left the node. Only for an HTLC the channel still holds and has not
+	 * fulfilled. Returns the decision it replaced, or undefined with nothing
+	 * changed.
+	 */
+	retractAuxiliarySettle(htlcId: bigint): IAuxiliaryHtlcDecision | undefined {
+		const decisions = this._state.auxiliaryState?.htlcDecisions;
+		const standing = decisions?.get(htlcId.toString());
+		if (!decisions || standing?.outcome !== 'settle') return undefined;
+		const entry = this._state.htlcs.get(`received-${htlcId}`);
+		if (!entry || entry.state === HtlcState.FULFILLED) return undefined;
+		decisions.set(htlcId.toString(), { outcome: 'fail' });
+		return standing;
+	}
+
+	/** Put back a decision a retraction replaced, when its row could not be written. */
+	restoreAuxiliaryHtlcDecision(
+		htlcId: bigint,
+		decision: IAuxiliaryHtlcDecision
+	): void {
+		const auxiliary = this._state.auxiliaryState;
+		if (!auxiliary) return;
+		auxiliary.htlcDecisions ??= new Map();
+		auxiliary.htlcDecisions.set(htlcId.toString(), decision);
+	}
+
+	/**
+	 * Asset channels: whether this node decided to settle an HTLC it
+	 * received. Such an HTLC is never failed: its preimage may have left the
+	 * node, and a claim on the chain is made by that decision.
+	 */
+	private _auxiliarySettleDecided(htlcId: bigint): boolean {
+		return (
+			this._state.auxiliaryState?.htlcDecisions?.get(htlcId.toString())
+				?.outcome === 'settle'
+		);
+	}
+
+	/** The refusal of a fail over a standing decision to settle. */
+	private _auxiliarySettleDecidedRefusal(htlcId: bigint): ChannelAction[] {
+		return [
+			{
+				type: ChannelActionType.ERROR,
+				message: `Cannot fail HTLC ${htlcId}: this node decided to settle it`,
+				code: ChannelErrorCode.WRONG_STATE
+			}
+		];
+	}
+
+	/**
 	 * The first decision for an HTLC stands. The one exception is a fulfil
 	 * this node has made in the channel: the preimage is with the peer
 	 * from then on, and the record says what was done.
@@ -4954,7 +5005,7 @@ export class Channel {
 	 * refused fail must not consume the bookkeeping a later retry needs.
 	 */
 	canFailHtlc(htlcId: bigint): boolean {
-		return this.canFulfillHtlc(htlcId);
+		return this.canFulfillHtlc(htlcId) && !this._auxiliarySettleDecided(htlcId);
 	}
 
 	fulfillHtlc(htlcId: bigint, paymentPreimage: Buffer): ChannelAction[] {
@@ -5304,6 +5355,13 @@ export class Channel {
 			return repeat;
 		}
 
+		// Asset channels: the first decision for an HTLC stands. One to
+		// settle it may have sent its preimage on, or make a claim on the
+		// chain, so the HTLC is not failed over it.
+		if (this._auxiliarySettleDecided(htlcId)) {
+			return this._auxiliarySettleDecidedRefusal(htlcId);
+		}
+
 		const assetRefusal = this._auxiliaryRoundRefusal('the failure of an HTLC', {
 			htlc: {
 				key,
@@ -5417,6 +5475,11 @@ export class Channel {
 		const repeat = this._guardRepeatSettle(entry, htlcId, HtlcState.FAILED);
 		if (repeat) {
 			return repeat;
+		}
+
+		// Asset channels: never over a decision to settle, as failHtlc.
+		if (this._auxiliarySettleDecided(htlcId)) {
+			return this._auxiliarySettleDecidedRefusal(htlcId);
 		}
 
 		const assetRefusal = this._auxiliaryRoundRefusal('the failure of an HTLC', {

@@ -1279,11 +1279,13 @@ method channel.Channel.repairLegacyV2OpenerDepth(): boolean
 method channel.Channel.repairWatchtowerCommitmentCache(): void
 method channel.Channel.requestSpliceConflictRevert(): channel.ChannelAction[]
 method channel.Channel.resetSimpleCloseNegotiation(): void
+method channel.Channel.restoreAuxiliaryHtlcDecision(htlcId: bigint, decision: channel.IAuxiliaryHtlcDecision): void
 method channel.Channel.restoreLastSentBatch(startBatch: Buffer, commitments: Buffer[]): void
 method channel.Channel.restoreSpliceInFlight(): void
 method channel.Channel.restoreV2InFlight(): void
 method channel.Channel.retainFundingPayload(txHex: string): void
 method channel.Channel.retirePreSpliceSpendWatch(txid: string, outputIndex: number): boolean
+method channel.Channel.retractAuxiliarySettle(htlcId: bigint): channel.IAuxiliaryHtlcDecision | undefined
 method channel.Channel.retransmitAnnouncementSignatures(localNodeId: Buffer, remoteNodeId: Buffer): channel.ChannelAction[]
 method channel.Channel.revertConflictedSplice(): channel.ChannelAction[]
 method channel.Channel.rollbackShutdown(previous: Pick<channel.IChannelState, 'state' | 'localShutdownScript' | 'externalClose' | 'staleCloseRiskAccepted' | 'simpleClose'>): void
@@ -1388,6 +1390,7 @@ method channel.ChannelManager.auxiliaryHtlcChainEnding(channelId: Buffer, direct
 method channel.ChannelManager.auxiliaryHtlcDecision(channelId: Buffer, htlcId: bigint): channel.IAuxiliaryHtlcDecision | undefined
 method channel.ChannelManager.auxiliaryRowWritten(channel: channel.Channel): void
 method channel.ChannelManager.bumpCloseFee(channelId: Buffer, feeSatoshis: bigint): channel.ChannelResult
+method channel.ChannelManager.canForgetPreimage(paymentHash: Buffer, held: ReadonlyArray<{ channelId: Buffer; htlcId: bigint; }>): boolean
 method channel.ChannelManager.canOpenZeroConfTo(pubkeyHex: string): boolean
 get channel.ChannelManager.channelIndexTipFloorArmed(): boolean
 method channel.ChannelManager.channelsAwaitingDurability(): Set<string>
@@ -1474,6 +1477,7 @@ method channel.ChannelManager.requestSpliceConflictRevert(channelId: Buffer): ch
 method channel.ChannelManager.resendAnnouncementSignatures(channelId: Buffer): boolean
 method channel.ChannelManager.restoreChannel(channel: channel.Channel, peerPubkey: string, keyIndex?: number | null, perChannelKeys?: channel.IPerChannelKeys | null): void
 method channel.ChannelManager.restoreMonitor(channelId: string, monitor: chain.ChainMonitor): void
+method channel.ChannelManager.retractAuxiliarySettleDecision(channelId: Buffer, htlcId: bigint): boolean
 method channel.ChannelManager.retryAuxiliaryOwed(settle?: (channelId: Buffer, htlcId: bigint, kind: 'fulfill' | 'fail') => channel.ChannelResult | undefined, now?: number): Array<{ channelId: Buffer; htlcId: bigint; kind: 'fulfill' | 'fail'; }>
 method channel.ChannelManager.revertConflictedSplice(channelId: Buffer): channel.ChannelResult
 method channel.ChannelManager.sendRecoveryCloseRequest(channelId: Buffer): boolean
