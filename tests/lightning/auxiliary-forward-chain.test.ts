@@ -898,6 +898,12 @@ describe('a forward with an asset leg on the chain (issue #2098, step 5)', funct
 				expect(outgoing.auxiliaryAmount).to.equal(
 					shape[1] === 'asset' ? OUTGOING_UNITS : undefined
 				);
+				// Issue #2098, step 7: the end tells the next hop the onion
+				// named and what the leg was worth, also on the chain.
+				expect(outgoing.shortChannelId?.toString('hex')).to.equal(
+					s.asked[0].shortChannelId.toString('hex')
+				);
+				expect(outgoing.valueMsat).to.equal(FORWARD_MSAT);
 				await world.mine(w, 3);
 				expect(s.told).to.have.length(2);
 			});
@@ -933,6 +939,13 @@ describe('a forward with an asset leg on the chain (issue #2098, step 5)', funct
 				const incoming = s.told.find((end) => end.leg === 'incoming')!;
 				expect(incoming.auxiliaryAmount).to.equal(
 					shape[0] === 'asset' ? INCOMING_UNITS : undefined
+				);
+				// Issue #2098, step 7: and the next hop and what it was worth.
+				expect(incoming.shortChannelId?.toString('hex')).to.equal(
+					s.asked[0].shortChannelId.toString('hex')
+				);
+				expect(incoming.valueMsat).to.equal(
+					shape[0] === 'asset' ? INCOMING_UNITS * MSAT_PER_UNIT : INCOMING_MSAT
 				);
 				await world.mine(w, 2);
 				expect(linksOf(w)).to.equal(0);

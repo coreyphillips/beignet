@@ -134,6 +134,24 @@ export interface IAuxiliaryForwardLegResolution {
 	/** The custom records its HTLC carried. Empty for a bitcoin leg. */
 	customRecords: CustomRecords;
 	/**
+	 * The next hop the onion named, as the request gave it
+	 * (`IAuxiliaryForwardRequest.shortChannelId`): for a forward by a quote,
+	 * the short channel id the host claimed for it. The same on both legs
+	 * of a forward. Absent only on the end of a forward a build before this
+	 * field asked about.
+	 */
+	shortChannelId?: Buffer;
+	/**
+	 * What the leg was worth as the node counted it, in millisatoshis: for
+	 * an incoming asset leg the host's value of it (`incomingValueMsat`),
+	 * for an incoming bitcoin leg the amount its HTLC carried, and for an
+	 * outgoing leg, never offered included, the amount the onion asked the
+	 * node to forward. Absent on an incoming asset leg whose terms were
+	 * refused as malformed, or whose answer a stop lost before it was kept,
+	 * and on the end of a forward a build before this field asked about.
+	 */
+	valueMsat?: bigint;
+	/**
 	 * Only on a failed incoming leg: the node had claimed it with the
 	 * preimage, in a fulfil made in the channel or in a claim it signed for
 	 * the chain, and the payer took the output back all the same. Such a leg

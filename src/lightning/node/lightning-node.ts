@@ -136,7 +136,7 @@ import type {
 	ICompositeSpliceStartResult
 } from './composite-splice-engine';
 import type { ICompositeSpliceRecord } from '../channel/composite-splice-record';
-import type { IHtlcEntry } from '../channel/types';
+import type { IHtlcEntry, IHtlcForwardTerms } from '../channel/types';
 import {
 	ChannelState,
 	ChannelRole,
@@ -28897,14 +28897,32 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		paymentHash: Buffer,
 		inChannelId: Buffer,
 		inHtlcId: bigint,
-		channelId?: Buffer
+		channelId?: Buffer,
+		/**
+		 * Issue #2098, step 7: the next hop and the amount to forward the end
+		 * tells, given wherever the onion has been read. Without them the end
+		 * tells what the ask kept on the incoming HTLC.
+		 */
+		terms?: Pick<IHtlcForwardTerms, 'shortChannelId' | 'amountToForwardMsat'>
 	): void {
 		this.channelManager.recordForwardNeverOffered(
 			inChannelId,
 			inHtlcId,
 			paymentHash,
-			channelId
+			channelId,
+			terms
 		);
+	}
+
+	/** Issue #2098, step 7: the next hop and the amount to forward of a forward being asked about. */
+	private askedTermsOf(ctx: {
+		shortChannelId: Buffer;
+		forwardAmountMsat: bigint;
+	}): Pick<IHtlcForwardTerms, 'shortChannelId' | 'amountToForwardMsat'> {
+		return {
+			shortChannelId: Buffer.from(ctx.shortChannelId),
+			amountToForwardMsat: ctx.forwardAmountMsat
+		};
 	}
 
 	/**
@@ -29455,7 +29473,12 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				return;
 			}
 		}
-		if (!this.channelManager.recordForwardAsk(ctx.inChannelId, ctx.inHtlcId)) {
+		if (
+			!this.channelManager.recordForwardAsk(ctx.inChannelId, ctx.inHtlcId, {
+				shortChannelId: ctx.shortChannelId,
+				amountToForwardMsat: ctx.forwardAmountMsat
+			})
+		) {
 			log('the incoming channel could not write that its host is asked');
 			ctx.failIncoming(TEMPORARY_CHANNEL_FAILURE);
 			return;
@@ -29522,11 +29545,22 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			}
 			return;
 		}
+		// Step 7: the terms are read first, which writes nothing, so that the
+		// mark carries what the incoming leg is worth.
+		const read = this.readForwardTerms(answer, {
+			named: ctx.named,
+			incomingAsset: false,
+			outgoingAsset: true
+		});
 		// Issue #2098, step 5: the host answered with terms, and is told how
 		// each leg of the forward ends from here on (onForwardLegResolved),
 		// also when the node refuses them. Written before anything is offered.
 		if (
-			!this.channelManager.recordForwardTaken(ctx.inChannelId, ctx.inHtlcId)
+			!this.channelManager.recordForwardTaken(ctx.inChannelId, ctx.inHtlcId, {
+				shortChannelId: ctx.shortChannelId,
+				amountToForwardMsat: ctx.forwardAmountMsat,
+				incomingValueMsat: ctx.incomingAmountMsat
+			})
 		) {
 			// The host answered with terms, so it is told that the outgoing leg
 			// was never offered, as after any refusal of its answer. Told before
@@ -29538,16 +29572,12 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				ctx.paymentHash,
 				ctx.inChannelId,
 				ctx.inHtlcId,
-				ctx.named
+				ctx.named,
+				this.askedTermsOf(ctx)
 			);
 			ctx.failIncoming(TEMPORARY_CHANNEL_FAILURE);
 			return;
 		}
-		const read = this.readForwardTerms(answer, {
-			named: ctx.named,
-			incomingAsset: false,
-			outgoingAsset: true
-		});
 		if ('refused' in read) {
 			log(`the terms are refused: ${read.refused}`);
 			ctx.failIncoming(TEMPORARY_CHANNEL_FAILURE);
@@ -29555,11 +29585,17 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				ctx.paymentHash,
 				ctx.inChannelId,
 				ctx.inHtlcId,
-				read.channelId
+				read.channelId,
+				this.askedTermsOf(ctx)
 			);
 			return;
 		}
-		const terms = { outChannelId: read.outChannelId, ...read.outgoingHtlc! };
+		const terms = {
+			outChannelId: read.outChannelId,
+			...read.outgoingHtlc!,
+			// A bitcoin incoming leg is worth what it carries.
+			incomingValueMsat: ctx.incomingAmountMsat
+		};
 		const refuseAfterTerms = (
 			reason: string,
 			failureCode: number,
@@ -29571,7 +29607,8 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				ctx.paymentHash,
 				ctx.inChannelId,
 				ctx.inHtlcId,
-				terms.outChannelId
+				terms.outChannelId,
+				this.askedTermsOf(ctx)
 			);
 		};
 		if (!ctx.named) {
@@ -29637,6 +29674,8 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			incomingCltvExpiry: number;
 			forwardAmountMsat: bigint;
 			forwardCltv: number;
+			/** The next hop the onion names. */
+			shortChannelId: Buffer;
 			nextPacket: IHeldJitPart['nextPacket'];
 			failIncoming: (
 				failureCode: number,
@@ -29647,6 +29686,8 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			outChannelId: Buffer;
 			customRecords: Map<bigint, Buffer>;
 			wireAmountMsat: bigint;
+			/** What the incoming leg is worth (IHtlcForwardTerms). */
+			incomingValueMsat: bigint;
 		}
 	): void {
 		const outChannelId = terms.outChannelId;
@@ -29683,7 +29724,14 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 					emitRefusal: false,
 					customRecords: terms.customRecords,
 					expectedHtlcId: outHtlcId,
-					forwardOf: this.forwardOfFor(ctx)
+					forwardOf: this.forwardOfFor(ctx),
+					// Issue #2098, step 7: kept with the add, whatever hooks the
+					// host supplies.
+					forwardTerms: {
+						shortChannelId: Buffer.from(ctx.shortChannelId),
+						amountToForwardMsat: ctx.forwardAmountMsat,
+						incomingValueMsat: terms.incomingValueMsat
+					}
 				}
 			);
 		} catch (err) {
@@ -29739,7 +29787,8 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				ctx.paymentHash,
 				ctx.inChannelId,
 				ctx.inHtlcId,
-				outChannelId
+				outChannelId,
+				this.askedTermsOf(ctx)
 			);
 			return;
 		}
@@ -29816,7 +29865,12 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				return;
 			}
 		}
-		if (!this.channelManager.recordForwardAsk(ctx.inChannelId, ctx.inHtlcId)) {
+		if (
+			!this.channelManager.recordForwardAsk(ctx.inChannelId, ctx.inHtlcId, {
+				shortChannelId: ctx.shortChannelId,
+				amountToForwardMsat: ctx.forwardAmountMsat
+			})
+		) {
 			log('the incoming channel could not write that its host is asked');
 			ctx.failIncoming(TEMPORARY_CHANNEL_FAILURE);
 			return;
@@ -29880,11 +29934,24 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			ctx.failIncoming(TEMPORARY_CHANNEL_FAILURE);
 			return;
 		}
+		// Step 7: the terms are read first, which writes nothing, so that the
+		// mark carries the host's value of the incoming leg.
+		const read = this.readForwardTerms(answer, {
+			named: ctx.named,
+			incomingAsset: true,
+			outgoingAsset: true
+		});
 		// Issue #2098, step 5: the host answered with terms, and is told how
 		// each leg of the forward ends from here on (onForwardLegResolved),
 		// also when the node refuses them. Written before anything is offered.
 		if (
-			!this.channelManager.recordForwardTaken(ctx.inChannelId, ctx.inHtlcId)
+			!this.channelManager.recordForwardTaken(ctx.inChannelId, ctx.inHtlcId, {
+				shortChannelId: ctx.shortChannelId,
+				amountToForwardMsat: ctx.forwardAmountMsat,
+				...('refused' in read
+					? {}
+					: { incomingValueMsat: read.incomingValueMsat })
+			})
 		) {
 			// The host answered with terms, so it is told that the outgoing leg
 			// was never offered, as after any refusal of its answer. Told before
@@ -29896,16 +29963,12 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				ctx.paymentHash,
 				ctx.inChannelId,
 				ctx.inHtlcId,
-				ctx.named
+				ctx.named,
+				this.askedTermsOf(ctx)
 			);
 			ctx.failIncoming(TEMPORARY_CHANNEL_FAILURE);
 			return;
 		}
-		const read = this.readForwardTerms(answer, {
-			named: ctx.named,
-			incomingAsset: true,
-			outgoingAsset: true
-		});
 		if ('refused' in read) {
 			log(`the terms are refused: ${read.refused}`, read.channelId);
 			ctx.failIncoming(TEMPORARY_CHANNEL_FAILURE);
@@ -29913,7 +29976,8 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				ctx.paymentHash,
 				ctx.inChannelId,
 				ctx.inHtlcId,
-				read.channelId
+				read.channelId,
+				this.askedTermsOf(ctx)
 			);
 			return;
 		}
@@ -29929,7 +29993,8 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				ctx.paymentHash,
 				ctx.inChannelId,
 				ctx.inHtlcId,
-				outChannelId
+				outChannelId,
+				this.askedTermsOf(ctx)
 			);
 		};
 		const outPolicy = this.getForwardingPolicyForChannel(outChannelId);
@@ -29990,7 +30055,8 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		}
 		this.addForwardOverAssetChannel(ctx, {
 			outChannelId,
-			...read.outgoingHtlc
+			...read.outgoingHtlc,
+			incomingValueMsat: read.incomingValueMsat
 		});
 	}
 
@@ -30072,7 +30138,12 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			ctx.failIncoming(TEMPORARY_CHANNEL_FAILURE);
 			return;
 		}
-		if (!this.channelManager.recordForwardAsk(ctx.inChannelId, ctx.inHtlcId)) {
+		if (
+			!this.channelManager.recordForwardAsk(ctx.inChannelId, ctx.inHtlcId, {
+				shortChannelId: ctx.shortChannelId,
+				amountToForwardMsat: ctx.forwardAmountMsat
+			})
+		) {
 			log('the incoming channel could not write that its host is asked');
 			ctx.failIncoming(TEMPORARY_CHANNEL_FAILURE);
 			return;
@@ -30131,11 +30202,24 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			ctx.failIncoming(TEMPORARY_CHANNEL_FAILURE);
 			return;
 		}
+		// Step 7: the terms are read first, which writes nothing, so that the
+		// mark carries the host's value of the incoming leg.
+		const terms = this.readForwardTerms(answer, {
+			named: ctx.outChannelId,
+			incomingAsset: true,
+			outgoingAsset: false
+		});
 		// Issue #2098, step 5: the host answered with terms, and is told how
 		// each leg of the forward ends from here on (onForwardLegResolved),
 		// also when the node refuses them. Written before anything is offered.
 		if (
-			!this.channelManager.recordForwardTaken(ctx.inChannelId, ctx.inHtlcId)
+			!this.channelManager.recordForwardTaken(ctx.inChannelId, ctx.inHtlcId, {
+				shortChannelId: ctx.shortChannelId,
+				amountToForwardMsat: ctx.forwardAmountMsat,
+				...('refused' in terms
+					? {}
+					: { incomingValueMsat: terms.incomingValueMsat })
+			})
 		) {
 			// The host answered with terms, so it is told that the outgoing leg
 			// was never offered, as after any refusal of its answer. Told before
@@ -30147,7 +30231,8 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				ctx.paymentHash,
 				ctx.inChannelId,
 				ctx.inHtlcId,
-				ctx.outChannelId
+				ctx.outChannelId,
+				this.askedTermsOf(ctx)
 			);
 			ctx.failIncoming(TEMPORARY_CHANNEL_FAILURE);
 			return;
@@ -30157,13 +30242,9 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				ctx.paymentHash,
 				ctx.inChannelId,
 				ctx.inHtlcId,
-				ctx.outChannelId
+				ctx.outChannelId,
+				this.askedTermsOf(ctx)
 			);
-		const terms = this.readForwardTerms(answer, {
-			named: ctx.outChannelId,
-			incomingAsset: true,
-			outgoingAsset: false
-		});
 		if ('refused' in terms) {
 			log(`the terms are refused: ${terms.refused}`);
 			ctx.failIncoming(TEMPORARY_CHANNEL_FAILURE);
@@ -30195,7 +30276,14 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				failIncoming: (code) => ctx.failIncoming(code)
 			},
 			'engine',
-			{ incomingAssetLeg: true }
+			{
+				incomingAssetLeg: true,
+				forwardTerms: {
+					shortChannelId: Buffer.from(ctx.shortChannelId),
+					amountToForwardMsat: ctx.forwardAmountMsat,
+					incomingValueMsat: terms.incomingValueMsat!
+				}
+			}
 		);
 		if (placement !== 'forwarded') tell();
 	}
@@ -30231,7 +30319,11 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		 * then does an incoming asset channel take this path, and such a part
 		 * is never held for a JIT splice.
 		 */
-		options: { incomingAssetLeg?: boolean } = {}
+		options: {
+			incomingAssetLeg?: boolean;
+			/** Issue #2098, step 7: kept on the outgoing HTLC of such a part. */
+			forwardTerms?: IHtlcForwardTerms;
+		} = {}
 	): ForwardPlacement {
 		// The tip may have moved since the forward was judged (issue #1009): a
 		// JIT part held for a splice, a held forward its receiver releases and
@@ -30333,7 +30425,12 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				{
 					emitRefusal: false,
 					...(options.incomingAssetLeg
-						? { forwardOf: this.forwardOfFor(part) }
+						? {
+								forwardOf: this.forwardOfFor(part),
+								...(options.forwardTerms
+									? { forwardTerms: options.forwardTerms }
+									: {})
+						  }
 						: {})
 				}
 			);

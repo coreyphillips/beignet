@@ -74,7 +74,11 @@ export const AUXILIARY_CHANNELS_API = Object.freeze({
 		// .reserve; a host may have asset HTLCs that end at the node taken
 		// only while those coins would pay to claim them.
 		'getFixedOutputFeeStatus:reserve',
-		'requireFeeCoinsToSettle'
+		'requireFeeCoinsToSettle',
+		// Issue #2098, step 7: each leg's end tells the quote the forward was
+		// taken under: the next hop the onion named (shortChannelId) and what
+		// the leg was worth (valueMsat).
+		'onForwardLegResolved:quote'
 	] as const),
 	// Nothing is declared and not run in this build.
 	declared: Object.freeze([] as const)

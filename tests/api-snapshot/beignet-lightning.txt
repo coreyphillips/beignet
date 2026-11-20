@@ -1031,7 +1031,7 @@ function chain.signP2wpkhInput(tx: bitcoinjs-lib#Transaction, inputIndex: number
 function chain.signSweepInput(tx: bitcoinjs-lib#Transaction, inputIndex: number, witnessScript: Buffer, value: number, privateKey: Buffer, sighashType?: number): Buffer
 function chain.sweepVbytes(witness: readonly Buffer[], destinationScript: Buffer): number
 namespace channel
-const channel.AUXILIARY_CHANNELS_API: Readonly<{ version: 1; surfaces: readonly [ "valueIncomingHtlc:three-outcome", "sendPaymentToRoute:assetPayment", "getAuxiliaryPaymentHtlcs", "onHtlcResolved:htlcId", "queryAuxiliaryRoute", "fundAuxiliaryChannel:unsigned", "onFundingSigned", "abandonAuxiliaryOpen", "IChannelInfo.auxiliary", "setAuxiliaryPaymentGate", "getChannelMonitorState", "IPaymentInfo.auxiliary", "IPaymentInfo.auxiliaryValueMsat", "IInvoiceInfo.auxiliary", "IAuxiliaryChannelInfo.undeliveredOutcomes", "onHtlcResolved:never-sent", "getFixedOutputFeeStatus", "IPaymentInfo.unresolved", "IHoldInvoiceStateEvent.auxiliary", "prepareForward", "getFixedOutputFeeStatus:splitCoins", "getFixedOutputFeeStatus:reserve", "requireFeeCoinsToSettle" ]; declared: readonly [ ]; }>
+const channel.AUXILIARY_CHANNELS_API: Readonly<{ version: 1; surfaces: readonly [ "valueIncomingHtlc:three-outcome", "sendPaymentToRoute:assetPayment", "getAuxiliaryPaymentHtlcs", "onHtlcResolved:htlcId", "queryAuxiliaryRoute", "fundAuxiliaryChannel:unsigned", "onFundingSigned", "abandonAuxiliaryOpen", "IChannelInfo.auxiliary", "setAuxiliaryPaymentGate", "getChannelMonitorState", "IPaymentInfo.auxiliary", "IPaymentInfo.auxiliaryValueMsat", "IInvoiceInfo.auxiliary", "IAuxiliaryChannelInfo.undeliveredOutcomes", "onHtlcResolved:never-sent", "getFixedOutputFeeStatus", "IPaymentInfo.unresolved", "IHoldInvoiceStateEvent.auxiliary", "prepareForward", "getFixedOutputFeeStatus:splitCoins", "getFixedOutputFeeStatus:reserve", "requireFeeCoinsToSettle", "onForwardLegResolved:quote" ]; declared: readonly [ ]; }>
 const channel.AUXILIARY_CHANNEL_DUST_LIMIT = 354n
 const channel.AUXILIARY_CLOSE_ASSET_OUTPUT_MINIMUM = 330n
 class channel.AuxiliaryChannelUnsupportedError extends beignet#CodedError<'ASSET_CHANNEL_UNSUPPORTED'>
@@ -1064,7 +1064,7 @@ method channel.Channel.abortDualFunding(reason?: string): channel.ChannelAction[
 method channel.Channel.abortFforEpoch(reason?: ffor.FforAbortReason, text?: string): channel.ChannelAction[]
 method channel.Channel.abortSplice(reason?: string): channel.ChannelAction[]
 method channel.Channel.acceptsNewHtlcs(lookThroughReestablish?: boolean, reservationHint?: boolean): boolean
-method channel.Channel.addHtlc(amountMsat: bigint, paymentHash: Buffer, cltvExpiry: number, onionRoutingPacket: Buffer, blindingPoint?: Buffer, skimmedFeeMsat?: bigint, customRecords?: message.CustomRecords, forwardOf?: { channelId: Buffer; htlcId: bigint; }): channel.ChannelAction[]
+method channel.Channel.addHtlc(amountMsat: bigint, paymentHash: Buffer, cltvExpiry: number, onionRoutingPacket: Buffer, blindingPoint?: Buffer, skimmedFeeMsat?: bigint, customRecords?: message.CustomRecords, forwardOf?: { channelId: Buffer; htlcId: bigint; }, forwardTerms?: channel.IHtlcForwardTerms): channel.ChannelAction[]
 method channel.Channel.addTxInput(input: interactiveTx.IInteractiveTxInput): channel.ChannelAction[]
 method channel.Channel.addTxOutput(output: interactiveTx.IInteractiveTxOutput): channel.ChannelAction[]
 method channel.Channel.adoptRemoteForwardingPolicy(policy: channel.IRemoteForwardingPolicy): boolean
@@ -1130,6 +1130,7 @@ method channel.Channel.forceClose(signer: keys.ISigner, chain?: channel.IForceCl
 method channel.Channel.forgetUnsentSplice(reason: string): channel.ChannelAction[]
 method channel.Channel.forwardAsked(htlcId: bigint): boolean
 method channel.Channel.forwardTaken(htlcId: bigint): boolean
+method channel.Channel.forwardTermsOf(htlcId: bigint): channel.IHtlcForwardTerms | undefined
 method channel.Channel.fulfillHtlc(htlcId: bigint, paymentPreimage: Buffer): channel.ChannelAction[]
 method channel.Channel.fundingConfirmed(confirmedTxid?: Buffer): channel.ChannelAction[]
 method channel.Channel.fundingMissingSince(): number | undefined
@@ -1277,7 +1278,7 @@ method channel.Channel.recordCloseReason(reason: channel.ChannelCloseReason): bo
 method channel.Channel.recordCooperativeCloseTx(txHex: string, localFeeSats?: bigint): void
 method channel.Channel.recordExternalCloseCandidate(txHex: string, localFeeSats: bigint): void
 method channel.Channel.recordForwardLegChainEnd(direction: channel.HtlcDirection, htlcId: bigint, outcome: 'fulfilled' | 'failed'): boolean
-method channel.Channel.recordForwardNeverOffered(inHtlcId: bigint, paymentHash: Buffer, channelId?: Buffer): boolean
+method channel.Channel.recordForwardNeverOffered(inHtlcId: bigint, paymentHash: Buffer, channelId?: Buffer, terms?: Pick<channel.IHtlcForwardTerms, 'shortChannelId' | 'amountToForwardMsat'>): boolean
 method channel.Channel.recordInFlightPreSpliceSpendWatch(): boolean
 method channel.Channel.recoverCloseSpendsFunding(fundingTxid: Buffer): boolean
 method channel.Channel.refuseHeldMutualClose(): channel.ChannelAction[]
@@ -1313,6 +1314,7 @@ method channel.Channel.setCompositeSpliceContribution(contribution: channel.ICom
 method channel.Channel.setDualFundingContribution(inputs: channel.ISpliceWalletInput[], changeScript: Buffer, contributionSats: bigint, feeratePerKw: number): void
 method channel.Channel.setFforCapabilities(concurrentNegotiated: boolean): void
 method channel.Channel.setFforContext(ctx: ffor.IFforChannelContext): void
+method channel.Channel.setForwardTerms(htlcId: bigint, terms: channel.IHtlcForwardTerms | undefined): boolean
 method channel.Channel.setFundingOutpoint(fundingTxid: Buffer, fundingOutputIndex: number): void
 method channel.Channel.setFundingTxHex(txHex: string): boolean
 method channel.Channel.setLocalNodeIdLower(lower: boolean): void
@@ -1395,7 +1397,7 @@ method channel.ChannelManager.abortDualFundedOpen(channelId: Buffer, reason?: st
 method channel.ChannelManager.abortFforEpoch(channelId: Buffer, reason?: ffor.FforAbortReason, text?: string): channel.ChannelResult
 method channel.ChannelManager.abortPendingOpen(channel: channel.Channel, reason: string): void
 method channel.ChannelManager.abortSplice(channelId: Buffer, reason?: string): channel.ChannelResult
-method channel.ChannelManager.addHtlc(channelId: Buffer, amountMsat: bigint, paymentHash: Buffer, cltvExpiry: number, onionRoutingPacket: Buffer, blindingPoint?: Buffer, skimmedFeeMsat?: bigint, options?: { emitRefusal?: boolean; customRecords?: message.CustomRecords; expectedHtlcId?: bigint; forwardOf?: { channelId: Buffer; htlcId: bigint; }; }): channel.ChannelResult
+method channel.ChannelManager.addHtlc(channelId: Buffer, amountMsat: bigint, paymentHash: Buffer, cltvExpiry: number, onionRoutingPacket: Buffer, blindingPoint?: Buffer, skimmedFeeMsat?: bigint, options?: { emitRefusal?: boolean; customRecords?: message.CustomRecords; expectedHtlcId?: bigint; forwardOf?: { channelId: Buffer; htlcId: bigint; }; forwardTerms?: channel.IHtlcForwardTerms; }): channel.ChannelResult
 method channel.ChannelManager.addTrustedPeer(pubkeyHex: string): void
 method channel.ChannelManager.armChannelIndexTipFloor(knownTipHeight?: number): void
 method channel.ChannelManager.attachToPeerManager(peerManager: transport.PeerManager): void
@@ -1489,10 +1491,10 @@ method channel.ChannelManager.reauthorizeFundingBroadcast(channelId: Buffer): bo
 method channel.ChannelManager.reauthorizeSpliceBroadcast(channelId: Buffer): boolean
 method channel.ChannelManager.rebuildForceCloseCommitment(channelId: Buffer, feeRatePerVbyte: number, noDeadlineFeeRatePerVbyte?: number): { ok: boolean; tx?: Buffer; error?: string; retryable?: boolean; }
 method channel.ChannelManager.recordAuxiliaryHtlcDecision(channelId: Buffer, htlcId: bigint, outcome: 'settle' | 'fail', preimage?: Buffer): boolean
-method channel.ChannelManager.recordForwardAsk(channelId: Buffer, htlcId: bigint): boolean
+method channel.ChannelManager.recordForwardAsk(channelId: Buffer, htlcId: bigint, terms?: Pick<channel.IHtlcForwardTerms, 'shortChannelId' | 'amountToForwardMsat'>): boolean
 method channel.ChannelManager.recordForwardDecision(channelId: Buffer, htlcId: bigint, outcome: 'settle' | 'fail', preimage?: Buffer): boolean
-method channel.ChannelManager.recordForwardNeverOffered(inChannelId: Buffer, inHtlcId: bigint, paymentHash: Buffer, channelId?: Buffer): void
-method channel.ChannelManager.recordForwardTaken(channelId: Buffer, htlcId: bigint): boolean
+method channel.ChannelManager.recordForwardNeverOffered(inChannelId: Buffer, inHtlcId: bigint, paymentHash: Buffer, channelId?: Buffer, terms?: Pick<channel.IHtlcForwardTerms, 'shortChannelId' | 'amountToForwardMsat'>): void
+method channel.ChannelManager.recordForwardTaken(channelId: Buffer, htlcId: bigint, terms?: channel.IHtlcForwardTerms): boolean
 method channel.ChannelManager.recordPreimage(paymentHash: Buffer, preimage: Buffer): void
 method channel.ChannelManager.releaseCompositeSpliceCommitment(channelId: Buffer): channel.ChannelResult
 method channel.ChannelManager.removeTrustedPeer(pubkeyHex: string): void
@@ -1813,6 +1815,8 @@ property channel.IAuxiliaryForwardLegResolution.onChain: boolean
 property channel.IAuxiliaryForwardLegResolution.outcome: 'fulfilled' | 'failed' | 'never-offered'
 property channel.IAuxiliaryForwardLegResolution.paymentHash: Buffer
 property channel.IAuxiliaryForwardLegResolution.preimageRevealed?: true
+property channel.IAuxiliaryForwardLegResolution.shortChannelId?: Buffer
+property channel.IAuxiliaryForwardLegResolution.valueMsat?: bigint
 interface channel.IAuxiliaryForwardRequest
 property channel.IAuxiliaryForwardRequest.amountToForwardMsat: bigint
 property channel.IAuxiliaryForwardRequest.incoming: channel.IAuxiliaryForwardIncoming
@@ -2315,6 +2319,7 @@ property channel.IHtlcEntry.forwardAsked?: boolean
 property channel.IHtlcEntry.forwardEmitted?: boolean
 property channel.IHtlcEntry.forwardOf?: { channelId: Buffer; htlcId: bigint; }
 property channel.IHtlcEntry.forwardTaken?: boolean
+property channel.IHtlcEntry.forwardTerms?: channel.IHtlcForwardTerms
 property channel.IHtlcEntry.funderFeeFailback?: boolean
 property channel.IHtlcEntry.id: bigint
 property channel.IHtlcEntry.onionRoutingPacket: Buffer
@@ -2328,6 +2333,10 @@ property channel.IHtlcFailedAction.htlcId: bigint
 property channel.IHtlcFailedAction.malformedCode?: number
 property channel.IHtlcFailedAction.reason: Buffer
 property channel.IHtlcFailedAction.type: channel.ChannelActionType.HTLC_FAILED
+interface channel.IHtlcForwardTerms
+property channel.IHtlcForwardTerms.amountToForwardMsat: bigint
+property channel.IHtlcForwardTerms.incomingValueMsat?: bigint
+property channel.IHtlcForwardTerms.shortChannelId: Buffer
 interface channel.IHtlcForwardedAction
 property channel.IHtlcForwardedAction.amountMsat: bigint
 property channel.IHtlcForwardedAction.htlcId: bigint
@@ -2636,6 +2645,7 @@ function channel.calculateCommitmentFee(feeratePerKw: number, numUntrimmedHtlcs:
 function channel.compositeSpliceStageAtLeast(stage: channel.CompositeSpliceStage, floor: channel.CompositeSpliceStage): boolean
 function channel.compositeSpliceStageIsTerminal(stage: channel.CompositeSpliceStage): boolean
 function channel.copyAuxiliaryCommitment(data: channel.IAuxiliaryCommitmentData): channel.IAuxiliaryCommitmentData
+function channel.copyForwardTerms(terms: channel.IHtlcForwardTerms): channel.IHtlcForwardTerms
 function channel.createAcceptorChannel(params: { temporaryChannelId: Buffer; localConfig?: channel.IChannelConfig; localBasepoints: keys.IChannelBasepoints; localPerCommitmentSeed: Buffer; }): channel.Channel
 function channel.createAcceptorState(params: { temporaryChannelId: Buffer; fundingSatoshis: bigint; pushMsat: bigint; localConfig: channel.IChannelConfig; localBasepoints: keys.IChannelBasepoints; localPerCommitmentSeed: Buffer; remoteBasepoints: keys.IChannelBasepoints; remoteConfig: channel.IChannelConfig; }): channel.IChannelState
 function channel.createOpenerChannel(params: { fundingSatoshis: bigint; pushMsat?: bigint; localConfig?: channel.IChannelConfig; localBasepoints: keys.IChannelBasepoints; localPerCommitmentSeed: Buffer; }): channel.Channel
@@ -2672,6 +2682,7 @@ function channel.receivedAddIrrevocablyCommitted(entry: channel.IHtlcEntry): boo
 function channel.recencyHoldOrigin(state: { restoreRecencyUnproven?: boolean; reestablishRecencyUnproven?: boolean; reestablishSecretMissing?: boolean; }): channel.RecencyHoldOrigin | null
 function channel.recordAuxiliaryClose(state: channel.IChannelState, txid: string, customData: Buffer): void
 function channel.requireAuxiliaryProvider(state: channel.IChannelState): channel.IChannelAuxiliaryProvider
+function channel.sameForwardTerms(a: channel.IHtlcForwardTerms | undefined, b: channel.IHtlcForwardTerms | undefined): boolean
 function channel.scidAliasAnnounceRefusal(channelType: Buffer | null | undefined, announceChannel: boolean): string | null
 function channel.signRemoteCommitment(state: channel.IChannelState, signer: keys.ISigner, remotePerCommitmentPoint: Buffer, commitmentNumber?: bigint): { signature: Buffer; htlcSignatures: Buffer[]; }
 function channel.signRemoteCommitmentPartial(state: channel.IChannelState, signer: keys.ISigner, ourPublicNonce: Uint8Array, theirPublicNonce: Buffer, remotePerCommitmentPoint: Buffer, commitmentNumber?: bigint, signed?: { auxiliary?: channel.IAuxiliaryCommitmentData; }): Buffer
@@ -8635,6 +8646,8 @@ property storage.ISerializedForwardLegEnd.onChain: boolean
 property storage.ISerializedForwardLegEnd.outcome: 'fulfilled' | 'failed' | 'never-offered'
 property storage.ISerializedForwardLegEnd.paymentHash: string
 property storage.ISerializedForwardLegEnd.preimageRevealed?: true
+property storage.ISerializedForwardLegEnd.shortChannelId?: string
+property storage.ISerializedForwardLegEnd.valueMsat?: string
 interface storage.ISerializedHtlcEntry
 property storage.ISerializedHtlcEntry.addCoverPending?: boolean
 property storage.ISerializedHtlcEntry.addLocallyRevoked?: boolean
@@ -8659,6 +8672,7 @@ property storage.ISerializedHtlcEntry.forwardAsked?: boolean
 property storage.ISerializedHtlcEntry.forwardEmitted?: boolean
 property storage.ISerializedHtlcEntry.forwardOf?: { channelId: string; htlcId: string; }
 property storage.ISerializedHtlcEntry.forwardTaken?: boolean
+property storage.ISerializedHtlcEntry.forwardTerms?: { shortChannelId: string; amountToForwardMsat: string; incomingValueMsat?: string; }
 property storage.ISerializedHtlcEntry.funderFeeFailback?: boolean
 property storage.ISerializedHtlcEntry.id: string
 property storage.ISerializedHtlcEntry.key: string
