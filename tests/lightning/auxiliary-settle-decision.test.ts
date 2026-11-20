@@ -407,6 +407,144 @@ describe('the settle decision of an asset channel is a record for each HTLC (iss
 		).to.not.equal(undefined);
 	});
 
+	/** Bob's channel manager answering every row write as not committed while `run` runs. */
+	const uncommitted = <T>(host: IAssetHost, run: () => T): T => {
+		const persistence = (
+			host.node.getChannelManager() as unknown as {
+				persistence: { persist: (...args: unknown[]) => unknown };
+			}
+		).persistence;
+		const persist = persistence.persist;
+		persistence.persist = (): unknown => ({ committed: false, outboxIds: [] });
+		try {
+			return run();
+		} finally {
+			persistence.persist = persist;
+		}
+	};
+
+	it('keeps no decision whose row the storage did not commit, and answers false for it', async () => {
+		const pair = await opened('aux-decision-uncommitted');
+		const held = await holdUnits(pair, 5000n, 'uncommitted');
+		const manager = pair.bob.node.getChannelManager();
+		const record = (): boolean =>
+			manager.recordAuxiliaryHtlcDecision(
+				pair.channelId,
+				0n,
+				'settle',
+				held.preimage
+			);
+		expect(uncommitted(pair.bob, record)).to.equal(false);
+		expect(decisionOf(pair.bob, pair, 0n)).to.equal(undefined);
+		// A persistence that answers nothing has written nothing either.
+		const persistence = (
+			manager as unknown as {
+				persistence: { persist: (...args: unknown[]) => unknown };
+			}
+		).persistence;
+		const persist = persistence.persist;
+		persistence.persist = (): unknown => undefined;
+		try {
+			expect(record()).to.equal(false);
+		} finally {
+			persistence.persist = persist;
+		}
+		expect(decisionOf(pair.bob, pair, 0n)).to.equal(undefined);
+		// Written once the storage takes it.
+		expect(record()).to.equal(true);
+		expect(decisionOf(pair.bob, pair, 0n)).to.equal('settle');
+	});
+
+	it('never fails an HTLC whose settle it decided: the fail is refused, nothing is sent, and the decision stands', async () => {
+		const pair = await opened('aux-decision-no-fail-over-settle');
+		const held = await holdUnits(pair, 5000n, 'no fail over settle');
+		const manager = pair.bob.node.getChannelManager();
+		expect(
+			manager.recordAuxiliaryHtlcDecision(
+				pair.channelId,
+				0n,
+				'settle',
+				held.preimage
+			)
+		).to.equal(true);
+		const sent = gateMessages(pair, 'bob', () => true);
+		const channel = manager.getChannel(pair.channelId)!;
+		expect(channel.canFailHtlc(0n)).to.equal(false);
+		const failed = manager.failHtlc(pair.channelId, 0n, Buffer.alloc(256));
+		expect(failed.ok).to.equal(false);
+		expect(failed.code).to.equal('WRONG_STATE');
+		const malformed = manager.failMalformedHtlc(
+			pair.channelId,
+			0n,
+			Buffer.alloc(32),
+			0x8000 | 0x4000 | 5
+		);
+		expect(malformed.ok).to.equal(false);
+		await settle();
+		expect(
+			sent.kept.filter(
+				(m) =>
+					m.type === UPDATE_FAIL_HTLC || m.type === UPDATE_FAIL_MALFORMED_HTLC
+			)
+		).to.deep.equal([]);
+		expect(channel.getFullState().htlcs.get('received-0')!.state).to.equal(
+			HtlcState.COMMITTED
+		);
+		expect(decisionOf(pair.bob, pair, 0n)).to.equal('settle');
+	});
+
+	it('takes back a decision to settle durably for an HTLC whose preimage never left it, and keeps it when the row cannot be written or the channel is on chain', async () => {
+		const pair = await opened('aux-decision-retract');
+		const held = await holdUnits(pair, 5000n, 'retract');
+		const manager = pair.bob.node.getChannelManager();
+		// Nothing to take back: true, and nothing changes.
+		expect(manager.retractAuxiliarySettleDecision(pair.channelId, 0n)).to.equal(
+			true
+		);
+		expect(decisionOf(pair.bob, pair, 0n)).to.equal(undefined);
+		expect(
+			manager.recordAuxiliaryHtlcDecision(
+				pair.channelId,
+				0n,
+				'settle',
+				held.preimage
+			)
+		).to.equal(true);
+		// A row the storage did not commit: the settle stands.
+		expect(
+			uncommitted(pair.bob, () =>
+				manager.retractAuxiliarySettleDecision(pair.channelId, 0n)
+			)
+		).to.equal(false);
+		expect(decisionOf(pair.bob, pair, 0n)).to.equal('settle');
+		// Written: the decision is one to fail, in the stored row too, and
+		// the HTLC can be failed back.
+		expect(manager.retractAuxiliarySettleDecision(pair.channelId, 0n)).to.equal(
+			true
+		);
+		expect(decisionOf(pair.bob, pair, 0n)).to.equal('fail');
+		expect(manager.getChannel(pair.channelId)!.canFailHtlc(0n)).to.equal(true);
+	});
+
+	it('does not take back a decision to settle on a channel that is on chain', async () => {
+		const pair = await opened('aux-decision-retract-on-chain');
+		const held = await holdUnits(pair, 5000n, 'retract on chain');
+		const { alice, bob, channelId } = pair;
+		gateMessages(pair, 'alice', () => true);
+		gateMessages(pair, 'bob', () => true);
+		const closed = alice.node.forceCloseChannel(channelId, SWEEP_DESTINATION);
+		expect(closed.ok, closed.error).to.equal(true);
+		await settle();
+		await world.mine(pair, 2);
+		bob.node.settleHeldHtlc(held.paymentHash, held.preimage);
+		await settle();
+		expect(decisionOf(bob, pair, 0n)).to.equal('settle');
+		expect(
+			bob.node.getChannelManager().retractAuxiliarySettleDecision(channelId, 0n)
+		).to.equal(false);
+		expect(decisionOf(bob, pair, 0n)).to.equal('settle');
+	});
+
 	it('writes and reads back both kinds of decision with the asset state, and refuses a malformed one', () => {
 		const state: IChannelAuxiliaryState = {
 			channelData: Buffer.from([0]),

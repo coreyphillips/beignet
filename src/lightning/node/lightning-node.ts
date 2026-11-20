@@ -24065,7 +24065,11 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	 * settle/cancel is already dispatching for it, when a cancel already
 	 * failed part of the set back, or when the channel refused any parked
 	 * part. Refused parts stay parked and the settle is retried on reestablish
-	 * and on every block; true only once every part was fulfilled.
+	 * and on every block; true only once every part was fulfilled. On an
+	 * asset channel a part whose decision to settle the storage did not take
+	 * also answers false, with the settle still chosen and closed to a
+	 * cancel: the decision is written when the storage takes it, and the
+	 * claim on the chain is made by it alone.
 	 * Throws if the preimage cannot be persisted, before revealing it.
 	 */
 	settleHeldHtlc(paymentHash: Buffer, preimage?: Buffer): boolean {
@@ -24112,6 +24116,10 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		// Asset channels: a part the asset provider refused, and whether the
 		// set is paid in asset units.
 		let providerRefused = false;
+		// Asset channels: a part whose decision to settle could not be
+		// written. The settle stays bound, and the decision is written when
+		// the set is driven again (retryHeldResolutions).
+		let decisionUnwritten = false;
 		const carriesUnits =
 			prior?.auxiliary === true || this.heldSetCarriesUnits(held);
 		try {
@@ -24150,15 +24158,12 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 					// chain has ended it. Refused, nothing is written and
 					// nothing is published.
 					if (
-						h.cltvExpiry - this.currentBlockHeight > HELD_HTLC_EXPIRY_MARGIN &&
-						this.channelManager.recordAuxiliaryHtlcDecision(
-							h.channelId,
-							h.htlcId,
-							'settle',
-							pre
-						)
+						h.cltvExpiry - this.currentBlockHeight >
+						HELD_HTLC_EXPIRY_MARGIN
 					) {
-						takenOnChain++;
+						const written = this.writeHeldSettleDecision(h, pre);
+						if (written === 'written') takenOnChain++;
+						else if (written === 'unwritten') decisionUnwritten = true;
 					}
 					refused.push(h);
 					continue;
@@ -24179,12 +24184,9 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 					// It is written down for the HTLC, and a claim on the
 					// chain is made by it should the channel close before the
 					// fulfil is made. A fulfil that leaves writes its own.
-					this.channelManager.recordAuxiliaryHtlcDecision(
-						h.channelId,
-						h.htlcId,
-						'settle',
-						pre
-					);
+					if (this.writeHeldSettleDecision(h, pre) === 'unwritten') {
+						decisionUnwritten = true;
+					}
 					refused.push(h);
 					continue;
 				}
@@ -24221,17 +24223,16 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				return true;
 			}
 			// A set paid in units stays bound to its settle exactly when a
-			// decision to settle is written for one of its HTLCs: a refusal
-			// that wrote none (an HTLC past its expiry, a channel on chain
+			// decision to settle is written for one of its HTLCs, or is to be
+			// written once the storage takes it: a refusal that wrote none
+			// and owes none (an HTLC past its expiry, a channel on chain
 			// inside the cancel margin) leaves the set open to a cancel.
-			const decided =
-				carriesUnits &&
-				held.some(
-					(h) =>
-						this.channelManager.auxiliaryHtlcDecision(h.channelId, h.htlcId)
-							?.outcome === 'settle'
-				);
-			if (!prior && !providerRefused && !decided) {
+			const decided = held.some(
+				(h) =>
+					this.channelManager.auxiliaryHtlcDecision(h.channelId, h.htlcId)
+						?.outcome === 'settle'
+			);
+			if (!prior && !providerRefused && !decided && !decisionUnwritten) {
 				this.heldResolutions.delete(hashHex);
 				this.persistHeldHtlcs();
 			}
@@ -24353,10 +24354,29 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			}
 			// Parts that carry units keep their settle or cancel bound. While
 			// each of their channels waits for its peer, is on chain or is
-			// gone, a new block has nothing to drive again: the reestablish
-			// drives it, by its channel, and the chain ends what is on chain.
+			// gone, a new block has nothing to drive again but a decision the
+			// storage did not take (above): the reestablish drives it, by its
+			// channel, and the chain ends what is on chain.
+			// Asset channels: a decision the storage did not take is written
+			// again here, for a part whose channel cannot carry its removal
+			// now. A settle's, from the stored preimage, while the part is
+			// outside the cancel margin: the claim on the chain, and the close
+			// for it, are made by that decision alone. A cancel's, on chain:
+			// the part ends with it.
+			if (resolution.outcome === 'settle') {
+				this.writeOwedHeldSettleDecisions(hashHex, held);
+			}
+			const cancelUnwritten =
+				resolution.outcome === 'cancel' &&
+				held.some(
+					(h) =>
+						this.channelManager.auxiliaryChannelOnChain(h.channelId) &&
+						this.channelManager.auxiliaryHtlcDecision(h.channelId, h.htlcId) ===
+							undefined
+				);
 			if (
 				!channelId &&
+				!cancelUnwritten &&
 				held.length > 0 &&
 				held.every((h) => {
 					if (h.auxiliary !== true) return false;
@@ -24434,9 +24454,28 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		if (this.resolvingHeldHtlcs.has(hashHex)) return false;
 		const chosen = this.heldResolutions.get(hashHex);
 		if (chosen?.outcome === 'settle') return false;
+		// Asset channels: a part whose settle is decided binds the set to its
+		// settle, also where the record of the chosen outcome was lost. A
+		// cancel already chosen over one (given up by a build before this
+		// one) takes that decision back first, as a give-up now does.
+		const settleStands = (h: { channelId: Buffer; htlcId: bigint }): boolean =>
+			this.channelManager.auxiliaryHtlcDecision(h.channelId, h.htlcId)
+				?.outcome === 'settle';
+		if (!chosen && held.some(settleStands)) return false;
 		if (chosen) {
 			failureCode = chosen.failureCode;
 			cancelReason = chosen.reason;
+			for (const h of held) {
+				if (
+					settleStands(h) &&
+					!this.channelManager.auxiliaryChannelOnChain(h.channelId)
+				) {
+					this.channelManager.retractAuxiliarySettleDecision(
+						h.channelId,
+						h.htlcId
+					);
+				}
+			}
 		}
 
 		this.resolvingHeldHtlcs.add(hashHex);
@@ -24474,6 +24513,16 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 						continue;
 					}
 					this.cleanupHtlcSharedSecret(key);
+					continue;
+				}
+				// Asset channels: a part whose settle stands is not cancelled
+				// here either, and no fail is tried for it (Channel.failHtlc
+				// refuses it).
+				if (
+					this.channelManager.auxiliaryHtlcDecision(h.channelId, h.htlcId)
+						?.outcome === 'settle'
+				) {
+					refused.push(h);
 					continue;
 				}
 				const ss = this.receivedHtlcSharedSecrets.get(key);
@@ -24825,6 +24874,10 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 					continue;
 				}
 			}
+			// A settle given up has its decisions to settle taken back first,
+			// each written with its channel's row, so that no claim on the
+			// chain is made by them and the fail back below is taken
+			// (retractHeldSettle).
 			if (
 				resolution?.outcome === 'settle' &&
 				resolution.resolved.length === 0 &&
@@ -24832,6 +24885,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 					(h) =>
 						h.cltvExpiry > 0 && h.cltvExpiry - height <= HELD_HTLC_EXPIRY_MARGIN
 				) &&
+				this.retractHeldSettle(hashHex, paymentHash, remaining) &&
 				this.forgetPreimageNeverSent(paymentHash, remaining)
 			) {
 				this.heldResolutions.delete(hashHex);
@@ -24846,6 +24900,141 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 					true
 				);
 			}
+		}
+	}
+
+	/**
+	 * Asset channels: write again, from the stored preimage, the decision to
+	 * settle each part of a settle-bound set that has none, whose asset
+	 * channel cannot carry its fulfil now (on chain, or waiting for its
+	 * peer) and that is outside the cancel margin. Only the decision is
+	 * written: the fulfil of a channel that carries updates is the settle's
+	 * own retry. A preimage a decision was written for is offered to the
+	 * monitors, which take it only for an HTLC whose settle is decided.
+	 */
+	private writeOwedHeldSettleDecisions(
+		hashHex: string,
+		held: ReadonlyArray<{
+			channelId: Buffer;
+			htlcId: bigint;
+			cltvExpiry: number;
+		}>
+	): void {
+		const preimage = this.preimages.get(hashHex);
+		if (!preimage) return;
+		let written = false;
+		for (const h of held) {
+			const channel = this.channelManager.getChannel(h.channelId);
+			if (!channel?.getFullState().auxiliaryState) continue;
+			if (
+				this.channelManager.auxiliaryHtlcDecision(h.channelId, h.htlcId) !==
+				undefined
+			) {
+				continue;
+			}
+			if (
+				!this.channelManager.auxiliaryChannelOnChain(h.channelId) &&
+				channel.getState() !== ChannelState.AWAITING_REESTABLISH
+			) {
+				continue;
+			}
+			if (h.cltvExpiry - this.currentBlockHeight <= HELD_HTLC_EXPIRY_MARGIN) {
+				continue;
+			}
+			if (this.writeHeldSettleDecision(h, preimage) === 'written') {
+				written = true;
+			}
+		}
+		if (written) {
+			this.channelManager.recordPreimage(Buffer.from(hashHex, 'hex'), preimage);
+		}
+	}
+
+	/**
+	 * Asset channels: write the decision to settle a held HTLC with its
+	 * channel's row (ChannelManager.recordAuxiliaryHtlcDecision). 'written'
+	 * once the row says so, also when it said so already. 'unwritten' when
+	 * an asset channel holds the HTLC, no decision stands for it, and the
+	 * row could not be written: the settle then stays bound, and the
+	 * decision is written when the set is driven again. 'refused' for every
+	 * other HTLC (an ordinary channel's, one the channel no longer holds,
+	 * one whose fail is decided).
+	 */
+	private writeHeldSettleDecision(
+		h: { channelId: Buffer; htlcId: bigint },
+		preimage: Buffer
+	): 'written' | 'unwritten' | 'refused' {
+		if (
+			this.channelManager.recordAuxiliaryHtlcDecision(
+				h.channelId,
+				h.htlcId,
+				'settle',
+				preimage
+			)
+		) {
+			return 'written';
+		}
+		const state = this.channelManager.getChannel(h.channelId)?.getFullState();
+		if (
+			!state?.auxiliaryState ||
+			!state.htlcs.has(`received-${h.htlcId}`) ||
+			this.channelManager.auxiliaryHtlcDecision(h.channelId, h.htlcId) !==
+				undefined
+		) {
+			return 'refused';
+		}
+		return 'unwritten';
+	}
+
+	/**
+	 * Asset channels: take back the decisions to settle of a hold whose
+	 * settle is given up, before its preimage is forgotten and the fail
+	 * back is made. Nothing is written unless all of it can be: the
+	 * preimage can be forgotten (ChannelManager.canForgetPreimage: no
+	 * monitor wants or holds it, no other HTLC of the hash is in a
+	 * channel), and every part whose settle stands is on a channel with no
+	 * monitor and is not fulfilled. Then each is taken back with its
+	 * channel's row. A write that does not land stops it: the settle stays
+	 * chosen, and the next block tries again, with the parts already taken
+	 * back reading fail (a fulfil made meanwhile still overrides that). The
+	 * set is held as resolving meanwhile, so that nothing settles it on the
+	 * same stack.
+	 */
+	private retractHeldSettle(
+		hashHex: string,
+		paymentHash: Buffer,
+		held: ReadonlyArray<{ channelId: Buffer; htlcId: bigint }>
+	): boolean {
+		if (!this.channelManager.canForgetPreimage(paymentHash, held)) return false;
+		for (const h of held) {
+			if (
+				this.channelManager.auxiliaryHtlcDecision(h.channelId, h.htlcId)
+					?.outcome !== 'settle'
+			) {
+				continue;
+			}
+			const entry = this.channelManager
+				.getChannel(h.channelId)
+				?.getFullState()
+				.htlcs.get(`received-${h.htlcId}`);
+			if (
+				this.channelManager.auxiliaryChannelOnChain(h.channelId) ||
+				!entry ||
+				entry.state === HtlcState.FULFILLED
+			) {
+				return false;
+			}
+		}
+		this.resolvingHeldHtlcs.add(hashHex);
+		try {
+			return held.every((h) =>
+				this.channelManager.retractAuxiliarySettleDecision(
+					h.channelId,
+					h.htlcId
+				)
+			);
+		} finally {
+			this.resolvingHeldHtlcs.delete(hashHex);
 		}
 	}
 
@@ -28900,6 +29089,10 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 					expectedHtlcId: outHtlcId
 				}
 			);
+		} catch (err) {
+			// Nothing was offered: the in-memory link goes too.
+			this.forwardedHtlcs.delete(outKey);
+			throw err;
 		} finally {
 			if (linkWritten) {
 				if (!result?.ok) {
@@ -29470,76 +29663,97 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			inHtlcId: part.inHtlcId
 		});
 
+		// The linkage and the add are one write: the link is staged beside the
+		// add and commits with it. A refused add takes the staged link back
+		// before anything is flushed, so no row ever maps an id the channel
+		// did not use (a later unrelated HTLC takes that id, and would be
+		// settled against this inbound leg). Only when a write inside the add
+		// took the link already is its delete staged with the fail back.
+		const link: RecoveryMutation = {
+			type: 'forwarded_htlc',
+			outKey,
+			inChannelId: part.inChannelId,
+			inHtlcId: part.inHtlcId
+		};
 		let result: ChannelResult | null = null;
-		this.withStagedMutations(
-			[
-				{
-					type: 'forwarded_htlc',
-					outKey,
-					inChannelId: part.inChannelId,
-					inHtlcId: part.inHtlcId
+		let linkWritten = !!this.recovery;
+		if (linkWritten) this.stagedMutations.push(link);
+		try {
+			// For a blinded forward, hand the next hop its blinding point and
+			// use the payment_relay-derived amount/CLTV.
+			result = this.channelManager.addHtlc(
+				outChannelId,
+				part.forwardAmountMsat,
+				part.paymentHash,
+				part.forwardCltv,
+				nextOnionBuf,
+				part.nextBlindingPoint,
+				part.skimmedFeeMsat,
+				// Reported below as htlc:forward-refused. As a node:error it
+				// read exactly like a refused send of the user's own.
+				{ emitRefusal: false }
+			);
+		} catch (err) {
+			// Nothing was offered: the in-memory link goes too.
+			this.forwardedHtlcs.delete(outKey);
+			throw err;
+		} finally {
+			if (linkWritten) {
+				if (!result?.ok) {
+					const at = this.stagedMutations.indexOf(link);
+					if (at !== -1) {
+						this.stagedMutations.splice(at, 1);
+						linkWritten = false;
+					}
 				}
-			],
-			() => {
-				// For a blinded forward, hand the next hop its blinding point and
-				// use the payment_relay-derived amount/CLTV.
-				result = this.channelManager.addHtlc(
-					outChannelId,
-					part.forwardAmountMsat,
-					part.paymentHash,
-					part.forwardCltv,
-					nextOnionBuf,
-					part.nextBlindingPoint,
-					part.skimmedFeeMsat,
-					// Reported below as htlc:forward-refused. As a node:error it
-					// read exactly like a refused send of the user's own.
-					{ emitRefusal: false }
-				);
+				this.flushStagedMutations();
 			}
-		);
+		}
 
 		if (!result || !(result as ChannelResult).ok) {
-			// Forward failed — fail the incoming HTLC back. Drop the persisted
-			// row too, not just the in-memory one: the outgoing id was read off
-			// localHtlcCounter before the add, and a refused add does not consume
-			// it, so a surviving row maps an id a later unrelated HTLC will take
-			// onto this inbound leg and would settle it against the wrong payment.
+			// Forward failed: fail the incoming HTLC back. The in-memory link
+			// goes; the stored one was never written, or its delete rides the
+			// fail back below.
 			this.forwardedHtlcs.delete(outKey);
 			let placement: ForwardPlacement = 'refused';
-			this.withStagedMutations(
-				[{ type: 'delete_forwarded_htlc', outKey }],
-				() => {
-					// JIT receive: for a channel whose peer is a JIT client this
-					// refusal is a liquidity shortfall, not a dead end. Hold the
-					// part, splice our own funds in, and retry the forward once.
-					// The hook sits INSIDE the staged transition, after the
-					// linkage rollback, because a held-for-splice part is a
-					// forward whose linkage was deliberately rolled back and is
-					// re-registered when the retry re-enters this method.
-					if (
-						options.incomingAssetLeg !== true &&
-						this.jitReceiveManager?.tryHoldForSplice(outChannelId, part)
-					) {
-						this.emitStructuredLog('htlc', 'jit_held_for_splice', {
-							channelId: outChannelId.toString('hex'),
-							paymentHash: part.paymentHash.toString('hex'),
-							amountMsat: Number(part.forwardAmountMsat)
-						});
-						placement = 'held';
-						return;
-					}
-					// A refund the inbound channel cannot carry right now (it is
-					// reestablishing) must not evaporate: its one owner retries
-					// it on every block. The engine owes it unless the caller
-					// said it would (the held-forward driver keeps its own).
-					if (
-						!part.failIncoming(TEMPORARY_CHANNEL_FAILURE) &&
-						refundOwner === 'engine'
-					) {
-						this.jitReceiveManager?.owedUpstreamFailure(part);
-					}
+			const onRefused = (): void => {
+				// JIT receive: for a channel whose peer is a JIT client this
+				// refusal is a liquidity shortfall, not a dead end. Hold the
+				// part, splice our own funds in, and retry the forward once.
+				// A held-for-splice part is a forward whose linkage is rolled
+				// back here and registered again when the retry re-enters
+				// this method.
+				if (
+					options.incomingAssetLeg !== true &&
+					this.jitReceiveManager?.tryHoldForSplice(outChannelId, part)
+				) {
+					this.emitStructuredLog('htlc', 'jit_held_for_splice', {
+						channelId: outChannelId.toString('hex'),
+						paymentHash: part.paymentHash.toString('hex'),
+						amountMsat: Number(part.forwardAmountMsat)
+					});
+					placement = 'held';
+					return;
 				}
-			);
+				// A refund the inbound channel cannot carry right now (it is
+				// reestablishing) must not evaporate: its one owner retries
+				// it on every block. The engine owes it unless the caller
+				// said it would (the held-forward driver keeps its own).
+				if (
+					!part.failIncoming(TEMPORARY_CHANNEL_FAILURE) &&
+					refundOwner === 'engine'
+				) {
+					this.jitReceiveManager?.owedUpstreamFailure(part);
+				}
+			};
+			if (linkWritten) {
+				this.withStagedMutations(
+					[{ type: 'delete_forwarded_htlc', outKey }],
+					onRefused
+				);
+			} else {
+				onRefused();
+			}
 			if (placement === 'refused') {
 				this.reportForwardRefused(
 					outChannelId,

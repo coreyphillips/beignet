@@ -4430,7 +4430,12 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			// its channel, when its retirement failed or the node was not
 			// running when its output was settled for good.
 			this.reconcileFixedOutputFees(channelIdHex);
-			if (monitor.isFullyResolved()) continue;
+			if (monitor.isFullyResolved()) {
+				// Asset channels: an ending whose row could not be written
+				// when its output was settled for good is recorded here.
+				this.recordAuxiliaryChainEndings(channelIdHex);
+				continue;
+			}
 
 			const actions = monitor.handleNewBlock(blockHeight);
 			// Persist the block transition before routing terminal or broadcast
@@ -4658,6 +4663,21 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		paymentHash: Buffer,
 		held: ReadonlyArray<{ channelId: Buffer; htlcId: bigint }>
 	): boolean {
+		if (!this.canForgetPreimage(paymentHash, held)) return false;
+		this._knownPreimages.delete(paymentHash.toString('hex'));
+		return true;
+	}
+
+	/**
+	 * Whether forgetPreimage would forget the preimage of `paymentHash` for
+	 * the HTLCs `held` names, changing nothing: no chain monitor wants or
+	 * holds a preimage for the hash, and no other received HTLC of the hash
+	 * is in a channel.
+	 */
+	canForgetPreimage(
+		paymentHash: Buffer,
+		held: ReadonlyArray<{ channelId: Buffer; htlcId: bigint }>
+	): boolean {
 		const hashHex = paymentHash.toString('hex');
 		for (const monitor of this.monitors.values()) {
 			if (
@@ -4685,7 +4705,6 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 				if (!settleWasForIt) return false;
 			}
 		}
-		this._knownPreimages.delete(hashHex);
 		return true;
 	}
 
@@ -12063,7 +12082,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 	 * claim by preimage on the chain is made by this record and by nothing
 	 * else. False, with nothing kept, when the channel does not hold the
 	 * HTLC, when the other decision stands, and when the row could not be
-	 * written.
+	 * written: the persistence threw or answered that it did not commit.
 	 *
 	 * The row is written here and now, with whatever the node has staged
 	 * for its next write, so this is not for a caller that stages records
@@ -12084,9 +12103,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			return false;
 		}
 		if (standing) return true;
-		try {
-			this.persistence.persist({ channel, peerPubkey, channelId });
-		} catch {
+		if (!this._persistCommitted(channel, peerPubkey, channelId)) {
 			channel.dropAuxiliaryHtlcDecision(htlcId);
 			return false;
 		}
@@ -12137,18 +12154,44 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		outcome: 'settle' | 'fail',
 		preimage?: Buffer
 	): boolean {
+		return this.recordAuxiliaryHtlcDecision(
+			channelId,
+			htlcId,
+			outcome,
+			preimage
+		);
+	}
+
+	/**
+	 * Asset channels: take back, with the channel's row, a decision to settle
+	 * an HTLC the node received, for a settle given up before its preimage
+	 * left the node (a hold whose settle the provider refused until the
+	 * cancel margin). The decision becomes one to fail, so no claim on the
+	 * chain is made by it and the HTLC can be failed back. True when no
+	 * settle stands for the HTLC afterwards, also when none stood. False,
+	 * with the settle standing, for a channel with a monitor (it is on chain
+	 * or closing, and a claim may carry the preimage), for an HTLC the node
+	 * fulfilled, and when the row could not be written.
+	 */
+	retractAuxiliarySettleDecision(channelId: Buffer, htlcId: bigint): boolean {
 		const hex = channelId.toString('hex');
 		const channel = this.channels.get(hex);
+		if (channel?.auxiliaryHtlcDecision(htlcId)?.outcome !== 'settle') {
+			return true;
+		}
 		const peerPubkey = this.channelPeers.get(hex);
-		if (!channel || !peerPubkey) return false;
-		const standing = channel.auxiliaryHtlcDecision(htlcId);
-		if (!channel.recordAuxiliaryHtlcDecision(htlcId, outcome, preimage)) {
+		if (!peerPubkey || this.monitors.has(hex)) return false;
+		const replaced = channel.retractAuxiliarySettle(htlcId);
+		if (!replaced) return false;
+		if (!this._persistCommitted(channel, peerPubkey, channelId)) {
+			channel.restoreAuxiliaryHtlcDecision(htlcId, replaced);
 			return false;
 		}
-		if (standing) return true;
-		if (!this._persistCommitted(channel, peerPubkey, channelId)) {
-			channel.dropAuxiliaryHtlcDecision(htlcId);
-			return false;
+		// A fulfil the provider refused is kept owed with its preimage: it is
+		// no longer owed, and nothing may make it with that preimage.
+		const owedKey = `${hex}:${htlcId}`;
+		if (this._auxiliaryRemovalsOwed.get(owedKey)?.kind === 'fulfill') {
+			this._auxiliaryRemovalsOwed.delete(owedKey);
 		}
 		return true;
 	}
@@ -12278,12 +12321,9 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			);
 			if (kept) {
 				if (!peerPubkey) continue;
-				try {
-					this.persistence.persist({ channel, peerPubkey, channelId });
-				} catch {
-					// Left unmarked: the next block records it again.
-					continue;
-				}
+				// Left unmarked when the row was not written: the next block
+				// records it again.
+				if (!this._persistCommitted(channel, peerPubkey, channelId)) continue;
 			}
 			if (ending.absent) {
 				monitor.noteAuxiliaryAbsentHtlcRecorded(ending.offered, ending.htlcId);

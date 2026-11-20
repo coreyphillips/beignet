@@ -376,9 +376,22 @@ describe('a hold invoice paid over an asset channel (issue #2093 step 8)', funct
 			heldHtlcs: Map<string, unknown[]>;
 			heldResolutions: Map<string, { outcome: string }>;
 		};
+		// Any close the node would make to claim an HTLC on the chain.
+		const claimCloses: string[] = [];
+		bob.node.on(
+			'log' as never,
+			((log: unknown) => {
+				const text = JSON.stringify(log);
+				if (text.includes('HTLC_CLAIM_FORCE_CLOSE')) claimCloses.push(text);
+			}) as never
+		);
+		const decided = (): string | undefined =>
+			bob.node.getChannelManager().auxiliaryHtlcDecision(channelId, 0n)
+				?.outcome;
 		arm.down = true;
 		expect(bob.node.settleHeldHtlc(paymentHash, preimage)).to.equal(false);
 		await turns(50);
+		expect(decided()).to.equal('settle');
 		const expiry =
 			bob.node.getAuxiliaryChannelInfo(channelId)!.htlcs[0].cltvExpiry;
 		expect(HELD_HTLC_EXPIRY_MARGIN).to.equal(18);
@@ -389,17 +402,25 @@ describe('a hold invoice paid over an asset channel (issue #2093 step 8)', funct
 		expect(parked.heldResolutions.get(hashHex)!.outcome).to.equal('settle');
 		expect(preimageKept(bob, hashHex)).to.deep.equal(everywhere);
 		// At the margin the provider is still down: the settle is given up,
-		// and the fail back it is turned into is refused and owed.
+		// and the fail back it is turned into is refused and owed. Its
+		// decision to settle was taken back first, so nothing claims the
+		// HTLC on the chain by it.
 		bob.node.handleNewBlock(expiry - HELD_HTLC_EXPIRY_MARGIN);
 		await turns(100);
 		expect(parked.heldResolutions.get(hashHex)!.outcome).to.equal('cancel');
+		expect(decided()).to.equal('fail');
 		expect(inFlight(bob, channelId)).to.have.length(1);
 		expect(parked.heldHtlcs.get(hashHex)).to.have.length(1);
 		expect(outcomes).to.deep.equal([]);
+		// Still refused on the next block: no close is made to claim it.
+		bob.node.handleNewBlock(expiry - HELD_HTLC_EXPIRY_MARGIN + 1);
+		await turns(100);
+		expect(inFlight(bob, channelId)).to.have.length(1);
+		expect(claimCloses).to.deep.equal([]);
 
 		// The payer is failed back with blocks to spare.
 		arm.down = false;
-		bob.node.handleNewBlock(expiry - HELD_HTLC_EXPIRY_MARGIN + 1);
+		bob.node.handleNewBlock(expiry - HELD_HTLC_EXPIRY_MARGIN + 2);
 		await turns(200);
 		expect(inFlight(bob, channelId)).to.deep.equal([]);
 		expect(alice.node.getPayment(paymentHash)!.status).to.equal(
@@ -418,6 +439,58 @@ describe('a hold invoice paid over an asset channel (issue #2093 step 8)', funct
 		expect(parked.heldHtlcs.size).to.equal(0);
 		expect(parked.heldResolutions.size).to.equal(0);
 		expect(bob.node.settleHeldHtlc(paymentHash, preimage)).to.equal(false);
+		// With the fail back taken, nothing claims the HTLC on the chain.
+		bob.node.handleNewBlock(expiry - HELD_HTLC_EXPIRY_MARGIN + 3);
+		await turns(100);
+		expect(claimCloses).to.deep.equal([]);
+	});
+
+	it('keeps a settle asked while the payer is away bound when its decision could not be written, and settles once the payer is back', async () => {
+		const arm = { down: false, thrown: 0 };
+		const { alice, bob, channelId, paymentHash, preimage } = await held(
+			'aux-hold-away-unwritten',
+			arm
+		);
+		const hashHex = paymentHash.toString('hex');
+		const parked = bob.node as unknown as {
+			heldResolutions: Map<string, { outcome: string }>;
+		};
+		bob.node.getChannelManager().handlePeerDisconnected(alice.node.getNodeId());
+		alice.node.getChannelManager().handlePeerDisconnected(bob.node.getNodeId());
+		await turns(20);
+		const persistence = (
+			bob.node.getChannelManager() as unknown as {
+				persistence: { persist: (...args: unknown[]) => unknown };
+			}
+		).persistence;
+		const persist = persistence.persist;
+		persistence.persist = (): unknown => ({ committed: false, outboxIds: [] });
+		try {
+			expect(bob.node.settleHeldHtlc(paymentHash, preimage)).to.equal(false);
+		} finally {
+			persistence.persist = persist;
+		}
+		// No decision is kept that the storage did not take, and the settle
+		// stays chosen: it is not open to a cancel.
+		expect(
+			bob.node.getChannelManager().auxiliaryHtlcDecision(channelId, 0n)
+		).to.equal(undefined);
+		expect(parked.heldResolutions.get(hashHex)?.outcome).to.equal('settle');
+		expect(bob.node.cancelHoldInvoice(paymentHash)).to.equal(null);
+		// The next block writes the decision, from the stored preimage, while
+		// the payer is still away: a close to claim on the chain is made by it.
+		bob.node.handleNewBlock(1);
+		await turns(50);
+		expect(
+			bob.node.getChannelManager().auxiliaryHtlcDecision(channelId, 0n)?.outcome
+		).to.equal('settle');
+
+		await reconnectHosts(alice, bob);
+		await turns(200);
+		expect(alice.node.getPayment(paymentHash)!.status).to.equal(
+			PaymentStatus.COMPLETED
+		);
+		expect(units(bob, channelId)).to.equal(6000n);
 	});
 
 	it('a hold invoice cancelled after its settle was given up is never settled: the preimage the refused settle stored is forgotten, and a later HTLC of the hash is failed back, also after a restart', async () => {
