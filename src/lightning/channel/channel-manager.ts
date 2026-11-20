@@ -648,6 +648,26 @@ function commitmentHasNoDeadline(state: Readonly<IChannelState>): boolean {
 	return state.htlcs.size === 0;
 }
 
+/**
+ * The output a held spend of an asset channel's units spends, its first
+ * input, which every form of that spend shares: a raise adds or replaces
+ * only fee inputs after it. A transaction that cannot be read is kept by
+ * its own bytes.
+ */
+function heldSpendOutput(tx: Buffer): string {
+	try {
+		const input = bitcoin.Transaction.fromBuffer(tx).ins[0];
+		if (input) {
+			return `${Buffer.from(input.hash).reverse().toString('hex')}:${
+				input.index
+			}`;
+		}
+	} catch {
+		// Kept by its bytes below.
+	}
+	return tx.toString('hex');
+}
+
 // BOLT 7: a channel_announcement is not sent before its funding has this
 // many confirmations.
 const ANNOUNCEMENT_MIN_CONFIRMATIONS = 6;
@@ -914,10 +934,11 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 	private monitors: Map<string, ChainMonitor> = new Map();
 	/**
 	 * Spends of the units of an asset channel that wait for the monitor row
-	 * with their asset side to be stored, by channel. Empty on a node
-	 * without asset channels.
+	 * with their asset side to be stored, by channel, and in a channel by the
+	 * output each spends (its first input): the newest spend of each output,
+	 * in the order they came. Empty on a node without asset channels.
 	 */
-	private auxiliarySpendsHeld: Map<string, Buffer[]> = new Map();
+	private auxiliarySpendsHeld: Map<string, Map<string, Buffer>> = new Map();
 	// Latest block height seen (for stamping when a force-close CPFP was broadcast).
 	private _currentBlockHeight = 0;
 	// Channels whose channel_announcement is signed by both sides but whose
@@ -13601,10 +13622,16 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			this.emit('broadcast:tx', tx);
 			return;
 		}
-		const held = this.auxiliarySpendsHeld.get(channelIdHex) ?? [];
-		if (!held.some((other) => other.equals(tx))) held.push(Buffer.from(tx));
-		// The newest few are enough: an older one was replaced many times over.
-		this.auxiliarySpendsHeld.set(channelIdHex, held.slice(-16));
+		// One spend for each output: a later spend of the same output is a
+		// raise of the earlier one, which it replaces. A channel full of HTLCs
+		// on the chain holds a spend of every one of them, so no count bounds
+		// the list but the outputs of the channel.
+		const held =
+			this.auxiliarySpendsHeld.get(channelIdHex) ?? new Map<string, Buffer>();
+		const output = heldSpendOutput(tx);
+		held.delete(output);
+		held.set(output, Buffer.from(tx));
+		this.auxiliarySpendsHeld.set(channelIdHex, held);
 		this.emitContained(
 			'error',
 			channelId,
@@ -13619,7 +13646,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			return;
 		}
 		this.auxiliarySpendsHeld.delete(channelIdHex);
-		for (const tx of held) this.emit('broadcast:tx', tx);
+		for (const tx of held.values()) this.emit('broadcast:tx', tx);
 	}
 
 	/** Fee actions of the fee pool being worked on, one at a time each. */
