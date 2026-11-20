@@ -1531,7 +1531,8 @@ describe('Asset payments (issue #2093, step 8)', function () {
 				// spends with a deadline, and the host's opt-in at the settle.
 				'getFixedOutputFeeStatus:reserve',
 				'requireFeeCoinsToSettle',
-				'onForwardLegResolved:quote'
+				'onForwardLegResolved:quote',
+				'IForwardingEvent.auxiliary'
 			]);
 			expect(Object.isFrozen(api)).to.equal(true);
 			expect(Object.isFrozen(api.surfaces)).to.equal(true);

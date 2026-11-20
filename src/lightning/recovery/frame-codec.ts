@@ -105,11 +105,21 @@ type IEncodedInvoice = Omit<IInvoiceInfo, 'amountMsat'> & {
 
 type IEncodedForwardingEvent = Omit<
 	Omit<IForwardingEvent, 'id'>,
-	'amountInMsat' | 'amountOutMsat' | 'feeMsat'
+	| 'amountInMsat'
+	| 'amountOutMsat'
+	| 'feeMsat'
+	| 'inAuxiliaryAmount'
+	| 'inWireAmountMsat'
+	| 'outAuxiliaryAmount'
+	| 'outWireAmountMsat'
 > & {
 	amountInMsat: string;
 	amountOutMsat: string;
 	feeMsat: string;
+	inAuxiliaryAmount?: string;
+	inWireAmountMsat?: string;
+	outAuxiliaryAmount?: string;
+	outWireAmountMsat?: string;
 };
 
 function encodeInvoice(invoice: IInvoiceInfo): IEncodedInvoice {
@@ -126,26 +136,48 @@ function decodeInvoice(encoded: IEncodedInvoice): IInvoiceInfo {
 		: { ...rest };
 }
 
+/**
+ * Issue #2098, step 7: the bigint fields of a forward with an asset leg,
+ * written as decimal strings like the amounts. A decoder that does not know
+ * them spreads them as strings, and its storage names its own columns.
+ */
+const FORWARDING_EVENT_AUXILIARY_AMOUNTS = [
+	'inAuxiliaryAmount',
+	'inWireAmountMsat',
+	'outAuxiliaryAmount',
+	'outWireAmountMsat'
+] as const;
+
 function encodeForwardingEvent(
 	event: Omit<IForwardingEvent, 'id'>
 ): IEncodedForwardingEvent {
-	return {
+	const encoded: Record<string, unknown> = {
 		...event,
 		amountInMsat: event.amountInMsat.toString(),
 		amountOutMsat: event.amountOutMsat.toString(),
 		feeMsat: event.feeMsat.toString()
 	};
+	for (const key of FORWARDING_EVENT_AUXILIARY_AMOUNTS) {
+		const value = event[key];
+		if (value !== undefined) encoded[key] = value.toString();
+	}
+	return encoded as unknown as IEncodedForwardingEvent;
 }
 
 function decodeForwardingEvent(
 	encoded: IEncodedForwardingEvent
 ): Omit<IForwardingEvent, 'id'> {
-	return {
+	const decoded: Record<string, unknown> = {
 		...encoded,
 		amountInMsat: BigInt(encoded.amountInMsat),
 		amountOutMsat: BigInt(encoded.amountOutMsat),
 		feeMsat: BigInt(encoded.feeMsat)
 	};
+	for (const key of FORWARDING_EVENT_AUXILIARY_AMOUNTS) {
+		const value = (encoded as unknown as Record<string, unknown>)[key];
+		if (typeof value === 'string') decoded[key] = BigInt(value);
+	}
+	return decoded as unknown as Omit<IForwardingEvent, 'id'>;
 }
 
 interface IEncodedFrame {

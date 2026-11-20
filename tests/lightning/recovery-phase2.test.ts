@@ -593,6 +593,40 @@ describe('Recovery phase 2: frame codec', () => {
 	});
 });
 
+describe('Recovery phase 2: a forward with an asset leg in a frame (issue #2098, step 7)', () => {
+	it('round trips the row of a forward with an asset leg, its bigints converted both ways', () => {
+		const event = {
+			settledAt: 1_700_000_000_002,
+			inChannelId: '66'.repeat(32),
+			outChannelId: '77'.repeat(32),
+			amountInMsat: 5_010_000n,
+			amountOutMsat: 5_000_000n,
+			feeMsat: 10_000n,
+			auxiliary: true as const,
+			inAuxiliaryAmount: 5_010n,
+			inWireAmountMsat: 354_000n,
+			outAuxiliaryAmount: 18_446_744_073_709_551_615n,
+			outWireAmountMsat: 354_000n,
+			nextHopScid: '0102030405060708'
+		};
+		const frame: RecoveryFrame = {
+			version: 1,
+			writerEpoch: 1n,
+			sequence: 43n,
+			previousFrameHash: Buffer.alloc(32, 1),
+			timestamp: 1_700_000_000_000,
+			mutations: [{ type: 'forwarding_event', event }],
+			outboundMessages: []
+		};
+		const plaintext = encodeFrame(frame);
+		const decoded = decodeFrame(plaintext);
+		expect(encodeFrame(decoded).equals(plaintext)).to.equal(true);
+		expect((decoded.mutations[0] as { event: unknown }).event).to.deep.equal(
+			event
+		);
+	});
+});
+
 describe('Recovery phase 2: a pending add journals its onion once (issue #1959)', () => {
 	const ONION_BYTES = 1366;
 

@@ -1031,7 +1031,7 @@ function chain.signP2wpkhInput(tx: bitcoinjs-lib#Transaction, inputIndex: number
 function chain.signSweepInput(tx: bitcoinjs-lib#Transaction, inputIndex: number, witnessScript: Buffer, value: number, privateKey: Buffer, sighashType?: number): Buffer
 function chain.sweepVbytes(witness: readonly Buffer[], destinationScript: Buffer): number
 namespace channel
-const channel.AUXILIARY_CHANNELS_API: Readonly<{ version: 1; surfaces: readonly [ "valueIncomingHtlc:three-outcome", "sendPaymentToRoute:assetPayment", "getAuxiliaryPaymentHtlcs", "onHtlcResolved:htlcId", "queryAuxiliaryRoute", "fundAuxiliaryChannel:unsigned", "onFundingSigned", "abandonAuxiliaryOpen", "IChannelInfo.auxiliary", "setAuxiliaryPaymentGate", "getChannelMonitorState", "IPaymentInfo.auxiliary", "IPaymentInfo.auxiliaryValueMsat", "IInvoiceInfo.auxiliary", "IAuxiliaryChannelInfo.undeliveredOutcomes", "onHtlcResolved:never-sent", "getFixedOutputFeeStatus", "IPaymentInfo.unresolved", "IHoldInvoiceStateEvent.auxiliary", "prepareForward", "getFixedOutputFeeStatus:splitCoins", "getFixedOutputFeeStatus:reserve", "requireFeeCoinsToSettle", "onForwardLegResolved:quote" ]; declared: readonly [ ]; }>
+const channel.AUXILIARY_CHANNELS_API: Readonly<{ version: 1; surfaces: readonly [ "valueIncomingHtlc:three-outcome", "sendPaymentToRoute:assetPayment", "getAuxiliaryPaymentHtlcs", "onHtlcResolved:htlcId", "queryAuxiliaryRoute", "fundAuxiliaryChannel:unsigned", "onFundingSigned", "abandonAuxiliaryOpen", "IChannelInfo.auxiliary", "setAuxiliaryPaymentGate", "getChannelMonitorState", "IPaymentInfo.auxiliary", "IPaymentInfo.auxiliaryValueMsat", "IInvoiceInfo.auxiliary", "IAuxiliaryChannelInfo.undeliveredOutcomes", "onHtlcResolved:never-sent", "getFixedOutputFeeStatus", "IPaymentInfo.unresolved", "IHoldInvoiceStateEvent.auxiliary", "prepareForward", "getFixedOutputFeeStatus:splitCoins", "getFixedOutputFeeStatus:reserve", "requireFeeCoinsToSettle", "onForwardLegResolved:quote", "IForwardingEvent.auxiliary" ]; declared: readonly [ ]; }>
 const channel.AUXILIARY_CHANNEL_DUST_LIMIT = 354n
 const channel.AUXILIARY_CLOSE_ASSET_OUTPUT_MINIMUM = 330n
 class channel.AuxiliaryChannelUnsupportedError extends beignet#CodedError<'ASSET_CHANNEL_UNSUPPORTED'>
@@ -6587,8 +6587,8 @@ property node.LightningNodeEvents.'hold:settled': (event: node.IHoldInvoiceState
 property node.LightningNodeEvents.'htlc:failed': (data: { channelId: Buffer; htlcId: bigint; }) => void
 property node.LightningNodeEvents.'htlc:forward': (inChannelId: Buffer, outChannelId: Buffer, amountMsat: bigint, paymentHash: Buffer) => void
 property node.LightningNodeEvents.'htlc:forward-failed': (data: { inChannelId: Buffer; outChannelId: Buffer; }) => void
-property node.LightningNodeEvents.'htlc:forward-refused': (data: { inChannelId: Buffer; outChannelId: Buffer; amountMsat: bigint; paymentHash: Buffer; reason: string; channelErrorCode?: channel.ChannelErrorCode; }) => void
-property node.LightningNodeEvents.'htlc:forwarded': (data: { inChannelId: Buffer; outChannelId: Buffer; amountInMsat: bigint; amountOutMsat: bigint; feeMsat: bigint; }) => void
+property node.LightningNodeEvents.'htlc:forward-refused': (data: { inChannelId: Buffer; outChannelId: Buffer; amountMsat: bigint; paymentHash: Buffer; reason: string; channelErrorCode?: channel.ChannelErrorCode; auxiliary?: true; }) => void
+property node.LightningNodeEvents.'htlc:forwarded': (data: { inChannelId: Buffer; outChannelId: Buffer; amountInMsat: bigint; amountOutMsat: bigint; feeMsat: bigint; auxiliary?: true; inAuxiliaryAmount?: bigint; inWireAmountMsat?: bigint; outAuxiliaryAmount?: bigint; outWireAmountMsat?: bigint; nextHopScid?: Buffer; }) => void
 property node.LightningNodeEvents.'htlc:fulfilled': (data: { channelId: Buffer; htlcId: bigint; }) => void
 property node.LightningNodeEvents.'htlc:held': (data: { paymentHash: Buffer; amountMsat: bigint; }) => void
 property node.LightningNodeEvents.'htlc:held-forward': (data: { holdId: Buffer; paymentHash: Buffer; amountMsat: bigint; cutoffHeight: number; }) => void
@@ -8331,12 +8331,18 @@ method storage.IFforStorage.saveFforVoucher(record: ffor.IFforVoucherArchive): v
 interface storage.IForwardingEvent
 property storage.IForwardingEvent.amountInMsat: bigint
 property storage.IForwardingEvent.amountOutMsat: bigint
+property storage.IForwardingEvent.auxiliary?: true
 property storage.IForwardingEvent.feeMsat: bigint
 property storage.IForwardingEvent.id: number
+property storage.IForwardingEvent.inAuxiliaryAmount?: bigint
 property storage.IForwardingEvent.inChannelId: string
 property storage.IForwardingEvent.inScid?: string
+property storage.IForwardingEvent.inWireAmountMsat?: bigint
+property storage.IForwardingEvent.nextHopScid?: string
+property storage.IForwardingEvent.outAuxiliaryAmount?: bigint
 property storage.IForwardingEvent.outChannelId: string
 property storage.IForwardingEvent.outScid?: string
+property storage.IForwardingEvent.outWireAmountMsat?: bigint
 property storage.IForwardingEvent.settledAt: number
 interface storage.IForwardingEventFilter
 property storage.IForwardingEventFilter.channelId?: string
@@ -8349,6 +8355,7 @@ method storage.IForwardingStorage.getForwardingSummary(options?: { since?: numbe
 method storage.IForwardingStorage.listForwardingEvents(filter?: storage.IForwardingEventFilter): storage.IForwardingEvent[]
 method storage.IForwardingStorage.saveForwardingEvent(event: Omit<storage.IForwardingEvent, 'id'>): void
 interface storage.IForwardingSummary
+property storage.IForwardingSummary.auxiliary?: { count: number; volumeOutMsat: bigint; feesEarnedMsat: bigint; }
 property storage.IForwardingSummary.count: number
 property storage.IForwardingSummary.feesEarnedMsat: bigint
 property storage.IForwardingSummary.volumeOutMsat: bigint

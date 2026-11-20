@@ -78,7 +78,11 @@ export const AUXILIARY_CHANNELS_API = Object.freeze({
 		// Issue #2098, step 7: each leg's end tells the quote the forward was
 		// taken under: the next hop the onion named (shortChannelId) and what
 		// the leg was worth (valueMsat).
-		'onForwardLegResolved:quote'
+		'onForwardLegResolved:quote',
+		// A forward with an asset leg is in the forwarding history and its
+		// htlc:forwarded event, marked auxiliary at what each leg was worth,
+		// and the summary counts it apart.
+		'IForwardingEvent.auxiliary'
 	] as const),
 	// Nothing is declared and not run in this build.
 	declared: Object.freeze([] as const)

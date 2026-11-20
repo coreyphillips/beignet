@@ -109,7 +109,7 @@ method IStoredPaymentRef.load(): beignet/lightning#node.IPaymentInfo | null
 property IStoredPaymentRef.paymentHash: string
 class SqliteStorage implements beignet/lightning#storage.IStorageBackend
 constructor SqliteStorage(dbPath: string, onCorruptRow?: (error: unknown) => void, opts?: { encryptionKey?: Buffer; })
-static readonly property SqliteStorage.CURRENT_SCHEMA_VERSION = 20
+static readonly property SqliteStorage.CURRENT_SCHEMA_VERSION = 21
 method SqliteStorage.addWatchtowerUpdate(update: beignet/lightning#watchtower.IWatchtowerUpdate): number
 method SqliteStorage.auxiliaryRevokedCommitmentsSize(channelId: string): { rows: number; bytes: number; }
 method SqliteStorage.backup(destPath: string): Promise<void>

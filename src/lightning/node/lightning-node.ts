@@ -29781,7 +29781,8 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			this.reportForwardRefused(
 				outChannelId,
 				part,
-				result as ChannelResult | null
+				result as ChannelResult | null,
+				true
 			);
 			this.tellForwardNeverOffered(
 				ctx.paymentHash,
@@ -30499,7 +30500,8 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				this.reportForwardRefused(
 					outChannelId,
 					part,
-					result as ChannelResult | null
+					result as ChannelResult | null,
+					options.incomingAssetLeg === true
 				);
 			}
 			return placement;
@@ -30523,7 +30525,9 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	private reportForwardRefused(
 		outChannelId: Buffer,
 		part: IHeldJitPart,
-		result: ChannelResult | null
+		result: ChannelResult | null,
+		/** Issue #2098, step 7: the forward has an asset leg. */
+		auxiliary = false
 	): void {
 		const reason = result?.error ?? 'outgoing add refused';
 		this.emitStructuredLog('htlc', 'forward_refused', {
@@ -30533,7 +30537,8 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			outChannelId: outChannelId.toString('hex'),
 			amountMsat: part.forwardAmountMsat.toString(),
 			reason,
-			...(result?.code !== undefined ? { channelErrorCode: result.code } : {})
+			...(result?.code !== undefined ? { channelErrorCode: result.code } : {}),
+			...(auxiliary ? { auxiliary: true } : {})
 		});
 		this.emit('htlc:forward-refused', {
 			inChannelId: part.inChannelId,
@@ -30541,7 +30546,8 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			amountMsat: part.forwardAmountMsat,
 			paymentHash: part.paymentHash,
 			reason,
-			...(result?.code !== undefined ? { channelErrorCode: result.code } : {})
+			...(result?.code !== undefined ? { channelErrorCode: result.code } : {}),
+			...(auxiliary ? { auxiliary: true as const } : {})
 		});
 	}
 
@@ -31610,23 +31616,56 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		const outHtlc = outState?.htlcs.get(`offered-${outHtlcId}`);
 		const inHtlc = inState?.htlcs.get(`received-${forward.inHtlcId}`);
 		if (!outHtlc || !inHtlc) return null;
-		// A forward out over an asset channel (issue #2098): its outgoing HTLC
-		// carries a carrier on the wire, not what the leg is worth, so the
-		// amount out and the fee would be wrong. It is recorded with its units
-		// and its quote by the step of the issue that shows asset forwards.
-		// So is a forward whose incoming HTLC came in on an asset channel
-		// (step 3): its amount in is a carrier.
-		if (outState?.auxiliaryState !== undefined) return null;
-		if (inState?.auxiliaryState !== undefined) return null;
-		const amountInMsat = inHtlc.amountMsat;
-		const amountOutMsat = outHtlc.amountMsat;
+		// Issue #2098, step 7: a forward with an asset leg is recorded marked
+		// `auxiliary`, where an ordinary forward is: its outgoing leg fulfilled
+		// in its channel. A preimage learned on the chain, a settle decision
+		// standing over a failed outgoing leg, and a fulfil retried after the
+		// outgoing entry is gone write none, as for an ordinary forward. Its
+		// amounts are what each leg was worth as the node kept them with the
+		// outgoing add (IHtlcEntry.forwardTerms), never a carrier, so a
+		// forward whose terms were not kept writes none either.
+		const inAsset = inState?.auxiliaryState !== undefined;
+		const outAsset = outState?.auxiliaryState !== undefined;
+		const kept = outHtlc.forwardTerms;
+		if (
+			(inAsset || outAsset) &&
+			(outHtlc.state !== HtlcState.FULFILLED ||
+				kept === undefined ||
+				kept.incomingValueMsat === undefined)
+		) {
+			return null;
+		}
+		const marked =
+			inAsset || outAsset
+				? {
+						auxiliary: true as const,
+						...(inAsset && inHtlc.auxiliaryAmount !== undefined
+							? {
+									inAuxiliaryAmount: inHtlc.auxiliaryAmount,
+									inWireAmountMsat: inHtlc.amountMsat
+							  }
+							: {}),
+						...(outAsset && outHtlc.auxiliaryAmount !== undefined
+							? {
+									outAuxiliaryAmount: outHtlc.auxiliaryAmount,
+									outWireAmountMsat: outHtlc.amountMsat
+							  }
+							: {})
+				  }
+				: undefined;
+		const amountInMsat = marked ? kept!.incomingValueMsat! : inHtlc.amountMsat;
+		const amountOutMsat = marked
+			? kept!.amountToForwardMsat
+			: outHtlc.amountMsat;
+		const nextHop = marked ? Buffer.from(kept!.shortChannelId) : undefined;
 		const emit = (): void => {
 			this.emit('htlc:forwarded', {
 				inChannelId: forward.inChannelId,
 				outChannelId,
 				amountInMsat,
 				amountOutMsat,
-				feeMsat: amountInMsat - amountOutMsat
+				feeMsat: amountInMsat - amountOutMsat,
+				...(marked ? { ...marked, nextHopScid: Buffer.from(nextHop!) } : {})
 			});
 			// Resolution counterpart to the forward_attempt log, at the same
 			// level as a settled payment: a completed relay should leave a
@@ -31637,7 +31676,25 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				outChannelId: outChannelId.toString('hex'),
 				amountInMsat: Number(amountInMsat),
 				amountOutMsat: Number(amountOutMsat),
-				feeMsat: Number(amountInMsat - amountOutMsat)
+				feeMsat: Number(amountInMsat - amountOutMsat),
+				...(marked
+					? {
+							auxiliary: true,
+							...(marked.inAuxiliaryAmount !== undefined
+								? {
+										inAuxiliaryAmount: marked.inAuxiliaryAmount.toString(),
+										inWireAmountMsat: marked.inWireAmountMsat!.toString()
+								  }
+								: {}),
+							...(marked.outAuxiliaryAmount !== undefined
+								? {
+										outAuxiliaryAmount: marked.outAuxiliaryAmount.toString(),
+										outWireAmountMsat: marked.outWireAmountMsat!.toString()
+								  }
+								: {}),
+							nextHopScid: nextHop!.toString('hex')
+					  }
+					: {})
 			});
 		};
 		if (
@@ -31657,7 +31714,10 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 					outScid: outState?.shortChannelId?.toString('hex'),
 					amountInMsat,
 					amountOutMsat,
-					feeMsat: amountInMsat - amountOutMsat
+					feeMsat: amountInMsat - amountOutMsat,
+					...(marked
+						? { ...marked, nextHopScid: nextHop!.toString('hex') }
+						: {})
 				}
 			},
 			emit
