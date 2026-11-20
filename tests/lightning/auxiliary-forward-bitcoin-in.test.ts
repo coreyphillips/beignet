@@ -121,6 +121,8 @@ interface IOptions {
 	forwardCltv?: number;
 	/** Bob's bound on HTLCs in flight across his channels refuses the HTLC. */
 	inFlightCap?: boolean;
+	/** Carol announced that she accepts no HTLC on the asset channel. */
+	peerTakesNone?: boolean;
 }
 
 interface IResult {
@@ -258,6 +260,11 @@ describe('a bitcoin HTLC forwarded out over an asset channel (issue #2098, step 
 			.getChannelManager()
 			.getChannel(context.assetChannel)!
 			.getFullState();
+		if (options.peerTakesNone) {
+			(
+				assetState as { remoteConfig: { maxAcceptedHtlcs: number } }
+			).remoteConfig.maxAcceptedHtlcs = 0;
+		}
 		if (options.realScid) {
 			// The channel's type with option_scid_alias, and the real short
 			// channel id a confirmed funding gives it (block 900,000,
@@ -609,6 +616,33 @@ describe('a bitcoin HTLC forwarded out over an asset channel (issue #2098, step 
 			else expect(told.channelId).to.equal(undefined);
 		});
 	}
+
+	it('asks nothing when the asset channel the onion names would refuse any carrier, its peer taking no more HTLCs, and tells the host of a quote that leads there', async () => {
+		const named = await run('aux-fwd-btc-peer-full-named', {
+			quote: false,
+			peerTakesNone: true,
+			answer: (request, context) => units(request, context)
+		});
+		refused(named, TEMPORARY_CHANNEL_FAILURE);
+		expect(named.asked).to.deep.equal([]);
+		expect(named.told).to.deep.equal([]);
+
+		const quote = await run('aux-fwd-btc-peer-full-quote', {
+			quote: true,
+			peerTakesNone: true,
+			answer: (request, context) => units(request, context)
+		});
+		refused(quote, TEMPORARY_CHANNEL_FAILURE);
+		expect(quote.asked).to.have.length(1);
+		expect(quote.told).to.have.length(1);
+		expect(quote.told[0]).to.deep.include({
+			leg: 'outgoing',
+			outcome: 'never-offered'
+		});
+		expect(
+			quote.told[0].channelId?.equals(quote.context.assetChannel)
+		).to.equal(true);
+	});
 
 	it('asks nothing for the real short channel id of an asset channel whose type has option_scid_alias, and fails it as before', async () => {
 		const result = await run('aux-fwd-btc-real-scid', {

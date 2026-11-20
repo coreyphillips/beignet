@@ -250,7 +250,9 @@ export interface IAuxiliaryChannelConfig {
 	 * the node has no channel for, or an asset channel the onion names (issue
 	 * #2098, step 2), and about an HTLC that came in on an asset channel with
 	 * units and is to go on over an ordinary channel the onion names (step
-	 * 3). The contract it is called under is in docs/EXTENSIONS.md
+	 * 3) or over another asset channel, the one the onion names or the one a
+	 * quote's short channel id stands for (step 4). The contract it is called
+	 * under is in docs/EXTENSIONS.md
 	 * ("Forwards with an asset leg"), and `AUXILIARY_CHANNELS_API` lists it in
 	 * `surfaces` from the build that calls it.
 	 *
