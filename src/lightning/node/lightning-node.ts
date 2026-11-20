@@ -29089,6 +29089,10 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 					expectedHtlcId: outHtlcId
 				}
 			);
+		} catch (err) {
+			// Nothing was offered: the in-memory link goes too.
+			this.forwardedHtlcs.delete(outKey);
+			throw err;
 		} finally {
 			if (linkWritten) {
 				if (!result?.ok) {
