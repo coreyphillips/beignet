@@ -362,6 +362,14 @@ The node's `htlc:forwarded` event and its `htlc/forwarded` log carry the same, a
 
 The SQLite database is at schema 21 from this build: `forwarding_events` gains one column, `auxiliary_json`, empty for every ordinary forward, on every node with or without asset channels. A build before it opens such a database, lists a forward with an asset leg as an ordinary one at what its legs were worth, counts it in its own totals, and writes its own rows with the column empty.
 
+### A gate for whoever wraps the node
+
+A program that wraps the node can refuse a forward with an asset leg before anything of it is offered, as `setAuxiliaryPaymentGate` lets it refuse an asset payment: `setAuxiliaryForwardGate(gate)`, and `undefined` to remove it. The node asks the gate once for each offer, synchronously: after the host's terms are read and the forward's checks before the add have passed (the look at the fee coins of a channel of the fixed mode among them), and before the link is staged and the outgoing HTLC added.
+
+The gate is given copies (`IAuxiliaryGatedForward`): the payment hash; the next hop the onion names; the incoming HTLC (its channel and peer, its id, the bitcoin it carries, its units, what it is worth, and whether it came in on an asset channel); the outgoing HTLC about to be offered (its channel and peer, the bitcoin it is to carry, what it is worth, and whether it leaves over an asset channel, but not its units, which the provider reads from the host's records at the add); and the node's fee. It answers `undefined` to let the forward through, or the reason it is refused, as a string or as `{ reason, message }` with its own stable code. One that throws, or answers with a promise, refuses.
+
+A refused forward offers and links nothing: its incoming HTLC fails back with `temporary_channel_failure`, the host is told that the outgoing leg was never offered, and the structured log `asset_forward_declined` says why, with `gateReason` when the gate gave a code. What the node wrote of the ask stays, as after any refusal that follows the host's terms: the marks of the ask with the terms they keep, the never-offered end, and an incoming asset leg's decision to fail. The gate is never asked about an ordinary forward, nor about one the host does not take or the node's own checks refused before it. The checks of the outgoing channel at the add come after it, so a forward it lets through may still be refused there. It runs between the node's look at its fee coins and the add, so it must not act on the node.
+
 ### Going back to an earlier build
 
 A node is taken back to a build without this part only with no forward with an asset leg in flight: its host stops answering `prepareForward` and waits until `getAuxiliaryChannelInfo` reports no `forwardsInFlight` on any asset channel. Such a build keeps none of the ends the host has not taken yet.

@@ -82,7 +82,10 @@ export const AUXILIARY_CHANNELS_API = Object.freeze({
 		// A forward with an asset leg is in the forwarding history and its
 		// htlc:forwarded event, marked auxiliary at what each leg was worth,
 		// and the summary counts it apart.
-		'IForwardingEvent.auxiliary'
+		'IForwardingEvent.auxiliary',
+		// Whoever wraps the node can refuse a forward with an asset leg
+		// before anything of it is offered.
+		'setAuxiliaryForwardGate'
 	] as const),
 	// Nothing is declared and not run in this build.
 	declared: Object.freeze([] as const)

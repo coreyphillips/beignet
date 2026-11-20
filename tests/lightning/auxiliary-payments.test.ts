@@ -1532,7 +1532,8 @@ describe('Asset payments (issue #2093, step 8)', function () {
 				'getFixedOutputFeeStatus:reserve',
 				'requireFeeCoinsToSettle',
 				'onForwardLegResolved:quote',
-				'IForwardingEvent.auxiliary'
+				'IForwardingEvent.auxiliary',
+				'setAuxiliaryForwardGate'
 			]);
 			expect(Object.isFrozen(api)).to.equal(true);
 			expect(Object.isFrozen(api.surfaces)).to.equal(true);
