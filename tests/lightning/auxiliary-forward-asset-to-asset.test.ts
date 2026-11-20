@@ -514,12 +514,39 @@ describe('an asset HTLC forwarded out over another asset channel (issue #2098, s
 		expect(result.inBalance[1] - result.inBalance[0]).to.equal(CARRIER_MSAT);
 		expect(result.outBalance[0] - result.outBalance[1]).to.equal(CARRIER_MSAT);
 		// Asked once, after the node wrote that it asks, outside any storage
-		// transaction; told nothing, since nothing was refused. The hook of
-		// an HTLC that ends at the node is not asked about a forward.
+		// transaction; told how each leg ended (step 5), each with the units
+		// and records its HTLC carried. The hook of an HTLC that ends at the
+		// node is not asked about a forward.
 		expect(result.asked).to.have.length(1);
 		expect(result.inTransaction).to.deep.equal([false]);
 		expect(result.markedBeforeAsk).to.deep.equal([true]);
-		expect(result.told).to.deep.equal([]);
+		expect(legEnds(result.told)).to.deep.equal([
+			'incoming:fulfilled',
+			'outgoing:fulfilled'
+		]);
+		const incoming = result.told.find((end) => end.leg === 'incoming')!;
+		expect(incoming).to.deep.include({
+			incomingHtlcId: 0n,
+			htlcId: 0n,
+			auxiliaryAmount: INCOMING_UNITS,
+			onChain: false
+		});
+		expect(incoming.channelId?.equals(result.context.inChannel)).to.equal(true);
+		const outgoing = result.told.find((end) => end.leg === 'outgoing')!;
+		expect(outgoing).to.deep.include({
+			incomingHtlcId: 0n,
+			htlcId: 0n,
+			auxiliaryAmount: OUTGOING_UNITS,
+			onChain: false
+		});
+		expect(outgoing.channelId?.equals(result.context.outChannel)).to.equal(
+			true
+		);
+		expect(
+			outgoing.customRecords
+				.get(65536n)
+				?.equals(amountRecord(OUTGOING_UNITS).get(65536n)!)
+		).to.equal(true);
 		expect(result.valuedHere).to.equal(0);
 		// The host hears of each asset HTLC: the one received on the incoming
 		// channel and the one offered on the outgoing channel.
@@ -533,6 +560,17 @@ describe('an asset HTLC forwarded out over another asset channel (issue #2098, s
 		// recorded in the forwarding history yet.
 		expect(result.links).to.equal(0);
 		expect(result.forwards).to.equal(0);
+	}
+
+	/** The ends of the forward's legs the host was told, as `leg:outcome` (step 5). */
+	function legEnds(told: IAuxiliaryForwardLegResolution[]): string[] {
+		return told.map((end) => `${end.leg}:${end.outcome}`).sort();
+	}
+	/** The never-offered end the host was told, beside its incoming leg's failure. */
+	function neverOfferedOf(
+		told: IAuxiliaryForwardLegResolution[]
+	): IAuxiliaryForwardLegResolution {
+		return told.find((end) => end.outcome === 'never-offered')!;
 	}
 
 	/** The checks of a forward refused at Bob before anything was offered. */
@@ -550,8 +588,12 @@ describe('an asset HTLC forwarded out over another asset channel (issue #2098, s
 
 	/** The one never-offered a host is told when it answered with terms. */
 	function toldNeverOffered(result: IResult, outChannel?: Buffer): void {
-		expect(result.told).to.have.length(1);
-		const [told] = result.told;
+		// Beside the incoming leg's own end: it was failed back (step 5).
+		expect(legEnds(result.told)).to.deep.equal([
+			'incoming:failed',
+			'outgoing:never-offered'
+		]);
+		const told = neverOfferedOf(result.told);
 		expect(told).to.deep.include({
 			incomingHtlcId: 0n,
 			leg: 'outgoing',
@@ -638,7 +680,11 @@ describe('an asset HTLC forwarded out over another asset channel (issue #2098, s
 		expect(result.hooks).to.include(
 			`onHtlcResolved:${HtlcDirection.RECEIVED}:failed`
 		);
-		expect(result.told).to.deep.equal([]);
+		// Offered, so never told never-offered; each leg ended failed (step 5).
+		expect(legEnds(result.told)).to.deep.equal([
+			'incoming:failed',
+			'outgoing:failed'
+		]);
 	});
 
 	interface INotAsked {
@@ -917,7 +963,7 @@ describe('an asset HTLC forwarded out over another asset channel (issue #2098, s
 						? result.context.outChannel
 						: undefined
 				);
-				expect(result.told[0].customRecords.size).to.equal(0);
+				expect(neverOfferedOf(result.told).customRecords.size).to.equal(0);
 			} else {
 				expect(result.told).to.deep.equal([]);
 			}
@@ -976,7 +1022,7 @@ describe('an asset HTLC forwarded out over another asset channel (issue #2098, s
 		expect(result.offered).to.equal(0n);
 		expect(result.asked).to.deep.equal([]);
 		toldNeverOffered(result);
-		expect(result.told[0].channelId).to.equal(undefined);
+		expect(neverOfferedOf(result.told).channelId).to.equal(undefined);
 	});
 
 	/**
@@ -1206,7 +1252,10 @@ describe('an asset HTLC forwarded out over another asset channel (issue #2098, s
 				outState.auxiliaryState!.remoteBalance
 			]).to.deep.equal([9000n - OUTGOING_UNITS, 1000n + OUTGOING_UNITS]);
 			expect(outState.localHtlcCounter).to.equal(1n);
-			expect(s.told).to.deep.equal([]);
+			expect(legEnds(s.told)).to.deep.equal([
+				'incoming:fulfilled',
+				'outgoing:fulfilled'
+			]);
 			fs.rmSync(s.directory, { recursive: true, force: true });
 		});
 	}
@@ -1240,7 +1289,10 @@ describe('an asset HTLC forwarded out over another asset channel (issue #2098, s
 		);
 		expect(s.bob.storage!.loadAllForwardedHtlcs()).to.have.length(0);
 		expect(s.asked).to.have.length(1);
-		expect(s.told).to.deep.equal([]);
+		expect(legEnds(s.told)).to.deep.equal([
+			'incoming:fulfilled',
+			'outgoing:fulfilled'
+		]);
 		fs.rmSync(s.directory, { recursive: true, force: true });
 	});
 
@@ -1287,7 +1339,10 @@ describe('an asset HTLC forwarded out over another asset channel (issue #2098, s
 					.getFullState().localHtlcCounter
 			).to.equal(1n);
 			expect(s.asked).to.have.length(1);
-			expect(s.told).to.deep.equal([]);
+			expect(legEnds(s.told)).to.deep.equal([
+				'incoming:fulfilled',
+				'outgoing:fulfilled'
+			]);
 			fs.rmSync(s.directory, { recursive: true, force: true });
 			restoreRandomness();
 		}
@@ -1317,7 +1372,10 @@ describe('an asset HTLC forwarded out over another asset channel (issue #2098, s
 			PaymentStatus.FAILED
 		);
 		expect(s.bob.storage!.loadAllForwardedHtlcs()).to.have.length(0);
-		expect(s.told).to.deep.equal([]);
+		expect(legEnds(s.told)).to.deep.equal([
+			'incoming:failed',
+			'outgoing:failed'
+		]);
 		fs.rmSync(s.directory, { recursive: true, force: true });
 	});
 

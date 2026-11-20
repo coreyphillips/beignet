@@ -19,7 +19,12 @@ import type {
 } from '../../src/lightning/channel/auxiliary-forward';
 import type { IAuxiliaryChannelConfig } from '../../src/lightning/channel/auxiliary-funding';
 import { ChannelState, HtlcState } from '../../src/lightning/channel/types';
-import { OutputStatus, OutputType } from '../../src/lightning/chain/types';
+import {
+	IRREVOCABLE_DEPTH,
+	OutputStatus,
+	OutputType,
+	type ITrackedOutput
+} from '../../src/lightning/chain/types';
 import type { ChainMonitor } from '../../src/lightning/chain/chain-monitor';
 import {
 	ASSET_FORWARD_FAIL_BACK_DEPTH,
@@ -795,6 +800,275 @@ describe('a forward with an asset leg on the chain (issue #2098, step 5)', funct
 			expect(
 				node.isOutgoingLegTerminallyFailed(outKey, held.paymentHash)
 			).to.equal(false);
+		});
+	});
+
+	describe("each leg's end, told to the host", () => {
+		/** The ends Bob's host was told, as `leg:outcome`, with `:chain` for one that ended there. */
+		const endsOf = (s: IScene): string[] =>
+			s.told
+				.map((end) => `${end.leg}:${end.outcome}${end.onChain ? ':chain' : ''}`)
+				.sort();
+		const linksOf = (w: IForwardWorld): number =>
+			w.hosts.bob.storage!.loadAllForwardedHtlcs().length;
+
+		for (const shape of SHAPES) {
+			it(`${named(
+				shape
+			)}: the outgoing leg timed out on the chain is told failed there once its spend is irrevocable, and the incoming leg failed in its channel, each once`, async () => {
+				const s = await scene(`fwd-ends-timeout-${shape.join('-')}`, shape);
+				const { w, held } = s;
+				const closedOut = w.hosts.bob.node.forceCloseChannel(
+					w.outChannel,
+					SWEEP_DESTINATION
+				);
+				expect(closedOut.ok, closedOut.error).to.equal(true);
+				await world.mine(w, 1);
+				await world.passTo(w, held.outgoingExpiry - 1);
+				await until(
+					w,
+					"Bob's timeout spend in a block",
+					() => spentAt(offeredOf(w)) !== undefined
+				);
+				const timedOutAt = spentAt(offeredOf(w))!;
+				await until(
+					w,
+					"Alice's payment failed",
+					() => paymentOf(s) === PaymentStatus.FAILED,
+					ASSET_FORWARD_FAIL_BACK_DEPTH + 6
+				);
+				await world.mine(w, 2);
+				expect(endsOf(s)).to.deep.equal(['incoming:failed']);
+				await world.passTo(w, timedOutAt + IRREVOCABLE_DEPTH - 1);
+				await until(w, "the outgoing leg's end", () => s.told.length === 2, 6);
+				expect(endsOf(s)).to.deep.equal([
+					'incoming:failed',
+					'outgoing:failed:chain'
+				]);
+				const outgoing = s.told.find((end) => end.leg === 'outgoing')!;
+				expect(outgoing.channelId?.equals(w.outChannel)).to.equal(true);
+				expect(outgoing.incomingChannelId.equals(w.inChannel)).to.equal(true);
+				expect(outgoing.auxiliaryAmount).to.equal(
+					shape[1] === 'asset' ? OUTGOING_UNITS : undefined
+				);
+				await world.mine(w, 3);
+				expect(s.told).to.have.length(2);
+			});
+
+			it(`${named(
+				shape
+			)}: the incoming leg Bob claimed on the chain is told fulfilled there once his claim is irrevocable, the outgoing leg fulfilled in its channel, and the link goes`, async () => {
+				const s = await scene(`fwd-ends-claim-${shape.join('-')}`, shape);
+				const { w, held } = s;
+				const closedIn = w.hosts.alice.node.forceCloseChannel(
+					w.inChannel,
+					SWEEP_DESTINATION
+				);
+				expect(closedIn.ok, closedIn.error).to.equal(true);
+				await world.mine(w, 2);
+				expect(
+					w.hosts.carol.node.settleHeldHtlc(held.paymentHash, held.preimage)
+				).to.equal(true);
+				await settle();
+				await until(
+					w,
+					"Bob's claim of the incoming HTLC in a block",
+					() => spentAt(receivedOf(w)) !== undefined
+				);
+				const claimedAt = spentAt(receivedOf(w))!;
+				expect(endsOf(s)).to.deep.equal(['outgoing:fulfilled']);
+				await world.passTo(w, claimedAt + IRREVOCABLE_DEPTH - 1);
+				await until(w, "the incoming leg's end", () => s.told.length === 2, 6);
+				expect(endsOf(s)).to.deep.equal([
+					'incoming:fulfilled:chain',
+					'outgoing:fulfilled'
+				]);
+				const incoming = s.told.find((end) => end.leg === 'incoming')!;
+				expect(incoming.auxiliaryAmount).to.equal(
+					shape[0] === 'asset' ? INCOMING_UNITS : undefined
+				);
+				await world.mine(w, 2);
+				expect(linksOf(w)).to.equal(0);
+				expect(s.told).to.have.length(2);
+			});
+
+			it(`${named(
+				shape
+			)}: the outgoing leg Carol claimed on the chain is told fulfilled there once her claim is irrevocable, and the incoming leg fulfilled in its channel`, async () => {
+				const s = await scene(`fwd-ends-carol-${shape.join('-')}`, shape);
+				const { w, held } = s;
+				world.silence(w, 'out');
+				expect(
+					w.hosts.carol.node.settleHeldHtlc(held.paymentHash, held.preimage)
+				).to.equal(true);
+				await settle();
+				const closedOut = w.hosts.carol.node.forceCloseChannel(
+					w.outChannel,
+					SWEEP_DESTINATION
+				);
+				expect(closedOut.ok, closedOut.error).to.equal(true);
+				await until(
+					w,
+					"Alice's payment completed",
+					() => paymentOf(s) === PaymentStatus.COMPLETED,
+					30
+				);
+				await until(
+					w,
+					"Carol's claim in a block",
+					() => spentAt(offeredOf(w)) !== undefined
+				);
+				const claimedAt = spentAt(offeredOf(w))!;
+				expect(endsOf(s)).to.deep.equal(['incoming:fulfilled']);
+				await world.passTo(w, claimedAt + IRREVOCABLE_DEPTH - 1);
+				await until(w, "the outgoing leg's end", () => s.told.length === 2, 6);
+				expect(endsOf(s)).to.deep.equal([
+					'incoming:fulfilled',
+					'outgoing:fulfilled:chain'
+				]);
+			});
+		}
+
+		it('a host whose call throws is told again on the next block and after a restart, until a call returns, and each end once', async () => {
+			let refuse = 3;
+			const taken: IAuxiliaryForwardLegResolution[] = [];
+			const s = await scene('fwd-ends-throws', ['asset', 'asset'], {
+				bob: {
+					onForwardLegResolved: (resolution): void => {
+						if (refuse > 0) {
+							refuse--;
+							throw new Error('host busy');
+						}
+						taken.push(resolution);
+					}
+				}
+			});
+			const { w, held } = s;
+			expect(
+				w.hosts.carol.node.settleHeldHtlc(held.paymentHash, held.preimage)
+			).to.equal(true);
+			for (let i = 0; i < 4; i++) await settle();
+			expect(paymentOf(s)).to.equal(PaymentStatus.COMPLETED);
+			expect(taken).to.deep.equal([]);
+			const held1 = (channelId: Buffer): number =>
+				w.hosts.bob.node
+					.getChannelManager()
+					.getChannel(channelId)!
+					.getFullState().forwardLegEnds?.size ?? 0;
+			expect(held1(w.inChannel) + held1(w.outChannel)).to.be.greaterThan(0);
+			// One more refusal is left for the restarted node to meet.
+			await world.mine(w, 1);
+			await world.restartBob(w, 'fwd-ends-throws', {
+				hooks: {
+					prepareForward: (): undefined => undefined,
+					onForwardLegResolved: (
+						resolution: IAuxiliaryForwardLegResolution
+					): void => {
+						if (refuse > 0) {
+							refuse--;
+							throw new Error('host busy');
+						}
+						taken.push(resolution);
+					}
+				}
+			});
+			for (let i = 0; i < 3; i++) await world.mine(w, 1);
+			expect(
+				taken.map((end) => `${end.leg}:${end.outcome}`).sort()
+			).to.deep.equal(['incoming:fulfilled', 'outgoing:fulfilled']);
+			const rows = (channelId: Buffer): number =>
+				w.hosts.bob.storage!.loadChannel(channelId.toString('hex'))?.state
+					.forwardLegEnds?.size ?? 0;
+			expect(rows(w.inChannel) + rows(w.outChannel)).to.equal(0);
+		});
+
+		it('a host without onForwardLegResolved is kept nothing: no mark on the HTLCs and no end in any row', async () => {
+			const s = await scene('fwd-ends-no-hook', ['asset', 'asset'], {
+				bob: { onForwardLegResolved: undefined }
+			});
+			const { w, held } = s;
+			const marks = (): string[] =>
+				[w.inChannel, w.outChannel].flatMap((channelId) =>
+					[
+						...w.hosts.bob.node
+							.getChannelManager()
+							.getChannel(channelId)!
+							.getFullState()
+							.htlcs.values()
+					].flatMap((entry) => [
+						...(entry.forwardTaken ? ['taken'] : []),
+						...(entry.forwardOf ? ['of'] : [])
+					])
+				);
+			expect(marks()).to.deep.equal([]);
+			expect(
+				w.hosts.carol.node.settleHeldHtlc(held.paymentHash, held.preimage)
+			).to.equal(true);
+			for (let i = 0; i < 4; i++) await settle();
+			expect(paymentOf(s)).to.equal(PaymentStatus.COMPLETED);
+			for (const channelId of [w.inChannel, w.outChannel]) {
+				expect(
+					w.hosts.bob.storage!.loadChannel(channelId.toString('hex'))?.state
+						.forwardLegEnds
+				).to.equal(undefined);
+			}
+			expect(s.told).to.deep.equal([]);
+		});
+
+		it('a channel holding as many ends its host has not taken as the node keeps for one takes no forward with an asset leg, and its host is not asked', async () => {
+			const asked: IAuxiliaryForwardRequest[] = [];
+			const w = await world.open('fwd-ends-bound', {
+				kinds: { in: 'asset', out: 'asset' },
+				hooks: {
+					bob: {
+						prepareForward: (request): IAuxiliaryForwardTerms => {
+							asked.push(request);
+							return termsOf(['asset', 'asset'])(request);
+						},
+						onForwardLegResolved: (): void => {
+							throw new Error('host down');
+						}
+					},
+					carol: { valueIncomingHtlc: valued }
+				}
+			});
+			const state = w.hosts.bob.node
+				.getChannelManager()
+				.getChannel(w.inChannel)!
+				.getFullState();
+			const ends = new Map<string, IAuxiliaryForwardLegResolution>();
+			(
+				state as {
+					forwardLegEnds?: Map<string, IAuxiliaryForwardLegResolution>;
+				}
+			).forwardLegEnds = ends;
+			for (let i = 0; i < 1000; i++) {
+				ends.set(`never-offered:${1000 + i}`, {
+					paymentHash: Buffer.alloc(32, 1),
+					incomingChannelId: Buffer.from(w.inChannel),
+					incomingHtlcId: BigInt(1000 + i),
+					leg: 'outgoing',
+					outcome: 'never-offered',
+					onChain: false,
+					customRecords: new Map()
+				});
+			}
+			const next = w.hosts.bob.node
+				.getChannelManager()
+				.getChannel(w.outChannel)!
+				.getFullState().scidAlias!;
+			const held = await forwardHeld(w, 'fwd-ends-bound', {
+				next,
+				forwardMsat: FORWARD_MSAT,
+				outgoingDelta: OUTGOING_DELTA,
+				cltvDelta: CLTV_DELTA,
+				units: INCOMING_UNITS,
+				held: false
+			});
+			expect(asked).to.deep.equal([]);
+			expect(w.hosts.alice.node.getPayment(held.paymentHash)?.status).to.equal(
+				PaymentStatus.FAILED
+			);
 		});
 	});
 });

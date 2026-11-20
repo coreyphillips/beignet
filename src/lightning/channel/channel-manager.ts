@@ -2272,6 +2272,12 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			 * next id is another, nothing is added.
 			 */
 			expectedHtlcId?: bigint;
+			/**
+			 * Issue #2098, step 5: the incoming HTLC of the forward this is the
+			 * outgoing leg of, kept on the entry so that its end is told to the
+			 * host (IHtlcEntry.forwardOf).
+			 */
+			forwardOf?: { channelId: Buffer; htlcId: bigint };
 		}
 	): ChannelResult {
 		const emitRefusal = options?.emitRefusal !== false;
@@ -2305,7 +2311,8 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			onionRoutingPacket,
 			blindingPoint,
 			skimmedFeeMsat,
-			options?.customRecords
+			options?.customRecords,
+			options?.forwardOf
 		);
 		// A refused add changed nothing in the channel and its ERROR carries no
 		// cleanup, so dropping it from the dispatch only drops the event.
@@ -3498,6 +3505,8 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 				if (channel.getFullState().auxiliaryState) {
 					this._notifyAuxiliaryResolutions(channel);
 				}
+				// Issue #2098, step 5: and the end of an outgoing leg it was.
+				this._notifyForwardLegEnds(channel);
 			}
 		});
 	}
@@ -3628,6 +3637,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			this.channels.set(channelId.toString('hex'), channel);
 			this.channelPeers.set(channelId.toString('hex'), peerPubkey);
 			this._notifyAuxiliaryResolutions(channel, { deferWrite: true });
+			this._notifyForwardLegEnds(channel, { deferWrite: true });
 			// A row exists only from funding_signed on: an asset opening that
 			// is restored is irrevocable, and a host that was never told, or
 			// whose callback threw, is told now. The mark rides the next
@@ -4422,6 +4432,8 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		// Asset channels: what the host's callback has not taken is offered
 		// again, whatever the state of the channel's monitor.
 		this._redeliverAuxiliaryResolutions();
+		// Issue #2098, step 5: and so are the ends of forward legs.
+		this._redeliverForwardLegEnds();
 
 		const allActions: ChainAction[] = [];
 
@@ -4434,6 +4446,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 				// Asset channels: an ending whose row could not be written
 				// when its output was settled for good is recorded here.
 				this.recordAuxiliaryChainEndings(channelIdHex);
+				this.recordForwardLegChainEnds(channelIdHex);
 				continue;
 			}
 
@@ -4446,6 +4459,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 				this.releaseHeldAuxiliarySpends(channelIdHex);
 			}
 			this.recordAuxiliaryChainEndings(channelIdHex);
+			this.recordForwardLegChainEnds(channelIdHex);
 
 			if (actions.length > 0) {
 				const channelId = Buffer.from(channelIdHex, 'hex');
@@ -12132,6 +12146,69 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 	}
 
 	/**
+	 * Issue #2098, step 5: write down, with the row of the channel the HTLC
+	 * came in on, that its host took the forward on (prepareForward answered
+	 * with terms), so that the end of this leg is told to it
+	 * (onForwardLegResolved) even after a restart. Only for a host that
+	 * supplies that hook: true and nothing written otherwise. False, with
+	 * nothing kept, when the channel does not hold the HTLC or the row could
+	 * not be written.
+	 */
+	recordForwardTaken(channelId: Buffer, htlcId: bigint): boolean {
+		if (!this.config.auxiliaryChannels?.onForwardLegResolved) return true;
+		const hex = channelId.toString('hex');
+		const channel = this.channels.get(hex);
+		const peerPubkey = this.channelPeers.get(hex);
+		if (!channel || !peerPubkey) return false;
+		if (channel.forwardTaken(htlcId)) return true;
+		if (!channel.markForwardTaken(htlcId)) return false;
+		if (!this._persistCommitted(channel, peerPubkey, channelId)) {
+			channel.unmarkForwardTaken(htlcId);
+			return false;
+		}
+		return true;
+	}
+
+	/**
+	 * Issue #2098, step 5: keep, with the row of the channel the HTLC came in
+	 * on, that the outgoing leg of its forward was never offered, and tell
+	 * the host (onForwardLegResolved), again after a restart until a call
+	 * returns. The received HTLC is marked so that its own end is told too.
+	 * Only for a host that supplies that hook. A row that could not be
+	 * written keeps the end in memory, to ride the channel's next write.
+	 */
+	recordForwardNeverOffered(
+		inChannelId: Buffer,
+		inHtlcId: bigint,
+		paymentHash: Buffer,
+		channelId?: Buffer
+	): void {
+		if (!this.config.auxiliaryChannels?.onForwardLegResolved) return;
+		const hex = inChannelId.toString('hex');
+		const channel = this.channels.get(hex);
+		const peerPubkey = this.channelPeers.get(hex);
+		if (!channel || !peerPubkey) return;
+		if (!channel.recordForwardNeverOffered(inHtlcId, paymentHash, channelId)) {
+			return;
+		}
+		if (this._persistCommitted(channel, peerPubkey, inChannelId)) {
+			this._notifyForwardLegEnds(channel);
+		}
+	}
+
+	/**
+	 * Issue #2098, step 5: how many ends of forward legs a channel holds that
+	 * its host has not taken. A forward over or from a channel that holds
+	 * AUXILIARY_MAX_UNDELIVERED_OUTCOMES of them is refused.
+	 */
+	undeliveredForwardLegEnds(channelId: Buffer): number {
+		return (
+			this.channels.get(channelId.toString('hex'))?.getFullState()
+				.forwardLegEnds?.size ?? 0
+		);
+	}
+
+	/**
 	 * Issue #2098: write down, with the row of the channel an asset HTLC came
 	 * in on, what the node decided for it as the incoming leg of a forward:
 	 * to settle it, with the preimage the outgoing leg gave up, or to fail
@@ -12338,6 +12415,8 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		if (recorded === 0) return;
 		this.emit('monitor:updated', channelIdHex, monitor);
 		this._notifyAuxiliaryResolutions(channel);
+		// Issue #2098, step 5: an ending of a forward's leg rode the same write.
+		this._notifyForwardLegEnds(channel);
 	}
 
 	/**
@@ -12513,6 +12592,173 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		}
 	}
 
+	/** Issue #2098, step 5: the identity of a leg end being told, so it is told once at a time. */
+	private readonly _forwardLegEndsInFlight = new Set<string>();
+	/** Where the next pass over a channel's leg ends starts, as for outcomes. */
+	private readonly _forwardLegEndsTriedLast = new WeakMap<Channel, string>();
+	/** Passes the per-block redelivery started for a channel, in the current interval. */
+	private readonly _forwardLegDeliveryWindows = new Map<
+		string,
+		{ since: number; attempts: number }
+	>();
+
+	/**
+	 * Issue #2098, step 5: tell the host the ends of forward legs a channel
+	 * holds (onForwardLegResolved), each once a call returns without
+	 * throwing, and take it out of the row then. Outside any storage
+	 * transaction, as `_notifyAuxiliaryResolutions` tells outcomes, with the
+	 * same bound on a host that keeps throwing: a pass stops at eight
+	 * refusals and the next starts behind the last end it tried. A host
+	 * without the hook is kept nothing.
+	 */
+	private _notifyForwardLegEnds(
+		channel: Channel,
+		options: { deferWrite?: boolean } = {}
+	): void {
+		const state = channel.getFullState();
+		const records = state.forwardLegEnds;
+		if (!records || records.size === 0) return;
+		const channelId = channel.getChannelId();
+		const peerPubkey = channelId && this.getPeerForChannel(channelId);
+		if (!channelId || !peerPubkey) return;
+		const callback = this.config.auxiliaryChannels?.onForwardLegResolved;
+		if (!callback) {
+			records.clear();
+			return;
+		}
+		let delivered = 0;
+		let refused = 0;
+		let firstRefusal = '';
+		const hex = channelId.toString('hex');
+		const pending = [...records];
+		const triedLast = this._forwardLegEndsTriedLast.get(channel);
+		const start =
+			triedLast === undefined
+				? 0
+				: pending.findIndex(([key]) => key === triedLast) + 1;
+		this._forwardLegEndsTriedLast.delete(channel);
+		for (let tried = 0; tried < pending.length; tried++) {
+			const [key, end] = pending[(start + tried) % pending.length];
+			const identity = `${hex}:${key}`;
+			if (this._forwardLegEndsInFlight.has(identity)) continue;
+			this._forwardLegEndsInFlight.add(identity);
+			try {
+				callback({
+					...end,
+					paymentHash: Buffer.from(end.paymentHash),
+					incomingChannelId: Buffer.from(end.incomingChannelId),
+					...(end.channelId ? { channelId: Buffer.from(end.channelId) } : {}),
+					customRecords: new Map(end.customRecords)
+				});
+				if (records.get(key) === end) {
+					records.delete(key);
+					delivered++;
+				}
+			} catch (error) {
+				if (refused++ === 0) {
+					firstRefusal = error instanceof Error ? error.message : String(error);
+				}
+			} finally {
+				this._forwardLegEndsInFlight.delete(identity);
+			}
+			if (refused >= 8) {
+				if (tried + 1 < pending.length) {
+					this._forwardLegEndsTriedLast.set(channel, key);
+				}
+				break;
+			}
+		}
+		if (refused > 0) {
+			this.emitContained(
+				'error',
+				channelId,
+				`Forward leg resolution callback failed (channel ${hex}): ${firstRefusal}; ${records.size} end(s) of forward legs of the channel are held undelivered`
+			);
+		}
+		if (delivered > 0) {
+			const write = (): void => {
+				try {
+					if (this.channels.get(hex) !== channel) return;
+					this.persistence.persist({ channel, peerPubkey, channelId });
+				} catch {
+					// The removal rides the next write of the channel; a restart
+					// before one tells the end again, as the contract allows.
+				}
+			};
+			if (options.deferWrite === true) setImmediate(write);
+			else write();
+		}
+	}
+
+	/**
+	 * Issue #2098, step 5: offer the host again, on a new block, every end
+	 * of a forward leg its callback has not taken, as
+	 * `_redeliverAuxiliaryResolutions` offers outcomes, within the same
+	 * limit of passes per channel and interval.
+	 */
+	private _redeliverForwardLegEnds(now: number = Date.now()): void {
+		if (!this.config.auxiliaryChannels?.onForwardLegResolved) return;
+		for (const [hex, channel] of [...this.channels]) {
+			const held = channel.getFullState().forwardLegEnds;
+			if (!held || held.size === 0) {
+				this._forwardLegDeliveryWindows.delete(hex);
+				continue;
+			}
+			const window = this._forwardLegDeliveryWindows.get(hex);
+			if (
+				!window ||
+				now - window.since >= ChannelManager.AUXILIARY_RETRY_INTERVAL_MS
+			) {
+				this._forwardLegDeliveryWindows.set(hex, { since: now, attempts: 1 });
+			} else if (
+				window.attempts >= ChannelManager.AUXILIARY_RETRY_ATTEMPTS_PER_INTERVAL
+			) {
+				continue;
+			} else {
+				window.attempts++;
+			}
+			this._notifyForwardLegEnds(channel);
+		}
+	}
+
+	/**
+	 * Issue #2098, step 5: keep, in an ordinary channel's row, the end on the
+	 * chain of every HTLC of it that is a leg of a forward with an asset leg,
+	 * once that end is for good (ChainMonitor.forwardLegChainEndings), and
+	 * tell the host. The mark of the HTLC goes with the end, in one write; a
+	 * write that fails leaves the mark, and the next block says it again.
+	 * An asset channel keeps these with its chain endings
+	 * (recordAuxiliaryChainEndings).
+	 */
+	private recordForwardLegChainEnds(channelIdHex: string): void {
+		const channel = this.channels.get(channelIdHex);
+		const monitor = this.monitors.get(channelIdHex);
+		const peerPubkey = this.channelPeers.get(channelIdHex);
+		if (!channel || !monitor || !peerPubkey) return;
+		if (channel.getFullState().auxiliaryState !== undefined) return;
+		const endings = monitor.forwardLegChainEndings();
+		if (endings.length === 0) return;
+		let recorded = false;
+		for (const ending of endings) {
+			recorded =
+				channel.recordForwardLegChainEnd(
+					ending.direction,
+					ending.htlcId,
+					ending.outcome
+				) || recorded;
+		}
+		if (!recorded) return;
+		if (
+			this._persistCommitted(
+				channel,
+				peerPubkey,
+				Buffer.from(channelIdHex, 'hex')
+			)
+		) {
+			this._notifyForwardLegEnds(channel);
+		}
+	}
+
 	private _persistBatch(ctx: IDispatchContext): boolean {
 		const { channel, outbox } = ctx;
 		let result: IChannelPersistResult | undefined;
@@ -12582,6 +12828,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		// then is the host told of it.
 		if (result?.committed === true) {
 			this._notifyAuxiliaryResolutions(channel);
+			this._notifyForwardLegEnds(channel);
 			this._auxiliaryOpenRowCommitted(ctx);
 		}
 		return true;
@@ -13814,6 +14061,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 					this.fixedOutputFeesReconciled.delete(channelId.toString('hex'));
 
 					this.recordAuxiliaryChainEndings(channelId.toString('hex'));
+					this.recordForwardLegChainEnds(channelId.toString('hex'));
 
 					this.emit(
 						'output:resolved',

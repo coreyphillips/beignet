@@ -345,6 +345,10 @@ describe('a bitcoin HTLC forwarded out over an asset channel (issue #2098, step 
 		};
 	}
 
+	/** The ends of the forward's legs the host was told, as `leg:outcome` (step 5). */
+	const legEnds = (told: IAuxiliaryForwardLegResolution[]): string[] =>
+		told.map((end) => `${end.leg}:${end.outcome}`).sort();
+
 	/** The checks of a forward that went through. */
 	function forwarded(result: IResult): void {
 		expect(result.alice).to.equal(PaymentStatus.COMPLETED);
@@ -358,11 +362,34 @@ describe('a bitcoin HTLC forwarded out over an asset channel (issue #2098, step 
 		expect(result.offered).to.equal(1n);
 		expect(result.units).to.deep.equal([4000n, 6000n]);
 		// Asked once, after the node wrote that it asks, outside any storage
-		// transaction; told nothing, since nothing was refused.
+		// transaction; told how each leg ended (step 5): the bitcoin leg it
+		// came in on, and the asset leg with the units and records it carried.
 		expect(result.asked).to.have.length(1);
 		expect(result.inTransaction).to.deep.equal([false]);
 		expect(result.markedBeforeAsk).to.deep.equal([true]);
-		expect(result.told).to.deep.equal([]);
+		expect(legEnds(result.told)).to.deep.equal([
+			'incoming:fulfilled',
+			'outgoing:fulfilled'
+		]);
+		const incoming = result.told.find((end) => end.leg === 'incoming')!;
+		expect(incoming).to.deep.include({
+			incomingHtlcId: 0n,
+			htlcId: 0n,
+			onChain: false
+		});
+		expect(incoming.auxiliaryAmount).to.equal(undefined);
+		expect(incoming.customRecords.size).to.equal(0);
+		const outgoing = result.told.find((end) => end.leg === 'outgoing')!;
+		expect(outgoing).to.deep.include({
+			incomingHtlcId: 0n,
+			auxiliaryAmount: 5000n,
+			onChain: false
+		});
+		expect(
+			outgoing.customRecords
+				.get(65536n)
+				?.equals(amountRecord(5000n).get(65536n)!)
+		).to.equal(true);
 		expect(result.hooks).to.include(
 			`onHtlcResolved:${HtlcDirection.OFFERED}:fulfilled`
 		);
@@ -438,8 +465,12 @@ describe('a bitcoin HTLC forwarded out over an asset channel (issue #2098, step 
 		expect(result.units).to.deep.equal([9000n, 1000n]);
 		expect(result.links).to.equal(0);
 		expect(result.asked).to.have.length(1);
-		// It was offered, so the host is not told it never was.
-		expect(result.told).to.deep.equal([]);
+		// It was offered, so the host is not told it never was; each leg
+		// ended failed (step 5).
+		expect(legEnds(result.told)).to.deep.equal([
+			'incoming:failed',
+			'outgoing:failed'
+		]);
 	});
 
 	interface IRefusal {
@@ -593,8 +624,12 @@ describe('a bitcoin HTLC forwarded out over an asset channel (issue #2098, step 
 				expect(result.told).to.deep.equal([]);
 				return;
 			}
-			expect(result.told).to.have.length(1);
-			const [told] = result.told;
+			// Never offered, and the incoming leg failed back (step 5).
+			expect(legEnds(result.told)).to.deep.equal([
+				'incoming:failed',
+				'outgoing:never-offered'
+			]);
+			const told = result.told.find((end) => end.outcome === 'never-offered')!;
 			expect(told).to.deep.include({
 				incomingHtlcId: 0n,
 				leg: 'outgoing',
@@ -634,14 +669,16 @@ describe('a bitcoin HTLC forwarded out over an asset channel (issue #2098, step 
 		});
 		refused(quote, TEMPORARY_CHANNEL_FAILURE);
 		expect(quote.asked).to.have.length(1);
-		expect(quote.told).to.have.length(1);
-		expect(quote.told[0]).to.deep.include({
-			leg: 'outgoing',
-			outcome: 'never-offered'
-		});
-		expect(
-			quote.told[0].channelId?.equals(quote.context.assetChannel)
-		).to.equal(true);
+		expect(legEnds(quote.told)).to.deep.equal([
+			'incoming:failed',
+			'outgoing:never-offered'
+		]);
+		const neverOffered = quote.told.find(
+			(end) => end.outcome === 'never-offered'
+		)!;
+		expect(neverOffered.channelId?.equals(quote.context.assetChannel)).to.equal(
+			true
+		);
 	});
 
 	it('asks nothing for the real short channel id of an asset channel whose type has option_scid_alias, and fails it as before', async () => {
@@ -686,8 +723,14 @@ describe('a bitcoin HTLC forwarded out over an asset channel (issue #2098, step 
 		});
 		refused(result, INCORRECT_CLTV_EXPIRY);
 		expect(result.asked).to.deep.equal([]);
-		expect(result.told).to.have.length(1);
-		expect(result.told[0]).to.deep.include({
+		// Beside the incoming leg's own end: it was failed back (step 5).
+		expect(legEnds(result.told)).to.deep.equal([
+			'incoming:failed',
+			'outgoing:never-offered'
+		]);
+		expect(
+			result.told.find((end) => end.outcome === 'never-offered')
+		).to.deep.include({
 			incomingHtlcId: 0n,
 			leg: 'outgoing',
 			outcome: 'never-offered',
@@ -709,8 +752,14 @@ describe('a bitcoin HTLC forwarded out over an asset channel (issue #2098, step 
 		expect(result.offered).to.equal(0n);
 		expect(result.units).to.deep.equal([9000n, 1000n]);
 		expect(result.asked).to.deep.equal([]);
-		expect(result.told).to.have.length(1);
-		expect(result.told[0]).to.deep.include({
+		// Beside the incoming leg's own end: it was failed back (step 5).
+		expect(legEnds(result.told)).to.deep.equal([
+			'incoming:failed',
+			'outgoing:never-offered'
+		]);
+		expect(
+			result.told.find((end) => end.outcome === 'never-offered')
+		).to.deep.include({
 			incomingHtlcId: 0n,
 			leg: 'outgoing',
 			outcome: 'never-offered',
@@ -842,7 +891,10 @@ describe('a bitcoin HTLC forwarded out over an asset channel (issue #2098, step 
 			state.auxiliaryState!.localBalance,
 			state.auxiliaryState!.remoteBalance
 		]).to.deep.equal([4000n, 6000n]);
-		expect(told).to.deep.equal([]);
+		// Each leg's end is told once, by the node started again (step 5).
+		expect(told.map((end) => `${end.leg}:${end.outcome}`).sort()).to.deep.equal(
+			['incoming:fulfilled', 'outgoing:fulfilled']
+		);
 		fs.rmSync(directory, { recursive: true, force: true });
 	});
 });

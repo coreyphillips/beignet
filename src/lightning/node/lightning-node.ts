@@ -27649,7 +27649,9 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 					'fail'
 				);
 			}
-			const failed = failIncomingNow(failureCode, fields);
+			// Issue #2098, step 5: told before the failure, so that the incoming
+			// HTLC carries the mark by which its own end is kept, whenever its
+			// removal turns irrevocable.
 			if (askedBefore && !askSettled) {
 				askSettled = true;
 				this.tellForwardNeverOffered(
@@ -27659,7 +27661,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 					assetChannelNamed ?? ordinaryChannelNamed
 				);
 			}
-			return failed;
+			return failIncomingNow(failureCode, fields);
 		};
 
 		if (blindedCleartextFields) {
@@ -27746,6 +27748,21 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		// of the host's, so it is judged before the host is asked.
 		const assetDeltaShort =
 			incomingCltvExpiry - forwardCltv < ASSET_FORWARD_MIN_CLTV_DELTA;
+		// Issue #2098, step 5: a channel holding as many ends of forward legs
+		// as the node keeps for one, its host not taking them, takes no more.
+		const refuseLegEndsFull = (channelId: Buffer): boolean => {
+			if (!this.forwardLegEndsFull(channelId)) return false;
+			this.emitStructuredLog('htlc', 'asset_forward_declined', {
+				paymentHash: paymentHash.toString('hex'),
+				inChannelId: inChannelId.toString('hex'),
+				inHtlcId: Number(inHtlcId),
+				reason: `the channel ${channelId.toString(
+					'hex'
+				)} holds ends of forward legs that its host has not taken`
+			});
+			failIncoming(TEMPORARY_CHANNEL_FAILURE);
+			return true;
+		};
 		const refuseAssetDelta = (): void => {
 			this.emitStructuredLog('htlc', 'asset_forward_declined', {
 				paymentHash: paymentHash.toString('hex'),
@@ -27806,6 +27823,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				refuseAssetDelta();
 				return;
 			}
+			if (refuseLegEndsFull(inChannelId)) return;
 			this.forwardAssetIntoAsset({
 				inChannelId,
 				inHtlcId,
@@ -27871,6 +27889,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 					refuseAssetDelta();
 					return;
 				}
+				if (refuseLegEndsFull(inChannelId)) return;
 				this.forwardOverAssetChannel({
 					inChannelId,
 					inHtlcId,
@@ -27925,6 +27944,14 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 					this.assetForwardAskable(inChannelId)))
 		) {
 			refuseAssetDelta();
+			return;
+		}
+		if (
+			(assetIncoming ||
+				(assetChannelNamed !== undefined &&
+					this.assetForwardAskable(inChannelId))) &&
+			(refuseLegEndsFull(inChannelId) || refuseLegEndsFull(outChannelId))
+		) {
 			return;
 		}
 		// The policy this forward must satisfy. A cleartext payer that is
@@ -28536,11 +28563,11 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	): void {
 		if (askedBefore) {
 			this.channelManager.recordForwardDecision(channelId, htlcId, 'fail');
-		}
-		fail();
-		if (askedBefore) {
+			// Issue #2098, step 5: told before the failure, so the incoming
+			// HTLC's own end is kept too.
 			this.tellForwardNeverOffered(paymentHash, channelId, htlcId);
 		}
+		fail();
 	}
 
 	/**
@@ -28586,6 +28613,34 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		);
 		if (failed.ok) this.cleanupHtlcSharedSecret(secretKey);
 		return true;
+	}
+
+	/**
+	 * Issue #2098, step 5: drop the link of every forward with an asset leg
+	 * whose incoming HTLC is settled on the chain for good, in a write of its
+	 * own: the chain decided that leg, and a preimage the outgoing leg gives
+	 * up later has nothing left to claim with. The outgoing leg's own end is
+	 * kept with its HTLC (IHtlcEntry.forwardOf), not with the link.
+	 */
+	private dropLinksEndedOnChain(): void {
+		for (const [outKey, forward] of [...this.forwardedHtlcs]) {
+			if (!this.forwardHasAssetLeg(outKey)) continue;
+			if (!this.channelOnChain(forward.inChannelId)) continue;
+			const monitor = this.channelManager.getMonitor(forward.inChannelId);
+			if (
+				!monitor?.htlcEndedOnChainForGood(
+					HtlcDirection.RECEIVED,
+					forward.inHtlcId
+				)
+			) {
+				continue;
+			}
+			this.forwardedHtlcs.delete(outKey);
+			this.withStagedMutations(
+				[{ type: 'delete_forwarded_htlc', outKey }],
+				() => undefined
+			);
+		}
 	}
 
 	/**
@@ -28713,6 +28768,11 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		if (undelivered > ChannelManager.AUXILIARY_MAX_UNDELIVERED_OUTCOMES) {
 			return `the outgoing channel holds ${undelivered} outcomes of asset HTLCs that its host has not taken`;
 		}
+		if (this.forwardLegEndsFull(channelId)) {
+			return `the outgoing channel holds ${this.channelManager.undeliveredForwardLegEnds(
+				channelId
+			)} ends of forward legs that its host has not taken`;
+		}
 		if (forwardCltv !== undefined) {
 			const dustMsat =
 				(state.localConfig.dustLimitSatoshis >
@@ -28741,9 +28801,9 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	 * Issue #2098: tell the host that the outgoing leg of a forward it was
 	 * asked about was never offered (onForwardLegResolved), so that it can let
 	 * go of what it reserved for it. `channelId` is the channel the node found
-	 * or the host named, when there was one. The call is made once, here; its
-	 * durable store and redelivery come with the step of the issue that takes
-	 * the forward to the chain.
+	 * or the host named, when there was one. Step 5: the end is kept with the
+	 * row of the channel the HTLC came in on and told until a call returns,
+	 * after a restart too, and the incoming leg's own end is told as well.
 	 */
 	private tellForwardNeverOffered(
 		paymentHash: Buffer,
@@ -28751,28 +28811,37 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		inHtlcId: bigint,
 		channelId?: Buffer
 	): void {
-		const host = this.auxiliaryChannels;
-		if (typeof host?.onForwardLegResolved !== 'function') return;
-		try {
-			host.onForwardLegResolved({
-				paymentHash: Buffer.from(paymentHash),
-				incomingChannelId: Buffer.from(inChannelId),
-				incomingHtlcId: inHtlcId,
-				leg: 'outgoing',
-				...(channelId ? { channelId: Buffer.from(channelId) } : {}),
-				outcome: 'never-offered',
-				onChain: false,
-				customRecords: new Map()
-			});
-		} catch (err) {
-			this.emitStructuredLog('htlc', 'asset_forward_resolution_refused', {
-				paymentHash: paymentHash.toString('hex'),
-				inChannelId: inChannelId.toString('hex'),
-				inHtlcId: Number(inHtlcId),
-				outcome: 'never-offered',
-				error: err instanceof Error ? err.message : String(err)
-			});
-		}
+		this.channelManager.recordForwardNeverOffered(
+			inChannelId,
+			inHtlcId,
+			paymentHash,
+			channelId
+		);
+	}
+
+	/**
+	 * Issue #2098, step 5: the incoming HTLC a forward's outgoing leg is kept
+	 * with (IHtlcEntry.forwardOf), for a host that is told how each leg ends.
+	 */
+	private forwardOfFor(ctx: {
+		inChannelId: Buffer;
+		inHtlcId: bigint;
+	}): { channelId: Buffer; htlcId: bigint } | undefined {
+		return typeof this.auxiliaryChannels?.onForwardLegResolved === 'function'
+			? { channelId: Buffer.from(ctx.inChannelId), htlcId: ctx.inHtlcId }
+			: undefined;
+	}
+
+	/**
+	 * Issue #2098, step 5: whether a channel holds as many ends of forward
+	 * legs its host has not taken as the node keeps for one channel: a
+	 * forward with an asset leg over or from it is then refused.
+	 */
+	private forwardLegEndsFull(channelId: Buffer): boolean {
+		return (
+			this.channelManager.undeliveredForwardLegEnds(channelId) >=
+			ChannelManager.AUXILIARY_MAX_UNDELIVERED_OUTCOMES
+		);
 	}
 
 	/**
@@ -29024,6 +29093,16 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			}
 			return;
 		}
+		// Issue #2098, step 5: the host answered with terms, and is told how
+		// each leg of the forward ends from here on (onForwardLegResolved),
+		// also when the node refuses them. Written before anything is offered.
+		if (
+			!this.channelManager.recordForwardTaken(ctx.inChannelId, ctx.inHtlcId)
+		) {
+			log('the row of the incoming channel could not be written');
+			ctx.failIncoming(TEMPORARY_CHANNEL_FAILURE);
+			return;
+		}
 		const read = this.readForwardTerms(answer, {
 			named: ctx.named,
 			incomingAsset: false,
@@ -29161,7 +29240,8 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				{
 					emitRefusal: false,
 					customRecords: terms.customRecords,
-					expectedHtlcId: outHtlcId
+					expectedHtlcId: outHtlcId,
+					forwardOf: this.forwardOfFor(ctx)
 				}
 			);
 		} catch (err) {
@@ -29355,6 +29435,16 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			// Not the host's: a forward with an asset leg is refused, also to
 			// a short channel id the host does not know.
 			log('the host does not take the forward');
+			ctx.failIncoming(TEMPORARY_CHANNEL_FAILURE);
+			return;
+		}
+		// Issue #2098, step 5: the host answered with terms, and is told how
+		// each leg of the forward ends from here on (onForwardLegResolved),
+		// also when the node refuses them. Written before anything is offered.
+		if (
+			!this.channelManager.recordForwardTaken(ctx.inChannelId, ctx.inHtlcId)
+		) {
+			log('the row of the incoming channel could not be written');
 			ctx.failIncoming(TEMPORARY_CHANNEL_FAILURE);
 			return;
 		}
@@ -29588,6 +29678,16 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			ctx.failIncoming(TEMPORARY_CHANNEL_FAILURE);
 			return;
 		}
+		// Issue #2098, step 5: the host answered with terms, and is told how
+		// each leg of the forward ends from here on (onForwardLegResolved),
+		// also when the node refuses them. Written before anything is offered.
+		if (
+			!this.channelManager.recordForwardTaken(ctx.inChannelId, ctx.inHtlcId)
+		) {
+			log('the row of the incoming channel could not be written');
+			ctx.failIncoming(TEMPORARY_CHANNEL_FAILURE);
+			return;
+		}
 		const tell = (): void =>
 			this.tellForwardNeverOffered(
 				ctx.paymentHash,
@@ -29766,7 +29866,12 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				part.skimmedFeeMsat,
 				// Reported below as htlc:forward-refused. As a node:error it
 				// read exactly like a refused send of the user's own.
-				{ emitRefusal: false }
+				{
+					emitRefusal: false,
+					...(options.incomingAssetLeg
+						? { forwardOf: this.forwardOfFor(part) }
+						: {})
+				}
 			);
 		} catch (err) {
 			// Nothing was offered: the in-memory link goes too.
@@ -34906,6 +35011,9 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		for (const inChannelIdHex of owedInbound) {
 			this.settleForwardsOwedUpstream(Buffer.from(inChannelIdHex, 'hex'));
 		}
+		// Issue #2098, step 5: the link of a forward with an asset leg whose
+		// incoming leg ended on the chain for good has nothing left to drive.
+		this.dropLinksEndedOnChain();
 		this.scanExpiringOfferedHtlcs(blockHeight);
 		// The swap provider looks before the held sweeper: a claim seen this
 		// block settles its hold before the sweeper could judge it (#737).
