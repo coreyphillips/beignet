@@ -48,8 +48,9 @@ export function withAssetOpens(enabled = true): void {
 /**
  * Set forwards with an asset leg on, or off, for the tests of the describe
  * block this is called in, and back to what they were after it (issue
- * #2098). The build has them off; a block that calls this says that it
- * depends on them.
+ * #2098). The build has them on since step 5 of that issue; a block that
+ * calls this says that it depends on them, or with `false` on their
+ * absence.
  */
 export function withAssetForwards(enabled = true): void {
 	let prior = false;

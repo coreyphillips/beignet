@@ -15,19 +15,13 @@ export const auxiliaryChannelOpens = { enabled: true };
 /**
  * Whether this build forwards an HTLC with an asset leg (issue #2098).
  *
- * Off until the step of that issue that defends such a forward on chain:
- * with it off, a node refuses every forward with an asset leg before
- * anything is offered, whatever its host supplies, and asks its host
- * nothing. Step 2 of the issue runs behind it: a bitcoin HTLC whose next
- * hop is a short channel id the host claims, or an asset channel the onion
- * names, forwarded over that asset channel with the records the host made.
- * So does step 3: an HTLC that came in on an asset channel with units,
- * forwarded over the ordinary channel the onion names when the host's
- * value for it covers the amount to forward and the node's fee. And step
- * 4: such an HTLC forwarded over another asset channel of the node, the
- * one the onion names or the one the host names for a quote's short
- * channel id, with the records the host made, on the same condition.
- * Tests turn it on to reach that; nothing else may, and the package does
- * not export it.
+ * On since such a forward can also be defended on the chain: in every
+ * direction, with either channel closed by either side, a preimage the
+ * outgoing leg gives up claims the incoming one, an outgoing leg that timed
+ * out fails the incoming one back, and each leg's end is told to the host
+ * durably. A node asks its host about a forward with an asset leg only when
+ * the host supplies prepareForward; one that does not refuses every such
+ * forward before anything is offered, as before. Tests turn it off to reach
+ * that refusal; nothing else may, and the package does not export it.
  */
-export const auxiliaryForwards = { enabled: false };
+export const auxiliaryForwards = { enabled: true };

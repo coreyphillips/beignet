@@ -32731,6 +32731,17 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			...(auxiliary.resolvedHtlcs && auxiliary.resolvedHtlcs.size > 0
 				? { undeliveredOutcomes: auxiliary.resolvedHtlcs.size }
 				: {}),
+			...((inFlight: number): { forwardsInFlight?: number } =>
+				inFlight > 0 ? { forwardsInFlight: inFlight } : {})(
+				[...this.forwardedHtlcs].filter(
+					([outKey, forward]) =>
+						forward.inChannelId.equals(channelId) ||
+						outKey.startsWith(`${channelId.toString('hex')}:`)
+				).length
+			),
+			...(state.forwardLegEnds && state.forwardLegEnds.size > 0
+				? { undeliveredForwardLegEnds: state.forwardLegEnds.size }
+				: {}),
 			...(revokedViews
 				? {
 						revokedViews: {
