@@ -219,6 +219,126 @@ describe('a hold invoice whose HTLC is on an asset channel that is on chain (iss
 		);
 	});
 
+	it('publishes no preimage for a settle on chain whose decision the storage did not write, keeps that settle bound, and writes the decision and claims once the storage takes it', async () => {
+		const { pair, held, published } = await heldOnChain(
+			'aux-hold-chain-unwritten'
+		);
+		await mineTo(pair, held.cltvExpiry - HELD_HTLC_EXPIRY_MARGIN - 10);
+		const persistence = (
+			pair.bob.node.getChannelManager() as unknown as {
+				persistence: { persist: (...args: unknown[]) => unknown };
+			}
+		).persistence;
+		const persist = persistence.persist;
+		persistence.persist = (): unknown => ({ committed: false, outboxIds: [] });
+		try {
+			expect(
+				pair.bob.node.settleHeldHtlc(held.paymentHash, held.preimage)
+			).to.equal(false);
+		} finally {
+			persistence.persist = persist;
+		}
+		await settle();
+		// Nothing the storage did not take: no decision, so no claim, and the
+		// settle stays chosen, closed to a cancel.
+		expect(decisionOf(pair.bob, pair, 0n)).to.equal(undefined);
+		expect(parkedOf(pair.bob, held.paymentHash)).to.equal(1);
+		expect(pair.bob.node.cancelHoldInvoice(held.paymentHash)).to.equal(null);
+		expect(published.filter((p) => p.who === 'bob')).to.deep.equal([]);
+
+		// The next blocks write the decision, and the claim follows in time.
+		for (let i = 0; i < 12 && !isSpent(htlcOf(pair.bob, pair)); i++) {
+			await world.mine(pair, 1);
+		}
+		expect(decisionOf(pair.bob, pair, 0n)).to.equal('settle');
+		const claimed = htlcOf(pair.bob, pair)!;
+		expect(isSpent(claimed), 'the HTLC output is spent').to.equal(true);
+		expect(
+			pair.chain.confirmed.get(claimed.resolutionTxid!)!.height
+		).to.be.below(held.cltvExpiry);
+		expect(
+			published.filter((p) => p.who === 'bob' && !p.preimage)
+		).to.deep.equal([]);
+	});
+
+	it('marks the ending of an HTLC on the chain recorded only once the row that keeps it is written, and records it again on a later block', async () => {
+		const { pair, held } = await heldOnChain('aux-hold-chain-ending-unwritten');
+		await mineTo(pair, held.cltvExpiry - HELD_HTLC_EXPIRY_MARGIN - 1);
+		expect(
+			pair.bob.node.settleHeldHtlc(held.paymentHash, held.preimage)
+		).to.equal(true);
+		await settle();
+		for (let i = 0; i < 12 && !isSpent(htlcOf(pair.bob, pair)); i++) {
+			await world.mine(pair, 1);
+		}
+		expect(isSpent(htlcOf(pair.bob, pair)), 'claimed').to.equal(true);
+		const manager = pair.bob.node.getChannelManager();
+		const endings = (): Array<{ recorded: boolean }> =>
+			(
+				manager.getMonitor(pair.channelId) as unknown as {
+					auxiliaryHtlcEndings: () => Array<{ recorded: boolean }>;
+				}
+			).auxiliaryHtlcEndings();
+		const persistence = (
+			manager as unknown as {
+				persistence: { persist: (...args: unknown[]) => unknown };
+			}
+		).persistence;
+		const persist = persistence.persist;
+
+		// The claim is there for good while the storage takes no row: the
+		// ending is not marked, so nothing says it was kept.
+		persistence.persist = (): unknown => ({ committed: false, outboxIds: [] });
+		try {
+			pair.chain.advance(IRREVOCABLE_DEPTH);
+			await settle();
+		} finally {
+			persistence.persist = persist;
+		}
+		expect(endings().length).to.be.above(0);
+		expect(endings().some((ending) => ending.recorded)).to.equal(false);
+
+		// Written on the next block, marked, and the host told.
+		await world.mine(pair, 2);
+		expect(endings().every((ending) => ending.recorded)).to.equal(true);
+		expect(outcomes.bob).to.include('RECEIVED:fulfilled:5000');
+	});
+
+	it('keeps a cancel bound on chain whose decision the storage did not write, and ends the hold once the next block writes it', async () => {
+		const { pair, held } = await heldOnChain('aux-hold-chain-cancel-unwritten');
+		await mineTo(pair, held.cltvExpiry - HELD_HTLC_EXPIRY_MARGIN - 10);
+		const persistence = (
+			pair.bob.node.getChannelManager() as unknown as {
+				persistence: { persist: (...args: unknown[]) => unknown };
+			}
+		).persistence;
+		const persist = persistence.persist;
+		persistence.persist = (): unknown => ({ committed: false, outboxIds: [] });
+		try {
+			// A cancel the node binds itself to, as its give-up does.
+			(
+				pair.bob.node as unknown as {
+					cancelHeldHtlc: (
+						paymentHash: Buffer,
+						failureCode: number,
+						reason: string,
+						bindWhenRefused: boolean
+					) => boolean;
+				}
+			).cancelHeldHtlc(held.paymentHash, 0x4000 | 15, 'expiry-scan', true);
+		} finally {
+			persistence.persist = persist;
+		}
+		await settle();
+		expect(decisionOf(pair.bob, pair, 0n)).to.equal(undefined);
+		expect(parkedOf(pair.bob, held.paymentHash)).to.equal(1);
+
+		await world.mine(pair, 1);
+		expect(decisionOf(pair.bob, pair, 0n)).to.equal('fail');
+		expect(parkedOf(pair.bob, held.paymentHash)).to.equal(0);
+		expect(holdEvents).to.deep.equal(['hold:cancelled:expiry-scan']);
+	});
+
 	it('ends a hold nobody decided at the cancel margin, and refuses a settle asked for one block before the expiry: no decision to settle, no preimage published, the payer takes the HTLC back', async () => {
 		const { pair, held, published } = await heldOnChain('aux-hold-chain-late');
 		await mineTo(pair, held.cltvExpiry - HELD_HTLC_EXPIRY_MARGIN - 1);
