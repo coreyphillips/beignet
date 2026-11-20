@@ -5889,6 +5889,7 @@ method node.IFundingProvider.getFixedOutputFeeActionIds?(channelId: Buffer): rea
 method node.IFundingProvider.getFixedOutputFeeBudget?(): wallet.IFixedOutputFeeBudget | undefined
 method node.IFundingProvider.getFixedOutputFeeStatus?(forFeeSatoshis?: bigint): wallet.IFixedOutputFeeStatus | undefined
 method node.IFundingProvider.pledgeTransactionInputs?(txHex: string): Promise<void>
+method node.IFundingProvider.prepareFixedOutputFees?(request: wallet.IFixedOutputFeePreparationRequest): Promise<wallet.IFixedOutputFeePreparation | undefined>
 method node.IFundingProvider.quoteDualFundingMax?(feeratePerKw: number): { fundingSatoshis: bigint; spendableSats: bigint; feeSats: bigint; inputCount: number; }
 method node.IFundingProvider.quoteSpliceIn?(feeratePerKw: number): { spendableSats: bigint; feeSats: bigint; maxAmountSats: bigint; inputCount: number; }
 method node.IFundingProvider.releaseFixedOutputFeeCoins?(): Promise<boolean>
@@ -10144,13 +10145,23 @@ interface wallet.IFixedOutputFeePoolState
 property wallet.IFixedOutputFeePoolState.actions: Array<{ feeActionId?: string; capSatoshis: bigint; inputs: number; heldSatoshis: bigint; }>
 property wallet.IFixedOutputFeePoolState.available: true
 property wallet.IFixedOutputFeePoolState.budget: wallet.IFixedOutputFeeBudget
-property wallet.IFixedOutputFeePoolState.feeCoins: { ready: number; readySatoshis: bigint; unconfirmed: number; }
+property wallet.IFixedOutputFeePoolState.feeCoins: { ready: number; readySatoshis: bigint; unconfirmed: number; readyCoinSatoshis?: bigint[]; }
 property wallet.IFixedOutputFeePoolState.lastRefusal?: { code: wallet.FixedOutputFeeErrorCode; remedy: wallet.FixedOutputFeeRemedy; at: number; deadlineHeight?: number; }
+property wallet.IFixedOutputFeePoolState.policy?: { maxFeeSatoshis: bigint; maxTotalFeeSatoshis: bigint; maxPreparationFeeSatoshis: bigint; feeCoinCount: number; preparationFeeRatePerVbyte: number; }
 property wallet.IFixedOutputFeePoolState.preparation: { possible: boolean; forFeeSatoshis: bigint; neededSatoshis: bigint; largestConfirmedSatoshis: bigint; reason?: 'FEE_FUNDS_UNAVAILABLE' | 'FEE_BUDGET_EXHAUSTED'; splitCoins: number; }
 property wallet.IFixedOutputFeePoolState.splits: Array<{ state: 'unsigned' | 'signed' | 'published'; transactionId?: string; feeSatoshis: bigint; feeCoins: number; feeCoinSatoshis: bigint; }>
 interface wallet.IFixedOutputFeePoolUnavailable
 property wallet.IFixedOutputFeePoolUnavailable.available: false
 property wallet.IFixedOutputFeePoolUnavailable.error: wallet.FixedOutputFeeError
+interface wallet.IFixedOutputFeePreparation
+property wallet.IFixedOutputFeePreparation.coins: number
+property wallet.IFixedOutputFeePreparation.split?: { transactionId: string; feeCoins: number; feeCoinSatoshis: bigint; feeSatoshis: bigint; }
+property wallet.IFixedOutputFeePreparation.waiting?: wallet.FixedOutputFeeErrorCode
+interface wallet.IFixedOutputFeePreparationRequest
+property wallet.IFixedOutputFeePreparationRequest.blockHeight?: number
+property wallet.IFixedOutputFeePreparationRequest.coinSatoshis: bigint
+property wallet.IFixedOutputFeePreparationRequest.coins: number
+property wallet.IFixedOutputFeePreparationRequest.feeratePerKw: number
 interface wallet.IFixedOutputFeeResolution
 property wallet.IFixedOutputFeeResolution.impossible?: true
 property wallet.IFixedOutputFeeResolution.spendingTransaction?: Buffer
@@ -10183,6 +10194,7 @@ method wallet.WalletFundingProvider.getFixedOutputFeeActionIds(channelId: Buffer
 method wallet.WalletFundingProvider.getFixedOutputFeeBudget(): wallet.IFixedOutputFeeBudget | undefined
 method wallet.WalletFundingProvider.getFixedOutputFeeStatus(forFeeSatoshis?: bigint): wallet.IFixedOutputFeeStatus | undefined
 method wallet.WalletFundingProvider.pledgeTransactionInputs(txHex: string): Promise<void>
+method wallet.WalletFundingProvider.prepareFixedOutputFees(request: wallet.IFixedOutputFeePreparationRequest): Promise<wallet.IFixedOutputFeePreparation | undefined>
 method wallet.WalletFundingProvider.quoteDualFundingMax(feeratePerKw: number): { fundingSatoshis: bigint; spendableSats: bigint; feeSats: bigint; inputCount: number; }
 method wallet.WalletFundingProvider.quoteSpliceIn(feeratePerKw: number): { spendableSats: bigint; feeSats: bigint; maxAmountSats: bigint; inputCount: number; }
 method wallet.WalletFundingProvider.releaseFixedOutputFeeCoins(): Promise<boolean>

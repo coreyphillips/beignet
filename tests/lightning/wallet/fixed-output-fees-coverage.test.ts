@@ -1280,3 +1280,36 @@ describe('fee coin pool: what a hand-back of the free coins leaves behind', func
 		expect(w.known.has(split)).equal(true);
 	});
 });
+
+describe('fee coin pool: coins prepared ahead, and the previous release (#2098 step 6)', function () {
+	this.timeout(20000);
+
+	it('reads a split made ahead of any claim as an ordinary split, and serves a claim from its coins after a downgrade', async () => {
+		const w = world({
+			maxFeeSatoshis: 20_000n,
+			maxTotalFeeSatoshis: 200_000n,
+			maxPreparationFeeSatoshis: 1_000n
+		});
+		w.fund(50_000);
+		const p = w.provider();
+		const made = await p.prepareFixedOutputFees({
+			coinSatoshis: 2000n,
+			coins: 4,
+			feeratePerKw: 250,
+			blockHeight: 100
+		});
+		expect(made!.split!.feeCoins).equal(4);
+		w.mine();
+		usePool(p, w, 'previous');
+		const sent = w.broadcasts.length;
+		const selection = await p.selectFeeBumpInputs(500n, 250, {
+			fixedOutputs: true,
+			feeActionId: 'claim-after-downgrade',
+			blockHeight: 101,
+			confirmedOnly: true
+		});
+		expect(selection.inputs).length(1);
+		// No split of its own: the coins prepared ahead served it.
+		expect(w.broadcasts.length).equal(sent);
+	});
+});

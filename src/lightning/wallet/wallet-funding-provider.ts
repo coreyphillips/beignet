@@ -4,6 +4,8 @@ import type {
 	FixedOutputFeeError,
 	IFixedOutputFeeBudget,
 	IFixedOutputFeePolicy,
+	IFixedOutputFeePreparation,
+	IFixedOutputFeePreparationRequest,
 	IFixedOutputFeeResolution,
 	IFixedOutputFeeStatus
 } from './fixed-output-fees';
@@ -405,6 +407,19 @@ export class WalletFundingProvider implements IFundingProvider {
 	releaseFixedOutputFeeCoins(): Promise<boolean> {
 		if (!this.fixedOutputFeePool) return Promise.resolve(false);
 		return this.runSelection(() => this.fixedOutputFeePool!.releaseFreeCoins());
+	}
+
+	/**
+	 * Prepare fee coins ahead of any claim, under the lock every selection of
+	 * this wallet takes: up to `request.coins` free fee coins of at least
+	 * `request.coinSatoshis` each (FixedOutputFeePool.prepare). Answers what
+	 * it did, or why it made no split. Undefined without a fee policy.
+	 */
+	prepareFixedOutputFees(
+		request: IFixedOutputFeePreparationRequest
+	): Promise<IFixedOutputFeePreparation | undefined> {
+		if (!this.fixedOutputFeePool) return Promise.resolve(undefined);
+		return this.runSelection(() => this.fixedOutputFeePool!.prepare(request));
 	}
 
 	/** Run fn after every previously queued selection has finished. */
