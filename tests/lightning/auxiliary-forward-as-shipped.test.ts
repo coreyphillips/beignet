@@ -86,7 +86,9 @@ describe('forwards with an asset leg as the build ships them (issue #2098, step 
 		expect(AUXILIARY_CHANNELS_API.surfaces).to.include(
 			'getFixedOutputFeeStatus:splitCoins'
 		);
-		expect([...AUXILIARY_CHANNELS_API.declared]).to.deep.equal([]);
+		// Issue #2098, step 9 declares sending in parts until the build that
+		// runs it.
+		expect([...AUXILIARY_CHANNELS_API.declared]).to.deep.equal(['sendInParts']);
 	});
 
 	for (const shape of SHAPES) {

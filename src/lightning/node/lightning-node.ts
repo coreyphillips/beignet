@@ -102,7 +102,8 @@ import type {
 } from '../channel/auxiliary-forward';
 import {
 	auxiliaryForwards,
-	auxiliaryPartsReceived
+	auxiliaryPartsReceived,
+	auxiliaryPartsSent
 } from '../channel/auxiliary-switch';
 import { copyCustomRecords } from '../message/custom-records';
 import {
@@ -509,9 +510,13 @@ import {
 import type {
 	IChannelPersistOutbox,
 	IChannelPersistRequest,
-	IChannelPersistResult
+	IChannelPersistResult,
+	IErrorAction
 } from '../channel/channel-actions';
-import { ChannelErrorCode } from '../channel/channel-actions';
+import {
+	ChannelActionType,
+	ChannelErrorCode
+} from '../channel/channel-actions';
 import {
 	FeatureFlags,
 	Feature,
@@ -1132,6 +1137,21 @@ interface IGraphRestoreRun {
 let constructingForCreate = false;
 
 /**
+ * Issue #2098, step 9: one HTLC of an asset payment sent by a host that
+ * sets sendInParts, as the payment's record keeps it in
+ * `_auxiliaryPartsSent` before the HTLC is added: what its route asked its
+ * first hop to carry and its carrier, in msat as decimal strings, the set
+ * of parts it was sent in, and, once it ended without paying, that it
+ * failed.
+ */
+interface IAuxiliaryPartSent {
+	route: string;
+	wire: string;
+	set: number;
+	failed?: true;
+}
+
+/**
  * Top-level Lightning node orchestrator. Its events and their listener
  * signatures are LightningNodeEvents (./events.ts).
  */
@@ -1642,6 +1662,18 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	private rateLimiter: PeerRateLimiter;
 	// Outbound MPP: tracks multi-part payment outcomes (keyed by paymentHash hex)
 	private outboundMppPayments: Map<string, IOutboundMppState> = new Map();
+	/**
+	 * Issue #2098, step 9: the route and onion secrets of each part of an
+	 * asset payment sent in parts, by `<channel hex>:offered-<id>`, so that
+	 * a part's failure decrypts with its own. Put in before the part's add,
+	 * since a fulfil or a failure can run inside it, and dropped when the
+	 * part ends. In memory only: after a restart a part's failure decrypts
+	 * with the record's, which are its set's first part's.
+	 */
+	private readonly assetPartSends = new Map<
+		string,
+		{ route: IPaymentInfo['route']; sharedSecrets: Buffer[] }
+	>();
 	private invoices: Map<string, IInvoiceInfo> = new Map();
 	private feeUpdateTimer: ReturnType<typeof setInterval> | null = null;
 	private lastKnownFeeratePerKw = 0;
@@ -12455,6 +12487,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		this.paymentRetryContexts.clear();
 		this.receivedHtlcSharedSecrets.clear();
 		this.outboundMppPayments.clear();
+		this.assetPartSends.clear();
 		this._stuckChannelTracker.clear();
 		this.rateLimiter.clear();
 		this.removeAllListeners();
@@ -19075,7 +19108,9 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				).toISOString()}`,
 				createdAt: Date.now(),
 				completedAt: Date.now(),
-				...(metadata && { metadata: { ...metadata } })
+				...(metadata && {
+					metadata: { ...LightningNode.withoutPartKeys(metadata) }
+				})
 			};
 			const expiredHashHex = invoice.paymentHash.toString('hex');
 			if (
@@ -19466,6 +19501,26 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			throw new Error('Route must have at least one hop');
 		}
 
+		// Issue #2098, step 9: the keys of an asset payment sent in parts are
+		// the node's to write, never a caller's.
+		metadata = LightningNode.withoutPartKeys(metadata);
+		// A host that sets sendInParts, on a build that runs it, sends every
+		// asset HTLC by its own path, in which a payment may be sent in parts.
+		// Every other send is as before.
+		if (options?.assetPayment && this.sendsAssetParts()) {
+			return this.sendAssetPaymentPart(
+				route,
+				paymentHash,
+				finalCltvExpiry,
+				paymentSecret,
+				totalMsat,
+				metadata,
+				payAll,
+				paymentMetadata,
+				options.assetPayment
+			);
+		}
+
 		// An asset payment leaves over the asset channel it names, and every
 		// attempt of one names it again: the node chooses no channel for it
 		// and retries nothing.
@@ -19685,73 +19740,14 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		// "cltv expiry too soon" (incorrect_or_unknown_payment_details).
 		const baseHeight = this.cltvBaseHeight(paymentHash);
 
-		// Convert route hops to onion hop payloads.
-		// For intermediate hops: the payload tells the hop what to FORWARD (next hop's
-		// amount/cltv), and which channel to use (next hop's SCID).
-		// For the final hop: the payload contains the payment amount/cltv directly.
-		const onionHops: { pubkey: Buffer; payload: IHopPayload }[] = hops.map(
-			(hop, idx) => {
-				const isFinal = idx === hops.length - 1;
-				const payload: IHopPayload = isFinal
-					? {
-							amountToForwardMsat: hop.amountToForwardMsat,
-							outgoingCltvValue: hop.outgoingCltvValue + baseHeight
-					  }
-					: {
-							amountToForwardMsat: hops[idx + 1].amountToForwardMsat,
-							outgoingCltvValue: hops[idx + 1].outgoingCltvValue + baseHeight,
-							shortChannelId: hops[idx + 1].shortChannelId
-					  };
-				if (isFinal && paymentSecret) {
-					payload.paymentSecret = paymentSecret;
-					payload.totalMsat = totalMsat ?? hop.amountToForwardMsat;
-					if (paymentMetadata) payload.paymentMetadata = paymentMetadata;
-				}
-				// Route blinding (BOLT 4): the introduction node and each blinded
-				// hop read their own encrypted_recipient_data (TLV 10) to learn the
-				// real next node/scid; the introduction node also receives the
-				// blinding_point (TLV 12). These belong to THIS hop, not the next.
-				if (hop.encryptedRecipientData) {
-					payload.encryptedRecipientData = hop.encryptedRecipientData;
-					// BOLT 4: a blinded hop MUST NOT carry a cleartext short_channel_id
-					// — its onward channel lives in encrypted_recipient_data. Leaving a
-					// (zero) SCID makes LND reject the payload as invalid_onion_blinding.
-					delete payload.shortChannelId;
-					// A blinded INTERMEDIATE hop also omits amt_to_forward/outgoing_cltv
-					// (derived from encrypted payment_relay). The final hop keeps them
-					// and MUST carry total_amount_msat (TLV 18) — the blinded path's
-					// path_id authenticates the payment there, not payment_data, and
-					// CLN fails a blinded final payload without it as
-					// invalid_onion_payload.
-					if (!isFinal) {
-						payload.omitForwardAmounts = true;
-					} else {
-						payload.totalAmountMsat = totalMsat ?? hop.amountToForwardMsat;
-					}
-				}
-				if (hop.blindingPoint) {
-					payload.blindingPoint = hop.blindingPoint;
-				}
-				return { pubkey: hop.pubkey, payload };
-			}
-		);
-		this.assertOnionFits(
-			onionHops.map((h) => h.payload),
+		const { onionBuf, sharedSecrets } = this.buildRouteOnion(
+			hops,
+			paymentHash,
+			baseHeight,
+			paymentSecret,
+			totalMsat,
 			paymentMetadata
 		);
-
-		// Generate session key and compute shared secrets for failure decryption
-		const sessionKey = randomBytes(32);
-		const hopPubkeys = hops.map((h) => h.pubkey);
-		const { sharedSecrets } = computeSharedSecrets(sessionKey, hopPubkeys);
-
-		// Construct and encode onion packet
-		const onionPacket = constructOnionPacket(
-			sessionKey,
-			onionHops,
-			paymentHash
-		);
-		const onionBuf = encodeOnionPacket(onionPacket);
 
 		// Find outgoing channel to first hop. When the route's first-hop SCID
 		// names one of OUR channels to that peer (e.g. a circular rebalance that
@@ -20034,6 +20030,820 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		}
 
 		return payment;
+	}
+
+	/**
+	 * Issue #2098, step 9: whether an asset HTLC is sent by the path in which
+	 * a payment may go out in parts: the host sets `sendInParts` and the
+	 * build's switch is on. Read for a new HTLC only; whatever follows a send
+	 * reads the payment's record.
+	 */
+	private sendsAssetParts(): boolean {
+		return (
+			this.auxiliaryChannels?.sendInParts === true && auxiliaryPartsSent.enabled
+		);
+	}
+
+	/**
+	 * The engine's keys of an asset payment's record that its caller neither
+	 * sets nor clears: those of a payment sent in parts on every record, and
+	 * the others on a record of a payment sent in parts.
+	 */
+	private static readonly ASSET_PART_KEYS = [
+		'_auxiliaryPartsSent',
+		'_auxiliaryPeer',
+		'_auxiliaryPartsTotalMsat'
+	] as const;
+	private static readonly ASSET_SEND_KEYS = [
+		'_auxiliaryPartAmounts',
+		'_auxiliaryChannelId',
+		'_auxiliaryWireAmountMsat',
+		'_auxiliaryNeverSent',
+		'_auxiliaryAdmissionRejected'
+	] as const;
+
+	/**
+	 * Issue #2098, step 9: a caller's metadata without the keys of an asset
+	 * payment sent in parts, which only the node writes. The caller's object
+	 * itself when it has none of them.
+	 */
+	private static withoutPartKeys(
+		metadata?: Record<string, string>
+	): Record<string, string> | undefined {
+		if (
+			!metadata ||
+			!LightningNode.ASSET_PART_KEYS.some((key) => key in metadata)
+		) {
+			return metadata;
+		}
+		const kept = { ...metadata };
+		for (const key of LightningNode.ASSET_PART_KEYS) delete kept[key];
+		return kept;
+	}
+
+	/**
+	 * Issue #2098, step 9: each HTLC of an asset payment sent in parts, by
+	 * `<channel hex>:offered-<id>` as `_auxiliaryPartAmounts` keys it, with
+	 * what its route asked its first hop to carry, its carrier, the set it
+	 * was sent in, and whether it has failed. Undefined for a record that
+	 * has none, and for one that cannot be read: such a record is handled as
+	 * a payment of one HTLC is.
+	 */
+	private auxiliaryPartsSent(
+		payment?: IPaymentInfo
+	): Record<string, IAuxiliaryPartSent> | undefined {
+		// Only the record of an asset payment this node sent holds its parts:
+		// the key on any other record says nothing.
+		if (
+			!payment ||
+			payment.direction !== PaymentDirection.OUTGOING ||
+			payment.auxiliary !== true
+		) {
+			return undefined;
+		}
+		const raw = payment.metadata?._auxiliaryPartsSent;
+		if (!raw) return undefined;
+		let parsed: unknown;
+		try {
+			parsed = JSON.parse(raw);
+		} catch {
+			return undefined;
+		}
+		if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+			return undefined;
+		}
+		const parts: Record<string, IAuxiliaryPartSent> = {};
+		for (const [key, entry] of Object.entries(parsed)) {
+			if (
+				!/^[0-9a-f]{64}:offered-(0|[1-9][0-9]*)$/.test(key) ||
+				!entry ||
+				typeof entry !== 'object'
+			) {
+				return undefined;
+			}
+			const { route, wire, set, failed } = entry as Record<string, unknown>;
+			if (
+				typeof route !== 'string' ||
+				!/^[1-9][0-9]*$/.test(route) ||
+				BigInt(route) > U64_MAX ||
+				typeof wire !== 'string' ||
+				!/^[1-9][0-9]*$/.test(wire) ||
+				BigInt(wire) > U64_MAX ||
+				typeof set !== 'number' ||
+				!Number.isSafeInteger(set) ||
+				set < 1 ||
+				(failed !== undefined && failed !== true)
+			) {
+				return undefined;
+			}
+			parts[key] = { route, wire, set, ...(failed ? { failed: true } : {}) };
+		}
+		return parts;
+	}
+
+	/** auxiliaryPartAmounts, undefined where it would throw. */
+	private readAuxiliaryPartAmounts(
+		payment?: IPaymentInfo
+	): Record<string, string> | undefined {
+		try {
+			return this.auxiliaryPartAmounts(payment);
+		} catch {
+			return undefined;
+		}
+	}
+
+	/**
+	 * Issue #2098, step 9: what the record of an asset payment sent in parts
+	 * says it carried and was worth, over the parts of its latest set that
+	 * have not failed, or over every part of that set once all have:
+	 * `amountMsat` their carriers, `auxiliaryValueMsat` their values. A
+	 * COMPLETED record keeps the figures it completed with, and is never put
+	 * to this.
+	 */
+	private applyAssetPartsFigures(payment: IPaymentInfo): void {
+		const sent = this.auxiliaryPartsSent(payment);
+		const values = this.readAuxiliaryPartAmounts(payment);
+		if (!sent || !values) return;
+		const entries = Object.entries(sent);
+		if (entries.length === 0) return;
+		const latest = Math.max(...entries.map(([, part]) => part.set));
+		const inSet = entries.filter(([, part]) => part.set === latest);
+		const live = inSet.filter(([, part]) => !part.failed);
+		const counted = live.length > 0 ? live : inSet;
+		let carriers = 0n;
+		let worth = 0n;
+		for (const [key, part] of counted) {
+			carriers += BigInt(part.wire);
+			worth += BigInt(values[key] ?? '0');
+		}
+		payment.amountMsat = carriers;
+		payment.auxiliaryValueMsat = worth;
+	}
+
+	/**
+	 * Issue #2098, step 9: the send of an asset HTLC for a host that sets
+	 * `sendInParts`, with the build's switch on. A payment may go out in
+	 * parts: each part is its own call, over an asset channel of the peer of
+	 * the payment's first HTLC, declaring the payment's total above what
+	 * the part is worth. A call that declares no total, or its own worth, is
+	 * a payment of one HTLC, a set of one.
+	 *
+	 * Every check comes before anything is recorded or sent, in this order:
+	 * the call's own; the record of the hash (not this node's own invoice,
+	 * not given up while a part is still out, not paid); no mixing with
+	 * HTLCs that carry no units; the peer; the total; the values of the
+	 * parts out and this one, at most the total; the node's bound on its
+	 * asset HTLCs; the route; the channel's own check of the carrier; and
+	 * last the gate, given the total and the id the HTLC will take.
+	 *
+	 * The part is then recorded, with its value, its first hop and its
+	 * carrier, in one write with its HTLC mapping, before it is added. The
+	 * record of the payment is kept while a part of it is out, so its parts
+	 * join one record. A part the channel refuses at the add leaves the
+	 * record again and is thrown as ASSET_HTLC_NOT_ADMITTED.
+	 */
+	private sendAssetPaymentPart(
+		route: {
+			hops: Array<{
+				pubkey: Buffer;
+				shortChannelId: Buffer;
+				amountToForwardMsat: bigint;
+				outgoingCltvValue: number;
+				encryptedRecipientData?: Buffer;
+				blindingPoint?: Buffer;
+			}>;
+		},
+		paymentHash: Buffer,
+		finalCltvExpiry: number,
+		paymentSecret: Buffer | undefined,
+		totalMsat: bigint | undefined,
+		metadata: Record<string, string> | undefined,
+		payAll: IPayAllBudget | undefined,
+		paymentMetadata: Buffer | undefined,
+		given: NonNullable<ISendToRouteOptions['assetPayment']>
+	): IPaymentInfo {
+		const hashHex = paymentHash.toString('hex');
+		// The call's own checks, as for any asset payment.
+		if (!Buffer.isBuffer(given.channelId) || given.channelId.length !== 32) {
+			throw new InvalidRequestError('Invalid asset payment channel id');
+		}
+		if (
+			typeof given.wireAmountMsat !== 'bigint' ||
+			given.wireAmountMsat <= 0n ||
+			given.wireAmountMsat > U64_MAX ||
+			!(given.customRecords instanceof Map) ||
+			given.customRecords.size === 0
+		) {
+			throw new AuxiliaryPaymentError(
+				'ASSET_PAYMENT_INVALID',
+				given.channelId,
+				'An asset payment carries custom records and a bitcoin amount above zero'
+			);
+		}
+		if (payAll) {
+			throw new AuxiliaryPaymentError(
+				'ASSET_PAYMENT_UNSUPPORTED',
+				given.channelId,
+				'An asset payment cannot be a pay-all'
+			);
+		}
+		if (this.paymentRetryContexts.has(hashHex)) {
+			throw new AuxiliaryPaymentError(
+				'ASSET_PAYMENT_UNSUPPORTED',
+				given.channelId,
+				'An asset payment cannot join a payment the node retries on its own'
+			);
+		}
+		if (this.persistedPayAllBudget(hashHex)) {
+			throw new LightningPaymentError(
+				LightningErrorCode.PAY_ALL_BUDGET_MISMATCH,
+				'Retry this payment through pay-all with its persisted budget'
+			);
+		}
+		let records: Map<bigint, Buffer>;
+		try {
+			records = copyCustomRecords(given.customRecords)!;
+		} catch (err) {
+			throw new AuxiliaryPaymentError(
+				'ASSET_PAYMENT_INVALID',
+				given.channelId,
+				err instanceof Error ? err.message : String(err)
+			);
+		}
+		const channelId = Buffer.from(given.channelId);
+		const channelHex = channelId.toString('hex');
+		const wireAmountMsat = given.wireAmountMsat;
+		const hops = route.hops;
+		const value = hops[hops.length - 1].amountToForwardMsat;
+		const routeAmountMsat = hops[0].amountToForwardMsat;
+		const total = totalMsat ?? value;
+
+		// The record of the hash.
+		const prior = this.payments.get(hashHex);
+		const view = this.getOutgoingHtlcs(paymentHash);
+		const inFlight = LightningNode.viewHasHtlcInFlight(view);
+		if (prior?.direction === PaymentDirection.INCOMING) {
+			throw new AuxiliaryPaymentError(
+				'ASSET_PAYMENT_UNSUPPORTED',
+				channelId,
+				'An asset payment is not sent to an invoice of this node'
+			);
+		}
+		const priorAsset =
+			prior !== undefined &&
+			(prior.auxiliary === true ||
+				prior.metadata?._auxiliaryChannelId !== undefined);
+		if (priorAsset && prior.status === PaymentStatus.FAILED && inFlight) {
+			throw new AuxiliaryPaymentError(
+				'ASSET_PAYMENT_UNSUPPORTED',
+				channelId,
+				'The asset payment was given up while a part of it is still out: a part may be sent once none is'
+			);
+		}
+		// A paid hash, an unresolved one, or one completed in storage. Asked
+		// without a total: the values are bound below, exactly.
+		this.assertHashUnpaid(paymentHash, 'mpp-part');
+		const values = priorAsset ? this.readAuxiliaryPartAmounts(prior) : {};
+		const sentBefore = priorAsset ? this.auxiliaryPartsSent(prior) ?? {} : {};
+		if (
+			values === undefined ||
+			(priorAsset &&
+				prior.metadata?._auxiliaryPartsSent !== undefined &&
+				this.auxiliaryPartsSent(prior) === undefined)
+		) {
+			throw new AuxiliaryPaymentError(
+				'ASSET_PAYMENT_INVALID',
+				channelId,
+				"The payment's record of its parts cannot be read"
+			);
+		}
+
+		// No mixing: every HTLC of the payment carries units.
+		const ordinaryOut = view.htlcs.some(
+			(entry) =>
+				LightningNode.htlcViewInFlight(entry) &&
+				values[`${entry.channelId.toString('hex')}:offered-${entry.htlcId}`] ===
+					undefined
+		);
+		if (
+			ordinaryOut ||
+			(prior !== undefined &&
+				!priorAsset &&
+				(prior.status === PaymentStatus.PENDING || inFlight))
+		) {
+			throw new AuxiliaryPaymentError(
+				'ASSET_PAYMENT_UNSUPPORTED',
+				channelId,
+				'An asset payment cannot join a payment whose HTLCs carry no units'
+			);
+		}
+
+		// The peer: every HTLC of the payment leaves over an asset channel of
+		// the peer of its first.
+		const peer = this.channelManager.getPeerForChannel(channelId);
+		if (priorAsset) {
+			const first = prior.metadata?._auxiliaryChannelId;
+			const recorded =
+				prior.metadata?._auxiliaryPeer ??
+				(first
+					? this.channelManager.getPeerForChannel(Buffer.from(first, 'hex'))
+					: undefined);
+			if (!recorded || recorded !== peer) {
+				throw new AuxiliaryPaymentError(
+					'ASSET_PAYMENT_ROUTE_REQUIRED',
+					channelId,
+					'Every part of an asset payment leaves over an asset channel of the peer of its first'
+				);
+			}
+		}
+
+		// The total.
+		if (totalMsat !== undefined && totalMsat > value && !paymentSecret) {
+			throw new AuxiliaryPaymentError(
+				'ASSET_PAYMENT_INVALID',
+				channelId,
+				'A part of an asset payment needs the payment secret, which carries its total'
+			);
+		}
+		if (totalMsat !== undefined && totalMsat < value) {
+			throw new AuxiliaryPaymentError(
+				'ASSET_PAYMENT_INVALID',
+				channelId,
+				'The total of an asset payment is below what this HTLC is worth'
+			);
+		}
+		const recordedTotal = priorAsset
+			? prior.metadata?._auxiliaryPartsTotalMsat
+			: undefined;
+		if (
+			inFlight &&
+			(recordedTotal === undefined || recordedTotal !== total.toString())
+		) {
+			throw new AuxiliaryPaymentError(
+				'ASSET_PAYMENT_INVALID',
+				channelId,
+				'A part of an asset payment declares another total than the parts out'
+			);
+		}
+
+		// The values of the parts out and this one, at most the total.
+		const valuesOut = view.htlcs
+			.filter(LightningNode.htlcViewInFlight)
+			.reduce(
+				(sum, entry) =>
+					sum +
+					BigInt(
+						values[
+							`${entry.channelId.toString('hex')}:offered-${entry.htlcId}`
+						] ?? '0'
+					),
+				0n
+			);
+		if (valuesOut + value > total) {
+			throw new AuxiliaryPaymentError(
+				'ASSET_PAYMENT_INVALID',
+				channelId,
+				`The parts out and this one would be worth ${
+					valuesOut + value
+				} msat, more than the total of ${total} msat the payment declares`
+			);
+		}
+
+		// The node's bound on its own asset HTLCs, and the outcomes its host
+		// has not taken.
+		const outChannel = this.channelManager.getChannel(channelId);
+		const state = outChannel?.getFullState();
+		const offeredNow = state
+			? countPendingHtlcs(state, HtlcDirection.OFFERED)
+			: 0;
+		const offeredMost = auxiliaryMaxHtlcs(this.auxiliaryChannels?.maxHtlcs);
+		if (offeredNow >= offeredMost) {
+			throw new AuxiliaryPaymentError(
+				'ASSET_HTLC_LIMIT_REACHED',
+				channelId,
+				`This node has ${offeredNow} asset HTLCs of its own open on the channel and offers no more than ${offeredMost} at once: the payment can be sent once one of them has ended`
+			);
+		}
+		const undelivered = state?.auxiliaryState?.resolvedHtlcs?.size ?? 0;
+		if (undelivered > ChannelManager.AUXILIARY_MAX_UNDELIVERED_OUTCOMES) {
+			throw new AuxiliaryPaymentError(
+				'ASSET_OUTCOMES_UNDELIVERED',
+				channelId,
+				`The channel holds ${undelivered} outcomes of asset HTLCs that its host has not taken (onHtlcResolved), and offers no further asset HTLC until it has`
+			);
+		}
+
+		// The route: it starts at this node's peer, over this asset channel.
+		if (this.prepareSelfIntroSend(route)) {
+			throw new AuxiliaryPaymentError(
+				'ASSET_PAYMENT_UNSUPPORTED',
+				channelId,
+				'An asset payment cannot start a blinded path at this node'
+			);
+		}
+		const firstHopPubkey = hops[0].pubkey.toString('hex');
+		if (!outChannel || !state?.auxiliaryState || peer !== firstHopPubkey) {
+			throw new AuxiliaryPaymentError(
+				'ASSET_PAYMENT_CHANNEL_MISMATCH',
+				channelId,
+				"The asset payment's channel is not an asset channel to the route's first hop"
+			);
+		}
+
+		// The channel's own check of the carrier, before anything is
+		// recorded: the peer's bound on HTLCs and on value in flight, the
+		// reserve and dust.
+		const baseHeight = this.cltvBaseHeight(paymentHash);
+		const cltvExpiry = hops[0].outgoingCltvValue + baseHeight;
+		const refusals = outChannel.validateOutgoingHtlc(
+			wireAmountMsat,
+			cltvExpiry
+		);
+		if (refusals.length > 0) {
+			throw new AuxiliaryPaymentError(
+				'ASSET_HTLC_NOT_ADMITTED',
+				channelId,
+				`The channel does not take the HTLC now: ${refusals
+					.map((action) =>
+						action.type === ChannelActionType.ERROR
+							? (action as IErrorAction).message
+							: action.type
+					)
+					.join('; ')}`
+			);
+		}
+
+		const { onionBuf, sharedSecrets } = this.buildRouteOnion(
+			hops,
+			paymentHash,
+			baseHeight,
+			paymentSecret,
+			totalMsat,
+			paymentMetadata
+		);
+		this.assertWithinCltvCeiling(paymentHash, cltvExpiry);
+		const htlcId = state.localHtlcCounter;
+		if (given.expectedHtlcId !== undefined && given.expectedHtlcId !== htlcId) {
+			throw new AuxiliaryPaymentError(
+				'ASSET_PAYMENT_CIRCUIT_CHANGED',
+				channelId,
+				`The asset payment was prepared for HTLC ${given.expectedHtlcId} and the channel's next is ${htlcId}`
+			);
+		}
+
+		// The part, recorded before it is sent: its value, its first hop, its
+		// carrier and its set, in the payment's record, which it joins while
+		// another part is out and otherwise starts afresh, carrying the
+		// engine's keys forward.
+		const htlcKey = `${channelHex}:offered-${htlcId}`;
+		const joins =
+			priorAsset && prior.status === PaymentStatus.PENDING && inFlight;
+		const sets = Object.values(sentBefore).map((part) => part.set);
+		const latest = sets.length > 0 ? Math.max(...sets) : 0;
+		const sent: Record<string, IAuxiliaryPartSent> = {
+			...sentBefore,
+			[htlcKey]: {
+				route: routeAmountMsat.toString(),
+				wire: wireAmountMsat.toString(),
+				set: joins && latest > 0 ? latest : latest + 1
+			}
+		};
+		const labels: Record<string, string> = {};
+		for (const [key, label] of Object.entries(metadata ?? {})) {
+			if (
+				!(LightningNode.ASSET_PART_KEYS as readonly string[]).includes(key) &&
+				!(LightningNode.ASSET_SEND_KEYS as readonly string[]).includes(key)
+			) {
+				labels[key] = label;
+			}
+		}
+		const carried: Record<string, string> =
+			priorAsset && prior.metadata?._auxiliaryNeverSent
+				? { _auxiliaryNeverSent: prior.metadata._auxiliaryNeverSent }
+				: {};
+		const engineKeys: Record<string, string> = {
+			_auxiliaryChannelId: joins
+				? prior.metadata?._auxiliaryChannelId ?? channelHex
+				: channelHex,
+			_auxiliaryWireAmountMsat: joins
+				? prior.metadata?._auxiliaryWireAmountMsat ?? wireAmountMsat.toString()
+				: wireAmountMsat.toString(),
+			_auxiliaryPartAmounts: JSON.stringify({
+				...values,
+				[htlcKey]: value.toString()
+			}),
+			_auxiliaryPartsSent: JSON.stringify(sent),
+			_auxiliaryPartsTotalMsat: total.toString(),
+			_auxiliaryPeer: peer
+		};
+		// The record as it will stand once the part is written.
+		const candidate: IPaymentInfo = joins
+			? {
+					...prior,
+					metadata: { ...prior.metadata, ...labels, ...engineKeys }
+			  }
+			: {
+					paymentHash,
+					amountMsat: wireAmountMsat,
+					status: PaymentStatus.PENDING,
+					direction: PaymentDirection.OUTGOING,
+					cltvBaseHeight: baseHeight,
+					route: route as IPaymentInfo['route'],
+					sharedSecrets,
+					createdAt: Date.now(),
+					metadata: { ...labels, ...carried, ...engineKeys }
+			  };
+		if (candidate.metadata) {
+			delete candidate.metadata._auxiliaryAdmissionRejected;
+		}
+		candidate.auxiliary = true;
+		this.applyAssetPartsFigures(candidate);
+		if (
+			!this.paymentMetadataFits(
+				candidate.metadata!,
+				[
+					{
+						type: 'payment_state',
+						paymentHash: hashHex,
+						payment: candidate
+					},
+					{ type: 'htlc_payment_mapping', htlcKey, paymentHash: hashHex }
+				],
+				[this.settledPaymentMutation(candidate)]
+			)
+		) {
+			throw new InvalidRequestError(
+				'payment metadata is too large for the recovery guardians to accept'
+			);
+		}
+
+		// The gate, last: what it lets through is sent unless the channel
+		// refuses it at the add.
+		const gate = this.auxiliaryPaymentGate;
+		if (gate) {
+			let refusal: ReturnType<AuxiliaryPaymentGate>;
+			try {
+				refusal = gate({
+					paymentHash: Buffer.from(paymentHash),
+					channelId: Buffer.from(channelId),
+					amountMsat: value,
+					wireAmountMsat,
+					routeAmountMsat,
+					totalMsat: total,
+					htlcId
+				});
+			} catch (err) {
+				// A gate that cannot answer has not let the payment through.
+				refusal = err instanceof Error ? err.message : String(err);
+			}
+			if (refusal !== undefined) {
+				const said =
+					typeof refusal === 'object' && refusal !== null
+						? refusal
+						: { message: String(refusal), reason: undefined };
+				throw new AuxiliaryPaymentError(
+					'ASSET_PAYMENT_REFUSED',
+					channelId,
+					String(said.message ?? '') || 'The asset payment was refused',
+					typeof said.reason === 'string' ? said.reason : undefined
+				);
+			}
+		}
+
+		// A joining part's fields go into the record its earlier parts' sends
+		// returned, so that the object a caller holds stays the node's own.
+		const saved = joins
+			? {
+					metadata: prior.metadata,
+					amountMsat: prior.amountMsat,
+					auxiliaryValueMsat: prior.auxiliaryValueMsat,
+					auxiliary: prior.auxiliary
+			  }
+			: undefined;
+		const payment: IPaymentInfo = joins
+			? Object.assign(prior, {
+					metadata: candidate.metadata,
+					amountMsat: candidate.amountMsat,
+					auxiliaryValueMsat: candidate.auxiliaryValueMsat,
+					auxiliary: true as const
+			  })
+			: candidate;
+		this.payments.set(hashHex, payment);
+		this.htlcPaymentMap.set(htlcKey, hashHex);
+		const recorded = this.commitMutations(
+			'persist asset payment part + HTLC mapping',
+			[
+				{ type: 'payment_state', paymentHash: hashHex, payment },
+				{ type: 'htlc_payment_mapping', htlcKey, paymentHash: hashHex }
+			],
+			RecoveryCriticality.SafetyCritical
+		);
+		if (!recorded) {
+			this.htlcPaymentMap.delete(htlcKey);
+			if (saved && prior) {
+				prior.metadata = saved.metadata;
+				prior.amountMsat = saved.amountMsat;
+				if (saved.auxiliaryValueMsat === undefined) {
+					delete prior.auxiliaryValueMsat;
+				} else {
+					prior.auxiliaryValueMsat = saved.auxiliaryValueMsat;
+				}
+				if (saved.auxiliary === undefined) delete prior.auxiliary;
+				else prior.auxiliary = saved.auxiliary;
+			}
+			if (prior) this.payments.set(hashHex, prior);
+			else this.payments.delete(hashHex);
+			throw new AuxiliaryPaymentError(
+				'ASSET_PAYMENT_NOT_RECORDED',
+				channelId,
+				'Could not persist the asset payment and its HTLC mapping; nothing was sent'
+			);
+		}
+		// Its own route and secrets, for its failure. Before the add, since a
+		// fulfil or a failure can run inside it.
+		this.assetPartSends.set(htlcKey, {
+			route: route as IPaymentInfo['route'],
+			sharedSecrets
+		});
+
+		const result = this.channelManager.addHtlc(
+			channelId,
+			wireAmountMsat,
+			paymentHash,
+			cltvExpiry,
+			onionBuf,
+			undefined,
+			undefined,
+			{ customRecords: records, expectedHtlcId: htlcId }
+		);
+		if (!result.ok && result.admissionRejected) {
+			this.refuseAssetPart(paymentHash, channelId, htlcKey, result.error);
+		}
+		// An add that went through writes nothing more: the part is out, and
+		// whatever ended it inside the add has written its own end.
+		return payment;
+	}
+
+	/**
+	 * Issue #2098, step 9: a part the channel refused at its add, after it
+	 * was recorded (its provider's own checks). Nothing of it entered the
+	 * channel. It leaves the record with its mapping in one write; the record
+	 * fails when no other part of the payment is out, with payment:failed,
+	 * and the send throws ASSET_HTLC_NOT_ADMITTED.
+	 */
+	private refuseAssetPart(
+		paymentHash: Buffer,
+		channelId: Buffer,
+		htlcKey: string,
+		reason: string | undefined
+	): never {
+		const hashHex = paymentHash.toString('hex');
+		this.assetPartSends.delete(htlcKey);
+		this.htlcPaymentMap.delete(htlcKey);
+		const mutations: RecoveryMutation[] = [
+			{ type: 'delete_htlc_payment_mapping', htlcKey }
+		];
+		const payment = this.payments.get(hashHex);
+		let failed = false;
+		if (payment && payment.direction === PaymentDirection.OUTGOING) {
+			// The part never entered its channel, so no record lists it,
+			// whatever became of the payment meanwhile.
+			const sent = this.auxiliaryPartsSent(payment) ?? {};
+			const values = this.readAuxiliaryPartAmounts(payment) ?? {};
+			const refused = sent[htlcKey];
+			const refusedValue = values[htlcKey];
+			delete sent[htlcKey];
+			delete values[htlcKey];
+			const metadata: Record<string, string> = { ...payment.metadata };
+			metadata._auxiliaryPartsSent = JSON.stringify(sent);
+			if (Object.keys(values).length > 0) {
+				metadata._auxiliaryPartAmounts = JSON.stringify(values);
+			} else {
+				delete metadata._auxiliaryPartAmounts;
+			}
+			payment.metadata = metadata;
+			if (payment.status === PaymentStatus.PENDING) {
+				const setLeft =
+					refused !== undefined &&
+					Object.values(sent).some((part) => part.set === refused.set);
+				if (setLeft) {
+					this.applyAssetPartsFigures(payment);
+				} else if (refused) {
+					// The set was this part alone: the record says what it tried.
+					payment.amountMsat = BigInt(refused.wire);
+					if (refusedValue) payment.auxiliaryValueMsat = BigInt(refusedValue);
+				}
+				if (!this.hasHtlcInFlight(paymentHash)) {
+					payment.status = PaymentStatus.FAILED;
+					payment.completedAt = Date.now();
+					payment.failureReason = boundedFailureReason(
+						reason ?? 'Local failure: could not add HTLC to the channel'
+					);
+					failed = true;
+				}
+			}
+			mutations.push({ type: 'payment_state', paymentHash: hashHex, payment });
+		}
+		this.commitMutations('release a refused asset part', mutations);
+		if (failed && payment) this.emit('payment:failed', payment);
+		throw new AuxiliaryPaymentError(
+			'ASSET_HTLC_NOT_ADMITTED',
+			channelId,
+			`The channel did not take the HTLC: ${
+				reason ?? 'refused'
+			}. Nothing of it was sent`
+		);
+	}
+
+	/**
+	 * The onion of a route, and the shared secrets its failures decrypt
+	 * with. Route CLTV values are relative deltas; `baseHeight` makes them
+	 * absolute. A route whose payloads do not fit the onion is refused with
+	 * NO_ROUTE (assertOnionFits) before anything else happens.
+	 */
+	private buildRouteOnion(
+		hops: Array<{
+			pubkey: Buffer;
+			shortChannelId: Buffer;
+			amountToForwardMsat: bigint;
+			outgoingCltvValue: number;
+			encryptedRecipientData?: Buffer;
+			blindingPoint?: Buffer;
+		}>,
+		paymentHash: Buffer,
+		baseHeight: number,
+		paymentSecret?: Buffer,
+		totalMsat?: bigint,
+		paymentMetadata?: Buffer
+	): { onionBuf: Buffer; sharedSecrets: Buffer[] } {
+		// Convert route hops to onion hop payloads.
+		// For intermediate hops: the payload tells the hop what to FORWARD (next hop's
+		// amount/cltv), and which channel to use (next hop's SCID).
+		// For the final hop: the payload contains the payment amount/cltv directly.
+		const onionHops: { pubkey: Buffer; payload: IHopPayload }[] = hops.map(
+			(hop, idx) => {
+				const isFinal = idx === hops.length - 1;
+				const payload: IHopPayload = isFinal
+					? {
+							amountToForwardMsat: hop.amountToForwardMsat,
+							outgoingCltvValue: hop.outgoingCltvValue + baseHeight
+					  }
+					: {
+							amountToForwardMsat: hops[idx + 1].amountToForwardMsat,
+							outgoingCltvValue: hops[idx + 1].outgoingCltvValue + baseHeight,
+							shortChannelId: hops[idx + 1].shortChannelId
+					  };
+				if (isFinal && paymentSecret) {
+					payload.paymentSecret = paymentSecret;
+					payload.totalMsat = totalMsat ?? hop.amountToForwardMsat;
+					if (paymentMetadata) payload.paymentMetadata = paymentMetadata;
+				}
+				// Route blinding (BOLT 4): the introduction node and each blinded
+				// hop read their own encrypted_recipient_data (TLV 10) to learn the
+				// real next node/scid; the introduction node also receives the
+				// blinding_point (TLV 12). These belong to THIS hop, not the next.
+				if (hop.encryptedRecipientData) {
+					payload.encryptedRecipientData = hop.encryptedRecipientData;
+					// BOLT 4: a blinded hop MUST NOT carry a cleartext short_channel_id:
+					// its onward channel lives in encrypted_recipient_data. Leaving a
+					// (zero) SCID makes LND reject the payload as invalid_onion_blinding.
+					delete payload.shortChannelId;
+					// A blinded INTERMEDIATE hop also omits amt_to_forward/outgoing_cltv
+					// (derived from encrypted payment_relay). The final hop keeps them
+					// and MUST carry total_amount_msat (TLV 18), since the blinded path's
+					// path_id authenticates the payment there, not payment_data, and
+					// CLN fails a blinded final payload without it as
+					// invalid_onion_payload.
+					if (!isFinal) {
+						payload.omitForwardAmounts = true;
+					} else {
+						payload.totalAmountMsat = totalMsat ?? hop.amountToForwardMsat;
+					}
+				}
+				if (hop.blindingPoint) {
+					payload.blindingPoint = hop.blindingPoint;
+				}
+				return { pubkey: hop.pubkey, payload };
+			}
+		);
+		this.assertOnionFits(
+			onionHops.map((h) => h.payload),
+			paymentMetadata
+		);
+
+		// Generate session key and compute shared secrets for failure decryption
+		const sessionKey = randomBytes(32);
+		const hopPubkeys = hops.map((h) => h.pubkey);
+		const { sharedSecrets } = computeSharedSecrets(sessionKey, hopPubkeys);
+
+		// Construct and encode onion packet
+		const onionPacket = constructOnionPacket(
+			sessionKey,
+			onionHops,
+			paymentHash
+		);
+		const onionBuf = encodeOnionPacket(onionPacket);
+		return { onionBuf, sharedSecrets };
 	}
 
 	/**
@@ -20770,7 +21580,9 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			status: PaymentStatus.PENDING,
 			direction: PaymentDirection.OUTGOING,
 			createdAt: Date.now(),
-			...(metadata && { metadata: { ...metadata } })
+			...(metadata && {
+				metadata: { ...LightningNode.withoutPartKeys(metadata) }
+			})
 		};
 		// Dispatch gives the row a part's route and secrets, and settlement
 		// adds the preimage and invoice. The row has to fit a frame with any
@@ -33185,7 +33997,18 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			// neither sets nor clears it. Nor _auxiliaryReceivedParts (issue
 			// #2098, step 8), the record of a committed asset set's parts,
 			// from which every part is claimed and each loss counted once.
-			for (const key of ['_keysend', '_auxiliaryReceivedParts']) {
+			// Nor the keys of an asset payment sent in parts (step 9), from
+			// which its parts are ended and its spending counted; and on the
+			// record of such a payment, nor the keys of its asset HTLCs.
+			const kept: string[] = [
+				'_keysend',
+				'_auxiliaryReceivedParts',
+				...LightningNode.ASSET_PART_KEYS
+			];
+			if (existing.metadata?._auxiliaryPartsSent !== undefined) {
+				kept.push(...LightningNode.ASSET_SEND_KEYS);
+			}
+			for (const key of kept) {
 				if (existing.metadata?.[key] !== undefined) {
 					merged[key] = existing.metadata[key];
 				} else {
@@ -34190,9 +35013,11 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	getAuxiliaryPaymentHtlcs(paymentHash: Buffer): IAuxiliaryPaymentHtlc[] {
 		const payment = this.payments.get(paymentHash.toString('hex'));
 		if (!payment || payment.direction !== PaymentDirection.OUTGOING) return [];
+		const sent = this.auxiliaryPartsSent(payment);
 		return Object.entries(this.auxiliaryPartAmounts(payment)).map(
 			([key, amount]) => {
 				const [channelHex, htlcKey] = key.split(':');
+				const part = sent?.[key];
 				const channelId = Buffer.from(channelHex, 'hex');
 				const entry = this.channelManager
 					.getChannel(channelId)
@@ -34209,6 +35034,13 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 					channelId,
 					htlcId: BigInt(htlcKey.slice('offered-'.length)),
 					amountMsat: BigInt(amount),
+					...(part
+						? {
+								routeAmountMsat: BigInt(part.route),
+								wireAmountMsat: BigInt(part.wire),
+								...(part.failed ? { failed: true as const } : {})
+						  }
+						: {}),
 					...(live ? { htlc: LightningNode.auxiliaryHtlcView(live) } : {})
 				};
 			}
