@@ -119,6 +119,20 @@ export interface IAuxiliaryPaymentHtlc {
 	htlcId: bigint;
 	/** What the HTLC is worth to the payment, as the route carries it. */
 	amountMsat: bigint;
+	/**
+	 * Issue #2098, step 9: for an HTLC sent by a host that sets
+	 * `sendInParts`, what its route asked its first hop to carry (its worth
+	 * and every routing fee) and the bitcoin it carried on the wire, as
+	 * recorded before it was sent. Absent for an HTLC sent otherwise.
+	 */
+	routeAmountMsat?: bigint;
+	wireAmountMsat?: bigint;
+	/**
+	 * Issue #2098, step 9: present, and true, once an HTLC sent by a host
+	 * that sets `sendInParts` has ended without paying: failed back, refused
+	 * on the chain, or taken back there by this node.
+	 */
+	failed?: true;
 	/** The HTLC as its channel holds it, while it is in flight there. */
 	htlc?: IAuxiliaryChannelHtlc;
 }
@@ -254,6 +268,19 @@ export interface IAuxiliaryChannelConfig {
 	 * paid in parts" in docs/EXTENSIONS.md.
 	 */
 	receiveInParts?: boolean;
+	/**
+	 * Issue #2098, step 9: this node may send an asset payment in parts.
+	 * The host splits it and sends each part by its own
+	 * `sendPaymentToRoute` with `assetPayment`, every part over an asset
+	 * channel of one peer and declaring the payment's total. Each part is
+	 * recorded before it is sent, with its value, its first hop and its
+	 * carrier, and counts toward its channel's bound on HTLCs; the payment's
+	 * record is kept across its parts and ends when they do. Only `true`
+	 * turns it on. Left out, a part is refused as before, and every attempt
+	 * names the one channel of the first. See "An asset payment sent in
+	 * parts" in docs/EXTENSIONS.md.
+	 */
+	sendInParts?: boolean;
 	provider: IChannelAuxiliaryProvider;
 	/**
 	 * Asked, before the node settles it and outside any storage

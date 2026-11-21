@@ -1031,7 +1031,7 @@ function chain.signP2wpkhInput(tx: bitcoinjs-lib#Transaction, inputIndex: number
 function chain.signSweepInput(tx: bitcoinjs-lib#Transaction, inputIndex: number, witnessScript: Buffer, value: number, privateKey: Buffer, sighashType?: number): Buffer
 function chain.sweepVbytes(witness: readonly Buffer[], destinationScript: Buffer): number
 namespace channel
-const channel.AUXILIARY_CHANNELS_API: Readonly<{ version: 1; surfaces: readonly [ "valueIncomingHtlc:three-outcome", "sendPaymentToRoute:assetPayment", "getAuxiliaryPaymentHtlcs", "onHtlcResolved:htlcId", "queryAuxiliaryRoute", "fundAuxiliaryChannel:unsigned", "onFundingSigned", "abandonAuxiliaryOpen", "IChannelInfo.auxiliary", "setAuxiliaryPaymentGate", "getChannelMonitorState", "IPaymentInfo.auxiliary", "IPaymentInfo.auxiliaryValueMsat", "IInvoiceInfo.auxiliary", "IAuxiliaryChannelInfo.undeliveredOutcomes", "onHtlcResolved:never-sent", "getFixedOutputFeeStatus", "IPaymentInfo.unresolved", "IHoldInvoiceStateEvent.auxiliary", "prepareForward", "getFixedOutputFeeStatus:splitCoins", "getFixedOutputFeeStatus:reserve", "requireFeeCoinsToSettle", "onForwardLegResolved:quote", "IForwardingEvent.auxiliary", "setAuxiliaryForwardGate", "receiveInParts" ]; declared: readonly [ ]; }>
+const channel.AUXILIARY_CHANNELS_API: Readonly<{ version: 1; surfaces: readonly [ "valueIncomingHtlc:three-outcome", "sendPaymentToRoute:assetPayment", "getAuxiliaryPaymentHtlcs", "onHtlcResolved:htlcId", "queryAuxiliaryRoute", "fundAuxiliaryChannel:unsigned", "onFundingSigned", "abandonAuxiliaryOpen", "IChannelInfo.auxiliary", "setAuxiliaryPaymentGate", "getChannelMonitorState", "IPaymentInfo.auxiliary", "IPaymentInfo.auxiliaryValueMsat", "IInvoiceInfo.auxiliary", "IAuxiliaryChannelInfo.undeliveredOutcomes", "onHtlcResolved:never-sent", "getFixedOutputFeeStatus", "IPaymentInfo.unresolved", "IHoldInvoiceStateEvent.auxiliary", "prepareForward", "getFixedOutputFeeStatus:splitCoins", "getFixedOutputFeeStatus:reserve", "requireFeeCoinsToSettle", "onForwardLegResolved:quote", "IForwardingEvent.auxiliary", "setAuxiliaryForwardGate", "receiveInParts", "sendInParts" ]; declared: readonly [ ]; }>
 const channel.AUXILIARY_CHANNEL_DUST_LIMIT = 354n
 const channel.AUXILIARY_CLOSE_ASSET_OUTPUT_MINIMUM = 330n
 class channel.AuxiliaryChannelUnsupportedError extends beignet#CodedError<'ASSET_CHANNEL_UNSUPPORTED'>
@@ -1729,6 +1729,7 @@ property channel.IAuxiliaryChannelConfig.provider: channel.IChannelAuxiliaryProv
 property channel.IAuxiliaryChannelConfig.receiveInParts?: boolean
 property channel.IAuxiliaryChannelConfig.requireFeeCoinsToSettle?: boolean
 method channel.IAuxiliaryChannelConfig.resolveIncoming(peerPubkey: string, temporaryChannelId: Buffer): channel.IAuxiliaryFundingDescriptor | undefined
+property channel.IAuxiliaryChannelConfig.sendInParts?: boolean
 method channel.IAuxiliaryChannelConfig.valueIncomingHtlc?(context: channel.IAuxiliaryIncomingHtlc): bigint | undefined
 interface channel.IAuxiliaryChannelHtlc
 property channel.IAuxiliaryChannelHtlc.auxiliaryAmount?: bigint
@@ -1894,8 +1895,11 @@ property channel.IAuxiliaryPayment.wireAmountMsat: bigint
 interface channel.IAuxiliaryPaymentHtlc
 property channel.IAuxiliaryPaymentHtlc.amountMsat: bigint
 property channel.IAuxiliaryPaymentHtlc.channelId: Buffer
+property channel.IAuxiliaryPaymentHtlc.failed?: true
 property channel.IAuxiliaryPaymentHtlc.htlc?: channel.IAuxiliaryChannelHtlc
 property channel.IAuxiliaryPaymentHtlc.htlcId: bigint
+property channel.IAuxiliaryPaymentHtlc.routeAmountMsat?: bigint
+property channel.IAuxiliaryPaymentHtlc.wireAmountMsat?: bigint
 interface channel.IAuxiliaryRestoredChannel
 property channel.IAuxiliaryRestoredChannel.channelData?: Buffer
 property channel.IAuxiliaryRestoredChannel.channelId: Buffer
@@ -5665,8 +5669,8 @@ class node.AuxiliaryPaymentError extends beignet#CodedError<node.AuxiliaryPaymen
 constructor node.AuxiliaryPaymentError(code: node.AuxiliaryPaymentErrorCode, channelId: Buffer | string, message: string, reason?: string)
 readonly property node.AuxiliaryPaymentError.channelId: string
 readonly property node.AuxiliaryPaymentError.reason?: string
-type node.AuxiliaryPaymentErrorCode = 'ASSET_PAYMENT_INVALID' | 'ASSET_PAYMENT_CHANNEL_MISMATCH' | 'ASSET_PAYMENT_ROUTE_REQUIRED' | 'ASSET_PAYMENT_UNSUPPORTED' | 'ASSET_PAYMENT_CIRCUIT_CHANGED' | 'ASSET_PAYMENT_NOT_RECORDED' | 'ASSET_CHANNEL_NEEDS_ASSET_PAYMENT' | 'ASSET_PAYMENT_REFUSED' | 'ASSET_OUTCOMES_UNDELIVERED' | 'ASSET_HTLC_LIMIT_REACHED'
-type node.AuxiliaryPaymentGate = (payment: { paymentHash: Buffer; channelId: Buffer; amountMsat: bigint; wireAmountMsat: bigint; routeAmountMsat: bigint; }) => string | node.IAuxiliaryPaymentRefusal | undefined
+type node.AuxiliaryPaymentErrorCode = 'ASSET_PAYMENT_INVALID' | 'ASSET_PAYMENT_CHANNEL_MISMATCH' | 'ASSET_PAYMENT_ROUTE_REQUIRED' | 'ASSET_PAYMENT_UNSUPPORTED' | 'ASSET_PAYMENT_CIRCUIT_CHANGED' | 'ASSET_PAYMENT_NOT_RECORDED' | 'ASSET_CHANNEL_NEEDS_ASSET_PAYMENT' | 'ASSET_PAYMENT_REFUSED' | 'ASSET_OUTCOMES_UNDELIVERED' | 'ASSET_HTLC_LIMIT_REACHED' | 'ASSET_HTLC_NOT_ADMITTED'
+type node.AuxiliaryPaymentGate = (payment: { paymentHash: Buffer; channelId: Buffer; amountMsat: bigint; wireAmountMsat: bigint; routeAmountMsat: bigint; totalMsat?: bigint; htlcId?: bigint; }) => string | node.IAuxiliaryPaymentRefusal | undefined
 class node.AuxiliaryProviderRequiredError extends beignet#CodedError<'AUXILIARY_PROVIDER_REQUIRED'>
 constructor node.AuxiliaryProviderRequiredError(channelIds: readonly string[])
 readonly property node.AuxiliaryProviderRequiredError.channelIds: readonly string[]
