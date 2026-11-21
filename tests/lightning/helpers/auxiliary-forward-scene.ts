@@ -13,7 +13,11 @@ import type {
 	IAuxiliaryForwardRequest,
 	IAuxiliaryForwardTerms
 } from '../../../src/lightning/channel/auxiliary-forward';
-import type { IAuxiliaryChannelConfig } from '../../../src/lightning/channel/auxiliary-funding';
+import type {
+	IAuxiliaryChannelConfig,
+	IAuxiliaryIncomingHtlc
+} from '../../../src/lightning/channel/auxiliary-funding';
+import { RECEIVE_IN_PARTS } from './auxiliary-nodes';
 import {
 	FORWARD_CARRIER_MSAT,
 	forwardHeld,
@@ -274,3 +278,213 @@ export async function cancelAtCarol(s: IScene): Promise<void> {
 /** The ends Bob's host was told, as `leg:outcome`, sorted. */
 export const legEnds = (s: IScene): string[] =>
 	s.told.map((end) => `${end.leg}:${end.outcome}`).sort();
+
+/*
+ * An asset invoice paid in parts (issue #2098, step 8): Alice pays an
+ * ordinary invoice of Carol's in bitcoin, one part at a time, and Bob's
+ * host makes each part an asset HTLC to Carol, its units for what the onion
+ * asks Bob to forward. Carol's host values each part against the parts it
+ * already accepted.
+ */
+
+/** The custom record that names the quote a part's units were priced under. */
+export const QUOTE_RECORD = 65538n;
+
+/** A quote of Bob's host: its id, and what one unit is worth under it. */
+export interface IPartQuote {
+	id: number;
+	msatPerUnit: bigint;
+}
+export const ONE_QUOTE: IPartQuote = { id: 1, msatPerUnit: MSAT_PER_UNIT };
+
+/** The records of an asset part: its units and the quote they were priced under. */
+export function partRecords(
+	units: bigint,
+	quote: IPartQuote = ONE_QUOTE
+): Map<bigint, Buffer> {
+	const records = amountRecord(units);
+	records.set(QUOTE_RECORD, Buffer.from([quote.id]));
+	return records;
+}
+
+/** The quote a part's records name, of `quotes`; the first when they name none. */
+export function quoteOfRecords(
+	records: ReadonlyMap<bigint, Buffer>,
+	quotes: IPartQuote[] = [ONE_QUOTE]
+): IPartQuote {
+	const id = records.get(QUOTE_RECORD)?.[0];
+	return quotes.find((quote) => quote.id === id) ?? quotes[0];
+}
+
+/**
+ * Bob's answer for a part: the units for what the onion asks him to
+ * forward, at the rate of the part's quote, rounded down as a host rounds.
+ */
+export function partsAnswer(
+	quoteOf: (request: IAuxiliaryForwardRequest) => IPartQuote = () => ONE_QUOTE
+): NonNullable<ISceneOptions['answer']> {
+	return (request, terms) => {
+		const quote = quoteOf(request);
+		return {
+			...terms,
+			outgoingHtlc: {
+				customRecords: partRecords(
+					request.amountToForwardMsat / quote.msatPerUnit,
+					quote
+				),
+				wireAmountMsat: FORWARD_CARRIER_MSAT
+			}
+		};
+	};
+}
+
+/**
+ * Carol's host valuing a part as a library's core does: the credits of the
+ * parts it already accepted (acceptedHtlcs) are summed, this part is worth
+ * its units at its quote's rate, and when the set then falls short of the
+ * invoice by less than one unit per part, this part is topped up so that
+ * the set reaches the invoice exactly. A plain HTLC is not the host's.
+ */
+export function setValuer(
+	options: { topUp?: boolean; quotes?: IPartQuote[] } = {}
+): (context: IAuxiliaryIncomingHtlc) => bigint | undefined {
+	return (context) => {
+		if (context.auxiliaryAmount === undefined) return undefined;
+		const quote = quoteOfRecords(context.customRecords, options.quotes);
+		const own = context.auxiliaryAmount * quote.msatPerUnit;
+		if (options.topUp === false) return own;
+		const invoiceMsat = context.invoice?.amountMsat ?? 0n;
+		const before = context.acceptedHtlcs.reduce(
+			(sum, part) => sum + part.amountMsat,
+			0n
+		);
+		const short = invoiceMsat - before - own;
+		const parts = BigInt(context.acceptedHtlcs.length + 1);
+		return short > 0n && short < parts * quote.msatPerUnit ? own + short : own;
+	};
+}
+
+export interface IPartsScene {
+	w: IForwardWorld;
+	shape: Shape;
+	/** What Bob's host was asked about each forward, and told of each leg's end. */
+	asked: IAuxiliaryForwardRequest[];
+	told: IAuxiliaryForwardLegResolution[];
+	/** Bob's structured logs and forward events. */
+	logs: IScene['logs'];
+	forwarded: IScene['forwarded'];
+	refused: IScene['refused'];
+	/** Each time Carol's host was asked to value an HTLC: what it was given. */
+	carolAsks: IAuxiliaryIncomingHtlc[];
+	/** Carol's structured logs, and her payment:received and invoice:settled events. */
+	carolLogs: IScene['logs'];
+	received: Array<{ paymentHash: Buffer }>;
+	settled: Array<Record<string, unknown>>;
+	/** Carol's hooks as she was opened with them, for a restart. */
+	carolHooks: Partial<IAuxiliaryChannelConfig>;
+}
+
+export interface IPartsSceneOptions {
+	/** Carol's host opts in with receiveInParts: true, unless false. */
+	optIn?: boolean;
+	/** Carol's host tops the part that completes a set up, unless false. */
+	topUp?: boolean;
+	quotes?: IPartQuote[];
+	/** The quote Bob's host prices a part under; the first unless said. */
+	quoteOf?: (request: IAuxiliaryForwardRequest) => IPartQuote;
+	/** Runs each time Carol's host is asked, before it answers. */
+	onCarolAsk?: (context: IAuxiliaryIncomingHtlc, s: IPartsScene) => void;
+	carol?: Partial<IAuxiliaryChannelConfig>;
+	bob?: Partial<IAuxiliaryChannelConfig>;
+	world?: Partial<IForwardWorldOptions>;
+	/** The fee coins each host's wallet is given; 2 unless said. */
+	coins?: number;
+	/** The fee coins Carol's wallet is given, in place of `coins`. */
+	carolCoins?: number;
+	/** The blocks mined once the wallets are funded; 1 unless said. */
+	blocks?: number;
+}
+
+/** Carol's logs and events, kept on the scene; again after a restart. */
+export function listenCarol(s: IPartsScene): void {
+	const carol = s.w.hosts.carol.node;
+	carol.on(
+		'log',
+		(log: {
+			category: string;
+			action: string;
+			data: Record<string, unknown>;
+		}) => {
+			s.carolLogs.push(log);
+		}
+	);
+	carol.on('payment:received', (payment: { paymentHash: Buffer }) => {
+		s.received.push(payment);
+	});
+	carol.on('invoice:settled', (event: Record<string, unknown>) => {
+		s.settled.push(event);
+	});
+}
+
+/**
+ * Open the world for bitcoin in, asset out, ready for Alice to pay Carol
+ * in parts (payInParts). Carol's host opts in unless said.
+ */
+export async function openPartsScene(
+	world: {
+		open(tag: string, options: IForwardWorldOptions): Promise<IForwardWorld>;
+		mine(world: IForwardWorld, blocks: number): Promise<void>;
+	},
+	tag: string,
+	options: IPartsSceneOptions = {}
+): Promise<IPartsScene> {
+	const s = {
+		shape: ['ordinary', 'asset'],
+		asked: [],
+		told: [],
+		logs: [],
+		forwarded: [],
+		refused: [],
+		carolAsks: [],
+		carolLogs: [],
+		received: [],
+		settled: []
+	} as unknown as IPartsScene;
+	const value = setValuer({ topUp: options.topUp, quotes: options.quotes });
+	s.carolHooks = {
+		valueIncomingHtlc: (context): bigint | undefined => {
+			s.carolAsks.push({
+				...context,
+				acceptedHtlcs: context.acceptedHtlcs.map((part) => ({ ...part }))
+			});
+			options.onCarolAsk?.(context, s);
+			return value(context);
+		},
+		...(options.optIn === false ? {} : RECEIVE_IN_PARTS),
+		...options.carol
+	};
+	const w = await world.open(tag, {
+		kinds: { in: 'ordinary', out: 'asset' },
+		feeWallet: { alice: true, bob: true, carol: true },
+		...options.world,
+		hooks: {
+			bob: bobHooks(s, {
+				answer: partsAnswer(options.quoteOf),
+				...(options.bob ? { bob: options.bob } : {})
+			}),
+			carol: s.carolHooks
+		}
+	});
+	s.w = w;
+	for (const name of ['alice', 'bob', 'carol'] as const) {
+		const coins =
+			name === 'carol'
+				? options.carolCoins ?? options.coins ?? 2
+				: options.coins ?? 2;
+		for (let i = 0; i < coins; i++) w.wallets[name]!.fund(100_000);
+	}
+	await world.mine(w, options.blocks ?? 1);
+	listenBob(s as unknown as IScene);
+	listenCarol(s);
+	return s;
+}

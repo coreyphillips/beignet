@@ -26,6 +26,11 @@ export interface IAuxiliaryRoundUpdate {
 	pendingFeeratePerKw?: number;
 	/** An HTLC added, or an existing one as the update leaves it. */
 	htlc?: { key: string; entry: IHtlcEntry };
+	/**
+	 * Several existing HTLCs as one round leaves them (issue #2098, step 8:
+	 * the parts of an asset set fulfilled together), after `htlc`.
+	 */
+	htlcs?: ReadonlyArray<{ key: string; entry: IHtlcEntry }>;
 	/** The asset balances after the update, where it moves them. */
 	auxiliaryBalances?: { local: bigint; remote: bigint };
 }
@@ -53,9 +58,12 @@ export function auxiliaryRoundRefusal(
 		candidate.pendingFeerateSignable = false;
 		candidate.pendingFeerateCommitted = false;
 	}
-	if (update.htlc) {
+	if (update.htlc || update.htlcs?.length) {
 		candidate.htlcs = new Map(state.htlcs);
-		candidate.htlcs.set(update.htlc.key, update.htlc.entry);
+		if (update.htlc) candidate.htlcs.set(update.htlc.key, update.htlc.entry);
+		for (const htlc of update.htlcs ?? []) {
+			candidate.htlcs.set(htlc.key, htlc.entry);
+		}
 	}
 	if (update.auxiliaryBalances) {
 		candidate.auxiliaryState = {

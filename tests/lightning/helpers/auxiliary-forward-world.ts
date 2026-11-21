@@ -20,12 +20,19 @@ import type {
 	IAuxiliaryFundingDescriptor
 } from '../../../src/lightning/channel/auxiliary-funding';
 import { ChannelState } from '../../../src/lightning/channel/types';
-import { PaymentStatus } from '../../../src/lightning/node/types';
+import {
+	PaymentStatus,
+	type INodeConfig
+} from '../../../src/lightning/node/types';
 import { createTaprootFundingScript } from '../../../src/lightning/script/funding-taproot';
 import type { IFixedOutputFeePolicy } from '../../../src/lightning/wallet/fixed-output-fees';
 import { TestChain, TestChainBackend } from './auxiliary-chain';
 import { chainWallet, type IChainWallet } from './auxiliary-fee-wallet';
-import { assetHost, type IAssetHost } from './auxiliary-nodes';
+import {
+	assetHost,
+	type IAssetHost,
+	type IEngineBuild
+} from './auxiliary-nodes';
 import {
 	SWEEP_DESTINATION,
 	errorsOf,
@@ -60,10 +67,14 @@ export interface IForwardWorld {
 	wallets: Partial<Record<ForwardHostName, IChainWallet>>;
 	/** Bob's database file, from which a restart starts him again. */
 	bobPath: string;
+	/** Carol's database file, when she was opened with `carolOnFile`. */
+	carolPath?: string;
 	/** Alice's channel with Bob: the incoming side of a forward. */
 	inChannel: Buffer;
 	/** Bob's channel with Carol: the outgoing side of a forward. */
 	outChannel: Buffer;
+	/** A second channel of Bob's with Carol, when opened with `secondOut`. */
+	outChannel2?: Buffer;
 	kinds: Record<ForwardLinkName, ForwardChannelKind>;
 	links: Record<ForwardLinkName, IForwardLink>;
 }
@@ -92,6 +103,12 @@ export interface IForwardWorldOptions {
 	units?: Partial<
 		Record<ForwardLinkName, { opener: bigint; acceptor: bigint }>
 	>;
+	/** Carol runs from a database file too, so a test can restart her. */
+	carolOnFile?: boolean;
+	/** A second channel from Bob to Carol, of this kind, on the same link. */
+	secondOut?: ForwardChannelKind;
+	/** More of a host's node configuration, such as its features. */
+	nodes?: Partial<Record<ForwardHostName, Partial<INodeConfig>>>;
 }
 
 /** A payment from Alice to Carol through Bob, put in flight. */
@@ -112,6 +129,26 @@ export function forwardChainWorld(): {
 	mine(world: IForwardWorld, blocks: number): Promise<void>;
 	/** Let blocks pass up to a height, the watchers hearing only of the last. */
 	passTo(world: IForwardWorld, height: number): Promise<void>;
+	/**
+	 * Stop Carol and start her again from her database, on the same chain
+	 * (a world opened with `carolOnFile`).
+	 */
+	restartCarol(
+		world: IForwardWorld,
+		tag: string,
+		options?: {
+			hooks?: Partial<IAuxiliaryChannelConfig>;
+			wrapProvider?: (
+				provider: IChannelAuxiliaryProvider
+			) => IChannelAuxiliaryProvider;
+			/** Runs while Carol is down. */
+			whileDown?: () => void | Promise<void>;
+			/** Her link with Bob comes back with her, unless false. */
+			reconnect?: boolean;
+			/** The build she comes back on, such as a release; this tree's unless said. */
+			build?: IEngineBuild;
+		}
+	): Promise<void>;
 	/** Stop Bob and start him again from his database, on the same chain. */
 	restartBob(
 		world: IForwardWorld,
@@ -149,7 +186,9 @@ export function forwardChainWorld(): {
 		hooks: Partial<IAuxiliaryChannelConfig> | undefined,
 		sqlitePath: string | undefined,
 		wallet: IChainWallet | undefined,
-		wrap?: (provider: IChannelAuxiliaryProvider) => IChannelAuxiliaryProvider
+		wrap?: (provider: IChannelAuxiliaryProvider) => IChannelAuxiliaryProvider,
+		node?: Partial<INodeConfig>,
+		build?: IEngineBuild
 	): Promise<{ host: IAssetHost; backend: TestChainBackend }> => {
 		const backend = new TestChainBackend(chain);
 		backends.push(backend);
@@ -180,8 +219,10 @@ export function forwardChainWorld(): {
 					...(wallet ? { fundingProvider: wallet.provider() } : {}),
 					revocationBasepointSecret: secret(1),
 					paymentBasepointSecret: secret(2),
-					delayedPaymentBasepointSecret: secret(3)
-				}
+					delayedPaymentBasepointSecret: secret(3),
+					...node
+				},
+				...(build ? { build } : {})
 			}
 		);
 		made.push(host);
@@ -394,9 +435,13 @@ export function forwardChainWorld(): {
 		link.up = true;
 		a.node.getChannelManager().handlePeerReconnected(b.node.getNodeId());
 		b.node.getChannelManager().handlePeerReconnected(a.node.getNodeId());
+		// In the order they were sent, as one connection has them: what a
+		// delivery sends waits behind what was already sent, so a node's
+		// reestablish is read before anything it sends once its channel is
+		// back (a fulfil the restart redispatch makes, for one).
+		while (held.length > 0) held.shift()!();
 		a.node.handlePeerMessage = originals[0];
 		b.node.handlePeerMessage = originals[1];
-		while (held.length > 0) held.shift()!();
 		for (let i = 0; i < 5; i++) await settle();
 	};
 
@@ -423,6 +468,17 @@ export function forwardChainWorld(): {
 				`${tag}-${process.pid}-${crypto.randomBytes(4).toString('hex')}.sqlite`
 			);
 			files.push(bobPath, `${bobPath}-wal`, `${bobPath}-shm`);
+			const carolPath = given.carolOnFile
+				? path.join(
+						os.tmpdir(),
+						`${tag}-carol-${process.pid}-${crypto
+							.randomBytes(4)
+							.toString('hex')}.sqlite`
+				  )
+				: undefined;
+			if (carolPath) {
+				files.push(carolPath, `${carolPath}-wal`, `${carolPath}-shm`);
+			}
 			const sweeps: Record<ForwardHostName, ISweepCall[]> = {
 				alice: [],
 				bob: [],
@@ -449,9 +505,10 @@ export function forwardChainWorld(): {
 					sweeps[name],
 					given.control?.[name],
 					given.hooks?.[name],
-					name === 'bob' ? bobPath : undefined,
+					name === 'bob' ? bobPath : name === 'carol' ? carolPath : undefined,
 					wallets[name],
-					given.wrapProvider?.[name]
+					given.wrapProvider?.[name],
+					given.nodes?.[name]
 				);
 				hosts[name] = host;
 				hostBackends[name] = backend;
@@ -468,6 +525,7 @@ export function forwardChainWorld(): {
 				sweeps,
 				wallets,
 				bobPath,
+				...(carolPath ? { carolPath } : {}),
 				inChannel: Buffer.alloc(0),
 				outChannel: Buffer.alloc(0),
 				kinds: { ...given.kinds },
@@ -498,11 +556,27 @@ export function forwardChainWorld(): {
 					: openOrdinary(`${tag} ${which}`, chain, opener, acceptor);
 			world.inChannel = await open('in', hosts.alice, hosts.bob);
 			world.outChannel = await open('out', hosts.bob, hosts.carol);
+			if (given.secondOut) {
+				world.outChannel2 =
+					given.secondOut === 'asset'
+						? await openAsset(
+								`${tag} out2`,
+								chain,
+								hosts.bob,
+								hosts.carol,
+								given.units?.out ?? { opener: 9000n, acceptor: 1000n }
+						  )
+						: await openOrdinary(`${tag} out2`, chain, hosts.bob, hosts.carol);
+			}
 			await mine(world, 6);
-			for (const [which, channelId, pair] of [
+			const opened: Array<[string, Buffer, IAssetHost[]]> = [
 				['in', world.inChannel, [hosts.alice, hosts.bob]],
 				['out', world.outChannel, [hosts.bob, hosts.carol]]
-			] as const) {
+			];
+			if (world.outChannel2) {
+				opened.push(['out2', world.outChannel2, [hosts.bob, hosts.carol]]);
+			}
+			for (const [which, channelId, pair] of opened) {
 				for (const host of pair) {
 					const now = host.node
 						.getChannelManager()
@@ -518,6 +592,39 @@ export function forwardChainWorld(): {
 				}
 			}
 			return world;
+		},
+		async restartCarol(world, tag, restart = {}): Promise<void> {
+			const given = options.get(world)!;
+			if (!world.carolPath) {
+				throw new Error(
+					'Carol runs from memory: open the world with carolOnFile'
+				);
+			}
+			cut(world, 'out');
+			world.hosts.carol.node.destroy();
+			world.hosts.carol.storage?.close();
+			world.backends.carol.close();
+			world.sweeps.carol = [];
+			await restart.whileDown?.();
+			const { host, backend } = await chainHost(
+				tag,
+				'carol',
+				world.chain,
+				world.sweeps.carol,
+				given.control?.carol,
+				restart.hooks ?? given.hooks?.carol,
+				world.carolPath,
+				world.wallets.carol,
+				restart.wrapProvider ?? given.wrapProvider?.carol,
+				given.nodes?.carol,
+				restart.build
+			);
+			world.hosts.carol = host;
+			world.backends.carol = backend;
+			if (given.realInit) readsRealInit(host, [world.hosts.bob]);
+			wire(world, world.links.out, 'carol', 'bob');
+			await settle();
+			if (restart.reconnect !== false) await reconnect(world, 'out');
 		},
 		async restartBob(world, tag, restart = {}): Promise<void> {
 			const given = options.get(world)!;
@@ -536,7 +643,8 @@ export function forwardChainWorld(): {
 				restart.hooks ?? given.hooks?.bob,
 				world.bobPath,
 				world.wallets.bob,
-				given.wrapProvider?.bob
+				given.wrapProvider?.bob,
+				given.nodes?.bob
 			);
 			world.hosts.bob = host;
 			world.backends.bob = backend;
@@ -674,4 +782,130 @@ export async function forwardHeld(
 		incomingExpiry: expiryOf(world.inChannel, 'received-'),
 		outgoingExpiry: expiryOf(world.outChannel, 'offered-')
 	};
+}
+
+/** An ordinary invoice of Carol's, which Alice pays in parts through Bob. */
+export interface IPartsInvoice {
+	paymentHash: Buffer;
+	paymentSecret: Buffer;
+	/** What Carol's invoice asks. */
+	invoiceMsat: bigint;
+	/** The total each part's onion declares. */
+	totalMsat: bigint;
+}
+
+/** How one part of a payment in parts is sent. */
+export interface IPartOptions {
+	/** The next hop the part's onion names; Bob's channel with Carol unless said. */
+	next?: Buffer;
+	/** What Alice pays Bob over what he forwards; 2 percent and a satoshi unless said. */
+	feeMsat?: bigint;
+	/** The expiry of Bob's HTLC to Carol, as blocks above the tip; 60 unless said. */
+	outgoingDelta?: number;
+	/** Blocks between the outgoing expiry and the incoming one; 40 unless said. */
+	cltvDelta?: number;
+	/** The total this part's onion declares, in place of the invoice's. */
+	totalMsat?: bigint;
+}
+
+/** The alias a host knows its channel by, which an onion names as the next hop. */
+export function aliasOf(host: IAssetHost, channelId: Buffer): Buffer {
+	return Buffer.from(
+		host.node.getChannelManager().getChannel(channelId)!.getFullState()
+			.scidAlias!
+	);
+}
+
+/** Carol makes an ordinary invoice (not a hold invoice) for parts to pay. */
+export function partsInvoice(
+	world: IForwardWorld,
+	tag: string,
+	invoiceMsat: bigint,
+	totalMsat = invoiceMsat
+): IPartsInvoice {
+	const invoice = world.hosts.carol.node.createInvoice({
+		amountMsat: invoiceMsat,
+		description: `parts ${tag}`
+	});
+	return {
+		paymentHash: invoice.paymentHash,
+		paymentSecret: invoice.paymentSecret,
+		invoiceMsat,
+		totalMsat
+	};
+}
+
+/**
+ * Alice sends one part of `invoice` through Bob, in bitcoin: `partMsat` is
+ * what the onion asks Bob to forward to Carol, and the part declares the
+ * total of the set. Nothing is awaited.
+ */
+export function sendPart(
+	world: IForwardWorld,
+	invoice: IPartsInvoice,
+	partMsat: bigint,
+	options: IPartOptions = {}
+): void {
+	const { alice, bob, carol } = world.hosts;
+	const outgoingDelta = options.outgoingDelta ?? 60;
+	const cltvDelta = options.cltvDelta ?? 40;
+	alice.node.sendPaymentToRoute(
+		{
+			hops: [
+				{
+					pubkey: Buffer.from(bob.node.getNodeId(), 'hex'),
+					// Over Alice's only ordinary channel to Bob.
+					shortChannelId: Buffer.alloc(8, 9),
+					amountToForwardMsat:
+						partMsat + (options.feeMsat ?? partMsat / 50n + 1000n),
+					outgoingCltvValue: outgoingDelta + cltvDelta
+				},
+				{
+					pubkey: Buffer.from(carol.node.getNodeId(), 'hex'),
+					shortChannelId: options.next ?? aliasOf(bob, world.outChannel),
+					amountToForwardMsat: partMsat,
+					outgoingCltvValue: outgoingDelta
+				}
+			]
+		},
+		invoice.paymentHash,
+		cltvDelta,
+		invoice.paymentSecret,
+		options.totalMsat ?? invoice.totalMsat
+	);
+}
+
+/**
+ * Alice pays an ordinary invoice of Carol's in parts through Bob: one
+ * sendPaymentToRoute per part, under one hash and secret, each declaring
+ * the total, and none an asset payment of hers (bitcoin in). Bob's host
+ * makes each part an asset HTLC to Carol. The invoice asks the sum of the
+ * parts unless said.
+ */
+export async function payInParts(
+	world: IForwardWorld,
+	tag: string,
+	parts: bigint[],
+	options: {
+		invoiceMsat?: bigint;
+		/** The total each part declares; the invoice's unless said. */
+		totalMsat?: bigint;
+		part?: (index: number) => IPartOptions;
+		/** Message rounds after the parts are sent; 8 unless said. */
+		rounds?: number;
+	} = {}
+): Promise<IPartsInvoice> {
+	const sum = parts.reduce((all, part) => all + part, 0n);
+	const invoiceMsat = options.invoiceMsat ?? sum;
+	const invoice = partsInvoice(
+		world,
+		tag,
+		invoiceMsat,
+		options.totalMsat ?? invoiceMsat
+	);
+	parts.forEach((partMsat, index) =>
+		sendPart(world, invoice, partMsat, options.part?.(index))
+	);
+	for (let i = 0; i < (options.rounds ?? 8); i++) await settle();
+	return invoice;
 }

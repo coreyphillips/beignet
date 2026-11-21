@@ -85,7 +85,11 @@ export const AUXILIARY_CHANNELS_API = Object.freeze({
 		'IForwardingEvent.auxiliary',
 		// Whoever wraps the node can refuse a forward with an asset leg
 		// before anything of it is offered.
-		'setAuxiliaryForwardGate'
+		'setAuxiliaryForwardGate',
+		// Issue #2098, step 8: an asset invoice paid in parts, collected into
+		// one set for a host that sets receiveInParts, settled together, and
+		// every part claimed once the set is committed.
+		'receiveInParts'
 	] as const),
 	// Nothing is declared and not run in this build.
 	declared: Object.freeze([] as const)

@@ -100,7 +100,10 @@ import type {
 	IAuxiliaryForwardRequest,
 	IAuxiliaryForwardTerms
 } from '../channel/auxiliary-forward';
-import { auxiliaryForwards } from '../channel/auxiliary-switch';
+import {
+	auxiliaryForwards,
+	auxiliaryPartsReceived
+} from '../channel/auxiliary-switch';
 import { copyCustomRecords } from '../message/custom-records';
 import {
 	AuxiliaryGuardianModeError,
@@ -1465,6 +1468,16 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	private _gossipRefreshTimer?: ReturnType<typeof setInterval>;
 	// MPP: pending multi-part payments awaiting all parts (keyed by paymentHash hex)
 	private pendingMppPayments: Map<string, IPendingMppPayment> = new Map();
+	/**
+	 * Issue #2098, step 8: the asset sets this node committed to settle,
+	 * by payment hash, each with its parts, until every part is fulfilled or
+	 * has ended on the chain. Memory only: the COMPLETED record of each,
+	 * with its `_auxiliaryReceivedParts`, is what a restart rebuilds it from.
+	 */
+	private readonly assetSetSettles = new Map<
+		string,
+		Array<{ channelId: Buffer; htlcId: bigint }>
+	>();
 	// Hold invoices: payment hashes whose incoming HTLCs are parked, not settled.
 	private heldInvoiceHashes: Set<string> = new Set();
 	// Parked HTLCs awaiting settleHeldHtlc/cancelHeldHtlc, keyed by payment hash.
@@ -4148,6 +4161,12 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		// signatures, keep tracking what did. Channels are restored by now.
 		this.compositeSplices?.restore();
 
+		// Issue #2098, step 8: the asset sets this node committed to settle
+		// are known again from their records, and a part whose decision to
+		// settle did not land before the stop gets it before the scan below.
+		this.rebuildAssetSetSettles();
+		this.writeOwedAssetSetDecisions();
+
 		// Scan for expiring HTLCs immediately on restore (may have missed blocks while down)
 		if (this.currentBlockHeight > 0) {
 			this.scanExpiringOfferedHtlcs(this.currentBlockHeight);
@@ -4320,6 +4339,11 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		if (!preimage) return false;
 		if (this.channelManager.fulfillHtlc(channelId, htlcId, preimage).ok) {
 			this.cleanupHtlcSharedSecret(htlcKey);
+		} else if (this.committedSetParts(payment)?.[htlcKey]) {
+			// Issue #2098, step 8: a part of a committed asset set whose fulfil
+			// cannot be made now has its decision to settle, by which a close
+			// claims it.
+			this.writeAssetSetDecision(channelId, htlcId, paymentHash, preimage);
 		}
 		return true;
 	}
@@ -4347,6 +4371,16 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	 */
 	private owesSettledFulfill(payment: IPaymentInfo): boolean {
 		if (payment.status !== PaymentStatus.COMPLETED) return false;
+		// Issue #2098, step 8: a committed asset set's record also stays while
+		// a part it names is open in a channel that has gone to the chain:
+		// the part's decision, and the claim by it, are made from this record.
+		const setParts = this.committedSetParts(payment);
+		if (
+			setParts &&
+			Object.keys(setParts).some((key) => this.assetSetPartOpen(key))
+		) {
+			return true;
+		}
 		for (const htlcKey of payment.settledHtlcs ?? []) {
 			const [channelHex, htlcId] = htlcKey.split(':');
 			const channelId = Buffer.from(channelHex, 'hex');
@@ -21019,6 +21053,11 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			return;
 		}
 
+		// Issue #2098, step 8: a part of an asset set this node committed to
+		// settle is fulfilled, whoever dispatches it, and never failed: the
+		// set's preimage may already have left with another part.
+		if (this.fulfillCommittedSetPart(channelId, htlcId, paymentHash)) return;
+
 		// Issue #2098: the incoming leg of a forward whose end this node
 		// already decided is driven to that decision, whoever dispatches it.
 		const decided = channel.getFullState().htlcs.get(`received-${htlcId}`);
@@ -23796,41 +23835,44 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			}
 		}
 
-		// Asset channels: an asset invoice is paid by one HTLC in this build.
-		// An HTLC that carries units and is a part of a set (its onion
-		// declares a total above what it was valued at, or another HTLC is
-		// already kept for the hash) is failed back and never collected.
-		if (assetCredit) {
-			const others = [
-				...(this.heldHtlcs.get(hashHex) ?? []),
-				...(this.pendingMppPayments.get(hashHex)?.receivedParts ?? [])
-			].some(
-				(part) => !(part.htlcId === htlcId && part.channelId.equals(channelId))
-			);
-			if (
-				others ||
-				(declaredTotalMsat !== undefined && declaredTotalMsat > partAmountMsat)
-			) {
-				this.emitStructuredLog('htlc', 'asset_multi_part_refused', {
-					paymentHash: hashHex,
-					channelId: channelId.toString('hex'),
-					htlcId: htlcId.toString(),
-					valuedMsat: partAmountMsat.toString(),
-					...(declaredTotalMsat !== undefined
-						? { declaredTotalMsat: declaredTotalMsat.toString() }
-						: {})
-				});
-				const reason = sharedSecret
-					? createFailureMessage(
-							sharedSecret,
-							INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS,
-							this.incorrectPaymentDetailsData(amountMsat)
-					  )
-					: Buffer.alloc(FAILURE_MESSAGE_LENGTH);
-				this.cleanupHtlcSharedSecret(htlcSecretKey);
-				this.channelManager.failHtlc(channelId, htlcId, reason);
-				return;
-			}
+		// Asset channels: an HTLC that carries units and is a part of a set
+		// (its onion declares a total above what it was valued at, or another
+		// HTLC is already kept for the hash) is failed back and never
+		// collected, unless this node collects asset sets (issue #2098, step
+		// 8) and the part may join one. A plain part is never collected
+		// beside an asset part, either way round.
+		const setRefusal = this.assetSetPartRefusal(
+			channelId,
+			htlcId,
+			hashHex,
+			assetCredit,
+			partAmountMsat,
+			declaredTotalMsat,
+			isHold,
+			hopPayload,
+			incomingBlindingPoint
+		);
+		if (setRefusal !== undefined) {
+			this.emitStructuredLog('htlc', 'asset_multi_part_refused', {
+				paymentHash: hashHex,
+				channelId: channelId.toString('hex'),
+				htlcId: htlcId.toString(),
+				valuedMsat: partAmountMsat.toString(),
+				...(declaredTotalMsat !== undefined
+					? { declaredTotalMsat: declaredTotalMsat.toString() }
+					: {}),
+				...(setRefusal ? { reason: setRefusal } : {})
+			});
+			const reason = sharedSecret
+				? createFailureMessage(
+						sharedSecret,
+						INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS,
+						this.incorrectPaymentDetailsData(amountMsat)
+				  )
+				: Buffer.alloc(FAILURE_MESSAGE_LENGTH);
+			this.cleanupHtlcSharedSecret(htlcSecretKey);
+			this.channelManager.failHtlc(channelId, htlcId, reason);
+			return;
 		}
 
 		// Hold invoice: park the HTLC instead of settling. The preimage is revealed
@@ -26693,6 +26735,304 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	}
 
 	/**
+	 * Issue #2098, step 8: whether this node collects the parts of an asset
+	 * payment into one set. The build's switch, the host's
+	 * `receiveInParts` and basic_mpp among the node's own features, whose
+	 * absence also stops the timer that fails a set that never completes.
+	 * Read only to collect a set: nothing after a set's commit reads it.
+	 */
+	private receivesAssetParts(): boolean {
+		return (
+			auxiliaryPartsReceived.enabled &&
+			this.auxiliaryChannels?.receiveInParts === true &&
+			this.localFeatures.hasFeature(Feature.BASIC_MPP)
+		);
+	}
+
+	/** Whether a received HTLC of a channel carries asset units. */
+	private receivedHtlcCarriesUnits(channelId: Buffer, htlcId: bigint): boolean {
+		return (
+			this.channelManager
+				.getChannel(channelId)
+				?.getFullState()
+				.htlcs.get(`received-${htlcId}`)?.auxiliaryAmount !== undefined
+		);
+	}
+
+	/**
+	 * Why a part may not join a set, at the final hop: undefined when it is
+	 * no part of a set or may join one; the empty string for today's refusal
+	 * of an asset part of a set, on a node that does not collect asset sets
+	 * (receivesAssetParts), whose log then names no reason; and the reason
+	 * otherwise (issue #2098, step 8).
+	 *
+	 * An asset set is all parts with units, from one peer, unblinded, each
+	 * declaring the set's total; a hold invoice stays paid by one asset
+	 * HTLC. A plain part is refused beside an asset part being collected,
+	 * which only a node that collects asset sets can have.
+	 */
+	private assetSetPartRefusal(
+		channelId: Buffer,
+		htlcId: bigint,
+		hashHex: string,
+		assetCredit: boolean,
+		partAmountMsat: bigint,
+		declaredTotalMsat: bigint | undefined,
+		isHold: boolean,
+		hopPayload: IHopPayload | undefined,
+		incomingBlindingPoint: Buffer | undefined
+	): string | undefined {
+		const pending = this.pendingMppPayments.get(hashHex);
+		const others = (part: { channelId: Buffer; htlcId: bigint }): boolean =>
+			!(part.htlcId === htlcId && part.channelId.equals(channelId));
+		if (!assetCredit) {
+			return pending?.receivedParts.some(
+				(part) =>
+					part.status === PaymentStatus.PENDING &&
+					others(part) &&
+					this.receivedHtlcCarriesUnits(part.channelId, part.htlcId)
+			)
+				? 'mixed'
+				: undefined;
+		}
+		const held = (this.heldHtlcs.get(hashHex) ?? []).filter(others);
+		const collected = (pending?.receivedParts ?? []).filter(others);
+		if (
+			held.length === 0 &&
+			collected.length === 0 &&
+			(declaredTotalMsat === undefined || declaredTotalMsat <= partAmountMsat)
+		) {
+			return undefined;
+		}
+		if (!this.receivesAssetParts()) return '';
+		if (isHold || held.length > 0) return 'hold';
+		if (
+			incomingBlindingPoint !== undefined ||
+			hopPayload?.blindingPoint !== undefined ||
+			(hopPayload?.encryptedRecipientData?.length ?? 0) > 0
+		) {
+			return 'blinded';
+		}
+		if (declaredTotalMsat === undefined) return 'no-total';
+		if (
+			collected.some(
+				(part) => !this.receivedHtlcCarriesUnits(part.channelId, part.htlcId)
+			)
+		) {
+			return 'mixed';
+		}
+		const first = collected[0];
+		if (
+			first &&
+			this.channelManager.getPeerForChannel(first.channelId) !==
+				this.channelManager.getPeerForChannel(channelId)
+		) {
+			return 'peer';
+		}
+		return undefined;
+	}
+
+	/**
+	 * Issue #2098, step 8: what each part of an asset set this node
+	 * committed to settle is worth, by `<channel id hex>:<HTLC id>`, as the
+	 * commit wrote it beside the payment (`_auxiliaryReceivedParts`).
+	 * Undefined for any other record, and for one whose entry cannot be
+	 * read as it is written.
+	 */
+	private committedSetParts(
+		payment: IPaymentInfo | undefined
+	): Record<string, string> | undefined {
+		const raw = payment?.metadata?._auxiliaryReceivedParts;
+		if (!raw || payment?.direction !== PaymentDirection.INCOMING) {
+			return undefined;
+		}
+		let parts: unknown;
+		try {
+			parts = JSON.parse(raw);
+		} catch {
+			return undefined;
+		}
+		if (!parts || typeof parts !== 'object' || Array.isArray(parts)) {
+			return undefined;
+		}
+		for (const [key, value] of Object.entries(parts)) {
+			if (
+				!/^[0-9a-f]{64}:(0|[1-9][0-9]*)$/.test(key) ||
+				typeof value !== 'string' ||
+				!/^[1-9][0-9]*$/.test(value) ||
+				BigInt(value) > U64_MAX
+			) {
+				return undefined;
+			}
+		}
+		return { ...(parts as Record<string, string>) };
+	}
+
+	/**
+	 * Issue #2098, step 8: fulfil a received HTLC that a committed asset
+	 * set's record names, whoever dispatches it, rather than let any check
+	 * of a fresh HTLC fail it back. True when the record names it.
+	 */
+	private fulfillCommittedSetPart(
+		channelId: Buffer,
+		htlcId: bigint,
+		paymentHash: Buffer
+	): boolean {
+		const parts = this.committedSetParts(
+			this.payments.get(paymentHash.toString('hex'))
+		);
+		if (!parts?.[`${channelId.toString('hex')}:${htlcId}`]) return false;
+		this.fulfillSettledReceivedHtlc(channelId, htlcId, paymentHash);
+		return true;
+	}
+
+	/** Whether a committed asset set's record names this received HTLC. */
+	private namesCommittedSetPart(
+		hashHex: string,
+		channelId: Buffer,
+		htlcId: bigint
+	): boolean {
+		return (
+			this.committedSetParts(this.payments.get(hashHex))?.[
+				`${channelId.toString('hex')}:${htlcId}`
+			] !== undefined
+		);
+	}
+
+	/**
+	 * Whether a part of a committed asset set, by `<channel id hex>:<HTLC
+	 * id>`, is still open: in its channel, neither fulfilled nor failed, and
+	 * not ended on the chain.
+	 */
+	private assetSetPartOpen(key: string): boolean {
+		const [channelHex, id] = key.split(':');
+		const channelId = Buffer.from(channelHex, 'hex');
+		const htlcId = BigInt(id);
+		const entry = this.channelManager
+			.getChannel(channelId)
+			?.getFullState()
+			.htlcs.get(`received-${htlcId}`);
+		return (
+			entry !== undefined &&
+			entry.state !== HtlcState.FULFILLED &&
+			entry.state !== HtlcState.FAILED &&
+			this.channelManager.auxiliaryHtlcChainEnding(
+				channelId,
+				HtlcDirection.RECEIVED,
+				htlcId
+			) === undefined
+		);
+	}
+
+	/**
+	 * Issue #2098, step 8: write the decision to settle a part of a
+	 * committed asset set, with its channel's row, when none stands, and
+	 * offer the preimage to the monitors once it is written: a close claims
+	 * the part by it. A write that does not land is made again on the next
+	 * block (writeOwedAssetSetDecisions).
+	 */
+	private writeAssetSetDecision(
+		channelId: Buffer,
+		htlcId: bigint,
+		paymentHash: Buffer,
+		preimage: Buffer
+	): void {
+		if (
+			this.channelManager.auxiliaryHtlcDecision(channelId, htlcId) !== undefined
+		) {
+			return;
+		}
+		if (
+			this.channelManager.recordAuxiliaryHtlcDecision(
+				channelId,
+				htlcId,
+				'settle',
+				preimage
+			)
+		) {
+			this.channelManager.recordPreimage(paymentHash, preimage);
+		}
+	}
+
+	/**
+	 * Issue #2098, step 8: the asset sets this node committed to settle, read
+	 * again from their records at a restore: every COMPLETED incoming record
+	 * with `_auxiliaryReceivedParts` that names a part still open.
+	 */
+	private rebuildAssetSetSettles(): void {
+		for (const [hashHex, payment] of this.payments) {
+			if (payment.status !== PaymentStatus.COMPLETED) continue;
+			const parts = this.committedSetParts(payment);
+			if (!parts) continue;
+			const keys = Object.keys(parts);
+			if (!keys.some((key) => this.assetSetPartOpen(key))) continue;
+			this.assetSetSettles.set(
+				hashHex,
+				keys.map((key) => {
+					const [channelHex, id] = key.split(':');
+					return {
+						channelId: Buffer.from(channelHex, 'hex'),
+						htlcId: BigInt(id)
+					};
+				})
+			);
+		}
+	}
+
+	/**
+	 * Issue #2098, step 8: every open part of a committed asset set has its
+	 * decision to settle, whatever its channel's state and however near its
+	 * expiry: a write that did not land at the commit, or before a stop, is
+	 * made here, on each block before the claim backstop and at a restore
+	 * before its scan. A part whose fulfil was never made (nothing owes it,
+	 * and its channel can take it now) has it made here too. A set whose
+	 * parts have all ended leaves the index.
+	 */
+	private writeOwedAssetSetDecisions(): void {
+		for (const [hashHex, parts] of [...this.assetSetSettles]) {
+			const open = parts.filter((part) =>
+				this.assetSetPartOpen(
+					`${part.channelId.toString('hex')}:${part.htlcId}`
+				)
+			);
+			if (open.length === 0) {
+				this.assetSetSettles.delete(hashHex);
+				continue;
+			}
+			const preimage =
+				this.preimages.get(hashHex) ?? this.payments.get(hashHex)?.preimage;
+			if (!preimage) continue;
+			const paymentHash = Buffer.from(hashHex, 'hex');
+			for (const part of open) {
+				this.writeAssetSetDecision(
+					part.channelId,
+					part.htlcId,
+					paymentHash,
+					preimage
+				);
+				// A fulfil the provider refused is the channel manager's to make
+				// again, and one the channel's state refused the reestablish's.
+				if (
+					!this.channelManager.owesAuxiliaryRemoval(
+						part.channelId,
+						part.htlcId
+					) &&
+					!this.channelManager.auxiliaryChannelOnChain(part.channelId) &&
+					this.channelManager
+						.getChannel(part.channelId)
+						?.canFulfillHtlc(part.htlcId) === true
+				) {
+					this.fulfillSettledReceivedHtlc(
+						part.channelId,
+						part.htlcId,
+						paymentHash
+					);
+				}
+			}
+		}
+	}
+
+	/**
 	 * Accumulate one part of a multi-part payment. Parts group by payment
 	 * hash; each part's authenticity was already enforced upstream in
 	 * handleFinalHopHtlc (the payment_secret match for BOLT 11 parts, the
@@ -26768,7 +27108,12 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 
 		// Settlement lists every part on the payment row. The parts already
 		// here stay pending and fail back at the MPP timeout.
-		if (!this.settledRowFits(hashHex)) {
+		if (
+			!this.settledRowFits(
+				hashHex,
+				this.receivedHtlcCarriesUnits(channelId, htlcId)
+			)
+		) {
 			this.emitStructuredLog('htlc', 'settled_row_full', {
 				paymentHash: hashHex,
 				parts: String(pending.receivedParts.length)
@@ -26816,6 +27161,12 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 
 		// Check if we have enough
 		if (totalReceived >= pending.totalMsat) {
+			// Issue #2098, step 8: a set of asset parts is settled by its own
+			// path, which writes the set's records before any part's fulfil.
+			if (this.receivedHtlcCarriesUnits(channelId, htlcId)) {
+				this.settleAssetSet(paymentHash, preimage, pending);
+				return;
+			}
 			// Deliver the preimage to the chain monitors BEFORE fulfilling any part,
 			// so every part's received HTLC can still be claimed on-chain if a channel
 			// force-closes mid-settlement. recordPreimage keys on the payment hash and
@@ -26876,6 +27227,256 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	}
 
 	/**
+	 * Issue #2098, step 8: settle a complete set of asset parts, each at the
+	 * value the host gave it.
+	 *
+	 * Nothing is written and nothing revealed until every part can take its
+	 * fulfil at once (assetSetNotSettled); otherwise the whole set is failed
+	 * back. Then the set's records are written alone, in one transition, and
+	 * before any fulfil: the payment COMPLETED with every part in
+	 * settledHtlcs, each part's value in `_auxiliaryReceivedParts`, the
+	 * invoice's mark and the payment secret's deletion. From that write on
+	 * the set is committed and nothing gives it up: each part gets its
+	 * decision to settle, with its channel's row, so that a close claims it
+	 * and nothing fails it, and then its fulfil. A fulfil refused now is
+	 * made again: by the channel manager when the provider refused it, by
+	 * the reestablish when the channel could not carry it, and the decision
+	 * of a part whose row did not take it is written again on each block.
+	 */
+	private settleAssetSet(
+		paymentHash: Buffer,
+		preimage: Buffer,
+		pending: IPendingMppPayment
+	): void {
+		const hashHex = paymentHash.toString('hex');
+		this.pendingMppPayments.delete(hashHex);
+		this.clearJitSkim(hashHex);
+		const parts = pending.receivedParts;
+		const keyOf = (part: { channelId: Buffer; htlcId: bigint }): string =>
+			`${part.channelId.toString('hex')}:${part.htlcId}`;
+		const failSet = (reason: string, failureCode: number): void => {
+			this.emitStructuredLog('htlc', 'asset_set_not_settled', {
+				paymentHash: hashHex,
+				parts: String(parts.length),
+				reason
+			});
+			for (const part of parts) {
+				if (part.status !== PaymentStatus.PENDING) continue;
+				part.status = PaymentStatus.FAILED;
+				this.failRejectedMppPart(
+					part.channelId,
+					part.htlcId,
+					failureCode,
+					part.amountMsat
+				);
+			}
+		};
+		const notSettled = this.assetSetNotSettled(paymentHash, parts);
+		if (notSettled) {
+			failSet(notSettled.reason, notSettled.failureCode);
+			return;
+		}
+
+		const payment = this.payments.get(hashHex)!;
+		const values: Record<string, string> = {};
+		let settledMsat = 0n;
+		for (const part of parts) {
+			values[keyOf(part)] = part.amountMsat.toString();
+			settledMsat += part.amountMsat;
+		}
+		const completed: IPaymentInfo = {
+			...payment,
+			status: PaymentStatus.COMPLETED,
+			preimage,
+			completedAt: Date.now(),
+			settledHtlcs: parts.map(keyOf),
+			auxiliary: true,
+			metadata: {
+				...(payment.metadata ?? {}),
+				_auxiliaryReceivedParts: JSON.stringify(values)
+			}
+		};
+		// Settled by HTLCs this wallet holds: no longer unresolved.
+		delete completed.unresolved;
+		if (completed.amountMsat === 0n) completed.amountMsat = settledMsat;
+		recordReceivedMsat(completed, settledMsat);
+		const invoice = this.invoices.get(hashHex);
+		const markedInvoice: IInvoiceInfo | undefined =
+			invoice && invoice.auxiliary !== true
+				? { ...invoice, auxiliary: true }
+				: undefined;
+		if (
+			!this.commitMutations(
+				'commit a set of asset parts',
+				[
+					...(markedInvoice
+						? [
+								{
+									type: 'invoice_state' as const,
+									paymentHash: hashHex,
+									invoice: markedInvoice
+								}
+						  ]
+						: []),
+					{ type: 'delete_payment_secret', paymentHash: hashHex },
+					{ type: 'payment_state', paymentHash: hashHex, payment: completed }
+				],
+				RecoveryCriticality.SafetyCritical
+			)
+		) {
+			failSet('write', TEMPORARY_NODE_FAILURE);
+			return;
+		}
+
+		// Committed. From here to the last fulfil nothing a listener does may
+		// stop the set: a log a listener throws on is contained.
+		const note = (action: string, data: Record<string, unknown>): void => {
+			try {
+				this.emitStructuredLog('htlc', action, data);
+			} catch {
+				/* a listener's throw is not the set's to stop on */
+			}
+		};
+		Object.assign(payment, completed);
+		delete payment.unresolved;
+		if (invoice && markedInvoice) invoice.auxiliary = true;
+		this.paymentSecrets.delete(hashHex);
+		this.assetSetSettles.set(
+			hashHex,
+			parts.map((part) => ({ channelId: part.channelId, htlcId: part.htlcId }))
+		);
+		note('asset_set_committed', {
+			paymentHash: hashHex,
+			parts: String(parts.length)
+		});
+		for (const part of parts) {
+			this.channelManager.recordAuxiliaryHtlcDecision(
+				part.channelId,
+				part.htlcId,
+				'settle',
+				preimage
+			);
+		}
+		// A monitor takes the preimage once a decision to settle stands for
+		// an HTLC of the hash on its channel.
+		this.channelManager.recordPreimage(paymentHash, preimage);
+		for (const part of parts) {
+			part.status = PaymentStatus.COMPLETED;
+			const result = this.channelManager.fulfillHtlc(
+				part.channelId,
+				part.htlcId,
+				preimage
+			);
+			if (result.ok) {
+				this.cleanupHtlcSharedSecret(keyOf(part));
+			} else {
+				note('asset_set_part_fulfill_refused', {
+					paymentHash: hashHex,
+					channelId: part.channelId.toString('hex'),
+					htlcId: part.htlcId.toString(),
+					error: result.error
+				});
+			}
+		}
+		this.emit('payment:received', payment);
+		this.emitInvoiceSettled(paymentHash, payment);
+		this.emitStructuredLog('payment', 'received', {
+			paymentHash: hashHex,
+			amountMsat: Number(payment.amountMsat),
+			status: payment.status
+		});
+	}
+
+	/**
+	 * Issue #2098, step 8: why a complete set of asset parts is not settled,
+	 * or undefined when every part can take its fulfil at once. The record
+	 * of the hash is this node's incoming payment, still PENDING; each part
+	 * is irrevocably committed in its channel under the hash and carries
+	 * units, with nothing decided or owed for it, more than the claim buffer
+	 * from its expiry; each channel can fulfil now and has no commitment on
+	 * the chain; the provider answers for the fulfils of each channel's
+	 * parts, tried on a copy; and on a node that forwards with
+	 * requireFeeCoinsToSettle, the fee coins ready would pay to claim them.
+	 */
+	private assetSetNotSettled(
+		paymentHash: Buffer,
+		parts: readonly IPaymentPart[]
+	): { reason: string; failureCode: number } | undefined {
+		const hashHex = paymentHash.toString('hex');
+		const payment = this.payments.get(hashHex);
+		if (
+			!payment ||
+			payment.direction !== PaymentDirection.INCOMING ||
+			payment.status !== PaymentStatus.PENDING
+		) {
+			return { reason: 'record', failureCode: TEMPORARY_NODE_FAILURE };
+		}
+		const claimBuffer = Math.max(
+			INBOUND_HTLC_CLAIM_FORCE_CLOSE_BUFFER,
+			this.htlcSafetyMargin
+		);
+		const byChannel = new Map<string, { channel: Channel; ids: bigint[] }>();
+		for (const part of parts) {
+			const channel = this.channelManager.getChannel(part.channelId);
+			const entry = channel
+				?.getFullState()
+				.htlcs.get(`received-${part.htlcId}`);
+			if (
+				!channel ||
+				!entry ||
+				part.status !== PaymentStatus.PENDING ||
+				entry.state !== HtlcState.COMMITTED ||
+				entry.direction !== HtlcDirection.RECEIVED ||
+				!entry.paymentHash.equals(paymentHash) ||
+				entry.auxiliaryAmount === undefined ||
+				!receivedAddIrrevocablyCommitted(entry)
+			) {
+				return { reason: 'part', failureCode: TEMPORARY_NODE_FAILURE };
+			}
+			if (
+				this.channelManager.auxiliaryHtlcDecision(
+					part.channelId,
+					part.htlcId
+				) !== undefined ||
+				this.channelManager.owesAuxiliaryRemoval(part.channelId, part.htlcId) ||
+				this.owedHeldForwardFailures.has(
+					`${part.channelId.toString('hex')}:${part.htlcId}`
+				)
+			) {
+				return { reason: 'decided', failureCode: TEMPORARY_NODE_FAILURE };
+			}
+			if (
+				this.currentBlockHeight > 0 &&
+				entry.cltvExpiry - this.currentBlockHeight <= claimBuffer
+			) {
+				return {
+					reason: 'expiry',
+					failureCode: INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS
+				};
+			}
+			if (
+				!channel.canFulfillHtlc(part.htlcId) ||
+				this.channelManager.auxiliaryChannelOnChain(part.channelId)
+			) {
+				return { reason: 'channel', failureCode: TEMPORARY_NODE_FAILURE };
+			}
+			if (this.feeCoinsShortForSettle(part.channelId)) {
+				return { reason: 'fee-coins', failureCode: TEMPORARY_NODE_FAILURE };
+			}
+			const hex = part.channelId.toString('hex');
+			const group = byChannel.get(hex) ?? { channel, ids: [] };
+			group.ids.push(part.htlcId);
+			byChannel.set(hex, group);
+		}
+		for (const { channel, ids } of byChannel.values()) {
+			if (channel.auxiliaryFulfilRefusal(ids) !== null) {
+				return { reason: 'provider', failureCode: TEMPORARY_NODE_FAILURE };
+			}
+		}
+		return undefined;
+	}
+
+	/**
 	 * Fail all timed-out MPP partial payments.
 	 */
 	failTimedOutMppPayments(): void {
@@ -26904,9 +27505,16 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	private failRejectedMppPart(
 		channelId: Buffer,
 		htlcId: bigint,
-		failureCode: number
+		failureCode: number,
+		/** What the part counted for, told with incorrect_or_unknown_payment_details. */
+		valueMsat?: bigint
 	): void {
-		const fail = this.rejectedPartFail(channelId, htlcId, failureCode);
+		const fail = this.rejectedPartFail(
+			channelId,
+			htlcId,
+			failureCode,
+			valueMsat
+		);
 		if (fail()) return;
 		this.owedHeldForwardFailures.set(`${channelId.toString('hex')}:${htlcId}`, {
 			inChannelIdHex: channelId.toString('hex'),
@@ -26960,13 +27568,33 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	private rejectedPartFail(
 		channelId: Buffer,
 		htlcId: bigint,
-		failureCode: number
+		failureCode: number,
+		valueMsat?: bigint
 	): () => boolean {
 		const secretKey = `${channelId.toString('hex')}:${htlcId}`;
 		return (): boolean => {
 			const sharedSecret = this.receivedHtlcSharedSecrets.get(secretKey);
+			// BOLT 4: incorrect_or_unknown_payment_details carries the HTLC's
+			// amount and the height (issue #2098, step 8: a set of asset parts
+			// failed back for a part too near its expiry). An asset part's
+			// amount is what it counted for, as the node's other refusals of
+			// an asset part tell it; after a restart, its carrier.
+			const detailsMsat =
+				failureCode === INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS
+					? valueMsat ??
+					  this.channelManager
+							.getChannel(channelId)
+							?.getFullState()
+							.htlcs.get(`received-${htlcId}`)?.amountMsat
+					: undefined;
 			const reason = sharedSecret
-				? createFailureMessage(sharedSecret, failureCode)
+				? createFailureMessage(
+						sharedSecret,
+						failureCode,
+						detailsMsat !== undefined
+							? this.incorrectPaymentDetailsData(detailsMsat)
+							: undefined
+				  )
 				: Buffer.alloc(FAILURE_MESSAGE_LENGTH);
 			const result = this.channelManager.failHtlc(channelId, htlcId, reason);
 			if (!result.ok || result.sendsWithheld) {
@@ -32554,11 +33182,15 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		if (existing) {
 			const merged = { ...existing.metadata, ...metadata };
 			// _keysend is the engine's classification, not a label: a caller
-			// neither sets nor clears it.
-			if (existing.metadata?._keysend !== undefined) {
-				merged._keysend = existing.metadata._keysend;
-			} else {
-				delete merged._keysend;
+			// neither sets nor clears it. Nor _auxiliaryReceivedParts (issue
+			// #2098, step 8), the record of a committed asset set's parts,
+			// from which every part is claimed and each loss counted once.
+			for (const key of ['_keysend', '_auxiliaryReceivedParts']) {
+				if (existing.metadata?.[key] !== undefined) {
+					merged[key] = existing.metadata[key];
+				} else {
+					delete merged[key];
+				}
 			}
 			const labelled = { ...existing, metadata: merged };
 			// Settlement replaces a caller's _invoice with the retry's invoice,
@@ -32624,7 +33256,12 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		payment: IPaymentInfo,
 		invoiceStr = this.paymentRetryContexts.get(
 			payment.paymentHash.toString('hex')
-		)?.invoiceStr
+		)?.invoiceStr,
+		/**
+		 * Issue #2098, step 8: the part that would join carries units, so the
+		 * settled row is an asset set's, which also lists every part's value.
+		 */
+		assetPart = false
 	): RecoveryMutation {
 		const hashHex = payment.paymentHash.toString('hex');
 		const settled: IPaymentInfo = {
@@ -32673,6 +33310,24 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				// invoice what they credited when that differs.
 				if (payment.amountMsat === 0n) settled.amountMsat = U64_MAX;
 				settled.receivedMsat = U64_MAX;
+				// Issue #2098, step 8: an asset set's row also carries what each
+				// part is worth, each at its widest, and its mark.
+				if (
+					assetPart ||
+					(this.pendingMppPayments.get(hashHex)?.receivedParts ?? []).some(
+						(part) => this.receivedHtlcCarriesUnits(part.channelId, part.htlcId)
+					)
+				) {
+					const values: Record<string, string> = {};
+					for (const key of settled.settledHtlcs) {
+						values[key] = U64_MAX.toString();
+					}
+					settled.auxiliary = true;
+					settled.metadata = {
+						...settled.metadata,
+						_auxiliaryReceivedParts: JSON.stringify(values)
+					};
+				}
 			}
 		}
 		return { type: 'payment_state', paymentHash: hashHex, payment: settled };
@@ -32684,13 +33339,15 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	 * more, has to fit a frame. Refusing the part keeps a payer's part
 	 * count from growing the settled row past what a guardian accepts.
 	 */
-	private settledRowFits(hashHex: string): boolean {
+	private settledRowFits(hashHex: string, assetPart = false): boolean {
 		const room = this.recoveryJournal?.mutationRoom();
 		const payment = this.payments.get(hashHex);
 		return (
 			room === undefined ||
 			payment === undefined ||
-			encodedMutationBytes(this.settledPaymentMutation(payment)) <= room
+			encodedMutationBytes(
+				this.settledPaymentMutation(payment, undefined, assetPart)
+			) <= room
 		);
 	}
 
@@ -35824,8 +36481,11 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		this.jitReceiveManager?.scanExpiringHolds();
 		this.jitReceiveManager?.sweep();
 		// Asset channels: what a provider refusal left owed is taken up
-		// before the expiry scan judges the same HTLCs.
+		// before the expiry scan judges the same HTLCs, and so is a decision
+		// to settle a part of a committed asset set did not get (issue #2098,
+		// step 8).
 		this.retryAuxiliaryOwed();
+		this.writeOwedAssetSetDecisions();
 		this.scanExpiringHtlcs(blockHeight);
 		// Invariant keeper for HTLC dispatches parked during quiescence: the
 		// terminal quiescence exits (disconnect, errored, force close) emit no
@@ -36475,6 +37135,53 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			) {
 				continue;
 			}
+			// Issue #2098, step 8: the parts of a committed asset set end one by
+			// one. A part lost leaves the record's parts and what it counts as
+			// received, in one write, so it is counted once; the record stays
+			// COMPLETED while any of its parts was received, and turns FAILED
+			// only when every part was lost.
+			const key = `${lost.channelId.toString('hex')}:${lost.htlcId}`;
+			const setParts = this.committedSetParts(payment);
+			if (setParts) {
+				const lostValue = setParts[key];
+				if (lostValue === undefined) continue;
+				delete setParts[key];
+				const left = Object.values(setParts).reduce(
+					(sum, value) => sum + BigInt(value),
+					0n
+				);
+				payment.metadata = {
+					...payment.metadata,
+					_auxiliaryReceivedParts: JSON.stringify(setParts)
+				};
+				if (left === payment.amountMsat) delete payment.receivedMsat;
+				else payment.receivedMsat = left;
+				const none = Object.keys(setParts).length === 0;
+				if (none) payment.status = PaymentStatus.FAILED;
+				this.safeStorage(
+					() => this.persistPayment(lost.paymentHash),
+					'persistPayment'
+				);
+				this.emitStructuredLog('htlc', 'asset_htlc_claim_lost', {
+					paymentHash: hashHex,
+					channelId: lost.channelId.toString('hex'),
+					htlcId: lost.htlcId.toString(),
+					lostMsat: lostValue,
+					partsLeft: String(Object.keys(setParts).length)
+				});
+				this.emit('node:error', {
+					code: 'ASSET_HTLC_CLAIM_LOST',
+					channelId: lost.channelId,
+					message: `HTLC ${
+						lost.htlcId
+					} of asset channel ${lost.channelId.toString(
+						'hex'
+					)}, a part of the asset set of payment ${hashHex} that this node settled, was taken back by the payer on the chain: ${lostValue} msat of it were not received`,
+					timestamp: Date.now()
+				});
+				if (none) this.emit('payment:failed', payment);
+				continue;
+			}
 			payment.status = PaymentStatus.FAILED;
 			this.safeStorage(
 				() => this.persistPayment(lost.paymentHash),
@@ -36780,6 +37487,20 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				// node paid the outgoing leg, and nothing gives that up: an HTLC
 				// it decided to settle is claimed on the chain at the claim
 				// buffer below, as on any other channel.
+				//
+				// Issue #2098, step 8: not so a part of an asset set this node
+				// committed to settle either. The set's preimage may have left
+				// with another part, and nothing gives the set up: the part is
+				// claimed at the claim buffer below by its decision, which the
+				// pass before this scan writes, and is never failed off the
+				// chain.
+				const committedPart =
+					paymentHashHex !== undefined &&
+					this.namesCommittedSetPart(
+						paymentHashHex,
+						state.channelId ?? state.temporaryChannelId,
+						htlc.id
+					);
 				if (
 					state.auxiliaryState !== undefined &&
 					htlc.auxiliaryAmount !== undefined &&
@@ -36787,6 +37508,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 					state.state === ChannelState.NORMAL &&
 					!parkedHold &&
 					htlc.forwardAsked !== true &&
+					!committedPart &&
 					paymentHashHex !== undefined &&
 					this.preimages.has(paymentHashHex)
 				) {
@@ -36899,6 +37621,10 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				// revoke_and_ack that completes the round makes it failable, and
 				// the node's dispatch or the next block's scan takes it then.
 				if (!receivedAddIrrevocablyCommitted(htlc)) continue;
+
+				// Issue #2098, step 8: a part of a committed asset set is never
+				// failed back, whether or not its decision to settle has landed.
+				if (committedPart) continue;
 
 				if (htlc.cltvExpiry - blockHeight <= this.htlcSafetyMargin) {
 					const channelId = state.channelId || state.temporaryChannelId;
@@ -38612,6 +39338,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			if (inv.hold) continue;
 			if (this.heldHtlcs.has(hashHex)) continue;
 			if (this.pendingMppPayments.has(hashHex)) continue;
+			if (this.assetSetSettles.has(hashHex)) continue;
 			// AFFIRMATIVE never-paid check: only the PENDING incoming
 			// placeholder minted at issuance marks an invoice as never paid. A
 			// MISSING record is not license to sweep: pruneCompletedPayments
