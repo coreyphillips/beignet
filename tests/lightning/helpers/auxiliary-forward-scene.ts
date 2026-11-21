@@ -399,6 +399,10 @@ export interface IPartsSceneOptions {
 	world?: Partial<IForwardWorldOptions>;
 	/** The fee coins each host's wallet is given; 2 unless said. */
 	coins?: number;
+	/** The fee coins Carol's wallet is given, in place of `coins`. */
+	carolCoins?: number;
+	/** The blocks mined once the wallets are funded; 1 unless said. */
+	blocks?: number;
 }
 
 /** Carol's logs and events, kept on the scene; again after a restart. */
@@ -473,10 +477,13 @@ export async function openPartsScene(
 	});
 	s.w = w;
 	for (const name of ['alice', 'bob', 'carol'] as const) {
-		for (let i = 0; i < (options.coins ?? 2); i++)
-			w.wallets[name]!.fund(100_000);
+		const coins =
+			name === 'carol'
+				? options.carolCoins ?? options.coins ?? 2
+				: options.coins ?? 2;
+		for (let i = 0; i < coins; i++) w.wallets[name]!.fund(100_000);
 	}
-	await world.mine(w, 1);
+	await world.mine(w, options.blocks ?? 1);
 	listenBob(s as unknown as IScene);
 	listenCarol(s);
 	return s;

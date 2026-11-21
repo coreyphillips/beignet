@@ -28,7 +28,11 @@ import { createTaprootFundingScript } from '../../../src/lightning/script/fundin
 import type { IFixedOutputFeePolicy } from '../../../src/lightning/wallet/fixed-output-fees';
 import { TestChain, TestChainBackend } from './auxiliary-chain';
 import { chainWallet, type IChainWallet } from './auxiliary-fee-wallet';
-import { assetHost, type IAssetHost } from './auxiliary-nodes';
+import {
+	assetHost,
+	type IAssetHost,
+	type IEngineBuild
+} from './auxiliary-nodes';
 import {
 	SWEEP_DESTINATION,
 	errorsOf,
@@ -141,6 +145,8 @@ export function forwardChainWorld(): {
 			whileDown?: () => void | Promise<void>;
 			/** Her link with Bob comes back with her, unless false. */
 			reconnect?: boolean;
+			/** The build she comes back on, such as a release; this tree's unless said. */
+			build?: IEngineBuild;
 		}
 	): Promise<void>;
 	/** Stop Bob and start him again from his database, on the same chain. */
@@ -181,7 +187,8 @@ export function forwardChainWorld(): {
 		sqlitePath: string | undefined,
 		wallet: IChainWallet | undefined,
 		wrap?: (provider: IChannelAuxiliaryProvider) => IChannelAuxiliaryProvider,
-		node?: Partial<INodeConfig>
+		node?: Partial<INodeConfig>,
+		build?: IEngineBuild
 	): Promise<{ host: IAssetHost; backend: TestChainBackend }> => {
 		const backend = new TestChainBackend(chain);
 		backends.push(backend);
@@ -214,7 +221,8 @@ export function forwardChainWorld(): {
 					paymentBasepointSecret: secret(2),
 					delayedPaymentBasepointSecret: secret(3),
 					...node
-				}
+				},
+				...(build ? { build } : {})
 			}
 		);
 		made.push(host);
@@ -608,7 +616,8 @@ export function forwardChainWorld(): {
 				world.carolPath,
 				world.wallets.carol,
 				restart.wrapProvider ?? given.wrapProvider?.carol,
-				given.nodes?.carol
+				given.nodes?.carol,
+				restart.build
 			);
 			world.hosts.carol = host;
 			world.backends.carol = backend;

@@ -28,7 +28,7 @@ import type {
 import { createTaprootFundingScript } from '../../../src/lightning/script/funding-taproot';
 import { SqliteStorage } from '../../../src/lightning/storage/sqlite-storage';
 import { ASSET_FUNDING_ROOT, hash, referenceProvider } from './auxiliary-pair';
-import { connectNodes, createNode } from './loopback-nodes';
+import { connectNodes, createNode, makeNodeConfig } from './loopback-nodes';
 
 /**
  * Set asset openings on, or off, for the tests of the describe block this
@@ -105,6 +105,17 @@ export const RECEIVE_IN_PARTS = {
 	receiveInParts: true
 } as unknown as Partial<IAuxiliaryChannelConfig>;
 
+/**
+ * Another build of the engine to make a host with, such as a release
+ * installed from npm (the downgrade tests): its node and its storage, as
+ * loaded from its dist. Typed as this tree's, which the release's match
+ * in what these helpers use.
+ */
+export interface IEngineBuild {
+	LightningNode: new (config: INodeConfig) => LightningNode;
+	SqliteStorage: new (file: string) => SqliteStorage;
+}
+
 export interface IAssetHost {
 	node: LightningNode;
 	/** Set when the node was made with `sqlite`. */
@@ -142,11 +153,14 @@ export function assetHost(
 		/** Handed the storage before the node is made, and restores from it. */
 		onStorage?: (storage: SqliteStorage) => void;
 		extra?: Partial<INodeConfig>;
+		/** The build to make the node and its storage with; this tree's unless said. */
+		build?: IEngineBuild;
 	} = {}
 ): IAssetHost {
+	const Storage = options.build?.SqliteStorage ?? SqliteStorage;
 	const storage =
 		options.sqlite || options.sqlitePath
-			? new SqliteStorage(options.sqlitePath ?? ':memory:')
+			? new Storage(options.sqlitePath ?? ':memory:')
 			: undefined;
 	storage?.open();
 	if (storage) options.onStorage?.(storage);
@@ -156,7 +170,7 @@ export function assetHost(
 		errors: [],
 		...(storage ? { storage } : {})
 	} as unknown as IAssetHost;
-	host.node = createNode(tag, seedId, storage, {
+	const config: Partial<INodeConfig> = {
 		fundingProvider: {
 			buildFundingTransaction: async () => {
 				throw new Error('an asset channel is funded by the host');
@@ -173,7 +187,13 @@ export function assetHost(
 			...hooks
 		},
 		...options.extra
-	});
+	};
+	host.node = options.build
+		? new options.build.LightningNode({
+				...makeNodeConfig(tag, seedId, storage),
+				...config
+		  })
+		: createNode(tag, seedId, storage, config);
 	host.node.on('node:error', (error: { code?: string; message?: string }) => {
 		host.errors.push(`${error.code ?? ''}: ${error.message ?? ''}`);
 	});
