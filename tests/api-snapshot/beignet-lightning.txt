@@ -1071,6 +1071,7 @@ method channel.Channel.adoptRemoteForwardingPolicy(policy: channel.IRemoteForwar
 property channel.Channel.announcementChainHash: Buffer
 method channel.Channel.applyForceClosePlan(plan: channel.IForceClosePlanReady): channel.ChannelAction[]
 method channel.Channel.applyPeerSpliceSignature(remoteSig: Buffer, peerWalletWitnesses?: Buffer[][]): bitcoinjs-lib#Transaction | null
+method channel.Channel.auxiliaryFulfilRefusal(htlcIds: readonly bigint[]): string | null
 method channel.Channel.auxiliaryHtlcDecision(htlcId: bigint): channel.IAuxiliaryHtlcDecision | undefined
 method channel.Channel.backfillLockedFundingTxids(): boolean
 method channel.Channel.beginClosingNegotiationIfReady(): boolean
