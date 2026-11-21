@@ -262,10 +262,15 @@ export interface IAuxiliaryChannelConfig {
 	 * reach the total the payer declared. Before anything is written, every
 	 * part must be able to take its fulfil at once; the set's records are
 	 * then written alone, and from that write on every part is settled, or
-	 * claimed on the chain. Only `true` turns it on, and only on a node that
-	 * advertises basic_mpp. Left out, such a part is failed back as before.
-	 * A hold invoice stays paid by one asset HTLC. See "An asset invoice
-	 * paid in parts" in docs/EXTENSIONS.md.
+	 * claimed on the chain. Only `true` turns it on, and only on a node whose
+	 * own features (`localFeatures`) include basic_mpp. Left out, such a part
+	 * is failed back as before. A hold invoice stays paid by one asset HTLC.
+	 * See "An asset invoice paid in parts" in docs/EXTENSIONS.md.
+	 *
+	 * It is read at each part, and it also decides whether an asset invoice
+	 * (`ICreateInvoiceOptions.assetInvoice`) offers basic_mpp, step 10: a
+	 * host that turns it off does so once the asset invoices that offered
+	 * parts have expired, since their parts are failed back from then on.
 	 */
 	receiveInParts?: boolean;
 	/**

@@ -854,6 +854,18 @@ const result3 = node.createInvoice({
   paymentMetadata: Buffer.from('order:12345')
 });
 
+// On a node with asset channels, an asset invoice (issue #2098, step 10):
+// paid in asset units through the hints its host gives, never through a hint
+// of the node's own channels, and offering basic_mpp only where its parts can
+// be collected. `inParts: false` keeps basic_mpp out for a peer that forwards
+// no parts. See "What an asset invoice advertises" in docs/EXTENSIONS.md.
+const assetInvoice = node.createInvoice({
+  amountMsat: 50_000_000n,
+  description: 'Units of an asset',
+  extraRoutingHints: [[quoteHint]], // the host's hint, e.g. a quote's
+  assetInvoice: {}
+});
+
 // Decode any BOLT 11 invoice
 const decoded = inv.decode(result.bolt11);
 // => { paymentHash, amountMsat, description, network, ... }

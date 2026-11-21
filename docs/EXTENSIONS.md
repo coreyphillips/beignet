@@ -374,11 +374,42 @@ A refused forward offers and links nothing: its incoming HTLC fails back with `t
 
 A node is taken back to a build without this part only with no forward with an asset leg in flight and no end of one its host has not taken: its host stops answering `prepareForward` and it waits until `getAuxiliaryChannelInfo` reports no `forwardsInFlight` and no `undeliveredForwardLegEnds` on any asset channel. A daemon does both with a drained stop (`POST /stop` with `drain`), given a `drainTimeoutMs` long enough for the forwards in flight to end. Such a build keeps none of the ends the host has not taken yet.
 
+## What an asset invoice advertises
+
+The node runs this part from the build whose `AUXILIARY_CHANNELS_API.surfaces` names `createInvoice:assetInvoice`, and a host passes the field to such a build.
+
+An asset invoice is paid with asset units over the node's asset channels, through the routing hints its host gives: the hint of a quote, for instance, whose short channel id only the peer that gave the quote recognises. The host makes one with `createInvoice`, passing those hints in `extraRoutingHints` and `assetInvoice: {}`. The invoice then carries only those hints, never one the node builds from its own channels: a payer that took such a hint would send a plain HTLC, which is the host's to refuse. The engine records nothing of the mark. The invoice's record is any invoice's, its `auxiliary` is set only once asset HTLCs pay it, and a plain HTLC that pays it is still the host's to refuse through `valueIncomingHtlc`.
+
+### When it offers basic_mpp
+
+An asset invoice offers basic_mpp only where its parts can be collected, that is when all of these hold:
+
+- the node collects the parts of an asset payment: its host sets `receiveInParts: true`, and basic_mpp is among the node's own features (`localFeatures`), as it is by default;
+- it is no hold invoice, which stays paid by one asset HTLC;
+- every hint ends at one peer, since a set is all one peer's parts;
+- that peer's asset channels with the node that take HTLCs, now or once the peer is back, can hold two at once toward the node: each holds the fewer of the HTLCs the node accepts and those the peer accepts (a peer of this engine offers no more asset HTLCs at once than its own `maxHtlcs`, which it announces as its `max_accepted_htlcs`), and together they hold at least 2;
+- the host did not pass `inParts: false`, which is for an invoice through a peer that does not forward the parts of one payment under its quote.
+
+Otherwise it does not offer basic_mpp, and a payer pays it by one HTLC, as BOLT 4 has it. Every other feature is as for any invoice: TLV onion and payment secret compulsory, and payment metadata when given. `receiveInParts` is read at each part, while an invoice keeps what it offered: a host turns `receiveInParts` off once the asset invoices that offered parts have expired, since their parts are failed back from then on. A host that pays splits only an invoice that offers basic_mpp.
+
+### Refusals
+
+Each comes after the checks any invoice gets (its description, a JIT fee allowance's values, the size of payment metadata, and a hold invoice's external payment hash) and before anything is kept (no preimage, payment secret, hold mark or record, and no random byte drawn), as an `AuxiliaryInvoiceError` with a `code` and the `option` at fault, in this order:
+
+- `ASSET_INVOICE_INVALID` for `assetInvoice`: the field is neither an object nor left out (`undefined`, `null` and `false` make an ordinary invoice), or its `inParts` is not a boolean;
+- `ASSET_INVOICE_UNSUPPORTED` for `assetInvoice`: the node has no asset channels configured (`auxiliaryChannels`), or its host gives no `valueIncomingHtlc`, without which every asset HTLC that pays the invoice is failed back;
+- `ASSET_INVOICE_UNSUPPORTED` for the option named: `useBlindedPaths` and `asyncHold` (a blinded path is built from the node's own channels, and a blinded asset part is refused), `fforVoucher` (an invoice of its own kind), and `jitFeeAllowance` (an allowance applies only to an ordinary HTLC);
+- `ASSET_INVOICE_INVALID` for `extraRoutingHints`: no hint, which an asset invoice needs even when only its direct peer will pay it; more than 20 hints, so that the invoice always fits its encoding; a hint of no hop or of more than 12; a hop that does not name a valid node id other than this node's, an 8-byte short channel id, fees from 0 to 4294967295 and a CLTV delta from 0 to 65535; a hint that does not end at a peer with an asset channel of the node that takes HTLCs now or once the peer is back, or that ends over an ordinary channel of the node, which the refusal names.
+
+### Going back to an earlier build
+
+Nothing new is stored: an asset invoice keeps its string, and its record is any invoice's. An earlier build settles one asset HTLC that pays it as before. One that collects no asset set fails back the parts of an invoice that offered basic_mpp. So before going back, a host stops passing the field, leaves `receiveInParts` out, and waits until the asset invoices that offered parts have expired.
+
 ## An asset invoice paid in parts
 
 The node runs this part from the build whose `AUXILIARY_CHANNELS_API.surfaces` names it as `receiveInParts`, and a host relies on it from that build on. Builds before it named the part in `declared`, or not at all, and failed back every HTLC that carries units and is a part of a set, whatever their host asked.
 
-A payer on the network may split a payment whenever the invoice lets it. When the invoice is an asset invoice of a wallet behind a node that converts, every part reaches the wallet as an asset HTLC of its own under one payment hash. A host takes part by setting `receiveInParts: true` in its auxiliary channel configuration. The node then collects such HTLCs into one set, each at the value `valueIncomingHtlc` gives it, and settles them together once their values reach the total the payer declared. It does so only while it also advertises basic_mpp, whose absence would stop the timer that fails a set that never completes. A host that leaves the field out keeps the refusal of earlier builds, its log included.
+A payer on the network may split a payment whenever the invoice lets it. When the invoice is an asset invoice of a wallet behind a node that converts, every part reaches the wallet as an asset HTLC of its own under one payment hash. A host takes part by setting `receiveInParts: true` in its auxiliary channel configuration. The node then collects such HTLCs into one set, each at the value `valueIncomingHtlc` gives it, and settles them together once their values reach the total the payer declared. It does so only while basic_mpp is also among its own features (`localFeatures`), whose absence would stop the timer that fails a set that never completes. A host that leaves the field out keeps the refusal of earlier builds, its log included. The asset invoices a host makes offer basic_mpp only while the node collects their parts (see "What an asset invoice advertises").
 
 ### Which parts make a set
 
@@ -426,7 +457,7 @@ Nothing new is stored but the metadata key, which every build keeps with the rec
 
 The node runs this part from the build whose `AUXILIARY_CHANNELS_API.surfaces` names it as `sendInParts`, and a host relies on it from that build on. Builds before it named the part in `declared`, or not at all, and refused every HTLC that carries units and is a part of a payment, whatever their host asked.
 
-A wallet that holds units in one or several asset channels with the node it pays through can pay an invoice in parts, as a payer on the network splits a bitcoin payment. Each part is an asset HTLC to that peer, which forwards it on as a forward of its own; the payee collects the parts as any set. A host takes part by setting `sendInParts: true` in its auxiliary channel configuration. The host splits the payment: it sends each part by its own `sendPaymentToRoute` with `assetPayment`, choosing the part's channel, its route, its records, its carrier and the HTLC id it prepared them for, as it does for a payment of one HTLC. The node chooses no channel and retries nothing. Reading whether the invoice lets a payer split it (basic_mpp) is the host's. A host that leaves the field out keeps what earlier builds do: a part is refused (`ASSET_PAYMENT_UNSUPPORTED`), and every attempt of a payment names the one channel of its first.
+A wallet that holds units in one or several asset channels with the node it pays through can pay an invoice in parts, as a payer on the network splits a bitcoin payment. Each part is an asset HTLC to that peer, which forwards it on as a forward of its own; the payee collects the parts as any set. A host takes part by setting `sendInParts: true` in its auxiliary channel configuration. The host splits the payment: it sends each part by its own `sendPaymentToRoute` with `assetPayment`, choosing the part's channel, its route, its records, its carrier and the HTLC id it prepared them for, as it does for a payment of one HTLC. The node chooses no channel and retries nothing. Reading whether the invoice lets a payer split it (basic_mpp) is the host's: an invoice that does not offer it is paid by one HTLC. A host that leaves the field out keeps what earlier builds do: a part is refused (`ASSET_PAYMENT_UNSUPPORTED`), and every attempt of a payment names the one channel of its first.
 
 ### What a send of the host is checked against
 

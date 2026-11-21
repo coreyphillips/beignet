@@ -93,7 +93,11 @@ export const AUXILIARY_CHANNELS_API = Object.freeze({
 		// Issue #2098, step 9: an asset payment sent in parts, for a host that
 		// sets sendInParts, each part recorded before it is sent and counted
 		// toward its channel's bound, the payment's record kept across them.
-		'sendInParts'
+		'sendInParts',
+		// Issue #2098, step 10: createInvoice takes { assetInvoice }, and such
+		// an invoice carries only its host's routing hints and offers
+		// basic_mpp only where its parts can be collected.
+		'createInvoice:assetInvoice'
 	] as const),
 	// Nothing is declared and not run in this build.
 	declared: Object.freeze([] as const)

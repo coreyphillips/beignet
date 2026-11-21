@@ -1031,7 +1031,7 @@ function chain.signP2wpkhInput(tx: bitcoinjs-lib#Transaction, inputIndex: number
 function chain.signSweepInput(tx: bitcoinjs-lib#Transaction, inputIndex: number, witnessScript: Buffer, value: number, privateKey: Buffer, sighashType?: number): Buffer
 function chain.sweepVbytes(witness: readonly Buffer[], destinationScript: Buffer): number
 namespace channel
-const channel.AUXILIARY_CHANNELS_API: Readonly<{ version: 1; surfaces: readonly [ "valueIncomingHtlc:three-outcome", "sendPaymentToRoute:assetPayment", "getAuxiliaryPaymentHtlcs", "onHtlcResolved:htlcId", "queryAuxiliaryRoute", "fundAuxiliaryChannel:unsigned", "onFundingSigned", "abandonAuxiliaryOpen", "IChannelInfo.auxiliary", "setAuxiliaryPaymentGate", "getChannelMonitorState", "IPaymentInfo.auxiliary", "IPaymentInfo.auxiliaryValueMsat", "IInvoiceInfo.auxiliary", "IAuxiliaryChannelInfo.undeliveredOutcomes", "onHtlcResolved:never-sent", "getFixedOutputFeeStatus", "IPaymentInfo.unresolved", "IHoldInvoiceStateEvent.auxiliary", "prepareForward", "getFixedOutputFeeStatus:splitCoins", "getFixedOutputFeeStatus:reserve", "requireFeeCoinsToSettle", "onForwardLegResolved:quote", "IForwardingEvent.auxiliary", "setAuxiliaryForwardGate", "receiveInParts", "sendInParts" ]; declared: readonly [ ]; }>
+const channel.AUXILIARY_CHANNELS_API: Readonly<{ version: 1; surfaces: readonly [ "valueIncomingHtlc:three-outcome", "sendPaymentToRoute:assetPayment", "getAuxiliaryPaymentHtlcs", "onHtlcResolved:htlcId", "queryAuxiliaryRoute", "fundAuxiliaryChannel:unsigned", "onFundingSigned", "abandonAuxiliaryOpen", "IChannelInfo.auxiliary", "setAuxiliaryPaymentGate", "getChannelMonitorState", "IPaymentInfo.auxiliary", "IPaymentInfo.auxiliaryValueMsat", "IInvoiceInfo.auxiliary", "IAuxiliaryChannelInfo.undeliveredOutcomes", "onHtlcResolved:never-sent", "getFixedOutputFeeStatus", "IPaymentInfo.unresolved", "IHoldInvoiceStateEvent.auxiliary", "prepareForward", "getFixedOutputFeeStatus:splitCoins", "getFixedOutputFeeStatus:reserve", "requireFeeCoinsToSettle", "onForwardLegResolved:quote", "IForwardingEvent.auxiliary", "setAuxiliaryForwardGate", "receiveInParts", "sendInParts", "createInvoice:assetInvoice" ]; declared: readonly [ ]; }>
 const channel.AUXILIARY_CHANNEL_DUST_LIMIT = 354n
 const channel.AUXILIARY_CLOSE_ASSET_OUTPUT_MINIMUM = 330n
 class channel.AuxiliaryChannelUnsupportedError extends beignet#CodedError<'ASSET_CHANNEL_UNSUPPORTED'>
@@ -5665,6 +5665,10 @@ constructor node.AuxiliaryChannelRowError(rows: ReadonlyArray<{ channelId: strin
 readonly property node.AuxiliaryChannelRowError.channelIds: readonly string[]
 readonly property node.AuxiliaryChannelRowError.reasons: ReadonlyMap<string, string>
 type node.AuxiliaryForwardGate = (forward: node.IAuxiliaryGatedForward) => string | node.IAuxiliaryForwardRefusal | undefined
+class node.AuxiliaryInvoiceError extends beignet#CodedError<node.AuxiliaryInvoiceErrorCode>
+constructor node.AuxiliaryInvoiceError(code: node.AuxiliaryInvoiceErrorCode, option: string, message: string)
+readonly property node.AuxiliaryInvoiceError.option: string
+type node.AuxiliaryInvoiceErrorCode = 'ASSET_INVOICE_UNSUPPORTED' | 'ASSET_INVOICE_INVALID'
 class node.AuxiliaryPaymentError extends beignet#CodedError<node.AuxiliaryPaymentErrorCode>
 constructor node.AuxiliaryPaymentError(code: node.AuxiliaryPaymentErrorCode, channelId: Buffer | string, message: string, reason?: string)
 readonly property node.AuxiliaryPaymentError.channelId: string
@@ -5711,6 +5715,8 @@ constructor node.FundingWaitTimeoutError(message: string)
 const node.HELD_HTLC_EXPIRY_MARGIN = 18
 type node.HoldCancelReason = 'expiry-scan' | 'api'
 type node.HoldInvoiceState = 'OPEN' | 'ACCEPTED' | 'SETTLED' | 'CANCELLED'
+interface node.IAssetInvoiceOptions
+property node.IAssetInvoiceOptions.inParts?: boolean
 interface node.IAutoRebalanceConfig
 property node.IAutoRebalanceConfig.budgetSatsPerDay?: number
 property node.IAutoRebalanceConfig.enabled?: boolean
@@ -5857,6 +5863,7 @@ property node.ICompositeSpliceStageEvent.txid?: Buffer
 type node.ICompositeSpliceStartResult = { ok: true; id: Buffer; plan: node.ICompositeSplicePlan; } | node.ICompositeSpliceRefusal
 interface node.ICreateInvoiceOptions
 property node.ICreateInvoiceOptions.amountMsat?: bigint
+property node.ICreateInvoiceOptions.assetInvoice?: node.IAssetInvoiceOptions | null | false
 property node.ICreateInvoiceOptions.asyncHold?: boolean
 property node.ICreateInvoiceOptions.blindedPathNumHops?: number
 property node.ICreateInvoiceOptions.description?: string
