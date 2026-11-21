@@ -16,6 +16,7 @@ import {
 	auxiliaryChannelOpens,
 	auxiliaryForwards
 } from '../../../src/lightning/channel/auxiliary-switch';
+import * as auxiliarySwitches from '../../../src/lightning/channel/auxiliary-switch';
 import { ChannelState } from '../../../src/lightning/channel/types';
 import { randomBytes as engineRandomBytes } from '../../../src/lightning/crypto/provider';
 import { Feature, FeatureFlags } from '../../../src/lightning/features/flags';
@@ -62,6 +63,47 @@ export function withAssetForwards(enabled = true): void {
 		auxiliaryForwards.enabled = prior;
 	});
 }
+
+/**
+ * The build's switch for collecting an asset invoice's parts (issue #2098,
+ * step 8), or undefined in a build that has none. Read from the module as
+ * a namespace, so a test file that uses it loads on a build before it.
+ */
+export function assetPartsSwitch(): { enabled: boolean } | undefined {
+	return (
+		auxiliarySwitches as unknown as {
+			auxiliaryPartsReceived?: { enabled: boolean };
+		}
+	).auxiliaryPartsReceived;
+}
+
+/**
+ * Set the collecting of an asset invoice's parts on, or off, for the tests
+ * of the describe block this is called in, and back to what it was after
+ * it (issue #2098, step 8). A build without the switch is left as it is.
+ */
+export function withAssetPartsReceived(enabled = true): void {
+	let prior: boolean | undefined;
+	before(() => {
+		const parts = assetPartsSwitch();
+		if (!parts) return;
+		prior = parts.enabled;
+		parts.enabled = enabled;
+	});
+	after(() => {
+		const parts = assetPartsSwitch();
+		if (parts && prior !== undefined) parts.enabled = prior;
+	});
+}
+
+/**
+ * A host's opt-in to being paid an asset invoice in parts (issue #2098,
+ * step 8): `receiveInParts: true` in its auxiliary channel configuration.
+ * Typed loosely, so that it also builds where the field is not declared.
+ */
+export const RECEIVE_IN_PARTS = {
+	receiveInParts: true
+} as unknown as Partial<IAuxiliaryChannelConfig>;
 
 export interface IAssetHost {
 	node: LightningNode;
