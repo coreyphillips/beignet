@@ -35,8 +35,9 @@ export const auxiliaryForwards = { enabled: true };
  * again until it lands, and a part whose fulfil is not made is claimed at
  * the claim buffer, never failed back. A node collects them only while
  * this is on, the host's configuration sets `receiveInParts`, and the
- * node advertises basic_mpp; otherwise such a part is failed back as
- * before. Nothing that follows the commit of a set reads it, so a set
+ * node's own features include basic_mpp; otherwise such a part is failed
+ * back as before, and an asset invoice does not offer basic_mpp (step 10).
+ * Nothing that follows the commit of a set reads it, so a set
  * already committed is driven to its end whatever this says. Tests turn
  * it off to reach that refusal; nothing else may, and the package does
  * not export it.

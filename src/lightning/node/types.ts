@@ -1287,6 +1287,37 @@ export interface ICreateInvoiceOptions {
 	 * createFforVoucherInvoice.
 	 */
 	fforVoucher?: boolean;
+	/**
+	 * Issue #2098, step 10: an asset invoice, to be paid with asset units
+	 * over this node's asset channels through the routing hints its host
+	 * gives in `extraRoutingHints`. A build whose
+	 * `AUXILIARY_CHANNELS_API.surfaces` names `createInvoice:assetInvoice`
+	 * makes such an invoice carry only those hints, never one built from
+	 * the node's own channels, and offer basic_mpp only where its parts can
+	 * be collected: the node collects the parts of an asset payment
+	 * (`IAuxiliaryChannelConfig.receiveInParts`), it is no hold invoice, its
+	 * hints all end at one peer whose asset channels can hold two HTLCs at
+	 * once toward the node, and `inParts` is not false. An object turns it
+	 * on; left out, null or false, the invoice is made as any other.
+	 * Anything else, a node without asset channels or whose host gives no
+	 * `valueIncomingHtlc`, and an asset invoice with blinded paths,
+	 * `asyncHold`, `fforVoucher`, a JIT fee allowance, more than 20 hints or
+	 * hints that do not lead in over an asset channel are refused with an
+	 * `AuxiliaryInvoiceError` before anything is kept. See "What an asset
+	 * invoice advertises" in docs/EXTENSIONS.md.
+	 */
+	assetInvoice?: IAssetInvoiceOptions | null | false;
+}
+
+/** The terms of an asset invoice (`ICreateInvoiceOptions.assetInvoice`). */
+export interface IAssetInvoiceOptions {
+	/**
+	 * False for an invoice through a peer that does not forward the parts of
+	 * one payment under its quote: the invoice then never offers basic_mpp.
+	 * Left out or true, it offers basic_mpp wherever the node can collect
+	 * the parts.
+	 */
+	inParts?: boolean;
 }
 
 export interface IChannelInfo {
@@ -2179,6 +2210,32 @@ export class AuxiliaryPaymentError extends CodedError<AuxiliaryPaymentErrorCode>
 		this.name = 'AuxiliaryPaymentError';
 		this.channelId = hex;
 		if (reason !== undefined) this.reason = reason;
+	}
+}
+
+/** Why an asset invoice (`ICreateInvoiceOptions.assetInvoice`) was refused. */
+export type AuxiliaryInvoiceErrorCode =
+	/** The node makes no such invoice, or not with the option named. */
+	| 'ASSET_INVOICE_UNSUPPORTED'
+	/** The terms or the routing hints of the asset invoice are malformed, or the hints do not lead in over an asset channel of the node. */
+	| 'ASSET_INVOICE_INVALID';
+
+/**
+ * Issue #2098, step 10: an asset invoice was refused before anything was
+ * kept: no preimage, payment secret, hold mark or record.
+ */
+export class AuxiliaryInvoiceError extends CodedError<AuxiliaryInvoiceErrorCode> {
+	/** The option of createInvoice the refusal concerns. */
+	readonly option: string;
+
+	constructor(
+		code: AuxiliaryInvoiceErrorCode,
+		option: string,
+		message: string
+	) {
+		super(code, `${message} (${option})`);
+		this.name = 'AuxiliaryInvoiceError';
+		this.option = option;
 	}
 }
 

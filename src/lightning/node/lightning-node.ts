@@ -65,7 +65,7 @@ import type { TxidHex } from '../../utils/identifiers';
 import type { LightningNodeEvents, NodeErrorCode } from './events';
 import { randomBytes, sha256 } from '../crypto/provider';
 import type { ILogger } from '../../logger';
-import { getPublicKey } from '../crypto/ecdh';
+import { getPublicKey, isValidPublicKey } from '../crypto/ecdh';
 import {
 	signMessageWithKey,
 	verifyMessageSignature
@@ -437,6 +437,7 @@ import {
 	PaymentWaitTimeoutError,
 	InvalidChannelOpenError,
 	AuxiliaryPaymentError,
+	AuxiliaryInvoiceError,
 	PaymentUnresolvedError,
 	ChannelFundingUnavailableError,
 	AuxiliaryChannelRowError,
@@ -932,6 +933,20 @@ const FORCE_CLOSE_FEE_MULTIPLIER = 1.5;
  * words, and 639 bytes is the most that fits.
  */
 const MAX_INVOICE_METADATA_BYTES = 639;
+
+/**
+ * The most hops one BOLT 11 routing hint holds: each takes 51 bytes, and a
+ * tagged field holds at most 1023 5-bit words (639 bytes). An asset
+ * invoice's hints are checked against it (issue #2098, step 10).
+ */
+const ASSET_INVOICE_HINT_MAX_HOPS = 12;
+
+/**
+ * The most routing hints an asset invoice takes. At 12 hops each they take
+ * about 20,000 of the 65,535 characters an encoded invoice may hold, so its
+ * encoding never fails after anything was kept (issue #2098, step 10).
+ */
+const ASSET_INVOICE_MAX_HINTS = 20;
 
 /** BOLT 2: a node forgets an unconfirmed funding only after 2016 blocks. */
 const FUNDING_FORGET_BLOCKS = 2016;
@@ -18569,6 +18584,10 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		if (externalHash && this.paymentHashInUse(externalHash)) {
 			throw new Error('paymentHash is already in use by this node');
 		}
+		// Issue #2098, step 10: an asset invoice's terms and hints, checked
+		// after the checks any invoice gets and before a preimage, a secret
+		// or a hold mark is kept or any random byte is drawn.
+		const assetInvoice = this.assetInvoiceTerms(options);
 		const preimage = externalHash ? undefined : randomBytes(32);
 		const paymentHash = externalHash ?? sha256(preimage!);
 		const paymentSecret = randomBytes(32);
@@ -18587,8 +18606,12 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		const routingHints = [
 			// An FFOR voucher invoice is payable only through S's hop with the
 			// epoch's fee terms (section 7.6); our own channel hints would name
-			// the same channel under S's ordinary policy.
-			...(options.fforVoucher ? [] : this.getPrivateChannelRoutingHints()),
+			// the same channel under S's ordinary policy. An asset invoice is
+			// paid only through the hints its host gives: a plain HTLC over one
+			// of our ordinary channels would be the host's to refuse.
+			...(options.fforVoucher || assetInvoice
+				? []
+				: this.getPrivateChannelRoutingHints()),
 			...(options.extraRoutingHints ?? [])
 		];
 
@@ -18633,7 +18656,11 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		const invoiceFeatures = FeatureFlags.empty();
 		invoiceFeatures.setCompulsory(Feature.TLV_ONION); // bit 8
 		invoiceFeatures.setCompulsory(Feature.PAYMENT_SECRET); // bit 14
-		invoiceFeatures.setOptional(Feature.BASIC_MPP); // bit 17
+		// An asset invoice offers basic_mpp only where its parts can be
+		// collected (issue #2098, step 10).
+		if (!assetInvoice || this.assetInvoiceOffersParts(options, assetInvoice)) {
+			invoiceFeatures.setOptional(Feature.BASIC_MPP); // bit 17
+		}
 		if (useBlinded) {
 			invoiceFeatures.setOptional(Feature.ROUTE_BLINDING); // bit 25
 		}
@@ -18712,6 +18739,217 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		this.invoices.set(paymentHash.toString('hex'), { ...record });
 
 		return { bolt11: invoiceStr, paymentHash, paymentSecret };
+	}
+
+	/**
+	 * Issue #2098, step 10: the terms of an asset invoice
+	 * (`ICreateInvoiceOptions.assetInvoice`), or undefined for any other
+	 * invoice. Every check runs before createInvoice keeps or draws
+	 * anything, and each refusal is an AuxiliaryInvoiceError naming the
+	 * option at fault. The host's hints are the invoice's whole way in, so
+	 * each hop is checked as the encoder writes it, and each hint must end
+	 * over an asset channel of the node: a plain HTLC over an ordinary
+	 * channel is the host's to refuse.
+	 */
+	private assetInvoiceTerms(
+		options: ICreateInvoiceOptions
+	): { inParts: boolean } | undefined {
+		const field: unknown = options.assetInvoice;
+		if (field === undefined || field === null || field === false) {
+			return undefined;
+		}
+		const invalid = (option: string, message: string): AuxiliaryInvoiceError =>
+			new AuxiliaryInvoiceError('ASSET_INVOICE_INVALID', option, message);
+		const unsupported = (
+			option: string,
+			message: string
+		): AuxiliaryInvoiceError =>
+			new AuxiliaryInvoiceError('ASSET_INVOICE_UNSUPPORTED', option, message);
+		if (typeof field !== 'object' || Array.isArray(field)) {
+			throw invalid(
+				'assetInvoice',
+				'An asset invoice takes an object of terms'
+			);
+		}
+		const inParts: unknown = (field as { inParts?: unknown }).inParts;
+		if (inParts !== undefined && typeof inParts !== 'boolean') {
+			throw invalid('assetInvoice', 'inParts of an asset invoice is a boolean');
+		}
+		if (!this.auxiliaryChannels) {
+			throw unsupported(
+				'assetInvoice',
+				'An asset invoice is made only by a node with asset channels'
+			);
+		}
+		if (typeof this.auxiliaryChannels.valueIncomingHtlc !== 'function') {
+			throw unsupported(
+				'assetInvoice',
+				'An asset invoice is made only by a node whose host values the asset HTLCs that pay it (valueIncomingHtlc); without it each is failed back'
+			);
+		}
+		if (options.useBlindedPaths) {
+			throw unsupported(
+				'useBlindedPaths',
+				"An asset invoice carries no blinded path: one is built from the node's own channels, and a blinded asset part is refused"
+			);
+		}
+		if (options.asyncHold) {
+			throw unsupported(
+				'asyncHold',
+				'An asset invoice carries no blinded path, which asyncHold needs'
+			);
+		}
+		if (options.fforVoucher) {
+			throw unsupported('fforVoucher', 'A voucher invoice is no asset invoice');
+		}
+		if (options.jitFeeAllowance !== undefined) {
+			throw unsupported(
+				'jitFeeAllowance',
+				'An asset invoice takes no JIT fee allowance, which applies only to an ordinary HTLC'
+			);
+		}
+		const hints: unknown = options.extraRoutingHints;
+		if (!Array.isArray(hints) || hints.length === 0) {
+			throw invalid(
+				'extraRoutingHints',
+				'An asset invoice needs the routing hints its host gives: the node builds none for an asset channel'
+			);
+		}
+		if (hints.length > ASSET_INVOICE_MAX_HINTS) {
+			throw invalid(
+				'extraRoutingHints',
+				`An asset invoice takes at most ${ASSET_INVOICE_MAX_HINTS} routing hints`
+			);
+		}
+		const ownId = this.ownNodeId();
+		for (const hint of hints as unknown[]) {
+			if (
+				!Array.isArray(hint) ||
+				hint.length === 0 ||
+				hint.length > ASSET_INVOICE_HINT_MAX_HOPS
+			) {
+				throw invalid(
+					'extraRoutingHints',
+					`A routing hint of an asset invoice has 1 to ${ASSET_INVOICE_HINT_MAX_HOPS} hops`
+				);
+			}
+			for (const hop of hint as unknown[]) {
+				const fault = LightningNode.assetInvoiceHopFault(hop, ownId);
+				if (fault !== undefined) {
+					throw invalid(
+						'extraRoutingHints',
+						`A hop of a routing hint of an asset invoice ${fault}`
+					);
+				}
+			}
+			const last = (hint as IRoutingHintHop[])[hint.length - 1];
+			const peerHex = last.pubkey.toString('hex');
+			if (this.assetChannelsTakingHtlcs(peerHex).length === 0) {
+				throw invalid(
+					'extraRoutingHints',
+					`A routing hint of an asset invoice ends at ${peerHex}, which has no asset channel with this node that takes HTLCs`
+				);
+			}
+			const ordinary = this.channelManager
+				.getChannelsByScid(last.shortChannelId)
+				.find((channel) => !channel.getFullState().auxiliaryState);
+			if (ordinary) {
+				throw invalid(
+					'extraRoutingHints',
+					`A routing hint of an asset invoice ends over ${last.shortChannelId.toString(
+						'hex'
+					)}, an ordinary channel of this node (channel ${
+						ordinary.getChannelId()?.toString('hex') ?? 'with no id yet'
+					})`
+				);
+			}
+		}
+		return { inParts: inParts !== false };
+	}
+
+	/**
+	 * What is wrong with one hop of an asset invoice's routing hint, or
+	 * undefined: the fields the encoder writes as they are, with no check of
+	 * its own (issue #2098, step 10).
+	 */
+	private static assetInvoiceHopFault(
+		hop: unknown,
+		ownId: Buffer
+	): string | undefined {
+		if (typeof hop !== 'object' || hop === null) return 'is not a hop';
+		const h = hop as Partial<Record<keyof IRoutingHintHop, unknown>>;
+		const within = (value: unknown, most: number): boolean =>
+			Number.isInteger(value) &&
+			(value as number) >= 0 &&
+			(value as number) <= most;
+		if (!Buffer.isBuffer(h.pubkey) || !isValidPublicKey(h.pubkey)) {
+			return 'names no valid node id';
+		}
+		if (h.pubkey.equals(ownId)) return 'names this node';
+		if (!Buffer.isBuffer(h.shortChannelId) || h.shortChannelId.length !== 8) {
+			return 'names no 8-byte short channel id';
+		}
+		if (
+			!within(h.feeBaseMsat, 0xffffffff) ||
+			!within(h.feeProportionalMillionths, 0xffffffff)
+		) {
+			return 'has a fee outside 0 to 4294967295';
+		}
+		if (!within(h.cltvExpiryDelta, 0xffff)) {
+			return 'has a CLTV delta outside 0 to 65535';
+		}
+		return undefined;
+	}
+
+	/**
+	 * The asset channels with a peer that take HTLCs now or once the peer is
+	 * back, looking through a reestablish as the node's own hints do.
+	 */
+	private assetChannelsTakingHtlcs(peerHex: string): Channel[] {
+		return this.channelManager
+			.getChannelsByPeer(peerHex)
+			.filter(
+				(channel) =>
+					channel.getFullState().auxiliaryState !== undefined &&
+					channel.acceptsNewHtlcs(true)
+			);
+	}
+
+	/**
+	 * Issue #2098, step 10: whether an asset invoice offers basic_mpp, which
+	 * it does only where its parts can be collected. The node collects the
+	 * parts of an asset payment (receivesAssetParts); a hold invoice stays
+	 * paid by one asset HTLC; a set is one peer's, so every hint ends at that
+	 * peer, whose asset channels with the node can hold two HTLCs at once
+	 * toward it; and the host did not say that the peer forwards no parts
+	 * (`inParts: false`). Each channel holds the fewer of the HTLCs the node
+	 * accepts and those the peer accepts: a peer of this engine offers no
+	 * more asset HTLCs at once than its own maxHtlcs, which it announces as
+	 * its max_accepted_htlcs.
+	 */
+	private assetInvoiceOffersParts(
+		options: ICreateInvoiceOptions,
+		terms: { inParts: boolean }
+	): boolean {
+		if (!terms.inParts || options.hold || !this.receivesAssetParts()) {
+			return false;
+		}
+		const peers = new Set(
+			(options.extraRoutingHints ?? []).map((hint) =>
+				hint[hint.length - 1].pubkey.toString('hex')
+			)
+		);
+		if (peers.size !== 1) return false;
+		const [peerHex] = [...peers];
+		let heldAtOnce = 0;
+		for (const channel of this.assetChannelsTakingHtlcs(peerHex)) {
+			const state = channel.getFullState();
+			heldAtOnce += Math.min(
+				state.localConfig.maxAcceptedHtlcs,
+				state.remoteConfig.maxAcceptedHtlcs
+			);
+		}
+		return heldAtOnce >= 2;
 	}
 
 	// ─────────────── Payment Sending ───────────────
@@ -27653,7 +27891,9 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	 * payment into one set. The build's switch, the host's
 	 * `receiveInParts` and basic_mpp among the node's own features, whose
 	 * absence also stops the timer that fails a set that never completes.
-	 * Read only to collect a set: nothing after a set's commit reads it.
+	 * Read to collect a set, and by createInvoice for whether an asset
+	 * invoice offers basic_mpp (step 10); nothing after a set's commit
+	 * reads it.
 	 */
 	private receivesAssetParts(): boolean {
 		return (
