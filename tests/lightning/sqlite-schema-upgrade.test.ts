@@ -290,6 +290,64 @@ describe('SqliteStorage upgrade from shipped schemas (#1999)', () => {
 		}
 	});
 
+	it('reads a forward of schema 20 back as an ordinary one, and keeps a forward with an asset leg written after the upgrade (#2098, step 7)', () => {
+		const fixture = FIXTURES.find((f) => f.version === 20);
+		expect(fixture, 'schema 20 fixture').to.not.equal(undefined);
+		const file = build(directory, fixture!);
+		const db = new Database(file);
+		db.prepare(
+			'INSERT INTO forwarding_events (settled_at, in_channel_id, out_channel_id, in_scid, out_scid, amount_in_msat, amount_out_msat, fee_msat) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
+		).run(100, 'aa', 'bb', null, null, '1005', '1000', '5');
+		db.close();
+		const storage = new SqliteStorage(file);
+		storage.open();
+		try {
+			expect(storage.getSchemaVersion()).to.equal(CURRENT);
+			const [old] = storage.listForwardingEvents();
+			expect(old).to.deep.include({
+				settledAt: 100,
+				amountInMsat: 1005n,
+				amountOutMsat: 1000n,
+				feeMsat: 5n
+			});
+			expect(old.auxiliary).to.equal(undefined);
+			expect(old.nextHopScid).to.equal(undefined);
+			storage.saveForwardingEvent({
+				settledAt: 200,
+				inChannelId: 'cc',
+				outChannelId: 'dd',
+				amountInMsat: 5_010_000n,
+				amountOutMsat: 5_000_000n,
+				feeMsat: 10_000n,
+				auxiliary: true,
+				inAuxiliaryAmount: 5_010n,
+				inWireAmountMsat: 354_000n,
+				nextHopScid: '0102030405060708'
+			});
+			const [marked] = storage.listForwardingEvents({ since: 150 });
+			expect(marked).to.deep.include({
+				auxiliary: true,
+				amountInMsat: 5_010_000n,
+				inAuxiliaryAmount: 5_010n,
+				inWireAmountMsat: 354_000n,
+				nextHopScid: '0102030405060708'
+			});
+			expect(marked.outAuxiliaryAmount).to.equal(undefined);
+			expect(storage.getForwardingSummary()).to.deep.equal({
+				count: 1,
+				volumeOutMsat: 1000n,
+				feesEarnedMsat: 5n,
+				auxiliary: {
+					count: 1,
+					volumeOutMsat: 5_000_000n,
+					feesEarnedMsat: 10_000n
+				}
+			});
+		} finally {
+			storage.close();
+		}
+	});
+
 	it('refuses to open a current database that lost a column', () => {
 		const file = path.join(directory, 'node.db');
 		const storage = new SqliteStorage(file);

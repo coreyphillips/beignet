@@ -96,7 +96,12 @@ import type {
 	IErrorAction
 } from './channel-actions';
 import { ChannelActionType, ChannelErrorCode } from './channel-actions';
-import type { IChannelConfig, IHtlcEntry, IHtlcSnapshotEntry } from './types';
+import type {
+	IChannelConfig,
+	IHtlcEntry,
+	IHtlcForwardTerms,
+	IHtlcSnapshotEntry
+} from './types';
 import {
 	ChannelState,
 	ChannelRole,
@@ -236,7 +241,8 @@ import {
 	isOverlayChannel,
 	receivedAddIrrevocablyCommitted,
 	scidAliasAnnounceRefusal,
-	validateV2ChannelType
+	validateV2ChannelType,
+	copyForwardTerms
 } from './types';
 import { generateNonce } from '../crypto/musig';
 import {
@@ -4150,6 +4156,18 @@ export class Channel {
 			entry.forwardOf !== undefined;
 		if (!own || (!incoming && !outgoing)) return false;
 		const leg = incoming ? 'incoming' : 'outgoing';
+		// Issue #2098, step 7: the next hop and the leg's worth, as the node
+		// kept them on the entry. An incoming bitcoin leg is worth what its
+		// HTLC carried, when the host's answer was not kept with its value.
+		const kept = entry.forwardTerms;
+		const valueMsat = !kept
+			? undefined
+			: incoming
+			? kept.incomingValueMsat ??
+			  (this._state.auxiliaryState === undefined
+					? entry.amountMsat
+					: undefined)
+			: kept.amountToForwardMsat;
 		this._state.forwardLegEnds ??= new Map();
 		this._state.forwardLegEnds.set(`${leg}:${entry.id}`, {
 			paymentHash: Buffer.from(entry.paymentHash),
@@ -4170,7 +4188,9 @@ export class Channel {
 			customRecords: copyCustomRecords(entry.customRecords) ?? new Map(),
 			...(end.preimageRevealed === true
 				? { preimageRevealed: true as const }
-				: {})
+				: {}),
+			...(kept ? { shortChannelId: Buffer.from(kept.shortChannelId) } : {}),
+			...(valueMsat !== undefined ? { valueMsat } : {})
 		});
 		delete entry.forwardTaken;
 		delete entry.forwardOf;
@@ -4212,10 +4232,19 @@ export class Channel {
 	recordForwardNeverOffered(
 		inHtlcId: bigint,
 		paymentHash: Buffer,
-		channelId?: Buffer
+		channelId?: Buffer,
+		/**
+		 * Issue #2098, step 7: the next hop the onion named and the amount it
+		 * asked the node to forward, which is what the leg never offered was
+		 * worth. Without them, what the ask kept on the received HTLC: a
+		 * refusal may come after that HTLC has left the channel.
+		 */
+		terms?: Pick<IHtlcForwardTerms, 'shortChannelId' | 'amountToForwardMsat'>
 	): boolean {
 		const own = this._state.channelId;
 		if (!own) return false;
+		const entry = this._state.htlcs.get(`received-${inHtlcId}`);
+		const kept = terms ?? entry?.forwardTerms;
 		this._state.forwardLegEnds ??= new Map();
 		this._state.forwardLegEnds.set(`never-offered:${inHtlcId}`, {
 			paymentHash: Buffer.from(paymentHash),
@@ -4225,9 +4254,14 @@ export class Channel {
 			...(channelId ? { channelId: Buffer.from(channelId) } : {}),
 			outcome: 'never-offered',
 			onChain: false,
-			customRecords: new Map()
+			customRecords: new Map(),
+			...(kept
+				? {
+						shortChannelId: Buffer.from(kept.shortChannelId),
+						valueMsat: kept.amountToForwardMsat
+				  }
+				: {})
 		});
-		const entry = this._state.htlcs.get(`received-${inHtlcId}`);
 		if (entry) entry.forwardTaken = true;
 		return true;
 	}
@@ -4320,6 +4354,31 @@ export class Channel {
 	unmarkForwardAsked(htlcId: bigint): void {
 		const entry = this._state.htlcs.get(`received-${htlcId}`);
 		if (entry) delete entry.forwardAsked;
+	}
+
+	/**
+	 * Issue #2098, step 7: the terms of its forward the node kept on the
+	 * HTLC it received with this id (IHtlcEntry.forwardTerms), as a copy.
+	 */
+	forwardTermsOf(htlcId: bigint): IHtlcForwardTerms | undefined {
+		const kept = this._state.htlcs.get(`received-${htlcId}`)?.forwardTerms;
+		return kept ? copyForwardTerms(kept) : undefined;
+	}
+
+	/**
+	 * Keeps, or with undefined drops, the terms of its forward on the HTLC
+	 * received with this id. False when the channel holds no such HTLC. The
+	 * caller writes the row.
+	 */
+	setForwardTerms(
+		htlcId: bigint,
+		terms: IHtlcForwardTerms | undefined
+	): boolean {
+		const entry = this._state.htlcs.get(`received-${htlcId}`);
+		if (!entry) return false;
+		if (terms === undefined) delete entry.forwardTerms;
+		else entry.forwardTerms = copyForwardTerms(terms);
+		return true;
 	}
 
 	/**
@@ -4505,7 +4564,9 @@ export class Channel {
 		skimmedFeeMsat?: bigint,
 		customRecords?: CustomRecords,
 		/** Issue #2098, step 5: see IHtlcEntry.forwardOf. */
-		forwardOf?: { channelId: Buffer; htlcId: bigint }
+		forwardOf?: { channelId: Buffer; htlcId: bigint },
+		/** Issue #2098, step 7: see IHtlcEntry.forwardTerms. */
+		forwardTerms?: IHtlcForwardTerms
 	): ChannelAction[] {
 		if (
 			skimmedFeeMsat !== undefined &&
@@ -4541,7 +4602,8 @@ export class Channel {
 							htlcId: forwardOf.htlcId
 						}
 				  }
-				: {})
+				: {}),
+			...(forwardTerms ? { forwardTerms: copyForwardTerms(forwardTerms) } : {})
 		};
 
 		const msg: IUpdateAddHtlcMessage = {

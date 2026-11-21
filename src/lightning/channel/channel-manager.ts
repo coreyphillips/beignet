@@ -86,6 +86,7 @@ import {
 	SUPERSEDED_ON_REVOKE_MESSAGE_TYPES
 } from './channel-actions';
 import * as bitcoin from 'bitcoinjs-lib';
+import { noDeadlineSpendMayAsk } from './fixed-output-reserve';
 import { ChainMonitor } from '../chain/chain-monitor';
 import type {
 	ChainAction,
@@ -96,6 +97,7 @@ import {
 	ChainActionType,
 	CommitmentType,
 	IRREVOCABLE_DEPTH,
+	OutputStatus,
 	OutputType,
 	FIXED_OUTPUT_FEE_TIMING,
 	fixedOutputFeeWaitMakesDeadline,
@@ -169,7 +171,7 @@ import {
 	deriveV2TemporaryChannelId,
 	isValidShutdownScript
 } from './validation';
-import type { IChannelConfig, ChannelResult } from './types';
+import type { IChannelConfig, ChannelResult, IHtlcForwardTerms } from './types';
 import {
 	DEFAULT_CHANNEL_CONFIG,
 	ChannelState,
@@ -185,7 +187,8 @@ import {
 	MAX_FUNDING_SATOSHIS,
 	MAX_WUMBO_FUNDING_SATOSHIS,
 	isOverlayChannel,
-	isFixedAssetHtlcChannel
+	isFixedAssetHtlcChannel,
+	sameForwardTerms
 } from './types';
 import type { IChannelBasepoints } from '../keys/derivation';
 import {
@@ -445,6 +448,12 @@ export interface IChannelManagerConfig {
 	 */
 	auxiliaryOpenRefusal?: Error;
 	/**
+	 * Issue #2098, step 6: asked at each incoming asset open, after
+	 * auxiliaryOpenRefusal: a refusal of the node's own when its fee policy
+	 * cannot cover the HTLCs a channel of its bound may hold on the chain.
+	 */
+	auxiliaryOpenFeeRefusal?: () => Error | undefined;
+	/**
 	 * What a peer advertised in its init, for the asset channel checks. A
 	 * node always supplies this, and with it an asset opening is refused
 	 * whenever the peer's features, or this node's own, cannot be read. A
@@ -646,6 +655,26 @@ const COMMITMENT_CPFP_REBUMP_INTERVAL = 6;
  */
 function commitmentHasNoDeadline(state: Readonly<IChannelState>): boolean {
 	return state.htlcs.size === 0;
+}
+
+/**
+ * The output a held spend of an asset channel's units spends, its first
+ * input, which every form of that spend shares: a raise adds or replaces
+ * only fee inputs after it. A transaction that cannot be read is kept by
+ * its own bytes.
+ */
+function heldSpendOutput(tx: Buffer): string {
+	try {
+		const input = bitcoin.Transaction.fromBuffer(tx).ins[0];
+		if (input) {
+			return `${Buffer.from(input.hash).reverse().toString('hex')}:${
+				input.index
+			}`;
+		}
+	} catch {
+		// Kept by its bytes below.
+	}
+	return tx.toString('hex');
 }
 
 // BOLT 7: a channel_announcement is not sent before its funding has this
@@ -914,10 +943,11 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 	private monitors: Map<string, ChainMonitor> = new Map();
 	/**
 	 * Spends of the units of an asset channel that wait for the monitor row
-	 * with their asset side to be stored, by channel. Empty on a node
-	 * without asset channels.
+	 * with their asset side to be stored, by channel, and in a channel by the
+	 * output each spends (its first input): the newest spend of each output,
+	 * in the order they came. Empty on a node without asset channels.
 	 */
-	private auxiliarySpendsHeld: Map<string, Buffer[]> = new Map();
+	private auxiliarySpendsHeld: Map<string, Map<string, Buffer>> = new Map();
 	// Latest block height seen (for stamping when a force-close CPFP was broadcast).
 	private _currentBlockHeight = 0;
 	// Channels whose channel_announcement is signed by both sides but whose
@@ -2278,6 +2308,12 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			 * host (IHtlcEntry.forwardOf).
 			 */
 			forwardOf?: { channelId: Buffer; htlcId: bigint };
+			/**
+			 * Issue #2098, step 7: the terms of the forward with an asset leg
+			 * this is the outgoing leg of, kept on the entry
+			 * (IHtlcEntry.forwardTerms).
+			 */
+			forwardTerms?: IHtlcForwardTerms;
 		}
 	): ChannelResult {
 		const emitRefusal = options?.emitRefusal !== false;
@@ -2312,7 +2348,8 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			blindingPoint,
 			skimmedFeeMsat,
 			options?.customRecords,
-			options?.forwardOf
+			options?.forwardOf,
+			options?.forwardTerms
 		);
 		// A refused add changed nothing in the channel and its ERROR carries no
 		// cleanup, so dropping it from the dispatch only drops the event.
@@ -4091,6 +4128,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			);
 		}
 		this.monitors.set(idHex, monitor);
+		this.applyFixedOutputFeeRules(idHex, monitor);
 		this._seedMonitorPreimages(idHex, monitor);
 		// Persist the monitor NOW. Without this it only reaches storage once the
 		// funding spend is detected on-chain — if the session ends first, the
@@ -4183,6 +4221,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 				perCh?.htlcBasepointSecret || this.config.htlcBasepointSecret
 			);
 			this.monitors.set(channelIdHex, monitor);
+			this.applyFixedOutputFeeRules(channelIdHex, monitor);
 			this._seedMonitorPreimages(channelIdHex, monitor);
 		} else if (reconciled?.view) {
 			monitor.setChannelState(reconciled.view);
@@ -4582,6 +4621,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 	 */
 	restoreMonitor(channelId: string, monitor: ChainMonitor): void {
 		this.monitors.set(channelId, monitor);
+		this.applyFixedOutputFeeRules(channelId, monitor);
 		if (typeof monitor.getChannelState === 'function') {
 			const monitorState = monitor.getChannelState();
 			const broadcast = monitor.getFullState().commitmentBroadcast;
@@ -5602,6 +5642,8 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		if (this.config.auxiliaryOpenRefusal) {
 			throw new AuxiliaryHostError(this.config.auxiliaryOpenRefusal);
 		}
+		const feeRefusal = this.config.auxiliaryOpenFeeRefusal?.();
+		if (feeRefusal) throw new AuxiliaryHostError(feeRefusal);
 		const config = this.config.auxiliaryChannels!;
 		const descriptor = askAuxiliaryHost(() => {
 			const answer = config.resolveIncoming(
@@ -12131,15 +12173,31 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 	 * nothing kept, when the channel does not hold the HTLC or the row could
 	 * not be written, and then the host must not be asked.
 	 */
-	recordForwardAsk(channelId: Buffer, htlcId: bigint): boolean {
+	recordForwardAsk(
+		channelId: Buffer,
+		htlcId: bigint,
+		/**
+		 * Issue #2098, step 7: the next hop the onion names and the amount it
+		 * asks the node to forward, kept with the mark (IHtlcEntry.forwardTerms).
+		 */
+		terms?: Pick<IHtlcForwardTerms, 'shortChannelId' | 'amountToForwardMsat'>
+	): boolean {
 		const hex = channelId.toString('hex');
 		const channel = this.channels.get(hex);
 		const peerPubkey = this.channelPeers.get(hex);
 		if (!channel || !peerPubkey) return false;
 		if (channel.forwardAsked(htlcId)) return true;
+		const before = channel.forwardTermsOf(htlcId);
 		if (!channel.markForwardAsked(htlcId)) return false;
+		if (terms) {
+			channel.setForwardTerms(htlcId, {
+				shortChannelId: terms.shortChannelId,
+				amountToForwardMsat: terms.amountToForwardMsat
+			});
+		}
 		if (!this._persistCommitted(channel, peerPubkey, channelId)) {
 			channel.unmarkForwardAsked(htlcId);
+			if (terms) channel.setForwardTerms(htlcId, before);
 			return false;
 		}
 		return true;
@@ -12154,16 +12212,32 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 	 * nothing kept, when the channel does not hold the HTLC or the row could
 	 * not be written.
 	 */
-	recordForwardTaken(channelId: Buffer, htlcId: bigint): boolean {
+	recordForwardTaken(
+		channelId: Buffer,
+		htlcId: bigint,
+		/**
+		 * Issue #2098, step 7: the forward's terms as the node read the
+		 * host's answer, kept with the mark (IHtlcEntry.forwardTerms) and
+		 * told with the leg's end. A second ask after a stop that answers
+		 * otherwise writes them again; the mark itself stays.
+		 */
+		terms?: IHtlcForwardTerms
+	): boolean {
 		if (!this.config.auxiliaryChannels?.onForwardLegResolved) return true;
 		const hex = channelId.toString('hex');
 		const channel = this.channels.get(hex);
 		const peerPubkey = this.channelPeers.get(hex);
 		if (!channel || !peerPubkey) return false;
-		if (channel.forwardTaken(htlcId)) return true;
-		if (!channel.markForwardTaken(htlcId)) return false;
+		const taken = channel.forwardTaken(htlcId);
+		const before = channel.forwardTermsOf(htlcId);
+		if (taken && (terms === undefined || sameForwardTerms(before, terms))) {
+			return true;
+		}
+		if (!taken && !channel.markForwardTaken(htlcId)) return false;
+		if (terms) channel.setForwardTerms(htlcId, terms);
 		if (!this._persistCommitted(channel, peerPubkey, channelId)) {
-			channel.unmarkForwardTaken(htlcId);
+			if (!taken) channel.unmarkForwardTaken(htlcId);
+			if (terms) channel.setForwardTerms(htlcId, before);
 			return false;
 		}
 		return true;
@@ -12181,14 +12255,23 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		inChannelId: Buffer,
 		inHtlcId: bigint,
 		paymentHash: Buffer,
-		channelId?: Buffer
+		channelId?: Buffer,
+		/** Issue #2098, step 7: see Channel.recordForwardNeverOffered. */
+		terms?: Pick<IHtlcForwardTerms, 'shortChannelId' | 'amountToForwardMsat'>
 	): void {
 		if (!this.config.auxiliaryChannels?.onForwardLegResolved) return;
 		const hex = inChannelId.toString('hex');
 		const channel = this.channels.get(hex);
 		const peerPubkey = this.channelPeers.get(hex);
 		if (!channel || !peerPubkey) return;
-		if (!channel.recordForwardNeverOffered(inHtlcId, paymentHash, channelId)) {
+		if (
+			!channel.recordForwardNeverOffered(
+				inHtlcId,
+				paymentHash,
+				channelId,
+				terms
+			)
+		) {
 			return;
 		}
 		if (this._persistCommitted(channel, peerPubkey, inChannelId)) {
@@ -12648,7 +12731,10 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 					paymentHash: Buffer.from(end.paymentHash),
 					incomingChannelId: Buffer.from(end.incomingChannelId),
 					...(end.channelId ? { channelId: Buffer.from(end.channelId) } : {}),
-					customRecords: new Map(end.customRecords)
+					customRecords: new Map(end.customRecords),
+					...(end.shortChannelId
+						? { shortChannelId: Buffer.from(end.shortChannelId) }
+						: {})
 				});
 				if (records.get(key) === end) {
 					records.delete(key);
@@ -13601,10 +13687,16 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			this.emit('broadcast:tx', tx);
 			return;
 		}
-		const held = this.auxiliarySpendsHeld.get(channelIdHex) ?? [];
-		if (!held.some((other) => other.equals(tx))) held.push(Buffer.from(tx));
-		// The newest few are enough: an older one was replaced many times over.
-		this.auxiliarySpendsHeld.set(channelIdHex, held.slice(-16));
+		// One spend for each output: a later spend of the same output is a
+		// raise of the earlier one, which it replaces. A channel full of HTLCs
+		// on the chain holds a spend of every one of them, so no count bounds
+		// the list but the outputs of the channel.
+		const held =
+			this.auxiliarySpendsHeld.get(channelIdHex) ?? new Map<string, Buffer>();
+		const output = heldSpendOutput(tx);
+		held.delete(output);
+		held.set(output, Buffer.from(tx));
+		this.auxiliarySpendsHeld.set(channelIdHex, held);
 		this.emitContained(
 			'error',
 			channelId,
@@ -13619,11 +13711,152 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			return;
 		}
 		this.auxiliarySpendsHeld.delete(channelIdHex);
-		for (const tx of held) this.emit('broadcast:tx', tx);
+		for (const tx of held.values()) this.emit('broadcast:tx', tx);
 	}
 
 	/** Fee actions of the fee pool being worked on, one at a time each. */
 	private fixedOutputFeesBusy = new Set<string>();
+	/**
+	 * Issue #2098, step 6: the node forwards asset HTLCs and keeps fee coins
+	 * for its spends with a deadline (setFixedOutputFeeReserve).
+	 */
+	private fixedOutputFeeReserve = false;
+	/** The deadlines of forwards' outgoing timeouts, by channel (setOfferedHtlcDeadlines). */
+	private offeredHtlcDeadlines = new Map<string, ReadonlyMap<bigint, number>>();
+
+	/**
+	 * Issue #2098, step 6: the node forwards asset HTLCs and keeps fee coins
+	 * for the spends of its asset channels' outputs that have a deadline. A
+	 * spend without a deadline then asks for its fee input only shortly
+	 * before it can confirm, and is funded only from coins beyond those the
+	 * spends with a deadline need. Off, a node funds its spends as before.
+	 */
+	setFixedOutputFeeReserve(on: boolean): void {
+		this.fixedOutputFeeReserve = on;
+		for (const [idHex, monitor] of this.monitors) {
+			this.applyFixedOutputFeeRules(idHex, monitor);
+		}
+	}
+
+	/**
+	 * Issue #2098, step 6: the heights by which the timeouts of the outgoing
+	 * HTLCs of forwards have to confirm, by outgoing channel and HTLC id, in
+	 * place of those given before. The node gives them on each block before
+	 * the monitors look at the chain, and after a start; a monitor made
+	 * later takes those of its channel.
+	 */
+	setOfferedHtlcDeadlines(
+		byChannel: ReadonlyMap<string, ReadonlyMap<bigint, number>>
+	): void {
+		this.offeredHtlcDeadlines = new Map(byChannel);
+		for (const [idHex, monitor] of this.monitors) {
+			this.applyFixedOutputFeeRules(idHex, monitor);
+		}
+	}
+
+	/** Give a monitor this node's rules for the fee coins of its spends. */
+	private applyFixedOutputFeeRules(idHex: string, monitor: ChainMonitor): void {
+		monitor.keepDeadlineFeeCoins?.(this.fixedOutputFeeReserve);
+		monitor.setOfferedHtlcDeadlines?.(
+			this.offeredHtlcDeadlines.get(idHex) ?? new Map()
+		);
+	}
+
+	/**
+	 * What the node's fee coins have to cover now (issue #2098, step 6): the
+	 * spends with a deadline it may have to fund. Each asset HTLC of a
+	 * channel of the fixed mode whose commitment has not confirmed on the
+	 * chain counts one, open or being removed; for a channel whose
+	 * commitment has, each output whose spend has a deadline and no fee
+	 * input yet counts one (ChainMonitor.fixedOutputFeeNeeds). `revoked` is
+	 * how many of those are penalties of a revoked commitment.
+	 */
+	fixedOutputFeeNeed(): { spends: number; revoked: number } {
+		const need = { spends: 0, revoked: 0 };
+		const counted = new Set<string>();
+		for (const [idHex, monitor] of this.monitors) {
+			if (typeof monitor.isCommitmentConfirmed !== 'function') continue;
+			if (!monitor.isCommitmentConfirmed()) continue;
+			const needs = monitor.fixedOutputFeeNeeds?.();
+			if (!needs) continue;
+			counted.add(idHex);
+			need.spends += needs.spends;
+			need.revoked += needs.revoked;
+		}
+		for (const channel of this.channels.values()) {
+			const state = channel.getFullState();
+			if (
+				state.auxiliaryState === undefined ||
+				!isFixedAssetHtlcChannel(state.channelType) ||
+				state.state === ChannelState.CLOSED
+			) {
+				continue;
+			}
+			if (state.channelId && counted.has(state.channelId.toString('hex'))) {
+				continue;
+			}
+			need.spends += state.htlcs.size;
+		}
+		return need;
+	}
+
+	/**
+	 * Issue #2098, step 6: whether a spend of an asset channel's output is
+	 * being given fee coins now, or asked for them and waits for the pool
+	 * (a wait whose remedy is `wait`, such as a split on its way). A spend
+	 * that leaves the coins kept for the spends with a deadline alone
+	 * (FEE_KEPT_FOR_DEADLINES), and one whose wait is for the operator or
+	 * past its deadline, does not make the node's preparation wait.
+	 */
+	fixedOutputFeesWaiting(): boolean {
+		if (this.fixedOutputFeesBusy.size > 0) return true;
+		for (const monitor of this.monitors.values()) {
+			for (const output of monitor.getTrackedOutputs?.() ?? []) {
+				const wait = output.auxiliaryFeeWait;
+				if (
+					wait &&
+					wait.remedy === 'wait' &&
+					wait.code !== 'FEE_KEPT_FOR_DEADLINES' &&
+					output.status !== OutputStatus.SPEND_CONFIRMED &&
+					output.status !== OutputStatus.IRREVOCABLY_RESOLVED
+				) {
+					return true;
+				}
+			}
+		}
+		return false;
+	}
+
+	/**
+	 * Whether a spend without a deadline may ask for fee coins now, on a
+	 * node that keeps them for its spends with a deadline: the coins ready
+	 * still pay for every such spend once this one took its own. A pool
+	 * whose status says too little to tell is asked, as before.
+	 */
+	private fixedOutputFeeReserveAllows(feeRatePerVbyte: number): boolean {
+		let status: ReturnType<
+			NonNullable<IFundingProvider['getFixedOutputFeeStatus']>
+		>;
+		try {
+			status = this.fundingProvider?.getFixedOutputFeeStatus?.();
+		} catch {
+			return true;
+		}
+		if (
+			!status ||
+			status.available !== true ||
+			!status.policy ||
+			!status.feeCoins.readyCoinSatoshis
+		) {
+			return true;
+		}
+		return noDeadlineSpendMayAsk({
+			readyCoins: status.feeCoins.readyCoinSatoshis,
+			ratePerVbyte: feeRatePerVbyte,
+			capSatoshis: status.policy.maxFeeSatoshis,
+			need: this.fixedOutputFeeNeed().spends
+		});
+	}
 	/** The fee actions whose retirement the wallet is being asked for now. */
 	private fixedOutputFeesRetiring = new Set<string>();
 	/** What was last said about a fee action, so that it is said once. */
@@ -13714,9 +13947,24 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 
 			this.emit('monitor:updated', channelIdHex, monitor);
 			if (late) {
+				// A timeout of an HTLC this node offered has a deadline only as
+				// a forward's outgoing leg (step 6 of #2098): the peer can take
+				// that output only with the preimage, and what is at stake is
+				// the incoming leg, which goes to the chain at its own deadline
+				// when the timeout is not deep enough by then.
+				const timeout =
+					monitor
+						.getTrackedOutputs?.()
+						.find(
+							(output) =>
+								output.txid === spent.txid &&
+								output.outputIndex === spent.outputIndex
+						)?.outputType === OutputType.OFFERED_HTLC;
 				say(
 					`late:${code}`,
-					`The spend of output ${spent.txid}:${spent.outputIndex} of an asset channel still has no fee input (${code}) and its deadline at height ${spent.deadlineHeight} was reached: the peer can now take the output back. The spend goes out as soon as a fee input is there.`
+					timeout
+						? `The timeout of output ${spent.txid}:${spent.outputIndex} of an asset channel, the outgoing leg of a forward, still has no fee input (${code}) and its deadline at height ${spent.deadlineHeight} was reached: the forward's incoming channel goes to the chain if the timeout is not 6 blocks deep by the incoming HTLC's own deadline. The spend goes out as soon as a fee input is there.`
+						: `The spend of output ${spent.txid}:${spent.outputIndex} of an asset channel still has no fee input (${code}) and its deadline at height ${spent.deadlineHeight} was reached: the peer can now take the output back. The spend goes out as soon as a fee input is there.`
 				);
 				return;
 			}
@@ -13731,6 +13979,25 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 				'FEE_WALLET_UNAVAILABLE',
 				'operator',
 				'the node has no wallet that prepares fee inputs'
+			);
+			return;
+		}
+		// Issue #2098, step 6: on a node that keeps fee coins for its spends
+		// with a deadline, a spend without one is first funded only while the
+		// coins ready would still pay for each of those once it took its own.
+		if (
+			replaced.length === 0 &&
+			this.fixedOutputFeeReserve &&
+			monitor.fixedOutputSpendYieldsToDeadlines?.(
+				spent.txid,
+				spent.outputIndex
+			) === true &&
+			!this.fixedOutputFeeReserveAllows(action.feeratePerVbyte)
+		) {
+			waits(
+				'FEE_KEPT_FOR_DEADLINES',
+				'wait',
+				'the fee coins ready are kept for the spends that have a deadline until more are prepared'
 			);
 			return;
 		}

@@ -179,7 +179,10 @@ describe('forwards with an asset leg as the build ships them (issue #2098, step 
 				w.wallets[name]!.fund(100_000);
 				w.wallets[name]!.fund(100_000);
 			}
-			await world.mine(w, 1);
+			// A block in which Bob splits a coin into the fee coins he keeps for
+			// his spends with a deadline, and one in which they confirm (#2098
+			// step 6): a forward goes on only once they are ready.
+			await world.mine(w, 3);
 			const held = await forwardHeld(w, `as-shipped-${shape.join('-')}`, {
 				next: w.hosts.bob.node
 					.getChannelManager()

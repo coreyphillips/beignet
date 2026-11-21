@@ -72,7 +72,8 @@ export type FixedOutputFeeErrorCode =
 	| 'FEE_PREPARATION_SIGNING_FAILED'
 	| 'FEE_POLICY_REFUSED'
 	| 'FEE_ACTION_RETIRED'
-	| 'FEE_INPUT_UNAVAILABLE';
+	| 'FEE_INPUT_UNAVAILABLE'
+	| 'FEE_COINS_SHORT';
 
 /**
  * Every refusal of the pool that is not a fault. `code` is stable, and
@@ -174,8 +175,27 @@ export interface IFixedOutputFeePoolState {
 	/**
 	 * The fee coins no action holds, as the wallet lists them now. `ready`
 	 * are confirmed, and are what a selection with confirmedOnly can take.
+	 * `readyCoinSatoshis` is the value of each, largest first: a fee coin is
+	 * spent whole, so what the ready coins can pay for is counted coin by
+	 * coin. Absent from a provider of an earlier build.
 	 */
-	feeCoins: { ready: number; readySatoshis: bigint; unconfirmed: number };
+	feeCoins: {
+		ready: number;
+		readySatoshis: bigint;
+		unconfirmed: number;
+		readyCoinSatoshis?: bigint[];
+	};
+	/**
+	 * The policy the pool works under, with the defaults it took. Absent
+	 * from a provider of an earlier build.
+	 */
+	policy?: {
+		maxFeeSatoshis: bigint;
+		maxTotalFeeSatoshis: bigint;
+		maxPreparationFeeSatoshis: bigint;
+		feeCoinCount: number;
+		preparationFeeRatePerVbyte: number;
+	};
 	/** The actions still open: each holds its cap in the budget until retired. */
 	actions: Array<{
 		feeActionId?: string;
@@ -212,6 +232,23 @@ export interface IFixedOutputFeePoolState {
 		splitCoins: number;
 	};
 	/**
+	 * Given by a node that forwards asset HTLCs (issue #2098, step 6), not
+	 * by the pool: the fee coins it keeps for the spends of its asset
+	 * channels' outputs that have a deadline. `coinSatoshis` is the size of
+	 * such a coin at `ratePerVbyte`, `need` how many such spends the coins
+	 * must cover now (`revoked` of them penalties), `fundable` how many the
+	 * coins ready pay for with whole coins at that rate, and `shortfall` the
+	 * difference when the coins fall short.
+	 */
+	reserve?: {
+		coinSatoshis: bigint;
+		ratePerVbyte: number;
+		need: number;
+		revoked: number;
+		fundable: number;
+		shortfall: number;
+	};
+	/**
 	 * The refusal the most recent refused selection of this provider ended
 	 * with, and when, in milliseconds since the epoch. It is not cleared by
 	 * a later selection that was served; compare `at`.
@@ -240,6 +277,41 @@ export interface IFixedOutputFeePoolUnavailable {
 export type IFixedOutputFeeStatus =
 	| IFixedOutputFeePoolState
 	| IFixedOutputFeePoolUnavailable;
+
+/**
+ * A request to prepare fee coins ahead of any claim (`prepare`): as many as
+ * `coins` free fee coins of at least `coinSatoshis` each, a split made at
+ * the rate of `feeratePerKw`.
+ */
+export interface IFixedOutputFeePreparationRequest {
+	coinSatoshis: bigint;
+	coins: number;
+	feeratePerKw: number;
+	/** The chain's height, by which a split of the pool's own is raised. */
+	blockHeight?: number;
+}
+
+/** What a preparation of fee coins ahead of any claim did. */
+export interface IFixedOutputFeePreparation {
+	/**
+	 * The free fee coins of at least the size asked: confirmed, listed and
+	 * not yet confirmed, of a split on its way, and made by this request.
+	 */
+	coins: number;
+	/** The split this request made, when it made one. */
+	split?: {
+		transactionId: string;
+		feeCoins: number;
+		feeCoinSatoshis: bigint;
+		feeSatoshis: bigint;
+	};
+	/**
+	 * Why no split was made while fewer coins than asked are there: a split
+	 * or its source still on its way (`FEE_PREPARATION_PENDING`), or the
+	 * refusal a selection would end with.
+	 */
+	waiting?: FixedOutputFeeErrorCode;
+}
 
 /**
  * The refusal of a provider whose fee policy the wallet refused, and
@@ -370,6 +442,8 @@ type Selection = {
 };
 /** How many retired actions the journal remembers by name. */
 const RETIRED_IDS = 128;
+/** The most fee coins one preparation may be asked to have ready. */
+const MAX_PREPARED_COINS = 10_000;
 const DEFAULT_WALLET_CALL_TIMEOUT_MS = 30_000;
 const DUST = 330;
 /** The input of a split says the split may be replaced (BIP 125). */
@@ -2292,6 +2366,172 @@ export class FixedOutputFeePool {
 			throw error;
 		}
 	}
+	/**
+	 * Prepare fee coins ahead of any claim: up to `request.coins` free fee
+	 * coins of at least `request.coinSatoshis` each. The splits on their way
+	 * are moved forward as a selection moves them, and a split of the pool's
+	 * own that has not confirmed is replaced by one that pays more when one
+	 * is due, at the rate asked and on the schedule of a claim with no
+	 * deadline. When fewer coins of that size are there, ready or coming,
+	 * and no split sits between recorded and listed, the largest confirmed
+	 * ordinary coin is split into coins of that size: as many as are missing,
+	 * at most the policy's feeCoinCount, and as many as the coin and the cap
+	 * of a split allow. The split is charged as a claim's split is; no fee
+	 * action is opened and no cap is held. A refusal of the pool is answered
+	 * as `waiting`, with nothing recorded. Coins over maxFeeSatoshis are
+	 * neither counted nor made: no fee action could spend one
+	 * (`FEE_ACTION_CAP_EXHAUSTED`).
+	 */
+	async prepare(
+		request: IFixedOutputFeePreparationRequest
+	): Promise<IFixedOutputFeePreparation> {
+		return this.locked(() => this.prepareLocked(request));
+	}
+	private async prepareLocked(
+		request: IFixedOutputFeePreparationRequest
+	): Promise<IFixedOutputFeePreparation> {
+		const { coinSatoshis, coins: wanted, feeratePerKw, blockHeight } = request;
+		if (
+			!positive(coinSatoshis) ||
+			coinSatoshis < BigInt(DUST) ||
+			!Number.isSafeInteger(wanted) ||
+			wanted < 1 ||
+			wanted > MAX_PREPARED_COINS ||
+			!Number.isSafeInteger(feeratePerKw) ||
+			feeratePerKw <= 0 ||
+			(blockHeight !== undefined &&
+				(!Number.isSafeInteger(blockHeight) || blockHeight < 0))
+		)
+			throw new Error('Invalid fixed-output fee preparation');
+		if (
+			`${this.wallet.network ?? 'bitcoin'}:${
+				this.policy.walletId ?? this.wallet.id
+			}` !== this.identity
+		)
+			throw new Error('Fixed-output wallet identity changed');
+		this.reload();
+		await this.completeRetirements();
+		await this.releaseOrphans();
+		const failures = new Map<string, Error>();
+		await this.refresh();
+		await this.each((row) => this.resume(row), failures);
+		await this.refresh();
+		await this.each((row) => this.observe(row), failures);
+		const derived = copy(this.journal);
+		if (this.recordMoves(derived)) this.save(derived);
+		await this.settleUnconfirmed();
+		const splitAt = this.splitRate(feeratePerKw);
+		// A split that has not confirmed is replaced when one is due, as for
+		// a claim with no deadline. One that cannot be replaced now is tried
+		// again by the next request.
+		if (blockHeight !== undefined)
+			for (const row of copy(this.journal.unconfirmed ?? [])) {
+				const txid = this.txidOf(row);
+				if (!txid) continue;
+				try {
+					await this.raiseIfDue(txid, splitAt, {
+						fixedOutputs: true,
+						blockHeight
+					});
+				} catch (error) {
+					if (!(error instanceof FixedOutputFeeError) || timedOut(error))
+						throw error;
+				}
+			}
+		const live = this.wallet.listUtxos!();
+		const listed = new Map(live.map((coin) => [key(coin), coin]));
+		const onTheWay = new Set(
+			(this.journal.unconfirmed ?? [])
+				.filter((row) => !row.listed)
+				.map((row) => this.txidOf(row)!)
+		);
+		const stays = (coin: Coin): boolean =>
+			listed.has(key(coin.utxo)) ||
+			onTheWay.has(coin.utxo.tx_hash.toLowerCase());
+		// A free fee coin the wallet no longer lists is no longer the pool's,
+		// as in a selection.
+		if ((this.journal.coins ?? []).some((c) => !stays(c))) {
+			const next = copy(this.journal);
+			next.coins = next.coins!.filter((c) => stays(c));
+			this.save(next);
+		}
+		await this.freezeCoins();
+		// What is there: the free fee coins of the size asked, confirmed or
+		// not, and the coins of a split recorded and not yet listed. A coin
+		// over the cap of one action pays for no spend, and is not counted.
+		const cap = this.policy.maxFeeSatoshis;
+		const sized = (value: bigint): boolean =>
+			value >= coinSatoshis && value <= cap;
+		let have = (this.journal.coins ?? []).filter((coin) =>
+			sized(BigInt(coin.utxo.value))
+		).length;
+		for (const row of this.journal.preparations)
+			if (row.state !== 'building' && sized(BigInt(row.amount)))
+				have += row.count;
+		if (have >= wanted) return { coins: have };
+		// No coin over the cap is made: no fee action could spend it.
+		if (coinSatoshis > cap) {
+			return { coins: have, waiting: 'FEE_ACTION_CAP_EXHAUSTED' };
+		}
+		const failure = failures.values().next();
+		if (!failure.done) {
+			if (failure.value instanceof FixedOutputFeeError)
+				return { coins: have, waiting: failure.value.code };
+			throw failure.value;
+		}
+		if (
+			this.journal.preparations.some(
+				(row) => row.state === 'signed' || row.state === 'published'
+			) ||
+			(this.journal.coins ?? []).some((coin) => !listed.has(key(coin.utxo)))
+		)
+			return { coins: have, waiting: 'FEE_PREPARATION_PENDING' };
+		const reserved = this.latest().reserved;
+		const ordinary = live.filter((coin) => this.ordinary(coin, reserved));
+		const large = (coin: ISpliceUtxo): boolean =>
+			BigInt(coin.value) >=
+			coinSatoshis + this.policy.maxPreparationFeeSatoshis;
+		const source = ordinary
+			.filter((coin) => coin.height > 0 && large(coin))
+			.sort((a, b) => b.value - a.value)[0];
+		if (!source)
+			return {
+				coins: have,
+				waiting: ordinary.some((coin) => coin.height <= 0 && large(coin))
+					? 'FEE_PREPARATION_PENDING'
+					: 'FEE_FUNDS_UNAVAILABLE'
+			};
+		const most = Math.min(
+			this.policy.feeCoinCount ?? 4,
+			wanted - have,
+			Number(
+				(BigInt(source.value) - this.policy.maxPreparationFeeSatoshis) /
+					coinSatoshis
+			)
+		);
+		try {
+			const made = await this.recordSplit(
+				source,
+				coinSatoshis,
+				most,
+				splitAt,
+				blockHeight
+			);
+			return {
+				coins: have + made.count,
+				split: {
+					transactionId: made.transactionId,
+					feeCoins: made.count,
+					feeCoinSatoshis: made.amount,
+					feeSatoshis: made.fee
+				}
+			};
+		} catch (error) {
+			if (error instanceof FixedOutputFeeError && !timedOut(error))
+				return { coins: have, waiting: error.code };
+			throw error;
+		}
+	}
 	/** An unfrozen P2WPKH coin of the wallet that the pool does not hold. */
 	private ordinary(coin: ISpliceUtxo, reserved: Set<string>): boolean {
 		if (
@@ -2321,15 +2561,22 @@ export class FixedOutputFeePool {
 		const { journal, reserved } = this.latest();
 		const live = this.wallet.listUtxos!();
 		const listed = new Map(live.map((coin) => [key(coin), coin]));
-		const feeCoins = { ready: 0, readySatoshis: 0n, unconfirmed: 0 };
+		const feeCoins = {
+			ready: 0,
+			readySatoshis: 0n,
+			unconfirmed: 0,
+			readyCoinSatoshis: [] as bigint[]
+		};
 		for (const coin of journal.coins ?? []) {
 			const current = listed.get(key(coin.utxo));
 			if (!current) continue;
 			if (current.height > 0) {
 				feeCoins.ready++;
 				feeCoins.readySatoshis += BigInt(current.value);
+				feeCoins.readyCoinSatoshis.push(BigInt(current.value));
 			} else feeCoins.unconfirmed++;
 		}
+		feeCoins.readyCoinSatoshis.sort((a, b) => (a < b ? 1 : a > b ? -1 : 0));
 		const needed =
 			(fee > BigInt(DUST) ? fee : BigInt(DUST)) +
 			this.policy.maxPreparationFeeSatoshis;
@@ -2351,6 +2598,13 @@ export class FixedOutputFeePool {
 			available: true,
 			budget: this.budgetOf(journal),
 			feeCoins,
+			policy: {
+				maxFeeSatoshis: this.policy.maxFeeSatoshis,
+				maxTotalFeeSatoshis: this.policy.maxTotalFeeSatoshis,
+				maxPreparationFeeSatoshis: this.policy.maxPreparationFeeSatoshis,
+				feeCoinCount: this.policy.feeCoinCount ?? 4,
+				preparationFeeRatePerVbyte: this.policy.preparationFeeRatePerVbyte ?? 1
+			},
 			actions: Object.values(journal.actions)
 				.filter((action) => !action.retired)
 				.map((action) => ({
@@ -2395,6 +2649,88 @@ export class FixedOutputFeePool {
 						: 0
 			},
 			...(this.lastRefusal ? { lastRefusal: { ...this.lastRefusal } } : {})
+		};
+	}
+	/**
+	 * Record, sign and send a split of `source` into at most `most` fee
+	 * coins of `amount` each at the rate `splitAt`, or fewer or at a lower
+	 * rate when that does not fit the cap of a split. The split and its
+	 * whole fee are computed and checked before anything is recorded or
+	 * frozen, and its cap has room in the budget first. Answers the split
+	 * as it went out.
+	 */
+	private async recordSplit(
+		source: ISpliceUtxo,
+		amount: bigint,
+		most: number,
+		splitAt: number,
+		blockHeight: number | undefined
+	): Promise<{
+		transactionId: string;
+		count: number;
+		amount: bigint;
+		fee: bigint;
+	}> {
+		const coin: Coin = {
+			utxo: { ...source },
+			previous: await this.previous(source.tx_hash)
+		};
+		this.checkCoin(coin);
+		const addressResult = await this.bounded('a change address request', () =>
+			this.wallet.getChangeAddress!(EAddressType.p2wpkh)
+		);
+		if (addressResult.isErr())
+			throw new FixedOutputFeeError(
+				'FEE_WALLET_UNAVAILABLE',
+				'wait',
+				'Fixed-output fee address unavailable'
+			);
+		const address = (
+			addressResult as {
+				isErr(): boolean;
+				isOk(): boolean;
+				value: { address: string };
+			}
+		).value.address;
+		this.owner(bitcoin.address.toOutputScript(address, this.network));
+		const plan = this.planSplit(coin, address, Number(amount), most, splitAt);
+		const rate = plan.rate;
+		// A new split: its cap has room in the budget before it is recorded.
+		this.assertRoom(this.policy.maxPreparationFeeSatoshis);
+		const next = copy(this.journal),
+			number = next.next ?? next.preparations.length,
+			row: Preparation = {
+				id: String(number),
+				state: 'unsigned',
+				source: coin,
+				address,
+				amount: Number(amount),
+				count: plan.count,
+				fee: String(plan.fee),
+				cap: this.policy.maxPreparationFeeSatoshis.toString(),
+				rate,
+				...(blockHeight !== undefined ? { at: blockHeight } : {}),
+				unsigned: plan.unsigned
+			};
+		this.validateUnsigned(row);
+		next.preparations.push(row);
+		next.next = number + 1;
+		await this.freeze(
+			source.tx_hash,
+			source.tx_pos,
+			this.prefix + ':source:' + row.id
+		);
+		this.save(next);
+		await this.resume(row);
+		await this.refresh();
+		const stored =
+			this.journal.preparations.find((p) => p.id === row.id) ??
+			(this.journal.unconfirmed ?? []).find((p) => p.id === row.id)!;
+		return {
+			transactionId: this.txidOf(stored)!,
+			count: plan.count,
+			amount,
+			fee: BigInt(plan.fee)
 		};
 	}
 	private async selectLocked(
@@ -2955,77 +3291,25 @@ export class FixedOutputFeePool {
 					'No confirmed ordinary Bitcoin coin can prepare fixed-output fees'
 				);
 			}
-			const coin: Coin = {
-				utxo: { ...source },
-				previous: await this.previous(source.tx_hash)
-			};
-			this.checkCoin(coin);
-			const addressResult = await this.bounded('a change address request', () =>
-				this.wallet.getChangeAddress!(EAddressType.p2wpkh)
-			);
-			if (addressResult.isErr())
-				throw new FixedOutputFeeError(
-					'FEE_WALLET_UNAVAILABLE',
-					'wait',
-					'Fixed-output fee address unavailable'
-				);
-			const address = (
-				addressResult as {
-					isErr(): boolean;
-					isOk(): boolean;
-					value: { address: string };
-				}
-			).value.address;
-			this.owner(bitcoin.address.toOutputScript(address, this.network));
 			// The split and its whole fee, before anything is recorded or
-			// frozen: one that cannot fit its cap leaves nothing behind.
-			// It pays the rate of the spend it is made for, never less than
-			// the policy's own rate and never more than the cap of a split.
-			const plan = this.planSplit(
-				coin,
-				address,
-				Number(amount),
-				Math.min(
-					this.policy.feeCoinCount ?? 4,
-					Number(
-						(BigInt(source.value) - this.policy.maxPreparationFeeSatoshis) /
-							amount
-					)
-				),
-				splitAt
-			);
-			const rate = plan.rate;
-			// A new split: its cap has room in the budget before it is recorded.
-			this.assertRoom(this.policy.maxPreparationFeeSatoshis);
-			const next = copy(this.journal),
-				number = next.next ?? next.preparations.length,
-				row: Preparation = {
-					id: String(number),
-					state: 'unsigned',
-					source: coin,
-					address,
-					amount: Number(amount),
-					count: plan.count,
-					fee: String(plan.fee),
-					cap: this.policy.maxPreparationFeeSatoshis.toString(),
-					rate,
-					...(opts.blockHeight !== undefined ? { at: opts.blockHeight } : {}),
-					unsigned: plan.unsigned
-				};
-			this.validateUnsigned(row);
-			next.preparations.push(row);
-			next.next = number + 1;
-			await this.freeze(
-				source.tx_hash,
-				source.tx_pos,
-				this.prefix + ':source:' + row.id
-			);
-			this.save(next);
-			await this.resume(row);
-			await this.refresh();
-			const made = this.txidOf(
-				this.journal.preparations.find((p) => p.id === row.id)!
-			)!;
+			// frozen: one that cannot fit its cap leaves nothing behind. It
+			// pays the rate of the spend it is made for, never less than the
+			// policy's own rate and never more than the cap of a split.
+			const made = (
+				await this.recordSplit(
+					source,
+					amount,
+					Math.min(
+						this.policy.feeCoinCount ?? 4,
+						Number(
+							(BigInt(source.value) - this.policy.maxPreparationFeeSatoshis) /
+								amount
+						)
+					),
+					splitAt,
+					opts.blockHeight
+				)
+			).transactionId;
 			// A spend with a deadline that may take a coin of the pool's own
 			// split before the split confirmed takes it at once, so that the
 			// two can be in one block.

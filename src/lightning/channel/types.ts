@@ -302,6 +302,51 @@ export enum HtlcState {
 	FAILED = 'FAILED'
 }
 
+/**
+ * Issue #2098, step 7: the terms of a forward with an asset leg as the node
+ * kept them on the HTLC entries of its legs (IHtlcEntry.forwardTerms).
+ */
+export interface IHtlcForwardTerms {
+	/**
+	 * The next hop the onion named: for a forward by a quote, the short
+	 * channel id the host claimed for it.
+	 */
+	shortChannelId: Buffer;
+	/** What the onion asked the node to forward: what the outgoing leg is worth. */
+	amountToForwardMsat: bigint;
+	/**
+	 * What the incoming leg is worth: the host's value of an incoming asset
+	 * leg (incomingValueMsat), else the amount of the incoming HTLC. Absent
+	 * until the host's terms are read, and when they were refused as
+	 * malformed.
+	 */
+	incomingValueMsat?: bigint;
+}
+
+/** Whether two kept terms of a forward say the same. */
+export function sameForwardTerms(
+	a: IHtlcForwardTerms | undefined,
+	b: IHtlcForwardTerms | undefined
+): boolean {
+	if (a === undefined || b === undefined) return a === b;
+	return (
+		a.shortChannelId.equals(b.shortChannelId) &&
+		a.amountToForwardMsat === b.amountToForwardMsat &&
+		a.incomingValueMsat === b.incomingValueMsat
+	);
+}
+
+/** A copy of kept terms, so that no caller shares the entry's Buffer. */
+export function copyForwardTerms(terms: IHtlcForwardTerms): IHtlcForwardTerms {
+	return {
+		shortChannelId: Buffer.from(terms.shortChannelId),
+		amountToForwardMsat: terms.amountToForwardMsat,
+		...(terms.incomingValueMsat !== undefined
+			? { incomingValueMsat: terms.incomingValueMsat }
+			: {})
+	};
+}
+
 export interface IHtlcEntry {
 	id: bigint;
 	amountMsat: bigint;
@@ -464,6 +509,18 @@ export interface IHtlcEntry {
 	 * drops it.
 	 */
 	forwardOf?: { channelId: Buffer; htlcId: bigint };
+	/**
+	 * Issue #2098, step 7: what the node kept of the terms of the forward
+	 * with an asset leg this HTLC is a leg of, to tell its host with the
+	 * leg's end and to write the forward into the forwarding history. On a
+	 * received HTLC, the next hop and the amount to forward are written with
+	 * the mark that the node asks (forwardAsked), and what the incoming leg
+	 * is worth with the mark that its host took the forward on
+	 * (forwardTaken). On an offered HTLC all three are written with the add,
+	 * whatever hooks the host supplies. A build that does not know the field
+	 * drops it.
+	 */
+	forwardTerms?: IHtlcForwardTerms;
 	/**
 	 * FFOR Variant D (section 9.5.1 step 3): this HTLC is a voucher of the
 	 * channel's epoch, recognised from the book by (id, amount, hash, cltv).

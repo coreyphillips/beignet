@@ -164,6 +164,17 @@ export interface IFundingProvider {
 	 * was handed back.
 	 */
 	releaseFixedOutputFeeCoins?(): Promise<boolean>;
+	/**
+	 * Prepare fee coins ahead of any claim: up to `request.coins` free fee
+	 * coins of at least `request.coinSatoshis` each, by a split of the
+	 * wallet's own when fewer are there. Resolves to what it did, or why it
+	 * made no split; undefined when no fee policy is configured.
+	 */
+	prepareFixedOutputFees?(
+		request: import('../wallet/fixed-output-fees').IFixedOutputFeePreparationRequest
+	): Promise<
+		import('../wallet/fixed-output-fees').IFixedOutputFeePreparation | undefined
+	>;
 	/** The lifetime budget for fixed-output fees; undefined when none is configured. */
 	getFixedOutputFeeBudget?():
 		| import('../wallet/fixed-output-fees').IFixedOutputFeeBudget
@@ -2061,6 +2072,73 @@ export type AuxiliaryPaymentGate = (payment: {
 	 */
 	routeAmountMsat: bigint;
 }) => string | IAuxiliaryPaymentRefusal | undefined;
+
+/**
+ * Issue #2098, step 7: a forward with an asset leg as the gate set on the
+ * node (setAuxiliaryForwardGate) judges it. Every field is a copy.
+ */
+export interface IAuxiliaryGatedForward {
+	paymentHash: Buffer;
+	/**
+	 * The next hop the onion names: for a forward by a quote, the short
+	 * channel id the host claimed for it.
+	 */
+	shortChannelId: Buffer;
+	/** The HTLC the forward came in on, irrevocably committed on its channel. */
+	incoming: {
+		channelId: Buffer;
+		peerPubkey: string;
+		htlcId: bigint;
+		/** The bitcoin it carries on the wire: for an asset leg, its carrier. */
+		wireAmountMsat: bigint;
+		/** The units it carries: an asset leg only. */
+		auxiliaryAmount?: bigint;
+		/**
+		 * What it is worth: the host's value of an asset leg
+		 * (incomingValueMsat), the amount of a bitcoin leg.
+		 */
+		valueMsat: bigint;
+		/** It came in on an asset channel. */
+		auxiliaryChannel: boolean;
+	};
+	/**
+	 * The HTLC the node is about to offer. Its units are not given: the
+	 * provider reads them from the records the host made, at the add.
+	 */
+	outgoing: {
+		channelId: Buffer;
+		peerPubkey: string;
+		/** The bitcoin it is to carry on the wire: for an asset leg, the carrier the host made. */
+		wireAmountMsat: bigint;
+		/** What it is worth: the amount the onion asks the node to forward. */
+		amountMsat: bigint;
+		/** It leaves over an asset channel. */
+		auxiliaryChannel: boolean;
+	};
+	/**
+	 * The node's fee: what the incoming leg is worth less the amount it
+	 * forwards, at or above the outgoing channel's by the node's own check.
+	 */
+	feeMsat: bigint;
+}
+
+/** A forward gate's refusal that names its own stable reason beside the sentence. */
+export type IAuxiliaryForwardRefusal = IAuxiliaryPaymentRefusal;
+
+/**
+ * Issue #2098, step 7: judges a forward with an asset leg after its host's
+ * terms are read and the node's own checks before the add have passed, and
+ * before anything of it is offered or linked. Undefined lets it through, a
+ * string is the reason it is refused, and an IAuxiliaryForwardRefusal is
+ * that with the gate's own stable code. A gate that throws, or answers with
+ * a promise, refuses. It is synchronous and must not act on the node: it
+ * runs between the node's look at its fee coins and the add. The checks of
+ * the outgoing channel at the add come after it, so a forward it lets
+ * through may still be refused there.
+ */
+export type AuxiliaryForwardGate = (
+	forward: IAuxiliaryGatedForward
+) => string | IAuxiliaryForwardRefusal | undefined;
 
 /**
  * An asset payment refused before anything left this node, or an ordinary

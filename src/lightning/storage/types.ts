@@ -352,7 +352,12 @@ export interface IPeerStorageBlobStorage {
 	deletePeerStorageBlob(peerPubkey: string): void;
 }
 
-/** The settled-forward ledger. */
+/**
+ * The settled-forward ledger. Since issue #2098, step 7, a backend keeps the
+ * fields that mark a forward with an asset leg (IForwardingEvent.auxiliary
+ * and the fields beside it) and lists them back as saved, and its summary
+ * counts such forwards apart (IForwardingSummary.auxiliary).
+ */
 export interface IForwardingStorage {
 	/** Persist one settled forward (both legs fulfilled). */
 	saveForwardingEvent(event: Omit<IForwardingEvent, 'id'>): void;
@@ -749,10 +754,41 @@ export interface IForwardingEvent {
 	outChannelId: string;
 	inScid?: string;
 	outScid?: string;
+	/**
+	 * What the incoming leg was worth. For a forward with an asset leg
+	 * (`auxiliary`) that is the host's value of an incoming asset leg, or
+	 * the amount of an incoming bitcoin leg, and never a carrier.
+	 */
 	amountInMsat: bigint;
+	/**
+	 * What the outgoing leg was worth. For a forward with an asset leg, the
+	 * amount the onion asked the node to forward, and never a carrier.
+	 */
 	amountOutMsat: bigint;
 	/** amountInMsat - amountOutMsat: the fee we earned. */
 	feeMsat: bigint;
+	/**
+	 * Issue #2098, step 7: present, and true, only on a forward with an
+	 * asset leg. Its amounts are then what its legs were worth, the reverse
+	 * of a payment record's (where the amount is the carrier and
+	 * auxiliaryValueMsat the worth), so that the fee stays in less out and a
+	 * build that does not know the mark reads sensible amounts. No bitcoin
+	 * total counts it (IForwardingSummary.auxiliary does).
+	 */
+	auxiliary?: true;
+	/** The units the incoming HTLC carried: an incoming asset leg only. */
+	inAuxiliaryAmount?: bigint;
+	/** The bitcoin the incoming HTLC carried on the wire, its carrier: an incoming asset leg only. */
+	inWireAmountMsat?: bigint;
+	/** The units the outgoing HTLC carried: an outgoing asset leg only. */
+	outAuxiliaryAmount?: bigint;
+	/** The bitcoin the outgoing HTLC carried on the wire, its carrier: an outgoing asset leg only. */
+	outWireAmountMsat?: bigint;
+	/**
+	 * The next hop the onion named, hex: for a forward by a quote, the short
+	 * channel id its host claimed for it. A forward with an asset leg only.
+	 */
+	nextHopScid?: string;
 }
 
 export interface IForwardingEventFilter {
@@ -767,9 +803,19 @@ export interface IForwardingEventFilter {
 }
 
 export interface IForwardingSummary {
+	/** Ordinary forwards: a forward with an asset leg counts in `auxiliary`. */
 	count: number;
 	volumeOutMsat: bigint;
 	feesEarnedMsat: bigint;
+	/**
+	 * Issue #2098, step 7: the same totals over the forwards with an asset
+	 * leg, at what their legs were worth. Present only when there is one.
+	 */
+	auxiliary?: {
+		count: number;
+		volumeOutMsat: bigint;
+		feesEarnedMsat: bigint;
+	};
 }
 
 export interface IInvoiceInfo {

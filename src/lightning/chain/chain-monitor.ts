@@ -26,7 +26,8 @@ import {
 	CommitmentType,
 	OutputStatus,
 	OutputType,
-	IRREVOCABLE_DEPTH
+	IRREVOCABLE_DEPTH,
+	FIXED_OUTPUT_FEE_TIMING
 } from './types';
 import {
 	classifyCommitmentTx,
@@ -107,6 +108,19 @@ export class ChainMonitor {
 	 * in its place. Not persisted, for the same reason as the flag above.
 	 */
 	private _commitmentDepthUnverified = false;
+	/**
+	 * Issue #2098, step 6: the node forwards asset HTLCs and keeps fee coins
+	 * for its spends with a deadline, so a spend without one asks for its
+	 * fee input only shortly before it can confirm, and a spend near its
+	 * deadline is raised sooner. Set by the channel manager; not persisted.
+	 */
+	private _keepsDeadlineFeeCoins = false;
+	/**
+	 * Issue #2098, step 6: the heights by which the timeouts of HTLCs this
+	 * node offered as the outgoing legs of forwards have to confirm, by HTLC
+	 * id. Given by the node on each block; not persisted.
+	 */
+	private _offeredHtlcDeadlines = new Map<string, number>();
 
 	constructor(
 		channelState: IChannelState,
@@ -1053,7 +1067,8 @@ export class ChainMonitor {
 						output.status === OutputStatus.SPEND_BROADCAST &&
 						output.broadcastHeight !== undefined &&
 						output.sweepTxHex !== undefined &&
-						blockHeight - output.broadcastHeight >= REBROADCAST_INTERVAL
+						blockHeight - output.broadcastHeight >=
+							this._raiseInterval(output, blockHeight)
 					) {
 						const originalRate =
 							output.originalFeeRate || this._feeRatePerVbyte;
@@ -1126,7 +1141,7 @@ export class ChainMonitor {
 					);
 				}
 				const blocksSinceBroadcast = blockHeight - output.broadcastHeight;
-				if (blocksSinceBroadcast >= REBROADCAST_INTERVAL) {
+				if (blocksSinceBroadcast >= this._raiseInterval(output, blockHeight)) {
 					// Bump the fee rate, but never below the current network estimate
 					// (the node feeds live rates via updateFeeRate). This lets a sweep
 					// catch up to a fee spike instead of crawling 1.5x per interval.
@@ -2198,11 +2213,153 @@ export class ChainMonitor {
 			fixedOutput: {
 				txid: output.txid,
 				outputIndex: output.outputIndex,
-				...(output.outputType === OutputType.RECEIVED_HTLC && output.cltvExpiry
-					? { deadlineHeight: output.cltvExpiry }
+				...(this._fixedOutputDeadline(output) !== undefined
+					? { deadlineHeight: this._fixedOutputDeadline(output) }
 					: {})
 			}
 		};
+	}
+
+	/**
+	 * The height by which the spend of an output of an asset channel has to
+	 * confirm, when it has one: the expiry of a received HTLC, which its
+	 * claim by preimage has to beat, and the height the node gave the
+	 * timeout of a forward's outgoing HTLC.
+	 */
+	private _fixedOutputDeadline(output: ITrackedOutput): number | undefined {
+		if (output.outputType === OutputType.RECEIVED_HTLC && output.cltvExpiry) {
+			return output.cltvExpiry;
+		}
+		// The timeout of an HTLC the node offered as a forward's outgoing leg:
+		// the height the node gave it (step 6 of #2098).
+		if (
+			output.outputType === OutputType.OFFERED_HTLC &&
+			output.isSecondLevelHtlc !== true &&
+			output.htlcId !== undefined
+		) {
+			return this._offeredHtlcDeadlines.get(output.htlcId.toString());
+		}
+		return undefined;
+	}
+
+	/**
+	 * Whether the spend of an output waits to ask for its fee input: on a
+	 * node that keeps fee coins for its spends with a deadline (step 6 of
+	 * #2098), a spend without one that cannot confirm for more than
+	 * FIXED_OUTPUT_FEE_TIMING.noDeadlineAskBlocks blocks yet. A penalty can
+	 * confirm at once and never waits.
+	 */
+	private _defersFeeAsk(output: ITrackedOutput): boolean {
+		return (
+			this._keepsDeadlineFeeCoins &&
+			this._fixedOutputDeadline(output) === undefined &&
+			output.maturityHeight !== undefined &&
+			this._currentBlockHeight <
+				output.maturityHeight - FIXED_OUTPUT_FEE_TIMING.noDeadlineAskBlocks
+		);
+	}
+
+	/**
+	 * Keep fee coins for the spends with a deadline (step 6 of #2098): a
+	 * spend without one asks for its fee input only shortly before it can
+	 * confirm (_defersFeeAsk), and a spend near its deadline is raised
+	 * sooner (_raiseInterval). With false, as before.
+	 */
+	keepDeadlineFeeCoins(on: boolean): void {
+		this._keepsDeadlineFeeCoins = on;
+	}
+
+	/**
+	 * The heights by which the timeouts of HTLCs this node offered as the
+	 * outgoing legs of forwards have to confirm, by HTLC id, in place of
+	 * those given before. Kept in memory: the node gives them again on each
+	 * block and after a start.
+	 */
+	setOfferedHtlcDeadlines(deadlines: ReadonlyMap<bigint, number>): void {
+		this._offeredHtlcDeadlines = new Map(
+			[...deadlines].map(([id, height]) => [id.toString(), height])
+		);
+	}
+
+	/**
+	 * How many blocks a spend that has gone out waits before it is raised:
+	 * on a node that keeps fee coins for its spends with a deadline, a spend
+	 * of the fee pool's coins whose deadline is near is raised every few
+	 * blocks; any other, as before.
+	 */
+	private _raiseInterval(output: ITrackedOutput, blockHeight: number): number {
+		if (!this._keepsDeadlineFeeCoins || !output.auxiliaryFeeFunding) {
+			return REBROADCAST_INTERVAL;
+		}
+		const deadline = this._fixedOutputDeadline(output);
+		return deadline !== undefined &&
+			deadline - blockHeight <= FIXED_OUTPUT_FEE_TIMING.nearDeadlineBlocks
+			? FIXED_OUTPUT_FEE_TIMING.splitRaiseBlocksNearDeadline
+			: REBROADCAST_INTERVAL;
+	}
+
+	/**
+	 * Whether the spend of an output leaves the fee coins kept for spends
+	 * with a deadline alone (step 6 of #2098): on a node that keeps them, a
+	 * spend that has no deadline and is no penalty.
+	 */
+	fixedOutputSpendYieldsToDeadlines(
+		txid: string,
+		outputIndex: number
+	): boolean {
+		const output = this._fixedOutput(txid, outputIndex);
+		if (!output || !this._keepsDeadlineFeeCoins) return false;
+		const penalty =
+			this._commitmentBroadcast?.commitmentType ===
+				CommitmentType.THEIR_REVOKED_COMMITMENT &&
+			(output.outputType !== OutputType.TO_REMOTE ||
+				output.isSecondLevelHtlc === true);
+		return !penalty && this._fixedOutputDeadline(output) === undefined;
+	}
+
+	/**
+	 * What the fee coins of the node have to cover for this channel once its
+	 * commitment is on the chain: each output whose spend has a deadline and
+	 * no fee input yet. A received HTLC, which the node claims once it can,
+	 * an output the node gave a deadline, and every output of a revoked
+	 * commitment of the peer and of a second-level transaction of one, whose
+	 * penalty races the peer. `revoked` counts those penalties: the peer's
+	 * second-level transaction may take the first, and a second penalty then
+	 * follows. Nothing for a channel that is not an asset channel.
+	 */
+	fixedOutputFeeNeeds(): { spends: number; revoked: number } {
+		const needs = { spends: 0, revoked: 0 };
+		if (!this._channelState.auxiliaryState || !this._commitmentBroadcast) {
+			return needs;
+		}
+		const revoked =
+			this._commitmentBroadcast.commitmentType ===
+			CommitmentType.THEIR_REVOKED_COMMITMENT;
+		for (const output of this._trackedOutputs) {
+			if (
+				output.status === OutputStatus.SPEND_CONFIRMED ||
+				output.status === OutputStatus.IRREVOCABLY_RESOLVED
+			) {
+				continue;
+			}
+			if (output.sweepTxHex !== undefined && !this._awaitsFeeInput(output)) {
+				continue;
+			}
+			const penalty =
+				revoked &&
+				(output.outputType !== OutputType.TO_REMOTE ||
+					output.isSecondLevelHtlc === true);
+			if (penalty) {
+				needs.spends++;
+				needs.revoked++;
+			} else if (
+				output.outputType === OutputType.RECEIVED_HTLC ||
+				this._fixedOutputDeadline(output) !== undefined
+			) {
+				needs.spends++;
+			}
+		}
+		return needs;
 	}
 
 	/**
@@ -2282,6 +2439,7 @@ export class ChainMonitor {
 				funded = false;
 			}
 			if (funded) continue;
+			if (this._defersFeeAsk(output)) continue;
 			actions.push(
 				this._fixedOutputFeeAction(
 					output,
@@ -2455,8 +2613,8 @@ export class ChainMonitor {
 			sinceHeight:
 				output.auxiliaryFeeWait?.sinceHeight ??
 				Math.max(height ?? 0, this._currentBlockHeight),
-			...(output.outputType === OutputType.RECEIVED_HTLC && output.cltvExpiry
-				? { deadlineHeight: output.cltvExpiry }
+			...(this._fixedOutputDeadline(output) !== undefined
+				? { deadlineHeight: this._fixedOutputDeadline(output) }
 				: {})
 		};
 	}
@@ -3537,9 +3695,11 @@ export class ChainMonitor {
 			// Timelock not yet matured — hold; handleNewBlock releases it.
 			r.trackedOutput.status = OutputStatus.CONFIRMED;
 
-			if (fixed && !kept) {
+			if (fixed && !kept && !this._defersFeeAsk(r.trackedOutput)) {
 				// The fee input is asked for at once, so that it is there by
-				// the time the spend may go out.
+				// the time the spend may go out. On a node that keeps fee coins
+				// for its spends with a deadline, a spend without one asks a few
+				// blocks before it may go out (_retryFixedOutputFees).
 				actions.push(this._fixedOutputFeeAction(r.trackedOutput, description));
 			}
 		}

@@ -1279,6 +1279,103 @@ export function storageConformanceChecks(
 		}
 	);
 
+	optional(
+		'forwarding',
+		'a forward with an asset leg keeps what marks it, and its totals stand apart (issue #2098, step 7)',
+		(s) => {
+			const ordinary = {
+				settledAt: 100,
+				inChannelId: 'a',
+				outChannelId: 'b',
+				amountInMsat: 1_005n,
+				amountOutMsat: 1_000n,
+				feeMsat: 5n
+			};
+			const marked = {
+				settledAt: 200,
+				inChannelId: 'c',
+				outChannelId: 'd',
+				amountInMsat: 5_010_000n,
+				amountOutMsat: 5_000_000n,
+				feeMsat: 10_000n,
+				auxiliary: true as const,
+				inAuxiliaryAmount: 5_010n,
+				inWireAmountMsat: 354_000n,
+				outAuxiliaryAmount: 18_446_744_073_709_551_615n,
+				outWireAmountMsat: 354_000n,
+				nextHopScid: '0102030405060708'
+			};
+			s.saveForwardingEvent(ordinary);
+			s.saveForwardingEvent(marked);
+			const [newest, oldest] = s.listForwardingEvents();
+			same(
+				[
+					newest.auxiliary,
+					newest.amountInMsat,
+					newest.amountOutMsat,
+					newest.feeMsat,
+					newest.inAuxiliaryAmount,
+					newest.inWireAmountMsat,
+					newest.outAuxiliaryAmount,
+					newest.outWireAmountMsat,
+					newest.nextHopScid
+				],
+				[
+					true,
+					5_010_000n,
+					5_000_000n,
+					10_000n,
+					5_010n,
+					354_000n,
+					18_446_744_073_709_551_615n,
+					354_000n,
+					'0102030405060708'
+				],
+				'a forward with an asset leg lists as it was saved'
+			);
+			same(
+				[
+					oldest.auxiliary,
+					oldest.inAuxiliaryAmount,
+					oldest.inWireAmountMsat,
+					oldest.outAuxiliaryAmount,
+					oldest.outWireAmountMsat,
+					oldest.nextHopScid
+				],
+				[undefined, undefined, undefined, undefined, undefined, undefined],
+				'an ordinary forward lists with nothing of a forward with an asset leg'
+			);
+			same(
+				s.getForwardingSummary(),
+				{
+					count: 1,
+					volumeOutMsat: 1_000n,
+					feesEarnedMsat: 5n,
+					auxiliary: {
+						count: 1,
+						volumeOutMsat: 5_000_000n,
+						feesEarnedMsat: 10_000n
+					}
+				},
+				'getForwardingSummary counts a forward with an asset leg apart'
+			);
+			same(
+				s.getForwardingSummary({ since: 150 }),
+				{
+					count: 0,
+					volumeOutMsat: 0n,
+					feesEarnedMsat: 0n,
+					auxiliary: {
+						count: 1,
+						volumeOutMsat: 5_000_000n,
+						feesEarnedMsat: 10_000n
+					}
+				},
+				'getForwardingSummary since, with only a forward with an asset leg'
+			);
+		}
+	);
+
 	optional('actionLog', 'entries list newest first and filter', (s) => {
 		const entry = (
 			category: string,

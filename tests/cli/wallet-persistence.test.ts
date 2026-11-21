@@ -83,7 +83,9 @@ describe('Daemon on-chain wallet persistence', function () {
 		// (#1670).
 		// v20 adds composite_splices, the composite splice-out records
 		// (issue #1922).
-		expect(SqliteStorage.CURRENT_SCHEMA_VERSION).to.equal(20);
+		// v21 adds forwarding_events.auxiliary_json, what marks a forward
+		// with an asset leg (issue #2098, step 7).
+		expect(SqliteStorage.CURRENT_SCHEMA_VERSION).to.equal(21);
 	});
 
 	describe('encrypted mode (default)', () => {
@@ -133,13 +135,13 @@ describe('Daemon on-chain wallet persistence', function () {
 			expect(raw.includes(markerUtxo.address)).to.equal(false);
 		});
 
-		it('recorded schema version is 20', () => {
+		it('recorded schema version is 21', () => {
 			const db = new Database(dbPath, { readonly: true });
 			try {
 				const row = db
 					.prepare('SELECT MAX(version) as v FROM schema_version')
 					.get() as { v: number };
-				expect(row.v).to.equal(20);
+				expect(row.v).to.equal(21);
 			} finally {
 				db.close();
 			}
