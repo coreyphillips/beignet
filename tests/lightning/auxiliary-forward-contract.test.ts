@@ -191,7 +191,9 @@ describe('a forward with an asset leg, under the declared contract (issue #2098,
 	it('is named among the surfaces of AUXILIARY_CHANNELS_API from the build that runs it, with nothing left declared (step 5)', () => {
 		const api = lightningChannel.AUXILIARY_CHANNELS_API;
 		expect(api.version).to.equal(1);
-		expect([...api.declared]).to.deep.equal([]);
+		// Issue #2098, step 8 declares receiving in parts until the build
+		// that runs it; nothing of forwards is left declared.
+		expect([...api.declared]).to.deep.equal(['receiveInParts']);
 		expect(Object.isFrozen(api.declared)).to.equal(true);
 		const surface: lightningChannel.AuxiliaryChannelsSurface = 'prepareForward';
 		expect((api.surfaces as readonly string[]).includes(surface)).to.equal(

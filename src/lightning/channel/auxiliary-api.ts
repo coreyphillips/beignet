@@ -87,8 +87,10 @@ export const AUXILIARY_CHANNELS_API = Object.freeze({
 		// before anything of it is offered.
 		'setAuxiliaryForwardGate'
 	] as const),
-	// Nothing is declared and not run in this build.
-	declared: Object.freeze([] as const)
+	// Declared and not yet run: an asset invoice paid in parts, collected
+	// into one set for a host that sets receiveInParts (issue #2098, step
+	// 8). It moves to surfaces in the build that runs it.
+	declared: Object.freeze(['receiveInParts'] as const)
 });
 
 /** A name in `AUXILIARY_CHANNELS_API.surfaces`. */

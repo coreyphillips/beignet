@@ -100,7 +100,10 @@ import type {
 	IAuxiliaryForwardRequest,
 	IAuxiliaryForwardTerms
 } from '../channel/auxiliary-forward';
-import { auxiliaryForwards } from '../channel/auxiliary-switch';
+import {
+	auxiliaryForwards,
+	auxiliaryPartsReceived
+} from '../channel/auxiliary-switch';
 import { copyCustomRecords } from '../message/custom-records';
 import {
 	AuxiliaryGuardianModeError,
@@ -21019,6 +21022,11 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			return;
 		}
 
+		// Issue #2098, step 8: a part of an asset set this node committed to
+		// settle is fulfilled, whoever dispatches it, and never failed: the
+		// set's preimage may already have left with another part.
+		if (this.fulfillCommittedSetPart(channelId, htlcId, paymentHash)) return;
+
 		// Issue #2098: the incoming leg of a forward whose end this node
 		// already decided is driven to that decision, whoever dispatches it.
 		const decided = channel.getFullState().htlcs.get(`received-${htlcId}`);
@@ -23796,41 +23804,44 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			}
 		}
 
-		// Asset channels: an asset invoice is paid by one HTLC in this build.
-		// An HTLC that carries units and is a part of a set (its onion
-		// declares a total above what it was valued at, or another HTLC is
-		// already kept for the hash) is failed back and never collected.
-		if (assetCredit) {
-			const others = [
-				...(this.heldHtlcs.get(hashHex) ?? []),
-				...(this.pendingMppPayments.get(hashHex)?.receivedParts ?? [])
-			].some(
-				(part) => !(part.htlcId === htlcId && part.channelId.equals(channelId))
-			);
-			if (
-				others ||
-				(declaredTotalMsat !== undefined && declaredTotalMsat > partAmountMsat)
-			) {
-				this.emitStructuredLog('htlc', 'asset_multi_part_refused', {
-					paymentHash: hashHex,
-					channelId: channelId.toString('hex'),
-					htlcId: htlcId.toString(),
-					valuedMsat: partAmountMsat.toString(),
-					...(declaredTotalMsat !== undefined
-						? { declaredTotalMsat: declaredTotalMsat.toString() }
-						: {})
-				});
-				const reason = sharedSecret
-					? createFailureMessage(
-							sharedSecret,
-							INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS,
-							this.incorrectPaymentDetailsData(amountMsat)
-					  )
-					: Buffer.alloc(FAILURE_MESSAGE_LENGTH);
-				this.cleanupHtlcSharedSecret(htlcSecretKey);
-				this.channelManager.failHtlc(channelId, htlcId, reason);
-				return;
-			}
+		// Asset channels: an HTLC that carries units and is a part of a set
+		// (its onion declares a total above what it was valued at, or another
+		// HTLC is already kept for the hash) is failed back and never
+		// collected, unless this node collects asset sets (issue #2098, step
+		// 8) and the part may join one. A plain part is never collected
+		// beside an asset part, either way round.
+		const setRefusal = this.assetSetPartRefusal(
+			channelId,
+			htlcId,
+			hashHex,
+			assetCredit,
+			partAmountMsat,
+			declaredTotalMsat,
+			isHold,
+			hopPayload,
+			incomingBlindingPoint
+		);
+		if (setRefusal !== undefined) {
+			this.emitStructuredLog('htlc', 'asset_multi_part_refused', {
+				paymentHash: hashHex,
+				channelId: channelId.toString('hex'),
+				htlcId: htlcId.toString(),
+				valuedMsat: partAmountMsat.toString(),
+				...(declaredTotalMsat !== undefined
+					? { declaredTotalMsat: declaredTotalMsat.toString() }
+					: {}),
+				...(setRefusal ? { reason: setRefusal } : {})
+			});
+			const reason = sharedSecret
+				? createFailureMessage(
+						sharedSecret,
+						INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS,
+						this.incorrectPaymentDetailsData(amountMsat)
+				  )
+				: Buffer.alloc(FAILURE_MESSAGE_LENGTH);
+			this.cleanupHtlcSharedSecret(htlcSecretKey);
+			this.channelManager.failHtlc(channelId, htlcId, reason);
+			return;
 		}
 
 		// Hold invoice: park the HTLC instead of settling. The preimage is revealed
@@ -26689,6 +26700,158 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			channelId: part.inChannelIdHex,
 			htlcId: part.inHtlcId
 		});
+		return true;
+	}
+
+	/**
+	 * Issue #2098, step 8: whether this node collects the parts of an asset
+	 * payment into one set. The build's switch, the host's
+	 * `receiveInParts` and basic_mpp among the node's own features, whose
+	 * absence also stops the timer that fails a set that never completes.
+	 * Read only to collect a set: nothing after a set's commit reads it.
+	 */
+	private receivesAssetParts(): boolean {
+		return (
+			auxiliaryPartsReceived.enabled &&
+			this.auxiliaryChannels?.receiveInParts === true &&
+			this.localFeatures.hasFeature(Feature.BASIC_MPP)
+		);
+	}
+
+	/** Whether a received HTLC of a channel carries asset units. */
+	private receivedHtlcCarriesUnits(channelId: Buffer, htlcId: bigint): boolean {
+		return (
+			this.channelManager
+				.getChannel(channelId)
+				?.getFullState()
+				.htlcs.get(`received-${htlcId}`)?.auxiliaryAmount !== undefined
+		);
+	}
+
+	/**
+	 * Why a part may not join a set, at the final hop: undefined when it is
+	 * no part of a set or may join one; the empty string for today's refusal
+	 * of an asset part of a set, on a node that does not collect asset sets
+	 * (receivesAssetParts), whose log then names no reason; and the reason
+	 * otherwise (issue #2098, step 8).
+	 *
+	 * An asset set is all parts with units, from one peer, unblinded, each
+	 * declaring the set's total; a hold invoice stays paid by one asset
+	 * HTLC. A plain part is refused beside an asset part being collected,
+	 * which only a node that collects asset sets can have.
+	 */
+	private assetSetPartRefusal(
+		channelId: Buffer,
+		htlcId: bigint,
+		hashHex: string,
+		assetCredit: boolean,
+		partAmountMsat: bigint,
+		declaredTotalMsat: bigint | undefined,
+		isHold: boolean,
+		hopPayload: IHopPayload | undefined,
+		incomingBlindingPoint: Buffer | undefined
+	): string | undefined {
+		const pending = this.pendingMppPayments.get(hashHex);
+		const others = (part: { channelId: Buffer; htlcId: bigint }): boolean =>
+			!(part.htlcId === htlcId && part.channelId.equals(channelId));
+		if (!assetCredit) {
+			return pending?.receivedParts.some(
+				(part) =>
+					part.status === PaymentStatus.PENDING &&
+					others(part) &&
+					this.receivedHtlcCarriesUnits(part.channelId, part.htlcId)
+			)
+				? 'mixed'
+				: undefined;
+		}
+		const held = (this.heldHtlcs.get(hashHex) ?? []).filter(others);
+		const collected = (pending?.receivedParts ?? []).filter(others);
+		if (
+			held.length === 0 &&
+			collected.length === 0 &&
+			(declaredTotalMsat === undefined || declaredTotalMsat <= partAmountMsat)
+		) {
+			return undefined;
+		}
+		if (!this.receivesAssetParts()) return '';
+		if (isHold || held.length > 0) return 'hold';
+		if (
+			incomingBlindingPoint !== undefined ||
+			hopPayload?.blindingPoint !== undefined ||
+			(hopPayload?.encryptedRecipientData?.length ?? 0) > 0
+		) {
+			return 'blinded';
+		}
+		if (declaredTotalMsat === undefined) return 'no-total';
+		if (
+			collected.some(
+				(part) => !this.receivedHtlcCarriesUnits(part.channelId, part.htlcId)
+			)
+		) {
+			return 'mixed';
+		}
+		const first = collected[0];
+		if (
+			first &&
+			this.channelManager.getPeerForChannel(first.channelId) !==
+				this.channelManager.getPeerForChannel(channelId)
+		) {
+			return 'peer';
+		}
+		return undefined;
+	}
+
+	/**
+	 * Issue #2098, step 8: what each part of an asset set this node
+	 * committed to settle is worth, by `<channel id hex>:<HTLC id>`, as the
+	 * commit wrote it beside the payment (`_auxiliaryReceivedParts`).
+	 * Undefined for any other record, and for one whose entry cannot be
+	 * read as it is written.
+	 */
+	private committedSetParts(
+		payment: IPaymentInfo | undefined
+	): Record<string, string> | undefined {
+		const raw = payment?.metadata?._auxiliaryReceivedParts;
+		if (!raw || payment?.direction !== PaymentDirection.INCOMING) {
+			return undefined;
+		}
+		let parts: unknown;
+		try {
+			parts = JSON.parse(raw);
+		} catch {
+			return undefined;
+		}
+		if (!parts || typeof parts !== 'object' || Array.isArray(parts)) {
+			return undefined;
+		}
+		for (const [key, value] of Object.entries(parts)) {
+			if (
+				!/^[0-9a-f]{64}:(0|[1-9][0-9]*)$/.test(key) ||
+				typeof value !== 'string' ||
+				!/^[1-9][0-9]*$/.test(value) ||
+				BigInt(value) > U64_MAX
+			) {
+				return undefined;
+			}
+		}
+		return { ...(parts as Record<string, string>) };
+	}
+
+	/**
+	 * Issue #2098, step 8: fulfil a received HTLC that a committed asset
+	 * set's record names, whoever dispatches it, rather than let any check
+	 * of a fresh HTLC fail it back. True when the record names it.
+	 */
+	private fulfillCommittedSetPart(
+		channelId: Buffer,
+		htlcId: bigint,
+		paymentHash: Buffer
+	): boolean {
+		const parts = this.committedSetParts(
+			this.payments.get(paymentHash.toString('hex'))
+		);
+		if (!parts?.[`${channelId.toString('hex')}:${htlcId}`]) return false;
+		this.fulfillSettledReceivedHtlc(channelId, htlcId, paymentHash);
 		return true;
 	}
 
