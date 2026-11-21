@@ -4161,6 +4161,12 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		// signatures, keep tracking what did. Channels are restored by now.
 		this.compositeSplices?.restore();
 
+		// Issue #2098, step 8: the asset sets this node committed to settle
+		// are known again from their records, and a part whose decision to
+		// settle did not land before the stop gets it before the scan below.
+		this.rebuildAssetSetSettles();
+		this.writeOwedAssetSetDecisions();
+
 		// Scan for expiring HTLCs immediately on restore (may have missed blocks while down)
 		if (this.currentBlockHeight > 0) {
 			this.scanExpiringOfferedHtlcs(this.currentBlockHeight);
@@ -4333,6 +4339,11 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		if (!preimage) return false;
 		if (this.channelManager.fulfillHtlc(channelId, htlcId, preimage).ok) {
 			this.cleanupHtlcSharedSecret(htlcKey);
+		} else if (this.committedSetParts(payment)?.[htlcKey]) {
+			// Issue #2098, step 8: a part of a committed asset set whose fulfil
+			// cannot be made now has its decision to settle, by which a close
+			// claims it.
+			this.writeAssetSetDecision(channelId, htlcId, paymentHash, preimage);
 		}
 		return true;
 	}
@@ -4360,6 +4371,16 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	 */
 	private owesSettledFulfill(payment: IPaymentInfo): boolean {
 		if (payment.status !== PaymentStatus.COMPLETED) return false;
+		// Issue #2098, step 8: a committed asset set's record also stays while
+		// a part it names is open in a channel that has gone to the chain:
+		// the part's decision, and the claim by it, are made from this record.
+		const setParts = this.committedSetParts(payment);
+		if (
+			setParts &&
+			Object.keys(setParts).some((key) => this.assetSetPartOpen(key))
+		) {
+			return true;
+		}
 		for (const htlcKey of payment.settledHtlcs ?? []) {
 			const [channelHex, htlcId] = htlcKey.split(':');
 			const channelId = Buffer.from(channelHex, 'hex');
@@ -26865,6 +26886,152 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		return true;
 	}
 
+	/** Whether a committed asset set's record names this received HTLC. */
+	private namesCommittedSetPart(
+		hashHex: string,
+		channelId: Buffer,
+		htlcId: bigint
+	): boolean {
+		return (
+			this.committedSetParts(this.payments.get(hashHex))?.[
+				`${channelId.toString('hex')}:${htlcId}`
+			] !== undefined
+		);
+	}
+
+	/**
+	 * Whether a part of a committed asset set, by `<channel id hex>:<HTLC
+	 * id>`, is still open: in its channel, neither fulfilled nor failed, and
+	 * not ended on the chain.
+	 */
+	private assetSetPartOpen(key: string): boolean {
+		const [channelHex, id] = key.split(':');
+		const channelId = Buffer.from(channelHex, 'hex');
+		const htlcId = BigInt(id);
+		const entry = this.channelManager
+			.getChannel(channelId)
+			?.getFullState()
+			.htlcs.get(`received-${htlcId}`);
+		return (
+			entry !== undefined &&
+			entry.state !== HtlcState.FULFILLED &&
+			entry.state !== HtlcState.FAILED &&
+			this.channelManager.auxiliaryHtlcChainEnding(
+				channelId,
+				HtlcDirection.RECEIVED,
+				htlcId
+			) === undefined
+		);
+	}
+
+	/**
+	 * Issue #2098, step 8: write the decision to settle a part of a
+	 * committed asset set, with its channel's row, when none stands, and
+	 * offer the preimage to the monitors once it is written: a close claims
+	 * the part by it. A write that does not land is made again on the next
+	 * block (writeOwedAssetSetDecisions).
+	 */
+	private writeAssetSetDecision(
+		channelId: Buffer,
+		htlcId: bigint,
+		paymentHash: Buffer,
+		preimage: Buffer
+	): void {
+		if (
+			this.channelManager.auxiliaryHtlcDecision(channelId, htlcId) !== undefined
+		) {
+			return;
+		}
+		if (
+			this.channelManager.recordAuxiliaryHtlcDecision(
+				channelId,
+				htlcId,
+				'settle',
+				preimage
+			)
+		) {
+			this.channelManager.recordPreimage(paymentHash, preimage);
+		}
+	}
+
+	/**
+	 * Issue #2098, step 8: the asset sets this node committed to settle, read
+	 * again from their records at a restore: every COMPLETED incoming record
+	 * with `_auxiliaryReceivedParts` that names a part still open.
+	 */
+	private rebuildAssetSetSettles(): void {
+		for (const [hashHex, payment] of this.payments) {
+			if (payment.status !== PaymentStatus.COMPLETED) continue;
+			const parts = this.committedSetParts(payment);
+			if (!parts) continue;
+			const keys = Object.keys(parts);
+			if (!keys.some((key) => this.assetSetPartOpen(key))) continue;
+			this.assetSetSettles.set(
+				hashHex,
+				keys.map((key) => {
+					const [channelHex, id] = key.split(':');
+					return {
+						channelId: Buffer.from(channelHex, 'hex'),
+						htlcId: BigInt(id)
+					};
+				})
+			);
+		}
+	}
+
+	/**
+	 * Issue #2098, step 8: every open part of a committed asset set has its
+	 * decision to settle, whatever its channel's state and however near its
+	 * expiry: a write that did not land at the commit, or before a stop, is
+	 * made here, on each block before the claim backstop and at a restore
+	 * before its scan. A part whose fulfil was never made (nothing owes it,
+	 * and its channel can take it now) has it made here too. A set whose
+	 * parts have all ended leaves the index.
+	 */
+	private writeOwedAssetSetDecisions(): void {
+		for (const [hashHex, parts] of [...this.assetSetSettles]) {
+			const open = parts.filter((part) =>
+				this.assetSetPartOpen(
+					`${part.channelId.toString('hex')}:${part.htlcId}`
+				)
+			);
+			if (open.length === 0) {
+				this.assetSetSettles.delete(hashHex);
+				continue;
+			}
+			const preimage =
+				this.preimages.get(hashHex) ?? this.payments.get(hashHex)?.preimage;
+			if (!preimage) continue;
+			const paymentHash = Buffer.from(hashHex, 'hex');
+			for (const part of open) {
+				this.writeAssetSetDecision(
+					part.channelId,
+					part.htlcId,
+					paymentHash,
+					preimage
+				);
+				// A fulfil the provider refused is the channel manager's to make
+				// again, and one the channel's state refused the reestablish's.
+				if (
+					!this.channelManager.owesAuxiliaryRemoval(
+						part.channelId,
+						part.htlcId
+					) &&
+					!this.channelManager.auxiliaryChannelOnChain(part.channelId) &&
+					this.channelManager
+						.getChannel(part.channelId)
+						?.canFulfillHtlc(part.htlcId) === true
+				) {
+					this.fulfillSettledReceivedHtlc(
+						part.channelId,
+						part.htlcId,
+						paymentHash
+					);
+				}
+			}
+		}
+	}
+
 	/**
 	 * Accumulate one part of a multi-part payment. Parts group by payment
 	 * hash; each part's authenticity was already enforced upstream in
@@ -36314,8 +36481,11 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		this.jitReceiveManager?.scanExpiringHolds();
 		this.jitReceiveManager?.sweep();
 		// Asset channels: what a provider refusal left owed is taken up
-		// before the expiry scan judges the same HTLCs.
+		// before the expiry scan judges the same HTLCs, and so is a decision
+		// to settle a part of a committed asset set did not get (issue #2098,
+		// step 8).
 		this.retryAuxiliaryOwed();
+		this.writeOwedAssetSetDecisions();
 		this.scanExpiringHtlcs(blockHeight);
 		// Invariant keeper for HTLC dispatches parked during quiescence: the
 		// terminal quiescence exits (disconnect, errored, force close) emit no
@@ -36965,6 +37135,53 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			) {
 				continue;
 			}
+			// Issue #2098, step 8: the parts of a committed asset set end one by
+			// one. A part lost leaves the record's parts and what it counts as
+			// received, in one write, so it is counted once; the record stays
+			// COMPLETED while any of its parts was received, and turns FAILED
+			// only when every part was lost.
+			const key = `${lost.channelId.toString('hex')}:${lost.htlcId}`;
+			const setParts = this.committedSetParts(payment);
+			if (setParts) {
+				const lostValue = setParts[key];
+				if (lostValue === undefined) continue;
+				delete setParts[key];
+				const left = Object.values(setParts).reduce(
+					(sum, value) => sum + BigInt(value),
+					0n
+				);
+				payment.metadata = {
+					...payment.metadata,
+					_auxiliaryReceivedParts: JSON.stringify(setParts)
+				};
+				if (left === payment.amountMsat) delete payment.receivedMsat;
+				else payment.receivedMsat = left;
+				const none = Object.keys(setParts).length === 0;
+				if (none) payment.status = PaymentStatus.FAILED;
+				this.safeStorage(
+					() => this.persistPayment(lost.paymentHash),
+					'persistPayment'
+				);
+				this.emitStructuredLog('htlc', 'asset_htlc_claim_lost', {
+					paymentHash: hashHex,
+					channelId: lost.channelId.toString('hex'),
+					htlcId: lost.htlcId.toString(),
+					lostMsat: lostValue,
+					partsLeft: String(Object.keys(setParts).length)
+				});
+				this.emit('node:error', {
+					code: 'ASSET_HTLC_CLAIM_LOST',
+					channelId: lost.channelId,
+					message: `HTLC ${
+						lost.htlcId
+					} of asset channel ${lost.channelId.toString(
+						'hex'
+					)}, a part of the asset set of payment ${hashHex} that this node settled, was taken back by the payer on the chain: ${lostValue} msat of it were not received`,
+					timestamp: Date.now()
+				});
+				if (none) this.emit('payment:failed', payment);
+				continue;
+			}
 			payment.status = PaymentStatus.FAILED;
 			this.safeStorage(
 				() => this.persistPayment(lost.paymentHash),
@@ -37270,6 +37487,20 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				// node paid the outgoing leg, and nothing gives that up: an HTLC
 				// it decided to settle is claimed on the chain at the claim
 				// buffer below, as on any other channel.
+				//
+				// Issue #2098, step 8: not so a part of an asset set this node
+				// committed to settle either. The set's preimage may have left
+				// with another part, and nothing gives the set up: the part is
+				// claimed at the claim buffer below by its decision, which the
+				// pass before this scan writes, and is never failed off the
+				// chain.
+				const committedPart =
+					paymentHashHex !== undefined &&
+					this.namesCommittedSetPart(
+						paymentHashHex,
+						state.channelId ?? state.temporaryChannelId,
+						htlc.id
+					);
 				if (
 					state.auxiliaryState !== undefined &&
 					htlc.auxiliaryAmount !== undefined &&
@@ -37277,6 +37508,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 					state.state === ChannelState.NORMAL &&
 					!parkedHold &&
 					htlc.forwardAsked !== true &&
+					!committedPart &&
 					paymentHashHex !== undefined &&
 					this.preimages.has(paymentHashHex)
 				) {
@@ -37389,6 +37621,10 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				// revoke_and_ack that completes the round makes it failable, and
 				// the node's dispatch or the next block's scan takes it then.
 				if (!receivedAddIrrevocablyCommitted(htlc)) continue;
+
+				// Issue #2098, step 8: a part of a committed asset set is never
+				// failed back, whether or not its decision to settle has landed.
+				if (committedPart) continue;
 
 				if (htlc.cltvExpiry - blockHeight <= this.htlcSafetyMargin) {
 					const channelId = state.channelId || state.temporaryChannelId;
@@ -39102,6 +39338,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			if (inv.hold) continue;
 			if (this.heldHtlcs.has(hashHex)) continue;
 			if (this.pendingMppPayments.has(hashHex)) continue;
+			if (this.assetSetSettles.has(hashHex)) continue;
 			// AFFIRMATIVE never-paid check: only the PENDING incoming
 			// placeholder minted at issuance marks an invoice as never paid. A
 			// MISSING record is not license to sweep: pruneCompletedPayments

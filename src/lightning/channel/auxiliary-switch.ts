@@ -30,12 +30,15 @@ export const auxiliaryForwards = { enabled: true };
  * Whether this build collects the parts of an asset payment into one set
  * (issue #2098, step 8): HTLCs that carry units under one payment hash,
  * each at the value the host's valueIncomingHtlc gives, settled together
- * once they are worth the invoice. A node collects them only while this
- * is on, the host's configuration sets `receiveInParts`, and the node
- * advertises basic_mpp; otherwise such a part is failed back as before.
- * Nothing that follows the commit of a set reads it, so a set already
- * committed is driven to its end whatever this says. Tests turn it off to
- * reach that refusal; nothing else may, and the package does not export
- * it.
+ * once they are worth the invoice. On since a committed set is also
+ * defended on the chain: every part has its decision to settle, written
+ * again until it lands, and a part whose fulfil is not made is claimed at
+ * the claim buffer, never failed back. A node collects them only while
+ * this is on, the host's configuration sets `receiveInParts`, and the
+ * node advertises basic_mpp; otherwise such a part is failed back as
+ * before. Nothing that follows the commit of a set reads it, so a set
+ * already committed is driven to its end whatever this says. Tests turn
+ * it off to reach that refusal; nothing else may, and the package does
+ * not export it.
  */
-export const auxiliaryPartsReceived = { enabled: false };
+export const auxiliaryPartsReceived = { enabled: true };

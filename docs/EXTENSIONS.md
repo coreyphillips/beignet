@@ -373,3 +373,51 @@ A refused forward offers and links nothing: its incoming HTLC fails back with `t
 ### Going back to an earlier build
 
 A node is taken back to a build without this part only with no forward with an asset leg in flight and no end of one its host has not taken: its host stops answering `prepareForward` and it waits until `getAuxiliaryChannelInfo` reports no `forwardsInFlight` and no `undeliveredForwardLegEnds` on any asset channel. A daemon does both with a drained stop (`POST /stop` with `drain`), given a `drainTimeoutMs` long enough for the forwards in flight to end. Such a build keeps none of the ends the host has not taken yet.
+
+## An asset invoice paid in parts
+
+The node runs this part from the build whose `AUXILIARY_CHANNELS_API.surfaces` names it as `receiveInParts`, and a host relies on it from that build on. Builds before it named the part in `declared`, or not at all, and failed back every HTLC that carries units and is a part of a set, whatever their host asked.
+
+A payer on the network may split a payment whenever the invoice lets it. When the invoice is an asset invoice of a wallet behind a node that converts, every part reaches the wallet as an asset HTLC of its own under one payment hash. A host takes part by setting `receiveInParts: true` in its auxiliary channel configuration. The node then collects such HTLCs into one set, each at the value `valueIncomingHtlc` gives it, and settles them together once their values reach the total the payer declared. It does so only while it also advertises basic_mpp, whose absence would stop the timer that fails a set that never completes. A host that leaves the field out keeps the refusal of earlier builds, its log included.
+
+### Which parts make a set
+
+An HTLC that carries units is a part of a set when its onion declares a total above what the host valued it at, or when other parts of the hash are already collected. Parts are collected as any multi-part set is: each declares the same total, which lies between the invoice and twice it; a duplicate is ignored; a total that disagrees fails the whole set; and a set whose settled row would outgrow what a guardian accepts takes no further part. The set is complete when the values reach the declared total. Each part is refused before anything is kept, with `incorrect_or_unknown_payment_details` and the structured log `asset_multi_part_refused` with a `reason`, when:
+
+- it would mix parts with units and parts without, either way round (`mixed`);
+- the invoice is a hold invoice, which stays paid by one asset HTLC (`hold`);
+- it comes from a peer other than the peer of the set's first part (`peer`);
+- it is blinded (`blinded`);
+- it declares no total while a set of the hash is being collected (`no-total`).
+
+### What the host is asked
+
+The host is asked about each part once for each dispatch, as about any HTLC that ends at the node. Its `acceptedHtlcs` lists the set's other parts still committed, each at the value the host gave it. The value it answers for a part is final for the set: the node sums the values and compares the sum with the declared total. Rounding is the host's to carry. A value may cover the shortfall the conversion of units leaves, a unit per part at most, when the host stands behind it, and a host that never covers it leaves such a set short until it times out. A set may name one quote or several: the node reads no quote. After a restart, a set that was not yet committed is collected again as its channels come back, and each part is valued afresh, with those collected before it in `acceptedHtlcs`; a part whose peer never returns is never collected again.
+
+### Before anything is written
+
+A complete set is settled only when every part can take its fulfil at once. Each part must be irrevocably committed in its channel under the hash, with nothing decided or owed for it, and more than the claim buffer (18 blocks, or the node's HTLC safety margin when that is larger) from its expiry. Each channel must be able to fulfil now, which a channel that is quiescing cannot, and must have no commitment on the chain. The provider must answer for the fulfils of each channel's parts, tried on a copy of the channel as each fulfil tries its own. A node that forwards with `requireFeeCoinsToSettle` also needs the fee coins ready to pay to claim them. Otherwise the whole set is failed back with `temporary_node_failure` (with `incorrect_or_unknown_payment_details`, each part's value and the height, when a part is too near its expiry), logged `asset_set_not_settled` with a `reason`, and nothing is written or revealed.
+
+### The commit, and every part claimed
+
+The set's records are then written alone, in one transition, before any fulfil: the payment COMPLETED with every part in `settledHtlcs`, `auxiliary: true`, `receivedMsat` the sum of the values, and `metadata._auxiliaryReceivedParts`, the value of each part by `<channel id hex>:<HTLC id>`; the invoice's `auxiliary` mark; and the deletion of the payment secret. A write that does not land fails the set back, with nothing revealed. From that write on, the set is committed and nothing gives it up, whatever `receiveInParts` says later:
+
+- each part gets its decision to settle, written with its channel's row, and the preimage goes to the monitors, so that a close claims the part by preimage and nothing fails it back;
+- each part's fulfil is made. One the provider refuses is made again by the node's periodic work, one the channel cannot carry now on its reestablish, and one never made on the next block;
+- a decision that did not land is written again on each block, and at a restore before the node's first scan of its HTLCs; the engine keeps `_auxiliaryReceivedParts` as its own, as it keeps `_keysend`: `setPaymentMetadata` neither sets nor clears it;
+- a part whose fulfil is still not made at the claim buffer is claimed on the chain by its decision, as the incoming leg of a forward is. That claim asks the same provider for its records, and needs fee coins: on a wallet, a set is taken as single payments are, and a shortfall shows in `getFixedOutputFeeStatus()`. A set adds no HTLC beyond what `maxHtlcs` admits on a channel already;
+- the record stays while a part it names is open, also on a channel that has gone to the chain.
+
+`payment:received` and `invoice:settled` come once, at the commit, and the host hears of each part through `onHtlcResolved` as of any asset HTLC.
+
+### A part lost on the chain
+
+A part the payer takes back on the chain after the commit leaves `_auxiliaryReceivedParts`, and `receivedMsat` is lowered by its value, in one write, so it is counted once. It is logged `asset_htlc_claim_lost` with a `node:error` coded `ASSET_HTLC_CLAIM_LOST`. The record stays COMPLETED while any part of the set was received, and turns FAILED, with `payment:failed`, only when every part was lost. A payment of one HTLC ends as before.
+
+### A set that never completes
+
+Each part of a set that does not reach its total within `mppTimeoutMs` is failed back with `mpp_timeout`, each fail owed and made again when it is refused, as for any multi-part set.
+
+### Going back to an earlier build
+
+Nothing new is stored but the metadata key, which every build keeps with the record. A set being collected lives in memory: after a restart an earlier build fails its parts back with the refusal it has. A committed set's parts are listed in its COMPLETED record, so an earlier build fulfils them on its restart and reestablish, and its monitor claims a part whose decision was written. An earlier build does not write a missing decision, does not claim at the claim buffer a part whose fulfil its provider keeps refusing on a channel that is open, and turns the whole record FAILED at the first part lost on the chain. So a node goes back only once no asset HTLC is left received: its host stops setting `receiveInParts`, and it waits until `getAuxiliaryChannelInfo` lists no HTLC with `direction: 'received'` on any asset channel.
