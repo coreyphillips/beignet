@@ -89,11 +89,14 @@ export const AUXILIARY_CHANNELS_API = Object.freeze({
 		// Issue #2098, step 8: an asset invoice paid in parts, collected into
 		// one set for a host that sets receiveInParts, settled together, and
 		// every part claimed once the set is committed.
-		'receiveInParts'
+		'receiveInParts',
+		// Issue #2098, step 9: an asset payment sent in parts, for a host that
+		// sets sendInParts, each part recorded before it is sent and counted
+		// toward its channel's bound, the payment's record kept across them.
+		'sendInParts'
 	] as const),
-	// Issue #2098, step 9: an asset payment sent in parts, for a host that
-	// sets sendInParts. Declared until the build that runs it.
-	declared: Object.freeze(['sendInParts'] as const)
+	// Nothing is declared and not run in this build.
+	declared: Object.freeze([] as const)
 });
 
 /** A name in `AUXILIARY_CHANNELS_API.surfaces`. */

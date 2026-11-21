@@ -20170,6 +20170,47 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	}
 
 	/**
+	 * Issue #2098, step 9: a part of an asset payment sent in parts that the
+	 * chain ended without paying (taken back by this node's timeout, or on
+	 * no output of the commitment that confirmed) is marked failed, once.
+	 * On a payment not yet complete its figures leave it out; one that has
+	 * completed keeps its figures, and the part is logged
+	 * asset_part_ended_after_payment. True when the part was marked now.
+	 */
+	private endAssetPartOnChain(
+		paymentHash: Buffer,
+		channelId: Buffer,
+		htlcId: bigint
+	): boolean {
+		const hashHex = paymentHash.toString('hex');
+		const key = `${channelId.toString('hex')}:offered-${htlcId}`;
+		const payment = this.payments.get(hashHex);
+		if (!payment || !this.isAssetPartOf(payment, key)) return false;
+		if (
+			this.channelManager.auxiliaryHtlcChainEnding(
+				channelId,
+				HtlcDirection.OFFERED,
+				htlcId
+			) !== 'failed'
+		) {
+			return false;
+		}
+		const completed =
+			payment.status === PaymentStatus.COMPLETED || this.preimages.has(hashHex);
+		if (!this.markAssetPartFailed(payment, key)) return false;
+		this.assetPartSends.delete(key);
+		this.persistPayment(paymentHash);
+		if (completed) {
+			this.emitStructuredLog('payment', 'asset_part_ended_after_payment', {
+				paymentHash: hashHex,
+				part: key,
+				onChain: true
+			});
+		}
+		return true;
+	}
+
+	/**
 	 * Issue #2098, step 9: whether an HTLC of the payment other than `key`
 	 * can still settle, or the payment is unresolved.
 	 */
@@ -28757,7 +28798,14 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			}
 			const paymentHash = Buffer.from(hashHex, 'hex');
 			try {
-				if (payment.status === PaymentStatus.PENDING) {
+				// Issue #2098, step 9: a payment sent in parts may have a part
+				// never sent beside one out after it was given up, so its pass
+				// runs for every record of it that has not completed.
+				if (
+					payment.status === PaymentStatus.PENDING ||
+					(payment.status === PaymentStatus.FAILED &&
+						this.auxiliaryPartsSent(payment) !== undefined)
+				) {
 					this.dropAuxiliaryPartsNeverSent(paymentHash, payment);
 				}
 				this.reportAuxiliaryPartsNeverSent(paymentHash, payment);
@@ -28779,6 +28827,10 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		const neverSent: Record<string, string> = {};
 		const kept: Record<string, string> = {};
 		let live = false;
+		// Issue #2098, step 9: a payment sent in parts counts a part whose
+		// fail is not yet irrevocable as live, as the in-flight view does, and
+		// is not failed while a preimage of it is stored or it is unresolved.
+		const inParts = this.auxiliaryPartsSent(payment);
 		for (const [key, amount] of Object.entries(
 			this.auxiliaryPartAmounts(payment)
 		)) {
@@ -28807,8 +28859,11 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			kept[key] = amount;
 			if (
 				inChannel &&
-				entry.state !== HtlcState.FULFILLED &&
-				entry.state !== HtlcState.FAILED
+				((entry.state !== HtlcState.FULFILLED &&
+					entry.state !== HtlcState.FAILED) ||
+					(inParts !== undefined &&
+						entry.state === HtlcState.FAILED &&
+						!LightningNode.isOfferedFailIrrevocable(entry)))
 			) {
 				live = true;
 			}
@@ -28821,6 +28876,10 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		} else {
 			delete metadata._auxiliaryPartAmounts;
 		}
+		if (inParts) {
+			for (const key of dropped) delete inParts[key];
+			metadata._auxiliaryPartsSent = JSON.stringify(inParts);
+		}
 		if (this.auxiliaryChannels?.onHtlcResolved) {
 			// Kept beside the payment until the host has been told.
 			metadata._auxiliaryNeverSent = JSON.stringify({
@@ -28829,13 +28888,22 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			});
 		}
 		payment.metadata = metadata;
+		if (inParts && payment.status !== PaymentStatus.COMPLETED) {
+			this.applyAssetPartsFigures(payment);
+		}
 		const mutations: RecoveryMutation[] = [];
 		for (const key of dropped) {
 			if (this.htlcPaymentMap.get(key) !== hashHex) continue;
 			this.htlcPaymentMap.delete(key);
 			mutations.push({ type: 'delete_htlc_payment_mapping', htlcKey: key });
 		}
-		if (!live) {
+		const fails = inParts
+			? !live &&
+			  payment.status === PaymentStatus.PENDING &&
+			  !this.preimages.has(hashHex) &&
+			  payment.unresolved === undefined
+			: !live;
+		if (fails) {
 			payment.status = PaymentStatus.FAILED;
 			payment.completedAt = Date.now();
 			payment.failureReason = boundedFailureReason(
@@ -28853,7 +28921,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			parts: dropped.join(','),
 			status: payment.status
 		});
-		if (!live) {
+		if (fails) {
 			// Nobody listens while the node is being built: the event is for
 			// whoever subscribes as soon as it is.
 			setImmediate(() => {
@@ -32148,6 +32216,9 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			) === hashHex
 		) {
 			this.emitHtlcResolved(paymentHash, channelId, htlcId, 'onchain-resolved');
+			// Issue #2098, step 9: a part of an asset payment sent in parts
+			// that the chain took back to this node is marked failed.
+			this.endAssetPartOnChain(paymentHash, channelId, htlcId);
 			// With no preimage the timeout path won for this HTLC (a preimage
 			// resolution is handleOnChainPreimageLearned's). Nothing else
 			// fails a PENDING record whose channel left NORMAL: the expiry
@@ -38086,11 +38157,15 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	private failAssetPaymentsEndedOnChain(): void {
 		for (const [key, hashHex] of [...this.htlcPaymentMap]) {
 			const payment = this.payments.get(hashHex);
+			// Issue #2098, step 9: a part of an asset payment sent in parts is
+			// ended on its own, also once the payment completed.
+			const part = payment !== undefined && this.isAssetPartOf(payment, key);
 			if (
 				!payment ||
 				payment.direction !== PaymentDirection.OUTGOING ||
-				payment.status !== PaymentStatus.PENDING ||
-				this.preimages.has(hashHex)
+				(!part &&
+					(payment.status !== PaymentStatus.PENDING ||
+						this.preimages.has(hashHex)))
 			) {
 				continue;
 			}
@@ -38123,6 +38198,28 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				continue;
 			}
 			const paymentHash = Buffer.from(hashHex, 'hex');
+			if (part) {
+				// Told once, by the mark; the payment fails only when nothing of
+				// it is out, and never once it has completed.
+				if (this.endAssetPartOnChain(paymentHash, channelId, htlcId)) {
+					this.emitHtlcResolved(
+						paymentHash,
+						channelId,
+						htlcId,
+						'onchain-resolved'
+					);
+				}
+				if (
+					payment.status === PaymentStatus.PENDING &&
+					!this.preimages.has(hashHex)
+				) {
+					this.failPaymentUnlessInFlight(
+						paymentHash,
+						'HTLC was not in the commitment that confirmed'
+					);
+				}
+				continue;
+			}
 			if (
 				this.failPaymentUnlessInFlight(
 					paymentHash,
