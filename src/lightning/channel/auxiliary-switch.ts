@@ -42,3 +42,17 @@ export const auxiliaryForwards = { enabled: true };
  * not export it.
  */
 export const auxiliaryPartsReceived = { enabled: true };
+
+/**
+ * Whether this build sends an asset payment in parts (issue #2098, step
+ * 9): several HTLCs that carry units under one payment hash, each sent by
+ * its own sendPaymentToRoute over an asset channel of one peer, recorded
+ * before it is sent with its value, its first hop and its carrier, and
+ * kept in one record of the payment. A node sends them only while this is
+ * on and the host's configuration sets `sendInParts`; otherwise a part is
+ * refused as before. Nothing that follows a send reads it, so the parts of
+ * a payment already out are driven to their end whatever this says. Tests
+ * turn it off to reach that refusal; nothing else may, and the package
+ * does not export it.
+ */
+export const auxiliaryPartsSent = { enabled: false };

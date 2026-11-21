@@ -91,8 +91,9 @@ export const AUXILIARY_CHANNELS_API = Object.freeze({
 		// every part claimed once the set is committed.
 		'receiveInParts'
 	] as const),
-	// Nothing is declared and not run in this build.
-	declared: Object.freeze([] as const)
+	// Issue #2098, step 9: an asset payment sent in parts, for a host that
+	// sets sendInParts. Declared until the build that runs it.
+	declared: Object.freeze(['sendInParts'] as const)
 });
 
 /** A name in `AUXILIARY_CHANNELS_API.surfaces`. */
