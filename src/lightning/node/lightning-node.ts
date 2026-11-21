@@ -20181,6 +20181,67 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	}
 
 	/**
+	 * Issue #2098, step 9: mark a part of an asset payment sent in parts as
+	 * failed in the record's `_auxiliaryPartsSent`, and, on a record that
+	 * has not completed, take it out of the figures. True when the record
+	 * changed; false for an HTLC the record does not list as such a part,
+	 * for one already marked, and for a record that cannot be read.
+	 */
+	private markAssetPartFailed(payment: IPaymentInfo, key: string): boolean {
+		const sent = this.auxiliaryPartsSent(payment);
+		const part = sent?.[key];
+		if (!sent || !part || part.failed) return false;
+		sent[key] = { ...part, failed: true };
+		payment.metadata = {
+			...payment.metadata,
+			_auxiliaryPartsSent: JSON.stringify(sent)
+		};
+		if (payment.status !== PaymentStatus.COMPLETED) {
+			this.applyAssetPartsFigures(payment);
+		}
+		return true;
+	}
+
+	/**
+	 * Issue #2098, step 9: a payment sent in parts that completes says no
+	 * failure: one a part that was replaced left on the record is not the
+	 * payment's.
+	 */
+	private clearAssetPartsFailure(payment: IPaymentInfo): void {
+		if (this.auxiliaryPartsSent(payment) === undefined) return;
+		delete payment.failureCode;
+		delete payment.failureSourceIndex;
+		delete payment.failureReason;
+	}
+
+	/**
+	 * Issue #2098, step 9: whether an HTLC of the payment other than `key`
+	 * can still settle, or the payment is unresolved.
+	 */
+	private assetPartOutBeside(paymentHash: Buffer, key: string): boolean {
+		const view = this.getOutgoingHtlcs(paymentHash);
+		return (
+			view.unresolved !== undefined ||
+			view.htlcs.some(
+				(entry) =>
+					LightningNode.htlcViewInFlight(entry) &&
+					`${entry.channelId.toString('hex')}:offered-${entry.htlcId}` !== key
+			)
+		);
+	}
+
+	/**
+	 * Issue #2098, step 9: whether the record lists `key` as a part of an
+	 * asset payment sent in parts.
+	 */
+	private isAssetPartOf(
+		payment: IPaymentInfo | undefined,
+		key: string
+	): boolean {
+		return this.auxiliaryPartsSent(payment)?.[key] !== undefined;
+	}
+
+	/**
 	 * Issue #2098, step 9: the send of an asset HTLC for a host that sets
 	 * `sendInParts`, with the build's switch on. A payment may go out in
 	 * parts: each part is its own call, over an asset channel of the peer of
@@ -32315,6 +32376,12 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 					owed.direction === PaymentDirection.OUTGOING &&
 					(owed.status === PaymentStatus.PENDING ||
 						owed.status === PaymentStatus.FAILED)
+				) &&
+				// Issue #2098, step 9: a part of an asset payment sent in parts
+				// whose mapping a stop left behind still has it released.
+				!(
+					this.htlcPaymentMap.get(outKey) === hashHex &&
+					this.isAssetPartOf(owed, outKey)
 				)
 			) {
 				this.retriesAwaitingRemoval.delete(outKey);
@@ -32396,6 +32463,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			delete payment.unresolved;
 			payment.preimage = preimage;
 			payment.completedAt = Date.now();
+			this.clearAssetPartsFailure(payment);
 			// Preserve invoice string for payment proof before deleting retry context
 			const retryCtx = this.paymentRetryContexts.get(hashHex);
 			if (retryCtx?.invoiceStr) {
@@ -32404,9 +32472,13 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			}
 			this.paymentRetryContexts.delete(hashHex);
 			this.outboundMppPayments.delete(hashHex);
-			// Record success in MissionControl
-			if (payment.route) {
-				for (const hop of payment.route.hops) {
+			// Record success in MissionControl, over the route of the part
+			// that settled when it is a part of an asset payment sent in parts.
+			const settledRoute =
+				this.assetPartSends.get(outKey)?.route ?? payment.route;
+			this.assetPartSends.delete(outKey);
+			if (settledRoute) {
+				for (const hop of settledRoute.hops) {
 					this.missionControl.recordSuccess(hop.shortChannelId.toString('hex'));
 				}
 			}
@@ -32430,6 +32502,29 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				amountMsat: Number(payment.amountMsat),
 				status: payment.status
 			});
+		} else if (
+			payment &&
+			payment.direction === PaymentDirection.OUTGOING &&
+			this.htlcPaymentMap.get(outKey) === hashHex &&
+			this.isAssetPartOf(payment, outKey)
+		) {
+			// Issue #2098, step 9: a later part of an asset payment sent in
+			// parts settled after the payment completed. Its mapping goes, with
+			// the channel's write; the record says what it said.
+			const partRoute = this.assetPartSends.get(outKey)?.route;
+			this.assetPartSends.delete(outKey);
+			if (partRoute) {
+				for (const hop of partRoute.hops) {
+					this.missionControl.recordSuccess(hop.shortChannelId.toString('hex'));
+				}
+			}
+			this.htlcPaymentMap.delete(outKey);
+			this.withStagedMutations(
+				[{ type: 'delete_htlc_payment_mapping', htlcKey: outKey }],
+				() => {
+					this.persistChannel(channelId);
+				}
+			);
 		}
 		// Every fulfilled part reports, not only the one that flipped the
 		// record, and whether or not a record exists: past the forward check
@@ -32498,6 +32593,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			delete payment.unresolved;
 			payment.preimage = preimage;
 			payment.completedAt = Date.now();
+			this.clearAssetPartsFailure(payment);
 			const retryCtx = this.paymentRetryContexts.get(hashHex);
 			if (retryCtx?.invoiceStr) {
 				if (!payment.metadata) payment.metadata = {};
@@ -33534,9 +33630,22 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		// resolution reported; the record is not failed.
 		if (payment.status === PaymentStatus.COMPLETED) {
 			this.htlcPaymentMap.delete(key);
-			this.commitMutations('release failed HTLC mapping', [
+			this.assetPartSends.delete(key);
+			const released: RecoveryMutation[] = [
 				{ type: 'delete_htlc_payment_mapping', htlcKey: key }
-			]);
+			];
+			// Issue #2098, step 9: a part of an asset payment sent in parts that
+			// ends without paying after the payment completed is marked in the
+			// record, whose figures stay what they were when it completed.
+			if (this.markAssetPartFailed(payment, key)) {
+				released.push({ type: 'payment_state', paymentHash: hashHex, payment });
+				this.emitStructuredLog('payment', 'asset_part_ended_after_payment', {
+					paymentHash: hashHex,
+					part: key,
+					onChain: false
+				});
+			}
+			this.commitMutations('release failed HTLC mapping', released);
 			this.emitHtlcResolved(payment.paymentHash, channelId, htlcId, 'failed');
 			return;
 		}
@@ -33550,8 +33659,14 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			(part) => part.htlcId === htlcId && part.channelId.equals(channelId)
 		);
 		if (failedPart) failedPart.status = PaymentStatus.FAILED;
-		const failureSecrets = failedPart?.sharedSecrets ?? payment.sharedSecrets;
-		const failureRoute = failedPart?.route ?? payment.route;
+		// A part of an asset payment sent in parts (issue #2098, step 9)
+		// decrypts with its own, kept while the node runs.
+		const partSend = this.assetPartSends.get(key);
+		const failureSecrets =
+			failedPart?.sharedSecrets ??
+			partSend?.sharedSecrets ??
+			payment.sharedSecrets;
+		const failureRoute = failedPart?.route ?? partSend?.route ?? payment.route;
 
 		// Decrypt failure message if we have shared secrets
 		let failureData: Buffer | undefined;
@@ -33806,6 +33921,29 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 						? `${payment.failureReason}; retry not dispatched: ${detail}`
 						: `Retry not dispatched: ${detail}`
 				);
+			}
+		}
+
+		// Issue #2098, step 9: a part of an asset payment sent in parts is
+		// marked failed, and the record's figures leave it out. While another
+		// part of the payment is out, the record stays as it is: only this
+		// part's mapping goes and its end is told. The last part to end gives
+		// the payment up below, once.
+		if (this.isAssetPartOf(payment, key)) {
+			this.markAssetPartFailed(payment, key);
+			this.assetPartSends.delete(key);
+			if (this.assetPartOutBeside(payment.paymentHash, key)) {
+				this.htlcPaymentMap.delete(key);
+				const partEnded: RecoveryMutation[] = [
+					{ type: 'delete_htlc_payment_mapping', htlcKey: key }
+				];
+				const partRecord = this.paymentMutation(payment.paymentHash);
+				if (partRecord) partEnded.push(partRecord);
+				this.withStagedMutations(partEnded, () => {
+					this.persistChannel(channelId);
+				});
+				this.emitHtlcResolved(payment.paymentHash, channelId, htlcId, 'failed');
+				return;
 			}
 		}
 
