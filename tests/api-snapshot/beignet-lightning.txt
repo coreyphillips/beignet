@@ -1031,7 +1031,7 @@ function chain.signP2wpkhInput(tx: bitcoinjs-lib#Transaction, inputIndex: number
 function chain.signSweepInput(tx: bitcoinjs-lib#Transaction, inputIndex: number, witnessScript: Buffer, value: number, privateKey: Buffer, sighashType?: number): Buffer
 function chain.sweepVbytes(witness: readonly Buffer[], destinationScript: Buffer): number
 namespace channel
-const channel.AUXILIARY_CHANNELS_API: Readonly<{ version: 1; surfaces: readonly [ "valueIncomingHtlc:three-outcome", "sendPaymentToRoute:assetPayment", "getAuxiliaryPaymentHtlcs", "onHtlcResolved:htlcId", "queryAuxiliaryRoute", "fundAuxiliaryChannel:unsigned", "onFundingSigned", "abandonAuxiliaryOpen", "IChannelInfo.auxiliary", "setAuxiliaryPaymentGate", "getChannelMonitorState", "IPaymentInfo.auxiliary", "IPaymentInfo.auxiliaryValueMsat", "IInvoiceInfo.auxiliary", "IAuxiliaryChannelInfo.undeliveredOutcomes", "onHtlcResolved:never-sent", "getFixedOutputFeeStatus", "IPaymentInfo.unresolved", "IHoldInvoiceStateEvent.auxiliary", "prepareForward", "getFixedOutputFeeStatus:splitCoins", "getFixedOutputFeeStatus:reserve", "requireFeeCoinsToSettle", "onForwardLegResolved:quote", "IForwardingEvent.auxiliary", "setAuxiliaryForwardGate" ]; declared: readonly [ ]; }>
+const channel.AUXILIARY_CHANNELS_API: Readonly<{ version: 1; surfaces: readonly [ "valueIncomingHtlc:three-outcome", "sendPaymentToRoute:assetPayment", "getAuxiliaryPaymentHtlcs", "onHtlcResolved:htlcId", "queryAuxiliaryRoute", "fundAuxiliaryChannel:unsigned", "onFundingSigned", "abandonAuxiliaryOpen", "IChannelInfo.auxiliary", "setAuxiliaryPaymentGate", "getChannelMonitorState", "IPaymentInfo.auxiliary", "IPaymentInfo.auxiliaryValueMsat", "IInvoiceInfo.auxiliary", "IAuxiliaryChannelInfo.undeliveredOutcomes", "onHtlcResolved:never-sent", "getFixedOutputFeeStatus", "IPaymentInfo.unresolved", "IHoldInvoiceStateEvent.auxiliary", "prepareForward", "getFixedOutputFeeStatus:splitCoins", "getFixedOutputFeeStatus:reserve", "requireFeeCoinsToSettle", "onForwardLegResolved:quote", "IForwardingEvent.auxiliary", "setAuxiliaryForwardGate", "receiveInParts", "sendInParts", "createInvoice:assetInvoice" ]; declared: readonly [ ]; }>
 const channel.AUXILIARY_CHANNEL_DUST_LIMIT = 354n
 const channel.AUXILIARY_CLOSE_ASSET_OUTPUT_MINIMUM = 330n
 class channel.AuxiliaryChannelUnsupportedError extends beignet#CodedError<'ASSET_CHANNEL_UNSUPPORTED'>
@@ -1071,6 +1071,7 @@ method channel.Channel.adoptRemoteForwardingPolicy(policy: channel.IRemoteForwar
 property channel.Channel.announcementChainHash: Buffer
 method channel.Channel.applyForceClosePlan(plan: channel.IForceClosePlanReady): channel.ChannelAction[]
 method channel.Channel.applyPeerSpliceSignature(remoteSig: Buffer, peerWalletWitnesses?: Buffer[][]): bitcoinjs-lib#Transaction | null
+method channel.Channel.auxiliaryFulfilRefusal(htlcIds: readonly bigint[]): string | null
 method channel.Channel.auxiliaryHtlcDecision(htlcId: bigint): channel.IAuxiliaryHtlcDecision | undefined
 method channel.Channel.backfillLockedFundingTxids(): boolean
 method channel.Channel.beginClosingNegotiationIfReady(): boolean
@@ -1725,8 +1726,10 @@ method channel.IAuxiliaryChannelConfig.onHtlcResolved?(context: Omit<channel.IAu
 method channel.IAuxiliaryChannelConfig.openingCsvPolicy?(peerPubkey: string): channel.IAuxiliaryOpeningCsvPolicy | undefined
 method channel.IAuxiliaryChannelConfig.prepareForward?(request: channel.IAuxiliaryForwardRequest): channel.IAuxiliaryForwardTerms | undefined
 property channel.IAuxiliaryChannelConfig.provider: channel.IChannelAuxiliaryProvider
+property channel.IAuxiliaryChannelConfig.receiveInParts?: boolean
 property channel.IAuxiliaryChannelConfig.requireFeeCoinsToSettle?: boolean
 method channel.IAuxiliaryChannelConfig.resolveIncoming(peerPubkey: string, temporaryChannelId: Buffer): channel.IAuxiliaryFundingDescriptor | undefined
+property channel.IAuxiliaryChannelConfig.sendInParts?: boolean
 method channel.IAuxiliaryChannelConfig.valueIncomingHtlc?(context: channel.IAuxiliaryIncomingHtlc): bigint | undefined
 interface channel.IAuxiliaryChannelHtlc
 property channel.IAuxiliaryChannelHtlc.auxiliaryAmount?: bigint
@@ -1892,8 +1895,11 @@ property channel.IAuxiliaryPayment.wireAmountMsat: bigint
 interface channel.IAuxiliaryPaymentHtlc
 property channel.IAuxiliaryPaymentHtlc.amountMsat: bigint
 property channel.IAuxiliaryPaymentHtlc.channelId: Buffer
+property channel.IAuxiliaryPaymentHtlc.failed?: true
 property channel.IAuxiliaryPaymentHtlc.htlc?: channel.IAuxiliaryChannelHtlc
 property channel.IAuxiliaryPaymentHtlc.htlcId: bigint
+property channel.IAuxiliaryPaymentHtlc.routeAmountMsat?: bigint
+property channel.IAuxiliaryPaymentHtlc.wireAmountMsat?: bigint
 interface channel.IAuxiliaryRestoredChannel
 property channel.IAuxiliaryRestoredChannel.channelData?: Buffer
 property channel.IAuxiliaryRestoredChannel.channelId: Buffer
@@ -5659,12 +5665,16 @@ constructor node.AuxiliaryChannelRowError(rows: ReadonlyArray<{ channelId: strin
 readonly property node.AuxiliaryChannelRowError.channelIds: readonly string[]
 readonly property node.AuxiliaryChannelRowError.reasons: ReadonlyMap<string, string>
 type node.AuxiliaryForwardGate = (forward: node.IAuxiliaryGatedForward) => string | node.IAuxiliaryForwardRefusal | undefined
+class node.AuxiliaryInvoiceError extends beignet#CodedError<node.AuxiliaryInvoiceErrorCode>
+constructor node.AuxiliaryInvoiceError(code: node.AuxiliaryInvoiceErrorCode, option: string, message: string)
+readonly property node.AuxiliaryInvoiceError.option: string
+type node.AuxiliaryInvoiceErrorCode = 'ASSET_INVOICE_UNSUPPORTED' | 'ASSET_INVOICE_INVALID'
 class node.AuxiliaryPaymentError extends beignet#CodedError<node.AuxiliaryPaymentErrorCode>
 constructor node.AuxiliaryPaymentError(code: node.AuxiliaryPaymentErrorCode, channelId: Buffer | string, message: string, reason?: string)
 readonly property node.AuxiliaryPaymentError.channelId: string
 readonly property node.AuxiliaryPaymentError.reason?: string
-type node.AuxiliaryPaymentErrorCode = 'ASSET_PAYMENT_INVALID' | 'ASSET_PAYMENT_CHANNEL_MISMATCH' | 'ASSET_PAYMENT_ROUTE_REQUIRED' | 'ASSET_PAYMENT_UNSUPPORTED' | 'ASSET_PAYMENT_CIRCUIT_CHANGED' | 'ASSET_PAYMENT_NOT_RECORDED' | 'ASSET_CHANNEL_NEEDS_ASSET_PAYMENT' | 'ASSET_PAYMENT_REFUSED' | 'ASSET_OUTCOMES_UNDELIVERED' | 'ASSET_HTLC_LIMIT_REACHED'
-type node.AuxiliaryPaymentGate = (payment: { paymentHash: Buffer; channelId: Buffer; amountMsat: bigint; wireAmountMsat: bigint; routeAmountMsat: bigint; }) => string | node.IAuxiliaryPaymentRefusal | undefined
+type node.AuxiliaryPaymentErrorCode = 'ASSET_PAYMENT_INVALID' | 'ASSET_PAYMENT_CHANNEL_MISMATCH' | 'ASSET_PAYMENT_ROUTE_REQUIRED' | 'ASSET_PAYMENT_UNSUPPORTED' | 'ASSET_PAYMENT_CIRCUIT_CHANGED' | 'ASSET_PAYMENT_NOT_RECORDED' | 'ASSET_CHANNEL_NEEDS_ASSET_PAYMENT' | 'ASSET_PAYMENT_REFUSED' | 'ASSET_OUTCOMES_UNDELIVERED' | 'ASSET_HTLC_LIMIT_REACHED' | 'ASSET_HTLC_NOT_ADMITTED'
+type node.AuxiliaryPaymentGate = (payment: { paymentHash: Buffer; channelId: Buffer; amountMsat: bigint; wireAmountMsat: bigint; routeAmountMsat: bigint; totalMsat?: bigint; htlcId?: bigint; }) => string | node.IAuxiliaryPaymentRefusal | undefined
 class node.AuxiliaryProviderRequiredError extends beignet#CodedError<'AUXILIARY_PROVIDER_REQUIRED'>
 constructor node.AuxiliaryProviderRequiredError(channelIds: readonly string[])
 readonly property node.AuxiliaryProviderRequiredError.channelIds: readonly string[]
@@ -5705,6 +5715,8 @@ constructor node.FundingWaitTimeoutError(message: string)
 const node.HELD_HTLC_EXPIRY_MARGIN = 18
 type node.HoldCancelReason = 'expiry-scan' | 'api'
 type node.HoldInvoiceState = 'OPEN' | 'ACCEPTED' | 'SETTLED' | 'CANCELLED'
+interface node.IAssetInvoiceOptions
+property node.IAssetInvoiceOptions.inParts?: boolean
 interface node.IAutoRebalanceConfig
 property node.IAutoRebalanceConfig.budgetSatsPerDay?: number
 property node.IAutoRebalanceConfig.enabled?: boolean
@@ -5851,6 +5863,7 @@ property node.ICompositeSpliceStageEvent.txid?: Buffer
 type node.ICompositeSpliceStartResult = { ok: true; id: Buffer; plan: node.ICompositeSplicePlan; } | node.ICompositeSpliceRefusal
 interface node.ICreateInvoiceOptions
 property node.ICreateInvoiceOptions.amountMsat?: bigint
+property node.ICreateInvoiceOptions.assetInvoice?: node.IAssetInvoiceOptions | null | false
 property node.ICreateInvoiceOptions.asyncHold?: boolean
 property node.ICreateInvoiceOptions.blindedPathNumHops?: number
 property node.ICreateInvoiceOptions.description?: string
@@ -6660,7 +6673,7 @@ class node.LightningPaymentError extends beignet#CodedError<node.LightningErrorC
 constructor node.LightningPaymentError(code: node.LightningErrorCode, message: string)
 const node.MAX_FEE_RATE_SAT_PER_VBYTE = 5000
 const node.MAX_HELD_PARTS_PER_HASH = 64
-type node.NodeErrorCode = 'ASSET_HTLC_CLAIM_UNCONFIRMED_AT_EXPIRY' | 'AUTO_FUNDING_FAILED' | 'AUTO_RECONNECT_FAILED' | 'BARRIER_DISPATCH_FAILED' | 'BLOCK_WORK_FAILED' | 'BOLT12_INVOICE_ERROR' | 'BROADCAST_FAILED' | 'BROADCAST_PERMANENT_FAILURE' | 'CHAIN_RESTORE_WATCH_FAILED' | 'CHAIN_WATCHER_ERROR' | 'CHAIN_WATCHER_START_FAILED' | 'CHANNEL_ERROR' | 'CHANNEL_FAILED_FORCE_CLOSED' | 'CHANNEL_FAILED_FORCE_CLOSE_FAILED' | 'CLOSE_CHANNEL_FAILED' | 'DURABILITY_BARRIER_TIMEOUT' | 'ERRORED_TIMEOUT_FORCE_CLOSED' | 'FORCE_CLOSE_FAILED' | 'FORCE_CLOSE_REVOKED' | 'FORWARD_TIMEOUT_FORCE_CLOSE' | 'FUNDING_BROADCAST_FAILED' | 'FUNDING_MISSING' | 'GRAPH_RESTORE_FAILED' | 'HTLC_CLAIM_FORCE_CLOSE' | 'HTLC_DEADLINE_HELD' | 'HTLC_EXPIRY_FORCE_CLOSE' | 'IROH_RELAY_ONLY_VIOLATED' | 'LISTEN_FAILED' | 'MESSAGE_TOO_LARGE' | 'NO_ROUTING_HINTS' | 'ONION_MESSAGE_ERROR' | 'ONION_PROCESSING_FAILED' | 'PERSISTENCE_ERROR' | 'PRESPLICE_WATCH_FAILED' | 'PROVIDE_EXTERNAL_WITNESS_FAILED' | 'RBF_OPEN_FAILED' | 'RECOVERY_WATCH_FAILED' | 'REESTABLISH_SECRET_MISSING' | 'REESTABLISH_TIMEOUT_FORCE_CLOSED' | 'SEND_TX_SIGNATURES_FAILED' | 'SPLICE_BROADCAST_REFUSED' | 'SPLICE_INPUT_CONFLICT' | 'SPLICE_IN_FAILED' | 'SPLICE_OUT_FAILED' | 'COMPOSITE_SPLICE_ABORTED' | 'COMPOSITE_SPLICE_RESTORE_FAILED' | 'STARTUP_RECONNECT_FAILED' | 'STARTUP_REPAIR_COMPLETION_FAILED' | 'STARTUP_REPAIR_UNRECEIPTED' | 'STUCK_CHANNEL' | 'STUCK_CHANNEL_FORCE_CLOSED' | 'UPDATE_FEE_FAILED' | 'WAL_CHECKPOINT_FAILED' | 'WATCH_OUTPUT_FAILED'
+type node.NodeErrorCode = 'ASSET_HTLC_CLAIM_LOST' | 'ASSET_HTLC_CLAIM_UNCONFIRMED_AT_EXPIRY' | 'AUTO_FUNDING_FAILED' | 'AUTO_RECONNECT_FAILED' | 'BARRIER_DISPATCH_FAILED' | 'BLOCK_WORK_FAILED' | 'BOLT12_INVOICE_ERROR' | 'BROADCAST_FAILED' | 'BROADCAST_PERMANENT_FAILURE' | 'CHAIN_RESTORE_WATCH_FAILED' | 'CHAIN_WATCHER_ERROR' | 'CHAIN_WATCHER_START_FAILED' | 'CHANNEL_ERROR' | 'CHANNEL_FAILED_FORCE_CLOSED' | 'CHANNEL_FAILED_FORCE_CLOSE_FAILED' | 'CLOSE_CHANNEL_FAILED' | 'DURABILITY_BARRIER_TIMEOUT' | 'ERRORED_TIMEOUT_FORCE_CLOSED' | 'FORCE_CLOSE_FAILED' | 'FORCE_CLOSE_REVOKED' | 'FORWARD_TIMEOUT_FORCE_CLOSE' | 'FUNDING_BROADCAST_FAILED' | 'FUNDING_MISSING' | 'GRAPH_RESTORE_FAILED' | 'HTLC_CLAIM_FORCE_CLOSE' | 'HTLC_DEADLINE_HELD' | 'HTLC_EXPIRY_FORCE_CLOSE' | 'IROH_RELAY_ONLY_VIOLATED' | 'LISTEN_FAILED' | 'MESSAGE_TOO_LARGE' | 'NO_ROUTING_HINTS' | 'ONION_MESSAGE_ERROR' | 'ONION_PROCESSING_FAILED' | 'PERSISTENCE_ERROR' | 'PRESPLICE_WATCH_FAILED' | 'PROVIDE_EXTERNAL_WITNESS_FAILED' | 'RBF_OPEN_FAILED' | 'RECOVERY_WATCH_FAILED' | 'REESTABLISH_SECRET_MISSING' | 'REESTABLISH_TIMEOUT_FORCE_CLOSED' | 'SEND_TX_SIGNATURES_FAILED' | 'SPLICE_BROADCAST_REFUSED' | 'SPLICE_INPUT_CONFLICT' | 'SPLICE_IN_FAILED' | 'SPLICE_OUT_FAILED' | 'COMPOSITE_SPLICE_ABORTED' | 'COMPOSITE_SPLICE_RESTORE_FAILED' | 'STARTUP_RECONNECT_FAILED' | 'STARTUP_REPAIR_COMPLETION_FAILED' | 'STARTUP_REPAIR_UNRECEIPTED' | 'STUCK_CHANNEL' | 'STUCK_CHANNEL_FORCE_CLOSED' | 'UPDATE_FEE_FAILED' | 'WAL_CHECKPOINT_FAILED' | 'WATCH_OUTPUT_FAILED'
 const node.OUTGOING_CLTV_REJECT_DELTA = 3
 type node.OutgoingHtlcState = 'offered' | 'fulfilled' | 'failed' | 'onchain-pending' | 'onchain-resolved'
 enum node.PaymentDirection

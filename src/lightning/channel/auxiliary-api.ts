@@ -85,7 +85,19 @@ export const AUXILIARY_CHANNELS_API = Object.freeze({
 		'IForwardingEvent.auxiliary',
 		// Whoever wraps the node can refuse a forward with an asset leg
 		// before anything of it is offered.
-		'setAuxiliaryForwardGate'
+		'setAuxiliaryForwardGate',
+		// Issue #2098, step 8: an asset invoice paid in parts, collected into
+		// one set for a host that sets receiveInParts, settled together, and
+		// every part claimed once the set is committed.
+		'receiveInParts',
+		// Issue #2098, step 9: an asset payment sent in parts, for a host that
+		// sets sendInParts, each part recorded before it is sent and counted
+		// toward its channel's bound, the payment's record kept across them.
+		'sendInParts',
+		// Issue #2098, step 10: createInvoice takes { assetInvoice }, and such
+		// an invoice carries only its host's routing hints and offers
+		// basic_mpp only where its parts can be collected.
+		'createInvoice:assetInvoice'
 	] as const),
 	// Nothing is declared and not run in this build.
 	declared: Object.freeze([] as const)

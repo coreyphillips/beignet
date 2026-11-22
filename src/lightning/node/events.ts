@@ -29,6 +29,7 @@ import type {
  * LISTEN_FAILED, which BeignetNode raises through the node's own funnel.
  */
 export type NodeErrorCode =
+	| 'ASSET_HTLC_CLAIM_LOST'
 	| 'ASSET_HTLC_CLAIM_UNCONFIRMED_AT_EXPIRY'
 	| 'AUTO_FUNDING_FAILED'
 	| 'AUTO_RECONNECT_FAILED'

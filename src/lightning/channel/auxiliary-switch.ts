@@ -25,3 +25,37 @@ export const auxiliaryChannelOpens = { enabled: true };
  * that refusal; nothing else may, and the package does not export it.
  */
 export const auxiliaryForwards = { enabled: true };
+
+/**
+ * Whether this build collects the parts of an asset payment into one set
+ * (issue #2098, step 8): HTLCs that carry units under one payment hash,
+ * each at the value the host's valueIncomingHtlc gives, settled together
+ * once they are worth the invoice. On since a committed set is also
+ * defended on the chain: every part has its decision to settle, written
+ * again until it lands, and a part whose fulfil is not made is claimed at
+ * the claim buffer, never failed back. A node collects them only while
+ * this is on, the host's configuration sets `receiveInParts`, and the
+ * node's own features include basic_mpp; otherwise such a part is failed
+ * back as before, and an asset invoice does not offer basic_mpp (step 10).
+ * Nothing that follows the commit of a set reads it, so a set
+ * already committed is driven to its end whatever this says. Tests turn
+ * it off to reach that refusal; nothing else may, and the package does
+ * not export it.
+ */
+export const auxiliaryPartsReceived = { enabled: true };
+
+/**
+ * Whether this build sends an asset payment in parts (issue #2098, step
+ * 9): several HTLCs that carry units under one payment hash, each sent by
+ * its own sendPaymentToRoute over an asset channel of one peer, recorded
+ * before it is sent with its value, its first hop and its carrier, and
+ * kept in one record of the payment. On since each part also ends on its
+ * own: off the chain and on it, after a restart, and in the spending
+ * limits of the daemon, which judge the payment whole. A node sends them
+ * only while this is on and the host's configuration sets `sendInParts`;
+ * otherwise a part is refused as before. Nothing that follows a send reads
+ * it, so the parts of a payment already out are driven to their end
+ * whatever this says. Tests turn it off to reach that refusal; nothing
+ * else may, and the package does not export it.
+ */
+export const auxiliaryPartsSent = { enabled: true };

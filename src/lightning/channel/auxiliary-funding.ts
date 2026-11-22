@@ -119,6 +119,20 @@ export interface IAuxiliaryPaymentHtlc {
 	htlcId: bigint;
 	/** What the HTLC is worth to the payment, as the route carries it. */
 	amountMsat: bigint;
+	/**
+	 * Issue #2098, step 9: for an HTLC sent by a host that sets
+	 * `sendInParts`, what its route asked its first hop to carry (its worth
+	 * and every routing fee) and the bitcoin it carried on the wire, as
+	 * recorded before it was sent. Absent for an HTLC sent otherwise.
+	 */
+	routeAmountMsat?: bigint;
+	wireAmountMsat?: bigint;
+	/**
+	 * Issue #2098, step 9: present, and true, once an HTLC sent by a host
+	 * that sets `sendInParts` has ended without paying: failed back, refused
+	 * on the chain, or taken back there by this node.
+	 */
+	failed?: true;
 	/** The HTLC as its channel holds it, while it is in flight there. */
 	htlc?: IAuxiliaryChannelHtlc;
 }
@@ -169,7 +183,14 @@ export interface IAuxiliaryIncomingHtlc {
 	customRecords: CustomRecords;
 	hopPayload: IHopPayload;
 	isFinalHop: boolean;
-	/** Previously accepted live circuits and their credited quoted value. */
+	/**
+	 * Previously accepted live circuits and their credited quoted value:
+	 * for a part of an asset set being collected (`receiveInParts`, issue
+	 * #2098 step 8), the set's other parts still committed, each at the
+	 * value this hook gave it. After a restart a set that was not yet
+	 * committed is collected again as its channels come back, and each part
+	 * is asked about afresh, with those collected before it in this list.
+	 */
 	acceptedHtlcs: readonly {
 		channelId: Buffer;
 		htlcId: bigint;
@@ -233,6 +254,38 @@ export interface IAuxiliaryChannelConfig {
 	 * getFixedOutputFeeStatus().reserve.
 	 */
 	requireFeeCoinsToSettle?: boolean;
+	/**
+	 * Issue #2098, step 8: an asset invoice of this node may be paid in
+	 * parts. HTLCs that carry units under one payment hash, all from one
+	 * peer, are collected into one set, each at the value
+	 * `valueIncomingHtlc` gives it, and settled together once the values
+	 * reach the total the payer declared. Before anything is written, every
+	 * part must be able to take its fulfil at once; the set's records are
+	 * then written alone, and from that write on every part is settled, or
+	 * claimed on the chain. Only `true` turns it on, and only on a node whose
+	 * own features (`localFeatures`) include basic_mpp. Left out, such a part
+	 * is failed back as before. A hold invoice stays paid by one asset HTLC.
+	 * See "An asset invoice paid in parts" in docs/EXTENSIONS.md.
+	 *
+	 * It is read at each part, and it also decides whether an asset invoice
+	 * (`ICreateInvoiceOptions.assetInvoice`) offers basic_mpp, step 10: a
+	 * host that turns it off does so once the asset invoices that offered
+	 * parts have expired, since their parts are failed back from then on.
+	 */
+	receiveInParts?: boolean;
+	/**
+	 * Issue #2098, step 9: this node may send an asset payment in parts.
+	 * The host splits it and sends each part by its own
+	 * `sendPaymentToRoute` with `assetPayment`, every part over an asset
+	 * channel of one peer and declaring the payment's total. Each part is
+	 * recorded before it is sent, with its value, its first hop and its
+	 * carrier, and counts toward its channel's bound on HTLCs; the payment's
+	 * record is kept across its parts and ends when they do. Only `true`
+	 * turns it on. Left out, a part is refused as before, and every attempt
+	 * names the one channel of the first. See "An asset payment sent in
+	 * parts" in docs/EXTENSIONS.md.
+	 */
+	sendInParts?: boolean;
 	provider: IChannelAuxiliaryProvider;
 	/**
 	 * Asked, before the node settles it and outside any storage

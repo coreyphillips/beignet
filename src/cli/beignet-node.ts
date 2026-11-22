@@ -1339,12 +1339,61 @@ function paymentAmountSats(info: IPaymentInfo): number {
 }
 
 /**
+ * Issue #2098, step 9: the fee of an asset payment sent in parts, from its
+ * record: what its parts that did not fail asked their first hops to carry
+ * over what they were worth (`_auxiliaryPartsSent` beside
+ * `_auxiliaryPartAmounts`). Undefined for any other record, and for one
+ * whose keys cannot be read, which is then answered as before.
+ */
+function assetPartsFeeMsat(info: IPaymentInfo): bigint | undefined {
+	if (info.direction !== PaymentDirection.OUTGOING || !info.auxiliary) {
+		return undefined;
+	}
+	const rawSent = info.metadata?._auxiliaryPartsSent;
+	const rawValues = info.metadata?._auxiliaryPartAmounts;
+	if (!rawSent || !rawValues) return undefined;
+	try {
+		const sent = JSON.parse(rawSent) as Record<
+			string,
+			{ route?: unknown; failed?: unknown }
+		>;
+		const values = JSON.parse(rawValues) as Record<string, unknown>;
+		let fee = 0n;
+		let counted = 0;
+		for (const [key, part] of Object.entries(sent)) {
+			if (!part || part.failed === true) continue;
+			const route = part.route;
+			const value = values[key];
+			if (typeof route !== 'string' || typeof value !== 'string') {
+				return undefined;
+			}
+			const over = BigInt(route) - BigInt(value);
+			fee += over > 0n ? over : 0n;
+			counted++;
+		}
+		return counted > 0 ? fee : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+/**
+ * The key a part of an asset payment is recorded under, `<channel
+ * hex>:offered-<id>`, from an entry of getAuxiliaryPaymentHtlcs.
+ */
+function assetPartKey(entry: { channelId: Buffer; htlcId: bigint }): string {
+	return `${entry.channelId.toString('hex')}:offered-${entry.htlcId}`;
+}
+
+/**
  * The fee a payment paid, in msat, or undefined when the record does not
  * say. An MPP record's route is its first part only, so its fee is what left
  * the node over what the invoice asked (#1008). An incoming payment's fee is
  * a JIT LSP's skim: what the invoice asked over what the node was credited.
  */
 function paymentFeeMsat(info: IPaymentInfo): bigint | undefined {
+	const parts = assetPartsFeeMsat(info);
+	if (parts !== undefined) return parts;
 	if (info.sentMsat !== undefined && info.sentMsat >= info.amountMsat) {
 		return info.sentMsat - info.amountMsat;
 	}
@@ -1630,6 +1679,13 @@ export interface AsyncSpendClaim {
 	 * charges one claim per report (issue #977).
 	 */
 	settled?: boolean;
+	/**
+	 * Issue #2098, step 9: the part of an asset payment sent in parts this
+	 * claim was opened for, as `<channel hex>:offered-<id>`. Such a claim is
+	 * released when its part fails, and the settle of the payment charges
+	 * the parts that did not.
+	 */
+	part?: string;
 }
 
 /**
@@ -4208,8 +4264,12 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 			// this event sees the settled payment already counted. Charged at
 			// what actually left the node, fees included, where the record
 			// says; the reservation (amount plus fee cap) otherwise (#1008).
+			// Issue #2098, step 9: a payment sent in parts is charged what
+			// every part that did not fail asked its first hop to carry.
+			const parts = this._assetPartsSpendSats(info.paymentHash);
 			this._chargeAsyncSpendClaim(pi.paymentHash, {
-				actualSats: sentSats(info)
+				actualSats: parts ?? sentSats(info),
+				...(parts !== undefined ? { whole: true } : {})
 			});
 			this.log('info', 'Payment sent', {
 				paymentHash: pi.paymentHash,
@@ -4218,6 +4278,27 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 			});
 			this.emit('payment:sent', pi);
 		});
+		// Issue #2098, step 9: a part of an asset payment sent in parts that
+		// ends without paying gives its claim back, while the payment's other
+		// parts still hold theirs.
+		this.node.on(
+			'payment:htlc-resolved',
+			(event: {
+				paymentHash: Buffer;
+				channelId: Buffer;
+				htlcId: bigint;
+				state: string;
+			}) => {
+				if (event.state !== 'failed' && event.state !== 'onchain-resolved') {
+					return;
+				}
+				this._releaseAssetPartClaim(
+					event.paymentHash,
+					`${event.channelId.toString('hex')}:offered-${event.htlcId}`,
+					event.state === 'failed'
+				);
+			}
+		);
 		this.node.on('payment:failed', (info: IPaymentInfo) => {
 			const pi = this.toPaymentInfo(info);
 			// The one place a failure report touches the daily budget (issue
@@ -12310,7 +12391,8 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	 */
 	private _openAsyncSpendClaim(
 		paymentHashHex: string,
-		amountSats: number
+		amountSats: number,
+		part?: string
 	): AsyncSpendClaim | undefined {
 		if (this._dailySpendLimitSats === undefined) return undefined;
 		this._expireAsyncSpendClaims();
@@ -12330,7 +12412,8 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 		const claim: AsyncSpendClaim = {
 			sats: amountSats,
 			expiresAt: Date.now() + ASYNC_SPEND_CLAIM_TTL_MS,
-			reserved: true
+			reserved: true,
+			...(part !== undefined ? { part } : {})
 		};
 		const claims = this._asyncSpendClaims.get(paymentHashHex);
 		if (claims) claims.push(claim);
@@ -12456,9 +12539,9 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	 */
 	private _chargeAsyncSpendClaim(
 		paymentHashHex: string,
-		opts: { claim?: AsyncSpendClaim; actualSats?: number } = {}
+		opts: { claim?: AsyncSpendClaim; actualSats?: number; whole?: boolean } = {}
 	): void {
-		const { claim, actualSats } = opts;
+		const { claim, actualSats, whole } = opts;
 		this._expireAsyncSpendClaims();
 		const claims = this._asyncSpendClaims.get(paymentHashHex);
 		if (!claims || claims.length === 0) return;
@@ -12484,7 +12567,9 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 		// _checkSpendLimit never sees the same sats counted twice. The record
 		// is the one write for all of it.
 		this._releaseClaimReservation(charged);
-		if (actualSats !== undefined && actualSats > charged.sats) {
+		// A payment sent in parts (issue #2098, step 9) is charged its parts
+		// together, above any one claim by design.
+		if (actualSats !== undefined && actualSats > charged.sats && !whole) {
 			this.log(
 				'warn',
 				'Payment settled above its reservation; charged in full',
@@ -12675,7 +12760,10 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 				typeof entry.expiresAt === 'number' &&
 				Number.isFinite(entry.expiresAt) &&
 				typeof entry.reserved === 'boolean' &&
-				(entry.settled === undefined || typeof entry.settled === 'boolean')
+				(entry.settled === undefined || typeof entry.settled === 'boolean') &&
+				(entry.part === undefined ||
+					(typeof entry.part === 'string' &&
+						/^[0-9a-f]{64}:offered-(0|[1-9][0-9]*)$/.test(entry.part)))
 			);
 		};
 		let restored = 0;
@@ -12706,12 +12794,28 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 			}
 			// Copied field by field: only the claim's own fields come back
 			// from disk. A settled hash's claims come back unreserved.
+			// Issue #2098, step 9: the claim of a part that is no longer listed
+			// (never sent, at the node's restore) or listed failed holds
+			// nothing, while the payment's other parts still hold theirs.
+			const partEnded = (part: string | undefined): boolean => {
+				if (part === undefined || outcome === 'settled') return false;
+				try {
+					const listed = this.node
+						.getAuxiliaryPaymentHtlcs(paymentHash)
+						.find((entry) => assetPartKey(entry) === part);
+					return !listed || listed.failed === true;
+				} catch {
+					return false;
+				}
+			};
 			const kept = claims.map(
 				(entry): AsyncSpendClaim => ({
 					sats: entry.sats,
 					expiresAt: entry.expiresAt,
-					reserved: entry.reserved && outcome !== 'settled',
-					...(entry.settled ? { settled: true } : {})
+					reserved:
+						entry.reserved && outcome !== 'settled' && !partEnded(entry.part),
+					...(entry.settled ? { settled: true } : {}),
+					...(entry.part !== undefined ? { part: entry.part } : {})
 				})
 			);
 			this._asyncSpendClaims.set(paymentHashHex, kept);
@@ -12729,8 +12833,12 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 		// can say (issue #1008).
 		for (const paymentHashHex of toCharge) {
 			const record = this._settledRecordAtBoot(paymentHashHex);
+			const parts = this._assetPartsSpendSats(
+				Buffer.from(paymentHashHex, 'hex')
+			);
 			this._chargeAsyncSpendClaim(paymentHashHex, {
-				actualSats: record ? sentSats(record) : undefined
+				actualSats: parts ?? (record ? sentSats(record) : undefined),
+				...(parts !== undefined ? { whole: true } : {})
 			});
 			charged++;
 		}
@@ -16980,14 +17088,24 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 			payment.routeAmountMsat > payment.wireAmountMsat
 				? payment.routeAmountMsat
 				: payment.wireAmountMsat;
+		// Issue #2098, step 9: an HTLC of a host that sets sendInParts comes
+		// with its total and its id, and is admitted as a part of its
+		// payment, which is judged whole.
+		const part =
+			payment.totalMsat !== undefined && payment.htlcId !== undefined
+				? `${payment.channelId.toString('hex')}:offered-${payment.htlcId}`
+				: undefined;
 		let claim: AsyncSpendClaim | undefined;
 		try {
 			this._checkDraining();
-			claim = this._admitLightningSpend(
-				payment.paymentHash.toString('hex'),
-				sentMsat,
-				0n
-			);
+			claim =
+				part !== undefined
+					? this._admitAssetPart(payment.paymentHash, sentMsat, part)
+					: this._admitLightningSpend(
+							payment.paymentHash.toString('hex'),
+							sentMsat,
+							0n
+					  );
 		} catch (err) {
 			if (err instanceof BeignetError) {
 				return { reason: err.code, message: err.message };
@@ -16998,15 +17116,23 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 			// The send that asked is synchronous and is not this daemon's to
 			// wrap. Once it has returned or thrown, a claim whose payment
 			// dispatched nothing holds no budget (issue #474): the engine
-			// refused it after the gate, with no record or a failed one.
+			// refused it after the gate, with no record or a failed one. A
+			// part's claim goes when its own part was not sent or has failed.
 			const held = claim;
 			const paymentHash = Buffer.from(payment.paymentHash);
 			queueMicrotask(() => {
 				if (!held.reserved) return;
 				try {
-					if (this.node.hasHtlcInFlight(paymentHash)) return;
-					const record = this.node.getPayment(paymentHash);
-					if (record?.status === PaymentStatus.PENDING) return;
+					if (part !== undefined) {
+						const listed = this.node
+							.getAuxiliaryPaymentHtlcs(paymentHash)
+							.find((entry) => assetPartKey(entry) === part);
+						if (listed && !listed.failed) return;
+					} else {
+						if (this.node.hasHtlcInFlight(paymentHash)) return;
+						const record = this.node.getPayment(paymentHash);
+						if (record?.status === PaymentStatus.PENDING) return;
+					}
 				} catch {
 					// A node that cannot answer is one that sends nothing.
 				}
@@ -17014,6 +17140,120 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 			});
 		}
 		return undefined;
+	}
+
+	/**
+	 * Issue #2098, step 9: the admission of a part of an asset payment sent
+	 * in parts. The per-payment limit is judged on the payment whole: what
+	 * its parts that have not failed and this one ask their first hops to
+	 * carry, each never less than its carrier. The daily limit is judged on
+	 * this part, beside every claim held, as for any payment. The claim is
+	 * tied to the part.
+	 */
+	private _admitAssetPart(
+		paymentHash: Buffer,
+		sentMsat: bigint,
+		part: string
+	): AsyncSpendClaim | undefined {
+		const spendSats = paymentAdmissionSats(sentMsat, 0n);
+		if (spendSats === 0) return undefined;
+		const amountSats = spendLimitSats(sentMsat);
+		// An HTLC id is taken again only after the channel refused the part
+		// that had it: that part's claim, if its release has not run yet, goes
+		// now, so the part sent in its place does not count it.
+		for (const claim of this._asyncSpendClaims.get(
+			paymentHash.toString('hex')
+		) ?? []) {
+			if (claim.part === part && claim.reserved) {
+				this._releaseAsyncSpendClaim(claim);
+			}
+		}
+		const out = this._assetPartsOutSats(paymentHash);
+		this._checkMaxPayment(out + spendSats, out + amountSats);
+		this._checkSpendLimit(spendSats, amountSats);
+		return this._openAsyncSpendClaim(
+			paymentHash.toString('hex'),
+			spendSats,
+			part
+		);
+	}
+
+	/**
+	 * Issue #2098, step 9: what the parts of an asset payment sent in parts
+	 * that have not failed ask their first hops to carry, in sats, each
+	 * never less than its carrier and rounded up on its own, as each was
+	 * admitted. Zero for a payment with none.
+	 */
+	private _assetPartsOutSats(paymentHash: Buffer): number {
+		return this._assetPartsSpendSats(paymentHash) ?? 0;
+	}
+
+	/**
+	 * Issue #2098, step 9: the figure a payment sent in parts is charged at
+	 * its settle, live and at the boot reconciliation alike: what every part
+	 * that did not fail asked its first hop to carry, each never less than
+	 * its carrier, in sats. Undefined for a payment that was not sent in
+	 * parts, which is charged as before.
+	 */
+	private _assetPartsSpendSats(paymentHash: Buffer): number | undefined {
+		let parts: ReturnType<LightningNode['getAuxiliaryPaymentHtlcs']>;
+		try {
+			// Only the node's own record of an asset payment says it was sent
+			// in parts; a key of that name on any other record is a label.
+			if (this.node.getPayment(paymentHash)?.auxiliary !== true) {
+				return undefined;
+			}
+			parts = this.node.getAuxiliaryPaymentHtlcs(paymentHash);
+		} catch {
+			return undefined;
+		}
+		const sent = parts.filter(
+			(entry) =>
+				entry.routeAmountMsat !== undefined &&
+				entry.wireAmountMsat !== undefined
+		);
+		if (sent.length === 0) return undefined;
+		return sent
+			.filter((entry) => !entry.failed)
+			.reduce(
+				(sum, entry) =>
+					sum +
+					spendLimitSats(
+						entry.routeAmountMsat! > entry.wireAmountMsat!
+							? entry.routeAmountMsat!
+							: entry.wireAmountMsat!
+					),
+				0
+			);
+	}
+
+	/**
+	 * Issue #2098, step 9: a part of an asset payment sent in parts ended
+	 * without paying (`failed`), or ended on the chain, which the engine's
+	 * listing says how: its claim gives its reservation back. The claims of
+	 * the payment's other parts are kept.
+	 */
+	private _releaseAssetPartClaim(
+		paymentHash: Buffer,
+		part: string,
+		failed: boolean
+	): void {
+		const claims = this._asyncSpendClaims.get(paymentHash.toString('hex'));
+		const claim = claims?.find(
+			(entry) => entry.part === part && entry.reserved
+		);
+		if (!claim) return;
+		if (!failed) {
+			try {
+				const listed = this.node
+					.getAuxiliaryPaymentHtlcs(paymentHash)
+					.find((entry) => assetPartKey(entry) === part);
+				if (!listed?.failed) return;
+			} catch {
+				return;
+			}
+		}
+		this._releaseAsyncSpendClaim(claim);
 	}
 
 	/**

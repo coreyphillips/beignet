@@ -16,6 +16,7 @@ import {
 	auxiliaryChannelOpens,
 	auxiliaryForwards
 } from '../../../src/lightning/channel/auxiliary-switch';
+import * as auxiliarySwitches from '../../../src/lightning/channel/auxiliary-switch';
 import { ChannelState } from '../../../src/lightning/channel/types';
 import { randomBytes as engineRandomBytes } from '../../../src/lightning/crypto/provider';
 import { Feature, FeatureFlags } from '../../../src/lightning/features/flags';
@@ -27,7 +28,7 @@ import type {
 import { createTaprootFundingScript } from '../../../src/lightning/script/funding-taproot';
 import { SqliteStorage } from '../../../src/lightning/storage/sqlite-storage';
 import { ASSET_FUNDING_ROOT, hash, referenceProvider } from './auxiliary-pair';
-import { connectNodes, createNode } from './loopback-nodes';
+import { connectNodes, createNode, makeNodeConfig } from './loopback-nodes';
 
 /**
  * Set asset openings on, or off, for the tests of the describe block this
@@ -61,6 +62,99 @@ export function withAssetForwards(enabled = true): void {
 	after(() => {
 		auxiliaryForwards.enabled = prior;
 	});
+}
+
+/**
+ * The build's switch for collecting an asset invoice's parts (issue #2098,
+ * step 8), or undefined in a build that has none. Read from the module as
+ * a namespace, so a test file that uses it loads on a build before it.
+ */
+export function assetPartsSwitch(): { enabled: boolean } | undefined {
+	return (
+		auxiliarySwitches as unknown as {
+			auxiliaryPartsReceived?: { enabled: boolean };
+		}
+	).auxiliaryPartsReceived;
+}
+
+/**
+ * Set the collecting of an asset invoice's parts on, or off, for the tests
+ * of the describe block this is called in, and back to what it was after
+ * it (issue #2098, step 8). A build without the switch is left as it is.
+ */
+export function withAssetPartsReceived(enabled = true): void {
+	let prior: boolean | undefined;
+	before(() => {
+		const parts = assetPartsSwitch();
+		if (!parts) return;
+		prior = parts.enabled;
+		parts.enabled = enabled;
+	});
+	after(() => {
+		const parts = assetPartsSwitch();
+		if (parts && prior !== undefined) parts.enabled = prior;
+	});
+}
+
+/**
+ * A host's opt-in to being paid an asset invoice in parts (issue #2098,
+ * step 8): `receiveInParts: true` in its auxiliary channel configuration.
+ * Typed loosely, so that it also builds where the field is not declared.
+ */
+export const RECEIVE_IN_PARTS = {
+	receiveInParts: true
+} as unknown as Partial<IAuxiliaryChannelConfig>;
+
+/**
+ * The build's switch for sending an asset payment in parts (issue #2098,
+ * step 9), or undefined in a build that has none. Read from the module as
+ * a namespace, so a test file that uses it loads on a build before it.
+ */
+export function assetPartsSentSwitch(): { enabled: boolean } | undefined {
+	return (
+		auxiliarySwitches as unknown as {
+			auxiliaryPartsSent?: { enabled: boolean };
+		}
+	).auxiliaryPartsSent;
+}
+
+/**
+ * Set the sending of an asset payment in parts on, or off, for the tests
+ * of the describe block this is called in, and back to what it was after
+ * it (issue #2098, step 9). A build without the switch is left as it is.
+ */
+export function withAssetPartsSent(enabled = true): void {
+	let prior: boolean | undefined;
+	before(() => {
+		const parts = assetPartsSentSwitch();
+		if (!parts) return;
+		prior = parts.enabled;
+		parts.enabled = enabled;
+	});
+	after(() => {
+		const parts = assetPartsSentSwitch();
+		if (parts && prior !== undefined) parts.enabled = prior;
+	});
+}
+
+/**
+ * A host's opt-in to sending an asset payment in parts (issue #2098, step
+ * 9): `sendInParts: true` in its auxiliary channel configuration. Typed
+ * loosely, so that it also builds where the field is not declared.
+ */
+export const SEND_IN_PARTS = {
+	sendInParts: true
+} as unknown as Partial<IAuxiliaryChannelConfig>;
+
+/**
+ * Another build of the engine to make a host with, such as a release
+ * installed from npm (the downgrade tests): its node and its storage, as
+ * loaded from its dist. Typed as this tree's, which the release's match
+ * in what these helpers use.
+ */
+export interface IEngineBuild {
+	LightningNode: new (config: INodeConfig) => LightningNode;
+	SqliteStorage: new (file: string) => SqliteStorage;
 }
 
 export interface IAssetHost {
@@ -100,11 +194,14 @@ export function assetHost(
 		/** Handed the storage before the node is made, and restores from it. */
 		onStorage?: (storage: SqliteStorage) => void;
 		extra?: Partial<INodeConfig>;
+		/** The build to make the node and its storage with; this tree's unless said. */
+		build?: IEngineBuild;
 	} = {}
 ): IAssetHost {
+	const Storage = options.build?.SqliteStorage ?? SqliteStorage;
 	const storage =
 		options.sqlite || options.sqlitePath
-			? new SqliteStorage(options.sqlitePath ?? ':memory:')
+			? new Storage(options.sqlitePath ?? ':memory:')
 			: undefined;
 	storage?.open();
 	if (storage) options.onStorage?.(storage);
@@ -114,7 +211,7 @@ export function assetHost(
 		errors: [],
 		...(storage ? { storage } : {})
 	} as unknown as IAssetHost;
-	host.node = createNode(tag, seedId, storage, {
+	const config: Partial<INodeConfig> = {
 		fundingProvider: {
 			buildFundingTransaction: async () => {
 				throw new Error('an asset channel is funded by the host');
@@ -131,7 +228,13 @@ export function assetHost(
 			...hooks
 		},
 		...options.extra
-	});
+	};
+	host.node = options.build
+		? new options.build.LightningNode({
+				...makeNodeConfig(tag, seedId, storage),
+				...config
+		  })
+		: createNode(tag, seedId, storage, config);
 	host.node.on('node:error', (error: { code?: string; message?: string }) => {
 		host.errors.push(`${error.code ?? ''}: ${error.message ?? ''}`);
 	});

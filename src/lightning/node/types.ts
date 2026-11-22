@@ -1287,6 +1287,37 @@ export interface ICreateInvoiceOptions {
 	 * createFforVoucherInvoice.
 	 */
 	fforVoucher?: boolean;
+	/**
+	 * Issue #2098, step 10: an asset invoice, to be paid with asset units
+	 * over this node's asset channels through the routing hints its host
+	 * gives in `extraRoutingHints`. A build whose
+	 * `AUXILIARY_CHANNELS_API.surfaces` names `createInvoice:assetInvoice`
+	 * makes such an invoice carry only those hints, never one built from
+	 * the node's own channels, and offer basic_mpp only where its parts can
+	 * be collected: the node collects the parts of an asset payment
+	 * (`IAuxiliaryChannelConfig.receiveInParts`), it is no hold invoice, its
+	 * hints all end at one peer whose asset channels can hold two HTLCs at
+	 * once toward the node, and `inParts` is not false. An object turns it
+	 * on; left out, null or false, the invoice is made as any other.
+	 * Anything else, a node without asset channels or whose host gives no
+	 * `valueIncomingHtlc`, and an asset invoice with blinded paths,
+	 * `asyncHold`, `fforVoucher`, a JIT fee allowance, more than 20 hints or
+	 * hints that do not lead in over an asset channel are refused with an
+	 * `AuxiliaryInvoiceError` before anything is kept. See "What an asset
+	 * invoice advertises" in docs/EXTENSIONS.md.
+	 */
+	assetInvoice?: IAssetInvoiceOptions | null | false;
+}
+
+/** The terms of an asset invoice (`ICreateInvoiceOptions.assetInvoice`). */
+export interface IAssetInvoiceOptions {
+	/**
+	 * False for an invoice through a peer that does not forward the parts of
+	 * one payment under its quote: the invoice then never offers basic_mpp.
+	 * Left out or true, it offers basic_mpp wherever the node can collect
+	 * the parts.
+	 */
+	inParts?: boolean;
 }
 
 export interface IChannelInfo {
@@ -2043,7 +2074,9 @@ export type AuxiliaryPaymentErrorCode =
 	/** The channel holds more outcomes its host has not taken (onHtlcResolved) than it keeps. Nothing was sent. */
 	| 'ASSET_OUTCOMES_UNDELIVERED'
 	/** This node already has as many asset HTLCs of its own open on the channel as it offers at once (IAuxiliaryChannelConfig.maxHtlcs, 8 by default). Nothing was sent. */
-	| 'ASSET_HTLC_LIMIT_REACHED';
+	| 'ASSET_HTLC_LIMIT_REACHED'
+	/** Issue #2098, step 9: the channel did not take the asset HTLC of a payment sent by a host that sets sendInParts, by its own checks or its provider's. Nothing of it was sent, and it is not in the payment's record. */
+	| 'ASSET_HTLC_NOT_ADMITTED';
 
 /** A gate's refusal that names its own stable reason beside the sentence. */
 export interface IAuxiliaryPaymentRefusal {
@@ -2071,6 +2104,16 @@ export type AuxiliaryPaymentGate = (payment: {
 	 * every routing fee, which is what leaves this node for it.
 	 */
 	routeAmountMsat: bigint;
+	/**
+	 * Issue #2098, step 9: for an HTLC sent by a host that sets
+	 * `sendInParts`, the total the payment declares (equal to `amountMsat`
+	 * for a payment of one HTLC) and the id the HTLC will take on its
+	 * channel. The gate is then asked last, after every check of the node's
+	 * own, so that what it lets through is sent unless the channel refuses
+	 * it at the add. Absent for an HTLC sent otherwise.
+	 */
+	totalMsat?: bigint;
+	htlcId?: bigint;
 }) => string | IAuxiliaryPaymentRefusal | undefined;
 
 /**
@@ -2170,6 +2213,32 @@ export class AuxiliaryPaymentError extends CodedError<AuxiliaryPaymentErrorCode>
 	}
 }
 
+/** Why an asset invoice (`ICreateInvoiceOptions.assetInvoice`) was refused. */
+export type AuxiliaryInvoiceErrorCode =
+	/** The node makes no such invoice, or not with the option named. */
+	| 'ASSET_INVOICE_UNSUPPORTED'
+	/** The terms or the routing hints of the asset invoice are malformed, or the hints do not lead in over an asset channel of the node. */
+	| 'ASSET_INVOICE_INVALID';
+
+/**
+ * Issue #2098, step 10: an asset invoice was refused before anything was
+ * kept: no preimage, payment secret, hold mark or record.
+ */
+export class AuxiliaryInvoiceError extends CodedError<AuxiliaryInvoiceErrorCode> {
+	/** The option of createInvoice the refusal concerns. */
+	readonly option: string;
+
+	constructor(
+		code: AuxiliaryInvoiceErrorCode,
+		option: string,
+		message: string
+	) {
+		super(code, `${message} (${option})`);
+		this.name = 'AuxiliaryInvoiceError';
+		this.option = option;
+	}
+}
+
 /** What sendPaymentToRoute takes beyond its positional arguments. */
 export interface ISendToRouteOptions {
 	/**
@@ -2177,6 +2246,15 @@ export interface ISendToRouteOptions {
 	 * carrying these records and this much bitcoin, while the route and the
 	 * onion keep the amounts the payment is worth. Never retried by the
 	 * node: each attempt names its channel and brings its own records.
+	 *
+	 * Issue #2098, step 9: for a host that sets
+	 * `IAuxiliaryChannelConfig.sendInParts`, a call whose total is above
+	 * what its route's final hop receives is a part of the payment. Each
+	 * part is its own call, over an asset channel of the peer of the
+	 * payment's first HTLC, declaring the same total, with records and a
+	 * carrier of its own; the values of the parts out never come to more
+	 * than the total. A part the channel refuses at its add is thrown as
+	 * ASSET_HTLC_NOT_ADMITTED.
 	 */
 	assetPayment?: IAuxiliaryPayment;
 }

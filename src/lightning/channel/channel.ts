@@ -5231,6 +5231,41 @@ export class Channel {
 	}
 
 	/**
+	 * Asset channels (issue #2098, step 8): the refusal the provider would
+	 * give the fulfils of these received HTLCs, made in this order, or null
+	 * when it answers for each commitment they lead to. Each fulfil is tried
+	 * on a copy of the state with the ones before it, as fulfillHtlc tries
+	 * its own (auxiliaryRoundRefusal), so nothing of the channel changes;
+	 * only the provider's answers are kept, in memory, as every round check
+	 * keeps them. Null on a channel without asset state.
+	 */
+	auxiliaryFulfilRefusal(htlcIds: readonly bigint[]): string | null {
+		if (!this._state.auxiliaryState) return null;
+		this._state.auxiliaryAnswers ??= new Map();
+		const fulfilled: Array<{ key: string; entry: IHtlcEntry }> = [];
+		for (const htlcId of htlcIds) {
+			const key = `received-${htlcId}`;
+			const entry = this._state.htlcs.get(key);
+			if (!entry) return `HTLC ${htlcId} not found`;
+			fulfilled.push({
+				key,
+				entry: {
+					...entry,
+					state: HtlcState.FULFILLED,
+					removalRemoteCommitted: false
+				}
+			});
+			const refusal = auxiliaryRoundRefusal(
+				this._state,
+				'the settlement of an HTLC',
+				{ htlcs: fulfilled }
+			);
+			if (refusal) return refusal.message;
+		}
+		return null;
+	}
+
+	/**
 	 * Whether failHtlc would currently accept this received HTLC. Same
 	 * contract and purpose as canFulfillHtlc above: callers that pair
 	 * irreversible bookkeeping with the fail check this first, because a
