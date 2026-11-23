@@ -28,6 +28,7 @@ import { withAssetOpens, type IAssetHost } from './helpers/auxiliary-nodes';
 import {
 	SWEEP_DESTINATION,
 	errorsOf,
+	settle,
 	trackedOutputs
 } from './helpers/auxiliary-on-chain';
 import {
@@ -495,6 +496,96 @@ describe('a plain HTLC on an asset channel that is on the chain, in a hold or a 
 		);
 	});
 
+	it('ends a hold set settled in part off the chain COMPLETED with what it settled when its part on the asset channel is under the dust limit: the ordinary part fulfilled, the records and hold:settled lowered by the other, and no cancel', async () => {
+		const held = await heldOnChain('plain-hold-chain-dust-mixed', {
+			closer: 'bob',
+			amountMsat: 300_000n,
+			expiryDelta: 150,
+			mixed: true
+		});
+		const { pw, paymentHash, offer, ordinary, preimage, commitmentHeight } =
+			held;
+		const carol = pw.w.hosts.carol;
+		const sent = endsSent(carol);
+		expect(outputOf(carol, pw.w.outChannel, offer), 'no output').to.equal(
+			undefined
+		);
+		carol.node.settleHeldHtlc(paymentHash, preimage);
+		await until(
+			'the ordinary part is settled',
+			() => bobHasOut(pw, pw.w.outChannel2!, paymentHash) === 0
+		);
+		expect(endsOfOffer(sent, ordinary!).map((end) => end.type)).to.deep.equal([
+			UPDATE_FULFILL_HTLC
+		]);
+		await world.passTo(pw.w, commitmentHeight + IRREVOCABLE_DEPTH - 1);
+		expect(
+			parkedOf(carol, paymentHash),
+			'parked a block short of that depth'
+		).to.equal(1);
+		await world.mine(pw.w, 1);
+		expect(parkedOf(carol, paymentHash)).to.equal(0);
+		const payment = carol.node.getPayment(paymentHash)!;
+		expect(payment.status).to.equal(PaymentStatus.COMPLETED);
+		expect(payment.receivedMsat).to.equal(30_000_000n);
+		expect(payment.settledHtlcs).to.deep.equal([
+			`${hex(ordinary!.channelId)}:${ordinary!.htlcId}`
+		]);
+		expect('auxiliary' in payment).to.equal(false);
+		const ends = held.events.filter((e) => e.name !== 'hold:accepted');
+		expect(ends.map((e) => e.name)).to.deep.equal(['hold:settled']);
+		expect(ends[0].event.heldAmountMsat).to.equal(30_000_000n);
+		expect(ends[0].event.htlcCount).to.equal(1);
+		expect('auxiliary' in ends[0].event).to.equal(false);
+		expect(pw.log.resolved).to.deep.equal([]);
+	});
+
+	it('keeps a part claimed on the chain with what its hold set settled while the other part waits for its channel, so the settle of that part ends the hold with both parts and the whole amount', async () => {
+		const held = await heldOnChain('plain-hold-chain-kept', {
+			closer: 'bob',
+			expiryDelta: 150,
+			mixed: true
+		});
+		const { pw, paymentHash, offer, ordinary } = held;
+		const carol = pw.w.hosts.carol;
+		// Carol's ordinary channel with Bob waits for him: the fulfil of its
+		// part cannot leave.
+		world.cut(pw.w, 'out');
+		const { claimHeight } = await settleOnChain(held, false);
+		await world.passTo(pw.w, claimHeight + IRREVOCABLE_DEPTH - 1);
+		await world.mine(pw.w, 1);
+		expect(
+			parkedOf(carol, paymentHash),
+			'the ordinary part waits; the other has ended'
+		).to.equal(1);
+		expect(carol.node.getPayment(paymentHash)!.status).to.not.equal(
+			PaymentStatus.COMPLETED
+		);
+		expect(held.events.map((e) => e.name)).to.deep.equal([
+			'hold:accepted',
+			'hold:accepted'
+		]);
+		const sent = endsSent(carol);
+		await world.reconnect(pw.w, 'out');
+		await until(
+			'the ordinary part is settled',
+			() => bobHasOut(pw, pw.w.outChannel2!, paymentHash) === 0
+		);
+		expect(endsOfOffer(sent, ordinary!).map((end) => end.type)).to.deep.equal([
+			UPDATE_FULFILL_HTLC
+		]);
+		await until('the hold ends', () => parkedOf(carol, paymentHash) === 0);
+		expectSettledHold(held, carol);
+		const settled = held.events.find((e) => e.name === 'hold:settled')!;
+		expect(settled.event.htlcCount).to.equal(2);
+		const payment = carol.node.getPayment(paymentHash)!;
+		expect(payment.receivedMsat ?? payment.amountMsat).to.equal(80_000_000n);
+		expect(payment.settledHtlcs).to.have.members([
+			`${hex(offer.channelId)}:${offer.htlcId}`,
+			`${hex(ordinary!.channelId)}:${ordinary!.htlcId}`
+		]);
+	});
+
 	it('ends a hold settled on chain COMPLETED at the depth of its claim after a restart over SQLite between the decision and the end', async () => {
 		const tag = 'plain-hold-chain-restart';
 		const held = await heldOnChain(tag, { closer: 'bob' });
@@ -504,6 +595,11 @@ describe('a plain HTLC on an asset channel that is on the chain, in a hold or a 
 		const carol = pw.w.hosts.carol;
 		held.events = holdEventsOf(carol);
 		expect(parkedOf(carol, paymentHash)).to.equal(1);
+		// A spend kept from the last session counts toward its depth once
+		// this session's watch reports it again, which its recheck does
+		// (every minute, and on any block that touches the output).
+		carol.node.getChainWatcher()!.recheckAllWatches();
+		await settle();
 		await world.passTo(pw.w, claimHeight + IRREVOCABLE_DEPTH - 1);
 		expect(
 			parkedOf(carol, paymentHash),

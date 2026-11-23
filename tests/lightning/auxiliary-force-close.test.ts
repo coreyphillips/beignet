@@ -393,7 +393,7 @@ describe('an asset channel with a commitment on the chain (issue #2093)', functi
 		expect(held.sweepTxHex).to.be.a('string');
 		expect(pair.backends.bob.published).to.deep.equal([]);
 		expect(said).to.include(
-			`A spend of the units of an asset channel waits for its monitor to be stored (channel ${channelId.toString(
+			`A spend of an output of an asset channel waits for its monitor to be stored (channel ${channelId.toString(
 				'hex'
 			)})`
 		);

@@ -13695,9 +13695,11 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 	}
 
 	/**
-	 * Broadcast a spend of the units of an asset channel, once the monitor
-	 * row that holds its asset side is stored. Until then it is held, said
-	 * as an error naming the channel, and released on a later block.
+	 * Broadcast a spend of an output of an asset channel (a sweep of its
+	 * units, or a spend funded from the fee coins, of an HTLC output with
+	 * units or without), once the monitor row that holds it is stored.
+	 * Until then it is held, said as an error naming the channel, and
+	 * released on a later block.
 	 */
 	private broadcastAuxiliarySpend(channelId: Buffer, tx: Buffer): void {
 		const channelIdHex = channelId.toString('hex');
@@ -13722,7 +13724,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		this.emitContained(
 			'error',
 			channelId,
-			`A spend of the units of an asset channel waits for its monitor to be stored (channel ${channelIdHex})`
+			`A spend of an output of an asset channel waits for its monitor to be stored (channel ${channelIdHex})`
 		);
 	}
 

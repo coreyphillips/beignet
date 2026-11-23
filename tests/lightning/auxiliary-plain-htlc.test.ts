@@ -29,9 +29,16 @@ import {
 	type ITrackedOutput
 } from '../../src/lightning/chain/types';
 import { PaymentStatus } from '../../src/lightning/node/types';
-import { HtlcState } from '../../src/lightning/channel/types';
+import {
+	HtlcState,
+	isFixedAssetHtlcChannel
+} from '../../src/lightning/channel/types';
 import { INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS } from '../../src/lightning/onion/types';
 import type { IHeldInvoiceSnapshot } from '../../src/lightning/node/types';
+import type {
+	IRecoveryCommitResult,
+	SafetyTransition
+} from '../../src/lightning/recovery/types';
 import {
 	assetHost,
 	connectHosts,
@@ -78,11 +85,76 @@ import {
 	unitsOn,
 	until,
 	type IPlainHostLog,
-	type IPlainOffer
+	type IPlainOffer,
+	type IPlainWorld
 } from './helpers/auxiliary-plain-scene';
 import { openReadyChannel } from './helpers/loopback-nodes';
 
 const REVOKE_AND_ACK = 133;
+
+/** The two kinds of asset channel: the overlay alone, and the fixed type. */
+const TYPES = [
+	{ name: 'the overlay alone', tag: 'overlay', fixed: false },
+	{ name: 'the fixed type (bit 450)', tag: 'fixed', fixed: true }
+] as const;
+type ChannelKind = (typeof TYPES)[number];
+
+/** A host's storage, as the node commits each transition to it. */
+interface ICommitHolder {
+	recovery: {
+		commit: (transition: SafetyTransition) => IRecoveryCommitResult;
+	};
+}
+
+/** Whether a transition makes the record of a hash COMPLETED. */
+const completes = (
+	transition: SafetyTransition,
+	paymentHash: Buffer
+): boolean =>
+	transition.mutations.some(
+		(mutation) =>
+			mutation.type === 'payment_state' &&
+			mutation.paymentHash === hex(paymentHash) &&
+			mutation.payment.status === PaymentStatus.COMPLETED
+	);
+
+/**
+ * A host's storage refuses the first transition that `refuses` picks out,
+ * and takes every other. Gives what the refused one carried; `restore`
+ * puts the storage back as it was.
+ */
+function refuseOnce(
+	host: IAssetHost,
+	refuses: (transition: SafetyTransition) => boolean
+): { refused: SafetyTransition[]; restore: () => void } {
+	const holder = host.node as unknown as ICommitHolder;
+	const commit = holder.recovery.commit.bind(holder.recovery);
+	const refused: SafetyTransition[] = [];
+	holder.recovery.commit = (transition): IRecoveryCommitResult => {
+		if (refused.length === 0 && refuses(transition)) {
+			refused.push(transition);
+			return {
+				committed: false,
+				released: [],
+				frameSequence: null,
+				error: new Error('the disk refuses the write')
+			};
+		}
+		return commit(transition);
+	};
+	return {
+		refused,
+		restore: (): void => {
+			holder.recovery.commit = commit;
+		}
+	};
+}
+
+/** The channels whose rows a transition writes, by id in hex. */
+const rowsOf = (transition: SafetyTransition): string[] =>
+	transition.mutations.flatMap((mutation) =>
+		mutation.type === 'channel_state' ? [mutation.channelId] : []
+	);
 
 /** The final CLTV of the HTLCs of the loopback pair, whose nodes have no chain. */
 const EXPIRY = 40;
@@ -753,6 +825,112 @@ describe('a plain HTLC on an asset channel', function () {
 		const keyOf = (offer: IPlainOffer): string =>
 			`${hex(offer.channelId)}:${offer.htlcId}`;
 
+		/**
+		 * Stop Carol in the settle of a set: a copy of her database is taken,
+		 * and nothing she sends from then on reaches Bob. At the first fulfil
+		 * of the hash, or with `atCommit` at the write that makes its record
+		 * COMPLETED when that comes first. `restart` brings her back on the
+		 * copy, not yet connected to Bob.
+		 */
+		const stopIn = (
+			pw: IPlainWorld,
+			tag: string,
+			paymentHash: Buffer,
+			atCommit = false
+		): {
+			stopped: () => boolean;
+			restart: (
+				options?: Omit<
+					NonNullable<Parameters<typeof fworld.restartCarol>[2]>,
+					'hooks' | 'reconnect' | 'whileDown'
+				>
+			) => Promise<void>;
+		} => {
+			const { w } = pw;
+			const image = `${w.carolPath!}.image`;
+			let stopped = false;
+			const stop = (): void => {
+				if (stopped) return;
+				stopped = true;
+				fworld.silence(w, 'out');
+				for (const suffix of ['', '-wal']) {
+					fs.rmSync(`${image}${suffix}`, { force: true });
+					if (fs.existsSync(`${w.carolPath!}${suffix}`)) {
+						fs.copyFileSync(`${w.carolPath!}${suffix}`, `${image}${suffix}`);
+					}
+				}
+			};
+			const manager = w.hosts.carol.node.getChannelManager();
+			const fulfil = manager.fulfillHtlc.bind(manager);
+			manager.fulfillHtlc = (
+				channelId,
+				htlcId,
+				preimage
+			): ReturnType<typeof fulfil> => {
+				if (sha256(preimage).equals(paymentHash)) stop();
+				return fulfil(channelId, htlcId, preimage);
+			};
+			if (atCommit) {
+				const holder = w.hosts.carol.node as unknown as ICommitHolder;
+				const commit = holder.recovery.commit.bind(holder.recovery);
+				holder.recovery.commit = (transition): IRecoveryCommitResult => {
+					if (completes(transition, paymentHash)) stop();
+					return commit(transition);
+				};
+			}
+			return {
+				stopped: () => stopped,
+				restart: async (options = {}): Promise<void> => {
+					try {
+						await fworld.restartCarol(w, tag, {
+							...options,
+							hooks: pw.hooks,
+							reconnect: false,
+							whileDown: () => {
+								for (const suffix of ['', '-wal', '-shm']) {
+									fs.rmSync(`${w.carolPath!}${suffix}`, { force: true });
+								}
+								for (const suffix of ['', '-wal']) {
+									if (fs.existsSync(`${image}${suffix}`)) {
+										fs.copyFileSync(
+											`${image}${suffix}`,
+											`${w.carolPath!}${suffix}`
+										);
+									}
+								}
+							}
+						});
+					} finally {
+						for (const suffix of ['', '-wal']) {
+							fs.rmSync(`${image}${suffix}`, { force: true });
+						}
+					}
+				}
+			};
+		};
+
+		/** The transactions Carol hands to the chain that show the preimage of a hash. */
+		const preimageShown = (pw: IPlainWorld, paymentHash: Buffer): string[] => {
+			const shown: string[] = [];
+			const backend = pw.w.backends.carol;
+			const publish = backend.broadcastTransaction.bind(backend);
+			backend.broadcastTransaction = async (txHex: string): Promise<string> => {
+				const tx = bitcoin.Transaction.fromHex(txHex);
+				if (
+					tx.ins.some((input) =>
+						input.witness.some(
+							(element) =>
+								element.length === 32 && sha256(element).equals(paymentHash)
+						)
+					)
+				) {
+					shown.push(tx.getId());
+				}
+				return publish(txHex);
+			};
+			return shown;
+		};
+
 		it('collects the ordinary part and then the plain part on the asset channel, settles both, and has the decision of the asset-channel part written when its first fulfil leaves', async () => {
 			const pw = await openPlainWorld(fworld, 'plain-set');
 			const { w } = pw;
@@ -898,7 +1076,7 @@ describe('a plain HTLC on an asset channel', function () {
 			expect(pw.log.resolved).to.deep.equal([]);
 		});
 
-		it('writes the decisions of two asset-channel parts all or none: the second refused by the storage, the first is taken back and the set fails back with nothing revealed', async () => {
+		it('writes the record and the decisions of two asset-channel parts in one transition: refused by the storage, nothing is written or revealed, and the set fails back', async () => {
 			const pw = await openPlainWorld(fworld, 'plain-set-unwritten', {
 				secondOut: 'asset'
 			});
@@ -909,49 +1087,9 @@ describe('a plain HTLC on an asset channel', function () {
 				amountMsat: 8_000_000n,
 				description: 'paid in parts'
 			});
-			const nextOf = (channelId: Buffer): bigint =>
-				w.hosts.bob.node
-					.getChannelManager()
-					.getChannel(channelId)!
-					.getFullState().localHtlcCounter;
-			const parts = new Map([
-				[hex(w.outChannel), nextOf(w.outChannel)],
-				[hex(w.outChannel2!), nextOf(w.outChannel2!)]
-			]);
-			// The first row that carries a part's decision to settle is written;
-			// the first such row of the other channel is refused.
-			const persistence = (
-				carol.node.getChannelManager() as unknown as {
-					persistence: {
-						persist: (args: {
-							channel: { auxiliaryHtlcDecision(id: bigint): unknown };
-							channelId: Buffer;
-						}) => unknown;
-					};
-				}
-			).persistence;
-			const persist = persistence.persist;
-			const written = new Set<string>();
-			const refused: string[] = [];
-			persistence.persist = (args): unknown => {
-				const channelHex = hex(args.channelId);
-				const htlcId = parts.get(channelHex);
-				const decided =
-					htlcId !== undefined &&
-					(
-						args.channel.auxiliaryHtlcDecision(htlcId) as
-							| { outcome?: string }
-							| undefined
-					)?.outcome === 'settle';
-				if (decided && !written.has(channelHex)) {
-					if (written.size === 0) written.add(channelHex);
-					else if (refused.length === 0) {
-						refused.push(channelHex);
-						return { committed: false, outboxIds: [] };
-					}
-				}
-				return persist.call(persistence, args);
-			};
+			const storage = refuseOnce(carol, (transition) =>
+				completes(transition, invoice.paymentHash)
+			);
 			try {
 				const first = bobOffers(pw, w.outChannel, invoice, 5_000_000n, {
 					totalMsat: 8_000_000n,
@@ -971,7 +1109,11 @@ describe('a plain HTLC on an asset channel', function () {
 						bobHasOut(pw, w.outChannel, invoice.paymentHash) === 0 &&
 						bobHasOut(pw, w.outChannel2!, invoice.paymentHash) === 0
 				);
-				expect(refused, 'a decision row was refused').to.have.length(1);
+				expect(storage.refused, 'the write was refused').to.have.length(1);
+				expect(
+					rowsOf(storage.refused[0]),
+					'the rows of both channels, with the record'
+				).to.have.members([hex(w.outChannel), hex(w.outChannel2!)]);
 				expect(
 					sent.filter((end) => end.type === UPDATE_FULFILL_HTLC),
 					'no fulfil left'
@@ -990,11 +1132,11 @@ describe('a plain HTLC on an asset channel', function () {
 					PaymentStatus.COMPLETED
 				);
 			} finally {
-				persistence.persist = persist;
+				storage.restore();
 			}
 		});
 
-		it('sends the fulfils and settles the set after a restart over SQLite between the write of the decisions and the first fulfil', async () => {
+		it('sends the fulfils and settles the set after a restart over SQLite between the write of its record and decisions and the first fulfil', async () => {
 			const tag = 'plain-set-restart';
 			const pw = await openPlainWorld(fworld, tag);
 			const { w } = pw;
@@ -1097,6 +1239,311 @@ describe('a plain HTLC on an asset channel', function () {
 				again.node.getPayment(invoice.paymentHash)!.settledHtlcs
 			).to.have.members([keyOf(ordinary), keyOf(plain)]);
 		});
+
+		it('fulfils every part after a restart over SQLite at the first fulfil, whatever the host answers then: the record COMPLETED and the decision of the asset-channel part were written together ahead of it', async () => {
+			const tag = 'plain-set-stop-fulfil';
+			const host = { down: false, ordinary: '', asked: 0 };
+			const pw = await openPlainWorld(fworld, tag, {
+				onAsk: (context) => {
+					host.asked++;
+					if (host.down && hex(context.channelId) === host.ordinary) {
+						throw new Error('the host is starting');
+					}
+				}
+			});
+			const { w } = pw;
+			host.ordinary = hex(w.outChannel2!);
+			const carol = w.hosts.carol;
+			const invoice = carol.node.createInvoice({
+				amountMsat: 8_000_000n,
+				description: 'paid in parts'
+			});
+			const stop = stopIn(pw, tag, invoice.paymentHash);
+			const ordinary = bobOffers(pw, w.outChannel2!, invoice, 3_000_000n, {
+				totalMsat: 8_000_000n,
+				label: 'ordinary part'
+			});
+			await until(
+				'Carol collects the ordinary part',
+				() => collectedOf(carol, invoice.paymentHash) === 1
+			);
+			const plain = bobOffers(pw, w.outChannel, invoice, 5_000_000n, {
+				totalMsat: 8_000_000n,
+				label: 'plain part'
+			});
+			await until('Carol is about to fulfil', stop.stopped);
+			await turns(40);
+			await stop.restart();
+
+			const again = w.hosts.carol;
+			const record = again.node.getPayment(invoice.paymentHash)!;
+			expect(record.status, 'the record on disk').to.equal(
+				PaymentStatus.COMPLETED
+			);
+			expect(record.settledHtlcs).to.have.members([
+				keyOf(ordinary),
+				keyOf(plain)
+			]);
+			expect(decisionOf(again, w.outChannel, plain.htlcId)).to.equal('settle');
+			const sent = endsSent(again);
+			const asked = host.asked;
+			host.down = true;
+			await fworld.reconnect(w, 'out');
+			await until(
+				'both parts are settled at Bob',
+				() =>
+					bobHasOut(pw, w.outChannel, invoice.paymentHash) === 0 &&
+					bobHasOut(pw, w.outChannel2!, invoice.paymentHash) === 0
+			);
+			for (const offer of [ordinary, plain]) {
+				const ends = endsOfOffer(sent, offer);
+				expect(
+					ends.map((end) => end.type),
+					keyOf(offer)
+				).to.deep.equal([UPDATE_FULFILL_HTLC]);
+				expect(sha256(ends[0].preimage!).equals(invoice.paymentHash)).to.equal(
+					true
+				);
+			}
+			expect(host.asked, 'the host is not asked again').to.equal(asked);
+			expect(again.node.getPayment(invoice.paymentHash)!.status).to.equal(
+				PaymentStatus.COMPLETED
+			);
+		});
+
+		it("reveals nothing and claims nothing after a restart over SQLite from ahead of the set's commit: when the provider refuses the round as the set completes again, every part fails back and no spend of Carol's shows the preimage, at the claim buffer either", async () => {
+			const tag = 'plain-set-stop-commit';
+			const arm = { down: false };
+			const host = { arming: false, ordinary: '' };
+			const pw = await openPlainWorld(fworld, tag, {
+				// From the ask about the asset-channel part on, once armed,
+				// Carol's provider builds no commitment.
+				onAsk: (context) => {
+					if (host.arming && hex(context.channelId) !== host.ordinary) {
+						arm.down = true;
+					}
+				}
+			});
+			const { w } = pw;
+			host.ordinary = hex(w.outChannel2!);
+			const carol = w.hosts.carol;
+			const invoice = carol.node.createInvoice({
+				amountMsat: 8_000_000n,
+				description: 'paid in parts'
+			});
+			const stop = stopIn(pw, tag, invoice.paymentHash, true);
+			const ordinary = bobOffers(pw, w.outChannel2!, invoice, 3_000_000n, {
+				totalMsat: 8_000_000n,
+				label: 'ordinary part'
+			});
+			await until(
+				'Carol collects the ordinary part',
+				() => collectedOf(carol, invoice.paymentHash) === 1
+			);
+			const plain = bobOffers(pw, w.outChannel, invoice, 5_000_000n, {
+				totalMsat: 8_000_000n,
+				label: 'plain part'
+			});
+			await until('Carol is about to settle', stop.stopped);
+			await turns(40);
+			await stop.restart({ wrapProvider: refusing(arm) });
+
+			const again = w.hosts.carol;
+			expect(again.node.getPayment(invoice.paymentHash)?.status).to.not.equal(
+				PaymentStatus.COMPLETED
+			);
+			expect(decisionOf(again, w.outChannel, plain.htlcId)).to.not.equal(
+				'settle'
+			);
+			const sent = endsSent(again);
+			const shown = preimageShown(pw, invoice.paymentHash);
+			host.arming = true;
+			await fworld.reconnect(w, 'out');
+			await until(
+				'the ordinary part is failed back',
+				() => bobHasOut(pw, w.outChannel2!, invoice.paymentHash) === 0
+			);
+			host.arming = false;
+			arm.down = false;
+			(
+				again.node as unknown as { retryAuxiliaryOwed: () => void }
+			).retryAuxiliaryOwed();
+			for (
+				let i = 0;
+				i < 5 && bobHasOut(pw, w.outChannel, invoice.paymentHash) > 0;
+				i++
+			) {
+				await fworld.mine(w, 1);
+			}
+			await until(
+				'the asset-channel part is failed back',
+				() => bobHasOut(pw, w.outChannel, invoice.paymentHash) === 0
+			);
+			for (const offer of [ordinary, plain]) {
+				expect(
+					endsOfOffer(sent, offer).map((end) => end.type),
+					keyOf(offer)
+				).to.deep.equal([UPDATE_FAIL_HTLC]);
+			}
+			await fworld.passTo(w, plain.cltvExpiry - 18);
+			await fworld.mine(w, 12);
+			expect(shown, 'no spend shows the preimage').to.deep.equal([]);
+			expect(again.node.getPayment(invoice.paymentHash)?.status).to.not.equal(
+				PaymentStatus.COMPLETED
+			);
+		});
+
+		it("takes back at a restart a decision to settle the asset-channel part that stands with its set's record not COMPLETED: the part fails back, and nothing claims it at the claim buffer", async () => {
+			const tag = 'plain-set-take-back';
+			const pw = await openPlainWorld(fworld, tag);
+			const { w } = pw;
+			const carol = w.hosts.carol;
+			const invoice = carol.node.createInvoice({
+				amountMsat: 8_000_000n,
+				description: 'paid in parts'
+			});
+			const plain = bobOffers(pw, w.outChannel, invoice, 5_000_000n, {
+				totalMsat: 8_000_000n,
+				label: 'plain part'
+			});
+			await until(
+				'Carol collects the plain part',
+				() => collectedOf(carol, invoice.paymentHash) === 1
+			);
+			// A decision no commit of the set wrote: the set is not complete.
+			const preimage = (
+				carol.node as unknown as { preimages: Map<string, Buffer> }
+			).preimages.get(hex(invoice.paymentHash))!;
+			expect(
+				carol.node
+					.getChannelManager()
+					.recordAuxiliaryHtlcDecision(
+						w.outChannel,
+						plain.htlcId,
+						'settle',
+						preimage
+					)
+			).to.equal(true);
+			await fworld.restartCarol(w, tag, { hooks: pw.hooks, reconnect: false });
+
+			const again = w.hosts.carol;
+			expect(again.node.getPayment(invoice.paymentHash)!.status).to.equal(
+				PaymentStatus.PENDING
+			);
+			expect(decisionOf(again, w.outChannel, plain.htlcId)).to.equal('fail');
+			const sent = endsSent(again);
+			const shown = preimageShown(pw, invoice.paymentHash);
+			await fworld.reconnect(w, 'out');
+			await until(
+				'Carol collects the plain part again',
+				() => collectedOf(again, invoice.paymentHash) === 1
+			);
+			// The set never completes: its part times out.
+			(again.node as unknown as { mppTimeoutMs: number }).mppTimeoutMs = 0;
+			await new Promise((resolve) => setTimeout(resolve, 5));
+			again.node.failTimedOutMppPayments();
+			await until(
+				'the plain part is failed back',
+				() => bobHasOut(pw, w.outChannel, invoice.paymentHash) === 0
+			);
+			expect(endsOfOffer(sent, plain).map((end) => end.type)).to.deep.equal([
+				UPDATE_FAIL_HTLC
+			]);
+			await fworld.passTo(w, plain.cltvExpiry - 18);
+			await fworld.mine(w, 12);
+			expect(shown, 'no spend shows the preimage').to.deep.equal([]);
+			expect(again.node.getPayment(invoice.paymentHash)!.status).to.not.equal(
+				PaymentStatus.COMPLETED
+			);
+		});
+
+		it("writes the decisions of a hold set's asset-channel parts ahead of any fulfil: the write refused by the storage, nothing is revealed and the set stays parked, and the settle asked again at the next block settles every part", async () => {
+			const tag = 'plain-hold-set-unwritten';
+			const pw = await openPlainWorld(fworld, tag);
+			const { w } = pw;
+			const carol = w.hosts.carol;
+			const sent = endsSent(carol);
+			const events = holdEventsOf(carol);
+			const preimage = sha256(`${tag} preimage`);
+			const paymentHash = sha256(preimage);
+			const invoice = carol.node.createInvoice({
+				amountMsat: 8_000_000n,
+				description: 'held in parts',
+				hold: true,
+				paymentHash
+			});
+			const ordinary = bobOffers(pw, w.outChannel2!, invoice, 3_000_000n, {
+				totalMsat: 8_000_000n,
+				label: 'ordinary part'
+			});
+			await until(
+				'the ordinary part is parked',
+				() => parkedOf(carol, paymentHash) === 1
+			);
+			const plain = bobOffers(pw, w.outChannel, invoice, 5_000_000n, {
+				totalMsat: 8_000_000n,
+				label: 'plain part'
+			});
+			await until(
+				'the set is parked',
+				() => parkedOf(carol, paymentHash) === 2
+			);
+			// The first write of the decision to settle the asset-channel part.
+			const storage = refuseOnce(carol, (transition) =>
+				transition.mutations.some(
+					(mutation) =>
+						mutation.type === 'channel_state' &&
+						mutation.channelId === hex(w.outChannel) &&
+						mutation.state.auxiliaryState?.htlcDecisions?.get(
+							plain.htlcId.toString()
+						)?.outcome === 'settle'
+				)
+			);
+			try {
+				expect(carol.node.settleHeldHtlc(paymentHash, preimage)).to.equal(
+					false
+				);
+				await turns(40);
+				expect(storage.refused, 'the write was refused').to.have.length(1);
+				expect(sent, 'nothing left Carol').to.deep.equal([]);
+				expect(monitorsKnow(carol, paymentHash)).to.equal(false);
+				expect(decisionOf(carol, w.outChannel, plain.htlcId)).to.equal(
+					undefined
+				);
+				expect(parkedOf(carol, paymentHash)).to.equal(2);
+				expect(bobHasOut(pw, w.outChannel, paymentHash)).to.equal(1);
+				expect(bobHasOut(pw, w.outChannel2!, paymentHash)).to.equal(1);
+				expect(
+					events.filter((e) => e.name !== 'hold:accepted'),
+					'the hold has not ended'
+				).to.deep.equal([]);
+
+				await fworld.mine(w, 1);
+				await until(
+					'both parts are settled at Bob',
+					() =>
+						bobHasOut(pw, w.outChannel, paymentHash) === 0 &&
+						bobHasOut(pw, w.outChannel2!, paymentHash) === 0
+				);
+			} finally {
+				storage.restore();
+			}
+			for (const offer of [ordinary, plain]) {
+				expect(
+					endsOfOffer(sent, offer).map((end) => end.type),
+					keyOf(offer)
+				).to.deep.equal([UPDATE_FULFILL_HTLC]);
+			}
+			const record = carol.node.getPayment(paymentHash)!;
+			expect(record.status).to.equal(PaymentStatus.COMPLETED);
+			expect(record.settledHtlcs).to.have.members([
+				keyOf(ordinary),
+				keyOf(plain)
+			]);
+			expect(
+				events.filter((e) => e.name !== 'hold:accepted').map((e) => e.name)
+			).to.deep.equal(['hold:settled']);
+		});
 	});
 
 	describe("on the chain, from the peer's commitment", () => {
@@ -1107,16 +1554,34 @@ describe('a plain HTLC on an asset channel', function () {
 			for (const file of kept.splice(0)) fs.rmSync(file, { force: true });
 		});
 
-		/** Alice is the peer and Bob the wallet, each with a fee wallet. */
+		/**
+		 * Alice is the peer and Bob the wallet, each with a fee wallet, on an
+		 * asset channel of the kind given: the overlay alone unless said.
+		 */
 		const chainPair = async (
 			tag: string,
-			coins: { alice: number; bob: number } = { alice: 2, bob: 2 }
+			coins: { alice: number; bob: number } = { alice: 2, bob: 2 },
+			kind: ChannelKind = TYPES[0]
 		): Promise<{ pair: IAssetChainPair; log: IPlainHostLog }> => {
 			const log = plainHostLog();
+			// The fixed type: each node reads the features the other
+			// advertises, and neither host allows the HTLC signatures of a
+			// channel without bit 450.
+			const fixed = kind.fixed ? { allowLegacyHtlcSignatures: undefined } : {};
 			const pair = await chainWorld.open(tag, {
 				feeWallet: { alice: true, bob: true },
-				hooks: { bob: plainValuer(log) }
+				...(kind.fixed ? { realInit: true } : {}),
+				hooks: { alice: { ...fixed }, bob: { ...plainValuer(log), ...fixed } }
 			});
+			expect(
+				isFixedAssetHtlcChannel(
+					pair.bob.node
+						.getChannelManager()
+						.getChannel(pair.channelId)!
+						.getFullState().channelType
+				),
+				'the type of the asset channel'
+			).to.equal(kind.fixed);
 			for (let i = 0; i < coins.alice; i++) pair.wallets.alice!.fund(100_000);
 			for (let i = 0; i < coins.bob; i++) pair.wallets.bob!.fund(100_000);
 			await chainWorld.mine(pair, 1);
@@ -1194,58 +1659,67 @@ describe('a plain HTLC on an asset channel', function () {
 			}
 		};
 
-		it("claims a plain HTLC it settled directly from the peer's commitment with the preimage of its decision, the fee paid from the output", async () => {
-			const { pair, log } = await chainPair('plain-chain-claim');
-			const { alice, bob, channelId } = pair;
-			const invoice = bob.node.createInvoice({
-				amountMsat: 50_000_000n,
-				description: 'ordinary'
-			});
-			// From Bob's fulfil on, nothing he sends reaches Alice.
-			let quiet = false;
-			gateMessages(pair, 'bob', (type) => {
-				if (type === UPDATE_FULFILL_HTLC) quiet = true;
-				return quiet;
-			});
-			const offer = offerHtlc(
-				alice,
-				bob,
-				channelId,
-				invoice.paymentHash,
-				50_000_000n,
-				pair.chain.height + 60,
-				{ paymentSecret: invoice.paymentSecret, label: 'claimed' }
-			);
-			await until(
-				'Bob settles',
-				() =>
-					bob.node.getPayment(invoice.paymentHash)?.status ===
-					PaymentStatus.COMPLETED
-			);
-			expect(decisionOf(bob, channelId, offer.htlcId)).to.equal('settle');
-			const closed = alice.node.forceCloseChannel(channelId, SWEEP_DESTINATION);
-			expect(closed.ok, closed.error).to.equal(true);
-			await mineUntil('the HTLC output is claimed', pair, () =>
-				spent(receivedOutput(bob, pair, closed.commitmentTxid))
-			);
+		for (const kind of TYPES) {
+			it(`claims a plain HTLC it settled directly from the peer's commitment with the preimage of its decision, the fee paid from the output, on ${kind.name}`, async () => {
+				const { pair, log } = await chainPair(
+					`plain-chain-claim-${kind.tag}`,
+					undefined,
+					kind
+				);
+				const { alice, bob, channelId } = pair;
+				const invoice = bob.node.createInvoice({
+					amountMsat: 50_000_000n,
+					description: 'ordinary'
+				});
+				// From Bob's fulfil on, nothing he sends reaches Alice.
+				let quiet = false;
+				gateMessages(pair, 'bob', (type) => {
+					if (type === UPDATE_FULFILL_HTLC) quiet = true;
+					return quiet;
+				});
+				const offer = offerHtlc(
+					alice,
+					bob,
+					channelId,
+					invoice.paymentHash,
+					50_000_000n,
+					pair.chain.height + 60,
+					{ paymentSecret: invoice.paymentSecret, label: 'claimed' }
+				);
+				await until(
+					'Bob settles',
+					() =>
+						bob.node.getPayment(invoice.paymentHash)?.status ===
+						PaymentStatus.COMPLETED
+				);
+				expect(decisionOf(bob, channelId, offer.htlcId)).to.equal('settle');
+				const closed = alice.node.forceCloseChannel(
+					channelId,
+					SWEEP_DESTINATION
+				);
+				expect(closed.ok, closed.error).to.equal(true);
+				await mineUntil('the HTLC output is claimed', pair, () =>
+					spent(receivedOutput(bob, pair, closed.commitmentTxid))
+				);
 
-			const output = receivedOutput(bob, pair, closed.commitmentTxid)!;
-			expect(output.amount).to.equal(50_000n);
-			expect(showsPreimage(pair, output, invoice.paymentHash)).to.equal(true);
-			const claim = pair.chain.confirmed.get(output.resolutionTxid!)!.tx;
-			expect(claim.ins, 'no input but the HTLC output').to.have.length(1);
-			const paidOut = claim.outs.reduce((sum, out) => sum + out.value, 0);
-			expect(paidOut).to.be.above(0);
-			expect(paidOut).to.be.below(50_000);
-			await chainWorld.mine(pair, 2);
-			expect(bob.node.getPayment(invoice.paymentHash)!.status).to.equal(
-				PaymentStatus.COMPLETED
-			);
-			expect(log.resolved).to.deep.equal([]);
-			expect(
-				errorsOf(bob).filter((e) => e.startsWith('ASSET_HTLC_CLAIM_LOST'))
-			).to.deep.equal([]);
-		});
+				const output = receivedOutput(bob, pair, closed.commitmentTxid)!;
+				expect(output.amount).to.equal(50_000n);
+				expect(showsPreimage(pair, output, invoice.paymentHash)).to.equal(true);
+				const claim = pair.chain.confirmed.get(output.resolutionTxid!)!.tx;
+				expect(claim.ins, 'no input but the HTLC output').to.have.length(1);
+				const paidOut = claim.outs.reduce((sum, out) => sum + out.value, 0);
+				expect(paidOut).to.be.above(0);
+				expect(paidOut).to.be.below(50_000);
+				await chainWorld.mine(pair, 2);
+				expect(bob.node.getPayment(invoice.paymentHash)!.status).to.equal(
+					PaymentStatus.COMPLETED
+				);
+				expect(log.resolved).to.deep.equal([]);
+				expect(
+					errorsOf(bob).filter((e) => e.startsWith('ASSET_HTLC_CLAIM_LOST'))
+				).to.deep.equal([]);
+			});
+		}
 
 		for (const decided of ['decided to fail', 'never decided'] as const) {
 			it(`lets the peer take a plain HTLC it ${decided} back by its timeout, with records as an ordinary channel's: no end told, nothing lowered, no claim lost`, async () => {
@@ -1346,14 +1820,15 @@ describe('a plain HTLC on an asset channel', function () {
 		const cheated = async (
 			tag: string,
 			coins: { alice: number; bob: number },
-			beforeClose?: (pair: IAssetChainPair) => void
+			beforeClose?: (pair: IAssetChainPair) => void,
+			kind: ChannelKind = TYPES[0]
 		): Promise<{
 			pair: IAssetChainPair;
 			log: IPlainHostLog;
 			txid: string;
 			cltvExpiry: number;
 		}> => {
-			const { pair, log } = await chainPair(tag, coins);
+			const { pair, log } = await chainPair(tag, coins, kind);
 			const preimage = sha256(`${tag} preimage`);
 			const paymentHash = sha256(preimage);
 			const invoice = pair.bob.node.createInvoice({
@@ -1413,92 +1888,94 @@ describe('a plain HTLC on an asset channel', function () {
 			};
 		};
 
-		it('takes the plain HTLC output of a revoked commitment of the peer with the revocation key', async () => {
-			const { pair, log, txid, cltvExpiry } = await cheated(
-				'plain-chain-revoked',
-				{ alice: 2, bob: 2 }
-			);
-			await chainWorld.mine(pair, 1);
-			expect(
-				pair.bob.node.getChannelMonitorState(pair.channelId)!
-					.commitmentBroadcast
-			).to.include({
-				txid,
-				commitmentType: CommitmentType.THEIR_REVOKED_COMMITMENT
+		for (const kind of TYPES) {
+			it(`takes the plain HTLC output of a revoked commitment of the peer with the revocation key, on ${kind.name}`, async () => {
+				const tag = `plain-chain-revoked-${kind.tag}`;
+				const { pair, log, txid, cltvExpiry } = await cheated(
+					tag,
+					{ alice: 2, bob: 2 },
+					undefined,
+					kind
+				);
+				await chainWorld.mine(pair, 1);
+				expect(
+					pair.bob.node.getChannelMonitorState(pair.channelId)!
+						.commitmentBroadcast
+				).to.include({
+					txid,
+					commitmentType: CommitmentType.THEIR_REVOKED_COMMITMENT
+				});
+				const output = receivedOutput(pair.bob, pair, txid)!;
+				expect(output.amount).to.equal(50_000n);
+				await mineUntil('the penalty is in a block', pair, () =>
+					spent(receivedOutput(pair.bob, pair, txid))
+				);
+				const taken = receivedOutput(pair.bob, pair, txid)!;
+				expect(
+					byRevocation(pair, taken, cltvExpiry),
+					'taken by the revocation key'
+				).to.equal(true);
+				expect(
+					showsPreimage(pair, taken, sha256(sha256(`${tag} preimage`)))
+				).to.equal(false);
+				expect(log.resolved).to.deep.equal([]);
 			});
-			const output = receivedOutput(pair.bob, pair, txid)!;
-			expect(output.amount).to.equal(50_000n);
-			await mineUntil('the penalty is in a block', pair, () =>
-				spent(receivedOutput(pair.bob, pair, txid))
-			);
-			const taken = receivedOutput(pair.bob, pair, txid)!;
-			expect(
-				byRevocation(pair, taken, cltvExpiry),
-				'taken by the revocation key'
-			).to.equal(true);
-			expect(
-				showsPreimage(
-					pair,
-					taken,
-					sha256(sha256('plain-chain-revoked preimage'))
-				)
-			).to.equal(false);
-			expect(log.resolved).to.deep.equal([]);
-		});
 
-		it("follows the plain HTLC output of a revoked commitment of the peer into the peer's second-level transaction, and takes that output with the revocation key", async () => {
-			// Bob's transactions are turned away until the peer's timeout is in.
-			let away = true;
-			const { pair, txid, cltvExpiry } = await cheated(
-				'plain-chain-revoked-second',
-				{ alice: 2, bob: 2 },
-				(cheatedPair) => {
-					const backend = cheatedPair.backends.bob;
-					const publish = backend.broadcastTransaction.bind(backend);
-					backend.broadcastTransaction = async (
-						txHex: string
-					): Promise<string> => {
-						if (away) throw new Error('not connected');
-						return publish(txHex);
-					};
+			it(`follows the plain HTLC output of a revoked commitment of the peer into the peer's second-level transaction, and takes that output with the revocation key, on ${kind.name}`, async () => {
+				// Bob's transactions are turned away until the peer's timeout is in.
+				let away = true;
+				const { pair, txid, cltvExpiry } = await cheated(
+					`plain-chain-revoked-second-${kind.tag}`,
+					{ alice: 2, bob: 2 },
+					(cheatedPair) => {
+						const backend = cheatedPair.backends.bob;
+						const publish = backend.broadcastTransaction.bind(backend);
+						backend.broadcastTransaction = async (
+							txHex: string
+						): Promise<string> => {
+							if (away) throw new Error('not connected');
+							return publish(txHex);
+						};
+					},
+					kind
+				);
+				await chainWorld.mine(pair, 1);
+				if (pair.chain.height < cltvExpiry - 1) {
+					pair.chain.advance(cltvExpiry - 1 - pair.chain.height);
 				}
-			);
-			await chainWorld.mine(pair, 1);
-			if (pair.chain.height < cltvExpiry - 1) {
-				pair.chain.advance(cltvExpiry - 1 - pair.chain.height);
-			}
-			await mineUntil("the peer's HTLC-timeout is in a block", pair, () =>
-				spent(receivedOutput(pair.bob, pair, txid))
-			);
-			const lost = receivedOutput(pair.bob, pair, txid)!;
-			const child = trackedOutputs(pair.bob, pair.channelId).find(
-				(output) => output.txid === lost.resolutionTxid
-			);
-			expect(child, 'the second-level output is tracked').to.not.equal(
-				undefined
-			);
-			away = false;
-			await mineUntil('the second-level output is taken', pair, () =>
-				spent(
-					trackedOutputs(pair.bob, pair.channelId).find(
-						(output) => output.txid === lost.resolutionTxid
+				await mineUntil("the peer's HTLC-timeout is in a block", pair, () =>
+					spent(receivedOutput(pair.bob, pair, txid))
+				);
+				const lost = receivedOutput(pair.bob, pair, txid)!;
+				const child = trackedOutputs(pair.bob, pair.channelId).find(
+					(output) => output.txid === lost.resolutionTxid
+				);
+				expect(child, 'the second-level output is tracked').to.not.equal(
+					undefined
+				);
+				away = false;
+				await mineUntil('the second-level output is taken', pair, () =>
+					spent(
+						trackedOutputs(pair.bob, pair.channelId).find(
+							(output) => output.txid === lost.resolutionTxid
+						)
 					)
-				)
-			);
-			expect(
-				pair.chain.confirmed.get(lost.resolutionTxid!)!.height,
-				"the peer's timeout"
-			).to.be.at.least(cltvExpiry);
-			const taken = trackedOutputs(pair.bob, pair.channelId).find(
-				(output) => output.txid === lost.resolutionTxid
-			)!;
-			const penalty = pair.chain.confirmed.get(taken.resolutionTxid!)!.tx;
-			const input = penalty.ins.find(
-				(candidate) =>
-					Buffer.from(candidate.hash).reverse().toString('hex') ===
-						taken.txid && candidate.index === taken.outputIndex
-			)!;
-			expect(input.witness, 'taken by the revocation key').to.have.length(1);
-		});
+				);
+				expect(
+					pair.chain.confirmed.get(lost.resolutionTxid!)!.height,
+					"the peer's timeout"
+				).to.be.at.least(cltvExpiry);
+				const taken = trackedOutputs(pair.bob, pair.channelId).find(
+					(output) => output.txid === lost.resolutionTxid
+				)!;
+				const penalty = pair.chain.confirmed.get(taken.resolutionTxid!)!.tx;
+				const input = penalty.ins.find(
+					(candidate) =>
+						Buffer.from(candidate.hash).reverse().toString('hex') ===
+							taken.txid && candidate.index === taken.outputIndex
+				)!;
+				expect(input.witness, 'taken by the revocation key').to.have.length(1);
+			});
+		}
 	});
 });
