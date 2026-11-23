@@ -70,6 +70,8 @@ import {
 	openReadyChannel
 } from './helpers/loopback-nodes';
 
+import { sizedRecoveryCapsule } from './helpers/sized-recovery-capsule';
+
 const GUARDIAN: GuardianDescriptor = {
 	guardianId: 'ab'.repeat(32),
 	transports: [{ type: 'https', url: 'https://guardian.example.com' }]
@@ -403,6 +405,12 @@ describe('a restore that holds asset channels', () => {
 		expect(inline, String(inlineError)).to.equal(true);
 		return { alice, channelId, ...(ordinaryId ? { ordinaryId } : {}), capsule };
 	};
+
+	for (const count of [1, 3]) {
+		it(`keeps the backup and locator when a current snapshot exceeds the capsule budget (issuances: ${count})`, async () => {
+			await sizedRecoveryCapsule(TAG, count, SECRET);
+		});
+	}
 
 	const provider = (
 		canRestore?: IAuxiliaryChannelConfig['canRestore']

@@ -15,12 +15,23 @@ import {
 	OutputType,
 	type ITrackedOutput
 } from '../../src/lightning/chain/types';
-import type { IAuxiliarySweepResult } from '../../src/lightning/channel/auxiliary';
+import {
+	prepareAuxiliarySweep,
+	type IAuxiliarySweepSource
+} from '../../src/lightning/chain/auxiliary-sweep';
+import { taprootPair, hash } from './helpers/auxiliary-pair';
+import { issuances } from './helpers/grouped-asset-fixture';
+import type {
+	IAuxiliarySweepResult,
+	IAuxiliaryCommitmentData,
+	IChannelAuxiliaryProvider
+} from '../../src/lightning/channel/auxiliary';
 import { withAssetOpens, type IAssetHost } from './helpers/auxiliary-nodes';
 import {
 	ASSET_SWEEP_SCRIPT,
 	SWEEP_DESTINATION,
 	assetChainWorld,
+	sweepingProvider,
 	errorsOf,
 	settle,
 	sweepData,
@@ -524,6 +535,195 @@ describe('an asset channel with a commitment on the chain (issue #2093)', functi
 		expect(swept.resolutionTxHex).to.equal(sweep.toHex());
 		expect(pair.backends.alice.refused).to.deep.equal([]);
 		expect(errorsOf(pair.alice)).to.deep.equal([]);
+	});
+
+	it('sweeps three issuances from one delayed output and retains the signed attempt across restart', async () => {
+		const tag = 'grouped delayed sweep';
+		const records = (
+			owner: 'local' | 'remote'
+		): Array<{ id: string; units: string }> =>
+			issuances.map((item) => ({
+				id: item.id.toString('hex'),
+				units: item[owner].toString()
+			}));
+		const expected = records('local');
+		const units = (side: 'local' | 'remote'): bigint =>
+			issuances.reduce((sum, item) => sum + item[side], 0n);
+		const checked = new Map<string, number>();
+		const makeProvider = (): IChannelAuxiliaryProvider => {
+			const provider = sweepingProvider([], {
+				answer: (context, right) => {
+					if (
+						context.side !== 'local' ||
+						context.inputs[0].kind !== 'to_local_delayed'
+					)
+						return right;
+					expect(context.inputs).to.have.length(1);
+					const input = context.inputs[0];
+					const view = context.state.auxiliaryState!.localCommitments.get(
+						context.commitmentNumber
+					)!;
+					const stored = JSON.parse(view.customData.toString());
+					expect(stored.issuances).to.deep.equal(expected);
+					expect(stored.index).to.equal(input.commitmentOutputIndex);
+					const outpoint = context.transaction.ins[input.transactionInputIndex];
+					expect(outpoint.index).to.equal(input.commitmentOutputIndex);
+					checked.set(
+						Buffer.from(outpoint.hash).reverse().toString('hex'),
+						outpoint.index
+					);
+					return {
+						...right,
+						customData: Buffer.from(JSON.stringify(stored.issuances))
+					};
+				}
+			});
+			const build = provider.buildCommitment;
+			provider.buildCommitment = (context): IAuxiliaryCommitmentData => {
+				const view = build(context);
+				const holderUnits =
+					context.side === 'local'
+						? context.localAssetBalance
+						: context.remoteAssetBalance;
+				const owner = holderUnits === units('local') ? 'local' : 'remote';
+				expect(holderUnits).to.equal(units(owner));
+				const index = context.outputs.find(
+					(out) => out.role === 'to_local'
+				)!.outputIndex;
+				return {
+					...view,
+					customData: Buffer.from(
+						JSON.stringify({ index, issuances: records(owner) })
+					)
+				};
+			};
+			return provider;
+		};
+		const hooks = { provider: makeProvider() };
+		const pair = await world.open(tag, {
+			openerUnits: units('local'),
+			acceptorUnits: units('remote'),
+			hooks: { alice: hooks, bob: { provider: makeProvider() } }
+		});
+		const commitmentTxid = await closedByAlice(pair);
+		await world.mine(pair, 2);
+		const before = output(pair.alice, pair.channelId, OutputType.TO_LOCAL);
+		const bytes = Buffer.from(JSON.stringify(expected));
+		expect(checked.get(commitmentTxid)).to.equal(before.outputIndex);
+		expect(before.auxiliaryData).to.deep.equal(bytes);
+		const held = bitcoin.Transaction.fromHex(before.sweepTxHex!);
+		expect(held.ins).to.have.length(1);
+		const stored = pair.alice
+			.storage!.loadAllChainMonitors()
+			.find((r) => r.channelId === pair.channelId.toString('hex'))!;
+		expect(
+			stored.state.trackedOutputs.find(
+				(o) => o.outputType === OutputType.TO_LOCAL
+			)!.auxiliarySweepAttempts![held.getId()]
+		).to.deep.equal({ transaction: held.toHex(), auxiliaryData: bytes });
+		await world.restartAlice(pair, tag, undefined, undefined, hooks);
+		const again = output(pair.alice, pair.channelId, OutputType.TO_LOCAL);
+		expect(again.auxiliarySweepAttempts).to.deep.equal(
+			before.auxiliarySweepAttempts
+		);
+		const delay = pair.alice.node
+			.getChannelManager()
+			.getChannel(pair.channelId)!
+			.getFullState().remoteConfig.toSelfDelay;
+		await world.mine(pair, delay + 2);
+		const swept = output(pair.alice, pair.channelId, OutputType.TO_LOCAL);
+		const confirmed = confirmedSweep(pair, swept);
+		expect(confirmed.outs[0].script).to.deep.equal(ASSET_SWEEP_SCRIPT);
+		expect(swept.auxiliarySweepAttempts![confirmed.getId()]).to.deep.equal({
+			transaction: confirmed.toHex(),
+			auxiliaryData: bytes,
+			offered: true
+		});
+	});
+
+	it('keeps sweep data through four MiB and requires one commitment for asset-bearing inputs', () => {
+		const pair = taprootPair(117);
+		const state = pair.aliceChannel.getFullState();
+		const source = (n: number): IAuxiliarySweepSource => ({
+			kind: 'to_local_delayed',
+			commitmentOutputIndex: 0,
+			privateKey: hash(`sweep test key ${n}`),
+			output: {
+				txid: hash(`sweep commitment ${n}`).toString('hex'),
+				outputIndex: 0,
+				amount: 5000n,
+				outputType: OutputType.TO_LOCAL,
+				status: OutputStatus.CONFIRMED,
+				confirmationHeight: 100,
+				auxiliaryCommitmentNumber: BigInt(n)
+			}
+		});
+		const txFor = (inputs: IAuxiliarySweepSource[]): bitcoin.Transaction => {
+			const tx = new bitcoin.Transaction();
+			for (const { output: tracked } of inputs)
+				tx.addInput(
+					Buffer.from(tracked.txid, 'hex').reverse(),
+					tracked.outputIndex
+				);
+			tx.addOutput(SWEEP_DESTINATION, 4500);
+			return tx;
+		};
+		const one = [source(1)];
+		const original = txFor(one);
+		const limit = 4 * 1024 * 1024;
+		let data = Buffer.alloc(limit, 0x31);
+		let calls = 0;
+		pair.aliceProvider.prepareSweep = (): IAuxiliarySweepResult => {
+			calls++;
+			return {
+				customData: data,
+				outputScripts: new Map([[0, ASSET_SWEEP_SCRIPT]])
+			};
+		};
+		const accepted = original.clone();
+		const result = prepareAuxiliarySweep(
+			state,
+			true,
+			accepted,
+			one,
+			SWEEP_DESTINATION
+		);
+		if (!result.assets || !result.ok)
+			throw new Error('expected an asset sweep');
+		expect(result.data.equals(data)).to.equal(true);
+		expect(accepted.outs[0].script).to.deep.equal(ASSET_SWEEP_SCRIPT);
+		data = Buffer.alloc(limit + 1, 0x32);
+		const large = original.clone();
+		const largeBefore = large.toHex();
+		const tooLarge = prepareAuxiliarySweep(
+			state,
+			true,
+			large,
+			one,
+			SWEEP_DESTINATION
+		);
+		expect(tooLarge).to.include({ assets: true, ok: false });
+		expect(tooLarge)
+			.to.have.property('refusal')
+			.that.includes('too large to keep');
+		expect(large.toHex()).to.equal(largeBefore);
+		expect(calls).to.equal(2);
+		const two = [source(1), source(2)];
+		const mixed = txFor(two);
+		const mixedBefore = mixed.toHex();
+		const refused = prepareAuxiliarySweep(
+			state,
+			true,
+			mixed,
+			two,
+			SWEEP_DESTINATION
+		);
+		expect(refused).to.include({ assets: true, ok: false });
+		expect(refused)
+			.to.have.property('refusal')
+			.that.includes('inputs are of different commitments');
+		expect(mixed.toHex()).to.equal(mixedBefore);
+		expect(calls).to.equal(2);
 	});
 
 	it('keeps an output of units that cannot pay its own fee, says so in its row, and publishes nothing for it', async () => {
