@@ -7,8 +7,8 @@
  * tx_add_output (67):  [32:channel_id][8:serial_id][8:sats][2:scriptpubkey_len][scriptpubkey]
  * tx_remove_input (68):[32:channel_id][8:serial_id]
  * tx_remove_output (69):[32:channel_id][8:serial_id]
- * tx_complete (70):    [32:channel_id]
- * tx_signatures (71):  [32:channel_id][32:txid][2:num_witnesses][witness...]
+ * tx_complete (70):    [32:channel_id][tlvs]
+ * tx_signatures (71):  [32:channel_id][32:txid][2:num_witnesses][witness...][tlvs]
  * tx_init_rbf (72):    [32:channel_id][4:locktime][4:feerate][tlvs]
  * tx_ack_rbf (73):     [32:channel_id][tlvs]
  *   RBF tlvs: 0 = funding_output_contribution (s64 satoshis),
@@ -54,6 +54,10 @@ export interface ITxRemoveOutputMessage {
 
 export interface ITxCompleteMessage {
 	channelId: Buffer;
+	/** Current and next commitment verification nonces for the new funding output. */
+	commitNonces?: { current: Buffer; next: Buffer };
+	/** Signing nonce for a previous shared Taproot funding input. */
+	fundingInputNonce?: Buffer;
 }
 
 export interface ITxSignaturesMessage {
@@ -62,11 +66,17 @@ export interface ITxSignaturesMessage {
 	/** Witness stacks for the sender's OWN inputs, in tx-input order. */
 	witnesses: Buffer[][];
 	/**
-	 * Splicing: the sender's 64-byte signature for the shared 2-of-2 funding
-	 * input, carried in the `shared_input_signature` TLV (type 0) — NOT in the
-	 * witnesses array (witnesses only cover the sender's own inputs).
+	 * The sender's 64-byte ECDSA signature for the shared 2-of-2 funding input.
+	 * Wallet witnesses are carried separately.
 	 */
 	sharedInputSignature?: Buffer;
+	/** The 32-byte MuSig2 partial and its 66-byte public nonce for a shared Taproot input. */
+	sharedInputPartialSignatureWithNonce?: Buffer;
+}
+
+export interface IInteractiveTxDecodeOptions {
+	/** Read Taproot interactive signing records for a negotiated session. */
+	taproot?: boolean;
 }
 
 export interface ITxInitRbfMessage {
@@ -332,6 +342,19 @@ export function decodeTxRemoveOutputMessage(
 
 // ---- tx_complete (70) ----
 
+const COMMIT_NONCES = 4n;
+const FUNDING_INPUT_NONCE = 6n;
+const TX_COMPLETE_TAPROOT_TLV_TYPES = new Set([
+	COMMIT_NONCES,
+	FUNDING_INPUT_NONCE
+]);
+
+function requireFieldLength(value: Buffer, length: number, name: string): void {
+	if (value.length !== length) {
+		throw new Error(`${name} must be ${length} bytes, got ${value.length}`);
+	}
+}
+
 /**
  * Encode a tx_complete message payload (without 2-byte type prefix).
  */
@@ -340,25 +363,72 @@ export function encodeTxCompleteMessage(msg: ITxCompleteMessage): Buffer {
 		throw new Error(`Channel ID must be 32 bytes, got ${msg.channelId.length}`);
 	}
 
-	return Buffer.from(msg.channelId);
+	const { commitNonces, fundingInputNonce } = msg;
+	if (!commitNonces && !fundingInputNonce) return Buffer.from(msg.channelId);
+
+	const records = [];
+	if (commitNonces) {
+		requireFieldLength(commitNonces.current, 66, 'current commitment nonce');
+		requireFieldLength(commitNonces.next, 66, 'next commitment nonce');
+		records.push({
+			type: COMMIT_NONCES,
+			value: Buffer.concat([commitNonces.current, commitNonces.next])
+		});
+	}
+	if (fundingInputNonce) {
+		requireFieldLength(fundingInputNonce, 66, 'funding input nonce');
+		records.push({ type: FUNDING_INPUT_NONCE, value: fundingInputNonce });
+	}
+	return Buffer.concat([msg.channelId, encodeTlvStream(records)]);
 }
 
 /**
  * Decode a tx_complete message payload.
  */
-export function decodeTxCompleteMessage(payload: Buffer): ITxCompleteMessage {
+export function decodeTxCompleteMessage(
+	payload: Buffer,
+	options: IInteractiveTxDecodeOptions = {}
+): ITxCompleteMessage {
 	if (payload.length < 32) {
 		throw new Error(
 			`tx_complete too short: need 32 bytes, got ${payload.length}`
 		);
 	}
 
-	const channelId = Buffer.from(payload.subarray(0, 32));
+	const result: ITxCompleteMessage = {
+		channelId: Buffer.from(payload.subarray(0, 32))
+	};
+	if (!options.taproot || payload.length === 32) return result;
 
-	return { channelId };
+	const { records } = decodeTlvStream(
+		payload,
+		32,
+		TX_COMPLETE_TAPROOT_TLV_TYPES
+	);
+	for (const { type, value } of records) {
+		if (type === COMMIT_NONCES) {
+			requireFieldLength(value, 132, 'commitment nonces');
+			result.commitNonces = {
+				current: value.subarray(0, 66),
+				next: value.subarray(66)
+			};
+		} else if (type === FUNDING_INPUT_NONCE) {
+			requireFieldLength(value, 66, 'funding input nonce');
+			result.fundingInputNonce = value;
+		}
+	}
+	return result;
 }
 
 // ---- tx_signatures (71) ----
+
+const SHARED_INPUT_SIGNATURE = 0n;
+const SHARED_INPUT_PARTIAL_WITH_NONCE = 2n;
+const TX_SIGNATURES_TLV_TYPES = new Set([SHARED_INPUT_SIGNATURE]);
+const TX_SIGNATURES_TAPROOT_TLV_TYPES = new Set([
+	SHARED_INPUT_SIGNATURE,
+	SHARED_INPUT_PARTIAL_WITH_NONCE
+]);
 
 /**
  * Encode a tx_signatures message payload (without 2-byte type prefix).
@@ -369,6 +439,7 @@ export function decodeTxCompleteMessage(payload: Buffer): ITxCompleteMessage {
  *     serialization: CompactSize element count, then per element a
  *     CompactSize length + bytes.
  *   TLV stream: type 0 (shared_input_signature, splicing) = 64-byte signature
+ *               type 2 (Taproot shared input) = 32-byte partial + 66-byte nonce
  */
 export function encodeTxSignaturesMessage(msg: ITxSignaturesMessage): Buffer {
 	if (msg.channelId.length !== 32) {
@@ -394,28 +465,42 @@ export function encodeTxSignaturesMessage(msg: ITxSignaturesMessage): Buffer {
 		parts.push(lenBuf, witnessData);
 	}
 
-	if (msg.sharedInputSignature) {
-		if (msg.sharedInputSignature.length !== 64) {
-			throw new Error(
-				`shared_input_signature must be 64 bytes, got ${msg.sharedInputSignature.length}`
-			);
+	const { sharedInputSignature, sharedInputPartialSignatureWithNonce } = msg;
+	if (sharedInputSignature) {
+		if (sharedInputPartialSignatureWithNonce) {
+			throw new Error('tx_signatures: conflicting shared-input signatures');
 		}
+		requireFieldLength(sharedInputSignature, 64, 'shared_input_signature');
 		parts.push(
-			encodeTlvStream([{ type: 0n, value: msg.sharedInputSignature }])
+			encodeTlvStream([
+				{ type: SHARED_INPUT_SIGNATURE, value: sharedInputSignature }
+			])
+		);
+	} else if (sharedInputPartialSignatureWithNonce) {
+		requireFieldLength(
+			sharedInputPartialSignatureWithNonce,
+			98,
+			'shared-input partial with nonce'
+		);
+		parts.push(
+			encodeTlvStream([
+				{
+					type: SHARED_INPUT_PARTIAL_WITH_NONCE,
+					value: sharedInputPartialSignatureWithNonce
+				}
+			])
 		);
 	}
 
 	return Buffer.concat(parts);
 }
 
-/** shared_input_signature (type 0) is the only tx_signatures TLV. */
-const TX_SIGNATURES_TLV_TYPES = new Set([0n]);
-
 /**
  * Decode a tx_signatures message payload.
  */
 export function decodeTxSignaturesMessage(
-	payload: Buffer
+	payload: Buffer,
+	options: IInteractiveTxDecodeOptions = {}
 ): ITxSignaturesMessage {
 	if (payload.length < 66) {
 		throw new Error(
@@ -455,11 +540,22 @@ export function decodeTxSignaturesMessage(
 		const { records } = decodeTlvStream(
 			payload,
 			offset,
-			TX_SIGNATURES_TLV_TYPES
+			options.taproot
+				? TX_SIGNATURES_TAPROOT_TLV_TYPES
+				: TX_SIGNATURES_TLV_TYPES
 		);
-		for (const record of records) {
-			if (record.type === 0n && record.value.length === 64) {
-				result.sharedInputSignature = Buffer.from(record.value);
+		for (const { type, value } of records) {
+			if (type === SHARED_INPUT_SIGNATURE) {
+				// Legacy peers ignore a malformed type 0. The negotiated codec is strict.
+				if (options.taproot)
+					requireFieldLength(value, 64, 'shared_input_signature');
+				if (value.length === 64) result.sharedInputSignature = value;
+			} else if (type === SHARED_INPUT_PARTIAL_WITH_NONCE) {
+				requireFieldLength(value, 98, 'shared-input partial with nonce');
+				if (result.sharedInputSignature) {
+					throw new Error('tx_signatures: conflicting shared-input signatures');
+				}
+				result.sharedInputPartialSignatureWithNonce = value;
 			}
 		}
 	}

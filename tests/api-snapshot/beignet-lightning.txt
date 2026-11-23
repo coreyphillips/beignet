@@ -5304,6 +5304,8 @@ interface message.IInitMessage
 property message.IInitMessage.customRecords?: message.CustomRecords
 property message.IInitMessage.features: features.FeatureFlags
 property message.IInitMessage.networks?: Buffer[]
+interface message.IInteractiveTxDecodeOptions
+property message.IInteractiveTxDecodeOptions.taproot?: boolean
 interface message.IMyCurrentFundingLocked
 property message.IMyCurrentFundingLocked.retransmitFlags: number
 property message.IMyCurrentFundingLocked.txid: Buffer
@@ -5425,6 +5427,8 @@ property message.ITxAddOutputMessage.scriptPubkey: Buffer
 property message.ITxAddOutputMessage.serialId: bigint
 interface message.ITxCompleteMessage
 property message.ITxCompleteMessage.channelId: Buffer
+property message.ITxCompleteMessage.commitNonces?: { current: Buffer; next: Buffer; }
+property message.ITxCompleteMessage.fundingInputNonce?: Buffer
 interface message.ITxInitRbfMessage
 property message.ITxInitRbfMessage.channelId: Buffer
 property message.ITxInitRbfMessage.feerate: number
@@ -5439,6 +5443,7 @@ property message.ITxRemoveOutputMessage.channelId: Buffer
 property message.ITxRemoveOutputMessage.serialId: bigint
 interface message.ITxSignaturesMessage
 property message.ITxSignaturesMessage.channelId: Buffer
+property message.ITxSignaturesMessage.sharedInputPartialSignatureWithNonce?: Buffer
 property message.ITxSignaturesMessage.sharedInputSignature?: Buffer
 property message.ITxSignaturesMessage.txid: Buffer
 property message.ITxSignaturesMessage.witnesses: Buffer[][]
@@ -5595,11 +5600,11 @@ function message.decodeTxAbortMessage(payload: Buffer): message.ITxAbortMessage
 function message.decodeTxAckRbfMessage(payload: Buffer): message.ITxAckRbfMessage
 function message.decodeTxAddInputMessage(payload: Buffer): message.ITxAddInputMessage
 function message.decodeTxAddOutputMessage(payload: Buffer): message.ITxAddOutputMessage
-function message.decodeTxCompleteMessage(payload: Buffer): message.ITxCompleteMessage
+function message.decodeTxCompleteMessage(payload: Buffer, options?: message.IInteractiveTxDecodeOptions): message.ITxCompleteMessage
 function message.decodeTxInitRbfMessage(payload: Buffer): message.ITxInitRbfMessage
 function message.decodeTxRemoveInputMessage(payload: Buffer): message.ITxRemoveInputMessage
 function message.decodeTxRemoveOutputMessage(payload: Buffer): message.ITxRemoveOutputMessage
-function message.decodeTxSignaturesMessage(payload: Buffer): message.ITxSignaturesMessage
+function message.decodeTxSignaturesMessage(payload: Buffer, options?: message.IInteractiveTxDecodeOptions): message.ITxSignaturesMessage
 function message.decodeUpdateAddHtlcMessage(payload: Buffer, options?: message.IUpdateAddHtlcDecodeOptions): message.IUpdateAddHtlcMessage
 function message.decodeUpdateBlockheightMessage(payload: Buffer): message.IUpdateBlockheightMessage
 function message.decodeUpdateFailHtlcMessage(payload: Buffer): message.IUpdateFailHtlcMessage
