@@ -64,6 +64,18 @@ import {
 	openReadyChannel
 } from './helpers/loopback-nodes';
 
+import {
+	assetHost,
+	connectHosts,
+	openAssetChannel,
+	withAssetOpens
+} from './helpers/auxiliary-nodes';
+import {
+	ASSET_FUNDING_ROOT,
+	referenceProvider
+} from './helpers/auxiliary-pair';
+import { fundingData, issuances } from './helpers/grouped-asset-fixture';
+
 const key = (n: number): Buffer => getPublicKey(Buffer.alloc(32, n));
 
 function channelType(...features: number[]): Buffer {
@@ -191,6 +203,92 @@ function stored(state: IChannelState): ISerializedChannelState {
 }
 
 describe('asset channel state in the channel row', () => {
+	describe('funding data for three issuances', () => {
+		withAssetOpens();
+
+		it('keeps the final proofs and aggregate balances across a restart and a frame round trip', async () => {
+			const tag = 'grouped funding proofs';
+			const storage = new MemoryStorage();
+			const alice = assetHost(tag, 1, {}, { extra: { storage } });
+			const proposedData = fundingData(3, 1);
+			const finalData = fundingData(3, 2);
+			const bob = assetHost(tag, 2, {
+				beforeFundingCreated: async (channel, peer) => {
+					bob.node.setAuxiliaryFundingData(
+						peer,
+						channel.getFullState().temporaryChannelId,
+						finalData
+					);
+				}
+			});
+			const local = issuances.reduce((sum, row) => sum + row.local, 0n);
+			const remote = issuances.reduce((sum, row) => sum + row.remote, 0n);
+			let id: Buffer;
+			try {
+				connectHosts(alice, bob);
+				id = await openAssetChannel(alice, bob, {
+					tag,
+					openerUnits: local,
+					acceptorUnits: remote,
+					proposedData,
+					fundingData: finalData
+				});
+				const peerInfo = bob.node.getAuxiliaryChannelInfo(id)!;
+				expect(peerInfo.channelData).to.deep.equal(finalData);
+				expect([
+					peerInfo.localAssetBalance,
+					peerInfo.remoteAssetBalance
+				]).to.deep.equal([remote, local]);
+				const row = storage.loadChannel(id.toString('hex'))!;
+				expect(row.peerPubkey).to.equal(bob.node.getNodeId());
+				expect(row.state.channelId).to.deep.equal(id);
+				expect(row.state.fundingTaprootMerkleRoot).to.deep.equal(
+					ASSET_FUNDING_ROOT
+				);
+				expect(row.state.auxiliaryState!.channelData).to.deep.equal(finalData);
+				expect(row.state.auxiliaryState!.localBalance).to.equal(local);
+				expect(row.state.auxiliaryState!.remoteBalance).to.equal(remote);
+			} finally {
+				alice.node.destroy();
+				bob.node.destroy();
+			}
+			const attached = referenceProvider();
+			const again = assetHost(
+				tag,
+				1,
+				{ provider: attached },
+				{ extra: { storage } }
+			);
+			try {
+				const state = again.node
+					.getChannelManager()
+					.getChannel(id)!
+					.getFullState();
+				expect(state.auxiliaryProvider).to.equal(attached);
+				const frame = decodeFrame(encodeFrame(channelStateFrame(state, 5)));
+				expect(frame.version).to.equal(5);
+				const mutation = frame.mutations[0];
+				if (mutation.type !== 'channel_state')
+					throw new Error('expected the channel state');
+				for (const recovered of [state, mutation.state]) {
+					expect(recovered.channelId).to.deep.equal(id);
+					expect(recovered.fundingTaprootMerkleRoot).to.deep.equal(
+						ASSET_FUNDING_ROOT
+					);
+					expect(recovered.auxiliaryState!.channelData).to.deep.equal(
+						finalData
+					);
+					expect([
+						recovered.auxiliaryState!.localBalance,
+						recovered.auxiliaryState!.remoteBalance
+					]).to.deep.equal([local, remote]);
+				}
+			} finally {
+				again.node.destroy();
+			}
+		});
+	});
+
 	describe('a channel without asset state', () => {
 		// Taken with the code as it stood before asset channels touched the
 		// storage codec, from the same fixture.

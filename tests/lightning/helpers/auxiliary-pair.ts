@@ -213,10 +213,19 @@ export interface IAssetPair {
  */
 export function taprootPair(
 	seed: number,
-	options: { asset?: boolean; channelType?: Buffer } = {}
+	options: {
+		asset?: boolean;
+		channelType?: Buffer;
+		pushMsat?: bigint;
+		maxHtlcs?: number;
+	} = {}
 ): IAssetPair {
 	const aliceCfg = configOf(seedFor(seed), true);
 	const bobCfg = configOf(seedFor(seed + 1), false);
+	if (options.maxHtlcs !== undefined) {
+		aliceCfg.localConfig!.maxAcceptedHtlcs = options.maxHtlcs;
+		bobCfg.localConfig!.maxAcceptedHtlcs = options.maxHtlcs;
+	}
 	const alice = new ChannelManager(aliceCfg);
 	const bob = new ChannelManager(bobCfg);
 	const alicePubkey = aliceCfg.localBasepoints.fundingPubkey.toString('hex');
@@ -265,7 +274,11 @@ export function taprootPair(
 	link('alice', alice, alicePubkey, bob, bobPubkey);
 	link('bob', bob, bobPubkey, alice, alicePubkey);
 
-	const aliceChannel = alice.openChannel(bobPubkey, 3_000_000n);
+	const aliceChannel = alice.openChannel(
+		bobPubkey,
+		3_000_000n,
+		options.pushMsat
+	);
 	const id = alice.createFunding(
 		aliceChannel,
 		hash(`asset pair funding ${seed}`),
