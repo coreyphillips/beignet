@@ -48,6 +48,7 @@ The option and event tables in the two READMEs above are generated from the code
 | [FFOR-RESERVED-RETIREMENT.md](FFOR-RESERVED-RETIREMENT.md) | FFOR concurrent receive and reserved retirement: the version 1 and 2 contracts |
 | [PORCH-PROTOCOL.md](PORCH-PROTOCOL.md) | Porch, version 1: a blind relay that lets a node hand out a `wss://` peer link without revealing where it runs. Roles and trust, messages, limits, test vectors |
 | [SPLICE-LOCK-DEPTH.md](SPLICE-LOCK-DEPTH.md) | Depth-locked splices and conflicted-splice revert, two BOLT 2 extensions |
+| [ASSET-SPLICING.md](ASSET-SPLICING.md) | Proposed asset splice protocol covering funding proofs, commitments, HTLCs and fee replacements |
 | [MULTI-CHANNEL-SPLICE-OUT.md](MULTI-CHANNEL-SPLICE-OUT.md) | Design note: one transaction that splices out of several channels and pays an address once, with session composition, signatures, abort, restart, fees and peer support |
 | [DIRECT-FUNDING-OWNERSHIP-PROOFS.md](DIRECT-FUNDING-OWNERSHIP-PROOFS.md) | How a direct-funding receiver proves control of its named input |
 
