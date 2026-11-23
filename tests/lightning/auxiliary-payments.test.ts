@@ -702,7 +702,7 @@ describe('Asset payments (issue #2093, step 8)', function () {
 			expect(units(bob, channelId)).to.deep.equal([1000n, 9000n]);
 		});
 
-		it('that the host does not know is failed back over an asset channel all the same: nothing of an asset channel is an ordinary payment', async () => {
+		it('that the host does not know is failed back over an asset channel all the same: there a plain HTLC is a payment only at a value the host gives it', async () => {
 			const asked: IAsked[] = [];
 			const { alice, bob, channelId } = await pair('aux-unknown-asset', {
 				bob: (holder) =>

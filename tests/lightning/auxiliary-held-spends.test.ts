@@ -103,7 +103,7 @@ describe('asset channels: spends of units held for the monitor row, one for each
 		for (let index = 0; index < 40; index++) hold(spendOf(index, 1));
 		expect(sent).to.have.length(0);
 		expect(said).to.include(
-			`A spend of the units of an asset channel waits for its monitor to be stored (channel ${channelId.toString(
+			`A spend of an output of an asset channel waits for its monitor to be stored (channel ${channelId.toString(
 				'hex'
 			)})`
 		);

@@ -48,6 +48,7 @@ import {
 	auxiliarySweepDataOf,
 	noteAuxiliarySweep,
 	noteAuxiliarySweepOffered,
+	noteFundedHtlcSpend,
 	selectAuxiliarySweep
 } from './auxiliary-sweep';
 
@@ -2124,9 +2125,12 @@ export class ChainMonitor {
 	 * attached before broadcast. Every other sweep broadcasts directly.
 	 */
 	/**
-	 * Whether a transaction is a sweep of units this monitor signed. It is
-	 * marked as offered for broadcast, so its asset side stays in the row.
-	 * Always false for a channel that is not an asset channel.
+	 * Whether a transaction is a spend this monitor keeps in the list of an
+	 * output's spends: a sweep of units it signed, or a funded spend of an
+	 * HTLC output without units (noteFundedHtlcSpend). It is marked as
+	 * offered for broadcast, so it stays in the row, with its asset side
+	 * when it has one, and the caller stores the row first. Always false
+	 * for a channel that is not an asset channel.
 	 */
 	offerAuxiliarySweep(transaction: Buffer): boolean {
 		if (!this._channelState.auxiliaryState) return false;
@@ -2710,6 +2714,9 @@ export class ChainMonitor {
 		output.sweepTxHex = funded.toHex();
 		delete output.auxiliaryRefusal;
 		noteAuxiliarySweep(output, made.data);
+		// The second-level transaction of an HTLC without units: each funded
+		// one is a spend of this node's that may confirm, kept by its own id.
+		noteFundedHtlcSpend(output);
 		output.auxiliaryFeeFunding = true;
 		output.auxiliaryFeeRate = feeRatePerVbyte;
 		delete output.auxiliaryFeeWait;
@@ -3050,6 +3057,102 @@ export class ChainMonitor {
 				recorded:
 					broadcast.auxiliaryAbsentHtlcsRecorded?.includes(key) === true,
 				absent: true
+			});
+		}
+		return endings;
+	}
+
+	/**
+	 * Asset channels: how each HTLC without units this node received ended
+	 * on the chain, once that is there for good, for a caller that keeps a
+	 * record of its own for such an HTLC (a hold parked for it). Read apart
+	 * from auxiliaryHtlcEndings, which serves the HTLCs with units and what
+	 * the host is told of them: the host is told of no HTLC without units,
+	 * and none of these is a claim lost.
+	 *
+	 * An HTLC with an output on the commitment that confirmed, this node's
+	 * or the peer's, has ended once the spend of that output is there for
+	 * good: fulfilled when the spend shows the preimage of its hash (or,
+	 * for a spend that is not held, when it is one of this node's own),
+	 * failed otherwise. One this node will not claim (it decided to fail it, or
+	 * decided nothing) has failed once its expiry has passed and the
+	 * commitment is there for good. One on no output of that commitment
+	 * (under the dust limit, or not in it) has ended once the commitment is
+	 * there for good: fulfilled when its preimage had been given in the
+	 * channel, failed otherwise, whatever was decided for it, since nothing
+	 * on the chain pays it. A revoked commitment of the peer that is there
+	 * for good ends every such HTLC the channel holds by that same rule.
+	 */
+	receivedPlainHtlcEndings(): Array<{
+		htlcId: bigint;
+		outcome: 'fulfilled' | 'failed';
+	}> {
+		const broadcast = this._commitmentBroadcast;
+		const type = broadcast?.commitmentType;
+		if (
+			!broadcast ||
+			!this._channelState.auxiliaryState ||
+			(type !== CommitmentType.OUR_COMMITMENT &&
+				type !== CommitmentType.THEIR_CURRENT_COMMITMENT &&
+				type !== CommitmentType.THEIR_REVOKED_COMMITMENT)
+		) {
+			return [];
+		}
+		const irrevocable =
+			broadcast.blockHeight > 0 &&
+			this._currentBlockHeight - broadcast.blockHeight >= IRREVOCABLE_DEPTH;
+		const endings: ReturnType<ChainMonitor['receivedPlainHtlcEndings']> = [];
+		const onOutputs = new Set<bigint>();
+		if (type !== CommitmentType.THEIR_REVOKED_COMMITMENT) {
+			for (const output of this._trackedOutputs) {
+				if (
+					output.txid !== broadcast.txid ||
+					output.isSecondLevelHtlc ||
+					output.outputType !== OutputType.RECEIVED_HTLC ||
+					output.auxiliaryCommitmentNumber !== undefined ||
+					output.htlcId === undefined
+				) {
+					continue;
+				}
+				onOutputs.add(output.htlcId);
+				if (
+					output.status !== OutputStatus.IRREVOCABLY_RESOLVED ||
+					output.resolutionTxid === undefined
+				) {
+					if (
+						irrevocable &&
+						output.cltvExpiry !== undefined &&
+						output.cltvExpiry > 0 &&
+						this._currentBlockHeight >= output.cltvExpiry &&
+						auxiliaryHtlcDecisionOf(this._channelState, output.htlcId)
+							?.outcome !== 'settle'
+					) {
+						endings.push({ htlcId: output.htlcId, outcome: 'failed' });
+					}
+					continue;
+				}
+				const shown = this._spendShowsPreimage(output);
+				const fulfilled =
+					shown ??
+					output.auxiliarySweepAttempts?.[output.resolutionTxid] !== undefined;
+				endings.push({
+					htlcId: output.htlcId,
+					outcome: fulfilled ? 'fulfilled' : 'failed'
+				});
+			}
+		}
+		if (!irrevocable) return endings;
+		for (const entry of this._channelState.htlcs.values()) {
+			if (
+				entry.direction !== HtlcDirection.RECEIVED ||
+				entry.auxiliaryAmount !== undefined ||
+				onOutputs.has(entry.id)
+			) {
+				continue;
+			}
+			endings.push({
+				htlcId: entry.id,
+				outcome: entry.state === HtlcState.FULFILLED ? 'fulfilled' : 'failed'
 			});
 		}
 		return endings;

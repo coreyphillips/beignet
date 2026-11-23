@@ -432,10 +432,52 @@ export function noteAuxiliarySweep(
 }
 
 /**
- * Mark the sweep the monitor is about to offer for broadcast: from here on
- * it may confirm, and its asset side stays with the output. True when the
- * transaction is a recorded sweep of units of this output; does nothing and
- * says false for any other.
+ * Keep a funded spend of an HTLC output without units among the spends
+ * signed for the output, by transaction id. On an asset channel the
+ * second-level transaction of such an output takes its whole fee from
+ * wallet inputs, and this node signs its own half again over each funded
+ * transaction, so every raise of that fee is another transaction, with
+ * another witness and another id, and any of those offered for broadcast
+ * may be the one that confirms. They are kept as noteAuxiliarySweep keeps
+ * the sweeps of an output with units, without an asset side: the present
+ * one, and every one that was offered. By that list the monitor knows the
+ * transaction that spent the output as its own, and tracks and sweeps the
+ * output it made.
+ * Asked after the monitor stored the spend; does nothing for an output
+ * that carries units (noteAuxiliarySweep keeps those) and for one that is
+ * not the HTLC output of a commitment.
+ */
+export function noteFundedHtlcSpend(output: ITrackedOutput): void {
+	if (
+		output.auxiliaryCommitmentNumber !== undefined ||
+		output.isSecondLevelHtlc ||
+		(output.outputType !== OutputType.OFFERED_HTLC &&
+			output.outputType !== OutputType.RECEIVED_HTLC) ||
+		!output.sweepTxHex
+	) {
+		return;
+	}
+	const txid = bitcoin.Transaction.fromHex(output.sweepTxHex).getId();
+	const kept: NonNullable<ITrackedOutput['auxiliarySweepAttempts']> = {};
+	for (const [id, attempt] of Object.entries(
+		output.auxiliarySweepAttempts ?? {}
+	)) {
+		if (attempt.offered && id !== txid) kept[id] = attempt;
+	}
+	kept[txid] = {
+		transaction: output.sweepTxHex,
+		...(output.auxiliarySweepAttempts?.[txid]?.offered ? { offered: true } : {})
+	};
+	output.auxiliarySweepAttempts = kept;
+}
+
+/**
+ * Mark the spend the monitor is about to offer for broadcast: from here on
+ * it may confirm, and it stays in the list of the output's spends, with its
+ * asset side when it has one. True when the transaction is a recorded spend
+ * of this output (a sweep of units, or a funded spend of an HTLC output
+ * without units, noteFundedHtlcSpend); does nothing and says false for any
+ * other.
  */
 export function noteAuxiliarySweepOffered(
 	output: ITrackedOutput,

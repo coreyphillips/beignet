@@ -85,6 +85,9 @@ export interface ITrackedOutput {
 	 * The sweeps signed for an output that carries units, by transaction id,
 	 * each with its asset side: the present one, and every one that was
 	 * offered for broadcast (`offered`), since any of those may confirm.
+	 * On an asset channel the funded second-level transactions of an HTLC
+	 * output without units are kept here too, by the same rule and with no
+	 * asset side.
 	 */
 	auxiliarySweepAttempts?: Record<
 		string,
