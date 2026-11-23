@@ -2699,9 +2699,17 @@ function resolveOurTaprootCommitmentOutputs(
 
 	const resolved: IResolvedOutput[] = [];
 	for (const output of trackedOutputs) {
-		if (state.auxiliaryState && output.isSecondLevelHtlc) {
-			// The second-level output of an HTLC of an asset channel is made
-			// again from the transaction that created it.
+		if (
+			state.auxiliaryState &&
+			output.isSecondLevelHtlc &&
+			output.auxiliaryCommitmentNumber !== undefined
+		) {
+			// The second-level output of an HTLC of an asset channel that
+			// carries units is made again from the transaction that created
+			// it. One without units is the ordinary second-level output, made
+			// again below by the script it was matched by, as on any taproot
+			// channel: so its sweep is raised when it is not in a block, and
+			// one declined as uneconomic is made once the fee rate allows it.
 			const again = output.auxiliaryParentTxHex
 				? resolveSecondLevelHtlcOutput(
 						state,

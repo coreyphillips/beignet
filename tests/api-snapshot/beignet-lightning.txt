@@ -641,6 +641,7 @@ method chain.ChainMonitor.offerAuxiliarySweep(transaction: Buffer): boolean
 method chain.ChainMonitor.offeredAuxiliaryHtlcAbsent(htlcId: bigint, depth: number): boolean
 method chain.ChainMonitor.rebuildSweep(output: chain.ITrackedOutput, feeRatePerVbyte: number): bitcoinjs-lib#Transaction | null
 method chain.ChainMonitor.rebuildSweeps(output: chain.ITrackedOutput, feeRatePerVbyte: number): bitcoinjs-lib#Transaction[]
+method chain.ChainMonitor.receivedPlainHtlcEndings(): Array<{ htlcId: bigint; outcome: 'fulfilled' | 'failed'; }>
 static method chain.ChainMonitor.restore(saved: chain.IChainMonitorState, channelState: channel.IChannelState, destinationScript: Buffer, feeRatePerVbyte: number, revocationBasepointSecret: Buffer, paymentPrivkey: Buffer, network?: bitcoinjs-lib#Network, delayedPaymentBasepointSecret?: Buffer, htlcBasepointSecret?: Buffer): chain.ChainMonitor
 method chain.ChainMonitor.setChannelState(channelState: channel.IChannelState): void
 method chain.ChainMonitor.setDestinationScript(destinationScript: Buffer): void
@@ -1491,6 +1492,7 @@ method channel.ChannelManager.rearmCommitmentCpfp(channelId: Buffer, feeRatePerV
 method channel.ChannelManager.reauthorizeFundingBroadcast(channelId: Buffer): boolean
 method channel.ChannelManager.reauthorizeSpliceBroadcast(channelId: Buffer): boolean
 method channel.ChannelManager.rebuildForceCloseCommitment(channelId: Buffer, feeRatePerVbyte: number, noDeadlineFeeRatePerVbyte?: number): { ok: boolean; tx?: Buffer; error?: string; retryable?: boolean; }
+method channel.ChannelManager.receivedPlainHtlcChainEnding(channelId: Buffer, htlcId: bigint): 'fulfilled' | 'failed' | undefined
 method channel.ChannelManager.recordAuxiliaryHtlcDecision(channelId: Buffer, htlcId: bigint, outcome: 'settle' | 'fail', preimage?: Buffer): boolean
 method channel.ChannelManager.recordForwardAsk(channelId: Buffer, htlcId: bigint, terms?: Pick<channel.IHtlcForwardTerms, 'shortChannelId' | 'amountToForwardMsat'>): boolean
 method channel.ChannelManager.recordForwardDecision(channelId: Buffer, htlcId: bigint, outcome: 'settle' | 'fail', preimage?: Buffer): boolean

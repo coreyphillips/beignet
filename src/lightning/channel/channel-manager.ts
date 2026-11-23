@@ -12579,6 +12579,27 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 	}
 
 	/**
+	 * Asset channels: how an HTLC without units this node received ended on
+	 * the chain, or undefined while that is not there for good, for a
+	 * caller that keeps a record of its own for the HTLC (a hold parked for
+	 * it). Read apart from auxiliaryHtlcChainEnding: such an HTLC is never
+	 * told to the host, and is never a claim lost
+	 * (ChainMonitor.receivedPlainHtlcEndings).
+	 */
+	receivedPlainHtlcChainEnding(
+		channelId: Buffer,
+		htlcId: bigint
+	): 'fulfilled' | 'failed' | undefined {
+		const monitor = this.monitors.get(channelId.toString('hex'));
+		if (!monitor || typeof monitor.receivedPlainHtlcEndings !== 'function') {
+			return undefined;
+		}
+		return monitor
+			.receivedPlainHtlcEndings()
+			.find((ending) => ending.htlcId === htlcId)?.outcome;
+	}
+
+	/**
 	 * Tell the host of every asset HTLC that has left a channel
 	 * (onHtlcResolved). An outcome stays in the channel's row until the
 	 * callback returns for it, so one that throws, or a crash before it ran,
@@ -13659,9 +13680,10 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 
 	/**
 	 * Whether a transaction a monitor is about to have broadcast is a sweep
-	 * of units it signed, by whichever path it was built. The monitor marks
-	 * it as offered, so its asset side stays in the row. Always false for a
-	 * channel without asset state.
+	 * of units it signed, or a funded spend of an HTLC output without units,
+	 * by whichever path it was built. The monitor marks it as offered, so it
+	 * stays in the row, which is stored ahead of the broadcast. Always false
+	 * for a channel without asset state.
 	 */
 	private offersAuxiliarySweep(channelId: Buffer, tx: Buffer): boolean {
 		const monitor = this.monitors.get(channelId.toString('hex'));
