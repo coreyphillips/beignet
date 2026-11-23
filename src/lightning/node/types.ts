@@ -1667,8 +1667,13 @@ export interface ILightningBalance {
 	unsettledBalanceMsat: bigint;
 	/**
 	 * The bitcoin on this node's side of its open asset channels, present
-	 * only when it has one. It carries asset outputs and cannot be sent or
-	 * received over Lightning, so it is in none of the figures above.
+	 * only when it has one. It carries asset outputs and is not sent over
+	 * Lightning as a payment of its own, so it is in none of the figures
+	 * above. It grows by the bitcoin of an HTLC without units that the
+	 * host values on an asset channel (an ordinary payment the peer sent
+	 * over that channel, see "A plain HTLC on an asset channel" in
+	 * docs/EXTENSIONS.md), and leaves as the carriers of the node's asset
+	 * HTLCs or at a close of the channel.
 	 */
 	auxiliaryBalanceMsat?: bigint;
 }
