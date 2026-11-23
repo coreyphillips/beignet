@@ -255,6 +255,12 @@ A fee outside the band is refused locally: nothing is signed, the peer is not se
 
 A program that embeds the engine can give its Lightning node an auxiliary channel provider (`INodeConfig.auxiliaryChannels`, an `IAuxiliaryChannelConfig`), and the node then holds asset channels: channels that carry asset units beside bitcoin. That is set where the node is made, not through the extension contract above, whose version 1 does not include the Lightning node. The options a host sets beside the provider are fields of the same object. This section lists the ones that bound what a channel holds, and what a host should watch.
 
+### Asset IDs and balances
+
+A channel can hold a single asset ID, including an ungrouped one. When it holds several IDs, they belong to one group. The provider tracks the IDs and assigns each ID's units to commitment outputs in the order the engine supplies. The engine keeps one balance per side and one amount per asset HTLC. Each is the sum of the units across the IDs it covers. For an HTLC, the provider returns this sum from `getHtlcAmount`.
+
+The signatures for all HTLCs and the provider's custom records must fit in one `commitment_signed` payload. The engine checks the size of the signed payload before recording the signature state or sending the message. The commitment tests use synthetic records sized for three asset signatures per HTLC, with three IDs of one group and 83 HTLCs in each direction. They cover both the basic overlay and the channel type with child custody.
+
 ### How many HTLCs an asset channel carries at once
 
 `auxiliaryChannels.maxHtlcs` is the most HTLCs the node holds open at once on an asset channel, each way. It is a whole number from 1 to 83 and is 8 when the host does not set it; a node given any other value refuses to start.
