@@ -34,7 +34,9 @@ export interface IAuxiliaryFundingDescriptor {
 	temporaryChannelId: Buffer;
 	fundingTaprootMerkleRoot: Buffer;
 	channelData: Buffer;
+	/** This node's opening units summed across the channel's asset IDs. */
 	localBalance: bigint;
+	/** The peer's opening units summed across the channel's asset IDs. */
 	remoteBalance: bigint;
 }
 
@@ -46,14 +48,14 @@ export interface IAuxiliaryChannelInfo {
 	state: ChannelState;
 	channelData: Buffer;
 	/**
-	 * The asset units on this node's side that no HTLC holds. An HTLC this
-	 * node offered leaves this balance when it is added and comes back only
-	 * if it fails; one in flight is in neither balance, it is in `htlcs`.
+	 * This node's units outside HTLCs, summed across the channel's asset IDs. An
+	 * HTLC this node offers leaves this balance when added. Its units stay
+	 * in `htlcs` while in flight and return to this balance if it fails.
 	 */
 	localAssetBalance: bigint;
 	/**
-	 * The asset units on the peer's side that no HTLC holds: an HTLC the
-	 * peer offered left this balance when it arrived.
+	 * The peer's units outside HTLCs, summed across the channel's asset IDs. An
+	 * HTLC the peer offered left this balance when it arrived.
 	 */
 	remoteAssetBalance: bigint;
 	nextLocalHtlcId: bigint;

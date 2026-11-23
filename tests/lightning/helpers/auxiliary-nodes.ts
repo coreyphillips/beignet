@@ -288,6 +288,8 @@ export async function openAssetChannel(
 		openerUnits: bigint;
 		acceptorUnits: bigint;
 		fundingSatoshis?: bigint;
+		proposedData?: Buffer;
+		fundingData?: Buffer;
 		pushMsat?: bigint;
 		/**
 		 * Called when both have signed and the opener has handed its funding
@@ -304,7 +306,7 @@ export async function openAssetChannel(
 	const descriptor: IAuxiliaryFundingDescriptor = {
 		temporaryChannelId: hash(`asset channel ${options.tag}`),
 		fundingTaprootMerkleRoot: Buffer.from(ASSET_FUNDING_ROOT),
-		channelData: Buffer.from('proposed asset funding'),
+		channelData: options.proposedData ?? Buffer.from('proposed asset funding'),
 		localBalance: options.openerUnits,
 		remoteBalance: options.acceptorUnits
 	};
@@ -349,7 +351,7 @@ export async function openAssetChannel(
 		descriptor.temporaryChannelId,
 		tx.toHex(),
 		1,
-		Buffer.from('final funding proofs')
+		options.fundingData ?? Buffer.from('final funding proofs')
 	);
 	await settle();
 	if ((await options.beforeConfirmation?.(channelId)) === false) {

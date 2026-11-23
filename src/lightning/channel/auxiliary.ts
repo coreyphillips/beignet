@@ -57,8 +57,9 @@ export interface IAuxiliaryCommitmentContext {
 	state: IChannelState;
 	side: 'local' | 'remote';
 	commitmentNumber: bigint;
-	/** Asset balances from the node perspective for this exact commitment view. */
+	/** This node's units in this commitment view, summed across the channel's asset IDs. */
 	localAssetBalance: bigint;
+	/** The peer's units in this commitment view, summed across the channel's asset IDs. */
 	remoteAssetBalance: bigint;
 	signedLocal: boolean;
 	perCommitmentPoint: Buffer;
@@ -165,7 +166,9 @@ export interface IChannelAuxiliaryState {
 	 * HTLCs of one payment hash have a decision each.
 	 */
 	htlcDecisions?: Map<string, IAuxiliaryHtlcDecision>;
+	/** This node's balance summed across the channel's asset IDs. */
 	localBalance: bigint;
+	/** The peer's balance summed across the channel's asset IDs. */
 	remoteBalance: bigint;
 	localShutdownRecords?: Map<bigint, Buffer>;
 	remoteShutdownRecords?: Map<bigint, Buffer>;
@@ -353,8 +356,9 @@ export interface IChannelAuxiliaryProvider {
 	 */
 	validateHtlc(state: IChannelState, entry: IHtlcEntry): void;
 	/**
-	 * The asset units an HTLC carries. Zero for a plain bitcoin HTLC, which
-	 * an asset channel takes from its peer and never offers.
+	 * The sum of the units this HTLC carries across the channel's asset IDs.
+	 * Zero for a plain bitcoin HTLC, which an asset channel takes from its
+	 * peer and never offers.
 	 */
 	getHtlcAmount(state: IChannelState, entry: IHtlcEntry): bigint;
 	prepareShutdown(

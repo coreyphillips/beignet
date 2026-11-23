@@ -62,6 +62,8 @@ import {
 	referenceProvider
 } from '../lightning/helpers/auxiliary-pair';
 
+import { sizedRecoveryCapsule } from '../lightning/helpers/sized-recovery-capsule';
+
 const MNEMONICS = [
 	'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about',
 	'zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong',
@@ -834,6 +836,42 @@ describe('Recovery modes and asset channels, over the daemon', function () {
 		expect(
 			(await request(portOf(auto), 'GET', '/channels')).body.result
 		).to.deep.equal([]);
+	});
+
+	it('restores the static backup from a current snapshot over the peer-storage budget', async () => {
+		const secret = deriveLightningKeysFromMnemonic(
+			MNEMONICS[0],
+			undefined,
+			LnCoinType.REGTEST
+		).nodePrivateKey;
+		const { blob, id, peerId } = await sizedRecoveryCapsule(
+			'current capsule',
+			3,
+			secret
+		);
+		const daemon = await boot('current capsule restore', {
+			mnemonic: MNEMONICS[0],
+			recoveryMode: 'peer-storage'
+		});
+		daemon.node.getNode().emit('peer_storage:retrieved', PEER, blob);
+		const port = portOf(daemon);
+		const answer = await request(port, 'POST', '/recovery/restore-capsule', {
+			confirm: true
+		});
+		expect(answer.status, JSON.stringify(answer.body)).to.equal(200);
+		const result = answer.body.result as {
+			tier: number;
+			skippedAssetChannels: unknown;
+			recovering: string[];
+		};
+		expect(result.tier).to.equal(1);
+		expect(result.recovering).to.deep.equal([]);
+		expect(result.skippedAssetChannels).to.deep.equal([
+			{ channelId: id, peerPubkey: peerId, capacitySats: 2_000_000 }
+		]);
+		expect((await request(port, 'GET', '/channels')).body.result).to.deep.equal(
+			[]
+		);
 	});
 
 	it('says nothing of asset channels on a refusal that is not about them: the status and the event are the bytes they were', async () => {
