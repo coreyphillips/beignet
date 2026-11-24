@@ -79,8 +79,11 @@ import { createWalletStorage } from './wallet-storage';
 import type { OnchainSweepInfo, OnchainSweepRequest } from './onchain-sweep';
 import { OnchainSweeps } from './onchain-sweep';
 import { ensurePrivateDir, writeFileAtomic } from './fs-utils';
-import { holdDbRestoredChannels } from './restore';
+import { dbRestoreMarkerPath, holdDbRestoredChannels } from './restore';
 import { deriveBackupMacKey, writeBackupMac } from './backup-mac';
+import { generateFinalDaemonWallet } from '../lightning/storage/final-wallet-generation';
+import { bindFinalDaemonView } from '../lightning/storage/final-daemon-admission';
+import type { IFinalWalletBinding } from '../lightning/storage/final-wallet-format';
 import { requireLegacyWallet } from '../lightning/storage/wallet-format-guard';
 import { assertLegacyWalletFile } from '../lightning/storage/final-wallet-format';
 import { nodeStorageView } from './node-storage-view';
@@ -151,6 +154,7 @@ import type { IPeerTransportOptions } from '../lightning/transport/duplex-transp
 import { normalizeHexPubkey } from '../lightning/validation';
 import { FixedOutputFeeError } from '../lightning/wallet/fixed-output-fees';
 import { WalletFundingProvider } from '../lightning/wallet/wallet-funding-provider';
+import { finalOpeningWalletOutpoints } from '../lightning/storage/final-opening-candidate';
 import type {
 	IStoredPaymentRef,
 	SqliteStorage
@@ -193,6 +197,7 @@ import {
 } from '../lightning/invoice/types';
 import {
 	LnCoinType,
+	bip32RootFromSeed,
 	deriveLightningKeysFromSeed
 } from '../lightning/keys/wallet-keys';
 import type {
@@ -506,6 +511,8 @@ export interface BeignetNodeOptions
 	maxInboundPeers?: number;
 	/** Open anchor channels (default true); false opens legacy static_remotekey channels. */
 	preferAnchors?: boolean;
+	/** Opt in to an original, freshly generated regtest type-80 wallet. */
+	finalTaprootWallet?: boolean;
 	/**
 	 * option_wumbo (large_channels, default false): advertise the bit and lift
 	 * the 2^24 sat funding cap (up to 10 BTC) for peers that also advertise it.
@@ -3005,6 +3012,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	private _nodeSecret?: Buffer;
 	/** The mnemonic's BIP39 seed once derived; read through walletSeed(). */
 	private _walletSeed?: Buffer;
+	private generatedFinalBinding?: IFinalWalletBinding;
 	private _storageEncryptionKey?: Buffer;
 	/**
 	 * A Tier 2 capsule restore replaced the database underneath this daemon;
@@ -3105,7 +3113,38 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 				);
 			}
 		}
-		const mnemonic = opts.mnemonic || generateMnemonic();
+		if (
+			opts.finalTaprootWallet !== undefined &&
+			typeof opts.finalTaprootWallet !== 'boolean'
+		)
+			throw new BeignetError(
+				'INVALID_PARAMS',
+				'finalTaprootWallet must be a boolean'
+			);
+		if (
+			opts.finalTaprootWallet &&
+			(opts.network !== 'regtest' ||
+				opts.storage ||
+				opts.storageEncryption === false ||
+				(opts.recoveryMode !== undefined && opts.recoveryMode !== 'off') ||
+				opts.recoveryAutoApply ||
+				opts.recoveryGuardians?.length)
+		)
+			throw new BeignetError(
+				'INVALID_PARAMS',
+				'Final wallet requires regtest, encrypted local SQLite and full database backup'
+			);
+		if (
+			opts.finalTaprootWallet &&
+			opts.mnemonic !== undefined &&
+			!bip39.validateMnemonic(opts.mnemonic)
+		)
+			throw new BeignetError('INVALID_PARAMS', 'Invalid final wallet mnemonic');
+		const fresh =
+			opts.finalTaprootWallet && opts.mnemonic === undefined
+				? generateFinalDaemonWallet()
+				: undefined;
+		const mnemonic = fresh?.mnemonic ?? (opts.mnemonic || generateMnemonic());
 		const networkName = opts.network;
 		// Before the lock and the database, so a node refused for another
 		// node's Electrum TLS setting leaves nothing held. initNode claims it.
@@ -3129,6 +3168,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 			dataDir === undefined ? undefined : ensurePrivateDir(dataDir);
 
 		const instance = new BeignetNode(mnemonic, networkName, dataDir);
+		instance.generatedFinalBinding = fresh?.binding;
 		await instance.init(opts);
 		if (dirMode?.error) {
 			instance.log('warn', 'Could not restrict data directory permissions', {
@@ -3180,6 +3220,29 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 		}
 
 		this._storageEncryptionKey = encryptionKey;
+		if (opts.finalTaprootWallet) {
+			for (const marker of [
+				this.capsuleRestoreMarkerPath(),
+				dbRestoreMarkerPath(dbPath)
+			]) {
+				if (nodeFs().lstatSync(marker, { throwIfNoEntry: false }))
+					throw new Error('Final wallet has a pending legacy restore');
+			}
+			const Sqlite = sqliteStorageClass();
+			const nodeId = getPublicKey(this.nodeSecret()).toString('hex');
+			const store = this.generatedFinalBinding
+				? Sqlite.createFinalWallet(dbPath, this.generatedFinalBinding)
+				: Sqlite.openFinalWallet(dbPath, {
+						encryptionKey: encryptionKey!,
+						network: networkName,
+						nodeId
+				  });
+			this.generatedFinalBinding = undefined;
+			this.storage = store;
+			store.assertFinalDaemonIdentity(nodeId);
+			this._bootOpts = opts;
+			return;
+		}
 		// A Tier 2 capsule restore that crashed mid-swap left its durable
 		// marker; finish the install before anything opens the database.
 		this.finishStagedCapsuleRestore(dbPath);
@@ -3219,7 +3282,8 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 			});
 		}
 		this.autoGossipSync = opts.autoGossipSync ?? true;
-		this.peerStorageEnabled = opts.peerStorageEnabled ?? true;
+		this.peerStorageEnabled =
+			!opts.finalTaprootWallet && (opts.peerStorageEnabled ?? true);
 		this.rapidGossipSync = opts.rapidGossipSync ?? true;
 		this.rapidGossipSyncUrl = opts.rapidGossipSyncUrl;
 		if (opts.recoveryLeaseCheckIntervalMs !== undefined) {
@@ -3574,12 +3638,17 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	private walletFundingProvider(
 		supply: IExtensionAuxiliarySupply | undefined
 	): WalletFundingProvider {
+		const finalOpeningCandidates = this._bootOpts?.finalTaprootWallet
+			? (): ReturnType<SqliteStorage['loadFinalOpenings']> =>
+					this.sqlite()!.loadFinalOpenings()
+			: undefined;
 		const fees: ExtensionFixedOutputFees | undefined = supply?.fixedOutputFees;
 		if (supply === undefined || fees === undefined) {
-			return new WalletFundingProvider(this.wallet);
+			return new WalletFundingProvider(this.wallet, { finalOpeningCandidates });
 		}
 		try {
 			return new WalletFundingProvider(this.wallet, {
+				finalOpeningCandidates,
 				fixedOutputFees: {
 					storage: this.storage,
 					maxFeeSatoshis: fees.maxFeeSatoshis,
@@ -3609,6 +3678,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 				code: refusal.code
 			});
 			return new WalletFundingProvider(this.wallet, {
+				finalOpeningCandidates,
 				fixedOutputFeeRefusal: refusal
 			});
 		}
@@ -3756,6 +3826,8 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 
 		// 4. Create funding provider from wallet
 		const fundingProvider = this.walletFundingProvider(supplied);
+		if (opts.finalTaprootWallet)
+			await fundingProvider.renewFinalOpeningPledges();
 		const auxiliary = supplied;
 		// Kept for a restore this process runs later: it is refused when it
 		// holds asset channels this provider does not say it can restore.
@@ -3916,6 +3988,13 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 		// node comes through here, so each gets a fresh view of the database
 		// it runs on.
 		this._nodeStorageView = nodeStorageView(this.storage);
+		if (opts.finalTaprootWallet)
+			bindFinalDaemonView(
+				this._nodeStorageView as SqliteStorage,
+				bip32RootFromSeed(this.walletSeed()),
+				fundingProvider,
+				electrumBackend
+			);
 		const constructStarted = Date.now();
 		this.node = LightningNode.fromMnemonic(this.mnemonic, {
 			coinType,
@@ -9088,11 +9167,25 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 		}));
 	}
 
+	private assertWalletInputMutable(txid: string, index: number): void {
+		this.onchainSweeps().assertInputMutable(txid, index);
+		if (
+			this._bootOpts?.finalTaprootWallet &&
+			finalOpeningWalletOutpoints(this.sqlite()!.loadFinalOpenings()).has(
+				txid.toLowerCase() + ':' + index
+			)
+		)
+			throw new BeignetError(
+				'INVALID_PARAMS',
+				'Input is reserved by a final channel opening'
+			);
+	}
+
 	/** Freeze a UTXO: excluded from all coin selection until unfrozen. */
 	async freezeUtxo(txid: TxidHex, index: number): Promise<{ frozen: string }> {
 		this._validateTxid(txid);
 		return this._runOnchainSend(async () => {
-			this.onchainSweeps().assertInputMutable(txid, index);
+			this.assertWalletInputMutable(txid, index);
 			const res = await this.wallet.freezeUtxo({ txid, vout: index });
 			if (res.isErr())
 				throw new BeignetError(
@@ -9110,7 +9203,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	): Promise<{ unfrozen: string }> {
 		this._validateTxid(txid);
 		return this._runOnchainSend(async () => {
-			this.onchainSweeps().assertInputMutable(txid, index);
+			this.assertWalletInputMutable(txid, index);
 			const res = await this.wallet.unfreezeUtxo({ txid, vout: index });
 			if (res.isErr())
 				throw new BeignetError(
@@ -14898,6 +14991,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 		peerPubkey: string,
 		params: {
 			amountSats: number;
+			finalTaproot?: boolean;
 			fundingFeeratePerkw?: number;
 			commitmentFeeratePerkw?: number;
 			locktime?: number;
@@ -14911,6 +15005,30 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 		}
 	): ChannelInfo {
 		requireOpenAmounts(params.amountSats);
+		if (
+			params.finalTaproot !== undefined &&
+			typeof params.finalTaproot !== 'boolean'
+		)
+			throw new BeignetError(
+				'INVALID_PARAMS',
+				'finalTaproot must be a boolean'
+			);
+		if (params.finalTaproot) {
+			const supported = [
+				'amountSats',
+				'fundingFeeratePerkw',
+				'commitmentFeeratePerkw',
+				'locktime',
+				'finalTaproot'
+			];
+			for (const [field, value] of Object.entries(params)) {
+				if (value !== undefined && !supported.includes(field))
+					throw new BeignetError(
+						'INVALID_PARAMS',
+						'Unsupported final Taproot opening option: ' + field
+					);
+			}
+		}
 		if (params.fundingFeeratePerkw !== undefined)
 			requireU32(params.fundingFeeratePerkw, 'fundingFeeratePerkw');
 		if (params.commitmentFeeratePerkw !== undefined)
@@ -14958,6 +15076,9 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 		const channel = fundingOrRefuse(() =>
 			this.node.openChannelV2(peerPubkey, {
 				fundingSatoshis: BigInt(params.amountSats),
+				...(params.finalTaproot === undefined
+					? {}
+					: { finalTaproot: params.finalTaproot }),
 				fundingFeeratePerkw: params.fundingFeeratePerkw,
 				commitmentFeeratePerkw: params.commitmentFeeratePerkw,
 				locktime: params.locktime,
@@ -14981,7 +15102,9 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 			localBalanceSats: Number(balances.localMsat / 1000n),
 			remoteBalanceSats: Number(balances.remoteMsat / 1000n),
 			capacitySats: params.amountSats,
-			isAnchor: isAnchorChannel(state.channelType)
+			isAnchor:
+				state.commitmentProfile === 'simple-taproot-final' ||
+				isAnchorChannel(state.channelType)
 		};
 	}
 
@@ -17985,7 +18108,12 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	 * advertises option_provide_storage (and to capable peers on connect).
 	 */
 	private refreshStaticChannelBackup(): void {
-		if (this.destroyed || this._restartRequired) return;
+		if (
+			this.destroyed ||
+			this._restartRequired ||
+			this._bootOpts?.finalTaprootWallet
+		)
+			return;
 		try {
 			const { encoded, channelCount } = this.exportStaticChannelBackup();
 			if (!this.peerStorageEnabled) return;

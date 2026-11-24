@@ -21,7 +21,7 @@ import { type Candidate, opening } from './final-opening';
 import { otherOpeningView } from './final-opening-commitment';
 import { seedFor } from './taproot-revoked-fixture';
 
-function participant(
+export function participant(
 	seed: number,
 	index: number
 ): {
@@ -58,7 +58,11 @@ function participant(
 export const alice = participant(840, 2);
 export const bob = participant(841, 4);
 
-export function signingFixture(oneSided = false): {
+export function signingFixture(
+	oneSided = false,
+	left = alice,
+	right = bob
+): {
 	candidate: Candidate;
 	terms: IFinalOpeningTerms;
 	counterpart: ReturnType<typeof otherOpeningView>;
@@ -66,8 +70,8 @@ export function signingFixture(oneSided = false): {
 	funding: Transaction;
 } {
 	const terms = {
-		localBasepoints: alice.points,
-		remoteBasepoints: bob.points,
+		localBasepoints: left.points,
+		remoteBasepoints: right.points,
 		localToSelfDelay: 17,
 		remoteToSelfDelay: 61,
 		localDustLimitSatoshis: 354,
@@ -76,13 +80,13 @@ export function signingFixture(oneSided = false): {
 	};
 	const candidate = opening(oneSided);
 	const id = deriveV2ChannelId(
-		alice.keys.channelBasepoints.revocationBasepoint,
-		bob.keys.channelBasepoints.revocationBasepoint
+		left.keys.channelBasepoints.revocationBasepoint,
+		right.keys.channelBasepoints.revocationBasepoint
 	).toString('hex');
 	Object.assign(candidate, {
 		channelId: id,
-		localFundingPubkey: alice.points.fundingPubkey,
-		remoteFundingPubkey: bob.points.fundingPubkey
+		localFundingPubkey: left.points.fundingPubkey,
+		remoteFundingPubkey: right.points.fundingPubkey
 	});
 	if (oneSided) {
 		candidate.isInitiator = true;
@@ -93,8 +97,8 @@ export function signingFixture(oneSided = false): {
 	const funding = Transaction.fromHex(candidate.fundingTxHex);
 	funding.outs[candidate.fundingOutputIndex].script =
 		createTaprootFundingScript(
-			alice.keys.channelBasepoints.fundingPubkey,
-			bob.keys.channelBasepoints.fundingPubkey
+			left.keys.channelBasepoints.fundingPubkey,
+			right.keys.channelBasepoints.fundingPubkey
 		).p2trOutput;
 	candidate.fundingTxHex = funding.toHex();
 	const counterpart = otherOpeningView(candidate, terms);

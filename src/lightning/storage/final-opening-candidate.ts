@@ -31,6 +31,23 @@ export interface IFinalOpeningCandidate {
 	outputSerialIds: string[];
 }
 
+/** Local wallet inputs reserved by authenticated final opening candidates. */
+export function finalOpeningWalletOutpoints(
+	candidates: readonly IFinalOpeningCandidate[]
+): Set<string> {
+	const result = new Set<string>();
+	for (const candidate of candidates) {
+		const tx = Transaction.fromHex(candidate.fundingTxHex);
+		for (const [i, input] of tx.ins.entries()) {
+			if (candidate.inputs[i].isLocal)
+				result.add(
+					Buffer.from(input.hash).reverse().toString('hex') + ':' + input.index
+				);
+		}
+	}
+	return result;
+}
+
 function requireCandidate(
 	condition: boolean,
 	field: string

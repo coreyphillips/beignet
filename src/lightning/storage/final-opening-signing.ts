@@ -1,5 +1,6 @@
 import type { BIP32Interface } from 'bip32';
 import { Transaction } from 'bitcoinjs-lib';
+import { verifyOpeningFunding } from './final-opening-funding';
 import { ecc } from '../../utils/ecc';
 import {
 	buildFinalOpeningCommitment,
@@ -34,6 +35,10 @@ export interface IFinalOpeningSigning {
 	outgoing?: string;
 	peer?: string;
 	exit?: string;
+	fundingLocal?: string;
+	fundingPeer?: string;
+	fundingTransaction?: string;
+	exitRequested?: true;
 }
 
 const WIRE_BYTES = 98 + 34 + 100;
@@ -43,7 +48,7 @@ function assertIndex(index: number): void {
 		throw new Error('Invalid opening channel key index');
 }
 
-function canonicalTerms(terms: IFinalOpeningTerms): string {
+export function canonicalTerms(terms: IFinalOpeningTerms): string {
 	const fields = [
 		...Object.keys(terms),
 		...Object.keys(terms.localBasepoints),
@@ -218,13 +223,28 @@ export function verifyOpeningSigning(
 		!signing ||
 		Object.keys(signing).some(
 			(k) =>
-				!['terms', 'channelKeyIndex', 'outgoing', 'peer', 'exit'].includes(k)
+				![
+					'terms',
+					'channelKeyIndex',
+					'outgoing',
+					'peer',
+					'exit',
+					'fundingLocal',
+					'fundingPeer',
+					'fundingTransaction',
+					'exitRequested'
+				].includes(k)
 		) ||
 		signing.channelKeyIndex !== storedIndex ||
 		(!signing.outgoing && !signing.exit) ||
 		(signing.peer === undefined) !== (signing.exit === undefined)
 	)
 		throw new Error('Incomplete opening signing record');
+	if (
+		signing.exitRequested !== undefined &&
+		(signing.exitRequested !== true || !signing.fundingLocal || !signing.exit)
+	)
+		throw new Error('Incomplete opening exit authorization');
 	assertIndex(signing.channelKeyIndex);
 	if (signing.outgoing !== undefined) {
 		if (!candidate.inputs.some((i) => i.isLocal) && signing.exit === undefined)
@@ -240,6 +260,7 @@ export function verifyOpeningSigning(
 		// A one-input key spend adds two marker bytes, two length bytes and a 64-byte signature.
 		verifyExit(local, storedBytes(signing.exit, local.tx.byteLength() + 68));
 	}
+	verifyOpeningFunding(candidate, signing);
 }
 
 /** Both recipient commitments must be viable before the wallet signs either one. */
@@ -264,6 +285,12 @@ export function signOpening(
 	const remote = commitmentView(candidate, terms, state, 'remote');
 	const key = fundingSecret(root, identity, index, terms);
 	const normalized = canonicalTerms(terms);
+	if (
+		state.session &&
+		(index !== state.session.channelKeyIndex ||
+			canonicalTerms(state.session.terms) !== normalized)
+	)
+		throw new Error('Opening signature does not match the registered session');
 	const signing = state.signing ?? {
 		terms: JSON.parse(normalized) as IFinalOpeningTerms,
 		channelKeyIndex: index
@@ -333,6 +360,8 @@ export function signOpening(
 
 	// These reservations commit independently of the wallet. A rolled-back
 	// wallet can repeat the same challenge, including its exact peer share.
+	if (!receiving && !candidate.inputs.some((i) => i.isLocal))
+		authority.requireEnforceableExit(candidate.channelId, signing.exit!);
 	authority.claim('commitment/terms/' + candidate.channelId, contract);
 	authority.claim('commitment/key/' + index, candidate.channelId);
 	const slot = 'commitment/nonce/' + nonce.toString('hex');

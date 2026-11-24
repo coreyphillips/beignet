@@ -111,6 +111,14 @@ export interface ChannelManagerEvents {
 		fundingOutputIndex: number,
 		minimumDepth: number
 	) => void;
+	/** Watch the authenticated funding output of a final opening. */
+	'watch:final-opening': (
+		channelId: Buffer,
+		txid: string,
+		index: number,
+		minimumDepth: number,
+		script: Buffer
+	) => void;
 	/** Arm spend detection on the outpoints a splice superseded. */
 	'watch:presplice-spend': (channelId: Buffer) => void;
 	/** Watch this output for a spend. */

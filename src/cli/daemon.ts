@@ -3024,37 +3024,16 @@ async function bootDaemon(
 
 		// ── Dual-Funding (v2 Channels) ──
 		'POST /channel/open-v2': (body) => {
-			const {
-				pubkey,
-				amountSats,
-				fundingFeeratePerkw,
-				commitmentFeeratePerkw,
-				locktime,
-				requestFunds,
-				maxLeaseRates
-			} = body as {
-				pubkey: string;
-				amountSats: number;
-				fundingFeeratePerkw?: number;
-				commitmentFeeratePerkw?: number;
-				locktime?: number;
-				/** Liquidity ads buyer (issue #532 1B): lease this much inbound
-				 *  into the channel being opened. Shape and ranges are enforced
-				 *  in BeignetNode.openChannelV2; the pairing rule (requestFunds
-				 *  needs maxLeaseRates) stays with the library. */
-				requestFunds?: { requestedSats: number; blockheight: number };
-				/** Buyer's own price ceiling for the lease; never echo the
-				 *  seller's advertised rates here. */
-				maxLeaseRates?: import('../lightning/gossip/types').ILeaseRates;
-			};
+			const { pubkey, amountSats, requestFunds, maxLeaseRates, ...options } =
+				body as {
+					pubkey: string;
+				} & Parameters<BeignetNode['openChannelV2']>[1];
 			if (!pubkey || amountSats === undefined)
 				return failure('INVALID_PARAMS', 'pubkey and amountSats required');
 			return success(
 				node.openChannelV2(pubkey, {
+					...options,
 					amountSats,
-					fundingFeeratePerkw,
-					commitmentFeeratePerkw,
-					locktime,
 					requestFunds,
 					maxLeaseRates
 				})

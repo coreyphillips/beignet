@@ -6,6 +6,7 @@
  * actual transport/broadcast operations.
  */
 
+import { validateFundingWitness } from '../interactive-tx/funding-witness';
 import { hmacSha256, randomBytes, sha256 } from '../crypto/provider';
 import * as bitcoin from 'bitcoinjs-lib';
 import { ecc } from '../../utils/ecc';
@@ -129,7 +130,14 @@ import {
 	isRecencyUnproven,
 	recencyHoldOrigin
 } from './channel-state';
-import { assertLegacyCommitmentProfile } from './commitment-profile';
+import {
+	assertLegacyCommitmentProfile,
+	isFinalTaprootTypeHex
+} from './commitment-profile';
+import {
+	isFinalNegotiation,
+	snapshotFinalOpening
+} from './final-opening-negotiation';
 import { recordRevokedHtlcSnapshot } from './htlc-snapshots';
 import type {
 	IAuxiliaryCommitmentData,
@@ -1872,6 +1880,13 @@ export class Channel {
 		preferTaproot?: boolean,
 		auxiliary: { fixedHtlcOutputs?: boolean; childCustody?: boolean } = {}
 	): ChannelAction[] {
+		if (isFinalNegotiation(this))
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: 'Final opening requires the durable signing protocol'
+				}
+			];
 		if (this._state.state !== ChannelState.NONE) {
 			return [
 				{
@@ -2719,6 +2734,13 @@ export class Channel {
 	 * Returns the accept_channel response.
 	 */
 	handleOpenChannel(msg: IOpenChannelMessage): ChannelAction[] {
+		if (isFinalNegotiation(this))
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: 'Final opening requires the durable signing protocol'
+				}
+			];
 		if (this._state.state !== ChannelState.NONE) {
 			// Deliberately LOCAL-only, the same carve-out handleOpenChannel2 makes:
 			// this guard can only fire on a channel that already has a life (a
@@ -6632,6 +6654,13 @@ export class Channel {
 	 * Returns revoke_and_ack.
 	 */
 	handleCommitmentSigned(msg: ICommitmentSignedMessage): ChannelAction[] {
+		if (isFinalNegotiation(this))
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: 'Final opening requires the durable signing protocol'
+				}
+			];
 		// A mid-splice commitment_signed that raced our tx_abort belongs to
 		// the aborted splice. Classify rather than blanket-ignore: arrival
 		// order of the peer's abort echo vs its stray is transport-dependent
@@ -8632,6 +8661,13 @@ export class Channel {
 	 * the live channel moves, which is the whole reason the two halves exist.
 	 */
 	forceClose(signer: ISigner, chain?: IForceCloseChainFacts): ChannelAction[] {
+		if (isFinalNegotiation(this))
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: 'Final opening requires the durable signing protocol'
+				}
+			];
 		const plan = this.prepareForceClose(signer, chain);
 		if (!plan.ok) {
 			return [{ type: ChannelActionType.ERROR, message: plan.error }];
@@ -18972,6 +19008,16 @@ export class Channel {
 		);
 	}
 
+	private _v2OpeningTypeRefusal(
+		type: Buffer | null,
+		unsupportedFinal: boolean
+	): string | null {
+		if (!isFinalNegotiation(this)) return validateV2ChannelType(type);
+		return isFinalTaprootTypeHex(type?.toString('hex')) && !unsupportedFinal
+			? null
+			: 'Unsupported final opening type or terms';
+	}
+
 	/**
 	 * Initiate opening a v2 (dual-funded) channel. Sends open_channel2.
 	 */
@@ -19008,13 +19054,19 @@ export class Channel {
 			defaultType.setCompulsory(Feature.STATIC_REMOTE_KEY);
 			params = { ...params, channelType: defaultType.toBuffer() };
 		}
-		// Admission validation of the type this open would propose, BEFORE
-		// any state mutation: taproot v2 signing does not exist, so a
-		// taproot (or otherwise unrecognized) type must never leave this
-		// method as an OPEN_CHANNEL2. The manager additionally validates
-		// against both init vectors; a raw Channel has none, so the
-		// presence, structural and taproot rules still hold here.
-		const v2TypeErr = validateV2ChannelType(params.channelType);
+		// The manager has already checked the peer's feature vectors. Direct
+		// callers still require explicit enrollment for the final profile.
+		const v2TypeErr = this._v2OpeningTypeRefusal(
+			params.channelType ?? null,
+			Boolean(
+				params.requestFunds ||
+					params.willFund ||
+					params.minimumDepth === 0 ||
+					params.channelFlags !== 0 ||
+					(this._zeroReservePolicy.waivePeer &&
+						this._zeroReservePolicy.waiveOnOpen)
+			)
+		);
 		if (v2TypeErr) {
 			return [
 				{
@@ -19149,14 +19201,21 @@ export class Channel {
 			return refuse(acceptV2MaxHtlcErr);
 		}
 
-		// Admission validation of the PROPOSED type before any state
-		// mutation, echo or key adoption: a taproot or unrecognized type
-		// would otherwise be echoed in ACCEPT_CHANNEL2 and die at the
-		// commitment stage, and BOLT 2 makes the field REQUIRED on
-		// open_channel2, so an absent type is refused too. The manager
-		// validates against both init vectors; a raw Channel has none, so
-		// the presence, structural and taproot rules still hold here.
-		const v2TypeErr = validateV2ChannelType(msg.channelType ?? null);
+		// Refuse an unsupported profile before echoing the offer or adopting keys.
+		const v2TypeErr = this._v2OpeningTypeRefusal(
+			msg.channelType ?? null,
+			Boolean(
+				msg.disableChannelReserve ||
+					msg.requestFunds ||
+					localParams.willFund ||
+					msg.channelFlags !== 0 ||
+					localParams.minimumDepth === 0 ||
+					this._zeroReservePolicy.waivePeer ||
+					(localParams.channelType &&
+						localParams.channelType.toString('hex') !==
+							msg.channelType?.toString('hex'))
+			)
+		);
 		if (v2TypeErr) {
 			return refuse(`open_channel2 refused: ${v2TypeErr}`);
 		}
@@ -19443,6 +19502,11 @@ export class Channel {
 		}
 		this._state.localReserveWaived = msg.disableChannelReserve === true;
 
+		if (
+			isFinalNegotiation(this) &&
+			(msg.willFund || msg.disableChannelReserve || msg.minimumDepth === 0)
+		)
+			return refuse('Unsupported final opening acceptance terms');
 		const result = session.handleAcceptChannel2(msg);
 		if (!result.ok) {
 			// The refusal must be WIRE-VISIBLE: a local error alone deletes
@@ -19630,6 +19694,15 @@ export class Channel {
 	/**
 	 * Add a local input during interactive TX construction (v2 channel).
 	 */
+	private _finalInteractiveEditAccepted(): void {
+		// Either party changing the transaction invalidates the peer's last
+		// completion. Signing requires consecutive completions of the same tx.
+		if (!isFinalNegotiation(this)) return;
+		const builder = this._state.dualFundingSession?.getTxBuilder();
+		if (builder?.getState() === InteractiveTxState.RECEIVED_COMPLETE)
+			builder.getSession().state = InteractiveTxState.COLLECTING;
+	}
+
 	addTxInput(input: IInteractiveTxInput): ChannelAction[] {
 		const session = this._state.dualFundingSession;
 		if (!session || session.getState() !== DualFundingState.TX_NEGOTIATION) {
@@ -19650,6 +19723,7 @@ export class Channel {
 				}
 			];
 		}
+		this._finalInteractiveEditAccepted();
 
 		const msg: ITxAddInputMessage = {
 			channelId: this._v2ChannelId(),
@@ -19803,6 +19877,7 @@ export class Channel {
 				}
 			];
 		}
+		this._finalInteractiveEditAccepted();
 
 		// Our turn: contribute our own inputs/change when we accepted with a
 		// contribution (lease selling); no-op otherwise. A rollback record
@@ -19835,6 +19910,7 @@ export class Channel {
 				}
 			];
 		}
+		this._finalInteractiveEditAccepted();
 
 		const msg: ITxAddOutputMessage = {
 			channelId: this._v2ChannelId(),
@@ -19905,6 +19981,7 @@ export class Channel {
 				}
 			];
 		}
+		this._finalInteractiveEditAccepted();
 
 		// Our turn (see handleTxAddInput).
 		return this._driveDualFunding();
@@ -19933,6 +20010,7 @@ export class Channel {
 				}
 			];
 		}
+		this._finalInteractiveEditAccepted();
 
 		const msg: ITxRemoveInputMessage = {
 			channelId: this._v2ChannelId(),
@@ -19975,6 +20053,7 @@ export class Channel {
 				}
 			];
 		}
+		this._finalInteractiveEditAccepted();
 
 		return [];
 	}
@@ -20002,6 +20081,7 @@ export class Channel {
 				}
 			];
 		}
+		this._finalInteractiveEditAccepted();
 
 		const msg: ITxRemoveOutputMessage = {
 			channelId: this._v2ChannelId(),
@@ -20047,6 +20127,7 @@ export class Channel {
 				}
 			];
 		}
+		this._finalInteractiveEditAccepted();
 
 		return [];
 	}
@@ -20142,32 +20223,31 @@ export class Channel {
 		// BOLT 2: the initiator adds the shared funding output, sized to the
 		// FULL negotiated capacity — both sides' funding plus any lease fee,
 		// which handleAcceptChannel2 has already folded into fundingSatoshis.
+		let fundingSpk: Buffer | undefined;
 		if (initiator) {
-			if (!this._state.remoteBasepoints) {
+			if (!this._state.remoteBasepoints)
 				return 'Cannot build funding output before accept_channel2';
-			}
-			const taproot = isTaprootChannel(session.getOpenChannelType() ?? null);
-			let fundingSpk: Buffer;
-			if (taproot) {
-				fundingSpk = createTaprootFundingScript(
-					this._state.localBasepoints.fundingPubkey,
-					this._state.remoteBasepoints.fundingPubkey
-				).p2trOutput;
-			} else {
-				fundingSpk = createFundingScript(
-					this._state.localBasepoints.fundingPubkey,
-					this._state.remoteBasepoints.fundingPubkey
-				).p2wshOutput;
-			}
-			this._dualFundingContribs.push({
+			const keys = [
+				this._state.localBasepoints.fundingPubkey,
+				this._state.remoteBasepoints.fundingPubkey
+			] as const;
+			fundingSpk =
+				isFinalNegotiation(this) ||
+				isTaprootChannel(session.getOpenChannelType() ?? null)
+					? createTaprootFundingScript(...keys).p2trOutput
+					: createFundingScript(...keys).p2wshOutput;
+		}
+		const addFundingOutput = (scriptPubkey: Buffer): void => {
+			this._dualFundingContribs!.push({
 				kind: 'output',
 				output: {
 					serialId: session.nextSerialId(),
 					amountSats: this._state.fundingSatoshis,
-					scriptPubkey: fundingSpk
+					scriptPubkey
 				}
 			});
-		}
+		};
+		if (fundingSpk && !isFinalNegotiation(this)) addFundingOutput(fundingSpk);
 
 		const changeSats = walletTotal - c.contributionSats - feeSats;
 		if (changeSats < 0n) {
@@ -20189,6 +20269,8 @@ export class Channel {
 				}
 			});
 		}
+		// A final opening discloses the shared output only after our own change.
+		if (fundingSpk && isFinalNegotiation(this)) addFundingOutput(fundingSpk);
 		return null;
 	}
 
@@ -20340,6 +20422,18 @@ export class Channel {
 		}
 
 		if (this._dualFundingContribIndex < this._dualFundingContribs!.length) {
+			// The opener's last item is the shared output. Wait for a peer completion
+			// so the peer has sent every input and its change before we publish it.
+			if (
+				isFinalNegotiation(this) &&
+				session.isInitiator() &&
+				this._dualFundingContribIndex === this._dualFundingContribs!.length - 1
+			) {
+				const state = session.getTxBuilder()?.getState();
+				if (state === InteractiveTxState.SENT_COMPLETE) return [];
+				if (state !== InteractiveTxState.RECEIVED_COMPLETE)
+					return this.sendTxComplete();
+			}
 			const c = this._dualFundingContribs![this._dualFundingContribIndex++];
 			if (c.kind === 'input') {
 				const result = session.addInput(c.input);
@@ -20348,6 +20442,7 @@ export class Channel {
 						result.error || 'Failed to add contribution input'
 					);
 				}
+				this._finalInteractiveEditAccepted();
 				const msg: ITxAddInputMessage = {
 					channelId: this._v2ChannelId(),
 					serialId: c.input.serialId,
@@ -20365,6 +20460,7 @@ export class Channel {
 					result.error || 'Failed to add contribution output'
 				);
 			}
+			this._finalInteractiveEditAccepted();
 			const outMsg: ITxAddOutputMessage = {
 				channelId: this._v2ChannelId(),
 				serialId: c.output.serialId,
@@ -20399,6 +20495,38 @@ export class Channel {
 		return this._driveDualFunding();
 	}
 
+	// Consecutive disposable completions can occur while the opener waits for
+	// the acceptor's last change. The transaction still lacks its shared output.
+	private _continueDisposableTurn(state: InteractiveTxState): void {
+		if (!isFinalNegotiation(this)) return;
+		const builder = this._state.dualFundingSession?.getTxBuilder();
+		if (builder?.getState() === state && !snapshotFinalOpening(this))
+			builder.getSession().state = InteractiveTxState.COLLECTING;
+	}
+
+	private _finalCompletionAction(): ChannelAction[] {
+		if (
+			this._state.dualFundingSession?.getState() ===
+			DualFundingState.AWAITING_TX_SIGNATURES
+		) {
+			try {
+				if (!snapshotFinalOpening(this))
+					throw Error('Missing final funding output');
+			} catch (error) {
+				return this._abortV2Negotiation(
+					error instanceof Error ? error.message : String(error)
+				);
+			}
+			this._state.state = ChannelState.AWAITING_TX_SIGNATURES;
+		}
+		return [
+			{
+				type: ChannelActionType.FINAL_OPENING_TX_COMPLETE,
+				channelId: this._v2ChannelId()
+			}
+		];
+	}
+
 	sendTxComplete(): ChannelAction[] {
 		const session = this._state.dualFundingSession;
 		if (!session || session.getState() !== DualFundingState.TX_NEGOTIATION) {
@@ -20410,6 +20538,7 @@ export class Channel {
 			];
 		}
 
+		this._continueDisposableTurn(InteractiveTxState.RECEIVED_COMPLETE);
 		const result = session.markComplete();
 		if (!result.ok) {
 			return [
@@ -20419,6 +20548,8 @@ export class Channel {
 				}
 			];
 		}
+
+		if (isFinalNegotiation(this)) return this._finalCompletionAction();
 
 		// If both sides are now complete, move to AWAITING_TX_SIGNATURES
 		if (session.getState() === DualFundingState.AWAITING_TX_SIGNATURES) {
@@ -20535,6 +20666,7 @@ export class Channel {
 			];
 		}
 
+		this._continueDisposableTurn(InteractiveTxState.SENT_COMPLETE);
 		const result = session.handlePeerComplete();
 		if (!result.ok) {
 			return [
@@ -20544,6 +20676,12 @@ export class Channel {
 				}
 			];
 		}
+
+		if (
+			isFinalNegotiation(this) &&
+			session.getState() === DualFundingState.AWAITING_TX_SIGNATURES
+		)
+			return this._finalCompletionAction();
 
 		// If both sides are now complete, move to AWAITING_TX_SIGNATURES and
 		// start the commitment_signed exchange (BOLT 2 v2: it precedes
@@ -21633,195 +21771,7 @@ export class Channel {
 		stack: Buffer[],
 		prevouts: { scripts: Buffer[]; values: bigint[] }
 	): string | null {
-		const script = prevouts.scripts[index];
-		const value = prevouts.values[index];
-		if (stack.length === 0) return 'empty witness stack';
-		// bitcoinjs sighash APIs take number values; above 2^53 the
-		// narrowing would silently compute a wrong sighash and fail the
-		// verify for the wrong reason. No real prevout gets there (21M BTC
-		// in sats fits), so refuse loudly instead of narrowing quietly.
-		if (prevouts.values.some((v) => v > BigInt(Number.MAX_SAFE_INTEGER))) {
-			return 'prevout value exceeds the safe integer range';
-		}
-		const isP2wpkh =
-			script.length === 22 && script[0] === 0x00 && script[1] === 0x14;
-		const isP2wsh =
-			script.length === 34 && script[0] === 0x00 && script[1] === 0x20;
-		const isP2tr =
-			script.length === 34 && script[0] === 0x51 && script[1] === 0x20;
-		if (isP2wpkh) {
-			if (stack.length !== 2) {
-				return 'P2WPKH witness must be [signature, pubkey]';
-			}
-			const decoded = this._decodeDerSighashAll(stack[0]);
-			if (typeof decoded === 'string') return `P2WPKH ${decoded}`;
-			const pubkey = stack[1];
-			if (pubkey.length !== 33 || (pubkey[0] !== 0x02 && pubkey[0] !== 0x03)) {
-				return 'P2WPKH witness pubkey is malformed';
-			}
-			if (!bitcoin.crypto.hash160(pubkey).equals(script.subarray(2))) {
-				return 'P2WPKH witness pubkey does not match the prevout program';
-			}
-			const scriptCode = bitcoin.payments.p2pkh({
-				hash: script.subarray(2)
-			}).output!;
-			const sighash = tx.hashForWitnessV0(
-				index,
-				scriptCode,
-				Number(value),
-				bitcoin.Transaction.SIGHASH_ALL
-			);
-			let valid = false;
-			try {
-				// strict: high-S signatures are refused (BIP 62 standardness).
-				valid = ecc.verify(sighash, pubkey, decoded, true);
-			} catch {
-				// A malformed peer-controlled point must fail the negotiation,
-				// not escape the validator as an exception.
-				valid = false;
-			}
-			if (!valid) {
-				return 'P2WPKH signature does not verify against its prevout';
-			}
-			return null;
-		}
-		if (isP2tr) {
-			if (stack.length === 1) {
-				const sig = stack[0];
-				// BOLT 2 names SIGHASH_ALL for tx_signatures, but BIP 341's
-				// 64-byte SIGHASH_DEFAULT shorthand commits to exactly the
-				// same transaction data, and common signers (Bitcoin Core,
-				// libwally, and so eclair and CLN) emit it for taproot
-				// inputs: both forms are accepted. A 65-byte signature with
-				// any other trailing byte stays refused, including 0x00,
-				// which BIP 341 forbids in the explicit form.
-				const isDefaultForm = sig.length === 64;
-				if (!isDefaultForm && (sig.length !== 65 || sig[64] !== 0x01)) {
-					return 'P2TR key-spend signature must be the 64-byte SIGHASH_DEFAULT form or carry an explicit SIGHASH_ALL byte';
-				}
-				// The hash type byte is part of the BIP 341 message, so the
-				// sighash must be computed for the form the witness carries.
-				const sighash = tx.hashForWitnessV1(
-					index,
-					prevouts.scripts,
-					prevouts.values.map((v) => Number(v)),
-					isDefaultForm
-						? bitcoin.Transaction.SIGHASH_DEFAULT
-						: bitcoin.Transaction.SIGHASH_ALL
-				);
-				let valid = false;
-				try {
-					valid = ecc.verifySchnorr(
-						sighash,
-						script.subarray(2),
-						sig.subarray(0, 64)
-					);
-				} catch {
-					valid = false;
-				}
-				if (!valid) {
-					return 'P2TR signature does not verify against its prevout';
-				}
-				return null;
-			}
-			// Script-path spends cannot be verified generically (the leaf
-			// semantics are the script's own): fail closed rather than accept
-			// a witness this validator cannot judge. The negotiation-time
-			// check keeps P2TR prevouts acceptable, because a KEY-spend of
-			// them is fully verifiable; only the path choice is refused here.
-			return 'P2TR script-path spends are not supported for funding inputs';
-		}
-		if (isP2wsh) {
-			// A general P2WSH witness cannot be verified without executing the
-			// script (a hash-matched OP_FALSE spend would pass any structural
-			// check), so exactly one form is admitted (issue #1922): the bare
-			// 2-of-2 of a channel funding output, OP_2 <key> <key> OP_2
-			// OP_CHECKMULTISIG, spent as [<>, sig, sig, script], whose
-			// semantics are fully known: both signatures must verify under
-			// BIP 143 against the key in the same position. Everything else
-			// stays refused here, which is where a splice session defers the
-			// judgment to (_v2CheckInputSpendable admits the program at
-			// tx_complete, where only the 32-byte hash is visible).
-			return this._validateBare2of2Witness(tx, index, stack, script, value);
-		}
-		return 'peer funding input is not a supported segwit output';
-	}
-
-	/**
-	 * The one P2WSH witness form a funding input may carry (issue #1922): a
-	 * bare 2-of-2 multisig in the canonical BOLT 3 funding form, with both
-	 * signatures present, SIGHASH_ALL, low-S, each verifying against the key
-	 * at its position. Returns the problem, or null when acceptable.
-	 */
-	private _validateBare2of2Witness(
-		tx: import('bitcoinjs-lib').Transaction,
-		index: number,
-		stack: Buffer[],
-		prevoutScript: Buffer,
-		value: bigint
-	): string | null {
-		if (stack.length !== 4 || stack[0].length !== 0) {
-			return 'P2WSH witness must be [<>, signature, signature, script] (bare 2-of-2)';
-		}
-		const script = stack[3];
-		if (!sha256(script).equals(prevoutScript.subarray(2))) {
-			return 'P2WSH witness script does not match the prevout program';
-		}
-		const chunks = bitcoin.script.decompile(script);
-		const isKey = (c: unknown): c is Buffer =>
-			Buffer.isBuffer(c) && c.length === 33 && (c[0] === 0x02 || c[0] === 0x03);
-		if (
-			!chunks ||
-			chunks.length !== 5 ||
-			chunks[0] !== bitcoin.opcodes.OP_2 ||
-			!isKey(chunks[1]) ||
-			!isKey(chunks[2]) ||
-			chunks[3] !== bitcoin.opcodes.OP_2 ||
-			chunks[4] !== bitcoin.opcodes.OP_CHECKMULTISIG ||
-			!bitcoin.script.compile(chunks).equals(script)
-		) {
-			return 'P2WSH witness script is not a bare 2-of-2 (OP_2 <key> <key> OP_2 OP_CHECKMULTISIG)';
-		}
-		const keys = [chunks[1], chunks[2]];
-		const sighash = tx.hashForWitnessV0(
-			index,
-			script,
-			Number(value),
-			bitcoin.Transaction.SIGHASH_ALL
-		);
-		for (let k = 0; k < 2; k++) {
-			const decoded = this._decodeDerSighashAll(stack[1 + k]);
-			if (typeof decoded === 'string') return `2-of-2 ${decoded}`;
-			let valid = false;
-			try {
-				// strict: high-S signatures are refused (BIP 62 standardness).
-				valid = ecc.verify(sighash, keys[k], decoded, true);
-			} catch {
-				valid = false;
-			}
-			if (!valid) {
-				return `2-of-2 signature ${k + 1} does not verify against its key`;
-			}
-		}
-		return null;
-	}
-
-	/**
-	 * Decode a DER-encoded signature-with-sighash element; returns the raw
-	 * 64-byte signature when it is structurally valid AND carries an explicit
-	 * SIGHASH_ALL byte, or the problem as a string.
-	 */
-	private _decodeDerSighashAll(el: Buffer): Buffer | string {
-		let decoded: { signature: Buffer; hashType: number };
-		try {
-			decoded = bitcoin.script.signature.decode(el);
-		} catch {
-			return 'signature is not a valid DER signature';
-		}
-		if (decoded.hashType !== bitcoin.Transaction.SIGHASH_ALL) {
-			return 'signature is not SIGHASH_ALL';
-		}
-		return decoded.signature;
+		return validateFundingWitness(tx, index, stack, prevouts);
 	}
 
 	/**
@@ -21844,6 +21794,7 @@ export class Channel {
 	 * exchange precedes tx_signatures). Idempotent.
 	 */
 	private _maybeSendV2Commitment(peerCommitted = false): ChannelAction[] {
+		if (isFinalNegotiation(this)) return [];
 		const session = this._state.dualFundingSession;
 		if (
 			!session ||
@@ -22099,6 +22050,7 @@ export class Channel {
 	 * the peer's tx_signatures already arrived). Idempotent; defers otherwise.
 	 */
 	private _maybeSendV2TxSigs(): ChannelAction[] {
+		if (isFinalNegotiation(this)) return [];
 		const session = this._state.dualFundingSession;
 		if (!session) return [];
 		// An un-acked tx_init_rbf freezes this attempt's release: the peer
@@ -22314,6 +22266,13 @@ export class Channel {
 		outputIndex: number,
 		witnesses: Buffer[][]
 	): ChannelAction[] {
+		if (isFinalNegotiation(this))
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: 'Final opening requires the durable signing protocol'
+				}
+			];
 		const session = this._state.dualFundingSession;
 		if (!session) {
 			return [
@@ -22806,6 +22765,13 @@ export class Channel {
 	 * Handle tx_signatures from peer.
 	 */
 	handleTxSignatures(msg: ITxSignaturesMessage): ChannelAction[] {
+		if (isFinalNegotiation(this))
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: 'Final opening requires the durable signing protocol'
+				}
+			];
 		// Splice: the peer's tx_signatures carries its shared-input signature.
 		// Verify+assemble the 2-of-2 witness, then broadcast and watch the splice
 		// tx for confirmation so we can send splice_locked.
@@ -23305,6 +23271,13 @@ export class Channel {
 			topUpInputs?: ISpliceWalletInput[];
 		}
 	): ChannelAction[] {
+		if (isFinalNegotiation(this))
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: 'Final opening requires the durable signing protocol'
+				}
+			];
 		// BOLT 2: a node MUST NOT send tx_init_rbf on an option_zeroconf
 		// channel. Local misuse, so a plain ERROR action (no wire error).
 		// Ahead of the lifecycle guard because it is the more specific reason
@@ -24502,6 +24475,13 @@ export class Channel {
 	 * Handle tx_init_rbf from peer (acceptor side).
 	 */
 	handleTxInitRbf(msg: ITxInitRbfMessage): ChannelAction[] {
+		if (isFinalNegotiation(this))
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: 'Final opening requires the durable signing protocol'
+				}
+			];
 		// BOLT 2: on an option_zeroconf channel the peer MUST NOT send
 		// tx_init_rbf at all (funding or splice): both sides already treat the
 		// unconfirmed lineage as usable, and replacing it creates fund-loss

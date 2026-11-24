@@ -10,7 +10,7 @@
  * commit path.
  */
 
-import { requireLegacyWallet } from '../storage/wallet-format-guard';
+import { requireRecoveryManagerAdmission } from '../storage/final-daemon-admission';
 import { SUPERSEDES_OWN_KIND_MESSAGE_TYPES } from '../channel/channel-actions';
 import { markAuxiliaryRevokedViewsStored } from '../channel/auxiliary-revoked';
 import type { IChannelState } from '../channel/channel-state';
@@ -83,8 +83,12 @@ export class RecoveryManager {
 	/** Lazily seeded row counts per channel, to avoid a COUNT per commit. */
 	private readonly outboxCounts = new Map<string, number>();
 
-	constructor(storage: IStorageBackend, options: IRecoveryManagerOptions = {}) {
-		requireLegacyWallet(storage);
+	constructor(
+		storage: IStorageBackend,
+		options: IRecoveryManagerOptions = {},
+		admission?: object
+	) {
+		requireRecoveryManagerAdmission(storage, admission);
 		this.storage = storage;
 		this.snapshotStore = storage.revokedHtlcSnapshotStore?.() ?? storage;
 		this.options = options;

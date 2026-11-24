@@ -4675,6 +4675,11 @@ export function getOpenApiSpec(): Record<string, unknown> {
 									properties: {
 										pubkey: { type: 'string' },
 										amountSats: { type: 'number' },
+										finalTaproot: {
+											type: 'boolean',
+											description:
+												'Request a private final type-80 opening between freshly enrolled regtest wallets.'
+										},
 										fundingFeeratePerkw: { type: 'number' },
 										commitmentFeeratePerkw: { type: 'number' },
 										locktime: { type: 'number' },

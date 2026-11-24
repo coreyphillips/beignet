@@ -1,8 +1,10 @@
 import type Database from 'better-sqlite3';
+import nodePath from 'path';
 import {
 	SIGNER_SUFFIX,
 	SIGNER_TABLE,
 	protectOriginalBackupDestination,
+	verifyStagedDaemonDevice,
 	markOpeningBackup
 } from './final-opening-authority';
 import { loadBetterSqlite3 } from './sqlite-binding';
@@ -141,6 +143,117 @@ export function installFreshWallet(
 		// This directory was created uniquely for this attempt.
 		fs.rmSync(stage, { recursive: true, force: true });
 	}
+}
+
+/** Finish only the second exclusive link of a fresh, authenticated regtest wallet. */
+export function finishStagedDaemonWallet(
+	file: string,
+	binding: IFinalWalletBinding
+): void {
+	const fs = nodeFs();
+	const identity = finalWalletIdentity(file, binding);
+	if (binding.network !== 'regtest')
+		throw new Error('Expected a regtest wallet');
+	const signerFile = file + SIGNER_SUFFIX;
+	const installed = fs.lstatSync(signerFile, { bigint: true });
+	if (!installed.isFile())
+		throw new Error('Expected an original opening signer');
+	for (const suffix of [
+		'',
+		...sidecars,
+		...sidecars.map((s) => SIGNER_SUFFIX + s)
+	])
+		if (fs.lstatSync(file + suffix, { throwIfNoEntry: false }))
+			throw new Error('Opening wallet destination is occupied');
+	const parent = nodePath.dirname(file);
+	const prefix = nodePath.basename(file) + '.new-';
+	const stages = fs
+		.readdirSync(parent, { withFileTypes: true })
+		.filter((entry) => {
+			if (
+				!entry.isDirectory() ||
+				!entry.name.startsWith(prefix) ||
+				!/^[A-Za-z0-9]{6}$/.test(entry.name.slice(prefix.length))
+			)
+				return false;
+			const stageSigner =
+				nodePath.join(parent, entry.name, 'wallet.db') + SIGNER_SUFFIX;
+			const stat = fs.lstatSync(stageSigner, {
+				bigint: true,
+				throwIfNoEntry: false
+			});
+			return (
+				stat?.isFile() &&
+				stat.dev === installed.dev &&
+				stat.ino === installed.ino
+			);
+		});
+	if (stages.length !== 1)
+		throw new Error(
+			'Cannot identify the interrupted original wallet installation'
+		);
+	const stage = nodePath.join(parent, stages[0].name);
+	const staged = nodePath.join(stage, 'wallet.db');
+	const source = fs.lstatSync(staged, { bigint: true });
+	if (!source.isFile()) throw new Error('Invalid original wallet stage');
+	for (const suffix of sidecars)
+		if (
+			fs.lstatSync(staged + suffix, { throwIfNoEntry: false }) ||
+			fs.lstatSync(staged + SIGNER_SUFFIX + suffix, { throwIfNoEntry: false })
+		)
+			throw new Error('Staged wallet contains unfinished SQLite state');
+	const Sqlite = loadBetterSqlite3();
+	const ro = { readonly: true, fileMustExist: true, timeout: 0 };
+	// SQLite can create WAL sidecars even on a read-only open. Inspect private
+	// copies so interruption during validation cannot leave either original dirty.
+	const scratch = fs.mkdtempSync(nodePath.join(stage, 'verify-'));
+	try {
+		const snapshot = nodePath.join(scratch, 'wallet.db');
+		fs.copyFileSync(staged, snapshot);
+		fs.copyFileSync(signerFile, snapshot + SIGNER_SUFFIX);
+		const db = new Sqlite(snapshot, ro);
+		try {
+			checkWalletFormat(db, binding.encryptionKey, identity);
+			if (
+				db.prepare('SELECT 1 FROM final_opening_candidates LIMIT 1').get() ||
+				db.prepare('SELECT 1 FROM channels LIMIT 1').get()
+			)
+				throw new Error('Staged final wallet already holds channels');
+			const signer = new Sqlite(snapshot + SIGNER_SUFFIX, ro);
+			try {
+				verifyStagedDaemonDevice(
+					db,
+					signer,
+					staged,
+					file,
+					binding.encryptionKey,
+					identity
+				);
+			} finally {
+				signer.close();
+			}
+		} finally {
+			db.close();
+		}
+	} finally {
+		fs.rmSync(scratch, { recursive: true, force: true });
+	}
+	const current = fs.lstatSync(staged, { bigint: true });
+	const companion = fs.lstatSync(signerFile, { bigint: true });
+	if (
+		current.dev !== source.dev ||
+		current.ino !== source.ino ||
+		companion.dev !== installed.dev ||
+		companion.ino !== installed.ino
+	)
+		throw new Error('Opening wallet stage changed before publication');
+	fs.linkSync(staged, file);
+	syncDirectory(parent);
+	// Remove only the two authenticated aliases. Leave unrelated files in the directory.
+	fs.unlinkSync(staged);
+	fs.unlinkSync(staged + SIGNER_SUFFIX);
+	if (fs.readdirSync(stage).length === 0) fs.rmdirSync(stage);
+	syncDirectory(parent);
 }
 
 type SchemaEntry = { type: string; name: string; sql: string | null };

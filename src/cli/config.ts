@@ -111,12 +111,20 @@ function tightenConfigPermissions(): void {
 	}
 }
 
-export function loadConfig(): BeignetConfig {
+export function loadConfig(strict = false): BeignetConfig {
 	tightenConfigPermissions();
 	try {
 		const raw = fs.readFileSync(configPath(), 'utf-8');
-		return JSON.parse(raw) as BeignetConfig;
-	} catch {
+		const config = JSON.parse(raw);
+		if (
+			strict &&
+			(!config || typeof config !== 'object' || Array.isArray(config))
+		)
+			throw new Error('Invalid wallet configuration');
+		return config as BeignetConfig;
+	} catch (error) {
+		if (strict && (error as NodeJS.ErrnoException).code !== 'ENOENT')
+			throw new Error('Cannot read the existing wallet configuration');
 		return {};
 	}
 }
@@ -499,6 +507,7 @@ export function resolveConfig(cliFlags: Partial<BeignetConfig>): BeignetConfig {
 				? parseInt(process.env.BEIGNET_DAEMON_PORT, 10)
 				: undefined) ||
 			file.daemonPort,
+		finalTaprootWallet: cliFlags.finalTaprootWallet ?? file.finalTaprootWallet,
 		preferAnchors:
 			cliFlags.preferAnchors ??
 			(process.env.BEIGNET_PREFER_ANCHORS !== undefined

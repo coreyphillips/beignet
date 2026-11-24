@@ -89,6 +89,7 @@ await node.destroy();
 | `websocketPort?` | `number` | Accept inbound Lightning peers over WebSocket (RFC 6455) on this port. Opt-in and additive: coexists with the TCP listener on listenPort. |
 | `maxInboundPeers?` | `number` | Inbound peer connections (default 125); once this many are up, only peers holding a channel with this node are admitted. |
 | `preferAnchors?` | `boolean` | Open anchor channels (default true); false opens legacy static_remotekey channels. |
+| `finalTaprootWallet?` | `boolean` | Opt in to an original, freshly generated regtest type-80 wallet. |
 | `largeChannels?` | `boolean` | option_wumbo (large_channels, default false): advertise the bit and lift the 2^24 sat funding cap (up to 10 BTC) for peers that also advertise it. |
 | `autoBootstrap?` | `boolean` | Connect to DNS seed peers (BOLT 10) at startup (default false). |
 | `autoReconnect?` | `boolean` | Enable auto-reconnection to peers (default true) |
@@ -1688,7 +1689,7 @@ All output is JSON. Add `--pretty` for indented output.
 ### Setup
 
 ```bash
-beignet init [--network regtest] [--alias mynode]
+beignet init [--network regtest] [--alias mynode] [--final-taproot-wallet]
 beignet start [--port 2112] [--host 0.0.0.0] [--daemon] [--anchors] [--api-token <token>] \
   [--backup-path /path/to/backup.db] [--backup-interval 21600000] \
   [--daily-spend-limit 100000] [--tls-cert /path/cert.pem] [--tls-key /path/key.pem] \
@@ -1954,10 +1955,14 @@ that primary's relay later.
 
 ### Channels
 
+To test a private final type-80 opening, initialize two fresh regtest wallets with `beignet init --network regtest --final-taproot-wallet`. Connect the peers, fund the opener, then run `beignet channel open-v2 <pubkey> <sats> --final-taproot`. The HTTP equivalent is `POST /channel/open-v2` with `finalTaproot: true`.
+
+Each original wallet records its enforceable local exit before sending funding witnesses. Restart it with the same wallet directory to resume the exchange. `GET /channels` reports the funding outpoint and opening state. After funding confirms, this rollout waits at `AWAITING_CHANNEL_READY`. Payments, collaborative closing and splicing on this channel are pending. `beignet channel forceclose <channelId>` broadcasts the saved first commitment. Spending its delayed output after the CSV delay is a separate recovery operation. Keep the original wallet directory and its device journal together. Encrypted SQLite backups can supply saved messages and already signed exits through the storage API.
+
 ```bash
 beignet channel open <pubkey> <sats> [pushSats]
 beignet channel open-zeroconf <pubkey> <sats> [pushSats]
-beignet channel open-v2 <pubkey> <sats> [fundingFeeratePerkw] [--request-funds <sats>] [--blockheight <n>] [--max-lease-rates '<json>']
+beignet channel open-v2 <pubkey> <sats> [fundingFeeratePerkw] [--final-taproot] [--request-funds <sats>] [--blockheight <n>] [--max-lease-rates '<json>']
 # The lease flags buy inbound liquidity (option_will_fund) at or under the
 # given rate ceiling; --blockheight defaults to the node's current tip.
 beignet channel open-and-wait <pubkey> <sats> [pushSats] [--timeout 60000]
@@ -2913,7 +2918,7 @@ The matching commands are `wallet sweep-prepare <requestJson|requestFile>`, `wal
 | POST | `/trusted-peer/remove` | `{ pubkey }` | Remove trusted peer |
 | POST | `/channel/open` | `{ pubkey, amountSats, pushSats? }` | Open channel |
 | POST | `/channel/open-zeroconf` | `{ pubkey, amountSats, pushSats? }` | Open zero-conf channel |
-| POST | `/channel/open-v2` | `{ pubkey, amountSats, fundingFeeratePerkw?, ... }` | Open dual-funded v2 channel |
+| POST | `/channel/open-v2` | `{ pubkey, amountSats, fundingFeeratePerkw?, finalTaproot?, ... }` | Open a v2 channel. Enrolled regtest wallets can request private final type 80. |
 | POST | `/channels/ensure-minimum` | `{ count, satsPerChannel, timeoutMs? }` | Auto-open channels to meet minimum count |
 | POST | `/channel/connect-and-open` | `{ pubkey, host, port, amountSats, pushSats? }` | Connect + open in one call |
 | POST | `/channel/open-and-wait` | `{ pubkey, amountSats, pushSats?, timeoutMs? }` | Open channel + wait for NORMAL state |

@@ -1,3 +1,8 @@
+import {
+	finalOpeningChannelType,
+	finalOpeningDependencies,
+	finalOpeningNegotiated
+} from '../features/final-opening';
 /**
  * Lightning Node API: Top-level orchestrator.
  *
@@ -65,6 +70,7 @@ import type { TxidHex } from '../../utils/identifiers';
 import type { LightningNodeEvents, NodeErrorCode } from './events';
 import { randomBytes, sha256 } from '../crypto/provider';
 import type { ILogger } from '../../logger';
+import { finalDaemonForNode } from '../storage/final-daemon-admission';
 import { requireLegacyWallet } from '../storage/wallet-format-guard';
 import { getPublicKey, isValidPublicKey } from '../crypto/ecdh';
 import {
@@ -1171,19 +1177,25 @@ interface IAuxiliaryPartSent {
 // Keep supported feature updates live in both directions. A caller can use its
 // own feature vector for other purposes, including describing a reference peer.
 class NodeFeatureFlags extends FeatureFlags {
-	constructor(private readonly configured: FeatureFlags) {
+	constructor(
+		private readonly configured: FeatureFlags,
+		private readonly finalDaemon: boolean
+	) {
 		super();
 	}
 
-	private isFinalTaprootBit(bit: number): boolean {
+	private masksFinalBit(bit: number): boolean {
+		if (bit === Feature.OPTION_SIMPLE_TAPROOT) return true;
 		return (
-			bit === Feature.OPTION_SIMPLE_TAPROOT ||
-			bit === Feature.OPTION_SIMPLE_TAPROOT + 1
+			bit === Feature.OPTION_SIMPLE_TAPROOT + 1 &&
+			(!this.finalDaemon ||
+				this.configured.hasFeature(Feature.OPTION_TAPROOT) ||
+				!finalOpeningDependencies(this.configured))
 		);
 	}
 
 	override setBit(bit: number): void {
-		if (!this.isFinalTaprootBit(bit)) this.configured.setBit(bit);
+		if (!this.masksFinalBit(bit)) this.configured.setBit(bit);
 	}
 
 	override clearBit(bit: number): void {
@@ -1191,15 +1203,19 @@ class NodeFeatureFlags extends FeatureFlags {
 	}
 
 	override hasBit(bit: number): boolean {
-		return !this.isFinalTaprootBit(bit) && this.configured.hasBit(bit);
+		return !this.masksFinalBit(bit) && this.configured.hasBit(bit);
 	}
 
 	private advertised(): FeatureFlags {
-		if (!this.configured.hasFeature(Feature.OPTION_SIMPLE_TAPROOT))
+		const final = Feature.OPTION_SIMPLE_TAPROOT;
+		if (
+			!this.configured.hasBit(final) &&
+			(!this.configured.hasBit(final + 1) || !this.masksFinalBit(final + 1))
+		)
 			return this.configured;
 		const flags = FeatureFlags.fromBuffer(this.configured.toBuffer());
-		flags.clearBit(Feature.OPTION_SIMPLE_TAPROOT);
-		flags.clearBit(Feature.OPTION_SIMPLE_TAPROOT + 1);
+		flags.clearBit(final);
+		if (this.masksFinalBit(final + 1)) flags.clearBit(final + 1);
 		return flags;
 	}
 
@@ -2009,7 +2025,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		this.setMaxListeners(50);
 		const leaveLifecycleToCreate = constructingForCreate;
 		constructingForCreate = false;
-		requireLegacyWallet(nodeConfig.storage);
+		const finalDaemon = finalDaemonForNode(nodeConfig);
 		const config = resolveNodeConfig(nodeConfig);
 		// Peers ignore a node_announcement whose alias breaks the BOLT 1 string
 		// rule, so the node would silently vanish from their graphs.
@@ -2176,31 +2192,35 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		this.recoveryJournal = journal;
 		this.recoveryGuardians = config.recovery.guardians;
 		this.recovery = this.storage
-			? new RecoveryManager(this.storage, {
-					journal,
-					onCommitted: journal
-						? (): void => {
-								this.scheduleRecoveryCapsuleRefresh();
-								// Start replicating without waiting for it. This is
-								// "appends are pipelined" from the commit side: the
-								// frame is handed to the pump and the transition
-								// returns, so later frames keep landing while an
-								// earlier receipt is still outstanding.
-								this.recoveryBarrier?.noteCommitted();
-						  }
-						: undefined,
-					onError: (err: Error, context): void => {
-						// persistChannel reports its own failures with the channel id
-						// attached, which is strictly more useful; emitting here too
-						// would give a listener two events for one failure.
-						if (context.reportedByCaller) return;
-						this.emit('node:error', {
-							code: 'PERSISTENCE_ERROR',
-							message: `safety transition failed: ${err.message}`,
-							timestamp: Date.now()
-						});
-					}
-			  })
+			? new RecoveryManager(
+					this.storage,
+					{
+						journal,
+						onCommitted: journal
+							? (): void => {
+									this.scheduleRecoveryCapsuleRefresh();
+									// Start replicating without waiting for it. This is
+									// "appends are pipelined" from the commit side: the
+									// frame is handed to the pump and the transition
+									// returns, so later frames keep landing while an
+									// earlier receipt is still outstanding.
+									this.recoveryBarrier?.noteCommitted();
+							  }
+							: undefined,
+						onError: (err: Error, context): void => {
+							// persistChannel reports its own failures with the channel id
+							// attached, which is strictly more useful; emitting here too
+							// would give a listener two events for one failure.
+							if (context.reportedByCaller) return;
+							this.emit('node:error', {
+								code: 'PERSISTENCE_ERROR',
+								message: `safety transition failed: ${err.message}`,
+								timestamp: Date.now()
+							});
+						}
+					},
+					finalDaemon
+			  )
 			: null;
 
 		this.resourceConfig = { ...config.resourceConfig };
@@ -2251,7 +2271,8 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		// Computed before the ChannelManager so per-peer feature-dependent
 		// behavior (e.g. option_simple_close) can consult our own advertisement.
 		const localFeatures = new NodeFeatureFlags(
-			config.localFeatures ?? LightningNode.defaultFeatures()
+			config.localFeatures ?? LightningNode.defaultFeatures(),
+			Boolean(finalDaemon)
 		);
 		// Advertise anchor support whenever anchors are preferred (the default).
 		if (
@@ -2411,6 +2432,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			localFeatures.clearBit(Feature.OPTION_ZERO_RESERVE);
 			localFeatures.clearBit(Feature.OPTION_ZERO_RESERVE + 1);
 		}
+		if (finalDaemon) localFeatures.setOptional(Feature.OPTION_SIMPLE_TAPROOT);
 		this.localFeatures = localFeatures;
 
 		// An asset channel is not accepted by a node whose wallet refused the
@@ -2478,6 +2500,18 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			chainHash: config.chainHashes?.[0] ?? this.chainHash(),
 			nodePrivateKey: config.nodePrivateKey,
 			channelKeyDeriver: config.channelKeyDeriver,
+			finalOpening: finalDaemon?.runtime,
+			finalOpeningNegotiated: finalDaemon
+				? (peerPubkey, channelType) =>
+						finalOpeningNegotiated(
+							localFeatures,
+							this.peerInitFeatures(peerPubkey),
+							channelType
+						)
+				: undefined,
+			allocateChannelKeyIndex: finalDaemon
+				? (minimum) => finalDaemon.storage.allocateFinalChannelKeyIndex(minimum)
+				: undefined,
 			// Issue #917: every index the manager hands out is durable before
 			// anything derived from it can reach the wire. Throws when the
 			// write fails, which refuses that open rather than letting a
@@ -6838,6 +6872,19 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			void this.armPreSpliceSpendWatches(channelId, channel.getFullState());
 		});
 
+		this.channelManager.on(
+			'watch:final-opening',
+			(id, txid, index, depth, script) => {
+				this.chainWatcher
+					?.watchFundingOutput(id, txid, index, depth, script)
+					.catch((err: Error) => {
+						this.emitStructuredLog('chain', 'funding_watch_failed', {
+							txid,
+							error: err.message
+						});
+					});
+			}
+		);
 		this.channelManager.on('watch:funding', (fundingTxid: Buffer) => {
 			const txidHex = fundingTxid.toString('hex');
 			// Arming the watch is deliberately NOT gated. It emits no bytes,
@@ -9586,6 +9633,11 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	 * block and once at startup after channels are restored.
 	 */
 	private retryPendingFundingBroadcasts(): void {
+		this.fundingProvider?.renewFinalOpeningPledges?.().catch((error) => {
+			this.emitStructuredLog('chain', 'input_pledge_renewal_failed', {
+				error: (error as Error)?.message ?? String(error)
+			});
+		});
 		// Self-heal the runtime index first. A disconnect purges a channel's
 		// barrier-held batch, and for a v2 open that suffix can be the
 		// TX_SIGNATURES release plus the funding broadcast: the fully signed
@@ -9828,6 +9880,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		network: string;
 		channels: IScbChannelEntry[];
 	} {
+		requireLegacyWallet(this.storage);
 		// One persisted address per peer (upserted on connect); map to 'host:port'.
 		const peerAddresses = new Map<string, string[]>();
 		if (this.storage) {
@@ -9903,6 +9956,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		recovering: string[];
 		skipped: Array<{ channelId: string; reason: string }>;
 	}> {
+		requireLegacyWallet(this.storage);
 		for (const entry of entries) assertLegacyCommitmentProfile(entry);
 		const recovering: string[] = [];
 		const skipped: Array<{ channelId: string; reason: string }> = [];
@@ -11209,6 +11263,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		this.chainWatcher.on(
 			'funding:unseen',
 			(channelId: Buffer, txid: string) => {
+				this.channelManager.forgetFinalFundingConfirmation(channelId);
 				this.onFundingWatchUnseen(channelId, txid);
 			}
 		);
@@ -11781,6 +11836,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			// eviction while we were down). Retries again on every new block.
 			// Channels are restored by now, so the payload that rode their
 			// frames can seed the runtime index before the sweep asks about it.
+			this.channelManager.restoreFinalOpeningBroadcasts();
 			this.restorePendingFundingFromChannels();
 			this.retryPendingFundingBroadcasts();
 			this.retryPendingSpliceBroadcasts();
@@ -13339,6 +13395,8 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		peerPubkey: string,
 		params: {
 			fundingSatoshis: bigint;
+			/** Request the private, positive-depth regtest final Taproot opening profile. */
+			finalTaproot?: boolean;
 			fundingFeeratePerkw?: number;
 			commitmentFeeratePerkw?: number;
 			locktime?: number;
@@ -13403,9 +13461,55 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			};
 		}
 	): Channel {
+		if (
+			params.finalTaproot !== undefined &&
+			typeof params.finalTaproot !== 'boolean'
+		)
+			throw new InvalidChannelOpenError('finalTaproot must be a boolean');
 		const pubkeyErr = validateHexPubkey(peerPubkey, 'peerPubkey');
 		if (pubkeyErr) throw new InvalidChannelOpenError(pubkeyErr);
 		peerPubkey = normalizeHexPubkey(peerPubkey);
+		let channelType = params.channelType;
+		if (params.finalTaproot && !channelType)
+			channelType = finalOpeningChannelType();
+		const final =
+			params.finalTaproot ||
+			(Buffer.isBuffer(channelType) &&
+				FeatureFlags.fromBuffer(channelType).hasFeature(
+					Feature.OPTION_SIMPLE_TAPROOT
+				));
+		if (final) {
+			if (
+				!channelType ||
+				!finalOpeningNegotiated(
+					this.localFeatures,
+					this.peerInitFeatures(peerPubkey),
+					channelType
+				)
+			)
+				throw new InvalidChannelOpenError(
+					'Final Taproot opening requires the enrolled original and negotiated channel type, simple close, shutdown anysegwit, dual funding and final Taproot'
+				);
+			const allowed = [
+				'fundingSatoshis',
+				'fundingFeeratePerkw',
+				'commitmentFeeratePerkw',
+				'locktime',
+				'finalTaproot',
+				'channelType'
+			];
+			for (const [name, value] of Object.entries(params)) {
+				if (
+					value === undefined ||
+					allowed.includes(name) ||
+					(value === false && (name === 'trusted' || name === 'fundMax'))
+				)
+					continue;
+				throw new InvalidChannelOpenError(
+					'Unsupported final Taproot opening option: ' + name
+				);
+			}
+		}
 		const satsErr = validatePositiveBigint(
 			params.fundingSatoshis,
 			'fundingSatoshis'
@@ -13488,6 +13592,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		const localConfig = config.localConfig || DEFAULT_CHANNEL_CONFIG;
 
 		const dualParams: import('../channel/dual-funding').IDualFundingParams = {
+			...(final ? { channelFlags: 0 } : {}),
 			fundingSatoshis: params.fundingSatoshis,
 			fundingFeeratePerkw:
 				params.fundingFeeratePerkw ?? localConfig.feeratePerKw,
@@ -13506,7 +13611,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			),
 			requestFunds: params.requestFunds,
 			maxLeaseRates: params.maxLeaseRates,
-			channelType: params.channelType,
+			channelType,
 			fundMax: params.fundMax,
 			// Txids case-normalized here so every downstream comparison
 			// (provider selection, directed-selection verification) sees the
@@ -16161,12 +16266,14 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 
 	listChannels(): IChannelInfo[] {
 		const channels = this.channelManager.listChannels();
-		return channels.map((ch) => this.buildChannelInfo(ch));
+		return channels
+			.map((ch) => this.buildChannelInfo(ch))
+			.concat(this.channelManager.finalOpeningInfo());
 	}
 
 	getChannel(channelId: Buffer): IChannelInfo | undefined {
 		const channel = this.channelManager.getChannel(channelId);
-		if (!channel) return undefined;
+		if (!channel) return this.channelManager.finalOpeningInfo(channelId)[0];
 		return this.buildChannelInfo(channel);
 	}
 

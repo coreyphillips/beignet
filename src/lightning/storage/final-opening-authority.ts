@@ -74,7 +74,8 @@ export function installOpeningAuthority(
 	canonical: string,
 	db: Database.Database,
 	key: Buffer,
-	identity: string
+	identity: string,
+	daemonGenerated: boolean
 ): void {
 	const fs = nodeFs();
 	const stagedSigner = stageWallet + SIGNER_SUFFIX;
@@ -100,7 +101,10 @@ export function installOpeningAuthority(
 					`INSERT INTO ${SIGNER_TABLE} (id, device, claim_count_tag) VALUES (1, ?, ?)`
 				)
 				.run(
-					encryptValue(seal, JSON.stringify([origin, secret.toString('hex')])),
+					encryptValue(
+						seal,
+						JSON.stringify([origin, secret.toString('hex'), daemonGenerated])
+					),
 					claimCountTag(secret, 0)
 				);
 		})();
@@ -152,6 +156,72 @@ function getOrigin(
 	throw new Error('Invalid final wallet original device binding');
 }
 
+function decodeDevice(
+	encrypted: string,
+	key: Buffer,
+	identity: string,
+	origin: WalletOrigin
+): {
+	secret: Buffer;
+	daemonGenerated: boolean;
+} {
+	const [claimedOrigin, deviceHex, daemonGenerated] = JSON.parse(
+		decryptValue(bindingKey(key, identity), encrypted)
+	);
+	if (
+		claimedOrigin !== origin.encoded ||
+		(daemonGenerated !== undefined && typeof daemonGenerated !== 'boolean') ||
+		typeof deviceHex !== 'string' ||
+		!/^[a-f0-9]{64}$/.test(deviceHex)
+	)
+		throw new Error('Wrong opening signer');
+	const secret = Buffer.from(deviceHex, 'hex');
+	if (sha256(secret).toString('hex') !== origin.lineage)
+		throw new Error('Wrong opening signer');
+	return { secret, daemonGenerated: daemonGenerated === true };
+}
+
+/** Validate an interrupted, unused installation before publishing its missing wallet link. */
+export function verifyStagedDaemonDevice(
+	wallet: Database.Database,
+	signer: Database.Database,
+	staged: string,
+	canonical: string,
+	key: Buffer,
+	identity: string
+): void {
+	const origin = getOrigin(wallet, key, identity);
+	if (
+		!origin.files ||
+		origin.files[0] !== descriptor(staged, canonical) ||
+		origin.files[1] !==
+			descriptor(staged + SIGNER_SUFFIX, canonical + SIGNER_SUFFIX) ||
+		origin.files[1] !== descriptor(canonical + SIGNER_SUFFIX)
+	)
+		throw new Error(
+			'Staged wallet does not match its installed opening signer'
+		);
+	const row = signer
+		.prepare(`SELECT device FROM ${SIGNER_TABLE} WHERE id=1`)
+		.get() as { device: string };
+	const { secret, daemonGenerated } = decodeDevice(
+		row.device,
+		key,
+		identity,
+		origin
+	);
+	try {
+		if (
+			!daemonGenerated ||
+			signer.prepare('SELECT 1 FROM claims LIMIT 1').get()
+		)
+			throw new Error('Expected an unused daemon-enrolled original signer');
+		readClaimCount(signer, secret);
+	} finally {
+		secret.fill(0);
+	}
+}
+
 export function protectOriginalBackupDestination(
 	db: Database.Database,
 	file: string,
@@ -200,7 +270,8 @@ export class FinalOpeningAuthority {
 		private readonly secret: Buffer,
 		private readonly wallet: string,
 		private readonly walletFile: string,
-		private readonly signerFile: string
+		private readonly signerFile: string,
+		private readonly daemonGenerated: boolean
 	) {}
 
 	static open(
@@ -242,25 +313,20 @@ export class FinalOpeningAuthority {
 					return row.device;
 				})
 				.exclusive();
-			const [claimedOrigin, deviceHex] = JSON.parse(
-				decryptValue(bindingKey(key, identity), encrypted)
+			const { secret, daemonGenerated } = decodeDevice(
+				encrypted,
+				key,
+				identity,
+				origin
 			);
-			if (
-				claimedOrigin !== origin.encoded ||
-				typeof deviceHex !== 'string' ||
-				!/^[a-f0-9]{64}$/.test(deviceHex)
-			)
-				throw new Error('Wrong opening signer');
-			const secret = Buffer.from(deviceHex, 'hex');
-			if (sha256(secret).toString('hex') !== origin.lineage)
-				throw new Error('Wrong opening signer');
 			readClaimCount(db, secret);
 			const authority = new FinalOpeningAuthority(
 				db,
 				secret,
 				file,
 				walletFile,
-				signerFile
+				signerFile,
+				daemonGenerated === true
 			);
 			for (const row of db
 				.prepare('SELECT slot, claim FROM claims')
@@ -286,6 +352,12 @@ export class FinalOpeningAuthority {
 			descriptor(this.wallet + SIGNER_SUFFIX) !== this.signerFile
 		)
 			throw new Error('Original opening signer files have changed');
+	}
+
+	assertDaemonEnrollment(): void {
+		this.verifyFiles();
+		if (!this.daemonGenerated)
+			throw new Error('Final wallet lacks fresh daemon enrollment');
 	}
 
 	nonceContext(candidateKey: Buffer): Buffer {
@@ -343,6 +415,84 @@ export class FinalOpeningAuthority {
 	claim(slot: string, transcript: string): Buffer | null {
 		this.verifyFiles();
 		return this.db.transaction(() => this.lock(slot, transcript)).immediate();
+	}
+
+	/** Burn a key before its basepoints leave this device, even if the wallet rolls back. */
+	requireAllocatedChannelKey(index: number): void {
+		this.verifyFiles();
+		if (
+			this.read('key-allocation/' + String(index).padStart(10, '0'))
+				?.transcript !== String(index)
+		)
+			throw new Error('Opening must use a previously allocated device key');
+	}
+
+	allocateChannelKey(minimum: number): number {
+		this.verifyFiles();
+		return this.db
+			.transaction(() => {
+				const previous = this.db
+					.prepare(
+						"SELECT slot FROM claims WHERE slot GLOB 'key-allocation/*' ORDER BY slot DESC LIMIT 1"
+					)
+					.get() as { slot: string } | undefined;
+				let highest = 0;
+				if (previous) {
+					const value = previous.slot.slice('key-allocation/'.length);
+					highest = Number(value);
+					if (
+						!/^[0-9]{10}$/.test(value) ||
+						this.read(previous.slot)?.transcript !== String(highest)
+					)
+						throw new Error('Invalid original wallet channel key allocation');
+				}
+				const index = Math.max(highest + 1, minimum);
+				if (!Number.isSafeInteger(index) || index < 1 || index > 0x7fffffff)
+					throw new Error('Channel key index exhausted');
+				this.lock(
+					'key-allocation/' + String(index).padStart(10, '0'),
+					String(index)
+				);
+				return index;
+			})
+			.immediate();
+	}
+
+	/** Retain this exact enforceable exit before a peer can acquire spend authority. */
+	requireEnforceableExit(channelId: string, exit: string): void {
+		this.claim(
+			'enforceable-exit/' + channelId,
+			sha256(Buffer.from(exit, 'hex')).toString('hex')
+		);
+	}
+
+	assertEnforceableExits(load: (channelId: string) => Buffer | null): void {
+		this.verifyFiles();
+		for (const row of this.db
+			.prepare(
+				"SELECT slot, claim FROM claims WHERE slot GLOB 'enforceable-exit/*'"
+			)
+			.iterate() as Iterable<{ slot: string; claim: string }>) {
+			const id = row.slot.slice('enforceable-exit/'.length);
+			const exit = /^[a-f0-9]{64}$/.test(id) && load(id);
+			const { transcript } = this.decodeClaim(row.slot, row.claim);
+			if (!exit || sha256(exit).toString('hex') !== transcript)
+				throw new Error(
+					'Original wallet is missing its authorized opening exit'
+				);
+		}
+	}
+
+	/** Reserve all wallet inputs together before the signer can release any funding witness. */
+	bindFundingInputs(outpoints: readonly string[], transcript: string): void {
+		if (!outpoints.length) return;
+		this.verifyFiles();
+		this.db
+			.transaction(() => {
+				for (const outpoint of outpoints)
+					this.lock('wallet-input/' + outpoint, transcript);
+			})
+			.immediate();
 	}
 
 	bindCandidate(channelId: string, outpoint: string, transcript: string): void {

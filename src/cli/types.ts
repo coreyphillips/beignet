@@ -1208,6 +1208,7 @@ export interface BeignetConfig
 	daemonPort?: number;
 	daemonHost?: string;
 	preferAnchors?: boolean;
+	finalTaprootWallet?: boolean;
 	/** option_wumbo: advertise large_channels and lift the 2^24 sat funding cap. */
 	largeChannels?: boolean;
 	/** Legacy single API bearer token. Still honored with implicit admin scope. */

@@ -8,7 +8,14 @@ import {
 	encodeTxCompleteMessage
 } from '../message/interactive-tx';
 
+export interface IFinalOpeningSession {
+	peer: string;
+	channelKeyIndex: number;
+	terms: import('../channel/final-opening-commitment').IFinalOpeningTerms;
+}
+
 export interface IFinalOpeningNonces {
+	session?: IFinalOpeningSession;
 	local?: { salt: string; payload: string };
 	peer?: string;
 	signing?: IFinalOpeningSigning;
@@ -58,7 +65,11 @@ export function decodeOpeningNonces(
 		typeof value !== 'object' ||
 		Array.isArray(value) ||
 		Object.keys(value).some(
-			(key) => key !== 'local' && key !== 'peer' && key !== 'signing'
+			(key) =>
+				key !== 'local' &&
+				key !== 'peer' &&
+				key !== 'signing' &&
+				key !== 'session'
 		)
 	)
 		throw new Error('Invalid stored final opening nonces');

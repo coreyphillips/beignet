@@ -12,8 +12,10 @@ import * as http from 'http';
 import * as fs from 'fs';
 import * as nodePath from 'path';
 import { randomBytes } from 'crypto';
+import { provisionFinalConfig } from './final-wallet-init';
 import { generateMnemonic } from '../utils/helpers';
 import {
+	configPath,
 	loadConfig,
 	saveConfig,
 	resolveConfig,
@@ -38,7 +40,11 @@ import { Console } from 'console';
 import { performDbRestore } from './restore';
 import { deriveBackupMacKey } from './backup-mac';
 import * as bip39 from 'bip39';
-import { InstanceLockError } from './instance-lock';
+import {
+	acquireInstanceLock,
+	releaseInstanceLock,
+	InstanceLockError
+} from './instance-lock';
 import { installProcessFaultHandlers } from './process-faults';
 import { ensurePrivateDir, writeFileAtomic } from './fs-utils';
 import type { ApiResponse, BeignetConfig } from './types';
@@ -432,9 +438,81 @@ function mintApiTokenIfAbsent(config: BeignetConfig): string | undefined {
 }
 
 function handleInit(): void {
-	const config = loadConfig();
-	const network = parseFlag('--network') || config.network || 'mainnet';
+	const file = configPath();
+	ensurePrivateDir(nodePath.dirname(file));
+	const lock = file + '.init-lock';
+	acquireInstanceLock(lock);
+	try {
+		initializeConfig(file);
+	} finally {
+		releaseInstanceLock(lock);
+	}
+}
+
+function initializeConfig(file: string): void {
+	const finalTaprootWallet = hasFlag('--final-taproot-wallet');
+	const pending = fs.lstatSync(
+		nodePath.join(nodePath.dirname(file), 'final-wallet-init.pending'),
+		{ throwIfNoEntry: false }
+	);
+	if (pending && !finalTaprootWallet)
+		throw new Error('A final wallet initialization is pending');
+	const config = loadConfig(finalTaprootWallet);
+	const network =
+		parseFlag('--network') ||
+		(finalTaprootWallet ? process.env.BEIGNET_NETWORK : undefined) ||
+		config.network ||
+		'mainnet';
+	if (
+		finalTaprootWallet &&
+		(network !== 'regtest' ||
+			process.env.BEIGNET_MNEMONIC ||
+			(config.mnemonic !== undefined &&
+				(config.finalTaprootWallet !== true ||
+					typeof config.mnemonic !== 'string' ||
+					!bip39.validateMnemonic(config.mnemonic))) ||
+			(config.finalTaprootWallet === true && !config.mnemonic))
+	)
+		throw new BeignetError(
+			'INVALID_PARAMS',
+			'Final wallet initialization requires a new regtest mnemonic'
+		);
 	const alias = parseFlag('--alias') || config.alias;
+
+	if (finalTaprootWallet) {
+		let apiToken: string | undefined;
+		const enrolled = provisionFinalConfig(
+			file,
+			config,
+			defaultDataDirForMnemonic,
+			(mnemonic, dataDir): BeignetConfig => {
+				const complete: BeignetConfig = {
+					...config,
+					mnemonic,
+					dataDir,
+					network: 'regtest',
+					finalTaprootWallet: true,
+					...(alias ? { alias } : {})
+				};
+				apiToken = mintApiTokenIfAbsent(complete);
+				return complete;
+			}
+		);
+		if (config.mnemonic) {
+			apiToken = mintApiTokenIfAbsent(enrolled);
+			if (apiToken) saveConfig(enrolled);
+		}
+		output({
+			ok: true,
+			result: {
+				message: config.mnemonic ? 'Config already exists' : 'Initialized',
+				network,
+				...(!config.mnemonic ? { mnemonic: enrolled.mnemonic } : {}),
+				...(apiToken ? { apiToken, note: API_TOKEN_NOTE } : {})
+			}
+		});
+		return;
+	}
 
 	if (config.mnemonic) {
 		// A config an older release wrote has a mnemonic and no token: it gets
@@ -1046,7 +1124,8 @@ async function handleChannel(): Promise<void> {
 			// the global ones or `open-v2 <pubkey> <sats> --request-funds n`
 			// reads the flag token as the feerate (the issue #534 bug class).
 			const pos = positionalArgs(
-				new Set(['--request-funds', '--blockheight', '--max-lease-rates'])
+				new Set(['--request-funds', '--blockheight', '--max-lease-rates']),
+				new Set(['--final-taproot'])
 			);
 			const requestFundsArg = parseFlag('--request-funds');
 			const maxLeaseRatesArg = parseFlag('--max-lease-rates');
@@ -1116,6 +1195,7 @@ async function handleChannel(): Promise<void> {
 			return outputResult(
 				await httpRequest('POST', '/channel/open-v2', {
 					pubkey: pos[2],
+					...(hasFlag('--final-taproot') ? { finalTaproot: true } : {}),
 					amountSats: parseInt(pos[3], 10),
 					fundingFeeratePerkw: pos[4] ? parseInt(pos[4], 10) : undefined,
 					requestFunds,
@@ -3298,6 +3378,7 @@ Usage: beignet <command> [options]
 
 Setup:
   init [--network N] [--alias A]         Generate mnemonic, API token + config
+    [--final-taproot-wallet]             Enroll a fresh regtest type-80 wallet
   start [flags]                          Start node daemon
   stop                                   Stop daemon
 
@@ -3438,7 +3519,7 @@ Channels:
   channel open <pubkey> <sats> [push] [--sats-per-vbyte N] [--max]
                                          Open channel (auto-funded)
   channel open-zeroconf <pk> <sats> [push]  Open zero-conf channel
-  channel open-v2 <pubkey> <sats> [feerate] [--request-funds <sats>] [--blockheight <n>] [--max-lease-rates '<json>']
+  channel open-v2 <pubkey> <sats> [feerate] [--final-taproot] [--request-funds <sats>] [--blockheight <n>] [--max-lease-rates '<json>']
                                          Open dual-funded v2 channel; the
                                          lease flags buy inbound liquidity
                                          (option_will_fund) at or under the

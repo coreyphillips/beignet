@@ -1,6 +1,7 @@
 # The exported API of beignet/lightning. Regenerate with npm run api:snapshot; do not edit.
 unexported type DeprecatedNodeConfigKey = 'forwardingEnabled' | 'forwardingCltvDelta' | 'forwardingFeeBaseMsat' | 'forwardingFeePropMillionths' | 'forwardingPolicyGraceMs' | 'fforSettle' | 'fforConcurrent' | 'fforWitness' | 'fforIssuer'
 unexported type EventMap<E> = { [K in keyof E]: (...args: any[]) => void; }
+unexported type FinalFundingWitnessSigner = (unsigned: bitcoinjs-lib#Transaction, indices: readonly number[], prevouts: Prevouts) => Buffer[][]
 unexported interface IAuxiliaryFeeFunding
 method IAuxiliaryFeeFunding.finalize(funded: bitcoinjs-lib#Transaction, prevouts: { scripts: Buffer[]; values: bigint[]; }): { ok: true; data?: Buffer; } | { ok: false; refusal: string; }
 property IAuxiliaryFeeFunding.ownVbytes?: number
@@ -19,6 +20,31 @@ method IDurableLedgerStore.load(id: string): R | null
 method IDurableLedgerStore.loadAll(): R[]
 method IDurableLedgerStore.put(record: R): void
 method IDurableLedgerStore.transaction<T>(fn: () => T): T
+unexported interface IFinalOpeningCandidate
+property IFinalOpeningCandidate.channelId: string
+property IFinalOpeningCandidate.channelType: string
+property IFinalOpeningCandidate.fundingFeeratePerKw: number
+property IFinalOpeningCandidate.fundingOutputIndex: number
+property IFinalOpeningCandidate.fundingTxHex: string
+property IFinalOpeningCandidate.inputs: Array<{ prevTxHex: string; isLocal: boolean; serialId: string; }>
+property IFinalOpeningCandidate.isInitiator: boolean
+property IFinalOpeningCandidate.localContributionSats: number
+property IFinalOpeningCandidate.localFundingPubkey: string
+property IFinalOpeningCandidate.minimumDepth: number
+property IFinalOpeningCandidate.outputSerialIds: string[]
+property IFinalOpeningCandidate.remoteContributionSats: number
+property IFinalOpeningCandidate.remoteFundingPubkey: string
+unexported interface IFinalOpeningRuntime
+property IFinalOpeningRuntime.root: bip32#BIP32Interface
+property IFinalOpeningRuntime.storage: beignet/lightning/sqlite#SqliteStorage
+unexported interface IFinalOpeningTerms
+property IFinalOpeningTerms.commitmentFeeratePerKw: number
+property IFinalOpeningTerms.localBasepoints: OpeningBasepoints
+property IFinalOpeningTerms.localDustLimitSatoshis: number
+property IFinalOpeningTerms.localToSelfDelay: number
+property IFinalOpeningTerms.remoteBasepoints: OpeningBasepoints
+property IFinalOpeningTerms.remoteDustLimitSatoshis: number
+property IFinalOpeningTerms.remoteToSelfDelay: number
 unexported interface IHistoryEntry
 property IHistoryEntry.amountMsat: string
 property IHistoryEntry.cltvExpiry: number
@@ -138,7 +164,9 @@ property IZeroReservePolicy.waivePeer: boolean
 unexported type JitFeeMode = 'skim' | 'hop'
 unexported type LedgerTransitionOutcome = 'applied' | 'stale' | 'missing' | 'storage_failed' | 'not_rehydrated'
 unexported type MessageHandler = (pubkey: string, type: number, payload: Buffer) => void
+unexported type OpeningBasepoints = Record<keyof keys.IChannelBasepoints, string>
 unexported type PeerState = 'disconnected' | 'connecting' | 'handshaking' | 'init' | 'ready' | 'closing'
+unexported type Prevouts = { scripts: Buffer[]; values: bigint[]; }
 unexported type SeedDerivedNodeConfigKey = 'nodePrivateKey' | 'channelBasepoints' | 'perCommitmentSeed' | 'fundingPrivkey' | 'htlcBasepointSecret' | 'revocationBasepointSecret' | 'paymentBasepointSecret' | 'delayedPaymentBasepointSecret'
 unexported type SerializedCustomRecords = [ string, string ][]
 unexported type SubmarineSwapEventName = 'swap:created' | 'swap:funding-seen' | 'swap:funded' | 'swap:funding-lost' | 'swap:paying' | 'swap:payment-unresolved' | 'swap:preimage' | 'swap:claim-broadcast' | 'swap:claim-confirmed' | 'swap:payment-failed' | 'swap:exposed' | 'swap:cancelled' | 'swap:failed'
@@ -1347,7 +1375,7 @@ method channel.Channel.unmarkForwardTaken(htlcId: bigint): void
 method channel.Channel.unregisteredV2TopUpInputs(inputs: channel.ISpliceWalletInput[]): channel.ISpliceWalletInput[]
 method channel.Channel.updateFee(feeratePerKw: number): channel.ChannelAction[]
 method channel.Channel.validateOutgoingHtlc(amountMsat: bigint, cltvExpiry: number): channel.ChannelAction[]
-type channel.ChannelAction = channel.ISendMessageAction | channel.IBroadcastTxAction | channel.IAuthorizeFundingBroadcastAction | channel.IWatchFundingAction | channel.IWatchPreSpliceSpendAction | channel.IChannelReadyAction | channel.IChannelClosedAction | channel.IErrorAction | channel.IHtlcForwardedAction | channel.IHtlcFulfilledAction | channel.IHtlcFailedAction | channel.IForceCloseAction | channel.IWatchOutputAction | channel.IPreimageLearnedAction | channel.IChannelFullyResolvedAction | channel.IAnnouncementReadyAction | channel.IProposeClosingFeeAction | channel.IPersistStateAction | channel.ISpliceCompleteAction | channel.ISpliceAbortedAction | channel.ISpliceRevertedAction | channel.ISpliceConflictRequestReadyAction | channel.ITxSignaturesNeededAction | channel.ISpliceTxSignaturesNeededAction | channel.ISpliceTxNegotiatedAction | channel.IDisconnectPeerAction
+type channel.ChannelAction = channel.ISendMessageAction | channel.IBroadcastTxAction | channel.IAuthorizeFundingBroadcastAction | channel.IWatchFundingAction | channel.IWatchPreSpliceSpendAction | channel.IChannelReadyAction | channel.IChannelClosedAction | channel.IErrorAction | channel.IHtlcForwardedAction | channel.IHtlcFulfilledAction | channel.IHtlcFailedAction | channel.IForceCloseAction | channel.IWatchOutputAction | channel.IPreimageLearnedAction | channel.IChannelFullyResolvedAction | channel.IAnnouncementReadyAction | channel.IProposeClosingFeeAction | channel.IPersistStateAction | channel.ISpliceCompleteAction | channel.ISpliceAbortedAction | channel.ISpliceRevertedAction | channel.ISpliceConflictRequestReadyAction | { type: channel.ChannelActionType.FINAL_OPENING_TX_COMPLETE; channelId: Buffer; } | channel.ITxSignaturesNeededAction | channel.ISpliceTxSignaturesNeededAction | channel.ISpliceTxNegotiatedAction | channel.IDisconnectPeerAction
 enum channel.ChannelActionType
 member channel.ChannelActionType.ANNOUNCEMENT_READY = "ANNOUNCEMENT_READY"
 member channel.ChannelActionType.AUTHORIZE_FUNDING_BROADCAST = "AUTHORIZE_FUNDING_BROADCAST"
@@ -1357,6 +1385,7 @@ member channel.ChannelActionType.CHANNEL_FULLY_RESOLVED = "CHANNEL_FULLY_RESOLVE
 member channel.ChannelActionType.CHANNEL_READY = "CHANNEL_READY"
 member channel.ChannelActionType.DISCONNECT_PEER = "DISCONNECT_PEER"
 member channel.ChannelActionType.ERROR = "ERROR"
+member channel.ChannelActionType.FINAL_OPENING_TX_COMPLETE = "FINAL_OPENING_TX_COMPLETE"
 member channel.ChannelActionType.FORCE_CLOSE = "FORCE_CLOSE"
 member channel.ChannelActionType.HTLC_FAILED = "HTLC_FAILED"
 member channel.ChannelActionType.HTLC_FORWARDED = "HTLC_FORWARDED"
@@ -1431,9 +1460,11 @@ method channel.ChannelManager.fforSetSlot(channelId: Buffer, k: number, state: f
 method channel.ChannelManager.fforSetupTimeout(channelId: Buffer): channel.ChannelResult
 method channel.ChannelManager.fforSync(channelId: Buffer): channel.ChannelResult
 method channel.ChannelManager.fforWitnessAcked(channelId: Buffer, mailboxId: Buffer, retentionUntil: number): channel.ChannelResult
+method channel.ChannelManager.finalOpeningInfo(id?: Buffer): node.IChannelInfo[]
 method channel.ChannelManager.fixedOutputFeeNeed(): { spends: number; revoked: number; }
 method channel.ChannelManager.fixedOutputFeesWaiting(): boolean
 method channel.ChannelManager.forceClose(channelId: Buffer, destinationScript: Buffer, feeRatePerVbyte?: number, network?: bitcoinjs-lib#Network, noDeadlineFeeRatePerVbyte?: number): channel.ChannelResult
+method channel.ChannelManager.forgetFinalFundingConfirmation(id: Buffer): void
 method channel.ChannelManager.forgetPreimage(paymentHash: Buffer, held: ReadonlyArray<{ channelId: Buffer; htlcId: bigint; }>): boolean
 method channel.ChannelManager.forgetUnsentSplice(channelId: Buffer, reason: string): channel.ChannelResult
 method channel.ChannelManager.forwardAsked(channelId: Buffer, htlcId: bigint): boolean
@@ -1504,6 +1535,7 @@ method channel.ChannelManager.removeTrustedPeer(pubkeyHex: string): void
 method channel.ChannelManager.requestSpliceConflictRevert(channelId: Buffer): channel.ChannelResult
 method channel.ChannelManager.resendAnnouncementSignatures(channelId: Buffer): boolean
 method channel.ChannelManager.restoreChannel(channel: channel.Channel, peerPubkey: string, keyIndex?: number | null, perChannelKeys?: channel.IPerChannelKeys | null): void
+method channel.ChannelManager.restoreFinalOpeningBroadcasts(): void
 method channel.ChannelManager.restoreMonitor(channelId: string, monitor: chain.ChainMonitor): void
 method channel.ChannelManager.retractAuxiliarySettleDecision(channelId: Buffer, htlcId: bigint): boolean
 method channel.ChannelManager.retryAuxiliaryOwed(settle?: (channelId: Buffer, htlcId: bigint, kind: 'fulfill' | 'fail') => channel.ChannelResult | undefined, now?: number): Array<{ channelId: Buffer; htlcId: bigint; kind: 'fulfill' | 'fail'; }>
@@ -1588,6 +1620,7 @@ property channel.ChannelManagerEvents.'transition:end': (channelIdHex: string | 
 property channel.ChannelManagerEvents.'transition:frozen': (peerPubkey: string, channelIdHex: string, reason: string, dropped: number) => void
 property channel.ChannelManagerEvents.'transition:held': (peerPubkey: string, channelIdHex: string, frameSequence: bigint | null) => void
 property channel.ChannelManagerEvents.'transition:terminal-override': (peerPubkey: string, channelIdHex: string, detachedBatches: number) => void
+property channel.ChannelManagerEvents.'watch:final-opening': (channelId: Buffer, txid: string, index: number, minimumDepth: number, script: Buffer) => void
 property channel.ChannelManagerEvents.'watch:funding': (fundingTxid: Buffer, fundingOutputIndex: number, minimumDepth: number) => void
 property channel.ChannelManagerEvents.'watch:output': (txid: string, outputIndex: number) => void
 property channel.ChannelManagerEvents.'watch:presplice-spend': (channelId: Buffer) => void
@@ -2021,6 +2054,7 @@ interface channel.IChannelFullyResolvedAction
 property channel.IChannelFullyResolvedAction.channelId: Buffer
 property channel.IChannelFullyResolvedAction.type: channel.ChannelActionType.CHANNEL_FULLY_RESOLVED
 interface channel.IChannelManagerConfig
+property channel.IChannelManagerConfig.allocateChannelKeyIndex?: (minimum: number) => number
 property channel.IChannelManagerConfig.auxiliaryChannels?: channel.IAuxiliaryChannelConfig
 property channel.IChannelManagerConfig.auxiliaryOpenFeeRefusal?: () => Error | undefined
 property channel.IChannelManagerConfig.auxiliaryOpenRefusal?: Error
@@ -2030,6 +2064,8 @@ property channel.IChannelManagerConfig.channelKeyDeriver?: (channelIndex: number
 property channel.IChannelManagerConfig.delayedPaymentBasepointSecret?: Buffer
 property channel.IChannelManagerConfig.durabilityBarrier?: channel.IWireDurabilityBarrier
 property channel.IChannelManagerConfig.fforVoucherLookup?: (paymentHash: string) => ffor.IFforVoucherArchive | undefined
+property channel.IChannelManagerConfig.finalOpening?: IFinalOpeningRuntime
+property channel.IChannelManagerConfig.finalOpeningNegotiated?: (peerPubkey: string, channelType: Buffer) => boolean
 property channel.IChannelManagerConfig.getClosingFeeratePerKw?: () => number | undefined
 property channel.IChannelManagerConfig.hasResumableChannelRow?: (channelId: Buffer) => boolean
 property channel.IChannelManagerConfig.htlcBasepointSecret?: Buffer
@@ -5960,6 +5996,8 @@ method node.IFundingProvider.quoteDualFundingMax?(feeratePerKw: number): { fundi
 method node.IFundingProvider.quoteSpliceIn?(feeratePerKw: number): { spendableSats: bigint; feeSats: bigint; maxAmountSats: bigint; inputCount: number; }
 method node.IFundingProvider.releaseFixedOutputFeeCoins?(): Promise<boolean>
 method node.IFundingProvider.releaseInputPledges?(outpoints: Array<{ txid: string; vout: number; }>): Promise<void>
+method node.IFundingProvider.renewFinalOpeningPledges?(): Promise<void>
+method node.IFundingProvider.resolveFinalOpeningInputs?(candidate: IFinalOpeningCandidate, terms?: IFinalOpeningTerms): Promise<FinalFundingWitnessSigner>
 method node.IFundingProvider.restoreFeeBumpInputs?(inputs: readonly { prevTx: Buffer; prevOutputIndex: number; sequence: number; }[]): Promise<channel.ISpliceWalletInput[]>
 method node.IFundingProvider.retireFixedOutputFeeAction?(feeActionId: string, resolution?: wallet.IFixedOutputFeeResolution): Promise<void>
 method node.IFundingProvider.selectDualFundingInputs?(amountSats: bigint, feeratePerKw: number, initiator: boolean, topUp?: boolean, opts?: node.IUtxoSelectionOpts): Promise<{ inputs: channel.ISpliceWalletInput[]; changeScript: Buffer; }>
@@ -6512,7 +6550,7 @@ method node.LightningNode.loadRapidGossipSnapshotAsync(data: Buffer, opts?: { ca
 method node.LightningNode.mintDirectFundingRequest(opts: { host?: string; port?: number; amountSat?: bigint; ttlMs?: number; liquidityPeer?: string; liquidityHost?: string; liquidityPort?: number; }): { record: directFunding.IDfRequestRecord; request: string; expiresAt: number; }
 method node.LightningNode.openAuxiliaryChannel(peerPubkey: string, fundingSatoshis: bigint, descriptor: channel.IAuxiliaryFundingDescriptor, pushMsat?: bigint): channel.Channel
 method node.LightningNode.openChannel(peerPubkey: string, fundingSatoshis: bigint, pushMsat?: bigint, satsPerVbyte?: number, fundMax?: boolean, trusted?: boolean): channel.Channel
-method node.LightningNode.openChannelV2(peerPubkey: string, params: { fundingSatoshis: bigint; fundingFeeratePerkw?: number; commitmentFeeratePerkw?: number; locktime?: number; requestFunds?: message.IRequestFunds; maxLeaseRates?: gossip.ILeaseRates; channelType?: Buffer; fundMax?: boolean; trusted?: boolean; fundingUtxos?: { utxos: Array<{ txid: string; vout: number; }>; allowTopUp?: boolean; }; contribution?: { inputs: channel.ISpliceWalletInput[]; changeScript: Buffer; }; }): channel.Channel
+method node.LightningNode.openChannelV2(peerPubkey: string, params: { fundingSatoshis: bigint; finalTaproot?: boolean; fundingFeeratePerkw?: number; commitmentFeeratePerkw?: number; locktime?: number; requestFunds?: message.IRequestFunds; maxLeaseRates?: gossip.ILeaseRates; channelType?: Buffer; fundMax?: boolean; trusted?: boolean; fundingUtxos?: { utxos: Array<{ txid: string; vout: number; }>; allowTopUp?: boolean; }; contribution?: { inputs: channel.ISpliceWalletInput[]; changeScript: Buffer; }; }): channel.Channel
 method node.LightningNode.openZeroConfChannel(peerPubkey: string, fundingSatoshis: bigint, pushMsat?: bigint): channel.Channel
 method node.LightningNode.openZeroConfChannelAndWait(peerPubkey: string, fundingSatoshis: bigint, timeoutMs?: number): Promise<Buffer>
 method node.LightningNode.payBolt12Invoice(invoice: offer.IBolt12Invoice, excludedChannels?: Set<string>, maxFeeMsat?: bigint, policyOverrides?: gossip.TPolicyOverrides): node.IPaymentInfo
@@ -7998,7 +8036,7 @@ method recovery.RecoveryJournal.onCommitRollback(): void
 method recovery.RecoveryJournal.prepareForReplication(): void
 method recovery.RecoveryJournal.snapshotSchemaRepair(): bigint | null
 class recovery.RecoveryManager
-constructor recovery.RecoveryManager(storage: storage.IStorageBackend, options?: recovery.IRecoveryManagerOptions)
+constructor recovery.RecoveryManager(storage: storage.IStorageBackend, options?: recovery.IRecoveryManagerOptions, admission?: object)
 method recovery.RecoveryManager.clearChannelOutbox(channelId: string): void
 method recovery.RecoveryManager.commit(transition: recovery.SafetyTransition): recovery.IRecoveryCommitResult
 method recovery.RecoveryManager.getOutbox(channelId?: string): recovery.IRecoveryOutboxRow[]
@@ -10268,7 +10306,7 @@ method wallet.IWalletLike.unfreezeUtxo?(params: { txid: string; index: number; }
 method wallet.IWalletLike.unfreezeUtxoIfTagged?(params: { txid: string; index: number; tag: string; }): Promise<IResult>
 method wallet.IWalletLike.withSendLock?<T>(fn: () => Promise<T>): Promise<T>
 class wallet.WalletFundingProvider implements node.IFundingProvider
-constructor wallet.WalletFundingProvider(wallet: wallet.IWalletLike, options?: { fixedOutputFees?: wallet.IFixedOutputFeePolicy; fixedOutputFeeRefusal?: wallet.FixedOutputFeeError; })
+constructor wallet.WalletFundingProvider(wallet: wallet.IWalletLike, options?: { fixedOutputFees?: wallet.IFixedOutputFeePolicy; finalOpeningCandidates?: () => IFinalOpeningCandidate[]; fixedOutputFeeRefusal?: wallet.FixedOutputFeeError; })
 method wallet.WalletFundingProvider.broadcastTransaction(txHex: string): Promise<string>
 method wallet.WalletFundingProvider.buildFundingTransaction(address: string, amountSats: bigint, satsPerByte?: number, max?: boolean): Promise<{ txHex: string; txid: Buffer; outputIndex: number; }>
 method wallet.WalletFundingProvider.getFixedOutputFeeActionIds(channelId: Buffer): readonly string[]
@@ -10280,6 +10318,8 @@ method wallet.WalletFundingProvider.quoteDualFundingMax(feeratePerKw: number): {
 method wallet.WalletFundingProvider.quoteSpliceIn(feeratePerKw: number): { spendableSats: bigint; feeSats: bigint; maxAmountSats: bigint; inputCount: number; }
 method wallet.WalletFundingProvider.releaseFixedOutputFeeCoins(): Promise<boolean>
 method wallet.WalletFundingProvider.releaseInputPledges(outpoints: Array<{ txid: string; vout: number; }>): Promise<void>
+method wallet.WalletFundingProvider.renewFinalOpeningPledges(): Promise<void>
+method wallet.WalletFundingProvider.resolveFinalOpeningInputs(candidate: IFinalOpeningCandidate, terms?: IFinalOpeningTerms): Promise<FinalFundingWitnessSigner>
 method wallet.WalletFundingProvider.restoreFeeBumpInputs(inputs: readonly { prevTx: Buffer; prevOutputIndex: number; sequence: number; }[]): Promise<channel.ISpliceWalletInput[]>
 method wallet.WalletFundingProvider.retireFixedOutputFeeAction(feeActionId: string, resolution?: wallet.IFixedOutputFeeResolution): Promise<void>
 method wallet.WalletFundingProvider.selectDualFundingInputs(amountSats: bigint, feeratePerKw: number, initiator: boolean, topUp?: boolean, opts?: node.IUtxoSelectionOpts): Promise<{ inputs: channel.ISpliceWalletInput[]; changeScript: Buffer; }>

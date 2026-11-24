@@ -21,22 +21,35 @@ import {
 } from '../ffor/voucher-archive';
 import type Database from 'better-sqlite3';
 import type { BIP32Interface } from 'bip32';
-import type { IFinalOpeningTerms } from '../channel/final-opening-commitment';
-import { signOpening, verifyOpeningSigning } from './final-opening-signing';
+import {
+	buildFinalOpeningCommitment,
+	type IFinalOpeningTerms
+} from '../channel/final-opening-commitment';
+import {
+	recordOpeningFunding,
+	type FinalFundingWitnessSigner
+} from './final-opening-funding';
+import {
+	canonicalTerms,
+	signOpening,
+	verifyOpeningSigning
+} from './final-opening-signing';
 import { validateFinalOpening } from './final-opening-candidate';
 import type { IFinalOpeningCandidate } from './final-opening-candidate';
 import {
 	decodeOpeningNonces,
 	localOpeningTxComplete,
 	recordPeerTxComplete,
-	type IFinalOpeningNonces
+	type IFinalOpeningNonces,
+	type IFinalOpeningSession
 } from './final-opening-nonces';
 import {
 	FinalOpeningAuthority,
 	installOpeningAuthority
 } from './final-opening-authority';
-import { getPublicKey } from '../crypto/ecdh';
+import { getPublicKey, isValidPublicKey } from '../crypto/ecdh';
 import { loadBetterSqlite3 } from './sqlite-binding';
+import { takeFinalDaemonGeneration } from './final-wallet-generation';
 import { finalWalletStorage } from './wallet-format-guard';
 import {
 	assertExistingWalletFile,
@@ -164,6 +177,13 @@ interface IRevokedHtlcSnapshotRow {
 	channel_id: string;
 	commitment_number: string;
 	htlcs_json: string;
+}
+
+interface IFinalDaemonOpening {
+	candidate: IFinalOpeningCandidate;
+	session: IFinalOpeningSession;
+	funding?: Buffer;
+	exitToBroadcast?: Buffer;
 }
 
 interface IFinalOpeningRecord {
@@ -420,6 +440,7 @@ export class SqliteStorage implements IStorageBackend {
 		binding: IFinalWalletBinding
 	): SqliteStorage {
 		const identity = finalWalletIdentity(dbPath, binding);
+		const daemonGenerated = takeFinalDaemonGeneration(binding);
 		installFreshWallet(dbPath, (stagedPath) => {
 			const staged = new SqliteStorage(stagedPath, undefined, binding);
 			try {
@@ -430,7 +451,8 @@ export class SqliteStorage implements IStorageBackend {
 					dbPath,
 					staged.db,
 					binding.encryptionKey,
-					identity
+					identity,
+					daemonGenerated
 				);
 				staged.checkpoint();
 			} finally {
@@ -740,6 +762,27 @@ export class SqliteStorage implements IStorageBackend {
 			candidate.channelId,
 			decryptValue(nonceKey, row.nonces_json)
 		);
+		if (nonces.session !== undefined) {
+			const session = nonces.session;
+			if (
+				!session ||
+				Object.keys(session).sort().join(',') !==
+					'channelKeyIndex,peer,terms' ||
+				!Number.isSafeInteger(session.channelKeyIndex) ||
+				session.channelKeyIndex < 0 ||
+				session.channelKeyIndex > 0x7fffffff ||
+				session.peer === JSON.parse(this.walletIdentity!)[1] ||
+				(nonces.signing &&
+					canonicalTerms(nonces.signing.terms) !==
+						canonicalTerms(session.terms)) ||
+				!/^(02|03)[a-f0-9]{64}$/.test(session.peer) ||
+				!isValidPublicKey(Buffer.from(session.peer, 'hex')) ||
+				getIndex(candidate.channelId) !== session.channelKeyIndex
+			)
+				throw new Error('Invalid stored opening session');
+			buildFinalOpeningCommitment(candidate, session.terms, 'local');
+			buildFinalOpeningCommitment(candidate, session.terms, 'remote');
+		}
 		if (nonces.signing !== undefined)
 			verifyOpeningSigning(candidate, nonces, getIndex(candidate.channelId));
 		return { candidate, nonces, nonceKey };
@@ -755,7 +798,10 @@ export class SqliteStorage implements IStorageBackend {
 
 	/** Stream and authenticate every reservation, including on startup. */
 	private readFinalOpenings(
-		visit?: (candidate: IFinalOpeningCandidate) => void
+		visit?: (
+			candidate: IFinalOpeningCandidate,
+			record: IFinalOpeningRecord
+		) => void
 	): void {
 		if (!this.walletIdentity)
 			throw new Error('Final opening candidates require a bound final wallet');
@@ -765,8 +811,8 @@ export class SqliteStorage implements IStorageBackend {
 			)
 			.iterate() as Iterable<IFinalOpeningRow>;
 		for (const row of rows) {
-			const { candidate } = this.readFinalOpening(row);
-			visit?.(candidate);
+			const record = this.readFinalOpening(row);
+			visit?.(record.candidate, record);
 		}
 	}
 
@@ -815,7 +861,44 @@ export class SqliteStorage implements IStorageBackend {
 	}
 
 	/** Remember the first unsigned candidate before beginning any signing session. */
+	get canSignFinalOpening(): boolean {
+		return this.openingAuthority !== null;
+	}
+
+	loadFinalOpeningSession(channelId: string): IFinalOpeningSession | null {
+		return this.finalOpeningRecord(channelId)?.nonces.session ?? null;
+	}
+
+	rememberFinalOpeningSession(
+		candidate: IFinalOpeningCandidate,
+		peer: string,
+		terms: IFinalOpeningTerms,
+		channelKeyIndex: number
+	): void {
+		if (
+			!/^(02|03)[0-9a-f]{64}$/.test(peer) ||
+			!isValidPublicKey(Buffer.from(peer, 'hex')) ||
+			peer === JSON.parse(this.walletIdentity ?? '[]')[1]
+		)
+			throw new Error('Invalid final opening peer identity');
+		buildFinalOpeningCommitment(candidate, terms, 'local');
+		buildFinalOpeningCommitment(candidate, terms, 'remote');
+		const session = {
+			peer,
+			terms: JSON.parse(canonicalTerms(terms)) as IFinalOpeningTerms,
+			channelKeyIndex
+		};
+		this.reserveFinalCandidate(candidate, session);
+	}
+
 	rememberFinalOpening(candidate: IFinalOpeningCandidate): void {
+		this.reserveFinalCandidate(candidate);
+	}
+
+	private reserveFinalCandidate(
+		candidate: IFinalOpeningCandidate,
+		session?: IFinalOpeningSession
+	): void {
 		if (this.db.inTransaction)
 			throw new Error('Final opening reservation requires a top-level commit');
 		const { encoded, fundingOutpoint } = validateFinalOpening(candidate);
@@ -829,16 +912,47 @@ export class SqliteStorage implements IStorageBackend {
 						throw new Error(
 							'A different final opening candidate is already reserved'
 						);
+					if (
+						session &&
+						JSON.stringify(this.loadFinalOpeningSession(channelId)) !==
+							JSON.stringify(session)
+					)
+						throw new Error(
+							'Opening session differs from its original reservation'
+						);
 					return;
 				}
 				const authority = this.requireOpeningAuthority();
+				if (session) {
+					authority.requireAllocatedChannelKey(session.channelKeyIndex);
+					if (
+						this.loadAllChannelKeyIndices().some((row) =>
+							row.channelId === channelId
+								? row.channelIndex !== session.channelKeyIndex
+								: row.channelIndex === session.channelKeyIndex
+						)
+					)
+						throw new Error('Opening key locator is already assigned');
+					authority.claim(
+						'opening/session/' + channelId,
+						sha256(Buffer.from(JSON.stringify(session))).toString('hex')
+					);
+					authority.claim(
+						'commitment/key/' + session.channelKeyIndex,
+						channelId
+					);
+					this.saveChannelKeyIndex(channelId, session.channelKeyIndex);
+				}
 				const inserted = this._stmt(
 					'INSERT INTO final_opening_candidates (channel_id, funding_outpoint, record_json, nonces_json) VALUES (?, ?, ?, ?)'
 				).run(
 					channelId,
 					fundingOutpoint,
 					encryptValue(key, encoded),
-					encryptValue(this.openingNonceKey(key, encoded), '{}')
+					encryptValue(
+						this.openingNonceKey(key, encoded),
+						JSON.stringify(session ? { session } : {})
+					)
 				);
 				if (
 					inserted.changes !== 1 ||
@@ -927,6 +1041,56 @@ export class SqliteStorage implements IStorageBackend {
 				return payload;
 			}
 		);
+	}
+
+	/** Reserve the actual BIP32 index in both original-device and wallet storage before key derivation. */
+	allocateFinalChannelKeyIndex(minimum: number): number {
+		if (
+			this.db.inTransaction ||
+			!Number.isSafeInteger(minimum) ||
+			minimum < 1 ||
+			minimum > 0x7fffffff
+		)
+			throw new Error(
+				'Opening keys require a valid minimum and a top-level commit'
+			);
+		const authority = this.requireOpeningAuthority();
+		return this.db
+			.transaction(() => {
+				const prior = this.loadMetadata('channel_key_index_allocated');
+				if (
+					prior !== null &&
+					(!/^(0|[1-9][0-9]{0,9})$/.test(prior) || Number(prior) > 0x7fffffff)
+				)
+					throw new Error('Invalid wallet channel key allocation');
+				const floor = this.loadMetadata('channel_key_index_floor');
+				if (
+					floor !== null &&
+					(!/^(0|[1-9][0-9]{0,9})$/.test(floor) || Number(floor) > 0x7fffffff)
+				)
+					throw new Error('Invalid wallet channel key index floor');
+				const index = authority.allocateChannelKey(
+					Math.max(
+						minimum,
+						this.loadNextChannelIndex(),
+						Number(prior) + 1,
+						Number(floor)
+					)
+				);
+				this.saveMetadata('channel_key_index_allocated', String(index));
+				if (this.loadMetadata('channel_key_index_allocated') !== String(index))
+					throw new Error('Opening channel key allocation was not written');
+				return index;
+			})
+			.immediate();
+	}
+
+	assertFinalDaemonIdentity(nodeId: string): void {
+		if (this.walletIdentity !== JSON.stringify([1, nodeId, 'regtest']))
+			throw new Error('Expected the enrolled regtest final wallet identity');
+		const authority = this.requireOpeningAuthority();
+		authority.assertDaemonEnrollment();
+		authority.assertEnforceableExits((id) => this.loadFinalOpeningExit(id));
 	}
 
 	private requireOpeningAuthority(): FinalOpeningAuthority {
@@ -1040,8 +1204,87 @@ export class SqliteStorage implements IStorageBackend {
 		return hex === undefined ? null : Buffer.from(hex, 'hex');
 	}
 
+	/** Persist the operator's request before broadcasting the already signed exit. */
+	requestFinalOpeningExit(channelId: string): Buffer {
+		return this.updateOpeningNonces(channelId, (state) => {
+			const signing = state.signing;
+			if (!state.session || !signing?.exit || !signing.fundingLocal)
+				throw new Error('Opening has not released its funding witnesses');
+			signing.exitRequested = true;
+			return Buffer.from(signing.exit, 'hex');
+		});
+	}
+
+	private daemonOpening(
+		record: IFinalOpeningRecord | null
+	): IFinalDaemonOpening | null {
+		if (!record?.nonces.session) return null;
+		const { signing, session } = record.nonces;
+		return {
+			candidate: record.candidate,
+			session,
+			...(signing?.fundingTransaction && {
+				funding: Buffer.from(signing.fundingTransaction, 'hex')
+			}),
+			...(signing?.exitRequested && {
+				exitToBroadcast: Buffer.from(signing.exit!, 'hex')
+			})
+		};
+	}
+
+	loadFinalDaemonOpening(channelId: string): IFinalDaemonOpening | null {
+		return this.daemonOpening(this.finalOpeningRecord(channelId));
+	}
+
+	loadFinalDaemonOpenings(): IFinalDaemonOpening[] {
+		const results: IFinalDaemonOpening[] = [];
+		this.readFinalOpenings((_candidate, record) => {
+			const opening = this.daemonOpening(record);
+			if (opening) results.push(opening);
+		});
+		return results;
+	}
+
 	loadFinalOpeningTerms(channelId: string): IFinalOpeningTerms | null {
 		return this.finalOpeningRecord(channelId)?.nonces.signing?.terms ?? null;
+	}
+
+	/** Return our exact opening tx_signatures only after the wallet release has committed. */
+	finalOpeningTxSignatures(
+		channelId: string,
+		sign: FinalFundingWitnessSigner
+	): Buffer {
+		return this.updateOpeningNonces(channelId, (state, candidate, key) =>
+			recordOpeningFunding(candidate, state, key, this.openingAuthority, {
+				sign
+			})
+		);
+	}
+
+	rememberFinalPeerTxSignatures(channelId: string, payload: Buffer): void {
+		this.updateOpeningNonces(channelId, (state, candidate, key) =>
+			recordOpeningFunding(candidate, state, key, this.openingAuthority, {
+				peer: payload
+			})
+		);
+	}
+
+	loadFinalLocalTxSignatures(channelId: string): Buffer | null {
+		const value =
+			this.finalOpeningRecord(channelId)?.nonces.signing?.fundingLocal;
+		return value === undefined ? null : Buffer.from(value, 'hex');
+	}
+
+	loadFinalPeerTxSignatures(channelId: string): Buffer | null {
+		const value =
+			this.finalOpeningRecord(channelId)?.nonces.signing?.fundingPeer;
+		return value === undefined ? null : Buffer.from(value, 'hex');
+	}
+
+	loadFinalFundingTransaction(channelId: string): Buffer | null {
+		const value =
+			this.finalOpeningRecord(channelId)?.nonces.signing?.fundingTransaction;
+		return value === undefined ? null : Buffer.from(value, 'hex');
 	}
 
 	private updateOpeningNonces<T>(
@@ -2819,11 +3062,12 @@ export class SqliteStorage implements IStorageBackend {
 		for (const row of rows) {
 			const sameChannel = row.channel_id === channelId;
 			const sameIndex = this._decodeChannelIndex(row.channel_index) === index;
-			if (
-				sameChannel !== sameIndex &&
-				this.finalOpeningRecord(row.channel_id)?.nonces.signing
-			)
-				throw new Error('Cannot reassign a signed opening channel key index');
+			if (sameChannel === sameIndex) continue;
+			const record = this.finalOpeningRecord(row.channel_id);
+			if (record?.nonces.session || record?.nonces.signing)
+				throw new Error(
+					'Cannot reassign a reserved or signed opening channel key index'
+				);
 		}
 	}
 
