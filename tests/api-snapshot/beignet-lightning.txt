@@ -694,6 +694,7 @@ method chain.ChainWatcher.stop(): void
 method chain.ChainWatcher.unwatchPreSpliceSpend(channelId: Buffer, txid: string, outputIndex: number): boolean
 method chain.ChainWatcher.unwatchSpliceInputs(channelId: Buffer, spliceTxidDisplayHex?: string): void
 method chain.ChainWatcher.verifySpliceInputConflict(spliceTxHex: string, conflictTxidDisplayHex: string, sharedInputIndex: number): Promise<{ inputIndex: number; height: number; depth: number; } | null>
+method chain.ChainWatcher.watchFinalFundingOutput(channelId: Buffer, txid: string, outputIndex: number, minimumDepth: number, script: Buffer, valueSat: number): Promise<void>
 method chain.ChainWatcher.watchFundingOutput(channelId: Buffer, txid: string, outputIndex: number, minimumDepth: number, scriptPubkey: Buffer, generation?: number, candidates?: Array<{ txid: string; outputIndex: number; }>, discoverAttemptInputs?: string[][], seenHeight?: number): Promise<void>
 method chain.ChainWatcher.watchFundingSpendDuringSplice(channelId: Buffer, txid: string, outputIndex: number, scriptPubkey: Buffer, ignoreSpendTxid: string): Promise<void>
 method chain.ChainWatcher.watchOutput(txid: string, outputIndex: number, scriptPubkey: Buffer, spendTxid?: string, spendHeight?: number, generation?: number): Promise<void>
@@ -1461,6 +1462,7 @@ method channel.ChannelManager.fforSetupTimeout(channelId: Buffer): channel.Chann
 method channel.ChannelManager.fforSync(channelId: Buffer): channel.ChannelResult
 method channel.ChannelManager.fforWitnessAcked(channelId: Buffer, mailboxId: Buffer, retentionUntil: number): channel.ChannelResult
 method channel.ChannelManager.finalOpeningInfo(id?: Buffer): node.IChannelInfo[]
+method channel.ChannelManager.finalOpeningPeers(): string[]
 method channel.ChannelManager.fixedOutputFeeNeed(): { spends: number; revoked: number; }
 method channel.ChannelManager.fixedOutputFeesWaiting(): boolean
 method channel.ChannelManager.forceClose(channelId: Buffer, destinationScript: Buffer, feeRatePerVbyte?: number, network?: bitcoinjs-lib#Network, noDeadlineFeeRatePerVbyte?: number): channel.ChannelResult
@@ -1620,7 +1622,7 @@ property channel.ChannelManagerEvents.'transition:end': (channelIdHex: string | 
 property channel.ChannelManagerEvents.'transition:frozen': (peerPubkey: string, channelIdHex: string, reason: string, dropped: number) => void
 property channel.ChannelManagerEvents.'transition:held': (peerPubkey: string, channelIdHex: string, frameSequence: bigint | null) => void
 property channel.ChannelManagerEvents.'transition:terminal-override': (peerPubkey: string, channelIdHex: string, detachedBatches: number) => void
-property channel.ChannelManagerEvents.'watch:final-opening': (channelId: Buffer, txid: string, index: number, minimumDepth: number, script: Buffer) => void
+property channel.ChannelManagerEvents.'watch:final-opening': (channelId: Buffer, txid: string, index: number, minimumDepth: number, script: Buffer, valueSat: number) => void
 property channel.ChannelManagerEvents.'watch:funding': (fundingTxid: Buffer, fundingOutputIndex: number, minimumDepth: number) => void
 property channel.ChannelManagerEvents.'watch:output': (txid: string, outputIndex: number) => void
 property channel.ChannelManagerEvents.'watch:presplice-spend': (channelId: Buffer) => void
@@ -1644,6 +1646,7 @@ member channel.ChannelState.AWAITING_CHANNEL_READY = "AWAITING_CHANNEL_READY"
 member channel.ChannelState.AWAITING_FUNDING_CONFIRMED = "AWAITING_FUNDING_CONFIRMED"
 member channel.ChannelState.AWAITING_REESTABLISH = "AWAITING_REESTABLISH"
 member channel.ChannelState.AWAITING_TX_SIGNATURES = "AWAITING_TX_SIGNATURES"
+member channel.ChannelState.CHANNEL_READY = "CHANNEL_READY"
 member channel.ChannelState.CLOSED = "CLOSED"
 member channel.ChannelState.DUAL_FUNDING_V2 = "DUAL_FUNDING_V2"
 member channel.ChannelState.ERRORED = "ERRORED"

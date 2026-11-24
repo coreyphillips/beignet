@@ -81,6 +81,8 @@ export interface IChainBackend {
 
 /** A funding output being watched for confirmation */
 interface IWatchedFunding {
+	/** A private final opening requires ongoing proof of this unspent amount at depth. */
+	finalFundingValueSat?: number;
 	channelId: Buffer;
 	txid: string; // hex, display byte order (as Electrum history reports it)
 	outputIndex: number;
@@ -581,6 +583,8 @@ export async function classifyAnnouncedChannelFunding(
  * - 'funding:unseen' (channelId: Buffer, txid: string): a transaction reported
  *   by 'funding:seen' is not in a block any more (reorged back to the mempool,
  *   or absent past the missing debounce)
+ * - 'funding:depth-lost' (channelId: Buffer, txid: string): a final opening
+ *   no longer has live evidence for its unspent funding at the required depth
  * - 'funding:spent' (channelId: Buffer, spendingTx: Transaction)
  * - 'funding:missing' (channelId: Buffer, txid: string): the watched funding
  *   tx disappeared from mempool AND chain before confirming (evicted/replaced).
@@ -783,6 +787,7 @@ export class ChainWatcher extends EventEmitter {
 	// transaction spent the funding output in a block.
 	private voidBroadcasts = new Set<string>();
 	private currentBlockHeight = 0;
+	private tipGeneration?: number;
 	private started = false;
 	/**
 	 * Bumped on every start() and stop(). Chain work captures the generation it
@@ -950,7 +955,7 @@ export class ChainWatcher extends EventEmitter {
 		this.retryFailedOutputSubscriptions(this.lifecycleGeneration);
 		// Re-check unconfirmed fundings and watched output spends directly.
 		for (const [key, watched] of this.watchedFundings) {
-			if (!watched.confirmed) {
+			if (!watched.confirmed || watched.finalFundingValueSat !== undefined) {
 				this.checkFundingConfirmation(key).catch((err) => this.emitError(err));
 				continue;
 			}
@@ -987,7 +992,11 @@ export class ChainWatcher extends EventEmitter {
 		// longer finds its watch, whatever the ticket state says.
 		this.channelSpendScans.delete(channelId.toString('hex'));
 		this.unwatchSpliceInputs(channelId);
-		return this.watchedFundings.delete(channelId.toString('hex'));
+		const key = channelId.toString('hex');
+		const watched = this.watchedFundings.get(key);
+		if (watched?.finalFundingValueSat !== undefined)
+			this.setFinalFundingDepth(watched, 0);
+		return this.watchedFundings.delete(key);
 	}
 
 	/**
@@ -1005,6 +1014,10 @@ export class ChainWatcher extends EventEmitter {
 		if (this._recheckTimer) {
 			clearInterval(this._recheckTimer);
 			this._recheckTimer = null;
+		}
+		for (const watched of this.watchedFundings.values()) {
+			if (watched.finalFundingValueSat !== undefined)
+				this.setFinalFundingDepth(watched, 0);
 		}
 		this.watchedFundings.clear();
 		this.channelSpendScans.clear();
@@ -1063,27 +1076,78 @@ export class ChainWatcher extends EventEmitter {
 		// naming a height the chain no longer has.
 		seenHeight?: number
 	): Promise<void> {
-		if (!this.isCurrentGeneration(generation)) return;
-		const scriptHash = computeScriptHash(scriptPubkey);
-		const key = channelId.toString('hex');
+		return this.registerFundingWatch(
+			channelId,
+			txid,
+			outputIndex,
+			minimumDepth,
+			scriptPubkey,
+			generation,
+			{
+				seenHeight,
+				seenTxid: seenHeight !== undefined ? txid : undefined,
+				candidates: candidates?.length ? candidates : undefined,
+				discoverAttemptInputs: discoverAttemptInputs?.length
+					? discoverAttemptInputs
+					: undefined
+			}
+		);
+	}
 
+	/** Keep checking the authenticated regtest funding output after it reaches depth. */
+	watchFinalFundingOutput(
+		channelId: Buffer,
+		txid: string,
+		outputIndex: number,
+		minimumDepth: number,
+		script: Buffer,
+		valueSat: number
+	): Promise<void> {
+		return this.registerFundingWatch(
+			channelId,
+			txid,
+			outputIndex,
+			minimumDepth,
+			script,
+			this.lifecycleGeneration,
+			{ finalFundingValueSat: valueSat }
+		);
+	}
+
+	private async registerFundingWatch(
+		channelId: Buffer,
+		txid: string,
+		outputIndex: number,
+		minimumDepth: number,
+		script: Buffer,
+		generation: number,
+		options: Pick<
+			IWatchedFunding,
+			| 'seenHeight'
+			| 'seenTxid'
+			| 'candidates'
+			| 'discoverAttemptInputs'
+			| 'finalFundingValueSat'
+		>
+	): Promise<void> {
+		if (!this.isCurrentGeneration(generation)) return;
+		const scriptHash = computeScriptHash(script);
+		const key = channelId.toString('hex');
 		const watched: IWatchedFunding = {
 			channelId,
 			txid,
 			outputIndex,
 			minimumDepth,
+			script,
 			scriptHash,
 			confirmed: false,
 			confirmationHeight: 0,
 			announcementTriggered: false,
-			seenHeight,
-			seenTxid: seenHeight !== undefined ? txid : undefined,
-			candidates: candidates?.length ? candidates : undefined,
-			script: scriptPubkey,
-			discoverAttemptInputs: discoverAttemptInputs?.length
-				? discoverAttemptInputs
-				: undefined
+			...options
 		};
+		const previous = this.watchedFundings.get(key);
+		if (previous?.finalFundingValueSat !== undefined)
+			this.setFinalFundingDepth(previous, 0);
 
 		this.watchedFundings.set(key, watched);
 
@@ -1865,7 +1929,16 @@ export class ChainWatcher extends EventEmitter {
 		// watcher that is no longer watching.
 		if (!this.started) return;
 		const generation = this.lifecycleGeneration;
+		const replacedTip =
+			this.tipGeneration === generation && height <= this.currentBlockHeight;
+		this.tipGeneration = generation;
 		this.currentBlockHeight = height;
+		if (replacedTip) {
+			for (const watched of this.watchedFundings.values()) {
+				if (watched.finalFundingValueSat !== undefined)
+					this.setFinalFundingDepth(watched, 0);
+			}
+		}
 
 		// Retry failed funding watch subscriptions
 		if (this.failedFundingWatches.length > 0) {
@@ -1929,7 +2002,7 @@ export class ChainWatcher extends EventEmitter {
 		// Check all watched fundings for confirmation, announcement depth and
 		// the spend that closes the channel.
 		for (const [key, watched] of this.watchedFundings) {
-			if (!watched.confirmed) {
+			if (!watched.confirmed || watched.finalFundingValueSat !== undefined) {
 				this.checkFundingConfirmation(key, generation).catch((err) => {
 					this.emitError(err);
 				});
@@ -2049,7 +2122,10 @@ export class ChainWatcher extends EventEmitter {
 	private onFundingScriptHashChange(key: string, generation: number): void {
 		const watched = this.watchedFundings.get(key);
 		if (!watched) return;
-		if (!watched.confirmed) {
+		// A script notification can be a spend or a reorg. Revalidate before replay.
+		if (watched.finalFundingValueSat !== undefined)
+			this.setFinalFundingDepth(watched, 0);
+		if (!watched.confirmed || watched.finalFundingValueSat !== undefined) {
 			this.checkFundingConfirmation(key, generation).catch((err) => {
 				this.emitError(err);
 			});
@@ -2138,6 +2214,69 @@ export class ChainWatcher extends EventEmitter {
 		}
 	}
 
+	private setFinalFundingDepth(watched: IWatchedFunding, height: number): void {
+		const atDepth =
+			this.tipGeneration === this.lifecycleGeneration &&
+			Number.isSafeInteger(height) &&
+			height > 0 &&
+			this.currentBlockHeight - height + 1 >= watched.minimumDepth;
+		watched.confirmationHeight = height;
+		if (atDepth === watched.confirmed) return;
+		watched.confirmed = atDepth;
+		if (atDepth) {
+			try {
+				this.channelManager.handleFundingConfirmed(
+					watched.channelId,
+					watched.txid
+				);
+			} catch (error) {
+				// Retry preparing or delivering ready on the next live chain observation.
+				this.setFinalFundingDepth(watched, 0);
+				throw error;
+			}
+			this.emit('funding:confirmed', watched.channelId, watched.txid);
+		} else {
+			this.emit('funding:depth-lost', watched.channelId, watched.txid);
+		}
+	}
+
+	private async checkFinalFundingDepth(
+		key: string,
+		watched: IWatchedFunding,
+		generation: number
+	): Promise<void> {
+		const ticket = (watched.nextScanTicket ?? 0) + 1;
+		watched.nextScanTicket = ticket;
+		const current = (): boolean =>
+			this.isCurrentGeneration(generation) &&
+			this.watchedFundings.get(key) === watched &&
+			watched.nextScanTicket === ticket;
+		let coins;
+		try {
+			if (!this.backend.listUnspent)
+				throw new Error('Final funding requires an unspent output lookup');
+			coins = await this.backend.listUnspent(watched.scriptHash);
+		} catch (error) {
+			if (!current()) return;
+			this.setFinalFundingDepth(watched, 0);
+			throw error;
+		}
+		if (!current()) return;
+		const funding = coins.find(
+			(coin) =>
+				coin.txid === watched.txid &&
+				coin.outputIndex === watched.outputIndex &&
+				coin.valueSat === watched.finalFundingValueSat
+		);
+		if (funding) {
+			// This UTXO also supersedes any spend lookup still reading an older history.
+			const outpoint = watched.txid + ':' + watched.outputIndex;
+			this.recordScanCompleted(key, outpoint, this.beginSpendScan(key));
+		}
+		this.setFinalFundingDepth(watched, funding?.height ?? 0);
+		if (!funding) await this.checkFundingSpent(watched, generation, key);
+	}
+
 	private async checkFundingConfirmation(
 		key: string,
 		// Defaults to the current generation for callers that ARE the start of
@@ -2146,7 +2285,10 @@ export class ChainWatcher extends EventEmitter {
 	): Promise<void> {
 		if (!this.isCurrentGeneration(generation)) return;
 		const watched = this.watchedFundings.get(key);
-		if (!watched || watched.confirmed) return;
+		if (!watched) return;
+		if (watched.finalFundingValueSat !== undefined)
+			return this.checkFinalFundingDepth(key, watched, generation);
+		if (watched.confirmed) return;
 		// Checks for one watch can overlap (a subscription callback, a block
 		// and the recheck timer all start them), and each one holds a history
 		// it fetched before its awaits. Whatever this scan concludes is only

@@ -11,10 +11,20 @@ import {
 export interface IFinalOpeningSession {
 	peer: string;
 	channelKeyIndex: number;
+	remoteSecondPerCommitmentPoint?: string;
 	terms: import('../channel/final-opening-commitment').IFinalOpeningTerms;
 }
 
+export interface IFinalReestablishNonce {
+	generation: number;
+	nonce: string;
+}
+
 export interface IFinalOpeningNonces {
+	localReady?: string;
+	peerReady?: string;
+	localReconnect?: IFinalReestablishNonce;
+	peerReconnect?: IFinalReestablishNonce;
 	session?: IFinalOpeningSession;
 	local?: { salt: string; payload: string };
 	peer?: string;
@@ -69,6 +79,10 @@ export function decodeOpeningNonces(
 				key !== 'local' &&
 				key !== 'peer' &&
 				key !== 'signing' &&
+				key !== 'localReady' &&
+				key !== 'peerReady' &&
+				key !== 'localReconnect' &&
+				key !== 'peerReconnect' &&
 				key !== 'session'
 		)
 	)

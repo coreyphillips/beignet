@@ -334,6 +334,221 @@ describe('Phase 4: Chain Watcher', () => {
 			watcher.stop();
 		});
 
+		it('tracks the exact final funding output across depth loss, spending and reconfirmation', async () => {
+			const channelId = crypto.randomBytes(32);
+			const txid = crypto.randomBytes(32).toString('hex');
+			const script = Buffer.concat([
+				Buffer.from([0x51, 32]),
+				crypto.randomBytes(32)
+			]);
+			const scriptHash = computeScriptHash(script);
+			const coin = { txid, outputIndex: 1, valueSat: 150000, height: 98 };
+			let coins = [coin];
+			let offline = false;
+			Object.assign(backend, {
+				listUnspent: async (hash: string) => {
+					expect(hash).to.equal(scriptHash);
+					if (offline) throw new Error('chain unavailable');
+					return coins;
+				}
+			});
+			const events: string[] = [];
+			watcher.on('funding:confirmed', () => events.push('confirmed'));
+			watcher.on('funding:depth-lost', () => events.push('lost'));
+			const settle = (): Promise<void> =>
+				new Promise<void>((resolve) => setImmediate(resolve));
+			await watcher.watchFinalFundingOutput(
+				channelId,
+				txid,
+				1,
+				3,
+				script,
+				coin.valueSat
+			);
+			backend.simulateNewBlock(99);
+			await settle();
+			expect(events).to.deep.equal([]);
+			backend.simulateNewBlock(100);
+			await settle();
+			backend.simulateNewBlock(99);
+			await settle();
+			expect(events).to.deep.equal(['confirmed', 'lost']);
+			backend.simulateNewBlock(100);
+			await settle();
+			coins = [
+				{ ...coin, outputIndex: 0 },
+				{ ...coin, height: 0 },
+				{ ...coin, valueSat: coin.valueSat + 1 },
+				{ ...coin, txid: 'ab'.repeat(32) }
+			];
+			backend.simulateScriptHashChange(scriptHash);
+			await settle();
+			expect(events).to.deep.equal(['confirmed', 'lost', 'confirmed', 'lost']);
+			coins = [coin];
+			watcher.recheckAllWatches();
+			await settle();
+			offline = true;
+			watcher.recheckAllWatches();
+			await settle();
+			offline = false;
+			watcher.recheckAllWatches();
+			await settle();
+			expect(events.slice(4)).to.deep.equal(['confirmed', 'lost', 'confirmed']);
+		});
+
+		it('discards a delayed final funding verdict superseded by a script notification', async () => {
+			const channelId = crypto.randomBytes(32);
+			const txid = crypto.randomBytes(32).toString('hex');
+			const script = Buffer.concat([
+				Buffer.from([0x51, 32]),
+				crypto.randomBytes(32)
+			]);
+			const coin = { txid, outputIndex: 0, valueSat: 30000, height: 100 };
+			let release!: () => void;
+			const stale = new Promise<void>((resolve) => {
+				release = resolve;
+			});
+			let reads = 0;
+			Object.assign(backend, {
+				listUnspent: async () => {
+					if (++reads !== 1) return [];
+					await stale;
+					return [coin];
+				}
+			});
+			const confirmations: string[] = [];
+			watcher.on('funding:confirmed', (_id, hash) => confirmations.push(hash));
+			backend.simulateNewBlock(100);
+			const watch = watcher.watchFinalFundingOutput(
+				channelId,
+				txid,
+				0,
+				1,
+				script,
+				coin.valueSat
+			);
+			await new Promise<void>((resolve) => setImmediate(resolve));
+			backend.simulateScriptHashChange(computeScriptHash(script));
+			release();
+			await watch;
+			expect(reads).to.equal(2);
+			expect(confirmations).to.deep.equal([]);
+		});
+
+		it('withdraws final readiness immediately on a replacement tip or script change', async () => {
+			const id = crypto.randomBytes(32);
+			const script = Buffer.concat([
+				Buffer.from([0x51, 32]),
+				crypto.randomBytes(32)
+			]);
+			const coin = {
+				txid: '3b'.repeat(32),
+				outputIndex: 0,
+				valueSat: 90000,
+				height: 40
+			};
+			let pending = Promise.resolve();
+			Object.assign(backend, {
+				listUnspent: async () => {
+					await pending;
+					return [coin];
+				}
+			});
+			let ready = false;
+			watcher.on('funding:confirmed', () => {
+				ready = true;
+			});
+			watcher.on('funding:depth-lost', () => {
+				ready = false;
+			});
+			backend.simulateNewBlock(42);
+			const watch = (): Promise<void> =>
+				watcher.watchFinalFundingOutput(
+					id,
+					coin.txid,
+					0,
+					3,
+					script,
+					coin.valueSat
+				);
+			await watch();
+			expect(ready).to.equal(true);
+			for (const notify of [
+				(): void => backend.simulateNewBlock(42),
+				(): void => backend.simulateScriptHashChange(computeScriptHash(script))
+			]) {
+				let release!: () => void;
+				pending = new Promise<void>((resolve) => {
+					release = resolve;
+				});
+				notify();
+				expect(ready).to.equal(false);
+				release();
+				await new Promise<void>((resolve) => setImmediate(resolve));
+				expect(ready).to.equal(true);
+			}
+			watcher.stop();
+			expect(ready).to.equal(false);
+			await watcher.start();
+			await watch();
+			expect(ready, 'restart needs a new tip').to.equal(false);
+			backend.simulateNewBlock(43);
+			await new Promise<void>((resolve) => setImmediate(resolve));
+			expect(ready).to.equal(true);
+			watcher.removeWatchedFunding(id);
+			expect(ready).to.equal(false);
+		});
+
+		it('discards a delayed final funding spend after the exact output returns', async () => {
+			const id = crypto.randomBytes(32);
+			const script = Buffer.concat([
+				Buffer.from([0x51, 32]),
+				crypto.randomBytes(32)
+			]);
+			const scriptHash = computeScriptHash(script);
+			const coin = {
+				txid: '6e'.repeat(32),
+				outputIndex: 1,
+				valueSat: 90000,
+				height: 98
+			};
+			const spend = new bitcoin.Transaction();
+			spend.addInput(Buffer.from(coin.txid, 'hex').reverse(), coin.outputIndex);
+			spend.addOutput(Buffer.from([0x51]), 88000);
+			let coins = [coin];
+			Object.assign(backend, { listUnspent: async () => coins });
+			const events: string[] = [];
+			watcher.on('funding:confirmed', () => events.push('confirmed'));
+			watcher.on('funding:spent', () => events.push('spent'));
+			const settle = (): Promise<void> =>
+				new Promise<void>((resolve) => setImmediate(resolve));
+			backend.simulateNewBlock(100);
+			await watcher.watchFinalFundingOutput(
+				id,
+				coin.txid,
+				coin.outputIndex,
+				3,
+				script,
+				coin.valueSat
+			);
+			coins = [];
+			backend.setHistory(scriptHash, [{ txid: spend.getId(), height: 100 }]);
+			backend.setTransaction(spend.getId(), spend.toBuffer());
+			backend.holdTransactions();
+			backend.simulateScriptHashChange(scriptHash);
+			await settle();
+			// A replacement branch restores this coin while the old spender is in flight.
+			coins = [coin];
+			backend.setHistory(scriptHash, [
+				{ txid: coin.txid, height: coin.height }
+			]);
+			backend.simulateScriptHashChange(scriptHash);
+			await settle();
+			backend.releaseNextTransaction();
+			await settle();
+			expect(events).to.deep.equal(['confirmed', 'confirmed']);
+		});
+
 		it('should detect funding confirmation at minimum depth', async () => {
 			const channelId = crypto.randomBytes(32);
 			const txid = crypto.randomBytes(32).toString('hex');

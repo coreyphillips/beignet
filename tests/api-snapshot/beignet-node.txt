@@ -762,7 +762,7 @@ property ChannelSendStatus.record?: beignet/lightning#channel.ICompositeSpliceRe
 property ChannelSendStatus.stage: ChannelSendStage
 property ChannelSendStatus.startedAt: number
 property ChannelSendStatus.txid?: TxidHex
-type ChannelStateString = 'NONE' | 'AWAITING_FUNDING_CONFIRMED' | 'AWAITING_CHANNEL_READY' | 'NORMAL' | 'SHUTTING_DOWN' | 'NEGOTIATING_CLOSING' | 'FORCE_CLOSED' | 'AWAITING_REESTABLISH' | 'CLOSED' | 'ERRORED' | 'ANNOUNCEMENT_READY'
+type ChannelStateString = 'NONE' | 'AWAITING_FUNDING_CONFIRMED' | 'AWAITING_CHANNEL_READY' | 'CHANNEL_READY' | 'NORMAL' | 'SHUTTING_DOWN' | 'NEGOTIATING_CLOSING' | 'FORCE_CLOSED' | 'AWAITING_REESTABLISH' | 'CLOSED' | 'ERRORED' | 'ANNOUNCEMENT_READY'
 interface ChannelSuggestion
 property ChannelSuggestion.alias?: string
 property ChannelSuggestion.channelCount: number

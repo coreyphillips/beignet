@@ -47,6 +47,7 @@ unexported interface IFinalDaemonOpening
 property IFinalDaemonOpening.candidate: IFinalOpeningCandidate
 property IFinalDaemonOpening.exitToBroadcast?: Buffer
 property IFinalDaemonOpening.funding?: Buffer
+property IFinalDaemonOpening.readyExchanged?: true
 property IFinalDaemonOpening.session: IFinalOpeningSession
 unexported interface IFinalOpeningCandidate
 property IFinalOpeningCandidate.channelId: string
@@ -65,6 +66,7 @@ property IFinalOpeningCandidate.remoteFundingPubkey: string
 unexported interface IFinalOpeningSession
 property IFinalOpeningSession.channelKeyIndex: number
 property IFinalOpeningSession.peer: string
+property IFinalOpeningSession.remoteSecondPerCommitmentPoint?: string
 property IFinalOpeningSession.terms: IFinalOpeningTerms
 unexported interface IFinalOpeningTerms
 property IFinalOpeningTerms.commitmentFeeratePerKw: number
@@ -185,6 +187,7 @@ method SqliteStorage.deleteRecoveryFramesBelow(sequence: number): void
 method SqliteStorage.deleteRecoveryMeta(key: string): void
 method SqliteStorage.deleteWatchtowerTower(towerUri: string): void
 method SqliteStorage.deleteWebhook(id: string): void
+method SqliteStorage.finalOpeningChannelReady(channelId: string, root: bip32#BIP32Interface): Buffer
 method SqliteStorage.finalOpeningTxComplete(channelId: string, fundingPrivateKey: Buffer): Buffer
 method SqliteStorage.finalOpeningTxSignatures(channelId: string, sign: FinalFundingWitnessSigner): Buffer
 property SqliteStorage.forwardingEventsMaxRows: number
@@ -225,9 +228,12 @@ method SqliteStorage.loadChannel(id: string): { state: beignet/lightning#channel
 method SqliteStorage.loadChannelKeyIndex(channelId: string): number | null
 method SqliteStorage.loadCompositeSplice(id: string): beignet/lightning#channel.ICompositeSpliceRecord | null
 method SqliteStorage.loadFforVoucher(id: string): beignet/lightning#ffor.IFforVoucherArchive | null
+method SqliteStorage.loadFinalCommitmentOneNonces(channelId: string): { local: Buffer; peer: Buffer; } | null
 method SqliteStorage.loadFinalDaemonOpening(channelId: string): IFinalDaemonOpening | null
 method SqliteStorage.loadFinalDaemonOpenings(): IFinalDaemonOpening[]
 method SqliteStorage.loadFinalFundingTransaction(channelId: string): Buffer | null
+method SqliteStorage.loadFinalLocalChannelReady(channelId: string): Buffer | null
+method SqliteStorage.loadFinalLocalReestablishNonce(channelId: string): Buffer | null
 method SqliteStorage.loadFinalLocalTxComplete(channelId: string): Buffer | null
 method SqliteStorage.loadFinalLocalTxSignatures(channelId: string): Buffer | null
 method SqliteStorage.loadFinalOpening(channelId: string): IFinalOpeningCandidate | null
@@ -235,7 +241,9 @@ method SqliteStorage.loadFinalOpeningExit(channelId: string): Buffer | null
 method SqliteStorage.loadFinalOpeningSession(channelId: string): IFinalOpeningSession | null
 method SqliteStorage.loadFinalOpeningTerms(channelId: string): IFinalOpeningTerms | null
 method SqliteStorage.loadFinalOpenings(): IFinalOpeningCandidate[]
+method SqliteStorage.loadFinalPeerChannelReady(channelId: string): Buffer | null
 method SqliteStorage.loadFinalPeerCommitment(channelId: string): Buffer | null
+method SqliteStorage.loadFinalPeerReestablishNonce(channelId: string): Buffer | null
 method SqliteStorage.loadFinalPeerTxComplete(channelId: string): Buffer | null
 method SqliteStorage.loadFinalPeerTxSignatures(channelId: string): Buffer | null
 method SqliteStorage.loadGossipChannelsAfter(afterRowid: number, limit: number): beignet/lightning#storage.IGossipRowPage<beignet/lightning#gossip.IGraphChannel>
@@ -264,9 +272,12 @@ method SqliteStorage.paymentsNewestFirst(since?: number, match?: IPaymentRowMatc
 method SqliteStorage.pruneOutboxMessages(channelId: string, keepNewest: number): void
 method SqliteStorage.recoveryFrameStats(): { count: number; minSequence: number; maxSequence: number; } | null
 method SqliteStorage.rememberFinalOpening(candidate: IFinalOpeningCandidate): void
-method SqliteStorage.rememberFinalOpeningSession(candidate: IFinalOpeningCandidate, peer: string, terms: IFinalOpeningTerms, channelKeyIndex: number): void
+method SqliteStorage.rememberFinalOpeningSession(candidate: IFinalOpeningCandidate, peer: string, terms: IFinalOpeningTerms, channelKeyIndex: number, remoteSecondPerCommitmentPoint?: string): void
+method SqliteStorage.rememberFinalPeerChannelReady(channelId: string, payload: Buffer, requireAlias?: boolean): void
+method SqliteStorage.rememberFinalPeerReestablishNonce(channelId: string, nonce: Buffer): void
 method SqliteStorage.rememberFinalPeerTxComplete(channelId: string, payload: Buffer): void
 method SqliteStorage.rememberFinalPeerTxSignatures(channelId: string, payload: Buffer): void
+method SqliteStorage.renewFinalReestablishNonce(channelId: string, root: bip32#BIP32Interface): Buffer
 method SqliteStorage.requestFinalOpeningExit(channelId: string): Buffer
 method SqliteStorage.revokedHtlcSnapshotStore(): object
 method SqliteStorage.saveActionLog(entry: { category: string; action: string; timestamp: number; data: string; }): void

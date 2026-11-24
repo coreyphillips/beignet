@@ -1465,6 +1465,7 @@ Channels progress through these states:
 |-------|-------------------|-------------|
 | `AWAITING_FUNDING_CONFIRMED` | No | Funding tx broadcast, waiting for on-chain confirmations |
 | `AWAITING_CHANNEL_READY` | No | Funding confirmed, exchanging `channel_ready` messages |
+| `CHANNEL_READY` | No | Private final type-80 peers have exchanged readiness at funding depth |
 | `NORMAL` | **Yes** | Fully operational — HTLCs can be sent and received |
 | `AWAITING_REESTABLISH` | No | Reconnected after disconnect, re-syncing state |
 | `SHUTTING_DOWN` | No | Cooperative close initiated, no new HTLCs |
@@ -1957,7 +1958,9 @@ that primary's relay later.
 
 To test a private final type-80 opening, initialize two fresh regtest wallets with `beignet init --network regtest --final-taproot-wallet`. Connect the peers, fund the opener, then run `beignet channel open-v2 <pubkey> <sats> --final-taproot`. The HTTP equivalent is `POST /channel/open-v2` with `finalTaproot: true`.
 
-Each original wallet records its enforceable local exit before sending funding witnesses. Restart it with the same wallet directory to resume the exchange. `GET /channels` reports the funding outpoint and opening state. After funding confirms, this rollout waits at `AWAITING_CHANNEL_READY`. Payments, collaborative closing and splicing on this channel are pending. `beignet channel forceclose <channelId>` broadcasts the saved first commitment. Spending its delayed output after the CSV delay is a separate recovery operation. Keep the original wallet directory and its device journal together. Encrypted SQLite backups can supply saved messages and already signed exits through the storage API.
+Each original wallet records its enforceable local exit before sending funding witnesses. At the negotiated confirmation depth, both peers save and exchange `channel_ready`. Check `GET /channels` for `CHANNEL_READY`. If the peer disconnects at depth, the channel waits at `AWAITING_REESTABLISH`. On reconnect each original advertises a fresh verification nonce for this funding transaction. A reorg below depth returns the channel to `AWAITING_FUNDING_CONFIRMED`. The peers can replay their saved readiness messages once the funding output reaches depth again. Payment support, cooperative closing and splicing remain pending for this profile.
+
+Restart with the same wallet directory and device journal. Encrypted SQLite backups can supply the saved messages and signed exit through the storage API. Use `beignet channel forceclose <channelId>` on the original daemon to broadcast the saved commitment. Spending its delayed output after the CSV delay is a separate recovery operation.
 
 ```bash
 beignet channel open <pubkey> <sats> [pushSats]

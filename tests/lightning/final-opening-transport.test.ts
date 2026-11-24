@@ -5,7 +5,10 @@ import path from 'path';
 import { FinalOpeningTransport } from '../../src/lightning/channel/final-opening-transport';
 import type { IFundingProvider } from '../../src/lightning/node/types';
 import { MessageType } from '../../src/lightning/message/types';
-import { encodeChannelReestablishMessage } from '../../src/lightning/message/channel-reestablish';
+import {
+	decodeChannelReestablishMessage,
+	encodeChannelReestablishMessage
+} from '../../src/lightning/message/channel-reestablish';
 import { SqliteStorage } from '../../src/lightning/storage/sqlite-storage';
 import { alice, bob, signingFixture } from './helpers/final-opening-signing';
 
@@ -147,6 +150,14 @@ describe('Final opening transport across backend and peer outages', () => {
 		};
 		A.reconnected(bob.binding.nodeId);
 		B.reconnected(alice.binding.nodeId);
+		for (const message of sent) {
+			const reestablish = decodeChannelReestablishMessage(message.payload, {
+				finalTaproot: true
+			});
+			expect(reestablish.nextCommitmentNumber).to.equal(1n);
+			expect(reestablish.nextFundingRetransmitFlags).to.equal(1);
+			expect(reestablish.currentCommitNonce).to.be.instanceOf(Buffer);
+		}
 		await deliver(MessageType.CHANNEL_REESTABLISH);
 		expect(sent.map((msg) => msg.payload.toString('hex'))).to.have.members(
 			before.map((raw) => raw!.toString('hex'))

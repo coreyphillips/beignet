@@ -1048,7 +1048,6 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 	/** Funding provider used to attach wallet inputs for anchor fee bumps. */
 	private fundingProvider: IFundingProvider | null = null;
 	private readonly finalTransport?: FinalOpeningTransport;
-	private readonly confirmedFinalOpenings = new Set<string>();
 	private readonly finalPeerComplete = new WeakMap<
 		Channel,
 		{ tx: string; payload: Buffer }
@@ -1149,7 +1148,29 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 						hash
 					);
 				},
-				(id, reason) => this.emitContained('error', id, reason)
+				(id, reason) => this.emitContained('error', id, reason),
+				(peer) => {
+					const local = this.config.localFeatures;
+					const remote = this.peerManager?.getPeer(peer)?.getRemoteInit()
+						?.features;
+					const both = (feature: Feature): boolean =>
+						!!local?.hasFeature(feature) && !!remote?.hasFeature(feature);
+					return {
+						alias: both(Feature.SCID_ALIAS),
+						splice: both(Feature.SPLICE) && both(Feature.QUIESCE)
+					};
+				},
+				(peer, id, reason) => {
+					const storage = config.finalOpening!.storage;
+					if (storage.loadFinalFundingTransaction(id.toString('hex'))) {
+						const exit = storage.requestFinalOpeningExit(id.toString('hex'));
+						this.finalTransport?.closed(peer, id.toString('hex'));
+						this.emit('broadcast:tx', exit);
+						const wire = wireErrorPayloadFor(id, reason);
+						if (wire) this.sendMessage(peer, MessageType.ERROR, wire);
+					}
+					this.emitContained('error', id, reason);
+				}
 			);
 		}
 	}
@@ -3846,7 +3867,13 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 	 * included.
 	 */
 	listChannelPeers(): string[] {
-		return [...new Set(this.channelPeers.values())];
+		return [
+			...new Set([...this.channelPeers.values(), ...this.finalOpeningPeers()])
+		];
+	}
+
+	finalOpeningPeers(): string[] {
+		return Array.from(this.finalTransport?.peers() ?? []);
 	}
 
 	/**
@@ -3863,12 +3890,15 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 	 * listChannelPeers, a peer with only a pending open does not count.
 	 */
 	hasChannelWithPeer(pubkey: string): boolean {
-		return this.getOwnChannelIndex().peers.has(pubkey);
+		return this.countChannelsWithPeer(pubkey) > 0;
 	}
 
 	/** How many of `pubkey`'s channels hasChannelWithPeer counts. */
 	countChannelsWithPeer(pubkey: string): number {
-		return this.getOwnChannelIndex().peers.get(pubkey) ?? 0;
+		return (
+			(this.getOwnChannelIndex().peers.get(pubkey) ?? 0) +
+			(this.finalTransport?.count(pubkey) ?? 0)
+		);
 	}
 
 	private getOwnChannelIndex(): {
@@ -3923,7 +3953,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 				confirmedTxidHex ===
 				bitcoin.Transaction.fromHex(final.candidate.fundingTxHex).getId()
 			)
-				this.confirmedFinalOpenings.add(final.candidate.channelId);
+				this.finalTransport?.fundingDepth(final.candidate.channelId, true);
 			return;
 		}
 		const channel = this.channels.get(channelId.toString('hex'));
@@ -4047,10 +4077,12 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 	): ChannelResult {
 		const idHex = channelId.toString('hex');
 		const storage = this.config.finalOpening?.storage;
-		if (storage?.loadFinalOpeningSession(idHex)) {
+		const finalSession = storage?.loadFinalOpeningSession(idHex);
+		if (storage && finalSession) {
 			let exit: Buffer;
 			try {
 				exit = storage.requestFinalOpeningExit(idHex);
+				this.finalTransport?.closed(finalSession.peer, idHex);
 			} catch (err) {
 				return {
 					ok: false,
@@ -5127,6 +5159,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 						type === MessageType.TX_COMPLETE ||
 						type === MessageType.COMMITMENT_SIGNED ||
 						type === MessageType.TX_SIGNATURES ||
+						type === MessageType.CHANNEL_READY ||
 						type === MessageType.CHANNEL_REESTABLISH
 					)
 						this.finalTransport.queue(peerPubkey, id, {
@@ -9620,7 +9653,8 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			tx.getId(),
 			candidate.fundingOutputIndex,
 			candidate.minimumDepth,
-			tx.outs[candidate.fundingOutputIndex].script
+			tx.outs[candidate.fundingOutputIndex].script,
+			tx.outs[candidate.fundingOutputIndex].value
 		);
 	}
 
@@ -9637,7 +9671,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 	}
 
 	forgetFinalFundingConfirmation(id: Buffer): void {
-		this.confirmedFinalOpenings.delete(id.toString('hex'));
+		this.finalTransport?.fundingDepth(id.toString('hex'), false);
 	}
 
 	finalOpeningInfo(id?: Buffer): IChannelInfo[] {
@@ -9649,29 +9683,36 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 				? [opening]
 				: []
 			: storage.loadFinalDaemonOpenings();
-		return openings.map(({ candidate, session, funding, exitToBroadcast }) => ({
-			channelId: Buffer.from(candidate.channelId, 'hex'),
-			channelType: Buffer.from(candidate.channelType, 'hex'),
-			peerPubkey: session.peer,
-			isPrivate: true,
-			isOpener: candidate.isInitiator,
-			state: exitToBroadcast
-				? ChannelState.FORCE_CLOSED
-				: this.confirmedFinalOpenings.has(candidate.channelId)
-				? ChannelState.AWAITING_CHANNEL_READY
-				: funding
-				? ChannelState.AWAITING_FUNDING_CONFIRMED
-				: ChannelState.AWAITING_TX_SIGNATURES,
-			fundingTxid: bitcoin.Transaction.fromHex(candidate.fundingTxHex).getId(),
-			fundingOutputIndex: candidate.fundingOutputIndex,
-			localBalanceMsat: BigInt(candidate.localContributionSats) * 1000n,
-			remoteBalanceMsat: BigInt(candidate.remoteContributionSats) * 1000n,
-			fundingSatoshis:
-				BigInt(candidate.localContributionSats) +
-				BigInt(candidate.remoteContributionSats),
-			spendableOutboundMsat: 0n,
-			htlcUsable: false
-		}));
+		return openings.map(
+			({ candidate, session, funding, exitToBroadcast, readyExchanged }) => ({
+				channelId: Buffer.from(candidate.channelId, 'hex'),
+				channelType: Buffer.from(candidate.channelType, 'hex'),
+				peerPubkey: session.peer,
+				isPrivate: true,
+				isOpener: candidate.isInitiator,
+				state: exitToBroadcast
+					? ChannelState.FORCE_CLOSED
+					: this.finalTransport?.state(
+							candidate.channelId,
+							!!funding,
+							!!readyExchanged
+					  ) ??
+					  (funding
+							? ChannelState.AWAITING_FUNDING_CONFIRMED
+							: ChannelState.AWAITING_TX_SIGNATURES),
+				fundingTxid: bitcoin.Transaction.fromHex(
+					candidate.fundingTxHex
+				).getId(),
+				fundingOutputIndex: candidate.fundingOutputIndex,
+				localBalanceMsat: BigInt(candidate.localContributionSats) * 1000n,
+				remoteBalanceMsat: BigInt(candidate.remoteContributionSats) * 1000n,
+				fundingSatoshis:
+					BigInt(candidate.localContributionSats) +
+					BigInt(candidate.remoteContributionSats),
+				spendableOutboundMsat: 0n,
+				htlcUsable: false
+			})
+		);
 	}
 
 	private finalOpeningRefusal(
@@ -10806,12 +10847,18 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			channel.channelKeyIndex === null
 		)
 			throw new Error('Missing opening key index');
+		const session = channel.getDualFundingSession()!;
+		const remote = candidate.isInitiator
+			? session.getAcceptMsg()!
+			: session.getOpenMsg()!;
 		runtime.storage.rememberFinalOpeningSession(
 			candidate,
 			peer,
 			terms,
-			channel.channelKeyIndex
+			channel.channelKeyIndex,
+			remote.secondPerCommitmentPoint.toString('hex')
 		);
+		this.finalTransport.opened(peer, candidate.channelId);
 		this.removeCurrentTempChannel(peer, channel);
 		this.watchFinalOpening(candidate);
 		const complete = this.finalPeerComplete.get(channel);
@@ -11452,7 +11499,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 					(opening) =>
 						!opening.candidate.isInitiator &&
 						opening.session.peer === peerPubkey &&
-						!this.confirmedFinalOpenings.has(opening.candidate.channelId)
+						!this.finalTransport?.hasDepth(opening.candidate.channelId)
 				).length ?? 0;
 		for (const [tempId, channel] of this.tempChannels) {
 			if (

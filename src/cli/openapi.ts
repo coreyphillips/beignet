@@ -6042,6 +6042,7 @@ export function getOpenApiSpec(): Record<string, unknown> {
 								'NONE',
 								'AWAITING_FUNDING_CONFIRMED',
 								'AWAITING_CHANNEL_READY',
+								'CHANNEL_READY',
 								'NORMAL',
 								'SHUTTING_DOWN',
 								'NEGOTIATING_CLOSING',

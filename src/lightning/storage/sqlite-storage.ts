@@ -34,6 +34,19 @@ import {
 	signOpening,
 	verifyOpeningSigning
 } from './final-opening-signing';
+import { decodeChannelReadyMessage } from '../message/channel-funding';
+import {
+	requireSameReadyPromise,
+	makeReadyPayload,
+	preservesReconnectNonce,
+	readyKeys,
+	readyVerificationNonce,
+	requireReadySession,
+	verifyReady,
+	verifyReadyNonce,
+	verifyStoredReadiness
+} from './final-opening-ready';
+import { Feature, FeatureFlags } from '../features/flags';
 import { validateFinalOpening } from './final-opening-candidate';
 import type { IFinalOpeningCandidate } from './final-opening-candidate';
 import {
@@ -184,6 +197,7 @@ interface IFinalDaemonOpening {
 	session: IFinalOpeningSession;
 	funding?: Buffer;
 	exitToBroadcast?: Buffer;
+	readyExchanged?: true;
 }
 
 interface IFinalOpeningRecord {
@@ -370,6 +384,20 @@ function decodeRecoveryFrameRow(row: IRecoveryFrameRow): IStoredRecoveryFrame {
 	};
 }
 
+function validateSecondPoint(
+	point: string | undefined,
+	terms: IFinalOpeningTerms
+): void {
+	if (
+		point !== undefined &&
+		(typeof point !== 'string' ||
+			!/^(02|03)[a-f0-9]{64}$/.test(point) ||
+			!isValidPublicKey(Buffer.from(point, 'hex')) ||
+			point === terms.remoteBasepoints.firstPerCommitmentPoint)
+	)
+		throw new Error('Invalid negotiated second per-commitment point');
+}
+
 function preservesOpeningFields<T extends object>(older: T, newer: T): boolean {
 	return (Object.keys(older) as (keyof T)[]).every(
 		(field) => JSON.stringify(older[field]) === JSON.stringify(newer[field])
@@ -481,6 +509,7 @@ export class SqliteStorage implements IStorageBackend {
 				binding.encryptionKey,
 				identity
 			);
+			storage.reconcileFinalExitRequests();
 			return storage;
 		} catch (error) {
 			storage.close();
@@ -676,6 +705,7 @@ export class SqliteStorage implements IStorageBackend {
 	 * Uses SQLite's online backup API for a crash-safe copy.
 	 */
 	async backup(destPath: string): Promise<void> {
+		this.reconcileFinalExitRequests();
 		await backUpWalletFile(
 			this.db,
 			destPath,
@@ -716,10 +746,13 @@ export class SqliteStorage implements IStorageBackend {
 				throw new Error('Cannot remove a final opening from its backup');
 			const before = read(old, row);
 			const after = read(next, incoming);
-			const { signing, ...promises } = before.nonces;
+			const { signing, localReconnect, peerReconnect, ...promises } =
+				before.nonces;
 			if (
 				JSON.stringify(before.candidate) !== JSON.stringify(after.candidate) ||
 				!preservesOpeningFields(promises, after.nonces) ||
+				!preservesReconnectNonce(localReconnect, after.nonces.localReconnect) ||
+				!preservesReconnectNonce(peerReconnect, after.nonces.peerReconnect) ||
 				(signing &&
 					(!after.nonces.signing ||
 						!preservesOpeningFields(signing, after.nonces.signing)))
@@ -766,8 +799,16 @@ export class SqliteStorage implements IStorageBackend {
 			const session = nonces.session;
 			if (
 				!session ||
-				Object.keys(session).sort().join(',') !==
-					'channelKeyIndex,peer,terms' ||
+				Object.keys(session).some(
+					(k) =>
+						![
+							'channelKeyIndex',
+							'peer',
+							'terms',
+							'remoteSecondPerCommitmentPoint'
+						].includes(k)
+				) ||
+				!session.terms ||
 				!Number.isSafeInteger(session.channelKeyIndex) ||
 				session.channelKeyIndex < 0 ||
 				session.channelKeyIndex > 0x7fffffff ||
@@ -780,11 +821,22 @@ export class SqliteStorage implements IStorageBackend {
 				getIndex(candidate.channelId) !== session.channelKeyIndex
 			)
 				throw new Error('Invalid stored opening session');
+			validateSecondPoint(
+				session.remoteSecondPerCommitmentPoint,
+				session.terms
+			);
 			buildFinalOpeningCommitment(candidate, session.terms, 'local');
 			buildFinalOpeningCommitment(candidate, session.terms, 'remote');
 		}
 		if (nonces.signing !== undefined)
 			verifyOpeningSigning(candidate, nonces, getIndex(candidate.channelId));
+		verifyStoredReadiness(
+			nonces,
+			candidate.channelId,
+			FeatureFlags.fromBuffer(
+				Buffer.from(candidate.channelType, 'hex')
+			).hasFeature(Feature.SCID_ALIAS)
+		);
 		return { candidate, nonces, nonceKey };
 	}
 
@@ -873,7 +925,8 @@ export class SqliteStorage implements IStorageBackend {
 		candidate: IFinalOpeningCandidate,
 		peer: string,
 		terms: IFinalOpeningTerms,
-		channelKeyIndex: number
+		channelKeyIndex: number,
+		remoteSecondPerCommitmentPoint?: string
 	): void {
 		if (
 			!/^(02|03)[0-9a-f]{64}$/.test(peer) ||
@@ -883,10 +936,14 @@ export class SqliteStorage implements IStorageBackend {
 			throw new Error('Invalid final opening peer identity');
 		buildFinalOpeningCommitment(candidate, terms, 'local');
 		buildFinalOpeningCommitment(candidate, terms, 'remote');
+		validateSecondPoint(remoteSecondPerCommitmentPoint, terms);
 		const session = {
 			peer,
 			terms: JSON.parse(canonicalTerms(terms)) as IFinalOpeningTerms,
-			channelKeyIndex
+			channelKeyIndex,
+			...(remoteSecondPerCommitmentPoint !== undefined && {
+				remoteSecondPerCommitmentPoint
+			})
 		};
 		this.reserveFinalCandidate(candidate, session);
 	}
@@ -1204,12 +1261,201 @@ export class SqliteStorage implements IStorageBackend {
 		return hex === undefined ? null : Buffer.from(hex, 'hex');
 	}
 
+	/** Prepare the immutable height-one promise after the chain watcher confirms funding. */
+	finalOpeningChannelReady(channelId: string, root: BIP32Interface): Buffer {
+		return this.updateOpeningNonces(channelId, (state, _candidate, key) => {
+			requireReadySession(state, true);
+			if (this.finalExitRequested(channelId, state))
+				throw new Error('Opening exit already requested');
+			if (state.localReady) return Buffer.from(state.localReady, 'hex');
+			const authority = this.requireOpeningAuthority();
+			const keys = readyKeys(root, state, this.walletIdentity!);
+			const payload = makeReadyPayload(
+				channelId,
+				keys,
+				authority.nonceContext(key)
+			);
+			verifyReady(state, channelId, payload, true, true);
+			const alias = decodeChannelReadyMessage(payload).shortChannelId!;
+			if (
+				this.loadAllChannels().some(
+					({ state: channel }) =>
+						channel.scidAlias?.equals(alias) ||
+						channel.shortChannelId?.equals(alias)
+				)
+			)
+				throw new Error('Local channel_ready alias is in use');
+			authority.claim(
+				'channel-ready/alias/' + alias.toString('hex'),
+				channelId
+			);
+			state.localReady = payload.toString('hex');
+			return payload;
+		});
+	}
+
+	rememberFinalPeerChannelReady(
+		channelId: string,
+		payload: Buffer,
+		requireAlias = false
+	): void {
+		this.updateOpeningNonces(channelId, (state, candidate, key) => {
+			verifyReady(
+				state,
+				channelId,
+				payload,
+				false,
+				requireAlias ||
+					FeatureFlags.fromBuffer(
+						Buffer.from(candidate.channelType, 'hex')
+					).hasFeature(Feature.SCID_ALIAS)
+			);
+			if (state.peerReady) {
+				requireSameReadyPromise(Buffer.from(state.peerReady, 'hex'), payload);
+				return;
+			}
+			if (this.finalExitRequested(channelId, state))
+				throw new Error('Opening exit already requested');
+			const authority = this.requireOpeningAuthority();
+			const slot = 'channel-ready/peer/' + channelId;
+			const transcript = key.toString('hex');
+			const first = authority.claim(slot, transcript) ?? payload;
+			requireSameReadyPromise(first, payload);
+			authority.finish(slot, transcript, first);
+			state.peerReady = first.toString('hex');
+		});
+	}
+
+	loadFinalLocalChannelReady(channelId: string): Buffer | null {
+		const hex = this.finalOpeningRecord(channelId)?.nonces.localReady;
+		return hex ? Buffer.from(hex, 'hex') : null;
+	}
+
+	loadFinalPeerChannelReady(channelId: string): Buffer | null {
+		const hex = this.finalOpeningRecord(channelId)?.nonces.peerReady;
+		return hex ? Buffer.from(hex, 'hex') : null;
+	}
+
+	/** Inspect the height-one promises once both ready messages are known. A funded
+	 * reconnect supersedes ready in its direction even when the first ready arrives
+	 * late. Its retransmission must never roll a signer back to the older promise.
+	 */
+	loadFinalCommitmentOneNonces(
+		channelId: string
+	): { local: Buffer; peer: Buffer } | null {
+		const state = this.finalOpeningRecord(channelId)?.nonces;
+		if (
+			!state?.localReady ||
+			!state.peerReady ||
+			this.finalExitRequested(channelId, state)
+		)
+			return null;
+		const promised = (ready: string, reconnect?: { nonce: string }): Buffer =>
+			reconnect
+				? Buffer.from(reconnect.nonce, 'hex')
+				: decodeChannelReadyMessage(Buffer.from(ready, 'hex')).nextLocalNonce!;
+		return {
+			local: promised(state.localReady, state.localReconnect),
+			peer: promised(state.peerReady, state.peerReconnect)
+		};
+	}
+
+	/** Each funded reconnect advances a separate device-backed generation for commitment one. */
+	renewFinalReestablishNonce(channelId: string, root: BIP32Interface): Buffer {
+		return this.updateOpeningNonces(channelId, (state, _candidate, key) => {
+			requireReadySession(state, true);
+			if (this.finalExitRequested(channelId, state))
+				throw new Error('Opening exit already requested');
+			const authority = this.requireOpeningAuthority();
+			const context = authority.nonceContext(key);
+			const keys = readyKeys(root, state, this.walletIdentity!);
+			state.localReconnect = authority.advanceReestablishNonce(
+				'channel-reestablish/local/' + channelId,
+				key.toString('hex'),
+				state.localReconnect,
+				(generation) => {
+					const nonce = Buffer.from(
+						readyVerificationNonce(context, keys.fundingPrivkey, generation)
+					);
+					verifyReadyNonce(state, nonce, true);
+					return nonce;
+				}
+			);
+			return Buffer.from(state.localReconnect.nonce, 'hex');
+		});
+	}
+
+	rememberFinalPeerReestablishNonce(channelId: string, nonce: Buffer): void {
+		this.updateOpeningNonces(channelId, (state, _candidate, key) => {
+			requireReadySession(state, false);
+			if (this.finalExitRequested(channelId, state))
+				throw new Error('Opening exit already requested');
+			verifyReadyNonce(state, nonce, false);
+			const authority = this.requireOpeningAuthority();
+			state.peerReconnect = authority.advanceReestablishNonce(
+				'channel-reestablish/peer/' + channelId,
+				key.toString('hex'),
+				state.peerReconnect,
+				() => nonce
+			);
+		});
+	}
+
+	loadFinalLocalReestablishNonce(channelId: string): Buffer | null {
+		const r = this.finalOpeningRecord(channelId)?.nonces.localReconnect;
+		return r ? Buffer.from(r.nonce, 'hex') : null;
+	}
+
+	loadFinalPeerReestablishNonce(channelId: string): Buffer | null {
+		const r = this.finalOpeningRecord(channelId)?.nonces.peerReconnect;
+		return r ? Buffer.from(r.nonce, 'hex') : null;
+	}
+
+	private finalExitRequested(
+		channelId: string,
+		state: IFinalOpeningNonces
+	): boolean {
+		if (state.signing?.exitRequested) return true;
+		return !!this.openingAuthority?.exitRequest(channelId);
+	}
+
+	/** Complete a device-first close after a crash and enroll wallet-only requests
+	 * made by the preceding final wallet version before it can emit readiness.
+	 */
+	private reconcileFinalExitRequests(): void {
+		const authority = this.openingAuthority;
+		if (!authority) return;
+		const pending: string[] = [];
+		this.readFinalOpenings((candidate, { nonces }) => {
+			const signing = nonces.signing;
+			if (!signing?.exit || !signing.fundingLocal) return;
+			const id = candidate.channelId;
+			if (signing.exitRequested) {
+				authority.recordExitRequest(id, signing.exit);
+			} else {
+				const requested = authority.exitRequest(id);
+				if (requested) {
+					if (
+						requested !==
+						sha256(Buffer.from(signing.exit, 'hex')).toString('hex')
+					)
+						throw new Error(
+							'Original exit request disagrees with its signed exit'
+						);
+					pending.push(id);
+				}
+			}
+		});
+		for (const id of pending) this.requestFinalOpeningExit(id);
+	}
+
 	/** Persist the operator's request before broadcasting the already signed exit. */
 	requestFinalOpeningExit(channelId: string): Buffer {
 		return this.updateOpeningNonces(channelId, (state) => {
 			const signing = state.signing;
 			if (!state.session || !signing?.exit || !signing.fundingLocal)
 				throw new Error('Opening has not released its funding witnesses');
+			this.openingAuthority?.recordExitRequest(channelId, signing.exit);
 			signing.exitRequested = true;
 			return Buffer.from(signing.exit, 'hex');
 		});
@@ -1223,12 +1469,15 @@ export class SqliteStorage implements IStorageBackend {
 		return {
 			candidate: record.candidate,
 			session,
+			...(record.nonces.localReady &&
+				record.nonces.peerReady && { readyExchanged: true }),
 			...(signing?.fundingTransaction && {
 				funding: Buffer.from(signing.fundingTransaction, 'hex')
 			}),
-			...(signing?.exitRequested && {
-				exitToBroadcast: Buffer.from(signing.exit!, 'hex')
-			})
+			...(signing?.exit &&
+				this.finalExitRequested(record.candidate.channelId, record.nonces) && {
+					exitToBroadcast: Buffer.from(signing.exit!, 'hex')
+				})
 		};
 	}
 

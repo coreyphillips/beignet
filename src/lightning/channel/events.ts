@@ -117,7 +117,8 @@ export interface ChannelManagerEvents {
 		txid: string,
 		index: number,
 		minimumDepth: number,
-		script: Buffer
+		script: Buffer,
+		valueSat: number
 	) => void;
 	/** Arm spend detection on the outpoints a splice superseded. */
 	'watch:presplice-spend': (channelId: Buffer) => void;

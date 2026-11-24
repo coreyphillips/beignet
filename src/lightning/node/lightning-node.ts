@@ -3012,7 +3012,8 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				maxReconnectDelay: config.maxReconnectDelay,
 				maxInboundPeers: config.maxInboundPeers,
 				isChannelPeer: (pubkey): boolean =>
-					this.channelManager.getChannelsByPeer(pubkey).length > 0,
+					this.channelManager.getChannelsByPeer(pubkey).length > 0 ||
+					this.channelManager.finalOpeningPeers().includes(pubkey),
 				socks5Proxy: config.socks5Proxy,
 				socks5ProxyScope: this.socks5ProxyScope,
 				learnedAddressDials: config.learnedAddressDials,
@@ -6874,9 +6875,9 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 
 		this.channelManager.on(
 			'watch:final-opening',
-			(id, txid, index, depth, script) => {
+			(id, txid, index, depth, script, valueSat) => {
 				this.chainWatcher
-					?.watchFundingOutput(id, txid, index, depth, script)
+					?.watchFinalFundingOutput(id, txid, index, depth, script, valueSat)
 					.catch((err: Error) => {
 						this.emitStructuredLog('chain', 'funding_watch_failed', {
 							txid,
@@ -8562,7 +8563,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		}
 
 		const peerAddresses = this.loadPeerAddresses();
-		const channelPeers = new Set<string>();
+		const channelPeers = new Set(this.channelManager.finalOpeningPeers());
 
 		// Only reconnect peers that have channels needing reestablishment, or
 		// carrying a durable recovery-close disposition (5.6): those must
@@ -11263,10 +11264,12 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		this.chainWatcher.on(
 			'funding:unseen',
 			(channelId: Buffer, txid: string) => {
-				this.channelManager.forgetFinalFundingConfirmation(channelId);
 				this.onFundingWatchUnseen(channelId, txid);
 			}
 		);
+		this.chainWatcher.on('funding:depth-lost', (channelId: Buffer) => {
+			this.channelManager.forgetFinalFundingConfirmation(channelId);
+		});
 		this.chainWatcher.on(
 			'funding:presplice-retired',
 			(channelId: Buffer, txid: string, outputIndex: number) => {
@@ -13670,6 +13673,12 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	}
 
 	handleFundingConfirmed(channelId: Buffer, confirmedTxidHex?: TxidHex): void {
+		// The private final opening depends on live proof of the output and its
+		// depth. An external notification can wake the watcher to obtain it.
+		if (this.channelManager.finalOpeningInfo(channelId).length) {
+			this.chainWatcher?.recheckAllWatches();
+			return;
+		}
 		this.channelManager.handleFundingConfirmed(channelId, confirmedTxidHex);
 		const channel = this.channelManager.getChannel(channelId);
 		if (!channel) return;

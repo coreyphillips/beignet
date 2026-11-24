@@ -1,3 +1,4 @@
+import type { IFinalReestablishNonce } from './final-opening-nonces';
 import type Database from 'better-sqlite3';
 import path from 'path';
 import { nodeFs } from '../../utils/node-builtins';
@@ -417,6 +418,61 @@ export class FinalOpeningAuthority {
 		return this.db.transaction(() => this.lock(slot, transcript)).immediate();
 	}
 
+	/** Advance the device high-water mark before the wallet releases a reconnect nonce.
+	 * Replacing one authenticated slot bounds storage across repeated disconnects.
+	 */
+	advanceReestablishNonce(
+		slot: string,
+		transcript: string,
+		wallet: IFinalReestablishNonce | undefined,
+		generate: (generation: number) => Buffer
+	): IFinalReestablishNonce {
+		this.verifyFiles();
+		return this.db
+			.transaction(() => {
+				const current = this.lock(slot, transcript);
+				const previous: IFinalReestablishNonce | null =
+					current && JSON.parse(current.toString());
+				if (
+					previous &&
+					(!Number.isSafeInteger(previous.generation) ||
+						previous.generation < 1 ||
+						typeof previous.nonce !== 'string' ||
+						!/^[0-9a-f]{132}$/.test(previous.nonce))
+				)
+					throw new Error('Invalid device reconnect nonce');
+				if (
+					wallet &&
+					(!previous ||
+						wallet.generation > previous.generation ||
+						(wallet.generation === previous.generation &&
+							wallet.nonce !== previous.nonce))
+				)
+					throw new Error('Reconnect nonce disagrees with original device');
+				const generation = (previous?.generation ?? 0) + 1;
+				if (!Number.isSafeInteger(generation))
+					throw new Error('Reconnect nonce counter exhausted');
+				const nonce = generate(generation).toString('hex');
+				// A deterministic peer can repeat its unused nonce for the same commitment height.
+				if (previous?.nonce === nonce) return previous;
+				const next = { generation, nonce };
+				const result = Buffer.from(JSON.stringify(next)).toString('hex');
+				this.db
+					.prepare('UPDATE claims SET claim=? WHERE slot=?')
+					.run(
+						encryptValue(
+							this.claimKey(slot),
+							JSON.stringify({ transcript, result })
+						),
+						slot
+					);
+				if (this.read(slot)?.result !== result)
+					throw new Error('Could not save reconnect nonce on device');
+				return next;
+			})
+			.immediate();
+	}
+
 	/** Burn a key before its basepoints leave this device, even if the wallet rolls back. */
 	requireAllocatedChannelKey(index: number): void {
 		this.verifyFiles();
@@ -464,6 +520,19 @@ export class FinalOpeningAuthority {
 			'enforceable-exit/' + channelId,
 			sha256(Buffer.from(exit, 'hex')).toString('hex')
 		);
+	}
+
+	/** An operator or protocol failure has irrevocably selected the existing signed exit. */
+	recordExitRequest(channelId: string, exit: string): void {
+		this.claim(
+			'exit-request/' + channelId,
+			sha256(Buffer.from(exit, 'hex')).toString('hex')
+		);
+	}
+
+	exitRequest(channelId: string): string | null {
+		this.verifyFiles();
+		return this.read('exit-request/' + channelId)?.transcript ?? null;
 	}
 
 	assertEnforceableExits(load: (channelId: string) => Buffer | null): void {
