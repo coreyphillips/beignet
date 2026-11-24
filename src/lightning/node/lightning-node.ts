@@ -74,6 +74,7 @@ import {
 	finalOpeningOutputClaims,
 	sponsorFinalClaim
 } from '../chain/final-output-claims';
+import { assetOpeningOutputClaims } from '../chain/asset-opening-claims';
 import { finalDaemonForNode } from '../storage/final-daemon-admission';
 import { requireLegacyWallet } from '../storage/wallet-format-guard';
 import { getPublicKey, isValidPublicKey } from '../crypto/ecdh';
@@ -311,6 +312,12 @@ import {
 	DEFAULT_EXPIRY
 } from '../invoice/types';
 import { MessageType } from '../message/types';
+import {
+	assetOpeningDependencies,
+	assetOpeningNegotiated,
+	ASSET_OPENING_TYPE_HEX
+} from '../features/asset-opening';
+import { completeAssetOpeningHost } from '../channel/asset-opening-coordinator';
 import {
 	PEER_STORAGE_MAX_BYTES,
 	encodePeerStorageMessage,
@@ -1183,12 +1190,16 @@ interface IAuxiliaryPartSent {
 class NodeFeatureFlags extends FeatureFlags {
 	constructor(
 		private readonly configured: FeatureFlags,
-		private readonly finalDaemon: boolean
+		private readonly finalDaemon: boolean,
+		private readonly assetOpening: boolean
 	) {
 		super();
 	}
 
 	private masksFinalBit(bit: number): boolean {
+		if (bit === Feature.OPTION_DUAL_FUNDED_ASSETS) return true;
+		if (bit === Feature.OPTION_DUAL_FUNDED_ASSETS + 1)
+			return !this.assetOpening || !assetOpeningDependencies(this.configured);
 		if (bit === Feature.OPTION_SIMPLE_TAPROOT) return true;
 		return (
 			bit === Feature.OPTION_SIMPLE_TAPROOT + 1 &&
@@ -1211,15 +1222,15 @@ class NodeFeatureFlags extends FeatureFlags {
 	}
 
 	private advertised(): FeatureFlags {
-		const final = Feature.OPTION_SIMPLE_TAPROOT;
-		if (
-			!this.configured.hasBit(final) &&
-			(!this.configured.hasBit(final + 1) || !this.masksFinalBit(final + 1))
-		)
-			return this.configured;
+		const masked = [
+			Feature.OPTION_SIMPLE_TAPROOT,
+			Feature.OPTION_SIMPLE_TAPROOT + 1,
+			Feature.OPTION_DUAL_FUNDED_ASSETS,
+			Feature.OPTION_DUAL_FUNDED_ASSETS + 1
+		].filter((bit) => this.configured.hasBit(bit) && this.masksFinalBit(bit));
+		if (!masked.length) return this.configured;
 		const flags = FeatureFlags.fromBuffer(this.configured.toBuffer());
-		flags.clearBit(final);
-		if (this.masksFinalBit(final + 1)) flags.clearBit(final + 1);
+		for (const bit of masked) flags.clearBit(bit);
 		return flags;
 	}
 
@@ -2276,7 +2287,9 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		// behavior (e.g. option_simple_close) can consult our own advertisement.
 		const localFeatures = new NodeFeatureFlags(
 			config.localFeatures ?? LightningNode.defaultFeatures(),
-			Boolean(finalDaemon)
+			Boolean(finalDaemon),
+			!!finalDaemon?.storage.canOpenDualFundedAssets &&
+				completeAssetOpeningHost(config.auxiliaryChannels?.dualFunding)
 		);
 		// Advertise anchor support whenever anchors are preferred (the default).
 		if (
@@ -2437,6 +2450,11 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			localFeatures.clearBit(Feature.OPTION_ZERO_RESERVE + 1);
 		}
 		if (finalDaemon) localFeatures.setOptional(Feature.OPTION_SIMPLE_TAPROOT);
+		if (
+			finalDaemon?.storage.canOpenDualFundedAssets &&
+			completeAssetOpeningHost(config.auxiliaryChannels?.dualFunding)
+		)
+			localFeatures.setOptional(Feature.OPTION_DUAL_FUNDED_ASSETS);
 		this.localFeatures = localFeatures;
 
 		// An asset channel is not accepted by a node whose wallet refused the
@@ -2507,11 +2525,16 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			finalOpening: finalDaemon?.runtime,
 			finalOpeningNegotiated: finalDaemon
 				? (peerPubkey, channelType) =>
-						finalOpeningNegotiated(
-							localFeatures,
-							this.peerInitFeatures(peerPubkey),
-							channelType
-						)
+						channelType.toString('hex') === ASSET_OPENING_TYPE_HEX
+							? assetOpeningNegotiated(
+									localFeatures,
+									this.peerInitFeatures(peerPubkey)
+							  )
+							: finalOpeningNegotiated(
+									localFeatures,
+									this.peerInitFeatures(peerPubkey),
+									channelType
+							  )
 				: undefined,
 			allocateChannelKeyIndex: finalDaemon
 				? (minimum) => finalDaemon.storage.allocateFinalChannelKeyIndex(minimum)
@@ -3113,7 +3136,17 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			// land in the tracked wallet; else fall back to the funding-key P2WPKH.
 			const destinationScript = this.getSweepDestinationScript();
 			this.chainWatcher = new ChainWatcher({
-				finalOutputClaims: finalDaemon?.storage.canUpdateFinalCommitments
+				finalOutputClaims: finalDaemon?.storage.canOpenDualFundedAssets
+					? (id, parent, destination, rate) =>
+							assetOpeningOutputClaims(
+								finalDaemon.runtime,
+								id,
+								parent,
+								destination,
+								rate,
+								config.auxiliaryChannels?.dualFunding
+							)
+					: finalDaemon?.storage.canUpdateFinalCommitments
 					? (id, parent, destination, rate, trimmed) =>
 							finalOpeningOutputClaims(
 								finalDaemon.runtime,
@@ -12749,6 +12782,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 
 	destroy(): void {
 		this._destroyed = true;
+		this.channelManager.stopAssetOpenings();
 		this.compositeSplices?.detach();
 		// A restore of the stored map ends here, before its storage closes.
 		if (this.graphRestore) this.cancelGraphRestore(this.graphRestore);
@@ -13463,6 +13497,8 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			fundingSatoshis: bigint;
 			/** Request the private, positive-depth regtest final Taproot opening profile. */
 			finalTaproot?: boolean;
+			/** Open the private two-contributor asset profile with the configured provider. */
+			dualFundedAssets?: boolean;
 			fundingFeeratePerkw?: number;
 			commitmentFeeratePerkw?: number;
 			locktime?: number;
@@ -13536,9 +13572,29 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		if (pubkeyErr) throw new InvalidChannelOpenError(pubkeyErr);
 		peerPubkey = normalizeHexPubkey(peerPubkey);
 		let channelType = params.channelType;
+		if (
+			params.dualFundedAssets !== undefined &&
+			typeof params.dualFundedAssets !== 'boolean'
+		)
+			throw new InvalidChannelOpenError('dualFundedAssets must be a boolean');
+		if (params.dualFundedAssets) {
+			if (
+				params.finalTaproot ||
+				(channelType && channelType.toString('hex') !== ASSET_OPENING_TYPE_HEX)
+			)
+				throw new InvalidChannelOpenError(
+					'Conflicting asset opening channel type'
+				);
+			channelType = Buffer.from(ASSET_OPENING_TYPE_HEX, 'hex');
+		} else if (channelType?.toString('hex') === ASSET_OPENING_TYPE_HEX) {
+			throw new InvalidChannelOpenError(
+				'Asset opening requires explicit opt-in'
+			);
+		}
 		if (params.finalTaproot && !channelType)
 			channelType = finalOpeningChannelType();
 		const final =
+			params.dualFundedAssets ||
 			params.finalTaproot ||
 			(Buffer.isBuffer(channelType) &&
 				FeatureFlags.fromBuffer(channelType).hasFeature(
@@ -13547,16 +13603,24 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		if (final) {
 			if (
 				!channelType ||
-				!finalOpeningNegotiated(
-					this.localFeatures,
-					this.peerInitFeatures(peerPubkey),
-					channelType
-				)
+				!(params.dualFundedAssets
+					? assetOpeningNegotiated(
+							this.localFeatures,
+							this.peerInitFeatures(peerPubkey)
+					  )
+					: finalOpeningNegotiated(
+							this.localFeatures,
+							this.peerInitFeatures(peerPubkey),
+							channelType
+					  ))
 			)
 				throw new InvalidChannelOpenError(
-					'Final Taproot opening requires the enrolled original and negotiated channel type, simple close, shutdown anysegwit, dual funding and final Taproot'
+					params.dualFundedAssets
+						? 'Asset opening requires an enrolled original wallet and negotiated asset funding'
+						: 'Final Taproot opening requires the enrolled original and negotiated channel type, simple close, shutdown anysegwit, dual funding and final Taproot'
 				);
 			const allowed = [
+				'dualFundedAssets',
 				'fundingSatoshis',
 				'fundingFeeratePerkw',
 				'commitmentFeeratePerkw',
@@ -36191,6 +36255,18 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				}
 				return;
 			}
+			if (
+				msg.version === 1 &&
+				(msg.subtype === BeignetCustomSubtype.ASSET_OPEN ||
+					msg.subtype === BeignetCustomSubtype.ASSET_OPEN_CONSENT)
+			) {
+				this.channelManager.handleAssetOpenFrame(
+					pubkey,
+					msg.subtype,
+					msg.payload
+				);
+				return;
+			}
 			// A guardian request addressed to the host this node runs is
 			// answered here, not observed: the host owns the session state
 			// (issue #699). Ordinary peers reach this branch only once the
@@ -39162,7 +39238,10 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	 */
 	isFundingBroadcastOrConfirmed(channelId: Buffer): boolean {
 		const channel = this.channelManager.getChannel(channelId);
-		if (!channel) return false;
+		if (!channel)
+			return (
+				this.channelManager.assetOpeningCollateral(channelId)?.funded ?? false
+			);
 		const state = channel.getFullState();
 		if (!state.fundingTxid) return false;
 		return this.fundingKnownOnChain(channel, state);

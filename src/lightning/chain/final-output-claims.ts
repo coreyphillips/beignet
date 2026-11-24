@@ -29,6 +29,10 @@ export interface IFinalOutputClaim {
 	absoluteHeight: number;
 	/** Absent when the output is uneconomic at the current rate but its spend still settles a payment. */
 	tx: Transaction | null;
+	/** Builds an asset-preserving payout only once the exact outpoint is spendable. */
+	recover?: () => Promise<Transaction | null>;
+	/** The reconstructed local balance output of a dual-funded asset opening. */
+	assetBalanceOutput?: boolean;
 	sponsor?: boolean;
 	paymentHash?: Buffer;
 	htlcId?: bigint;

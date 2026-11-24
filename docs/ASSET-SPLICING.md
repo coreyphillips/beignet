@@ -54,7 +54,7 @@ A peer can publish an earlier signed candidate at any time. Mempool replacement,
 
 ## Checks before enabling the feature
 
-Step 13 establishes ordinary Taproot interactive opening and splicing. Step 14 uses the proof and exit sequence for an opening with two contributors, where there is no old funding outpoint. Step 15 exercises units in, units out and a bitcoin-only splice with two peers. Step 16 covers chain resolution and recovery before release.
+Step 13 establishes ordinary Taproot interactive opening and splicing. The regtest [dual-funded asset opening](EXTENSIONS.md#dual-funded-asset-opening-on-regtest) in Step 14 uses the proof and exit sequence with two contributors and fresh funding inputs. Step 15 exercises units in, units out and a bitcoin-only splice with two peers. Step 16 covers chain resolution and recovery before release.
 
 Acceptance cases include both peers contributing, wrong per-ID totals with a correct group total, a removed or reordered output, missing proof data, a tag that exceeds the message limit, mixed plain and asset HTLCs carried and resolved during the window, and a disconnect on either side of each signature and revocation. Drop the last replacement funding-signature message and mine the original. Mine the replacement in a separate run. Exercise a unilateral close and a revoked commitment on each possible funding output, a reorg below lock depth, and restoration from before and after the splice. In each case compare the actual outpoints, per-ID receipts, HTLC outcomes and spendable balances.
 

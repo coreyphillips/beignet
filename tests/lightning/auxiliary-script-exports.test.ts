@@ -1,6 +1,6 @@
 /**
- * What a provider of asset channels builds with (issue #2093 step 6): the
- * four taproot builders are reachable by name as `script.<name>` from the
+ * What a provider of asset channels builds with (issue #2093 step 6 and #2098 step 14):
+ * the taproot builders are reachable by name as `script.<name>` from the
  * package's `lightning` entry, and they are the very functions the engine's
  * commitment builder and funding code call, so what a provider computes
  * cannot drift from what the node signs. The on-chain HTLC tests compare
@@ -24,9 +24,12 @@ describe('the script builders a provider of asset channels uses (issue #2093 ste
 	it('are reachable by name from the lightning entry, and nothing else of their modules is', () => {
 		const taproot = Object.keys(script).filter((name) => /Taproot/.test(name));
 		expect(taproot.sort()).to.deep.equal([
+			'buildTaprootAnchorOutput',
 			'buildTaprootOfferedHtlcOutput',
 			'buildTaprootReceivedHtlcOutput',
 			'buildTaprootSecondLevelOutput',
+			'buildTaprootToLocalOutput',
+			'buildTaprootToRemoteOutput',
 			'createTaprootFundingScript'
 		]);
 		for (const name of taproot) {
@@ -39,6 +42,15 @@ describe('the script builders a provider of asset channels uses (issue #2093 ste
 	it('are the functions the engine builds its own commitments and funding with', () => {
 		expect(script.createTaprootFundingScript).to.equal(
 			fundingTaproot.createTaprootFundingScript
+		);
+		expect(script.buildTaprootAnchorOutput).to.equal(
+			commitmentTaproot.buildTaprootAnchorOutput
+		);
+		expect(script.buildTaprootToLocalOutput).to.equal(
+			commitmentTaproot.buildTaprootToLocalOutput
+		);
+		expect(script.buildTaprootToRemoteOutput).to.equal(
+			commitmentTaproot.buildTaprootToRemoteOutput
 		);
 		expect(script.buildTaprootOfferedHtlcOutput).to.equal(
 			commitmentTaproot.buildTaprootOfferedHtlcOutput

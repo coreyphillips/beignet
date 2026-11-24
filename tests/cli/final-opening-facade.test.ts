@@ -61,6 +61,8 @@ describe('Final opening public options', () => {
 		});
 		for (const extra of [
 			{ finalTaproot: 'true' },
+			{ dualFundedAssets: 'true' },
+			{ dualFundedAssets: true },
 			{ pushSats: 1 },
 			{ requestFunds: { requestedSats: 500, blockheight: 100 } },
 			{ channelFlags: 1 },
@@ -73,6 +75,12 @@ describe('Final opening public options', () => {
 		expect(calls).to.have.length(1);
 		facade.openChannelV2(peer, { amountSats: 80_000 });
 		expect(calls[1]).not.to.have.property('finalTaproot');
+		expect(calls[1]).not.to.have.property('dualFundedAssets');
+		facade.openChannelV2(peer, { amountSats: 80_000, dualFundedAssets: true });
+		expect(calls[2]).to.include({
+			fundingSatoshis: 80_000n,
+			dualFundedAssets: true
+		});
 	});
 
 	it('requires both init vectors to agree on the exact proposed type and dependencies', () => {

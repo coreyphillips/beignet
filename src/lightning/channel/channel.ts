@@ -136,8 +136,10 @@ import {
 } from './commitment-profile';
 import {
 	isFinalNegotiation,
+	isAssetNegotiation,
 	snapshotFinalOpening
 } from './final-opening-negotiation';
+import { ASSET_OPENING_TYPE_HEX } from '../features/asset-opening';
 import { recordRevokedHtlcSnapshot } from './htlc-snapshots';
 import type {
 	IAuxiliaryCommitmentData,
@@ -19013,7 +19015,10 @@ export class Channel {
 		unsupportedFinal: boolean
 	): string | null {
 		if (!isFinalNegotiation(this)) return validateV2ChannelType(type);
-		return isFinalTaprootTypeHex(type?.toString('hex')) && !unsupportedFinal
+		const supported = isAssetNegotiation(this)
+			? type?.toString('hex') === ASSET_OPENING_TYPE_HEX
+			: isFinalTaprootTypeHex(type?.toString('hex'));
+		return supported && !unsupportedFinal
 			? null
 			: 'Unsupported final opening type or terms';
 	}

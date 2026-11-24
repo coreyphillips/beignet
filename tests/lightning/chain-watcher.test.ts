@@ -396,6 +396,169 @@ describe('Phase 4: Chain Watcher', () => {
 			expect(events.slice(4)).to.deep.equal(['confirmed', 'lost', 'confirmed']);
 		});
 
+		it('recovers confirmed asset witnesses and keeps funding proofs on a spend until the funding block is orphaned', async () => {
+			const id = crypto.randomBytes(32),
+				script = Buffer.from('5120' + '92'.repeat(32), 'hex');
+			const funding = new bitcoin.Transaction();
+			funding.addInput(crypto.randomBytes(32), 0);
+			funding.addOutput(script, 50000);
+			funding.setWitness(0, [Buffer.alloc(64, 9)]);
+			const txid = funding.getId(),
+				sh = computeScriptHash(script);
+			const coin = { txid, outputIndex: 0, valueSat: 50000, height: 70 };
+			let spent = false,
+				missing = true;
+			const verdicts: boolean[] = [];
+			Object.assign(backend, {
+				listUnspent: async () => (spent ? [] : [coin])
+			});
+			Object.assign(channelManager, {
+				assetOpeningAnchor: () => ({ missingWitnesses: missing }),
+				observeAssetOpeningAnchor: (
+					_id: string,
+					deep: boolean,
+					raw?: bitcoin.Transaction
+				) => {
+					verdicts.push(deep);
+					if (raw) {
+						expect(raw.toHex()).to.equal(funding.toHex());
+						missing = false;
+					}
+				}
+			});
+			backend.setTransaction(txid, funding.toBuffer());
+			backend.setHistory(sh, [{ txid, height: 70 }]);
+			backend.simulateNewBlock(72);
+			await watcher.watchFinalFundingOutput(id, txid, 0, 3, script, 50000);
+			expect(missing).to.equal(false);
+			expect(verdicts.slice(-1)).to.deep.equal([true]);
+			spent = true;
+			backend.simulateScriptHashChange(sh);
+			await new Promise<void>((done) => setImmediate(done));
+			expect(verdicts.slice(-1)).to.deep.equal([true]);
+			backend.setHistory(sh, []);
+			backend.simulateNewBlock(72);
+			await new Promise<void>((done) => setImmediate(done));
+			expect(verdicts.slice(-1)).to.deep.equal([false]);
+		});
+
+		it('releases an asset payout callback only for the mature exact outpoint on a current tip', async () => {
+			watcher.stop();
+			let releases = 0;
+			const settled: boolean[] = [];
+			Object.assign(channelManager, {
+				observeAssetOpeningPayout: (
+					_id: Buffer,
+					_parent: string,
+					mined: boolean
+				) => settled.push(mined)
+			});
+			const funding = new bitcoin.Transaction(),
+				script = Buffer.from('5120' + '71'.repeat(32), 'hex');
+			funding.addInput(crypto.randomBytes(32), 0);
+			funding.addOutput(script, 50000);
+			const parent = new bitcoin.Transaction(),
+				payout = Buffer.from('5120' + '92'.repeat(32), 'hex');
+			parent.addInput(funding.getHash(), 0);
+			parent.addOutput(payout, 49000);
+			const sweep = new bitcoin.Transaction();
+			sweep.addInput(parent.getHash(), 0, 3);
+			sweep.addOutput(Buffer.of(0x51), 48000);
+			const coin = {
+				txid: parent.getId(),
+				outputIndex: 0,
+				height: 100,
+				valueSat: 49000
+			};
+			let coins = [coin];
+			Object.assign(backend, {
+				listUnspent: async (hash: string) =>
+					hash === computeScriptHash(payout) ? coins : []
+			});
+			backend.setHistory(computeScriptHash(script), [
+				{ txid: parent.getId(), height: 100 }
+			]);
+			backend.setTransaction(parent.getId(), parent.toBuffer());
+			watcher = new ChainWatcher({
+				backend,
+				channelManager,
+				finalOutputClaims: () => [
+					{
+						outputIndex: 0,
+						relativeDelay: 3,
+						assetBalanceOutput: true,
+						absoluteHeight: 0,
+						tx: null,
+						recover: async () => {
+							releases++;
+							return sweep;
+						}
+					}
+				]
+			});
+			await watcher.start();
+			const id = crypto.randomBytes(32);
+			const watch = () =>
+				watcher.watchFinalFundingOutput(
+					id,
+					funding.getId(),
+					0,
+					1,
+					script,
+					50000
+				);
+			const tick = () => new Promise<void>((resolve) => setImmediate(resolve));
+			backend.simulateNewBlock(101);
+			await watch();
+			expect(releases).to.equal(0);
+			coins = [
+				{ ...coin, outputIndex: 1 },
+				{ ...coin, height: 0 }
+			];
+			backend.simulateNewBlock(102);
+			await tick();
+			expect(releases).to.equal(0);
+			coins = [coin];
+			watcher.recheckAllWatches();
+			await tick();
+			expect(releases).to.equal(1);
+			expect(backend.getBroadcastedTxs()).to.deep.equal([sweep.toHex()]);
+			coins = [];
+			const payoutHash = computeScriptHash(payout);
+			const other = sweep.clone();
+			other.ins[0].index++;
+			backend.setHistory(payoutHash, [
+				{ txid: other.getId(), height: 102 },
+				{ txid: sweep.getId(), height: 0 }
+			]);
+			backend.setTransaction(other.getId(), other.toBuffer());
+			backend.setTransaction(sweep.getId(), sweep.toBuffer());
+			watcher.recheckAllWatches();
+			await tick();
+			expect(
+				settled.slice(-1),
+				'unrelated confirmed input and our unconfirmed spend'
+			).to.deep.equal([false]);
+			backend.setHistory(payoutHash, [{ txid: sweep.getId(), height: 102 }]);
+			backend.simulateNewBlock(103);
+			await tick();
+			expect(
+				settled.slice(-1),
+				'confirmed spend of the wallet output'
+			).to.deep.equal([true]);
+			backend.setHistory(payoutHash, [{ txid: sweep.getId(), height: 0 }]);
+			backend.simulateNewBlock(102);
+			await tick();
+			expect(
+				settled.slice(-1),
+				'spend orphaned into the mempool'
+			).to.deep.equal([false]);
+			watcher.stop();
+			await watcher.start();
+			await watch();
+			expect(releases, 'no header accepted since restart').to.equal(1);
+		});
+
 		it('discards a delayed final funding verdict superseded by a script notification', async () => {
 			const channelId = crypto.randomBytes(32);
 			const txid = crypto.randomBytes(32).toString('hex');

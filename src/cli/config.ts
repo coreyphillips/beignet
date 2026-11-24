@@ -510,6 +510,7 @@ export function resolveConfig(cliFlags: Partial<BeignetConfig>): BeignetConfig {
 		finalTaprootWallet: cliFlags.finalTaprootWallet ?? file.finalTaprootWallet,
 		finalCommitmentUpdates:
 			cliFlags.finalCommitmentUpdates ?? file.finalCommitmentUpdates,
+		dualFundedAssets: cliFlags.dualFundedAssets ?? file.dualFundedAssets,
 		preferAnchors:
 			cliFlags.preferAnchors ??
 			(process.env.BEIGNET_PREFER_ANCHORS !== undefined
