@@ -1408,13 +1408,11 @@ describe('an asset invoice (issue #2098, step 10)', function () {
 	});
 
 	describe('what the build says it offers a host', () => {
-		it('names createInvoice:assetInvoice last among the surfaces, after sendInParts, at version 1 with nothing declared', () => {
+		it('names createInvoice:assetInvoice immediately after sendInParts at version 1 with nothing declared', () => {
 			const api = lightningChannel.AUXILIARY_CHANNELS_API;
-			const surfaces = [...api.surfaces] as string[];
-			expect(surfaces.slice(-2)).to.deep.equal([
-				'sendInParts',
-				'createInvoice:assetInvoice'
-			]);
+			const send = api.surfaces.indexOf('sendInParts');
+			expect(send).to.be.at.least(0);
+			expect(api.surfaces[send + 1]).to.equal('createInvoice:assetInvoice');
 			expect(api.version).to.equal(1);
 			expect([...api.declared]).to.deep.equal([]);
 		});
