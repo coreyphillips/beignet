@@ -46,6 +46,7 @@
  * generation is live.
  */
 
+import { requireLegacyWallet } from '../storage/wallet-format-guard';
 import { sha256 } from '../crypto/provider';
 import { assertGuardianJournalHoldsNoAuxiliaryChannels } from './auxiliary-restore';
 import type { IStorageBackend, IStoredRecoveryFrame } from '../storage/types';
@@ -362,6 +363,7 @@ export class RestoreDriver {
 	private verifiedBindings: Set<string> | null = null;
 
 	constructor(config: IRestoreDriverConfig) {
+		requireLegacyWallet(config.target);
 		if (config.required < 1 || config.required > config.guardians.length) {
 			throw new Error('required quorum is outside the configured guardian set');
 		}

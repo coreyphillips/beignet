@@ -58,6 +58,8 @@ import {
 	encodeOpenChannelMessage
 } from '../../src/lightning/message/channel-open';
 import {
+	decodeAcceptChannel2Message,
+	decodeOpenChannel2Message,
 	encodeOpenChannel2Message,
 	IOpenChannel2Message
 } from '../../src/lightning/message/dual-funding';
@@ -486,6 +488,91 @@ describe('Channel key index allocation mark (issue #917)', () => {
 			if (second) second.destroy();
 			else node.destroy();
 			fs.rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	it('uses the device allocation for both v2 wire key sets before sending any basepoints', () => {
+		const order: string[] = [];
+		const manager = makeManager('original-device', {
+			allocateChannelKeyIndex: (minimum) => {
+				order.push('minimum ' + minimum);
+				return minimum + 4;
+			},
+			onChannelIndexAllocated: (index) => {
+				order.push('record ' + index);
+			},
+			channelKeyDeriver: (index) => {
+				order.push('derive ' + index);
+				return makePerChannelKeys(index);
+			}
+		});
+		const wire: Buffer[] = [];
+		manager.on('message:outbound', (_peer, type, payload) => {
+			if (
+				type === MessageType.OPEN_CHANNEL2 ||
+				type === MessageType.ACCEPT_CHANNEL2
+			) {
+				const decode =
+					type === MessageType.OPEN_CHANNEL2
+						? decodeOpenChannel2Message
+						: decodeAcceptChannel2Message;
+				wire.push(decode(payload).fundingPubkey);
+				order.push('wire');
+			}
+		});
+		manager.createDualFundedChannel(
+			LSP_PUBKEY,
+			dualFundingParams('durable-opener')
+		);
+		inbound(
+			manager,
+			WALLET_PUBKEY,
+			MessageType.OPEN_CHANNEL2,
+			encodeOpenChannel2Message(makeOpenChannel2('durable-acceptor'))
+		);
+		expect(wire).to.deep.equal([
+			makePerChannelKeys(5).basepoints.fundingPubkey,
+			makePerChannelKeys(10).basepoints.fundingPubkey
+		]);
+		expect(order).to.deep.equal([
+			'minimum 1',
+			'record 5',
+			'derive 5',
+			'wire',
+			'minimum 6',
+			'record 10',
+			'derive 10',
+			'wire'
+		]);
+		expect(manager.nextChannelIndex).to.equal(11);
+	});
+
+	it('refuses an invalid durable allocation before deriving or sending either v2 wire key set', () => {
+		for (const result of [0, 1.5, 0x80000000]) {
+			let derived = false;
+			const manager = makeManager('invalid-device-index', {
+				allocateChannelKeyIndex: () => result,
+				channelKeyDeriver: (index) => {
+					derived = true;
+					return makePerChannelKeys(index);
+				}
+			});
+			expect(() =>
+				manager.createDualFundedChannel(
+					LSP_PUBKEY,
+					dualFundingParams('refused')
+				)
+			).to.throw();
+			const inboundResult = inbound(
+				manager,
+				WALLET_PUBKEY,
+				MessageType.OPEN_CHANNEL2,
+				encodeOpenChannel2Message(makeOpenChannel2('refused'))
+			);
+			expect(inboundResult.wireTypes).to.not.include(
+				MessageType.ACCEPT_CHANNEL2
+			);
+			expect(derived).to.equal(false);
 		}
 	});
 

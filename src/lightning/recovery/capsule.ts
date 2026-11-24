@@ -31,6 +31,7 @@
  * tests prove.
  */
 
+import { requireLegacyWallet } from '../storage/wallet-format-guard';
 import {
 	aes256GcmDecrypt,
 	aes256GcmEncrypt,
@@ -120,6 +121,8 @@ export class CapsuleReplayError extends Error {
 }
 
 export interface ICapsuleRestoreOptions {
+	/** Network recorded in the target wallet's Lightning static channel backups. */
+	expectedNetwork?: string;
 	/**
 	 * Factory for a FRESH, empty storage backend used to dry-run the
 	 * candidate's reconstruction before the real target is written (see
@@ -1050,6 +1053,7 @@ export interface IComposedCapsule {
 export function composeRecoveryCapsule(
 	options: IComposeCapsuleOptions
 ): IComposedCapsule {
+	requireLegacyWallet(options.storage);
 	const maxBytes = options.maxBytes ?? CAPSULE_MAX_BYTES;
 	const storage = options.storage;
 	const tipSequence = storage?.getRecoveryMeta?.(JOURNAL_META_KEYS.tipSequence);
@@ -1414,9 +1418,18 @@ export function restoreFromRecoveryCapsule(
 	nodeSecret: Buffer,
 	options: ICapsuleRestoreOptions = {}
 ): ICapsuleRestoreResult {
+	requireLegacyWallet(target);
 	// Authenticates the Tier 1 material up front: wrong-key or tampered SCBs
 	// fail here before anything touches the target.
 	const scb = decodeScb(capsule.encryptedScb, nodeSecret);
+	if (
+		options.expectedNetwork !== undefined &&
+		scb.network !== options.expectedNetwork
+	) {
+		throw new CapsuleCandidateError(
+			`Capsule SCB network "${scb.network}" does not match target network "${options.expectedNetwork}"`
+		);
+	}
 
 	if (!capsule.inlineRecoveryState || !journalSupported(target)) {
 		return { tier: 1, scb, framesApplied: 0 };
@@ -1617,9 +1630,25 @@ export function restoreBestRecoveryCapsule(
 	nodeSecret: Buffer,
 	options: ICapsuleRestoreOptions = {}
 ): IBestCapsuleRestore {
-	const candidates = blobs
+	requireLegacyWallet(target);
+	const decrypted = blobs
 		.map((blob) => decodeRecoveryCapsuleBlob(blob, nodeSecret))
 		.filter((c): c is RecoveryCapsule => c !== null);
+	// The same node secret can be used on several test networks. Only an
+	// authenticated backup for this network can announce a competing head.
+	const candidates =
+		options.expectedNetwork === undefined
+			? decrypted
+			: decrypted.filter((candidate) => {
+					try {
+						return (
+							decodeScb(candidate.encryptedScb, nodeSecret).network ===
+							options.expectedNetwork
+						);
+					} catch {
+						return false;
+					}
+			  });
 	if (candidates.length === 0) {
 		throw new CapsuleCandidateError(
 			`no recovery capsule among ${blobs.length} candidate blobs`
@@ -1735,7 +1764,7 @@ export function restoreBestRecoveryCapsule(
 					...result,
 					capsule: candidate,
 					newestSeenHead,
-					rejectedCandidates: candidates.length - 1
+					rejectedCandidates: decrypted.length - 1
 				};
 			}
 		}
@@ -1758,7 +1787,7 @@ export function restoreBestRecoveryCapsule(
 			framesApplied: 0,
 			capsule: candidate,
 			newestSeenHead,
-			rejectedCandidates: candidates.length - 1
+			rejectedCandidates: decrypted.length - 1
 		};
 	}
 	throw new CapsuleCandidateError(

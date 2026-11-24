@@ -31,6 +31,7 @@ import {
 	RecoveryManager,
 	RecoveryJournal,
 	RecoveryCapsule,
+	CapsuleCandidateError,
 	GuardianDescriptor,
 	RecoveryMutation,
 	RecoveryOutboundMessage,
@@ -253,14 +254,14 @@ function openStorage(): SqliteStorage {
 	return storage;
 }
 
-function makeScb(): string {
+function makeScb(network = 'regtest', secret = NODE_SECRET): string {
 	const backup: IStaticChannelBackup = {
 		version: 1,
-		network: 'regtest',
+		network,
 		createdAt: 1_700_000_000_000,
 		channels: []
 	};
-	return encodeScb(backup, NODE_SECRET);
+	return encodeScb(backup, secret);
 }
 
 /**
@@ -1432,6 +1433,145 @@ describe('Recovery phase 3: review regressions', () => {
 			nodeSecret
 		);
 	}
+
+	describe('wallet and network scoped restore', () => {
+		const expectedNetwork = Network.REGTEST;
+		const foreignSecret = makeNodeConfig(2).nodePrivateKey;
+
+		it('selects the local Tier 1 head before ranking other networks or unauthenticated backups', () => {
+			const local = composeRecoveryCapsule({
+				encryptedScb: makeScb(expectedNetwork),
+				nodeSecret: NODE_SECRET
+			});
+			const higher = { ...local.capsule, latestSequence: 7n };
+			const otherNetwork = encryptRecoveryCapsule(
+				{ ...higher, encryptedScb: makeScb(Network.SIGNET) },
+				NODE_SECRET
+			);
+			const otherWallet = encryptRecoveryCapsule(higher, foreignSecret);
+			const wrongInnerKey = encryptRecoveryCapsule(
+				{ ...higher, encryptedScb: makeScb(expectedNetwork, foreignSecret) },
+				NODE_SECRET
+			);
+			const target = openStorage();
+			try {
+				const result = restoreBestRecoveryCapsule(
+					[otherNetwork, otherWallet, wrongInnerKey, local.blob],
+					target,
+					NODE_SECRET,
+					{ expectedNetwork, scratchStorage }
+				);
+				expect(result.tier).to.equal(1);
+				expect(result.scb.network).to.equal(expectedNetwork);
+				expect(result.newestSeenHead.latestSequence).to.equal(
+					local.capsule.latestSequence
+				);
+				expect(target.loadRecoveryFrames()).to.be.empty;
+			} finally {
+				target.close();
+			}
+		});
+
+		it('compares equal Tier 2 head hashes only within the requested wallet and network', () => {
+			const local = journaledStorage(2);
+			const foreign = journaledStorage(2, 100);
+			const target = openStorage();
+			try {
+				const ours = composeRecoveryCapsule({
+					storage: local.storage,
+					encryptedScb: makeScb(expectedNetwork),
+					nodeSecret: NODE_SECRET
+				});
+				const theirs = composeRecoveryCapsule({
+					storage: foreign.storage,
+					encryptedScb: makeScb(Network.SIGNET),
+					nodeSecret: NODE_SECRET
+				});
+				const wrongInnerKey = encryptRecoveryCapsule(
+					{
+						...theirs.capsule,
+						encryptedScb: makeScb(expectedNetwork, foreignSecret)
+					},
+					NODE_SECRET
+				);
+				const result = restoreBestRecoveryCapsule(
+					[theirs.blob, wrongInnerKey, ours.blob],
+					target,
+					NODE_SECRET,
+					{ expectedNetwork, scratchStorage }
+				);
+				expect(result.tier).to.equal(2);
+				expect(dumpTables(target)).to.equal(dumpTables(local.storage));
+			} finally {
+				local.storage.close();
+				foreign.storage.close();
+				target.close();
+			}
+		});
+
+		it('refuses a single foreign-network capsule through both tiers before replay', () => {
+			const { storage } = journaledStorage(2);
+			const target = openStorage();
+			let scratchOpens = 0;
+			const options = {
+				expectedNetwork,
+				scratchStorage: (): SqliteStorage => {
+					scratchOpens++;
+					return scratchStorage();
+				}
+			};
+			try {
+				for (const source of [undefined, storage]) {
+					const { capsule, blob } = composeRecoveryCapsule({
+						storage: source,
+						encryptedScb: makeScb(Network.SIGNET),
+						nodeSecret: NODE_SECRET
+					});
+					expect(() =>
+						restoreFromRecoveryCapsule(capsule, target, NODE_SECRET, options)
+					).to.throw();
+					expect(() =>
+						restoreBestRecoveryCapsule([blob], target, NODE_SECRET, options)
+					).to.throw(CapsuleCandidateError);
+					expect(scratchOpens).to.equal(0);
+					expect(target.loadRecoveryFrames()).to.be.empty;
+					expect(target.loadAllPreimages()).to.be.empty;
+				}
+			} finally {
+				target.close();
+				storage.close();
+			}
+		});
+
+		it('falls back from a damaged local journal to its authenticated local SCB', () => {
+			const { storage } = journaledStorage(1);
+			const target = openStorage();
+			try {
+				const ours = composeRecoveryCapsule({
+					storage,
+					encryptedScb: makeScb(expectedNetwork),
+					nodeSecret: NODE_SECRET
+				});
+				const theirs = composeRecoveryCapsule({
+					storage,
+					encryptedScb: makeScb(Network.SIGNET),
+					nodeSecret: NODE_SECRET
+				});
+				const result = restoreBestRecoveryCapsule(
+					[theirs.blob, tamperInline(ours.capsule, NODE_SECRET)],
+					target,
+					NODE_SECRET,
+					{ expectedNetwork, scratchStorage }
+				);
+				expect(result.tier).to.equal(1);
+				expect(result.scb.network).to.equal(expectedNetwork);
+				expect(target.loadRecoveryFrames()).to.be.empty;
+			} finally {
+				target.close();
+				storage.close();
+			}
+		});
+	});
 
 	it('restores the highest candidate WHOSE CHAIN VALIDATES, not the raw highest', () => {
 		const { storage, manager } = journaledStorage(2);

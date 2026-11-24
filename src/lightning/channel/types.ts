@@ -27,12 +27,30 @@ export function isAnchorChannel(channelType: Buffer | null): boolean {
 
 /**
  * Check whether a negotiated channel_type has taproot commitments: simple
- * taproot channels (bit 80/81, OPTION_TAPROOT) and the asset overlay, which
+ * taproot channels (staging 180/181, OPTION_TAPROOT) and the asset overlay, which
  * is the same commitment format with auxiliary leaves.
  */
 export function isTaprootChannel(channelType: Buffer | null): boolean {
 	if (!channelType || channelType.length === 0) return false;
 	return hasSimpleTaprootBit(channelType) || isOverlayChannel(channelType);
+}
+
+/**
+ * Admission check for a new open. Stored types retain the commitment format
+ * that was selected when the channel was created.
+ */
+export function finalTaprootOpenRefusal(
+	channelType?: Buffer | null
+): string | null {
+	if (
+		channelType &&
+		FeatureFlags.fromBuffer(channelType).hasFeature(
+			Feature.OPTION_SIMPLE_TAPROOT
+		)
+	) {
+		return 'Final Taproot channel opening is not enabled';
+	}
+	return null;
 }
 
 /**
@@ -273,6 +291,8 @@ export enum ChannelState {
 	SENT_FUNDING_SIGNED = 'SENT_FUNDING_SIGNED',
 	AWAITING_FUNDING_CONFIRMED = 'AWAITING_FUNDING_CONFIRMED',
 	AWAITING_CHANNEL_READY = 'AWAITING_CHANNEL_READY',
+	/** Final peers exchanged channel_ready; payments remain gated. */
+	CHANNEL_READY = 'CHANNEL_READY',
 	NORMAL = 'NORMAL',
 	SHUTTING_DOWN = 'SHUTTING_DOWN',
 	NEGOTIATING_CLOSING = 'NEGOTIATING_CLOSING',

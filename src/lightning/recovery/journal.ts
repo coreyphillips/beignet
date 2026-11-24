@@ -24,6 +24,8 @@
  * originals, which is what makes the rebuilt tables byte-identical.
  */
 
+import { requireLegacyWallet } from '../storage/wallet-format-guard';
+import { assertLegacyCommitmentProfile } from '../channel/commitment-profile';
 import type { IChannelState } from '../channel/channel-state';
 import { aes256GcmDecrypt, aes256GcmEncrypt } from '../crypto/provider';
 import { WIRE_SAFETY_POLICY_VERSION } from '../channel/channel-actions';
@@ -876,6 +878,7 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 		recoveryId: Buffer,
 		options: IRecoveryJournalOptions = {}
 	) {
+		requireLegacyWallet(storage);
 		if (!journalSupported(storage)) {
 			throw new Error('Storage backend does not support the recovery journal');
 		}
@@ -2647,6 +2650,7 @@ export function reconstructFromFrames(
 	frames: RecoveryFrame[],
 	options: { maxOutboxRowsPerChannel?: number } = {}
 ): void {
+	requireLegacyWallet(target);
 	const snapshotIndex = baseSnapshotIndex(frames);
 	// A journal ALWAYS begins with a snapshot (bootstrap or compaction base),
 	// so a frame set without one is a suffix of deltas whose base was lost:
@@ -2676,6 +2680,15 @@ export function reconstructFromFrames(
 			? FFOR_SNAPSHOT_SCHEMA_VERSION
 			: declaredSchema;
 	const replayEnd = lastAppliedFrameIndex(frames) + 1;
+	for (const channel of frames[snapshotIndex].snapshot!.channels) {
+		assertLegacyCommitmentProfile(channel.state);
+	}
+	for (let i = snapshotIndex + 1; i < replayEnd; i++) {
+		for (const mutation of frames[i].mutations) {
+			if (mutation.type === 'channel_state')
+				assertLegacyCommitmentProfile(mutation.state);
+		}
+	}
 	// Path_id preflight runs over the WHOLE restore set (snapshot AND replay
 	// deltas) before the first write: a refusal discovered mid-replay would
 	// leave the target partially populated and unretryable.
@@ -2800,6 +2813,7 @@ export function assertNoJournalResidue(target: IStorageBackend): void {
 
 /** Throw when the reconstruction target already holds journaled state. */
 export function assertEmptyTarget(target: IStorageBackend): void {
+	requireLegacyWallet(target);
 	if (target.saveFforVoucher && !target.loadAllFforVouchers)
 		throw new Error('Restore target cannot enumerate FFOR voucher custody');
 	// A target that can write path_id rows but cannot enumerate them could

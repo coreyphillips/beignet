@@ -17,6 +17,7 @@
  */
 
 import { timingSafeEqual } from 'crypto';
+import { assertLegacyWalletFile } from '../lightning/storage/final-wallet-format';
 import { nodeFs } from '../utils/node-builtins';
 import { acquireInstanceLock, releaseInstanceLock } from './instance-lock';
 import { SECRET_FILE_MODE, tightenMode, writeFileAtomic } from './fs-utils';
@@ -117,6 +118,7 @@ export async function restoreDbFile(
 	// would otherwise become a 0644 live database, and the pre-restore copy
 	// keeps whatever an older release left on the file it came from.
 	const staged = `${dbPath}.restoring`;
+	assertLegacyWalletFile(staged);
 	fs.copyFileSync(backupFile, staged);
 	tightenMode(staged, SECRET_FILE_MODE);
 	const markerPath = dbRestoreMarkerPath(dbPath);
@@ -138,8 +140,11 @@ export async function restoreDbFile(
 			);
 		}
 
+		assertLegacyWalletFile(staged);
+		assertLegacyWalletFile(dbPath);
 		if (fs.existsSync(dbPath)) {
 			preRestorePath = preRestoreBackupPath(dbPath, now);
+			assertLegacyWalletFile(preRestorePath);
 			fs.copyFileSync(dbPath, preRestorePath);
 			tightenMode(preRestorePath, SECRET_FILE_MODE);
 		}

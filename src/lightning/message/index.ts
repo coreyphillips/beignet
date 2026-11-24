@@ -8,6 +8,10 @@ export * from './channel-open';
 export * from './channel-funding';
 export * from './channel-update';
 export * from './channel-commitment';
+export type {
+	ICommitmentNonceDecodeOptions,
+	IFundingVerificationNonce
+} from './commitment-nonces';
 export * from './channel-close';
 export * from './channel-reestablish';
 export * from './stfu';

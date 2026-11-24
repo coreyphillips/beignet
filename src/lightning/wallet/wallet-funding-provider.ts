@@ -1,4 +1,19 @@
 import { EAddressType } from '../../types';
+import {
+	finalFundingInputs,
+	type FinalFundingWitnessSigner
+} from '../storage/final-opening-funding';
+import {
+	finalOpeningWalletOutpoints,
+	validateFinalOpening,
+	type IFinalOpeningCandidate
+} from '../storage/final-opening-candidate';
+import type { IFinalOpeningTerms } from '../channel/final-opening-commitment';
+import {
+	MIN_DUST_LIMIT_SATOSHIS,
+	MAX_DUST_LIMIT_SATOSHIS
+} from '../channel/types';
+import { DUST_LIMIT_SATS } from '../interactive-tx/validation';
 import { FixedOutputFeePool } from './fixed-output-fees';
 import type {
 	FixedOutputFeeError,
@@ -205,6 +220,8 @@ export interface IWalletLike {
  */
 export class WalletFundingProvider implements IFundingProvider {
 	private wallet: IWalletLike;
+	private readonly finalOpeningCandidates?: () => IFinalOpeningCandidate[];
+	private readonly finalSpliceOutpoints?: () => ReadonlySet<string>;
 	private fixedOutputFeePool?: FixedOutputFeePool;
 	/** Why there is no pool although a fee policy was supplied. */
 	private fixedOutputFeeRefusal?: FixedOutputFeeError;
@@ -275,6 +292,8 @@ export class WalletFundingProvider implements IFundingProvider {
 		wallet: IWalletLike,
 		options: {
 			fixedOutputFees?: IFixedOutputFeePolicy;
+			finalOpeningCandidates?: () => IFinalOpeningCandidate[];
+			finalSpliceOutpoints?: () => ReadonlySet<string>;
 			/**
 			 * A fee policy was supplied and refused. The provider is an ordinary
 			 * one that says so: it reports its pool unavailable, and a selection
@@ -284,6 +303,8 @@ export class WalletFundingProvider implements IFundingProvider {
 		} = {}
 	) {
 		this.wallet = wallet;
+		this.finalOpeningCandidates = options.finalOpeningCandidates;
+		this.finalSpliceOutpoints = options.finalSpliceOutpoints;
 		if (!options.fixedOutputFees)
 			this.fixedOutputFeeRefusal = options.fixedOutputFeeRefusal;
 		if (options.fixedOutputFees)
@@ -691,6 +712,40 @@ export class WalletFundingProvider implements IFundingProvider {
 		}
 	}
 
+	/** Read authenticated candidates and protect only inputs assigned to this wallet. */
+	private finalOpeningOutpoints(): Set<string> {
+		const reserved = finalOpeningWalletOutpoints(
+			this.finalOpeningCandidates?.() ?? []
+		);
+		for (const input of this.finalSpliceOutpoints?.() ?? [])
+			reserved.add(input);
+		return reserved;
+	}
+
+	private async renewLiveFinalPledges(
+		utxos?: readonly ISpliceUtxo[]
+	): Promise<void> {
+		if (!this.finalOpeningCandidates) return;
+		const reserved = this.finalOpeningOutpoints();
+		if (reserved.size === 0) return;
+		const refused: string[] = [];
+		for (const coin of utxos ?? this.wallet.listUtxos?.() ?? []) {
+			const outpoint = coin.tx_hash + ':' + coin.tx_pos;
+			if (!reserved.has(outpoint)) continue;
+			const refusal = await this.pledge(coin.tx_hash, coin.tx_pos, true);
+			if (refusal !== null) refused.push(outpoint);
+		}
+		if (refused.length)
+			throw new Error(
+				'Could not reserve final opening inputs ' + refused.join(', ')
+			);
+	}
+
+	renewFinalOpeningPledges(): Promise<void> {
+		if (!this.finalOpeningCandidates) return Promise.resolve();
+		return this.runSelection(() => this.renewLiveFinalPledges());
+	}
+
 	/** Unfreeze pledges whose funding tx spent them or that timed out. */
 	private async prunePledges(
 		protectedInputs?: ReadonlySet<string>
@@ -700,13 +755,18 @@ export class WalletFundingProvider implements IFundingProvider {
 			...(this.fixedOutputFeePool?.reservedOutpoints() ?? [])
 		]);
 		this.adoptStalePledges();
-		if (this.pledged.size === 0 || !this.wallet.listUtxos) return;
+		if (
+			(!this.finalOpeningCandidates && this.pledged.size === 0) ||
+			!this.wallet.listUtxos
+		)
+			return;
 		const utxos = this.wallet.listUtxos();
 		// An empty UTXO list is indistinguishable from a wallet that has not
 		// loaded or refreshed yet. Treating everything as spent would mass
 		// unfreeze valid pledges, and with no coins there is nothing a pledge
 		// could block anyway.
 		if (utxos.length === 0) return;
+		if (this.finalOpeningCandidates) await this.renewLiveFinalPledges(utxos);
 		const live = new Set(utxos.map((u) => `${u.tx_hash}:${u.tx_pos}`));
 		const now = Date.now();
 		for (const key of [...this.pledged.keys()]) {
@@ -754,27 +814,35 @@ export class WalletFundingProvider implements IFundingProvider {
 		outpoints: Array<{ txid: string; vout: number }>
 	): Promise<void> {
 		if (outpoints.length === 0) return;
-		return this.runSelection(async () => {
+		return this.runSelection(() => {
 			this.adoptStalePledges();
-			for (const { txid, vout } of outpoints) {
-				const key = `${txid}:${vout}`;
-				if (
-					!this.pledged.has(key) ||
-					this.fixedOutputFeePool?.isReserved(txid, vout)
-				)
-					continue;
-				if (await this.releasePledge(txid, vout)) {
-					this.pledged.delete(key);
-					this.renewedPledges.delete(key);
-					continue;
-				}
-				// The coin is still frozen. Keep the entry, but age it out so
-				// the next prune retries the unfreeze instead of holding the
-				// release for a TTL nothing is waiting on any more.
-				this.pledged.set(key, 0);
-				this.renewedPledges.delete(key);
-			}
+			return this.releaseInputPledgesLocked(outpoints);
 		});
+	}
+
+	private async releaseInputPledgesLocked(
+		outpoints: Array<{ txid: string; vout: number }>
+	): Promise<void> {
+		const final = this.finalOpeningOutpoints();
+		for (const { txid, vout } of outpoints) {
+			const key = `${txid}:${vout}`;
+			if (
+				!this.pledged.has(key) ||
+				final.has(key) ||
+				this.fixedOutputFeePool?.isReserved(txid, vout)
+			)
+				continue;
+			if (await this.releasePledge(txid, vout)) {
+				this.pledged.delete(key);
+				this.renewedPledges.delete(key);
+				continue;
+			}
+			// The coin is still frozen. Keep the entry, but age it out so
+			// the next prune retries the unfreeze instead of holding the
+			// release for a TTL nothing is waiting on any more.
+			this.pledged.set(key, 0);
+			this.renewedPledges.delete(key);
+		}
 	}
 
 	async buildFundingTransaction(
@@ -919,7 +987,8 @@ export class WalletFundingProvider implements IFundingProvider {
 	async selectSpliceInputs(
 		amountSats: bigint,
 		feeratePerKw: number,
-		opts?: IUtxoSelectionOpts
+		opts?: IUtxoSelectionOpts,
+		taprootSharedInput = false
 	): Promise<{ inputs: ISpliceWalletInput[]; changeScript: Buffer }> {
 		// Cover the splice amount plus the splice tx fee, recomputed per added
 		// input using the SAME weight formula the channel uses to derive change.
@@ -929,6 +998,7 @@ export class WalletFundingProvider implements IFundingProvider {
 				amountSats +
 				spliceFeeSats(
 					estimateSpliceTxWeight({
+						taprootSharedInput,
 						walletInputCount: selectedCount,
 						changeScriptLen: 22
 					}),
@@ -1038,7 +1108,10 @@ export class WalletFundingProvider implements IFundingProvider {
 	 * sweeps every spendable UTXO; the change output the weight includes is
 	 * dropped as dust by the channel, a slight, safe overestimate of the fee.
 	 */
-	quoteSpliceIn(feeratePerKw: number): {
+	quoteSpliceIn(
+		feeratePerKw: number,
+		taprootSharedInput = false
+	): {
 		spendableSats: bigint;
 		feeSats: bigint;
 		maxAmountSats: bigint;
@@ -1048,6 +1121,7 @@ export class WalletFundingProvider implements IFundingProvider {
 		const spendableSats = candidates.reduce((s, u) => s + BigInt(u.value), 0n);
 		const feeSats = spliceFeeSats(
 			estimateSpliceTxWeight({
+				taprootSharedInput,
 				walletInputCount: Math.max(1, candidates.length),
 				changeScriptLen: 22
 			}),
@@ -1390,11 +1464,228 @@ export class WalletFundingProvider implements IFundingProvider {
 		// Pledge every selected coin: it now belongs to a funding negotiation
 		// whose tx may not broadcast for a while, and no concurrent funding
 		// (this method OR wallet.send) may double-spend it in the meantime.
-		for (const utxo of selected) {
-			await this.pledgeOrThrow(utxo.tx_hash, utxo.tx_pos);
+		const acquired: Array<{ txid: string; vout: number }> = [];
+		try {
+			for (const coin of selected) {
+				await this.pledgeOrThrow(coin.tx_hash, coin.tx_pos);
+				acquired.push({ txid: coin.tx_hash, vout: coin.tx_pos });
+			}
+		} catch (error) {
+			// Selection still owns the lock. Reused inputs were never added to this list.
+			await this.releaseInputPledgesLocked(acquired);
+			throw error;
 		}
 
 		return { inputs, changeScript };
+	}
+
+	/** Recover only the selected funding outpoints. Reading an existing outgoing message needs no wallet. */
+	async resolveFinalOpeningInputs(
+		candidate: IFinalOpeningCandidate,
+		terms?: IFinalOpeningTerms
+	): Promise<FinalFundingWitnessSigner> {
+		const retained: IFinalOpeningCandidate = JSON.parse(
+			validateFinalOpening(candidate).encoded
+		);
+		const { tx, prevouts, local } = finalFundingInputs(retained);
+		const limits = terms
+			? [terms.localDustLimitSatoshis, terms.remoteDustLimitSatoshis]
+			: [];
+		if (
+			limits.some(
+				(v) =>
+					!Number.isSafeInteger(v) ||
+					v < MIN_DUST_LIMIT_SATOSHIS ||
+					v > MAX_DUST_LIMIT_SATOSHIS
+			)
+		)
+			throw new Error('Invalid opening change dust limit');
+		const dust = BigInt(Math.max(Number(DUST_LIMIT_SATS), ...limits));
+		const change = tx.outs.filter(
+			(_, i) =>
+				i !== retained.fundingOutputIndex &&
+				(BigInt(retained.outputSerialIds[i]) % 2n === 0n) ===
+					retained.isInitiator
+		);
+		const fee =
+			local.reduce((v, i) => v + prevouts.values[i], 0n) -
+			BigInt(retained.localContributionSats) -
+			change.reduce((v, out) => v + BigInt(out.value), 0n);
+		const feeShare = local.length
+			? spliceFeeSats(
+					dualFundingContributionWeight(local.length, retained.isInitiator),
+					retained.fundingFeeratePerKw
+			  )
+			: 0n;
+		if (fee > feeShare + (change.length || !local.length ? 0n : dust - 1n))
+			throw new Error(
+				'Final opening spends more than the local contribution and its fee share'
+			);
+		return this.finalFundingSigner(
+			tx,
+			prevouts,
+			local,
+			change,
+			retained.inputs.map((i) => i.prevTxHex)
+		);
+	}
+
+	async resolveFinalSpliceInputs(
+		request: import('../channel/final-splice-session').ISpliceSignatureRequest
+	): Promise<FinalFundingWitnessSigner> {
+		const { candidate: c, intent } = request;
+		const tx = c.tx.clone();
+		const inputs = c.localInputs.map((index) => {
+			const v = tx.ins[index];
+			const source = intent.inputs.find(
+				(i) =>
+					i.vout === v.index &&
+					bitcoin.Transaction.fromHex(i.prevTxHex).getHash().equals(v.hash) &&
+					i.sequence === v.sequence
+			);
+			if (!source)
+				throw new Error('Splice signer refused an unselected wallet outpoint');
+			return source;
+		});
+		if (inputs.length !== intent.inputs.length)
+			throw new Error('Splice omitted a selected wallet input');
+		const scripts = tx.ins.map((_, i) => {
+			const pos = c.localInputs.indexOf(i);
+			return pos < 0 ? '' : inputs[pos].prevTxHex;
+		});
+		const change =
+			BigInt(intent.localDelta) > 0n
+				? intent.outputs.map((o) => ({ script: Buffer.from(o.script, 'hex') }))
+				: [];
+		return this.finalFundingSigner(
+			tx,
+			{
+				scripts: c.scripts.map((b) => Buffer.from(b)),
+				values: c.values.map(BigInt)
+			},
+			[...c.localInputs],
+			change,
+			scripts
+		);
+	}
+
+	private finalFundingSigner(
+		tx: bitcoin.Transaction,
+		prevouts: { scripts: Buffer[]; values: bigint[] },
+		local: number[],
+		change: readonly { script: Buffer }[],
+		inputHex: string[]
+	): Promise<FinalFundingWitnessSigner> {
+		const expectedHex = tx.toHex();
+		const checkWallet = (): ISpliceUtxo[] => {
+			const wallet = this.wallet;
+			if (!wallet.listUtxos || !wallet.getAddressFromScriptHash)
+				throw new Error('Final opening requires wallet ownership lookup');
+			if (
+				local.length &&
+				(!wallet.getPrivateKey ||
+					!wallet.listFrozenUtxos ||
+					!wallet.isUtxoFrozen)
+			)
+				throw new Error('Final opening requires pledged wallet inputs');
+			const network = this.bitcoinJsNetwork();
+			const descriptor = (
+				script: Buffer
+			): ReturnType<NonNullable<IWalletLike['getAddressFromScriptHash']>> => {
+				const owned = wallet.getAddressFromScriptHash!(
+					bitcoin.crypto.sha256(script).reverse().toString('hex')
+				);
+				if (!owned) return undefined;
+				const pubkey = Buffer.from(owned.publicKey, 'hex');
+				const kind = scriptKind(script);
+				const derived =
+					kind === 'p2tr'
+						? bitcoin.payments.p2tr({
+								internalPubkey: pubkey.subarray(1),
+								network
+						  }).output
+						: kind === 'p2wpkh'
+						? bitcoin.payments.p2wpkh({ pubkey, network }).output
+						: undefined;
+				if (
+					!derived?.equals(script) ||
+					!bitcoin.address.toOutputScript(owned.address, network).equals(script)
+				)
+					throw new Error(
+						'Final opening script does not match wallet derivation'
+					);
+				return owned;
+			};
+			for (const out of change) {
+				if (!descriptor(out.script))
+					throw new Error('Final opening change does not belong to the wallet');
+			}
+			const listed = wallet.listUtxos();
+			const freezes = wallet.listFrozenUtxos?.() ?? [];
+			const coins: ISpliceUtxo[] = [];
+			for (const [i, input] of tx.ins.entries()) {
+				const hash = Buffer.from(input.hash).reverse().toString('hex');
+				const coin = listed.find(
+					(c) => c.tx_hash === hash && c.tx_pos === input.index
+				);
+				const owned = descriptor(prevouts.scripts[i]);
+				if (!local.includes(i)) {
+					if (owned || coin)
+						throw new Error('Peer funding input belongs to the wallet');
+					continue;
+				}
+				if (
+					!owned ||
+					!coin ||
+					coin.value !== Number(prevouts.values[i]) ||
+					coin.address !== owned.address ||
+					coin.publicKey !== owned.publicKey ||
+					coin.path !== owned.path
+				)
+					throw new Error(
+						'Final opening input is missing its original wallet derivation or amount'
+					);
+				const frozen = freezes.find(
+					(f) => f.tx_hash === hash && f.tx_pos === input.index
+				);
+				if (
+					frozen?.freezeTag !== WalletFundingProvider.PLEDGE_TAG ||
+					!wallet.isUtxoFrozen!(hash, input.index)
+				)
+					throw new Error('Final opening input is missing its funding pledge');
+				coins.push(coin);
+			}
+			return coins;
+		};
+		return this.runSelection(async () => {
+			checkWallet();
+			return (unsigned, indices, provided) => {
+				if (
+					unsigned.toHex() !== expectedHex ||
+					indices.length !== local.length ||
+					!local.every((index, n) => indices[n] === index) ||
+					provided.scripts.length !== prevouts.scripts.length ||
+					provided.values.length !== prevouts.values.length ||
+					!prevouts.scripts.every(
+						(s, i) =>
+							s.equals(provided.scripts[i]) &&
+							prevouts.values[i] === provided.values[i]
+					)
+				)
+					throw new Error(
+						'Funding signer received a different transaction or prevouts'
+					);
+				const coins = checkWallet();
+				return local.map((index, n) =>
+					this.walletInput(
+						coins[n],
+						inputHex[index],
+						'final opening',
+						tx.ins[index].sequence
+					).signWitness(tx, index, prevouts.values[index], prevouts)
+				);
+			};
+		});
 	}
 
 	private walletInput(

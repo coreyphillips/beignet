@@ -457,6 +457,44 @@ describe('Funding input pledges', function () {
 	});
 
 	describe('releaseInputPledges (issue #311)', function () {
+		it('rolls back fresh splice pledges if a later coin refuses its freeze', async function () {
+			const { wallet, frozen, utxos } = makeWallet([
+				100_000, 100_000, 100_000, 100_000
+			]);
+			const provider = new WalletFundingProvider(wallet as never);
+			const held = await provider.selectSpliceInputs(
+				50000n,
+				1000,
+				undefined,
+				true
+			);
+			const reserved = outpoints(held.inputs)[0];
+			const user = utxos.find((coin) => coin.tx_hash + ':0' !== reserved)!;
+			await wallet.freezeUtxo({ txid: user.tx_hash, index: 0 });
+			const freeze = wallet.freezeUtxo;
+			let n = 0;
+			(wallet as { freezeUtxo: unknown }).freezeUtxo = async (
+				params: Parameters<typeof freeze>[0]
+			) => (++n === 2 ? errResult('second freeze refused') : freeze(params));
+			let failure: unknown;
+			try {
+				await provider.selectSpliceInputs(150000n, 1000, undefined, true);
+			} catch (err) {
+				failure = err;
+			}
+			expect(String(failure)).to.include('second freeze refused');
+			expect([...frozen.keys()].sort()).to.deep.equal(
+				[reserved, user.tx_hash + ':0'].sort()
+			);
+			const retry = await provider.selectSpliceInputs(
+				150000n,
+				1000,
+				undefined,
+				true
+			);
+			expect(retry.inputs).to.have.length(2);
+		});
+
 		it('releases a selection pledge so the coin is selectable at once', async function () {
 			const { wallet, unfrozenLog } = makeWallet([100_000, 100_000]);
 			const provider = new WalletFundingProvider(wallet as never);

@@ -76,16 +76,9 @@ export enum Feature {
 	SPLICE = 62,
 	/** option_zero_reserve, init and node announcement scope (BOLTs proposal 1140). */
 	OPTION_ZERO_RESERVE = 64,
-	/**
-	 * Simple taproot channels (option_taproot, lightning/bolts PR #995): MuSig2
-	 * key-spend P2TR funding + taproot commitment/HTLC outputs.
-	 *
-	 * Bits 180/181 — LND's *staging* assignment (`simple-taproot-chans-x`), which
-	 * is what LND v0.20 actually advertises (verified live: getinfo shows feature
-	 * 181). The "final" bits 80/81 are reserved in the spec but NOT yet activated
-	 * by any production node, so we negotiate the staging bit for interop. With
-	 * base=180, setOptional() advertises bit 181, matching LND exactly.
-	 */
+	/** Final simple Taproot channel type. Live opening requires final-format signing. */
+	OPTION_SIMPLE_TAPROOT = 80,
+	/** Staging simple Taproot channel type used by existing channels and the asset overlay. */
 	OPTION_TAPROOT = 180,
 	/**
 	 * Liquidity ads / option_will_fund (bLIP-0051): advertises that this node

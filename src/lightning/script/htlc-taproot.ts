@@ -5,26 +5,23 @@
  * P2TR HTLC output through its 2-of-2 tapscript leaf (offered→timeout leaf,
  * received→success leaf) and pay into a taproot second-level output (the
  * REVOCATION key as internal key + a single CSV-delay leaf — LND's
- * TaprootSecondLevelScriptTree, NOT the to_local script). Both parties sign
- * the SAME BIP342 tapscript-path sighash with their HTLC key — these are plain
- * BIP340 Schnorr signatures (only the funding output uses MuSig2), so they ride
- * in commitment_signed's htlc_signatures exactly like the legacy ECDSA ones.
+ * TaprootSecondLevelScriptTree). Each party signs the tapscript spend with its
+ * HTLC key. Only the funding output uses MuSig2.
  *
- * Taproot simple channels are zero-fee-HTLC (option_anchors): the second-level
- * tx pays no fee (output value = full HTLC amount) and is fee-bumped by the
- * broadcaster, who attaches its own input(s)/change. To allow that, the HTLC
- * signatures use SIGHASH_SINGLE | SIGHASH_ANYONECANPAY (taproot 0x83) — exactly
- * as the legacy option_anchors ECDSA path does — so each sig commits only to its
- * own input (the HTLC output) and the single corresponding output. The 64-byte
- * Schnorr signature is what travels in commitment_signed.htlc_signatures (the
- * 0x83 sighash byte is implicit and appended only when building the witness).
+ * The peer sends a 64-byte BIP340 signature in commitment_signed. For ordinary
+ * Taproot channels the implicit sighash is SINGLE|ANYONECANPAY (0x83), which
+ * lets the broadcaster add fee inputs while preserving the matching output.
+ * Append the sighash byte when assembling that signature's witness. The
+ * broadcaster may sign its own input with SIGHASH_DEFAULT on the finished
+ * transaction, as in Eclair's final Taproot transaction vectors.
  */
 
 import * as bitcoin from 'bitcoinjs-lib';
-import type { ITaprootAuxLeaf } from './commitment-taproot';
+import type { TaprootOutputFormat } from './commitment-taproot';
 import { tapleafHash as bip341TapleafHash } from 'bitcoinjs-lib/src/payments/bip341';
 import { ecc } from '../../utils/ecc';
 import {
+	assertFinalTaprootHtlcExpiry,
 	buildTaprootSecondLevelOutput,
 	TAPLEAF_VERSION
 } from './commitment-taproot';
@@ -85,7 +82,7 @@ export function buildTaprootHtlcSuccessTx(
 	localDelayedPubkey: Buffer,
 	toSelfDelay: number,
 	network: bitcoin.Network = bitcoin.networks.bitcoin,
-	auxiliaryLeaf?: ITaprootAuxLeaf
+	format?: TaprootOutputFormat
 ): bitcoin.Transaction {
 	return buildSecondLevel(
 		htlcTxid,
@@ -96,7 +93,7 @@ export function buildTaprootHtlcSuccessTx(
 		toSelfDelay,
 		0,
 		network,
-		auxiliaryLeaf
+		format
 	);
 }
 
@@ -114,8 +111,9 @@ export function buildTaprootHtlcTimeoutTx(
 	localDelayedPubkey: Buffer,
 	toSelfDelay: number,
 	network: bitcoin.Network = bitcoin.networks.bitcoin,
-	auxiliaryLeaf?: ITaprootAuxLeaf
+	format?: TaprootOutputFormat
 ): bitcoin.Transaction {
+	if (format === 'final') assertFinalTaprootHtlcExpiry(cltvExpiry);
 	return buildSecondLevel(
 		htlcTxid,
 		htlcOutputIndex,
@@ -125,7 +123,7 @@ export function buildTaprootHtlcTimeoutTx(
 		toSelfDelay,
 		cltvExpiry,
 		network,
-		auxiliaryLeaf
+		format
 	);
 }
 
@@ -138,7 +136,7 @@ function buildSecondLevel(
 	toSelfDelay: number,
 	nLockTime: number,
 	network: bitcoin.Network,
-	auxiliaryLeaf?: ITaprootAuxLeaf
+	format?: TaprootOutputFormat
 ): bitcoin.Transaction {
 	const tx = new bitcoin.Transaction();
 	tx.version = 2;
@@ -156,7 +154,7 @@ function buildSecondLevel(
 		localDelayedPubkey,
 		toSelfDelay,
 		network,
-		auxiliaryLeaf
+		format
 	);
 	// Zero-fee: the whole HTLC amount carries over (fee comes from CPFP/anchor).
 	tx.addOutput(out.output, Number(htlcAmount));

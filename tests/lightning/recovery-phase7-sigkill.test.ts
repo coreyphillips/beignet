@@ -24,7 +24,8 @@
  */
 
 import { expect } from 'chai';
-import { ChildProcess, spawn } from 'child_process';
+import { ChildProcess, spawn, spawnSync } from 'child_process';
+import type Database from 'better-sqlite3';
 import crypto from 'crypto';
 import fs from 'fs';
 import os from 'os';
@@ -40,11 +41,194 @@ import {
 	xOnlyFromSecret
 } from '../../src/lightning/recovery';
 import { createChaosNode } from './helpers/chaos-harness';
+import { SqliteStorage } from '../../src/lightning/storage/sqlite-storage';
+import { opening, wallet, localFundingSecret } from './helpers/final-opening';
+
+import { alice, bob, peers } from './helpers/final-opening-signing';
+import { seedFor } from './helpers/taproot-revoked-fixture';
 
 const CHILD = path.join(__dirname, 'helpers', 'chaos-node-child.cjs');
 const REPO_ROOT = path.join(__dirname, '..', '..');
 const VICTIM_SEED = 171;
 const PEER_SEED = 172;
+
+describe('Final opening commitment signatures across SIGKILL', () => {
+	for (const operation of ['sign', 'accept'] as const) {
+		for (const boundary of [
+			'before-device-result',
+			'during-update',
+			'after-return'
+		]) {
+			it(operation + ' restarts after SIGKILL at ' + boundary, () => {
+				const dir = fs.mkdtempSync(
+					path.join(os.tmpdir(), 'opening-signature-kill-')
+				);
+				let reopened: SqliteStorage | undefined;
+				const fixture = peers(dir);
+				const { a, b, aFile, id, terms, bTerms } = fixture;
+				try {
+					const peer =
+						operation === 'accept'
+							? b.signFinalPeerCommitment(id, bTerms, bob.root, bob.index)
+							: undefined;
+					a.close();
+					const child = spawnSync(
+						process.execPath,
+						[path.join(__dirname, 'helpers', 'final-opening-crash-child.cjs')],
+						{
+							cwd: REPO_ROOT,
+							encoding: 'utf8',
+							timeout: 20_000,
+							input: JSON.stringify({
+								file: aFile,
+								channelId: id,
+								operation,
+								boundary,
+								terms,
+								channelIndex: alice.index,
+								walletSeed: seedFor(840).toString('hex'),
+								peerCommitment: peer?.toString('hex'),
+								nodeId: alice.binding.nodeId,
+								encryptionKey: alice.binding.encryptionKey.toString('hex'),
+								network: 'regtest'
+							})
+						}
+					);
+					expect(child.signal, child.stderr).to.equal('SIGKILL');
+					reopened = SqliteStorage.openFinalWallet(aFile, alice.binding);
+					const saved =
+						operation === 'accept'
+							? reopened.loadFinalOpeningExit(id)
+							: reopened.loadFinalPeerCommitment(id);
+					if (boundary !== 'after-return') {
+						expect(child.stdout).to.equal(boundary);
+						expect(saved).to.equal(null);
+					} else {
+						expect(saved?.toString('hex')).to.equal(child.stdout);
+					}
+					// An interrupted operation can complete only its original transcript.
+					const resume = (): Buffer =>
+						operation === 'accept'
+							? reopened!.acceptFinalPeerCommitment(
+									id,
+									terms,
+									alice.root,
+									alice.index,
+									peer!
+							  )
+							: reopened!.signFinalPeerCommitment(
+									id,
+									terms,
+									alice.root,
+									alice.index
+							  );
+					const replay = resume();
+					expect(resume().equals(replay)).to.equal(true);
+					if (saved) expect(replay.equals(saved)).to.equal(true);
+					if (operation === 'sign')
+						expect(
+							b.acceptFinalPeerCommitment(
+								id,
+								bTerms,
+								bob.root,
+								bob.index,
+								replay
+							).length
+						).to.be.greaterThan(100);
+					else
+						expect(reopened.loadFinalOpeningExit(id)?.equals(replay)).to.equal(
+							true
+						);
+				} finally {
+					a.close();
+					b.close();
+					reopened?.close();
+					fs.rmSync(dir, { recursive: true, force: true });
+				}
+			});
+		}
+	}
+});
+
+describe('Final opening nonce reservation across SIGKILL', () => {
+	for (const boundary of ['during-update', 'after-return'] as const) {
+		it(
+			'restores the committed candidate and nonce record when killed ' +
+				boundary,
+			() => {
+				const file = tempDb('final-opening-kill');
+				let store: SqliteStorage | undefined;
+				const candidate = opening();
+				const ciphertext = (s: SqliteStorage): string => {
+					const raw = (s as unknown as { db: Database.Database }).db;
+					return raw
+						.prepare(
+							'SELECT nonces_json FROM final_opening_candidates WHERE channel_id = ?'
+						)
+						.pluck()
+						.get(candidate.channelId) as string;
+				};
+				try {
+					store = SqliteStorage.createFinalWallet(file, wallet);
+					store.rememberFinalOpening(candidate);
+					const before = ciphertext(store);
+					store.close();
+					store = undefined;
+					const child = spawnSync(
+						process.execPath,
+						[path.join(__dirname, 'helpers', 'final-opening-crash-child.cjs')],
+						{
+							cwd: REPO_ROOT,
+							input: JSON.stringify({
+								file,
+								boundary,
+								channelId: candidate.channelId,
+								nodeId: wallet.nodeId,
+								network: wallet.network,
+								encryptionKey: wallet.encryptionKey.toString('hex'),
+								fundingKey: localFundingSecret.toString('hex')
+							}),
+							encoding: 'utf8',
+							timeout: 10_000
+						}
+					);
+					if (child.error) throw child.error;
+					expect(child.signal, child.stderr).to.equal('SIGKILL');
+					store = SqliteStorage.openFinalWallet(file, wallet);
+					expect(store.loadFinalOpening(candidate.channelId)).to.deep.equal(
+						candidate
+					);
+					const committed = ciphertext(store);
+					const replay = store.finalOpeningTxComplete(
+						candidate.channelId,
+						localFundingSecret
+					);
+					if (boundary === 'during-update') {
+						expect(child.stdout).to.equal('during-update');
+						expect(committed).to.equal(before);
+						expect(ciphertext(store)).to.not.equal(before);
+					} else {
+						expect(child.stdout).to.equal(replay.toString('hex'));
+						expect(committed).to.not.equal(before);
+						expect(ciphertext(store)).to.equal(committed);
+					}
+					store.close();
+					store = undefined;
+					store = SqliteStorage.openFinalWallet(file, wallet);
+					expect(
+						store.finalOpeningTxComplete(
+							candidate.channelId,
+							localFundingSecret
+						)
+					).to.deep.equal(replay);
+				} finally {
+					store?.close();
+					fs.rmSync(path.dirname(file), { recursive: true, force: true });
+				}
+			}
+		);
+	}
+});
 
 interface IChildHandle {
 	proc: ChildProcess;

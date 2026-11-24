@@ -1,8 +1,7 @@
 # BOLT Conformance Vectors — Provenance
 
-These vectors are vendored **verbatim** from the official Lightning Network
-specification so beignet can be asserted against the spec's canonical truth
-rather than hand-written fixtures.
+These fixtures preserve upstream test values. The table identifies their source
+and any selection of fields used in the conformance tests.
 
 - **Upstream repo:** https://github.com/lightning/bolts
 - **Commit:** `94eb038c42e664dd7862faeec6508ccd25f63ff8` (master, fetched 2026-06-25; re-verified still master 2026-07-17)
@@ -15,6 +14,8 @@ rather than hand-written fixtures.
 | `bolt03/commitment.json` | `03-transactions.md` — Appendix C: Commitment and HTLC Transaction Test Vectors (non-anchor) |
 | `bolt03/per-commitment-secrets.json` | `03-transactions.md` — Appendix D: Per-commitment Secret Generation Test Vectors |
 | `bolt03/commitment-anchors.json` | `03-transactions.md` — Appendix F: Commitment and HTLC Transaction Test Vectors (anchors) |
+| `bolt03/simple-taproot-scripts.json` | Public keys, lock parameters and script trees from the [BOLT Simple Taproot test vectors](https://github.com/lightning/bolts/blob/191462825ae341f0a27098765c075f01ca9bc6c2/bolt-simple-taproot.md#test-vectors). |
+| `bolt03/simple-taproot-transactions.json` | Funding transaction, payment basepoints and public fields of all three signed commitments and seven signed HTLC transactions from [Eclair v0.14.0](https://github.com/ACINQ/eclair/blob/ec8c63b215b98148887237e3f050342a6ca61f4c/eclair-core/src/test/resources/bolt3-tx-test-vectors-simple-taproot-commitment-format.json). The signed transaction bytes also match the BOLT vectors. |
 | `bolt04/onion.json` | `bolt04/onion-test.json` |
 | `bolt04/route-blinding.json` | `bolt04/route-blinding-test.json` |
 | `bolt04/blinded-payment-onion.json` | `bolt04/blinded-payment-onion-test.json` |
@@ -35,7 +36,8 @@ payer's checks refuse it. Upstream's "Non canonical signature (high-S) with
 'n' field defined" vector also carries two `s` fields, so `decode()` refuses
 it on the duplicate first; the test checks its high-S signature separately.
 
-Each other JSON carries a `_source` field naming its upstream origin. Values are the
+The two simple Taproot tests record source hashes alongside the assertions.
+The other BOLT JSON wrappers carry a `_source` field naming their upstream origin. Values are the
 spec's hex/decimal as published; the JSON wrappers only reshape them into
 machine-loadable records (no values altered — uint64-range decimals are quoted
 as strings so JSON.parse cannot lose precision). To re-sync, refetch the files

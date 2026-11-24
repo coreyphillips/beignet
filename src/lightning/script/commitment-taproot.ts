@@ -1,5 +1,5 @@
 /**
- * Simple taproot channels (option_taproot): commitment output scripts.
+ * Commitment output scripts for staging and final simple Taproot channels.
  *
  * The to_local and to_remote commitment outputs become P2TR. Key-path spends are
  * disabled by using the BIP341 NUMS point as the internal key, so funds move only
@@ -8,11 +8,7 @@
  *     leaf (mirrors the legacy OP_IF revocation / ELSE delay branches).
  *   - to_remote: a single 1-block-CSV leaf (anchor-style).
  *
- * BIP341 tweak / merkle / control-block construction is delegated to bitcoinjs
- * (initEccLib), which is well-tested; this module only defines the leaf scripts
- * and assembles the outputs. NOTE: exact-byte parity with LND's option_taproot is
- * pinned at interop (Phase 7); the leaf opcode order is documented here so any
- * divergence can be diffed and corrected against a live LND channel.
+ * bitcoinjs builds the BIP341 trees, output keys and control blocks.
  */
 
 import * as bitcoin from 'bitcoinjs-lib';
@@ -40,12 +36,19 @@ export interface ITaprootAuxLeaf {
 }
 
 /**
+ * An omitted argument selects the staging Bitcoin scripts. An auxiliary leaf
+ * extends the staging tree for an asset channel. Final Bitcoin scripts use
+ * the explicit 'final' format and have no auxiliary leaf.
+ */
+export type TaprootOutputFormat = ITaprootAuxLeaf | 'final';
+
+/**
  * `tree` with the auxiliary leaf committed beside it, as the right child of
  * a new root. Without a leaf the tree is returned as it is, so an output
  * built without one has the key it always had.
  */
-function withAuxLeaf(tree: Taptree, leaf?: ITaprootAuxLeaf): Taptree {
-	if (!leaf) return tree;
+function withAuxLeaf(tree: Taptree, leaf?: TaprootOutputFormat): Taptree {
+	if (!leaf || leaf === 'final') return tree;
 	const version = leaf.leafVersion ?? TAPLEAF_VERSION;
 	if (
 		!Buffer.isBuffer(leaf.script) ||
@@ -110,20 +113,43 @@ export function tweakTaprootKeyPathPrivkey(
 }
 
 /**
- * to_local CSV-delayed self-spend leaf:
- *   <local_delayed_key> OP_CHECKSIG <to_self_delay> OP_CHECKSEQUENCEVERIFY OP_DROP
+ * Staging leaves the signature result on the stack and drops the CSV operand.
+ * Final verifies the signature immediately and leaves the delay as the result.
  */
-export function buildTaprootToLocalDelayScript(
-	localDelayedPubkey: Buffer,
-	toSelfDelay: number
-): Buffer {
-	return script.compile([
-		toXOnly(localDelayedPubkey),
+function delayedSignature(
+	pubkey: Buffer,
+	delay: number,
+	format?: TaprootOutputFormat
+): (number | Buffer)[] {
+	if (format === 'final') {
+		if (!Number.isInteger(delay) || delay < 1 || delay > 0xffff) {
+			throw new Error('Final Taproot CSV delay must be a positive uint16');
+		}
+		return [
+			toXOnly(pubkey),
+			opcodes.OP_CHECKSIGVERIFY,
+			script.number.encode(delay),
+			opcodes.OP_CHECKSEQUENCEVERIFY
+		];
+	}
+	return [
+		toXOnly(pubkey),
 		opcodes.OP_CHECKSIG,
-		script.number.encode(toSelfDelay),
+		script.number.encode(delay),
 		opcodes.OP_CHECKSEQUENCEVERIFY,
 		opcodes.OP_DROP
-	]);
+	];
+}
+
+/** Build the CSV-delayed spend leaf for a commitment or second-level output. */
+export function buildTaprootToLocalDelayScript(
+	localDelayedPubkey: Buffer,
+	toSelfDelay: number,
+	format?: TaprootOutputFormat
+): Buffer {
+	return script.compile(
+		delayedSignature(localDelayedPubkey, toSelfDelay, format)
+	);
 }
 
 /**
@@ -148,18 +174,12 @@ export function buildTaprootToLocalRevokeScript(
 	]);
 }
 
-/**
- * to_remote leaf (anchor-style 1-block CSV):
- *   <remote_key> OP_CHECKSIG OP_1 OP_CHECKSEQUENCEVERIFY OP_DROP
- */
-export function buildTaprootToRemoteScript(remotePubkey: Buffer): Buffer {
-	return script.compile([
-		toXOnly(remotePubkey),
-		opcodes.OP_CHECKSIG,
-		script.number.encode(1),
-		opcodes.OP_CHECKSEQUENCEVERIFY,
-		opcodes.OP_DROP
-	]);
+/** Build the to_remote spend leaf with a one-block delay. */
+export function buildTaprootToRemoteScript(
+	remotePubkey: Buffer,
+	format?: TaprootOutputFormat
+): Buffer {
+	return script.compile(delayedSignature(remotePubkey, 1, format));
 }
 
 /** A tapscript leaf plus the control block needed to spend it. */
@@ -205,14 +225,15 @@ export function buildTaprootToLocalOutput(
 	localDelayedPubkey: Buffer,
 	toSelfDelay: number,
 	network: bitcoin.Network = bitcoin.networks.bitcoin,
-	auxiliaryLeaf?: ITaprootAuxLeaf
+	format?: TaprootOutputFormat
 ): ITaprootCommitOutput & {
 	delay: ITaprootLeafSpend;
 	revoke: ITaprootLeafSpend;
 } {
 	const delayScript = buildTaprootToLocalDelayScript(
 		localDelayedPubkey,
-		toSelfDelay
+		toSelfDelay,
+		format
 	);
 	const revokeScript = buildTaprootToLocalRevokeScript(
 		revocationPubkey,
@@ -221,7 +242,7 @@ export function buildTaprootToLocalOutput(
 	// Leaf order: [delay, revoke]. (Document for LND byte-diff at interop.)
 	const scriptTree = withAuxLeaf(
 		[{ output: delayScript }, { output: revokeScript }],
-		auxiliaryLeaf
+		format
 	);
 	const base = bitcoin.payments.p2tr({
 		internalPubkey: TAPROOT_NUMS_KEY,
@@ -268,14 +289,15 @@ export function buildTaprootSecondLevelOutput(
 	localDelayedPubkey: Buffer,
 	toSelfDelay: number,
 	network: bitcoin.Network = bitcoin.networks.bitcoin,
-	auxiliaryLeaf?: ITaprootAuxLeaf
+	format?: TaprootOutputFormat
 ): ITaprootCommitOutput & { merkleRoot: Buffer; delay: ITaprootLeafSpend } {
 	const delayScript = buildTaprootToLocalDelayScript(
 		localDelayedPubkey,
-		toSelfDelay
+		toSelfDelay,
+		format
 	);
 	const internalPubkey = toXOnly(revocationPubkey);
-	const scriptTree = withAuxLeaf({ output: delayScript }, auxiliaryLeaf);
+	const scriptTree = withAuxLeaf({ output: delayScript }, format);
 	const base = bitcoin.payments.p2tr({ internalPubkey, scriptTree, network });
 	return {
 		merkleRoot: base.hash!,
@@ -302,10 +324,10 @@ export function buildTaprootSecondLevelOutput(
 export function buildTaprootToRemoteOutput(
 	remotePubkey: Buffer,
 	network: bitcoin.Network = bitcoin.networks.bitcoin,
-	auxiliaryLeaf?: ITaprootAuxLeaf
+	format?: TaprootOutputFormat
 ): ITaprootCommitOutput & { spend: ITaprootLeafSpend } {
-	const leaf = buildTaprootToRemoteScript(remotePubkey);
-	const scriptTree = withAuxLeaf({ output: leaf }, auxiliaryLeaf);
+	const leaf = buildTaprootToRemoteScript(remotePubkey, format);
+	const scriptTree = withAuxLeaf({ output: leaf }, format);
 	const base = bitcoin.payments.p2tr({
 		internalPubkey: TAPROOT_NUMS_KEY,
 		scriptTree,
@@ -340,14 +362,15 @@ export function buildTaprootToRemoteOutput(
 // We keep beignet's local/remote naming and map accordingly per leaf.
 
 /**
- * Offered-HTLC success leaf — the receiver (remote) claims with the preimage,
- * after a 1-block CSV (LND SenderHTLCTapLeafSuccess):
+ * Offered-HTLC success leaf. The receiver claims with the preimage after
+ * one block. The staging encoding is
  *   OP_SIZE 32 EQUALVERIFY OP_HASH160 <rmd160(ph)> EQUALVERIFY
  *   <receiver=remote> OP_CHECKSIG OP_1 OP_CSV OP_DROP
  */
 export function buildTaprootOfferedHtlcSuccessLeaf(
 	remoteHtlcPubkey: Buffer,
-	paymentHash: Buffer
+	paymentHash: Buffer,
+	format?: TaprootOutputFormat
 ): Buffer {
 	return script.compile([
 		opcodes.OP_SIZE,
@@ -356,11 +379,7 @@ export function buildTaprootOfferedHtlcSuccessLeaf(
 		opcodes.OP_HASH160,
 		ripemd160(paymentHash),
 		opcodes.OP_EQUALVERIFY,
-		toXOnly(remoteHtlcPubkey),
-		opcodes.OP_CHECKSIG,
-		opcodes.OP_1,
-		opcodes.OP_CHECKSEQUENCEVERIFY,
-		opcodes.OP_DROP
+		...delayedSignature(remoteHtlcPubkey, 1, format)
 	]);
 }
 
@@ -406,15 +425,39 @@ export function buildTaprootReceivedHtlcSuccessLeaf(
 	]);
 }
 
+/** Final Taproot HTLCs expire at a positive block height. */
+export function assertFinalTaprootHtlcExpiry(cltvExpiry: number): void {
+	// The last stack item is the CLTV operand itself.
+	if (
+		!Number.isInteger(cltvExpiry) ||
+		cltvExpiry < 1 ||
+		cltvExpiry >= 500_000_000
+	) {
+		throw new Error(
+			'Final Taproot HTLC expiry must be a positive block height'
+		);
+	}
+}
+
 /**
- * Received-HTLC timeout leaf — the sender (remote) reclaims after a 1-block CSV
- * AND the CLTV expiry (LND ReceiverHtlcTapLeafTimeout):
+ * Received-HTLC timeout leaf. The sender reclaims after a one-block delay
+ * and the HTLC expiry. The staging encoding is
  *   <sender=remote> OP_CHECKSIG OP_1 OP_CSV OP_DROP <cltv> OP_CLTV OP_DROP
  */
 export function buildTaprootReceivedHtlcTimeoutLeaf(
 	remoteHtlcPubkey: Buffer,
-	cltvExpiry: number
+	cltvExpiry: number,
+	format?: TaprootOutputFormat
 ): Buffer {
+	if (format === 'final') {
+		assertFinalTaprootHtlcExpiry(cltvExpiry);
+		return script.compile([
+			...delayedSignature(remoteHtlcPubkey, 1, format),
+			opcodes.OP_VERIFY,
+			script.number.encode(cltvExpiry),
+			opcodes.OP_CHECKLOCKTIMEVERIFY
+		]);
+	}
 	return script.compile([
 		toXOnly(remoteHtlcPubkey),
 		opcodes.OP_CHECKSIG,
@@ -442,12 +485,12 @@ function assembleHtlcOutput(
 	successScript: Buffer,
 	timeoutScript: Buffer,
 	network: bitcoin.Network,
-	auxiliaryLeaf?: ITaprootAuxLeaf
+	format?: TaprootOutputFormat
 ): ITaprootHtlcOutput {
 	const internalPubkey = toXOnly(revocationPubkey);
 	const scriptTree = withAuxLeaf(
 		[{ output: successScript }, { output: timeoutScript }],
-		auxiliaryLeaf
+		format
 	);
 	const base = bitcoin.payments.p2tr({ internalPubkey, scriptTree, network });
 	return {
@@ -486,14 +529,14 @@ export function buildTaprootOfferedHtlcOutput(
 	remoteHtlcPubkey: Buffer,
 	paymentHash: Buffer,
 	network: bitcoin.Network = bitcoin.networks.bitcoin,
-	auxiliaryLeaf?: ITaprootAuxLeaf
+	format?: TaprootOutputFormat
 ): ITaprootHtlcOutput {
 	return assembleHtlcOutput(
 		revocationPubkey,
-		buildTaprootOfferedHtlcSuccessLeaf(remoteHtlcPubkey, paymentHash),
+		buildTaprootOfferedHtlcSuccessLeaf(remoteHtlcPubkey, paymentHash, format),
 		buildTaprootOfferedHtlcTimeoutLeaf(localHtlcPubkey, remoteHtlcPubkey),
 		network,
-		auxiliaryLeaf
+		format
 	);
 }
 
@@ -508,19 +551,19 @@ export function buildTaprootAnchorLeaf(): Buffer {
 }
 
 /**
- * Build a taproot anchor output. The owning party's funding key is the taproot
+ * Build a taproot anchor output. The party's commitment key is the taproot
  * internal key (immediate key-path sweep); the single 16-CSV leaf lets anyone
  * sweep after 16 blocks (so the anchor can't pin the UTXO set forever).
  */
 export function buildTaprootAnchorOutput(
-	fundingPubkey: Buffer,
+	commitmentPubkey: Buffer,
 	network: bitcoin.Network = bitcoin.networks.bitcoin
 ): ITaprootCommitOutput & {
 	internalKey: Buffer;
 	merkleRoot: Buffer;
 	anyone: ITaprootLeafSpend;
 } {
-	const internalPubkey = toXOnly(fundingPubkey);
+	const internalPubkey = toXOnly(commitmentPubkey);
 	const leaf = buildTaprootAnchorLeaf();
 	const scriptTree: Taptree = { output: leaf };
 	const base = bitcoin.payments.p2tr({ internalPubkey, scriptTree, network });
@@ -546,7 +589,7 @@ export function buildTaprootReceivedHtlcOutput(
 	paymentHash: Buffer,
 	cltvExpiry: number,
 	network: bitcoin.Network = bitcoin.networks.bitcoin,
-	auxiliaryLeaf?: ITaprootAuxLeaf
+	format?: TaprootOutputFormat
 ): ITaprootHtlcOutput {
 	return assembleHtlcOutput(
 		revocationPubkey,
@@ -555,8 +598,8 @@ export function buildTaprootReceivedHtlcOutput(
 			remoteHtlcPubkey,
 			paymentHash
 		),
-		buildTaprootReceivedHtlcTimeoutLeaf(remoteHtlcPubkey, cltvExpiry),
+		buildTaprootReceivedHtlcTimeoutLeaf(remoteHtlcPubkey, cltvExpiry, format),
 		network,
-		auxiliaryLeaf
+		format
 	);
 }

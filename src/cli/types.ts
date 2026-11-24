@@ -215,6 +215,7 @@ export type ChannelStateString =
 	| 'NONE'
 	| 'AWAITING_FUNDING_CONFIRMED'
 	| 'AWAITING_CHANNEL_READY'
+	| 'CHANNEL_READY'
 	| 'NORMAL'
 	| 'SHUTTING_DOWN'
 	| 'NEGOTIATING_CLOSING'
@@ -1208,6 +1209,9 @@ export interface BeignetConfig
 	daemonPort?: number;
 	daemonHost?: string;
 	preferAnchors?: boolean;
+	finalTaprootWallet?: boolean;
+	/** Enroll a new regtest wallet for type-80 payments, splicing and closes. */
+	finalCommitmentUpdates?: boolean;
 	/** option_wumbo: advertise large_channels and lift the 2^24 sat funding cap. */
 	largeChannels?: boolean;
 	/** Legacy single API bearer token. Still honored with implicit admin scope. */

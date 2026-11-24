@@ -34,13 +34,14 @@ type InitResult = {
 
 function runInit(
 	home: string,
-	env: Record<string, string> = {}
+	env: Record<string, string> = {},
+	args: string[] = []
 ): Promise<InitResult> {
 	const repoRoot = path.resolve(__dirname, '..', '..');
 	return new Promise((resolve) => {
 		const child = spawn(
 			process.execPath,
-			[DIST_CLI, 'init', '--network', 'regtest'],
+			[DIST_CLI, 'init', '--network', 'regtest', ...args],
 			{
 				cwd: repoRoot,
 				env: {
@@ -99,6 +100,44 @@ describe('beignet init mints an API token (issue #1005)', function () {
 
 	afterEach(() => {
 		fs.rmSync(home, { recursive: true, force: true });
+	});
+
+	it('preserves an unreadable config during final wallet initialization', async () => {
+		fs.mkdirSync(path.dirname(configPath), { recursive: true, mode: 0o700 });
+		const malformed = '{"mnemonic":';
+		fs.writeFileSync(configPath, malformed, { mode: 0o600 });
+		await runInit(home, {}, ['--final-taproot-wallet']);
+		expect(fs.readFileSync(configPath, 'utf8')).to.equal(malformed);
+	});
+
+	it('provisions the final wallet only in the CLI branch generating its original seed', async () => {
+		const dataDir = path.join(home, 'generated');
+		fs.mkdirSync(path.dirname(configPath), { recursive: true, mode: 0o700 });
+		fs.writeFileSync(configPath, JSON.stringify({ dataDir }), { mode: 0o600 });
+		const first = await runInit(home, {}, ['--final-taproot-wallet']);
+		expect(first.code).to.equal(0);
+		expect(readConfig().finalTaprootWallet).to.equal(true);
+		expect(readConfig().apiToken).to.match(/^[0-9a-f]{64}$/);
+		const signer = path.join(dataDir, 'regtest.db.opening-signer');
+		const before = fs.statSync(signer);
+		const again = await runInit(home, {}, ['--final-taproot-wallet']);
+		expect(again.code).to.equal(0);
+		expect(again.result).to.not.have.property('mnemonic');
+		expect(fs.statSync(signer).ino).to.equal(before.ino);
+		const importedDir = path.join(home, 'imported');
+		fs.writeFileSync(
+			configPath,
+			JSON.stringify({
+				dataDir: importedDir,
+				mnemonic: MNEMONIC,
+				network: 'regtest'
+			})
+		);
+		await runInit(home, {}, ['--final-taproot-wallet']);
+		expect(readConfig().finalTaprootWallet).not.to.equal(true);
+		expect(
+			fs.existsSync(path.join(importedDir, 'regtest.db.opening-signer'))
+		).to.equal(false);
 	});
 
 	it('a fresh init mints a 64-hex apiToken, prints it once and a second init keeps it', async () => {
