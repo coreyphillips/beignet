@@ -511,6 +511,7 @@ export function resolveConfig(cliFlags: Partial<BeignetConfig>): BeignetConfig {
 		finalCommitmentUpdates:
 			cliFlags.finalCommitmentUpdates ?? file.finalCommitmentUpdates,
 		dualFundedAssets: cliFlags.dualFundedAssets ?? file.dualFundedAssets,
+		assetSplice: cliFlags.assetSplice ?? file.assetSplice,
 		preferAnchors:
 			cliFlags.preferAnchors ??
 			(process.env.BEIGNET_PREFER_ANCHORS !== undefined

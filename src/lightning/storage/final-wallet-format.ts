@@ -18,6 +18,8 @@ export interface IFinalWalletBinding {
 	finalCommitmentUpdates?: boolean;
 	/** Fresh regtest wallets with authority to open dual-funded asset channels. */
 	dualFundedAssets?: boolean;
+	/** Fresh regtest wallets capable of retaining multiple generations of asset funding. */
+	assetSplice?: boolean;
 	encryptionKey: Buffer;
 	nodeId: string;
 	network: 'mainnet' | 'testnet' | 'regtest' | 'signet';
@@ -52,7 +54,8 @@ export function finalWalletIdentity(
 		throw new Error('Invalid final wallet network');
 	const generation = finalWalletGeneration(
 		binding.finalCommitmentUpdates,
-		binding.dualFundedAssets
+		binding.dualFundedAssets,
+		binding.assetSplice
 	);
 	if (generation !== 1 && binding.network !== 'regtest')
 		throw new Error('This final wallet generation requires regtest');
@@ -490,7 +493,8 @@ export function installWalletMarker(
 				nonces_json TEXT NOT NULL
 			);
 		`);
-		if (JSON.parse(identity)[0] === 2)
+		const generation = JSON.parse(identity)[0];
+		if (generation === 2 || generation === 4)
 			db.exec(`
 				CREATE TABLE final_lifecycle_log (
 					scope TEXT NOT NULL,
@@ -498,7 +502,10 @@ export function installWalletMarker(
 					sequence INTEGER NOT NULL,
 					record TEXT NOT NULL,
 					PRIMARY KEY(scope,channel_id,sequence)
-				);
+				)
+			`);
+		if (generation === 2)
+			db.exec(`
 				CREATE TABLE final_channel_update_log (
 					channel_id TEXT NOT NULL,
 					sequence INTEGER NOT NULL,

@@ -11,6 +11,8 @@ import type {
 import type { IAssetOpenLayout } from './asset-opening-manifest';
 
 export interface IAssetOpenContext {
+	/** Local original-device enrollment. Never sourced from the peer. */
+	walletGeneration?: 4;
 	peer: string;
 	isInitiator: boolean;
 	channelId: Buffer;

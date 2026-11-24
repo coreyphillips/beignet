@@ -452,8 +452,12 @@ function handleInit(): void {
 function initializeConfig(file: string): void {
 	const requestedUpdates = hasFlag('--final-commitment-updates');
 	const requestedAssets = hasFlag('--dual-funded-assets');
+	const requestedSplice = hasFlag('--asset-splice');
 	const finalTaprootWallet =
-		requestedUpdates || requestedAssets || hasFlag('--final-taproot-wallet');
+		requestedUpdates ||
+		requestedAssets ||
+		requestedSplice ||
+		hasFlag('--final-taproot-wallet');
 	const pending = fs.lstatSync(
 		nodePath.join(nodePath.dirname(file), 'final-wallet-init.pending'),
 		{ throwIfNoEntry: false }
@@ -463,7 +467,11 @@ function initializeConfig(file: string): void {
 	const config = loadConfig(finalTaprootWallet);
 	const updates = requestedUpdates || config.finalCommitmentUpdates === true;
 	const assets = requestedAssets || config.dualFundedAssets === true;
-	if (finalTaprootWallet && updates && assets)
+	const assetSplice = requestedSplice || config.assetSplice === true;
+	if (
+		finalTaprootWallet &&
+		[updates, assets, assetSplice].filter(Boolean).length > 1
+	)
 		throw new BeignetError(
 			'INVALID_PARAMS',
 			'Select one final wallet enrollment mode'
@@ -481,6 +489,7 @@ function initializeConfig(file: string): void {
 				(config.finalTaprootWallet !== true ||
 					(updates && config.finalCommitmentUpdates !== true) ||
 					(assets && config.dualFundedAssets !== true) ||
+					(assetSplice && config.assetSplice !== true) ||
 					typeof config.mnemonic !== 'string' ||
 					!bip39.validateMnemonic(config.mnemonic))) ||
 			(config.finalTaprootWallet === true && !config.mnemonic))
@@ -506,13 +515,15 @@ function initializeConfig(file: string): void {
 					finalTaprootWallet: true,
 					...(updates && { finalCommitmentUpdates: true }),
 					...(assets && { dualFundedAssets: true }),
+					...(assetSplice && { assetSplice: true }),
 					...(alias ? { alias } : {})
 				};
 				apiToken = mintApiTokenIfAbsent(complete);
 				return complete;
 			},
 			updates,
-			assets
+			assets,
+			assetSplice
 		);
 		if (config.mnemonic) {
 			apiToken = mintApiTokenIfAbsent(enrolled);
@@ -3400,6 +3411,7 @@ Setup:
     [--final-taproot-wallet]             Enroll a fresh regtest type-80 wallet
     [--final-commitment-updates]         Enroll a fresh regtest wallet for revocable commitments
     [--dual-funded-assets]               Enroll a fresh regtest wallet for dual-funded asset opening
+    [--asset-splice]                     Enroll a fresh regtest wallet for asset channel splices
   start [flags]                          Start node daemon
   stop                                   Stop daemon
 

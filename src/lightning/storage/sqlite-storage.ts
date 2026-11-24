@@ -1,5 +1,6 @@
 import { encodeSpliceLockedMessage } from '../message/splice';
 import { Transaction } from 'bitcoinjs-lib';
+import { isDeepStrictEqual } from 'util';
 import { FinalSpliceSession } from '../channel/final-splice-session';
 import {
 	finalSpliceAttempts,
@@ -11,6 +12,7 @@ import {
 import type { IFinalFundingReference } from '../channel/final-splice-candidate';
 import {
 	FinalDeviceJournal,
+	type IFinalJournalHead,
 	checkFinalLifecycleBackup
 } from './final-device-journal';
 import {
@@ -487,8 +489,12 @@ export class SqliteStorage implements IStorageBackend {
 		);
 	}
 	private finalJournal(): FinalDeviceJournal {
-		if (!this.updateWallet || !this.walletIdentity || !this.encryptionKey)
-			throw new Error('Final journal requires an update-enabled wallet');
+		if (
+			(!this.updateWallet && this.finalGeneration !== 4) ||
+			!this.walletIdentity ||
+			!this.encryptionKey
+		)
+			throw new Error('Final journal requires an enrolled wallet');
 		return new FinalDeviceJournal(
 			this.db,
 			this.encryptionKey,
@@ -613,7 +619,9 @@ export class SqliteStorage implements IStorageBackend {
 		const identity = finalWalletIdentity(dbPath, binding);
 		const daemonGenerated = takeFinalDaemonGeneration(binding);
 		if (
-			(binding.finalCommitmentUpdates || binding.dualFundedAssets) &&
+			(binding.finalCommitmentUpdates ||
+				binding.dualFundedAssets ||
+				binding.assetSplice) &&
 			!daemonGenerated
 		)
 			throw new Error(
@@ -659,6 +667,11 @@ export class SqliteStorage implements IStorageBackend {
 				binding.encryptionKey,
 				identity
 			);
+			if (storage.finalGeneration === 4) {
+				const journal = storage.finalJournal();
+				for (const c of storage.loadFinalOpenings())
+					journal.reconcile(c.channelId);
+			}
 			storage.reconcileFinalUpdateOpenings();
 			storage.reconcileFinalExitRequests();
 			if (storage.canOpenDualFundedAssets) {
@@ -867,7 +880,7 @@ export class SqliteStorage implements IStorageBackend {
 	 */
 	async backup(destPath: string): Promise<void> {
 		this.reconcileFinalExitRequests();
-		if (this.updateWallet) {
+		if (this.updateWallet || this.finalGeneration === 4) {
 			const journal = this.finalJournal();
 			for (const candidate of this.loadFinalOpenings())
 				journal.reconcile(candidate.channelId);
@@ -889,10 +902,9 @@ export class SqliteStorage implements IStorageBackend {
 		old: Database.Database,
 		next: Database.Database
 	): void {
-		if (this.updateWallet) {
+		if (this.updateWallet || this.finalGeneration === 4)
 			checkFinalLifecycleBackup(old, next);
-			preserveFinalJournal(old, next);
-		}
+		if (this.updateWallet) preserveFinalJournal(old, next);
 		const read = (
 			db: Database.Database,
 			row: IFinalOpeningRow
@@ -961,7 +973,7 @@ export class SqliteStorage implements IStorageBackend {
 		const evidence = nonces.session?.assetEvidence;
 		if (evidence !== undefined) {
 			if (
-				this.finalGeneration !== 3 ||
+				(this.finalGeneration !== 3 && this.finalGeneration !== 4) ||
 				nonces.session?.updateLimits ||
 				JSON.stringify(canonicalAssetOpeningEvidence(evidence)) !==
 					JSON.stringify(evidence)
@@ -1108,7 +1120,70 @@ export class SqliteStorage implements IStorageBackend {
 
 	/** Original-device authority of the dedicated asset opening generation. */
 	get canOpenDualFundedAssets(): boolean {
-		return this.finalGeneration === 3 && this.canSignFinalOpening;
+		return (
+			(this.finalGeneration === 3 || this.finalGeneration === 4) &&
+			this.canSignFinalOpening
+		);
+	}
+
+	/** The original wallet can authorize new records for its asset funding views. */
+	get canSpliceDualFundedAssets(): boolean {
+		return this.finalGeneration === 4 && this.canSignFinalOpening;
+	}
+
+	/** Bind a funding signature, including a replay, to the live signer for this journal. */
+	assertAssetSpliceAuthority(authority: FinalOpeningAuthority): void {
+		if (
+			!this.canSpliceDualFundedAssets ||
+			this.db.inTransaction ||
+			authority !== this.requireOpeningAuthority()
+		)
+			throw new Error(
+				'Asset splice signing requires this original wallet device outside a transaction'
+			);
+		authority.assertDaemonEnrollment();
+	}
+
+	private assetSpliceJournal(channelId: string): FinalDeviceJournal {
+		if (
+			this.finalGeneration !== 4 ||
+			!this.loadFinalOpeningSession(channelId)?.assetEvidence
+		)
+			throw new Error(
+				'Asset splice history requires an enrolled asset channel'
+			);
+		return this.finalJournal();
+	}
+
+	readAssetSpliceJournal<T = unknown>(channelId: string) {
+		return this.assetSpliceJournal(channelId).read<T>(
+			'asset-splice',
+			channelId
+		);
+	}
+
+	appendAssetSpliceEvent<T>(
+		channelId: string,
+		head: IFinalJournalHead,
+		event: T
+	) {
+		if (!this.canSpliceDualFundedAssets || this.db.inTransaction)
+			throw new Error(
+				'Asset splice history requires the original wallet device outside a transaction'
+			);
+		// Reject information that JSON would drop before recording an irreversible device claim.
+		const encoded = JSON.stringify(event);
+		if (encoded === undefined || event === null || typeof event !== 'object')
+			throw new Error('Expected a JSON asset splice event');
+		const snapshot = JSON.parse(encoded) as T;
+		if (!isDeepStrictEqual(event, snapshot))
+			throw new Error('Asset splice event must preserve its exact JSON fields');
+		return this.assetSpliceJournal(channelId).append(
+			'asset-splice',
+			channelId,
+			head,
+			snapshot
+		);
 	}
 
 	private assetStageAuthority(): FinalOpeningAuthority {
@@ -1142,7 +1217,10 @@ export class SqliteStorage implements IStorageBackend {
 	}
 
 	private requireCurrentFinalDevice(): void {
-		if (this.updateWallet && !this.canSignFinalOpening)
+		if (
+			(this.updateWallet || this.finalGeneration === 4) &&
+			!this.canSignFinalOpening
+		)
 			throw new Error('Current commitment requires the original wallet device');
 	}
 
@@ -2487,7 +2565,8 @@ export class SqliteStorage implements IStorageBackend {
 			...(signing?.fundingTransaction && {
 				funding: Buffer.from(signing.fundingTransaction, 'hex')
 			}),
-			...((!this.updateWallet || this.canSignFinalOpening) &&
+			...(((!this.updateWallet && this.finalGeneration !== 4) ||
+				this.canSignFinalOpening) &&
 				signing?.exit &&
 				this.finalExitRequested(record.candidate.channelId, record.nonces) && {
 					exitToBroadcast: Buffer.from(

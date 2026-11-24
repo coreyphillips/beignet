@@ -64,6 +64,11 @@ export interface IChainBackend {
 		txid: string,
 		height: number
 	): Promise<{ blockHeight: number; txIndex: number }>;
+	/** Bind a regtest splice txid to its funding block and a locally accepted chain tip. */
+	getAssetSpliceInclusion?(
+		txid: string,
+		height: number
+	): Promise<{ txid: string; blockHash: string; confirmations: number }>;
 	/**
 	 * List unspent outputs for a script hash (Electrum
 	 * blockchain.scripthash.listunspent). Optional; used to verify that a

@@ -518,6 +518,8 @@ export interface BeignetNodeOptions
 	finalCommitmentUpdates?: boolean;
 	/** Enroll a fresh regtest wallet for dual-funded asset channel opening. */
 	dualFundedAssets?: boolean;
+	/** Enroll a fresh regtest wallet for asset channel splices. */
+	assetSplice?: boolean;
 	/**
 	 * option_wumbo (large_channels, default false): advertise the bit and lift
 	 * the 2^24 sat funding cap (up to 10 BTC) for peers that also advertise it.
@@ -3138,6 +3140,18 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 				'Dual-funded assets require a separately enrolled final wallet'
 			);
 		if (
+			opts.assetSplice !== undefined &&
+			(typeof opts.assetSplice !== 'boolean' ||
+				(opts.assetSplice &&
+					(opts.finalTaprootWallet !== true ||
+						opts.finalCommitmentUpdates ||
+						opts.dualFundedAssets)))
+		)
+			throw new BeignetError(
+				'INVALID_PARAMS',
+				'Asset splicing requires a separately enrolled final wallet'
+			);
+		if (
 			opts.finalTaprootWallet !== undefined &&
 			typeof opts.finalTaprootWallet !== 'boolean'
 		)
@@ -3168,7 +3182,8 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 			opts.finalTaprootWallet && opts.mnemonic === undefined
 				? generateFinalDaemonWallet(
 						opts.finalCommitmentUpdates,
-						opts.dualFundedAssets
+						opts.dualFundedAssets,
+						opts.assetSplice
 				  )
 				: undefined;
 		const mnemonic = fresh?.mnemonic ?? (opts.mnemonic || generateMnemonic());
@@ -3263,6 +3278,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 						encryptionKey: encryptionKey!,
 						finalCommitmentUpdates: opts.finalCommitmentUpdates,
 						dualFundedAssets: opts.dualFundedAssets,
+						assetSplice: opts.assetSplice,
 						network: networkName,
 						nodeId
 				  });

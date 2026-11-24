@@ -136,6 +136,9 @@ export class AssetOpeningSession {
 		)
 			throw new Error('Invalid asset opening negotiation');
 		this.ctx = {
+			...(runtime.storage.canSpliceDualFundedAssets && {
+				walletGeneration: 4 as const
+			}),
 			peer: start.peer,
 			isInitiator: start.initiator,
 			open,
