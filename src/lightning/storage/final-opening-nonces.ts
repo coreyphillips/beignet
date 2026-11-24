@@ -9,6 +9,7 @@ import {
 } from '../message/interactive-tx';
 
 export interface IFinalOpeningSession {
+	assetEvidence?: import('./asset-opening-evidence').IAssetOpeningEvidence;
 	updateLimits?: import('./final-channel-updates').IFinalUpdateLimits;
 	peer: string;
 	channelKeyIndex: number;

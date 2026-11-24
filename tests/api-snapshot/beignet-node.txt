@@ -37,6 +37,7 @@ property BeignetConfig.dailySpendLimitSats?: number
 property BeignetConfig.dataDir?: string
 property BeignetConfig.dfMinAmountSat?: number
 property BeignetConfig.dfRelay?: boolean
+property BeignetConfig.dualFundedAssets?: boolean
 property BeignetConfig.eagerGossipVerify?: boolean
 property BeignetConfig.electrumHost?: string
 property BeignetConfig.electrumPort?: number
@@ -398,7 +399,7 @@ get BeignetNode.onchainWallet(): beignet#Wallet
 method BeignetNode.openChannel(pubkey: string, amountSats: number, opts?: IOpenChannelOptions): ChannelInfo
 method BeignetNode.openChannel(pubkey: string, amountSats: number, pushSats?: number, satsPerVbyte?: number, max?: boolean, trusted?: boolean): ChannelInfo
 method BeignetNode.openChannelAndWait(pubkey: string, amountSats: number, opts?: { pushSats?: number; timeoutMs?: number; }): Promise<ChannelInfo>
-method BeignetNode.openChannelV2(peerPubkey: string, params: { amountSats: number; finalTaproot?: boolean; fundingFeeratePerkw?: number; commitmentFeeratePerkw?: number; locktime?: number; requestFunds?: { requestedSats: number; blockheight: number; }; maxLeaseRates?: beignet/lightning#gossip.ILeaseRates; }): ChannelInfo
+method BeignetNode.openChannelV2(peerPubkey: string, params: { amountSats: number; finalTaproot?: boolean; dualFundedAssets?: boolean; fundingFeeratePerkw?: number; commitmentFeeratePerkw?: number; locktime?: number; requestFunds?: { requestedSats: number; blockheight: number; }; maxLeaseRates?: beignet/lightning#gossip.ILeaseRates; }): ChannelInfo
 method BeignetNode.openZeroConfChannel(peerPubkey: string, amountSats: number, pushSats?: number): ChannelInfo
 method BeignetNode.payInvoice(bolt11: string, opts?: IPayInvoiceOptions): Promise<PaymentInfo>
 method BeignetNode.payInvoice(bolt11: string, timeoutMs?: number, maxFeeSats?: number, amountSats?: number, metadata?: Record<string, string>, cltvLimit?: number, maxFeeMsat?: number | string): Promise<PaymentInfo>
@@ -591,6 +592,7 @@ property BeignetNodeOptions.dataDir?: string
 property BeignetNodeOptions.deferGraphRestore?: boolean
 property BeignetNodeOptions.dfMinAmountSat?: number
 property BeignetNodeOptions.dfRelay?: boolean
+property BeignetNodeOptions.dualFundedAssets?: boolean
 property BeignetNodeOptions.eagerGossipVerify?: boolean
 property BeignetNodeOptions.electrumHost?: string
 property BeignetNodeOptions.electrumPort?: number

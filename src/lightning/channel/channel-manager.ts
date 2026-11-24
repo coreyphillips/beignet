@@ -1,3 +1,8 @@
+import {
+	AssetOpeningCoordinator,
+	completeAssetOpeningHost
+} from './asset-opening-coordinator';
+import { ASSET_OPENING_TYPE_HEX } from '../features/asset-opening';
 import { releasedFinalSpliceFunding } from './final-splice-state';
 import { FinalSpliceTransport } from './final-splice-transport';
 import type { FinalSplicePlan } from './final-splice-session';
@@ -15,6 +20,7 @@ import {
 	disposableFinalTxComplete,
 	enrollFinalNegotiation,
 	isFinalNegotiation,
+	isAssetNegotiation,
 	snapshotFinalOpening
 } from './final-opening-negotiation';
 import { recordPeerTxComplete } from '../storage/final-opening-nonces';
@@ -238,6 +244,8 @@ import type { PeerManager } from '../transport/peer-manager';
 import { PeerError, PeerErrorCode } from '../transport/peer-manager';
 import { ZeroConfManager } from './zero-conf';
 import {
+	encodeOpenChannel2Message,
+	encodeAcceptChannel2Message,
 	decodeOpenChannel2Message,
 	decodeAcceptChannel2Message
 } from '../message/dual-funding';
@@ -1086,11 +1094,22 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 	private _walletDestinationScript: Buffer | null = null;
 	/** Funding provider used to attach wallet inputs for anchor fee bumps. */
 	private fundingProvider: IFundingProvider | null = null;
+	private readonly assetOpening?: AssetOpeningCoordinator;
 	private readonly finalTransport?: FinalOpeningTransport;
 	private readonly finalSplice?: FinalSpliceTransport;
 	private readonly finalObservedFunding = new Map<
 		string,
 		Map<string, { height: number; parentAtDepth: boolean }>
+	>();
+	private readonly assetFundingChannels = new Map<string, string>();
+	private readonly assetCollateral = new Map<
+		string,
+		{
+			accepted: boolean;
+			confirmed: boolean;
+			present: boolean;
+			spentPayoutParent?: string;
+		}
 	>();
 	private readonly finalDepthByChannel = new Map<string, Set<string>>();
 	private readonly finalObservedClose = new Map<
@@ -1204,7 +1223,10 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 					this.emitContained('splice:aborted', Buffer.from(id, 'hex'), reason)
 			);
 			this.finalTransport = new FinalOpeningTransport(
-				config.finalOpening,
+				{
+					...config.finalOpening,
+					dualFunding: config.auxiliaryChannels?.dualFunding
+				},
 				config.verifyRemoteFundingInput,
 				() => this.fundingProvider,
 				(peer, type, payload) => this.sendMessage(peer, type, payload),
@@ -1259,6 +1281,54 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 				this.finalSplice,
 				(peer) => this.peerManager?.recyclePeer(peer, 1000)
 			);
+			const host = config.auxiliaryChannels?.dualFunding;
+			if (
+				config.finalOpening.storage.canOpenDualFundedAssets &&
+				completeAssetOpeningHost(host)
+			) {
+				const verify = config.verifyRemoteFundingInput;
+				this.assetOpening = new AssetOpeningCoordinator(
+					config.finalOpening,
+					host,
+					(peer, type, raw) => this.sendMessage(peer, type, raw),
+					async (tx, vout) =>
+						(await verify({
+							txid: tx.getHash(),
+							vout,
+							scriptPubKey: tx.outs[vout].script
+						})) === 'unspent',
+					(peer, candidate, nonce, early, reestablish, reconnected) => {
+						const id = candidate.channelId;
+						const channel = this.findChannelByChannelIdInTemp(
+							Buffer.from(id, 'hex')
+						);
+						if (channel) this.removeCurrentTempChannel(peer, channel);
+						this.finalTransport!.opened(peer, id, reconnected);
+						this.watchFinalOpening(candidate);
+						if (reestablish) {
+							this.finalTransport!.queue(peer, id, {
+								type: MessageType.CHANNEL_REESTABLISH,
+								payload: reestablish
+							});
+						}
+						if (reconnected) return;
+						this.finalTransport!.queue(peer, id, {
+							type: MessageType.TX_COMPLETE,
+							payload: nonce
+						});
+						if (early)
+							this.finalTransport!.queue(peer, id, {
+								type: MessageType.COMMITMENT_SIGNED,
+								payload: early
+							});
+					},
+					(peer, id, reason) => {
+						const channel = this.findChannelByChannelIdInTemp(id);
+						if (channel) this.removeCurrentTempChannel(peer, channel);
+						this.refuseInboundOpen(peer, id, reason, 'Asset opening refused');
+					}
+				);
+			}
 		}
 	}
 
@@ -3671,6 +3741,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 	): void {
 		// Before the channels forget their pre-commitment splices: a composite
 		// splice (issue #1922) ends with the connection and must hear it first.
+		this.assetOpening?.disconnect(peerPubkey);
 		this.finalTransport?.disconnected(peerPubkey);
 		this.emit('peer:disconnected', peerPubkey);
 		const openDiedOnDisconnect = (state: ChannelState): string => {
@@ -3785,7 +3856,8 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			if (
 				finalId &&
 				isFinalNegotiation(channel) &&
-				this.config.finalOpening?.storage.loadFinalOpeningSession(finalId)
+				(this.config.finalOpening?.storage.loadFinalOpeningSession(finalId) ||
+					(isAssetNegotiation(channel) && this.assetOpening?.pending(finalId)))
 			)
 				continue;
 			const state = channel.getState();
@@ -3844,6 +3916,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 	 * Handle peer reconnection: send channel_reestablish for all peer channels.
 	 */
 	handlePeerReconnected(peerPubkey: string): void {
+		this.assetOpening?.reconnect(peerPubkey);
 		this.finalTransport?.reconnected(peerPubkey);
 		for (const channel of this.getChannelsByPeer(peerPubkey)) {
 			if (channel.getState() === ChannelState.AWAITING_REESTABLISH) {
@@ -4203,8 +4276,21 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		];
 	}
 
+	stopAssetOpenings(): void {
+		this.assetOpening?.destroy();
+	}
+
+	handleAssetOpenFrame(peer: string, subtype: number, raw: Buffer): void {
+		this.assetOpening?.custom(peer, subtype, raw);
+	}
+
 	finalOpeningPeers(): string[] {
-		return Array.from(this.finalTransport?.peers() ?? []);
+		return [
+			...new Set([
+				...(this.finalTransport?.peers() ?? []),
+				...(this.assetOpening?.peers() ?? [])
+			])
+		];
 	}
 
 	/**
@@ -4633,6 +4719,27 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 	): ChainAction[] {
 		const channelIdHex = channelId.toString('hex');
 		const runtime = this.config.finalOpening;
+		if (runtime?.storage.canOpenDualFundedAssets) {
+			const opening = runtime.storage.loadFinalDaemonOpening(channelIdHex);
+			if (opening?.session.assetEvidence) {
+				const { candidate } = opening;
+				const funding = bitcoin.Transaction.fromHex(candidate.fundingTxHex);
+				if (
+					spendingTx.ins.some(
+						(input) =>
+							input.hash.equals(funding.getHash()) &&
+							input.index === candidate.fundingOutputIndex
+					)
+				) {
+					this.finalObservedClose.set(channelIdHex, {
+						txid: spendingTx.getId(),
+						state: ChannelState.FORCE_CLOSED
+					});
+					this.finalTransport?.assetFundingSpendable(channelIdHex, false);
+				}
+				return [];
+			}
+		}
 		if (
 			runtime?.storage.canUpdateFinalCommitments &&
 			runtime.storage.loadFinalOpeningSession(channelIdHex)
@@ -5515,6 +5622,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 				);
 				return;
 			}
+			if (this.assetOpening?.handle(peerPubkey, type, payload)) return;
 			if (
 				this.finalTransport &&
 				payload.length >= 32 &&
@@ -9863,7 +9971,8 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		if (hasScidAliasChannelType(channelType)) {
 			channelFlags = (channelFlags ?? 0x01) & ~0x01;
 		}
-		const final = isFinalTaprootTypeHex(channelType.toString('hex'));
+		const asset = channelType.toString('hex') === ASSET_OPENING_TYPE_HEX;
+		const final = asset || isFinalTaprootTypeHex(channelType.toString('hex'));
 		const typeRefusal = final
 			? this.finalOpeningRefusal(
 					peerPubkey,
@@ -9884,6 +9993,8 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		if (typeRefusal) {
 			throw new Error(`Cannot open a dual-funded (v2) channel: ${typeRefusal}`);
 		}
+		if (asset)
+			this.assetOpening!.contribution(peerPubkey, true, params.fundingSatoshis);
 		// openChannelV2 arrives here rather than through openChannel, so the
 		// guard has to be on both, or half the opens escape it.
 		this._assertNamespaceCanRecordANewChannel();
@@ -9944,7 +10055,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		};
 
 		channel.setMaxFundingSatoshis(this.maxFundingForPeer(peerPubkey));
-		if (final) enrollFinalNegotiation(channel);
+		if (final) enrollFinalNegotiation(channel, asset);
 		else this.configureZeroReserve(channel, peerPubkey);
 		// initiateOpenV2 derives the BOLT-2 temporary_channel_id from our
 		// revocation basepoint (replacing the random stub), so key tempChannels
@@ -10108,6 +10219,17 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 
 	private watchFinalOpening(candidate: IFinalOpeningCandidate): void {
 		const tx = bitcoin.Transaction.fromHex(candidate.fundingTxHex);
+		if (
+			candidate.channelType === ASSET_OPENING_TYPE_HEX &&
+			!this.assetCollateral.has(candidate.channelId)
+		) {
+			this.assetFundingChannels.set(tx.getId(), candidate.channelId);
+			this.assetCollateral.set(candidate.channelId, {
+				accepted: false,
+				confirmed: false,
+				present: false
+			});
+		}
 		this.emit(
 			'watch:final-opening',
 			Buffer.from(candidate.channelId, 'hex'),
@@ -10150,6 +10272,12 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		else {
 			this.finalDepthByChannel.delete(hex);
 			this.finalObservedFunding.delete(hex);
+			const collateral = this.assetCollateral.get(hex);
+			if (collateral) {
+				collateral.confirmed = false;
+				delete collateral.spentPayoutParent;
+			}
+			this.finalTransport?.invalidateAssetFundingAnchor(hex);
 		}
 		this.updateFinalDepth(hex);
 	}
@@ -10176,6 +10304,11 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		height: number | undefined,
 		parentAtDepth: boolean
 	): void {
+		const collateral = this.assetCollateral.get(id);
+		if (collateral && height !== undefined) {
+			this.finalObservedClose.delete(id);
+			delete collateral.spentPayoutParent;
+		}
 		const seen = this.finalObservedFunding.get(id) ?? new Map();
 		if (height === undefined) seen.delete(txid);
 		else seen.set(txid, { height, parentAtDepth });
@@ -10220,6 +10353,70 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		}
 		return undefined;
 	}
+	observeAssetFundingBroadcast(txid: string, raw: Buffer): void {
+		const id = this.assetFundingChannels.get(txid);
+		if (id && bitcoin.Transaction.fromBuffer(raw).getId() === txid)
+			this.assetCollateral.get(id)!.accepted = true;
+	}
+
+	observeAssetOpeningPayout(
+		id: Buffer,
+		parent: string,
+		confirmed: boolean
+	): void {
+		const hex = id.toString('hex');
+		const collateral = this.assetCollateral.get(hex);
+		if (collateral && this.finalObservedClose.get(hex)?.txid === parent)
+			collateral.spentPayoutParent = confirmed ? parent : undefined;
+	}
+
+	assetOpeningCollateral(
+		id: Buffer
+	): { funded: boolean; payoutSpent: boolean } | undefined {
+		const hex = id.toString('hex');
+		const collateral = this.assetCollateral.get(hex);
+		if (!collateral) return;
+		return {
+			funded: collateral.accepted || collateral.confirmed,
+			payoutSpent:
+				!!collateral.spentPayoutParent &&
+				collateral.spentPayoutParent === this.finalObservedClose.get(hex)?.txid
+		};
+	}
+
+	assetOpeningAnchor(id: string): { missingWitnesses: boolean } | undefined {
+		const storage = this.config.finalOpening?.storage;
+		if (!storage?.canOpenDualFundedAssets) return;
+		const opening = storage.loadFinalDaemonOpening(id);
+		if (
+			!opening?.session.assetEvidence ||
+			!storage.loadFinalLocalTxSignatures(id)
+		)
+			return;
+		return { missingWitnesses: !opening.funding };
+	}
+
+	observeAssetOpeningAnchor(
+		id: string,
+		atDepth: boolean,
+		observed?: bitcoin.Transaction,
+		height?: number
+	): void {
+		if (observed)
+			this.config.finalOpening!.storage.rememberObservedAssetFunding(
+				id,
+				observed
+			);
+		const collateral = this.assetCollateral.get(id);
+		if (collateral) {
+			if (collateral.present && height === undefined)
+				collateral.accepted = false;
+			collateral.present = height !== undefined;
+			collateral.confirmed = height !== undefined && height > 0;
+		}
+		this.finalTransport?.assetFundingAnchor(id, atDepth, height);
+	}
+
 	private updateFinalDepth(id: string): void {
 		const storage = this.config.finalOpening?.storage;
 		const c = storage?.loadFinalOpening(id);
@@ -10244,6 +10441,13 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			: !!parentSecured ||
 			  (!!live && (live.has(active) || (!!next && live.has(next))));
 		if (confirmed) this.finalObservedClose.delete(id);
+		if (
+			storage!.canOpenDualFundedAssets &&
+			storage!.loadAssetOpeningEvidence(id)
+		) {
+			this.finalTransport?.assetFundingSpendable(id, confirmed);
+			return;
+		}
 		if (this.finalTransport?.hasDepth(id) !== confirmed)
 			this.finalTransport?.fundingDepth(id, confirmed);
 	}
@@ -10338,6 +10542,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 				const alias =
 					localReady && decodeChannelReadyMessage(localReady).shortChannelId;
 				return {
+					...(session.assetEvidence && { auxiliary: true as const }),
 					channelId: Buffer.from(candidate.channelId, 'hex'),
 					channelType: Buffer.from(candidate.channelType, 'hex'),
 					peerPubkey: session.peer,
@@ -10394,6 +10599,8 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		flags: number | undefined,
 		unsupported: boolean
 	): string | null {
+		if (type.toString('hex') === ASSET_OPENING_TYPE_HEX && !this.assetOpening)
+			return 'Asset opening requires an enrolled wallet and provider';
 		if (
 			!this.finalTransport ||
 			!this.config.finalOpening?.storage.canSignFinalOpening ||
@@ -10486,7 +10693,9 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		// or otherwise unsupported type accepted here would echo through
 		// ACCEPT_CHANNEL2 and then die at the commitment stage with a burnt
 		// key index and a stuck retained channel.
-		const final = isFinalTaprootTypeHex(msg.channelType?.toString('hex'));
+		const asset = msg.channelType?.toString('hex') === ASSET_OPENING_TYPE_HEX;
+		const final =
+			asset || isFinalTaprootTypeHex(msg.channelType?.toString('hex'));
 		const typeRefusal = final
 			? this.finalOpeningRefusal(
 					peerPubkey,
@@ -10592,6 +10801,32 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			return;
 		}
 
+		let assetContribution = 0n;
+		if (asset) {
+			if (!encodeOpenChannel2Message(msg).equals(payload)) {
+				this.refuseInboundOpen(
+					peerPubkey,
+					msg.channelId,
+					'Unsupported asset opening terms'
+				);
+				return;
+			}
+			try {
+				assetContribution = this.assetOpening!.contribution(
+					peerPubkey,
+					false,
+					msg.fundingSatoshis
+				);
+			} catch (err) {
+				this.refuseInboundOpen(
+					peerPubkey,
+					msg.channelId,
+					String(err),
+					'Asset opening refused'
+				);
+				return;
+			}
+		}
 		const chKeys = this.deriveKeysForNewChannel();
 		// Issue #906: the index is consumed HERE, ahead of the parameter
 		// validation the channel does below, so every exit from here on that
@@ -10646,7 +10881,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			}
 			channel.channelKeyIndex = chKeys.channelIndex;
 			channel.setMaxFundingSatoshis(this.maxFundingForPeer(peerPubkey));
-			if (final) enrollFinalNegotiation(channel);
+			if (final) enrollFinalNegotiation(channel, asset);
 			else this.configureZeroReserve(channel, peerPubkey);
 			const tempId = msg.channelId.toString('hex');
 			this.tempChannels.set(tempId, channel);
@@ -10662,7 +10897,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 
 			// Generate per-commitment points for local params
 			const localParams: IDualFundingParams = {
-				fundingSatoshis: 0n, // acceptor can contribute 0 or more
+				fundingSatoshis: assetContribution,
 				fundingFeeratePerkw: msg.fundingFeeratePerkw,
 				commitmentFeeratePerkw: msg.commitmentFeeratePerkw,
 				dustLimitSatoshis: (this.config.localConfig || DEFAULT_CHANNEL_CONFIG)
@@ -10823,7 +11058,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 				}
 				// No funding provider: keep the legacy behavior (the embedder — or a
 				// test harness — drives the contribution itself via addTxInput).
-			} else {
+			} else if (!asset) {
 				// Plain zero-contribution accept. Register the EMPTY contribution so
 				// the interactive-tx drive takes our turns: with nothing to add it
 				// answers each opener message with tx_complete. Without a registered
@@ -10841,6 +11076,15 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			}
 
 			const answer = channel.handleOpenChannel2(msg, localParams);
+			if (
+				asset &&
+				answer.some(
+					(a) =>
+						a.type === ChannelActionType.SEND_MESSAGE &&
+						a.messageType === MessageType.ACCEPT_CHANNEL2
+				)
+			)
+				this.assetOpening!.register(channel, peerPubkey);
 			answered = true;
 			this.dispatchInboundOpenActions(
 				peerPubkey,
@@ -10906,6 +11150,8 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		if (
 			isFinalNegotiation(channel) &&
 			(msg.willFund ||
+				(isAssetNegotiation(channel) &&
+					!encodeAcceptChannel2Message(msg).equals(payload)) ||
 				msg.disableChannelReserve ||
 				msg.minimumDepth < 1 ||
 				!msg.channelType?.equals(
@@ -10959,7 +11205,9 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			const isCurrentOpen = (): boolean =>
 				this.tempChannels.get(tempId) === channel &&
 				this.channelPeers.get(tempId) === peerPubkey;
-			this.autoFundDualFundedOpen(channel, peerPubkey);
+			if (isAssetNegotiation(channel))
+				this.assetOpening!.register(channel, peerPubkey);
+			else this.autoFundDualFundedOpen(channel, peerPubkey);
 			if (!isCurrentOpen()) return;
 			if (leaseEvent) {
 				this.emitContained('channel:lease', leaseEvent);

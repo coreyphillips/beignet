@@ -23,11 +23,13 @@ import {
 	buildTaprootOfferedHtlcOutput,
 	buildTaprootReceivedHtlcOutput,
 	assertFinalTaprootHtlcExpiry,
+	type ITaprootAuxLeaf,
 	type ITaprootHtlcOutput,
 	type ITaprootLeafSpend
 } from '../script/commitment-taproot';
 import {
 	type IFinalOpeningCandidate,
+	validateAssetOpening,
 	validateFinalOpening
 } from '../storage/final-opening-candidate';
 import {
@@ -149,6 +151,85 @@ export function buildFinalCommitmentView(
 	fundingRef?: IFinalFundingReference
 ): IFinalCommitmentView {
 	validateFinalOpening(candidate);
+	return buildValidatedView(
+		candidate,
+		terms,
+		owner,
+		point,
+		height,
+		balances,
+		htlcs,
+		fundingRef
+	);
+}
+
+/** Leaves are named for the holder of this commitment, on either peer. */
+export interface IAssetOpeningLeaves {
+	fundingRoot: Buffer;
+	toLocal?: ITaprootAuxLeaf;
+	toRemote?: ITaprootAuxLeaf;
+}
+
+export function buildAssetOpeningCommitment(
+	candidate: IFinalOpeningCandidate,
+	terms: IFinalOpeningTerms,
+	owner: 'local' | 'remote',
+	assets: IAssetOpeningLeaves
+): IFinalCommitmentView {
+	validateAssetOpening(candidate, assets.fundingRoot);
+	const holder =
+		owner === 'local' ? terms.localBasepoints : terms.remoteBasepoints;
+	const peer =
+		owner === 'local' ? terms.remoteBasepoints : terms.localBasepoints;
+	const view = buildValidatedView(
+		candidate,
+		terms,
+		owner,
+		readPoint(holder.firstPerCommitmentPoint),
+		0n,
+		{
+			localBalanceMsat: BigInt(candidate.localContributionSats) * 1000n,
+			remoteBalanceMsat: BigInt(candidate.remoteContributionSats) * 1000n
+		},
+		[]
+	);
+	// A virtual transfer commits to output indexes. Both peers first sort the
+	// ordinary outputs, then attach the signed leaves at those fixed indexes.
+	if (assets.toLocal) {
+		const index = view.outputMap.toLocal;
+		if (index === undefined)
+			throw new Error('Missing carrier for local asset payout');
+		view.tx.outs[index].script = buildTaprootToLocalOutput(
+			view.keys.revocationPubkey,
+			view.keys.localDelayedPubkey,
+			view.toSelfDelay,
+			undefined,
+			{ finalLeaf: assets.toLocal }
+		).output;
+	}
+	if (assets.toRemote) {
+		const index = view.outputMap.toRemote;
+		if (index === undefined)
+			throw new Error('Missing carrier for remote asset payout');
+		view.tx.outs[index].script = buildTaprootToRemoteOutput(
+			readPoint(peer.paymentBasepoint),
+			undefined,
+			{ finalLeaf: assets.toRemote }
+		).output;
+	}
+	return view;
+}
+
+function buildValidatedView(
+	candidate: IFinalOpeningCandidate,
+	terms: IFinalOpeningTerms,
+	owner: 'local' | 'remote',
+	point: Buffer,
+	height: bigint,
+	balances: IFinalBalances,
+	htlcs: readonly IFinalCommitmentHtlc[],
+	fundingRef?: IFinalFundingReference
+): IFinalCommitmentView {
 	if (
 		Object.keys(terms).length !== 7 ||
 		![

@@ -451,8 +451,9 @@ function handleInit(): void {
 
 function initializeConfig(file: string): void {
 	const requestedUpdates = hasFlag('--final-commitment-updates');
+	const requestedAssets = hasFlag('--dual-funded-assets');
 	const finalTaprootWallet =
-		requestedUpdates || hasFlag('--final-taproot-wallet');
+		requestedUpdates || requestedAssets || hasFlag('--final-taproot-wallet');
 	const pending = fs.lstatSync(
 		nodePath.join(nodePath.dirname(file), 'final-wallet-init.pending'),
 		{ throwIfNoEntry: false }
@@ -461,6 +462,12 @@ function initializeConfig(file: string): void {
 		throw new Error('A final wallet initialization is pending');
 	const config = loadConfig(finalTaprootWallet);
 	const updates = requestedUpdates || config.finalCommitmentUpdates === true;
+	const assets = requestedAssets || config.dualFundedAssets === true;
+	if (finalTaprootWallet && updates && assets)
+		throw new BeignetError(
+			'INVALID_PARAMS',
+			'Select one final wallet enrollment mode'
+		);
 	const network =
 		parseFlag('--network') ||
 		(finalTaprootWallet ? process.env.BEIGNET_NETWORK : undefined) ||
@@ -473,6 +480,7 @@ function initializeConfig(file: string): void {
 			(config.mnemonic !== undefined &&
 				(config.finalTaprootWallet !== true ||
 					(updates && config.finalCommitmentUpdates !== true) ||
+					(assets && config.dualFundedAssets !== true) ||
 					typeof config.mnemonic !== 'string' ||
 					!bip39.validateMnemonic(config.mnemonic))) ||
 			(config.finalTaprootWallet === true && !config.mnemonic))
@@ -497,12 +505,14 @@ function initializeConfig(file: string): void {
 					network: 'regtest',
 					finalTaprootWallet: true,
 					...(updates && { finalCommitmentUpdates: true }),
+					...(assets && { dualFundedAssets: true }),
 					...(alias ? { alias } : {})
 				};
 				apiToken = mintApiTokenIfAbsent(complete);
 				return complete;
 			},
-			updates
+			updates,
+			assets
 		);
 		if (config.mnemonic) {
 			apiToken = mintApiTokenIfAbsent(enrolled);
@@ -1131,7 +1141,7 @@ async function handleChannel(): Promise<void> {
 			// reads the flag token as the feerate (the issue #534 bug class).
 			const pos = positionalArgs(
 				new Set(['--request-funds', '--blockheight', '--max-lease-rates']),
-				new Set(['--final-taproot'])
+				new Set(['--final-taproot', '--dual-funded-assets'])
 			);
 			const requestFundsArg = parseFlag('--request-funds');
 			const maxLeaseRatesArg = parseFlag('--max-lease-rates');
@@ -1201,6 +1211,9 @@ async function handleChannel(): Promise<void> {
 			return outputResult(
 				await httpRequest('POST', '/channel/open-v2', {
 					pubkey: pos[2],
+					...(hasFlag('--dual-funded-assets')
+						? { dualFundedAssets: true }
+						: {}),
 					...(hasFlag('--final-taproot') ? { finalTaproot: true } : {}),
 					amountSats: parseInt(pos[3], 10),
 					fundingFeeratePerkw: pos[4] ? parseInt(pos[4], 10) : undefined,
@@ -3386,6 +3399,7 @@ Setup:
   init [--network N] [--alias A]         Generate mnemonic, API token + config
     [--final-taproot-wallet]             Enroll a fresh regtest type-80 wallet
     [--final-commitment-updates]         Enroll a fresh regtest wallet for revocable commitments
+    [--dual-funded-assets]               Enroll a fresh regtest wallet for dual-funded asset opening
   start [flags]                          Start node daemon
   stop                                   Stop daemon
 
@@ -3526,7 +3540,7 @@ Channels:
   channel open <pubkey> <sats> [push] [--sats-per-vbyte N] [--max]
                                          Open channel (auto-funded)
   channel open-zeroconf <pk> <sats> [push]  Open zero-conf channel
-  channel open-v2 <pubkey> <sats> [feerate] [--final-taproot] [--request-funds <sats>] [--blockheight <n>] [--max-lease-rates '<json>']
+  channel open-v2 <pubkey> <sats> [feerate] [--final-taproot | --dual-funded-assets] [--request-funds <sats>] [--blockheight <n>] [--max-lease-rates '<json>']
                                          Open dual-funded v2 channel; the
                                          lease flags buy inbound liquidity
                                          (option_will_fund) at or under the

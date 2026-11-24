@@ -6,6 +6,7 @@ import os from 'os';
 import path from 'path';
 import { mnemonicToSeedSync } from 'bip39';
 import { BeignetNode } from '../../src/cli/beignet-node';
+import { daemonOptions } from '../../src/cli/daemon-options';
 import { deriveLightningKeysFromSeed } from '../../src/lightning/keys/wallet-keys';
 import { assertDistCliFresh, DIST_CLI } from './helpers/dist-cli';
 
@@ -72,7 +73,8 @@ describe('Final wallet CLI initialization recovery', function () {
 	function init(
 		fault?: Interruption,
 		targetHome = home,
-		updates = false
+		updates = false,
+		assets = false
 	): {
 		ok: boolean;
 		signal: NodeJS.Signals | null;
@@ -88,7 +90,7 @@ describe('Final wallet CLI initialization recovery', function () {
 				'init',
 				'--network',
 				'regtest',
-				'--final-taproot-wallet',
+				...(assets ? ['--dual-funded-assets'] : ['--final-taproot-wallet']),
 				...(updates ? ['--final-commitment-updates'] : [])
 			],
 			{
@@ -217,6 +219,39 @@ describe('Final wallet CLI initialization recovery', function () {
 			JSON.parse(fs.readFileSync(config, 'utf8')).finalCommitmentUpdates
 		).to.equal(true);
 		expect(fs.existsSync(pending)).to.equal(false);
+	});
+	it('restarts the same asset original after an interrupted init and refuses a changed generation', async () => {
+		expect(init(undefined, home, true, true).ok).to.equal(false);
+		expect(fs.existsSync(db)).to.equal(false);
+		expect(init('kill-signer', home, false, true).signal).to.equal('SIGKILL');
+		expect(JSON.parse(fs.readFileSync(pending, 'utf8')).version).to.equal(3);
+		expect(init(undefined, home, true).ok).to.equal(false);
+		expect(init(undefined, home, false, true).ok).to.equal(true);
+		const saved = JSON.parse(fs.readFileSync(config, 'utf8'));
+		expect(saved.dualFundedAssets).to.equal(true);
+		expect(saved.finalCommitmentUpdates).to.equal(undefined);
+		const opts = {
+			...daemonOptions(saved, 0),
+			network: 'regtest' as const,
+			electrumHost: '127.0.0.1',
+			electrumPort: 65529,
+			electrumTls: false,
+			autoBootstrap: false,
+			autoReconnect: false,
+			logLevel: 'silent' as const
+		};
+		const node = await BeignetNode.create(opts);
+		try {
+			expect(node.getInfo().nodeId).to.equal(
+				deriveLightningKeysFromSeed(
+					mnemonicToSeedSync(saved.mnemonic),
+					1
+				).nodePublicKey.toString('hex')
+			);
+		} finally {
+			await node.destroy();
+		}
+		expect(init(undefined, home, true).ok).to.equal(false);
 	});
 	it('cannot enroll a supplied pending mnemonic without its original device', () => {
 		const original = interrupt('kill');

@@ -254,6 +254,7 @@ describe('final splice negotiation and recovery', function () {
 								config: {
 									finalOpening: { storage: stores[i], root: peers[i].root }
 								},
+								assetCollateral: new Map(),
 								finalObservedFunding: new Map(),
 								finalDepthByChannel: new Map([[id, depths[i]]]),
 								finalObservedClose: new Map(),

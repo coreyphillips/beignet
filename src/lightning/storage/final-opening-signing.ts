@@ -2,10 +2,8 @@ import type { BIP32Interface } from 'bip32';
 import { Transaction } from 'bitcoinjs-lib';
 import { verifyOpeningFunding } from './final-opening-funding';
 import { ecc } from '../../utils/ecc';
-import {
-	buildFinalOpeningCommitment,
-	type IFinalOpeningTerms
-} from '../channel/final-opening-commitment';
+import type { IFinalOpeningTerms } from '../channel/final-opening-commitment';
+import { storedOpeningCommitment } from './asset-opening-evidence';
 import {
 	aggregateCommitmentSig,
 	partialSignCommitment,
@@ -95,6 +93,7 @@ function noncePair(payload?: string): { current: Buffer; next: Buffer } {
 }
 
 interface CommitmentView {
+	fundingRoot?: Buffer;
 	tx: Transaction;
 	script: Buffer;
 	fundingTxid: Buffer;
@@ -112,7 +111,8 @@ function commitmentView(
 	nonces: IFinalOpeningNonces,
 	owner: 'local' | 'remote'
 ): CommitmentView {
-	const tx = buildFinalOpeningCommitment(candidate, terms, owner);
+	const evidence = nonces.session?.assetEvidence;
+	const tx = storedOpeningCommitment(candidate, terms, owner, evidence);
 	const funding = Transaction.fromHex(candidate.fundingTxHex);
 	const { script, value } = funding.outs[candidate.fundingOutputIndex];
 	const local = noncePair(nonces.local?.payload);
@@ -121,6 +121,7 @@ function commitmentView(
 	if (new Set(promises.map((n) => n.toString('hex'))).size !== promises.length)
 		throw new Error('Overlapping opening verification nonce promises');
 	return {
+		...(evidence && { fundingRoot: Buffer.from(evidence.fundingRoot, 'hex') }),
 		tx,
 		script,
 		fundingTxid: funding.getHash(),
@@ -178,7 +179,8 @@ function parseShare(
 		view.holderKey,
 		view.signerKey,
 		view.holderNonce,
-		nonce
+		nonce,
+		view.fundingRoot
 	);
 	if (!verifyPartialCommitmentSig(session, share, view.signerKey, nonce))
 		throw new Error('Incorrect opening commitment partial signature');
@@ -320,6 +322,13 @@ export function signOpening(
 				nonceKey.toString('hex'),
 				index,
 				normalized,
+				...(state.session?.assetEvidence
+					? [
+							sha256(
+								Buffer.from(JSON.stringify(state.session.assetEvidence))
+							).toString('hex')
+					  ]
+					: []),
 				state.local!.payload,
 				state.peer
 			])
@@ -387,7 +396,8 @@ export function signOpening(
 				view.holderKey,
 				view.signerKey,
 				view.holderNonce,
-				nonce
+				nonce,
+				view.fundingRoot
 			);
 			const share = partialSignCommitment(session, key, handle);
 			raw = encodeCommitmentSignedMessage({

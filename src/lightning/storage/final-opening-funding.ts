@@ -137,11 +137,16 @@ export function recordOpeningFunding(
 	state: IFinalOpeningNonces,
 	nonceKey: Buffer,
 	authority: FinalOpeningAuthority | null,
-	operation: { sign: FinalFundingWitnessSigner } | { peer: Buffer }
+	operation:
+		| { sign: FinalFundingWitnessSigner }
+		| { peer: Buffer }
+		| { witnesses: Buffer[][] }
 ): Buffer {
 	const signing = state.signing;
 	requireCommitments(signing);
-	const field = 'sign' in operation ? 'fundingLocal' : 'fundingPeer';
+	if ('sign' in operation && state.session?.assetEvidence)
+		throw new Error('Asset opening requires prepared asset wallet witnesses');
+	const field = 'peer' in operation ? 'fundingPeer' : 'fundingLocal';
 	if (
 		'peer' in operation &&
 		(!Buffer.isBuffer(operation.peer) ||
@@ -149,68 +154,149 @@ export function recordOpeningFunding(
 	)
 		throw new Error('Invalid peer funding witness payload');
 	const saved = signing[field];
+	const supplied =
+		'witnesses' in operation
+			? walletWitnessPayload(candidate, operation.witnesses)
+			: undefined;
 	if (saved !== undefined) {
 		const original = readWire(saved);
 		if ('peer' in operation && !original.equals(operation.peer))
 			throw new Error('Peer changed its saved funding witnesses');
+		if (supplied && !original.equals(supplied))
+			throw new Error('Changed asset funding witnesses');
 		return original;
 	}
 	if (!authority)
 		throw new Error('New funding witnesses require the original wallet device');
 	const slot = 'funding-witness/' + field + '/' + candidate.channelId;
-	const transcript = sha256(
-		Buffer.from(
-			JSON.stringify([
-				nonceKey.toString('hex'),
-				signing.outgoing,
-				signing.peer,
-				signing.exit,
-				'peer' in operation ? operation.peer.toString('hex') : null
-			])
-		)
-	).toString('hex');
+	const transcript = fundingTranscript(
+		nonceKey,
+		state,
+		'peer' in operation ? operation.peer : undefined
+	);
 	let wire: Buffer;
-	if ('sign' in operation) {
+	if (!('peer' in operation)) {
 		const { tx, local, prevouts } = finalFundingInputs(candidate);
-		authority.requireEnforceableExit(candidate.channelId, signing.exit);
-		authority.bindFundingInputs(
-			local.map((i) => {
-				const input = tx.ins[i];
-				return (
-					Buffer.from(input.hash).reverse().toString('hex') + ':' + input.index
-				);
-			}),
+		reserveOpeningInputs(
+			candidate.channelId,
+			signing.exit,
+			tx,
+			local,
+			authority,
 			transcript
 		);
 		const cached = authority.claim(slot, transcript);
-		if (cached) wire = cached;
-		else {
-			const txid = tx.getHash();
+		if (cached) {
+			if (supplied && !cached.equals(supplied))
+				throw new Error('Changed asset funding witnesses');
+			wire = cached;
+		} else if (supplied) wire = supplied;
+		else if ('sign' in operation) {
 			// The wallet receives its own working copy. Verify its result against the stored unsigned transaction.
-			const count = local.length;
-			const witnesses = count ? operation.sign(tx, local, prevouts) : [];
-			if (
-				!Array.isArray(witnesses) ||
-				witnesses.length !== count ||
-				witnesses.some(
-					(w) =>
-						!Array.isArray(w) ||
-						w.length < 1 ||
-						w.length > 2 ||
-						w.some((e) => !Buffer.isBuffer(e) || e.length > 73)
-				)
-			)
-				throw new Error('Invalid wallet funding witness stacks');
-			wire = encodeTxSignaturesMessage({
-				channelId: Buffer.from(candidate.channelId, 'hex'),
-				txid,
-				witnesses
-			});
-		}
+			wire = walletWitnessPayload(
+				candidate,
+				local.length ? operation.sign(tx, local, prevouts) : []
+			);
+		} else throw new Error('Missing asset funding witnesses');
 	} else wire = Buffer.from(operation.peer);
 	signing[field] = wire.toString('hex');
 	const complete = assembled(candidate, signing);
 	if (complete) signing.fundingTransaction = complete.toString('hex');
 	if ('peer' in operation) authority.claim(slot, transcript);
 	return authority.finish(slot, transcript, wire);
+}
+
+function walletWitnessPayload(
+	candidate: IFinalOpeningCandidate,
+	witnesses: Buffer[][]
+): Buffer {
+	const { tx, local } = finalFundingInputs(candidate);
+	if (
+		!Array.isArray(witnesses) ||
+		witnesses.length !== local.length ||
+		witnesses.some(
+			(w) =>
+				!Array.isArray(w) ||
+				w.length < 1 ||
+				w.length > 2 ||
+				w.some((e) => !Buffer.isBuffer(e) || e.length > 73)
+		)
+	)
+		throw new Error('Invalid wallet funding witness stacks');
+	return encodeTxSignaturesMessage({
+		channelId: Buffer.from(candidate.channelId, 'hex'),
+		txid: tx.getHash(),
+		witnesses
+	});
+}
+
+function fundingTranscript(
+	nonceKey: Buffer,
+	state: IFinalOpeningNonces,
+	peer?: Buffer
+): string {
+	const signing = state.signing;
+	requireCommitments(signing);
+	const evidence = state.session?.assetEvidence;
+	return sha256(
+		Buffer.from(
+			JSON.stringify([
+				nonceKey.toString('hex'),
+				signing.outgoing,
+				signing.peer,
+				signing.exit,
+				...(evidence
+					? [sha256(Buffer.from(JSON.stringify(evidence))).toString('hex')]
+					: []),
+				peer ? peer.toString('hex') : null
+			])
+		)
+	).toString('hex');
+}
+
+function reserveOpeningInputs(
+	id: string,
+	exit: string,
+	tx: Transaction,
+	local: number[],
+	authority: FinalOpeningAuthority,
+	transcript: string
+): void {
+	authority.requireEnforceableExit(id, exit);
+	authority.bindFundingInputs(
+		local.map((i) => {
+			const input = tx.ins[i];
+			return (
+				Buffer.from(input.hash).reverse().toString('hex') + ':' + input.index
+			);
+		}),
+		transcript
+	);
+}
+
+/** Reserve the asset exit and pledge each input before the host gets a signing request. */
+export function prepareAssetWitnessRelease(
+	candidate: IFinalOpeningCandidate,
+	state: IFinalOpeningNonces,
+	nonceKey: Buffer,
+	authority: FinalOpeningAuthority
+) {
+	if (!state.session?.assetEvidence)
+		throw new Error('Missing asset opening proof material');
+	requireCommitments(state.signing);
+	const inputs = finalFundingInputs(candidate);
+	const transcript = fundingTranscript(nonceKey, state);
+	reserveOpeningInputs(
+		candidate.channelId,
+		state.signing.exit,
+		inputs.tx,
+		inputs.local,
+		authority,
+		transcript
+	);
+	authority.claim(
+		'funding-witness/fundingLocal/' + candidate.channelId,
+		transcript
+	);
+	return inputs;
 }

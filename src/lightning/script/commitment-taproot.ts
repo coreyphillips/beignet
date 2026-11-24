@@ -38,17 +38,26 @@ export interface ITaprootAuxLeaf {
 /**
  * An omitted argument selects the staging Bitcoin scripts. An auxiliary leaf
  * extends the staging tree for an asset channel. Final Bitcoin scripts use
- * the explicit 'final' format and have no auxiliary leaf.
+ * the explicit 'final' format. An opening that commits an auxiliary leaf
+ * alongside the final scripts specifies both.
  */
-export type TaprootOutputFormat = ITaprootAuxLeaf | 'final';
+export type TaprootOutputFormat =
+	| ITaprootAuxLeaf
+	| 'final'
+	| { finalLeaf: ITaprootAuxLeaf };
+
+function isFinalFormat(format?: TaprootOutputFormat): boolean {
+	return format === 'final' || (!!format && 'finalLeaf' in format);
+}
 
 /**
  * `tree` with the auxiliary leaf committed beside it, as the right child of
  * a new root. Without a leaf the tree is returned as it is, so an output
  * built without one has the key it always had.
  */
-function withAuxLeaf(tree: Taptree, leaf?: TaprootOutputFormat): Taptree {
-	if (!leaf || leaf === 'final') return tree;
+function withAuxLeaf(tree: Taptree, format?: TaprootOutputFormat): Taptree {
+	if (!format || format === 'final') return tree;
+	const leaf = 'finalLeaf' in format ? format.finalLeaf : format;
 	const version = leaf.leafVersion ?? TAPLEAF_VERSION;
 	if (
 		!Buffer.isBuffer(leaf.script) ||
@@ -121,7 +130,7 @@ function delayedSignature(
 	delay: number,
 	format?: TaprootOutputFormat
 ): (number | Buffer)[] {
-	if (format === 'final') {
+	if (isFinalFormat(format)) {
 		if (!Number.isInteger(delay) || delay < 1 || delay > 0xffff) {
 			throw new Error('Final Taproot CSV delay must be a positive uint16');
 		}
@@ -449,7 +458,7 @@ export function buildTaprootReceivedHtlcTimeoutLeaf(
 	cltvExpiry: number,
 	format?: TaprootOutputFormat
 ): Buffer {
-	if (format === 'final') {
+	if (isFinalFormat(format)) {
 		assertFinalTaprootHtlcExpiry(cltvExpiry);
 		return script.compile([
 			...delayedSignature(remoteHtlcPubkey, 1, format),

@@ -6,6 +6,7 @@
  * class with plain JSON return types.
  */
 
+import { ASSET_OPENING_TYPE_HEX } from '../lightning/features/asset-opening';
 import type { IrohDaemonConfig } from './iroh-config';
 import { validateIrohConfig } from './iroh-config';
 import type { PorchDaemonConfig } from './porch-config';
@@ -515,6 +516,8 @@ export interface BeignetNodeOptions
 	finalTaprootWallet?: boolean;
 	/** Enroll a new regtest wallet for type-80 payments, splicing and closes. */
 	finalCommitmentUpdates?: boolean;
+	/** Enroll a fresh regtest wallet for dual-funded asset channel opening. */
+	dualFundedAssets?: boolean;
 	/**
 	 * option_wumbo (large_channels, default false): advertise the bit and lift
 	 * the 2^24 sat funding cap (up to 10 BTC) for peers that also advertise it.
@@ -3125,6 +3128,16 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 				'Final commitment updates require an enrolled final wallet'
 			);
 		if (
+			opts.dualFundedAssets !== undefined &&
+			(typeof opts.dualFundedAssets !== 'boolean' ||
+				(opts.dualFundedAssets &&
+					(opts.finalTaprootWallet !== true || opts.finalCommitmentUpdates)))
+		)
+			throw new BeignetError(
+				'INVALID_PARAMS',
+				'Dual-funded assets require a separately enrolled final wallet'
+			);
+		if (
 			opts.finalTaprootWallet !== undefined &&
 			typeof opts.finalTaprootWallet !== 'boolean'
 		)
@@ -3153,7 +3166,10 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 			throw new BeignetError('INVALID_PARAMS', 'Invalid final wallet mnemonic');
 		const fresh =
 			opts.finalTaprootWallet && opts.mnemonic === undefined
-				? generateFinalDaemonWallet(opts.finalCommitmentUpdates)
+				? generateFinalDaemonWallet(
+						opts.finalCommitmentUpdates,
+						opts.dualFundedAssets
+				  )
 				: undefined;
 		const mnemonic = fresh?.mnemonic ?? (opts.mnemonic || generateMnemonic());
 		const networkName = opts.network;
@@ -3246,6 +3262,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 				: Sqlite.openFinalWallet(dbPath, {
 						encryptionKey: encryptionKey!,
 						finalCommitmentUpdates: opts.finalCommitmentUpdates,
+						dualFundedAssets: opts.dualFundedAssets,
 						network: networkName,
 						nodeId
 				  });
@@ -7960,6 +7977,12 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 			case ChannelState.NEGOTIATING_CLOSING:
 				return 'assetChannelClosingSats';
 			case ChannelState.FORCE_CLOSED: {
+				if (ch.channelType?.toString('hex') === ASSET_OPENING_TYPE_HEX)
+					return this.node
+						.getChannelManager()
+						.assetOpeningCollateral(ch.channelId)?.payoutSpent
+						? undefined
+						: 'assetChannelClosingSats';
 				const status = this.forceCloseBalanceOutput(ch.channelId)?.status;
 				return status === OutputStatus.SPEND_CONFIRMED ||
 					status === OutputStatus.IRREVOCABLY_RESOLVED
@@ -14827,7 +14850,8 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	 */
 	private assetChannelMark(channelId: Buffer): { auxiliary?: true } {
 		try {
-			return this.node.getAuxiliaryChannelInfo(channelId) !== undefined
+			return this.node.getAuxiliaryChannelInfo(channelId) !== undefined ||
+				this.node.getChannel(channelId)?.auxiliary
 				? { auxiliary: true }
 				: {};
 		} catch {
@@ -15022,6 +15046,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 		params: {
 			amountSats: number;
 			finalTaproot?: boolean;
+			dualFundedAssets?: boolean;
 			fundingFeeratePerkw?: number;
 			commitmentFeeratePerkw?: number;
 			locktime?: number;
@@ -15043,12 +15068,23 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 				'INVALID_PARAMS',
 				'finalTaproot must be a boolean'
 			);
-		if (params.finalTaproot) {
+		if (
+			params.dualFundedAssets !== undefined &&
+			typeof params.dualFundedAssets !== 'boolean'
+		)
+			throw new BeignetError(
+				'INVALID_PARAMS',
+				'dualFundedAssets must be a boolean'
+			);
+		if (params.finalTaproot && params.dualFundedAssets)
+			throw new BeignetError('INVALID_PARAMS', 'Choose one v2 opening profile');
+		if (params.finalTaproot || params.dualFundedAssets) {
 			const supported = [
 				'amountSats',
 				'fundingFeeratePerkw',
 				'commitmentFeeratePerkw',
 				'locktime',
+				'dualFundedAssets',
 				'finalTaproot'
 			];
 			for (const [field, value] of Object.entries(params)) {
@@ -15106,6 +15142,9 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 		const channel = fundingOrRefuse(() =>
 			this.node.openChannelV2(peerPubkey, {
 				fundingSatoshis: BigInt(params.amountSats),
+				...(params.dualFundedAssets === undefined
+					? {}
+					: { dualFundedAssets: params.dualFundedAssets }),
 				...(params.finalTaproot === undefined
 					? {}
 					: { finalTaproot: params.finalTaproot }),

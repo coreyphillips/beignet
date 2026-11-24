@@ -148,7 +148,9 @@ export enum Feature {
 	 * Optional scoped custody for the asset HTLC children of a revoked
 	 * commitment (bits 452/453). Requires fixed asset HTLC outputs.
 	 */
-	OPTION_ASSET_CHILD_CUSTODY = 452
+	OPTION_ASSET_CHILD_CUSTODY = 452,
+	/** Private, two-contributor asset opening version 1 (init pair 456/457). */
+	OPTION_DUAL_FUNDED_ASSETS = 456
 }
 
 /**

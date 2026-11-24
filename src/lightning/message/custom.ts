@@ -95,7 +95,9 @@ export enum BeignetCustomSubtype {
 	 *  reason. */
 	SPLICE_CONFLICT_ACK = 65,
 	FFOR_RECEIVE_REQUEST = 80,
-	FFOR_RECEIVE_RESPONSE = 81
+	FFOR_RECEIVE_RESPONSE = 81,
+	ASSET_OPEN = 96,
+	ASSET_OPEN_CONSENT = 97
 }
 
 export interface ICustomMessage {

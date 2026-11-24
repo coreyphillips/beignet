@@ -10,12 +10,15 @@ import {
 	type IFinalWalletBinding
 } from '../lightning/storage/final-wallet-format';
 import { SIGNER_SUFFIX } from '../lightning/storage/final-opening-authority';
-import { generateFinalDaemonWallet } from '../lightning/storage/final-wallet-generation';
+import {
+	finalWalletGeneration,
+	generateFinalDaemonWallet
+} from '../lightning/storage/final-wallet-generation';
 import { ensurePrivateDir } from './fs-utils';
 import type { BeignetConfig } from './types';
 
 interface Pending {
-	version: 1 | 2;
+	version: 1 | 2 | 3;
 	base: string;
 	mnemonic: string;
 	dataDir: string;
@@ -77,7 +80,7 @@ function loadPending(file: string): Pending | undefined {
 	if (
 		!p ||
 		Object.keys(p).sort().join(',') !== 'base,dataDir,mnemonic,version' ||
-		(p.version !== 1 && p.version !== 2) ||
+		(p.version !== 1 && p.version !== 2 && p.version !== 3) ||
 		typeof p.base !== 'string' ||
 		!/^[a-f0-9]{64}$/.test(p.base) ||
 		typeof p.mnemonic !== 'string' ||
@@ -89,11 +92,15 @@ function loadPending(file: string): Pending | undefined {
 	return p;
 }
 
-function walletBinding(words: string, updates: boolean): IFinalWalletBinding {
+function walletBinding(
+	words: string,
+	generation: Pending['version']
+): IFinalWalletBinding {
 	const seed = mnemonicToSeedSync(words);
 	return {
 		network: 'regtest',
-		finalCommitmentUpdates: updates,
+		finalCommitmentUpdates: generation === 2,
+		dualFundedAssets: generation === 3,
 		nodeId: deriveLightningKeysFromSeed(seed, 1).nodePublicKey.toString('hex'),
 		encryptionKey: deriveStorageKey(seed)
 	};
@@ -101,11 +108,11 @@ function walletBinding(words: string, updates: boolean): IFinalWalletBinding {
 function verifyEnrolledWallet(
 	dataDir: string,
 	words: string,
-	updates: boolean
+	generation: Pending['version']
 ): void {
 	const { SqliteStorage } =
 		require('../lightning/storage/sqlite-storage') as typeof import('../lightning/storage/sqlite-storage');
-	const binding = walletBinding(words, updates);
+	const binding = walletBinding(words, generation);
 	const store = SqliteStorage.openFinalWallet(
 		path.join(dataDir, 'regtest.db'),
 		binding
@@ -123,8 +130,10 @@ export function provisionFinalConfig(
 	config: BeignetConfig,
 	fallbackDir: (words: string) => string,
 	makeConfig: (words: string, dataDir: string) => BeignetConfig,
-	updates = false
+	updates = false,
+	assets = false
 ): BeignetConfig {
+	const generation = finalWalletGeneration(updates, assets);
 	const dir = path.dirname(configFile);
 	const pendingFile = path.join(dir, 'final-wallet-init.pending');
 	const previous = loadPending(pendingFile);
@@ -135,17 +144,25 @@ export function provisionFinalConfig(
 	const dataDirFor = (words: string): string =>
 		path.resolve(target || fallbackDir(words));
 	if (!previous && config.mnemonic) {
-		verifyEnrolledWallet(dataDirFor(config.mnemonic), config.mnemonic, updates);
+		verifyEnrolledWallet(
+			dataDirFor(config.mnemonic),
+			config.mnemonic,
+			generation
+		);
 		return config;
 	}
 	let pending: Pending | undefined = previous;
 	if (pending) {
-		if (pending.version !== (updates ? 2 : 1))
+		if (pending.version !== generation)
 			throw new Error(
-				'Pending final wallet requires the same commitment update setting'
+				'Pending final wallet requires the original enrollment mode'
 			);
 		const complete =
 			config.finalTaprootWallet === true &&
+			finalWalletGeneration(
+				config.finalCommitmentUpdates,
+				config.dualFundedAssets
+			) === generation &&
 			config.network === 'regtest' &&
 			config.mnemonic === pending.mnemonic &&
 			config.dataDir === pending.dataDir;
@@ -164,10 +181,10 @@ export function provisionFinalConfig(
 		)
 			finishStagedDaemonWallet(
 				wallet,
-				walletBinding(pending.mnemonic, updates)
+				walletBinding(pending.mnemonic, generation)
 			);
 		if (fs.lstatSync(wallet, { throwIfNoEntry: false })) {
-			verifyEnrolledWallet(pending.dataDir, pending.mnemonic, updates);
+			verifyEnrolledWallet(pending.dataDir, pending.mnemonic, generation);
 			if (complete) {
 				fs.unlinkSync(pendingFile);
 				syncDir(dir);
@@ -181,13 +198,13 @@ export function provisionFinalConfig(
 		}
 	}
 	if (!pending) {
-		const fresh = generateFinalDaemonWallet(updates);
+		const fresh = generateFinalDaemonWallet(updates, assets);
 		const dataDir = dataDirFor(fresh.mnemonic);
 		ensurePrivateDir(dataDir);
 		const file = path.join(dataDir, 'regtest.db');
 		assertUnusedWalletPath(file);
 		pending = {
-			version: updates ? 2 : 1,
+			version: generation,
 			base,
 			mnemonic: fresh.mnemonic,
 			dataDir
