@@ -22,6 +22,10 @@
  * HKDF-SHA256(seed, salt empty, info 'beignet-scb-v1').
  */
 
+import {
+	assertLegacyCommitmentProfile,
+	hasCommitmentProfile
+} from '../channel/commitment-profile';
 import { parseIrohAddress } from '../transport/iroh';
 import { parseWebSocketUrl } from '../transport/websocket';
 import type { IPeerTransportOptions } from '../transport/duplex-transport';
@@ -180,6 +184,7 @@ function isIndex(value: unknown, max: number): boolean {
  */
 export function validateScbEntry(entry: unknown): string | null {
 	if (!entry || typeof entry !== 'object') return 'entry is not an object';
+	if (hasCommitmentProfile(entry)) return 'Unsupported SCB commitment profile';
 	const e = entry as Record<string, unknown>;
 	if (!isHexOfBytes(e.channelId, 32)) {
 		return 'invalid channelId (expected 32-byte hex)';
@@ -280,6 +285,9 @@ export function validateScbEntry(entry: unknown): string | null {
  * Returns 'beignet-scb-v1:' + base64(iv || authTag || ciphertext).
  */
 export function encodeScb(backup: IStaticChannelBackup, seed: Buffer): string {
+	if (Array.isArray(backup?.channels)) {
+		for (const entry of backup.channels) assertLegacyCommitmentProfile(entry);
+	}
 	const key = hkdfKey(seed, SCB_HKDF_INFO);
 	return encryptWithPrefix(key, JSON.stringify(backup), SCB_PREFIX);
 }
@@ -328,6 +336,7 @@ export function decodeScb(encoded: string, seed: Buffer): IStaticChannelBackup {
 	if (!Array.isArray(backup.channels)) {
 		throw new Error('SCB payload is missing the channels array');
 	}
+	for (const entry of backup.channels) assertLegacyCommitmentProfile(entry);
 	return backup;
 }
 

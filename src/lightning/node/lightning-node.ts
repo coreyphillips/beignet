@@ -577,6 +577,7 @@ import {
 	isRecencyUnproven,
 	recencyHoldOrigin
 } from '../channel/channel-state';
+import { assertLegacyCommitmentProfile } from '../channel/commitment-profile';
 import type { IScbChannelEntry } from '../backup/scb';
 import { encodeScb, parseScbAddress, validateScbEntry } from '../backup/scb';
 import { signRemoteCommitment } from '../channel/commitment-builder';
@@ -3103,6 +3104,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		// HTLC history included. Nothing writes a channel row before
 		// restore's main loop has walked them.
 		const storedChannels = this.storage.loadAllChannels();
+		for (const row of storedChannels) assertLegacyCommitmentProfile(row.state);
 		// Asset channels (issue #2093): a stored channel with asset state
 		// cannot be run without the provider that reads it. Signing for it as
 		// an ordinary channel would commit to outputs without their asset
@@ -9847,6 +9849,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		const seen = new Set<string>();
 		for (const channel of this.channelManager.listChannels()) {
 			const state = channel.getFullState();
+			assertLegacyCommitmentProfile(state);
 			if (!state.fundingTxid || !state.channelId) continue;
 			if (state.state === ChannelState.CLOSED) continue;
 			const idHex = state.channelId.toString('hex');
@@ -9898,6 +9901,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		recovering: string[];
 		skipped: Array<{ channelId: string; reason: string }>;
 	}> {
+		for (const entry of entries) assertLegacyCommitmentProfile(entry);
 		const recovering: string[] = [];
 		const skipped: Array<{ channelId: string; reason: string }> = [];
 

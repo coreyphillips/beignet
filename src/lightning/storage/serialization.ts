@@ -68,6 +68,12 @@ import type {
 	ISerializedAuxiliaryState,
 	SerializedCustomRecords
 } from './auxiliary-serialization';
+import {
+	assertLegacyCommitmentProfile,
+	hasCommitmentProfile,
+	UnsupportedCommitmentProfileError
+} from '../channel/commitment-profile';
+import { Feature, FeatureFlags } from '../features/flags';
 import type { IAuxiliaryForwardLegResolution } from '../channel/auxiliary-forward';
 
 /** Issue #2098, step 5: the end of a forward's leg, as a channel row keeps it. */
@@ -436,6 +442,7 @@ export interface ISerializedChannelState {
 	 * pre-taproot serialized states.
 	 */
 	remoteSigningNonce?: string | null;
+	readonly commitmentProfile?: string;
 	channelType: string | null;
 	localChannelReady: boolean;
 	remoteChannelReady: boolean;
@@ -888,9 +895,63 @@ export function deserializeV2InFlight(s: ISerializedV2InFlight): IV2InFlight {
 	};
 }
 
+// BOLT 2 channel_type: final simple Taproot, with optional scid_alias.
+const FINAL_TYPES = ['0100000000000000000000', '0100000000400000000000'];
+
+function channelCommitmentProfile(
+	s: IChannelState | ISerializedChannelState,
+	finalTaproot: boolean | undefined,
+	direction: 'encode' | 'decode'
+): 'simple-taproot-final' | undefined {
+	if (finalTaproot !== true) {
+		assertLegacyCommitmentProfile(s);
+		return undefined;
+	}
+	const raw = s.channelType;
+	// Check the bytes the reader would actually load, including historical
+	// permissive hex decoding. A marked row must additionally carry exact hex.
+	const type = direction === 'decode' ? hexToBuf(raw as string | null) : raw;
+	const hex = Buffer.isBuffer(type) ? type.toString('hex') : undefined;
+	if (!hasCommitmentProfile(s)) {
+		if (Buffer.isBuffer(type) && type.length >= 11) {
+			const flags = FeatureFlags.fromBuffer(type);
+			if (
+				flags.hasFeature(Feature.OPTION_SIMPLE_TAPROOT) &&
+				!flags.hasFeature(Feature.STATIC_REMOTE_KEY) &&
+				!flags.hasFeature(Feature.OPTION_TAPROOT) &&
+				!flags.hasFeature(Feature.OPTION_TAPROOT_OVERLAY)
+			) {
+				throw new UnsupportedCommitmentProfileError(
+					'Missing final Taproot commitment profile'
+				);
+			}
+		}
+		return undefined;
+	}
+	if (
+		s.commitmentProfile !== 'simple-taproot-final' ||
+		hex === undefined ||
+		!FINAL_TYPES.includes(hex) ||
+		(direction === 'decode' && raw !== hex) ||
+		s.fundingVersion !== 2 ||
+		s.fundingTaprootMerkleRoot !== undefined ||
+		s.auxiliaryState !== undefined ||
+		s.lastSentAuxiliaryRecords !== undefined ||
+		('auxiliaryProvider' in s && s.auxiliaryProvider !== undefined) ||
+		('auxiliaryAnswers' in s && s.auxiliaryAnswers !== undefined)
+	) {
+		throw new UnsupportedCommitmentProfileError(
+			'Invalid final Taproot commitment profile, channel type or funding state'
+		);
+	}
+	return s.commitmentProfile;
+}
+
 export function serializeChannelState(
 	s: IChannelState,
 	options: {
+		/** Permit the final Bitcoin commitment profile in this codec only. */
+		finalTaproot?: boolean;
 		legacyHtlcHistory?: boolean;
 		/**
 		 * Which revoked-commitment snapshots to write. Storage keeps them in
@@ -907,6 +968,11 @@ export function serializeChannelState(
 		addOnionsByReference?: boolean;
 	} = {}
 ): ISerializedChannelState {
+	const commitmentProfile = channelCommitmentProfile(
+		s,
+		options.finalTaproot,
+		'encode'
+	);
 	const htlcs: ISerializedHtlcEntry[] = [];
 	for (const [key, entry] of s.htlcs) {
 		htlcs.push(serializeHtlcEntry(key, entry));
@@ -1011,6 +1077,7 @@ export function serializeChannelState(
 		remoteCommitmentSignature: bufToHex(s.remoteCommitmentSignature),
 		remoteHtlcSignatures: s.remoteHtlcSignatures.map((b) => b.toString('hex')),
 		remoteSigningNonce: bufToHex(s.remoteSigningNonce ?? null),
+		...(commitmentProfile && { commitmentProfile }),
 		channelType: bufToHex(s.channelType),
 		localChannelReady: s.localChannelReady,
 		remoteChannelReady: s.remoteChannelReady,
@@ -1567,8 +1634,14 @@ export function deserializeFforEpoch(
 }
 
 export function deserializeChannelState(
-	s: ISerializedChannelState
+	s: ISerializedChannelState,
+	options: { finalTaproot?: boolean } = {}
 ): IChannelState {
+	const commitmentProfile = channelCommitmentProfile(
+		s,
+		options.finalTaproot,
+		'decode'
+	);
 	const htlcs = new Map<string, IHtlcEntry>();
 	for (const h of s.htlcs) {
 		const { key, entry } = deserializeHtlcEntry(h);
@@ -1681,6 +1754,7 @@ export function deserializeChannelState(
 			Buffer.from(h, 'hex')
 		),
 		remoteSigningNonce: hexToBuf(s.remoteSigningNonce) ?? undefined,
+		...(commitmentProfile && { commitmentProfile }),
 		channelType: hexToBuf(s.channelType),
 		localChannelReady: s.localChannelReady,
 		remoteChannelReady: s.remoteChannelReady,
@@ -1928,6 +2002,7 @@ export interface IStoredAssetChannelRow {
 export function channelRowToStore(
 	row: ISerializedChannelState
 ): ISerializedChannelState | IStoredAssetChannelRow {
+	assertLegacyCommitmentProfile(row);
 	return channelRowCarriesAssetState(row)
 		? { assetChannelRow: 1, channel: row }
 		: row;
@@ -1941,6 +2016,7 @@ export function channelRowToStore(
  * knows asset channels, and is refused.
  */
 export function channelRowFromStore(stored: unknown): ISerializedChannelState {
+	assertLegacyCommitmentProfile(stored);
 	if (
 		stored &&
 		typeof stored === 'object' &&
@@ -1948,6 +2024,7 @@ export function channelRowFromStore(stored: unknown): ISerializedChannelState {
 		'assetChannelRow' in stored
 	) {
 		const envelope = stored as Record<string, unknown>;
+		assertLegacyCommitmentProfile(envelope.channel);
 		if (
 			envelope.assetChannelRow !== 1 ||
 			Object.keys(envelope).length !== 2 ||

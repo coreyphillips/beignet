@@ -2091,6 +2091,7 @@ property channel.IChannelState.closeSpendsSpliceTxid?: Buffer | null
 property channel.IChannelState.closingFeeMax: bigint | null
 property channel.IChannelState.closingFeeMin: bigint | null
 property channel.IChannelState.commitmentFeeratePerkw: number
+readonly property channel.IChannelState.commitmentProfile?: 'simple-taproot-final'
 property channel.IChannelState.compactHtlcHistory?: true
 property channel.IChannelState.condemned?: boolean
 property channel.IChannelState.dataLossDetected?: boolean
@@ -8524,6 +8525,7 @@ property storage.ISerializedChannelState.closeSpendsSpliceTxid?: string | null
 property storage.ISerializedChannelState.closingFeeMax: string | null
 property storage.ISerializedChannelState.closingFeeMin: string | null
 property storage.ISerializedChannelState.commitmentFeeratePerkw?: number
+readonly property storage.ISerializedChannelState.commitmentProfile?: string
 property storage.ISerializedChannelState.compactHtlcHistory?: ICompactHtlcHistory
 property storage.ISerializedChannelState.condemned?: boolean
 property storage.ISerializedChannelState.dataLossDetected?: boolean
@@ -9068,7 +9070,7 @@ function storage.deriveStorageKey(secret: Uint8Array): Buffer
 function storage.deserializeBasepoints(s: storage.ISerializedBasepoints): keys.IChannelBasepoints
 function storage.deserializeChainMonitorState(json: string): chain.IChainMonitorState
 function storage.deserializeChannelConfig(s: storage.ISerializedChannelConfig): channel.IChannelConfig
-function storage.deserializeChannelState(s: storage.ISerializedChannelState): channel.IChannelState
+function storage.deserializeChannelState(s: storage.ISerializedChannelState, options?: { finalTaproot?: boolean; }): channel.IChannelState
 function storage.deserializeFforEpoch(s: storage.ISerializedFforEpoch): ffor.IFforEpochRecord
 function storage.deserializeGraphChannel(json: string): gossip.IGraphChannel
 function storage.deserializeGraphNode(json: string): gossip.IGraphNode
@@ -9091,7 +9093,7 @@ function storage.runStorageConformanceSuite(factory: () => storage.IStorageBacke
 function storage.serializeBasepoints(bp: keys.IChannelBasepoints): storage.ISerializedBasepoints
 function storage.serializeChainMonitorState(s: chain.IChainMonitorState): string
 function storage.serializeChannelConfig(c: channel.IChannelConfig): storage.ISerializedChannelConfig
-function storage.serializeChannelState(s: channel.IChannelState, options?: { legacyHtlcHistory?: boolean; htlcHistory?: 'all' | 'unsaved' | 'none'; addOnionsByReference?: boolean; }): storage.ISerializedChannelState
+function storage.serializeChannelState(s: channel.IChannelState, options?: { finalTaproot?: boolean; legacyHtlcHistory?: boolean; htlcHistory?: 'all' | 'unsaved' | 'none'; addOnionsByReference?: boolean; }): storage.ISerializedChannelState
 function storage.serializeFforEpoch(f: ffor.IFforEpochRecord): storage.ISerializedFforEpoch
 function storage.serializeGraphChannel(ch: gossip.IGraphChannel): string
 function storage.serializeGraphNode(node: gossip.IGraphNode): string

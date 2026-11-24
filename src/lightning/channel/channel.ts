@@ -129,6 +129,7 @@ import {
 	isRecencyUnproven,
 	recencyHoldOrigin
 } from './channel-state';
+import { assertLegacyCommitmentProfile } from './commitment-profile';
 import { recordRevokedHtlcSnapshot } from './htlc-snapshots';
 import type {
 	IAuxiliaryCommitmentData,
@@ -1497,6 +1498,7 @@ export class Channel {
 		signer?: ISigner,
 		auxiliaryProvider?: IChannelAuxiliaryProvider
 	) {
+		assertLegacyCommitmentProfile(state);
 		this._state = state;
 		// Asset channels (issue #2093). A channel with asset state, an asset
 		// funding root or the overlay channel type is never built without

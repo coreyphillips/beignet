@@ -58,6 +58,7 @@ import type { IPaymentInfo } from '../node/payment-types';
 import type { IChainMonitorState } from '../chain/chain-monitor';
 import type { IGraphChannel, IGraphNode } from '../gossip/types';
 import type { ISerializedChannelState } from './serialization';
+import { UnsupportedCommitmentProfileError } from '../channel/commitment-profile';
 import {
 	serializeChannelState,
 	deserializeChannelState,
@@ -1417,6 +1418,7 @@ export class SqliteStorage implements IStorageBackend {
 					peerPubkey: row.peer_pubkey
 				});
 			} catch (err) {
+				if (err instanceof UnsupportedCommitmentProfileError) throw err;
 				// An asset channel row that parses but does not decode is
 				// remembered by id before it is skipped: startup refuses to
 				// run without it (see unreadableAssetChannelIds).

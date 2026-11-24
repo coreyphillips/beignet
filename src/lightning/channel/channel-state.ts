@@ -570,6 +570,9 @@ export interface IChannelState {
 	remoteCommitmentSignature: Buffer | null;
 	remoteHtlcSignatures: Buffer[];
 
+	/** Commitment format recorded for a final Bitcoin channel. Absent on legacy channels. */
+	readonly commitmentProfile?: 'simple-taproot-final';
+
 	/** Negotiated channel type (feature bitmap) */
 	channelType: Buffer | null;
 

@@ -24,6 +24,7 @@
  * originals, which is what makes the rebuilt tables byte-identical.
  */
 
+import { assertLegacyCommitmentProfile } from '../channel/commitment-profile';
 import type { IChannelState } from '../channel/channel-state';
 import { aes256GcmDecrypt, aes256GcmEncrypt } from '../crypto/provider';
 import { WIRE_SAFETY_POLICY_VERSION } from '../channel/channel-actions';
@@ -2676,6 +2677,15 @@ export function reconstructFromFrames(
 			? FFOR_SNAPSHOT_SCHEMA_VERSION
 			: declaredSchema;
 	const replayEnd = lastAppliedFrameIndex(frames) + 1;
+	for (const channel of frames[snapshotIndex].snapshot!.channels) {
+		assertLegacyCommitmentProfile(channel.state);
+	}
+	for (let i = snapshotIndex + 1; i < replayEnd; i++) {
+		for (const mutation of frames[i].mutations) {
+			if (mutation.type === 'channel_state')
+				assertLegacyCommitmentProfile(mutation.state);
+		}
+	}
 	// Path_id preflight runs over the WHOLE restore set (snapshot AND replay
 	// deltas) before the first write: a refusal discovered mid-replay would
 	// leave the target partially populated and unretryable.

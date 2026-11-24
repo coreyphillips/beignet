@@ -166,6 +166,7 @@ import {
 } from './auxiliary-funding';
 import type { IChannelState } from './channel-state';
 import { createOpenerState, createAcceptorState } from './channel-state';
+import { assertLegacyCommitmentProfile } from './commitment-profile';
 import {
 	deriveChannelId,
 	deriveV2TemporaryChannelId,
@@ -3568,6 +3569,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		keyIndex?: number | null,
 		perChannelKeys?: IPerChannelKeys | null
 	): void {
+		assertLegacyCommitmentProfile(channel.getFullState());
 		// Rows written before opens lowercased the caller's pubkey can carry
 		// any case, and inbound connections register the lowercase form.
 		peerPubkey = normalizeHexPubkey(peerPubkey);
