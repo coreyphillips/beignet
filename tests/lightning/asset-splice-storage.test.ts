@@ -139,6 +139,20 @@ describe('Original-device asset splice storage', () => {
 		expect(() => generateFinalDaemonWallet(false, true, true)).to.throw();
 	});
 
+	const limits = {
+		local: {
+			channelReserveSats: '1000',
+			htlcMinimumMsat: '1',
+			maxHtlcValueInFlightMsat: '1000000',
+			maxAcceptedHtlcs: 8
+		},
+		remote: {
+			channelReserveSats: '1100',
+			htlcMinimumMsat: '2',
+			maxHtlcValueInFlightMsat: '1000100',
+			maxAcceptedHtlcs: 6
+		}
+	};
 	function opened() {
 		const { binding, mnemonic } = generateFinalDaemonWallet(false, false, true);
 		store = SqliteStorage.createFinalWallet(file, binding);
@@ -177,10 +191,20 @@ describe('Original-device asset splice storage', () => {
 				fundingProofs: '01',
 				local: side('02'),
 				remote: side('03')
-			}
+			},
+			limits
 		);
 		return { binding, id };
 	}
+
+	it('retains the actual opening HTLC and reserve terms for splice admission after restart', () => {
+		const { binding, id } = opened();
+		store!.close();
+		store = SqliteStorage.openFinalWallet(file, binding);
+		expect(store.loadFinalOpeningSession(id)?.updateLimits).to.deep.equal(
+			limits
+		);
+	});
 
 	it('repairs the lost SQLite tail from the original device and includes exact evidence bytes in a fresh backup', async () => {
 		const { binding, id } = opened();

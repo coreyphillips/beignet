@@ -1,3 +1,14 @@
+import {
+	prepareAssetSpliceAgreement,
+	type IAssetSplicePlanner,
+	type IAssetSpliceContext
+} from '../../src/lightning/channel/asset-splice-agreement';
+import { AssetSpliceExchange } from '../../src/lightning/channel/asset-splice-exchange';
+import {
+	BeignetCustomSubtype,
+	decodeCustomMessage
+} from '../../src/lightning/message/custom';
+import type { SqliteStorage } from '../../src/lightning/storage/sqlite-storage';
 import { expect } from 'chai';
 import { Transaction } from 'bitcoinjs-lib';
 import { REGTEST_CHAIN_HASH } from '../../src/lightning/chain/hashes';
@@ -197,6 +208,190 @@ describe('Asset splice manifests', () => {
 					commitmentRecordLimits: pair
 				})
 			).to.throw(/65551/);
+	});
+
+	it('uses both authenticated proposals and the actual BOLT transaction before accepting the wallet result', async () => {
+		const f = fixture(),
+			l = f.layout;
+		let height = 0n,
+			consentCalls = 0;
+		const parent = {
+			oldOutpoint: { hash: l.parent.getHash(), index: l.parentIndex },
+			stateNumber: height,
+			walletGeneration: 4 as const
+		};
+		const ctx: IAssetSpliceContext = {
+			...parent,
+			attempt: l.attempt,
+			channelId: l.channelId.toString('hex'),
+			peer: key(33).toString('hex'),
+			isInitiator: true,
+			currentParent: () => ({ ...parent, stateNumber: height })
+		};
+		const proofs = Buffer.from('retained proofs'),
+			blobs = [hash(11), hash(12)] as const;
+		const host: IAssetSplicePlanner = {
+			proposeSplice: async () => blobs[0],
+			spliceContribution: () => -3000n,
+			abandonSplice: async () => {},
+			describeSplice: async () => ({
+				inputs: l.inputs.map((i) => ({
+					serialId: i.serialId,
+					txid: i.prevTxid,
+					vout: i.prevOutputIndex,
+					sequence: i.sequence,
+					isShared: i.isShared === true,
+					prevTx: i.prevTx
+				})),
+				outputs: l.outputs.map((o) => ({
+					serialId: o.serialId,
+					kind: o.role,
+					valueSats: o.amountSats,
+					descriptorHash: o.descriptorHash
+				})),
+				movements: l.movements,
+				parentBalances: l.parentBalances,
+				feeBudgets: l.feeBudgets,
+				relativeSatoshis: [-3000n, 0n],
+				commitmentRecordLimits: l.commitmentRecordLimits
+			}),
+			prepareSplice: async (_ctx, pair, _btc, digest) => {
+				expect(pair).to.deep.equal(blobs);
+				return {
+					digest: hash(33),
+					consent: async () => {
+						consentCalls++;
+						return Buffer.alloc(64, 9);
+					},
+					authorize: async () => hash(7),
+					finalize: async () => ({
+						...f.verified,
+						fundingProofs: proofs,
+						layoutDigest: digest
+					})
+				};
+			}
+		};
+		const round = await prepareAssetSpliceAgreement(
+			host,
+			ctx,
+			{
+				parent: {
+					fundingTxHex: l.parent.toHex(),
+					fundingOutputIndex: l.parentIndex,
+					localFundingPubkey: l.parentKeys[0].toString('hex'),
+					remoteFundingPubkey: l.parentKeys[1].toString('hex'),
+					localFundingKeyIndex: 0
+				},
+				parentRoot: l.parentRoot,
+				maxAcceptedHtlcs: l.maxAcceptedHtlcs,
+				dust: l.dust
+			},
+			l.init,
+			l.ack,
+			blobs
+		);
+		async function rejected(f: () => Promise<unknown>) {
+			const result = await f().then(
+				() => false,
+				() => true
+			);
+			expect(result).to.equal(true);
+		}
+		await rejected(() => round.consent(hash(3)));
+		expect(consentCalls).to.equal(0);
+		const ours = await round.consent(round.agreement),
+			both = [ours, ours] as const;
+		const authorization = await round.authorize(round.agreement, both);
+		const complete = await round.finalize(both, [authorization, authorization]);
+		complete.funding.proofDigest.fill(0);
+		complete.funding.transaction.fill(0);
+		expect(complete.verifyFrozen(f.tx).candidate.tx.toHex()).to.equal(
+			f.tx.toHex()
+		);
+		const substituted = f.tx.clone();
+		substituted.locktime++;
+		expect(() => complete.verifyFrozen(substituted)).to.throw();
+		const channel = {
+			parent: {
+				fundingTxHex: l.parent.toHex(),
+				fundingOutputIndex: l.parentIndex,
+				localFundingPubkey: l.parentKeys[0].toString('hex'),
+				remoteFundingPubkey: l.parentKeys[1].toString('hex'),
+				localFundingKeyIndex: 0
+			},
+			parentRoot: l.parentRoot,
+			maxAcceptedHtlcs: l.maxAcceptedHtlcs,
+			dust: l.dust
+		};
+		const journal = () => {
+			const records: unknown[] = [];
+			return {
+				readAssetSpliceJournal: () => ({
+					records,
+					sequence: records.length,
+					hash: ''
+				}),
+				appendAssetSpliceEvent: (
+					_id: string,
+					head: { sequence: number },
+					entry: unknown
+				) => {
+					expect(head.sequence).to.equal(records.length);
+					records.push(entry);
+				}
+			} as unknown as SqliteStorage;
+		};
+		const wire: { side: number; raw: Buffer }[] = [];
+		const stores = [journal(), journal()];
+		const make = (side: number) =>
+			new AssetSpliceExchange(
+				{ ...host, proposeSplice: async () => blobs[side] },
+				{ ...ctx, isInitiator: side === 0 },
+				side === 0
+					? channel
+					: {
+							...channel,
+							parent: {
+								...channel.parent,
+								localFundingPubkey: channel.parent.remoteFundingPubkey,
+								remoteFundingPubkey: channel.parent.localFundingPubkey
+							}
+					  },
+				l.init,
+				l.ack,
+				stores[side],
+				(raw) => wire.push({ side, raw })
+			);
+		const parties = [make(0), make(1)];
+		await Promise.all(parties.map((p) => p.advance()));
+		expect(wire).to.have.length(2);
+		const saved = Buffer.from(wire[0].raw);
+		parties[0] = make(0);
+		await parties[0].advance();
+		expect(wire.pop()!.raw.equals(saved)).to.equal(true);
+		for (let turns = 0; wire.length && turns < 50; turns++) {
+			const msg = wire.shift()!;
+			const peer = parties[1 - msg.side],
+				decoded = decodeCustomMessage(msg.raw);
+			expect([
+				BeignetCustomSubtype.ASSET_SPLICE,
+				BeignetCustomSubtype.ASSET_SPLICE_CONSENT
+			]).to.include(decoded.subtype);
+			await peer.receive(decoded.subtype, decoded.payload);
+		}
+		expect(wire.length).to.equal(0);
+		expect(
+			parties[0]
+				.result()!
+				.verified.digest.equals(parties[1].result()!.verified.digest)
+		).to.equal(true);
+		expect(parties[0].result()!.verified.candidate.tx.toHex()).to.equal(
+			f.tx.toHex()
+		);
+		height = 1n;
+		await rejected(() => round.authorize(round.agreement, both));
+		expect(() => complete.verifyFrozen(f.tx)).to.throw(/stale/i);
 	});
 
 	it('matches the initiator-order wire and manifest vectors', () => {

@@ -153,6 +153,12 @@ export class AssetSpliceLock {
 		this.adopt();
 	}
 
+	/** A disconnect or a new chain lookup invalidates the previous block sample. */
+	suspend(): void {
+		++this.observation;
+		this.verifiedBlock = undefined;
+	}
+
 	async peerLocked(txid: string): Promise<void> {
 		const h = this.history();
 		if (h.reconcile) return;

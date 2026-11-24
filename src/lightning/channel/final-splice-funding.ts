@@ -182,6 +182,12 @@ export function signFinalSpliceFunding(
 	validateFinalSpliceExits(exits, c, terms);
 	if (Boolean(proofContext) !== Boolean(roots))
 		throw new Error('Asset funding requires retained proof-backed exits');
+	const localWalletInputs = c.localInputs.map(
+		(i) =>
+			Buffer.from(c.tx.ins[i].hash).reverse().toString('hex') +
+			':' +
+			c.tx.ins[i].index
+	);
 	let receipt: ReturnType<typeof loadAssetSpliceExitProofs> | undefined;
 	let evidenceHash: Buffer | undefined;
 	if (proofContext && roots) {
@@ -213,7 +219,12 @@ export function signFinalSpliceFunding(
 					'Asset funding disagrees with retained commitment or proof generation'
 				);
 		}
-		evidenceHash = recordAssetSpliceFundingPhase(store, receipt);
+		evidenceHash = recordAssetSpliceFundingPhase(
+			store,
+			receipt,
+			undefined,
+			localWalletInputs
+		);
 	}
 	const txid = c.tx.getId();
 	const retained = sha256(exits.candidate.signed.toBuffer()).toString('hex');
@@ -251,15 +262,7 @@ export function signFinalSpliceFunding(
 				Buffer.from(String(terms.parentIndex))
 			])
 		).toString('hex');
-		authority.bindFundingInputs(
-			c.localInputs.map(
-				(i) =>
-					Buffer.from(c.tx.ins[i].hash).reverse().toString('hex') +
-					':' +
-					c.tx.ins[i].index
-			),
-			family
-		);
+		authority.bindFundingInputs(localWalletInputs, family);
 		const witnesses = c.localInputs.length
 			? signWallet(c.tx.clone(), c.localInputs, {
 					scripts: c.scripts.map((v) => Buffer.from(v)),

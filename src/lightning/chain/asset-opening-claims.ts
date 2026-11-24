@@ -2,7 +2,8 @@ import { ecc } from '../../utils/ecc';
 import { getPublicKey } from '../crypto/ecdh';
 import { Transaction } from 'bitcoinjs-lib';
 import type { IAuxiliaryDualFunding } from '../channel/asset-opening-provider';
-import { buildAssetOpeningCommitment } from '../channel/final-opening-commitment';
+import { matchedAssetPayoutViews } from './asset-splice-output-view';
+import { generateFromSeed, MAX_INDEX } from '../keys/shachain';
 import type { IFinalOpeningRuntime } from '../channel/final-opening-runtime';
 import { derivePrivateKey } from '../keys/derivation';
 import { deriveChannelKeys } from '../keys/wallet-keys';
@@ -12,7 +13,6 @@ import {
 	type ITaprootLeafSpend
 } from '../script/commitment-taproot';
 import { tapleafHash, signTaprootHtlcLeaf } from '../script/htlc-taproot';
-import { assetOpeningLeaves } from '../storage/asset-opening-evidence';
 import { MAX_STANDARD_TX_WEIGHT } from '../interactive-tx/validation';
 import { finalLeafClaim, type IFinalOutputClaim } from './final-output-claims';
 
@@ -39,18 +39,18 @@ export function assetOpeningOutputClaims(
 		!storage.loadFinalLocalTxSignatures(id)
 	)
 		return [];
-	const { candidate, session } = opening,
-		evidence = session.assetEvidence!;
+	const { candidate, session } = opening;
 	const keys = deriveChannelKeys(root, 1, session.channelKeyIndex);
-	for (const holder of ['local', 'remote'] as const) {
-		const assets = assetOpeningLeaves(evidence, holder);
-		const view = buildAssetOpeningCommitment(
-			candidate,
-			session.terms,
-			holder,
-			assets
-		);
-		if (view.tx.getId() !== parent.getId()) continue;
+	for (const {
+		holder,
+		view,
+		assets,
+		point,
+		state,
+		fundingProofs,
+		exitProofs,
+		splice
+	} of matchedAssetPayoutViews(storage, id, parent)) {
 		const local = holder === 'local';
 		const outputIndex = local
 			? view.outputMap.toLocal
@@ -61,6 +61,15 @@ export function assetOpeningOutputClaims(
 		const delay = local ? view.toSelfDelay : 1;
 		let leaf: ITaprootLeafSpend, secret: Buffer, output: Buffer;
 		if (local) {
+			if (
+				splice &&
+				!getPublicKey(
+					generateFromSeed(keys.perCommitmentSeed, MAX_INDEX - state)
+				).equals(point)
+			)
+				throw new Error(
+					'Watched asset commitment point differs from this wallet'
+				);
 			const tree = buildTaprootToLocalOutput(
 				view.keys.revocationPubkey,
 				view.keys.localDelayedPubkey,
@@ -72,10 +81,7 @@ export function assetOpeningOutputClaims(
 			output = tree.output;
 			secret = derivePrivateKey(
 				keys.delayedPaymentBasepointSecret,
-				Buffer.from(
-					session.terms.localBasepoints.firstPerCommitmentPoint,
-					'hex'
-				),
+				point,
 				keys.channelBasepoints.delayedPaymentBasepoint
 			);
 		} else {
@@ -178,8 +184,9 @@ export function assetOpeningOutputClaims(
 					outputIndex,
 					delay,
 					feeRate,
-					fundingProofs: Buffer.from(evidence.fundingProofs, 'hex'),
-					exitProofs: Buffer.from(evidence[holder].proofs, 'hex'),
+					fundingProofs: Buffer.from(fundingProofs, 'hex'),
+					exitProofs: Buffer.from(exitProofs, 'hex'),
+					...(splice && { splice }),
 					signSweep
 				});
 			} finally {

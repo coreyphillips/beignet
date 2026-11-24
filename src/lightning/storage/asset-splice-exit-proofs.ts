@@ -1,9 +1,30 @@
 import { Transaction } from 'bitcoinjs-lib';
+import { isDeepStrictEqual } from 'util';
+import {
+	checkedWalletInputs,
+	assetWalletInputState
+} from './asset-splice-wallet-inputs';
 import { sha256 } from '../crypto/provider';
 import { MAX_INDEX } from '../keys/shachain';
 import type { SqliteStorage } from './sqlite-storage';
+import type { IFinalFundingReference } from '../channel/final-splice-candidate';
+import {
+	canonicalSpliceFunding,
+	canonicalSpliceHolder,
+	spliceRecoveryView,
+	type IAssetSpliceHolderRecovery
+} from './asset-splice-recovery';
+export type {
+	IAssetSpliceHolderRecovery,
+	IStoredSpliceHtlc,
+	IStoredSpliceLeaf
+} from './asset-splice-recovery';
 
 export interface IAssetSpliceExitBranch {
+	minimumDepth: number;
+	funding: IFinalFundingReference;
+	localRecovery: IAssetSpliceHolderRecovery;
+	remoteRecovery: IAssetSpliceHolderRecovery;
 	fundingTxid: string;
 	outputIndex: number;
 	fundingRoot: string;
@@ -15,6 +36,7 @@ export interface IAssetSpliceExitBranch {
 }
 
 export interface IAssetSpliceExitProofs {
+	minimumDepth: number;
 	channelId: string;
 	finalDigest: string;
 	stateNumber: string;
@@ -34,6 +56,7 @@ export type AssetSpliceExitEvent =
 	| { kind: 'exit-proofs'; evidence: IAssetSpliceExitProofs }
 	| {
 			kind: 'funding-reserved';
+			localInputs: string[];
 			finalDigest: string;
 			stateNumber: string;
 			evidenceHash: string;
@@ -58,6 +81,12 @@ function hex(raw: string, maxBytes: number, exact = false): string {
 		throw new Error('Invalid retained asset splice proof bytes');
 	return raw;
 }
+function positiveDepth(value: number): number {
+	if (!Number.isSafeInteger(value) || value < 1 || value > 0xffffffff)
+		throw new Error('Invalid asset splice funding depth');
+	return value;
+}
+
 function branch(v: IAssetSpliceExitBranch): IAssetSpliceExitBranch {
 	const fundingTxid = hex(v.fundingTxid, 32, true);
 	const { outputIndex } = v;
@@ -82,6 +111,10 @@ function branch(v: IAssetSpliceExitBranch): IAssetSpliceExitBranch {
 		return raw;
 	}
 	return {
+		minimumDepth: positiveDepth(v.minimumDepth),
+		funding: canonicalSpliceFunding(v.funding),
+		localRecovery: canonicalSpliceHolder(v.localRecovery),
+		remoteRecovery: canonicalSpliceHolder(v.remoteRecovery),
 		fundingTxid,
 		outputIndex,
 		fundingRoot: hex(v.fundingRoot, 32, true),
@@ -108,17 +141,51 @@ function canonical(
 		throw new Error('Invalid retained asset splice identity or height');
 	const parent = branch(v.parent),
 		candidate = branch(v.candidate);
+	if (positiveDepth(v.minimumDepth) !== candidate.minimumDepth)
+		throw new Error('Candidate splice depth differs from its approved receipt');
 	if (parent.fundingTxid === candidate.fundingTxid)
 		throw new Error(
 			'Retained splice generations must use distinct funding transactions'
 		);
 	return {
+		minimumDepth: v.minimumDepth,
 		channelId: id,
 		finalDigest: hex(v.finalDigest, 32, true),
 		stateNumber: v.stateNumber,
 		parent,
 		candidate
 	};
+}
+
+function verifyRecovery(
+	store: SqliteStorage,
+	evidence: IAssetSpliceExitProofs
+): IAssetSpliceExitProofs {
+	const { channelId: id, parent, candidate, stateNumber } = evidence;
+	const opening = store.loadFinalOpening(id),
+		session = store.loadFinalOpeningSession(id);
+	if (!opening || !session?.assetEvidence)
+		throw new Error('Missing enrolled asset opening');
+	const incoming = Transaction.fromHex(
+		candidate.funding.fundingTxHex
+	).ins.filter(
+		(input) =>
+			input.hash.equals(Buffer.from(parent.fundingTxid, 'hex').reverse()) &&
+			input.index === parent.outputIndex
+	);
+	if (incoming.length !== 1)
+		throw new Error('Candidate does not spend the retained parent outpoint');
+	for (const b of [parent, candidate])
+		for (const holder of ['local', 'remote'] as const)
+			spliceRecoveryView(
+				opening,
+				session.terms,
+				session.assetEvidence.fundingRoot,
+				b,
+				holder,
+				stateNumber
+			);
+	return evidence;
 }
 
 /** Called after the host has independently verified both sets of asset proofs and reconstructed the exits. */
@@ -129,7 +196,7 @@ export function retainAssetSpliceExitProofs(
 ): void {
 	if (!store.canSpliceDualFundedAssets)
 		throw new Error('Proof retention requires the original splice wallet');
-	const evidence = canonical(id, supplied);
+	const evidence = verifyRecovery(store, canonical(id, supplied));
 	const head = store.readAssetSpliceJournal<AssetSpliceExitEvent>(id);
 	for (const row of head.records) {
 		if (row.kind !== 'exit-proofs') continue;
@@ -165,7 +232,7 @@ export function loadAssetSpliceExitProofs(
 		);
 	if (rows.length !== 1)
 		throw new Error('Missing or ambiguous retained asset splice proofs');
-	return canonical(id, rows[0].evidence);
+	return verifyRecovery(store, canonical(id, rows[0].evidence));
 }
 
 function proofHash(evidence: IAssetSpliceExitProofs): Buffer {
@@ -218,8 +285,10 @@ export function publishableAssetSpliceEvidence(
 export function recordAssetSpliceFundingPhase(
 	store: SqliteStorage,
 	evidence: IAssetSpliceExitProofs,
-	wire?: Buffer
+	wire?: Buffer,
+	coinSelection: readonly string[] = []
 ): Buffer {
+	const localInputs = checkedWalletInputs(coinSelection);
 	const evidenceHash = proofHash(evidence);
 	const kind = wire ? 'funding-released' : 'funding-reserved';
 	const { finalDigest, stateNumber, channelId } = evidence;
@@ -236,6 +305,26 @@ export function recordAssetSpliceFundingPhase(
 			r.stateNumber === stateNumber
 	);
 	const reserved = same.find((r) => r.kind === 'funding-reserved');
+	if (!reserved) {
+		const parent =
+			evidence.parent.fundingTxid + ':' + evidence.parent.outputIndex;
+		const state = assetWalletInputState(head.records);
+		const submitted = [...state.attempts.values()].filter(
+			(a) => a.parent === parent
+		);
+		const exact = submitted.some(
+			(a) => !a.aborted && isDeepStrictEqual(a.inputs, localInputs)
+		);
+		if (submitted.length && !exact)
+			throw new Error(
+				'Splice funding inputs differ from the device reservation'
+			);
+		if (localInputs.length && !exact) {
+			const held = store.loadFinalSpliceWalletOutpoints();
+			if (localInputs.some((input) => held.has(input)))
+				throw new Error('Splice wallet input is already reserved');
+		}
+	}
 	if (wire && !reserved)
 		throw new Error('Asset funding witness has no original reservation');
 	const previous = same.find((r) => r.kind === kind);
@@ -246,6 +335,8 @@ export function recordAssetSpliceFundingPhase(
 	) {
 		if (
 			previous.evidenceHash !== fields.evidenceHash ||
+			(previous.kind === 'funding-reserved' &&
+				!isDeepStrictEqual(previous.localInputs, localInputs)) ||
 			(previous.kind === 'funding-released' &&
 				previous.wire !== wire?.toString('hex'))
 		)
@@ -253,7 +344,7 @@ export function recordAssetSpliceFundingPhase(
 	} else {
 		const event: AssetSpliceExitEvent = wire
 			? { kind: 'funding-released', ...fields, wire: wire.toString('hex') }
-			: { kind: 'funding-reserved', ...fields };
+			: { kind: 'funding-reserved', ...fields, localInputs };
 		store.appendAssetSpliceEvent(channelId, head, event);
 	}
 	return evidenceHash;

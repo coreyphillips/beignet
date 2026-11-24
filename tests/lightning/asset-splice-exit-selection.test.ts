@@ -117,22 +117,24 @@ describe('Unilateral exits for multiple live asset funding outpoints', () => {
 			db.loadFinalOpeningExit(f.id)!.toString('hex')
 		);
 		expect(signed.getId()).to.equal(prev.getId());
-		reserve({
-			...first,
-			parent: { ...first.parent, fundingRoot: 'ca'.repeat(32) }
-		});
-		expect(() => db.loadFinalFundingExits(f.id)).to.throw();
+		expect(() =>
+			reserve({
+				...first,
+				parent: { ...first.parent, fundingRoot: 'ca'.repeat(32) }
+			})
+		).to.throw();
+		expect(db.loadFinalFundingExits(f.id)).to.have.length(1);
 	});
 
 	it('keeps competing same-height candidates while refusing to advance a partial logical round', () => {
 		const db = f.devices[0].store;
-		const first = reserve();
+		reserve();
 		const second = reserve({
 			...f.otherCandidate(0),
 			finalDigest: 'bb'.repeat(32)
 		});
 		expect(db.loadFinalFundingExits(f.id)).to.have.length(3);
-		reserve({ ...first, finalDigest: 'ea'.repeat(32), stateNumber: '1' });
+		reserve({ ...f.evidence(0, 1n), finalDigest: 'ea'.repeat(32) });
 		expect(() => db.loadFinalFundingExits(f.id)).to.throw();
 		expect(() =>
 			db.requestFinalOpeningExit(
@@ -142,18 +144,20 @@ describe('Unilateral exits for multiple live asset funding outpoints', () => {
 		).to.throw();
 	});
 
-	it('withholds every exit on a contradictory commitment for the same outpoint and logical height', () => {
+	it('refuses to retain a contradictory commitment for the same outpoint and logical height', () => {
 		const db = f.devices[0].store;
 		const first = reserve();
 		const other = f.otherCandidate(0);
 		const altered = Transaction.fromHex(first.parent.localCommitment);
 		altered.outs[0].value--;
-		reserve({
-			...other,
-			finalDigest: 'ba'.repeat(32),
-			parent: { ...other.parent, localCommitment: altered.toHex() }
-		});
-		expect(() => db.loadFinalFundingExits(f.id)).to.throw();
+		expect(() =>
+			reserve({
+				...other,
+				finalDigest: 'ba'.repeat(32),
+				parent: { ...other.parent, localCommitment: altered.toHex() }
+			})
+		).to.throw();
+		expect(db.loadFinalFundingExits(f.id)).to.have.length(2);
 		expect(() => db.requestFinalOpeningExit(f.id)).to.throw();
 	});
 });

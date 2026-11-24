@@ -400,10 +400,11 @@ export function verifyAssetSpliceCandidate(
 		!candidate.tx.toBuffer().equals(verified.transaction)
 	)
 		throw new Error('Final asset splice disagrees with the approved layout');
-	return {
+	const result = {
 		terms,
 		candidate,
 		balances,
+		layoutDigest: Buffer.from(layoutDigest),
 		digest: digest(
 			[
 				hashHex(layoutDigest),
@@ -415,4 +416,55 @@ export function verifyAssetSpliceCandidate(
 			'final'
 		)
 	};
+	constructionViews.set(result, {
+		transaction: candidate.tx.toHex(),
+		layoutDigest: hashHex(layoutDigest),
+		finalDigest: hashHex(result.digest),
+		terms: copyConstructionTerms(terms)
+	});
+	return result;
+}
+
+function copyConstructionTerms(terms: IFinalSpliceTerms): IFinalSpliceTerms {
+	const roots = terms.assetFundingRoots!;
+	return {
+		...terms,
+		parent: Transaction.fromBuffer(terms.parent.toBuffer()),
+		oldLocalKey: Buffer.from(terms.oldLocalKey),
+		oldPeerKey: Buffer.from(terms.oldPeerKey),
+		newLocalKey: Buffer.from(terms.newLocalKey),
+		newPeerKey: Buffer.from(terms.newPeerKey),
+		assetFundingRoots: {
+			parent: Buffer.from(roots.parent),
+			candidate: Buffer.from(roots.candidate)
+		}
+	};
+}
+const constructionViews = new WeakMap<
+	object,
+	{
+		transaction: string;
+		layoutDigest: string;
+		finalDigest: string;
+		terms: IFinalSpliceTerms;
+	}
+>();
+
+/** Pin construction to the exact provider-verified transaction even if a caller mutates its returned buffers. */
+export function assetSpliceConstructionView(
+	layout: IAssetSpliceLayout,
+	verified: ReturnType<typeof verifyAssetSpliceCandidate>
+) {
+	const view = constructionViews.get(verified);
+	if (
+		!view ||
+		view.layoutDigest !== hashHex(assetSpliceLayoutDigest(layout)) ||
+		view.layoutDigest !== hashHex(verified.layoutDigest) ||
+		view.finalDigest !== hashHex(verified.digest) ||
+		view.transaction !== verified.candidate.tx.toHex()
+	)
+		throw new Error(
+			'Asset splice construction differs from the verified manifest'
+		);
+	return { ...view, terms: copyConstructionTerms(view.terms) };
 }

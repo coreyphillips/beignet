@@ -2,7 +2,18 @@ import { encodeSpliceLockedMessage } from '../message/splice';
 import { Transaction } from 'bitcoinjs-lib';
 import { isDeepStrictEqual } from 'util';
 import { assetSpliceFundingExits } from './asset-splice-funding-exits';
-import type { AssetSpliceExitEvent } from './asset-splice-exit-proofs';
+import {
+	publishableAssetSpliceEvidence,
+	type AssetSpliceExitEvent
+} from './asset-splice-exit-proofs';
+import type { IAssetSpliceLockEvent } from '../channel/asset-splice-lock';
+import {
+	assetSpliceAttemptId,
+	assetWalletInputState,
+	checkedWalletInputs,
+	currentAssetWalletParent,
+	type AssetWalletInputEvent
+} from './asset-splice-wallet-inputs';
 import { FinalSpliceSession } from '../channel/final-splice-session';
 import {
 	finalSpliceAttempts,
@@ -526,8 +537,103 @@ export class SqliteStorage implements IStorageBackend {
 		return finalSpliceAttempts(id, head.records);
 	}
 
+	private assetWalletInputHistory(channelId: string) {
+		return this.readAssetSpliceJournal<
+			AssetWalletInputEvent | AssetSpliceExitEvent | IAssetSpliceLockEvent
+		>(channelId);
+	}
+	reserveAssetSpliceWalletInputs(
+		channelId: string,
+		attempt: string,
+		parent: string,
+		selected: readonly string[]
+	): void {
+		this.assertAssetSpliceAuthority(this.requireOpeningAuthority());
+		assetSpliceAttemptId(attempt);
+		const inputs = checkedWalletInputs(selected);
+		const opening = this.loadFinalDaemonOpening(channelId);
+		if (
+			!opening?.funding ||
+			!opening.session.assetEvidence ||
+			opening.exitToBroadcast
+		)
+			throw new Error('Asset splice requires a live funded opening');
+		const base =
+			Transaction.fromBuffer(opening.funding).getId() +
+			':' +
+			opening.candidate.fundingOutputIndex;
+		const head = this.assetWalletInputHistory(channelId);
+		const phases = head.records.filter(
+			(r): r is AssetSpliceExitEvent =>
+				r.kind === 'exit-proofs' ||
+				r.kind === 'funding-reserved' ||
+				r.kind === 'funding-released'
+		);
+		const exits = publishableAssetSpliceEvidence(phases, channelId);
+		if (
+			currentAssetWalletParent(head.records, exits, channelId, base) !==
+				parent ||
+			inputs.includes(parent)
+		)
+			throw new Error(
+				'Asset splice wallet reservation differs from active funding'
+			);
+		const existing = assetWalletInputState(head.records).attempts.get(attempt);
+		if (existing) {
+			if (
+				existing.aborted ||
+				existing.parent !== parent ||
+				!isDeepStrictEqual(existing.inputs, inputs)
+			)
+				throw new Error('Asset splice wallet input reservation changed');
+			return;
+		}
+		const reserved = this.loadFinalSpliceWalletOutpoints();
+		if (inputs.some((input) => reserved.has(input)))
+			throw new Error('Wallet input is reserved by another asset splice');
+		this.appendAssetSpliceEvent(channelId, head, {
+			kind: 'wallet-inputs',
+			attempt,
+			parent,
+			inputs
+		} satisfies AssetWalletInputEvent);
+	}
+	releaseAssetSpliceWalletInputs(channelId: string, attempt: string): void {
+		this.assertAssetSpliceAuthority(this.requireOpeningAuthority());
+		assetSpliceAttemptId(attempt);
+		const head = this.assetWalletInputHistory(channelId);
+		const { attempts, irreversible, signedParents } = assetWalletInputState(
+			head.records
+		);
+		const prior = attempts.get(attempt);
+		if (
+			!prior ||
+			(!prior.aborted &&
+				(signedParents.has(prior.parent) ||
+					prior.inputs.some((input) => irreversible.has(input))))
+		)
+			throw new Error(
+				'Cannot release an unknown or signed asset splice wallet input'
+			);
+		if (!prior.aborted)
+			this.appendAssetSpliceEvent(channelId, head, {
+				kind: 'wallet-inputs-aborted',
+				attempt
+			} satisfies AssetWalletInputEvent);
+	}
+
 	loadFinalSpliceWalletOutpoints(): Set<string> {
 		const reserved = new Set<string>();
+		if (this.finalGeneration === 4) {
+			for (const c of this.loadFinalOpenings()) {
+				if (!this.loadAssetOpeningEvidence(c.channelId)) continue;
+				for (const input of assetWalletInputState(
+					this.assetWalletInputHistory(c.channelId).records
+				).reserved)
+					reserved.add(input);
+			}
+			return reserved;
+		}
 		if (!this.canUpdateFinalCommitments) return reserved;
 		for (const c of this.loadFinalOpenings()) {
 			for (const a of this.readFinalSpliceAttempts(c.channelId)) {
@@ -976,7 +1082,8 @@ export class SqliteStorage implements IStorageBackend {
 		if (evidence !== undefined) {
 			if (
 				(this.finalGeneration !== 3 && this.finalGeneration !== 4) ||
-				nonces.session?.updateLimits ||
+				(this.finalGeneration === 3 &&
+					nonces.session?.updateLimits !== undefined) ||
 				JSON.stringify(canonicalAssetOpeningEvidence(evidence)) !==
 					JSON.stringify(evidence)
 			)
@@ -1254,7 +1361,8 @@ export class SqliteStorage implements IStorageBackend {
 		terms: IFinalOpeningTerms,
 		channelKeyIndex: number,
 		remoteSecondPerCommitmentPoint: string,
-		evidence: IAssetOpeningEvidence
+		evidence: IAssetOpeningEvidence,
+		updateLimits?: IFinalUpdateLimits
 	): void {
 		if (!this.canOpenDualFundedAssets)
 			throw new Error('Asset opening requires its enrolled original device');
@@ -1264,7 +1372,7 @@ export class SqliteStorage implements IStorageBackend {
 			terms,
 			channelKeyIndex,
 			remoteSecondPerCommitmentPoint,
-			undefined,
+			this.canSpliceDualFundedAssets ? updateLimits : undefined,
 			canonicalAssetOpeningEvidence(evidence)
 		);
 	}

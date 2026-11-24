@@ -7,7 +7,7 @@ import type { IChainBackend } from './chain-watcher';
 import { ChainBackendUnavailableError } from './chain-watcher';
 import type { IFeeEstimator } from '../node/types';
 import type { Electrum } from '../../electrum';
-import { verifyAssetSpliceInclusion } from './asset-splice-inclusion';
+import { verifyAssetSpliceInclusion, type IAssetSpliceInclusionRecovery } from './asset-splice-inclusion';
 import type { IAssetSpliceAnchor } from '../channel/asset-splice-lock';
 
 /** A get_merkle answer, in either the wrapped or the bare shape. */
@@ -548,7 +548,8 @@ export class ElectrumBackend implements IChainBackend, IFeeEstimator {
 
 	async getAssetSpliceInclusion(
 		txid: string,
-		height: number
+		height: number,
+		recovery?: IAssetSpliceInclusionRecovery
 	): Promise<IAssetSpliceAnchor> {
 		const source = this.electrum;
 		if (source.electrumNetwork !== 'bitcoinRegtest')
@@ -583,7 +584,7 @@ export class ElectrumBackend implements IChainBackend, IFeeEstimator {
 						return answer.value;
 					},
 					() => source.getTransactionMerkle({ tx_hash: txid, height }),
-					assertCurrent
+					assertCurrent, recovery
 				),
 				'getAssetSpliceInclusion'
 			);

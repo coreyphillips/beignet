@@ -64,6 +64,14 @@ export interface IAssetOpenExit {
 }
 
 export interface IAssetOpeningPayout {
+	/** Present when the observed commitment matches a retained splice generation. */
+	splice?: {
+		finalDigest: string;
+		stateNumber: string;
+		generation: 'parent' | 'candidate';
+		fundingTxid: string;
+		fundingOutputIndex: number;
+	};
 	candidate: IFinalOpeningCandidate;
 	fundingProofs: Buffer;
 	exitProofs: Buffer;
@@ -77,7 +85,10 @@ export interface IAssetOpeningPayout {
 }
 
 /** Explicit host support for private dual-funded asset openings on regtest. */
-export interface IAuxiliaryDualFunding {
+export interface IAuxiliaryDualFunding
+	extends Partial<
+		import('./asset-splice-confirmation').IAssetSpliceConfirmationProvider
+	> {
 	version: 1;
 	/** Synchronous local policy. An absent answer declines before a key is allocated. */
 	contribution(

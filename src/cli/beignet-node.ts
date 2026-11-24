@@ -3687,9 +3687,10 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 			? (): ReturnType<SqliteStorage['loadFinalOpenings']> =>
 					this.sqlite()!.loadFinalOpenings()
 			: undefined;
-		const finalSpliceOutpoints = this._bootOpts?.finalCommitmentUpdates
-			? () => this.sqlite()!.loadFinalSpliceWalletOutpoints()
-			: undefined;
+		const finalSpliceOutpoints =
+			this._bootOpts?.finalCommitmentUpdates || this._bootOpts?.assetSplice
+				? () => this.sqlite()!.loadFinalSpliceWalletOutpoints()
+				: undefined;
 		const fees: ExtensionFixedOutputFees | undefined = supply?.fixedOutputFees;
 		if (supply === undefined || fees === undefined) {
 			return new WalletFundingProvider(this.wallet, {
@@ -8366,7 +8367,15 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	private _runWalletSend<T>(
 		fn: (locked: Pick<Wallet, 'send' | 'sendMax' | 'buildPsbt'>) => Promise<T>
 	): Promise<T> {
-		return this._runOnchainSend(() => this.wallet.withSendLock(fn));
+		return this._runOnchainSend(() =>
+			this.wallet.withSendLock(async (locked) => {
+				if (this._bootOpts?.assetSplice)
+					await this.walletFundingProvider(
+						undefined
+					).renewFinalOpeningPledges();
+				return fn(locked);
+			})
+		);
 	}
 
 	async sendOnchain(
@@ -8541,6 +8550,22 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	private async _broadcastRawTx(hex: string): Promise<TxInfo> {
 		const bitcoin = await import('bitcoinjs-lib');
 		const tx = bitcoin.Transaction.fromHex(hex);
+		if (this._bootOpts?.assetSplice) {
+			const reserved = this.sqlite()!.loadFinalSpliceWalletOutpoints();
+			if (
+				tx.ins.some((input) =>
+					reserved.has(
+						Buffer.from(input.hash).reverse().toString('hex') +
+							':' +
+							input.index
+					)
+				)
+			)
+				throw new BeignetError(
+					'INVALID_PARAMS',
+					'Input is reserved by an asset splice'
+				);
+		}
 		const broadcastRes = await this.wallet.electrum.broadcastTransaction({
 			rawTx: hex
 		});
@@ -9229,7 +9254,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	private assertWalletInputMutable(txid: string, index: number): void {
 		this.onchainSweeps().assertInputMutable(txid, index);
 		if (
-			this._bootOpts?.finalCommitmentUpdates &&
+			(this._bootOpts?.finalCommitmentUpdates || this._bootOpts?.assetSplice) &&
 			this.sqlite()!
 				.loadFinalSpliceWalletOutpoints()
 				.has(txid.toLowerCase() + ':' + index)

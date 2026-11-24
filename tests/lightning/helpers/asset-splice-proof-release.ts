@@ -18,6 +18,11 @@ import {
 	finalSpliceSharedNonce,
 	signFinalSpliceFunding
 } from '../../../src/lightning/channel/final-splice-funding';
+import { getPublicKey } from '../../../src/lightning/crypto/ecdh';
+import {
+	generateFromSeed,
+	MAX_INDEX
+} from '../../../src/lightning/keys/shachain';
 import { generateNonce } from '../../../src/lightning/crypto/musig';
 import { ASSET_OPENING_TYPE_HEX } from '../../../src/lightning/features/asset-opening';
 import {
@@ -211,37 +216,49 @@ export function setupAssetSpliceProofs(dir: string) {
 	function exit(
 		holder: number,
 		old: boolean,
-		source = old ? parent : candidate.tx
+		source = old ? parent : candidate.tx,
+		height = 0n
 	) {
 		const index = old ? opening.fundingOutputIndex : candidate.fundingIndex;
 		const keys = old ? oldKeys : newKeys;
 		const root = old ? parentRoot : candidateRoot;
 		const name = holder === 0 ? 'local' : 'remote';
-		const expected = old
-			? buildAssetOpeningCommitment(opening, openingTerms, name, {
-					fundingRoot: root,
-					...leaves
-			  }).tx
-			: buildAssetSpliceCommitment(
-					opening,
-					openingTerms,
-					name,
-					Buffer.from(parties[holder].points.firstPerCommitmentPoint, 'hex'),
-					0n,
-					{ localBalanceMsat: 100000000n, remoteBalanceMsat: 50000000n },
-					[],
-					{
-						fundingTxHex: source.toHex(),
-						fundingOutputIndex: index,
-						localFundingPubkey:
-							keys[0].channelBasepoints.fundingPubkey.toString('hex'),
-						remoteFundingPubkey:
-							keys[1].channelBasepoints.fundingPubkey.toString('hex'),
-						localFundingKeyIndex: 2
-					},
-					parentRoot,
-					{ fundingRoot: root, ...leaves }
-			  ).tx;
+		const point = getPublicKey(
+			generateFromSeed(
+				parties[holder].keys.perCommitmentSeed,
+				MAX_INDEX - height
+			)
+		);
+		const built =
+			old && height === 0n
+				? buildAssetOpeningCommitment(opening, openingTerms, name, {
+						fundingRoot: root,
+						...leaves
+				  })
+				: buildAssetSpliceCommitment(
+						opening,
+						openingTerms,
+						name,
+						point,
+						height,
+						{
+							localBalanceMsat: old ? 90000000n : 100000000n,
+							remoteBalanceMsat: 50000000n
+						},
+						[],
+						{
+							fundingTxHex: source.toHex(),
+							fundingOutputIndex: index,
+							localFundingPubkey:
+								keys[0].channelBasepoints.fundingPubkey.toString('hex'),
+							remoteFundingPubkey:
+								keys[1].channelBasepoints.fundingPubkey.toString('hex'),
+							localFundingKeyIndex: old ? 1 : 2
+						},
+						parentRoot,
+						{ fundingRoot: root, ...leaves }
+				  );
+		const expected = built.tx;
 		const prev = source.outs[index];
 		const digest = expected.hashForWitnessV1(
 			0,
@@ -271,7 +288,7 @@ export function setupAssetSpliceProofs(dir: string) {
 		signed.setWitness(0, [
 			aggregateCommitmentSig(session, shares[0], shares[1])
 		]);
-		return { expected, signed };
+		return { expected, signed, point, outputMap: built.outputMap };
 	}
 	const views = parties.map((_, i) => ({
 		parent: exit(i, true),
@@ -286,24 +303,60 @@ export function setupAssetSpliceProofs(dir: string) {
 	);
 	const calls: number[] = [];
 	const witness = walletSigner(oldKeys[0].fundingPrivkey, 1, calls);
-	function evidence(i: number): IAssetSpliceExitProofs {
+	function evidence(i: number, height = 0n): IAssetSpliceExitProofs {
+		const atHeight =
+			height === 0n
+				? views
+				: parties.map((_, j) => ({
+						parent: exit(j, true, parent, height),
+						candidate: exit(j, false, candidate.tx, height)
+				  }));
 		function branch(name: (typeof branchNames)[number]) {
 			const old = name === 'parent';
+			const keys = old ? oldKeys : newKeys;
+			const funding = {
+				fundingTxHex: (old ? parent : candidate.tx).toHex(),
+				fundingOutputIndex: old
+					? opening.fundingOutputIndex
+					: candidate.fundingIndex,
+				localFundingPubkey:
+					keys[i].channelBasepoints.fundingPubkey.toString('hex'),
+				remoteFundingPubkey:
+					keys[1 - i].channelBasepoints.fundingPubkey.toString('hex'),
+				localFundingKeyIndex: old ? 1 : 2
+			};
+			const recovery = (holder: number) => ({
+				point: atHeight[holder][name].point.toString('hex'),
+				localBalanceMsat: String(i ? 50000000 : old ? 90000000 : 100000000),
+				remoteBalanceMsat: String(i ? (old ? 90000000 : 100000000) : 50000000),
+				toLocal: { script: leaves.toLocal.script.toString('hex') },
+				toRemote: { script: leaves.toRemote.script.toString('hex') },
+				ownedOutputIndex:
+					(holder === i
+						? atHeight[holder][name].outputMap.toLocal
+						: atHeight[holder][name].outputMap.toRemote) ?? null,
+				htlcs: []
+			});
 			return {
+				minimumDepth: 3,
+				funding,
+				localRecovery: recovery(i),
+				remoteRecovery: recovery(1 - i),
 				fundingTxid: (old ? parent : candidate.tx).getId(),
 				outputIndex: old ? opening.fundingOutputIndex : candidate.fundingIndex,
 				fundingRoot: (old ? parentRoot : candidateRoot).toString('hex'),
 				fundingProofs: old ? 'a0b1' : 'b0c1',
-				localCommitment: views[i][name].signed.toHex(),
-				remoteCommitment: views[1 - i][name].expected.toHex(),
+				localCommitment: atHeight[i][name].signed.toHex(),
+				remoteCommitment: atHeight[1 - i][name].expected.toHex(),
 				localProofs: (old ? 'a' : 'b') + (i + 1),
 				remoteProofs: (old ? 'a' : 'b') + (2 - i)
 			};
 		}
 		return {
+			minimumDepth: 3,
 			channelId: id,
 			finalDigest,
-			stateNumber: '0',
+			stateNumber: height.toString(),
 			parent: branch('parent'),
 			candidate: branch('candidate')
 		};
@@ -314,6 +367,7 @@ export function setupAssetSpliceProofs(dir: string) {
 		const result = evidence(i);
 		result.candidate = {
 			...result.candidate,
+			funding: { ...result.candidate.funding, fundingTxHex: other.toHex() },
 			fundingTxid: other.getId(),
 			localCommitment: exit(i, false, other).signed.toHex(),
 			remoteCommitment: exit(1 - i, false, other).expected.toHex()
@@ -353,6 +407,8 @@ export function setupAssetSpliceProofs(dir: string) {
 	}
 	return {
 		fundOpening,
+		inputs,
+		outputs,
 		devices,
 		id,
 		candidates,

@@ -1,4 +1,9 @@
 import {
+	AssetSpliceConfirmationCoordinator,
+	type AssetSpliceInclusionLookup
+} from './asset-splice-confirmation';
+import { finalHtlcLimits } from './final-commitment-reserve';
+import {
 	AssetOpeningCoordinator,
 	completeAssetOpeningHost
 } from './asset-opening-coordinator';
@@ -905,23 +910,6 @@ class CountedMap<K, V> extends Map<K, V> {
 	}
 }
 
-function finalHtlcLimits(
-	config: IChannelConfig,
-	reserve: bigint
-): {
-	htlcMinimumMsat: string;
-	maxHtlcValueInFlightMsat: string;
-	maxAcceptedHtlcs: number;
-	channelReserveSats: string;
-} {
-	return {
-		htlcMinimumMsat: config.htlcMinimumMsat.toString(),
-		maxHtlcValueInFlightMsat: config.maxHtlcValueInFlightMsat.toString(),
-		maxAcceptedHtlcs: config.maxAcceptedHtlcs,
-		channelReserveSats: reserve.toString()
-	};
-}
-
 /**
  * Manages multiple channels, dispatching messages between PeerManager
  * and Channel instances. Its events and their listener signatures are
@@ -1094,6 +1082,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 	private _walletDestinationScript: Buffer | null = null;
 	/** Funding provider used to attach wallet inputs for anchor fee bumps. */
 	private fundingProvider: IFundingProvider | null = null;
+	private readonly assetSpliceConfirmation?: AssetSpliceConfirmationCoordinator;
 	private readonly assetOpening?: AssetOpeningCoordinator;
 	private readonly finalTransport?: FinalOpeningTransport;
 	private readonly finalSplice?: FinalSpliceTransport;
@@ -1201,6 +1190,20 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		}
 		this.config = config;
 		this.persistence = config.persistence;
+		if (config.finalOpening?.storage.canSpliceDualFundedAssets) {
+			this.assetSpliceConfirmation = new AssetSpliceConfirmationCoordinator(
+				config.finalOpening.storage,
+				config.finalOpening.dualFunding,
+				(id, ref, depth) => this.watchFinalSplice(id, ref, depth),
+				(peer, raw) => this.sendMessage(peer, MessageType.SPLICE_LOCKED, raw),
+				(id, txid) =>
+					this.emit(
+						'splice:complete',
+						Buffer.from(id, 'hex'),
+						Buffer.from(txid, 'hex').reverse()
+					)
+			);
+		}
 		if (config.finalOpening && config.verifyRemoteFundingInput) {
 			this.finalSplice = new FinalSpliceTransport(
 				config.finalOpening,
@@ -3742,6 +3745,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		// Before the channels forget their pre-commitment splices: a composite
 		// splice (issue #1922) ends with the connection and must hear it first.
 		this.assetOpening?.disconnect(peerPubkey);
+		this.assetSpliceConfirmation?.disconnected(peerPubkey);
 		this.finalTransport?.disconnected(peerPubkey);
 		this.emit('peer:disconnected', peerPubkey);
 		const openDiedOnDisconnect = (state: ChannelState): string => {
@@ -3917,6 +3921,9 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 	 */
 	handlePeerReconnected(peerPubkey: string): void {
 		this.assetOpening?.reconnect(peerPubkey);
+		void this.assetSpliceConfirmation
+			?.reconnected(peerPubkey)
+			.catch((error) => this.emitContained('error', null, error.message));
 		this.finalTransport?.reconnected(peerPubkey);
 		for (const channel of this.getChannelsByPeer(peerPubkey)) {
 			if (channel.getState() === ChannelState.AWAITING_REESTABLISH) {
@@ -10044,6 +10051,13 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 
 		const alignedParams: IDualFundingParams = {
 			...params,
+			...(asset &&
+				this.config.finalOpening?.storage.canSpliceDualFundedAssets && {
+					maxAcceptedHtlcs: Math.min(
+						params.maxAcceptedHtlcs,
+						auxiliaryMaxHtlcs(this.config.auxiliaryChannels?.maxHtlcs)
+					)
+				}),
 			chainHash: params.chainHash ?? this.config.chainHash,
 			channelType,
 			channelFlags,
@@ -10185,7 +10199,43 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			);
 		this.finalSplice.start(hex, plan);
 	}
-	private watchFinalSplice(id: string, ref: IFinalFundingReference): void {
+	restoreAssetSpliceWatches(channelId?: string): void {
+		this.assetSpliceConfirmation?.restore(channelId);
+	}
+	suspendAssetSpliceFunding(id: string, txid: string): void {
+		this.assetSpliceConfirmation?.suspend(id, txid);
+	}
+	hasAssetSpliceWatch(id: string, txid: string): boolean {
+		return !!this.assetSpliceConfirmation?.has(id, txid);
+	}
+	async observeAssetSpliceFunding(
+		id: string,
+		txid: string,
+		height: number | undefined,
+		prove: AssetSpliceInclusionLookup,
+		current: () => boolean
+	): Promise<void> {
+		await this.assetSpliceConfirmation?.observe(
+			id,
+			txid,
+			height,
+			prove,
+			current
+		);
+	}
+	async receiveAssetSpliceLocked(
+		peer: string,
+		payload: Buffer
+	): Promise<boolean> {
+		return (
+			(await this.assetSpliceConfirmation?.receive(peer, payload)) ?? false
+		);
+	}
+	private watchFinalSplice(
+		id: string,
+		ref: IFinalFundingReference,
+		depth?: number
+	): void {
 		const opening = this.config.finalOpening!.storage.loadFinalOpening(id)!;
 		const tx = bitcoin.Transaction.fromHex(ref.fundingTxHex),
 			output = tx.outs[ref.fundingOutputIndex];
@@ -10194,7 +10244,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			Buffer.from(id, 'hex'),
 			tx.getId(),
 			ref.fundingOutputIndex,
-			opening.minimumDepth,
+			depth ?? opening.minimumDepth,
 			output.script,
 			output.value,
 			true
@@ -10242,6 +10292,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 	}
 
 	restoreFinalOpeningBroadcasts(): void {
+		this.restoreAssetSpliceWatches();
 		for (const {
 			candidate,
 			funding,
@@ -10909,8 +10960,15 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 					.htlcMinimumMsat,
 				toSelfDelay: (this.config.localConfig || DEFAULT_CHANNEL_CONFIG)
 					.toSelfDelay,
-				maxAcceptedHtlcs: (this.config.localConfig || DEFAULT_CHANNEL_CONFIG)
-					.maxAcceptedHtlcs,
+				maxAcceptedHtlcs:
+					asset && this.config.finalOpening?.storage.canSpliceDualFundedAssets
+						? Math.min(
+								(this.config.localConfig || DEFAULT_CHANNEL_CONFIG)
+									.maxAcceptedHtlcs,
+								auxiliaryMaxHtlcs(this.config.auxiliaryChannels?.maxHtlcs)
+						  )
+						: (this.config.localConfig || DEFAULT_CHANNEL_CONFIG)
+								.maxAcceptedHtlcs,
 				locktime: msg.locktime,
 				localBasepoints: chKeys.basepoints,
 				localPerCommitmentSeed: chKeys.perCommitmentSeed,

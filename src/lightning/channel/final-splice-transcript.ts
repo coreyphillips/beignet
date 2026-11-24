@@ -12,7 +12,8 @@ import {
 } from '../message/interactive-tx';
 import { decodeSpliceMessage, decodeSpliceAckMessage } from '../message/splice';
 import { createTaprootFundingScript } from '../script/funding-taproot';
-import { isValidPublicKey } from '../crypto/ecdh';
+import { getPublicKey, isValidPublicKey } from '../crypto/ecdh';
+import { randomBytes } from '../crypto/provider';
 import type { IFinalSpliceAttempt } from './final-splice-state';
 import {
 	buildFinalSpliceCandidate,
@@ -131,8 +132,16 @@ export function localSpliceContributions(
 		output(Buffer.from(x.script, 'hex'), BigInt(x.value));
 	return messages;
 }
+export function freshSplicePublicNonce(): Buffer {
+	return Buffer.concat([
+		getPublicKey(randomBytes(32)),
+		getPublicKey(randomBytes(32))
+	]);
+}
 export function spliceConstruction(
-	a: IFinalSpliceAttempt,
+	a: Pick<IFinalSpliceAttempt, 'messages'> & {
+		intent: Pick<IFinalSpliceAttempt['intent'], 'initiator'>;
+	},
 	terms: IFinalSpliceTerms
 ) {
 	const builder = new InteractiveTxBuilder(a.intent.initiator, terms.locktime);
