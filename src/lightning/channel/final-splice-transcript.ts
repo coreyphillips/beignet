@@ -117,8 +117,12 @@ export function localSpliceContributions(
 		input(Buffer.from(x.prevTxHex, 'hex'), x.vout, x.sequence);
 	if (a.intent.initiator)
 		output(
-			createTaprootFundingScript(terms.newLocalKey, terms.newPeerKey)
-				.p2trOutput,
+			createTaprootFundingScript(
+				terms.newLocalKey,
+				terms.newPeerKey,
+				undefined,
+				terms.assetFundingRoots?.candidate
+			).p2trOutput,
 			BigInt(terms.parent.outs[terms.parentIndex].value) +
 				terms.localDelta +
 				terms.peerDelta

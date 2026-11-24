@@ -1,5 +1,9 @@
 import type { Transaction } from 'bitcoinjs-lib';
 import { ecc } from '../../utils/ecc';
+import {
+	createTaprootFundingScript,
+	taprootKeySpendSighash
+} from '../script/funding-taproot';
 import { getPublicKey, isValidPublicKey } from '../crypto/ecdh';
 import { generateNonce } from '../crypto/musig';
 import { sha256 } from '../crypto/provider';
@@ -84,7 +88,8 @@ export function verifyFinalSpliceContribution(
 		terms.oldLocalKey,
 		terms.oldPeerKey,
 		localNonce,
-		peerNonce
+		peerNonce,
+		terms.assetFundingRoots?.parent
 	);
 	const share = data.subarray(0, 32);
 	if (
@@ -133,6 +138,41 @@ export function signFinalSpliceFunding(
 		localNonce.equals(peerNonce)
 	)
 		throw new Error('Unverified shared funding nonce or key');
+	// Verify the supplied terms again at the one-use signer boundary.
+	const parent = terms.parent.outs[terms.parentIndex];
+	const shared = c.tx.ins[c.sharedIndex];
+	const roots = terms.assetFundingRoots;
+	if (
+		!parent ||
+		!shared ||
+		!shared.hash.equals(terms.parent.getHash()) ||
+		shared.index !== terms.parentIndex ||
+		c.values[c.sharedIndex] !== parent.value ||
+		!c.scripts[c.sharedIndex]?.equals(parent.script) ||
+		(roots !== undefined &&
+			(!Buffer.isBuffer(roots?.parent) ||
+				roots.parent.length !== 32 ||
+				!Buffer.isBuffer(roots.candidate) ||
+				roots.candidate.length !== 32)) ||
+		!createTaprootFundingScript(
+			terms.oldLocalKey,
+			terms.oldPeerKey,
+			undefined,
+			roots?.parent
+		).p2trOutput.equals(parent.script) ||
+		!createTaprootFundingScript(
+			terms.newLocalKey,
+			terms.newPeerKey,
+			undefined,
+			roots?.candidate
+		).p2trOutput.equals(c.tx.outs[c.fundingIndex].script) ||
+		!taprootKeySpendSighash(c.tx, c.sharedIndex, c.scripts, c.values).equals(
+			c.digest
+		)
+	)
+		throw new Error(
+			'Splice keys, roots or digest disagree with the funding transaction'
+		);
 	validateFinalSpliceExits(exits, c, terms);
 	const txid = c.tx.getId();
 	const retained = sha256(exits.candidate.signed.toBuffer()).toString('hex');
@@ -147,7 +187,10 @@ export function signFinalSpliceFunding(
 			c.digest,
 			localNonce,
 			peerNonce,
-			Buffer.from(retained, 'hex')
+			Buffer.from(retained, 'hex'),
+			...(roots
+				? [terms.oldLocalKey, terms.oldPeerKey, roots.parent, roots.candidate]
+				: [])
 		])
 	).toString('hex');
 	let signed = authority.claim(slot, transcript);
@@ -181,7 +224,8 @@ export function signFinalSpliceFunding(
 			terms.oldLocalKey,
 			terms.oldPeerKey,
 			handle,
-			peerNonce
+			peerNonce,
+			terms.assetFundingRoots?.parent
 		);
 		const partial = partialSignCommitment(session, key, handle);
 		signed = encodeTxSignaturesMessage({
@@ -235,7 +279,8 @@ export function assembleFinalSplice(
 		terms.oldLocalKey,
 		terms.oldPeerKey,
 		localNonce,
-		peerNonce
+		peerNonce,
+		terms.assetFundingRoots?.parent
 	);
 	const aggregate = aggregateCommitmentSig(session, a.share, b.share);
 	if (
