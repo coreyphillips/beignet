@@ -97,7 +97,8 @@ export const AUXILIARY_CHANNELS_API = Object.freeze({
 		// Issue #2098, step 10: createInvoice takes { assetInvoice }, and such
 		// an invoice carries only its host's routing hints and offers
 		// basic_mpp only where its parts can be collected.
-		'createInvoice:assetInvoice'
+		'createInvoice:assetInvoice',
+		'dualFunding:v1'
 	] as const),
 	// Nothing is declared and not run in this build.
 	declared: Object.freeze([] as const)

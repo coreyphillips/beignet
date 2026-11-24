@@ -46,6 +46,7 @@ export function daemonOptions(
 		preferAnchors: config.preferAnchors,
 		finalTaprootWallet: config.finalTaprootWallet,
 		finalCommitmentUpdates: config.finalCommitmentUpdates,
+		dualFundedAssets: config.dualFundedAssets,
 		largeChannels: config.largeChannels,
 		apiToken: config.apiToken,
 		apiKeys: config.apiKeys,

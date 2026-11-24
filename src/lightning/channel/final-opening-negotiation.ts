@@ -3,6 +3,10 @@ import { ChannelState } from './types';
 import { isFinalTaprootTypeHex } from './commitment-profile';
 import type { IFinalOpeningTerms } from './final-opening-commitment';
 import type { IChannelBasepoints } from '../keys/derivation';
+import type {
+	IOpenChannel2Message,
+	IAcceptChannel2Message
+} from '../message/dual-funding';
 import { buildSpliceTx } from './splice-tx';
 import { generateNonce } from '../crypto/musig';
 import { randomBytes } from '../crypto/provider';
@@ -16,12 +20,17 @@ import {
 // Enrollment belongs to the admitted, ephemeral negotiation. Stored channels
 // cannot acquire this capability by supplying a field in a serialized row.
 const enrolled = new WeakSet<Channel>();
+const assetOpenings = new WeakSet<Channel>();
 
-export function enrollFinalNegotiation(channel: Channel): void {
+export function enrollFinalNegotiation(channel: Channel, asset = false): void {
 	if (channel.getState() !== ChannelState.NONE)
 		throw Error('Final opening must be enrolled before negotiation');
 	enrolled.add(channel);
+	if (asset) assetOpenings.add(channel);
 }
+
+export const isAssetNegotiation = (channel: Channel): boolean =>
+	assetOpenings.has(channel);
 
 export function isFinalNegotiation(channel: Channel): boolean {
 	return enrolled.has(channel);
@@ -37,6 +46,23 @@ function openingPoints(
 		delayedPaymentBasepoint: points.delayedPaymentBasepoint.toString('hex'),
 		htlcBasepoint: points.htlcBasepoint.toString('hex'),
 		firstPerCommitmentPoint: points.firstPerCommitmentPoint.toString('hex')
+	};
+}
+
+export function openingTerms(
+	open: IOpenChannel2Message,
+	accept: IAcceptChannel2Message,
+	isInitiator: boolean
+): IFinalOpeningTerms {
+	const [local, remote] = isInitiator ? [open, accept] : [accept, open];
+	return {
+		localBasepoints: openingPoints(local),
+		remoteBasepoints: openingPoints(remote),
+		localToSelfDelay: local.toSelfDelay,
+		remoteToSelfDelay: remote.toSelfDelay,
+		localDustLimitSatoshis: Number(local.dustLimitSatoshis),
+		remoteDustLimitSatoshis: Number(remote.dustLimitSatoshis),
+		commitmentFeeratePerKw: open.commitmentFeeratePerkw
 	};
 }
 
@@ -117,15 +143,7 @@ export function snapshotFinalOpening(
 	}
 	return {
 		candidate,
-		terms: {
-			localBasepoints: openingPoints(local),
-			remoteBasepoints: openingPoints(remote),
-			localToSelfDelay: local.toSelfDelay,
-			remoteToSelfDelay: remote.toSelfDelay,
-			localDustLimitSatoshis: Number(local.dustLimitSatoshis),
-			remoteDustLimitSatoshis: Number(remote.dustLimitSatoshis),
-			commitmentFeeratePerKw: open.commitmentFeeratePerkw
-		}
+		terms: openingTerms(open, accept, isInitiator)
 	};
 }
 

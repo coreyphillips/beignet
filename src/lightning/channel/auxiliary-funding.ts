@@ -225,6 +225,8 @@ export interface IAuxiliaryRestoredChannel {
  * that hook the node is only ever an endpoint of an asset payment.
  */
 export interface IAuxiliaryChannelConfig {
+	/** Private, positive-depth dual-funded opening in a fresh enrolled regtest wallet. */
+	dualFunding?: import('./asset-opening-provider').IAuxiliaryDualFunding;
 	/** Standard-wire CSV compatibility for new channels only. Does not authorize legacy signatures. */
 	openingCsvPolicy?(peerPubkey: string): IAuxiliaryOpeningCsvPolicy | undefined;
 	/** Explicitly permit delegated Bitcoin and asset custody for independently scoped revoked HTLC children. */

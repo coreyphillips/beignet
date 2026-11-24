@@ -85,6 +85,7 @@ export function installOpeningAuthority(
 	const signer = new Sqlite(stagedSigner, { fileMustExist: true });
 	try {
 		signer.pragma('synchronous = EXTRA');
+		if (JSON.parse(identity)[0] === 3) signer.pragma('auto_vacuum = FULL');
 		const secret = randomBytes(32);
 		const origin = JSON.stringify([
 			descriptor(stageWallet, canonical),
@@ -384,7 +385,8 @@ export class FinalOpeningAuthority {
 			typeof value.transcript !== 'string' ||
 			(value.result !== null &&
 				(typeof value.result !== 'string' ||
-					!/^(?:[0-9a-f]{2})+$/.test(value.result)))
+					value.result.length % 2 !== 0 ||
+					!/^[0-9a-f]+$/.test(value.result)))
 		)
 			throw new Error('Invalid opening signer transcript');
 		return value;
@@ -416,6 +418,15 @@ export class FinalOpeningAuthority {
 	claim(slot: string, transcript: string): Buffer | null {
 		this.verifyFiles();
 		return this.db.transaction(() => this.lock(slot, transcript)).immediate();
+	}
+
+	fundingWitnessResult(
+		id: string,
+		field: 'fundingLocal' | 'fundingPeer'
+	): Buffer | null {
+		this.verifyFiles();
+		const result = this.read('funding-witness/' + field + '/' + id)?.result;
+		return result ? Buffer.from(result, 'hex') : null;
 	}
 
 	/** Advance the device high-water mark before the wallet releases a reconnect nonce.
@@ -509,6 +520,186 @@ export class FinalOpeningAuthority {
 			.transaction(() => {
 				this.lock(name, digest);
 				this.finish(name, digest, raw);
+			})
+			.immediate();
+	}
+
+	listAssetOpenStages(): string[] {
+		this.verifyFiles();
+		const rows = this.db
+			.prepare(
+				`
+			SELECT substr(slot, 15) AS id FROM claims AS started
+			WHERE slot GLOB 'asset-attempt/*'
+			AND NOT EXISTS (SELECT 1 FROM claims WHERE slot =
+				'asset-packet/' || substr(started.slot, 15) || '/finished')
+			ORDER BY slot LIMIT 9
+		`
+			)
+			.all() as { id: string }[];
+		if (rows.length > 8) throw new Error('Too many pending asset openings');
+		return rows.map((row) => row.id);
+	}
+
+	private assetStageName(id: string, field: string): string {
+		if (
+			typeof id !== 'string' ||
+			!/^[0-9a-f]{64}$/.test(id) ||
+			typeof field !== 'string' ||
+			!/^[a-zA-Z0-9][a-zA-Z0-9_./:-]{0,79}$/.test(field)
+		)
+			throw new Error('Invalid asset opening stage');
+		return id + '/' + field;
+	}
+
+	loadAssetOpenStage(id: string, field: string): Buffer | null {
+		this.verifyFiles();
+		const name = this.assetStageName(id, field);
+		const record = this.read('asset-packet/' + name);
+		if (!record) return null;
+		if (
+			record.result === '00' &&
+			field !== 'finished' &&
+			this.read('asset-packet/' + id + '/finished')
+		)
+			return null;
+		if (!record.result?.startsWith('01'))
+			throw new Error('Incomplete asset opening stage');
+		const bytes = Buffer.from(record.result.slice(2), 'hex');
+		if (record.transcript !== sha256(bytes).toString('hex'))
+			throw new Error('Invalid stored asset opening stage');
+		return bytes;
+	}
+
+	/** An unfinished attempt has at most 128 named packets/reservations and 40 MiB of packet data. */
+	private admitAssetStage(
+		id: string,
+		field: string,
+		additionalBytes: number
+	): void {
+		if (this.read('asset-packet/' + id + '/finished'))
+			throw new Error('Asset opening stage is finished');
+		if (!this.read('asset-attempt/' + id)) {
+			if (field === 'finished' || this.listAssetOpenStages().length >= 8)
+				throw new Error('Cannot start an asset opening stage');
+			this.lock('asset-attempt/' + id, id);
+		}
+		const prefix = 'asset-size/' + id + '/';
+		const rows = this.db
+			.prepare('SELECT slot,claim FROM claims WHERE slot GLOB ? LIMIT 129')
+			.all(prefix + '*') as { slot: string; claim: string }[];
+		if (rows.length >= (field === 'finished' ? 128 : 127))
+			throw new Error('Too many asset opening fields');
+		let total = additionalBytes;
+		for (const row of rows) {
+			const size = Number(this.decodeClaim(row.slot, row.claim).transcript);
+			if (!Number.isSafeInteger(size) || size < 0 || size > 4 * 1024 * 1024)
+				throw new Error('Invalid asset opening record size');
+			total += size;
+		}
+		if (total > 40 * 1024 * 1024 - (field === 'finished' ? 0 : 1))
+			throw new Error('Asset opening byte limit exceeded');
+	}
+
+	/** Retain the authenticated packet digest and signing reservations, releasing completed proof bodies. */
+	private compactAssetStage(id: string): void {
+		const prefix = 'asset-packet/' + id + '/';
+		const slots = this.db
+			.prepare('SELECT slot FROM claims WHERE slot GLOB ?')
+			.all(prefix + '*') as { slot: string }[];
+		const update = this.db.prepare('UPDATE claims SET claim=? WHERE slot=?');
+		for (const { slot } of slots) {
+			const field = slot.slice(prefix.length);
+			if (field === 'finished') continue;
+			const record = this.read(slot)!;
+			if (record.result === '00') continue;
+			if (
+				!record.result?.startsWith('01') ||
+				!/^[0-9a-f]{64}$/.test(record.transcript)
+			)
+				throw new Error('Invalid asset opening packet at retirement');
+			// The public session can be interrupted between admission and nonce persistence.
+			if (field === 'peerNonce' && record.result.length <= 514) continue;
+			const receipt = encryptValue(
+				this.claimKey(slot),
+				JSON.stringify({ transcript: record.transcript, result: '00' })
+			);
+			update.run(receipt, slot);
+			const saved = this.read(slot);
+			if (saved?.result !== '00' || saved.transcript !== record.transcript)
+				throw new Error('Could not compact the retired asset opening');
+		}
+		this.lock('asset-compacted/' + id, id);
+	}
+
+	compactRetiredAssetStages(): void {
+		this.verifyFiles();
+		const rows = this.db
+			.prepare(
+				`SELECT substr(slot,14,64) AS id FROM claims AS done
+			WHERE slot GLOB 'asset-packet/*/finished' AND length(slot)=86
+			AND NOT EXISTS(SELECT 1 FROM claims WHERE slot='asset-compacted/'||substr(done.slot,14,64))`
+			)
+			.all() as { id: string }[];
+		for (const { id } of rows)
+			this.db.transaction(() => this.compactAssetStage(id)).immediate();
+	}
+
+	saveAssetOpenStage(id: string, field: string, bytes: Buffer): void {
+		this.verifyFiles();
+		const name = this.assetStageName(id, field);
+		if (
+			!Buffer.isBuffer(bytes) ||
+			bytes.length > 4 * 1024 * 1024 ||
+			(field === 'finished' && bytes.length > 1)
+		)
+			throw new Error('Invalid asset opening stage size');
+		const digest = sha256(bytes).toString('hex');
+		this.db
+			.transaction(() => {
+				const old = this.loadAssetOpenStage(id, field);
+				if (old) {
+					if (!old.equals(bytes))
+						throw new Error('Asset opening stage changed');
+					return;
+				}
+				this.admitAssetStage(id, field, bytes.length);
+				this.lock(
+					'asset-size/' + id + '/packet/' + field,
+					String(bytes.length)
+				);
+				const slot = 'asset-packet/' + name;
+				this.lock(slot, digest);
+				this.finish(slot, digest, Buffer.concat([Buffer.of(1), bytes]));
+				if (field === 'finished') this.compactAssetStage(id);
+			})
+			.immediate();
+	}
+
+	reserveAssetOpenSignature(
+		id: string,
+		field: string,
+		digest: string | Buffer
+	): void {
+		this.verifyFiles();
+		const name = this.assetStageName(id, field);
+		const hex = Buffer.isBuffer(digest) ? digest.toString('hex') : digest;
+		if (
+			field === 'finished' ||
+			typeof hex !== 'string' ||
+			!/^[0-9a-f]{64}$/.test(hex)
+		)
+			throw new Error('Invalid asset opening signature reservation');
+		const slot = 'asset-reservation/' + name;
+		this.db
+			.transaction(() => {
+				if (!this.read(slot)) {
+					this.admitAssetStage(id, field, 0);
+					this.lock('asset-size/' + id + '/signature/' + field, '0');
+				} else if (this.read('asset-packet/' + id + '/finished')) {
+					throw new Error('Asset opening stage is finished');
+				}
+				this.lock(slot, hex);
 			})
 			.immediate();
 	}

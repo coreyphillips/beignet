@@ -1,4 +1,5 @@
 import { Transaction } from 'bitcoinjs-lib';
+import { ASSET_OPENING_TYPE_HEX } from '../features/asset-opening';
 import { isFinalTaprootTypeHex } from '../channel/commitment-profile';
 import { MAX_MINIMUM_DEPTH } from '../channel/types';
 import { isValidPublicKey } from '../crypto/ecdh';
@@ -109,11 +110,35 @@ export function validateFinalOpening(c: IFinalOpeningCandidate): {
 	encoded: string;
 	fundingOutpoint: string;
 } {
+	requireCandidate(isFinalTaprootTypeHex(c.channelType), 'channel type');
+	return validateOpening(c);
+}
+
+export function validateAssetOpening(
+	c: IFinalOpeningCandidate,
+	fundingRoot: Buffer
+) {
+	requireCandidate(
+		c.channelType === ASSET_OPENING_TYPE_HEX,
+		'asset channel type'
+	);
+	requireCandidate(
+		Buffer.isBuffer(fundingRoot) && fundingRoot.length === 32,
+		'asset funding root'
+	);
+	const checked = validateOpening(c, fundingRoot);
+	requireCandidate(
+		c.inputs.some((i) => i.isLocal) && c.inputs.some((i) => !i.isLocal),
+		'two contributors'
+	);
+	return checked;
+}
+
+function validateOpening(c: IFinalOpeningCandidate, fundingRoot?: Buffer) {
 	requireCandidate(
 		typeof c.channelId === 'string' && /^[0-9a-f]{64}$/.test(c.channelId),
 		'channel id'
 	);
-	requireCandidate(isFinalTaprootTypeHex(c.channelType), 'channel type');
 	requireCandidate(typeof c.isInitiator === 'boolean', 'role');
 	requireCandidate(
 		uint(c.minimumDepth, MAX_MINIMUM_DEPTH, 1),
@@ -140,7 +165,9 @@ export function validateFinalOpening(c: IFinalOpeningCandidate): {
 	);
 	const fundingScript = createTaprootFundingScript(
 		fundingKey(c.localFundingPubkey),
-		fundingKey(c.remoteFundingPubkey)
+		fundingKey(c.remoteFundingPubkey),
+		undefined,
+		fundingRoot
 	).p2trOutput;
 	const tx = readTransaction(c.fundingTxHex, MAX_STANDARD_TX_WEIGHT / 4);
 	requireCandidate(

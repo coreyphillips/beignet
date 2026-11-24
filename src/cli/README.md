@@ -91,6 +91,7 @@ await node.destroy();
 | `preferAnchors?` | `boolean` | Open anchor channels (default true); false opens legacy static_remotekey channels. |
 | `finalTaprootWallet?` | `boolean` | Opt in to an original, freshly generated regtest type-80 wallet. |
 | `finalCommitmentUpdates?` | `boolean` | Enroll a new regtest wallet for type-80 payments, splicing and closes. |
+| `dualFundedAssets?` | `boolean` | Enroll a fresh regtest wallet for dual-funded asset channel opening. |
 | `largeChannels?` | `boolean` | option_wumbo (large_channels, default false): advertise the bit and lift the 2^24 sat funding cap (up to 10 BTC) for peers that also advertise it. |
 | `autoBootstrap?` | `boolean` | Connect to DNS seed peers (BOLT 10) at startup (default false). |
 | `autoReconnect?` | `boolean` | Enable auto-reconnection to peers (default true) |
@@ -1691,7 +1692,7 @@ All output is JSON. Add `--pretty` for indented output.
 ### Setup
 
 ```bash
-beignet init [--network regtest] [--alias mynode] [--final-taproot-wallet] [--final-commitment-updates]
+beignet init [--network regtest] [--alias mynode] [--final-taproot-wallet] [--final-commitment-updates | --dual-funded-assets]
 beignet start [--port 2112] [--host 0.0.0.0] [--daemon] [--anchors] [--api-token <token>] \
   [--backup-path /path/to/backup.db] [--backup-interval 21600000] \
   [--daily-spend-limit 100000] [--tls-cert /path/cert.pem] [--tls-key /path/key.pem] \
@@ -1958,6 +1959,9 @@ that primary's relay later.
 ### Channels
 
 For a private Bitcoin type-80 channel, initialize a fresh regtest wallet on each Beignet peer with `beignet init --network regtest --final-commitment-updates`. Fund the opener, connect the peers and run `beignet channel open-v2 <pubkey> <sats> --final-taproot`. HTTP clients can send `POST /channel/open-v2` with `finalTaproot` set to `true`.
+
+For a two-contributor asset opening, initialize both fresh regtest wallets with `beignet init --network regtest --dual-funded-assets`, attach an asset extension with the `dualFunding:v1` provider on both nodes, and configure the contributions in that extension. Run `beignet channel open-v2 <pubkey> <sats> --dual-funded-assets` or set `dualFundedAssets` to `true` in the HTTP request. The channel becomes ready after the configured confirmation depth and successful proof import on both wallets. See [the extension contract](../../docs/EXTENSIONS.md#dual-funded-asset-opening-on-regtest).
+
 
 Each original wallet saves its unilateral exit before sending funding witnesses. After the funding reaches the negotiated depth and the peers exchange `channel_ready`, `GET /channels` reports `NORMAL`. The daemon can then pay and receive invoices. After restart it checks the funding and reestablishes with the peer before sending another update. A reorg that removes the necessary funding depth suspends payments.
 
@@ -2928,7 +2932,7 @@ The matching commands are `wallet sweep-prepare <requestJson|requestFile>`, `wal
 | POST | `/trusted-peer/remove` | `{ pubkey }` | Remove trusted peer |
 | POST | `/channel/open` | `{ pubkey, amountSats, pushSats? }` | Open channel |
 | POST | `/channel/open-zeroconf` | `{ pubkey, amountSats, pushSats? }` | Open zero-conf channel |
-| POST | `/channel/open-v2` | `{ pubkey, amountSats, fundingFeeratePerkw?, finalTaproot?, ... }` | Open a v2 channel. Enrolled regtest wallets can request private final type 80. |
+| POST | `/channel/open-v2` | `{ pubkey, amountSats, fundingFeeratePerkw?, finalTaproot?, dualFundedAssets?, ... }` | Open a v2 channel. Enrolled regtest wallets can request private final type 80. |
 | POST | `/channels/ensure-minimum` | `{ count, satsPerChannel, timeoutMs? }` | Auto-open channels to meet minimum count |
 | POST | `/channel/connect-and-open` | `{ pubkey, host, port, amountSats, pushSats? }` | Connect + open in one call |
 | POST | `/channel/open-and-wait` | `{ pubkey, amountSats, pushSats?, timeoutMs? }` | Open channel + wait for NORMAL state |

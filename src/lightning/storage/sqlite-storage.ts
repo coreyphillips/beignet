@@ -42,11 +42,14 @@ import {
 } from '../ffor/voucher-archive';
 import type Database from 'better-sqlite3';
 import type { BIP32Interface } from 'bip32';
+import type { IFinalOpeningTerms } from '../channel/final-opening-commitment';
 import {
-	buildFinalOpeningCommitment,
-	type IFinalOpeningTerms
-} from '../channel/final-opening-commitment';
+	canonicalAssetOpeningEvidence,
+	storedOpeningCommitment,
+	type IAssetOpeningEvidence
+} from './asset-opening-evidence';
 import {
+	prepareAssetWitnessRelease,
 	recordOpeningFunding,
 	type FinalFundingWitnessSigner
 } from './final-opening-funding';
@@ -56,6 +59,10 @@ import {
 	verifyOpeningSigning
 } from './final-opening-signing';
 import type { IChannelReestablishMessage } from '../message/channel-reestablish';
+import {
+	decodeTxSignaturesMessage,
+	encodeTxSignaturesMessage
+} from '../message/interactive-tx';
 import {
 	withFunding,
 	finalFundingLedgers,
@@ -104,7 +111,10 @@ import {
 	verifyStoredReadiness
 } from './final-opening-ready';
 import { Feature, FeatureFlags } from '../features/flags';
-import { validateFinalOpening } from './final-opening-candidate';
+import {
+	validateAssetOpening,
+	validateFinalOpening
+} from './final-opening-candidate';
 import type { IFinalOpeningCandidate } from './final-opening-candidate';
 import {
 	decodeOpeningNonces,
@@ -491,6 +501,7 @@ export class SqliteStorage implements IStorageBackend {
 	private readonly dbPath: string;
 	private readonly walletIdentity?: string;
 	private readonly updateWallet: boolean;
+	private readonly finalGeneration?: number;
 	private openingAuthority: FinalOpeningAuthority | null = null;
 	/** Public negotiation history excludes the local exit template, which later revocations can supersede. */
 	loadFinalSpliceAttempts(id: string) {
@@ -575,9 +586,9 @@ export class SqliteStorage implements IStorageBackend {
 	) {
 		const Sqlite = loadBetterSqlite3();
 		this.walletIdentity = opts?.[boundWallet];
-		this.updateWallet =
-			this.walletIdentity !== undefined &&
-			JSON.parse(this.walletIdentity)[0] === 2;
+		this.finalGeneration =
+			this.walletIdentity && JSON.parse(this.walletIdentity)[0];
+		this.updateWallet = this.finalGeneration === 2;
 		this.db = this.walletIdentity
 			? new Sqlite(dbPath, { fileMustExist: true, timeout: 0 })
 			: new Sqlite(dbPath);
@@ -601,9 +612,12 @@ export class SqliteStorage implements IStorageBackend {
 	): SqliteStorage {
 		const identity = finalWalletIdentity(dbPath, binding);
 		const daemonGenerated = takeFinalDaemonGeneration(binding);
-		if (binding.finalCommitmentUpdates && !daemonGenerated)
+		if (
+			(binding.finalCommitmentUpdates || binding.dualFundedAssets) &&
+			!daemonGenerated
+		)
 			throw new Error(
-				'Final commitment updates require a freshly generated original wallet'
+				'This enrollment requires a freshly generated original wallet'
 			);
 		installFreshWallet(dbPath, (stagedPath) => {
 			const staged = new SqliteStorage(stagedPath, undefined, binding);
@@ -647,6 +661,13 @@ export class SqliteStorage implements IStorageBackend {
 			);
 			storage.reconcileFinalUpdateOpenings();
 			storage.reconcileFinalExitRequests();
+			if (storage.canOpenDualFundedAssets) {
+				storage.openingAuthority!.assertEnforceableExits((id) =>
+					storage.openingExitBytes(id)
+				);
+				storage.reconcileAssetOpeningWitnesses();
+				storage.openingAuthority!.compactRetiredAssetStages();
+			}
 			return storage;
 		} catch (error) {
 			storage.close();
@@ -932,18 +953,33 @@ export class SqliteStorage implements IStorageBackend {
 		const key = this.finalOpeningKey(row.channel_id, row.funding_outpoint);
 		const plaintext = decryptValue(key, row.record_json);
 		const candidate: IFinalOpeningCandidate = JSON.parse(plaintext);
-		const { encoded, fundingOutpoint } = validateFinalOpening(candidate);
+		const nonceKey = this.openingNonceKey(key, plaintext);
+		const nonces = decodeOpeningNonces(
+			candidate.channelId,
+			decryptValue(nonceKey, row.nonces_json)
+		);
+		const evidence = nonces.session?.assetEvidence;
+		if (evidence !== undefined) {
+			if (
+				this.finalGeneration !== 3 ||
+				nonces.session?.updateLimits ||
+				JSON.stringify(canonicalAssetOpeningEvidence(evidence)) !==
+					JSON.stringify(evidence)
+			)
+				throw new Error('Invalid stored asset opening evidence');
+		}
+		const { encoded, fundingOutpoint } = evidence
+			? validateAssetOpening(
+					candidate,
+					Buffer.from(evidence.fundingRoot, 'hex')
+			  )
+			: validateFinalOpening(candidate);
 		if (
 			candidate.channelId !== row.channel_id ||
 			fundingOutpoint !== row.funding_outpoint ||
 			encoded !== plaintext
 		)
 			throw new Error('Invalid stored final opening candidate');
-		const nonceKey = this.openingNonceKey(key, encoded);
-		const nonces = decodeOpeningNonces(
-			candidate.channelId,
-			decryptValue(nonceKey, row.nonces_json)
-		);
 		if (nonces.session !== undefined) {
 			const session = nonces.session;
 			if (
@@ -954,6 +990,7 @@ export class SqliteStorage implements IStorageBackend {
 							'channelKeyIndex',
 							'peer',
 							'terms',
+							'assetEvidence',
 							'updateLimits',
 							'remoteSecondPerCommitmentPoint'
 						].includes(k)
@@ -977,8 +1014,8 @@ export class SqliteStorage implements IStorageBackend {
 				session.remoteSecondPerCommitmentPoint,
 				session.terms
 			);
-			buildFinalOpeningCommitment(candidate, session.terms, 'local');
-			buildFinalOpeningCommitment(candidate, session.terms, 'remote');
+			storedOpeningCommitment(candidate, session.terms, 'local', evidence);
+			storedOpeningCommitment(candidate, session.terms, 'remote', evidence);
 		}
 		if (nonces.signing !== undefined)
 			verifyOpeningSigning(candidate, nonces, getIndex(candidate.channelId));
@@ -1069,6 +1106,36 @@ export class SqliteStorage implements IStorageBackend {
 		return this.openingAuthority !== null;
 	}
 
+	/** Original-device authority of the dedicated asset opening generation. */
+	get canOpenDualFundedAssets(): boolean {
+		return this.finalGeneration === 3 && this.canSignFinalOpening;
+	}
+
+	private assetStageAuthority(): FinalOpeningAuthority {
+		if (!this.canOpenDualFundedAssets || this.db.inTransaction)
+			throw new Error(
+				'Asset opening stages require their enrolled original device outside a transaction'
+			);
+		return this.requireOpeningAuthority();
+	}
+
+	saveAssetOpenStage(id: string, field: string, bytes: Buffer): void {
+		this.assetStageAuthority().saveAssetOpenStage(id, field, bytes);
+	}
+	loadAssetOpenStage(id: string, field: string): Buffer | null {
+		return this.assetStageAuthority().loadAssetOpenStage(id, field);
+	}
+	listAssetOpenStages(): string[] {
+		return this.assetStageAuthority().listAssetOpenStages();
+	}
+	reserveAssetOpenSignature(
+		id: string,
+		field: string,
+		digest: string | Buffer
+	): void {
+		this.assetStageAuthority().reserveAssetOpenSignature(id, field, digest);
+	}
+
 	/** A copied wallet cannot prove that a backup commitment remains unrevoked. */
 	get canUpdateFinalCommitments(): boolean {
 		return this.updateWallet && this.canSignFinalOpening;
@@ -1091,17 +1158,62 @@ export class SqliteStorage implements IStorageBackend {
 		remoteSecondPerCommitmentPoint?: string,
 		updateLimits?: IFinalUpdateLimits
 	): void {
+		this.rememberOpeningSession(
+			candidate,
+			peer,
+			terms,
+			channelKeyIndex,
+			remoteSecondPerCommitmentPoint,
+			updateLimits
+		);
+	}
+
+	rememberAssetOpeningSession(
+		candidate: IFinalOpeningCandidate,
+		peer: string,
+		terms: IFinalOpeningTerms,
+		channelKeyIndex: number,
+		remoteSecondPerCommitmentPoint: string,
+		evidence: IAssetOpeningEvidence
+	): void {
+		if (!this.canOpenDualFundedAssets)
+			throw new Error('Asset opening requires its enrolled original device');
+		this.rememberOpeningSession(
+			candidate,
+			peer,
+			terms,
+			channelKeyIndex,
+			remoteSecondPerCommitmentPoint,
+			undefined,
+			canonicalAssetOpeningEvidence(evidence)
+		);
+	}
+
+	loadAssetOpeningEvidence(channelId: string): IAssetOpeningEvidence | null {
+		return this.loadFinalOpeningSession(channelId)?.assetEvidence ?? null;
+	}
+
+	private rememberOpeningSession(
+		candidate: IFinalOpeningCandidate,
+		peer: string,
+		terms: IFinalOpeningTerms,
+		channelKeyIndex: number,
+		remoteSecondPerCommitmentPoint?: string,
+		updateLimits?: IFinalUpdateLimits,
+		assetEvidence?: IAssetOpeningEvidence
+	): void {
 		if (
 			!/^(02|03)[0-9a-f]{64}$/.test(peer) ||
 			!isValidPublicKey(Buffer.from(peer, 'hex')) ||
 			peer === JSON.parse(this.walletIdentity ?? '[]')[1]
 		)
 			throw new Error('Invalid final opening peer identity');
-		buildFinalOpeningCommitment(candidate, terms, 'local');
-		buildFinalOpeningCommitment(candidate, terms, 'remote');
+		storedOpeningCommitment(candidate, terms, 'local', assetEvidence);
+		storedOpeningCommitment(candidate, terms, 'remote', assetEvidence);
 		validateSecondPoint(remoteSecondPerCommitmentPoint, terms);
 		if (updateLimits !== undefined) validateUpdateLimits(updateLimits);
 		const session = {
+			...(assetEvidence && { assetEvidence }),
 			...(updateLimits && { updateLimits }),
 			peer,
 			terms: JSON.parse(canonicalTerms(terms)) as IFinalOpeningTerms,
@@ -1123,7 +1235,13 @@ export class SqliteStorage implements IStorageBackend {
 	): void {
 		if (this.db.inTransaction)
 			throw new Error('Final opening reservation requires a top-level commit');
-		const { encoded, fundingOutpoint } = validateFinalOpening(candidate);
+		const evidence = session?.assetEvidence;
+		const { encoded, fundingOutpoint } = evidence
+			? validateAssetOpening(
+					candidate,
+					Buffer.from(evidence.fundingRoot, 'hex')
+			  )
+			: validateFinalOpening(candidate);
 		const { channelId } = candidate;
 		const key = this.finalOpeningKey(channelId, fundingOutpoint);
 		this.db
@@ -1224,9 +1342,39 @@ export class SqliteStorage implements IStorageBackend {
 		fundingKey: Buffer,
 		keyIndex: number
 	): Buffer {
+		return this.previewOpeningNonce(
+			candidate,
+			validateFinalOpening(candidate),
+			fundingKey,
+			keyIndex
+		);
+	}
+
+	previewAssetOpeningTxComplete(
+		candidate: IFinalOpeningCandidate,
+		fundingRoot: Buffer,
+		fundingKey: Buffer,
+		keyIndex: number
+	): Buffer {
+		if (!this.canOpenDualFundedAssets)
+			throw new Error('Asset opening requires its enrolled original device');
+		return this.previewOpeningNonce(
+			candidate,
+			validateAssetOpening(candidate, fundingRoot),
+			fundingKey,
+			keyIndex
+		);
+	}
+
+	private previewOpeningNonce(
+		candidate: IFinalOpeningCandidate,
+		checked: ReturnType<typeof validateFinalOpening>,
+		fundingKey: Buffer,
+		keyIndex: number
+	): Buffer {
 		const authority = this.requireOpeningAuthority();
 		authority.requireAllocatedChannelKey(keyIndex);
-		const { encoded, fundingOutpoint } = validateFinalOpening(candidate);
+		const { encoded, fundingOutpoint } = checked;
 		const key = this.finalOpeningKey(candidate.channelId, fundingOutpoint);
 		const context = authority.nonceContext(this.openingNonceKey(key, encoded));
 		return localOpeningTxComplete(
@@ -1334,7 +1482,7 @@ export class SqliteStorage implements IStorageBackend {
 	assertFinalDaemonIdentity(nodeId: string): void {
 		if (
 			this.walletIdentity !==
-			JSON.stringify([this.updateWallet ? 2 : 1, nodeId, 'regtest'])
+			JSON.stringify([this.finalGeneration, nodeId, 'regtest'])
 		)
 			throw new Error('Expected the enrolled regtest final wallet identity');
 		const authority = this.requireOpeningAuthority();
@@ -2386,6 +2534,115 @@ export class SqliteStorage implements IStorageBackend {
 				sign
 			})
 		);
+	}
+
+	assetOpeningPayout(id: string, parent: string, raw?: Buffer): Buffer | null {
+		if (
+			!this.canOpenDualFundedAssets ||
+			!/^[0-9a-f]{64}$/.test(id) ||
+			!/^[0-9a-f]{64}$/.test(parent)
+		)
+			throw new Error('Asset payout requires the original wallet');
+		const auth = this.requireOpeningAuthority(),
+			slot = 'asset-payout/' + id + '/' + parent;
+		if (raw) {
+			if (raw.length > 400_000)
+				throw new Error('Asset payout exceeds standard weight');
+			auth.commitLifecycleEntry(slot, raw.toString('hex'));
+		}
+		const retained = auth.lifecycleEntry(slot);
+		return retained ? Buffer.from(retained, 'hex') : null;
+	}
+
+	prepareAssetOpeningWitnesses(channelId: string) {
+		if (!this.canOpenDualFundedAssets || this.db.inTransaction)
+			throw new Error(
+				'Asset funding witnesses require the enrolled original device outside a transaction'
+			);
+		const record = this.finalOpeningRecord(channelId);
+		if (!record) throw new Error('Unknown asset opening candidate');
+		return prepareAssetWitnessRelease(
+			record.candidate,
+			record.nonces,
+			record.nonceKey,
+			this.requireOpeningAuthority()
+		);
+	}
+
+	storeAssetOpeningWitnesses(channelId: string, witnesses: Buffer[][]): Buffer {
+		if (!this.canOpenDualFundedAssets)
+			throw new Error('Asset opening requires its enrolled original device');
+		return this.updateOpeningNonces(channelId, (state, candidate, key) => {
+			if (!state.session?.assetEvidence)
+				throw new Error('Missing asset opening proof material');
+			return recordOpeningFunding(
+				candidate,
+				state,
+				key,
+				this.openingAuthority,
+				{ witnesses }
+			);
+		});
+	}
+
+	/** A peer can broadcast the funding transaction and disconnect before returning its tx_signatures. */
+	rememberObservedAssetFunding(id: string, tx: Transaction): void {
+		const record = this.finalOpeningRecord(id);
+		if (
+			!this.canOpenDualFundedAssets ||
+			!record?.nonces.session?.assetEvidence ||
+			!record.nonces.signing?.fundingLocal
+		)
+			throw new Error('Missing original asset funding authorization');
+		const { candidate } = record;
+		const unsigned = tx.clone();
+		for (let i = 0; i < unsigned.ins.length; i++) unsigned.setWitness(i, []);
+		if (unsigned.toHex() !== candidate.fundingTxHex)
+			throw new Error(
+				'Observed funding transaction differs from the asset opening'
+			);
+		const packet = (local: boolean) =>
+			encodeTxSignaturesMessage({
+				channelId: Buffer.from(id, 'hex'),
+				txid: tx.getHash(),
+				witnesses: tx.ins
+					.filter((_input, i) => candidate.inputs[i].isLocal === local)
+					.map((input) => input.witness)
+			});
+		if (packet(true).toString('hex') !== record.nonces.signing.fundingLocal)
+			throw new Error(
+				'Observed funding transaction differs from the released wallet witnesses'
+			);
+		this.rememberFinalPeerTxSignatures(id, packet(false));
+	}
+
+	/** A process cut can leave the original device ahead of the wallet's last SQLite commit. */
+	private reconcileAssetOpeningWitnesses(): void {
+		const authority = this.requireOpeningAuthority();
+		const ids: string[] = [];
+		this.readFinalOpenings((candidate, state) => {
+			if (state.nonces.session?.assetEvidence) ids.push(candidate.channelId);
+		});
+		for (const id of ids) {
+			const saved = this.finalOpeningRecord(id)!.nonces.signing;
+			for (const field of ['fundingLocal', 'fundingPeer'] as const) {
+				const raw = authority.fundingWitnessResult(id, field);
+				if (saved?.[field]) {
+					if (raw?.toString('hex') !== saved[field])
+						throw new Error(
+							'Asset funding witness differs from the original device'
+						);
+				} else if (raw) {
+					if (field === 'fundingPeer')
+						this.rememberFinalPeerTxSignatures(id, raw);
+					else
+						this.storeAssetOpeningWitnesses(
+							id,
+							decodeTxSignaturesMessage(raw, { taproot: true }).witnesses
+						);
+				}
+			}
+		}
 	}
 
 	rememberFinalPeerTxSignatures(channelId: string, payload: Buffer): void {

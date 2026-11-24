@@ -10,11 +10,14 @@ import {
 import { loadBetterSqlite3 } from './sqlite-binding';
 import { nodeFs } from '../../utils/node-builtins';
 import { isValidPublicKey } from '../crypto/ecdh';
+import { finalWalletGeneration } from './final-wallet-generation';
 import { decryptValue, encryptValue, hkdfKey } from './encryption';
 
 export interface IFinalWalletBinding {
 	/** Distinct identity for fresh wallets that can revoke earlier exits. */
 	finalCommitmentUpdates?: boolean;
+	/** Fresh regtest wallets with authority to open dual-funded asset channels. */
+	dualFundedAssets?: boolean;
 	encryptionKey: Buffer;
 	nodeId: string;
 	network: 'mainnet' | 'testnet' | 'regtest' | 'signet';
@@ -47,18 +50,13 @@ export function finalWalletIdentity(
 		throw new Error('Invalid final wallet node ID');
 	if (!['mainnet', 'testnet', 'regtest', 'signet'].includes(binding.network))
 		throw new Error('Invalid final wallet network');
-	if (
-		binding.finalCommitmentUpdates !== undefined &&
-		typeof binding.finalCommitmentUpdates !== 'boolean'
-	)
-		throw new Error('Invalid final wallet update capability');
-	if (binding.finalCommitmentUpdates && binding.network !== 'regtest')
-		throw new Error('Final commitment updates require regtest');
-	return JSON.stringify([
-		binding.finalCommitmentUpdates ? 2 : 1,
-		binding.nodeId,
-		binding.network
-	]);
+	const generation = finalWalletGeneration(
+		binding.finalCommitmentUpdates,
+		binding.dualFundedAssets
+	);
+	if (generation !== 1 && binding.network !== 'regtest')
+		throw new Error('This final wallet generation requires regtest');
+	return JSON.stringify([generation, binding.nodeId, binding.network]);
 }
 
 export function assertUnusedWalletPath(path: string): void {

@@ -51,6 +51,19 @@ describe('the asset flag on a daemon channel row', () => {
 		expect(asset.capacitySats).to.equal(100_000);
 	});
 
+	it('marks daemon channel events from an original asset opening without legacy provider state', () => {
+		const mark = (
+			BeignetNode.prototype as unknown as {
+				assetChannelMark(this: unknown, id: Buffer): { auxiliary?: true };
+			}
+		).assetChannelMark;
+		const id = Buffer.alloc(32, 4);
+		const node = {
+			getAuxiliaryChannelInfo: () => undefined,
+			getChannel: () => ({ ...row, channelId: id, auxiliary: true })
+		};
+		expect(mark.call({ node }, id)).to.deep.equal({ auxiliary: true });
+	});
 	it("is documented for the API, with the balance key that holds an asset channel's sats", () => {
 		const spec = JSON.stringify(getOpenApiSpec());
 		expect(spec).to.include('"auxiliary":{"type":"boolean"');

@@ -7,6 +7,7 @@ import {
 	isFinalCommitmentUpdate
 } from './final-commitment-transport';
 import { FinalUpdateProtocolError } from '../storage/final-channel-updates';
+import { deriveChannelKeys, deriveLightningKeys } from '../keys/wallet-keys';
 import { Transaction } from 'bitcoinjs-lib';
 import { isValidPublicKey } from '../crypto/ecdh';
 import { ChannelState } from './types';
@@ -25,6 +26,7 @@ import { FinalChannelReadyProtocolError } from '../storage/final-opening-ready';
 import type { IFinalOpeningCandidate } from '../storage/final-opening-candidate';
 import type { IChannelManagerConfig } from './channel-manager';
 import {
+	localSendsFirst,
 	resumeFinalOpening,
 	type IFinalOpeningMessage,
 	type IFinalOpeningRuntime
@@ -40,6 +42,7 @@ interface IOpeningConnection {
 	peer: string;
 	established: boolean;
 	readySent: boolean;
+	pendingAssetReady?: Buffer;
 	openingRbfRefused?: boolean;
 	peerReestablish?: Buffer;
 	deferred?: IFinalOpeningMessage[];
@@ -285,13 +288,153 @@ export class FinalOpeningTransport {
 		this.queues.delete(id);
 	}
 
-	opened(peer: string, id: string): void {
+	opened(peer: string, id: string, reconnected = false): void {
 		this.track(peer, id);
+		if (reconnected) {
+			this.reconnected(peer, id);
+			return;
+		}
 		this.connections.set(id, { peer, established: true, readySent: false });
 	}
 
+	// A disconnect can replace the peer queue while the host is still signing.
+	private readonly assetFunding = new Map<string, Promise<Buffer>>();
+	private readonly assetSpendable = new Set<string>();
+	private readonly assetDepth = new Map<
+		string,
+		{
+			atDepth?: boolean;
+			height?: number;
+			imported: boolean;
+			tail: Promise<void>;
+		}
+	>();
+
+	private releaseAssetFunding(
+		id: string,
+		peer: string,
+		candidate: IFinalOpeningCandidate
+	): Promise<Buffer> | undefined {
+		const { storage, root, dualFunding } = this.runtime;
+		if (
+			!storage.canOpenDualFundedAssets ||
+			!storage.loadFinalOpeningExit(id) ||
+			!storage.loadFinalPeerCommitment(id) ||
+			(!localSendsFirst(
+				candidate,
+				deriveLightningKeys(root, 1).nodePublicKey,
+				peer
+			) &&
+				!storage.loadFinalPeerTxSignatures(id))
+		)
+			return;
+		const previous = this.assetFunding.get(id);
+		if (previous) return previous;
+		const evidence = storage.loadAssetOpeningEvidence(id);
+		if (!dualFunding || !evidence)
+			throw new Error('Missing asset funding provider or proof material');
+		const pending = (async () => {
+			const inputs = storage.prepareAssetOpeningWitnesses(id);
+			for (const [i, input] of inputs.tx.ins.entries()) {
+				const result = await this.verifyInput({
+					txid: input.hash,
+					vout: input.index,
+					scriptPubKey: inputs.prevouts.scripts[i]
+				});
+				if (result !== 'unspent')
+					throw new Error('Opening input is not verified unspent');
+			}
+			if (storage.loadFinalDaemonOpening(id)?.exitToBroadcast)
+				throw new Error('Asset opening is closing');
+			const stacks = await dualFunding.signFunding(
+				candidate,
+				Buffer.from(evidence.fundingProofs, 'hex'),
+				inputs.tx,
+				inputs.local,
+				inputs.prevouts
+			);
+			return storage.storeAssetOpeningWitnesses(id, stacks);
+		})().finally(() => this.assetFunding.delete(id));
+		this.assetFunding.set(id, pending);
+		return pending;
+	}
+
+	/** Channel readiness needs an unspent output as well as accepted proof imports. */
+	assetFundingSpendable(id: string, spendable: boolean): void {
+		if (spendable) this.assetSpendable.add(id);
+		else this.assetSpendable.delete(id);
+		const ready = spendable && !!this.assetDepth.get(id)?.imported;
+		if (this.hasDepth(id) !== ready) this.setDepth(id, ready);
+		const connection = this.connections.get(id);
+		if (ready && connection?.pendingAssetReady) {
+			const payload = connection.pendingAssetReady;
+			delete connection.pendingAssetReady;
+			this.queue(connection.peer, id, {
+				type: MessageType.CHANNEL_READY,
+				payload
+			});
+		}
+	}
+
+	/** A replacement tip can move the same transaction into another block at the same height. */
+	invalidateAssetFundingAnchor(id: string): void {
+		const old = this.assetDepth.get(id);
+		if (!old) return;
+		this.assetDepth.set(id, { tail: old.tail, imported: false });
+		this.assetFundingSpendable(id, false);
+	}
+
+	/** Proof ownership follows accepted funding history, including after a unilateral spend. */
+	assetFundingAnchor(id: string, atDepth: boolean, height?: number): void {
+		const prior = this.assetDepth.get(id);
+		if (prior?.atDepth === atDepth && (!atDepth || prior.height === height))
+			return;
+		const { storage, dualFunding } = this.runtime;
+		if (!storage.canOpenDualFundedAssets || !dualFunding) return;
+		const opening = storage.loadFinalDaemonOpening(id);
+		if (!opening?.session.assetEvidence) return;
+		const { candidate, session } = opening;
+		const proof = Buffer.from(session.assetEvidence!.fundingProofs, 'hex');
+		const state = { atDepth, height, imported: false, tail: Promise.resolve() };
+		this.assetDepth.set(id, state);
+		this.assetFundingSpendable(id, this.assetSpendable.has(id));
+		state.tail = (prior?.tail ?? Promise.resolve())
+			.then(async () => {
+				if (!atDepth) {
+					await dualFunding.retractFunding(candidate);
+					return;
+				}
+				if (this.assetDepth.get(id) !== state) return;
+				if (!storage.loadFinalFundingTransaction(id))
+					throw new Error('Asset funding witnesses are incomplete');
+				await dualFunding.confirmFunding(candidate, proof);
+				if (this.assetDepth.get(id) !== state) return;
+				state.imported = true;
+				this.assetFundingSpendable(id, this.assetSpendable.has(id));
+			})
+			.catch((error) => {
+				if (this.assetDepth.get(id) === state) {
+					this.assetDepth.delete(id);
+					this.setDepth(id, false);
+				}
+				this.refuse(Buffer.from(id, 'hex'), String(error));
+			});
+	}
+
 	fundingDepth(id: string, confirmed: boolean): void {
+		if (
+			this.runtime.storage.canOpenDualFundedAssets &&
+			this.runtime.storage.loadAssetOpeningEvidence(id)
+		) {
+			this.assetFundingSpendable(id, confirmed);
+			this.assetFundingAnchor(id, confirmed);
+			return;
+		}
 		this.splice?.fundingDepth(id, confirmed);
+		this.setDepth(id, confirmed);
+	}
+
+	private setDepth(id: string, confirmed: boolean): void {
 		if (confirmed) {
 			this.confirmed.add(id);
 			this.sendReady(id);
@@ -356,9 +499,10 @@ export class FinalOpeningTransport {
 		}
 	}
 
-	reconnected(peer: string): void {
+	reconnected(peer: string, onlyId?: string): void {
 		const { storage } = this.runtime;
 		for (const id of this.openingsByPeer.get(peer) ?? []) {
+			if (onlyId && id !== onlyId) continue;
 			const opening = storage.loadFinalDaemonOpening(id)!;
 			const { session, candidate } = opening;
 			if (session.peer !== peer) throw new Error('Final opening peer changed');
@@ -392,6 +536,22 @@ export class FinalOpeningTransport {
 				});
 				this.send(peer, MessageType.CHANNEL_REESTABLISH, payload);
 				continue;
+			}
+			if (session.assetEvidence && storage.canOpenDualFundedAssets) {
+				// Admission and nonce persistence can be separated by a power cut.
+				// Reestablish must carry the verification nonce promised during construction.
+				if (!storage.loadFinalLocalTxComplete(id)) {
+					const keys = deriveChannelKeys(
+						this.runtime.root,
+						1,
+						session.channelKeyIndex
+					);
+					storage.finalOpeningTxComplete(id, keys.fundingPrivkey);
+				}
+				if (!storage.loadFinalPeerTxComplete(id)) {
+					const promised = storage.loadAssetOpenStage(id, 'peerNonce');
+					if (promised) storage.rememberFinalPeerTxComplete(id, promised);
+				}
 			}
 			const nonce = storage.loadFinalLocalTxComplete(id);
 			const pair =
@@ -716,7 +876,11 @@ export class FinalOpeningTransport {
 						this.funded(candidate, full);
 						this.sendReady(id);
 					}
-					if (storage.loadFinalLocalTxComplete(id)) return;
+					if (
+						storage.loadFinalLocalTxComplete(id) &&
+						(!session.assetEvidence || storage.loadFinalLocalTxSignatures(id))
+					)
+						return;
 				}
 				if (connection && !connection.established)
 					throw new Error('Waiting for final channel_reestablish');
@@ -725,6 +889,17 @@ export class FinalOpeningTransport {
 						throw new Error(
 							'Final channel_ready requires an established connection'
 						);
+					if (session.assetEvidence && !this.hasDepth(id)) {
+						if (
+							connection.pendingAssetReady &&
+							!connection.pendingAssetReady.equals(message.payload)
+						)
+							throw new FinalChannelReadyProtocolError(
+								'Changed asset channel_ready'
+							);
+						connection.pendingAssetReady = Buffer.from(message.payload);
+						return;
+					}
 					storage.rememberFinalPeerChannelReady(
 						id,
 						message.payload,
@@ -760,6 +935,7 @@ export class FinalOpeningTransport {
 					);
 				let signer;
 				if (
+					!session.assetEvidence &&
 					storage.canSignFinalOpening &&
 					!storage.loadFinalLocalTxSignatures(id)
 				) {
@@ -793,6 +969,19 @@ export class FinalOpeningTransport {
 				);
 				for (const { type, payload } of response.messages)
 					this.send(peer, type, payload);
+				if (session.assetEvidence && !storage.loadFinalLocalTxSignatures(id)) {
+					const released = await this.releaseAssetFunding(id, peer, candidate);
+					if (
+						this.queues.get(id) !== active ||
+						storage.loadFinalDaemonOpening(id)?.exitToBroadcast
+					)
+						return;
+					if (released) {
+						this.send(peer, MessageType.TX_SIGNATURES, released);
+						response.fundingTx =
+							storage.loadFinalFundingTransaction(id) ?? undefined;
+					}
+				}
 				if (response.fundingTx) {
 					this.funded(candidate, response.fundingTx);
 					this.sendReady(id);

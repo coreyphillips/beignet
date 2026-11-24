@@ -5,9 +5,12 @@ export * from './revocation';
 export * from './anchor';
 
 // What a provider of asset channels builds the asset side of a commitment
-// and of a second-level HTLC transaction with (issue #2093). These four by
-// name: the rest of the taproot modules stays the engine's own.
+// and of a second-level HTLC transaction with (issue #2093). The opening also commits to the two
+// payout scripts and the anchor in each holder view.
 export {
+	buildTaprootToLocalOutput,
+	buildTaprootToRemoteOutput,
+	buildTaprootAnchorOutput,
 	buildTaprootOfferedHtlcOutput,
 	buildTaprootReceivedHtlcOutput,
 	buildTaprootSecondLevelOutput

@@ -7,6 +7,7 @@ import type { IFinalOpeningCandidate } from '../storage/final-opening-candidate'
 import type { FinalFundingWitnessSigner } from '../storage/final-opening-funding';
 
 export interface IFinalOpeningRuntime {
+	dualFunding?: import('./asset-opening-provider').IAuxiliaryDualFunding;
 	storage: SqliteStorage;
 	root: BIP32Interface;
 }
@@ -22,7 +23,7 @@ export interface IFinalOpeningResponse {
 }
 
 /** Interactive funding order uses raw input amounts, before change or fees. */
-function localSendsFirst(
+export function localSendsFirst(
 	candidate: IFinalOpeningCandidate,
 	node: Buffer,
 	peer: string
@@ -115,6 +116,7 @@ export function resumeFinalOpening(
 	let funding = ourFunding;
 	if (
 		!funding &&
+		!session.assetEvidence &&
 		original &&
 		exit &&
 		share &&
