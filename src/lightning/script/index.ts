@@ -16,7 +16,8 @@ export type {
 	ITaprootAuxLeaf,
 	ITaprootCommitOutput,
 	ITaprootHtlcOutput,
-	ITaprootLeafSpend
+	ITaprootLeafSpend,
+	TaprootOutputFormat
 } from './commitment-taproot';
 export { createTaprootFundingScript } from './funding-taproot';
 export type { ITaprootFundingScript } from './funding-taproot';

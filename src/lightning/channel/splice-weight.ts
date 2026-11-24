@@ -21,6 +21,9 @@ export const SPLICE_TX_BASE_WEIGHT = 42;
  */
 export const SHARED_FUNDING_INPUT_WEIGHT = 386;
 
+/** A P2TR shared input has a single 64-byte default sighash witness. */
+export const TAPROOT_SHARED_INPUT_WEIGHT = 230;
+
 /**
  * A P2WPKH wallet input: 41 bytes ×4 = 164 WU + witness (sig + pubkey) ≈ 108 WU.
  * Matches the per-input figures used by utils/transaction getByteCount.
@@ -49,6 +52,8 @@ export function outputWeight(scriptLen: number): number {
 export function estimateSpliceTxWeight(opts: {
 	/** Wallet inputs priced as P2WPKH. */
 	walletInputCount: number;
+	/** When the active outpoint is a final P2TR funding output. */
+	taprootSharedInput?: boolean;
 	/**
 	 * 2-of-2 funding inputs besides the shared one this channel always
 	 * spends: other channels' funding outpoints riding along (issue #1922),
@@ -67,7 +72,9 @@ export function estimateSpliceTxWeight(opts: {
 }): number {
 	let weight =
 		SPLICE_TX_BASE_WEIGHT +
-		SHARED_FUNDING_INPUT_WEIGHT +
+		(opts.taprootSharedInput
+			? TAPROOT_SHARED_INPUT_WEIGHT
+			: SHARED_FUNDING_INPUT_WEIGHT) +
 		opts.walletInputCount * P2WPKH_INPUT_WEIGHT +
 		(opts.fundingInputCount ?? 0) * SHARED_FUNDING_INPUT_WEIGHT +
 		(opts.fundingOutputCount ?? 0) * outputWeight(34) +

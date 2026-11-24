@@ -296,12 +296,19 @@ describe('Production Hardening 10', () => {
 			expect(stageStart).to.be.greaterThan(-1);
 			// The fulfill message is sent INSIDE the staged block, so the
 			// mutations and the send belong to one transition.
-			const stagedBlock = fulfillSection.substring(stageStart);
-			expect(stagedBlock).to.include('fulfillHtlc');
+			const decision = fulfillSection.match(
+				/const decision: RecoveryMutation\[\] = \[([\s\S]*?)\n\s*\];/
+			);
 			expect(
-				stagedBlock.indexOf('delete_payment_secret'),
-				'payment secret staged before the fulfill call'
-			).to.be.lessThan(stagedBlock.indexOf('fulfillHtlc'));
+				decision,
+				'settlement mutations are defined before staging'
+			).not.to.equal(null);
+			expect(decision!.index!).to.be.lessThan(stageStart);
+			expect(decision![1]).to.include('delete_payment_secret');
+			expect(decision![1]).to.include('payment_state');
+			expect(fulfillSection.substring(stageStart)).to.match(
+				/this\.withStagedMutations\(decision,\s*\(\) => \{\s*this\.channelManager\.fulfillHtlc\(/
+			);
 			// Channel state persisted separately AFTER fulfillHtlc (best-effort)
 			expect(fulfillSection).to.include('persistChannel');
 		});

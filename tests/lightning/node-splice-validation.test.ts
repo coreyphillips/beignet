@@ -1148,6 +1148,51 @@ describe('LightningNode transient splice refusals', function () {
 		node.destroy();
 	});
 
+	it('releases its own wallet selection when a peer starts a final splice first', async function () {
+		const node = createTestNode();
+		try {
+			const id = Buffer.alloc(32, 0x35);
+			const manager = (node as any).channelManager;
+			const input = makeInput(200_000);
+			const outpoint = {
+				txid: bitcoin.Transaction.fromBuffer(input.prevTx).getId(),
+				vout: input.prevOutputIndex
+			};
+			const released: Array<typeof outpoint> = [];
+			let selected = false;
+			manager.finalUpdateStatus = () => ({});
+			manager.finalOpeningInfo = () => [{ htlcUsable: true }];
+			manager.finalSpliceDust = () => 546n;
+			manager.config.finalOpening = {
+				storage: {
+					loadFinalOpeningSession: () => ({ peer: 'peer' }),
+					loadFinalSpliceAttempts: () =>
+						selected ? [{ intent: { initiator: false, inputs: [] } }] : []
+				}
+			};
+			manager.finalSplice = {};
+			manager.finalTransport = { updatesReady: () => !selected };
+			(node as any).fundingProvider = {
+				selectSpliceInputs: async () => {
+					selected = true;
+					return { inputs: [input], changeScript: p2wpkhScript() };
+				},
+				resolveFinalSpliceInputs: () => undefined,
+				releaseInputPledges: async (coins: typeof released) => {
+					released.push(...coins);
+				}
+			};
+			const failure = new Promise<string>((resolve) =>
+				node.once('node:error', (e) => resolve(e.message))
+			);
+			expect(node.spliceIn(id, 100000n, 253).ok).to.equal(true);
+			expect(await failure).to.include('requires live funding');
+			expect(released).to.deep.equal([outpoint]);
+		} finally {
+			node.destroy();
+		}
+	});
+
 	/**
 	 * Issue #655, the asynchronous half: spliceIn selects its wallet inputs
 	 * before anything reaches the channel, so a second caller passed the busy

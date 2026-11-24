@@ -1,3 +1,23 @@
+import { releasedFinalSpliceFunding } from './final-splice-state';
+import { FinalSpliceTransport } from './final-splice-transport';
+import type { FinalSplicePlan } from './final-splice-session';
+import type { IFinalFundingReference } from './final-splice-candidate';
+import { deriveChannelKeys } from '../keys/wallet-keys';
+import { InteractiveTxState } from '../interactive-tx/types';
+import { v2ReserveWeKeep, v2ReserveWeEnforce } from './htlc-policy';
+import type { SqliteStorage } from '../storage/sqlite-storage';
+import type { IFinalOpeningRuntime } from './final-opening-runtime';
+import { FinalUpdateDataLossError } from '../storage/final-channel-updates';
+import { isFinalCommitmentUpdate } from './final-commitment-transport';
+import type { IFinalOpeningMessage } from './final-opening-runtime';
+import { FinalOpeningTransport } from './final-opening-transport';
+import {
+	disposableFinalTxComplete,
+	enrollFinalNegotiation,
+	isFinalNegotiation,
+	snapshotFinalOpening
+} from './final-opening-negotiation';
+import { recordPeerTxComplete } from '../storage/final-opening-nonces';
 /**
  * BOLT 2: Channel Manager.
  *
@@ -33,11 +53,16 @@ import {
 	decodeChannelReadyMessage
 } from '../message/channel-funding';
 import {
+	encodeUpdateAddHtlcMessage,
+	encodeUpdateFailHtlcMessage,
+	encodeUpdateFulfillHtlcMessage,
+	encodeUpdateFailMalformedHtlcMessage,
 	decodeUpdateAddHtlcMessage,
 	decodeUpdateFulfillHtlcMessage,
 	decodeUpdateFailHtlcMessage,
 	decodeUpdateFailMalformedHtlcMessage,
 	decodeUpdateFeeMessage,
+	encodeUpdateFeeMessage,
 	decodeUpdateBlockheightMessage
 } from '../message/channel-update';
 import {
@@ -115,7 +140,8 @@ import {
 	buildAnchorOutput,
 	buildAnchorScript
 } from '../script/anchor';
-import type { IFundingProvider } from '../node/types';
+import type { IFundingProvider, IChannelInfo } from '../node/types';
+import type { IFinalOpeningCandidate } from '../storage/final-opening-candidate';
 import {
 	canSelectDualFundingInputs,
 	releaseInputPledgesBestEffort,
@@ -167,11 +193,20 @@ import {
 import type { IChannelState } from './channel-state';
 import { createOpenerState, createAcceptorState } from './channel-state';
 import {
+	assertLegacyCommitmentProfile,
+	isFinalTaprootTypeHex
+} from './commitment-profile';
+import {
 	deriveChannelId,
 	deriveV2TemporaryChannelId,
 	isValidShutdownScript
 } from './validation';
-import type { IChannelConfig, ChannelResult, IHtlcForwardTerms } from './types';
+import type {
+	IChannelConfig,
+	ChannelResult,
+	IHtlcForwardTerms,
+	IHtlcEntry
+} from './types';
 import {
 	DEFAULT_CHANNEL_CONFIG,
 	ChannelState,
@@ -181,6 +216,7 @@ import {
 	hasScidAliasChannelType,
 	isAnchorChannel,
 	isTaprootChannel,
+	finalTaprootOpenRefusal,
 	hasSimpleTaprootBit,
 	scidAliasAnnounceRefusal,
 	validateV2ChannelType,
@@ -413,6 +449,10 @@ function askAuxiliaryHost<T>(ask: () => T): T {
 }
 
 export interface IChannelManagerConfig {
+	/** Available only on the specifically enrolled final wallet daemon. */
+	finalOpening?: IFinalOpeningRuntime;
+	getFinalPreviousTransaction?: (displayTxid: string) => Promise<Buffer>;
+	finalOpeningNegotiated?: (peerPubkey: string, channelType: Buffer) => boolean;
 	/**
 	 * Where each batch's PERSIST_STATE commits before the sends it authorizes
 	 * leave (Recovery Protocol 5.1). Required, and the constructor throws
@@ -530,6 +570,8 @@ export interface IChannelManagerConfig {
 	 * to add).
 	 */
 	onChannelIndexAllocated?: (channelIndex: number) => void;
+	/** An original device can retain a higher index than a restored database. */
+	allocateChannelKeyIndex?: (minimum: number) => number;
 	/**
 	 * Fence on brand-new channels (issue #906). Consulted by every path that
 	 * would consume a fresh channel key index, the inbound acceptors
@@ -855,6 +897,23 @@ class CountedMap<K, V> extends Map<K, V> {
 	}
 }
 
+function finalHtlcLimits(
+	config: IChannelConfig,
+	reserve: bigint
+): {
+	htlcMinimumMsat: string;
+	maxHtlcValueInFlightMsat: string;
+	maxAcceptedHtlcs: number;
+	channelReserveSats: string;
+} {
+	return {
+		htlcMinimumMsat: config.htlcMinimumMsat.toString(),
+		maxHtlcValueInFlightMsat: config.maxHtlcValueInFlightMsat.toString(),
+		maxAcceptedHtlcs: config.maxAcceptedHtlcs,
+		channelReserveSats: reserve.toString()
+	};
+}
+
 /**
  * Manages multiple channels, dispatching messages between PeerManager
  * and Channel instances. Its events and their listener signatures are
@@ -1027,6 +1086,21 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 	private _walletDestinationScript: Buffer | null = null;
 	/** Funding provider used to attach wallet inputs for anchor fee bumps. */
 	private fundingProvider: IFundingProvider | null = null;
+	private readonly finalTransport?: FinalOpeningTransport;
+	private readonly finalSplice?: FinalSpliceTransport;
+	private readonly finalObservedFunding = new Map<
+		string,
+		Map<string, { height: number; parentAtDepth: boolean }>
+	>();
+	private readonly finalDepthByChannel = new Map<string, Set<string>>();
+	private readonly finalObservedClose = new Map<
+		string,
+		{ txid: string; state: ChannelState }
+	>();
+	private readonly finalPeerComplete = new WeakMap<
+		Channel,
+		{ tx: string; payload: Buffer; localSent: boolean }
+	>();
 	/**
 	 * Peer funding outpoints already submitted to verifyRemoteFundingInput,
 	 * keyed per channel instance as `txidHex:vout` (issue #311). Dedups the
@@ -1108,6 +1182,227 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		}
 		this.config = config;
 		this.persistence = config.persistence;
+		if (config.finalOpening && config.verifyRemoteFundingInput) {
+			this.finalSplice = new FinalSpliceTransport(
+				config.finalOpening,
+				() => this.fundingProvider,
+				config.verifyRemoteFundingInput,
+				config.getFinalPreviousTransaction,
+				(peer, type, payload) => this.sendMessage(peer, type, payload),
+				(id, f) => this.watchFinalSplice(id, f),
+				(raw) => this.emit('broadcast:tx', raw),
+				(id, txid) => {
+					this.updateFinalDepth(id);
+					this.emit(
+						'splice:complete',
+						Buffer.from(id, 'hex'),
+						Buffer.from(txid, 'hex').reverse()
+					);
+				},
+				(id, txid) => !!this.finalDepthByChannel.get(id)?.has(txid),
+				(id, reason) =>
+					this.emitContained('splice:aborted', Buffer.from(id, 'hex'), reason)
+			);
+			this.finalTransport = new FinalOpeningTransport(
+				config.finalOpening,
+				config.verifyRemoteFundingInput,
+				() => this.fundingProvider,
+				(peer, type, payload) => this.sendMessage(peer, type, payload),
+				(candidate, raw) => {
+					const hash = bitcoin.Transaction.fromBuffer(raw).getHash();
+					this.emit('broadcast:tx', raw);
+					this.emit(
+						'channel:opening',
+						Buffer.from(candidate.channelId, 'hex'),
+						hash
+					);
+				},
+				(id, reason) => this.emitContained('error', id, reason),
+				(peer) => {
+					const local = this.config.localFeatures;
+					const remote = this.peerManager?.getPeer(peer)?.getRemoteInit()
+						?.features;
+					const both = (feature: Feature): boolean =>
+						!!local?.hasFeature(feature) && !!remote?.hasFeature(feature);
+					return {
+						alias: both(Feature.SCID_ALIAS),
+						splice: both(Feature.SPLICE) && both(Feature.QUIESCE)
+					};
+				},
+				(peer, id, reason) => {
+					const storage = config.finalOpening!.storage;
+					if (storage.loadFinalFundingTransaction(id.toString('hex'))) {
+						const hex = id.toString('hex');
+						const exit = storage.requestFinalOpeningExit(
+							hex,
+							this.observedFinalExit(hex)
+						);
+						this.finalTransport?.closed(peer, id.toString('hex'));
+						this.emit('broadcast:tx', exit);
+						const wire = wireErrorPayloadFor(id, reason);
+						if (wire) this.sendMessage(peer, MessageType.ERROR, wire);
+					}
+					this.emitContained('error', id, reason);
+				},
+				(id, message) =>
+					this.deliverFinalUpdate(Buffer.from(id, 'hex'), message),
+				(id) => !this.finalSpliceQuiescent(id),
+				() => ({
+					script: this.getDefaultShutdownScript(),
+					blockHeight: this._currentBlockHeight,
+					feeratePerKw:
+						this.config.getClosingFeeratePerKw?.() ??
+						this.config.localConfig?.feeratePerKw ??
+						1000
+				}),
+				(raw) => this.emit('broadcast:tx', raw),
+				this.finalSplice,
+				(peer) => this.peerManager?.recyclePeer(peer, 1000)
+			);
+		}
+	}
+
+	private deliverFinalUpdate(
+		channelId: Buffer,
+		message: IFinalOpeningMessage
+	): void {
+		switch (message.type) {
+			case MessageType.UPDATE_ADD_HTLC: {
+				const add = decodeUpdateAddHtlcMessage(message.payload);
+				this.emit(
+					'htlc:forwarded',
+					channelId,
+					add.id,
+					add.amountMsat,
+					add.paymentHash
+				);
+				return;
+			}
+			case MessageType.UPDATE_FULFILL_HTLC: {
+				const done = decodeUpdateFulfillHtlcMessage(message.payload);
+				this.recordPreimage(sha256(done.paymentPreimage), done.paymentPreimage);
+				this.emit(
+					'htlc:fulfilled',
+					channelId,
+					done.id,
+					done.paymentPreimage,
+					true
+				);
+				return;
+			}
+			case MessageType.UPDATE_FAIL_HTLC: {
+				const failed = decodeUpdateFailHtlcMessage(message.payload);
+				this.emit(
+					'htlc:failed',
+					channelId,
+					failed.id,
+					failed.reason,
+					undefined
+				);
+				return;
+			}
+			case MessageType.UPDATE_FAIL_MALFORMED_HTLC: {
+				const failed = decodeUpdateFailMalformedHtlcMessage(message.payload);
+				this.emit(
+					'htlc:failed',
+					channelId,
+					failed.id,
+					failed.sha256OfOnion,
+					failed.failureCode
+				);
+				return;
+			}
+		}
+	}
+
+	private sendFinalUpdate(
+		id: string,
+		type: MessageType,
+		payload: Buffer
+	): ChannelResult {
+		try {
+			if (!this.finalTransport) throw new Error('Final transport unavailable');
+			this.finalTransport.localUpdate(id, type, payload);
+			return { ok: true, actions: [] };
+		} catch (err) {
+			const pending = this.finalUpdateStatus(id)?.pending;
+			// Once admitted, a send or signer failure is recoverable through reestablish.
+			// The node must retain the payment record and mapping to this HTLC.
+			if (
+				pending?.direction === 'local' &&
+				pending.type === type &&
+				pending.payload.equals(payload)
+			)
+				return { ok: true, actions: [], sendsWithheld: true };
+			return {
+				ok: false,
+				actions: [],
+				admissionRejected: true,
+				error: String(err)
+			};
+		}
+	}
+
+	finalRemoteHtlcMinimum(id: Buffer): bigint {
+		const session = this.config.finalOpening?.storage.loadFinalOpeningSession(
+			id.toString('hex')
+		);
+		return BigInt(session?.updateLimits?.remote.htlcMinimumMsat ?? '0');
+	}
+
+	finalOfferedHtlc(
+		id: string,
+		htlcId: bigint,
+		hash: Buffer
+	): {
+		amountMsat: bigint;
+		cltvExpiry: number;
+		onChain: boolean;
+		terminal: boolean;
+	} | null {
+		const storage = this.config.finalOpening?.storage;
+		if (!storage?.canUpdateFinalCommitments) return null;
+		const offer = storage.loadFinalOfferedHtlc(id, htlcId);
+		if (!offer?.paymentHash.equals(hash)) return null;
+		const terminal = storage.finalHtlcTimedOut(id, hash, htlcId);
+		return {
+			amountMsat: offer.amountMsat,
+			cltvExpiry: offer.cltvExpiry,
+			onChain:
+				terminal ||
+				this.finalObservedClose.has(id) ||
+				!!storage.loadFinalDaemonOpening(id)?.exitToBroadcast,
+			terminal
+		};
+	}
+
+	finalReceivedHtlc(id: Buffer, htlcId: bigint): IHtlcEntry | undefined {
+		const htlc = this.finalUpdateStatus(id.toString('hex'))?.htlcs.find(
+			(entry) => entry.offeredBy === 'peer' && entry.id === htlcId
+		);
+		return (
+			htlc && {
+				id: htlc.id,
+				direction: HtlcDirection.RECEIVED,
+				state: HtlcState.COMMITTED,
+				amountMsat: htlc.amountMsat,
+				paymentHash: htlc.paymentHash,
+				cltvExpiry: htlc.cltvExpiry,
+				onionRoutingPacket: htlc.onionPacket,
+				blindingPoint: htlc.blindingPoint,
+				addLocallyRevoked: true,
+				addRemotelyRevoked: true
+			}
+		);
+	}
+
+	finalUpdateStatus(
+		id: string
+	): ReturnType<SqliteStorage['loadFinalUpdateStatus']> {
+		const storage = this.config.finalOpening?.storage;
+		return storage?.canUpdateFinalCommitments
+			? storage.loadFinalUpdateStatus(id)
+			: null;
 	}
 
 	/**
@@ -1347,7 +1642,12 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		const refusal = this._newChannelRefusal();
 		if (refusal) throw new Error(refusal);
 		if (this.config.channelKeyDeriver) {
-			const idx = this._nextChannelIndex;
+			const minimum = this._nextChannelIndex;
+			const idx = this.config.allocateChannelKeyIndex
+				? this.config.allocateChannelKeyIndex(minimum)
+				: minimum;
+			if (!Number.isSafeInteger(idx) || idx < minimum || idx > 0x7fffffff)
+				throw new Error('Channel key allocator returned an invalid index');
 			// Issue #917: the allocation is made durable HERE, before the
 			// counter moves and before a single key is derived from the
 			// index, because everything downstream of this line can put our
@@ -2319,6 +2619,43 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		const emitRefusal = options?.emitRefusal !== false;
 		const idHex = channelId.toString('hex');
 		const channel = this.channels.get(idHex);
+		const update = !channel && this.finalUpdateStatus(idHex);
+		if (update) {
+			if (
+				options?.customRecords ||
+				options?.forwardTerms ||
+				options?.forwardOf ||
+				(options?.expectedHtlcId !== undefined &&
+					options.expectedHtlcId !== update.nextLocalHtlcId) ||
+				!Number.isSafeInteger(cltvExpiry) ||
+				this._currentBlockHeight < 1 ||
+				cltvExpiry <= this._currentBlockHeight ||
+				cltvExpiry >= 500000000 ||
+				cltvExpiry - this._currentBlockHeight >
+					Channel.MAX_HTLC_CLTV_EXPIRY_DELTA
+			) {
+				return {
+					ok: false,
+					actions: [],
+					error: 'Final HTLC parameters cannot be admitted',
+					admissionRejected: true
+				};
+			}
+			return this.sendFinalUpdate(
+				idHex,
+				MessageType.UPDATE_ADD_HTLC,
+				encodeUpdateAddHtlcMessage({
+					channelId,
+					id: update.nextLocalHtlcId,
+					amountMsat,
+					paymentHash,
+					cltvExpiry,
+					onionRoutingPacket,
+					blindingPoint,
+					skimmedFeeMsat
+				})
+			);
+		}
 		if (!channel) {
 			const error = `Channel not found: ${idHex}`;
 			if (emitRefusal) this.emit('error', channelId, error);
@@ -2385,6 +2722,18 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 	): ChannelResult {
 		const idHex = channelId.toString('hex');
 		const channel = this.channels.get(idHex);
+		if (!channel && this.finalUpdateStatus(idHex)) {
+			this.recordPreimage(sha256(preimage), preimage);
+			return this.sendFinalUpdate(
+				idHex,
+				MessageType.UPDATE_FULFILL_HTLC,
+				encodeUpdateFulfillHtlcMessage({
+					channelId,
+					id: htlcId,
+					paymentPreimage: preimage
+				})
+			);
+		}
 		if (!channel) {
 			const error = `Channel not found: ${idHex}`;
 			this.emit('error', channelId, error);
@@ -2650,6 +2999,15 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 	): ChannelResult {
 		const idHex = channelId.toString('hex');
 		const channel = this.channels.get(idHex);
+		if (!channel && this.finalUpdateStatus(idHex)) {
+			if (direction !== HtlcDirection.RECEIVED)
+				return { ok: false, actions: [], error: 'Final HTLC is not incoming' };
+			return this.sendFinalUpdate(
+				idHex,
+				MessageType.UPDATE_FAIL_HTLC,
+				encodeUpdateFailHtlcMessage({ channelId, id: htlcId, reason })
+			);
+		}
 		if (!channel) {
 			const error = `Channel not found: ${idHex}`;
 			this.emit('error', channelId, error);
@@ -2709,6 +3067,18 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 	): ChannelResult {
 		const idHex = channelId.toString('hex');
 		const channel = this.channels.get(idHex);
+		if (!channel && this.finalUpdateStatus(idHex)) {
+			return this.sendFinalUpdate(
+				idHex,
+				MessageType.UPDATE_FAIL_MALFORMED_HTLC,
+				encodeUpdateFailMalformedHtlcMessage({
+					channelId,
+					id: htlcId,
+					sha256OfOnion,
+					failureCode
+				})
+			);
+		}
 		if (!channel) {
 			const error = `Channel not found: ${idHex}`;
 			this.emit('error', channelId, error);
@@ -2963,6 +3333,16 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 	): ChannelResult {
 		const idHex = channelId.toString('hex');
 		const channel = this.channels.get(idHex);
+		if (!channel && this.finalUpdateStatus(idHex)) {
+			try {
+				if (!this.finalTransport)
+					throw new Error('Final transport unavailable');
+				this.finalTransport.initiateShutdown(idHex, scriptPubkey);
+				return { ok: true, actions: [] };
+			} catch (err) {
+				return { ok: false, actions: [], error: String(err) };
+			}
+		}
 		if (!channel) {
 			const error = `Channel not found: ${idHex}`;
 			this.emit('error', channelId, error);
@@ -3026,6 +3406,23 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 	updateChannelFee(channelId: Buffer, feeratePerKw: number): ChannelResult {
 		const idHex = channelId.toString('hex');
 		const channel = this.channels.get(idHex);
+		if (!channel && this.finalUpdateStatus(idHex)) {
+			if (
+				!Number.isSafeInteger(feeratePerKw) ||
+				feeratePerKw < 253 ||
+				feeratePerKw > 100000
+			)
+				return {
+					ok: false,
+					actions: [],
+					error: 'Commitment feerate is outside the permitted range'
+				};
+			return this.sendFinalUpdate(
+				idHex,
+				MessageType.UPDATE_FEE,
+				encodeUpdateFeeMessage({ channelId, feeratePerKw })
+			);
+		}
 		if (!channel) {
 			const error = `Channel not found: ${idHex}`;
 			this.emit('error', channelId, error);
@@ -3274,6 +3671,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 	): void {
 		// Before the channels forget their pre-commitment splices: a composite
 		// splice (issue #1922) ends with the connection and must hear it first.
+		this.finalTransport?.disconnected(peerPubkey);
 		this.emit('peer:disconnected', peerPubkey);
 		const openDiedOnDisconnect = (state: ChannelState): string => {
 			const base = `Peer disconnected during channel open (state: ${state})`;
@@ -3383,6 +3781,13 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 
 		for (const [tempId, channel] of this.tempChannels) {
 			if (this.channelPeers.get(tempId) !== peerPubkey) continue;
+			const finalId = channel.getChannelId()?.toString('hex');
+			if (
+				finalId &&
+				isFinalNegotiation(channel) &&
+				this.config.finalOpening?.storage.loadFinalOpeningSession(finalId)
+			)
+				continue;
 			const state = channel.getState();
 			// A dead unfunded v2 open still in the temp map: it errored as
 			// the tx_abort responder and the aborting peer disconnected
@@ -3439,6 +3844,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 	 * Handle peer reconnection: send channel_reestablish for all peer channels.
 	 */
 	handlePeerReconnected(peerPubkey: string): void {
+		this.finalTransport?.reconnected(peerPubkey);
 		for (const channel of this.getChannelsByPeer(peerPubkey)) {
 			if (channel.getState() === ChannelState.AWAITING_REESTABLISH) {
 				this.sendReestablish(peerPubkey, channel);
@@ -3567,6 +3973,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		keyIndex?: number | null,
 		perChannelKeys?: IPerChannelKeys | null
 	): void {
+		assertLegacyCommitmentProfile(channel.getFullState());
 		// Rows written before opens lowercased the caller's pubkey can carry
 		// any case, and inbound connections register the lowercase form.
 		peerPubkey = normalizeHexPubkey(peerPubkey);
@@ -3743,7 +4150,11 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 	 * Get the peer pubkey for a channel.
 	 */
 	getPeerForChannel(channelId: Buffer): string | undefined {
-		return this.channelPeers.get(channelId.toString('hex'));
+		const id = channelId.toString('hex');
+		return (
+			this.channelPeers.get(id) ??
+			this.config.finalOpening?.storage.loadFinalOpeningSession(id)?.peer
+		);
 	}
 
 	/**
@@ -3787,7 +4198,13 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 	 * included.
 	 */
 	listChannelPeers(): string[] {
-		return [...new Set(this.channelPeers.values())];
+		return [
+			...new Set([...this.channelPeers.values(), ...this.finalOpeningPeers()])
+		];
+	}
+
+	finalOpeningPeers(): string[] {
+		return Array.from(this.finalTransport?.peers() ?? []);
 	}
 
 	/**
@@ -3804,12 +4221,15 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 	 * listChannelPeers, a peer with only a pending open does not count.
 	 */
 	hasChannelWithPeer(pubkey: string): boolean {
-		return this.getOwnChannelIndex().peers.has(pubkey);
+		return this.countChannelsWithPeer(pubkey) > 0;
 	}
 
 	/** How many of `pubkey`'s channels hasChannelWithPeer counts. */
 	countChannelsWithPeer(pubkey: string): number {
-		return this.getOwnChannelIndex().peers.get(pubkey) ?? 0;
+		return (
+			(this.getOwnChannelIndex().peers.get(pubkey) ?? 0) +
+			(this.finalTransport?.count(pubkey) ?? 0)
+		);
 	}
 
 	private getOwnChannelIndex(): {
@@ -3856,6 +4276,33 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 	 * means the channel's current funding tx.
 	 */
 	handleFundingConfirmed(channelId: Buffer, confirmedTxidHex?: TxidHex): void {
+		const final = this.config.finalOpening?.storage.loadFinalDaemonOpening(
+			channelId.toString('hex')
+		);
+		if (final) {
+			if (confirmedTxidHex) {
+				const id = final.candidate.channelId;
+				const known = this.finalDepthByChannel.get(id) ?? new Set<string>();
+				known.add(confirmedTxidHex);
+				this.finalDepthByChannel.set(id, known);
+				const storage = this.config.finalOpening!.storage;
+				const a =
+					storage.canUpdateFinalCommitments &&
+					storage.loadFinalSpliceAttempts(id).slice(-1)[0];
+				if (
+					a &&
+					a.funded &&
+					bitcoin.Transaction.fromHex(a.funded).getId() === confirmedTxidHex
+				)
+					this.finalSplice?.depth(
+						id,
+						confirmedTxidHex,
+						!!this.finalTransport?.connected(id)
+					);
+				this.updateFinalDepth(id);
+			}
+			return;
+		}
 		const channel = this.channels.get(channelId.toString('hex'));
 		if (!channel) return;
 
@@ -3976,6 +4423,29 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		noDeadlineFeeRatePerVbyte?: number
 	): ChannelResult {
 		const idHex = channelId.toString('hex');
+		const storage = this.config.finalOpening?.storage;
+		const finalSession = storage?.loadFinalOpeningSession(idHex);
+		if (storage && finalSession) {
+			let exit: Buffer;
+			try {
+				exit = storage.requestFinalOpeningExit(
+					idHex,
+					this.observedFinalExit(idHex)
+				);
+				this.finalTransport?.closed(finalSession.peer, idHex);
+			} catch (err) {
+				return {
+					ok: false,
+					actions: [],
+					error: err instanceof Error ? err.message : String(err)
+				};
+			}
+			this.emit('broadcast:tx', exit);
+			return {
+				ok: true,
+				actions: [{ type: ChannelActionType.BROADCAST_TX, tx: exit }]
+			};
+		}
 		const channel = this.channels.get(idHex);
 		if (!channel) {
 			const error = `Channel not found: ${idHex}`;
@@ -4162,6 +4632,35 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		spentOutpoint?: { txid: string; outputIndex: number }
 	): ChainAction[] {
 		const channelIdHex = channelId.toString('hex');
+		const runtime = this.config.finalOpening;
+		if (
+			runtime?.storage.canUpdateFinalCommitments &&
+			runtime.storage.loadFinalOpeningSession(channelIdHex)
+		) {
+			const txid = spendingTx.getId();
+			const splice = runtime.storage
+				.loadFinalSpliceAttempts(channelIdHex)
+				.some((a) => {
+					const funding = releasedFinalSpliceFunding(a);
+					return (
+						funding &&
+						bitcoin.Transaction.fromHex(funding.fundingTxHex).getId() === txid
+					);
+				});
+			if (!splice) {
+				const mutual = runtime.storage.matchFinalSimpleCloseSpend(
+					channelIdHex,
+					spendingTx.toBuffer(),
+					runtime.root
+				);
+				this.finalObservedClose.set(channelIdHex, {
+					txid,
+					state: mutual ? ChannelState.CLOSED : ChannelState.FORCE_CLOSED
+				});
+				this.finalTransport?.fundingDepth(channelIdHex, false);
+			}
+			return [];
+		}
 		let monitor = this.monitors.get(channelIdHex);
 		const owner = this.channels.get(channelIdHex);
 		// Which funding the spend consumed decides the view the monitor
@@ -5000,6 +5499,10 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 	 */
 	handleMessage(peerPubkey: string, type: number, payload: Buffer): void {
 		try {
+			if (
+				this.finalTransport?.collectCommitmentBatch(peerPubkey, type, payload)
+			)
+				return;
 			if (this.isForeignChannelMessage(peerPubkey, type, payload)) {
 				// A peer quoting another peer's channel_id: drop it silently. BOLT 1
 				// only requires an error reply for our own closed/unknown channels,
@@ -5011,6 +5514,78 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 					`Ignoring ${type} for a channel owned by another peer`
 				);
 				return;
+			}
+			if (
+				this.finalTransport &&
+				payload.length >= 32 &&
+				(ChannelManager.OWNED_CHANNEL_MESSAGES.has(type) ||
+					type === MessageType.ERROR ||
+					type === MessageType.WARNING)
+			) {
+				const wireId = payload.subarray(0, 32);
+				const id = wireId.toString('hex');
+				const channel =
+					this.findChannelByChannelIdInTemp(wireId) ||
+					this.findTempChannel(wireId);
+				const finalId =
+					channel && isFinalNegotiation(channel)
+						? channel.getChannelId()?.toString('hex')
+						: undefined;
+				const session =
+					this.config.finalOpening!.storage.loadFinalOpeningSession(
+						finalId ?? id
+					);
+				if (session) {
+					if (session.peer !== peerPubkey || (finalId && finalId !== id))
+						return;
+					if (
+						this.finalSplice?.handles(id, type, payload) ||
+						type === MessageType.TX_INIT_RBF ||
+						type === MessageType.TX_ACK_RBF ||
+						type === MessageType.TX_ABORT ||
+						type === MessageType.TX_COMPLETE ||
+						type === MessageType.COMMITMENT_SIGNED ||
+						type === MessageType.TX_SIGNATURES ||
+						type === MessageType.CHANNEL_READY ||
+						type === MessageType.CHANNEL_REESTABLISH ||
+						(this.config.finalOpening!.storage.canUpdateFinalCommitments &&
+							(isFinalCommitmentUpdate(type) ||
+								type === MessageType.REVOKE_AND_ACK ||
+								type === MessageType.SHUTDOWN ||
+								type === MessageType.CLOSING_COMPLETE ||
+								type === MessageType.CLOSING_SIG))
+					)
+						this.finalTransport.queue(peerPubkey, id, {
+							type,
+							payload: Buffer.from(payload)
+						});
+					else
+						this.emitContained(
+							'error',
+							wireId,
+							'Message is outside the stored final opening'
+						);
+					return;
+				}
+				if (
+					channel &&
+					isFinalNegotiation(channel) &&
+					type !== MessageType.TX_ADD_INPUT &&
+					type !== MessageType.TX_ADD_OUTPUT &&
+					type !== MessageType.TX_REMOVE_INPUT &&
+					type !== MessageType.TX_REMOVE_OUTPUT &&
+					type !== MessageType.TX_COMPLETE &&
+					type !== MessageType.TX_ABORT &&
+					type !== MessageType.ERROR &&
+					type !== MessageType.WARNING
+				) {
+					this.emitContained(
+						'error',
+						wireId,
+						'Unexpected message before final opening agreement'
+					);
+					return;
+				}
 			}
 			switch (type) {
 				case MessageType.OPEN_CHANNEL:
@@ -5251,6 +5826,11 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 				msg.temporaryChannelId,
 				`open_channel refused: ${MAX_PENDING_INBOUND_OPENS_PER_PEER} opens from this peer are already pending`
 			);
+			return;
+		}
+		const finalRefusal = finalTaprootOpenRefusal(msg.channelType);
+		if (finalRefusal) {
+			this.refuseInboundOpen(peerPubkey, msg.temporaryChannelId, finalRefusal);
 			return;
 		}
 		// Asset channels (issue #2093). Only a node with a provider looks:
@@ -8922,6 +9502,14 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		}
 	): ChannelResult {
 		const idHex = channelId.toString('hex');
+		if (this.config.finalOpening?.storage.loadFinalOpeningSession(idHex)) {
+			this.releaseStaleSelectionPledges(newContribution?.topUpInputs ?? []);
+			return {
+				ok: false,
+				actions: [],
+				error: 'Fee replacement is unavailable for this final funding'
+			};
+		}
 		const channel =
 			this.channels.get(idHex) || this.findChannelByChannelIdInTemp(channelId);
 		if (!channel) {
@@ -9275,11 +9863,24 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		if (hasScidAliasChannelType(channelType)) {
 			channelFlags = (channelFlags ?? 0x01) & ~0x01;
 		}
-		const typeRefusal = validateV2ChannelType(
-			channelType,
-			this.config.localFeatures,
-			this.peerManager?.getPeer(peerPubkey)?.getRemoteInit()?.features
-		);
+		const final = isFinalTaprootTypeHex(channelType.toString('hex'));
+		const typeRefusal = final
+			? this.finalOpeningRefusal(
+					peerPubkey,
+					channelType,
+					channelFlags,
+					!!(
+						params.requestFunds ||
+						params.willFund ||
+						opts?.trusted ||
+						opts?.contribution
+					)
+			  )
+			: validateV2ChannelType(
+					channelType,
+					this.config.localFeatures,
+					this.peerManager?.getPeer(peerPubkey)?.getRemoteInit()?.features
+			  );
 		if (typeRefusal) {
 			throw new Error(`Cannot open a dual-funded (v2) channel: ${typeRefusal}`);
 		}
@@ -9343,7 +9944,8 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		};
 
 		channel.setMaxFundingSatoshis(this.maxFundingForPeer(peerPubkey));
-		this.configureZeroReserve(channel, peerPubkey);
+		if (final) enrollFinalNegotiation(channel);
+		else this.configureZeroReserve(channel, peerPubkey);
 		// initiateOpenV2 derives the BOLT-2 temporary_channel_id from our
 		// revocation basepoint (replacing the random stub), so key tempChannels
 		// AFTER it runs — otherwise accept_channel2 (which echoes the derived id)
@@ -9444,6 +10046,367 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		}
 	}
 
+	finalSpliceDust(id: string): bigint {
+		const terms =
+			this.config.finalOpening?.storage.loadFinalOpeningSession(id)?.terms;
+		if (!terms) throw new Error('Missing final splice terms');
+		return BigInt(
+			Math.max(546, terms.localDustLimitSatoshis, terms.remoteDustLimitSatoshis)
+		);
+	}
+	startFinalSplice(id: Buffer, plan: FinalSplicePlan): void {
+		const hex = id.toString('hex');
+		const r = this.config.finalOpening;
+		const peer = r?.storage.loadFinalOpeningSession(hex)?.peer;
+		const features =
+			peer && this.peerManager?.getPeer(peer)?.getRemoteInit()?.features;
+		if (
+			!this.finalSplice ||
+			!this.finalTransport?.updatesReady(hex) ||
+			!features ||
+			![Feature.SPLICE, Feature.QUIESCE].every(
+				(f) =>
+					features.hasFeature(f) && this.config.localFeatures?.hasFeature(f)
+			)
+		)
+			throw new Error(
+				'Final splice requires live funding and negotiated quiescence and splicing'
+			);
+		this.finalSplice.start(hex, plan);
+	}
+	private watchFinalSplice(id: string, ref: IFinalFundingReference): void {
+		const opening = this.config.finalOpening!.storage.loadFinalOpening(id)!;
+		const tx = bitcoin.Transaction.fromHex(ref.fundingTxHex),
+			output = tx.outs[ref.fundingOutputIndex];
+		this.emit(
+			'watch:final-opening',
+			Buffer.from(id, 'hex'),
+			tx.getId(),
+			ref.fundingOutputIndex,
+			opening.minimumDepth,
+			output.script,
+			output.value,
+			true
+		);
+	}
+	finalSpliceQuiescent(id: string): boolean {
+		const attempts =
+			this.config.finalOpening?.storage.loadFinalSpliceAttempts(id);
+		const latest = attempts?.[attempts.length - 1];
+		return (
+			!!latest &&
+			!latest.adopted &&
+			(!!latest.awaitingAbortEcho ||
+				(latest.aborted !== undefined
+					? !latest.inputsReleased
+					: !latest.funded ||
+					  latest.rbf === 'quiescent' ||
+					  latest.rbf === 'refused' ||
+					  (!!latest.localLock && !!latest.peerLock)))
+		);
+	}
+
+	private watchFinalOpening(candidate: IFinalOpeningCandidate): void {
+		const tx = bitcoin.Transaction.fromHex(candidate.fundingTxHex);
+		this.emit(
+			'watch:final-opening',
+			Buffer.from(candidate.channelId, 'hex'),
+			tx.getId(),
+			candidate.fundingOutputIndex,
+			candidate.minimumDepth,
+			tx.outs[candidate.fundingOutputIndex].script,
+			tx.outs[candidate.fundingOutputIndex].value
+		);
+	}
+
+	restoreFinalOpeningBroadcasts(): void {
+		for (const {
+			candidate,
+			funding,
+			exitToBroadcast
+		} of this.config.finalOpening?.storage.loadFinalDaemonOpenings() ?? []) {
+			this.watchFinalOpening(candidate);
+			const store = this.config.finalOpening!.storage;
+			if (store.canUpdateFinalCommitments) {
+				const id = candidate.channelId;
+				this.finalTransport?.restoreFinalSettlements(id);
+				for (const a of store.loadFinalSpliceAttempts(id)) {
+					if (a.aborted !== undefined) continue;
+					if (a.candidate) this.watchFinalSplice(id, a.candidate.funding);
+					if (a.funded && !a.adopted)
+						this.emit('broadcast:tx', Buffer.from(a.funded, 'hex'));
+				}
+				for (const raw of store.finalSimpleCloseTransactions(id))
+					this.emit('broadcast:tx', raw);
+			}
+			if (funding) this.emit('broadcast:tx', funding);
+			if (exitToBroadcast) this.emit('broadcast:tx', exitToBroadcast);
+		}
+	}
+
+	forgetFinalFundingConfirmation(id: Buffer, txid?: string): void {
+		const hex = id.toString('hex');
+		if (txid) this.finalDepthByChannel.get(hex)?.delete(txid);
+		else {
+			this.finalDepthByChannel.delete(hex);
+			this.finalObservedFunding.delete(hex);
+		}
+		this.updateFinalDepth(hex);
+	}
+	finalSpliceParent(
+		id: string,
+		txid: string
+	): IFinalFundingReference | undefined {
+		const storage = this.config.finalOpening?.storage;
+		if (!storage?.canUpdateFinalCommitments) return;
+		const a = storage.loadFinalSpliceAttempts(id).slice(-1)[0];
+		const ref = releasedFinalSpliceFunding(a);
+		if (
+			ref &&
+			a &&
+			!a.adopted &&
+			bitcoin.Transaction.fromHex(ref.fundingTxHex).getId() === txid
+		)
+			return a.intent.parent;
+		return undefined;
+	}
+	observeFinalFunding(
+		id: string,
+		txid: string,
+		height: number | undefined,
+		parentAtDepth: boolean
+	): void {
+		const seen = this.finalObservedFunding.get(id) ?? new Map();
+		if (height === undefined) seen.delete(txid);
+		else seen.set(txid, { height, parentAtDepth });
+		if (seen.size) this.finalObservedFunding.set(id, seen);
+		else this.finalObservedFunding.delete(id);
+		this.updateFinalDepth(id);
+		const storage = this.config.finalOpening?.storage;
+		if (height !== undefined && storage?.canUpdateFinalCommitments) {
+			const close = storage.loadFinalDaemonOpening(id)?.exitToBroadcast;
+			const hash = this.observedFinalExit(id);
+			if (
+				close &&
+				hash &&
+				!bitcoin.Transaction.fromBuffer(close).ins[0].hash.equals(hash) &&
+				storage
+					.loadFinalFundingExits(id)
+					.some((v) => v.fundingTxid.equals(hash))
+			)
+				this.emit('broadcast:tx', storage.requestFinalOpeningExit(id, hash));
+		}
+	}
+	private observedFinalExit(id: string): Buffer | undefined {
+		const storage = this.config.finalOpening?.storage;
+		if (!storage?.canUpdateFinalCommitments) return;
+		const seen = this.finalObservedFunding.get(id);
+		const opening = storage.loadFinalOpening(id);
+		if (!opening) return;
+		const txids = [bitcoin.Transaction.fromHex(opening.fundingTxHex).getId()];
+		for (const attempt of storage.loadFinalSpliceAttempts(id)) {
+			const funding = releasedFinalSpliceFunding(attempt);
+			if (funding)
+				txids.push(bitcoin.Transaction.fromHex(funding.fundingTxHex).getId());
+		}
+		// The newest observed descendant spends its ancestors, irrespective of journal order.
+		for (const txid of txids.reverse()) {
+			const observed = seen?.get(txid);
+			if (
+				(observed && (observed.height > 0 || observed.parentAtDepth)) ||
+				this.finalDepthByChannel.get(id)?.has(txid)
+			)
+				return Buffer.from(txid, 'hex').reverse();
+		}
+		return undefined;
+	}
+	private updateFinalDepth(id: string): void {
+		const storage = this.config.finalOpening?.storage;
+		const c = storage?.loadFinalOpening(id);
+		if (!c) return;
+		const attempts = storage!.canUpdateFinalCommitments
+			? storage!.loadFinalSpliceAttempts(id)
+			: [];
+		const adopted = [...attempts].reverse().find((a) => a.adopted);
+		const active =
+			adopted?.adopted ?? bitcoin.Transaction.fromHex(c.fundingTxHex).getId();
+		const candidate = releasedFinalSpliceFunding(attempts[attempts.length - 1]);
+		const live = this.finalDepthByChannel.get(id);
+		const pending = attempts[attempts.length - 1];
+		const next =
+			candidate && bitcoin.Transaction.fromHex(candidate.fundingTxHex).getId();
+		const parentSecured =
+			next &&
+			!pending.adopted &&
+			this.finalObservedFunding.get(id)?.get(next)?.parentAtDepth;
+		const confirmed = pending?.localLock
+			? !!live?.has(pending.localLock)
+			: !!parentSecured ||
+			  (!!live && (live.has(active) || (!!next && live.has(next))));
+		if (confirmed) this.finalObservedClose.delete(id);
+		if (this.finalTransport?.hasDepth(id) !== confirmed)
+			this.finalTransport?.fundingDepth(id, confirmed);
+	}
+
+	/** Act on the latest signed exit for an outpoint with live funding depth, even while disconnected. */
+	checkFinalHtlcDeadlines(
+		height: number,
+		claimMargin: number,
+		offeredGrace: number
+	): void {
+		const storage = this.config.finalOpening?.storage;
+		if (!storage?.canUpdateFinalCommitments) return;
+		for (const id of new Set([
+			...this.finalDepthByChannel.keys(),
+			...this.finalObservedFunding.keys()
+		])) {
+			if (this.finalObservedClose.has(id)) continue;
+			const channelId = Buffer.from(id, 'hex');
+			try {
+				const status = storage.loadFinalUpdateStatus(id);
+				if (!status || (!status.pending && !status.htlcs.length)) continue;
+				const opening = storage.loadFinalDaemonOpening(id);
+				if (!opening || opening.exitToBroadcast) continue;
+				const resolution = storage.loadFinalResolutionStates(id);
+				if (!resolution) continue;
+				const observed = this.observedFinalExit(id);
+				if (!observed) continue;
+				const known = new Set(
+					resolution.preimages.map((p) => sha256(p).toString('hex'))
+				);
+				for (const local of resolution.locals) {
+					const funding = bitcoin.Transaction.fromBuffer(local.tx).ins[0].hash;
+					if (!funding.equals(observed)) continue;
+					const atDeadline = local.htlcs.some((htlc) =>
+						htlc.offeredBy === 'local'
+							? height >= htlc.cltvExpiry + offeredGrace
+							: height >= htlc.cltvExpiry - claimMargin &&
+							  known.has(htlc.paymentHash.toString('hex'))
+					);
+					if (!atDeadline) continue;
+					const exit = storage.requestFinalOpeningExit(id, funding);
+					this.finalTransport?.closed(opening.session.peer, id);
+					this.emit('broadcast:tx', exit);
+					break;
+				}
+			} catch (err) {
+				this.emit(
+					'error',
+					channelId,
+					err instanceof Error ? err.message : String(err)
+				);
+			}
+		}
+	}
+
+	finalOpeningInfo(id?: Buffer): IChannelInfo[] {
+		const storage = this.config.finalOpening?.storage;
+		if (!storage) return [];
+		const opening = id && storage.loadFinalDaemonOpening(id.toString('hex'));
+		const openings = id
+			? opening
+				? [opening]
+				: []
+			: storage.loadFinalDaemonOpenings();
+		return openings.map(
+			({ candidate, session, funding, exitToBroadcast, readyExchanged }) => {
+				let status: ReturnType<ChannelManager['finalUpdateStatus']> = null;
+				let dataLoss = false;
+				try {
+					status = this.finalUpdateStatus(candidate.channelId);
+				} catch (error) {
+					if (!(error instanceof FinalUpdateDataLossError)) throw error;
+					dataLoss = true;
+				}
+				const close =
+					status && storage.loadFinalSimpleClose(candidate.channelId);
+				const adopted = storage.canUpdateFinalCommitments
+					? storage
+							.loadFinalSpliceAttempts(candidate.channelId)
+							.filter((a) => a.adopted)
+							.slice(-1)[0]?.candidate?.funding
+					: undefined;
+				const fundingRef = adopted ?? candidate;
+				const activeTx = bitcoin.Transaction.fromHex(fundingRef.fundingTxHex);
+				const seenClose = this.finalObservedClose.get(candidate.channelId);
+				const enabled =
+					!!status &&
+					!close &&
+					this.finalTransport?.updatesReady(candidate.channelId);
+				const localReady =
+					status && storage.loadFinalLocalChannelReady(candidate.channelId);
+				const alias =
+					localReady && decodeChannelReadyMessage(localReady).shortChannelId;
+				return {
+					channelId: Buffer.from(candidate.channelId, 'hex'),
+					channelType: Buffer.from(candidate.channelType, 'hex'),
+					peerPubkey: session.peer,
+					isPrivate: true,
+					isOpener: candidate.isInitiator,
+					state: dataLoss
+						? ChannelState.ERRORED
+						: seenClose
+						? seenClose.state
+						: exitToBroadcast
+						? ChannelState.FORCE_CLOSED
+						: close?.localTransaction || close?.peerTransaction
+						? ChannelState.CLOSED
+						: close?.locked
+						? ChannelState.NEGOTIATING_CLOSING
+						: close
+						? ChannelState.SHUTTING_DOWN
+						: enabled
+						? ChannelState.NORMAL
+						: this.finalTransport?.state(
+								candidate.channelId,
+								!!funding,
+								!!readyExchanged
+						  ) ??
+						  (funding
+								? ChannelState.AWAITING_FUNDING_CONFIRMED
+								: ChannelState.AWAITING_TX_SIGNATURES),
+					fundingTxid: activeTx.getId(),
+					fundingOutputIndex: fundingRef.fundingOutputIndex,
+					localBalanceMsat:
+						status?.localBalanceMsat ??
+						(dataLoss ? 0n : BigInt(candidate.localContributionSats) * 1000n),
+					remoteBalanceMsat:
+						status?.remoteBalanceMsat ??
+						(dataLoss ? 0n : BigInt(candidate.remoteContributionSats) * 1000n),
+					fundingSatoshis: BigInt(
+						activeTx.outs[fundingRef.fundingOutputIndex].value
+					),
+					...(alias && { shortChannelId: alias.toString('hex') }),
+					...(status && { htlcCount: status.htlcs.length }),
+					spendableOutboundMsat:
+						enabled && status && !status.pending
+							? status.spendableOutboundMsat
+							: 0n,
+					htlcUsable: !!enabled && !status?.pending
+				};
+			}
+		);
+	}
+
+	private finalOpeningRefusal(
+		peer: string,
+		type: Buffer,
+		flags: number | undefined,
+		unsupported: boolean
+	): string | null {
+		if (
+			!this.finalTransport ||
+			!this.config.finalOpening?.storage.canSignFinalOpening ||
+			!this.config.allocateChannelKeyIndex ||
+			!this.fundingProvider?.resolveFinalOpeningInputs ||
+			!this.config.finalOpeningNegotiated?.(peer, type)
+		)
+			return 'Final Taproot opening requires an enrolled wallet, verified inputs and negotiated peer features';
+		if (flags !== 0 || unsupported)
+			return 'Unsupported options for a private final Taproot opening';
+		return null;
+	}
+
 	private handleOpenChannel2(peerPubkey: string, payload: Buffer): void {
 		let msg: ReturnType<typeof decodeOpenChannel2Message>;
 		try {
@@ -9523,11 +10486,19 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		// or otherwise unsupported type accepted here would echo through
 		// ACCEPT_CHANNEL2 and then die at the commitment stage with a burnt
 		// key index and a stuck retained channel.
-		const typeRefusal = validateV2ChannelType(
-			msg.channelType ?? null,
-			localFeatures,
-			remoteInit?.features
-		);
+		const final = isFinalTaprootTypeHex(msg.channelType?.toString('hex'));
+		const typeRefusal = final
+			? this.finalOpeningRefusal(
+					peerPubkey,
+					msg.channelType!,
+					msg.channelFlags,
+					!!(msg.requestFunds || msg.disableChannelReserve)
+			  )
+			: validateV2ChannelType(
+					msg.channelType ?? null,
+					localFeatures,
+					remoteInit?.features
+			  );
 		if (typeRefusal) {
 			const reason = `open_channel2 refused: ${typeRefusal}`;
 			this.refuseInboundOpen(peerPubkey, msg.channelId, reason);
@@ -9675,7 +10646,8 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			}
 			channel.channelKeyIndex = chKeys.channelIndex;
 			channel.setMaxFundingSatoshis(this.maxFundingForPeer(peerPubkey));
-			this.configureZeroReserve(channel, peerPubkey);
+			if (final) enrollFinalNegotiation(channel);
+			else this.configureZeroReserve(channel, peerPubkey);
 			const tempId = msg.channelId.toString('hex');
 			this.tempChannels.set(tempId, channel);
 			this.channelPeers.set(tempId, peerPubkey);
@@ -9931,6 +10903,25 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 					sellerFundingSatoshis: bigint;
 			  }
 			| undefined;
+		if (
+			isFinalNegotiation(channel) &&
+			(msg.willFund ||
+				msg.disableChannelReserve ||
+				msg.minimumDepth < 1 ||
+				!msg.channelType?.equals(
+					session?.getOpenMsg()?.channelType ?? Buffer.alloc(0)
+				))
+		) {
+			this.processActions(
+				peerPubkey,
+				channel,
+				this.refusalActions(
+					msg.channelId,
+					'Invalid accept_channel2 for the final opening'
+				)
+			);
+			return;
+		}
 		if (msg.willFund && requestFunds) {
 			const ok = verifyWillFund(
 				msg.willFund.signature,
@@ -10484,12 +11475,119 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			this.findTempChannel(msg.channelId);
 		if (!channel) return;
 
+		if (isFinalNegotiation(channel)) {
+			const id = channel.getChannelId();
+			if (!id?.equals(msg.channelId))
+				throw new Error('Unexpected final opening channel id');
+			recordPeerTxComplete({}, id.toString('hex'), payload);
+			const snapshot = snapshotFinalOpening(channel, true);
+			if (snapshot)
+				this.finalPeerComplete.set(channel, {
+					tx: snapshot.candidate.fundingTxHex,
+					localSent:
+						channel.getDualFundingSession()?.getTxBuilder()?.getState() ===
+						InteractiveTxState.SENT_COMPLETE,
+					payload: Buffer.from(payload)
+				});
+			else this.finalPeerComplete.delete(channel);
+		}
 		const actions = channel.handleTxComplete();
 		// tx_complete may trigger our v2 commitment_signed, which sets the
 		// derived channelId — promote before processActions so PERSIST_STATE
 		// resolves the channel by its permanent id.
 		this._promoteV2ChannelIfReady(peerPubkey, channel);
 		this.processActions(peerPubkey, channel, actions);
+	}
+
+	private finalComplete(peer: string, channel: Channel, id: Buffer): void {
+		const runtime = this.config.finalOpening;
+		if (
+			!this.finalTransport ||
+			!runtime ||
+			!isFinalNegotiation(channel) ||
+			!channel.getChannelId()?.equals(id)
+		)
+			throw new Error('Missing final opening authority');
+		const session = channel.getDualFundingSession()!;
+		const agreed =
+			session.getTxBuilder()?.getState() === InteractiveTxState.COMPLETE;
+		const snapshot = snapshotFinalOpening(channel, !agreed);
+		if (!snapshot) {
+			if (agreed) throw new Error('Missing agreed final funding output');
+			this.sendMessage(
+				peer,
+				MessageType.TX_COMPLETE,
+				disposableFinalTxComplete(channel)
+			);
+			return;
+		}
+		const { candidate, terms } = snapshot;
+		const index = channel.channelKeyIndex;
+		if (index === undefined || index === null)
+			throw new Error('Missing opening key index');
+		if (!agreed) {
+			const key = deriveChannelKeys(runtime.root, 1, index).fundingPrivkey;
+			this.sendMessage(
+				peer,
+				MessageType.TX_COMPLETE,
+				runtime.storage.previewFinalOpeningTxComplete(candidate, key, index)
+			);
+			return;
+		}
+		const remote = candidate.isInitiator
+			? session.getAcceptMsg()!
+			: session.getOpenMsg()!;
+		const state = channel.getFullState();
+		const capacity = BigInt(
+			candidate.localContributionSats + candidate.remoteContributionSats
+		);
+		const dust = [
+			BigInt(terms.localDustLimitSatoshis),
+			BigInt(terms.remoteDustLimitSatoshis)
+		] as const;
+		const localReserve = state.remoteReserveWaived
+			? 0n
+			: v2ReserveWeEnforce(capacity, ...dust);
+		const remoteReserve = state.localReserveWaived
+			? 0n
+			: v2ReserveWeKeep(capacity, ...dust);
+		runtime.storage.rememberFinalOpeningSession(
+			candidate,
+			peer,
+			terms,
+			index,
+			remote.secondPerCommitmentPoint.toString('hex'),
+			runtime.storage.canUpdateFinalCommitments
+				? {
+						local: finalHtlcLimits(
+							channel.getFullState().localConfig,
+							localReserve
+						),
+						remote: finalHtlcLimits(
+							channel.getFullState().remoteConfig,
+							remoteReserve
+						)
+				  }
+				: undefined
+		);
+		this.finalTransport.opened(peer, candidate.channelId);
+		this.removeCurrentTempChannel(peer, channel);
+		this.watchFinalOpening(candidate);
+		const complete = this.finalPeerComplete.get(channel);
+		if (complete?.tx === candidate.fundingTxHex && complete.localSent) {
+			// This peer already received our final turn. Persist its exact nonce
+			// pair without sending another tx_complete after construction.
+			const key = deriveChannelKeys(runtime.root, 1, index).fundingPrivkey;
+			runtime.storage.finalOpeningTxComplete(candidate.channelId, key);
+		}
+		this.finalPeerComplete.delete(channel);
+		this.finalTransport.queue(
+			peer,
+			candidate.channelId,
+			complete?.tx === candidate.fundingTxHex
+				? { type: MessageType.TX_COMPLETE, payload: complete.payload }
+				: undefined
+		);
 	}
 
 	private handleTxSignaturesMsg(peerPubkey: string, payload: Buffer): void {
@@ -11094,7 +12192,8 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			this.findChannelByChannelIdInTemp(Buffer.from(idHex, 'hex')) !==
 				undefined ||
 			this.channelPeers.has(idHex) ||
-			this.channelIdReservations.has(idHex)
+			this.channelIdReservations.has(idHex) ||
+			!!this.config.finalOpening?.storage.loadFinalOpeningSession(idHex)
 		);
 	}
 
@@ -11111,7 +12210,15 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 	 * longer watches its funding).
 	 */
 	private _pendingInboundOpensFull(peerPubkey: string): boolean {
-		let pending = 0;
+		let pending =
+			this.config.finalOpening?.storage
+				.loadFinalDaemonOpenings()
+				.filter(
+					(opening) =>
+						!opening.candidate.isInitiator &&
+						opening.session.peer === peerPubkey &&
+						!this.finalTransport?.hasDepth(opening.candidate.channelId)
+				).length ?? 0;
 		for (const [tempId, channel] of this.tempChannels) {
 			if (
 				this.channelPeers.get(tempId) === peerPubkey &&
@@ -11142,6 +12249,8 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		peerPubkey: string,
 		channel: Channel
 	): boolean {
+		if (this.config.finalOpening?.storage.loadFinalOpeningSession(idHex))
+			return false;
 		const permanent = this.channels.get(idHex);
 		const temporary = this.tempChannels.get(idHex);
 		const derivedTemporary = this.findChannelByChannelIdInTemp(
@@ -11795,6 +12904,9 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			if (progress) progress.index = index;
 			const action = actions[index];
 			switch (action.type) {
+				case ChannelActionType.FINAL_OPENING_TX_COMPLETE:
+					this.finalComplete(peerPubkey, channel, action.channelId);
+					break;
 				case ChannelActionType.SEND_MESSAGE:
 					// A message the failed persist authorized must not reach the
 					// peer: the state that justifies it is not on disk.

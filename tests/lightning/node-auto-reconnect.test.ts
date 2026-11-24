@@ -115,8 +115,13 @@ function armRecovery(node: LightningNode): { dialed: string[] } {
 	return { dialed };
 }
 
-const ready = (node: LightningNode): Promise<void> =>
-	new Promise((resolve) => node.on('node:ready', () => resolve()));
+function runStartupRecovery(node: LightningNode): Promise<void> {
+	const ready = new Promise<void>((resolve) =>
+		node.once('node:ready', () => resolve())
+	);
+	(node as unknown as { autoReconnectPeers(): void }).autoReconnectPeers();
+	return ready;
+}
 
 const sleep = (ms: number): Promise<void> =>
 	new Promise((r) => setTimeout(r, ms));
@@ -127,9 +132,7 @@ describe('LightningNode startup recovery under autoReconnect', function () {
 		injectReestablishingChannel(node);
 		const { dialed } = armRecovery(node);
 
-		const readyPromise = ready(node);
-		(node as any).autoReconnectPeers();
-		await readyPromise;
+		await runStartupRecovery(node);
 		await sleep(50);
 
 		expect(dialed, 'a parked node calls nobody back').to.deep.equal([]);
@@ -141,11 +144,20 @@ describe('LightningNode startup recovery under autoReconnect', function () {
 		injectReestablishingChannel(node);
 		const { dialed } = armRecovery(node);
 
-		const readyPromise = ready(node);
-		(node as any).autoReconnectPeers();
-		await readyPromise;
+		await runStartupRecovery(node);
 
 		expect(dialed).to.deep.equal([PEER]);
 		node.destroy();
+	});
+	it('dials a saved final channel partner after a restart from the authenticated opening store', async () => {
+		const node = createTestNode(true);
+		node.getChannelManager().finalOpeningPeers = (): string[] => [PEER];
+		const { dialed } = armRecovery(node);
+		try {
+			await runStartupRecovery(node);
+			expect(dialed).to.deep.equal([PEER]);
+		} finally {
+			node.destroy();
+		}
 	});
 });

@@ -34,6 +34,7 @@ export enum ChannelActionType {
 	SPLICE_ABORTED = 'SPLICE_ABORTED',
 	SPLICE_REVERTED = 'SPLICE_REVERTED',
 	SPLICE_CONFLICT_REQUEST_READY = 'SPLICE_CONFLICT_REQUEST_READY',
+	FINAL_OPENING_TX_COMPLETE = 'FINAL_OPENING_TX_COMPLETE',
 	TX_SIGNATURES_NEEDED = 'TX_SIGNATURES_NEEDED',
 	SPLICE_TX_SIGNATURES_NEEDED = 'SPLICE_TX_SIGNATURES_NEEDED',
 	SPLICE_TX_NEGOTIATED = 'SPLICE_TX_NEGOTIATED',
@@ -684,6 +685,7 @@ export type ChannelAction =
 	| ISpliceAbortedAction
 	| ISpliceRevertedAction
 	| ISpliceConflictRequestReadyAction
+	| { type: ChannelActionType.FINAL_OPENING_TX_COMPLETE; channelId: Buffer }
 	| ITxSignaturesNeededAction
 	| ISpliceTxSignaturesNeededAction
 	| ISpliceTxNegotiatedAction

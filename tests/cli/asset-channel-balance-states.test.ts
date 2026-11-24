@@ -72,6 +72,7 @@ const FUNDED: Record<ChannelState, Figure> = {
 	[ChannelState.SENT_FUNDING_SIGNED]: 'assetChannelSats',
 	[ChannelState.AWAITING_FUNDING_CONFIRMED]: 'assetChannelSats',
 	[ChannelState.AWAITING_CHANNEL_READY]: 'assetChannelSats',
+	[ChannelState.CHANNEL_READY]: 'assetChannelSats',
 	[ChannelState.NORMAL]: 'assetChannelSats',
 	[ChannelState.SHUTTING_DOWN]: 'assetChannelClosingSats',
 	[ChannelState.NEGOTIATING_CLOSING]: 'assetChannelClosingSats',

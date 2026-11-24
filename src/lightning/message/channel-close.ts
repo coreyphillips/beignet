@@ -19,18 +19,20 @@
  *   [8: fee_satoshis]
  *   [4: locktime]
  *   [closing_tlvs]
- * where closing_tlvs carries the 64-byte signature(s):
+ * where ordinary closing_tlvs carries the 64-byte signature(s):
  *   type 1: closer_output_only
  *   type 2: closee_output_only
  *   type 3: closer_and_closee_outputs
  * closing_complete may carry two records (1 and 3); closing_sig must carry
  * exactly one, matching a field the closer sent (enforced in the state
- * machine, not the codec).
+ * machine, not the codec). Final Taproot uses 5/6/7 for partial signatures and
+ * adds the next closee nonce in closing_sig (22).
  */
 
 import type { CustomRecords } from './custom-records';
 import {
 	CUSTOM_RECORD_START,
+	MAX_LIGHTNING_PAYLOAD,
 	boundedLightningPayload,
 	customRecordEntries,
 	decodeWithCustomRecords
@@ -267,14 +269,92 @@ export interface IClosingCompleteMessage {
 	closeeOutputOnlySig?: Buffer;
 	/** Signature for a closing tx with both outputs (TLV 3). */
 	closerAndCloseeSig?: Buffer;
+	/** Final TLVs 5, 6 and 7 carry a 32-byte partial plus its 66-byte nonce
+	 * on a proposal, or the selected 32-byte partial alone on a reply. */
+	closerOutputOnlyPartialSig?: Buffer;
+	closeeOutputOnlyPartialSig?: Buffer;
+	closerAndCloseePartialSig?: Buffer;
 }
 
-/** Identical wire layout; exactly-one-sig is a state-machine rule. */
-export type IClosingSigMessage = IClosingCompleteMessage;
+/** A final closing_sig also supplies the closee nonce for the next fee proposal. */
+export interface IClosingSigMessage extends IClosingCompleteMessage {
+	nextCloseeNonce?: Buffer;
+}
+
+export interface ISimpleCloseCodecOptions {
+	/** Use the final Bitcoin Taproot channel's signature records. */
+	finalTaproot?: boolean;
+}
+
+type SimpleCloseName = 'closing_complete' | 'closing_sig';
 
 const CLOSING_TLV_TYPES = new Set<bigint>([1n, 2n, 3n]);
 
-function encodeSimpleCloseMessage(msg: IClosingCompleteMessage): Buffer {
+const FINAL_PARTIAL_SIG_FIELDS = [
+	[5n, 'closerOutputOnlyPartialSig'],
+	[6n, 'closeeOutputOnlyPartialSig'],
+	[7n, 'closerAndCloseePartialSig']
+] as const;
+const NEXT_CLOSEE_NONCE = 22n;
+const FINAL_COMPLETE_TYPES = new Set<bigint>(
+	FINAL_PARTIAL_SIG_FIELDS.map(([type]) => type)
+);
+const FINAL_SIG_TYPES = new Set([...FINAL_COMPLETE_TYPES, NEXT_CLOSEE_NONCE]);
+
+function finalClosingRecords(
+	msg: IClosingSigMessage,
+	name: SimpleCloseName
+): ITlvRecord[] {
+	if (
+		msg.closerOutputOnlySig !== undefined ||
+		msg.closeeOutputOnlySig !== undefined ||
+		msg.closerAndCloseeSig !== undefined
+	) {
+		throw new Error(`${name}: final Taproot requires partial signatures`);
+	}
+	const reply = name === 'closing_sig';
+	const length = reply ? 32 : 98;
+	const records: ITlvRecord[] = [];
+	for (const [type, field] of FINAL_PARTIAL_SIG_FIELDS) {
+		const value = msg[field];
+		if (value === undefined) continue;
+		if (!Buffer.isBuffer(value) || value.length !== length) {
+			throw new Error(
+				`${name}: partial signature TLV ${type} must be ${length} bytes`
+			);
+		}
+		records.push({ type, value });
+	}
+	if (records.length === 0 || (reply && records.length !== 1)) {
+		throw new Error(
+			`${name}: invalid number of final Taproot partial signatures`
+		);
+	}
+	// Only the lesser-paid party can omit its own output.
+	if (msg.closerOutputOnlyPartialSig && msg.closeeOutputOnlyPartialSig) {
+		throw new Error('Conflicting single-output closing proposals');
+	}
+	if (reply) {
+		if (
+			!Buffer.isBuffer(msg.nextCloseeNonce) ||
+			msg.nextCloseeNonce.length !== 66
+		) {
+			throw new Error('closing_sig requires a 66-byte next_closee_nonce');
+		}
+		records.push({ type: NEXT_CLOSEE_NONCE, value: msg.nextCloseeNonce });
+	} else if (msg.nextCloseeNonce !== undefined) {
+		throw new Error('next_closee_nonce is only valid on closing_sig');
+	}
+	return records;
+}
+
+function ordinaryClosingRecords(msg: IClosingSigMessage): ITlvRecord[] {
+	if (
+		msg.nextCloseeNonce !== undefined ||
+		FINAL_PARTIAL_SIG_FIELDS.some(([, field]) => msg[field] !== undefined)
+	) {
+		throw new Error('Taproot closing fields require the final Taproot format');
+	}
 	const sigRecords: ITlvRecord[] = [];
 	const pushSig = (type: bigint, sig?: Buffer): void => {
 		if (!sig) return;
@@ -290,15 +370,27 @@ function encodeSimpleCloseMessage(msg: IClosingCompleteMessage): Buffer {
 		throw new Error('closing message requires at least one signature TLV');
 	}
 
-	const fixed = Buffer.alloc(
-		32 +
-			2 +
-			msg.closerScriptPubkey.length +
-			2 +
-			msg.closeeScriptPubkey.length +
-			8 +
-			4
-	);
+	return sigRecords;
+}
+
+function encodeSimpleCloseMessage(
+	msg: IClosingSigMessage,
+	name: SimpleCloseName,
+	options: ISimpleCloseCodecOptions
+): Buffer {
+	const records = options.finalTaproot
+		? finalClosingRecords(msg, name)
+		: ordinaryClosingRecords(msg);
+	const tlvs = encodeTlvStream(records);
+	const fixedLength =
+		48 + msg.closerScriptPubkey.length + msg.closeeScriptPubkey.length;
+	if (options.finalTaproot) {
+		if (msg.channelId.length !== 32)
+			throw new Error(`${name}: channel_id must be 32 bytes`);
+		if (fixedLength + tlvs.length > MAX_LIGHTNING_PAYLOAD)
+			throw new Error('Lightning message exceeds BOLT 8 payload limit');
+	}
+	const fixed = Buffer.alloc(fixedLength);
 	let offset = 0;
 	msg.channelId.copy(fixed, offset);
 	offset += 32;
@@ -314,13 +406,15 @@ function encodeSimpleCloseMessage(msg: IClosingCompleteMessage): Buffer {
 	offset += 8;
 	fixed.writeUInt32BE(msg.locktime, offset);
 
-	return Buffer.concat([fixed, encodeTlvStream(sigRecords)]);
+	return Buffer.concat([fixed, tlvs]);
 }
 
 function decodeSimpleCloseMessage(
 	payload: Buffer,
-	name: string
-): IClosingCompleteMessage {
+	name: SimpleCloseName,
+	options: ISimpleCloseCodecOptions
+): IClosingSigMessage {
+	if (options.finalTaproot) boundedLightningPayload(payload);
 	// Minimum: channel_id + two empty-script length prefixes + fee + locktime
 	if (payload.length < 32 + 2 + 2 + 8 + 4) {
 		throw new Error(`${name} too short: got ${payload.length} bytes`);
@@ -356,15 +450,36 @@ function decodeSimpleCloseMessage(
 	offset += 4;
 
 	// Unknown even TLV types are rejected; unknown odd types are ignored.
-	const { records } = decodeTlvStream(payload, offset, CLOSING_TLV_TYPES);
-
-	const msg: IClosingCompleteMessage = {
+	const msg: IClosingSigMessage = {
 		channelId,
 		closerScriptPubkey,
 		closeeScriptPubkey,
 		feeSatoshis,
 		locktime
 	};
+	if (options.finalTaproot) {
+		const types =
+			name === 'closing_sig' ? FINAL_SIG_TYPES : FINAL_COMPLETE_TYPES;
+		const { records } = decodeTlvStream(payload, offset, types);
+		for (const record of records) {
+			if (CLOSING_TLV_TYPES.has(record.type)) {
+				throw new Error(
+					`${name}: unexpected ECDSA signature TLV ${record.type}`
+				);
+			}
+			if (record.type === NEXT_CLOSEE_NONCE) {
+				msg.nextCloseeNonce = record.value;
+			} else {
+				const entry = FINAL_PARTIAL_SIG_FIELDS.find(
+					([type]) => type === record.type
+				);
+				if (entry) msg[entry[1]] = record.value;
+			}
+		}
+		finalClosingRecords(msg, name);
+		return msg;
+	}
+	const { records } = decodeTlvStream(payload, offset, CLOSING_TLV_TYPES);
 	for (const record of records) {
 		if (!CLOSING_TLV_TYPES.has(record.type)) continue;
 		if (record.value.length !== 64) {
@@ -391,24 +506,32 @@ function decodeSimpleCloseMessage(
 
 /** Encode a `closing_complete` (type 40) message payload. */
 export function encodeClosingCompleteMessage(
-	msg: IClosingCompleteMessage
+	msg: IClosingCompleteMessage,
+	options: ISimpleCloseCodecOptions = {}
 ): Buffer {
-	return encodeSimpleCloseMessage(msg);
+	return encodeSimpleCloseMessage(msg, 'closing_complete', options);
 }
 
 /** Decode a `closing_complete` (type 40) message payload. */
 export function decodeClosingCompleteMessage(
-	payload: Buffer
+	payload: Buffer,
+	options: ISimpleCloseCodecOptions = {}
 ): IClosingCompleteMessage {
-	return decodeSimpleCloseMessage(payload, 'closing_complete');
+	return decodeSimpleCloseMessage(payload, 'closing_complete', options);
 }
 
 /** Encode a `closing_sig` (type 41) message payload. */
-export function encodeClosingSigMessage(msg: IClosingSigMessage): Buffer {
-	return encodeSimpleCloseMessage(msg);
+export function encodeClosingSigMessage(
+	msg: IClosingSigMessage,
+	options: ISimpleCloseCodecOptions = {}
+): Buffer {
+	return encodeSimpleCloseMessage(msg, 'closing_sig', options);
 }
 
 /** Decode a `closing_sig` (type 41) message payload. */
-export function decodeClosingSigMessage(payload: Buffer): IClosingSigMessage {
-	return decodeSimpleCloseMessage(payload, 'closing_sig');
+export function decodeClosingSigMessage(
+	payload: Buffer,
+	options: ISimpleCloseCodecOptions = {}
+): IClosingSigMessage {
+	return decodeSimpleCloseMessage(payload, 'closing_sig', options);
 }

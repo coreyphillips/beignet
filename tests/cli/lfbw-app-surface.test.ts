@@ -148,6 +148,9 @@ describe('LFBW app surface (issue #614)', () => {
 					'application/json'
 				]?.schema
 			);
+			expect((body?.properties as Schema).finalTaproot).to.include({
+				type: 'boolean'
+			});
 			const requestFunds = (body?.properties as Schema).requestFunds as Schema;
 			expect(propertiesOf(requestFunds)).to.have.members([
 				'requestedSats',

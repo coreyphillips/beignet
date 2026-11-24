@@ -79,6 +79,8 @@ property BeignetConfig.fforReceiveFunding?: FforReceiveFunding
 property BeignetConfig.fforSettle?: { enabled: boolean; maxBudgetMsat?: string | number; maxEpochBlocks?: number; feeBaseMsat?: number; feePpm?: number; }
 property BeignetConfig.fforSettleConcurrent?: boolean
 property BeignetConfig.fforWitness?: { enabled: boolean; maxMailboxes?: number; maxBytes?: number; }
+property BeignetConfig.finalCommitmentUpdates?: boolean
+property BeignetConfig.finalTaprootWallet?: boolean
 property BeignetConfig.forwardingEnabled?: boolean
 property BeignetConfig.guardianMaxBytesPerSet?: number
 property BeignetConfig.guardianMaxCiphertextBytes?: number
@@ -426,7 +428,7 @@ get BeignetNode.onchainWallet(): beignet#Wallet
 method BeignetNode.openChannel(pubkey: string, amountSats: number, opts?: IOpenChannelOptions): ChannelInfo
 method BeignetNode.openChannel(pubkey: string, amountSats: number, pushSats?: number, satsPerVbyte?: number, max?: boolean, trusted?: boolean): ChannelInfo
 method BeignetNode.openChannelAndWait(pubkey: string, amountSats: number, opts?: { pushSats?: number; timeoutMs?: number; }): Promise<ChannelInfo>
-method BeignetNode.openChannelV2(peerPubkey: string, params: { amountSats: number; fundingFeeratePerkw?: number; commitmentFeeratePerkw?: number; locktime?: number; requestFunds?: { requestedSats: number; blockheight: number; }; maxLeaseRates?: beignet/lightning#gossip.ILeaseRates; }): ChannelInfo
+method BeignetNode.openChannelV2(peerPubkey: string, params: { amountSats: number; finalTaproot?: boolean; fundingFeeratePerkw?: number; commitmentFeeratePerkw?: number; locktime?: number; requestFunds?: { requestedSats: number; blockheight: number; }; maxLeaseRates?: beignet/lightning#gossip.ILeaseRates; }): ChannelInfo
 method BeignetNode.openZeroConfChannel(peerPubkey: string, amountSats: number, pushSats?: number): ChannelInfo
 method BeignetNode.payInvoice(bolt11: string, opts?: IPayInvoiceOptions): Promise<PaymentInfo>
 method BeignetNode.payInvoice(bolt11: string, timeoutMs?: number, maxFeeSats?: number, amountSats?: number, metadata?: Record<string, string>, cltvLimit?: number, maxFeeMsat?: number | string): Promise<PaymentInfo>
@@ -632,6 +634,8 @@ property BeignetNodeOptions.fforReceiveFunding?: FforReceiveFunding
 property BeignetNodeOptions.fforSettle?: { enabled: boolean; maxBudgetMsat?: string | number; maxEpochBlocks?: number; feeBaseMsat?: number; feePpm?: number; }
 property BeignetNodeOptions.fforSettleConcurrent?: boolean
 property BeignetNodeOptions.fforWitness?: { enabled: boolean; maxMailboxes?: number; maxBytes?: number; }
+property BeignetNodeOptions.finalCommitmentUpdates?: boolean
+property BeignetNodeOptions.finalTaprootWallet?: boolean
 property BeignetNodeOptions.forwardingEnabled?: boolean
 property BeignetNodeOptions.guardianMaxBytesPerSet?: number
 property BeignetNodeOptions.guardianMaxCiphertextBytes?: number
@@ -790,7 +794,7 @@ property ChannelSendStatus.record?: beignet/lightning#channel.ICompositeSpliceRe
 property ChannelSendStatus.stage: ChannelSendStage
 property ChannelSendStatus.startedAt: number
 property ChannelSendStatus.txid?: TxidHex
-type ChannelStateString = 'NONE' | 'AWAITING_FUNDING_CONFIRMED' | 'AWAITING_CHANNEL_READY' | 'NORMAL' | 'SHUTTING_DOWN' | 'NEGOTIATING_CLOSING' | 'FORCE_CLOSED' | 'AWAITING_REESTABLISH' | 'CLOSED' | 'ERRORED' | 'ANNOUNCEMENT_READY'
+type ChannelStateString = 'NONE' | 'AWAITING_FUNDING_CONFIRMED' | 'AWAITING_CHANNEL_READY' | 'CHANNEL_READY' | 'NORMAL' | 'SHUTTING_DOWN' | 'NEGOTIATING_CLOSING' | 'FORCE_CLOSED' | 'AWAITING_REESTABLISH' | 'CLOSED' | 'ERRORED' | 'ANNOUNCEMENT_READY'
 interface ChannelSuggestion
 property ChannelSuggestion.alias?: string
 property ChannelSuggestion.channelCount: number

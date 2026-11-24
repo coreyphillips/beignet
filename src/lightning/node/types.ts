@@ -145,6 +145,20 @@ export interface IFeeBumpSelectionOpts {
 }
 
 export interface IFundingProvider {
+	resolveFinalSpliceInputs?(
+		request: import('../channel/final-splice-session').ISpliceSignatureRequest
+	): Promise<
+		import('../storage/final-opening-funding').FinalFundingWitnessSigner
+	>;
+
+	/** Recover the wallet signer for this exact final opening, including its original change and prevouts. */
+	resolveFinalOpeningInputs?(
+		candidate: import('../storage/final-opening-candidate').IFinalOpeningCandidate,
+		terms?: import('../channel/final-opening-commitment').IFinalOpeningTerms
+	): Promise<
+		import('../storage/final-opening-funding').FinalFundingWitnessSigner
+	>;
+
 	/**
 	 * Retire one fee action only after irrevocable resolution. With the
 	 * transaction that settled it named, the action is charged the fee coins
@@ -220,6 +234,8 @@ export interface IFundingProvider {
 	 * no longer holds (the transaction's own confirmed or in-mempool spend).
 	 */
 	pledgeTransactionInputs?(txHex: string): Promise<void>;
+	/** Renew locally owned inputs assigned to durable final opening candidates. */
+	renewFinalOpeningPledges?(): Promise<void>;
 
 	/**
 	 * Release the pledges holding these exact outpoints (optional). Called when
@@ -250,7 +266,8 @@ export interface IFundingProvider {
 	selectSpliceInputs?(
 		amountSats: bigint,
 		feeratePerKw: number,
-		opts?: IUtxoSelectionOpts
+		opts?: IUtxoSelectionOpts,
+		taprootSharedInput?: boolean
 	): Promise<{
 		inputs: import('../channel/channel').ISpliceWalletInput[];
 		changeScript: Buffer;
@@ -261,7 +278,10 @@ export interface IFundingProvider {
 	 * largest fundable amount at this feerate, computed with the same UTXO
 	 * filter and weight formula selectSpliceInputs will use.
 	 */
-	quoteSpliceIn?(feeratePerKw: number): {
+	quoteSpliceIn?(
+		feeratePerKw: number,
+		taprootSharedInput?: boolean
+	): {
 		spendableSats: bigint;
 		feeSats: bigint;
 		maxAmountSats: bigint;

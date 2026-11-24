@@ -1,10 +1,13 @@
 import { expect } from 'chai';
+import { rejects } from 'assert';
+import { opening } from '../helpers/final-opening';
 import crypto from 'crypto';
 import * as bitcoin from 'bitcoinjs-lib';
 import * as ecc from '@bitcoinerlab/secp256k1';
 import {
 	WalletFundingProvider,
-	IWalletLike
+	IWalletLike,
+	type ISpliceUtxo
 } from '../../../src/lightning/wallet/wallet-funding-provider';
 
 bitcoin.initEccLib(ecc);
@@ -406,6 +409,7 @@ describe('WalletFundingProvider', () => {
 		function createSpliceMockWallet(setup: IMockUtxoSetup): {
 			wallet: IWalletLike;
 			changeAddress: string;
+			txByHash: Map<string, { txid: string; hex: string }>;
 		} {
 			const walletNetwork = setup.walletNetwork ?? 'regtest';
 			const params = paramsByNetwork[walletNetwork];
@@ -490,8 +494,189 @@ describe('WalletFundingProvider', () => {
 				network: walletNetwork
 			};
 
-			return { wallet, changeAddress };
+			return { wallet, changeAddress, txByHash };
 		}
+
+		function finalWalletInputFixture(): {
+			provider: WalletFundingProvider;
+			wallet: IWalletLike;
+			candidate: ReturnType<typeof opening>;
+			tx: bitcoin.Transaction;
+			coin: ISpliceUtxo;
+			other: ISpliceUtxo;
+			descriptors: Map<
+				string,
+				Pick<ISpliceUtxo, 'address' | 'path' | 'publicKey'>
+			>;
+			changeScript: Buffer;
+			freeze: { freezeTag: string };
+			peer: bitcoin.Transaction;
+			scriptHash: (s: Buffer) => string;
+			prevouts: { scripts: Buffer[]; values: bigint[] };
+		} {
+			const { wallet, changeAddress, txByHash } = createSpliceMockWallet({
+				utxos: [{ valueSats: 90_770 }, { valueSats: 240000 }]
+			});
+			const [coin, other] = wallet.listUtxos!();
+			const candidate = opening();
+			const local = bitcoin.Transaction.fromHex(
+				txByHash.get(coin.tx_hash)!.hex
+			);
+			const peer = bitcoin.Transaction.fromHex(candidate.inputs[1].prevTxHex);
+			const tx = bitcoin.Transaction.fromHex(candidate.fundingTxHex);
+			tx.ins[0].hash = local.getHash();
+			candidate.inputs[0].prevTxHex = local.toHex();
+			const changeScript = bitcoin.address.toOutputScript(
+				changeAddress,
+				network
+			);
+			tx.addOutput(changeScript, 600);
+			candidate.outputSerialIds.push('4');
+			candidate.fundingTxHex = tx.toHex();
+			const changePriv = crypto
+				.createHash('sha256')
+				.update('splice-change')
+				.digest();
+			const change = ECPair.fromPrivateKey(changePriv, { network });
+			const changeDescriptor = {
+				address: changeAddress,
+				path: "m/84'/0'/0'/1/0",
+				publicKey: Buffer.from(change.publicKey).toString('hex')
+			};
+			const scriptHash = (sig: Buffer): string =>
+				bitcoin.crypto.sha256(sig).reverse().toString('hex');
+			const descriptors = new Map<
+				string,
+				Pick<ISpliceUtxo, 'address' | 'path' | 'publicKey'>
+			>([
+				[scriptHash(local.outs[0].script), coin],
+				[scriptHash(changeScript), changeDescriptor]
+			]);
+			wallet.getAddressFromScriptHash = (
+				hash
+			): ReturnType<NonNullable<IWalletLike['getAddressFromScriptHash']>> =>
+				descriptors.get(hash);
+			const originalKey = wallet.getPrivateKey!;
+			wallet.getPrivateKey = (coinPath): string =>
+				coinPath === changeDescriptor.path
+					? change.toWIF()
+					: originalKey(coinPath);
+			const freeze = {
+				tx_hash: coin.tx_hash,
+				tx_pos: coin.tx_pos,
+				freezeTag: 'funding-pledge',
+				frozenAt: Date.now()
+			};
+			wallet.listFrozenUtxos = (): (typeof freeze)[] => [freeze];
+			wallet.isUtxoFrozen = (hash, index): boolean =>
+				hash === coin.tx_hash && index === coin.tx_pos;
+			wallet.getChangeAddress = async (): Promise<never> => {
+				throw new Error('unexpected change selection');
+			};
+			wallet.send = async (): Promise<never> => {
+				throw new Error('unexpected reselection');
+			};
+			const provider = new WalletFundingProvider(wallet);
+			return {
+				provider,
+				wallet,
+				candidate,
+				tx,
+				coin,
+				other,
+				descriptors,
+				changeScript,
+				freeze,
+				peer,
+				scriptHash,
+				prevouts: {
+					scripts: [local.outs[0].script, peer.outs[0].script],
+					values: [BigInt(local.outs[0].value), BigInt(peer.outs[0].value)]
+				}
+			};
+		}
+
+		it('resolves only the exact retained final opening inputs and binds all prevouts and change before signing', async () => {
+			const { provider, wallet, candidate, tx, coin, other, prevouts } =
+				finalWalletInputFixture();
+			const sign = await provider.resolveFinalOpeningInputs(candidate);
+			const [witness] = sign(tx, [0], prevouts);
+			const decoded = bitcoin.script.signature.decode(witness[0]);
+			const pubkey = Buffer.from(coin.publicKey, 'hex');
+			expect(witness[1]).to.deep.equal(pubkey);
+			expect(
+				ecc.verify(
+					tx.hashForWitnessV0(
+						0,
+						bitcoin.payments.p2pkh({ pubkey }).output!,
+						Number(prevouts.values[0]),
+						decoded.hashType
+					),
+					pubkey,
+					decoded.signature
+				)
+			).to.equal(true);
+			expect(() => sign(tx, [1], prevouts)).to.throw();
+			expect(() =>
+				sign(tx, [0], {
+					...prevouts,
+					values: [prevouts.values[0], prevouts.values[1] + 1n]
+				})
+			).to.throw();
+			const changed = tx.clone();
+			changed.outs[1].value++;
+			expect(() => sign(changed, [0], prevouts)).to.throw();
+			wallet.listUtxos = (): ISpliceUtxo[] => [other];
+			expect(() => sign(tx, [0], prevouts)).to.throw();
+			await rejects(provider.resolveFinalOpeningInputs(candidate));
+		});
+
+		it('refuses stale amounts, foreign change, unowned pledges and a peer-designated wallet coin', async () => {
+			for (const fault of [
+				'amount',
+				'change',
+				'pledge',
+				'peer',
+				'descriptor',
+				'withheld-change'
+			]) {
+				const {
+					provider,
+					wallet,
+					candidate,
+					coin,
+					other,
+					descriptors,
+					freeze,
+					peer,
+					scriptHash,
+					changeScript
+				} = finalWalletInputFixture();
+				if (fault === 'amount')
+					wallet.listUtxos = (): ISpliceUtxo[] => [
+						{ ...coin, value: coin.value - 1 },
+						other
+					];
+				if (fault === 'change') descriptors.delete(scriptHash(changeScript));
+				if (fault === 'pledge') freeze.freezeTag = 'user';
+				if (fault === 'peer')
+					descriptors.set(scriptHash(peer.outs[0].script), other);
+				if (fault === 'descriptor')
+					wallet.listUtxos = (): ISpliceUtxo[] => [
+						{ ...coin, path: other.path },
+						other
+					];
+				if (fault === 'withheld-change') {
+					const withoutChange = bitcoin.Transaction.fromHex(
+						candidate.fundingTxHex
+					);
+					withoutChange.outs.pop();
+					candidate.fundingTxHex = withoutChange.toHex();
+					candidate.outputSerialIds.pop();
+				}
+				await rejects(provider.resolveFinalOpeningInputs(candidate), fault);
+			}
+		});
 
 		it('selects a single UTXO covering amount + fee and builds verifiable witnesses', async () => {
 			const { wallet, changeAddress } = createSpliceMockWallet({

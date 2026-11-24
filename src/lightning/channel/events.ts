@@ -111,6 +111,16 @@ export interface ChannelManagerEvents {
 		fundingOutputIndex: number,
 		minimumDepth: number
 	) => void;
+	/** Watch the authenticated funding output of a final opening. */
+	'watch:final-opening': (
+		channelId: Buffer,
+		txid: string,
+		index: number,
+		minimumDepth: number,
+		script: Buffer,
+		valueSat: number,
+		splice?: boolean
+	) => void;
 	/** Arm spend detection on the outpoints a splice superseded. */
 	'watch:presplice-spend': (channelId: Buffer) => void;
 	/** Watch this output for a spend. */
@@ -210,7 +220,7 @@ export interface ChannelManagerEvents {
 	// ─── Splices and quiescence ───
 
 	/** splice_locked exchanged both ways. */
-	'splice:complete': (channelId: Buffer) => void;
+	'splice:complete': (channelId: Buffer, finalFundingTxid?: Buffer) => void;
 	/** A splice negotiation was unwound by tx_abort. */
 	'splice:aborted': (channelId: Buffer, reason: string) => void;
 	/** The quiescence handshake behind a splice conflict revert request completed with this node as initiator. */
