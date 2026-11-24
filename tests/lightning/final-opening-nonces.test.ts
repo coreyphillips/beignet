@@ -217,28 +217,17 @@ describe('Final opening commitment nonce reservation', () => {
 		expect(emit).to.throw();
 	});
 
-	it('returns nonce bytes only when the database retains the reservation', async () => {
+	it('returns nonce bytes only when the original database retains the reservation', () => {
 		const candidate = opening();
 		store.rememberFinalOpening(candidate);
-		const fileCopy = path.join(directory, 'discarded-update.db');
-		await store.backup(fileCopy);
-		const copy = new Database(fileCopy, { fileMustExist: true });
-		try {
-			copy.exec(`CREATE TRIGGER preserve_old_row AFTER UPDATE OF nonces_json ON final_opening_candidates
+		const db = (store as unknown as { db: Database.Database }).db;
+		db.exec(`CREATE TRIGGER preserve_old_row AFTER UPDATE OF nonces_json ON final_opening_candidates
 			BEGIN
 				UPDATE final_opening_candidates SET nonces_json = OLD.nonces_json WHERE channel_id = OLD.channel_id;
 			END`);
-		} finally {
-			copy.close();
-		}
-		expect(() => {
-			const guarded = SqliteStorage.openFinalWallet(fileCopy, wallet);
-			try {
-				guarded.finalOpeningTxComplete(candidate.channelId, localFundingSecret);
-			} finally {
-				guarded.close();
-			}
-		}).to.throw();
+		expect(() =>
+			store.finalOpeningTxComplete(candidate.channelId, localFundingSecret)
+		).to.throw();
 	});
 
 	it('refuses nested writes and returns nothing when the independent durable write fails', () => {

@@ -1,3 +1,4 @@
+import type { IFinalOpeningSigning } from './final-opening-signing';
 import { getPublicKey, isValidPublicKey } from '../crypto/ecdh';
 import { generateNonce } from '../crypto/musig';
 import { hmacSha256, randomBytes } from '../crypto/provider';
@@ -10,6 +11,7 @@ import {
 export interface IFinalOpeningNonces {
 	local?: { salt: string; payload: string };
 	peer?: string;
+	signing?: IFinalOpeningSigning;
 }
 
 function validPayload(channelId: string, payload: Buffer): void {
@@ -55,7 +57,9 @@ export function decodeOpeningNonces(
 		!value ||
 		typeof value !== 'object' ||
 		Array.isArray(value) ||
-		Object.keys(value).some((key) => key !== 'local' && key !== 'peer')
+		Object.keys(value).some(
+			(key) => key !== 'local' && key !== 'peer' && key !== 'signing'
+		)
 	)
 		throw new Error('Invalid stored final opening nonces');
 	if (value.local !== undefined) {
@@ -72,6 +76,21 @@ export function decodeOpeningNonces(
 	return value;
 }
 
+/** The signer consumes the original BIP327 handle. Only its public bytes go on wire. */
+export function openingVerificationNonce(
+	height: 0 | 1,
+	salt: Buffer,
+	context: Buffer,
+	fundingPrivateKey: Buffer
+): Uint8Array {
+	return generateNonce({
+		publicKey: getPublicKey(fundingPrivateKey),
+		secretKey: fundingPrivateKey,
+		sessionId: hmacSha256(salt, Buffer.concat([context, Buffer.of(height)])),
+		extraInput: Buffer.from('beignet-final-opening-verification-v1')
+	});
+}
+
 /** Reserve verification nonces for commitment heights zero and one. A signing nonce has a separate lifecycle. */
 export function localOpeningTxComplete(
 	state: IFinalOpeningNonces,
@@ -86,21 +105,17 @@ export function localOpeningTxComplete(
 	const salt = state.local
 		? Buffer.from(state.local.salt, 'hex')
 		: randomBytes(32);
-	const verificationNonce = (height: number): Buffer =>
-		Buffer.from(
-			generateNonce({
-				publicKey,
-				secretKey: fundingPrivateKey,
-				sessionId: hmacSha256(
-					salt,
-					Buffer.concat([context, Buffer.of(height)])
-				),
-				extraInput: Buffer.from('beignet-final-opening-verification-v1')
-			})
-		);
+
 	const payload = encodeTxCompleteMessage({
 		channelId: Buffer.from(channelId, 'hex'),
-		commitNonces: { current: verificationNonce(0), next: verificationNonce(1) }
+		commitNonces: {
+			current: Buffer.from(
+				openingVerificationNonce(0, salt, context, fundingPrivateKey)
+			),
+			next: Buffer.from(
+				openingVerificationNonce(1, salt, context, fundingPrivateKey)
+			)
+		}
 	});
 	validPayload(channelId, payload);
 	if (state.local) {

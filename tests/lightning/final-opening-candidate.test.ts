@@ -388,26 +388,14 @@ describe('Final opening funding candidate', () => {
 		expect(store.loadFinalOpening(candidate.channelId)).to.equal(null);
 	});
 
-	it('only acknowledges a candidate that SQLite actually stored', async () => {
-		const copy = path.join(directory, 'aborted-write.db');
-		await store.backup(copy);
-		const db = new Database(copy);
-		try {
-			db.exec(
-				'CREATE TRIGGER interrupt_insert BEFORE INSERT ON final_opening_candidates BEGIN SELECT RAISE(IGNORE); END'
-			);
-		} finally {
-			db.close();
-		}
+	it('only acknowledges a candidate that SQLite actually stored', () => {
+		const db = (store as unknown as { db: Database.Database }).db;
+		db.exec(
+			'CREATE TRIGGER interrupt_insert BEFORE INSERT ON final_opening_candidates BEGIN SELECT RAISE(IGNORE); END'
+		);
 		const candidate = opening();
-		expect(() => {
-			const reopened = SqliteStorage.openFinalWallet(copy, wallet);
-			try {
-				reopened.rememberFinalOpening(candidate);
-			} finally {
-				reopened.close();
-			}
-		}).to.throw();
+		expect(() => store.rememberFinalOpening(candidate)).to.throw();
+		expect(store.loadFinalOpening(candidate.channelId)).to.equal(null);
 	});
 
 	it('refuses candidate storage on the legacy wallet format', () => {

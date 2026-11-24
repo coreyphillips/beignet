@@ -56,6 +56,14 @@ property IFinalOpeningCandidate.minimumDepth: number
 property IFinalOpeningCandidate.outputSerialIds: string[]
 property IFinalOpeningCandidate.remoteContributionSats: number
 property IFinalOpeningCandidate.remoteFundingPubkey: string
+unexported interface IFinalOpeningTerms
+property IFinalOpeningTerms.commitmentFeeratePerKw: number
+property IFinalOpeningTerms.localBasepoints: OpeningBasepoints
+property IFinalOpeningTerms.localDustLimitSatoshis: number
+property IFinalOpeningTerms.localToSelfDelay: number
+property IFinalOpeningTerms.remoteBasepoints: OpeningBasepoints
+property IFinalOpeningTerms.remoteDustLimitSatoshis: number
+property IFinalOpeningTerms.remoteToSelfDelay: number
 unexported interface IFinalWalletBinding
 property IFinalWalletBinding.encryptionKey: Buffer
 property IFinalWalletBinding.network: 'mainnet' | 'testnet' | 'regtest' | 'signet'
@@ -125,10 +133,12 @@ interface IStoredPaymentRef
 property IStoredPaymentRef.createdAt: number
 method IStoredPaymentRef.load(): beignet/lightning#node.IPaymentInfo | null
 property IStoredPaymentRef.paymentHash: string
+unexported type OpeningBasepoints = Record<keyof beignet/lightning#keys.IChannelBasepoints, string>
 class SqliteStorage implements beignet/lightning#storage.IStorageBackend
 constructor SqliteStorage(dbPath: string, onCorruptRow?: (error: unknown) => void, opts?: { encryptionKey?: Buffer; [boundWallet]?: string; })
 static readonly property SqliteStorage.CURRENT_SCHEMA_VERSION = 21
 get SqliteStorage.[finalWalletStorage](): boolean
+method SqliteStorage.acceptFinalPeerCommitment(channelId: string, terms: IFinalOpeningTerms, keys: bip32#BIP32Interface, channelKeyIndex: number, payload: Buffer): Buffer
 method SqliteStorage.addWatchtowerUpdate(update: beignet/lightning#watchtower.IWatchtowerUpdate): number
 method SqliteStorage.auxiliaryRevokedCommitmentsSize(channelId: string): { rows: number; bytes: number; }
 method SqliteStorage.backup(destPath: string): Promise<void>
@@ -200,8 +210,12 @@ method SqliteStorage.loadChannel(id: string): { state: beignet/lightning#channel
 method SqliteStorage.loadChannelKeyIndex(channelId: string): number | null
 method SqliteStorage.loadCompositeSplice(id: string): beignet/lightning#channel.ICompositeSpliceRecord | null
 method SqliteStorage.loadFforVoucher(id: string): beignet/lightning#ffor.IFforVoucherArchive | null
+method SqliteStorage.loadFinalLocalTxComplete(channelId: string): Buffer | null
 method SqliteStorage.loadFinalOpening(channelId: string): IFinalOpeningCandidate | null
+method SqliteStorage.loadFinalOpeningExit(channelId: string): Buffer | null
+method SqliteStorage.loadFinalOpeningTerms(channelId: string): IFinalOpeningTerms | null
 method SqliteStorage.loadFinalOpenings(): IFinalOpeningCandidate[]
+method SqliteStorage.loadFinalPeerCommitment(channelId: string): Buffer | null
 method SqliteStorage.loadFinalPeerTxComplete(channelId: string): Buffer | null
 method SqliteStorage.loadGossipChannelsAfter(afterRowid: number, limit: number): beignet/lightning#storage.IGossipRowPage<beignet/lightning#gossip.IGraphChannel>
 method SqliteStorage.loadGossipNodesAfter(afterRowid: number, limit: number): beignet/lightning#storage.IGossipRowPage<beignet/lightning#gossip.IGraphNode>
@@ -267,6 +281,7 @@ method SqliteStorage.setOutboxDisposition(id: number, disposition: beignet/light
 method SqliteStorage.setOutboxFrameSequence(ids: number[], frameSequence: number): void
 method SqliteStorage.setRecoveryMeta(key: string, value: string): void
 method SqliteStorage.setWatchtowerSessionProgress(sessionId: string, seqNum: number, lastApplied: number): void
+method SqliteStorage.signFinalPeerCommitment(channelId: string, terms: IFinalOpeningTerms, keys: bip32#BIP32Interface, channelKeyIndex: number): Buffer
 method SqliteStorage.transaction<T>(fn: () => T): T
 method SqliteStorage.unreadableAssetChannelIds(): string[]
 method SqliteStorage.updateQueueEntryStatus(id: string, status: string, error?: string, completedAt?: number): void
