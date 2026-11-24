@@ -41,11 +41,21 @@ interface Binding {
 	initiator: boolean;
 }
 type Wire = Extract<FinalSpliceEvent, { kind: 'wire' }>;
-type Entry = Binding &
+export interface IAssetSpliceConstructionTerms {
+	feerate: number;
+	localFeeBudget: string;
+	dust: string;
+}
+export type AssetSpliceConstructionEvent = Binding &
 	(
-		| { kind: 'construction-start'; localComplete: string }
+		| {
+				kind: 'construction-start';
+				localComplete: string;
+				terms: IAssetSpliceConstructionTerms;
+		  }
 		| { kind: 'construction-frame'; local: boolean; type: M; payload: string }
 	);
+type Entry = AssetSpliceConstructionEvent;
 function complete(raw: Buffer, id: Buffer): Nonces {
 	const m = decodeTxCompleteMessage(raw, { taproot: true });
 	if (
@@ -142,15 +152,27 @@ export class AssetSpliceConstruction {
 			});
 		}
 		this.turns = alternatingConstructionTurns(sides);
-		if (this.turns.some(t => t.payload && t.payload.length > MAX_LIGHTNING_PAYLOAD))
-			throw new Error('Asset splice construction exceeds the BOLT payload limit');
+		if (
+			this.turns.some(
+				(t) => t.payload && t.payload.length > MAX_LIGHTNING_PAYLOAD
+			)
+		)
+			throw new Error(
+				'Asset splice construction exceeds the BOLT payload limit'
+			);
 		const head = store.readAssetSpliceJournal<Entry>(this.idHex);
 		const saved = head.records.find(
 			(r) =>
 				r.kind === 'construction-start' && r.attempt === this.binding.attempt
 		);
 		if (!saved) {
-			if (head.records.some(r => r.kind === 'construction-frame' && r.attempt === this.binding.attempt))
+			if (
+				head.records.some(
+					(r) =>
+						r.kind === 'construction-frame' &&
+						r.attempt === this.binding.attempt
+				)
+			)
 				throw new Error('Asset splice frames lack their initial reservation');
 			const localKeys = new Set(
 				nonceKeys(complete(this.localComplete, this.id))
@@ -173,6 +195,11 @@ export class AssetSpliceConstruction {
 			store.appendAssetSpliceEvent(this.idHex, head, {
 				kind: 'construction-start',
 				...this.binding,
+				terms: {
+					feerate: this.terms.feerate,
+					localFeeBudget: String(this.terms.localFeeBudget),
+					dust: String(this.terms.dust)
+				},
 				localComplete: this.localComplete.toString('hex')
 			} satisfies Entry);
 		}
@@ -216,7 +243,10 @@ export class AssetSpliceConstruction {
 			if (entry.kind === 'construction-start') {
 				if (
 					started ||
-					entry.localComplete !== this.localComplete.toString('hex')
+					entry.localComplete !== this.localComplete.toString('hex') ||
+					entry.terms.feerate !== this.terms.feerate ||
+					entry.terms.localFeeBudget !== String(this.terms.localFeeBudget) ||
+					entry.terms.dust !== String(this.terms.dust)
 				)
 					throw new Error('Asset splice nonce reservation changed');
 				started = true;
@@ -307,7 +337,8 @@ export class AssetSpliceConstruction {
 			: undefined;
 	}
 	receive(type: M, payload: Buffer): void {
-		if (payload.length > MAX_LIGHTNING_PAYLOAD) throw new Error('Oversize asset splice frame');
+		if (payload.length > MAX_LIGHTNING_PAYLOAD)
+			throw new Error('Oversize asset splice frame');
 		const s = this.state(),
 			raw = payload.toString('hex');
 		if (s.frames.some((m) => !m.local && m.type === type && m.payload === raw))

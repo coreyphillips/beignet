@@ -9,10 +9,22 @@ export type AssetWalletInputEvent =
 	| { kind: 'wallet-inputs'; attempt: string; parent: string; inputs: string[] }
 	| { kind: 'wallet-inputs-aborted'; attempt: string };
 
-type JournalEvent =
+export type AssetSpliceLockJournalEvent =
+	| {
+			kind: 'asset-splice-lock';
+			event: IAssetSpliceLockEvent;
+			blockHeight?: number;
+	  }
+	| {
+			kind: 'asset-splice-imported';
+			finalDigest: string;
+			txid: string;
+			blockHash: string;
+	  };
+export type AssetWalletJournalEvent =
 	| AssetWalletInputEvent
 	| AssetSpliceExitEvent
-	| IAssetSpliceLockEvent;
+	| AssetSpliceLockJournalEvent;
 const txid = /^[a-f0-9]{64}$/;
 export function assetSpliceAttemptId(id: string): void {
 	if (typeof id !== 'string' || id.length !== 64 || !txid.test(id))
@@ -39,7 +51,9 @@ export function checkedWalletInputs(inputs: readonly string[]): string[] {
 	return [...seen].sort();
 }
 
-export function assetWalletInputState(records: readonly JournalEvent[]) {
+export function assetWalletInputState(
+	records: readonly AssetWalletJournalEvent[]
+) {
 	const attempts = new Map<
 		string,
 		{ parent: string; inputs: string[]; aborted: boolean }
@@ -91,29 +105,89 @@ export function assetWalletInputState(records: readonly JournalEvent[]) {
 	return { attempts, irreversible, signedParents, reserved };
 }
 
-/** Select the funding output acknowledged by the two peers and the original device. */
-export function currentAssetWalletParent(
-	records: readonly JournalEvent[],
+/** Replay bilateral adoption and the independent wallet import in journal order. */
+export function assetWalletFundingInfo(
+	records: readonly AssetWalletJournalEvent[],
 	exits: readonly IAssetSpliceExitProofs[],
 	channelId: string,
 	opening: string
-): string {
+) {
+	let reconciliation = false;
+	const previousFundingTxids: string[] = [];
+	let active: IAssetSpliceExitProofs | undefined;
+	let pending:
+		| { receipt: IAssetSpliceExitProofs; blockHash: string }
+		| undefined;
 	let parent = opening;
-
-	for (const r of records) {
-		if (r.kind === 'reconcile')
-			throw new Error('Asset splice funding needs reconciliation');
-		if (r.kind !== 'adopt') continue;
-		const e = exits.find((x) => x.finalDigest === r.terms.finalDigest);
+	const observations = new Map<string, { peer: boolean; blockHash?: string }>();
+	for (const row of records) {
+		if (row.kind === 'asset-splice-imported') {
+			if (
+				!pending ||
+				pending.receipt.finalDigest !== row.finalDigest ||
+				pending.receipt.candidate.fundingTxid !== row.txid ||
+				pending.blockHash !== row.blockHash
+			)
+				throw new Error(
+					'Asset splice wallet import differs from adopted funding'
+				);
+			previousFundingTxids.push(pending.receipt.parent.fundingTxid);
+			active = pending.receipt;
+			parent =
+				active.candidate.fundingTxid + ':' + active.candidate.outputIndex;
+			pending = undefined;
+			continue;
+		}
+		if (row.kind !== 'asset-splice-lock') continue;
+		const r = row.event,
+			terms = r.terms;
+		const e = exits.find((v) => v.finalDigest === terms.finalDigest);
 		if (
 			!e ||
-			r.terms.channelId !== channelId ||
-			e.parent.fundingTxid + ':' + e.parent.outputIndex !== parent ||
-			e.candidate.fundingTxid !== r.terms.txid ||
-			e.candidate.outputIndex !== r.terms.outputIndex
+			terms.channelId !== channelId ||
+			e.candidate.fundingTxid !== terms.txid ||
+			e.candidate.outputIndex !== terms.outputIndex ||
+			e.minimumDepth !== terms.minimumDepth
 		)
-			throw new Error('Asset splice adopted a disconnected funding reference');
-		parent = e.candidate.fundingTxid + ':' + e.candidate.outputIndex;
+			throw new Error('Asset splice lock differs from its funding receipt');
+		if (r.kind === 'reconcile') {
+			reconciliation = true;
+			continue;
+		}
+		const observed = observations.get(terms.finalDigest) ?? { peer: false };
+		if (r.kind === 'local') observed.blockHash = r.blockHash;
+		else if (r.kind === 'peer') observed.peer = true;
+		else if (r.kind === 'adopt') {
+			if (
+				pending ||
+				!observed.peer ||
+				observed.blockHash !== r.blockHash ||
+				e.parent.fundingTxid + ':' + e.parent.outputIndex !== parent
+			)
+				throw new Error(
+					'Asset splice adopted a disconnected funding reference'
+				);
+			pending = { receipt: e, blockHash: r.blockHash };
+		}
+		observations.set(terms.finalDigest, observed);
 	}
-	return parent;
+	return {
+		active,
+		awaitingImport: !!pending,
+		reconciliation,
+		previousFundingTxids,
+		pending: exits.filter(
+			(e) => e.parent.fundingTxid + ':' + e.parent.outputIndex === parent
+		)
+	};
+}
+
+export function requireAssetWalletParent(
+	info: ReturnType<typeof assetWalletFundingInfo>
+) {
+	if (info.reconciliation)
+		throw new Error('Asset splice funding needs reconciliation');
+	if (info.awaitingImport)
+		throw new Error('Asset splice adoption is awaiting its wallet proof');
+	return info.active;
 }

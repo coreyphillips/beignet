@@ -86,9 +86,7 @@ export interface IAssetOpeningPayout {
 
 /** Explicit host support for private dual-funded asset openings on regtest. */
 export interface IAuxiliaryDualFunding
-	extends Partial<
-		import('./asset-splice-confirmation').IAssetSpliceConfirmationProvider
-	> {
+	extends Partial<import('./asset-splice-transport').AssetSpliceHost> {
 	version: 1;
 	/** Synchronous local policy. An absent answer declines before a key is allocated. */
 	contribution(

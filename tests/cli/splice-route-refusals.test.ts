@@ -105,6 +105,27 @@ describe('Splice routes answer a refusal as a failure', function () {
 		fs.rmSync(dir, { recursive: true, force: true });
 	});
 
+	it('rejects asset splices on an ordinary wallet and validates the requested lock depth', async () => {
+		const valid = {
+			channelId: '11'.repeat(32),
+			fundingFeeratePerkw: 1000,
+			minimumDepth: 3
+		};
+		const unavailable = await request(port, '/channel/asset-splice', valid);
+		expect(unavailable.status).to.equal(409);
+		expect((unavailable.body.error as { code: string }).code).to.equal(
+			'SPLICE_REFUSED'
+		);
+		expect(
+			(
+				await request(port, '/channel/asset-splice', {
+					...valid,
+					minimumDepth: 0
+				})
+			).status
+		).to.equal(400);
+	});
+
 	for (const route of ['/channel/splice-in', '/channel/splice-out']) {
 		it(`${route} answers an unknown channel 404 CHANNEL_NOT_FOUND`, async () => {
 			const res = await request(port, route, {

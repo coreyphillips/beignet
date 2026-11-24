@@ -7,7 +7,10 @@ import type { IChainBackend } from './chain-watcher';
 import { ChainBackendUnavailableError } from './chain-watcher';
 import type { IFeeEstimator } from '../node/types';
 import type { Electrum } from '../../electrum';
-import { verifyAssetSpliceInclusion, type IAssetSpliceInclusionRecovery } from './asset-splice-inclusion';
+import {
+	verifyAssetSpliceInclusion,
+	type IAssetSpliceInclusionRecovery
+} from './asset-splice-inclusion';
 import type { IAssetSpliceAnchor } from '../channel/asset-splice-lock';
 
 /** A get_merkle answer, in either the wrapped or the bare shape. */
@@ -476,22 +479,31 @@ export class ElectrumBackend implements IChainBackend, IFeeEstimator {
 		if (!this.electrum.connectedToElectrum) {
 			throw new Error('Electrum not connected');
 		}
-		const result = await this.withTimeout(
-			this.electrum.listUnspentAddressScriptHashes({
-				addresses: {
-					[scriptHash]: {
-						index: 0,
-						path: '',
-						address: '',
-						scriptHash,
-						publicKey: ''
-					}
-				},
-				// Callers read an empty list as "no such output".
-				rejectFailedEntries: true
-			}),
-			`listUnspent(${scriptHash.slice(0, 8)}...)`
-		);
+		const read = () =>
+			this.withTimeout(
+				this.electrum.listUnspentAddressScriptHashes({
+					addresses: {
+						[scriptHash]: {
+							index: 0,
+							path: '',
+							address: '',
+							scriptHash,
+							publicKey: ''
+						}
+					},
+					// Callers read an empty list as "no such output".
+					rejectFailedEntries: true
+				}),
+				`listUnspent(${scriptHash.slice(0, 8)}...)`
+			);
+		let result = await read();
+		for (
+			let attempt = 1;
+			attempt < 3 && result.isErr() && result.error.message === '"Timed Out."';
+			attempt++
+		) {
+			result = await read();
+		}
 		if (result.isErr()) {
 			throw new Error(`Failed to list unspent: ${result.error}`);
 		}
@@ -584,7 +596,8 @@ export class ElectrumBackend implements IChainBackend, IFeeEstimator {
 						return answer.value;
 					},
 					() => source.getTransactionMerkle({ tx_hash: txid, height }),
-					assertCurrent, recovery
+					assertCurrent,
+					recovery
 				),
 				'getAssetSpliceInclusion'
 			);

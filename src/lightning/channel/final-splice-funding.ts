@@ -1,4 +1,4 @@
-import type { Transaction } from 'bitcoinjs-lib';
+import { Transaction } from 'bitcoinjs-lib';
 import { ecc } from '../../utils/ecc';
 import {
 	createTaprootFundingScript,
@@ -122,7 +122,7 @@ export function verifyFinalSpliceContribution(
 }
 
 /** Reserve the local verification nonce before producing either a wallet witness or the shared partial. */
-export function signFinalSpliceFunding(
+function prepareFinalSpliceFunding(
 	c: IFinalSpliceCandidate,
 	terms: IFinalSpliceTerms,
 	id: Buffer,
@@ -131,9 +131,8 @@ export function signFinalSpliceFunding(
 	peerNonce: Buffer,
 	authority: FinalOpeningAuthority,
 	exits: Parameters<typeof validateFinalSpliceExits>[0],
-	signWallet: FinalFundingWitnessSigner,
 	proofContext?: IAssetSpliceReleaseContext
-): Buffer {
+) {
 	const handle = nonceHandle(c, key, authority);
 	if (
 		!getPublicKey(key).equals(terms.oldLocalKey) ||
@@ -263,44 +262,123 @@ export function signFinalSpliceFunding(
 			])
 		).toString('hex');
 		authority.bindFundingInputs(localWalletInputs, family);
-		const witnesses = c.localInputs.length
-			? signWallet(c.tx.clone(), c.localInputs, {
-					scripts: c.scripts.map((v) => Buffer.from(v)),
-					values: c.values.map(BigInt)
-			  })
-			: [];
-		const session = startCommitmentSigningSession(
-			c.digest,
-			terms.oldLocalKey,
-			terms.oldPeerKey,
-			handle,
-			peerNonce,
-			terms.assetFundingRoots?.parent
-		);
-		const partial = partialSignCommitment(session, key, handle);
-		signed = encodeTxSignaturesMessage({
-			channelId: id,
-			txid: c.tx.getHash(),
-			witnesses,
-			sharedInputPartialSignatureWithNonce: Buffer.concat([partial, localNonce])
-		});
 	}
-	verifyFinalSpliceContribution(
+	const request =
+		!signed && c.localInputs.length
+			? {
+					unsigned: Transaction.fromBuffer(c.tx.toBuffer()),
+					indices: [...c.localInputs],
+					prevouts: {
+						scripts: c.scripts.map((v) => Buffer.from(v)),
+						values: c.values.map(BigInt)
+					}
+			  }
+			: undefined;
+	return {
+		request,
+		finish(witnesses: Buffer[][]): Buffer {
+			if (proofContext && authority.exitRequest(id.toString('hex')))
+				throw new Error('Channel closed while authorizing asset funding');
+			signed = authority.claim(slot, transcript);
+			if (!signed) {
+				const session = startCommitmentSigningSession(
+					c.digest,
+					terms.oldLocalKey,
+					terms.oldPeerKey,
+					handle,
+					peerNonce,
+					terms.assetFundingRoots?.parent
+				);
+				const partial = partialSignCommitment(session, key, handle);
+				signed = encodeTxSignaturesMessage({
+					channelId: id,
+					txid: c.tx.getHash(),
+					witnesses,
+					sharedInputPartialSignatureWithNonce: Buffer.concat([
+						partial,
+						localNonce
+					])
+				});
+			}
+			verifyFinalSpliceContribution(
+				c,
+				terms,
+				id,
+				signed,
+				true,
+				localNonce,
+				peerNonce
+			);
+			const packet = authority.finish(slot, transcript, signed);
+			if (proofContext && receipt) {
+				if (authority.exitRequest(id.toString('hex')))
+					throw new Error('Channel closed while authorizing asset funding');
+				recordAssetSpliceFundingPhase(proofContext.store, receipt, packet);
+			}
+			return packet;
+		}
+	};
+}
+
+export function signFinalSpliceFunding(
+	c: IFinalSpliceCandidate,
+	terms: IFinalSpliceTerms,
+	id: Buffer,
+	key: Buffer,
+	localNonce: Buffer,
+	peerNonce: Buffer,
+	authority: FinalOpeningAuthority,
+	exits: Parameters<typeof validateFinalSpliceExits>[0],
+	signWallet: FinalFundingWitnessSigner,
+	proofContext?: IAssetSpliceReleaseContext
+): Buffer {
+	const prepared = prepareFinalSpliceFunding(
 		c,
 		terms,
 		id,
-		signed,
-		true,
+		key,
 		localNonce,
-		peerNonce
+		peerNonce,
+		authority,
+		exits,
+		proofContext
 	);
-	const packet = authority.finish(slot, transcript, signed);
-	if (proofContext && receipt) {
-		if (authority.exitRequest(id.toString('hex')))
-			throw new Error('Channel closed while authorizing asset funding');
-		recordAssetSpliceFundingPhase(proofContext.store, receipt, packet);
-	}
-	return packet;
+	const r = prepared.request;
+	return prepared.finish(
+		r ? signWallet(r.unsigned, r.indices, r.prevouts) : []
+	);
+}
+
+/** The device reservation commits before invoking an asynchronous host wallet. */
+export async function signAssetSpliceFunding(
+	c: IFinalSpliceCandidate,
+	terms: IFinalSpliceTerms,
+	id: Buffer,
+	key: Buffer,
+	localNonce: Buffer,
+	peerNonce: Buffer,
+	authority: FinalOpeningAuthority,
+	exits: Parameters<typeof validateFinalSpliceExits>[0],
+	signWallet: (
+		...args: Parameters<FinalFundingWitnessSigner>
+	) => Promise<Buffer[][]>,
+	proofContext: IAssetSpliceReleaseContext
+): Promise<Buffer> {
+	const prepared = prepareFinalSpliceFunding(
+		c,
+		terms,
+		id,
+		key,
+		localNonce,
+		peerNonce,
+		authority,
+		exits,
+		proofContext
+	);
+	const r = prepared.request;
+	return prepared.finish(
+		r ? await signWallet(r.unsigned, r.indices, r.prevouts) : []
+	);
 }
 
 export function assembleFinalSplice(

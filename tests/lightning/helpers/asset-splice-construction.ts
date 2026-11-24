@@ -93,7 +93,8 @@ export function constructionFixture(dir: string) {
 				layoutDigest: digest,
 				transaction: tx.toBuffer(),
 				fundingRoot: t.assetFundingRoots!.candidate,
-				proofDigest: tag(85)
+				proofDigest: tag(85),
+				fundingProofs: Buffer.from('b0c1', 'hex')
 			},
 			[tag(86), tag(87)]
 		)

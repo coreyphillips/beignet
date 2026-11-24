@@ -3075,6 +3075,20 @@ async function bootDaemon(
 				node.spliceQuote(channelId, direction, feeratePerkw, address)
 			);
 		},
+		'POST /channel/asset-splice': async (body) => {
+			const { channelId, fundingFeeratePerkw, minimumDepth } = body as {
+				channelId: string;
+				fundingFeeratePerkw: number;
+				minimumDepth: number;
+			};
+			return success(
+				await node.startAssetSplice(
+					channelId,
+					fundingFeeratePerkw,
+					minimumDepth
+				)
+			);
+		},
 		'POST /channel/splice-in': (body) => {
 			const { channelId, amountSats, feeratePerkw } = body as {
 				channelId: string;

@@ -8181,7 +8181,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 			// by EFFECTIVE state — including one disconnected mid-splice, whose
 			// in-transit funds must not vanish from the bucket while the peer is
 			// away.
-			if (ch.payThroughSplice === undefined) continue;
+			if (ch.auxiliary || ch.payThroughSplice === undefined) continue;
 			const pending = ch.pendingSpliceLocalBalanceMsat ?? ch.localBalanceMsat;
 			if (ch.payThroughSplice) {
 				// Pay-during-splice: the canonical balance already counts this
@@ -15236,6 +15236,33 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 				this._decodeSpliceDestination(destinationAddress)
 			)
 		);
+	}
+
+	async startAssetSplice(
+		channelId: ChannelIdHex,
+		fundingFeeratePerkw: number,
+		minimumDepth: number
+	): Promise<{ started: true }> {
+		const id = requireChannelIdHex(channelId);
+		requireU32(
+			fundingFeeratePerkw,
+			'fundingFeeratePerkw',
+			1,
+			MAX_SPLICE_FEERATE_PERKW
+		);
+		requireU32(minimumDepth, 'minimumDepth', 1, 6);
+		try {
+			await this.node.startAssetSplice(id, {
+				fundingFeeratePerkw,
+				minimumDepth
+			});
+			return { started: true };
+		} catch (error) {
+			throw new BeignetError(
+				BeignetErrorCode.SPLICE_REFUSED,
+				error instanceof Error ? error.message : String(error)
+			);
+		}
 	}
 
 	spliceIn(

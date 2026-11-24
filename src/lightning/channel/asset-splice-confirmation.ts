@@ -54,6 +54,7 @@ interface Entry {
 	lock: AssetSpliceLock;
 	ticket: number;
 	verified?: { blockHash: string; height: number };
+	mined?: boolean;
 	sample?: {
 		height: number;
 		prove: AssetSpliceInclusionLookup;
@@ -113,6 +114,7 @@ export class AssetSpliceConfirmationCoordinator {
 		const existing = this.entries.get(k);
 		if (existing) {
 			if (
+				existing.terms.finalDigest !== terms.finalDigest ||
 				existing.terms.outputIndex !== terms.outputIndex ||
 				existing.terms.minimumDepth !== terms.minimumDepth
 			)
@@ -168,7 +170,12 @@ export class AssetSpliceConfirmationCoordinator {
 			)
 		};
 		this.entries.set(k, entry);
-		this.watch(id, b.funding, terms.minimumDepth);
+		try {
+			this.watch(id, b.funding, terms.minimumDepth);
+		} catch (err) {
+			this.entries.delete(k);
+			throw err;
+		}
 	}
 
 	restore(id?: string): void {
@@ -191,9 +198,37 @@ export class AssetSpliceConfirmationCoordinator {
 		e.lock.suspend();
 		e.verified = undefined;
 		e.sample = undefined;
+		e.mined = false;
+	}
+	hasChannel(id: string): boolean {
+		for (const e of this.entries.values())
+			if (e.terms.channelId === id) return true;
+		return false;
 	}
 	has(id: string, txid: string): boolean {
 		return this.entries.has(key(id, txid));
+	}
+	/** Identify a spend of our watched funding before classifying a unilateral close. */
+	fundingSpend(
+		id: string,
+		spendingTxid: string,
+		inputs: readonly string[]
+	): 'splice' | 'close' | undefined {
+		const child = this.entries.get(key(id, spendingTxid));
+		if (child && inputs.includes(child.parent)) return 'splice';
+		for (const entry of this.entries.values()) {
+			if (entry.terms.channelId !== id) continue;
+			if (
+				inputs.includes(entry.parent) ||
+				inputs.includes(entry.terms.txid + ':' + entry.terms.outputIndex)
+			)
+				return 'close';
+		}
+		return undefined;
+	}
+	hasCurrentInclusion(id: string, txid: string): boolean {
+		const entry = this.entries.get(key(id, txid));
+		return !!entry?.mined && !!entry.sample?.current();
 	}
 	status(id: string, txid: string) {
 		const e = this.entries.get(key(id, txid));
@@ -293,7 +328,6 @@ export class AssetSpliceConfirmationCoordinator {
 					e.lock.state().needsReconciliation
 				)
 					return;
-				e.imported = local.blockHash;
 				const { channelId, txid, finalDigest } = e.terms;
 				const head = this.store.readAssetSpliceJournal<{
 					kind: string;
@@ -316,8 +350,9 @@ export class AssetSpliceConfirmationCoordinator {
 						blockHash: local.blockHash,
 						finalDigest
 					});
+					e.imported = local.blockHash;
 					this.adopted?.(channelId, txid);
-				}
+				} else e.imported = local.blockHash;
 			}
 		}
 		if (
@@ -341,6 +376,7 @@ export class AssetSpliceConfirmationCoordinator {
 		const ticket = ++e.ticket;
 		e.lock.suspend();
 		e.verified = undefined;
+		e.mined = false;
 		e.sample = height && height > 0 ? { height, prove, current } : undefined;
 		if (!e.sample) {
 			await e.lock.observe(null);
@@ -355,6 +391,8 @@ export class AssetSpliceConfirmationCoordinator {
 		if (ticket !== e.ticket || !current()) return;
 		if (anchor.txid !== txid)
 			throw new Error('Verified chain transaction differs from splice funding');
+		e.mined =
+			Number.isSafeInteger(anchor.confirmations) && anchor.confirmations > 0;
 		await e.lock.observe(anchor);
 		if (ticket !== e.ticket || !current()) return;
 		if (e.lock.outboundLock())
@@ -393,13 +431,7 @@ export class AssetSpliceConfirmationCoordinator {
 			}
 	}
 	disconnected(peer: string): void {
-		for (const e of this.entries.values())
-			if (e.peer === peer) {
-				++e.ticket;
-				e.lock.suspend();
-				e.verified = undefined;
-				e.sample = undefined;
-				e.sent = undefined;
-			}
+		// The independent chain watch still establishes which funding can be spent offline.
+		for (const e of this.entries.values()) if (e.peer === peer) e.sent = undefined;
 	}
 }

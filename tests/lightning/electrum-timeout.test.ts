@@ -10,6 +10,60 @@ import { ElectrumBackend } from '../../src/lightning/chain/electrum-backend';
 import { ChainBackendUnavailableError } from '../../src/lightning/chain/chain-watcher';
 import { Electrum } from '../../src/electrum';
 
+describe('Electrum funding UTXO retries', () => {
+	it('repeats a timed out listunspent and requires the later positive result', async () => {
+		let calls = 0;
+		const source = {
+			connectedToElectrum: true,
+			listUnspentAddressScriptHashes: async () =>
+				++calls < 3
+					? { isErr: () => true, error: new Error('"Timed Out."') }
+					: {
+							isErr: () => false,
+							value: {
+								utxos: [
+									{
+										tx_hash: '10'.repeat(32),
+										tx_pos: 1,
+										value: 1200,
+										height: 25
+									}
+								]
+							}
+					  }
+		};
+		const chain = new ElectrumBackend(source as unknown as Electrum);
+		const coins = await chain.listUnspent('19'.repeat(32));
+		expect(calls).to.equal(3);
+		expect(coins).to.deep.equal([
+			{ txid: '10'.repeat(32), outputIndex: 1, valueSat: 1200, height: 25 }
+		]);
+	});
+	it('fails a persistent timeout after three reads and other errors after one', async () => {
+		for (const [message, limit] of [
+			['"Timed Out."', 3],
+			['bad server data', 1]
+		] as const) {
+			let calls = 0;
+			const source = {
+				connectedToElectrum: true,
+				listUnspentAddressScriptHashes: async () => {
+					++calls;
+					return { isErr: () => true, error: new Error(message) };
+				}
+			};
+			const chain = new ElectrumBackend(source as unknown as Electrum);
+			let error: unknown;
+			try {
+				await chain.listUnspent('19'.repeat(32));
+			} catch (e) {
+				error = e;
+			}
+			expect(String(error)).to.include(message);
+			expect(calls).to.equal(limit);
+		}
+	});
+});
 // ─────────────── Mock Electrum ───────────────
 
 /** Creates a mock Electrum that hangs forever on all calls */

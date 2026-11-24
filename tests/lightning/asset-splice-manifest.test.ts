@@ -389,6 +389,20 @@ describe('Asset splice manifests', () => {
 		expect(parties[0].result()!.verified.candidate.tx.toHex()).to.equal(
 			f.tx.toHex()
 		);
+		await rejected(() => parties[0].exitShares(async () => hash(10)));
+		const promises = [hash(18), hash(19)] as const;
+		expect(await parties[0].checkpoint(f.tx, promises)).to.equal(false);
+		const freeze = decodeCustomMessage(wire.shift()!.raw);
+		await parties[1].receive(freeze.subtype, freeze.payload);
+		expect(await parties[1].checkpoint(f.tx, promises)).to.equal(true);
+		const echo = decodeCustomMessage(wire.shift()!.raw);
+		await parties[0].receive(echo.subtype, echo.payload);
+		await rejected(() =>
+			parties[0].checkpoint(f.tx, [promises[1], promises[0]])
+		);
+		await rejected(() => parties[0].checkpoint(substituted, promises));
+		expect(await parties[0].checkpoint(f.tx, promises)).to.equal(true);
+
 		height = 1n;
 		await rejected(() => round.authorize(round.agreement, both));
 		expect(() => complete.verifyFrozen(f.tx)).to.throw(/stale/i);

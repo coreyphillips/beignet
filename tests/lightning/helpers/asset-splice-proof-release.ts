@@ -76,7 +76,10 @@ type AlternateContext = {
 	parentRemote: Transaction;
 	candidateRemote: Transaction;
 };
-export function setupAssetSpliceProofs(dir: string) {
+export function setupAssetSpliceProofs(
+	dir: string,
+	updateLimits?: import('../../../src/lightning/storage/final-channel-updates').IFinalUpdateLimits
+) {
 	const devices = [device(dir, 'left'), device(dir, 'right')];
 	const parties = devices.map((d) => d.party);
 	const oldKeys = parties.map((p) => p.keys);
@@ -119,7 +122,9 @@ export function setupAssetSpliceProofs(dir: string) {
 			parties[1 - i].binding.nodeId,
 			openingViews[i].terms,
 			1,
-			parties[1 - i].points.paymentBasepoint,
+			getPublicKey(
+				generateFromSeed(parties[1 - i].keys.perCommitmentSeed, MAX_INDEX - 1n)
+			).toString('hex'),
 			{
 				fundingRoot: parentRoot.toString('hex'),
 				layoutDigest: '11'.repeat(32),
@@ -127,6 +132,20 @@ export function setupAssetSpliceProofs(dir: string) {
 				fundingProofs: 'a0b1',
 				local: side(i ? 'a2' : 'a1'),
 				remote: side(i ? 'a1' : 'a2')
+			},
+			updateLimits ?? {
+				local: {
+					htlcMinimumMsat: '1',
+					maxHtlcValueInFlightMsat: '100000000',
+					maxAcceptedHtlcs: 20,
+					channelReserveSats: '1400'
+				},
+				remote: {
+					htlcMinimumMsat: '1',
+					maxHtlcValueInFlightMsat: '100000000',
+					maxAcceptedHtlcs: 20,
+					channelReserveSats: '1400'
+				}
 			}
 		);
 	}

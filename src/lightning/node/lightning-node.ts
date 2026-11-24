@@ -1,4 +1,8 @@
 import {
+	completeAssetSpliceHost,
+	type IStartAssetSplice
+} from '../channel/asset-splice-transport';
+import {
 	finalOpeningChannelType,
 	finalOpeningDependencies,
 	finalOpeningNegotiated
@@ -1191,12 +1195,25 @@ class NodeFeatureFlags extends FeatureFlags {
 	constructor(
 		private readonly configured: FeatureFlags,
 		private readonly finalDaemon: boolean,
-		private readonly assetOpening: boolean
+		private readonly assetOpening: boolean,
+		private readonly assetSplice: boolean
 	) {
 		super();
 	}
 
 	private masksFinalBit(bit: number): boolean {
+		if (bit === Feature.OPTION_ASSET_SPLICE) return true;
+		if (bit === Feature.OPTION_ASSET_SPLICE + 1)
+			return (
+				!this.assetSplice ||
+				!this.assetOpening ||
+				!assetOpeningDependencies(this.configured) ||
+				![
+					Feature.QUIESCE,
+					Feature.SPLICE,
+					Feature.OPTION_DUAL_FUNDED_ASSETS
+				].every((f) => this.configured.hasFeature(f))
+			);
 		if (bit === Feature.OPTION_DUAL_FUNDED_ASSETS) return true;
 		if (bit === Feature.OPTION_DUAL_FUNDED_ASSETS + 1)
 			return !this.assetOpening || !assetOpeningDependencies(this.configured);
@@ -1223,6 +1240,8 @@ class NodeFeatureFlags extends FeatureFlags {
 
 	private advertised(): FeatureFlags {
 		const masked = [
+			Feature.OPTION_ASSET_SPLICE,
+			Feature.OPTION_ASSET_SPLICE + 1,
 			Feature.OPTION_SIMPLE_TAPROOT,
 			Feature.OPTION_SIMPLE_TAPROOT + 1,
 			Feature.OPTION_DUAL_FUNDED_ASSETS,
@@ -2289,7 +2308,9 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			config.localFeatures ?? LightningNode.defaultFeatures(),
 			Boolean(finalDaemon),
 			!!finalDaemon?.storage.canOpenDualFundedAssets &&
-				completeAssetOpeningHost(config.auxiliaryChannels?.dualFunding)
+				completeAssetOpeningHost(config.auxiliaryChannels?.dualFunding),
+			!!finalDaemon?.storage.canSpliceDualFundedAssets &&
+				completeAssetSpliceHost(config.auxiliaryChannels?.dualFunding)
 		);
 		// Advertise anchor support whenever anchors are preferred (the default).
 		if (
@@ -2455,6 +2476,11 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			completeAssetOpeningHost(config.auxiliaryChannels?.dualFunding)
 		)
 			localFeatures.setOptional(Feature.OPTION_DUAL_FUNDED_ASSETS);
+		if (
+			finalDaemon?.storage.canSpliceDualFundedAssets &&
+			completeAssetSpliceHost(config.auxiliaryChannels?.dualFunding)
+		)
+			localFeatures.setOptional(Feature.OPTION_ASSET_SPLICE);
 		this.localFeatures = localFeatures;
 
 		// An asset channel is not accepted by a node whose wallet refused the
@@ -15346,6 +15372,14 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			error: SPLICE_BUSY_SELECTION_PENDING,
 			code: SpliceRefusalCode.SPLICE_BUSY
 		};
+	}
+
+	/** Start a private regtest splice after both peers have enrolled asset funding wallets. */
+	startAssetSplice(
+		channelId: Buffer,
+		options: IStartAssetSplice
+	): Promise<void> {
+		return this.channelManager.startAssetSplice(channelId, options);
 	}
 
 	/**
@@ -36258,7 +36292,9 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			if (
 				msg.version === 1 &&
 				(msg.subtype === BeignetCustomSubtype.ASSET_OPEN ||
-					msg.subtype === BeignetCustomSubtype.ASSET_OPEN_CONSENT)
+					msg.subtype === BeignetCustomSubtype.ASSET_OPEN_CONSENT ||
+					msg.subtype === BeignetCustomSubtype.ASSET_SPLICE ||
+					msg.subtype === BeignetCustomSubtype.ASSET_SPLICE_CONSENT)
 			) {
 				this.channelManager.handleAssetOpenFrame(
 					pubkey,

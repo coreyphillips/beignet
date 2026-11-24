@@ -87,7 +87,8 @@ export class FinalOpeningTransport {
 		>,
 		private readonly broadcastClose?: (tx: Buffer) => void,
 		private readonly splice?: FinalSpliceTransport,
-		private readonly reconnectFunding?: (peer: string) => void
+		private readonly reconnectFunding?: (peer: string) => void,
+		private readonly resumeAssetSplice?: (peer: string, id: string) => void
 	) {
 		this.commitments = new FinalCommitmentTransport(
 			runtime,
@@ -376,6 +377,12 @@ export class FinalOpeningTransport {
 		}
 	}
 
+	/** The splice wallet verifies and imports its own proofs before passing true here. */
+	assetSpliceSpendable(id: string, ready: boolean): void {
+		this.assetSpendable.delete(id);
+		if (this.hasDepth(id) !== ready) this.setDepth(id, ready);
+	}
+
 	/** A replacement tip can move the same transaction into another block at the same height. */
 	invalidateAssetFundingAnchor(id: string): void {
 		const old = this.assetDepth.get(id);
@@ -483,6 +490,7 @@ export class FinalOpeningTransport {
 		connection.readySent = true;
 		try {
 			this.send(connection.peer, MessageType.CHANNEL_READY, payload);
+			this.resumeAssetSplice?.(connection.peer, id);
 		} catch (error) {
 			connection.readySent = false;
 			throw error;

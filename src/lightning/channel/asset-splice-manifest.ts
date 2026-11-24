@@ -346,6 +346,7 @@ export function verifyAssetSpliceCandidate(
 		transaction: Buffer;
 		fundingRoot: Buffer;
 		proofDigest: Buffer;
+		fundingProofs?: Buffer;
 	},
 	authorizations: Pair<Buffer>
 ) {
@@ -420,6 +421,10 @@ export function verifyAssetSpliceCandidate(
 		transaction: candidate.tx.toHex(),
 		layoutDigest: hashHex(layoutDigest),
 		finalDigest: hashHex(result.digest),
+		fundingProofHash: verified.fundingProofs?.length
+			? sha256(verified.fundingProofs).toString('hex')
+			: undefined,
+		minimumDepth: init.lockDepth!,
 		terms: copyConstructionTerms(terms)
 	});
 	return result;
@@ -446,6 +451,8 @@ const constructionViews = new WeakMap<
 		transaction: string;
 		layoutDigest: string;
 		finalDigest: string;
+		fundingProofHash: string | undefined;
+		minimumDepth: number;
 		terms: IFinalSpliceTerms;
 	}
 >();

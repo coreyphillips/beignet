@@ -1250,6 +1250,16 @@ async function handleChannel(): Promise<void> {
 					feeratePerkw: parseInt(filteredArgs[4], 10)
 				})
 			);
+		case 'asset-splice': {
+			const pos = positionalArgs();
+			return outputResult(
+				await httpRequest('POST', '/channel/asset-splice', {
+					channelId: pos[2],
+					fundingFeeratePerkw: Number(pos[3]),
+					minimumDepth: Number(pos[4])
+				})
+			);
+		}
 		case 'splice-in':
 			return outputResult(
 				await httpRequest('POST', '/channel/splice-in', {
@@ -1446,7 +1456,7 @@ async function handleChannel(): Promise<void> {
 				error: {
 					code: 'UNKNOWN_COMMAND',
 					message:
-						'Usage: beignet channel [open|open-zeroconf|open-v2|open-and-wait|connect-and-open|close|forceclose|rebroadcast-close|funding-quote|splice-quote|splice-in|splice-out|send-quote|send|send-status|send-list|send-abort|ensure-minimum|update-policy|update-commitment-feerate|policy|diagnostics|health|suggestions|wait-ready|ready|list|get]'
+						'Usage: beignet channel [open|open-zeroconf|open-v2|open-and-wait|connect-and-open|close|forceclose|rebroadcast-close|funding-quote|splice-quote|asset-splice|splice-in|splice-out|send-quote|send|send-status|send-list|send-abort|ensure-minimum|update-policy|update-commitment-feerate|policy|diagnostics|health|suggestions|wait-ready|ready|list|get]'
 				}
 			});
 			process.exitCode = 1;
@@ -3586,6 +3596,7 @@ Channels:
                                          v2 decided like openChannel would
   channel splice-quote <id> <in|out> <feerate>
                                          Quote a splice: fee + max amount
+  channel asset-splice <id> <feerate> <depth>   Start an agreed regtest asset splice
   channel splice-in <id> <sats> <feerate>   Add funds to channel
   channel splice-out <id> <sats> <feerate> [address]
                                          Withdraw funds from channel, to the

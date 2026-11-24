@@ -1539,7 +1539,8 @@ describe('Asset payments (issue #2093, step 8)', function () {
 				// Issue #2098, step 10: an asset invoice, made by createInvoice
 				// with { assetInvoice }.
 				'createInvoice:assetInvoice',
-				'dualFunding:v1'
+				'dualFunding:v1',
+				'assetSplice:v1'
 			]);
 			expect(Object.isFrozen(api)).to.equal(true);
 			expect(Object.isFrozen(api.surfaces)).to.equal(true);

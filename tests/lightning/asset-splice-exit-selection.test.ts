@@ -23,6 +23,39 @@ describe('Unilateral exits for multiple live asset funding outpoints', () => {
 		fs.rmSync(dir, { recursive: true, force: true });
 	});
 
+	it('authenticates fresh opening rows and key locators after reading an unchanged funded opening', () => {
+		const db = f.devices[0].store;
+		const first = db.loadFinalDaemonOpening(f.id)!;
+		const original = first.session.assetEvidence!.fundingRoot;
+		first.session.assetEvidence!.fundingRoot = '00'.repeat(32);
+		expect(
+			db.loadFinalDaemonOpening(f.id)!.session.assetEvidence!.fundingRoot
+		).to.equal(original);
+		const row = db['db']
+			.prepare(
+				'SELECT channel_index FROM channel_key_indices WHERE channel_id=?'
+			)
+			.get(f.id) as { channel_index: number | string };
+		db['db']
+			.prepare('DELETE FROM channel_key_indices WHERE channel_id=?')
+			.run(f.id);
+		expect(() => db.loadFinalDaemonOpening(f.id)).to.throw();
+		db['db']
+			.prepare(
+				'INSERT INTO channel_key_indices(channel_id,channel_index) VALUES (?,?)'
+			)
+			.run(f.id, row.channel_index);
+		expect(
+			db.loadFinalDaemonOpening(f.id)!.session.assetEvidence!.fundingRoot
+		).to.equal(original);
+		db['db']
+			.prepare(
+				"UPDATE final_opening_candidates SET nonces_json='00' WHERE channel_id=?"
+			)
+			.run(f.id);
+		expect(() => db.loadFinalDaemonOpening(f.id)).to.throw();
+	});
+
 	function reserve(e = f.evidence(0)): IAssetSpliceExitProofs {
 		f.retain(0, e);
 		const db = f.devices[0].store;

@@ -11,8 +11,10 @@ import {
 } from '../../src/lightning/message/interactive-tx';
 import { MessageType as M } from '../../src/lightning/message/types';
 import { SqliteStorage } from '../../src/lightning/storage/sqlite-storage';
-import { constructionFixture as fixture, localPromise } from './helpers/asset-splice-construction';
-
+import {
+	constructionFixture as fixture,
+	localPromise
+} from './helpers/asset-splice-construction';
 
 const tag = (n: number) => Buffer.alloc(32, n);
 describe('durable interactive construction of an exact asset splice', () => {
