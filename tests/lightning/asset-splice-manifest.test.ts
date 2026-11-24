@@ -53,6 +53,11 @@ function fixture() {
 		parentRoot: root,
 		stateNumber: 0n,
 		feeBudgets: [1000n, 0n],
+		maxAcceptedHtlcs: [8, 8],
+		commitmentRecordLimits: [
+			[{ type: 65537n, maxBytes: 2000 }],
+			[{ type: 65537n, maxBytes: 2000 }]
+		],
 		dust: 546n,
 		parentBalances: {
 			issuances: [{ assetId: id, funding: 60n, initiator: 40n, acceptor: 20n }],
@@ -172,6 +177,28 @@ describe('Asset splice manifests', () => {
 		).to.throw();
 	});
 
+	it('authenticates the maximum tagged commitment budget of both holders before construction', () => {
+		const { layout } = fixture();
+		const agreed = assetSpliceLayoutDigest(layout);
+		const revised = { ...layout, maxAcceptedHtlcs: [7, 8] as const };
+		expect(assetSpliceLayoutDigest(revised)).not.to.deep.equal(agreed);
+		const wide = [
+			{ type: 65537n, maxBytes: 54615 },
+			{ type: 65553n, maxBytes: 66 }
+		];
+		for (const pair of [
+			[wide, layout.commitmentRecordLimits[1]],
+			[layout.commitmentRecordLimits[0], wide]
+		] as const)
+			expect(() =>
+				assetSpliceLayoutDigest({
+					...layout,
+					maxAcceptedHtlcs: [83, 83],
+					commitmentRecordLimits: pair
+				})
+			).to.throw(/65551/);
+	});
+
 	it('matches the initiator-order wire and manifest vectors', () => {
 		const { layout, tx, verified, auth } = fixture();
 		expect(layout.init.toString('hex')).to.equal(
@@ -182,7 +209,7 @@ describe('Asset splice manifests', () => {
 		);
 		const agreed = assetSpliceLayoutDigest(layout);
 		expect(agreed.toString('hex')).to.equal(
-			'65521836c21042d95ebf6db931cae2894aa2d26baee061af150cfa87bd913bf3'
+			'30a1ab020fd20f4e5c48915fab741c7fae11097c46f388ace915959dc729a1b5'
 		);
 		expect(
 			verifyAssetSpliceCandidate(
@@ -194,7 +221,7 @@ describe('Asset splice manifests', () => {
 				auth
 			).digest.toString('hex')
 		).to.equal(
-			'faa816c46e01cf117451e4c73ab8b79fa1dc2009ef9a7fcbad564c0230c65021'
+			'136536a2646c9908e2844772204a272619b440f4667e3f5944256e0cb871269b'
 		);
 	});
 

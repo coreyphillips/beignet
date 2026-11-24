@@ -150,7 +150,9 @@ export enum Feature {
 	 */
 	OPTION_ASSET_CHILD_CUSTODY = 452,
 	/** Private, two-contributor asset opening version 1 (init pair 456/457). */
-	OPTION_DUAL_FUNDED_ASSETS = 456
+	OPTION_DUAL_FUNDED_ASSETS = 456,
+	/** Private regtest asset splice v1, optional bit 459. */
+	OPTION_ASSET_SPLICE = 458
 }
 
 /**

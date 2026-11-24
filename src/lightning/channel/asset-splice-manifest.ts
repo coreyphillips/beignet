@@ -1,5 +1,9 @@
 import { Transaction } from 'bitcoinjs-lib';
 import { REGTEST_CHAIN_HASH } from '../chain/hashes';
+import {
+	assetSpliceCommitmentBytes,
+	type IAssetSpliceWireRecordLimit
+} from '../features/asset-splice';
 import { isValidPublicKey } from '../crypto/ecdh';
 import { sha256 } from '../crypto/provider';
 import type { IInteractiveTxInput } from '../interactive-tx/types';
@@ -46,6 +50,8 @@ export interface IAssetSpliceLayout {
 	parentRoot: Buffer;
 	stateNumber: bigint;
 	feeBudgets: Pair<bigint>;
+	maxAcceptedHtlcs: Pair<number>;
+	commitmentRecordLimits: Pair<readonly IAssetSpliceWireRecordLimit[]>;
 	dust: bigint;
 	parentBalances: IAssetSpliceBalanceState;
 	movements: readonly IAssetSpliceUnitMovement[];
@@ -285,6 +291,16 @@ function checkLayout(layout: IAssetSpliceLayout) {
 			v.withdrawals.toString(),
 			v.delta.toString()
 		]);
+	if (layout.commitmentRecordLimits.length !== 2)
+		throw new Error(
+			'Asset splice requires commitment wire budgets for both holders'
+		);
+	const signatureLimits = layout.commitmentRecordLimits.map((records) => {
+		assetSpliceCommitmentBytes(layout.maxAcceptedHtlcs, records);
+		return [...records]
+			.sort((a, b) => (a.type < b.type ? -1 : 1))
+			.map((r) => [r.type.toString(), r.maxBytes]);
+	});
 	const layoutDigest = digest(
 		[
 			hashHex(layout.attempt),
@@ -298,6 +314,8 @@ function checkLayout(layout: IAssetSpliceLayout) {
 			hashHex(layout.parentRoot),
 			layout.stateNumber.toString(),
 			layout.feeBudgets.map((x) => x.toString()),
+			layout.maxAcceptedHtlcs,
+			signatureLimits,
 			layout.dust.toString(),
 			issues,
 			htlcs,
