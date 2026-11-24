@@ -181,6 +181,7 @@ import {
 	hasScidAliasChannelType,
 	isAnchorChannel,
 	isTaprootChannel,
+	finalTaprootOpenRefusal,
 	hasSimpleTaprootBit,
 	scidAliasAnnounceRefusal,
 	validateV2ChannelType,
@@ -5251,6 +5252,11 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 				msg.temporaryChannelId,
 				`open_channel refused: ${MAX_PENDING_INBOUND_OPENS_PER_PEER} opens from this peer are already pending`
 			);
+			return;
+		}
+		const finalRefusal = finalTaprootOpenRefusal(msg.channelType);
+		if (finalRefusal) {
+			this.refuseInboundOpen(peerPubkey, msg.temporaryChannelId, finalRefusal);
 			return;
 		}
 		// Asset channels (issue #2093). Only a node with a provider looks:

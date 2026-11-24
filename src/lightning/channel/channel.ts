@@ -235,6 +235,7 @@ import {
 	getLocalCommitmentLeaseBlockheight
 } from './commitment-builder';
 import {
+	finalTaprootOpenRefusal,
 	hasScidAliasChannelType,
 	isAnchorChannel,
 	isTaprootChannel,
@@ -2760,6 +2761,8 @@ export class Channel {
 		// demands, having been sliced from the wire by decodeOpenChannelMessage.
 		const refuse = (reason: string): ChannelAction[] =>
 			refuseWithWireError(msg.temporaryChannelId, reason);
+		const finalRefusal = finalTaprootOpenRefusal(msg.channelType);
+		if (finalRefusal) return refuse(finalRefusal);
 		if (this._state.auxiliaryState || this._state.fundingTaprootMerkleRoot) {
 			const auxiliaryError = this._auxiliaryOpeningError(
 				msg.channelType,

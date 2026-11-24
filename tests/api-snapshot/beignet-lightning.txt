@@ -2666,6 +2666,7 @@ function channel.dualFundingContributionWeight(inputCount: number, initiator: bo
 function channel.dualFundingTopUpWeight(inputCount: number): number
 function channel.estimateSpliceTxWeight(opts: { walletInputCount: number; fundingInputCount?: number; fundingOutputCount?: number; fundingScriptLen?: number; changeScriptLen?: number; destinationScriptLen?: number; }): number
 function channel.filterUntrimmedHtlcs<T extends { amount: bigint; direction: channel.HtlcDirection; auxiliaryAmount?: bigint; }>(htlcOutputs: T[], dustLimitSat: bigint, feeratePerKw: number, isAnchor: boolean): T[]
+function channel.finalTaprootOpenRefusal(channelType?: Buffer | null): string | null
 function channel.funderCommitmentCostSats(feeratePerKw: number, numUntrimmedHtlcs: number, channelType: Buffer | null): bigint
 function channel.generateTemporaryChannelId(): Buffer
 function channel.getCommitmentFeeRate(state: channel.IChannelState, signedLocal?: boolean): number
@@ -3568,6 +3569,7 @@ member features.Feature.OPTION_ASSET_FIXED_HTLC_OUTPUTS = 450
 member features.Feature.OPTION_COMPOSITE_SPLICE_INPUTS = 454
 member features.Feature.OPTION_FF_CONCURRENT = 442
 member features.Feature.OPTION_FF_RECEIVE = 440
+member features.Feature.OPTION_SIMPLE_TAPROOT = 80
 member features.Feature.OPTION_TAPROOT = 180
 member features.Feature.OPTION_TAPROOT_OVERLAY = 2026
 member features.Feature.OPTION_WILL_FUND = 112

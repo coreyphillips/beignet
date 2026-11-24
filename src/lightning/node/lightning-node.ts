@@ -1166,6 +1166,54 @@ interface IAuxiliaryPartSent {
 	failed?: true;
 }
 
+// Keep supported feature updates live in both directions. A caller can use its
+// own feature vector for other purposes, including describing a reference peer.
+class NodeFeatureFlags extends FeatureFlags {
+	constructor(private readonly configured: FeatureFlags) {
+		super();
+	}
+
+	private isFinalTaprootBit(bit: number): boolean {
+		return (
+			bit === Feature.OPTION_SIMPLE_TAPROOT ||
+			bit === Feature.OPTION_SIMPLE_TAPROOT + 1
+		);
+	}
+
+	override setBit(bit: number): void {
+		if (!this.isFinalTaprootBit(bit)) this.configured.setBit(bit);
+	}
+
+	override clearBit(bit: number): void {
+		this.configured.clearBit(bit);
+	}
+
+	override hasBit(bit: number): boolean {
+		return !this.isFinalTaprootBit(bit) && this.configured.hasBit(bit);
+	}
+
+	private advertised(): FeatureFlags {
+		if (!this.configured.hasFeature(Feature.OPTION_SIMPLE_TAPROOT))
+			return this.configured;
+		const flags = FeatureFlags.fromBuffer(this.configured.toBuffer());
+		flags.clearBit(Feature.OPTION_SIMPLE_TAPROOT);
+		flags.clearBit(Feature.OPTION_SIMPLE_TAPROOT + 1);
+		return flags;
+	}
+
+	override maxBit(): number {
+		return this.advertised().maxBit();
+	}
+
+	override toBuffer(): Buffer {
+		return this.advertised().toBuffer();
+	}
+
+	override listSetBits(): number[] {
+		return this.advertised().listSetBits();
+	}
+}
+
 /**
  * Top-level Lightning node orchestrator. Its events and their listener
  * signatures are LightningNodeEvents (./events.ts).
@@ -2199,8 +2247,9 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		// Set default features if not provided (includes static_remotekey).
 		// Computed before the ChannelManager so per-peer feature-dependent
 		// behavior (e.g. option_simple_close) can consult our own advertisement.
-		const localFeatures =
-			config.localFeatures || LightningNode.defaultFeatures();
+		const localFeatures = new NodeFeatureFlags(
+			config.localFeatures ?? LightningNode.defaultFeatures()
+		);
 		// Advertise anchor support whenever anchors are preferred (the default).
 		if (
 			preferAnchors &&
