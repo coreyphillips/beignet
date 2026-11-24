@@ -13,6 +13,11 @@ import {
 	encodeTxSignaturesMessage
 } from '../message/interactive-tx';
 import { validateFinalSpliceExits } from './final-splice-exits';
+import {
+	loadAssetSpliceExitProofs,
+	recordAssetSpliceFundingPhase,
+	type IAssetSpliceReleaseContext
+} from '../storage/asset-splice-exit-proofs';
 import type { FinalOpeningAuthority } from '../storage/final-opening-authority';
 import type { FinalFundingWitnessSigner } from '../storage/final-opening-funding';
 import {
@@ -126,7 +131,8 @@ export function signFinalSpliceFunding(
 	peerNonce: Buffer,
 	authority: FinalOpeningAuthority,
 	exits: Parameters<typeof validateFinalSpliceExits>[0],
-	signWallet: FinalFundingWitnessSigner
+	signWallet: FinalFundingWitnessSigner,
+	proofContext?: IAssetSpliceReleaseContext
 ): Buffer {
 	const handle = nonceHandle(c, key, authority);
 	if (
@@ -174,6 +180,41 @@ export function signFinalSpliceFunding(
 			'Splice keys, roots or digest disagree with the funding transaction'
 		);
 	validateFinalSpliceExits(exits, c, terms);
+	if (Boolean(proofContext) !== Boolean(roots))
+		throw new Error('Asset funding requires retained proof-backed exits');
+	let receipt: ReturnType<typeof loadAssetSpliceExitProofs> | undefined;
+	let evidenceHash: Buffer | undefined;
+	if (proofContext && roots) {
+		const { store, finalDigest, stateNumber, parentRemote, candidateRemote } =
+			proofContext;
+		store.assertAssetSpliceAuthority(authority);
+		if (authority.exitRequest(id.toString('hex')))
+			throw new Error('Cannot release asset funding after a unilateral close');
+		receipt = loadAssetSpliceExitProofs(
+			store,
+			id.toString('hex'),
+			finalDigest.toString('hex')
+		);
+		if (String(stateNumber) !== receipt.stateNumber)
+			throw new Error('Asset proof state differs from commitment state');
+		for (const [name, funding, index, remote] of [
+			['parent', terms.parent, terms.parentIndex, parentRemote],
+			['candidate', c.tx, c.fundingIndex, candidateRemote]
+		] as const) {
+			const saved = receipt[name];
+			if (
+				saved.fundingTxid !== funding.getId() ||
+				saved.outputIndex !== index ||
+				saved.fundingRoot !== roots[name].toString('hex') ||
+				saved.localCommitment !== exits[name].signed.toHex() ||
+				saved.remoteCommitment !== remote.toHex()
+			)
+				throw new Error(
+					'Asset funding disagrees with retained commitment or proof generation'
+				);
+		}
+		evidenceHash = recordAssetSpliceFundingPhase(store, receipt);
+	}
 	const txid = c.tx.getId();
 	const retained = sha256(exits.candidate.signed.toBuffer()).toString('hex');
 	authority.claim(
@@ -189,7 +230,13 @@ export function signFinalSpliceFunding(
 			peerNonce,
 			Buffer.from(retained, 'hex'),
 			...(roots
-				? [terms.oldLocalKey, terms.oldPeerKey, roots.parent, roots.candidate]
+				? [
+						terms.oldLocalKey,
+						terms.oldPeerKey,
+						roots.parent,
+						roots.candidate,
+						evidenceHash!
+				  ]
 				: [])
 		])
 	).toString('hex');
@@ -244,7 +291,13 @@ export function signFinalSpliceFunding(
 		localNonce,
 		peerNonce
 	);
-	return authority.finish(slot, transcript, signed);
+	const packet = authority.finish(slot, transcript, signed);
+	if (proofContext && receipt) {
+		if (authority.exitRequest(id.toString('hex')))
+			throw new Error('Channel closed while authorizing asset funding');
+		recordAssetSpliceFundingPhase(proofContext.store, receipt, packet);
+	}
+	return packet;
 }
 
 export function assembleFinalSplice(

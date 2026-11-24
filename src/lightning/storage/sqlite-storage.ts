@@ -1,6 +1,8 @@
 import { encodeSpliceLockedMessage } from '../message/splice';
 import { Transaction } from 'bitcoinjs-lib';
 import { isDeepStrictEqual } from 'util';
+import { assetSpliceFundingExits } from './asset-splice-funding-exits';
+import type { AssetSpliceExitEvent } from './asset-splice-exit-proofs';
 import { FinalSpliceSession } from '../channel/final-splice-session';
 import {
 	finalSpliceAttempts,
@@ -1685,8 +1687,27 @@ export class SqliteStorage implements IStorageBackend {
 		return this.openingExitBytes(channelId);
 	}
 
+	private retainedAssetFundingExits(record: IFinalOpeningRecord): string[] {
+		if (this.finalGeneration !== 4 || !record.nonces.session?.assetEvidence)
+			return [];
+		const { channelId, fundingTxHex, fundingOutputIndex } = record.candidate;
+		const { records } = this.finalJournal().read<AssetSpliceExitEvent>(
+			'asset-splice',
+			channelId
+		);
+		return assetSpliceFundingExits(
+			records,
+			channelId,
+			Transaction.fromHex(fundingTxHex).getId(),
+			fundingOutputIndex,
+			record.nonces.session.assetEvidence.fundingRoot,
+			record.nonces.signing?.exit
+		);
+	}
+
 	private openingSuperseded(record: IFinalOpeningRecord): boolean {
 		return (
+			this.retainedAssetFundingExits(record).length > 0 ||
 			!!this.latestFinalUpdate(record)?.local.height ||
 			(this.canUpdateFinalCommitments &&
 				this.readFinalSpliceAttempts(record.candidate.channelId).some(
@@ -1718,7 +1739,8 @@ export class SqliteStorage implements IStorageBackend {
 	private availableFundingExits(record: IFinalOpeningRecord) {
 		const opening = record.nonces.signing?.exit;
 		if (!opening) return [];
-		let exits = [opening];
+		const retained = this.retainedAssetFundingExits(record);
+		let exits = retained.length ? retained : [opening];
 		if (this.canUpdateFinalCommitments && record.nonces.session?.updateLimits) {
 			const existing = this.latestFinalUpdate(record);
 			if (existing || (record.nonces.localReady && record.nonces.peerReady)) {
@@ -1765,14 +1787,24 @@ export class SqliteStorage implements IStorageBackend {
 	private selectedFinalExit(
 		record: IFinalOpeningRecord,
 		requested?: string | null,
-		fundingTxid?: Buffer
+		fundingTxid?: Buffer,
+		fundingOutputIndex?: number
 	): string {
 		const exits = this.availableFundingExits(record);
-		const match = exits.find((e) =>
+		if (fundingOutputIndex !== undefined && !fundingTxid)
+			throw new Error('A funding output index requires its transaction ID');
+		const matches = exits.filter((e) =>
 			fundingTxid
-				? e.fundingTxid.equals(fundingTxid)
+				? e.fundingTxid.equals(fundingTxid) &&
+				  (fundingOutputIndex === undefined ||
+						Transaction.fromBuffer(e.exit).ins[0].index === fundingOutputIndex)
 				: !requested || sha256(e.exit).toString('hex') === requested
 		);
+		if (this.finalGeneration === 4 && matches.length > 1)
+			throw new Error(
+				'Select the matching asset funding outpoint for this exit'
+			);
+		const match = matches[0];
 		if (!match)
 			throw new Error(
 				'Requested exit does not match a current funding commitment'
@@ -2529,7 +2561,11 @@ export class SqliteStorage implements IStorageBackend {
 	}
 
 	/** Persist the operator's request before broadcasting the already signed exit. */
-	requestFinalOpeningExit(channelId: string, fundingTxid?: Buffer): Buffer {
+	requestFinalOpeningExit(
+		channelId: string,
+		fundingTxid?: Buffer,
+		fundingOutputIndex?: number
+	): Buffer {
 		this.requireCurrentFinalDevice();
 		return this.updateOpeningNonces(channelId, (state, candidate, nonceKey) => {
 			const signing = state.signing;
@@ -2538,11 +2574,15 @@ export class SqliteStorage implements IStorageBackend {
 			const exit = this.selectedFinalExit(
 				{ candidate, nonces: state, nonceKey },
 				this.openingAuthority?.chosenFundingExit(channelId),
-				fundingTxid
+				fundingTxid,
+				fundingOutputIndex
 			);
 			if (!this.openingAuthority?.exitRequest(channelId))
 				this.openingAuthority?.recordExitRequest(channelId, exit);
-			if (this.canUpdateFinalCommitments && fundingTxid)
+			if (
+				(this.canUpdateFinalCommitments || this.canSpliceDualFundedAssets) &&
+				fundingTxid
+			)
 				this.openingAuthority!.recordFundingExitChoice(
 					channelId,
 					sha256(Buffer.from(exit, 'hex')).toString('hex')
