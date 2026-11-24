@@ -7408,6 +7408,7 @@ property recovery.IBoundGuardianClient.client: recovery.GuardianClient
 property recovery.IBoundGuardianClient.expectedGuardianId: Buffer
 interface recovery.ICapsuleRestoreOptions
 property recovery.ICapsuleRestoreOptions.auxiliaryChannels?: channel.IAuxiliaryChannelConfig
+property recovery.ICapsuleRestoreOptions.expectedNetwork?: string
 property recovery.ICapsuleRestoreOptions.omitAuxiliaryChannels?: boolean
 property recovery.ICapsuleRestoreOptions.scratchStorage?: () => storage.IStorageBackend
 interface recovery.ICapsuleRestoreResult

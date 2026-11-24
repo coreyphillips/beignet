@@ -81,6 +81,8 @@ import { OnchainSweeps } from './onchain-sweep';
 import { ensurePrivateDir, writeFileAtomic } from './fs-utils';
 import { holdDbRestoredChannels } from './restore';
 import { deriveBackupMacKey, writeBackupMac } from './backup-mac';
+import { requireLegacyWallet } from '../lightning/storage/wallet-format-guard';
+import { assertLegacyWalletFile } from '../lightning/storage/final-wallet-format';
 import { nodeStorageView } from './node-storage-view';
 import {
 	ENGINE_VERSION,
@@ -3081,6 +3083,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 		// serve is refused with nothing held.
 		if (opts.extensions !== undefined) validateExtensions(opts.extensions);
 		if (opts.storage !== undefined) {
+			requireLegacyWallet(opts.storage);
 			const refusal = injectedStorageRefusal(opts.storage);
 			if (refusal !== null) throw new BeignetError('INVALID_PARAMS', refusal);
 			if (opts.backupPath !== undefined) {
@@ -3400,13 +3403,22 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 		}
 
 		// 3. Open storage: the caller's backend as given, else SQLite.
-		if (opts.storage) {
-			this.storageInjected = true;
-			this.storage = opts.storage;
-			this.storage.open();
-			this._bootOpts = opts;
-		} else {
-			this.openSqliteStorage(opts);
+		try {
+			if (opts.storage) {
+				this.storageInjected = true;
+				this.storage = opts.storage;
+				this.storage.open();
+				this._bootOpts = opts;
+			} else {
+				this.openSqliteStorage(opts);
+			}
+		} catch (err) {
+			try {
+				if (!opts.storage) this.storage?.close();
+			} finally {
+				this.releaseLock();
+			}
+			throw err;
 		}
 
 		// Recovery Protocol boot decision (docs/RECOVERY-PROTOCOL.md section
@@ -6106,6 +6118,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 				'capsule:selecting',
 				`${blobs.length} candidate capsule(s) from storage peers`
 			);
+			assertLegacyWalletFile(stagedPath);
 			dropStaged();
 			// Everything up to the marker write is a TARGET failure unless the
 			// library says otherwise: the candidates are only to blame for a
@@ -6144,6 +6157,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 			let result: ReturnType<typeof restoreBestRecoveryCapsule>;
 			try {
 				result = restoreBestRecoveryCapsule(blobs, staged, this.nodeSecret(), {
+					expectedNetwork: this.toLnNetwork(this.networkName),
 					scratchStorage: (): SqliteStorage => {
 						const scratch = new Sqlite(':memory:');
 						scratch.open();
@@ -6154,15 +6168,6 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 						: {}),
 					...(omitAssetChannels ? { omitAuxiliaryChannels: true } : {})
 				});
-				// Retrieval already refuses wrong-network capsules; this is the
-				// belt on those braces, and a candidate defect if it ever fires.
-				const expectedNetwork = this.toLnNetwork(this.networkName);
-				if (result.scb.network !== expectedNetwork) {
-					throw new CapsuleCandidateError(
-						`capsule SCB network "${result.scb.network}" does not match ` +
-							`this node's network "${expectedNetwork}"`
-					);
-				}
 			} catch (err) {
 				staged.close();
 				dropStaged();
@@ -7022,6 +7027,8 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 		}
 		const stagedPath = path.join(this.requireDataDir(), marker.staged);
 		const keptPath = path.join(this.requireDataDir(), marker.keep);
+		for (const file of [dbPath, stagedPath, keptPath])
+			assertLegacyWalletFile(file);
 		const sidecars = ['-wal', '-shm'];
 		const moveAside = (): void => {
 			// The restore verified emptiness before writing the marker; verify
@@ -7037,8 +7044,8 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 					? { encryptionKey: this._storageEncryptionKey }
 					: undefined
 			);
-			current.open();
 			try {
+				current.open();
 				assertEmptyTarget(current);
 			} finally {
 				current.close();

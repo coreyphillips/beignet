@@ -1,0 +1,131 @@
+import { getPublicKey, isValidPublicKey } from '../crypto/ecdh';
+import { generateNonce } from '../crypto/musig';
+import { hmacSha256, randomBytes } from '../crypto/provider';
+import { MAX_LIGHTNING_PAYLOAD } from '../message/custom-records';
+import {
+	decodeTxCompleteMessage,
+	encodeTxCompleteMessage
+} from '../message/interactive-tx';
+
+export interface IFinalOpeningNonces {
+	local?: { salt: string; payload: string };
+	peer?: string;
+}
+
+function validPayload(channelId: string, payload: Buffer): void {
+	if (!Buffer.isBuffer(payload) || payload.length > MAX_LIGHTNING_PAYLOAD)
+		throw new Error('Invalid opening tx_complete payload');
+	const message = decodeTxCompleteMessage(payload, { taproot: true });
+	const pair = message.commitNonces;
+	if (
+		!pair ||
+		message.fundingInputNonce ||
+		message.channelId.toString('hex') !== channelId ||
+		pair.current.equals(pair.next)
+	)
+		throw new Error('Invalid opening commitment nonce pair');
+	for (const nonce of [pair.current, pair.next]) {
+		if (
+			!isValidPublicKey(nonce.subarray(0, 33)) ||
+			!isValidPublicKey(nonce.subarray(33))
+		)
+			throw new Error('Invalid opening public nonce point');
+	}
+}
+
+function readPayload(channelId: string, hex: string): Buffer {
+	if (
+		typeof hex !== 'string' ||
+		hex.length % 2 ||
+		hex.length > MAX_LIGHTNING_PAYLOAD * 2 ||
+		!/^[0-9a-f]+$/.test(hex)
+	)
+		throw new Error('Invalid stored tx_complete');
+	const payload = Buffer.from(hex, 'hex');
+	validPayload(channelId, payload);
+	return payload;
+}
+
+export function decodeOpeningNonces(
+	channelId: string,
+	text: string
+): IFinalOpeningNonces {
+	const value: IFinalOpeningNonces = JSON.parse(text);
+	if (
+		!value ||
+		typeof value !== 'object' ||
+		Array.isArray(value) ||
+		Object.keys(value).some((key) => key !== 'local' && key !== 'peer')
+	)
+		throw new Error('Invalid stored final opening nonces');
+	if (value.local !== undefined) {
+		if (
+			!value.local ||
+			typeof value.local.salt !== 'string' ||
+			!/^[0-9a-f]{64}$/.test(value.local.salt) ||
+			Object.keys(value.local).length !== 2
+		)
+			throw new Error('Invalid local opening nonce reservation');
+		readPayload(channelId, value.local.payload);
+	}
+	if (value.peer !== undefined) readPayload(channelId, value.peer);
+	return value;
+}
+
+/** Reserve verification nonces for commitment heights zero and one. A signing nonce has a separate lifecycle. */
+export function localOpeningTxComplete(
+	state: IFinalOpeningNonces,
+	channelId: string,
+	localFundingPubkey: string,
+	fundingPrivateKey: Buffer,
+	context: Buffer
+): Buffer {
+	const publicKey = getPublicKey(fundingPrivateKey);
+	if (publicKey.toString('hex') !== localFundingPubkey)
+		throw new Error('Opening funding key does not match');
+	const salt = state.local
+		? Buffer.from(state.local.salt, 'hex')
+		: randomBytes(32);
+	const verificationNonce = (height: number): Buffer =>
+		Buffer.from(
+			generateNonce({
+				publicKey,
+				secretKey: fundingPrivateKey,
+				sessionId: hmacSha256(
+					salt,
+					Buffer.concat([context, Buffer.of(height)])
+				),
+				extraInput: Buffer.from('beignet-final-opening-verification-v1')
+			})
+		);
+	const payload = encodeTxCompleteMessage({
+		channelId: Buffer.from(channelId, 'hex'),
+		commitNonces: { current: verificationNonce(0), next: verificationNonce(1) }
+	});
+	validPayload(channelId, payload);
+	if (state.local) {
+		const promised = Buffer.from(state.local.payload, 'hex');
+		if (!payload.equals(promised))
+			throw new Error(
+				'Opening nonce reservation does not reproduce the promised payload'
+			);
+		return promised;
+	}
+	state.local = {
+		salt: salt.toString('hex'),
+		payload: payload.toString('hex')
+	};
+	return payload;
+}
+
+export function recordPeerTxComplete(
+	state: IFinalOpeningNonces,
+	channelId: string,
+	payload: Buffer
+): void {
+	validPayload(channelId, payload);
+	const hex = payload.toString('hex');
+	if (state.peer !== undefined && state.peer !== hex)
+		throw new Error('Peer changed its remembered opening tx_complete');
+	state.peer = hex;
+}

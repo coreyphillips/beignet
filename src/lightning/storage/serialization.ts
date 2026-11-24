@@ -71,6 +71,7 @@ import type {
 import {
 	assertLegacyCommitmentProfile,
 	hasCommitmentProfile,
+	isFinalTaprootTypeHex,
 	UnsupportedCommitmentProfileError
 } from '../channel/commitment-profile';
 import { Feature, FeatureFlags } from '../features/flags';
@@ -895,9 +896,6 @@ export function deserializeV2InFlight(s: ISerializedV2InFlight): IV2InFlight {
 	};
 }
 
-// BOLT 2 channel_type: final simple Taproot, with optional scid_alias.
-const FINAL_TYPES = ['0100000000000000000000', '0100000000400000000000'];
-
 function channelCommitmentProfile(
 	s: IChannelState | ISerializedChannelState,
 	finalTaproot: boolean | undefined,
@@ -931,7 +929,7 @@ function channelCommitmentProfile(
 	if (
 		s.commitmentProfile !== 'simple-taproot-final' ||
 		hex === undefined ||
-		!FINAL_TYPES.includes(hex) ||
+		!isFinalTaprootTypeHex(hex) ||
 		(direction === 'decode' && raw !== hex) ||
 		s.fundingVersion !== 2 ||
 		s.fundingTaprootMerkleRoot !== undefined ||

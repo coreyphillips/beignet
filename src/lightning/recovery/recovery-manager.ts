@@ -10,6 +10,7 @@
  * commit path.
  */
 
+import { requireLegacyWallet } from '../storage/wallet-format-guard';
 import { SUPERSEDES_OWN_KIND_MESSAGE_TYPES } from '../channel/channel-actions';
 import { markAuxiliaryRevokedViewsStored } from '../channel/auxiliary-revoked';
 import type { IChannelState } from '../channel/channel-state';
@@ -83,6 +84,7 @@ export class RecoveryManager {
 	private readonly outboxCounts = new Map<string, number>();
 
 	constructor(storage: IStorageBackend, options: IRecoveryManagerOptions = {}) {
+		requireLegacyWallet(storage);
 		this.storage = storage;
 		this.snapshotStore = storage.revokedHtlcSnapshotStore?.() ?? storage;
 		this.options = options;

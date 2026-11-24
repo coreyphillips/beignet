@@ -20,8 +20,27 @@ import {
 	validateFforVoucherArchive
 } from '../ffor/voucher-archive';
 import type Database from 'better-sqlite3';
+import { validateFinalOpening } from './final-opening-candidate';
+import type { IFinalOpeningCandidate } from './final-opening-candidate';
+import {
+	decodeOpeningNonces,
+	localOpeningTxComplete,
+	recordPeerTxComplete,
+	type IFinalOpeningNonces
+} from './final-opening-nonces';
 import { loadBetterSqlite3 } from './sqlite-binding';
-import { hmacSha256 } from '../crypto/provider';
+import { finalWalletStorage } from './wallet-format-guard';
+import {
+	assertExistingWalletFile,
+	backUpWalletFile,
+	checkWalletFormat,
+	finalWalletIdentity,
+	installFreshWallet,
+	installWalletMarker,
+	type IFinalWalletBinding
+} from './final-wallet-format';
+
+import { hmacSha256, sha256 } from '../crypto/provider';
 import { nodeFs } from '../../utils/node-builtins';
 import type {
 	IStorageBackend,
@@ -87,6 +106,8 @@ import {
 	StorageEncryptedError
 } from './encryption';
 
+const boundWallet = Symbol('final wallet binding');
+
 /** Owner read/write only: the mode for a file holding this wallet's data. */
 const OWNER_ONLY_FILE_MODE = 0o600;
 
@@ -135,6 +156,19 @@ interface IRevokedHtlcSnapshotRow {
 	channel_id: string;
 	commitment_number: string;
 	htlcs_json: string;
+}
+
+interface IFinalOpeningRecord {
+	candidate: IFinalOpeningCandidate;
+	nonces: IFinalOpeningNonces;
+	nonceKey: Buffer;
+}
+
+interface IFinalOpeningRow {
+	channel_id: string;
+	funding_outpoint: string;
+	record_json: string;
+	nonces_json: string;
 }
 
 /** What paymentsNewestFirst tests a row on besides its age. */
@@ -311,6 +345,13 @@ function decodeRecoveryFrameRow(row: IRecoveryFrameRow): IStoredRecoveryFrame {
 export class SqliteStorage implements IStorageBackend {
 	private db: Database.Database;
 	private readonly dbPath: string;
+	private readonly walletIdentity?: string;
+	get [finalWalletStorage](): boolean {
+		return this.walletIdentity !== undefined;
+	}
+	private get channelStateColumn(): 'state_json' | 'channel_state_v2' {
+		return this.walletIdentity ? 'channel_state_v2' : 'state_json';
+	}
 	private onCorruptRow?: (error: unknown) => void;
 	private unreadableAssetChannels: string[] = [];
 	private encryptionKey?: Buffer;
@@ -338,10 +379,13 @@ export class SqliteStorage implements IStorageBackend {
 	constructor(
 		dbPath: string,
 		onCorruptRow?: (error: unknown) => void,
-		opts?: { encryptionKey?: Buffer }
+		opts?: { encryptionKey?: Buffer; [boundWallet]?: string }
 	) {
 		const Sqlite = loadBetterSqlite3();
-		this.db = new Sqlite(dbPath);
+		this.walletIdentity = opts?.[boundWallet];
+		this.db = this.walletIdentity
+			? new Sqlite(dbPath, { fileMustExist: true, timeout: 0 })
+			: new Sqlite(dbPath);
 		this.dbPath = dbPath;
 		this.onCorruptRow = onCorruptRow;
 		this.encryptionKey = opts?.encryptionKey;
@@ -352,7 +396,46 @@ export class SqliteStorage implements IStorageBackend {
 		// Before open() switches on WAL: SQLite creates the -wal and -shm
 		// sidecars with the database file's own bits, so tightening the main
 		// file first covers them from the start.
-		this._restrictFileModes();
+		if (!this.walletIdentity) this._restrictFileModes();
+	}
+
+	/** Initialize a separate physical format for a newly generated wallet. */
+	static createFinalWallet(
+		dbPath: string,
+		binding: IFinalWalletBinding
+	): SqliteStorage {
+		const identity = finalWalletIdentity(dbPath, binding);
+		installFreshWallet(dbPath, (stagedPath) => {
+			const staged = new SqliteStorage(stagedPath, undefined, binding);
+			try {
+				staged.open();
+				installWalletMarker(staged.db, binding.encryptionKey, identity);
+				staged.checkpoint();
+			} finally {
+				staged.close();
+			}
+		});
+		return SqliteStorage.openFinalWallet(dbPath, binding);
+	}
+
+	/** Reopen a wallet with its authenticated node identity, chain and storage key. */
+	static openFinalWallet(
+		dbPath: string,
+		binding: IFinalWalletBinding
+	): SqliteStorage {
+		const identity = finalWalletIdentity(dbPath, binding);
+		assertExistingWalletFile(dbPath);
+		const storage = new SqliteStorage(dbPath, undefined, {
+			encryptionKey: Buffer.from(binding.encryptionKey),
+			[boundWallet]: identity
+		});
+		try {
+			storage.open();
+			return storage;
+		} catch (error) {
+			storage.close();
+			throw error;
+		}
 	}
 
 	/**
@@ -487,6 +570,29 @@ export class SqliteStorage implements IStorageBackend {
 	}
 
 	open(opts?: { synchronous?: 'FULL' | 'NORMAL' }): void {
+		// Installing the final format happens only in a private staging file. A
+		// bound open checks the complete format before any migration or rewrite.
+		if (this.walletIdentity) {
+			if (opts?.synchronous === 'NORMAL')
+				throw new Error('Final wallet requires full synchronous writes');
+			this.db.pragma('locking_mode = EXCLUSIVE');
+			this.db
+				.transaction(() => {
+					checkWalletFormat(this.db, this.encryptionKey, this.walletIdentity);
+					if (this.getSchemaVersion() !== SqliteStorage.CURRENT_SCHEMA_VERSION)
+						throw new Error('Unsupported final wallet schema version');
+					this._checkRequiredColumns();
+				})
+				.exclusive();
+			this.db.pragma('journal_mode = WAL');
+			this.db.pragma('synchronous = FULL');
+			this.db.pragma('foreign_keys = ON');
+			this.loadAllChannels();
+			this.readFinalOpenings();
+			this._restrictFileModes();
+			return;
+		}
+		checkWalletFormat(this.db);
 		this.db.pragma('journal_mode = WAL');
 		this.db.pragma(`synchronous = ${opts?.synchronous ?? 'FULL'}`);
 		this.db.pragma('foreign_keys = ON');
@@ -518,10 +624,233 @@ export class SqliteStorage implements IStorageBackend {
 	 * Uses SQLite's online backup API for a crash-safe copy.
 	 */
 	async backup(destPath: string): Promise<void> {
-		await this.db.backup(destPath);
+		await backUpWalletFile(
+			this.db,
+			destPath,
+			this.encryptionKey,
+			this.walletIdentity
+		);
 		// A backup is a copy of this database, plaintext lookup columns
 		// included, created by SQLite under the process umask (issue #1004).
 		if (process.platform !== 'win32') restrictFileMode(destPath);
+	}
+
+	private finalOpeningKey(channelId: string, outpoint: string): Buffer {
+		if (!this.walletIdentity || !this.encryptionKey)
+			throw new Error('Final opening candidates require a bound final wallet');
+		return hkdfKey(
+			this.encryptionKey,
+			JSON.stringify([
+				'beignet-final-opening-candidate-v1',
+				this.walletIdentity,
+				channelId,
+				outpoint
+			])
+		);
+	}
+
+	private readFinalOpening(row: IFinalOpeningRow): IFinalOpeningRecord {
+		const key = this.finalOpeningKey(row.channel_id, row.funding_outpoint);
+		const plaintext = decryptValue(key, row.record_json);
+		const candidate: IFinalOpeningCandidate = JSON.parse(plaintext);
+		const { encoded, fundingOutpoint } = validateFinalOpening(candidate);
+		if (
+			candidate.channelId !== row.channel_id ||
+			fundingOutpoint !== row.funding_outpoint ||
+			encoded !== plaintext
+		)
+			throw new Error('Invalid stored final opening candidate');
+		const nonceKey = this.openingNonceKey(key, encoded);
+		const nonces = decodeOpeningNonces(
+			candidate.channelId,
+			decryptValue(nonceKey, row.nonces_json)
+		);
+		return { candidate, nonces, nonceKey };
+	}
+
+	private openingNonceKey(key: Buffer, encoded: string): Buffer {
+		return hkdfKey(
+			key,
+			'beignet-final-opening-nonces-v1/' +
+				sha256(Buffer.from(encoded)).toString('hex')
+		);
+	}
+
+	/** Stream and authenticate every reservation, including on startup. */
+	private readFinalOpenings(
+		visit?: (candidate: IFinalOpeningCandidate) => void
+	): void {
+		if (!this.walletIdentity)
+			throw new Error('Final opening candidates require a bound final wallet');
+		const rows = this.db
+			.prepare(
+				'SELECT channel_id, funding_outpoint, record_json, nonces_json FROM final_opening_candidates ORDER BY channel_id'
+			)
+			.iterate() as Iterable<IFinalOpeningRow>;
+		for (const row of rows) {
+			const { candidate } = this.readFinalOpening(row);
+			visit?.(candidate);
+		}
+	}
+
+	private assertNoFinalOpeningConflict(id: string, state: IChannelState): void {
+		const reservedId = this._stmt(
+			'SELECT 1 FROM final_opening_candidates WHERE channel_id IN (?, ?, ?)'
+		).get(
+			id,
+			state.channelId?.toString('hex') ?? null,
+			state.temporaryChannelId.toString('hex')
+		);
+		if (reservedId)
+			throw new Error('Channel id already reserved for a final opening');
+
+		const outpoints = new Set<string>();
+		const add = (hash: Buffer | null, index: number): void => {
+			if (hash)
+				outpoints.add(
+					Buffer.from(hash).reverse().toString('hex') + ':' + index
+				);
+		};
+		add(state.fundingTxid, state.fundingOutputIndex);
+		add(state.spliceFundingTxid, state.spliceFundingOutputIndex);
+		if (state.spliceInFlight)
+			add(
+				state.spliceInFlight.spliceTxid,
+				state.spliceInFlight.newFundingOutputIndex
+			);
+		if (state.v2InFlight)
+			add(state.v2InFlight.fundingTxid, state.v2InFlight.fundingOutputIndex);
+		for (const attempt of state.v2PreviousAttempts ?? [])
+			add(attempt.fundingTxid, attempt.fundingOutputIndex);
+		for (const watch of state.preSpliceSpendWatches ?? [])
+			outpoints.add(watch.txid + ':' + watch.outputIndex);
+		for (const reverted of state.revertedSplices ?? [])
+			outpoints.add(reverted.spliceTxid + ':' + reverted.newFundingOutputIndex);
+		const reserved = this._stmt(
+			'SELECT 1 FROM final_opening_candidates WHERE funding_outpoint = ?'
+		);
+		for (const outpoint of outpoints) {
+			if (reserved.get(outpoint))
+				throw new Error(
+					'Channel funding outpoint already reserved for a final opening'
+				);
+		}
+	}
+
+	/** Remember the first unsigned candidate before beginning any signing session. */
+	rememberFinalOpening(candidate: IFinalOpeningCandidate): void {
+		if (this.db.inTransaction)
+			throw new Error('Final opening reservation requires a top-level commit');
+		const { encoded, fundingOutpoint } = validateFinalOpening(candidate);
+		const { channelId } = candidate;
+		const key = this.finalOpeningKey(channelId, fundingOutpoint);
+		this.db
+			.transaction(() => {
+				const existing = this.loadFinalOpening(channelId);
+				if (existing) {
+					if (JSON.stringify(existing) !== encoded)
+						throw new Error(
+							'A different final opening candidate is already reserved'
+						);
+					return;
+				}
+				const inserted = this._stmt(
+					'INSERT INTO final_opening_candidates (channel_id, funding_outpoint, record_json, nonces_json) VALUES (?, ?, ?, ?)'
+				).run(
+					channelId,
+					fundingOutpoint,
+					encryptValue(key, encoded),
+					encryptValue(this.openingNonceKey(key, encoded), '{}')
+				);
+				if (
+					inserted.changes !== 1 ||
+					JSON.stringify(this.loadFinalOpening(channelId)) !== encoded
+				)
+					throw new Error('Final opening candidate was not written');
+				// Channel outpoints are in encrypted state, including pending v2
+				// attempts and splices. Check every row before committing this slot.
+				this.loadAllChannels();
+			})
+			.immediate();
+	}
+
+	/** Read and authenticate the complete unsigned candidate against its indexed outpoint. */
+	loadFinalOpening(channelId: string): IFinalOpeningCandidate | null {
+		return this.finalOpeningRecord(channelId)?.candidate ?? null;
+	}
+
+	/** Discover the remembered openings after a restart, before any live channel exists. */
+	loadFinalOpenings(): IFinalOpeningCandidate[] {
+		const candidates: IFinalOpeningCandidate[] = [];
+		this.readFinalOpenings((candidate) => candidates.push(candidate));
+		return candidates;
+	}
+
+	private finalOpeningRecord(channelId: string): IFinalOpeningRecord | null {
+		if (!this.walletIdentity)
+			throw new Error('Final opening candidates require a bound final wallet');
+		if (typeof channelId !== 'string' || !/^[0-9a-f]{64}$/.test(channelId))
+			throw new Error('Invalid final opening channel id');
+		const row = this._stmt(
+			'SELECT channel_id, funding_outpoint, record_json, nonces_json FROM final_opening_candidates WHERE channel_id = ?'
+		).get(channelId) as IFinalOpeningRow | undefined;
+		return row ? this.readFinalOpening(row) : null;
+	}
+
+	/** Return the exact tx_complete payload after its nonce reservation commits. */
+	finalOpeningTxComplete(channelId: string, fundingPrivateKey: Buffer): Buffer {
+		return this.updateOpeningNonces(channelId, (nonces, candidate, nonceKey) =>
+			localOpeningTxComplete(
+				nonces,
+				channelId,
+				candidate.localFundingPubkey,
+				fundingPrivateKey,
+				nonceKey
+			)
+		);
+	}
+
+	rememberFinalPeerTxComplete(channelId: string, payload: Buffer): void {
+		this.updateOpeningNonces(channelId, (nonces) =>
+			recordPeerTxComplete(nonces, channelId, payload)
+		);
+	}
+
+	loadFinalPeerTxComplete(channelId: string): Buffer | null {
+		const peer = this.finalOpeningRecord(channelId)?.nonces.peer;
+		return peer === undefined ? null : Buffer.from(peer, 'hex');
+	}
+
+	private updateOpeningNonces<T>(
+		channelId: string,
+		update: (
+			nonces: IFinalOpeningNonces,
+			candidate: IFinalOpeningCandidate,
+			nonceKey: Buffer
+		) => T
+	): T {
+		if (this.db.inTransaction)
+			throw new Error('Opening nonces require a top-level commit');
+		return this.db
+			.transaction(() => {
+				const record = this.finalOpeningRecord(channelId);
+				if (!record) throw new Error('Unknown final opening candidate');
+				const before = JSON.stringify(record.nonces);
+				const result = update(record.nonces, record.candidate, record.nonceKey);
+				const after = JSON.stringify(record.nonces);
+				if (before !== after) {
+					const written = this._stmt(
+						'UPDATE final_opening_candidates SET nonces_json = ? WHERE channel_id = ?'
+					).run(encryptValue(record.nonceKey, after), channelId);
+					if (
+						written.changes !== 1 ||
+						JSON.stringify(this.finalOpeningRecord(channelId)?.nonces) !== after
+					)
+						throw new Error('Opening nonce reservation was not written');
+				}
+				return result;
+			})
+			.immediate();
 	}
 
 	// ─── Schema ───
@@ -1233,7 +1562,11 @@ export class SqliteStorage implements IStorageBackend {
 		)) {
 			const present = columnNames(this.db, table);
 			for (const column of required) {
-				if (!present.has(column)) missing.push(`${table}.${column}`);
+				const expected =
+					table === 'channels' && column === 'state_json'
+						? this.channelStateColumn
+						: column;
+				if (!present.has(expected)) missing.push(`${table}.${expected}`);
 			}
 		}
 		if (missing.length > 0) {
@@ -1264,8 +1597,9 @@ export class SqliteStorage implements IStorageBackend {
 		let addedRows = 0;
 		let addedBytes = 0;
 		this.db.transaction(() => {
+			if (this.walletIdentity) this.assertNoFinalOpeningConflict(id, state);
 			this._stmt(
-				'INSERT OR REPLACE INTO channels (channel_id, state_json, peer_pubkey) VALUES (?, ?, ?)'
+				`INSERT OR REPLACE INTO channels (channel_id, ${this.channelStateColumn}, peer_pubkey) VALUES (?, ?, ?)`
 			).run(id, this._enc(json), peerPubkey);
 			if (revokedViews) {
 				const keep = this._stmt(
@@ -1362,13 +1696,20 @@ export class SqliteStorage implements IStorageBackend {
 		return this;
 	}
 
+	private _decodeChannelJson(value: string): unknown {
+		const text = this.walletIdentity
+			? decryptValue(this.encryptionKey!, value)
+			: this._dec(value);
+		return JSON.parse(text);
+	}
+
 	loadChannel(id: string): { state: IChannelState; peerPubkey: string } | null {
 		const row = this._stmt(
-			'SELECT state_json, peer_pubkey FROM channels WHERE channel_id = ?'
+			`SELECT ${this.channelStateColumn} AS state_json, peer_pubkey FROM channels WHERE channel_id = ?`
 		).get(id) as { state_json: string; peer_pubkey: string } | undefined;
 		if (!row) return null;
 		const state = deserializeChannelState(
-			channelRowFromStore(JSON.parse(this._dec(row.state_json)))
+			channelRowFromStore(this._decodeChannelJson(row.state_json))
 		);
 		const history = this._readRevokedHtlcSnapshots(
 			this._stmt(
@@ -1387,7 +1728,7 @@ export class SqliteStorage implements IStorageBackend {
 		peerPubkey: string;
 	}> {
 		const rows = this._stmt(
-			'SELECT channel_id, state_json, peer_pubkey FROM channels'
+			`SELECT channel_id, ${this.channelStateColumn} AS state_json, peer_pubkey FROM channels`
 		).all() as Array<{
 			channel_id: string;
 			state_json: string;
@@ -1409,8 +1750,10 @@ export class SqliteStorage implements IStorageBackend {
 		for (const row of rows) {
 			let parsed: unknown;
 			try {
-				parsed = JSON.parse(this._dec(row.state_json));
+				parsed = this._decodeChannelJson(row.state_json);
 				const state = deserializeChannelState(channelRowFromStore(parsed));
+				if (this.walletIdentity)
+					this.assertNoFinalOpeningConflict(row.channel_id, state);
 				this._attachRevokedHtlcSnapshots(state, history.get(row.channel_id));
 				results.push({
 					channelId: row.channel_id,
@@ -1418,7 +1761,11 @@ export class SqliteStorage implements IStorageBackend {
 					peerPubkey: row.peer_pubkey
 				});
 			} catch (err) {
-				if (err instanceof UnsupportedCommitmentProfileError) throw err;
+				if (
+					this.walletIdentity ||
+					err instanceof UnsupportedCommitmentProfileError
+				)
+					throw err;
 				// An asset channel row that parses but does not decode is
 				// remembered by id before it is skipped: startup refuses to
 				// run without it (see unreadableAssetChannelIds).

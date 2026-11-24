@@ -65,6 +65,7 @@ import type { TxidHex } from '../../utils/identifiers';
 import type { LightningNodeEvents, NodeErrorCode } from './events';
 import { randomBytes, sha256 } from '../crypto/provider';
 import type { ILogger } from '../../logger';
+import { requireLegacyWallet } from '../storage/wallet-format-guard';
 import { getPublicKey, isValidPublicKey } from '../crypto/ecdh';
 import {
 	signMessageWithKey,
@@ -2008,6 +2009,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		this.setMaxListeners(50);
 		const leaveLifecycleToCreate = constructingForCreate;
 		constructingForCreate = false;
+		requireLegacyWallet(nodeConfig.storage);
 		const config = resolveNodeConfig(nodeConfig);
 		// Peers ignore a node_announcement whose alias breaks the BOLT 1 string
 		// rule, so the node would silently vanish from their graphs.

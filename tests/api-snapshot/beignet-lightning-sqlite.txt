@@ -42,6 +42,24 @@ method GuardianStore.updateNamespaceState(recoveryId: Buffer, state: Buffer, rec
 method GuardianStore.updateRegistrationReceipt(recoveryId: Buffer, issuedAt: Buffer, signature: Buffer): void
 method GuardianStore.usageBytes(recoveryId?: Buffer): number
 method GuardianStore.write<T>(fn: () => T): T
+unexported interface IFinalOpeningCandidate
+property IFinalOpeningCandidate.channelId: string
+property IFinalOpeningCandidate.channelType: string
+property IFinalOpeningCandidate.fundingFeeratePerKw: number
+property IFinalOpeningCandidate.fundingOutputIndex: number
+property IFinalOpeningCandidate.fundingTxHex: string
+property IFinalOpeningCandidate.inputs: Array<{ prevTxHex: string; isLocal: boolean; serialId: string; }>
+property IFinalOpeningCandidate.isInitiator: boolean
+property IFinalOpeningCandidate.localContributionSats: number
+property IFinalOpeningCandidate.localFundingPubkey: string
+property IFinalOpeningCandidate.minimumDepth: number
+property IFinalOpeningCandidate.outputSerialIds: string[]
+property IFinalOpeningCandidate.remoteContributionSats: number
+property IFinalOpeningCandidate.remoteFundingPubkey: string
+unexported interface IFinalWalletBinding
+property IFinalWalletBinding.encryptionKey: Buffer
+property IFinalWalletBinding.network: 'mainnet' | 'testnet' | 'regtest' | 'signet'
+property IFinalWalletBinding.nodeId: string
 interface IGuardianEpochRow
 property IGuardianEpochRow.certIssuedAt: Buffer | null
 property IGuardianEpochRow.certSignature: Buffer | null
@@ -108,8 +126,9 @@ property IStoredPaymentRef.createdAt: number
 method IStoredPaymentRef.load(): beignet/lightning#node.IPaymentInfo | null
 property IStoredPaymentRef.paymentHash: string
 class SqliteStorage implements beignet/lightning#storage.IStorageBackend
-constructor SqliteStorage(dbPath: string, onCorruptRow?: (error: unknown) => void, opts?: { encryptionKey?: Buffer; })
+constructor SqliteStorage(dbPath: string, onCorruptRow?: (error: unknown) => void, opts?: { encryptionKey?: Buffer; [boundWallet]?: string; })
 static readonly property SqliteStorage.CURRENT_SCHEMA_VERSION = 21
+get SqliteStorage.[finalWalletStorage](): boolean
 method SqliteStorage.addWatchtowerUpdate(update: beignet/lightning#watchtower.IWatchtowerUpdate): number
 method SqliteStorage.auxiliaryRevokedCommitmentsSize(channelId: string): { rows: number; bytes: number; }
 method SqliteStorage.backup(destPath: string): Promise<void>
@@ -117,6 +136,7 @@ method SqliteStorage.checkpoint(): void
 method SqliteStorage.close(): void
 method SqliteStorage.corruptRowCount(): number
 method SqliteStorage.countOutboxMessages(channelId: string): number
+static method SqliteStorage.createFinalWallet(dbPath: string, binding: IFinalWalletBinding): SqliteStorage
 method SqliteStorage.deleteAllWebhooks(): void
 method SqliteStorage.deleteChannel(id: string): void
 method SqliteStorage.deleteChannelPolicy(channelId: string): void
@@ -141,6 +161,7 @@ method SqliteStorage.deleteRecoveryFramesBelow(sequence: number): void
 method SqliteStorage.deleteRecoveryMeta(key: string): void
 method SqliteStorage.deleteWatchtowerTower(towerUri: string): void
 method SqliteStorage.deleteWebhook(id: string): void
+method SqliteStorage.finalOpeningTxComplete(channelId: string, fundingPrivateKey: Buffer): Buffer
 property SqliteStorage.forwardingEventsMaxRows: number
 method SqliteStorage.getForwardingSummary(options?: { since?: number; }): beignet/lightning#storage.IForwardingSummary
 method SqliteStorage.getRecoveryMeta(key: string): string | null
@@ -179,6 +200,9 @@ method SqliteStorage.loadChannel(id: string): { state: beignet/lightning#channel
 method SqliteStorage.loadChannelKeyIndex(channelId: string): number | null
 method SqliteStorage.loadCompositeSplice(id: string): beignet/lightning#channel.ICompositeSpliceRecord | null
 method SqliteStorage.loadFforVoucher(id: string): beignet/lightning#ffor.IFforVoucherArchive | null
+method SqliteStorage.loadFinalOpening(channelId: string): IFinalOpeningCandidate | null
+method SqliteStorage.loadFinalOpenings(): IFinalOpeningCandidate[]
+method SqliteStorage.loadFinalPeerTxComplete(channelId: string): Buffer | null
 method SqliteStorage.loadGossipChannelsAfter(afterRowid: number, limit: number): beignet/lightning#storage.IGossipRowPage<beignet/lightning#gossip.IGraphChannel>
 method SqliteStorage.loadGossipNodesAfter(afterRowid: number, limit: number): beignet/lightning#storage.IGossipRowPage<beignet/lightning#gossip.IGraphNode>
 method SqliteStorage.loadMetadata(key: string): string | null
@@ -199,10 +223,13 @@ method SqliteStorage.loadWalletData(key: string): string | null
 method SqliteStorage.loadWatchtowerSessions(): Array<beignet/lightning#watchtower.IWatchtowerSession & { sessionKey: Buffer; }>
 method SqliteStorage.markWatchtowerUpdateAcked(id: number, seqNum: number): void
 method SqliteStorage.open(opts?: { synchronous?: 'FULL' | 'NORMAL'; }): void
+static method SqliteStorage.openFinalWallet(dbPath: string, binding: IFinalWalletBinding): SqliteStorage
 method SqliteStorage.paymentHashesWith(match: { status: string; direction: string; }): Set<string>
 method SqliteStorage.paymentsNewestFirst(since?: number, match?: IPaymentRowMatch): Generator<IStoredPaymentRef>
 method SqliteStorage.pruneOutboxMessages(channelId: string, keepNewest: number): void
 method SqliteStorage.recoveryFrameStats(): { count: number; minSequence: number; maxSequence: number; } | null
+method SqliteStorage.rememberFinalOpening(candidate: IFinalOpeningCandidate): void
+method SqliteStorage.rememberFinalPeerTxComplete(channelId: string, payload: Buffer): void
 method SqliteStorage.revokedHtlcSnapshotStore(): object
 method SqliteStorage.saveActionLog(entry: { category: string; action: string; timestamp: number; data: string; }): void
 method SqliteStorage.saveAnnouncedPeerAddresses(pubkey: string, timestamp: number, addresses: Array<{ host: string; port: number; }>): void
@@ -243,3 +270,5 @@ method SqliteStorage.setWatchtowerSessionProgress(sessionId: string, seqNum: num
 method SqliteStorage.transaction<T>(fn: () => T): T
 method SqliteStorage.unreadableAssetChannelIds(): string[]
 method SqliteStorage.updateQueueEntryStatus(id: string, status: string, error?: string, completedAt?: number): void
+unexported const boundWallet: unique symbol
+unexported const finalWalletStorage: unique symbol
