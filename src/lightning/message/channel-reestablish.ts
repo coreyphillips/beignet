@@ -20,6 +20,14 @@
  *     your announcement_signatures".
  */
 
+import {
+	type ICommitmentNonceDecodeOptions,
+	type IFundingVerificationNonce,
+	decodeNextLocalNonces,
+	encodeNextLocalNonces,
+	TLV_NEXT_LOCAL_NONCES
+} from './commitment-nonces';
+import { boundedLightningPayload } from './custom-records';
 import type { ITlvRecord } from './tlv';
 import { encodeTlvStream, decodeTlvStream } from './tlv';
 import {
@@ -50,6 +58,10 @@ export interface IChannelReestablishMessage {
 	 * local_nonce, TLV type 4 — same convention as open/accept/revoke).
 	 */
 	nextLocalNonce?: Buffer;
+	/** Final Taproot verification nonces keyed by funding txid (TLV 22). */
+	nextLocalNonces?: IFundingVerificationNonce[];
+	/** Verification nonce for a requested interactive commitment retransmission (TLV 24). */
+	currentCommitNonce?: Buffer;
 	/**
 	 * Splice spec (bolts#1160) TLV 5: the funding tx the sender last locked.
 	 * A receiver treats it as a splice_locked for that txid, which is how a
@@ -87,12 +99,21 @@ const TLV_NEXT_FUNDING_LEGACY = 0n;
 /** option_taproot verification nonce (LND local_nonce convention). */
 const TLV_NEXT_LOCAL_NONCE = 4n;
 const TLV_MY_CURRENT_FUNDING_LOCKED = 5n;
-const CHANNEL_REESTABLISH_TLV_TYPES = new Set<bigint>([
+const TLV_CURRENT_COMMIT_NONCE = 24n;
+const COMMON_REESTABLISH_TLV_TYPES = [
 	TLV_NEXT_FUNDING_LEGACY,
 	TLV_NEXT_FUNDING,
-	TLV_NEXT_LOCAL_NONCE,
 	TLV_MY_CURRENT_FUNDING_LOCKED,
 	FF_REESTABLISH_TLV_TYPE
+];
+const CHANNEL_REESTABLISH_TLV_TYPES = new Set([
+	...COMMON_REESTABLISH_TLV_TYPES,
+	TLV_NEXT_LOCAL_NONCE
+]);
+const FINAL_CHANNEL_REESTABLISH_TLV_TYPES = new Set([
+	...COMMON_REESTABLISH_TLV_TYPES,
+	TLV_NEXT_LOCAL_NONCES,
+	TLV_CURRENT_COMMIT_NONCE
 ]);
 
 /**
@@ -101,6 +122,10 @@ const CHANNEL_REESTABLISH_TLV_TYPES = new Set<bigint>([
 export function encodeChannelReestablishMessage(
 	msg: IChannelReestablishMessage
 ): Buffer {
+	const finalNonces =
+		msg.nextLocalNonces !== undefined || msg.currentCommitNonce !== undefined;
+	if (finalNonces && msg.nextLocalNonce !== undefined)
+		throw new Error('Cannot mix staging and final Taproot nonce records');
 	const buf = Buffer.alloc(CHANNEL_REESTABLISH_LENGTH);
 	let offset = 0;
 
@@ -154,6 +179,20 @@ export function encodeChannelReestablishMessage(
 			value: Buffer.concat([txid, Buffer.from([retransmitFlags & 0xff])])
 		});
 	}
+	if (msg.nextLocalNonces !== undefined) {
+		tlvRecords.push(encodeNextLocalNonces(msg.nextLocalNonces));
+	}
+	if (msg.currentCommitNonce !== undefined) {
+		if (
+			!Buffer.isBuffer(msg.currentCommitNonce) ||
+			msg.currentCommitNonce.length !== 66
+		)
+			throw new Error('current_commit_nonce must be 66 bytes');
+		tlvRecords.push({
+			type: TLV_CURRENT_COMMIT_NONCE,
+			value: msg.currentCommitNonce
+		});
+	}
 	if (msg.ffor) {
 		tlvRecords.push(encodeFforReestablishTlv(msg.ffor));
 	}
@@ -161,15 +200,18 @@ export function encodeChannelReestablishMessage(
 		parts.push(encodeTlvStream(tlvRecords));
 	}
 
-	return Buffer.concat(parts);
+	const payload = Buffer.concat(parts);
+	return finalNonces ? boundedLightningPayload(payload) : payload;
 }
 
 /**
  * Decode a `channel_reestablish` message payload.
  */
 export function decodeChannelReestablishMessage(
-	payload: Buffer
+	payload: Buffer,
+	options: ICommitmentNonceDecodeOptions = {}
 ): IChannelReestablishMessage {
+	if (options.finalTaproot) boundedLightningPayload(payload);
 	if (payload.length < CHANNEL_REESTABLISH_LENGTH) {
 		throw new Error(
 			`channel_reestablish too short: need ${CHANNEL_REESTABLISH_LENGTH} bytes, got ${payload.length}`
@@ -205,7 +247,9 @@ export function decodeChannelReestablishMessage(
 		const { records } = decodeTlvStream(
 			payload,
 			offset,
-			CHANNEL_REESTABLISH_TLV_TYPES
+			options.finalTaproot
+				? FINAL_CHANNEL_REESTABLISH_TLV_TYPES
+				: CHANNEL_REESTABLISH_TLV_TYPES
 		);
 		for (const record of records) {
 			// Type 1 = current spec ([txid][retransmit_flags]); type 0 = the
@@ -236,6 +280,12 @@ export function decodeChannelReestablishMessage(
 					txid: Buffer.from(record.value.subarray(0, 32)),
 					retransmitFlags: record.value[32]
 				};
+			} else if (record.type === TLV_NEXT_LOCAL_NONCES) {
+				result.nextLocalNonces = decodeNextLocalNonces(record.value);
+			} else if (record.type === TLV_CURRENT_COMMIT_NONCE) {
+				if (record.value.length !== 66)
+					throw new Error('current_commit_nonce must be 66 bytes');
+				result.currentCommitNonce = record.value;
 			} else if (record.type === FF_REESTABLISH_TLV_TYPE) {
 				// A malformed epoch TLV is a peer bug in an odd record: drop
 				// the record rather than the whole reestablish.

@@ -5245,6 +5245,7 @@ property message.IChannelReadyMessage.secondPerCommitmentPoint: Buffer
 property message.IChannelReadyMessage.shortChannelId?: Buffer
 interface message.IChannelReestablishMessage
 property message.IChannelReestablishMessage.channelId: Buffer
+property message.IChannelReestablishMessage.currentCommitNonce?: Buffer
 property message.IChannelReestablishMessage.ffor?: ffor.IFforReestablishTlv
 property message.IChannelReestablishMessage.myCurrentFundingLocked?: message.IMyCurrentFundingLocked
 property message.IChannelReestablishMessage.myCurrentPerCommitmentPoint: Buffer
@@ -5252,23 +5253,30 @@ property message.IChannelReestablishMessage.nextCommitmentNumber: bigint
 property message.IChannelReestablishMessage.nextFundingRetransmitFlags?: number
 property message.IChannelReestablishMessage.nextFundingTxid?: Buffer
 property message.IChannelReestablishMessage.nextLocalNonce?: Buffer
+property message.IChannelReestablishMessage.nextLocalNonces?: message.IFundingVerificationNonce[]
 property message.IChannelReestablishMessage.nextRevocationNumber: bigint
 property message.IChannelReestablishMessage.yourLastPerCommitmentSecret: Buffer
 interface message.IClosingCompleteMessage
 property message.IClosingCompleteMessage.channelId: Buffer
+property message.IClosingCompleteMessage.closeeOutputOnlyPartialSig?: Buffer
 property message.IClosingCompleteMessage.closeeOutputOnlySig?: Buffer
 property message.IClosingCompleteMessage.closeeScriptPubkey: Buffer
+property message.IClosingCompleteMessage.closerAndCloseePartialSig?: Buffer
 property message.IClosingCompleteMessage.closerAndCloseeSig?: Buffer
+property message.IClosingCompleteMessage.closerOutputOnlyPartialSig?: Buffer
 property message.IClosingCompleteMessage.closerOutputOnlySig?: Buffer
 property message.IClosingCompleteMessage.closerScriptPubkey: Buffer
 property message.IClosingCompleteMessage.feeSatoshis: bigint
 property message.IClosingCompleteMessage.locktime: number
-type message.IClosingSigMessage = message.IClosingCompleteMessage
+interface message.IClosingSigMessage extends message.IClosingCompleteMessage
+property message.IClosingSigMessage.nextCloseeNonce?: Buffer
 interface message.IClosingSignedMessage
 property message.IClosingSignedMessage.channelId: Buffer
 property message.IClosingSignedMessage.feeSatoshis: bigint
 property message.IClosingSignedMessage.partialSignature?: Buffer
 property message.IClosingSignedMessage.signature: Buffer
+interface message.ICommitmentNonceDecodeOptions
+property message.ICommitmentNonceDecodeOptions.finalTaproot?: boolean
 interface message.ICommitmentSignedDecodeOptions
 property message.ICommitmentSignedDecodeOptions.customRecords?: boolean
 interface message.ICommitmentSignedMessage
@@ -5298,6 +5306,9 @@ interface message.IFundingSignedMessage
 property message.IFundingSignedMessage.channelId: Buffer
 property message.IFundingSignedMessage.partialSignatureWithNonce?: Buffer
 property message.IFundingSignedMessage.signature: Buffer
+interface message.IFundingVerificationNonce
+property message.IFundingVerificationNonce.fundingTxid: Buffer
+property message.IFundingVerificationNonce.nonce: Buffer
 interface message.IInitDecodeOptions
 property message.IInitDecodeOptions.customRecords?: boolean
 interface message.IInitMessage
@@ -5367,6 +5378,7 @@ property message.IRequestFunds.requestedSats: bigint
 interface message.IRevokeAndAckMessage
 property message.IRevokeAndAckMessage.channelId: Buffer
 property message.IRevokeAndAckMessage.nextLocalNonce?: Buffer
+property message.IRevokeAndAckMessage.nextLocalNonces?: message.IFundingVerificationNonce[]
 property message.IRevokeAndAckMessage.nextPerCommitmentPoint: Buffer
 property message.IRevokeAndAckMessage.perCommitmentSecret: Buffer
 interface message.IShutdownDecodeOptions
@@ -5376,6 +5388,8 @@ property message.IShutdownMessage.channelId: Buffer
 property message.IShutdownMessage.customRecords?: message.CustomRecords
 property message.IShutdownMessage.scriptPubkey: Buffer
 property message.IShutdownMessage.shutdownNonce?: Buffer
+interface message.ISimpleCloseCodecOptions
+property message.ISimpleCloseCodecOptions.finalTaproot?: boolean
 interface message.ISpliceAckMessage
 property message.ISpliceAckMessage.channelId: Buffer
 property message.ISpliceAckMessage.fundingPubkey: Buffer
@@ -5571,9 +5585,9 @@ function message.decodeAcceptChannel2Message(payload: Buffer): message.IAcceptCh
 function message.decodeAcceptChannelMessage(payload: Buffer): message.IAcceptChannelMessage
 function message.decodeBigSize(data: Buffer, offset?: number): message.IBigSizeResult
 function message.decodeChannelReadyMessage(payload: Buffer): message.IChannelReadyMessage
-function message.decodeChannelReestablishMessage(payload: Buffer): message.IChannelReestablishMessage
-function message.decodeClosingCompleteMessage(payload: Buffer): message.IClosingCompleteMessage
-function message.decodeClosingSigMessage(payload: Buffer): message.IClosingSigMessage
+function message.decodeChannelReestablishMessage(payload: Buffer, options?: message.ICommitmentNonceDecodeOptions): message.IChannelReestablishMessage
+function message.decodeClosingCompleteMessage(payload: Buffer, options?: message.ISimpleCloseCodecOptions): message.IClosingCompleteMessage
+function message.decodeClosingSigMessage(payload: Buffer, options?: message.ISimpleCloseCodecOptions): message.IClosingSigMessage
 function message.decodeClosingSignedMessage(payload: Buffer): message.IClosingSignedMessage
 function message.decodeCommitmentSignedMessage(payload: Buffer, options?: message.ICommitmentSignedDecodeOptions): message.ICommitmentSignedMessage
 function message.decodeCustomMessage(data: Buffer): message.ICustomMessage
@@ -5588,7 +5602,7 @@ function message.decodePeerStorageMessage(payload: Buffer): message.IPeerStorage
 function message.decodePeerStorageRetrievalMessage(payload: Buffer): message.IPeerStorageMessage
 function message.decodePingMessage(payload: Buffer): message.IPingMessage
 function message.decodePongMessage(payload: Buffer): message.IPongMessage
-function message.decodeRevokeAndAckMessage(payload: Buffer): message.IRevokeAndAckMessage
+function message.decodeRevokeAndAckMessage(payload: Buffer, options?: message.ICommitmentNonceDecodeOptions): message.IRevokeAndAckMessage
 function message.decodeShutdownMessage(payload: Buffer, options?: message.IShutdownDecodeOptions): message.IShutdownMessage
 function message.decodeSpliceAckMessage(payload: Buffer): message.ISpliceAckMessage
 function message.decodeSpliceLockedMessage(payload: Buffer): message.ISpliceLockedMessage
@@ -5617,8 +5631,8 @@ function message.encodeAcceptChannelMessage(msg: message.IAcceptChannelMessage):
 function message.encodeBigSize(value: bigint): Buffer
 function message.encodeChannelReadyMessage(msg: message.IChannelReadyMessage): Buffer
 function message.encodeChannelReestablishMessage(msg: message.IChannelReestablishMessage): Buffer
-function message.encodeClosingCompleteMessage(msg: message.IClosingCompleteMessage): Buffer
-function message.encodeClosingSigMessage(msg: message.IClosingSigMessage): Buffer
+function message.encodeClosingCompleteMessage(msg: message.IClosingCompleteMessage, options?: message.ISimpleCloseCodecOptions): Buffer
+function message.encodeClosingSigMessage(msg: message.IClosingSigMessage, options?: message.ISimpleCloseCodecOptions): Buffer
 function message.encodeClosingSignedMessage(msg: message.IClosingSignedMessage): Buffer
 function message.encodeCommitmentSignedMessage(msg: message.ICommitmentSignedMessage): Buffer
 function message.encodeCustomMessage(subtype: number, payload: Buffer, version?: number): Buffer
@@ -8305,6 +8319,7 @@ interface script.ITaprootLeafSpend
 property script.ITaprootLeafSpend.controlBlock: Buffer
 property script.ITaprootLeafSpend.leafVersion: number
 property script.ITaprootLeafSpend.script: Buffer
+type script.TaprootOutputFormat = channel.ITaprootAuxLeaf | 'final'
 function script.buildAnchorOutput(fundingPubkey: Buffer): { script: Buffer; witnessScript: Buffer; }
 function script.buildAnchorScript(fundingPubkey: Buffer): Buffer
 function script.buildCommitmentTx(params: script.ICommitmentTxParams): script.ICommitmentTxResult
@@ -8315,9 +8330,9 @@ function script.buildHtlcTimeoutTx(htlcTxid: string, htlcOutputIndex: number, ht
 function script.buildOfferedHtlcScript(revocationPubkey: Buffer, localHtlcPubkey: Buffer, remoteHtlcPubkey: Buffer, paymentHash: Buffer, useAnchors?: boolean): Buffer
 function script.buildPenaltyTx(params: script.IPenaltyTxParams): bitcoinjs-lib#Transaction
 function script.buildReceivedHtlcScript(revocationPubkey: Buffer, localHtlcPubkey: Buffer, remoteHtlcPubkey: Buffer, paymentHash: Buffer, cltvExpiry: number, useAnchors?: boolean): Buffer
-function script.buildTaprootOfferedHtlcOutput(revocationPubkey: Buffer, localHtlcPubkey: Buffer, remoteHtlcPubkey: Buffer, paymentHash: Buffer, network?: bitcoinjs-lib#Network, auxiliaryLeaf?: channel.ITaprootAuxLeaf): script.ITaprootHtlcOutput
-function script.buildTaprootReceivedHtlcOutput(revocationPubkey: Buffer, localHtlcPubkey: Buffer, remoteHtlcPubkey: Buffer, paymentHash: Buffer, cltvExpiry: number, network?: bitcoinjs-lib#Network, auxiliaryLeaf?: channel.ITaprootAuxLeaf): script.ITaprootHtlcOutput
-function script.buildTaprootSecondLevelOutput(revocationPubkey: Buffer, localDelayedPubkey: Buffer, toSelfDelay: number, network?: bitcoinjs-lib#Network, auxiliaryLeaf?: channel.ITaprootAuxLeaf): script.ITaprootCommitOutput & { merkleRoot: Buffer; delay: script.ITaprootLeafSpend; }
+function script.buildTaprootOfferedHtlcOutput(revocationPubkey: Buffer, localHtlcPubkey: Buffer, remoteHtlcPubkey: Buffer, paymentHash: Buffer, network?: bitcoinjs-lib#Network, format?: script.TaprootOutputFormat): script.ITaprootHtlcOutput
+function script.buildTaprootReceivedHtlcOutput(revocationPubkey: Buffer, localHtlcPubkey: Buffer, remoteHtlcPubkey: Buffer, paymentHash: Buffer, cltvExpiry: number, network?: bitcoinjs-lib#Network, format?: script.TaprootOutputFormat): script.ITaprootHtlcOutput
+function script.buildTaprootSecondLevelOutput(revocationPubkey: Buffer, localDelayedPubkey: Buffer, toSelfDelay: number, network?: bitcoinjs-lib#Network, format?: script.TaprootOutputFormat): script.ITaprootCommitOutput & { merkleRoot: Buffer; delay: script.ITaprootLeafSpend; }
 function script.buildToLocalPenaltyWitness(signature: Buffer, witnessScript: Buffer): Buffer[]
 function script.buildToLocalScript(revocationPubkey: Buffer, localDelayedPubkey: Buffer, toSelfDelay: number, leaseCsv?: number): Buffer
 function script.buildToRemoteAnchorOutput(remotePubkey: Buffer, leaseCsv?: number): { script: Buffer; witnessScript: Buffer; }

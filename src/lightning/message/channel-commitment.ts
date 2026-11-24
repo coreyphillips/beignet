@@ -21,6 +21,13 @@
  *   [33: next_per_commitment_point]
  */
 
+import {
+	type ICommitmentNonceDecodeOptions,
+	type IFundingVerificationNonce,
+	decodeNextLocalNonces,
+	encodeNextLocalNonces,
+	TLV_NEXT_LOCAL_NONCES
+} from './commitment-nonces';
 import type { ITlvRecord } from './tlv';
 import type { CustomRecords } from './custom-records';
 import {
@@ -68,6 +75,7 @@ const COMMITMENT_SIGNED_TLV_TYPES = new Set<bigint>([
 	TLV_SPLICE_INFO,
 	TLV_PARTIAL_SIG_WITH_NONCE
 ]);
+const FINAL_REVOKE_AND_ACK_TLV_TYPES = new Set([TLV_NEXT_LOCAL_NONCES]);
 const REVOKE_AND_ACK_TLV_TYPES = new Set<bigint>([TLV_NEXT_LOCAL_NONCE]);
 
 export interface IRevokeAndAckMessage {
@@ -79,6 +87,8 @@ export interface IRevokeAndAckMessage {
 	 * (rotate-on-revoke). The previous nonce is now spent. TLV type 4.
 	 */
 	nextLocalNonce?: Buffer;
+	/** Final Taproot verification nonces keyed by funding txid (TLV 22). */
+	nextLocalNonces?: IFundingVerificationNonce[];
 }
 
 const COMMITMENT_SIGNED_FIXED_LENGTH = 98; // 32 + 64 + 2
@@ -215,7 +225,16 @@ export function encodeRevokeAndAckMessage(msg: IRevokeAndAckMessage): Buffer {
 	msg.perCommitmentSecret.copy(buf, 32);
 	msg.nextPerCommitmentPoint.copy(buf, 64);
 
-	// option_taproot: append the next verification nonce (TLV type 4).
+	if (msg.nextLocalNonces !== undefined) {
+		if (msg.nextLocalNonce !== undefined)
+			throw new Error('Cannot mix staging and final Taproot nonce records');
+		const nonces = encodeNextLocalNonces(msg.nextLocalNonces);
+		return boundedLightningPayload(
+			Buffer.concat([buf, encodeTlvStream([nonces])])
+		);
+	}
+
+	// Staging uses one verification nonce (TLV type 4).
 	if (msg.nextLocalNonce) {
 		if (msg.nextLocalNonce.length !== 66) {
 			throw new Error(
@@ -236,8 +255,10 @@ export function encodeRevokeAndAckMessage(msg: IRevokeAndAckMessage): Buffer {
  * Decode a `revoke_and_ack` message payload.
  */
 export function decodeRevokeAndAckMessage(
-	payload: Buffer
+	payload: Buffer,
+	options: ICommitmentNonceDecodeOptions = {}
 ): IRevokeAndAckMessage {
+	if (options.finalTaproot) boundedLightningPayload(payload);
 	if (payload.length < REVOKE_AND_ACK_LENGTH) {
 		throw new Error(
 			`revoke_and_ack too short: need ${REVOKE_AND_ACK_LENGTH} bytes, got ${payload.length}`
@@ -248,25 +269,34 @@ export function decodeRevokeAndAckMessage(
 	const perCommitmentSecret = Buffer.from(payload.subarray(32, 64));
 	const nextPerCommitmentPoint = Buffer.from(payload.subarray(64, 97));
 
-	// option_taproot: parse the optional next_local_nonce TLV (type 4).
+	let nextLocalNonces: IFundingVerificationNonce[] | undefined;
 	let nextLocalNonce: Buffer | undefined;
 	if (payload.length > REVOKE_AND_ACK_LENGTH) {
 		const { records } = decodeTlvStream(
 			payload,
 			REVOKE_AND_ACK_LENGTH,
-			REVOKE_AND_ACK_TLV_TYPES
+			options.finalTaproot
+				? FINAL_REVOKE_AND_ACK_TLV_TYPES
+				: REVOKE_AND_ACK_TLV_TYPES
 		);
 		for (const record of records) {
 			if (record.type === TLV_NEXT_LOCAL_NONCE && record.value.length === 66) {
 				nextLocalNonce = Buffer.from(record.value);
+			} else if (record.type === TLV_NEXT_LOCAL_NONCES) {
+				nextLocalNonces = decodeNextLocalNonces(record.value);
 			}
 		}
+	}
+
+	if (options.finalTaproot && !nextLocalNonces) {
+		throw new Error('Final revoke_and_ack requires next_local_nonces');
 	}
 
 	return {
 		channelId,
 		perCommitmentSecret,
 		nextPerCommitmentPoint,
-		nextLocalNonce
+		nextLocalNonce,
+		...(nextLocalNonces && { nextLocalNonces })
 	};
 }
