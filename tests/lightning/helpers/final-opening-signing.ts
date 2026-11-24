@@ -32,17 +32,24 @@ export function participant(
 	points: IFinalOpeningTerms['localBasepoints'];
 } {
 	const root = bip32RootFromSeed(seedFor(seed));
+	return boundParticipant(root, index, {
+		encryptionKey: seedFor(seed + 20),
+		network: 'regtest',
+		nodeId: deriveLightningKeys(root, 1).nodePublicKey.toString('hex')
+	});
+}
+export function boundParticipant(
+	root: BIP32Interface,
+	index: number,
+	binding: IFinalWalletBinding
+) {
 	const keys = deriveChannelKeys(root, 1, index);
 	const bp = keys.channelBasepoints;
 	return {
 		root,
 		index,
 		keys,
-		binding: {
-			encryptionKey: seedFor(seed + 20),
-			network: 'regtest' as const,
-			nodeId: deriveLightningKeys(root, 1).nodePublicKey.toString('hex')
-		},
+		binding,
 		points: {
 			fundingPubkey: bp.fundingPubkey.toString('hex'),
 			revocationBasepoint: bp.revocationBasepoint.toString('hex'),

@@ -44,7 +44,10 @@ function bySerial(a: { serialId: bigint }, b: { serialId: bigint }): number {
 	return a.serialId < b.serialId ? -1 : a.serialId > b.serialId ? 1 : 0;
 }
 
-export function snapshotFinalOpening(channel: Channel): {
+export function snapshotFinalOpening(
+	channel: Channel,
+	provisional = false
+): {
 	candidate: IFinalOpeningCandidate;
 	terms: IFinalOpeningTerms;
 } | null {
@@ -106,7 +109,12 @@ export function snapshotFinalOpening(channel: Channel): {
 		}),
 		outputSerialIds: outputs.map((o) => o.serialId.toString())
 	};
-	validateFinalOpening(candidate);
+	try {
+		validateFinalOpening(candidate);
+	} catch (error) {
+		if (provisional) return null;
+		throw error;
+	}
 	return {
 		candidate,
 		terms: {
@@ -125,7 +133,7 @@ export function snapshotFinalOpening(channel: Channel): {
 // signing handle is retained. A complete candidate uses the durable signer.
 export function disposableFinalTxComplete(channel: Channel): Buffer {
 	const id = channel.getChannelId();
-	if (!enrolled.has(channel) || !id || snapshotFinalOpening(channel))
+	if (!enrolled.has(channel) || !id || snapshotFinalOpening(channel, true))
 		throw Error('Disposable completion requires an unfinished final opening');
 	const publicKey = channel.getFullState().localBasepoints.fundingPubkey;
 	const nonce = (): Buffer =>

@@ -71,7 +71,8 @@ describe('Final wallet CLI initialization recovery', function () {
 
 	function init(
 		fault?: Interruption,
-		targetHome = home
+		targetHome = home,
+		updates = false
 	): {
 		ok: boolean;
 		signal: NodeJS.Signals | null;
@@ -87,7 +88,8 @@ describe('Final wallet CLI initialization recovery', function () {
 				'init',
 				'--network',
 				'regtest',
-				'--final-taproot-wallet'
+				'--final-taproot-wallet',
+				...(updates ? ['--final-commitment-updates'] : [])
 			],
 			{
 				env: {
@@ -205,6 +207,17 @@ describe('Final wallet CLI initialization recovery', function () {
 		expect(fs.statSync(signer).ino).to.equal(signerInode);
 	});
 
+	it('recovers a pending update-enabled original only with its original init mode', () => {
+		const failed = init('kill', home, true);
+		expect(failed.signal).to.equal('SIGKILL');
+		expect(JSON.parse(fs.readFileSync(pending, 'utf8')).version).to.equal(2);
+		expect(init().ok).to.equal(false);
+		expect(init(undefined, home, true).ok).to.equal(true);
+		expect(
+			JSON.parse(fs.readFileSync(config, 'utf8')).finalCommitmentUpdates
+		).to.equal(true);
+		expect(fs.existsSync(pending)).to.equal(false);
+	});
 	it('cannot enroll a supplied pending mnemonic without its original device', () => {
 		const original = interrupt('kill');
 		expect(fs.existsSync(pending)).to.equal(true);

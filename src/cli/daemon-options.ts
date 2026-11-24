@@ -45,6 +45,7 @@ export function daemonOptions(
 		daemonHost: config.daemonHost,
 		preferAnchors: config.preferAnchors,
 		finalTaprootWallet: config.finalTaprootWallet,
+		finalCommitmentUpdates: config.finalCommitmentUpdates,
 		largeChannels: config.largeChannels,
 		apiToken: config.apiToken,
 		apiKeys: config.apiKeys,

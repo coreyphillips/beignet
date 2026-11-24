@@ -513,6 +513,8 @@ export interface BeignetNodeOptions
 	preferAnchors?: boolean;
 	/** Opt in to an original, freshly generated regtest type-80 wallet. */
 	finalTaprootWallet?: boolean;
+	/** Enroll a new regtest wallet for type-80 payments, splicing and closes. */
+	finalCommitmentUpdates?: boolean;
 	/**
 	 * option_wumbo (large_channels, default false): advertise the bit and lift
 	 * the 2^24 sat funding cap (up to 10 BTC) for peers that also advertise it.
@@ -3114,6 +3116,15 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 			}
 		}
 		if (
+			opts.finalCommitmentUpdates !== undefined &&
+			(typeof opts.finalCommitmentUpdates !== 'boolean' ||
+				(opts.finalCommitmentUpdates && opts.finalTaprootWallet !== true))
+		)
+			throw new BeignetError(
+				'INVALID_PARAMS',
+				'Final commitment updates require an enrolled final wallet'
+			);
+		if (
 			opts.finalTaprootWallet !== undefined &&
 			typeof opts.finalTaprootWallet !== 'boolean'
 		)
@@ -3142,7 +3153,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 			throw new BeignetError('INVALID_PARAMS', 'Invalid final wallet mnemonic');
 		const fresh =
 			opts.finalTaprootWallet && opts.mnemonic === undefined
-				? generateFinalDaemonWallet()
+				? generateFinalDaemonWallet(opts.finalCommitmentUpdates)
 				: undefined;
 		const mnemonic = fresh?.mnemonic ?? (opts.mnemonic || generateMnemonic());
 		const networkName = opts.network;
@@ -3234,6 +3245,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 				? Sqlite.createFinalWallet(dbPath, this.generatedFinalBinding)
 				: Sqlite.openFinalWallet(dbPath, {
 						encryptionKey: encryptionKey!,
+						finalCommitmentUpdates: opts.finalCommitmentUpdates,
 						network: networkName,
 						nodeId
 				  });
@@ -3642,13 +3654,20 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 			? (): ReturnType<SqliteStorage['loadFinalOpenings']> =>
 					this.sqlite()!.loadFinalOpenings()
 			: undefined;
+		const finalSpliceOutpoints = this._bootOpts?.finalCommitmentUpdates
+			? () => this.sqlite()!.loadFinalSpliceWalletOutpoints()
+			: undefined;
 		const fees: ExtensionFixedOutputFees | undefined = supply?.fixedOutputFees;
 		if (supply === undefined || fees === undefined) {
-			return new WalletFundingProvider(this.wallet, { finalOpeningCandidates });
+			return new WalletFundingProvider(this.wallet, {
+				finalOpeningCandidates,
+				finalSpliceOutpoints
+			});
 		}
 		try {
 			return new WalletFundingProvider(this.wallet, {
 				finalOpeningCandidates,
+				finalSpliceOutpoints,
 				fixedOutputFees: {
 					storage: this.storage,
 					maxFeeSatoshis: fees.maxFeeSatoshis,
@@ -3679,6 +3698,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 			});
 			return new WalletFundingProvider(this.wallet, {
 				finalOpeningCandidates,
+				finalSpliceOutpoints,
 				fixedOutputFeeRefusal: refusal
 			});
 		}
@@ -9169,6 +9189,16 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 
 	private assertWalletInputMutable(txid: string, index: number): void {
 		this.onchainSweeps().assertInputMutable(txid, index);
+		if (
+			this._bootOpts?.finalCommitmentUpdates &&
+			this.sqlite()!
+				.loadFinalSpliceWalletOutpoints()
+				.has(txid.toLowerCase() + ':' + index)
+		)
+			throw new BeignetError(
+				'INVALID_PARAMS',
+				'Input is reserved by a final channel splice'
+			);
 		if (
 			this._bootOpts?.finalTaprootWallet &&
 			finalOpeningWalletOutpoints(this.sqlite()!.loadFinalOpenings()).has(
@@ -15211,9 +15241,15 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 		// midnight reset, which errs on the safe side.
 		let externalSpendSats: number | undefined;
 		if (destinationScript !== undefined) {
+			const taprootSharedInput =
+				this._bootOpts?.finalCommitmentUpdates === true &&
+				!!this.node
+					.getChannelManager()
+					.finalUpdateStatus(idBuf.toString('hex'));
 			const feeSats = Number(
 				spliceFeeSats(
 					estimateSpliceTxWeight({
+						taprootSharedInput,
 						walletInputCount: 0,
 						destinationScriptLen: destinationScript.length
 					}),

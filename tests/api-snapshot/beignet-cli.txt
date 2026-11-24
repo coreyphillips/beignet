@@ -79,6 +79,7 @@ property BeignetConfig.fforReceiveFunding?: FforReceiveFunding
 property BeignetConfig.fforSettle?: { enabled: boolean; maxBudgetMsat?: string | number; maxEpochBlocks?: number; feeBaseMsat?: number; feePpm?: number; }
 property BeignetConfig.fforSettleConcurrent?: boolean
 property BeignetConfig.fforWitness?: { enabled: boolean; maxMailboxes?: number; maxBytes?: number; }
+property BeignetConfig.finalCommitmentUpdates?: boolean
 property BeignetConfig.finalTaprootWallet?: boolean
 property BeignetConfig.forwardingEnabled?: boolean
 property BeignetConfig.guardianMaxBytesPerSet?: number
@@ -633,6 +634,7 @@ property BeignetNodeOptions.fforReceiveFunding?: FforReceiveFunding
 property BeignetNodeOptions.fforSettle?: { enabled: boolean; maxBudgetMsat?: string | number; maxEpochBlocks?: number; feeBaseMsat?: number; feePpm?: number; }
 property BeignetNodeOptions.fforSettleConcurrent?: boolean
 property BeignetNodeOptions.fforWitness?: { enabled: boolean; maxMailboxes?: number; maxBytes?: number; }
+property BeignetNodeOptions.finalCommitmentUpdates?: boolean
 property BeignetNodeOptions.finalTaprootWallet?: boolean
 property BeignetNodeOptions.forwardingEnabled?: boolean
 property BeignetNodeOptions.guardianMaxBytesPerSet?: number

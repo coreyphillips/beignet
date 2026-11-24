@@ -6,7 +6,7 @@ import type { IFinalWalletBinding } from './final-wallet-format';
 const generated = new WeakSet<IFinalWalletBinding>();
 
 /** Only the generation path can enroll a wallet in the first regtest daemon. */
-export function generateFinalDaemonWallet(): {
+export function generateFinalDaemonWallet(finalCommitmentUpdates = false): {
 	mnemonic: string;
 	binding: IFinalWalletBinding;
 } {
@@ -15,6 +15,7 @@ export function generateFinalDaemonWallet(): {
 	const encryptionKey = deriveStorageKey(seed);
 	const binding: IFinalWalletBinding = Object.freeze({
 		network: 'regtest',
+		...(finalCommitmentUpdates && { finalCommitmentUpdates: true }),
 		nodeId: deriveLightningKeysFromSeed(seed, 1).nodePublicKey.toString('hex'),
 		get encryptionKey(): Buffer {
 			return Buffer.from(encryptionKey);

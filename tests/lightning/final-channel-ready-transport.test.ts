@@ -13,6 +13,7 @@ import {
 } from '../../src/lightning/message/channel-reestablish';
 import { MessageType } from '../../src/lightning/message/types';
 import { alice, bob, signingFixture } from './helpers/final-opening-signing';
+import { FinalUpdateDataLossError } from '../../src/lightning/storage/final-channel-updates';
 import type { TxidHex } from '../../src/utils/identifiers';
 
 interface IReadyFixture {
@@ -69,6 +70,8 @@ function setup(): IReadyFixture {
 		loadFinalDaemonOpening: (key) => (key === id ? opening() : null),
 		loadFinalDaemonOpenings: () => [opening()],
 		loadFinalOpeningSession: (key) => (key === id ? session : null),
+		loadFinalOpening: (key) => (key === id ? candidate : null),
+		loadFinalSpliceAttempts: () => [],
 		loadFinalLocalTxComplete: () => null,
 		loadFinalPeerTxComplete: () => null,
 		loadFinalOpeningExit: () => signed,
@@ -147,6 +150,35 @@ function setup(): IReadyFixture {
 }
 
 describe('Final channel readiness on the daemon dispatcher', () => {
+	it('reports only the proven stale channel as errored and propagates unrelated store failures', () => {
+		const f = setup();
+		const store = f.manager['config'].finalOpening!.storage;
+		const first = store.loadFinalDaemonOpening(f.channelId.toString('hex'))!;
+		const secondId = 'ac'.repeat(32);
+		store.loadFinalDaemonOpenings = (): (typeof first)[] => [
+			first,
+			{ ...first, candidate: { ...first.candidate, channelId: secondId } }
+		];
+		f.manager.finalUpdateStatus = (id): null => {
+			if (id === first.candidate.channelId)
+				throw new FinalUpdateDataLossError();
+			return null;
+		};
+		const rows = f.manager.finalOpeningInfo();
+		expect(rows.map((r) => r.state)).to.deep.equal([
+			'ERRORED',
+			'AWAITING_FUNDING_CONFIRMED'
+		]);
+		expect(rows[0].htlcUsable).to.equal(false);
+		expect(rows[0].spendableOutboundMsat).to.equal(0n);
+		expect(rows[0].localBalanceMsat).to.equal(0n);
+		expect(rows[0].remoteBalanceMsat).to.equal(0n);
+		f.manager.finalUpdateStatus = (): never => {
+			throw new Error('Journal read failed');
+		};
+		expect(() => f.manager.finalOpeningInfo()).to.throw('Journal read failed');
+	});
+
 	it('treats manual final funding confirmation as a request for live verification', async () => {
 		const f = setup();
 		let rechecks = 0;

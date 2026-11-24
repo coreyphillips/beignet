@@ -20500,7 +20500,7 @@ export class Channel {
 	private _continueDisposableTurn(state: InteractiveTxState): void {
 		if (!isFinalNegotiation(this)) return;
 		const builder = this._state.dualFundingSession?.getTxBuilder();
-		if (builder?.getState() === state && !snapshotFinalOpening(this))
+		if (builder?.getState() === state && !snapshotFinalOpening(this, true))
 			builder.getSession().state = InteractiveTxState.COLLECTING;
 	}
 

@@ -450,7 +450,9 @@ function handleInit(): void {
 }
 
 function initializeConfig(file: string): void {
-	const finalTaprootWallet = hasFlag('--final-taproot-wallet');
+	const requestedUpdates = hasFlag('--final-commitment-updates');
+	const finalTaprootWallet =
+		requestedUpdates || hasFlag('--final-taproot-wallet');
 	const pending = fs.lstatSync(
 		nodePath.join(nodePath.dirname(file), 'final-wallet-init.pending'),
 		{ throwIfNoEntry: false }
@@ -458,6 +460,7 @@ function initializeConfig(file: string): void {
 	if (pending && !finalTaprootWallet)
 		throw new Error('A final wallet initialization is pending');
 	const config = loadConfig(finalTaprootWallet);
+	const updates = requestedUpdates || config.finalCommitmentUpdates === true;
 	const network =
 		parseFlag('--network') ||
 		(finalTaprootWallet ? process.env.BEIGNET_NETWORK : undefined) ||
@@ -469,6 +472,7 @@ function initializeConfig(file: string): void {
 			process.env.BEIGNET_MNEMONIC ||
 			(config.mnemonic !== undefined &&
 				(config.finalTaprootWallet !== true ||
+					(updates && config.finalCommitmentUpdates !== true) ||
 					typeof config.mnemonic !== 'string' ||
 					!bip39.validateMnemonic(config.mnemonic))) ||
 			(config.finalTaprootWallet === true && !config.mnemonic))
@@ -492,11 +496,13 @@ function initializeConfig(file: string): void {
 					dataDir,
 					network: 'regtest',
 					finalTaprootWallet: true,
+					...(updates && { finalCommitmentUpdates: true }),
 					...(alias ? { alias } : {})
 				};
 				apiToken = mintApiTokenIfAbsent(complete);
 				return complete;
-			}
+			},
+			updates
 		);
 		if (config.mnemonic) {
 			apiToken = mintApiTokenIfAbsent(enrolled);
@@ -3379,6 +3385,7 @@ Usage: beignet <command> [options]
 Setup:
   init [--network N] [--alias A]         Generate mnemonic, API token + config
     [--final-taproot-wallet]             Enroll a fresh regtest type-80 wallet
+    [--final-commitment-updates]         Enroll a fresh regtest wallet for revocable commitments
   start [flags]                          Start node daemon
   stop                                   Stop daemon
 

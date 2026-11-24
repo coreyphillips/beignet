@@ -9,6 +9,7 @@ import {
 } from '../message/interactive-tx';
 
 export interface IFinalOpeningSession {
+	updateLimits?: import('./final-channel-updates').IFinalUpdateLimits;
 	peer: string;
 	channelKeyIndex: number;
 	remoteSecondPerCommitmentPoint?: string;
@@ -122,14 +123,15 @@ export function localOpeningTxComplete(
 	channelId: string,
 	localFundingPubkey: string,
 	fundingPrivateKey: Buffer,
-	context: Buffer
+	context: Buffer,
+	initialSalt?: Buffer
 ): Buffer {
 	const publicKey = getPublicKey(fundingPrivateKey);
 	if (publicKey.toString('hex') !== localFundingPubkey)
 		throw new Error('Opening funding key does not match');
 	const salt = state.local
 		? Buffer.from(state.local.salt, 'hex')
-		: randomBytes(32);
+		: initialSalt ?? randomBytes(32);
 
 	const payload = encodeTxCompleteMessage({
 		channelId: Buffer.from(channelId, 'hex'),

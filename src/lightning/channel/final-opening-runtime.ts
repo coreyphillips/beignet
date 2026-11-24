@@ -11,6 +11,8 @@ export interface IFinalOpeningRuntime {
 	root: BIP32Interface;
 }
 export interface IFinalOpeningMessage {
+	signatureBatch?: Buffer[];
+	batchError?: string;
 	type: MessageType;
 	payload: Buffer;
 }

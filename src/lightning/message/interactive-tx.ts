@@ -33,6 +33,8 @@ export interface ITxAddInputMessage {
 	 * for such inputs `prevTx` is empty. 32 bytes, internal byte order.
 	 */
 	sharedInputTxid?: Buffer;
+	/** A final Taproot splice can verify this compact prevout against the chain. */
+	prevTxOut?: { txid: Buffer; amount: bigint; script: Buffer; type?: 2 | 1111 };
 }
 
 export interface ITxAddOutputMessage {
@@ -124,7 +126,30 @@ export function encodeTxAddInputMessage(msg: ITxAddInputMessage): Buffer {
 
 	// 32 channelId + 8 serialId + 2 prevTxLen + prevTx.length + 4 prevTxVout + 4 sequence
 	// + optional TLV: shared_input_txid (type 0, len 32) = 0x00 0x20 <32 bytes>
-	const tlvLen = msg.sharedInputTxid ? 2 + 32 : 0;
+	const compact = msg.prevTxOut;
+	if (
+		compact &&
+		(msg.sharedInputTxid ||
+			msg.prevTx.length ||
+			compact.txid.length !== 32 ||
+			compact.amount < 0n ||
+			compact.amount > 2100000000000000n ||
+			!compact.script.length ||
+			compact.script.length > 10000)
+	)
+		throw new Error('Invalid compact splice prevout');
+	let extension = Buffer.alloc(0);
+	if (compact) {
+		const amount = Buffer.alloc(8);
+		amount.writeBigUInt64BE(compact.amount);
+		extension = encodeTlvStream([
+			{
+				type: BigInt(compact.type ?? 1111),
+				value: Buffer.concat([compact.txid, amount, compact.script])
+			}
+		]);
+	}
+	const tlvLen = msg.sharedInputTxid ? 2 + 32 : extension.length;
 	const fixedLen = 32 + 8 + 2 + msg.prevTx.length + 4 + 4 + tlvLen;
 	const buf = Buffer.alloc(fixedLen);
 	let offset = 0;
@@ -148,17 +173,21 @@ export function encodeTxAddInputMessage(msg: ITxAddInputMessage): Buffer {
 		buf.writeUInt8(32, offset);
 		offset += 1; // TLV length 32
 		msg.sharedInputTxid.copy(buf, offset);
-	}
+	} else extension.copy(buf, offset);
 
 	return buf;
 }
 
 const TX_ADD_INPUT_TLV_TYPES = new Set([0n]);
+const TAPROOT_ADD_INPUT_TLVS = new Set([0n, 2n, 1111n]);
 
 /**
  * Decode a tx_add_input message payload.
  */
-export function decodeTxAddInputMessage(payload: Buffer): ITxAddInputMessage {
+export function decodeTxAddInputMessage(
+	payload: Buffer,
+	options: IInteractiveTxDecodeOptions = {}
+): ITxAddInputMessage {
 	if (payload.length < 50) {
 		throw new Error(
 			`tx_add_input too short: need at least 50 bytes, got ${payload.length}`
@@ -187,11 +216,12 @@ export function decodeTxAddInputMessage(payload: Buffer): ITxAddInputMessage {
 
 	// Optional TLV stream; only shared_input_txid (type 0) is known.
 	let sharedInputTxid: Buffer | undefined;
+	let prevTxOut: ITxAddInputMessage['prevTxOut'];
 	if (offset < payload.length) {
 		const { records } = decodeTlvStream(
 			payload,
 			offset,
-			TX_ADD_INPUT_TLV_TYPES
+			options.taproot ? TAPROOT_ADD_INPUT_TLVS : TX_ADD_INPUT_TLV_TYPES
 		);
 		for (const record of records) {
 			if (record.type === 0n) {
@@ -201,11 +231,39 @@ export function decodeTxAddInputMessage(payload: Buffer): ITxAddInputMessage {
 					);
 				}
 				sharedInputTxid = record.value;
+			} else if (
+				options.taproot &&
+				(record.type === 1111n || record.type === 2n)
+			) {
+				if (
+					prevTxOut ||
+					sharedInputTxid ||
+					prevTx.length ||
+					record.value.length <= 40 ||
+					record.value.length > 10040
+				)
+					throw new Error('Invalid compact splice prevout');
+				prevTxOut = {
+					...(record.type === 2n && { type: 2 as const }),
+					txid: Buffer.from(record.value.subarray(0, 32)),
+					amount: record.value.readBigUInt64BE(32),
+					script: Buffer.from(record.value.subarray(40))
+				};
+				if (prevTxOut.amount > 2100000000000000n)
+					throw new Error('Splice prevout amount exceeds money supply');
 			}
 		}
 	}
 
-	return { channelId, serialId, prevTx, prevTxVout, sequence, sharedInputTxid };
+	return {
+		channelId,
+		serialId,
+		prevTx,
+		prevTxVout,
+		sequence,
+		sharedInputTxid,
+		...(prevTxOut && { prevTxOut })
+	};
 }
 
 // ---- tx_add_output (67) ----

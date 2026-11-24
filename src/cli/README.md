@@ -90,6 +90,7 @@ await node.destroy();
 | `maxInboundPeers?` | `number` | Inbound peer connections (default 125); once this many are up, only peers holding a channel with this node are admitted. |
 | `preferAnchors?` | `boolean` | Open anchor channels (default true); false opens legacy static_remotekey channels. |
 | `finalTaprootWallet?` | `boolean` | Opt in to an original, freshly generated regtest type-80 wallet. |
+| `finalCommitmentUpdates?` | `boolean` | Enroll a new regtest wallet for type-80 payments, splicing and closes. |
 | `largeChannels?` | `boolean` | option_wumbo (large_channels, default false): advertise the bit and lift the 2^24 sat funding cap (up to 10 BTC) for peers that also advertise it. |
 | `autoBootstrap?` | `boolean` | Connect to DNS seed peers (BOLT 10) at startup (default false). |
 | `autoReconnect?` | `boolean` | Enable auto-reconnection to peers (default true) |
@@ -1690,7 +1691,7 @@ All output is JSON. Add `--pretty` for indented output.
 ### Setup
 
 ```bash
-beignet init [--network regtest] [--alias mynode] [--final-taproot-wallet]
+beignet init [--network regtest] [--alias mynode] [--final-taproot-wallet] [--final-commitment-updates]
 beignet start [--port 2112] [--host 0.0.0.0] [--daemon] [--anchors] [--api-token <token>] \
   [--backup-path /path/to/backup.db] [--backup-interval 21600000] \
   [--daily-spend-limit 100000] [--tls-cert /path/cert.pem] [--tls-key /path/key.pem] \
@@ -1956,11 +1957,17 @@ that primary's relay later.
 
 ### Channels
 
-To test a private final type-80 opening, initialize two fresh regtest wallets with `beignet init --network regtest --final-taproot-wallet`. Connect the peers, fund the opener, then run `beignet channel open-v2 <pubkey> <sats> --final-taproot`. The HTTP equivalent is `POST /channel/open-v2` with `finalTaproot: true`.
+For a private Bitcoin type-80 channel, initialize a fresh regtest wallet on each Beignet peer with `beignet init --network regtest --final-commitment-updates`. Fund the opener, connect the peers and run `beignet channel open-v2 <pubkey> <sats> --final-taproot`. HTTP clients can send `POST /channel/open-v2` with `finalTaproot` set to `true`.
 
-Each original wallet records its enforceable local exit before sending funding witnesses. At the negotiated confirmation depth, both peers save and exchange `channel_ready`. Check `GET /channels` for `CHANNEL_READY`. If the peer disconnects at depth, the channel waits at `AWAITING_REESTABLISH`. On reconnect each original advertises a fresh verification nonce for this funding transaction. A reorg below depth returns the channel to `AWAITING_FUNDING_CONFIRMED`. The peers can replay their saved readiness messages once the funding output reaches depth again. Payment support, cooperative closing and splicing remain pending for this profile.
+Each original wallet saves its unilateral exit before sending funding witnesses. After the funding reaches the negotiated depth and the peers exchange `channel_ready`, `GET /channels` reports `NORMAL`. The daemon can then pay and receive invoices. After restart it checks the funding and reestablishes with the peer before sending another update. A reorg that removes the necessary funding depth suspends payments.
 
-Restart with the same wallet directory and device journal. Encrypted SQLite backups can supply the saved messages and signed exit through the storage API. Use `beignet channel forceclose <channelId>` on the original daemon to broadcast the saved commitment. Spending its delayed output after the CSV delay is a separate recovery operation.
+Use the ordinary splice-in and splice-out commands to change the channel capacity. Both parties retain enforceable commitments for the old and new funding while the splice awaits matching locks. Ordinary payments during that interval commit to each live funding outpoint. The daemon supports one pending splice per channel. It declines fee replacement during opening and splicing. Once both peers lock the new funding at the negotiated depth, subsequent updates spend the new outpoint. If a peer discards an unsigned splice on disconnect, the original wallet releases its selected inputs and a retry uses new funding keys.
+
+Use `beignet channel close <channelId>` for a cooperative close or `beignet channel forceclose <channelId>` to publish the current unilateral exit. An original daemon with a chain connection claims its eligible outputs to the wallet after the applicable delay. A local HTLC second-stage transaction also needs a spendable wallet fee input.
+
+Restart with the original wallet directory and device journal. An encrypted SQLite backup preserves public messages and recovery records. Selecting a current unilateral exit or issuing new signatures requires the original device journal. Keep the original device through final settlement. A whole-device rollback can also roll back that journal.
+
+The earlier `--final-taproot-wallet` enrollment still provides the opening and readiness profile for existing regtest wallets. It reaches `CHANNEL_READY`. Commitment updates require fresh enrollment with the new switch.
 
 ```bash
 beignet channel open <pubkey> <sats> [pushSats]

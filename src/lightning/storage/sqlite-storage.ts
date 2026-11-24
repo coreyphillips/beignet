@@ -1,3 +1,24 @@
+import { encodeSpliceLockedMessage } from '../message/splice';
+import { Transaction } from 'bitcoinjs-lib';
+import { FinalSpliceSession } from '../channel/final-splice-session';
+import {
+	finalSpliceAttempts,
+	releasedFinalSpliceFunding,
+	selectFinalFunding,
+	type FinalSpliceEvent,
+	type IFinalSpliceAttempt
+} from '../channel/final-splice-state';
+import type { IFinalFundingReference } from '../channel/final-splice-candidate';
+import {
+	FinalDeviceJournal,
+	checkFinalLifecycleBackup
+} from './final-device-journal';
+import {
+	driveFinalSimpleClose,
+	matchFinalSimpleCloseSpend,
+	type IFinalSimpleCloseState,
+	type IFinalCloseRequest
+} from './final-simple-close';
 /**
  * SQLite storage backend for Lightning node persistence.
  *
@@ -34,6 +55,42 @@ import {
 	signOpening,
 	verifyOpeningSigning
 } from './final-opening-signing';
+import type { IChannelReestablishMessage } from '../message/channel-reestablish';
+import {
+	withFunding,
+	finalFundingLedgers,
+	fundingAdmission,
+	spliceBlocksFinalUpdates,
+	signFundingBatch,
+	receiveFundingBatch,
+	receiveFundingRevoke,
+	fundingReestablish,
+	receiveFundingReestablish,
+	type IFundingLedger
+} from './final-funding-updates';
+import { MessageType } from '../message/types';
+import {
+	FinalUpdateProtocolError,
+	FinalUpdateDataLossError,
+	finalOfferedHtlc,
+	stageFinalLedgerUpdate,
+	initialFinalLedger,
+	finalResolutionStates,
+	finalLedgerDeliveries,
+	validateUpdateLimits,
+	finalLedgerSnapshot,
+	type IFinalUpdateLimits,
+	type IFinalLedgerState,
+	type IFinalUpdateContext
+} from './final-channel-updates';
+import {
+	recoveryOpening,
+	finalJournalHistory,
+	currentFinalJournal,
+	appendFinalJournal,
+	preserveFinalJournal,
+	verifyFinalJournal
+} from './final-update-journal';
 import { decodeChannelReadyMessage } from '../message/channel-funding';
 import {
 	requireSameReadyPromise,
@@ -405,10 +462,82 @@ function preservesOpeningFields<T extends object>(older: T, newer: T): boolean {
 }
 
 export class SqliteStorage implements IStorageBackend {
+	finalSpliceSession(id: string, root: BIP32Interface): FinalSpliceSession {
+		if (!this.canUpdateFinalCommitments || this.db.inTransaction)
+			throw new Error(
+				'Splice requires the original update wallet and a top-level commit'
+			);
+		return new FinalSpliceSession(
+			id,
+			this,
+			root,
+			this.finalJournal(),
+			this.requireOpeningAuthority(),
+			() => this.readFinalSpliceAttempts(id).slice(-1)[0]
+		);
+	}
+	private finalJournal(): FinalDeviceJournal {
+		if (!this.updateWallet || !this.walletIdentity || !this.encryptionKey)
+			throw new Error('Final journal requires an update-enabled wallet');
+		return new FinalDeviceJournal(
+			this.db,
+			this.encryptionKey,
+			this.walletIdentity,
+			this.openingAuthority
+		);
+	}
+
 	private db: Database.Database;
 	private readonly dbPath: string;
 	private readonly walletIdentity?: string;
+	private readonly updateWallet: boolean;
 	private openingAuthority: FinalOpeningAuthority | null = null;
+	/** Public negotiation history excludes the local exit template, which later revocations can supersede. */
+	loadFinalSpliceAttempts(id: string) {
+		return this.readFinalSpliceAttempts(id).map(({ candidate, ...attempt }) => {
+			if (!candidate) return { ...attempt, candidate: undefined };
+			const { localExit: _exit, ...status } = candidate;
+			return { ...attempt, candidate: status };
+		});
+	}
+	private readFinalSpliceAttempts(id: string): IFinalSpliceAttempt[] {
+		if (!this.updateWallet) return [];
+		this.requireCurrentFinalDevice();
+		const head = this.finalJournal().read<FinalSpliceEvent>('splice', id);
+		return finalSpliceAttempts(id, head.records);
+	}
+
+	loadFinalSpliceWalletOutpoints(): Set<string> {
+		const reserved = new Set<string>();
+		if (!this.canUpdateFinalCommitments) return reserved;
+		for (const c of this.loadFinalOpenings()) {
+			for (const a of this.readFinalSpliceAttempts(c.channelId)) {
+				if (a.aborted !== undefined) continue;
+				for (const input of a.intent.inputs)
+					reserved.add(
+						Transaction.fromHex(input.prevTxHex).getId() + ':' + input.vout
+					);
+			}
+		}
+		return reserved;
+	}
+
+	loadFinalActiveFunding(id: string): IFinalFundingReference | null {
+		const opening = this.loadFinalDaemonOpening(id);
+		if (!opening?.funding) return null;
+		const c = opening.candidate;
+		return selectFinalFunding(
+			{
+				fundingTxHex: c.fundingTxHex,
+				fundingOutputIndex: c.fundingOutputIndex,
+				localFundingPubkey: c.localFundingPubkey,
+				remoteFundingPubkey: c.remoteFundingPubkey,
+				localFundingKeyIndex: opening.session.channelKeyIndex
+			},
+			this.readFinalSpliceAttempts(id)
+		);
+	}
+
 	get [finalWalletStorage](): boolean {
 		return this.walletIdentity !== undefined;
 	}
@@ -446,6 +575,9 @@ export class SqliteStorage implements IStorageBackend {
 	) {
 		const Sqlite = loadBetterSqlite3();
 		this.walletIdentity = opts?.[boundWallet];
+		this.updateWallet =
+			this.walletIdentity !== undefined &&
+			JSON.parse(this.walletIdentity)[0] === 2;
 		this.db = this.walletIdentity
 			? new Sqlite(dbPath, { fileMustExist: true, timeout: 0 })
 			: new Sqlite(dbPath);
@@ -469,6 +601,10 @@ export class SqliteStorage implements IStorageBackend {
 	): SqliteStorage {
 		const identity = finalWalletIdentity(dbPath, binding);
 		const daemonGenerated = takeFinalDaemonGeneration(binding);
+		if (binding.finalCommitmentUpdates && !daemonGenerated)
+			throw new Error(
+				'Final commitment updates require a freshly generated original wallet'
+			);
 		installFreshWallet(dbPath, (stagedPath) => {
 			const staged = new SqliteStorage(stagedPath, undefined, binding);
 			try {
@@ -509,6 +645,7 @@ export class SqliteStorage implements IStorageBackend {
 				binding.encryptionKey,
 				identity
 			);
+			storage.reconcileFinalUpdateOpenings();
 			storage.reconcileFinalExitRequests();
 			return storage;
 		} catch (error) {
@@ -667,7 +804,10 @@ export class SqliteStorage implements IStorageBackend {
 			this.db.pragma('synchronous = FULL');
 			this.db.pragma('foreign_keys = ON');
 			this.loadAllChannels();
-			this.readFinalOpenings();
+			this.readFinalOpenings((candidate, record) => {
+				if (this.updateWallet)
+					verifyFinalJournal(this.db, candidate.channelId, record.nonceKey);
+			});
 			this._restrictFileModes();
 			return;
 		}
@@ -706,6 +846,11 @@ export class SqliteStorage implements IStorageBackend {
 	 */
 	async backup(destPath: string): Promise<void> {
 		this.reconcileFinalExitRequests();
+		if (this.updateWallet) {
+			const journal = this.finalJournal();
+			for (const candidate of this.loadFinalOpenings())
+				journal.reconcile(candidate.channelId);
+		}
 		await backUpWalletFile(
 			this.db,
 			destPath,
@@ -723,6 +868,10 @@ export class SqliteStorage implements IStorageBackend {
 		old: Database.Database,
 		next: Database.Database
 	): void {
+		if (this.updateWallet) {
+			checkFinalLifecycleBackup(old, next);
+			preserveFinalJournal(old, next);
+		}
 		const read = (
 			db: Database.Database,
 			row: IFinalOpeningRow
@@ -805,6 +954,7 @@ export class SqliteStorage implements IStorageBackend {
 							'channelKeyIndex',
 							'peer',
 							'terms',
+							'updateLimits',
 							'remoteSecondPerCommitmentPoint'
 						].includes(k)
 				) ||
@@ -821,6 +971,8 @@ export class SqliteStorage implements IStorageBackend {
 				getIndex(candidate.channelId) !== session.channelKeyIndex
 			)
 				throw new Error('Invalid stored opening session');
+			if (session.updateLimits !== undefined)
+				validateUpdateLimits(session.updateLimits);
 			validateSecondPoint(
 				session.remoteSecondPerCommitmentPoint,
 				session.terms
@@ -917,6 +1069,16 @@ export class SqliteStorage implements IStorageBackend {
 		return this.openingAuthority !== null;
 	}
 
+	/** A copied wallet cannot prove that a backup commitment remains unrevoked. */
+	get canUpdateFinalCommitments(): boolean {
+		return this.updateWallet && this.canSignFinalOpening;
+	}
+
+	private requireCurrentFinalDevice(): void {
+		if (this.updateWallet && !this.canSignFinalOpening)
+			throw new Error('Current commitment requires the original wallet device');
+	}
+
 	loadFinalOpeningSession(channelId: string): IFinalOpeningSession | null {
 		return this.finalOpeningRecord(channelId)?.nonces.session ?? null;
 	}
@@ -926,7 +1088,8 @@ export class SqliteStorage implements IStorageBackend {
 		peer: string,
 		terms: IFinalOpeningTerms,
 		channelKeyIndex: number,
-		remoteSecondPerCommitmentPoint?: string
+		remoteSecondPerCommitmentPoint?: string,
+		updateLimits?: IFinalUpdateLimits
 	): void {
 		if (
 			!/^(02|03)[0-9a-f]{64}$/.test(peer) ||
@@ -937,7 +1100,9 @@ export class SqliteStorage implements IStorageBackend {
 		buildFinalOpeningCommitment(candidate, terms, 'local');
 		buildFinalOpeningCommitment(candidate, terms, 'remote');
 		validateSecondPoint(remoteSecondPerCommitmentPoint, terms);
+		if (updateLimits !== undefined) validateUpdateLimits(updateLimits);
 		const session = {
+			...(updateLimits && { updateLimits }),
 			peer,
 			terms: JSON.parse(canonicalTerms(terms)) as IFinalOpeningTerms,
 			channelKeyIndex,
@@ -1051,6 +1216,29 @@ export class SqliteStorage implements IStorageBackend {
 		return row ? this.readFinalOpening(row) : null;
 	}
 
+	/** An editable turn advertises only verification nonces. The device can reproduce
+	 * the promise if this exact transaction closes the interactive exchange.
+	 */
+	previewFinalOpeningTxComplete(
+		candidate: IFinalOpeningCandidate,
+		fundingKey: Buffer,
+		keyIndex: number
+	): Buffer {
+		const authority = this.requireOpeningAuthority();
+		authority.requireAllocatedChannelKey(keyIndex);
+		const { encoded, fundingOutpoint } = validateFinalOpening(candidate);
+		const key = this.finalOpeningKey(candidate.channelId, fundingOutpoint);
+		const context = authority.nonceContext(this.openingNonceKey(key, encoded));
+		return localOpeningTxComplete(
+			{},
+			candidate.channelId,
+			candidate.localFundingPubkey,
+			fundingKey,
+			context,
+			hkdfKey(context, 'beignet-editable-opening-turn-v1')
+		);
+	}
+
 	/** Return the exact tx_complete payload after its nonce reservation commits. */
 	finalOpeningTxComplete(channelId: string, fundingPrivateKey: Buffer): Buffer {
 		return this.updateOpeningNonces(
@@ -1088,7 +1276,8 @@ export class SqliteStorage implements IStorageBackend {
 					channelId,
 					candidate.localFundingPubkey,
 					fundingPrivateKey,
-					context
+					context,
+					hkdfKey(context, 'beignet-editable-opening-turn-v1')
 				);
 				authority.finish(
 					slot,
@@ -1143,11 +1332,14 @@ export class SqliteStorage implements IStorageBackend {
 	}
 
 	assertFinalDaemonIdentity(nodeId: string): void {
-		if (this.walletIdentity !== JSON.stringify([1, nodeId, 'regtest']))
+		if (
+			this.walletIdentity !==
+			JSON.stringify([this.updateWallet ? 2 : 1, nodeId, 'regtest'])
+		)
 			throw new Error('Expected the enrolled regtest final wallet identity');
 		const authority = this.requireOpeningAuthority();
 		authority.assertDaemonEnrollment();
-		authority.assertEnforceableExits((id) => this.loadFinalOpeningExit(id));
+		authority.assertEnforceableExits((id) => this.openingExitBytes(id));
 	}
 
 	private requireOpeningAuthority(): FinalOpeningAuthority {
@@ -1217,9 +1409,12 @@ export class SqliteStorage implements IStorageBackend {
 		index: number,
 		payload?: Buffer
 	): Buffer {
+		this.requireCurrentFinalDevice();
 		return this.updateOpeningNonces(
 			channelId,
 			(nonces, candidate, nonceKey) => {
+				if (payload && this.openingSuperseded({ candidate, nonces, nonceKey }))
+					throw new Error('Opening exit was superseded by a later commitment');
 				const current = this.loadChannelKeyIndex(channelId);
 				if (
 					(current !== null && current !== index) ||
@@ -1257,8 +1452,476 @@ export class SqliteStorage implements IStorageBackend {
 	}
 
 	loadFinalOpeningExit(channelId: string): Buffer | null {
+		this.requireCurrentFinalDevice();
+		const r = this.finalOpeningRecord(channelId);
+		if (r && this.openingSuperseded(r))
+			throw new Error('Opening exit was superseded by a later commitment');
+		return this.openingExitBytes(channelId);
+	}
+
+	private openingSuperseded(record: IFinalOpeningRecord): boolean {
+		return (
+			!!this.latestFinalUpdate(record)?.local.height ||
+			(this.canUpdateFinalCommitments &&
+				this.readFinalSpliceAttempts(record.candidate.channelId).some(
+					(a) => !!a.adopted
+				))
+		);
+	}
+
+	private openingExitBytes(channelId: string): Buffer | null {
 		const hex = this.finalOpeningRecord(channelId)?.nonces.signing?.exit;
 		return hex === undefined ? null : Buffer.from(hex, 'hex');
+	}
+
+	private latestFinalUpdate(
+		record: IFinalOpeningRecord
+	): IFinalLedgerState | null {
+		if (!this.canUpdateFinalCommitments) return null;
+		const state =
+			currentFinalJournal(
+				this.db,
+				this.requireOpeningAuthority(),
+				record.candidate.channelId,
+				record.nonceKey
+			)?.state ?? null;
+		if (state?.dataLoss) throw new FinalUpdateDataLossError();
+		return state;
+	}
+
+	private availableFundingExits(record: IFinalOpeningRecord) {
+		const opening = record.nonces.signing?.exit;
+		if (!opening) return [];
+		let exits = [opening];
+		if (this.canUpdateFinalCommitments && record.nonces.session?.updateLimits) {
+			const existing = this.latestFinalUpdate(record);
+			if (existing || (record.nonces.localReady && record.nonces.peerReady)) {
+				const ctx = this.finalUpdateContext(record);
+				const state = existing ?? this.initialUpdateState(ctx);
+				const attempts = this.readFinalSpliceAttempts(
+					record.candidate.channelId
+				);
+				const released = new Set(
+					attempts.map((a) => releasedFinalSpliceFunding(a)?.fundingTxHex)
+				);
+				const views = finalFundingLedgers(ctx, state, attempts);
+				const all = [
+					...views.map((v) => v.s),
+					state,
+					...Object.values(state.alternatives ?? {})
+				];
+				const latest = Math.max(...all.map((s) => s.local.height));
+				exits = [
+					...new Set(
+						all
+							.filter(
+								(s) =>
+									s.local.height === latest &&
+									(!s.funding || released.has(s.funding.fundingTxHex))
+							)
+							.map((s) => s.local.tx)
+					)
+				];
+			}
+		}
+		return exits.map((hex) => {
+			const exit = Buffer.from(hex, 'hex');
+			return { exit, fundingTxid: Transaction.fromBuffer(exit).ins[0].hash };
+		});
+	}
+
+	loadFinalFundingExits(id: string) {
+		this.requireCurrentFinalDevice();
+		const record = this.finalOpeningRecord(id);
+		return record ? this.availableFundingExits(record) : [];
+	}
+
+	private selectedFinalExit(
+		record: IFinalOpeningRecord,
+		requested?: string | null,
+		fundingTxid?: Buffer
+	): string {
+		const exits = this.availableFundingExits(record);
+		const match = exits.find((e) =>
+			fundingTxid
+				? e.fundingTxid.equals(fundingTxid)
+				: !requested || sha256(e.exit).toString('hex') === requested
+		);
+		if (!match)
+			throw new Error(
+				'Requested exit does not match a current funding commitment'
+			);
+		return match.exit.toString('hex');
+	}
+
+	private finalUpdateContext(record: IFinalOpeningRecord): IFinalUpdateContext {
+		return {
+			...record,
+			identity: this.walletIdentity!,
+			authority: this.requireOpeningAuthority()
+		};
+	}
+
+	private initialUpdateState(ctx: IFinalUpdateContext): IFinalLedgerState {
+		const id = ctx.candidate.channelId;
+		for (const side of ['local', 'peer'] as const)
+			ctx.authority.requireReconnectPromise(
+				'channel-reestablish/' + side + '/' + id,
+				ctx.nonces[side === 'local' ? 'localReconnect' : 'peerReconnect']
+			);
+		return initialFinalLedger(ctx.candidate, ctx.nonces);
+	}
+
+	private updateFinalLedger<T>(
+		id: string,
+		change: (views: IFundingLedger[]) => T,
+		access: 'commitment' | 'reestablish' | 'delivery' = 'commitment'
+	): T {
+		if (!this.canUpdateFinalCommitments || this.db.inTransaction)
+			throw new Error(
+				'Final updates require an original update wallet and a top-level commit'
+			);
+		return this.db
+			.transaction(() => {
+				const record = this.finalOpeningRecord(id);
+				if (!record?.nonces.session?.updateLimits)
+					throw new Error('Missing negotiated final HTLC limits');
+				if (access !== 'delivery' && this.finalExitRequested(id, record.nonces))
+					throw new Error('Final channel close already requested');
+				const ctx = this.finalUpdateContext(record);
+				const previous = currentFinalJournal(
+					this.db,
+					ctx.authority,
+					id,
+					ctx.nonceKey
+				);
+				const state = previous?.state ?? this.initialUpdateState(ctx);
+				const before = JSON.stringify(state);
+				const attempts = this.readFinalSpliceAttempts(id);
+				if (access === 'commitment' && attempts.some(spliceBlocksFinalUpdates))
+					throw new Error(
+						'Final channel is quiescent during splice negotiation'
+					);
+				const views = finalFundingLedgers(
+					ctx,
+					state,
+					attempts,
+					access === 'reestablish'
+				);
+				if (
+					access === 'commitment' &&
+					views.some((v) => v.s.awaitingFundingNonce)
+				)
+					throw new Error(
+						'Waiting for the peer verification nonce for its funded splice'
+					);
+				if (views.some((v) => v.s.dataLoss) || state.dataLoss)
+					throw new FinalUpdateDataLossError();
+				if (
+					this.finalSimpleCloseLocked(id) &&
+					(access === 'commitment' ||
+						(access === 'reestablish' &&
+							views.some((v) => v.s.waiting.length || v.s.inFlight)))
+				)
+					throw new Error('Final simple close already locked');
+				const result = change(views);
+				if (views.some((v) => v.s.dataLoss)) state.dataLoss = true;
+				if (JSON.stringify(state) !== before)
+					appendFinalJournal(
+						this.db,
+						ctx.authority,
+						id,
+						ctx.nonceKey,
+						previous,
+						state,
+						access === 'delivery'
+					);
+				return result;
+			})
+			.immediate();
+	}
+
+	private finalUpdateView(id: string) {
+		if (!this.canUpdateFinalCommitments) return null;
+		const record = this.finalOpeningRecord(id);
+		if (
+			!record?.nonces.session?.updateLimits ||
+			!record.nonces.peerReady ||
+			!record.nonces.localReady
+		)
+			return null;
+		const ctx = this.finalUpdateContext(record);
+		const state =
+			this.latestFinalUpdate(record) ?? this.initialUpdateState(ctx);
+		const attempts = this.readFinalSpliceAttempts(id);
+		return {
+			ctx,
+			state,
+			attempts,
+			views: finalFundingLedgers(ctx, state, attempts)
+		};
+	}
+
+	loadFinalOfferedHtlc(id: string, htlcId: bigint) {
+		const view = this.finalUpdateView(id);
+		if (!view) return null;
+		for (const { s } of view.views) {
+			const match = finalOfferedHtlc(s, htlcId);
+			if (match) return match;
+		}
+		return null;
+	}
+
+	loadFinalUpdateStatus(id: string) {
+		const view = this.finalUpdateView(id);
+		return view ? fundingAdmission(view.views) : null;
+	}
+
+	loadFinalResolutionStates(id: string) {
+		const view = this.finalUpdateView(id);
+		if (!view) return null;
+		const rawHistory = () =>
+			finalJournalHistory(this.db, id, view.ctx.nonceKey);
+		const primary = finalResolutionStates(view.ctx, view.state, rawHistory());
+		const all = [primary];
+		for (const [txid, slot] of Object.entries(view.state.alternatives ?? {})) {
+			const history = function* () {
+				for (const root of rawHistory())
+					if (root.alternatives?.[txid]) yield root.alternatives[txid];
+			};
+			all.push(
+				finalResolutionStates(
+					withFunding(view.ctx, slot.funding!),
+					slot,
+					history()
+				)
+			);
+		}
+		const selected = view.views[0].ctx.funding;
+		const current = all.find(
+			(a) => a.local.funding?.fundingTxHex === selected?.fundingTxHex
+		)!;
+		const revoked = all.flatMap((v) => v.revoked);
+		const secrets = new Map(revoked.map((v) => [v.height, v.secret!]));
+		const remote = all
+			.flatMap((v) => v.remote)
+			.filter((tx) => {
+				const secret = secrets.get(tx.height);
+				if (!secret) return true;
+				revoked.push({ ...tx, secret });
+				return false;
+			});
+		const latest = all.reduce(
+			(h, v) => (v.local.height > h ? v.local.height : h),
+			0n
+		);
+		if (current.local.height !== latest)
+			throw new Error('Selected funding has no unrevoked local commitment');
+		const released = new Set(
+			view.attempts.map((a) => releasedFinalSpliceFunding(a)?.fundingTxHex)
+		);
+		return {
+			...current,
+			locals: all
+				.map((v) => v.local)
+				.filter(
+					(v) =>
+						v.height === latest &&
+						(!v.funding || released.has(v.funding.fundingTxHex))
+				),
+			remote,
+			revoked,
+			preimages: [
+				...new Map(
+					all
+						.flatMap((v) => v.preimages)
+						.map((preimage) => [preimage.toString('hex'), preimage])
+				).values()
+			]
+		};
+	}
+
+	loadFinalCommitmentSnapshot(id: string) {
+		const view = this.finalUpdateView(id);
+		return view
+			? finalLedgerSnapshot(view.views[0].ctx, view.views[0].s)
+			: null;
+	}
+
+	stageFinalHtlcUpdate(
+		id: string,
+		direction: 'local' | 'peer',
+		type: MessageType,
+		payload: Buffer
+	): void {
+		this.updateFinalLedger(id, (views) => {
+			if (
+				type === MessageType.UPDATE_ADD_HTLC &&
+				(direction === 'local'
+					? this.finalSimpleCloseStarted(id)
+					: this.finalPeerSimpleShutdownReceived(id))
+			)
+				throw new Error('Final channel shutdown forbids new HTLCs');
+			for (const { ctx, s } of views)
+				stageFinalLedgerUpdate(ctx, s, direction, type, payload);
+		});
+	}
+
+	signFinalUpdateCommitment(id: string, root: BIP32Interface): Buffer {
+		return this.updateFinalLedger(id, (views) => {
+			if (views.length !== 1)
+				throw new Error('Final commitment requires a funding batch');
+			return signFundingBatch(views, root)[0];
+		});
+	}
+
+	signFinalUpdateCommitmentBatch(id: string, root: BIP32Interface): Buffer[] {
+		return this.updateFinalLedger(id, (views) => signFundingBatch(views, root));
+	}
+
+	acceptFinalUpdateCommitment(
+		id: string,
+		root: BIP32Interface,
+		payload: Buffer
+	): Buffer {
+		return this.acceptFinalUpdateCommitmentBatch(id, root, [payload]);
+	}
+
+	acceptFinalUpdateCommitmentBatch(
+		id: string,
+		root: BIP32Interface,
+		payloads: Buffer[]
+	): Buffer {
+		return this.updateFinalLedger(id, (views) =>
+			receiveFundingBatch(views, root, payloads)
+		);
+	}
+
+	acceptFinalUpdateRevocation(id: string, payload: Buffer): void {
+		this.updateFinalLedger(id, (views) => receiveFundingRevoke(views, payload));
+	}
+
+	finalUpdateReestablish(id: string, root: BIP32Interface) {
+		return this.updateFinalLedger(
+			id,
+			(views) => fundingReestablish(views, root),
+			'reestablish'
+		);
+	}
+
+	acceptFinalUpdateReestablish(
+		id: string,
+		root: BIP32Interface,
+		msg: IChannelReestablishMessage
+	) {
+		const splice = msg.myCurrentFundingLocked
+			? this.finalSpliceSession(id, root)
+			: undefined;
+		const result = this.updateFinalLedger(
+			id,
+			(views) => {
+				const attempts = this.readFinalSpliceAttempts(id);
+				const pending = attempts.find(
+					(a) => a.aborted === undefined && !a.adopted && a.candidate
+				);
+				const locked = msg.myCurrentFundingLocked;
+				const child =
+					pending?.candidate &&
+					Transaction.fromHex(pending.candidate.funding.fundingTxHex).getHash();
+				if (locked) {
+					const original = Transaction.fromHex(
+						views[0].ctx.candidate.fundingTxHex
+					).getHash();
+					if (
+						locked.retransmitFlags !== 0 ||
+						(!locked.txid.equals(original) &&
+							!attempts.some((a) => {
+								const ref = releasedFinalSpliceFunding(a);
+								return (
+									ref &&
+									locked.txid.equals(
+										Transaction.fromHex(ref.fundingTxHex).getHash()
+									)
+								);
+							}))
+					)
+						throw new FinalUpdateProtocolError(
+							'Peer named an unknown locked funding transaction'
+						);
+				}
+				const lock = !!(
+					locked &&
+					pending?.funded &&
+					locked.txid.equals(child!)
+				);
+				const covered =
+					lock &&
+					pending!.localLock === Buffer.from(child!).reverse().toString('hex')
+						? views.filter(
+								(v) =>
+									v.ctx.funding?.fundingTxHex ===
+									pending!.candidate!.funding.fundingTxHex
+						  )
+						: views;
+				const needsWitnesses = !!(child && msg.nextFundingTxid?.equals(child));
+				// A peer requesting its interactive funding signatures may still advertise only the parent.
+				const expected = needsWitnesses
+					? covered.filter(
+							(v) =>
+								!v.ctx.funding ||
+								v.ctx.funding.fundingTxHex !==
+									pending!.candidate!.funding.fundingTxHex ||
+								msg.nextLocalNonces?.some((n) => n.fundingTxid.equals(child!))
+					  )
+					: covered;
+				if (!expected.length)
+					throw new Error('Missing active reconnect funding');
+				const incomplete = attempts.some(spliceBlocksFinalUpdates);
+				const missing = expected.length !== covered.length;
+				const frames = receiveFundingReestablish(
+					expected,
+					root,
+					msg,
+					missing || incomplete
+				);
+				for (const v of covered) {
+					if (expected.includes(v)) delete v.s.awaitingFundingNonce;
+					else v.s.awaitingFundingNonce = true;
+				}
+				const dataLoss = expected.some((v) => v.s.dataLoss);
+				if (lock && !dataLoss && !pending!.peerLock) {
+					splice!.receive({
+						type: MessageType.SPLICE_LOCKED,
+						payload: encodeSpliceLockedMessage({
+							channelId: msg.channelId,
+							fundingTxid: child!
+						})
+					});
+				}
+				return { frames, dataLoss };
+			},
+			'reestablish'
+		);
+		if (result.dataLoss) throw new FinalUpdateDataLossError();
+		return result.frames;
+	}
+
+	loadFinalUpdateDeliveries(id: string) {
+		const view = this.finalUpdateView(id);
+		return view ? finalLedgerDeliveries(view.views[0].s) : [];
+	}
+
+	ackFinalUpdateDelivery(id: string, deliveryId: bigint): void {
+		this.updateFinalLedger(
+			id,
+			(views) => {
+				for (const { s } of views)
+					s.deliveries = s.deliveries.filter(
+						(d) => BigInt(d.update.ordinal) !== deliveryId
+					);
+			},
+			'delivery'
+		);
 	}
 
 	/** Prepare the immutable height-one promise after the chain watcher confirms funding. */
@@ -1324,6 +1987,150 @@ export class SqliteStorage implements IStorageBackend {
 			authority.finish(slot, transcript, first);
 			state.peerReady = first.toString('hex');
 		});
+	}
+
+	/** Record finality only after the watched, confirmed spend reaches the ordinary irrevocable depth. */
+	finalHtlcTimedOut(
+		id: string,
+		paymentHash: Buffer,
+		htlcId: bigint,
+		record = false
+	): boolean {
+		if (!this.canUpdateFinalCommitments) return false;
+		const key = htlcId.toString() + '/' + paymentHash.toString('hex');
+		const journal = this.finalJournal();
+		const head = journal.read<string>('htlc-timeout', id);
+		if (head.records.includes(key)) return true;
+		if (!record) return false;
+		journal.append('htlc-timeout', id, head, key);
+		return true;
+	}
+
+	/** Keep the fee inputs and exact child witness selected on this original. */
+	finalSponsoredClaim(
+		channelId: string,
+		template: string,
+		signed?: string
+	): Buffer | null {
+		if (!this.canUpdateFinalCommitments || !/^[a-f0-9]{64}$/.test(template))
+			throw new Error(
+				'Final claim sponsorship requires the original update wallet'
+			);
+		return this.db
+			.transaction(() => {
+				const journal = this.finalJournal();
+				const head = journal.read<{ template: string; raw: string }>(
+					'output-claim',
+					channelId
+				);
+				const retained = head.records.find((r) => r.template === template);
+				if (retained) return Buffer.from(retained.raw, 'hex');
+				if (!signed) return null;
+				journal.append('output-claim', channelId, head, {
+					template,
+					raw: signed
+				});
+				return Buffer.from(signed, 'hex');
+			})
+			.immediate();
+	}
+
+	loadFinalSimpleClose(id: string): IFinalSimpleCloseState | null {
+		if (!this.updateWallet) return null;
+		const { records } = this.finalJournal().read<IFinalSimpleCloseState>(
+			'simple-close',
+			id
+		);
+		return records[records.length - 1] ?? null;
+	}
+
+	finalSimpleCloseStarted(id: string): boolean {
+		return !!this.loadFinalSimpleClose(id);
+	}
+
+	finalPeerSimpleShutdownReceived(id: string): boolean {
+		return !!this.loadFinalSimpleClose(id)?.peerShutdown;
+	}
+
+	finalSimpleCloseLocked(id: string): boolean {
+		return (
+			this.updateWallet &&
+			(!!this.openingAuthority?.lifecycleEntry('simple-close-lock/' + id) ||
+				!!this.loadFinalSimpleClose(id)?.locked)
+		);
+	}
+
+	matchFinalSimpleCloseSpend(
+		id: string,
+		rawTx: Buffer,
+		_root: BIP32Interface
+	): boolean {
+		return matchFinalSimpleCloseSpend(this.loadFinalSimpleClose(id), rawTx);
+	}
+
+	finalSimpleCloseTransactions(id: string): Buffer[] {
+		const close = this.loadFinalSimpleClose(id);
+		const all = [
+			close?.localTransaction,
+			close?.peerTransaction,
+			...(close?.priorTransactions ?? [])
+		];
+		return [...new Set(all)]
+			.filter((hex): hex is string => !!hex)
+			.map((hex) => Buffer.from(hex, 'hex'));
+	}
+
+	finalSimpleCloseStep(
+		id: string,
+		root: BIP32Interface,
+		request: IFinalCloseRequest
+	): ReturnType<typeof driveFinalSimpleClose> {
+		if (!this.canUpdateFinalCommitments)
+			throw new Error(
+				'Final close requires the original update-capable wallet'
+			);
+		if (this.db.inTransaction)
+			throw new Error('Final close requires a top-level wallet commit');
+		return this.db
+			.transaction(() => {
+				const row = this.finalOpeningRecord(id);
+				const authority = this.requireOpeningAuthority();
+				if (
+					!row?.nonces.session ||
+					!row.nonces.localReady ||
+					!row.nonces.peerReady ||
+					!row.nonces.signing?.fundingTransaction ||
+					this.finalExitRequested(id, row.nonces)
+				)
+					throw new Error('Funding is unavailable for cooperative close');
+				const journal = this.finalJournal();
+				const head = journal.read<IFinalSimpleCloseState>('simple-close', id);
+				const previous = JSON.stringify(
+					head.records[head.records.length - 1] ?? {}
+				);
+				const state = JSON.parse(previous) as IFinalSimpleCloseState;
+				const view = this.loadFinalUpdateStatus(id);
+				if (!view) throw new Error('Missing final channel commitment view');
+				const active = this.loadFinalActiveFunding(id);
+				if (!active)
+					throw new Error('Ambiguous final funding during cooperative close');
+				const result = driveFinalSimpleClose(
+					id,
+					active,
+					row.nonces,
+					authority.nonceContext(row.nonceKey),
+					authority,
+					root,
+					this.walletIdentity!,
+					state,
+					view,
+					request
+				);
+				if (JSON.stringify(state) !== previous)
+					journal.append('simple-close', id, head, state);
+				return result;
+			})
+			.immediate();
 	}
 
 	loadFinalLocalChannelReady(channelId: string): Buffer | null {
@@ -1419,6 +2226,43 @@ export class SqliteStorage implements IStorageBackend {
 		return !!this.openingAuthority?.exitRequest(channelId);
 	}
 
+	/** A retained immutable opening makes device-repaired update states usable even after a much earlier wallet-only rollback. */
+	private reconcileFinalUpdateOpenings(): void {
+		if (!this.canUpdateFinalCommitments) return;
+		const ids = this.db
+			.prepare('SELECT channel_id FROM final_opening_candidates')
+			.all() as { channel_id: string }[];
+		for (const { channel_id: id } of ids) {
+			const record = this.finalOpeningRecord(id)!;
+			const latest = currentFinalJournal(
+				this.db,
+				this.requireOpeningAuthority(),
+				id,
+				record.nonceKey
+			);
+			if (
+				!latest ||
+				(record.nonces.peerReady &&
+					record.nonces.localReady &&
+					record.nonces.signing?.fundingTransaction)
+			)
+				continue;
+			const recovery = recoveryOpening(this.db, id, record.nonceKey);
+			if (!recovery)
+				throw new Error(
+					'Device commitment log is missing the opening required for recovery'
+				);
+			this.updateOpeningNonces(id, (nonces) => {
+				for (const [field, value] of Object.entries(recovery)) {
+					if (field === 'signing')
+						nonces.signing = { ...recovery.signing!, ...nonces.signing };
+					else if (!(field in nonces))
+						Object.assign(nonces, { [field]: value });
+				}
+			});
+		}
+	}
+
 	/** Complete a device-first close after a crash and enroll wallet-only requests
 	 * made by the preceding final wallet version before it can emit readiness.
 	 */
@@ -1426,38 +2270,59 @@ export class SqliteStorage implements IStorageBackend {
 		const authority = this.openingAuthority;
 		if (!authority) return;
 		const pending: string[] = [];
-		this.readFinalOpenings((candidate, { nonces }) => {
-			const signing = nonces.signing;
-			if (!signing?.exit || !signing.fundingLocal) return;
-			const id = candidate.channelId;
+		const ids = this.db
+			.prepare('SELECT channel_id FROM final_opening_candidates')
+			.all() as { channel_id: string }[];
+		for (const { channel_id: id } of ids) {
+			const record = this.finalOpeningRecord(id)!;
+			const signing = record.nonces.signing;
+			if (!signing?.exit || !signing.fundingLocal) continue;
+			if (!signing.exitRequested && !authority.exitRequest(id)) {
+				if (this.canUpdateFinalCommitments)
+					currentFinalJournal(this.db, authority, id, record.nonceKey);
+				continue;
+			}
+			const exit = this.selectedFinalExit(
+				record,
+				authority.chosenFundingExit(id)
+			);
 			if (signing.exitRequested) {
-				authority.recordExitRequest(id, signing.exit);
+				if (!authority.exitRequest(id)) authority.recordExitRequest(id, exit);
 			} else {
-				const requested = authority.exitRequest(id);
+				const requested = authority.chosenFundingExit(id);
 				if (requested) {
-					if (
-						requested !==
-						sha256(Buffer.from(signing.exit, 'hex')).toString('hex')
-					)
+					if (requested !== sha256(Buffer.from(exit, 'hex')).toString('hex'))
 						throw new Error(
 							'Original exit request disagrees with its signed exit'
 						);
 					pending.push(id);
 				}
 			}
-		});
+		}
 		for (const id of pending) this.requestFinalOpeningExit(id);
 	}
 
 	/** Persist the operator's request before broadcasting the already signed exit. */
-	requestFinalOpeningExit(channelId: string): Buffer {
-		return this.updateOpeningNonces(channelId, (state) => {
+	requestFinalOpeningExit(channelId: string, fundingTxid?: Buffer): Buffer {
+		this.requireCurrentFinalDevice();
+		return this.updateOpeningNonces(channelId, (state, candidate, nonceKey) => {
 			const signing = state.signing;
 			if (!state.session || !signing?.exit || !signing.fundingLocal)
 				throw new Error('Opening has not released its funding witnesses');
-			this.openingAuthority?.recordExitRequest(channelId, signing.exit);
+			const exit = this.selectedFinalExit(
+				{ candidate, nonces: state, nonceKey },
+				this.openingAuthority?.chosenFundingExit(channelId),
+				fundingTxid
+			);
+			if (!this.openingAuthority?.exitRequest(channelId))
+				this.openingAuthority?.recordExitRequest(channelId, exit);
+			if (this.canUpdateFinalCommitments && fundingTxid)
+				this.openingAuthority!.recordFundingExitChoice(
+					channelId,
+					sha256(Buffer.from(exit, 'hex')).toString('hex')
+				);
 			signing.exitRequested = true;
-			return Buffer.from(signing.exit, 'hex');
+			return Buffer.from(exit, 'hex');
 		});
 	}
 
@@ -1474,9 +2339,18 @@ export class SqliteStorage implements IStorageBackend {
 			...(signing?.fundingTransaction && {
 				funding: Buffer.from(signing.fundingTransaction, 'hex')
 			}),
-			...(signing?.exit &&
+			...((!this.updateWallet || this.canSignFinalOpening) &&
+				signing?.exit &&
 				this.finalExitRequested(record.candidate.channelId, record.nonces) && {
-					exitToBroadcast: Buffer.from(signing.exit!, 'hex')
+					exitToBroadcast: Buffer.from(
+						this.selectedFinalExit(
+							record,
+							this.openingAuthority?.chosenFundingExit(
+								record.candidate.channelId
+							)
+						),
+						'hex'
+					)
 				})
 		};
 	}
@@ -1486,11 +2360,15 @@ export class SqliteStorage implements IStorageBackend {
 	}
 
 	loadFinalDaemonOpenings(): IFinalDaemonOpening[] {
+		const ids: string[] = [];
+		this.readFinalOpenings((candidate) => ids.push(candidate.channelId));
 		const results: IFinalDaemonOpening[] = [];
-		this.readFinalOpenings((_candidate, record) => {
-			const opening = this.daemonOpening(record);
+		// Selecting the enforceable exit may reconcile entries from the device journal.
+		// Close the candidate iterator before opening its write transaction.
+		for (const id of ids) {
+			const opening = this.loadFinalDaemonOpening(id);
 			if (opening) results.push(opening);
-		});
+		}
 		return results;
 	}
 

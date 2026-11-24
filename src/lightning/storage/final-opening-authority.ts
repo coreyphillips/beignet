@@ -473,7 +473,46 @@ export class FinalOpeningAuthority {
 			.immediate();
 	}
 
+	requireReconnectPromise(
+		slot: string,
+		promise: IFinalReestablishNonce | undefined
+	): void {
+		this.verifyFiles();
+		const result = this.read(slot)?.result;
+		if (
+			(result ? Buffer.from(result, 'hex').toString() : undefined) !==
+			(promise ? JSON.stringify(promise) : undefined)
+		)
+			throw new Error(
+				'Wallet requires a fresh authenticated reconnect before its first update'
+			);
+	}
+
 	/** Burn a key before its basepoints leave this device, even if the wallet rolls back. */
+	lifecycleEntry(slot: string): string | null {
+		this.verifyFiles();
+		const existing = this.read('lifecycle/' + slot);
+		if (!existing) return null;
+		if (!existing.result) throw new Error('Incomplete final lifecycle entry');
+		const data = Buffer.from(existing.result, 'hex');
+		if (sha256(data).toString('hex') !== existing.transcript)
+			throw new Error('Invalid final lifecycle entry');
+		return data.toString('utf8');
+	}
+
+	commitLifecycleEntry(slot: string, value: string): void {
+		this.verifyFiles();
+		const name = 'lifecycle/' + slot,
+			raw = Buffer.from(value),
+			digest = sha256(raw).toString('hex');
+		this.db
+			.transaction(() => {
+				this.lock(name, digest);
+				this.finish(name, digest, raw);
+			})
+			.immediate();
+	}
+
 	requireAllocatedChannelKey(index: number): void {
 		this.verifyFiles();
 		if (
@@ -528,6 +567,47 @@ export class FinalOpeningAuthority {
 			'exit-request/' + channelId,
 			sha256(Buffer.from(exit, 'hex')).toString('hex')
 		);
+	}
+
+	/** A chain observer may select another retained unrevoked funding generation after a reorg. */
+	recordFundingExitChoice(channelId: string, digest: string): void {
+		const anchor = this.exitRequest(channelId);
+		if (!anchor || !/^[a-f0-9]{64}$/.test(digest))
+			throw new Error('Original close decision is missing');
+		const slot = 'funding-exit-choice/' + channelId;
+		this.db
+			.transaction(() => {
+				const result = Buffer.from(digest).toString('hex');
+				const previous = this.lock(slot, anchor);
+				if (previous?.toString() === digest) return;
+				this.db
+					.prepare('UPDATE claims SET claim=? WHERE slot=?')
+					.run(
+						encryptValue(
+							this.claimKey(slot),
+							JSON.stringify({ transcript: anchor, result })
+						),
+						slot
+					);
+				if (this.chosenFundingExit(channelId) !== digest)
+					throw new Error('Could not persist current funding exit');
+			})
+			.immediate();
+	}
+
+	chosenFundingExit(channelId: string): string | null {
+		const anchor = this.exitRequest(channelId);
+		if (!anchor) return null;
+		const claim = this.read('funding-exit-choice/' + channelId);
+		if (!claim) return anchor;
+		const result = claim.result && Buffer.from(claim.result, 'hex').toString();
+		if (
+			claim.transcript !== anchor ||
+			!result ||
+			!/^[a-f0-9]{64}$/.test(result)
+		)
+			throw new Error('Invalid current funding exit selection');
+		return result;
 	}
 
 	exitRequest(channelId: string): string | null {

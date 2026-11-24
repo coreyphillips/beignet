@@ -1,4 +1,14 @@
+import type { IFinalFundingReference } from './final-splice-candidate';
+import { createTaprootFundingScript } from '../script/funding-taproot';
 import { Transaction } from 'bitcoinjs-lib';
+import { MAX_INDEX } from '../keys/shachain';
+import type { ICommitmentTxResult } from '../script/commitment';
+import type { ICommitmentKeys } from './commitment-builder';
+import {
+	buildTaprootHtlcSuccessTx,
+	buildTaprootHtlcTimeoutTx,
+	taprootHtlcLeafSighash
+} from '../script/htlc-taproot';
 import { isValidPublicKey } from '../crypto/ecdh';
 import type { IChannelBasepoints } from '../keys/derivation';
 import { ANCHOR_TOTAL_COST } from '../script/anchor';
@@ -9,7 +19,12 @@ import {
 import {
 	buildTaprootToLocalOutput,
 	buildTaprootToRemoteOutput,
-	buildTaprootAnchorOutput
+	buildTaprootAnchorOutput,
+	buildTaprootOfferedHtlcOutput,
+	buildTaprootReceivedHtlcOutput,
+	assertFinalTaprootHtlcExpiry,
+	type ITaprootHtlcOutput,
+	type ITaprootLeafSpend
 } from '../script/commitment-taproot';
 import {
 	type IFinalOpeningCandidate,
@@ -70,12 +85,69 @@ function requireRange(value: number, min: number, max: number): void {
 		throw new Error('Opening commitment terms out of range');
 }
 
+export interface IFinalCommitmentHtlc {
+	id: bigint;
+	offeredBy: 'local' | 'peer';
+	amountMsat: bigint;
+	paymentHash: Buffer;
+	cltvExpiry: number;
+}
+
+export interface IFinalBalances {
+	localBalanceMsat: bigint;
+	remoteBalanceMsat: bigint;
+}
+
+export interface IFinalCommitmentView {
+	tx: Transaction;
+	outputMap: ICommitmentTxResult['outputMap'];
+	keys: ICommitmentKeys;
+	toSelfDelay: number;
+	htlcs: Array<{
+		htlc: IFinalCommitmentHtlc;
+		offered: boolean;
+		outputIndex: number;
+		tree: ITaprootHtlcOutput;
+		leaf: ITaprootLeafSpend;
+		secondLevelTx: Transaction;
+		digest: Buffer;
+	}>;
+}
+
 /** The first Bitcoin-only commitment has no HTLCs, push or lease. */
 export function buildFinalOpeningCommitment(
 	candidate: IFinalOpeningCandidate,
 	terms: IFinalOpeningTerms,
 	owner: 'local' | 'remote'
 ): Transaction {
+	const point = (
+		owner === 'local' ? terms.localBasepoints : terms.remoteBasepoints
+	).firstPerCommitmentPoint;
+	return buildFinalCommitmentView(
+		candidate,
+		terms,
+		owner,
+		readPoint(point),
+		0n,
+		{
+			localBalanceMsat: BigInt(candidate.localContributionSats) * 1000n,
+			remoteBalanceMsat: BigInt(candidate.remoteContributionSats) * 1000n
+		},
+		[]
+	).tx;
+}
+
+/** Balances exclude pending HTLCs and include the opener's commitment fee and anchors. */
+export function buildFinalCommitmentView(
+	candidate: IFinalOpeningCandidate,
+	terms: IFinalOpeningTerms,
+	owner: 'local' | 'remote',
+	point: Buffer,
+	height: bigint,
+	balances: IFinalBalances,
+	htlcs: readonly IFinalCommitmentHtlc[],
+	fundingRef?: IFinalFundingReference
+): IFinalCommitmentView {
 	validateFinalOpening(candidate);
 	if (
 		Object.keys(terms).length !== 7 ||
@@ -118,47 +190,115 @@ export function buildFinalOpeningCommitment(
 	for (const delay of [terms.localToSelfDelay, terms.remoteToSelfDelay])
 		requireRange(delay, 1, 2016);
 
+	const selected = fundingRef ?? candidate;
+	const funding = Transaction.fromHex(selected.fundingTxHex);
+	const fundingIndex = selected.fundingOutputIndex;
+	if (fundingRef) {
+		local.fundingPubkey = readPoint(fundingRef.localFundingPubkey);
+		remote.fundingPubkey = readPoint(fundingRef.remoteFundingPubkey);
+		const actual = funding.outs[fundingIndex]?.script;
+		if (
+			!actual ||
+			local.fundingPubkey.equals(remote.fundingPubkey) ||
+			!createTaprootFundingScript(
+				local.fundingPubkey,
+				remote.fundingPubkey
+			).p2trOutput.equals(actual)
+		)
+			throw new Error(
+				'Commitment funding output disagrees with the agreed keys'
+			);
+	}
 	const localOwner = owner === 'local';
 	const holder = localOwner ? local : remote;
 	const peer = localOwner ? remote : local;
 	const opener = candidate.isInitiator ? local : remote;
 	const acceptor = candidate.isInitiator ? remote : local;
-	const keys = deriveCommitmentKeys(
-		local,
-		remote,
-		holder.firstPerCommitmentPoint,
-		localOwner
-	);
-	const cost =
-		calculateCommitmentFee(terms.commitmentFeeratePerKw, 0, true, true) +
-		ANCHOR_TOTAL_COST;
-	const localBalance =
-		BigInt(candidate.localContributionSats) -
-		(candidate.isInitiator ? cost : 0n);
-	const remoteBalance =
-		BigInt(candidate.remoteContributionSats) -
-		(candidate.isInitiator ? 0n : cost);
-	if (localBalance < 0n || remoteBalance < 0n)
-		throw new Error(
-			'Opener cannot fund the opening commitment fee and anchors'
-		);
+	const keys = deriveCommitmentKeys(local, remote, point, localOwner);
+	if (
+		!Buffer.isBuffer(point) ||
+		point.length !== 33 ||
+		!isValidPublicKey(point) ||
+		height < 0n ||
+		height > MAX_INDEX
+	)
+		throw new Error('Invalid commitment height or per-commitment point');
 	const dust = BigInt(
 		localOwner ? terms.localDustLimitSatoshis : terms.remoteDustLimitSatoshis
 	);
-	if (localBalance < dust && remoteBalance < dust)
-		throw new Error('Opening commitment has no spendable balance');
+	let total = balances.localBalanceMsat + balances.remoteBalanceMsat;
+	const seen = new Set<string>();
+	const prepared: {
+		htlc: IFinalCommitmentHtlc;
+		offered: boolean;
+		tree: ITaprootHtlcOutput;
+		amount: bigint;
+	}[] = [];
+	for (const htlc of htlcs) {
+		const { id, offeredBy, amountMsat, paymentHash, cltvExpiry } = htlc;
+		const htlcKey = offeredBy + '/' + id;
+		if (
+			id < 0n ||
+			id > 0xffffffffffffffffn ||
+			amountMsat <= 0n ||
+			(offeredBy !== 'local' && offeredBy !== 'peer') ||
+			!Buffer.isBuffer(paymentHash) ||
+			paymentHash.length !== 32 ||
+			seen.has(htlcKey)
+		)
+			throw new Error('Invalid commitment HTLC');
+		assertFinalTaprootHtlcExpiry(cltvExpiry);
+		seen.add(htlcKey);
+		total += amountMsat;
+		const amount = amountMsat / 1000n;
+		if (amount < dust) continue;
+		const offered = localOwner === (offeredBy === 'local');
+		const args = [
+			keys.revocationPubkey,
+			keys.localHtlcPubkey,
+			keys.remoteHtlcPubkey,
+			paymentHash
+		] as const;
+		const tree = offered
+			? buildTaprootOfferedHtlcOutput(...args, undefined, 'final')
+			: buildTaprootReceivedHtlcOutput(...args, cltvExpiry, undefined, 'final');
+		prepared.push({ htlc, offered, tree, amount });
+	}
+	if (total !== BigInt(funding.outs[fundingIndex].value) * 1000n)
+		throw new Error(
+			'Commitment balances and HTLCs do not conserve channel capacity'
+		);
+	const cost =
+		calculateCommitmentFee(
+			terms.commitmentFeeratePerKw,
+			prepared.length,
+			true,
+			true
+		) + ANCHOR_TOTAL_COST;
+	const localBalance =
+		balances.localBalanceMsat / 1000n - (candidate.isInitiator ? cost : 0n);
+	const remoteBalance =
+		balances.remoteBalanceMsat / 1000n - (candidate.isInitiator ? 0n : cost);
+	if (
+		balances.localBalanceMsat < 0n ||
+		balances.remoteBalanceMsat < 0n ||
+		localBalance < 0n ||
+		remoteBalance < 0n
+	)
+		throw new Error('Opener cannot fund the commitment fee and anchors');
+	if (localBalance < dust && remoteBalance < dust && !prepared.length)
+		throw new Error('Commitment has no spendable balance');
 	const toSelfDelay = localOwner
 		? terms.remoteToSelfDelay
 		: terms.localToSelfDelay;
-	const funding = Transaction.fromHex(candidate.fundingTxHex);
-	return buildCommitmentTx({
+	const { tx, outputMap } = buildCommitmentTx({
 		fundingTxid: funding.getHash().toString('hex'),
-		fundingOutputIndex: candidate.fundingOutputIndex,
-		fundingAmount: BigInt(funding.outs[candidate.fundingOutputIndex].value),
+		fundingOutputIndex: fundingIndex,
+		fundingAmount: BigInt(funding.outs[fundingIndex].value),
 		obscuredCommitmentNumber: calculateObscuredCommitmentNumber(
 			opener.paymentBasepoint,
 			acceptor.paymentBasepoint,
-			0n
+			height
 		),
 		localAmount: localOwner ? localBalance : remoteBalance,
 		remoteAmount: localOwner ? remoteBalance : localBalance,
@@ -168,6 +308,14 @@ export function buildFinalOpeningCommitment(
 		toSelfDelay,
 		dustLimitSatoshis: dust,
 		useAnchors: true,
+		htlcOutputs: prepared.map(({ htlc, tree, amount }) => ({
+			htlcId: htlc.id,
+			script: Buffer.alloc(0),
+			amount,
+			cltvExpiry: htlc.cltvExpiry,
+			paymentHash: htlc.paymentHash,
+			taprootScript: tree.output
+		})),
 		localFundingPubkey: holder.fundingPubkey,
 		remoteFundingPubkey: peer.fundingPubkey,
 		taprootToLocalScript: buildTaprootToLocalOutput(
@@ -186,5 +334,48 @@ export function buildFinalOpeningCommitment(
 			.output,
 		taprootAnchorRemoteScript: buildTaprootAnchorOutput(peer.paymentBasepoint)
 			.output
-	}).tx;
+	});
+	const signedHtlcs = outputMap.htlcs.map((outputIndex, i) => {
+		const { htlc, offered, tree, amount } =
+			prepared[outputMap.htlcOriginalIndices[i]];
+		const childKeys = [
+			keys.revocationPubkey,
+			keys.localDelayedPubkey,
+			toSelfDelay
+		] as const;
+		const secondLevelTx = offered
+			? buildTaprootHtlcTimeoutTx(
+					tx.getId(),
+					outputIndex,
+					amount,
+					htlc.cltvExpiry,
+					...childKeys,
+					undefined,
+					'final'
+			  )
+			: buildTaprootHtlcSuccessTx(
+					tx.getId(),
+					outputIndex,
+					amount,
+					...childKeys,
+					undefined,
+					'final'
+			  );
+		const leaf = offered ? tree.timeout : tree.success;
+		return {
+			htlc,
+			offered,
+			outputIndex,
+			tree,
+			leaf,
+			secondLevelTx,
+			digest: taprootHtlcLeafSighash(
+				secondLevelTx,
+				tree.output,
+				Number(amount),
+				leaf.script
+			)
+		};
+	});
+	return { tx, outputMap, keys, toSelfDelay, htlcs: signedHtlcs };
 }

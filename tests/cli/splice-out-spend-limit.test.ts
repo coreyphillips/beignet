@@ -51,10 +51,14 @@ const REGTEST_SCRIPT = bitcoin.address.toOutputScript(
 );
 
 /** The exact fee BeignetNode.spliceOut charges against the budget. */
-function expectedFeeSats(feeratePerkw: number): number {
+function expectedFeeSats(
+	feeratePerkw: number,
+	taprootSharedInput = false
+): number {
 	return Number(
 		spliceFeeSats(
 			estimateSpliceTxWeight({
+				taprootSharedInput,
 				walletInputCount: 0,
 				destinationScriptLen: REGTEST_SCRIPT.length
 			}),
@@ -192,7 +196,11 @@ describe('Splice-out daily spend limit: accounting', () => {
 		_dailySpendResetTime: number;
 		_asyncSpendClaims: Map<string, unknown>;
 		getBitcoinNetwork: () => unknown;
-		node: { spliceOut: () => { ok: boolean; error?: string } };
+		_bootOpts?: { finalCommitmentUpdates: boolean };
+		node: {
+			spliceOut: () => { ok: boolean; error?: string };
+			getChannelManager?: () => { finalUpdateStatus: (id: string) => unknown };
+		};
 		engineCalls: number;
 		spliceOut: BeignetNode['spliceOut'];
 	}
@@ -238,6 +246,34 @@ describe('Splice-out daily spend limit: accounting', () => {
 		expect(fake._dailySpentSats).to.equal(total);
 		expect(fake._dailySpentOnchainSats).to.equal(total);
 		expect(fake._dailySpentLightningSats).to.equal(0);
+	});
+
+	it('charges the shared-input fee for each channel in an update-enabled wallet', () => {
+		const fake = fakeNode(1_000_000, { ok: true });
+		fake._bootOpts = { finalCommitmentUpdates: true };
+		const manager = {
+			finalUpdateStatus: (id: string): { localHeight: bigint } | null =>
+				id === UNKNOWN_CHANNEL_ID ? { localHeight: 2n } : null
+		};
+		fake.node.getChannelManager = (): typeof manager => manager;
+		const amount = 5_000;
+		const feerate = 2500;
+		const taprootTotal = amount + expectedFeeSats(feerate, true);
+		const legacyTotal = amount + expectedFeeSats(feerate);
+		expect(taprootTotal).to.be.lessThan(legacyTotal);
+		expect(
+			fake.spliceOut(
+				UNKNOWN_CHANNEL_ID.toUpperCase(),
+				amount,
+				feerate,
+				REGTEST_ADDRESS
+			).ok
+		).to.equal(true);
+		expect(fake._dailySpentOnchainSats).to.equal(taprootTotal);
+		expect(
+			fake.spliceOut('cd'.repeat(32), amount, feerate, REGTEST_ADDRESS).ok
+		).to.equal(true);
+		expect(fake._dailySpentOnchainSats).to.equal(taprootTotal + legacyTotal);
 	});
 
 	it('refuses over the limit before the engine is called', () => {

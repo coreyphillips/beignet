@@ -17,6 +17,7 @@ import { createFundingScript } from '../script/funding';
 import { createTaprootFundingScript } from '../script/funding-taproot';
 import { isTaprootChannel } from '../channel/types';
 import { decodeShortChannelId } from '../gossip/types';
+import type { IFinalOutputClaim } from './final-output-claims';
 import type { IFundingSpendScan } from './types';
 import { IRREVOCABLE_DEPTH } from './types';
 import { isDuplicateBroadcastRejection } from './broadcast-rejection';
@@ -369,6 +370,19 @@ export interface IChainWatcherChannelManager {
 	listChannels(): Channel[];
 	handleNewBlock(blockHeight: number): void;
 	handleFundingConfirmed(channelId: Buffer, confirmedTxidHex?: TxidHex): void;
+	finalSpliceParent?(
+		id: string,
+		txid: string
+	):
+		| import('../channel/final-splice-candidate').IFinalFundingReference
+		| undefined;
+	forgetFinalFundingConfirmation?(id: Buffer, txid?: string): void;
+	observeFinalFunding?(
+		id: string,
+		txid: string,
+		height: number | undefined,
+		parentAtDepth: boolean
+	): void;
 	handleFundingSpent(
 		channelId: Buffer,
 		spendingTx: bitcoin.Transaction,
@@ -395,6 +409,21 @@ export interface IChainWatcherChannelManager {
 }
 
 export interface IChainWatcherConfig {
+	/** Claims for an observed final commitment, using this wallet's destination and fee estimate. */
+	finalOutputClaims?: (
+		channelId: Buffer,
+		parent: bitcoin.Transaction,
+		destination: Buffer,
+		feeRate: number,
+		trimmed?: (hash: Buffer, htlcId: bigint, preimage?: Buffer) => void
+	) => IFinalOutputClaim[];
+	sponsorFinalClaim?: (
+		id: Buffer,
+		tx: bitcoin.Transaction,
+		rate: number
+	) => Promise<bitcoin.Transaction>;
+	finalPreimage?: (hash: Buffer, preimage: Buffer) => void;
+	finalTimeout?: (id: Buffer, hash: Buffer, htlcId: bigint) => void;
 	backend: IChainBackend;
 	channelManager: IChainWatcherChannelManager;
 	/** Destination script for sweep outputs (P2WPKH). Falls back to zeros if not set. */
@@ -647,6 +676,7 @@ export async function classifyAnnouncedChannelFunding(
  * registry holds.
  */
 interface IFailedFundingWatch {
+	key?: string;
 	watched: IWatchedFunding;
 }
 
@@ -810,6 +840,13 @@ export class ChainWatcher extends EventEmitter {
 	 */
 	private acceptingWork = true;
 	private destinationScript: Buffer;
+	private readonly finalOutputClaims?: IChainWatcherConfig['finalOutputClaims'];
+	private readonly sponsorFinalClaim?: IChainWatcherConfig['sponsorFinalClaim'];
+	private readonly finalPreimage?: IChainWatcherConfig['finalPreimage'];
+	private readonly finalTimeout?: IChainWatcherConfig['finalTimeout'];
+	private readonly observedFinalTimeouts = new Set<string>();
+	private readonly observedFinalPreimages = new Set<string>();
+
 	private getSweepFeeRatePerVbyte?: () => number;
 	private readonly missingDebounceMs: number;
 	private _recheckTimer: ReturnType<typeof setInterval> | null = null;
@@ -820,6 +857,10 @@ export class ChainWatcher extends EventEmitter {
 		this.channelManager = config.channelManager;
 		this.destinationScript = config.destinationScript || Buffer.alloc(22);
 		this.getSweepFeeRatePerVbyte = config.getSweepFeeRatePerVbyte;
+		this.finalOutputClaims = config.finalOutputClaims;
+		this.sponsorFinalClaim = config.sponsorFinalClaim;
+		this.finalPreimage = config.finalPreimage;
+		this.finalTimeout = config.finalTimeout;
 		this.missingDebounceMs =
 			config.missingDebounceMs ?? DEFAULT_MISSING_DEBOUNCE_MS;
 		this.confirmedTxCacheBytes =
@@ -928,8 +969,9 @@ export class ChainWatcher extends EventEmitter {
 	 */
 	private isSupersededFundingWatch(entry: IFailedFundingWatch): boolean {
 		return (
-			this.watchedFundings.get(entry.watched.channelId.toString('hex')) !==
-			entry.watched
+			this.watchedFundings.get(
+				entry.key ?? entry.watched.channelId.toString('hex')
+			) !== entry.watched
 		);
 	}
 
@@ -1003,6 +1045,8 @@ export class ChainWatcher extends EventEmitter {
 	 * Stop watching. Clears all watched outputs.
 	 */
 	stop(): void {
+		this.observedFinalTimeouts.clear();
+		this.observedFinalPreimages.clear();
 		// Refuses new work as well as retiring work already in flight: an outer
 		// operation that began before stop() can still call in for the first
 		// time afterwards, and it would otherwise be handed this new generation.
@@ -1016,6 +1060,13 @@ export class ChainWatcher extends EventEmitter {
 			this._recheckTimer = null;
 		}
 		for (const watched of this.watchedFundings.values()) {
+			if (watched.finalFundingValueSat !== undefined)
+				this.channelManager.observeFinalFunding?.(
+					watched.channelId.toString('hex'),
+					watched.txid,
+					undefined,
+					false
+				);
 			if (watched.finalFundingValueSat !== undefined)
 				this.setFinalFundingDepth(watched, 0);
 		}
@@ -1101,7 +1152,8 @@ export class ChainWatcher extends EventEmitter {
 		outputIndex: number,
 		minimumDepth: number,
 		script: Buffer,
-		valueSat: number
+		valueSat: number,
+		splice = false
 	): Promise<void> {
 		return this.registerFundingWatch(
 			channelId,
@@ -1110,7 +1162,10 @@ export class ChainWatcher extends EventEmitter {
 			minimumDepth,
 			script,
 			this.lifecycleGeneration,
-			{ finalFundingValueSat: valueSat }
+			{ finalFundingValueSat: valueSat },
+			splice
+				? channelId.toString('hex') + '/' + txid + ':' + outputIndex
+				: undefined
 		);
 	}
 
@@ -1128,11 +1183,12 @@ export class ChainWatcher extends EventEmitter {
 			| 'candidates'
 			| 'discoverAttemptInputs'
 			| 'finalFundingValueSat'
-		>
+		>,
+		registryKey?: string
 	): Promise<void> {
 		if (!this.isCurrentGeneration(generation)) return;
 		const scriptHash = computeScriptHash(script);
-		const key = channelId.toString('hex');
+		const key = registryKey ?? channelId.toString('hex');
 		const watched: IWatchedFunding = {
 			channelId,
 			txid,
@@ -1168,7 +1224,7 @@ export class ChainWatcher extends EventEmitter {
 				this.isCurrentGeneration(generation) &&
 				this.watchedFundings.get(key) === watched
 			) {
-				this.failedFundingWatches.push({ watched });
+				this.failedFundingWatches.push({ watched, key });
 			}
 			return;
 		}
@@ -1214,7 +1270,7 @@ export class ChainWatcher extends EventEmitter {
 		generation: number
 	): Promise<void> {
 		const watched = entry.watched;
-		const key = watched.channelId.toString('hex');
+		const key = entry.key ?? watched.channelId.toString('hex');
 		const live = (): boolean =>
 			this.isCurrentGeneration(generation) &&
 			this.watchedFundings.get(key) === watched;
@@ -1934,9 +1990,17 @@ export class ChainWatcher extends EventEmitter {
 		this.tipGeneration = generation;
 		this.currentBlockHeight = height;
 		if (replacedTip) {
+			const cleared = new Set<string>();
 			for (const watched of this.watchedFundings.values()) {
-				if (watched.finalFundingValueSat !== undefined)
-					this.setFinalFundingDepth(watched, 0);
+				if (watched.finalFundingValueSat === undefined) continue;
+				const id = watched.channelId.toString('hex');
+				if (!cleared.has(id)) {
+					this.channelManager.forgetFinalFundingConfirmation?.(
+						watched.channelId
+					);
+					cleared.add(id);
+				}
+				this.setFinalFundingDepth(watched, 0);
 			}
 		}
 
@@ -2240,6 +2304,136 @@ export class ChainWatcher extends EventEmitter {
 		}
 	}
 
+	/** Rebuild from the observed commitment on every header and after restart.
+	 * A confirmed sweep disappears from the unspent set. An orphaned one may be retried.
+	 */
+	private async claimFinalOutputs(
+		channelId: Buffer,
+		parent: bitcoin.Transaction,
+		height: number,
+		superseded: () => boolean
+	): Promise<void> {
+		if (!this.backend.listUnspent || !this.finalOutputClaims || superseded())
+			return;
+		const rate = this.getSweepFeeRatePerVbyte?.() ?? 10;
+		const irrevocable =
+			height > 0 && this.currentBlockHeight - height >= IRREVOCABLE_DEPTH;
+		const trimmed = (hash: Buffer, htlcId: bigint, preimage?: Buffer): void => {
+			const key = parent.getId() + ':trimmed:' + htlcId;
+			if (this.observedFinalTimeouts.has(key)) return;
+			if (preimage) this.finalPreimage?.(hash, preimage);
+			else this.finalTimeout?.(channelId, hash, htlcId);
+			this.observedFinalTimeouts.add(key);
+		};
+		const claims = this.finalOutputClaims(
+			channelId,
+			parent,
+			this.destinationScript,
+			rate,
+			irrevocable ? trimmed : undefined
+		);
+		for (const claim of claims) {
+			try {
+				await this.claimFinalOutput(
+					channelId,
+					parent,
+					height,
+					claim,
+					rate,
+					superseded
+				);
+			} catch (err) {
+				if (!this.isDuplicateRejection(err)) this.emitError(err);
+			}
+		}
+	}
+
+	private async claimFinalOutput(
+		id: Buffer,
+		parent: bitcoin.Transaction,
+		height: number,
+		claim: IFinalOutputClaim,
+		rate: number,
+		superseded: () => boolean
+	): Promise<void> {
+		if (superseded()) return;
+		const out = parent.outs[claim.outputIndex];
+		const scriptHash = computeScriptHash(out.script);
+		const coins = await this.backend.listUnspent!(scriptHash);
+		if (superseded()) return;
+		const coin = coins.find(
+			(c) =>
+				c.txid === parent.getId() &&
+				c.outputIndex === claim.outputIndex &&
+				c.valueSat === out.value
+		);
+		if (coin) {
+			if (!claim.tx) return;
+			if (
+				Math.max(0, coin.height) !== height ||
+				(claim.relativeDelay > 0 &&
+					(height <= 0 ||
+						this.currentBlockHeight - height + 1 < claim.relativeDelay)) ||
+				this.currentBlockHeight < claim.absoluteHeight
+			)
+				return;
+			if (claim.sponsor && !this.sponsorFinalClaim)
+				throw new Error('Final HTLC claim needs a wallet fee input');
+			const tx = claim.sponsor
+				? await this.sponsorFinalClaim!(id, claim.tx, rate)
+				: claim.tx;
+			if (!superseded()) await this.broadcastTransaction(tx.toBuffer());
+			return;
+		}
+		if (!claim.child && !claim.paymentHash) return;
+		for (const entry of await this.backend.getScriptHashHistory(scriptHash)) {
+			if (superseded()) return;
+			if (entry.txid === parent.getId()) continue;
+			const raw = await this.getHistoryTransaction(entry.txid, entry.height);
+			if (superseded()) return;
+			const spend = bitcoin.Transaction.fromBuffer(raw);
+			if (spend.getId() !== entry.txid) continue;
+			const index = spend.ins.findIndex(
+				(i) => i.index === claim.outputIndex && i.hash.equals(parent.getHash())
+			);
+			if (index < 0) continue;
+			if (claim.paymentHash) {
+				const hash = claim.paymentHash;
+				const preimage = spend.ins[index].witness.find(
+					(w) => w.length === 32 && sha256(w).equals(hash)
+				);
+				if (
+					preimage &&
+					!this.observedFinalPreimages.has(hash.toString('hex'))
+				) {
+					this.finalPreimage?.(hash, preimage);
+					this.observedFinalPreimages.add(hash.toString('hex'));
+				} else if (
+					!preimage &&
+					claim.htlcId !== undefined &&
+					entry.height > 0 &&
+					this.currentBlockHeight - entry.height >= IRREVOCABLE_DEPTH
+				) {
+					const key = parent.getId() + ':' + claim.outputIndex;
+					if (!this.observedFinalTimeouts.has(key)) {
+						this.finalTimeout?.(id, hash, claim.htlcId);
+						this.observedFinalTimeouts.add(key);
+					}
+				}
+			}
+			const child = claim.child?.(spend, index);
+			if (child)
+				await this.claimFinalOutput(
+					id,
+					spend,
+					Math.max(0, entry.height),
+					child,
+					rate,
+					superseded
+				);
+		}
+	}
+
 	private async checkFinalFundingDepth(
 		key: string,
 		watched: IWatchedFunding,
@@ -2258,6 +2452,12 @@ export class ChainWatcher extends EventEmitter {
 			coins = await this.backend.listUnspent(watched.scriptHash);
 		} catch (error) {
 			if (!current()) return;
+			this.channelManager.observeFinalFunding?.(
+				watched.channelId.toString('hex'),
+				watched.txid,
+				undefined,
+				false
+			);
 			this.setFinalFundingDepth(watched, 0);
 			throw error;
 		}
@@ -2273,6 +2473,42 @@ export class ChainWatcher extends EventEmitter {
 			const outpoint = watched.txid + ':' + watched.outputIndex;
 			this.recordScanCompleted(key, outpoint, this.beginSpendScan(key));
 		}
+		const id = watched.channelId.toString('hex');
+		const parent =
+			funding && this.channelManager.finalSpliceParent?.(id, watched.txid);
+		let parentAtDepth = false;
+		if (parent) {
+			const tx = bitcoin.Transaction.fromHex(parent.fundingTxHex);
+			try {
+				const history = await this.backend.getScriptHashHistory(
+					computeScriptHash(tx.outs[parent.fundingOutputIndex].script)
+				);
+				if (!current()) return;
+				const inclusion = history.find((v) => v.txid === tx.getId());
+				parentAtDepth =
+					this.tipGeneration === generation &&
+					!!inclusion &&
+					inclusion.height > 0 &&
+					this.currentBlockHeight - inclusion.height + 1 >=
+						watched.minimumDepth;
+			} catch (err) {
+				if (!current()) return;
+				this.channelManager.observeFinalFunding?.(
+					id,
+					watched.txid,
+					undefined,
+					false
+				);
+				this.setFinalFundingDepth(watched, 0);
+				throw err;
+			}
+		}
+		this.channelManager.observeFinalFunding?.(
+			id,
+			watched.txid,
+			funding?.height,
+			parentAtDepth
+		);
 		this.setFinalFundingDepth(watched, funding?.height ?? 0);
 		if (!funding) await this.checkFundingSpent(watched, generation, key);
 	}
@@ -2848,6 +3084,14 @@ export class ChainWatcher extends EventEmitter {
 			if (superseded()) return;
 			const spendingTx = bitcoin.Transaction.fromBuffer(rawTx);
 
+			// Bind the reported depth to the transaction before final wallet decisions.
+			if (
+				watched.finalFundingValueSat !== undefined &&
+				spendingTx.getId() !== entry.txid
+			)
+				throw new Error(
+					'Final funding history transaction does not match its txid'
+				);
 			// Verify this tx actually spends our funding output
 			const spendsOurs = spendingTx.ins.some((txIn) => {
 				const inputTxid = Buffer.from(txIn.hash).reverse().toString('hex');
@@ -2878,6 +3122,17 @@ export class ChainWatcher extends EventEmitter {
 				{ txid: outpoint.txid, outputIndex: outpoint.outputIndex }
 			);
 			this.emit('funding:spent', watched.channelId, spendingTx);
+			if (
+				watched.finalFundingValueSat !== undefined &&
+				this.finalOutputClaims
+			) {
+				await this.claimFinalOutputs(
+					watched.channelId,
+					spendingTx,
+					height,
+					superseded
+				);
+			}
 			return;
 		}
 

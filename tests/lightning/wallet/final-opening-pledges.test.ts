@@ -79,5 +79,16 @@ describe('Final wallet funding pledges after restart', () => {
 			/stop after coin selection/
 		);
 		expect(frozen.size).to.equal(0);
+
+		// A losing splice selection can release its coins even if the winner already reserved one.
+		frozen.add(mine.tx_hash);
+		frozen.add(other.tx_hash);
+		const afterSplice = new WalletFundingProvider(wallet, {
+			finalSpliceOutpoints: () => new Set([other.tx_hash + ':' + other.tx_pos])
+		});
+		await afterSplice.releaseInputPledges(
+			coins.map((coin) => ({ txid: coin.tx_hash, vout: coin.tx_pos }))
+		);
+		expect([...frozen]).to.deep.equal([other.tx_hash]);
 	});
 });

@@ -13,6 +13,8 @@ import { isValidPublicKey } from '../crypto/ecdh';
 import { decryptValue, encryptValue, hkdfKey } from './encryption';
 
 export interface IFinalWalletBinding {
+	/** Distinct identity for fresh wallets that can revoke earlier exits. */
+	finalCommitmentUpdates?: boolean;
 	encryptionKey: Buffer;
 	nodeId: string;
 	network: 'mainnet' | 'testnet' | 'regtest' | 'signet';
@@ -45,7 +47,18 @@ export function finalWalletIdentity(
 		throw new Error('Invalid final wallet node ID');
 	if (!['mainnet', 'testnet', 'regtest', 'signet'].includes(binding.network))
 		throw new Error('Invalid final wallet network');
-	return JSON.stringify([1, binding.nodeId, binding.network]);
+	if (
+		binding.finalCommitmentUpdates !== undefined &&
+		typeof binding.finalCommitmentUpdates !== 'boolean'
+	)
+		throw new Error('Invalid final wallet update capability');
+	if (binding.finalCommitmentUpdates && binding.network !== 'regtest')
+		throw new Error('Final commitment updates require regtest');
+	return JSON.stringify([
+		binding.finalCommitmentUpdates ? 2 : 1,
+		binding.nodeId,
+		binding.network
+	]);
 }
 
 export function assertUnusedWalletPath(path: string): void {
@@ -479,6 +492,22 @@ export function installWalletMarker(
 				nonces_json TEXT NOT NULL
 			);
 		`);
+		if (JSON.parse(identity)[0] === 2)
+			db.exec(`
+				CREATE TABLE final_lifecycle_log (
+					scope TEXT NOT NULL,
+					channel_id TEXT NOT NULL,
+					sequence INTEGER NOT NULL,
+					record TEXT NOT NULL,
+					PRIMARY KEY(scope,channel_id,sequence)
+				);
+				CREATE TABLE final_channel_update_log (
+					channel_id TEXT NOT NULL,
+					sequence INTEGER NOT NULL,
+					record TEXT NOT NULL,
+					PRIMARY KEY (channel_id, sequence)
+				)
+			`);
 		db.prepare(
 			'INSERT INTO final_wallet_format (id, identity) VALUES (1, ?)'
 		).run(encryptValue(hkdfKey(key, MARKER_KEY_INFO), identity));
