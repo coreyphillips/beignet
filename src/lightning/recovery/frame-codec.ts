@@ -191,6 +191,7 @@ interface IEncodedFrame {
 	durability?: RecoveryDurability;
 	durabilityPolicy?: number;
 	snapshot?: IEncodedSnapshot;
+	originalDeviceChannel?: RecoveryFrame['originalDeviceChannel'];
 }
 
 /** The only durability values a frame may declare (spec 5.8). */
@@ -678,6 +679,7 @@ export function frameVersionForContent(
 	// entry carries, which would otherwise take every add's onion twice and
 	// let one channel with hundreds of HTLCs in flight outgrow a guardian
 	// record. Releases before it would replay those adds truncated.
+	if (frame.originalDeviceChannel) return 6;
 	const states = [
 		...frame.mutations.flatMap((mutation) =>
 			mutation.type === 'channel_state' ? [mutation.state] : []
@@ -717,6 +719,55 @@ export function frameVersionForContent(
 		: 1;
 }
 
+function originalDeviceCheckpoint(
+	frame: RecoveryFrame
+): NonNullable<RecoveryFrame['originalDeviceChannel']> {
+	const row = frame.originalDeviceChannel;
+	if (
+		!row ||
+		frame.version !== 6 ||
+		frame.writerEpoch !== 1n ||
+		frame.sequence < 1n ||
+		frame.sequence > BigInt(Number.MAX_SAFE_INTEGER) ||
+		frame.previousFrameHash.length !== 32 ||
+		(frame.sequence === 1n) !==
+			frame.previousFrameHash.equals(Buffer.alloc(32)) ||
+		!Number.isSafeInteger(frame.timestamp) ||
+		frame.timestamp < 0 ||
+		frame.mutations.length ||
+		frame.outboundMessages.length ||
+		frame.snapshot ||
+		frame.durability !== 'local' ||
+		frame.durabilityPolicy !== undefined ||
+		!Number.isSafeInteger(row.channelIndex) ||
+		row.channelIndex < 0 ||
+		row.channelIndex > 0x7fffffff ||
+		!Number.isSafeInteger(row.spliceSequence) ||
+		row.spliceSequence < 0 ||
+		typeof row.channelId !== 'string' ||
+		!/^[a-f0-9]{64}$/.test(row.channelId) ||
+		typeof row.spliceHash !== 'string' ||
+		!/^[a-f0-9]{64}$/.test(row.spliceHash) ||
+		typeof row.fundingOutpoint !== 'string' ||
+		!/^[a-f0-9]{64}:(0|[1-9][0-9]{0,9})$/.test(row.fundingOutpoint) ||
+		Number(row.fundingOutpoint.slice(65)) > 0xffffffff ||
+		typeof row.openingRecord !== 'string' ||
+		!row.openingRecord.startsWith('enc1:') ||
+		typeof row.openingNonces !== 'string' ||
+		!row.openingNonces.startsWith('enc1:')
+	)
+		throw Error('Invalid original-device asset channel recovery frame');
+	return {
+		channelId: row.channelId,
+		channelIndex: row.channelIndex,
+		fundingOutpoint: row.fundingOutpoint,
+		openingRecord: row.openingRecord,
+		openingNonces: row.openingNonces,
+		spliceSequence: row.spliceSequence,
+		spliceHash: row.spliceHash
+	};
+}
+
 /** Encode a frame to the plaintext bytes the frame hash commits to. */
 export function encodeFrame(frame: RecoveryFrame): Buffer {
 	const encoded: IEncodedFrame = {
@@ -748,21 +799,29 @@ export function encodeFrame(frame: RecoveryFrame): Buffer {
 	if (frame.snapshot) {
 		encoded.snapshot = encodeSnapshot(frame.snapshot, frame.version);
 	}
+	if (frame.version === 6 || frame.originalDeviceChannel !== undefined)
+		encoded.originalDeviceChannel = originalDeviceCheckpoint(frame);
 	return Buffer.from(JSON.stringify(encoded), 'utf8');
 }
 
 /** Decode plaintext frame bytes. Throws on any malformed content. */
-export function decodeFrame(plaintext: Buffer): RecoveryFrame {
+export function decodeFrame(
+	plaintext: Buffer,
+	options?: { originalDevice: true }
+): RecoveryFrame {
 	const encoded = JSON.parse(plaintext.toString('utf8')) as IEncodedFrame;
 	if (
 		encoded.version !== 1 &&
 		encoded.version !== 2 &&
 		encoded.version !== 3 &&
 		encoded.version !== 4 &&
-		encoded.version !== 5
+		encoded.version !== 5 &&
+		!(encoded.version === 6 && options?.originalDevice === true)
 	) {
 		throw new Error(`Unsupported recovery frame version: ${encoded.version}`);
 	}
+	if (encoded.version !== 6 && encoded.originalDeviceChannel !== undefined)
+		throw Error('Original-device channel recovery requires a version 6 frame');
 	const encodedStates = [
 		...encoded.mutations.flatMap((mutation) =>
 			mutation.type === 'channel_state'
@@ -846,6 +905,12 @@ export function decodeFrame(plaintext: Buffer): RecoveryFrame {
 	}
 	if (encoded.snapshot) {
 		frame.snapshot = decodeSnapshot(encoded.snapshot);
+	}
+	if (encoded.version === 6) {
+		frame.originalDeviceChannel = encoded.originalDeviceChannel;
+		frame.originalDeviceChannel = originalDeviceCheckpoint(frame);
+		if (!encodeFrame(frame).equals(plaintext))
+			throw Error('Noncanonical original-device asset channel recovery frame');
 	}
 	return frame;
 }

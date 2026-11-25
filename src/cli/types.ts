@@ -1216,6 +1216,8 @@ export interface BeignetConfig
 	dualFundedAssets?: boolean;
 	/** Enroll a fresh regtest wallet for asset channel splices. */
 	assetSplice?: boolean;
+	/** Enroll a fresh regtest wallet for revocable asset payouts across splices. */
+	assetSpliceRecovery?: boolean;
 	/** option_wumbo: advertise large_channels and lift the 2^24 sat funding cap. */
 	largeChannels?: boolean;
 	/** Legacy single API bearer token. Still honored with implicit admin scope. */

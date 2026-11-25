@@ -3,8 +3,11 @@ import type { IAssetSpliceUpdateHost } from '../../../src/lightning/channel/asse
 import { signatureRoundFixture } from './asset-splice-signature-round';
 
 /** Real peer devices and Bitcoin signatures, with a deterministic wallet proof test double. */
-export async function setupFundedAssetUpdatePair(dir: string) {
-	const s = signatureRoundFixture(dir);
+export async function setupFundedAssetUpdatePair(
+	dir: string,
+	generation: 4 | 5 = 4
+) {
+	const s = signatureRoundFixture(dir, false, generation);
 	s.construct();
 	const rounds = [s.round(0), s.round(1)];
 	const shares = (await Promise.all(

@@ -86,7 +86,7 @@ export function installOpeningAuthority(
 	try {
 		signer.pragma('synchronous = EXTRA');
 		const generation = JSON.parse(identity)[0];
-		if (generation === 3 || generation === 4)
+		if (generation === 3 || generation === 4 || generation === 5)
 			signer.pragma('auto_vacuum = FULL');
 		const secret = randomBytes(32);
 		const origin = JSON.stringify([
@@ -362,6 +362,43 @@ export class FinalOpeningAuthority {
 		this.verifyFiles();
 		if (!this.daemonGenerated)
 			throw new Error('Final wallet lacks fresh daemon enrollment');
+	}
+
+	/** Match a replay-only SQLite backup to its original wallet. */
+	verifyAssetBackupLineage(
+		source: Database.Database,
+		key: Buffer,
+		identity: string
+	): void {
+		this.assertDaemonEnrollment();
+		const origin = getOrigin(source, key, identity);
+		if (origin.files || origin.lineage !== sha256(this.secret).toString('hex'))
+			throw new Error('Expected a replay-only backup from this wallet lineage');
+	}
+
+	/** Verify the enrolled opening against existing device claims without reserving a signing operation. */
+	verifyAssetOpeningClaims(
+		id: string,
+		outpoint: string,
+		candidate: string,
+		session: string,
+		exit: string
+	): void {
+		this.assertDaemonEnrollment();
+		const candidateHash = sha256(Buffer.from(candidate)).toString('hex');
+		const claims = [
+			['channel/' + id, candidateHash],
+			['funding/' + outpoint, candidateHash],
+			['opening/session/' + id, sha256(Buffer.from(session)).toString('hex')],
+			[
+				'enforceable-exit/' + id,
+				sha256(Buffer.from(exit, 'hex')).toString('hex')
+			]
+		];
+		for (const [slot, transcript] of claims) {
+			if (this.read(slot)?.transcript !== transcript)
+				throw new Error('Backup opening differs from the original device');
+		}
 	}
 
 	nonceContext(candidateKey: Buffer): Buffer {

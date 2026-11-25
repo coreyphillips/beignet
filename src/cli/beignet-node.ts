@@ -6,7 +6,7 @@
  * class with plain JSON return types.
  */
 
-import { ASSET_OPENING_TYPE_HEX } from '../lightning/features/asset-opening';
+import { isAssetOpeningType } from '../lightning/features/asset-opening';
 import type { IrohDaemonConfig } from './iroh-config';
 import { validateIrohConfig } from './iroh-config';
 import type { PorchDaemonConfig } from './porch-config';
@@ -81,6 +81,7 @@ import type { OnchainSweepInfo, OnchainSweepRequest } from './onchain-sweep';
 import { OnchainSweeps } from './onchain-sweep';
 import { ensurePrivateDir, writeFileAtomic } from './fs-utils';
 import { dbRestoreMarkerPath, holdDbRestoredChannels } from './restore';
+import { writeAssetChannelFrame } from './asset-channel-frame';
 import { deriveBackupMacKey, writeBackupMac } from './backup-mac';
 import { generateFinalDaemonWallet } from '../lightning/storage/final-wallet-generation';
 import { bindFinalDaemonView } from '../lightning/storage/final-daemon-admission';
@@ -520,6 +521,8 @@ export interface BeignetNodeOptions
 	dualFundedAssets?: boolean;
 	/** Enroll a fresh regtest wallet for asset channel splices. */
 	assetSplice?: boolean;
+	/** Enroll a fresh regtest wallet for revocable asset payouts across splices. */
+	assetSpliceRecovery?: boolean;
 	/**
 	 * option_wumbo (large_channels, default false): advertise the bit and lift
 	 * the 2^24 sat funding cap (up to 10 BTC) for peers that also advertise it.
@@ -3139,13 +3142,16 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 				'INVALID_PARAMS',
 				'Dual-funded assets require a separately enrolled final wallet'
 			);
+		const spliceModes = [opts.assetSplice, opts.assetSpliceRecovery];
 		if (
-			opts.assetSplice !== undefined &&
-			(typeof opts.assetSplice !== 'boolean' ||
-				(opts.assetSplice &&
-					(opts.finalTaprootWallet !== true ||
-						opts.finalCommitmentUpdates ||
-						opts.dualFundedAssets)))
+			spliceModes.some(
+				(mode) => mode !== undefined && typeof mode !== 'boolean'
+			) ||
+			(spliceModes.includes(true) &&
+				(opts.finalTaprootWallet !== true ||
+					opts.finalCommitmentUpdates ||
+					opts.dualFundedAssets ||
+					(opts.assetSplice && opts.assetSpliceRecovery)))
 		)
 			throw new BeignetError(
 				'INVALID_PARAMS',
@@ -3183,7 +3189,8 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 				? generateFinalDaemonWallet(
 						opts.finalCommitmentUpdates,
 						opts.dualFundedAssets,
-						opts.assetSplice
+						opts.assetSplice,
+						opts.assetSpliceRecovery
 				  )
 				: undefined;
 		const mnemonic = fresh?.mnemonic ?? (opts.mnemonic || generateMnemonic());
@@ -3279,6 +3286,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 						finalCommitmentUpdates: opts.finalCommitmentUpdates,
 						dualFundedAssets: opts.dualFundedAssets,
 						assetSplice: opts.assetSplice,
+						assetSpliceRecovery: opts.assetSpliceRecovery,
 						network: networkName,
 						nodeId
 				  });
@@ -3688,7 +3696,9 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 					this.sqlite()!.loadFinalOpenings()
 			: undefined;
 		const finalSpliceOutpoints =
-			this._bootOpts?.finalCommitmentUpdates || this._bootOpts?.assetSplice
+			this._bootOpts?.finalCommitmentUpdates ||
+			this._bootOpts?.assetSplice ||
+			this._bootOpts?.assetSpliceRecovery
 				? () => this.sqlite()!.loadFinalSpliceWalletOutpoints()
 				: undefined;
 		const fees: ExtensionFixedOutputFees | undefined = supply?.fixedOutputFees;
@@ -7994,7 +8004,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 			case ChannelState.NEGOTIATING_CLOSING:
 				return 'assetChannelClosingSats';
 			case ChannelState.FORCE_CLOSED: {
-				if (ch.channelType?.toString('hex') === ASSET_OPENING_TYPE_HEX)
+				if (isAssetOpeningType(ch.channelType?.toString('hex')))
 					return this.node
 						.getChannelManager()
 						.assetOpeningCollateral(ch.channelId)?.payoutSpent
@@ -8369,7 +8379,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	): Promise<T> {
 		return this._runOnchainSend(() =>
 			this.wallet.withSendLock(async (locked) => {
-				if (this._bootOpts?.assetSplice)
+				if (this._bootOpts?.assetSplice || this._bootOpts?.assetSpliceRecovery)
 					await this.walletFundingProvider(
 						undefined
 					).renewFinalOpeningPledges();
@@ -8550,7 +8560,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	private async _broadcastRawTx(hex: string): Promise<TxInfo> {
 		const bitcoin = await import('bitcoinjs-lib');
 		const tx = bitcoin.Transaction.fromHex(hex);
-		if (this._bootOpts?.assetSplice) {
+		if (this._bootOpts?.assetSplice || this._bootOpts?.assetSpliceRecovery) {
 			const reserved = this.sqlite()!.loadFinalSpliceWalletOutpoints();
 			if (
 				tx.ins.some((input) =>
@@ -9254,7 +9264,9 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	private assertWalletInputMutable(txid: string, index: number): void {
 		this.onchainSweeps().assertInputMutable(txid, index);
 		if (
-			(this._bootOpts?.finalCommitmentUpdates || this._bootOpts?.assetSplice) &&
+			(this._bootOpts?.finalCommitmentUpdates ||
+				this._bootOpts?.assetSplice ||
+				this._bootOpts?.assetSpliceRecovery) &&
 			this.sqlite()!
 				.loadFinalSpliceWalletOutpoints()
 				.has(txid.toLowerCase() + ':' + index)
@@ -18111,6 +18123,24 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	}
 
 	// ─────────────── Database Backup ───────────────
+
+	/** Export an authenticated channel checkpoint for offline repair on this wallet's original device. */
+	async backupAssetChannelFrame(
+		channelId: string,
+		destPath: string
+	): Promise<void> {
+		const sqlite = this.sqlite();
+		if (!sqlite?.canRecoverAssetSplice)
+			throw new BeignetError(
+				'INVALID_PARAMS',
+				'Asset channel recovery frames require the enrolled original wallet'
+			);
+		writeAssetChannelFrame(
+			destPath,
+			deriveBackupMacKey(this.walletSeed()),
+			() => sqlite.createAssetChannelRecoveryFrame(channelId)
+		);
+	}
 
 	/** Back up the database to `destPath`, with its MAC in backupMacPath(destPath). */
 	async backup(destPath: string): Promise<void> {

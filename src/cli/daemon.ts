@@ -3368,11 +3368,25 @@ async function bootDaemon(
 
 		// ── Database Backup ──
 		'POST /backup': async (body) => {
-			const { destPath, overwrite } = body as {
+			const { destPath, channelId, overwrite } = body as {
 				destPath: string;
+				channelId?: string;
 				overwrite?: boolean;
 			};
-			if (!destPath) return failure('INVALID_PARAMS', 'destPath required');
+			if (typeof destPath !== 'string' || !destPath)
+				return failure('INVALID_PARAMS', 'destPath required');
+			if (channelId !== undefined) {
+				if (typeof channelId !== 'string' || !/^[0-9a-f]{64}$/.test(channelId))
+					return failure(
+						'INVALID_PARAMS',
+						'Expected a lowercase hex channel ID'
+					);
+				if (overwrite !== undefined && overwrite !== false)
+					return failure(
+						'INVALID_PARAMS',
+						'Channel frames require a new destination'
+					);
+			}
 			if (
 				destPath.includes('..') ||
 				destPath.includes('%2e%2e') ||
@@ -3386,6 +3400,10 @@ async function bootDaemon(
 				overwrite === true
 			);
 			if ('refusal' in dest) return failure('INVALID_PARAMS', dest.refusal);
+			if (channelId !== undefined) {
+				await node.backupAssetChannelFrame(channelId, dest.path);
+				return success({ backed_up: true, path: dest.path, channelId });
+			}
 			await node.backup(dest.path);
 			return success({
 				backed_up: true,

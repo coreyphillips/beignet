@@ -42,6 +42,10 @@ export type AssetSpliceInclusionLookup = (
 	height: number,
 	recovery: IAssetSpliceInclusionRecovery
 ) => Promise<IAssetSpliceAnchor>;
+export type AssetSpliceParentLookup = (
+	parent: IFinalFundingReference,
+	recovery: IAssetSpliceInclusionRecovery
+) => Promise<boolean>;
 interface LockEvent {
 	kind: 'asset-splice-lock';
 	event: IAssetSpliceLockEvent;
@@ -51,6 +55,8 @@ interface Entry {
 	terms: IAssetSpliceLockTerms;
 	peer: string;
 	parent: string;
+	parentFunding: IFinalFundingReference;
+	mempoolParentCurrent?: () => boolean;
 	lock: AssetSpliceLock;
 	ticket: number;
 	verified?: { blockHash: string; height: number };
@@ -126,6 +132,7 @@ export class AssetSpliceConfirmationCoordinator {
 			terms,
 			peer,
 			parent,
+			parentFunding: e.parent.funding,
 			ticket: 0,
 			lock: new AssetSpliceLock(
 				terms,
@@ -208,6 +215,13 @@ export class AssetSpliceConfirmationCoordinator {
 	}
 	has(id: string, txid: string): boolean {
 		return this.entries.has(key(id, txid));
+	}
+	mempoolCloseParents(id: string): Set<string> {
+		const parents = new Set<string>();
+		for (const e of this.entries.values())
+			if (e.terms.channelId === id && e.mempoolParentCurrent?.())
+				parents.add(e.parent);
+		return parents;
 	}
 	/** Identify a spend of our watched funding before classifying a unilateral close. */
 	fundingSpend(
@@ -378,7 +392,8 @@ export class AssetSpliceConfirmationCoordinator {
 		txid: string,
 		height: number | undefined,
 		prove: AssetSpliceInclusionLookup,
-		current: () => boolean
+		current: () => boolean,
+		proveMempoolParent?: AssetSpliceParentLookup
 	): Promise<void> {
 		const e = this.entries.get(key(id, txid));
 		if (!e || !current()) return;
@@ -386,10 +401,26 @@ export class AssetSpliceConfirmationCoordinator {
 		e.lock.suspend();
 		e.verified = undefined;
 		e.mined = false;
+		e.mempoolParentCurrent = undefined;
 		e.sample = height && height > 0 ? { height, prove, current } : undefined;
 		if (!e.sample) {
+			const fresh = () => current() && ticket === e.ticket;
 			await e.lock.observe(null);
-			if (current() && ticket === e.ticket) await this.settled(e, ticket);
+			if (!fresh()) return;
+			await this.settled(e, ticket);
+			if (
+				(height === 0 || height === -1) &&
+				proveMempoolParent &&
+				fresh() &&
+				!e.lock.state().adopted
+			) {
+				const confirmed = await proveMempoolParent(e.parentFunding, {
+					store: this.store,
+					channelId: id,
+					finalDigest: e.terms.finalDigest
+				});
+				if (confirmed && fresh()) e.mempoolParentCurrent = fresh;
+			}
 			return;
 		}
 		const anchor = await prove(e.sample.height, {

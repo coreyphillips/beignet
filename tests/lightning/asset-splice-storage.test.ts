@@ -3,7 +3,10 @@ import { mnemonicToSeedSync } from 'bip39';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
-import { ASSET_OPENING_TYPE_HEX } from '../../src/lightning/features/asset-opening';
+import {
+	ASSET_OPENING_TYPE_HEX,
+	ASSET_SPLICE_RECOVERY_TYPE_HEX
+} from '../../src/lightning/features/asset-opening';
 import { bip32RootFromSeed } from '../../src/lightning/keys/wallet-keys';
 import { createTaprootFundingScript } from '../../src/lightning/script/funding-taproot';
 import {
@@ -67,6 +70,45 @@ describe('Original-device asset splice storage', () => {
 		expect(() => store!.loadFinalOpeningExit('13'.repeat(32))).to.throw(
 			/original/
 		);
+	});
+
+	it('enrolls recovery only on a fresh original and binds its copies to the same generation', async () => {
+		const { binding } = generateFinalDaemonWallet(false, false, false, true);
+		expect(finalWalletGeneration(false, false, false, true)).to.equal(5);
+		expect(() => finalWalletGeneration(false, false, true, true)).to.throw();
+		store = SqliteStorage.createFinalWallet(file, binding);
+		expect(store.canRecoverAssetSplice).to.equal(true);
+		expect(store.canSpliceDualFundedAssets).to.equal(true);
+		expect(store.canOpenDualFundedAssets).to.equal(true);
+		expect(store.canUpdateFinalCommitments).to.equal(false);
+		await store.backup(copy);
+		store.close();
+		store = undefined;
+		for (const where of [file, copy]) {
+			expect(() =>
+				SqliteStorage.openFinalWallet(where, {
+					...binding,
+					assetSplice: true,
+					assetSpliceRecovery: false
+				})
+			).to.throw(/binding/);
+		}
+		store = SqliteStorage.openFinalWallet(copy, binding);
+		expect(store.supportsAssetSpliceRecovery).to.equal(true);
+		expect(store.canRecoverAssetSplice).to.equal(false);
+		expect(store.canSpliceDualFundedAssets).to.equal(false);
+		expect(() => store!.loadFinalFundingExits('12'.repeat(32))).to.throw(
+			/original/
+		);
+		expect(() =>
+			SqliteStorage.createFinalWallet(file + '.imported', { ...binding })
+		).to.throw(/fresh/);
+		expect(() =>
+			SqliteStorage.createFinalWallet(file + '.mainnet', {
+				...binding,
+				network: 'mainnet'
+			})
+		).to.throw(/regtest/);
 	});
 
 	it('recognizes only the live original signing authority of this splice wallet outside a transaction', () => {
@@ -153,8 +195,13 @@ describe('Original-device asset splice storage', () => {
 			maxAcceptedHtlcs: 6
 		}
 	};
-	function opened() {
-		const { binding, mnemonic } = generateFinalDaemonWallet(false, false, true);
+	function opened(recovery = false, type = ASSET_OPENING_TYPE_HEX) {
+		const { binding, mnemonic } = generateFinalDaemonWallet(
+			false,
+			false,
+			!recovery,
+			recovery
+		);
 		store = SqliteStorage.createFinalWallet(file, binding);
 		const alice = boundParticipant(
 			bip32RootFromSeed(mnemonicToSeedSync(mnemonic)),
@@ -163,7 +210,7 @@ describe('Original-device asset splice storage', () => {
 		);
 		const { candidate, terms, id, funding } = signingFixture(false, alice, bob);
 		const root = Buffer.alloc(32, 42);
-		candidate.channelType = ASSET_OPENING_TYPE_HEX;
+		candidate.channelType = type;
 		funding.outs[candidate.fundingOutputIndex].script =
 			createTaprootFundingScript(
 				alice.keys.channelBasepoints.fundingPubkey,
@@ -195,6 +242,18 @@ describe('Original-device asset splice storage', () => {
 			limits
 		);
 		return { binding, id };
+	}
+
+	for (const recovery of [true, false]) {
+		it(
+			'requires the enrolled channel type when recovery is ' + recovery,
+			() => {
+				const otherType = recovery
+					? ASSET_OPENING_TYPE_HEX
+					: ASSET_SPLICE_RECOVERY_TYPE_HEX;
+				expect(() => opened(recovery, otherType)).to.throw(/channel type/);
+			}
+		);
 	}
 
 	it('retains the actual opening HTLC and reserve terms for splice admission after restart', () => {

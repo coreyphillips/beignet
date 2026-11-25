@@ -99,7 +99,8 @@ export const AUXILIARY_CHANNELS_API = Object.freeze({
 		// basic_mpp only where its parts can be collected.
 		'createInvoice:assetInvoice',
 		'dualFunding:v1',
-		'assetSplice:v1'
+		'assetSplice:v1',
+		'assetSpliceRecovery:v1'
 	] as const),
 	// Nothing is declared and not run in this build.
 	declared: Object.freeze([] as const)

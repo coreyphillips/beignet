@@ -2157,10 +2157,11 @@ export function getOpenApiSpec(): Record<string, unknown> {
 			'/backup': {
 				post: {
 					summary:
-						'Create database backup at the canonical destPath (returned as path; a relative destPath resolves against the working directory of the daemon, not the caller), with its seed-derived MAC in <destPath>.hmac (returned as macPath; `beignet restore db` needs it). An existing destPath or MAC file needs overwrite: true; the live database, its sidecars, the instance lock, config.json and daemon.pid are always refused',
+						'Export an authenticated database backup or an encrypted recovery frame for one funded generation 5 regtest channel. Admin access required. A relative destPath resolves against the daemon working directory. A database backup returns its macPath and accepts overwrite for existing backup files. With channelId, supply a new destination and omit overwrite. The daemon protects its live database, sidecars, instance lock, config.json and daemon.pid.',
 					tags: ['Node'],
 					requestBody: bodyContent({
 						destPath: 'string',
+						channelId: 'string?',
 						overwrite: 'boolean?'
 					}),
 					responses: {
@@ -2168,11 +2169,13 @@ export function getOpenApiSpec(): Record<string, unknown> {
 							description: 'Backup result',
 							content: jsonContent({
 								type: 'object',
-								required: ['backed_up', 'path', 'macPath'],
+								required: ['backed_up', 'path'],
+								oneOf: [{ required: ['macPath'] }, { required: ['channelId'] }],
 								properties: {
 									backed_up: { type: 'boolean', enum: [true] },
 									path: { type: 'string' },
-									macPath: { type: 'string' }
+									macPath: { type: 'string' },
+									channelId: { type: 'string', pattern: '^[0-9a-f]{64}$' }
 								}
 							})
 						}

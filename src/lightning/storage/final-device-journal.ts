@@ -10,7 +10,7 @@ const scopes = [
 	'output-claim',
 	'htlc-timeout'
 ] as const;
-type Scope = (typeof scopes)[number];
+type Scope = (typeof scopes)[number] | 'asset-recovery-frame';
 interface JournalRow {
 	sequence: number;
 	record: string;
@@ -34,12 +34,26 @@ export class FinalDeviceJournal {
 	) {}
 
 	private prefix(scope: Scope, channelId: string): string {
-		if (!scopes.includes(scope) || !/^[a-f0-9]{64}$/.test(channelId))
+		if (
+			(scope !== 'asset-recovery-frame' && !scopes.includes(scope)) ||
+			!/^[a-f0-9]{64}$/.test(channelId)
+		)
 			throw new Error('Invalid final journal identity');
 		return scope + '/' + channelId;
 	}
 
-	private readPrefix<T>(scope: Scope, id: string): IFinalJournalRead<T> {
+	private readPrefix<T>(
+		scope: Scope,
+		id: string,
+		checkpoint?: IFinalJournalHead
+	): IFinalJournalRead<T> {
+		if (
+			checkpoint &&
+			(!Number.isSafeInteger(checkpoint.sequence) ||
+				checkpoint.sequence < 0 ||
+				!/^[a-f0-9]{64}$/.test(checkpoint.hash))
+		)
+			throw new Error('Invalid final journal checkpoint');
 		const prefix = this.prefix(scope, id);
 		const key = hkdfKey(
 			this.walletKey,
@@ -55,10 +69,20 @@ export class FinalDeviceJournal {
 		for (let seq = 1; ; seq++) {
 			const row = rows[seq - 1],
 				slot = prefix + '/' + seq;
+			if (checkpoint?.sequence === seq - 1 && checkpoint.hash !== hash)
+				throw new Error(
+					'Recovery frame splice history differs from the original device'
+				);
 			const device = this.authority?.lifecycleEntry(slot);
 			if (row?.sequence !== undefined && row.sequence !== seq)
 				throw new Error('Final journal has missing records');
-			if (!row && !device) return { records, sequence: seq - 1, hash };
+			if (!row && !device) {
+				if (checkpoint && checkpoint.sequence >= seq)
+					throw new Error(
+						'Recovery frame splice history exceeds the original device'
+					);
+				return { records, sequence: seq - 1, hash };
+			}
 			const encoded = row?.record ?? device!;
 			if (this.authority && encoded !== device)
 				throw new Error('Final journal differs from the original device');
@@ -85,16 +109,24 @@ export class FinalDeviceJournal {
 	}
 
 	/** Copy every device-ahead byte before SQLite takes a portable wallet snapshot. */
-	reconcile(channelId: string): void {
+	reconcile(channelId: string, includeAssetFrames = false): void {
 		this.db
 			.transaction(() => {
 				for (const scope of scopes) this.readPrefix(scope, channelId);
+				if (includeAssetFrames)
+					this.readPrefix('asset-recovery-frame', channelId);
 			})
 			.deferred();
 	}
 
-	read<T>(scope: Scope, id: string): IFinalJournalRead<T> {
-		return this.db.transaction(() => this.readPrefix<T>(scope, id)).deferred();
+	read<T>(
+		scope: Scope,
+		id: string,
+		checkpoint?: IFinalJournalHead
+	): IFinalJournalRead<T> {
+		return this.db
+			.transaction(() => this.readPrefix<T>(scope, id, checkpoint))
+			.deferred();
 	}
 
 	append<T>(

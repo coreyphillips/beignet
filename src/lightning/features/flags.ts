@@ -152,7 +152,8 @@ export enum Feature {
 	/** Private, two-contributor asset opening version 1 (init pair 456/457). */
 	OPTION_DUAL_FUNDED_ASSETS = 456,
 	/** Private regtest asset splice v1, optional bit 459. */
-	OPTION_ASSET_SPLICE = 458
+	OPTION_ASSET_SPLICE = 458,
+	OPTION_ASSET_SPLICE_RECOVERY = 460
 }
 
 /**

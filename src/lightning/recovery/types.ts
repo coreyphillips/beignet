@@ -195,6 +195,17 @@ export interface IRecoveryCommitResult {
 
 // ─────────────── Phase 2: the recovery journal (spec 5.3) ───────────────
 
+/** Original-device inputs for repairing an enrolled channel. Opening values remain sealed under the channel's storage keys. */
+export interface IOriginalDeviceAssetChannel {
+	channelId: string;
+	channelIndex: number;
+	fundingOutpoint: string;
+	openingRecord: string;
+	openingNonces: string;
+	spliceSequence: number;
+	spliceHash: string;
+}
+
 /**
  * One append-only journal record: everything an Important or SafetyCritical
  * transition changed, hash-chained to its predecessor.
@@ -210,7 +221,9 @@ export interface IRecoveryCommitResult {
  * frame's mutations list is empty; the snapshot IS the state.
  */
 export interface RecoveryFrame {
-	version: 1 | 2 | 3 | 4 | 5;
+	version: 1 | 2 | 3 | 4 | 5 | 6;
+	/** A local version 6 checkpoint can be applied only to its enrolled original device. */
+	originalDeviceChannel?: IOriginalDeviceAssetChannel;
 	/** Changes only when a restored device takes ownership (Phase 5). */
 	writerEpoch: bigint;
 	/** Globally monotonic across the node, starting at 1. */

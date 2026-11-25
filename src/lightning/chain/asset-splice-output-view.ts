@@ -1,6 +1,11 @@
+import { decodeRevokeAndAckMessage } from '../message/channel-commitment';
 import { assetUpdateHistory } from '../storage/asset-update-history';
 import { Transaction } from 'bitcoinjs-lib';
-import type { IAssetOpeningPayout } from '../channel/asset-opening-provider';
+import type {
+	IAssetOpeningPayout,
+	IAssetFundingLineageEntry
+} from '../channel/asset-opening-provider';
+import type { IFinalOpeningCandidate } from '../storage/final-opening-candidate';
 import { buildAssetOpeningCommitment } from '../channel/final-opening-commitment';
 import { assetOpeningLeaves } from '../storage/asset-opening-evidence';
 import {
@@ -22,6 +27,24 @@ export function matchedAssetPayoutViews(
 	const history = storage.canSpliceDualFundedAssets
 		? assetUpdateHistory(storage, id)
 		: undefined;
+	// A received revocation names the preceding logical height. The caller
+	// checks its secret against the point of the matched commitment.
+	const authority = (height: string, holder: 'local' | 'remote') => {
+		const wire = history?.stages.get(
+			BigInt(height) +
+				1n +
+				'/' +
+				(holder === 'local' ? 'local-revoke' : 'peer-revoke')
+		);
+		if (!wire) return { revoked: undefined as Buffer | undefined };
+		if (holder !== 'remote' || !storage.canRecoverAssetSplice) return;
+		const msg = decodeRevokeAndAckMessage(Buffer.from(wire, 'hex'), {
+			finalTaproot: true
+		});
+		if (msg.channelId.toString('hex') !== id)
+			throw Error('Asset payout revocation names a different channel');
+		return { revoked: msg.perCommitmentSecret };
+	};
 	for (const updated of [...(history?.states.values() ?? [])].reverse()) {
 		for (const b of updated.members) {
 			if (
@@ -36,17 +59,11 @@ export function matchedAssetPayoutViews(
 						local ? b.localCommitment : b.remoteCommitment
 					);
 				if (commit.getId() !== parent.getId()) continue;
-				if (
-					history?.stages.has(
-						BigInt(updated.height) +
-							1n +
-							'/' +
-							(local ? 'local-revoke' : 'peer-revoke')
-					)
-				)
-					return [];
+				const protection = authority(updated.height, holder);
+				if (!protection) return [];
 				return [
 					{
+						...protection,
 						...spliceRecoveryView(
 							opening,
 							{ ...session.terms, commitmentFeeratePerKw: updated.feerate },
@@ -79,16 +96,10 @@ export function matchedAssetPayoutViews(
 		  )
 		: [];
 	const holders = ['local', 'remote'] as const;
-	const revoked = (height: string, holder: 'local' | 'remote') =>
-		history?.stages.has(
-			BigInt(height) +
-				1n +
-				'/' +
-				(holder === 'local' ? 'local-revoke' : 'peer-revoke')
-		);
 	if (!retained.length)
 		return holders.flatMap((holder) => {
-			if (revoked('0', holder)) return [];
+			const protection = authority('0', holder);
+			if (!protection) return [];
 			const assets = assetOpeningLeaves(evidence, holder);
 			const view = buildAssetOpeningCommitment(
 				opening,
@@ -99,6 +110,7 @@ export function matchedAssetPayoutViews(
 			return view.tx.getId() === parent.getId()
 				? [
 						{
+							...protection,
 							view,
 							assets,
 							holder,
@@ -132,8 +144,9 @@ export function matchedAssetPayoutViews(
 				const tx = Transaction.fromHex(
 					local ? b.localCommitment : b.remoteCommitment
 				);
-				if (tx.getId() !== parent.getId() || revoked(entry.stateNumber, holder))
-					return [];
+				if (tx.getId() !== parent.getId()) return [];
+				const protection = authority(entry.stateNumber, holder);
+				if (!protection) return [];
 				const state =
 					entry.priorDigest && history?.states.get(BigInt(entry.stateNumber));
 				if (entry.priorDigest && (!state || state.digest !== entry.priorDigest))
@@ -153,6 +166,7 @@ export function matchedAssetPayoutViews(
 				return [
 					{
 						...built,
+						...protection,
 						holder,
 						state: BigInt(entry.stateNumber),
 						fundingProofs: b.fundingProofs,
@@ -183,4 +197,79 @@ export function matchedAssetPayoutViews(
 	)
 		throw new Error('Ambiguous retained proof for watched asset commitment');
 	return first ? [first] : [];
+}
+
+/** Follow only released candidate funding outpoints back to the enrolled opening.
+ * The peer can finish the witness after the local share was sent and before the
+ * signed transaction was recorded. The authorized txid still binds that template.
+ */
+export function retainedAssetFundingLineage(
+	storage: SqliteStorage,
+	id: string,
+	opening: IFinalOpeningCandidate,
+	fundingTxid: string,
+	fundingOutputIndex: number
+): IAssetFundingLineageEntry[] {
+	if (!storage.canRecoverAssetSplice || opening.channelId !== id)
+		throw Error('Asset payout lineage requires the original recovery wallet');
+	const original =
+		Transaction.fromHex(opening.fundingTxHex).getId() +
+		':' +
+		opening.fundingOutputIndex;
+	let outpoint = fundingTxid + ':' + fundingOutputIndex;
+	if (outpoint === original) return [];
+	type Stage = { kind: 'peer-splice-stage'; field: string; hex: string };
+	const { records } = storage.readAssetSpliceJournal<
+		AssetSpliceExitEvent | Stage
+	>(id);
+	const releases = new Set<string>();
+	const assembled = new Map<string, string>();
+	const phases = records.filter(
+		(r): r is AssetSpliceExitEvent => r.kind !== 'peer-splice-stage'
+	);
+	for (const row of records) {
+		if (row.kind === 'funding-released') releases.add(row.finalDigest);
+		if (row.kind !== 'peer-splice-stage' || row.field !== 'assembled') continue;
+		const txid = Transaction.fromHex(row.hex).getId();
+		if (assembled.has(txid) && assembled.get(txid) !== row.hex)
+			throw Error('Conflicting signed asset splice funding transactions');
+		assembled.set(txid, row.hex);
+	}
+	const candidates = new Map<string, IAssetFundingLineageEntry>();
+	for (const e of publishableAssetSpliceEvidence(phases, id)) {
+		if (!releases.has(e.finalDigest)) continue;
+		const { parent, candidate } = e;
+		const edge = {
+			parentTxid: parent.fundingTxid,
+			parentOutputIndex: parent.outputIndex,
+			fundingTxid: candidate.fundingTxid,
+			fundingOutputIndex: candidate.outputIndex,
+			fundingTxHex:
+				assembled.get(candidate.fundingTxid) ?? candidate.funding.fundingTxHex
+		};
+		const key = edge.fundingTxid + ':' + edge.fundingOutputIndex;
+		if (candidates.has(key))
+			throw Error('Ambiguous released asset splice lineage');
+		candidates.set(key, edge);
+	}
+	const path: IAssetFundingLineageEntry[] = [];
+	while (outpoint !== original) {
+		const edge = candidates.get(outpoint);
+		if (!edge) throw Error('Missing released asset splice funding lineage');
+		candidates.delete(outpoint);
+		const tx = Transaction.fromHex(edge.fundingTxHex);
+		if (
+			tx.getId() !== edge.fundingTxid ||
+			!tx.outs[edge.fundingOutputIndex] ||
+			tx.ins.filter(
+				(i) =>
+					i.index === edge.parentOutputIndex &&
+					i.hash.equals(Buffer.from(edge.parentTxid, 'hex').reverse())
+			).length !== 1
+		)
+			throw Error('Released asset splice differs from its parent outpoint');
+		path.push(edge);
+		outpoint = edge.parentTxid + ':' + edge.parentOutputIndex;
+	}
+	return path.reverse();
 }
