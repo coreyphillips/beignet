@@ -1,3 +1,7 @@
+import {
+	receivedAdoptedSpliceSignature,
+	type AdoptedSpliceReplayEvent
+} from '../storage/asset-splice-release-replay';
 import { assetUpdateFundingMembers } from '../storage/asset-splice-exit-proofs';
 import { assetUpdateHistory } from '../storage/asset-update-history';
 import { INBOUND_HTLC_CLAIM_FORCE_CLOSE_BUFFER } from '../node/config';
@@ -958,6 +962,17 @@ export class AssetSpliceTransport {
 		)
 			return false;
 		const pending = this.pending(id);
+		if (
+			pending &&
+			(type === M.COMMITMENT_SIGNED || type === M.TX_SIGNATURES) &&
+			receivedAdoptedSpliceSignature(
+				this.store.readAssetSpliceJournal<AdoptedSpliceReplayEvent>(id).records,
+				pending.index,
+				type,
+				raw
+			)
+		)
+			return true;
 		if (type !== M.STFU && !pending) {
 			if (type !== M.TX_ABORT) return false;
 			const last = this.store

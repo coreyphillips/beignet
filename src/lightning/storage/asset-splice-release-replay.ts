@@ -24,6 +24,58 @@ interface Frame {
 	payload: string;
 }
 
+export type AdoptedSpliceReplayEvent =
+	| Frame
+	| { kind: 'peer-splice'; index: number }
+	| { kind: 'peer-splice-stage'; field: string; hex: string }
+	| Extract<AssetSpliceExitEvent, { kind: 'funding-released' }>
+	| { kind: 'asset-splice-imported'; finalDigest: string; txid: string };
+
+/** Match a previously accepted peer wire against a fully assembled, imported predecessor. */
+export function receivedAdoptedSpliceSignature(
+	records: readonly AdoptedSpliceReplayEvent[],
+	currentIndex: number,
+	type: M,
+	wire: Buffer
+): boolean {
+	const begin = records.findIndex(
+		(r) => r.kind === 'peer-splice' && r.index === currentIndex
+	);
+	if (begin < 0 || (type !== M.COMMITMENT_SIGNED && type !== M.TX_SIGNATURES))
+		return false;
+	// A current signature can already be durable before its outer transport marker.
+	const previous = records.slice(0, begin);
+	const payload = wire.toString('hex');
+	const signed = previous.find(
+		(r): r is Frame =>
+			r.kind === 'asset-splice-signature' &&
+			r.local === false &&
+			r.type === type &&
+			r.payload === payload
+	);
+	if (!signed) return false;
+	const imported = previous.find(
+		(
+			r
+		): r is Extract<
+			AdoptedSpliceReplayEvent,
+			{ kind: 'asset-splice-imported' }
+		> => r.kind === 'asset-splice-imported' && r.finalDigest === signed.digest
+	);
+	return (
+		!!imported &&
+		previous.some(
+			(r) => r.kind === 'funding-released' && r.finalDigest === signed.digest
+		) &&
+		previous.some(
+			(r) =>
+				r.kind === 'peer-splice-stage' &&
+				r.field === 'assembled' &&
+				Transaction.fromHex(r.hex).getId() === imported.txid
+		)
+	);
+}
+
 export function assetSpliceSignatureFrame(
 	store: SqliteStorage,
 	id: string,
