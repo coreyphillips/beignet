@@ -262,6 +262,11 @@ export class AssetSpliceExchange {
 			throw new Error('Peers disagree on final asset splice funding');
 		this.final = { layout: plan.layout, funding, verified };
 	}
+	hasLocalExitShares(): boolean {
+		return this.values.has(
+			this.key(true, this.ctx.stateNumber > 0n ? 'final' : 'exit')
+		);
+	}
 	result() {
 		return this.final;
 	}

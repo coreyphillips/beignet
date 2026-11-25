@@ -4,11 +4,17 @@ import type { IAssetSpliceSigningHost } from '../../../src/lightning/channel/ass
 import { constructionFixture } from './asset-splice-construction';
 import { walletSigner } from './final-update-pair';
 
-export function signatureRoundFixture(dir: string) {
+export function signatureRoundFixture(
+	dir: string,
+	transportAllocatesKeys = false
+) {
 	const s = constructionFixture(dir),
 		{ f, layout } = s;
 	f.fundOpening();
-	const pending = f.devices.map((d) => d.store.allocateFinalChannelKeyIndex(2));
+	const pending = f.devices.map((d) =>
+		transportAllocatesKeys ? 2 : d.store.allocateFinalChannelKeyIndex(2)
+	);
+	const retainedDigests: Buffer[] = [];
 	const round = (i: number) =>
 		f.devices[i].store.assetSpliceSignatureRound(
 			f.devices[i].party.root,
@@ -67,9 +73,10 @@ export function signatureRoundFixture(dir: string) {
 					}
 				};
 			},
-			async retainSpliceExits(_ctx, _views, exact) {
+			async retainSpliceExits(_ctx, views, exact) {
 				const e = f.evidence(i);
-				e.finalDigest = s.verified[i].digest.toString('hex');
+				retainedDigests[i] = Buffer.from(views.finalDigest);
+				e.finalDigest = views.finalDigest.toString('hex');
 				for (const name of ['parent', 'candidate'] as const) {
 					e[name].localCommitment = exact[name].local.toHex();
 					e[name].remoteCommitment = exact[name].remote.toHex();
@@ -77,7 +84,7 @@ export function signatureRoundFixture(dir: string) {
 				return e;
 			},
 			async signSpliceFunding(_ctx, digest, tx, indices, prevouts) {
-				assert.deepEqual(digest, s.verified[i].digest);
+				assert.deepEqual(digest, retainedDigests[i]);
 				assert(
 					store
 						.readAssetSpliceJournal<{ kind: string }>(f.id)

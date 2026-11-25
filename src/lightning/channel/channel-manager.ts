@@ -10606,12 +10606,14 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		if (seen.size) this.finalObservedFunding.set(id, seen);
 		else this.finalObservedFunding.delete(id);
 		this.updateFinalDepth(id);
-		if (height !== undefined && height > 0)
-			this.assetUpdates?.fundingObserved(id, () =>
+		if (height !== undefined && height > 0) {
+			const current = (): boolean =>
 				this.assetSpliceConfirmation?.has(id, txid)
 					? this.assetSpliceConfirmation.hasCurrentInclusion(id, txid, height)
-					: this.finalTransport?.hasDepth(id) === true
-			);
+					: this.finalTransport?.hasDepth(id) === true;
+			this.assetUpdates?.fundingObserved(id, current);
+			this.assetSplice?.fundingObserved(id, txid, current);
+		}
 		const storage = this.config.finalOpening?.storage;
 		if (
 			height !== undefined &&

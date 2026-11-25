@@ -6,12 +6,19 @@ import { sha256 } from '../crypto/provider';
 import { isValidPublicKey } from '../crypto/ecdh';
 import { deriveChannelKeys } from '../keys/wallet-keys';
 import { MessageType as M } from '../message/types';
+import { MAX_LIGHTNING_PAYLOAD } from '../message/custom-records';
+import {
+	decodeCommitmentSignedMessage,
+	encodeCommitmentSignedMessage
+} from '../message/channel-commitment';
 import {
 	BEIGNET_CUSTOM_MESSAGE_TYPE,
 	BeignetCustomSubtype as Sub
 } from '../message/custom';
 import {
 	encodeTxCompleteMessage,
+	decodeTxSignaturesMessage,
+	encodeTxSignaturesMessage,
 	decodeTxAbortMessage,
 	encodeTxAbortMessage
 } from '../message/interactive-tx';
@@ -118,6 +125,10 @@ type Live = {
 	round?: Round;
 	leaves?: Awaited<ReturnType<Round['verifyExitShares']>>;
 	retained?: boolean;
+	peerCommitment?: Buffer;
+	peerWitness?: Buffer;
+	waitingForParent?: boolean;
+	parentRetry?: { current: () => boolean };
 	replayConstruction?: boolean;
 	expired?: boolean;
 	expires?: ReturnType<typeof setTimeout>;
@@ -537,19 +548,29 @@ export class AssetSpliceTransport {
 					return undefined;
 				}
 				const v = this.selected(id);
-				return v
-					? {
-							oldOutpoint: {
-								hash: Transaction.fromHex(v.parent.fundingTxHex).getHash(),
-								index: v.parent.fundingOutputIndex
-							},
-							stateNumber: BigInt(v.state),
-							...(v.priorDigest && {
-								priorDigest: Buffer.from(v.priorDigest, 'hex')
-							}),
-							walletGeneration: 4 as const
-					  }
-					: undefined;
+				if (!v) {
+					s.waitingForParent = true;
+					return;
+				}
+				if (
+					v.parent.fundingTxHex !== b.parent.fundingTxHex ||
+					v.parent.fundingOutputIndex !== b.parent.fundingOutputIndex ||
+					v.root !== b.root ||
+					v.state !== b.state ||
+					v.priorDigest !== b.priorDigest
+				)
+					return;
+				return {
+					oldOutpoint: {
+						hash: tx.getHash(),
+						index: b.parent.fundingOutputIndex
+					},
+					stateNumber: BigInt(b.state),
+					...(b.priorDigest && {
+						priorDigest: Buffer.from(b.priorDigest, 'hex')
+					}),
+					walletGeneration: 4 as const
+				};
 			}
 		};
 		return s.ctx;
@@ -591,8 +612,93 @@ export class AssetSpliceTransport {
 		return true;
 	}
 
+	/** Retry the same connected attempt once its exact parent is available again. */
+	fundingObserved(id: string, txid: string, current: () => boolean): void {
+		const s = this.live.get(id);
+		if (
+			!s?.ctx ||
+			s.sent.has('broadcast') ||
+			(!s.waitingForParent && !this.queues.has(id)) ||
+			Transaction.fromHex(s.begin.parent.fundingTxHex).getId() !== txid ||
+			!current()
+		)
+			return;
+		if (s.parentRetry) {
+			s.parentRetry.current = current;
+			return;
+		}
+		const retry = { current };
+		s.parentRetry = retry;
+		void this.enqueue(id, async () => {
+			s.parentRetry = undefined;
+			if (
+				s.waitingForParent &&
+				this.live.get(id) === s &&
+				this.eligible(s.peer, id) &&
+				retry.current() &&
+				s.ctx?.currentParent()
+			) {
+				await this.drive(id, s);
+			}
+		}).catch((error) => {
+			if (s.parentRetry === retry) s.parentRetry = undefined;
+			if (this.live.get(id) === s) this.failure(id, error);
+		});
+	}
+
+	// The peer can finish the frozen transaction while our funding read is pending.
+	// Keep one canonical packet per stage, in this connection only. The round
+	// verifies its signatures after local proof verification and before release.
+	private queueSignature(id: string, s: Live, type: M, payload: Buffer): void {
+		const commitment = type === M.COMMITMENT_SIGNED;
+		const stored = this.saved(
+			id,
+			s.begin,
+			commitment ? 'peer-share' : 'peer-witness'
+		);
+		if (stored?.equals(payload)) return;
+		const key = commitment ? 'peerCommitment' : 'peerWitness';
+		const candidate = s.exchange?.result()?.verified.candidate.tx;
+		if (
+			!candidate ||
+			!s.exchange?.hasLocalExitShares() ||
+			(!commitment && !s.sent.has('commitment') && !s.retained) ||
+			payload.length > MAX_LIGHTNING_PAYLOAD
+		) {
+			throw Error(
+				commitment
+					? 'Premature asset splice commitment'
+					: 'Premature asset splice funding witness'
+			);
+		}
+		if (commitment) {
+			const wire = decodeCommitmentSignedMessage(payload, {
+				customRecords: true
+			});
+			if (
+				!wire.fundingTxid?.equals(candidate.getHash()) ||
+				!wire.partialSignatureWithNonce ||
+				!encodeCommitmentSignedMessage(wire).equals(payload)
+			)
+				throw Error('Unmatched asset splice commitment candidate');
+		} else {
+			const wire = decodeTxSignaturesMessage(payload, { taproot: true });
+			if (
+				!wire.txid.equals(candidate.getHash()) ||
+				!wire.sharedInputPartialSignatureWithNonce ||
+				!encodeTxSignaturesMessage(wire).equals(payload)
+			)
+				throw Error('Unmatched asset splice funding candidate');
+		}
+		const queued = s[key];
+		if (stored || (queued && !queued.equals(payload)))
+			throw Error('Conflicting asset splice signature replay');
+		s[key] ??= payload;
+	}
+
 	private async drive(id: string, s: Live) {
 		if (this.live.get(id) !== s || !this.eligible(s.peer, id)) return;
+		s.waitingForParent = false;
 		const b = s.begin,
 			cid = Buffer.from(id, 'hex');
 		if (this.replayFunding(id, s)) {
@@ -753,16 +859,22 @@ export class AssetSpliceTransport {
 			M.COMMITMENT_SIGNED,
 			round.commitmentSigned(s.leaves)
 		);
-		const peerCommit = this.saved(id, b, 'peer-share');
+		const peerCommit = s.peerCommitment ?? this.saved(id, b, 'peer-share');
 		if (!peerCommit) return;
+		s.peerCommitment = undefined;
 		round.acceptCommitmentSigned(s.leaves, peerCommit);
+		this.record(id, b, 'peer-share', peerCommit);
 		if (!s.retained) {
 			await round.retainExits(this.host, ctx, s.leaves);
 			s.retained = true;
 		}
 		if (!ctx.currentParent()) return;
-		const peerFunding = this.saved(id, b, 'peer-witness');
-		if (peerFunding) round.receiveFunding(peerFunding);
+		const peerFunding = s.peerWitness ?? this.saved(id, b, 'peer-witness');
+		if (peerFunding) {
+			s.peerWitness = undefined;
+			round.receiveFunding(peerFunding);
+			this.record(id, b, 'peer-witness', peerFunding);
+		}
 		const funding = await round.nextFunding(this.host, ctx, this.verify);
 		if (this.live.get(id) !== s) return;
 		if (funding) {
@@ -929,23 +1041,13 @@ export class AssetSpliceTransport {
 					await this.retire(id, s, true);
 					return;
 				}
-				case M.COMMITMENT_SIGNED: {
-					if (this.saved(id, b, 'peer-share')?.equals(payload)) break;
-					if (!s.round || !s.leaves)
-						throw Error('Premature asset splice commitment');
-					s.round.acceptCommitmentSigned(s.leaves, payload);
-					this.record(id, b, 'peer-share', payload);
+				case M.COMMITMENT_SIGNED:
+					this.queueSignature(id, s, type, payload);
 					break;
-				}
-				case M.TX_SIGNATURES: {
+				case M.TX_SIGNATURES:
 					if (this.replayFunding(id, s, payload)) return;
-					if (this.saved(id, b, 'peer-witness')?.equals(payload)) break;
-					if (!s.round || !s.retained)
-						throw Error('Premature asset splice funding witness');
-					s.round.receiveFunding(payload);
-					this.record(id, b, 'peer-witness', payload);
+					this.queueSignature(id, s, type, payload);
 					break;
-				}
 				default:
 					if (interactive.includes(type)) {
 						if (!s.construction)
