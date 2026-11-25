@@ -18,7 +18,7 @@ import { ensurePrivateDir } from './fs-utils';
 import type { BeignetConfig } from './types';
 
 interface Pending {
-	version: 1 | 2 | 3;
+	version: ReturnType<typeof finalWalletGeneration>;
 	base: string;
 	mnemonic: string;
 	dataDir: string;
@@ -80,7 +80,7 @@ function loadPending(file: string): Pending | undefined {
 	if (
 		!p ||
 		Object.keys(p).sort().join(',') !== 'base,dataDir,mnemonic,version' ||
-		(p.version !== 1 && p.version !== 2 && p.version !== 3) ||
+		![1, 2, 3, 4].includes(p.version) ||
 		typeof p.base !== 'string' ||
 		!/^[a-f0-9]{64}$/.test(p.base) ||
 		typeof p.mnemonic !== 'string' ||
@@ -101,6 +101,7 @@ function walletBinding(
 		network: 'regtest',
 		finalCommitmentUpdates: generation === 2,
 		dualFundedAssets: generation === 3,
+		assetSplice: generation === 4,
 		nodeId: deriveLightningKeysFromSeed(seed, 1).nodePublicKey.toString('hex'),
 		encryptionKey: deriveStorageKey(seed)
 	};
@@ -131,9 +132,10 @@ export function provisionFinalConfig(
 	fallbackDir: (words: string) => string,
 	makeConfig: (words: string, dataDir: string) => BeignetConfig,
 	updates = false,
-	assets = false
+	assets = false,
+	assetSplice = false
 ): BeignetConfig {
-	const generation = finalWalletGeneration(updates, assets);
+	const generation = finalWalletGeneration(updates, assets, assetSplice);
 	const dir = path.dirname(configFile);
 	const pendingFile = path.join(dir, 'final-wallet-init.pending');
 	const previous = loadPending(pendingFile);
@@ -161,7 +163,8 @@ export function provisionFinalConfig(
 			config.finalTaprootWallet === true &&
 			finalWalletGeneration(
 				config.finalCommitmentUpdates,
-				config.dualFundedAssets
+				config.dualFundedAssets,
+				config.assetSplice
 			) === generation &&
 			config.network === 'regtest' &&
 			config.mnemonic === pending.mnemonic &&
@@ -198,7 +201,7 @@ export function provisionFinalConfig(
 		}
 	}
 	if (!pending) {
-		const fresh = generateFinalDaemonWallet(updates, assets);
+		const fresh = generateFinalDaemonWallet(updates, assets, assetSplice);
 		const dataDir = dataDirFor(fresh.mnemonic);
 		ensurePrivateDir(dataDir);
 		const file = path.join(dataDir, 'regtest.db');

@@ -170,6 +170,68 @@ export interface IAssetOpeningLeaves {
 	toRemote?: ITaprootAuxLeaf;
 }
 
+export interface IAssetSpliceLeaves extends IAssetOpeningLeaves {
+	htlcs?: readonly {
+		offeredBy: IFinalCommitmentHtlc['offeredBy'];
+		id: bigint;
+		output: ITaprootAuxLeaf;
+		secondLevel: ITaprootAuxLeaf;
+	}[];
+}
+
+export function buildAssetSpliceCommitment(
+	opening: IFinalOpeningCandidate,
+	terms: IFinalOpeningTerms,
+	holder: 'local' | 'remote',
+	point: Buffer,
+	height: bigint,
+	balances: IFinalBalances,
+	htlcs: readonly IFinalCommitmentHtlc[],
+	funding: IFinalFundingReference,
+	openingRoot: Buffer,
+	assets: IAssetSpliceLeaves
+): IFinalCommitmentView {
+	validateAssetOpening(opening, openingRoot);
+	if (
+		!funding ||
+		!Number.isSafeInteger(funding.fundingOutputIndex) ||
+		funding.fundingOutputIndex < 0
+	)
+		throw new Error('Missing selected asset funding outpoint');
+	const validateLeaf = (leaf: ITaprootAuxLeaf) => {
+		if (!leaf || !Buffer.isBuffer(leaf.script) || leaf.script.length === 0)
+			throw new Error('Missing asset commitment leaf script');
+	};
+	if (assets.toLocal !== undefined) validateLeaf(assets.toLocal);
+	if (assets.toRemote !== undefined) validateLeaf(assets.toRemote);
+	for (const h of assets.htlcs ?? []) {
+		if (
+			(h.offeredBy !== 'local' && h.offeredBy !== 'peer') ||
+			typeof h.id !== 'bigint' ||
+			h.id < 0n ||
+			h.id > 0xffffffffffffffffn
+		)
+			throw new Error('Invalid asset HTLC identity');
+		validateLeaf(h.output);
+		validateLeaf(h.secondLevel);
+	}
+	if (!Buffer.isBuffer(assets.fundingRoot) || assets.fundingRoot.length !== 32)
+		throw new Error(
+			'Asset splice commitment requires its selected funding root'
+		);
+	return buildValidatedView(
+		opening,
+		terms,
+		holder,
+		point,
+		height,
+		balances,
+		htlcs,
+		funding,
+		assets
+	);
+}
+
 export function buildAssetOpeningCommitment(
 	candidate: IFinalOpeningCandidate,
 	terms: IFinalOpeningTerms,
@@ -179,9 +241,7 @@ export function buildAssetOpeningCommitment(
 	validateAssetOpening(candidate, assets.fundingRoot);
 	const holder =
 		owner === 'local' ? terms.localBasepoints : terms.remoteBasepoints;
-	const peer =
-		owner === 'local' ? terms.remoteBasepoints : terms.localBasepoints;
-	const view = buildValidatedView(
+	return buildValidatedView(
 		candidate,
 		terms,
 		owner,
@@ -191,33 +251,10 @@ export function buildAssetOpeningCommitment(
 			localBalanceMsat: BigInt(candidate.localContributionSats) * 1000n,
 			remoteBalanceMsat: BigInt(candidate.remoteContributionSats) * 1000n
 		},
-		[]
+		[],
+		undefined,
+		assets
 	);
-	// A virtual transfer commits to output indexes. Both peers first sort the
-	// ordinary outputs, then attach the signed leaves at those fixed indexes.
-	if (assets.toLocal) {
-		const index = view.outputMap.toLocal;
-		if (index === undefined)
-			throw new Error('Missing carrier for local asset payout');
-		view.tx.outs[index].script = buildTaprootToLocalOutput(
-			view.keys.revocationPubkey,
-			view.keys.localDelayedPubkey,
-			view.toSelfDelay,
-			undefined,
-			{ finalLeaf: assets.toLocal }
-		).output;
-	}
-	if (assets.toRemote) {
-		const index = view.outputMap.toRemote;
-		if (index === undefined)
-			throw new Error('Missing carrier for remote asset payout');
-		view.tx.outs[index].script = buildTaprootToRemoteOutput(
-			readPoint(peer.paymentBasepoint),
-			undefined,
-			{ finalLeaf: assets.toRemote }
-		).output;
-	}
-	return view;
 }
 
 function buildValidatedView(
@@ -228,7 +265,8 @@ function buildValidatedView(
 	height: bigint,
 	balances: IFinalBalances,
 	htlcs: readonly IFinalCommitmentHtlc[],
-	fundingRef?: IFinalFundingReference
+	fundingRef?: IFinalFundingReference,
+	assets?: IAssetSpliceLeaves
 ): IFinalCommitmentView {
 	if (
 		Object.keys(terms).length !== 7 ||
@@ -283,7 +321,9 @@ function buildValidatedView(
 			local.fundingPubkey.equals(remote.fundingPubkey) ||
 			!createTaprootFundingScript(
 				local.fundingPubkey,
-				remote.fundingPubkey
+				remote.fundingPubkey,
+				undefined,
+				assets?.fundingRoot
 			).p2trOutput.equals(actual)
 		)
 			throw new Error(
@@ -319,6 +359,8 @@ function buildValidatedView(
 		const { id, offeredBy, amountMsat, paymentHash, cltvExpiry } = htlc;
 		const htlcKey = offeredBy + '/' + id;
 		if (
+			typeof id !== 'bigint' ||
+			typeof amountMsat !== 'bigint' ||
 			id < 0n ||
 			id > 0xffffffffffffffffn ||
 			amountMsat <= 0n ||
@@ -416,9 +458,74 @@ function buildValidatedView(
 		taprootAnchorRemoteScript: buildTaprootAnchorOutput(peer.paymentBasepoint)
 			.output
 	});
+	// A virtual transfer commits to output indexes. Both peers first sort the
+	// ordinary outputs, then attach the signed leaves at those fixed indexes.
+	if (assets?.toLocal) {
+		const index = outputMap.toLocal;
+		if (index === undefined)
+			throw new Error('Missing carrier for local asset payout');
+		tx.outs[index].script = buildTaprootToLocalOutput(
+			keys.revocationPubkey,
+			keys.localDelayedPubkey,
+			toSelfDelay,
+			undefined,
+			{ finalLeaf: assets.toLocal }
+		).output;
+	}
+	if (assets?.toRemote) {
+		const index = outputMap.toRemote;
+		if (index === undefined)
+			throw new Error('Missing carrier for remote asset payout');
+		tx.outs[index].script = buildTaprootToRemoteOutput(
+			peer.paymentBasepoint,
+			undefined,
+			{ finalLeaf: assets.toRemote }
+		).output;
+	}
+	const byHtlc = new Map<
+		string,
+		NonNullable<IAssetSpliceLeaves['htlcs']>[number]
+	>();
+	for (const leaves of assets?.htlcs ?? []) {
+		const key = leaves.offeredBy + '/' + leaves.id;
+		if (byHtlc.has(key) || !leaves.output || !leaves.secondLevel)
+			throw new Error('Incomplete or duplicate asset HTLC leaves');
+		byHtlc.set(key, leaves);
+	}
+	// Every child spends the final parent txid, including children with no asset leaves.
+	let attached = 0;
+	for (const [i, index] of outputMap.htlcs.entries()) {
+		const item = prepared[outputMap.htlcOriginalIndices[i]];
+		const h = item.htlc;
+		const leaves = byHtlc.get(h.offeredBy + '/' + h.id);
+		if (!leaves) continue;
+		const args = [
+			keys.revocationPubkey,
+			keys.localHtlcPubkey,
+			keys.remoteHtlcPubkey,
+			h.paymentHash
+		] as const;
+		const format = { finalLeaf: leaves.output };
+		item.tree = item.offered
+			? buildTaprootOfferedHtlcOutput(...args, undefined, format)
+			: buildTaprootReceivedHtlcOutput(
+					...args,
+					h.cltvExpiry,
+					undefined,
+					format
+			  );
+		tx.outs[index].script = item.tree.output;
+		attached++;
+	}
+	if (attached !== byHtlc.size)
+		throw new Error(
+			'Asset HTLC requires a matching untrimmed commitment output'
+		);
 	const signedHtlcs = outputMap.htlcs.map((outputIndex, i) => {
 		const { htlc, offered, tree, amount } =
 			prepared[outputMap.htlcOriginalIndices[i]];
+		const leaves = byHtlc.get(htlc.offeredBy + '/' + htlc.id);
+		const childFormat = leaves ? { finalLeaf: leaves.secondLevel } : 'final';
 		const childKeys = [
 			keys.revocationPubkey,
 			keys.localDelayedPubkey,
@@ -432,7 +539,7 @@ function buildValidatedView(
 					htlc.cltvExpiry,
 					...childKeys,
 					undefined,
-					'final'
+					childFormat
 			  )
 			: buildTaprootHtlcSuccessTx(
 					tx.getId(),
@@ -440,7 +547,7 @@ function buildValidatedView(
 					amount,
 					...childKeys,
 					undefined,
-					'final'
+					childFormat
 			  );
 		const leaf = offered ? tree.timeout : tree.success;
 		return {

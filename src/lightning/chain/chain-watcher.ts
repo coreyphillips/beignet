@@ -7,6 +7,8 @@
  */
 
 import { EventEmitter } from 'events';
+import type { IAssetSpliceInclusionRecovery } from './asset-splice-inclusion';
+import type { AssetSpliceInclusionLookup } from '../channel/asset-splice-confirmation';
 import { sha256 } from '../crypto/provider';
 import * as bitcoin from 'bitcoinjs-lib';
 import { ecc } from '../../utils/ecc';
@@ -64,6 +66,12 @@ export interface IChainBackend {
 		txid: string,
 		height: number
 	): Promise<{ blockHeight: number; txIndex: number }>;
+	/** Bind a regtest splice txid to its funding block and a locally accepted chain tip. */
+	getAssetSpliceInclusion?(
+		txid: string,
+		height: number,
+		recovery?: IAssetSpliceInclusionRecovery
+	): Promise<{ txid: string; blockHash: string; confirmations: number }>;
 	/**
 	 * List unspent outputs for a script hash (Electrum
 	 * blockchain.scripthash.listunspent). Optional; used to verify that a
@@ -376,6 +384,22 @@ export interface IChainWatcherChannelManager {
 		parent: string,
 		confirmed: boolean
 	): void;
+	hasAssetSpliceWatch?(id: string, txid: string): boolean;
+	beginFinalFundingObservation?(
+		id: string,
+		txid: string,
+		index: number,
+		minimumDepth: number,
+		current: () => boolean
+	): (() => void) | undefined;
+	suspendAssetSpliceFunding?(id: string, txid: string): void;
+	observeAssetSpliceFunding?(
+		id: string,
+		txid: string,
+		height: number | undefined,
+		prove: AssetSpliceInclusionLookup,
+		current: () => boolean
+	): Promise<void>;
 	assetOpeningAnchor?(id: string): { missingWitnesses: boolean } | undefined;
 	observeAssetOpeningAnchor?(
 		id: string,
@@ -831,6 +855,7 @@ export class ChainWatcher extends EventEmitter {
 	private voidBroadcasts = new Set<string>();
 	private currentBlockHeight = 0;
 	private tipGeneration?: number;
+	private tipObservation = 0;
 	private started = false;
 	/**
 	 * Bumped on every start() and stop(). Chain work captures the generation it
@@ -1073,6 +1098,10 @@ export class ChainWatcher extends EventEmitter {
 			this._recheckTimer = null;
 		}
 		for (const watched of this.watchedFundings.values()) {
+			this.channelManager.suspendAssetSpliceFunding?.(
+				watched.channelId.toString('hex'),
+				watched.txid
+			);
 			if (watched.finalFundingValueSat !== undefined)
 				this.channelManager.observeFinalFunding?.(
 					watched.channelId.toString('hex'),
@@ -2007,6 +2036,7 @@ export class ChainWatcher extends EventEmitter {
 			this.tipGeneration === generation && height <= this.currentBlockHeight;
 		this.tipGeneration = generation;
 		this.currentBlockHeight = height;
+		++this.tipObservation;
 		if (replacedTip) {
 			const cleared = new Set<string>();
 			for (const watched of this.watchedFundings.values()) {
@@ -2505,19 +2535,53 @@ export class ChainWatcher extends EventEmitter {
 		watched: IWatchedFunding,
 		generation: number
 	): Promise<void> {
+		const tipObservation = this.tipObservation;
 		const ticket = (watched.nextScanTicket ?? 0) + 1;
 		watched.nextScanTicket = ticket;
 		const current = (): boolean =>
 			this.isCurrentGeneration(generation) &&
 			this.watchedFundings.get(key) === watched &&
 			watched.nextScanTicket === ticket;
+		const finish = this.channelManager.beginFinalFundingObservation?.(
+			watched.channelId.toString('hex'),
+			watched.txid,
+			watched.outputIndex,
+			watched.minimumDepth,
+			() => current() && this.tipObservation === tipObservation
+		);
+		try {
+			await this.readFinalFundingDepth(
+				key,
+				watched,
+				generation,
+				tipObservation,
+				current,
+				finish
+			);
+		} finally {
+			finish?.();
+		}
+	}
+	private async readFinalFundingDepth(
+		key: string,
+		watched: IWatchedFunding,
+		generation: number,
+		tipObservation: number,
+		current: () => boolean,
+		finish?: () => void
+	): Promise<void> {
 		let coins;
 		try {
 			if (!this.backend.listUnspent)
 				throw new Error('Final funding requires an unspent output lookup');
 			coins = await this.backend.listUnspent(watched.scriptHash);
 		} catch (error) {
+			finish?.();
 			if (!current()) return;
+			this.channelManager.suspendAssetSpliceFunding?.(
+				watched.channelId.toString('hex'),
+				watched.txid
+			);
 			this.channelManager.observeFinalFunding?.(
 				watched.channelId.toString('hex'),
 				watched.txid,
@@ -2534,14 +2598,28 @@ export class ChainWatcher extends EventEmitter {
 				coin.outputIndex === watched.outputIndex &&
 				coin.valueSat === watched.finalFundingValueSat
 		);
+		if (
+			!funding?.height ||
+			funding.height < 1 ||
+			this.currentBlockHeight - funding.height + 1 < watched.minimumDepth
+		)
+			finish?.();
 		if (funding) {
 			// This UTXO also supersedes any spend lookup still reading an older history.
 			const outpoint = watched.txid + ':' + watched.outputIndex;
 			this.recordScanCompleted(key, outpoint, this.beginSpendScan(key));
 		}
 		const id = watched.channelId.toString('hex');
-		const asset = this.channelManager.assetOpeningAnchor?.(id);
-		if (asset && this.tipGeneration === generation) {
+		const splice = this.channelManager.hasAssetSpliceWatch?.(id, watched.txid);
+		if (splice && !funding)
+			this.channelManager.observeFinalFunding?.(
+				id,
+				watched.txid,
+				undefined,
+				false
+			);
+		const asset = !splice && this.channelManager.assetOpeningAnchor?.(id);
+		if ((asset || splice) && this.tipGeneration === generation) {
 			let height = funding?.height;
 			if (height === undefined) {
 				// A valid funding transaction can be spent and still be deep enough for its proofs.
@@ -2556,19 +2634,37 @@ export class ChainWatcher extends EventEmitter {
 				height > 0 &&
 				this.currentBlockHeight - height + 1 >= watched.minimumDepth;
 			let observed: bitcoin.Transaction | undefined;
-			if (atDepth && asset.missingWitnesses) {
+			if (atDepth && asset && asset.missingWitnesses) {
 				const raw = await this.getHistoryTransaction(watched.txid, height!);
 				if (!current()) return;
 				observed = bitcoin.Transaction.fromBuffer(raw);
 			}
-			this.channelManager.observeAssetOpeningAnchor?.(
-				id,
-				atDepth,
-				observed,
-				height !== undefined && height <= this.currentBlockHeight
-					? height
-					: undefined
-			);
+			if (splice) {
+				const prove = this.backend.getAssetSpliceInclusion;
+				if (prove) {
+					try {
+						await this.channelManager.observeAssetSpliceFunding?.(
+							id,
+							watched.txid,
+							height,
+							(h, recovery) =>
+								prove.call(this.backend, watched.txid, h, recovery),
+							() => current() && tipObservation === this.tipObservation
+						);
+					} catch (error) {
+						finish?.();
+						if (current()) this.emitError(error as Error);
+					}
+				}
+			} else
+				this.channelManager.observeAssetOpeningAnchor?.(
+					id,
+					atDepth,
+					observed,
+					height !== undefined && height <= this.currentBlockHeight
+						? height
+						: undefined
+				);
 		}
 		const parent =
 			funding && this.channelManager.finalSpliceParent?.(id, watched.txid);
@@ -2588,6 +2684,7 @@ export class ChainWatcher extends EventEmitter {
 					this.currentBlockHeight - inclusion.height + 1 >=
 						watched.minimumDepth;
 			} catch (err) {
+				finish?.();
 				if (!current()) return;
 				this.channelManager.observeFinalFunding?.(
 					id,

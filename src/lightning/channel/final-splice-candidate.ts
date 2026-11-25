@@ -29,6 +29,8 @@ export interface IFinalFundingReference {
 }
 
 export interface IFinalSpliceTerms {
+	/** Roots verified against the retained parent and the completed candidate asset proofs. */
+	assetFundingRoots?: { parent: Buffer; candidate: Buffer };
 	parent: Transaction;
 	parentIndex: number;
 	oldLocalKey: Buffer;
@@ -71,6 +73,7 @@ export function finalSpliceFeeError(
 	const strict = checkFeeSufficiency(fee, weight, t.feerate);
 	if (
 		!strict ||
+		t.assetFundingRoots !== undefined ||
 		t.localIsSpliceInitiator ||
 		!singleShared ||
 		t.localDelta !== 0n ||
@@ -129,18 +132,31 @@ export function buildFinalSpliceCandidate(
 		].every(isValidPublicKey)
 	)
 		throw new Error('Invalid final splice terms');
+	const roots = terms.assetFundingRoots;
+	if (
+		roots !== undefined &&
+		(!Buffer.isBuffer(roots?.parent) ||
+			roots.parent.length !== 32 ||
+			!Buffer.isBuffer(roots.candidate) ||
+			roots.candidate.length !== 32)
+	)
+		throw new Error('Asset splicing requires both verified funding roots');
 	const parentOutput = terms.parent.outs[terms.parentIndex];
 	if (
 		!parentOutput ||
 		!createTaprootFundingScript(
 			terms.oldLocalKey,
-			terms.oldPeerKey
+			terms.oldPeerKey,
+			undefined,
+			roots?.parent
 		).p2trOutput.equals(parentOutput.script)
 	)
 		throw new Error('Shared input does not match the active funding keys');
 	const newScript = createTaprootFundingScript(
 		terms.newLocalKey,
-		terms.newPeerKey
+		terms.newPeerKey,
+		undefined,
+		roots?.candidate
 	).p2trOutput;
 	const capacity =
 		BigInt(parentOutput.value) + terms.localDelta + terms.peerDelta;

@@ -11,6 +11,8 @@ import type {
 import type { IAssetOpenLayout } from './asset-opening-manifest';
 
 export interface IAssetOpenContext {
+	/** Local original-device enrollment. Never sourced from the peer. */
+	walletGeneration?: 4;
 	peer: string;
 	isInitiator: boolean;
 	channelId: Buffer;
@@ -62,6 +64,20 @@ export interface IAssetOpenExit {
 }
 
 export interface IAssetOpeningPayout {
+	update?: {
+		roundDigest: string;
+		stateNumber: string;
+		fundingTxid: string;
+		fundingOutputIndex: number;
+	};
+	/** Present when the observed commitment matches a retained splice generation. */
+	splice?: {
+		finalDigest: string;
+		stateNumber: string;
+		generation: 'parent' | 'candidate';
+		fundingTxid: string;
+		fundingOutputIndex: number;
+	};
 	candidate: IFinalOpeningCandidate;
 	fundingProofs: Buffer;
 	exitProofs: Buffer;
@@ -75,7 +91,9 @@ export interface IAssetOpeningPayout {
 }
 
 /** Explicit host support for private dual-funded asset openings on regtest. */
-export interface IAuxiliaryDualFunding {
+export interface IAuxiliaryDualFunding
+	extends Partial<import('./asset-splice-transport').AssetSpliceHost>,
+		Partial<import('./asset-splice-update-provider').IAssetSpliceUpdateHost> {
 	version: 1;
 	/** Synchronous local policy. An absent answer declines before a key is allocated. */
 	contribution(

@@ -1,8 +1,14 @@
 # The exported API of beignet/lightning. Regenerate with npm run api:snapshot; do not edit.
+unexported type ./channel/asset-splice-agreement#Pair<T> = channel.AssetOpenPair<T>
+unexported type ./channel/asset-splice-manifest#Pair<T> = readonly [ initiator: T, acceptor: T ]
+unexported type AssetSpliceInclusionLookup = (height: number, recovery: IAssetSpliceInclusionRecovery) => Promise<IAssetSpliceAnchor>
+unexported type Both<T> = Record<Branch, Record<Holder, T>>
+unexported type Branch = 'parent' | 'candidate'
 unexported type DeprecatedNodeConfigKey = 'forwardingEnabled' | 'forwardingCltvDelta' | 'forwardingFeeBaseMsat' | 'forwardingFeePropMillionths' | 'forwardingPolicyGraceMs' | 'fforSettle' | 'fforConcurrent' | 'fforWitness' | 'fforIssuer'
 unexported type EventMap<E> = { [K in keyof E]: (...args: any[]) => void; }
 unexported type FinalFundingWitnessSigner = (unsigned: bitcoinjs-lib#Transaction, indices: readonly number[], prevouts: Prevouts) => Buffer[][]
 unexported type FinalSplicePlan = Pick<IFinalSpliceIntent, 'localDelta' | 'feeBudget' | 'feerate' | 'locktime' | 'inputs' | 'outputs'>
+unexported type Holder = 'local' | 'remote'
 unexported interface IAssetOpenLayout
 property IAssetOpenLayout.acceptHash: Buffer
 property IAssetOpenLayout.acceptorProposalHash: Buffer
@@ -14,6 +20,115 @@ property IAssetOpenLayout.inputs: readonly { serialId: bigint; txid: Buffer; vou
 property IAssetOpenLayout.locktime: number
 property IAssetOpenLayout.openHash: Buffer
 property IAssetOpenLayout.outputs: readonly { serialId: bigint; kind: 'funding' | 'change'; valueSats: bigint; descriptorHash: Buffer; }[]
+unexported interface IAssetSpliceAnchor
+readonly property IAssetSpliceAnchor.blockHash: string
+readonly property IAssetSpliceAnchor.confirmations: number
+readonly property IAssetSpliceAnchor.txid: string
+unexported interface IAssetSpliceBalanceState
+property IAssetSpliceBalanceState.htlcs: readonly IHtlc[]
+property IAssetSpliceBalanceState.issuances: readonly IIssuance[]
+unexported interface IAssetSpliceConfirmationProvider
+method IAssetSpliceConfirmationProvider.confirmSpliceFunding(ctx: channel.IAssetSpliceConfirmation): Promise<void>
+method IAssetSpliceConfirmationProvider.retractSpliceFunding(ctx: channel.IAssetSpliceConfirmation): Promise<void>
+method IAssetSpliceConfirmationProvider.verifySpliceFunding(ctx: channel.IAssetSpliceConfirmation): Promise<void>
+unexported interface IAssetSpliceExitBranch
+property IAssetSpliceExitBranch.funding: IFinalFundingReference
+property IAssetSpliceExitBranch.fundingProofs: string
+property IAssetSpliceExitBranch.fundingRoot: string
+property IAssetSpliceExitBranch.fundingTxid: string
+property IAssetSpliceExitBranch.localCommitment: string
+property IAssetSpliceExitBranch.localProofs: string
+property IAssetSpliceExitBranch.localRecovery: IAssetSpliceHolderRecovery
+property IAssetSpliceExitBranch.minimumDepth: number
+property IAssetSpliceExitBranch.outputIndex: number
+property IAssetSpliceExitBranch.remoteCommitment: string
+property IAssetSpliceExitBranch.remoteProofs: string
+property IAssetSpliceExitBranch.remoteRecovery: IAssetSpliceHolderRecovery
+unexported interface IAssetSpliceExitEvidence extends channel.IAssetOpenExit
+property IAssetSpliceExitEvidence.htlcSignatures?: string
+property IAssetSpliceExitEvidence.htlcs?: readonly { id: string; offeredBy: 'local' | 'peer'; output: NonNullable<channel.IAssetOpenExit['toLocal']>; secondLevel: NonNullable<channel.IAssetOpenExit['toLocal']>; }[]
+unexported interface IAssetSpliceHolderRecovery
+property IAssetSpliceHolderRecovery.htlcs: IStoredSpliceHtlc[]
+property IAssetSpliceHolderRecovery.localBalanceMsat: string
+property IAssetSpliceHolderRecovery.ownedOutputIndex: number | null
+property IAssetSpliceHolderRecovery.point: string
+property IAssetSpliceHolderRecovery.remoteBalanceMsat: string
+property IAssetSpliceHolderRecovery.toLocal: IStoredSpliceLeaf | null
+property IAssetSpliceHolderRecovery.toRemote: IStoredSpliceLeaf | null
+unexported type IAssetSpliceHostHolder = IAssetUpdateHolderView
+unexported interface IAssetSpliceInclusionRecovery
+property IAssetSpliceInclusionRecovery.channelId: string
+property IAssetSpliceInclusionRecovery.finalDigest: string
+property IAssetSpliceInclusionRecovery.store: beignet/lightning/sqlite#SqliteStorage
+unexported interface IAssetSpliceLayout
+property IAssetSpliceLayout.ack: Buffer
+property IAssetSpliceLayout.attempt: Buffer
+property IAssetSpliceLayout.chainHash: Buffer
+property IAssetSpliceLayout.channelId: Buffer
+property IAssetSpliceLayout.commitmentRecordLimits: ./channel/asset-splice-manifest#Pair<readonly IAssetSpliceWireRecordLimit[]>
+property IAssetSpliceLayout.dust: bigint
+property IAssetSpliceLayout.feeBudgets: ./channel/asset-splice-manifest#Pair<bigint>
+property IAssetSpliceLayout.init: Buffer
+property IAssetSpliceLayout.inputs: readonly interactiveTx.IInteractiveTxInput[]
+property IAssetSpliceLayout.maxAcceptedHtlcs: ./channel/asset-splice-manifest#Pair<number>
+property IAssetSpliceLayout.movements: readonly IAssetSpliceUnitMovement[]
+property IAssetSpliceLayout.outputs: readonly { serialId: bigint; role: 'funding' | 'change' | 'withdrawal'; amountSats: bigint; descriptorHash: Buffer; }[]
+property IAssetSpliceLayout.parent: bitcoinjs-lib#Transaction
+property IAssetSpliceLayout.parentBalances: IAssetSpliceBalanceState
+property IAssetSpliceLayout.parentIndex: number
+property IAssetSpliceLayout.parentKeys: ./channel/asset-splice-manifest#Pair<Buffer>
+property IAssetSpliceLayout.parentRoot: Buffer
+property IAssetSpliceLayout.priorDigest?: Buffer
+property IAssetSpliceLayout.proposalDigests: ./channel/asset-splice-manifest#Pair<Buffer>
+property IAssetSpliceLayout.stateNumber: bigint
+unexported interface IAssetSplicePlanner
+method IAssetSplicePlanner.abandonSplice(ctx: channel.IAssetSpliceContext): Promise<void>
+method IAssetSplicePlanner.describeSplice(ctx: channel.IAssetSpliceContext, proposals: ./channel/asset-splice-agreement#Pair<Buffer>, bitcoin: channel.IAssetSpliceBitcoin): Promise<channel.IAssetSpliceDescription>
+method IAssetSplicePlanner.prepareSplice(ctx: channel.IAssetSpliceContext, proposals: ./channel/asset-splice-agreement#Pair<Buffer>, bitcoin: channel.IAssetSpliceBitcoin, layout: Buffer): Promise<channel.IAssetSpliceWalletPlan>
+method IAssetSplicePlanner.proposeSplice(ctx: channel.IAssetSpliceContext): Promise<Buffer>
+method IAssetSplicePlanner.spliceContribution(ctx: channel.IAssetSpliceContext): bigint
+unexported interface IAssetSpliceSigningHost
+method IAssetSpliceSigningHost.retainSpliceExits(ctx: channel.IAssetSpliceContext, views: channel.IAssetSpliceHostExitViews, exact: Both<bitcoinjs-lib#Transaction>): Promise<channel.IAssetSpliceExitProofs>
+method IAssetSpliceSigningHost.signSpliceExitHtlcs?(ctx: channel.IAssetSpliceContext, views: channel.IAssetSpliceHostExitViews, jointShares: channel.AssetOpenPair<Buffer>, signer: channel.IAssetUpdateHtlcSigner): Promise<Buffer>
+method IAssetSpliceSigningHost.signSpliceExits(ctx: channel.IAssetSpliceContext, views: channel.IAssetSpliceHostExitViews): Promise<Buffer>
+method IAssetSpliceSigningHost.signSpliceFunding(ctx: channel.IAssetSpliceContext, finalDigest: Buffer, ...args: Parameters<FinalFundingWitnessSigner>): Promise<Buffer[][]>
+method IAssetSpliceSigningHost.verifySpliceExits(ctx: channel.IAssetSpliceContext, views: channel.IAssetSpliceHostExitViews, shares: channel.AssetOpenPair<Buffer>, htlcShares?: channel.AssetOpenPair<Buffer>): Promise<Both<IAssetSpliceExitEvidence>>
+unexported interface IAssetSpliceUnitMovement
+property IAssetSpliceUnitMovement.assetId: string
+property IAssetSpliceUnitMovement.change: bigint
+property IAssetSpliceUnitMovement.delta: bigint
+property IAssetSpliceUnitMovement.inputs: bigint
+property IAssetSpliceUnitMovement.owner: Owner
+property IAssetSpliceUnitMovement.withdrawals: bigint
+unexported interface IAssetSpliceWireRecordLimit
+property IAssetSpliceWireRecordLimit.maxBytes: number
+property IAssetSpliceWireRecordLimit.type: bigint
+unexported interface IAssetUpdateAmount
+property IAssetUpdateAmount.assetId: string
+property IAssetUpdateAmount.units: bigint
+unexported interface IAssetUpdateHolderEvidence
+property IAssetUpdateHolderEvidence.htlcSignatures: Buffer
+property IAssetUpdateHolderEvidence.htlcs: readonly { id: bigint; offeredBy: Offerer; output: channel.ITaprootAuxLeaf; secondLevel: channel.ITaprootAuxLeaf; }[]
+property IAssetUpdateHolderEvidence.proofs: Buffer
+property IAssetUpdateHolderEvidence.toLocal?: channel.ITaprootAuxLeaf
+property IAssetUpdateHolderEvidence.toRemote?: channel.ITaprootAuxLeaf
+unexported interface IAssetUpdateHolderView extends IFinalBalances
+property IAssetUpdateHolderView.htlcOutputs: IFinalCommitmentView['htlcs']
+property IAssetUpdateHolderView.htlcs: readonly IAssetUpdateHtlc[]
+property IAssetUpdateHolderView.keys: IFinalCommitmentView['keys']
+property IAssetUpdateHolderView.outputMap: IFinalCommitmentView['outputMap']
+property IAssetUpdateHolderView.point: Buffer
+property IAssetUpdateHolderView.toSelfDelay: number
+property IAssetUpdateHolderView.tx: bitcoinjs-lib#Transaction
+unexported interface IAssetUpdateHtlc extends IFinalCommitmentHtlc
+property IAssetUpdateHtlc.allocations: readonly IAssetUpdateAmount[]
+unexported interface IAssetUpdateMemberView
+property IAssetUpdateMemberView.funding: IFinalFundingReference
+property IAssetUpdateMemberView.fundingProofs: Buffer
+property IAssetUpdateMemberView.fundingRoot: Buffer
+property IAssetUpdateMemberView.local: IAssetUpdateHolderView
+property IAssetUpdateMemberView.outpoint: string
+property IAssetUpdateMemberView.remote: IAssetUpdateHolderView
 unexported interface IAuxiliaryFeeFunding
 method IAuxiliaryFeeFunding.finalize(funded: bitcoinjs-lib#Transaction, prevouts: { scripts: Buffer[]; values: bigint[]; }): { ok: true; data?: Buffer; } | { ok: false; refusal: string; }
 property IAuxiliaryFeeFunding.ownVbytes?: number
@@ -32,6 +147,9 @@ method IDurableLedgerStore.load(id: string): R | null
 method IDurableLedgerStore.loadAll(): R[]
 method IDurableLedgerStore.put(record: R): void
 method IDurableLedgerStore.transaction<T>(fn: () => T): T
+unexported interface IFinalBalances
+property IFinalBalances.localBalanceMsat: bigint
+property IFinalBalances.remoteBalanceMsat: bigint
 unexported interface IFinalCommitmentHtlc
 property IFinalCommitmentHtlc.amountMsat: bigint
 property IFinalCommitmentHtlc.cltvExpiry: number
@@ -113,6 +231,18 @@ property IHistoryEntry.amountMsat: string
 property IHistoryEntry.cltvExpiry: number
 property IHistoryEntry.direction: channel.HtlcDirection
 property IHistoryEntry.paymentHash: string
+unexported interface IHtlc
+property IHtlc.allocations: readonly { assetId: string; units: bigint; }[]
+property IHtlc.amountMsat: bigint
+property IHtlc.cltvExpiry: number
+property IHtlc.id: bigint
+property IHtlc.offeredBy: Owner
+property IHtlc.paymentHash: string
+unexported interface IIssuance
+property IIssuance.acceptor: bigint
+property IIssuance.assetId: string
+property IIssuance.funding: bigint
+property IIssuance.initiator: bigint
 unexported interface ILeaseOffer
 property ILeaseOffer.leaseRates: gossip.ILeaseRates
 property ILeaseOffer.sellerNodeId: string
@@ -213,12 +343,33 @@ property ISpliceUtxo.publicKey: string
 property ISpliceUtxo.tx_hash: string
 property ISpliceUtxo.tx_pos: number
 property ISpliceUtxo.value: number
+unexported interface IStoredSpliceHtlc
+property IStoredSpliceHtlc.amountMsat: string
+property IStoredSpliceHtlc.cltvExpiry: number
+property IStoredSpliceHtlc.id: string
+property IStoredSpliceHtlc.offeredBy: 'local' | 'peer'
+property IStoredSpliceHtlc.outputIndex: number | null
+property IStoredSpliceHtlc.outputLeaf: IStoredSpliceLeaf | null
+property IStoredSpliceHtlc.paymentHash: string
+property IStoredSpliceHtlc.secondLevelLeaf: IStoredSpliceLeaf | null
+unexported interface IStoredSpliceLeaf
+property IStoredSpliceLeaf.leafVersion?: number
+property IStoredSpliceLeaf.script: string
 unexported interface ITowerConnectionOptions
 property ITowerConnectionOptions.address: watchtower.ITowerAddress
 property ITowerConnectionOptions.connectTimeoutMs?: number
 property ITowerConnectionOptions.localPrivateKey: Buffer
 property ITowerConnectionOptions.socks5Proxy?: { host: string; port: number; }
 property ITowerConnectionOptions.socks5ProxyScope?: transport.Socks5ProxyScope
+unexported interface IWalletSpliceLock
+property IWalletSpliceLock.adopted: boolean
+property IWalletSpliceLock.channelId: string
+property IWalletSpliceLock.finalDigest: string
+property IWalletSpliceLock.fundingOutputIndex: number
+property IWalletSpliceLock.fundingTxid: string
+property IWalletSpliceLock.localBlockHash?: string
+property IWalletSpliceLock.needsReconciliation: boolean
+property IWalletSpliceLock.peerFundingTxid?: string
 unexported interface IZeroReserveConfig
 property IZeroReserveConfig.advertise?: boolean
 property IZeroReserveConfig.role?: 'wallet' | 'primary'
@@ -230,7 +381,14 @@ property IZeroReservePolicy.waivePeer: boolean
 unexported type JitFeeMode = 'skim' | 'hop'
 unexported type LedgerTransitionOutcome = 'applied' | 'stale' | 'missing' | 'storage_failed' | 'not_rehydrated'
 unexported type MessageHandler = (pubkey: string, type: number, payload: Buffer) => void
+unexported type Offerer = IAssetUpdateHtlc['offeredBy']
 unexported type OpeningBasepoints = Record<keyof keys.IChannelBasepoints, string>
+unexported type Owner = 'initiator' | 'acceptor'
+unexported interface ParentView
+property ParentView.oldOutpoint: { hash: Buffer; index: number; }
+property ParentView.priorDigest?: Buffer
+property ParentView.stateNumber: bigint
+property ParentView.walletGeneration: 4
 unexported type PeerState = 'disconnected' | 'connecting' | 'handshaking' | 'init' | 'ready' | 'closing'
 unexported type Prevouts = { scripts: Buffer[]; values: bigint[]; }
 unexported type SeedDerivedNodeConfigKey = 'nodePrivateKey' | 'channelBasepoints' | 'perCommitmentSeed' | 'fundingPrivkey' | 'htlcBasepointSecret' | 'revocationBasepointSecret' | 'paymentBasepointSecret' | 'delayedPaymentBasepointSecret'
@@ -780,6 +938,7 @@ method chain.ElectrumBackend.broadcastTransaction(rawTxHex: string): Promise<str
 readonly property chain.ElectrumBackend.callTimeoutMs: number
 method chain.ElectrumBackend.estimateFee(targetBlocks: number): Promise<number>
 readonly property chain.ElectrumBackend.failoverThreshold: number
+method chain.ElectrumBackend.getAssetSpliceInclusion(txid: string, height: number, recovery?: IAssetSpliceInclusionRecovery): Promise<IAssetSpliceAnchor>
 method chain.ElectrumBackend.getConsecutiveFailures(): number
 method chain.ElectrumBackend.getScriptHashHistory(scriptHash: string): Promise<Array<{ txid: string; height: number; }>>
 method chain.ElectrumBackend.getTransaction(txid: string): Promise<Buffer>
@@ -822,6 +981,7 @@ property chain.IBroadcastTxChainAction.tx: Buffer
 property chain.IBroadcastTxChainAction.type: chain.ChainActionType.BROADCAST_TX
 interface chain.IChainBackend
 method chain.IChainBackend.broadcastTransaction(rawTxHex: string): Promise<string>
+method chain.IChainBackend.getAssetSpliceInclusion?(txid: string, height: number, recovery?: IAssetSpliceInclusionRecovery): Promise<{ txid: string; blockHash: string; confirmations: number; }>
 method chain.IChainBackend.getScriptHashHistory(scriptHash: string): Promise<Array<{ txid: string; height: number; }>>
 method chain.IChainBackend.getTransaction(txid: string): Promise<Buffer>
 method chain.IChainBackend.getTransactionMerkleProof?(txid: string, height: number): Promise<{ blockHeight: number; txIndex: number; }>
@@ -839,6 +999,7 @@ property chain.IChainMonitorState.monitorState: chain.MonitorState
 property chain.IChainMonitorState.trackedOutputs: chain.ITrackedOutput[]
 interface chain.IChainWatcherChannelManager
 method chain.IChainWatcherChannelManager.assetOpeningAnchor?(id: string): { missingWitnesses: boolean; } | undefined
+method chain.IChainWatcherChannelManager.beginFinalFundingObservation?(id: string, txid: string, index: number, minimumDepth: number, current: () => boolean): (() => void) | undefined
 method chain.IChainWatcherChannelManager.finalSpliceParent?(id: string, txid: string): IFinalFundingReference | undefined
 method chain.IChainWatcherChannelManager.forgetFinalFundingConfirmation?(id: Buffer, txid?: string): void
 method chain.IChainWatcherChannelManager.handleFundingConfirmed(channelId: Buffer, confirmedTxidHex?: beignet/cli#TxidHex): void
@@ -847,13 +1008,16 @@ method chain.IChainWatcherChannelManager.handleFundingSpent(channelId: Buffer, s
 method chain.IChainWatcherChannelManager.handleNewBlock(blockHeight: number): void
 method chain.IChainWatcherChannelManager.handleOutputSpent(txid: string, outputIndex: number, spendingTx: bitcoinjs-lib#Transaction, blockHeight: number): void
 method chain.IChainWatcherChannelManager.handleOutputUnspent(txid: string, outputIndex: number): void
+method chain.IChainWatcherChannelManager.hasAssetSpliceWatch?(id: string, txid: string): boolean
 method chain.IChainWatcherChannelManager.listChannels(): channel.Channel[]
 method chain.IChainWatcherChannelManager.observeAssetFundingBroadcast?(txid: string, raw: Buffer): void
 method chain.IChainWatcherChannelManager.observeAssetOpeningAnchor?(id: string, atDepth: boolean, observed?: bitcoinjs-lib#Transaction, height?: number): void
 method chain.IChainWatcherChannelManager.observeAssetOpeningPayout?(id: Buffer, parent: string, confirmed: boolean): void
+method chain.IChainWatcherChannelManager.observeAssetSpliceFunding?(id: string, txid: string, height: number | undefined, prove: AssetSpliceInclusionLookup, current: () => boolean): Promise<void>
 method chain.IChainWatcherChannelManager.observeFinalFunding?(id: string, txid: string, height: number | undefined, parentAtDepth: boolean): void
 method chain.IChainWatcherChannelManager.off<K extends 'watch:funding' | 'broadcast:tx' | 'broadcast:void' | 'watch:output'>(event: K, listener: channel.ChannelManagerEvents[K]): void
 method chain.IChainWatcherChannelManager.on<K extends 'watch:funding' | 'broadcast:tx' | 'broadcast:void' | 'watch:output'>(event: K, listener: channel.ChannelManagerEvents[K]): void
+method chain.IChainWatcherChannelManager.suspendAssetSpliceFunding?(id: string, txid: string): void
 interface chain.IChainWatcherConfig
 property chain.IChainWatcherConfig.backend: chain.IChainBackend
 property chain.IChainWatcherConfig.channelManager: chain.IChainWatcherChannelManager
@@ -1138,10 +1302,12 @@ function chain.signP2wpkhInput(tx: bitcoinjs-lib#Transaction, inputIndex: number
 function chain.signSweepInput(tx: bitcoinjs-lib#Transaction, inputIndex: number, witnessScript: Buffer, value: number, privateKey: Buffer, sighashType?: number): Buffer
 function chain.sweepVbytes(witness: readonly Buffer[], destinationScript: Buffer): number
 namespace channel
-const channel.AUXILIARY_CHANNELS_API: Readonly<{ version: 1; surfaces: readonly [ "valueIncomingHtlc:three-outcome", "sendPaymentToRoute:assetPayment", "getAuxiliaryPaymentHtlcs", "onHtlcResolved:htlcId", "queryAuxiliaryRoute", "fundAuxiliaryChannel:unsigned", "onFundingSigned", "abandonAuxiliaryOpen", "IChannelInfo.auxiliary", "setAuxiliaryPaymentGate", "getChannelMonitorState", "IPaymentInfo.auxiliary", "IPaymentInfo.auxiliaryValueMsat", "IInvoiceInfo.auxiliary", "IAuxiliaryChannelInfo.undeliveredOutcomes", "onHtlcResolved:never-sent", "getFixedOutputFeeStatus", "IPaymentInfo.unresolved", "IHoldInvoiceStateEvent.auxiliary", "prepareForward", "getFixedOutputFeeStatus:splitCoins", "getFixedOutputFeeStatus:reserve", "requireFeeCoinsToSettle", "onForwardLegResolved:quote", "IForwardingEvent.auxiliary", "setAuxiliaryForwardGate", "receiveInParts", "sendInParts", "createInvoice:assetInvoice", "dualFunding:v1" ]; declared: readonly [ ]; }>
+const channel.AUXILIARY_CHANNELS_API: Readonly<{ version: 1; surfaces: readonly [ "valueIncomingHtlc:three-outcome", "sendPaymentToRoute:assetPayment", "getAuxiliaryPaymentHtlcs", "onHtlcResolved:htlcId", "queryAuxiliaryRoute", "fundAuxiliaryChannel:unsigned", "onFundingSigned", "abandonAuxiliaryOpen", "IChannelInfo.auxiliary", "setAuxiliaryPaymentGate", "getChannelMonitorState", "IPaymentInfo.auxiliary", "IPaymentInfo.auxiliaryValueMsat", "IInvoiceInfo.auxiliary", "IAuxiliaryChannelInfo.undeliveredOutcomes", "onHtlcResolved:never-sent", "getFixedOutputFeeStatus", "IPaymentInfo.unresolved", "IHoldInvoiceStateEvent.auxiliary", "prepareForward", "getFixedOutputFeeStatus:splitCoins", "getFixedOutputFeeStatus:reserve", "requireFeeCoinsToSettle", "onForwardLegResolved:quote", "IForwardingEvent.auxiliary", "setAuxiliaryForwardGate", "receiveInParts", "sendInParts", "createInvoice:assetInvoice", "dualFunding:v1", "assetSplice:v1" ]; declared: readonly [ ]; }>
 const channel.AUXILIARY_CHANNEL_DUST_LIMIT = 354n
 const channel.AUXILIARY_CLOSE_ASSET_OUTPUT_MINIMUM = 330n
 type channel.AssetOpenPair<T> = readonly [ initiator: T, acceptor: T ]
+type channel.AssetSpliceHost = IAssetSplicePlanner & IAssetSpliceSigningHost & IAssetSpliceConfirmationProvider
+type channel.AssetUpdateChange = { kind: 'add'; htlc: IAssetUpdateHtlc; } | { kind: 'fulfill'; offeredBy: Offerer; id: bigint; preimage: Buffer; } | { kind: 'fail'; offeredBy: Offerer; id: bigint; reason: Buffer; } | { kind: 'fee'; feeratePerKw: number; }
 class channel.AuxiliaryChannelUnsupportedError extends beignet#CodedError<'ASSET_CHANNEL_UNSUPPORTED'>
 constructor channel.AuxiliaryChannelUnsupportedError(channelId: string, operation: channel.AuxiliaryUnsupportedOperation)
 readonly property channel.AuxiliaryChannelUnsupportedError.channelId: string
@@ -1519,6 +1685,7 @@ method channel.ChannelManager.auxiliaryClaimsLost(): Array<{ channelId: Buffer; 
 method channel.ChannelManager.auxiliaryHtlcChainEnding(channelId: Buffer, direction: channel.HtlcDirection, htlcId: bigint): 'fulfilled' | 'failed' | undefined
 method channel.ChannelManager.auxiliaryHtlcDecision(channelId: Buffer, htlcId: bigint): channel.IAuxiliaryHtlcDecision | undefined
 method channel.ChannelManager.auxiliaryRowWritten(channel: channel.Channel): void
+method channel.ChannelManager.beginFinalFundingObservation(id: string, txid: string, index: number, minimumDepth: number, current: () => boolean): (() => void) | undefined
 method channel.ChannelManager.bumpCloseFee(channelId: Buffer, feeSatoshis: bigint): channel.ChannelResult
 method channel.ChannelManager.canForgetPreimage(paymentHash: Buffer, held: ReadonlyArray<{ channelId: Buffer; htlcId: bigint; }>): boolean
 method channel.ChannelManager.canOpenZeroConfTo(pubkeyHex: string): boolean
@@ -1580,6 +1747,7 @@ method channel.ChannelManager.handleOutputSpent(txid: string, outputIndex: numbe
 method channel.ChannelManager.handleOutputUnspent(txid: string, outputIndex: number): chain.ChainAction[]
 method channel.ChannelManager.handlePeerDisconnected(peerPubkey: string, cause?: { initiator: 'local' | 'remote'; reason?: string; }): void
 method channel.ChannelManager.handlePeerReconnected(peerPubkey: string): void
+method channel.ChannelManager.hasAssetSpliceWatch(id: string, txid: string): boolean
 method channel.ChannelManager.hasChannelWithPeer(pubkey: string): boolean
 method channel.ChannelManager.heldUnknownChannelReestablish(): Array<{ peer: string; channelId: string; expiresAt: number; }>
 method channel.ChannelManager.initiateFforEpoch(channelId: Buffer, request: { voucherAmountsMsat: bigint[]; minPaymentMsat: bigint; settlementDeadline: number; voucherExpiry: number; feeBaseMsat: number; feeProportionalMillionths: number; epochId?: Buffer; witnessPeers?: Buffer[]; hashChain?: boolean; concurrent?: boolean; concurrentVersion?: 1 | 2; }): channel.ChannelResult
@@ -1588,6 +1756,7 @@ method channel.ChannelManager.initiateQuiescence(channelId: Buffer): channel.Cha
 method channel.ChannelManager.initiateShutdown(channelId: Buffer, scriptPubkey: Buffer, acceptStaleStateRisk?: boolean, externalDestination?: boolean): channel.ChannelResult
 method channel.ChannelManager.initiateSplice(channelId: Buffer, relativeSatoshis: bigint, fundingFeeratePerkw: number, locktime?: number): channel.ChannelResult
 method channel.ChannelManager.isAnnouncementHeld(channelId: Buffer): boolean
+method channel.ChannelManager.isAssetSpliceFundingAvailable(id: string, txid: string): boolean
 method channel.ChannelManager.isChannelRestoredFromDisk(channelId: Buffer): boolean
 method channel.ChannelManager.isJitClient(pubkeyHex: string): boolean
 method channel.ChannelManager.isTrustedPeer(pubkeyHex: string): boolean
@@ -1602,6 +1771,7 @@ set channel.ChannelManager.nextChannelIndex(value: number)
 method channel.ChannelManager.observeAssetFundingBroadcast(txid: string, raw: Buffer): void
 method channel.ChannelManager.observeAssetOpeningAnchor(id: string, atDepth: boolean, observed?: bitcoinjs-lib#Transaction, height?: number): void
 method channel.ChannelManager.observeAssetOpeningPayout(id: Buffer, parent: string, confirmed: boolean): void
+method channel.ChannelManager.observeAssetSpliceFunding(id: string, txid: string, height: number | undefined, prove: AssetSpliceInclusionLookup, current: () => boolean): Promise<void>
 method channel.ChannelManager.observeFinalFunding(id: string, txid: string, height: number | undefined, parentAtDepth: boolean): void
 method channel.ChannelManager.openChannel(peerPubkey: string, fundingSatoshis: bigint, pushMsat?: bigint, beforeNegotiate?: (temporaryChannelId: Buffer) => void, opts?: { trusted?: boolean; auxiliary?: channel.IAuxiliaryFundingDescriptor; }): channel.Channel
 method channel.ChannelManager.openZeroConfChannel(peerPubkey: string, fundingSatoshis: bigint, pushMsat?: bigint): channel.Channel | null
@@ -1618,6 +1788,7 @@ method channel.ChannelManager.rearmCommitmentCpfp(channelId: Buffer, feeRatePerV
 method channel.ChannelManager.reauthorizeFundingBroadcast(channelId: Buffer): boolean
 method channel.ChannelManager.reauthorizeSpliceBroadcast(channelId: Buffer): boolean
 method channel.ChannelManager.rebuildForceCloseCommitment(channelId: Buffer, feeRatePerVbyte: number, noDeadlineFeeRatePerVbyte?: number): { ok: boolean; tx?: Buffer; error?: string; retryable?: boolean; }
+method channel.ChannelManager.receiveAssetSpliceLocked(peer: string, payload: Buffer): Promise<boolean>
 method channel.ChannelManager.receivedPlainHtlcChainEnding(channelId: Buffer, htlcId: bigint): 'fulfilled' | 'failed' | undefined
 method channel.ChannelManager.recordAuxiliaryHtlcDecision(channelId: Buffer, htlcId: bigint, outcome: 'settle' | 'fail', preimage?: Buffer): boolean
 method channel.ChannelManager.recordForwardAsk(channelId: Buffer, htlcId: bigint, terms?: Pick<channel.IHtlcForwardTerms, 'shortChannelId' | 'amountToForwardMsat'>): boolean
@@ -1629,10 +1800,12 @@ method channel.ChannelManager.releaseCompositeSpliceCommitment(channelId: Buffer
 method channel.ChannelManager.removeTrustedPeer(pubkeyHex: string): void
 method channel.ChannelManager.requestSpliceConflictRevert(channelId: Buffer): channel.ChannelResult
 method channel.ChannelManager.resendAnnouncementSignatures(channelId: Buffer): boolean
+method channel.ChannelManager.restoreAssetSpliceWatches(channelId?: string): void
 method channel.ChannelManager.restoreChannel(channel: channel.Channel, peerPubkey: string, keyIndex?: number | null, perChannelKeys?: channel.IPerChannelKeys | null): void
 method channel.ChannelManager.restoreFinalOpeningBroadcasts(): void
 method channel.ChannelManager.restoreMonitor(channelId: string, monitor: chain.ChainMonitor): void
 method channel.ChannelManager.retractAuxiliarySettleDecision(channelId: Buffer, htlcId: bigint): boolean
+method channel.ChannelManager.retryAssetSpliceLocks(channelId: string): Promise<void>
 method channel.ChannelManager.retryAuxiliaryOwed(settle?: (channelId: Buffer, htlcId: bigint, kind: 'fulfill' | 'fail') => channel.ChannelResult | undefined, now?: number): Array<{ channelId: Buffer; htlcId: bigint; kind: 'fulfill' | 'fail'; }>
 method channel.ChannelManager.revertConflictedSplice(channelId: Buffer): channel.ChannelResult
 method channel.ChannelManager.sendRecoveryCloseRequest(channelId: Buffer): boolean
@@ -1647,8 +1820,11 @@ method channel.ChannelManager.setJitClients(pubkeyHexes: Iterable<string>): void
 method channel.ChannelManager.setMonitorDestinationScript(destinationScript: Buffer): void
 method channel.ChannelManager.setOfferedHtlcDeadlines(byChannel: ReadonlyMap<string, ReadonlyMap<bigint, number>>): void
 method channel.ChannelManager.signCommitment(channelId: Buffer, signature: Buffer, htlcSignatures: Buffer[]): channel.ChannelResult
+method channel.ChannelManager.startAssetSplice(id: Buffer, options: channel.IStartAssetSplice): Promise<void>
+method channel.ChannelManager.startAssetSpliceUpdate(channelId: Buffer, changes: readonly channel.AssetUpdateChange[]): Promise<void>
 method channel.ChannelManager.startFinalSplice(id: Buffer, plan: FinalSplicePlan): void
 method channel.ChannelManager.stopAssetOpenings(): void
+method channel.ChannelManager.suspendAssetSpliceFunding(id: string, txid: string): void
 method channel.ChannelManager.takeAuxiliaryClaimsPastExpiry(): Array<{ channelId: Buffer; htlcId: bigint; cltvExpiry: number; }>
 method channel.ChannelManager.triggerAnnouncementDepth(channelId: Buffer, blockHeight: number, txIndex: number, localNodeId: Buffer, signAnnouncement: (data: Buffer) => { nodeSig: Buffer; bitcoinSig: Buffer; }): void
 method channel.ChannelManager.txSignaturesStillHeld(channel: channel.Channel): boolean
@@ -1841,6 +2017,7 @@ property channel.IAssetOpenContext.channelId: Buffer
 property channel.IAssetOpenContext.isInitiator: boolean
 property channel.IAssetOpenContext.open: message.IOpenChannel2Message
 property channel.IAssetOpenContext.peer: string
+property channel.IAssetOpenContext.walletGeneration?: 4
 interface channel.IAssetOpenDescription
 property channel.IAssetOpenDescription.inputs: (IAssetOpenLayout['inputs'][number] & { prevTx: Buffer; })[]
 property channel.IAssetOpenDescription.outputs: IAssetOpenLayout['outputs']
@@ -1875,6 +2052,81 @@ property channel.IAssetOpeningPayout.holder: 'local' | 'remote'
 property channel.IAssetOpeningPayout.outputIndex: number
 property channel.IAssetOpeningPayout.parent: bitcoinjs-lib#Transaction
 method channel.IAssetOpeningPayout.signSweep(unsigned: bitcoinjs-lib#Transaction, prevTxs: readonly bitcoinjs-lib#Transaction[]): Buffer[]
+property channel.IAssetOpeningPayout.splice?: { finalDigest: string; stateNumber: string; generation: 'parent' | 'candidate'; fundingTxid: string; fundingOutputIndex: number; }
+property channel.IAssetOpeningPayout.update?: { roundDigest: string; stateNumber: string; fundingTxid: string; fundingOutputIndex: number; }
+interface channel.IAssetSpliceBitcoin
+property channel.IAssetSpliceBitcoin.fundingKeys: ./channel/asset-splice-agreement#Pair<Buffer>
+property channel.IAssetSpliceBitcoin.lockTime: number
+property channel.IAssetSpliceBitcoin.maxAcceptedHtlcs: ./channel/asset-splice-agreement#Pair<number>
+property channel.IAssetSpliceBitcoin.minimumDepth: number
+interface channel.IAssetSpliceConfirmation
+property channel.IAssetSpliceConfirmation.blockHash: string
+property channel.IAssetSpliceConfirmation.blockHeight: number
+property channel.IAssetSpliceConfirmation.channelId: string
+method channel.IAssetSpliceConfirmation.currentLock(): IWalletSpliceLock | undefined
+property channel.IAssetSpliceConfirmation.finalDigest: string
+property channel.IAssetSpliceConfirmation.fundingOutputIndex: number
+property channel.IAssetSpliceConfirmation.fundingTxid: string
+interface channel.IAssetSpliceContext extends ParentView
+property channel.IAssetSpliceContext.attempt: Buffer
+property channel.IAssetSpliceContext.channelId: string
+method channel.IAssetSpliceContext.currentParent(): ParentView | undefined
+property channel.IAssetSpliceContext.isInitiator: boolean
+method channel.IAssetSpliceContext.parentObservationPending?(): boolean
+property channel.IAssetSpliceContext.peer: string
+interface channel.IAssetSpliceDescription
+property channel.IAssetSpliceDescription.commitmentRecordLimits: readonly (readonly IAssetSpliceWireRecordLimit[])[]
+property channel.IAssetSpliceDescription.feeBudgets: readonly bigint[]
+property channel.IAssetSpliceDescription.inputs: readonly { serialId: bigint; txid: Buffer; vout: number; sequence: number; isShared: boolean; prevTx?: Buffer; }[]
+property channel.IAssetSpliceDescription.movements: IAssetSpliceLayout['movements']
+property channel.IAssetSpliceDescription.outputs: readonly { serialId: bigint; kind: 'funding' | 'withdrawal' | 'change'; valueSats: bigint; descriptorHash: Buffer; }[]
+property channel.IAssetSpliceDescription.parentBalances: IAssetSpliceLayout['parentBalances']
+property channel.IAssetSpliceDescription.relativeSatoshis: readonly bigint[]
+interface channel.IAssetSpliceExitProofs
+property channel.IAssetSpliceExitProofs.candidate: IAssetSpliceExitBranch
+property channel.IAssetSpliceExitProofs.channelId: string
+property channel.IAssetSpliceExitProofs.finalDigest: string
+property channel.IAssetSpliceExitProofs.minimumDepth: number
+property channel.IAssetSpliceExitProofs.parent: IAssetSpliceExitBranch
+property channel.IAssetSpliceExitProofs.priorDigest?: string
+property channel.IAssetSpliceExitProofs.stateNumber: string
+interface channel.IAssetSpliceHostExitViews
+property channel.IAssetSpliceHostExitViews.candidate: Record<Holder, IAssetSpliceHostHolder> & { funding: IFinalFundingReference; fundingRoot: Buffer; }
+property channel.IAssetSpliceHostExitViews.finalDigest: Buffer
+property channel.IAssetSpliceHostExitViews.fundingFeeratePerkw: number
+property channel.IAssetSpliceHostExitViews.layoutDigest: Buffer
+property channel.IAssetSpliceHostExitViews.originalInitiator: boolean
+property channel.IAssetSpliceHostExitViews.parent: Record<Holder, IAssetSpliceHostHolder> & { funding: IFinalFundingReference; fundingRoot: Buffer; }
+property channel.IAssetSpliceHostExitViews.paymentBasepoints: channel.AssetOpenPair<Buffer>
+property channel.IAssetSpliceHostExitViews.terms: IFinalOpeningTerms
+interface channel.IAssetSpliceUpdateHost
+method channel.IAssetSpliceUpdateHost.retainAssetUpdateViews(round: channel.IAssetUpdateRound, members: readonly channel.IAssetUpdateSignedMember[]): Promise<void>
+method channel.IAssetSpliceUpdateHost.signAssetUpdateHtlcs(round: channel.IAssetUpdateRound, jointShares: channel.AssetOpenPair<Buffer>, signer: channel.IAssetUpdateHtlcSigner): Promise<Buffer>
+method channel.IAssetSpliceUpdateHost.signAssetUpdateViews(round: channel.IAssetUpdateRound): Promise<Buffer>
+method channel.IAssetSpliceUpdateHost.verifyAssetUpdateViews(round: channel.IAssetUpdateRound, jointShares: channel.AssetOpenPair<Buffer>, htlcShares: channel.AssetOpenPair<Buffer>): Promise<readonly channel.IAssetUpdateMemberEvidence[]>
+interface channel.IAssetSpliceWalletPlan extends channel.IAssetOpenPlan
+method channel.IAssetSpliceWalletPlan.finalize(consents: ./channel/asset-splice-agreement#Pair<Buffer>, authorizations: ./channel/asset-splice-agreement#Pair<Buffer>): Promise<channel.IAssetOpenFunding & { layoutDigest: Buffer; }>
+interface channel.IAssetUpdateHtlcSigner
+method channel.IAssetUpdateHtlcSigner.signHtlc(hash: Buffer, point: Buffer, htlcBasepoint: Buffer, outpoint: string, offeredBy: IAssetUpdateHtlc['offeredBy'], htlcId: bigint, assetId: string): Buffer
+interface channel.IAssetUpdateMemberEvidence
+property channel.IAssetUpdateMemberEvidence.local: IAssetUpdateHolderEvidence
+property channel.IAssetUpdateMemberEvidence.outpoint: string
+property channel.IAssetUpdateMemberEvidence.remote: IAssetUpdateHolderEvidence
+interface channel.IAssetUpdateRound
+property channel.IAssetUpdateRound.changes: readonly channel.AssetUpdateChange[]
+property channel.IAssetUpdateRound.channelId: string
+property channel.IAssetUpdateRound.digest: Buffer
+property channel.IAssetUpdateRound.localIsInitiator: boolean
+property channel.IAssetUpdateRound.members: readonly IAssetUpdateMemberView[]
+property channel.IAssetUpdateRound.priorDigest?: Buffer
+property channel.IAssetUpdateRound.stateNumber: bigint
+property channel.IAssetUpdateRound.terms: IFinalOpeningTerms
+interface channel.IAssetUpdateSignedMember
+property channel.IAssetUpdateSignedMember.local: bitcoinjs-lib#Transaction
+property channel.IAssetUpdateSignedMember.localEvidence: IAssetUpdateHolderEvidence
+property channel.IAssetUpdateSignedMember.outpoint: string
+property channel.IAssetUpdateSignedMember.remote: bitcoinjs-lib#Transaction
+property channel.IAssetUpdateSignedMember.remoteEvidence: IAssetUpdateHolderEvidence
 interface channel.IAuthorizeFundingBroadcastAction
 property channel.IAuthorizeFundingBroadcastAction.fundingTxid: Buffer
 property channel.IAuthorizeFundingBroadcastAction.type: channel.ChannelActionType.AUTHORIZE_FUNDING_BROADCAST
@@ -1968,7 +2220,7 @@ property channel.IAuxiliaryCommitmentData.secondLevelCommitmentTxid?: string
 property channel.IAuxiliaryCommitmentData.secondLevelLeaves: Map<string, channel.ITaprootAuxLeaf>
 property channel.IAuxiliaryCommitmentData.secondLevelRevocationBasepoint?: Buffer
 property channel.IAuxiliaryCommitmentData.secondLevelRevocationKey?: Buffer
-interface channel.IAuxiliaryDualFunding
+interface channel.IAuxiliaryDualFunding extends Partial<channel.AssetSpliceHost>, Partial<channel.IAssetSpliceUpdateHost>
 method channel.IAuxiliaryDualFunding.abandon(ctx: channel.IAssetOpenContext): Promise<void>
 method channel.IAuxiliaryDualFunding.confirmFunding(candidate: IFinalOpeningCandidate, fundingProofs: Buffer): Promise<void>
 method channel.IAuxiliaryDualFunding.contribution(peer: string, isInitiator: boolean, openerSats: bigint): bigint | undefined
@@ -2664,6 +2916,9 @@ property channel.ISpliceWalletInput.prevTx: Buffer
 property channel.ISpliceWalletInput.sequence: number
 property channel.ISpliceWalletInput.signWitness: (tx: bitcoinjs-lib#Transaction, inputIndex: number, value: bigint, prevouts?: { scripts: Buffer[]; values: bigint[]; }) => Buffer[]
 property channel.ISpliceWalletInput.value: bigint
+interface channel.IStartAssetSplice
+property channel.IStartAssetSplice.fundingFeeratePerkw: number
+property channel.IStartAssetSplice.minimumDepth: number
 interface channel.ITaprootAuxLeaf
 property channel.ITaprootAuxLeaf.leafVersion?: number
 property channel.ITaprootAuxLeaf.script: Buffer
@@ -3758,6 +4013,7 @@ member features.Feature.LARGE_CHANNELS = 18
 member features.Feature.ONION_MESSAGES = 38
 member features.Feature.OPTION_ASSET_CHILD_CUSTODY = 452
 member features.Feature.OPTION_ASSET_FIXED_HTLC_OUTPUTS = 450
+member features.Feature.OPTION_ASSET_SPLICE = 458
 member features.Feature.OPTION_COMPOSITE_SPLICE_INPUTS = 454
 member features.Feature.OPTION_DUAL_FUNDED_ASSETS = 456
 member features.Feature.OPTION_FF_CONCURRENT = 442
@@ -5363,6 +5619,9 @@ const message.BEIGNET_CUSTOM_PROTOCOL_VERSION = 1
 enum message.BeignetCustomSubtype
 member message.BeignetCustomSubtype.ASSET_OPEN = 96
 member message.BeignetCustomSubtype.ASSET_OPEN_CONSENT = 97
+member message.BeignetCustomSubtype.ASSET_SPLICE = 98
+member message.BeignetCustomSubtype.ASSET_SPLICE_CONSENT = 99
+member message.BeignetCustomSubtype.ASSET_UPDATE = 100
 member message.BeignetCustomSubtype.DIRECT_FUNDING_ABORT = 20
 member message.BeignetCustomSubtype.DIRECT_FUNDING_OFFER = 16
 member message.BeignetCustomSubtype.DIRECT_FUNDING_OFFER_ACK = 17
@@ -6780,6 +7039,8 @@ method node.LightningNode.spliceInAndWait(channelId: Buffer, amountSats: bigint,
 method node.LightningNode.spliceInWithInputs(channelId: Buffer, amountSats: bigint, inputs: channel.ISpliceWalletInput[], changeScript: Buffer, fundingFeeratePerkw?: number, options?: { lockAtDepth?: number; }): node.ISpliceRequestResult
 method node.LightningNode.spliceOut(channelId: Buffer, amountSats: bigint, fundingFeeratePerkw?: number, destinationScript?: Buffer): node.ISpliceRequestResult
 method node.LightningNode.spliceQuote(channelId: Buffer, direction: 'in' | 'out', fundingFeeratePerkw?: number, destinationScript?: Buffer): { direction: 'in' | 'out'; feeSats: number; spendableSats: number; maxAmountSats: number; reserveSats?: number; commitmentCostSats?: number; inputCount?: number; }
+method node.LightningNode.startAssetSplice(channelId: Buffer, options: channel.IStartAssetSplice): Promise<void>
+method node.LightningNode.startAssetSpliceUpdate(channelId: Buffer, changes: readonly channel.AssetUpdateChange[]): Promise<void>
 method node.LightningNode.startChainWatcher(): Promise<void>
 method node.LightningNode.startCompositeSpliceOut(request: node.ICompositeSpliceOutRequest): Promise<node.ICompositeSpliceStartResult>
 method node.LightningNode.startDirectFunding(): Promise<void>

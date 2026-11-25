@@ -369,6 +369,39 @@ describe('Issue #1616: daemon replies validate against the spec', function () {
 		expect(problems).to.deep.equal([]);
 	});
 
+	it('POST /channel/asset-splice documents its started response', async () => {
+		const route = '/channel/asset-splice';
+		const channelId = 'ab'.repeat(32);
+		const node = daemon.node.lightningNode;
+		const original = node.startAssetSplice;
+		node.startAssetSplice = async (id, options) => {
+			expect(id.toString('hex')).to.equal(channelId);
+			expect(options).to.deep.equal({
+				fundingFeeratePerkw: 1000,
+				minimumDepth: 3
+			});
+		};
+		try {
+			const reply = await request(port, route, 'POST', {
+				channelId,
+				fundingFeeratePerkw: 1000,
+				minimumDepth: 3
+			});
+			expect(reply.status).to.equal(200);
+			expect(reply.body).to.deep.equal({ ok: true, result: { started: true } });
+			const schema = successSchema(route, 'post');
+			expect(validate(schema, reply.body)).to.deep.equal([]);
+			expect(validate(schema, { ok: true, result: {} })).to.include(
+				'$.result: missing started'
+			);
+			expect(
+				validate(schema, { ok: true, result: { started: false } })
+			).to.include('$.result.started: false not in enum');
+		} finally {
+			node.startAssetSplice = original;
+		}
+	});
+
 	// Issue #1650: each route wrapped the engine's in-band refusal in
 	// success(), so a refusal answered 200 ok:true with ok:false inside.
 	describe('Issue #1650: an engine refusal is a failure envelope', () => {

@@ -1,3 +1,7 @@
+import {
+	finalFundingReserveSats,
+	finalHtlcLimits
+} from './final-commitment-reserve';
 import { Transaction } from 'bitcoinjs-lib';
 import { MAX_PEER_PREVTX_BYTES_PER_SESSION } from '../interactive-tx/validation';
 import { MAX_LIGHTNING_PAYLOAD } from '../message/custom-records';
@@ -136,6 +140,9 @@ export class AssetOpeningSession {
 		)
 			throw new Error('Invalid asset opening negotiation');
 		this.ctx = {
+			...(runtime.storage.canSpliceDualFundedAssets && {
+				walletGeneration: 4 as const
+			}),
 			peer: start.peer,
 			isInitiator: start.initiator,
 			open,
@@ -651,6 +658,20 @@ export class AssetOpeningSession {
 		if (!shares) return;
 		const exits = await provider.verifyExits(exitContext, shares);
 		this.assertLive(g);
+		const capacity = ctx.open.fundingSatoshis + ctx.accept.fundingSatoshis;
+		const updateLimits =
+			ctx.walletGeneration === 4
+				? {
+						local: finalHtlcLimits(
+							ctx.isInitiator ? ctx.open : ctx.accept,
+							finalFundingReserveSats(capacity, terms, false)
+						),
+						remote: finalHtlcLimits(
+							ctx.isInitiator ? ctx.accept : ctx.open,
+							finalFundingReserveSats(capacity, terms, true)
+						)
+				  }
+				: undefined;
 		runtime.storage.rememberAssetOpeningSession(
 			candidate,
 			ctx.peer,
@@ -667,7 +688,8 @@ export class AssetOpeningSession {
 				fundingProofs: funding.fundingProofs.toString('hex'),
 				local: exits.local,
 				remote: exits.remote
-			}
+			},
+			updateLimits
 		);
 		runtime.storage.finalOpeningTxComplete(this.id, keys.fundingPrivkey);
 		runtime.storage.rememberFinalPeerTxComplete(this.id, peerNonce);

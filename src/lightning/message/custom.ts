@@ -97,7 +97,10 @@ export enum BeignetCustomSubtype {
 	FFOR_RECEIVE_REQUEST = 80,
 	FFOR_RECEIVE_RESPONSE = 81,
 	ASSET_OPEN = 96,
-	ASSET_OPEN_CONSENT = 97
+	ASSET_OPEN_CONSENT = 97,
+	ASSET_SPLICE = 98,
+	ASSET_SPLICE_CONSENT = 99,
+	ASSET_UPDATE = 100
 }
 
 export interface ICustomMessage {

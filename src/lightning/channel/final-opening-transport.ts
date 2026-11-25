@@ -1,3 +1,4 @@
+import { acceptAssetSpliceReestablish } from '../storage/asset-splice-reestablish';
 import { decodeStartBatchMessage } from '../message/splice';
 import type { FinalSpliceTransport } from './final-splice-transport';
 import type { IFinalCloseRequest } from '../storage/final-simple-close';
@@ -87,7 +88,8 @@ export class FinalOpeningTransport {
 		>,
 		private readonly broadcastClose?: (tx: Buffer) => void,
 		private readonly splice?: FinalSpliceTransport,
-		private readonly reconnectFunding?: (peer: string) => void
+		private readonly reconnectFunding?: (peer: string) => void,
+		private readonly resumeAssetSplice?: (peer: string, id: string) => void
 	) {
 		this.commitments = new FinalCommitmentTransport(
 			runtime,
@@ -376,6 +378,12 @@ export class FinalOpeningTransport {
 		}
 	}
 
+	/** The splice wallet verifies and imports its own proofs before passing true here. */
+	assetSpliceSpendable(id: string, ready: boolean): void {
+		this.assetSpendable.delete(id);
+		if (this.hasDepth(id) !== ready) this.setDepth(id, ready);
+	}
+
 	/** A replacement tip can move the same transaction into another block at the same height. */
 	invalidateAssetFundingAnchor(id: string): void {
 		const old = this.assetDepth.get(id);
@@ -483,6 +491,7 @@ export class FinalOpeningTransport {
 		connection.readySent = true;
 		try {
 			this.send(connection.peer, MessageType.CHANNEL_READY, payload);
+			this.resumeAssetSplice?.(connection.peer, id);
 		} catch (error) {
 			connection.readySent = false;
 			throw error;
@@ -537,6 +546,30 @@ export class FinalOpeningTransport {
 				this.send(peer, MessageType.CHANNEL_REESTABLISH, payload);
 				continue;
 			}
+			if (
+				session.assetEvidence &&
+				storage.canSpliceDualFundedAssets &&
+				opening.funding &&
+				opening.readyExchanged &&
+				this.negotiated(peer).splice
+			) {
+				const fields = storage.assetSpliceReconnect(
+					id,
+					this.runtime.root,
+					this.confirmed.has(id)
+				);
+				this.connections.set(id, {
+					peer,
+					established: false,
+					readySent: false
+				});
+				this.send(
+					peer,
+					MessageType.CHANNEL_REESTABLISH,
+					encodeChannelReestablishMessage(fields)
+				);
+				continue;
+			}
 			if (session.assetEvidence && storage.canOpenDualFundedAssets) {
 				// Admission and nonce persistence can be separated by a power cut.
 				// Reestablish must carry the verification nonce promised during construction.
@@ -557,7 +590,8 @@ export class FinalOpeningTransport {
 			const pair =
 				nonce && decodeTxCompleteMessage(nonce, { taproot: true }).commitNonces;
 			const fundingTxid = Transaction.fromHex(candidate.fundingTxHex).getHash();
-			const missingCommitment = !storage.loadFinalOpeningExit(id);
+			const missingCommitment =
+				!opening.funding && !storage.loadFinalOpeningExit(id);
 			const next = opening.funding
 				? storage.renewFinalReestablishNonce(id, this.runtime.root)
 				: pair && pair.next;
@@ -847,6 +881,38 @@ export class FinalOpeningTransport {
 						this.replayClose(id);
 						return;
 					}
+					if (
+						session.assetEvidence &&
+						storage.canSpliceDualFundedAssets &&
+						opening.funding &&
+						opening.readyExchanged &&
+						this.negotiated(peer).splice
+					) {
+						const msg = decodeChannelReestablishMessage(message.payload, {
+							finalTaproot: true
+						});
+						// A peer still finishing the initial exchange can request the original witnesses.
+						if (
+							!msg.nextFundingTxid?.equals(
+								Transaction.fromHex(candidate.fundingTxHex).getHash()
+							)
+						) {
+							acceptAssetSpliceReestablish(storage, id, this.runtime.root, msg);
+							connection.peerReestablish = Buffer.from(message.payload);
+							connection.established = true;
+							if (
+								msg.nextCommitmentNumber === 1n &&
+								!storage.assetSpliceUpdateHead(id).committed
+							) {
+								this.sendReady(id);
+								if (!connection.readySent) this.resumeAssetSplice?.(peer, id);
+							} else {
+								connection.readySent = true;
+								this.resumeAssetSplice?.(peer, id);
+							}
+							return;
+						}
+					}
 					const needsFunding = this.validateReestablish(
 						id,
 						candidate,
@@ -922,6 +988,36 @@ export class FinalOpeningTransport {
 					this.commitments.receive(id, message!);
 					if (storage.finalSimpleCloseStarted(id)) this.driveClose(id);
 					return;
+				}
+				if (
+					storage.canSpliceDualFundedAssets &&
+					opening.readyExchanged &&
+					opening.funding &&
+					session.assetEvidence &&
+					message
+				) {
+					const saved =
+						message.type === MessageType.TX_COMPLETE
+							? storage.loadFinalPeerTxComplete(id)
+							: message.type === MessageType.COMMITMENT_SIGNED
+							? storage.loadReceivedOpeningCommitment(id)
+							: message.type === MessageType.TX_SIGNATURES
+							? storage.loadFinalPeerTxSignatures(id)
+							: undefined;
+					if (saved) {
+						if (
+							!saved.equals(message.payload) &&
+							!storage.receivedAssetSpliceWire(
+								id,
+								message.type,
+								message.payload
+							)
+						)
+							throw Error(
+								'Opening replay differs from the secured original funding'
+							);
+						return;
+					}
 				}
 				// Secure the inbound commitment even if the chain verifier is offline.
 				// Its peer and immutable candidate were bound before we offered a nonce.

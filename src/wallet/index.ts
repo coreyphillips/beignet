@@ -8149,15 +8149,36 @@ export class Wallet {
 	): Promise<Result<TTxDetails>> {
 		try {
 			const details = await this.electrum.getTransactions({
-				txHashes: [{ tx_hash: txid }]
+				txHashes: [{ tx_hash: txid }],
+				rejectFailedBatches: true
 			});
-			if (details.isErr()) {
-				return err(details.error);
+			if (details.isErr()) return err(details.error);
+			const entries = details.value.data;
+			if (entries.length === 0) {
+				return err(
+					EWalletErrorCode.ELECTRUM_TRANSACTION_RESPONSE_MISSING,
+					'Electrum returned no transaction details for the requested transaction'
+				);
 			}
-			if (details.value.data[0]?.error?.message) {
-				return err(details.value.data[0].error.message);
+			const [entry] = entries;
+			if (entries.length !== 1 || !entry)
+				return err('Unexpected Electrum transaction response');
+			if (entry.error)
+				return err(
+					entry.error.message || 'Electrum refused the transaction request'
+				);
+			const result = entry.result;
+			if (
+				typeof result?.txid !== 'string' ||
+				result.txid.toLowerCase() !== txid.toLowerCase() ||
+				typeof result.hex !== 'string' ||
+				result.hex.length === 0
+			) {
+				return err(
+					'Electrum transaction details do not match the requested transaction'
+				);
 			}
-			return ok(details.value.data[0].result);
+			return ok(result);
 		} catch (e) {
 			return err(e);
 		}

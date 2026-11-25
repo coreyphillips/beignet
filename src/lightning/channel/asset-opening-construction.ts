@@ -81,6 +81,12 @@ export function assetOpeningConstruction(
 			})
 		});
 	}
+	return { candidate, turns: alternatingConstructionTurns(sides) };
+}
+
+export function alternatingConstructionTurns(
+	sides: readonly IAssetConstructionTurn[][]
+): IAssetConstructionTurn[] {
 	const positions = [0, 0],
 		turns: IAssetConstructionTurn[] = [];
 	let consecutive = 0;
@@ -95,5 +101,5 @@ export function assetOpeningConstruction(
 			consecutive++;
 		}
 	}
-	return { candidate, turns };
+	return turns;
 }

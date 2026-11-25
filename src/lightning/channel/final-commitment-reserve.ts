@@ -94,3 +94,24 @@ export function finalSpliceWithdrawalSats(
 	}
 	return lower;
 }
+
+export function finalHtlcLimits(
+	config: {
+		htlcMinimumMsat: bigint;
+		maxHtlcValueInFlightMsat: bigint;
+		maxAcceptedHtlcs: number;
+	},
+	reserve: bigint
+): {
+	htlcMinimumMsat: string;
+	maxHtlcValueInFlightMsat: string;
+	maxAcceptedHtlcs: number;
+	channelReserveSats: string;
+} {
+	return {
+		htlcMinimumMsat: config.htlcMinimumMsat.toString(),
+		maxHtlcValueInFlightMsat: config.maxHtlcValueInFlightMsat.toString(),
+		maxAcceptedHtlcs: config.maxAcceptedHtlcs,
+		channelReserveSats: reserve.toString()
+	};
+}

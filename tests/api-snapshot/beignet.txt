@@ -69,6 +69,7 @@ member EUnit.BTC = "BTC"
 member EUnit.fiat = "fiat"
 member EUnit.satoshi = "satoshi"
 enum EWalletErrorCode
+member EWalletErrorCode.ELECTRUM_TRANSACTION_RESPONSE_MISSING = "ELECTRUM_TRANSACTION_RESPONSE_MISSING"
 member EWalletErrorCode.FEE_EXCEEDS_HALF_INPUTS = "FEE_EXCEEDS_HALF_INPUTS"
 member EWalletErrorCode.FEE_EXCEEDS_HALF_OUTPUTS = "FEE_EXCEEDS_HALF_OUTPUTS"
 member EWalletErrorCode.REPLACEMENT_FEE_TOO_LOW = "REPLACEMENT_FEE_TOO_LOW"
@@ -96,7 +97,7 @@ method Electrum.getConnectedPeer(): Promise<Result<IPeerData>>
 method Electrum.getFeeEstimate(blocksWillingToWait: number): Promise<Result<number>>
 method Electrum.getScriptPubKeyHistory(scriptPubkey: string): Promise<TGetAddressHistory[]>
 method Electrum.getTransactionMerkle({ tx_hash, height }: { tx_hash: string; height: number; }): Promise<{ merkle: string[]; block_height: number; pos: number; }>
-method Electrum.getTransactions({ txHashes }: { txHashes: ITxHash[]; }): Promise<Result<IGetTransactions>>
+method Electrum.getTransactions({ txHashes, rejectFailedBatches }: { txHashes: ITxHash[]; rejectFailedBatches?: boolean; }): Promise<Result<IGetTransactions>>
 method Electrum.getTransactionsFromInputs({ txHashes }: { txHashes: ITxHash[]; }): Promise<Result<IGetTransactionsFromInputs>>
 method Electrum.getUtxos({ scanningStrategy, addressIndex, changeAddressIndex, addressTypesToCheck, additionalAddresses, additionalScriptHashes }: { scanningStrategy?: EScanningStrategy; addressIndex?: number; changeAddressIndex?: number; addressTypesToCheck?: EAddressType[]; additionalAddresses?: string[]; additionalScriptHashes?: IAddresses; }): Promise<Result<IGetUtxosResponse>>
 method Electrum.isConnected(): Promise<boolean>

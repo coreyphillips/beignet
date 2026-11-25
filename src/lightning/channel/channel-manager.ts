@@ -1,4 +1,22 @@
 import {
+	AssetSpliceUpdateTransport,
+	hasAssetUpdateHost
+} from './asset-splice-update-transport';
+import { releasedAssetUpdateFunding } from './asset-splice-update-ledger';
+import type { AssetUpdateChange } from './asset-splice-update-provider';
+import { BeignetCustomSubtype } from '../message/custom';
+import {
+	AssetSpliceTransport,
+	completeAssetSpliceHost,
+	type IStartAssetSplice
+} from './asset-splice-transport';
+import { assetSpliceNegotiated } from '../features/asset-splice';
+import {
+	AssetSpliceConfirmationCoordinator,
+	type AssetSpliceInclusionLookup
+} from './asset-splice-confirmation';
+import { finalHtlcLimits } from './final-commitment-reserve';
+import {
 	AssetOpeningCoordinator,
 	completeAssetOpeningHost
 } from './asset-opening-coordinator';
@@ -905,23 +923,6 @@ class CountedMap<K, V> extends Map<K, V> {
 	}
 }
 
-function finalHtlcLimits(
-	config: IChannelConfig,
-	reserve: bigint
-): {
-	htlcMinimumMsat: string;
-	maxHtlcValueInFlightMsat: string;
-	maxAcceptedHtlcs: number;
-	channelReserveSats: string;
-} {
-	return {
-		htlcMinimumMsat: config.htlcMinimumMsat.toString(),
-		maxHtlcValueInFlightMsat: config.maxHtlcValueInFlightMsat.toString(),
-		maxAcceptedHtlcs: config.maxAcceptedHtlcs,
-		channelReserveSats: reserve.toString()
-	};
-}
-
 /**
  * Manages multiple channels, dispatching messages between PeerManager
  * and Channel instances. Its events and their listener signatures are
@@ -1094,9 +1095,13 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 	private _walletDestinationScript: Buffer | null = null;
 	/** Funding provider used to attach wallet inputs for anchor fee bumps. */
 	private fundingProvider: IFundingProvider | null = null;
+	private readonly assetSplice?: AssetSpliceTransport;
+	private readonly assetUpdates?: AssetSpliceUpdateTransport;
+	private readonly assetSpliceConfirmation?: AssetSpliceConfirmationCoordinator;
 	private readonly assetOpening?: AssetOpeningCoordinator;
 	private readonly finalTransport?: FinalOpeningTransport;
 	private readonly finalSplice?: FinalSpliceTransport;
+	private readonly finalFundingChecks = new Map<string, () => boolean>();
 	private readonly finalObservedFunding = new Map<
 		string,
 		Map<string, { height: number; parentAtDepth: boolean }>
@@ -1201,6 +1206,21 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		}
 		this.config = config;
 		this.persistence = config.persistence;
+		if (config.finalOpening?.storage.canSpliceDualFundedAssets) {
+			this.assetSpliceConfirmation = new AssetSpliceConfirmationCoordinator(
+				config.finalOpening.storage,
+				config.auxiliaryChannels?.dualFunding ??
+					config.finalOpening.dualFunding,
+				(id, ref, depth) => this.watchFinalSplice(id, ref, depth),
+				(peer, raw) => this.sendMessage(peer, MessageType.SPLICE_LOCKED, raw),
+				(id, txid) =>
+					this.emit(
+						'splice:complete',
+						Buffer.from(id, 'hex'),
+						Buffer.from(txid, 'hex').reverse()
+					)
+			);
+		}
 		if (config.finalOpening && config.verifyRemoteFundingInput) {
 			this.finalSplice = new FinalSpliceTransport(
 				config.finalOpening,
@@ -1279,9 +1299,118 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 				}),
 				(raw) => this.emit('broadcast:tx', raw),
 				this.finalSplice,
-				(peer) => this.peerManager?.recyclePeer(peer, 1000)
+				(peer) => this.peerManager?.recyclePeer(peer, 1000),
+				(peer, id) => {
+					this.assetSplice?.resume(peer, id);
+					this.assetUpdates?.resume(peer, id);
+				}
 			);
 			const host = config.auxiliaryChannels?.dualFunding;
+			if (
+				config.finalOpening.storage.canSpliceDualFundedAssets &&
+				completeAssetSpliceHost(host) &&
+				completeAssetOpeningHost(host)
+			) {
+				this.assetSplice = new AssetSpliceTransport(
+					config.finalOpening,
+					host,
+					(peer, id) => {
+						const open =
+							config.finalOpening!.storage.loadFinalOpeningSession(id);
+						const features = config.localFeatures;
+						return (
+							!!open?.assetEvidence &&
+							open.peer === peer &&
+							!!this.finalTransport?.connected(id) &&
+							!!features &&
+							assetSpliceNegotiated(
+								ASSET_OPENING_TYPE_HEX,
+								features,
+								this.peerManager?.getPeer(peer)?.getRemoteInit()?.features
+							)
+						);
+					},
+					(id, txid, opening) =>
+						!this.finalObservedClose.has(id) &&
+						(opening
+							? !!this.finalTransport?.hasDepth(id)
+							: this.isAssetSpliceFundingAvailable(id, txid)),
+					() => this._currentBlockHeight,
+					(peer, type, raw) => this.sendMessage(peer, type, raw),
+					config.verifyRemoteFundingInput,
+					(id) => this.restoreAssetSpliceWatches(id),
+					(raw) => this.emit('broadcast:tx', raw),
+					(id, reason) =>
+						this.emitContained('error', Buffer.from(id, 'hex'), reason),
+					{
+						timeoutMs: config.quiescenceTimeoutMs,
+						observingFunding: (id, txid, index): boolean =>
+							!this.finalObservedClose.has(id) &&
+							this.finalFundingChecks.get(id + '/' + txid + ':' + index)?.() ===
+								true,
+						disconnect: (peer) => this.peerManager?.recyclePeer(peer, 1000),
+						close: (id) => {
+							if (this.finalObservedClose.has(id)) return;
+							const storage = config.finalOpening!.storage;
+							const session = storage.loadFinalOpeningSession(id)!;
+							const exit = storage.requestFinalOpeningExit(
+								id,
+								this.observedFinalExit(id)
+							);
+							this.finalTransport?.closed(session.peer, id);
+							this.emit('broadcast:tx', exit);
+						}
+					}
+				);
+				if (hasAssetUpdateHost(host)) {
+					this.assetUpdates = new AssetSpliceUpdateTransport(
+						config.finalOpening,
+						host,
+						(id) => {
+							const opening =
+								config.finalOpening!.storage.loadFinalDaemonOpening(id);
+							const peer = opening?.session.peer,
+								features = config.localFeatures;
+							if (
+								!peer ||
+								!opening?.readyExchanged ||
+								opening.exitToBroadcast ||
+								!opening.session.assetEvidence ||
+								!this.finalTransport?.connected(id) ||
+								!features ||
+								!assetSpliceNegotiated(
+									ASSET_OPENING_TYPE_HEX,
+									features,
+									this.peerManager?.getPeer(peer)?.getRemoteInit()?.features
+								)
+							)
+								return;
+							return { peer, originalInitiator: opening.candidate.isInitiator };
+						},
+						(id) => this.assetUpdateHeight(id),
+						(peer, type, raw) => this.sendMessage(peer, type, raw),
+						(id) => this.retryAssetSpliceLocks(id),
+						(id, reason) =>
+							this.emitContained('error', Buffer.from(id, 'hex'), reason),
+						(id, peer) => {
+							const opening =
+								config.finalOpening!.storage.loadFinalDaemonOpening(id);
+							return (
+								!!opening?.readyExchanged &&
+								!opening.exitToBroadcast &&
+								!!opening.session.assetEvidence &&
+								opening.session.peer === peer &&
+								!!config.localFeatures &&
+								assetSpliceNegotiated(
+									ASSET_OPENING_TYPE_HEX,
+									config.localFeatures,
+									this.peerManager?.getPeer(peer)?.getRemoteInit()?.features
+								)
+							);
+						}
+					);
+				}
+			}
 			if (
 				config.finalOpening.storage.canOpenDualFundedAssets &&
 				completeAssetOpeningHost(host)
@@ -3742,6 +3871,9 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		// Before the channels forget their pre-commitment splices: a composite
 		// splice (issue #1922) ends with the connection and must hear it first.
 		this.assetOpening?.disconnect(peerPubkey);
+		this.assetSplice?.disconnected(peerPubkey);
+		this.assetUpdates?.disconnected(peerPubkey);
+		this.assetSpliceConfirmation?.disconnected(peerPubkey);
 		this.finalTransport?.disconnected(peerPubkey);
 		this.emit('peer:disconnected', peerPubkey);
 		const openDiedOnDisconnect = (state: ChannelState): string => {
@@ -3917,6 +4049,10 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 	 */
 	handlePeerReconnected(peerPubkey: string): void {
 		this.assetOpening?.reconnect(peerPubkey);
+		this.assetSplice?.reconnected(peerPubkey);
+		void this.assetSpliceConfirmation
+			?.reconnected(peerPubkey)
+			.catch((error) => this.emitContained('error', null, error.message));
 		this.finalTransport?.reconnected(peerPubkey);
 		for (const channel of this.getChannelsByPeer(peerPubkey)) {
 			if (channel.getState() === ChannelState.AWAITING_REESTABLISH) {
@@ -4278,10 +4414,20 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 
 	stopAssetOpenings(): void {
 		this.assetOpening?.destroy();
+		this.assetSplice?.destroy();
 	}
 
 	handleAssetOpenFrame(peer: string, subtype: number, raw: Buffer): void {
-		this.assetOpening?.custom(peer, subtype, raw);
+		if (subtype === BeignetCustomSubtype.ASSET_UPDATE) {
+			this.assetUpdates?.custom(peer, raw);
+			return;
+		}
+		if (
+			subtype === BeignetCustomSubtype.ASSET_SPLICE ||
+			subtype === BeignetCustomSubtype.ASSET_SPLICE_CONSENT
+		)
+			this.assetSplice?.custom(peer, subtype, raw);
+		else this.assetOpening?.custom(peer, subtype, raw);
 	}
 
 	finalOpeningPeers(): string[] {
@@ -4722,9 +4868,22 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		if (runtime?.storage.canOpenDualFundedAssets) {
 			const opening = runtime.storage.loadFinalDaemonOpening(channelIdHex);
 			if (opening?.session.assetEvidence) {
+				const kind = this.assetSpliceConfirmation?.fundingSpend(
+					channelIdHex,
+					spendingTx.getId(),
+					spendingTx.ins.map(
+						(input) =>
+							Buffer.from(input.hash).reverse().toString('hex') +
+							':' +
+							input.index
+					)
+				);
+				if (kind === 'splice') return [];
+
 				const { candidate } = opening;
 				const funding = bitcoin.Transaction.fromHex(candidate.fundingTxHex);
 				if (
+					kind === 'close' ||
 					spendingTx.ins.some(
 						(input) =>
 							input.hash.equals(funding.getHash()) &&
@@ -5607,6 +5766,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 	handleMessage(peerPubkey: string, type: number, payload: Buffer): void {
 		try {
 			if (
+				this.assetUpdates?.collect(peerPubkey, type, payload) ||
 				this.finalTransport?.collectCommitmentBatch(peerPubkey, type, payload)
 			)
 				return;
@@ -5623,6 +5783,25 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 				return;
 			}
 			if (this.assetOpening?.handle(peerPubkey, type, payload)) return;
+			if (
+				this.assetSplice &&
+				payload.length >= 32 &&
+				type === MessageType.SPLICE_LOCKED &&
+				this.hasAssetSpliceWatch(
+					payload.subarray(0, 32).toString('hex'),
+					Buffer.from(payload.subarray(32, 64)).reverse().toString('hex')
+				)
+			) {
+				void this.receiveAssetSpliceLocked(peerPubkey, payload).catch((err) =>
+					this.emitContained('error', payload.subarray(0, 32), err.message)
+				);
+				return;
+			}
+			if (
+				this.assetUpdates?.handle(peerPubkey, type, payload) ||
+				this.assetSplice?.handle(peerPubkey, type, payload)
+			)
+				return;
 			if (
 				this.finalTransport &&
 				payload.length >= 32 &&
@@ -10044,6 +10223,13 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 
 		const alignedParams: IDualFundingParams = {
 			...params,
+			...(asset &&
+				this.config.finalOpening?.storage.canSpliceDualFundedAssets && {
+					maxAcceptedHtlcs: Math.min(
+						params.maxAcceptedHtlcs,
+						auxiliaryMaxHtlcs(this.config.auxiliaryChannels?.maxHtlcs)
+					)
+				}),
 			chainHash: params.chainHash ?? this.config.chainHash,
 			channelType,
 			channelFlags,
@@ -10165,6 +10351,68 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			Math.max(546, terms.localDustLimitSatoshis, terms.remoteDustLimitSatoshis)
 		);
 	}
+	private assetUpdateHeight(id: string): number | undefined {
+		const height = this._currentBlockHeight;
+		if (height < 1 || this.finalObservedClose.has(id)) return;
+		const openingAtDepth = this.finalTransport?.hasDepth(id);
+		const store = this.config.finalOpening?.storage;
+		if (
+			!store?.canSpliceDualFundedAssets ||
+			!this.assetSpliceConfirmation?.hasChannel(id)
+		)
+			return openingAtDepth ? height : undefined;
+		const funding = store.loadAssetSpliceFundingInfo(id);
+		if (funding.reconciliation || funding.awaitingImport) return;
+		if (funding.active) {
+			const txid = funding.active.candidate.fundingTxid;
+			const mined = this.finalObservedFunding.get(id)?.get(txid)?.height;
+			if (
+				mined !== undefined &&
+				height - mined + 1 >= funding.active.minimumDepth &&
+				this.assetSpliceConfirmation.hasCurrentInclusion(id, txid, mined) &&
+				this.isAssetSpliceFundingAvailable(id, txid)
+			)
+				return height;
+		} else if (openingAtDepth) return height;
+		// A mined replacement spends its parent before the bilateral lock matures.
+		// Updates still sign every live branch and cannot advance the funding lock.
+		const eligible = funding.pending.filter(({ candidate }) => {
+			const txid = candidate.fundingTxid;
+			const mined = this.finalObservedFunding.get(id)?.get(txid)?.height;
+			return (
+				mined !== undefined &&
+				mined > 0 &&
+				mined <= height &&
+				this.assetSpliceConfirmation?.hasCurrentInclusion(id, txid, mined)
+			);
+		});
+		if (eligible.length !== 1) return;
+		const [e] = eligible;
+		return releasedAssetUpdateFunding(store, id, e.candidate, e.finalDigest)
+			? height
+			: undefined;
+	}
+	async startAssetSpliceUpdate(
+		channelId: Buffer,
+		changes: readonly AssetUpdateChange[]
+	): Promise<void> {
+		if (!this.assetUpdates || channelId.length !== 32)
+			throw Error(
+				'Asset commitment updates require the original enrolled wallet and update signer'
+			);
+		await this.assetUpdates.start(channelId.toString('hex'), changes);
+	}
+
+	async startAssetSplice(
+		id: Buffer,
+		options: IStartAssetSplice
+	): Promise<void> {
+		if (!Buffer.isBuffer(id) || id.length !== 32 || !this.assetSplice)
+			throw Error(
+				'Asset splicing requires an enrolled regtest wallet and its splice provider'
+			);
+		await this.assetSplice.start(id.toString('hex'), options);
+	}
 	startFinalSplice(id: Buffer, plan: FinalSplicePlan): void {
 		const hex = id.toString('hex');
 		const r = this.config.finalOpening;
@@ -10185,7 +10433,77 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			);
 		this.finalSplice.start(hex, plan);
 	}
-	private watchFinalSplice(id: string, ref: IFinalFundingReference): void {
+	async retryAssetSpliceLocks(channelId: string): Promise<void> {
+		await this.assetSpliceConfirmation?.retry(channelId);
+	}
+	restoreAssetSpliceWatches(channelId?: string): void {
+		this.assetSpliceConfirmation?.restore(channelId);
+	}
+	/** Expose a refresh only for a previously confirmed unspent parent while its exact scan ticket is active. */
+	beginFinalFundingObservation(
+		id: string,
+		txid: string,
+		index: number,
+		minimumDepth: number,
+		current: () => boolean
+	): (() => void) | undefined {
+		const height = this.finalObservedFunding.get(id)?.get(txid)?.height;
+		if (
+			!this.config.finalOpening?.storage.canSpliceDualFundedAssets ||
+			!height ||
+			height < 1 ||
+			this._currentBlockHeight - height + 1 < minimumDepth
+		)
+			return;
+		const key = id + '/' + txid + ':' + index;
+		this.finalFundingChecks.set(key, current);
+		return () => {
+			if (this.finalFundingChecks.get(key) === current)
+				this.finalFundingChecks.delete(key);
+		};
+	}
+	suspendAssetSpliceFunding(id: string, txid: string): void {
+		this.assetSpliceConfirmation?.suspend(id, txid);
+	}
+	isAssetSpliceFundingAvailable(id: string, txid: string): boolean {
+		const height = this.finalObservedFunding.get(id)?.get(txid)?.height;
+		return (
+			height !== undefined &&
+			height > 0 &&
+			this.assetSpliceConfirmation?.status(id, txid)?.available === true
+		);
+	}
+	hasAssetSpliceWatch(id: string, txid: string): boolean {
+		return !!this.assetSpliceConfirmation?.has(id, txid);
+	}
+	async observeAssetSpliceFunding(
+		id: string,
+		txid: string,
+		height: number | undefined,
+		prove: AssetSpliceInclusionLookup,
+		current: () => boolean
+	): Promise<void> {
+		await this.assetSpliceConfirmation?.observe(
+			id,
+			txid,
+			height,
+			prove,
+			current
+		);
+	}
+	async receiveAssetSpliceLocked(
+		peer: string,
+		payload: Buffer
+	): Promise<boolean> {
+		return (
+			(await this.assetSpliceConfirmation?.receive(peer, payload)) ?? false
+		);
+	}
+	private watchFinalSplice(
+		id: string,
+		ref: IFinalFundingReference,
+		depth?: number
+	): void {
 		const opening = this.config.finalOpening!.storage.loadFinalOpening(id)!;
 		const tx = bitcoin.Transaction.fromHex(ref.fundingTxHex),
 			output = tx.outs[ref.fundingOutputIndex];
@@ -10194,7 +10512,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			Buffer.from(id, 'hex'),
 			tx.getId(),
 			ref.fundingOutputIndex,
-			opening.minimumDepth,
+			depth ?? opening.minimumDepth,
 			output.script,
 			output.value,
 			true
@@ -10242,6 +10560,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 	}
 
 	restoreFinalOpeningBroadcasts(): void {
+		this.restoreAssetSpliceWatches();
 		for (const {
 			candidate,
 			funding,
@@ -10315,9 +10634,21 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		if (seen.size) this.finalObservedFunding.set(id, seen);
 		else this.finalObservedFunding.delete(id);
 		this.updateFinalDepth(id);
+		if (height !== undefined && height > 0) {
+			const current = (): boolean =>
+				this.assetSpliceConfirmation?.has(id, txid)
+					? this.assetSpliceConfirmation.hasCurrentInclusion(id, txid, height)
+					: this.finalTransport?.hasDepth(id) === true;
+			this.assetUpdates?.fundingObserved(id, current);
+			this.assetSplice?.fundingObserved(id, txid, current);
+		}
 		const storage = this.config.finalOpening?.storage;
-		if (height !== undefined && storage?.canUpdateFinalCommitments) {
+		if (
+			height !== undefined &&
+			(storage?.canUpdateFinalCommitments || storage?.canSpliceDualFundedAssets)
+		) {
 			const close = storage.loadFinalDaemonOpening(id)?.exitToBroadcast;
+			if (!close) return;
 			const hash = this.observedFinalExit(id);
 			if (
 				close &&
@@ -10332,6 +10663,25 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 	}
 	private observedFinalExit(id: string): Buffer | undefined {
 		const storage = this.config.finalOpening?.storage;
+		if (storage?.canSpliceDualFundedAssets) {
+			const seen = this.finalObservedFunding.get(id);
+			const exits = storage.loadFinalFundingExits(id);
+			if (exits.length < 2) return;
+			const eligible = exits.filter((exit) => {
+				const txid = Buffer.from(exit.fundingTxid).reverse().toString('hex');
+				const height = seen?.get(txid)?.height;
+				if (height === undefined || height <= 0) return false;
+				if (this.assetSpliceConfirmation?.has(id, txid)) {
+					return this.assetSpliceConfirmation.hasCurrentInclusion(id, txid);
+				}
+				return this.assetCollateral.get(id)?.confirmed === true;
+			});
+			if (eligible.length !== 1)
+				throw new Error(
+					'Asset splice close needs one confirmed unspent funding outpoint'
+				);
+			return eligible[0].fundingTxid;
+		}
 		if (!storage?.canUpdateFinalCommitments) return;
 		const seen = this.finalObservedFunding.get(id);
 		const opening = storage.loadFinalOpening(id);
@@ -10414,6 +10764,11 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			collateral.present = height !== undefined;
 			collateral.confirmed = height !== undefined && height > 0;
 		}
+		if (this.assetSpliceConfirmation?.hasChannel(id)) {
+			const summary =
+				this.config.finalOpening!.storage.loadAssetSpliceFundingInfo(id);
+			if (summary.active || summary.reconciliation) return;
+		}
 		this.finalTransport?.assetFundingAnchor(id, atDepth, height);
 	}
 
@@ -10421,6 +10776,22 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		const storage = this.config.finalOpening?.storage;
 		const c = storage?.loadFinalOpening(id);
 		if (!c) return;
+		if (
+			storage!.canSpliceDualFundedAssets &&
+			this.assetSpliceConfirmation?.hasChannel(id)
+		) {
+			const summary = storage!.loadAssetSpliceFundingInfo(id);
+			if (summary.reconciliation || summary.active || summary.awaitingImport) {
+				const funding = summary.active?.candidate.fundingTxid;
+				const ready =
+					!!funding &&
+					!summary.reconciliation &&
+					this.isAssetSpliceFundingAvailable(id, funding) &&
+					!!this.finalDepthByChannel.get(id)?.has(funding);
+				this.finalTransport?.assetSpliceSpendable(id, ready);
+				return;
+			}
+		}
 		const attempts = storage!.canUpdateFinalCommitments
 			? storage!.loadFinalSpliceAttempts(id)
 			: [];
@@ -10458,6 +10829,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		claimMargin: number,
 		offeredGrace: number
 	): void {
+		this.assetSplice?.checkHtlcDeadlines(height, claimMargin);
 		const storage = this.config.finalOpening?.storage;
 		if (!storage?.canUpdateFinalCommitments) return;
 		for (const id of new Set([
@@ -10530,9 +10902,42 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 							.filter((a) => a.adopted)
 							.slice(-1)[0]?.candidate?.funding
 					: undefined;
-				const fundingRef = adopted ?? candidate;
-				const activeTx = bitcoin.Transaction.fromHex(fundingRef.fundingTxHex);
 				const seenClose = this.finalObservedClose.get(candidate.channelId);
+				const closingTxid =
+					seenClose?.txid ??
+					(exitToBroadcast &&
+						bitcoin.Transaction.fromBuffer(exitToBroadcast).getId());
+				const asset =
+					session.assetEvidence && funding && storage.canSpliceDualFundedAssets
+						? storage.loadAssetSpliceFundingInfo(
+								candidate.channelId,
+								closingTxid
+						  )
+						: undefined;
+				if (asset?.reconciliation && !asset.closing) dataLoss = true;
+				const active = asset?.closing ?? asset?.active?.candidate;
+				const fundingRef = active?.funding ?? adopted ?? candidate;
+				const activeTx = bitcoin.Transaction.fromHex(fundingRef.fundingTxHex);
+				const latest =
+					asset && storage.assetSpliceUpdateHead(candidate.channelId).committed;
+				const current = (txid: string, index: number) =>
+					latest?.members.find(
+						(m) => m.fundingTxid === txid && m.outputIndex === index
+					);
+				const live =
+					asset?.closing?.localRecovery ??
+					current(activeTx.getId(), fundingRef.fundingOutputIndex)
+						?.localRecovery ??
+					active?.localRecovery;
+				const splicing =
+					!!asset?.pending.length &&
+					!dataLoss &&
+					!exitToBroadcast &&
+					!seenClose;
+				const pending =
+					splicing && asset!.pending.length === 1
+						? asset!.pending[0].candidate
+						: undefined;
 				const enabled =
 					!!status &&
 					!close &&
@@ -10560,6 +10965,8 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 						? ChannelState.NEGOTIATING_CLOSING
 						: close
 						? ChannelState.SHUTTING_DOWN
+						: splicing
+						? ChannelState.SPLICING
 						: enabled
 						? ChannelState.NORMAL
 						: this.finalTransport?.state(
@@ -10574,15 +10981,42 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 					fundingOutputIndex: fundingRef.fundingOutputIndex,
 					localBalanceMsat:
 						status?.localBalanceMsat ??
-						(dataLoss ? 0n : BigInt(candidate.localContributionSats) * 1000n),
+						(dataLoss
+							? 0n
+							: live
+							? BigInt(live.localBalanceMsat)
+							: BigInt(candidate.localContributionSats) * 1000n),
 					remoteBalanceMsat:
 						status?.remoteBalanceMsat ??
-						(dataLoss ? 0n : BigInt(candidate.remoteContributionSats) * 1000n),
+						(dataLoss
+							? 0n
+							: live
+							? BigInt(live.remoteBalanceMsat)
+							: BigInt(candidate.remoteContributionSats) * 1000n),
 					fundingSatoshis: BigInt(
 						activeTx.outs[fundingRef.fundingOutputIndex].value
 					),
 					...(alias && { shortChannelId: alias.toString('hex') }),
-					...(status && { htlcCount: status.htlcs.length }),
+					...(splicing && { payThroughSplice: false }),
+					...(pending && {
+						pendingSpliceTxid: pending.fundingTxid,
+						pendingSpliceLocalBalanceMsat: BigInt(
+							(current(pending.fundingTxid, pending.outputIndex) ?? pending)
+								.localRecovery.localBalanceMsat
+						)
+					}),
+					...(asset?.previousFundingTxids.length && {
+						previousFundingTxids: asset.previousFundingTxids,
+						lockedFundingTxids: [
+							...asset.previousFundingTxids,
+							asset.active!.candidate.fundingTxid
+						]
+					}),
+					...(status
+						? { htlcCount: status.htlcs.length }
+						: asset && !dataLoss
+						? { htlcCount: live?.htlcs.length ?? 0 }
+						: {}),
 					spendableOutboundMsat:
 						enabled && status && !status.pending
 							? status.spendableOutboundMsat
@@ -10909,8 +11343,15 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 					.htlcMinimumMsat,
 				toSelfDelay: (this.config.localConfig || DEFAULT_CHANNEL_CONFIG)
 					.toSelfDelay,
-				maxAcceptedHtlcs: (this.config.localConfig || DEFAULT_CHANNEL_CONFIG)
-					.maxAcceptedHtlcs,
+				maxAcceptedHtlcs:
+					asset && this.config.finalOpening?.storage.canSpliceDualFundedAssets
+						? Math.min(
+								(this.config.localConfig || DEFAULT_CHANNEL_CONFIG)
+									.maxAcceptedHtlcs,
+								auxiliaryMaxHtlcs(this.config.auxiliaryChannels?.maxHtlcs)
+						  )
+						: (this.config.localConfig || DEFAULT_CHANNEL_CONFIG)
+								.maxAcceptedHtlcs,
 				locktime: msg.locktime,
 				localBasepoints: chKeys.basepoints,
 				localPerCommitmentSeed: chKeys.perCommitmentSeed,

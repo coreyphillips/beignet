@@ -5,6 +5,7 @@ import { sha256 } from '../crypto/provider';
 
 const scopes = [
 	'splice',
+	'asset-splice',
 	'simple-close',
 	'output-claim',
 	'htlc-timeout'

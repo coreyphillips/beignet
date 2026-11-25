@@ -1,7 +1,6 @@
 import { Transaction } from 'bitcoinjs-lib';
 import type { BIP32Interface } from 'bip32';
-import { randomBytes } from '../crypto/provider';
-import { getPublicKey, isValidPublicKey } from '../crypto/ecdh';
+import { isValidPublicKey } from '../crypto/ecdh';
 import { deriveChannelKeys, deriveLightningKeys } from '../keys/wallet-keys';
 import { MessageType as M } from '../message/types';
 import { encodeStfuMessage, decodeStfuMessage } from '../message/stfu';
@@ -29,6 +28,7 @@ import {
 import {
 	lastSpliceWire,
 	spliceConstruction,
+	freshSplicePublicNonce,
 	spliceTerms,
 	localSpliceContributions
 } from './final-splice-transcript';
@@ -63,13 +63,6 @@ export interface ISpliceSignatureRequest {
 	candidate: IFinalSpliceCandidate;
 	intent: IFinalSpliceIntent;
 }
-function freshPublicNonce(): Buffer {
-	return Buffer.concat([
-		getPublicKey(randomBytes(32)),
-		getPublicKey(randomBytes(32))
-	]);
-}
-
 export class FinalSpliceSession {
 	private readonly id: Buffer;
 	constructor(
@@ -201,8 +194,11 @@ export class FinalSpliceSession {
 		if (!c)
 			return encodeTxCompleteMessage({
 				channelId: this.id,
-				commitNonces: { current: freshPublicNonce(), next: freshPublicNonce() },
-				fundingInputNonce: freshPublicNonce()
+				commitNonces: {
+					current: freshSplicePublicNonce(),
+					next: freshSplicePublicNonce()
+				},
+				fundingInputNonce: freshSplicePublicNonce()
 			});
 		const { context, key, oldKey } = this.refs(a, c, t);
 		const snapshot = this.snapshot;
