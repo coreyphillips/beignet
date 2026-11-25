@@ -10490,6 +10490,16 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 	hasAssetSpliceWatch(id: string, txid: string): boolean {
 		return !!this.assetSpliceConfirmation?.has(id, txid);
 	}
+	isAssetSpliceSuccessor(
+		id: string,
+		txid: string,
+		parentOutpoint: string
+	): boolean {
+		return (
+			this.assetSpliceConfirmation?.fundingSpend(id, txid, [parentOutpoint]) ===
+			'splice'
+		);
+	}
 	async observeAssetSpliceFunding(
 		id: string,
 		txid: string,

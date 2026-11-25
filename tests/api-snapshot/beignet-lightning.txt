@@ -1013,6 +1013,7 @@ method chain.IChainWatcherChannelManager.handleNewBlock(blockHeight: number): vo
 method chain.IChainWatcherChannelManager.handleOutputSpent(txid: string, outputIndex: number, spendingTx: bitcoinjs-lib#Transaction, blockHeight: number): void
 method chain.IChainWatcherChannelManager.handleOutputUnspent(txid: string, outputIndex: number): void
 method chain.IChainWatcherChannelManager.hasAssetSpliceWatch?(id: string, txid: string): boolean
+method chain.IChainWatcherChannelManager.isAssetSpliceSuccessor?(id: string, txid: string, parentOutpoint: string): boolean
 method chain.IChainWatcherChannelManager.listChannels(): channel.Channel[]
 method chain.IChainWatcherChannelManager.observeAssetFundingBroadcast?(txid: string, raw: Buffer): void
 method chain.IChainWatcherChannelManager.observeAssetOpeningAnchor?(id: string, atDepth: boolean, observed?: bitcoinjs-lib#Transaction, height?: number): void
@@ -1761,6 +1762,7 @@ method channel.ChannelManager.initiateShutdown(channelId: Buffer, scriptPubkey: 
 method channel.ChannelManager.initiateSplice(channelId: Buffer, relativeSatoshis: bigint, fundingFeeratePerkw: number, locktime?: number): channel.ChannelResult
 method channel.ChannelManager.isAnnouncementHeld(channelId: Buffer): boolean
 method channel.ChannelManager.isAssetSpliceFundingAvailable(id: string, txid: string): boolean
+method channel.ChannelManager.isAssetSpliceSuccessor(id: string, txid: string, parentOutpoint: string): boolean
 method channel.ChannelManager.isChannelRestoredFromDisk(channelId: Buffer): boolean
 method channel.ChannelManager.isJitClient(pubkeyHex: string): boolean
 method channel.ChannelManager.isTrustedPeer(pubkeyHex: string): boolean

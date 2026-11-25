@@ -389,6 +389,11 @@ export interface IChainWatcherChannelManager {
 		confirmed: boolean
 	): void;
 	hasAssetSpliceWatch?(id: string, txid: string): boolean;
+	isAssetSpliceSuccessor?(
+		id: string,
+		txid: string,
+		parentOutpoint: string
+	): boolean;
 	beginFinalFundingObservation?(
 		id: string,
 		txid: string,
@@ -2580,6 +2585,18 @@ export class ChainWatcher extends EventEmitter {
 			watched.minimumDepth,
 			() => current() && this.tipObservation === tipObservation
 		);
+		let spendScan: Promise<void> | undefined;
+		const startSpendScan = (): void => {
+			spendScan = this.checkFundingSpent(watched, generation, key).catch(
+				(err) => {
+					if (
+						this.isCurrentGeneration(generation) &&
+						this.watchedFundings.get(key) === watched
+					)
+						this.emitError(err);
+				}
+			);
+		};
 		try {
 			await this.readFinalFundingDepth(
 				key,
@@ -2587,10 +2604,12 @@ export class ChainWatcher extends EventEmitter {
 				generation,
 				tipObservation,
 				current,
+				startSpendScan,
 				finish
 			);
 		} finally {
 			finish?.();
+			await spendScan;
 		}
 	}
 	private async readFinalFundingDepth(
@@ -2599,6 +2618,7 @@ export class ChainWatcher extends EventEmitter {
 		generation: number,
 		tipObservation: number,
 		current: () => boolean,
+		startSpendScan: () => void,
 		finish?: () => void
 	): Promise<void> {
 		let coins;
@@ -2635,20 +2655,24 @@ export class ChainWatcher extends EventEmitter {
 			this.currentBlockHeight - funding.height + 1 < watched.minimumDepth
 		)
 			finish?.();
+		const id = watched.channelId.toString('hex');
 		if (funding) {
 			// This UTXO also supersedes any spend lookup still reading an older history.
 			const outpoint = watched.txid + ':' + watched.outputIndex;
-			this.recordScanCompleted(key, outpoint, this.beginSpendScan(key));
+			this.recordScanCompleted(id, outpoint, this.beginSpendScan(id));
 		}
-		const id = watched.channelId.toString('hex');
 		const splice = this.channelManager.hasAssetSpliceWatch?.(id, watched.txid);
-		if (splice && !funding)
+		if (splice && !funding) {
 			this.channelManager.observeFinalFunding?.(
 				id,
 				watched.txid,
 				undefined,
 				false
 			);
+			// A close can have a mature claim while the historical funding proof
+			// is still running. Each check retains its own observation ticket.
+			startSpendScan();
+		}
 		const asset = !splice && this.channelManager.assetOpeningAnchor?.(id);
 		if ((asset || splice) && this.tipGeneration === generation) {
 			let height = funding?.height;
@@ -2699,7 +2723,7 @@ export class ChainWatcher extends EventEmitter {
 			if (splice) {
 				const prove = this.backend.getAssetSpliceInclusion;
 				if (prove) {
-					const fresh = () =>
+					const fresh = (): boolean =>
 						current() && tipObservation === this.tipObservation;
 					try {
 						await this.channelManager.observeAssetSpliceFunding?.(
@@ -2710,7 +2734,7 @@ export class ChainWatcher extends EventEmitter {
 								prove.call(this.backend, watched.txid, h, recovery),
 							fresh,
 							mempoolCandidate
-								? (parent, recovery) =>
+								? (parent, recovery): Promise<boolean> =>
 										this.proveMempoolSpliceParent(
 											watched.txid,
 											parent,
@@ -2772,7 +2796,8 @@ export class ChainWatcher extends EventEmitter {
 			parentAtDepth
 		);
 		this.setFinalFundingDepth(watched, funding?.height ?? 0);
-		if (!funding) await this.checkFundingSpent(watched, generation, key);
+		if (!funding && !splice)
+			await this.checkFundingSpent(watched, generation, key);
 	}
 
 	/** A known mempool splice can hide its confirmed parent from listunspent. */
@@ -3380,7 +3405,7 @@ export class ChainWatcher extends EventEmitter {
 		// for "this is a splice", so the channel gets marked closed on chain
 		// while it is very much alive. The leg vouches for the splice on behalf
 		// of every watch of the same outpoint.
-		const expectedSpender = this.expectedSpenderFor(watched);
+		let expectedSpender = this.expectedSpenderFor(watched);
 
 		for (const entry of history) {
 			if (entry.txid === outpoint.txid) continue;
@@ -3415,6 +3440,15 @@ export class ChainWatcher extends EventEmitter {
 				);
 			});
 			if (!spendsOurs) continue;
+			if (
+				watched.finalFundingValueSat !== undefined &&
+				this.channelManager.isAssetSpliceSuccessor?.(idHex, entry.txid, outKey)
+			) {
+				// A known splice spends this outpoint without settling the channel.
+				// A sibling funding watch can still be recovering its closing payout.
+				expectedSpender = entry.txid;
+				continue;
+			}
 
 			// Use 0 for mempool txs (Electrum returns height <= 0 for unconfirmed)
 			const height = entry.height > 0 ? entry.height : 0;
