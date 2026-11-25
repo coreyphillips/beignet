@@ -442,6 +442,46 @@ describe('Phase 4: Chain Watcher', () => {
 			expect(verdicts.slice(-1)).to.deep.equal([false]);
 		});
 
+		it('clears a spent splice outpoint before revalidating its historical inclusion', async () => {
+			const id = crypto.randomBytes(32),
+				txid = 'a2'.repeat(32);
+			const script = Buffer.from('5120' + '2a'.repeat(32), 'hex');
+			const coin = { txid, outputIndex: 1, valueSat: 50000, height: 70 };
+			let spent = false,
+				liveHeight: number | undefined;
+			const history: (number | undefined)[] = [];
+			Object.assign(backend, {
+				listUnspent: async () => (spent ? [] : [coin]),
+				getAssetSpliceInclusion: async () => ({
+					txid,
+					blockHash: 'ba'.repeat(32),
+					confirmations: 3
+				})
+			});
+			Object.assign(channelManager, {
+				hasAssetSpliceWatch: () => true,
+				observeAssetSpliceFunding: async () => {
+					history.push(liveHeight);
+				},
+				observeFinalFunding: (
+					_id: string,
+					_txid: string,
+					height: number | undefined
+				) => {
+					liveHeight = height;
+				}
+			});
+			backend.setHistory(computeScriptHash(script), [{ txid, height: 70 }]);
+			backend.simulateNewBlock(72);
+			await watcher.watchFinalFundingOutput(id, txid, 1, 3, script, 50000);
+			expect(liveHeight).to.equal(70);
+			spent = true;
+			backend.simulateScriptHashChange(computeScriptHash(script));
+			await new Promise<void>((done) => setImmediate(done));
+			expect(history.length).to.be.greaterThan(1);
+			expect(history.at(-1)).to.equal(undefined);
+		});
+
 		it('releases an asset payout callback only for the mature exact outpoint on a current tip', async () => {
 			watcher.stop();
 			let releases = 0;

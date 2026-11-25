@@ -1,3 +1,4 @@
+import { assetSpliceReestablish } from './asset-splice-reestablish';
 import { encodeSpliceLockedMessage } from '../message/splice';
 import { Transaction } from 'bitcoinjs-lib';
 import { isDeepStrictEqual } from 'util';
@@ -15,6 +16,13 @@ import {
 	type AssetWalletJournalEvent,
 	type AssetWalletInputEvent
 } from './asset-splice-wallet-inputs';
+import { AssetSpliceUpdateBatch } from '../channel/asset-splice-update-batch';
+import type { AssetUpdateChange } from '../channel/asset-splice-update-provider';
+import {
+	assetUpdateFundingMembers,
+	assetSpliceUpdateHead,
+	assetUpdateHistory
+} from './asset-update-history';
 import { releasedAssetSplice } from './asset-splice-release-replay';
 import { AssetSpliceSignatureRound } from '../channel/asset-splice-signature-round';
 import type {
@@ -494,6 +502,35 @@ function preservesOpeningFields<T extends object>(older: T, newer: T): boolean {
 }
 
 export class SqliteStorage implements IStorageBackend {
+	assetSpliceReconnect(id: string, root: BIP32Interface, reportLock: boolean) {
+		const authority = this.requireOpeningAuthority();
+		this.assertAssetSpliceAuthority(authority);
+		return assetSpliceReestablish(this, authority, id, root, reportLock);
+	}
+
+	assetSpliceUpdateHead(id: string) {
+		this.assertAssetSpliceAuthority(this.requireOpeningAuthority());
+		return assetSpliceUpdateHead(this, id);
+	}
+
+	assetSpliceUpdateBatch(
+		id: string,
+		root: BIP32Interface,
+		height: bigint,
+		changes: readonly AssetUpdateChange[],
+		currentHeight: () => number | undefined
+	) {
+		return new AssetSpliceUpdateBatch(
+			this,
+			this.requireOpeningAuthority(),
+			id,
+			root,
+			height,
+			changes,
+			currentHeight
+		);
+	}
+
 	releasedAssetSplice(channelId: string, attempt: string) {
 		this.assertAssetSpliceAuthority(this.requireOpeningAuthority());
 		return releasedAssetSplice(this, channelId, attempt);
@@ -587,8 +624,10 @@ export class SqliteStorage implements IStorageBackend {
 		);
 		const info = assetWalletFundingInfo(records, exits, channelId, base);
 		const closing = closingTxid
-			? exits
-					.flatMap((e) => [e.parent, e.candidate])
+			? [...assetUpdateHistory(this, channelId).states.values()]
+					.reverse()
+					.flatMap((s) => s.members)
+					.concat(exits.flatMap((e) => [e.parent, e.candidate]))
 					.find(
 						(b) =>
 							Transaction.fromHex(b.localCommitment).getId() === closingTxid ||
@@ -611,6 +650,11 @@ export class SqliteStorage implements IStorageBackend {
 		);
 	}
 
+	assertAssetSpliceCanStart(channelId: string): void {
+		this.assertAssetSpliceAuthority(this.requireOpeningAuthority());
+		if (this.assetSpliceUpdateHead(channelId).inProgress)
+			throw new Error('An asset commitment update is still in progress');
+	}
 	loadAdoptedAssetSpliceReceipt(channelId: string) {
 		return requireAssetWalletParent(this.loadAssetSpliceFundingInfo(channelId));
 	}
@@ -1878,6 +1922,34 @@ export class SqliteStorage implements IStorageBackend {
 		return hex === undefined ? null : Buffer.from(hex, 'hex');
 	}
 
+	/** The share received for our original holder transaction. */
+	loadReceivedOpeningCommitment(channelId: string): Buffer | null {
+		const hex = this.finalOpeningRecord(channelId)?.nonces.signing?.peer;
+		return hex === undefined ? null : Buffer.from(hex, 'hex');
+	}
+
+	/** Recognize an exact inbound splice wire if adoption or reestablishment crossed its retransmission. */
+	receivedAssetSpliceWire(
+		channelId: string,
+		type: MessageType,
+		payload: Buffer
+	): boolean {
+		const hex = payload.toString('hex');
+		return this.readAssetSpliceJournal<{
+			kind: string;
+			local?: boolean;
+			type?: MessageType;
+			payload?: string;
+		}>(channelId).records.some(
+			(r) =>
+				(r.kind === 'asset-splice-signature' ||
+					r.kind === 'construction-frame') &&
+				r.local === false &&
+				r.type === type &&
+				r.payload === hex
+		);
+	}
+
 	loadFinalOpeningExit(channelId: string): Buffer | null {
 		this.requireCurrentFinalDevice();
 		const r = this.finalOpeningRecord(channelId);
@@ -1889,6 +1961,13 @@ export class SqliteStorage implements IStorageBackend {
 	private retainedAssetFundingExits(record: IFinalOpeningRecord): string[] {
 		if (this.finalGeneration !== 4 || !record.nonces.session?.assetEvidence)
 			return [];
+		const latest = assetUpdateHistory(this, record.candidate.channelId).latest;
+		if (latest)
+			return assetUpdateFundingMembers(
+				this,
+				record.candidate.channelId,
+				latest
+			).map((b) => b.localCommitment);
 		const { channelId, fundingTxHex, fundingOutputIndex } = record.candidate;
 		const { records } = this.finalJournal().read<AssetSpliceExitEvent>(
 			'asset-splice',

@@ -189,6 +189,32 @@ function prepareFinalSpliceFunding(
 	);
 	let receipt: ReturnType<typeof loadAssetSpliceExitProofs> | undefined;
 	let evidenceHash: Buffer | undefined;
+	const assertCurrentAssetState = () => {
+		if (!proofContext || !receipt) return;
+		const channel = id.toString('hex'),
+			head = proofContext.store.assetSpliceUpdateHead(channel);
+		if (
+			head.inProgress ||
+			(head.committed?.height ?? '0') !== receipt.stateNumber ||
+			head.committed?.digest !== receipt.priorDigest
+		)
+			throw new Error(
+				'Asset funding requires the current irrevocable update state'
+			);
+		if (head.committed) {
+			const elected =
+				proofContext.store.loadAdoptedAssetSpliceReceipt(channel)?.candidate
+					.funding ?? proofContext.store.loadFinalOpening(channel);
+			if (
+				!elected ||
+				Transaction.fromHex(elected.fundingTxHex).getId() !==
+					receipt.parent.fundingTxid ||
+				elected.fundingOutputIndex !== receipt.parent.outputIndex
+			)
+				throw new Error('Updated splice parent is no longer elected');
+		}
+	};
+
 	if (proofContext && roots) {
 		const { store, finalDigest, stateNumber, parentRemote, candidateRemote } =
 			proofContext;
@@ -200,6 +226,7 @@ function prepareFinalSpliceFunding(
 			id.toString('hex'),
 			finalDigest.toString('hex')
 		);
+		assertCurrentAssetState();
 		if (String(stateNumber) !== receipt.stateNumber)
 			throw new Error('Asset proof state differs from commitment state');
 		for (const [name, funding, index, remote] of [
@@ -277,6 +304,7 @@ function prepareFinalSpliceFunding(
 	return {
 		request,
 		finish(witnesses: Buffer[][]): Buffer {
+			assertCurrentAssetState();
 			if (proofContext && authority.exitRequest(id.toString('hex')))
 				throw new Error('Channel closed while authorizing asset funding');
 			signed = authority.claim(slot, transcript);

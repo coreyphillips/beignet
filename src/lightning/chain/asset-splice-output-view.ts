@@ -1,3 +1,4 @@
+import { assetUpdateHistory } from '../storage/asset-update-history';
 import { Transaction } from 'bitcoinjs-lib';
 import type { IAssetOpeningPayout } from '../channel/asset-opening-provider';
 import { buildAssetOpeningCommitment } from '../channel/final-opening-commitment';
@@ -18,6 +19,59 @@ export function matchedAssetPayoutViews(
 		session = storage.loadFinalOpeningSession(id);
 	if (!opening || !session?.assetEvidence) return [];
 	const evidence = session.assetEvidence;
+	const history = storage.canSpliceDualFundedAssets
+		? assetUpdateHistory(storage, id)
+		: undefined;
+	for (const updated of [...(history?.states.values() ?? [])].reverse()) {
+		for (const b of updated.members) {
+			if (
+				parent.ins.length !== 1 ||
+				parent.ins[0].index !== b.outputIndex ||
+				!parent.ins[0].hash.equals(Buffer.from(b.fundingTxid, 'hex').reverse())
+			)
+				continue;
+			for (const holder of ['local', 'remote'] as const) {
+				const local = holder === 'local',
+					commit = Transaction.fromHex(
+						local ? b.localCommitment : b.remoteCommitment
+					);
+				if (commit.getId() !== parent.getId()) continue;
+				if (
+					history?.stages.has(
+						BigInt(updated.height) +
+							1n +
+							'/' +
+							(local ? 'local-revoke' : 'peer-revoke')
+					)
+				)
+					return [];
+				return [
+					{
+						...spliceRecoveryView(
+							opening,
+							{ ...session.terms, commitmentFeeratePerKw: updated.feerate },
+							evidence.fundingRoot,
+							b,
+							holder,
+							updated.height
+						),
+						holder,
+						state: BigInt(updated.height),
+						fundingProofs: b.fundingProofs,
+						exitProofs: local ? b.localProofs : b.remoteProofs,
+						splice: undefined as IAssetOpeningPayout['splice'],
+						update: {
+							roundDigest: updated.digest,
+							stateNumber: updated.height,
+							fundingTxid: b.fundingTxid,
+							fundingOutputIndex: b.outputIndex
+						}
+					}
+				];
+			}
+		}
+	}
+
 	const retained = storage.canSpliceDualFundedAssets
 		? publishableAssetSpliceEvidence(
 				storage.readAssetSpliceJournal<AssetSpliceExitEvent>(id).records,
@@ -25,8 +79,16 @@ export function matchedAssetPayoutViews(
 		  )
 		: [];
 	const holders = ['local', 'remote'] as const;
+	const revoked = (height: string, holder: 'local' | 'remote') =>
+		history?.stages.has(
+			BigInt(height) +
+				1n +
+				'/' +
+				(holder === 'local' ? 'local-revoke' : 'peer-revoke')
+		);
 	if (!retained.length)
 		return holders.flatMap((holder) => {
+			if (revoked('0', holder)) return [];
 			const assets = assetOpeningLeaves(evidence, holder);
 			const view = buildAssetOpeningCommitment(
 				opening,
@@ -50,7 +112,8 @@ export function matchedAssetPayoutViews(
 							state: 0n,
 							fundingProofs: evidence.fundingProofs,
 							exitProofs: evidence[holder].proofs,
-							splice: undefined as IAssetOpeningPayout['splice']
+							splice: undefined as IAssetOpeningPayout['splice'],
+							update: undefined as IAssetOpeningPayout['update']
 						}
 				  ]
 				: [];
@@ -69,10 +132,19 @@ export function matchedAssetPayoutViews(
 				const tx = Transaction.fromHex(
 					local ? b.localCommitment : b.remoteCommitment
 				);
-				if (tx.getId() !== parent.getId()) return [];
+				if (tx.getId() !== parent.getId() || revoked(entry.stateNumber, holder))
+					return [];
+				const state =
+					entry.priorDigest && history?.states.get(BigInt(entry.stateNumber));
+				if (entry.priorDigest && (!state || state.digest !== entry.priorDigest))
+					throw Error(
+						'Historical asset splice is missing its signed predecessor'
+					);
 				const built = spliceRecoveryView(
 					opening,
-					session.terms,
+					state
+						? { ...session.terms, commitmentFeeratePerKw: state.feerate }
+						: session.terms,
 					evidence.fundingRoot,
 					b,
 					holder,
@@ -85,6 +157,7 @@ export function matchedAssetPayoutViews(
 						state: BigInt(entry.stateNumber),
 						fundingProofs: b.fundingProofs,
 						exitProofs: local ? b.localProofs : b.remoteProofs,
+						update: undefined as IAssetOpeningPayout['update'],
 						splice: {
 							finalDigest: entry.finalDigest,
 							stateNumber: entry.stateNumber,

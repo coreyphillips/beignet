@@ -64,6 +64,12 @@ export interface IAssetOpenExit {
 }
 
 export interface IAssetOpeningPayout {
+	update?: {
+		roundDigest: string;
+		stateNumber: string;
+		fundingTxid: string;
+		fundingOutputIndex: number;
+	};
 	/** Present when the observed commitment matches a retained splice generation. */
 	splice?: {
 		finalDigest: string;
@@ -86,7 +92,8 @@ export interface IAssetOpeningPayout {
 
 /** Explicit host support for private dual-funded asset openings on regtest. */
 export interface IAuxiliaryDualFunding
-	extends Partial<import('./asset-splice-transport').AssetSpliceHost> {
+	extends Partial<import('./asset-splice-transport').AssetSpliceHost>,
+		Partial<import('./asset-splice-update-provider').IAssetSpliceUpdateHost> {
 	version: 1;
 	/** Synchronous local policy. An absent answer declines before a key is allocated. */
 	contribution(

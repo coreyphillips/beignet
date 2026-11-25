@@ -166,7 +166,8 @@ export class AssetSpliceConfirmationCoordinator {
 					);
 					if (!sample.current())
 						throw new Error('Asset splice chain observation expired');
-				}
+				},
+				() => !this.store.assetSpliceUpdateHead(id).inProgress
 			)
 		};
 		this.entries.set(k, entry);
@@ -304,7 +305,11 @@ export class AssetSpliceConfirmationCoordinator {
 		}
 		const wire = e.lock.outboundLock();
 		if (!wire || !e.verified) return;
-		if (h.adopted && e.imported !== local.blockHash) {
+		if (
+			h.adopted &&
+			e.imported !== local.blockHash &&
+			!this.store.assetSpliceUpdateHead(e.terms.channelId).inProgress
+		) {
 			const active = e.importing;
 			if (active) {
 				await active.pending;
@@ -393,11 +398,15 @@ export class AssetSpliceConfirmationCoordinator {
 			throw new Error('Verified chain transaction differs from splice funding');
 		e.mined =
 			Number.isSafeInteger(anchor.confirmations) && anchor.confirmations > 0;
-		await e.lock.observe(anchor);
-		if (ticket !== e.ticket || !current()) return;
-		if (e.lock.outboundLock())
-			e.verified = { blockHash: anchor.blockHash, height: e.sample.height };
-		await this.settled(e, ticket);
+		try {
+			await e.lock.observe(anchor);
+			if (ticket !== e.ticket || !current()) return;
+			if (e.lock.outboundLock())
+				e.verified = { blockHash: anchor.blockHash, height: e.sample.height };
+			await this.settled(e, ticket);
+		} catch (error) {
+			if (ticket === e.ticket && current()) throw error;
+		}
 	}
 	async receive(peer: string, raw: Buffer): Promise<boolean> {
 		if (raw.length !== 64) return false;
@@ -414,6 +423,22 @@ export class AssetSpliceConfirmationCoordinator {
 		if (sample?.current())
 			await this.observe(id, txid, sample.height, sample.prove, sample.current);
 		return true;
+	}
+	/** Complete a crossing lock only after the update batch and its revocations are durable. */
+	async retry(id: string): Promise<void> {
+		if (this.store.assetSpliceUpdateHead(id).inProgress) return;
+		for (const e of this.entries.values()) {
+			if (e.terms.channelId !== id || !e.lock.state().peerLocked) continue;
+			const sample = e.sample;
+			if (sample?.current())
+				await this.observe(
+					id,
+					e.terms.txid,
+					sample.height,
+					sample.prove,
+					sample.current
+				);
+		}
 	}
 	async reconnected(peer: string): Promise<void> {
 		for (const e of this.entries.values())
@@ -432,6 +457,7 @@ export class AssetSpliceConfirmationCoordinator {
 	}
 	disconnected(peer: string): void {
 		// The independent chain watch still establishes which funding can be spent offline.
-		for (const e of this.entries.values()) if (e.peer === peer) e.sent = undefined;
+		for (const e of this.entries.values())
+			if (e.peer === peer) e.sent = undefined;
 	}
 }

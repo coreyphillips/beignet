@@ -1,3 +1,7 @@
+import {
+	assetUpdateHistory,
+	assetUpdateFundingMembers
+} from './asset-update-history';
 import { Transaction } from 'bitcoinjs-lib';
 import { isDeepStrictEqual } from 'util';
 import {
@@ -36,6 +40,7 @@ export interface IAssetSpliceExitBranch {
 }
 
 export interface IAssetSpliceExitProofs {
+	priorDigest?: string;
 	minimumDepth: number;
 	channelId: string;
 	finalDigest: string;
@@ -143,12 +148,17 @@ function canonical(
 		candidate = branch(v.candidate);
 	if (positiveDepth(v.minimumDepth) !== candidate.minimumDepth)
 		throw new Error('Candidate splice depth differs from its approved receipt');
+	if (v.stateNumber === '0' && v.priorDigest !== undefined)
+		throw new Error('Unexpected opening update digest');
 	if (parent.fundingTxid === candidate.fundingTxid)
 		throw new Error(
 			'Retained splice generations must use distinct funding transactions'
 		);
 	return {
 		minimumDepth: v.minimumDepth,
+		...(v.stateNumber === '0'
+			? {}
+			: { priorDigest: hex(v.priorDigest ?? '', 32, true) }),
 		channelId: id,
 		finalDigest: hex(v.finalDigest, 32, true),
 		stateNumber: v.stateNumber,
@@ -166,6 +176,26 @@ function verifyRecovery(
 		session = store.loadFinalOpeningSession(id);
 	if (!opening || !session?.assetEvidence)
 		throw new Error('Missing enrolled asset opening');
+	let terms = session.terms;
+	if (stateNumber !== '0') {
+		const history = assetUpdateHistory(store, id),
+			state = history.states.get(BigInt(stateNumber));
+		if (
+			!state ||
+			state.digest !== evidence.priorDigest ||
+			!history.stages.has(stateNumber + '/local-revoke') ||
+			!history.stages.has(stateNumber + '/peer-revoke')
+		)
+			throw new Error('Asset splice needs its irrevocable signed predecessor');
+		const previous = assetUpdateFundingMembers(store, id, state).find(
+			(m) =>
+				m.fundingTxid === parent.fundingTxid &&
+				m.outputIndex === parent.outputIndex
+		);
+		if (!previous || !isDeepStrictEqual(branch(previous), parent))
+			throw new Error('Asset splice parent differs from signed predecessor');
+		terms = { ...terms, commitmentFeeratePerKw: state.feerate };
+	}
 	const incoming = Transaction.fromHex(
 		candidate.funding.fundingTxHex
 	).ins.filter(
@@ -179,7 +209,7 @@ function verifyRecovery(
 		for (const holder of ['local', 'remote'] as const)
 			spliceRecoveryView(
 				opening,
-				session.terms,
+				terms,
 				session.assetEvidence.fundingRoot,
 				b,
 				holder,

@@ -32,3 +32,12 @@ export * from './auxiliary-guard';
 export * from './auxiliary-close';
 export * from './auxiliary-api';
 export * from './auxiliary-forward';
+
+export type {
+	AssetUpdateChange,
+	IAssetSpliceUpdateHost,
+	IAssetUpdateRound,
+	IAssetUpdateMemberEvidence,
+	IAssetUpdateSignedMember,
+	IAssetUpdateHtlcSigner
+} from './asset-splice-update-provider';

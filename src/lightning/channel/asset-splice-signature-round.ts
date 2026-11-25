@@ -1,7 +1,25 @@
+import { deserialize, serialize } from 'v8';
+import {
+	assetUpdateFundingMembers,
+	assetUpdateHistory
+} from '../storage/asset-update-history';
+import type {
+	IAssetUpdateHtlcSigner,
+	IAssetUpdateHtlc,
+	IAssetUpdateHolderView
+} from './asset-splice-update-provider';
+import { readUpdateHtlc } from './asset-splice-update-ledger';
+import {
+	decodeCommitmentSignedMessage,
+	encodeCommitmentSignedMessage
+} from '../message/channel-commitment';
+import { derivePrivateKey } from '../keys/derivation';
+import { signTaprootHtlcLeaf } from '../script/htlc-taproot';
 import type { BIP32Interface } from 'bip32';
 import { Transaction } from 'bitcoinjs-lib';
 import { isDeepStrictEqual } from 'util';
 import { deriveChannelKeys, deriveLightningKeys } from '../keys/wallet-keys';
+import { ASSET_OPEN_OBJECT_LIMIT } from '../message/asset-open';
 import { encodeTxCompleteMessage } from '../message/interactive-tx';
 import { MessageType as M } from '../message/types';
 import { sha256 } from '../crypto/provider';
@@ -30,12 +48,7 @@ import {
 	type verifyAssetSpliceCandidate
 } from './asset-splice-manifest';
 import { validateFinalSpliceReserves } from './final-commitment-reserve';
-import {
-	buildAssetSpliceCommitment,
-	type IFinalBalances,
-	type IFinalCommitmentView,
-	type IFinalCommitmentHtlc
-} from './final-opening-commitment';
+import { buildAssetSpliceCommitment } from './final-opening-commitment';
 import {
 	buildFinalSpliceCandidate,
 	type IFinalFundingReference,
@@ -53,28 +66,30 @@ type Holder = 'local' | 'remote';
 type Branch = 'parent' | 'candidate';
 type Both<T> = Record<Branch, Record<Holder, T>>;
 type Verified = ReturnType<typeof verifyAssetSpliceCandidate>;
-export type IAssetSpliceHostHolder = Pick<
-	IFinalCommitmentView,
-	'tx' | 'outputMap' | 'toSelfDelay'
-> &
-	IFinalBalances & {
-		point: Buffer;
-		keys: Pick<
-			IFinalCommitmentView['keys'],
-			'revocationPubkey' | 'localDelayedPubkey'
-		>;
-		htlcs: readonly IFinalCommitmentHtlc[];
-	};
+export type IAssetSpliceHostHolder = IAssetUpdateHolderView;
+export interface IAssetSpliceExitEvidence extends IAssetOpenExit {
+	htlcs?: readonly {
+		id: string;
+		offeredBy: 'local' | 'peer';
+		output: NonNullable<IAssetOpenExit['toLocal']>;
+		secondLevel: NonNullable<IAssetOpenExit['toLocal']>;
+	}[];
+	htlcSignatures?: string;
+}
 export interface IAssetSpliceHostExitViews {
+	terms: import('./final-opening-commitment').IFinalOpeningTerms;
+	originalInitiator: boolean;
 	finalDigest: Buffer;
 	layoutDigest: Buffer;
 	paymentBasepoints: AssetOpenPair<Buffer>;
 	fundingFeeratePerkw: number;
 	parent: Record<Holder, IAssetSpliceHostHolder> & {
 		funding: IFinalFundingReference;
+		fundingRoot: Buffer;
 	};
 	candidate: Record<Holder, IAssetSpliceHostHolder> & {
 		funding: IFinalFundingReference;
+		fundingRoot: Buffer;
 	};
 }
 export interface IAssetSpliceSigningHost {
@@ -82,11 +97,18 @@ export interface IAssetSpliceSigningHost {
 		ctx: IAssetSpliceContext,
 		views: IAssetSpliceHostExitViews
 	): Promise<Buffer>;
+	signSpliceExitHtlcs?(
+		ctx: IAssetSpliceContext,
+		views: IAssetSpliceHostExitViews,
+		jointShares: AssetOpenPair<Buffer>,
+		signer: IAssetUpdateHtlcSigner
+	): Promise<Buffer>;
 	verifySpliceExits(
 		ctx: IAssetSpliceContext,
 		views: IAssetSpliceHostExitViews,
-		shares: AssetOpenPair<Buffer>
-	): Promise<Both<IAssetOpenExit>>;
+		shares: AssetOpenPair<Buffer>,
+		htlcShares?: AssetOpenPair<Buffer>
+	): Promise<Both<IAssetSpliceExitEvidence>>;
 	retainSpliceExits(
 		ctx: IAssetSpliceContext,
 		views: IAssetSpliceHostExitViews,
@@ -99,6 +121,20 @@ export interface IAssetSpliceSigningHost {
 	): Promise<Buffer[][]>;
 }
 
+function boundedShares(value: Buffer): Buffer {
+	if (
+		!Buffer.isBuffer(value) ||
+		!value.length ||
+		value.length > ASSET_OPEN_OBJECT_LIMIT
+	)
+		throw Error('Invalid asset splice exit share length');
+	return Buffer.from(value);
+}
+function sharePair(pair: AssetOpenPair<Buffer>): [Buffer, Buffer] {
+	if (pair.length !== 2)
+		throw Error('Splice exit authorization requires both devices');
+	return [boundedShares(pair[0]), boundedShares(pair[1])];
+}
 export interface VerifiedSpliceExitLeaves {
 	readonly digest: string;
 }
@@ -109,7 +145,7 @@ const retainedLeaves = new WeakMap<
 		context: IAssetSpliceContext;
 		id: string;
 		digest: string;
-		leaves: Both<IAssetOpenExit>;
+		leaves: Both<IAssetSpliceExitEvidence>;
 	}
 >();
 export type AssetSpliceInputVerifier = (coin: {
@@ -135,6 +171,8 @@ export class AssetSpliceSignatureRound {
 	private readonly funding: Record<Branch, IFinalFundingReference>;
 	private readonly parentBranch: IAssetSpliceExitBranch | undefined;
 	private readonly oldSigned: Buffer;
+	private readonly ledger;
+	private readonly commitmentTerms;
 	private readonly keys;
 	private readonly oldKey: Buffer;
 	private readonly newKey: Buffer;
@@ -180,13 +218,61 @@ export class AssetSpliceSignatureRound {
 		const active = released
 			? loadAssetSpliceExitProofs(store, this.id, this.digest)
 			: store.loadAdoptedAssetSpliceReceipt(this.id);
-		const parent = active && (released ? active.parent : active.candidate);
+		const latest = store.assetSpliceUpdateHead(this.id);
+		if (!released && latest.inProgress)
+			throw new Error('Asset commitment update still in progress');
+		this.ledger =
+			layout.stateNumber > 0n
+				? assetUpdateHistory(store, this.id).states.get(layout.stateNumber)
+				: undefined;
 		if (
-			parent &&
-			(!sameParent(parent) ||
-				String(layout.stateNumber) !== active!.stateNumber)
+			(layout.stateNumber > 0n &&
+				(!this.ledger ||
+					this.ledger.digest !== layout.priorDigest?.toString('hex'))) ||
+			(!released &&
+				(latest.committed?.height ?? '0') !== String(layout.stateNumber))
 		)
-			throw new Error('Asset splice parent differs from its enrolled state');
+			throw new Error('Asset splice prior digest or height is not current');
+		this.commitmentTerms = this.ledger
+			? { ...this.session.terms, commitmentFeeratePerKw: this.ledger.feerate }
+			: this.session.terms;
+		const elected = active && (released ? active.parent : active.candidate);
+		if (
+			elected
+				? !sameParent(elected)
+				: this.terms.parent.getId() !==
+						Transaction.fromHex(this.opening.fundingTxHex).getId() ||
+				  this.terms.parentIndex !== this.opening.fundingOutputIndex
+		)
+			throw new Error('Asset splice requires the elected funding output');
+		const parent = this.ledger
+			? assetUpdateFundingMembers(store, this.id, this.ledger).find(sameParent)
+			: elected;
+		if (this.ledger && !parent)
+			throw new Error('Missing signed asset splice member');
+		const saved = this.ledger?.htlcs ?? [];
+		if (
+			layout.parentBalances.htlcs.length !== saved.length ||
+			saved.some((h) => {
+				const row = layout.parentBalances.htlcs.find(
+					(v) =>
+						v.id === BigInt(h.id) &&
+						(v.offeredBy === 'initiator') ===
+							((h.offeredBy === 'local') === this.terms.localIsSpliceInitiator)
+				);
+				return (
+					!row ||
+					row.amountMsat !== BigInt(h.amountMsat) ||
+					row.cltvExpiry !== h.cltvExpiry ||
+					row.paymentHash !== h.paymentHash ||
+					!isDeepStrictEqual(
+						row.allocations.map((a) => [a.assetId, String(a.units)]).sort(),
+						h.allocations.map((a) => [a.assetId, a.units]).sort()
+					)
+				);
+			})
+		)
+			throw new Error('Splice layout differs from the signed HTLC obligations');
 		this.parentBranch = parent;
 		const old = parent?.funding ?? {
 			fundingTxHex: this.opening.fundingTxHex,
@@ -290,7 +376,7 @@ export class AssetSpliceSignatureRound {
 		const ledger = this.balances('candidate', 'local');
 		validateFinalSpliceReserves(
 			BigInt(tx.outs[this.candidate.fundingIndex].value),
-			this.session.terms,
+			this.commitmentTerms,
 			ledger,
 			ledger.htlcs,
 			this.opening.isInitiator,
@@ -303,6 +389,12 @@ export class AssetSpliceSignatureRound {
 		this.store.assertAssetSpliceAuthority(this.authority);
 		if (this.authority.exitRequest(this.id))
 			throw new Error('Asset splice channel is closing');
+		const head = this.store.assetSpliceUpdateHead(this.id);
+		if (
+			head.inProgress ||
+			(head.committed?.digest ?? undefined) !== this.ledger?.digest
+		)
+			throw new Error('Signed asset funding parent has changed');
 		if (!ctx) return;
 		const current = ctx.currentParent();
 		if (
@@ -316,6 +408,8 @@ export class AssetSpliceSignatureRound {
 			ctx.oldOutpoint.index !== this.terms.parentIndex ||
 			current?.walletGeneration !== 4 ||
 			current.stateNumber !== ctx.stateNumber ||
+			ctx.priorDigest?.toString('hex') !== this.ledger?.digest ||
+			current.priorDigest?.toString('hex') !== this.ledger?.digest ||
 			current.oldOutpoint.index !== ctx.oldOutpoint.index ||
 			!current.oldOutpoint.hash.equals(ctx.oldOutpoint.hash)
 		)
@@ -331,13 +425,9 @@ export class AssetSpliceSignatureRound {
 			h?.point ??
 			(holder === 'local' ? localBasepoints : remoteBasepoints)
 				.firstPerCommitmentPoint;
-		const htlcs: IFinalCommitmentHtlc[] = (h?.htlcs ?? []).map((v) => ({
-			id: BigInt(v.id),
-			offeredBy: v.offeredBy,
-			amountMsat: BigInt(v.amountMsat),
-			paymentHash: Buffer.from(v.paymentHash, 'hex'),
-			cltvExpiry: v.cltvExpiry
-		}));
+		const htlcs: IAssetUpdateHtlc[] = (this.ledger?.htlcs ?? []).map(
+			readUpdateHtlc
+		);
 		return {
 			point: Buffer.from(point, 'hex'),
 			localBalanceMsat:
@@ -353,11 +443,11 @@ export class AssetSpliceSignatureRound {
 			htlcs
 		};
 	}
-	private view(name: Branch, holder: Holder, exit?: IAssetOpenExit) {
+	private view(name: Branch, holder: Holder, exit?: IAssetSpliceExitEvidence) {
 		const state = this.balances(name, holder);
 		const v = buildAssetSpliceCommitment(
 			this.opening,
-			this.session.terms,
+			this.commitmentTerms,
 			holder,
 			state.point,
 			this.layout.stateNumber,
@@ -368,7 +458,13 @@ export class AssetSpliceSignatureRound {
 			{
 				fundingRoot: this.terms.assetFundingRoots![name],
 				toLocal: proofLeaf(exit?.toLocal),
-				toRemote: proofLeaf(exit?.toRemote)
+				toRemote: proofLeaf(exit?.toRemote),
+				htlcs: exit?.htlcs?.map((h) => ({
+					id: BigInt(h.id),
+					offeredBy: h.offeredBy,
+					output: proofLeaf(h.output)!,
+					secondLevel: proofLeaf(h.secondLevel)!
+				}))
 			}
 		);
 		return { state, v };
@@ -380,15 +476,14 @@ export class AssetSpliceSignatureRound {
 				...state,
 				tx: v.tx,
 				outputMap: v.outputMap,
-				keys: {
-					revocationPubkey: v.keys.revocationPubkey,
-					localDelayedPubkey: v.keys.localDelayedPubkey
-				},
+				keys: v.keys,
+				htlcOutputs: v.htlcs,
 				toSelfDelay: v.toSelfDelay
 			};
 		};
 		const branch = (name: Branch) => ({
 			funding: { ...this.funding[name] },
+			fundingRoot: Buffer.from(this.terms.assetFundingRoots![name]),
 			local: side(name, 'local'),
 			remote: side(name, 'remote')
 		});
@@ -398,6 +493,8 @@ export class AssetSpliceSignatureRound {
 		];
 		if (!this.terms.localIsSpliceInitiator) points.reverse();
 		return {
+			terms: deserialize(serialize(this.commitmentTerms)),
+			originalInitiator: this.opening.isInitiator,
 			finalDigest: Buffer.from(this.digest, 'hex'),
 			layoutDigest: Buffer.from(this.verified.layoutDigest),
 			fundingFeeratePerkw: this.terms.feerate,
@@ -442,34 +539,234 @@ export class AssetSpliceSignatureRound {
 			throw new Error('Missing completed asset splice construction');
 		return g;
 	}
+	private savedShare(
+		phase: 'joint' | 'htlc',
+		binding: string,
+		payload?: Buffer
+	): Buffer | undefined {
+		type Share = {
+			kind: 'splice-exit-share';
+			digest: string;
+			phase: typeof phase;
+			binding: string;
+			bytes: string;
+		};
+		const head = this.store.readAssetSpliceJournal<Share>(this.id);
+		const prior = head.records.filter(
+			(s) =>
+				s.kind === 'splice-exit-share' &&
+				s.digest === this.digest &&
+				s.phase === phase
+		);
+		if (
+			prior.length > 1 ||
+			(prior[0] &&
+				(prior[0].binding !== binding ||
+					(payload && prior[0].bytes !== payload.toString('hex'))))
+		)
+			throw new Error('Conflicting asset splice exit shares');
+		if (prior[0]) return boundedShares(Buffer.from(prior[0].bytes, 'hex'));
+		if (!payload) return;
+		const exact = boundedShares(payload);
+		this.store.appendAssetSpliceEvent(this.id, head, {
+			kind: 'splice-exit-share',
+			digest: this.digest,
+			phase,
+			binding,
+			bytes: exact.toString('hex')
+		} satisfies Share);
+		return exact;
+	}
 	async signExitShares(
 		host: IAssetSpliceSigningHost,
 		ctx: IAssetSpliceContext
 	) {
 		this.agreement();
 		this.current(ctx);
+		const cached = this.ledger && this.savedShare('joint', this.ledger.digest);
+		if (cached) return cached;
 		const raw = await host.signSpliceExits(ctx, this.hostViews());
 		this.current(ctx);
-		return Buffer.from(raw);
+		return this.ledger
+			? this.savedShare('joint', this.ledger.digest, raw)!
+			: boundedShares(raw);
+	}
+	async signExitHtlcs(
+		host: IAssetSpliceSigningHost,
+		ctx: IAssetSpliceContext,
+		shares: AssetOpenPair<Buffer>
+	): Promise<Buffer> {
+		this.agreement();
+		this.current(ctx);
+		if (!this.ledger || !host.signSpliceExitHtlcs)
+			throw new Error('Missing signed parent asset HTLC support');
+		const pair = sharePair(shares);
+		const binding = sha256(Buffer.concat(pair.map((b) => sha256(b)))).toString(
+			'hex'
+		);
+		const cached = this.savedShare('htlc', binding);
+		if (cached) return cached;
+		const our = await this.signExitShares(host, ctx);
+		if (!pair[this.terms.localIsSpliceInitiator ? 0 : 1].equals(our))
+			throw new Error('Splice asset joint shares omit local authorization');
+		let active = true;
+		try {
+			const out = await host.signSpliceExitHtlcs(ctx, this.hostViews(), pair, {
+				signHtlc: (hash, point, base, outpoint, dir, id, assetId) => {
+					this.current(ctx);
+					if (
+						!active ||
+						hash.length !== 32 ||
+						!base.equals(this.keys.channelBasepoints.htlcBasepoint) ||
+						!['local', 'remote'].some((h) =>
+							this.balances('candidate', h as Holder).point.equals(point)
+						) ||
+						outpoint !==
+							this.candidate.tx.getId() + ':' + this.candidate.fundingIndex ||
+						!this.ledger?.htlcs.some(
+							(h) =>
+								h.id === String(id) &&
+								h.offeredBy === dir &&
+								h.allocations.some((a) => a.assetId === assetId)
+						)
+					)
+						throw Error('Unauthorized candidate asset HTLC signature');
+					const slot = [
+							'asset-splice-htlc',
+							this.id,
+							this.digest,
+							outpoint,
+							point.toString('hex'),
+							dir,
+							String(id),
+							assetId
+						].join('/'),
+						digest = hash.toString('hex');
+					return (
+						this.authority.claim(slot, digest) ??
+						this.authority.finish(
+							slot,
+							digest,
+							signTaprootHtlcLeaf(
+								hash,
+								derivePrivateKey(this.keys.htlcBasepointSecret, point, base)
+							)
+						)
+					);
+				}
+			});
+			this.current(ctx);
+			return this.savedShare('htlc', binding, out)!;
+		} finally {
+			active = false;
+		}
 	}
 	async verifyExitShares(
 		host: IAssetSpliceSigningHost,
 		ctx: IAssetSpliceContext,
-		shares: AssetOpenPair<Buffer>
+		shares: AssetOpenPair<Buffer>,
+		htlcShares?: AssetOpenPair<Buffer>
 	): Promise<VerifiedSpliceExitLeaves> {
 		this.agreement();
 		this.current(ctx);
-		const leaves = await host.verifySpliceExits(ctx, this.hostViews(), [
-			Buffer.from(shares[0]),
-			Buffer.from(shares[1])
-		]);
+		const joints = sharePair(shares),
+			children = htlcShares && sharePair(htlcShares);
+		if (this.ledger) {
+			if (!children)
+				throw new Error(
+					'Splicing an updated channel needs both asset HTLC share sets'
+				);
+			const our = await this.signExitHtlcs(host, ctx, joints);
+			if (!our.equals(children[this.terms.localIsSpliceInitiator ? 0 : 1]))
+				throw new Error('Missing local asset HTLC authorization');
+		} else if (htlcShares)
+			throw new Error('Unexpected asset HTLC shares on opening');
+		const leaves = await host.verifySpliceExits(
+			ctx,
+			this.hostViews(),
+			joints,
+			children
+		);
 		this.current(ctx);
 		const copy = JSON.parse(JSON.stringify(leaves)) as typeof leaves;
 		for (const name of ['parent', 'candidate'] as const)
 			for (const h of ['local', 'remote'] as const) {
 				if (!/^(?:[a-f0-9]{2})+$/.test(copy[name][h].proofs))
 					throw new Error('Missing verified holder asset proofs');
+				const holder = copy[name][h];
+				const required = (this.ledger?.htlcs ?? []).filter(
+					(v) => v.allocations.length
+				);
+				if (
+					(holder.htlcs?.length ?? 0) !== required.length ||
+					required.some(
+						(v) =>
+							!holder.htlcs?.some(
+								(e) => e.id === v.id && e.offeredBy === v.offeredBy
+							)
+					) ||
+					(this.ledger &&
+						!/^(?:[0-9a-f]{2})+$/.test(holder.htlcSignatures ?? ''))
+				)
+					throw new Error(
+						'Incomplete authorized asset HTLC exit leaves or records'
+					);
+				const rebuilt = this.view(name, h, holder);
+				if (
+					this.ledger &&
+					(!rebuilt.v.tx.outs.length ||
+						Buffer.from(holder.htlcSignatures!, 'hex').length >
+							(this.layout.commitmentRecordLimits[
+								(h === 'local') === this.terms.localIsSpliceInitiator ? 0 : 1
+							].find((r) => r.type === 65537n)?.maxBytes ?? 0))
+				)
+					throw new Error('Asset HTLC signature exceeds the agreed wire bound');
 				if (name === 'parent') {
+					if (this.ledger && this.parentBranch) {
+						const branch = this.parentBranch,
+							local = h === 'local',
+							recovery = local ? branch.localRecovery : branch.remoteRecovery;
+						const expected = Transaction.fromHex(
+							local ? branch.localCommitment : branch.remoteCommitment
+						);
+						const priorLeaves = recovery.htlcs.flatMap((v) =>
+							v.outputLeaf && v.secondLevelLeaf
+								? [
+										{
+											id: v.id,
+											offeredBy: v.offeredBy,
+											output: v.outputLeaf,
+											secondLevel: v.secondLevelLeaf
+										}
+								  ]
+								: []
+						);
+						const index = this.ledger.members.findIndex(
+							(m) =>
+								m.fundingTxid === branch.fundingTxid &&
+								m.outputIndex === branch.outputIndex
+						);
+						const original =
+							index >= 0
+								? Buffer.from(
+										(local
+											? this.ledger.peerCommitments
+											: this.ledger.localCommitments)[index],
+										'hex'
+								  )
+								: this.parentCommitmentRecord(local);
+						if (
+							!original ||
+							decodeCommitmentSignedMessage(original, { customRecords: true })
+								.customRecords?.get(65537n)
+								?.toString('hex') !== holder.htlcSignatures ||
+							!expected.getHash().equals(rebuilt.v.tx.getHash()) ||
+							!isDeepStrictEqual(priorLeaves, holder.htlcs ?? [])
+						)
+							throw new Error(
+								'Signed parent HTLC leaves or signatures changed'
+							);
+					}
 					const previous = this.parentBranch
 						? this.parentBranch[h === 'local' ? 'localProofs' : 'remoteProofs']
 						: this.session.assetEvidence![h].proofs;
@@ -522,6 +819,19 @@ export class AssetSpliceSignatureRound {
 		});
 		return handle;
 	}
+	private parentCommitmentRecord(localHolder: boolean): Buffer | undefined {
+		const active = this.store.loadAdoptedAssetSpliceReceipt(this.id);
+		return (
+			active &&
+			assetSpliceSignatureFrame(
+				this.store,
+				this.id,
+				active.finalDigest,
+				!localHolder,
+				M.COMMITMENT_SIGNED
+			)
+		);
+	}
 	private exact(
 		handle: VerifiedSpliceExitLeaves,
 		name: Branch,
@@ -564,7 +874,26 @@ export class AssetSpliceSignatureRound {
 			'candidate',
 			peer ? 'local' : 'remote'
 		);
-		return signFinalUpdate(
+		const evidence =
+			retainedLeaves.get(handle)!.leaves.candidate[peer ? 'local' : 'remote'];
+		let bitcoin = peer;
+		if (this.ledger && peer) {
+			const decoded = decodeCommitmentSignedMessage(peer, {
+				customRecords: true
+			});
+			if (
+				decoded.customRecords?.size !== 1 ||
+				decoded.customRecords.get(65537n)?.toString('hex') !==
+					evidence.htlcSignatures ||
+				!encodeCommitmentSignedMessage(decoded).equals(peer)
+			)
+				throw new Error('Candidate commitment asset HTLC signatures differ');
+			bitcoin = encodeCommitmentSignedMessage({
+				...decoded,
+				customRecords: undefined
+			});
+		}
+		const signed = signFinalUpdate(
 			this.opening,
 			v,
 			state.point,
@@ -576,8 +905,8 @@ export class AssetSpliceSignatureRound {
 			this.keys,
 			this.authority,
 			this.nonceContext,
-			[],
-			peer,
+			this.ledger ? [handle.digest] : [],
+			bitcoin,
 			{
 				reference: this.funding.candidate,
 				privateKey: this.newKey,
@@ -587,6 +916,14 @@ export class AssetSpliceSignatureRound {
 				}
 			}
 		);
+		return this.ledger && !peer
+			? encodeCommitmentSignedMessage({
+					...decodeCommitmentSignedMessage(signed),
+					customRecords: new Map([
+						[65537n, Buffer.from(evidence.htlcSignatures!, 'hex')]
+					])
+			  })
+			: signed;
 	}
 	commitmentSigned(handle: VerifiedSpliceExitLeaves) {
 		const raw = this.commitment(handle);
@@ -630,6 +967,7 @@ export class AssetSpliceSignatureRound {
 			receipt.channelId !== this.id ||
 			receipt.finalDigest !== this.digest ||
 			receipt.stateNumber !== String(this.layout.stateNumber) ||
+			receipt.priorDigest !== this.ledger?.digest ||
 			receipt.minimumDepth !== this.minimumDepth ||
 			receipt.candidate.minimumDepth !== this.minimumDepth ||
 			receipt.parent.minimumDepth !==
@@ -644,6 +982,39 @@ export class AssetSpliceSignatureRound {
 			throw new Error('Host returned a different splice proof receipt');
 		for (const name of ['parent', 'candidate'] as const) {
 			const b = receipt[name];
+			for (const holder of ['local', 'remote'] as const) {
+				const recovery =
+						holder === 'local' ? b.localRecovery : b.remoteRecovery,
+					evidence = leaves[name][holder];
+				const { v, state } = this.exact(handle, name, holder);
+				const expectedHtlcs = state.htlcs.map((h) => {
+					const source = v.htlcs.find(
+						(x) => x.htlc.id === h.id && x.htlc.offeredBy === h.offeredBy
+					);
+					const aux = evidence.htlcs?.find(
+						(x) => x.id === String(h.id) && x.offeredBy === h.offeredBy
+					);
+					return {
+						id: String(h.id),
+						offeredBy: h.offeredBy,
+						amountMsat: String(h.amountMsat),
+						paymentHash: h.paymentHash.toString('hex'),
+						cltvExpiry: h.cltvExpiry,
+						outputIndex: source?.outputIndex ?? null,
+						outputLeaf: aux?.output ?? null,
+						secondLevelLeaf: aux?.secondLevel ?? null
+					};
+				});
+				if (
+					recovery.point !== state.point.toString('hex') ||
+					recovery.localBalanceMsat !== String(state.localBalanceMsat) ||
+					recovery.remoteBalanceMsat !== String(state.remoteBalanceMsat) ||
+					!isDeepStrictEqual(recovery.htlcs, expectedHtlcs)
+				)
+					throw new Error(
+						'Retained splice HTLC claim differs from the verified holder'
+					);
+			}
 			if (
 				!isDeepStrictEqual(b.funding, this.funding[name]) ||
 				b.fundingRoot !== this.terms.assetFundingRoots![name].toString('hex') ||
@@ -710,7 +1081,7 @@ export class AssetSpliceSignatureRound {
 			return {
 				expected: spliceRecoveryView(
 					this.opening,
-					this.session.terms,
+					this.commitmentTerms,
 					this.session.assetEvidence!.fundingRoot,
 					b,
 					'local',

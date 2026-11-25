@@ -136,10 +136,11 @@ describe('Splice lock, confirmed wallet receipt and offline recovery', function 
 				loadAssetSpliceExitProofs(store, id, e.finalDigest)
 			);
 		}
+		let expiredVerification: (() => void) | undefined;
 		const c = new AssetSpliceConfirmationCoordinator(
 			store,
 			{
-				verifySpliceFunding: async () => {},
+				verifySpliceFunding: async () => expiredVerification?.(),
 				confirmSpliceFunding: async () => {},
 				retractSpliceFunding: async () => {}
 			},
@@ -186,6 +187,19 @@ describe('Splice lock, confirmed wallet receipt and offline recovery', function 
 			() => current
 		);
 		expect(c.hasCurrentInclusion(id, txid)).to.equal(false);
+		expiredVerification = () => {
+			c.suspend(id, txid);
+			throw Error('Wallet revoked the old inclusion ticket');
+		};
+		await c.observe(
+			id,
+			txid,
+			10,
+			async () => anchor(txid, 3),
+			() => true
+		);
+		expect(c.status(id, txid)!.available).to.equal(false);
+		expiredVerification = undefined;
 		await c.observe(
 			id,
 			txid,
@@ -225,6 +239,51 @@ describe('Splice lock, confirmed wallet receipt and offline recovery', function 
 		expect(store.loadAdoptedAssetSpliceReceipt(id)?.finalDigest).to.equal(
 			first.finalDigest
 		);
+	});
+	it('requires the exact live unspent funding in addition to its historical bilateral adoption', async () => {
+		const { store, party } = f.devices[0],
+			e = f.evidence(0);
+		f.retain(0);
+		f.sign(0, f.context(0));
+		const manager = new ChannelManager({
+			finalOpening: {
+				storage: store,
+				root: party.root,
+				dualFunding: {
+					verifySpliceFunding: async () => {},
+					confirmSpliceFunding: async () => {}
+				}
+			},
+			persistence: { persist: () => 'committed' }
+		} as unknown as IChannelManagerConfig);
+		const txid = e.candidate.fundingTxid;
+		manager.restoreAssetSpliceWatches(f.id);
+		await manager.receiveAssetSpliceLocked(
+			f.devices[1].party.binding.nodeId,
+			encodeSpliceLockedMessage({
+				channelId: Buffer.from(f.id, 'hex'),
+				fundingTxid: Buffer.from(txid, 'hex').reverse()
+			})
+		);
+		await manager.observeAssetSpliceFunding(
+			f.id,
+			txid,
+			20,
+			async () => ({
+				txid,
+				blockHash: 'b0'.repeat(32),
+				confirmations: 3
+			}),
+			() => true
+		);
+		expect(store.loadAdoptedAssetSpliceReceipt(f.id)?.finalDigest).to.equal(
+			e.finalDigest
+		);
+		expect(manager.isAssetSpliceFundingAvailable(f.id, txid)).to.equal(false);
+		manager.observeFinalFunding(f.id, txid, 20, false);
+		expect(manager.isAssetSpliceFundingAvailable(f.id, txid)).to.equal(true);
+		manager.observeFinalFunding(f.id, txid, undefined, false);
+		expect(manager.isAssetSpliceFundingAvailable(f.id, txid)).to.equal(false);
 	});
 	it('treats an observed splice as funding and force closes the proven unspent candidate below lock depth', async () => {
 		const { store, party } = f.devices[0],

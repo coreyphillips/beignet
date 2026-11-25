@@ -7,10 +7,23 @@ method AssetSpliceSignatureRound.commitmentSigned(handle: VerifiedSpliceExitLeav
 method AssetSpliceSignatureRound.nextFunding(host: IAssetSpliceSigningHost, ctx: beignet/lightning#channel.IAssetSpliceContext, verify: AssetSpliceInputVerifier): Promise<Buffer | undefined>
 method AssetSpliceSignatureRound.receiveFunding(wire: Buffer): void
 method AssetSpliceSignatureRound.retainExits(host: IAssetSpliceSigningHost, ctx: beignet/lightning#channel.IAssetSpliceContext, handle: VerifiedSpliceExitLeaves): Promise<beignet/lightning#channel.IAssetSpliceExitProofs>
+method AssetSpliceSignatureRound.signExitHtlcs(host: IAssetSpliceSigningHost, ctx: beignet/lightning#channel.IAssetSpliceContext, shares: beignet/lightning#channel.AssetOpenPair<Buffer>): Promise<Buffer>
 method AssetSpliceSignatureRound.signExitShares(host: IAssetSpliceSigningHost, ctx: beignet/lightning#channel.IAssetSpliceContext): Promise<Buffer>
 method AssetSpliceSignatureRound.transaction(): bitcoinjs-lib#Transaction | undefined
 method AssetSpliceSignatureRound.txComplete(): Buffer
-method AssetSpliceSignatureRound.verifyExitShares(host: IAssetSpliceSigningHost, ctx: beignet/lightning#channel.IAssetSpliceContext, shares: beignet/lightning#channel.AssetOpenPair<Buffer>): Promise<VerifiedSpliceExitLeaves>
+method AssetSpliceSignatureRound.verifyExitShares(host: IAssetSpliceSigningHost, ctx: beignet/lightning#channel.IAssetSpliceContext, shares: beignet/lightning#channel.AssetOpenPair<Buffer>, htlcShares?: beignet/lightning#channel.AssetOpenPair<Buffer>): Promise<VerifiedSpliceExitLeaves>
+unexported class AssetSpliceUpdateBatch
+constructor AssetSpliceUpdateBatch(store: SqliteStorage, authority: FinalOpeningAuthority, id: string, root: bip32#BIP32Interface, height: bigint, changes: readonly beignet/lightning#channel.AssetUpdateChange[], currentHeight: () => number | undefined)
+method AssetSpliceUpdateBatch.acceptCommitments(host: beignet/lightning#channel.IAssetSpliceUpdateHost, supplied: readonly Buffer[]): Promise<void>
+method AssetSpliceUpdateBatch.acceptOffer(raw: Buffer): void
+method AssetSpliceUpdateBatch.commitments(): Buffer[]
+get AssetSpliceUpdateBatch.fundingCount(): number
+method AssetSpliceUpdateBatch.offer(): Buffer
+method AssetSpliceUpdateBatch.receiveRevocation(raw: Buffer): void
+method AssetSpliceUpdateBatch.revocation(): Buffer
+method AssetSpliceUpdateBatch.signAssetHtlcs(host: beignet/lightning#channel.IAssetSpliceUpdateHost, shares: beignet/lightning#channel.AssetOpenPair<Buffer>): Promise<Buffer>
+method AssetSpliceUpdateBatch.signAssetShares(host: beignet/lightning#channel.IAssetSpliceUpdateHost): Promise<Buffer>
+method AssetSpliceUpdateBatch.verifyAssetShares(host: beignet/lightning#channel.IAssetSpliceUpdateHost, shares: beignet/lightning#channel.AssetOpenPair<Buffer>, htlcShares: beignet/lightning#channel.AssetOpenPair<Buffer>): Promise<void>
 unexported type Both<T> = Record<Branch, Record<Holder, T>>
 unexported type Branch = 'parent' | 'candidate'
 unexported class FinalDeviceJournal
@@ -137,6 +150,9 @@ property IAssetSpliceExitBranch.outputIndex: number
 property IAssetSpliceExitBranch.remoteCommitment: string
 property IAssetSpliceExitBranch.remoteProofs: string
 property IAssetSpliceExitBranch.remoteRecovery: IAssetSpliceHolderRecovery
+unexported interface IAssetSpliceExitEvidence extends beignet/lightning#channel.IAssetOpenExit
+property IAssetSpliceExitEvidence.htlcSignatures?: string
+property IAssetSpliceExitEvidence.htlcs?: readonly { id: string; offeredBy: 'local' | 'peer'; output: NonNullable<beignet/lightning#channel.IAssetOpenExit['toLocal']>; secondLevel: NonNullable<beignet/lightning#channel.IAssetOpenExit['toLocal']>; }[]
 unexported interface IAssetSpliceHolderRecovery
 property IAssetSpliceHolderRecovery.htlcs: IStoredSpliceHtlc[]
 property IAssetSpliceHolderRecovery.localBalanceMsat: string
@@ -163,13 +179,15 @@ property IAssetSpliceLayout.parentBalances: IAssetSpliceBalanceState
 property IAssetSpliceLayout.parentIndex: number
 property IAssetSpliceLayout.parentKeys: Pair<Buffer>
 property IAssetSpliceLayout.parentRoot: Buffer
+property IAssetSpliceLayout.priorDigest?: Buffer
 property IAssetSpliceLayout.proposalDigests: Pair<Buffer>
 property IAssetSpliceLayout.stateNumber: bigint
 unexported interface IAssetSpliceSigningHost
 method IAssetSpliceSigningHost.retainSpliceExits(ctx: beignet/lightning#channel.IAssetSpliceContext, views: beignet/lightning#channel.IAssetSpliceHostExitViews, exact: Both<bitcoinjs-lib#Transaction>): Promise<beignet/lightning#channel.IAssetSpliceExitProofs>
+method IAssetSpliceSigningHost.signSpliceExitHtlcs?(ctx: beignet/lightning#channel.IAssetSpliceContext, views: beignet/lightning#channel.IAssetSpliceHostExitViews, jointShares: beignet/lightning#channel.AssetOpenPair<Buffer>, signer: beignet/lightning#channel.IAssetUpdateHtlcSigner): Promise<Buffer>
 method IAssetSpliceSigningHost.signSpliceExits(ctx: beignet/lightning#channel.IAssetSpliceContext, views: beignet/lightning#channel.IAssetSpliceHostExitViews): Promise<Buffer>
 method IAssetSpliceSigningHost.signSpliceFunding(ctx: beignet/lightning#channel.IAssetSpliceContext, finalDigest: Buffer, ...args: Parameters<FinalFundingWitnessSigner>): Promise<Buffer[][]>
-method IAssetSpliceSigningHost.verifySpliceExits(ctx: beignet/lightning#channel.IAssetSpliceContext, views: beignet/lightning#channel.IAssetSpliceHostExitViews, shares: beignet/lightning#channel.AssetOpenPair<Buffer>): Promise<Both<beignet/lightning#channel.IAssetOpenExit>>
+method IAssetSpliceSigningHost.verifySpliceExits(ctx: beignet/lightning#channel.IAssetSpliceContext, views: beignet/lightning#channel.IAssetSpliceHostExitViews, shares: beignet/lightning#channel.AssetOpenPair<Buffer>, htlcShares?: beignet/lightning#channel.AssetOpenPair<Buffer>): Promise<Both<IAssetSpliceExitEvidence>>
 unexported interface IAssetSpliceUnitMovement
 property IAssetSpliceUnitMovement.assetId: string
 property IAssetSpliceUnitMovement.change: bigint
@@ -180,6 +198,25 @@ property IAssetSpliceUnitMovement.withdrawals: bigint
 unexported interface IAssetSpliceWireRecordLimit
 property IAssetSpliceWireRecordLimit.maxBytes: number
 property IAssetSpliceWireRecordLimit.type: bigint
+unexported interface IAssetUpdateSavedHtlc
+property IAssetUpdateSavedHtlc.allocations: { assetId: string; units: string; }[]
+property IAssetUpdateSavedHtlc.amountMsat: string
+property IAssetUpdateSavedHtlc.cltvExpiry: number
+property IAssetUpdateSavedHtlc.id: string
+property IAssetUpdateSavedHtlc.offeredBy: 'local' | 'peer'
+property IAssetUpdateSavedHtlc.paymentHash: string
+unexported interface IAssetUpdateSecured
+property IAssetUpdateSecured.digest: string
+property IAssetUpdateSecured.feerate: number
+property IAssetUpdateSecured.height: string
+property IAssetUpdateSecured.htlcs: IAssetUpdateSavedHtlc[]
+property IAssetUpdateSecured.id: string
+property IAssetUpdateSecured.kind: 'asset-update-secured'
+property IAssetUpdateSecured.localCommitments: string[]
+property IAssetUpdateSecured.members: IAssetSpliceExitBranch[]
+property IAssetUpdateSecured.nextLocalId: string
+property IAssetUpdateSecured.nextPeerId: string
+property IAssetUpdateSecured.peerCommitments: string[]
 unexported interface IFinalCloseFunding
 property IFinalCloseFunding.fundingOutputIndex: number
 property IFinalCloseFunding.fundingTxHex: string
@@ -464,9 +501,13 @@ method SqliteStorage.addWatchtowerUpdate(update: beignet/lightning#watchtower.IW
 method SqliteStorage.allocateFinalChannelKeyIndex(minimum: number): number
 method SqliteStorage.appendAssetSpliceEvent<T>(channelId: string, head: IFinalJournalHead, event: T): IFinalJournalHead
 method SqliteStorage.assertAssetSpliceAuthority(authority: FinalOpeningAuthority): void
+method SqliteStorage.assertAssetSpliceCanStart(channelId: string): void
 method SqliteStorage.assertFinalDaemonIdentity(nodeId: string): void
 method SqliteStorage.assetOpeningPayout(id: string, parent: string, raw?: Buffer): Buffer | null
+method SqliteStorage.assetSpliceReconnect(id: string, root: bip32#BIP32Interface, reportLock: boolean): beignet/lightning#message.IChannelReestablishMessage
 method SqliteStorage.assetSpliceSignatureRound(root: bip32#BIP32Interface, layout: IAssetSpliceLayout, verified: ReturnType<typeof verifyAssetSpliceCandidate>, localFundingKeyIndex: number): AssetSpliceSignatureRound
+method SqliteStorage.assetSpliceUpdateBatch(id: string, root: bip32#BIP32Interface, height: bigint, changes: readonly beignet/lightning#channel.AssetUpdateChange[], currentHeight: () => number | undefined): AssetSpliceUpdateBatch
+method SqliteStorage.assetSpliceUpdateHead(id: string): { inProgress?: { stateNumber: bigint; changes: beignet/lightning#channel.AssetUpdateChange[]; } | undefined; nextNumber: bigint; nextLocalId: bigint; nextPeerId: bigint; committed: IAssetUpdateSecured | undefined; }
 method SqliteStorage.auxiliaryRevokedCommitmentsSize(channelId: string): { rows: number; bytes: number; }
 method SqliteStorage.backup(destPath: string): Promise<void>
 get SqliteStorage.canOpenDualFundedAssets(): boolean
@@ -581,7 +622,7 @@ method SqliteStorage.loadFinalPeerTxComplete(channelId: string): Buffer | null
 method SqliteStorage.loadFinalPeerTxSignatures(channelId: string): Buffer | null
 method SqliteStorage.loadFinalResolutionStates(id: string): { locals: { point: Buffer; tx: Buffer; localBalanceMsat: bigint; remoteBalanceMsat: bigint; htlcs: { id: bigint; offeredBy: "local" | "peer"; amountMsat: bigint; paymentHash: Buffer; cltvExpiry: number; onionPacket: Buffer; blindingPoint: Buffer | undefined; skimmedFeeMsat: bigint | undefined; }[]; commitmentSigned: Buffer | undefined; secret: Buffer | undefined; funding?: IFinalFundingReference | undefined; feeratePerKw: number; height: bigint; }[]; remote: { point: Buffer; tx: Buffer; localBalanceMsat: bigint; remoteBalanceMsat: bigint; htlcs: { id: bigint; offeredBy: "local" | "peer"; amountMsat: bigint; paymentHash: Buffer; cltvExpiry: number; onionPacket: Buffer; blindingPoint: Buffer | undefined; skimmedFeeMsat: bigint | undefined; }[]; commitmentSigned: Buffer | undefined; secret: Buffer | undefined; funding?: IFinalFundingReference | undefined; feeratePerKw: number; height: bigint; }[]; revoked: { point: Buffer; tx: Buffer; localBalanceMsat: bigint; remoteBalanceMsat: bigint; htlcs: { id: bigint; offeredBy: "local" | "peer"; amountMsat: bigint; paymentHash: Buffer; cltvExpiry: number; onionPacket: Buffer; blindingPoint: Buffer | undefined; skimmedFeeMsat: bigint | undefined; }[]; commitmentSigned: Buffer | undefined; secret: Buffer | undefined; funding?: IFinalFundingReference | undefined; feeratePerKw: number; height: bigint; }[]; preimages: Buffer[]; candidate: IFinalOpeningCandidate; terms: IFinalOpeningTerms; local: { point: Buffer; tx: Buffer; localBalanceMsat: bigint; remoteBalanceMsat: bigint; htlcs: { id: bigint; offeredBy: "local" | "peer"; amountMsat: bigint; paymentHash: Buffer; cltvExpiry: number; onionPacket: Buffer; blindingPoint: Buffer | undefined; skimmedFeeMsat: bigint | undefined; }[]; commitmentSigned: Buffer | undefined; secret: Buffer | undefined; funding?: IFinalFundingReference | undefined; feeratePerKw: number; height: bigint; }; } | null
 method SqliteStorage.loadFinalSimpleClose(id: string): IFinalSimpleCloseState | null
-method SqliteStorage.loadFinalSpliceAttempts(id: string): ({ candidate: undefined; intent: IFinalSpliceIntent; messages: { kind: "wire"; local: boolean; type: beignet/lightning#message.MessageType; payload: string; resolvedPrevTx?: string | undefined; }[]; funded?: string | undefined; rbf?: "refused" | "quiescent" | "finished" | undefined; localLock?: string | undefined; peerLock?: string | undefined; adopted?: string | undefined; aborted?: string | undefined; awaitingAbortEcho?: boolean | undefined; inputsReleased?: boolean | undefined; } | { candidate: { kind: "candidate"; funding: IFinalFundingReference; localDelta: string; peerDelta: string; peerCommitment: string; ourCommitment: string; localHeight: number; remoteHeight: number; localNextNonce: string; peerNextNonce: string; }; intent: IFinalSpliceIntent; messages: { kind: "wire"; local: boolean; type: beignet/lightning#message.MessageType; payload: string; resolvedPrevTx?: string | undefined; }[]; funded?: string | undefined; rbf?: "refused" | "quiescent" | "finished" | undefined; localLock?: string | undefined; peerLock?: string | undefined; adopted?: string | undefined; aborted?: string | undefined; awaitingAbortEcho?: boolean | undefined; inputsReleased?: boolean | undefined; })[]
+method SqliteStorage.loadFinalSpliceAttempts(id: string): ({ candidate: undefined; intent: IFinalSpliceIntent; messages: { kind: "wire"; local: boolean; type: beignet/lightning#message.MessageType; payload: string; resolvedPrevTx?: string | undefined; }[]; funded?: string | undefined; rbf?: "refused" | "finished" | "quiescent" | undefined; localLock?: string | undefined; peerLock?: string | undefined; adopted?: string | undefined; aborted?: string | undefined; awaitingAbortEcho?: boolean | undefined; inputsReleased?: boolean | undefined; } | { candidate: { kind: "candidate"; funding: IFinalFundingReference; localDelta: string; peerDelta: string; peerCommitment: string; ourCommitment: string; localHeight: number; remoteHeight: number; localNextNonce: string; peerNextNonce: string; }; intent: IFinalSpliceIntent; messages: { kind: "wire"; local: boolean; type: beignet/lightning#message.MessageType; payload: string; resolvedPrevTx?: string | undefined; }[]; funded?: string | undefined; rbf?: "refused" | "finished" | "quiescent" | undefined; localLock?: string | undefined; peerLock?: string | undefined; adopted?: string | undefined; aborted?: string | undefined; awaitingAbortEcho?: boolean | undefined; inputsReleased?: boolean | undefined; })[]
 method SqliteStorage.loadFinalSpliceWalletOutpoints(): Set<string>
 method SqliteStorage.loadFinalUpdateDeliveries(id: string): { height: bigint; id: bigint; direction: "local" | "peer"; type: beignet/lightning#message.MessageType; payload: Buffer; }[]
 method SqliteStorage.loadFinalUpdateStatus(id: string): { multipleFunding: boolean; awaitingFundingNonce: boolean; spliced: boolean; localHeight: bigint; remoteHeight: bigint; localBalanceMsat: bigint; remoteBalanceMsat: bigint; feeratePerKw: number; spendableSpliceOutSats: bigint; spendableOutboundMsat: bigint; htlcs: { id: bigint; offeredBy: "local" | "peer"; amountMsat: bigint; paymentHash: Buffer; cltvExpiry: number; onionPacket: Buffer; blindingPoint: Buffer | undefined; skimmedFeeMsat: bigint | undefined; }[]; nextLocalHtlcId: bigint; nextPeerHtlcId: bigint; pending: { height: bigint; commitmentSigned: Buffer | undefined; peerCommitmentSigned: Buffer | undefined; revocation: Buffer | undefined; peerRevocation: Buffer | undefined; id: bigint; direction: "local" | "peer"; type: beignet/lightning#message.MessageType; payload: Buffer; } | null; last: { height: bigint; commitmentSigned: Buffer | undefined; peerCommitmentSigned: Buffer | undefined; revocation: Buffer | undefined; peerRevocation: Buffer | undefined; id: bigint; direction: "local" | "peer"; type: beignet/lightning#message.MessageType; payload: Buffer; } | undefined; needsPeerCommitment: boolean; } | null
@@ -598,6 +639,7 @@ method SqliteStorage.loadPendingWatchtowerUpdates(): Array<beignet/lightning#wat
 method SqliteStorage.loadPreimage(paymentHash: string): Buffer | null
 method SqliteStorage.loadQueueEntry(id: string): IQueueEntryRow | undefined
 method SqliteStorage.loadQueueHistory(limit: number, before?: string): IQueueEntryRow[]
+method SqliteStorage.loadReceivedOpeningCommitment(channelId: string): Buffer | null
 method SqliteStorage.loadRecoveryFrame(sequence: number): beignet/lightning#storage.IStoredRecoveryFrame | null
 method SqliteStorage.loadRecoveryFrameHeader(sequence: number): beignet/lightning#storage.IStoredRecoveryFrameHeader | null
 method SqliteStorage.loadRecoveryFrames(afterSequence?: number): beignet/lightning#storage.IStoredRecoveryFrame[]
@@ -614,6 +656,7 @@ method SqliteStorage.previewAssetOpeningTxComplete(candidate: IFinalOpeningCandi
 method SqliteStorage.previewFinalOpeningTxComplete(candidate: IFinalOpeningCandidate, fundingKey: Buffer, keyIndex: number): Buffer
 method SqliteStorage.pruneOutboxMessages(channelId: string, keepNewest: number): void
 method SqliteStorage.readAssetSpliceJournal<T = unknown>(channelId: string): IFinalJournalRead<T>
+method SqliteStorage.receivedAssetSpliceWire(channelId: string, type: beignet/lightning#message.MessageType, payload: Buffer): boolean
 method SqliteStorage.recoveryFrameStats(): { count: number; minSequence: number; maxSequence: number; } | null
 method SqliteStorage.releaseAssetSpliceWalletInputs(channelId: string, attempt: string): void
 method SqliteStorage.releasedAssetSplice(channelId: string, attempt: string): { readonly wire: Buffer; receive(raw: Buffer): void; transaction(): bitcoinjs-lib#Transaction | undefined; } | undefined

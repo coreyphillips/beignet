@@ -2569,6 +2569,13 @@ export class ChainWatcher extends EventEmitter {
 		}
 		const id = watched.channelId.toString('hex');
 		const splice = this.channelManager.hasAssetSpliceWatch?.(id, watched.txid);
+		if (splice && !funding)
+			this.channelManager.observeFinalFunding?.(
+				id,
+				watched.txid,
+				undefined,
+				false
+			);
 		const asset = !splice && this.channelManager.assetOpeningAnchor?.(id);
 		if ((asset || splice) && this.tipGeneration === generation) {
 			let height = funding?.height;

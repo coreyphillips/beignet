@@ -52,7 +52,8 @@ export class AssetSpliceLock {
 		private readonly verify: (
 			terms: IAssetSpliceLockTerms,
 			anchor: IAssetSpliceAnchor
-		) => Promise<void>
+		) => Promise<void>,
+		private readonly mayAdopt: () => boolean = () => true
 	) {
 		if (
 			!hash.test(terms.channelId) ||
@@ -114,7 +115,8 @@ export class AssetSpliceLock {
 			!h.adopted &&
 			h.peer &&
 			h.block &&
-			this.verifiedBlock === h.block
+			this.verifiedBlock === h.block &&
+			this.mayAdopt()
 		)
 			this.write({ kind: 'adopt', blockHash: h.block }, h.length);
 	}

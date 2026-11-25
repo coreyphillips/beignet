@@ -29,7 +29,8 @@ type Field =
 	| 'authorization'
 	| 'final_ack'
 	| 'construction_checkpoint'
-	| 'exit';
+	| 'exit'
+	| 'final';
 type Entry = {
 	kind: 'exchange';
 	attempt: string;
@@ -301,6 +302,21 @@ export class AssetSpliceExchange {
 		await this.publish('exit', ours);
 		return this.both('exit');
 	}
+	async exitHtlcShares(
+		ours: () => Promise<Buffer>
+	): Promise<AssetOpenPair<Buffer> | undefined> {
+		if (
+			!this.constructionAgreed ||
+			this.ctx.stateNumber === 0n ||
+			!this.both('exit')
+		)
+			throw Error(
+				'Splice HTLC signatures require both secured joint transfer shares'
+			);
+		await this.publish('final', ours);
+		return this.both('final');
+	}
+
 	async receive(subtype: number, raw: Buffer): Promise<void> {
 		let field: Field, bytes: Buffer;
 		if (subtype === Sub.ASSET_SPLICE_CONSENT) {
@@ -337,11 +353,15 @@ export class AssetSpliceExchange {
 					break;
 				case 'layout':
 				case 'authorization':
-				case 'exit': {
+				case 'exit':
+				case 'final': {
 					field = frame.phase;
 					if (
 						(field === 'authorization' && !this.value(true, 'consent')) ||
-						(field === 'exit' && !this.value(true, 'construction_checkpoint'))
+						(field === 'exit' &&
+							!this.value(true, 'construction_checkpoint')) ||
+						(field === 'final' &&
+							(!this.value(true, 'exit') || this.ctx.stateNumber === 0n))
 					)
 						throw new Error('Premature splice proof object');
 					const saved = this.value(false, field);

@@ -49,7 +49,8 @@ export function assetOpeningOutputClaims(
 		state,
 		fundingProofs,
 		exitProofs,
-		splice
+		splice,
+		update
 	} of matchedAssetPayoutViews(storage, id, parent)) {
 		const local = holder === 'local';
 		const outputIndex = local
@@ -62,7 +63,7 @@ export function assetOpeningOutputClaims(
 		let leaf: ITaprootLeafSpend, secret: Buffer, output: Buffer;
 		if (local) {
 			if (
-				splice &&
+				(splice || update) &&
 				!getPublicKey(
 					generateFromSeed(keys.perCommitmentSeed, MAX_INDEX - state)
 				).equals(point)
@@ -187,6 +188,7 @@ export function assetOpeningOutputClaims(
 					fundingProofs: Buffer.from(fundingProofs, 'hex'),
 					exitProofs: Buffer.from(exitProofs, 'hex'),
 					...(splice && { splice }),
+					...(update && { update }),
 					signSweep
 				});
 			} finally {

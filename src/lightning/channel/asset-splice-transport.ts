@@ -1,3 +1,4 @@
+import { assetUpdateFundingMembers } from '../storage/asset-update-history';
 import { Transaction } from 'bitcoinjs-lib';
 import { sha256 } from '../crypto/provider';
 import { isValidPublicKey } from '../crypto/ecdh';
@@ -79,6 +80,7 @@ type Begin = {
 	parent: IFinalFundingReference;
 	root: string;
 	state: string;
+	priorDigest?: string;
 	feerate: number;
 	locktime: number;
 	depth: number;
@@ -232,12 +234,26 @@ export class AssetSpliceTransport {
 		if (!parent) return;
 		const tx = Transaction.fromHex(parent.fundingTxHex);
 		if (!this.available(id, tx.getId(), !adopted)) return;
+		const updates = this.store.assetSpliceUpdateHead(id);
+		if (updates.inProgress) return;
+		const secured = updates.committed;
+		if (
+			secured &&
+			!assetUpdateFundingMembers(this.store, id, secured).some(
+				(m) =>
+					m.fundingTxid === tx.getId() &&
+					m.outputIndex === parent.fundingOutputIndex
+			)
+		)
+			return;
+
 		return {
 			parent,
 			root:
 				adopted?.candidate.fundingRoot ??
 				opening.session.assetEvidence.fundingRoot,
-			state: adopted?.stateNumber ?? '0',
+			state: secured?.height ?? adopted?.stateNumber ?? '0',
+			...(secured && { priorDigest: secured.digest }),
 			depth: adopted?.minimumDepth ?? opening.candidate.minimumDepth
 		};
 	}
@@ -287,6 +303,7 @@ export class AssetSpliceTransport {
 		fee: number,
 		depth: number
 	): Begin {
+		this.store.assertAssetSpliceCanStart(id);
 		const parent = this.selected(id);
 		if (!parent)
 			throw Error(
@@ -310,6 +327,7 @@ export class AssetSpliceTransport {
 			parent: parent.parent,
 			root: parent.root,
 			state: parent.state,
+			...(parent.priorDigest && { priorDigest: parent.priorDigest }),
 			feerate: fee,
 			depth,
 			locktime: this.height()
@@ -346,9 +364,15 @@ export class AssetSpliceTransport {
 			attempt: attemptId(id, b, initKey),
 			walletGeneration: 4,
 			stateNumber: BigInt(b.state),
+			...(b.priorDigest && { priorDigest: Buffer.from(b.priorDigest, 'hex') }),
 			oldOutpoint: { hash: tx.getHash(), index: b.parent.fundingOutputIndex },
 			currentParent: () => {
 				if (this.live.get(id) !== s || !this.eligible(s.peer, id)) return;
+				try {
+					this.store.assertAssetSpliceCanStart(id);
+				} catch {
+					return undefined;
+				}
 				const v = this.selected(id);
 				return v
 					? {
@@ -357,6 +381,9 @@ export class AssetSpliceTransport {
 								index: v.parent.fundingOutputIndex
 							},
 							stateNumber: BigInt(v.state),
+							...(v.priorDigest && {
+								priorDigest: Buffer.from(v.priorDigest, 'hex')
+							}),
 							walletGeneration: 4 as const
 					  }
 					: undefined;
@@ -540,7 +567,14 @@ export class AssetSpliceTransport {
 			round.signExitShares(this.host, ctx)
 		);
 		if (!pair || this.live.get(id) !== s) return;
-		s.leaves ??= await round.verifyExitShares(this.host, ctx, pair);
+		const children =
+			ctx.stateNumber > 0n
+				? await s.exchange.exitHtlcShares(() =>
+						round.signExitHtlcs(this.host, ctx, pair)
+				  )
+				: undefined;
+		if (ctx.stateNumber > 0n && !children) return;
+		s.leaves ??= await round.verifyExitShares(this.host, ctx, pair, children);
 		if (!ctx.currentParent()) return;
 		this.sendOnce(
 			id,
@@ -626,7 +660,7 @@ export class AssetSpliceTransport {
 				: type === M.TX_SIGNATURES
 				? this.store.loadFinalPeerTxSignatures(id)
 				: type === M.COMMITMENT_SIGNED
-				? this.store.loadFinalPeerCommitment(id)
+				? this.store.loadReceivedOpeningCommitment(id)
 				: undefined;
 		if (openingReplay?.equals(raw)) return false;
 		if (
@@ -642,7 +676,19 @@ export class AssetSpliceTransport {
 		)
 			return false;
 		const pending = this.pending(id);
-		if (type !== M.STFU && !pending) return false;
+		if (type !== M.STFU && !pending) {
+			if (type !== M.TX_ABORT) return false;
+			const last = this.store
+				.readAssetSpliceJournal<Record>(id)
+				.records.filter((r): r is Begin => r.kind === 'peer-splice')
+				.at(-1);
+			// Both peers can abort the same unsigned splice. Consume the terminal acknowledgement after retirement.
+			return (
+				!!last &&
+				!!this.saved(id, last, 'retired') &&
+				decodeTxAbortMessage(raw).data.equals(Buffer.from('Splice abandoned'))
+			);
+		}
 		const payload = Buffer.from(raw);
 		void this.enqueue(id, async () => {
 			let b = this.pending(id);

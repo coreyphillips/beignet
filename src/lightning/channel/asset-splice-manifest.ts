@@ -49,6 +49,7 @@ export interface IAssetSpliceLayout {
 	parentKeys: Pair<Buffer>;
 	parentRoot: Buffer;
 	stateNumber: bigint;
+	priorDigest?: Buffer;
 	feeBudgets: Pair<bigint>;
 	maxAcceptedHtlcs: Pair<number>;
 	commitmentRecordLimits: Pair<readonly IAssetSpliceWireRecordLimit[]>;
@@ -129,6 +130,7 @@ function checkLayout(layout: IAssetSpliceLayout) {
 		init.fundingFeeratePerkw < 1 ||
 		init.fundingFeeratePerkw > MAX_SPLICE_FEERATE_PERKW ||
 		!inRange(layout.stateNumber, 0n, MAX_INDEX) ||
+		layout.stateNumber > 0n !== (layout.priorDigest !== undefined) ||
 		!inRange(layout.dust, 1n, MAX_MONEY_SATS) ||
 		layout.feeBudgets.length !== 2 ||
 		!layout.feeBudgets.every((cap) => inRange(cap, 0n, MAX_MONEY_SATS)) ||
@@ -313,6 +315,7 @@ function checkLayout(layout: IAssetSpliceLayout) {
 			layout.parentKeys.map((k) => k.toString('hex')),
 			hashHex(layout.parentRoot),
 			layout.stateNumber.toString(),
+			...(layout.priorDigest ? [hashHex(layout.priorDigest)] : []),
 			layout.feeBudgets.map((x) => x.toString()),
 			layout.maxAcceptedHtlcs,
 			signatureLimits,

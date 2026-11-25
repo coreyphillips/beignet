@@ -1,3 +1,4 @@
+import type { AssetUpdateChange } from '../channel/asset-splice-update-provider';
 import {
 	completeAssetSpliceHost,
 	type IStartAssetSplice
@@ -15372,6 +15373,14 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			error: SPLICE_BUSY_SELECTION_PENDING,
 			code: SpliceRefusalCode.SPLICE_BUSY
 		};
+	}
+
+	/** Cross-sign one set of locally authorized changes against every live funding output. */
+	startAssetSpliceUpdate(
+		channelId: Buffer,
+		changes: readonly AssetUpdateChange[]
+	): Promise<void> {
+		return this.channelManager.startAssetSpliceUpdate(channelId, changes);
 	}
 
 	/** Start a private regtest splice after both peers have enrolled asset funding wallets. */
@@ -36294,7 +36303,8 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				(msg.subtype === BeignetCustomSubtype.ASSET_OPEN ||
 					msg.subtype === BeignetCustomSubtype.ASSET_OPEN_CONSENT ||
 					msg.subtype === BeignetCustomSubtype.ASSET_SPLICE ||
-					msg.subtype === BeignetCustomSubtype.ASSET_SPLICE_CONSENT)
+					msg.subtype === BeignetCustomSubtype.ASSET_SPLICE_CONSENT ||
+					msg.subtype === BeignetCustomSubtype.ASSET_UPDATE)
 			) {
 				this.channelManager.handleAssetOpenFrame(
 					pubkey,

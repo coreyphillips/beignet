@@ -181,7 +181,7 @@ describe('Asset splice manifests', () => {
 
 	it('rejects a verified provider result from another state even after both parties acknowledge the new layout', () => {
 		const { layout, tx, verified, auth } = fixture();
-		const revised = { ...layout, stateNumber: 1n };
+		const revised = { ...layout, stateNumber: 1n, priorDigest: hash(49) };
 		const agreed = assetSpliceLayoutDigest(revised);
 		expect(() =>
 			verifyAssetSpliceCandidate(revised, agreed, true, tx, verified, auth)
@@ -535,7 +535,7 @@ describe('Asset splice manifests', () => {
 		const agreed = assetSpliceLayoutDigest(layout);
 		const changed = [
 			{ ...layout, attempt: hash(31) },
-			{ ...layout, stateNumber: 1n },
+			{ ...layout, stateNumber: 1n, priorDigest: hash(49) },
 			{ ...layout, feeBudgets: [1001n, 0n] as const },
 			{
 				...layout,

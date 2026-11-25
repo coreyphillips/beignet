@@ -17,6 +17,7 @@ import {
 
 type Pair<T> = AssetOpenPair<T>;
 interface ParentView {
+	priorDigest?: Buffer;
 	oldOutpoint: { hash: Buffer; index: number };
 	stateNumber: bigint;
 	walletGeneration: 4;
@@ -92,6 +93,11 @@ function fresh(ctx: IAssetSpliceContext): void {
 		ctx.walletGeneration !== 4 ||
 		current?.walletGeneration !== 4 ||
 		current.stateNumber !== ctx.stateNumber ||
+		(ctx.stateNumber > 0n
+			? !ctx.priorDigest ||
+			  ctx.priorDigest.length !== 32 ||
+			  !current.priorDigest?.equals(ctx.priorDigest)
+			: ctx.priorDigest !== undefined || current.priorDigest !== undefined) ||
 		current.oldOutpoint.index !== ctx.oldOutpoint.index ||
 		!current.oldOutpoint.hash.equals(ctx.oldOutpoint.hash)
 	)
@@ -118,6 +124,7 @@ export async function prepareAssetSpliceAgreement(
 	const ctx: IAssetSpliceContext = {
 		...source,
 		attempt: Buffer.from(source.attempt),
+		...(source.priorDigest && { priorDigest: Buffer.from(source.priorDigest) }),
 		oldOutpoint: {
 			...source.oldOutpoint,
 			hash: Buffer.from(source.oldOutpoint.hash)
@@ -176,6 +183,7 @@ export async function prepareAssetSpliceAgreement(
 		parentRoot,
 		parentKeys: pair(keys.map((k) => Buffer.from(k, 'hex'))),
 		stateNumber: ctx.stateNumber,
+		...(ctx.priorDigest && { priorDigest: Buffer.from(ctx.priorDigest) }),
 		dust,
 		feeBudgets: pair(desc.feeBudgets),
 		maxAcceptedHtlcs: bitcoin.maxAcceptedHtlcs,

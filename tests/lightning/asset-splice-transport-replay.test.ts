@@ -1,3 +1,4 @@
+import { encodeTxAbortMessage } from '../../src/lightning/message/interactive-tx';
 import { expect } from 'chai';
 import fs from 'fs';
 import os from 'os';
@@ -41,6 +42,53 @@ describe('Asset splice peer session replay', function () {
 		for (const t of transports.splice(0)) t.destroy();
 		for (const d of setup.devices) d.store.close();
 		fs.rmSync(dir, { recursive: true, force: true });
+	});
+
+	it('consumes the terminal abort acknowledgement only for the last retired attempt', async () => {
+		const d = setup.devices[0],
+			peer = setup.devices[1].party.binding.nodeId,
+			id = setup.id;
+		const host = {
+			spliceContribution: () => 0n,
+			abandonSplice: async () => undefined
+		} as unknown as AssetSpliceHost;
+		const sent: number[] = [],
+			reasons: string[] = [];
+		const t = new AssetSpliceTransport(
+			{ storage: d.store, root: d.party.root },
+			host,
+			(p, i) => p === peer && i === id,
+			() => true,
+			() => 120,
+			(_p, type) => sent.push(type),
+			async () => 'unspent',
+			() => undefined,
+			() => undefined,
+			(_id, e) => reasons.push(e)
+		);
+		transports.push(t);
+		const ack = encodeTxAbortMessage({
+			channelId: Buffer.from(id, 'hex'),
+			data: Buffer.from('Splice abandoned')
+		});
+		expect(t.handle(peer, M.TX_ABORT, ack)).to.equal(false);
+		await t.start(id, { fundingFeeratePerkw: 1000, minimumDepth: 3 });
+		expect(t.handle(peer, M.TX_ABORT, ack)).to.equal(true);
+		for (let i = 0; i < 50 && !sent.includes(M.TX_ABORT); i++)
+			await new Promise<void>((resolve) => setImmediate(resolve));
+		expect(sent).to.include(M.TX_ABORT);
+		expect(t.handle(peer, M.TX_ABORT, ack)).to.equal(true);
+		expect(
+			t.handle(
+				peer,
+				M.TX_ABORT,
+				encodeTxAbortMessage({
+					channelId: Buffer.from(id, 'hex'),
+					data: Buffer.from('unrelated')
+				})
+			)
+		).to.equal(false);
+		expect(reasons).to.deep.equal([]);
 	});
 
 	for (const beforeResume of [false, true])

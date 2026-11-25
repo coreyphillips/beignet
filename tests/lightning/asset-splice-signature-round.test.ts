@@ -6,7 +6,7 @@ import type { Transaction } from 'bitcoinjs-lib';
 import type { IAssetSpliceSigningHost } from '../../src/lightning/channel/asset-splice-signature-round';
 import { SqliteStorage } from '../../src/lightning/storage/sqlite-storage';
 
-import {signatureRoundFixture as setup} from './helpers/asset-splice-signature-round';
+import { signatureRoundFixture as setup } from './helpers/asset-splice-signature-round';
 describe('asset splice Bitcoin commit and funding signature round', () => {
 	let dir: string, t: ReturnType<typeof setup>;
 	beforeEach(() => {

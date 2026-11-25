@@ -167,14 +167,20 @@ describe('Unilateral exits for multiple live asset funding outpoints', () => {
 			finalDigest: 'bb'.repeat(32)
 		});
 		expect(db.loadFinalFundingExits(f.id)).to.have.length(3);
-		reserve({ ...f.evidence(0, 1n), finalDigest: 'ea'.repeat(32) });
-		expect(() => db.loadFinalFundingExits(f.id)).to.throw();
+		const newer = { ...f.evidence(0, 1n), finalDigest: 'ea'.repeat(32) };
+		expect(() => reserve(newer)).to.throw();
 		expect(() =>
-			db.requestFinalOpeningExit(
-				f.id,
-				Transaction.fromHex(second.candidate.localCommitment).ins[0].hash
-			)
+			reserve({ ...newer, priorDigest: '91'.repeat(32) })
 		).to.throw();
+		expect(db.loadFinalFundingExits(f.id)).to.have.length(3);
+		expect(
+			db
+				.requestFinalOpeningExit(
+					f.id,
+					Transaction.fromHex(second.candidate.localCommitment).ins[0].hash
+				)
+				.toString('hex')
+		).to.equal(second.candidate.localCommitment);
 	});
 
 	it('refuses to retain a contradictory commitment for the same outpoint and logical height', () => {

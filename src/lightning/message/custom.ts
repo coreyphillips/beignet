@@ -99,7 +99,8 @@ export enum BeignetCustomSubtype {
 	ASSET_OPEN = 96,
 	ASSET_OPEN_CONSENT = 97,
 	ASSET_SPLICE = 98,
-	ASSET_SPLICE_CONSENT = 99
+	ASSET_SPLICE_CONSENT = 99,
+	ASSET_UPDATE = 100
 }
 
 export interface ICustomMessage {
