@@ -255,6 +255,7 @@ describe('a splice carrying an irrevocable mixed HTLC set', function () {
 					Buffer.of(2)
 				])
 			);
+			const approvals: string[] = [];
 			const hosts = f.f.devices.map((device, i): IAssetSpliceSigningHost => {
 				const old = heads[i].members[0];
 				const fromOld = (h: 'local' | 'remote'): IAssetSpliceExitEvidence => {
@@ -372,6 +373,20 @@ describe('a splice carrying an irrevocable mixed HTLC set', function () {
 						return { ...e, priorDigest: priorDigest.toString('hex') };
 					},
 					async signSpliceFunding(c, digest, tx, indices, prevouts) {
+						assert.equal(c.stateNumber, stateNumber);
+						assert.deepEqual(digest, rounds[i].approved.digest);
+						assert.equal(tx.toHex(), s.tx.toHex());
+						assert.deepEqual(indices, f.f.candidates[i].localInputs);
+						assert.deepEqual(prevouts.scripts, f.f.candidates[i].scripts);
+						assert.deepEqual(
+							prevouts.values,
+							f.f.candidates[i].values.map(BigInt)
+						);
+						approvals.push(tx.getId());
+						if (i === 1) {
+							assert.deepEqual(indices, []);
+							return [];
+						}
 						return walletSigner(device.party.keys.fundingPrivkey, 1, f.f.calls)(
 							tx,
 							indices,
@@ -485,6 +500,27 @@ describe('a splice carrying an irrevocable mixed HTLC set', function () {
 				);
 				await round.retainExits(hosts[i], ctx(i), handles[i]);
 			}
+			const refusingHost = {
+				...hosts[1],
+				async signSpliceFunding(): Promise<Buffer[][]> {
+					throw Error('Wallet refused the shared funding input');
+				}
+			};
+			const acceptor = f.f.devices[1];
+			await assert.rejects(
+				rounds[1].round.nextFunding(
+					refusingHost,
+					ctx(1),
+					async () => 'unspent'
+				),
+				/Wallet refused the shared funding input/
+			);
+			const fundingEvents = () =>
+				acceptor.store
+					.readAssetSpliceJournal<{ kind: string }>(id)
+					.records.map((row) => row.kind);
+			assert(fundingEvents().includes('funding-reserved'));
+			assert(!fundingEvents().includes('funding-released'));
 			const first = await rounds[1].round.nextFunding(
 				hosts[1],
 				ctx(1),
@@ -499,6 +535,16 @@ describe('a splice carrying an irrevocable mixed HTLC set', function () {
 			);
 			assert(second);
 			rounds[1].round.receiveFunding(second);
+			assert.deepEqual(approvals, [s.tx.getId(), s.tx.getId()]);
+			assert(fundingEvents().includes('funding-released'));
+			assert.deepEqual(
+				await make(1).round.nextFunding(
+					refusingHost,
+					ctx(1),
+					async () => 'spent'
+				),
+				first
+			);
 			assert.equal(rounds[0].round.transaction()?.getId(), s.tx.getId());
 			for (const d of f.f.devices)
 				assert.equal(d.store.loadFinalFundingExits(id).length, 2);

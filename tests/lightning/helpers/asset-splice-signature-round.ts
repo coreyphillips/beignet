@@ -83,6 +83,10 @@ export function signatureRoundFixture(dir: string) {
 						.readAssetSpliceJournal<{ kind: string }>(f.id)
 						.records.some((r) => r.kind === 'funding-reserved')
 				);
+				if (i === 1) {
+					assert.deepEqual(indices, []);
+					return [];
+				}
 				return walletSigner(party.keys.fundingPrivkey, 1, f.calls)(
 					tx,
 					indices,

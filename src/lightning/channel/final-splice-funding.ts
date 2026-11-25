@@ -290,8 +290,10 @@ function prepareFinalSpliceFunding(
 		).toString('hex');
 		authority.bindFundingInputs(localWalletInputs, family);
 	}
+	// Asset wallets also approve a shared-input-only contribution and persist it
+	// as a live funding generation before we release the shared signature.
 	const request =
-		!signed && c.localInputs.length
+		!signed && (c.localInputs.length || proofContext)
 			? {
 					unsigned: Transaction.fromBuffer(c.tx.toBuffer()),
 					indices: [...c.localInputs],

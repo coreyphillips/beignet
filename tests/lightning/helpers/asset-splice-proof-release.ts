@@ -406,7 +406,11 @@ export function setupAssetSpliceProofs(
 		i: number,
 		ctx: AlternateContext | undefined,
 		selected = views[i],
-		signer = witness
+		signer: typeof witness = (tx, indices, prevouts) => {
+			if (i === 0) return witness(tx, indices, prevouts);
+			if (indices.length) throw Error('Unexpected external input on acceptor');
+			return [];
+		}
 	) {
 		return signFinalSpliceFunding(
 			candidates[i],
