@@ -91,6 +91,7 @@ type SpliceWatchdog = {
 	disconnect(peer: string): void;
 	close(id: string): void;
 	timeoutMs?: number;
+	observingFunding?(id: string, txid: string, outputIndex: number): boolean;
 };
 type Begin = {
 	deadline: number;
@@ -579,6 +580,8 @@ export class AssetSpliceTransport {
 		if (s.ctx) return s.ctx;
 		const b = s.begin,
 			tx = Transaction.fromHex(b.parent.fundingTxHex);
+		const connected = (): boolean =>
+			this.live.get(id) === s && this.eligible(s.peer, id) && !this.ended(s);
 		s.ctx = {
 			channelId: id,
 			peer: s.peer,
@@ -589,12 +592,7 @@ export class AssetSpliceTransport {
 			...(b.priorDigest && { priorDigest: Buffer.from(b.priorDigest, 'hex') }),
 			oldOutpoint: { hash: tx.getHash(), index: b.parent.fundingOutputIndex },
 			currentParent: () => {
-				if (
-					this.live.get(id) !== s ||
-					!this.eligible(s.peer, id) ||
-					this.ended(s)
-				)
-					return;
+				if (!connected()) return;
 				try {
 					this.store.assertAssetSpliceCanStart(id);
 				} catch {
@@ -617,6 +615,31 @@ export class AssetSpliceTransport {
 					}),
 					walletGeneration: 4 as const
 				};
+			},
+			parentObservationPending: (): boolean => {
+				try {
+					if (
+						!connected() ||
+						Date.now() >= b.deadline ||
+						s.sent.has('broadcast') ||
+						!this.watchdog?.observingFunding?.(
+							id,
+							tx.getId(),
+							b.parent.fundingOutputIndex
+						) ||
+						this.pending(id)?.index !== b.index
+					)
+						return false;
+					this.store.assertAssetSpliceCanStart(id);
+					const parent = this.parentBinding(id);
+					return (
+						!!parent &&
+						sameParent(parent, b) &&
+						!this.available(id, parent.txid, parent.opening)
+					);
+				} catch {
+					return false;
+				}
 			}
 		};
 		return s.ctx;

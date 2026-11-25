@@ -999,6 +999,7 @@ property chain.IChainMonitorState.monitorState: chain.MonitorState
 property chain.IChainMonitorState.trackedOutputs: chain.ITrackedOutput[]
 interface chain.IChainWatcherChannelManager
 method chain.IChainWatcherChannelManager.assetOpeningAnchor?(id: string): { missingWitnesses: boolean; } | undefined
+method chain.IChainWatcherChannelManager.beginFinalFundingObservation?(id: string, txid: string, index: number, minimumDepth: number, current: () => boolean): (() => void) | undefined
 method chain.IChainWatcherChannelManager.finalSpliceParent?(id: string, txid: string): IFinalFundingReference | undefined
 method chain.IChainWatcherChannelManager.forgetFinalFundingConfirmation?(id: Buffer, txid?: string): void
 method chain.IChainWatcherChannelManager.handleFundingConfirmed(channelId: Buffer, confirmedTxidHex?: beignet/cli#TxidHex): void
@@ -1684,6 +1685,7 @@ method channel.ChannelManager.auxiliaryClaimsLost(): Array<{ channelId: Buffer; 
 method channel.ChannelManager.auxiliaryHtlcChainEnding(channelId: Buffer, direction: channel.HtlcDirection, htlcId: bigint): 'fulfilled' | 'failed' | undefined
 method channel.ChannelManager.auxiliaryHtlcDecision(channelId: Buffer, htlcId: bigint): channel.IAuxiliaryHtlcDecision | undefined
 method channel.ChannelManager.auxiliaryRowWritten(channel: channel.Channel): void
+method channel.ChannelManager.beginFinalFundingObservation(id: string, txid: string, index: number, minimumDepth: number, current: () => boolean): (() => void) | undefined
 method channel.ChannelManager.bumpCloseFee(channelId: Buffer, feeSatoshis: bigint): channel.ChannelResult
 method channel.ChannelManager.canForgetPreimage(paymentHash: Buffer, held: ReadonlyArray<{ channelId: Buffer; htlcId: bigint; }>): boolean
 method channel.ChannelManager.canOpenZeroConfTo(pubkeyHex: string): boolean
@@ -2070,6 +2072,7 @@ property channel.IAssetSpliceContext.attempt: Buffer
 property channel.IAssetSpliceContext.channelId: string
 method channel.IAssetSpliceContext.currentParent(): ParentView | undefined
 property channel.IAssetSpliceContext.isInitiator: boolean
+method channel.IAssetSpliceContext.parentObservationPending?(): boolean
 property channel.IAssetSpliceContext.peer: string
 interface channel.IAssetSpliceDescription
 property channel.IAssetSpliceDescription.commitmentRecordLimits: readonly (readonly IAssetSpliceWireRecordLimit[])[]

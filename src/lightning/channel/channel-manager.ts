@@ -1101,6 +1101,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 	private readonly assetOpening?: AssetOpeningCoordinator;
 	private readonly finalTransport?: FinalOpeningTransport;
 	private readonly finalSplice?: FinalSpliceTransport;
+	private readonly finalFundingChecks = new Map<string, () => boolean>();
 	private readonly finalObservedFunding = new Map<
 		string,
 		Map<string, { height: number; parentAtDepth: boolean }>
@@ -1343,6 +1344,10 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 						this.emitContained('error', Buffer.from(id, 'hex'), reason),
 					{
 						timeoutMs: config.quiescenceTimeoutMs,
+						observingFunding: (id, txid, index): boolean =>
+							!this.finalObservedClose.has(id) &&
+							this.finalFundingChecks.get(id + '/' + txid + ':' + index)?.() ===
+								true,
 						disconnect: (peer) => this.peerManager?.recyclePeer(peer, 1000),
 						close: (id) => {
 							if (this.finalObservedClose.has(id)) return;
@@ -10433,6 +10438,29 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 	}
 	restoreAssetSpliceWatches(channelId?: string): void {
 		this.assetSpliceConfirmation?.restore(channelId);
+	}
+	/** Expose a refresh only for a previously confirmed unspent parent while its exact scan ticket is active. */
+	beginFinalFundingObservation(
+		id: string,
+		txid: string,
+		index: number,
+		minimumDepth: number,
+		current: () => boolean
+	): (() => void) | undefined {
+		const height = this.finalObservedFunding.get(id)?.get(txid)?.height;
+		if (
+			!this.config.finalOpening?.storage.canSpliceDualFundedAssets ||
+			!height ||
+			height < 1 ||
+			this._currentBlockHeight - height + 1 < minimumDepth
+		)
+			return;
+		const key = id + '/' + txid + ':' + index;
+		this.finalFundingChecks.set(key, current);
+		return () => {
+			if (this.finalFundingChecks.get(key) === current)
+				this.finalFundingChecks.delete(key);
+		};
 	}
 	suspendAssetSpliceFunding(id: string, txid: string): void {
 		this.assetSpliceConfirmation?.suspend(id, txid);

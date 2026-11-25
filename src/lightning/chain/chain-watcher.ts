@@ -385,6 +385,13 @@ export interface IChainWatcherChannelManager {
 		confirmed: boolean
 	): void;
 	hasAssetSpliceWatch?(id: string, txid: string): boolean;
+	beginFinalFundingObservation?(
+		id: string,
+		txid: string,
+		index: number,
+		minimumDepth: number,
+		current: () => boolean
+	): (() => void) | undefined;
 	suspendAssetSpliceFunding?(id: string, txid: string): void;
 	observeAssetSpliceFunding?(
 		id: string,
@@ -2535,12 +2542,41 @@ export class ChainWatcher extends EventEmitter {
 			this.isCurrentGeneration(generation) &&
 			this.watchedFundings.get(key) === watched &&
 			watched.nextScanTicket === ticket;
+		const finish = this.channelManager.beginFinalFundingObservation?.(
+			watched.channelId.toString('hex'),
+			watched.txid,
+			watched.outputIndex,
+			watched.minimumDepth,
+			() => current() && this.tipObservation === tipObservation
+		);
+		try {
+			await this.readFinalFundingDepth(
+				key,
+				watched,
+				generation,
+				tipObservation,
+				current,
+				finish
+			);
+		} finally {
+			finish?.();
+		}
+	}
+	private async readFinalFundingDepth(
+		key: string,
+		watched: IWatchedFunding,
+		generation: number,
+		tipObservation: number,
+		current: () => boolean,
+		finish?: () => void
+	): Promise<void> {
 		let coins;
 		try {
 			if (!this.backend.listUnspent)
 				throw new Error('Final funding requires an unspent output lookup');
 			coins = await this.backend.listUnspent(watched.scriptHash);
 		} catch (error) {
+			finish?.();
 			if (!current()) return;
 			this.channelManager.suspendAssetSpliceFunding?.(
 				watched.channelId.toString('hex'),
@@ -2562,6 +2598,12 @@ export class ChainWatcher extends EventEmitter {
 				coin.outputIndex === watched.outputIndex &&
 				coin.valueSat === watched.finalFundingValueSat
 		);
+		if (
+			!funding?.height ||
+			funding.height < 1 ||
+			this.currentBlockHeight - funding.height + 1 < watched.minimumDepth
+		)
+			finish?.();
 		if (funding) {
 			// This UTXO also supersedes any spend lookup still reading an older history.
 			const outpoint = watched.txid + ':' + watched.outputIndex;
@@ -2610,6 +2652,7 @@ export class ChainWatcher extends EventEmitter {
 							() => current() && tipObservation === this.tipObservation
 						);
 					} catch (error) {
+						finish?.();
 						if (current()) this.emitError(error as Error);
 					}
 				}
@@ -2641,6 +2684,7 @@ export class ChainWatcher extends EventEmitter {
 					this.currentBlockHeight - inclusion.height + 1 >=
 						watched.minimumDepth;
 			} catch (err) {
+				finish?.();
 				if (!current()) return;
 				this.channelManager.observeFinalFunding?.(
 					id,

@@ -554,6 +554,48 @@ describe('Phase 4: Chain Watcher', () => {
 				present = true;
 				await observe();
 				expect(updates()).to.equal(74);
+				// Two scans can overlap during wallet exit verification. Only the
+				// newest original-device ticket identifies an observation in progress.
+				const marker = () =>
+					channelManager['finalFundingChecks'].get(
+						id + '/' + txid + ':' + index
+					);
+				const reads: ((
+					v: {
+						txid: string;
+						outputIndex: number;
+						valueSat: number;
+						height: number;
+					}[]
+				) => void)[] = [];
+				Object.assign(backend, {
+					listUnspent: () => new Promise((resolve) => reads.push(resolve))
+				});
+				const firstScan = observe();
+				await new Promise<void>((resolve) => setImmediate(resolve));
+				const firstTicket = marker();
+				expect(firstTicket?.()).to.equal(true);
+				const secondScan = observe();
+				await new Promise<void>((resolve) => setImmediate(resolve));
+				expect(firstTicket?.()).to.equal(false);
+				expect(marker()?.()).to.equal(true);
+				reads[0]([]);
+				await firstScan;
+				expect(marker()?.()).to.equal(true);
+				let historicallyVerified = false;
+				Object.assign(backend, {
+					getAssetSpliceInclusion: async () => {
+						expect(marker(), 'spent UTXO before its history proof').to.equal(
+							undefined
+						);
+						historicallyVerified = true;
+						return { txid, blockHash: '44'.repeat(32), confirmations: depth };
+					}
+				});
+				reads[1]([]);
+				await secondScan;
+				expect(historicallyVerified).to.equal(true);
+				expect(marker()).to.equal(undefined);
 				channelManager.suspendAssetSpliceFunding(id, txid);
 				expect(updates()).to.equal(undefined);
 			} finally {

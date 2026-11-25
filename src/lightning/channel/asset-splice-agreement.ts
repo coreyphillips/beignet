@@ -30,6 +30,8 @@ export interface IAssetSpliceContext extends ParentView {
 	isInitiator: boolean;
 	/** Sourced from the enrolled device after quiescence and before each signature. */
 	currentParent(): ParentView | undefined;
+	/** The same authorized original-device parent is undergoing a fresh unspent funding check. */
+	parentObservationPending?(): boolean;
 }
 export interface IAssetSpliceBitcoin {
 	fundingKeys: Pair<Buffer>;

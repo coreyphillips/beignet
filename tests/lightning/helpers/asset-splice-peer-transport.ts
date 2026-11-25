@@ -40,7 +40,13 @@ interface SpliceTransportPair {
 
 /** Two original SQLite devices using the regular on-wire construction and Bitcoin signers. */
 export function setupAssetSplicePeerTransport(
-	dir: string
+	dir: string,
+	observingFunding?: (
+		side: number,
+		channelId: string,
+		txid: string,
+		index: number
+	) => boolean
 ): SpliceTransportPair {
 	const { f, s, hosts } = signatureRoundFixture(dir, true);
 	const { layout } = s;
@@ -127,6 +133,12 @@ export function setupAssetSplicePeerTransport(
 			},
 			(_id, reason) => {
 				errors.push(reason);
+			},
+			observingFunding && {
+				disconnect: (): void => {},
+				close: (): void => {},
+				observingFunding: (id, txid, index): boolean =>
+					observingFunding(i, id, txid, index)
 			}
 		);
 	}
