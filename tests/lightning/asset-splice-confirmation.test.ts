@@ -265,22 +265,38 @@ describe('Splice lock, confirmed wallet receipt and offline recovery', function 
 				fundingTxid: Buffer.from(txid, 'hex').reverse()
 			})
 		);
-		await manager.observeAssetSpliceFunding(
-			f.id,
-			txid,
-			20,
-			async () => ({
-				txid,
-				blockHash: 'b0'.repeat(32),
-				confirmations: 3
-			}),
-			() => true
-		);
+		let reads = 0;
+		let headerAvailable = true;
+		const prove = async (): Promise<{
+			txid: string;
+			blockHash: string;
+			confirmations: number;
+		}> => {
+			reads++;
+			if (!headerAvailable) throw Error('Asset splice header unavailable');
+			return { txid, blockHash: 'b0'.repeat(32), confirmations: 3 };
+		};
+		const observe = (): Promise<void> =>
+			manager.observeAssetSpliceFunding(f.id, txid, 20, prove, () => true);
+		await observe();
 		expect(store.loadAdoptedAssetSpliceReceipt(f.id)?.finalDigest).to.equal(
 			e.finalDigest
 		);
 		expect(manager.isAssetSpliceFundingAvailable(f.id, txid)).to.equal(false);
 		manager.observeFinalFunding(f.id, txid, 20, false);
+		expect(manager.isAssetSpliceFundingAvailable(f.id, txid)).to.equal(true);
+		headerAvailable = false;
+		await manager.retryAssetSpliceLocks(f.id);
+		expect(reads).to.equal(1);
+		expect(manager.isAssetSpliceFundingAvailable(f.id, txid)).to.equal(true);
+		const error = await observe().then(
+			() => undefined,
+			(cause: Error) => cause.message
+		);
+		expect(error).to.equal('Asset splice header unavailable');
+		expect(manager.isAssetSpliceFundingAvailable(f.id, txid)).to.equal(false);
+		headerAvailable = true;
+		await observe();
 		expect(manager.isAssetSpliceFundingAvailable(f.id, txid)).to.equal(true);
 		manager.observeFinalFunding(f.id, txid, undefined, false);
 		expect(manager.isAssetSpliceFundingAvailable(f.id, txid)).to.equal(false);

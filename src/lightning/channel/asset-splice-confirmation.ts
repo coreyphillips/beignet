@@ -434,7 +434,15 @@ export class AssetSpliceConfirmationCoordinator {
 	async retry(id: string): Promise<void> {
 		if (this.store.assetSpliceUpdateHead(id).inProgress) return;
 		for (const e of this.entries.values()) {
-			if (e.terms.channelId !== id || !e.lock.state().peerLocked) continue;
+			if (e.terms.channelId !== id) continue;
+			const lock = e.lock.state();
+			// A completed update can release a deferred lock or wallet import.
+			// An imported generation still follows its independent chain watch.
+			if (
+				!lock.peerLocked ||
+				(lock.adopted && e.imported && !lock.needsReconciliation)
+			)
+				continue;
 			const sample = e.sample;
 			if (sample?.current())
 				await this.observe(
