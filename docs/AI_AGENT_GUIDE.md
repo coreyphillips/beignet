@@ -741,7 +741,7 @@ curl -X POST http://localhost:2112/invoice/pay-safe \
 # Same key with DIFFERENT body — returns 409 IDEMPOTENCY_CONFLICT
 ```
 
-Supported endpoints: `/invoice/pay`, `/invoice/pay-safe`, `/invoice/pay-async`, `/invoice/pay-retry`, `/keysend`, `/keysend/safe`, `/l402/fetch`, `/rebalance`, `/advisor/execute-rebalances`, `/direct-funding/send`, `/send`, `/send-max`, `/offer/pay`, `/channel/splice-out`, `/channel/open`, `/channel/open-v2`, `/channel/open-zeroconf`, `/channel/connect-and-open`.
+Supported endpoints: `/invoice/pay`, `/invoice/pay-safe`, `/invoice/pay-async`, `/invoice/pay-retry`, `/keysend`, `/keysend/safe`, `/l402/fetch`, `/rebalance`, `/advisor/execute-rebalances`, `/direct-funding/send`, `/send`, `/send-max`, `/offer/pay`, `/channel/asset-splice`, `/channel/splice-out`, `/channel/open`, `/channel/open-v2`, `/channel/open-zeroconf`, `/channel/connect-and-open`.
 
 Any other `POST` that carries the header is refused with `400 INVALID_PARAMS`
 and does not run, so a key is never silently dropped. Drop the header for

@@ -4891,7 +4891,7 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						'400': { description: 'Invalid channel ID, feerate or lock depth' },
 						'409': {
 							description:
-								'The original wallet, peer or active channel cannot start an asset splice'
+								'The original wallet, peer or active channel cannot start an asset splice, or X-Idempotency-Key was reused with a different request body'
 						}
 					}
 				}

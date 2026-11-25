@@ -41,7 +41,8 @@ const UNKNOWN_CHANNEL_ID = 'ab'.repeat(32);
 function request(
 	port: number,
 	route: string,
-	body: Record<string, unknown>
+	body: Record<string, unknown>,
+	headers: Record<string, string> = {}
 ): Promise<{ status: number; body: Record<string, unknown> }> {
 	return new Promise((resolve, reject) => {
 		const payload = JSON.stringify(body);
@@ -52,6 +53,7 @@ function request(
 				path: route,
 				method: 'POST',
 				headers: {
+					...headers,
 					'Content-Type': 'application/json',
 					'Content-Length': Buffer.byteLength(payload)
 				}
@@ -124,6 +126,45 @@ describe('Splice routes answer a refusal as a failure', function () {
 				})
 			).status
 		).to.equal(400);
+	});
+
+	it('replays a keyed asset splice after the channel can start another withdrawal', async () => {
+		const route = '/channel/asset-splice';
+		const body = {
+			channelId: UNKNOWN_CHANNEL_ID,
+			fundingFeeratePerkw: 1000,
+			minimumDepth: 3
+		};
+		const headers = { 'X-Idempotency-Key': 'first-asset-withdrawal' };
+		const node = daemon.node.lightningNode;
+		const original = node.startAssetSplice;
+		let starts = 0;
+		node.startAssetSplice = async (): Promise<void> => {
+			starts++;
+		};
+		try {
+			const first = await request(port, route, body, headers);
+			expect(first.status, JSON.stringify(first.body)).to.equal(200);
+			expect(first.body).to.deep.equal({ ok: true, result: { started: true } });
+			expect(await request(port, route, body, headers)).to.deep.equal(first);
+
+			const conflict = await request(
+				port,
+				route,
+				{ ...body, minimumDepth: 4 },
+				headers
+			);
+			expect(conflict.status).to.equal(409);
+			expect((conflict.body.error as { code: string }).code).to.equal(
+				'IDEMPOTENCY_CONFLICT'
+			);
+			expect(starts).to.equal(1);
+
+			expect((await request(port, route, body)).status).to.equal(200);
+			expect(starts).to.equal(2);
+		} finally {
+			node.startAssetSplice = original;
+		}
 	});
 
 	for (const route of ['/channel/splice-in', '/channel/splice-out']) {

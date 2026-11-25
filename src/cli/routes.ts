@@ -341,7 +341,12 @@ const ROUTE_TABLE = [
 	{ method: 'POST', path: '/channel/rebroadcast-close', scopes: [] },
 	{ method: 'POST', path: '/channel/funding-quote', scopes: ['readonly'] },
 	{ method: 'POST', path: '/channel/splice-quote', scopes: ['readonly'] },
-	{ method: 'POST', path: '/channel/asset-splice', scopes: [] },
+	{
+		method: 'POST',
+		path: '/channel/asset-splice',
+		scopes: [],
+		idempotent: true
+	},
 	{ method: 'POST', path: '/channel/splice-in', scopes: [] },
 	// A retried splice-out moves the funds twice, to an external address: a
 	// real spend.
