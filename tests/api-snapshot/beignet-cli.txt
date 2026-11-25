@@ -56,6 +56,7 @@ property BeignetConfig.alias?: string
 property BeignetConfig.announceAddresses?: string[]
 property BeignetConfig.apiKeys?: Array<{ name: string; key: string; scopes: Array<'readonly' | 'invoice' | 'admin'>; expiresAt?: string; }>
 property BeignetConfig.apiToken?: string
+property BeignetConfig.assetSplice?: boolean
 property BeignetConfig.autoBootstrap?: boolean
 property BeignetConfig.autoReconnect?: boolean
 property BeignetConfig.backupIntervalMs?: number
@@ -483,6 +484,7 @@ method BeignetNode.signMessage(message: string): { signature: string; pubkey: st
 method BeignetNode.spliceIn(channelId: ChannelIdHex, amountSats: number, feeratePerkw: number, fundingUtxos?: { utxos: Array<{ txid: TxidHex; vout: number; }>; allowTopUp?: boolean; }): SpliceResult
 method BeignetNode.spliceOut(channelId: ChannelIdHex, amountSats: number, feeratePerkw: number, destinationAddress?: string): SpliceResult
 method BeignetNode.spliceQuote(channelId: ChannelIdHex, direction: 'in' | 'out', feeratePerkw: number, destinationAddress?: string): ReturnType<beignet/lightning#node.LightningNode['spliceQuote']>
+method BeignetNode.startAssetSplice(channelId: ChannelIdHex, fundingFeeratePerkw: number, minimumDepth: number): Promise<{ started: true; }>
 method BeignetNode.storageFiles(): string[]
 method BeignetNode.submitOnchainSweep(requestId: string): Promise<OnchainSweepInfo>
 method BeignetNode.syncGossip(pubkey?: string): string[]
@@ -608,6 +610,7 @@ property BeignetNodeOptions.addressType?: 'p2wpkh' | 'p2tr'
 property BeignetNodeOptions.alias?: string
 property BeignetNodeOptions.allowMultipleInstances?: boolean
 property BeignetNodeOptions.announceAddresses?: string[]
+property BeignetNodeOptions.assetSplice?: boolean
 property BeignetNodeOptions.autoBootstrap?: boolean
 property BeignetNodeOptions.autoGossipSync?: boolean
 property BeignetNodeOptions.autoRebalance?: { enabled?: boolean; budgetSatsPerDay?: number; minImbalancePct?: number; intervalMs?: number; }

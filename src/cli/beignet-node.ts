@@ -518,6 +518,8 @@ export interface BeignetNodeOptions
 	finalCommitmentUpdates?: boolean;
 	/** Enroll a fresh regtest wallet for dual-funded asset channel opening. */
 	dualFundedAssets?: boolean;
+	/** Enroll a fresh regtest wallet for asset channel splices. */
+	assetSplice?: boolean;
 	/**
 	 * option_wumbo (large_channels, default false): advertise the bit and lift
 	 * the 2^24 sat funding cap (up to 10 BTC) for peers that also advertise it.
@@ -3138,6 +3140,18 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 				'Dual-funded assets require a separately enrolled final wallet'
 			);
 		if (
+			opts.assetSplice !== undefined &&
+			(typeof opts.assetSplice !== 'boolean' ||
+				(opts.assetSplice &&
+					(opts.finalTaprootWallet !== true ||
+						opts.finalCommitmentUpdates ||
+						opts.dualFundedAssets)))
+		)
+			throw new BeignetError(
+				'INVALID_PARAMS',
+				'Asset splicing requires a separately enrolled final wallet'
+			);
+		if (
 			opts.finalTaprootWallet !== undefined &&
 			typeof opts.finalTaprootWallet !== 'boolean'
 		)
@@ -3168,7 +3182,8 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 			opts.finalTaprootWallet && opts.mnemonic === undefined
 				? generateFinalDaemonWallet(
 						opts.finalCommitmentUpdates,
-						opts.dualFundedAssets
+						opts.dualFundedAssets,
+						opts.assetSplice
 				  )
 				: undefined;
 		const mnemonic = fresh?.mnemonic ?? (opts.mnemonic || generateMnemonic());
@@ -3263,6 +3278,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 						encryptionKey: encryptionKey!,
 						finalCommitmentUpdates: opts.finalCommitmentUpdates,
 						dualFundedAssets: opts.dualFundedAssets,
+						assetSplice: opts.assetSplice,
 						network: networkName,
 						nodeId
 				  });
@@ -3671,9 +3687,10 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 			? (): ReturnType<SqliteStorage['loadFinalOpenings']> =>
 					this.sqlite()!.loadFinalOpenings()
 			: undefined;
-		const finalSpliceOutpoints = this._bootOpts?.finalCommitmentUpdates
-			? () => this.sqlite()!.loadFinalSpliceWalletOutpoints()
-			: undefined;
+		const finalSpliceOutpoints =
+			this._bootOpts?.finalCommitmentUpdates || this._bootOpts?.assetSplice
+				? () => this.sqlite()!.loadFinalSpliceWalletOutpoints()
+				: undefined;
 		const fees: ExtensionFixedOutputFees | undefined = supply?.fixedOutputFees;
 		if (supply === undefined || fees === undefined) {
 			return new WalletFundingProvider(this.wallet, {
@@ -8164,7 +8181,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 			// by EFFECTIVE state — including one disconnected mid-splice, whose
 			// in-transit funds must not vanish from the bucket while the peer is
 			// away.
-			if (ch.payThroughSplice === undefined) continue;
+			if (ch.auxiliary || ch.payThroughSplice === undefined) continue;
 			const pending = ch.pendingSpliceLocalBalanceMsat ?? ch.localBalanceMsat;
 			if (ch.payThroughSplice) {
 				// Pay-during-splice: the canonical balance already counts this
@@ -8350,7 +8367,15 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	private _runWalletSend<T>(
 		fn: (locked: Pick<Wallet, 'send' | 'sendMax' | 'buildPsbt'>) => Promise<T>
 	): Promise<T> {
-		return this._runOnchainSend(() => this.wallet.withSendLock(fn));
+		return this._runOnchainSend(() =>
+			this.wallet.withSendLock(async (locked) => {
+				if (this._bootOpts?.assetSplice)
+					await this.walletFundingProvider(
+						undefined
+					).renewFinalOpeningPledges();
+				return fn(locked);
+			})
+		);
 	}
 
 	async sendOnchain(
@@ -8525,6 +8550,22 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	private async _broadcastRawTx(hex: string): Promise<TxInfo> {
 		const bitcoin = await import('bitcoinjs-lib');
 		const tx = bitcoin.Transaction.fromHex(hex);
+		if (this._bootOpts?.assetSplice) {
+			const reserved = this.sqlite()!.loadFinalSpliceWalletOutpoints();
+			if (
+				tx.ins.some((input) =>
+					reserved.has(
+						Buffer.from(input.hash).reverse().toString('hex') +
+							':' +
+							input.index
+					)
+				)
+			)
+				throw new BeignetError(
+					'INVALID_PARAMS',
+					'Input is reserved by an asset splice'
+				);
+		}
 		const broadcastRes = await this.wallet.electrum.broadcastTransaction({
 			rawTx: hex
 		});
@@ -9213,7 +9254,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	private assertWalletInputMutable(txid: string, index: number): void {
 		this.onchainSweeps().assertInputMutable(txid, index);
 		if (
-			this._bootOpts?.finalCommitmentUpdates &&
+			(this._bootOpts?.finalCommitmentUpdates || this._bootOpts?.assetSplice) &&
 			this.sqlite()!
 				.loadFinalSpliceWalletOutpoints()
 				.has(txid.toLowerCase() + ':' + index)
@@ -15195,6 +15236,33 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 				this._decodeSpliceDestination(destinationAddress)
 			)
 		);
+	}
+
+	async startAssetSplice(
+		channelId: ChannelIdHex,
+		fundingFeeratePerkw: number,
+		minimumDepth: number
+	): Promise<{ started: true }> {
+		const id = requireChannelIdHex(channelId);
+		requireU32(
+			fundingFeeratePerkw,
+			'fundingFeeratePerkw',
+			1,
+			MAX_SPLICE_FEERATE_PERKW
+		);
+		requireU32(minimumDepth, 'minimumDepth', 1, 6);
+		try {
+			await this.node.startAssetSplice(id, {
+				fundingFeeratePerkw,
+				minimumDepth
+			});
+			return { started: true };
+		} catch (error) {
+			throw new BeignetError(
+				BeignetErrorCode.SPLICE_REFUSED,
+				error instanceof Error ? error.message : String(error)
+			);
+		}
 	}
 
 	spliceIn(

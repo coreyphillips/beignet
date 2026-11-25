@@ -1,4 +1,6 @@
 import { Transaction } from 'bitcoinjs-lib';
+import { ASSET_OPENING_TYPE_HEX } from '../features/asset-opening';
+import { createTaprootFundingScript } from '../script/funding-taproot';
 import { decodeTlvStream } from '../message/tlv';
 import type { IFinalFundingReference } from '../channel/final-splice-candidate';
 import type { IFinalCommitmentView } from '../channel/final-opening-commitment';
@@ -129,7 +131,11 @@ export function signFinalUpdate(
 	nonceKey: Buffer,
 	updates: string[],
 	peerPayload?: Buffer,
-	spliceFunding?: { reference: IFinalFundingReference; privateKey: Buffer }
+	spliceFunding?: {
+		reference: IFinalFundingReference;
+		privateKey: Buffer;
+		asset?: { fundingRoot: Buffer; transcriptDigest: Buffer };
+	}
 ): Buffer {
 	const receiving = peerPayload !== undefined;
 	const tx = view.tx;
@@ -137,6 +143,40 @@ export function signFinalUpdate(
 	const localFundingKey = spliceFunding?.privateKey ?? keys.fundingPrivkey;
 	const funding = Transaction.fromHex(ref.fundingTxHex);
 	const prevout = funding.outs[ref.fundingOutputIndex];
+	const asset = spliceFunding?.asset;
+	if (
+		(candidate.channelType === ASSET_OPENING_TYPE_HEX) !==
+		(asset !== undefined)
+	)
+		throw new Error(
+			'Asset commitment signing requires its funding root and transcript'
+		);
+	if (
+		asset &&
+		(!Buffer.isBuffer(asset.fundingRoot) ||
+			asset.fundingRoot.length !== 32 ||
+			!Buffer.isBuffer(asset.transcriptDigest) ||
+			asset.transcriptDigest.length !== 32 ||
+			!nonceKey.equals(
+				spliceCommitmentNonceContext(
+					candidate.channelId,
+					funding.getHash(),
+					ref.fundingOutputIndex
+				)
+			) ||
+			!prevout ||
+			!prevout.script.equals(
+				createTaprootFundingScript(
+					Buffer.from(ref.localFundingPubkey, 'hex'),
+					Buffer.from(ref.remoteFundingPubkey, 'hex'),
+					undefined,
+					asset.fundingRoot
+				).p2trOutput
+			))
+	)
+		throw new Error(
+			'Asset commitment funding script, nonce context or transcript mismatch'
+		);
 	if (
 		getPublicKey(localFundingKey).toString('hex') !== ref.localFundingPubkey ||
 		tx.ins.length !== 1 ||
@@ -172,7 +212,14 @@ export function signFinalUpdate(
 				point.toString('hex'),
 				digest.toString('hex'),
 				updates,
-				view.htlcs.map((h) => h.digest.toString('hex'))
+				view.htlcs.map((h) => h.digest.toString('hex')),
+				...(asset
+					? [
+							'asset-splice-v1',
+							asset.fundingRoot.toString('hex'),
+							asset.transcriptDigest.toString('hex')
+					  ]
+					: [])
 			])
 		)
 	);
@@ -211,6 +258,7 @@ export function signFinalUpdate(
 			!partial ||
 			!wire.signature.equals(Buffer.alloc(64)) ||
 			wire.channelId.toString('hex') !== candidate.channelId ||
+			(asset && !wire.fundingTxid) ||
 			(wire.fundingTxid !== undefined &&
 				!wire.fundingTxid.equals(funding.getHash())) ||
 			wire.htlcSignatures.length !== view.htlcs.length
@@ -243,7 +291,8 @@ export function signFinalUpdate(
 		holderKey,
 		signerKey,
 		promised,
-		signerNonce
+		signerNonce,
+		asset?.fundingRoot
 	);
 	const partial = wire?.partialSignatureWithNonce?.subarray(0, 32);
 	if (

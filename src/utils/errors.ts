@@ -24,6 +24,8 @@ export class CodedError<C extends string = string> extends Error {
 export enum EWalletErrorCode {
 	/** Built from a bare message, so it names no failure in particular. */
 	UNSPECIFIED = 'UNSPECIFIED',
+	/** The Electrum server answered a transaction lookup without a transaction entry. */
+	ELECTRUM_TRANSACTION_RESPONSE_MISSING = 'ELECTRUM_TRANSACTION_RESPONSE_MISSING',
 	/** The new fee would reach half the value of the transaction's inputs. */
 	FEE_EXCEEDS_HALF_INPUTS = 'FEE_EXCEEDS_HALF_INPUTS',
 	/** The new fee would reach half the amount the transaction sends. */

@@ -47,6 +47,7 @@ export function daemonOptions(
 		finalTaprootWallet: config.finalTaprootWallet,
 		finalCommitmentUpdates: config.finalCommitmentUpdates,
 		dualFundedAssets: config.dualFundedAssets,
+		assetSplice: config.assetSplice,
 		largeChannels: config.largeChannels,
 		apiToken: config.apiToken,
 		apiKeys: config.apiKeys,

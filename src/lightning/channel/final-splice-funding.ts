@@ -1,5 +1,9 @@
-import type { Transaction } from 'bitcoinjs-lib';
+import { Transaction } from 'bitcoinjs-lib';
 import { ecc } from '../../utils/ecc';
+import {
+	createTaprootFundingScript,
+	taprootKeySpendSighash
+} from '../script/funding-taproot';
 import { getPublicKey, isValidPublicKey } from '../crypto/ecdh';
 import { generateNonce } from '../crypto/musig';
 import { sha256 } from '../crypto/provider';
@@ -9,6 +13,11 @@ import {
 	encodeTxSignaturesMessage
 } from '../message/interactive-tx';
 import { validateFinalSpliceExits } from './final-splice-exits';
+import {
+	loadAssetSpliceExitProofs,
+	recordAssetSpliceFundingPhase,
+	type IAssetSpliceReleaseContext
+} from '../storage/asset-splice-exit-proofs';
 import type { FinalOpeningAuthority } from '../storage/final-opening-authority';
 import type { FinalFundingWitnessSigner } from '../storage/final-opening-funding';
 import {
@@ -84,7 +93,8 @@ export function verifyFinalSpliceContribution(
 		terms.oldLocalKey,
 		terms.oldPeerKey,
 		localNonce,
-		peerNonce
+		peerNonce,
+		terms.assetFundingRoots?.parent
 	);
 	const share = data.subarray(0, 32);
 	if (
@@ -112,7 +122,7 @@ export function verifyFinalSpliceContribution(
 }
 
 /** Reserve the local verification nonce before producing either a wallet witness or the shared partial. */
-export function signFinalSpliceFunding(
+function prepareFinalSpliceFunding(
 	c: IFinalSpliceCandidate,
 	terms: IFinalSpliceTerms,
 	id: Buffer,
@@ -121,8 +131,8 @@ export function signFinalSpliceFunding(
 	peerNonce: Buffer,
 	authority: FinalOpeningAuthority,
 	exits: Parameters<typeof validateFinalSpliceExits>[0],
-	signWallet: FinalFundingWitnessSigner
-): Buffer {
+	proofContext?: IAssetSpliceReleaseContext
+) {
 	const handle = nonceHandle(c, key, authority);
 	if (
 		!getPublicKey(key).equals(terms.oldLocalKey) ||
@@ -133,7 +143,115 @@ export function signFinalSpliceFunding(
 		localNonce.equals(peerNonce)
 	)
 		throw new Error('Unverified shared funding nonce or key');
+	// Verify the supplied terms again at the one-use signer boundary.
+	const parent = terms.parent.outs[terms.parentIndex];
+	const shared = c.tx.ins[c.sharedIndex];
+	const roots = terms.assetFundingRoots;
+	if (
+		!parent ||
+		!shared ||
+		!shared.hash.equals(terms.parent.getHash()) ||
+		shared.index !== terms.parentIndex ||
+		c.values[c.sharedIndex] !== parent.value ||
+		!c.scripts[c.sharedIndex]?.equals(parent.script) ||
+		(roots !== undefined &&
+			(!Buffer.isBuffer(roots?.parent) ||
+				roots.parent.length !== 32 ||
+				!Buffer.isBuffer(roots.candidate) ||
+				roots.candidate.length !== 32)) ||
+		!createTaprootFundingScript(
+			terms.oldLocalKey,
+			terms.oldPeerKey,
+			undefined,
+			roots?.parent
+		).p2trOutput.equals(parent.script) ||
+		!createTaprootFundingScript(
+			terms.newLocalKey,
+			terms.newPeerKey,
+			undefined,
+			roots?.candidate
+		).p2trOutput.equals(c.tx.outs[c.fundingIndex].script) ||
+		!taprootKeySpendSighash(c.tx, c.sharedIndex, c.scripts, c.values).equals(
+			c.digest
+		)
+	)
+		throw new Error(
+			'Splice keys, roots or digest disagree with the funding transaction'
+		);
 	validateFinalSpliceExits(exits, c, terms);
+	if (Boolean(proofContext) !== Boolean(roots))
+		throw new Error('Asset funding requires retained proof-backed exits');
+	const localWalletInputs = c.localInputs.map(
+		(i) =>
+			Buffer.from(c.tx.ins[i].hash).reverse().toString('hex') +
+			':' +
+			c.tx.ins[i].index
+	);
+	let receipt: ReturnType<typeof loadAssetSpliceExitProofs> | undefined;
+	let evidenceHash: Buffer | undefined;
+	const assertCurrentAssetState = () => {
+		if (!proofContext || !receipt) return;
+		const channel = id.toString('hex'),
+			head = proofContext.store.assetSpliceUpdateHead(channel);
+		if (
+			head.inProgress ||
+			(head.committed?.height ?? '0') !== receipt.stateNumber ||
+			head.committed?.digest !== receipt.priorDigest
+		)
+			throw new Error(
+				'Asset funding requires the current irrevocable update state'
+			);
+		if (head.committed) {
+			const elected =
+				proofContext.store.loadAdoptedAssetSpliceReceipt(channel)?.candidate
+					.funding ?? proofContext.store.loadFinalOpening(channel);
+			if (
+				!elected ||
+				Transaction.fromHex(elected.fundingTxHex).getId() !==
+					receipt.parent.fundingTxid ||
+				elected.fundingOutputIndex !== receipt.parent.outputIndex
+			)
+				throw new Error('Updated splice parent is no longer elected');
+		}
+	};
+
+	if (proofContext && roots) {
+		const { store, finalDigest, stateNumber, parentRemote, candidateRemote } =
+			proofContext;
+		store.assertAssetSpliceAuthority(authority);
+		if (authority.exitRequest(id.toString('hex')))
+			throw new Error('Cannot release asset funding after a unilateral close');
+		receipt = loadAssetSpliceExitProofs(
+			store,
+			id.toString('hex'),
+			finalDigest.toString('hex')
+		);
+		assertCurrentAssetState();
+		if (String(stateNumber) !== receipt.stateNumber)
+			throw new Error('Asset proof state differs from commitment state');
+		for (const [name, funding, index, remote] of [
+			['parent', terms.parent, terms.parentIndex, parentRemote],
+			['candidate', c.tx, c.fundingIndex, candidateRemote]
+		] as const) {
+			const saved = receipt[name];
+			if (
+				saved.fundingTxid !== funding.getId() ||
+				saved.outputIndex !== index ||
+				saved.fundingRoot !== roots[name].toString('hex') ||
+				saved.localCommitment !== exits[name].signed.toHex() ||
+				saved.remoteCommitment !== remote.toHex()
+			)
+				throw new Error(
+					'Asset funding disagrees with retained commitment or proof generation'
+				);
+		}
+		evidenceHash = recordAssetSpliceFundingPhase(
+			store,
+			receipt,
+			undefined,
+			localWalletInputs
+		);
+	}
 	const txid = c.tx.getId();
 	const retained = sha256(exits.candidate.signed.toBuffer()).toString('hex');
 	authority.claim(
@@ -147,7 +265,16 @@ export function signFinalSpliceFunding(
 			c.digest,
 			localNonce,
 			peerNonce,
-			Buffer.from(retained, 'hex')
+			Buffer.from(retained, 'hex'),
+			...(roots
+				? [
+						terms.oldLocalKey,
+						terms.oldPeerKey,
+						roots.parent,
+						roots.candidate,
+						evidenceHash!
+				  ]
+				: [])
 		])
 	).toString('hex');
 	let signed = authority.claim(slot, transcript);
@@ -161,46 +288,127 @@ export function signFinalSpliceFunding(
 				Buffer.from(String(terms.parentIndex))
 			])
 		).toString('hex');
-		authority.bindFundingInputs(
-			c.localInputs.map(
-				(i) =>
-					Buffer.from(c.tx.ins[i].hash).reverse().toString('hex') +
-					':' +
-					c.tx.ins[i].index
-			),
-			family
-		);
-		const witnesses = c.localInputs.length
-			? signWallet(c.tx.clone(), c.localInputs, {
-					scripts: c.scripts.map((v) => Buffer.from(v)),
-					values: c.values.map(BigInt)
-			  })
-			: [];
-		const session = startCommitmentSigningSession(
-			c.digest,
-			terms.oldLocalKey,
-			terms.oldPeerKey,
-			handle,
-			peerNonce
-		);
-		const partial = partialSignCommitment(session, key, handle);
-		signed = encodeTxSignaturesMessage({
-			channelId: id,
-			txid: c.tx.getHash(),
-			witnesses,
-			sharedInputPartialSignatureWithNonce: Buffer.concat([partial, localNonce])
-		});
+		authority.bindFundingInputs(localWalletInputs, family);
 	}
-	verifyFinalSpliceContribution(
+	// Asset wallets also approve a shared-input-only contribution and persist it
+	// as a live funding generation before we release the shared signature.
+	const request =
+		!signed && (c.localInputs.length || proofContext)
+			? {
+					unsigned: Transaction.fromBuffer(c.tx.toBuffer()),
+					indices: [...c.localInputs],
+					prevouts: {
+						scripts: c.scripts.map((v) => Buffer.from(v)),
+						values: c.values.map(BigInt)
+					}
+			  }
+			: undefined;
+	return {
+		request,
+		finish(witnesses: Buffer[][]): Buffer {
+			assertCurrentAssetState();
+			if (proofContext && authority.exitRequest(id.toString('hex')))
+				throw new Error('Channel closed while authorizing asset funding');
+			signed = authority.claim(slot, transcript);
+			if (!signed) {
+				const session = startCommitmentSigningSession(
+					c.digest,
+					terms.oldLocalKey,
+					terms.oldPeerKey,
+					handle,
+					peerNonce,
+					terms.assetFundingRoots?.parent
+				);
+				const partial = partialSignCommitment(session, key, handle);
+				signed = encodeTxSignaturesMessage({
+					channelId: id,
+					txid: c.tx.getHash(),
+					witnesses,
+					sharedInputPartialSignatureWithNonce: Buffer.concat([
+						partial,
+						localNonce
+					])
+				});
+			}
+			verifyFinalSpliceContribution(
+				c,
+				terms,
+				id,
+				signed,
+				true,
+				localNonce,
+				peerNonce
+			);
+			const packet = authority.finish(slot, transcript, signed);
+			if (proofContext && receipt) {
+				if (authority.exitRequest(id.toString('hex')))
+					throw new Error('Channel closed while authorizing asset funding');
+				recordAssetSpliceFundingPhase(proofContext.store, receipt, packet);
+			}
+			return packet;
+		}
+	};
+}
+
+export function signFinalSpliceFunding(
+	c: IFinalSpliceCandidate,
+	terms: IFinalSpliceTerms,
+	id: Buffer,
+	key: Buffer,
+	localNonce: Buffer,
+	peerNonce: Buffer,
+	authority: FinalOpeningAuthority,
+	exits: Parameters<typeof validateFinalSpliceExits>[0],
+	signWallet: FinalFundingWitnessSigner,
+	proofContext?: IAssetSpliceReleaseContext
+): Buffer {
+	const prepared = prepareFinalSpliceFunding(
 		c,
 		terms,
 		id,
-		signed,
-		true,
+		key,
 		localNonce,
-		peerNonce
+		peerNonce,
+		authority,
+		exits,
+		proofContext
 	);
-	return authority.finish(slot, transcript, signed);
+	const r = prepared.request;
+	return prepared.finish(
+		r ? signWallet(r.unsigned, r.indices, r.prevouts) : []
+	);
+}
+
+/** The device reservation commits before invoking an asynchronous host wallet. */
+export async function signAssetSpliceFunding(
+	c: IFinalSpliceCandidate,
+	terms: IFinalSpliceTerms,
+	id: Buffer,
+	key: Buffer,
+	localNonce: Buffer,
+	peerNonce: Buffer,
+	authority: FinalOpeningAuthority,
+	exits: Parameters<typeof validateFinalSpliceExits>[0],
+	signWallet: (
+		...args: Parameters<FinalFundingWitnessSigner>
+	) => Promise<Buffer[][]>,
+	proofContext: IAssetSpliceReleaseContext
+): Promise<Buffer> {
+	const prepared = prepareFinalSpliceFunding(
+		c,
+		terms,
+		id,
+		key,
+		localNonce,
+		peerNonce,
+		authority,
+		exits,
+		proofContext
+	);
+	const r = prepared.request;
+	return prepared.finish(
+		r ? await signWallet(r.unsigned, r.indices, r.prevouts) : []
+	);
 }
 
 export function assembleFinalSplice(
@@ -235,7 +443,8 @@ export function assembleFinalSplice(
 		terms.oldLocalKey,
 		terms.oldPeerKey,
 		localNonce,
-		peerNonce
+		peerNonce,
+		terms.assetFundingRoots?.parent
 	);
 	const aggregate = aggregateCommitmentSig(session, a.share, b.share);
 	if (

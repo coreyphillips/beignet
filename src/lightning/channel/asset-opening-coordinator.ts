@@ -157,7 +157,10 @@ export class AssetOpeningCoordinator {
 			if (!raw) continue;
 			const start = JSON.parse(raw.toString()) as IAssetOpeningStart;
 			if (start.peer !== peer) continue;
-			if (this.runtime.storage.loadFinalOpeningExit(id)) {
+			if (
+				this.runtime.storage.loadFinalFundingTransaction(id) ||
+				this.runtime.storage.loadFinalOpeningExit(id)
+			) {
 				this.sessions.get(id)?.detach();
 				this.runtime.storage.saveAssetOpenStage(
 					id,
@@ -193,7 +196,10 @@ export class AssetOpeningCoordinator {
 			s = this.sessions.get(id);
 		if (!s || s.start.peer !== peer) return false;
 		if (this.runtime.storage.loadFinalOpeningSession(id)) {
-			if (this.runtime.storage.loadFinalOpeningExit(id)) {
+			if (
+				this.runtime.storage.loadFinalFundingTransaction(id) ||
+				this.runtime.storage.loadFinalOpeningExit(id)
+			) {
 				s.detach();
 				this.runtime.storage.saveAssetOpenStage(
 					id,

@@ -74,7 +74,8 @@ describe('Final wallet CLI initialization recovery', function () {
 		fault?: Interruption,
 		targetHome = home,
 		updates = false,
-		assets = false
+		assets = false,
+		splice = false
 	): {
 		ok: boolean;
 		signal: NodeJS.Signals | null;
@@ -91,7 +92,8 @@ describe('Final wallet CLI initialization recovery', function () {
 				'--network',
 				'regtest',
 				...(assets ? ['--dual-funded-assets'] : ['--final-taproot-wallet']),
-				...(updates ? ['--final-commitment-updates'] : [])
+				...(updates ? ['--final-commitment-updates'] : []),
+				...(splice ? ['--asset-splice'] : [])
 			],
 			{
 				env: {
@@ -252,6 +254,41 @@ describe('Final wallet CLI initialization recovery', function () {
 			await node.destroy();
 		}
 		expect(init(undefined, home, true).ok).to.equal(false);
+	});
+	it('retains the original asset splice enrollment through interrupted publication', async () => {
+		expect(init(undefined, home, false, true, true).ok).to.equal(false);
+		expect(fs.existsSync(db)).to.equal(false);
+		expect(init('kill-signer', home, false, false, true).signal).to.equal(
+			'SIGKILL'
+		);
+		expect(JSON.parse(fs.readFileSync(pending, 'utf8')).version).to.equal(4);
+		expect(init(undefined, home, false, true).ok).to.equal(false);
+		expect(init(undefined, home, false, false, true).ok).to.equal(true);
+		const saved = JSON.parse(fs.readFileSync(config, 'utf8'));
+		expect(saved.assetSplice).to.equal(true);
+		expect(saved.dualFundedAssets).to.equal(undefined);
+		const options = daemonOptions(saved, 0);
+		expect(options.assetSplice).to.equal(true);
+		const node = await BeignetNode.create({
+			...options,
+			network: 'regtest',
+			autoBootstrap: false,
+			autoReconnect: false,
+			electrumHost: '127.0.0.1',
+			electrumPort: 65529,
+			electrumTls: false,
+			logLevel: 'silent'
+		});
+		try {
+			expect(node.getInfo().nodeId).to.equal(
+				deriveLightningKeysFromSeed(
+					mnemonicToSeedSync(saved.mnemonic),
+					1
+				).nodePublicKey.toString('hex')
+			);
+		} finally {
+			await node.destroy();
+		}
 	});
 	it('cannot enroll a supplied pending mnemonic without its original device', () => {
 		const original = interrupt('kill');

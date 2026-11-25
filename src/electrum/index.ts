@@ -48,6 +48,7 @@ import { EElectrumNetworks, EScanningStrategy } from '../types';
 import type { Network } from '../network';
 import { toElectrumNetwork } from '../network';
 import type { Result } from '../utils';
+import { EWalletErrorCode } from '../utils/errors';
 import {
 	btcPerKbToSatPerVbyte,
 	err,
@@ -70,6 +71,22 @@ import {
 	onMessageKeys,
 	POLLING_INTERVAL
 } from '../shapes';
+
+function requireTransactionBatch(response: IGetTransactions): void {
+	if (!response.error) return;
+	// The client puts a string, native Error or JSON-RPC error object in a failed batch.
+	const cause: unknown = response.data;
+	if (typeof cause === 'string' || cause instanceof Error)
+		throw err(cause).error;
+	const message = (cause as { message?: unknown } | null)?.message;
+	throw err(
+		EWalletErrorCode.UNSPECIFIED,
+		typeof message === 'string'
+			? message
+			: 'Electrum transaction request failed',
+		cause
+	).error;
+}
 
 /** Answer of every subscribe refused because the instance has disconnected. */
 const DISCONNECTED_ERROR = 'Electrum instance is disconnected.';
@@ -1872,9 +1889,12 @@ export class Electrum {
 	 * @return {Promise<Result<IGetTransactions>>}
 	 */
 	async getTransactions({
-		txHashes = []
+		txHashes = [],
+		rejectFailedBatches = false
 	}: {
 		txHashes: ITxHash[];
+		/** Return a batch RPC failure to callers requiring the requested transaction. */
+		rejectFailedBatches?: boolean;
 	}): Promise<Result<IGetTransactions>> {
 		try {
 			if (txHashes.length < 1) {
@@ -1901,11 +1921,17 @@ export class Electrum {
 				promises.push(this.requestTransactionBatch(chunk, raw));
 			}
 			const responses = await Promise.all(promises);
-			responses.forEach((response) => {
+			for (const response of responses) {
 				this.noteAnswer(response);
+				if (rejectFailedBatches) requireTransactionBatch(response);
 				if (!response.error) result.push(...response.data);
-			});
-			await this.settleTransactionAnswers(result, server, raw);
+			}
+			await this.settleTransactionAnswers(
+				result,
+				server,
+				raw,
+				rejectFailedBatches
+			);
 			return ok({
 				error: false,
 				id: 0,
@@ -2000,7 +2026,8 @@ export class Electrum {
 	private async settleTransactionAnswers(
 		entries: ITransaction<IUtxo>[],
 		server: string,
-		raw: boolean
+		raw: boolean,
+		rejectFailedBatches = false
 	): Promise<void> {
 		if (raw) {
 			for (const entry of entries) {
@@ -2021,6 +2048,7 @@ export class Electrum {
 			refused.map((entry) => entry.data),
 			true
 		);
+		if (rejectFailedBatches) requireTransactionBatch(retried);
 		if (retried.error || !Array.isArray(retried.data)) return;
 		const answers = new Map<string, ITransaction<IUtxo>>();
 		for (const entry of retried.data) {

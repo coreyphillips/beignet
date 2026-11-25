@@ -4868,6 +4868,34 @@ export function getOpenApiSpec(): Record<string, unknown> {
 					}
 				}
 			},
+			'/channel/asset-splice': {
+				post: {
+					summary:
+						'Start a private regtest asset splice using the wallet contribution policies',
+					tags: ['Channels'],
+					requestBody: bodyContent({
+						channelId: 'string',
+						fundingFeeratePerkw: 'number',
+						minimumDepth: 'number'
+					}),
+					responses: {
+						'200': {
+							description:
+								'Quiescence started. Wait for splice:complete to confirm the new funding output.',
+							content: jsonContent({
+								type: 'object',
+								required: ['started'],
+								properties: { started: { type: 'boolean', enum: [true] } }
+							})
+						},
+						'400': { description: 'Invalid channel ID, feerate or lock depth' },
+						'409': {
+							description:
+								'The original wallet, peer or active channel cannot start an asset splice, or X-Idempotency-Key was reused with a different request body'
+						}
+					}
+				}
+			},
 			'/channel/splice-in': {
 				post: {
 					summary: 'Splice funds into a channel',

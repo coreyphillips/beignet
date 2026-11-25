@@ -85,7 +85,9 @@ export function installOpeningAuthority(
 	const signer = new Sqlite(stagedSigner, { fileMustExist: true });
 	try {
 		signer.pragma('synchronous = EXTRA');
-		if (JSON.parse(identity)[0] === 3) signer.pragma('auto_vacuum = FULL');
+		const generation = JSON.parse(identity)[0];
+		if (generation === 3 || generation === 4)
+			signer.pragma('auto_vacuum = FULL');
 		const secret = randomBytes(32);
 		const origin = JSON.stringify([
 			descriptor(stageWallet, canonical),

@@ -11,6 +11,12 @@
  */
 
 import { expect } from 'chai';
+import { mkdtempSync, rmSync } from 'fs';
+import { tmpdir } from 'os';
+import { join } from 'path';
+import { setupFundedAssetUpdatePair } from './helpers/asset-splice-update';
+import { encodeSpliceLockedMessage } from '../../src/lightning/message/splice';
+import type { IChannelManagerConfig } from '../../src/lightning/channel/channel-manager';
 import crypto from 'crypto';
 import * as bitcoin from 'bitcoinjs-lib';
 import * as ecc from '@bitcoinerlab/secp256k1';
@@ -440,6 +446,202 @@ describe('Phase 4: Chain Watcher', () => {
 			backend.simulateNewBlock(72);
 			await new Promise<void>((done) => setImmediate(done));
 			expect(verdicts.slice(-1)).to.deep.equal([false]);
+		});
+
+		it('permits pending asset updates only for a released candidate with a current mined unspent output', async function () {
+			this.timeout(60000);
+			watcher.stop();
+			const dir = mkdtempSync(join(tmpdir(), 'asset-splice-mixed-readiness-'));
+			const pair = await setupFundedAssetUpdatePair(dir),
+				d = pair.f.devices[0],
+				id = pair.f.id;
+			try {
+				channelManager = new ChannelManager({
+					finalOpening: {
+						storage: d.store,
+						root: d.party.root,
+						dualFunding: {
+							verifySpliceFunding: async () => {},
+							confirmSpliceFunding: async () => {}
+						}
+					},
+					verifyRemoteFundingInput: async () => 'unspent',
+					persistence: COMMIT_ALL
+				} as unknown as IChannelManagerConfig);
+				channelManager.on('error', () => {});
+				const { candidate } = d.store.loadAssetSpliceFundingInfo(id).pending[0],
+					tx = bitcoin.Transaction.fromHex(candidate.funding.fundingTxHex);
+				const txid = tx.getId(),
+					index = candidate.outputIndex,
+					out = tx.outs[index],
+					sh = computeScriptHash(out.script);
+				let present = true,
+					allowProof = false,
+					depth = 1;
+				Object.assign(backend, {
+					listUnspent: async () =>
+						present
+							? [{ txid, outputIndex: index, valueSat: out.value, height: 72 }]
+							: [],
+					getAssetSpliceInclusion: async () => {
+						if (!allowProof) throw Error('No accepted chain proof');
+						return { txid, blockHash: '44'.repeat(32), confirmations: depth };
+					}
+				});
+				backend.setHistory(sh, [{ txid, height: 72 }]);
+				backend.setTransaction(txid, tx.toBuffer());
+				channelManager.restoreAssetSpliceWatches(id);
+				watcher = new ChainWatcher({
+					backend,
+					channelManager,
+					missingDebounceMs: 0
+				});
+				await watcher.start();
+				backend.simulateNewBlock(72);
+				const observe = () =>
+					watcher.watchFinalFundingOutput(
+						Buffer.from(id, 'hex'),
+						txid,
+						index,
+						3,
+						out.script,
+						out.value
+					);
+				const updates = () => channelManager['assetUpdateHeight'](id);
+				await observe();
+				expect(updates()).to.equal(undefined);
+				allowProof = true;
+				await observe();
+				expect(updates()).to.equal(72);
+				expect(channelManager.isAssetSpliceFundingAvailable(id, txid)).to.equal(
+					false
+				);
+				expect(d.store.loadAssetSpliceFundingInfo(id).active).to.equal(
+					undefined
+				);
+				present = false;
+				await observe();
+				expect(updates()).to.equal(undefined);
+				present = true;
+				await observe();
+				expect(updates()).to.equal(72);
+				await channelManager.receiveAssetSpliceLocked(
+					pair.f.devices[1].party.binding.nodeId,
+					encodeSpliceLockedMessage({
+						channelId: Buffer.from(id, 'hex'),
+						fundingTxid: Buffer.from(txid, 'hex').reverse()
+					})
+				);
+				let atImport: number | undefined;
+				channelManager.once('splice:complete', () => {
+					atImport = updates();
+				});
+				depth = 3;
+				backend.simulateNewBlock(74);
+				await observe();
+				expect(d.store.loadAssetSpliceFundingInfo(id).pending).to.be.empty;
+				expect(
+					d.store.loadAssetSpliceFundingInfo(id).active?.candidate.fundingTxid
+				).to.equal(txid);
+				expect(
+					atImport,
+					'current wallet import before the legacy depth callback'
+				).to.equal(74);
+				expect(updates()).to.equal(74);
+				present = false;
+				await observe();
+				expect(updates(), 'spent adopted funding').to.equal(undefined);
+				present = true;
+				await observe();
+				expect(updates()).to.equal(74);
+				// Two scans can overlap during wallet exit verification. Only the
+				// newest original-device ticket identifies an observation in progress.
+				const marker = () =>
+					channelManager['finalFundingChecks'].get(
+						id + '/' + txid + ':' + index
+					);
+				const reads: ((
+					v: {
+						txid: string;
+						outputIndex: number;
+						valueSat: number;
+						height: number;
+					}[]
+				) => void)[] = [];
+				Object.assign(backend, {
+					listUnspent: () => new Promise((resolve) => reads.push(resolve))
+				});
+				const firstScan = observe();
+				await new Promise<void>((resolve) => setImmediate(resolve));
+				const firstTicket = marker();
+				expect(firstTicket?.()).to.equal(true);
+				const secondScan = observe();
+				await new Promise<void>((resolve) => setImmediate(resolve));
+				expect(firstTicket?.()).to.equal(false);
+				expect(marker()?.()).to.equal(true);
+				reads[0]([]);
+				await firstScan;
+				expect(marker()?.()).to.equal(true);
+				let historicallyVerified = false;
+				Object.assign(backend, {
+					getAssetSpliceInclusion: async () => {
+						expect(marker(), 'spent UTXO before its history proof').to.equal(
+							undefined
+						);
+						historicallyVerified = true;
+						return { txid, blockHash: '44'.repeat(32), confirmations: depth };
+					}
+				});
+				reads[1]([]);
+				await secondScan;
+				expect(historicallyVerified).to.equal(true);
+				expect(marker()).to.equal(undefined);
+				channelManager.suspendAssetSpliceFunding(id, txid);
+				expect(updates()).to.equal(undefined);
+			} finally {
+				watcher.stop();
+				for (const dev of pair.f.devices) dev.store.close();
+				rmSync(dir, { recursive: true, force: true });
+			}
+		});
+		it('clears a spent splice outpoint before revalidating its historical inclusion', async () => {
+			const id = crypto.randomBytes(32),
+				txid = 'a2'.repeat(32);
+			const script = Buffer.from('5120' + '2a'.repeat(32), 'hex');
+			const coin = { txid, outputIndex: 1, valueSat: 50000, height: 70 };
+			let spent = false,
+				liveHeight: number | undefined;
+			const history: (number | undefined)[] = [];
+			Object.assign(backend, {
+				listUnspent: async () => (spent ? [] : [coin]),
+				getAssetSpliceInclusion: async () => ({
+					txid,
+					blockHash: 'ba'.repeat(32),
+					confirmations: 3
+				})
+			});
+			Object.assign(channelManager, {
+				hasAssetSpliceWatch: () => true,
+				observeAssetSpliceFunding: async () => {
+					history.push(liveHeight);
+				},
+				observeFinalFunding: (
+					_id: string,
+					_txid: string,
+					height: number | undefined
+				) => {
+					liveHeight = height;
+				}
+			});
+			backend.setHistory(computeScriptHash(script), [{ txid, height: 70 }]);
+			backend.simulateNewBlock(72);
+			await watcher.watchFinalFundingOutput(id, txid, 1, 3, script, 50000);
+			expect(liveHeight).to.equal(70);
+			spent = true;
+			backend.simulateScriptHashChange(computeScriptHash(script));
+			await new Promise<void>((done) => setImmediate(done));
+			expect(history.length).to.be.greaterThan(1);
+			expect(history.at(-1)).to.equal(undefined);
 		});
 
 		it('releases an asset payout callback only for the mature exact outpoint on a current tip', async () => {
