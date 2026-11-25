@@ -22,7 +22,10 @@ import {
 	tweakTaprootKeyPathPrivkey
 } from '../script/commitment-taproot';
 import { verifyTaprootHtlcLeaf } from '../script/htlc-taproot';
-import { assetUpdateHistory } from '../storage/asset-update-history';
+import {
+	assetUpdateHistory,
+	inFlightAssetUpdates
+} from '../storage/asset-update-history';
 import {
 	publishableAssetSpliceEvidence,
 	type AssetSpliceExitEvent
@@ -59,7 +62,13 @@ export function assetHtlcClaims(
 		return [];
 	const opening = storage.loadFinalDaemonOpening(id)!;
 	const history = assetUpdateHistory(storage, id),
-		ledger = history.states.get(state);
+		secured = history.states.get(state),
+		// A peer commitment we signed in an unsecured round names the same obligations.
+		ledger =
+			secured ??
+			(holder === 'remote'
+				? inFlightAssetUpdates(history).get(state)
+				: undefined);
 	if (!ledger) throw Error('Missing signed asset HTLC state');
 	const disclosures = [...history.stages]
 		.filter(([stage]) => stage.endsWith('/intent'))
@@ -121,13 +130,14 @@ export function assetHtlcClaims(
 		);
 	let signed: ReturnType<typeof decodeCommitmentSignedMessage> | undefined;
 	if (local) {
-		const memberIndex = ledger.members.findIndex(
+		if (!secured) throw Error('Missing signed asset HTLC state');
+		const memberIndex = secured.members.findIndex(
 			(b) => Transaction.fromHex(b.localCommitment).getId() === parent.getId()
 		);
 		let raw =
 			memberIndex < 0
 				? undefined
-				: Buffer.from(ledger.peerCommitments[memberIndex], 'hex');
+				: Buffer.from(secured.peerCommitments[memberIndex], 'hex');
 		if (!raw) {
 			const receipt = publishableAssetSpliceEvidence(
 				storage.readAssetSpliceJournal<AssetSpliceExitEvent>(id).records,

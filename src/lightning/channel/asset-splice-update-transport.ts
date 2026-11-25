@@ -109,7 +109,9 @@ export function completeAssetSpliceRecoveryHost(host: unknown): boolean {
 		typeof provider.restoreOutputReceipt === 'function' &&
 		completeAssetOpeningHost(provider as IAuxiliaryDualFunding) &&
 		completeAssetSpliceHost(provider) &&
-		hasAssetUpdateHost(provider)
+		hasAssetUpdateHost(provider) &&
+		typeof (provider as Partial<IAssetSpliceUpdateHost>)
+			.retainAssetUpdatePeerViews === 'function'
 	);
 }
 function checkAuthor(

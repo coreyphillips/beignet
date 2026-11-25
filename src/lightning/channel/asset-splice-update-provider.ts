@@ -79,6 +79,12 @@ export interface IAssetUpdateSignedMember {
 	localEvidence: IAssetUpdateHolderEvidence;
 	remoteEvidence: IAssetUpdateHolderEvidence;
 }
+/** The peer's exact unsigned commitment on one member, before this device signs it. */
+export interface IAssetUpdatePeerMember {
+	outpoint: string;
+	remote: Transaction;
+	remoteEvidence: IAssetUpdateHolderEvidence;
+}
 export interface IAssetUpdateHtlcSigner {
 	signHtlc(
 		hash: Buffer,
@@ -105,5 +111,15 @@ export interface IAssetSpliceUpdateHost {
 	retainAssetUpdateViews(
 		round: IAssetUpdateRound,
 		members: readonly IAssetUpdateSignedMember[]
+	): Promise<void>;
+	/**
+	 * Retain the peer's commitment on every member before this device releases
+	 * its signature for it. The peer can publish that commitment before it
+	 * returns its own signatures, so the host must be able to recover its
+	 * balance and HTLC outputs from it. Required by the recovery profile.
+	 */
+	retainAssetUpdatePeerViews?(
+		round: IAssetUpdateRound,
+		members: readonly IAssetUpdatePeerMember[]
 	): Promise<void>;
 }

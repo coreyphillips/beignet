@@ -1,5 +1,8 @@
 import { decodeRevokeAndAckMessage } from '../message/channel-commitment';
-import { assetUpdateHistory } from '../storage/asset-update-history';
+import {
+	assetUpdateHistory,
+	inFlightAssetUpdates
+} from '../storage/asset-update-history';
 import { Transaction } from 'bitcoinjs-lib';
 import type {
 	IAssetOpeningPayout,
@@ -89,6 +92,48 @@ export function matchedAssetPayoutViews(
 		}
 	}
 
+	// The peer holds our signature for its commitment in a round we have not
+	// secured. It is the peer's current state on that member.
+	for (const [height, round] of history ? inFlightAssetUpdates(history) : []) {
+		for (const b of round.members) {
+			if (
+				parent.ins.length !== 1 ||
+				parent.ins[0].index !== b.outputIndex ||
+				!parent.ins[0].hash.equals(
+					Buffer.from(b.fundingTxid, 'hex').reverse()
+				) ||
+				Transaction.fromHex(b.remoteCommitment).getId() !== parent.getId()
+			)
+				continue;
+			const protection = authority(String(height), 'remote');
+			if (!protection) return [];
+			return [
+				{
+					...protection,
+					...spliceRecoveryView(
+						opening,
+						{ ...session.terms, commitmentFeeratePerKw: round.feerate },
+						evidence.fundingRoot,
+						b,
+						'remote',
+						String(height)
+					),
+					holder: 'remote' as const,
+					state: height,
+					fundingProofs: b.fundingProofs,
+					exitProofs: b.remoteProofs,
+					splice: undefined as IAssetOpeningPayout['splice'],
+					update: {
+						roundDigest: round.digest,
+						stateNumber: String(height),
+						fundingTxid: b.fundingTxid,
+						fundingOutputIndex: b.outputIndex
+					}
+				}
+			];
+		}
+	}
+
 	const retained = storage.canSpliceDualFundedAssets
 		? publishableAssetSpliceEvidence(
 				storage.readAssetSpliceJournal<AssetSpliceExitEvent>(id).records,
@@ -96,8 +141,11 @@ export function matchedAssetPayoutViews(
 		  )
 		: [];
 	const holders = ['local', 'remote'] as const;
-	if (!retained.length)
-		return holders.flatMap((holder) => {
+	// The opening commitment spends the original outpoint at state 0. A splice
+	// signed from a later state keeps no copy of it, so it is matched here by
+	// its exact txid whenever no retained splice commitment matches.
+	const openingMatch = () =>
+		holders.flatMap((holder) => {
 			const protection = authority('0', holder);
 			if (!protection) return [];
 			const assets = assetOpeningLeaves(evidence, holder);
@@ -130,6 +178,7 @@ export function matchedAssetPayoutViews(
 				  ]
 				: [];
 		});
+	if (!retained.length) return openingMatch();
 	const matches = retained.flatMap((entry) =>
 		(['parent', 'candidate'] as const).flatMap((generation) => {
 			const b = entry[generation];
@@ -196,7 +245,7 @@ export function matchedAssetPayoutViews(
 		)
 	)
 		throw new Error('Ambiguous retained proof for watched asset commitment');
-	return first ? [first] : [];
+	return first ? [first] : openingMatch();
 }
 
 /** Follow only released candidate funding outpoints back to the enrolled opening.

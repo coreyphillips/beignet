@@ -118,11 +118,21 @@ export function spliceRecoveryView(
 	opening: IFinalOpeningCandidate,
 	terms: IFinalOpeningTerms,
 	openingRoot: string,
-	branch: IAssetSpliceExitBranch,
+	branch:
+		| IAssetSpliceExitBranch
+		| (Omit<
+				IAssetSpliceExitBranch,
+				'localCommitment' | 'localProofs' | 'localRecovery'
+		  > &
+				Partial<IAssetSpliceExitBranch>),
 	holder: 'local' | 'remote',
 	stateNumber: string
 ) {
 	const h = holder === 'local' ? branch.localRecovery : branch.remoteRecovery;
+	const signed =
+		holder === 'local' ? branch.localCommitment : branch.remoteCommitment;
+	if (!h || !signed)
+		throw new Error('Splice recovery is missing the selected holder');
 	const { funding } = branch;
 	const tx = Transaction.fromHex(funding.fundingTxHex);
 	if (
@@ -179,9 +189,7 @@ export function spliceRecoveryView(
 		Buffer.from(openingRoot, 'hex'),
 		assets
 	);
-	const commitment = Transaction.fromHex(
-		holder === 'local' ? branch.localCommitment : branch.remoteCommitment
-	);
+	const commitment = Transaction.fromHex(signed);
 	const local = holder === 'local';
 	const coin = tx.outs[funding.fundingOutputIndex];
 	if (

@@ -1,4 +1,8 @@
 import type { IAssetSpliceExitBranch } from './asset-splice-exit-proofs';
+import {
+	canonicalSpliceFunding,
+	canonicalSpliceHolder
+} from './asset-splice-recovery';
 import { decodeAssetUpdateIntent } from '../channel/asset-splice-update-intent';
 import type { SqliteStorage } from './sqlite-storage';
 
@@ -23,6 +27,24 @@ export interface IAssetUpdateSecured {
 	peerCommitments: string[];
 	localCommitments: string[];
 }
+/** The peer's side of one member, kept before this device signs the peer's commitment. */
+export type IAssetUpdatePeerExit = Pick<
+	IAssetSpliceExitBranch,
+	| 'minimumDepth'
+	| 'funding'
+	| 'fundingTxid'
+	| 'outputIndex'
+	| 'fundingRoot'
+	| 'fundingProofs'
+	| 'remoteCommitment'
+	| 'remoteProofs'
+	| 'remoteRecovery'
+>;
+export interface IAssetUpdatePeerExits {
+	feerate: number;
+	htlcs: IAssetUpdateSavedHtlc[];
+	members: IAssetUpdatePeerExit[];
+}
 export type AssetUpdateEvent =
 	| IAssetUpdateSecured
 	| {
@@ -38,6 +60,7 @@ export type AssetUpdateEvent =
 				| 'joint-shares'
 				| 'local-htlcs'
 				| 'verified'
+				| 'peer-exits'
 				| 'local-commits'
 				| 'local-revoke'
 				| 'peer-revoke';
@@ -82,6 +105,62 @@ export function assetUpdateHistory(store: SqliteStorage, id: string) {
 		stages.set(key, e.bytes);
 	}
 	return { states, stages, digests, latest: [...states.values()].at(-1) };
+}
+
+const isHex = (v: unknown, bytes?: number): v is string =>
+	typeof v === 'string' &&
+	v.length > 0 &&
+	v.length % 2 === 0 &&
+	(bytes === undefined || v.length === bytes * 2) &&
+	/^[0-9a-f]+$/.test(v);
+
+/**
+ * Peer commitments this device has signed in a round it has not secured yet.
+ * The peer can publish one before it returns its own signatures.
+ */
+export function inFlightAssetUpdates(
+	history: ReturnType<typeof assetUpdateHistory>
+): Map<bigint, IAssetUpdatePeerExits & { digest: string }> {
+	const pending = new Map<bigint, IAssetUpdatePeerExits & { digest: string }>();
+	for (const [key, raw] of history.stages) {
+		const [h, stage] = key.split('/');
+		const height = BigInt(h);
+		if (stage !== 'peer-exits' || history.states.has(height)) continue;
+		const v = JSON.parse(Buffer.from(raw, 'hex').toString()) as unknown;
+		const r = v as Partial<IAssetUpdatePeerExits>;
+		if (
+			!r ||
+			!Number.isSafeInteger(r.feerate) ||
+			!Array.isArray(r.htlcs) ||
+			!Array.isArray(r.members) ||
+			!r.members.length
+		)
+			throw new Error('Invalid in-flight asset update peer exits');
+		const members = r.members.map((m) => {
+			if (
+				!isHex(m.fundingTxid, 32) ||
+				!Number.isSafeInteger(m.outputIndex) ||
+				!Number.isSafeInteger(m.minimumDepth) ||
+				!isHex(m.fundingRoot, 32) ||
+				!isHex(m.fundingProofs) ||
+				!isHex(m.remoteCommitment) ||
+				!isHex(m.remoteProofs)
+			)
+				throw new Error('Invalid in-flight asset update peer exit');
+			return {
+				...m,
+				funding: canonicalSpliceFunding(m.funding),
+				remoteRecovery: canonicalSpliceHolder(m.remoteRecovery)
+			};
+		});
+		pending.set(height, {
+			digest: history.digests.get(height)!,
+			feerate: r.feerate!,
+			htlcs: r.htlcs,
+			members
+		});
+	}
+	return pending;
 }
 
 export function assetSpliceUpdateHead(store: SqliteStorage, id: string) {
