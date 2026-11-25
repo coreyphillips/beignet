@@ -189,7 +189,8 @@ describe('Asset splice admission on each commitment wire', () => {
 			'signAssetUpdateViews',
 			'signAssetUpdateHtlcs',
 			'verifyAssetUpdateViews',
-			'retainAssetUpdateViews'
+			'retainAssetUpdateViews',
+			'retainAssetUpdatePeerViews'
 		];
 		const host = {
 			version: 1,
@@ -204,6 +205,7 @@ describe('Asset splice admission on each commitment wire', () => {
 			'restoreOutputReceipt',
 			'recoverOutput',
 			'retainAssetUpdateViews',
+			'retainAssetUpdatePeerViews',
 			'verifySpliceFunding'
 		]) {
 			expect(

@@ -43,6 +43,7 @@ import {
 import {
 	assetUpdateHistory,
 	type AssetUpdateEvent,
+	type IAssetUpdatePeerExits,
 	type IAssetUpdateSecured
 } from '../storage/asset-update-history';
 import {
@@ -58,6 +59,7 @@ import type {
 	IAssetUpdateRound,
 	IAssetSpliceUpdateHost,
 	IAssetUpdateHolderEvidence,
+	IAssetUpdatePeerMember,
 	IAssetUpdateSignedMember
 } from './asset-splice-update-provider';
 import {
@@ -720,6 +722,113 @@ export class AssetSpliceUpdateBatch {
 				8 * ASSET_OPEN_OBJECT_LIMIT
 			)
 		);
+		await this.retainPeerExits(host);
+	}
+	/** The peer's commitment on every member, kept before this device signs it. */
+	private peerExits(): IAssetUpdatePeerExits {
+		const ev = this.evidence();
+		return {
+			feerate: this.next.feerate,
+			htlcs: this.next.htlcs.map(saveUpdateHtlc),
+			members: this.sources.map((s, i) => {
+				const b = this.branch(s, ev[i], 'remote');
+				return {
+					minimumDepth: b.minimumDepth,
+					funding: b.funding,
+					fundingTxid: b.fundingTxid,
+					outputIndex: b.outputIndex,
+					fundingRoot: b.fundingRoot,
+					fundingProofs: b.fundingProofs,
+					remoteCommitment: b.remoteCommitment,
+					remoteProofs: b.remoteProofs,
+					remoteRecovery: b.remoteRecovery
+				};
+			})
+		};
+	}
+	private async retainPeerExits(host: IAssetSpliceUpdateHost) {
+		if (this.stage('peer-exits')) return;
+		const ev = this.evidence();
+		const exact: IAssetUpdatePeerMember[] = this.sources.map((s, i) => ({
+			outpoint: fundingPoint(s.funding),
+			remote: this.checkHolder(s, 'remote', ev[i].remote).tx,
+			remoteEvidence: ev[i].remote
+		}));
+		const record = pack(this.peerExits());
+		await host.retainAssetUpdatePeerViews?.(this.request(), exact);
+		// Bounded like the secured round it precedes, by its canonical fields.
+		this.save('peer-exits', record);
+	}
+	private recovery(
+		s: UpdateSource,
+		e: IAssetUpdateMemberEvidence,
+		side: Side
+	): IAssetSpliceHolderRecovery {
+		const v = e[side],
+			view = this.checkHolder(s, side, v);
+		return {
+			point: hex(side === 'local' ? this.localPoint : this.peerPoint),
+			localBalanceMsat: String(s.localBalanceMsat),
+			remoteBalanceMsat: String(s.remoteBalanceMsat),
+			toLocal: encodedLeaf(v.toLocal),
+			toRemote: encodedLeaf(v.toRemote),
+			ownedOutputIndex:
+				(side === 'local' ? view.outputMap.toLocal : view.outputMap.toRemote) ??
+				null,
+			htlcs: this.next.htlcs.map((h) => {
+				const htlc = view.htlcs.find(
+						(x) => x.htlc.id === h.id && x.htlc.offeredBy === h.offeredBy
+					),
+					leaf = v.htlcs.find(
+						(x) => x.id === h.id && x.offeredBy === h.offeredBy
+					);
+				return {
+					id: String(h.id),
+					offeredBy: h.offeredBy,
+					amountMsat: String(h.amountMsat),
+					paymentHash: hex(h.paymentHash),
+					cltvExpiry: h.cltvExpiry,
+					outputIndex: htlc?.outputIndex ?? null,
+					outputLeaf: encodedLeaf(leaf?.output),
+					secondLevelLeaf: encodedLeaf(leaf?.secondLevel)
+				};
+			})
+		};
+	}
+	/** One member's recovery branch; the local commitment is signed only once secured. */
+	private branch(
+		s: UpdateSource,
+		e: IAssetUpdateMemberEvidence,
+		checked: Side | 'both',
+		localCommitment?: Transaction
+	) {
+		const remote = this.checkHolder(s, 'remote', e.remote).tx;
+		const b = {
+			minimumDepth: s.minimumDepth,
+			funding: { ...s.funding },
+			fundingTxid: Transaction.fromHex(s.funding.fundingTxHex).getId(),
+			outputIndex: s.funding.fundingOutputIndex,
+			fundingRoot: s.root,
+			fundingProofs: s.proofs,
+			localCommitment: localCommitment?.toHex() ?? '',
+			remoteCommitment: remote.toHex(),
+			localProofs: hex(e.local.proofs),
+			remoteProofs: hex(e.remote.proofs),
+			localRecovery: this.recovery(s, e, 'local'),
+			remoteRecovery: this.recovery(s, e, 'remote')
+		} satisfies IAssetSpliceExitBranch;
+		for (const side of checked === 'both'
+			? (['local', 'remote'] as const)
+			: [checked])
+			spliceRecoveryView(
+				this.opening.candidate,
+				{ ...this.base, commitmentFeeratePerKw: this.next.feerate },
+				hex(this.originalRoot),
+				b,
+				side,
+				String(this.height)
+			);
+		return b;
 	}
 	private evidence(): IAssetUpdateMemberEvidence[] {
 		const v = this.stage('verified');
@@ -773,6 +882,11 @@ export class AssetSpliceUpdateBatch {
 	commitments(): Buffer[] {
 		const old = this.stage('local-commits');
 		if (old) return (JSON.parse(old.toString()) as string[]).map(bytes);
+		const kept = this.stage('peer-exits');
+		if (!kept || !kept.equals(pack(this.peerExits())))
+			throw new Error(
+				'Asset update peer exits must be retained before signing them'
+			);
 		const ev = this.evidence(),
 			verified = hex(sha256(this.stage('verified')!));
 		const raw = ev.map((e, i) => {
@@ -880,65 +994,9 @@ export class AssetSpliceUpdateBatch {
 			localEvidence: ev[i].local,
 			remoteEvidence: ev[i].remote
 		}));
-		const members = this.sources.map((s, i) => {
-			const holder = (side: Side): IAssetSpliceHolderRecovery => {
-				const v = ev[i][side],
-					view = this.checkHolder(s, side, v);
-				return {
-					point: hex(side === 'local' ? this.localPoint : this.peerPoint),
-					localBalanceMsat: String(s.localBalanceMsat),
-					remoteBalanceMsat: String(s.remoteBalanceMsat),
-					toLocal: encodedLeaf(v.toLocal),
-					toRemote: encodedLeaf(v.toRemote),
-					ownedOutputIndex:
-						(side === 'local'
-							? view.outputMap.toLocal
-							: view.outputMap.toRemote) ?? null,
-					htlcs: this.next.htlcs.map((h) => {
-						const htlc = view.htlcs.find(
-								(x) => x.htlc.id === h.id && x.htlc.offeredBy === h.offeredBy
-							),
-							leaf = v.htlcs.find(
-								(x) => x.id === h.id && x.offeredBy === h.offeredBy
-							);
-						return {
-							id: String(h.id),
-							offeredBy: h.offeredBy,
-							amountMsat: String(h.amountMsat),
-							paymentHash: hex(h.paymentHash),
-							cltvExpiry: h.cltvExpiry,
-							outputIndex: htlc?.outputIndex ?? null,
-							outputLeaf: encodedLeaf(leaf?.output),
-							secondLevelLeaf: encodedLeaf(leaf?.secondLevel)
-						};
-					})
-				};
-			};
-			const b: IAssetSpliceExitBranch = {
-				minimumDepth: s.minimumDepth,
-				funding: { ...s.funding },
-				fundingTxid: Transaction.fromHex(s.funding.fundingTxHex).getId(),
-				outputIndex: s.funding.fundingOutputIndex,
-				fundingRoot: s.root,
-				fundingProofs: s.proofs,
-				localCommitment: exact[i].local.toHex(),
-				remoteCommitment: exact[i].remote.toHex(),
-				localProofs: hex(ev[i].local.proofs),
-				remoteProofs: hex(ev[i].remote.proofs),
-				localRecovery: holder('local'),
-				remoteRecovery: holder('remote')
-			};
-			for (const side of ['local', 'remote'] as const)
-				spliceRecoveryView(
-					this.opening.candidate,
-					{ ...this.base, commitmentFeeratePerKw: this.next.feerate },
-					hex(this.originalRoot),
-					b,
-					side,
-					String(this.height)
-				);
-			return b;
-		});
+		const members = this.sources.map((s, i) =>
+			this.branch(s, ev[i], 'both', exact[i].local)
+		);
 		await host.retainAssetUpdateViews(this.request(), exact);
 		this.fresh();
 		const secured: IAssetUpdateSecured = {

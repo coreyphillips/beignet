@@ -43,5 +43,6 @@ export type {
 	IAssetUpdateRound,
 	IAssetUpdateMemberEvidence,
 	IAssetUpdateSignedMember,
+	IAssetUpdatePeerMember,
 	IAssetUpdateHtlcSigner
 } from './asset-splice-update-provider';

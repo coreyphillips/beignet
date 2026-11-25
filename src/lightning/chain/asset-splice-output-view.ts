@@ -1,5 +1,8 @@
 import { decodeRevokeAndAckMessage } from '../message/channel-commitment';
-import { assetUpdateHistory } from '../storage/asset-update-history';
+import {
+	assetUpdateHistory,
+	inFlightAssetUpdates
+} from '../storage/asset-update-history';
 import { Transaction } from 'bitcoinjs-lib';
 import type {
 	IAssetOpeningPayout,
@@ -86,6 +89,48 @@ export function matchedAssetPayoutViews(
 					}
 				];
 			}
+		}
+	}
+
+	// The peer holds our signature for its commitment in a round we have not
+	// secured. It is the peer's current state on that member.
+	for (const [height, round] of history ? inFlightAssetUpdates(history) : []) {
+		for (const b of round.members) {
+			if (
+				parent.ins.length !== 1 ||
+				parent.ins[0].index !== b.outputIndex ||
+				!parent.ins[0].hash.equals(
+					Buffer.from(b.fundingTxid, 'hex').reverse()
+				) ||
+				Transaction.fromHex(b.remoteCommitment).getId() !== parent.getId()
+			)
+				continue;
+			const protection = authority(String(height), 'remote');
+			if (!protection) return [];
+			return [
+				{
+					...protection,
+					...spliceRecoveryView(
+						opening,
+						{ ...session.terms, commitmentFeeratePerKw: round.feerate },
+						evidence.fundingRoot,
+						b,
+						'remote',
+						String(height)
+					),
+					holder: 'remote' as const,
+					state: height,
+					fundingProofs: b.fundingProofs,
+					exitProofs: b.remoteProofs,
+					splice: undefined as IAssetOpeningPayout['splice'],
+					update: {
+						roundDigest: round.digest,
+						stateNumber: String(height),
+						fundingTxid: b.fundingTxid,
+						fundingOutputIndex: b.outputIndex
+					}
+				}
+			];
 		}
 	}
 

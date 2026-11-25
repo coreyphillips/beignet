@@ -2152,6 +2152,7 @@ property channel.IAssetSpliceHostExitViews.parent: Record<Holder, IAssetSpliceHo
 property channel.IAssetSpliceHostExitViews.paymentBasepoints: channel.AssetOpenPair<Buffer>
 property channel.IAssetSpliceHostExitViews.terms: IFinalOpeningTerms
 interface channel.IAssetSpliceUpdateHost
+method channel.IAssetSpliceUpdateHost.retainAssetUpdatePeerViews?(round: channel.IAssetUpdateRound, members: readonly channel.IAssetUpdatePeerMember[]): Promise<void>
 method channel.IAssetSpliceUpdateHost.retainAssetUpdateViews(round: channel.IAssetUpdateRound, members: readonly channel.IAssetUpdateSignedMember[]): Promise<void>
 method channel.IAssetSpliceUpdateHost.signAssetUpdateHtlcs(round: channel.IAssetUpdateRound, jointShares: channel.AssetOpenPair<Buffer>, signer: channel.IAssetUpdateHtlcSigner): Promise<Buffer>
 method channel.IAssetSpliceUpdateHost.signAssetUpdateViews(round: channel.IAssetUpdateRound): Promise<Buffer>
@@ -2164,6 +2165,10 @@ interface channel.IAssetUpdateMemberEvidence
 property channel.IAssetUpdateMemberEvidence.local: IAssetUpdateHolderEvidence
 property channel.IAssetUpdateMemberEvidence.outpoint: string
 property channel.IAssetUpdateMemberEvidence.remote: IAssetUpdateHolderEvidence
+interface channel.IAssetUpdatePeerMember
+property channel.IAssetUpdatePeerMember.outpoint: string
+property channel.IAssetUpdatePeerMember.remote: bitcoinjs-lib#Transaction
+property channel.IAssetUpdatePeerMember.remoteEvidence: IAssetUpdateHolderEvidence
 interface channel.IAssetUpdateRound
 property channel.IAssetUpdateRound.changes: readonly channel.AssetUpdateChange[]
 property channel.IAssetUpdateRound.channelId: string
