@@ -6,9 +6,10 @@ import { walletSigner } from './final-update-pair';
 
 export function signatureRoundFixture(
 	dir: string,
-	transportAllocatesKeys = false
+	transportAllocatesKeys = false,
+	generation: 4 | 5 = 4
 ) {
-	const s = constructionFixture(dir),
+	const s = constructionFixture(dir, generation),
 		{ f, layout } = s;
 	f.fundOpening();
 	const pending = f.devices.map((d) =>
@@ -27,12 +28,12 @@ export function signatureRoundFixture(
 		peer: f.devices[1 - i].party.binding.nodeId,
 		attempt: layout.attempt,
 		isInitiator: i === 0,
-		walletGeneration: 4 as const,
+		walletGeneration: generation,
 		stateNumber: 0n,
 		oldOutpoint: { hash: layout.parent.getHash(), index: layout.parentIndex },
 		currentParent: () => ({
 			stateNumber: 0n,
-			walletGeneration: 4 as const,
+			walletGeneration: generation,
 			oldOutpoint: { hash: layout.parent.getHash(), index: layout.parentIndex }
 		})
 	});

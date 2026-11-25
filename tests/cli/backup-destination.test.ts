@@ -278,6 +278,107 @@ describe('Backup destination (issue #1230)', () => {
 			).to.equal('');
 		});
 
+		it('exports a channel frame through the admin route and the backup command', async function () {
+			this.timeout(120_000);
+			const id = '09'.repeat(32);
+			const source = path.join(home, 'frame-destinations');
+			const alias = path.join(home, 'frame-directory-link');
+			fs.mkdirSync(source);
+			fs.symlinkSync(source, alias);
+			const calls: string[][] = [];
+			const original = daemon.node.backupAssetChannelFrame;
+			daemon.node.backupAssetChannelFrame = async (channelId, destination) => {
+				calls.push([channelId, destination]);
+			};
+			try {
+				const direct = path.join(source, 'rpc.frame');
+				const result = await post(port, '/backup', {
+					channelId: id,
+					destPath: path.join(alias, 'rpc.frame')
+				});
+				expect(result.status).to.equal(200);
+				expect(result.body).to.deep.equal({
+					ok: true,
+					result: { backed_up: true, path: direct, channelId: id }
+				});
+				fs.writeFileSync(
+					path.join(home, '.beignet', 'daemon.pid'),
+					JSON.stringify({ pid: process.pid, port })
+				);
+				const cli = path.join(source, 'cli.frame');
+				const stdout = await runCli(source, home, [
+					'backup',
+					'asset-channel',
+					id,
+					'cli.frame'
+				]);
+				expect(JSON.parse(stdout)).to.deep.equal({
+					ok: true,
+					result: { backed_up: true, path: cli, channelId: id }
+				});
+				expect(calls).to.deep.equal([
+					[id, direct],
+					[id, cli]
+				]);
+			} finally {
+				daemon.node.backupAssetChannelFrame = original;
+			}
+		});
+
+		it('rejects invalid channel frame requests before invoking either backup method', async function () {
+			this.timeout(120_000);
+			const id = 'ad'.repeat(32);
+			const dest = path.join(home, 'unused-channel.frame');
+			const calls: string[] = [];
+			const originalFrame = daemon.node.backupAssetChannelFrame;
+			const originalBackup = daemon.node.backup;
+			daemon.node.backupAssetChannelFrame = async () => {
+				calls.push('channel');
+			};
+			daemon.node.backup = async () => {
+				calls.push('database');
+			};
+			try {
+				for (const invalid of [null, 9, '', 'x'.repeat(64), 'fe']) {
+					const res = await post(port, '/backup', {
+						channelId: invalid,
+						destPath: dest
+					});
+					expect(res.status).to.equal(400);
+					expect(res.body.error?.code).to.equal('INVALID_PARAMS');
+				}
+				const existing = path.join(home, 'protected-channel.frame');
+				fs.writeFileSync(existing, 'preserve');
+				for (const body of [
+					{ destPath: existing },
+					{ destPath: path.join(dataDir, 'regtest.db') },
+					{ destPath: dest, overwrite: true }
+				]) {
+					const res = await post(port, '/backup', { channelId: id, ...body });
+					expect(res.status).to.equal(400);
+					expect(res.body.error?.code).to.equal('INVALID_PARAMS');
+				}
+				fs.writeFileSync(
+					path.join(home, '.beignet', 'daemon.pid'),
+					JSON.stringify({ pid: process.pid, port })
+				);
+				const bad = await runCli(home, home, [
+					'backup',
+					'asset-channel',
+					id,
+					dest,
+					'--overwrite'
+				]);
+				expect(JSON.parse(bad).ok).to.equal(false);
+				expect(calls).to.deep.equal([]);
+				expect(fs.existsSync(dest)).to.equal(false);
+				expect(fs.readFileSync(existing, 'utf8')).to.equal('preserve');
+			} finally {
+				daemon.node.backupAssetChannelFrame = originalFrame;
+				daemon.node.backup = originalBackup;
+			}
+		});
+
 		it('writes a new file, and replaces an existing one only with overwrite', async () => {
 			const dest = path.join(home, 'backup.db');
 			const first = await post(port, '/backup', { destPath: dest });

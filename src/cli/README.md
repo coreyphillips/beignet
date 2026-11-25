@@ -93,6 +93,7 @@ await node.destroy();
 | `finalCommitmentUpdates?` | `boolean` | Enroll a new regtest wallet for type-80 payments, splicing and closes. |
 | `dualFundedAssets?` | `boolean` | Enroll a fresh regtest wallet for dual-funded asset channel opening. |
 | `assetSplice?` | `boolean` | Enroll a fresh regtest wallet for asset channel splices. |
+| `assetSpliceRecovery?` | `boolean` | Enroll a fresh regtest wallet for revocable asset payouts across splices. |
 | `largeChannels?` | `boolean` | option_wumbo (large_channels, default false): advertise the bit and lift the 2^24 sat funding cap (up to 10 BTC) for peers that also advertise it. |
 | `autoBootstrap?` | `boolean` | Connect to DNS seed peers (BOLT 10) at startup (default false). |
 | `autoReconnect?` | `boolean` | Enable auto-reconnection to peers (default true) |
@@ -433,6 +434,7 @@ Automatic execution is **off by default**: pass `autoRebalance: { enabled: true,
 | Method | Returns | Description |
 |--------|---------|-------------|
 | `backup(destPath)` | `Promise<void>` | Create online backup of SQLite database, with its MAC in `<destPath>.hmac` |
+| `backupAssetChannelFrame(channelId, destPath)` | `Promise<void>` | Export an encrypted recovery frame for one funded generation 5 regtest channel to a new file |
 | `storageFiles()` | `string[]` | The live database, its sidecars and the instance lock (paths `POST /backup` refuses to write over) |
 
 Storage encryption: the SQLite database is encrypted at rest by default with a
@@ -500,10 +502,14 @@ With `peerStorageEnabled` (default true) the node advertises
 |--------|---------|-------------|
 | `restoreFromScb(encoded)` | `Promise<{ recovering, skipped, channelCount }>` | Recover channels from an SCB blob (daemon: `POST /restore/scb` with `{ encoded }` or `{ path }`; CLI: `beignet restore scb <file>`) |
 | `beignet restore db <backupFile> [--unauthenticated]` | JSON result | Copy an authenticated database backup into place (OFFLINE, local CLI operation - no daemon call) |
+| `beignet restore asset-channel <channelId> <backupFile>` | JSON result | Repair one funded regtest asset channel on its enrolled original device while the daemon is stopped. |
 | `restoreFromGuardians()` | `Promise<{ exact, framesApplied, guardiansRepaired, epoch }>` | Restore from guardian replicas and start the node on the restored state (daemon: `POST /recovery/restore` with `{ confirm: true }`; CLI: `beignet recovery restore`) |
 | `restoreFromCapsules({ unfenced?, omitAssetChannels? })` | `Promise<{ tier, channelCount, framesApplied, head, newestSeenHead, rejectedCandidates, restartRequired, unfenced?, recovering?, skipped?, omittedAssetChannels? }>` | Peer-storage mode: restore from the Recovery Capsules storage peers returned this session (daemon: `POST /recovery/restore-capsule` with `{ confirm: true }`; CLI: `beignet recovery restore-capsule`). Tier 2 installs the exact state into a fresh database and holds the daemon until a restart; Tier 1 recovers the embedded SCB on the live node. `omitAssetChannels: true` leaves the asset channels the capsule holds out in place of refusing the restore, and lists them in `omittedAssetChannels` as `{ channelId, peerPubkey, capacitySats }`; the payments that were in flight on one are listed by hash in `unresolvedPayments` and stay PENDING with `unresolved` on their rows ([docs/EXTENSIONS.md](../../docs/EXTENSIONS.md)) |
 
-Three very different restore modes:
+After a regtest channel enrolled with `--asset-splice-recovery` is funded and ready, run `beignet backup asset-channel <channelId> <destPath>` to save an encrypted local recovery frame. Choose a new filename for each export. Frames taken before and after a splice are hash-linked on the original device. Keep the asset extension's matching recovery backup alongside the engine backup.
+
+Both `--asset-splice` and `--asset-splice-recovery` wallets also support a full SQLite snapshot through `beignet backup <destPath>`. Keep its `.hmac` file. To repair one channel, stop the daemon on the enrolled device and run `beignet restore asset-channel <channelId> <backupFile>` with its original database, signer and device journal present. The command recognizes either supported format, restores missing opening records and checks the saved journal prefix against the device's current history. The result reports `snapshotSequence` and `currentSequence` for the splice journal, plus `frameSequence` for a channel frame. An earlier backup can recover later confirmed payouts using the records on that device. Guardian and peer-storage recovery have their own formats.
+
 
 - **SCB restore = on-chain recovery only.** The backup holds no commitment
   state, so the channels themselves cannot be resumed. Each entry is
@@ -2986,7 +2992,7 @@ The matching commands are `wallet sweep-prepare <requestJson|requestFile>`, `wal
 | GET | `/graph/describe` | `?limit=&offset=` | Paged channel dump (limit defaults to 500, capped at 500) |
 | POST | `/route/query` | `{ destination, amountSats, maxFeeSats? }` | Compute a route WITHOUT sending; hops feed `/payment/send-to-route` |
 | POST | `/payment/send-to-route` | `{ paymentHash, route: { hops }, paymentSecret? }` | Send a payment along an explicit route from `/route/query`. Answers 409 while draining and 403 over a spending limit, judged on what the first hop carries (amount plus every fee); a first hop below the final amount or a negative amount is 400 `INVALID_PARAMS` |
-| POST | `/backup` | `{ destPath, overwrite? }` | Create online database backup. An existing `destPath` is 400 `INVALID_PARAMS` unless `overwrite: true`; the live database, its sidecars, the instance lock, `config.json` and `daemon.pid` are refused even then |
+| POST | `/backup` | `{ destPath, channelId?, overwrite? }` | Admin export. A database backup returns `path` and `macPath` and accepts `overwrite: true` for an existing backup. Supplying a generation 5 channel ID exports an encrypted recovery frame to a new file and returns `path` and `channelId`. The daemon protects its live database, sidecars, instance lock, `config.json` and `daemon.pid`. |
 | GET | `/backup/scb` | - | Export encrypted static channel backup `{ encoded, channelCount, path }` |
 | POST | `/backup/trigger` | -- | Run the configured scheduled backup now (no-op when `backupPath` unset) |
 | POST | `/message/sign` | `{ message }` | Sign message with the node key (LND-compatible zbase32 signature) |

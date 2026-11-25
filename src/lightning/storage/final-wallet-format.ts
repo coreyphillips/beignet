@@ -20,6 +20,8 @@ export interface IFinalWalletBinding {
 	dualFundedAssets?: boolean;
 	/** Fresh regtest wallets capable of retaining multiple generations of asset funding. */
 	assetSplice?: boolean;
+	/** Fresh regtest enrollment with a distinct recoverable asset channel type. */
+	assetSpliceRecovery?: boolean;
 	encryptionKey: Buffer;
 	nodeId: string;
 	network: 'mainnet' | 'testnet' | 'regtest' | 'signet';
@@ -55,7 +57,8 @@ export function finalWalletIdentity(
 	const generation = finalWalletGeneration(
 		binding.finalCommitmentUpdates,
 		binding.dualFundedAssets,
-		binding.assetSplice
+		binding.assetSplice,
+		binding.assetSpliceRecovery
 	);
 	if (generation !== 1 && binding.network !== 'regtest')
 		throw new Error('This final wallet generation requires regtest');
@@ -494,7 +497,7 @@ export function installWalletMarker(
 			);
 		`);
 		const generation = JSON.parse(identity)[0];
-		if (generation === 2 || generation === 4)
+		if (generation === 2 || generation === 4 || generation === 5)
 			db.exec(`
 				CREATE TABLE final_lifecycle_log (
 					scope TEXT NOT NULL,

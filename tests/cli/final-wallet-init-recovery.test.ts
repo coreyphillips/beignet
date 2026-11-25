@@ -75,7 +75,8 @@ describe('Final wallet CLI initialization recovery', function () {
 		targetHome = home,
 		updates = false,
 		assets = false,
-		splice = false
+		splice = false,
+		recovery = false
 	): {
 		ok: boolean;
 		signal: NodeJS.Signals | null;
@@ -93,7 +94,8 @@ describe('Final wallet CLI initialization recovery', function () {
 				'regtest',
 				...(assets ? ['--dual-funded-assets'] : ['--final-taproot-wallet']),
 				...(updates ? ['--final-commitment-updates'] : []),
-				...(splice ? ['--asset-splice'] : [])
+				...(splice ? ['--asset-splice'] : []),
+				...(recovery ? ['--asset-splice-recovery'] : [])
 			],
 			{
 				env: {
@@ -290,6 +292,25 @@ describe('Final wallet CLI initialization recovery', function () {
 			await node.destroy();
 		}
 	});
+	it('enrolls a separate recovery-capable regtest wallet and preserves its generation across retry', () => {
+		const enroll = (fault?: Interruption) =>
+			init(fault, home, false, false, false, true);
+		expect(init(undefined, home, false, false, true, true).ok).to.equal(false);
+		expect(fs.existsSync(db)).to.equal(false);
+		expect(enroll('kill-signer').signal).to.equal('SIGKILL');
+		expect(JSON.parse(fs.readFileSync(pending, 'utf8')).version).to.equal(5);
+		expect(init(undefined, home, false, false, true).ok).to.equal(false);
+		expect(enroll().ok).to.equal(true);
+		const saved = JSON.parse(fs.readFileSync(config, 'utf8'));
+		expect(saved.assetSpliceRecovery).to.equal(true);
+		expect(saved.assetSplice).to.equal(undefined);
+		expect(daemonOptions(saved, 0)).to.have.property(
+			'assetSpliceRecovery',
+			true
+		);
+		expect(init(undefined, home, false, false, true).ok).to.equal(false);
+	});
+
 	it('cannot enroll a supplied pending mnemonic without its original device', () => {
 		const original = interrupt('kill');
 		expect(fs.existsSync(pending)).to.equal(true);

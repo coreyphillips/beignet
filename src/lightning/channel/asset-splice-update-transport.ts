@@ -23,6 +23,9 @@ import {
 	AssetUpdateFundingUnavailable,
 	type AssetSpliceUpdateBatch
 } from './asset-splice-update-batch';
+import { completeAssetOpeningHost } from './asset-opening-coordinator';
+import { completeAssetSpliceHost } from './asset-splice-transport';
+import type { IAuxiliaryDualFunding } from './asset-opening-provider';
 import type { IFinalOpeningRuntime } from './final-opening-runtime';
 import {
 	decodeAssetUpdateIntent,
@@ -94,6 +97,19 @@ export function hasAssetUpdateHost(h: unknown): h is IAssetSpliceUpdateHost {
 		typeof a.signAssetUpdateHtlcs === 'function' &&
 		typeof a.verifyAssetUpdateViews === 'function' &&
 		typeof a.retainAssetUpdateViews === 'function'
+	);
+}
+/** Advertise the recovery profile only when the wallet can resolve every negotiated output. */
+export function completeAssetSpliceRecoveryHost(host: unknown): boolean {
+	const provider = host as Partial<IAuxiliaryDualFunding> | undefined;
+	return (
+		provider?.assetSpliceRecoveryVersion === 1 &&
+		typeof provider.recoverHtlc === 'function' &&
+		typeof provider.outputRecoveryReceipt === 'function' &&
+		typeof provider.restoreOutputReceipt === 'function' &&
+		completeAssetOpeningHost(provider as IAuxiliaryDualFunding) &&
+		completeAssetSpliceHost(provider) &&
+		hasAssetUpdateHost(provider)
 	);
 }
 function checkAuthor(

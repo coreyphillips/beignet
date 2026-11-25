@@ -2,7 +2,8 @@ import { Transaction } from 'bitcoinjs-lib';
 import { getPerCommitmentPoint } from '../channel/channel-helpers';
 import {
 	buildFinalOpeningCommitment,
-	buildFinalCommitmentView
+	buildFinalCommitmentView,
+	type IFinalCommitmentView
 } from '../channel/final-opening-commitment';
 import type { IFinalOpeningRuntime } from '../channel/final-opening-runtime';
 import { derivePrivateKey, deriveRevocationPrivkey } from '../keys/derivation';
@@ -30,9 +31,15 @@ export interface IFinalOutputClaim {
 	/** Absent when the output is uneconomic at the current rate but its spend still settles a payment. */
 	tx: Transaction | null;
 	/** Builds an asset-preserving payout only once the exact outpoint is spendable. */
-	recover?: () => Promise<Transaction | null>;
+	recover?: (sponsored?: Transaction) => Promise<Transaction | null>;
+	/** Asset HTLC proofs must bind a confirmed block and its observed parent. */
+	confirmedOnly?: boolean;
 	/** The reconstructed local balance output of a dual-funded asset opening. */
 	assetBalanceOutput?: boolean;
+	/** Recognizes the authorized payout of this balance outpoint after restart. */
+	matchesAssetPayout?: (spend: Transaction) => boolean;
+	/** Import an exact confirmed terminal payout using its original-device receipt. */
+	confirmAssetPayout?: (spend: Transaction) => Promise<boolean>;
 	sponsor?: boolean;
 	paymentHash?: Buffer;
 	htlcId?: bigint;
@@ -309,98 +316,144 @@ export function finalOpeningOutputClaims(
 		local?.commitmentSigned &&
 		decodeCommitmentSignedMessage(local.commitmentSigned).htlcSignatures;
 	for (const [n, h] of view.htlcs.entries()) {
-		const { outputIndex, htlc, tree } = h;
 		const preimage = states.preimages.find((p) =>
-			sha256(p).equals(htlc.paymentHash)
+			sha256(p).equals(h.htlc.paymentHash)
 		);
-		const offered = htlc.offeredBy === 'local';
-		let claim: IFinalOutputClaim | null;
-		if (revoked) {
-			claim = keyPathClaim(
-				parent,
-				outputIndex,
-				tree,
-				revoked,
-				destination,
-				feeRate
-			);
-		} else if (!offered && !preimage) {
-			continue;
-		} else if (!local) {
-			const leaf = offered ? tree.timeout : tree.success;
-			claim = finalLeafClaim(
-				parent,
-				outputIndex,
-				tree.output,
-				leaf,
-				htlcKey,
-				destination,
-				feeRate,
-				1,
-				offered ? htlc.cltvExpiry : 0,
-				offered ? [] : [preimage!]
-			);
-		} else {
-			if (!sigs || !sigs[n])
-				throw new Error('Missing authenticated peer HTLC signature');
-			const flag = Buffer.of(0x83);
-			const remoteSig = Buffer.concat([sigs[n], flag]),
-				ours = Buffer.concat([signTaprootHtlcLeaf(h.digest, htlcKey), flag]);
-			h.secondLevelTx.setWitness(0, [
-				remoteSig,
-				ours,
-				...(!offered ? [preimage!] : []),
-				h.leaf.script,
-				h.leaf.controlBlock
-			]);
-			claim = {
-				outputIndex,
-				relativeDelay: 1,
-				absoluteHeight: offered ? htlc.cltvExpiry : 0,
-				tx: h.secondLevelTx,
-				sponsor: true
-			};
-		}
-		if (!claim) {
-			if (!offered && !revoked) continue;
-			claim = { outputIndex, absoluteHeight: 0, relativeDelay: 0, tx: null };
-		}
-		if (offered) {
-			claim.paymentHash = htlc.paymentHash;
-			if (!revoked) claim.htlcId = htlc.id;
-		}
-		if (local || revoked)
-			claim.child = (spender, inputIndex): IFinalOutputClaim | null => {
-				// SIGHASH_SINGLE fixes the delayed output at the spending input's index,
-				// including transactions aggregated with other HTLCs and wallet inputs.
-				if (
-					!spender.outs[inputIndex]?.script.equals(second.output) ||
-					spender.outs[inputIndex].value !== parent.outs[outputIndex].value
-				)
-					return null;
-				return revoked
-					? keyPathClaim(
-							spender,
-							inputIndex,
-							second,
-							revoked,
-							destination,
-							feeRate
-					  )
-					: finalLeafClaim(
-							spender,
-							inputIndex,
-							second.output,
-							second.delay,
-							delayedKey,
-							destination,
-							feeRate,
-							view.toSelfDelay
-					  );
-			};
-		claims.push(claim);
+		const claim = finalHtlcClaim({
+			h,
+			parent,
+			local: !!local,
+			revoked,
+			delayedKey,
+			htlcKey,
+			destination,
+			feeRate,
+			preimage,
+			peerSignature: sigs?.[n],
+			second,
+			toSelfDelay: view.toSelfDelay
+		});
+		if (claim) claims.push(claim);
 	}
 	return claims;
+}
+
+export function finalHtlcClaim(params: {
+	h: IFinalCommitmentView['htlcs'][number];
+	parent: Transaction;
+	local: boolean;
+	revoked?: Buffer;
+	delayedKey: Buffer;
+	htlcKey: Buffer;
+	destination: Buffer;
+	feeRate: number;
+	preimage?: Buffer;
+	peerSignature?: Buffer;
+	second: ReturnType<typeof buildTaprootSecondLevelOutput>;
+	toSelfDelay: number;
+}): IFinalOutputClaim | null {
+	const {
+		h,
+		parent,
+		local,
+		revoked,
+		delayedKey,
+		htlcKey,
+		destination,
+		feeRate,
+		preimage,
+		peerSignature,
+		second,
+		toSelfDelay
+	} = params;
+	const { outputIndex, htlc, tree } = h;
+	const offered = htlc.offeredBy === 'local';
+	let claim: IFinalOutputClaim | null;
+	if (revoked) {
+		claim = keyPathClaim(
+			parent,
+			outputIndex,
+			tree,
+			revoked,
+			destination,
+			feeRate
+		);
+	} else if (!offered && !preimage) {
+		return null;
+	} else if (!local) {
+		const leaf = offered ? tree.timeout : tree.success;
+		claim = finalLeafClaim(
+			parent,
+			outputIndex,
+			tree.output,
+			leaf,
+			htlcKey,
+			destination,
+			feeRate,
+			1,
+			offered ? htlc.cltvExpiry : 0,
+			offered ? [] : [preimage!]
+		);
+	} else {
+		if (!peerSignature)
+			throw new Error('Missing authenticated peer HTLC signature');
+		const flag = Buffer.of(0x83);
+		const remoteSig = Buffer.concat([peerSignature, flag]),
+			ours = Buffer.concat([signTaprootHtlcLeaf(h.digest, htlcKey), flag]);
+		const child = h.secondLevelTx.clone();
+		child.setWitness(0, [
+			remoteSig,
+			ours,
+			...(!offered ? [preimage!] : []),
+			h.leaf.script,
+			h.leaf.controlBlock
+		]);
+		claim = {
+			outputIndex,
+			relativeDelay: 1,
+			absoluteHeight: offered ? htlc.cltvExpiry : 0,
+			tx: child,
+			sponsor: true
+		};
+	}
+	if (!claim) {
+		if (!offered && !revoked) return null;
+		claim = { outputIndex, absoluteHeight: 0, relativeDelay: 0, tx: null };
+	}
+	if (offered) {
+		claim.paymentHash = htlc.paymentHash;
+		if (!revoked) claim.htlcId = htlc.id;
+	}
+	if (local || revoked)
+		claim.child = (spender, inputIndex): IFinalOutputClaim | null => {
+			// SIGHASH_SINGLE fixes the delayed output at the spending input's index,
+			// including transactions aggregated with other HTLCs and wallet inputs.
+			if (
+				!spender.outs[inputIndex]?.script.equals(second.output) ||
+				spender.outs[inputIndex].value !== parent.outs[outputIndex].value
+			)
+				return null;
+			return revoked
+				? keyPathClaim(
+						spender,
+						inputIndex,
+						second,
+						revoked,
+						destination,
+						feeRate
+				  )
+				: finalLeafClaim(
+						spender,
+						inputIndex,
+						second.output,
+						second.delay,
+						delayedKey,
+						destination,
+						feeRate,
+						toSelfDelay
+				  );
+		};
+	return claim;
 }
 
 export async function sponsorFinalClaim(

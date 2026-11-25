@@ -1,5 +1,5 @@
 import { Transaction } from 'bitcoinjs-lib';
-import { ASSET_OPENING_TYPE_HEX } from '../features/asset-opening';
+import { isAssetOpeningType } from '../features/asset-opening';
 import { isFinalTaprootTypeHex } from '../channel/commitment-profile';
 import { MAX_MINIMUM_DEPTH } from '../channel/types';
 import { isValidPublicKey } from '../crypto/ecdh';
@@ -118,10 +118,7 @@ export function validateAssetOpening(
 	c: IFinalOpeningCandidate,
 	fundingRoot: Buffer
 ) {
-	requireCandidate(
-		c.channelType === ASSET_OPENING_TYPE_HEX,
-		'asset channel type'
-	);
+	requireCandidate(isAssetOpeningType(c.channelType), 'asset channel type');
 	requireCandidate(
 		Buffer.isBuffer(fundingRoot) && fundingRoot.length === 32,
 		'asset funding root'

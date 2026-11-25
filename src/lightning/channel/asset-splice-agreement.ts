@@ -20,7 +20,7 @@ interface ParentView {
 	priorDigest?: Buffer;
 	oldOutpoint: { hash: Buffer; index: number };
 	stateNumber: bigint;
-	walletGeneration: 4;
+	walletGeneration: 4 | 5;
 }
 
 export interface IAssetSpliceContext extends ParentView {
@@ -92,8 +92,8 @@ export interface IAssetSpliceChannelTerms {
 function fresh(ctx: IAssetSpliceContext): void {
 	const current = ctx.currentParent();
 	if (
-		ctx.walletGeneration !== 4 ||
-		current?.walletGeneration !== 4 ||
+		(ctx.walletGeneration !== 4 && ctx.walletGeneration !== 5) ||
+		current?.walletGeneration !== ctx.walletGeneration ||
 		current.stateNumber !== ctx.stateNumber ||
 		(ctx.stateNumber > 0n
 			? !ctx.priorDigest ||

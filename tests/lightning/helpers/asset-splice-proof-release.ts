@@ -24,7 +24,10 @@ import {
 	MAX_INDEX
 } from '../../../src/lightning/keys/shachain';
 import { generateNonce } from '../../../src/lightning/crypto/musig';
-import { ASSET_OPENING_TYPE_HEX } from '../../../src/lightning/features/asset-opening';
+import {
+	ASSET_OPENING_TYPE_HEX,
+	ASSET_SPLICE_RECOVERY_TYPE_HEX
+} from '../../../src/lightning/features/asset-opening';
 import {
 	bip32RootFromSeed,
 	deriveChannelKeys
@@ -42,16 +45,19 @@ import { otherOpeningView } from './final-opening-commitment';
 import { boundParticipant, signingFixture } from './final-opening-signing';
 import { walletSigner } from './final-update-pair';
 
-function device(dir: string, name: string) {
-	const fresh = generateFinalDaemonWallet(false, false, true);
-	const party = boundParticipant(
-		bip32RootFromSeed(mnemonicToSeedSync(fresh.mnemonic)),
-		1,
-		fresh.binding
+function device(dir: string, name: string, generation: 4 | 5) {
+	const fresh = generateFinalDaemonWallet(
+		false,
+		false,
+		generation === 4,
+		generation === 5
 	);
+	const seed = mnemonicToSeedSync(fresh.mnemonic);
+	const party = boundParticipant(bip32RootFromSeed(seed), 1, fresh.binding);
 	const file = path.join(dir, name);
 	return {
 		party,
+		seed,
 		file,
 		store: SqliteStorage.createFinalWallet(file, fresh.binding)
 	};
@@ -78,9 +84,13 @@ type AlternateContext = {
 };
 export function setupAssetSpliceProofs(
 	dir: string,
-	updateLimits?: import('../../../src/lightning/storage/final-channel-updates').IFinalUpdateLimits
+	updateLimits?: import('../../../src/lightning/storage/final-channel-updates').IFinalUpdateLimits,
+	generation: 4 | 5 = 4
 ) {
-	const devices = [device(dir, 'left'), device(dir, 'right')];
+	const devices = [
+		device(dir, 'left', generation),
+		device(dir, 'right', generation)
+	];
 	const parties = devices.map((d) => d.party);
 	const oldKeys = parties.map((p) => p.keys);
 	const newKeys = parties.map((p) => deriveChannelKeys(p.root, 1, 2));
@@ -97,7 +107,8 @@ export function setupAssetSpliceProofs(
 			undefined,
 			root
 		).p2trOutput;
-	opening.channelType = ASSET_OPENING_TYPE_HEX;
+	opening.channelType =
+		generation === 5 ? ASSET_SPLICE_RECOVERY_TYPE_HEX : ASSET_OPENING_TYPE_HEX;
 	for (const [i, input] of opening.inputs.entries()) {
 		const previous = Transaction.fromHex(input.prevTxHex);
 		previous.outs[0].script = payments.p2wpkh({

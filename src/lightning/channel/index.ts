@@ -15,6 +15,10 @@ export * from './dual-funding';
 export * from './auxiliary';
 export * from './auxiliary-funding';
 export * from './asset-opening-provider';
+export {
+	assetPayoutRevocationKey,
+	type IAssetPayoutScope
+} from './asset-payout-revocation';
 export type {
 	AssetSpliceHost,
 	IStartAssetSplice

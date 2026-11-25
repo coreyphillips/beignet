@@ -26,8 +26,8 @@ export function localPromise(channelId: Buffer, i: number) {
 		fundingInputNonce: nonce(2)
 	});
 }
-export function constructionFixture(dir: string) {
-	const f = setupAssetSpliceProofs(dir),
+export function constructionFixture(dir: string, generation: 4 | 5 = 4) {
+	const f = setupAssetSpliceProofs(dir, undefined, generation),
 		t = f.terms[0],
 		channelId = Buffer.from(f.id, 'hex');
 	const layout: IAssetSpliceLayout = {

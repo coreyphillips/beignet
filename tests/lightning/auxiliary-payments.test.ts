@@ -1540,7 +1540,8 @@ describe('Asset payments (issue #2093, step 8)', function () {
 				// with { assetInvoice }.
 				'createInvoice:assetInvoice',
 				'dualFunding:v1',
-				'assetSplice:v1'
+				'assetSplice:v1',
+				'assetSpliceRecovery:v1'
 			]);
 			expect(Object.isFrozen(api)).to.equal(true);
 			expect(Object.isFrozen(api.surfaces)).to.equal(true);

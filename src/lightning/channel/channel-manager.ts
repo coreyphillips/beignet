@@ -1,5 +1,6 @@
 import {
 	AssetSpliceUpdateTransport,
+	completeAssetSpliceRecoveryHost,
 	hasAssetUpdateHost
 } from './asset-splice-update-transport';
 import { releasedAssetUpdateFunding } from './asset-splice-update-ledger';
@@ -13,14 +14,19 @@ import {
 import { assetSpliceNegotiated } from '../features/asset-splice';
 import {
 	AssetSpliceConfirmationCoordinator,
-	type AssetSpliceInclusionLookup
+	type AssetSpliceInclusionLookup,
+	type AssetSpliceParentLookup
 } from './asset-splice-confirmation';
 import { finalHtlcLimits } from './final-commitment-reserve';
 import {
 	AssetOpeningCoordinator,
 	completeAssetOpeningHost
 } from './asset-opening-coordinator';
-import { ASSET_OPENING_TYPE_HEX } from '../features/asset-opening';
+import {
+	isAssetOpeningType,
+	ASSET_OPENING_TYPE_HEX,
+	ASSET_SPLICE_RECOVERY_TYPE_HEX
+} from '../features/asset-opening';
 import { releasedFinalSpliceFunding } from './final-splice-state';
 import { FinalSpliceTransport } from './final-splice-transport';
 import type { FinalSplicePlan } from './final-splice-session';
@@ -1306,7 +1312,14 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 				}
 			);
 			const host = config.auxiliaryChannels?.dualFunding;
+			const recovery = config.finalOpening.storage.canRecoverAssetSplice;
+			const assetType = recovery
+				? ASSET_SPLICE_RECOVERY_TYPE_HEX
+				: ASSET_OPENING_TYPE_HEX;
+			const profileSupported =
+				!recovery || completeAssetSpliceRecoveryHost(host);
 			if (
+				profileSupported &&
 				config.finalOpening.storage.canSpliceDualFundedAssets &&
 				completeAssetSpliceHost(host) &&
 				completeAssetOpeningHost(host)
@@ -1324,7 +1337,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 							!!this.finalTransport?.connected(id) &&
 							!!features &&
 							assetSpliceNegotiated(
-								ASSET_OPENING_TYPE_HEX,
+								assetType,
 								features,
 								this.peerManager?.getPeer(peer)?.getRemoteInit()?.features
 							)
@@ -1379,7 +1392,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 								!this.finalTransport?.connected(id) ||
 								!features ||
 								!assetSpliceNegotiated(
-									ASSET_OPENING_TYPE_HEX,
+									assetType,
 									features,
 									this.peerManager?.getPeer(peer)?.getRemoteInit()?.features
 								)
@@ -1402,7 +1415,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 								opening.session.peer === peer &&
 								!!config.localFeatures &&
 								assetSpliceNegotiated(
-									ASSET_OPENING_TYPE_HEX,
+									assetType,
 									config.localFeatures,
 									this.peerManager?.getPeer(peer)?.getRemoteInit()?.features
 								)
@@ -1412,6 +1425,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 				}
 			}
 			if (
+				profileSupported &&
 				config.finalOpening.storage.canOpenDualFundedAssets &&
 				completeAssetOpeningHost(host)
 			) {
@@ -10150,7 +10164,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		if (hasScidAliasChannelType(channelType)) {
 			channelFlags = (channelFlags ?? 0x01) & ~0x01;
 		}
-		const asset = channelType.toString('hex') === ASSET_OPENING_TYPE_HEX;
+		const asset = isAssetOpeningType(channelType.toString('hex'));
 		const final = asset || isFinalTaprootTypeHex(channelType.toString('hex'));
 		const typeRefusal = final
 			? this.finalOpeningRefusal(
@@ -10476,19 +10490,31 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 	hasAssetSpliceWatch(id: string, txid: string): boolean {
 		return !!this.assetSpliceConfirmation?.has(id, txid);
 	}
+	isAssetSpliceSuccessor(
+		id: string,
+		txid: string,
+		parentOutpoint: string
+	): boolean {
+		return (
+			this.assetSpliceConfirmation?.fundingSpend(id, txid, [parentOutpoint]) ===
+			'splice'
+		);
+	}
 	async observeAssetSpliceFunding(
 		id: string,
 		txid: string,
 		height: number | undefined,
 		prove: AssetSpliceInclusionLookup,
-		current: () => boolean
+		current: () => boolean,
+		proveMempoolParent?: AssetSpliceParentLookup
 	): Promise<void> {
 		await this.assetSpliceConfirmation?.observe(
 			id,
 			txid,
 			height,
 			prove,
-			current
+			current,
+			proveMempoolParent
 		);
 	}
 	async receiveAssetSpliceLocked(
@@ -10538,7 +10564,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 	private watchFinalOpening(candidate: IFinalOpeningCandidate): void {
 		const tx = bitcoin.Transaction.fromHex(candidate.fundingTxHex);
 		if (
-			candidate.channelType === ASSET_OPENING_TYPE_HEX &&
+			isAssetOpeningType(candidate.channelType) &&
 			!this.assetCollateral.has(candidate.channelId)
 		) {
 			this.assetFundingChannels.set(tx.getId(), candidate.channelId);
@@ -10667,8 +10693,17 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			const seen = this.finalObservedFunding.get(id);
 			const exits = storage.loadFinalFundingExits(id);
 			if (exits.length < 2) return;
+			const mempoolParents =
+				this.assetSpliceConfirmation?.mempoolCloseParents(id);
 			const eligible = exits.filter((exit) => {
 				const txid = Buffer.from(exit.fundingTxid).reverse().toString('hex');
+				if (
+					mempoolParents?.size &&
+					mempoolParents.has(
+						txid + ':' + bitcoin.Transaction.fromBuffer(exit.exit).ins[0].index
+					)
+				)
+					return true;
 				const height = seen?.get(txid)?.height;
 				if (height === undefined || height <= 0) return false;
 				if (this.assetSpliceConfirmation?.has(id, txid)) {
@@ -11033,7 +11068,12 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		flags: number | undefined,
 		unsupported: boolean
 	): string | null {
-		if (type.toString('hex') === ASSET_OPENING_TYPE_HEX && !this.assetOpening)
+		if (
+			isAssetOpeningType(type.toString('hex')) &&
+			(!this.assetOpening ||
+				(type.toString('hex') === ASSET_SPLICE_RECOVERY_TYPE_HEX) !==
+					!!this.config.finalOpening?.storage.canRecoverAssetSplice)
+		)
 			return 'Asset opening requires an enrolled wallet and provider';
 		if (
 			!this.finalTransport ||
@@ -11127,7 +11167,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		// or otherwise unsupported type accepted here would echo through
 		// ACCEPT_CHANNEL2 and then die at the commitment stage with a burnt
 		// key index and a stuck retained channel.
-		const asset = msg.channelType?.toString('hex') === ASSET_OPENING_TYPE_HEX;
+		const asset = isAssetOpeningType(msg.channelType?.toString('hex'));
 		const final =
 			asset || isFinalTaprootTypeHex(msg.channelType?.toString('hex'));
 		const typeRefusal = final

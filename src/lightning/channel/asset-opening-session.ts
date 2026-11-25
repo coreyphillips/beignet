@@ -49,7 +49,10 @@ import { buildAssetOpeningCommitment } from './final-opening-commitment';
 import { openingTerms } from './final-opening-negotiation';
 import type { IFinalOpeningRuntime } from './final-opening-runtime';
 import { deriveV2ChannelId } from './validation';
-import { ASSET_OPENING_TYPE_HEX } from '../features/asset-opening';
+import {
+	ASSET_OPENING_TYPE_HEX,
+	ASSET_SPLICE_RECOVERY_TYPE_HEX
+} from '../features/asset-opening';
 import type { IFinalOpeningCandidate } from '../storage/final-opening-candidate';
 
 type Phase = IAssetOpenFrame['phase'] | 'consent';
@@ -128,7 +131,10 @@ export class AssetOpeningSession {
 			!open.chainHash?.equals(REGTEST_CHAIN_HASH) ||
 			open.channelFlags !== 0 ||
 			accept.minimumDepth < 1 ||
-			open.channelType?.toString('hex') !== ASSET_OPENING_TYPE_HEX ||
+			open.channelType?.toString('hex') !==
+				(runtime.storage.canRecoverAssetSplice
+					? ASSET_SPLICE_RECOVERY_TYPE_HEX
+					: ASSET_OPENING_TYPE_HEX) ||
 			!accept.channelType?.equals(open.channelType) ||
 			!open.channelId.equals(accept.channelId) ||
 			open.requestFunds ||
@@ -141,7 +147,9 @@ export class AssetOpeningSession {
 			throw new Error('Invalid asset opening negotiation');
 		this.ctx = {
 			...(runtime.storage.canSpliceDualFundedAssets && {
-				walletGeneration: 4 as const
+				walletGeneration: runtime.storage.canRecoverAssetSplice
+					? (5 as const)
+					: (4 as const)
 			}),
 			peer: start.peer,
 			isInitiator: start.initiator,
@@ -660,7 +668,7 @@ export class AssetOpeningSession {
 		this.assertLive(g);
 		const capacity = ctx.open.fundingSatoshis + ctx.accept.fundingSatoshis;
 		const updateLimits =
-			ctx.walletGeneration === 4
+			ctx.walletGeneration !== undefined
 				? {
 						local: finalHtlcLimits(
 							ctx.isInitiator ? ctx.open : ctx.accept,

@@ -27,6 +27,7 @@ property BeignetConfig.announceAddresses?: string[]
 property BeignetConfig.apiKeys?: Array<{ name: string; key: string; scopes: Array<'readonly' | 'invoice' | 'admin'>; expiresAt?: string; }>
 property BeignetConfig.apiToken?: string
 property BeignetConfig.assetSplice?: boolean
+property BeignetConfig.assetSpliceRecovery?: boolean
 property BeignetConfig.autoBootstrap?: boolean
 property BeignetConfig.autoReconnect?: boolean
 property BeignetConfig.backupIntervalMs?: number
@@ -257,6 +258,7 @@ method BeignetNode.addPrimary(opts: { pubkey: string; host?: string; port?: numb
 method BeignetNode.addTrustedPeer(pubkey: string): TrustedPeerInfo
 method BeignetNode.addWatchtower(uri: string): void
 method BeignetNode.backup(destPath: string): Promise<void>
+method BeignetNode.backupAssetChannelFrame(channelId: string, destPath: string): Promise<void>
 method BeignetNode.boostOnchain(txid: TxidHex, satsPerVbyte?: number): Promise<BoostResult>
 method BeignetNode.bootstrapPeers(): Promise<BootstrapPeerInfo[]>
 method BeignetNode.buildPsbt(outputs: Array<{ address: string; amountSats: number; }>, satsPerVbyte?: number): Promise<PsbtBuildInfo>
@@ -581,6 +583,7 @@ property BeignetNodeOptions.alias?: string
 property BeignetNodeOptions.allowMultipleInstances?: boolean
 property BeignetNodeOptions.announceAddresses?: string[]
 property BeignetNodeOptions.assetSplice?: boolean
+property BeignetNodeOptions.assetSpliceRecovery?: boolean
 property BeignetNodeOptions.autoBootstrap?: boolean
 property BeignetNodeOptions.autoGossipSync?: boolean
 property BeignetNodeOptions.autoRebalance?: { enabled?: boolean; budgetSatsPerDay?: number; minImbalancePct?: number; intervalMs?: number; }

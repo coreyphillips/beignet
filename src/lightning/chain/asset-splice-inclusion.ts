@@ -105,9 +105,12 @@ async function historicalInclusion(
 			'Historical asset inclusion requires the original splice wallet'
 		);
 	const evidence = loadAssetSpliceExitProofs(store, channelId, finalDigest);
-	if (evidence.candidate.fundingTxid !== txid)
+	if (
+		evidence.candidate.fundingTxid !== txid &&
+		evidence.parent.fundingTxid !== txid
+	)
 		throw new Error(
-			'Historical proof is for a different retained funding candidate'
+			'Historical proof is outside the retained splice funding pair'
 		);
 	const head = store.readAssetSpliceJournal<InclusionCursor>(channelId);
 	const prior = head.records

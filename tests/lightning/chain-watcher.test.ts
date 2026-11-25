@@ -26,6 +26,8 @@ import {
 	computeScriptHash
 } from '../../src/lightning/chain/chain-watcher';
 import { ChannelManager } from '../../src/lightning/channel/channel-manager';
+import type { IFinalOutputClaim } from '../../src/lightning/chain/final-output-claims';
+import { SqliteStorage } from '../../src/lightning/storage/sqlite-storage';
 import {
 	IFundingSpendScan,
 	IRREVOCABLE_DEPTH
@@ -448,6 +450,195 @@ describe('Phase 4: Chain Watcher', () => {
 			expect(verdicts.slice(-1)).to.deep.equal([false]);
 		});
 
+		for (const role of [0, 1] as const) {
+			it(`selects the confirmed parent for a mempool-only asset splice as ${
+				role ? 'acceptor' : 'initiator'
+			}`, async function () {
+				this.timeout(60000);
+				watcher.stop();
+				const dir = mkdtempSync(join(tmpdir(), 'asset-splice-parent-'));
+				const pair = await setupFundedAssetUpdatePair(dir);
+				try {
+					const { store, party } = pair.f.devices[role];
+					const id = pair.f.id,
+						channelId = Buffer.from(id, 'hex');
+					channelManager = new ChannelManager({
+						finalOpening: {
+							storage: store,
+							root: party.root,
+							dualFunding: {
+								verifySpliceFunding: async () => {},
+								confirmSpliceFunding: async () => {}
+							}
+						},
+						verifyRemoteFundingInput: async () => 'unspent',
+						persistence: COMMIT_ALL
+					} as unknown as IChannelManagerConfig);
+					channelManager.on('error', () => {});
+					const { parent, candidate } =
+						store.loadAssetSpliceFundingInfo(id).pending[0];
+					const parentTx = bitcoin.Transaction.fromHex(
+						parent.funding.fundingTxHex
+					);
+					const candidateTx = bitcoin.Transaction.fromHex(
+						candidate.funding.fundingTxHex
+					);
+					const coin = candidateTx.outs[candidate.outputIndex];
+					const candidateScript = computeScriptHash(coin.script);
+					const parentScript = computeScriptHash(
+						parentTx.outs[parent.outputIndex].script
+					);
+					const parentRow = { txid: parentTx.getId(), height: 60 };
+					let candidateHeight = 0,
+						candidateUnspent = true,
+						validProof = false;
+					const candidateRow = () => ({
+						txid: candidateTx.getId(),
+						height: candidateHeight
+					});
+					backend.setTransaction(parentTx.getId(), parentTx.toBuffer());
+					backend.setTransaction(candidateTx.getId(), candidateTx.toBuffer());
+					Object.assign(backend, {
+						listUnspent: async (script: string) =>
+							script === candidateScript && candidateUnspent
+								? [
+										{
+											...candidateRow(),
+											outputIndex: candidate.outputIndex,
+											valueSat: coin.value
+										}
+								  ]
+								: [],
+						getAssetSpliceInclusion: async (txid: string, height: number) => {
+							const found = [parentRow, candidateRow()].find(
+								(r) => r.txid === txid && r.height === height
+							);
+							if (!validProof || !found || height <= 0)
+								throw Error('Missing block proof');
+							return {
+								txid,
+								blockHash: '35'.repeat(32),
+								confirmations: 73 - height
+							};
+						}
+					});
+					channelManager.restoreAssetSpliceWatches(id);
+					watcher = new ChainWatcher({
+						backend,
+						channelManager,
+						missingDebounceMs: 0
+					});
+					await watcher.start();
+					backend.simulateNewBlock(72);
+					const scan = () =>
+						watcher.watchFinalFundingOutput(
+							channelId,
+							candidateTx.getId(),
+							candidate.outputIndex,
+							3,
+							coin.script,
+							coin.value
+						);
+					const close = () =>
+						channelManager.forceClose(channelId, Buffer.alloc(0));
+					const broadcasts: string[] = [];
+					channelManager.on('broadcast:tx', (raw: Buffer) =>
+						broadcasts.push(raw.toString('hex'))
+					);
+					const history = () => {
+						backend.setHistory(candidateScript, [candidateRow()]);
+						backend.setHistory(parentScript, [parentRow, candidateRow()]);
+					};
+					history();
+					await scan();
+					expect(close().ok, 'missing parent inclusion proof').to.equal(false);
+					validProof = true;
+					backend.setHistory(parentScript, [parentRow]);
+					await scan();
+					expect(
+						close().ok,
+						'candidate missing from parent script history'
+					).to.equal(false);
+					const conflict = new bitcoin.Transaction();
+					conflict.addInput(parentTx.getHash(), parent.outputIndex);
+					conflict.addOutput(Buffer.from([0x51]), 1000);
+					backend.setTransaction(conflict.getId(), conflict.toBuffer());
+					backend.setHistory(parentScript, [
+						parentRow,
+						candidateRow(),
+						{ txid: conflict.getId(), height: 72 }
+					]);
+					await scan();
+					expect(close().ok, 'another confirmed parent spend').to.equal(false);
+					expect(broadcasts).to.be.empty;
+
+					history();
+					await scan();
+					expect(channelManager['assetUpdateHeight'](id)).to.equal(undefined);
+					expect(store.loadAssetSpliceFundingInfo(id).active).to.equal(
+						undefined
+					);
+					expect(close().ok, 'confirmed parent with a mempool splice').to.equal(
+						true
+					);
+					expect(broadcasts[broadcasts.length - 1]).to.equal(
+						parent.localCommitment
+					);
+
+					candidateHeight = 72;
+					history();
+					await scan();
+					expect(close().ok, 'candidate at one confirmation').to.equal(true);
+					expect(broadcasts[broadcasts.length - 1]).to.equal(
+						candidate.localCommitment
+					);
+					candidateHeight = 0;
+					history();
+					backend.simulateNewBlock(72);
+					await scan();
+					expect(
+						close().ok,
+						'parent available again after a shallow reorg'
+					).to.equal(true);
+					expect(broadcasts[broadcasts.length - 1]).to.equal(
+						parent.localCommitment
+					);
+					const child = pair.f.views[role === 0 ? 1 : 0].candidate.expected;
+					expect(child.ins[0].hash.equals(candidateTx.getHash())).to.equal(
+						true
+					);
+					const observed: string[] = [];
+					watcher.on(
+						'funding:spent',
+						(_id: Buffer, spend: bitcoin.Transaction) =>
+							observed.push(spend.getId())
+					);
+					candidateUnspent = false;
+					backend.setTransaction(child.getId(), child.toBuffer());
+					backend.setHistory(candidateScript, [
+						candidateRow(),
+						{ txid: child.getId(), height: -1 }
+					]);
+					await scan();
+					expect(
+						observed,
+						'passively detects a candidate child in the mempool'
+					).to.include(child.getId());
+					expect(channelManager['assetUpdateHeight'](id)).to.equal(undefined);
+					expect(close().ok, 'confirmed parent remains available').to.equal(
+						true
+					);
+					expect(broadcasts[broadcasts.length - 1]).to.equal(
+						parent.localCommitment
+					);
+				} finally {
+					watcher.stop();
+					for (const dev of pair.f.devices) dev.store.close();
+					rmSync(dir, { recursive: true, force: true });
+				}
+			});
+		}
+
 		it('permits pending asset updates only for a released candidate with a current mined unspent output', async function () {
 			this.timeout(60000);
 			watcher.stop();
@@ -644,6 +835,362 @@ describe('Phase 4: Chain Watcher', () => {
 			expect(history.at(-1)).to.equal(undefined);
 		});
 
+		it('observes a confirmed close while new headers supersede slow splice funding proofs', async () => {
+			watcher.stop();
+			const id = crypto.randomBytes(32);
+			const fundingScript = Buffer.from('5120' + '58'.repeat(32), 'hex');
+			const payoutScript = Buffer.from('5120' + '59'.repeat(32), 'hex');
+			const funding = new bitcoin.Transaction();
+			funding.addInput(crypto.randomBytes(32), 1);
+			funding.addOutput(fundingScript, 50000);
+			const close = new bitcoin.Transaction();
+			close.addInput(funding.getHash(), 0);
+			close.addOutput(payoutScript, 49000);
+			const closeRow = { txid: close.getId(), height: 101 };
+			const fundingRow = { txid: funding.getId(), height: 95 };
+			const fundingHash = computeScriptHash(fundingScript);
+			const payoutHash = computeScriptHash(payoutScript);
+			backend.setTransaction(close.getId(), close.toBuffer());
+			backend.setHistory(fundingHash, [fundingRow]);
+			let spent = false;
+			Object.assign(backend, {
+				listUnspent: async (hash: string) => {
+					if (hash === fundingHash && !spent)
+						return [{ ...fundingRow, outputIndex: 0, valueSat: 50000 }];
+					if (hash === payoutHash && spent)
+						return [{ ...closeRow, outputIndex: 0, valueSat: 49000 }];
+					return [];
+				},
+				getAssetSpliceInclusion: async () => ({
+					txid: funding.getId(),
+					blockHash: '31'.repeat(32),
+					confirmations: 6
+				})
+			});
+			const pending: (() => void)[] = [];
+			const freshness: boolean[] = [];
+			channelManager.hasAssetSpliceWatch = (): boolean => true;
+			channelManager.observeAssetSpliceFunding = async (
+				_id,
+				_txid,
+				_height,
+				_prove,
+				current
+			): Promise<void> => {
+				if (!spent) return;
+				await new Promise<void>((done) => pending.push(done));
+				freshness.push(current());
+			};
+			const observations: string[] = [];
+			const recoveries: string[] = [];
+			const errors: Error[] = [];
+			watcher = new ChainWatcher({
+				backend,
+				channelManager,
+				finalOutputClaims: (channelId, tx): IFinalOutputClaim[] => {
+					expect(channelId.equals(id)).to.equal(true);
+					expect(tx.toHex()).to.equal(close.toHex());
+					return [
+						{
+							outputIndex: 0,
+							relativeDelay: 1,
+							absoluteHeight: 0,
+							confirmedOnly: true,
+							assetBalanceOutput: true,
+							tx: null,
+							recover: async (): Promise<null> => {
+								recoveries.push(tx.getId());
+								return null;
+							}
+						}
+					];
+				}
+			});
+			watcher.on('funding:spent', (_id, tx: bitcoin.Transaction) =>
+				observations.push(tx.getId())
+			);
+			watcher.on('error', (error: Error) => errors.push(error));
+			const tick = (): Promise<void> =>
+				new Promise((done) => setImmediate(done));
+			await watcher.start();
+			backend.simulateNewBlock(100);
+			await watcher.watchFinalFundingOutput(
+				id,
+				funding.getId(),
+				0,
+				3,
+				fundingScript,
+				50000,
+				true
+			);
+			try {
+				spent = true;
+				backend.setHistory(fundingHash, [fundingRow, closeRow]);
+				backend.simulateNewBlock(101);
+				await tick();
+				expect(pending).to.have.length(1);
+				backend.simulateNewBlock(102);
+				await tick();
+				expect(pending).to.have.length(2);
+				expect(freshness).to.deep.equal([]);
+				expect(errors).to.deep.equal([]);
+				expect(
+					observations,
+					'confirmed spender observed before the latest funding proof finishes'
+				).to.include(close.getId());
+				expect(
+					recoveries,
+					'mature beneficiary output reaches the claim provider'
+				).to.include(close.getId());
+				pending.shift()!();
+				await tick();
+				expect(freshness).to.deep.equal([false]);
+			} finally {
+				watcher.stop();
+				for (const done of pending) done();
+				await tick();
+			}
+			expect(freshness).to.deep.equal([false, false]);
+		});
+
+		it('verifies historical splice funding while a confirmed spender lookup is pending', async () => {
+			const id = crypto.randomBytes(32);
+			const txid = '64'.repeat(32);
+			const script = Buffer.from('5120' + '65'.repeat(32), 'hex');
+			const fundingHeight = 98;
+			const close = new bitcoin.Transaction();
+			close.addInput(Buffer.from(txid, 'hex').reverse(), 1);
+			close.addOutput(Buffer.of(0x51), 49000);
+			backend.setHistory(computeScriptHash(script), [
+				{ txid, height: fundingHeight },
+				{ txid: close.getId(), height: 100 }
+			]);
+			backend.setTransaction(close.getId(), close.toBuffer());
+			backend.holdTransactions();
+			const anchor = { txid, blockHash: '66'.repeat(32), confirmations: 3 };
+			Object.assign(backend, {
+				listUnspent: async () => [],
+				getAssetSpliceInclusion: async (hash: string, height: number) => {
+					expect(hash).to.equal(txid);
+					expect(height).to.equal(fundingHeight);
+					return anchor;
+				}
+			});
+			const store = new SqliteStorage(':memory:');
+			const recovery = {
+				store,
+				channelId: id.toString('hex'),
+				finalDigest: '67'.repeat(32)
+			};
+			let verified = false;
+			channelManager.hasAssetSpliceWatch = (): boolean => true;
+			channelManager.observeAssetSpliceFunding = async (
+				_id,
+				_txid,
+				height,
+				prove,
+				current
+			): Promise<void> => {
+				expect(height).to.equal(fundingHeight);
+				expect(await prove(height!, recovery)).to.deep.equal(anchor);
+				verified = current();
+			};
+			const spends: string[] = [];
+			watcher.on('funding:spent', (_id, tx: bitcoin.Transaction) =>
+				spends.push(tx.getId())
+			);
+			backend.simulateNewBlock(100);
+			const watch = watcher.watchFinalFundingOutput(
+				id,
+				txid,
+				1,
+				3,
+				script,
+				50000,
+				true
+			);
+			try {
+				await new Promise<void>((done) => setImmediate(done));
+				expect(backend.transactionReads.get(close.getId())).to.equal(1);
+				expect(spends).to.deep.equal([]);
+				expect(
+					verified,
+					'historical inclusion can finish before the spend read'
+				).to.equal(true);
+			} finally {
+				backend.releaseNextTransaction();
+				await watch;
+				await new Promise<void>((done) => setImmediate(done));
+				store.close();
+			}
+			expect(spends).to.deep.equal([close.getId()]);
+		});
+
+		it('finishes a mature payout while an ancestor watch observes its authorized splice successor', async function () {
+			this.timeout(30000);
+			watcher.stop();
+			const dir = mkdtempSync(join(tmpdir(), 'asset-splice-payout-watch-'));
+			const pair = await setupFundedAssetUpdatePair(dir);
+			let release: (() => void) | undefined;
+			try {
+				const { store, party } = pair.f.devices[0];
+				const id = pair.f.id,
+					channelId = Buffer.from(id, 'hex');
+				channelManager = new ChannelManager({
+					finalOpening: {
+						storage: store,
+						root: party.root,
+						dualFunding: {
+							verifySpliceFunding: async () => {},
+							confirmSpliceFunding: async () => {}
+						}
+					},
+					verifyRemoteFundingInput: async () => 'unspent',
+					persistence: COMMIT_ALL
+				} as unknown as IChannelManagerConfig);
+				channelManager.restoreAssetSpliceWatches(id);
+				const { parent, candidate } =
+					store.loadAssetSpliceFundingInfo(id).pending[0];
+				const previous = bitcoin.Transaction.fromHex(
+					parent.funding.fundingTxHex
+				);
+				const successor = bitcoin.Transaction.fromHex(
+					candidate.funding.fundingTxHex
+				);
+				expect(
+					channelManager.hasAssetSpliceWatch(id, successor.getId())
+				).to.equal(true);
+				expect(
+					successor.ins.some(
+						(input) =>
+							input.hash.equals(previous.getHash()) &&
+							input.index === parent.outputIndex
+					)
+				).to.equal(true);
+				const close = new bitcoin.Transaction();
+				close.addInput(successor.getHash(), candidate.outputIndex);
+				const destination = Buffer.from('5120' + '12'.repeat(32), 'hex');
+				close.addOutput(destination, 49000);
+				const payout = new bitcoin.Transaction();
+				payout.addInput(close.getHash(), 0, 3);
+				payout.addOutput(Buffer.of(0x51), 48000);
+				const transactions = [previous, successor, close];
+				for (const tx of transactions)
+					backend.setTransaction(tx.getId(), tx.toBuffer());
+				const previousScript = previous.outs[parent.outputIndex].script;
+				const successorScript = successor.outs[candidate.outputIndex].script;
+				const rows = transactions.map((tx, i) => ({
+					txid: tx.getId(),
+					height: 80 + i
+				}));
+				backend.setHistory(computeScriptHash(previousScript), rows.slice(0, 2));
+				backend.setHistory(computeScriptHash(successorScript), rows.slice(1));
+				Object.assign(backend, {
+					listUnspent: async (hash: string) =>
+						hash === computeScriptHash(destination)
+							? [{ ...rows[2], outputIndex: 0, valueSat: 49000 }]
+							: []
+				});
+				const observed: string[] = [];
+				const errors: Error[] = [];
+				const held = new Promise<void>((done) => {
+					release = done;
+				});
+				let began!: () => void;
+				const recovering = new Promise<void>((done) => {
+					began = done;
+				});
+				watcher = new ChainWatcher({
+					backend,
+					channelManager,
+					finalOutputClaims: (_id, tx): IFinalOutputClaim[] =>
+						tx.getId() !== close.getId()
+							? []
+							: [
+									{
+										outputIndex: 0,
+										relativeDelay: 3,
+										absoluteHeight: 0,
+										confirmedOnly: true,
+										assetBalanceOutput: true,
+										tx: null,
+										async recover(): Promise<bitcoin.Transaction> {
+											began();
+											await held;
+											return payout;
+										}
+									}
+							  ]
+				});
+				watcher.on('funding:spent', (_id, tx: bitcoin.Transaction) =>
+					observed.push(tx.getId())
+				);
+				watcher.on('error', (error: Error) => errors.push(error));
+				await watcher.start();
+				backend.simulateNewBlock(100);
+				const head = watcher.watchFinalFundingOutput(
+					channelId,
+					successor.getId(),
+					candidate.outputIndex,
+					1,
+					successorScript,
+					successor.outs[candidate.outputIndex].value,
+					true
+				);
+				await recovering;
+				await watcher.watchFinalFundingOutput(
+					channelId,
+					previous.getId(),
+					parent.outputIndex,
+					1,
+					previousScript,
+					previous.outs[parent.outputIndex].value
+				);
+				expect(observed).to.include(close.getId());
+				expect(errors).to.deep.equal([]);
+				release!();
+				await head;
+				expect(
+					backend.getBroadcastedTxs(),
+					'the prior splice should leave the current outpoint claim active'
+				).to.deep.equal([payout.toHex()]);
+				const parentOutpoint = previous.getId() + ':' + parent.outputIndex;
+				expect(
+					channelManager.isAssetSpliceSuccessor(
+						id,
+						successor.getId(),
+						parentOutpoint
+					)
+				).to.equal(true);
+				expect(
+					channelManager.isAssetSpliceSuccessor(
+						id,
+						close.getId(),
+						parentOutpoint
+					)
+				).to.equal(false);
+				expect(
+					channelManager.isAssetSpliceSuccessor(
+						id,
+						successor.getId(),
+						previous.getId() + ':' + (parent.outputIndex + 1)
+					)
+				).to.equal(false);
+				expect(
+					channelManager.isAssetSpliceSuccessor(
+						'00'.repeat(32),
+						successor.getId(),
+						parentOutpoint
+					)
+				).to.equal(false);
+			} finally {
+				release?.();
+				watcher.stop();
+				for (const device of pair.f.devices) device.store.close();
+				rmSync(dir, { recursive: true, force: true });
+			}
+		});
+
 		it('releases an asset payout callback only for the mature exact outpoint on a current tip', async () => {
 			watcher.stop();
 			let releases = 0;
@@ -761,6 +1308,104 @@ describe('Phase 4: Chain Watcher', () => {
 			expect(releases, 'no header accepted since restart').to.equal(1);
 		});
 
+		it('requires confirmed wallet receipts for every balance output of an observed commitment', async () => {
+			watcher.stop();
+			const funding = new bitcoin.Transaction();
+			const fundingScript = Buffer.from('5120' + '71'.repeat(32), 'hex');
+			funding.addInput(crypto.randomBytes(32), 0);
+			funding.addOutput(fundingScript, 50000);
+			const commitment = new bitcoin.Transaction();
+			commitment.addInput(funding.getHash(), 0);
+			const scripts = [0x92, 0x93].map((byte) =>
+				Buffer.concat([Buffer.of(0x51, 32), Buffer.alloc(32, byte)])
+			);
+			for (const script of scripts) commitment.addOutput(script, 24000);
+			const sweeps = scripts.map((_, i) => {
+				const tx = new bitcoin.Transaction();
+				tx.addInput(commitment.getHash(), i);
+				tx.addOutput(Buffer.of(0x51), 23000);
+				return tx;
+			});
+			const other = sweeps[0].clone();
+			other.outs[0].value--;
+			for (const tx of [commitment, other, ...sweeps])
+				backend.setTransaction(tx.getId(), tx.toBuffer());
+			const observations: boolean[] = [];
+			let imported: boolean | Error = true;
+			const restored: string[] = [];
+			Object.assign(channelManager, {
+				observeAssetOpeningPayout: (
+					_id: Buffer,
+					_parent: string,
+					settled: boolean
+				) => observations.push(settled)
+			});
+			Object.assign(backend, { listUnspent: async () => [] });
+			backend.setHistory(computeScriptHash(fundingScript), [
+				{ txid: commitment.getId(), height: 100 }
+			]);
+			watcher = new ChainWatcher({
+				backend,
+				channelManager,
+				finalOutputClaims: () =>
+					sweeps.map((sweep, index) => ({
+						outputIndex: index,
+						relativeDelay: 0,
+						absoluteHeight: 0,
+						assetBalanceOutput: true,
+						tx: null,
+						matchesAssetPayout: (spend: bitcoin.Transaction) =>
+							spend.getId() === sweep.getId(),
+						confirmAssetPayout: async (tx: bitcoin.Transaction) => {
+							expect(tx.getId()).to.equal(sweep.getId());
+							restored.push(tx.getId());
+							if (imported instanceof Error) throw imported;
+							return imported;
+						}
+					}))
+			});
+			await watcher.start();
+			backend.simulateNewBlock(103);
+			const channelId = crypto.randomBytes(32);
+			const scan = async (
+				first: bitcoin.Transaction | null,
+				secondHeight: number,
+				settled: boolean
+			) => {
+				backend.setHistory(
+					computeScriptHash(scripts[0]),
+					first ? [{ txid: first.getId(), height: 102 }] : []
+				);
+				backend.setHistory(computeScriptHash(scripts[1]), [
+					{ txid: sweeps[1].getId(), height: secondHeight }
+				]);
+				observations.length = 0;
+				await watcher.watchFinalFundingOutput(
+					channelId,
+					funding.getId(),
+					0,
+					1,
+					fundingScript,
+					50000
+				);
+				expect(observations).to.deep.equal([settled]);
+			};
+			await scan(null, 102, false);
+			await scan(other, 102, false);
+			expect(restored).not.to.include(other.getId());
+			imported = false;
+			await scan(sweeps[0], 102, false);
+			imported = Error('wallet receipt not yet imported');
+			await scan(sweeps[0], 102, false);
+			imported = true;
+			restored.length = 0;
+			await scan(sweeps[0], 0, false);
+			expect(restored).not.to.include(sweeps[1].getId());
+			await scan(sweeps[0], 102, true);
+			expect(restored).to.include.members(sweeps.map((t) => t.getId()));
+			await scan(sweeps[0], 0, false);
+		});
+
 		it('discards a delayed final funding verdict superseded by a script notification', async () => {
 			const channelId = crypto.randomBytes(32);
 			const txid = crypto.randomBytes(32).toString('hex');
@@ -864,55 +1509,68 @@ describe('Phase 4: Chain Watcher', () => {
 			expect(ready).to.equal(false);
 		});
 
-		it('discards a delayed final funding spend after the exact output returns', async () => {
-			const id = crypto.randomBytes(32);
-			const script = Buffer.concat([
-				Buffer.from([0x51, 32]),
-				crypto.randomBytes(32)
-			]);
-			const scriptHash = computeScriptHash(script);
-			const coin = {
-				txid: '6e'.repeat(32),
-				outputIndex: 1,
-				valueSat: 90000,
-				height: 98
-			};
-			const spend = new bitcoin.Transaction();
-			spend.addInput(Buffer.from(coin.txid, 'hex').reverse(), coin.outputIndex);
-			spend.addOutput(Buffer.from([0x51]), 88000);
-			let coins = [coin];
-			Object.assign(backend, { listUnspent: async () => coins });
-			const events: string[] = [];
-			watcher.on('funding:confirmed', () => events.push('confirmed'));
-			watcher.on('funding:spent', () => events.push('spent'));
-			const settle = (): Promise<void> =>
-				new Promise<void>((resolve) => setImmediate(resolve));
-			backend.simulateNewBlock(100);
-			await watcher.watchFinalFundingOutput(
-				id,
-				coin.txid,
-				coin.outputIndex,
-				3,
-				script,
-				coin.valueSat
+		for (const splice of [false, true]) {
+			it(
+				'discards a delayed spend when the exact ' +
+					(splice ? 'splice' : 'opening') +
+					' funding output returns',
+				async () => {
+					const id = crypto.randomBytes(32);
+					const script = Buffer.concat([
+						Buffer.from([0x51, 32]),
+						crypto.randomBytes(32)
+					]);
+					const scriptHash = computeScriptHash(script);
+					const coin = {
+						txid: '6e'.repeat(32),
+						outputIndex: 1,
+						valueSat: 90000,
+						height: 98
+					};
+					const spend = new bitcoin.Transaction();
+					spend.addInput(
+						Buffer.from(coin.txid, 'hex').reverse(),
+						coin.outputIndex
+					);
+					spend.addOutput(Buffer.from([0x51]), 88000);
+					let coins = [coin];
+					Object.assign(backend, { listUnspent: async () => coins });
+					const events: string[] = [];
+					watcher.on('funding:confirmed', () => events.push('confirmed'));
+					watcher.on('funding:spent', () => events.push('spent'));
+					const settle = (): Promise<void> =>
+						new Promise<void>((resolve) => setImmediate(resolve));
+					backend.simulateNewBlock(100);
+					await watcher.watchFinalFundingOutput(
+						id,
+						coin.txid,
+						coin.outputIndex,
+						3,
+						script,
+						coin.valueSat,
+						splice
+					);
+					coins = [];
+					backend.setHistory(scriptHash, [
+						{ txid: spend.getId(), height: 100 }
+					]);
+					backend.setTransaction(spend.getId(), spend.toBuffer());
+					backend.holdTransactions();
+					backend.simulateScriptHashChange(scriptHash);
+					await settle();
+					// A replacement branch restores this coin while the old spender is in flight.
+					coins = [coin];
+					backend.setHistory(scriptHash, [
+						{ txid: coin.txid, height: coin.height }
+					]);
+					backend.simulateScriptHashChange(scriptHash);
+					await settle();
+					backend.releaseNextTransaction();
+					await settle();
+					expect(events).to.deep.equal(['confirmed', 'confirmed']);
+				}
 			);
-			coins = [];
-			backend.setHistory(scriptHash, [{ txid: spend.getId(), height: 100 }]);
-			backend.setTransaction(spend.getId(), spend.toBuffer());
-			backend.holdTransactions();
-			backend.simulateScriptHashChange(scriptHash);
-			await settle();
-			// A replacement branch restores this coin while the old spender is in flight.
-			coins = [coin];
-			backend.setHistory(scriptHash, [
-				{ txid: coin.txid, height: coin.height }
-			]);
-			backend.simulateScriptHashChange(scriptHash);
-			await settle();
-			backend.releaseNextTransaction();
-			await settle();
-			expect(events).to.deep.equal(['confirmed', 'confirmed']);
-		});
+		}
 
 		it('should detect funding confirmation at minimum depth', async () => {
 			const channelId = crypto.randomBytes(32);

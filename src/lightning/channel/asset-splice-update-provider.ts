@@ -43,6 +43,7 @@ export interface IAssetUpdateMemberView {
 	remote: IAssetUpdateHolderView;
 }
 export interface IAssetUpdateRound {
+	walletGeneration?: 5;
 	channelId: string;
 	localIsInitiator: boolean;
 	stateNumber: bigint;
