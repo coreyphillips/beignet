@@ -258,6 +258,79 @@ describe('Electrum: a server that answers transactions only in raw form', functi
 		await wallet?.stop();
 	});
 
+	it('preserves a failed transaction batch for an individual detail read', async () => {
+		const id = payment().getId();
+		const failure = new Error('Connection to server lost, please retry');
+		const request = electrumHelpers.getTransactions as sinon.SinonStub;
+		request.resolves({ error: true, data: failure });
+		const scan = await wallet.electrum.getTransactions({
+			txHashes: [{ tx_hash: id }]
+		});
+		if (scan.isErr()) throw scan.error;
+		expect(scan.value.data).to.deep.equal([]);
+		for (const reason of [failure, 'Timed Out.']) {
+			request.resolves({ error: true, data: reason });
+			const details = await wallet.fetchTransactionDetails(id);
+			if (details.isOk()) throw Error('Missing failed transaction batch');
+			expect(details.error.message).to.equal(
+				typeof reason === 'string' ? reason : reason.message
+			);
+			if (reason === failure) expect(details.error.cause).to.equal(failure);
+		}
+	});
+
+	it('preserves the raw RPC failure when verbose transaction details need a fallback', async () => {
+		mode = 'esplora';
+		const id = place(payment(), TIP);
+		const failure = new Error('Connection to server lost, please retry');
+		(electrumHelpers.getClient as sinon.SinonStub).resolves({
+			error: false,
+			data: {
+				blockchainTransaction_getBatch: async () => {
+					throw failure;
+				}
+			}
+		});
+		const details = await wallet.fetchTransactionDetails(id);
+		if (details.isOk()) throw Error('Missing failed raw transaction batch');
+		expect(details.error.message).to.equal(failure.message);
+		expect(details.error.cause).to.equal(failure);
+	});
+
+	it('distinguishes an empty transaction answer from a wrong or malformed one', async () => {
+		mode = 'verbose';
+		const id = place(payment(), TIP),
+			request = electrumHelpers.getTransactions as sinon.SinonStub;
+		const found = await wallet.fetchTransactionDetails(id);
+		if (found.isErr()) throw found.error;
+		expect(found.value.txid).to.equal(id);
+		request.resolves({ error: false, data: [] });
+		const missing = await wallet.fetchTransactionDetails(id);
+		if (missing.isOk()) throw Error('Missing empty transaction answer');
+		expect(missing.error.code).to.equal(
+			'ELECTRUM_TRANSACTION_RESPONSE_MISSING'
+		);
+		for (const data of [
+			[entry({ tx_hash: id }, {})],
+			[entry({ tx_hash: id }, { result: { txid: id } })],
+			[
+				entry(
+					{ tx_hash: id },
+					{ result: { ...found.value, txid: 'aa'.repeat(32) } }
+				)
+			],
+			[
+				entry({ tx_hash: id }, { result: found.value }),
+				entry({ tx_hash: id }, { result: found.value })
+			]
+		]) {
+			request.resolves({ error: false, data });
+			const invalid = await wallet.fetchTransactionDetails(id);
+			if (invalid.isOk()) throw Error('Accepted an invalid transaction answer');
+			expect(invalid.error.code).not.to.equal(missing.error.code);
+		}
+	});
+
 	it('asks for the verbose form first, takes the raw answer from a server that refuses it, and decodes it into the verbose shape', async () => {
 		const tx = payment();
 		const txid = place(tx, 298);
