@@ -43,6 +43,7 @@ describe('asset update peer transport on enrolled devices', function () {
 					done: number[] = [],
 					seen: number[] = [];
 				const packets: { from: number; type: number; wire: Buffer }[] = [];
+				let currentHeight: number | undefined = 600900;
 				const makeSides = () =>
 					f.devices.map(
 						({ store, party }, i) =>
@@ -56,7 +57,7 @@ describe('asset update peer transport on enrolled devices', function () {
 												originalInitiator: i === 0
 										  }
 										: undefined,
-								() => 600900,
+								() => currentHeight,
 								(_peer, type, raw) =>
 									packets.push({ from: i, type, wire: raw }),
 								async () => {
@@ -82,6 +83,23 @@ describe('asset update peer transport on enrolled devices', function () {
 							allocations: [{ assetId: '4c'.repeat(32), units: 3n }]
 						}
 					};
+					if (scenario === 'complete') {
+						currentHeight = undefined;
+						await assert.rejects(
+							sides[0].start('00'.repeat(32), [add]),
+							/established enrolled channel/
+						);
+						await assert.rejects(
+							sides[0].start(f.id, [add]),
+							/waiting for verified live funding/
+						);
+						assert.equal(packets.length, 0);
+						assert.equal(
+							f.devices[0].store.assetSpliceUpdateHead(f.id).inProgress,
+							undefined
+						);
+						currentHeight = 600900;
+					}
 					await assert.rejects(() =>
 						sides[0].start(f.id, [
 							{ ...add, htlc: { ...add.htlc, offeredBy: 'peer' } }

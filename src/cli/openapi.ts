@@ -4881,7 +4881,12 @@ export function getOpenApiSpec(): Record<string, unknown> {
 					responses: {
 						'200': {
 							description:
-								'Quiescence started. Wait for splice:complete to confirm the new funding output.'
+								'Quiescence started. Wait for splice:complete to confirm the new funding output.',
+							content: jsonContent({
+								type: 'object',
+								required: ['started'],
+								properties: { started: { type: 'boolean', enum: [true] } }
+							})
 						},
 						'400': { description: 'Invalid channel ID, feerate or lock depth' },
 						'409': {
