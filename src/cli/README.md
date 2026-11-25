@@ -93,6 +93,7 @@ await node.destroy();
 | `finalCommitmentUpdates?` | `boolean` | Enroll a new regtest wallet for type-80 payments, splicing and closes. |
 | `dualFundedAssets?` | `boolean` | Enroll a fresh regtest wallet for dual-funded asset channel opening. |
 | `assetSplice?` | `boolean` | Enroll a fresh regtest wallet for asset channel splices. |
+| `assetSpliceRecovery?` | `boolean` | Enroll a fresh regtest wallet for revocable asset payouts across splices. |
 | `largeChannels?` | `boolean` | option_wumbo (large_channels, default false): advertise the bit and lift the 2^24 sat funding cap (up to 10 BTC) for peers that also advertise it. |
 | `autoBootstrap?` | `boolean` | Connect to DNS seed peers (BOLT 10) at startup (default false). |
 | `autoReconnect?` | `boolean` | Enable auto-reconnection to peers (default true) |

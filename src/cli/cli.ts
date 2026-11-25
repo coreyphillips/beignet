@@ -3087,8 +3087,8 @@ async function handleMessage(): Promise<void> {
 }
 
 async function handleBackup(): Promise<void> {
-	const args = positionalArgs(undefined, new Set(['--overwrite']));
-	const sub = args[1];
+	const backupArgs = positionalArgs(undefined, new Set(['--overwrite']));
+	const sub = backupArgs[1];
 	if (sub === 'trigger') {
 		// On-demand encrypted database backup to the configured backupPath.
 		return outputResult(await httpRequest('POST', '/backup/trigger'));
@@ -3116,12 +3116,14 @@ async function handleBackup(): Promise<void> {
 		});
 	}
 	const channelFrame = sub === 'asset-channel';
-	const destPath = channelFrame ? args[3] : sub;
+	const destPath = channelFrame ? backupArgs[3] : sub;
 	const overwrite = hasFlag('--overwrite');
 	if (
 		!destPath ||
 		(channelFrame &&
-			(args.length !== 4 || !/^[0-9a-f]{64}$/.test(args[2]) || overwrite))
+			(backupArgs.length !== 4 ||
+				!/^[0-9a-f]{64}$/.test(backupArgs[2]) ||
+				overwrite))
 	) {
 		output({
 			ok: false,
@@ -3139,7 +3141,7 @@ async function handleBackup(): Promise<void> {
 		await httpRequest('POST', '/backup', {
 			// The daemon would resolve a relative path against its own cwd.
 			destPath: nodePath.resolve(destPath),
-			...(channelFrame ? { channelId: args[2] } : {}),
+			...(channelFrame ? { channelId: backupArgs[2] } : {}),
 			...(overwrite ? { overwrite: true } : {})
 		})
 	);

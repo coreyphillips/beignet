@@ -336,7 +336,7 @@ describe('Original-device asset channel RecoveryFrame files', function () {
 			device = local,
 			channel = id,
 			destination = device.file,
-			key = deriveBackupMacKey(device.seed)
+			backupMacKey = deriveBackupMacKey(device.seed)
 		) =>
 			performAssetChannelRestore(
 				file,
@@ -344,7 +344,7 @@ describe('Original-device asset channel RecoveryFrame files', function () {
 				lock,
 				device.party.binding,
 				channel,
-				key
+				backupMacKey
 			);
 		for (const file of [damaged, reordered, truncated, prefix, link]) {
 			await assert.rejects(restore(file));
