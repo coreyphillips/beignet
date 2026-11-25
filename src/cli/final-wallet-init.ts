@@ -80,7 +80,7 @@ function loadPending(file: string): Pending | undefined {
 	if (
 		!p ||
 		Object.keys(p).sort().join(',') !== 'base,dataDir,mnemonic,version' ||
-		![1, 2, 3, 4].includes(p.version) ||
+		![1, 2, 3, 4, 5].includes(p.version) ||
 		typeof p.base !== 'string' ||
 		!/^[a-f0-9]{64}$/.test(p.base) ||
 		typeof p.mnemonic !== 'string' ||
@@ -92,7 +92,7 @@ function loadPending(file: string): Pending | undefined {
 	return p;
 }
 
-function walletBinding(
+export function finalWalletBinding(
 	words: string,
 	generation: Pending['version']
 ): IFinalWalletBinding {
@@ -102,6 +102,7 @@ function walletBinding(
 		finalCommitmentUpdates: generation === 2,
 		dualFundedAssets: generation === 3,
 		assetSplice: generation === 4,
+		assetSpliceRecovery: generation === 5,
 		nodeId: deriveLightningKeysFromSeed(seed, 1).nodePublicKey.toString('hex'),
 		encryptionKey: deriveStorageKey(seed)
 	};
@@ -113,7 +114,7 @@ function verifyEnrolledWallet(
 ): void {
 	const { SqliteStorage } =
 		require('../lightning/storage/sqlite-storage') as typeof import('../lightning/storage/sqlite-storage');
-	const binding = walletBinding(words, generation);
+	const binding = finalWalletBinding(words, generation);
 	const store = SqliteStorage.openFinalWallet(
 		path.join(dataDir, 'regtest.db'),
 		binding
@@ -133,9 +134,15 @@ export function provisionFinalConfig(
 	makeConfig: (words: string, dataDir: string) => BeignetConfig,
 	updates = false,
 	assets = false,
-	assetSplice = false
+	assetSplice = false,
+	assetSpliceRecovery = false
 ): BeignetConfig {
-	const generation = finalWalletGeneration(updates, assets, assetSplice);
+	const generation = finalWalletGeneration(
+		updates,
+		assets,
+		assetSplice,
+		assetSpliceRecovery
+	);
 	const dir = path.dirname(configFile);
 	const pendingFile = path.join(dir, 'final-wallet-init.pending');
 	const previous = loadPending(pendingFile);
@@ -164,7 +171,8 @@ export function provisionFinalConfig(
 			finalWalletGeneration(
 				config.finalCommitmentUpdates,
 				config.dualFundedAssets,
-				config.assetSplice
+				config.assetSplice,
+				config.assetSpliceRecovery
 			) === generation &&
 			config.network === 'regtest' &&
 			config.mnemonic === pending.mnemonic &&
@@ -184,7 +192,7 @@ export function provisionFinalConfig(
 		)
 			finishStagedDaemonWallet(
 				wallet,
-				walletBinding(pending.mnemonic, generation)
+				finalWalletBinding(pending.mnemonic, generation)
 			);
 		if (fs.lstatSync(wallet, { throwIfNoEntry: false })) {
 			verifyEnrolledWallet(pending.dataDir, pending.mnemonic, generation);
@@ -201,7 +209,12 @@ export function provisionFinalConfig(
 		}
 	}
 	if (!pending) {
-		const fresh = generateFinalDaemonWallet(updates, assets, assetSplice);
+		const fresh = generateFinalDaemonWallet(
+			updates,
+			assets,
+			assetSplice,
+			assetSpliceRecovery
+		);
 		const dataDir = dataDirFor(fresh.mnemonic);
 		ensurePrivateDir(dataDir);
 		const file = path.join(dataDir, 'regtest.db');

@@ -101,6 +101,8 @@ function isForeignHost(recorded: unknown, ours: string): boolean {
 export type LockReclaimReason = 'dead-pid' | 'foreign-host';
 
 export interface IAcquireLockOptions {
+	/** An offline repair must also refuse an embedded daemon or concurrent repair in this process. */
+	refuseOwnPid?: boolean;
 	/** Timestamp recorded in the lock; pass a fixed value for deterministic tests. */
 	now?: number;
 	/**
@@ -173,7 +175,7 @@ export function acquireInstanceLock(
 				}
 				if (
 					!foreign &&
-					holder.pid !== process.pid &&
+					(holder.pid !== process.pid || opts.refuseOwnPid === true) &&
 					isProcessAlive(holder.pid)
 				) {
 					throw new InstanceLockError(

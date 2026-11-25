@@ -17,6 +17,8 @@
  */
 
 import { timingSafeEqual } from 'crypto';
+import path from 'path';
+import type { IFinalWalletBinding } from '../lightning/storage/final-wallet-format';
 import { assertLegacyWalletFile } from '../lightning/storage/final-wallet-format';
 import { nodeFs } from '../utils/node-builtins';
 import { acquireInstanceLock, releaseInstanceLock } from './instance-lock';
@@ -201,6 +203,55 @@ export async function performDbRestore(
 	acquireInstanceLock(lockPath);
 	try {
 		return await restoreDbFile(backupFile, dbPath, opts);
+	} finally {
+		releaseInstanceLock(lockPath);
+	}
+}
+
+/** Repair one funded asset channel from the exact authenticated copy while the original daemon is stopped. */
+export async function performAssetChannelRestore(
+	backupFile: string,
+	dbPath: string,
+	lockPath: string,
+	binding: IFinalWalletBinding,
+	channelId: string,
+	macKey: Buffer
+) {
+	const fs = nodeFs();
+	acquireInstanceLock(lockPath, { refuseOwnPid: true });
+	try {
+		const mac = readBackupMac(backupFile);
+		if (!mac)
+			throw new Error(
+				'Asset channel repair requires an authenticated backup with its MAC'
+			);
+		if (
+			[
+				dbRestoreMarkerPath(dbPath),
+				path.join(path.dirname(dbPath), 'regtest.capsule-restore.json')
+			].some((p) => fs.lstatSync(p, { throwIfNoEntry: false }))
+		)
+			throw new Error('Final wallet has a pending legacy restore');
+		const dir = fs.mkdtempSync(
+			path.join(path.dirname(dbPath), '.asset-channel-restore-')
+		);
+		try {
+			const staged = path.join(dir, 'snapshot.db');
+			fs.copyFileSync(backupFile, staged);
+			tightenMode(staged, SECRET_FILE_MODE);
+			if (!timingSafeEqual(await fileMac(macKey, staged), mac))
+				throw new Error('Asset channel backup MAC does not match');
+			const { SqliteStorage } =
+				require('../lightning/storage/sqlite-storage') as typeof import('../lightning/storage/sqlite-storage');
+			return SqliteStorage.repairAssetSpliceChannel(
+				dbPath,
+				binding,
+				staged,
+				channelId
+			);
+		} finally {
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
 	} finally {
 		releaseInstanceLock(lockPath);
 	}

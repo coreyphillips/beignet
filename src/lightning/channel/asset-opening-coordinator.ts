@@ -1,5 +1,8 @@
 import type { Transaction } from 'bitcoinjs-lib';
-import { ASSET_OPENING_TYPE_HEX } from '../features/asset-opening';
+import {
+	ASSET_OPENING_TYPE_HEX,
+	ASSET_SPLICE_RECOVERY_TYPE_HEX
+} from '../features/asset-opening';
 import {
 	encodeOpenChannel2Message,
 	encodeAcceptChannel2Message
@@ -106,7 +109,10 @@ export class AssetOpeningCoordinator {
 			!v2 ||
 			!open ||
 			!accept ||
-			open.channelType?.toString('hex') !== ASSET_OPENING_TYPE_HEX ||
+			open.channelType?.toString('hex') !==
+				(this.runtime.storage.canRecoverAssetSplice
+					? ASSET_SPLICE_RECOVERY_TYPE_HEX
+					: ASSET_OPENING_TYPE_HEX) ||
 			typeof channel.channelKeyIndex !== 'number'
 		)
 			throw new Error('Missing asset opening terms');

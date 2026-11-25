@@ -6,7 +6,13 @@ import {
 import { Feature, FeatureFlags } from '../../src/lightning/features/flags';
 import { encodeCommitmentSignedMessage } from '../../src/lightning/message/channel-commitment';
 import { MAX_LIGHTNING_PAYLOAD } from '../../src/lightning/message/custom-records';
-import { ASSET_OPENING_TYPE_HEX } from '../../src/lightning/features/asset-opening';
+import {
+	ASSET_OPENING_TYPE_HEX,
+	ASSET_SPLICE_RECOVERY_TYPE_HEX,
+	assetOpeningNegotiated
+} from '../../src/lightning/features/asset-opening';
+
+import { completeAssetSpliceRecoveryHost } from '../../src/lightning/channel/asset-splice-update-transport';
 
 describe('Asset splice admission on each commitment wire', () => {
 	const records = [
@@ -91,6 +97,50 @@ describe('Asset splice admission on each commitment wire', () => {
 			for (const f of dependencies) if (f !== except) value.setOptional(f);
 			return value;
 		}
+		const recoveryType = FeatureFlags.fromBuffer(
+			Buffer.from(ASSET_SPLICE_RECOVERY_TYPE_HEX, 'hex')
+		);
+		expect(recoveryType.hasBit(460)).to.equal(true);
+		expect(recoveryType.hasBit(461)).to.equal(false);
+		expect(recoveryType.hasBit(456)).to.equal(true);
+		expect(recoveryType.hasBit(2026)).to.equal(true);
+		const recoveryFlags = (except?: Feature) => {
+			const result = flags(except);
+			if (except !== Feature.OPTION_ASSET_SPLICE_RECOVERY)
+				result.setOptional(Feature.OPTION_ASSET_SPLICE_RECOVERY);
+			return result;
+		};
+		expect(recoveryFlags().hasBit(461)).to.equal(true);
+		expect(
+			assetOpeningNegotiated(
+				recoveryFlags(),
+				recoveryFlags(),
+				ASSET_SPLICE_RECOVERY_TYPE_HEX
+			)
+		).to.equal(true);
+		expect(
+			assetSpliceNegotiated(
+				ASSET_SPLICE_RECOVERY_TYPE_HEX,
+				recoveryFlags(),
+				recoveryFlags()
+			)
+		).to.equal(true);
+		for (const missing of [
+			...dependencies,
+			Feature.OPTION_ASSET_SPLICE_RECOVERY
+		]) {
+			for (const [a, b] of [
+				[recoveryFlags(missing), recoveryFlags()],
+				[recoveryFlags(), recoveryFlags(missing)]
+			]) {
+				expect(
+					assetOpeningNegotiated(a, b, ASSET_SPLICE_RECOVERY_TYPE_HEX)
+				).to.equal(false);
+				expect(
+					assetSpliceNegotiated(ASSET_SPLICE_RECOVERY_TYPE_HEX, a, b)
+				).to.equal(false);
+			}
+		}
 		expect(flags().hasBit(459)).to.equal(true);
 		expect(
 			assetSpliceNegotiated(ASSET_OPENING_TYPE_HEX, flags(), flags())
@@ -105,6 +155,60 @@ describe('Asset splice admission on each commitment wire', () => {
 			).to.equal(false);
 			expect(
 				assetSpliceNegotiated(ASSET_OPENING_TYPE_HEX, flags(), flags(f))
+			).to.equal(false);
+		}
+	});
+	it('requires both recovery handlers on the installed host before it offers the recovery type', () => {
+		const callbacks = [
+			'contribution',
+			'abandon',
+			'propose',
+			'describe',
+			'prepare',
+			'signExits',
+			'verifyExits',
+			'signFunding',
+			'confirmFunding',
+			'retractFunding',
+			'recoverOutput',
+			'recoverHtlc',
+			'outputRecoveryReceipt',
+			'restoreOutputReceipt',
+			'proposeSplice',
+			'spliceContribution',
+			'abandonSplice',
+			'describeSplice',
+			'prepareSplice',
+			'signSpliceExits',
+			'verifySpliceExits',
+			'retainSpliceExits',
+			'signSpliceFunding',
+			'verifySpliceFunding',
+			'confirmSpliceFunding',
+			'retractSpliceFunding',
+			'signAssetUpdateViews',
+			'signAssetUpdateHtlcs',
+			'verifyAssetUpdateViews',
+			'retainAssetUpdateViews'
+		];
+		const host = {
+			version: 1,
+			assetSpliceRecoveryVersion: 1,
+			...Object.fromEntries(callbacks.map((k) => [k, () => {}]))
+		};
+		expect(completeAssetSpliceRecoveryHost(host)).to.equal(true);
+		for (const field of [
+			'assetSpliceRecoveryVersion',
+			'recoverHtlc',
+			'outputRecoveryReceipt',
+			'restoreOutputReceipt',
+			'recoverOutput',
+			'retainAssetUpdateViews',
+			'verifySpliceFunding'
+		]) {
+			expect(
+				completeAssetSpliceRecoveryHost({ ...host, [field]: undefined }),
+				field
 			).to.equal(false);
 		}
 	});

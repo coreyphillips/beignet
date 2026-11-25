@@ -1,3 +1,4 @@
+import { completeAssetSpliceRecoveryHost } from '../channel/asset-splice-update-transport';
 import type { AssetUpdateChange } from '../channel/asset-splice-update-provider';
 import {
 	completeAssetSpliceHost,
@@ -320,7 +321,9 @@ import { MessageType } from '../message/types';
 import {
 	assetOpeningDependencies,
 	assetOpeningNegotiated,
-	ASSET_OPENING_TYPE_HEX
+	ASSET_OPENING_TYPE_HEX,
+	ASSET_SPLICE_RECOVERY_TYPE_HEX,
+	isAssetOpeningType
 } from '../features/asset-opening';
 import { completeAssetOpeningHost } from '../channel/asset-opening-coordinator';
 import {
@@ -1197,12 +1200,20 @@ class NodeFeatureFlags extends FeatureFlags {
 		private readonly configured: FeatureFlags,
 		private readonly finalDaemon: boolean,
 		private readonly assetOpening: boolean,
-		private readonly assetSplice: boolean
+		private readonly assetSplice: boolean,
+		private readonly assetRecovery: boolean
 	) {
 		super();
 	}
 
 	private masksFinalBit(bit: number): boolean {
+		if (bit === Feature.OPTION_ASSET_SPLICE_RECOVERY) return true;
+		if (bit === Feature.OPTION_ASSET_SPLICE_RECOVERY + 1)
+			return (
+				!this.assetRecovery ||
+				this.masksFinalBit(Feature.OPTION_ASSET_SPLICE + 1) ||
+				!this.configured.hasFeature(Feature.OPTION_ASSET_SPLICE)
+			);
 		if (bit === Feature.OPTION_ASSET_SPLICE) return true;
 		if (bit === Feature.OPTION_ASSET_SPLICE + 1)
 			return (
@@ -1241,6 +1252,8 @@ class NodeFeatureFlags extends FeatureFlags {
 
 	private advertised(): FeatureFlags {
 		const masked = [
+			Feature.OPTION_ASSET_SPLICE_RECOVERY,
+			Feature.OPTION_ASSET_SPLICE_RECOVERY + 1,
 			Feature.OPTION_ASSET_SPLICE,
 			Feature.OPTION_ASSET_SPLICE + 1,
 			Feature.OPTION_SIMPLE_TAPROOT,
@@ -1374,6 +1387,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	private resourceConfig: Required<IResourceConfig>;
 	private cleanupTimer: ReturnType<typeof setInterval> | null = null;
 	private storage: IStorageBackend | null = null;
+	private readonly assetOpeningType: string;
 	/** Safety transition committer; null when the node persists nothing. */
 	private recovery: RecoveryManager | null = null;
 	/**
@@ -2305,13 +2319,21 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		// Set default features if not provided (includes static_remotekey).
 		// Computed before the ChannelManager so per-peer feature-dependent
 		// behavior (e.g. option_simple_close) can consult our own advertisement.
+		const recoveryWallet = !!finalDaemon?.storage.canRecoverAssetSplice;
+		this.assetOpeningType = recoveryWallet
+			? ASSET_SPLICE_RECOVERY_TYPE_HEX
+			: ASSET_OPENING_TYPE_HEX;
+		const recoveryHost =
+			recoveryWallet &&
+			completeAssetSpliceRecoveryHost(config.auxiliaryChannels?.dualFunding);
 		const localFeatures = new NodeFeatureFlags(
 			config.localFeatures ?? LightningNode.defaultFeatures(),
 			Boolean(finalDaemon),
 			!!finalDaemon?.storage.canOpenDualFundedAssets &&
 				completeAssetOpeningHost(config.auxiliaryChannels?.dualFunding),
 			!!finalDaemon?.storage.canSpliceDualFundedAssets &&
-				completeAssetSpliceHost(config.auxiliaryChannels?.dualFunding)
+				completeAssetSpliceHost(config.auxiliaryChannels?.dualFunding),
+			recoveryHost
 		);
 		// Advertise anchor support whenever anchors are preferred (the default).
 		if (
@@ -2482,6 +2504,8 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			completeAssetSpliceHost(config.auxiliaryChannels?.dualFunding)
 		)
 			localFeatures.setOptional(Feature.OPTION_ASSET_SPLICE);
+		if (recoveryHost)
+			localFeatures.setOptional(Feature.OPTION_ASSET_SPLICE_RECOVERY);
 		this.localFeatures = localFeatures;
 
 		// An asset channel is not accepted by a node whose wallet refused the
@@ -2552,10 +2576,11 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			finalOpening: finalDaemon?.runtime,
 			finalOpeningNegotiated: finalDaemon
 				? (peerPubkey, channelType) =>
-						channelType.toString('hex') === ASSET_OPENING_TYPE_HEX
+						isAssetOpeningType(channelType.toString('hex'))
 							? assetOpeningNegotiated(
 									localFeatures,
-									this.peerInitFeatures(peerPubkey)
+									this.peerInitFeatures(peerPubkey),
+									channelType.toString('hex')
 							  )
 							: finalOpeningNegotiated(
 									localFeatures,
@@ -3164,14 +3189,15 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			const destinationScript = this.getSweepDestinationScript();
 			this.chainWatcher = new ChainWatcher({
 				finalOutputClaims: finalDaemon?.storage.canOpenDualFundedAssets
-					? (id, parent, destination, rate) =>
+					? (id, parent, destination, rate, trimmed) =>
 							assetOpeningOutputClaims(
 								finalDaemon.runtime,
 								id,
 								parent,
 								destination,
 								rate,
-								config.auxiliaryChannels?.dualFunding
+								config.auxiliaryChannels?.dualFunding,
+								trimmed
 							)
 					: finalDaemon?.storage.canUpdateFinalCommitments
 					? (id, parent, destination, rate, trimmed) =>
@@ -3184,16 +3210,19 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 								trimmed
 							)
 					: undefined,
-				sponsorFinalClaim: finalDaemon?.storage.canUpdateFinalCommitments
-					? (id, tx, rate) =>
-							sponsorFinalClaim(
-								finalDaemon.runtime,
-								this.fundingProvider,
-								id,
-								tx,
-								rate
-							)
-					: undefined,
+				sponsorFinalClaim:
+					finalDaemon &&
+					(finalDaemon.storage.canUpdateFinalCommitments ||
+						finalDaemon.storage.canRecoverAssetSplice)
+						? (id, tx, rate) =>
+								sponsorFinalClaim(
+									finalDaemon.runtime,
+									this.fundingProvider,
+									id,
+									tx,
+									rate
+								)
+						: undefined,
 				finalPreimage: (hash, preimage) =>
 					this.handleOnChainPreimageLearned(hash, preimage),
 				finalTimeout: (id, hash, htlcId) => {
@@ -13607,13 +13636,13 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		if (params.dualFundedAssets) {
 			if (
 				params.finalTaproot ||
-				(channelType && channelType.toString('hex') !== ASSET_OPENING_TYPE_HEX)
+				(channelType && channelType.toString('hex') !== this.assetOpeningType)
 			)
 				throw new InvalidChannelOpenError(
 					'Conflicting asset opening channel type'
 				);
-			channelType = Buffer.from(ASSET_OPENING_TYPE_HEX, 'hex');
-		} else if (channelType?.toString('hex') === ASSET_OPENING_TYPE_HEX) {
+			channelType = Buffer.from(this.assetOpeningType, 'hex');
+		} else if (isAssetOpeningType(channelType?.toString('hex'))) {
 			throw new InvalidChannelOpenError(
 				'Asset opening requires explicit opt-in'
 			);
@@ -13633,7 +13662,8 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				!(params.dualFundedAssets
 					? assetOpeningNegotiated(
 							this.localFeatures,
-							this.peerInitFeatures(peerPubkey)
+							this.peerInitFeatures(peerPubkey),
+							channelType.toString('hex')
 					  )
 					: finalOpeningNegotiated(
 							this.localFeatures,

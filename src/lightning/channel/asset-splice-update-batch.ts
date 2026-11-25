@@ -551,6 +551,7 @@ export class AssetSpliceUpdateBatch {
 			};
 		});
 		return {
+			...(this.store.canRecoverAssetSplice && { walletGeneration: 5 as const }),
 			channelId: this.id,
 			localIsInitiator: this.opening.candidate.isInitiator,
 			digest: bytes(this.digest),

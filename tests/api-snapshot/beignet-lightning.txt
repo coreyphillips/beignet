@@ -2,6 +2,7 @@
 unexported type ./channel/asset-splice-agreement#Pair<T> = channel.AssetOpenPair<T>
 unexported type ./channel/asset-splice-manifest#Pair<T> = readonly [ initiator: T, acceptor: T ]
 unexported type AssetSpliceInclusionLookup = (height: number, recovery: IAssetSpliceInclusionRecovery) => Promise<IAssetSpliceAnchor>
+unexported type AssetSpliceParentLookup = (parent: IFinalFundingReference, recovery: IAssetSpliceInclusionRecovery) => Promise<boolean>
 unexported type Both<T> = Record<Branch, Record<Holder, T>>
 unexported type Branch = 'parent' | 'candidate'
 unexported type DeprecatedNodeConfigKey = 'forwardingEnabled' | 'forwardingCltvDelta' | 'forwardingFeeBaseMsat' | 'forwardingFeePropMillionths' | 'forwardingPolicyGraceMs' | 'fforSettle' | 'fforConcurrent' | 'fforWitness' | 'fforIssuer'
@@ -198,10 +199,13 @@ unexported interface IFinalOutputClaim
 property IFinalOutputClaim.absoluteHeight: number
 property IFinalOutputClaim.assetBalanceOutput?: boolean
 property IFinalOutputClaim.child?: (tx: bitcoinjs-lib#Transaction, inputIndex: number) => IFinalOutputClaim | null
+property IFinalOutputClaim.confirmAssetPayout?: (spend: bitcoinjs-lib#Transaction) => Promise<boolean>
+property IFinalOutputClaim.confirmedOnly?: boolean
 property IFinalOutputClaim.htlcId?: bigint
+property IFinalOutputClaim.matchesAssetPayout?: (spend: bitcoinjs-lib#Transaction) => boolean
 property IFinalOutputClaim.outputIndex: number
 property IFinalOutputClaim.paymentHash?: Buffer
-property IFinalOutputClaim.recover?: () => Promise<bitcoinjs-lib#Transaction | null>
+property IFinalOutputClaim.recover?: (sponsored?: bitcoinjs-lib#Transaction) => Promise<bitcoinjs-lib#Transaction | null>
 property IFinalOutputClaim.relativeDelay: number
 property IFinalOutputClaim.sponsor?: boolean
 property IFinalOutputClaim.tx: bitcoinjs-lib#Transaction | null
@@ -388,7 +392,7 @@ unexported interface ParentView
 property ParentView.oldOutpoint: { hash: Buffer; index: number; }
 property ParentView.priorDigest?: Buffer
 property ParentView.stateNumber: bigint
-property ParentView.walletGeneration: 4
+property ParentView.walletGeneration: 4 | 5
 unexported type PeerState = 'disconnected' | 'connecting' | 'handshaking' | 'init' | 'ready' | 'closing'
 unexported type Prevouts = { scripts: Buffer[]; values: bigint[]; }
 unexported type SeedDerivedNodeConfigKey = 'nodePrivateKey' | 'channelBasepoints' | 'perCommitmentSeed' | 'fundingPrivkey' | 'htlcBasepointSecret' | 'revocationBasepointSecret' | 'paymentBasepointSecret' | 'delayedPaymentBasepointSecret'
@@ -1013,7 +1017,7 @@ method chain.IChainWatcherChannelManager.listChannels(): channel.Channel[]
 method chain.IChainWatcherChannelManager.observeAssetFundingBroadcast?(txid: string, raw: Buffer): void
 method chain.IChainWatcherChannelManager.observeAssetOpeningAnchor?(id: string, atDepth: boolean, observed?: bitcoinjs-lib#Transaction, height?: number): void
 method chain.IChainWatcherChannelManager.observeAssetOpeningPayout?(id: Buffer, parent: string, confirmed: boolean): void
-method chain.IChainWatcherChannelManager.observeAssetSpliceFunding?(id: string, txid: string, height: number | undefined, prove: AssetSpliceInclusionLookup, current: () => boolean): Promise<void>
+method chain.IChainWatcherChannelManager.observeAssetSpliceFunding?(id: string, txid: string, height: number | undefined, prove: AssetSpliceInclusionLookup, current: () => boolean, proveMempoolParent?: AssetSpliceParentLookup): Promise<void>
 method chain.IChainWatcherChannelManager.observeFinalFunding?(id: string, txid: string, height: number | undefined, parentAtDepth: boolean): void
 method chain.IChainWatcherChannelManager.off<K extends 'watch:funding' | 'broadcast:tx' | 'broadcast:void' | 'watch:output'>(event: K, listener: channel.ChannelManagerEvents[K]): void
 method chain.IChainWatcherChannelManager.on<K extends 'watch:funding' | 'broadcast:tx' | 'broadcast:void' | 'watch:output'>(event: K, listener: channel.ChannelManagerEvents[K]): void
@@ -1302,7 +1306,7 @@ function chain.signP2wpkhInput(tx: bitcoinjs-lib#Transaction, inputIndex: number
 function chain.signSweepInput(tx: bitcoinjs-lib#Transaction, inputIndex: number, witnessScript: Buffer, value: number, privateKey: Buffer, sighashType?: number): Buffer
 function chain.sweepVbytes(witness: readonly Buffer[], destinationScript: Buffer): number
 namespace channel
-const channel.AUXILIARY_CHANNELS_API: Readonly<{ version: 1; surfaces: readonly [ "valueIncomingHtlc:three-outcome", "sendPaymentToRoute:assetPayment", "getAuxiliaryPaymentHtlcs", "onHtlcResolved:htlcId", "queryAuxiliaryRoute", "fundAuxiliaryChannel:unsigned", "onFundingSigned", "abandonAuxiliaryOpen", "IChannelInfo.auxiliary", "setAuxiliaryPaymentGate", "getChannelMonitorState", "IPaymentInfo.auxiliary", "IPaymentInfo.auxiliaryValueMsat", "IInvoiceInfo.auxiliary", "IAuxiliaryChannelInfo.undeliveredOutcomes", "onHtlcResolved:never-sent", "getFixedOutputFeeStatus", "IPaymentInfo.unresolved", "IHoldInvoiceStateEvent.auxiliary", "prepareForward", "getFixedOutputFeeStatus:splitCoins", "getFixedOutputFeeStatus:reserve", "requireFeeCoinsToSettle", "onForwardLegResolved:quote", "IForwardingEvent.auxiliary", "setAuxiliaryForwardGate", "receiveInParts", "sendInParts", "createInvoice:assetInvoice", "dualFunding:v1", "assetSplice:v1" ]; declared: readonly [ ]; }>
+const channel.AUXILIARY_CHANNELS_API: Readonly<{ version: 1; surfaces: readonly [ "valueIncomingHtlc:three-outcome", "sendPaymentToRoute:assetPayment", "getAuxiliaryPaymentHtlcs", "onHtlcResolved:htlcId", "queryAuxiliaryRoute", "fundAuxiliaryChannel:unsigned", "onFundingSigned", "abandonAuxiliaryOpen", "IChannelInfo.auxiliary", "setAuxiliaryPaymentGate", "getChannelMonitorState", "IPaymentInfo.auxiliary", "IPaymentInfo.auxiliaryValueMsat", "IInvoiceInfo.auxiliary", "IAuxiliaryChannelInfo.undeliveredOutcomes", "onHtlcResolved:never-sent", "getFixedOutputFeeStatus", "IPaymentInfo.unresolved", "IHoldInvoiceStateEvent.auxiliary", "prepareForward", "getFixedOutputFeeStatus:splitCoins", "getFixedOutputFeeStatus:reserve", "requireFeeCoinsToSettle", "onForwardLegResolved:quote", "IForwardingEvent.auxiliary", "setAuxiliaryForwardGate", "receiveInParts", "sendInParts", "createInvoice:assetInvoice", "dualFunding:v1", "assetSplice:v1", "assetSpliceRecovery:v1" ]; declared: readonly [ ]; }>
 const channel.AUXILIARY_CHANNEL_DUST_LIMIT = 354n
 const channel.AUXILIARY_CLOSE_ASSET_OUTPUT_MINIMUM = 330n
 type channel.AssetOpenPair<T> = readonly [ initiator: T, acceptor: T ]
@@ -1771,7 +1775,7 @@ set channel.ChannelManager.nextChannelIndex(value: number)
 method channel.ChannelManager.observeAssetFundingBroadcast(txid: string, raw: Buffer): void
 method channel.ChannelManager.observeAssetOpeningAnchor(id: string, atDepth: boolean, observed?: bitcoinjs-lib#Transaction, height?: number): void
 method channel.ChannelManager.observeAssetOpeningPayout(id: Buffer, parent: string, confirmed: boolean): void
-method channel.ChannelManager.observeAssetSpliceFunding(id: string, txid: string, height: number | undefined, prove: AssetSpliceInclusionLookup, current: () => boolean): Promise<void>
+method channel.ChannelManager.observeAssetSpliceFunding(id: string, txid: string, height: number | undefined, prove: AssetSpliceInclusionLookup, current: () => boolean, proveMempoolParent?: AssetSpliceParentLookup): Promise<void>
 method channel.ChannelManager.observeFinalFunding(id: string, txid: string, height: number | undefined, parentAtDepth: boolean): void
 method channel.ChannelManager.openChannel(peerPubkey: string, fundingSatoshis: bigint, pushMsat?: bigint, beforeNegotiate?: (temporaryChannelId: Buffer) => void, opts?: { trusted?: boolean; auxiliary?: channel.IAuxiliaryFundingDescriptor; }): channel.Channel
 method channel.ChannelManager.openZeroConfChannel(peerPubkey: string, fundingSatoshis: bigint, pushMsat?: bigint): channel.Channel | null
@@ -2010,6 +2014,19 @@ property channel.IAnnouncementReadyAction.channelAnnouncement: Buffer
 property channel.IAnnouncementReadyAction.channelId: Buffer
 property channel.IAnnouncementReadyAction.channelUpdate: Buffer
 property channel.IAnnouncementReadyAction.type: channel.ChannelActionType.ANNOUNCEMENT_READY
+interface channel.IAssetFundingLineageEntry
+property channel.IAssetFundingLineageEntry.fundingOutputIndex: number
+property channel.IAssetFundingLineageEntry.fundingTxHex: string
+property channel.IAssetFundingLineageEntry.fundingTxid: string
+property channel.IAssetFundingLineageEntry.parentOutputIndex: number
+property channel.IAssetFundingLineageEntry.parentTxid: string
+interface channel.IAssetHtlcVirtualSpend
+property channel.IAssetHtlcVirtualSpend.assetId: string
+property channel.IAssetHtlcVirtualSpend.inputRoot: Buffer
+property channel.IAssetHtlcVirtualSpend.lockTime: number
+property channel.IAssetHtlcVirtualSpend.outputRoot: Buffer
+property channel.IAssetHtlcVirtualSpend.sequence: number
+property channel.IAssetHtlcVirtualSpend.stage: 'commitment' | 'second-level'
 interface channel.IAssetOpenContext
 property channel.IAssetOpenContext.accept: message.IAcceptChannel2Message
 property channel.IAssetOpenContext.attempt: Buffer
@@ -2017,7 +2034,7 @@ property channel.IAssetOpenContext.channelId: Buffer
 property channel.IAssetOpenContext.isInitiator: boolean
 property channel.IAssetOpenContext.open: message.IOpenChannel2Message
 property channel.IAssetOpenContext.peer: string
-property channel.IAssetOpenContext.walletGeneration?: 4
+property channel.IAssetOpenContext.walletGeneration?: 4 | 5
 interface channel.IAssetOpenDescription
 property channel.IAssetOpenDescription.inputs: (IAssetOpenLayout['inputs'][number] & { prevTx: Buffer; })[]
 property channel.IAssetOpenDescription.outputs: IAssetOpenLayout['outputs']
@@ -2042,18 +2059,51 @@ method channel.IAssetOpenPlan.authorize(consents: channel.AssetOpenPair<Buffer>)
 method channel.IAssetOpenPlan.consent(): Promise<Buffer>
 property channel.IAssetOpenPlan.digest: Buffer
 method channel.IAssetOpenPlan.finalize(consents: channel.AssetOpenPair<Buffer>, authorizations: channel.AssetOpenPair<Buffer>): Promise<channel.IAssetOpenFunding>
+interface channel.IAssetOpeningHtlcPayout
+property channel.IAssetOpeningHtlcPayout.candidate: IFinalOpeningCandidate
+property channel.IAssetOpeningHtlcPayout.childSignatureIndex: number
+property channel.IAssetOpeningHtlcPayout.commitment: bitcoinjs-lib#Transaction
+property channel.IAssetOpeningHtlcPayout.commitmentOutputIndex: number
+property channel.IAssetOpeningHtlcPayout.exitProofs: Buffer
+property channel.IAssetOpeningHtlcPayout.fundingLineage?: readonly channel.IAssetFundingLineageEntry[]
+property channel.IAssetOpeningHtlcPayout.fundingProofs: Buffer
+property channel.IAssetOpeningHtlcPayout.holder: 'local' | 'remote'
+property channel.IAssetOpeningHtlcPayout.htlc: IAssetUpdateHtlc
+property channel.IAssetOpeningHtlcPayout.keys: IFinalCommitmentView['keys']
+property channel.IAssetOpeningHtlcPayout.kind: Exclude<channel.AuxiliarySpendKind, 'to_local_delayed' | 'to_local_revocation' | 'to_remote'>
+property channel.IAssetOpeningHtlcPayout.outputIndex: number
+property channel.IAssetOpeningHtlcPayout.parent: bitcoinjs-lib#Transaction
+property channel.IAssetOpeningHtlcPayout.peerHtlcSignatures?: Buffer
+property channel.IAssetOpeningHtlcPayout.preimage?: Buffer
+property channel.IAssetOpeningHtlcPayout.secondLevelTemplate: bitcoinjs-lib#Transaction
+method channel.IAssetOpeningHtlcPayout.signSweep(tx: bitcoinjs-lib#Transaction): Buffer[]
+method channel.IAssetOpeningHtlcPayout.signVirtual(spend: channel.IAssetHtlcVirtualSpend): Buffer
+property channel.IAssetOpeningHtlcPayout.toSelfDelay: number
+property channel.IAssetOpeningHtlcPayout.transaction: bitcoinjs-lib#Transaction
+property channel.IAssetOpeningHtlcPayout.virtualPayout: channel.IAssetPayoutScope
+property channel.IAssetOpeningHtlcPayout.walletGeneration: 5
 interface channel.IAssetOpeningPayout
 property channel.IAssetOpeningPayout.candidate: IFinalOpeningCandidate
 property channel.IAssetOpeningPayout.delay: number
 property channel.IAssetOpeningPayout.exitProofs: Buffer
 property channel.IAssetOpeningPayout.feeRate: number
+property channel.IAssetOpeningPayout.fundingLineage?: readonly channel.IAssetFundingLineageEntry[]
 property channel.IAssetOpeningPayout.fundingProofs: Buffer
 property channel.IAssetOpeningPayout.holder: 'local' | 'remote'
 property channel.IAssetOpeningPayout.outputIndex: number
 property channel.IAssetOpeningPayout.parent: bitcoinjs-lib#Transaction
+property channel.IAssetOpeningPayout.revocation?: { signVirtual(assetId: string, digest: Buffer): Buffer; }
 method channel.IAssetOpeningPayout.signSweep(unsigned: bitcoinjs-lib#Transaction, prevTxs: readonly bitcoinjs-lib#Transaction[]): Buffer[]
 property channel.IAssetOpeningPayout.splice?: { finalDigest: string; stateNumber: string; generation: 'parent' | 'candidate'; fundingTxid: string; fundingOutputIndex: number; }
 property channel.IAssetOpeningPayout.update?: { roundDigest: string; stateNumber: string; fundingTxid: string; fundingOutputIndex: number; }
+property channel.IAssetOpeningPayout.virtualPayout?: channel.IAssetPayoutScope
+property channel.IAssetOpeningPayout.walletGeneration?: 5
+interface channel.IAssetPayoutScope
+property channel.IAssetPayoutScope.channelId: string
+property channel.IAssetPayoutScope.fundingOutputIndex: number
+property channel.IAssetPayoutScope.fundingTxid: string
+property channel.IAssetPayoutScope.revocationPubkey: Buffer
+property channel.IAssetPayoutScope.stateNumber: string
 interface channel.IAssetSpliceBitcoin
 property channel.IAssetSpliceBitcoin.fundingKeys: ./channel/asset-splice-agreement#Pair<Buffer>
 property channel.IAssetSpliceBitcoin.lockTime: number
@@ -2121,6 +2171,7 @@ property channel.IAssetUpdateRound.members: readonly IAssetUpdateMemberView[]
 property channel.IAssetUpdateRound.priorDigest?: Buffer
 property channel.IAssetUpdateRound.stateNumber: bigint
 property channel.IAssetUpdateRound.terms: IFinalOpeningTerms
+property channel.IAssetUpdateRound.walletGeneration?: 5
 interface channel.IAssetUpdateSignedMember
 property channel.IAssetUpdateSignedMember.local: bitcoinjs-lib#Transaction
 property channel.IAssetUpdateSignedMember.localEvidence: IAssetUpdateHolderEvidence
@@ -2222,12 +2273,16 @@ property channel.IAuxiliaryCommitmentData.secondLevelRevocationBasepoint?: Buffe
 property channel.IAuxiliaryCommitmentData.secondLevelRevocationKey?: Buffer
 interface channel.IAuxiliaryDualFunding extends Partial<channel.AssetSpliceHost>, Partial<channel.IAssetSpliceUpdateHost>
 method channel.IAuxiliaryDualFunding.abandon(ctx: channel.IAssetOpenContext): Promise<void>
+property channel.IAuxiliaryDualFunding.assetSpliceRecoveryVersion?: 1
 method channel.IAuxiliaryDualFunding.confirmFunding(candidate: IFinalOpeningCandidate, fundingProofs: Buffer): Promise<void>
 method channel.IAuxiliaryDualFunding.contribution(peer: string, isInitiator: boolean, openerSats: bigint): bigint | undefined
 method channel.IAuxiliaryDualFunding.describe(ctx: channel.IAssetOpenContext, proposals: channel.AssetOpenPair<Buffer>): Promise<channel.IAssetOpenDescription>
+method channel.IAuxiliaryDualFunding.outputRecoveryReceipt?(channelId: string, parentTxid: string, outputIndex: number, payout: bitcoinjs-lib#Transaction): Buffer | undefined
 method channel.IAuxiliaryDualFunding.prepare(ctx: channel.IAssetOpenContext, proposals: channel.AssetOpenPair<Buffer>, layoutDigest: Buffer): Promise<channel.IAssetOpenPlan>
 method channel.IAuxiliaryDualFunding.propose(ctx: channel.IAssetOpenContext): Promise<Buffer>
+method channel.IAuxiliaryDualFunding.recoverHtlc?(ctx: channel.IAssetOpeningHtlcPayout): Promise<bitcoinjs-lib#Transaction | null>
 method channel.IAuxiliaryDualFunding.recoverOutput(ctx: channel.IAssetOpeningPayout): Promise<bitcoinjs-lib#Transaction | null>
+method channel.IAuxiliaryDualFunding.restoreOutputReceipt?(channelId: string, parentTxid: string, outputIndex: number, payout: bitcoinjs-lib#Transaction, receipt: Buffer): Promise<void>
 method channel.IAuxiliaryDualFunding.retractFunding(candidate: IFinalOpeningCandidate): Promise<void>
 method channel.IAuxiliaryDualFunding.signExits(ctx: channel.IAssetOpenExitContext): Promise<Buffer>
 method channel.IAuxiliaryDualFunding.signFunding(candidate: IFinalOpeningCandidate, fundingProofs: Buffer, tx: bitcoinjs-lib#Transaction, indices: readonly number[], prevouts: { scripts: Buffer[]; values: bigint[]; }): Promise<Buffer[][]>
@@ -3086,6 +3141,7 @@ function channel.aggregateLocalCommitmentSig(state: channel.IChannelState, signe
 function channel.applyAuxiliaryClose(state: channel.IChannelState, transaction: bitcoinjs-lib#Transaction, feeSatoshis: bigint, outputMap: { local?: number; remote?: number; }): Buffer | undefined
 function channel.applyAuxiliaryFunding(state: channel.IChannelState, descriptor: channel.IAuxiliaryFundingDescriptor, maxHtlcs?: number): void
 function channel.assetHtlcSighashType(channelType: Buffer | null | undefined): 0x81 | 0x83
+function channel.assetPayoutRevocationKey(scope: channel.IAssetPayoutScope, assetId: string): Buffer
 function channel.auxiliaryCarrierError(opening: channel.IAuxiliaryCarrier): string | undefined
 function channel.auxiliaryClosingRelayProfile(state: channel.IChannelState, feeSatoshis: bigint): { weight: number; feePaid: bigint; }
 function channel.auxiliaryClosingWeight(state: channel.IChannelState, baseWeight: number): number
@@ -4014,6 +4070,7 @@ member features.Feature.ONION_MESSAGES = 38
 member features.Feature.OPTION_ASSET_CHILD_CUSTODY = 452
 member features.Feature.OPTION_ASSET_FIXED_HTLC_OUTPUTS = 450
 member features.Feature.OPTION_ASSET_SPLICE = 458
+member features.Feature.OPTION_ASSET_SPLICE_RECOVERY = 460
 member features.Feature.OPTION_COMPOSITE_SPLICE_INPUTS = 454
 member features.Feature.OPTION_DUAL_FUNDED_ASSETS = 456
 member features.Feature.OPTION_FF_CONCURRENT = 442

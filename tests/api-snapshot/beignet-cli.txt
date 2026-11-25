@@ -57,6 +57,7 @@ property BeignetConfig.announceAddresses?: string[]
 property BeignetConfig.apiKeys?: Array<{ name: string; key: string; scopes: Array<'readonly' | 'invoice' | 'admin'>; expiresAt?: string; }>
 property BeignetConfig.apiToken?: string
 property BeignetConfig.assetSplice?: boolean
+property BeignetConfig.assetSpliceRecovery?: boolean
 property BeignetConfig.autoBootstrap?: boolean
 property BeignetConfig.autoReconnect?: boolean
 property BeignetConfig.backupIntervalMs?: number
@@ -611,6 +612,7 @@ property BeignetNodeOptions.alias?: string
 property BeignetNodeOptions.allowMultipleInstances?: boolean
 property BeignetNodeOptions.announceAddresses?: string[]
 property BeignetNodeOptions.assetSplice?: boolean
+property BeignetNodeOptions.assetSpliceRecovery?: boolean
 property BeignetNodeOptions.autoBootstrap?: boolean
 property BeignetNodeOptions.autoGossipSync?: boolean
 property BeignetNodeOptions.autoRebalance?: { enabled?: boolean; budgetSatsPerDay?: number; minImbalancePct?: number; intervalMs?: number; }

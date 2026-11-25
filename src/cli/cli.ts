@@ -12,7 +12,7 @@ import * as http from 'http';
 import * as fs from 'fs';
 import * as nodePath from 'path';
 import { randomBytes } from 'crypto';
-import { provisionFinalConfig } from './final-wallet-init';
+import { finalWalletBinding, provisionFinalConfig } from './final-wallet-init';
 import { generateMnemonic } from '../utils/helpers';
 import {
 	configPath,
@@ -37,7 +37,7 @@ import {
 } from './offline-force-close';
 import { createConsoleLogger, noopLogger } from '../logger';
 import { Console } from 'console';
-import { performDbRestore } from './restore';
+import { performAssetChannelRestore, performDbRestore } from './restore';
 import { deriveBackupMacKey } from './backup-mac';
 import * as bip39 from 'bip39';
 import {
@@ -453,10 +453,12 @@ function initializeConfig(file: string): void {
 	const requestedUpdates = hasFlag('--final-commitment-updates');
 	const requestedAssets = hasFlag('--dual-funded-assets');
 	const requestedSplice = hasFlag('--asset-splice');
+	const requestedRecovery = hasFlag('--asset-splice-recovery');
 	const finalTaprootWallet =
 		requestedUpdates ||
 		requestedAssets ||
 		requestedSplice ||
+		requestedRecovery ||
 		hasFlag('--final-taproot-wallet');
 	const pending = fs.lstatSync(
 		nodePath.join(nodePath.dirname(file), 'final-wallet-init.pending'),
@@ -468,9 +470,12 @@ function initializeConfig(file: string): void {
 	const updates = requestedUpdates || config.finalCommitmentUpdates === true;
 	const assets = requestedAssets || config.dualFundedAssets === true;
 	const assetSplice = requestedSplice || config.assetSplice === true;
+	const assetSpliceRecovery =
+		requestedRecovery || config.assetSpliceRecovery === true;
 	if (
 		finalTaprootWallet &&
-		[updates, assets, assetSplice].filter(Boolean).length > 1
+		[updates, assets, assetSplice, assetSpliceRecovery].filter(Boolean).length >
+			1
 	)
 		throw new BeignetError(
 			'INVALID_PARAMS',
@@ -490,6 +495,7 @@ function initializeConfig(file: string): void {
 					(updates && config.finalCommitmentUpdates !== true) ||
 					(assets && config.dualFundedAssets !== true) ||
 					(assetSplice && config.assetSplice !== true) ||
+					(assetSpliceRecovery && config.assetSpliceRecovery !== true) ||
 					typeof config.mnemonic !== 'string' ||
 					!bip39.validateMnemonic(config.mnemonic))) ||
 			(config.finalTaprootWallet === true && !config.mnemonic))
@@ -516,6 +522,7 @@ function initializeConfig(file: string): void {
 					...(updates && { finalCommitmentUpdates: true }),
 					...(assets && { dualFundedAssets: true }),
 					...(assetSplice && { assetSplice: true }),
+					...(assetSpliceRecovery && { assetSpliceRecovery: true }),
 					...(alias ? { alias } : {})
 				};
 				apiToken = mintApiTokenIfAbsent(complete);
@@ -523,7 +530,8 @@ function initializeConfig(file: string): void {
 			},
 			updates,
 			assets,
-			assetSplice
+			assetSplice,
+			assetSpliceRecovery
 		);
 		if (config.mnemonic) {
 			apiToken = mintApiTokenIfAbsent(enrolled);
@@ -3279,20 +3287,30 @@ async function handleRestore(): Promise<void> {
 		return outputResult(await httpRequest('POST', '/restore/scb', { encoded }));
 	}
 
-	if (sub === 'db') {
-		// OFFLINE full-state restore: copies a database backup into place. The
-		// daemon must be stopped - the restore holds the same single-instance
-		// lock the daemon takes, so a live node is never overwritten.
-		const backupFile = positionalArgs(
+	if (sub === 'db' || sub === 'asset-channel') {
+		// Both offline operations hold the daemon's wallet lock through the restore.
+		const restoreArgs = positionalArgs(
 			undefined,
 			new Set(['--unauthenticated'])
-		)[2];
-		if (!backupFile) {
+		);
+		const channelId = sub === 'asset-channel' ? restoreArgs[2] : undefined;
+		const backupFile = restoreArgs[sub === 'asset-channel' ? 3 : 2];
+		if (
+			!backupFile ||
+			(sub === 'asset-channel' &&
+				(!channelId ||
+					!/^[0-9a-f]{64}$/.test(channelId) ||
+					restoreArgs.length !== 4 ||
+					hasFlag('--unauthenticated')))
+		) {
 			output({
 				ok: false,
 				error: {
 					code: 'INVALID_PARAMS',
-					message: 'Usage: beignet restore db <backupFile> [--unauthenticated]'
+					message:
+						sub === 'asset-channel'
+							? 'Usage: beignet restore asset-channel <channelId> <backupFile>'
+							: 'Usage: beignet restore db <backupFile> [--unauthenticated]'
 				}
 			});
 			process.exitCode = 1;
@@ -3337,8 +3355,34 @@ async function handleRestore(): Promise<void> {
 		const lockPath = nodePath.join(dataDir, `${network}.lock`);
 		try {
 			ensurePrivateDir(dataDir);
+			const macKey = deriveBackupMacKey(
+				bip39.mnemonicToSeedSync(config.mnemonic)
+			);
+			if (sub === 'asset-channel' && channelId) {
+				if (
+					network !== 'regtest' ||
+					!config.finalTaprootWallet ||
+					(!config.assetSplice && !config.assetSpliceRecovery)
+				)
+					throw new Error(
+						'Asset channel repair requires the enrolled regtest splice wallet'
+					);
+				const result = await performAssetChannelRestore(
+					backupFile,
+					dbPath,
+					lockPath,
+					finalWalletBinding(
+						config.mnemonic,
+						config.assetSpliceRecovery ? 5 : 4
+					),
+					channelId,
+					macKey
+				);
+				output({ ok: true, result });
+				return;
+			}
 			const result = await performDbRestore(backupFile, dbPath, lockPath, {
-				macKey: deriveBackupMacKey(bip39.mnemonicToSeedSync(config.mnemonic)),
+				macKey,
 				allowUnauthenticated: hasFlag('--unauthenticated')
 			});
 			output({
@@ -3372,7 +3416,7 @@ async function handleRestore(): Promise<void> {
 		error: {
 			code: 'UNKNOWN_COMMAND',
 			message:
-				'Usage: beignet restore scb <file> | beignet restore db <backupFile>'
+				'Usage: beignet restore scb <file> | beignet restore db <backupFile> | beignet restore asset-channel <channelId> <backupFile>'
 		}
 	});
 	process.exitCode = 1;
@@ -3422,6 +3466,7 @@ Setup:
     [--final-commitment-updates]         Enroll a fresh regtest wallet for revocable commitments
     [--dual-funded-assets]               Enroll a fresh regtest wallet for dual-funded asset opening
     [--asset-splice]                     Enroll a fresh regtest wallet for asset channel splices
+    [--asset-splice-recovery]            Enroll a fresh regtest wallet for revocable asset payouts
   start [flags]                          Start node daemon
   stop                                   Stop daemon
 
@@ -3498,6 +3543,8 @@ On-chain:
   restore scb <file>                     Restore channels from an SCB (on-chain
                                          recovery only: peers force-close and
                                          funds are swept to the wallet)
+  restore asset-channel <channelId> <backupFile>
+                                         Repair a funded regtest asset channel on its original device
   restore db <backupFile> [--unauthenticated]
                                          Restore a database backup (full state;
                                          OFFLINE - stop the daemon first; needs

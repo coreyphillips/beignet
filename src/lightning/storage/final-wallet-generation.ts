@@ -9,16 +9,23 @@ const generated = new WeakSet<IFinalWalletBinding>();
 export function finalWalletGeneration(
 	finalCommitmentUpdates = false,
 	dualFundedAssets = false,
-	assetSplice = false
-): 1 | 2 | 3 | 4 {
+	assetSplice = false,
+	assetSpliceRecovery = false
+): 1 | 2 | 3 | 4 | 5 {
 	if (
 		typeof finalCommitmentUpdates !== 'boolean' ||
 		typeof dualFundedAssets !== 'boolean' ||
 		typeof assetSplice !== 'boolean' ||
-		[finalCommitmentUpdates, dualFundedAssets, assetSplice].filter(Boolean)
-			.length > 1
+		typeof assetSpliceRecovery !== 'boolean' ||
+		[
+			finalCommitmentUpdates,
+			dualFundedAssets,
+			assetSplice,
+			assetSpliceRecovery
+		].filter(Boolean).length > 1
 	)
 		throw new Error('Invalid or conflicting final wallet capabilities');
+	if (assetSpliceRecovery) return 5;
 	if (assetSplice) return 4;
 	if (dualFundedAssets) return 3;
 	return finalCommitmentUpdates ? 2 : 1;
@@ -28,12 +35,18 @@ export function finalWalletGeneration(
 export function generateFinalDaemonWallet(
 	finalCommitmentUpdates = false,
 	dualFundedAssets = false,
-	assetSplice = false
+	assetSplice = false,
+	assetSpliceRecovery = false
 ): {
 	mnemonic: string;
 	binding: IFinalWalletBinding;
 } {
-	finalWalletGeneration(finalCommitmentUpdates, dualFundedAssets, assetSplice);
+	finalWalletGeneration(
+		finalCommitmentUpdates,
+		dualFundedAssets,
+		assetSplice,
+		assetSpliceRecovery
+	);
 	const mnemonic = generateMnemonic();
 	const seed = mnemonicToSeedSync(mnemonic);
 	const encryptionKey = deriveStorageKey(seed);
@@ -42,6 +55,7 @@ export function generateFinalDaemonWallet(
 		...(finalCommitmentUpdates && { finalCommitmentUpdates: true }),
 		...(dualFundedAssets && { dualFundedAssets: true }),
 		...(assetSplice && { assetSplice: true }),
+		...(assetSpliceRecovery && { assetSpliceRecovery: true }),
 		nodeId: deriveLightningKeysFromSeed(seed, 1).nodePublicKey.toString('hex'),
 		get encryptionKey(): Buffer {
 			return Buffer.from(encryptionKey);

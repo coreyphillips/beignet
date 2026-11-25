@@ -139,7 +139,7 @@ import {
 	isAssetNegotiation,
 	snapshotFinalOpening
 } from './final-opening-negotiation';
-import { ASSET_OPENING_TYPE_HEX } from '../features/asset-opening';
+import { isAssetOpeningType } from '../features/asset-opening';
 import { recordRevokedHtlcSnapshot } from './htlc-snapshots';
 import type {
 	IAuxiliaryCommitmentData,
@@ -19016,7 +19016,7 @@ export class Channel {
 	): string | null {
 		if (!isFinalNegotiation(this)) return validateV2ChannelType(type);
 		const supported = isAssetNegotiation(this)
-			? type?.toString('hex') === ASSET_OPENING_TYPE_HEX
+			? isAssetOpeningType(type?.toString('hex'))
 			: isFinalTaprootTypeHex(type?.toString('hex'));
 		return supported && !unsupportedFinal
 			? null

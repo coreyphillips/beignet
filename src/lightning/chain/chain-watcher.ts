@@ -8,7 +8,11 @@
 
 import { EventEmitter } from 'events';
 import type { IAssetSpliceInclusionRecovery } from './asset-splice-inclusion';
-import type { AssetSpliceInclusionLookup } from '../channel/asset-splice-confirmation';
+import type {
+	AssetSpliceInclusionLookup,
+	AssetSpliceParentLookup
+} from '../channel/asset-splice-confirmation';
+import type { IFinalFundingReference } from '../channel/final-splice-candidate';
 import { sha256 } from '../crypto/provider';
 import * as bitcoin from 'bitcoinjs-lib';
 import { ecc } from '../../utils/ecc';
@@ -398,7 +402,8 @@ export interface IChainWatcherChannelManager {
 		txid: string,
 		height: number | undefined,
 		prove: AssetSpliceInclusionLookup,
-		current: () => boolean
+		current: () => boolean,
+		proveMempoolParent?: AssetSpliceParentLookup
 	): Promise<void>;
 	assetOpeningAnchor?(id: string): { missingWitnesses: boolean } | undefined;
 	observeAssetOpeningAnchor?(
@@ -410,9 +415,7 @@ export interface IChainWatcherChannelManager {
 	finalSpliceParent?(
 		id: string,
 		txid: string
-	):
-		| import('../channel/final-splice-candidate').IFinalFundingReference
-		| undefined;
+	): IFinalFundingReference | undefined;
 	forgetFinalFundingConfirmation?(id: Buffer, txid?: string): void;
 	observeFinalFunding?(
 		id: string,
@@ -2380,6 +2383,12 @@ export class ChainWatcher extends EventEmitter {
 			rate,
 			irrevocable ? trimmed : undefined
 		);
+		const balances = new Set(
+			claims
+				.filter((claim) => claim.assetBalanceOutput)
+				.map((claim) => claim.outputIndex)
+		);
+		const confirmed = new Set<number>();
 		for (const claim of claims) {
 			try {
 				await this.claimFinalOutput(
@@ -2388,12 +2397,23 @@ export class ChainWatcher extends EventEmitter {
 					height,
 					claim,
 					rate,
-					superseded
+					superseded,
+					() => confirmed.add(claim.outputIndex)
 				);
 			} catch (err) {
 				if (!this.isDuplicateRejection(err)) this.emitError(err);
 			}
 		}
+		if (
+			balances.size &&
+			!superseded() &&
+			this.tipGeneration === this.lifecycleGeneration
+		)
+			this.channelManager.observeAssetOpeningPayout?.(
+				channelId,
+				parent.getId(),
+				confirmed.size === balances.size
+			);
 	}
 
 	private async claimFinalOutput(
@@ -2402,7 +2422,8 @@ export class ChainWatcher extends EventEmitter {
 		height: number,
 		claim: IFinalOutputClaim,
 		rate: number,
-		superseded: () => boolean
+		superseded: () => boolean,
+		confirmedPayout?: () => void
 	): Promise<void> {
 		if (superseded()) return;
 		const out = parent.outs[claim.outputIndex];
@@ -2416,17 +2437,12 @@ export class ChainWatcher extends EventEmitter {
 				c.valueSat === out.value
 		);
 		if (coin) {
-			if (claim.assetBalanceOutput)
-				this.channelManager.observeAssetOpeningPayout?.(
-					id,
-					parent.getId(),
-					false
-				);
 			if (!claim.tx && !claim.recover) return;
 			if (claim.recover && this.tipGeneration !== this.lifecycleGeneration)
 				return;
 			if (
 				Math.max(0, coin.height) !== height ||
+				(claim.confirmedOnly && height <= 0) ||
 				(claim.relativeDelay > 0 &&
 					(height <= 0 ||
 						this.currentBlockHeight - height + 1 < claim.relativeDelay)) ||
@@ -2435,11 +2451,13 @@ export class ChainWatcher extends EventEmitter {
 				return;
 			if (claim.sponsor && !this.sponsorFinalClaim)
 				throw new Error('Final HTLC claim needs a wallet fee input');
-			const tx = claim.recover
-				? await claim.recover()
-				: claim.sponsor
+			const sponsored = claim.sponsor
 				? await this.sponsorFinalClaim!(id, claim.tx!, rate)
-				: claim.tx;
+				: undefined;
+			if (superseded()) return;
+			const tx = claim.recover
+				? await claim.recover(sponsored)
+				: sponsored ?? claim.tx;
 			if (tx && claim.recover && !superseded()) {
 				// Proof construction can span a tip change or an intervening spend.
 				const unspent = await this.backend.listUnspent!(scriptHash);
@@ -2459,8 +2477,13 @@ export class ChainWatcher extends EventEmitter {
 			if (tx && !superseded()) await this.broadcastTransaction(tx.toBuffer());
 			return;
 		}
-		if (!claim.child && !claim.paymentHash && !claim.assetBalanceOutput) return;
-		let payoutMined = false;
+		if (
+			!claim.child &&
+			!claim.paymentHash &&
+			!claim.assetBalanceOutput &&
+			!claim.confirmAssetPayout
+		)
+			return;
 		for (const entry of await this.backend.getScriptHashHistory(scriptHash)) {
 			if (superseded()) return;
 			if (entry.txid === parent.getId()) continue;
@@ -2479,9 +2502,27 @@ export class ChainWatcher extends EventEmitter {
 				(i) => i.index === claim.outputIndex && i.hash.equals(parent.getHash())
 			);
 			if (index < 0) continue;
+			let imported = !claim.confirmAssetPayout;
+			if (
+				claim.confirmAssetPayout &&
+				this.tipGeneration === this.lifecycleGeneration &&
+				height > 0 &&
+				entry.height >= height &&
+				entry.height <= this.currentBlockHeight
+			) {
+				const tip = this.tipObservation;
+				imported = await claim.confirmAssetPayout(spend);
+				if (superseded() || this.tipObservation !== tip) return;
+			}
 			if (claim.assetBalanceOutput) {
-				payoutMined = true;
-				break;
+				if (
+					imported &&
+					(!claim.matchesAssetPayout || claim.matchesAssetPayout(spend))
+				) {
+					confirmedPayout?.();
+					break;
+				}
+				continue;
 			}
 			if (claim.paymentHash) {
 				const hash = claim.paymentHash;
@@ -2518,16 +2559,6 @@ export class ChainWatcher extends EventEmitter {
 					superseded
 				);
 		}
-		if (
-			claim.assetBalanceOutput &&
-			!superseded() &&
-			this.tipGeneration === this.lifecycleGeneration
-		)
-			this.channelManager.observeAssetOpeningPayout?.(
-				id,
-				parent.getId(),
-				payoutMined
-			);
 	}
 
 	private async checkFinalFundingDepth(
@@ -2621,6 +2652,7 @@ export class ChainWatcher extends EventEmitter {
 		const asset = !splice && this.channelManager.assetOpeningAnchor?.(id);
 		if ((asset || splice) && this.tipGeneration === generation) {
 			let height = funding?.height;
+			let mempoolCandidate = height === 0 || height === -1;
 			if (height === undefined) {
 				// A valid funding transaction can be spent and still be deep enough for its proofs.
 				const history = await this.backend.getScriptHashHistory(
@@ -2628,6 +2660,31 @@ export class ChainWatcher extends EventEmitter {
 				);
 				if (!current()) return;
 				height = history.find((e) => e.txid === watched.txid)?.height;
+				if (splice && (height === 0 || height === -1)) {
+					// A mempool child can consume the candidate before listunspent sees either member.
+					const spends = [];
+					for (const row of history) {
+						if (row.txid === watched.txid) continue;
+						const raw = await this.getHistoryTransaction(row.txid, row.height);
+						if (!current()) return;
+						const spend = bitcoin.Transaction.fromBuffer(raw);
+						if (spend.getId() !== row.txid)
+							throw new Error(
+								'Wrong transaction in asset splice funding history'
+							);
+						if (
+							spend.ins.some(
+								(input) =>
+									input.index === watched.outputIndex &&
+									Buffer.from(input.hash).reverse().toString('hex') ===
+										watched.txid
+							)
+						)
+							spends.push(row.height);
+					}
+					mempoolCandidate =
+						spends.length === 1 && (spends[0] === 0 || spends[0] === -1);
+				}
 			}
 			const atDepth =
 				height !== undefined &&
@@ -2642,6 +2699,8 @@ export class ChainWatcher extends EventEmitter {
 			if (splice) {
 				const prove = this.backend.getAssetSpliceInclusion;
 				if (prove) {
+					const fresh = () =>
+						current() && tipObservation === this.tipObservation;
 					try {
 						await this.channelManager.observeAssetSpliceFunding?.(
 							id,
@@ -2649,12 +2708,22 @@ export class ChainWatcher extends EventEmitter {
 							height,
 							(h, recovery) =>
 								prove.call(this.backend, watched.txid, h, recovery),
-							() => current() && tipObservation === this.tipObservation
+							fresh,
+							mempoolCandidate
+								? (parent, recovery) =>
+										this.proveMempoolSpliceParent(
+											watched.txid,
+											parent,
+											recovery,
+											fresh
+										)
+								: undefined
 						);
 					} catch (error) {
 						finish?.();
 						if (current()) this.emitError(error as Error);
 					}
+					if (!fresh()) return;
 				}
 			} else
 				this.channelManager.observeAssetOpeningAnchor?.(
@@ -2704,6 +2773,59 @@ export class ChainWatcher extends EventEmitter {
 		);
 		this.setFinalFundingDepth(watched, funding?.height ?? 0);
 		if (!funding) await this.checkFundingSpent(watched, generation, key);
+	}
+
+	/** A known mempool splice can hide its confirmed parent from listunspent. */
+	private async proveMempoolSpliceParent(
+		candidate: string,
+		parent: IFinalFundingReference,
+		recovery: IAssetSpliceInclusionRecovery,
+		current: () => boolean
+	): Promise<boolean> {
+		const tx = bitcoin.Transaction.fromHex(parent.fundingTxHex);
+		const txid = tx.getId(),
+			index = parent.fundingOutputIndex;
+		const history = await this.backend.getScriptHashHistory(
+			computeScriptHash(tx.outs[index].script)
+		);
+		if (!current()) return false;
+		const parents = history.filter((row) => row.txid === txid);
+		const children = history.filter((row) => row.txid === candidate);
+		if (
+			parents.length !== 1 ||
+			children.length !== 1 ||
+			(children[0].height !== 0 && children[0].height !== -1)
+		)
+			return false;
+		const height = parents[0].height;
+		if (
+			!Number.isSafeInteger(height) ||
+			height <= 0 ||
+			height > this.currentBlockHeight
+		)
+			return false;
+		for (const row of history) {
+			if (row.txid === candidate || row.txid === txid) continue;
+			const raw = await this.getHistoryTransaction(row.txid, row.height);
+			if (!current()) return false;
+			const other = bitcoin.Transaction.fromBuffer(raw);
+			if (
+				other.getId() !== row.txid ||
+				other.ins.some((i) => i.index === index && i.hash.equals(tx.getHash()))
+			)
+				return false;
+		}
+		const proof = await this.backend.getAssetSpliceInclusion!(
+			txid,
+			height,
+			recovery
+		);
+		return (
+			current() &&
+			proof.txid === txid &&
+			/^[0-9a-f]{64}$/.test(proof.blockHash) &&
+			proof.confirmations === this.currentBlockHeight - height + 1
+		);
 	}
 
 	private async checkFundingConfirmation(

@@ -1,5 +1,5 @@
 import { Transaction } from 'bitcoinjs-lib';
-import { ASSET_OPENING_TYPE_HEX } from '../features/asset-opening';
+import { isAssetOpeningType } from '../features/asset-opening';
 import { createTaprootFundingScript } from '../script/funding-taproot';
 import { decodeTlvStream } from '../message/tlv';
 import type { IFinalFundingReference } from '../channel/final-splice-candidate';
@@ -144,10 +144,7 @@ export function signFinalUpdate(
 	const funding = Transaction.fromHex(ref.fundingTxHex);
 	const prevout = funding.outs[ref.fundingOutputIndex];
 	const asset = spliceFunding?.asset;
-	if (
-		(candidate.channelType === ASSET_OPENING_TYPE_HEX) !==
-		(asset !== undefined)
-	)
+	if (isAssetOpeningType(candidate.channelType) !== (asset !== undefined))
 		throw new Error(
 			'Asset commitment signing requires its funding root and transcript'
 		);

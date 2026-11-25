@@ -4,7 +4,6 @@ import {
 	encodeTxAddInputMessage,
 	encodeTxAddOutputMessage
 } from '../message/interactive-tx';
-import { ASSET_OPENING_TYPE_HEX } from '../features/asset-opening';
 import {
 	validateAssetOpening,
 	type IFinalOpeningCandidate
@@ -33,7 +32,7 @@ export function assetOpeningConstruction(
 	const remote = ctx.isInitiator ? ctx.accept : ctx.open;
 	const candidate: IFinalOpeningCandidate = {
 		channelId: ctx.channelId.toString('hex'),
-		channelType: ASSET_OPENING_TYPE_HEX,
+		channelType: ctx.open.channelType!.toString('hex'),
 		localFundingPubkey: local.fundingPubkey.toString('hex'),
 		remoteFundingPubkey: remote.fundingPubkey.toString('hex'),
 		fundingTxHex: tx.toHex(),

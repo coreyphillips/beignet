@@ -448,6 +448,195 @@ describe('Phase 4: Chain Watcher', () => {
 			expect(verdicts.slice(-1)).to.deep.equal([false]);
 		});
 
+		for (const role of [0, 1] as const) {
+			it(`selects the confirmed parent for a mempool-only asset splice as ${
+				role ? 'acceptor' : 'initiator'
+			}`, async function () {
+				this.timeout(60000);
+				watcher.stop();
+				const dir = mkdtempSync(join(tmpdir(), 'asset-splice-parent-'));
+				const pair = await setupFundedAssetUpdatePair(dir);
+				try {
+					const { store, party } = pair.f.devices[role];
+					const id = pair.f.id,
+						channelId = Buffer.from(id, 'hex');
+					channelManager = new ChannelManager({
+						finalOpening: {
+							storage: store,
+							root: party.root,
+							dualFunding: {
+								verifySpliceFunding: async () => {},
+								confirmSpliceFunding: async () => {}
+							}
+						},
+						verifyRemoteFundingInput: async () => 'unspent',
+						persistence: COMMIT_ALL
+					} as unknown as IChannelManagerConfig);
+					channelManager.on('error', () => {});
+					const { parent, candidate } =
+						store.loadAssetSpliceFundingInfo(id).pending[0];
+					const parentTx = bitcoin.Transaction.fromHex(
+						parent.funding.fundingTxHex
+					);
+					const candidateTx = bitcoin.Transaction.fromHex(
+						candidate.funding.fundingTxHex
+					);
+					const coin = candidateTx.outs[candidate.outputIndex];
+					const candidateScript = computeScriptHash(coin.script);
+					const parentScript = computeScriptHash(
+						parentTx.outs[parent.outputIndex].script
+					);
+					const parentRow = { txid: parentTx.getId(), height: 60 };
+					let candidateHeight = 0,
+						candidateUnspent = true,
+						validProof = false;
+					const candidateRow = () => ({
+						txid: candidateTx.getId(),
+						height: candidateHeight
+					});
+					backend.setTransaction(parentTx.getId(), parentTx.toBuffer());
+					backend.setTransaction(candidateTx.getId(), candidateTx.toBuffer());
+					Object.assign(backend, {
+						listUnspent: async (script: string) =>
+							script === candidateScript && candidateUnspent
+								? [
+										{
+											...candidateRow(),
+											outputIndex: candidate.outputIndex,
+											valueSat: coin.value
+										}
+								  ]
+								: [],
+						getAssetSpliceInclusion: async (txid: string, height: number) => {
+							const found = [parentRow, candidateRow()].find(
+								(r) => r.txid === txid && r.height === height
+							);
+							if (!validProof || !found || height <= 0)
+								throw Error('Missing block proof');
+							return {
+								txid,
+								blockHash: '35'.repeat(32),
+								confirmations: 73 - height
+							};
+						}
+					});
+					channelManager.restoreAssetSpliceWatches(id);
+					watcher = new ChainWatcher({
+						backend,
+						channelManager,
+						missingDebounceMs: 0
+					});
+					await watcher.start();
+					backend.simulateNewBlock(72);
+					const scan = () =>
+						watcher.watchFinalFundingOutput(
+							channelId,
+							candidateTx.getId(),
+							candidate.outputIndex,
+							3,
+							coin.script,
+							coin.value
+						);
+					const close = () =>
+						channelManager.forceClose(channelId, Buffer.alloc(0));
+					const broadcasts: string[] = [];
+					channelManager.on('broadcast:tx', (raw: Buffer) =>
+						broadcasts.push(raw.toString('hex'))
+					);
+					const history = () => {
+						backend.setHistory(candidateScript, [candidateRow()]);
+						backend.setHistory(parentScript, [parentRow, candidateRow()]);
+					};
+					history();
+					await scan();
+					expect(close().ok, 'missing parent inclusion proof').to.equal(false);
+					validProof = true;
+					backend.setHistory(parentScript, [parentRow]);
+					await scan();
+					expect(
+						close().ok,
+						'candidate missing from parent script history'
+					).to.equal(false);
+					const conflict = new bitcoin.Transaction();
+					conflict.addInput(parentTx.getHash(), parent.outputIndex);
+					conflict.addOutput(Buffer.from([0x51]), 1000);
+					backend.setTransaction(conflict.getId(), conflict.toBuffer());
+					backend.setHistory(parentScript, [
+						parentRow,
+						candidateRow(),
+						{ txid: conflict.getId(), height: 72 }
+					]);
+					await scan();
+					expect(close().ok, 'another confirmed parent spend').to.equal(false);
+					expect(broadcasts).to.be.empty;
+
+					history();
+					await scan();
+					expect(channelManager['assetUpdateHeight'](id)).to.equal(undefined);
+					expect(store.loadAssetSpliceFundingInfo(id).active).to.equal(
+						undefined
+					);
+					expect(close().ok, 'confirmed parent with a mempool splice').to.equal(
+						true
+					);
+					expect(broadcasts[broadcasts.length - 1]).to.equal(
+						parent.localCommitment
+					);
+
+					candidateHeight = 72;
+					history();
+					await scan();
+					expect(close().ok, 'candidate at one confirmation').to.equal(true);
+					expect(broadcasts[broadcasts.length - 1]).to.equal(
+						candidate.localCommitment
+					);
+					candidateHeight = 0;
+					history();
+					backend.simulateNewBlock(72);
+					await scan();
+					expect(
+						close().ok,
+						'parent available again after a shallow reorg'
+					).to.equal(true);
+					expect(broadcasts[broadcasts.length - 1]).to.equal(
+						parent.localCommitment
+					);
+					const child = pair.f.views[role === 0 ? 1 : 0].candidate.expected;
+					expect(child.ins[0].hash.equals(candidateTx.getHash())).to.equal(
+						true
+					);
+					const observed: string[] = [];
+					watcher.on(
+						'funding:spent',
+						(_id: Buffer, spend: bitcoin.Transaction) =>
+							observed.push(spend.getId())
+					);
+					candidateUnspent = false;
+					backend.setTransaction(child.getId(), child.toBuffer());
+					backend.setHistory(candidateScript, [
+						candidateRow(),
+						{ txid: child.getId(), height: -1 }
+					]);
+					await scan();
+					expect(
+						observed,
+						'passively detects a candidate child in the mempool'
+					).to.include(child.getId());
+					expect(channelManager['assetUpdateHeight'](id)).to.equal(undefined);
+					expect(close().ok, 'confirmed parent remains available').to.equal(
+						true
+					);
+					expect(broadcasts[broadcasts.length - 1]).to.equal(
+						parent.localCommitment
+					);
+				} finally {
+					watcher.stop();
+					for (const dev of pair.f.devices) dev.store.close();
+					rmSync(dir, { recursive: true, force: true });
+				}
+			});
+		}
+
 		it('permits pending asset updates only for a released candidate with a current mined unspent output', async function () {
 			this.timeout(60000);
 			watcher.stop();
@@ -759,6 +948,104 @@ describe('Phase 4: Chain Watcher', () => {
 			await watcher.start();
 			await watch();
 			expect(releases, 'no header accepted since restart').to.equal(1);
+		});
+
+		it('requires confirmed wallet receipts for every balance output of an observed commitment', async () => {
+			watcher.stop();
+			const funding = new bitcoin.Transaction();
+			const fundingScript = Buffer.from('5120' + '71'.repeat(32), 'hex');
+			funding.addInput(crypto.randomBytes(32), 0);
+			funding.addOutput(fundingScript, 50000);
+			const commitment = new bitcoin.Transaction();
+			commitment.addInput(funding.getHash(), 0);
+			const scripts = [0x92, 0x93].map((byte) =>
+				Buffer.concat([Buffer.of(0x51, 32), Buffer.alloc(32, byte)])
+			);
+			for (const script of scripts) commitment.addOutput(script, 24000);
+			const sweeps = scripts.map((_, i) => {
+				const tx = new bitcoin.Transaction();
+				tx.addInput(commitment.getHash(), i);
+				tx.addOutput(Buffer.of(0x51), 23000);
+				return tx;
+			});
+			const other = sweeps[0].clone();
+			other.outs[0].value--;
+			for (const tx of [commitment, other, ...sweeps])
+				backend.setTransaction(tx.getId(), tx.toBuffer());
+			const observations: boolean[] = [];
+			let imported: boolean | Error = true;
+			const restored: string[] = [];
+			Object.assign(channelManager, {
+				observeAssetOpeningPayout: (
+					_id: Buffer,
+					_parent: string,
+					settled: boolean
+				) => observations.push(settled)
+			});
+			Object.assign(backend, { listUnspent: async () => [] });
+			backend.setHistory(computeScriptHash(fundingScript), [
+				{ txid: commitment.getId(), height: 100 }
+			]);
+			watcher = new ChainWatcher({
+				backend,
+				channelManager,
+				finalOutputClaims: () =>
+					sweeps.map((sweep, index) => ({
+						outputIndex: index,
+						relativeDelay: 0,
+						absoluteHeight: 0,
+						assetBalanceOutput: true,
+						tx: null,
+						matchesAssetPayout: (spend: bitcoin.Transaction) =>
+							spend.getId() === sweep.getId(),
+						confirmAssetPayout: async (tx: bitcoin.Transaction) => {
+							expect(tx.getId()).to.equal(sweep.getId());
+							restored.push(tx.getId());
+							if (imported instanceof Error) throw imported;
+							return imported;
+						}
+					}))
+			});
+			await watcher.start();
+			backend.simulateNewBlock(103);
+			const channelId = crypto.randomBytes(32);
+			const scan = async (
+				first: bitcoin.Transaction | null,
+				secondHeight: number,
+				settled: boolean
+			) => {
+				backend.setHistory(
+					computeScriptHash(scripts[0]),
+					first ? [{ txid: first.getId(), height: 102 }] : []
+				);
+				backend.setHistory(computeScriptHash(scripts[1]), [
+					{ txid: sweeps[1].getId(), height: secondHeight }
+				]);
+				observations.length = 0;
+				await watcher.watchFinalFundingOutput(
+					channelId,
+					funding.getId(),
+					0,
+					1,
+					fundingScript,
+					50000
+				);
+				expect(observations).to.deep.equal([settled]);
+			};
+			await scan(null, 102, false);
+			await scan(other, 102, false);
+			expect(restored).not.to.include(other.getId());
+			imported = false;
+			await scan(sweeps[0], 102, false);
+			imported = Error('wallet receipt not yet imported');
+			await scan(sweeps[0], 102, false);
+			imported = true;
+			restored.length = 0;
+			await scan(sweeps[0], 0, false);
+			expect(restored).not.to.include(sweeps[1].getId());
+			await scan(sweeps[0], 102, true);
+			expect(restored).to.include.members(sweeps.map((t) => t.getId()));
+			await scan(sweeps[0], 0, false);
 		});
 
 		it('discards a delayed final funding verdict superseded by a script notification', async () => {

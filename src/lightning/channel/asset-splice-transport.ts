@@ -582,12 +582,13 @@ export class AssetSpliceTransport {
 			tx = Transaction.fromHex(b.parent.fundingTxHex);
 		const connected = (): boolean =>
 			this.live.get(id) === s && this.eligible(s.peer, id) && !this.ended(s);
+		const walletGeneration = this.store.canRecoverAssetSplice ? 5 : 4;
 		s.ctx = {
 			channelId: id,
 			peer: s.peer,
 			isInitiator: b.initiator,
 			attempt: attemptId(id, b, initKey),
-			walletGeneration: 4,
+			walletGeneration,
 			stateNumber: BigInt(b.state),
 			...(b.priorDigest && { priorDigest: Buffer.from(b.priorDigest, 'hex') }),
 			oldOutpoint: { hash: tx.getHash(), index: b.parent.fundingOutputIndex },
@@ -613,7 +614,7 @@ export class AssetSpliceTransport {
 					...(b.priorDigest && {
 						priorDigest: Buffer.from(b.priorDigest, 'hex')
 					}),
-					walletGeneration: 4 as const
+					walletGeneration
 				};
 			},
 			parentObservationPending: (): boolean => {

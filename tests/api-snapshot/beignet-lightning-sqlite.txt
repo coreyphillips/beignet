@@ -60,6 +60,7 @@ method FinalOpeningAuthority.requireEnforceableExit(channelId: string, exit: str
 method FinalOpeningAuthority.requireReconnectPromise(slot: string, promise: IFinalReestablishNonce | undefined): void
 method FinalOpeningAuthority.reserveAssetOpenSignature(id: string, field: string, digest: string | Buffer): void
 method FinalOpeningAuthority.saveAssetOpenStage(id: string, field: string, bytes: Buffer): void
+method FinalOpeningAuthority.verifyAssetOpeningBackup(source: Database.Database, key: Buffer, identity: string, id: string, outpoint: string, candidate: string, session: string, exit: string): void
 unexported type FinalSpliceEvent = { kind: 'begin'; intent: IFinalSpliceIntent; } | { kind: 'wire'; local: boolean; type: beignet/lightning#message.MessageType; payload: string; resolvedPrevTx?: string; } | { kind: 'candidate'; funding: IFinalFundingReference; localDelta: string; peerDelta: string; localExit: string; peerCommitment: string; ourCommitment: string; localHeight: number; remoteHeight: number; localNextNonce: string; peerNextNonce: string; } | { kind: 'rbf'; phase: 'quiescent' | 'refused' | 'finished'; } | { kind: 'funded'; transaction: string; } | { kind: 'adopt'; txid: string; } | { kind: 'abort'; reason: string; awaitingEcho?: boolean; } | { kind: 'abort-ack'; } | { kind: 'inputs-released'; }
 unexported type FinalSplicePlan = Pick<IFinalSpliceIntent, 'localDelta' | 'feeBudget' | 'feerate' | 'locktime' | 'inputs' | 'outputs'>
 unexported class FinalSpliceSession
@@ -382,6 +383,7 @@ property IFinalUpdateLimits.local: IFinalHtlcLimits
 property IFinalUpdateLimits.remote: IFinalHtlcLimits
 unexported interface IFinalWalletBinding
 property IFinalWalletBinding.assetSplice?: boolean
+property IFinalWalletBinding.assetSpliceRecovery?: boolean
 property IFinalWalletBinding.dualFundedAssets?: boolean
 property IFinalWalletBinding.encryptionKey: Buffer
 property IFinalWalletBinding.finalCommitmentUpdates?: boolean
@@ -503,7 +505,8 @@ method SqliteStorage.appendAssetSpliceEvent<T>(channelId: string, head: IFinalJo
 method SqliteStorage.assertAssetSpliceAuthority(authority: FinalOpeningAuthority): void
 method SqliteStorage.assertAssetSpliceCanStart(channelId: string): void
 method SqliteStorage.assertFinalDaemonIdentity(nodeId: string): void
-method SqliteStorage.assetOpeningPayout(id: string, parent: string, raw?: Buffer): Buffer | null
+method SqliteStorage.assetOpeningPayout(id: string, parent: string, raw?: Buffer, outputIndex?: number, receipt?: Buffer): Buffer | null
+method SqliteStorage.assetOpeningPayoutReceipt(id: string, parent: string, outputIndex: number): { transaction: Buffer; receipt: Buffer; } | null
 method SqliteStorage.assetSpliceReconnect(id: string, root: bip32#BIP32Interface, reportLock: boolean): beignet/lightning#message.IChannelReestablishMessage
 method SqliteStorage.assetSpliceSignatureRound(root: bip32#BIP32Interface, layout: IAssetSpliceLayout, verified: ReturnType<typeof verifyAssetSpliceCandidate>, localFundingKeyIndex: number): AssetSpliceSignatureRound
 method SqliteStorage.assetSpliceUpdateBatch(id: string, root: bip32#BIP32Interface, height: bigint, changes: readonly beignet/lightning#channel.AssetUpdateChange[], currentHeight: () => number | undefined): AssetSpliceUpdateBatch
@@ -511,6 +514,7 @@ method SqliteStorage.assetSpliceUpdateHead(id: string): { inProgress?: { stateNu
 method SqliteStorage.auxiliaryRevokedCommitmentsSize(channelId: string): { rows: number; bytes: number; }
 method SqliteStorage.backup(destPath: string): Promise<void>
 get SqliteStorage.canOpenDualFundedAssets(): boolean
+get SqliteStorage.canRecoverAssetSplice(): boolean
 get SqliteStorage.canSignFinalOpening(): boolean
 get SqliteStorage.canSpliceDualFundedAssets(): boolean
 get SqliteStorage.canUpdateFinalCommitments(): boolean
@@ -669,6 +673,7 @@ method SqliteStorage.rememberFinalPeerTxComplete(channelId: string, payload: Buf
 method SqliteStorage.rememberFinalPeerTxSignatures(channelId: string, payload: Buffer): void
 method SqliteStorage.rememberObservedAssetFunding(id: string, tx: bitcoinjs-lib#Transaction): void
 method SqliteStorage.renewFinalReestablishNonce(channelId: string, root: bip32#BIP32Interface): Buffer
+static method SqliteStorage.repairAssetSpliceChannel(dbPath: string, binding: IFinalWalletBinding, snapshotPath: string, channelId: string): { channelId: string; openingRestored: boolean; snapshotSequence: number; currentSequence: number; }
 method SqliteStorage.requestFinalOpeningExit(channelId: string, fundingTxid?: Buffer, fundingOutputIndex?: number): Buffer
 method SqliteStorage.reserveAssetOpenSignature(id: string, field: string, digest: string | Buffer): void
 method SqliteStorage.reserveAssetSpliceWalletInputs(channelId: string, attempt: string, parent: string, selected: readonly string[]): void
@@ -715,6 +720,7 @@ method SqliteStorage.signFinalUpdateCommitment(id: string, root: bip32#BIP32Inte
 method SqliteStorage.signFinalUpdateCommitmentBatch(id: string, root: bip32#BIP32Interface): Buffer[]
 method SqliteStorage.stageFinalHtlcUpdate(id: string, direction: 'local' | 'peer', type: beignet/lightning#message.MessageType, payload: Buffer): void
 method SqliteStorage.storeAssetOpeningWitnesses(channelId: string, witnesses: Buffer[][]): Buffer
+get SqliteStorage.supportsAssetSpliceRecovery(): boolean
 method SqliteStorage.transaction<T>(fn: () => T): T
 method SqliteStorage.unreadableAssetChannelIds(): string[]
 method SqliteStorage.updateQueueEntryStatus(id: string, status: string, error?: string, completedAt?: number): void

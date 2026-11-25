@@ -400,11 +400,11 @@ export class AssetSpliceSignatureRound {
 			ctx.channelId !== this.id ||
 			!ctx.attempt.equals(this.layout.attempt) ||
 			ctx.isInitiator !== this.terms.localIsSpliceInitiator ||
-			ctx.walletGeneration !== 4 ||
+			ctx.walletGeneration !== (this.store.canRecoverAssetSplice ? 5 : 4) ||
 			ctx.stateNumber !== this.layout.stateNumber ||
 			!ctx.oldOutpoint.hash.equals(this.terms.parent.getHash()) ||
 			ctx.oldOutpoint.index !== this.terms.parentIndex ||
-			current?.walletGeneration !== 4 ||
+			current?.walletGeneration !== ctx.walletGeneration ||
 			current.stateNumber !== ctx.stateNumber ||
 			ctx.priorDigest?.toString('hex') !== this.ledger?.digest ||
 			current.priorDigest?.toString('hex') !== this.ledger?.digest ||

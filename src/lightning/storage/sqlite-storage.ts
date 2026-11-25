@@ -142,6 +142,10 @@ import {
 } from './final-opening-ready';
 import { Feature, FeatureFlags } from '../features/flags';
 import {
+	ASSET_OPENING_TYPE_HEX,
+	ASSET_SPLICE_RECOVERY_TYPE_HEX
+} from '../features/asset-opening';
+import {
 	validateAssetOpening,
 	validateFinalOpening
 } from './final-opening-candidate';
@@ -566,7 +570,7 @@ export class SqliteStorage implements IStorageBackend {
 	}
 	private finalJournal(): FinalDeviceJournal {
 		if (
-			(!this.updateWallet && this.finalGeneration !== 4) ||
+			(!this.updateWallet && !this.assetSpliceWallet) ||
 			!this.walletIdentity ||
 			!this.encryptionKey
 		)
@@ -733,7 +737,7 @@ export class SqliteStorage implements IStorageBackend {
 
 	loadFinalSpliceWalletOutpoints(): Set<string> {
 		const reserved = new Set<string>();
-		if (this.finalGeneration === 4) {
+		if (this.assetSpliceWallet) {
 			for (const c of this.loadFinalOpenings()) {
 				if (!this.loadAssetOpeningEvidence(c.channelId)) continue;
 				for (const input of assetWalletInputState(
@@ -838,7 +842,8 @@ export class SqliteStorage implements IStorageBackend {
 		if (
 			(binding.finalCommitmentUpdates ||
 				binding.dualFundedAssets ||
-				binding.assetSplice) &&
+				binding.assetSplice ||
+				binding.assetSpliceRecovery) &&
 			!daemonGenerated
 		)
 			throw new Error(
@@ -865,6 +870,183 @@ export class SqliteStorage implements IStorageBackend {
 		return SqliteStorage.openFinalWallet(dbPath, binding);
 	}
 
+	/** Recover one funded channel into the original wallet file. Only missing records are inserted. */
+	static repairAssetSpliceChannel(
+		dbPath: string,
+		binding: IFinalWalletBinding,
+		snapshotPath: string,
+		channelId: string
+	) {
+		const identity = finalWalletIdentity(dbPath, binding);
+		if (
+			(!binding.assetSplice && !binding.assetSpliceRecovery) ||
+			!/^[0-9a-f]{64}$/.test(channelId)
+		)
+			throw new Error(
+				'Asset channel repair requires its regtest wallet binding and channel ID'
+			);
+		assertExistingWalletFile(dbPath);
+		assertExistingWalletFile(snapshotPath);
+		const key = Buffer.from(binding.encryptionKey);
+		const target = new SqliteStorage(dbPath, undefined, {
+			encryptionKey: key,
+			[boundWallet]: identity
+		});
+		const Sqlite = loadBetterSqlite3();
+		try {
+			target.openBoundDatabase();
+			target._restrictFileModes();
+			target.openingAuthority = FinalOpeningAuthority.open(
+				target.db,
+				dbPath,
+				key,
+				identity
+			);
+			const authority = target.requireOpeningAuthority();
+			authority.assertDaemonEnrollment();
+			const source = new Sqlite(snapshotPath, {
+				readonly: true,
+				fileMustExist: true,
+				timeout: 0
+			});
+			try {
+				return source
+					.transaction(() => {
+						try {
+							checkWalletFormat(source, key, identity);
+						} catch {
+							throw new Error('Backup wallet identity or format is invalid');
+						}
+						return target.db
+							.transaction(() =>
+								target.repairFundedAssetOpening(source, channelId, authority)
+							)
+							.immediate();
+					})
+					.deferred();
+			} finally {
+				source.close();
+			}
+		} finally {
+			target.close();
+		}
+	}
+
+	private repairFundedAssetOpening(
+		source: Database.Database,
+		id: string,
+		authority: FinalOpeningAuthority
+	) {
+		const row = source
+			.prepare(
+				'SELECT channel_id, funding_outpoint, record_json, nonces_json FROM final_opening_candidates WHERE channel_id=?'
+			)
+			.get(id) as IFinalOpeningRow | undefined;
+		const locator = source
+			.prepare(
+				'SELECT channel_index FROM channel_key_indices WHERE channel_id=?'
+			)
+			.get(id) as { channel_index: number | string } | undefined;
+		if (!row || !locator)
+			throw new Error('Snapshot lacks this asset channel opening');
+		const index = this._decodeChannelIndex(locator.channel_index);
+		const snapshot = this.readFinalOpening(row, () => index);
+		const { session, signing } = snapshot.nonces;
+		if (
+			!session?.assetEvidence ||
+			!signing?.exit ||
+			!signing.fundingTransaction ||
+			!snapshot.nonces.localReady ||
+			!snapshot.nonces.peerReady
+		)
+			throw new Error(
+				'A ready and funded asset opening is required in the backup'
+			);
+		authority.verifyAssetOpeningBackup(
+			source,
+			this.encryptionKey!,
+			this.walletIdentity!,
+			id,
+			row.funding_outpoint,
+			JSON.stringify(snapshot.candidate),
+			JSON.stringify(session),
+			signing.exit
+		);
+		for (const field of ['fundingLocal', 'fundingPeer'] as const) {
+			if (
+				!signing[field] ||
+				signing[field] !==
+					authority.fundingWitnessResult(id, field)?.toString('hex')
+			)
+				throw new Error(
+					'Backup funding witness differs from the original device'
+				);
+		}
+		if (signing.exitRequested && !authority.exitRequest(id))
+			throw new Error('Backup exit decision differs from the original device');
+
+		const indices = this.loadAllChannelKeyIndices();
+		if (
+			indices.some((r) => (r.channelId === id) !== (r.channelIndex === index))
+		)
+			throw new Error('Backup key locator conflicts with an existing channel');
+		if (!indices.some((r) => r.channelId === id))
+			this.saveChannelKeyIndex(id, index);
+		const current = this.finalOpeningRecord(id);
+		if (current) {
+			if (
+				!isDeepStrictEqual(current.candidate, snapshot.candidate) ||
+				!isDeepStrictEqual(current.nonces.session, session) ||
+				current.nonces.signing?.exit !== signing.exit ||
+				current.nonces.signing?.fundingTransaction !==
+					signing.fundingTransaction
+			)
+				throw new Error('Existing opening differs from the backup');
+		} else {
+			this.db
+				.prepare(
+					'INSERT INTO final_opening_candidates (channel_id, funding_outpoint, record_json, nonces_json) VALUES (?, ?, ?, ?)'
+				)
+				.run(id, row.funding_outpoint, row.record_json, row.nonces_json);
+		}
+		if (!this.finalOpeningRecord(id))
+			throw new Error('Asset opening repair was not persisted');
+		this.loadAllChannels();
+
+		this.finalJournal().reconcile(id);
+		const currentLog = this.db
+			.prepare(
+				"SELECT record FROM final_lifecycle_log WHERE scope='asset-splice' AND channel_id=? AND sequence=?"
+			)
+			.pluck();
+		let snapshotSequence = 0;
+		for (const entry of source
+			.prepare(
+				"SELECT sequence,record FROM final_lifecycle_log WHERE scope='asset-splice' AND channel_id=? ORDER BY sequence"
+			)
+			.iterate(id) as Iterable<{ sequence: number; record: string }>) {
+			if (
+				entry.sequence !== ++snapshotSequence ||
+				currentLog.get(id, entry.sequence) !== entry.record
+			)
+				throw new Error(
+					'Backup splice history differs from the original device'
+				);
+		}
+		const currentSequence = this.db
+			.prepare(
+				"SELECT COUNT(*) FROM final_lifecycle_log WHERE scope='asset-splice' AND channel_id=?"
+			)
+			.pluck()
+			.get(id) as number;
+		return {
+			channelId: id,
+			openingRestored: !current,
+			snapshotSequence,
+			currentSequence
+		};
+	}
+
 	/** Reopen a wallet with its authenticated node identity, chain and storage key. */
 	static openFinalWallet(
 		dbPath: string,
@@ -884,7 +1066,7 @@ export class SqliteStorage implements IStorageBackend {
 				binding.encryptionKey,
 				identity
 			);
-			if (storage.finalGeneration === 4) {
+			if (storage.assetSpliceWallet) {
 				const journal = storage.finalJournal();
 				for (const c of storage.loadFinalOpenings())
 					journal.reconcile(c.channelId);
@@ -1036,24 +1218,28 @@ export class SqliteStorage implements IStorageBackend {
 		}
 	}
 
+	private openBoundDatabase(): void {
+		this.db.pragma('locking_mode = EXCLUSIVE');
+		this.db
+			.transaction(() => {
+				checkWalletFormat(this.db, this.encryptionKey, this.walletIdentity);
+				if (this.getSchemaVersion() !== SqliteStorage.CURRENT_SCHEMA_VERSION)
+					throw new Error('Unsupported final wallet schema version');
+				this._checkRequiredColumns();
+			})
+			.exclusive();
+		this.db.pragma('journal_mode = WAL');
+		this.db.pragma('synchronous = FULL');
+		this.db.pragma('foreign_keys = ON');
+	}
+
 	open(opts?: { synchronous?: 'FULL' | 'NORMAL' }): void {
 		// Installing the final format happens only in a private staging file. A
 		// bound open checks the complete format before any migration or rewrite.
 		if (this.walletIdentity) {
 			if (opts?.synchronous === 'NORMAL')
 				throw new Error('Final wallet requires full synchronous writes');
-			this.db.pragma('locking_mode = EXCLUSIVE');
-			this.db
-				.transaction(() => {
-					checkWalletFormat(this.db, this.encryptionKey, this.walletIdentity);
-					if (this.getSchemaVersion() !== SqliteStorage.CURRENT_SCHEMA_VERSION)
-						throw new Error('Unsupported final wallet schema version');
-					this._checkRequiredColumns();
-				})
-				.exclusive();
-			this.db.pragma('journal_mode = WAL');
-			this.db.pragma('synchronous = FULL');
-			this.db.pragma('foreign_keys = ON');
+			this.openBoundDatabase();
 			this.loadAllChannels();
 			this.readFinalOpenings((candidate, record) => {
 				if (this.updateWallet)
@@ -1097,7 +1283,7 @@ export class SqliteStorage implements IStorageBackend {
 	 */
 	async backup(destPath: string): Promise<void> {
 		this.reconcileFinalExitRequests();
-		if (this.updateWallet || this.finalGeneration === 4) {
+		if (this.updateWallet || this.assetSpliceWallet) {
 			const journal = this.finalJournal();
 			for (const candidate of this.loadFinalOpenings())
 				journal.reconcile(candidate.channelId);
@@ -1119,7 +1305,7 @@ export class SqliteStorage implements IStorageBackend {
 		old: Database.Database,
 		next: Database.Database
 	): void {
-		if (this.updateWallet || this.finalGeneration === 4)
+		if (this.updateWallet || this.assetSpliceWallet)
 			checkFinalLifecycleBackup(old, next);
 		if (this.updateWallet) preserveFinalJournal(old, next);
 		const read = (
@@ -1199,9 +1385,7 @@ export class SqliteStorage implements IStorageBackend {
 		const index =
 			nonces.session || nonces.signing ? getIndex(candidate.channelId) : null;
 		const proofKey =
-			this.finalGeneration === 4 &&
-			nonces.session?.assetEvidence &&
-			nonces.signing
+			this.assetSpliceWallet && nonces.session?.assetEvidence && nonces.signing
 				? {
 						record: sha256(Buffer.from(row.record_json)).toString('hex'),
 						nonces: sha256(Buffer.from(row.nonces_json)).toString('hex'),
@@ -1215,7 +1399,7 @@ export class SqliteStorage implements IStorageBackend {
 		const evidence = nonces.session?.assetEvidence;
 		if (evidence !== undefined) {
 			if (
-				(this.finalGeneration !== 3 && this.finalGeneration !== 4) ||
+				(this.finalGeneration !== 3 && !this.assetSpliceWallet) ||
 				(this.finalGeneration === 3 &&
 					nonces.session?.updateLimits !== undefined) ||
 				JSON.stringify(canonicalAssetOpeningEvidence(evidence)) !==
@@ -1224,7 +1408,7 @@ export class SqliteStorage implements IStorageBackend {
 				throw new Error('Invalid stored asset opening evidence');
 		}
 		const { encoded, fundingOutpoint } = evidence
-			? validateAssetOpening(
+			? this.validateBoundAssetOpening(
 					candidate,
 					Buffer.from(evidence.fundingRoot, 'hex')
 			  )
@@ -1365,14 +1549,28 @@ export class SqliteStorage implements IStorageBackend {
 	/** Original-device authority of the dedicated asset opening generation. */
 	get canOpenDualFundedAssets(): boolean {
 		return (
-			(this.finalGeneration === 3 || this.finalGeneration === 4) &&
+			(this.finalGeneration === 3 || this.assetSpliceWallet) &&
 			this.canSignFinalOpening
 		);
 	}
 
+	private get assetSpliceWallet(): boolean {
+		return this.finalGeneration === 4 || this.finalGeneration === 5;
+	}
+
+	/** The enrolled format carries the recoverable asset channel type even when opened for reading. */
+	get supportsAssetSpliceRecovery(): boolean {
+		return this.finalGeneration === 5;
+	}
+
+	/** Only the live original of a recoverable asset wallet can authorize new records. */
+	get canRecoverAssetSplice(): boolean {
+		return this.supportsAssetSpliceRecovery && this.canSignFinalOpening;
+	}
+
 	/** The original wallet can authorize new records for its asset funding views. */
 	get canSpliceDualFundedAssets(): boolean {
-		return this.finalGeneration === 4 && this.canSignFinalOpening;
+		return this.assetSpliceWallet && this.canSignFinalOpening;
 	}
 
 	/** Bind a funding signature, including a replay, to the live signer for this journal. */
@@ -1390,7 +1588,7 @@ export class SqliteStorage implements IStorageBackend {
 
 	private assetSpliceJournal(channelId: string): FinalDeviceJournal {
 		if (
-			this.finalGeneration !== 4 ||
+			!this.assetSpliceWallet ||
 			!this.loadFinalOpeningSession(channelId)?.assetEvidence
 		)
 			throw new Error(
@@ -1462,7 +1660,7 @@ export class SqliteStorage implements IStorageBackend {
 
 	private requireCurrentFinalDevice(): void {
 		if (
-			(this.updateWallet || this.finalGeneration === 4) &&
+			(this.updateWallet || this.assetSpliceWallet) &&
 			!this.canSignFinalOpening
 		)
 			throw new Error('Current commitment requires the original wallet device');
@@ -1560,7 +1758,7 @@ export class SqliteStorage implements IStorageBackend {
 			throw new Error('Final opening reservation requires a top-level commit');
 		const evidence = session?.assetEvidence;
 		const { encoded, fundingOutpoint } = evidence
-			? validateAssetOpening(
+			? this.validateBoundAssetOpening(
 					candidate,
 					Buffer.from(evidence.fundingRoot, 'hex')
 			  )
@@ -1673,6 +1871,18 @@ export class SqliteStorage implements IStorageBackend {
 		);
 	}
 
+	private validateBoundAssetOpening(
+		candidate: IFinalOpeningCandidate,
+		fundingRoot: Buffer
+	) {
+		const enrolled = this.supportsAssetSpliceRecovery
+			? ASSET_SPLICE_RECOVERY_TYPE_HEX
+			: ASSET_OPENING_TYPE_HEX;
+		if (candidate.channelType !== enrolled)
+			throw new Error('Asset channel type conflicts with wallet enrollment');
+		return validateAssetOpening(candidate, fundingRoot);
+	}
+
 	previewAssetOpeningTxComplete(
 		candidate: IFinalOpeningCandidate,
 		fundingRoot: Buffer,
@@ -1683,7 +1893,7 @@ export class SqliteStorage implements IStorageBackend {
 			throw new Error('Asset opening requires its enrolled original device');
 		return this.previewOpeningNonce(
 			candidate,
-			validateAssetOpening(candidate, fundingRoot),
+			this.validateBoundAssetOpening(candidate, fundingRoot),
 			fundingKey,
 			keyIndex
 		);
@@ -1959,7 +2169,7 @@ export class SqliteStorage implements IStorageBackend {
 	}
 
 	private retainedAssetFundingExits(record: IFinalOpeningRecord): string[] {
-		if (this.finalGeneration !== 4 || !record.nonces.session?.assetEvidence)
+		if (!this.assetSpliceWallet || !record.nonces.session?.assetEvidence)
 			return [];
 		const latest = assetUpdateHistory(this, record.candidate.channelId).latest;
 		if (latest)
@@ -2078,7 +2288,7 @@ export class SqliteStorage implements IStorageBackend {
 						Transaction.fromBuffer(e.exit).ins[0].index === fundingOutputIndex)
 				: !requested || sha256(e.exit).toString('hex') === requested
 		);
-		if (this.finalGeneration === 4 && matches.length > 1)
+		if (this.assetSpliceWallet && matches.length > 1)
 			throw new Error(
 				'Select the matching asset funding outpoint for this exit'
 			);
@@ -2532,7 +2742,8 @@ export class SqliteStorage implements IStorageBackend {
 		htlcId: bigint,
 		record = false
 	): boolean {
-		if (!this.canUpdateFinalCommitments) return false;
+		if (!this.canUpdateFinalCommitments && !this.canRecoverAssetSplice)
+			return false;
 		const key = htlcId.toString() + '/' + paymentHash.toString('hex');
 		const journal = this.finalJournal();
 		const head = journal.read<string>('htlc-timeout', id);
@@ -2548,7 +2759,10 @@ export class SqliteStorage implements IStorageBackend {
 		template: string,
 		signed?: string
 	): Buffer | null {
-		if (!this.canUpdateFinalCommitments || !/^[a-f0-9]{64}$/.test(template))
+		if (
+			(!this.canUpdateFinalCommitments && !this.canRecoverAssetSplice) ||
+			!/^[a-f0-9]{64}$/.test(template)
+		)
 			throw new Error(
 				'Final claim sponsorship requires the original update wallet'
 			);
@@ -2883,7 +3097,7 @@ export class SqliteStorage implements IStorageBackend {
 			...(signing?.fundingTransaction && {
 				funding: Buffer.from(signing.fundingTransaction, 'hex')
 			}),
-			...(((!this.updateWallet && this.finalGeneration !== 4) ||
+			...(((!this.updateWallet && !this.assetSpliceWallet) ||
 				this.canSignFinalOpening) &&
 				signing?.exit &&
 				this.finalExitRequested(record.candidate.channelId, record.nonces) && {
@@ -2933,22 +3147,105 @@ export class SqliteStorage implements IStorageBackend {
 		);
 	}
 
-	assetOpeningPayout(id: string, parent: string, raw?: Buffer): Buffer | null {
+	private assetPayoutSlot(
+		id: string,
+		parent: string,
+		outputIndex?: number
+	): string {
 		if (
 			!this.canOpenDualFundedAssets ||
 			!/^[0-9a-f]{64}$/.test(id) ||
 			!/^[0-9a-f]{64}$/.test(parent)
 		)
 			throw new Error('Asset payout requires the original wallet');
-		const auth = this.requireOpeningAuthority(),
-			slot = 'asset-payout/' + id + '/' + parent;
-		if (raw) {
-			if (raw.length > 400_000)
-				throw new Error('Asset payout exceeds standard weight');
-			auth.commitLifecycleEntry(slot, raw.toString('hex'));
+		if (this.supportsAssetSpliceRecovery) {
+			if (
+				outputIndex === undefined ||
+				!Number.isSafeInteger(outputIndex) ||
+				outputIndex < 0 ||
+				outputIndex > 0xffffffff
+			)
+				throw new Error(
+					'Asset payout requires a valid commitment output index'
+				);
+		} else if (outputIndex !== undefined) {
+			throw new Error('Indexed asset payouts require a recovery wallet');
 		}
-		const retained = auth.lifecycleEntry(slot);
-		return retained ? Buffer.from(retained, 'hex') : null;
+		return (
+			'asset-payout/' +
+			id +
+			'/' +
+			parent +
+			(outputIndex === undefined ? '' : '/' + outputIndex)
+		);
+	}
+
+	assetOpeningPayout(
+		id: string,
+		parent: string,
+		raw?: Buffer,
+		outputIndex?: number,
+		receipt?: Buffer
+	): Buffer | null {
+		const slot = this.assetPayoutSlot(id, parent, outputIndex);
+		const auth = this.requireOpeningAuthority();
+		if (
+			receipt !== undefined &&
+			(!this.canRecoverAssetSplice ||
+				!raw ||
+				!Buffer.isBuffer(receipt) ||
+				!receipt.length ||
+				receipt.length > 32 * 1024 * 1024)
+		)
+			throw Error('Invalid or oversized asset payout recovery receipt');
+		if (raw) {
+			if (!Buffer.isBuffer(raw) || !raw.length || raw.length > 400_000)
+				throw new Error('Asset payout exceeds standard weight');
+			if (receipt) {
+				const tx = Transaction.fromBuffer(raw);
+				if (
+					!tx.toBuffer().equals(raw) ||
+					!tx.ins.length ||
+					tx.ins.some((i) => !i.witness.length) ||
+					tx.ins.filter(
+						(i) =>
+							i.index === outputIndex &&
+							Buffer.from(i.hash).reverse().toString('hex') === parent
+					).length !== 1
+				)
+					throw Error('Asset payout receipt differs from its signed outpoint');
+			}
+			auth.commitLifecycleEntry(
+				slot,
+				receipt
+					? JSON.stringify([raw.toString('hex'), receipt.toString('base64')])
+					: raw.toString('hex')
+			);
+			return Buffer.from(raw);
+		}
+		const record = auth.lifecycleEntry(slot);
+		if (!record) return null;
+		return Buffer.from(
+			record[0] === '[' ? JSON.parse(record)[0] : record,
+			'hex'
+		);
+	}
+
+	assetOpeningPayoutReceipt(
+		id: string,
+		parent: string,
+		outputIndex: number
+	): { transaction: Buffer; receipt: Buffer } | null {
+		if (!this.canRecoverAssetSplice)
+			throw Error('Asset payout receipt requires its original recovery wallet');
+		const slot = this.assetPayoutSlot(id, parent, outputIndex);
+		const record = this.requireOpeningAuthority().lifecycleEntry(slot);
+		if (!record || record[0] !== '[') return null;
+		const [transaction, receipt] = JSON.parse(record) as [string, string];
+		return {
+			transaction: Buffer.from(transaction, 'hex'),
+			receipt: Buffer.from(receipt, 'base64')
+		};
 	}
 
 	prepareAssetOpeningWitnesses(channelId: string) {

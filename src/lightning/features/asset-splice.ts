@@ -2,10 +2,7 @@ import { MAX_AUXILIARY_HTLCS_PER_PARTY } from '../channel/auxiliary';
 import { encodeBigSize } from '../message/codec';
 import { encodeCommitmentSignedMessage } from '../message/channel-commitment';
 import { MAX_LIGHTNING_PAYLOAD } from '../message/custom-records';
-import {
-	ASSET_OPENING_TYPE_HEX,
-	assetOpeningNegotiated
-} from './asset-opening';
+import { isAssetOpeningType, assetOpeningNegotiated } from './asset-opening';
 import { Feature, type FeatureFlags } from './flags';
 
 /** Private regtest extension. Each participant must explicitly select this profile. */
@@ -15,9 +12,9 @@ export function assetSpliceNegotiated(
 	peer?: FeatureFlags
 ): boolean {
 	return (
-		channelType === ASSET_OPENING_TYPE_HEX &&
+		isAssetOpeningType(channelType) &&
 		!!peer &&
-		assetOpeningNegotiated(local, peer) &&
+		assetOpeningNegotiated(local, peer, channelType) &&
 		[local, peer].every((flags) =>
 			[Feature.QUIESCE, Feature.SPLICE, Feature.OPTION_ASSET_SPLICE].every(
 				(f) => flags.hasFeature(f)
