@@ -2,6 +2,7 @@ import {
 	AssetSpliceUpdateTransport,
 	hasAssetUpdateHost
 } from './asset-splice-update-transport';
+import { releasedAssetUpdateFunding } from './asset-splice-update-ledger';
 import type { AssetUpdateChange } from './asset-splice-update-provider';
 import { BeignetCustomSubtype } from '../message/custom';
 import {
@@ -1339,7 +1340,22 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 					(id) => this.restoreAssetSpliceWatches(id),
 					(raw) => this.emit('broadcast:tx', raw),
 					(id, reason) =>
-						this.emitContained('error', Buffer.from(id, 'hex'), reason)
+						this.emitContained('error', Buffer.from(id, 'hex'), reason),
+					{
+						timeoutMs: config.quiescenceTimeoutMs,
+						disconnect: (peer) => this.peerManager?.recyclePeer(peer, 1000),
+						close: (id) => {
+							if (this.finalObservedClose.has(id)) return;
+							const storage = config.finalOpening!.storage;
+							const session = storage.loadFinalOpeningSession(id)!;
+							const exit = storage.requestFinalOpeningExit(
+								id,
+								this.observedFinalExit(id)
+							);
+							this.finalTransport?.closed(session.peer, id);
+							this.emit('broadcast:tx', exit);
+						}
+					}
 				);
 				if (hasAssetUpdateHost(host)) {
 					this.assetUpdates = new AssetSpliceUpdateTransport(
@@ -1366,12 +1382,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 								return;
 							return { peer, originalInitiator: opening.candidate.isInitiator };
 						},
-						(id) =>
-							this.finalTransport?.hasDepth(id) &&
-							!this.finalObservedClose.has(id) &&
-							this._currentBlockHeight > 0
-								? this._currentBlockHeight
-								: undefined,
+						(id) => this.assetUpdateHeight(id),
 						(peer, type, raw) => this.sendMessage(peer, type, raw),
 						(id) => this.retryAssetSpliceLocks(id),
 						(id, reason) =>
@@ -10335,6 +10346,36 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			Math.max(546, terms.localDustLimitSatoshis, terms.remoteDustLimitSatoshis)
 		);
 	}
+	private assetUpdateHeight(id: string): number | undefined {
+		const height = this._currentBlockHeight;
+		if (height < 1 || this.finalObservedClose.has(id)) return;
+		if (this.finalTransport?.hasDepth(id)) return height;
+		const store = this.config.finalOpening?.storage;
+		if (
+			!store?.canSpliceDualFundedAssets ||
+			!this.assetSpliceConfirmation?.hasChannel(id)
+		)
+			return;
+		const funding = store.loadAssetSpliceFundingInfo(id);
+		if (funding.reconciliation || funding.awaitingImport) return;
+		// A mined replacement spends its parent before the bilateral lock matures.
+		// Updates still sign every live branch and cannot advance the funding lock.
+		const eligible = funding.pending.filter(({ candidate }) => {
+			const txid = candidate.fundingTxid;
+			const mined = this.finalObservedFunding.get(id)?.get(txid)?.height;
+			return (
+				mined !== undefined &&
+				mined > 0 &&
+				mined <= height &&
+				this.assetSpliceConfirmation?.hasCurrentInclusion(id, txid, mined)
+			);
+		});
+		if (eligible.length !== 1) return;
+		const [e] = eligible;
+		return releasedAssetUpdateFunding(store, id, e.candidate, e.finalDigest)
+			? height
+			: undefined;
+	}
 	async startAssetSpliceUpdate(
 		channelId: Buffer,
 		changes: readonly AssetUpdateChange[]
@@ -10741,6 +10782,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		claimMargin: number,
 		offeredGrace: number
 	): void {
+		this.assetSplice?.checkHtlcDeadlines(height, claimMargin);
 		const storage = this.config.finalOpening?.storage;
 		if (!storage?.canUpdateFinalCommitments) return;
 		for (const id of new Set([

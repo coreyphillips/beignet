@@ -302,21 +302,21 @@ describe('Original device commitment signing across splice funding generations',
 		fixture = setup(directory, true);
 		const a = fixture.agreement('splice', 0),
 			signed = a.submit(1);
-		const device = fixture.devices[1];
-		device.store.close();
-		fs.copyFileSync(device.file, path.join(directory, 'restored.db'));
+		const originalDevice = fixture.devices[1];
+		originalDevice.store.close();
+		fs.copyFileSync(originalDevice.file, path.join(directory, 'restored.db'));
 		const restored = SqliteStorage.openFinalWallet(
 			path.join(directory, 'restored.db'),
-			device.party.binding
+			originalDevice.party.binding
 		);
 		try {
 			expect(authority(restored)).not.to.exist;
 		} finally {
 			restored.close();
 		}
-		device.store = SqliteStorage.openFinalWallet(
-			device.file,
-			device.party.binding
+		originalDevice.store = SqliteStorage.openFinalWallet(
+			originalDevice.file,
+			originalDevice.party.binding
 		);
 		expect(a.submit(1)).to.deep.equal(signed);
 		const funding = a.input(1).funding;

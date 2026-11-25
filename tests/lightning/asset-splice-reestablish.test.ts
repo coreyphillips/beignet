@@ -85,7 +85,7 @@ function openTransportPair(f: DevicePair) {
 			decodeChannelReestablishMessage(m.payload, { finalTaproot: true })
 		);
 	};
-	return { transports, cycle, sent, resumes };
+	return { transports, cycle, sent, resumes, refusals };
 }
 const sortedIds = (m: { nextLocalNonces?: { fundingTxid: Buffer }[] }) =>
 	m.nextLocalNonces!.map((n) =>
@@ -101,6 +101,33 @@ describe('original-device asset splice channel_reestablish', function () {
 		for (const d of f?.f.devices ?? []) d.store.close();
 		fs.rmSync(dir, { recursive: true, force: true });
 	});
+	it('accepts a retransmitted original inbound share and rejects a different commitment after opening', async () => {
+		f = signatureRoundFixture(dir);
+		markReady(f);
+		const id = f.f.id,
+			t = openTransportPair(f),
+			d = f.f.devices[0],
+			peer = f.f.devices[1];
+		await t.cycle();
+		const share = peer.store.loadFinalPeerCommitment(id)!;
+		assert(d.store.loadReceivedOpeningCommitment(id)!.equals(share));
+		assert(!d.store.loadFinalPeerCommitment(id)!.equals(share));
+		t.transports[0].queue(peer.party.binding.nodeId, id, {
+			type: M.COMMITMENT_SIGNED,
+			payload: share
+		});
+		await new Promise<void>((done) => setImmediate(done));
+		assert.deepEqual(t.refusals, []);
+		t.transports[0].queue(peer.party.binding.nodeId, id, {
+			type: M.COMMITMENT_SIGNED,
+			payload: d.store.loadFinalPeerCommitment(id)!
+		});
+		await new Promise<void>((done) => setImmediate(done));
+		assert.deepEqual(t.refusals, [
+			'Opening replay differs from the secured original funding'
+		]);
+	});
+
 	it('renews a height-one promise on two funded opening devices, then freezes the emitted offer even across a restart', async () => {
 		f = signatureRoundFixture(dir);
 		markReady(f);

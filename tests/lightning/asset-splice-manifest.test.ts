@@ -291,8 +291,8 @@ describe('Asset splice manifests', () => {
 			l.ack,
 			blobs
 		);
-		async function rejected(f: () => Promise<unknown>) {
-			const result = await f().then(
+		async function rejected(action: () => Promise<unknown>) {
+			const result = await action().then(
 				() => false,
 				() => true
 			);

@@ -6,7 +6,7 @@ import {
 	ASSET_OPENING_TYPE_HEX,
 	assetOpeningNegotiated
 } from './asset-opening';
-import { Feature, FeatureFlags } from './flags';
+import { Feature, type FeatureFlags } from './flags';
 
 /** Private regtest extension. Each participant must explicitly select this profile. */
 export function assetSpliceNegotiated(

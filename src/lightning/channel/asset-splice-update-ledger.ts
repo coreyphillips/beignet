@@ -1,4 +1,4 @@
-import { assetUpdateFundingMembers } from '../storage/asset-update-history';
+import { assetUpdateFundingMembers } from '../storage/asset-splice-exit-proofs';
 import { Transaction } from 'bitcoinjs-lib';
 import { sha256 } from '../crypto/provider';
 import type {
@@ -56,6 +56,21 @@ export interface UpdateSource {
 	localBalanceMsat: bigint;
 	remoteBalanceMsat: bigint;
 }
+export function releasedAssetUpdateFunding(
+	store: SqliteStorage,
+	id: string,
+	candidate: IAssetSpliceExitBranch,
+	finalDigest: string
+): boolean {
+	const start = store
+		.readAssetSpliceJournal<AssetSpliceConstructionEvent>(id)
+		.records.find(
+			(r) => r.kind === 'construction-start' && r.finalDigest === finalDigest
+		);
+	if (!start) return false;
+	const tx = store.releasedAssetSplice(id, start.attempt)?.transaction();
+	return tx?.getId() === candidate.fundingTxid;
+}
 export function assetUpdateSources(
 	store: SqliteStorage,
 	id: string,
@@ -102,16 +117,16 @@ export function assetUpdateSources(
 				localBalanceMsat: BigInt(c.localContributionSats) * 1000n,
 				remoteBalanceMsat: BigInt(c.remoteContributionSats) * 1000n
 		  };
-	const starts = store
-		.readAssetSpliceJournal<AssetSpliceConstructionEvent>(id)
-		.records.filter((s) => s.kind === 'construction-start');
 	const sources = [
 		selected,
 		...info.pending.map((candidate) => {
-			const begin = starts.find((b) => b.finalDigest === candidate.finalDigest);
 			if (
-				!begin ||
-				!store.releasedAssetSplice(id, begin.attempt)?.transaction()
+				!releasedAssetUpdateFunding(
+					store,
+					id,
+					candidate.candidate,
+					candidate.finalDigest
+				)
 			)
 				throw new Error('Incomplete funding exchange freezes asset updates');
 			return source(candidate.candidate);

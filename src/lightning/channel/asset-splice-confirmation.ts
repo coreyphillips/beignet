@@ -227,9 +227,13 @@ export class AssetSpliceConfirmationCoordinator {
 		}
 		return undefined;
 	}
-	hasCurrentInclusion(id: string, txid: string): boolean {
+	hasCurrentInclusion(id: string, txid: string, height?: number): boolean {
 		const entry = this.entries.get(key(id, txid));
-		return !!entry?.mined && !!entry.sample?.current();
+		return (
+			!!entry?.mined &&
+			!!entry.sample?.current() &&
+			(height === undefined || entry.sample.height === height)
+		);
 	}
 	status(id: string, txid: string) {
 		const e = this.entries.get(key(id, txid));
@@ -397,7 +401,9 @@ export class AssetSpliceConfirmationCoordinator {
 		if (anchor.txid !== txid)
 			throw new Error('Verified chain transaction differs from splice funding');
 		e.mined =
-			Number.isSafeInteger(anchor.confirmations) && anchor.confirmations > 0;
+			/^[0-9a-f]{64}$/.test(anchor.blockHash) &&
+			Number.isSafeInteger(anchor.confirmations) &&
+			anchor.confirmations > 0;
 		try {
 			await e.lock.observe(anchor);
 			if (ticket !== e.ticket || !current()) return;

@@ -4,6 +4,7 @@ import { Transaction } from 'bitcoinjs-lib';
 import { isDeepStrictEqual } from 'util';
 import { assetSpliceFundingExits } from './asset-splice-funding-exits';
 import {
+	assetUpdateFundingMembers,
 	publishableAssetSpliceEvidence,
 	type AssetSpliceExitEvent
 } from './asset-splice-exit-proofs';
@@ -19,7 +20,6 @@ import {
 import { AssetSpliceUpdateBatch } from '../channel/asset-splice-update-batch';
 import type { AssetUpdateChange } from '../channel/asset-splice-update-provider';
 import {
-	assetUpdateFundingMembers,
 	assetSpliceUpdateHead,
 	assetUpdateHistory
 } from './asset-update-history';

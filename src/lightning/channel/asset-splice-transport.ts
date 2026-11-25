@@ -1,4 +1,6 @@
-import { assetUpdateFundingMembers } from '../storage/asset-update-history';
+import { assetUpdateFundingMembers } from '../storage/asset-splice-exit-proofs';
+import { assetUpdateHistory } from '../storage/asset-update-history';
+import { INBOUND_HTLC_CLAIM_FORCE_CLOSE_BUFFER } from '../node/config';
 import { Transaction } from 'bitcoinjs-lib';
 import { sha256 } from '../crypto/provider';
 import { isValidPublicKey } from '../crypto/ecdh';
@@ -72,8 +74,16 @@ export interface IStartAssetSplice {
 const MAX_NEGOTIATING_CHANNELS = 8,
 	MAX_QUEUED_FRAMES = 160;
 const PROPOSAL_LIFETIME_MS = 120000;
+const HTLC_QUIESCENCE_MS = 60000;
+type HtlcDeadline = { expiry: number; claimHeight: number };
+type SpliceWatchdog = {
+	disconnect(peer: string): void;
+	close(id: string): void;
+	timeoutMs?: number;
+};
 type Begin = {
 	deadline: number;
+	htlcDeadline?: HtlcDeadline | null;
 	kind: 'peer-splice';
 	index: number;
 	initiator: boolean;
@@ -86,6 +96,7 @@ type Begin = {
 	depth: number;
 };
 type Field =
+	| 'expired'
 	| 'peer-stfu'
 	| 'init'
 	| 'ack'
@@ -108,6 +119,7 @@ type Live = {
 	leaves?: Awaited<ReturnType<Round['verifyExitShares']>>;
 	retained?: boolean;
 	replayConstruction?: boolean;
+	expired?: boolean;
 	expires?: ReturnType<typeof setTimeout>;
 };
 const interactive = [
@@ -148,6 +160,8 @@ export class AssetSpliceTransport {
 	private queues = new Map<string, Promise<void>>();
 	private pendingFrames = new Map<string, number>();
 	private epochs = new Map<string, number>();
+	private claimMargin = INBOUND_HTLC_CLAIM_FORCE_CLOSE_BUFFER;
+	private retiring = new Set<string>();
 	constructor(
 		private runtime: IFinalOpeningRuntime,
 		private host: AssetSpliceHost,
@@ -160,7 +174,8 @@ export class AssetSpliceTransport {
 		>,
 		private watch: (id: string) => void,
 		private broadcast: (raw: Buffer) => void,
-		private report: (id: string, reason: string) => void
+		private report: (id: string, reason: string) => void,
+		private watchdog?: SpliceWatchdog
 	) {}
 	private get store() {
 		return this.runtime.storage;
@@ -253,6 +268,7 @@ export class AssetSpliceTransport {
 				adopted?.candidate.fundingRoot ??
 				opening.session.assetEvidence.fundingRoot,
 			state: secured?.height ?? adopted?.stateNumber ?? '0',
+			htlcDeadline: this.htlcDeadline(secured?.htlcs ?? []),
 			...(secured && { priorDigest: secured.digest }),
 			depth: adopted?.minimumDepth ?? opening.candidate.minimumDepth
 		};
@@ -273,7 +289,23 @@ export class AssetSpliceTransport {
 			)
 				return undefined;
 		}
-		return existing?.begin.index === last.index ? existing.begin : last;
+		if (existing?.begin.index === last.index) return existing.begin;
+		// Older records stored the two-minute proposal deadline and the authenticated state digest.
+		if (last.htlcDeadline === undefined && last.priorDigest) {
+			const state = assetUpdateHistory(this.store, id).states.get(
+				BigInt(last.state)
+			);
+			if (state?.digest !== last.priorDigest)
+				throw Error('Unknown asset splice parent state');
+			const deadline = this.htlcDeadline(state.htlcs);
+			if (deadline)
+				return {
+					...last,
+					htlcDeadline: deadline,
+					deadline: last.deadline - PROPOSAL_LIFETIME_MS + HTLC_QUIESCENCE_MS
+				};
+		}
+		return last;
 	}
 	private session(id: string, b: Begin): Live {
 		const current = this.live.get(id);
@@ -284,24 +316,128 @@ export class AssetSpliceTransport {
 			peer,
 			begin: b,
 			sent: new Set<string>(),
-			replayConstruction: true
+			replayConstruction: true,
+			expired: !!this.saved(id, b, 'expired')
 		};
 		this.live.set(id, live);
-		live.expires = setTimeout(
-			() => {
-				if (this.live.get(id) === live && !this.hasAuthorization(id, live))
-					this.failure(id, new Error('Asset splice proposal expired'));
-			},
-			Math.max(1, b.deadline - Date.now())
-		);
-		live.expires.unref?.();
+		if (!this.saved(id, b, 'assembled') && !live.expired) {
+			live.expires = setTimeout(
+				() => {
+					if (this.live.get(id) !== live || this.saved(id, b, 'assembled'))
+						return;
+					if (b.htlcDeadline) this.expire(id, live, this.height());
+					else if (!this.hasAuthorization(id, live))
+						this.failure(id, new Error('Asset splice proposal expired'));
+				},
+				Math.max(1, b.deadline - Date.now())
+			);
+			live.expires.unref?.();
+		}
 		return live;
+	}
+	private htlcDeadline(
+		htlcs: readonly { cltvExpiry: number }[]
+	): HtlcDeadline | null {
+		if (!htlcs.length) return null;
+		const expiry = Math.min(...htlcs.map((h) => h.cltvExpiry));
+		return { expiry, claimHeight: expiry - this.claimMargin };
+	}
+	private atMargin(b: Begin, height: number): boolean {
+		return (
+			!!b.htlcDeadline &&
+			height >=
+				Math.min(
+					b.htlcDeadline.claimHeight,
+					b.htlcDeadline.expiry - this.claimMargin
+				)
+		);
+	}
+	private ended(s: Live): boolean {
+		const b = s.begin;
+		return (
+			!!b.htlcDeadline &&
+			(Date.now() >= b.deadline ||
+				this.atMargin(b, this.height()) ||
+				!!s.expired)
+		);
+	}
+	private expire(id: string, s: Live, height: number): void {
+		const b = s.begin;
+		try {
+			if (this.saved(id, b, 'retired') || this.saved(id, b, 'assembled'))
+				return;
+			if (!this.saved(id, b, 'expired')) {
+				this.record(id, b, 'expired', Buffer.alloc(0));
+				s.expired = true;
+				this.report(id, 'Asset splice reached its HTLC quiescence deadline');
+				if (this.live.get(id) === s) {
+					this.disconnected(s.peer);
+					this.watchdog?.disconnect(s.peer);
+				}
+			}
+			if (this.hasAuthorization(id, s)) {
+				// The wallet may have released its asset share. Keep its inputs locked and
+				// retry the chain-selected exit on every block until the observation is certain.
+				if (
+					this.atMargin(b, height) &&
+					!this.store.loadFinalDaemonOpening(id)?.exitToBroadcast
+				)
+					this.watchdog?.close(id);
+				return;
+			}
+			if (this.retiring.has(id)) return;
+			this.retiring.add(id);
+			void this.enqueue(id, async () => {
+				if (!this.hasAuthorization(id, s) && !this.saved(id, b, 'retired'))
+					await this.retire(id, s, false);
+			})
+				.catch((e) =>
+					this.report(id, e instanceof Error ? e.message : String(e))
+				)
+				.finally(() => this.retiring.delete(id));
+		} catch (e) {
+			this.report(id, e instanceof Error ? e.message : String(e));
+		}
+	}
+	/** Check original-device attempts even when no peer is connected or the wallet just restarted. */
+	checkHtlcDeadlines(height: number, claimMargin: number): void {
+		this.claimMargin = Math.max(
+			INBOUND_HTLC_CLAIM_FORCE_CLOSE_BUFFER,
+			claimMargin
+		);
+		for (const { channelId: id } of this.store.loadFinalOpenings()) {
+			try {
+				if (
+					!this.store.loadFinalOpeningSession(id)?.assetEvidence ||
+					this.store.loadFinalDaemonOpening(id)?.exitToBroadcast
+				)
+					continue;
+				const b = this.pending(id);
+				if (
+					!b?.htlcDeadline ||
+					this.saved(id, b, 'assembled') ||
+					(!this.atMargin(b, height) &&
+						Date.now() < b.deadline &&
+						!this.saved(id, b, 'expired'))
+				)
+					continue;
+				const peer = this.store.loadFinalOpeningSession(id)!.peer;
+				this.expire(
+					id,
+					this.live.get(id) ?? { begin: b, peer, sent: new Set() },
+					height
+				);
+			} catch (e) {
+				this.report(id, e instanceof Error ? e.message : String(e));
+			}
+		}
 	}
 	private startRecord(
 		id: string,
 		initiator: boolean,
 		fee: number,
-		depth: number
+		depth: number,
+		firstDeadline?: number
 	): Begin {
 		this.store.assertAssetSpliceCanStart(id);
 		const parent = this.selected(id);
@@ -309,6 +445,19 @@ export class AssetSpliceTransport {
 			throw Error(
 				'Asset splice requires an active, confirmed original wallet funding output'
 			);
+		const block = this.height();
+		if (
+			parent.htlcDeadline &&
+			(!Number.isSafeInteger(block) ||
+				block < 1 ||
+				block >= parent.htlcDeadline.claimHeight)
+		) {
+			if (!initiator)
+				this.watchdog?.disconnect(this.store.loadFinalOpeningSession(id)!.peer);
+			throw Error(
+				'Asset splice requires every pending HTLC to be outside its claim margin'
+			);
+		}
 		const active = this.store
 			.loadFinalOpenings()
 			.filter(
@@ -321,7 +470,16 @@ export class AssetSpliceTransport {
 		const index = this.store.allocateFinalChannelKeyIndex(1);
 		const begin: Begin = {
 			kind: 'peer-splice',
-			deadline: Date.now() + PROPOSAL_LIFETIME_MS,
+			deadline:
+				firstDeadline ??
+				Date.now() +
+					(parent.htlcDeadline
+						? Math.min(
+								HTLC_QUIESCENCE_MS,
+								this.watchdog?.timeoutMs ?? HTLC_QUIESCENCE_MS
+						  )
+						: PROPOSAL_LIFETIME_MS),
+			htlcDeadline: parent.htlcDeadline,
 			index,
 			initiator,
 			parent: parent.parent,
@@ -330,7 +488,7 @@ export class AssetSpliceTransport {
 			...(parent.priorDigest && { priorDigest: parent.priorDigest }),
 			feerate: fee,
 			depth,
-			locktime: this.height()
+			locktime: block
 		};
 		const head = this.store.readAssetSpliceJournal(id);
 		this.store.appendAssetSpliceEvent(id, head, begin);
@@ -367,7 +525,12 @@ export class AssetSpliceTransport {
 			...(b.priorDigest && { priorDigest: Buffer.from(b.priorDigest, 'hex') }),
 			oldOutpoint: { hash: tx.getHash(), index: b.parent.fundingOutputIndex },
 			currentParent: () => {
-				if (this.live.get(id) !== s || !this.eligible(s.peer, id)) return;
+				if (
+					this.live.get(id) !== s ||
+					!this.eligible(s.peer, id) ||
+					this.ended(s)
+				)
+					return;
 				try {
 					this.store.assertAssetSpliceCanStart(id);
 				} catch {
@@ -432,7 +595,14 @@ export class AssetSpliceTransport {
 		if (this.live.get(id) !== s || !this.eligible(s.peer, id)) return;
 		const b = s.begin,
 			cid = Buffer.from(id, 'hex');
-		if (this.replayFunding(id, s)) return;
+		if (this.replayFunding(id, s)) {
+			if (this.ended(s)) this.expire(id, s, this.height());
+			return;
+		}
+		if (this.ended(s)) {
+			this.expire(id, s, this.height());
+			return;
+		}
 		if (Date.now() > b.deadline && !this.hasAuthorization(id, s))
 			throw Error('Asset splice proposal expired');
 		this.sendOnce(
@@ -505,13 +675,13 @@ export class AssetSpliceTransport {
 			ack,
 			this.store,
 			(raw) => {
-				if (this.live.get(id) === s)
+				if (this.live.get(id) === s && !this.ended(s))
 					this.send(s.peer, BEIGNET_CUSTOM_MESSAGE_TYPE, raw);
 			}
 		);
 		await s.exchange.advance();
 		const result = s.exchange.result();
-		if (!result || this.live.get(id) !== s) return;
+		if (!result || this.live.get(id) !== s || !ctx.currentParent()) return;
 		const tx = result.verified.candidate.tx;
 		if (!s.construction) {
 			this.store.reserveAssetSpliceWalletInputs(
@@ -700,6 +870,10 @@ export class AssetSpliceTransport {
 					b = this.startRecord(id, false, 1, 1);
 				}
 				const s = this.session(id, b);
+				if (this.ended(s)) {
+					this.expire(id, s, this.height());
+					return;
+				}
 				if (
 					payload[32] === 1 &&
 					b.initiator &&
@@ -707,7 +881,7 @@ export class AssetSpliceTransport {
 					!this.store.loadFinalOpening(id)!.isInitiator
 				) {
 					await this.retire(id, s, false);
-					b = this.startRecord(id, false, 1, 1);
+					b = this.startRecord(id, false, 1, 1, b.deadline);
 					// Both quiescence messages on a simultaneous attempt carry the initiator flag.
 					this.session(id, b).sent.add('stfu');
 				} else if (!b.initiator && payload[32] !== 1)
@@ -827,6 +1001,10 @@ export class AssetSpliceTransport {
 			void this.enqueue(id, async () => {
 				if (!this.eligible(peer, id) || this.live.get(id) !== s || !s.exchange)
 					return;
+				if (this.ended(s)) {
+					this.expire(id, s, this.height());
+					return;
+				}
 				await s.exchange.receive(subtype, copy);
 				await this.drive(id, s);
 			}).catch((error) => this.failure(id, error));

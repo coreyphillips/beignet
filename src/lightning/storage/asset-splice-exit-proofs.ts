@@ -1,6 +1,6 @@
 import {
 	assetUpdateHistory,
-	assetUpdateFundingMembers
+	type IAssetUpdateSecured
 } from './asset-update-history';
 import { Transaction } from 'bitcoinjs-lib';
 import { isDeepStrictEqual } from 'util';
@@ -378,4 +378,39 @@ export function recordAssetSpliceFundingPhase(
 		store.appendAssetSpliceEvent(channelId, head, event);
 	}
 	return evidenceHash;
+}
+
+/** A splice at this already signed height can introduce another funding outpoint with the identical obligations. */
+export function assetUpdateFundingMembers(
+	store: SqliteStorage,
+	id: string,
+	state: IAssetUpdateSecured
+): IAssetSpliceExitBranch[] {
+	const chosen = new Map(
+		state.members.map((m) => [m.fundingTxid + ':' + m.outputIndex, m])
+	);
+	const receipts = publishableAssetSpliceEvidence(
+		store.readAssetSpliceJournal<AssetSpliceExitEvent>(id).records,
+		id
+	);
+	for (const e of receipts) {
+		if (e.priorDigest !== state.digest || e.stateNumber !== state.height)
+			continue;
+		const parent = chosen.get(
+			e.parent.fundingTxid + ':' + e.parent.outputIndex
+		);
+		if (
+			!parent ||
+			parent.localCommitment !== e.parent.localCommitment ||
+			parent.remoteCommitment !== e.parent.remoteCommitment ||
+			parent.localProofs !== e.parent.localProofs ||
+			parent.remoteProofs !== e.parent.remoteProofs
+		)
+			throw new Error('Splice does not extend the cross-signed funding state');
+		const key = e.candidate.fundingTxid + ':' + e.candidate.outputIndex;
+		if (chosen.has(key))
+			throw new Error('Duplicate cross-signed splice outpoint');
+		chosen.set(key, e.candidate);
+	}
+	return [...chosen.values()];
 }

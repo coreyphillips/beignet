@@ -903,10 +903,13 @@ export class FinalOpeningTransport {
 							if (
 								msg.nextCommitmentNumber === 1n &&
 								!storage.assetSpliceUpdateHead(id).committed
-							)
+							) {
 								this.sendReady(id);
-							else connection.readySent = true;
-							this.resumeAssetSplice?.(peer, id);
+								if (!connection.readySent) this.resumeAssetSplice?.(peer, id);
+							} else {
+								connection.readySent = true;
+								this.resumeAssetSplice?.(peer, id);
+							}
 							return;
 						}
 					}

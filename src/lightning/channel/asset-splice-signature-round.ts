@@ -1,8 +1,5 @@
 import { deserialize, serialize } from 'v8';
-import {
-	assetUpdateFundingMembers,
-	assetUpdateHistory
-} from '../storage/asset-update-history';
+import { assetUpdateHistory } from '../storage/asset-update-history';
 import type {
 	IAssetUpdateHtlcSigner,
 	IAssetUpdateHtlc,
@@ -26,6 +23,7 @@ import { sha256 } from '../crypto/provider';
 import type { FinalOpeningAuthority } from '../storage/final-opening-authority';
 import type { FinalFundingWitnessSigner } from '../storage/final-opening-funding';
 import {
+	assetUpdateFundingMembers,
 	loadAssetSpliceExitProofs,
 	retainAssetSpliceExitProofs,
 	type IAssetSpliceExitProofs,

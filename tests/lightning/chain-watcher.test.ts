@@ -11,6 +11,11 @@
  */
 
 import { expect } from 'chai';
+import { mkdtempSync, rmSync } from 'fs';
+import { tmpdir } from 'os';
+import { join } from 'path';
+import { setupFundedAssetUpdatePair } from './helpers/asset-splice-update';
+import type { IChannelManagerConfig } from '../../src/lightning/channel/channel-manager';
 import crypto from 'crypto';
 import * as bitcoin from 'bitcoinjs-lib';
 import * as ecc from '@bitcoinerlab/secp256k1';
@@ -442,6 +447,82 @@ describe('Phase 4: Chain Watcher', () => {
 			expect(verdicts.slice(-1)).to.deep.equal([false]);
 		});
 
+		it('permits pending asset updates only for a released candidate with a current mined unspent output', async function () {
+			this.timeout(60000);
+			watcher.stop();
+			const dir = mkdtempSync(join(tmpdir(), 'asset-splice-mixed-readiness-'));
+			const pair = await setupFundedAssetUpdatePair(dir),
+				d = pair.f.devices[0],
+				id = pair.f.id;
+			try {
+				channelManager = new ChannelManager({
+					finalOpening: { storage: d.store, root: d.party.root },
+					persistence: COMMIT_ALL
+				} as unknown as IChannelManagerConfig);
+				channelManager.on('error', () => {});
+				const { candidate } = d.store.loadAssetSpliceFundingInfo(id).pending[0],
+					tx = bitcoin.Transaction.fromHex(candidate.funding.fundingTxHex);
+				const txid = tx.getId(),
+					index = candidate.outputIndex,
+					out = tx.outs[index],
+					sh = computeScriptHash(out.script);
+				let present = true,
+					allowProof = false;
+				Object.assign(backend, {
+					listUnspent: async () =>
+						present
+							? [{ txid, outputIndex: index, valueSat: out.value, height: 72 }]
+							: [],
+					getAssetSpliceInclusion: async () => {
+						if (!allowProof) throw Error('No accepted chain proof');
+						return { txid, blockHash: '44'.repeat(32), confirmations: 1 };
+					}
+				});
+				backend.setHistory(sh, [{ txid, height: 72 }]);
+				backend.setTransaction(txid, tx.toBuffer());
+				channelManager.restoreAssetSpliceWatches(id);
+				watcher = new ChainWatcher({
+					backend,
+					channelManager,
+					missingDebounceMs: 0
+				});
+				await watcher.start();
+				backend.simulateNewBlock(72);
+				const observe = () =>
+					watcher.watchFinalFundingOutput(
+						Buffer.from(id, 'hex'),
+						txid,
+						index,
+						3,
+						out.script,
+						out.value
+					);
+				const updates = () => channelManager['assetUpdateHeight'](id);
+				await observe();
+				expect(updates()).to.equal(undefined);
+				allowProof = true;
+				await observe();
+				expect(updates()).to.equal(72);
+				expect(channelManager.isAssetSpliceFundingAvailable(id, txid)).to.equal(
+					false
+				);
+				expect(d.store.loadAssetSpliceFundingInfo(id).active).to.equal(
+					undefined
+				);
+				present = false;
+				await observe();
+				expect(updates()).to.equal(undefined);
+				present = true;
+				await observe();
+				expect(updates()).to.equal(72);
+				channelManager.suspendAssetSpliceFunding(id, txid);
+				expect(updates()).to.equal(undefined);
+			} finally {
+				watcher.stop();
+				for (const dev of pair.f.devices) dev.store.close();
+				rmSync(dir, { recursive: true, force: true });
+			}
+		});
 		it('clears a spent splice outpoint before revalidating its historical inclusion', async () => {
 			const id = crypto.randomBytes(32),
 				txid = 'a2'.repeat(32);
