@@ -23,6 +23,7 @@ import { assertLegacyWalletFile } from '../lightning/storage/final-wallet-format
 import { nodeFs } from '../utils/node-builtins';
 import { acquireInstanceLock, releaseInstanceLock } from './instance-lock';
 import { SECRET_FILE_MODE, tightenMode, writeFileAtomic } from './fs-utils';
+import { readAssetChannelFrame } from './asset-channel-frame';
 import { backupMacPath, fileMac, readBackupMac } from './backup-mac';
 import { ChannelState } from '../lightning/channel/types';
 import type { IStorageBackend } from '../lightning/storage/types';
@@ -220,11 +221,6 @@ export async function performAssetChannelRestore(
 	const fs = nodeFs();
 	acquireInstanceLock(lockPath, { refuseOwnPid: true });
 	try {
-		const mac = readBackupMac(backupFile);
-		if (!mac)
-			throw new Error(
-				'Asset channel repair requires an authenticated backup with its MAC'
-			);
 		if (
 			[
 				dbRestoreMarkerPath(dbPath),
@@ -232,6 +228,16 @@ export async function performAssetChannelRestore(
 			].some((p) => fs.lstatSync(p, { throwIfNoEntry: false }))
 		)
 			throw new Error('Final wallet has a pending legacy restore');
+		const { SqliteStorage } =
+			require('../lightning/storage/sqlite-storage') as typeof import('../lightning/storage/sqlite-storage');
+		const frame = readAssetChannelFrame(backupFile, channelId, macKey);
+		if (frame)
+			return SqliteStorage.repairAssetChannelFrame(dbPath, binding, frame);
+		const mac = readBackupMac(backupFile);
+		if (!mac)
+			throw new Error(
+				'Asset channel repair requires an authenticated backup with its MAC'
+			);
 		const dir = fs.mkdtempSync(
 			path.join(path.dirname(dbPath), '.asset-channel-restore-')
 		);
@@ -241,8 +247,6 @@ export async function performAssetChannelRestore(
 			tightenMode(staged, SECRET_FILE_MODE);
 			if (!timingSafeEqual(await fileMac(macKey, staged), mac))
 				throw new Error('Asset channel backup MAC does not match');
-			const { SqliteStorage } =
-				require('../lightning/storage/sqlite-storage') as typeof import('../lightning/storage/sqlite-storage');
 			return SqliteStorage.repairAssetSpliceChannel(
 				dbPath,
 				binding,

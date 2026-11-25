@@ -3087,7 +3087,8 @@ async function handleMessage(): Promise<void> {
 }
 
 async function handleBackup(): Promise<void> {
-	const sub = positionalArgs(undefined, new Set(['--overwrite']))[1];
+	const args = positionalArgs(undefined, new Set(['--overwrite']));
+	const sub = args[1];
 	if (sub === 'trigger') {
 		// On-demand encrypted database backup to the configured backupPath.
 		return outputResult(await httpRequest('POST', '/backup/trigger'));
@@ -3114,14 +3115,21 @@ async function handleBackup(): Promise<void> {
 			result: { written: true, path: destPath, channelCount }
 		});
 	}
-	// `beignet backup <destPath>`: legacy full-database copy.
-	if (!sub) {
+	const channelFrame = sub === 'asset-channel';
+	const destPath = channelFrame ? args[3] : sub;
+	const overwrite = hasFlag('--overwrite');
+	if (
+		!destPath ||
+		(channelFrame &&
+			(args.length !== 4 || !/^[0-9a-f]{64}$/.test(args[2]) || overwrite))
+	) {
 		output({
 			ok: false,
 			error: {
 				code: 'INVALID_PARAMS',
-				message:
-					'Usage: beignet backup <destPath> [--overwrite] | beignet backup scb [destPath] | beignet backup trigger'
+				message: channelFrame
+					? 'Usage: beignet backup asset-channel <channelId> <newFile>'
+					: 'Usage: beignet backup <destPath> [--overwrite] | beignet backup asset-channel <channelId> <newFile> | beignet backup scb [destPath] | beignet backup trigger'
 			}
 		});
 		process.exitCode = 1;
@@ -3130,8 +3138,9 @@ async function handleBackup(): Promise<void> {
 	return outputResult(
 		await httpRequest('POST', '/backup', {
 			// The daemon would resolve a relative path against its own cwd.
-			destPath: nodePath.resolve(sub),
-			...(hasFlag('--overwrite') ? { overwrite: true } : {})
+			destPath: nodePath.resolve(destPath),
+			...(channelFrame ? { channelId: args[2] } : {}),
+			...(overwrite ? { overwrite: true } : {})
 		})
 	);
 }
@@ -3536,6 +3545,8 @@ On-chain:
   backup <destPath> [--overwrite]        Create database backup, MAC in
                                          <destPath>.hmac (--overwrite to
                                          replace existing files)
+  backup asset-channel <channelId> <newFile>
+                                         Export an encrypted regtest channel frame
   backup trigger                         Run the configured scheduled backup now
   backup scb [destPath]                  Export encrypted static channel backup
   backup peer-retrieved                  Show newest SCB returned by a peer

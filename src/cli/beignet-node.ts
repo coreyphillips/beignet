@@ -81,6 +81,7 @@ import type { OnchainSweepInfo, OnchainSweepRequest } from './onchain-sweep';
 import { OnchainSweeps } from './onchain-sweep';
 import { ensurePrivateDir, writeFileAtomic } from './fs-utils';
 import { dbRestoreMarkerPath, holdDbRestoredChannels } from './restore';
+import { writeAssetChannelFrame } from './asset-channel-frame';
 import { deriveBackupMacKey, writeBackupMac } from './backup-mac';
 import { generateFinalDaemonWallet } from '../lightning/storage/final-wallet-generation';
 import { bindFinalDaemonView } from '../lightning/storage/final-daemon-admission';
@@ -18122,6 +18123,24 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	}
 
 	// ─────────────── Database Backup ───────────────
+
+	/** Export an authenticated channel checkpoint for offline repair on this wallet's original device. */
+	async backupAssetChannelFrame(
+		channelId: string,
+		destPath: string
+	): Promise<void> {
+		const sqlite = this.sqlite();
+		if (!sqlite?.canRecoverAssetSplice)
+			throw new BeignetError(
+				'INVALID_PARAMS',
+				'Asset channel recovery frames require the enrolled original wallet'
+			);
+		writeAssetChannelFrame(
+			destPath,
+			deriveBackupMacKey(this.walletSeed()),
+			() => sqlite.createAssetChannelRecoveryFrame(channelId)
+		);
+	}
 
 	/** Back up the database to `destPath`, with its MAC in backupMacPath(destPath). */
 	async backup(destPath: string): Promise<void> {

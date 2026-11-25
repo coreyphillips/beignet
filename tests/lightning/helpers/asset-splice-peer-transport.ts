@@ -46,9 +46,10 @@ export function setupAssetSplicePeerTransport(
 		channelId: string,
 		txid: string,
 		index: number
-	) => boolean
+	) => boolean,
+	generation: 4 | 5 = 4
 ): SpliceTransportPair {
-	const { f, s, hosts } = signatureRoundFixture(dir, true);
+	const { f, s, hosts } = signatureRoundFixture(dir, true, generation);
 	const { layout } = s;
 	const ready = f.devices.map((d) =>
 		d.store.finalOpeningChannelReady(f.id, d.party.root)

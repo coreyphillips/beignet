@@ -8312,6 +8312,14 @@ property recovery.IGuardianTransportHint.url: string
 interface recovery.IGuardianVerbOutcome
 property recovery.IGuardianVerbOutcome.body: Buffer
 property recovery.IGuardianVerbOutcome.status: recovery.GuardianStatus
+interface recovery.IOriginalDeviceAssetChannel
+property recovery.IOriginalDeviceAssetChannel.channelId: string
+property recovery.IOriginalDeviceAssetChannel.channelIndex: number
+property recovery.IOriginalDeviceAssetChannel.fundingOutpoint: string
+property recovery.IOriginalDeviceAssetChannel.openingNonces: string
+property recovery.IOriginalDeviceAssetChannel.openingRecord: string
+property recovery.IOriginalDeviceAssetChannel.spliceHash: string
+property recovery.IOriginalDeviceAssetChannel.spliceSequence: number
 interface recovery.IParsedGuardian
 property recovery.IParsedGuardian.auth?: recovery.GuardianAuth
 property recovery.IParsedGuardian.guardianId: Buffer
@@ -8492,12 +8500,13 @@ interface recovery.RecoveryFrame
 property recovery.RecoveryFrame.durability?: recovery.RecoveryDurability
 property recovery.RecoveryFrame.durabilityPolicy?: number
 property recovery.RecoveryFrame.mutations: recovery.RecoveryMutation[]
+property recovery.RecoveryFrame.originalDeviceChannel?: recovery.IOriginalDeviceAssetChannel
 property recovery.RecoveryFrame.outboundMessages: recovery.RecoveryOutboundMessage[]
 property recovery.RecoveryFrame.previousFrameHash: Buffer
 property recovery.RecoveryFrame.sequence: bigint
 property recovery.RecoveryFrame.snapshot?: recovery.RecoverySnapshot
 property recovery.RecoveryFrame.timestamp: number
-property recovery.RecoveryFrame.version: 1 | 2 | 3 | 4 | 5
+property recovery.RecoveryFrame.version: 1 | 2 | 3 | 4 | 5 | 6
 property recovery.RecoveryFrame.writerEpoch: bigint
 class recovery.RecoveryJournal implements recovery.IRecoveryJournalSink
 constructor recovery.RecoveryJournal(storage: storage.IStorageBackend, masterKey: Buffer, nodeId: Buffer, recoveryId: Buffer, options?: recovery.IRecoveryJournalOptions)
@@ -8627,7 +8636,7 @@ function recovery.countReceiptQuorum(results: Array<recovery.IGuardianFanOutResu
 function recovery.createGuardianRequestListener(options: recovery.IGuardianHttpOptions): (request: http#IncomingMessage, response: http#ServerResponse) => void
 function recovery.decodeAcquireEpochRequest(buf: Buffer): recovery.IGuardianAcquireEpochRequest
 function recovery.decodeAcquireEpochResponse(buf: Buffer): recovery.IGuardianAcquireEpochResponse
-function recovery.decodeFrame(plaintext: Buffer): recovery.RecoveryFrame
+function recovery.decodeFrame(plaintext: Buffer, options?: { originalDevice: true; }): recovery.RecoveryFrame
 function recovery.decodeGetHeadRequest(buf: Buffer): recovery.IGuardianGetHeadRequest
 function recovery.decodeGetHeadResponse(buf: Buffer): recovery.IGuardianGetHeadResponse
 function recovery.decodeGetStateRequest(buf: Buffer): recovery.IGuardianGetStateRequest

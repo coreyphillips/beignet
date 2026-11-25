@@ -52,14 +52,12 @@ function device(dir: string, name: string, generation: 4 | 5) {
 		generation === 4,
 		generation === 5
 	);
-	const party = boundParticipant(
-		bip32RootFromSeed(mnemonicToSeedSync(fresh.mnemonic)),
-		1,
-		fresh.binding
-	);
+	const seed = mnemonicToSeedSync(fresh.mnemonic);
+	const party = boundParticipant(bip32RootFromSeed(seed), 1, fresh.binding);
 	const file = path.join(dir, name);
 	return {
 		party,
+		seed,
 		file,
 		store: SqliteStorage.createFinalWallet(file, fresh.binding)
 	};

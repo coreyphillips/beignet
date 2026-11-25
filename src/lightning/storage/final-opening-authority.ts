@@ -364,11 +364,20 @@ export class FinalOpeningAuthority {
 			throw new Error('Final wallet lacks fresh daemon enrollment');
 	}
 
-	/** Match the replay-only snapshot and its funded opening to existing claims without creating a signing reservation. */
-	verifyAssetOpeningBackup(
+	/** Match a replay-only SQLite backup to its original wallet. */
+	verifyAssetBackupLineage(
 		source: Database.Database,
 		key: Buffer,
-		identity: string,
+		identity: string
+	): void {
+		this.assertDaemonEnrollment();
+		const origin = getOrigin(source, key, identity);
+		if (origin.files || origin.lineage !== sha256(this.secret).toString('hex'))
+			throw new Error('Expected a replay-only backup from this wallet lineage');
+	}
+
+	/** Verify the enrolled opening against existing device claims without reserving a signing operation. */
+	verifyAssetOpeningClaims(
 		id: string,
 		outpoint: string,
 		candidate: string,
@@ -376,9 +385,6 @@ export class FinalOpeningAuthority {
 		exit: string
 	): void {
 		this.assertDaemonEnrollment();
-		const origin = getOrigin(source, key, identity);
-		if (origin.files || origin.lineage !== sha256(this.secret).toString('hex'))
-			throw new Error('Expected a replay-only backup from this wallet lineage');
 		const candidateHash = sha256(Buffer.from(candidate)).toString('hex');
 		const claims = [
 			['channel/' + id, candidateHash],

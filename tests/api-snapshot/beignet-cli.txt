@@ -288,6 +288,7 @@ method BeignetNode.addPrimary(opts: { pubkey: string; host?: string; port?: numb
 method BeignetNode.addTrustedPeer(pubkey: string): TrustedPeerInfo
 method BeignetNode.addWatchtower(uri: string): void
 method BeignetNode.backup(destPath: string): Promise<void>
+method BeignetNode.backupAssetChannelFrame(channelId: string, destPath: string): Promise<void>
 method BeignetNode.boostOnchain(txid: TxidHex, satsPerVbyte?: number): Promise<BoostResult>
 method BeignetNode.bootstrapPeers(): Promise<BootstrapPeerInfo[]>
 method BeignetNode.buildPsbt(outputs: Array<{ address: string; amountSats: number; }>, satsPerVbyte?: number): Promise<PsbtBuildInfo>
