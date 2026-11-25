@@ -106,6 +106,34 @@ type Begin = {
 	locktime: number;
 	depth: number;
 };
+type ParentBinding = Pick<Begin, 'parent' | 'root' | 'state' | 'priorDigest'>;
+type FundingParent = ParentBinding & {
+	txid: string;
+	opening: boolean;
+	htlcDeadline: HtlcDeadline | null;
+};
+type InboundStfu = {
+	peer: string;
+	parent: ParentBinding;
+	txid: string;
+	htlcDeadline: HtlcDeadline | null;
+	deadline: number;
+	timer: ReturnType<typeof setTimeout>;
+	retry?: { current: () => boolean };
+	abortingCrossed?: { index: number; proposalHash?: Buffer };
+};
+function sameParent(a: ParentBinding, b: ParentBinding): boolean {
+	return (
+		a.parent.fundingTxHex === b.parent.fundingTxHex &&
+		a.parent.fundingOutputIndex === b.parent.fundingOutputIndex &&
+		a.parent.localFundingPubkey === b.parent.localFundingPubkey &&
+		a.parent.remoteFundingPubkey === b.parent.remoteFundingPubkey &&
+		a.parent.localFundingKeyIndex === b.parent.localFundingKeyIndex &&
+		a.root === b.root &&
+		a.state === b.state &&
+		a.priorDigest === b.priorDigest
+	);
+}
 type Field =
 	| 'expired'
 	| 'peer-stfu'
@@ -172,6 +200,7 @@ function attemptId(id: string, b: Begin, key: Buffer) {
 /** Each channel advances on one queue. The original device records public key allocation, both offers and exact wires before use. */
 export class AssetSpliceTransport {
 	private live = new Map<string, Live>();
+	private inbound = new Map<string, InboundStfu>();
 	private queues = new Map<string, Promise<void>>();
 	private pendingFrames = new Map<string, number>();
 	private epochs = new Map<string, number>();
@@ -243,7 +272,7 @@ export class AssetSpliceTransport {
 			hex: bytes.toString('hex')
 		} satisfies Record);
 	}
-	private selected(id: string) {
+	private parentBinding(id: string): FundingParent | undefined {
 		const opening = this.store.loadFinalDaemonOpening(id);
 		if (
 			!opening?.readyExchanged ||
@@ -263,7 +292,7 @@ export class AssetSpliceTransport {
 		};
 		if (!parent) return;
 		const tx = Transaction.fromHex(parent.fundingTxHex);
-		if (!this.available(id, tx.getId(), !adopted)) return;
+		const txid = tx.getId();
 		const updates = this.store.assetSpliceUpdateHead(id);
 		if (updates.inProgress) return;
 		const secured = updates.committed;
@@ -271,22 +300,28 @@ export class AssetSpliceTransport {
 			secured &&
 			!assetUpdateFundingMembers(this.store, id, secured).some(
 				(m) =>
-					m.fundingTxid === tx.getId() &&
-					m.outputIndex === parent.fundingOutputIndex
+					m.fundingTxid === txid && m.outputIndex === parent.fundingOutputIndex
 			)
 		)
 			return;
 
 		return {
 			parent,
+			txid,
+			opening: !adopted,
 			root:
 				adopted?.candidate.fundingRoot ??
 				opening.session.assetEvidence.fundingRoot,
 			state: secured?.height ?? adopted?.stateNumber ?? '0',
 			htlcDeadline: this.htlcDeadline(secured?.htlcs ?? []),
-			...(secured && { priorDigest: secured.digest }),
-			depth: adopted?.minimumDepth ?? opening.candidate.minimumDepth
+			...(secured && { priorDigest: secured.digest })
 		};
+	}
+	private selected(id: string): FundingParent | undefined {
+		const parent = this.parentBinding(id);
+		return parent && this.available(id, parent.txid, parent.opening)
+			? parent
+			: undefined;
 	}
 	private pending(id: string): Begin | undefined {
 		const existing = this.live.get(id);
@@ -357,7 +392,7 @@ export class AssetSpliceTransport {
 		const expiry = Math.min(...htlcs.map((h) => h.cltvExpiry));
 		return { expiry, claimHeight: expiry - this.claimMargin };
 	}
-	private atMargin(b: Begin, height: number): boolean {
+	private atMargin(b: Pick<Begin, 'htlcDeadline'>, height: number): boolean {
 		return (
 			!!b.htlcDeadline &&
 			height >=
@@ -420,6 +455,9 @@ export class AssetSpliceTransport {
 			INBOUND_HTLC_CLAIM_FORCE_CLOSE_BUFFER,
 			claimMargin
 		);
+		for (const [id, request] of this.inbound) {
+			if (this.atMargin(request, height)) this.dropInbound(id, request, true);
+		}
 		for (const { channelId: id } of this.store.loadFinalOpenings()) {
 			try {
 				if (
@@ -447,16 +485,38 @@ export class AssetSpliceTransport {
 			}
 		}
 	}
+	private checkCapacity(): void {
+		const active = this.store
+			.loadFinalOpenings()
+			.filter(
+				(c) =>
+					this.store.loadFinalOpeningSession(c.channelId)?.assetEvidence &&
+					!!this.pending(c.channelId)
+			);
+		if (active.length + this.inbound.size >= MAX_NEGOTIATING_CHANNELS)
+			throw Error('Too many unfinished asset splice attempts');
+	}
+	private proposalDeadline(htlc: HtlcDeadline | null): number {
+		return (
+			Date.now() +
+			(htlc
+				? Math.min(
+						HTLC_QUIESCENCE_MS,
+						this.watchdog?.timeoutMs ?? HTLC_QUIESCENCE_MS
+				  )
+				: PROPOSAL_LIFETIME_MS)
+		);
+	}
 	private startRecord(
 		id: string,
 		initiator: boolean,
 		fee: number,
 		depth: number,
-		firstDeadline?: number
+		firstDeadline?: number,
+		parent = this.parentBinding(id)
 	): Begin {
 		this.store.assertAssetSpliceCanStart(id);
-		const parent = this.selected(id);
-		if (!parent)
+		if (!parent || !this.available(id, parent.txid, parent.opening))
 			throw Error(
 				'Asset splice requires an active, confirmed original wallet funding output'
 			);
@@ -473,27 +533,11 @@ export class AssetSpliceTransport {
 				'Asset splice requires every pending HTLC to be outside its claim margin'
 			);
 		}
-		const active = this.store
-			.loadFinalOpenings()
-			.filter(
-				(c) =>
-					this.store.loadFinalOpeningSession(c.channelId)?.assetEvidence &&
-					!!this.pending(c.channelId)
-			);
-		if (active.length >= MAX_NEGOTIATING_CHANNELS)
-			throw Error('Too many unfinished asset splice attempts');
+		this.checkCapacity();
 		const index = this.store.allocateFinalChannelKeyIndex(1);
 		const begin: Begin = {
 			kind: 'peer-splice',
-			deadline:
-				firstDeadline ??
-				Date.now() +
-					(parent.htlcDeadline
-						? Math.min(
-								HTLC_QUIESCENCE_MS,
-								this.watchdog?.timeoutMs ?? HTLC_QUIESCENCE_MS
-						  )
-						: PROPOSAL_LIFETIME_MS),
+			deadline: firstDeadline ?? this.proposalDeadline(parent.htlcDeadline),
 			htlcDeadline: parent.htlcDeadline,
 			index,
 			initiator,
@@ -513,7 +557,12 @@ export class AssetSpliceTransport {
 		await this.enqueue(id, async () => {
 			const peer = this.store.loadFinalOpeningSession(id)?.peer;
 			validOptions(options.fundingFeeratePerkw, options.minimumDepth);
-			if (!peer || !this.eligible(peer, id) || this.pending(id))
+			if (
+				!peer ||
+				!this.eligible(peer, id) ||
+				this.pending(id) ||
+				this.inbound.has(id)
+			)
 				throw Error(
 					'Asset splice requires an idle channel and bilateral feature negotiation'
 				);
@@ -556,14 +605,7 @@ export class AssetSpliceTransport {
 					s.waitingForParent = true;
 					return;
 				}
-				if (
-					v.parent.fundingTxHex !== b.parent.fundingTxHex ||
-					v.parent.fundingOutputIndex !== b.parent.fundingOutputIndex ||
-					v.root !== b.root ||
-					v.state !== b.state ||
-					v.priorDigest !== b.priorDigest
-				)
-					return;
+				if (!sameParent(v, b)) return;
 				return {
 					oldOutpoint: {
 						hash: tx.getHash(),
@@ -616,8 +658,122 @@ export class AssetSpliceTransport {
 		return true;
 	}
 
+	// A peer can request quiescence while the original wallet is refreshing its
+	// accepted funding observation. Bind the request to this connection and
+	// allocate the funding key only after both that observation and its state agree.
+	private receiveStfu(id: string, peer: string): void {
+		if (this.inbound.has(id)) return;
+		this.store.assertAssetSpliceCanStart(id);
+		const parent = this.parentBinding(id);
+		if (!parent)
+			throw Error(
+				'Asset splice requires an active, confirmed original wallet funding output'
+			);
+		this.checkCapacity();
+		if (this.atMargin(parent, this.height())) {
+			this.watchdog?.disconnect(peer);
+			throw Error(
+				'Asset splice requires every pending HTLC to be outside its claim margin'
+			);
+		}
+		const request = this.bindInbound(
+			id,
+			peer,
+			parent,
+			this.proposalDeadline(parent.htlcDeadline)
+		);
+		this.retryInbound(id, request, parent.txid, () =>
+			this.available(id, parent.txid, parent.opening)
+		);
+	}
+	private bindInbound(
+		id: string,
+		peer: string,
+		parent: ParentBinding & Pick<Begin, 'htlcDeadline'>,
+		deadline: number
+	): InboundStfu {
+		const request: InboundStfu = {
+			peer,
+			parent,
+			txid: Transaction.fromHex(parent.parent.fundingTxHex).getId(),
+			htlcDeadline: parent.htlcDeadline ?? null,
+			deadline,
+			timer: setTimeout(
+				() => this.dropInbound(id, request, true),
+				Math.max(1, deadline - Date.now())
+			)
+		};
+		request.timer.unref?.();
+		this.inbound.set(id, request);
+		return request;
+	}
+
+	private dropInbound(
+		id: string,
+		request: InboundStfu,
+		disconnect = false
+	): void {
+		if (this.inbound.get(id) !== request) return;
+		clearTimeout(request.timer);
+		this.inbound.delete(id);
+		if (disconnect && this.eligible(request.peer, id))
+			this.watchdog?.disconnect(request.peer);
+	}
+	private retryInbound(
+		id: string,
+		request: InboundStfu,
+		observedTxid: string,
+		current: () => boolean
+	): void {
+		if (request.abortingCrossed || !current()) return;
+		// An observation for another funding can invalidate the bound state but
+		// only an observation for this funding can admit the request.
+		const matches = request.txid === observedTxid;
+		if (request.retry) {
+			if (matches) request.retry.current = current;
+			return;
+		}
+		const retry = { current: matches ? current : () => false };
+		request.retry = retry;
+		void this.enqueue(id, async () => {
+			request.retry = undefined;
+			if (this.inbound.get(id) !== request) return;
+			if (
+				!this.eligible(request.peer, id) ||
+				Date.now() >= request.deadline ||
+				this.atMargin(request, this.height())
+			) {
+				this.dropInbound(id, request, true);
+				return;
+			}
+			const parent = this.parentBinding(id);
+			if (!parent || !sameParent(parent, request.parent) || this.pending(id)) {
+				this.dropInbound(id, request, true);
+				return;
+			}
+			if (!retry.current() || !this.available(id, parent.txid, parent.opening))
+				return;
+			this.dropInbound(id, request);
+			const b = this.startRecord(id, false, 1, 1, request.deadline, parent);
+			this.record(
+				id,
+				b,
+				'peer-stfu',
+				encodeStfuMessage({
+					channelId: Buffer.from(id, 'hex'),
+					initiator: true
+				})
+			);
+			await this.drive(id, this.session(id, b));
+		}).catch((error) => {
+			this.dropInbound(id, request, true);
+			this.report(id, error instanceof Error ? error.message : String(error));
+		});
+	}
 	/** Retry the same connected attempt once its exact parent is available again. */
 	fundingObserved(id: string, txid: string, current: () => boolean): void {
+		const request = this.inbound.get(id);
+		if (request) this.retryInbound(id, request, txid, current);
 		const s = this.live.get(id);
 		if (
 			!s?.ctx ||
@@ -923,17 +1079,63 @@ export class AssetSpliceTransport {
 				);
 		}
 		this.record(id, s.begin, 'retired', Buffer.alloc(0));
-		if (reply)
-			this.send(
-				s.peer,
-				M.TX_ABORT,
-				encodeTxAbortMessage({
-					channelId: Buffer.from(id, 'hex'),
-					data: Buffer.from('Splice abandoned')
-				})
-			);
+		if (reply) this.sendAbort(id, s.peer);
 		if (s.expires) clearTimeout(s.expires);
 		this.live.delete(id);
+	}
+	private sendAbort(id: string, peer: string): void {
+		this.send(
+			peer,
+			M.TX_ABORT,
+			encodeTxAbortMessage({
+				channelId: Buffer.from(id, 'hex'),
+				data: Buffer.from('Splice abandoned')
+			})
+		);
+	}
+	private checkProposal(payload: Buffer): void {
+		const msg = decodeSpliceMessage(payload);
+		validOptions(msg.fundingFeeratePerkw, msg.lockDepth ?? 0);
+		if (
+			!isValidPublicKey(msg.fundingPubkey) ||
+			msg.locktime > this.height() + 1 ||
+			!encodeSpliceMessage(msg).equals(payload) ||
+			msg.requireConfirmedInputs
+		)
+			throw Error('Unsupported asset splice proposal');
+	}
+	private inboundControl(
+		id: string,
+		request: InboundStfu,
+		type: M,
+		raw: Buffer
+	): boolean {
+		try {
+			if (type === M.TX_ABORT) {
+				if (!encodeTxAbortMessage(decodeTxAbortMessage(raw)).equals(raw))
+					throw Error('Malformed asset splice abort');
+				this.dropInbound(id, request);
+				if (!request.abortingCrossed) this.sendAbort(id, request.peer);
+				return true;
+			}
+			// The winning peer may already have sent its proposal. Drain that
+			// canonical frame only while the two unsigned attempts are canceling.
+			if (type !== M.SPLICE || !request.abortingCrossed) return false;
+			if (raw.length > MAX_LIGHTNING_PAYLOAD)
+				throw Error('Malformed canceled asset splice proposal');
+			this.checkProposal(raw);
+			const hash = sha256(raw);
+			if (
+				request.abortingCrossed.proposalHash &&
+				!request.abortingCrossed.proposalHash.equals(hash)
+			)
+				throw Error('Conflicting canceled asset splice proposal');
+			request.abortingCrossed.proposalHash = hash;
+		} catch (error) {
+			this.dropInbound(id, request, true);
+			this.report(id, error instanceof Error ? error.message : String(error));
+		}
+		return true;
 	}
 	handle(peer: string, type: M, raw: Buffer): boolean {
 		if (raw.length < 32) return false;
@@ -973,7 +1175,18 @@ export class AssetSpliceTransport {
 			)
 		)
 			return true;
+		if (!pending && type === M.STFU && raw.length === 33 && raw[32] === 1) {
+			try {
+				this.receiveStfu(id, peer);
+			} catch (error) {
+				this.report(id, error instanceof Error ? error.message : String(error));
+			}
+			return true;
+		}
 		if (type !== M.STFU && !pending) {
+			const request = this.inbound.get(id);
+			if (request?.peer === peer && this.inboundControl(id, request, type, raw))
+				return true;
 			if (type !== M.TX_ABORT) return false;
 			const last = this.store
 				.readAssetSpliceJournal<Record>(id)
@@ -992,10 +1205,8 @@ export class AssetSpliceTransport {
 			if (type === M.STFU) {
 				if (payload.length !== 33 || payload[32] > 1)
 					throw Error('Malformed asset splice quiescence');
-				if (!b) {
-					if (!payload[32]) return;
-					b = this.startRecord(id, false, 1, 1);
-				}
+				// A queued reply for an earlier negotiation cannot initiate another one.
+				if (!b || b.index !== pending?.index) return;
 				const s = this.session(id, b);
 				if (this.ended(s)) {
 					this.expire(id, s, this.height());
@@ -1007,29 +1218,55 @@ export class AssetSpliceTransport {
 					!this.saved(id, b, 'peer-stfu') &&
 					!this.store.loadFinalOpening(id)!.isInitiator
 				) {
+					const epoch = this.epochs.get(id);
 					await this.retire(id, s, false);
-					b = this.startRecord(id, false, 1, 1, b.deadline);
+					if (!this.eligible(peer, id) || this.epochs.get(id) !== epoch) return;
+					const original = b;
+					try {
+						const parent = this.selected(id);
+						if (
+							!parent ||
+							!sameParent(original, parent) ||
+							Date.now() >= original.deadline
+						)
+							throw Error('Crossed asset splice lost its selected funding');
+						b = this.startRecord(id, false, 1, 1, original.deadline, parent);
+					} catch (error) {
+						this.bindInbound(
+							id,
+							peer,
+							original,
+							original.deadline
+						).abortingCrossed = { index: original.index };
+						this.sendAbort(id, peer);
+						this.report(
+							id,
+							error instanceof Error ? error.message : String(error)
+						);
+						return;
+					}
 					// Both quiescence messages on a simultaneous attempt carry the initiator flag.
 					this.session(id, b).sent.add('stfu');
 				} else if (!b.initiator && payload[32] !== 1)
 					throw Error('Unexpected asset splice quiescence response');
 				this.record(id, b, 'peer-stfu', payload);
 			}
-			if (!b) return;
+			if (!b) {
+				const request = this.inbound.get(id);
+				if (
+					pending &&
+					request?.abortingCrossed?.index === pending.index &&
+					request.peer === peer
+				)
+					this.inboundControl(id, request, type, payload);
+				return;
+			}
 			const s = this.session(id, b);
 			switch (type) {
 				case M.SPLICE: {
 					if (b.initiator || !this.saved(id, b, 'peer-stfu'))
 						throw Error('Unsolicited splice proposal');
-					const msg = decodeSpliceMessage(payload);
-					validOptions(msg.fundingFeeratePerkw, msg.lockDepth ?? 0);
-					if (
-						!isValidPublicKey(msg.fundingPubkey) ||
-						msg.locktime > this.height() + 1 ||
-						!encodeSpliceMessage(msg).equals(payload) ||
-						msg.requireConfirmedInputs
-					)
-						throw Error('Unsupported asset splice proposal');
+					this.checkProposal(payload);
 					this.record(id, b, 'init', payload);
 					break;
 				}
@@ -1167,10 +1404,13 @@ export class AssetSpliceTransport {
 	}
 	destroy() {
 		this.restoring.clear();
+		for (const [id, request] of this.inbound) this.dropInbound(id, request);
 		for (const s of this.live.values()) this.disconnected(s.peer);
 	}
 
 	disconnected(peer: string) {
+		for (const [id, request] of this.inbound)
+			if (request.peer === peer) this.dropInbound(id, request);
 		for (const [key, route] of this.restoring)
 			if (route.peer === peer) this.restoring.delete(key);
 		for (const [id, s] of this.live)
