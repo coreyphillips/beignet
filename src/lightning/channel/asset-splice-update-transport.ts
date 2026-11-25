@@ -18,7 +18,10 @@ import {
 	encodeCustomMessage
 } from '../message/custom';
 import { MessageType as M } from '../message/types';
-import type { AssetSpliceUpdateBatch } from './asset-splice-update-batch';
+import {
+	AssetUpdateFundingUnavailable,
+	type AssetSpliceUpdateBatch
+} from './asset-splice-update-batch';
 import type { IFinalOpeningRuntime } from './final-opening-runtime';
 import {
 	decodeAssetUpdateIntent,
@@ -49,6 +52,10 @@ type Session = {
 	chunks: Map<Phase, AssetOpenObjectReceiver>;
 	peerFrames: Buffer[];
 	sentBatch?: Buffer[];
+	awaitingAdmission?: boolean;
+	peerRevocation?: Buffer;
+	waitingForFunding?: boolean;
+	fundingRetry?: { current: () => boolean };
 	retained: boolean;
 	completed: boolean;
 };
@@ -202,12 +209,16 @@ export class AssetSpliceUpdateTransport {
 		};
 		const changes = decodeAssetUpdateIntent(id, p.originalInitiator, bytes);
 		checkAuthor(changes, origin, p.originalInitiator);
+		let session: Session | null = null;
 		const batch = this.runtime.storage.assetSpliceUpdateBatch(
 			id,
 			this.runtime.root,
 			height,
 			changes,
-			() => this.currentHeight(id)
+			() =>
+				!session || this.sessions.get(id) === session
+					? this.currentHeight(id)
+					: undefined
 		);
 		if (existing?.attempt !== digest) {
 			// Crossed unsigned requests are sequenced by the original channel opener. Published offers can only replay.
@@ -222,12 +233,9 @@ export class AssetSpliceUpdateTransport {
 				e
 			);
 		}
-		const session = this.session(
-			id,
-			p,
-			existing?.attempt === digest ? existing : e
-		);
+		session = this.session(id, p, existing?.attempt === digest ? existing : e);
 		session.batch ??= batch;
+		session.awaitingAdmission = false;
 		return session;
 	}
 	private emit(s: Session, k: string, type: number, wire: Buffer) {
@@ -303,13 +311,79 @@ export class AssetSpliceUpdateTransport {
 		for (const [i, wire] of wires.entries())
 			this.emit(s, 'commit/' + i, M.COMMITMENT_SIGNED, wire);
 	}
-	private async drive(s: Session, p: Params) {
+	/** A current chain observation can wake an admitted round without another peer frame. */
+	fundingObserved(id: string, current: () => boolean): void {
+		const s = this.sessions.get(id);
 		if (
-			this.sessions.get(s.id) !== s ||
-			!this.channel(s.id) ||
-			!this.currentHeight(s.id)
+			!s ||
+			s.completed ||
+			(!s.waitingForFunding && !this.queues.has(id)) ||
+			!current()
 		)
 			return;
+		if (s.fundingRetry) {
+			s.fundingRetry.current = current;
+			return;
+		}
+		const retry = { current };
+		s.fundingRetry = retry;
+		void this.run(id, async () => {
+			s.fundingRetry = undefined;
+			const p = this.channel(id);
+			if (s.waitingForFunding && p?.peer === s.peer && retry.current())
+				await this.drive(s, p);
+		}).catch((error) => {
+			if (s.fundingRetry === retry) s.fundingRetry = undefined;
+			this.report(id, String(error));
+		});
+	}
+	private async drive(s: Session, p: Params): Promise<void> {
+		if (
+			this.sessions.get(s.id) !== s ||
+			s.completed ||
+			this.channel(s.id)?.peer !== s.peer
+		)
+			return;
+		s.waitingForFunding = !this.currentHeight(s.id);
+		if (s.waitingForFunding) return;
+		try {
+			if (s.awaitingAdmission) {
+				const height = BigInt(s.entry.height);
+				const head = this.head(s.id);
+				if (
+					height !== head.nextNumber &&
+					height !== head.inProgress?.stateNumber
+				)
+					throw Error('Invalid deferred asset update height');
+				this.remember(
+					s.id,
+					p,
+					height,
+					false,
+					Buffer.from(s.entry.bytes, 'hex')
+				);
+			}
+			if (!s.retained) await this.advance(s, p);
+			const batch = s.batch;
+			if (!batch || !s.retained || this.sessions.get(s.id) !== s) return;
+			this.emit(s, 'revocation', M.REVOKE_AND_ACK, batch.revocation());
+			if (s.peerRevocation) {
+				try {
+					batch.receiveRevocation(s.peerRevocation);
+				} catch (error) {
+					if (!(error instanceof AssetUpdateFundingUnavailable))
+						s.peerRevocation = undefined;
+					throw error;
+				}
+				s.completed = true;
+				await this.settled(s.id);
+			}
+		} catch (error) {
+			if (!(error instanceof AssetUpdateFundingUnavailable)) throw error;
+			s.waitingForFunding = true;
+		}
+	}
+	private async advance(s: Session, p: Params): Promise<void> {
 		if (s.entry.origin)
 			this.object(s, 'layout', Buffer.from(s.entry.bytes, 'hex'));
 		else this.object(s, 'layout_ack', Buffer.from(s.entry.attempt, 'hex'));
@@ -352,18 +426,14 @@ export class AssetSpliceUpdateTransport {
 			s.sentBatch = b.commitments();
 		}
 		this.sendCommitments(s, s.sentBatch);
-		if (!s.retained) {
-			if (s.peerFrames.length !== s.sentBatch.length) return;
-			try {
-				await b.acceptCommitments(this.host, s.peerFrames);
-			} catch (e) {
-				s.peerFrames = [];
-				throw e;
-			}
-			s.retained = true;
+		if (s.peerFrames.length !== s.sentBatch.length) return;
+		try {
+			await b.acceptCommitments(this.host, s.peerFrames);
+		} catch (error) {
+			if (!(error instanceof AssetUpdateFundingUnavailable)) s.peerFrames = [];
+			throw error;
 		}
-		if (this.sessions.get(s.id) === s)
-			this.emit(s, 'revocation', M.REVOKE_AND_ACK, b.revocation());
+		s.retained = true;
 	}
 	private replaySettled(id: string, p: Params, height: bigint, digest: Buffer) {
 		const head = this.head(id);
@@ -478,7 +548,25 @@ export class AssetSpliceUpdateTransport {
 					intent
 				);
 				checkAuthor(decoded, false, p.originalInitiator);
-				s = this.remember(id, p, height, false, Buffer.from(intent));
+				try {
+					s = this.remember(id, p, height, false, Buffer.from(intent));
+				} catch (error) {
+					if (!(error instanceof AssetUpdateFundingUnavailable)) throw error;
+					if (s && !s.completed && s.entry.attempt !== identity)
+						throw Error('Overlapping asset update intents');
+					// Keep at most one authenticated layout in memory. Recheck its
+					// height and complete wallet admission before writing or replying.
+					s = this.session(id, p, {
+						kind: 'asset-update-peer',
+						height: String(height),
+						attempt: identity,
+						origin: false,
+						bytes: intent.toString('hex')
+					});
+					s.awaitingAdmission = true;
+					s.waitingForFunding = true;
+					return;
+				}
 			}
 			if (
 				!s ||
@@ -486,6 +574,8 @@ export class AssetSpliceUpdateTransport {
 				s.entry.attempt !== f.attempt.toString('hex')
 			)
 				return;
+			if (s.awaitingAdmission && f.phase !== 'layout')
+				throw Error('Asset update is awaiting verified funding admission');
 			if (f.phase === 'layout_ack') {
 				if (!s.entry.origin || !f.digest.equals(f.attempt))
 					throw Error('Unmatched asset update acknowledgement');
@@ -603,13 +693,21 @@ export class AssetSpliceUpdateTransport {
 		void this.run(id, async () => {
 			if (this.sessions.get(id) !== s || !s.batch) return;
 			if (type === M.REVOKE_AND_ACK) {
-				if (!s.retained)
+				if (
+					!s.retained &&
+					!(
+						s.waitingForFunding &&
+						s.sentBatch &&
+						s.peerFrames.length === s.sentBatch.length
+					)
+				)
 					throw Error(
 						'Asset update revocation preceded the complete peer batch'
 					);
-				s.batch.receiveRevocation(msg);
-				s.completed = true;
-				await this.settled(id);
+				if (s.peerRevocation && !s.peerRevocation.equals(msg))
+					throw Error('Conflicting asset update revocation replay');
+				s.peerRevocation = msg;
+				await this.drive(s, p);
 				return;
 			}
 			if (!s.completed)

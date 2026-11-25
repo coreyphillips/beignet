@@ -138,6 +138,13 @@ function unpackHolder(s: Stored): IAssetUpdateHolderEvidence {
 	};
 }
 
+/** The accepted funding sample expired while an otherwise current update was running. */
+export class AssetUpdateFundingUnavailable extends Error {
+	constructor() {
+		super('Asset update requires live accepted funding');
+	}
+}
+
 export class AssetSpliceUpdateBatch {
 	private readonly opening;
 	private readonly limits;
@@ -288,8 +295,9 @@ export class AssetSpliceUpdateBatch {
 	}
 	private block() {
 		const h = this.currentHeight();
-		if (h === undefined || !Number.isSafeInteger(h) || h < 0)
-			throw new Error('Asset update requires live accepted funding');
+		if (h === undefined) throw new AssetUpdateFundingUnavailable();
+		if (!Number.isSafeInteger(h) || h < 0)
+			throw new Error('Invalid asset update chain height');
 		return h;
 	}
 	private fresh() {
