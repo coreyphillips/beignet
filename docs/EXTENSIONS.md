@@ -380,6 +380,14 @@ A refused forward offers and links nothing: its incoming HTLC fails back with `t
 
 A node is taken back to a build without this part only with no forward with an asset leg in flight and no end of one its host has not taken: its host stops answering `prepareForward` and it waits until `getAuxiliaryChannelInfo` reports no `forwardsInFlight` and no `undeliveredForwardLegEnds` on any asset channel. A daemon does both with a drained stop (`POST /stop` with `drain`), given a `drainTimeoutMs` long enough for the forwards in flight to end. Such a build keeps none of the ends the host has not taken yet.
 
+## How a wallet learns which assets its primary offers
+
+Asset channels stay private from opening through every splice. The engine never announces either funding output. The BOLT 7 `channel_announcement` verifies a 2-of-2 P2WSH output. An asset channel uses a Taproot output, and its value in satoshis does not tell a payer how many units of an asset can cross it. [BOLT 7 channel announcements](https://github.com/lightning/bolts/blob/master/07-routing-gossip.md#the-channel_announcement-message)
+
+For discovery, the host should send its connected wallets the asset IDs its node offers. This list is planned host work. A wallet uses it to choose an asset and request a quote. Payers can reach the primary over its ordinary announced Bitcoin channels, then use the quote's invoice route hint for the private leg. The list exposes no channel IDs, funding outpoints or balances. [What an asset invoice advertises](#what-an-asset-invoice-advertises)
+
+Public asset routing would require a separate decision and a gossip format that can verify Taproot funding. This discovery decision adds no engine wire message or stored state and has no effect on downgrade.
+
 ## What an asset invoice advertises
 
 The node runs this part from the build whose `AUXILIARY_CHANNELS_API.surfaces` names `createInvoice:assetInvoice`, and a host passes the field to such a build.
