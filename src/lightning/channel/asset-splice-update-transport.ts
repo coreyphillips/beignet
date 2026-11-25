@@ -9,6 +9,7 @@ import {
 	ASSET_OPEN_OBJECT_LIMIT,
 	ASSET_OPEN_CHUNK_SIZE,
 	AssetOpenObjectReceiver,
+	type IAssetOpenFrame,
 	decodeAssetOpenFrame,
 	encodeAssetOpenFrame
 } from '../message/asset-open';
@@ -118,7 +119,12 @@ export class AssetSpliceUpdateTransport {
 	private sessions = new Map<string, Session>();
 	private intents = new Map<
 		string,
-		{ height: bigint; attempt: string; receiver: AssetOpenObjectReceiver }
+		{
+			peer: string;
+			height: bigint;
+			attempt: string;
+			receiver: AssetOpenObjectReceiver;
+		}
 	>();
 	private early = new Map<
 		string,
@@ -128,6 +134,7 @@ export class AssetSpliceUpdateTransport {
 		string,
 		{ id: string; size: number; parts: Buffer[] }
 	>();
+	private connections = new Map<string, symbol>();
 	private queues = new Map<string, { tail: Promise<void>; pending: number }>();
 	constructor(
 		private readonly runtime: IFinalOpeningRuntime,
@@ -140,6 +147,15 @@ export class AssetSpliceUpdateTransport {
 		private readonly knownPeer: (id: string, peer: string) => boolean = () =>
 			false
 	) {}
+	private connectionCurrent(id: string, peer: string): () => boolean {
+		let token = this.connections.get(peer);
+		if (!token) {
+			token = Symbol();
+			this.connections.set(peer, token);
+		}
+		return () =>
+			this.connections.get(peer) === token && this.channel(id)?.peer === peer;
+	}
 	private run(id: string, action: () => Promise<void>) {
 		const q = this.queues.get(id) ?? { tail: Promise.resolve(), pending: 0 };
 		if (q.pending >= 160)
@@ -289,7 +305,10 @@ export class AssetSpliceUpdateTransport {
 			throw Error('Asset update is waiting for verified live funding');
 		checkAuthor(changes, true, p.originalInitiator);
 		const raw = encodeAssetUpdateIntent(id, p.originalInitiator, changes);
+		const current = this.connectionCurrent(id, p.peer);
 		await this.run(id, async () => {
+			if (!current())
+				throw Error('Asset update channel disconnected before admission');
 			const h = this.head(id);
 			if (h.inProgress)
 				throw Error('Another asset update is awaiting settlement');
@@ -435,7 +454,13 @@ export class AssetSpliceUpdateTransport {
 		}
 		s.retained = true;
 	}
-	private replaySettled(id: string, p: Params, height: bigint, digest: Buffer) {
+	private replaySettled(
+		id: string,
+		p: Params,
+		height: bigint,
+		frame: IAssetOpenFrame
+	): boolean {
+		const digest = frame.attempt;
 		const head = this.head(id);
 		if (head.inProgress || head.nextNumber !== height + 1n) return false;
 		const entry = this.remembered(id, height);
@@ -445,6 +470,35 @@ export class AssetSpliceUpdateTransport {
 		const stage = (name: string) => history.stages.get(height + '/' + name);
 		const revoke = stage('local-revoke');
 		if (!state || !revoke || !stage('peer-revoke')) return false;
+		const live = this.sessions.get(id);
+		if (live && BigInt(live.entry.height) > height) {
+			// A completed peer proof can be delayed past our next layout. Only a
+			// replay of the preceding negotiation can signal a missing revocation.
+			const layout = Buffer.from(entry.bytes, 'hex');
+			const request = entry.origin
+				? frame.phase === 'layout_ack' && frame.digest.equals(digest)
+				: frame.phase === 'layout' &&
+				  frame.total === layout.length &&
+				  frame.digest.equals(sha256(layout)) &&
+				  frame.bytes.equals(
+						layout.subarray(frame.offset, frame.offset + frame.bytes.length)
+				  );
+			if (request && !live.sent.has('previous-revocation')) {
+				this.emit(
+					live,
+					'previous-revocation',
+					M.REVOKE_AND_ACK,
+					Buffer.from(revoke, 'hex')
+				);
+				if (live.entry.origin && !live.ack) {
+					for (const key of live.sent)
+						if (key === 'layout' || key.startsWith('layout/'))
+							live.sent.delete(key);
+					this.object(live, 'layout', Buffer.from(live.entry.bytes, 'hex'));
+				}
+			}
+			return true;
+		}
 		const s = this.session(id, p, entry);
 		if (s.sent.has('history')) return true;
 		if (entry.origin) this.object(s, 'layout', Buffer.from(entry.bytes, 'hex'));
@@ -494,10 +548,11 @@ export class AssetSpliceUpdateTransport {
 			return;
 		}
 		const height = raw.readBigUInt64BE(32),
-			f = decodeAssetOpenFrame(raw.subarray(40));
+			f = decodeAssetOpenFrame(raw.subarray(40)),
+			current = this.connectionCurrent(id, peer);
 		void this.run(id, async () => {
-			if (this.channel(id)?.peer !== peer) return;
-			if (this.replaySettled(id, p, height, f.attempt)) return;
+			if (!current()) return;
+			if (this.replaySettled(id, p, height, f)) return;
 			if (
 				f.phase !== 'layout' &&
 				f.phase !== 'layout_ack' &&
@@ -514,6 +569,7 @@ export class AssetSpliceUpdateTransport {
 				let assembled = this.intents.get(id);
 				if (!assembled) {
 					assembled = {
+						peer,
 						height,
 						attempt: identity,
 						receiver: new AssetOpenObjectReceiver(f.attempt, 'layout', 65533)
@@ -540,6 +596,16 @@ export class AssetSpliceUpdateTransport {
 					height !== head.inProgress?.stateNumber
 				) {
 					if (known?.attempt === f.attempt.toString('hex')) return;
+					// A reconnected peer may have received our revocation before we
+					// received theirs. Its next layout follows the missing revoke again.
+					if (
+						head.inProgress &&
+						height === head.nextNumber + 1n &&
+						assetUpdateHistory(this.runtime.storage, id).states.has(
+							head.nextNumber
+						)
+					)
+						return;
 					throw Error('Invalid asset update height');
 				}
 				const decoded = decodeAssetUpdateIntent(
@@ -630,6 +696,20 @@ export class AssetSpliceUpdateTransport {
 				const s = this.sessions.get(id);
 				void this.run(id, async () => {
 					if (!s || this.sessions.get(id) !== s || s.completed) return;
+					const previousHeight = BigInt(s.entry.height) - 1n;
+					const previous =
+						previousHeight > 0n &&
+						assetUpdateHistory(this.runtime.storage, id).states.get(
+							previousHeight
+						)?.peerCommitments;
+					if (
+						previous &&
+						previous.length === active.parts.length &&
+						previous.every(
+							(wire, i) => wire === active.parts[i].toString('hex')
+						)
+					)
+						return;
 					if (!s.batch || active.size !== s.batch.fundingCount)
 						throw Error(
 							'Asset commitment batch does not cover the elected funding set'
@@ -693,6 +773,15 @@ export class AssetSpliceUpdateTransport {
 		void this.run(id, async () => {
 			if (this.sessions.get(id) !== s || !s.batch) return;
 			if (type === M.REVOKE_AND_ACK) {
+				const history = assetUpdateHistory(this.runtime.storage, id);
+				const height = BigInt(s.entry.height);
+				if (
+					history.stages.get(height - 1n + '/peer-revoke') ===
+					msg.toString('hex')
+				)
+					return;
+				// A restarted device can already have secured this exact round.
+				if (history.states.has(height)) s.retained = true;
 				if (
 					!s.retained &&
 					!(
@@ -718,7 +807,10 @@ export class AssetSpliceUpdateTransport {
 		return true;
 	}
 	disconnected(peer: string) {
+		this.connections.delete(peer);
 		this.batches.delete(peer);
+		for (const [id, intent] of this.intents)
+			if (intent.peer === peer) this.intents.delete(id);
 		for (const [id, p] of this.early)
 			if (p.peer === peer) this.early.delete(id);
 		for (const [id, s] of this.sessions)
@@ -730,13 +822,16 @@ export class AssetSpliceUpdateTransport {
 	resume(peer: string, id: string) {
 		const p = this.channel(id);
 		if (p?.peer !== peer) return;
+		const current = this.connectionCurrent(id, peer);
 		void this.run(id, async () => {
+			if (!current()) return;
 			const head = this.head(id),
 				e = this.remembered(
 					id,
 					head.inProgress?.stateNumber ?? head.nextNumber
 				);
 			if (e) await this.drive(this.session(id, p, e), p);
+			if (!current()) return;
 			const early = this.early.get(id);
 			if (early?.peer === peer) {
 				this.early.delete(id);
