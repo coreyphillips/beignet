@@ -515,7 +515,7 @@ describe('a splice carrying an irrevocable mixed HTLC set', function () {
 				),
 				/Wallet refused the shared funding input/
 			);
-			const fundingEvents = () =>
+			const fundingEvents = (): string[] =>
 				acceptor.store
 					.readAssetSpliceJournal<{ kind: string }>(id)
 					.records.map((row) => row.kind);
