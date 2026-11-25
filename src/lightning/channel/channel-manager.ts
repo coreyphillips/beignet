@@ -10349,15 +10349,26 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 	private assetUpdateHeight(id: string): number | undefined {
 		const height = this._currentBlockHeight;
 		if (height < 1 || this.finalObservedClose.has(id)) return;
-		if (this.finalTransport?.hasDepth(id)) return height;
+		const openingAtDepth = this.finalTransport?.hasDepth(id);
 		const store = this.config.finalOpening?.storage;
 		if (
 			!store?.canSpliceDualFundedAssets ||
 			!this.assetSpliceConfirmation?.hasChannel(id)
 		)
-			return;
+			return openingAtDepth ? height : undefined;
 		const funding = store.loadAssetSpliceFundingInfo(id);
 		if (funding.reconciliation || funding.awaitingImport) return;
+		if (funding.active) {
+			const txid = funding.active.candidate.fundingTxid;
+			const mined = this.finalObservedFunding.get(id)?.get(txid)?.height;
+			if (
+				mined !== undefined &&
+				height - mined + 1 >= funding.active.minimumDepth &&
+				this.assetSpliceConfirmation.hasCurrentInclusion(id, txid, mined) &&
+				this.isAssetSpliceFundingAvailable(id, txid)
+			)
+				return height;
+		} else if (openingAtDepth) return height;
 		// A mined replacement spends its parent before the bilateral lock matures.
 		// Updates still sign every live branch and cannot advance the funding lock.
 		const eligible = funding.pending.filter(({ candidate }) => {

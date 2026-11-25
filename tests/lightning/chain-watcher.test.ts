@@ -15,6 +15,7 @@ import { mkdtempSync, rmSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { setupFundedAssetUpdatePair } from './helpers/asset-splice-update';
+import { encodeSpliceLockedMessage } from '../../src/lightning/message/splice';
 import type { IChannelManagerConfig } from '../../src/lightning/channel/channel-manager';
 import crypto from 'crypto';
 import * as bitcoin from 'bitcoinjs-lib';
@@ -456,7 +457,15 @@ describe('Phase 4: Chain Watcher', () => {
 				id = pair.f.id;
 			try {
 				channelManager = new ChannelManager({
-					finalOpening: { storage: d.store, root: d.party.root },
+					finalOpening: {
+						storage: d.store,
+						root: d.party.root,
+						dualFunding: {
+							verifySpliceFunding: async () => {},
+							confirmSpliceFunding: async () => {}
+						}
+					},
+					verifyRemoteFundingInput: async () => 'unspent',
 					persistence: COMMIT_ALL
 				} as unknown as IChannelManagerConfig);
 				channelManager.on('error', () => {});
@@ -467,7 +476,8 @@ describe('Phase 4: Chain Watcher', () => {
 					out = tx.outs[index],
 					sh = computeScriptHash(out.script);
 				let present = true,
-					allowProof = false;
+					allowProof = false,
+					depth = 1;
 				Object.assign(backend, {
 					listUnspent: async () =>
 						present
@@ -475,7 +485,7 @@ describe('Phase 4: Chain Watcher', () => {
 							: [],
 					getAssetSpliceInclusion: async () => {
 						if (!allowProof) throw Error('No accepted chain proof');
-						return { txid, blockHash: '44'.repeat(32), confirmations: 1 };
+						return { txid, blockHash: '44'.repeat(32), confirmations: depth };
 					}
 				});
 				backend.setHistory(sh, [{ txid, height: 72 }]);
@@ -515,6 +525,35 @@ describe('Phase 4: Chain Watcher', () => {
 				present = true;
 				await observe();
 				expect(updates()).to.equal(72);
+				await channelManager.receiveAssetSpliceLocked(
+					pair.f.devices[1].party.binding.nodeId,
+					encodeSpliceLockedMessage({
+						channelId: Buffer.from(id, 'hex'),
+						fundingTxid: Buffer.from(txid, 'hex').reverse()
+					})
+				);
+				let atImport: number | undefined;
+				channelManager.once('splice:complete', () => {
+					atImport = updates();
+				});
+				depth = 3;
+				backend.simulateNewBlock(74);
+				await observe();
+				expect(d.store.loadAssetSpliceFundingInfo(id).pending).to.be.empty;
+				expect(
+					d.store.loadAssetSpliceFundingInfo(id).active?.candidate.fundingTxid
+				).to.equal(txid);
+				expect(
+					atImport,
+					'current wallet import before the legacy depth callback'
+				).to.equal(74);
+				expect(updates()).to.equal(74);
+				present = false;
+				await observe();
+				expect(updates(), 'spent adopted funding').to.equal(undefined);
+				present = true;
+				await observe();
+				expect(updates()).to.equal(74);
 				channelManager.suspendAssetSpliceFunding(id, txid);
 				expect(updates()).to.equal(undefined);
 			} finally {

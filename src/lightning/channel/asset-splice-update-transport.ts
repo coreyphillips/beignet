@@ -275,8 +275,10 @@ export class AssetSpliceUpdateTransport {
 	}
 	async start(id: string, changes: readonly AssetUpdateChange[]) {
 		const p = this.channel(id);
-		if (!p || !this.currentHeight(id))
-			throw Error('Asset update requires an authenticated funded channel');
+		if (!p)
+			throw Error('Asset update requires an established enrolled channel');
+		if (!this.currentHeight(id))
+			throw Error('Asset update is waiting for verified live funding');
 		checkAuthor(changes, true, p.originalInitiator);
 		const raw = encodeAssetUpdateIntent(id, p.originalInitiator, changes);
 		await this.run(id, async () => {
@@ -590,6 +592,13 @@ export class AssetSpliceUpdateTransport {
 			}).customRecords?.has(65537n)
 		)
 			return false;
+		if (type === M.COMMITMENT_SIGNED && s.completed) {
+			const prior = assetUpdateHistory(this.runtime.storage, id).states.get(
+				BigInt(s.entry.height)
+			);
+			// A subsequent interactive splice also tags its HTLC signatures. It has its own funding txid.
+			return prior?.peerCommitments.includes(raw.toString('hex')) === true;
+		}
 		const msg = Buffer.from(raw);
 		void this.run(id, async () => {
 			if (this.sessions.get(id) !== s || !s.batch) return;

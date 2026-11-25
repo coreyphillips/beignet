@@ -23,9 +23,83 @@ import type { AssetUpdateChange } from '../../src/lightning/channel/asset-splice
 import { signatureRoundFixture } from './helpers/asset-splice-signature-round';
 import { assetUpdateTestHost } from './helpers/asset-splice-update';
 
+import { COMMIT_ALL } from './helpers/channel-persistence';
+import { ChannelManager } from '../../src/lightning/channel/channel-manager';
+import { AssetSpliceUpdateTransport } from '../../src/lightning/channel/asset-splice-update-transport';
+import {
+	BEIGNET_CUSTOM_MESSAGE_TYPE,
+	decodeCustomMessage
+} from '../../src/lightning/message/custom';
+import { MessageType as M } from '../../src/lightning/message/types';
+
+async function connectedUpdates(
+	f: ReturnType<typeof signatureRoundFixture>,
+	changes: (i: number) => AssetUpdateChange[]
+) {
+	const { devices, id } = f.f;
+	const managers = devices.map(
+		({ party }) =>
+			new ChannelManager({
+				localBasepoints: party.keys.channelBasepoints,
+				localPerCommitmentSeed: party.keys.perCommitmentSeed,
+				localFundingPrivkey: party.keys.fundingPrivkey,
+				persistence: COMMIT_ALL
+			})
+	);
+	const queue: { from: number; type: number; wire: Buffer }[] = [],
+		errors: string[] = [];
+	const settled = [0, 0];
+	const updates = devices.map(
+		(d, i) =>
+			new AssetSpliceUpdateTransport(
+				{ storage: d.store, root: d.party.root },
+				assetUpdateTestHost(i, [], 1),
+				(channel) =>
+					channel === id
+						? {
+								peer: devices[1 - i].party.binding.nodeId,
+								originalInitiator: i === 0
+						  }
+						: undefined,
+				() => 600900,
+				(_peer, type, wire) => queue.push({ from: i, type, wire }),
+				async () => {
+					settled[i]++;
+				},
+				(_id, e) => errors.push(e)
+			)
+	);
+	for (const [i, m] of managers.entries())
+		Object.assign(m, { assetUpdates: updates[i] });
+	for (let origin = 0; origin < 2; origin++) {
+		await updates[origin].start(id, [changes(origin)[origin]]);
+		for (
+			let turns = 0;
+			turns < 1000 && settled.some((n) => n !== origin + 1);
+			turns++
+		) {
+			const msg = queue.shift();
+			if (msg) {
+				const peer = devices[msg.from].party.binding.nodeId,
+					to = 1 - msg.from;
+				if (msg.type === BEIGNET_CUSTOM_MESSAGE_TYPE)
+					updates[to].custom(peer, decodeCustomMessage(msg.wire).payload);
+				else managers[to].handleMessage(peer, msg.type, msg.wire);
+			}
+			await new Promise<void>((resolve) => setImmediate(resolve));
+			assert.deepEqual(errors, []);
+		}
+		assert.deepEqual(settled, [origin + 1, origin + 1]);
+	}
+	return managers;
+}
 describe('a splice carrying an irrevocable mixed HTLC set', function () {
 	this.timeout(90000);
-	it('pins the current parent digest, named obligations and four enforceable exits before a funding signature', async () => {
+	it('pins the current parent digest, named obligations and four enforceable exits before a funding signature', () =>
+		exercise(false));
+	it('dispatches signed candidate commitments after a settled update on the same peer connection', () =>
+		exercise(true));
+	async function exercise(connected: boolean) {
 		const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'splice-signed-parent-'));
 		const f = signatureRoundFixture(dir),
 			{ s } = f,
@@ -45,33 +119,37 @@ describe('a splice carrying an irrevocable mixed HTLC set', function () {
 						allocations: n ? [] : [{ assetId, units: 3n }]
 					}
 				}));
-			const batch = f.f.devices.map((d, i) =>
-					d.store.assetSpliceUpdateBatch(
-						id,
-						d.party.root,
-						1n,
-						ops(i),
-						() => 600900
-					)
-				),
-				host = [assetUpdateTestHost(0, [], 1), assetUpdateTestHost(1, [], 1)];
-			const offers = batch.map((b) => b.offer());
-			batch.forEach((b, i) => b.acceptOffer(offers[1 - i]));
-			const shares = (await Promise.all(
-				batch.map((b, i) => b.signAssetShares(host[i]))
-			)) as [Buffer, Buffer];
-			const children = (await Promise.all(
-				batch.map((b, i) => b.signAssetHtlcs(host[i], shares))
-			)) as [Buffer, Buffer];
-			await Promise.all(
-				batch.map((b, i) => b.verifyAssetShares(host[i], shares, children))
-			);
-			const commits = batch.map((b) => b.commitments());
-			await Promise.all(
-				batch.map((b, i) => b.acceptCommitments(host[i], commits[1 - i]))
-			);
-			const revokes = batch.map((b) => b.revocation());
-			batch.forEach((b, i) => b.receiveRevocation(revokes[1 - i]));
+			const managers = connected ? await connectedUpdates(f, ops) : undefined;
+			const stateNumber = connected ? 2n : 1n;
+			if (!connected) {
+				const batch = f.f.devices.map((d, i) =>
+						d.store.assetSpliceUpdateBatch(
+							id,
+							d.party.root,
+							1n,
+							ops(i),
+							() => 600900
+						)
+					),
+					host = [assetUpdateTestHost(0, [], 1), assetUpdateTestHost(1, [], 1)];
+				const offers = batch.map((b) => b.offer());
+				batch.forEach((b, i) => b.acceptOffer(offers[1 - i]));
+				const shares = (await Promise.all(
+					batch.map((b, i) => b.signAssetShares(host[i]))
+				)) as [Buffer, Buffer];
+				const children = (await Promise.all(
+					batch.map((b, i) => b.signAssetHtlcs(host[i], shares))
+				)) as [Buffer, Buffer];
+				await Promise.all(
+					batch.map((b, i) => b.verifyAssetShares(host[i], shares, children))
+				);
+				const commits = batch.map((b) => b.commitments());
+				await Promise.all(
+					batch.map((b, i) => b.acceptCommitments(host[i], commits[1 - i]))
+				);
+				const revokes = batch.map((b) => b.revocation());
+				batch.forEach((b, i) => b.receiveRevocation(revokes[1 - i]));
+			}
 			const heads = f.f.devices.map(
 				(d) => d.store.assetSpliceUpdateHead(id).committed!
 			);
@@ -79,7 +157,7 @@ describe('a splice carrying an irrevocable mixed HTLC set', function () {
 			const priorDigest = Buffer.from(heads[0].digest, 'hex');
 			const layout = {
 				...s.layout,
-				stateNumber: 1n,
+				stateNumber,
 				priorDigest,
 				parentBalances: {
 					issuances: [{ assetId, funding: 20n, initiator: 8n, acceptor: 9n }],
@@ -154,11 +232,11 @@ describe('a splice carrying an irrevocable mixed HTLC set', function () {
 			}
 			const ctx = (i: number) => ({
 				...f.ctx(i),
-				stateNumber: 1n,
+				stateNumber,
 				priorDigest,
 				currentParent: () => ({
 					...f.ctx(i).currentParent(),
-					stateNumber: 1n,
+					stateNumber,
 					priorDigest
 				})
 			});
@@ -212,7 +290,10 @@ describe('a splice carrying an irrevocable mixed HTLC set', function () {
 				};
 				const result = {
 					parent: { local: fromOld('local'), remote: fromOld('remote') },
-					candidate: { local: fromOld('local'), remote: fromOld('remote') }
+					candidate: {
+						local: fromOld('local'),
+						remote: fromOld('remote')
+					}
 				};
 				return {
 					async signSpliceExits(c, v) {
@@ -258,7 +339,7 @@ describe('a splice carrying an irrevocable mixed HTLC set', function () {
 							candidate = e.candidate;
 						e.parent = old;
 						e.finalDigest = rounds[i].approved.digest.toString('hex');
-						e.stateNumber = '1';
+						e.stateNumber = String(stateNumber);
 						candidate.localCommitment = exact.candidate.local.toHex();
 						candidate.remoteCommitment = exact.candidate.remote.toHex();
 						candidate.localProofs = result.candidate.local.proofs;
@@ -314,8 +395,10 @@ describe('a splice carrying an irrevocable mixed HTLC set', function () {
 				])
 			);
 			for (const [i, d] of f.f.devices.entries()) {
-				d.store.close();
-				d.store = SqliteStorage.openFinalWallet(d.file, d.party.binding);
+				if (!connected) {
+					d.store.close();
+					d.store = SqliteStorage.openFinalWallet(d.file, d.party.binding);
+				}
 				rounds[i] = make(i);
 				const shouldReplay = {
 					...hosts[i],
@@ -356,7 +439,34 @@ describe('a splice carrying an irrevocable mixed HTLC set', function () {
 				});
 				assert.equal(decoded.htlcSignatures.length, 2);
 				assert(decoded.customRecords?.get(65537n));
-				round.acceptCommitmentSigned(handles[i], wires[1 - i]);
+				if (managers) {
+					const received: Buffer[] = [];
+					const peer = f.f.devices[1 - i].party.binding.nodeId;
+					Object.assign(managers[i], {
+						assetSplice: {
+							handle: (p: string, type: number, wire: Buffer) => {
+								assert.equal(p, peer);
+								assert.equal(type, M.COMMITMENT_SIGNED);
+								round.acceptCommitmentSigned(handles[i], wire);
+								received.push(wire);
+								return true;
+							}
+						}
+					});
+					managers[i].handleMessage(
+						peer,
+						M.COMMITMENT_SIGNED,
+						Buffer.from(heads[i].peerCommitments[0], 'hex')
+					);
+					assert.equal(received.length, 0);
+					managers[i].handleMessage(peer, M.COMMITMENT_SIGNED, wires[1 - i]);
+					assert.equal(
+						received.length,
+						1,
+						'The completed update swallowed the new candidate commitment'
+					);
+					assert.deepEqual(received[0], wires[1 - i]);
+				} else round.acceptCommitmentSigned(handles[i], wires[1 - i]);
 				await assert.rejects(() =>
 					round.retainExits(
 						{
@@ -397,7 +507,7 @@ describe('a splice carrying an irrevocable mixed HTLC set', function () {
 				d.store.assetSpliceUpdateBatch(
 					id,
 					d.party.root,
-					2n,
+					stateNumber + 1n,
 					[
 						{
 							kind: 'fulfill',
@@ -443,5 +553,5 @@ describe('a splice carrying an irrevocable mixed HTLC set', function () {
 			for (const d of f.f.devices) d.store.close();
 			fs.rmSync(dir, { recursive: true, force: true });
 		}
-	});
+	}
 });
