@@ -1048,6 +1048,33 @@ export class AssetSpliceSignatureRound {
 				(r) => r.kind === 'funding-released' && r.finalDigest === this.digest
 			)?.wire;
 	}
+	private async verifyUnspentInputs(
+		ctx: IAssetSpliceContext,
+		verify: AssetSpliceInputVerifier
+	): Promise<void> {
+		// The wallet polls its Electrum connection every ten seconds. A transient
+		// unknown gets a bounded window to recover. Each pass reads every prevout
+		// again so an earlier positive result cannot survive a later spend.
+		for (const delay of [0, 250, 1250, 4000, 6500]) {
+			if (delay)
+				await new Promise<void>((resolve) => setTimeout(resolve, delay));
+			this.current(ctx);
+			let allUnspent = true;
+			for (const [i, coin] of this.candidate.tx.ins.entries()) {
+				const verdict = await verify({
+					txid: Buffer.from(coin.hash),
+					vout: coin.index,
+					scriptPubKey: Buffer.from(this.candidate.scripts[i])
+				});
+				this.current(ctx);
+				if (verdict === 'unknown') allUnspent = false;
+				else if (verdict !== 'unspent')
+					throw new Error('Asset splice input is spent or missing');
+			}
+			if (allUnspent) return;
+		}
+		throw new Error('Asset splice input is not verified unspent');
+	}
 	async nextFunding(
 		host: IAssetSpliceSigningHost,
 		ctx: IAssetSpliceContext,
@@ -1063,17 +1090,8 @@ export class AssetSpliceSignatureRound {
 		}
 		this.current(ctx);
 		if (!this.first && !this.wire(false, M.TX_SIGNATURES)) return;
-		for (const [i, coin] of this.candidate.tx.ins.entries()) {
-			if (
-				(await verify({
-					txid: Buffer.from(coin.hash),
-					vout: coin.index,
-					scriptPubKey: Buffer.from(this.candidate.scripts[i])
-				})) !== 'unspent'
-			)
-				throw new Error('Asset splice input is not verified unspent');
-			this.current(ctx);
-		}
+		await this.verifyUnspentInputs(ctx, verify);
+		this.current(ctx);
 		const branch = (name: Branch) => {
 			const b = e[name];
 			return {

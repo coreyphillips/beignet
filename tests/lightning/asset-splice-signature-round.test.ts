@@ -1,4 +1,12 @@
 import { strict as assert } from 'assert';
+import sinon from 'sinon';
+import { walletSigner } from './helpers/final-update-pair';
+import {
+	classifyRemoteFundingInput,
+	computeScriptHash
+} from '../../src/lightning/chain/chain-watcher';
+import { ElectrumBackend } from '../../src/lightning/chain/electrum-backend';
+import type { Electrum } from '../../src/electrum';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
@@ -154,6 +162,167 @@ describe('asset splice Bitcoin commit and funding signature round', () => {
 		available = false;
 		assert.throws(() => a.commitmentSigned(checked));
 	});
+	for (const outcome of [
+		'unspent',
+		'spent',
+		'unknown',
+		'parent changed'
+	] as const) {
+		it(
+			'rechecks the funding input set after a lost Electrum read on restart: ' +
+				outcome,
+			async () => {
+				const { a, b } = await commits();
+				const first = await b.nextFunding(
+					t.hosts[1],
+					t.ctx(1),
+					async () => 'unspent'
+				);
+				assert(first);
+				a.receiveFunding(first);
+				const device = t.f.devices[0];
+				device.store.close();
+				device.store = SqliteStorage.openFinalWallet(
+					device.file,
+					device.party.binding
+				);
+				const round = t.round(0),
+					initial = t.ctx(0);
+				const candidate = t.s.verified[0].candidate;
+				const coins = candidate.tx.ins.map((coin, i) => ({
+					script: computeScriptHash(candidate.scripts[i]),
+					txid: Buffer.from(coin.hash).reverse().toString('hex'),
+					vout: coin.index,
+					value: candidate.values[i]
+				}));
+				assert(coins.length >= 2);
+				assert.notEqual(coins[0].script, coins[1].script);
+				const reads: string[] = [];
+				const calls = (script: string) =>
+					reads.filter((s) => s === script).length;
+				let connected = true;
+				const source = {
+					connectedToElectrum: true,
+					async listUnspentAddressScriptHashes({
+						addresses,
+						rejectFailedEntries
+					}: {
+						addresses: Record<string, unknown>;
+						rejectFailedEntries: boolean;
+					}) {
+						assert.equal(rejectFailedEntries, true);
+						const [script] = Object.keys(addresses);
+						reads.push(script);
+						const owned = coins.filter((c) => c.script === script);
+						assert(owned.length);
+						if (
+							script === coins[1].script &&
+							(calls(script) === 1 || outcome === 'unknown')
+						) {
+							if (outcome === 'parent changed')
+								setTimeout(() => {
+									connected = false;
+								}, 1);
+							return {
+								isErr: () => true,
+								error: new Error('Connection to server lost, please retry')
+							};
+						}
+						const spent =
+							outcome === 'spent' &&
+							script === coins[0].script &&
+							calls(script) > 1;
+						return {
+							isErr: () => false,
+							value: {
+								utxos: spent
+									? []
+									: owned.map((c) => ({
+											tx_hash: c.txid,
+											tx_pos: c.vout,
+											value: c.value,
+											height: 831
+									  }))
+							}
+						};
+					},
+					async getAddressScriptHashesHistory([script]: string[]) {
+						return {
+							isErr: () => false,
+							value: {
+								data: [
+									{
+										result: coins
+											.filter((c) => c.script === script)
+											.map((c) => ({ tx_hash: c.txid, height: 831 }))
+									}
+								]
+							}
+						};
+					}
+				};
+				const backend = new ElectrumBackend(source as unknown as Electrum);
+				const before = device.store.readAssetSpliceJournal(t.f.id);
+				const ctx = {
+					...initial,
+					currentParent: () => (connected ? initial.currentParent() : undefined)
+				};
+				let signed = false;
+				const host = {
+					...t.hosts[0],
+					async signSpliceFunding(
+						...args: Parameters<IAssetSpliceSigningHost['signSpliceFunding']>
+					) {
+						signed = true;
+						const [, , tx, indices, prevouts] = args;
+						return walletSigner(device.party.keys.fundingPrivkey, 1, t.f.calls)(
+							tx,
+							indices,
+							prevouts
+						);
+					}
+				};
+				const clock = sinon.useFakeTimers({
+					toFake: ['setTimeout', 'clearTimeout']
+				});
+				try {
+					const funding = round.nextFunding(host, ctx, (coin) =>
+						classifyRemoteFundingInput(backend, {
+							txidDisplayHex: Buffer.from(coin.txid).reverse().toString('hex'),
+							vout: coin.vout,
+							scriptPubKey: coin.scriptPubKey
+						})
+					);
+					const result =
+						outcome === 'unspent'
+							? funding.then((wire) => assert(wire))
+							: assert.rejects(funding);
+					await Promise.all([result, clock.runAllAsync()]);
+					assert.equal(signed, outcome === 'unspent');
+					if (outcome === 'unspent') {
+						assert.equal(calls(coins[1].script), 2);
+						assert.deepEqual(
+							reads.slice(-coins.length),
+							coins.map((c) => c.script)
+						);
+					} else {
+						assert.deepEqual(
+							device.store.readAssetSpliceJournal(t.f.id),
+							before
+						);
+						if (outcome === 'spent')
+							assert.equal(reads.at(-1), coins[0].script);
+						if (outcome === 'parent changed')
+							assert.equal(calls(coins[1].script), 1);
+						if (outcome === 'unknown')
+							assert(calls(coins[1].script) > 1 && calls(coins[1].script) <= 5);
+					}
+				} finally {
+					clock.restore();
+				}
+			}
+		);
+	}
 	it('declines early, conflicting and spent inputs without releasing wallet signatures', async () => {
 		const original = t.round(0);
 		await assert.rejects(() => original.signExitShares(t.hosts[0], t.ctx(0)));
@@ -176,9 +345,19 @@ describe('asset splice Bitcoin commit and funding signature round', () => {
 		changed[changed.length - 1] ^= 1;
 		assert.throws(() => a.receiveFunding(changed));
 		a.receiveFunding(first);
-		await assert.rejects(() =>
-			a.nextFunding(t.hosts[0], t.ctx(0), async () => 'unknown')
-		);
+		const clock = sinon.useFakeTimers({
+			toFake: ['setTimeout', 'clearTimeout']
+		});
+		try {
+			await Promise.all([
+				assert.rejects(() =>
+					a.nextFunding(t.hosts[0], t.ctx(0), async () => 'unknown')
+				),
+				clock.runAllAsync()
+			]);
+		} finally {
+			clock.restore();
+		}
 		assert.deepEqual(t.f.calls, []);
 	});
 });
