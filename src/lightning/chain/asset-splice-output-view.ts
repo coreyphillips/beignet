@@ -96,8 +96,11 @@ export function matchedAssetPayoutViews(
 		  )
 		: [];
 	const holders = ['local', 'remote'] as const;
-	if (!retained.length)
-		return holders.flatMap((holder) => {
+	// The opening commitment spends the original outpoint at state 0. A splice
+	// signed from a later state keeps no copy of it, so it is matched here by
+	// its exact txid whenever no retained splice commitment matches.
+	const openingMatch = () =>
+		holders.flatMap((holder) => {
 			const protection = authority('0', holder);
 			if (!protection) return [];
 			const assets = assetOpeningLeaves(evidence, holder);
@@ -130,6 +133,7 @@ export function matchedAssetPayoutViews(
 				  ]
 				: [];
 		});
+	if (!retained.length) return openingMatch();
 	const matches = retained.flatMap((entry) =>
 		(['parent', 'candidate'] as const).flatMap((generation) => {
 			const b = entry[generation];
@@ -196,7 +200,7 @@ export function matchedAssetPayoutViews(
 		)
 	)
 		throw new Error('Ambiguous retained proof for watched asset commitment');
-	return first ? [first] : [];
+	return first ? [first] : openingMatch();
 }
 
 /** Follow only released candidate funding outpoints back to the enrolled opening.
