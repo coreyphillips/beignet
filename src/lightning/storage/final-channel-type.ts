@@ -406,12 +406,6 @@ export function fundingOutpoint(ref: {
  * prior. Both peers compute it from opener-ordered fields, since each side's
  * own record names local and remote the other way round.
  */
-function holderUnits(
-	r: IAssetSpliceExitBranch['localRecovery'],
-	proofs: string
-): (string | null)[] {
-	return [proofs, r.toLocal?.script ?? null, r.toRemote?.script ?? null];
-}
 export function finalAssetSeedDigest(
 	channelId: string,
 	isInitiator: boolean,
@@ -429,11 +423,9 @@ export function finalAssetSeedDigest(
 		input.funding.fundingOutputIndex,
 		m.fundingRoot,
 		opener(m.localRecovery.localBalanceMsat, m.localRecovery.remoteBalanceMsat),
-		// Each holder's units per issuance travel in its proofs and leaves.
-		opener(
-			holderUnits(m.localRecovery, m.localProofs),
-			holderUnits(m.remoteRecovery, m.remoteProofs)
-		),
+		// Units per issuance are bound through the commitment txids below: each
+		// output's script commits to its asset root. Proof bytes come from each
+		// peer's own host and are not hashed, as in the round digest.
 		seed.feerate,
 		opener(seed.nextLocalId, seed.nextPeerId),
 		[],

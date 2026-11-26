@@ -1208,6 +1208,49 @@ describe('Channel type reader and memo (#2151 step 2a, item 2)', function () {
 		);
 	});
 
+	it("binds the asset seed digest to the commitments, not to either host's proof bytes", () => {
+		const pair = plainTypePair(s, 0);
+		const c = buildConversion(pair.devices, pair.id, {
+			type: 'asset',
+			stateNumber: 0,
+			parent: openingParent(pair.stores[0], pair.id)
+		});
+		const digestOf = (i: number, input: IChannelTypeRecordInput): string =>
+			step2a().finalAssetSeedDigest(
+				c.id,
+				pair.stores[i].loadFinalOpening(c.id)!.isInitiator,
+				input
+			);
+		const [d0, d1] = [digestOf(0, c.inputs[0]), digestOf(1, c.inputs[1])];
+		expect(d0).to.equal(d1);
+		const reproved = JSON.parse(
+			JSON.stringify(c.inputs[1])
+		) as IChannelTypeRecordInput;
+		const m = (reproved.seed as IFinalAssetSeedInput).members[0];
+		m.localProofs = 'ab'.repeat(40);
+		m.remoteProofs = 'cd'.repeat(40);
+		m.fundingProofs = 'ef'.repeat(40);
+		expect(digestOf(1, reproved)).to.equal(d0);
+		const moved = JSON.parse(
+			JSON.stringify(c.inputs[1])
+		) as IChannelTypeRecordInput;
+		(moved.seed as IFinalAssetSeedInput).members[0].remoteCommitment =
+			c.tx.toHex();
+		expect(digestOf(1, moved)).to.not.equal(d0);
+	});
+
+	it('reads a funded channel of generations 1 and 3 as its opening, without the lifecycle journal', () => {
+		for (const g of [1, 3] as const) {
+			const pair = plainTypePair(s, 0, g);
+			const read = typed(pair.stores[0]).loadFinalChannelType(pair.id)!;
+			expect(read.source).to.equal('opening');
+			expect(read.stateNumber).to.equal(0n);
+			expect(
+				typed(pair.stores[0]).loadFinalChannelTypeRecords(pair.id)
+			).to.deep.equal([]);
+		}
+	});
+
 	it("keeps a block's work going when one channel's type cannot be read", async () => {
 		const { pair } = await converted(0);
 		const d = pair.p.f.devices[0];

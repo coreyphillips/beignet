@@ -2261,7 +2261,6 @@ export class SqliteStorage implements IStorageBackend {
 		// The journals are read directly, without the live-device gates of the
 		// splice and asset readers, so a copy and a transaction see what the
 		// original device sees outside one.
-		const journal = this.finalJournal();
 		if (state?.current.type === 'asset') {
 			if (!this.assetSpliceWallet) return original;
 			const info = this.assetWalletFundingInfo(
@@ -2272,6 +2271,8 @@ export class SqliteStorage implements IStorageBackend {
 			return copyJson(info.active?.candidate.funding ?? original);
 		}
 		if (!this.updateWallet) return original;
+		// Generations 1 and 3 have no lifecycle journal, so it is opened only here.
+		const journal = this.finalJournal();
 		let selected = original;
 		for (const a of finalSpliceAttempts(
 			channelId,
