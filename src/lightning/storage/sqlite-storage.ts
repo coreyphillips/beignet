@@ -3385,9 +3385,6 @@ export class SqliteStorage implements IStorageBackend {
 			!/^[0-9a-f]{64}$/.test(parent)
 		)
 			throw new Error('Asset payout requires the original wallet');
-		// A plain channel of a wallet that also runs asset channels has no payout slot.
-		if (this.loadFinalChannelKind(id) === 'plain')
-			throw new Error('Asset payout requires an asset channel');
 		if (this.supportsAssetSpliceRecovery) {
 			if (
 				outputIndex === undefined ||

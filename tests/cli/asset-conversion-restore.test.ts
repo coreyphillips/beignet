@@ -138,7 +138,8 @@ describe('Asset channel restore in a generation 6 wallet (#2151 step 1, item 10)
 				devices[0].party.binding,
 				plainId,
 				mac
-			)
+			),
+			/A ready and funded asset opening is required/
 		);
 		// The device still holds the plain channel's authorized exit, so the
 		// wallet without its rows is refused at open; read the rows directly.

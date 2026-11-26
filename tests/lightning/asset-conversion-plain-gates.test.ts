@@ -265,7 +265,8 @@ describe('Fail-closed plain entry points for an asset channel (#2151 step 1, ite
 		expect(
 			fixture.devices[0].store.loadFinalOpeningSession(fixture.id)!.updateLimits
 		).to.not.equal(undefined);
-		expect(table(fixture).result).to.deep.equal({
+		const { result, rows } = table(fixture);
+		expect(result).to.deep.equal({
 			finalUpdateView: null,
 			loadFinalUpdateStatus: null,
 			loadFinalResolutionStates: null,
@@ -277,6 +278,15 @@ describe('Fail-closed plain entry points for an asset channel (#2151 step 1, ite
 			updateFinalLedger: 'throws',
 			finalSpliceSession: 'throws',
 			finalSimpleCloseStep: 'throws'
+		});
+		expect(outcome(rows.updateFinalLedger)).to.deep.equal({
+			threw: 'Final updates require a plain final channel'
+		});
+		expect(outcome(rows.finalSpliceSession)).to.deep.equal({
+			threw: 'Final splice requires a plain final channel'
+		});
+		expect(outcome(rows.finalSimpleCloseStep)).to.deep.equal({
+			threw: 'Final close requires a plain final channel'
 		});
 	});
 
@@ -479,5 +489,27 @@ describe('Channel types of a generation 6 node (#2151 step 1, item 12)', functio
 			})
 		).to.throw(/conversion|463/i);
 		expect(alice.calls).to.deep.equal([]);
+	});
+});
+
+describe('Asset payout slots of a plain opening in generation 5 (#2151 step 1)', function () {
+	this.timeout(60000);
+	it('keeps the answers and error texts of generation 5', () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'asset-conversion-g5-'));
+		const sides = [generateSide(5), generateSide(5)];
+		const stores = sides.map((s, i) =>
+			SqliteStorage.createFinalWallet(path.join(dir, 'w' + i), s.binding)
+		);
+		try {
+			const id = fundReadyPair(stores[0], stores[1], sides[0], sides[1]);
+			const parent = 'ab'.repeat(32);
+			expect(stores[0].assetOpeningPayoutReceipt(id, parent, 0)).to.equal(null);
+			expect(() => stores[0].assetOpeningPayout(id, parent)).to.throw(
+				'Asset payout requires a valid commitment output index'
+			);
+		} finally {
+			for (const s of stores) s.close();
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
 	});
 });

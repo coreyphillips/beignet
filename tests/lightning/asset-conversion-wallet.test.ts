@@ -625,15 +625,22 @@ describe('One generation 6 wallet with both kinds of channel (#2151 step 1, item
 		expect(stores[0].loadFinalResolutionStates(assetId)).to.equal(null);
 		expect(stores[0].loadFinalSpliceAttempts(assetId)).to.deep.equal([]);
 		expect(stores[0].loadFinalSimpleClose(assetId)).to.equal(null);
-		expect(() => stores[0].finalSpliceSession(assetId, assetRoot)).to.throw();
-		expect(() =>
-			stores[0].finalSimpleCloseStep(assetId, assetRoot, {
-				start: true,
-				script: destination,
-				blockHeight: 200,
-				feeratePerKw: 1000
-			})
-		).to.throw();
+		expect(() => stores[0].finalSpliceSession(assetId, assetRoot)).to.throw(
+			/plain final channel/
+		);
+		expect(
+			() =>
+				stores[0].finalSimpleCloseStep(assetId, assetRoot, {
+					start: true,
+					script: destination,
+					blockHeight: 200,
+					feeratePerKw: 1000
+				})
+			// The existing readiness check may come first; the gate's own text is
+			// proven on a funded asset channel in asset-conversion-plain-gates.
+		).to.throw(
+			/Funding is unavailable for cooperative close|plain final channel/
+		);
 		expect(() =>
 			stores[0].stageFinalHtlcUpdate(
 				assetId,
@@ -648,24 +655,19 @@ describe('One generation 6 wallet with both kinds of channel (#2151 step 1, item
 					onionRoutingPacket: Buffer.alloc(1366)
 				})
 			)
-		).to.throw();
-		// The plain transport may also refuse the asset channel outright, which
-		// offers it to the plain ledger no more than a false updatesReady does.
-		let assetReady = [false, false];
-		try {
-			const probe = plainWire(
-				stores,
-				s.f.devices.map((d) => d.party),
-				assetId,
-				false
-			);
-			await probe.drain();
-			assetReady = probe.sockets.map((x) => x.updatesReady(assetId));
-			probe.destroy();
-		} catch {
-			assetReady = [false, false];
-		}
-		expect(assetReady).to.deep.equal([false, false]);
+		).to.throw(/plain final channel/);
+		const probe = plainWire(
+			stores,
+			s.f.devices.map((d) => d.party),
+			assetId,
+			false
+		);
+		await probe.drain();
+		expect(probe.sockets.map((x) => x.updatesReady(assetId))).to.deep.equal([
+			false,
+			false
+		]);
+		probe.destroy();
 		const wire = plainWire(stores, plainSides, plainId);
 		await wire.drain();
 		expect(wire.sockets.map((x) => x.updatesReady(plainId))).to.deep.equal([
