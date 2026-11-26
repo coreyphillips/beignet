@@ -1123,9 +1123,10 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		}
 	>();
 	private readonly finalDepthByChannel = new Map<string, Set<string>>();
+	/** The close seen for a channel; `spends` lists the outpoints an asset channel's close spent, as `txid:index`. */
 	private readonly finalObservedClose = new Map<
 		string,
-		{ txid: string; state: ChannelState }
+		{ txid: string; state: ChannelState; spends?: readonly string[] }
 	>();
 	private readonly finalPeerComplete = new WeakMap<
 		Channel,
@@ -1224,7 +1225,9 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 						'splice:complete',
 						Buffer.from(id, 'hex'),
 						Buffer.from(txid, 'hex').reverse()
-					)
+					),
+				(id, outpoint) =>
+					!!this.finalObservedClose.get(id)?.spends?.includes(outpoint)
 			);
 		}
 		if (config.finalOpening && config.verifyRemoteFundingInput) {
@@ -4882,15 +4885,16 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		if (runtime?.storage.canOpenDualFundedAssets) {
 			const opening = runtime.storage.loadFinalDaemonOpening(channelIdHex);
 			if (opening?.session.assetEvidence) {
+				const spends = spendingTx.ins.map(
+					(input) =>
+						Buffer.from(input.hash).reverse().toString('hex') +
+						':' +
+						input.index
+				);
 				const kind = this.assetSpliceConfirmation?.fundingSpend(
 					channelIdHex,
 					spendingTx.getId(),
-					spendingTx.ins.map(
-						(input) =>
-							Buffer.from(input.hash).reverse().toString('hex') +
-							':' +
-							input.index
-					)
+					spends
 				);
 				if (kind === 'splice') return [];
 
@@ -4906,7 +4910,8 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 				) {
 					this.finalObservedClose.set(channelIdHex, {
 						txid: spendingTx.getId(),
-						state: ChannelState.FORCE_CLOSED
+						state: ChannelState.FORCE_CLOSED,
+						spends
 					});
 					this.finalTransport?.assetFundingSpendable(channelIdHex, false);
 				}
