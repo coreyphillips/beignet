@@ -86,8 +86,7 @@ export function installOpeningAuthority(
 	try {
 		signer.pragma('synchronous = EXTRA');
 		const generation = JSON.parse(identity)[0];
-		if (generation === 3 || generation === 4 || generation === 5)
-			signer.pragma('auto_vacuum = FULL');
+		if ([3, 4, 5, 6].includes(generation)) signer.pragma('auto_vacuum = FULL');
 		const secret = randomBytes(32);
 		const origin = JSON.stringify([
 			descriptor(stageWallet, canonical),

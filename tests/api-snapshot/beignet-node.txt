@@ -26,6 +26,7 @@ property BeignetConfig.alias?: string
 property BeignetConfig.announceAddresses?: string[]
 property BeignetConfig.apiKeys?: Array<{ name: string; key: string; scopes: Array<'readonly' | 'invoice' | 'admin'>; expiresAt?: string; }>
 property BeignetConfig.apiToken?: string
+property BeignetConfig.assetConversion?: boolean
 property BeignetConfig.assetSplice?: boolean
 property BeignetConfig.assetSpliceRecovery?: boolean
 property BeignetConfig.autoBootstrap?: boolean
@@ -582,6 +583,7 @@ property BeignetNodeOptions.addressType?: 'p2wpkh' | 'p2tr'
 property BeignetNodeOptions.alias?: string
 property BeignetNodeOptions.allowMultipleInstances?: boolean
 property BeignetNodeOptions.announceAddresses?: string[]
+property BeignetNodeOptions.assetConversion?: boolean
 property BeignetNodeOptions.assetSplice?: boolean
 property BeignetNodeOptions.assetSpliceRecovery?: boolean
 property BeignetNodeOptions.autoBootstrap?: boolean

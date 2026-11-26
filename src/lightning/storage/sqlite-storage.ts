@@ -561,6 +561,8 @@ export class SqliteStorage implements IStorageBackend {
 			throw new Error(
 				'Splice requires the original update wallet and a top-level commit'
 			);
+		if (this.assetChannel(id))
+			throw new Error('Final splice requires a plain final channel');
 		return new FinalSpliceSession(
 			id,
 			this,
@@ -602,6 +604,7 @@ export class SqliteStorage implements IStorageBackend {
 	private readFinalSpliceAttempts(id: string): IFinalSpliceAttempt[] {
 		if (!this.updateWallet) return [];
 		this.requireCurrentFinalDevice();
+		if (this.assetChannel(id)) return [];
 		const head = this.finalJournal().read<FinalSpliceEvent>('splice', id);
 		return finalSpliceAttempts(id, head.records);
 	}
@@ -747,7 +750,8 @@ export class SqliteStorage implements IStorageBackend {
 				).reserved)
 					reserved.add(input);
 			}
-			return reserved;
+			// A wallet of both kinds also reserves its plain splice inputs.
+			if (!this.updateWallet) return reserved;
 		}
 		if (!this.canUpdateFinalCommitments) return reserved;
 		for (const c of this.loadFinalOpenings()) {
@@ -817,7 +821,8 @@ export class SqliteStorage implements IStorageBackend {
 		this.walletIdentity = opts?.[boundWallet];
 		this.finalGeneration =
 			this.walletIdentity && JSON.parse(this.walletIdentity)[0];
-		this.updateWallet = this.finalGeneration === 2;
+		this.updateWallet =
+			this.finalGeneration === 2 || this.finalGeneration === 6;
 		this.db = this.walletIdentity
 			? new Sqlite(dbPath, { fileMustExist: true, timeout: 0 })
 			: new Sqlite(dbPath);
@@ -845,7 +850,8 @@ export class SqliteStorage implements IStorageBackend {
 			(binding.finalCommitmentUpdates ||
 				binding.dualFundedAssets ||
 				binding.assetSplice ||
-				binding.assetSpliceRecovery) &&
+				binding.assetSpliceRecovery ||
+				binding.assetConversion) &&
 			!daemonGenerated
 		)
 			throw new Error(
@@ -928,7 +934,10 @@ export class SqliteStorage implements IStorageBackend {
 		binding: IFinalWalletBinding,
 		frame: RecoveryFrame
 	) {
-		if (!binding.assetSpliceRecovery || frame.version !== 6)
+		if (
+			(!binding.assetSpliceRecovery && !binding.assetConversion) ||
+			frame.version !== 6
+		)
 			throw new Error(
 				'Original-device recovery frames require a recoverable asset wallet'
 			);
@@ -1053,7 +1062,9 @@ export class SqliteStorage implements IStorageBackend {
 	): T {
 		const identity = finalWalletIdentity(dbPath, binding);
 		if (
-			(!binding.assetSplice && !binding.assetSpliceRecovery) ||
+			(!binding.assetSplice &&
+				!binding.assetSpliceRecovery &&
+				!binding.assetConversion) ||
 			!/^[0-9a-f]{64}$/.test(channelId)
 		)
 			throw new Error(
@@ -1405,7 +1416,7 @@ export class SqliteStorage implements IStorageBackend {
 			this.openBoundDatabase();
 			this.loadAllChannels();
 			this.readFinalOpenings((candidate, record) => {
-				if (this.updateWallet)
+				if (this.updateWallet && !record.nonces.session?.assetEvidence)
 					verifyFinalJournal(this.db, candidate.channelId, record.nonceKey);
 			});
 			this._restrictFileModes();
@@ -1721,12 +1732,43 @@ export class SqliteStorage implements IStorageBackend {
 	}
 
 	private get assetSpliceWallet(): boolean {
-		return this.finalGeneration === 4 || this.finalGeneration === 5;
+		return (
+			this.finalGeneration === 4 ||
+			this.finalGeneration === 5 ||
+			this.finalGeneration === 6
+		);
 	}
 
 	/** The enrolled format carries the recoverable asset channel type even when opened for reading. */
 	get supportsAssetSpliceRecovery(): boolean {
-		return this.finalGeneration === 5;
+		return this.finalGeneration === 5 || this.finalGeneration === 6;
+	}
+
+	/** The enrolled format runs plain final channels and recoverable asset channels side by side, also when opened for reading. */
+	get supportsAssetConversion(): boolean {
+		return this.finalGeneration === 6;
+	}
+
+	/** Only the live original of a generation 6 wallet can authorize records for either kind of channel. */
+	get canConvertAssetChannels(): boolean {
+		return this.supportsAssetConversion && this.canSignFinalOpening;
+	}
+
+	/** Only a wallet that holds asset splice channels stores their evidence, so another skips the read. */
+	private assetChannel(id: string): boolean {
+		return this.assetSpliceWallet && this.loadFinalChannelKind(id) === 'asset';
+	}
+
+	/**
+	 * The kind of a final channel, from its opening: 'asset' when the opening
+	 * session carries asset evidence, 'plain' for a final opening without it,
+	 * and null for an unknown channel or a wallet that is not final.
+	 */
+	loadFinalChannelKind(channelId: string): 'plain' | 'asset' | null {
+		if (!this.walletIdentity) return null;
+		const record = this.finalOpeningRecord(channelId);
+		if (!record) return null;
+		return record.nonces.session?.assetEvidence ? 'asset' : 'plain';
 	}
 
 	/** Only the live original of a recoverable asset wallet can authorize new records. */
@@ -2378,7 +2420,8 @@ export class SqliteStorage implements IStorageBackend {
 	private latestFinalUpdate(
 		record: IFinalOpeningRecord
 	): IFinalLedgerState | null {
-		if (!this.canUpdateFinalCommitments) return null;
+		if (!this.canUpdateFinalCommitments || record.nonces.session?.assetEvidence)
+			return null;
 		const state =
 			currentFinalJournal(
 				this.db,
@@ -2395,7 +2438,12 @@ export class SqliteStorage implements IStorageBackend {
 		if (!opening) return [];
 		const retained = this.retainedAssetFundingExits(record);
 		let exits = retained.length ? retained : [opening];
-		if (this.canUpdateFinalCommitments && record.nonces.session?.updateLimits) {
+		// An asset session stores updateLimits too, so only a plain one takes the ledger.
+		if (
+			this.canUpdateFinalCommitments &&
+			record.nonces.session?.updateLimits &&
+			!record.nonces.session.assetEvidence
+		) {
 			const existing = this.latestFinalUpdate(record);
 			if (existing || (record.nonces.localReady && record.nonces.peerReady)) {
 				const ctx = this.finalUpdateContext(record);
@@ -2454,7 +2502,11 @@ export class SqliteStorage implements IStorageBackend {
 						Transaction.fromBuffer(e.exit).ins[0].index === fundingOutputIndex)
 				: !requested || sha256(e.exit).toString('hex') === requested
 		);
-		if (this.assetSpliceWallet && matches.length > 1)
+		if (
+			this.assetSpliceWallet &&
+			record.nonces.session?.assetEvidence &&
+			matches.length > 1
+		)
 			throw new Error(
 				'Select the matching asset funding outpoint for this exit'
 			);
@@ -2498,6 +2550,8 @@ export class SqliteStorage implements IStorageBackend {
 				const record = this.finalOpeningRecord(id);
 				if (!record?.nonces.session?.updateLimits)
 					throw new Error('Missing negotiated final HTLC limits');
+				if (record.nonces.session.assetEvidence)
+					throw new Error('Final updates require a plain final channel');
 				if (access !== 'delivery' && this.finalExitRequested(id, record.nonces))
 					throw new Error('Final channel close already requested');
 				const ctx = this.finalUpdateContext(record);
@@ -2559,7 +2613,8 @@ export class SqliteStorage implements IStorageBackend {
 		if (
 			!record?.nonces.session?.updateLimits ||
 			!record.nonces.peerReady ||
-			!record.nonces.localReady
+			!record.nonces.localReady ||
+			record.nonces.session.assetEvidence
 		)
 			return null;
 		const ctx = this.finalUpdateContext(record);
@@ -2952,7 +3007,7 @@ export class SqliteStorage implements IStorageBackend {
 	}
 
 	loadFinalSimpleClose(id: string): IFinalSimpleCloseState | null {
-		if (!this.updateWallet) return null;
+		if (!this.updateWallet || this.assetChannel(id)) return null;
 		const { records } = this.finalJournal().read<IFinalSimpleCloseState>(
 			'simple-close',
 			id
@@ -3019,6 +3074,8 @@ export class SqliteStorage implements IStorageBackend {
 					this.finalExitRequested(id, row.nonces)
 				)
 					throw new Error('Funding is unavailable for cooperative close');
+				if (row.nonces.session.assetEvidence)
+					throw new Error('Final close requires a plain final channel');
 				const journal = this.finalJournal();
 				const head = journal.read<IFinalSimpleCloseState>('simple-close', id);
 				const previous = JSON.stringify(
@@ -3150,6 +3207,7 @@ export class SqliteStorage implements IStorageBackend {
 			.all() as { channel_id: string }[];
 		for (const { channel_id: id } of ids) {
 			const record = this.finalOpeningRecord(id)!;
+			if (record.nonces.session?.assetEvidence) continue;
 			const latest = currentFinalJournal(
 				this.db,
 				this.requireOpeningAuthority(),
@@ -3194,7 +3252,10 @@ export class SqliteStorage implements IStorageBackend {
 			const signing = record.nonces.signing;
 			if (!signing?.exit || !signing.fundingLocal) continue;
 			if (!signing.exitRequested && !authority.exitRequest(id)) {
-				if (this.canUpdateFinalCommitments)
+				if (
+					this.canUpdateFinalCommitments &&
+					!record.nonces.session?.assetEvidence
+				)
 					currentFinalJournal(this.db, authority, id, record.nonceKey);
 				continue;
 			}

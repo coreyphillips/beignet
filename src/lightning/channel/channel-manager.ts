@@ -5855,6 +5855,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 						type === MessageType.CHANNEL_READY ||
 						type === MessageType.CHANNEL_REESTABLISH ||
 						(this.config.finalOpening!.storage.canUpdateFinalCommitments &&
+							!session.assetEvidence &&
 							(isFinalCommitmentUpdate(type) ||
 								type === MessageType.REVOKE_AND_ACK ||
 								type === MessageType.SHUTDOWN ||
@@ -10594,12 +10595,13 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		this.restoreAssetSpliceWatches();
 		for (const {
 			candidate,
+			session,
 			funding,
 			exitToBroadcast
 		} of this.config.finalOpening?.storage.loadFinalDaemonOpenings() ?? []) {
 			this.watchFinalOpening(candidate);
 			const store = this.config.finalOpening!.storage;
-			if (store.canUpdateFinalCommitments) {
+			if (store.canUpdateFinalCommitments && !session.assetEvidence) {
 				const id = candidate.channelId;
 				this.finalTransport?.restoreFinalSettlements(id);
 				for (const a of store.loadFinalSpliceAttempts(id)) {
@@ -10694,7 +10696,11 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 	}
 	private observedFinalExit(id: string): Buffer | undefined {
 		const storage = this.config.finalOpening?.storage;
-		if (storage?.canSpliceDualFundedAssets) {
+		// A plain channel of a wallet that also runs asset channels takes the plain branch.
+		if (
+			storage?.canSpliceDualFundedAssets &&
+			storage.loadFinalChannelKind(id) === 'asset'
+		) {
 			const seen = this.finalObservedFunding.get(id);
 			const exits = storage.loadFinalFundingExits(id);
 			if (exits.length < 2) return;

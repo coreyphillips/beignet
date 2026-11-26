@@ -1,11 +1,12 @@
 import { strict as assert } from 'assert';
 import type { IAssetSpliceUpdateHost } from '../../../src/lightning/channel/asset-splice-update-provider';
 import { signatureRoundFixture } from './asset-splice-signature-round';
+import type { AssetSpliceGeneration } from './asset-splice-proof-release';
 
 /** Real peer devices and Bitcoin signatures, with a deterministic wallet proof test double. */
 export async function setupFundedAssetUpdatePair(
 	dir: string,
-	generation: 4 | 5 = 4
+	generation: AssetSpliceGeneration = 4
 ) {
 	const s = signatureRoundFixture(dir, false, generation);
 	s.construct();

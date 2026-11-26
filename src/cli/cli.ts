@@ -454,11 +454,13 @@ function initializeConfig(file: string): void {
 	const requestedAssets = hasFlag('--dual-funded-assets');
 	const requestedSplice = hasFlag('--asset-splice');
 	const requestedRecovery = hasFlag('--asset-splice-recovery');
+	const requestedConversion = hasFlag('--asset-conversion');
 	const finalTaprootWallet =
 		requestedUpdates ||
 		requestedAssets ||
 		requestedSplice ||
 		requestedRecovery ||
+		requestedConversion ||
 		hasFlag('--final-taproot-wallet');
 	const pending = fs.lstatSync(
 		nodePath.join(nodePath.dirname(file), 'final-wallet-init.pending'),
@@ -472,10 +474,13 @@ function initializeConfig(file: string): void {
 	const assetSplice = requestedSplice || config.assetSplice === true;
 	const assetSpliceRecovery =
 		requestedRecovery || config.assetSpliceRecovery === true;
+	const assetConversion =
+		requestedConversion || config.assetConversion === true;
 	if (
 		finalTaprootWallet &&
-		[updates, assets, assetSplice, assetSpliceRecovery].filter(Boolean).length >
-			1
+		[updates, assets, assetSplice, assetSpliceRecovery, assetConversion].filter(
+			Boolean
+		).length > 1
 	)
 		throw new BeignetError(
 			'INVALID_PARAMS',
@@ -496,6 +501,7 @@ function initializeConfig(file: string): void {
 					(assets && config.dualFundedAssets !== true) ||
 					(assetSplice && config.assetSplice !== true) ||
 					(assetSpliceRecovery && config.assetSpliceRecovery !== true) ||
+					(assetConversion && config.assetConversion !== true) ||
 					typeof config.mnemonic !== 'string' ||
 					!bip39.validateMnemonic(config.mnemonic))) ||
 			(config.finalTaprootWallet === true && !config.mnemonic))
@@ -523,6 +529,7 @@ function initializeConfig(file: string): void {
 					...(assets && { dualFundedAssets: true }),
 					...(assetSplice && { assetSplice: true }),
 					...(assetSpliceRecovery && { assetSpliceRecovery: true }),
+					...(assetConversion && { assetConversion: true }),
 					...(alias ? { alias } : {})
 				};
 				apiToken = mintApiTokenIfAbsent(complete);
@@ -531,7 +538,8 @@ function initializeConfig(file: string): void {
 			updates,
 			assets,
 			assetSplice,
-			assetSpliceRecovery
+			assetSpliceRecovery,
+			assetConversion
 		);
 		if (config.mnemonic) {
 			apiToken = mintApiTokenIfAbsent(enrolled);
@@ -3373,7 +3381,9 @@ async function handleRestore(): Promise<void> {
 				if (
 					network !== 'regtest' ||
 					!config.finalTaprootWallet ||
-					(!config.assetSplice && !config.assetSpliceRecovery)
+					(!config.assetSplice &&
+						!config.assetSpliceRecovery &&
+						!config.assetConversion)
 				)
 					throw new Error(
 						'Asset channel repair requires the enrolled regtest splice wallet'
@@ -3384,7 +3394,7 @@ async function handleRestore(): Promise<void> {
 					lockPath,
 					finalWalletBinding(
 						config.mnemonic,
-						config.assetSpliceRecovery ? 5 : 4
+						config.assetConversion ? 6 : config.assetSpliceRecovery ? 5 : 4
 					),
 					channelId,
 					macKey
@@ -3478,6 +3488,7 @@ Setup:
     [--dual-funded-assets]               Enroll a fresh regtest wallet for dual-funded asset opening
     [--asset-splice]                     Enroll a fresh regtest wallet for asset channel splices
     [--asset-splice-recovery]            Enroll a fresh regtest wallet for revocable asset payouts
+    [--asset-conversion]                 Enroll a fresh regtest wallet for plain and asset channels side by side
   start [flags]                          Start node daemon
   stop                                   Stop daemon
 

@@ -7,14 +7,18 @@ import {
 	MAX_INDEX
 } from '../../../src/lightning/keys/shachain';
 import { bip32RootFromSeed } from '../../../src/lightning/keys/wallet-keys';
-import { generateFinalDaemonWallet } from '../../../src/lightning/storage/final-wallet-generation';
 import type { SqliteStorage } from '../../../src/lightning/storage/sqlite-storage';
 import { ecc } from '../../../src/utils/ecc';
 import { boundParticipant, signingFixture } from './final-opening-signing';
 import { otherOpeningView } from './final-opening-commitment';
+import {
+	generateFinalGeneration,
+	type FinalGeneration
+} from './final-generation';
 export type Side = ReturnType<typeof boundParticipant>;
-export function generateSide() {
-	const { binding, mnemonic } = generateFinalDaemonWallet(true);
+/** A fresh original of the given generation, by default the plain update generation 2. */
+export function generateSide(generation: FinalGeneration = 2) {
+	const { binding, mnemonic } = generateFinalGeneration(generation);
 	return boundParticipant(
 		bip32RootFromSeed(mnemonicToSeedSync(mnemonic)),
 		1,

@@ -94,6 +94,7 @@ await node.destroy();
 | `dualFundedAssets?` | `boolean` | Enroll a fresh regtest wallet for dual-funded asset channel opening. |
 | `assetSplice?` | `boolean` | Enroll a fresh regtest wallet for asset channel splices. |
 | `assetSpliceRecovery?` | `boolean` | Enroll a fresh regtest wallet for revocable asset payouts across splices. |
+| `assetConversion?` | `boolean` | Enroll a fresh regtest wallet that runs plain final channels and recoverable asset channels side by side. |
 | `largeChannels?` | `boolean` | option_wumbo (large_channels, default false): advertise the bit and lift the 2^24 sat funding cap (up to 10 BTC) for peers that also advertise it. |
 | `autoBootstrap?` | `boolean` | Connect to DNS seed peers (BOLT 10) at startup (default false). |
 | `autoReconnect?` | `boolean` | Enable auto-reconnection to peers (default true) |
@@ -509,6 +510,8 @@ With `peerStorageEnabled` (default true) the node advertises
 After a regtest channel enrolled with `--asset-splice-recovery` is funded and ready, run `beignet backup asset-channel <channelId> <destPath>` to save an encrypted local recovery frame. Choose a new filename for each export. Frames taken before and after a splice are hash-linked on the original device. Keep the asset extension's matching recovery backup alongside the engine backup.
 
 Both `--asset-splice` and `--asset-splice-recovery` wallets also support a full SQLite snapshot through `beignet backup <destPath>`. Keep its `.hmac` file. To repair one channel, stop the daemon on the enrolled device and run `beignet restore asset-channel <channelId> <backupFile>` with its original database, signer and device journal present. The command recognizes either supported format, restores missing opening records and checks the saved journal prefix against the device's current history. The result reports `snapshotSequence` and `currentSequence` for the splice journal, plus `frameSequence` for a channel frame. An earlier backup can recover later confirmed payouts using the records on that device. Guardian and peer-storage recovery have their own formats.
+
+A wallet initialized with `--asset-conversion` (generation 6) runs plain final Taproot channels and asset channels of the `--asset-splice-recovery` profile side by side. Its asset channels take the same recovery frames, snapshots and `beignet restore asset-channel` repair. The command refuses its plain channels. It opens and accepts a plain channel only with a peer that also advertises bit 463 ([docs/EXTENSIONS.md](../../docs/EXTENSIONS.md)). Channels do not convert between the two types yet.
 
 
 - **SCB restore = on-chain recovery only.** The backup holds no commitment
@@ -1700,7 +1703,7 @@ All output is JSON. Add `--pretty` for indented output.
 ### Setup
 
 ```bash
-beignet init [--network regtest] [--alias mynode] [--final-taproot-wallet] [--final-commitment-updates | --dual-funded-assets | --asset-splice]
+beignet init [--network regtest] [--alias mynode] [--final-taproot-wallet] [--final-commitment-updates | --dual-funded-assets | --asset-splice | --asset-splice-recovery | --asset-conversion]
 beignet start [--port 2112] [--host 0.0.0.0] [--daemon] [--anchors] [--api-token <token>] \
   [--backup-path /path/to/backup.db] [--backup-interval 21600000] \
   [--daily-spend-limit 100000] [--tls-cert /path/cert.pem] [--tls-key /path/key.pem] \

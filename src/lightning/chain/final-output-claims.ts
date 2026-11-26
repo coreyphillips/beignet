@@ -23,6 +23,10 @@ import type { IFundingProvider } from '../node/types';
 import { attachFeeInputsToZeroFeeHtlcTx } from './sweep';
 import { satPerVbyteToSatPerKw } from './types';
 import { isDustOutput } from './closing';
+import type { IAuxiliaryDualFunding } from '../channel/asset-opening-provider';
+
+type AssetClaimBuilder =
+	typeof import('./asset-opening-claims').assetOpeningOutputClaims;
 
 export interface IFinalOutputClaim {
 	outputIndex: number;
@@ -132,6 +136,49 @@ function keyPathClaim(
 	return { outputIndex: index, relativeDelay: 0, absoluteHeight: 0, tx };
 }
 
+/**
+ * Claims for one final channel, by that channel's own kind: a plain channel
+ * from the plain builder, an asset channel from the asset builder, and an
+ * unknown channel from neither. A wallet that runs both kinds of channel
+ * decides per channel, not once per wallet.
+ */
+export function finalChannelOutputClaims(
+	runtime: IFinalOpeningRuntime,
+	id: Buffer,
+	parent: Transaction,
+	destination: Buffer,
+	feeRate: number,
+	provider: IAuxiliaryDualFunding | undefined,
+	trimmed:
+		| ((hash: Buffer, htlcId: bigint, preimage?: Buffer) => void)
+		| undefined,
+	kindOf: (channelId: string) => 'plain' | 'asset' | null,
+	builders: {
+		plain?: typeof finalOpeningOutputClaims;
+		asset?: AssetClaimBuilder;
+	} = {}
+): IFinalOutputClaim[] {
+	const kind = kindOf(id.toString('hex'));
+	if (kind === 'plain')
+		return (builders.plain ?? finalOpeningOutputClaims)(
+			runtime,
+			id,
+			parent,
+			destination,
+			feeRate,
+			trimmed
+		);
+	if (kind === 'asset')
+		return (
+			builders.asset ??
+			// Loaded on use: the asset builder imports this module's leaf claims.
+			(
+				require('./asset-opening-claims') as typeof import('./asset-opening-claims')
+			).assetOpeningOutputClaims
+		)(runtime, id, parent, destination, feeRate, provider, trimmed);
+	return [];
+}
+
 /** Rebuild only a journaled commitment, including every eligible output of revoked remote states. */
 export function finalOpeningOutputClaims(
 	runtime: IFinalOpeningRuntime,
@@ -150,7 +197,8 @@ export function finalOpeningOutputClaims(
 		return [];
 	const channelId = id.toString('hex'),
 		session = storage.loadFinalOpeningSession(channelId);
-	if (!session) return [];
+	// Plain channels only: an asset channel is claimed by assetOpeningOutputClaims.
+	if (!session || session.assetEvidence) return [];
 	const ledger = storage.loadFinalResolutionStates(channelId);
 	const opening = ledger
 		? undefined

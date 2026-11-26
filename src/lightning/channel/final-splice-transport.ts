@@ -92,7 +92,13 @@ export class FinalSpliceTransport {
 		if (first?.wire) this.sendFor(id, first.wire);
 	}
 	handles(id: string, type: M, payload: Buffer): boolean {
-		if (!this.runtime.storage.canUpdateFinalCommitments) return false;
+		const storage = this.runtime.storage;
+		if (
+			!storage.canUpdateFinalCommitments ||
+			(storage.canSpliceDualFundedAssets &&
+				storage.loadFinalChannelKind(id) === 'asset')
+		)
+			return false;
 		if (
 			[
 				M.STFU,

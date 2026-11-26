@@ -383,6 +383,7 @@ unexported interface IFinalUpdateLimits
 property IFinalUpdateLimits.local: IFinalHtlcLimits
 property IFinalUpdateLimits.remote: IFinalHtlcLimits
 unexported interface IFinalWalletBinding
+property IFinalWalletBinding.assetConversion?: boolean
 property IFinalWalletBinding.assetSplice?: boolean
 property IFinalWalletBinding.assetSpliceRecovery?: boolean
 property IFinalWalletBinding.dualFundedAssets?: boolean
@@ -514,6 +515,7 @@ method SqliteStorage.assetSpliceUpdateBatch(id: string, root: bip32#BIP32Interfa
 method SqliteStorage.assetSpliceUpdateHead(id: string): { inProgress?: { stateNumber: bigint; changes: beignet/lightning#channel.AssetUpdateChange[]; } | undefined; nextNumber: bigint; nextLocalId: bigint; nextPeerId: bigint; committed: IAssetUpdateSecured | undefined; }
 method SqliteStorage.auxiliaryRevokedCommitmentsSize(channelId: string): { rows: number; bytes: number; }
 method SqliteStorage.backup(destPath: string): Promise<void>
+get SqliteStorage.canConvertAssetChannels(): boolean
 get SqliteStorage.canOpenDualFundedAssets(): boolean
 get SqliteStorage.canRecoverAssetSplice(): boolean
 get SqliteStorage.canSignFinalOpening(): boolean
@@ -605,6 +607,7 @@ method SqliteStorage.loadChannelKeyIndex(channelId: string): number | null
 method SqliteStorage.loadCompositeSplice(id: string): beignet/lightning#channel.ICompositeSpliceRecord | null
 method SqliteStorage.loadFforVoucher(id: string): beignet/lightning#ffor.IFforVoucherArchive | null
 method SqliteStorage.loadFinalActiveFunding(id: string): IFinalFundingReference | null
+method SqliteStorage.loadFinalChannelKind(channelId: string): 'plain' | 'asset' | null
 method SqliteStorage.loadFinalCommitmentOneNonces(channelId: string): { local: Buffer; peer: Buffer; } | null
 method SqliteStorage.loadFinalCommitmentSnapshot(id: string): { localHeight: bigint; remoteHeight: bigint; localPoint: Buffer; remotePoint: Buffer; localNextPoint: Buffer; remoteNextPoint: Buffer; localBalanceMsat: bigint; remoteBalanceMsat: bigint; htlcs: { id: bigint; offeredBy: "local" | "peer"; amountMsat: bigint; paymentHash: Buffer; cltvExpiry: number; onionPacket: Buffer; blindingPoint: Buffer | undefined; skimmedFeeMsat: bigint | undefined; }[]; candidate: IFinalOpeningCandidate; terms: { commitmentFeeratePerKw: number; localBasepoints: { fundingPubkey: string; revocationBasepoint: string; paymentBasepoint: string; delayedPaymentBasepoint: string; htlcBasepoint: string; firstPerCommitmentPoint: string; }; remoteBasepoints: { fundingPubkey: string; revocationBasepoint: string; paymentBasepoint: string; delayedPaymentBasepoint: string; htlcBasepoint: string; firstPerCommitmentPoint: string; }; localToSelfDelay: number; remoteToSelfDelay: number; localDustLimitSatoshis: number; remoteDustLimitSatoshis: number; }; quiescent: boolean; } | null
 method SqliteStorage.loadFinalDaemonOpening(channelId: string): IFinalDaemonOpening | null
@@ -723,6 +726,7 @@ method SqliteStorage.signFinalUpdateCommitment(id: string, root: bip32#BIP32Inte
 method SqliteStorage.signFinalUpdateCommitmentBatch(id: string, root: bip32#BIP32Interface): Buffer[]
 method SqliteStorage.stageFinalHtlcUpdate(id: string, direction: 'local' | 'peer', type: beignet/lightning#message.MessageType, payload: Buffer): void
 method SqliteStorage.storeAssetOpeningWitnesses(channelId: string, witnesses: Buffer[][]): Buffer
+get SqliteStorage.supportsAssetConversion(): boolean
 get SqliteStorage.supportsAssetSpliceRecovery(): boolean
 method SqliteStorage.transaction<T>(fn: () => T): T
 method SqliteStorage.unreadableAssetChannelIds(): string[]

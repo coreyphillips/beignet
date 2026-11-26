@@ -77,6 +77,7 @@ import type { LightningNodeEvents, NodeErrorCode } from './events';
 import { randomBytes, sha256 } from '../crypto/provider';
 import type { ILogger } from '../../logger';
 import {
+	finalChannelOutputClaims,
 	finalOpeningOutputClaims,
 	sponsorFinalClaim
 } from '../chain/final-output-claims';
@@ -1201,12 +1202,26 @@ class NodeFeatureFlags extends FeatureFlags {
 		private readonly finalDaemon: boolean,
 		private readonly assetOpening: boolean,
 		private readonly assetSplice: boolean,
-		private readonly assetRecovery: boolean
+		private readonly assetRecovery: boolean,
+		private readonly assetConversion: boolean
 	) {
 		super();
 	}
 
 	private masksFinalBit(bit: number): boolean {
+		if (bit === Feature.OPTION_ASSET_CONVERSION) return true;
+		// 463 also stands for the plain final type, so it needs what that type needs.
+		if (bit === Feature.OPTION_ASSET_CONVERSION + 1)
+			return (
+				!this.assetConversion ||
+				this.masksFinalBit(Feature.OPTION_ASSET_SPLICE_RECOVERY + 1) ||
+				![
+					Feature.OPTION_ASSET_SPLICE_RECOVERY,
+					Feature.CHANNEL_TYPE,
+					Feature.SHUTDOWN_ANY_SEGWIT,
+					Feature.DUAL_FUND
+				].every((f) => this.configured.hasFeature(f))
+			);
 		if (bit === Feature.OPTION_ASSET_SPLICE_RECOVERY) return true;
 		if (bit === Feature.OPTION_ASSET_SPLICE_RECOVERY + 1)
 			return (
@@ -1252,6 +1267,8 @@ class NodeFeatureFlags extends FeatureFlags {
 
 	private advertised(): FeatureFlags {
 		const masked = [
+			Feature.OPTION_ASSET_CONVERSION,
+			Feature.OPTION_ASSET_CONVERSION + 1,
 			Feature.OPTION_ASSET_SPLICE_RECOVERY,
 			Feature.OPTION_ASSET_SPLICE_RECOVERY + 1,
 			Feature.OPTION_ASSET_SPLICE,
@@ -1388,6 +1405,8 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	private cleanupTimer: ReturnType<typeof setInterval> | null = null;
 	private storage: IStorageBackend | null = null;
 	private readonly assetOpeningType: string;
+	/** A generation 6 wallet negotiates the plain final type through bit 463 only. */
+	private readonly conversionWallet: boolean;
 	/** Safety transition committer; null when the node persists nothing. */
 	private recovery: RecoveryManager | null = null;
 	/**
@@ -2326,6 +2345,8 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		const recoveryHost =
 			recoveryWallet &&
 			completeAssetSpliceRecoveryHost(config.auxiliaryChannels?.dualFunding);
+		const conversionWallet = !!finalDaemon?.storage.supportsAssetConversion;
+		this.conversionWallet = conversionWallet;
 		const localFeatures = new NodeFeatureFlags(
 			config.localFeatures ?? LightningNode.defaultFeatures(),
 			Boolean(finalDaemon),
@@ -2333,7 +2354,8 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				completeAssetOpeningHost(config.auxiliaryChannels?.dualFunding),
 			!!finalDaemon?.storage.canSpliceDualFundedAssets &&
 				completeAssetSpliceHost(config.auxiliaryChannels?.dualFunding),
-			recoveryHost
+			recoveryHost,
+			!!finalDaemon?.storage.canConvertAssetChannels && recoveryHost
 		);
 		// Advertise anchor support whenever anchors are preferred (the default).
 		if (
@@ -2506,6 +2528,8 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			localFeatures.setOptional(Feature.OPTION_ASSET_SPLICE);
 		if (recoveryHost)
 			localFeatures.setOptional(Feature.OPTION_ASSET_SPLICE_RECOVERY);
+		if (finalDaemon?.storage.canConvertAssetChannels && recoveryHost)
+			localFeatures.setOptional(Feature.OPTION_ASSET_CONVERSION);
 		this.localFeatures = localFeatures;
 
 		// An asset channel is not accepted by a node whose wallet refused the
@@ -2585,7 +2609,8 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 							: finalOpeningNegotiated(
 									localFeatures,
 									this.peerInitFeatures(peerPubkey),
-									channelType
+									channelType,
+									conversionWallet
 							  )
 				: undefined,
 			allocateChannelKeyIndex: finalDaemon
@@ -3188,7 +3213,21 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			// land in the tracked wallet; else fall back to the funding-key P2WPKH.
 			const destinationScript = this.getSweepDestinationScript();
 			this.chainWatcher = new ChainWatcher({
-				finalOutputClaims: finalDaemon?.storage.canOpenDualFundedAssets
+				// A generation 6 original claims each channel by its own kind.
+				finalOutputClaims: finalDaemon?.storage.canConvertAssetChannels
+					? (id, parent, destination, rate, trimmed) =>
+							finalChannelOutputClaims(
+								finalDaemon.runtime,
+								id,
+								parent,
+								destination,
+								rate,
+								config.auxiliaryChannels?.dualFunding,
+								trimmed,
+								(channelId) =>
+									finalDaemon.storage.loadFinalChannelKind(channelId)
+							)
+					: finalDaemon?.storage.canOpenDualFundedAssets
 					? (id, parent, destination, rate, trimmed) =>
 							assetOpeningOutputClaims(
 								finalDaemon.runtime,
@@ -13657,6 +13696,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 					Feature.OPTION_SIMPLE_TAPROOT
 				));
 		if (final) {
+			const conversionWallet = this.conversionWallet;
 			if (
 				!channelType ||
 				!(params.dualFundedAssets
@@ -13668,12 +13708,15 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 					: finalOpeningNegotiated(
 							this.localFeatures,
 							this.peerInitFeatures(peerPubkey),
-							channelType
+							channelType,
+							conversionWallet
 					  ))
 			)
 				throw new InvalidChannelOpenError(
 					params.dualFundedAssets
 						? 'Asset opening requires an enrolled original wallet and negotiated asset funding'
+						: conversionWallet
+						? 'Final Taproot opening of a conversion wallet requires the enrolled original and negotiated asset conversion (bit 463), channel type, shutdown anysegwit and dual funding'
 						: 'Final Taproot opening requires the enrolled original and negotiated channel type, simple close, shutdown anysegwit, dual funding and final Taproot'
 				);
 			const allowed = [

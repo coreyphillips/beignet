@@ -4075,6 +4075,7 @@ member features.Feature.KEYSEND = 54
 member features.Feature.LARGE_CHANNELS = 18
 member features.Feature.ONION_MESSAGES = 38
 member features.Feature.OPTION_ASSET_CHILD_CUSTODY = 452
+member features.Feature.OPTION_ASSET_CONVERSION = 462
 member features.Feature.OPTION_ASSET_FIXED_HTLC_OUTPUTS = 450
 member features.Feature.OPTION_ASSET_SPLICE = 458
 member features.Feature.OPTION_ASSET_SPLICE_RECOVERY = 460

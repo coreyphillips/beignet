@@ -3,14 +3,18 @@ import { AssetSpliceConstruction } from '../../../src/lightning/channel/asset-sp
 import type { IAssetSpliceSigningHost } from '../../../src/lightning/channel/asset-splice-signature-round';
 import { constructionFixture } from './asset-splice-construction';
 import { walletSigner } from './final-update-pair';
+import type { AssetSpliceGeneration } from './asset-splice-proof-release';
 
 export function signatureRoundFixture(
 	dir: string,
 	transportAllocatesKeys = false,
-	generation: 4 | 5 = 4
+	generation: AssetSpliceGeneration = 4
 ) {
 	const s = constructionFixture(dir, generation),
 		{ f, layout } = s;
+	// The host sees the asset channel's profile, not the wallet identity: a
+	// generation 6 wallet's asset channel is of the recovery profile (5).
+	const walletGeneration = generation === 6 ? 5 : generation;
 	f.fundOpening();
 	const pending = f.devices.map((d) =>
 		transportAllocatesKeys ? 2 : d.store.allocateFinalChannelKeyIndex(2)
@@ -28,12 +32,12 @@ export function signatureRoundFixture(
 		peer: f.devices[1 - i].party.binding.nodeId,
 		attempt: layout.attempt,
 		isInitiator: i === 0,
-		walletGeneration: generation,
+		walletGeneration,
 		stateNumber: 0n,
 		oldOutpoint: { hash: layout.parent.getHash(), index: layout.parentIndex },
 		currentParent: () => ({
 			stateNumber: 0n,
-			walletGeneration: generation,
+			walletGeneration,
 			oldOutpoint: { hash: layout.parent.getHash(), index: layout.parentIndex }
 		})
 	});

@@ -1218,6 +1218,8 @@ export interface BeignetConfig
 	assetSplice?: boolean;
 	/** Enroll a fresh regtest wallet for revocable asset payouts across splices. */
 	assetSpliceRecovery?: boolean;
+	/** Enroll a fresh regtest wallet that runs plain final channels and recoverable asset channels side by side. */
+	assetConversion?: boolean;
 	/** option_wumbo: advertise large_channels and lift the 2^24 sat funding cap. */
 	largeChannels?: boolean;
 	/** Legacy single API bearer token. Still honored with implicit admin scope. */

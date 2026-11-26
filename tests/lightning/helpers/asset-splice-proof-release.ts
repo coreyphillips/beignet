@@ -38,26 +38,24 @@ import {
 	type IAssetSpliceExitProofs
 } from '../../../src/lightning/storage/asset-splice-exit-proofs';
 import type { FinalOpeningAuthority } from '../../../src/lightning/storage/final-opening-authority';
-import { generateFinalDaemonWallet } from '../../../src/lightning/storage/final-wallet-generation';
 import { SqliteStorage } from '../../../src/lightning/storage/sqlite-storage';
 import { inputTransaction } from './final-opening';
+import { generateFinalGeneration } from './final-generation';
 import { otherOpeningView } from './final-opening-commitment';
 import { boundParticipant, signingFixture } from './final-opening-signing';
 import { walletSigner } from './final-update-pair';
 
-function device(dir: string, name: string, generation: 4 | 5) {
-	const fresh = generateFinalDaemonWallet(
-		false,
-		false,
-		generation === 4,
-		generation === 5
-	);
+/** Generation 6 holds asset channels of the recovery profile, as 5 does. */
+export type AssetSpliceGeneration = 4 | 5 | 6;
+function device(dir: string, name: string, generation: AssetSpliceGeneration) {
+	const fresh = generateFinalGeneration(generation);
 	const seed = mnemonicToSeedSync(fresh.mnemonic);
 	const party = boundParticipant(bip32RootFromSeed(seed), 1, fresh.binding);
 	const file = path.join(dir, name);
 	return {
 		party,
 		seed,
+		mnemonic: fresh.mnemonic,
 		file,
 		store: SqliteStorage.createFinalWallet(file, fresh.binding)
 	};
@@ -85,7 +83,7 @@ type AlternateContext = {
 export function setupAssetSpliceProofs(
 	dir: string,
 	updateLimits?: import('../../../src/lightning/storage/final-channel-updates').IFinalUpdateLimits,
-	generation: 4 | 5 = 4
+	generation: AssetSpliceGeneration = 4
 ) {
 	const devices = [
 		device(dir, 'left', generation),
@@ -108,7 +106,7 @@ export function setupAssetSpliceProofs(
 			root
 		).p2trOutput;
 	opening.channelType =
-		generation === 5 ? ASSET_SPLICE_RECOVERY_TYPE_HEX : ASSET_OPENING_TYPE_HEX;
+		generation === 4 ? ASSET_OPENING_TYPE_HEX : ASSET_SPLICE_RECOVERY_TYPE_HEX;
 	for (const [i, input] of opening.inputs.entries()) {
 		const previous = Transaction.fromHex(input.prevTxHex);
 		previous.outs[0].script = payments.p2wpkh({

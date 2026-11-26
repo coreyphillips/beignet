@@ -86,8 +86,10 @@ export enum Feature {
 	 * bit pending a spec assignment.
 	 */
 	OPTION_WILL_FUND = 112,
-	// beignet's own experimental bits sit in the 440-445 block and on the
-	// 454/455 pair (446-453 are reserved for the taproot asset channel work).
+	// beignet's own experimental bits sit in the 440-445 block, on the
+	// 454/455 pair and in the 456-463 block of private regtest asset channel
+	// profiles and conversion (446-453 are reserved for the taproot asset
+	// channel work).
 	// None may share a bit with another implementation or the bLIP-2 registry: a peer that
 	// reads our bit as its own feature sends messages we do not know, and we
 	// disconnect (560-563 collided with eclair's on-the-fly funding, #1886).
@@ -153,7 +155,13 @@ export enum Feature {
 	OPTION_DUAL_FUNDED_ASSETS = 456,
 	/** Private regtest asset splice v1, optional bit 459. */
 	OPTION_ASSET_SPLICE = 458,
-	OPTION_ASSET_SPLICE_RECOVERY = 460
+	OPTION_ASSET_SPLICE_RECOVERY = 460,
+	/**
+	 * Private regtest asset conversion v1, optional bit 463. Between two
+	 * generation 6 peers it also stands for the plain final type and its
+	 * simple close.
+	 */
+	OPTION_ASSET_CONVERSION = 462
 }
 
 /**

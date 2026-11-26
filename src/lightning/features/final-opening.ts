@@ -10,11 +10,30 @@ export function finalOpeningDependencies(features: FeatureFlags): boolean {
 	].every((feature) => features.hasFeature(feature));
 }
 
-/** Opening admission uses the two live init vectors, including the proposed SCID alias. */
+/**
+ * What bit 463 stands for between two generation 6 peers: their inits keep
+ * the asset masks, which clear simple close and bit 81, so the conversion bit
+ * takes the place of both for the plain final type.
+ */
+function conversionDependencies(features: FeatureFlags): boolean {
+	return [
+		Feature.OPTION_ASSET_CONVERSION,
+		Feature.CHANNEL_TYPE,
+		Feature.SHUTDOWN_ANY_SEGWIT,
+		Feature.DUAL_FUND
+	].every((feature) => features.hasFeature(feature));
+}
+
+/**
+ * Opening admission uses the two live init vectors, including the proposed
+ * SCID alias. A generation 6 wallet (`conversionWallet`) negotiates the plain
+ * final type only through bit 463 on both inits.
+ */
 export function finalOpeningNegotiated(
 	local: FeatureFlags,
 	remote: FeatureFlags | undefined,
-	channelType: Buffer
+	channelType: Buffer,
+	conversionWallet = false
 ): boolean {
 	if (
 		!Buffer.isBuffer(channelType) ||
@@ -27,8 +46,10 @@ export function finalOpeningNegotiated(
 	);
 	return [local, remote].every(
 		(features) =>
-			finalOpeningDependencies(features) &&
-			features.hasFeature(Feature.OPTION_SIMPLE_TAPROOT) &&
+			(conversionWallet
+				? conversionDependencies(features)
+				: finalOpeningDependencies(features) &&
+				  features.hasFeature(Feature.OPTION_SIMPLE_TAPROOT)) &&
 			(!alias || features.hasFeature(Feature.SCID_ALIAS))
 	);
 }

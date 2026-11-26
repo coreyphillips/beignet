@@ -514,6 +514,7 @@ export function resolveConfig(cliFlags: Partial<BeignetConfig>): BeignetConfig {
 		assetSplice: cliFlags.assetSplice ?? file.assetSplice,
 		assetSpliceRecovery:
 			cliFlags.assetSpliceRecovery ?? file.assetSpliceRecovery,
+		assetConversion: cliFlags.assetConversion ?? file.assetConversion,
 		preferAnchors:
 			cliFlags.preferAnchors ??
 			(process.env.BEIGNET_PREFER_ANCHORS !== undefined

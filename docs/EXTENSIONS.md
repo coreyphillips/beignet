@@ -585,3 +585,17 @@ For unresolved HTLCs the watcher uses the recorded preimage or the negotiated ex
 After the channel is funded and ready, export an encrypted local recovery frame with `beignet backup asset-channel <channelId> <destPath>` or `await beignetNode.backupAssetChannelFrame(channelId, destPath)`. Use a new file for each export. Frames for the same channel carry a sequence and the previous frame's hash. A full SQLite backup and its HMAC also support repair. Save the extension's matching payout locators with either format.
 
 On the enrolled original device, stop the daemon and run `beignet restore asset-channel <channelId> <backupFile>` with the original wallet, signer and device journal present. The engine authenticates the saved opening and the splice journal prefix against that device. Its current journal supplies later funding and exit records. Restoring the extension's payout locators lets the host observe the confirmed exit and import its verified payouts while the peer is offline. Signing authority stays on the enrolled device.
+
+## Plain and asset channels in one regtest wallet
+
+For a fresh regtest wallet, `beignet init --network regtest --asset-conversion` enrolls the original device in generation 6. The profiles the regtest wallets enroll are:
+
+- generation 2 (`--final-commitment-updates`): plain final Taproot channels;
+- generation 3 (`--dual-funded-assets`), 4 (`--asset-splice`) and 5 (`--asset-splice-recovery`): asset channels;
+- generation 6 (`--asset-conversion`): plain final Taproot channels as generation 2 runs them and asset channels of the generation 5 recovery profile, side by side.
+
+Each channel of a generation 6 wallet is driven, claimed and backed up by its own type, which its opening fixes. An asset channel keeps the generation 5 channel type and reports `walletGeneration` 5 to the host, and the host requirements are those of generation 5. The node refuses an opening of the generation 4 asset type. A build without generation 6 refuses the whole wallet.
+
+Generation 6 nodes advertise optional init bit 463 (pair 462/463) once bit 461 is advertised and the node has channel type, shutdown anysegwit and dual funding. A node configured with asset channels clears simple close and bit 81 from its init. Between two peers that both set 463, the bit stands for the plain final type and its simple close. A generation 6 node opens and accepts a plain final channel only with 463 on both inits. That channel closes cooperatively through the final close, which reads no init features. An asset channel is negotiated as in generation 5, so a generation 6 wallet can hold one with a generation 5 peer.
+
+Converting a channel from one type to the other is not available yet. Bit 463 is the feature such a conversion will negotiate. `beignet restore asset-channel` restores the asset channels of a generation 6 wallet, but not its plain channels.
