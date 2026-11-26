@@ -301,6 +301,137 @@ describe('Splice lock, confirmed wallet receipt and offline recovery', function 
 		manager.observeFinalFunding(f.id, txid, undefined, false);
 		expect(manager.isAssetSpliceFundingAvailable(f.id, txid)).to.equal(false);
 	});
+	describe('a close that spends a pending candidate', () => {
+		let verifies: number, spent: boolean, manager: ChannelManager;
+		let e: ReturnType<typeof f.evidence>, id: Buffer, txid: string;
+		const observe = (confirmations = 3): Promise<void> =>
+			manager.observeAssetSpliceFunding(
+				f.id,
+				txid,
+				20,
+				async () => ({ txid, blockHash: 'b0'.repeat(32), confirmations }),
+				() => true
+			);
+		beforeEach(() => {
+			const { store, party } = f.devices[0];
+			e = f.evidence(0);
+			f.retain(0);
+			f.sign(0, f.context(0));
+			verifies = 0;
+			spent = false;
+			manager = new ChannelManager({
+				finalOpening: {
+					storage: store,
+					root: party.root,
+					dualFunding: {
+						verifySpliceFunding: async () => {
+							verifies++;
+							if (spent)
+								throw Error('Candidate funding has already been spent');
+						},
+						confirmSpliceFunding: async () => {}
+					}
+				},
+				persistence: { persist: () => 'committed' }
+			} as unknown as IChannelManagerConfig);
+			manager.restoreFinalOpeningBroadcasts();
+			id = Buffer.from(f.id, 'hex');
+			txid = e.candidate.fundingTxid;
+		});
+		it('stops asking the wallet to verify the candidate once the close is seen, and asks again after a reorg removes the close', async () => {
+			await observe(1);
+			expect(verifies).to.equal(0);
+			manager.handleFundingSpent(
+				id,
+				Transaction.fromHex(e.candidate.remoteCommitment),
+				22,
+				Buffer.alloc(0)
+			);
+			spent = true;
+			expect(manager.finalOpeningInfo(id)[0].state).to.equal(
+				ChannelState.FORCE_CLOSED
+			);
+			await observe(3);
+			await observe(4);
+			expect(verifies).to.equal(0);
+			// The inclusion that exit selection reads is kept as before.
+			expect(
+				manager['assetSpliceConfirmation']!.hasCurrentInclusion(f.id, txid, 20)
+			).to.equal(true);
+			// The peer's lock arriving after the close is taken without asking.
+			expect(
+				await manager.receiveAssetSpliceLocked(
+					f.devices[1].party.binding.nodeId,
+					encodeSpliceLockedMessage({
+						channelId: id,
+						fundingTxid: Buffer.from(txid, 'hex').reverse()
+					})
+				)
+			).to.equal(true);
+			expect(verifies).to.equal(0);
+			expect(manager.isAssetSpliceFundingAvailable(f.id, txid)).to.equal(false);
+
+			manager.observeFinalFunding(f.id, txid, 20, false);
+			spent = false;
+			expect(manager.finalOpeningInfo(id)[0].state).not.to.equal(
+				ChannelState.FORCE_CLOSED
+			);
+			await observe(3);
+			expect(verifies).to.equal(1);
+		});
+		it('stops as well for a close still in the mempool, and asks again once the candidate is seen unspent', async () => {
+			manager.handleFundingSpent(
+				id,
+				Transaction.fromHex(e.candidate.localCommitment),
+				0,
+				Buffer.alloc(0)
+			);
+			spent = true;
+			await observe(3);
+			expect(verifies).to.equal(0);
+			manager.observeFinalFunding(f.id, txid, 20, false);
+			spent = false;
+			await observe(3);
+			expect(verifies).to.equal(1);
+		});
+		it('keeps asking when the close spent the original funding output instead', async () => {
+			manager.handleFundingSpent(
+				id,
+				Transaction.fromHex(e.parent.localCommitment),
+				22,
+				Buffer.alloc(0)
+			);
+			expect(manager.finalOpeningInfo(id)[0].state).to.equal(
+				ChannelState.FORCE_CLOSED
+			);
+			await observe(3);
+			await observe(4);
+			expect(verifies).to.equal(2);
+		});
+		it('leaves an adopted splice to its lock', async () => {
+			await manager.receiveAssetSpliceLocked(
+				f.devices[1].party.binding.nodeId,
+				encodeSpliceLockedMessage({
+					channelId: id,
+					fundingTxid: Buffer.from(txid, 'hex').reverse()
+				})
+			);
+			await observe(3);
+			expect(verifies).to.equal(1);
+			expect(manager.hasAssetSpliceWatch(f.id, txid)).to.equal(true);
+			expect(
+				f.devices[0].store.loadAdoptedAssetSpliceReceipt(f.id)
+			).to.not.equal(undefined);
+			manager.handleFundingSpent(
+				id,
+				Transaction.fromHex(e.candidate.remoteCommitment),
+				22,
+				Buffer.alloc(0)
+			);
+			await observe(4);
+			expect(verifies).to.equal(2);
+		});
+	});
 	it('treats an observed splice as funding and force closes the proven unspent candidate below lock depth', async () => {
 		const { store, party } = f.devices[0],
 			e = f.evidence(0);

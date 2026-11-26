@@ -87,7 +87,9 @@ export class AssetSpliceConfirmationCoordinator {
 			depth: number
 		) => void,
 		private readonly send: (peer: string, raw: Buffer) => void,
-		private readonly adopted?: (id: string, txid: string) => void
+		private readonly adopted?: (id: string, txid: string) => void,
+		/** Whether a close seen for the channel spends this funding outpoint (`txid:index`). */
+		private readonly closedBy?: (id: string, outpoint: string) => boolean
 	) {}
 
 	private walletAction(
@@ -435,6 +437,15 @@ export class AssetSpliceConfirmationCoordinator {
 			/^[0-9a-f]{64}$/.test(anchor.blockHash) &&
 			Number.isSafeInteger(anchor.confirmations) &&
 			anchor.confirmations > 0;
+		// A close seen spending this candidate's output before the splice
+		// locks leaves nothing to lock: the wallet would refuse to verify the
+		// spent funding on every block. A reorg or eviction that leaves the
+		// output unspent clears the close, and the next observation verifies.
+		if (
+			!e.lock.state().adopted &&
+			this.closedBy?.(id, e.terms.txid + ':' + e.terms.outputIndex)
+		)
+			return;
 		try {
 			await e.lock.observe(anchor);
 			if (ticket !== e.ticket || !current()) return;

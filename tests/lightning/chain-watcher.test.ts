@@ -35,6 +35,7 @@ import {
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
 import { IChannelBasepoints } from '../../src/lightning/keys/derivation';
 import { COMMIT_ALL } from './helpers/channel-persistence';
+import { ChannelState as FinalChannelState } from '../../src/lightning/channel/types';
 
 bitcoin.initEccLib(ecc);
 
@@ -638,6 +639,146 @@ describe('Phase 4: Chain Watcher', () => {
 				}
 			});
 		}
+
+		it('stops verifying a pending splice once a mined close spends its output, and verifies again after a reorg removes the close', async function () {
+			this.timeout(60000);
+			watcher.stop();
+			const dir = mkdtempSync(join(tmpdir(), 'asset-splice-closed-candidate-'));
+			const pair = await setupFundedAssetUpdatePair(dir);
+			try {
+				const { store, party } = pair.f.devices[0];
+				const id = pair.f.id,
+					channelId = Buffer.from(id, 'hex');
+				let verifies = 0,
+					spent = false;
+				channelManager = new ChannelManager({
+					finalOpening: {
+						storage: store,
+						root: party.root,
+						dualFunding: {
+							verifySpliceFunding: async () => {
+								verifies++;
+								if (spent)
+									throw Error('Candidate funding has already been spent');
+							},
+							confirmSpliceFunding: async () => {}
+						}
+					},
+					verifyRemoteFundingInput: async () => 'unspent',
+					persistence: COMMIT_ALL
+				} as unknown as IChannelManagerConfig);
+				channelManager.on('error', () => {});
+				const { parent, candidate } =
+					store.loadAssetSpliceFundingInfo(id).pending[0];
+				const parentTx = bitcoin.Transaction.fromHex(
+					parent.funding.fundingTxHex
+				);
+				const candidateTx = bitcoin.Transaction.fromHex(
+					candidate.funding.fundingTxHex
+				);
+				const coin = candidateTx.outs[candidate.outputIndex];
+				const candidateScript = computeScriptHash(coin.script);
+				const parentScript = computeScriptHash(
+					parentTx.outs[parent.outputIndex].script
+				);
+				const parentRow = { txid: parentTx.getId(), height: 60 };
+				const candidateRow = { txid: candidateTx.getId(), height: 70 };
+				const close = pair.f.views[1].candidate.expected;
+				expect(close.ins[0].hash.equals(candidateTx.getHash())).to.equal(true);
+				let candidateUnspent = true;
+				backend.setTransaction(parentTx.getId(), parentTx.toBuffer());
+				backend.setTransaction(candidateTx.getId(), candidateTx.toBuffer());
+				backend.setTransaction(close.getId(), close.toBuffer());
+				Object.assign(backend, {
+					listUnspent: async (script: string) =>
+						script === candidateScript && candidateUnspent
+							? [
+									{
+										...candidateRow,
+										outputIndex: candidate.outputIndex,
+										valueSat: coin.value
+									}
+							  ]
+							: [],
+					getAssetSpliceInclusion: async (txid: string, height: number) => {
+						const found = [parentRow, candidateRow].find(
+							(r) => r.txid === txid && r.height === height
+						);
+						if (!found) throw Error('Missing block proof');
+						return {
+							txid,
+							blockHash: '35'.repeat(32),
+							confirmations: 73 - height
+						};
+					}
+				});
+				channelManager.restoreFinalOpeningBroadcasts();
+				watcher = new ChainWatcher({
+					backend,
+					channelManager,
+					missingDebounceMs: 0
+				});
+				const errors: string[] = [];
+				watcher.on('error', (err: Error) => errors.push(err.message));
+				await watcher.start();
+				backend.simulateNewBlock(72);
+				const scan = () =>
+					watcher.watchFinalFundingOutput(
+						channelId,
+						candidateTx.getId(),
+						candidate.outputIndex,
+						3,
+						coin.script,
+						coin.value
+					);
+				backend.setHistory(parentScript, [parentRow, candidateRow]);
+				backend.setHistory(candidateScript, [candidateRow]);
+				await scan();
+				expect(verifies, 'verified at depth').to.equal(1);
+
+				candidateUnspent = false;
+				spent = true;
+				backend.setHistory(candidateScript, [
+					candidateRow,
+					{ txid: close.getId(), height: 71 }
+				]);
+				const closed = (): boolean =>
+					channelManager.finalOpeningInfo(channelId)[0]?.state ===
+					FinalChannelState.FORCE_CLOSED;
+				for (let i = 0; i < 50 && !closed(); i++) {
+					await scan();
+					await new Promise<void>((done) => setImmediate(done));
+				}
+				expect(closed(), 'the close is recorded').to.equal(true);
+				const atClose = verifies;
+				for (let height = 73; height < 76; height++) {
+					backend.simulateNewBlock(height);
+					await new Promise<void>((done) => setImmediate(done));
+					await scan();
+				}
+				expect(verifies, 'no verification after the close').to.equal(atClose);
+				const refusals = errors.filter((m) => /already been spent/.test(m));
+				expect(refusals.length, 'refusals after the close').to.be.at.most(
+					atClose - 1
+				);
+
+				candidateUnspent = true;
+				spent = false;
+				backend.setHistory(candidateScript, [candidateRow]);
+				backend.simulateNewBlock(75);
+				await new Promise<void>((done) => setImmediate(done));
+				await scan();
+				await scan();
+				expect(closed(), 'the reorg removes the close').to.equal(false);
+				expect(verifies, 'verified again after the reorg').to.be.greaterThan(
+					atClose
+				);
+			} finally {
+				watcher.stop();
+				for (const dev of pair.f.devices) dev.store.close();
+				rmSync(dir, { recursive: true, force: true });
+			}
+		});
 
 		it('permits pending asset updates only for a released candidate with a current mined unspent output', async function () {
 			this.timeout(60000);
