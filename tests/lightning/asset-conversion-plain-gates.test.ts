@@ -39,6 +39,18 @@ import {
 	type Side
 } from './helpers/final-update-pair';
 import { plainUpdates, plainWire } from './helpers/final-plain-wire';
+import {
+	assetTypePair,
+	plainTypePair,
+	scratch
+} from './helpers/channel-type-pairs';
+import {
+	appendBoth,
+	buildConversion,
+	openingParent,
+	TEXT,
+	typed
+} from './helpers/channel-type-record';
 
 const CONVERSION = 462;
 const destination = Buffer.from('0014' + 'cd'.repeat(20), 'hex');
@@ -510,6 +522,251 @@ describe('Asset payout slots of a plain opening in generation 5 (#2151 step 1)',
 		} finally {
 			for (const s of stores) s.close();
 			fs.rmSync(dir, { recursive: true, force: true });
+		}
+	});
+});
+
+/** The sites of section 3 a test reaches through public storage calls, by label. */
+function currentTypeSites(
+	store: SqliteStorage,
+	root: import('bip32').BIP32Interface,
+	id: string,
+	labels: Record<string, string>
+): Record<string, unknown> {
+	const label = (txid: string) => labels[txid] ?? txid;
+	const spends = (raw: Buffer) =>
+		label(
+			Buffer.from(Transaction.fromBuffer(raw).ins[0].hash)
+				.reverse()
+				.toString('hex')
+		);
+	const rows: Record<string, () => unknown> = {
+		loadFinalChannelKind: () => store.loadFinalChannelKind(id),
+		loadFinalActiveFunding: () => {
+			const f = store.loadFinalActiveFunding(id);
+			return f ? label(Transaction.fromHex(f.fundingTxHex).getId()) : null;
+		},
+		loadFinalOpeningExit: () => {
+			const exit = store.loadFinalOpeningExit(id);
+			return exit ? spends(exit) : null;
+		},
+		loadFinalFundingExits: () =>
+			store
+				.loadFinalFundingExits(id)
+				.map((e) =>
+					label(Buffer.from(e.fundingTxid).reverse().toString('hex'))
+				),
+		loadFinalUpdateStatus: () => {
+			const status = store.loadFinalUpdateStatus(id);
+			return status ? status.localHeight + '/' + status.remoteHeight : null;
+		},
+		loadFinalResolutionStates: () => {
+			const states = store.loadFinalResolutionStates(id);
+			return states ? String(states.local.height) : null;
+		},
+		loadFinalSimpleClose: () => store.loadFinalSimpleClose(id),
+		loadFinalSpliceAttempts: () => store.loadFinalSpliceAttempts(id).length,
+		readAssetSpliceJournal: () => store.readAssetSpliceJournal(id).sequence,
+		assetSpliceUpdateHead: () =>
+			String(store.assetSpliceUpdateHead(id).nextNumber),
+		loadAssetSpliceFundingInfo: () => {
+			const active = store.loadAssetSpliceFundingInfo(id).active;
+			return active ? label(active.candidate.fundingTxid) : 'none';
+		},
+		finalSpliceSession: () => {
+			store.finalSpliceSession(id, root);
+			return 'session';
+		}
+	};
+	const result: Record<string, unknown> = {};
+	for (const [name, run] of Object.entries(rows))
+		try {
+			result[name] = run();
+		} catch (e) {
+			result[name] = { threw: (e as Error).message };
+		}
+	return result;
+}
+
+describe('Current type at each reachable site (#2151 step 2a, items 3 and 8)', function () {
+	this.timeout(240000);
+	const s = scratch('channel-type-sites-');
+	afterEach(() => s.release());
+	const openingLabel = (store: SqliteStorage, id: string) => ({
+		[Transaction.fromHex(store.loadFinalOpening(id)!.fundingTxHex).getId()]:
+			'opening'
+	});
+	async function assetRow(generation: 5 | 6) {
+		const pair = await assetTypePair(s, 1, generation);
+		const { store, root } = pair.devices[0];
+		return {
+			pair,
+			sites: currentTypeSites(
+				store,
+				root,
+				pair.id,
+				openingLabel(store, pair.id)
+			)
+		};
+	}
+	function plainRow(generation: 2 | 6) {
+		const pair = plainTypePair(s, 1, generation);
+		const { store, root } = pair.devices[0];
+		return {
+			pair,
+			sites: currentTypeSites(
+				store,
+				root,
+				pair.id,
+				openingLabel(store, pair.id)
+			)
+		};
+	}
+
+	const superseded = {
+		threw: 'Opening exit was superseded by a later commitment'
+	};
+	const asset5 = {
+		loadFinalChannelKind: 'asset',
+		loadFinalActiveFunding: 'opening',
+		loadFinalOpeningExit: superseded,
+		loadFinalFundingExits: ['opening'],
+		loadFinalUpdateStatus: null,
+		loadFinalResolutionStates: null,
+		loadFinalSimpleClose: null,
+		loadFinalSpliceAttempts: 0,
+		readAssetSpliceJournal: 12,
+		assetSpliceUpdateHead: '2',
+		loadAssetSpliceFundingInfo: 'none',
+		finalSpliceSession: {
+			threw: 'Splice requires the original update wallet and a top-level commit'
+		}
+	};
+	const plain2 = {
+		loadFinalChannelKind: 'plain',
+		loadFinalActiveFunding: 'opening',
+		loadFinalOpeningExit: superseded,
+		loadFinalFundingExits: ['opening'],
+		loadFinalUpdateStatus: '1/1',
+		loadFinalResolutionStates: '1',
+		loadFinalSimpleClose: null,
+		loadFinalSpliceAttempts: 0,
+		readAssetSpliceJournal: {
+			threw: 'Asset splice history requires an enrolled asset channel'
+		},
+		assetSpliceUpdateHead: {
+			threw:
+				'Asset splice signing requires this original wallet device outside a transaction'
+		},
+		loadAssetSpliceFundingInfo: {
+			threw:
+				'Asset splice signing requires this original wallet device outside a transaction'
+		},
+		finalSpliceSession: 'session'
+	};
+
+	it("keeps today's result at every site for a channel with no record, in generations 2, 5 and 6", async () => {
+		expect((await assetRow(5)).sites, 'generation 5 asset').to.deep.equal(
+			asset5
+		);
+		expect((await assetRow(6)).sites, 'generation 6 asset').to.deep.equal({
+			...asset5,
+			finalSpliceSession: {
+				threw: 'Final splice requires a plain final channel'
+			}
+		});
+		expect(plainRow(2).sites, 'generation 2 plain').to.deep.equal(plain2);
+		expect(plainRow(6).sites, 'generation 6 plain').to.deep.equal({
+			...plain2,
+			assetSpliceUpdateHead: {
+				threw: 'Asset splice history requires an enrolled asset channel'
+			},
+			loadAssetSpliceFundingInfo: {
+				threw: 'Asset splice requires a funded opening'
+			}
+		});
+	});
+
+	it("gives the current type's result at every site after a record", async () => {
+		const pick = (sites: Record<string, unknown>, keys: string[]) =>
+			Object.fromEntries(keys.map((k) => [k, sites[k]]));
+		const shared = {
+			loadFinalActiveFunding: 'record',
+			loadFinalFundingExits: ['record'],
+			loadFinalSimpleClose: null,
+			loadFinalSpliceAttempts: 0,
+			finalSpliceSession: { threw: TEXT.splice }
+		};
+		const asset = await assetTypePair(s, 1);
+		const toPlain = buildConversion(asset.devices, asset.id, {
+			type: 'plain',
+			stateNumber: 1,
+			parent: openingParent(asset.devices[0].store, asset.id)
+		});
+		appendBoth(asset.devices, toPlain);
+		const plainNow = {
+			...shared,
+			loadFinalChannelKind: 'plain',
+			loadFinalUpdateStatus: '1/1',
+			loadFinalResolutionStates: '1',
+			// The asset era's journal stays readable.
+			readAssetSpliceJournal: 12
+		};
+		const a = asset.devices[0];
+		expect(
+			pick(
+				currentTypeSites(a.store, a.root, asset.id, {
+					...openingLabel(a.store, asset.id),
+					[toPlain.tx.getId()]: 'record'
+				}),
+				Object.keys(plainNow)
+			)
+		).to.deep.equal(plainNow);
+		const plain = plainTypePair(s, 1);
+		const toAsset = buildConversion(plain.devices, plain.id, {
+			type: 'asset',
+			stateNumber: 1,
+			parent: openingParent(plain.stores[0], plain.id)
+		});
+		appendBoth(plain.devices, toAsset);
+		const assetNow = {
+			...shared,
+			loadFinalChannelKind: 'asset',
+			loadFinalUpdateStatus: null,
+			loadFinalResolutionStates: null,
+			assetSpliceUpdateHead: '2'
+		};
+		const p = plain.devices[0];
+		expect(
+			pick(
+				currentTypeSites(p.store, p.root, plain.id, {
+					...openingLabel(p.store, plain.id),
+					[toAsset.tx.getId()]: 'record'
+				}),
+				Object.keys(assetNow)
+			)
+		).to.deep.equal(assetNow);
+	});
+
+	it("gives today's answers from loadFinalChannelType for a generation 5 asset channel and a generation 2 plain channel (item 8)", async () => {
+		const asset = (await assetRow(5)).pair;
+		const plain = plainRow(2).pair;
+		for (const [store, id, type] of [
+			[asset.devices[0].store, asset.id, 'asset'],
+			[plain.stores[0], plain.id, 'plain']
+		] as const) {
+			const opening = store.loadFinalOpening(id)!;
+			expect(typed(store).loadFinalChannelType(id)).to.deep.equal({
+				type,
+				channelType: opening.channelType,
+				source: 'opening',
+				stateNumber: 0n,
+				funding: {
+					txid: Transaction.fromHex(opening.fundingTxHex).getId(),
+					outputIndex: opening.fundingOutputIndex
+				}
+			});
+			expect(typed(store).loadFinalChannelTypeRecords(id)).to.deep.equal([]);
 		}
 	});
 });
