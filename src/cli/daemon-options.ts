@@ -49,6 +49,7 @@ export function daemonOptions(
 		dualFundedAssets: config.dualFundedAssets,
 		assetSplice: config.assetSplice,
 		assetSpliceRecovery: config.assetSpliceRecovery,
+		assetConversion: config.assetConversion,
 		largeChannels: config.largeChannels,
 		apiToken: config.apiToken,
 		apiKeys: config.apiKeys,

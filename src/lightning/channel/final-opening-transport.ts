@@ -121,7 +121,12 @@ export class FinalOpeningTransport {
 		)
 			return false;
 		const opening = this.runtime.storage.loadFinalDaemonOpening(id);
-		return !!opening?.readyExchanged && !opening.exitToBroadcast;
+		// An asset session stores updateLimits too: only a plain channel takes plain updates.
+		return (
+			!!opening?.readyExchanged &&
+			!opening.exitToBroadcast &&
+			!opening.session.assetEvidence
+		);
 	}
 
 	private reconnectAfterFundingReplay(id: string): boolean {
@@ -218,7 +223,12 @@ export class FinalOpeningTransport {
 			return false;
 		const id = payload.subarray(0, 32).toString('hex');
 		const opening = this.runtime.storage.loadFinalDaemonOpening(id);
-		if (!opening?.readyExchanged || opening.session.peer !== peer) return false;
+		if (
+			!opening?.readyExchanged ||
+			opening.session.peer !== peer ||
+			opening.session.assetEvidence
+		)
+			return false;
 		try {
 			const msg = decodeStartBatchMessage(payload);
 			if (msg.batchSize > 20)

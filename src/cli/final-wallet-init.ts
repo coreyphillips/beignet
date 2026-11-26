@@ -80,7 +80,7 @@ function loadPending(file: string): Pending | undefined {
 	if (
 		!p ||
 		Object.keys(p).sort().join(',') !== 'base,dataDir,mnemonic,version' ||
-		![1, 2, 3, 4, 5].includes(p.version) ||
+		![1, 2, 3, 4, 5, 6].includes(p.version) ||
 		typeof p.base !== 'string' ||
 		!/^[a-f0-9]{64}$/.test(p.base) ||
 		typeof p.mnemonic !== 'string' ||
@@ -103,6 +103,7 @@ export function finalWalletBinding(
 		dualFundedAssets: generation === 3,
 		assetSplice: generation === 4,
 		assetSpliceRecovery: generation === 5,
+		assetConversion: generation === 6,
 		nodeId: deriveLightningKeysFromSeed(seed, 1).nodePublicKey.toString('hex'),
 		encryptionKey: deriveStorageKey(seed)
 	};
@@ -135,13 +136,15 @@ export function provisionFinalConfig(
 	updates = false,
 	assets = false,
 	assetSplice = false,
-	assetSpliceRecovery = false
+	assetSpliceRecovery = false,
+	assetConversion = false
 ): BeignetConfig {
 	const generation = finalWalletGeneration(
 		updates,
 		assets,
 		assetSplice,
-		assetSpliceRecovery
+		assetSpliceRecovery,
+		assetConversion
 	);
 	const dir = path.dirname(configFile);
 	const pendingFile = path.join(dir, 'final-wallet-init.pending');
@@ -172,7 +175,8 @@ export function provisionFinalConfig(
 				config.finalCommitmentUpdates,
 				config.dualFundedAssets,
 				config.assetSplice,
-				config.assetSpliceRecovery
+				config.assetSpliceRecovery,
+				config.assetConversion
 			) === generation &&
 			config.network === 'regtest' &&
 			config.mnemonic === pending.mnemonic &&
@@ -213,7 +217,8 @@ export function provisionFinalConfig(
 			updates,
 			assets,
 			assetSplice,
-			assetSpliceRecovery
+			assetSpliceRecovery,
+			assetConversion
 		);
 		const dataDir = dataDirFor(fresh.mnemonic);
 		ensurePrivateDir(dataDir);

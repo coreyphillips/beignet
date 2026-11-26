@@ -160,12 +160,17 @@ describe('Feature bit collisions with other implementations (issue #1886)', () =
 		}
 	});
 
-	it('the beignet block is 440-445 plus the 454/455 pair', () => {
+	it('the beignet block is 440-445 plus the 454/455 pair and the 456-463 asset profile block', () => {
 		expect(Feature.OPTION_FF_RECEIVE).to.equal(440);
 		expect(Feature.OPTION_FF_CONCURRENT).to.equal(442);
 		expect(Feature.ASYNC_RECEIVE_SERVICE).to.equal(444);
 		// 446-453 are left for the taproot asset channel work.
 		expect(Feature.OPTION_COMPOSITE_SPLICE_INPUTS).to.equal(454);
+		// 456-463: the private regtest asset channel profiles and conversion.
+		expect(Feature.OPTION_DUAL_FUNDED_ASSETS).to.equal(456);
+		expect(Feature.OPTION_ASSET_SPLICE).to.equal(458);
+		expect(Feature.OPTION_ASSET_SPLICE_RECOVERY).to.equal(460);
+		expect(Feature.OPTION_ASSET_CONVERSION).to.equal(462);
 	});
 
 	it('the asset channel bits are 450 and 452, inside the block left for them', () => {

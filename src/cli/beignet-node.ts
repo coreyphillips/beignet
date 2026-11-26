@@ -523,6 +523,8 @@ export interface BeignetNodeOptions
 	assetSplice?: boolean;
 	/** Enroll a fresh regtest wallet for revocable asset payouts across splices. */
 	assetSpliceRecovery?: boolean;
+	/** Enroll a fresh regtest wallet that runs plain final channels and recoverable asset channels side by side. */
+	assetConversion?: boolean;
 	/**
 	 * option_wumbo (large_channels, default false): advertise the bit and lift
 	 * the 2^24 sat funding cap (up to 10 BTC) for peers that also advertise it.
@@ -3158,6 +3160,20 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 				'Asset splicing requires a separately enrolled final wallet'
 			);
 		if (
+			opts.assetConversion !== undefined &&
+			(typeof opts.assetConversion !== 'boolean' ||
+				(opts.assetConversion &&
+					(opts.finalTaprootWallet !== true ||
+						opts.finalCommitmentUpdates ||
+						opts.dualFundedAssets ||
+						opts.assetSplice ||
+						opts.assetSpliceRecovery)))
+		)
+			throw new BeignetError(
+				'INVALID_PARAMS',
+				'Asset conversion requires a separately enrolled final wallet'
+			);
+		if (
 			opts.finalTaprootWallet !== undefined &&
 			typeof opts.finalTaprootWallet !== 'boolean'
 		)
@@ -3190,7 +3206,8 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 						opts.finalCommitmentUpdates,
 						opts.dualFundedAssets,
 						opts.assetSplice,
-						opts.assetSpliceRecovery
+						opts.assetSpliceRecovery,
+						opts.assetConversion
 				  )
 				: undefined;
 		const mnemonic = fresh?.mnemonic ?? (opts.mnemonic || generateMnemonic());
@@ -3287,6 +3304,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 						dualFundedAssets: opts.dualFundedAssets,
 						assetSplice: opts.assetSplice,
 						assetSpliceRecovery: opts.assetSpliceRecovery,
+						assetConversion: opts.assetConversion,
 						network: networkName,
 						nodeId
 				  });
@@ -3698,7 +3716,8 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 		const finalSpliceOutpoints =
 			this._bootOpts?.finalCommitmentUpdates ||
 			this._bootOpts?.assetSplice ||
-			this._bootOpts?.assetSpliceRecovery
+			this._bootOpts?.assetSpliceRecovery ||
+			this._bootOpts?.assetConversion
 				? () => this.sqlite()!.loadFinalSpliceWalletOutpoints()
 				: undefined;
 		const fees: ExtensionFixedOutputFees | undefined = supply?.fixedOutputFees;
@@ -8379,7 +8398,11 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	): Promise<T> {
 		return this._runOnchainSend(() =>
 			this.wallet.withSendLock(async (locked) => {
-				if (this._bootOpts?.assetSplice || this._bootOpts?.assetSpliceRecovery)
+				if (
+					this._bootOpts?.assetSplice ||
+					this._bootOpts?.assetSpliceRecovery ||
+					this._bootOpts?.assetConversion
+				)
 					await this.walletFundingProvider(
 						undefined
 					).renewFinalOpeningPledges();
@@ -8560,7 +8583,12 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	private async _broadcastRawTx(hex: string): Promise<TxInfo> {
 		const bitcoin = await import('bitcoinjs-lib');
 		const tx = bitcoin.Transaction.fromHex(hex);
-		if (this._bootOpts?.assetSplice || this._bootOpts?.assetSpliceRecovery) {
+		if (
+			this._bootOpts?.assetSplice ||
+			this._bootOpts?.assetSpliceRecovery ||
+			this._bootOpts?.assetConversion
+		) {
+			// A generation 6 wallet also reserves the inputs of its plain splices.
 			const reserved = this.sqlite()!.loadFinalSpliceWalletOutpoints();
 			if (
 				tx.ins.some((input) =>
@@ -8573,7 +8601,9 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 			)
 				throw new BeignetError(
 					'INVALID_PARAMS',
-					'Input is reserved by an asset splice'
+					this._bootOpts?.assetConversion
+						? 'Input is reserved by a final channel splice'
+						: 'Input is reserved by an asset splice'
 				);
 		}
 		const broadcastRes = await this.wallet.electrum.broadcastTransaction({
@@ -9266,7 +9296,8 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 		if (
 			(this._bootOpts?.finalCommitmentUpdates ||
 				this._bootOpts?.assetSplice ||
-				this._bootOpts?.assetSpliceRecovery) &&
+				this._bootOpts?.assetSpliceRecovery ||
+				this._bootOpts?.assetConversion) &&
 			this.sqlite()!
 				.loadFinalSpliceWalletOutpoints()
 				.has(txid.toLowerCase() + ':' + index)
@@ -15360,8 +15391,10 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 		// midnight reset, which errs on the safe side.
 		let externalSpendSats: number | undefined;
 		if (destinationScript !== undefined) {
+			// Only a plain final channel has an update status, also in generation 6.
 			const taprootSharedInput =
-				this._bootOpts?.finalCommitmentUpdates === true &&
+				(this._bootOpts?.finalCommitmentUpdates === true ||
+					this._bootOpts?.assetConversion === true) &&
 				!!this.node
 					.getChannelManager()
 					.finalUpdateStatus(idBuf.toString('hex'));

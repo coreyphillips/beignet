@@ -140,11 +140,18 @@ describe('Asset channel restore in a generation 6 wallet (#2151 step 1, item 10)
 				mac
 			)
 		);
-		devices[0].store = SqliteStorage.openFinalWallet(
-			devices[0].file,
-			devices[0].party.binding
-		);
-		assert.equal(devices[0].store.loadFinalDaemonOpening(plainId), null);
-		assert(devices[0].store.loadFinalDaemonOpening(spliced.f.id));
+		// The device still holds the plain channel's authorized exit, so the
+		// wallet without its rows is refused at open; read the rows directly.
+		const db = new Database(devices[0].file, { readonly: true });
+		try {
+			const opening = (id: string) =>
+				!!db
+					.prepare('SELECT 1 FROM final_opening_candidates WHERE channel_id=?')
+					.get(id);
+			assert.equal(opening(plainId), false);
+			assert.equal(opening(spliced.f.id), true);
+		} finally {
+			db.close();
+		}
 	});
 });

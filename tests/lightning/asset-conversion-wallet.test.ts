@@ -204,12 +204,6 @@ describe('Generation 6 enrollment (#2151 step 1)', () => {
 			'final_lifecycle_log',
 			'final_channel_update_log'
 		]);
-		const signer = new Database(file + '.opening-signer', { readonly: true });
-		try {
-			expect(signer.pragma('auto_vacuum', { simple: true })).to.equal(1);
-		} finally {
-			signer.close();
-		}
 		await store.backup(copy);
 		const backup = SqliteStorage.openFinalWallet(copy, binding);
 		open.push(backup);
@@ -230,6 +224,15 @@ describe('Generation 6 enrollment (#2151 step 1)', () => {
 				network: 'mainnet'
 			})
 		).to.throw(/regtest/);
+		// The live original holds its signer under an exclusive lock, so the
+		// signer's pragma is read once the original is closed.
+		store.close();
+		const signer = new Database(file + '.opening-signer', { readonly: true });
+		try {
+			expect(signer.pragma('auto_vacuum', { simple: true })).to.equal(1);
+		} finally {
+			signer.close();
+		}
 	});
 
 	it('names no capability of generation 6 in the earlier generations', () => {
