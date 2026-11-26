@@ -10,6 +10,7 @@ import {
 	decodeCustomMessage
 } from '../../../src/lightning/message/custom';
 import { signatureRoundFixture } from './asset-splice-signature-round';
+import type { AssetSpliceGeneration } from './asset-splice-proof-release';
 
 export interface SplicePeerPacket {
 	from: number;
@@ -47,7 +48,7 @@ export function setupAssetSplicePeerTransport(
 		txid: string,
 		index: number
 	) => boolean,
-	generation: 4 | 5 = 4
+	generation: AssetSpliceGeneration = 4
 ): SpliceTransportPair {
 	const { f, s, hosts } = signatureRoundFixture(dir, true, generation);
 	const { layout } = s;

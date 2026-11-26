@@ -11,7 +11,10 @@ import {
 	encodeSpliceMessage,
 	encodeSpliceAckMessage
 } from '../../../src/lightning/message/splice';
-import { setupAssetSpliceProofs } from './asset-splice-proof-release';
+import {
+	setupAssetSpliceProofs,
+	type AssetSpliceGeneration
+} from './asset-splice-proof-release';
 
 const tag = (n: number) => Buffer.alloc(32, n);
 export function localPromise(channelId: Buffer, i: number) {
@@ -26,7 +29,10 @@ export function localPromise(channelId: Buffer, i: number) {
 		fundingInputNonce: nonce(2)
 	});
 }
-export function constructionFixture(dir: string, generation: 4 | 5 = 4) {
+export function constructionFixture(
+	dir: string,
+	generation: AssetSpliceGeneration = 4
+) {
 	const f = setupAssetSpliceProofs(dir, undefined, generation),
 		t = f.terms[0],
 		channelId = Buffer.from(f.id, 'hex');
