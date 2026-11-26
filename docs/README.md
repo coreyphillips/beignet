@@ -49,6 +49,7 @@ The option and event tables in the two READMEs above are generated from the code
 | [PORCH-PROTOCOL.md](PORCH-PROTOCOL.md) | Porch, version 1: a blind relay that lets a node hand out a `wss://` peer link without revealing where it runs. Roles and trust, messages, limits, test vectors |
 | [SPLICE-LOCK-DEPTH.md](SPLICE-LOCK-DEPTH.md) | Depth-locked splices and conflicted-splice revert, two BOLT 2 extensions |
 | [ASSET-SPLICING.md](ASSET-SPLICING.md) | Proposed asset splice protocol covering funding proofs, commitments, HTLCs and fee replacements |
+| [ASSET-CONVERSION-SPLICE.md](ASSET-CONVERSION-SPLICE.md) | Proposed conversion splice: one transaction that turns an asset channel into a plain channel or the reverse, trading the balance at agreed figures |
 | [MULTI-CHANNEL-SPLICE-OUT.md](MULTI-CHANNEL-SPLICE-OUT.md) | Design note: one transaction that splices out of several channels and pays an address once, with session composition, signatures, abort, restart, fees and peer support |
 | [DIRECT-FUNDING-OWNERSHIP-PROOFS.md](DIRECT-FUNDING-OWNERSHIP-PROOFS.md) | How a direct-funding receiver proves control of its named input |
 
