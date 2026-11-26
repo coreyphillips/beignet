@@ -77,7 +77,7 @@ Today a final wallet is one generation, chosen when it is made, and the generati
 - **Why this pair.** It continues the profile bits 456, 458 and 460, and clears every pair in `FOREIGN_PAIRS` (`tests/lightning/feature-bit-collisions.test.ts`). Pairs 446/447 and 448/449 stay in the block left for asset channel type modes.
 - **When to update the bit comments.** The comment in `src/lightning/features/flags.ts` and the test's description of the beignet block, which already leave out 456 to 461, are updated when the bit lands.
 - **What it requires:** quiescence, splicing, `OPTION_ASSET_SPLICE` (458/459) and `OPTION_ASSET_SPLICE_RECOVERY` (460/461).
-- **What 463 stands for.** A node configured with asset channels sets LND's staging Taproot bit 180, which masks bit 81 and clears simple close (`src/lightning/node/lightning-node.ts`), and the final opening depends on simple close (`src/lightning/features/final-opening.ts`). A generation 6 node keeps those masks toward every peer, for the reasons they exist (LND's staging type, and its RBF close, #1929). Between two peers that both set 463, bit 463 alone stands for the plain final type and its simple close, for channels of generation 6 wallets only. The two predicates that read the masked bits accept 463 in their place between two generation 6 peers: `finalOpeningNegotiated` (`src/lightning/features/final-opening.ts`), which requires simple close and bit 80 or 81 on both inits, and `peerNegotiatedSimpleClose` (`src/lightning/channel/channel-manager.ts`). A generation 6 node opens or closes a plain channel only that way.
+- **What 463 stands for.** A node configured with asset channels sets LND's staging Taproot bit 180, which masks bit 81 and clears simple close (`src/lightning/node/lightning-node.ts`), and the final opening depends on simple close (`src/lightning/features/final-opening.ts`). A generation 6 node keeps those masks toward every peer, for the reasons they exist (LND's staging type, and its RBF close, #1929). Between two peers that both set 463, bit 463 alone stands for the plain final type and its simple close, for channels of generation 6 wallets only. The predicate that reads the masked bits, `finalOpeningNegotiated` (`src/lightning/features/final-opening.ts`), which requires simple close and bit 80 or 81 on both inits, accepts 463 in their place between two generation 6 peers, at both of its call sites in `src/lightning/node/lightning-node.ts`. A generation 6 node opens a plain channel only that way. Its close follows from the channel's type: a final channel closes through the final transport, which reads no init features, and `peerNegotiatedSimpleClose` (`src/lightning/channel/channel-manager.ts`) governs only legacy channels.
 - **How the host is checked.** The build lists `assetConversion:v1` among its surfaces (`src/lightning/channel/auxiliary-api.ts`), and the engine probes the host with a `completeAssetConversionHost` predicate. The host's planner, exit views and confirmation calls all take a channel type per branch, since every existing member assumes an asset root on both. The node masks 462/463 unless the wallet is generation 6 and the predicate passes.
 - **Before construction.** A peer missing a requirement declines. The wire encodings need test vectors before implementation.
 
@@ -206,9 +206,9 @@ The old type's state is **not** dropped at adoption.
 **Until the reorg window closes**, at `IRREVOCABLE_DEPTH` (100 blocks, `src/lightning/chain/types.ts`) past adoption, each peer keeps for the parent:
 - the old type's evidence, proofs, exit data, ledgers and watches;
 - every remedy of a revoked parent commitment, including its HTLC penalty claims;
-- on its host, the proofs and payout locators that the host's `recoverOutput` and `confirmAssetPayout` need for an asset parent (`src/lightning/chain/asset-opening-claims.ts`).
+- on its host, the proofs and payout locators that the host's `recoverOutput` (called from `src/lightning/chain/asset-opening-claims.ts`) and `confirmAssetPayout` (`src/lightning/chain/asset-payout-receipt.ts`) need for an asset parent.
 
-After a restart in that window, the parent's watch is armed again. Today `AssetSpliceConfirmation.restore` skips a channel with no asset state, which a parent of a conversion to an asset would not have. A deeper reorganisation after adoption needs chain resolution before updates resume, as for an asset splice.
+After a restart in that window, the parent's watch is armed again. Today `AssetSpliceConfirmationCoordinator.restore` (`src/lightning/channel/asset-splice-confirmation.ts`) skips a channel with no asset state, which a parent of a conversion to an asset would not have. A deeper reorganisation after adoption needs chain resolution before updates resume, as for an asset splice.
 
 **Revocation secrets cross the type change**
 - **Numbering continues.** Commitment numbers and per-commitment points continue: same seed, and the obscured number from the opening's basepoints.
@@ -221,7 +221,7 @@ After a restart in that window, the parent's watch is armed again. Today `AssetS
 
 **Claiming by branch**
 - **The watcher.** It has one hook, which receives the spending transaction.
-- **The claim builders.** They match the branch by prevout and txid, as `matchedAssetPayoutViews` does today. Then they build the claims of that branch's recorded type:
+- **The claim builders.** They match the branch by prevout and txid, as `matchedAssetPayoutViews` (`src/lightning/chain/asset-splice-output-view.ts`) does today. Then they build the claims of that branch's recorded type:
   - the parent's commitments, current or revoked, by the old type's claims;
   - the candidate's first commitment, which is never revoked before lock, by the new type's.
 - **Asset-only reporting.** Today the asset builder marks every balance output as an asset balance (`assetOpeningOutputClaims`), and that drives the payout and collateral reporting. A plain branch must not trigger either.
@@ -289,9 +289,10 @@ Acceptance cases, each in both directions:
 
 In every case, compare the actual outpoints, the per-issuance receipts and the spendable balances of both peers against the agreed terms.
 
-## Open questions for review
+## Decisions
 
-1. **Who sends `tx_signatures` first.** This design says the quote giver, so a user never depends on a primary to publish. A primary serving many wallets then carries the taker's option to hold the complete transaction, bounded by its own cancel, and the taker carries the giver's option to cancel until confirmation, priced by its host.
-2. **Moving an existing generation 5 wallet to generation 6.** This design says no: a new wallet, as for every earlier generation.
+The owner settled the two questions the review left open:
+1. **Who sends `tx_signatures` first.** The quote giver, so a user never depends on a primary to publish. A primary serving many wallets then carries the taker's option to hold the complete transaction, bounded by its own cancel, and the taker carries the giver's option to cancel until confirmation, priced by its host.
+2. **Moving an existing generation 5 wallet to generation 6.** No. A generation 6 wallet is a new wallet, as for every earlier generation.
 
 The underlying protocols are those of [asset splicing](ASSET-SPLICING.md), [BOLT 2, channel splicing](https://github.com/lightning/bolts/blob/master/02-peer-protocol.md#channel-splicing) and [Depth-locked splices](SPLICE-LOCK-DEPTH.md).
