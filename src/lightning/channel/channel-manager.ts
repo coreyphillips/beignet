@@ -4888,6 +4888,17 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 	): ChainAction[] {
 		const channelIdHex = channelId.toString('hex');
 		const runtime = this.config.finalOpening;
+		// A record's funding spending its parent is the channel's type change,
+		// not a close: no close is observed for it in either branch below.
+		if (
+			runtime &&
+			channelTypeRecordsOf(runtime.storage, channelIdHex).some(
+				(r) =>
+					bitcoin.Transaction.fromHex(r.funding.fundingTxHex).getId() ===
+					spendingTx.getId()
+			)
+		)
+			return [];
 		if (runtime?.storage.canOpenDualFundedAssets) {
 			const opening = runtime.storage.loadFinalDaemonOpening(channelIdHex);
 			// The asset branch follows the current type, on the opening's evidence.
@@ -5248,7 +5259,6 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 	 */
 	handleNewBlock(blockHeight: number): ChainAction[] {
 		this._currentBlockHeight = blockHeight;
-		this.rereadAssetMarkers();
 		this._applyChannelIndexTipFloor(blockHeight);
 		// Update block height on all channels for CLTV validation
 		for (const channel of this.channels.values()) {
@@ -5309,6 +5319,8 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		// back to the wallet when no asset channel can need them any more.
 		this.releaseFreeFixedOutputFeeCoins();
 
+		// Asset markers follow the current type; read after the per-channel work.
+		this.rereadAssetMarkers();
 		return allActions;
 	}
 
@@ -10628,7 +10640,19 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			| undefined;
 		if (!storage || !markers?.size) return;
 		for (const id of [...markers.keys()]) {
-			if (!channelTypeRecordsOf(storage, id).length) continue;
+			// One unreadable channel must not stop the block's work for the others.
+			let recorded: boolean;
+			try {
+				recorded = channelTypeRecordsOf(storage, id).length > 0;
+			} catch (err) {
+				this.emitContained(
+					'error',
+					Buffer.from(id, 'hex'),
+					err instanceof Error ? err.message : String(err)
+				);
+				continue;
+			}
+			if (!recorded) continue;
 			this.assetCollateral.delete(id);
 			for (const [txid, owner] of this.assetFundingChannels)
 				if (owner === id) this.assetFundingChannels.delete(txid);

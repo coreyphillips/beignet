@@ -15,6 +15,7 @@ import {
 } from '../channel/final-opening-commitment';
 import type { IFinalFundingReference } from '../channel/final-splice-candidate';
 import { taggedHash } from '../crypto/hash';
+import { decodeRevokeAndAckMessage } from '../message/channel-commitment';
 import { ASSET_SPLICE_RECOVERY_TYPE_HEX } from '../features/asset-opening';
 import { MAX_INDEX } from '../keys/shachain';
 import type { IAssetSpliceExitBranch } from './asset-splice-exit-proofs';
@@ -405,6 +406,12 @@ export function fundingOutpoint(ref: {
  * prior. Both peers compute it from opener-ordered fields, since each side's
  * own record names local and remote the other way round.
  */
+function holderUnits(
+	r: IAssetSpliceExitBranch['localRecovery'],
+	proofs: string
+): (string | null)[] {
+	return [proofs, r.toLocal?.script ?? null, r.toRemote?.script ?? null];
+}
 export function finalAssetSeedDigest(
 	channelId: string,
 	isInitiator: boolean,
@@ -422,7 +429,11 @@ export function finalAssetSeedDigest(
 		input.funding.fundingOutputIndex,
 		m.fundingRoot,
 		opener(m.localRecovery.localBalanceMsat, m.localRecovery.remoteBalanceMsat),
-		opener([], []),
+		// Each holder's units per issuance travel in its proofs and leaves.
+		opener(
+			holderUnits(m.localRecovery, m.localProofs),
+			holderUnits(m.remoteRecovery, m.remoteProofs)
+		),
 		seed.feerate,
 		opener(seed.nextLocalId, seed.nextPeerId),
 		[],
@@ -445,6 +456,42 @@ export interface IFinalSeedContext {
 	peerPoints: [Buffer, Buffer];
 	nextLocalId: string;
 	nextPeerId: string;
+	/** The old ledger's revoke_and_ack bytes that completed round N, both absent at N = 0. */
+	revocations: { localRevoke?: string; peerRevoke?: string };
+}
+/**
+ * The seed's revocations are the old ledger's for round N: absent at N = 0,
+ * both present and byte-identical at N >= 1, and the peer's names the point
+ * the seed takes for N + 1.
+ */
+function verifyRevocations(
+	seed: { localRevoke?: string; peerRevoke?: string },
+	ctx: IFinalSeedContext,
+	n: bigint,
+	peerNext: string
+): void {
+	const old = ctx.revocations;
+	if (n === 0n) {
+		if (seed.localRevoke !== undefined || seed.peerRevoke !== undefined)
+			seedRefused('revocations');
+		return;
+	}
+	if (
+		seed.localRevoke === undefined ||
+		seed.peerRevoke === undefined ||
+		seed.localRevoke !== old.localRevoke ||
+		seed.peerRevoke !== old.peerRevoke
+	)
+		seedRefused('revocations');
+	let next: string | undefined;
+	try {
+		next = decodeRevokeAndAckMessage(Buffer.from(seed.peerRevoke, 'hex'), {
+			finalTaproot: true
+		}).nextPerCommitmentPoint.toString('hex');
+	} catch {
+		next = undefined;
+	}
+	if (next !== peerNext) seedRefused('revocations');
 }
 function unsigned(hexTx: string): string {
 	const tx = Transaction.fromHex(hexTx);
@@ -564,6 +611,7 @@ export function verifyFinalChannelTypeSeed(
 					ref,
 					as
 				).tx;
+		verifyRevocations(seed, ctx, n, ctx.peerPoints[1].toString('hex'));
 		rebuilt(view('remote', ctx.peerPoints[0]), seed.remote.tx, 'rebuilt bytes');
 		rebuilt(
 			view('local', ctx.localPoint),
@@ -599,6 +647,13 @@ export function verifyFinalChannelTypeSeed(
 		seed.peerNextPoint !== ctx.peerPoints[1].toString('hex')
 	)
 		seedRefused('points');
+	verifyRevocations(seed, ctx, n, seed.peerNextPoint);
+	// Both holders' records name the same balances, in this device's perspective.
+	if (
+		m.localRecovery.localBalanceMsat !== m.remoteRecovery.localBalanceMsat ||
+		m.localRecovery.remoteBalanceMsat !== m.remoteRecovery.remoteBalanceMsat
+	)
+		seedRefused('holder balances');
 	const terms = { ...ctx.terms, commitmentFeeratePerKw: seed.feerate };
 	const leaf = (
 		v: { script: string; leafVersion?: number } | null
@@ -647,12 +702,12 @@ export function verifyFinalChannelTypeSeed(
 		validNonce(pub, 'nonce');
 	if (new Set([...seed.peerNonces, ...seed.localNonces]).size !== 2)
 		seedRefused('nonces');
+	verifyIds(seed, ctx);
 	if (
 		seed.digest !==
 		finalAssetSeedDigest(channelId, ctx.candidate.isInitiator, input)
 	)
 		seedRefused('digest');
-	verifyIds(seed, ctx);
 	verifyReserves(
 		ctx,
 		ref,

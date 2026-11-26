@@ -22,6 +22,15 @@ import {
 	type Side
 } from './final-update-pair';
 
+/** Each fixture store's wallet root, so a writer call can pass the device's root. */
+const roots = new WeakMap<SqliteStorage, ITypeDevice['root']>();
+export function rootOf(store: SqliteStorage): ITypeDevice['root'] | undefined {
+	return roots.get(store);
+}
+function remember(devices: readonly ITypeDevice[]): void {
+	for (const d of devices) roots.set(d.store, d.root);
+}
+
 /** Terms that fit both types: dust 354 on both sides and at most 83 accepted HTLCs. */
 export const FIT_TERMS: IReadyPairTerms = {
 	remoteDustLimitSatoshis: 354,
@@ -80,6 +89,7 @@ export async function assetTypePair(
 		store: d.store,
 		root: d.party.root
 	}));
+	remember(devices);
 	await assetRounds(devices, p.id, rounds);
 	return {
 		p,
@@ -92,6 +102,7 @@ export async function assetTypePair(
 			d.store.close();
 			d.store = SqliteStorage.openFinalWallet(d.file, d.party.binding);
 			devices[i].store = d.store;
+			remember(devices);
 			return d.store;
 		}
 	};
@@ -121,6 +132,7 @@ export function plainTypePair(
 	s.closing(() => stores.forEach((st) => st.close()));
 	const id = fundReadyPair(stores[0], stores[1], sides[0], sides[1], terms);
 	const devices = stores.map((store, i) => ({ store, root: sides[i].root }));
+	remember(devices);
 	plainRounds(devices, id, rounds);
 	return {
 		id,
@@ -132,6 +144,7 @@ export function plainTypePair(
 			stores[i].close();
 			stores[i] = SqliteStorage.openFinalWallet(files[i], sides[i].binding);
 			devices[i].store = stores[i];
+			remember(devices);
 			return stores[i];
 		}
 	};

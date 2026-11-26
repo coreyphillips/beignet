@@ -643,6 +643,35 @@ describe('A conversion to plain on real SQLite devices (#2151 step 2a, item 5)',
 		expect(broadcasts[0].ins[0].hash).to.deep.equal(t.c.tx.getHash());
 	});
 
+	it("keeps the deadline exit after the parent is spent by the record's funding", async () => {
+		const t = await toPlain(1);
+		plainUpdates(t.stores(), t.sides, t.id).add(1100);
+		const { store } = t.devices[0];
+		const { manager, broadcasts, errors } = exitManager(
+			store,
+			t.devices[0],
+			t.id,
+			t.c.tx.getId()
+		);
+		Object.assign(
+			(manager as unknown as { finalTransport: object }).finalTransport,
+			{ fundingDepth: (): void => {}, assetFundingSpendable: (): void => {} }
+		);
+		// The conversion transaction spends the asset parent: a type change, not a close.
+		expect(
+			manager.handleFundingSpent(
+				Buffer.from(t.id, 'hex'),
+				t.c.tx,
+				101,
+				destination
+			)
+		).to.deep.equal([]);
+		manager.checkFinalHtlcDeadlines(1100, 10, 0);
+		expect(errors).to.deep.equal([]);
+		expect(broadcasts).to.have.length(1);
+		expect(broadcasts[0].ins[0].hash).to.deep.equal(t.c.tx.getHash());
+	});
+
 	it('refuses a peer reestablish one revocation behind the record', async () => {
 		const k = 2;
 		const t = await toPlain(k);

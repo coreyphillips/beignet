@@ -45,6 +45,7 @@ import {
 	assetTypePair,
 	FIT_TERMS,
 	plainTypePair,
+	rootOf,
 	scratch,
 	type IAssetTypePair,
 	type IPlainTypePair
@@ -67,6 +68,7 @@ import {
 	openingParent,
 	PLAIN_TYPE_HEX,
 	plainTwin,
+	step2a,
 	TEXT,
 	TWIN_ROOT,
 	typed
@@ -187,14 +189,15 @@ describe('Channel type record writer gates (#2151 step 2a, item 1)', function ()
 			...extra
 		});
 	}
+	/** A refusal with its own text, by the device's root, storing nothing. */
 	const refusesNothingStored = (
 		store: SqliteStorage,
 		id: string,
 		input: IChannelTypeRecordInput,
-		text?: string
+		text: string
 	): Error => {
 		const e = expectRefusal(
-			() => typed(store).appendFinalChannelType(id, input),
+			() => typed(store).appendFinalChannelType(id, input, rootOf(store)),
 			text
 		);
 		expect(typed(store).loadFinalChannelTypeRecords(id)).to.deep.equal([]);
@@ -283,10 +286,16 @@ describe('Channel type record writer gates (#2151 step 2a, item 1)', function ()
 	it('refuses inside a transaction (rule 2)', async () => {
 		const { pair, c } = await toPlain(0);
 		const store = pair.devices[0].store;
-		expectRefusal(() =>
-			db(store).transaction(() =>
-				typed(store).appendFinalChannelType(pair.id, c.inputs[0])
-			)()
+		expectRefusal(
+			() =>
+				db(store).transaction(() =>
+					typed(store).appendFinalChannelType(
+						pair.id,
+						c.inputs[0],
+						rootOf(store)
+					)
+				)(),
+			'Channel type records require a top-level commit'
 		);
 		expect(typed(store).loadFinalChannelTypeRecords(pair.id)).to.deep.equal([]);
 	});
@@ -294,14 +303,22 @@ describe('Channel type record writer gates (#2151 step 2a, item 1)', function ()
 	it('refuses an unknown channel and one without a funded ready session (rule 3)', async () => {
 		const { pair, c } = await toPlain(0);
 		const store = pair.devices[0].store;
-		refusesNothingStored(store, unknown, { ...c.inputs[0] });
+		refusesNothingStored(
+			store,
+			unknown,
+			{ ...c.inputs[0] },
+			'Channel type record requires a funded ready channel'
+		);
 		const unfunded = setupAssetSpliceProofs(s.dir(), undefined, 6);
 		s.closing(() => unfunded.devices.forEach((d) => d.store.close()));
-		expectRefusal(() =>
-			typed(unfunded.devices[0].store).appendFinalChannelType(
-				unfunded.id,
-				c.inputs[0]
-			)
+		expectRefusal(
+			() =>
+				typed(unfunded.devices[0].store).appendFinalChannelType(
+					unfunded.id,
+					c.inputs[0],
+					pair.devices[0].root
+				),
+			'Channel type record requires a funded ready channel'
 		);
 	});
 
@@ -356,8 +373,10 @@ describe('Channel type record writer gates (#2151 step 2a, item 1)', function ()
 			} as IChannelTypeRecordInput
 		};
 		for (const [name, input] of Object.entries(variants)) {
-			const e = expectRefusal(() =>
-				typed(store).appendFinalChannelType(pair.id, input)
+			const e = expectRefusal(
+				() =>
+					typed(store).appendFinalChannelType(pair.id, input, rootOf(store)),
+				'Invalid channel type record'
 			);
 			expect(e.message, name).to.not.equal(TEXT.sameType);
 			expect(e.message, name).to.not.equal(TEXT.state);
@@ -403,10 +422,20 @@ describe('Channel type record writer gates (#2151 step 2a, item 1)', function ()
 		const store = pair.devices[0].store;
 		const wrong = copyInput(c.inputs[0]);
 		wrong.parent.txid = 'ab'.repeat(32);
-		refusesNothingStored(store, pair.id, wrong);
+		refusesNothingStored(
+			store,
+			pair.id,
+			wrong,
+			'Channel type record parent is not the live funding'
+		);
 		const index = copyInput(c.inputs[0]);
 		index.parent.outputIndex += 1;
-		refusesNothingStored(store, pair.id, index);
+		refusesNothingStored(
+			store,
+			pair.id,
+			index,
+			'Channel type record parent is not the live funding'
+		);
 		// After an adopted asset splice, the opening is no longer the live funding.
 		const spliced = await assetTypePair(s, 0);
 		await spliced.p.start();
@@ -417,7 +446,12 @@ describe('Channel type record writer gates (#2151 step 2a, item 1)', function ()
 			stateNumber: 0,
 			parent: openingParent(spliced.devices[0].store, spliced.id)
 		});
-		refusesNothingStored(spliced.devices[0].store, spliced.id, stale.inputs[0]);
+		refusesNothingStored(
+			spliced.devices[0].store,
+			spliced.id,
+			stale.inputs[0],
+			'Channel type record parent is not the live funding'
+		);
 	});
 
 	it('refuses a funding that does not spend the parent or reuses an earlier funding (rule 7)', async () => {
@@ -427,7 +461,12 @@ describe('Channel type record writer gates (#2151 step 2a, item 1)', function ()
 		const tx = Transaction.fromHex(elsewhere.funding.fundingTxHex);
 		tx.ins[0].hash = Buffer.alloc(32, 9);
 		elsewhere.funding.fundingTxHex = tx.toHex();
-		refusesNothingStored(store, pair.id, elsewhere);
+		refusesNothingStored(
+			store,
+			pair.id,
+			elsewhere,
+			'Channel type record funding must spend its parent and be new'
+		);
 		const opening = store.loadFinalDaemonOpening(pair.id)!;
 		const reused = copyInput(c.inputs[0]);
 		reused.funding = {
@@ -437,7 +476,12 @@ describe('Channel type record writer gates (#2151 step 2a, item 1)', function ()
 			remoteFundingPubkey: opening.candidate.remoteFundingPubkey,
 			localFundingKeyIndex: opening.session.channelKeyIndex
 		};
-		refusesNothingStored(store, pair.id, reused);
+		refusesNothingStored(
+			store,
+			pair.id,
+			reused,
+			'Channel type record funding must spend its parent and be new'
+		);
 	});
 
 	it('refuses a plain ledger that is not quiescent at one height (rule 8)', () => {
@@ -462,7 +506,12 @@ describe('Channel type record writer gates (#2151 step 2a, item 1)', function ()
 		expect(status.localHeight).to.not.equal(status.remoteHeight);
 		const differInput = toAsset(differ, 0);
 		for (const i of [0, 1])
-			refusesNothingStored(differ.stores[i], differ.id, differInput.inputs[i]);
+			refusesNothingStored(
+				differ.stores[i],
+				differ.id,
+				differInput.inputs[i],
+				'Channel type record requires a quiescent channel'
+			);
 
 		// A staged update waiting to be signed.
 		const waiting = plainTypePair(s, 0);
@@ -472,7 +521,12 @@ describe('Channel type record writer gates (#2151 step 2a, item 1)', function ()
 			feeUpdate(waiting.id)
 		);
 		const waitingInput = toAsset(waiting, 0);
-		refusesNothingStored(waiting.stores[0], waiting.id, waitingInput.inputs[0]);
+		refusesNothingStored(
+			waiting.stores[0],
+			waiting.id,
+			waitingInput.inputs[0],
+			'Channel type record requires a quiescent channel'
+		);
 
 		// A commitment signed and not yet revoked by the peer.
 		const inFlight = plainTypePair(s, 0);
@@ -489,7 +543,8 @@ describe('Channel type record writer gates (#2151 step 2a, item 1)', function ()
 		refusesNothingStored(
 			inFlight.stores[0],
 			inFlight.id,
-			inFlightInput.inputs[0]
+			inFlightInput.inputs[0],
+			'Channel type record requires a quiescent channel'
 		);
 
 		// A locked-in HTLC: offered on side 0, received on side 1.
@@ -497,7 +552,12 @@ describe('Channel type record writer gates (#2151 step 2a, item 1)', function ()
 		plainUpdates(htlc.stores, htlc.sides, htlc.id).add();
 		const htlcInput = toAsset(htlc, 1);
 		for (const i of [0, 1])
-			refusesNothingStored(htlc.stores[i], htlc.id, htlcInput.inputs[i]);
+			refusesNothingStored(
+				htlc.stores[i],
+				htlc.id,
+				htlcInput.inputs[i],
+				'Channel type record requires a quiescent channel'
+			);
 	});
 
 	it('refuses an asset ledger with an intent (rule 8)', async () => {
@@ -517,7 +577,12 @@ describe('Channel type record writer gates (#2151 step 2a, item 1)', function ()
 			stateNumber: 0,
 			parent: openingParent(store, pair.id)
 		});
-		refusesNothingStored(store, pair.id, c.inputs[0]);
+		refusesNothingStored(
+			store,
+			pair.id,
+			c.inputs[0],
+			'Channel type record requires a quiescent channel'
+		);
 	});
 
 	it('refuses a pending splice of either kind (rule 9)', async () => {
@@ -526,7 +591,12 @@ describe('Channel type record writer gates (#2151 step 2a, item 1)', function ()
 		await wire.spliceOut();
 		wire.destroy();
 		const plainInput = toAsset(plain, 0);
-		refusesNothingStored(plain.stores[0], plain.id, plainInput.inputs[0]);
+		refusesNothingStored(
+			plain.stores[0],
+			plain.id,
+			plainInput.inputs[0],
+			'Channel type record requires no pending splice attempt'
+		);
 		const asset = await assetTypePair(s, 0);
 		await asset.p.start();
 		await asset.p.drain();
@@ -541,7 +611,8 @@ describe('Channel type record writer gates (#2151 step 2a, item 1)', function ()
 		refusesNothingStored(
 			asset.devices[0].store,
 			asset.id,
-			assetInput.inputs[0]
+			assetInput.inputs[0],
+			'Channel type record requires no pending splice attempt'
 		);
 	});
 
@@ -549,7 +620,12 @@ describe('Channel type record writer gates (#2151 step 2a, item 1)', function ()
 		const exit = plainTypePair(s, 0);
 		const exitInput = toAsset(exit, 0);
 		exit.stores[0].requestFinalOpeningExit(exit.id);
-		refusesNothingStored(exit.stores[0], exit.id, exitInput.inputs[0]);
+		refusesNothingStored(
+			exit.stores[0],
+			exit.id,
+			exitInput.inputs[0],
+			'Channel type record requires an open channel'
+		);
 		const close = plainTypePair(s, 0);
 		const closeInput = toAsset(close, 0);
 		close.stores[0].finalSimpleCloseStep(close.id, close.sides[0].root, {
@@ -560,7 +636,12 @@ describe('Channel type record writer gates (#2151 step 2a, item 1)', function ()
 			blockHeight: 200,
 			feeratePerKw: 1000
 		});
-		refusesNothingStored(close.stores[0], close.id, closeInput.inputs[0]);
+		refusesNothingStored(
+			close.stores[0],
+			close.id,
+			closeInput.inputs[0],
+			'Channel type record requires an open channel'
+		);
 	});
 
 	it('refuses a state number that is not the current height (rule 11), before the seed is verified', async () => {
@@ -590,17 +671,74 @@ describe('Channel type record writer gates (#2151 step 2a, item 1)', function ()
 				.remoteDustLimitSatoshis
 		).to.equal(1000);
 		const dustInput = toAsset(dust, 0);
-		refusesNothingStored(dust.stores[0], dust.id, dustInput.inputs[0]);
+		refusesNothingStored(
+			dust.stores[0],
+			dust.id,
+			dustInput.inputs[0],
+			'Channel opening terms do not fit the new type'
+		);
 		const htlcs = plainTypePair(s, 0, 6, {
 			...FIT_TERMS,
 			maxAcceptedHtlcs: 84
 		});
 		const htlcInput = toAsset(htlcs, 0);
-		refusesNothingStored(htlcs.stores[0], htlcs.id, htlcInput.inputs[0]);
+		refusesNothingStored(
+			htlcs.stores[0],
+			htlcs.id,
+			htlcInput.inputs[0],
+			'Channel opening terms do not fit the new type'
+		);
 	});
 
 	describe('a seed that does not verify (rule 13)', () => {
-		type Mutation = (seed: never, c: IConversion, i: number) => void;
+		type Mutation = (
+			seed: never,
+			c: IConversion,
+			i: number,
+			input: IChannelTypeRecordInput,
+			isInitiator: boolean
+		) => void;
+		const dropRevocations = (seed: {
+			localRevoke?: string;
+			peerRevoke?: string;
+		}): void => {
+			delete seed.localRevoke;
+			delete seed.peerRevoke;
+		};
+		const swapRevocations = (seed: {
+			localRevoke?: string;
+			peerRevoke?: string;
+		}): void => {
+			[seed.localRevoke, seed.peerRevoke] = [seed.peerRevoke, seed.localRevoke];
+		};
+		/** The check each mutation must fail, as "Channel type seed <check> does not verify". */
+		const plainChecks: Record<string, string> = {
+			'rebuilt bytes': 'rebuilt bytes',
+			signature: 'signature',
+			'local next nonce': 'local nonce',
+			'remote next nonce': 'remote nonce',
+			points: 'rebuilt bytes',
+			'HTLC IDs': 'HTLC IDs',
+			'peer HTLC ID': 'HTLC IDs',
+			'a balance sum off by one msat': 'rebuilt bytes',
+			'both revocations dropped': 'revocations',
+			'a one-byte peer revocation': 'revocations',
+			'swapped revocations': 'revocations'
+		};
+		const assetChecks: Record<string, string> = {
+			'rebuilt bytes': 'rebuilt bytes',
+			signature: 'signature',
+			'local nonce': 'local nonce',
+			'peer nonce': 'nonce',
+			'the asset digest': 'digest',
+			'the peer next point': 'points',
+			'the peer current point': 'points',
+			'HTLC IDs': 'HTLC IDs',
+			'a balance sum off by one msat': 'rebuilt bytes',
+			'both revocations dropped': 'revocations',
+			'swapped revocations': 'revocations',
+			'holders that disagree on balances': 'holder balances'
+		};
 		const witnessless = (hex: string): string => {
 			const t = Transaction.fromHex(hex);
 			t.setWitness(0, [Buffer.alloc(64, 1)]);
@@ -635,7 +773,12 @@ describe('Channel type record writer gates (#2151 step 2a, item 1)', function ()
 			},
 			'a balance sum off by one msat': (seed: IFinalPlainSeedInput) => {
 				seed.funds.local = String(BigInt(seed.funds.local) + 1n);
-			}
+			},
+			'both revocations dropped': dropRevocations,
+			'a one-byte peer revocation': (seed: IFinalPlainSeedInput) => {
+				seed.peerRevoke = '00';
+			},
+			'swapped revocations': swapRevocations
 		};
 		const assetMutations: Record<string, Mutation> = {
 			'rebuilt bytes': (seed: IFinalAssetSeedInput, c, i) => {
@@ -672,35 +815,66 @@ describe('Channel type record writer gates (#2151 step 2a, item 1)', function ()
 				const m = seed.members[0];
 				for (const r of [m.localRecovery, m.remoteRecovery])
 					r.localBalanceMsat = String(BigInt(r.localBalanceMsat) + 1n);
+			},
+			'both revocations dropped': dropRevocations,
+			'swapped revocations': swapRevocations,
+			// The peer's commitment as rebuilt with 1000 sat moved to the peer, and
+			// a digest recomputed over it: only the holders' agreement refuses it.
+			'holders that disagree on balances': (
+				seed: IFinalAssetSeedInput,
+				c,
+				i,
+				input,
+				isInitiator
+			) => {
+				const m = seed.members[0];
+				const balances = {
+					localBalanceMsat:
+						BigInt(m.remoteRecovery.localBalanceMsat) - 1_000_000n,
+					remoteBalanceMsat:
+						BigInt(m.remoteRecovery.remoteBalanceMsat) + 1_000_000n
+				};
+				m.remoteRecovery.localBalanceMsat = String(balances.localBalanceMsat);
+				m.remoteRecovery.remoteBalanceMsat = String(balances.remoteBalanceMsat);
+				m.remoteCommitment = c.view(i, 'remote', { balances }).tx.toHex();
+				seed.digest = step2a().finalAssetSeedDigest(c.id, isInitiator, input);
 			}
 		};
 		function each(
 			device: { store: SqliteStorage; root: import('bip32').BIP32Interface },
 			c: IConversion,
-			mutations: Record<string, Mutation>
+			mutations: Record<string, Mutation>,
+			checks: Record<string, string>
 		): void {
 			const { store, root } = device;
+			const isInitiator = store.loadFinalOpening(c.id)!.isInitiator;
+			expect(Object.keys(checks)).to.deep.equal(Object.keys(mutations));
 			for (const [name, mutate] of Object.entries(mutations)) {
 				const input = copyInput(c.inputs[0]);
-				mutate(input.seed as never, c, 0);
-				const e = expectRefusal(() =>
-					typed(store).appendFinalChannelType(c.id, input, root)
+				mutate(input.seed as never, c, 0, input, isInitiator);
+				let error: Error | undefined;
+				try {
+					typed(store).appendFinalChannelType(c.id, input, root);
+				} catch (e) {
+					error = e as Error;
+				}
+				expect(error?.message, name).to.equal(
+					'Channel type seed ' + checks[name] + ' does not verify'
 				);
-				expect(e.message, name).to.not.equal(TEXT.state);
 			}
 			expect(typed(store).loadFinalChannelTypeRecords(c.id)).to.deep.equal([]);
 		}
 
 		it('refuses each failing check of a plain seed at N >= 1, and accepts it unchanged', async () => {
 			const { pair, c } = await toPlain(1);
-			each(pair.devices[0], c, plainMutations);
+			each(pair.devices[0], c, plainMutations, plainChecks);
 			appendBoth(pair.devices, c);
 		});
 
 		it('refuses each failing check of an asset seed at N >= 1, and accepts it unchanged', () => {
 			const plain = plainTypePair(s, 1);
 			const c = toAsset(plain, 1);
-			each(plain.devices[0], c, assetMutations);
+			each(plain.devices[0], c, assetMutations, assetChecks);
 			appendBoth(plain.devices, c);
 		});
 
@@ -724,7 +898,51 @@ describe('Channel type record writer gates (#2151 step 2a, item 1)', function ()
 				]
 			});
 			for (const i of [0, 1])
-				refusesNothingStored(pair.devices[i].store, pair.id, poor.inputs[i]);
+				refusesNothingStored(
+					pair.devices[i].store,
+					pair.id,
+					poor.inputs[i],
+					'Channel type seed reserve does not verify'
+				);
+		});
+
+		it('refuses revocations in a seed at N = 0', async () => {
+			const { pair, c } = await toPlain(0);
+			const input = copyInput(c.inputs[0]);
+			// In the canonical field order, so only the revocation rule refuses it.
+			const { local, remote, ...rest } = input.seed as IFinalPlainSeedInput;
+			input.seed = { local, remote, peerRevoke: 'ab'.repeat(97), ...rest };
+			refusesNothingStored(
+				pair.devices[0].store,
+				pair.id,
+				input,
+				'Channel type seed revocations does not verify'
+			);
+		});
+
+		it('refuses an asset seed whose reserve does not hold on the new funding', () => {
+			const plain = plainTypePair(s, 0);
+			const parent = openingParent(plain.stores[0], plain.id);
+			const value = BigInt(parent.tx.outs[parent.index].value - 600);
+			const poor = toAsset(plain, 0, {
+				balances: [
+					{
+						localBalanceMsat: (value - 500n) * 1000n,
+						remoteBalanceMsat: 500_000n
+					},
+					{
+						localBalanceMsat: 500_000n,
+						remoteBalanceMsat: (value - 500n) * 1000n
+					}
+				]
+			});
+			for (const i of [0, 1])
+				refusesNothingStored(
+					plain.stores[i],
+					plain.id,
+					poor.inputs[i],
+					'Channel type seed reserve does not verify'
+				);
 		});
 
 		it('refuses a funding key index used by an earlier funding', async () => {
@@ -738,7 +956,12 @@ describe('Channel type record writer gates (#2151 step 2a, item 1)', function ()
 				parent: openingParent(pair.devices[0].store, pair.id),
 				keyIndices: index
 			});
-			refusesNothingStored(pair.devices[0].store, pair.id, reused.inputs[0]);
+			refusesNothingStored(
+				pair.devices[0].store,
+				pair.id,
+				reused.inputs[0],
+				'Channel type record reuses a funding key'
+			);
 		});
 	});
 });
@@ -983,6 +1206,70 @@ describe('Channel type reader and memo (#2151 step 2a, item 2)', function () {
 		expect(typed(g2.stores[0]).loadFinalChannelType(g2.id)!.source).to.equal(
 			'opening'
 		);
+	});
+
+	it("keeps a block's work going when one channel's type cannot be read", async () => {
+		const { pair } = await converted(0);
+		const d = pair.p.f.devices[0];
+		const running = finalTestNode(6, {
+			wallet: { db: d.store, mnemonic: d.mnemonic }
+		});
+		try {
+			const manager = running.node.getChannelManager();
+			const fields = manager as unknown as {
+				assetCollateral: Map<string, unknown>;
+			};
+			const unreadable = '66'.repeat(32);
+			const marker = { accepted: false, confirmed: false, present: false };
+			fields.assetCollateral.set(unreadable, { ...marker });
+			fields.assetCollateral.set(pair.id, { ...marker });
+			const read = d.store.loadFinalChannelTypeRecords.bind(d.store);
+			sinon
+				.stub(d.store, 'loadFinalChannelTypeRecords')
+				.callsFake((id: string) => {
+					if (id === unreadable) throw new Error('unreadable channel type');
+					return read(id);
+				});
+			// Every channel's HTLC deadline check follows the manager's block work.
+			const deadlines = sinon.spy(manager, 'checkFinalHtlcDeadlines');
+			const errors: string[] = [];
+			manager.on('error', (_id: Buffer | null, message: string) => {
+				errors.push(message);
+			});
+			expect(() => running.node.handleNewBlock(300)).to.not.throw();
+			expect(deadlines.callCount).to.equal(1);
+			expect(errors).to.include('unreadable channel type');
+			// The readable recorded channel still loses its marker at this block.
+			expect(fields.assetCollateral.has(pair.id)).to.equal(false);
+		} finally {
+			sinon.restore();
+			running.close();
+		}
+	});
+
+	it("reads a backup copy's plain channel and an asset channel inside a transaction as outside", async () => {
+		const plain = plainTypePair(s, 1);
+		const copy = path.join(s.dir(), 'plain-copy.db');
+		await plain.stores[0].backup(copy);
+		const backup = SqliteStorage.openFinalWallet(copy, plain.sides[0].binding);
+		s.closing(() => backup.close());
+		expect(backup.canSignFinalOpening).to.equal(false);
+		expect(typed(backup).loadFinalChannelType(plain.id)).to.deep.equal(
+			typed(plain.stores[0]).loadFinalChannelType(plain.id)
+		);
+		const spliced = await assetTypePair(s, 0);
+		await spliced.p.start();
+		await spliced.p.drain();
+		await spliced.p.adopt();
+		const store = spliced.devices[0].store;
+		const outside = typed(store).loadFinalChannelType(spliced.id)!;
+		expect(outside.funding.txid).to.not.equal(
+			txidOf(store.loadFinalOpening(spliced.id)!.fundingTxHex)
+		);
+		const inside = db(store).transaction(() =>
+			typed(store).loadFinalChannelType(spliced.id)
+		)();
+		expect(inside).to.deep.equal(outside);
 	});
 
 	it('opens and restarts with a record present', async () => {

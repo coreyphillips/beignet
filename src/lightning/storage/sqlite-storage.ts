@@ -688,7 +688,7 @@ export class SqliteStorage implements IStorageBackend {
 		if (typeRecord?.type === 'asset') {
 			// The asset base: the record's member is the active funding, and
 			// splices after a record are refused in #2151 step 2a.
-			const member = (typeRecord.seed as IFinalAssetSeed).members[0];
+			const member = copyJson((typeRecord.seed as IFinalAssetSeed).members[0]);
 			const base = outpointOf(typeRecord.funding);
 			const info = assetWalletFundingInfo(
 				[],
@@ -1988,7 +1988,8 @@ export class SqliteStorage implements IStorageBackend {
 			localPoint: old.localPoint,
 			peerPoints: old.peerPoints,
 			nextLocalId: old.nextLocalId,
-			nextPeerId: old.nextPeerId
+			nextPeerId: old.nextPeerId,
+			revocations: old.revocations
 		});
 		// The local points and nonces are this device's derivation from its root.
 		if (!root) throw new Error('Channel type record requires the wallet root');
@@ -2246,7 +2247,7 @@ export class SqliteStorage implements IStorageBackend {
 	private liveFinalFunding(channelId: string): IFinalFundingReference | null {
 		const state = this.channelTypeState(channelId);
 		const latest = state?.records.at(-1);
-		if (latest) return latest.funding;
+		if (latest) return copyJson(latest.funding);
 		const opening = this.loadFinalDaemonOpening(channelId);
 		if (!opening?.funding) return null;
 		const c = opening.candidate;
@@ -2257,18 +2258,27 @@ export class SqliteStorage implements IStorageBackend {
 			remoteFundingPubkey: c.remoteFundingPubkey,
 			localFundingKeyIndex: opening.session.channelKeyIndex
 		};
+		// The journals are read directly, without the live-device gates of the
+		// splice and asset readers, so a copy and a transaction see what the
+		// original device sees outside one.
+		const journal = this.finalJournal();
 		if (state?.current.type === 'asset') {
-			if (!this.canSpliceDualFundedAssets || this.db.inTransaction)
-				return original;
-			return (
-				this.loadAssetSpliceFundingInfo(channelId).active?.candidate.funding ??
-				original
+			if (!this.assetSpliceWallet) return original;
+			const info = this.assetWalletFundingInfo(
+				channelId,
+				opening,
+				this.assetWalletInputHistory(channelId).records
 			);
+			return copyJson(info.active?.candidate.funding ?? original);
 		}
+		if (!this.updateWallet) return original;
 		let selected = original;
-		for (const a of this.readFinalSpliceAttempts(channelId))
+		for (const a of finalSpliceAttempts(
+			channelId,
+			journal.read<FinalSpliceEvent>('splice', channelId).records
+		))
 			if (a.aborted === undefined && a.adopted) selected = a.candidate!.funding;
-		return selected;
+		return copyJson(selected);
 	}
 	private liveFundingOutpoint(
 		channelId: string
@@ -2382,6 +2392,7 @@ export class SqliteStorage implements IStorageBackend {
 		peerPoints: [Buffer, Buffer];
 		nextLocalId: string;
 		nextPeerId: string;
+		revocations: { localRevoke?: string; peerRevoke?: string };
 		secrets: (
 			from: number
 		) => { height: number; secret: Buffer; point: Buffer }[];
@@ -2395,7 +2406,6 @@ export class SqliteStorage implements IStorageBackend {
 				throw new Error('Channel type record requires a funded ready channel');
 			const s = view.views[0].s;
 			const pending =
-				view.views.length !== 1 ||
 				s.local.height !== s.remote.height ||
 				!!s.waiting.length ||
 				!!s.inFlight ||
@@ -2411,6 +2421,10 @@ export class SqliteStorage implements IStorageBackend {
 				] as [Buffer, Buffer],
 				nextLocalId: s.nextLocalId,
 				nextPeerId: s.nextPeerId,
+				revocations: {
+					localRevoke: s.local.revoke,
+					peerRevoke: s.remote.revoke
+				},
 				secrets: (from: number) => this.plainPeerSecrets(view, from)
 			};
 		}
@@ -2448,6 +2462,10 @@ export class SqliteStorage implements IStorageBackend {
 			] as [Buffer, Buffer],
 			nextLocalId: String(head.nextLocalId),
 			nextPeerId: String(head.nextPeerId),
+			revocations: {
+				localRevoke: history.stages.get(height + '/local-revoke'),
+				peerRevoke: history.stages.get(height + '/peer-revoke')
+			},
 			secrets: (from: number) =>
 				this.assetPeerSecrets(opening, history, from, Number(height))
 		};
