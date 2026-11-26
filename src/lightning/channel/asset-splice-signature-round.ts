@@ -1,4 +1,5 @@
 import { deserialize, serialize } from 'v8';
+import { channelTypeRecordsOf } from '../storage/final-channel-type';
 import { assetUpdateHistory } from '../storage/asset-update-history';
 import type {
 	IAssetUpdateHtlcSigner,
@@ -201,6 +202,12 @@ export class AssetSpliceSignatureRound {
 		if (!opening?.session.assetEvidence || !opening.funding)
 			throw new Error(
 				'Splice signatures need the funded original asset channel'
+			);
+		// With no record the asset base is the opening's evidence, which the
+		// reads below take; a recorded channel's splices are refused in 2a.
+		if (channelTypeRecordsOf(store, this.id).length)
+			throw new Error(
+				'Splices of a channel with a recorded type change are not supported yet'
 			);
 		this.opening = opening.candidate;
 		this.session = opening.session;

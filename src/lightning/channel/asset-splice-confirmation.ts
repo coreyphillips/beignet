@@ -1,4 +1,5 @@
 import type { IAssetSpliceInclusionRecovery } from '../chain/asset-splice-inclusion';
+import { channelTypeRecordsOf } from '../storage/final-channel-type';
 import { decodeSpliceLockedMessage } from '../message/splice';
 import {
 	publishableAssetSpliceEvidence,
@@ -194,7 +195,12 @@ export class AssetSpliceConfirmationCoordinator {
 			? [id]
 			: this.store.loadFinalOpenings().map((c) => c.channelId)) {
 			const session = this.store.loadFinalOpeningSession(channel);
-			if (!session?.assetEvidence) continue;
+			// Splice confirmations belong to the opening's asset era: none follow a record.
+			if (
+				!session?.assetEvidence ||
+				channelTypeRecordsOf(this.store, channel).length
+			)
+				continue;
 			const { records } =
 				this.store.readAssetSpliceJournal<AssetSpliceExitEvent>(channel);
 			for (const e of publishableAssetSpliceEvidence(records, channel))

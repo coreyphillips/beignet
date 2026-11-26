@@ -29,7 +29,11 @@ export const FIT_TERMS: IReadyPairTerms = {
 };
 
 /** Temporary directories and stores, released after each test. */
-export function scratch(prefix: string) {
+export function scratch(prefix: string): {
+	dir(): string;
+	closing(close: () => void): void;
+	release(): void;
+} {
 	const dirs: string[] = [];
 	const closers: (() => void)[] = [];
 	return {

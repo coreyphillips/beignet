@@ -42,7 +42,9 @@ import { plainUpdates, plainWire } from './helpers/final-plain-wire';
 import {
 	assetTypePair,
 	plainTypePair,
-	scratch
+	scratch,
+	type IAssetTypePair,
+	type IPlainTypePair
 } from './helpers/channel-type-pairs';
 import {
 	appendBoth,
@@ -533,8 +535,8 @@ function currentTypeSites(
 	id: string,
 	labels: Record<string, string>
 ): Record<string, unknown> {
-	const label = (txid: string) => labels[txid] ?? txid;
-	const spends = (raw: Buffer) =>
+	const label = (txid: string): string => labels[txid] ?? txid;
+	const spends = (raw: Buffer): string =>
 		label(
 			Buffer.from(Transaction.fromBuffer(raw).ins[0].hash)
 				.reverse()
@@ -592,11 +594,16 @@ describe('Current type at each reachable site (#2151 step 2a, items 3 and 8)', f
 	this.timeout(240000);
 	const s = scratch('channel-type-sites-');
 	afterEach(() => s.release());
-	const openingLabel = (store: SqliteStorage, id: string) => ({
+	const openingLabel = (
+		store: SqliteStorage,
+		id: string
+	): { [x: string]: string } => ({
 		[Transaction.fromHex(store.loadFinalOpening(id)!.fundingTxHex).getId()]:
 			'opening'
 	});
-	async function assetRow(generation: 5 | 6) {
+	async function assetRow(
+		generation: 5 | 6
+	): Promise<{ pair: IAssetTypePair; sites: Record<string, unknown> }> {
 		const pair = await assetTypePair(s, 1, generation);
 		const { store, root } = pair.devices[0];
 		return {
@@ -609,7 +616,10 @@ describe('Current type at each reachable site (#2151 step 2a, items 3 and 8)', f
 			)
 		};
 	}
-	function plainRow(generation: 2 | 6) {
+	function plainRow(generation: 2 | 6): {
+		pair: IPlainTypePair;
+		sites: Record<string, unknown>;
+	} {
 		const pair = plainTypePair(s, 1, generation);
 		const { store, root } = pair.devices[0];
 		return {
@@ -688,7 +698,10 @@ describe('Current type at each reachable site (#2151 step 2a, items 3 and 8)', f
 	});
 
 	it("gives the current type's result at every site after a record", async () => {
-		const pick = (sites: Record<string, unknown>, keys: string[]) =>
+		const pick = (
+			sites: Record<string, unknown>,
+			keys: string[]
+		): { [k: string]: unknown } =>
 			Object.fromEntries(keys.map((k) => [k, sites[k]]));
 		const shared = {
 			loadFinalActiveFunding: 'record',

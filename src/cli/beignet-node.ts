@@ -8007,6 +8007,8 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	private assetChannelFigureOf(
 		ch: ReturnType<LightningNode['listChannels']>[number]
 	): 'assetChannelSats' | 'assetChannelClosingSats' | undefined {
+		// `auxiliary` and `channelType` are the channel's current type (#2151),
+		// as finalOpeningInfo reports them.
 		if (!ch.auxiliary || ch.fundingTxid === undefined) return undefined;
 		if (!this.node.isFundingBroadcastOrConfirmed(ch.channelId)) {
 			return undefined;

@@ -27,7 +27,11 @@ import {
 } from '../script/commitment-taproot';
 import { tapleafHash, signTaprootHtlcLeaf } from '../script/htlc-taproot';
 import { MAX_STANDARD_TX_WEIGHT } from '../interactive-tx/validation';
-import { finalLeafClaim, type IFinalOutputClaim } from './final-output-claims';
+import {
+	finalLeafClaim,
+	type IFinalOutputClaim,
+	recordedChannelType
+} from './final-output-claims';
 
 /** Identify the wallet's output by reconstructing the complete signed commitment and its tree. */
 export function assetOpeningOutputClaims(
@@ -49,6 +53,7 @@ export function assetOpeningOutputClaims(
 		return [];
 	const opening = storage.loadFinalDaemonOpening(id);
 	if (
+		recordedChannelType(storage, id) ||
 		!opening?.session.assetEvidence ||
 		!storage.loadFinalLocalTxSignatures(id)
 	)

@@ -58,6 +58,7 @@ import {
 	buildConversion,
 	expectRefusal,
 	type IChannelTypeRecord,
+	localPointsOf,
 	type IConversion,
 	type IFinalPlainSeedInput,
 	openingParent,
@@ -87,7 +88,9 @@ interface ISecretVectors {
 const vectors = loadVectors<ISecretVectors>(
 	'bolt03/per-commitment-secrets.json'
 );
-const sequence = (name: string) =>
+const sequence = (
+	name: string
+): { height: number; secret: Buffer; point: Buffer }[] =>
 	vectors.storage
 		.find((c) => c.name === name)!
 		.inserts.map((i) => {
@@ -100,11 +103,16 @@ const derivedSeed = hexToBuffer(
 	vectors.generation.find((g) => g.name === 'generate_from_seed FF final node')!
 		.seed
 );
-const derived = (h: number) => {
+const derived = (
+	h: number
+): { height: number; secret: Buffer; point: Buffer } => {
 	const secret = generateFromSeed(derivedSeed, MAX_INDEX - BigInt(h));
 	return { height: h, secret, point: getPublicKey(secret) };
 };
-const heights = (from: number, to: number) =>
+const heights = (
+	from: number,
+	to: number
+): { height: number; secret: Buffer; point: Buffer }[] =>
 	Array.from({ length: to - from }, (_, i) => derived(from + i));
 
 /** The BOLT 3 buckets of the given secrets, as rememberRevocation stores them. */
@@ -126,7 +134,7 @@ function secretOf(
 	id: string,
 	peer: number,
 	h: number
-) {
+): Buffer {
 	const index =
 		devices[peer].store.loadFinalOpeningSession(id)!.channelKeyIndex;
 	return generateFromSeed(
@@ -140,14 +148,14 @@ const recordOf = (
 	shachain: Shachain
 ): IChannelTypeRecord => ({
 	...c.inputs[i],
-	seed: { ...c.inputs[i].seed, shachain }
+	seed: { ...c.inputs[i].seed, localPoints: localPointsOf(c, i), shachain }
 });
 
 describe('The peer shachain and the seeded plain ledger, pure (#2151 step 2a, item 4)', function () {
 	this.timeout(120000);
 	const s = scratch('channel-type-pure-');
 	afterEach(() => s.release());
-	const pure = () => step2a();
+	const pure = (): ReturnType<typeof step2a> => step2a();
 
 	it('computes the BOLT 3 buckets of the spec sequence at N = 0, 1, 2 and 7', () => {
 		for (const n of [0, 1, 2, 7, 8])
@@ -195,7 +203,8 @@ describe('The peer shachain and the seeded plain ledger, pure (#2151 step 2a, it
 	it('refuses a missing height, also one that no bucket check would notice', () => {
 		const run = (
 			input: Parameters<ReturnType<typeof step2a>['finalSeedShachain']>[0]
-		) => expectRefusal(() => pure().finalSeedShachain(input), TEXT.missing);
+		): Error =>
+			expectRefusal(() => pure().finalSeedShachain(input), TEXT.missing);
 		// Height 2 is derivable from height 3, so its bucket check alone passes.
 		run({ secrets: [derived(0), derived(1), derived(3)], stateNumber: 4 });
 		run({ secrets: heights(0, 3), stateNumber: 4 });
@@ -319,7 +328,7 @@ function exitManager(
 	side: ITypeDevice,
 	id: string,
 	txid: string
-) {
+): { manager: ChannelManager; broadcasts: Transaction[]; errors: string[] } {
 	const manager = Object.assign(Object.create(ChannelManager.prototype), {
 		config: { finalOpening: { storage: store, root: side.root } },
 		assetCollateral: new Map(),
@@ -346,7 +355,7 @@ function claimsOf(
 	root: ITypeDevice['root'],
 	id: string,
 	parent: Transaction
-) {
+): Record<'dispatched' | 'plain' | 'asset' | 'matched', unknown[]> {
 	const runtime = { storage: store, root };
 	const key = Buffer.from(id, 'hex');
 	return {
@@ -369,7 +378,7 @@ async function assetSpliceRefusal(
 	store: SqliteStorage,
 	root: ITypeDevice['root'],
 	id: string
-) {
+): Promise<string> {
 	const reported: string[] = [];
 	const transport = new AssetSpliceTransport(
 		{ storage: store, root },
@@ -394,16 +403,24 @@ async function assetSpliceRefusal(
 	transport.destroy();
 	return message ?? reported[0];
 }
-const feeUpdate = (id: string, feeratePerKw: number) =>
+const feeUpdate = (id: string, feeratePerKw: number): Buffer =>
 	encodeUpdateFeeMessage({ channelId: Buffer.from(id, 'hex'), feeratePerKw });
-const txidOf = (raw: Buffer) => Transaction.fromBuffer(raw).ins[0].hash;
+const txidOf = (raw: Buffer): Buffer => Transaction.fromBuffer(raw).ins[0].hash;
 
 describe('A conversion to plain on real SQLite devices (#2151 step 2a, item 5)', function () {
 	this.timeout(240000);
 	const s = scratch('channel-type-to-plain-');
 	afterEach(() => s.release());
 
-	async function toPlain(k: number) {
+	async function toPlain(k: number): Promise<{
+		pair: IAssetTypePair;
+		c: IConversion;
+		sides: Side[];
+		stores: () => SqliteStorage[];
+		parentExits: Transaction[];
+		id: string;
+		devices: ITypeDevice[];
+	}> {
 		const pair: IAssetTypePair = await assetTypePair(s, k);
 		const c = buildConversion(pair.devices, pair.id, {
 			type: 'plain',
@@ -416,7 +433,7 @@ describe('A conversion to plain on real SQLite devices (#2151 step 2a, item 5)',
 			.map((e) => Transaction.fromBuffer(e.exit));
 		appendBoth(pair.devices, c);
 		const sides: Side[] = pair.p.f.devices.map((d) => d.party);
-		const stores = () => pair.devices.map((d) => d.store);
+		const stores = (): SqliteStorage[] => pair.devices.map((d) => d.store);
 		return {
 			pair,
 			c,
@@ -428,7 +445,7 @@ describe('A conversion to plain on real SQLite devices (#2151 step 2a, item 5)',
 		};
 	}
 	/** One plain round at N + 1 each way, returning each revoke_and_ack. */
-	function roundEachWay(t: Awaited<ReturnType<typeof toPlain>>) {
+	function roundEachWay(t: Awaited<ReturnType<typeof toPlain>>): Buffer[] {
 		const st = t.stores();
 		const opener = st[0].loadFinalOpening(t.id)!.isInitiator ? 0 : 1;
 		const wire = feeUpdate(t.id, 400);
@@ -508,7 +525,7 @@ describe('A conversion to plain on real SQLite devices (#2151 step 2a, item 5)',
 			const wire = plainWire(st, t.sides, t.id);
 			const seen: number[] = [];
 			const push = wire.messages.push.bind(wire.messages);
-			wire.messages.push = (...items) => {
+			wire.messages.push = (...items): number => {
 				seen.push(...items.map((m) => m.type));
 				return push(...items);
 			};
@@ -682,7 +699,12 @@ describe('A conversion to asset on real SQLite devices (#2151 step 2a, item 6)',
 	const s = scratch('channel-type-to-asset-');
 	afterEach(() => s.release());
 
-	function toAsset(k: number) {
+	function toAsset(k: number): {
+		pair: IPlainTypePair;
+		c: IConversion;
+		id: string;
+		devices: ITypeDevice[];
+	} {
 		const pair: IPlainTypePair = plainTypePair(s, k);
 		const c = buildConversion(pair.devices, pair.id, {
 			type: 'asset',

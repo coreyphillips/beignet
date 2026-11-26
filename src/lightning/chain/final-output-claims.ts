@@ -158,6 +158,7 @@ export function finalChannelOutputClaims(
 		asset?: AssetClaimBuilder;
 	} = {}
 ): IFinalOutputClaim[] {
+	if (recordedChannelType(runtime.storage, id.toString('hex'))) return [];
 	const kind = kindOf(id.toString('hex'));
 	if (kind === 'plain')
 		return (builders.plain ?? finalOpeningOutputClaims)(
@@ -179,6 +180,24 @@ export function finalChannelOutputClaims(
 	return [];
 }
 
+/**
+ * A channel with a `channel-type` record is claimed by branch, which is
+ * #2151 step 2b; until then its claims are empty (#2151 step 2a).
+ */
+export function recordedChannelType(
+	storage: IFinalOpeningRuntime['storage'],
+	channelId: string
+): boolean {
+	const records = (
+		storage as {
+			loadFinalChannelTypeRecords?: (id: string) => readonly unknown[];
+		}
+	).loadFinalChannelTypeRecords;
+	return (
+		typeof records === 'function' && records.call(storage, channelId).length > 0
+	);
+}
+
 /** Rebuild only a journaled commitment, including every eligible output of revoked remote states. */
 export function finalOpeningOutputClaims(
 	runtime: IFinalOpeningRuntime,
@@ -197,6 +216,7 @@ export function finalOpeningOutputClaims(
 		return [];
 	const channelId = id.toString('hex'),
 		session = storage.loadFinalOpeningSession(channelId);
+	if (recordedChannelType(storage, channelId)) return [];
 	// Plain channels only: an asset channel is claimed by assetOpeningOutputClaims.
 	if (!session || session.assetEvidence) return [];
 	const ledger = storage.loadFinalResolutionStates(channelId);

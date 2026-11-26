@@ -1,6 +1,9 @@
 import { Transaction } from 'bitcoinjs-lib';
 import type { BIP32Interface } from 'bip32';
-import { buildFinalCommitmentView } from '../channel/final-opening-commitment';
+import {
+	buildFinalCommitmentView,
+	type IFinalCommitmentType
+} from '../channel/final-opening-commitment';
 import {
 	finalFunderCostMsat,
 	finalFundingReserveSats,
@@ -30,6 +33,10 @@ import { MAX_LIGHTNING_PAYLOAD } from '../message/custom-records';
 import type { IFinalOpeningCandidate } from './final-opening-candidate';
 import type { IFinalOpeningNonces } from './final-opening-nonces';
 import type { FinalOpeningAuthority } from './final-opening-authority';
+import type {
+	IFinalChannelTypeRecord,
+	IFinalPlainSeed
+} from './final-channel-type';
 import { readyKeys } from './final-opening-ready';
 import {
 	signFinalUpdate,
@@ -121,6 +128,24 @@ export interface IFinalUpdateContext {
 	nonceKey: Buffer;
 	identity: string;
 	authority: FinalOpeningAuthority;
+	/** The channel's current type when a record changed it from the opening's (#2151). */
+	channelType?: string;
+	/** The opening's own asset root, which validates the opening's own funding script. */
+	openingRoot?: Buffer;
+	/** The state number of the record this ledger was seeded at. */
+	recordStateNumber?: number;
+}
+
+/** The type the builders and the signer take for a context, when a record set it. */
+export function contextType(
+	ctx: IFinalUpdateContext
+): IFinalCommitmentType | undefined {
+	return ctx.channelType === undefined
+		? undefined
+		: {
+				channelType: ctx.channelType,
+				...(ctx.openingRoot && { openingRoot: ctx.openingRoot })
+		  };
 }
 
 export function finalFundingTxid(ctx: IFinalUpdateContext): Buffer {
@@ -511,7 +536,8 @@ function build(
 			remoteBalanceMsat: BigInt(funds.peer)
 		},
 		publicHtlcs(funds),
-		ctx.funding
+		ctx.funding,
+		contextType(ctx)
 	);
 	return { funds, view };
 }
@@ -566,7 +592,8 @@ export function signFinalLedger(
 			remoteBalanceMsat: BigInt(funds.peer)
 		},
 		publicHtlcs(funds),
-		ctx.funding
+		ctx.funding,
+		contextType(ctx)
 	);
 	const transcript = prior?.target ?? target.map((u) => u.payload);
 	const keys = readyKeys(root, ctx.nonces, ctx.identity);
@@ -581,7 +608,8 @@ export function signFinalLedger(
 		ctx.nonceKey,
 		transcript,
 		undefined,
-		fundingSigner(ctx, root)
+		fundingSigner(ctx, root),
+		ctx.channelType
 	);
 	for (const u of target) u.remoteAt ??= height;
 	s.inFlight = {
@@ -627,7 +655,8 @@ export function acceptFinalLedgerCommit(
 		ctx.nonceKey,
 		target.map((u) => u.payload),
 		wire,
-		fundingSigner(ctx, root)
+		fundingSigner(ctx, root),
+		ctx.channelType
 	);
 	const nextPoint = getPublicKey(
 		generateFromSeed(keys.perCommitmentSeed, MAX_INDEX - BigInt(height + 1))
@@ -873,6 +902,102 @@ function rememberRevocation(
 	}
 	s.shachain[bits] = { height, secret: secret.toString('hex') };
 }
+/** The peer shachain step, for the channel type record's writer (internal). */
+export function rememberPeerRevocation(
+	shachain: IFinalLedgerState['shachain'],
+	height: number,
+	secret: Buffer
+): void {
+	rememberRevocation({ shachain } as IFinalLedgerState, height, secret);
+}
+
+/**
+ * The BOLT 3 buckets covering every peer secret below `stateNumber`: the
+ * prior record's buckets, then each secret since, in increasing height. A
+ * missing height is refused explicitly, since a bucket check alone does not
+ * always notice it.
+ */
+export function finalSeedShachain(input: {
+	prior?: IFinalLedgerState['shachain'];
+	secrets: readonly { height: number; secret: Buffer; point: Buffer }[];
+	stateNumber: number;
+}): IFinalLedgerState['shachain'] {
+	const shachain: IFinalLedgerState['shachain'] = JSON.parse(
+		JSON.stringify(input.prior ?? [])
+	);
+	let next = 0;
+	for (const e of shachain) if (e && e.height + 1 > next) next = e.height + 1;
+	for (const { height, secret, point } of input.secrets) {
+		protocol(height === next, 'Missing preceding revocation secret');
+		let derived: Buffer;
+		try {
+			derived = getPublicKey(secret);
+		} catch {
+			throw new FinalUpdateProtocolError('Invalid revocation secret');
+		}
+		protocol(
+			derived.equals(point),
+			'Revocation secret does not match previous commitment'
+		);
+		rememberPeerRevocation(shachain, height, secret);
+		next++;
+	}
+	protocol(next === input.stateNumber, 'Missing preceding revocation secret');
+	return shachain;
+}
+
+/**
+ * The plain ledger a `channel-type` record seeds at its state number N, on
+ * the record's funding. Both sides are at N and quiescent. The local points
+ * are the record's, which the writer computed from the per-commitment seed.
+ */
+export function seedFinalLedger(input: {
+	candidate: IFinalOpeningCandidate;
+	nonces: IFinalOpeningNonces;
+	record: IFinalChannelTypeRecord;
+	peerPoints: [Buffer, Buffer];
+}): IFinalLedgerState {
+	const { record } = input;
+	if (record.type !== 'plain')
+		throw new Error('A plain ledger is seeded only by a plain record');
+	const seed = record.seed as IFinalPlainSeed;
+	const height = Number(record.stateNumber);
+	const funds = (): Funds => JSON.parse(JSON.stringify(seed.funds)) as Funds;
+	const local: Commitment = {
+		height,
+		point: seed.localPoints[0],
+		nextPoint: seed.localPoints[1],
+		nextNonce: { ...seed.local.nextNonce },
+		tx: seed.local.tx,
+		funds: funds(),
+		signed: seed.local.signed,
+		...(seed.localRevoke && { revoke: seed.localRevoke })
+	};
+	const remote: Commitment = {
+		height,
+		point: input.peerPoints[0].toString('hex'),
+		nextPoint: input.peerPoints[1].toString('hex'),
+		nextNonce: { ...seed.remote.nextNonce },
+		tx: seed.remote.tx,
+		funds: funds(),
+		...(seed.peerRevoke && { revoke: seed.peerRevoke })
+	};
+	return {
+		funding: { ...record.funding },
+		initialRemote: JSON.parse(JSON.stringify(remote)),
+		local,
+		remote,
+		locked: funds(),
+		waiting: [],
+		deliveries: [],
+		nextLocalId: seed.nextLocalId,
+		nextPeerId: seed.nextPeerId,
+		nextUpdate: 1,
+		wireSequence: 0,
+		shachain: JSON.parse(JSON.stringify(seed.shachain))
+	};
+}
+
 export function finalLedgerReconnect(
 	ctx: IFinalUpdateContext,
 	s: IFinalLedgerState,
@@ -951,6 +1076,13 @@ function checkReconnectCounters(
 	if (msg.nextRevocationNumber > BigInt(s.local.height)) {
 		return { dataLoss: true, needAck: false, needCommit: false };
 	}
+	// Both sides completed round N before a record at N. Resending the old
+	// era's revoke_and_ack would name the old funding's nonce.
+	protocol(
+		ctx.recordStateNumber === undefined ||
+			msg.nextRevocationNumber >= BigInt(ctx.recordStateNumber),
+		'Peer reestablish is behind the channel type record'
+	);
 	const needAck = msg.nextRevocationNumber === BigInt(s.local.height - 1);
 	protocol(
 		needAck || msg.nextRevocationNumber === BigInt(s.local.height),
@@ -1071,10 +1203,11 @@ export function finalResolutionStates(
 	s: IFinalLedgerState,
 	history: Iterable<IFinalLedgerState>
 ) {
-	const opening = initialFinalLedger(ctx.candidate, ctx.nonces);
+	// A seeded ledger starts at its record's state number, with no opening view.
+	let remote =
+		s.initialRemote ?? initialFinalLedger(ctx.candidate, ctx.nonces).remote;
 	const revoked: ReturnType<typeof resolutionView>[] = [];
 	const preimages = new Map<string, Buffer>();
-	let remote = s.initialRemote ?? opening.remote;
 	for (const entry of history) {
 		if (entry.remote.height === remote.height + 1) {
 			const old = resolutionView(remote, ctx);

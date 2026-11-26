@@ -1,7 +1,8 @@
 import { Transaction } from 'bitcoinjs-lib';
 import {
 	buildAssetSpliceCommitment,
-	type IFinalOpeningTerms
+	type IFinalOpeningTerms,
+	type IFinalCommitmentType
 } from '../channel/final-opening-commitment';
 import type { IFinalFundingReference } from '../channel/final-splice-candidate';
 import type { IFinalOpeningCandidate } from './final-opening-candidate';
@@ -126,7 +127,8 @@ export function spliceRecoveryView(
 		  > &
 				Partial<IAssetSpliceExitBranch>),
 	holder: 'local' | 'remote',
-	stateNumber: string
+	stateNumber: string,
+	as?: IFinalCommitmentType
 ) {
 	const h = holder === 'local' ? branch.localRecovery : branch.remoteRecovery;
 	const signed =
@@ -187,7 +189,8 @@ export function spliceRecoveryView(
 		})),
 		funding,
 		Buffer.from(openingRoot, 'hex'),
-		assets
+		assets,
+		as
 	);
 	const commitment = Transaction.fromHex(signed);
 	const local = holder === 'local';

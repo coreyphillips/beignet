@@ -8,7 +8,8 @@ const scopes = [
 	'asset-splice',
 	'simple-close',
 	'output-claim',
-	'htlc-timeout'
+	'htlc-timeout',
+	'channel-type'
 ] as const;
 type Scope = (typeof scopes)[number] | 'asset-recovery-frame';
 interface JournalRow {

@@ -24,7 +24,8 @@ import { deriveBackupMacKey, writeBackupMac } from '../../src/cli/backup-mac';
 import { performAssetChannelRestore } from '../../src/cli/restore';
 import {
 	buildAssetSpliceCommitment,
-	buildFinalCommitmentView
+	buildFinalCommitmentView,
+	type IFinalCommitmentView
 } from '../../src/lightning/channel/final-opening-commitment';
 import { generateFromSeed, MAX_INDEX } from '../../src/lightning/keys/shachain';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
@@ -45,6 +46,7 @@ import {
 	FIT_TERMS,
 	plainTypePair,
 	scratch,
+	type IAssetTypePair,
 	type IPlainTypePair
 } from './helpers/channel-type-pairs';
 import {
@@ -61,6 +63,7 @@ import {
 	type IFinalAssetSeedInput,
 	type IFinalPlainSeedInput,
 	LEAVES,
+	localPointsOf,
 	openingParent,
 	PLAIN_TYPE_HEX,
 	plainTwin,
@@ -74,7 +77,7 @@ import { signingFixture } from './helpers/final-opening-signing';
 import { plainUpdates, plainWire } from './helpers/final-plain-wire';
 
 const unknown = '77'.repeat(32);
-const feeUpdate = (id: string) =>
+const feeUpdate = (id: string): Buffer =>
 	encodeUpdateFeeMessage({
 		channelId: Buffer.from(id, 'hex'),
 		feeratePerKw: 301
@@ -85,7 +88,7 @@ function buildAs(
 	kind: 'plain' | 'asset',
 	args: unknown[],
 	as: { channelType: string; openingRoot?: Buffer }
-) {
+): IFinalCommitmentView {
 	const build = (kind === 'plain'
 		? buildFinalCommitmentView
 		: buildAssetSpliceCommitment) as unknown as (
@@ -94,7 +97,10 @@ function buildAs(
 	return build(...args, as);
 }
 /** signFinalUpdate with the assumed trailing type argument. */
-function signAs(args: Parameters<typeof signFinalUpdate>, channelType: string) {
+function signAs(
+	args: Parameters<typeof signFinalUpdate>,
+	channelType: string
+): Buffer {
 	return (signFinalUpdate as unknown as (...a: unknown[]) => Buffer)(
 		...args,
 		channelType
@@ -104,20 +110,23 @@ function signAs(args: Parameters<typeof signFinalUpdate>, channelType: string) {
 function db(store: SqliteStorage): Database.Database {
 	return (store as unknown as { db: Database.Database }).db;
 }
-function typeRows(store: SqliteStorage, id: string) {
+function typeRows(store: SqliteStorage, id: string): unknown[] {
 	return db(store)
 		.prepare(
 			"SELECT sequence, record FROM final_lifecycle_log WHERE scope='channel-type' AND channel_id=? ORDER BY sequence"
 		)
 		.all(id);
 }
-const txidOf = (hex: string) => Transaction.fromHex(hex).getId();
+const txidOf = (hex: string): string => Transaction.fromHex(hex).getId();
 /** The output the channel lives on, as loadFinalChannelType names it. */
-const fundingOf = (c: IConversion) => ({
+const fundingOf = (c: IConversion): { txid: string; outputIndex: number } => ({
 	txid: c.tx.getId(),
 	outputIndex: 0
 });
-const parentOf = (c: IConversion) => ({ tx: c.tx, index: 0 });
+const parentOf = (c: IConversion): { tx: Transaction; index: number } => ({
+	tx: c.tx,
+	index: 0
+});
 
 /** The peer's per-commitment secret for height h, from its device root. */
 function peerSecret(
@@ -138,7 +147,10 @@ function peerSecret(
 	return generateFromSeed(seed, MAX_INDEX - BigInt(h));
 }
 /** The BOLT 3 buckets of secrets for heights 0 to n - 1, as rememberRevocation stores them. */
-function buckets(secret: (h: number) => Buffer, n: number) {
+function buckets(
+	secret: (h: number) => Buffer,
+	n: number
+): ({ height: number; secret: string } | null)[] {
 	const out: ({ height: number; secret: string } | null)[] = [];
 	for (let h = 0; h < n; h++) {
 		const index = MAX_INDEX - BigInt(h);
@@ -155,7 +167,10 @@ describe('Channel type record writer gates (#2151 step 2a, item 1)', function ()
 	const s = scratch('channel-type-writer-');
 	afterEach(() => s.release());
 
-	async function toPlain(rounds = 0, generation: 5 | 6 = 6) {
+	async function toPlain(
+		rounds = 0,
+		generation: 5 | 6 = 6
+	): Promise<{ pair: IAssetTypePair; c: IConversion }> {
 		const pair = await assetTypePair(s, rounds, generation);
 		const c = buildConversion(pair.devices, pair.id, {
 			type: 'plain',
@@ -164,7 +179,7 @@ describe('Channel type record writer gates (#2151 step 2a, item 1)', function ()
 		});
 		return { pair, c };
 	}
-	function toAsset(pair: IPlainTypePair, n = 0, extra = {}) {
+	function toAsset(pair: IPlainTypePair, n = 0, extra = {}): IConversion {
 		return buildConversion(pair.devices, pair.id, {
 			type: 'asset',
 			stateNumber: n,
@@ -177,7 +192,7 @@ describe('Channel type record writer gates (#2151 step 2a, item 1)', function ()
 		id: string,
 		input: IChannelTypeRecordInput,
 		text?: string
-	) => {
+	): Error => {
 		const e = expectRefusal(
 			() => typed(store).appendFinalChannelType(id, input),
 			text
@@ -193,7 +208,11 @@ describe('Channel type record writer gates (#2151 step 2a, item 1)', function ()
 			const [record] = typed(d.store).loadFinalChannelTypeRecords(pair.id);
 			expect(record).to.deep.equal({
 				...c.inputs[i],
-				seed: { ...c.inputs[i].seed, shachain: [] }
+				seed: {
+					...c.inputs[i].seed,
+					localPoints: localPointsOf(c, i),
+					shachain: []
+				}
 			});
 		}
 		const plain = plainTypePair(s, 0);
@@ -203,7 +222,14 @@ describe('Channel type record writer gates (#2151 step 2a, item 1)', function ()
 			expect(
 				typed(d.store).loadFinalChannelTypeRecords(plain.id)
 			).to.deep.equal([
-				{ ...a.inputs[i], seed: { ...a.inputs[i].seed, shachain: [] } }
+				{
+					...a.inputs[i],
+					seed: {
+						...a.inputs[i].seed,
+						localPoints: localPointsOf(a, i),
+						shachain: []
+					}
+				}
 			]);
 	});
 
@@ -292,6 +318,10 @@ describe('Channel type record writer gates (#2151 step 2a, item 1)', function ()
 			'a seed shachain supplied by the caller': {
 				...base,
 				seed: { ...base.seed, shachain: [] }
+			} as unknown as IChannelTypeRecordInput,
+			'seed local points supplied by the caller': {
+				...base,
+				seed: { ...base.seed, localPoints: localPointsOf(c, 0) }
 			} as unknown as IChannelTypeRecordInput,
 			'another kind': { ...base, kind: 'asset-splice' } as never,
 			'an unknown type': { ...base, type: 'bitcoin' } as never,
@@ -571,7 +601,7 @@ describe('Channel type record writer gates (#2151 step 2a, item 1)', function ()
 
 	describe('a seed that does not verify (rule 13)', () => {
 		type Mutation = (seed: never, c: IConversion, i: number) => void;
-		const witnessless = (hex: string) => {
+		const witnessless = (hex: string): string => {
 			const t = Transaction.fromHex(hex);
 			t.setWitness(0, [Buffer.alloc(64, 1)]);
 			return t.toHex();
@@ -645,15 +675,16 @@ describe('Channel type record writer gates (#2151 step 2a, item 1)', function ()
 			}
 		};
 		function each(
-			store: SqliteStorage,
+			device: { store: SqliteStorage; root: import('bip32').BIP32Interface },
 			c: IConversion,
 			mutations: Record<string, Mutation>
-		) {
+		): void {
+			const { store, root } = device;
 			for (const [name, mutate] of Object.entries(mutations)) {
 				const input = copyInput(c.inputs[0]);
 				mutate(input.seed as never, c, 0);
 				const e = expectRefusal(() =>
-					typed(store).appendFinalChannelType(c.id, input)
+					typed(store).appendFinalChannelType(c.id, input, root)
 				);
 				expect(e.message, name).to.not.equal(TEXT.state);
 			}
@@ -662,14 +693,14 @@ describe('Channel type record writer gates (#2151 step 2a, item 1)', function ()
 
 		it('refuses each failing check of a plain seed at N >= 1, and accepts it unchanged', async () => {
 			const { pair, c } = await toPlain(1);
-			each(pair.devices[0].store, c, plainMutations);
+			each(pair.devices[0], c, plainMutations);
 			appendBoth(pair.devices, c);
 		});
 
 		it('refuses each failing check of an asset seed at N >= 1, and accepts it unchanged', () => {
 			const plain = plainTypePair(s, 1);
 			const c = toAsset(plain, 1);
-			each(plain.stores[0], c, assetMutations);
+			each(plain.devices[0], c, assetMutations);
 			appendBoth(plain.devices, c);
 		});
 
@@ -720,7 +751,9 @@ describe('Channel type reader and memo (#2151 step 2a, item 2)', function () {
 		s.release();
 	});
 
-	async function converted(rounds = 0) {
+	async function converted(
+		rounds = 0
+	): Promise<{ pair: IAssetTypePair; c: IConversion }> {
 		const pair = await assetTypePair(s, rounds);
 		const c = buildConversion(pair.devices, pair.id, {
 			type: 'plain',
@@ -821,7 +854,8 @@ describe('Channel type reader and memo (#2151 step 2a, item 2)', function () {
 		for (const [i, d] of plain.devices.entries()) {
 			const records = typed(d.store).loadFinalChannelTypeRecords(plain.id);
 			expect(records.map((r) => r.type)).to.deep.equal(['asset', 'plain']);
-			const secret = (h: number) => peerSecret(plain, plain.id, 1 - i, h);
+			const secret = (h: number): Buffer =>
+				peerSecret(plain, plain.id, 1 - i, h);
 			expect(records[0].seed.shachain).to.deep.equal(buckets(secret, 2));
 			expect(records[1].seed.shachain).to.deep.equal(buckets(secret, 3));
 			expect(typed(d.store).loadFinalChannelType(plain.id)!.type).to.equal(
@@ -911,7 +945,11 @@ describe('Channel type reader and memo (#2151 step 2a, item 2)', function () {
 					throw new Error('wallet insert failed');
 			});
 		expect(() =>
-			typed(store).appendFinalChannelType(pair.id, c.inputs[0])
+			typed(store).appendFinalChannelType(
+				pair.id,
+				c.inputs[0],
+				pair.devices[0].root
+			)
 		).to.throw('wallet insert failed');
 		sinon.restore();
 		expect(typed(store).loadFinalChannelType(pair.id)!.type).to.equal('plain');
@@ -1081,14 +1119,18 @@ describe('Builders and signer by type (#2151 step 2a, item 7)', function () {
 	const s = scratch('channel-type-builders-');
 	afterEach(() => s.release());
 
-	function openings() {
+	function openings(): {
+		f: ReturnType<typeof setupAssetSpliceProofs>;
+		asset: NonNullable<ReturnType<SqliteStorage['loadFinalDaemonOpening']>>;
+		plain: ReturnType<typeof signingFixture>;
+	} {
 		const f = setupAssetSpliceProofs(s.dir(), undefined, 6);
 		s.closing(() => f.devices.forEach((d) => d.store.close()));
 		const asset = f.devices[0].store.loadFinalDaemonOpening(f.id)!;
 		const plain = signingFixture(false);
 		return { f, asset, plain };
 	}
-	const point = (seed: Buffer) =>
+	const point = (seed: Buffer): Buffer =>
 		getPublicKey(generateFromSeed(seed, MAX_INDEX - 3n));
 
 	it('builds on an asset opening by the plain type what a plain opening of the same terms builds', () => {
@@ -1113,7 +1155,7 @@ describe('Builders and signer by type (#2151 step 2a, item 7)', function () {
 			localFundingKeyIndex: 2
 		};
 		const root = Buffer.from(asset.session.assetEvidence!.fundingRoot, 'hex');
-		const args = (c: typeof asset.candidate) => [
+		const args = (c: typeof asset.candidate): unknown[] => [
 			c,
 			asset.session.terms,
 			'local',
@@ -1170,7 +1212,10 @@ describe('Builders and signer by type (#2151 step 2a, item 7)', function () {
 			remoteFundingPubkey: remote.toString('hex'),
 			localFundingKeyIndex: 2
 		};
-		const args = (c: typeof candidate, openingRoot: Buffer | undefined) => [
+		const args = (
+			c: typeof candidate,
+			openingRoot: Buffer | undefined
+		): unknown[] => [
 			c,
 			terms,
 			'remote',

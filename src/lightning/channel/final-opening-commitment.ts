@@ -30,7 +30,9 @@ import {
 import {
 	type IFinalOpeningCandidate,
 	validateAssetOpening,
-	validateFinalOpening
+	validateAssetOpeningAs,
+	validateFinalOpening,
+	validateFinalOpeningAs
 } from '../storage/final-opening-candidate';
 import {
 	calculateCommitmentFee,
@@ -116,6 +118,16 @@ export interface IFinalCommitmentView {
 	}>;
 }
 
+/**
+ * The type a commitment is built by when it differs from the opening's
+ * (#2151): the channel's current type and the opening's own asset root, if
+ * any, which validates the opening's own funding script.
+ */
+export interface IFinalCommitmentType {
+	channelType: string;
+	openingRoot?: Buffer;
+}
+
 /** The first Bitcoin-only commitment has no HTLCs, push or lease. */
 export function buildFinalOpeningCommitment(
 	candidate: IFinalOpeningCandidate,
@@ -148,9 +160,11 @@ export function buildFinalCommitmentView(
 	height: bigint,
 	balances: IFinalBalances,
 	htlcs: readonly IFinalCommitmentHtlc[],
-	fundingRef?: IFinalFundingReference
+	fundingRef?: IFinalFundingReference,
+	as?: IFinalCommitmentType
 ): IFinalCommitmentView {
-	validateFinalOpening(candidate);
+	if (as) validateFinalOpeningAs(candidate, as.channelType, as.openingRoot);
+	else validateFinalOpening(candidate);
 	return buildValidatedView(
 		candidate,
 		terms,
@@ -189,9 +203,11 @@ export function buildAssetSpliceCommitment(
 	htlcs: readonly IFinalCommitmentHtlc[],
 	funding: IFinalFundingReference,
 	openingRoot: Buffer,
-	assets: IAssetSpliceLeaves
+	assets: IAssetSpliceLeaves,
+	as?: IFinalCommitmentType
 ): IFinalCommitmentView {
-	validateAssetOpening(opening, openingRoot);
+	if (as) validateAssetOpeningAs(opening, as.channelType, as.openingRoot);
+	else validateAssetOpening(opening, openingRoot);
 	if (
 		!funding ||
 		!Number.isSafeInteger(funding.fundingOutputIndex) ||

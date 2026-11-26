@@ -20,6 +20,7 @@ import {
 	acceptFinalLedgerCommit,
 	acceptFinalLedgerReconnect,
 	acceptFinalLedgerRevoke,
+	contextType,
 	finalFundingTxid,
 	finalLedgerReconnect,
 	finalLedgerSnapshot,
@@ -85,7 +86,8 @@ function startSpliceView(
 		snapshot.localHeight,
 		balances,
 		snapshot.htlcs,
-		c.funding
+		c.funding,
+		contextType(ctx)
 	);
 	validateFinalSpliceExit(
 		{ expected: local.tx, signed: Transaction.fromHex(c.localExit) },
@@ -100,7 +102,8 @@ function startSpliceView(
 		snapshot.remoteHeight,
 		balances,
 		snapshot.htlcs,
-		c.funding
+		c.funding,
+		contextType(ctx)
 	);
 	state.funding = c.funding;
 	state.locked = funds;

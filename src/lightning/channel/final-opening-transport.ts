@@ -1,4 +1,9 @@
 import { acceptAssetSpliceReestablish } from '../storage/asset-splice-reestablish';
+import {
+	channelTypeRecordsOf,
+	currentKindOf,
+	type IFinalChannelTypeRecord
+} from '../storage/final-channel-type';
 import { decodeStartBatchMessage } from '../message/splice';
 import type { FinalSpliceTransport } from './final-splice-transport';
 import type { IFinalCloseRequest } from '../storage/final-simple-close';
@@ -121,12 +126,27 @@ export class FinalOpeningTransport {
 		)
 			return false;
 		const opening = this.runtime.storage.loadFinalDaemonOpening(id);
-		// An asset session stores updateLimits too: only a plain channel takes plain updates.
+		// An asset session stores updateLimits too: only a channel whose current
+		// type is plain takes plain updates.
 		return (
-			!!opening?.readyExchanged &&
+			(!!opening?.readyExchanged || !!this.recordedType(id, 'plain')) &&
+			!!opening &&
 			!opening.exitToBroadcast &&
-			!opening.session.assetEvidence
+			currentKindOf(
+				this.runtime.storage,
+				id,
+				opening.session.assetEvidence ? 'asset' : 'plain'
+			) === 'plain'
 		);
+	}
+
+	/** The channel's latest `channel-type` record when it is of `kind` (#2151). */
+	private recordedType(
+		id: string,
+		kind: 'plain' | 'asset'
+	): IFinalChannelTypeRecord | undefined {
+		const latest = channelTypeRecordsOf(this.runtime.storage, id).at(-1);
+		return latest?.type === kind ? latest : undefined;
 	}
 
 	private reconnectAfterFundingReplay(id: string): boolean {
@@ -224,9 +244,14 @@ export class FinalOpeningTransport {
 		const id = payload.subarray(0, 32).toString('hex');
 		const opening = this.runtime.storage.loadFinalDaemonOpening(id);
 		if (
-			!opening?.readyExchanged ||
+			!(opening?.readyExchanged || this.recordedType(id, 'plain')) ||
+			!opening ||
 			opening.session.peer !== peer ||
-			opening.session.assetEvidence
+			currentKindOf(
+				this.runtime.storage,
+				id,
+				opening.session.assetEvidence ? 'asset' : 'plain'
+			) !== 'plain'
 		)
 			return false;
 		try {
@@ -410,7 +435,12 @@ export class FinalOpeningTransport {
 		const { storage, dualFunding } = this.runtime;
 		if (!storage.canOpenDualFundedAssets || !dualFunding) return;
 		const opening = storage.loadFinalDaemonOpening(id);
-		if (!opening?.session.assetEvidence) return;
+		// The opening's anchor is the current era's only while no record exists.
+		if (
+			!opening?.session.assetEvidence ||
+			channelTypeRecordsOf(storage, id).length
+		)
+			return;
 		const { candidate, session } = opening;
 		const proof = Buffer.from(session.assetEvidence!.fundingProofs, 'hex');
 		const state = { atDepth, height, imported: false, tail: Promise.resolve() };
@@ -440,9 +470,11 @@ export class FinalOpeningTransport {
 	}
 
 	fundingDepth(id: string, confirmed: boolean): void {
+		// The asset anchor follows the current type: a channel recorded as plain takes the plain path.
 		if (
 			this.runtime.storage.canOpenDualFundedAssets &&
-			this.runtime.storage.loadAssetOpeningEvidence(id)
+			this.runtime.storage.loadAssetOpeningEvidence(id) &&
+			currentKindOf(this.runtime.storage, id, 'asset') === 'asset'
 		) {
 			this.assetFundingSpendable(id, confirmed);
 			this.assetFundingAnchor(id, confirmed);
@@ -492,7 +524,11 @@ export class FinalOpeningTransport {
 		if (!opening?.funding || opening.exitToBroadcast) return;
 		const status =
 			storage.canUpdateFinalCommitments && storage.loadFinalUpdateStatus(id);
-		if (status && (status.localHeight > 0n || status.remoteHeight > 0n)) {
+		// A recorded type change follows channel_ready: none is resent.
+		if (
+			(status && (status.localHeight > 0n || status.remoteHeight > 0n)) ||
+			channelTypeRecordsOf(storage, id).length
+		) {
 			connection.readySent = true;
 			return;
 		}
@@ -528,17 +564,22 @@ export class FinalOpeningTransport {
 			if (opening.exitToBroadcast || this.connections.has(id)) continue;
 			const update =
 				storage.canUpdateFinalCommitments && storage.loadFinalUpdateStatus(id);
+			// With a plain record the channel takes the plain path on the record's funding.
+			const recorded = this.recordedType(id, 'plain');
 			if (
 				update &&
 				(update.pending ||
 					update.last ||
+					recorded ||
 					storage.loadFinalSpliceAttempts(id).length)
 			) {
 				const fields = storage.finalUpdateReestablish(id, this.runtime.root);
 				const attempts = storage.loadFinalSpliceAttempts(id);
 				const adopted = [...attempts].reverse().find((a) => a.adopted);
 				const fundingTxid = Transaction.fromHex(
-					adopted?.candidate?.funding.fundingTxHex ?? candidate.fundingTxHex
+					recorded?.funding.fundingTxHex ??
+						adopted?.candidate?.funding.fundingTxHex ??
+						candidate.fundingTxHex
 				).getHash();
 				const locked = this.confirmed.has(id) && this.negotiated(peer).splice;
 				const payload = encodeChannelReestablishMessage({
@@ -556,8 +597,10 @@ export class FinalOpeningTransport {
 				this.send(peer, MessageType.CHANNEL_REESTABLISH, payload);
 				continue;
 			}
+			const recordedAsset = this.recordedType(id, 'asset');
 			if (
-				session.assetEvidence &&
+				(session.assetEvidence || recordedAsset) &&
+				currentKindOf(storage, id, 'asset') === 'asset' &&
 				storage.canSpliceDualFundedAssets &&
 				opening.funding &&
 				opening.readyExchanged &&
@@ -580,7 +623,11 @@ export class FinalOpeningTransport {
 				);
 				continue;
 			}
-			if (session.assetEvidence && storage.canOpenDualFundedAssets) {
+			if (
+				session.assetEvidence &&
+				!channelTypeRecordsOf(storage, id).length &&
+				storage.canOpenDualFundedAssets
+			) {
 				// Admission and nonce persistence can be separated by a power cut.
 				// Reestablish must carry the verification nonce promised during construction.
 				if (!storage.loadFinalLocalTxComplete(id)) {
@@ -782,7 +829,11 @@ export class FinalOpeningTransport {
 					}
 				}
 				const activeUpdate =
-					update && (update.pending || update.last || splicing);
+					update &&
+					(update.pending ||
+						update.last ||
+						splicing ||
+						!!this.recordedType(id, 'plain'));
 				if (
 					message &&
 					!message.signatureBatch &&
@@ -892,7 +943,8 @@ export class FinalOpeningTransport {
 						return;
 					}
 					if (
-						session.assetEvidence &&
+						(session.assetEvidence || this.recordedType(id, 'asset')) &&
+						currentKindOf(storage, id, 'asset') === 'asset' &&
 						storage.canSpliceDualFundedAssets &&
 						opening.funding &&
 						opening.readyExchanged &&
@@ -999,6 +1051,15 @@ export class FinalOpeningTransport {
 					if (storage.finalSimpleCloseStarted(id)) this.driveClose(id);
 					return;
 				}
+				// A recorded channel's opening is settled: its replay arm replays nothing.
+				if (
+					message &&
+					channelTypeRecordsOf(storage, id).length &&
+					(message.type === MessageType.TX_COMPLETE ||
+						message.type === MessageType.COMMITMENT_SIGNED ||
+						message.type === MessageType.TX_SIGNATURES)
+				)
+					return;
 				if (
 					storage.canSpliceDualFundedAssets &&
 					opening.readyExchanged &&

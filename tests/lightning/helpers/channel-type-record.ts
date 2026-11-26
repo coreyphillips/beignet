@@ -115,7 +115,10 @@ export interface IChannelTypeRecordInput {
 	seed: IFinalPlainSeedInput | IFinalAssetSeedInput;
 }
 export type IChannelTypeRecord = Omit<IChannelTypeRecordInput, 'seed'> & {
-	seed: (IFinalPlainSeedInput | IFinalAssetSeedInput) & { shachain: Shachain };
+	seed: (IFinalPlainSeedInput | IFinalAssetSeedInput) & {
+		localPoints: [string, string];
+		shachain: Shachain;
+	};
 };
 export interface IChannelTypeView {
 	type: ChannelKind;
@@ -130,7 +133,8 @@ export interface IChannelTypeStorage {
 	loadFinalChannelType(channelId: string): IChannelTypeView | null;
 	appendFinalChannelType(
 		channelId: string,
-		input: IChannelTypeRecordInput
+		input: IChannelTypeRecordInput,
+		root?: BIP32Interface
 	): unknown;
 	loadFinalChannelTypeRecords(channelId: string): IChannelTypeRecord[];
 }
@@ -187,7 +191,7 @@ export function step2a(): IStep2aPure {
 	};
 	const type = load('final-channel-type'),
 		updates = load('final-channel-updates');
-	const need = (from: Record<string, unknown>, name: string) =>
+	const need = (from: Record<string, unknown>, name: string): never =>
 		((...args: unknown[]) => {
 			const f = from[name];
 			if (typeof f !== 'function')
@@ -206,7 +210,10 @@ export function step2a(): IStep2aPure {
 }
 
 /** A refusal raised by the code under test, not by a missing name. */
-export function expectRefusal(run: () => unknown, text?: string | RegExp) {
+export function expectRefusal(
+	run: () => unknown,
+	text?: string | RegExp
+): Error {
 	let error: Error | undefined;
 	try {
 		run();
@@ -224,7 +231,7 @@ export function expectRefusal(run: () => unknown, text?: string | RegExp) {
 export async function expectRejection(
 	run: () => Promise<unknown>,
 	text?: string | RegExp
-) {
+): Promise<Error> {
 	let error: Error | undefined;
 	try {
 		await run();
@@ -319,7 +326,10 @@ export interface IConversion {
 	): IFinalCommitmentView;
 }
 
-function openingOf(store: SqliteStorage, id: string) {
+function openingOf(
+	store: SqliteStorage,
+	id: string
+): NonNullable<ReturnType<SqliteStorage['loadFinalDaemonOpening']>> {
 	const record = store.loadFinalDaemonOpening(id);
 	if (!record) throw new Error('fixture: no funded opening');
 	return record;
@@ -430,23 +440,28 @@ export function buildConversion(
 			localFundingKeyIndex: keyIndices[i]
 		})
 	) as [IFinalFundingReference, IFinalFundingReference];
+	// The opener pays the fee and whatever earlier conversions took from the opening capacity.
+	const spent = (c: IFinalOpeningCandidate): bigint =>
+		BigInt(fee) +
+		BigInt(c.localContributionSats) +
+		BigInt(c.remoteContributionSats) -
+		BigInt(parentOut.value);
 	const balances = (o.balances ??
 		openings.map(({ candidate: c }) => ({
 			localBalanceMsat:
-				(BigInt(c.localContributionSats) - (c.isInitiator ? BigInt(fee) : 0n)) *
+				(BigInt(c.localContributionSats) - (c.isInitiator ? spent(c) : 0n)) *
 				1000n,
 			remoteBalanceMsat:
-				(BigInt(c.remoteContributionSats) -
-					(c.isInitiator ? 0n : BigInt(fee))) *
+				(BigInt(c.remoteContributionSats) - (c.isInitiator ? 0n : spent(c))) *
 				1000n
 		}))) as [IBalances, IBalances];
 	const feerate = o.feerate ?? openings[0].session.terms.commitmentFeeratePerKw;
-	const point = (i: number, h: number) =>
+	const point = (i: number, h: number): Buffer =>
 		getPublicKey(
 			generateFromSeed(openKeys[i].perCommitmentSeed, MAX_INDEX - BigInt(h))
 		);
 	const nonceKey = spliceCommitmentNonceContext(id, tx.getHash(), 0);
-	const nonceAt = (i: number, h: number) =>
+	const nonceAt = (i: number, h: number): string =>
 		Buffer.from(
 			updateVerificationNonce(
 				deviceAuthority(devices[i].store).nonceContext(nonceKey),
@@ -456,13 +471,13 @@ export function buildConversion(
 			)
 		).toString('hex');
 	// The candidate the new type's builder and the signer see.
-	const twin = (i: number) => {
+	const twin = (i: number): IFinalOpeningCandidate => {
 		const c = openings[i].candidate;
 		if (o.type === 'plain')
 			return isAssetOpeningType(c.channelType) ? plainTwin(c) : c;
 		return isAssetOpeningType(c.channelType) ? c : assetTwin(c);
 	};
-	const openingRoot = (i: number) => {
+	const openingRoot = (i: number): Buffer => {
 		const c = openings[i].candidate;
 		return isAssetOpeningType(c.channelType)
 			? Buffer.from(openings[i].session.assetEvidence!.fundingRoot, 'hex')
@@ -576,7 +591,17 @@ export function buildConversion(
 					...ids
 				}
 			};
-		const recovery = (holder: number) => {
+		const recovery = (
+			holder: number
+		): {
+			point: string;
+			localBalanceMsat: string;
+			remoteBalanceMsat: string;
+			toLocal: { script: string };
+			toRemote: { script: string };
+			ownedOutputIndex: number | null;
+			htlcs: never[];
+		} => {
 			const built = view(i, holder === i ? 'local' : 'remote');
 			return {
 				point: point(holder, n).toString('hex'),
@@ -652,8 +677,16 @@ export function appendBoth(
 	c: IConversion
 ): void {
 	devices.forEach((d, i) =>
-		typed(d.store).appendFinalChannelType(c.id, c.inputs[i])
+		typed(d.store).appendFinalChannelType(c.id, c.inputs[i], d.root)
 	);
+}
+
+/** The local points at N and N + 1 the writer stores for device i. */
+export function localPointsOf(c: IConversion, i: number): [string, string] {
+	return [
+		c.point(i, c.stateNumber).toString('hex'),
+		c.point(i, c.stateNumber + 1).toString('hex')
+	];
 }
 
 /** A deep copy of an input, for a test that changes one field. */
@@ -662,7 +695,10 @@ export function copyInput(i: IChannelTypeRecordInput): IChannelTypeRecordInput {
 }
 
 /** The opening's funding outpoint. */
-export function openingParent(store: SqliteStorage, id: string) {
+export function openingParent(
+	store: SqliteStorage,
+	id: string
+): { tx: Transaction; index: number } {
 	const c = store.loadFinalOpening(id)!;
 	return {
 		tx: Transaction.fromHex(c.fundingTxHex),
@@ -675,7 +711,7 @@ export async function assetRounds(
 	devices: readonly ITypeDevice[],
 	id: string,
 	to: number,
-	feerate = (h: number) => 1100 + h
+	feerate = (h: number): number => 1100 + h
 ): Promise<void> {
 	const { assetUpdateTestHost } = await import('./asset-splice-update');
 	const from = Number(assetSpliceUpdateHead(devices[0].store, id).nextNumber);
@@ -715,11 +751,11 @@ export function plainRounds(
 	devices: readonly ITypeDevice[],
 	id: string,
 	rounds: number,
-	feerate = (r: number) => 300 + r
+	feerate = (r: number): number => 300 + r
 ): void {
 	const stores = devices.map((d) => d.store);
 	const opener = stores[0].loadFinalOpening(id)!.isInitiator ? 0 : 1;
-	const exchange = (from: number) => {
+	const exchange = (from: number): void => {
 		const sig = stores[from].signFinalUpdateCommitment(id, devices[from].root);
 		const ack = stores[1 - from].acceptFinalUpdateCommitment(
 			id,

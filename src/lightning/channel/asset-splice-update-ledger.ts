@@ -5,6 +5,8 @@ import type {
 	IAssetUpdateSavedHtlc,
 	IAssetUpdateSecured
 } from '../storage/asset-update-history';
+import { currentAssetRecord } from '../storage/asset-update-history';
+import type { IFinalAssetSeed } from '../storage/final-channel-type';
 import type { IAssetSpliceExitBranch } from '../storage/asset-splice-exit-proofs';
 import type { IFinalUpdateLimits } from '../storage/final-channel-updates';
 import type { IFinalOpeningCandidate } from '../storage/final-opening-candidate';
@@ -80,9 +82,12 @@ export function assetUpdateSources(
 	opening: NonNullable<ReturnType<SqliteStorage['loadFinalDaemonOpening']>>;
 } {
 	const opening = store.loadFinalDaemonOpening(id);
+	// The asset base: the current asset record's member, else the opening's evidence.
+	const record = currentAssetRecord(store, id);
+	const base = (record?.seed as IFinalAssetSeed | undefined)?.members[0];
 	if (
 		!opening?.funding ||
-		!opening.session.assetEvidence ||
+		(!opening.session.assetEvidence && !base) ||
 		!opening.session.updateLimits
 	)
 		throw new Error(
@@ -101,7 +106,9 @@ export function assetUpdateSources(
 	});
 	const c = opening.candidate,
 		e = opening.session.assetEvidence;
-	const selected = info.active
+	const selected = base
+		? source(base)
+		: info.active
 		? source(info.active.candidate)
 		: {
 				funding: {
@@ -112,8 +119,8 @@ export function assetUpdateSources(
 					localFundingKeyIndex: opening.session.channelKeyIndex
 				},
 				minimumDepth: c.minimumDepth,
-				root: e.fundingRoot,
-				proofs: e.fundingProofs,
+				root: e!.fundingRoot,
+				proofs: e!.fundingProofs,
 				localBalanceMsat: BigInt(c.localContributionSats) * 1000n,
 				remoteBalanceMsat: BigInt(c.remoteContributionSats) * 1000n
 		  };

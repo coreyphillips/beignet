@@ -135,7 +135,8 @@ export function signFinalUpdate(
 		reference: IFinalFundingReference;
 		privateKey: Buffer;
 		asset?: { fundingRoot: Buffer; transcriptDigest: Buffer };
-	}
+	},
+	channelType?: string
 ): Buffer {
 	const receiving = peerPayload !== undefined;
 	const tx = view.tx;
@@ -144,7 +145,11 @@ export function signFinalUpdate(
 	const funding = Transaction.fromHex(ref.fundingTxHex);
 	const prevout = funding.outs[ref.fundingOutputIndex];
 	const asset = spliceFunding?.asset;
-	if (isAssetOpeningType(candidate.channelType) !== (asset !== undefined))
+	// The type of the commitment being signed: the channel's current type when the caller passes it.
+	if (
+		isAssetOpeningType(channelType ?? candidate.channelType) !==
+		(asset !== undefined)
+	)
 		throw new Error(
 			'Asset commitment signing requires its funding root and transcript'
 		);
