@@ -117,11 +117,7 @@ interface IAttempt {
 	bytes?: Buffer;
 	reference?: string;
 	ctx?: IAssetConversionContext;
-	/**
-	 * No reply of the peer's to the initiator's terms can still arrive: it
-	 * took an accept or a decline, or the peer sends none (identical
-	 * crossing terms).
-	 */
+	/** The initiator took the peer's accept or decline of its terms. */
 	replied?: boolean;
 	/** The host's verify call was reached, so the end is told to it. */
 	verified: boolean;
@@ -190,12 +186,18 @@ const unref = (timer: ReturnType<typeof setTimeout>): void => {
 	(timer as { unref?: () => void }).unref?.();
 };
 
-/** sha256('asset-conversion-attempt/v1\0' || id || txid (internal order) || u32 BE index || D). */
+/**
+ * sha256('asset-conversion-attempt/v1\0' || id || txid (internal order) ||
+ * u32 BE index || D || role), where role is 0x00 when the opening's opener
+ * initiates and 0x01 when its acceptor does. The two sides' attempts on one
+ * agreement therefore never share an id (amendment v3.5).
+ */
 function attemptId(
 	id: string,
 	txid: string,
 	outputIndex: number,
-	digest: Buffer
+	digest: Buffer,
+	openerInitiates: boolean
 ): Buffer {
 	const index = Buffer.alloc(4);
 	index.writeUInt32BE(outputIndex);
@@ -205,10 +207,15 @@ function attemptId(
 			Buffer.from(id, 'hex'),
 			Buffer.from(txid, 'hex').reverse(),
 			index,
-			digest
+			digest,
+			Buffer.from([openerInitiates ? 0 : 1])
 		])
 	);
 }
+
+/** The key of a withdrawn attempt: its channel and its attempt id. */
+const withdrawnKey = (id: string, attempt: Buffer): string =>
+	id + ':' + attempt.toString('hex');
 
 /** A received decline reason, or its bytes escaped when the BOLT 1 rules refuse it. */
 function declineReason(bytes: Buffer): string {
@@ -234,10 +241,10 @@ export class AssetConversionTransport {
 	/** The no-transport responder's last attempt answered, per peer. */
 	private readonly answered = new Map<string, string>();
 	/**
-	 * Attempts the initiator ended in `announced` before any reply, per
-	 * channel, for the reply bound. The peer's reply may still be on the
-	 * wire, and identical terms give the same attempt id, so a retry of
-	 * them could take that stale reply as its own.
+	 * Attempts the initiator ended in `announced` before any reply, by
+	 * channel and attempt id, each for the reply bound. The peer's reply may
+	 * still be on the wire, and identical terms from this side give the same
+	 * attempt id, so a retry of them could take that stale reply as its own.
 	 */
 	private readonly withdrawn = new Map<
 		string,
@@ -311,8 +318,14 @@ export class AssetConversionTransport {
 			a.terms = terms;
 			a.bytes = Buffer.from(JSON.stringify(terms), 'utf8');
 			a.digest = assetConversionBytesDigest(a.bytes);
-			a.attempt = attemptId(id, parent.txid, parent.outputIndex, a.digest);
-			if (this.withdrawn.get(id)?.attempt.equals(a.attempt))
+			a.attempt = attemptId(
+				id,
+				parent.txid,
+				parent.outputIndex,
+				a.digest,
+				parent.opener
+			);
+			if (this.withdrawn.has(withdrawnKey(id, a.attempt)))
 				throw new Error(TOO_SOON);
 			a.ctx = { ...base, attempt: Buffer.from(a.attempt) };
 			a.verified = true;
@@ -442,8 +455,8 @@ export class AssetConversionTransport {
 		for (const a of [...this.attempts.values()])
 			if (a.peer === peer) this.end(a, DISCONNECTED);
 		// A reply from the old connection can no longer arrive.
-		for (const [id, w] of [...this.withdrawn])
-			if (w.peer === peer) this.forgetWithdrawn(id);
+		for (const [key, w] of [...this.withdrawn])
+			if (w.peer === peer) this.forgetWithdrawn(key);
 	}
 
 	/** Every attempt ends; nothing is sent. */
@@ -451,7 +464,7 @@ export class AssetConversionTransport {
 		for (const peer of [...this.assembling.keys()]) this.dropAssembly(peer);
 		this.answered.clear();
 		for (const a of [...this.attempts.values()]) this.end(a, DISCONNECTED);
-		for (const id of [...this.withdrawn.keys()]) this.forgetWithdrawn(id);
+		for (const key of [...this.withdrawn.keys()]) this.forgetWithdrawn(key);
 	}
 
 	/** A local close or a requested exit ends the channel's attempt by the failure rule. */
@@ -533,18 +546,9 @@ export class AssetConversionTransport {
 			) {
 				// Crossing terms: the opening's opener's attempt continues.
 				if (storage.loadFinalOpening(id)?.isInitiator) {
-					// Identical terms share the attempt id, so once the opener's
-					// terms are out a decline would also name the acceptor attempt
-					// the peer opens for them. The peer ends its own on those terms.
-					if (
-						existing.state === 'starting' ||
-						!existing.attempt?.equals(attempt)
-					)
-						this.sendReply(peer, attempt, digest, OTHER_ATTEMPT);
+					this.sendReply(peer, attempt, digest, OTHER_ATTEMPT);
 					return;
 				}
-				// The opener ignores identical terms, so no reply to them comes.
-				if (existing.attempt?.equals(attempt)) existing.replied = true;
 				this.end(existing, PEER_GOES_FIRST);
 			} else {
 				const same =
@@ -592,10 +596,15 @@ export class AssetConversionTransport {
 				Date.now()
 			);
 			if (failure) throw new Error(failure);
+			// The peer initiates, so its role names the id.
 			if (
-				!attemptId(a.id, parent.txid, parent.outputIndex, a.digest!).equals(
-					a.attempt!
-				)
+				!attemptId(
+					a.id,
+					parent.txid,
+					parent.outputIndex,
+					a.digest!,
+					!parent.opener
+				).equals(a.attempt!)
 			)
 				throw new Error(T.invalid);
 			a.ctx = { ...this.context(a, parent), attempt: Buffer.from(a.attempt!) };
@@ -639,41 +648,42 @@ export class AssetConversionTransport {
 			// A decline is the peer's last reply for an attempt, so a withdrawn
 			// one has nothing more on the wire once its decline arrived.
 			if (decline)
-				for (const [id, w] of [...this.withdrawn])
+				for (const [key, w] of [...this.withdrawn])
 					if (w.peer === peer && w.attempt.equals(f.attempt))
-						this.forgetWithdrawn(id);
+						this.forgetWithdrawn(key);
 			return;
 		}
 		if (!accept && !decline) return;
-		const reason = decline ? declineReason(f.bytes.subarray(1)) : '';
-		this.enqueue(a, async () => {
-			if (a.initiator) {
-				if (a.state !== 'announced') return;
-				if (decline) {
-					a.replied = true;
-					this.end(a, reason);
-					return;
-				}
-				// An accept must carry D.
-				if (!f.digest.equals(a.digest!)) return;
-				a.replied = true;
-				if (a.reply) clearTimeout(a.reply);
-				a.reply = undefined;
-				await this.barrier(a);
-				if (a.ended || a.state !== 'announced') return;
-				try {
-					this.recheck(a, this.preconditions(a.id));
-				} catch (error) {
-					this.fail(a, message(error));
-					return;
-				}
-				this.send(a, M.STFU, encodeStfuMessage(this.stfu(a, true)));
-				a.state = 'quiescing';
-				return;
-			}
-			// The initiator withdrew.
+		if (!a.initiator) {
+			// The initiator withdrew. The acceptor ends at once, not behind its
+			// queue, so terms that follow in the same burst find no live attempt.
 			if (decline && (a.state === 'assessing' || a.state === 'accepted'))
 				this.end(a, WITHDRAWN);
+			return;
+		}
+		const reason = decline ? declineReason(f.bytes.subarray(1)) : '';
+		this.enqueue(a, async () => {
+			if (a.state !== 'announced') return;
+			if (decline) {
+				a.replied = true;
+				this.end(a, reason);
+				return;
+			}
+			// An accept must carry D.
+			if (!f.digest.equals(a.digest!)) return;
+			a.replied = true;
+			if (a.reply) clearTimeout(a.reply);
+			a.reply = undefined;
+			await this.barrier(a);
+			if (a.ended || a.state !== 'announced') return;
+			try {
+				this.recheck(a, this.preconditions(a.id));
+			} catch (error) {
+				this.fail(a, message(error));
+				return;
+			}
+			this.send(a, M.STFU, encodeStfuMessage(this.stfu(a, true)));
+			a.state = 'quiescing';
 		});
 	}
 
@@ -951,19 +961,20 @@ export class AssetConversionTransport {
 	}
 
 	private rememberWithdrawn(id: string, peer: string, attempt: Buffer): void {
-		this.forgetWithdrawn(id);
-		this.withdrawn.set(id, {
+		const key = withdrawnKey(id, attempt);
+		this.forgetWithdrawn(key);
+		this.withdrawn.set(key, {
 			peer,
 			attempt: Buffer.from(attempt),
-			timer: this.timer(REPLY_BOUND_MS, () => this.forgetWithdrawn(id))
+			timer: this.timer(REPLY_BOUND_MS, () => this.forgetWithdrawn(key))
 		});
 	}
 
-	private forgetWithdrawn(id: string): void {
-		const w = this.withdrawn.get(id);
+	private forgetWithdrawn(key: string): void {
+		const w = this.withdrawn.get(key);
 		if (!w) return;
 		clearTimeout(w.timer);
-		this.withdrawn.delete(id);
+		this.withdrawn.delete(key);
 	}
 
 	// ---- Helpers ----

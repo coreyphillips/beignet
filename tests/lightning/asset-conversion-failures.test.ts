@@ -4,7 +4,10 @@
  */
 import { expect } from 'chai';
 import sinon from 'sinon';
-import { BEIGNET_CUSTOM_MESSAGE_TYPE } from '../../src/lightning/message/custom';
+import {
+	BEIGNET_CUSTOM_MESSAGE_TYPE,
+	decodeCustomMessage
+} from '../../src/lightning/message/custom';
 import { encodeUpdateAddHtlcMessage } from '../../src/lightning/message/channel-update';
 import { MessageType } from '../../src/lightning/message/types';
 import type { IAssetConversionTerms } from '../../src/lightning/channel';
@@ -15,6 +18,7 @@ import {
 	agreeOnTerms,
 	allocatedKeyIndex,
 	conversionPair,
+	conversionTransportOf,
 	decodeSpliceInit,
 	encodeSpliceAck,
 	encodeSpliceInit,
@@ -22,6 +26,7 @@ import {
 	held,
 	never,
 	readReply,
+	readTerms,
 	replyMessage,
 	startConversion,
 	stfu,
@@ -785,22 +790,26 @@ describe('Crossing identical terms (#2151 step 3a, diff review 1)', function () 
 				other = (1 - opener) as 0 | 1;
 			const terms = p.link.sent.filter((m) => m.name === 'conversion_terms');
 			expect(terms.map((m) => m.from).sort()).to.deep.equal([0, 1]);
-			expect(terms[0].payload.equals(terms[1].payload)).to.equal(true);
-			// The opener sends no decline that would also name the acceptor attempt.
-			expect(
-				p.link.sent.filter(
-					(m) => m.from === opener && m.name === 'conversion_reply'
-				)
-			).to.deep.equal([]);
+			// Identical terms, but each side's attempt id names its own role
+			// (amendment v3.5), so the opener's decline names only the peer's.
+			const sent = terms.map((m) => readTerms([m]));
+			expect(sent[0].bytes.equals(sent[1].bytes)).to.equal(true);
+			expect(sent[0].attempt).to.not.equal(sent[1].attempt);
+			const declines = p.link.sent
+				.filter((m) => m.from === opener && m.name === 'conversion_reply')
+				.map(readReply);
+			expect(declines.map((r) => [r.attempt, r.accept])).to.deep.equal([
+				[sent[terms[0].from === other ? 0 : 1].attempt, false]
+			]);
 			expect(abandoned(p, other)).to.deep.equal([PEER_GOES_FIRST, FENCE]);
 			expect(abandoned(p, opener)).to.deep.equal([FENCE]);
 			expect([
 				held(p.managers[0], p.id),
 				held(p.managers[1], p.id)
 			]).to.deep.equal([false, false]);
-			// No reply to the non-opener's terms can still come, so it may
-			// start the same terms (same state number, same id) again at once
-			// (amendment v3.4 item 3).
+			// The opener's decline of the non-opener's terms has arrived, so it
+			// may start the same terms (same state number, same id) again at
+			// once (amendment v3.4 item 3).
 			const again = track(
 				startConversion(p.managers[other], p.channelId, { reference })
 			);
@@ -950,5 +959,139 @@ describe('A retry of withdrawn terms (#2151 step 3a, amendment v3.4)', function 
 		expect(again.error).to.equal(undefined);
 		await p.settle();
 		expect(abandoned(p, 0)).to.deep.equal([DECLINED, FENCE]);
+	});
+});
+
+describe('Withdrawals and attempt ids (#2151 step 3a, amendment v3.5)', function () {
+	this.timeout(120000);
+	const s = scratch('conversion-withdrawals-');
+	let clock: sinon.SinonFakeTimers | undefined;
+	afterEach(() => {
+		clock?.restore();
+		clock = undefined;
+	});
+	after(() => s.release());
+	const TOO_SOON = 'Asset conversion repeats a withdrawn attempt too soon';
+	const shortDeadline = (p: IConversionPair, side: 0 | 1): void => {
+		(
+			conversionTransportOf(p.managers[side]) as unknown as {
+				deps: { timeoutMs?: number };
+			}
+		).deps.timeoutMs = 2000;
+	};
+	const startAt = async (
+		p: IConversionPair,
+		side: 0 | 1,
+		reference: Buffer
+	): Promise<ReturnType<typeof track>> => {
+		const t = track(
+			startConversion(p.managers[side], p.channelId, { reference })
+		);
+		await p.settle();
+		await t.done;
+		return t;
+	};
+
+	it('still refuses the first withdrawn terms after other terms were withdrawn inside its bound', async () => {
+		const p = await conversionPair(s, 'plain');
+		agreeOnTerms(p);
+		shortDeadline(p, 0);
+		clock = fakeClock();
+		// Side 1's accepts stay on the wire past two withdrawals.
+		p.link.hold({ from: 1, name: 'conversion_reply' });
+		const X = Buffer.alloc(8, 0x21),
+			Y = Buffer.alloc(8, 0x42);
+		expect((await startAt(p, 0, X)).error).to.equal(undefined);
+		await tick(p, clock, 2000);
+		expect((await startAt(p, 0, Y)).error).to.equal(undefined);
+		await tick(p, clock, 2000);
+		expect(abandoned(p, 0)).to.deep.equal([WITHDRAWN, WITHDRAWN]);
+		expect(p.link.held.map((m) => m.name)).to.deep.equal([
+			'conversion_reply',
+			'conversion_reply'
+		]);
+		const mark = p.link.sent.length;
+		const retry = await startAt(p, 0, X);
+		expect(retry.error).to.equal(TOO_SOON);
+		p.link.clearRules();
+		p.link.release();
+		await p.settle();
+		// Both stale accepts match nothing.
+		expect(
+			p.link.sent.slice(mark).map((m) => m.from + ':' + m.name)
+		).to.deep.equal([]);
+		expect(abandoned(p, 0)).to.deep.equal([WITHDRAWN, WITHDRAWN]);
+		expect([
+			held(p.managers[0], p.id),
+			held(p.managers[1], p.id)
+		]).to.deep.equal([false, false]);
+	});
+
+	it("keeps the opener's attempt when the non-opener withdraws its own identical terms first", async () => {
+		const p = await conversionPair(s, 'plain');
+		agreeOnTerms(p);
+		const opener = p.opener,
+			other = (1 - opener) as 0 | 1;
+		const reference = Buffer.alloc(8, 0x77);
+		shortDeadline(p, other);
+		clock = fakeClock();
+		// The opener's terms and its decline of the peer's are delayed.
+		p.link.hold(
+			(m) =>
+				m.from === opener &&
+				(m.name === 'conversion_terms' || m.name === 'conversion_reply')
+		);
+		expect((await startAt(p, opener, reference)).error).to.equal(undefined);
+		expect((await startAt(p, other, reference)).error).to.equal(undefined);
+		// The non-opener withdraws its own attempt. Its decline names its own
+		// id, not the opener's, so the opener's attempt goes on.
+		await tick(p, clock, 2000);
+		expect(abandoned(p, other)).to.deep.equal([WITHDRAWN]);
+		expect(abandoned(p, opener)).to.deep.equal([]);
+		expect(held(p.managers[opener], p.id)).to.equal(true);
+		p.link.clearRules();
+		p.link.release();
+		await p.settle();
+		expect(abandoned(p, opener)).to.deep.equal([FENCE]);
+		expect(abandoned(p, other)).to.deep.equal([WITHDRAWN, FENCE]);
+		expect([
+			held(p.managers[0], p.id),
+			held(p.managers[1], p.id)
+		]).to.deep.equal([false, false]);
+	});
+
+	it('takes a withdrawal and the retry of the same terms in one burst as two attempts', async () => {
+		const p = await conversionPair(s, 'plain');
+		expect(p.opener).to.equal(0);
+		p.link.script(0);
+		const t = storeTerms(p.stores[0], p.id, { reference: REF });
+		const id = termsIdentity(t);
+		const deliver = (raw: Buffer): void => {
+			const { subtype, payload } = decodeCustomMessage(raw);
+			p.managers[1].handleAssetOpenFrame(p.nodeIds[0], subtype, payload);
+		};
+		for (const raw of termsFrames(id.attempt, id.bytes))
+			p.link.send(0, BEIGNET_CUSTOM_MESSAGE_TYPE, raw);
+		await p.settle();
+		const replies = (): ReturnType<typeof readReply>[] =>
+			p.link.inbox[0]
+				.filter((m) => m.name === 'conversion_reply')
+				.map(readReply);
+		expect(replies().map((r) => r.accept)).to.deep.equal([true]);
+		// The withdrawal, then the same terms again, with no turn between.
+		deliver(replyMessage(id.attempt, id.digest, WITHDRAWN));
+		for (const raw of termsFrames(id.attempt, id.bytes)) deliver(raw);
+		await p.settle();
+		expect(abandoned(p, 1)).to.deep.equal([WITHDRAWN]);
+		expect(replies().map((r) => r.accept)).to.deep.equal([true, true]);
+		expect(held(p.managers[1], p.id)).to.equal(true);
+		p.link.send(
+			0,
+			BEIGNET_CUSTOM_MESSAGE_TYPE,
+			replyMessage(id.attempt, id.digest, WITHDRAWN)
+		);
+		await p.settle();
+		expect(abandoned(p, 1)).to.deep.equal([WITHDRAWN, WITHDRAWN]);
+		expect(held(p.managers[1], p.id)).to.equal(false);
 	});
 });

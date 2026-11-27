@@ -102,7 +102,11 @@ describe('Asset conversion agreement to the fence (#2151 step 3a, test 5)', func
 					`${A}:TX_ABORT`
 				]);
 				const terms = storeTerms(p.stores[I], p.id, { giver, reference });
-				const { digest, attempt, bytes } = termsIdentity(terms);
+				const { digest, attempt, bytes } = termsIdentity(
+					terms,
+					undefined,
+					roleOf(p.stores[I], p.id)
+				);
 				const sent = readTerms([wire[0]]);
 				expect(sent.attempt).to.equal(attempt.toString('hex'));
 				expect(sent.bytes.toString()).to.equal(bytes.toString());

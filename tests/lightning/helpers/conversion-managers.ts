@@ -956,7 +956,8 @@ export function storeTerms(
  */
 export function termsIdentity(
 	terms: IAssetConversionTerms,
-	bytes = Buffer.from(JSON.stringify(terms), 'ascii')
+	bytes = Buffer.from(JSON.stringify(terms), 'ascii'),
+	initiator: Role = 'opener'
 ): { bytes: Buffer; digest: Buffer; attempt: Buffer } {
 	const digest = createHash('sha256')
 		.update(
@@ -973,7 +974,8 @@ export function termsIdentity(
 			terms.channelId,
 			terms.parent.txid,
 			terms.parent.outputIndex,
-			digest
+			digest,
+			initiator
 		)
 	};
 }
@@ -986,12 +988,17 @@ export function canonicalBytes(terms: IAssetConversionTerms): Buffer {
 	);
 }
 
-/** sha256('asset-conversion-attempt/v1\0' || id || txid (internal) || u32 BE index || D). */
+/**
+ * sha256('asset-conversion-attempt/v1\0' || id || txid (internal) || u32 BE
+ * index || D || role), role 0x00 when the opening's opener initiates and
+ * 0x01 when its acceptor does (amendment v3.5).
+ */
 export function attemptIdOf(
 	channelId: string,
 	displayTxid: string,
 	outputIndex: number,
-	digest: Buffer
+	digest: Buffer,
+	initiator: Role = 'opener'
 ): Buffer {
 	// Terms whose index is not a u32 have no attempt id of this form. Check 2
 	// refuses them before the acceptor computes one, so any id serves.
@@ -1009,7 +1016,8 @@ export function attemptIdOf(
 				Buffer.from(channelId, 'hex'),
 				Buffer.from(displayTxid, 'hex').reverse(),
 				index,
-				digest
+				digest,
+				Buffer.from([initiator === 'opener' ? 0 : 1])
 			])
 		)
 		.digest();

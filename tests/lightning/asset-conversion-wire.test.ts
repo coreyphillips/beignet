@@ -644,12 +644,14 @@ describe('Asset conversion envelope phases (#2151 step 3a, test 9)', function ()
 			const D = sha(Buffer.from('beignet/asset-conversion/terms/v1\0'), bytes);
 			const index = Buffer.alloc(4);
 			index.writeUInt32BE(r.outputIndex);
+			// The peer, the opening's acceptor, initiates (role 0x01).
 			const attempt = sha(
 				Buffer.from('asset-conversion-attempt/v1\0'),
 				hex(r.id),
 				r.txid,
 				index,
-				D
+				D,
+				Buffer.from([1])
 			);
 			return { attempt, bytes };
 		}
