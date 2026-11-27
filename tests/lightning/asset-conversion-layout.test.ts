@@ -1837,4 +1837,79 @@ describe('From the description to the layout (#2151 step 3b, section 3 S15 and v
 		coin.prevTx = (coin.prevTx as Buffer).toString('hex');
 		expect(thrown(p)).to.equal(DESCRIBE);
 	});
+
+	// v2.5 item 2: every list is copied before its shape is read, and a
+	// read that throws or a list longer than any layout holds is the host's
+	// failure too.
+	for (const direction of BOTH)
+		it(`gives the describe text for a sparse movements array (${direction})`, () => {
+			const p = parts(direction);
+			const holed = [...(p.description.movements as Record_[])];
+			expect(holed.length).to.be.greaterThan(0);
+			holed.length += 1;
+			p.description.movements = holed;
+			expect(thrown(p)).to.equal(DESCRIBE);
+		});
+
+	it('gives the describe text for a sparse parentUnits array (to-plain)', () => {
+		const p = parts('to-plain');
+		const holed = [...(p.description.parentUnits as Record_[])];
+		expect(holed.length).to.be.greaterThan(0);
+		holed.length += 1;
+		p.description.parentUnits = holed;
+		expect(thrown(p)).to.equal(DESCRIBE);
+	});
+
+	it('gives the describe text for a fee budget pair with a hole', () => {
+		const p = parts('to-plain');
+		const holed: bigint[] = [(p.description.feeBudgets as bigint[])[0]];
+		holed.length = 2;
+		p.description.feeBudgets = holed;
+		expect(thrown(p)).to.equal(DESCRIBE);
+	});
+
+	it('reads a movement field once: a second answer cannot reach the layout', () => {
+		const p = parts('to-plain');
+		const m = (p.description.movements as Record_[])[0];
+		const good = m.units as bigint;
+		let reads = 0;
+		Object.defineProperty(m, 'units', {
+			enumerable: true,
+			get: (): bigint => (reads++ === 0 ? good : good + 1n)
+		});
+		const layout = mapped(p);
+		expect(reads, 'reads of the field').to.equal(1);
+		expect(verdict(layout, p.x)).to.equal(undefined);
+		expect(digestOf(layout)).to.deep.equal(digestOf(p.sample.layout));
+	});
+
+	it('gives the describe text, not the host text, for a read that throws', () => {
+		const p = parts('to-asset');
+		Object.defineProperty(p.description, 'outputs', {
+			enumerable: true,
+			get: (): never => {
+				throw new Error('host secret text');
+			}
+		});
+		expect(thrown(p)).to.equal(DESCRIBE);
+	});
+
+	it('gives the describe text for a list longer than any layout holds, without reading its items', () => {
+		const p = parts('to-asset');
+		let itemReads = 0;
+		const huge = new Proxy([] as Record_[], {
+			get(target, key, receiver): unknown {
+				if (key === 'length') return 2 ** 32 - 1;
+				if (typeof key === 'string' && /^[0-9]+$/.test(key)) {
+					// Fail fast instead of filling four billion entries.
+					if (++itemReads > 100_000) throw new Error('read too far');
+					return undefined;
+				}
+				return Reflect.get(target, key, receiver) as unknown;
+			}
+		});
+		p.description.outputs = huge;
+		expect(thrown(p)).to.equal(DESCRIBE);
+		expect(itemReads, 'items read').to.equal(0);
+	});
 });

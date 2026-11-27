@@ -572,3 +572,48 @@ describe('Crossings (#2151 step 3a, test 10)', function () {
 		]);
 	});
 });
+
+describe('A draining acceptor answers once (#2151 step 3b, v2.5 item 1)', function () {
+	this.timeout(90000);
+	const s = scratch('conversion-draining-once-');
+	after(() => s.release());
+
+	/** A scripted I takes the real A to draining: terms, then stfu(0) before A's own. */
+	async function draining(): Promise<IConversionPair> {
+		const p = await conversionPair(s, 'plain');
+		agreeOnTerms(p);
+		p.link.script(0);
+		const t = storeTerms(p.stores[0], p.id);
+		const id = termsIdentity(t);
+		for (const raw of termsFrames(id.attempt, id.bytes))
+			p.link.send(0, BEIGNET_CUSTOM_MESSAGE_TYPE, raw);
+		await p.settle();
+		p.link.send(0, MessageType.STFU, stfu(p.channelId, false));
+		await p.settle();
+		return p;
+	}
+	const abortsToI = (p: IConversionPair): string[] =>
+		p.link.inbox[0].filter((m) => m.name === 'TX_ABORT').map(abortText);
+
+	it('answers a repeated stfu(1) once', async () => {
+		const p = await draining();
+		p.link.send(0, MessageType.STFU, stfu(p.channelId, true));
+		await p.settle();
+		p.link.send(0, MessageType.STFU, stfu(p.channelId, true));
+		await p.settle();
+		expect(abortsToI(p)).to.deep.equal(['Asset conversion withdrawn']);
+	});
+
+	it('answers stfu(1) and then a tx_abort once, and ends', async () => {
+		const p = await draining();
+		p.link.send(0, MessageType.STFU, stfu(p.channelId, true));
+		await p.settle();
+		p.link.send(0, MessageType.TX_ABORT, txAbort(p.channelId, 'x'));
+		await p.settle();
+		expect(abortsToI(p)).to.deep.equal(['Asset conversion withdrawn']);
+		expect(held(p.managers[1], p.id)).to.equal(false);
+		expect(abandoned(p, 1)).to.deep.equal([
+			'Unexpected message during asset conversion'
+		]);
+	});
+});
