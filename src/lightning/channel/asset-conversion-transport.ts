@@ -78,6 +78,7 @@ const INIT_MISMATCH = 'Asset conversion splice_init does not match its terms';
 const ACK_MISMATCH = 'Asset conversion splice_ack does not match its terms';
 /** A local close or a requested exit. */
 const CLOSED = 'Asset conversion ended by a close';
+const TOO_SOON = 'Asset conversion repeats a withdrawn attempt too soon';
 
 /** The plain target type, without the alias bit. */
 const PLAIN_TARGET_TYPE_HEX = '0100000000000000000000';
@@ -116,6 +117,8 @@ interface IAttempt {
 	bytes?: Buffer;
 	reference?: string;
 	ctx?: IAssetConversionContext;
+	/** The initiator took the peer's accept or decline of its terms. */
+	replied?: boolean;
 	/** The host's verify call was reached, so the end is told to it. */
 	verified: boolean;
 	/** The acceptor sent its stfu(0). */
@@ -226,6 +229,16 @@ export class AssetConversionTransport {
 	private readonly assembling = new Map<string, IAssembly>();
 	/** The no-transport responder's last attempt answered, per peer. */
 	private readonly answered = new Map<string, string>();
+	/**
+	 * Attempts the initiator ended in `announced` before any reply, per
+	 * channel, for the reply bound. The peer's reply may still be on the
+	 * wire, and identical terms give the same attempt id, so a retry of
+	 * them could take that stale reply as its own.
+	 */
+	private readonly withdrawn = new Map<
+		string,
+		{ peer: string; attempt: Buffer; timer: ReturnType<typeof setTimeout> }
+	>();
 
 	constructor(
 		private readonly runtime: IFinalOpeningRuntime | undefined,
@@ -295,6 +308,8 @@ export class AssetConversionTransport {
 			a.bytes = Buffer.from(JSON.stringify(terms), 'utf8');
 			a.digest = assetConversionBytesDigest(a.bytes);
 			a.attempt = attemptId(id, parent.txid, parent.outputIndex, a.digest);
+			if (this.withdrawn.get(id)?.attempt.equals(a.attempt))
+				throw new Error(TOO_SOON);
 			a.ctx = { ...base, attempt: Buffer.from(a.attempt) };
 			a.verified = true;
 			const ctx = a.ctx;
@@ -422,6 +437,9 @@ export class AssetConversionTransport {
 		this.dropAssembly(peer);
 		for (const a of [...this.attempts.values()])
 			if (a.peer === peer) this.end(a, DISCONNECTED);
+		// A reply from the old connection can no longer arrive.
+		for (const [id, w] of [...this.withdrawn])
+			if (w.peer === peer) this.forgetWithdrawn(id);
 	}
 
 	/** Every attempt ends; nothing is sent. */
@@ -429,6 +447,7 @@ export class AssetConversionTransport {
 		for (const peer of [...this.assembling.keys()]) this.dropAssembly(peer);
 		this.answered.clear();
 		for (const a of [...this.attempts.values()]) this.end(a, DISCONNECTED);
+		for (const id of [...this.withdrawn.keys()]) this.forgetWithdrawn(id);
 	}
 
 	/** A local close or a requested exit ends the channel's attempt by the failure rule. */
@@ -510,7 +529,14 @@ export class AssetConversionTransport {
 			) {
 				// Crossing terms: the opening's opener's attempt continues.
 				if (storage.loadFinalOpening(id)?.isInitiator) {
-					this.sendReply(peer, attempt, digest, OTHER_ATTEMPT);
+					// Identical terms share the attempt id, so once the opener's
+					// terms are out a decline would also name the acceptor attempt
+					// the peer opens for them. The peer ends its own on those terms.
+					if (
+						existing.state === 'starting' ||
+						!existing.attempt?.equals(attempt)
+					)
+						this.sendReply(peer, attempt, digest, OTHER_ATTEMPT);
 					return;
 				}
 				this.end(existing, PEER_GOES_FIRST);
@@ -610,15 +636,17 @@ export class AssetConversionTransport {
 			if (a.initiator) {
 				if (a.state !== 'announced') return;
 				if (decline) {
+					a.replied = true;
 					this.end(a, reason);
 					return;
 				}
 				// An accept must carry D.
 				if (!f.digest.equals(a.digest!)) return;
+				a.replied = true;
 				if (a.reply) clearTimeout(a.reply);
 				a.reply = undefined;
 				await this.barrier(a);
-				if (a.state !== 'announced') return;
+				if (a.ended || a.state !== 'announced') return;
 				try {
 					this.recheck(a, this.preconditions(a.id));
 				} catch (error) {
@@ -699,7 +727,7 @@ export class AssetConversionTransport {
 	/** I on the peer's stfu(0): checks, key, splice_init. */
 	private async quiesced(a: IAttempt): Promise<void> {
 		await this.barrier(a);
-		if (a.state !== 'quiescing') return;
+		if (a.ended || a.state !== 'quiescing') return;
 		let parent: IAssetConversionParent;
 		try {
 			parent = this.preconditions(a.id);
@@ -727,7 +755,7 @@ export class AssetConversionTransport {
 	/** A on the initiator's stfu(1): checks, then its own stfu(0). */
 	private async answerStfu(a: IAttempt): Promise<void> {
 		await this.barrier(a);
-		if (a.state !== 'quiesced' || a.ownStfu) return;
+		if (a.ended || a.state !== 'quiesced' || a.ownStfu) return;
 		try {
 			this.recheck(a, this.preconditions(a.id));
 		} catch (error) {
@@ -765,7 +793,7 @@ export class AssetConversionTransport {
 			return;
 		}
 		await this.barrier(a);
-		if (a.state !== 'quiesced') return;
+		if (a.ended || a.state !== 'quiesced') return;
 		let parent: IAssetConversionParent;
 		try {
 			parent = this.preconditions(a.id);
@@ -892,6 +920,8 @@ export class AssetConversionTransport {
 		a.held = false;
 		this.clearTimers(a);
 		if (this.attempts.get(a.id) === a) this.attempts.delete(a.id);
+		if (a.initiator && a.state === 'announced' && !a.replied && a.attempt)
+			this.rememberWithdrawn(a.id, a.peer, a.attempt);
 		if (!a.verified || !a.ctx || !this.host) return;
 		const host = this.host,
 			ctx = a.ctx;
@@ -904,6 +934,22 @@ export class AssetConversionTransport {
 					'Asset conversion host abandon failed: ' + r.error
 				);
 		});
+	}
+
+	private rememberWithdrawn(id: string, peer: string, attempt: Buffer): void {
+		this.forgetWithdrawn(id);
+		this.withdrawn.set(id, {
+			peer,
+			attempt: Buffer.from(attempt),
+			timer: this.timer(REPLY_BOUND_MS, () => this.forgetWithdrawn(id))
+		});
+	}
+
+	private forgetWithdrawn(id: string): void {
+		const w = this.withdrawn.get(id);
+		if (!w) return;
+		clearTimeout(w.timer);
+		this.withdrawn.delete(id);
 	}
 
 	// ---- Helpers ----

@@ -1503,23 +1503,25 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			conversionOffered ? config.finalOpening : undefined,
 			conversionOffered ? conversionHost : undefined,
 			{
-				localFeatures: () => this.config.localFeatures,
-				remoteFeatures: (peer) =>
+				localFeatures: (): FeatureFlags | undefined =>
+					this.config.localFeatures,
+				remoteFeatures: (peer): FeatureFlags | undefined =>
 					this.peerManager?.getPeer(peer)?.getRemoteInit()?.features,
-				connected: (id) => !!this.finalTransport?.connected(id),
-				hasDepth: (id) => !!this.finalTransport?.hasDepth(id),
-				busy: (id) =>
+				connected: (id): boolean => !!this.finalTransport?.connected(id),
+				hasDepth: (id): boolean => !!this.finalTransport?.hasDepth(id),
+				busy: (id): boolean =>
 					this.finalSpliceQuiescent(id) || !!this.assetSplice?.negotiating(id),
-				settled: async (id) => {
+				settled: async (id): Promise<void> => {
 					await Promise.all([
 						this.finalTransport?.settled(id),
 						this.assetUpdates?.settled(id)
 					]);
 				},
-				height: () => this._currentBlockHeight,
-				send: (peer, type, payload) => this.sendMessage(peer, type, payload),
-				disconnect: (peer) => this.peerManager?.recyclePeer(peer, 1000),
-				report: (id, reason) =>
+				height: (): number => this._currentBlockHeight,
+				send: (peer, type, payload): void =>
+					this.sendMessage(peer, type, payload),
+				disconnect: (peer): void => this.peerManager?.recyclePeer(peer, 1000),
+				report: (id, reason): void =>
 					this.emitContained('error', Buffer.from(id, 'hex'), reason),
 				timeoutMs: config.quiescenceTimeoutMs
 			}

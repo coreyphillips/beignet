@@ -13,6 +13,7 @@ import {
 	abandoned,
 	abortText,
 	agreeOnTerms,
+	allocatedKeyIndex,
 	conversionPair,
 	decodeSpliceInit,
 	encodeSpliceAck,
@@ -761,4 +762,179 @@ describe('The failure rule for a close (#2151 step 3a, test 6, V2-M2)', function
 				[]
 			);
 		});
+});
+
+describe('Crossing identical terms (#2151 step 3a, diff review 1)', function () {
+	this.timeout(60000);
+	const s = scratch('conversion-crossing-identical-');
+	after(() => s.release());
+	const PEER_GOES_FIRST = "Peer's conversion of this channel goes first";
+
+	for (const kind of ['plain', 'asset'] as const)
+		it(`continues the opener's attempt to the fence when both sides start the same agreement (${kind})`, async () => {
+			const p = await conversionPair(s, kind);
+			agreeOnTerms(p);
+			// One agreement on both sides: identical terms, one attempt id.
+			const reference = Buffer.alloc(8, 0x77);
+			const starts = [0, 1].map((i) =>
+				track(startConversion(p.managers[i], p.channelId, { reference }))
+			);
+			await p.settle();
+			await Promise.all(starts.map((x) => x.done));
+			const opener = p.opener,
+				other = (1 - opener) as 0 | 1;
+			const terms = p.link.sent.filter((m) => m.name === 'conversion_terms');
+			expect(terms.map((m) => m.from).sort()).to.deep.equal([0, 1]);
+			expect(terms[0].payload.equals(terms[1].payload)).to.equal(true);
+			// The opener sends no decline that would also name the acceptor attempt.
+			expect(
+				p.link.sent.filter(
+					(m) => m.from === opener && m.name === 'conversion_reply'
+				)
+			).to.deep.equal([]);
+			expect(abandoned(p, other)).to.deep.equal([PEER_GOES_FIRST, FENCE]);
+			expect(abandoned(p, opener)).to.deep.equal([FENCE]);
+			expect([
+				held(p.managers[0], p.id),
+				held(p.managers[1], p.id)
+			]).to.deep.equal([false, false]);
+			await updateRound(p);
+		});
+});
+
+describe('An attempt that ends while it waits for the barrier (#2151 step 3a, diff review 2)', function () {
+	this.timeout(60000);
+	const s = scratch('conversion-barrier-end-');
+	after(() => s.release());
+
+	/** Make side i's barrier wait until the returned function is called. */
+	function gateBarrier(p: IConversionPair, i: 0 | 1): () => void {
+		const m = p.managers[i] as unknown as {
+			finalTransport?: { settled(id: string): Promise<void> };
+			assetUpdates?: { settled(id: string): Promise<void> };
+		};
+		let open!: () => void;
+		const gate = new Promise<void>((done) => (open = done));
+		const restore: (() => void)[] = [];
+		for (const t of [m.finalTransport, m.assetUpdates]) {
+			if (!t) continue;
+			const original = t.settled.bind(t);
+			t.settled = (id: string): Promise<void> => gate.then(() => original(id));
+			restore.push(() => (t.settled = original));
+		}
+		return () => {
+			for (const r of restore) r();
+			open();
+		};
+	}
+
+	const WIRE = ['STFU', 'SPLICE', 'SPLICE_ACK', 'TX_ABORT'];
+	// [handler, the message held to reach it, the side whose handler waits]
+	const cases: [string, WireMatch, 0 | 1][] = [
+		["I's accept (before stfu(1))", { from: 1, name: 'conversion_reply' }, 0],
+		["I's stfu(0) (before splice_init)", { from: 1, name: 'STFU' }, 0],
+		["A's stfu(1) (before stfu(0))", { from: 0, name: 'STFU' }, 1],
+		["A's splice_init (before splice_ack)", { from: 0, name: 'SPLICE' }, 1]
+	];
+	for (const [what, at, side] of cases)
+		it(`sends nothing and allocates no key once a disconnect ended it, at ${what}`, async () => {
+			const p = await conversionPair(s, 'plain');
+			agreeOnTerms(p);
+			p.link.hold(at, true);
+			const start = track(
+				startConversion(p.managers[0], p.channelId, { reference: REF })
+			);
+			await p.settle();
+			await start.done;
+			expect(p.link.held.length, 'the message is held').to.equal(1);
+			const open = gateBarrier(p, side);
+			p.link.release();
+			await p.settle();
+			p.disconnect();
+			expect(abandoned(p, side)).to.deep.equal([DISCONNECTED]);
+			const keys = allocatedKeyIndex(p.stores[side]);
+			const mark = p.link.sent.length;
+			await p.reconnect();
+			open();
+			await p.settle();
+			expect(
+				p.link.sent
+					.slice(mark)
+					.filter((m) => m.from === side && WIRE.includes(m.name))
+					.map((m) => m.name),
+				'sent after the attempt ended'
+			).to.deep.equal([]);
+			expect(allocatedKeyIndex(p.stores[side]), 'key index').to.equal(keys);
+			await updateRound(p);
+		});
+});
+
+describe('A retry of withdrawn terms (#2151 step 3a, amendment v3.4)', function () {
+	this.timeout(60000);
+	const s = scratch('conversion-retry-');
+	let clock: sinon.SinonFakeTimers | undefined;
+	afterEach(() => {
+		clock?.restore();
+		clock = undefined;
+	});
+	after(() => s.release());
+	const TOO_SOON = 'Asset conversion repeats a withdrawn attempt too soon';
+
+	it('refuses identical terms for the reply bound after a withdrawal with no reply, and ignores the stale accept', async () => {
+		const p = await conversionPair(s, 'plain');
+		agreeOnTerms(p);
+		clock = fakeClock();
+		// A accepts, but its reply stays on the wire past I's reply bound.
+		p.link.hold({ from: 1, name: 'conversion_reply' });
+		await run(p);
+		await tick(p, clock, 30_500);
+		expect(abandoned(p, 0)).to.deep.equal([WITHDRAWN]);
+		expect(abandoned(p, 1)).to.deep.equal([WITHDRAWN]);
+		// The same agreement again: identical terms, the same attempt id.
+		const mark = p.link.sent.length,
+			log = p.hostLog.length;
+		const retry = await run(p);
+		await retry.done;
+		expect(retry.error).to.equal(TOO_SOON);
+		expect(
+			p.link.sent
+				.slice(mark)
+				.filter((m) => m.from === 0)
+				.map((m) => m.name)
+		).to.deep.equal([]);
+		expect(
+			p.hostLog.slice(log).map((c) => c.side + ':' + c.name)
+		).to.deep.equal(['0:conversionTerms']);
+		expect(held(p.managers[0], p.id)).to.equal(false);
+		// The stale accept arrives and matches nothing.
+		p.link.clearRules();
+		p.link.release();
+		await p.settle();
+		expect(p.link.sent.slice(mark).some((m) => m.name === 'STFU')).to.equal(
+			false
+		);
+		// After the bound, the same terms convert to the fence.
+		await tick(p, clock, 30_000);
+		const again = await run(p);
+		await again.done;
+		expect(again.error).to.equal(undefined);
+		await p.settle();
+		expect(abandoned(p, 0)).to.deep.equal([WITHDRAWN, FENCE]);
+		expect(abandoned(p, 1)).to.deep.equal([WITHDRAWN, FENCE]);
+	});
+
+	it('lets identical terms start again at once after a decline', async () => {
+		const p = await conversionPair(s, 'plain');
+		agreeOnTerms(p);
+		p.hosts[1].verify = (): unknown => false;
+		const first = await run(p);
+		await first.done;
+		expect(abandoned(p, 0)).to.deep.equal([DECLINED]);
+		p.hosts[1].verify = (): unknown => true;
+		const again = await run(p);
+		await again.done;
+		expect(again.error).to.equal(undefined);
+		await p.settle();
+		expect(abandoned(p, 0)).to.deep.equal([DECLINED, FENCE]);
+	});
 });
