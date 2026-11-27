@@ -1408,13 +1408,14 @@ describe('an asset invoice (issue #2098, step 10)', function () {
 	});
 
 	describe('what the build says it offers a host', () => {
-		it('names createInvoice:assetInvoice immediately after sendInParts at version 1 with nothing declared', () => {
+		it('names createInvoice:assetInvoice immediately after sendInParts at version 1, declaring only the conversion', () => {
 			const api = lightningChannel.AUXILIARY_CHANNELS_API;
 			const send = api.surfaces.indexOf('sendInParts');
 			expect(send).to.be.at.least(0);
 			expect(api.surfaces[send + 1]).to.equal('createInvoice:assetInvoice');
 			expect(api.version).to.equal(1);
-			expect([...api.declared]).to.deep.equal([]);
+			// #2151 step 3b declares the conversion, which runs only in part.
+			expect([...api.declared]).to.deep.equal(['assetConversion:v1']);
 		});
 	});
 });

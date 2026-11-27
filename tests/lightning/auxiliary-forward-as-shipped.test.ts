@@ -80,13 +80,16 @@ describe('forwards with an asset leg as the build ships them (issue #2098, step 
 		}
 	};
 
-	it('says so itself: the switch is on, and the API names the part among its surfaces with nothing declared', () => {
+	it('says so itself: the switch is on, and the API names the part among its surfaces, declaring only the conversion', () => {
 		expect(auxiliaryForwards.enabled).to.equal(true);
 		expect(AUXILIARY_CHANNELS_API.surfaces).to.include('prepareForward');
 		expect(AUXILIARY_CHANNELS_API.surfaces).to.include(
 			'getFixedOutputFeeStatus:splitCoins'
 		);
-		expect([...AUXILIARY_CHANNELS_API.declared]).to.deep.equal([]);
+		// #2151 step 3b declares the conversion, which runs only in part.
+		expect([...AUXILIARY_CHANNELS_API.declared]).to.deep.equal([
+			'assetConversion:v1'
+		]);
 	});
 
 	for (const shape of SHAPES) {

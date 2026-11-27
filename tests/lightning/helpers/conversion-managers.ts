@@ -52,7 +52,15 @@ import {
 } from './channel-type-pairs';
 import type { FinalGeneration } from './final-generation';
 import type { IReadyPairTerms } from './final-update-pair';
-import { conversionTerms, method } from './conversion-modules';
+import {
+	conversionTerms,
+	method,
+	type ConversionPair,
+	type IConversionBitcoin,
+	type IConversionDescription,
+	type IConversionPlan
+} from './conversion-modules';
+import { CONVERSION_HOST_KEYS } from './asset-conversion-node';
 
 /** The height both managers run at once the pair is ready. */
 export const PAIR_HEIGHT = 600_000;
@@ -127,7 +135,7 @@ function matches(rule: WireMatch, m: IWireMessage): boolean {
 
 interface IRule {
 	match: WireMatch;
-	action: 'hold' | 'drop' | 'cut';
+	action: 'hold' | 'drop' | 'cut' | 'burst';
 	once: boolean;
 }
 
@@ -183,6 +191,14 @@ export class PeerLink {
 	cutAt(match: WireMatch): void {
 		this.rules.push({ match, action: 'cut', once: true });
 	}
+	/**
+	 * Deliver the next matching message together with every message queued
+	 * right after it that also matches, in one synchronous turn: no
+	 * setImmediate runs between them (step 3b contract, M1).
+	 */
+	burst(match: WireMatch): void {
+		this.rules.push({ match, action: 'burst', once: true });
+	}
 	clearRules(): void {
 		this.rules = [];
 	}
@@ -235,10 +251,16 @@ export class PeerLink {
 					this.onCut();
 					continue;
 				}
-				const to = (1 - m.from) as 0 | 1;
-				this.delivered.push(m);
-				if (this.scripted[to]) this.inbox[to].push(m);
-				else this.receive(to, m);
+				const turn = [m];
+				if (rule?.action === 'burst')
+					while (this.queue.length && matches(rule.match, this.queue[0]))
+						turn.push(this.queue.shift()!);
+				for (const x of turn) {
+					const to = (1 - x.from) as 0 | 1;
+					this.delivered.push(x);
+					if (this.scripted[to]) this.inbox[to].push(x);
+					else this.receive(to, x);
+				}
 				await settleOnce();
 			}
 		} finally {
@@ -266,7 +288,10 @@ export async function settleOnce(): Promise<void> {
 export type ConversionHostCallName =
 	| 'conversionTerms'
 	| 'verifyConversionTerms'
-	| 'abandonConversion';
+	| 'abandonConversion'
+	| 'proposeConversion'
+	| 'describeConversion'
+	| 'prepareConversion';
 
 export interface IConversionHostCall {
 	side: 0 | 1;
@@ -304,6 +329,37 @@ export class ConversionHostStub {
 	) => unknown = () => true;
 	abandon: (ctx: IAssetConversionContext, reason: string) => unknown = () =>
 		undefined;
+	/** Answers proposeConversion: by default this side's fixed blob. */
+	propose: (
+		ctx: IAssetConversionContext,
+		terms: IAssetConversionTerms
+	) => unknown = () => stubProposal(this.side);
+	/** Answers describeConversion: by default the stub layout of the pair. */
+	describe: (
+		ctx: IAssetConversionContext,
+		proposals: ConversionPair<Buffer>,
+		bitcoin: IConversionBitcoin
+	) => unknown = (ctx, _proposals, bitcoin) =>
+		stubConversionDescription(ctx, this.termsFor(ctx), bitcoin);
+	/** Answers prepareConversion: by default sha256 of the layout digest. */
+	prepare: (
+		ctx: IAssetConversionContext,
+		proposals: ConversionPair<Buffer>,
+		bitcoin: IConversionBitcoin,
+		layoutDigest: Buffer
+	) => unknown = (_ctx, _proposals, _bitcoin, layoutDigest) => ({
+		digest: createHash('sha256').update(layoutDigest).digest()
+	});
+	/** The terms this host was shown for each attempt (hex id). */
+	private readonly shown = new Map<string, IAssetConversionTerms>();
+
+	/** The terms this host verified or was asked to propose for, by the attempt. */
+	termsFor(ctx: IAssetConversionContext): IAssetConversionTerms {
+		const terms = this.shown.get(Buffer.from(ctx.attempt).toString('hex'));
+		if (!terms)
+			throw new Error('The stub host was shown no terms for this attempt');
+		return terms;
+	}
 
 	constructor(
 		readonly side: 0 | 1,
@@ -338,11 +394,23 @@ export class ConversionHostStub {
 		);
 	}
 
-	/** The three optional members of IAuxiliaryDualFunding (contract section 5). */
+	/**
+	 * The six conversion members (3a's three terms calls and 3b's three
+	 * planner calls), each recorded in the shared log.
+	 */
 	members(): Pick<
 		IAuxiliaryDualFunding,
 		'conversionTerms' | 'verifyConversionTerms' | 'abandonConversion'
-	> {
+	> &
+		IConversionHostPlanner {
+		const show = (
+			ctx: IAssetConversionContext,
+			terms: IAssetConversionTerms
+		): unknown =>
+			this.shown.set(
+				Buffer.from(ctx.attempt).toString('hex'),
+				JSON.parse(JSON.stringify(terms)) as IAssetConversionTerms
+			);
 		return {
 			conversionTerms: (
 				ctx: Omit<IAssetConversionContext, 'attempt'>,
@@ -356,39 +424,107 @@ export class ConversionHostStub {
 				terms: IAssetConversionTerms,
 				digest: Buffer
 			) =>
-				this.record('verifyConversionTerms', [ctx, terms, digest], () =>
-					Promise.resolve().then(
+				this.record('verifyConversionTerms', [ctx, terms, digest], () => {
+					show(ctx, terms);
+					return Promise.resolve().then(
 						() => this.verify(ctx, terms, digest) as boolean
-					)
-				),
+					);
+				}),
 			abandonConversion: (ctx: IAssetConversionContext, reason: string) =>
 				this.record('abandonConversion', [ctx, reason], () =>
 					Promise.resolve().then(() => this.abandon(ctx, reason) as void)
+				),
+			proposeConversion: (
+				ctx: IAssetConversionContext,
+				terms: IAssetConversionTerms
+			) =>
+				this.record('proposeConversion', [ctx, terms], () => {
+					show(ctx, terms);
+					return Promise.resolve().then(
+						() => this.propose(ctx, terms) as Buffer
+					);
+				}),
+			describeConversion: (
+				ctx: IAssetConversionContext,
+				proposals: ConversionPair<Buffer>,
+				bitcoin: IConversionBitcoin
+			) =>
+				this.record('describeConversion', [ctx, proposals, bitcoin], () =>
+					Promise.resolve().then(
+						() =>
+							this.describe(ctx, proposals, bitcoin) as IConversionDescription
+					)
+				),
+			prepareConversion: (
+				ctx: IAssetConversionContext,
+				proposals: ConversionPair<Buffer>,
+				bitcoin: IConversionBitcoin,
+				layoutDigest: Buffer
+			) =>
+				this.record(
+					'prepareConversion',
+					[ctx, proposals, bitcoin, layoutDigest],
+					() =>
+						Promise.resolve().then(
+							() =>
+								this.prepare(
+									ctx,
+									proposals,
+									bitcoin,
+									layoutDigest
+								) as IConversionPlan
+						)
 				)
 		};
 	}
 }
 
+/** The planner members as the stub supplies them. */
+export interface IConversionHostPlanner {
+	proposeConversion(
+		ctx: IAssetConversionContext,
+		terms: IAssetConversionTerms
+	): Promise<Buffer>;
+	describeConversion(
+		ctx: IAssetConversionContext,
+		proposals: ConversionPair<Buffer>,
+		bitcoin: IConversionBitcoin
+	): Promise<IConversionDescription>;
+	prepareConversion(
+		ctx: IAssetConversionContext,
+		proposals: ConversionPair<Buffer>,
+		bitcoin: IConversionBitcoin,
+		layoutDigest: Buffer
+	): Promise<IConversionPlan>;
+}
+
 /**
  * The host a pair's manager runs with: the complete recovery host (every
  * other callback throws), a proof import that succeeds, the asset update
- * signer of the fixtures, and, unless `conversion` is false, the stub's
- * three members.
+ * signer of the fixtures, and, unless `conversion` is false, the stub's six
+ * conversion members over the default version and margin (0, or `margin`).
+ * Without `conversion` every conversion key is deleted: the six members,
+ * `assetConversionVersion` and `conversionFeerateMarginPerKw`.
  */
 function pairHost(
 	i: 0 | 1,
 	stub: ConversionHostStub,
 	conversion: boolean,
-	unexpected: string[]
+	unexpected: string[],
+	margin?: number
 ): IAuxiliaryDualFunding {
-	return {
+	const host: Record<string, unknown> = {
 		...completeRecoveryHost(unexpected),
 		confirmFunding: async () => undefined,
 		retractFunding: async () => undefined,
 		...assetUpdateTestHost(i, [], 1),
 		retainAssetUpdatePeerViews: async () => undefined,
-		...(conversion && stub.members())
-	} as unknown as IAuxiliaryDualFunding;
+		...(conversion && stub.members()),
+		...(conversion &&
+			margin !== undefined && { conversionFeerateMarginPerKw: margin })
+	};
+	if (!conversion) for (const key of CONVERSION_HOST_KEYS) delete host[key];
+	return host as unknown as IAuxiliaryDualFunding;
 }
 
 // ---------------------------------------------------------------------------
@@ -425,8 +561,22 @@ export interface IPairOptions {
 	terms?: IReadyPairTerms;
 	/** Rounds before the managers start (plain: update_fee; asset: fee rounds). */
 	rounds?: number;
-	/** Side i's host lacks the three conversion members. */
+	/**
+	 * Side i's host lacks every conversion key: the six members, the version
+	 * and the margin.
+	 */
 	withoutHostMembers?: [boolean, boolean];
+	/**
+	 * Side i's config.conversionFeerateEstimate in sat/kw: a function, or
+	 * null to leave the field out. Default: 1000 sat/kw, which the default
+	 * terms' feerate of 1000 meets at margin 0.
+	 */
+	conversionFeerateEstimate?: [
+		FeerateEstimate | null | undefined,
+		FeerateEstimate | null | undefined
+	];
+	/** Side i's host margin, conversionFeerateMarginPerKw (default 0). */
+	conversionFeerateMarginPerKw?: [number | undefined, number | undefined];
 	/** Side i's live init lacks 463. */
 	without463?: [boolean, boolean];
 	/** config.quiescenceTimeoutMs for both managers. */
@@ -443,6 +593,12 @@ export interface IPairOptions {
 		nodeIds: [string, string];
 	};
 }
+
+/** config.conversionFeerateEstimate (step 3b contract, section 4 check 9). */
+export type FeerateEstimate = () => Promise<number | null | undefined>;
+
+/** The default estimate of a pair's sides, in sat/kw. */
+export const PAIR_FEERATE_ESTIMATE = 1000;
 
 export interface IConversionPair {
 	kind: 'plain' | 'asset';
@@ -484,6 +640,11 @@ export interface IConversionPair {
 	restart(i: 0 | 1, afterTeardown?: () => void): Promise<void>;
 	/** Plain: updatesReady; asset: the asset update height. */
 	ready(i: 0 | 1): boolean;
+	/**
+	 * What each side's config.conversionFeerateEstimate answers; a test may
+	 * replace one. A side built with the option null has no estimate field.
+	 */
+	feerateEstimates: [FeerateEstimate, FeerateEstimate];
 }
 
 function txidOfHex(hex: string): TxidHex {
@@ -568,8 +729,19 @@ export async function conversionPair(
 	const link = new PeerLink(deliver, disconnectBoth);
 
 	const dualFunding = [0, 1].map((i) =>
-		pairHost(i as 0 | 1, hosts[i], !options.withoutHostMembers?.[i], unexpected)
+		pairHost(
+			i as 0 | 1,
+			hosts[i],
+			!options.withoutHostMembers?.[i],
+			unexpected,
+			options.conversionFeerateMarginPerKw?.[i]
+		)
 	) as [IAuxiliaryDualFunding, IAuxiliaryDualFunding];
+	const fixed: FeerateEstimate = async () => PAIR_FEERATE_ESTIMATE;
+	const feerateEstimates: [FeerateEstimate, FeerateEstimate] = [
+		options.conversionFeerateEstimate?.[0] ?? fixed,
+		options.conversionFeerateEstimate?.[1] ?? fixed
+	];
 	const build = (i: 0 | 1): ChannelManager => {
 		const manager = new ChannelManager({
 			finalOpening: { storage: stores[i], root: roots[i] },
@@ -581,6 +753,10 @@ export async function conversionPair(
 				resolveIncoming: () => undefined,
 				dualFunding: dualFunding[i]
 			},
+			...(options.conversionFeerateEstimate?.[i] !== null && {
+				conversionFeerateEstimate: (): Promise<number | null | undefined> =>
+					feerateEstimates[i]()
+			}),
 			...(options.quiescenceTimeoutMs !== undefined && {
 				quiescenceTimeoutMs: options.quiescenceTimeoutMs
 			})
@@ -695,7 +871,8 @@ export async function conversionPair(
 			return kind === 'plain'
 				? !!m.finalTransport?.updatesReady(id)
 				: m.assetUpdateHeight(id) === PAIR_HEIGHT;
-		}
+		},
+		feerateEstimates
 	};
 	return pair;
 }
@@ -873,11 +1050,72 @@ export function parentCommitmentFeerate(
 }
 
 /**
+ * The parent's balances before the commitment fee and the anchors, from one
+ * side's own store, as the step 3b parent reader takes its snapshot
+ * (section 5): a plain parent's locked ledger state; an asset parent's
+ * committed round member on the live funding, else the opening's
+ * contributions.
+ */
+export function parentBalancesMsat(
+	store: SqliteStorage,
+	id: string
+): { local: bigint; remote: bigint } {
+	const current = store.loadFinalChannelType(id)!;
+	if (current.type === 'plain') {
+		const view = (
+			store as unknown as {
+				finalUpdateView(id: string): {
+					views: { s: { locked: { local: string; peer: string } } }[];
+				} | null;
+			}
+		).finalUpdateView(id);
+		const locked = view?.views[0]?.s.locked;
+		if (locked)
+			return { local: BigInt(locked.local), remote: BigInt(locked.peer) };
+	} else {
+		const head = store.assetSpliceUpdateHead(id) as unknown as {
+			committed?: {
+				members: {
+					fundingTxid: string;
+					outputIndex: number;
+					localRecovery: {
+						localBalanceMsat: string;
+						remoteBalanceMsat: string;
+					};
+				}[];
+			};
+		};
+		const member = head.committed?.members.find(
+			(m) =>
+				m.fundingTxid === current.funding.txid &&
+				m.outputIndex === current.funding.outputIndex
+		);
+		if (member)
+			return {
+				local: BigInt(member.localRecovery.localBalanceMsat),
+				remote: BigInt(member.localRecovery.remoteBalanceMsat)
+			};
+	}
+	const opening = store.loadFinalOpening(id)!;
+	return {
+		local: BigInt(opening.localContributionSats) * 1000n,
+		remote: BigInt(opening.remoteContributionSats) * 1000n
+	};
+}
+
+/**
  * Terms a correct engine accepts for the pair's channel, derived only from
  * `store` (one side's own records): roles from its opening record, the
  * parent from its current type, the channel parameters from its opening
  * terms and limits mapped to roles, and the commitment feerate as check 7
  * reads it.
+ *
+ * Step 3b: the amounts pass every layout check of section 4 against the
+ * stub planner's description (`stubConversionDescription`). To an asset,
+ * nobody contributes and the first commitment keeps the parent's balances.
+ * To bitcoin, the buyer (the unit holder) contributes minus its withdrawal
+ * of STUB_WITHDRAWAL_SATS and the fee of STUB_FEE_SATS, and its balance
+ * drops by as much. The fee budget follows the funding payer, the giver.
  */
 export function storeTerms(
 	store: SqliteStorage,
@@ -896,6 +1134,20 @@ export function storeTerms(
 	const amount = options.amount ?? '1000';
 	const assetId = SAMPLE_ASSET_ID;
 	const limits = session.updateLimits!;
+	const byGiver = <T>(own: T, rest: T): { opener: T; acceptor: T } =>
+		giver === 'opener'
+			? { opener: own, acceptor: rest }
+			: { opener: rest, acceptor: own };
+	const contributions =
+		options.contributions ??
+		byGiver(
+			toAsset ? '0' : String(-(STUB_WITHDRAWAL_SATS + STUB_FEE_SATS)),
+			'0'
+		);
+	const parent = parentBalancesMsat(store, id);
+	const parentByRole = byRole(parent.local, parent.remote);
+	const balanceOf = (role: Role): string =>
+		String(parentByRole[role] + BigInt(contributions[role]) * 1000n);
 	return {
 		version: 1,
 		channelId: id,
@@ -919,11 +1171,14 @@ export function storeTerms(
 				limits.remote.maxAcceptedHtlcs
 			)
 		},
-		contributions: options.contributions ?? { opener: '0', acceptor: '0' },
+		contributions,
 		units: { holder: giver, issuances: [{ assetId, amount }] },
 		firstCommitment: {
 			commitmentFeeratePerKw: parentCommitmentFeerate(store, id, current.type),
-			balanceMsat: { opener: '100000000', acceptor: '50000000' },
+			balanceMsat: {
+				opener: balanceOf('opener'),
+				acceptor: balanceOf('acceptor')
+			},
 			...(toAsset && {
 				units: [
 					{
@@ -936,7 +1191,7 @@ export function storeTerms(
 		},
 		fees: {
 			fundingPayer: giver,
-			budgets: { opener: '2000', acceptor: '0' },
+			budgets: byGiver(String(STUB_BUDGET_SATS), '0'),
 			feeratePerKw: options.feeratePerKw ?? 1000,
 			...(!toAsset && { withdrawalPayer: giver })
 		},
@@ -1277,8 +1532,9 @@ export function gateBarrier(p: IConversionPair, i: 0 | 1): () => void {
 	};
 }
 
-/** The fence's text (contract section 6). */
-export const FENCE = 'Asset conversion stops before its layout in this build';
+/** The fence's text (step 3b contract, section 6). */
+export const FENCE =
+	'Asset conversion stops before its layout is signed in this build';
 
 /** One update round on the parent, which must complete. */
 export async function updateRound(p: IConversionPair): Promise<void> {
@@ -1303,4 +1559,301 @@ export async function updateRound(p: IConversionPair): Promise<void> {
 	await p.settle();
 	for (const store of p.stores)
 		expect(store.assetSpliceUpdateHead(p.id).nextNumber).to.equal(before + 1n);
+}
+
+// ---------------------------------------------------------------------------
+// The stub planner (step 3b contract, section 8)
+// ---------------------------------------------------------------------------
+
+/** The fee each stub layout pays, all of it from the funding payer. */
+export const STUB_FEE_SATS = 1000n;
+/** The funding payer's fee budget in storeTerms. */
+export const STUB_BUDGET_SATS = 2000n;
+/** The seller's wallet coin, standing in for its asset input, to an asset. */
+export const STUB_SELLER_COIN_SATS = 10_000n;
+/** The buyer's withdrawal, to bitcoin: the asset pair's larger dust limit. */
+export const STUB_WITHDRAWAL_SATS = 1000n;
+/** The commitment record limit each holder declares, to an asset. */
+export const STUB_RECORD_LIMITS: readonly { type: bigint; maxBytes: number }[] =
+	[{ type: 65537n, maxBytes: 1024 }];
+
+/** Side i's fixed proposal. */
+export function stubProposal(side: 0 | 1): Buffer {
+	return Buffer.from('stub conversion proposal ' + side, 'ascii');
+}
+
+const tagHash = (tag: string): Buffer =>
+	createHash('sha256')
+		.update('stub conversion ' + tag)
+		.digest();
+
+/** The seller's wallet coin: one P2TR output of STUB_SELLER_COIN_SATS. */
+export function stubSellerCoin(): Transaction {
+	const tx = new Transaction();
+	tx.version = 2;
+	tx.addInput(tagHash('coin input'), 0, 0xfffffffd);
+	tx.addOutput(
+		Buffer.concat([Buffer.from([0x51, 0x20]), tagHash('coin key')]),
+		Number(STUB_SELLER_COIN_SATS)
+	);
+	return tx;
+}
+
+/**
+ * Serials of the stub layout: the shared input 0 and the funding output 2,
+ * then each side's own output and input by its parity.
+ */
+export const STUB_SERIALS = {
+	shared: 0n,
+	funding: 2n,
+	initiator: { output: 4n, input: 6n },
+	acceptor: { output: 3n, input: 1n }
+} as const;
+
+/**
+ * The description the stub planner returns, derived from the context, the
+ * terms the host was shown and the engine's bitcoin facts:
+ * - to an asset, the seller (the unit holder) adds its wallet coin and a
+ *   change output, and moves every unit of the terms into the funding
+ *   output;
+ * - to bitcoin, the buyer (the unit holder) withdraws to one output what its
+ *   contribution leaves after the fee, and every unit of the parent moves
+ *   there, split between the two holders as `parentUnits` says.
+ * The funding payer pays STUB_FEE_SATS. Pairs are in initiator order.
+ */
+export function stubConversionDescription(
+	ctx: IAssetConversionContext,
+	terms: IAssetConversionTerms,
+	bitcoin: IConversionBitcoin
+): IConversionDescription {
+	const openerInitiates = ctx.isInitiator === ctx.isOpener;
+	const order = <T>(p: { opener: T; acceptor: T }): [T, T] =>
+		openerInitiates ? [p.opener, p.acceptor] : [p.acceptor, p.opener];
+	const spliceRole = (role: Role): 'initiator' | 'acceptor' =>
+		(role === 'opener') === openerInitiates ? 'initiator' : 'acceptor';
+	const holder = spliceRole(terms.units.holder);
+	const rel = order(terms.contributions).map(BigInt) as [bigint, bigint];
+	const own = holder === 'initiator' ? rel[0] : rel[1];
+	const serials = STUB_SERIALS[holder];
+	const bySerial = <T extends { serialId: bigint }>(a: T, b: T): number =>
+		a.serialId < b.serialId ? -1 : 1;
+	const shared = {
+		serialId: STUB_SERIALS.shared,
+		txid: Buffer.from(ctx.parent.txid, 'hex').reverse(),
+		vout: ctx.parent.outputIndex,
+		sequence: 0xfffffffd,
+		isShared: true
+	};
+	const funding = {
+		serialId: STUB_SERIALS.funding,
+		kind: 'funding' as const,
+		valueSats: bitcoin.parent.valueSats + rel[0] + rel[1],
+		descriptorHash: tagHash('funding')
+	};
+	const common = {
+		feeBudgets: order(terms.fees.budgets).map(BigInt),
+		relativeSatoshis: rel
+	};
+	if (terms.direction === 'to-asset') {
+		const coin = stubSellerCoin();
+		return {
+			inputs: [
+				shared,
+				{
+					serialId: serials.input,
+					txid: coin.getHash(),
+					vout: 0,
+					sequence: 0xfffffffd,
+					isShared: false,
+					prevTx: coin.toBuffer()
+				}
+			].sort(bySerial),
+			outputs: [
+				funding,
+				{
+					serialId: serials.output,
+					kind: 'change' as const,
+					valueSats: STUB_SELLER_COIN_SATS + own - STUB_FEE_SATS,
+					descriptorHash: tagHash('change')
+				}
+			].sort(bySerial),
+			movements: terms.units.issuances.map((i) => ({
+				assetId: i.assetId,
+				from: holder,
+				outputSerial: STUB_SERIALS.funding,
+				units: BigInt(i.amount)
+			})),
+			parentUnits: [],
+			...common,
+			commitmentRecordLimits: [
+				STUB_RECORD_LIMITS.map((r) => ({ ...r })),
+				STUB_RECORD_LIMITS.map((r) => ({ ...r }))
+			]
+		};
+	}
+	const split = (amount: string): [bigint, bigint] => {
+		const all = BigInt(amount);
+		return [all / 2n, all - all / 2n];
+	};
+	return {
+		inputs: [shared],
+		outputs: [
+			funding,
+			{
+				serialId: serials.output,
+				kind: 'withdrawal' as const,
+				valueSats: -own - STUB_FEE_SATS,
+				descriptorHash: tagHash('withdrawal')
+			}
+		].sort(bySerial),
+		movements: terms.units.issuances.flatMap((i) => {
+			const [initiator, acceptor] = split(i.amount);
+			return [
+				...(initiator > 0n
+					? [
+							{
+								assetId: i.assetId,
+								from: 'initiator' as const,
+								outputSerial: serials.output,
+								units: initiator
+							}
+					  ]
+					: []),
+				...(acceptor > 0n
+					? [
+							{
+								assetId: i.assetId,
+								from: 'acceptor' as const,
+								outputSerial: serials.output,
+								units: acceptor
+							}
+					  ]
+					: [])
+			];
+		}),
+		parentUnits: terms.units.issuances.map((i) => {
+			const [initiator, acceptor] = split(i.amount);
+			return { assetId: i.assetId, initiator, acceptor };
+		}),
+		...common
+	};
+}
+
+// ---------------------------------------------------------------------------
+// Layout frames and digests (step 3b contract, sections 2 and 4)
+// ---------------------------------------------------------------------------
+
+/** Envelope phase bytes of `layout` and `layout_ack`. */
+export const LAYOUT_PHASE = 0;
+export const LAYOUT_ACK_PHASE = 4;
+
+/** The `layout` frames of an object (one chunk per 32 KiB), as custom messages. */
+export function layoutFrames(
+	attempt: Buffer,
+	bytes: Buffer,
+	digest = createHash('sha256').update(bytes).digest(),
+	total = bytes.length
+): Buffer[] {
+	const out: Buffer[] = [];
+	for (let offset = 0; offset < bytes.length; offset += 32 * 1024)
+		out.push(
+			assetSpliceCustom(
+				rawFrame({
+					phase: LAYOUT_PHASE,
+					attempt,
+					digest,
+					total,
+					offset,
+					bytes: bytes.subarray(offset, offset + 32 * 1024)
+				})
+			)
+		);
+	return out;
+}
+
+/** A `layout_ack` carrying `digest`, as a custom message. */
+export function layoutAckMessage(
+	attempt: Buffer,
+	digest: Buffer,
+	bytes = Buffer.alloc(0)
+): Buffer {
+	return assetSpliceCustom(
+		rawFrame({
+			phase: LAYOUT_ACK_PHASE,
+			attempt,
+			digest,
+			total: 0,
+			offset: 0,
+			bytes
+		})
+	);
+}
+
+/** The frame header of a delivered or sent envelope message. */
+export function frameOf(m: IWireMessage): IRawFrame {
+	return parseFrame(customPayload(m.payload).frame);
+}
+
+/** sha256('asset-conversion-agreement/v1\0' || layoutDigest || planDigest). */
+export function agreementDigestOf(
+	layoutDigest: Buffer,
+	planDigest: Buffer
+): Buffer {
+	return createHash('sha256')
+		.update(
+			Buffer.concat([
+				Buffer.from('asset-conversion-agreement/v1\0', 'ascii'),
+				layoutDigest,
+				planDigest
+			])
+		)
+		.digest();
+}
+
+/**
+ * The host calls of an attempt that reached the fence, I initiating: each
+ * side's calls in order, and the order across the sides that section 3's
+ * flow fixes. Calls of other attempts must not be in `calls`.
+ */
+export function expectFenceHostOrder(
+	calls: IConversionHostCall[],
+	I: 0 | 1
+): void {
+	const A = (1 - I) as 0 | 1;
+	const names = (side: 0 | 1): string[] =>
+		calls.filter((c) => c.side === side).map((c) => c.name);
+	expect(names(I), 'initiator host calls').to.deep.equal([
+		'conversionTerms',
+		'verifyConversionTerms',
+		'proposeConversion',
+		'describeConversion',
+		'prepareConversion',
+		'abandonConversion'
+	]);
+	expect(names(A), 'acceptor host calls').to.deep.equal([
+		'verifyConversionTerms',
+		'proposeConversion',
+		'describeConversion',
+		'prepareConversion',
+		'abandonConversion'
+	]);
+	const at = (side: 0 | 1, name: ConversionHostCallName): number =>
+		calls.findIndex((c) => c.side === side && c.name === name);
+	const before = (
+		a: [0 | 1, ConversionHostCallName],
+		b: [0 | 1, ConversionHostCallName]
+	): void => {
+		expect(
+			at(...a) < at(...b),
+			a.join(':') + ' before ' + b.join(':')
+		).to.equal(true);
+	};
+	before([I, 'verifyConversionTerms'], [A, 'verifyConversionTerms']);
+	before([A, 'verifyConversionTerms'], [I, 'proposeConversion']);
+	before([I, 'proposeConversion'], [A, 'proposeConversion']);
+	before([A, 'proposeConversion'], [I, 'describeConversion']);
+	before([A, 'proposeConversion'], [A, 'describeConversion']);
+	before([I, 'prepareConversion'], [A, 'abandonConversion']);
+	before([A, 'prepareConversion'], [A, 'abandonConversion']);
+	before([A, 'abandonConversion'], [I, 'abandonConversion']);
 }

@@ -18,6 +18,27 @@ import {
 	type FinalGeneration
 } from './final-generation';
 
+/**
+ * The six conversion members of a host (#2151 step 3a's three terms calls
+ * and step 3b's three planner calls), which completeAssetConversionHost
+ * requires beside its version and margin (step 3b contract, section 1).
+ */
+export const CONVERSION_HOST_MEMBERS = [
+	'conversionTerms',
+	'verifyConversionTerms',
+	'abandonConversion',
+	'proposeConversion',
+	'describeConversion',
+	'prepareConversion'
+] as const;
+
+/** Every key of the conversion surface: the six members, the version and the margin. */
+export const CONVERSION_HOST_KEYS = [
+	...CONVERSION_HOST_MEMBERS,
+	'assetConversionVersion',
+	'conversionFeerateMarginPerKw'
+] as const;
+
 const callbacks = [
 	'contribution',
 	'abandon',
@@ -49,24 +70,38 @@ const callbacks = [
 	'signAssetUpdateHtlcs',
 	'verifyAssetUpdateViews',
 	'retainAssetUpdateViews',
-	'retainAssetUpdatePeerViews'
+	'retainAssetUpdatePeerViews',
+	...CONVERSION_HOST_MEMBERS
 ];
 
 /**
- * A stub host that passes completeAssetOpeningHost, completeAssetSpliceHost
- * and completeAssetSpliceRecoveryHost, and is never asked to act. Every
- * callback records its name and throws, so a test sees any call.
+ * A stub host that passes completeAssetOpeningHost, completeAssetSpliceHost,
+ * completeAssetSpliceRecoveryHost and completeAssetConversionHost, and is
+ * never asked to act. Every callback records its name and throws, so a test
+ * sees any call. `without` leaves out one key, or several: any callback,
+ * `assetConversionVersion` or `conversionFeerateMarginPerKw`.
  */
 export function completeRecoveryHost(
 	calls: string[] = [],
-	without?: string
+	without?: string | readonly string[]
 ): IAuxiliaryDualFunding {
+	const left = new Set<string>(
+		without === undefined
+			? []
+			: typeof without === 'string'
+			? [without]
+			: without
+	);
 	return {
 		version: 1,
 		assetSpliceRecoveryVersion: 1,
+		...(!left.has('assetConversionVersion') && { assetConversionVersion: 1 }),
+		...(!left.has('conversionFeerateMarginPerKw') && {
+			conversionFeerateMarginPerKw: 0
+		}),
 		...Object.fromEntries(
 			callbacks
-				.filter((name) => name !== without)
+				.filter((name) => !left.has(name))
 				.map((name) => [
 					name,
 					() => {

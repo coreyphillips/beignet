@@ -188,10 +188,11 @@ describe('a forward with an asset leg, under the declared contract (issue #2098,
 		expect(ended).to.deep.equal([resolution]);
 	});
 
-	it('is named among the surfaces of AUXILIARY_CHANNELS_API from the build that runs it, with nothing left declared (step 5)', () => {
+	it('is named among the surfaces of AUXILIARY_CHANNELS_API from the build that runs it, and not declared (step 5)', () => {
 		const api = lightningChannel.AUXILIARY_CHANNELS_API;
 		expect(api.version).to.equal(1);
-		expect([...api.declared]).to.deep.equal([]);
+		// #2151 step 3b declares the conversion, which runs only in part.
+		expect([...api.declared]).to.deep.equal(['assetConversion:v1']);
 		expect(Object.isFrozen(api.declared)).to.equal(true);
 		const surface: lightningChannel.AuxiliaryChannelsSurface = 'prepareForward';
 		expect((api.surfaces as readonly string[]).includes(surface)).to.equal(

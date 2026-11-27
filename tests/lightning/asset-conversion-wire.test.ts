@@ -26,7 +26,10 @@ import {
 import * as splice from '../../src/lightning/message/splice';
 import { decodeTlvStream } from '../../src/lightning/message/tlv';
 import type { SqliteStorage } from '../../src/lightning/storage/sqlite-storage';
-import { completeRecoveryHost } from './helpers/asset-conversion-node';
+import {
+	completeRecoveryHost,
+	CONVERSION_HOST_KEYS
+} from './helpers/asset-conversion-node';
 import { plainTypePair, scratch } from './helpers/channel-type-pairs';
 import { member } from './helpers/conversion-modules';
 
@@ -573,9 +576,12 @@ describe('Asset conversion envelope phases (#2151 step 3a, test 9)', function ()
 				finalOpening: { storage: store, root: pair.devices[0].root },
 				verifyRemoteFundingInput: async () => 'unspent',
 				persistence: { persist: () => 'committed' },
-				// A generation 6 host without the three conversion members.
+				// A generation 6 host without the conversion surface (step 3b:
+				// its six members, its version and its margin).
 				...(generation === 6 && {
-					auxiliaryChannels: { dualFunding: completeRecoveryHost() }
+					auxiliaryChannels: {
+						dualFunding: completeRecoveryHost([], CONVERSION_HOST_KEYS)
+					}
 				})
 			} as unknown as IChannelManagerConfig);
 			manager.on('error', () => {});
