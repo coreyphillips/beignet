@@ -549,6 +549,11 @@ export class AssetConversionTransport {
 					this.sendReply(peer, attempt, digest, OTHER_ATTEMPT);
 					return;
 				}
+				// Withdraw its own announced terms, so an opener that has no
+				// attempt by the time they arrive does not take them up. The
+				// ids are per side, so this names no attempt of the opener's.
+				if (existing.state === 'announced')
+					this.sendReply(peer, existing.attempt!, existing.digest!, WITHDRAWN);
 				this.end(existing, PEER_GOES_FIRST);
 			} else {
 				const same =
@@ -661,6 +666,9 @@ export class AssetConversionTransport {
 				this.end(a, WITHDRAWN);
 			return;
 		}
+		// A decline is the peer's last reply for the attempt, even when an
+		// end runs before the queued handler does.
+		if (decline && a.state === 'announced') a.replied = true;
 		const reason = decline ? declineReason(f.bytes.subarray(1)) : '';
 		this.enqueue(a, async () => {
 			if (a.state !== 'announced') return;

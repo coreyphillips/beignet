@@ -145,7 +145,7 @@ export interface IAssetOpeningHtlcPayout {
 export interface IAssetConversionContext {
 	channelId: string;
 	peer: string;
-	/** The attempt id, from the channel, the parent outpoint and the terms digest. */
+	/** The attempt id, from the channel, the parent outpoint, the terms digest and the initiator's role. */
 	attempt: Buffer;
 	isInitiator: boolean;
 	/** Whether this side opened the channel: the role the terms name it by. */

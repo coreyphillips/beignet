@@ -23,6 +23,7 @@ import {
 	encodeSpliceAck,
 	encodeSpliceInit,
 	FENCE,
+	gateBarrier,
 	held,
 	never,
 	readReply,
@@ -829,27 +830,6 @@ describe('An attempt that ends while it waits for the barrier (#2151 step 3a, di
 	this.timeout(60000);
 	const s = scratch('conversion-barrier-end-');
 	after(() => s.release());
-
-	/** Make side i's barrier wait until the returned function is called. */
-	function gateBarrier(p: IConversionPair, i: 0 | 1): () => void {
-		const m = p.managers[i] as unknown as {
-			finalTransport?: { settled(id: string): Promise<void> };
-			assetUpdates?: { settled(id: string): Promise<void> };
-		};
-		let open!: () => void;
-		const gate = new Promise<void>((done) => (open = done));
-		const restore: (() => void)[] = [];
-		for (const t of [m.finalTransport, m.assetUpdates]) {
-			if (!t) continue;
-			const original = t.settled.bind(t);
-			t.settled = (id: string): Promise<void> => gate.then(() => original(id));
-			restore.push(() => (t.settled = original));
-		}
-		return () => {
-			for (const r of restore) r();
-			open();
-		};
-	}
 
 	const WIRE = ['STFU', 'SPLICE', 'SPLICE_ACK', 'TX_ABORT'];
 	// [handler, the message held to reach it, the side whose handler waits]

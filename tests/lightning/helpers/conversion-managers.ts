@@ -1252,6 +1252,31 @@ export async function tick(
 	await pair.settle();
 }
 
+/**
+ * Make side i's barrier (the conversion's wait for the final and asset
+ * update queues) wait until the returned function is called, as a queued
+ * task that spans an I/O turn would.
+ */
+export function gateBarrier(p: IConversionPair, i: 0 | 1): () => void {
+	const m = p.managers[i] as unknown as {
+		finalTransport?: { settled(id: string): Promise<void> };
+		assetUpdates?: { settled(id: string): Promise<void> };
+	};
+	let open!: () => void;
+	const gate = new Promise<void>((done) => (open = done));
+	const restore: (() => void)[] = [];
+	for (const t of [m.finalTransport, m.assetUpdates]) {
+		if (!t) continue;
+		const original = t.settled.bind(t);
+		t.settled = (id: string): Promise<void> => gate.then(() => original(id));
+		restore.push(() => (t.settled = original));
+	}
+	return () => {
+		for (const r of restore) r();
+		open();
+	};
+}
+
 /** The fence's text (contract section 6). */
 export const FENCE = 'Asset conversion stops before its layout in this build';
 
