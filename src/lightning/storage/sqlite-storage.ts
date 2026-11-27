@@ -37,6 +37,16 @@ import {
 	type IPlainExitBranch
 } from './final-conversion-exits';
 import {
+	CONVERSION_ATTEMPT_TEXTS,
+	canonicalConversionAttempt,
+	checkedConversionAttempts,
+	isCanonicalConversionReason,
+	type FinalConversionAttemptEvent,
+	type IConversionAttemptFields,
+	type IOpenConversionAttempt,
+	type ISweptConversionAttempt
+} from './final-conversion-attempt';
+import {
 	noteFinalPeerSecretConflict,
 	shachainSecret,
 	shachainSecrets,
@@ -952,7 +962,16 @@ export class SqliteStorage implements IStorageBackend {
 				this.finalOwnCommitmentRevoked(id, era, height),
 			loadFinalPeerSecrets: (id) => this.loadFinalPeerSecrets(id),
 			finalPeerSecretScope: (run) => this.finalPeerSecretScope(run),
-			assetConversionParent: (id) => this.assetConversionParent(id)
+			assetConversionParent: (id) => this.assetConversionParent(id),
+			recordConversionAttempt: (id, fields) =>
+				this.recordConversionAttempt(id, fields),
+			withdrawConversionAttempt: (id, sequence, attempt, reason) =>
+				this.withdrawConversionAttempt(id, sequence, attempt, reason),
+			withdrawOpenConversionAttempts: (reason) =>
+				this.withdrawOpenConversionAttempts(reason),
+			conversionAttemptRows: (id) => this.conversionAttemptRows(id),
+			conversionAttemptOpen: (id) => this.conversionAttemptOpen(id),
+			openConversionAttempt: (id) => this.openConversionAttempt(id)
 		});
 	}
 
@@ -3270,6 +3289,181 @@ export class SqliteStorage implements IStorageBackend {
 			}
 			throw e;
 		}
+	}
+
+	// ---- Conversion attempt records (#2151 Step 4a) ----
+	// @internal: the conversion transport reaches these through
+	// storage/final-branch-readers.ts. The scope `conversion-attempt`
+	// alternates a record and its withdrawal (storage/final-conversion-attempt.ts).
+
+	/** The writers' gates: the original generation 6 wallet, at a top-level commit. */
+	private requireConversionAttemptWriter(): void {
+		if (!this.canConvertAssetChannels)
+			throw new Error(CONVERSION_ATTEMPT_TEXTS.wallet);
+		if (this.db.inTransaction)
+			throw new Error(CONVERSION_ATTEMPT_TEXTS.topLevel);
+	}
+
+	/** The channel's attempt events, checked, with the journal head they end at. */
+	private readConversionAttempts(
+		journal: FinalDeviceJournal,
+		channelId: string
+	): { events: FinalConversionAttemptEvent[]; head: IFinalJournalHead } {
+		const { records, sequence, hash } = journal.read<unknown>(
+			'conversion-attempt',
+			channelId
+		);
+		return {
+			events: checkedConversionAttempts(records),
+			head: { sequence, hash }
+		};
+	}
+
+	/** Append one attempt event, reconciling the scope when a failure follows the device slot. */
+	private appendConversionAttemptEvent(
+		journal: FinalDeviceJournal,
+		channelId: string,
+		head: IFinalJournalHead,
+		event: FinalConversionAttemptEvent
+	): IFinalJournalHead {
+		try {
+			return journal.append('conversion-attempt', channelId, head, event);
+		} catch (e) {
+			// The device slot commits before the wallet row: pull it in, so the
+			// row count sees the row.
+			try {
+				journal.read('conversion-attempt', channelId);
+			} catch {
+				// The rethrown error below is the one the caller needs.
+			}
+			throw e;
+		}
+	}
+
+	/** Append an attempt record and return its scope sequence; refused while the last record is open. */
+	private recordConversionAttempt(
+		channelId: string,
+		fields: IConversionAttemptFields
+	): number {
+		this.requireConversionAttemptWriter();
+		if (typeof channelId !== 'string' || !/^[0-9a-f]{64}$/.test(channelId))
+			throw new Error(CONVERSION_ATTEMPT_TEXTS.invalid);
+		const record = canonicalConversionAttempt(fields);
+		const journal = this.finalJournal();
+		const { events, head } = this.readConversionAttempts(journal, channelId);
+		if (events.length % 2) throw new Error(CONVERSION_ATTEMPT_TEXTS.open);
+		return this.appendConversionAttemptEvent(journal, channelId, head, {
+			kind: 'conversion-attempt',
+			...record
+		}).sequence;
+	}
+
+	/**
+	 * Withdraw the record at `sequence` (amendment A1): appended when that
+	 * record of `attempt` is the scope's last row, a no-op when the next row
+	 * withdraws it, and refused otherwise.
+	 */
+	private withdrawConversionAttempt(
+		channelId: string,
+		sequence: number,
+		attempt: string,
+		reason: string
+	): void {
+		this.requireConversionAttemptWriter();
+		if (
+			typeof channelId !== 'string' ||
+			!/^[0-9a-f]{64}$/.test(channelId) ||
+			typeof attempt !== 'string' ||
+			!/^[0-9a-f]{64}$/.test(attempt) ||
+			!Number.isSafeInteger(sequence) ||
+			!isCanonicalConversionReason(reason)
+		)
+			throw new Error(CONVERSION_ATTEMPT_TEXTS.invalid);
+		const journal = this.finalJournal();
+		const { events, head } = this.readConversionAttempts(journal, channelId);
+		const record = sequence >= 1 ? events[sequence - 1] : undefined;
+		if (record?.kind !== 'conversion-attempt' || record.attempt !== attempt)
+			throw new Error(CONVERSION_ATTEMPT_TEXTS.notRecorded);
+		// The scope alternates, so a row after the record is its withdrawal.
+		if (events.length > sequence) return;
+		this.appendConversionAttemptEvent(journal, channelId, head, {
+			kind: 'conversion-withdrawn',
+			attempt,
+			reason
+		});
+	}
+
+	/**
+	 * The startup sweep (#2151 Step 4a, section 4.5): withdraw every open
+	 * record of the wallet with `reason`. A channel whose record cannot be
+	 * read or withdrawn is returned with its error, never thrown.
+	 */
+	private withdrawOpenConversionAttempts(
+		reason: string
+	): ISweptConversionAttempt[] {
+		if (!this.canConvertAssetChannels) return [];
+		const counts = this.db
+			.prepare(
+				"SELECT channel_id AS id, COUNT(*) AS n FROM final_lifecycle_log WHERE scope = 'conversion-attempt' GROUP BY channel_id ORDER BY channel_id"
+			)
+			.all() as { id: string; n: number }[];
+		const swept: ISweptConversionAttempt[] = [];
+		for (const { id, n } of counts) {
+			if (n % 2 === 0) continue;
+			const out: ISweptConversionAttempt = { channelId: id, sequence: n };
+			try {
+				const open = this.openConversionAttempt(id);
+				if (!open) continue;
+				const { sequence, ...record } = open;
+				out.sequence = sequence;
+				out.record = record;
+				this.withdrawConversionAttempt(id, sequence, record.attempt, reason);
+			} catch (e) {
+				out.error = e instanceof Error ? e.message : String(e);
+			}
+			swept.push(out);
+		}
+		return swept;
+	}
+
+	/** The scope's row count: one COUNT, in generation 6 only; no other generation runs a query. */
+	private conversionAttemptRows(channelId: string): number {
+		if (
+			!this.supportsAssetConversion ||
+			typeof channelId !== 'string' ||
+			!/^[0-9a-f]{64}$/.test(channelId)
+		)
+			return 0;
+		return (
+			this._stmt(
+				"SELECT COUNT(*) AS n FROM final_lifecycle_log WHERE scope = 'conversion-attempt' AND channel_id = ?"
+			).get(channelId) as { n: number }
+		).n;
+	}
+
+	/** Whether the channel's last attempt record is open: its row count is odd (section 2.5). */
+	private conversionAttemptOpen(channelId: string): boolean {
+		return this.conversionAttemptRows(channelId) % 2 === 1;
+	}
+
+	/** The open record and its sequence, or null: an authenticated read of the scope. */
+	private openConversionAttempt(
+		channelId: string
+	): IOpenConversionAttempt | null {
+		if (
+			!this.supportsAssetConversion ||
+			typeof channelId !== 'string' ||
+			!/^[0-9a-f]{64}$/.test(channelId)
+		)
+			return null;
+		const { events } = this.readConversionAttempts(
+			this.finalJournal(),
+			channelId
+		);
+		const last = events[events.length - 1];
+		if (last?.kind !== 'conversion-attempt') return null;
+		const { kind: _kind, ...record } = last;
+		return { ...record, sequence: events.length };
 	}
 
 	/** The current ledger's local and remote commitments at its height, on the live funding. */

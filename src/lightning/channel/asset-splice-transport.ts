@@ -231,7 +231,7 @@ export class AssetSpliceTransport {
 		private broadcast: (raw: Buffer) => void,
 		private report: (id: string, reason: string) => void,
 		private watchdog?: SpliceWatchdog,
-		/** A conversion holds the channel against local splice starts (#2151). */
+		/** A conversion holds the channel against local splice starts (#2151): in memory, or by its record on disk (Step 4a). */
 		private held: (id: string) => boolean = () => false
 	) {}
 	/**
@@ -584,6 +584,9 @@ export class AssetSpliceTransport {
 		return begin;
 	}
 	async start(id: string, options: IStartAssetSplice) {
+		// Before the queue as well (#2151 Step 4a): a refused start never makes
+		// the channel read as negotiating.
+		if (this.held(id)) throw Error(ASSET_CONVERSION_TEXTS.held);
 		await this.enqueue(id, async () => {
 			if (this.held(id)) throw Error(ASSET_CONVERSION_TEXTS.held);
 			refuseRecordedSplice(this.store, id);

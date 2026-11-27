@@ -95,7 +95,8 @@ export class FinalOpeningTransport {
 		private readonly splice?: FinalSpliceTransport,
 		private readonly reconnectFunding?: (peer: string) => void,
 		private readonly resumeAssetSplice?: (peer: string, id: string) => void,
-		held?: (id: string) => boolean
+		held?: (id: string) => boolean,
+		quiet?: (id: string) => boolean
 	) {
 		this.commitments = new FinalCommitmentTransport(
 			runtime,
@@ -103,7 +104,8 @@ export class FinalOpeningTransport {
 			(id, msg) =>
 				this.send(this.connections.get(id)!.peer, msg.type, msg.payload),
 			deliver,
-			held
+			held,
+			quiet
 		);
 		for (const {
 			candidate,

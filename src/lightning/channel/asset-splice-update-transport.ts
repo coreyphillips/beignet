@@ -166,7 +166,9 @@ export class AssetSpliceUpdateTransport {
 		private readonly knownPeer: (id: string, peer: string) => boolean = () =>
 			false,
 		/** A conversion holds the channel against local adds and fee changes (#2151). */
-		private readonly held: (id: string) => boolean = () => false
+		private readonly held: (id: string) => boolean = () => false,
+		/** A conversion attempt on disk keeps the channel quiet: no local change of any kind (#2151 Step 4a). */
+		private readonly quiet: (id: string) => boolean = () => false
 	) {}
 	/** Resolves once the channel's queue has run what it held when called. Side-effect free. */
 	settled(id: string): Promise<void> {
@@ -334,8 +336,9 @@ export class AssetSpliceUpdateTransport {
 		const current = this.connectionCurrent(id, p.peer);
 		await this.run(id, async () => {
 			if (
-				this.held(id) &&
-				changes.some((c) => c.kind === 'add' || c.kind === 'fee')
+				(this.held(id) &&
+					changes.some((c) => c.kind === 'add' || c.kind === 'fee')) ||
+				this.quiet(id)
 			)
 				throw Error(ASSET_CONVERSION_TEXTS.held);
 			if (!current())

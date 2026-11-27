@@ -4,10 +4,16 @@
  * the API snapshot. Each store attaches them when it is built, so the claim
  * builders in src/lightning/chain reach them without a public member, and a
  * storage double without them takes today's path. The asset conversion
- * transport reads a conversion's parent the same way (#2151 step 3a).
+ * transport reads a conversion's parent the same way (#2151 step 3a), and
+ * writes and reads its attempt records (#2151 Step 4a).
  */
 import type { IFinalCommitmentType } from '../channel/final-opening-commitment';
 import type { IFinalConversionExits } from './final-conversion-exits';
+import type {
+	IConversionAttemptFields,
+	IOpenConversionAttempt,
+	ISweptConversionAttempt
+} from './final-conversion-attempt';
 import type { IFinalChannelTypeRecord } from './final-channel-type';
 import type { IFinalFundingReference } from '../channel/final-splice-candidate';
 import type { IFinalPeerSecret } from './final-peer-secrets';
@@ -90,6 +96,33 @@ export interface IFinalBranchReaders {
 	finalPeerSecretScope<T>(run: () => T): T;
 	/** A conversion's parent, or a throw naming the first precondition it fails. */
 	assetConversionParent(channelId: string): IAssetConversionParent;
+	/**
+	 * Append a conversion's attempt record (#2151 Step 4a) and return its
+	 * scope sequence. Refused while the channel's last record is open.
+	 */
+	recordConversionAttempt(
+		channelId: string,
+		fields: IConversionAttemptFields
+	): number;
+	/**
+	 * Withdraw the record at scope sequence `sequence`: appended when it is
+	 * the scope's last row, a no-op once the next row withdraws it, refused
+	 * otherwise. `reason` must be canonical.
+	 */
+	withdrawConversionAttempt(
+		channelId: string,
+		sequence: number,
+		attempt: string,
+		reason: string
+	): void;
+	/** The startup sweep: withdraw every open record; a channel's failure is returned with it, not thrown. */
+	withdrawOpenConversionAttempts(reason: string): ISweptConversionAttempt[];
+	/** The scope's row count: one COUNT, generation 6 only. */
+	conversionAttemptRows(channelId: string): number;
+	/** Whether the channel's last record is open: its row count is odd. */
+	conversionAttemptOpen(channelId: string): boolean;
+	/** The open record and its sequence, or null: an authenticated read, never on an update path. */
+	openConversionAttempt(channelId: string): IOpenConversionAttempt | null;
 }
 
 /**

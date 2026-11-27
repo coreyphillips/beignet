@@ -246,7 +246,7 @@ export interface IAssetConversionHost {
 		terms: IAssetConversionTerms,
 		digest: Buffer
 	): Promise<boolean>;
-	/** Called once when an attempt this host verified ends, with the end's text. It is final, even while a planner call is pending. */
+	/** Called when an attempt this host verified ends, with the end's text. After a restart it may also be called for an attempt from before it, which this process never saw, and may then repeat a call made before the restart; it must be idempotent. It is final, even while a planner call is pending. */
 	abandonConversion(
 		ctx: IAssetConversionContext,
 		reason: string
@@ -343,7 +343,7 @@ export interface IAuxiliaryDualFunding
 		terms: IAssetConversionTerms,
 		digest: Buffer
 	): Promise<boolean>;
-	/** Called once when an attempt this host verified ends, with the end's text. */
+	/** Called when an attempt this host verified ends, with the end's text. After a restart it may also be called for an attempt from before it, which this process never saw, and may then repeat a call made before the restart; it must be idempotent. */
 	abandonConversion?(
 		ctx: IAssetConversionContext,
 		reason: string
