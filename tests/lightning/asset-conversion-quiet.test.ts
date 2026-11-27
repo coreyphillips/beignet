@@ -1457,14 +1457,15 @@ describe('Asset conversion quiet from layout_ack (#2151 step 4a, section 8 quiet
 			expect(closed.statements, 'statements').to.have.length(1);
 			expect(closed.statements[0]).to.match(/COUNT/i);
 			expect(closed.reads, 'no journal or device read').to.equal(0);
-			const record = sampleRecord(store, p.id, p.nodeIds[1], '7a'.repeat(32));
-			const n = storage.recordConversionAttempt(p.id, record);
+			// The open record is a live attempt's (amendment B1: a record that
+			// no live attempt holds is an orphan, withdrawn when it is met).
+			await toQuiet(p, 0);
 			const open = read();
 			expect(open.quiet).to.equal(true);
 			expect(open.statements).to.have.length(1);
 			expect(open.statements[0]).to.match(/COUNT/i);
 			expect(open.reads).to.equal(0);
-			storage.withdrawConversionAttempt(p.id, n, record.attempt, FENCE);
+			await fence(p);
 			expect(held(p.managers[0], p.id)).to.equal(false);
 		});
 	});

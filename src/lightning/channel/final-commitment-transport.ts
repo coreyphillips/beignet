@@ -30,7 +30,7 @@ export class FinalCommitmentTransport {
 		) => void,
 		/** A conversion holds the channel against local adds and fee updates (#2151). */
 		private readonly held: (id: string) => boolean = () => false,
-		/** A conversion attempt on disk keeps the channel quiet: no local update of any type (#2151 Step 4a). */
+		/** A live conversion attempt's record on disk keeps the channel quiet: no local update of any type (#2151 Step 4a). */
 		private readonly quiet: (id: string) => boolean = () => false
 	) {}
 

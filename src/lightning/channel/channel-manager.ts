@@ -1547,9 +1547,10 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 	}
 
 	/**
-	 * Whether a conversion attempt of the channel is on disk and open, so the
-	 * channel is quiet (#2151 Step 4a, section 3): no local update and no
-	 * splice start of either kind. Separate from the in-memory hold.
+	 * Whether a live conversion attempt of the channel holds its open record
+	 * on disk, so the channel is quiet (#2151 Step 4a, section 3 and
+	 * amendment B1): no local update and no splice start of either kind.
+	 * Separate from the in-memory hold.
 	 */
 	private conversionQuiet(id: string): boolean {
 		return !!this.assetConversion?.quiet(id);
