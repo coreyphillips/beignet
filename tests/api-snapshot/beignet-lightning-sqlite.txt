@@ -51,7 +51,7 @@ unexported class FinalDeviceJournal
 constructor FinalDeviceJournal(db: Database.Database, walletKey: Buffer, identity: string, authority: FinalOpeningAuthority | null)
 method FinalDeviceJournal.append<T>(scope: Scope, id: string, head: IFinalJournalHead, event: T): IFinalJournalHead
 method FinalDeviceJournal.read<T>(scope: Scope, id: string, checkpoint?: IFinalJournalHead): IFinalJournalRead<T>
-method FinalDeviceJournal.reconcile(channelId: string, includeAssetFrames?: boolean): void
+method FinalDeviceJournal.reconcile(channelId: string, includeAssetFrames?: boolean, reconciled?: readonly Scope[]): void
 unexported type FinalFundingWitnessSigner = (unsigned: bitcoinjs-lib#Transaction, indices: readonly number[], prevouts: Prevouts) => Buffer[][]
 unexported class FinalOpeningAuthority
 private constructor FinalOpeningAuthority()
@@ -142,6 +142,7 @@ method GuardianStore.updateRegistrationReceipt(recoveryId: Buffer, issuedAt: Buf
 method GuardianStore.usageBytes(recoveryId?: Buffer): number
 method GuardianStore.write<T>(fn: () => T): T
 unexported type Holder = 'local' | 'remote'
+unexported type IAssetExitBranch = { type: 'asset'; feeratePerKw: number; } & IAssetSpliceExitBranch
 unexported interface IAssetOpeningEvidence
 property IAssetOpeningEvidence.finalDigest: string
 property IAssetOpeningEvidence.fundingProofs: string
@@ -289,12 +290,18 @@ property IFinalCloseView.localHeight: bigint
 property IFinalCloseView.pending: unknown
 property IFinalCloseView.remoteBalanceMsat: bigint
 property IFinalCloseView.remoteHeight: bigint
+unexported interface IFinalConversionExits
+property IFinalConversionExits.candidate: IFinalExitBranch
+property IFinalConversionExits.digest: string
+property IFinalConversionExits.parent: IFinalExitBranch
+property IFinalConversionExits.stateNumber: string
 unexported interface IFinalDaemonOpening
 property IFinalDaemonOpening.candidate: IFinalOpeningCandidate
 property IFinalDaemonOpening.exitToBroadcast?: Buffer
 property IFinalDaemonOpening.funding?: Buffer
 property IFinalDaemonOpening.readyExchanged?: true
 property IFinalDaemonOpening.session: IFinalOpeningSession
+unexported type IFinalExitBranch = IAssetExitBranch | IPlainExitBranch
 unexported interface IFinalFundingReference
 property IFinalFundingReference.fundingOutputIndex: number
 property IFinalFundingReference.fundingTxHex: string
@@ -539,6 +546,23 @@ interface IPaymentRowMatch
 property IPaymentRowMatch.direction?: string
 property IPaymentRowMatch.metadata?: { key: string; value?: string; }
 property IPaymentRowMatch.status?: string
+unexported interface IPlainExitBranch
+property IPlainExitBranch.channelType: string
+property IPlainExitBranch.funding: IFinalFundingReference
+property IPlainExitBranch.fundingTxid: string
+property IPlainExitBranch.localCommitment: string
+property IPlainExitBranch.localRecovery: IPlainHolderRecovery
+property IPlainExitBranch.minimumDepth: number
+property IPlainExitBranch.outputIndex: number
+property IPlainExitBranch.remoteCommitment: string
+property IPlainExitBranch.remoteRecovery: IPlainHolderRecovery
+property IPlainExitBranch.type: 'plain'
+unexported interface IPlainHolderRecovery
+property IPlainHolderRecovery.feeratePerKw: number
+property IPlainHolderRecovery.htlcs: [ ]
+property IPlainHolderRecovery.localBalanceMsat: string
+property IPlainHolderRecovery.point: string
+property IPlainHolderRecovery.remoteBalanceMsat: string
 interface IQueueEntryRow
 property IQueueEntryRow.amountSats?: number
 property IQueueEntryRow.bolt11: string
@@ -758,6 +782,7 @@ method SqliteStorage.readAssetSpliceJournal<T = unknown>(channelId: string): IFi
 method SqliteStorage.receivedAssetSpliceWire(channelId: string, type: beignet/lightning#message.MessageType, payload: Buffer): boolean
 method SqliteStorage.recoveryFrameStats(): { count: number; minSequence: number; maxSequence: number; } | null
 method SqliteStorage.releaseAssetSpliceWalletInputs(channelId: string, attempt: string): void
+method SqliteStorage.releaseFinalConversionExits(channelId: string, digest: string): void
 method SqliteStorage.releasedAssetSplice(channelId: string, attempt: string): { readonly wire: Buffer; receive(raw: Buffer): void; transaction(): bitcoinjs-lib#Transaction | undefined; } | undefined
 method SqliteStorage.rememberAssetOpeningSession(candidate: IFinalOpeningCandidate, peer: string, terms: IFinalOpeningTerms, channelKeyIndex: number, remoteSecondPerCommitmentPoint: string, evidence: IAssetOpeningEvidence, updateLimits?: IFinalUpdateLimits): void
 method SqliteStorage.rememberFinalOpening(candidate: IFinalOpeningCandidate): void
@@ -773,6 +798,7 @@ static method SqliteStorage.repairAssetSpliceChannel(dbPath: string, binding: IF
 method SqliteStorage.requestFinalOpeningExit(channelId: string, fundingTxid?: Buffer, fundingOutputIndex?: number): Buffer
 method SqliteStorage.reserveAssetOpenSignature(id: string, field: string, digest: string | Buffer): void
 method SqliteStorage.reserveAssetSpliceWalletInputs(channelId: string, attempt: string, parent: string, selected: readonly string[]): void
+method SqliteStorage.retainFinalConversionExits(channelId: string, exits: IFinalConversionExits, root: bip32#BIP32Interface): IFinalConversionExits
 method SqliteStorage.revokedHtlcSnapshotStore(): object
 method SqliteStorage.saveActionLog(entry: { category: string; action: string; timestamp: number; data: string; }): void
 method SqliteStorage.saveAnnouncedPeerAddresses(pubkey: string, timestamp: number, addresses: Array<{ host: string; port: number; }>): void
@@ -835,5 +861,5 @@ property WireUpdate.type: beignet/lightning#message.MessageType
 unexported const boundWallet: unique symbol
 unexported function driveFinalSimpleClose(id: string, candidate: IFinalCloseFunding, opening: IFinalOpeningNonces, context: Buffer, authority: FinalOpeningAuthority, root: bip32#BIP32Interface, identity: string, close: IFinalSimpleCloseState, view: IFinalCloseView, req: IFinalCloseRequest): { messages: IFinalOpeningMessage[]; transaction?: Buffer; }
 unexported const finalWalletStorage: unique symbol
-unexported const scopes: readonly [ "splice", "asset-splice", "simple-close", "output-claim", "htlc-timeout", "channel-type" ]
+unexported const scopes: readonly [ "splice", "asset-splice", "simple-close", "output-claim", "htlc-timeout", "channel-type", "conversion" ]
 unexported function verifyAssetSpliceCandidate(layout: IAssetSpliceLayout, acknowledged: Buffer, isInitiator: boolean, frozen: bitcoinjs-lib#Transaction, verified: { layoutDigest: Buffer; transaction: Buffer; fundingRoot: Buffer; proofDigest: Buffer; fundingProofs?: Buffer; }, authorizations: Pair<Buffer>): { terms: IFinalSpliceTerms; candidate: IFinalSpliceCandidate; balances: IAssetSpliceBalancePlan; layoutDigest: Buffer; digest: Buffer; }

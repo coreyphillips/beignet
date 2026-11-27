@@ -55,13 +55,15 @@ export function assetHtlcClaims(
 ): IFinalOutputClaim[] {
 	const { storage } = runtime,
 		{ view, point, state, holder } = match;
+	// A pending conversion's candidate has an empty HTLC ledger (#2151 step 2b).
+	if (match.conversion) return [];
 	if (
 		!storage.canRecoverAssetSplice ||
 		(!view.htlcs.length && (!trimmed || state === 0n))
 	)
 		return [];
 	const opening = storage.loadFinalDaemonOpening(id)!;
-	const history = assetUpdateHistory(storage, id),
+	const history = match.history ?? assetUpdateHistory(storage, id),
 		secured = history.states.get(state),
 		// A peer commitment we signed in an unsecured round names the same obligations.
 		ledger =
@@ -302,13 +304,15 @@ export function assetHtlcClaims(
 				);
 				const context = {
 					walletGeneration: 5 as const,
-					fundingLineage: retainedAssetFundingLineage(
-						storage,
-						id,
-						opening.candidate,
-						Buffer.from(parent.ins[0].hash).reverse().toString('hex'),
-						parent.ins[0].index
-					),
+					fundingLineage:
+						match.lineage?.map((e) => ({ ...e })) ??
+						retainedAssetFundingLineage(
+							storage,
+							id,
+							opening.candidate,
+							Buffer.from(parent.ins[0].hash).reverse().toString('hex'),
+							parent.ins[0].index
+						),
 					candidate: JSON.parse(
 						JSON.stringify(opening.candidate)
 					) as typeof opening.candidate,

@@ -3225,7 +3225,9 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 								config.auxiliaryChannels?.dualFunding,
 								trimmed,
 								(channelId) =>
-									finalDaemon.storage.loadFinalChannelKind(channelId)
+									finalDaemon.storage.loadFinalChannelKind(channelId),
+								// The asset builder is passed, not loaded on use (#2151).
+								{ asset: assetOpeningOutputClaims }
 							)
 					: finalDaemon?.storage.canOpenDualFundedAssets
 					? (id, parent, destination, rate, trimmed) =>

@@ -24,6 +24,16 @@ import { attachFeeInputsToZeroFeeHtlcTx } from './sweep';
 import { satPerVbyteToSatPerKw } from './types';
 import { isDustOutput } from './closing';
 import type { IAuxiliaryDualFunding } from '../channel/asset-opening-provider';
+import type { IFinalCommitmentType } from '../channel/final-opening-commitment';
+import {
+	finalBranchReaders,
+	type IFinalChannelFunding
+} from '../storage/final-branch-readers';
+import {
+	finalSpendBranch,
+	hasFinalBranchRows,
+	spendsBranch
+} from './final-spend-branch';
 
 type AssetClaimBuilder =
 	typeof import('./asset-opening-claims').assetOpeningOutputClaims;
@@ -141,6 +151,12 @@ function keyPathClaim(
  * from the plain builder, an asset channel from the asset builder, and an
  * unknown channel from neither. A wallet that runs both kinds of channel
  * decides per channel, not once per wallet.
+ *
+ * A channel with a `channel-type` record or a conversion exit is claimed by
+ * the branch the commitment spends (#2151 step 2b): the type and era of that
+ * funding output decide the builder and its views, and an outpoint the
+ * channel never had gives no claim. Every other channel takes today's path
+ * after one row count.
  */
 export function finalChannelOutputClaims(
 	runtime: IFinalOpeningRuntime,
@@ -156,10 +172,67 @@ export function finalChannelOutputClaims(
 	builders: {
 		plain?: typeof finalOpeningOutputClaims;
 		asset?: AssetClaimBuilder;
-	} = {}
+	} = {},
+	branch?: IFinalChannelFunding | null
 ): IFinalOutputClaim[] {
-	if (recordedChannelType(runtime.storage, id.toString('hex'))) return [];
-	const kind = kindOf(id.toString('hex'));
+	const channelId = id.toString('hex');
+	const spend =
+		branch !== undefined
+			? branch
+			: hasFinalBranchRows(runtime.storage, channelId)
+			? finalSpendBranch(runtime.storage, channelId, parent)
+			: undefined;
+	if (spend === null) return [];
+	// One claim build reads each source of peer secrets once.
+	const readers = spend && finalBranchReaders(runtime.storage);
+	if (readers)
+		return readers.finalPeerSecretScope(() =>
+			dispatch(
+				spend,
+				kindOf,
+				builders,
+				runtime,
+				id,
+				parent,
+				destination,
+				feeRate,
+				provider,
+				trimmed
+			)
+		);
+	return dispatch(
+		spend,
+		kindOf,
+		builders,
+		runtime,
+		id,
+		parent,
+		destination,
+		feeRate,
+		provider,
+		trimmed
+	);
+}
+
+function dispatch(
+	spend: IFinalChannelFunding | undefined,
+	kindOf: (channelId: string) => 'plain' | 'asset' | null,
+	builders: {
+		plain?: typeof finalOpeningOutputClaims;
+		asset?: AssetClaimBuilder;
+	},
+	runtime: IFinalOpeningRuntime,
+	id: Buffer,
+	parent: Transaction,
+	destination: Buffer,
+	feeRate: number,
+	provider: IAuxiliaryDualFunding | undefined,
+	trimmed:
+		| ((hash: Buffer, htlcId: bigint, preimage?: Buffer) => void)
+		| undefined
+): IFinalOutputClaim[] {
+	const kind = spend ? spend.type : kindOf(id.toString('hex'));
+	const branchArgs: [] | [IFinalChannelFunding] = spend ? [spend] : [];
 	if (kind === 'plain')
 		return (builders.plain ?? finalOpeningOutputClaims)(
 			runtime,
@@ -167,7 +240,8 @@ export function finalChannelOutputClaims(
 			parent,
 			destination,
 			feeRate,
-			trimmed
+			trimmed,
+			...branchArgs
 		);
 	if (kind === 'asset')
 		return (
@@ -176,13 +250,22 @@ export function finalChannelOutputClaims(
 			(
 				require('./asset-opening-claims') as typeof import('./asset-opening-claims')
 			).assetOpeningOutputClaims
-		)(runtime, id, parent, destination, feeRate, provider, trimmed);
+		)(
+			runtime,
+			id,
+			parent,
+			destination,
+			feeRate,
+			provider,
+			trimmed,
+			...branchArgs
+		);
 	return [];
 }
 
 /**
- * A channel with a `channel-type` record is claimed by branch, which is
- * #2151 step 2b; until then its claims are empty (#2151 step 2a).
+ * A channel with a `channel-type` record is claimed by branch (#2151 step
+ * 2b): a builder called without a branch gives it no claims, as in step 2a.
  */
 export function recordedChannelType(
 	storage: IFinalOpeningRuntime['storage'],
@@ -205,7 +288,8 @@ export function finalOpeningOutputClaims(
 	parent: Transaction,
 	destination: Buffer,
 	feeRate: number,
-	trimmed?: (hash: Buffer, htlcId: bigint, preimage?: Buffer) => void
+	trimmed?: (hash: Buffer, htlcId: bigint, preimage?: Buffer) => void,
+	branch?: IFinalChannelFunding
 ): IFinalOutputClaim[] {
 	const storage = runtime.storage;
 	if (
@@ -216,10 +300,46 @@ export function finalOpeningOutputClaims(
 		return [];
 	const channelId = id.toString('hex'),
 		session = storage.loadFinalOpeningSession(channelId);
-	if (recordedChannelType(storage, channelId)) return [];
-	// Plain channels only: an asset channel is claimed by assetOpeningOutputClaims.
-	if (!session || session.assetEvidence) return [];
-	const ledger = storage.loadFinalResolutionStates(channelId);
+	let ledger: ReturnType<typeof storage.loadFinalResolutionStates>;
+	let as: IFinalCommitmentType | undefined;
+	let peerSecret:
+		| ((s: { height: bigint; point: Buffer }) => Buffer | undefined)
+		| undefined;
+	let ownRevoked = (_height: bigint): boolean => false;
+	if (!branch) {
+		if (recordedChannelType(storage, channelId)) return [];
+		// Plain channels only: an asset channel is claimed by assetOpeningOutputClaims.
+		if (!session || session.assetEvidence) return [];
+		ledger = storage.loadFinalResolutionStates(channelId);
+	} else {
+		// A plain branch of any era: its views, its type, and the store's secrets.
+		const readers = finalBranchReaders(storage);
+		if (
+			!session ||
+			!readers ||
+			branch.type !== 'plain' ||
+			!spendsBranch(parent, branch)
+		)
+			return [];
+		if (branch.source === 'conversion') {
+			ledger = conversionResolutionStates(
+				storage,
+				channelId,
+				readers.finalConversion(channelId, branch.digest ?? '')
+			);
+		} else {
+			const era = branch.era ?? 0;
+			ledger = readers.loadFinalEraResolutionStates(channelId, era);
+			peerSecret = (s): Buffer | undefined =>
+				readers.loadFinalPeerSecret(channelId, s.height, s.point).secret ??
+				undefined;
+			ownRevoked = (height): boolean =>
+				readers.finalOwnCommitmentRevoked(channelId, era, height);
+		}
+		as = readers.finalPlainBranchType(channelId, branch);
+		if (!ledger && (branch.source !== 'opening' || session.assetEvidence))
+			return [];
+	}
 	const opening = ledger
 		? undefined
 		: storage.loadFinalDaemonOpening(channelId);
@@ -264,11 +384,18 @@ export function finalOpeningOutputClaims(
 	const local = (states.locals?.length ? states.locals : [states.local]).find(
 		matches
 	);
-	const state:
+	let state:
 		| (typeof states.local & { funding?: IFinalFundingReference })
 		| undefined =
 		local ?? states.revoked.find(matches) ?? states.remote.find(matches);
 	if (!state) return [];
+	// A branch's peer commitment is revoked when any ledger holds its height's
+	// secret; our own commitment revoked since by a later era is never claimed.
+	if (local && ownRevoked(state.height)) return [];
+	if (!local && peerSecret) {
+		const secret = peerSecret(state) ?? state.secret;
+		if (secret) state = { ...state, secret };
+	}
 	const { candidate, terms } = states;
 	const view = buildFinalCommitmentView(
 		candidate,
@@ -278,7 +405,8 @@ export function finalOpeningOutputClaims(
 		state.height,
 		state,
 		state.htlcs,
-		state.funding
+		state.funding,
+		...(as ? [as] : [])
 	);
 	if (view.tx.getId() !== parent.getId())
 		throw new Error('Final commitment does not match its resolution data');
@@ -404,6 +532,51 @@ export function finalOpeningOutputClaims(
 		if (claim) claims.push(claim);
 	}
 	return claims;
+}
+
+/** A pending plain candidate's views: its local and remote commitments at the conversion's height, and no revoked state. */
+function conversionResolutionStates(
+	storage: IFinalOpeningRuntime['storage'],
+	channelId: string,
+	exits: ReturnType<
+		NonNullable<ReturnType<typeof finalBranchReaders>>['finalConversion']
+	>
+): ReturnType<typeof storage.loadFinalResolutionStates> {
+	const opening = storage.loadFinalDaemonOpening(channelId);
+	const branch = exits?.candidate;
+	if (!opening || !exits || branch?.type !== 'plain') return null;
+	const height = BigInt(exits.stateNumber);
+	type View = NonNullable<
+		ReturnType<typeof storage.loadFinalResolutionStates>
+	>['local'];
+	const view = (holder: 'local' | 'remote'): View => {
+		const r = holder === 'local' ? branch.localRecovery : branch.remoteRecovery;
+		return {
+			feeratePerKw: r.feeratePerKw,
+			height,
+			funding: branch.funding,
+			point: Buffer.from(r.point, 'hex'),
+			tx: Buffer.from(
+				holder === 'local' ? branch.localCommitment : branch.remoteCommitment,
+				'hex'
+			),
+			localBalanceMsat: BigInt(r.localBalanceMsat),
+			remoteBalanceMsat: BigInt(r.remoteBalanceMsat),
+			htlcs: [],
+			commitmentSigned: undefined as Buffer | undefined,
+			secret: undefined as Buffer | undefined
+		};
+	};
+	const local = view('local');
+	return {
+		candidate: opening.candidate,
+		terms: opening.session.terms,
+		local,
+		locals: [local],
+		remote: [view('remote')],
+		revoked: [],
+		preimages: []
+	};
 }
 
 export function finalHtlcClaim(params: {

@@ -57,6 +57,26 @@ import {
 	type IFinalUpdateNonce
 } from '../../../src/lightning/storage/final-update-signing';
 import type { SqliteStorage } from '../../../src/lightning/storage/sqlite-storage';
+import type {
+	IAssetOpeningHtlcPayout,
+	IAssetOpeningPayout,
+	IAuxiliaryDualFunding
+} from '../../../src/lightning/channel/asset-opening-provider';
+import type { AssetUpdateChange } from '../../../src/lightning/channel/asset-splice-update-provider';
+import type { IFinalOutputClaim } from '../../../src/lightning/chain/final-output-claims';
+import { sha256 } from '../../../src/lightning/crypto/provider';
+import {
+	encodeUpdateAddHtlcMessage,
+	encodeUpdateFulfillHtlcMessage
+} from '../../../src/lightning/message/channel-update';
+import {
+	assetTypePair,
+	plainTypePair,
+	type IAssetTypePair,
+	type IPlainTypePair,
+	type Scratch
+} from './channel-type-pairs';
+import type { Side } from './final-update-pair';
 
 /** The plain final Taproot type with no SCID alias bit (bit 80 alone). */
 export const PLAIN_TYPE_HEX = '0100000000000000000000';
@@ -777,4 +797,584 @@ export function plainRounds(
 			for (const event of store.loadFinalUpdateDeliveries(id))
 				store.ackFinalUpdateDelivery(id, event.id);
 	}
+}
+
+/** A channel recorded to plain at N = k after k asset rounds (moved from asset-conversion-seeded-ledger.test.ts). */
+export interface IToPlain {
+	pair: IAssetTypePair;
+	c: IConversion;
+	sides: Side[];
+	stores: () => SqliteStorage[];
+	parentExits: Transaction[];
+	id: string;
+	devices: ITypeDevice[];
+}
+export async function toPlain(s: Scratch, k: number): Promise<IToPlain> {
+	const pair: IAssetTypePair = await assetTypePair(s, k);
+	const c = buildConversion(pair.devices, pair.id, {
+		type: 'plain',
+		stateNumber: k,
+		parent: openingParent(pair.devices[0].store, pair.id)
+	});
+	// The asset parent's exit, before the record.
+	const parentExits = pair.devices[0].store
+		.loadFinalFundingExits(pair.id)
+		.map((e) => Transaction.fromBuffer(e.exit));
+	appendBoth(pair.devices, c);
+	const sides: Side[] = pair.p.f.devices.map((d) => d.party);
+	const stores = (): SqliteStorage[] => pair.devices.map((d) => d.store);
+	return {
+		pair,
+		c,
+		sides,
+		stores,
+		parentExits,
+		id: pair.id,
+		devices: pair.devices
+	};
+}
+
+/** A channel recorded to asset at N = k after k plain rounds (moved from asset-conversion-seeded-ledger.test.ts). */
+export interface IToAsset {
+	pair: IPlainTypePair;
+	c: IConversion;
+	id: string;
+	devices: ITypeDevice[];
+}
+export function toAsset(s: Scratch, k: number): IToAsset {
+	const pair: IPlainTypePair = plainTypePair(s, k);
+	const c = buildConversion(pair.devices, pair.id, {
+		type: 'asset',
+		stateNumber: k,
+		parent: openingParent(pair.stores[0], pair.id)
+	});
+	appendBoth(pair.devices, c);
+	return { pair, c, id: pair.id, devices: pair.devices };
+}
+
+/** One asset round at the next height, each device naming the changes from its own side. Returns the height. */
+export async function assetRound(
+	devices: readonly ITypeDevice[],
+	id: string,
+	changes: (i: number) => AssetUpdateChange[],
+	blockHeight = 600000
+): Promise<bigint> {
+	const { assetUpdateTestHost } = await import('./asset-splice-update');
+	const h = assetSpliceUpdateHead(devices[0].store, id).nextNumber;
+	const rounds = devices.map((d, i) =>
+		d.store.assetSpliceUpdateBatch(id, d.root, h, changes(i), () => blockHeight)
+	);
+	const hosts = rounds.map((_, i) => assetUpdateTestHost(i, [], 1));
+	const offers = rounds.map((r) => r.offer());
+	rounds.forEach((r, i) => r.acceptOffer(offers[1 - i]));
+	const joint = (await Promise.all(
+		rounds.map((r, i) => r.signAssetShares(hosts[i]))
+	)) as [Buffer, Buffer];
+	const children = (await Promise.all(
+		rounds.map((r, i) => r.signAssetHtlcs(hosts[i], joint))
+	)) as [Buffer, Buffer];
+	await Promise.all(
+		rounds.map((r, i) => r.verifyAssetShares(hosts[i], joint, children))
+	);
+	const commitments = rounds.map((r) => r.commitments());
+	await Promise.all(
+		rounds.map((r, i) => r.acceptCommitments(hosts[i], commitments[1 - i]))
+	);
+	const revokes = rounds.map((r) => r.revocation());
+	rounds.forEach((r, i) => r.receiveRevocation(revokes[1 - i]));
+	return h;
+}
+
+/** The heights an add-then-settle HTLC round ran at, and its HTLC. */
+export interface IHtlcRound {
+	htlcId: bigint;
+	preimage: Buffer;
+	paymentHash: Buffer;
+	/** The height whose commitments hold the HTLC. */
+	added: bigint;
+	/** The height whose commitments settled it. */
+	settled: bigint;
+}
+export interface IHtlcRoundOptions {
+	amountMsat?: bigint;
+	cltvExpiry?: number;
+	preimage?: Buffer;
+	/** Runs after the add round and before the settle round, while the HTLC is live. */
+	added?: () => void;
+}
+export const HTLC_ASSET_ID = '4c'.repeat(32);
+
+/**
+ * Device 0 offers an asset HTLC in one round and device 1 settles it in the
+ * next, so the commitments of the first round hold the HTLC and the ledger
+ * is quiescent after the second (a record refuses a live HTLC).
+ */
+export async function assetHtlcRound(
+	devices: readonly ITypeDevice[],
+	id: string,
+	o: IHtlcRoundOptions & { units?: bigint } = {}
+): Promise<IHtlcRound> {
+	const preimage = o.preimage ?? Buffer.alloc(32, 0x5e);
+	const paymentHash = sha256(preimage);
+	const htlcId = BigInt(
+		assetSpliceUpdateHead(devices[0].store, id).nextLocalId
+	);
+	const side = (i: number): 'local' | 'peer' => (i === 0 ? 'local' : 'peer');
+	const added = await assetRound(devices, id, (i) => [
+		{
+			kind: 'add',
+			htlc: {
+				offeredBy: side(i),
+				id: htlcId,
+				amountMsat: o.amountMsat ?? 5000000n,
+				cltvExpiry: o.cltvExpiry ?? 601000,
+				paymentHash,
+				allocations: [{ assetId: HTLC_ASSET_ID, units: o.units ?? 3n }]
+			}
+		}
+	]);
+	o.added?.();
+	const settled = await assetRound(devices, id, (i) => [
+		{ kind: 'fulfill', offeredBy: side(i), id: htlcId, preimage }
+	]);
+	return { htlcId, preimage, paymentHash, added, settled };
+}
+
+/** The plain counterpart: device 0 adds an HTLC in one round and device 1 fulfills it in the next. */
+export function plainHtlcRound(
+	devices: readonly ITypeDevice[],
+	id: string,
+	o: IHtlcRoundOptions = {}
+): IHtlcRound {
+	const stores = devices.map((d) => d.store);
+	const preimage = o.preimage ?? Buffer.alloc(32, 0x6e);
+	const paymentHash = sha256(preimage);
+	const state = (
+		stores[0] as unknown as {
+			finalUpdateView(id: string): { state: IFinalLedgerState } | null;
+		}
+	).finalUpdateView(id)?.state;
+	const htlcId = BigInt(state?.nextLocalId ?? '0');
+	const channelId = Buffer.from(id, 'hex');
+	const stage = (from: number, type: M, wire: Buffer): void => {
+		stores[from].stageFinalHtlcUpdate(id, 'local', type, wire);
+		stores[1 - from].stageFinalHtlcUpdate(id, 'peer', type, wire);
+	};
+	const exchange = (from: number): void => {
+		const sig = stores[from].signFinalUpdateCommitment(id, devices[from].root);
+		const ack = stores[1 - from].acceptFinalUpdateCommitment(
+			id,
+			devices[1 - from].root,
+			sig
+		);
+		stores[from].acceptFinalUpdateRevocation(id, ack);
+	};
+	const deliver = (): void => {
+		for (const store of stores)
+			for (const event of store.loadFinalUpdateDeliveries(id))
+				store.ackFinalUpdateDelivery(id, event.id);
+	};
+	const height = (): bigint => stores[0].loadFinalUpdateStatus(id)!.localHeight;
+	stage(
+		0,
+		M.UPDATE_ADD_HTLC,
+		encodeUpdateAddHtlcMessage({
+			channelId,
+			id: htlcId,
+			amountMsat: o.amountMsat ?? 8000000n,
+			paymentHash,
+			cltvExpiry: o.cltvExpiry ?? 1100,
+			onionRoutingPacket: Buffer.alloc(1366)
+		})
+	);
+	exchange(0);
+	exchange(1);
+	deliver();
+	const added = height();
+	o.added?.();
+	stage(
+		1,
+		M.UPDATE_FULFILL_HTLC,
+		encodeUpdateFulfillHtlcMessage({
+			channelId,
+			id: htlcId,
+			paymentPreimage: preimage
+		})
+	);
+	exchange(1);
+	exchange(0);
+	deliver();
+	return { htlcId, preimage, paymentHash, added, settled: height() };
+}
+
+/** A recovery host that records what the asset builders hand it and recovers nothing. */
+export interface IRecordingHost {
+	host: IAuxiliaryDualFunding;
+	outputs: IAssetOpeningPayout[];
+	htlcs: IAssetOpeningHtlcPayout[];
+}
+export function recordingHost(): IRecordingHost {
+	const outputs: IAssetOpeningPayout[] = [],
+		htlcs: IAssetOpeningHtlcPayout[] = [];
+	const host = {
+		assetSpliceRecoveryVersion: 1,
+		outputRecoveryReceipt: (
+			_channelId: string,
+			_parentTxid: string,
+			_outputIndex: number,
+			payout: Transaction
+		): Buffer => Buffer.from(payout.getId(), 'hex'),
+		restoreOutputReceipt: async (): Promise<void> => {},
+		async recoverOutput(ctx: IAssetOpeningPayout): Promise<null> {
+			outputs.push(ctx);
+			return null;
+		},
+		async recoverHtlc(ctx: IAssetOpeningHtlcPayout): Promise<null> {
+			htlcs.push(ctx);
+			return null;
+		}
+	} as unknown as IAuxiliaryDualFunding;
+	return { host, outputs, htlcs };
+}
+
+/** A claim list as plain data, every transaction as its bytes, for byte-for-byte comparison. */
+export function claimBytes(claims: readonly IFinalOutputClaim[]): unknown[] {
+	return claims.map((c) => ({
+		outputIndex: c.outputIndex,
+		relativeDelay: c.relativeDelay,
+		absoluteHeight: c.absoluteHeight,
+		tx: c.tx ? c.tx.toHex() : null,
+		confirmedOnly: !!c.confirmedOnly,
+		assetBalanceOutput: !!c.assetBalanceOutput,
+		sponsor: !!c.sponsor,
+		paymentHash: c.paymentHash ? c.paymentHash.toString('hex') : null,
+		htlcId: c.htlcId === undefined ? null : String(c.htlcId),
+		recover: typeof c.recover === 'function',
+		matchesAssetPayout: typeof c.matchesAssetPayout === 'function',
+		confirmAssetPayout: typeof c.confirmAssetPayout === 'function',
+		child: typeof c.child === 'function'
+	}));
+}
+/** Whether a claim carries any of the asset-only reporting of section 5. */
+export function assetReporting(c: IFinalOutputClaim): boolean {
+	return (
+		!!c.assetBalanceOutput ||
+		!!c.matchesAssetPayout ||
+		!!c.confirmAssetPayout ||
+		!!c.recover
+	);
+}
+
+/** One funding output a channel has had (step 2b, section 1 and the amendment). */
+export interface IFinalChannelFunding {
+	txid: string;
+	outputIndex: number;
+	type: ChannelKind;
+	era?: number;
+	source: 'opening' | 'record' | 'plain-splice' | 'asset-splice' | 'conversion';
+	parent?: { txid: string; outputIndex: number };
+	digest?: string;
+}
+export interface IPlainHolderRecovery {
+	point: string;
+	localBalanceMsat: string;
+	remoteBalanceMsat: string;
+	feeratePerKw: number;
+	htlcs: [];
+}
+export interface IPlainExitBranch {
+	type: 'plain';
+	channelType: string;
+	minimumDepth: number;
+	funding: IFinalFundingReference;
+	fundingTxid: string;
+	outputIndex: number;
+	localCommitment: string;
+	remoteCommitment: string;
+	localRecovery: IPlainHolderRecovery;
+	remoteRecovery: IPlainHolderRecovery;
+}
+/** A conversion's asset branch carries the feerate its commitments were signed at. */
+export type IFinalExitBranch =
+	| ({ type: 'asset'; feeratePerKw: number } & IAssetSpliceExitBranch)
+	| IPlainExitBranch;
+/** The `conversion-exits` event a writer takes. */
+export interface IConversionExits {
+	stateNumber: string;
+	digest: string;
+	parent: IFinalExitBranch;
+	candidate: IFinalExitBranch;
+}
+export interface IPeerSecret {
+	secret: Buffer | null;
+	conflict: boolean;
+}
+type Resolution = NonNullable<
+	ReturnType<SqliteStorage['loadFinalResolutionStates']>
+>;
+type AssetHistory = ReturnType<typeof assetUpdateHistory>;
+
+/**
+ * The step 2b names, reached loosely so the test files load on a base
+ * without them and each test fails at its first use of a missing name. Where
+ * the contract leaves a detail open, the assumption is made here only:
+ * - heights are passed to the secret readers as bigint;
+ * - finalSpendBranch is a named export of src/lightning/chain/final-spend-branch.ts,
+ *   assetEraHistory of storage/asset-update-history.ts;
+ * - selectedFinalExit is the private SqliteStorage method of today, given the
+ *   opening record and the outpoint.
+ */
+export interface IStep2b {
+	finalChannelFundings(
+		store: SqliteStorage,
+		id: string
+	): IFinalChannelFunding[];
+	finalSpendBranch(
+		store: SqliteStorage,
+		id: string,
+		spend: Transaction
+	): IFinalChannelFunding | null;
+	loadFinalEraResolutionStates(
+		store: SqliteStorage,
+		id: string,
+		era: number
+	): Resolution | null;
+	assetEraHistory(store: SqliteStorage, id: string, era: number): AssetHistory;
+	loadFinalPeerSecret(
+		store: SqliteStorage,
+		id: string,
+		height: bigint,
+		point: Buffer
+	): IPeerSecret;
+	loadFinalPeerSecrets(store: SqliteStorage, id: string): Map<bigint, Buffer>;
+	retainFinalConversionExits(
+		store: SqliteStorage,
+		id: string,
+		exits: IConversionExits,
+		root: BIP32Interface
+	): unknown;
+	releaseFinalConversionExits(
+		store: SqliteStorage,
+		id: string,
+		digest: string
+	): unknown;
+	selectedFinalExit(
+		store: SqliteStorage,
+		id: string,
+		fundingTxid: Buffer,
+		outputIndex: number
+	): string;
+}
+export function step2b(): IStep2b {
+	const load = (from: string): Record<string, unknown> => {
+		try {
+			return require('../../../src/lightning/' + from) as Record<
+				string,
+				unknown
+			>;
+		} catch {
+			return {};
+		}
+	};
+	const fn = (
+		from: Record<string, unknown>,
+		name: string
+	): ((...args: unknown[]) => unknown) => {
+		const f = from[name];
+		if (typeof f !== 'function')
+			throw new TypeError(name + ' is not a function');
+		return f as (...args: unknown[]) => unknown;
+	};
+	const method =
+		(name: string): ((store: SqliteStorage, ...args: unknown[]) => never) =>
+		(store: SqliteStorage, ...args: unknown[]): never =>
+			fn(store as unknown as Record<string, unknown>, name).apply(
+				store,
+				args
+			) as never;
+	return {
+		finalChannelFundings: method('finalChannelFundings'),
+		finalSpendBranch: (store, id, spend) =>
+			fn(load('chain/final-spend-branch'), 'finalSpendBranch')(
+				store,
+				id,
+				spend
+			) as IFinalChannelFunding | null,
+		loadFinalEraResolutionStates: method('loadFinalEraResolutionStates'),
+		assetEraHistory: (store, id, era) =>
+			fn(load('storage/asset-update-history'), 'assetEraHistory')(
+				store,
+				id,
+				era
+			) as AssetHistory,
+		loadFinalPeerSecret: method('loadFinalPeerSecret'),
+		loadFinalPeerSecrets: method('loadFinalPeerSecrets'),
+		retainFinalConversionExits: method('retainFinalConversionExits'),
+		releaseFinalConversionExits: method('releaseFinalConversionExits'),
+		selectedFinalExit: (store, id, fundingTxid, outputIndex): string => {
+			const loose = store as unknown as {
+				finalOpeningRecord(id: string): unknown;
+				selectedFinalExit(
+					record: unknown,
+					requested: undefined,
+					fundingTxid: Buffer,
+					fundingOutputIndex: number
+				): string;
+			};
+			return loose.selectedFinalExit(
+				loose.finalOpeningRecord(id),
+				undefined,
+				fundingTxid,
+				outputIndex
+			);
+		}
+	};
+}
+
+/** An outpoint as the fundings name it. */
+export function outpoint(
+	tx: Transaction,
+	outputIndex: number
+): { txid: string; outputIndex: number } {
+	return { txid: tx.getId(), outputIndex };
+}
+
+/** The asset parent branch: the current asset ledger's member at height n. */
+export function assetParentBranch(
+	store: SqliteStorage,
+	id: string,
+	n: number
+): IFinalExitBranch {
+	const state = assetUpdateHistory(store, id).states.get(BigInt(n));
+	if (!state) throw new Error('fixture: no secured asset state at ' + n);
+	return { type: 'asset', feeratePerKw: state.feerate, ...state.members[0] };
+}
+
+/** The plain parent branch: the current plain ledger's commitments at its height, on the opening's funding. */
+export function plainParentBranch(
+	store: SqliteStorage,
+	id: string
+): IFinalExitBranch {
+	const opening = openingOf(store, id);
+	const c = opening.candidate;
+	const states = store.loadFinalResolutionStates(id);
+	if (!states || states.remote.length !== 1)
+		throw new Error('fixture: plain ledger not at one height');
+	const recovery = (s: Resolution['local']): IPlainHolderRecovery => ({
+		point: s.point.toString('hex'),
+		localBalanceMsat: String(s.localBalanceMsat),
+		remoteBalanceMsat: String(s.remoteBalanceMsat),
+		feeratePerKw: s.feeratePerKw,
+		htlcs: []
+	});
+	const [exit] = store.loadFinalFundingExits(id);
+	const tx = Transaction.fromHex(c.fundingTxHex);
+	return {
+		type: 'plain',
+		channelType: c.channelType,
+		minimumDepth: c.minimumDepth,
+		funding: {
+			fundingTxHex: c.fundingTxHex,
+			fundingOutputIndex: c.fundingOutputIndex,
+			localFundingPubkey: c.localFundingPubkey,
+			remoteFundingPubkey: c.remoteFundingPubkey,
+			localFundingKeyIndex: opening.session.channelKeyIndex
+		},
+		fundingTxid: tx.getId(),
+		outputIndex: c.fundingOutputIndex,
+		localCommitment: exit.exit.toString('hex'),
+		remoteCommitment: states.remote[0].tx.toString('hex'),
+		localRecovery: recovery(states.local),
+		remoteRecovery: recovery(states.remote[0])
+	};
+}
+
+/** Device i's candidate branch: the new type's commitments at N that a conversion `c` signed on its funding. */
+export function candidateBranch(
+	devices: readonly ITypeDevice[],
+	c: IConversion,
+	i: number
+): IFinalExitBranch {
+	const seed = c.inputs[i].seed;
+	if (c.type === 'asset') {
+		const asset = seed as IFinalAssetSeedInput;
+		return { type: 'asset', feeratePerKw: asset.feerate, ...asset.members[0] };
+	}
+	const plain = seed as IFinalPlainSeedInput;
+	const recovery = (holder: number): IPlainHolderRecovery => ({
+		point: c.point(holder, c.stateNumber).toString('hex'),
+		localBalanceMsat: String(c.balances[i].localBalanceMsat),
+		remoteBalanceMsat: String(c.balances[i].remoteBalanceMsat),
+		feeratePerKw: plain.funds.feeratePerKw ?? 0,
+		htlcs: []
+	});
+	return {
+		type: 'plain',
+		channelType: PLAIN_TYPE_HEX,
+		minimumDepth: openingOf(devices[i].store, c.id).candidate.minimumDepth,
+		funding: c.refs[i],
+		fundingTxid: c.tx.getId(),
+		outputIndex: 0,
+		localCommitment: plain.local.tx,
+		remoteCommitment: plain.remote.tx,
+		localRecovery: recovery(i),
+		remoteRecovery: recovery(1 - i)
+	};
+}
+
+/** The digest the tests give a pending conversion (Step 4 computes the real one). */
+export const CONVERSION_DIGEST = 'd1'.repeat(32);
+
+/** Each device's conversion exits for a candidate `c` of the other type on the live funding. */
+export function conversionExits(
+	devices: readonly ITypeDevice[],
+	c: IConversion,
+	parents: readonly IFinalExitBranch[],
+	digest = CONVERSION_DIGEST
+): [IConversionExits, IConversionExits] {
+	return devices.map((_, i) => ({
+		stateNumber: String(c.stateNumber),
+		digest,
+		parent: parents[i],
+		candidate: candidateBranch(devices, c, i)
+	})) as [IConversionExits, IConversionExits];
+}
+
+/** Retain each device's exits, as Step 4 will. */
+export function retainBoth(
+	devices: readonly ITypeDevice[],
+	id: string,
+	exits: readonly IConversionExits[]
+): void {
+	devices.forEach((d, i) =>
+		step2b().retainFinalConversionExits(d.store, id, exits[i], d.root)
+	);
+}
+
+/** The secret device `peer` reveals for height h, and its point. */
+export function revealedSecret(
+	devices: readonly ITypeDevice[],
+	id: string,
+	peer: number,
+	h: number | bigint
+): { secret: Buffer; point: Buffer } {
+	const index =
+		devices[peer].store.loadFinalOpeningSession(id)!.channelKeyIndex;
+	const secret = generateFromSeed(
+		deriveChannelKeys(devices[peer].root, 1, index).perCommitmentSeed,
+		MAX_INDEX - BigInt(h)
+	);
+	return { secret, point: getPublicKey(secret) };
+}
+
+/** Device i's signed exit of the current height, as the peer would publish it. */
+export function exitOf(device: ITypeDevice, id: string): Transaction {
+	const [exit] = device.store.loadFinalFundingExits(id);
+	if (!exit) throw new Error('fixture: no exit');
+	return Transaction.fromBuffer(exit.exit);
+}
+
+/** The outputs of a commitment that carry value (anchors excluded). */
+export function valueOutputs(tx: Transaction): number[] {
+	return tx.outs.flatMap((o, i) => (o.value > 330 ? [i] : []));
 }

@@ -22,9 +22,31 @@ import {
 import { AssetSpliceUpdateBatch } from '../channel/asset-splice-update-batch';
 import type { AssetUpdateChange } from '../channel/asset-splice-update-provider';
 import {
+	assetEraHistory,
 	assetSpliceUpdateHead,
 	assetUpdateHistory
 } from './asset-update-history';
+import {
+	branchCommitmentType,
+	canonicalFinalConversionExits,
+	conversionRecoveryView,
+	conversionViewContext,
+	verifyPlainBranchWitness,
+	type FinalConversionEvent,
+	type IFinalConversionExits,
+	type IPlainExitBranch
+} from './final-conversion-exits';
+import {
+	noteFinalPeerSecretConflict,
+	shachainSecret,
+	shachainSecrets,
+	type IFinalPeerSecret
+} from './final-peer-secrets';
+import {
+	registerFinalBranchReaders,
+	type IFinalChannelFunding
+} from './final-branch-readers';
+import type { IFinalCommitmentType } from '../channel/final-opening-commitment';
 import { releasedAssetSplice } from './asset-splice-release-replay';
 import { AssetSpliceSignatureRound } from '../channel/asset-splice-signature-round';
 import type {
@@ -42,6 +64,7 @@ import {
 import type { IFinalFundingReference } from '../channel/final-splice-candidate';
 import {
 	FinalDeviceJournal,
+	finalJournalScopes,
 	type IFinalJournalHead,
 	checkFinalLifecycleBackup
 } from './final-device-journal';
@@ -912,6 +935,23 @@ export class SqliteStorage implements IStorageBackend {
 		// sidecars with the database file's own bits, so tightening the main
 		// file first covers them from the start.
 		if (!this.walletIdentity) this._restrictFileModes();
+		// The claim builders reach the private branch readers here (#2151).
+		registerFinalBranchReaders(this, {
+			finalBranchRows: (id) => this.finalBranchRows(id),
+			finalChannelFundings: (id) => this.finalChannelFundings(id),
+			loadFinalEraResolutionStates: (id, era) =>
+				this.loadFinalEraResolutionStates(id, era),
+			loadFinalPeerSecret: (id, height, point) =>
+				this.loadFinalPeerSecret(id, height, point),
+			finalConversion: (id, digest) => this.finalConversion(id, digest),
+			finalEraRecords: (id) => this.finalEraRecords(id),
+			finalPlainBranchType: (id, branch) =>
+				this.finalPlainBranchType(id, branch),
+			finalOwnCommitmentRevoked: (id, era, height) =>
+				this.finalOwnCommitmentRevoked(id, era, height),
+			loadFinalPeerSecrets: (id) => this.loadFinalPeerSecrets(id),
+			finalPeerSecretScope: (run) => this.finalPeerSecretScope(run)
+		});
 	}
 
 	/** Initialize a separate physical format for a newly generated wallet. */
@@ -1266,7 +1306,11 @@ export class SqliteStorage implements IStorageBackend {
 			throw new Error('Asset opening repair was not persisted');
 		this.loadAllChannels();
 
-		this.finalJournal().reconcile(id, this.supportsAssetSpliceRecovery);
+		this.finalJournal().reconcile(
+			id,
+			this.supportsAssetSpliceRecovery,
+			finalJournalScopes(this.supportsAssetConversion)
+		);
 		return !current;
 	}
 
@@ -1321,7 +1365,11 @@ export class SqliteStorage implements IStorageBackend {
 			if (storage.assetSpliceWallet) {
 				const journal = storage.finalJournal();
 				for (const c of storage.loadFinalOpenings())
-					journal.reconcile(c.channelId, storage.supportsAssetSpliceRecovery);
+					journal.reconcile(
+						c.channelId,
+						storage.supportsAssetSpliceRecovery,
+						finalJournalScopes(storage.supportsAssetConversion)
+					);
 			}
 			storage.channelTypesReady = storage.openingAuthority !== null;
 			storage.reconcileFinalUpdateOpenings();
@@ -1543,7 +1591,8 @@ export class SqliteStorage implements IStorageBackend {
 			for (const candidate of this.loadFinalOpenings())
 				journal.reconcile(
 					candidate.channelId,
-					this.supportsAssetSpliceRecovery
+					this.supportsAssetSpliceRecovery,
+					finalJournalScopes(this.supportsAssetConversion)
 				);
 		}
 		await backUpWalletFile(
@@ -2020,7 +2069,18 @@ export class SqliteStorage implements IStorageBackend {
 		// The device slot commits before the wallet row, so a failure between
 		// them leaves a durable record that the next authenticated read pulls in.
 		this.channelTypes.delete(channelId);
-		journal.append('channel-type', channelId, head, record);
+		try {
+			journal.append('channel-type', channelId, head, record);
+		} catch (e) {
+			// Pull a committed device slot in now, since the claim fast path
+			// counts the wallet's rows (#2151 step 2b).
+			try {
+				journal.read('channel-type', channelId);
+			} catch {
+				// The rethrown error below is the one the caller needs.
+			}
+			throw e;
+		}
 		return copyJson(record);
 	}
 
@@ -2305,6 +2365,791 @@ export class SqliteStorage implements IStorageBackend {
 		);
 	}
 
+	/**
+	 * The rows that take a channel off the claim fast path (#2151 step 2b): one
+	 * count of its `channel-type` and `conversion` rows, or of the `conversion`
+	 * rows alone, in generation 6 only. No other generation runs a query.
+	 */
+	private finalBranchRows(channelId: string, scope?: 'conversion'): number {
+		if (!this.supportsAssetConversion || !/^[0-9a-f]{64}$/.test(channelId))
+			return 0;
+		return (
+			(scope
+				? this._stmt(
+						"SELECT COUNT(*) AS n FROM final_lifecycle_log WHERE scope = 'conversion' AND channel_id = ?"
+				  )
+				: this._stmt(
+						"SELECT COUNT(*) AS n FROM final_lifecycle_log WHERE scope IN ('channel-type', 'conversion') AND channel_id = ?"
+				  )
+			).get(channelId) as { n: number }
+		).n;
+	}
+
+	/** The retained conversions, each with whether Step 4 released it; read only behind the row count. */
+	private finalConversions(
+		channelId: string
+	): (IFinalConversionExits & { released: boolean })[] {
+		if (!this.finalBranchRows(channelId, 'conversion')) return [];
+		const events = this.finalJournal().read<FinalConversionEvent>(
+			'conversion',
+			channelId
+		).records;
+		const released = new Set(
+			events.flatMap((e) =>
+				e.kind === 'conversion-released' ? [e.digest] : []
+			)
+		);
+		return events.flatMap((e) =>
+			e.kind === 'conversion-exits'
+				? [
+						{
+							stateNumber: e.stateNumber,
+							digest: e.digest,
+							parent: e.parent,
+							candidate: e.candidate,
+							released: released.has(e.digest)
+						}
+				  ]
+				: []
+		);
+	}
+	private finalConversion(
+		channelId: string,
+		digest: string
+	): IFinalConversionExits | null {
+		const found = this.finalConversions(channelId).find(
+			(c) => c.digest === digest
+		);
+		if (!found) return null;
+		const { released: _released, ...exits } = found;
+		return copyJson(exits);
+	}
+	/** Conversions whose candidate no record adopted. */
+	private pendingFinalConversions(
+		channelId: string
+	): (IFinalConversionExits & { released: boolean })[] {
+		// The row count first, so no other generation runs a query here.
+		const conversions = this.finalConversions(channelId);
+		if (!conversions.length) return [];
+		const records = this.channelTypeState(channelId)?.records ?? [];
+		const adopted = new Set(
+			records.map((r) => {
+				const o = outpointOf(r.funding);
+				return o.txid + ':' + o.outputIndex;
+			})
+		);
+		return conversions.filter(
+			(c) =>
+				!adopted.has(c.candidate.fundingTxid + ':' + c.candidate.outputIndex)
+		);
+	}
+
+	/**
+	 * Every funding output the channel ever had, each with the type and era
+	 * whose rules claim a commitment on it (#2151 step 2b). @internal: the
+	 * claim dispatcher reaches it through storage/final-branch-readers.ts. The
+	 * splice journals are read directly, without the gates of the live
+	 * readers, which refuse after a record or for a plain opening.
+	 */
+	private finalChannelFundings(channelId: string): IFinalChannelFunding[] {
+		const opening = this.finalOpeningRecord(channelId);
+		const state = opening && this.channelTypeState(channelId);
+		if (!opening || !state) return [];
+		const key = (o: { txid: string; outputIndex: number }): string =>
+			o.txid + ':' + o.outputIndex;
+		const out: IFinalChannelFunding[] = [];
+		const known = new Map<string, IFinalChannelFunding>();
+		const add = (f: IFinalChannelFunding): void => {
+			if (known.has(key(f))) return;
+			known.set(key(f), f);
+			out.push(f);
+		};
+		add({
+			...outpointOf(opening.candidate),
+			type: state.openingAsset ? 'asset' : 'plain',
+			era: 0,
+			source: 'opening'
+		});
+		const records = state.records.map(
+			(r, i): IFinalChannelFunding => ({
+				...outpointOf(r.funding),
+				type: r.type,
+				era: i + 1,
+				source: 'record',
+				parent: { txid: r.parent.txid, outputIndex: r.parent.outputIndex }
+			})
+		);
+		const recorded = new Map(records.map((r) => [key(r), r]));
+		const lookup = (o: {
+			txid: string;
+			outputIndex: number;
+		}): IFinalChannelFunding | undefined =>
+			known.get(key(o)) ?? recorded.get(key(o));
+		const inherit = (
+			o: { txid: string; outputIndex: number },
+			parent: IFinalChannelFunding,
+			source: 'plain-splice' | 'asset-splice'
+		): void =>
+			add({
+				...o,
+				type: parent.type,
+				era: parent.era,
+				source,
+				parent: { txid: parent.txid, outputIndex: parent.outputIndex }
+			});
+		if (this.updateWallet)
+			for (const a of finalSpliceAttempts(
+				channelId,
+				this.finalJournal().read<FinalSpliceEvent>('splice', channelId).records
+			)) {
+				if (!a.candidate) continue;
+				// Splice attempts store no parent: it is the known funding the
+				// candidate's funding transaction spends.
+				const parent = Transaction.fromHex(a.candidate.funding.fundingTxHex)
+					.ins.map((i) =>
+						lookup({
+							txid: Buffer.from(i.hash).reverse().toString('hex'),
+							outputIndex: i.index
+						})
+					)
+					.find((f) => f);
+				if (parent)
+					inherit(outpointOf(a.candidate.funding), parent, 'plain-splice');
+			}
+		if (
+			this.assetSpliceWallet &&
+			(state.openingAsset || state.records.some((r) => r.type === 'asset'))
+		)
+			for (const e of this.finalJournal().read<AssetSpliceExitEvent>(
+				'asset-splice',
+				channelId
+			).records) {
+				if (e.kind !== 'exit-proofs') continue;
+				const parent = lookup({
+					txid: e.evidence.parent.fundingTxid,
+					outputIndex: e.evidence.parent.outputIndex
+				});
+				if (parent)
+					inherit(
+						{
+							txid: e.evidence.candidate.fundingTxid,
+							outputIndex: e.evidence.candidate.outputIndex
+						},
+						parent,
+						'asset-splice'
+					);
+			}
+		// Where a record's funding is a conversion's candidate, the record wins.
+		for (const c of this.finalConversions(channelId)) {
+			const o = {
+				txid: c.candidate.fundingTxid,
+				outputIndex: c.candidate.outputIndex
+			};
+			if (recorded.has(key(o))) continue;
+			add({
+				txid: c.candidate.fundingTxid,
+				outputIndex: c.candidate.outputIndex,
+				type: c.candidate.type,
+				source: 'conversion',
+				parent: {
+					txid: c.parent.fundingTxid,
+					outputIndex: c.parent.outputIndex
+				},
+				digest: c.digest
+			});
+		}
+		for (const r of records) add(r);
+		return out;
+	}
+
+	/** The records, oldest first, which bound each era. */
+	private finalEraRecords(channelId: string): IFinalChannelTypeRecord[] {
+		return copyJson(this.channelTypeState(channelId)?.records ?? []);
+	}
+
+	/**
+	 * A plain era's views, in the shape loadFinalResolutionStates returns
+	 * (#2151 step 2b). The current era is that reader. A past era walks its
+	 * own segment of the plain log, with its own context: the opening's for
+	 * era 0, the record's funding and type for a seeded era.
+	 */
+	private loadFinalEraResolutionStates(
+		channelId: string,
+		era: number
+	): ReturnType<SqliteStorage['loadFinalResolutionStates']> {
+		const record = this.finalOpeningRecord(channelId);
+		const state = record && this.channelTypeState(channelId);
+		if (
+			!record ||
+			!state ||
+			!this.canUpdateFinalCommitments ||
+			!Number.isSafeInteger(era) ||
+			era < 0 ||
+			era > state.records.length
+		)
+			return null;
+		const typeRecord = era ? state.records[era - 1] : undefined;
+		if (
+			(typeRecord
+				? typeRecord.type
+				: state.openingAsset
+				? 'asset'
+				: 'plain') !== 'plain'
+		)
+			return null;
+		if (era === state.records.length)
+			return this.loadFinalResolutionStates(channelId);
+		const base = this.finalUpdateContext(record);
+		const evidence = record.nonces.session?.assetEvidence;
+		const ctx = typeRecord
+			? withFunding(
+					{
+						...base,
+						channelType: typeRecord.channelType,
+						...(evidence && {
+							openingRoot: Buffer.from(evidence.fundingRoot, 'hex')
+						}),
+						recordStateNumber: Number(typeRecord.stateNumber)
+					},
+					typeRecord.funding
+			  )
+			: base;
+		const recordFundings = new Set(
+			state.records.map((r) => r.funding.fundingTxHex)
+		);
+		// Ledger events belong to the era of the funding they were signed on.
+		const segment = [
+			...finalJournalHistory(this.db, channelId, record.nonceKey)
+		].filter((s) =>
+			typeRecord
+				? s.funding?.fundingTxHex === typeRecord.funding.fundingTxHex
+				: !s.funding || !recordFundings.has(s.funding.fundingTxHex)
+		);
+		const last =
+			segment.at(-1) ??
+			(typeRecord &&
+				seedFinalLedger({
+					candidate: record.candidate,
+					nonces: record.nonces,
+					record: typeRecord,
+					peerPoints: this.eraSeedPeerPoints(record, typeRecord, era)
+				}));
+		if (!last) return null;
+		const attempts = typeRecord
+			? []
+			: finalSpliceAttempts(
+					channelId,
+					this.finalJournal().read<FinalSpliceEvent>('splice', channelId)
+						.records
+			  );
+		const all = [finalResolutionStates(ctx, last, segment)];
+		for (const [txid, slot] of Object.entries(last.alternatives ?? {}))
+			all.push(
+				finalResolutionStates(
+					withFunding(ctx, slot.funding!),
+					slot,
+					segment.flatMap((s) =>
+						s.alternatives?.[txid] ? [s.alternatives[txid]] : []
+					)
+				)
+			);
+		const revoked = all.flatMap((v) => v.revoked);
+		const secrets = new Map(revoked.map((v) => [v.height, v.secret!]));
+		const remote = all
+			.flatMap((v) => v.remote)
+			.filter((tx) => {
+				const secret = secrets.get(tx.height);
+				if (!secret) return true;
+				revoked.push({ ...tx, secret });
+				return false;
+			});
+		const latest = all.reduce(
+			(h, v) => (v.local.height > h ? v.local.height : h),
+			0n
+		);
+		const released = new Set([
+			...attempts.map((a) => releasedFinalSpliceFunding(a)?.fundingTxHex),
+			typeRecord?.funding.fundingTxHex
+		]);
+		const current = all.find((v) => v.local.height === latest) ?? all[0];
+		return {
+			...current,
+			locals: all
+				.map((v) => v.local)
+				.filter(
+					(v) =>
+						v.height === latest &&
+						(!v.funding || released.has(v.funding.fundingTxHex))
+				),
+			remote,
+			revoked,
+			preimages: [
+				...new Map(
+					all
+						.flatMap((v) => v.preimages)
+						.map((preimage) => [preimage.toString('hex'), preimage])
+				).values()
+			]
+		};
+	}
+
+	/** The peer's points at a past seeded plain era's N and N + 1, from the asset era before it. */
+	private eraSeedPeerPoints(
+		opening: IFinalOpeningRecord,
+		r: IFinalChannelTypeRecord,
+		era: number
+	): [Buffer, Buffer] {
+		const n = BigInt(r.stateNumber);
+		const seed = r.seed as IFinalPlainSeed;
+		const terms = opening.nonces.session!.terms;
+		const history = assetEraHistory(this, opening.candidate.channelId, era - 1);
+		const prior =
+			era > 1
+				? this.channelTypeState(opening.candidate.channelId)?.records[era - 2]
+				: undefined;
+		const member =
+			history.states.get(n)?.members[0] ??
+			(prior && BigInt(prior.stateNumber) === n
+				? (prior.seed as IFinalAssetSeed).members[0]
+				: undefined);
+		const point =
+			member?.remoteRecovery.point ??
+			(n === 0n ? terms.remoteBasepoints.firstPerCommitmentPoint : undefined);
+		const raw = seed.peerRevoke ?? history.stages.get(n + '/peer-revoke');
+		const peerNext =
+			(raw &&
+				decodeRevokeAndAckMessage(Buffer.from(raw, 'hex'), {
+					finalTaproot: true
+				}).nextPerCommitmentPoint.toString('hex')) ||
+			(n === 0n ? opening.nonces.session!.remoteSecondPerCommitmentPoint : '');
+		if (!point || !peerNext)
+			throw new Error('Missing peer points for the channel type record');
+		return [Buffer.from(point, 'hex'), Buffer.from(peerNext, 'hex')];
+	}
+
+	/** The type a plain branch's builder passes, or none when it is the opening's own plain type. */
+	private finalPlainBranchType(
+		channelId: string,
+		branch: IFinalChannelFunding
+	): IFinalCommitmentType | undefined {
+		const record = this.finalOpeningRecord(channelId);
+		if (!record) return undefined;
+		const evidence = record.nonces.session?.assetEvidence;
+		const candidate =
+			branch.source === 'conversion'
+				? this.finalConversion(channelId, branch.digest ?? '')?.candidate
+				: undefined;
+		const channelType = candidate
+			? (candidate as IPlainExitBranch).channelType
+			: branch.era
+			? this.channelTypeState(channelId)?.records[branch.era - 1]?.channelType
+			: record.candidate.channelType;
+		if (!channelType) return undefined;
+		if (!evidence && channelType === record.candidate.channelType)
+			return undefined;
+		return branchCommitmentType(
+			channelType,
+			evidence && Buffer.from(evidence.fundingRoot, 'hex')
+		);
+	}
+
+	/** Our own commitment at `height` of a past era, revoked since by the current ledger. */
+	private finalOwnCommitmentRevoked(
+		channelId: string,
+		era: number,
+		height: bigint
+	): boolean {
+		const state = this.channelTypeState(channelId);
+		if (!state || era >= state.records.length) return false;
+		const current = state.current.type;
+		const local =
+			current === 'plain'
+				? this.loadFinalUpdateStatus(channelId)?.localHeight ?? 0n
+				: assetSpliceUpdateHead(this, channelId).nextNumber - 1n;
+		return height < BigInt(local);
+	}
+
+	/**
+	 * The peer's secret for `height` whose public key is `point` (#2151 step
+	 * 2b), looked up lazily in each source that holds it durably: the records'
+	 * shachains below their N, the plain log's latest snapshot, and each asset
+	 * era's `(height + 1)/peer-revoke` stage. It never throws on a
+	 * disagreement: it returns the candidate that matches the point, with
+	 * `conflict`, and notes the conflict for the chain watcher. Private.
+	 */
+	private loadFinalPeerSecret(
+		channelId: string,
+		height: bigint,
+		point: Buffer
+	): IFinalPeerSecret {
+		const candidates = this.peerSecretCandidates(channelId, height);
+		const distinct = new Set(candidates.map((s) => s.toString('hex')));
+		const secret =
+			candidates.find((s) => {
+				try {
+					return getPublicKey(s).equals(point);
+				} catch {
+					return false;
+				}
+			}) ?? null;
+		const conflict = distinct.size > 1;
+		if (conflict) noteFinalPeerSecretConflict(channelId, height);
+		return { secret: secret && Buffer.from(secret), conflict };
+	}
+
+	/** Every peer secret of the channel by height, for tests and diagnostics; it throws on a disagreement. Private. */
+	private loadFinalPeerSecrets(channelId: string): Map<bigint, Buffer> {
+		const out = new Map<bigint, Buffer>();
+		const sources = this.peerSecretSources(channelId);
+		if (!sources) return out;
+		const take = (height: bigint, secret: Buffer): void => {
+			const prior = out.get(height);
+			if (prior && !prior.equals(secret))
+				throw new Error('Inconsistent peer revocation secrets');
+			out.set(height, secret);
+		};
+		for (const r of sources.records)
+			for (const [h, s] of shachainSecrets(
+				r.seed.shachain,
+				BigInt(r.stateNumber)
+			))
+				take(h, s);
+		if (sources.plain)
+			for (const [h, s] of shachainSecrets(
+				sources.plain.shachain,
+				BigInt(sources.plain.remote.height)
+			))
+				take(h, s);
+		for (const history of sources.asset())
+			for (const [stage, wire] of history.stages) {
+				const [h, kind] = stage.split('/');
+				const secret =
+					kind === 'peer-revoke' && this.revealedSecret(channelId, wire);
+				if (secret && BigInt(h) > 0n) take(BigInt(h) - 1n, secret);
+			}
+		return new Map([...out.entries()].sort((a, b) => (a[0] < b[0] ? -1 : 1)));
+	}
+
+	/** The sources of peer secrets, or none in a wallet that keeps neither ledger (generations 1 and 3). */
+	/** The peer secret sources of each channel, kept for one claim build. */
+	private peerSecretScope?: Map<
+		string,
+		ReturnType<SqliteStorage['readPeerSecretSources']>
+	>;
+	/** Run one claim build with the sources of every height read once. */
+	private finalPeerSecretScope<T>(run: () => T): T {
+		if (this.peerSecretScope) return run();
+		this.peerSecretScope = new Map();
+		try {
+			return run();
+		} finally {
+			this.peerSecretScope = undefined;
+		}
+	}
+	private peerSecretSources(
+		channelId: string
+	): ReturnType<SqliteStorage['readPeerSecretSources']> {
+		const scope = this.peerSecretScope;
+		if (!scope) return this.readPeerSecretSources(channelId);
+		if (!scope.has(channelId))
+			scope.set(channelId, this.readPeerSecretSources(channelId));
+		return scope.get(channelId)!;
+	}
+	private readPeerSecretSources(channelId: string): {
+		records: IFinalChannelTypeRecord[];
+		plain?: IFinalLedgerState;
+		asset: () => ReturnType<typeof assetUpdateHistory>[];
+	} | null {
+		if (
+			!this.walletIdentity ||
+			(!this.updateWallet && !this.assetSpliceWallet) ||
+			!/^[0-9a-f]{64}$/.test(channelId)
+		)
+			return null;
+		const opening = this.finalOpeningRecord(channelId);
+		const state = opening && this.channelTypeState(channelId);
+		if (!opening || !state) return null;
+		const records = state.records;
+		const plainHistory =
+			!state.openingAsset || records.some((r) => r.type === 'plain');
+		const plain =
+			this.canUpdateFinalCommitments && plainHistory
+				? currentFinalJournal(
+						this.db,
+						this.requireOpeningAuthority(),
+						channelId,
+						opening.nonceKey
+				  )?.state
+				: undefined;
+		const eras = [state.openingAsset, ...records.map((r) => r.type === 'asset')]
+			.map((asset, era) => (asset ? era : -1))
+			.filter((era) => era >= 0);
+		let asset: ReturnType<typeof assetUpdateHistory>[] | undefined;
+		return {
+			records,
+			...(plain && { plain }),
+			// Each asset era is read once, on first use.
+			asset: () =>
+				(asset ??= this.assetSpliceWallet
+					? eras.map((era) => assetEraHistory(this, channelId, era))
+					: [])
+		};
+	}
+
+	/** Each source's candidate secret for one height. */
+	private peerSecretCandidates(channelId: string, height: bigint): Buffer[] {
+		const sources = this.peerSecretSources(channelId);
+		if (!sources || height < 0n) return [];
+		const out: Buffer[] = [];
+		for (const r of sources.records) {
+			if (height >= BigInt(r.stateNumber)) continue;
+			const s = shachainSecret(r.seed.shachain, height);
+			if (s) out.push(s);
+		}
+		if (sources.plain && height < BigInt(sources.plain.remote.height)) {
+			const s = shachainSecret(sources.plain.shachain, height);
+			if (s) out.push(s);
+		}
+		for (const history of sources.asset()) {
+			const wire = history.stages.get(height + 1n + '/peer-revoke');
+			const s = wire && this.revealedSecret(channelId, wire);
+			if (s) out.push(s);
+		}
+		return out;
+	}
+
+	/** The secret a stored revoke_and_ack reveals, when it names this channel. */
+	private revealedSecret(channelId: string, wire: string): Buffer | null {
+		try {
+			const msg = decodeRevokeAndAckMessage(Buffer.from(wire, 'hex'), {
+				finalTaproot: true
+			});
+			return msg.channelId.toString('hex') === channelId
+				? msg.perCommitmentSecret
+				: null;
+		} catch {
+			return null;
+		}
+	}
+
+	/**
+	 * Retain a pending conversion's exits (#2151 step 2b): the parent branch of
+	 * the current type on the live funding and the candidate branch of the
+	 * other type, both at the current height. Step 4 calls this while signing a
+	 * conversion; no production path calls it before then. A second retain of
+	 * the same bytes is a no-op.
+	 */
+	retainFinalConversionExits(
+		channelId: string,
+		exits: IFinalConversionExits,
+		root: BIP32Interface
+	): IFinalConversionExits {
+		if (!this.canConvertAssetChannels)
+			throw new Error('Conversion exits require an original conversion wallet');
+		if (this.db.inTransaction)
+			throw new Error('Conversion exits require a top-level commit');
+		const opening =
+			typeof channelId === 'string' && /^[0-9a-f]{64}$/.test(channelId)
+				? this.finalOpeningRecord(channelId)
+				: null;
+		const session = opening?.nonces.session;
+		const state = opening && this.channelTypeState(channelId);
+		if (
+			!opening ||
+			!session?.updateLimits ||
+			!opening.nonces.signing?.fundingTransaction ||
+			!opening.nonces.signing.exit ||
+			!state
+		)
+			throw new Error('Conversion exits require a funded ready channel');
+		let canonical: IFinalConversionExits;
+		try {
+			canonical = canonicalFinalConversionExits(exits);
+		} catch {
+			throw new Error('Invalid conversion exits');
+		}
+		// The canonical form keeps every field, whatever the input's key order.
+		if (!isDeepStrictEqual(copyJson(canonical), copyJson(exits)))
+			throw new Error('Invalid conversion exits');
+		const retained = this.finalConversions(channelId);
+		const same = retained.find((c) => c.digest === canonical.digest);
+		if (same) {
+			const { released: _released, ...prior } = same;
+			if (isDeepStrictEqual(copyJson(prior), copyJson(canonical)))
+				return copyJson(canonical);
+			throw new Error('Conversion exits differ from the retained ones');
+		}
+		if (this.pendingFinalConversions(channelId).length)
+			throw new Error('Another conversion of this channel is pending');
+		const current = state.current;
+		const { parent, candidate } = canonical;
+		if (parent.type !== current.type)
+			throw new Error('Conversion parent is not of the current type');
+		if (candidate.type === parent.type)
+			throw new Error('Conversion candidate does not change the type');
+		const live = this.liveFundingOutpoint(channelId);
+		if (
+			!live ||
+			live.txid !== parent.fundingTxid ||
+			live.outputIndex !== parent.outputIndex
+		)
+			throw new Error('Conversion parent is not the live funding');
+		const fundingTx = Transaction.fromHex(candidate.funding.fundingTxHex);
+		if (
+			fundingTx.getId() !== candidate.fundingTxid ||
+			candidate.funding.fundingOutputIndex !== candidate.outputIndex ||
+			!fundingTx.ins.some(
+				(i) =>
+					Buffer.from(i.hash).reverse().toString('hex') ===
+						parent.fundingTxid && i.index === parent.outputIndex
+			)
+		)
+			throw new Error('Conversion candidate must spend its parent');
+		if (
+			this.finalChannelFundings(channelId).some(
+				(f) =>
+					f.txid === candidate.fundingTxid &&
+					f.outputIndex === candidate.outputIndex
+			)
+		)
+			throw new Error('Conversion candidate funding must be new');
+		const index = candidate.funding.localFundingKeyIndex;
+		this.requireOpeningAuthority().requireAllocatedChannelKey(index);
+		if (
+			this.channelFundings(channelId, state).some((f) => f.keyIndex === index)
+		)
+			throw new Error('Conversion candidate reuses a funding key');
+		if (
+			deriveChannelKeys(
+				root,
+				1,
+				index
+			).channelBasepoints.fundingPubkey.toString('hex') !==
+			candidate.funding.localFundingPubkey
+		)
+			throw new Error(
+				'Conversion candidate uses a different local funding key'
+			);
+		const old = this.typeLedgerAt(opening, current);
+		if (old.pending)
+			throw new Error('Conversion exits require a quiescent channel');
+		if (this.channelSpliceInProgress(channelId, current))
+			throw new Error('Conversion exits require no pending splice attempt');
+		if (
+			this.finalExitRequested(channelId, opening.nonces) ||
+			this.finalSimpleCloseStarted(channelId) ||
+			old.dataLoss
+		)
+			throw new Error('Conversion exits require an open channel');
+		if (BigInt(canonical.stateNumber) !== BigInt(old.height))
+			throw new Error('Conversion exits name a different state');
+		// The candidate's own commitment is at this device's point for N.
+		const ownPoint = getPublicKey(
+			generateFromSeed(
+				deriveChannelKeys(root, 1, session.channelKeyIndex).perCommitmentSeed,
+				MAX_INDEX - BigInt(old.height)
+			)
+		).toString('hex');
+		if (candidate.localRecovery.point !== ownPoint)
+			throw new Error(
+				"Conversion candidate's local point is not this device's at its state"
+			);
+		const ledger = this.currentLedgerCommitments(
+			channelId,
+			current,
+			old.height
+		);
+		if (
+			!ledger ||
+			ledger.local !== parent.localCommitment ||
+			ledger.remote !== parent.remoteCommitment
+		)
+			throw new Error(
+				"Conversion parent differs from the current ledger's commitments"
+			);
+		const ctx = conversionViewContext(
+			opening.candidate,
+			session.terms,
+			session.assetEvidence?.fundingRoot
+		);
+		// Each branch is rebuilt by its own type, an asset one at its own feerate.
+		for (const branch of [parent, candidate]) {
+			if (branch.type === 'plain' && branch === candidate)
+				verifyPlainBranchWitness(branch);
+			for (const holder of ['local', 'remote'] as const)
+				conversionRecoveryView(ctx, branch, holder, canonical.stateNumber);
+		}
+		this.appendFinalConversionEvent(channelId, {
+			kind: 'conversion-exits',
+			...canonical
+		});
+		return copyJson(canonical);
+	}
+
+	/**
+	 * Mark a retained conversion released (#2151 step 2b): its funding witness
+	 * has left, so the candidate's local exit may be offered for broadcast.
+	 * Step 4 calls this. A second release is a no-op.
+	 */
+	releaseFinalConversionExits(channelId: string, digest: string): void {
+		if (!this.canConvertAssetChannels)
+			throw new Error('Conversion exits require an original conversion wallet');
+		if (this.db.inTransaction)
+			throw new Error('Conversion exits require a top-level commit');
+		const found =
+			typeof channelId === 'string' &&
+			/^[0-9a-f]{64}$/.test(channelId) &&
+			this.finalConversions(channelId).find((c) => c.digest === digest);
+		if (!found) throw new Error('Conversion exits were not retained');
+		if (found.released) return;
+		this.appendFinalConversionEvent(channelId, {
+			kind: 'conversion-released',
+			digest
+		});
+	}
+
+	/** Append one conversion event, reconciling the scope when a failure follows the device slot. */
+	private appendFinalConversionEvent(
+		channelId: string,
+		event: FinalConversionEvent
+	): void {
+		const journal = this.finalJournal();
+		const head = journal.read('conversion', channelId);
+		this.channelTypes.delete(channelId);
+		try {
+			journal.append('conversion', channelId, head, event);
+		} catch (e) {
+			// The device slot commits before the wallet row: pull it in, so the
+			// fast path's row count sees the row.
+			try {
+				journal.read('conversion', channelId);
+			} catch {
+				// The rethrown error below is the one the caller needs.
+			}
+			throw e;
+		}
+	}
+
+	/** The current ledger's local and remote commitments at its height, on the live funding. */
+	private currentLedgerCommitments(
+		channelId: string,
+		current: IChannelTypeView,
+		height: number
+	): { local: string; remote: string } | null {
+		if (current.type === 'plain') {
+			const view = this.finalUpdateView(channelId);
+			const s = view?.views[0].s;
+			if (!s || s.local.height !== height) return null;
+			return { local: s.local.tx, remote: s.remote.tx };
+		}
+		const member = assetUpdateHistory(this, channelId).states.get(
+			BigInt(height)
+		)?.members[0];
+		return member
+			? { local: member.localCommitment, remote: member.remoteCommitment }
+			: null;
+	}
+
 	/** The view context and base state of a channel whose current type is a plain record. */
 	private seededPlain(
 		record: IFinalOpeningRecord,
@@ -2572,6 +3417,19 @@ export class SqliteStorage implements IStorageBackend {
 		)
 			throw new Error(
 				'Restore of a channel with a recorded type change is not supported yet'
+			);
+		// A pending conversion is refused the same way until Step 7 (#2151 step 2b).
+		const conversions = db
+			.prepare(
+				"SELECT COUNT(*) AS n FROM final_lifecycle_log WHERE scope = 'conversion' AND channel_id = ?"
+			)
+			.get(channelId) as { n: number } | undefined;
+		if (
+			conversions?.n ||
+			authority?.lifecycleEntry('conversion/' + channelId + '/1')
+		)
+			throw new Error(
+				'Restore of a channel with a pending type conversion is not supported yet'
 			);
 	}
 
@@ -3322,6 +4180,10 @@ export class SqliteStorage implements IStorageBackend {
 				];
 			}
 		}
+		// After its release, a pending conversion's candidate exit too, by its
+		// own type; the conversion scope is read only behind its row count.
+		for (const c of this.pendingFinalConversions(record.candidate.channelId))
+			if (c.released) exits = [...exits, c.candidate.localCommitment];
 		return exits.map((hex) => {
 			const exit = Buffer.from(hex, 'hex');
 			return { exit, fundingTxid: Transaction.fromBuffer(exit).ins[0].hash };
