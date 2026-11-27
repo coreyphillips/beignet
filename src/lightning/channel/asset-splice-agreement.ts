@@ -148,7 +148,10 @@ export async function prepareAssetSpliceAgreement(
 		request.channelId.toString('hex') !== ctx.channelId ||
 		!reply.channelId.equals(request.channelId) ||
 		!request.lockDepth ||
-		request.lockDepth !== reply.lockDepth
+		request.lockDepth !== reply.lockDepth ||
+		// An asset conversion (#2151) is not an asset splice.
+		request.conversion ||
+		reply.conversion
 	)
 		throw new Error(
 			'Asset splice does not agree with the local parent or depth'

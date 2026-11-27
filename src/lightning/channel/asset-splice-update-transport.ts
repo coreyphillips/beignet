@@ -27,6 +27,7 @@ import { completeAssetOpeningHost } from './asset-opening-coordinator';
 import { completeAssetSpliceHost } from './asset-splice-transport';
 import type { IAuxiliaryDualFunding } from './asset-opening-provider';
 import type { IFinalOpeningRuntime } from './final-opening-runtime';
+import { ASSET_CONVERSION_TEXTS } from './asset-conversion-terms';
 import {
 	decodeAssetUpdateIntent,
 	encodeAssetUpdateIntent
@@ -160,11 +161,18 @@ export class AssetSpliceUpdateTransport {
 		private readonly channel: (id: string) => Params | undefined,
 		private readonly currentHeight: (id: string) => number | undefined,
 		private readonly send: (peer: string, type: number, raw: Buffer) => void,
-		private readonly settled: (id: string) => Promise<void>,
+		private readonly afterSettlement: (id: string) => Promise<void>,
 		private readonly report: (id: string, error: string) => void,
 		private readonly knownPeer: (id: string, peer: string) => boolean = () =>
-			false
+			false,
+		/** A conversion holds the channel against local adds and fee changes (#2151). */
+		private readonly held: (id: string) => boolean = () => false
 	) {}
+	/** Resolves once the channel's queue has run what it held when called. Side-effect free. */
+	settled(id: string): Promise<void> {
+		const q = this.queues.get(id);
+		return q ? q.tail.then(() => undefined) : Promise.resolve();
+	}
 	private connectionCurrent(id: string, peer: string): () => boolean {
 		let token = this.connections.get(peer);
 		if (!token) {
@@ -325,6 +333,11 @@ export class AssetSpliceUpdateTransport {
 		const raw = encodeAssetUpdateIntent(id, p.originalInitiator, changes);
 		const current = this.connectionCurrent(id, p.peer);
 		await this.run(id, async () => {
+			if (
+				this.held(id) &&
+				changes.some((c) => c.kind === 'add' || c.kind === 'fee')
+			)
+				throw Error(ASSET_CONVERSION_TEXTS.held);
 			if (!current())
 				throw Error('Asset update channel disconnected before admission');
 			const h = this.head(id);
@@ -413,7 +426,7 @@ export class AssetSpliceUpdateTransport {
 					throw error;
 				}
 				s.completed = true;
-				await this.settled(s.id);
+				await this.afterSettlement(s.id);
 			}
 		} catch (error) {
 			if (!(error instanceof AssetUpdateFundingUnavailable)) throw error;

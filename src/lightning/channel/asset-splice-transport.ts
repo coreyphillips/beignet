@@ -51,6 +51,7 @@ import type { IAssetSpliceConfirmationProvider } from './asset-splice-confirmati
 import type { IChannelManagerConfig } from './channel-manager';
 import type { IFinalFundingReference } from './final-splice-candidate';
 import { MAX_SPLICE_FEERATE_PERKW } from './splice-weight';
+import { ASSET_CONVERSION_TEXTS } from './asset-conversion-terms';
 
 export type AssetSpliceHost = IAssetSplicePlanner &
 	IAssetSpliceSigningHost &
@@ -229,8 +230,23 @@ export class AssetSpliceTransport {
 		private watch: (id: string) => void,
 		private broadcast: (raw: Buffer) => void,
 		private report: (id: string, reason: string) => void,
-		private watchdog?: SpliceWatchdog
+		private watchdog?: SpliceWatchdog,
+		/** A conversion holds the channel against local splice starts (#2151). */
+		private held: (id: string) => boolean = () => false
 	) {}
+	/**
+	 * Whether the channel has a splice under way: a durable begin record, an
+	 * inbound request, or queued work. Side-effect free.
+	 */
+	negotiating(id: string): boolean {
+		if (this.inbound.has(id) || this.queues.has(id)) return true;
+		if (!this.store.loadFinalOpeningSession(id)?.assetEvidence) return false;
+		try {
+			return !!this.pending(id);
+		} catch {
+			return true;
+		}
+	}
 	private get store() {
 		return this.runtime.storage;
 	}
@@ -569,6 +585,7 @@ export class AssetSpliceTransport {
 	}
 	async start(id: string, options: IStartAssetSplice) {
 		await this.enqueue(id, async () => {
+			if (this.held(id)) throw Error(ASSET_CONVERSION_TEXTS.held);
 			refuseRecordedSplice(this.store, id);
 			const peer = this.store.loadFinalOpeningSession(id)?.peer;
 			validOptions(options.fundingFeeratePerkw, options.minimumDepth);
@@ -1140,7 +1157,9 @@ export class AssetSpliceTransport {
 			!isValidPublicKey(msg.fundingPubkey) ||
 			msg.locktime > this.height() + 1 ||
 			!encodeSpliceMessage(msg).equals(payload) ||
-			msg.requireConfirmedInputs
+			msg.requireConfirmedInputs ||
+			// An asset conversion's proposal (#2151) is not an asset splice.
+			msg.conversion
 		)
 			throw Error('Unsupported asset splice proposal');
 	}
@@ -1318,6 +1337,7 @@ export class AssetSpliceTransport {
 						msg.lockDepth !== b.depth ||
 						!isValidPublicKey(msg.fundingPubkey) ||
 						msg.requireConfirmedInputs ||
+						msg.conversion ||
 						!encodeSpliceAckMessage(msg).equals(payload)
 					)
 						throw Error('Unmatched asset splice acknowledgement');
@@ -1363,7 +1383,9 @@ export class AssetSpliceTransport {
 	>();
 	reconnected(peer: string) {
 		for (const { channelId: id } of this.store.loadFinalOpenings()) {
-			if (this.store.loadFinalOpeningSession(id)?.peer !== peer) continue;
+			const session = this.store.loadFinalOpeningSession(id);
+			// A plain final channel has no asset splice journal to read.
+			if (session?.peer !== peer || !session.assetEvidence) continue;
 			const b = this.pending(id);
 			const init = b && this.saved(id, b, 'init');
 			if (!b || !init) continue;

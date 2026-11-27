@@ -52,6 +52,11 @@ export interface ISpliceMessage {
 	 * coin at broadcast.
 	 */
 	lockDepth?: number;
+	/**
+	 * The terms digest and target channel type of the asset conversion this
+	 * splice carries out (TLV `ASSET_CONVERSION_TLV`, #2151).
+	 */
+	conversion?: { termsDigest: Buffer; targetType: Buffer };
 }
 
 export interface ISpliceAckMessage {
@@ -61,6 +66,8 @@ export interface ISpliceAckMessage {
 	requireConfirmedInputs?: boolean;
 	/** The splice_init lock depth, echoed by an acceptor that will honour it. */
 	lockDepth?: number;
+	/** The splice_init conversion, echoed by the acceptor (#2151). */
+	conversion?: { termsDigest: Buffer; targetType: Buffer };
 }
 
 /**
@@ -80,6 +87,12 @@ export const SPLICE_LOCK_DEPTH_MAX = 2016;
  * with tx_abort before any input is added.
  */
 export const SPLICE_LOCK_DEPTH_ACCEPT_MAX = 6;
+/**
+ * TLV type of an asset conversion (#2151): the 32-byte terms digest, then
+ * the target channel type's bytes. Even, so a peer that does not know it
+ * refuses the message, and in the experimental range. 65538 stays unused.
+ */
+export const ASSET_CONVERSION_TLV = 65540;
 
 function writeBigSize(n: number): Buffer {
 	if (n < 0xfd) return Buffer.from([n]);
@@ -95,20 +108,25 @@ function writeBigSize(n: number): Buffer {
 	return b;
 }
 
+type Conversion = NonNullable<ISpliceMessage['conversion']>;
+
 const SPLICE_REQUIRE_CONFIRMED_INPUTS_TLV = 2n;
 const SPLICE_TLV_TYPES = new Set<bigint>([
 	SPLICE_REQUIRE_CONFIRMED_INPUTS_TLV,
-	BigInt(SPLICE_LOCK_DEPTH_TLV)
+	BigInt(SPLICE_LOCK_DEPTH_TLV),
+	BigInt(ASSET_CONVERSION_TLV)
 ]);
 
 /**
  * The TLV stream shared by splice_init and splice_ack: type 2
- * require_confirmed_inputs (empty) and the lock depth extension. Unknown odd
- * types are skipped, an unknown even type is a malformed message (BOLT 1).
+ * require_confirmed_inputs (empty), the lock depth and the asset conversion
+ * extensions, in ascending type order. Unknown odd types are skipped, an
+ * unknown even type is a malformed message (BOLT 1).
  */
 function encodeSpliceTlvs(msg: {
 	requireConfirmedInputs?: boolean;
 	lockDepth?: number;
+	conversion?: Conversion;
 }): Buffer[] {
 	const parts: Buffer[] = [];
 	if (msg.requireConfirmedInputs) parts.push(Buffer.from([2, 0]));
@@ -126,14 +144,40 @@ function encodeSpliceTlvs(msg: {
 		value.writeUInt16BE(msg.lockDepth, 0);
 		parts.push(writeBigSize(SPLICE_LOCK_DEPTH_TLV), writeBigSize(2), value);
 	}
+	if (msg.conversion) {
+		const { termsDigest, targetType } = msg.conversion;
+		if (
+			!Buffer.isBuffer(termsDigest) ||
+			termsDigest.length !== 32 ||
+			!Buffer.isBuffer(targetType) ||
+			!targetType.length
+		)
+			throw new Error(
+				'asset_conversion needs a 32-byte digest and a channel type'
+			);
+		parts.push(
+			writeBigSize(ASSET_CONVERSION_TLV),
+			writeBigSize(32 + targetType.length),
+			termsDigest,
+			targetType
+		);
+	}
 	return parts;
 }
 
 function decodeSpliceTlvs(
 	payload: Buffer,
 	offset: number
-): { requireConfirmedInputs?: boolean; lockDepth?: number } {
-	const out: { requireConfirmedInputs?: boolean; lockDepth?: number } = {};
+): {
+	requireConfirmedInputs?: boolean;
+	lockDepth?: number;
+	conversion?: Conversion;
+} {
+	const out: {
+		requireConfirmedInputs?: boolean;
+		lockDepth?: number;
+		conversion?: Conversion;
+	} = {};
 	const { records } = decodeTlvStream(payload, offset, SPLICE_TLV_TYPES);
 	for (const { type, value } of records) {
 		if (type === SPLICE_REQUIRE_CONFIRMED_INPUTS_TLV) {
@@ -147,6 +191,16 @@ function decodeSpliceTlvs(
 				throw new Error(`lock_depth ${depth} out of range`);
 			}
 			out.lockDepth = depth;
+		} else if (type === BigInt(ASSET_CONVERSION_TLV)) {
+			// The type is the conversion transport's to judge, not the codec's.
+			if (value.length < 33)
+				throw new Error(
+					'asset_conversion must carry a terms digest and a channel type'
+				);
+			out.conversion = {
+				termsDigest: Buffer.from(value.subarray(0, 32)),
+				targetType: Buffer.from(value.subarray(32))
+			};
 		}
 	}
 	return out;
@@ -229,7 +283,8 @@ export function decodeSpliceMessage(payload: Buffer): ISpliceMessage {
 		fundingFeeratePerkw,
 		locktime,
 		requireConfirmedInputs: tlvs.requireConfirmedInputs,
-		lockDepth: tlvs.lockDepth
+		lockDepth: tlvs.lockDepth,
+		...(tlvs.conversion && { conversion: tlvs.conversion })
 	};
 }
 
@@ -290,7 +345,8 @@ export function decodeSpliceAckMessage(payload: Buffer): ISpliceAckMessage {
 		fundingPubkey,
 		relativeSatoshis,
 		requireConfirmedInputs: tlvs.requireConfirmedInputs,
-		lockDepth: tlvs.lockDepth
+		lockDepth: tlvs.lockDepth,
+		...(tlvs.conversion && { conversion: tlvs.conversion })
 	};
 }
 

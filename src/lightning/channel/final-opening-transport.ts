@@ -94,14 +94,16 @@ export class FinalOpeningTransport {
 		private readonly broadcastClose?: (tx: Buffer) => void,
 		private readonly splice?: FinalSpliceTransport,
 		private readonly reconnectFunding?: (peer: string) => void,
-		private readonly resumeAssetSplice?: (peer: string, id: string) => void
+		private readonly resumeAssetSplice?: (peer: string, id: string) => void,
+		held?: (id: string) => boolean
 	) {
 		this.commitments = new FinalCommitmentTransport(
 			runtime,
 			(id) => this.updatesReady(id),
 			(id, msg) =>
 				this.send(this.connections.get(id)!.peer, msg.type, msg.payload),
-			deliver
+			deliver,
+			held
 		);
 		for (const {
 			candidate,
@@ -114,6 +116,16 @@ export class FinalOpeningTransport {
 
 	connected(id: string): boolean {
 		return !!this.connections.get(id)?.established;
+	}
+	/** Resolves once the channel's queue has run what it held when called. Side-effect free. */
+	settled(id: string): Promise<void> {
+		const queue = this.queues.get(id);
+		return queue
+			? queue.tail.then(
+					() => undefined,
+					() => undefined
+			  )
+			: Promise.resolve();
 	}
 	updatesReady(id: string): boolean {
 		const connection = this.connections.get(id);

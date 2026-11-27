@@ -3,11 +3,13 @@
  * (#2151 step 2b). They are private members of SqliteStorage, kept out of
  * the API snapshot. Each store attaches them when it is built, so the claim
  * builders in src/lightning/chain reach them without a public member, and a
- * storage double without them takes today's path.
+ * storage double without them takes today's path. The asset conversion
+ * transport reads a conversion's parent the same way (#2151 step 3a).
  */
 import type { IFinalCommitmentType } from '../channel/final-opening-commitment';
 import type { IFinalConversionExits } from './final-conversion-exits';
 import type { IFinalChannelTypeRecord } from './final-channel-type';
+import type { IFinalFundingReference } from '../channel/final-splice-candidate';
 import type { IFinalPeerSecret } from './final-peer-secrets';
 import type { SqliteStorage } from './sqlite-storage';
 
@@ -21,6 +23,21 @@ export interface IFinalChannelFunding {
 	source: 'opening' | 'record' | 'plain-splice' | 'asset-splice' | 'conversion';
 	parent?: { txid: string; outputIndex: number };
 	digest?: string;
+}
+
+/** The live parent of an asset conversion, once every precondition holds. */
+export interface IAssetConversionParent {
+	type: 'plain' | 'asset';
+	channelType: string;
+	funding: IFinalFundingReference;
+	/** The live funding txid, in display order. */
+	txid: string;
+	outputIndex: number;
+	/** The current state number N. */
+	height: bigint;
+	/** Whether this side opened the channel. */
+	opener: boolean;
+	commitmentFeeratePerKw: number;
 }
 
 export type FinalResolutionStates = ReturnType<
@@ -62,6 +79,8 @@ export interface IFinalBranchReaders {
 	loadFinalPeerSecrets(channelId: string): Map<bigint, Buffer>;
 	/** Run one claim build with each channel's secret sources read once for every height. */
 	finalPeerSecretScope<T>(run: () => T): T;
+	/** A conversion's parent, or a throw naming the first precondition it fails. */
+	assetConversionParent(channelId: string): IAssetConversionParent;
 }
 
 /**

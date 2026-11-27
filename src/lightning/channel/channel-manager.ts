@@ -42,6 +42,11 @@ import type { SqliteStorage } from '../storage/sqlite-storage';
 import type { IFinalOpeningRuntime } from './final-opening-runtime';
 import { FinalUpdateDataLossError } from '../storage/final-channel-updates';
 import { isFinalCommitmentUpdate } from './final-commitment-transport';
+import {
+	AssetConversionTransport,
+	hasAssetConversionHost
+} from './asset-conversion-transport';
+import { ASSET_CONVERSION_TEXTS } from './asset-conversion-terms';
 import type { IFinalOpeningMessage } from './final-opening-runtime';
 import { FinalOpeningTransport } from './final-opening-transport';
 import {
@@ -1111,6 +1116,8 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 	private readonly assetOpening?: AssetOpeningCoordinator;
 	private readonly finalTransport?: FinalOpeningTransport;
 	private readonly finalSplice?: FinalSpliceTransport;
+	/** Agreeing on an asset conversion (#2151); without its wallet and host it offers nothing. */
+	private readonly assetConversion?: AssetConversionTransport;
 	private readonly finalFundingChecks = new Map<string, () => boolean>();
 	private readonly finalObservedFunding = new Map<
 		string,
@@ -1293,6 +1300,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 							this.observedFinalExit(hex)
 						);
 						this.finalTransport?.closed(peer, id.toString('hex'));
+						this.assetConversion?.closed(hex);
 						this.emit('broadcast:tx', exit);
 						const wire = wireErrorPayloadFor(id, reason);
 						if (wire) this.sendMessage(peer, MessageType.ERROR, wire);
@@ -1316,7 +1324,8 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 				(peer, id) => {
 					this.assetSplice?.resume(peer, id);
 					this.assetUpdates?.resume(peer, id);
-				}
+				},
+				(id) => !!this.assetConversion?.held(id)
 			);
 			const host = config.auxiliaryChannels?.dualFunding;
 			const recovery = config.finalOpening.storage.canRecoverAssetSplice;
@@ -1380,9 +1389,11 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 								this.observedFinalExit(id)
 							);
 							this.finalTransport?.closed(session.peer, id);
+							this.assetConversion?.closed(id);
 							this.emit('broadcast:tx', exit);
 						}
-					}
+					},
+					(id) => !!this.assetConversion?.held(id)
 				);
 				if (hasAssetUpdateHost(host)) {
 					this.assetUpdates = new AssetSpliceUpdateTransport(
@@ -1429,7 +1440,8 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 									this.peerManager?.getPeer(peer)?.getRemoteInit()?.features
 								)
 							);
-						}
+						},
+						(id) => !!this.assetConversion?.held(id)
 					);
 				}
 			}
@@ -1482,6 +1494,36 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 				);
 			}
 		}
+		const conversionHost = config.auxiliaryChannels?.dualFunding;
+		const conversionOffered =
+			!!this.finalTransport &&
+			!!config.finalOpening?.storage.canConvertAssetChannels &&
+			hasAssetConversionHost(conversionHost);
+		this.assetConversion = new AssetConversionTransport(
+			conversionOffered ? config.finalOpening : undefined,
+			conversionOffered ? conversionHost : undefined,
+			{
+				localFeatures: () => this.config.localFeatures,
+				remoteFeatures: (peer) =>
+					this.peerManager?.getPeer(peer)?.getRemoteInit()?.features,
+				connected: (id) => !!this.finalTransport?.connected(id),
+				hasDepth: (id) => !!this.finalTransport?.hasDepth(id),
+				busy: (id) =>
+					this.finalSpliceQuiescent(id) || !!this.assetSplice?.negotiating(id),
+				settled: async (id) => {
+					await Promise.all([
+						this.finalTransport?.settled(id),
+						this.assetUpdates?.settled(id)
+					]);
+				},
+				height: () => this._currentBlockHeight,
+				send: (peer, type, payload) => this.sendMessage(peer, type, payload),
+				disconnect: (peer) => this.peerManager?.recyclePeer(peer, 1000),
+				report: (id, reason) =>
+					this.emitContained('error', Buffer.from(id, 'hex'), reason),
+				timeoutMs: config.quiescenceTimeoutMs
+			}
+		);
 	}
 
 	private deliverFinalUpdate(
@@ -1560,7 +1602,11 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 				ok: false,
 				actions: [],
 				admissionRejected: true,
-				error: String(err)
+				// A conversion's hold reads as its own text.
+				error:
+					err instanceof Error && err.message === ASSET_CONVERSION_TEXTS.held
+						? err.message
+						: String(err)
 			};
 		}
 	}
@@ -3559,6 +3605,8 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			try {
 				if (!this.finalTransport)
 					throw new Error('Final transport unavailable');
+				// A local close start ends a conversion attempt first (#2151).
+				this.assetConversion?.closed(idHex);
 				this.finalTransport.initiateShutdown(idHex, scriptPubkey);
 				return { ok: true, actions: [] };
 			} catch (err) {
@@ -3893,6 +3941,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 	): void {
 		// Before the channels forget their pre-commitment splices: a composite
 		// splice (issue #1922) ends with the connection and must hear it first.
+		this.assetConversion?.disconnected(peerPubkey);
 		this.assetOpening?.disconnect(peerPubkey);
 		this.assetSplice?.disconnected(peerPubkey);
 		this.assetUpdates?.disconnected(peerPubkey);
@@ -4436,13 +4485,24 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 	}
 
 	stopAssetOpenings(): void {
+		this.assetConversion?.destroy();
 		this.assetOpening?.destroy();
 		this.assetSplice?.destroy();
 	}
 
 	handleAssetOpenFrame(peer: string, subtype: number, raw: Buffer): void {
 		if (subtype === BeignetCustomSubtype.ASSET_UPDATE) {
+			this.assetConversion?.observeAssetUpdate(peer, raw);
 			this.assetUpdates?.custom(peer, raw);
+			return;
+		}
+		// The conversion phases (#2151) of subtype 98: terms and replies.
+		if (
+			subtype === BeignetCustomSubtype.ASSET_SPLICE &&
+			raw.length >= 2 &&
+			(raw[1] === 7 || raw[1] === 8)
+		) {
+			this.assetConversion?.custom(peer, raw);
 			return;
 		}
 		if (
@@ -4688,6 +4748,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 					this.observedFinalExit(idHex)
 				);
 				this.finalTransport?.closed(finalSession.peer, idHex);
+				this.assetConversion?.closed(idHex);
 			} catch (err) {
 				return {
 					ok: false,
@@ -5807,6 +5868,8 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 	 */
 	handleMessage(peerPubkey: string, type: number, payload: Buffer): void {
 		try {
+			// A peer update in a conversion's quiet window aborts it, then goes on.
+			this.assetConversion?.observe(peerPubkey, type, payload);
 			if (
 				this.assetUpdates?.collect(peerPubkey, type, payload) ||
 				this.finalTransport?.collectCommitmentBatch(peerPubkey, type, payload)
@@ -5824,6 +5887,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 				);
 				return;
 			}
+			if (this.assetConversion?.handle(peerPubkey, type, payload)) return;
 			if (this.assetOpening?.handle(peerPubkey, type, payload)) return;
 			if (
 				this.assetSplice &&
@@ -10460,6 +10524,8 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 	}
 	startFinalSplice(id: Buffer, plan: FinalSplicePlan): void {
 		const hex = id.toString('hex');
+		if (this.assetConversion?.held(hex))
+			throw new Error(ASSET_CONVERSION_TEXTS.held);
 		const r = this.config.finalOpening;
 		const peer = r?.storage.loadFinalOpeningSession(hex)?.peer;
 		const features =

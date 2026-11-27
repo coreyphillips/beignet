@@ -7,16 +7,28 @@ const phases = [
 	'exit',
 	'layout_ack',
 	'final_ack',
-	'construction_checkpoint'
+	'construction_checkpoint',
+	// An asset conversion's terms and its reply (#2151), on subtype 98 only.
+	'conversion_terms',
+	'conversion_reply'
 ] as const;
 type Phase = (typeof phases)[number];
-type ObjectPhase = Exclude<
-	Phase,
-	'layout_ack' | 'final_ack' | 'construction_checkpoint'
->;
+/** The phases that carry a chunked object. */
+const objectPhases = [
+	'layout',
+	'authorization',
+	'final',
+	'exit',
+	'conversion_terms'
+] as const;
+type ObjectPhase = (typeof objectPhases)[number];
 const HEADER = 74;
 export const ASSET_OPEN_CHUNK_SIZE = 32 * 1024;
 export const ASSET_OPEN_OBJECT_LIMIT = 4 * 1024 * 1024;
+/** The largest conversion_terms object. */
+const CONVERSION_TERMS_LIMIT = 65536;
+/** A conversion_reply: a one-byte verdict and a reason of at most 200 bytes. */
+const CONVERSION_REPLY_LIMIT = 201;
 
 export interface IAssetOpenConsent {
 	attempt: Buffer;
@@ -71,6 +83,16 @@ function validateFrame(frame: IAssetOpenFrame): void {
 		!Buffer.isBuffer(bytes)
 	)
 		throw new Error('Invalid asset opening frame');
+	if (
+		(phase === 'conversion_reply' &&
+			(offset !== 0 ||
+				total !== bytes.length ||
+				total < 1 ||
+				total > CONVERSION_REPLY_LIMIT)) ||
+		(phase === 'conversion_terms' && total > CONVERSION_TERMS_LIMIT)
+	)
+		throw new Error('Invalid asset conversion frame');
+	if (phase === 'conversion_reply') return;
 	if (
 		phase === 'layout_ack' ||
 		phase === 'final_ack' ||
@@ -144,7 +166,7 @@ export class AssetOpenObjectReceiver {
 		if (
 			!Buffer.isBuffer(attempt) ||
 			attempt.length !== 32 ||
-			!phases.slice(0, 4).includes(phase) ||
+			!(objectPhases as readonly string[]).includes(phase) ||
 			!Number.isInteger(maxBytes) ||
 			maxBytes < 1 ||
 			maxBytes > ASSET_OPEN_OBJECT_LIMIT

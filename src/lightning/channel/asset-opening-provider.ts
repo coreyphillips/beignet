@@ -8,6 +8,7 @@ import type {
 	IFinalOpeningTerms,
 	IFinalCommitmentView
 } from './final-opening-commitment';
+import type { IAssetConversionTerms } from './asset-conversion-terms';
 import type { IAssetOpenLayout } from './asset-opening-manifest';
 
 export interface IAssetOpenContext {
@@ -140,6 +141,25 @@ export interface IAssetOpeningHtlcPayout {
 	signVirtual(spend: IAssetHtlcVirtualSpend): Buffer;
 }
 
+/** The attempt a conversion host call concerns (#2151). */
+export interface IAssetConversionContext {
+	channelId: string;
+	peer: string;
+	/** The attempt id, from the channel, the parent outpoint and the terms digest. */
+	attempt: Buffer;
+	isInitiator: boolean;
+	/** Whether this side opened the channel: the role the terms name it by. */
+	isOpener: boolean;
+	parent: {
+		txid: string;
+		outputIndex: number;
+		stateNumber: string;
+		type: 'plain' | 'asset';
+		channelType: string;
+	};
+	direction: 'to-plain' | 'to-asset';
+}
+
 /** Explicit host support for private dual-funded asset openings on regtest. */
 export interface IAuxiliaryDualFunding
 	extends Partial<import('./asset-splice-transport').AssetSpliceHost>,
@@ -201,4 +221,20 @@ export interface IAuxiliaryDualFunding
 		payout: Transaction,
 		receipt: Buffer
 	): Promise<void>;
+	/** The initiator's terms of a conversion under the host's agreement `reference` (#2151). */
+	conversionTerms?(
+		ctx: Omit<IAssetConversionContext, 'attempt'>,
+		request: { reference: Buffer }
+	): Promise<IAssetConversionTerms>;
+	/** Confirm the exact canonical terms and their digest. Only `true` confirms. */
+	verifyConversionTerms?(
+		ctx: IAssetConversionContext,
+		terms: IAssetConversionTerms,
+		digest: Buffer
+	): Promise<boolean>;
+	/** Called once when an attempt this host verified ends, with the end's text. */
+	abandonConversion?(
+		ctx: IAssetConversionContext,
+		reason: string
+	): void | Promise<void>;
 }
