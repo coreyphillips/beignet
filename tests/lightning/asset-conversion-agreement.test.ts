@@ -207,7 +207,8 @@ describe('Asset conversion agreement to the fence (#2151 step 3a, test 5)', func
 				expect(abandoned(p, 1)).to.deep.equal([FENCE]);
 				p.hostLog.splice(0);
 
-				// The parent is unchanged, except each side's one key allocation.
+				// The parent is unchanged, except each side's one key allocation
+				// and, since Step 4a, its attempt record and withdrawal.
 				for (const i of [0, 1] as const) {
 					expect(held(p.managers[i], p.id)).to.equal(false);
 					expect(p.stores[i].loadFinalChannelType(p.id)).to.deep.equal(
@@ -218,13 +219,22 @@ describe('Asset conversion agreement to the fence (#2151 step 3a, test 5)', func
 					expect(now.remoteBalanceMsat).to.equal(info[i].remoteBalanceMsat);
 					expect(allocatedKeyIndex(p.stores[i])).to.equal(keys[i] + 1);
 					const changed = changedRows(rows[i], tableRows(p.stores[i]));
-					expect(changed).to.have.length(2);
+					expect(changed, changed.join('\n')).to.have.length(4);
 					expect(
-						changed.every((r) =>
-							/^[+-] metadata \{"key":"channel_key_index_allocated"/.test(r)
-						),
+						[
+							changed.filter((r) =>
+								/^[+-] metadata \{"key":"channel_key_index_allocated"/.test(r)
+							).length,
+							changed.filter((r) =>
+								r.startsWith(
+									'+ final_lifecycle_log {"scope":"conversion-attempt","channel_id":"' +
+										p.id +
+										'"'
+								)
+							).length
+						],
 						changed.join('\n')
-					).to.equal(true);
+					).to.deep.equal([2, 2]);
 				}
 				expect(p.errors).to.deep.equal([[], []]);
 				await updateRound(p);

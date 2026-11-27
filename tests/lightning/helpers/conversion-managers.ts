@@ -51,7 +51,7 @@ import {
 	type Scratch
 } from './channel-type-pairs';
 import type { FinalGeneration } from './final-generation';
-import type { IReadyPairTerms } from './final-update-pair';
+import { fundReadyPair, type IReadyPairTerms } from './final-update-pair';
 import {
 	conversionTerms,
 	method,
@@ -61,6 +61,7 @@ import {
 	type IConversionPlan
 } from './conversion-modules';
 import { CONVERSION_HOST_KEYS } from './asset-conversion-node';
+import { boundParticipant } from './final-opening-signing';
 
 /** The height both managers run at once the pair is ready. */
 export const PAIR_HEIGHT = 600_000;
@@ -152,6 +153,11 @@ export class PeerLink {
 	/** Messages addressed to a scripted side. */
 	readonly inbox: [IWireMessage[], IWireMessage[]] = [[], []];
 	readonly scripted: [boolean, boolean] = [false, false];
+	/**
+	 * Called with each message the moment a side puts it on the link, before
+	 * any delivery, so a test can read the sender's store at that point.
+	 */
+	readonly taps: ((m: IWireMessage) => void)[] = [];
 	connected = true;
 	private readonly queue: IWireMessage[] = [];
 	private rules: IRule[] = [];
@@ -173,6 +179,7 @@ export class PeerLink {
 			seq: this.seq++
 		};
 		this.sent.push(m);
+		for (const tap of this.taps) tap(m);
 		if (!this.connected) {
 			this.dropped.push(m);
 			return;
@@ -215,6 +222,11 @@ export class PeerLink {
 	/** Send in the name of a scripted side. */
 	send(from: 0 | 1, type: number, payload: Buffer): void {
 		this.push(from, type, payload);
+	}
+	/** Lose every queued and held message, as a crash does, and go disconnected. */
+	lose(): void {
+		this.connected = false;
+		this.dropped.push(...this.held.splice(0), ...this.queue.splice(0));
 	}
 	/** Detach side i: messages to it go to inbox[i]. */
 	script(i: 0 | 1): void {
@@ -590,6 +602,12 @@ export interface IPairOptions {
 	skipDepth?: boolean;
 	/** false: never call handlePeerReconnected (the link stays silent). */
 	connect?: boolean;
+	/**
+	 * A plain pair only: a second ready plain channel between the same two
+	 * wallets, at key index 2, which the managers take through
+	 * channel_reestablish and funding depth with the first (`pair.extra`).
+	 */
+	extraChannel?: boolean;
 	/** Build the managers over these stores instead of a fresh pair. */
 	existing?: {
 		id: string;
@@ -643,6 +661,22 @@ export interface IConversionPair {
 	 * tell the old manager's calls from the new one's.
 	 */
 	restart(i: 0 | 1, afterTeardown?: () => void): Promise<void>;
+	/**
+	 * Crash side i (#2151 Step 4a, amendment A5) and build it again over its
+	 * store, with no teardown: the old manager's peer manager becomes a sink
+	 * and its listeners go; its conversion attempts are silenced without an
+	 * end (their three timers cleared and each marked ended, and the
+	 * withdrawn tombstones' timers cleared), so it writes no withdrawal and
+	 * calls no abandon; every message in flight is lost. The store is kept,
+	 * or with `reopen` opened again from its file (which runs the reconcile
+	 * at open). The new manager is built (its constructor and the pair's
+	 * first handleNewBlock), the peer then sees a disconnect, and the call
+	 * returns before any reconnect: `reconnect()` takes both sides through
+	 * channel_reestablish again.
+	 */
+	crash(i: 0 | 1, options?: ICrashOptions): void;
+	/** The second channel of a pair built with `extraChannel`. */
+	extra?: { id: string; channelId: Buffer; fundingTxid: TxidHex };
 	/** Plain: updatesReady; asset: the asset update height. */
 	ready(i: 0 | 1): boolean;
 	/**
@@ -650,6 +684,118 @@ export interface IConversionPair {
 	 * replace one. A side built with the option null has no estimate field.
 	 */
 	feerateEstimates: [FeerateEstimate, FeerateEstimate];
+}
+
+/** How `crash(i)` builds side i again. */
+export interface ICrashOptions {
+	/** Open the store again from its file instead of keeping the handle. */
+	reopen?: boolean;
+	/** false: the new manager's host lacks every conversion key. */
+	conversion?: boolean;
+	/** false: no verifyRemoteFundingInput, so no final transport and no conversion offered. */
+	verify?: boolean;
+	/** Runs after the old manager is silenced and before the new one is built. */
+	afterCrash?: () => void;
+}
+
+/** A peer manager that takes everything and answers nothing. */
+const SINK_PEER_MANAGER = {
+	sendToPeer: (): void => undefined,
+	getPeer: (): undefined => undefined,
+	recyclePeer: (): void => undefined,
+	disconnectPeer: (): void => undefined
+};
+
+/** The private attempt of side i's conversion transport for a channel, as the tests read it. */
+export interface IConversionAttemptView {
+	state: string;
+	ended: boolean;
+	initiator: boolean;
+	proposal?: Buffer;
+	snapshot?: unknown;
+	deadline?: ReturnType<typeof setTimeout>;
+	reply?: ReturnType<typeof setTimeout>;
+	phase?: ReturnType<typeof setTimeout>;
+}
+interface IConversionTransportInternals {
+	attempts: Map<string, IConversionAttemptView>;
+	withdrawn: Map<string, { timer: ReturnType<typeof setTimeout> }>;
+	deps: Record<string, unknown>;
+}
+function transportInternals(
+	manager: ChannelManager
+): IConversionTransportInternals | undefined {
+	return conversionTransportOf(manager) as unknown as
+		| IConversionTransportInternals
+		| undefined;
+}
+
+/** The live attempt of side i's conversion transport for channel `id`, if any. */
+export function attemptOf(
+	manager: ChannelManager,
+	id: string
+): IConversionAttemptView | undefined {
+	return transportInternals(manager)?.attempts.get(id);
+}
+
+/**
+ * The conversion transport's dependencies (`deps`), so a test can wrap one:
+ * `send`, `busy` or `settled`, for instance.
+ */
+export function conversionDeps(
+	manager: ChannelManager
+): Record<string, unknown> {
+	const t = transportInternals(manager);
+	if (!t) throw new Error('not implemented: ChannelManager.assetConversion');
+	return t.deps;
+}
+
+/**
+ * Silence a manager's conversion transport as a crash does (amendment A5,
+ * step 2): each attempt's three timers are cleared and it is marked ended,
+ * without `end`, so a handler suspended at an await stops at its next
+ * check; the withdrawn tombstones' timers are cleared.
+ */
+export function silenceConversion(manager: ChannelManager): void {
+	const t = transportInternals(manager);
+	if (!t) return;
+	for (const a of t.attempts.values()) {
+		for (const timer of [a.deadline, a.reply, a.phase])
+			if (timer) clearTimeout(timer);
+		a.deadline = a.reply = a.phase = undefined;
+		a.ended = true;
+	}
+	for (const w of t.withdrawn.values()) clearTimeout(w.timer);
+}
+
+/**
+ * Hang side i's barrier (its wait on the final and asset update queues)
+ * for every call that `when` picks by the channel's live attempt; every
+ * other call waits as before. Returns the undo.
+ */
+export function hangBarrier(
+	p: IConversionPair,
+	i: 0 | 1,
+	when: (a: IConversionAttemptView) => boolean
+): () => void {
+	const manager = p.managers[i];
+	const m = manager as unknown as {
+		finalTransport?: { settled(id: string): Promise<void> };
+		assetUpdates?: { settled(id: string): Promise<void> };
+	};
+	const restore: (() => void)[] = [];
+	for (const t of [m.finalTransport, m.assetUpdates]) {
+		if (!t) continue;
+		const original = t.settled.bind(t);
+		t.settled = (id: string): Promise<void> => {
+			const a = attemptOf(manager, id);
+			return a && !a.ended && when(a) ? never<void>() : original(id);
+		};
+		restore.push(() => (t.settled = original));
+	}
+	return () => {
+		for (const r of restore) r();
+	};
 }
 
 function txidOfHex(hex: string): TxidHex {
@@ -669,6 +815,11 @@ export async function conversionPair(
 	const generations = options.generations ?? [6, 6];
 	let id: string, stores: SqliteStorage[], roots: BIP32Interface[];
 	let nodeIds: [string, string];
+	let extraId: string | undefined;
+	/** The type pair's restart of store i, which opens it again from its file. */
+	let reopenStore: ((i: number) => SqliteStorage) | undefined;
+	if (options.extraChannel && (kind !== 'plain' || options.existing))
+		throw new Error('Only a fresh plain pair takes an extra channel');
 	if (options.existing) {
 		({ id, stores, roots, nodeIds } = options.existing);
 	} else if (kind === 'plain') {
@@ -684,6 +835,19 @@ export async function conversionPair(
 		stores = p.stores;
 		roots = p.sides.map((side) => side.root);
 		nodeIds = [p.sides[0].binding.nodeId, p.sides[1].binding.nodeId];
+		reopenStore = (i): SqliteStorage => p.restart(i);
+		if (options.extraChannel) {
+			const twins = p.sides.map((side) =>
+				boundParticipant(side.root, 2, side.binding)
+			);
+			extraId = fundReadyPair(
+				stores[0],
+				stores[1],
+				twins[0],
+				twins[1],
+				options.terms ?? FIT_TERMS
+			);
+		}
 	} else {
 		const g = generations[0];
 		if (g !== generations[1] || (g !== 4 && g !== 5 && g !== 6))
@@ -693,6 +857,7 @@ export async function conversionPair(
 		stores = p.devices.map((d) => d.store);
 		roots = p.devices.map((d) => d.root);
 		nodeIds = [p.bindings[0].nodeId, p.bindings[1].nodeId];
+		reopenStore = (i): SqliteStorage => p.restart(i);
 	}
 	const channelId = Buffer.from(id, 'hex');
 	const hostLog: IConversionHostCall[] = [];
@@ -709,6 +874,16 @@ export async function conversionPair(
 	const recycled: [string[], string[]] = [[], []];
 	const managers: ChannelManager[] = [];
 	const fundingTxid = txidOfHex(stores[0].loadFinalOpening(id)!.fundingTxHex);
+	const extra =
+		extraId === undefined
+			? undefined
+			: {
+					id: extraId,
+					channelId: Buffer.from(extraId, 'hex'),
+					fundingTxid: txidOfHex(
+						stores[0].loadFinalOpening(extraId)!.fundingTxHex
+					)
+			  };
 	const opener: 0 | 1 = stores[0].loadFinalOpening(id)!.isInitiator ? 0 : 1;
 
 	const deliver = (to: 0 | 1, m: IWireMessage): void => {
@@ -747,16 +922,31 @@ export async function conversionPair(
 		options.conversionFeerateEstimate?.[0] ?? fixed,
 		options.conversionFeerateEstimate?.[1] ?? fixed
 	];
-	const build = (i: 0 | 1): ChannelManager => {
+	const build = (
+		i: 0 | 1,
+		variant: Pick<ICrashOptions, 'conversion' | 'verify'> = {}
+	): ChannelManager => {
+		const host =
+			variant.conversion === false
+				? pairHost(
+						i,
+						hosts[i],
+						false,
+						unexpected,
+						options.conversionFeerateMarginPerKw?.[i]
+				  )
+				: dualFunding[i];
 		const manager = new ChannelManager({
 			finalOpening: { storage: stores[i], root: roots[i] },
-			verifyRemoteFundingInput: async () => 'unspent',
+			...(variant.verify !== false && {
+				verifyRemoteFundingInput: async (): Promise<'unspent'> => 'unspent'
+			}),
 			persistence: { persist: () => 'committed' },
 			localFeatures: inits[i],
 			auxiliaryChannels: {
 				provider: referenceProvider(),
 				resolveIncoming: () => undefined,
-				dualFunding: dualFunding[i]
+				dualFunding: host
 			},
 			...(options.conversionFeerateEstimate?.[i] !== null && {
 				conversionFeerateEstimate: (): Promise<number | null | undefined> =>
@@ -820,6 +1010,15 @@ export async function conversionPair(
 			m.observeAssetOpeningAnchor(id, true, undefined, PAIR_HEIGHT - 10);
 		m.observeFinalFunding(id, fundingTxid, PAIR_HEIGHT - 10, false);
 		m.handleFundingConfirmed(channelId, fundingTxid);
+		if (extra) {
+			m.observeFinalFunding(
+				extra.id,
+				extra.fundingTxid,
+				PAIR_HEIGHT - 10,
+				false
+			);
+			m.handleFundingConfirmed(extra.channelId, extra.fundingTxid);
+		}
 	};
 	const connect = async (): Promise<void> => {
 		link.connected = true;
@@ -859,6 +1058,24 @@ export async function conversionPair(
 			disconnectBoth();
 		},
 		reconnect: connect,
+		crash(i: 0 | 1, crash: ICrashOptions = {}): void {
+			const old = managers[i];
+			(old as unknown as { peerManager: unknown }).peerManager =
+				SINK_PEER_MANAGER;
+			old.removeAllListeners();
+			silenceConversion(old);
+			link.lose();
+			crash.afterCrash?.();
+			if (crash.reopen) {
+				if (!reopenStore)
+					throw new Error('A pair over existing stores cannot reopen them');
+				stores[i] = reopenStore(i);
+			}
+			managers[i] = build(i, crash);
+			pair.managers[i] = managers[i];
+			managers[1 - i].handlePeerDisconnected(nodeIds[i]);
+		},
+		...(extra && { extra }),
 		async restart(i: 0 | 1, afterTeardown?: () => void): Promise<void> {
 			managers[i].handlePeerDisconnected(nodeIds[1 - i]);
 			managers[i].stopAssetOpenings();
