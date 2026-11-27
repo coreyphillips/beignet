@@ -646,6 +646,9 @@ function describedShape(d: unknown): d is {
 	);
 }
 
+/** More entries than any list of a layout can hold. */
+const DESCRIPTION_LIST_LIMIT = 65_536;
+
 /**
  * A plain copy of a host's description, read once per field before any
  * check (amendment v2.4 item 2): arrays become dense arrays (a hole is
@@ -654,8 +657,15 @@ function describedShape(d: unknown): d is {
  */
 function copyDescription(d: unknown): unknown {
 	if (!isRecord(d)) return d;
-	const list = (v: unknown, item: (x: unknown) => unknown): unknown =>
-		Array.isArray(v) ? Array.from(v as unknown[], item) : v;
+	// The length is read once, and a list longer than any layout holds is
+	// not read at all: its shape check then fails (amendment v2.5 item 2).
+	const list = (v: unknown, item: (x: unknown) => unknown): unknown => {
+		if (!Array.isArray(v)) return v;
+		const items = v as unknown[];
+		const length = items.length;
+		if (length > DESCRIPTION_LIST_LIMIT) return undefined;
+		return Array.from({ length }, (_, i) => item(items[i]));
+	};
 	const fields =
 		(...names: string[]) =>
 		(x: unknown): unknown => {

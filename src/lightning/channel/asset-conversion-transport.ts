@@ -818,7 +818,9 @@ export class AssetConversionTransport {
 	): Promise<void> {
 		if (a.ended || a.state === 'aborting') return;
 		if (a.state === 'draining') {
-			if (type === M.STFU && payload[32] === 1) this.sendAbort(a, WITHDRAWN);
+			// One answer: a side that has sent its tx_abort sends no other.
+			if (type === M.STFU && payload[32] === 1 && !a.abortSent)
+				this.sendAbort(a, WITHDRAWN);
 			return;
 		}
 		const stfu =
