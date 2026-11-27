@@ -81,7 +81,7 @@ export interface IAssetTypePair {
 export async function assetTypePair(
 	s: Scratch,
 	rounds = 0,
-	generation: 5 | 6 = 6
+	generation: 4 | 5 | 6 = 6
 ): Promise<IAssetTypePair> {
 	const p = setupAssetSplicePeerTransport(s.dir(), undefined, generation);
 	s.closing(() => p.close());

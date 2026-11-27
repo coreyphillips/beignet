@@ -10,13 +10,31 @@
  * canSpliceDualFundedAssets holds: a real generation 2 store whose
  * capability getters (and the private assetSpliceWallet) answer as a
  * generation 6 original does. The view exposes no new name.
+ *
+ * #2151 step 2b adds the builder pass (item 7), the claim goldens of
+ * channels with no record (item 8, captured on the step's base into
+ * tests/lightning/fixtures/asset-conversion-claim-goldens.json by
+ * helpers/claim-goldens.ts) and the guards of section 7 and the amendment
+ * (reconcile scopes by generation, restore of a channel with a conversion
+ * row).
  */
 import { expect } from 'chai';
 import { Transaction } from 'bitcoinjs-lib';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
+import sinon from 'sinon';
+import * as assetClaims from '../../src/lightning/chain/asset-opening-claims';
+import * as outputClaims from '../../src/lightning/chain/final-output-claims';
 import { finalOpeningOutputClaims } from '../../src/lightning/chain/final-output-claims';
+import { writeBackupMac } from '../../src/cli/backup-mac';
+import { performAssetChannelRestore } from '../../src/cli/restore';
+import { FinalDeviceJournal } from '../../src/lightning/storage/final-device-journal';
+import {
+	GOLDEN_CHANNELS,
+	goldenClaims,
+	goldenFixture
+} from './helpers/claim-goldens';
 import { ChannelManager } from '../../src/lightning/channel/channel-manager';
 import {
 	ASSET_OPENING_TYPE_HEX,
@@ -48,8 +66,13 @@ import {
 } from './helpers/channel-type-pairs';
 import {
 	appendBoth,
+	assetParentBranch,
 	buildConversion,
+	conversionExits,
+	exitOf,
+	expectRejection,
 	openingParent,
+	retainBoth,
 	TEXT,
 	typed
 } from './helpers/channel-type-record';
@@ -781,5 +804,213 @@ describe('Current type at each reachable site (#2151 step 2a, items 3 and 8)', f
 			});
 			expect(typed(store).loadFinalChannelTypeRecords(id)).to.deep.equal([]);
 		}
+	});
+});
+
+describe('The builder pass (#2151 step 2b, item 7)', function () {
+	this.timeout(240000);
+	const s = scratch('builder-pass-');
+	afterEach(() => sinon.restore());
+	afterEach(() => s.release());
+
+	it('calls the asset builder it is given and never the lazy fallback', async () => {
+		const pair = await assetTypePair(s, 0);
+		const { store, root } = pair.devices[0];
+		const fallback = sinon
+			.stub(assetClaims, 'assetOpeningOutputClaims')
+			.throws(new Error('the lazy fallback ran'));
+		const given = sinon.stub().returns([]);
+		expect(
+			outputClaims.finalChannelOutputClaims(
+				{ storage: store, root },
+				Buffer.from(pair.id, 'hex'),
+				exitOf(pair.devices[1], pair.id),
+				destination,
+				1,
+				undefined,
+				undefined,
+				(cid) => store.loadFinalChannelKind(cid),
+				{ asset: given }
+			)
+		).to.deep.equal([]);
+		expect(given.callCount).to.equal(1);
+		expect(fallback.callCount).to.equal(0);
+	});
+
+	it("passes the node's asset builder to the dispatcher", async () => {
+		const pair = await assetTypePair(s, 0);
+		const d = pair.p.f.devices[0];
+		const dispatcher = sinon.spy(outputClaims, 'finalChannelOutputClaims');
+		const running = finalTestNode(6, {
+			wallet: { db: d.store, mnemonic: d.mnemonic }
+		});
+		try {
+			const watcher = (
+				running.node as unknown as {
+					chainWatcher: {
+						finalOutputClaims(
+							id: Buffer,
+							parent: Transaction,
+							destination: Buffer,
+							rate: number,
+							trimmed?: unknown
+						): unknown[];
+					};
+				}
+			).chainWatcher;
+			watcher.finalOutputClaims(
+				Buffer.from(pair.id, 'hex'),
+				exitOf(pair.devices[1], pair.id),
+				destination,
+				1
+			);
+			expect(dispatcher.callCount).to.equal(1);
+			const builders = dispatcher.firstCall.args[8];
+			expect(builders?.asset).to.equal(assetClaims.assetOpeningOutputClaims);
+		} finally {
+			running.close();
+		}
+	});
+});
+
+describe('Claim goldens of channels with no record (#2151 step 2b, item 8)', function () {
+	this.timeout(240000);
+	const s = scratch('claim-goldens-');
+	afterEach(() => s.release());
+	const goldens = JSON.parse(
+		fs.readFileSync(
+			path.join(__dirname, 'fixtures', 'asset-conversion-claim-goldens.json'),
+			'utf8'
+		)
+	) as Record<string, unknown>;
+
+	it('holds a golden for each channel the contract names', () => {
+		expect(Object.keys(goldens)).to.deep.equal(Object.keys(GOLDEN_CHANNELS));
+	});
+	for (const name of Object.keys(GOLDEN_CHANNELS))
+		it(
+			'claims a ' +
+				name +
+				" channel's current and revoked commitments byte for byte as the base did",
+			async () => {
+				expect(goldenClaims(await goldenFixture(s, name))).to.deep.equal(
+					goldens[name]
+				);
+			}
+		);
+});
+
+describe('Reads by generation with no record (#2151 step 2b, section 7 and amendment A9)', function () {
+	this.timeout(240000);
+	const s = scratch('reads-by-generation-');
+	afterEach(() => sinon.restore());
+	afterEach(() => s.release());
+
+	/** The device-journal scopes read while `run` runs. */
+	function scopesRead(run: () => void): Set<string> {
+		const read = sinon.spy(FinalDeviceJournal.prototype, 'read');
+		const prefix = sinon.spy(
+			FinalDeviceJournal.prototype as unknown as {
+				readPrefix(scope: string, id: string): unknown;
+			},
+			'readPrefix'
+		);
+		try {
+			run();
+			return new Set(
+				[...read.getCalls(), ...prefix.getCalls()].map((c) => String(c.args[0]))
+			);
+		} finally {
+			read.restore();
+			prefix.restore();
+		}
+	}
+
+	it('reads no channel-type or conversion scope to claim in generations 2, 4 and 5', async () => {
+		const channels = [
+			{ g: 2, pair: plainTypePair(s, 1, 2) },
+			{ g: 4, pair: await assetTypePair(s, 1, 4) },
+			{ g: 5, pair: await assetTypePair(s, 1, 5) }
+		];
+		for (const { g, pair } of channels) {
+			const { store, root } = pair.devices[0];
+			const scopes = scopesRead(() =>
+				outputClaims.finalChannelOutputClaims(
+					{ storage: store, root },
+					Buffer.from(pair.id, 'hex'),
+					exitOf(pair.devices[1], pair.id),
+					destination,
+					1,
+					undefined,
+					undefined,
+					(cid) => store.loadFinalChannelKind(cid)
+				)
+			);
+			expect(scopes.has('channel-type'), 'generation ' + g).to.equal(false);
+			expect(scopes.has('conversion'), 'generation ' + g).to.equal(false);
+		}
+	});
+
+	it('reconciles the conversion and channel-type scopes in generation 6 only', async () => {
+		const channels = [
+			{ g: 2, pair: plainTypePair(s, 0, 2) },
+			{ g: 4, pair: await assetTypePair(s, 0, 4) },
+			{ g: 5, pair: await assetTypePair(s, 0, 5) },
+			{ g: 6, pair: await assetTypePair(s, 0, 6) }
+		];
+		for (const { g, pair } of channels) {
+			const scopes = scopesRead(() => {
+				pair.restart(0);
+			});
+			expect(scopes.has('splice'), 'generation ' + g + ' reconciles').to.equal(
+				true
+			);
+			for (const scope of ['channel-type', 'conversion'])
+				expect(scopes.has(scope), 'generation ' + g + ' ' + scope).to.equal(
+					g === 6
+				);
+		}
+	});
+});
+
+describe('Restore of a channel with a conversion row (#2151 step 2b, amendment A4)', function () {
+	this.timeout(240000);
+	const s = scratch('conversion-restore-');
+	afterEach(() => s.release());
+
+	it('refuses restore from a backup that holds a pending conversion', async () => {
+		const pair = await assetTypePair(s, 1);
+		const { id, devices } = pair;
+		const c = buildConversion(devices, id, {
+			type: 'plain',
+			stateNumber: 1,
+			parent: openingParent(devices[0].store, id)
+		});
+		retainBoth(
+			devices,
+			id,
+			conversionExits(
+				devices,
+				c,
+				devices.map((d) => assetParentBranch(d.store, id, 1))
+			)
+		);
+		const dir = s.dir();
+		const mac = Buffer.alloc(32, 79);
+		const backup = path.join(dir, 'conversion.db');
+		await devices[0].store.backup(backup);
+		await writeBackupMac(mac, backup);
+		const d = pair.p.f.devices[0];
+		d.store.close();
+		await expectRejection(() =>
+			performAssetChannelRestore(
+				backup,
+				d.file,
+				path.join(dir, 'restore.lock'),
+				d.party.binding,
+				id,
+				mac
+			)
+		);
 	});
 });

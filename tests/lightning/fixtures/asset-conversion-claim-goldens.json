@@ -1,0 +1,655 @@
+{
+	"generation 6 plain": {
+		"ours": {
+			"parent": "9f12af932038b8c9017de26cee84ca6b240a6ad4cf3bf162be23a0690991ccec",
+			"direct": [
+				{
+					"outputIndex": 3,
+					"relativeDelay": 61,
+					"absoluteHeight": 0,
+					"tx": "02000000000101eccc910969a023be62f13bcfd46a0a246bca84ee6ce27d01c9b8382093af129f03000000003d000000015d5b010000000000160014cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd03402bd2d5aae67fff1f45c5c2c34381f21492dacc967b6f4a228cf345e2dd9bdae0a01031f27f1ebc7b7d3bd3b7f149cfb2d82f83a71a351314a0d86706a0eaf66725209cca1d89130218c54c0525e96859de1ae1c232187b36c06f5ecc16e468af2aafad013db241c0dca094751109d0bd055d03565874e8276dd53e926b44e3bd1bb6bf4bc130a2799de2e58035cd43213e41dc8d5aaab56ad929295ddc231f9a16f97cf612bad0f100000000",
+					"confirmedOnly": false,
+					"assetBalanceOutput": false,
+					"sponsor": false,
+					"paymentHash": null,
+					"htlcId": null,
+					"recover": false,
+					"matchesAssetPayout": false,
+					"confirmAssetPayout": false,
+					"child": false
+				}
+			],
+			"dispatched": [
+				{
+					"outputIndex": 3,
+					"relativeDelay": 61,
+					"absoluteHeight": 0,
+					"tx": "02000000000101eccc910969a023be62f13bcfd46a0a246bca84ee6ce27d01c9b8382093af129f03000000003d000000015d5b010000000000160014cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd03402bd2d5aae67fff1f45c5c2c34381f21492dacc967b6f4a228cf345e2dd9bdae0a01031f27f1ebc7b7d3bd3b7f149cfb2d82f83a71a351314a0d86706a0eaf66725209cca1d89130218c54c0525e96859de1ae1c232187b36c06f5ecc16e468af2aafad013db241c0dca094751109d0bd055d03565874e8276dd53e926b44e3bd1bb6bf4bc130a2799de2e58035cd43213e41dc8d5aaab56ad929295ddc231f9a16f97cf612bad0f100000000",
+					"confirmedOnly": false,
+					"assetBalanceOutput": false,
+					"sponsor": false,
+					"paymentHash": null,
+					"htlcId": null,
+					"recover": false,
+					"matchesAssetPayout": false,
+					"confirmAssetPayout": false,
+					"child": false
+				}
+			]
+		},
+		"peer current": {
+			"parent": "c74b26c8f4e1530c1fb1d05ae5fdf82012a50902675a5f1a98d579c44c6edd9a",
+			"direct": [
+				{
+					"outputIndex": 3,
+					"relativeDelay": 1,
+					"absoluteHeight": 0,
+					"tx": "020000000001019add6e4cc479d5981a5f5a670209a51220f8fde55ad0b11f0c53e1f4c8264bc703000000000100000001655b010000000000160014cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd03401098c750808ba4aa8bbd8bf73e8c05769ef96f89fa3f3c5fe38925f4e769ebb53be2c3e9475a8983a5e3b723f12aad282b4ecaff07eda6310778856b76c03d932420e7aa51d8c7d66d85de465962d1670e9bca301eb69902eefedfdc731bcf6cad15ad51b221c1dca094751109d0bd055d03565874e8276dd53e926b44e3bd1bb6bf4bc130a27900000000",
+					"confirmedOnly": false,
+					"assetBalanceOutput": false,
+					"sponsor": false,
+					"paymentHash": null,
+					"htlcId": null,
+					"recover": false,
+					"matchesAssetPayout": false,
+					"confirmAssetPayout": false,
+					"child": false
+				}
+			],
+			"dispatched": [
+				{
+					"outputIndex": 3,
+					"relativeDelay": 1,
+					"absoluteHeight": 0,
+					"tx": "020000000001019add6e4cc479d5981a5f5a670209a51220f8fde55ad0b11f0c53e1f4c8264bc703000000000100000001655b010000000000160014cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd03401098c750808ba4aa8bbd8bf73e8c05769ef96f89fa3f3c5fe38925f4e769ebb53be2c3e9475a8983a5e3b723f12aad282b4ecaff07eda6310778856b76c03d932420e7aa51d8c7d66d85de465962d1670e9bca301eb69902eefedfdc731bcf6cad15ad51b221c1dca094751109d0bd055d03565874e8276dd53e926b44e3bd1bb6bf4bc130a27900000000",
+					"confirmedOnly": false,
+					"assetBalanceOutput": false,
+					"sponsor": false,
+					"paymentHash": null,
+					"htlcId": null,
+					"recover": false,
+					"matchesAssetPayout": false,
+					"confirmAssetPayout": false,
+					"child": false
+				}
+			]
+		},
+		"peer revoked": {
+			"parent": "282f001d032193a4d601eddf2a8cc242048620d3641223a25817d1ba88ee6bf0",
+			"direct": [
+				{
+					"outputIndex": 3,
+					"relativeDelay": 1,
+					"absoluteHeight": 0,
+					"tx": "02000000000101f06bee88bad11758a2231264d320860442c28c2adfed01d6a49321031d002f2803000000000100000001935b010000000000160014cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd0340b0da8c6cd3894e3172fb1b877a31a363bd663c409503dcf4ff83bf72bfcaca8d3fb52273cdc781caa1c5fef09835129cc090537cf9a7d3a43d72943fc2dc6b352420e7aa51d8c7d66d85de465962d1670e9bca301eb69902eefedfdc731bcf6cad15ad51b221c1dca094751109d0bd055d03565874e8276dd53e926b44e3bd1bb6bf4bc130a27900000000",
+					"confirmedOnly": false,
+					"assetBalanceOutput": false,
+					"sponsor": false,
+					"paymentHash": null,
+					"htlcId": null,
+					"recover": false,
+					"matchesAssetPayout": false,
+					"confirmAssetPayout": false,
+					"child": false
+				},
+				{
+					"outputIndex": 2,
+					"relativeDelay": 0,
+					"absoluteHeight": 0,
+					"tx": "02000000000101f06bee88bad11758a2231264d320860442c28c2adfed01d6a49321031d002f2802000000000000000001cbc2000000000000160014cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd0340efbef8cb1aa8d2973d5636a52ca63deff51d19a68ce21dd36f3081218c2e4502da12a4a7a44c9015b394d5e7f74da9a5e948d717b8e79576e231c910ac7bd1014420b08efa5c2789f7709d04a27b9711b83fc30eee4344b0c692264aad78818cbc84752064e450910e92f0a6f5b563c14d9d32903525dcc12aff809b342583712f18bbc8ac41c1dca094751109d0bd055d03565874e8276dd53e926b44e3bd1bb6bf4bc130a279e11e935d5d687710bbe5bb702f83a59ab0a8c0bea149bb6b7a51a145d334f14400000000",
+					"confirmedOnly": false,
+					"assetBalanceOutput": false,
+					"sponsor": false,
+					"paymentHash": null,
+					"htlcId": null,
+					"recover": false,
+					"matchesAssetPayout": false,
+					"confirmAssetPayout": false,
+					"child": false
+				}
+			],
+			"dispatched": [
+				{
+					"outputIndex": 3,
+					"relativeDelay": 1,
+					"absoluteHeight": 0,
+					"tx": "02000000000101f06bee88bad11758a2231264d320860442c28c2adfed01d6a49321031d002f2803000000000100000001935b010000000000160014cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd0340b0da8c6cd3894e3172fb1b877a31a363bd663c409503dcf4ff83bf72bfcaca8d3fb52273cdc781caa1c5fef09835129cc090537cf9a7d3a43d72943fc2dc6b352420e7aa51d8c7d66d85de465962d1670e9bca301eb69902eefedfdc731bcf6cad15ad51b221c1dca094751109d0bd055d03565874e8276dd53e926b44e3bd1bb6bf4bc130a27900000000",
+					"confirmedOnly": false,
+					"assetBalanceOutput": false,
+					"sponsor": false,
+					"paymentHash": null,
+					"htlcId": null,
+					"recover": false,
+					"matchesAssetPayout": false,
+					"confirmAssetPayout": false,
+					"child": false
+				},
+				{
+					"outputIndex": 2,
+					"relativeDelay": 0,
+					"absoluteHeight": 0,
+					"tx": "02000000000101f06bee88bad11758a2231264d320860442c28c2adfed01d6a49321031d002f2802000000000000000001cbc2000000000000160014cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd0340efbef8cb1aa8d2973d5636a52ca63deff51d19a68ce21dd36f3081218c2e4502da12a4a7a44c9015b394d5e7f74da9a5e948d717b8e79576e231c910ac7bd1014420b08efa5c2789f7709d04a27b9711b83fc30eee4344b0c692264aad78818cbc84752064e450910e92f0a6f5b563c14d9d32903525dcc12aff809b342583712f18bbc8ac41c1dca094751109d0bd055d03565874e8276dd53e926b44e3bd1bb6bf4bc130a279e11e935d5d687710bbe5bb702f83a59ab0a8c0bea149bb6b7a51a145d334f14400000000",
+					"confirmedOnly": false,
+					"assetBalanceOutput": false,
+					"sponsor": false,
+					"paymentHash": null,
+					"htlcId": null,
+					"recover": false,
+					"matchesAssetPayout": false,
+					"confirmAssetPayout": false,
+					"child": false
+				}
+			]
+		}
+	},
+	"generation 6 asset": {
+		"ours": {
+			"parent": "4414617c1f67da3954113b4de0bfb21978ee999f18b8feb5baf93add66eb3e89",
+			"direct": [
+				{
+					"outputIndex": 3,
+					"relativeDelay": 61,
+					"absoluteHeight": 0,
+					"tx": null,
+					"confirmedOnly": false,
+					"assetBalanceOutput": true,
+					"sponsor": false,
+					"paymentHash": null,
+					"htlcId": null,
+					"recover": false,
+					"matchesAssetPayout": false,
+					"confirmAssetPayout": true,
+					"child": false
+				}
+			],
+			"dispatched": [
+				{
+					"outputIndex": 3,
+					"relativeDelay": 61,
+					"absoluteHeight": 0,
+					"tx": null,
+					"confirmedOnly": false,
+					"assetBalanceOutput": true,
+					"sponsor": false,
+					"paymentHash": null,
+					"htlcId": null,
+					"recover": false,
+					"matchesAssetPayout": false,
+					"confirmAssetPayout": true,
+					"child": false
+				}
+			]
+		},
+		"peer current": {
+			"parent": "a8e134494427310538d8a94806f2ffab3d4e195656b3e9d1dacd44a05ca1ce6e",
+			"direct": [
+				{
+					"outputIndex": 3,
+					"relativeDelay": 1,
+					"absoluteHeight": 0,
+					"tx": null,
+					"confirmedOnly": false,
+					"assetBalanceOutput": true,
+					"sponsor": false,
+					"paymentHash": null,
+					"htlcId": null,
+					"recover": false,
+					"matchesAssetPayout": false,
+					"confirmAssetPayout": true,
+					"child": false
+				}
+			],
+			"dispatched": [
+				{
+					"outputIndex": 3,
+					"relativeDelay": 1,
+					"absoluteHeight": 0,
+					"tx": null,
+					"confirmedOnly": false,
+					"assetBalanceOutput": true,
+					"sponsor": false,
+					"paymentHash": null,
+					"htlcId": null,
+					"recover": false,
+					"matchesAssetPayout": false,
+					"confirmAssetPayout": true,
+					"child": false
+				}
+			]
+		},
+		"peer revoked": {
+			"parent": "e63b675cff35949e7dc29b0ec0b91a1116c39a56a0680efaae05c0fb7ec9f47f",
+			"direct": [
+				{
+					"outputIndex": 3,
+					"relativeDelay": 1,
+					"absoluteHeight": 0,
+					"tx": null,
+					"confirmedOnly": false,
+					"assetBalanceOutput": true,
+					"sponsor": false,
+					"paymentHash": null,
+					"htlcId": null,
+					"recover": false,
+					"matchesAssetPayout": false,
+					"confirmAssetPayout": true,
+					"child": false
+				},
+				{
+					"outputIndex": 2,
+					"relativeDelay": 0,
+					"absoluteHeight": 0,
+					"tx": null,
+					"confirmedOnly": false,
+					"assetBalanceOutput": true,
+					"sponsor": false,
+					"paymentHash": null,
+					"htlcId": null,
+					"recover": false,
+					"matchesAssetPayout": false,
+					"confirmAssetPayout": true,
+					"child": false
+				}
+			],
+			"dispatched": [
+				{
+					"outputIndex": 3,
+					"relativeDelay": 1,
+					"absoluteHeight": 0,
+					"tx": null,
+					"confirmedOnly": false,
+					"assetBalanceOutput": true,
+					"sponsor": false,
+					"paymentHash": null,
+					"htlcId": null,
+					"recover": false,
+					"matchesAssetPayout": false,
+					"confirmAssetPayout": true,
+					"child": false
+				},
+				{
+					"outputIndex": 2,
+					"relativeDelay": 0,
+					"absoluteHeight": 0,
+					"tx": null,
+					"confirmedOnly": false,
+					"assetBalanceOutput": true,
+					"sponsor": false,
+					"paymentHash": null,
+					"htlcId": null,
+					"recover": false,
+					"matchesAssetPayout": false,
+					"confirmAssetPayout": true,
+					"child": false
+				}
+			]
+		}
+	},
+	"generation 5 asset": {
+		"ours": {
+			"parent": "57af48d98eb985d0b33d458bbc406b5479d671bf0baf834135419dd7efc69856",
+			"direct": [
+				{
+					"outputIndex": 3,
+					"relativeDelay": 61,
+					"absoluteHeight": 0,
+					"tx": null,
+					"confirmedOnly": false,
+					"assetBalanceOutput": true,
+					"sponsor": false,
+					"paymentHash": null,
+					"htlcId": null,
+					"recover": false,
+					"matchesAssetPayout": false,
+					"confirmAssetPayout": true,
+					"child": false
+				}
+			],
+			"dispatched": [
+				{
+					"outputIndex": 3,
+					"relativeDelay": 61,
+					"absoluteHeight": 0,
+					"tx": null,
+					"confirmedOnly": false,
+					"assetBalanceOutput": true,
+					"sponsor": false,
+					"paymentHash": null,
+					"htlcId": null,
+					"recover": false,
+					"matchesAssetPayout": false,
+					"confirmAssetPayout": true,
+					"child": false
+				}
+			]
+		},
+		"peer current": {
+			"parent": "f9c767d94f73df744b8955cb0e9bccef43c5521520f27737a251af74a80cfac2",
+			"direct": [
+				{
+					"outputIndex": 3,
+					"relativeDelay": 1,
+					"absoluteHeight": 0,
+					"tx": null,
+					"confirmedOnly": false,
+					"assetBalanceOutput": true,
+					"sponsor": false,
+					"paymentHash": null,
+					"htlcId": null,
+					"recover": false,
+					"matchesAssetPayout": false,
+					"confirmAssetPayout": true,
+					"child": false
+				}
+			],
+			"dispatched": [
+				{
+					"outputIndex": 3,
+					"relativeDelay": 1,
+					"absoluteHeight": 0,
+					"tx": null,
+					"confirmedOnly": false,
+					"assetBalanceOutput": true,
+					"sponsor": false,
+					"paymentHash": null,
+					"htlcId": null,
+					"recover": false,
+					"matchesAssetPayout": false,
+					"confirmAssetPayout": true,
+					"child": false
+				}
+			]
+		},
+		"peer revoked": {
+			"parent": "d23de0833b157e2c9ad20b38857d1b96d49c56da70abb94a09e13a182a8cea93",
+			"direct": [
+				{
+					"outputIndex": 3,
+					"relativeDelay": 1,
+					"absoluteHeight": 0,
+					"tx": null,
+					"confirmedOnly": false,
+					"assetBalanceOutput": true,
+					"sponsor": false,
+					"paymentHash": null,
+					"htlcId": null,
+					"recover": false,
+					"matchesAssetPayout": false,
+					"confirmAssetPayout": true,
+					"child": false
+				},
+				{
+					"outputIndex": 2,
+					"relativeDelay": 0,
+					"absoluteHeight": 0,
+					"tx": null,
+					"confirmedOnly": false,
+					"assetBalanceOutput": true,
+					"sponsor": false,
+					"paymentHash": null,
+					"htlcId": null,
+					"recover": false,
+					"matchesAssetPayout": false,
+					"confirmAssetPayout": true,
+					"child": false
+				}
+			],
+			"dispatched": [
+				{
+					"outputIndex": 3,
+					"relativeDelay": 1,
+					"absoluteHeight": 0,
+					"tx": null,
+					"confirmedOnly": false,
+					"assetBalanceOutput": true,
+					"sponsor": false,
+					"paymentHash": null,
+					"htlcId": null,
+					"recover": false,
+					"matchesAssetPayout": false,
+					"confirmAssetPayout": true,
+					"child": false
+				},
+				{
+					"outputIndex": 2,
+					"relativeDelay": 0,
+					"absoluteHeight": 0,
+					"tx": null,
+					"confirmedOnly": false,
+					"assetBalanceOutput": true,
+					"sponsor": false,
+					"paymentHash": null,
+					"htlcId": null,
+					"recover": false,
+					"matchesAssetPayout": false,
+					"confirmAssetPayout": true,
+					"child": false
+				}
+			]
+		}
+	},
+	"generation 4 asset": {
+		"ours": {
+			"parent": "ba72024b2565b56b0a4d8a5d2ef768cbec32ad85594477ff3604c44f5d88525f",
+			"direct": [
+				{
+					"outputIndex": 3,
+					"relativeDelay": 61,
+					"absoluteHeight": 0,
+					"tx": null,
+					"confirmedOnly": false,
+					"assetBalanceOutput": true,
+					"sponsor": false,
+					"paymentHash": null,
+					"htlcId": null,
+					"recover": false,
+					"matchesAssetPayout": false,
+					"confirmAssetPayout": false,
+					"child": false
+				}
+			],
+			"dispatched": [
+				{
+					"outputIndex": 3,
+					"relativeDelay": 61,
+					"absoluteHeight": 0,
+					"tx": null,
+					"confirmedOnly": false,
+					"assetBalanceOutput": true,
+					"sponsor": false,
+					"paymentHash": null,
+					"htlcId": null,
+					"recover": false,
+					"matchesAssetPayout": false,
+					"confirmAssetPayout": false,
+					"child": false
+				}
+			]
+		},
+		"peer current": {
+			"parent": "f0c4ca798054f0236305083b20d1a3adafa1de0a06f308543000a0b51e8b56d1",
+			"direct": [
+				{
+					"outputIndex": 3,
+					"relativeDelay": 1,
+					"absoluteHeight": 0,
+					"tx": null,
+					"confirmedOnly": false,
+					"assetBalanceOutput": true,
+					"sponsor": false,
+					"paymentHash": null,
+					"htlcId": null,
+					"recover": false,
+					"matchesAssetPayout": false,
+					"confirmAssetPayout": false,
+					"child": false
+				}
+			],
+			"dispatched": [
+				{
+					"outputIndex": 3,
+					"relativeDelay": 1,
+					"absoluteHeight": 0,
+					"tx": null,
+					"confirmedOnly": false,
+					"assetBalanceOutput": true,
+					"sponsor": false,
+					"paymentHash": null,
+					"htlcId": null,
+					"recover": false,
+					"matchesAssetPayout": false,
+					"confirmAssetPayout": false,
+					"child": false
+				}
+			]
+		},
+		"peer revoked": {
+			"parent": "fc1644624fb33012d487f37586c3e6ba7212ffa05619b7f21e7d03ea068197a6",
+			"direct": [],
+			"dispatched": []
+		}
+	},
+	"generation 2 plain": {
+		"ours": {
+			"parent": "3518088b17ff88bacc1ee5a92250d31af20bb9aa126e0c2d7ad6919d5424a3f4",
+			"direct": [
+				{
+					"outputIndex": 3,
+					"relativeDelay": 61,
+					"absoluteHeight": 0,
+					"tx": "02000000000101f4a324549d91d67a2d0c6e12aab90bf21ad35022a9e51eccba88ff178b08183503000000003d000000015d5b010000000000160014cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd0340a81a22e74c603e9705d8074b373c2387b55b59ebbf3f08670b7ac98e7e17d74b95af0050fbba52be865581132d46f93ac6d61fccc8e09e15a8fa8f58311ddd85252074c4e21201967fbd5823b93478fe7c62e1cffae636c00646b41bec0bd6f7b492ad013db241c1dca094751109d0bd055d03565874e8276dd53e926b44e3bd1bb6bf4bc130a279046dcef3fb637426b51e18867a89d75d94c9a58b62ba9d9a1a78a434a665773e00000000",
+					"confirmedOnly": false,
+					"assetBalanceOutput": false,
+					"sponsor": false,
+					"paymentHash": null,
+					"htlcId": null,
+					"recover": false,
+					"matchesAssetPayout": false,
+					"confirmAssetPayout": false,
+					"child": false
+				}
+			],
+			"dispatched": [
+				{
+					"outputIndex": 3,
+					"relativeDelay": 61,
+					"absoluteHeight": 0,
+					"tx": "02000000000101f4a324549d91d67a2d0c6e12aab90bf21ad35022a9e51eccba88ff178b08183503000000003d000000015d5b010000000000160014cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd0340a81a22e74c603e9705d8074b373c2387b55b59ebbf3f08670b7ac98e7e17d74b95af0050fbba52be865581132d46f93ac6d61fccc8e09e15a8fa8f58311ddd85252074c4e21201967fbd5823b93478fe7c62e1cffae636c00646b41bec0bd6f7b492ad013db241c1dca094751109d0bd055d03565874e8276dd53e926b44e3bd1bb6bf4bc130a279046dcef3fb637426b51e18867a89d75d94c9a58b62ba9d9a1a78a434a665773e00000000",
+					"confirmedOnly": false,
+					"assetBalanceOutput": false,
+					"sponsor": false,
+					"paymentHash": null,
+					"htlcId": null,
+					"recover": false,
+					"matchesAssetPayout": false,
+					"confirmAssetPayout": false,
+					"child": false
+				}
+			]
+		},
+		"peer current": {
+			"parent": "0bae76241432748a949b455eb2e60485fe6a416cd2659f6139cef1f3863e0108",
+			"direct": [
+				{
+					"outputIndex": 3,
+					"relativeDelay": 1,
+					"absoluteHeight": 0,
+					"tx": "0200000000010108013e86f3f1ce39619f65d26c416afe8504e6b25e459b948a7432142476ae0b03000000000100000001655b010000000000160014cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd0340206fd9c32f800279f2e5d305416adbd92296629e0b9cb56fd73a29d4d4a95036653e98b88633f5fa4913af9d3634c8b822533eb3c63120720778a372f99cdbf82420df88021163086de91b0ec24c0001c6c84c9d2f80be42ea3de99eeb4056f516a3ad51b221c0dca094751109d0bd055d03565874e8276dd53e926b44e3bd1bb6bf4bc130a27900000000",
+					"confirmedOnly": false,
+					"assetBalanceOutput": false,
+					"sponsor": false,
+					"paymentHash": null,
+					"htlcId": null,
+					"recover": false,
+					"matchesAssetPayout": false,
+					"confirmAssetPayout": false,
+					"child": false
+				}
+			],
+			"dispatched": [
+				{
+					"outputIndex": 3,
+					"relativeDelay": 1,
+					"absoluteHeight": 0,
+					"tx": "0200000000010108013e86f3f1ce39619f65d26c416afe8504e6b25e459b948a7432142476ae0b03000000000100000001655b010000000000160014cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd0340206fd9c32f800279f2e5d305416adbd92296629e0b9cb56fd73a29d4d4a95036653e98b88633f5fa4913af9d3634c8b822533eb3c63120720778a372f99cdbf82420df88021163086de91b0ec24c0001c6c84c9d2f80be42ea3de99eeb4056f516a3ad51b221c0dca094751109d0bd055d03565874e8276dd53e926b44e3bd1bb6bf4bc130a27900000000",
+					"confirmedOnly": false,
+					"assetBalanceOutput": false,
+					"sponsor": false,
+					"paymentHash": null,
+					"htlcId": null,
+					"recover": false,
+					"matchesAssetPayout": false,
+					"confirmAssetPayout": false,
+					"child": false
+				}
+			]
+		},
+		"peer revoked": {
+			"parent": "982b4d45215faf06e562fe31a02e3a0eb30e74bbf3e9f10eb27859f667db1502",
+			"direct": [
+				{
+					"outputIndex": 3,
+					"relativeDelay": 1,
+					"absoluteHeight": 0,
+					"tx": "020000000001010215db67f65978b20ef1e9f3bb740eb30e3a2ea031fe62e506af5f21454d2b9803000000000100000001935b010000000000160014cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd0340d0e9614340f4c9529f88155cfcb9c26e6f16ec063d8bfc7a0be65879a561907e1ed11f8a543396e054cabb6c540060dcb538beb35d3a036aba6ef4be486bd9802420df88021163086de91b0ec24c0001c6c84c9d2f80be42ea3de99eeb4056f516a3ad51b221c0dca094751109d0bd055d03565874e8276dd53e926b44e3bd1bb6bf4bc130a27900000000",
+					"confirmedOnly": false,
+					"assetBalanceOutput": false,
+					"sponsor": false,
+					"paymentHash": null,
+					"htlcId": null,
+					"recover": false,
+					"matchesAssetPayout": false,
+					"confirmAssetPayout": false,
+					"child": false
+				},
+				{
+					"outputIndex": 2,
+					"relativeDelay": 0,
+					"absoluteHeight": 0,
+					"tx": "020000000001010215db67f65978b20ef1e9f3bb740eb30e3a2ea031fe62e506af5f21454d2b9802000000000000000001cbc2000000000000160014cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd0340bb1d029c770c6ff82178d18d30cafc2b16cc4d0d59b1cc596b6ab622ba357c7b17ac1772e23c0d0c8010dd0f8b8c18a1ffcbc3ba74e74f917297c6bba3dadead44208ae4096d6f0b502322e90cda6833d8117d190929984469875365fe687dce71f0752041b8cd2620c698e2073a5b41972d60a6293af917b9d267166fe8bb023eb0fbecac41c1dca094751109d0bd055d03565874e8276dd53e926b44e3bd1bb6bf4bc130a27944148e116cefbb551abfb2c4d4f74af622d312e56489a54342b461b604ad70c700000000",
+					"confirmedOnly": false,
+					"assetBalanceOutput": false,
+					"sponsor": false,
+					"paymentHash": null,
+					"htlcId": null,
+					"recover": false,
+					"matchesAssetPayout": false,
+					"confirmAssetPayout": false,
+					"child": false
+				}
+			],
+			"dispatched": [
+				{
+					"outputIndex": 3,
+					"relativeDelay": 1,
+					"absoluteHeight": 0,
+					"tx": "020000000001010215db67f65978b20ef1e9f3bb740eb30e3a2ea031fe62e506af5f21454d2b9803000000000100000001935b010000000000160014cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd0340d0e9614340f4c9529f88155cfcb9c26e6f16ec063d8bfc7a0be65879a561907e1ed11f8a543396e054cabb6c540060dcb538beb35d3a036aba6ef4be486bd9802420df88021163086de91b0ec24c0001c6c84c9d2f80be42ea3de99eeb4056f516a3ad51b221c0dca094751109d0bd055d03565874e8276dd53e926b44e3bd1bb6bf4bc130a27900000000",
+					"confirmedOnly": false,
+					"assetBalanceOutput": false,
+					"sponsor": false,
+					"paymentHash": null,
+					"htlcId": null,
+					"recover": false,
+					"matchesAssetPayout": false,
+					"confirmAssetPayout": false,
+					"child": false
+				},
+				{
+					"outputIndex": 2,
+					"relativeDelay": 0,
+					"absoluteHeight": 0,
+					"tx": "020000000001010215db67f65978b20ef1e9f3bb740eb30e3a2ea031fe62e506af5f21454d2b9802000000000000000001cbc2000000000000160014cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd0340bb1d029c770c6ff82178d18d30cafc2b16cc4d0d59b1cc596b6ab622ba357c7b17ac1772e23c0d0c8010dd0f8b8c18a1ffcbc3ba74e74f917297c6bba3dadead44208ae4096d6f0b502322e90cda6833d8117d190929984469875365fe687dce71f0752041b8cd2620c698e2073a5b41972d60a6293af917b9d267166fe8bb023eb0fbecac41c1dca094751109d0bd055d03565874e8276dd53e926b44e3bd1bb6bf4bc130a27944148e116cefbb551abfb2c4d4f74af622d312e56489a54342b461b604ad70c700000000",
+					"confirmedOnly": false,
+					"assetBalanceOutput": false,
+					"sponsor": false,
+					"paymentHash": null,
+					"htlcId": null,
+					"recover": false,
+					"matchesAssetPayout": false,
+					"confirmAssetPayout": false,
+					"child": false
+				}
+			]
+		}
+	}
+}

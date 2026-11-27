@@ -16,11 +16,9 @@
  */
 import { expect } from 'chai';
 import { Transaction } from 'bitcoinjs-lib';
-import { assetOpeningOutputClaims } from '../../src/lightning/chain/asset-opening-claims';
-import { matchedAssetPayoutViews } from '../../src/lightning/chain/asset-splice-output-view';
 import {
 	finalChannelOutputClaims,
-	finalOpeningOutputClaims
+	type IFinalOutputClaim
 } from '../../src/lightning/chain/final-output-claims';
 import {
 	AssetSpliceTransport,
@@ -45,15 +43,9 @@ import {
 import type { IFinalOpeningNonces } from '../../src/lightning/storage/final-opening-nonces';
 import type { SqliteStorage } from '../../src/lightning/storage/sqlite-storage';
 import { loadVectors, hexToBuffer } from './conformance/helpers';
+import { assetTypePair, scratch } from './helpers/channel-type-pairs';
 import {
-	assetTypePair,
-	plainTypePair,
-	scratch,
-	type IAssetTypePair,
-	type IPlainTypePair
-} from './helpers/channel-type-pairs';
-import {
-	appendBoth,
+	assetReporting,
 	assetRounds,
 	buildConversion,
 	expectRefusal,
@@ -66,9 +58,12 @@ import {
 	step2a,
 	TEXT,
 	typed,
+	toAsset as toAssetOf,
+	toPlain as toPlainOf,
+	type IToAsset,
+	type IToPlain,
 	type ITypeDevice
 } from './helpers/channel-type-record';
-import type { Side } from './helpers/final-update-pair';
 import {
 	closeCooperatively,
 	plainUpdates,
@@ -350,29 +345,23 @@ function exitManager(
 	});
 	return { manager, broadcasts, errors };
 }
-function claimsOf(
+/** The dispatcher's claims alone, as the node's chain watcher asks for them. */
+function dispatchedOf(
 	store: SqliteStorage,
 	root: ITypeDevice['root'],
 	id: string,
 	parent: Transaction
-): Record<'dispatched' | 'plain' | 'asset' | 'matched', unknown[]> {
-	const runtime = { storage: store, root };
-	const key = Buffer.from(id, 'hex');
-	return {
-		dispatched: finalChannelOutputClaims(
-			runtime,
-			key,
-			parent,
-			destination,
-			1,
-			undefined,
-			undefined,
-			(cid) => store.loadFinalChannelKind(cid)
-		),
-		plain: finalOpeningOutputClaims(runtime, key, parent, destination, 1),
-		asset: assetOpeningOutputClaims(runtime, key, parent, destination, 1),
-		matched: matchedAssetPayoutViews(store, id, parent)
-	};
+): IFinalOutputClaim[] {
+	return finalChannelOutputClaims(
+		{ storage: store, root },
+		Buffer.from(id, 'hex'),
+		parent,
+		destination,
+		1,
+		undefined,
+		undefined,
+		(cid) => store.loadFinalChannelKind(cid)
+	);
 }
 async function assetSpliceRefusal(
 	store: SqliteStorage,
@@ -412,38 +401,7 @@ describe('A conversion to plain on real SQLite devices (#2151 step 2a, item 5)',
 	const s = scratch('channel-type-to-plain-');
 	afterEach(() => s.release());
 
-	async function toPlain(k: number): Promise<{
-		pair: IAssetTypePair;
-		c: IConversion;
-		sides: Side[];
-		stores: () => SqliteStorage[];
-		parentExits: Transaction[];
-		id: string;
-		devices: ITypeDevice[];
-	}> {
-		const pair: IAssetTypePair = await assetTypePair(s, k);
-		const c = buildConversion(pair.devices, pair.id, {
-			type: 'plain',
-			stateNumber: k,
-			parent: openingParent(pair.devices[0].store, pair.id)
-		});
-		// The asset parent's exit, before the record.
-		const parentExits = pair.devices[0].store
-			.loadFinalFundingExits(pair.id)
-			.map((e) => Transaction.fromBuffer(e.exit));
-		appendBoth(pair.devices, c);
-		const sides: Side[] = pair.p.f.devices.map((d) => d.party);
-		const stores = (): SqliteStorage[] => pair.devices.map((d) => d.store);
-		return {
-			pair,
-			c,
-			sides,
-			stores,
-			parentExits,
-			id: pair.id,
-			devices: pair.devices
-		};
-	}
+	const toPlain = (k: number): Promise<IToPlain> => toPlainOf(s, k);
 	/** One plain round at N + 1 each way, returning each revoke_and_ack. */
 	function roundEachWay(t: Awaited<ReturnType<typeof toPlain>>): Buffer[] {
 		const st = t.stores();
@@ -700,20 +658,29 @@ describe('A conversion to plain on real SQLite devices (#2151 step 2a, item 5)',
 		wire.destroy();
 	});
 
-	it('builds no claims for the recorded channel, from the new exit or the asset parent', async () => {
+	// Flipped by #2151 step 2b: a recorded channel is claimed by branch.
+	it('claims the new exit by the plain builder and the asset parent by the asset builder (#2151 step 2b)', async () => {
 		const t = await toPlain(1);
 		const { store, root } = t.devices[0];
 		const exits = store
 			.loadFinalFundingExits(t.id)
 			.map((e) => Transaction.fromBuffer(e.exit));
 		expect(exits.map((e) => e.ins[0].hash)).to.deep.equal([t.c.tx.getHash()]);
-		for (const exit of [...exits, ...t.parentExits])
-			expect(claimsOf(store, root, t.id, exit)).to.deep.equal({
-				dispatched: [],
-				plain: [],
-				asset: [],
-				matched: []
-			});
+		// Our plain commitment at N: to_local after its delay, with no asset reporting.
+		const [plain] = exits.map((e) => dispatchedOf(store, root, t.id, e));
+		expect(plain).to.have.length(1);
+		expect(plain[0].tx, 'a signed to_local sweep').to.not.equal(null);
+		expect(plain[0].relativeDelay).to.be.greaterThan(1);
+		expect(plain[0].tx!.ins[0].hash).to.deep.equal(exits[0].getHash());
+		expect(plain.some(assetReporting)).to.equal(false);
+		// Our asset commitment of the parent at N: the asset builder's balance output.
+		expect(t.parentExits).to.have.length(1);
+		for (const exit of t.parentExits) {
+			const claims = dispatchedOf(store, root, t.id, exit);
+			expect(claims).to.have.length(1);
+			expect(claims[0].assetBalanceOutput).to.equal(true);
+			expect(claims[0].relativeDelay).to.be.greaterThan(1);
+		}
 	});
 
 	it('closes cooperatively by spending the new funding', async () => {
@@ -728,21 +695,7 @@ describe('A conversion to asset on real SQLite devices (#2151 step 2a, item 6)',
 	const s = scratch('channel-type-to-asset-');
 	afterEach(() => s.release());
 
-	function toAsset(k: number): {
-		pair: IPlainTypePair;
-		c: IConversion;
-		id: string;
-		devices: ITypeDevice[];
-	} {
-		const pair: IPlainTypePair = plainTypePair(s, k);
-		const c = buildConversion(pair.devices, pair.id, {
-			type: 'asset',
-			stateNumber: k,
-			parent: openingParent(pair.stores[0], pair.id)
-		});
-		appendBoth(pair.devices, c);
-		return { pair, c, id: pair.id, devices: pair.devices };
-	}
+	const toAsset = (k: number): IToAsset => toAssetOf(s, k);
 
 	it('runs as asset: refuses plain updates and both kinds of splice', async () => {
 		const t = toAsset(1);
@@ -829,18 +782,17 @@ describe('A conversion to asset on real SQLite devices (#2151 step 2a, item 6)',
 		).to.deep.equal([t.c.tx.getHash()]);
 	});
 
-	it('builds no claims for the recorded channel', () => {
+	// Flipped by #2151 step 2b: a recorded channel is claimed by branch.
+	it('claims the new exit by the asset builder (#2151 step 2b)', () => {
 		const t = toAsset(1);
 		const { store, root } = t.devices[0];
 		const [exit] = store
 			.loadFinalFundingExits(t.id)
 			.map((e) => Transaction.fromBuffer(e.exit));
 		expect(exit.ins[0].hash).to.deep.equal(t.c.tx.getHash());
-		expect(claimsOf(store, root, t.id, exit)).to.deep.equal({
-			dispatched: [],
-			plain: [],
-			asset: [],
-			matched: []
-		});
+		const claims = dispatchedOf(store, root, t.id, exit);
+		expect(claims).to.have.length(1);
+		expect(claims[0].assetBalanceOutput).to.equal(true);
+		expect(claims[0].relativeDelay).to.be.greaterThan(1);
 	});
 });
