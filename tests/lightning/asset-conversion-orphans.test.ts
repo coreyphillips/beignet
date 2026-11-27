@@ -10,8 +10,10 @@
  *   open with no live attempt;
  * - a record whose append and re-read both fail is pulled in by a later
  *   read, again with no live attempt.
- * The last group pins guards the site audit listed as green with no test
+ * The third group pins guards the site audit listed as green with no test
  * (G1 to G3, the sweep's outer wrap and the strict reader with planted rows).
+ * The last pins the order of an end and its report when a send throws
+ * (amendments B4 and B5).
  */
 import { expect } from 'chai';
 import { createHash } from 'crypto';
@@ -19,6 +21,8 @@ import path from 'path';
 import sinon from 'sinon';
 import type Database from 'better-sqlite3';
 import type { ChannelManager } from '../../src/lightning/channel/channel-manager';
+import { encodeTxAbortMessage } from '../../src/lightning/message/interactive-tx';
+import { MessageType } from '../../src/lightning/message/types';
 import { checkedConversionAttempts } from '../../src/lightning/storage/final-conversion-attempt';
 import { FinalDeviceJournal } from '../../src/lightning/storage/final-device-journal';
 import type { SqliteStorage } from '../../src/lightning/storage/sqlite-storage';
@@ -37,6 +41,8 @@ import {
 import {
 	abandoned,
 	abortText,
+	attemptOf,
+	conversionDeps,
 	conversionPair,
 	FENCE,
 	held,
@@ -221,6 +227,18 @@ function sampleRecord(
 		agreement: 'e5'.repeat(32),
 		keyIndex: 7
 	};
+}
+
+type Send = (peer: string, type: number, payload: Buffer) => void;
+/** Make side i's conversion sends of tx_abort throw; returns the undo. */
+function failAbortSends(p: IConversionPair, i: 0 | 1): () => void {
+	const deps = conversionDeps(p.managers[i]);
+	const send = deps.send as Send;
+	deps.send = (peer: string, type: number, payload: Buffer): void => {
+		if (type === MessageType.TX_ABORT) throw new Error('the send failed');
+		send(peer, type, payload);
+	};
+	return () => (deps.send = send);
 }
 
 /** Append an event to the scope through the device journal, past the writers. */
@@ -622,6 +640,100 @@ describe('Asset conversion orphans (#2151 step 4a, amendments B1 and B2)', funct
 					).to.throw(INVALID);
 					expect(attemptRowCount(store, id), 'nothing written').to.equal(2);
 				});
+		});
+	});
+
+	describe('An end before its report when a send throws (amendments B4 and B5)', () => {
+		const PEER_TEXT = 'The peer ends it';
+		/** Side 0 is past its layout_ack; the peer's tx_abort comes in and side 0's echo throws. */
+		async function echoThrows(
+			p: IConversionPair,
+			atReport: (reason: string) => void,
+			quiet: () => void = (): void => undefined
+		): Promise<number> {
+			const base = rows(p, 0);
+			p.link.hold('asset_splice:4');
+			expect((await run(p, 0)).error, 'start').to.equal(undefined);
+			quiet();
+			const m = p.managers[0];
+			m.on('error', (_id: Buffer | null, reason: string) => atReport(reason));
+			const undo = failAbortSends(p, 0);
+			try {
+				m.handleMessage(
+					p.nodeIds[1],
+					MessageType.TX_ABORT,
+					encodeTxAbortMessage({
+						channelId: p.channelId,
+						data: Buffer.from(PEER_TEXT)
+					})
+				);
+			} catch {
+				// The send's error may reach the caller; the end must not wait on it.
+			} finally {
+				undo();
+			}
+			return base;
+		}
+
+		it("B4: ends the attempt when its echo of the peer's tx_abort cannot be sent, and the withdrawal stands", async () => {
+			const p = await fresh();
+			const base = await echoThrows(p, () => undefined);
+			const m = p.managers[0];
+			expect(attemptOf(m, p.id), 'ended').to.equal(undefined);
+			expect(held(m, p.id)).to.equal(false);
+			expect(kindsSince(p, 0, base)).to.deep.equal([
+				'conversion-attempt',
+				PEER_TEXT
+			]);
+			expect(conversionQuiet(m, p.id), 'not quiet').to.equal(false);
+			expect(abandoned(p, 0), 'one end').to.deep.equal([PEER_TEXT]);
+		});
+
+		it('B4: reports a failed withdrawal after that end', async () => {
+			const p = await fresh();
+			const live: boolean[] = [];
+			await echoThrows(
+				p,
+				(reason) => {
+					if (reason.startsWith(WITHDRAWAL_FAILED))
+						live.push(attemptOf(p.managers[0], p.id) !== undefined);
+				},
+				// The withdrawal fails, not the record.
+				() => failCommits(p, 0, 1)
+			);
+			expect(live, 'reported once, the attempt already ended').to.deep.equal([
+				false
+			]);
+		});
+
+		it('B5: a deadline whose tx_abort cannot be sent ends the attempt before it reports (fake clock)', async () => {
+			const p = await fresh({
+				quiescenceTimeoutMs: 5000,
+				config: [{}, { quiescenceTimeoutMs: 60_000 }]
+			});
+			p.link.hold('asset_splice:4');
+			const m = p.managers[0];
+			const live: boolean[] = [];
+			m.on('error', (_id: Buffer | null, reason: string) => {
+				if (reason.includes('the send failed'))
+					live.push(attemptOf(m, p.id) !== undefined);
+			});
+			const undo = failAbortSends(p, 0);
+			try {
+				clock = sinon.useFakeTimers({
+					now: Date.now(),
+					toFake: ['Date', 'setTimeout', 'clearTimeout']
+				});
+				expect((await run(p, 0)).error, 'start').to.equal(undefined);
+				expect(held(m, p.id), 'laid-out').to.equal(true);
+				await tick(p, clock, 5100);
+			} finally {
+				undo();
+			}
+			expect(live, 'reported once, the attempt already ended').to.deep.equal([
+				false
+			]);
+			expect(held(m, p.id)).to.equal(false);
 		});
 	});
 });
