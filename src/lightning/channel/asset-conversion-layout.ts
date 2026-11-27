@@ -647,17 +647,72 @@ function describedShape(d: unknown): d is {
 }
 
 /**
+ * A plain copy of a host's description, read once per field before any
+ * check (amendment v2.4 item 2): arrays become dense arrays (a hole is
+ * `undefined`), records become plain objects of the named fields, and
+ * Buffers are copied. Anything else is kept as read, for the shape check.
+ */
+function copyDescription(d: unknown): unknown {
+	if (!isRecord(d)) return d;
+	const list = (v: unknown, item: (x: unknown) => unknown): unknown =>
+		Array.isArray(v) ? Array.from(v as unknown[], item) : v;
+	const fields =
+		(...names: string[]) =>
+		(x: unknown): unknown => {
+			if (!isRecord(x)) return x;
+			const out: Record<string, unknown> = {};
+			for (const name of names) {
+				const v = x[name];
+				out[name] = Buffer.isBuffer(v) ? Buffer.from(v) : v;
+			}
+			return out;
+		};
+	const same = (x: unknown): unknown => x;
+	const records = d.commitmentRecordLimits;
+	return {
+		inputs: list(
+			d.inputs,
+			fields('serialId', 'txid', 'vout', 'sequence', 'isShared', 'prevTx')
+		),
+		outputs: list(
+			d.outputs,
+			fields('serialId', 'kind', 'valueSats', 'descriptorHash')
+		),
+		movements: list(
+			d.movements,
+			fields('assetId', 'from', 'outputSerial', 'units')
+		),
+		parentUnits: list(
+			d.parentUnits,
+			fields('assetId', 'initiator', 'acceptor')
+		),
+		feeBudgets: list(d.feeBudgets, same),
+		relativeSatoshis: list(d.relativeSatoshis, same),
+		commitmentRecordLimits: list(records, (r) =>
+			list(r, fields('type', 'maxBytes'))
+		)
+	};
+}
+
+/**
  * The layout of a host's description over the engine's own fields, as the
- * asset splice maps one. A description of the wrong shape is the host's
- * failure; pairs that differ from the terms' budgets and contributions are
- * "Invalid asset conversion layout". Everything is copied.
+ * asset splice maps one. The description is copied first and only the copy
+ * is read. A description of the wrong shape is the host's failure; pairs
+ * that differ from the terms' budgets and contributions are "Invalid asset
+ * conversion layout".
  */
 export function describedConversionLayout(
 	base: IAssetConversionLayoutBase,
 	relativeSatoshis: Pair<bigint>,
 	description: unknown
 ): IAssetConversionLayout {
-	const d = description;
+	let d: unknown;
+	try {
+		d = copyDescription(description);
+	} catch {
+		// A getter or proxy that throws is the host's failure too.
+		return fail(T.describe);
+	}
 	if (!describedShape(d)) return fail(T.describe);
 	if (
 		!samePair(base.feeBudgets, d.feeBudgets as unknown as Pair<bigint>) ||

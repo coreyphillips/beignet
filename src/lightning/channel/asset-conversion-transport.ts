@@ -170,6 +170,8 @@ interface IAttempt {
 	agreement?: Buffer;
 	/** The peer's layout_ack value. */
 	peerAck?: Buffer;
+	/** The side has sent its own tx_abort. */
+	abortSent?: boolean;
 	/** The text of the side's own tx_abort or decline, which its end repeats. */
 	sent?: string;
 	deadline?: ReturnType<typeof setTimeout>;
@@ -357,9 +359,12 @@ export class AssetConversionTransport {
 			let parent = this.preconditions(id);
 			const base = this.context(a, parent);
 			const proposed = await this.hostCall(() =>
-				host.conversionTerms(base, {
-					reference: Buffer.from(request.reference)
-				})
+				host.conversionTerms(
+					{ ...base, parent: { ...base.parent } },
+					{
+						reference: Buffer.from(request.reference)
+					}
+				)
 			);
 			this.live(a);
 			if (!proposed.ok) throw new Error(DECLINED);
@@ -392,10 +397,9 @@ export class AssetConversionTransport {
 			if (floor) throw new Error(floor);
 			a.ctx = { ...base, attempt: Buffer.from(a.attempt) };
 			a.verified = true;
-			const ctx = a.ctx;
 			const verdict = await this.hostCall(() =>
 				host.verifyConversionTerms(
-					{ ...ctx, parent: { ...ctx.parent } },
+					this.ctxCopy(a),
 					JSON.parse(JSON.stringify(terms)) as IAssetConversionTerms,
 					Buffer.from(a.digest!)
 				)
@@ -727,10 +731,9 @@ export class AssetConversionTransport {
 			if (floor) throw new Error(floor);
 			a.ctx = { ...this.context(a, parent), attempt: Buffer.from(a.attempt!) };
 			a.verified = true;
-			const ctx = a.ctx;
 			const verdict = await this.hostCall(() =>
 				host.verifyConversionTerms(
-					{ ...ctx, parent: { ...ctx.parent } },
+					this.ctxCopy(a),
 					JSON.parse(JSON.stringify(a.terms)) as IAssetConversionTerms,
 					Buffer.from(a.digest!)
 				)
@@ -849,11 +852,13 @@ export class AssetConversionTransport {
 
 	/**
 	 * The peer's tx_abort, at once: in `aborting` or `draining` it ends the
-	 * attempt with the side's own text; otherwise it is echoed with its data
-	 * and the attempt ends with its text.
+	 * attempt with the side's own text, and a `draining` side that has sent
+	 * no tx_abort answers it first; otherwise it is echoed with its data and
+	 * the attempt ends with its text.
 	 */
 	private peerAbort(a: IAttempt, payload: Buffer): void {
 		if (a.state === 'aborting' || a.state === 'draining') {
+			if (a.state === 'draining' && !a.abortSent) this.sendAbort(a, WITHDRAWN);
 			this.end(a, a.sent!);
 			return;
 		}
@@ -1381,10 +1386,8 @@ export class AssetConversionTransport {
 			this.rememberWithdrawn(a.id, a.peer, a.attempt);
 		if (!a.verified || !a.ctx || !this.host) return;
 		const host = this.host,
-			ctx = a.ctx;
-		void this.hostCall(() =>
-			host.abandonConversion({ ...ctx, parent: { ...ctx.parent } }, text)
-		).then((r) => {
+			ctx = this.ctxCopy(a);
+		void this.hostCall(() => host.abandonConversion(ctx, text)).then((r) => {
 			if (!r.ok && r.error !== undefined)
 				this.deps.report(
 					a.id,
@@ -1637,6 +1640,7 @@ export class AssetConversionTransport {
 	}
 
 	private sendAbort(a: IAttempt, text: string): void {
+		a.abortSent = true;
 		this.send(
 			a,
 			M.TX_ABORT,

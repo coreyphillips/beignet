@@ -1530,7 +1530,10 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 				report: (id, reason): void =>
 					this.emitContained('error', Buffer.from(id, 'hex'), reason),
 				timeoutMs: config.quiescenceTimeoutMs,
+				// Called as a method of the config, as its other callbacks are.
 				feerateEstimate: config.conversionFeerateEstimate
+					? () => config.conversionFeerateEstimate!()
+					: undefined
 			}
 		);
 	}
