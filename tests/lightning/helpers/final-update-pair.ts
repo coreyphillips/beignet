@@ -31,13 +31,33 @@ const policy = {
 	maxAcceptedHtlcs: 40,
 	channelReserveSats: '1000'
 };
-const limits = { local: policy, remote: policy };
+const defaultLimits = { local: policy, remote: policy };
+/**
+ * Opening terms a test may override. The defaults are the fixture's: dust
+ * 354 on the opener's side and 1000 on the acceptor's, and at most 40
+ * accepted HTLCs on each side.
+ */
+export interface IReadyPairTerms {
+	localDustLimitSatoshis?: number;
+	remoteDustLimitSatoshis?: number;
+	maxAcceptedHtlcs?: number;
+}
 function openingWithChange(
 	alice: Side,
-	bob: Side
+	bob: Side,
+	overrides: IReadyPairTerms = {}
 ): ReturnType<typeof signingFixture> {
 	const fixture = signingFixture(false, alice, bob);
-	const { candidate, funding, terms } = fixture;
+	const { candidate, funding } = fixture;
+	const terms = {
+		...fixture.terms,
+		...(overrides.localDustLimitSatoshis !== undefined && {
+			localDustLimitSatoshis: overrides.localDustLimitSatoshis
+		}),
+		...(overrides.remoteDustLimitSatoshis !== undefined && {
+			remoteDustLimitSatoshis: overrides.remoteDustLimitSatoshis
+		})
+	};
 	const scripts = [alice, bob].map(
 		(side) =>
 			payments.p2wpkh({ pubkey: side.keys.channelBasepoints.fundingPubkey })
@@ -53,7 +73,11 @@ function openingWithChange(
 	funding.addOutput(scripts[1], 110_000);
 	candidate.outputSerialIds.push('3');
 	candidate.fundingTxHex = funding.toHex();
-	return { ...fixture, counterpart: otherOpeningView(candidate, terms) };
+	return {
+		...fixture,
+		terms,
+		counterpart: otherOpeningView(candidate, terms)
+	};
 }
 
 export function walletSigner(
@@ -94,9 +118,22 @@ export function fundReadyPair(
 	a: SqliteStorage,
 	b: SqliteStorage,
 	alice: Side,
-	bob: Side
+	bob: Side,
+	overrides: IReadyPairTerms = {}
 ): string {
-	const { candidate, counterpart, terms, id } = openingWithChange(alice, bob);
+	const { candidate, counterpart, terms, id } = openingWithChange(
+		alice,
+		bob,
+		overrides
+	);
+	const htlcs = overrides.maxAcceptedHtlcs;
+	const limits =
+		htlcs === undefined
+			? defaultLimits
+			: {
+					local: { ...policy, maxAcceptedHtlcs: htlcs },
+					remote: { ...policy, maxAcceptedHtlcs: htlcs }
+			  };
 	const second = (p: typeof alice): string =>
 		getPublicKey(
 			generateFromSeed(p.keys.perCommitmentSeed, MAX_INDEX - 1n)

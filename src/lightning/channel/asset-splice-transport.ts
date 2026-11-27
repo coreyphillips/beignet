@@ -2,6 +2,7 @@ import {
 	receivedAdoptedSpliceSignature,
 	type AdoptedSpliceReplayEvent
 } from '../storage/asset-splice-release-replay';
+import { channelTypeRecordsOf } from '../storage/final-channel-type';
 import { assetUpdateFundingMembers } from '../storage/asset-splice-exit-proofs';
 import { assetUpdateHistory } from '../storage/asset-update-history';
 import { INBOUND_HTLC_CLAIM_FORCE_CLOSE_BUFFER } from '../node/config';
@@ -198,6 +199,14 @@ function attemptId(id: string, b: Begin, key: Buffer) {
 	);
 }
 
+/** Splices of a channel with a `channel-type` record are refused in #2151 step 2a. */
+function refuseRecordedSplice(store: SqliteStorage, id: string): void {
+	if (channelTypeRecordsOf(store, id).length)
+		throw new Error(
+			'Splices of a channel with a recorded type change are not supported yet'
+		);
+}
+
 /** Each channel advances on one queue. The original device records public key allocation, both offers and exact wires before use. */
 export class AssetSpliceTransport {
 	private live = new Map<string, Live>();
@@ -280,6 +289,8 @@ export class AssetSpliceTransport {
 			!opening.funding ||
 			opening.exitToBroadcast ||
 			!opening.session.assetEvidence ||
+			// A recorded channel has no splice parent in #2151 step 2a.
+			channelTypeRecordsOf(this.store, id).length ||
 			!opening.session.updateLimits
 		)
 			return;
@@ -463,6 +474,7 @@ export class AssetSpliceTransport {
 			try {
 				if (
 					!this.store.loadFinalOpeningSession(id)?.assetEvidence ||
+					channelTypeRecordsOf(this.store, id).length ||
 					this.store.loadFinalDaemonOpening(id)?.exitToBroadcast
 				)
 					continue;
@@ -492,6 +504,7 @@ export class AssetSpliceTransport {
 			.filter(
 				(c) =>
 					this.store.loadFinalOpeningSession(c.channelId)?.assetEvidence &&
+					!channelTypeRecordsOf(this.store, c.channelId).length &&
 					!!this.pending(c.channelId)
 			);
 		if (active.length + this.inbound.size >= MAX_NEGOTIATING_CHANNELS)
@@ -556,6 +569,7 @@ export class AssetSpliceTransport {
 	}
 	async start(id: string, options: IStartAssetSplice) {
 		await this.enqueue(id, async () => {
+			refuseRecordedSplice(this.store, id);
 			const peer = this.store.loadFinalOpeningSession(id)?.peer;
 			validOptions(options.fundingFeeratePerkw, options.minimumDepth);
 			if (
@@ -687,6 +701,7 @@ export class AssetSpliceTransport {
 	// allocate the funding key only after both that observation and its state agree.
 	private receiveStfu(id: string, peer: string): void {
 		if (this.inbound.has(id)) return;
+		refuseRecordedSplice(this.store, id);
 		this.store.assertAssetSpliceCanStart(id);
 		const parent = this.parentBinding(id);
 		if (!parent)
@@ -716,6 +731,7 @@ export class AssetSpliceTransport {
 		parent: ParentBinding & Pick<Begin, 'htlcDeadline'>,
 		deadline: number
 	): InboundStfu {
+		refuseRecordedSplice(this.store, id);
 		const request: InboundStfu = {
 			peer,
 			parent,

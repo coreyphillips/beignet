@@ -2,6 +2,7 @@ import {
 	assetUpdateHistory,
 	type IAssetUpdateSecured
 } from './asset-update-history';
+import { channelTypeRecordsOf } from './final-channel-type';
 import { Transaction } from 'bitcoinjs-lib';
 import { isDeepStrictEqual } from 'util';
 import {
@@ -226,6 +227,12 @@ export function retainAssetSpliceExitProofs(
 ): void {
 	if (!store.canSpliceDualFundedAssets)
 		throw new Error('Proof retention requires the original splice wallet');
+	// Stored proofs verify against the opening's era, the only one with
+	// splices in #2151 step 2a; a recorded channel retains no new proofs.
+	if (channelTypeRecordsOf(store, id).length)
+		throw new Error(
+			'Splices of a channel with a recorded type change are not supported yet'
+		);
 	const evidence = verifyRecovery(store, canonical(id, supplied));
 	const head = store.readAssetSpliceJournal<AssetSpliceExitEvent>(id);
 	for (const row of head.records) {

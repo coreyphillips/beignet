@@ -5,6 +5,10 @@ import {
 } from './asset-splice-recovery';
 import { decodeAssetUpdateIntent } from '../channel/asset-splice-update-intent';
 import type { SqliteStorage } from './sqlite-storage';
+import type {
+	IFinalAssetSeed,
+	IFinalChannelTypeRecord
+} from './final-channel-type';
 
 export interface IAssetUpdateSavedHtlc {
 	id: string;
@@ -66,16 +70,62 @@ export type AssetUpdateEvent =
 				| 'peer-revoke';
 			bytes: string;
 	  };
+/** The current asset record, whose seed starts the asset ledger at its state number (#2151). */
+export function currentAssetRecord(
+	store: SqliteStorage,
+	id: string
+): IFinalChannelTypeRecord | undefined {
+	// A store without records (a test double or an older surface) has none.
+	const records =
+		typeof store.loadFinalChannelTypeRecords === 'function'
+			? store.loadFinalChannelTypeRecords(id)
+			: [];
+	const latest = records.at(-1);
+	return latest?.type === 'asset' ? latest : undefined;
+}
+/** The seed of an asset record as the secured state at its N. */
+function seededState(
+	id: string,
+	r: IFinalChannelTypeRecord
+): IAssetUpdateSecured {
+	const seed = r.seed as IFinalAssetSeed;
+	return {
+		kind: 'asset-update-secured',
+		id,
+		height: r.stateNumber,
+		digest: seed.digest,
+		feerate: seed.feerate,
+		nextLocalId: seed.nextLocalId,
+		nextPeerId: seed.nextPeerId,
+		htlcs: [],
+		members: seed.members,
+		peerCommitments: seed.members.map((m) => m.remoteCommitment),
+		localCommitments: seed.members.map((m) => m.localCommitment)
+	};
+}
 export function assetUpdateHistory(store: SqliteStorage, id: string) {
-	const all = store
-		.readAssetSpliceJournal<AssetUpdateEvent>(id)
-		.records.filter(
-			(e) =>
-				e.kind === 'asset-update-stage' || e.kind === 'asset-update-secured'
-		);
+	const record = currentAssetRecord(store, id);
+	const seedHeight = record ? BigInt(record.stateNumber) : undefined;
+	const all = store.readAssetSpliceJournal<AssetUpdateEvent>(id).records.filter(
+		(e) =>
+			(e.kind === 'asset-update-stage' || e.kind === 'asset-update-secured') &&
+			// The seed shadows every height at or below its N.
+			(seedHeight === undefined ||
+				!/^[0-9]+$/.test(e.height) ||
+				BigInt(e.height) > seedHeight)
+	);
 	const states = new Map<bigint, IAssetUpdateSecured>(),
 		stages = new Map<string, string>(),
 		digests = new Map<bigint, string>();
+	if (record && seedHeight !== undefined) {
+		const seed = record.seed as IFinalAssetSeed;
+		states.set(seedHeight, seededState(id, record));
+		digests.set(seedHeight, seed.digest);
+		if (seed.localRevoke)
+			stages.set(seedHeight + '/local-revoke', seed.localRevoke);
+		if (seed.peerRevoke)
+			stages.set(seedHeight + '/peer-revoke', seed.peerRevoke);
+	}
 	for (const e of all) {
 		const height = BigInt(e.height);
 		if (
@@ -104,7 +154,14 @@ export function assetUpdateHistory(store: SqliteStorage, id: string) {
 			throw new Error('Invalid asset update signing stage');
 		stages.set(key, e.bytes);
 	}
-	return { states, stages, digests, latest: [...states.values()].at(-1) };
+	return {
+		states,
+		stages,
+		digests,
+		latest: [...states.values()].at(-1),
+		seedHeight,
+		seed: record?.seed as IFinalAssetSeed | undefined
+	};
 }
 
 const isHex = (v: unknown, bytes?: number): v is string =>
@@ -172,8 +229,9 @@ export function assetSpliceUpdateHead(store: SqliteStorage, id: string) {
 	const last = newest ? BigInt(newest.height) : 0n;
 	const acknowledged =
 		newest &&
-		history.stages.has(last + '/local-revoke') &&
-		history.stages.has(last + '/peer-revoke');
+		(history.seedHeight === last ||
+			(history.stages.has(last + '/local-revoke') &&
+				history.stages.has(last + '/peer-revoke')));
 	const current = acknowledged ? newest : history.states.get(last - 1n);
 	const nextNumber = current ? BigInt(current.height) + 1n : 1n;
 	const intent = history.stages.get(nextNumber + '/intent');

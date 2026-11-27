@@ -25,7 +25,13 @@ export function matchedAssetPayoutViews(
 ) {
 	const opening = storage.loadFinalOpening(id),
 		session = storage.loadFinalOpeningSession(id);
-	if (!opening || !session?.assetEvidence) return [];
+	// Matching by branch after a recorded type change is #2151 step 2b.
+	if (
+		!opening ||
+		!session?.assetEvidence ||
+		storage.loadFinalChannelTypeRecords(id).length
+	)
+		return [];
 	const evidence = session.assetEvidence;
 	const history = storage.canSpliceDualFundedAssets
 		? assetUpdateHistory(storage, id)

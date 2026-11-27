@@ -131,6 +131,35 @@ export function validateAssetOpening(
 	return checked;
 }
 
+/**
+ * Validate an opening's fixed fields (basepoints, opener and its own funding
+ * output and script, which carries `openingRoot` only for an asset opening)
+ * for a channel whose current type is `channelType`, a plain final type.
+ */
+export function validateFinalOpeningAs(
+	c: IFinalOpeningCandidate,
+	channelType: string,
+	openingRoot?: Buffer
+): { encoded: string; fundingOutpoint: string } {
+	requireCandidate(isFinalTaprootTypeHex(channelType), 'channel type');
+	return validateOpening(c, openingRoot);
+}
+
+/** As validateFinalOpeningAs, for a current asset type. A plain opening may have one contributor. */
+export function validateAssetOpeningAs(
+	c: IFinalOpeningCandidate,
+	channelType: string,
+	openingRoot?: Buffer
+): { encoded: string; fundingOutpoint: string } {
+	requireCandidate(isAssetOpeningType(channelType), 'asset channel type');
+	requireCandidate(
+		openingRoot === undefined ||
+			(Buffer.isBuffer(openingRoot) && openingRoot.length === 32),
+		'asset funding root'
+	);
+	return validateOpening(c, openingRoot);
+}
+
 function validateOpening(c: IFinalOpeningCandidate, fundingRoot?: Buffer) {
 	requireCandidate(
 		typeof c.channelId === 'string' && /^[0-9a-f]{64}$/.test(c.channelId),

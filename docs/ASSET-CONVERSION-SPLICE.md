@@ -70,6 +70,7 @@ Today a final wallet is one generation, chosen when it is made, and the generati
   - the gates that take a session with `updateLimits` for a plain channel, since asset sessions store `updateLimits` too: the plain ledger in `src/lightning/storage/sqlite-storage.ts`, and `updatesReady` and `collectCommitmentBatch` in `src/lightning/channel/final-opening-transport.ts`;
   - `IFinalSpliceTerms.assetFundingRoots` (`src/lightning/channel/final-splice-candidate.ts`), which requires a root on both sides;
   - the claim builders.
+- **In place (Step 2a).** The `channel-type` record (`src/lightning/storage/final-channel-type.ts`, written by `SqliteStorage.appendFinalChannelType`) and its readers (`loadFinalChannelType`, `loadFinalChannelTypeRecords`, and every site above) are in place, and adoption (Step 5) appends it.
 
 ## Negotiation
 

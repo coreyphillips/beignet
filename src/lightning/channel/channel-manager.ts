@@ -3,6 +3,10 @@ import {
 	completeAssetSpliceRecoveryHost,
 	hasAssetUpdateHost
 } from './asset-splice-update-transport';
+import {
+	channelTypeRecordsOf,
+	currentKindOf
+} from '../storage/final-channel-type';
 import { releasedAssetUpdateFunding } from './asset-splice-update-ledger';
 import type { AssetUpdateChange } from './asset-splice-update-provider';
 import { BeignetCustomSubtype } from '../message/custom';
@@ -1334,8 +1338,10 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 						const open =
 							config.finalOpening!.storage.loadFinalOpeningSession(id);
 						const features = config.localFeatures;
+						// Splices of a recorded channel are refused in #2151 step 2a.
 						return (
 							!!open?.assetEvidence &&
+							!channelTypeRecordsOf(config.finalOpening!.storage, id).length &&
 							open.peer === peer &&
 							!!this.finalTransport?.connected(id) &&
 							!!features &&
@@ -1391,7 +1397,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 								!peer ||
 								!opening?.readyExchanged ||
 								opening.exitToBroadcast ||
-								!opening.session.assetEvidence ||
+								!this.currentAssetType(id, !!opening.session.assetEvidence) ||
 								!this.finalTransport?.connected(id) ||
 								!features ||
 								!assetSpliceNegotiated(
@@ -1414,7 +1420,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 							return (
 								!!opening?.readyExchanged &&
 								!opening.exitToBroadcast &&
-								!!opening.session.assetEvidence &&
+								this.currentAssetType(id, !!opening.session.assetEvidence) &&
 								opening.session.peer === peer &&
 								!!config.localFeatures &&
 								assetSpliceNegotiated(
@@ -4882,9 +4888,24 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 	): ChainAction[] {
 		const channelIdHex = channelId.toString('hex');
 		const runtime = this.config.finalOpening;
+		// A record's funding spending its parent is the channel's type change,
+		// not a close: no close is observed for it in either branch below.
+		if (
+			runtime &&
+			channelTypeRecordsOf(runtime.storage, channelIdHex).some(
+				(r) =>
+					bitcoin.Transaction.fromHex(r.funding.fundingTxHex).getId() ===
+					spendingTx.getId()
+			)
+		)
+			return [];
 		if (runtime?.storage.canOpenDualFundedAssets) {
 			const opening = runtime.storage.loadFinalDaemonOpening(channelIdHex);
-			if (opening?.session.assetEvidence) {
+			// The asset branch follows the current type, on the opening's evidence.
+			if (
+				opening?.session.assetEvidence &&
+				this.currentAssetType(channelIdHex, true)
+			) {
 				const spends = spendingTx.ins.map(
 					(input) =>
 						Buffer.from(input.hash).reverse().toString('hex') +
@@ -5298,6 +5319,8 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		// back to the wallet when no asset channel can need them any more.
 		this.releaseFreeFixedOutputFeeCoins();
 
+		// Asset markers follow the current type; read after the per-channel work.
+		this.rereadAssetMarkers();
 		return allActions;
 	}
 
@@ -5855,7 +5878,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 						type === MessageType.CHANNEL_READY ||
 						type === MessageType.CHANNEL_REESTABLISH ||
 						(this.config.finalOpening!.storage.canUpdateFinalCommitments &&
-							!session.assetEvidence &&
+							!this.currentAssetType(id, !!session.assetEvidence) &&
 							(isFinalCommitmentUpdate(type) ||
 								type === MessageType.REVOKE_AND_ACK ||
 								type === MessageType.SHUTDOWN ||
@@ -10376,6 +10399,8 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		if (height < 1 || this.finalObservedClose.has(id)) return;
 		const openingAtDepth = this.finalTransport?.hasDepth(id);
 		const store = this.config.finalOpening?.storage;
+		// A recorded channel's funding is watched from Step 5: no asset update height before then.
+		if (store && channelTypeRecordsOf(store, id).length) return;
 		if (
 			!store?.canSpliceDualFundedAssets ||
 			!this.assetSpliceConfirmation?.hasChannel(id)
@@ -10569,9 +10594,15 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 
 	private watchFinalOpening(candidate: IFinalOpeningCandidate): void {
 		const tx = bitcoin.Transaction.fromHex(candidate.fundingTxHex);
+		// A recorded type change arms no asset marker in #2151 step 2a: the
+		// record's watch is Step 5's.
 		if (
 			isAssetOpeningType(candidate.channelType) &&
-			!this.assetCollateral.has(candidate.channelId)
+			!this.assetCollateral.has(candidate.channelId) &&
+			!channelTypeRecordsOf(
+				this.config.finalOpening?.storage ?? {},
+				candidate.channelId
+			).length
 		) {
 			this.assetFundingChannels.set(tx.getId(), candidate.channelId);
 			this.assetCollateral.set(candidate.channelId, {
@@ -10591,6 +10622,43 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		);
 	}
 
+	/** The current type is asset (#2151): the latest record's, else the opening's evidence. */
+	private currentAssetType(id: string, openingAsset: boolean): boolean {
+		const storage = this.config.finalOpening?.storage;
+		if (!storage) return openingAsset;
+		return (
+			currentKindOf(storage, id, openingAsset ? 'asset' : 'plain') === 'asset'
+		);
+	}
+
+	/** Asset markers follow the current type: a channel recorded since its watch loses them at the next block. */
+	private rereadAssetMarkers(): void {
+		const storage = this.config.finalOpening?.storage;
+		// A manager assembled without its fields (a test double) has no markers.
+		const markers = this.assetCollateral as
+			| typeof this.assetCollateral
+			| undefined;
+		if (!storage || !markers?.size) return;
+		for (const id of [...markers.keys()]) {
+			// One unreadable channel must not stop the block's work for the others.
+			let recorded: boolean;
+			try {
+				recorded = channelTypeRecordsOf(storage, id).length > 0;
+			} catch (err) {
+				this.emitContained(
+					'error',
+					Buffer.from(id, 'hex'),
+					err instanceof Error ? err.message : String(err)
+				);
+				continue;
+			}
+			if (!recorded) continue;
+			this.assetCollateral.delete(id);
+			for (const [txid, owner] of this.assetFundingChannels)
+				if (owner === id) this.assetFundingChannels.delete(txid);
+		}
+	}
+
 	restoreFinalOpeningBroadcasts(): void {
 		this.restoreAssetSpliceWatches();
 		for (const {
@@ -10601,7 +10669,14 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		} of this.config.finalOpening?.storage.loadFinalDaemonOpenings() ?? []) {
 			this.watchFinalOpening(candidate);
 			const store = this.config.finalOpening!.storage;
-			if (store.canUpdateFinalCommitments && !session.assetEvidence) {
+			if (
+				store.canUpdateFinalCommitments &&
+				currentKindOf(
+					store,
+					candidate.channelId,
+					session.assetEvidence ? 'asset' : 'plain'
+				) === 'plain'
+			) {
 				const id = candidate.channelId;
 				this.finalTransport?.restoreFinalSettlements(id);
 				for (const a of store.loadFinalSpliceAttempts(id)) {
@@ -10732,7 +10807,13 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		const seen = this.finalObservedFunding.get(id);
 		const opening = storage.loadFinalOpening(id);
 		if (!opening) return;
-		const txids = [bitcoin.Transaction.fromHex(opening.fundingTxHex).getId()];
+		// After a recorded type change the channel lives on the record's funding only.
+		const recorded = channelTypeRecordsOf(storage, id).at(-1);
+		const txids = [
+			bitcoin.Transaction.fromHex(
+				(recorded?.funding ?? opening).fundingTxHex
+			).getId()
+		];
 		for (const attempt of storage.loadFinalSpliceAttempts(id)) {
 			const funding = releasedFinalSpliceFunding(attempt);
 			if (funding)
@@ -10786,6 +10867,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		const opening = storage.loadFinalDaemonOpening(id);
 		if (
 			!opening?.session.assetEvidence ||
+			channelTypeRecordsOf(storage, id).length ||
 			!storage.loadFinalLocalTxSignatures(id)
 		)
 			return;
@@ -10810,6 +10892,9 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			collateral.present = height !== undefined;
 			collateral.confirmed = height !== undefined && height > 0;
 		}
+		// The opening's anchor belongs to the current asset era only.
+		if (channelTypeRecordsOf(this.config.finalOpening!.storage, id).length)
+			return;
 		if (this.assetSpliceConfirmation?.hasChannel(id)) {
 			const summary =
 				this.config.finalOpening!.storage.loadAssetSpliceFundingInfo(id);
@@ -10822,6 +10907,20 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		const storage = this.config.finalOpening?.storage;
 		const c = storage?.loadFinalOpening(id);
 		if (!c) return;
+		// A recorded channel lives on the record's funding, by the record's type.
+		const recorded = channelTypeRecordsOf(storage!, id).at(-1);
+		if (recorded) {
+			const live = bitcoin.Transaction.fromHex(
+				recorded.funding.fundingTxHex
+			).getId();
+			const confirmed = !!this.finalDepthByChannel.get(id)?.has(live);
+			if (confirmed) this.finalObservedClose.delete(id);
+			if (recorded.type === 'asset')
+				this.finalTransport?.assetFundingSpendable(id, confirmed);
+			else if (this.finalTransport?.hasDepth(id) !== confirmed)
+				this.finalTransport?.fundingDepth(id, confirmed);
+			return;
+		}
 		if (
 			storage!.canSpliceDualFundedAssets &&
 			this.assetSpliceConfirmation?.hasChannel(id)
@@ -10953,8 +11052,20 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 					seenClose?.txid ??
 					(exitToBroadcast &&
 						bitcoin.Transaction.fromBuffer(exitToBroadcast).getId());
+				const kind = currentKindOf(
+					storage,
+					candidate.channelId,
+					session.assetEvidence ? 'asset' : 'plain'
+				);
+				const typeRecord = channelTypeRecordsOf(
+					storage,
+					candidate.channelId
+				).at(-1);
 				const asset =
-					session.assetEvidence && funding && storage.canSpliceDualFundedAssets
+					session.assetEvidence &&
+					!typeRecord &&
+					funding &&
+					storage.canSpliceDualFundedAssets
 						? storage.loadAssetSpliceFundingInfo(
 								candidate.channelId,
 								closingTxid
@@ -10962,7 +11073,8 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 						: undefined;
 				if (asset?.reconciliation && !asset.closing) dataLoss = true;
 				const active = asset?.closing ?? asset?.active?.candidate;
-				const fundingRef = active?.funding ?? adopted ?? candidate;
+				const fundingRef =
+					active?.funding ?? adopted ?? typeRecord?.funding ?? candidate;
 				const activeTx = bitcoin.Transaction.fromHex(fundingRef.fundingTxHex);
 				const latest =
 					asset && storage.assetSpliceUpdateHead(candidate.channelId).committed;
@@ -10993,9 +11105,12 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 				const alias =
 					localReady && decodeChannelReadyMessage(localReady).shortChannelId;
 				return {
-					...(session.assetEvidence && { auxiliary: true as const }),
+					...(kind === 'asset' && { auxiliary: true as const }),
 					channelId: Buffer.from(candidate.channelId, 'hex'),
-					channelType: Buffer.from(candidate.channelType, 'hex'),
+					channelType: Buffer.from(
+						typeRecord?.channelType ?? candidate.channelType,
+						'hex'
+					),
 					peerPubkey: session.peer,
 					isPrivate: true,
 					isOpener: candidate.isInitiator,

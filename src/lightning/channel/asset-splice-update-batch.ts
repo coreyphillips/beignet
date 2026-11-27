@@ -62,6 +62,7 @@ import type {
 	IAssetUpdatePeerMember,
 	IAssetUpdateSignedMember
 } from './asset-splice-update-provider';
+import { currentAssetRecord } from '../storage/asset-update-history';
 import {
 	assetUpdateSources,
 	applyAssetChanges,
@@ -150,7 +151,11 @@ export class AssetUpdateFundingUnavailable extends Error {
 export class AssetSpliceUpdateBatch {
 	private readonly opening;
 	private readonly limits;
-	private readonly originalRoot: Buffer;
+	private readonly originalRoot: Buffer | undefined;
+	/** The current asset record's type, when a record changed it from the opening's. */
+	private readonly typeAs;
+	/** The seed of the current asset record, when this round follows it. */
+	private readonly seed;
 	private readonly base;
 	private readonly sources;
 	private readonly prior;
@@ -191,7 +196,19 @@ export class AssetSpliceUpdateBatch {
 		this.opening = opening;
 		this.sources = sources;
 		this.membership = this.fundingMembership();
-		this.originalRoot = bytes(opening.session.assetEvidence!.fundingRoot);
+		// The opening's own root validates the opening's own funding script; a
+		// plain opening has none. The member's root travels in its source.
+		const evidence = opening.session.assetEvidence;
+		this.originalRoot = evidence ? bytes(evidence.fundingRoot) : undefined;
+		const record = currentAssetRecord(store, id);
+		this.typeAs = record && {
+			channelType: record.channelType,
+			...(this.originalRoot && { openingRoot: this.originalRoot })
+		};
+		this.seed =
+			history.seedHeight !== undefined && history.seedHeight === height - 1n
+				? history.seed
+				: undefined;
 		this.identity = deriveLightningKeys(root, 1);
 		store.assertFinalDaemonIdentity(hex(this.identity.nodePublicKey));
 		this.keys = deriveChannelKeys(root, 1, opening.session.channelKeyIndex);
@@ -207,7 +224,10 @@ export class AssetSpliceUpdateBatch {
 		this.base = opening.session.terms;
 		this.limits = opening.session.updateLimits!;
 		const previous = history.stages.get(height - 1n + '/peer-revoke');
-		const point = previous
+		// After a record, the peer's next point is the seed's.
+		const point = this.seed
+			? bytes(this.seed.peerNextPoint)
+			: previous
 			? decodeRevokeAndAckMessage(bytes(previous), { finalTaproot: true })
 					.nextPerCommitmentPoint
 			: bytes(opening.session.remoteSecondPerCommitmentPoint ?? '');
@@ -383,8 +403,10 @@ export class AssetSpliceUpdateBatch {
 			!/^[0-9a-f]{128}$/.test(signature)
 		)
 			throw new Error('Asset update peer membership or holder point differs');
+		// The seed's revoke_and_ack names the old funding: its nonces are the seed's.
 		const previous =
 			!local &&
+			!this.seed &&
 			assetUpdateHistory(this.store, this.id).stages.get(
 				this.height - 1n + '/peer-revoke'
 			);
@@ -397,6 +419,10 @@ export class AssetSpliceUpdateBatch {
 				this.sources[i].funding.fundingTxHex
 			).getHash();
 			let expected = promised?.find((e) => e.fundingTxid.equals(hash))?.nonce;
+			if (!local && this.seed && this.seed.peerNonces[i] !== n)
+				throw new Error(
+					'Peer changed the previously promised asset update funding nonce'
+				);
 			if (previous && !expected) {
 				const txid = Transaction.fromHex(
 					this.sources[i].funding.fundingTxHex
@@ -516,13 +542,14 @@ export class AssetSpliceUpdateBatch {
 			s,
 			this.next.htlcs,
 			s.funding,
-			this.originalRoot,
+			this.originalRoot as Buffer,
 			{
 				fundingRoot: bytes(s.root),
 				toLocal: e?.toLocal,
 				toRemote: e?.toRemote,
 				htlcs: e?.htlcs
-			}
+			},
+			this.typeAs
 		);
 	}
 	private request(): IAssetUpdateRound {
@@ -823,10 +850,11 @@ export class AssetSpliceUpdateBatch {
 			spliceRecoveryView(
 				this.opening.candidate,
 				{ ...this.base, commitmentFeeratePerKw: this.next.feerate },
-				hex(this.originalRoot),
+				this.originalRoot ? hex(this.originalRoot) : '',
 				b,
 				side,
-				String(this.height)
+				String(this.height),
+				this.typeAs
 			);
 		return b;
 	}
@@ -876,7 +904,8 @@ export class AssetSpliceUpdateBatch {
 					fundingRoot: bytes(s.root),
 					transcriptDigest: bytes(this.digest)
 				}
-			}
+			},
+			this.typeAs?.channelType
 		);
 	}
 	commitments(): Buffer[] {

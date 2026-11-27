@@ -291,6 +291,13 @@ export function acceptAssetSpliceReestablish(
 		throw Error(
 			'Asset reconnect commitment or revocation counter differs from the original device'
 		);
+	// Both sides completed round N before a record at N: the old era's
+	// revoke_and_ack names the old funding's nonce and cannot be resent.
+	if (
+		c.history.seedHeight !== undefined &&
+		msg.nextRevocationNumber < c.history.seedHeight
+	)
+		throw Error('Peer reestablish is behind the channel type record');
 	const prior = remote - 1n;
 	const priorRevoke = c.rev(prior - 1n, false);
 	const point =
