@@ -476,7 +476,12 @@ export interface IConversionPair {
 	/** Reconnect both sides and run channel_reestablish and readiness again. */
 	reconnect(): Promise<void>;
 	/** Rebuild side i's manager over its store, as after a restart. */
-	restart(i: 0 | 1): Promise<void>;
+	/**
+	 * Tear side i's manager down as a disconnect does, then build a new one
+	 * from its store. `afterTeardown` runs between the two, so a test can
+	 * tell the old manager's calls from the new one's.
+	 */
+	restart(i: 0 | 1, afterTeardown?: () => void): Promise<void>;
 	/** Plain: updatesReady; asset: the asset update height. */
 	ready(i: 0 | 1): boolean;
 }
@@ -672,10 +677,11 @@ export async function conversionPair(
 			disconnectBoth();
 		},
 		reconnect: connect,
-		async restart(i: 0 | 1): Promise<void> {
+		async restart(i: 0 | 1, afterTeardown?: () => void): Promise<void> {
 			managers[i].handlePeerDisconnected(nodeIds[1 - i]);
 			managers[i].stopAssetOpenings();
 			managers[i].removeAllListeners();
+			afterTeardown?.();
 			managers[i] = build(i);
 			pair.managers[i] = managers[i];
 			managers[1 - i].handlePeerDisconnected(nodeIds[i]);
@@ -904,7 +910,7 @@ export function storeTerms(
 			: PLAIN_TARGET_TYPE_HEX,
 		giver,
 		candidate: {
-			dustLimitSatoshis: byRole(
+			dustLimitSats: byRole(
 				String(session.terms.localDustLimitSatoshis),
 				String(session.terms.remoteDustLimitSatoshis)
 			),
@@ -987,8 +993,15 @@ export function attemptIdOf(
 	outputIndex: number,
 	digest: Buffer
 ): Buffer {
+	// Terms whose index is not a u32 have no attempt id of this form. Check 2
+	// refuses them before the acceptor computes one, so any id serves.
 	const index = Buffer.alloc(4);
-	index.writeUInt32BE(outputIndex);
+	if (
+		Number.isInteger(outputIndex) &&
+		outputIndex >= 0 &&
+		outputIndex <= 0xffffffff
+	)
+		index.writeUInt32BE(outputIndex);
 	return createHash('sha256')
 		.update(
 			Buffer.concat([

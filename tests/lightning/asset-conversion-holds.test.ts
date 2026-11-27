@@ -80,8 +80,8 @@ async function localStarts(
 			out.fee = await text(() => m.updateChannelFee(p.channelId, 555));
 		out.splice = await text(() =>
 			m.startFinalSplice(p.channelId, {
-				localDelta: -10_000n,
-				feeBudget: 2_000n,
+				localDelta: '-10000',
+				feeBudget: '2000',
 				feerate: 1000,
 				locktime: PAIR_HEIGHT,
 				inputs: [],
@@ -104,11 +104,13 @@ async function localStarts(
 				}
 			])
 		);
-		out.fee = await text(() =>
-			m.startAssetSpliceUpdate(p.channelId, [
-				{ kind: 'fee', feeratePerKw: 1555 }
-			])
-		);
+		// Only the opener may change the fee, on either type.
+		if (i === p.opener)
+			out.fee = await text(() =>
+				m.startAssetSpliceUpdate(p.channelId, [
+					{ kind: 'fee', feeratePerKw: 1555 }
+				])
+			);
 		out.splice = await text(() =>
 			m.startAssetSplice(p.channelId, {
 				fundingFeeratePerkw: 1000,
@@ -195,10 +197,18 @@ describe('Holds while an attempt is live (#2151 step 3a, test 7)', function () {
 		const fail = p.managers[0].failHtlc(p.channelId, 0n, Buffer.alloc(32));
 		expect(fail.ok, fail.error).to.equal(true);
 		await p.settle();
+		expect(
+			p.managers[0].finalReceivedHtlc(p.channelId, 0n),
+			'fail committed'
+		).to.equal(undefined);
 		p.link.clearRules();
 		p.link.release();
 		await p.settle();
-		expect(abandoned(p, 0)).to.deep.equal([FENCE]);
+		// The two rounds moved the state number past the held terms' (check 2).
+		expect(abandoned(p, 0)).to.deep.equal([
+			'Asset conversion terms name a different parent'
+		]);
+		await updateRound(p);
 	});
 
 	it('handles an inbound asset update before the stfu as today, and the next check refuses its HTLC', async () => {
@@ -247,8 +257,8 @@ describe('Crossings (#2151 step 3a, test 10)', function () {
 		p.link.hold({ from: 1, name: 'TX_ABORT' });
 		await start(p);
 		const plan = {
-			localDelta: -10_000n,
-			feeBudget: 2_000n,
+			localDelta: '-10000',
+			feeBudget: '2000',
 			feerate: 1000,
 			locktime: PAIR_HEIGHT,
 			inputs: [],
@@ -349,9 +359,10 @@ describe('Crossings (#2151 step 3a, test 10)', function () {
 			]);
 			// Delivered as today: the plain add is recorded, the asset frame reaches its transport.
 			if (kind === 'plain')
-				expect(p.managers[0].finalReceivedHtlc(p.channelId, 0n)).to.not.equal(
-					undefined
-				);
+				expect(p.managers[0].finalUpdateStatus(p.id)?.pending).to.deep.include({
+					direction: 'peer',
+					type: MessageType.UPDATE_ADD_HTLC
+				});
 			else expect(p.errors[0].length).to.be.at.least(errorsBefore);
 		});
 

@@ -11,6 +11,7 @@ import {
 import { BEIGNET_CUSTOM_MESSAGE_TYPE } from '../../src/lightning/message/custom';
 import { MessageType } from '../../src/lightning/message/types';
 import type { IAssetConversionTerms } from '../../src/lightning/channel';
+import { finalBranchReaders } from '../../src/lightning/storage/final-branch-readers';
 import { scratch, type Scratch } from './helpers/channel-type-pairs';
 import {
 	assetParentBranch,
@@ -49,11 +50,13 @@ const IN_PROGRESS = 'A conversion of this channel is in progress';
 /** Side 0 starts; returns its rejection, what reached the wire and the host calls. */
 async function initiate(
 	p: IConversionPair,
-	side: 0 | 1 = 0
+	side: 0 | 1 = 0,
+	prepare?: () => void
 ): Promise<{ error?: string; wire: string[]; calls: string[] }> {
 	const mark = p.link.sent.length,
 		log = p.hostLog.length;
 	agreeOnTerms(p);
+	prepare?.();
 	const start = track(
 		startConversion(p.managers[side], p.channelId, {
 			reference: Buffer.alloc(8, 3)
@@ -172,24 +175,38 @@ describe('Asset conversion preconditions (#2151 step 3a, test 4, section 4)', fu
 	const s = scratch('conversion-preconditions-');
 	after(() => s.release());
 
-	it('refuses a channel with a type record', async () => {
+	// A recorded channel never reaches a connected state before Step 5, so
+	// rules 1 to 3 are read from the storage reader the transport calls.
+	const parentError = (store: object, id: string): string | undefined => {
+		const readers = finalBranchReaders(store);
+		expect(readers, 'storage readers').to.not.equal(undefined);
+		try {
+			readers!.assetConversionParent(id);
+			return undefined;
+		} catch (error) {
+			return error instanceof Error ? error.message : String(error);
+		}
+	};
+
+	it('refuses a channel with a type record (rule 3)', async () => {
 		const t = await toPlain(s, 0);
-		const devices = t.pair.p.f.devices;
-		const p = await pair(s, 'plain', {
-			existing: {
-				id: t.id,
-				stores: t.stores(),
-				roots: devices.map((d) => d.party.root),
-				nodeIds: [
-					devices[0].party.binding.nodeId,
-					devices[1].party.binding.nodeId
-				]
-			}
-		});
-		await refusedAtStart(
-			p,
-			'Asset conversion of a channel with a recorded type change is not supported yet'
+		for (const store of t.stores())
+			expect(parentError(store, t.id)).to.equal(
+				'Asset conversion of a channel with a recorded type change is not supported yet'
+			);
+	});
+
+	it('refuses a generation 5 wallet and an unknown channel in the storage reader (rules 1 and 2)', async () => {
+		const old = await pair(s, 'plain', { generations: [5, 5] });
+		expect(parentError(old.stores[0], old.id)).to.equal(
+			'Asset conversion requires an original conversion wallet'
 		);
+		const p = await pair(s, 'plain');
+		expect(parentError(p.stores[0], p.id)).to.equal(undefined);
+		for (const id of ['00'.repeat(32), 'AB'.repeat(32), 'ab'])
+			expect(parentError(p.stores[0], id), id).to.equal(
+				'Asset conversion requires a funded ready channel'
+			);
 	});
 
 	it('refuses a plain parent opened at 483 HTLCs or with dust limits that are not 354', async () => {
@@ -258,9 +275,14 @@ describe('Asset conversion preconditions (#2151 step 3a, test 4, section 4)', fu
 	it('refuses while a plain round is in flight at the initiator and at the acceptor', async () => {
 		const p = await pair(s, 'plain');
 		const quiet = 'Asset conversion requires a quiescent channel';
-		// Hold the non-opener's revocation so the opener's round stays open.
+		// Hold the non-opener's revocation and its commitment_signed, in order,
+		// so the opener's round stays open on both sides.
 		const other = (1 - p.opener) as 0 | 1;
-		p.link.hold({ from: other, name: 'REVOKE_AND_ACK' });
+		p.link.hold(
+			(m) =>
+				m.from === other &&
+				(m.name === 'REVOKE_AND_ACK' || m.name === 'COMMITMENT_SIGNED')
+		);
 		const r = p.managers[p.opener].updateChannelFee(p.channelId, 777);
 		expect(r.ok, r.error).to.equal(true);
 		await p.settle();
@@ -376,8 +398,8 @@ describe('Asset conversion preconditions (#2151 step 3a, test 4, section 4)', fu
 		const p = await pair(s, 'plain');
 		p.link.hold({ from: 1, name: 'STFU' });
 		p.managers[0].startFinalSplice(p.channelId, {
-			localDelta: -10_000n,
-			feeBudget: 2_000n,
+			localDelta: '-10000',
+			feeBudget: '2000',
 			feerate: 1000,
 			locktime: PAIR_HEIGHT,
 			inputs: [],
@@ -392,11 +414,20 @@ describe('Asset conversion preconditions (#2151 step 3a, test 4, section 4)', fu
 			const p = await pair(s, kind);
 			await updateRound(p);
 			// Terms built from the opening's feerate are declined; the current one converts.
-			const stale = storeTerms(p.stores[1], p.id);
-			stale.firstCommitment.commitmentFeeratePerKw =
-				p.stores[1].loadFinalOpeningSession(p.id)!.terms.commitmentFeeratePerKw;
-			p.hosts[1].terms = (): IAssetConversionTerms => stale;
-			const r = await initiate(p, 1);
+			const opened = p.stores[1].loadFinalOpeningSession(p.id)!.terms
+				.commitmentFeeratePerKw;
+			const r = await initiate(p, 1, () => {
+				p.hosts[1].terms = (_ctx, request): IAssetConversionTerms => {
+					const stale = storeTerms(p.stores[1], p.id, {
+						reference: request.reference
+					});
+					expect(stale.firstCommitment.commitmentFeeratePerKw).to.not.equal(
+						opened
+					);
+					stale.firstCommitment.commitmentFeeratePerKw = opened;
+					return stale;
+				};
+			});
 			expect(r.error).to.equal(
 				"Asset conversion commitment feerate differs from the channel's"
 			);

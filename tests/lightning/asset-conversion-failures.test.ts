@@ -445,17 +445,19 @@ describe('Disconnects and restarts in each state (#2151 step 3a, test 6)', funct
 	let p: IConversionPair;
 	after(() => s.release());
 
-	const states: [string, WireMatch][] = [
-		['I announced', { from: 1, name: 'conversion_reply' }],
-		['A accepted', { from: 0, name: 'STFU' }],
-		['I quiescing', { from: 1, name: 'STFU' }],
-		['A quiesced', { from: 0, name: 'SPLICE' }],
-		['I init-sent', { from: 1, name: 'SPLICE_ACK' }],
-		['A acked', { from: 0, name: 'TX_ABORT' }],
-		['I aborting', { from: 1, name: 'TX_ABORT' }]
+	// In I aborting, A has already ended at I's tx_abort with the fence text
+	// (row "A acked | tx_abort"); only its echo is held.
+	const states: [string, WireMatch, string][] = [
+		['I announced', { from: 1, name: 'conversion_reply' }, DISCONNECTED],
+		['A accepted', { from: 0, name: 'STFU' }, DISCONNECTED],
+		['I quiescing', { from: 1, name: 'STFU' }, DISCONNECTED],
+		['A quiesced', { from: 0, name: 'SPLICE' }, DISCONNECTED],
+		['I init-sent', { from: 1, name: 'SPLICE_ACK' }, DISCONNECTED],
+		['A acked', { from: 0, name: 'TX_ABORT' }, DISCONNECTED],
+		['I aborting', { from: 1, name: 'TX_ABORT' }, FENCE]
 	];
-	for (const [state, at] of states) {
-		it(`ends both sides with "${DISCONNECTED}" at ${state} and replays nothing after reconnect`, async () => {
+	for (const [state, at, peerEnd] of states) {
+		it(`ends I with "${DISCONNECTED}" at ${state}, A with "${peerEnd}", and replays nothing after reconnect`, async () => {
 			p = await shared();
 			clean(p);
 			p.link.hold(at);
@@ -463,7 +465,7 @@ describe('Disconnects and restarts in each state (#2151 step 3a, test 6)', funct
 			p.link.held.splice(0);
 			p.disconnect();
 			expect(abandoned(p, 0)).to.deep.equal([DISCONNECTED]);
-			expect(abandoned(p, 1)).to.deep.equal([DISCONNECTED]);
+			expect(abandoned(p, 1)).to.deep.equal([peerEnd]);
 			p.link.clearRules();
 			const mark = p.link.sent.length;
 			await p.reconnect();
@@ -485,10 +487,14 @@ describe('Disconnects and restarts in each state (#2151 step 3a, test 6)', funct
 			await run(p);
 			p.link.held.splice(0);
 			p.link.clearRules();
-			const before = p.hosts[0].calls('abandonConversion').length;
-			await p.restart(0);
+			// The old manager's teardown ends the attempt as a disconnect does;
+			// count only what the new manager calls.
+			let before = -1;
+			await p.restart(0, () => {
+				before = p.hosts[0].calls('abandonConversion').length;
+			});
 			expect(p.hosts[0].calls('abandonConversion').length).to.equal(before);
-			expect(abandoned(p, 1)).to.deep.equal([DISCONNECTED]);
+			expect(abandoned(p, 1)).to.deep.equal([peerEnd]);
 			expect(held(p.managers[0], p.id)).to.equal(false);
 			await updateRound(p);
 		});
@@ -513,8 +519,11 @@ describe('Restarts on a plain pair (#2151 step 3a, test 6)', function () {
 			await run(p);
 			p.link.held.splice(0);
 			p.link.clearRules();
-			const before = p.hosts[0].calls('abandonConversion').length;
-			await p.restart(0);
+			// Count only what the new manager calls (see above).
+			let before = -1;
+			await p.restart(0, () => {
+				before = p.hosts[0].calls('abandonConversion').length;
+			});
 			expect(p.hosts[0].calls('abandonConversion').length).to.equal(before);
 			expect(abandoned(p, 1)).to.deep.equal([DISCONNECTED]);
 			expect(held(p.managers[0], p.id)).to.equal(false);

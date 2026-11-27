@@ -297,12 +297,12 @@ describe("The engine's checks of the terms (#2151 step 3a, test 2)", function ()
 		],
 		[
 			"the opener's dust limit",
-			(t): unknown => (t.candidate.dustLimitSatoshis.opener = '355'),
+			(t): unknown => (t.candidate.dustLimitSats.opener = '355'),
 			"Asset conversion channel parameters differ from the channel's"
 		],
 		[
 			"the acceptor's dust limit",
-			(t): unknown => (t.candidate.dustLimitSatoshis.acceptor = '353'),
+			(t): unknown => (t.candidate.dustLimitSats.acceptor = '353'),
 			"Asset conversion channel parameters differ from the channel's"
 		],
 		[
@@ -472,34 +472,50 @@ describe("The initiator's checks of its host's terms (#2151 step 3a, test 2)", f
 	for (const [what, change, text] of [
 		[
 			'version 2',
-			(t: IAssetConversionTerms): unknown =>
-				((t as { version: number }).version = 2),
+			(t: IAssetConversionTerms): unknown => {
+				(t as { version: number }).version = 2;
+				return undefined;
+			},
 			'Unsupported asset conversion terms version'
 		],
 		[
 			'another channel id',
-			(t: IAssetConversionTerms): unknown => (t.channelId = 'cd'.repeat(32)),
+			(t: IAssetConversionTerms): unknown => {
+				t.channelId = 'cd'.repeat(32);
+				return undefined;
+			},
 			'Asset conversion terms name a different parent'
 		],
 		[
 			'another target type',
-			(t: IAssetConversionTerms): unknown =>
-				(t.targetType = '0100000000000000000000'),
+			(t: IAssetConversionTerms): unknown => {
+				t.targetType = '0100000000000000000000';
+				return undefined;
+			},
 			'Asset conversion names a different target type'
 		],
 		[
 			'another agreement reference',
-			(t: IAssetConversionTerms): unknown => (t.agreement.reference = 'beef'),
+			(t: IAssetConversionTerms): unknown => {
+				t.agreement.reference = 'beef';
+				return undefined;
+			},
 			'Asset conversion terms name a different agreement'
 		],
 		[
 			'an odd-length reference',
-			(t: IAssetConversionTerms): unknown => (t.agreement.reference = 'abc'),
+			(t: IAssetConversionTerms): unknown => {
+				t.agreement.reference = 'abc';
+				return undefined;
+			},
 			'Invalid asset conversion agreement reference'
 		],
 		[
 			'lock depth 7',
-			(t: IAssetConversionTerms): unknown => (t.lockDepth = 7),
+			(t: IAssetConversionTerms): unknown => {
+				t.lockDepth = 7;
+				return undefined;
+			},
 			'Asset conversion lock depth must be 3 to 6'
 		],
 		[
@@ -601,8 +617,11 @@ describe('A reply naming another attempt (#2151 step 3a, test 9)', function () {
 		await start.done;
 		expect(p.link.held.map((m) => m.name)).to.deep.equal(['conversion_reply']);
 		// The start resolves once the terms are sent, before any reply (v3.1 item 2).
-		expect(start).to.include({ settled: true, error: undefined });
+		expect(start.settled).to.equal(true);
+		expect(start.error).to.equal(undefined);
 		const real = readReply(p.link.held[0]);
+		// The real reply stays held; the injected ones must reach side 0.
+		p.link.clearRules();
 		p.link.inject(
 			1,
 			BEIGNET_CUSTOM_MESSAGE_TYPE,
@@ -619,9 +638,13 @@ describe('A reply naming another attempt (#2151 step 3a, test 9)', function () {
 			replyMessage(Buffer.from(real.attempt, 'hex'), Buffer.alloc(32, 9))
 		);
 		await p.settle();
+		expect(
+			p.link.delivered.filter(
+				(m) => m.from === 1 && m.name === 'conversion_reply'
+			)
+		).to.have.length(2);
 		expect(abandoned(p, 0)).to.deep.equal([]);
 		expect(held(p.managers[0], p.id)).to.equal(true);
-		p.link.clearRules();
 		p.link.release();
 		await p.settle();
 		expect(abandoned(p, 0)).to.deep.equal([FENCE]);
@@ -641,6 +664,7 @@ describe('A reply naming another attempt (#2151 step 3a, test 9)', function () {
 		await start.done;
 		const real = readReply(p.link.held[0]);
 		p.link.held.splice(0);
+		p.link.clearRules();
 		p.link.inject(
 			1,
 			BEIGNET_CUSTOM_MESSAGE_TYPE,
