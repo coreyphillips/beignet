@@ -1,4 +1,5 @@
 import { completeAssetSpliceRecoveryHost } from '../channel/asset-splice-update-transport';
+import { completeAssetConversionHost } from '../channel/asset-conversion-transport';
 import type { AssetUpdateChange } from '../channel/asset-splice-update-provider';
 import {
 	completeAssetSpliceHost,
@@ -2347,6 +2348,11 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			completeAssetSpliceRecoveryHost(config.auxiliaryChannels?.dualFunding);
 		const conversionWallet = !!finalDaemon?.storage.supportsAssetConversion;
 		this.conversionWallet = conversionWallet;
+		// Bit 463 needs the whole conversion surface (#2151 step 3b).
+		const conversionHost =
+			!!finalDaemon?.storage.canConvertAssetChannels &&
+			recoveryHost &&
+			completeAssetConversionHost(config.auxiliaryChannels?.dualFunding);
 		const localFeatures = new NodeFeatureFlags(
 			config.localFeatures ?? LightningNode.defaultFeatures(),
 			Boolean(finalDaemon),
@@ -2355,7 +2361,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			!!finalDaemon?.storage.canSpliceDualFundedAssets &&
 				completeAssetSpliceHost(config.auxiliaryChannels?.dualFunding),
 			recoveryHost,
-			!!finalDaemon?.storage.canConvertAssetChannels && recoveryHost
+			conversionHost
 		);
 		// Advertise anchor support whenever anchors are preferred (the default).
 		if (
@@ -2528,7 +2534,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			localFeatures.setOptional(Feature.OPTION_ASSET_SPLICE);
 		if (recoveryHost)
 			localFeatures.setOptional(Feature.OPTION_ASSET_SPLICE_RECOVERY);
-		if (finalDaemon?.storage.canConvertAssetChannels && recoveryHost)
+		if (conversionHost)
 			localFeatures.setOptional(Feature.OPTION_ASSET_CONVERSION);
 		this.localFeatures = localFeatures;
 
@@ -2632,6 +2638,11 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			largeChannels: this.largeChannels,
 			// BOLT 2 quiescence watchdog window (default 60s in the manager).
 			quiescenceTimeoutMs: config.quiescenceTimeoutMs,
+			// An asset conversion's feerate floor starts from this (#2151).
+			conversionFeerateEstimate: async (): Promise<number | null> => {
+				const satPerVbyte = await this.estimateClampedFeeSatPerVbyte(6);
+				return satPerVbyte === null ? null : satPerVbyteToSatPerKw(satPerVbyte);
+			},
 			// Recovery 5.7 (issue #462): on a node that may still be an
 			// incomplete restore target, park an unknown channel's reestablish
 			// for this long instead of failing it. Unset everywhere else, where

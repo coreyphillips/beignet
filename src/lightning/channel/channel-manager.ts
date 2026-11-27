@@ -44,7 +44,7 @@ import { FinalUpdateDataLossError } from '../storage/final-channel-updates';
 import { isFinalCommitmentUpdate } from './final-commitment-transport';
 import {
 	AssetConversionTransport,
-	hasAssetConversionHost
+	completeAssetConversionHost
 } from './asset-conversion-transport';
 import { ASSET_CONVERSION_TEXTS } from './asset-conversion-terms';
 import type { IFinalOpeningMessage } from './final-opening-runtime';
@@ -701,6 +701,12 @@ export interface IChannelManagerConfig {
 	 * Injectable so tests can shrink it.
 	 */
 	quiescenceTimeoutMs?: number;
+	/**
+	 * The local funding feerate estimate in sat/kw that an asset conversion's
+	 * feerate floor starts from (#2151). Without it, or when it answers
+	 * nothing, a conversion is refused.
+	 */
+	conversionFeerateEstimate?: () => Promise<number | null | undefined>;
 	/**
 	 * How long an inbound channel_reestablish naming a channel this node has
 	 * NO record of is held before it is answered with the BOLT 1 error
@@ -1498,7 +1504,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		const conversionOffered =
 			!!this.finalTransport &&
 			!!config.finalOpening?.storage.canConvertAssetChannels &&
-			hasAssetConversionHost(conversionHost);
+			completeAssetConversionHost(conversionHost);
 		this.assetConversion = new AssetConversionTransport(
 			conversionOffered ? config.finalOpening : undefined,
 			conversionOffered ? conversionHost : undefined,
@@ -1523,7 +1529,8 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 				disconnect: (peer): void => this.peerManager?.recyclePeer(peer, 1000),
 				report: (id, reason): void =>
 					this.emitContained('error', Buffer.from(id, 'hex'), reason),
-				timeoutMs: config.quiescenceTimeoutMs
+				timeoutMs: config.quiescenceTimeoutMs,
+				feerateEstimate: config.conversionFeerateEstimate
 			}
 		);
 	}
@@ -4498,11 +4505,15 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			this.assetUpdates?.custom(peer, raw);
 			return;
 		}
-		// The conversion phases (#2151) of subtype 98: terms and replies.
+		// The conversion phases (#2151) of subtype 98: terms and replies, and
+		// a layout or layout_ack under a live conversion's own attempt.
 		if (
 			subtype === BeignetCustomSubtype.ASSET_SPLICE &&
 			raw.length >= 2 &&
-			(raw[1] === 7 || raw[1] === 8)
+			(raw[1] === 7 ||
+				raw[1] === 8 ||
+				((raw[1] === 0 || raw[1] === 4) &&
+					!!this.assetConversion?.ownsFrame(peer, raw)))
 		) {
 			this.assetConversion?.custom(peer, raw);
 			return;

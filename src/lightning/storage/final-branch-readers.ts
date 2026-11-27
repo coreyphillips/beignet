@@ -38,6 +38,15 @@ export interface IAssetConversionParent {
 	/** Whether this side opened the channel. */
 	opener: boolean;
 	commitmentFeeratePerKw: number;
+	/** The balances at N before the commitment fee and the anchors (#2151 step 3b). */
+	localBalanceMsat: bigint;
+	remoteBalanceMsat: bigint;
+	/** An asset parent's funding root, lowercase hex. */
+	root?: string;
+	/** The live funding output's value. */
+	parentValueSats: bigint;
+	/** An asset parent at N > 0: the committed round's digest, lowercase hex. */
+	priorDigest?: string;
 }
 
 export type FinalResolutionStates = ReturnType<

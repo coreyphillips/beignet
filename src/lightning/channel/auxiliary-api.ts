@@ -11,10 +11,11 @@
  * unsupported. `surfaces` names the optional parts of the contract that
  * are present, each by the member a host would otherwise have to probe.
  * `declared` names the parts whose types and documentation the build
- * already carries and which it does not run: a host may supply their
- * hooks, and the node calls none of them and does what it does without
- * them. A name leaves `declared` for `surfaces` in the build that runs its
- * part, and a host relies on a part only once `surfaces` names it.
+ * already carries and which it does not run, or runs only in the part its
+ * documentation names, with no effect a host may rely on: a host may
+ * supply their hooks, and the node does what it does without them. A name
+ * leaves `declared` for `surfaces` in the build that runs its part, and a
+ * host relies on a part only once `surfaces` names it.
  */
 export const AUXILIARY_CHANNELS_API = Object.freeze({
 	version: 1,
@@ -102,8 +103,10 @@ export const AUXILIARY_CHANNELS_API = Object.freeze({
 		'assetSplice:v1',
 		'assetSpliceRecovery:v1'
 	] as const),
-	// Nothing is declared and not run in this build.
-	declared: Object.freeze([] as const)
+	// assetConversion:v1 runs the agreement on the terms and on the layout,
+	// with no signing: every attempt stops at a fence before its layout is
+	// signed (#2151).
+	declared: Object.freeze(['assetConversion:v1'] as const)
 });
 
 /** A name in `AUXILIARY_CHANNELS_API.surfaces`. */

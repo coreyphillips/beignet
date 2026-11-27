@@ -110,7 +110,7 @@ With no HTLC, the candidate's commitments have two balance outputs and their anc
   - to bitcoin, the whole of each issuance, to withdrawal outputs of the buyer;
   - to an asset, what the seller adds.
 - **The first commitment of the new channel.** Each peer's bitcoin balance, and to an asset each peer's units of each issuance.
-  - These are absolute figures, after the opener's commitment fee, the anchors and the carriers.
+  - The balances are the two channel balances before the commitment fee and the anchors, as `IFinalBalances` holds them, and they add up to the new capacity times 1000. The opener's fee and anchors come out of the opener's balance when the commitments are built.
   - `relative_satoshis` keeps its meaning: the funding output equals the parent plus both relative contributions.
 - **Fees.**
   - **Funding fee and budgets.** Who pays the funding fee, with each peer's fee budget. `feeBudgets` (`src/lightning/channel/asset-splice-manifest.ts`) already lets one peer pay all of it.
@@ -136,13 +136,20 @@ The five steps of [From proposal to a spendable splice](ASSET-SPLICING.md#from-p
 
 1. **Agree on the move.** As above. A peer refuses before spending time on proofs when the preconditions fail or its host declines the terms.
    - **In place (Step 3a)** (`src/lightning/channel/asset-conversion-transport.ts`). The initiator's host proposes the terms (`conversionTerms`), both engines check them, and both hosts confirm their canonical form by digest (`verifyConversionTerms`). The initiator sends them in `conversion_terms` and the acceptor answers. The initiator then sends `stfu`, the acceptor answers, and `splice_init` and `splice_ack` carry the digest and the target type, each with a fresh candidate funding key.
-   - **The fence.** The layout is Step 3b's, so the attempt stops there: the initiator sends `tx_abort` and the channel goes on at its parent, unchanged. Both hosts hear the end through `abandonConversion`.
+   - **The fence.** The attempt goes on to the layout (Step 3b, below) and stops after it: the initiator sends `tx_abort` and the channel goes on at its parent, unchanged. Both hosts hear the end through `abandonConversion`.
    - **Memory only.** An attempt is never persisted, and nothing is replayed after a reconnect. A restart calls nothing, so a host treats any attempt still pending at its own startup as abandoned.
 2. **Agree on the layout.**
    - **Planners.** A conversion has a planner of its own. `planAssetSpliceBalances` (`src/lightning/channel/asset-splice-balances.ts`) refuses a candidate with no units ("Invalid candidate asset inventory") and a parent with none ("Missing parent asset inventory"). The layout's `parentRoot` is required today and checked against the parent's script.
    - **To bitcoin:** the candidate's channel output carries no asset root. The virtual transfer assigns every unit of the parent's funding asset to the agreed withdrawal outputs. For each issuance, `old funding + external asset inputs = withdrawals + change`, with nothing left in the channel.
    - **To an asset:** the parent has no root, and the candidate's channel output gets the root built from the added inputs, as a dual-funded asset opening builds it.
    - **Quiet starts here.** From the layout acknowledgement, the channel is quiet (see below), since the layout binds the state number.
+   - **In place (Step 3b)** (`src/lightning/channel/asset-conversion-transport.ts`, `src/lightning/channel/asset-conversion-layout.ts`).
+     - **The proposals.** Each side asks its host for a proposal (`proposeConversion`) before it allocates its key: the initiator at the peer's `stfu`, the acceptor at `splice_init`. Each sends it as its `layout` (envelope phase 0, under the conversion's own attempt id), the acceptor right after its `splice_ack` and the initiator once it takes that ack.
+     - **The engine's checks.** Holding both proposals, each side has its host describe the layout (`describeConversion`), builds the layout in initiator order and checks it by itself: the negotiation against the terms, the parent and the four keys, the serials, the inputs, the output amounts, the funding output, the fee budgets, the first commitment's sum, the units against the terms, the credits by parity, the reserves with the trade rule, and to an asset the carriers. The funding feerate is also held to a floor: the local estimate less the host's `conversionFeerateMarginPerKw`, and at least 253 sat/kw. That check runs on the terms at both sides and again before each proposal.
+     - **`layout_ack`.** Each side then hashes the layout, has its host prepare it (`prepareConversion`), and sends `sha256('asset-conversion-agreement/v1\0' || layout digest || plan digest)` in `layout_ack` (phase 4). Two digests that differ end the attempt ("Peers disagree on the asset conversion layout").
+     - **The fence.** Once the two digests agree, the initiator sends `tx_abort` "Asset conversion stops before its layout is signed in this build", and the channel goes on at its parent. Nothing is written but the two key allocations.
+     - **The bit gate.** Bit 463 now needs the whole conversion surface (`completeAssetConversionHost`): `assetConversionVersion` 1, a margin from 0 to 100,000 sat/kw, and the six terms and planner members. A generation 6 node whose host lacks one sets neither bit.
+     - **A limit.** The engine holds no per-issuance unit state for an asset parent, so to bitcoin the parent's units by holder rest on the two hosts agreeing, which the layout digest compares.
 3. **Authorize the assets, then freeze the Bitcoin transaction.** As for an asset splice. Each peer verifies every input history and every output commitment, and unrelated passive assets go to owner-authorized outputs or the input is declined.
 4. **Secure both exits and the units before funding signatures.**
    - **Commitment views.** Each peer builds the candidate's first commitment views in the new type, at the state number the layout bound and at the agreed balances:

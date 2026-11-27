@@ -10,6 +10,8 @@ import type {
 } from './final-opening-commitment';
 import type { IAssetConversionTerms } from './asset-conversion-terms';
 import type { IAssetOpenLayout } from './asset-opening-manifest';
+import type { IAssetSpliceDescription } from './asset-splice-agreement';
+import type { IAssetSpliceWireRecordLimit } from '../features/asset-splice';
 
 export interface IAssetOpenContext {
 	/** Local original-device enrollment. Never sourced from the peer. */
@@ -160,6 +162,115 @@ export interface IAssetConversionContext {
 	direction: 'to-plain' | 'to-asset';
 }
 
+/** What the engine knows of a conversion's bitcoin side, initiator first where paired (#2151). */
+export interface IAssetConversionBitcoin {
+	/** The candidate funding keys, initiator first. */
+	fundingKeys: AssetOpenPair<Buffer>;
+	/** `splice_init.locktime`. */
+	lockTime: number;
+	/** The terms' lock depth. */
+	minimumDepth: number;
+	/** The terms' funding feerate. */
+	feeratePerKw: number;
+	parent: {
+		type: 'plain' | 'asset';
+		channelType: string;
+		/** The live funding output's value. */
+		valueSats: bigint;
+		/** The parent funding keys, initiator first. */
+		fundingKeys: AssetOpenPair<Buffer>;
+		/** An asset parent's funding root, and only there. */
+		root?: Buffer;
+	};
+	candidate: {
+		type: 'plain' | 'asset';
+		channelType: string;
+		maxAcceptedHtlcs: AssetOpenPair<number>;
+		dustLimitSats: AssetOpenPair<bigint>;
+	};
+}
+
+/** Units of one issuance that move in a conversion. */
+export interface IAssetConversionMovement {
+	/** 64 lowercase hex characters. */
+	assetId: string;
+	/** The side whose units move: from its channel balance (to bitcoin) or its own inputs (to an asset). */
+	from: 'initiator' | 'acceptor';
+	/** The output that receives them. */
+	outputSerial: bigint;
+	units: bigint;
+}
+
+/** The host's description of a conversion's layout, initiator first where paired. */
+export interface IAssetConversionDescription {
+	inputs: IAssetSpliceDescription['inputs'];
+	outputs: IAssetSpliceDescription['outputs'];
+	movements: readonly IAssetConversionMovement[];
+	/** To bitcoin: the parent's funded issuances by holder. To an asset: empty. */
+	parentUnits: readonly {
+		assetId: string;
+		initiator: bigint;
+		acceptor: bigint;
+	}[];
+	/** Two, initiator first. */
+	feeBudgets: readonly bigint[];
+	/** Two, initiator first. */
+	relativeSatoshis: readonly bigint[];
+	/** To an asset only: each holder's commitment record limits, initiator first. Absent to bitcoin. */
+	commitmentRecordLimits?: readonly (readonly IAssetSpliceWireRecordLimit[])[];
+}
+
+/** Both hosts derive `digest` from the proposals and the layout digest, so it is equal on both sides. */
+export interface IAssetConversionPlan {
+	/** 32 bytes. */
+	digest: Buffer;
+}
+
+/**
+ * The conversion surface of a host (#2151): the terms calls and the
+ * planner calls. This build agrees on the terms and on the layout, and
+ * signs nothing.
+ */
+export interface IAssetConversionHost {
+	assetConversionVersion: 1;
+	/** The engine's floor is its own estimate less this margin, in sat/kw, so that two engines whose estimates differ do not deadlock. */
+	conversionFeerateMarginPerKw: number;
+	/** The initiator's terms of a conversion under the host's agreement `reference`. */
+	conversionTerms(
+		ctx: Omit<IAssetConversionContext, 'attempt'>,
+		request: { reference: Buffer }
+	): Promise<IAssetConversionTerms>;
+	/** Confirm the exact canonical terms and their digest. Only `true` confirms. */
+	verifyConversionTerms(
+		ctx: IAssetConversionContext,
+		terms: IAssetConversionTerms,
+		digest: Buffer
+	): Promise<boolean>;
+	/** Called once when an attempt this host verified ends, with the end's text. It is final, even while a planner call is pending. */
+	abandonConversion(
+		ctx: IAssetConversionContext,
+		reason: string
+	): void | Promise<void>;
+	/** This side's proposal, 1 byte to 4 MiB, sent to the peer as its layout. */
+	proposeConversion(
+		ctx: IAssetConversionContext,
+		terms: IAssetConversionTerms
+	): Promise<Buffer>;
+	/** The layout both proposals describe. */
+	describeConversion(
+		ctx: IAssetConversionContext,
+		proposals: AssetOpenPair<Buffer>,
+		bitcoin: IAssetConversionBitcoin
+	): Promise<IAssetConversionDescription>;
+	/** The plan for the layout the engine checked and hashed. */
+	prepareConversion(
+		ctx: IAssetConversionContext,
+		proposals: AssetOpenPair<Buffer>,
+		bitcoin: IAssetConversionBitcoin,
+		layoutDigest: Buffer
+	): Promise<IAssetConversionPlan>;
+}
+
 /** Explicit host support for private dual-funded asset openings on regtest. */
 export interface IAuxiliaryDualFunding
 	extends Partial<import('./asset-splice-transport').AssetSpliceHost>,
@@ -237,4 +348,26 @@ export interface IAuxiliaryDualFunding
 		ctx: IAssetConversionContext,
 		reason: string
 	): void | Promise<void>;
+	/** The conversion surface's version (#2151 step 3b). */
+	assetConversionVersion?: 1;
+	/** See `IAssetConversionHost.conversionFeerateMarginPerKw`. */
+	conversionFeerateMarginPerKw?: number;
+	/** See `IAssetConversionHost.proposeConversion`. */
+	proposeConversion?(
+		ctx: IAssetConversionContext,
+		terms: IAssetConversionTerms
+	): Promise<Buffer>;
+	/** See `IAssetConversionHost.describeConversion`. */
+	describeConversion?(
+		ctx: IAssetConversionContext,
+		proposals: AssetOpenPair<Buffer>,
+		bitcoin: IAssetConversionBitcoin
+	): Promise<IAssetConversionDescription>;
+	/** See `IAssetConversionHost.prepareConversion`. */
+	prepareConversion?(
+		ctx: IAssetConversionContext,
+		proposals: AssetOpenPair<Buffer>,
+		bitcoin: IAssetConversionBitcoin,
+		layoutDigest: Buffer
+	): Promise<IAssetConversionPlan>;
 }

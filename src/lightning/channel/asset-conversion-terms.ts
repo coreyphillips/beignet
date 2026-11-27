@@ -32,7 +32,12 @@ export interface IAssetConversionTerms {
 		/** At most 16, ascending by asset id. */
 		issuances: { assetId: string; amount: string }[];
 	};
-	/** Absolute figures of the candidate's first commitment. */
+	/**
+	 * The candidate's first commitment. `balanceMsat` is the two channel
+	 * balances before the commitment fee and the anchors, adding up to the
+	 * capacity times 1000; the opener's fee and anchors come out of the
+	 * opener's balance when the commitments are built.
+	 */
 	firstCommitment: {
 		commitmentFeeratePerKw: number;
 		balanceMsat: { opener: string; acceptor: string };
