@@ -44,6 +44,7 @@ import {
 } from './final-peer-secrets';
 import {
 	registerFinalBranchReaders,
+	type IAssetConversionParent,
 	type IFinalChannelFunding
 } from './final-branch-readers';
 import type { IFinalCommitmentType } from '../channel/final-opening-commitment';
@@ -950,7 +951,8 @@ export class SqliteStorage implements IStorageBackend {
 			finalOwnCommitmentRevoked: (id, era, height) =>
 				this.finalOwnCommitmentRevoked(id, era, height),
 			loadFinalPeerSecrets: (id) => this.loadFinalPeerSecrets(id),
-			finalPeerSecretScope: (run) => this.finalPeerSecretScope(run)
+			finalPeerSecretScope: (run) => this.finalPeerSecretScope(run),
+			assetConversionParent: (id) => this.assetConversionParent(id)
 		});
 	}
 
@@ -2442,6 +2444,104 @@ export class SqliteStorage implements IStorageBackend {
 			(c) =>
 				!adopted.has(c.candidate.fundingTxid + ':' + c.candidate.outputIndex)
 		);
+	}
+
+	/**
+	 * The live parent of an asset conversion (#2151 step 3a), or a throw
+	 * naming the first precondition it fails. @internal: the conversion
+	 * transport reaches it through storage/final-branch-readers.ts.
+	 */
+	private assetConversionParent(channelId: string): IAssetConversionParent {
+		if (!this.canConvertAssetChannels)
+			throw new Error(
+				'Asset conversion requires an original conversion wallet'
+			);
+		const unready = 'Asset conversion requires a funded ready channel';
+		const opening =
+			typeof channelId === 'string' && /^[0-9a-f]{64}$/.test(channelId)
+				? this.finalOpeningRecord(channelId)
+				: null;
+		const session = opening?.nonces.session;
+		const state = opening && this.channelTypeState(channelId);
+		const funding = opening && this.liveFinalFunding(channelId);
+		if (
+			!opening ||
+			!session?.updateLimits ||
+			!opening.nonces.signing?.fundingTransaction ||
+			!opening.nonces.signing.exit ||
+			!this.loadFinalDaemonOpening(channelId)?.readyExchanged ||
+			!state ||
+			!funding
+		)
+			throw new Error(unready);
+		if (state.records.length)
+			throw new Error(
+				'Asset conversion of a channel with a recorded type change is not supported yet'
+			);
+		const current = state.current;
+		if (
+			current.type === 'asset' &&
+			current.channelType !== ASSET_SPLICE_RECOVERY_TYPE_HEX
+		)
+			throw new Error('Asset conversion requires the recovery asset type');
+		let ledger: ReturnType<SqliteStorage['typeLedgerAt']>;
+		try {
+			ledger = this.typeLedgerAt(opening, current);
+		} catch (error) {
+			if (
+				error instanceof Error &&
+				error.message === 'Channel type record requires a funded ready channel'
+			)
+				throw new Error(unready);
+			throw error;
+		}
+		if (
+			this.finalExitRequested(channelId, opening.nonces) ||
+			this.finalSimpleCloseStarted(channelId) ||
+			ledger.dataLoss
+		)
+			throw new Error('Asset conversion requires an open channel');
+		const { terms, updateLimits: limits } = session;
+		let feerate: number | undefined;
+		let htlcs: number;
+		if (current.type === 'plain') {
+			const s = this.finalUpdateView(channelId)!.views[0].s;
+			htlcs = s.locked.htlcs.length;
+			feerate = s.locked.feeratePerKw;
+		} else {
+			const committed = assetSpliceUpdateHead(this, channelId).committed;
+			htlcs = committed?.htlcs.length ?? 0;
+			feerate = committed?.feerate;
+		}
+		if (htlcs)
+			throw new Error('Asset conversion requires a channel with no HTLC');
+		if (ledger.pending)
+			throw new Error('Asset conversion requires a quiescent channel');
+		if (this.channelSpliceInProgress(channelId, current))
+			throw new Error('Asset conversion requires no pending splice');
+		if (this.pendingFinalConversions(channelId).length)
+			throw new Error('Another conversion of this channel is pending');
+		if (
+			current.type === 'plain' &&
+			(terms.localDustLimitSatoshis !== 354 ||
+				terms.remoteDustLimitSatoshis !== 354 ||
+				limits.local.maxAcceptedHtlcs > 83 ||
+				limits.remote.maxAcceptedHtlcs > 83)
+		)
+			throw new Error(
+				'Asset conversion requires channel parameters that fit the asset type'
+			);
+		const outpoint = outpointOf(funding);
+		return {
+			type: current.type,
+			channelType: current.channelType,
+			funding: copyJson(funding),
+			txid: outpoint.txid,
+			outputIndex: outpoint.outputIndex,
+			height: BigInt(ledger.height),
+			opener: opening.candidate.isInitiator,
+			commitmentFeeratePerKw: feerate ?? terms.commitmentFeeratePerKw
+		};
 	}
 
 	/**

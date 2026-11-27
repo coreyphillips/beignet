@@ -113,7 +113,7 @@ describe('Asset opening wire version 1', function () {
 		for (const [position, value] of [
 			[0, 0],
 			[0, 2],
-			[1, 7],
+			[1, 9],
 			[1, 255]
 		]) {
 			const copy = Buffer.from(raw);

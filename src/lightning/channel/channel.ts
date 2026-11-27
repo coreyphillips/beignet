@@ -595,6 +595,9 @@ const SPLICE_BUSY_REQUEST_PENDING =
 const SPLICE_BUSY_SPLICE_ACTIVE =
 	'Cannot splice: a splice is already in progress on this channel; retry after it completes';
 const QUIESCE_BUSY_PENDING_HTLCS = 'Cannot quiesce: pending HTLCs exist';
+/** The wire reason and error for a splice carrying the asset conversion TLV (#2151). */
+const ASSET_CONVERSION_REFUSAL =
+	'Asset conversion is not offered on this channel';
 
 /**
  * Compute a transaction id (internal byte order, as bitcoinjs addInput expects)
@@ -15267,6 +15270,12 @@ export class Channel {
 	): ChannelAction[] {
 		const assetRefusal = this._refuseForAssetChannel('a splice');
 		if (assetRefusal) return assetRefusal;
+		// An asset conversion (#2151) is for final channels only.
+		if (msg.conversion)
+			return this.refuseSpliceInit(
+				ASSET_CONVERSION_REFUSAL,
+				ASSET_CONVERSION_REFUSAL
+			);
 		if (this._state.state !== ChannelState.NORMAL) {
 			return [
 				{
@@ -15426,6 +15435,16 @@ export class Channel {
 					type: ChannelActionType.ERROR,
 					message: 'Unexpected splice_ack: no splice session'
 				}
+			];
+		}
+
+		// An asset conversion (#2151) is for final channels only. Unwind as a
+		// lock depth mismatch does, composite splices (#1922) included.
+		if (msg.conversion) {
+			return [
+				this._txAbort(this._state.channelId!, ASSET_CONVERSION_REFUSAL),
+				...this.abortSplice(ASSET_CONVERSION_REFUSAL),
+				{ type: ChannelActionType.ERROR, message: ASSET_CONVERSION_REFUSAL }
 			];
 		}
 

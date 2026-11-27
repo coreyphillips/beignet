@@ -16,6 +16,11 @@ export * from './auxiliary';
 export * from './auxiliary-funding';
 export * from './asset-opening-provider';
 export {
+	assetConversionTermsDigest,
+	canonicalAssetConversionTerms,
+	type IAssetConversionTerms
+} from './asset-conversion-terms';
+export {
 	assetPayoutRevocationKey,
 	type IAssetPayoutScope
 } from './asset-payout-revocation';

@@ -87,6 +87,8 @@ Today a final wallet is one generation, chosen when it is made, and the generati
 - no pending splice or unadopted candidate;
 - no update round in flight.
 
+**In place (Step 3a).** A side declines while a commitment round is in flight, rather than waiting for it to finish: between two peers that follow the agreement a round cannot settle between the start or the accept and the `stfu` points, and the holds stop local starts of adds and fee updates for the whole attempt. Step 3 also refuses a plain parent whose dust limits are not both 354 or whose HTLC limit exceeds 83, where the design gives the candidate a smaller limit. Channel parameters per branch come later, with signing.
+
 With no HTLC, the candidate's commitments have two balance outputs and their anchors. A revoked commitment of the parent may still hold HTLCs, and keeps the old type's HTLC penalty claims.
 
 **Binding the target type.** The funding script tells an output with an asset root from one without, but not one asset type from another, or an SCID alias from none.
@@ -95,6 +97,7 @@ With no HTLC, the candidate's commitments have two balance outputs and their anc
 - **To the host.** It is passed to the host's verify call.
 - **In storage.** It is persisted in each exit branch before the first candidate commitment signature.
 - **The alias bit.** A plain target keeps the parent's choice of the SCID alias bit, and the asset type has none.
+- **In place (Step 3a).** The TLV is `ASSET_CONVERSION_TLV` (65540, `src/lightning/message/splice.ts`): the 32-byte terms digest, then the target channel type's bytes. 65538 stays unused. The terms themselves arrive before quiescence, in phase 7 (`conversion_terms`) of the asset splice envelope, and the acceptor answers them in phase 8 (`conversion_reply`): an accept, or a decline with its reason. Until the parent's type can change (Step 5), the target follows from it: a plain parent converts to the recovery asset type, and an asset parent to the plain type without the alias bit.
 
 **The terms.** Bind these in `splice_init` and `splice_ack` and in the asset splice envelope (`ASSET_SPLICE` 98, `ASSET_SPLICE_CONSENT` 99), on top of everything an asset splice binds:
 - **Roles.** Which peer is the quote giver and which the quote taker.
@@ -132,6 +135,9 @@ Each host checks the terms against its own agreement before its node signs anyth
 The five steps of [From proposal to a spendable splice](ASSET-SPLICING.md#from-proposal-to-a-spendable-splice) apply, with these differences.
 
 1. **Agree on the move.** As above. A peer refuses before spending time on proofs when the preconditions fail or its host declines the terms.
+   - **In place (Step 3a)** (`src/lightning/channel/asset-conversion-transport.ts`). The initiator's host proposes the terms (`conversionTerms`), both engines check them, and both hosts confirm their canonical form by digest (`verifyConversionTerms`). The initiator sends them in `conversion_terms` and the acceptor answers. The initiator then sends `stfu`, the acceptor answers, and `splice_init` and `splice_ack` carry the digest and the target type, each with a fresh candidate funding key.
+   - **The fence.** The layout is Step 3b's, so the attempt stops there: the initiator sends `tx_abort` and the channel goes on at its parent, unchanged. Both hosts hear the end through `abandonConversion`.
+   - **Memory only.** An attempt is never persisted, and nothing is replayed after a reconnect. A restart calls nothing, so a host treats any attempt still pending at its own startup as abandoned.
 2. **Agree on the layout.**
    - **Planners.** A conversion has a planner of its own. `planAssetSpliceBalances` (`src/lightning/channel/asset-splice-balances.ts`) refuses a candidate with no units ("Invalid candidate asset inventory") and a parent with none ("Missing parent asset inventory"). The layout's `parentRoot` is required today and checked against the parent's script.
    - **To bitcoin:** the candidate's channel output carries no asset root. The virtual transfer assigns every unit of the parent's funding asset to the agreed withdrawal outputs. For each issuance, `old funding + external asset inputs = withdrawals + change`, with nothing left in the channel.

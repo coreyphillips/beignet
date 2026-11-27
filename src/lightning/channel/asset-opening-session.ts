@@ -56,10 +56,7 @@ import {
 import type { IFinalOpeningCandidate } from '../storage/final-opening-candidate';
 
 type Phase = IAssetOpenFrame['phase'] | 'consent';
-type ObjectPhase = Exclude<
-	Phase,
-	'layout_ack' | 'final_ack' | 'construction_checkpoint' | 'consent'
->;
+type ObjectPhase = 'layout' | 'authorization' | 'final' | 'exit';
 type Sender = (peer: string, type: number, payload: Buffer) => void;
 export interface IAssetOpeningStart {
 	peer: string;
@@ -420,6 +417,9 @@ export class AssetOpeningSession {
 				const f = decodeAssetOpenFrame(raw);
 				if (!f.attempt.equals(this.ctx.attempt))
 					throw new Error('Asset opening attempt mismatch');
+				// The conversion phases (#2151) belong to subtype 98 alone.
+				if (f.phase === 'conversion_terms' || f.phase === 'conversion_reply')
+					throw new Error('Unexpected asset opening phase');
 				if (f.phase === 'construction_checkpoint') {
 					if (!this.read('our/authorization'))
 						throw new Error('Unexpected asset construction checkpoint');

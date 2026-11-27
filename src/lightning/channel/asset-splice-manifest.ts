@@ -124,6 +124,9 @@ function checkLayout(layout: IAssetSpliceLayout) {
 		!ack.channelId.equals(layout.channelId) ||
 		init.requireConfirmedInputs ||
 		ack.requireConfirmedInputs ||
+		// An asset conversion (#2151) has a layout of its own.
+		init.conversion ||
+		ack.conversion ||
 		!init.lockDepth ||
 		init.lockDepth > SPLICE_LOCK_DEPTH_ACCEPT_MAX ||
 		ack.lockDepth !== init.lockDepth ||

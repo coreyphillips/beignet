@@ -354,20 +354,25 @@ export class FinalSpliceSession {
 					p.fundingFeeratePerkw > MAX_SPLICE_FEERATE_PERKW ||
 					p.lockDepth ||
 					p.requireConfirmedInputs ||
+					// An asset conversion (#2151) is the conversion transport's.
+					p.conversion ||
 					!isValidPublicKey(p.fundingPubkey)
 				)
 					throw new Error('Unsupported splice proposal');
 				break;
 			}
-			case M.SPLICE_ACK:
+			case M.SPLICE_ACK: {
+				const ack = decodeSpliceAckMessage(msg.payload);
 				if (
 					old ||
 					!a.intent.initiator ||
 					!lastSpliceWire(a, true, M.SPLICE) ||
-					!isValidPublicKey(decodeSpliceAckMessage(msg.payload).fundingPubkey)
+					ack.conversion ||
+					!isValidPublicKey(ack.fundingPubkey)
 				)
 					throw new Error('Unexpected splice acknowledgment');
 				break;
+			}
 			case M.COMMITMENT_SIGNED: {
 				const agreed = t && this.agreement(a, t);
 				if (!t || !agreed || old)

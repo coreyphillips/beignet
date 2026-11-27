@@ -2016,6 +2016,28 @@ property channel.IAnnouncementReadyAction.channelAnnouncement: Buffer
 property channel.IAnnouncementReadyAction.channelId: Buffer
 property channel.IAnnouncementReadyAction.channelUpdate: Buffer
 property channel.IAnnouncementReadyAction.type: channel.ChannelActionType.ANNOUNCEMENT_READY
+interface channel.IAssetConversionContext
+property channel.IAssetConversionContext.attempt: Buffer
+property channel.IAssetConversionContext.channelId: string
+property channel.IAssetConversionContext.direction: 'to-plain' | 'to-asset'
+property channel.IAssetConversionContext.isInitiator: boolean
+property channel.IAssetConversionContext.isOpener: boolean
+property channel.IAssetConversionContext.parent: { txid: string; outputIndex: number; stateNumber: string; type: 'plain' | 'asset'; channelType: string; }
+property channel.IAssetConversionContext.peer: string
+interface channel.IAssetConversionTerms
+property channel.IAssetConversionTerms.agreement: { reference: string; expiresAt: number; }
+property channel.IAssetConversionTerms.candidate: { dustLimitSats: { opener: string; acceptor: string; }; maxAcceptedHtlcs: { opener: number; acceptor: number; }; }
+property channel.IAssetConversionTerms.channelId: string
+property channel.IAssetConversionTerms.contributions: { opener: string; acceptor: string; }
+property channel.IAssetConversionTerms.direction: 'to-plain' | 'to-asset'
+property channel.IAssetConversionTerms.fees: { fundingPayer: 'opener' | 'acceptor'; budgets: { opener: string; acceptor: string; }; feeratePerKw: number; withdrawalPayer?: 'opener' | 'acceptor'; }
+property channel.IAssetConversionTerms.firstCommitment: { commitmentFeeratePerKw: number; balanceMsat: { opener: string; acceptor: string; }; units?: { assetId: string; opener: string; acceptor: string; }[]; }
+property channel.IAssetConversionTerms.giver: 'opener' | 'acceptor'
+property channel.IAssetConversionTerms.lockDepth: number
+property channel.IAssetConversionTerms.parent: { txid: string; outputIndex: number; stateNumber: string; }
+property channel.IAssetConversionTerms.targetType: string
+property channel.IAssetConversionTerms.units: { holder: 'opener' | 'acceptor'; issuances: { assetId: string; amount: string; }[]; }
+property channel.IAssetConversionTerms.version: 1
 interface channel.IAssetFundingLineageEntry
 property channel.IAssetFundingLineageEntry.fundingOutputIndex: number
 property channel.IAssetFundingLineageEntry.fundingTxHex: string
@@ -2280,9 +2302,11 @@ property channel.IAuxiliaryCommitmentData.secondLevelRevocationBasepoint?: Buffe
 property channel.IAuxiliaryCommitmentData.secondLevelRevocationKey?: Buffer
 interface channel.IAuxiliaryDualFunding extends Partial<channel.AssetSpliceHost>, Partial<channel.IAssetSpliceUpdateHost>
 method channel.IAuxiliaryDualFunding.abandon(ctx: channel.IAssetOpenContext): Promise<void>
+method channel.IAuxiliaryDualFunding.abandonConversion?(ctx: channel.IAssetConversionContext, reason: string): void | Promise<void>
 property channel.IAuxiliaryDualFunding.assetSpliceRecoveryVersion?: 1
 method channel.IAuxiliaryDualFunding.confirmFunding(candidate: IFinalOpeningCandidate, fundingProofs: Buffer): Promise<void>
 method channel.IAuxiliaryDualFunding.contribution(peer: string, isInitiator: boolean, openerSats: bigint): bigint | undefined
+method channel.IAuxiliaryDualFunding.conversionTerms?(ctx: Omit<channel.IAssetConversionContext, 'attempt'>, request: { reference: Buffer; }): Promise<channel.IAssetConversionTerms>
 method channel.IAuxiliaryDualFunding.describe(ctx: channel.IAssetOpenContext, proposals: channel.AssetOpenPair<Buffer>): Promise<channel.IAssetOpenDescription>
 method channel.IAuxiliaryDualFunding.outputRecoveryReceipt?(channelId: string, parentTxid: string, outputIndex: number, payout: bitcoinjs-lib#Transaction): Buffer | undefined
 method channel.IAuxiliaryDualFunding.prepare(ctx: channel.IAssetOpenContext, proposals: channel.AssetOpenPair<Buffer>, layoutDigest: Buffer): Promise<channel.IAssetOpenPlan>
@@ -2293,6 +2317,7 @@ method channel.IAuxiliaryDualFunding.restoreOutputReceipt?(channelId: string, pa
 method channel.IAuxiliaryDualFunding.retractFunding(candidate: IFinalOpeningCandidate): Promise<void>
 method channel.IAuxiliaryDualFunding.signExits(ctx: channel.IAssetOpenExitContext): Promise<Buffer>
 method channel.IAuxiliaryDualFunding.signFunding(candidate: IFinalOpeningCandidate, fundingProofs: Buffer, tx: bitcoinjs-lib#Transaction, indices: readonly number[], prevouts: { scripts: Buffer[]; values: bigint[]; }): Promise<Buffer[][]>
+method channel.IAuxiliaryDualFunding.verifyConversionTerms?(ctx: channel.IAssetConversionContext, terms: channel.IAssetConversionTerms, digest: Buffer): Promise<boolean>
 method channel.IAuxiliaryDualFunding.verifyExits(ctx: channel.IAssetOpenExitContext, signatures: channel.AssetOpenPair<Buffer>): Promise<{ local: channel.IAssetOpenExit; remote: channel.IAssetOpenExit; }>
 property channel.IAuxiliaryDualFunding.version: 1
 interface channel.IAuxiliaryForwardChannel
@@ -3147,6 +3172,7 @@ method channel.ZeroConfManager.shouldUseZeroConf(peerPubkeyHex: string, requeste
 function channel.aggregateLocalCommitmentSig(state: channel.IChannelState, signer: keys.ISigner, ourPublicNonce: Uint8Array, theirPublicNonce: Buffer, theirPartialSig: Buffer, localPerCommitmentPoint: Buffer, commitmentNumber?: bigint): Buffer
 function channel.applyAuxiliaryClose(state: channel.IChannelState, transaction: bitcoinjs-lib#Transaction, feeSatoshis: bigint, outputMap: { local?: number; remote?: number; }): Buffer | undefined
 function channel.applyAuxiliaryFunding(state: channel.IChannelState, descriptor: channel.IAuxiliaryFundingDescriptor, maxHtlcs?: number): void
+function channel.assetConversionTermsDigest(terms: channel.IAssetConversionTerms): Buffer
 function channel.assetHtlcSighashType(channelType: Buffer | null | undefined): 0x81 | 0x83
 function channel.assetPayoutRevocationKey(scope: channel.IAssetPayoutScope, assetId: string): Buffer
 function channel.auxiliaryCarrierError(opening: channel.IAuxiliaryCarrier): string | undefined
@@ -3160,6 +3186,7 @@ function channel.auxiliaryUnsupported(state: channel.IChannelState, operation: c
 function channel.buildLocalCommitment(state: channel.IChannelState, perCommitmentPoint: Buffer, commitmentNumber?: bigint, signedLocal?: boolean): channel.IBuiltCommitment
 function channel.buildRemoteCommitment(state: channel.IChannelState, remotePerCommitmentPoint: Buffer, commitmentNumber?: bigint): channel.IBuiltCommitment
 function channel.calculateCommitmentFee(feeratePerKw: number, numUntrimmedHtlcs: number, isAnchor?: boolean, isTaproot?: boolean): bigint
+function channel.canonicalAssetConversionTerms(terms: channel.IAssetConversionTerms): channel.IAssetConversionTerms
 function channel.compositeSpliceStageAtLeast(stage: channel.CompositeSpliceStage, floor: channel.CompositeSpliceStage): boolean
 function channel.compositeSpliceStageIsTerminal(stage: channel.CompositeSpliceStage): boolean
 function channel.copyAuxiliaryCommitment(data: channel.IAuxiliaryCommitmentData): channel.IAuxiliaryCommitmentData
@@ -5678,6 +5705,7 @@ function liquidity.normalizePrimary(entry: unknown): liquidity.IPrimary
 function liquidity.selectReceiveTargets(policy: Readonly<liquidity.IPrimariesPolicy>, balances: ReadonlyMap<string, number>): liquidity.IPrimaryCandidate[]
 namespace message
 const message.ALL_CHANNELS: Buffer
+const message.ASSET_CONVERSION_TLV = 65540
 const message.BEIGNET_CUSTOM_MAX_PAYLOAD: number
 const message.BEIGNET_CUSTOM_MESSAGE_TYPE = 44069
 const message.BEIGNET_CUSTOM_PROTOCOL_VERSION = 1
@@ -5913,6 +5941,7 @@ interface message.ISimpleCloseCodecOptions
 property message.ISimpleCloseCodecOptions.finalTaproot?: boolean
 interface message.ISpliceAckMessage
 property message.ISpliceAckMessage.channelId: Buffer
+property message.ISpliceAckMessage.conversion?: { termsDigest: Buffer; targetType: Buffer; }
 property message.ISpliceAckMessage.fundingPubkey: Buffer
 property message.ISpliceAckMessage.lockDepth?: number
 property message.ISpliceAckMessage.relativeSatoshis: bigint
@@ -5922,6 +5951,7 @@ property message.ISpliceLockedMessage.channelId: Buffer
 property message.ISpliceLockedMessage.fundingTxid?: Buffer
 interface message.ISpliceMessage
 property message.ISpliceMessage.channelId: Buffer
+property message.ISpliceMessage.conversion?: { termsDigest: Buffer; targetType: Buffer; }
 property message.ISpliceMessage.fundingFeeratePerkw: number
 property message.ISpliceMessage.fundingPubkey: Buffer
 property message.ISpliceMessage.lockDepth?: number

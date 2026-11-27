@@ -4,6 +4,7 @@ import type {
 } from './final-opening-runtime';
 import { signatureFrames } from '../storage/final-funding-updates';
 import { MessageType } from '../message/types';
+import { ASSET_CONVERSION_TEXTS } from './asset-conversion-terms';
 
 export function isFinalCommitmentUpdate(type: MessageType): boolean {
 	return (
@@ -26,7 +27,9 @@ export class FinalCommitmentTransport {
 		private readonly deliver: (
 			id: string,
 			message: IFinalOpeningMessage
-		) => void
+		) => void,
+		/** A conversion holds the channel against local adds and fee updates (#2151). */
+		private readonly held: (id: string) => boolean = () => false
 	) {}
 
 	private requireReady(id: string): void {
@@ -40,6 +43,12 @@ export class FinalCommitmentTransport {
 		this.requireReady(id);
 		if (!isFinalCommitmentUpdate(type))
 			throw new Error('Invalid final commitment update');
+		if (
+			(type === MessageType.UPDATE_ADD_HTLC ||
+				type === MessageType.UPDATE_FEE) &&
+			this.held(id)
+		)
+			throw new Error(ASSET_CONVERSION_TEXTS.held);
 		const { storage, root } = this.runtime;
 		storage.stageFinalHtlcUpdate(id, 'local', type, payload);
 		const signatures = storage.loadFinalUpdateStatus(id)?.needsPeerCommitment
