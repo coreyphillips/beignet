@@ -1532,7 +1532,8 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 				timeoutMs: config.quiescenceTimeoutMs,
 				// Called as a method of the config, as its other callbacks are.
 				feerateEstimate: config.conversionFeerateEstimate
-					? () => config.conversionFeerateEstimate!()
+					? (): Promise<number | null | undefined> =>
+							config.conversionFeerateEstimate!()
 					: undefined
 			}
 		);
