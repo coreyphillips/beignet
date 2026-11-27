@@ -384,6 +384,46 @@ describe('Asset conversion orphans (#2151 step 4a, amendments B1 and B2)', funct
 			]);
 		});
 
+		it('F1e: tells the host once when the first read of the orphan fails, its next withdrawal fails and a third succeeds', async () => {
+			const p = await fresh();
+			const { side, base, reports, told, ctx } = await strand(p);
+			const m = p.managers[side];
+			const read = FinalDeviceJournal.prototype.read;
+			let reads = 0;
+			sinon.stub(FinalDeviceJournal.prototype, 'read').callsFake(function (
+				this: FinalDeviceJournal,
+				...args: unknown[]
+			) {
+				if (args[0] === ATTEMPT_SCOPE && reads++ === 0)
+					throw new Error('disk I/O error');
+				return (read as (...a: unknown[]) => unknown).apply(this, args);
+			} as typeof read);
+			const commits = failCommits(p, side, 1);
+			const quiet = [0, 1, 2].map(() => conversionQuiet(m, p.id));
+			expect(quiet, 'not quiet').to.deep.equal([false, false, false]);
+			expect(
+				commits.failures(),
+				"the second read's withdrawal failed"
+			).to.equal(1);
+			expect(
+				kindsSince(p, side, base),
+				'the third read withdrew it'
+			).to.deep.equal(['conversion-attempt', RESTART]);
+			await settleOnce();
+			expect(
+				reports,
+				'the listing and the first failure, once each'
+			).to.deep.equal([
+				[p.id, WITHDRAWAL_FAILED + LOCKED],
+				[p.id, WITHDRAWAL_FAILED + 'disk I/O error']
+			]);
+			const calls = p.hosts[side].calls('abandonConversion').slice(told);
+			expect(
+				calls.map((c) => c.args),
+				'the host hears the end once, once the record is read'
+			).to.deep.equal([[ctx, RESTART]]);
+		});
+
 		it("T24: builds the manager when the sweep's listing throws, which the sweep contains (green on the base)", async () => {
 			const p = await fresh();
 			const side = p.opener;
