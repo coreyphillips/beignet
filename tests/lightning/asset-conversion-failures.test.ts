@@ -798,6 +798,20 @@ describe('Crossing identical terms (#2151 step 3a, diff review 1)', function () 
 				held(p.managers[0], p.id),
 				held(p.managers[1], p.id)
 			]).to.deep.equal([false, false]);
+			// No reply to the non-opener's terms can still come, so it may
+			// start the same terms (same state number, same id) again at once
+			// (amendment v3.4 item 3).
+			const again = track(
+				startConversion(p.managers[other], p.channelId, { reference })
+			);
+			await p.settle();
+			await again.done;
+			expect(again.error).to.equal(undefined);
+			expect(abandoned(p, other)).to.deep.equal([
+				PEER_GOES_FIRST,
+				FENCE,
+				FENCE
+			]);
 			await updateRound(p);
 		});
 });

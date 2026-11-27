@@ -117,7 +117,11 @@ interface IAttempt {
 	bytes?: Buffer;
 	reference?: string;
 	ctx?: IAssetConversionContext;
-	/** The initiator took the peer's accept or decline of its terms. */
+	/**
+	 * No reply of the peer's to the initiator's terms can still arrive: it
+	 * took an accept or a decline, or the peer sends none (identical
+	 * crossing terms).
+	 */
 	replied?: boolean;
 	/** The host's verify call was reached, so the end is told to it. */
 	verified: boolean;
@@ -539,6 +543,8 @@ export class AssetConversionTransport {
 						this.sendReply(peer, attempt, digest, OTHER_ATTEMPT);
 					return;
 				}
+				// The opener ignores identical terms, so no reply to them comes.
+				if (existing.attempt?.equals(attempt)) existing.replied = true;
 				this.end(existing, PEER_GOES_FIRST);
 			} else {
 				const same =
@@ -627,9 +633,17 @@ export class AssetConversionTransport {
 		const a = [...this.attempts.values()].find(
 			(x) => x.peer === peer && !!x.attempt?.equals(f.attempt)
 		);
-		if (!a) return;
 		const accept = f.bytes.length === 1 && f.bytes[0] === 0;
 		const decline = f.bytes[0] === 1;
+		if (!a) {
+			// A decline is the peer's last reply for an attempt, so a withdrawn
+			// one has nothing more on the wire once its decline arrived.
+			if (decline)
+				for (const [id, w] of [...this.withdrawn])
+					if (w.peer === peer && w.attempt.equals(f.attempt))
+						this.forgetWithdrawn(id);
+			return;
+		}
 		if (!accept && !decline) return;
 		const reason = decline ? declineReason(f.bytes.subarray(1)) : '';
 		this.enqueue(a, async () => {
