@@ -53,6 +53,7 @@ import {
 	claimBytes,
 	CONVERSION_DIGEST,
 	conversionExits,
+	deviceAuthority,
 	exitOf,
 	expectRefusal,
 	openingParent,
@@ -182,6 +183,20 @@ function fundingOf(
 }
 function db(store: SqliteStorage): Database.Database {
 	return (store as unknown as { db: Database.Database }).db;
+}
+/** The wallet's raw rows of one journal scope for a channel, as the fast path counts them. */
+function lifecycleRows(
+	store: SqliteStorage,
+	scope: string,
+	id: string
+): number {
+	return (
+		db(store)
+			.prepare(
+				'SELECT COUNT(*) AS n FROM final_lifecycle_log WHERE scope = ? AND channel_id = ?'
+			)
+			.get(scope, id) as { n: number }
+	).n;
 }
 
 describe('Fundings and branches (#2151 step 2b, item 1)', function () {
@@ -747,7 +762,7 @@ for (const direction of ['to plain', 'to asset'] as const)
 				step2b().releaseFinalConversionExits(store, t.id, CONVERSION_DIGEST);
 			});
 
-			it('refuses each exit the contract names', async () => {
+			it('refuses each exit the contract names, each with its text', async () => {
 				const t = await setup();
 				const { store, root } = t.devices[0];
 				const retain = (exits: IConversionExits): void => {
@@ -757,55 +772,103 @@ for (const direction of ['to plain', 'to asset'] as const)
 					e.parent.type === 'plain' ? e.parent : e.candidate;
 				const assetBranch = (e: IConversionExits): IFinalExitBranch =>
 					e.parent.type === 'asset' ? e.parent : e.candidate;
-				const cases: [string, (e: IConversionExits) => IConversionExits][] = [
+				const put = (
+					e: IConversionExits,
+					b: IFinalExitBranch,
+					changed: IFinalExitBranch
+				): IConversionExits =>
+					b === e.parent
+						? { ...e, parent: changed }
+						: { ...e, candidate: changed };
+				// A whole branch moved onto another outpoint: well formed, but not the live funding.
+				const moved = (b: IFinalExitBranch): IFinalExitBranch => {
+					const hash = Buffer.alloc(32, 0xab);
+					const move = (raw: string): string => {
+						const moving = tx(raw);
+						moving.ins[0].hash = hash;
+						return moving.toHex();
+					};
+					return {
+						...b,
+						fundingTxid: Buffer.from(hash).reverse().toString('hex'),
+						localCommitment: move(b.localCommitment),
+						remoteCommitment: move(b.remoteCommitment)
+					};
+				};
+				// Our signed commitment at height 0 on the same funding: well formed, but stale.
+				const stale = (
+					store as unknown as { openingExitBytes(id: string): Buffer }
+				)
+					.openingExitBytes(t.id)
+					.toString('hex');
+				const cases: [
+					string,
+					(e: IConversionExits) => IConversionExits,
+					string
+				][] = [
 					[
 						'a parent of another type than the current one',
 						(e): IConversionExits => ({
 							...e,
 							parent: e.candidate,
 							candidate: e.parent
-						})
+						}),
+						'Conversion parent is not of the current type'
 					],
 					[
 						'a candidate of the same type',
-						(e): IConversionExits => ({ ...e, candidate: e.parent })
+						(e): IConversionExits => ({ ...e, candidate: e.parent }),
+						'Conversion candidate does not change the type'
 					],
 					[
-						'a parent that is not the live funding',
+						'a parent with a malformed outpoint',
 						(e): IConversionExits => ({
 							...e,
 							parent: { ...e.parent, fundingTxid: 'ab'.repeat(32) }
-						})
+						}),
+						'Invalid conversion exits'
+					],
+					[
+						'a well-formed parent that is not the live funding',
+						(e): IConversionExits => ({ ...e, parent: moved(e.parent) }),
+						'Conversion parent is not the live funding'
 					],
 					[
 						'another state number',
-						(e): IConversionExits => ({ ...e, stateNumber: String(t.n + 1) })
+						(e): IConversionExits => ({ ...e, stateNumber: String(t.n + 1) }),
+						'Conversion exits name a different state'
 					],
 					[
 						'a plain commitment the plain builder does not rebuild',
 						(e): IConversionExits => {
-							const b = plainBranch(e);
-							const changed = {
-								...b,
-								remoteCommitment:
-									b === e.candidate
-										? t.c.view(0, 'remote', { feerate: 999 }).tx.toHex()
-										: e.candidate.remoteCommitment
+							const b = plainBranch(e) as IFinalExitBranch & {
+								type: 'plain';
 							};
-							return b === e.parent
-								? { ...e, parent: changed }
-								: { ...e, candidate: changed };
-						}
+							// The parent's bytes are the ledger's, so its recovery data changes instead.
+							return b === e.candidate
+								? put(e, b, {
+										...b,
+										remoteCommitment: t.c
+											.view(0, 'remote', { feerate: 999 })
+											.tx.toHex()
+								  })
+								: put(e, b, {
+										...b,
+										remoteRecovery: {
+											...b.remoteRecovery,
+											feeratePerKw: b.remoteRecovery.feeratePerKw + 1000
+										}
+								  });
+						},
+						'Conversion commitment differs from the reconstructed transaction'
 					],
 					[
 						'an asset branch failing the asset branch checks',
 						(e): IConversionExits => {
 							const b = assetBranch(e);
-							const changed = { ...b, fundingRoot: '00' };
-							return b === e.parent
-								? { ...e, parent: changed }
-								: { ...e, candidate: changed };
-						}
+							return put(e, b, { ...b, fundingRoot: '00' } as IFinalExitBranch);
+						},
+						'Invalid conversion exits'
 					],
 					[
 						'an asset branch whose feerate does not reproduce its signed commitment',
@@ -813,35 +876,77 @@ for (const direction of ['to plain', 'to asset'] as const)
 							const b = assetBranch(e) as IFinalExitBranch & {
 								feeratePerKw: number;
 							};
-							const changed = { ...b, feeratePerKw: b.feeratePerKw + 1000 };
-							return b === e.parent
-								? { ...e, parent: changed }
-								: { ...e, candidate: changed };
-						}
+							return put(e, b, {
+								...b,
+								feeratePerKw: b.feeratePerKw + 1000
+							} as IFinalExitBranch);
+						},
+						'Retained splice commitment differs from the reconstructed transaction'
 					],
 					[
-						"parent commitments other than the current ledger's",
+						'a parent without a witness on its local commitment',
 						(e): IConversionExits => ({
 							...e,
 							parent: {
 								...e.parent,
 								localCommitment: e.parent.remoteCommitment
 							}
-						})
-					]
-				];
-				if (direction === 'to plain')
-					cases.push([
-						'a plain candidate whose local witness does not verify',
+						}),
+						'Invalid conversion exits'
+					],
+					[
+						"a well-formed parent local commitment other than the current ledger's",
+						(e): IConversionExits => ({
+							...e,
+							parent: { ...e.parent, localCommitment: stale }
+						}),
+						"Conversion parent differs from the current ledger's commitments"
+					],
+					[
+						"a candidate whose local point is not this device's at N",
 						(e): IConversionExits => ({
 							...e,
 							candidate: {
 								...e.candidate,
-								localCommitment: t.c.view(0, 'local').tx.toHex()
-							}
-						})
-					]);
-				for (const [why, change] of cases) {
+								localRecovery: {
+									...e.candidate.localRecovery,
+									point: t.c.point(0, t.n + 1).toString('hex')
+								}
+							} as IFinalExitBranch
+						}),
+						"Conversion candidate's local point is not this device's at its state"
+					]
+				];
+				if (direction === 'to plain')
+					cases.push(
+						[
+							'a plain candidate local commitment without a witness',
+							(e): IConversionExits => ({
+								...e,
+								candidate: {
+									...e.candidate,
+									localCommitment: t.c.view(0, 'local').tx.toHex()
+								}
+							}),
+							'Invalid conversion exits'
+						],
+						[
+							'a plain candidate whose local witness does not verify',
+							(e): IConversionExits => {
+								const unsigned = t.c.view(0, 'local').tx;
+								unsigned.setWitness(0, [Buffer.alloc(64, 1)]);
+								return {
+									...e,
+									candidate: {
+										...e.candidate,
+										localCommitment: unsigned.toHex()
+									}
+								};
+							},
+							'Conversion commitment witness does not verify'
+						]
+					);
+				for (const [why, change, text] of cases) {
 					let refused: Error | undefined;
 					try {
 						retain(change(copy(t.exits[0])));
@@ -849,9 +954,7 @@ for (const direction of ['to plain', 'to asset'] as const)
 						refused = e as Error;
 					}
 					expect(refused, why).to.be.instanceOf(Error);
-					expect(refused!.message, why).to.not.match(
-						/is not a function|Cannot read propert|is not defined/
-					);
+					expect(refused!.message, why).to.equal(text);
 				}
 				// A candidate that does not spend the parent.
 				const elsewhere = new Transaction();
@@ -863,8 +966,9 @@ for (const direction of ['to plain', 'to asset'] as const)
 					stateNumber: t.n,
 					parent: { tx: elsewhere, index: 0 }
 				});
-				expectRefusal(() =>
-					retain(conversionExits(t.devices, stray, t.parents)[0])
+				expectRefusal(
+					() => retain(conversionExits(t.devices, stray, t.parents)[0]),
+					'Conversion candidate must spend its parent'
 				);
 				// A candidate funding on an unallocated key index.
 				const unallocated = buildConversion(t.devices, t.id, {
@@ -873,10 +977,24 @@ for (const direction of ['to plain', 'to asset'] as const)
 					parent: t.opening,
 					keyIndices: [9999, 9999]
 				});
-				expectRefusal(() =>
-					retain(conversionExits(t.devices, unallocated, t.parents)[0])
+				expectRefusal(
+					() => retain(conversionExits(t.devices, unallocated, t.parents)[0]),
+					'Opening must use a previously allocated device key'
 				);
-				// A candidate funding equal to an earlier funding of the channel: the opening.
+				// A candidate funding on the key index an earlier funding (the opening) used.
+				const reusedKey = buildConversion(t.devices, t.id, {
+					type: candidateType,
+					stateNumber: t.n,
+					parent: t.opening,
+					keyIndices: t.devices.map(
+						(d) => d.store.loadFinalOpeningSession(t.id)!.channelKeyIndex
+					) as [number, number]
+				});
+				expectRefusal(
+					() => retain(conversionExits(t.devices, reusedKey, t.parents)[0]),
+					'Conversion candidate reuses a funding key'
+				);
+				// A candidate funding equal to the parent's, whose commitments then spend another outpoint.
 				const reused = copy(t.exits[0]);
 				reused.candidate = {
 					...reused.candidate,
@@ -884,22 +1002,74 @@ for (const direction of ['to plain', 'to asset'] as const)
 					fundingTxid: reused.parent.fundingTxid,
 					outputIndex: reused.parent.outputIndex
 				};
-				expectRefusal(() => retain(reused));
+				expectRefusal(() => retain(reused), 'Invalid conversion exits');
 				// Inside a transaction.
-				expectRefusal(() =>
-					db(store).transaction(() => retain(copy(t.exits[0])))()
+				expectRefusal(
+					() => db(store).transaction(() => retain(copy(t.exits[0])))(),
+					'Conversion exits require a top-level commit'
 				);
 				// The same digest with other bytes, a second pending conversion, an unknown release.
 				retain(copy(t.exits[0]));
 				const other = copy(t.exits[0]);
 				other.candidate.minimumDepth += 1;
-				expectRefusal(() => retain(other));
-				expectRefusal(() =>
-					retain({ ...copy(t.exits[0]), digest: 'd2'.repeat(32) })
+				expectRefusal(
+					() => retain(other),
+					'Conversion exits differ from the retained ones'
 				);
-				expectRefusal(() =>
-					step2b().releaseFinalConversionExits(store, t.id, 'd3'.repeat(32))
+				expectRefusal(
+					() => retain({ ...copy(t.exits[0]), digest: 'd2'.repeat(32) }),
+					'Another conversion of this channel is pending'
 				);
+				expectRefusal(
+					() =>
+						step2b().releaseFinalConversionExits(store, t.id, 'd3'.repeat(32)),
+					'Conversion exits were not retained'
+				);
+			});
+
+			it('leaves a conversion row the fast path counts when the wallet insert fails after the device slot (A6)', async () => {
+				const t = await setup();
+				const { store, root } = t.devices[0];
+				const authority = deviceAuthority(store);
+				const commit = authority.commitLifecycleEntry.bind(authority);
+				const stub = sinon
+					.stub(authority, 'commitLifecycleEntry')
+					.callsFake((slot: string, encoded: string) => {
+						commit(slot, encoded);
+						if (slot.startsWith('conversion/'))
+							throw new Error('wallet insert failed');
+					});
+				try {
+					expect(() =>
+						step2b().retainFinalConversionExits(store, t.id, t.exits[0], root)
+					).to.throw('wallet insert failed');
+				} finally {
+					stub.restore();
+				}
+				expect(lifecycleRows(store, 'conversion', t.id)).to.equal(1);
+			});
+
+			it("gives a record whose funding is the candidate's outpoint the record's era and type", async () => {
+				const t = await setup();
+				retainBoth(t.devices, t.id, t.exits);
+				appendBoth(t.devices, t.c);
+				const store = t.devices[0].store;
+				const fundings = step2b().finalChannelFundings(store, t.id);
+				expect(fundings.filter((f) => f.source === 'conversion')).to.deep.equal(
+					[]
+				);
+				expect(fundingOf(store, t.id, t.c.tx.getId())).to.deep.include({
+					type: candidateType,
+					era: 1,
+					source: 'record'
+				});
+				expect(
+					step2b().finalSpendBranch(
+						store,
+						t.id,
+						tx(t.exits[1].candidate.localCommitment)
+					)
+				).to.deep.include({ source: 'record', era: 1 });
 			});
 
 			it('refuses a ledger that is not quiescent', async () => {
@@ -1092,3 +1262,130 @@ for (const direction of ['to plain', 'to asset'] as const)
 			});
 		}
 	);
+
+describe('Our own past-era commitment and the record writer (#2151 step 2b, review fixes)', function () {
+	this.timeout(300000);
+	const s = scratch('branch-own-revoked-');
+	afterEach(() => sinon.restore());
+	afterEach(() => s.release());
+
+	it('claims nothing for our own asset commitment of the parent once a plain round revoked it', async () => {
+		const pair = await assetTypePair(s, 1);
+		const { id, devices } = pair;
+		const ours = exitOf(devices[0], id);
+		appendBoth(
+			devices,
+			buildConversion(devices, id, {
+				type: 'plain',
+				stateNumber: 1,
+				parent: openingParent(devices[0].store, id)
+			})
+		);
+		expect(claimsOf(devices, id, ours)).to.have.length(1);
+		plainRounds(devices, id, 1, () => 400);
+		expect(claimsOf(devices, id, ours)).to.deep.equal([]);
+	});
+
+	it('claims nothing for our own plain commitment of the parent once an asset round revoked it', async () => {
+		const pair = plainTypePair(s, 1);
+		const { id, devices } = pair;
+		const ours = exitOf(devices[0], id);
+		appendBoth(
+			devices,
+			buildConversion(devices, id, {
+				type: 'asset',
+				stateNumber: 1,
+				parent: openingParent(devices[0].store, id)
+			})
+		);
+		expect(claimsOf(devices, id, ours)).to.have.length(1);
+		await assetRounds(devices, id, 2);
+		expect(claimsOf(devices, id, ours)).to.deep.equal([]);
+	});
+
+	it('leaves a channel-type row the fast path counts when the wallet insert fails after the device slot', async () => {
+		const pair = await assetTypePair(s, 0);
+		const c = buildConversion(pair.devices, pair.id, {
+			type: 'plain',
+			stateNumber: 0,
+			parent: openingParent(pair.devices[0].store, pair.id)
+		});
+		const { store, root } = pair.devices[0];
+		const authority = deviceAuthority(store);
+		const commit = authority.commitLifecycleEntry.bind(authority);
+		sinon
+			.stub(authority, 'commitLifecycleEntry')
+			.callsFake((slot: string, encoded: string) => {
+				commit(slot, encoded);
+				if (slot.startsWith('channel-type/'))
+					throw new Error('wallet insert failed');
+			});
+		expect(() =>
+			typed(store).appendFinalChannelType(pair.id, c.inputs[0], root)
+		).to.throw('wallet insert failed');
+		sinon.restore();
+		expect(lifecycleRows(store, 'channel-type', pair.id)).to.equal(1);
+	});
+});
+
+describe('A conversion candidate on an earlier funding (#2151 step 2b, review fixes)', function () {
+	this.timeout(300000);
+	const s = scratch('branch-funding-new-');
+	afterEach(() => s.release());
+
+	it('refuses a candidate funding equal to a plain splice candidate that spends the same parent', async () => {
+		const pair = plainTypePair(s, 1);
+		const { id, devices, stores, sides } = pair;
+		const opening = openingParent(stores[0], id);
+		const parents = devices.map((d) => plainParentBranch(d.store, id));
+		const c = buildConversion(devices, id, {
+			type: 'asset',
+			stateNumber: 1,
+			parent: opening
+		});
+		const [exits] = conversionExits(devices, c, parents);
+		const wire = plainWire(stores, sides, id);
+		const child = await wire.spliceOut();
+		wire.destroy();
+		const attempt = (
+			stores[0].loadFinalSpliceAttempts(id).at(-1) as unknown as {
+				candidate: {
+					funding: { fundingTxHex: string; fundingOutputIndex: number };
+				};
+			}
+		).candidate.funding;
+		const index = attempt.fundingOutputIndex;
+		const move = (raw: string): string => {
+			const moving = tx(raw);
+			moving.ins[0].hash = child.getHash();
+			moving.ins[0].index = index;
+			return moving.toHex();
+		};
+		const candidate = exits.candidate;
+		const onSplice: IConversionExits = {
+			...exits,
+			candidate: {
+				...candidate,
+				funding: {
+					...candidate.funding,
+					fundingTxHex: attempt.fundingTxHex,
+					fundingOutputIndex: index
+				},
+				fundingTxid: child.getId(),
+				outputIndex: index,
+				localCommitment: move(candidate.localCommitment),
+				remoteCommitment: move(candidate.remoteCommitment)
+			}
+		};
+		expectRefusal(
+			() =>
+				step2b().retainFinalConversionExits(
+					stores[0],
+					id,
+					onSplice,
+					devices[0].root
+				),
+			'Conversion candidate funding must be new'
+		);
+	});
+});

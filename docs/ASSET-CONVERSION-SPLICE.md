@@ -217,7 +217,7 @@ After a restart in that window, the parent's watch is armed again. Today `AssetS
   - the plain ledger starts at height 0 from the opening and enforces the BOLT 3 shachain buckets ("Missing preceding revocation secret", `src/lightning/storage/final-channel-updates.ts`);
   - the asset ledger expects the prior state's point (`src/lightning/channel/asset-splice-update-batch.ts`).
 - **The rule.** The new type's ledger is seeded at the conversion's state number with the peer's current and next points and every secret the old ledger holds.
-- **One store.** Each peer secret received after adoption is recorded in one store that both claim builders read. A plain revocation then also punishes an asset commitment of the parent published after a reorganisation, and the reverse. The store is one reader over each type's ledger and the records' shachains, looked up per height and read by both claim builders, rather than a second record of each secret.
+- **One store.** The peer's secrets are read through one store: one reader over each type's ledger and the records' shachains, looked up per height and read by both claim builders. Each secret stays only where its own ledger records it; there is no second record of it. A plain revocation then also punishes an asset commitment of the parent published after a reorganisation, and the reverse.
 - **Today.** Plain claims read secrets from `loadFinalResolutionStates`, and asset claims look for them only at the asset journal's `peer-revoke` stage (`src/lightning/chain/asset-splice-output-view.ts`).
 
 **Claiming by branch**

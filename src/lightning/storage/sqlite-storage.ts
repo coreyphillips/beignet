@@ -949,7 +949,8 @@ export class SqliteStorage implements IStorageBackend {
 				this.finalPlainBranchType(id, branch),
 			finalOwnCommitmentRevoked: (id, era, height) =>
 				this.finalOwnCommitmentRevoked(id, era, height),
-			loadFinalPeerSecrets: (id) => this.loadFinalPeerSecrets(id)
+			loadFinalPeerSecrets: (id) => this.loadFinalPeerSecrets(id),
+			finalPeerSecretScope: (run) => this.finalPeerSecretScope(run)
 		});
 	}
 
@@ -2068,7 +2069,18 @@ export class SqliteStorage implements IStorageBackend {
 		// The device slot commits before the wallet row, so a failure between
 		// them leaves a durable record that the next authenticated read pulls in.
 		this.channelTypes.delete(channelId);
-		journal.append('channel-type', channelId, head, record);
+		try {
+			journal.append('channel-type', channelId, head, record);
+		} catch (e) {
+			// Pull a committed device slot in now, since the claim fast path
+			// counts the wallet's rows (#2151 step 2b).
+			try {
+				journal.read('channel-type', channelId);
+			} catch {
+				// The rethrown error below is the one the caller needs.
+			}
+			throw e;
+		}
 		return copyJson(record);
 	}
 
@@ -2527,9 +2539,13 @@ export class SqliteStorage implements IStorageBackend {
 						'asset-splice'
 					);
 			}
-		for (const r of records) add(r);
 		// Where a record's funding is a conversion's candidate, the record wins.
-		for (const c of this.finalConversions(channelId))
+		for (const c of this.finalConversions(channelId)) {
+			const o = {
+				txid: c.candidate.fundingTxid,
+				outputIndex: c.candidate.outputIndex
+			};
+			if (recorded.has(key(o))) continue;
 			add({
 				txid: c.candidate.fundingTxid,
 				outputIndex: c.candidate.outputIndex,
@@ -2541,6 +2557,8 @@ export class SqliteStorage implements IStorageBackend {
 				},
 				digest: c.digest
 			});
+		}
+		for (const r of records) add(r);
 		return out;
 	}
 
@@ -2813,7 +2831,31 @@ export class SqliteStorage implements IStorageBackend {
 	}
 
 	/** The sources of peer secrets, or none in a wallet that keeps neither ledger (generations 1 and 3). */
-	private peerSecretSources(channelId: string): {
+	/** The peer secret sources of each channel, kept for one claim build. */
+	private peerSecretScope?: Map<
+		string,
+		ReturnType<SqliteStorage['readPeerSecretSources']>
+	>;
+	/** Run one claim build with the sources of every height read once. */
+	private finalPeerSecretScope<T>(run: () => T): T {
+		if (this.peerSecretScope) return run();
+		this.peerSecretScope = new Map();
+		try {
+			return run();
+		} finally {
+			this.peerSecretScope = undefined;
+		}
+	}
+	private peerSecretSources(
+		channelId: string
+	): ReturnType<SqliteStorage['readPeerSecretSources']> {
+		const scope = this.peerSecretScope;
+		if (!scope) return this.readPeerSecretSources(channelId);
+		if (!scope.has(channelId))
+			scope.set(channelId, this.readPeerSecretSources(channelId));
+		return scope.get(channelId)!;
+	}
+	private readPeerSecretSources(channelId: string): {
 		records: IFinalChannelTypeRecord[];
 		plain?: IFinalLedgerState;
 		asset: () => ReturnType<typeof assetUpdateHistory>[];
@@ -2842,13 +2884,15 @@ export class SqliteStorage implements IStorageBackend {
 		const eras = [state.openingAsset, ...records.map((r) => r.type === 'asset')]
 			.map((asset, era) => (asset ? era : -1))
 			.filter((era) => era >= 0);
+		let asset: ReturnType<typeof assetUpdateHistory>[] | undefined;
 		return {
 			records,
 			...(plain && { plain }),
+			// Each asset era is read once, on first use.
 			asset: () =>
-				this.assetSpliceWallet
+				(asset ??= this.assetSpliceWallet
 					? eras.map((era) => assetEraHistory(this, channelId, era))
-					: []
+					: [])
 		};
 	}
 
@@ -2999,6 +3043,17 @@ export class SqliteStorage implements IStorageBackend {
 			throw new Error('Conversion exits require an open channel');
 		if (BigInt(canonical.stateNumber) !== BigInt(old.height))
 			throw new Error('Conversion exits name a different state');
+		// The candidate's own commitment is at this device's point for N.
+		const ownPoint = getPublicKey(
+			generateFromSeed(
+				deriveChannelKeys(root, 1, session.channelKeyIndex).perCommitmentSeed,
+				MAX_INDEX - BigInt(old.height)
+			)
+		).toString('hex');
+		if (candidate.localRecovery.point !== ownPoint)
+			throw new Error(
+				"Conversion candidate's local point is not this device's at its state"
+			);
 		const ledger = this.currentLedgerCommitments(
 			channelId,
 			current,

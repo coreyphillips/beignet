@@ -365,6 +365,7 @@ describe('Disagreeing peer secrets (#2151 step 2b, item 2)', function () {
 				);
 			expect(errors, 'one report for the channel and height').to.have.length(1);
 			expect(errors[0]).to.not.match(/is not a function|Cannot read propert/);
+			expect(errors[0]).to.match(/Inconsistent peer revocation secrets/);
 		} finally {
 			running.close();
 		}

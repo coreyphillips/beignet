@@ -60,14 +60,17 @@ export interface IFinalBranchReaders {
 	): boolean;
 	/** Every peer secret by height, for diagnostics; it throws on a disagreement and is never on a claim path. */
 	loadFinalPeerSecrets(channelId: string): Map<bigint, Buffer>;
+	/** Run one claim build with each channel's secret sources read once for every height. */
+	finalPeerSecretScope<T>(run: () => T): T;
 }
 
 /**
  * A symbol-keyed function on the store, not a declared member: it reaches
  * through the node's fenced storage view, which wraps every function it
- * hands out, so a closed view refuses it like any other call.
+ * hands out, so a closed view refuses it like any other call. The symbol is
+ * private to this module, so only its importers reach the readers.
  */
-const readersKey = Symbol.for('beignet.storage.final-branch-readers-v1');
+const readersKey = Symbol('final-branch-readers');
 
 export function registerFinalBranchReaders(
 	storage: object,

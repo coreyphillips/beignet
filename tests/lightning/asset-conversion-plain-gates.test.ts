@@ -999,15 +999,17 @@ describe('Restore of a channel with a conversion row (#2151 step 2b, amendment A
 		await writeBackupMac(mac, backup);
 		const d = pair.p.f.devices[0];
 		d.store.close();
-		await expectRejection(() =>
-			performAssetChannelRestore(
-				backup,
-				d.file,
-				path.join(dir, 'restore.lock'),
-				d.party.binding,
-				id,
-				mac
-			)
+		await expectRejection(
+			() =>
+				performAssetChannelRestore(
+					backup,
+					d.file,
+					path.join(dir, 'restore.lock'),
+					d.party.binding,
+					id,
+					mac
+				),
+			/pending type conversion/
 		);
 	});
 });

@@ -183,7 +183,55 @@ export function finalChannelOutputClaims(
 			? finalSpendBranch(runtime.storage, channelId, parent)
 			: undefined;
 	if (spend === null) return [];
-	const kind = spend ? spend.type : kindOf(channelId);
+	// One claim build reads each source of peer secrets once.
+	const readers = spend && finalBranchReaders(runtime.storage);
+	if (readers)
+		return readers.finalPeerSecretScope(() =>
+			dispatch(
+				spend,
+				kindOf,
+				builders,
+				runtime,
+				id,
+				parent,
+				destination,
+				feeRate,
+				provider,
+				trimmed
+			)
+		);
+	return dispatch(
+		spend,
+		kindOf,
+		builders,
+		runtime,
+		id,
+		parent,
+		destination,
+		feeRate,
+		provider,
+		trimmed
+	);
+}
+
+function dispatch(
+	spend: IFinalChannelFunding | undefined,
+	kindOf: (channelId: string) => 'plain' | 'asset' | null,
+	builders: {
+		plain?: typeof finalOpeningOutputClaims;
+		asset?: AssetClaimBuilder;
+	},
+	runtime: IFinalOpeningRuntime,
+	id: Buffer,
+	parent: Transaction,
+	destination: Buffer,
+	feeRate: number,
+	provider: IAuxiliaryDualFunding | undefined,
+	trimmed:
+		| ((hash: Buffer, htlcId: bigint, preimage?: Buffer) => void)
+		| undefined
+): IFinalOutputClaim[] {
+	const kind = spend ? spend.type : kindOf(id.toString('hex'));
 	const branchArgs: [] | [IFinalChannelFunding] = spend ? [spend] : [];
 	if (kind === 'plain')
 		return (builders.plain ?? finalOpeningOutputClaims)(
