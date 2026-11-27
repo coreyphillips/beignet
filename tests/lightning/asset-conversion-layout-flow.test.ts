@@ -8,7 +8,10 @@ import { expect } from 'chai';
 import { createHash } from 'crypto';
 import sinon from 'sinon';
 import { Transaction } from 'bitcoinjs-lib';
-import { encodeUpdateAddHtlcMessage } from '../../src/lightning/message/channel-update';
+import {
+	encodeUpdateAddHtlcMessage,
+	encodeUpdateFulfillHtlcMessage
+} from '../../src/lightning/message/channel-update';
 import {
 	BEIGNET_CUSTOM_MESSAGE_TYPE,
 	BeignetCustomSubtype,
@@ -21,7 +24,8 @@ import type {
 	IAssetConversionTerms
 } from '../../src/lightning/channel';
 import { createTaprootFundingScript } from '../../src/lightning/script/funding-taproot';
-import { scratch } from './helpers/channel-type-pairs';
+import { finalBranchReaders } from '../../src/lightning/storage/final-branch-readers';
+import { plainTypePair, scratch } from './helpers/channel-type-pairs';
 import type { IConversionBitcoin } from './helpers/conversion-modules';
 import {
 	abandoned,
@@ -43,6 +47,7 @@ import {
 	layoutFrames,
 	never,
 	PAIR_HEIGHT,
+	parentBalancesMsat,
 	readReply,
 	replyMessage,
 	roleOf,
@@ -1073,6 +1078,36 @@ describe('Received layout frames (#2151 step 3b, section 3 and v2.1 item 13)', f
 		await endsI(p, FENCE);
 	});
 
+	it("keeps a layout that arrives before the peer's splice_ack, and runs the layout steps on the ack (M1)", async () => {
+		const p = await conversionPair(s, 'plain');
+		const { id, ack } = await toInitSent(p);
+		const layout = Buffer.from('scripted acceptor layout, sent early');
+		sendAll(p, 1, layoutFrames(id.attempt, layout));
+		await p.settle();
+		expect(
+			callsOf(p, 0, 'describeConversion'),
+			'no steps in init-sent'
+		).to.deep.equal([]);
+		expect(p.link.inbox[1].some((m) => m.name === 'TX_ABORT')).to.equal(false);
+		p.link.send(1, MessageType.SPLICE_ACK, ack);
+		await p.settle();
+		expect(
+			p.link.inbox[1].map((m) => m.name).slice(-2),
+			"I's layout, then its layout_ack"
+		).to.deep.equal(['asset_splice:0', 'asset_splice:4']);
+		const describe = callsOf(p, 0, 'describeConversion');
+		expect(describe).to.have.length(1);
+		expect(describe[0].args[1]).to.deep.equal([stubProposal(0), layout]);
+		const own = p.link.inbox[1].filter((m) => m.name === 'asset_splice:4');
+		const L = callsOf(p, 0, 'prepareConversion')[0].args[3] as Buffer;
+		expect(frameOf(own[0]).digest).to.deep.equal(
+			agreementDigestOf(L, sha256(L))
+		);
+		sendAll(p, 1, [layoutAckMessage(id.attempt, frameOf(own[0]).digest)]);
+		await p.settle();
+		await endsI(p, FENCE);
+	});
+
 	/** Scripted I (side 0), real A (side 1), up to A's layout_ack. */
 	async function toAcceptorAck(
 		p: IConversionPair
@@ -1463,5 +1498,476 @@ describe('Routing of the layout frames (#2151 step 3b, section 2)', function () 
 		expect(names(seen[1], attempt).map((x) => x.raw[1])).to.deep.equal([0]);
 		expect(p.link.sent.filter((m) => m.name === 'TX_ABORT').length).to.equal(2);
 		await updateRound(p);
+	});
+});
+
+describe('Copies of what the host is given and gives back (#2151 step 3b, v2.4 items 2 and 4)', function () {
+	this.timeout(90000);
+	const s = scratch('conversion-layout-copies-');
+	const shared = sharedPair(s, 'plain');
+	after(() => s.release());
+
+	/** Side 0 starts; `prepare` runs after agreeOnTerms, before the start. */
+	async function startWith(
+		p: IConversionPair,
+		prepare: () => void
+	): Promise<ReturnType<typeof track>> {
+		agreeOnTerms(p);
+		prepare();
+		const start = track(
+			startConversion(p.managers[0], p.channelId, { reference: REF })
+		);
+		await p.settle();
+		await start.done;
+		return start;
+	}
+	type Ctx = Omit<IAssetConversionContext, 'attempt'> & { attempt?: Buffer };
+	const LATER = [
+		'verifyConversionTerms',
+		'proposeConversion',
+		'describeConversion',
+		'prepareConversion',
+		'abandonConversion'
+	];
+
+	it("passes later host calls the engine's own context when the host changes the one conversionTerms got (v2.4 item 4)", async () => {
+		const p = await shared();
+		clean(p);
+		let given: unknown;
+		const start = await startWith(p, () => {
+			const terms = p.hosts[0].terms;
+			p.hosts[0].terms = (ctx, request): ReturnType<typeof terms> => {
+				given = JSON.parse(JSON.stringify(ctx));
+				const c = ctx as unknown as Record<string, unknown> & {
+					parent: Record<string, unknown>;
+				};
+				c.channelId = 'ee'.repeat(32);
+				c.peer = '02' + 'ee'.repeat(32);
+				c.isOpener = !c.isOpener;
+				c.direction = c.direction === 'to-asset' ? 'to-plain' : 'to-asset';
+				c.parent.txid = 'ee'.repeat(32);
+				c.parent.outputIndex = 7;
+				c.parent.stateNumber = '999';
+				return terms(ctx, request);
+			};
+		});
+		expect(start.error, 'start').to.equal(undefined);
+		const later = p.hostLog.filter(
+			(c) => c.side === 0 && c.name !== 'conversionTerms'
+		);
+		for (const c of later) {
+			const { attempt, ...rest } = c.args[0] as Ctx;
+			expect(attempt, c.name).to.not.equal(undefined);
+			expect(JSON.parse(JSON.stringify(rest)), c.name).to.deep.equal(given);
+		}
+		expect(later.map((c) => c.name)).to.deep.equal(LATER);
+		expect(abandoned(p, 0)).to.deep.equal([FENCE]);
+		expect(abandoned(p, 1)).to.deep.equal([FENCE]);
+	});
+
+	it('passes later host calls and the wire the attempt id when each host overwrites the bytes verifyConversionTerms got (v2.4 item 4)', async () => {
+		const p = await shared();
+		clean(p);
+		const terms = storeTerms(p.stores[0], p.id, { reference: REF });
+		const { attempt } = termsIdentity(
+			terms,
+			undefined,
+			roleOf(p.stores[0], p.id)
+		);
+		const mark = p.link.sent.length;
+		await startWith(p, () => {
+			for (const i of [0, 1] as const)
+				p.hosts[i].verify = (ctx): unknown => {
+					ctx.attempt.fill(0xee);
+					return true;
+				};
+		});
+		for (const i of [0, 1] as const) {
+			const later = p.hostLog.filter(
+				(c) => c.side === i && LATER.slice(1).includes(c.name)
+			);
+			expect(later.map((c) => c.name)).to.deep.equal(LATER.slice(1));
+			for (const c of later)
+				expect((c.args[0] as Ctx).attempt, i + ':' + c.name).to.deep.equal(
+					attempt
+				);
+		}
+		const frames = p.link.sent
+			.slice(mark)
+			.filter((m) => m.type === BEIGNET_CUSTOM_MESSAGE_TYPE);
+		expect(frames.map((m) => m.name)).to.include.members([
+			'conversion_terms',
+			'conversion_reply',
+			'asset_splice:0',
+			'asset_splice:4'
+		]);
+		for (const m of frames)
+			expect(frameOf(m).attempt, m.from + ':' + m.name).to.deep.equal(attempt);
+		expect(abandoned(p, 0)).to.deep.equal([FENCE]);
+		expect(abandoned(p, 1)).to.deep.equal([FENCE]);
+	});
+
+	it('copies the description once: a descriptorHash getter that answers 2 bytes on its second read leaves both layouts equal (v2.4 item 2)', async () => {
+		const p = await shared();
+		clean(p);
+		const h = p.hosts[1];
+		h.describe = (ctx, _proposals, bitcoin): unknown => {
+			const d = stubConversionDescription(
+				ctx,
+				h.termsFor(ctx),
+				bitcoin
+			) as unknown as { outputs: Record<string, unknown>[] };
+			const o = d.outputs[d.outputs.length - 1];
+			const good = o.descriptorHash as Buffer;
+			let reads = 0;
+			Object.defineProperty(o, 'descriptorHash', {
+				enumerable: true,
+				get: (): Buffer => (reads++ === 0 ? good : good.subarray(0, 2))
+			});
+			return d;
+		};
+		await run(p, 0);
+		expect(abandoned(p, 0)).to.deep.equal([FENCE]);
+		expect(abandoned(p, 1)).to.deep.equal([FENCE]);
+	});
+
+	it('ends both sides with the describe text, not a TypeError, when a host describes a sparse outputs array (v2.4 item 2)', async () => {
+		const p = await shared();
+		clean(p);
+		const h = p.hosts[1];
+		h.describe = (ctx, _proposals, bitcoin): unknown => {
+			const d = stubConversionDescription(
+				ctx,
+				h.termsFor(ctx),
+				bitcoin
+			) as unknown as { outputs: unknown[] };
+			d.outputs = [...d.outputs];
+			d.outputs.length += 1;
+			return d;
+		};
+		const mark = p.link.sent.length;
+		await run(p, 0);
+		expect(abortsFrom(p, 1, mark)).to.deep.equal([DESCRIBE]);
+		expect(abortsFrom(p, 0, mark), 'the echo').to.deep.equal([DESCRIBE]);
+		expect(abandoned(p, 0)).to.deep.equal([DESCRIBE]);
+		expect(abandoned(p, 1)).to.deep.equal([DESCRIBE]);
+	});
+});
+
+describe('The estimate as a method of the config (#2151 step 3b, v2.4 item 5)', function () {
+	this.timeout(90000);
+	const s = scratch('conversion-estimate-method-');
+	after(() => s.release());
+
+	it("calls config.conversionFeerateEstimate as the config's method, so one that reads this is the floor's estimate", async () => {
+		const rates = { perKw: 1000 };
+		const config = {
+			rates,
+			conversionFeerateEstimate(this: {
+				rates: { perKw: number };
+			}): Promise<number> {
+				return Promise.resolve(this.rates.perKw);
+			}
+		};
+		const p = await conversionPair(s, 'plain', {
+			conversionFeerateEstimate: [null, null],
+			config: [config, config]
+		});
+		const start = await run(p, 0);
+		expect(start.error, 'start').to.equal(undefined);
+		expect(abandoned(p, 0)).to.deep.equal([FENCE]);
+		expect(abandoned(p, 1)).to.deep.equal([FENCE]);
+		// The method's own answer is the estimate: above the terms' feerate, the start is refused.
+		clean(p);
+		rates.perKw = 1001;
+		const refused = await run(p, 0);
+		expect(refused.error).to.equal(BELOW_FLOOR);
+	});
+});
+
+describe('Frame order and late host answers (#2151 step 3b, sections 2 and 3)', function () {
+	this.timeout(90000);
+	const s = scratch('conversion-layout-order-');
+	const shared = sharedPair(s, 'plain');
+	after(() => s.release());
+
+	it('routes a frame naming the attempt from another peer to the asset splice transport (section 2, ownsFrame)', async () => {
+		const p = await shared();
+		clean(p);
+		const seen: { peer: string; raw: Buffer }[] = [];
+		const t = (
+			p.managers[0] as unknown as {
+				assetSplice: {
+					custom(peer: string, subtype: number, raw: Buffer): void;
+				};
+			}
+		).assetSplice;
+		const original = t.custom;
+		t.custom = (peer, subtype, raw): void => {
+			seen.push({ peer, raw: Buffer.from(raw) });
+			original.call(t, peer, subtype, raw);
+		};
+		try {
+			const terms = storeTerms(p.stores[0], p.id, { reference: REF });
+			const { attempt } = termsIdentity(
+				terms,
+				undefined,
+				roleOf(p.stores[0], p.id)
+			);
+			// I is laid-out with its agreement when the stranger's frame arrives.
+			p.link.hold({ from: 1, name: 'asset_splice:4' });
+			await run(p, 0);
+			expect(callsOf(p, 0, 'prepareConversion')).to.have.length(1);
+			const stranger = '02' + '5a'.repeat(32);
+			for (const raw of [
+				layoutAckMessage(attempt, Buffer.alloc(32, 0x5a)),
+				layoutFrames(attempt, Buffer.from('a stranger layout'))[0]
+			]) {
+				const { subtype, payload } = decodeCustomMessage(raw);
+				p.managers[0].handleAssetOpenFrame(stranger, subtype, payload);
+			}
+			await p.settle();
+			expect(
+				seen.filter((x) => x.raw.includes(attempt)).map((x) => x.peer)
+			).to.deep.equal([stranger, stranger]);
+			expect(abandoned(p, 0)).to.deep.equal([]);
+			p.link.clearRules();
+			p.link.release();
+			await p.settle();
+			expect(abandoned(p, 0)).to.deep.equal([FENCE]);
+			expect(abandoned(p, 1)).to.deep.equal([FENCE]);
+		} finally {
+			t.custom = original;
+		}
+	});
+
+	it("reaches the fence when A's layout_ack reaches I before A's layout: I compares once its own agreement is in", async () => {
+		const p = await shared();
+		clean(p);
+		p.link.hold({ from: 1, name: 'asset_splice:0' });
+		const mark = p.link.sent.length;
+		const seen = p.link.delivered.length;
+		await run(p, 0);
+		expect(
+			p.link.delivered
+				.slice(seen)
+				.filter((m) => m.from === 1 && isLayoutFrame(m))
+				.map((m) => m.name),
+			"A's layout_ack, ahead of its held layout"
+		).to.deep.equal(['asset_splice:4']);
+		expect(callsOf(p, 0, 'describeConversion')).to.deep.equal([]);
+		expect(abandoned(p, 0)).to.deep.equal([]);
+		p.link.clearRules();
+		p.link.release();
+		await p.settle();
+		expect(abortsFrom(p, 0, mark)).to.deep.equal([FENCE]);
+		expect(abandoned(p, 0)).to.deep.equal([FENCE]);
+		expect(abandoned(p, 1)).to.deep.equal([FENCE]);
+	});
+
+	it('sends no layout_ack from I when a peer tx_abort ends it while its prepareConversion waits (the await rule)', async () => {
+		const p = await shared();
+		clean(p);
+		const h = p.hosts[0];
+		const gate = holdCall((_ctx, _proposals, _bitcoin, layoutDigest) => ({
+			digest: sha256(layoutDigest as Buffer)
+		}));
+		h.prepare = gate.call;
+		p.hosts[1].prepare = (): unknown => {
+			throw new Error('no plan');
+		};
+		p.link.hold({ from: 1, name: 'TX_ABORT' });
+		const mark = p.link.sent.length;
+		await run(p, 0);
+		expect(gate.called(), "I's prepare called").to.equal(true);
+		p.link.clearRules();
+		p.link.release();
+		await p.settle();
+		expect(abandoned(p, 0)).to.deep.equal([PREPARE]);
+		expect(abortsFrom(p, 0, mark), 'the echo').to.deep.equal([PREPARE]);
+		gate.release();
+		await p.settle();
+		expect(sentNames(p, 0, mark)).to.not.include('asset_splice:4');
+		expect(abortsFrom(p, 0, mark)).to.deep.equal([PREPARE]);
+		expect(p.recycled).to.deep.equal([[], []]);
+	});
+
+	it('sends no layout_ack from A when a disconnect ends it while its prepareConversion waits (the await rule)', async () => {
+		const p = await conversionPair(s, 'asset');
+		const h = p.hosts[1];
+		const gate = holdCall((_ctx, _proposals, _bitcoin, layoutDigest) => ({
+			digest: sha256(layoutDigest as Buffer)
+		}));
+		h.prepare = gate.call;
+		await run(p, 0);
+		expect(gate.called(), "A's prepare called").to.equal(true);
+		p.disconnect();
+		expect(abandoned(p, 1)).to.deep.equal([DISCONNECTED]);
+		const mark = p.link.sent.length;
+		gate.release();
+		await p.settle();
+		expect(sentNames(p, 1, mark)).to.deep.equal([]);
+	});
+});
+
+describe('The parent reader (#2151 step 3b, section 5)', function () {
+	this.timeout(90000);
+	const s = scratch('conversion-parent-reader-');
+	after(() => s.release());
+	const UNREADY = 'Asset conversion requires a funded ready channel';
+	const reader = (
+		store: IConversionPair['stores'][number],
+		id: string
+	): ReturnType<
+		NonNullable<ReturnType<typeof finalBranchReaders>>['assetConversionParent']
+	> => finalBranchReaders(store)!.assetConversionParent(id);
+	const opening = (
+		store: IConversionPair['stores'][number],
+		id: string
+	): [bigint, bigint] => {
+		const o = store.loadFinalOpening(id)!;
+		return [
+			BigInt(o.localContributionSats) * 1000n,
+			BigInt(o.remoteContributionSats) * 1000n
+		];
+	};
+	const PAYMENT_MSAT = 7_000_000n;
+	const preimage = Buffer.alloc(32, 0x52);
+
+	it("reads a plain parent's balances from its locked ledger state after a payment", () => {
+		const t = plainTypePair(s);
+		const { id, stores } = t;
+		const roots = t.sides.map((side) => side.root);
+		const channelId = Buffer.from(id, 'hex');
+		const exchange = (from: number): void => {
+			const sig = stores[from].signFinalUpdateCommitment(id, roots[from]);
+			const ack = stores[1 - from].acceptFinalUpdateCommitment(
+				id,
+				roots[1 - from],
+				sig
+			);
+			stores[from].acceptFinalUpdateRevocation(id, ack);
+		};
+		const stage = (from: number, type: number, wire: Buffer): void => {
+			stores[from].stageFinalHtlcUpdate(id, 'local', type, wire);
+			stores[1 - from].stageFinalHtlcUpdate(id, 'peer', type, wire);
+			exchange(from);
+			exchange(1 - from);
+		};
+		const before = stores.map((st) => opening(st, id));
+		expect(stores.map((st) => reader(st, id).localBalanceMsat)).to.deep.equal(
+			before.map((b) => b[0])
+		);
+		// Side 0 pays side 1: an add, then its fulfill.
+		stage(
+			0,
+			MessageType.UPDATE_ADD_HTLC,
+			encodeUpdateAddHtlcMessage({
+				channelId,
+				id: 0n,
+				amountMsat: PAYMENT_MSAT,
+				paymentHash: sha256(preimage),
+				cltvExpiry: PAIR_HEIGHT + 100,
+				onionRoutingPacket: Buffer.alloc(1366)
+			})
+		);
+		stage(
+			1,
+			MessageType.UPDATE_FULFILL_HTLC,
+			encodeUpdateFulfillHtlcMessage({
+				channelId,
+				id: 0n,
+				paymentPreimage: preimage
+			})
+		);
+		for (const store of stores)
+			for (const event of store.loadFinalUpdateDeliveries(id))
+				store.ackFinalUpdateDelivery(id, event.id);
+		for (const i of [0, 1] as const) {
+			const r = reader(stores[i], id);
+			const delta = i === 0 ? -PAYMENT_MSAT : PAYMENT_MSAT;
+			expect(
+				[r.localBalanceMsat, r.remoteBalanceMsat],
+				'side ' + i
+			).to.deep.equal([before[i][0] + delta, before[i][1] - delta]);
+			const view = parentBalancesMsat(stores[i], id);
+			expect([r.localBalanceMsat, r.remoteBalanceMsat]).to.deep.equal([
+				view.local,
+				view.remote
+			]);
+			expect(r.root).to.equal(undefined);
+			expect(r.priorDigest).to.equal(undefined);
+		}
+	});
+
+	it("reads an asset parent's balances from the committed round's member on the live funding, and the round's digest", async () => {
+		const p = await conversionPair(s, 'asset');
+		const before = p.stores.map((st) => opening(st, p.id));
+		for (const i of [0, 1] as const) {
+			const r = reader(p.stores[i], p.id);
+			expect(
+				[r.localBalanceMsat, r.remoteBalanceMsat],
+				'at N = 0'
+			).to.deep.equal(before[i]);
+			expect(r.priorDigest, 'at N = 0').to.equal(undefined);
+		}
+		await p.managers[0].startAssetSpliceUpdate(p.channelId, [
+			{
+				kind: 'add',
+				htlc: {
+					id: 0n,
+					offeredBy: 'local',
+					amountMsat: PAYMENT_MSAT,
+					paymentHash: sha256(preimage),
+					cltvExpiry: PAIR_HEIGHT + 100,
+					allocations: []
+				}
+			}
+		]);
+		await p.settle();
+		await p.managers[1].startAssetSpliceUpdate(p.channelId, [
+			{ kind: 'fulfill', offeredBy: 'peer', id: 0n, preimage }
+		]);
+		await p.settle();
+		expect(p.errors).to.deep.equal([[], []]);
+		for (const i of [0, 1] as const) {
+			const store = p.stores[i];
+			const head = store.assetSpliceUpdateHead(p.id) as unknown as {
+				committed?: { digest: string; height: string | number | bigint };
+			};
+			expect(String(head.committed?.height), 'N').to.equal('2');
+			const r = reader(store, p.id);
+			const delta = i === 0 ? -PAYMENT_MSAT : PAYMENT_MSAT;
+			expect(
+				[r.localBalanceMsat, r.remoteBalanceMsat],
+				'side ' + i
+			).to.deep.equal([before[i][0] + delta, before[i][1] - delta]);
+			const member = parentBalancesMsat(store, p.id);
+			expect([r.localBalanceMsat, r.remoteBalanceMsat]).to.deep.equal([
+				member.local,
+				member.remote
+			]);
+			expect(r.priorDigest).to.equal(head.committed!.digest);
+			expect(r.root).to.equal(
+				store.loadFinalOpeningSession(p.id)!.assetEvidence!.fundingRoot
+			);
+		}
+		// No member of the committed round is the live funding under the root the
+		// reader takes (an adopted receipt naming another root): it fails closed.
+		const store = p.stores[0] as unknown as {
+			loadAdoptedAssetSpliceReceipt(id: string): unknown;
+		};
+		const original = store.loadAdoptedAssetSpliceReceipt;
+		store.loadAdoptedAssetSpliceReceipt = (): unknown => ({
+			candidate: { fundingRoot: 'ff'.repeat(32) }
+		});
+		try {
+			expect(() => reader(p.stores[0], p.id)).to.throw(UNREADY);
+		} finally {
+			store.loadAdoptedAssetSpliceReceipt = original;
+		}
+		expect(reader(p.stores[0], p.id).localBalanceMsat).to.equal(
+			before[0][0] - PAYMENT_MSAT
+		);
 	});
 });

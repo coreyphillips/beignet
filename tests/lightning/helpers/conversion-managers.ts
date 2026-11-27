@@ -581,6 +581,11 @@ export interface IPairOptions {
 	without463?: [boolean, boolean];
 	/** config.quiescenceTimeoutMs for both managers. */
 	quiescenceTimeoutMs?: number;
+	/**
+	 * More fields of side i's manager config, spread last, so a test can
+	 * give it a callback that is a method of the config.
+	 */
+	config?: [Record<string, unknown>?, Record<string, unknown>?];
 	/** Stop before funding depth (an unconfirmed funding). */
 	skipDepth?: boolean;
 	/** false: never call handlePeerReconnected (the link stays silent). */
@@ -759,7 +764,8 @@ export async function conversionPair(
 			}),
 			...(options.quiescenceTimeoutMs !== undefined && {
 				quiescenceTimeoutMs: options.quiescenceTimeoutMs
-			})
+			}),
+			...options.config?.[i]
 		} as unknown as IChannelManagerConfig);
 		const peerManager = {
 			sendToPeer: (peer: string, type: number, payload: Buffer): void => {

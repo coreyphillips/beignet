@@ -12,6 +12,7 @@
  * pinned on the wire by asset-conversion-layout-flow.test.ts.
  */
 import { expect } from 'chai';
+import { Transaction } from 'bitcoinjs-lib';
 import { auxiliaryCarrierError } from '../../src/lightning/channel/auxiliary-funding';
 import { funderCommitmentCostSats } from '../../src/lightning/channel/commitment-builder';
 import {
@@ -32,6 +33,7 @@ import {
 import {
 	conversionLayout,
 	type IConversionLayout,
+	type IConversionLayoutBase,
 	type IConversionLayoutExpectation
 } from './helpers/conversion-modules';
 import {
@@ -1487,5 +1489,352 @@ describe('The asset conversion layout digest (#2151 step 3b, section 4)', () => 
 		const { layout } = buildSample(specOf('to-plain'));
 		expect(layout.targetType.toString('hex')).to.equal(PLAIN_TARGET_TYPE_HEX);
 		expect(digestOf(layout).toString('hex')).to.equal(PINS['to-plain']);
+	});
+});
+
+describe('Asset conversion layout guards (#2151 step 3b, section 4 checks 1, 2, 4 and 10)', function () {
+	describe('check 1, the fields the engine fills from the terms', () => {
+		runCases('check 1', [
+			{
+				what: "a channel id other than the terms', which both splice messages carry",
+				in: BOTH,
+				layout: (l): void => {
+					const other = flip(l.channelId);
+					l.channelId = other;
+					reinit(l, (m) => (m.channelId = other));
+					reack(l, (m) => (m.channelId = other));
+				},
+				text: T.layout
+			},
+			{
+				what: 'a first commitment that leaves out the last units row of the terms',
+				in: TO_ASSET,
+				layout: (l): unknown =>
+					(l.firstCommitment = {
+						...l.firstCommitment,
+						units: l.firstCommitment.units.slice(0, -1)
+					}),
+				text: T.layout
+			},
+			{
+				what: 'a first commitment with no units row, to an asset',
+				in: TO_ASSET,
+				layout: (l): unknown =>
+					(l.firstCommitment = { ...l.firstCommitment, units: [] }),
+				text: T.layout
+			}
+		]);
+	});
+
+	describe('check 2, the parent output', () => {
+		runCases('check 2', [
+			{
+				what: "a parent transaction with no output at the terms' index (its id kept)",
+				in: BOTH,
+				layout: (l): void => {
+					const id = l.parent.getId();
+					const hash = l.parent.getHash();
+					const parent = l.parent.clone();
+					parent.outs.splice(l.parentIndex);
+					parent.getId = (): string => id;
+					parent.getHash = (): Buffer => Buffer.from(hash);
+					l.parent = parent;
+				},
+				text: T.keys
+			},
+			{
+				what: 'a plain parent that carries a root, which its script never uses',
+				in: TO_ASSET,
+				layout: (l): unknown => (l.parentRoot = SAMPLE_ROOT),
+				text: undefined
+			}
+		]);
+	});
+
+	describe("check 4, the asset splice's input rules", () => {
+		/** A coin of `value` sats whose previous transaction is `size` bytes or more. */
+		const bigCoin = (value: bigint, tag: string, size: number): Transaction => {
+			const coin = sampleCoin(value, tag);
+			coin.addOutput(Buffer.alloc(size, 0x6a), 0);
+			return coin;
+		};
+		/** The coin's bytes with its input count as a three-byte varint: the same txid. */
+		const nonMinimal = (coin: Transaction): Buffer => {
+			const b = coin.toBuffer();
+			return Buffer.concat([
+				b.subarray(0, 4),
+				Buffer.from([0xfd, 1, 0]),
+				b.subarray(5)
+			]);
+		};
+		runCases('check 4', [
+			{
+				what: 'a 31-byte previous txid',
+				in: BOTH,
+				layout: (l, s): void => {
+					const i = inputOf(l, s, 'shared');
+					i.prevTxid = i.prevTxid.subarray(0, 31);
+				},
+				text: T.input
+			},
+			{
+				what: 'an external input index of 2^32',
+				in: TO_ASSET,
+				layout: (l, s): unknown =>
+					(inputOf(l, s, 'coin').prevOutputIndex = 0x100000000),
+				text: T.input
+			},
+			{
+				what: 'an external input index of -1',
+				in: TO_ASSET,
+				layout: (l, s): unknown => (inputOf(l, s, 'coin').prevOutputIndex = -1),
+				text: T.input
+			},
+			{
+				what: 'a fractional external input index',
+				in: TO_ASSET,
+				layout: (l, s): unknown =>
+					(inputOf(l, s, 'coin').prevOutputIndex = 0.5),
+				text: T.input
+			},
+			{
+				what: 'a fractional sequence',
+				in: BOTH,
+				layout: (l, s): unknown => (inputOf(l, s, 'shared').sequence = 1.5),
+				text: T.input
+			},
+			{
+				what: 'a negative sequence',
+				in: BOTH,
+				layout: (l, s): unknown => (inputOf(l, s, 'shared').sequence = -1),
+				text: T.input
+			},
+			{
+				what: 'a prevTxVout other than the input index',
+				in: BOTH,
+				layout: (l, s): void => {
+					const i = inputOf(l, s, 'shared');
+					i.prevTxVout = i.prevOutputIndex + 1;
+				},
+				text: T.input
+			},
+			{
+				what: 'an external input whose isShared is neither a boolean nor absent',
+				in: TO_ASSET,
+				layout: (l, s): unknown =>
+					((inputOf(l, s, 'coin') as { isShared?: unknown }).isShared = 1),
+				text: T.external
+			},
+			{
+				what: 'an external previous transaction over 65,535 bytes',
+				in: TO_ASSET,
+				layout: (l, s): void => {
+					const coin = bigCoin(20_000n, 'coin', 65_536);
+					const i = inputOf(l, s, 'coin');
+					i.prevTx = coin.toBuffer();
+					i.prevTxid = coin.getHash();
+				},
+				text: T.external
+			},
+			{
+				what: "one owner's previous transactions over 1 MiB in all",
+				in: TO_ASSET,
+				layout: (l, s): void => {
+					const owner = s.serialOf('coin') & 1n;
+					const extra = Array.from({ length: 17 }, (_, n) => {
+						const coin = bigCoin(1_000n, 'heavy ' + n, 65_000);
+						return {
+							serialId: 100n + 2n * BigInt(n) + owner,
+							prevTxid: coin.getHash(),
+							prevOutputIndex: 0,
+							sequence: 0xfffffffd,
+							prevTx: coin.toBuffer(),
+							isShared: false
+						};
+					});
+					l.inputs = [...l.inputs, ...extra];
+				},
+				text: T.external
+			},
+			{
+				what: 'an external previous transaction in a non-canonical encoding of its txid',
+				in: TO_ASSET,
+				layout: (l, s): void => {
+					const i = inputOf(l, s, 'coin');
+					const coin = Transaction.fromBuffer(i.prevTx!);
+					i.prevTx = nonMinimal(coin);
+					expect(Transaction.fromBuffer(i.prevTx).getHash()).to.deep.equal(
+						i.prevTxid
+					);
+				},
+				text: T.mismatch
+			}
+		]);
+	});
+
+	describe('check 10, the movements', () => {
+		runCases('check 10', [
+			{
+				what: "a movement whose from is a String object, not the union's string",
+				in: TO_PLAIN,
+				layout: (l): void => {
+					const m = l.movements[0] as { from: unknown };
+					m.from = Object(m.from) as unknown;
+				},
+				text: T.units
+			}
+		]);
+	});
+});
+
+describe('From the description to the layout (#2151 step 3b, section 3 S15 and v2.4 item 2)', () => {
+	const DESCRIBE = 'Asset conversion host could not describe the layout';
+	type Record_ = Record<string, unknown>;
+	/** The sample's engine fields, its expectation and the description it maps from. */
+	function parts(direction: Direction): {
+		sample: ISample;
+		base: IConversionLayoutBase;
+		x: IConversionLayoutExpectation;
+		description: Record_ & {
+			inputs: Record_[];
+			outputs: Record_[];
+		};
+	} {
+		const sample = buildSample(specOf(direction));
+		const {
+			commitmentRecordLimits,
+			parentUnits,
+			movements,
+			inputs,
+			outputs,
+			...base
+		} = sample.layout;
+		const x = sample.expectations[0];
+		const description = {
+			inputs: inputs.map(
+				(i): Record_ => ({
+					serialId: i.serialId,
+					txid: Buffer.from(i.prevTxid),
+					vout: i.prevOutputIndex,
+					sequence: i.sequence,
+					isShared: i.isShared === true,
+					...(i.prevTx !== undefined && { prevTx: Buffer.from(i.prevTx) })
+				})
+			),
+			outputs: outputs.map(
+				(o): Record_ => ({
+					serialId: o.serialId,
+					kind: o.role,
+					valueSats: o.amountSats,
+					descriptorHash: Buffer.from(o.descriptorHash)
+				})
+			),
+			movements: movements.map((m) => ({ ...m })),
+			parentUnits: parentUnits.map((u) => ({ ...u })),
+			feeBudgets: [...sample.layout.feeBudgets],
+			relativeSatoshis: [...x.relativeSatoshis],
+			...(commitmentRecordLimits !== null && {
+				commitmentRecordLimits: commitmentRecordLimits.map((r) =>
+					r.map((v) => ({ ...v }))
+				)
+			})
+		};
+		return { sample, base, x, description };
+	}
+	const mapped = (p: ReturnType<typeof parts>): IConversionLayout =>
+		conversionLayout().describedConversionLayout(
+			p.base,
+			p.x.relativeSatoshis,
+			p.description
+		);
+	/** The text describedConversionLayout throws, or undefined. */
+	const thrown = (p: ReturnType<typeof parts>): string | undefined => {
+		try {
+			mapped(p);
+			return undefined;
+		} catch (error) {
+			return error instanceof Error ? error.message : String(error);
+		}
+	};
+	const digestOf = (l: IConversionLayout): Buffer =>
+		conversionLayout().assetConversionLayoutDigest(l);
+
+	for (const direction of BOTH)
+		it(`maps the sample description to the sample layout (${direction})`, () => {
+			const p = parts(direction);
+			const layout = mapped(p);
+			expect(verdict(layout, p.x)).to.equal(undefined);
+			expect(digestOf(layout)).to.deep.equal(digestOf(p.sample.layout));
+		});
+
+	it('reads an output descriptorHash once: a 2-byte second answer cannot reach the layout', () => {
+		const p = parts('to-plain');
+		const o = p.description.outputs[p.description.outputs.length - 1];
+		const good = o.descriptorHash as Buffer;
+		let reads = 0;
+		Object.defineProperty(o, 'descriptorHash', {
+			enumerable: true,
+			get: (): Buffer => (reads++ === 0 ? good : good.subarray(0, 2))
+		});
+		const layout = mapped(p);
+		expect(layout.outputs.map((x) => x.descriptorHash.length)).to.deep.equal(
+			layout.outputs.map(() => 32)
+		);
+		expect(reads, 'reads of the field').to.equal(1);
+		expect(verdict(layout, p.x)).to.equal(undefined);
+		expect(digestOf(layout)).to.deep.equal(digestOf(p.sample.layout));
+	});
+
+	it('reads the outputs list once: a second answer with 2-byte hashes cannot reach the layout', () => {
+		const p = parts('to-plain');
+		const good = p.description.outputs;
+		const bad = good.map((o) => ({
+			...o,
+			descriptorHash: (o.descriptorHash as Buffer).subarray(0, 2)
+		}));
+		let reads = 0;
+		Object.defineProperty(p.description, 'outputs', {
+			enumerable: true,
+			get: (): Record_[] => (reads++ === 0 ? good : bad)
+		});
+		const layout = mapped(p);
+		expect(layout.outputs.map((x) => x.descriptorHash.length)).to.deep.equal(
+			good.map(() => 32)
+		);
+		expect(reads, 'reads of the field').to.equal(1);
+		expect(verdict(layout, p.x)).to.equal(undefined);
+	});
+
+	for (const direction of BOTH) {
+		it(`gives the describe text for a sparse outputs array, not a TypeError (${direction})`, () => {
+			const p = parts(direction);
+			const holed = [...p.description.outputs];
+			holed.length += 1;
+			p.description.outputs = holed;
+			expect(thrown(p)).to.equal(DESCRIBE);
+		});
+
+		it(`gives the describe text for an inputs array with a hole in the middle (${direction})`, () => {
+			const p = parts(direction);
+			const [first, ...rest] = p.description.inputs;
+			const holed: Record_[] = [first];
+			holed.length = 2;
+			holed.push(...rest);
+			p.description.inputs = holed;
+			expect(thrown(p)).to.equal(DESCRIBE);
+		});
+
+		it(`gives the describe text for an input sequence that is not a safe integer (${direction})`, () => {
+			const p = parts(direction);
+			p.description.inputs[0].sequence = 1.5;
+			expect(thrown(p)).to.equal(DESCRIBE);
+		});
+	}
+
+	it('gives the describe text for a previous transaction that is hex, not a Buffer', () => {
+		const p = parts('to-asset');
+		const coin = p.description.inputs.find((i) => i.prevTx !== undefined)!;
+		coin.prevTx = (coin.prevTx as Buffer).toString('hex');
+		expect(thrown(p)).to.equal(DESCRIBE);
 	});
 });

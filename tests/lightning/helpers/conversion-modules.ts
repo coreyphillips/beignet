@@ -224,7 +224,23 @@ interface LayoutModule {
 		expectation: IConversionLayoutExpectation
 	): unknown;
 	assetConversionLayoutDigest(layout: IConversionLayout): Buffer;
+	/**
+	 * The layout of a host's description over the engine's own fields
+	 * (section 4, "From the description to the layout"): it throws the
+	 * describe text for a description of the wrong shape (section 3, S15).
+	 */
+	describedConversionLayout(
+		base: IConversionLayoutBase,
+		relativeSatoshis: ConversionPair<bigint>,
+		description: unknown
+	): IConversionLayout;
 }
+
+/** The layout fields the engine fills itself, before the description's. */
+export type IConversionLayoutBase = Omit<
+	IConversionLayout,
+	'commitmentRecordLimits' | 'parentUnits' | 'movements' | 'inputs' | 'outputs'
+>;
 
 /** `src/lightning/channel/asset-conversion-layout.ts` (section 4). */
 export const conversionLayout = (): LayoutModule =>

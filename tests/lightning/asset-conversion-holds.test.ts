@@ -301,6 +301,110 @@ describe('Crossings (#2151 step 3a, test 10)', function () {
 		]);
 	});
 
+	/** The texts of the tx_abort messages side `from` put on the link since `mark`. */
+	const abortsFrom = (p: IConversionPair, from: 0 | 1, mark = 0): string[] =>
+		p.link.sent
+			.slice(mark)
+			.filter((m) => m.from === from && m.name === 'TX_ABORT')
+			.map(abortText);
+	const WITHDRAWN = 'Asset conversion withdrawn';
+	const CLOSED = 'Asset conversion ended by a close';
+	const TIMED_OUT = 'Asset conversion timed out';
+	const closeA = (p: IConversionPair): void => {
+		p.managers[1].initiateShutdown(
+			p.channelId,
+			Buffer.from('0014' + '22'.repeat(20), 'hex')
+		);
+	};
+
+	it('answers once from draining when stfu(1) and tx_abort reach it in one turn, and I ends on that answer (v2.4 item 1)', async () => {
+		const p = await conversionPair(s, 'plain', { quiescenceTimeoutMs: 5_000 });
+		clock = sinon.useFakeTimers({
+			now: Date.now(),
+			toFake: ['Date', 'setTimeout', 'clearTimeout']
+		});
+		p.link.hold({ from: 0, name: 'STFU' });
+		p.link.hold({ from: 0, name: 'TX_ABORT' });
+		await start(p);
+		// A declines after its accept (a local close), goes draining.
+		closeA(p);
+		await p.settle();
+		// I's deadline fails it in quiescing, right after its stfu(1).
+		await tick(p, clock, 5_000);
+		expect(p.link.held.map((m) => m.from + ':' + m.name)).to.deep.equal([
+			'0:STFU',
+			'0:TX_ABORT'
+		]);
+		const mark = p.link.sent.length;
+		p.link.clearRules();
+		p.link.burst(
+			(m) => m.from === 0 && (m.name === 'STFU' || m.name === 'TX_ABORT')
+		);
+		p.link.release();
+		await p.settle();
+		expect(abortsFrom(p, 1, mark), "A's answer").to.deep.equal([WITHDRAWN]);
+		expect(abandoned(p, 0), 'I ends on it as its echo').to.deep.equal([
+			TIMED_OUT
+		]);
+		expect(abandoned(p, 1)).to.deep.equal([CLOSED]);
+		// Past both phase bounds: nobody waited for an echo.
+		await tick(p, clock, 20_000);
+		expect(p.recycled).to.deep.equal([[], []]);
+		expect(abortsFrom(p, 0)).to.deep.equal([TIMED_OUT]);
+		expect(abortsFrom(p, 1)).to.deep.equal([WITHDRAWN]);
+		expect(abandoned(p, 0)).to.deep.equal([TIMED_OUT]);
+		expect(abandoned(p, 1)).to.deep.equal([CLOSED]);
+		expect([
+			held(p.managers[0], p.id),
+			held(p.managers[1], p.id)
+		]).to.deep.equal([false, false]);
+	});
+
+	it('answers once from draining a tx_abort with no stfu(1) before it (v2.4 item 1)', async () => {
+		const p = await conversionPair(s, 'plain');
+		p.link.hold({ from: 0, name: 'STFU' });
+		await start(p);
+		closeA(p);
+		await p.settle();
+		const mark = p.link.sent.length;
+		p.link.inject(0, MessageType.TX_ABORT, txAbort(p.channelId, CLOSED));
+		const injected = p.link.sent.length;
+		await p.settle();
+		expect(abortsFrom(p, 1, mark), "A's answer").to.deep.equal([WITHDRAWN]);
+		expect(abandoned(p, 1)).to.deep.equal([CLOSED]);
+		// I, still quiescing, takes the answer as a peer tx_abort: it echoes and ends.
+		expect(abortsFrom(p, 0, injected)).to.deep.equal([WITHDRAWN]);
+		expect(abandoned(p, 0)).to.deep.equal([WITHDRAWN]);
+		p.link.held.splice(0);
+		expect(abortsFrom(p, 1, mark), 'A answers once').to.deep.equal([WITHDRAWN]);
+		expect(p.recycled).to.deep.equal([[], []]);
+	});
+
+	it('sends nothing more from aborting when the tx_abort messages of both sides cross (v2.4 item 1)', async () => {
+		const p = await conversionPair(s, 'plain');
+		const DESCRIBE = 'Asset conversion host could not describe the layout';
+		const PREPARE = 'Asset conversion host could not prepare the layout';
+		p.hosts[0].describe = (): unknown => {
+			throw new Error('no description');
+		};
+		p.hosts[1].prepare = (): unknown => {
+			throw new Error('no plan');
+		};
+		p.link.hold('TX_ABORT');
+		await start(p);
+		expect(p.link.held.map((m) => m.from + ':' + abortText(m))).to.have.members(
+			['0:' + DESCRIBE, '1:' + PREPARE]
+		);
+		p.link.clearRules();
+		p.link.release();
+		await p.settle();
+		expect(abortsFrom(p, 0)).to.deep.equal([DESCRIBE]);
+		expect(abortsFrom(p, 1)).to.deep.equal([PREPARE]);
+		expect(abandoned(p, 0)).to.deep.equal([DESCRIBE]);
+		expect(abandoned(p, 1)).to.deep.equal([PREPARE]);
+		expect(p.recycled).to.deep.equal([[], []]);
+	});
+
 	it('passes a stale asset splice echo to the asset splice transport while the conversion owns no wire', async () => {
 		const p = await conversionPair(s, 'asset');
 		p.link.hold({ from: 1, name: 'conversion_reply' });
