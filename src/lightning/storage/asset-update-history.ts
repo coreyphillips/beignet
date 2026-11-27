@@ -103,8 +103,59 @@ function seededState(
 		localCommitments: seed.members.map((m) => m.localCommitment)
 	};
 }
-export function assetUpdateHistory(store: SqliteStorage, id: string) {
-	const record = currentAssetRecord(store, id);
+export function assetUpdateHistory(
+	store: SqliteStorage,
+	id: string
+): ReturnType<typeof historyOf> {
+	return historyOf(store, id, currentAssetRecord(store, id));
+}
+
+/**
+ * The asset history of one era (#2151 step 2b), in the shape of
+ * assetUpdateHistory: for era 0, the opening's events up to the first
+ * record's N; for the era of an asset record, its seed at N and the events
+ * above N up to the next record's N. The current asset era is
+ * assetUpdateHistory itself. A plain era has no asset history.
+ */
+export function assetEraHistory(
+	store: SqliteStorage,
+	id: string,
+	era: number
+): ReturnType<typeof assetUpdateHistory> {
+	const records =
+		typeof store.loadFinalChannelTypeRecords === 'function'
+			? store.loadFinalChannelTypeRecords(id)
+			: [];
+	if (!Number.isSafeInteger(era) || era < 0 || era > records.length)
+		throw new Error('Unknown channel type era');
+	const record = era ? records[era - 1] : undefined;
+	const next = records[era];
+	const asset = record
+		? record.type === 'asset'
+		: !!store.loadAssetOpeningEvidence(id);
+	if (!asset) return emptyHistory();
+	// The last era is the current one.
+	if (!next) return assetUpdateHistory(store, id);
+	return historyOf(store, id, record, BigInt(next.stateNumber));
+}
+
+function emptyHistory(): ReturnType<typeof assetUpdateHistory> {
+	return {
+		states: new Map<bigint, IAssetUpdateSecured>(),
+		stages: new Map<string, string>(),
+		digests: new Map<bigint, string>(),
+		latest: undefined,
+		seedHeight: undefined,
+		seed: undefined
+	};
+}
+
+function historyOf(
+	store: SqliteStorage,
+	id: string,
+	record: IFinalChannelTypeRecord | undefined,
+	upTo?: bigint
+) {
 	const seedHeight = record ? BigInt(record.stateNumber) : undefined;
 	const all = store.readAssetSpliceJournal<AssetUpdateEvent>(id).records.filter(
 		(e) =>
@@ -112,7 +163,11 @@ export function assetUpdateHistory(store: SqliteStorage, id: string) {
 			// The seed shadows every height at or below its N.
 			(seedHeight === undefined ||
 				!/^[0-9]+$/.test(e.height) ||
-				BigInt(e.height) > seedHeight)
+				BigInt(e.height) > seedHeight) &&
+			// A later record ends the era at its N (#2151 step 2b).
+			(upTo === undefined ||
+				!/^[0-9]+$/.test(e.height) ||
+				BigInt(e.height) <= upTo)
 	);
 	const states = new Map<bigint, IAssetUpdateSecured>(),
 		stages = new Map<string, string>(),

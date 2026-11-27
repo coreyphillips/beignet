@@ -14,6 +14,7 @@ import {
 } from './asset-splice-output-view';
 import { generateFromSeed, MAX_INDEX } from '../keys/shachain';
 import type { IFinalOpeningRuntime } from '../channel/final-opening-runtime';
+import type { IFinalChannelFunding } from '../storage/final-branch-readers';
 import {
 	assetPayoutRevocationTweak,
 	type IAssetPayoutScope
@@ -41,7 +42,8 @@ export function assetOpeningOutputClaims(
 	destination: Buffer,
 	feeRate: number,
 	provider?: IAuxiliaryDualFunding,
-	trimmed?: (hash: Buffer, htlcId: bigint, preimage?: Buffer) => void
+	trimmed?: (hash: Buffer, htlcId: bigint, preimage?: Buffer) => void,
+	branch?: IFinalChannelFunding
 ): IFinalOutputClaim[] {
 	const { storage, root } = runtime,
 		id = channelId.toString('hex');
@@ -52,16 +54,20 @@ export function assetOpeningOutputClaims(
 	)
 		return [];
 	const opening = storage.loadFinalDaemonOpening(id);
+	// A branch (#2151 step 2b) carries its own asset base, also on a plain
+	// opening. Collateral stays keyed by the current asset markers: an old
+	// asset era's payout reporting after a record to plain is Step 5's.
 	if (
-		recordedChannelType(storage, id) ||
-		!opening?.session.assetEvidence ||
+		(!branch &&
+			(recordedChannelType(storage, id) || !opening?.session.assetEvidence)) ||
+		!opening ||
 		!storage.loadFinalLocalTxSignatures(id)
 	)
 		return [];
 	const { candidate, session } = opening;
 	const parent = detached(observed);
 	const keys = deriveChannelKeys(root, 1, session.channelKeyIndex);
-	const [match] = matchedAssetPayoutViews(storage, id, parent);
+	const [match] = matchedAssetPayoutViews(storage, id, parent, branch);
 	if (!match) return [];
 	const {
 		revoked,
@@ -287,13 +293,15 @@ export function assetOpeningOutputClaims(
 					tx = await provider.recoverOutput({
 						...(virtualPayout && {
 							walletGeneration: 5 as const,
-							fundingLineage: retainedAssetFundingLineage(
-								storage,
-								id,
-								candidate,
-								virtualPayout.fundingTxid,
-								virtualPayout.fundingOutputIndex
-							),
+							fundingLineage:
+								match.lineage?.map((e) => ({ ...e })) ??
+								retainedAssetFundingLineage(
+									storage,
+									id,
+									candidate,
+									virtualPayout.fundingTxid,
+									virtualPayout.fundingOutputIndex
+								),
 							virtualPayout: {
 								...virtualPayout,
 								revocationPubkey: Buffer.from(virtualPayout.revocationPubkey)

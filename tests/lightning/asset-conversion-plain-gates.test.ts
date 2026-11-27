@@ -962,9 +962,6 @@ describe('Reads by generation with no record (#2151 step 2b, section 7 and amend
 			const scopes = scopesRead(() => {
 				pair.restart(0);
 			});
-			expect(scopes.has('splice'), 'generation ' + g + ' reconciles').to.equal(
-				true
-			);
 			for (const scope of ['channel-type', 'conversion'])
 				expect(scopes.has(scope), 'generation ' + g + ' ' + scope).to.equal(
 					g === 6

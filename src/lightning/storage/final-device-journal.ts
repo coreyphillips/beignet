@@ -9,9 +9,19 @@ const scopes = [
 	'simple-close',
 	'output-claim',
 	'htlc-timeout',
-	'channel-type'
+	'channel-type',
+	'conversion'
 ] as const;
 type Scope = (typeof scopes)[number] | 'asset-recovery-frame';
+/** The scopes a generation 6 wallet adds (#2151): reconciled only there. */
+const conversionScopes: readonly Scope[] = ['channel-type', 'conversion'];
+
+/** The scopes a wallet of this kind reconciles: the conversion scopes only in generation 6. */
+export function finalJournalScopes(conversion: boolean): readonly Scope[] {
+	return conversion
+		? scopes
+		: scopes.filter((s) => !conversionScopes.includes(s));
+}
 interface JournalRow {
 	sequence: number;
 	record: string;
@@ -110,10 +120,14 @@ export class FinalDeviceJournal {
 	}
 
 	/** Copy every device-ahead byte before SQLite takes a portable wallet snapshot. */
-	reconcile(channelId: string, includeAssetFrames = false): void {
+	reconcile(
+		channelId: string,
+		includeAssetFrames = false,
+		reconciled: readonly Scope[] = scopes
+	): void {
 		this.db
 			.transaction(() => {
-				for (const scope of scopes) this.readPrefix(scope, channelId);
+				for (const scope of reconciled) this.readPrefix(scope, channelId);
 				if (includeAssetFrames)
 					this.readPrefix('asset-recovery-frame', channelId);
 			})

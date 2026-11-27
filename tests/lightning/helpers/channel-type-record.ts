@@ -1094,8 +1094,9 @@ export interface IPlainExitBranch {
 	localRecovery: IPlainHolderRecovery;
 	remoteRecovery: IPlainHolderRecovery;
 }
+/** A conversion's asset branch carries the feerate its commitments were signed at. */
 export type IFinalExitBranch =
-	| ({ type: 'asset' } & IAssetSpliceExitBranch)
+	| ({ type: 'asset'; feeratePerKw: number } & IAssetSpliceExitBranch)
 	| IPlainExitBranch;
 /** The `conversion-exits` event a writer takes. */
 export interface IConversionExits {
@@ -1246,7 +1247,7 @@ export function assetParentBranch(
 ): IFinalExitBranch {
 	const state = assetUpdateHistory(store, id).states.get(BigInt(n));
 	if (!state) throw new Error('fixture: no secured asset state at ' + n);
-	return { type: 'asset', ...state.members[0] };
+	return { type: 'asset', feeratePerKw: state.feerate, ...state.members[0] };
 }
 
 /** The plain parent branch: the current plain ledger's commitments at its height, on the opening's funding. */
@@ -1295,8 +1296,10 @@ export function candidateBranch(
 	i: number
 ): IFinalExitBranch {
 	const seed = c.inputs[i].seed;
-	if (c.type === 'asset')
-		return { type: 'asset', ...(seed as IFinalAssetSeedInput).members[0] };
+	if (c.type === 'asset') {
+		const asset = seed as IFinalAssetSeedInput;
+		return { type: 'asset', feeratePerKw: asset.feerate, ...asset.members[0] };
+	}
 	const plain = seed as IFinalPlainSeedInput;
 	const recovery = (holder: number): IPlainHolderRecovery => ({
 		point: c.point(holder, c.stateNumber).toString('hex'),

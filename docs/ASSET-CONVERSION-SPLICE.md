@@ -217,7 +217,7 @@ After a restart in that window, the parent's watch is armed again. Today `AssetS
   - the plain ledger starts at height 0 from the opening and enforces the BOLT 3 shachain buckets ("Missing preceding revocation secret", `src/lightning/storage/final-channel-updates.ts`);
   - the asset ledger expects the prior state's point (`src/lightning/channel/asset-splice-update-batch.ts`).
 - **The rule.** The new type's ledger is seeded at the conversion's state number with the peer's current and next points and every secret the old ledger holds.
-- **One store.** Each peer secret received after adoption is recorded in one store that both claim builders read. A plain revocation then also punishes an asset commitment of the parent published after a reorganisation, and the reverse.
+- **One store.** Each peer secret received after adoption is recorded in one store that both claim builders read. A plain revocation then also punishes an asset commitment of the parent published after a reorganisation, and the reverse. The store is one reader over each type's ledger and the records' shachains, looked up per height and read by both claim builders, rather than a second record of each secret.
 - **Today.** Plain claims read secrets from `loadFinalResolutionStates`, and asset claims look for them only at the asset journal's `peer-revoke` stage (`src/lightning/chain/asset-splice-output-view.ts`).
 
 **Claiming by branch**
@@ -226,7 +226,7 @@ After a restart in that window, the parent's watch is armed again. Today `AssetS
   - the parent's commitments, current or revoked, by the old type's claims;
   - the candidate's first commitment, which is never revoked before lock, by the new type's.
 - **Asset-only reporting.** Today the asset builder marks every balance output as an asset balance (`assetOpeningOutputClaims`), and that drives the payout and collateral reporting. A plain branch must not trigger either.
-- **Per-branch views.** `IAssetSpliceExitBranch` (`src/lightning/storage/asset-splice-exit-proofs.ts`) requires a `fundingRoot`, `fundingProofs` and asset proofs on both branches, and `spliceRecoveryView` (`src/lightning/storage/asset-splice-recovery.ts`) uses one opening type and root. In a generation 6 wallet, each branch records its type, a plain branch has no root or proofs, and the recovery view is built per branch.
+- **Per-branch views.** `IAssetSpliceExitBranch` (`src/lightning/storage/asset-splice-exit-proofs.ts`) requires a `fundingRoot`, `fundingProofs` and asset proofs on both branches, and `spliceRecoveryView` (`src/lightning/storage/asset-splice-recovery.ts`) uses one opening type and root. In a generation 6 wallet, each branch records its type, a plain branch has no root or proofs, and the recovery view is built per branch. Conversion exits, with recovery views and claims per branch, are in place, and Step 4 writes them.
 
 ## Restart and backups
 

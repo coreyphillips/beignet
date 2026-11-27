@@ -515,7 +515,14 @@ function expectSeededEra(
 		lineageOf(t.c.tx, outpoint(t.opening.tx, t.opening.index))
 	);
 	expect(ctx.fundingProofs.toString('hex')).to.equal(member.fundingProofs);
-	expect(ctx.exitProofs.toString('hex')).to.equal(member.remoteProofs);
+	// The state at N carries the seed member's proofs; a later round its own member's.
+	const round =
+		update.stateNumber === String(t.n)
+			? member
+			: assetUpdateHistory(t.devices[0].store, t.id).states.get(
+					BigInt(update.stateNumber)
+			  )!.members[0];
+	expect(ctx.exitProofs.toString('hex')).to.equal(round.remoteProofs);
 	expect(ctx.splice).to.equal(undefined);
 	expect(ctx.update).to.deep.equal({
 		...update,
@@ -795,6 +802,18 @@ for (const direction of ['to plain', 'to asset'] as const)
 						(e): IConversionExits => {
 							const b = assetBranch(e);
 							const changed = { ...b, fundingRoot: '00' };
+							return b === e.parent
+								? { ...e, parent: changed }
+								: { ...e, candidate: changed };
+						}
+					],
+					[
+						'an asset branch whose feerate does not reproduce its signed commitment',
+						(e): IConversionExits => {
+							const b = assetBranch(e) as IFinalExitBranch & {
+								feeratePerKw: number;
+							};
+							const changed = { ...b, feeratePerKw: b.feeratePerKw + 1000 };
 							return b === e.parent
 								? { ...e, parent: changed }
 								: { ...e, candidate: changed };

@@ -6,6 +6,7 @@
  * output spends) and translates them into ChannelManager calls.
  */
 
+import { collectFinalPeerSecretConflicts } from '../storage/final-peer-secrets';
 import { EventEmitter } from 'events';
 import type { IAssetSpliceInclusionRecovery } from './asset-splice-inclusion';
 import type {
@@ -887,6 +888,8 @@ export class ChainWatcher extends EventEmitter {
 	private acceptingWork = true;
 	private destinationScript: Buffer;
 	private readonly finalOutputClaims?: IChainWatcherConfig['finalOutputClaims'];
+	/** Channel and height of each peer secret conflict already reported. */
+	private reportedPeerSecretConflicts?: Set<string>;
 	private readonly sponsorFinalClaim?: IChainWatcherConfig['sponsorFinalClaim'];
 	private readonly finalPreimage?: IChainWatcherConfig['finalPreimage'];
 	private readonly finalTimeout?: IChainWatcherConfig['finalTimeout'];
@@ -2381,13 +2384,33 @@ export class ChainWatcher extends EventEmitter {
 			else this.finalTimeout?.(channelId, hash, htlcId);
 			this.observedFinalTimeouts.add(key);
 		};
-		const claims = this.finalOutputClaims(
-			channelId,
-			parent,
-			this.destinationScript,
-			rate,
-			irrevocable ? trimmed : undefined
+		const build = this.finalOutputClaims;
+		const { value: claims, conflicts } = collectFinalPeerSecretConflicts(() =>
+			build(
+				channelId,
+				parent,
+				this.destinationScript,
+				rate,
+				irrevocable ? trimmed : undefined
+			)
 		);
+		// Disagreeing peer secrets never stop a claim: they are reported once
+		// per channel and height (#2151 step 2b).
+		for (const c of conflicts) {
+			const key = c.channelId + ':' + c.height;
+			this.reportedPeerSecretConflicts ??= new Set();
+			if (this.reportedPeerSecretConflicts.has(key)) continue;
+			this.reportedPeerSecretConflicts.add(key);
+			this.emitError(
+				new Error(
+					'Inconsistent peer revocation secrets for channel ' +
+						c.channelId +
+						' at height ' +
+						c.height +
+						'; claims use the secret that matches the commitment'
+				)
+			);
+		}
 		const balances = new Set(
 			claims
 				.filter((claim) => claim.assetBalanceOutput)

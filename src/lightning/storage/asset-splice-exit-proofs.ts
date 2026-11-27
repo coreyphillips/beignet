@@ -132,6 +132,13 @@ function branch(v: IAssetSpliceExitBranch): IAssetSpliceExitBranch {
 	};
 }
 
+/** The asset branch checks, for a conversion's asset branch (#2151 step 2b). */
+export function validateAssetExitBranch(
+	v: IAssetSpliceExitBranch
+): IAssetSpliceExitBranch {
+	return branch(v);
+}
+
 function canonical(
 	id: string,
 	v: IAssetSpliceExitProofs
