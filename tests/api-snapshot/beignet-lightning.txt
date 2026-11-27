@@ -1307,7 +1307,7 @@ function chain.signP2wpkhInput(tx: bitcoinjs-lib#Transaction, inputIndex: number
 function chain.signSweepInput(tx: bitcoinjs-lib#Transaction, inputIndex: number, witnessScript: Buffer, value: number, privateKey: Buffer, sighashType?: number): Buffer
 function chain.sweepVbytes(witness: readonly Buffer[], destinationScript: Buffer): number
 namespace channel
-const channel.AUXILIARY_CHANNELS_API: Readonly<{ version: 1; surfaces: readonly [ "valueIncomingHtlc:three-outcome", "sendPaymentToRoute:assetPayment", "getAuxiliaryPaymentHtlcs", "onHtlcResolved:htlcId", "queryAuxiliaryRoute", "fundAuxiliaryChannel:unsigned", "onFundingSigned", "abandonAuxiliaryOpen", "IChannelInfo.auxiliary", "setAuxiliaryPaymentGate", "getChannelMonitorState", "IPaymentInfo.auxiliary", "IPaymentInfo.auxiliaryValueMsat", "IInvoiceInfo.auxiliary", "IAuxiliaryChannelInfo.undeliveredOutcomes", "onHtlcResolved:never-sent", "getFixedOutputFeeStatus", "IPaymentInfo.unresolved", "IHoldInvoiceStateEvent.auxiliary", "prepareForward", "getFixedOutputFeeStatus:splitCoins", "getFixedOutputFeeStatus:reserve", "requireFeeCoinsToSettle", "onForwardLegResolved:quote", "IForwardingEvent.auxiliary", "setAuxiliaryForwardGate", "receiveInParts", "sendInParts", "createInvoice:assetInvoice", "dualFunding:v1", "assetSplice:v1", "assetSpliceRecovery:v1" ]; declared: readonly [ ]; }>
+const channel.AUXILIARY_CHANNELS_API: Readonly<{ version: 1; surfaces: readonly [ "valueIncomingHtlc:three-outcome", "sendPaymentToRoute:assetPayment", "getAuxiliaryPaymentHtlcs", "onHtlcResolved:htlcId", "queryAuxiliaryRoute", "fundAuxiliaryChannel:unsigned", "onFundingSigned", "abandonAuxiliaryOpen", "IChannelInfo.auxiliary", "setAuxiliaryPaymentGate", "getChannelMonitorState", "IPaymentInfo.auxiliary", "IPaymentInfo.auxiliaryValueMsat", "IInvoiceInfo.auxiliary", "IAuxiliaryChannelInfo.undeliveredOutcomes", "onHtlcResolved:never-sent", "getFixedOutputFeeStatus", "IPaymentInfo.unresolved", "IHoldInvoiceStateEvent.auxiliary", "prepareForward", "getFixedOutputFeeStatus:splitCoins", "getFixedOutputFeeStatus:reserve", "requireFeeCoinsToSettle", "onForwardLegResolved:quote", "IForwardingEvent.auxiliary", "setAuxiliaryForwardGate", "receiveInParts", "sendInParts", "createInvoice:assetInvoice", "dualFunding:v1", "assetSplice:v1", "assetSpliceRecovery:v1" ]; declared: readonly [ "assetConversion:v1" ]; }>
 const channel.AUXILIARY_CHANNEL_DUST_LIMIT = 354n
 const channel.AUXILIARY_CLOSE_ASSET_OUTPUT_MINIMUM = 330n
 type channel.AssetOpenPair<T> = readonly [ initiator: T, acceptor: T ]
@@ -2016,6 +2016,13 @@ property channel.IAnnouncementReadyAction.channelAnnouncement: Buffer
 property channel.IAnnouncementReadyAction.channelId: Buffer
 property channel.IAnnouncementReadyAction.channelUpdate: Buffer
 property channel.IAnnouncementReadyAction.type: channel.ChannelActionType.ANNOUNCEMENT_READY
+interface channel.IAssetConversionBitcoin
+property channel.IAssetConversionBitcoin.candidate: { type: 'plain' | 'asset'; channelType: string; maxAcceptedHtlcs: channel.AssetOpenPair<number>; dustLimitSats: channel.AssetOpenPair<bigint>; }
+property channel.IAssetConversionBitcoin.feeratePerKw: number
+property channel.IAssetConversionBitcoin.fundingKeys: channel.AssetOpenPair<Buffer>
+property channel.IAssetConversionBitcoin.lockTime: number
+property channel.IAssetConversionBitcoin.minimumDepth: number
+property channel.IAssetConversionBitcoin.parent: { type: 'plain' | 'asset'; channelType: string; valueSats: bigint; fundingKeys: channel.AssetOpenPair<Buffer>; root?: Buffer; }
 interface channel.IAssetConversionContext
 property channel.IAssetConversionContext.attempt: Buffer
 property channel.IAssetConversionContext.channelId: string
@@ -2024,6 +2031,30 @@ property channel.IAssetConversionContext.isInitiator: boolean
 property channel.IAssetConversionContext.isOpener: boolean
 property channel.IAssetConversionContext.parent: { txid: string; outputIndex: number; stateNumber: string; type: 'plain' | 'asset'; channelType: string; }
 property channel.IAssetConversionContext.peer: string
+interface channel.IAssetConversionDescription
+property channel.IAssetConversionDescription.commitmentRecordLimits?: readonly (readonly IAssetSpliceWireRecordLimit[])[]
+property channel.IAssetConversionDescription.feeBudgets: readonly bigint[]
+property channel.IAssetConversionDescription.inputs: channel.IAssetSpliceDescription['inputs']
+property channel.IAssetConversionDescription.movements: readonly channel.IAssetConversionMovement[]
+property channel.IAssetConversionDescription.outputs: channel.IAssetSpliceDescription['outputs']
+property channel.IAssetConversionDescription.parentUnits: readonly { assetId: string; initiator: bigint; acceptor: bigint; }[]
+property channel.IAssetConversionDescription.relativeSatoshis: readonly bigint[]
+interface channel.IAssetConversionHost
+method channel.IAssetConversionHost.abandonConversion(ctx: channel.IAssetConversionContext, reason: string): void | Promise<void>
+property channel.IAssetConversionHost.assetConversionVersion: 1
+property channel.IAssetConversionHost.conversionFeerateMarginPerKw: number
+method channel.IAssetConversionHost.conversionTerms(ctx: Omit<channel.IAssetConversionContext, 'attempt'>, request: { reference: Buffer; }): Promise<channel.IAssetConversionTerms>
+method channel.IAssetConversionHost.describeConversion(ctx: channel.IAssetConversionContext, proposals: channel.AssetOpenPair<Buffer>, bitcoin: channel.IAssetConversionBitcoin): Promise<channel.IAssetConversionDescription>
+method channel.IAssetConversionHost.prepareConversion(ctx: channel.IAssetConversionContext, proposals: channel.AssetOpenPair<Buffer>, bitcoin: channel.IAssetConversionBitcoin, layoutDigest: Buffer): Promise<channel.IAssetConversionPlan>
+method channel.IAssetConversionHost.proposeConversion(ctx: channel.IAssetConversionContext, terms: channel.IAssetConversionTerms): Promise<Buffer>
+method channel.IAssetConversionHost.verifyConversionTerms(ctx: channel.IAssetConversionContext, terms: channel.IAssetConversionTerms, digest: Buffer): Promise<boolean>
+interface channel.IAssetConversionMovement
+property channel.IAssetConversionMovement.assetId: string
+property channel.IAssetConversionMovement.from: 'initiator' | 'acceptor'
+property channel.IAssetConversionMovement.outputSerial: bigint
+property channel.IAssetConversionMovement.units: bigint
+interface channel.IAssetConversionPlan
+property channel.IAssetConversionPlan.digest: Buffer
 interface channel.IAssetConversionTerms
 property channel.IAssetConversionTerms.agreement: { reference: string; expiresAt: number; }
 property channel.IAssetConversionTerms.candidate: { dustLimitSats: { opener: string; acceptor: string; }; maxAcceptedHtlcs: { opener: number; acceptor: number; }; }
@@ -2303,14 +2334,19 @@ property channel.IAuxiliaryCommitmentData.secondLevelRevocationKey?: Buffer
 interface channel.IAuxiliaryDualFunding extends Partial<channel.AssetSpliceHost>, Partial<channel.IAssetSpliceUpdateHost>
 method channel.IAuxiliaryDualFunding.abandon(ctx: channel.IAssetOpenContext): Promise<void>
 method channel.IAuxiliaryDualFunding.abandonConversion?(ctx: channel.IAssetConversionContext, reason: string): void | Promise<void>
+property channel.IAuxiliaryDualFunding.assetConversionVersion?: 1
 property channel.IAuxiliaryDualFunding.assetSpliceRecoveryVersion?: 1
 method channel.IAuxiliaryDualFunding.confirmFunding(candidate: IFinalOpeningCandidate, fundingProofs: Buffer): Promise<void>
 method channel.IAuxiliaryDualFunding.contribution(peer: string, isInitiator: boolean, openerSats: bigint): bigint | undefined
+property channel.IAuxiliaryDualFunding.conversionFeerateMarginPerKw?: number
 method channel.IAuxiliaryDualFunding.conversionTerms?(ctx: Omit<channel.IAssetConversionContext, 'attempt'>, request: { reference: Buffer; }): Promise<channel.IAssetConversionTerms>
 method channel.IAuxiliaryDualFunding.describe(ctx: channel.IAssetOpenContext, proposals: channel.AssetOpenPair<Buffer>): Promise<channel.IAssetOpenDescription>
+method channel.IAuxiliaryDualFunding.describeConversion?(ctx: channel.IAssetConversionContext, proposals: channel.AssetOpenPair<Buffer>, bitcoin: channel.IAssetConversionBitcoin): Promise<channel.IAssetConversionDescription>
 method channel.IAuxiliaryDualFunding.outputRecoveryReceipt?(channelId: string, parentTxid: string, outputIndex: number, payout: bitcoinjs-lib#Transaction): Buffer | undefined
 method channel.IAuxiliaryDualFunding.prepare(ctx: channel.IAssetOpenContext, proposals: channel.AssetOpenPair<Buffer>, layoutDigest: Buffer): Promise<channel.IAssetOpenPlan>
+method channel.IAuxiliaryDualFunding.prepareConversion?(ctx: channel.IAssetConversionContext, proposals: channel.AssetOpenPair<Buffer>, bitcoin: channel.IAssetConversionBitcoin, layoutDigest: Buffer): Promise<channel.IAssetConversionPlan>
 method channel.IAuxiliaryDualFunding.propose(ctx: channel.IAssetOpenContext): Promise<Buffer>
+method channel.IAuxiliaryDualFunding.proposeConversion?(ctx: channel.IAssetConversionContext, terms: channel.IAssetConversionTerms): Promise<Buffer>
 method channel.IAuxiliaryDualFunding.recoverHtlc?(ctx: channel.IAssetOpeningHtlcPayout): Promise<bitcoinjs-lib#Transaction | null>
 method channel.IAuxiliaryDualFunding.recoverOutput(ctx: channel.IAssetOpeningPayout): Promise<bitcoinjs-lib#Transaction | null>
 method channel.IAuxiliaryDualFunding.restoreOutputReceipt?(channelId: string, parentTxid: string, outputIndex: number, payout: bitcoinjs-lib#Transaction, receipt: Buffer): Promise<void>
@@ -2553,6 +2589,7 @@ property channel.IChannelManagerConfig.auxiliaryOpenRefusal?: Error
 method channel.IChannelManagerConfig.auxiliaryPeerFeatures?(peerPubkey: string): features.FeatureFlags | undefined
 property channel.IChannelManagerConfig.chainHash?: Buffer
 property channel.IChannelManagerConfig.channelKeyDeriver?: (channelIndex: number) => channel.IPerChannelKeys
+property channel.IChannelManagerConfig.conversionFeerateEstimate?: () => Promise<number | null | undefined>
 property channel.IChannelManagerConfig.delayedPaymentBasepointSecret?: Buffer
 property channel.IChannelManagerConfig.durabilityBarrier?: channel.IWireDurabilityBarrier
 property channel.IChannelManagerConfig.fforVoucherLookup?: (paymentHash: string) => ffor.IFforVoucherArchive | undefined

@@ -93,13 +93,20 @@ function digest(fields: unknown[], stage: 'layout' | 'final'): Buffer {
 	);
 }
 
-function checkSerials(
+const SPLICE_SERIAL_TEXTS = {
+	count: 'Invalid asset splice item count',
+	order: 'Invalid asset splice serial order or reuse'
+} as const;
+
+/** Counts of 1 to `max`, ascending u64 serials, unique across `serials`; the texts are the caller's. */
+export function checkSerials(
 	items: readonly { serialId: bigint }[],
 	max: number,
-	serials: Set<bigint>
+	serials: Set<bigint>,
+	texts: { count: string; order: string }
 ): void {
 	if (!Array.isArray(items) || items.length < 1 || items.length > max)
-		throw new Error('Invalid asset splice item count');
+		throw new Error(texts.count);
 	let previous = -1n;
 	for (const { serialId } of items) {
 		if (
@@ -107,7 +114,7 @@ function checkSerials(
 			serialId <= previous ||
 			serials.has(serialId)
 		)
-			throw new Error('Invalid asset splice serial order or reuse');
+			throw new Error(texts.order);
 		serials.add(serialId);
 		previous = serialId;
 	}
@@ -157,8 +164,18 @@ function checkLayout(layout: IAssetSpliceLayout) {
 	)
 		throw new Error('Invalid asset splice parent or funding keys');
 	const serials = new Set<bigint>();
-	checkSerials(layout.inputs, MAX_INTERACTIVE_TX_INPUTS, serials);
-	checkSerials(layout.outputs, MAX_INTERACTIVE_TX_OUTPUTS, serials);
+	checkSerials(
+		layout.inputs,
+		MAX_INTERACTIVE_TX_INPUTS,
+		serials,
+		SPLICE_SERIAL_TEXTS
+	);
+	checkSerials(
+		layout.outputs,
+		MAX_INTERACTIVE_TX_OUTPUTS,
+		serials,
+		SPLICE_SERIAL_TEXTS
+	);
 	const parentHash = layout.parent.getHash();
 	const prevouts = new Set<string>();
 	const fees = [-init.relativeSatoshis, -ack.relativeSatoshis];

@@ -443,14 +443,18 @@ describe('A second conversion start while an attempt exists (#2151 step 3a, test
 	let p: IConversionPair;
 	after(() => s.release());
 
+	// Step 3b: A's laid-out replaces acked, and the hold that parks I in
+	// init-sent also holds A's layout, which A sends with its splice_ack.
+	const spliceAckAndLayout = (m: { from: 0 | 1; name: string }): boolean =>
+		m.from === 1 && (m.name === 'SPLICE_ACK' || m.name === 'asset_splice:0');
 	for (const [state, side, hold] of [
 		['I announced', 0, { from: 1, name: 'conversion_reply' }],
 		['I quiescing', 0, { from: 1, name: 'STFU' }],
-		['I init-sent', 0, { from: 1, name: 'SPLICE_ACK' }],
+		['I init-sent', 0, spliceAckAndLayout],
 		['I aborting', 0, { from: 1, name: 'TX_ABORT' }],
 		['A accepted', 1, { from: 0, name: 'STFU' }],
 		['A quiesced', 1, { from: 0, name: 'SPLICE' }],
-		['A acked', 1, { from: 0, name: 'TX_ABORT' }]
+		['A laid-out', 1, { from: 0, name: 'TX_ABORT' }]
 	] as const)
 		it(`refuses a second start in ${state}`, async () => {
 			p = await shared();

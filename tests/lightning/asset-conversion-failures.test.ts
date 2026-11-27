@@ -59,6 +59,9 @@ const fakeClock = (): sinon.SinonFakeTimers =>
 		toFake: ['Date', 'setTimeout', 'clearTimeout']
 	});
 const REF = Buffer.alloc(8, 0x21);
+/** A's splice_ack and the layout it sends with it (step 3b): I stays in init-sent. */
+const spliceAckAndLayout: WireMatch = (m) =>
+	m.from === 1 && (m.name === 'SPLICE_ACK' || m.name === 'asset_splice:0');
 
 async function run(
 	p: IConversionPair,
@@ -453,14 +456,16 @@ describe('Disconnects and restarts in each state (#2151 step 3a, test 6)', funct
 	after(() => s.release());
 
 	// In I aborting, A has already ended at I's tx_abort with the fence text
-	// (row "A acked | tx_abort"); only its echo is held.
+	// (row "A laid-out | tx_abort"); only its echo is held. Step 3b: A's
+	// laid-out replaces acked, and the hold that parks I in init-sent also
+	// holds A's layout, which A sends with its splice_ack.
 	const states: [string, WireMatch, string][] = [
 		['I announced', { from: 1, name: 'conversion_reply' }, DISCONNECTED],
 		['A accepted', { from: 0, name: 'STFU' }, DISCONNECTED],
 		['I quiescing', { from: 1, name: 'STFU' }, DISCONNECTED],
 		['A quiesced', { from: 0, name: 'SPLICE' }, DISCONNECTED],
-		['I init-sent', { from: 1, name: 'SPLICE_ACK' }, DISCONNECTED],
-		['A acked', { from: 0, name: 'TX_ABORT' }, DISCONNECTED],
+		['I init-sent', spliceAckAndLayout, DISCONNECTED],
+		['A laid-out', { from: 0, name: 'TX_ABORT' }, DISCONNECTED],
 		['I aborting', { from: 1, name: 'TX_ABORT' }, FENCE]
 	];
 	for (const [state, at, peerEnd] of states) {
@@ -517,7 +522,7 @@ describe('Restarts on a plain pair (#2151 step 3a, test 6)', function () {
 	for (const [state, at] of [
 		['I announced', { from: 1, name: 'conversion_reply' }],
 		['I quiescing', { from: 1, name: 'STFU' }],
-		['A acked', { from: 0, name: 'TX_ABORT' }]
+		['A laid-out', { from: 0, name: 'TX_ABORT' }]
 	] as const)
 		it(`calls nothing on the restarted side at ${state}, and the peer ends`, async () => {
 			p = await shared();

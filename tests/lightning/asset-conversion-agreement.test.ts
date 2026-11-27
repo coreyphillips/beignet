@@ -40,17 +40,25 @@ import {
 	FENCE,
 	parentHeight,
 	updateRound,
-	sharedPair
+	sharedPair,
+	expectFenceHostOrder
 } from './helpers/conversion-managers';
 import { BEIGNET_CUSTOM_MESSAGE_TYPE } from '../../src/lightning/message/custom';
 
+/**
+ * The conversion's messages since `from`: every BOLT message, its terms and
+ * replies, and (step 3b) its layout and layout_ack frames, which no other
+ * attempt sends on these pairs.
+ */
 function conversionMessages(p: IConversionPair, from: number): IWireMessage[] {
 	return p.link.delivered
 		.slice(from)
 		.filter(
 			(m) =>
 				m.type !== BEIGNET_CUSTOM_MESSAGE_TYPE ||
-				m.name.startsWith('conversion_')
+				m.name.startsWith('conversion_') ||
+				m.name === 'asset_splice:0' ||
+				m.name === 'asset_splice:4'
 		);
 }
 
@@ -89,18 +97,27 @@ describe('Asset conversion agreement to the fence (#2151 step 3a, test 5)', func
 				await start.done;
 				expect(start.error, 'start').to.equal(undefined);
 
-				// The message order of section 6.
-				const wire = conversionMessages(p, mark);
-				expect(wire.map((m) => m.from + ':' + m.name)).to.deep.equal([
+				// The message order of section 6, with step 3b's layout and
+				// layout_ack before the fence. The two layout_acks may cross.
+				const all = conversionMessages(p, mark);
+				const head = [
 					`${I}:conversion_terms`,
 					`${A}:conversion_reply`,
 					`${I}:STFU`,
 					`${A}:STFU`,
 					`${I}:SPLICE`,
 					`${A}:SPLICE_ACK`,
-					`${I}:TX_ABORT`,
-					`${A}:TX_ABORT`
-				]);
+					`${A}:asset_splice:0`,
+					`${I}:asset_splice:0`
+				];
+				const tail = [`${I}:TX_ABORT`, `${A}:TX_ABORT`];
+				expect(
+					[
+						[...head, `${I}:asset_splice:4`, `${A}:asset_splice:4`, ...tail],
+						[...head, `${A}:asset_splice:4`, `${I}:asset_splice:4`, ...tail]
+					].map((o) => o.join(' '))
+				).to.include(all.map((m) => m.from + ':' + m.name).join(' '));
+				const wire = all.filter((m) => !m.name.startsWith('asset_splice:'));
 				const terms = storeTerms(p.stores[I], p.id, { giver, reference });
 				const { digest, attempt, bytes } = termsIdentity(
 					terms,
@@ -145,15 +162,10 @@ describe('Asset conversion agreement to the fence (#2151 step 3a, test 5)', func
 				// The echo repeats the data it received (v3.1 item 5).
 				expect(wire[7].payload).to.deep.equal(wire[6].payload);
 
-				// Both hosts, in order, with the same canonical terms and digest.
+				// Both hosts, in order, with the same canonical terms and digest,
+				// and (step 3b) the planner calls before the ends.
 				const calls = p.hostLog.slice(log);
-				expect(calls.map((c) => c.side + ':' + c.name)).to.deep.equal([
-					`${I}:conversionTerms`,
-					`${I}:verifyConversionTerms`,
-					`${A}:verifyConversionTerms`,
-					`${A}:abandonConversion`,
-					`${I}:abandonConversion`
-				]);
+				expectFenceHostOrder(calls, I);
 				const request = calls[0].args[1] as { reference: Buffer };
 				expect(request.reference).to.deep.equal(reference);
 				expect(calls[0].args[0]).to.not.have.property('attempt');

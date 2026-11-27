@@ -2532,6 +2532,40 @@ export class SqliteStorage implements IStorageBackend {
 				'Asset conversion requires channel parameters that fit the asset type'
 			);
 		const outpoint = outpointOf(funding);
+		// The parent snapshot (#2151 step 3b): a plain parent's locked view, or
+		// an asset parent's branch as the asset splice selects it.
+		let balances = {
+			local: BigInt(opening.candidate.localContributionSats) * 1000n,
+			remote: BigInt(opening.candidate.remoteContributionSats) * 1000n
+		};
+		let asset: { root?: string; priorDigest?: string } = {};
+		if (current.type === 'plain') {
+			const { locked } = this.finalUpdateView(channelId)!.views[0].s;
+			balances = { local: BigInt(locked.local), remote: BigInt(locked.peer) };
+		} else {
+			const committed = assetSpliceUpdateHead(this, channelId).committed;
+			const adopted = this.loadAdoptedAssetSpliceReceipt(channelId);
+			const root =
+				adopted?.candidate.fundingRoot ?? session.assetEvidence?.fundingRoot;
+			const member = committed
+				? assetUpdateFundingMembers(this, channelId, committed).find(
+						(m) =>
+							m.fundingTxid === outpoint.txid &&
+							m.outputIndex === outpoint.outputIndex &&
+							m.fundingRoot === root
+				  )
+				: adopted?.candidate;
+			if (committed && !member) throw new Error(unready);
+			if (member)
+				balances = {
+					local: BigInt(member.localRecovery.localBalanceMsat),
+					remote: BigInt(member.localRecovery.remoteBalanceMsat)
+				};
+			asset = {
+				...(root !== undefined && { root }),
+				...(committed && { priorDigest: committed.digest })
+			};
+		}
 		return {
 			type: current.type,
 			channelType: current.channelType,
@@ -2540,7 +2574,15 @@ export class SqliteStorage implements IStorageBackend {
 			outputIndex: outpoint.outputIndex,
 			height: BigInt(ledger.height),
 			opener: opening.candidate.isInitiator,
-			commitmentFeeratePerKw: feerate ?? terms.commitmentFeeratePerKw
+			commitmentFeeratePerKw: feerate ?? terms.commitmentFeeratePerKw,
+			localBalanceMsat: balances.local,
+			remoteBalanceMsat: balances.remote,
+			parentValueSats: BigInt(
+				Transaction.fromHex(funding.fundingTxHex).outs[
+					funding.fundingOutputIndex
+				].value
+			),
+			...asset
 		};
 	}
 
