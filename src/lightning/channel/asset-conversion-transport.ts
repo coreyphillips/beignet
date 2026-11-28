@@ -976,7 +976,9 @@ export class AssetConversionTransport {
 				!!a.attempt?.equals(attempt) &&
 				(signing
 					? SIGNING.has(a.state)
-					: a.state === 'laid-out' || (a.initiator && a.state === 'init-sent'))
+					: a.state === 'laid-out' ||
+					  SIGNING.has(a.state) ||
+					  (a.initiator && a.state === 'init-sent'))
 			)
 				return a;
 		return undefined;
@@ -1651,6 +1653,19 @@ export class AssetConversionTransport {
 
 	/** A layout or layout_ack frame the attempt owns, in its queue. */
 	private async receiveFrame(a: IAttempt, raw: Buffer): Promise<void> {
+		// After the agreement a layout_ack is still compared (a different one
+		// is a disagreement) and a layout replay is still taken by its
+		// receiver, as in laid-out.
+		if (SIGNING.has(a.state)) {
+			try {
+				const f = decodeAssetOpenFrame(raw);
+				if (f.phase === 'layout_ack') await this.peerLayoutAck(a, f.digest);
+				else a.receiver?.receive(f);
+			} catch {
+				this.fail(a, FRAME);
+			}
+			return;
+		}
 		if (a.state !== 'init-sent' && a.state !== 'laid-out') return;
 		let bytes: Buffer | undefined;
 		try {
