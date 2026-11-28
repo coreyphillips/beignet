@@ -593,6 +593,71 @@ describe('Zero reserve amount and commitment checks', () => {
 		}
 	});
 
+	it('quotes a 300,000 sat wallet with only the zero and maximum commitment checks', () => {
+		const { primary, wallet, client, id } = fundedPair(false);
+		try {
+			const paid = primary.sendPayment(
+				wallet.createInvoice({
+					description: 'fund the wallet',
+					amountMsat: 300_000_000n
+				}).bolt11
+			);
+			expect(paid.status).to.equal('COMPLETED');
+			const withdrawals: bigint[] = [];
+			const check = client.spliceOutCommitmentRefusal.bind(client);
+			client.spliceOutCommitmentRefusal = (withdrawal) => {
+				withdrawals.push(withdrawal);
+				return check(withdrawal);
+			};
+			const quote = wallet.spliceQuote(id, 'out');
+			expect(quote.maxAmountSats).to.equal(300_000 - quote.feeSats);
+			expect(quote.spendableSats).to.equal(300_000);
+			expect(quote.reserveSats).to.equal(0);
+			expect(quote.commitmentCostSats).to.equal(0);
+			expect(withdrawals).to.deep.equal([BigInt(quote.feeSats), 300_000n]);
+		} finally {
+			primary.destroy();
+			wallet.destroy();
+		}
+	});
+
+	it('quotes the exact last withdrawal that leaves a commitment output', () => {
+		const { primary, wallet, client, id } = fundedPair(true);
+		try {
+			const quote = wallet.spliceQuote(id, 'out');
+			const maxDebit = BigInt(quote.maxAmountSats + quote.feeSats);
+			const balanceLimit =
+				client.getBalances().localMsat / 1000n -
+				client.spliceOutCommitmentCostSats();
+			expect(maxDebit < balanceLimit).to.equal(true);
+			expect(client.spliceOutCommitmentRefusal(maxDebit)).to.equal(null);
+			expect(client.spliceOutCommitmentRefusal(maxDebit + 1n)).to.include(
+				'no outputs'
+			);
+		} finally {
+			primary.destroy();
+			wallet.destroy();
+		}
+	});
+
+	it('quotes zero when even the fee would leave an unfunded commitment', () => {
+		const { primary, wallet, client, id } = fundedPair(false);
+		try {
+			const state = writableState(client);
+			state.localBalanceMsat = state.fundingSatoshis * 1000n;
+			state.remoteBalanceMsat = 0n;
+			const quote = wallet.spliceQuote(id, 'out');
+			expect(quote.spendableSats).to.equal(Number(state.fundingSatoshis));
+			expect(
+				client.spliceOutCommitmentRefusal(BigInt(quote.feeSats))
+			).to.include('commitment cost');
+			expect(quote.maxAmountSats).to.equal(0);
+		} finally {
+			primary.destroy();
+			wallet.destroy();
+		}
+	});
+
 	it('refuses a splice candidate whose peer opener cannot fund its commitment', () => {
 		const { primary, wallet, server, client } = fundedPair(true);
 		try {
