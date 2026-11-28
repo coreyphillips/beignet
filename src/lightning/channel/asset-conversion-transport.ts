@@ -372,6 +372,15 @@ export class AssetConversionTransport {
 	 * until the first orphan met reports it.
 	 */
 	private unswept?: { error?: string };
+	/**
+	 * Pre-restart records the host has not heard of (amendment D1), by
+	 * channel: the sequence of an open record from before this process. The
+	 * sweep notes each record it listed but could not read. After a failed
+	 * listing, a channel's first COUNT notes its odd count: every own record
+	 * follows a `start` or `assess`, which counts first. The key stays, with
+	 * no sequence, once the host is told or when that first count was even.
+	 */
+	private readonly untold = new Map<string, number | undefined>();
 
 	constructor(
 		private readonly runtime: IFinalOpeningRuntime | undefined,
@@ -403,10 +412,8 @@ export class AssetConversionTransport {
 	 * channel quiet, since nothing is signed in this build.
 	 */
 	quiet(id: string): boolean {
-		const records = this.records;
-		if (!records) return false;
-		const count = records.conversionAttemptRows(id);
-		if (count % 2 === 0) return false;
+		const count = this.count(id);
+		if (count === undefined || count % 2 === 0) return false;
 		if (this.holds(id, count)) return true;
 		this.orphan(id, count);
 		return false;
@@ -418,11 +425,25 @@ export class AssetConversionTransport {
 	 * withdrawn when met here.
 	 */
 	private recordOpen(id: string): boolean {
-		const records = this.records;
-		if (!records) return false;
-		const count = records.conversionAttemptRows(id);
-		if (count % 2 === 0) return false;
+		const count = this.count(id);
+		if (count === undefined || count % 2 === 0) return false;
 		return this.holds(id, count) || !this.orphan(id, count);
+	}
+
+	/**
+	 * The scope's count, one COUNT, read only when the storage can convert
+	 * asset channels (amendment D2): a copy never runs the orphan rule, and
+	 * its own gates refuse its updates and splices. After a failed listing,
+	 * a channel's first count notes its pre-restart record (D1).
+	 */
+	private count(id: string): number | undefined {
+		const records = this.records;
+		if (!records || !this.deps.storage?.canConvertAssetChannels)
+			return undefined;
+		const count = records.conversionAttemptRows(id);
+		if (this.unswept && !this.untold.has(id))
+			this.untold.set(id, count % 2 === 1 ? count : undefined);
+		return count;
 	}
 
 	/** A live attempt holds its record at `count` until it tries the withdrawal. */
@@ -435,21 +456,22 @@ export class AssetConversionTransport {
 	 * Withdraw the orphan record at `count` (amendment B1), by sequence: with
 	 * the reason of the end whose withdrawal failed when this process has
 	 * it, else "Asset conversion ended by a restart". A failure is reported
-	 * once per record. When the startup sweep could not list the scope, the
-	 * host hears of a record this process did not end once it is read, and
-	 * only once (an entry with the attempt id tells no more), and the
-	 * listing's failure is reported through the first orphan met. Reports
-	 * and host calls run in one microtask, outside any update path. True
-	 * once nothing is open at `count`.
+	 * once per record. The host hears of a pre-restart record it has not
+	 * heard of (amendment D1) once the record is read, and only once; any
+	 * other orphan's end already told it. When the startup sweep could not
+	 * list the scope, the listing's failure is reported through the first
+	 * orphan met. Reports and host calls run in one microtask, outside any
+	 * update path. True once nothing is open at `count`.
 	 */
 	private orphan(id: string, count: number): boolean {
 		const known = this.unwithdrawn.get(id);
 		const entry = known?.sequence === count ? known : undefined;
 		const reason = entry?.reason ?? RESTART;
 		const unswept = this.unswept;
-		// A record this process did not end and the host has not heard of:
-		// no entry, or one left before the record could be read.
-		const tell = !!unswept && entry?.attempt === undefined && this.offered;
+		// A record from before this process that the host has not heard of
+		// (amendment D1). Any other orphan, such as a record of an attempt
+		// this process ended, was told by that end.
+		const tell = this.offered && this.untold.get(id) === count;
 		let attempt = entry?.attempt;
 		let record: IConversionAttemptFields | undefined;
 		let failure: string | undefined;
@@ -483,6 +505,7 @@ export class AssetConversionTransport {
 		const listing = unswept?.error;
 		if (unswept) unswept.error = undefined;
 		const host = tell && record ? this.host : undefined;
+		if (host) this.untold.set(id, undefined);
 		if (listing === undefined && failure === undefined && !host)
 			return withdrawn;
 		queueMicrotask(() => {
@@ -516,9 +539,11 @@ export class AssetConversionTransport {
 	 * met. When the node offers conversion, the host hears the end of every
 	 * open record found, written or not, and the failures are reported, both
 	 * in one microtask after the constructor returns, once the node listens.
-	 * Nothing reaches the constructor: when the scope cannot be listed, every
-	 * open record is an orphan, the host hears of each when it is met, and
-	 * the failure is reported with the first.
+	 * A record listed but not read is told when an orphan read first learns
+	 * its attempt id (amendment D1). Nothing reaches the constructor: when
+	 * the scope cannot be listed, every open record is an orphan, the host
+	 * hears of the one at each channel's first count when it is met, and the
+	 * failure is reported with the first.
 	 */
 	sweep(): void {
 		let swept: ISweptConversionAttempt[] = [];
@@ -527,13 +552,15 @@ export class AssetConversionTransport {
 			const run = this.records?.withdrawOpenConversionAttempts;
 			if (!run) return;
 			swept = run(RESTART);
-			for (const s of swept)
-				if (s.error !== undefined)
-					this.unwithdrawn.set(s.channelId, {
-						sequence: s.sequence,
-						...(s.record && { attempt: s.record.attempt }),
-						reason: RESTART
-					});
+			for (const s of swept) {
+				if (s.error === undefined) continue;
+				this.unwithdrawn.set(s.channelId, {
+					sequence: s.sequence,
+					...(s.record && { attempt: s.record.attempt }),
+					reason: RESTART
+				});
+				if (!s.record) this.untold.set(s.channelId, s.sequence);
+			}
 		} catch (error) {
 			this.unswept = { error: message(error) };
 			return;
