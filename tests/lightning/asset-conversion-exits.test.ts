@@ -1977,7 +1977,7 @@ describe('Asset conversion signs both exits up to the 4b fence (#2151 step 4b, s
 					: 'one update since (the added member)'
 			}`, async () => {
 				// k = 1: one update round on the adopted candidate, through the
-				// pair (tests-notes.md item 17).
+				// pair, since the splice fixture cannot adopt at k = 1 directly.
 				const spliced = await assetTypePair(s, 0);
 				await spliced.p.start();
 				await spliced.p.drain();

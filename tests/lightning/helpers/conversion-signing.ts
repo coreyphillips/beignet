@@ -255,9 +255,8 @@ export const branchRowsOf = (store: SqliteStorage, id: string): number =>
 	finalBranchReaders(store)!.finalBranchRows(id);
 
 /**
- * `SqliteStorage.refuseRecordedRepair` with 7.4's arguments. The contract
- * names the two new ones (the wallet's journal key and identity) but not
- * their place; the tests take them after the channel id (tests-notes.md).
+ * `SqliteStorage.refuseRecordedRepair` with its two #2151 Step 4b arguments,
+ * the wallet's journal key and identity, after the channel id.
  */
 export function refuseRepair(
 	db: Database.Database,
