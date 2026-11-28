@@ -3,7 +3,8 @@
  * cannot reach. The round's constructor refuses a derived key that differs
  * (2.6), the round refuses a construction whose transaction differs from
  * the agreed candidate (3.1, through the construction seam), and the
- * tombstone owns only its own candidate's commitment_signed (W1).
+ * tombstone owns only its own candidate's commitment_signed (W1). The last
+ * test pins W6's tolerant read, which no test reached.
  */
 import { expect } from 'chai';
 import sinon from 'sinon';
@@ -17,12 +18,26 @@ import { AssetConversionTransport } from '../../src/lightning/channel/asset-conv
 import type { SpliceConstructionCore } from '../../src/lightning/channel/asset-splice-construction';
 import { MessageType } from '../../src/lightning/message/types';
 import { scratch } from './helpers/channel-type-pairs';
+import { finalBranchReaders } from '../../src/lightning/storage/final-branch-readers';
+import { deviceAuthority } from './helpers/channel-type-record';
 import {
+	agreeOnTerms,
 	attemptOf,
 	sharedPair,
+	startConversion,
+	track,
 	type IConversionPair
 } from './helpers/conversion-managers';
-import { forgedCommitmentSigned, toPhase } from './helpers/conversion-signing';
+import {
+	conversionEvents,
+	forgedCommitmentSigned,
+	fundingsOf,
+	pendingConversionsOf,
+	plantConversionEvent,
+	refuseRepair,
+	toPhase,
+	walletDb
+} from './helpers/conversion-signing';
 
 interface IRoundView {
 	f: IConversionRoundFacts;
@@ -118,16 +133,16 @@ describe('Asset conversion round guards (#2151 step 4b, X5, X6 and X15)', functi
 
 	it("X15. the tombstone owns only its candidate's commitment_signed", () => {
 		const transport = new AssetConversionTransport(undefined, undefined, {
-			localFeatures: () => undefined,
-			remoteFeatures: () => undefined,
-			connected: () => false,
-			hasDepth: () => false,
-			busy: () => false,
-			settled: async () => undefined,
-			height: () => 0,
-			send: () => undefined,
-			disconnect: () => undefined,
-			report: () => undefined
+			localFeatures: (): undefined => undefined,
+			remoteFeatures: (): undefined => undefined,
+			connected: (): boolean => false,
+			hasDepth: (): boolean => false,
+			busy: (): boolean => false,
+			settled: async (): Promise<void> => undefined,
+			height: (): number => 0,
+			send: (): void => undefined,
+			disconnect: (): void => undefined,
+			report: (): void => undefined
 		});
 		const id = Buffer.alloc(32, 0x11);
 		const candidate = Buffer.alloc(32, 0x22);
@@ -151,5 +166,47 @@ describe('Asset conversion round guards (#2151 step 4b, X5, X6 and X15)', functi
 		expect(handle(candidate), 'the tombstoned candidate').to.equal(true);
 		transport.disconnected(peer);
 		expect(handle(candidate), 'after a disconnect').to.equal(false);
+	});
+});
+
+describe('The tolerant read of the conversion scope (#2151 step 4b, W6)', function () {
+	this.timeout(240000);
+	const s = scratch('conversion-tolerant-read-');
+	const pair = sharedPair(s, 'plain');
+	after(() => s.release());
+
+	it('W6. ignores a malformed scope on the claim and exit paths and refuses it on the conversion paths', async () => {
+		const p = await pair();
+		agreeOnTerms(p);
+		await track(
+			startConversion(p.managers[0], p.channelId, {
+				reference: Buffer.alloc(8, 0x57)
+			})
+		).done;
+		await p.settle();
+		const store = p.stores[0];
+		const [exits] = conversionEvents(store, p.id);
+		expect(exits?.kind, 'retained').to.equal('conversion-exits');
+		const fundings = fundingsOf(store, p.id);
+		// A second drop of one digest breaks the strict rules (7.2).
+		plantConversionEvent(store, p.id, {
+			kind: 'conversion-dropped',
+			digest: exits.digest
+		});
+		expect(fundingsOf(store, p.id), 'the claim fundings').to.deep.equal(
+			fundings
+		);
+		expect(
+			finalBranchReaders(store)!.finalConversion(p.id, exits.digest),
+			'the chain readers see nothing'
+		).to.equal(null);
+		expect(() => pendingConversionsOf(store, p.id)).to.throw(
+			'Invalid conversion exits'
+		);
+		expect(() =>
+			refuseRepair(walletDb(store), deviceAuthority(store), p.id, store)
+		).to.throw(
+			'Restore of a channel with a pending type conversion is not supported yet'
+		);
 	});
 });
