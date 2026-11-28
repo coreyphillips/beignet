@@ -188,7 +188,8 @@ describe('Asset conversion round guards (#2151 step 4b, X5, X6 and X15)', functi
 		for (const conversionRoots of [
 			{ parent: Buffer.alloc(32, 1), candidate: root },
 			{},
-			{ candidate: root.subarray(1) }
+			{ candidate: root.subarray(1) },
+			{ parent: root.subarray(1) }
 		])
 			expect(() =>
 				buildFinalSpliceCandidate(
