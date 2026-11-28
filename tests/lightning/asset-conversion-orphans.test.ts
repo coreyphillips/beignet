@@ -95,9 +95,8 @@ function clean(p: IConversionPair, terms: TermsOptions = {}): void {
 		h.propose = (): unknown => stubProposal(i);
 		h.describe = (ctx, _proposals, bitcoin): unknown =>
 			stubConversionDescription(ctx, h.termsFor(ctx), bitcoin);
-		h.prepare = (_ctx, _proposals, _bitcoin, layoutDigest): unknown => ({
-			digest: sha256(layoutDigest)
-		});
+		h.prepare = (ctx, proposals, bitcoin, layoutDigest): unknown =>
+			h.planFor(ctx, proposals, bitcoin, layoutDigest);
 		p.feerateEstimates[i] = async (): Promise<number> => 1000;
 		h.terms = (ctx, request): ReturnType<typeof storeTerms> =>
 			storeTerms(p.stores[i], ctx.channelId, {
