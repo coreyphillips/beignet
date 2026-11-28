@@ -499,7 +499,11 @@ describe('Asset conversion signs both exits up to the 4b fence (#2151 step 4b, s
 			{
 				row: '1, consent after both layout_acks',
 				ours: A,
-				hold: (m) => m.from === I && m.name === 'asset_splice:4',
+				// The held object's sender's later consent is held too, as an
+				// ordered connection would deliver it after the layout_ack.
+				hold: (m) =>
+					m.from === I &&
+					(m.name === 'asset_splice:4' || m.name === 'asset_splice_consent'),
 				done: (p, mark) =>
 					sentNames(p, A, mark).includes('asset_splice_consent')
 			},
@@ -541,14 +545,22 @@ describe('Asset conversion signs both exits up to the 4b fence (#2151 step 4b, s
 			{
 				row: '7, commitment_signed after both exit shares and the verify',
 				ours: A,
-				hold: (m) => m.from === I && m.name === 'asset_splice:3',
+				// I's commitment_signed is held too: it follows I's exit share
+				// on an ordered connection.
+				hold: (m) =>
+					m.from === I &&
+					(m.name === 'asset_splice:3' || m.name === 'COMMITMENT_SIGNED'),
 				before: 'asset_splice:3',
 				done: (p, mark) => sentNames(p, A, mark).includes('COMMITMENT_SIGNED')
 			},
 			{
 				row: "8, the retain after the peer's commitment_signed",
 				ours: A,
-				hold: (m) => m.from === I && m.name === 'COMMITMENT_SIGNED',
+				// I's fence is held too: it follows I's commitment_signed on an
+				// ordered connection.
+				hold: (m) =>
+					m.from === I &&
+					(m.name === 'COMMITMENT_SIGNED' || m.name === 'TX_ABORT'),
 				before: 'COMMITMENT_SIGNED',
 				done: (p) => p.hosts[A].calls('retainConversionExits').length === 1
 			}
@@ -961,10 +973,17 @@ describe('Asset conversion signs both exits up to the 4b fence (#2151 step 4b, s
 					expect(abortsFrom(p, 0, mark), 'on the wire').to.include(text);
 					expect(abandoned(p, 0), 'in abandon').to.deep.equal([text]);
 					for (const i of [0, 1] as const) {
+						// The declining side retains nothing. Its peer may have
+						// retained before the abort reached it (section 1, step 8),
+						// and then drops at the end (7.1).
 						expect(
 							conversionKinds(p.stores[i], p.id).slice(base.conversions[i]),
 							'side ' + i + ' no conversion-exits'
-						).to.deep.equal([]);
+						).to.deep.equal(
+							i !== 0 && p.hosts[i].calls('retainConversionExits').length
+								? ['conversion-exits', 'conversion-dropped']
+								: []
+						);
 						expect(
 							attemptEvents(p.stores[i], p.id)
 								.slice(base.attempts[i])
@@ -1029,10 +1048,17 @@ describe('Asset conversion signs both exits up to the 4b fence (#2151 step 4b, s
 				0
 			);
 			for (const i of [0, 1] as const) {
+				// The refusing side retains nothing. Its peer may have retained
+				// before the abort reached it (section 1, step 8), and then
+				// drops at the end (7.1).
 				expect(
 					conversionKinds(p.stores[i], p.id).slice(base.conversions[i]),
 					'side ' + i + ' no conversion-exits'
-				).to.deep.equal([]);
+				).to.deep.equal(
+					i !== side && p.hosts[i].calls('retainConversionExits').length
+						? ['conversion-exits', 'conversion-dropped']
+						: []
+				);
 				expect(
 					attemptEvents(p.stores[i], p.id)
 						.slice(base.attempts[i])
