@@ -288,6 +288,20 @@ describe('Asset conversion round guards (#2151 step 4b, X5, X6 and X15)', functi
 		expect(() => build(facts)).to.throw('test: not the original device');
 	});
 
+	it('Z2. refuses a store with no device authority, before it reads anything else (2.6)', () => {
+		const store = p.stores[0] as unknown as { openingAuthority: unknown };
+		const authority = store.openingAuthority;
+		store.openingAuthority = undefined;
+		try {
+			expect(() => build(facts)).to.throw(
+				'New opening signatures require the original wallet device'
+			);
+		} finally {
+			store.openingAuthority = authority;
+		}
+		expect(() => build(facts), 'restored').to.not.throw();
+	});
+
 	it('2.1. refuses a consent whose digest is not the agreement', async () => {
 		// Last in this block: it ends the attempt the facts came from.
 		const a = attemptOf(p.managers[0], p.id) as unknown as { attempt: Buffer };
