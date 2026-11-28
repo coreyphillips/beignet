@@ -35,6 +35,7 @@ import {
 	allocatedKeyIndex,
 	changedRows,
 	conversionPair,
+	customPayload,
 	decodeSpliceAck,
 	decodeSpliceInit,
 	encodeSpliceAck,
@@ -884,14 +885,21 @@ describe('An attempt in laid-out (#2151 step 3b, section 3)', function () {
 		clock = undefined;
 	});
 	after(() => s.release());
-	const ackOfA = { from: 1 as const, name: 'asset_splice:4' };
+	// A's consent follows its layout_ack on an ordered connection (Step 4b),
+	// so it is held with it: I stays laid-out.
+	const ackOfA = (m: IWireMessage): boolean =>
+		m.from === 1 &&
+		(m.name === 'asset_splice:4' || m.name === 'asset_splice_consent');
 	const layoutOfI = { from: 0 as const, name: 'asset_splice:0' };
 
 	it('ends both sides at a disconnect and replays nothing after the reconnect', async () => {
 		const p = await conversionPair(s, 'asset');
 		p.link.hold(ackOfA);
 		await run(p, 0);
-		expect(p.link.held.map((m) => m.name)).to.deep.equal(['asset_splice:4']);
+		expect(p.link.held.map((m) => m.name)).to.deep.equal([
+			'asset_splice:4',
+			'asset_splice_consent'
+		]);
 		expect(abandoned(p, 0)).to.deep.equal([]);
 		p.link.held.splice(0);
 		p.disconnect();
@@ -1009,6 +1017,30 @@ describe('Received layout frames (#2151 step 3b, section 3 and v2.1 item 13)', f
 		expect(abandoned(p, 0)).to.deep.equal([text]);
 		expect(held(p.managers[0], p.id)).to.equal(false);
 	}
+	/**
+	 * Since Step 4b, I goes on to sign after equal layout_acks: it sends its
+	 * consent. The scripted peer cannot sign, so it ends the attempt with
+	 * its own tx_abort; I takes it at once, echoes it and ends with its text.
+	 */
+	async function peerEndsAfterConsent(
+		p: IConversionPair,
+		text: string
+	): Promise<void> {
+		expect(
+			p.link.inbox[1].map((m) => m.name),
+			"I's consent after the agreement"
+		).to.include('asset_splice_consent');
+		expect(p.link.inbox[1].some((m) => m.name === 'TX_ABORT')).to.equal(false);
+		p.link.send(1, MessageType.TX_ABORT, txAbort(p.channelId, text));
+		await p.settle();
+		expect(
+			p.link.inbox[1].filter((m) => m.name === 'TX_ABORT').map(abortText),
+			"I's echo"
+		).to.deep.equal([text]);
+		expect(abandoned(p, 0)).to.deep.equal([text]);
+		expect(held(p.managers[0], p.id)).to.equal(false);
+	}
+	const NO_SIGNER = 'Scripted peer cannot sign the conversion';
 	const big = Buffer.alloc(40 * 1024, 0x61);
 
 	const refusals: [
@@ -1107,7 +1139,7 @@ describe('Received layout frames (#2151 step 3b, section 3 and v2.1 item 13)', f
 		);
 		sendAll(p, 1, [layoutAckMessage(id.attempt, frameOf(own[0]).digest)]);
 		await p.settle();
-		await endsI(p, FENCE);
+		await peerEndsAfterConsent(p, NO_SIGNER);
 	});
 
 	it("keeps a layout that arrives before the peer's splice_ack, and runs the layout steps on the ack (M1)", async () => {
@@ -1137,7 +1169,7 @@ describe('Received layout frames (#2151 step 3b, section 3 and v2.1 item 13)', f
 		);
 		sendAll(p, 1, [layoutAckMessage(id.attempt, frameOf(own[0]).digest)]);
 		await p.settle();
-		await endsI(p, FENCE);
+		await peerEndsAfterConsent(p, NO_SIGNER);
 	});
 
 	/** Scripted I (side 0), real A (side 1), up to A's layout_ack. */
@@ -1489,17 +1521,24 @@ describe('Routing of the layout frames (#2151 step 3b, section 2)', function () 
 			undefined,
 			roleOf(p.stores[0], p.id)
 		);
-		// Hold A's layout_ack: I is laid-out when the other frames arrive.
-		p.link.hold({ from: 1, name: 'asset_splice:4' });
+		// Hold A's layout_ack, and its consent that follows it: I is laid-out
+		// when the other frames arrive.
+		p.link.hold(
+			(m) =>
+				m.from === 1 &&
+				(m.name === 'asset_splice:4' || m.name === 'asset_splice_consent')
+		);
 		await run(p, 0);
 		expect(names(seen[0], attempt), 'I').to.deep.equal([]);
 		expect(names(seen[1], attempt), 'A').to.deep.equal([]);
-		// A consent frame (subtype 99) naming the attempt, and a layout of another attempt.
+		// A consent frame (subtype 99) of another attempt (one naming the
+		// conversion's own is the conversion's since Step 4b, 5.4), and a
+		// layout of another attempt.
 		const consent = encodeCustomMessage(
 			BeignetCustomSubtype.ASSET_SPLICE_CONSENT,
 			Buffer.concat([
 				Buffer.from([1]),
-				attempt,
+				Buffer.alloc(32, 0x76),
 				Buffer.alloc(32, 5),
 				Buffer.alloc(64, 6)
 			])
@@ -1554,11 +1593,20 @@ describe('Copies of what the host is given and gives back (#2151 step 3b, v2.4 i
 		return start;
 	}
 	type Ctx = Omit<IAssetConversionContext, 'attempt'> & { attempt?: Buffer };
+	// Since Step 4b the plan's three members and the host's three exit
+	// members come before the end; the stub logs each plan call with the
+	// context its plan was made for.
 	const LATER = [
 		'verifyConversionTerms',
 		'proposeConversion',
 		'describeConversion',
 		'prepareConversion',
+		'consent',
+		'authorize',
+		'finalize',
+		'signConversionExits',
+		'verifyConversionExits',
+		'retainConversionExits',
 		'abandonConversion'
 	];
 
@@ -1633,8 +1681,15 @@ describe('Copies of what the host is given and gives back (#2151 step 3b, v2.4 i
 			'asset_splice:0',
 			'asset_splice:4'
 		]);
+		// A consent (subtype 99) carries the attempt id at bytes 1 to 33, a
+		// frame (subtype 98) at bytes 2 to 34.
 		for (const m of frames)
-			expect(frameOf(m).attempt, m.from + ':' + m.name).to.deep.equal(attempt);
+			expect(
+				m.name === 'asset_splice_consent'
+					? customPayload(m.payload).frame.subarray(1, 33)
+					: frameOf(m).attempt,
+				m.from + ':' + m.name
+			).to.deep.equal(attempt);
 		expect(abandoned(p, 0)).to.deep.equal([FENCE]);
 		expect(abandoned(p, 1)).to.deep.equal([FENCE]);
 	});
@@ -1651,6 +1706,12 @@ describe('Copies of what the host is given and gives back (#2151 step 3b, v2.4 i
 			) as unknown as { outputs: Record<string, unknown>[] };
 			const o = d.outputs[d.outputs.length - 1];
 			const good = o.descriptorHash as Buffer;
+			// The stub's own finalize builds from a copy taken before the getter
+			// is installed: its later read is the host's, not the engine's.
+			const before = stubConversionDescription(ctx, h.termsFor(ctx), bitcoin);
+			const finalize = h.finalize;
+			h.finalize = (facts, consents, authorizations): unknown =>
+				finalize({ ...facts, description: before }, consents, authorizations);
 			let reads = 0;
 			Object.defineProperty(o, 'descriptorHash', {
 				enumerable: true,
@@ -1746,8 +1807,13 @@ describe('Frame order and late host answers (#2151 step 3b, sections 2 and 3)', 
 				undefined,
 				roleOf(p.stores[0], p.id)
 			);
-			// I is laid-out with its agreement when the stranger's frame arrives.
-			p.link.hold({ from: 1, name: 'asset_splice:4' });
+			// I is laid-out with its agreement when the stranger's frame arrives;
+			// A's consent follows its layout_ack, so it is held with it.
+			p.link.hold(
+				(m) =>
+					m.from === 1 &&
+					(m.name === 'asset_splice:4' || m.name === 'asset_splice_consent')
+			);
 			await run(p, 0);
 			expect(callsOf(p, 0, 'prepareConversion')).to.have.length(1);
 			const stranger = '02' + '5a'.repeat(32);

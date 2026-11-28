@@ -503,18 +503,18 @@ export class ConversionHostStub {
 		return {
 			digest: createHash('sha256').update(layoutDigest).digest(),
 			consent: () =>
-				this.record('consent', [], () =>
+				this.record('consent', [ctx], () =>
 					Promise.resolve().then(() => this.consent(ctx) as Buffer)
 				),
 			authorize: (consents: ConversionPair<Buffer>) =>
-				this.record('authorize', [consents], () =>
+				this.record('authorize', [ctx, consents], () =>
 					Promise.resolve().then(() => this.authorize(ctx, consents) as Buffer)
 				),
 			finalize: (
 				consents: ConversionPair<Buffer>,
 				authorizations: ConversionPair<Buffer>
 			) =>
-				this.record('finalize', [consents, authorizations], () =>
+				this.record('finalize', [ctx, consents, authorizations], () =>
 					Promise.resolve().then(
 						() =>
 							this.finalize(
