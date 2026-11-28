@@ -8,9 +8,16 @@
  * agree, the attempt stops at a fence before signing: the initiator sends
  * `tx_abort` and the channel goes on at its parent, unchanged.
  *
- * Every attempt lives in memory only. Nothing is replayed after a
- * reconnect, and a restart calls nothing. The only durable write is each
- * side's candidate funding key allocation.
+ * An attempt lives in memory, and nothing is replayed after a reconnect.
+ * From its `layout_ack` on, a side's attempt is also on disk (#2151 Step 4a):
+ * the side writes its attempt record before the frame leaves, and its
+ * withdrawal the moment it decides the attempt ends, before any `tx_abort`
+ * of its own. While its live attempt holds the record the channel is quiet:
+ * the manager refuses every local update and every splice or conversion
+ * start. The manager's constructor withdraws whatever an earlier process
+ * left open, and a record no live attempt holds is withdrawn when it is met.
+ * The only other durable write is each side's candidate funding key
+ * allocation.
  */
 import { Transaction } from 'bitcoinjs-lib';
 import { REGTEST_CHAIN_HASH } from '../chain/hashes';
@@ -49,8 +56,17 @@ import { encodeStfuMessage } from '../message/stfu';
 import { MessageType as M } from '../message/types';
 import {
 	finalBranchReaders,
-	type IAssetConversionParent
+	type IAssetConversionParent,
+	type IFinalBranchReaders
 } from '../storage/final-branch-readers';
+import {
+	CONVERSION_ATTEMPT_TEXTS,
+	canonicalConversionReason,
+	sameConversionAttempt,
+	type IConversionAttemptFields,
+	type ISweptConversionAttempt
+} from '../storage/final-conversion-attempt';
+import type { SqliteStorage } from '../storage/sqlite-storage';
 import {
 	ASSET_CONVERSION_TEXTS as T,
 	assetConversionBytesDigest,
@@ -106,6 +122,9 @@ const PREMATURE = 'Premature asset conversion acknowledgement';
 const NO_ESTIMATE = 'Asset conversion requires a feerate estimate';
 const BELOW_FLOOR = 'Asset conversion funding feerate is below the local floor';
 const MARGIN = 'Invalid asset conversion feerate margin';
+const NOT_RECORDED = CONVERSION_ATTEMPT_TEXTS.notRecorded;
+const WITHDRAWAL_FAILED = 'Asset conversion withdrawal could not be recorded: ';
+const RESTART = 'Asset conversion ended by a restart';
 
 /** The plain target type, without the alias bit. */
 const PLAIN_TARGET_TYPE_HEX = '0100000000000000000000';
@@ -170,6 +189,10 @@ interface IAttempt {
 	agreement?: Buffer;
 	/** The peer's layout_ack value. */
 	peerAck?: Buffer;
+	/** The scope sequence of the side's attempt record, once it is on disk (#2151 Step 4a). */
+	recorded?: number;
+	/** The record's withdrawal was tried: written, or its failure handled. */
+	withdrawing?: boolean;
 	/** The side has sent its own tx_abort. */
 	abortSent?: boolean;
 	/** The text of the side's own tx_abort or decline, which its end repeats. */
@@ -234,6 +257,11 @@ export interface IAssetConversionDeps {
 	report: (id: string, reason: string) => void;
 	/** The quiescence deadline. */
 	timeoutMs?: number;
+	/**
+	 * The final opening's store, offered or not: the attempt records are
+	 * written and read through its branch readers (#2151 Step 4a).
+	 */
+	storage?: SqliteStorage;
 	/** The local funding feerate estimate in sat/kw; none counts as no estimate. */
 	feerateEstimate?: () => Promise<number | null | undefined>;
 }
@@ -275,6 +303,22 @@ function attemptId(
 	);
 }
 
+/** The host's context, rebuilt from an attempt record (#2151 Step 4a). */
+function recordContext(
+	channelId: string,
+	r: IConversionAttemptFields
+): IAssetConversionContext {
+	return {
+		channelId,
+		peer: r.peer,
+		attempt: Buffer.from(r.attempt, 'hex'),
+		isInitiator: r.isInitiator,
+		isOpener: r.isOpener,
+		parent: { ...r.parent },
+		direction: r.direction
+	};
+}
+
 /** The key of a withdrawn attempt: its channel and its attempt id. */
 const withdrawnKey = (id: string, attempt: Buffer): string =>
 	id + ':' + attempt.toString('hex');
@@ -312,6 +356,31 @@ export class AssetConversionTransport {
 		string,
 		{ peer: string; attempt: Buffer; timer: ReturnType<typeof setTimeout> }
 	>();
+	/**
+	 * Withdrawals that failed and were reported (#2151 Step 4a, amendment
+	 * B1), by channel: the record's scope sequence, its attempt id when
+	 * known and the canonical reason its end chose. The orphan at that
+	 * sequence is withdrawn with that reason, and its failures are not
+	 * reported again.
+	 */
+	private readonly unwithdrawn = new Map<
+		string,
+		{ sequence: number; attempt?: string; reason: string }
+	>();
+	/**
+	 * The startup sweep could not list the scope (amendment B1): its error,
+	 * until the first orphan met reports it.
+	 */
+	private unswept?: { error?: string };
+	/**
+	 * Pre-restart records the host has not heard of (amendment D1), by
+	 * channel: the sequence of an open record from before this process. The
+	 * sweep notes each record it listed but could not read. After a failed
+	 * listing, a channel's first COUNT notes its odd count: every own record
+	 * follows a `start` or `assess`, which counts first. The key stays, with
+	 * no sequence, once the host is told or when that first count was even.
+	 */
+	private readonly untold = new Map<string, number | undefined>();
 
 	constructor(
 		private readonly runtime: IFinalOpeningRuntime | undefined,
@@ -326,6 +395,198 @@ export class AssetConversionTransport {
 	/** Whether local starts of adds, fee updates, splices and conversions are refused. */
 	held(id: string): boolean {
 		return !!this.attempts.get(id)?.held;
+	}
+
+	/** The store's branch readers, for the attempt records. */
+	private get records(): IFinalBranchReaders | undefined {
+		return this.deps.storage
+			? finalBranchReaders(this.deps.storage)
+			: undefined;
+	}
+
+	/**
+	 * Quiet (#2151 Step 4a, section 3.1 and amendment B1): the scope's count
+	 * is odd and a live attempt of this process holds the record at that
+	 * count, which is one COUNT and a map lookup. An odd count that no live
+	 * attempt holds is an orphan: it is withdrawn here and never makes the
+	 * channel quiet, since nothing is signed in this build.
+	 */
+	quiet(id: string): boolean {
+		const count = this.count(id);
+		if (count === undefined || count % 2 === 0) return false;
+		if (this.holds(id, count)) return true;
+		this.orphan(id, count);
+		return false;
+	}
+
+	/**
+	 * Whether a record refuses a new conversion of the channel (amendment
+	 * B1): a live attempt holds it, or it is an orphan that could not be
+	 * withdrawn when met here.
+	 */
+	private recordOpen(id: string): boolean {
+		const count = this.count(id);
+		if (count === undefined || count % 2 === 0) return false;
+		return this.holds(id, count) || !this.orphan(id, count);
+	}
+
+	/**
+	 * The scope's count, one COUNT, read only when the storage can convert
+	 * asset channels (amendment D2): a copy never runs the orphan rule, and
+	 * its own gates refuse its updates and splices. After a failed listing,
+	 * a channel's first count notes its pre-restart record (D1).
+	 */
+	private count(id: string): number | undefined {
+		const records = this.records;
+		if (!records || !this.deps.storage?.canConvertAssetChannels)
+			return undefined;
+		const count = records.conversionAttemptRows(id);
+		if (this.unswept && !this.untold.has(id))
+			this.untold.set(id, count % 2 === 1 ? count : undefined);
+		return count;
+	}
+
+	/** A live attempt holds its record at `count` until it tries the withdrawal. */
+	private holds(id: string, count: number): boolean {
+		const a = this.attempts.get(id);
+		return !!a && !a.ended && !a.withdrawing && a.recorded === count;
+	}
+
+	/**
+	 * Withdraw the orphan record at `count` (amendment B1), by sequence: with
+	 * the reason of the end whose withdrawal failed when this process has
+	 * it, else "Asset conversion ended by a restart". A failure is reported
+	 * once per record. The host hears of a pre-restart record it has not
+	 * heard of (amendment D1) once the record is read, and only once; any
+	 * other orphan's end already told it. When the startup sweep could not
+	 * list the scope, the listing's failure is reported through the first
+	 * orphan met. Reports and host calls run in one microtask, outside any
+	 * update path. True once nothing is open at `count`.
+	 */
+	private orphan(id: string, count: number): boolean {
+		const known = this.unwithdrawn.get(id);
+		const entry = known?.sequence === count ? known : undefined;
+		const reason = entry?.reason ?? RESTART;
+		const unswept = this.unswept;
+		// A record from before this process that the host has not heard of
+		// (amendment D1). Any other orphan, such as a record of an attempt
+		// this process ended, was told by that end.
+		const tell = this.offered && this.untold.get(id) === count;
+		let attempt = entry?.attempt;
+		let record: IConversionAttemptFields | undefined;
+		let failure: string | undefined;
+		let withdrawn = false;
+		try {
+			const records = this.records!;
+			if (attempt === undefined || tell) {
+				const open = records.openConversionAttempt(id);
+				if (open && open.sequence !== count) throw new Error(NOT_RECORDED);
+				if (open) {
+					const { sequence: _sequence, ...fields } = open;
+					record = fields;
+					attempt = open.attempt;
+				}
+			}
+			// No open record: the read pulled in its withdrawal from the device.
+			if (attempt !== undefined)
+				records.withdrawConversionAttempt(id, count, attempt, reason);
+			withdrawn = true;
+		} catch (error) {
+			if (!entry) {
+				failure = WITHDRAWAL_FAILED + message(error);
+				this.unwithdrawn.set(id, {
+					sequence: count,
+					...(attempt !== undefined && { attempt }),
+					reason
+				});
+			} else if (entry.attempt === undefined) entry.attempt = attempt;
+		}
+		if (withdrawn && known) this.unwithdrawn.delete(id);
+		const listing = unswept?.error;
+		if (unswept) unswept.error = undefined;
+		const host = tell && record ? this.host : undefined;
+		if (host) this.untold.set(id, undefined);
+		if (listing === undefined && failure === undefined && !host)
+			return withdrawn;
+		queueMicrotask(() => {
+			try {
+				if (listing !== undefined)
+					this.deps.report(id, WITHDRAWAL_FAILED + listing);
+				if (failure !== undefined) this.deps.report(id, failure);
+				if (!host || !record) return;
+				const ctx = recordContext(id, record);
+				void this.hostCall(() => host.abandonConversion(ctx, RESTART)).then(
+					(r) => {
+						if (!r.ok && r.error !== undefined)
+							this.deps.report(
+								id,
+								'Asset conversion host abandon failed: ' + r.error
+							);
+					}
+				);
+			} catch {
+				// Contained: nothing reaches the reader.
+			}
+		});
+		return withdrawn;
+	}
+
+	/**
+	 * The startup sweep (#2151 Step 4a, section 4.5 and amendments A6 and
+	 * B1), run by the manager's constructor before any peer can connect:
+	 * every record an earlier process left open is withdrawn at once. A
+	 * channel whose withdrawal fails is left an orphan, withdrawn when it is
+	 * met. When the node offers conversion, the host hears the end of every
+	 * open record found, written or not, and the failures are reported, both
+	 * in one microtask after the constructor returns, once the node listens.
+	 * A record listed but not read is told when an orphan read first learns
+	 * its attempt id (amendment D1). Nothing reaches the constructor: when
+	 * the scope cannot be listed, every open record is an orphan, the host
+	 * hears of the one at each channel's first count when it is met, and the
+	 * failure is reported with the first.
+	 */
+	sweep(): void {
+		let swept: ISweptConversionAttempt[] = [];
+		try {
+			if (!this.deps.storage?.canConvertAssetChannels) return;
+			const run = this.records?.withdrawOpenConversionAttempts;
+			if (!run) return;
+			swept = run(RESTART);
+			for (const s of swept) {
+				if (s.error === undefined) continue;
+				this.unwithdrawn.set(s.channelId, {
+					sequence: s.sequence,
+					...(s.record && { attempt: s.record.attempt }),
+					reason: RESTART
+				});
+				if (!s.record) this.untold.set(s.channelId, s.sequence);
+			}
+		} catch (error) {
+			this.unswept = { error: message(error) };
+			return;
+		}
+		if (!swept.length) return;
+		const host = this.offered ? this.host : undefined;
+		queueMicrotask(() => {
+			for (const s of swept)
+				try {
+					if (s.error !== undefined)
+						this.deps.report(s.channelId, WITHDRAWAL_FAILED + s.error);
+					if (!host || !s.record) continue;
+					const ctx = recordContext(s.channelId, s.record);
+					void this.hostCall(() => host.abandonConversion(ctx, RESTART)).then(
+						(r) => {
+							if (!r.ok && r.error !== undefined)
+								this.deps.report(
+									s.channelId,
+									'Asset conversion host abandon failed: ' + r.error
+								);
+						}
+					);
+				} catch {
+					// Contained: the next record is still told.
+				}
+		});
 	}
 
 	// ---- The initiator's start ----
@@ -349,6 +610,7 @@ export class AssetConversionTransport {
 		if (!session || !this.deps.connected(id)) throw new Error(NOT_CONNECTED);
 		if (!this.negotiated(id, session.peer)) throw new Error(NOT_NEGOTIATED);
 		if (this.attempts.has(id)) throw new Error(T.held);
+		if (this.recordOpen(id)) throw new Error(OTHER_ATTEMPT);
 		if (!Buffer.isBuffer(request?.reference)) throw new Error(T.reference);
 		const a = this.open(id, session.peer, true);
 		a.reference = request.reference.toString('hex');
@@ -706,6 +968,7 @@ export class AssetConversionTransport {
 		try {
 			if (!this.deps.connected(a.id)) throw new Error(NOT_CONNECTED);
 			if (!this.negotiated(a.id, a.peer)) throw new Error(NOT_NEGOTIATED);
+			if (this.recordOpen(a.id)) throw new Error(OTHER_ATTEMPT);
 			await this.barrier(a);
 			this.live(a);
 			let parent = this.preconditions(a.id);
@@ -856,12 +1119,18 @@ export class AssetConversionTransport {
 	 * The peer's tx_abort, at once: in `aborting` or `draining` it ends the
 	 * attempt with the side's own text, and a `draining` side that has sent
 	 * no tx_abort answers it first; otherwise it is echoed with its data and
-	 * the attempt ends with its text.
+	 * the attempt ends with its text. The attempt ends even when a send
+	 * throws, and a failed withdrawal is reported after the end (amendment
+	 * B4).
 	 */
 	private peerAbort(a: IAttempt, payload: Buffer): void {
 		if (a.state === 'aborting' || a.state === 'draining') {
-			if (a.state === 'draining' && !a.abortSent) this.sendAbort(a, WITHDRAWN);
-			this.end(a, a.sent!);
+			try {
+				if (a.state === 'draining' && !a.abortSent)
+					this.sendAbort(a, WITHDRAWN);
+			} finally {
+				this.end(a, a.sent!);
+			}
 			return;
 		}
 		let data: Buffer;
@@ -870,12 +1139,21 @@ export class AssetConversionTransport {
 		} catch {
 			data = payload.subarray(32);
 		}
-		this.send(
-			a,
-			M.TX_ABORT,
-			encodeTxAbortMessage({ channelId: this.channelId(a), data })
-		);
-		this.end(a, data.toString('utf8'));
+		// The withdrawal before the echo, its reason escaped from the raw bytes.
+		const failure = this.withdraw(a, data);
+		try {
+			this.send(
+				a,
+				M.TX_ABORT,
+				encodeTxAbortMessage({ channelId: this.channelId(a), data })
+			);
+		} finally {
+			try {
+				this.end(a, data.toString('utf8'));
+			} finally {
+				if (failure) this.deps.report(a.id, failure);
+			}
+		}
 	}
 
 	/** I on the peer's stfu(0): checks, the proposal, key, splice_init. */
@@ -889,7 +1167,7 @@ export class AssetConversionTransport {
 			return;
 		}
 		const parent = await this.propose(a, 'quiescing');
-		if (!parent) return;
+		if (!parent || !this.still(a, 'quiescing')) return;
 		const key = this.fundingKey(a);
 		if (!key) return;
 		const t = a.terms!;
@@ -956,7 +1234,7 @@ export class AssetConversionTransport {
 			return;
 		}
 		const parent = await this.propose(a, 'quiesced');
-		if (!parent) return;
+		if (!parent || !this.still(a, 'quiesced')) return;
 		const key = this.fundingKey(a);
 		if (!key) return;
 		const ack = encodeSpliceAckMessage({
@@ -1164,16 +1442,7 @@ export class AssetConversionTransport {
 		await this.barrier(a);
 		if (!this.still(a, 'laid-out')) return;
 		try {
-			const parent = this.preconditions(a.id);
-			this.recheck(a, parent);
-			if (
-				parent.txid !== s.txid ||
-				parent.outputIndex !== s.outputIndex ||
-				parent.height !== s.height ||
-				parent.localBalanceMsat !== s.localBalanceMsat ||
-				parent.remoteBalanceMsat !== s.remoteBalanceMsat
-			)
-				throw new Error(T.parent);
+			this.parentUnchanged(a);
 		} catch (error) {
 			this.fail(a, message(error));
 			return;
@@ -1190,11 +1459,123 @@ export class AssetConversionTransport {
 			this.fail(a, PREPARE);
 			return;
 		}
+		// The parent again, after prepare and before the record (#2151 Step 4a,
+		// section 1.4). From here to the layout_ack all is synchronous.
+		try {
+			this.parentUnchanged(a);
+		} catch (error) {
+			this.fail(a, message(error));
+			return;
+		}
 		a.layoutDigest = layoutDigest;
 		a.planDigest = Buffer.from(plan);
 		a.agreement = assetConversionAgreementDigest(layoutDigest, a.planDigest);
+		if (!this.record(a)) return;
 		this.sendLayoutAck(a);
 		this.compare(a);
+	}
+
+	/** The rules and the terms against the parent now, and the parent against the snapshot. */
+	private parentUnchanged(a: IAttempt): void {
+		const s = a.snapshot!;
+		const parent = this.preconditions(a.id);
+		this.recheck(a, parent);
+		if (
+			parent.txid !== s.txid ||
+			parent.outputIndex !== s.outputIndex ||
+			parent.height !== s.height ||
+			parent.localBalanceMsat !== s.localBalanceMsat ||
+			parent.remoteBalanceMsat !== s.remoteBalanceMsat
+		)
+			throw new Error(T.parent);
+	}
+
+	// ---- The attempt record (#2151 Step 4a) ----
+
+	/** The record's fields: the snapshot's parent, the digests and the candidate key. */
+	private attemptFields(a: IAttempt): IConversionAttemptFields {
+		const s = a.snapshot!;
+		return {
+			attempt: a.attempt!.toString('hex'),
+			peer: a.peer,
+			isInitiator: a.initiator,
+			isOpener: s.opener,
+			giver: a.terms!.giver,
+			direction: a.ctx!.direction,
+			parent: {
+				txid: s.txid,
+				outputIndex: s.outputIndex,
+				stateNumber: s.height.toString(),
+				type: s.type,
+				channelType: s.channelType
+			},
+			termsDigest: a.digest!.toString('hex'),
+			layoutDigest: a.layoutDigest!.toString('hex'),
+			planDigest: a.planDigest!.toString('hex'),
+			agreement: a.agreement!.toString('hex'),
+			keyIndex: a.keyIndex!
+		};
+	}
+
+	/**
+	 * Write the attempt record before the layout_ack (section 4.1 and
+	 * amendment A3). A failed write first reads the scope again: a last row
+	 * equal to this record in every field landed after all, and the attempt
+	 * is marked recorded so that its end withdraws it. The attempt then fails
+	 * with a fixed text, and the storage error is reported last. False once
+	 * the attempt failed.
+	 */
+	private record(a: IAttempt): boolean {
+		const fields = this.attemptFields(a);
+		try {
+			const records = this.records;
+			if (!records) throw new Error(NOT_RECORDED);
+			// An orphan of the channel is withdrawn first (amendment B1).
+			if (this.recordOpen(a.id)) throw new Error(OTHER_ATTEMPT);
+			a.recorded = records.recordConversionAttempt(a.id, fields);
+			return true;
+		} catch (error) {
+			try {
+				const open = this.records?.openConversionAttempt(a.id);
+				if (open) {
+					const { sequence, ...record } = open;
+					if (sameConversionAttempt(record, fields)) a.recorded = sequence;
+				}
+			} catch {
+				// Not recorded, as far as this side can tell.
+			}
+			try {
+				this.fail(a, NOT_RECORDED);
+			} finally {
+				this.deps.report(a.id, message(error));
+			}
+			return false;
+		}
+	}
+
+	/**
+	 * Withdraw the side's record, once (section 4.2): the canonical form of
+	 * `reason`, the side's own text or the peer's raw bytes. After a failed
+	 * write the record is an orphan, no longer held by the attempt: it goes
+	 * into the set of reported failures with its reason, and is withdrawn
+	 * when it is met (amendment B1). Returns the failure's report, which the
+	 * caller gives once its own state has changed (amendment A3).
+	 */
+	private withdraw(a: IAttempt, reason: string | Buffer): string | undefined {
+		if (a.recorded === undefined || a.withdrawing) return undefined;
+		a.withdrawing = true;
+		const sequence = a.recorded;
+		const attempt = a.attempt!.toString('hex');
+		const text = canonicalConversionReason(reason);
+		try {
+			const records = this.records;
+			if (!records) throw new Error(NOT_RECORDED);
+			records.withdrawConversionAttempt(a.id, sequence, attempt, text);
+			return undefined;
+		} catch (error) {
+			this.unwithdrawn.set(a.id, { sequence, attempt, reason: text });
+			return WITHDRAWAL_FAILED + message(error);
+		}
 	}
 
 	/** The engine's bitcoin facts for the host, fresh copies each call. */
@@ -1350,16 +1731,27 @@ export class AssetConversionTransport {
 		}
 	}
 
-	/** Send tx_abort with `text` and wait for the echo. */
+	/**
+	 * Send tx_abort with `text` and wait for the echo. A recorded attempt's
+	 * withdrawal is written first, so it precedes the tx_abort on the wire
+	 * (#2151 Step 4a, section 4.2). The attempt is aborting before the send
+	 * and before any report, so a listener that re-enters finds it so and
+	 * sends no second tx_abort.
+	 */
 	private abort(a: IAttempt, text: string): void {
 		if (a.ended || a.state === 'aborting') return;
-		this.sendAbort(a, text);
+		const failure = this.withdraw(a, text);
 		a.sent = text;
 		this.enter(a, 'aborting', () => {
 			// No echo: disconnect the peer.
 			this.end(a, text);
 			this.deps.disconnect(a.peer);
 		});
+		try {
+			this.sendAbort(a, text);
+		} finally {
+			if (failure) this.deps.report(a.id, failure);
+		}
 	}
 
 	private enter(
@@ -1369,14 +1761,20 @@ export class AssetConversionTransport {
 	): void {
 		a.state = state;
 		this.clearTimers(a);
-		a.phase = this.timer(PHASE_BOUND_MS, () =>
-			this.enqueue(a, () => {
-				if (a.state === state) expire();
+		// At once, outside the queue (#2151 Step 4a, section 1.2).
+		a.phase = this.timer(
+			PHASE_BOUND_MS,
+			this.bounded(a, () => {
+				if (!a.ended && a.state === state) expire();
 			})
 		);
 	}
 
-	/** Release the hold, forget the attempt, then tell the host when it verified the terms. */
+	/**
+	 * Release the hold, forget the attempt, withdraw its record when neither
+	 * abort nor the peer's tx_abort did (a disconnect, a destroy or the
+	 * phase bound), then tell the host when it verified the terms.
+	 */
 	private end(a: IAttempt, text: string): void {
 		if (a.ended) return;
 		a.ended = true;
@@ -1384,18 +1782,21 @@ export class AssetConversionTransport {
 		a.held = false;
 		this.clearTimers(a);
 		if (this.attempts.get(a.id) === a) this.attempts.delete(a.id);
+		const failure = this.withdraw(a, text);
 		if (a.initiator && a.state === 'announced' && !a.replied && a.attempt)
 			this.rememberWithdrawn(a.id, a.peer, a.attempt);
-		if (!a.verified || !a.ctx || !this.host) return;
-		const host = this.host,
-			ctx = this.ctxCopy(a);
-		void this.hostCall(() => host.abandonConversion(ctx, text)).then((r) => {
-			if (!r.ok && r.error !== undefined)
-				this.deps.report(
-					a.id,
-					'Asset conversion host abandon failed: ' + r.error
-				);
-		});
+		if (a.verified && a.ctx && this.host) {
+			const host = this.host,
+				ctx = this.ctxCopy(a);
+			void this.hostCall(() => host.abandonConversion(ctx, text)).then((r) => {
+				if (!r.ok && r.error !== undefined)
+					this.deps.report(
+						a.id,
+						'Asset conversion host abandon failed: ' + r.error
+					);
+			});
+		}
+		if (failure) this.deps.report(a.id, failure);
 	}
 
 	private rememberWithdrawn(id: string, peer: string, attempt: Buffer): void {
@@ -1437,9 +1838,12 @@ export class AssetConversionTransport {
 		return a;
 	}
 
+	/** The deadline runs at once, outside the queue (#2151 Step 4a, section 1.2). */
 	private armDeadline(a: IAttempt): void {
-		a.deadline = this.timer(this.deadlineMs, () =>
-			this.enqueue(a, () => {
+		a.deadline = this.timer(
+			this.deadlineMs,
+			this.bounded(a, () => {
+				if (a.ended) return;
 				if (a.state === 'announced' || a.state === 'starting')
 					this.fail(a, WITHDRAWN);
 				else this.fail(a, TIMED_OUT);
@@ -1473,6 +1877,40 @@ export class AssetConversionTransport {
 				this.deps.report(a.id, message(error));
 				this.fail(a, message(error));
 			});
+	}
+
+	/**
+	 * A bound's callback, run at once and contained as the queue contains its
+	 * work (amendment A2): a throw fails the attempt and is then reported
+	 * once (amendment B5). The attempt ends with the error's text when that
+	 * fail throws too, or when the attempt is left aborting, whose tx_abort
+	 * may never have left (amendment A9). Nothing escapes the timer.
+	 */
+	private bounded(a: IAttempt, run: () => void): () => void {
+		return () => {
+			try {
+				run();
+			} catch (error) {
+				if (a.ended) return;
+				const text = message(error);
+				let failed = false;
+				try {
+					this.fail(a, text);
+				} catch {
+					failed = true;
+				}
+				try {
+					if (failed || a.state === 'aborting') this.end(a, text);
+				} catch {
+					// Nothing escapes a timer.
+				}
+				try {
+					this.deps.report(a.id, text);
+				} catch {
+					// Nothing escapes a timer.
+				}
+			}
+		};
 	}
 
 	/** Throws the end's text once the attempt ended. */

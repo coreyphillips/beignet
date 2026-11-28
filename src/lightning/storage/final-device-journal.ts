@@ -10,11 +10,16 @@ const scopes = [
 	'output-claim',
 	'htlc-timeout',
 	'channel-type',
-	'conversion'
+	'conversion',
+	'conversion-attempt'
 ] as const;
 type Scope = (typeof scopes)[number] | 'asset-recovery-frame';
 /** The scopes a generation 6 wallet adds (#2151): reconciled only there. */
-const conversionScopes: readonly Scope[] = ['channel-type', 'conversion'];
+const conversionScopes: readonly Scope[] = [
+	'channel-type',
+	'conversion',
+	'conversion-attempt'
+];
 
 /** The scopes a wallet of this kind reconciles: the conversion scopes only in generation 6. */
 export function finalJournalScopes(conversion: boolean): readonly Scope[] {

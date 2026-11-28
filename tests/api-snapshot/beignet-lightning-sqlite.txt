@@ -861,5 +861,5 @@ property WireUpdate.type: beignet/lightning#message.MessageType
 unexported const boundWallet: unique symbol
 unexported function driveFinalSimpleClose(id: string, candidate: IFinalCloseFunding, opening: IFinalOpeningNonces, context: Buffer, authority: FinalOpeningAuthority, root: bip32#BIP32Interface, identity: string, close: IFinalSimpleCloseState, view: IFinalCloseView, req: IFinalCloseRequest): { messages: IFinalOpeningMessage[]; transaction?: Buffer; }
 unexported const finalWalletStorage: unique symbol
-unexported const scopes: readonly [ "splice", "asset-splice", "simple-close", "output-claim", "htlc-timeout", "channel-type", "conversion" ]
+unexported const scopes: readonly [ "splice", "asset-splice", "simple-close", "output-claim", "htlc-timeout", "channel-type", "conversion", "conversion-attempt" ]
 unexported function verifyAssetSpliceCandidate(layout: IAssetSpliceLayout, acknowledged: Buffer, isInitiator: boolean, frozen: bitcoinjs-lib#Transaction, verified: { layoutDigest: Buffer; transaction: Buffer; fundingRoot: Buffer; proofDigest: Buffer; fundingProofs?: Buffer; }, authorizations: Pair<Buffer>): { terms: IFinalSpliceTerms; candidate: IFinalSpliceCandidate; balances: IAssetSpliceBalancePlan; layoutDigest: Buffer; digest: Buffer; }

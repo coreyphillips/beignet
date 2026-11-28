@@ -29,7 +29,9 @@ export class FinalCommitmentTransport {
 			message: IFinalOpeningMessage
 		) => void,
 		/** A conversion holds the channel against local adds and fee updates (#2151). */
-		private readonly held: (id: string) => boolean = () => false
+		private readonly held: (id: string) => boolean = () => false,
+		/** A live conversion attempt's record on disk keeps the channel quiet: no local update of any type (#2151 Step 4a). */
+		private readonly quiet: (id: string) => boolean = () => false
 	) {}
 
 	private requireReady(id: string): void {
@@ -44,9 +46,10 @@ export class FinalCommitmentTransport {
 		if (!isFinalCommitmentUpdate(type))
 			throw new Error('Invalid final commitment update');
 		if (
-			(type === MessageType.UPDATE_ADD_HTLC ||
+			((type === MessageType.UPDATE_ADD_HTLC ||
 				type === MessageType.UPDATE_FEE) &&
-			this.held(id)
+				this.held(id)) ||
+			this.quiet(id)
 		)
 			throw new Error(ASSET_CONVERSION_TEXTS.held);
 		const { storage, root } = this.runtime;

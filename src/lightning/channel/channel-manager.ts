@@ -1331,7 +1331,8 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 					this.assetSplice?.resume(peer, id);
 					this.assetUpdates?.resume(peer, id);
 				},
-				(id) => !!this.assetConversion?.held(id)
+				(id) => !!this.assetConversion?.held(id),
+				(id) => this.conversionQuiet(id)
 			);
 			const host = config.auxiliaryChannels?.dualFunding;
 			const recovery = config.finalOpening.storage.canRecoverAssetSplice;
@@ -1399,7 +1400,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 							this.emit('broadcast:tx', exit);
 						}
 					},
-					(id) => !!this.assetConversion?.held(id)
+					(id) => !!this.assetConversion?.held(id) || this.conversionQuiet(id)
 				);
 				if (hasAssetUpdateHost(host)) {
 					this.assetUpdates = new AssetSpliceUpdateTransport(
@@ -1447,7 +1448,8 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 								)
 							);
 						},
-						(id) => !!this.assetConversion?.held(id)
+						(id) => !!this.assetConversion?.held(id),
+						(id) => this.conversionQuiet(id)
 					);
 				}
 			}
@@ -1530,6 +1532,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 				report: (id, reason): void =>
 					this.emitContained('error', Buffer.from(id, 'hex'), reason),
 				timeoutMs: config.quiescenceTimeoutMs,
+				storage: config.finalOpening?.storage,
 				// Called as a method of the config, as its other callbacks are.
 				feerateEstimate: config.conversionFeerateEstimate
 					? (): Promise<number | null | undefined> =>
@@ -1537,6 +1540,20 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 					: undefined
 			}
 		);
+		// The startup sweep (#2151 Step 4a, section 4.5): every attempt record
+		// an earlier process left open is withdrawn here, before anything can
+		// dial or accept a peer. It never throws.
+		this.assetConversion.sweep();
+	}
+
+	/**
+	 * Whether a live conversion attempt of the channel holds its open record
+	 * on disk, so the channel is quiet (#2151 Step 4a, section 3 and
+	 * amendment B1): no local update and no splice start of either kind.
+	 * Separate from the in-memory hold.
+	 */
+	private conversionQuiet(id: string): boolean {
+		return !!this.assetConversion?.quiet(id);
 	}
 
 	private deliverFinalUpdate(
@@ -10541,7 +10558,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 	}
 	startFinalSplice(id: Buffer, plan: FinalSplicePlan): void {
 		const hex = id.toString('hex');
-		if (this.assetConversion?.held(hex))
+		if (this.assetConversion?.held(hex) || this.conversionQuiet(hex))
 			throw new Error(ASSET_CONVERSION_TEXTS.held);
 		const r = this.config.finalOpening;
 		const peer = r?.storage.loadFinalOpeningSession(hex)?.peer;
