@@ -10,7 +10,6 @@ unexported type EventMap<E> = { [K in keyof E]: (...args: any[]) => void; }
 unexported type FinalFundingWitnessSigner = (unsigned: bitcoinjs-lib#Transaction, indices: readonly number[], prevouts: Prevouts) => Buffer[][]
 unexported type FinalSplicePlan = Pick<IFinalSpliceIntent, 'localDelta' | 'feeBudget' | 'feerate' | 'locktime' | 'inputs' | 'outputs'>
 unexported type Holder = 'local' | 'remote'
-unexported type IAssetExitBranch = { type: 'asset'; feeratePerKw: number; } & IAssetSpliceExitBranch
 unexported interface IAssetOpenLayout
 property IAssetOpenLayout.acceptHash: Buffer
 property IAssetOpenLayout.acceptorProposalHash: Buffer
@@ -164,7 +163,6 @@ property IFinalCommitmentView.keys: channel.ICommitmentKeys
 property IFinalCommitmentView.outputMap: script.ICommitmentTxResult['outputMap']
 property IFinalCommitmentView.toSelfDelay: number
 property IFinalCommitmentView.tx: bitcoinjs-lib#Transaction
-unexported type IFinalExitBranch = IAssetExitBranch | IPlainExitBranch
 unexported interface IFinalFundingReference
 property IFinalFundingReference.fundingOutputIndex: number
 property IFinalFundingReference.fundingTxHex: string
@@ -273,17 +271,6 @@ unexported interface ILedgerTransitionResult<R extends ILedgerRecord>
 property ILedgerTransitionResult.actualState?: string
 property ILedgerTransitionResult.outcome: LedgerTransitionOutcome
 property ILedgerTransitionResult.record?: R
-unexported interface IPlainExitBranch
-property IPlainExitBranch.channelType: string
-property IPlainExitBranch.funding: IFinalFundingReference
-property IPlainExitBranch.fundingTxid: string
-property IPlainExitBranch.localCommitment: string
-property IPlainExitBranch.localRecovery: IPlainHolderRecovery
-property IPlainExitBranch.minimumDepth: number
-property IPlainExitBranch.outputIndex: number
-property IPlainExitBranch.remoteCommitment: string
-property IPlainExitBranch.remoteRecovery: IPlainHolderRecovery
-property IPlainExitBranch.type: 'plain'
 unexported interface IPlainHolderRecovery
 property IPlainHolderRecovery.feeratePerKw: number
 property IPlainHolderRecovery.htlcs: [ ]
@@ -2062,10 +2049,10 @@ interface channel.IAssetConversionExitEvidence
 property channel.IAssetConversionExitEvidence.candidate: Record<'local' | 'remote', channel.IAssetOpenExit> | null
 property channel.IAssetConversionExitEvidence.parent: Record<'local' | 'remote', channel.IAssetOpenExit> | null
 interface channel.IAssetConversionExitReceipt
-property channel.IAssetConversionExitReceipt.candidate: IFinalExitBranch
+property channel.IAssetConversionExitReceipt.candidate: channel.IFinalExitBranch
 property channel.IAssetConversionExitReceipt.channelId: string
 property channel.IAssetConversionExitReceipt.finalDigest: string
-property channel.IAssetConversionExitReceipt.parent: IFinalExitBranch
+property channel.IAssetConversionExitReceipt.parent: channel.IFinalExitBranch
 property channel.IAssetConversionExitReceipt.stateNumber: string
 property channel.IAssetConversionExitReceipt.withdrawals: readonly channel.IAssetConversionWithdrawalReceipt[]
 interface channel.IAssetConversionFunding
@@ -2133,6 +2120,7 @@ property channel.IAssetConversionWithdrawalReceipt.assetId: string
 property channel.IAssetConversionWithdrawalReceipt.outputIndex: number
 property channel.IAssetConversionWithdrawalReceipt.proof: string
 property channel.IAssetConversionWithdrawalReceipt.units: string
+type channel.IAssetExitBranch = { type: 'asset'; feeratePerKw: number; } & IAssetSpliceExitBranch
 interface channel.IAssetFundingLineageEntry
 property channel.IAssetFundingLineageEntry.fundingOutputIndex: number
 property channel.IAssetFundingLineageEntry.fundingTxHex: string
@@ -2918,6 +2906,7 @@ property channel.IErrorAction.code?: channel.ChannelErrorCode
 property channel.IErrorAction.message: string
 property channel.IErrorAction.transient?: boolean
 property channel.IErrorAction.type: channel.ChannelActionType.ERROR
+type channel.IFinalExitBranch = channel.IAssetExitBranch | channel.IPlainExitBranch
 interface channel.IForceCloseAction
 property channel.IForceCloseAction.channelId: Buffer
 property channel.IForceCloseAction.commitmentTx: Buffer
@@ -3010,6 +2999,17 @@ property channel.IPerChannelKeys.perCommitmentSeed: Buffer
 property channel.IPerChannelKeys.revocationBasepointSecret?: Buffer
 interface channel.IPersistStateAction
 property channel.IPersistStateAction.type: channel.ChannelActionType.PERSIST_STATE
+interface channel.IPlainExitBranch
+property channel.IPlainExitBranch.channelType: string
+property channel.IPlainExitBranch.funding: IFinalFundingReference
+property channel.IPlainExitBranch.fundingTxid: string
+property channel.IPlainExitBranch.localCommitment: string
+property channel.IPlainExitBranch.localRecovery: IPlainHolderRecovery
+property channel.IPlainExitBranch.minimumDepth: number
+property channel.IPlainExitBranch.outputIndex: number
+property channel.IPlainExitBranch.remoteCommitment: string
+property channel.IPlainExitBranch.remoteRecovery: IPlainHolderRecovery
+property channel.IPlainExitBranch.type: 'plain'
 interface channel.IPreimageLearnedAction
 property channel.IPreimageLearnedAction.paymentHash: Buffer
 property channel.IPreimageLearnedAction.preimage: Buffer

@@ -142,7 +142,6 @@ method GuardianStore.updateRegistrationReceipt(recoveryId: Buffer, issuedAt: Buf
 method GuardianStore.usageBytes(recoveryId?: Buffer): number
 method GuardianStore.write<T>(fn: () => T): T
 unexported type Holder = 'local' | 'remote'
-unexported type IAssetExitBranch = { type: 'asset'; feeratePerKw: number; } & IAssetSpliceExitBranch
 unexported interface IAssetOpeningEvidence
 property IAssetOpeningEvidence.finalDigest: string
 property IAssetOpeningEvidence.fundingProofs: string
@@ -291,9 +290,9 @@ property IFinalCloseView.pending: unknown
 property IFinalCloseView.remoteBalanceMsat: bigint
 property IFinalCloseView.remoteHeight: bigint
 unexported interface IFinalConversionExits
-property IFinalConversionExits.candidate: IFinalExitBranch
+property IFinalConversionExits.candidate: beignet/lightning#channel.IFinalExitBranch
 property IFinalConversionExits.digest: string
-property IFinalConversionExits.parent: IFinalExitBranch
+property IFinalConversionExits.parent: beignet/lightning#channel.IFinalExitBranch
 property IFinalConversionExits.stateNumber: string
 unexported interface IFinalDaemonOpening
 property IFinalDaemonOpening.candidate: IFinalOpeningCandidate
@@ -301,7 +300,6 @@ property IFinalDaemonOpening.exitToBroadcast?: Buffer
 property IFinalDaemonOpening.funding?: Buffer
 property IFinalDaemonOpening.readyExchanged?: true
 property IFinalDaemonOpening.session: IFinalOpeningSession
-unexported type IFinalExitBranch = IAssetExitBranch | IPlainExitBranch
 unexported interface IFinalFundingReference
 property IFinalFundingReference.fundingOutputIndex: number
 property IFinalFundingReference.fundingTxHex: string
@@ -547,23 +545,6 @@ interface IPaymentRowMatch
 property IPaymentRowMatch.direction?: string
 property IPaymentRowMatch.metadata?: { key: string; value?: string; }
 property IPaymentRowMatch.status?: string
-unexported interface IPlainExitBranch
-property IPlainExitBranch.channelType: string
-property IPlainExitBranch.funding: IFinalFundingReference
-property IPlainExitBranch.fundingTxid: string
-property IPlainExitBranch.localCommitment: string
-property IPlainExitBranch.localRecovery: IPlainHolderRecovery
-property IPlainExitBranch.minimumDepth: number
-property IPlainExitBranch.outputIndex: number
-property IPlainExitBranch.remoteCommitment: string
-property IPlainExitBranch.remoteRecovery: IPlainHolderRecovery
-property IPlainExitBranch.type: 'plain'
-unexported interface IPlainHolderRecovery
-property IPlainHolderRecovery.feeratePerKw: number
-property IPlainHolderRecovery.htlcs: [ ]
-property IPlainHolderRecovery.localBalanceMsat: string
-property IPlainHolderRecovery.point: string
-property IPlainHolderRecovery.remoteBalanceMsat: string
 interface IQueueEntryRow
 property IQueueEntryRow.amountSats?: number
 property IQueueEntryRow.bolt11: string

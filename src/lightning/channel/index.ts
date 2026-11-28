@@ -15,6 +15,12 @@ export * from './dual-funding';
 export * from './auxiliary';
 export * from './auxiliary-funding';
 export * from './asset-opening-provider';
+// The receipt's branches (#2151 Step 4b, 9.2).
+export type {
+	IAssetExitBranch,
+	IFinalExitBranch,
+	IPlainExitBranch
+} from '../storage/final-conversion-exits';
 export {
 	assetConversionTermsDigest,
 	canonicalAssetConversionTerms,
