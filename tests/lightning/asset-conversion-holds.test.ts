@@ -471,7 +471,7 @@ describe('Crossings (#2151 step 3a, test 10)', function () {
 		});
 
 	for (const kind of ['plain', 'asset'] as const)
-		it(`disconnects the peer when aborting has no echo for 15 seconds on a ${kind} channel`, async () => {
+		it(`disconnects the peer when aborting has no echo for 30 seconds after the 4b fence on a ${kind} channel`, async () => {
 			const p = await conversionPair(s, kind);
 			clock = sinon.useFakeTimers({
 				now: Date.now(),
@@ -485,7 +485,9 @@ describe('Crossings (#2151 step 3a, test 10)', function () {
 					.filter((m) => m.from === 0 && m.name === 'TX_ABORT')
 					.map(abortText)
 			).to.deep.equal([FENCE]);
-			await tick(p, clock, 14_000);
+			// The 4b fence follows the candidate commitment_signed, so its echo
+			// bound is the host bound plus the phase bound (V2).
+			await tick(p, clock, 29_000);
 			expect(p.recycled[0]).to.deep.equal([]);
 			await tick(p, clock, 1_500);
 			expect(p.recycled[0]).to.deep.equal([p.nodeIds[1]]);
