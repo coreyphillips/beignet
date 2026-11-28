@@ -5,8 +5,13 @@
  * terms digest and the target type. Each side then sends its host's
  * proposal as its `layout`, builds and checks the layout the hosts
  * describe, and sends its agreement digest in `layout_ack`. Once the two
- * agree, the attempt stops at a fence before signing: the initiator sends
- * `tx_abort` and the channel goes on at its parent, unchanged.
+ * agree (#2151 Step 4b), both sides consent and authorize the assets,
+ * freeze the funding transaction, run its interactive construction, sign
+ * and check both branches' exits and the candidate's first commitments,
+ * and retain both branches. The attempt then stops at a fence before any
+ * funding signature: the initiator sends `tx_abort`, each side drops its
+ * retained candidate and withdraws its record, and the channel goes on at
+ * its parent, unchanged.
  *
  * An attempt lives in memory, and nothing is replayed after a reconnect.
  * From its `layout_ack` on, a side's attempt is also on disk (#2151 Step 4a):
@@ -16,8 +21,9 @@
  * the manager refuses every local update and every splice or conversion
  * start. The manager's constructor withdraws whatever an earlier process
  * left open, and a record no live attempt holds is withdrawn when it is met.
- * The only other durable write is each side's candidate funding key
- * allocation.
+ * The other durable writes are each side's candidate funding key
+ * allocation, the signer's claims of the candidate's commitment signatures,
+ * and the retained candidate (`conversion-exits`) with its drop.
  */
 import { Transaction } from 'bitcoinjs-lib';
 import { REGTEST_CHAIN_HASH } from '../chain/hashes';
@@ -42,9 +48,11 @@ import {
 	encodeCustomMessage
 } from '../message/custom';
 import { decodeBolt1String, encodeBolt1String } from '../message/field-rules';
+import { decodeCommitmentSignedMessage } from '../message/channel-commitment';
 import {
 	decodeTxAbortMessage,
-	encodeTxAbortMessage
+	encodeTxAbortMessage,
+	encodeTxCompleteMessage
 } from '../message/interactive-tx';
 import {
 	decodeSpliceAckMessage,
@@ -79,16 +87,30 @@ import {
 	ASSET_CONVERSION_LAYOUT_TEXTS,
 	assetConversionAgreementDigest,
 	assetConversionLayoutDigest,
+	assetConversionCheckpointDigest,
 	checkConversionLayout,
 	describedConversionLayout,
+	FROZEN_CONVERSION_TEXT,
+	verifyConversionCandidate,
 	type IAssetConversionLayout
 } from './asset-conversion-layout';
 import type {
 	AssetOpenPair,
 	IAssetConversionBitcoin,
 	IAssetConversionContext,
-	IAssetConversionHost
+	IAssetConversionFunding,
+	IAssetConversionHost,
+	IAssetConversionPlan
 } from './asset-opening-provider';
+import {
+	CONVERSION_SIGNING_TEXTS,
+	ConversionSigningExchange
+} from './asset-conversion-signing';
+import {
+	CONVERSION_ROUND_TEXTS,
+	ConversionSignatureRound,
+	type VerifiedConversionExits
+} from './asset-conversion-signature-round';
 import type { IFinalOpeningRuntime } from './final-opening-runtime';
 import { isFinalCommitmentUpdate } from './final-commitment-transport';
 import { MAX_SPLICE_FEERATE_PERKW } from './splice-weight';
@@ -105,7 +127,7 @@ const DISCONNECTED = 'Peer disconnected';
 const PEER_FIRST = 'Peer started quiescence first';
 const PEER_GOES_FIRST = "Peer's conversion of this channel goes first";
 const FENCE =
-	'Asset conversion stops before its layout is signed in this build';
+	'Asset conversion stops before its funding is signed in this build';
 const PEER_UPDATED = 'Peer updated the channel during conversion quiescence';
 const KEY_FAILED = 'Asset conversion could not allocate a funding key';
 const INIT_MISMATCH = 'Asset conversion splice_init does not match its terms';
@@ -125,6 +147,19 @@ const MARGIN = 'Invalid asset conversion feerate margin';
 const NOT_RECORDED = CONVERSION_ATTEMPT_TEXTS.notRecorded;
 const WITHDRAWAL_FAILED = 'Asset conversion withdrawal could not be recorded: ';
 const RESTART = 'Asset conversion ended by a restart';
+// The signing phases (#2151 Step 4b).
+const CONSENT = 'Asset conversion host could not consent';
+const AUTHORIZE = 'Asset conversion host could not authorize the assets';
+const FINALIZE = 'Asset conversion host could not finalize the funding';
+const SIGN = CONVERSION_ROUND_TEXTS.sign;
+const VERIFY = CONVERSION_ROUND_TEXTS.verify;
+const RETAIN = CONVERSION_ROUND_TEXTS.retain;
+const FINAL_ACK = 'Peers disagree on the final asset conversion funding';
+const CHECKPOINT =
+	'Asset conversion peers disagree on the frozen transaction or signing nonces';
+const PREMATURE_SIGNING = CONVERSION_SIGNING_TEXTS.premature;
+/** Thrown when an await finds its attempt ended or moved on: nothing more is done. */
+const STALE = new Error('Asset conversion attempt moved on');
 
 /** The plain target type, without the alias bit. */
 const PLAIN_TARGET_TYPE_HEX = '0100000000000000000000';
@@ -147,6 +182,13 @@ type State =
 	| 'quiesced'
 	// Either side: its own layout sent (#2151 step 3b).
 	| 'laid-out'
+	// Either side, after equal layout_acks (#2151 Step 4b): the consents,
+	// authorizations and final_acks; the construction and its checkpoint;
+	// the exit shares and both commitment_signed; then its retain returned.
+	| 'agreed'
+	| 'constructing'
+	| 'securing'
+	| 'secured'
 	// Its own tx_abort sent, waiting for the echo.
 	| 'aborting'
 	// The acceptor's decline sent after its accept.
@@ -189,6 +231,25 @@ interface IAttempt {
 	agreement?: Buffer;
 	/** The peer's layout_ack value. */
 	peerAck?: Buffer;
+	/** The checked layout and the host's plan (#2151 Step 4b). */
+	layout?: IAssetConversionLayout;
+	plan?: IAssetConversionPlan;
+	/** The attempt reached equal layout_acks. */
+	signing?: boolean;
+	exchange?: ConversionSigningExchange;
+	round?: ConversionSignatureRound;
+	/** The frozen candidate's txid, in internal byte order. */
+	candidateHash?: Buffer;
+	handle?: VerifiedConversionExits;
+	/** Our candidate commitment_signed left. */
+	ownCommitSent?: boolean;
+	/** The peer's candidate commitment_signed was taken by handle. */
+	peerCommitSeen?: boolean;
+	peerCommit?: Buffer;
+	/** The retained candidate's final digest. */
+	retained?: string;
+	/** The host was told of the end (#2151 Step 4b, Z1): at the side's own tx_abort, or at the end. */
+	told?: boolean;
 	/** The scope sequence of the side's attempt record, once it is on disk (#2151 Step 4a). */
 	recorded?: number;
 	/** The record's withdrawal was tried: written, or its failure handled. */
@@ -217,15 +278,64 @@ const HOST_MEMBERS = [
 	'abandonConversion',
 	'proposeConversion',
 	'describeConversion',
-	'prepareConversion'
+	'prepareConversion',
+	'signConversionExits',
+	'verifyConversionExits',
+	'retainConversionExits'
 ] as const;
+
+/** The states after equal layout_acks (#2151 Step 4b). */
+const SIGNING: ReadonlySet<State> = new Set<State>([
+	'agreed',
+	'constructing',
+	'securing',
+	'secured'
+]);
+/** What an attempt in a signing state owns, besides its candidate's commitment_signed. */
+const SIGNING_TYPES: ReadonlySet<number> = new Set([
+	M.STFU,
+	M.SPLICE,
+	M.SPLICE_ACK,
+	M.TX_ABORT,
+	M.TX_ADD_INPUT,
+	M.TX_ADD_OUTPUT,
+	M.TX_REMOVE_INPUT,
+	M.TX_REMOVE_OUTPUT,
+	M.TX_COMPLETE,
+	M.TX_SIGNATURES,
+	M.TX_INIT_RBF,
+	M.TX_ACK_RBF
+]);
+/** The construction messages a signing attempt drops while it aborts. */
+const CONSTRUCTION: ReadonlySet<number> = new Set([
+	M.TX_ADD_INPUT,
+	M.TX_ADD_OUTPUT,
+	M.TX_REMOVE_INPUT,
+	M.TX_REMOVE_OUTPUT,
+	M.TX_COMPLETE
+]);
+/** The turns the construction takes. */
+const TURNS: ReadonlySet<number> = new Set([
+	M.TX_ADD_INPUT,
+	M.TX_ADD_OUTPUT,
+	M.TX_COMPLETE
+]);
+
+const bytesIn = (v: unknown, min: number, max: number): v is Buffer =>
+	Buffer.isBuffer(v) && v.length >= min && v.length <= max;
+const pairCopy = (p: AssetOpenPair<Buffer>): AssetOpenPair<Buffer> => [
+	Buffer.from(p[0]),
+	Buffer.from(p[1])
+];
+const isRecord = (v: unknown): v is Record<string, unknown> =>
+	!!v && typeof v === 'object' && !Array.isArray(v);
 
 const validMargin = (margin: unknown): margin is number =>
 	Number.isSafeInteger(margin) &&
 	(margin as number) >= 0 &&
 	(margin as number) <= MAX_SPLICE_FEERATE_PERKW;
 
-/** Whether a host has the whole conversion surface: version 1, a margin in bounds and the six members. */
+/** Whether a host has the whole conversion surface: version 1, a margin in bounds and the nine members. */
 export function completeAssetConversionHost(
 	host: unknown
 ): host is IAssetConversionHost {
@@ -381,6 +491,17 @@ export class AssetConversionTransport {
 	 * no sequence, once the host is told or when that first count was even.
 	 */
 	private readonly untold = new Map<string, number | undefined>();
+	/**
+	 * The candidate of the channel's last attempt that reached `finalize`
+	 * (#2151 Step 4b, W1), until the peer disconnects: a late
+	 * `commitment_signed` naming it is dropped, and writes nothing.
+	 */
+	private readonly tombstones = new Map<
+		string,
+		{ peer: string; candidate: Buffer }
+	>();
+	/** Each received commitment_signed's decoded funding_txid, decoded once. */
+	private readonly fundingTxids = new WeakMap<Buffer, Buffer | null>();
 
 	constructor(
 		private readonly runtime: IFinalOpeningRuntime | undefined,
@@ -694,17 +815,38 @@ export class AssetConversionTransport {
 	 */
 	handle(peer: string, type: number, payload: Buffer): boolean {
 		if (payload.length < 32) return false;
-		const a = this.attempts.get(payload.subarray(0, 32).toString('hex'));
-		if (!a || a.peer !== peer || !this.owns(a, type)) return false;
+		const id = payload.subarray(0, 32).toString('hex');
+		const a = this.attempts.get(id);
+		if (!a || a.peer !== peer || !this.owns(a, type, payload))
+			return this.tombstoned(peer, id, type, payload);
 		if (a.state === 'announced') {
 			// Observed only.
 			if (payload.length === 33 && payload[32] === 1) this.end(a, PEER_FIRST);
 			return false;
 		}
 		if (type === M.TX_ABORT) {
-			// Taken at once, not behind the attempt's queue.
-			this.peerAbort(a, payload);
+			// Taken at once, not behind the attempt's queue, except once our
+			// candidate commitment_signed left and the peer's arrived: then it
+			// waits behind that commitment_signed's handler, so our retain
+			// comes first (#2151 Step 4b, W2).
+			if (
+				(a.state === 'securing' || a.state === 'secured') &&
+				a.ownCommitSent &&
+				a.peerCommitSeen
+			) {
+				const raw = Buffer.from(payload);
+				this.enqueue(a, () => this.peerAbort(a, raw));
+			} else this.peerAbort(a, payload);
 			return true;
+		}
+		if (type === M.COMMITMENT_SIGNED && SIGNING.has(a.state)) {
+			a.peerCommitSeen = true;
+			// A second copy is judged at once (V5): an identical one is
+			// dropped, and one that differs is unexpected.
+			if (a.peerCommit) {
+				if (!a.peerCommit.equals(payload)) this.fail(a, UNEXPECTED);
+				return true;
+			}
 		}
 		if (
 			a.state === 'accepted' &&
@@ -740,7 +882,55 @@ export class AssetConversionTransport {
 			type !== M.START_BATCH
 		)
 			return;
+		// The candidate's commitment_signed is not a peer update (#2151 Step
+		// 4b), and nor is a late one naming a tombstoned candidate.
+		if (type === M.COMMITMENT_SIGNED && payload.length >= 32) {
+			const id = payload.subarray(0, 32).toString('hex');
+			const a = this.attempts.get(id);
+			if (
+				(a && a.peer === peer && this.namesCandidate(a, payload)) ||
+				this.tombstoned(peer, id, type, payload)
+			)
+				return;
+		}
 		this.observeChannel(peer, payload);
+	}
+
+	/** A commitment_signed's decoded funding_txid (internal order), decoded once; null when it has none or does not decode. */
+	private fundingTxidOf(payload: Buffer): Buffer | null {
+		const known = this.fundingTxids.get(payload);
+		if (known !== undefined) return known;
+		let txid: Buffer | null = null;
+		try {
+			txid = decodeCommitmentSignedMessage(payload).fundingTxid ?? null;
+		} catch {
+			txid = null;
+		}
+		this.fundingTxids.set(payload, txid);
+		return txid;
+	}
+
+	/** A commitment_signed of a signing or aborting attempt naming its candidate. */
+	private namesCandidate(a: IAttempt, payload: Buffer): boolean {
+		if (!a.candidateHash || !(SIGNING.has(a.state) || a.state === 'aborting'))
+			return false;
+		return !!this.fundingTxidOf(payload)?.equals(a.candidateHash);
+	}
+
+	/** A late commitment_signed naming the channel's tombstoned candidate: dropped. */
+	private tombstoned(
+		peer: string,
+		id: string,
+		type: number,
+		payload: Buffer
+	): boolean {
+		if (type !== M.COMMITMENT_SIGNED) return false;
+		const t = this.tombstones.get(id);
+		return (
+			!!t &&
+			t.peer === peer &&
+			!!this.fundingTxidOf(payload)?.equals(t.candidate)
+		);
 	}
 
 	/** An `ASSET_UPDATE` frame, which begins with its channel id. */
@@ -758,6 +948,7 @@ export class AssetConversionTransport {
 				(a.state === 'quiescing' && a.peerStfu) ||
 				a.state === 'init-sent' ||
 				a.state === 'laid-out' ||
+				SIGNING.has(a.state) ||
 				(a.state === 'quiesced' && a.ownStfu)
 			)
 		)
@@ -767,8 +958,10 @@ export class AssetConversionTransport {
 
 	/**
 	 * Whether a subtype 98 frame names a live attempt of the peer's that
-	 * owns envelope frames: the initiator's in `init-sent`, or either side's
-	 * in `laid-out`. Side-effect free.
+	 * owns envelope frames: a layout or layout_ack the initiator's in
+	 * `init-sent` or either side's in `laid-out`, and a signing frame (phases
+	 * 1, 2, 3, 5 and 6) either side's in a signing state (#2151 Step 4b).
+	 * Side-effect free.
 	 */
 	ownsFrame(peer: string, raw: Buffer): boolean {
 		return !!this.frameOwner(peer, raw);
@@ -777,15 +970,65 @@ export class AssetConversionTransport {
 	private frameOwner(peer: string, raw: Buffer): IAttempt | undefined {
 		if (!Buffer.isBuffer(raw) || raw.length < 34) return undefined;
 		const attempt = raw.subarray(2, 34);
+		const signing = raw[1] !== 0 && raw[1] !== 4;
 		for (const a of this.attempts.values())
 			if (
 				a.peer === peer &&
 				!a.ended &&
 				!!a.attempt?.equals(attempt) &&
-				(a.state === 'laid-out' || (a.initiator && a.state === 'init-sent'))
+				(signing
+					? SIGNING.has(a.state)
+					: a.state === 'laid-out' ||
+					  SIGNING.has(a.state) ||
+					  (a.initiator && a.state === 'init-sent'))
 			)
 				return a;
 		return undefined;
+	}
+
+	/**
+	 * Whether a consent of subtype 99 names, at its bytes 1 to 33, a live
+	 * attempt of the peer's in `laid-out` or a signing state (#2151 Step 4b).
+	 * Side-effect free.
+	 */
+	ownsConsent(peer: string, raw: Buffer): boolean {
+		return !!this.consentOwner(peer, raw);
+	}
+
+	private consentOwner(peer: string, raw: Buffer): IAttempt | undefined {
+		if (!Buffer.isBuffer(raw) || raw.length < 33) return undefined;
+		const attempt = raw.subarray(1, 33);
+		for (const a of this.attempts.values())
+			if (
+				a.peer === peer &&
+				!a.ended &&
+				!!a.attempt?.equals(attempt) &&
+				(a.state === 'laid-out' || SIGNING.has(a.state))
+			)
+				return a;
+		return undefined;
+	}
+
+	/** A consent the attempt owns, in its queue: premature before the agreement. */
+	consent(peer: string, raw: Buffer): void {
+		const a = this.consentOwner(peer, raw);
+		if (!a) return;
+		const copy = Buffer.from(raw);
+		this.enqueue(a, async () => {
+			if (a.state === 'laid-out') {
+				this.fail(a, PREMATURE_SIGNING);
+				return;
+			}
+			if (!SIGNING.has(a.state)) return;
+			let fresh: boolean;
+			try {
+				fresh = a.exchange!.receiveConsent(copy);
+			} catch (error) {
+				this.fail(a, message(error));
+				return;
+			}
+			if (fresh) await this.advance(a);
+		});
 	}
 
 	/**
@@ -793,8 +1036,20 @@ export class AssetConversionTransport {
 	 * byte 7 or 8), or a layout or layout_ack (0 or 4) the attempt owns.
 	 */
 	custom(peer: string, raw: Buffer): void {
-		const owner =
-			raw[1] === 0 || raw[1] === 4 ? this.frameOwner(peer, raw) : undefined;
+		const owner = raw[1] <= 6 ? this.frameOwner(peer, raw) : undefined;
+		if (owner && raw[1] !== 0 && raw[1] !== 4) {
+			// A signing frame is judged when it arrives (#2151 Step 4b), not
+			// behind a host call the queue awaits; its step runs in the queue.
+			let fresh: boolean;
+			try {
+				fresh = owner.exchange!.receiveFrame(Buffer.from(raw));
+			} catch (error) {
+				this.fail(owner, message(error));
+				return;
+			}
+			if (fresh) this.enqueue(owner, () => this.advance(owner));
+			return;
+		}
 		if (owner) {
 			const frame = Buffer.from(raw);
 			this.enqueue(owner, () => this.receiveFrame(owner, frame));
@@ -833,6 +1088,8 @@ export class AssetConversionTransport {
 		// A reply from the old connection can no longer arrive.
 		for (const [key, w] of [...this.withdrawn])
 			if (w.peer === peer) this.forgetWithdrawn(key);
+		for (const [id, t] of [...this.tombstones])
+			if (t.peer === peer) this.tombstones.delete(id);
 	}
 
 	/** Every attempt ends; nothing is sent. */
@@ -841,6 +1098,7 @@ export class AssetConversionTransport {
 		this.answered.clear();
 		for (const a of [...this.attempts.values()]) this.end(a, DISCONNECTED);
 		for (const key of [...this.withdrawn.keys()]) this.forgetWithdrawn(key);
+		this.tombstones.clear();
 	}
 
 	/** A local close or a requested exit ends the channel's attempt by the failure rule. */
@@ -1112,14 +1370,58 @@ export class AssetConversionTransport {
 			case 'laid-out':
 				this.abort(a, UNEXPECTED);
 				return;
+			case 'agreed':
+			case 'constructing':
+			case 'securing':
+			case 'secured':
+				await this.signingMessage(a, type, payload);
+				return;
 		}
+	}
+
+	/**
+	 * A Lightning message a signing attempt owns (#2151 Step 4b): a
+	 * construction turn while constructing, and the peer's candidate
+	 * commitment_signed while securing, after both exit shares; an identical
+	 * copy of it is dropped. Anything else is unexpected.
+	 */
+	private async signingMessage(
+		a: IAttempt,
+		type: number,
+		payload: Buffer
+	): Promise<void> {
+		if (type === M.COMMITMENT_SIGNED) {
+			if (a.peerCommit) {
+				if (!a.peerCommit.equals(payload)) this.fail(a, UNEXPECTED);
+				return;
+			}
+			if (a.state !== 'securing' || !a.exchange?.both('exit')) {
+				this.fail(a, UNEXPECTED);
+				return;
+			}
+			a.peerCommit = Buffer.from(payload);
+			await this.advance(a);
+			return;
+		}
+		if (a.state === 'constructing' && TURNS.has(type)) {
+			try {
+				a.round!.construction().receive(type, payload);
+			} catch (error) {
+				this.fail(a, message(error));
+				return;
+			}
+			await this.advance(a);
+			return;
+		}
+		this.fail(a, UNEXPECTED);
 	}
 
 	/**
 	 * The peer's tx_abort, at once: in `aborting` or `draining` it ends the
 	 * attempt with the side's own text, and a `draining` side that has sent
 	 * no tx_abort answers it first; otherwise it is echoed with its data and
-	 * the attempt ends with its text. The attempt ends even when a send
+	 * the attempt ends with its canonical text (#2151 Step 4b). The attempt
+	 * ends even when a send
 	 * throws, and a failed withdrawal is reported after the end (amendment
 	 * B4).
 	 */
@@ -1149,7 +1451,8 @@ export class AssetConversionTransport {
 			);
 		} finally {
 			try {
-				this.end(a, data.toString('utf8'));
+				// The end repeats the canonical reason (#2151 Step 4b, B6).
+				this.end(a, canonicalConversionReason(data));
 			} finally {
 				if (failure) this.deps.report(a.id, failure);
 			}
@@ -1352,12 +1655,25 @@ export class AssetConversionTransport {
 
 	/** A layout or layout_ack frame the attempt owns, in its queue. */
 	private async receiveFrame(a: IAttempt, raw: Buffer): Promise<void> {
+		// After the agreement a layout_ack is still compared (a different one
+		// is a disagreement) and a layout replay is still taken by its
+		// receiver, as in laid-out.
+		if (SIGNING.has(a.state)) {
+			try {
+				const f = decodeAssetOpenFrame(raw);
+				if (f.phase === 'layout_ack') await this.peerLayoutAck(a, f.digest);
+				else a.receiver?.receive(f);
+			} catch {
+				this.fail(a, FRAME);
+			}
+			return;
+		}
 		if (a.state !== 'init-sent' && a.state !== 'laid-out') return;
 		let bytes: Buffer | undefined;
 		try {
 			const f = decodeAssetOpenFrame(raw);
 			if (f.phase === 'layout_ack') {
-				this.peerLayoutAck(a, f.digest);
+				await this.peerLayoutAck(a, f.digest);
 				return;
 			}
 			a.receiver ??= new AssetOpenObjectReceiver(
@@ -1375,7 +1691,7 @@ export class AssetConversionTransport {
 		if (a.state === 'laid-out') await this.layoutSteps(a);
 	}
 
-	private peerLayoutAck(a: IAttempt, digest: Buffer): void {
+	private async peerLayoutAck(a: IAttempt, digest: Buffer): Promise<void> {
 		if (!a.layoutSent) {
 			this.fail(a, PREMATURE);
 			return;
@@ -1385,14 +1701,239 @@ export class AssetConversionTransport {
 			return;
 		}
 		a.peerAck = Buffer.from(digest);
-		this.compare(a);
+		await this.compare(a);
 	}
 
-	/** Once both agreement digests are present: the fence at I, or the disagreement. */
-	private compare(a: IAttempt): void {
-		if (!a.agreement || !a.peerAck) return;
-		if (!a.agreement.equals(a.peerAck)) this.fail(a, DISAGREE);
-		else if (a.initiator) this.abort(a, FENCE);
+	/**
+	 * Once both agreement digests are present: the disagreement, or the
+	 * agreement, which starts signing (#2151 Step 4b) under a deadline armed
+	 * again here.
+	 */
+	private async compare(a: IAttempt): Promise<void> {
+		if (!a.agreement || !a.peerAck || a.state !== 'laid-out') return;
+		if (!a.agreement.equals(a.peerAck)) {
+			this.fail(a, DISAGREE);
+			return;
+		}
+		a.state = 'agreed';
+		a.signing = true;
+		if (a.deadline) clearTimeout(a.deadline);
+		this.armDeadline(a);
+		a.exchange = new ConversionSigningExchange(
+			a.attempt!,
+			a.agreement,
+			a.initiator,
+			(subtype, payload) =>
+				this.send(
+					a,
+					BEIGNET_CUSTOM_MESSAGE_TYPE,
+					encodeCustomMessage(subtype, payload)
+				)
+		);
+		await this.advance(a);
+	}
+
+	// ---- Signing (#2151 Step 4b) ----
+
+	/** Run the signing steps as far as the material held allows; a failed step fails the attempt with its text. */
+	private async advance(a: IAttempt): Promise<void> {
+		try {
+			await this.signingSteps(a);
+		} catch (error) {
+			if (error === STALE || a.ended) return;
+			this.fail(a, message(error));
+		}
+	}
+
+	/**
+	 * A host call under its bound, then the await rule (section 6.3): the
+	 * attempt is still in `state`, and the parent is unchanged; then the
+	 * answer, or the member's text.
+	 */
+	private async ask<V>(
+		a: IAttempt,
+		state: State,
+		call: () => V | Promise<V>,
+		text: string
+	): Promise<V> {
+		const answer = await this.hostCall(call);
+		if (!this.still(a, state)) throw STALE;
+		this.parentUnchanged(a);
+		if (!answer.ok) throw new Error(text);
+		return answer.value;
+	}
+
+	/**
+	 * Section 1's steps, ours first: consent, authorization and the frozen
+	 * funding's final_ack; the construction and its checkpoint; the exit
+	 * share, the verify and our commitment_signed; the peer's
+	 * commitment_signed, the host's retain and our own; then, at the
+	 * initiator, the fence.
+	 */
+	private async signingSteps(a: IAttempt): Promise<void> {
+		const ex = a.exchange!;
+		if (a.state === 'agreed') {
+			const plan = a.plan!;
+			if (!ex.ours('consent')) {
+				const consent = await this.ask(
+					a,
+					'agreed',
+					() => plan.consent(),
+					CONSENT
+				);
+				if (!bytesIn(consent, 64, 64)) throw new Error(CONSENT);
+				ex.publish('consent', consent);
+			}
+			const consents = ex.both('consent');
+			if (!consents) return;
+			if (!ex.ours('authorization')) {
+				const auth = await this.ask(
+					a,
+					'agreed',
+					() => plan.authorize(pairCopy(consents)),
+					AUTHORIZE
+				);
+				if (!bytesIn(auth, 1, ASSET_OPEN_OBJECT_LIMIT))
+					throw new Error(AUTHORIZE);
+				ex.publish('authorization', auth);
+			}
+			const auths = ex.both('authorization');
+			if (!auths) return;
+			if (!a.round) {
+				const funding = await this.ask(
+					a,
+					'agreed',
+					() => plan.finalize(pairCopy(consents), pairCopy(auths)),
+					FINALIZE
+				);
+				if (
+					!isRecord(funding) ||
+					!Buffer.isBuffer(funding.layoutDigest) ||
+					!Buffer.isBuffer(funding.transaction) ||
+					!Buffer.isBuffer(funding.proofDigest)
+				)
+					throw new Error(FINALIZE);
+				const f = funding as IAssetConversionFunding;
+				let frozen: Transaction;
+				try {
+					frozen = Transaction.fromBuffer(f.transaction);
+				} catch {
+					throw new Error(FROZEN_CONVERSION_TEXT);
+				}
+				const verified = verifyConversionCandidate(
+					a.layout!,
+					{
+						layoutDigest: a.layoutDigest!,
+						agreement: a.agreement!,
+						planDigest: a.planDigest!
+					},
+					a.initiator,
+					frozen,
+					f,
+					auths
+				);
+				a.candidateHash = verified.candidate.tx.getHash();
+				// Section 2.6's checks, before any construction turn.
+				a.round = new ConversionSignatureRound(
+					this.runtime!.storage,
+					this.runtime!.root,
+					{
+						channelId: a.id,
+						attempt: Buffer.from(a.attempt!),
+						isInitiator: a.initiator,
+						keyIndex: a.keyIndex!,
+						layout: a.layout!,
+						parent: a.snapshot!,
+						targetType: a.terms!.targetType,
+						lockDepth: a.terms!.lockDepth,
+						commitmentFeeratePerKw:
+							a.terms!.firstCommitment.commitmentFeeratePerKw,
+						verified
+					}
+				);
+				ex.publish('final_ack', verified.finalDigest);
+			}
+			const peerFinal = ex.theirs('final_ack');
+			if (!peerFinal) return;
+			if (!peerFinal.equals(ex.ours('final_ack')!)) throw new Error(FINAL_ACK);
+			a.state = 'constructing';
+		}
+		if (a.state === 'constructing') {
+			const round = a.round!;
+			const core = round.construction();
+			const turn = core.next();
+			if (turn) this.send(a, turn.type, turn.payload);
+			const built = core.agreement();
+			if (!built) return;
+			round.agreement();
+			if (!ex.ours('construction_checkpoint')) {
+				const local = encodeTxCompleteMessage(built.local);
+				const peer = encodeTxCompleteMessage(built.peer);
+				ex.publish(
+					'construction_checkpoint',
+					assetConversionCheckpointDigest(
+						ex.ours('final_ack')!,
+						built.candidate.tx.getHash(),
+						a.initiator ? [local, peer] : [peer, local]
+					)
+				);
+			}
+			const peerCheckpoint = ex.theirs('construction_checkpoint');
+			if (!peerCheckpoint) return;
+			if (!peerCheckpoint.equals(ex.ours('construction_checkpoint')!))
+				throw new Error(CHECKPOINT);
+			a.state = 'securing';
+		}
+		if (a.state !== 'securing') return;
+		const round = a.round!;
+		const host = this.host!;
+		if (!ex.ours('exit')) {
+			const views = round.hostViews();
+			const share = await this.ask(
+				a,
+				'securing',
+				() => host.signConversionExits(this.ctxCopy(a), views),
+				SIGN
+			);
+			ex.publish('exit', round.exitShare(share));
+		}
+		const shares = ex.both('exit');
+		if (!shares) return;
+		if (!a.handle) {
+			const views = round.hostViews();
+			const evidence = await this.ask(
+				a,
+				'securing',
+				() =>
+					host.verifyConversionExits(this.ctxCopy(a), views, pairCopy(shares)),
+				VERIFY
+			);
+			if (!isRecord(evidence)) throw new Error(VERIFY);
+			a.handle = round.checkEvidence(evidence);
+			this.send(a, M.COMMITMENT_SIGNED, round.commitmentSigned(a.handle));
+			a.ownCommitSent = true;
+		}
+		if (!a.peerCommit) return;
+		round.acceptCommitmentSigned(a.handle, a.peerCommit);
+		const exact = round.exact(a.handle);
+		const views = round.hostViews();
+		const receipt = await this.ask(
+			a,
+			'securing',
+			() => host.retainConversionExits(this.ctxCopy(a), views, exact),
+			RETAIN
+		);
+		if (!isRecord(receipt)) throw new Error(RETAIN);
+		const exits = round.checkReceipt(receipt as never, a.handle);
+		// From here to the fence all is synchronous.
+		this.runtime!.storage.retainFinalConversionExits(
+			a.id,
+			exits,
+			this.runtime!.root
+		);
+		a.retained = exits.digest;
+		a.state = 'secured';
+		if (a.initiator) this.abort(a, FENCE);
 	}
 
 	/** Section 3's layout steps, once the side holds both proposals; then its layout_ack. */
@@ -1447,15 +1988,24 @@ export class AssetConversionTransport {
 			this.fail(a, message(error));
 			return;
 		}
+		a.layout = layout;
 		const layoutDigest = assetConversionLayoutDigest(layout);
 		const prepared = await this.hostCall(() =>
 			host.prepareConversion(...args(), Buffer.from(layoutDigest))
 		);
 		if (!this.still(a, 'laid-out')) return;
-		const plan = prepared.ok
-			? (prepared.value as { digest?: unknown } | null | undefined)?.digest
+		const value = prepared.ok
+			? (prepared.value as Partial<IAssetConversionPlan> | null | undefined)
 			: undefined;
-		if (!Buffer.isBuffer(plan) || plan.length !== 32) {
+		const plan = value?.digest;
+		// The plan signs too since Step 4b: its three members must be there.
+		if (
+			!Buffer.isBuffer(plan) ||
+			plan.length !== 32 ||
+			typeof value?.consent !== 'function' ||
+			typeof value.authorize !== 'function' ||
+			typeof value.finalize !== 'function'
+		) {
 			this.fail(a, PREPARE);
 			return;
 		}
@@ -1469,10 +2019,11 @@ export class AssetConversionTransport {
 		}
 		a.layoutDigest = layoutDigest;
 		a.planDigest = Buffer.from(plan);
+		a.plan = value as IAssetConversionPlan;
 		a.agreement = assetConversionAgreementDigest(layoutDigest, a.planDigest);
 		if (!this.record(a)) return;
 		this.sendLayoutAck(a);
-		this.compare(a);
+		await this.compare(a);
 	}
 
 	/** The rules and the terms against the parent now, and the parent against the snapshot. */
@@ -1736,20 +2287,34 @@ export class AssetConversionTransport {
 	 * withdrawal is written first, so it precedes the tx_abort on the wire
 	 * (#2151 Step 4a, section 4.2). The attempt is aborting before the send
 	 * and before any report, so a listener that re-enters finds it so and
-	 * sends no second tx_abort.
+	 * sends no second tx_abort. The host is told with the same text once the
+	 * withdrawal has landed, in a microtask after the tx_abort left, so no
+	 * host code runs inside this path (#2151 Step 4b, Z1 and v2.5).
 	 */
 	private abort(a: IAttempt, text: string): void {
 		if (a.ended || a.state === 'aborting') return;
 		const failure = this.withdraw(a, text);
 		a.sent = text;
-		this.enter(a, 'aborting', () => {
-			// No echo: disconnect the peer.
-			this.end(a, text);
-			this.deps.disconnect(a.peer);
-		});
+		// After our candidate commitment_signed left, the peer may be finishing
+		// its own retain first: the echo bound adds the host bound (V2).
+		this.enter(
+			a,
+			'aborting',
+			() => {
+				// No echo: disconnect the peer.
+				this.end(a, text);
+				this.deps.disconnect(a.peer);
+			},
+			a.ownCommitSent ? HOST_BOUND_MS + PHASE_BOUND_MS : PHASE_BOUND_MS
+		);
 		try {
 			this.sendAbort(a, text);
 		} finally {
+			// The host hears of the end once the withdrawal has landed (Z1),
+			// with the text the tx_abort carries. The call waits for a
+			// microtask, so a host that re-enters runs after this path and
+			// after the tx_abort; an end that comes first tells it instead.
+			queueMicrotask(() => this.tell(a, text));
 			if (failure) this.deps.report(a.id, failure);
 		}
 	}
@@ -1757,13 +2322,14 @@ export class AssetConversionTransport {
 	private enter(
 		a: IAttempt,
 		state: 'aborting' | 'draining',
-		expire: () => void
+		expire: () => void,
+		bound = PHASE_BOUND_MS
 	): void {
 		a.state = state;
 		this.clearTimers(a);
 		// At once, outside the queue (#2151 Step 4a, section 1.2).
 		a.phase = this.timer(
-			PHASE_BOUND_MS,
+			bound,
 			this.bounded(a, () => {
 				if (!a.ended && a.state === state) expire();
 			})
@@ -1773,7 +2339,8 @@ export class AssetConversionTransport {
 	/**
 	 * Release the hold, forget the attempt, withdraw its record when neither
 	 * abort nor the peer's tx_abort did (a disconnect, a destroy or the
-	 * phase bound), then tell the host when it verified the terms.
+	 * phase bound), then tell the host when it verified the terms and was
+	 * not told at the side's own tx_abort (Z1).
 	 */
 	private end(a: IAttempt, text: string): void {
 		if (a.ended) return;
@@ -1782,21 +2349,32 @@ export class AssetConversionTransport {
 		a.held = false;
 		this.clearTimers(a);
 		if (this.attempts.get(a.id) === a) this.attempts.delete(a.id);
+		// A late commitment_signed naming the candidate is dropped (W1).
+		if (a.candidateHash)
+			this.tombstones.set(a.id, {
+				peer: a.peer,
+				candidate: Buffer.from(a.candidateHash)
+			});
 		const failure = this.withdraw(a, text);
 		if (a.initiator && a.state === 'announced' && !a.replied && a.attempt)
 			this.rememberWithdrawn(a.id, a.peer, a.attempt);
-		if (a.verified && a.ctx && this.host) {
-			const host = this.host,
-				ctx = this.ctxCopy(a);
-			void this.hostCall(() => host.abandonConversion(ctx, text)).then((r) => {
-				if (!r.ok && r.error !== undefined)
-					this.deps.report(
-						a.id,
-						'Asset conversion host abandon failed: ' + r.error
-					);
-			});
-		}
+		this.tell(a, text);
 		if (failure) this.deps.report(a.id, failure);
+	}
+
+	/** Tell the host once that an attempt it verified ended, with `text`; never awaited. */
+	private tell(a: IAttempt, text: string): void {
+		if (a.told || !a.verified || !a.ctx || !this.host) return;
+		a.told = true;
+		const host = this.host,
+			ctx = this.ctxCopy(a);
+		void this.hostCall(() => host.abandonConversion(ctx, text)).then((r) => {
+			if (!r.ok && r.error !== undefined)
+				this.deps.report(
+					a.id,
+					'Asset conversion host abandon failed: ' + r.error
+				);
+		});
 	}
 
 	private rememberWithdrawn(id: string, peer: string, attempt: Buffer): void {
@@ -2052,7 +2630,21 @@ export class AssetConversionTransport {
 	}
 
 	/** The types the attempt receives in its state. */
-	private owns(a: IAttempt, type: number): boolean {
+	private owns(a: IAttempt, type: number, payload: Buffer): boolean {
+		if (SIGNING.has(a.state))
+			return (
+				SIGNING_TYPES.has(type) ||
+				(type === M.COMMITMENT_SIGNED && this.namesCandidate(a, payload))
+			);
+		// An aborting signing attempt drops its construction messages and its
+		// candidate's commitment_signed (W1).
+		if (
+			a.state === 'aborting' &&
+			a.signing &&
+			(CONSTRUCTION.has(type) ||
+				(type === M.COMMITMENT_SIGNED && this.namesCandidate(a, payload)))
+		)
+			return true;
 		switch (a.state) {
 			case 'announced':
 			case 'accepted':

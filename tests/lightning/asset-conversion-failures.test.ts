@@ -17,6 +17,7 @@ import {
 	abortText,
 	agreeOnTerms,
 	allocatedKeyIndex,
+	attemptOf,
 	conversionPair,
 	conversionTransportOf,
 	decodeSpliceInit,
@@ -469,14 +470,25 @@ describe('Disconnects and restarts in each state (#2151 step 3a, test 6)', funct
 		['I aborting', { from: 1, name: 'TX_ABORT' }, FENCE]
 	];
 	for (const [state, at, peerEnd] of states) {
-		it(`ends I with "${DISCONNECTED}" at ${state}, A with "${peerEnd}", and replays nothing after reconnect`, async () => {
+		// Z1: once I's fence left (A laid-out, I aborting), I's host was told
+		// with the fence; a disconnect then tells it nothing more.
+		const iEnd =
+			state === 'A laid-out' || state === 'I aborting' ? FENCE : DISCONNECTED;
+		it(`ends I with "${iEnd}" at ${state}, A with "${peerEnd}", and replays nothing after reconnect`, async () => {
 			p = await shared();
 			clean(p);
 			p.link.hold(at);
 			await run(p);
 			p.link.held.splice(0);
 			p.disconnect();
-			expect(abandoned(p, 0)).to.deep.equal([DISCONNECTED]);
+			// The disconnect itself ends both sides, even where I's host was
+			// already told at its fence (Z1).
+			expect(
+				[attemptOf(p.managers[0], p.id), attemptOf(p.managers[1], p.id)],
+				'no attempt is live after the disconnect'
+			).to.deep.equal([undefined, undefined]);
+			expect(held(p.managers[0], p.id), 'I holds nothing').to.equal(false);
+			expect(abandoned(p, 0)).to.deep.equal([iEnd]);
 			expect(abandoned(p, 1)).to.deep.equal([peerEnd]);
 			p.link.clearRules();
 			const mark = p.link.sent.length;

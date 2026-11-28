@@ -12,6 +12,9 @@ import type { IAssetConversionTerms } from './asset-conversion-terms';
 import type { IAssetOpenLayout } from './asset-opening-manifest';
 import type { IAssetSpliceDescription } from './asset-splice-agreement';
 import type { IAssetSpliceWireRecordLimit } from '../features/asset-splice';
+import type { IFinalExitBranch } from '../storage/final-conversion-exits';
+import type { IAssetSpliceHostHolder } from './asset-splice-signature-round';
+import type { IFinalFundingReference } from './final-splice-candidate';
 
 export interface IAssetOpenContext {
 	/** Local original-device enrollment. Never sourced from the peer. */
@@ -220,16 +223,119 @@ export interface IAssetConversionDescription {
 	commitmentRecordLimits?: readonly (readonly IAssetSpliceWireRecordLimit[])[];
 }
 
-/** Both hosts derive `digest` from the proposals and the layout digest, so it is equal on both sides. */
+/**
+ * Both hosts derive `digest` from the proposals and the layout digest, so it
+ * is equal on both sides. Since Step 4b the plan also consents, authorizes
+ * the assets and freezes the funding transaction.
+ */
 export interface IAssetConversionPlan {
 	/** 32 bytes. */
 	digest: Buffer;
+	/** This side's 64-byte consent to the agreement. */
+	consent(): Promise<Buffer>;
+	/** This side's asset authorizations, 1 byte to 4 MiB, given both consents in initiator order. */
+	authorize(consents: AssetOpenPair<Buffer>): Promise<Buffer>;
+	/** The unsigned funding transaction both hosts build from the layout and both authorizations. */
+	finalize(
+		consents: AssetOpenPair<Buffer>,
+		authorizations: AssetOpenPair<Buffer>
+	): Promise<IAssetConversionFunding>;
+}
+
+/** The plan's frozen funding (#2151 Step 4b). */
+export interface IAssetConversionFunding {
+	layoutDigest: Buffer;
+	transaction: Buffer;
+	/** To an asset: the transfer proofs into the candidate's funding. To bitcoin: those of the withdrawals. 32 bytes. */
+	proofDigest: Buffer;
+	/** To an asset only: the candidate's funding root, 32 bytes. */
+	fundingRoot?: Buffer;
+	/** To an asset only: the candidate's funding proofs, 1 byte to 4 MiB. */
+	fundingProofs?: Buffer;
+}
+
+/** One branch of a conversion's exits as the host sees it: its type, funding and both holders' views, built without leaves. */
+export type IAssetConversionHostBranch =
+	| {
+			type: 'plain';
+			channelType: string;
+			funding: IFinalFundingReference;
+			local: IAssetSpliceHostHolder;
+			remote: IAssetSpliceHostHolder;
+	  }
+	| {
+			type: 'asset';
+			channelType: string;
+			funding: IFinalFundingReference;
+			fundingRoot: Buffer;
+			local: IAssetSpliceHostHolder;
+			remote: IAssetSpliceHostHolder;
+	  };
+
+/** To bitcoin: one withdrawal movement of the layout, at its output in the frozen funding. */
+export interface IAssetConversionWithdrawal {
+	assetId: string;
+	/** The side whose units move. */
+	from: 'initiator' | 'acceptor';
+	outputSerial: bigint;
+	/** The output's index in the frozen funding transaction. */
+	outputIndex: number;
+	units: bigint;
+	/** The output's owner by serial parity: the buyer. */
+	owner: 'local' | 'remote';
+}
+
+/** What both hosts sign and verify a conversion's exits against. */
+export interface IAssetConversionHostExitViews {
+	/** The candidate's commitment terms: the channel's, at the terms' commitment feerate. */
+	terms: IFinalOpeningTerms;
+	originalInitiator: boolean;
+	finalDigest: Buffer;
+	layoutDigest: Buffer;
+	fundingFeeratePerkw: number;
+	/** Initiator first. */
+	paymentBasepoints: AssetOpenPair<Buffer>;
+	/** The current type at N on the live funding. */
+	parent: IAssetConversionHostBranch;
+	/** The target type at N on the candidate's funding. */
+	candidate: IAssetConversionHostBranch;
+	/** To bitcoin: the layout's withdrawal movements. Absent to an asset. */
+	withdrawals?: readonly IAssetConversionWithdrawal[];
+}
+
+/** The host's verified exit evidence: an asset branch's holder leaves and proofs; null for a plain branch. */
+export interface IAssetConversionExitEvidence {
+	parent: Record<'local' | 'remote', IAssetOpenExit> | null;
+	candidate: Record<'local' | 'remote', IAssetOpenExit> | null;
+}
+
+/** To bitcoin on the buyer's side: one withdrawal's signed transfer and proof as the host persisted them. */
+export interface IAssetConversionWithdrawalReceipt {
+	outputIndex: number;
+	assetId: string;
+	/** Decimal. */
+	units: string;
+	/** Lowercase hex, 1 byte to 4 MiB. */
+	proof: string;
+}
+
+/** What the host retained for a conversion's exits. */
+export interface IAssetConversionExitReceipt {
+	channelId: string;
+	/** Lowercase hex. */
+	finalDigest: string;
+	/** Decimal. */
+	stateNumber: string;
+	parent: IFinalExitBranch;
+	candidate: IFinalExitBranch;
+	/** To bitcoin on the buyer's side: one receipt per withdrawal it owns. Otherwise empty. */
+	withdrawals: readonly IAssetConversionWithdrawalReceipt[];
 }
 
 /**
- * The conversion surface of a host (#2151): the terms calls and the
- * planner calls. This build agrees on the terms and on the layout, and
- * signs nothing.
+ * The conversion surface of a host (#2151): the terms calls, the planner
+ * calls and, since Step 4b, the exit calls. This build signs the
+ * candidate's exits and first commitments, and no funding.
  */
 export interface IAssetConversionHost {
 	assetConversionVersion: 1;
@@ -246,7 +352,7 @@ export interface IAssetConversionHost {
 		terms: IAssetConversionTerms,
 		digest: Buffer
 	): Promise<boolean>;
-	/** Called when an attempt this host verified ends, with the end's text. After a restart it may also be called for an attempt from before it, which this process never saw, and may then repeat a call made before the restart; it must be idempotent. It is final, even while a planner call is pending. */
+	/** Called once for an attempt this host verified, with the end's text: when the attempt ends, or, for an attempt that sends its own tx_abort, as soon as its withdrawal is on disk, with the tx_abort's text. The channel can then stay held for up to 30 seconds, until the peer echoes the tx_abort or its bound expires, so a new conversion or update of the channel may be refused with the in-progress text until then. After a restart it may also be called for an attempt from before it, which this process never saw, and may then repeat a call made before the restart; it must be idempotent. It is final, even while a planner call is pending. Since Step 4b it also releases what the host retained for the attempt's candidate, its exits and, to bitcoin, the withdrawal receipts: the candidate was dropped and can never confirm, and a retain that finishes after this call is released too. The attempt id can repeat; the final digest names the candidate. */
 	abandonConversion(
 		ctx: IAssetConversionContext,
 		reason: string
@@ -269,6 +375,31 @@ export interface IAssetConversionHost {
 		bitcoin: IAssetConversionBitcoin,
 		layoutDigest: Buffer
 	): Promise<IAssetConversionPlan>;
+	/**
+	 * This side's exit share, 1 byte to 4 MiB. It signs only the candidate's
+	 * exits and, to bitcoin, a seller's withdrawal transfers and proofs for
+	 * the buyer. It must never sign a new transfer over the parent's
+	 * commitment outputs at N, which stay broadcastable until N is revoked.
+	 */
+	signConversionExits(
+		ctx: IAssetConversionContext,
+		views: IAssetConversionHostExitViews
+	): Promise<Buffer>;
+	/** Verify both shares, in initiator order, against the views. */
+	verifyConversionExits(
+		ctx: IAssetConversionContext,
+		views: IAssetConversionHostExitViews,
+		shares: AssetOpenPair<Buffer>
+	): Promise<IAssetConversionExitEvidence>;
+	/** Persist this side's exits and, to bitcoin on the buyer's side, each withdrawal's signed transfer and proof, then return them. */
+	retainConversionExits(
+		ctx: IAssetConversionContext,
+		views: IAssetConversionHostExitViews,
+		exact: Record<
+			'parent' | 'candidate',
+			Record<'local' | 'remote', Transaction>
+		>
+	): Promise<IAssetConversionExitReceipt>;
 }
 
 /** Explicit host support for private dual-funded asset openings on regtest. */
@@ -343,7 +474,7 @@ export interface IAuxiliaryDualFunding
 		terms: IAssetConversionTerms,
 		digest: Buffer
 	): Promise<boolean>;
-	/** Called when an attempt this host verified ends, with the end's text. After a restart it may also be called for an attempt from before it, which this process never saw, and may then repeat a call made before the restart; it must be idempotent. */
+	/** Called once for an attempt this host verified, with the end's text: when the attempt ends, or, for an attempt that sends its own tx_abort, as soon as its withdrawal is on disk, with the tx_abort's text. The channel can then stay held for up to 30 seconds, until the peer echoes the tx_abort or its bound expires, so a new conversion or update of the channel may be refused with the in-progress text until then. After a restart it may also be called for an attempt from before it, which this process never saw, and may then repeat a call made before the restart; it must be idempotent. Since Step 4b it also releases what the host retained for the attempt's candidate, its exits and, to bitcoin, the withdrawal receipts: the candidate was dropped and can never confirm, and a retain that finishes after this call is released too. The attempt id can repeat; the final digest names the candidate. */
 	abandonConversion?(
 		ctx: IAssetConversionContext,
 		reason: string
@@ -370,4 +501,24 @@ export interface IAuxiliaryDualFunding
 		bitcoin: IAssetConversionBitcoin,
 		layoutDigest: Buffer
 	): Promise<IAssetConversionPlan>;
+	/** See `IAssetConversionHost.signConversionExits` (#2151 Step 4b). */
+	signConversionExits?(
+		ctx: IAssetConversionContext,
+		views: IAssetConversionHostExitViews
+	): Promise<Buffer>;
+	/** See `IAssetConversionHost.verifyConversionExits`. */
+	verifyConversionExits?(
+		ctx: IAssetConversionContext,
+		views: IAssetConversionHostExitViews,
+		shares: AssetOpenPair<Buffer>
+	): Promise<IAssetConversionExitEvidence>;
+	/** See `IAssetConversionHost.retainConversionExits`. */
+	retainConversionExits?(
+		ctx: IAssetConversionContext,
+		views: IAssetConversionHostExitViews,
+		exact: Record<
+			'parent' | 'candidate',
+			Record<'local' | 'remote', Transaction>
+		>
+	): Promise<IAssetConversionExitReceipt>;
 }

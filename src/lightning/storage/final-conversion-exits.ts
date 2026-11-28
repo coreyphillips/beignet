@@ -67,7 +67,15 @@ export interface IFinalConversionExits {
 }
 export type FinalConversionEvent =
 	| ({ kind: 'conversion-exits' } & IFinalConversionExits)
-	| { kind: 'conversion-released'; digest: string };
+	| { kind: 'conversion-released'; digest: string }
+	/** Every end of a Step 4b attempt drops its retained candidate: it can never confirm. */
+	| { kind: 'conversion-dropped'; digest: string };
+
+/** A retained conversion with whether it was released or dropped. */
+export type IFinalConversionState = IFinalConversionExits & {
+	released: boolean;
+	dropped: boolean;
+};
 
 function invalid(): never {
 	throw new Error('Invalid conversion exits');
@@ -156,6 +164,45 @@ export function canonicalFinalExitBranch(
 	const { type: _type, feeratePerKw, ...rest } = v;
 	if (!Number.isSafeInteger(feeratePerKw) || feeratePerKw < 0) invalid();
 	return { type: 'asset', feeratePerKw, ...validateAssetExitBranch(rest) };
+}
+
+/**
+ * The scope's conversions, read strictly (#2151 Step 4b): a drop carries
+ * only its 32-byte digest, follows its own `conversion-exits`, comes once and
+ * never after a release, no release follows a drop, and no other kind
+ * appears. Anything else throws "Invalid conversion exits".
+ */
+export function checkedFinalConversions(
+	events: readonly unknown[]
+): IFinalConversionState[] {
+	const out: IFinalConversionState[] = [];
+	const byDigest = new Map<string, IFinalConversionState>();
+	for (const e of events) {
+		if (!e || typeof e !== 'object') invalid();
+		const event = e as FinalConversionEvent;
+		if (event.kind === 'conversion-exits') {
+			const c: IFinalConversionState = {
+				stateNumber: event.stateNumber,
+				digest: event.digest,
+				parent: event.parent,
+				candidate: event.candidate,
+				released: false,
+				dropped: false
+			};
+			out.push(c);
+			byDigest.set(event.digest, c);
+		} else if (event.kind === 'conversion-released') {
+			const c = byDigest.get(event.digest);
+			if (c?.dropped) invalid();
+			if (c) c.released = true;
+		} else if (event.kind === 'conversion-dropped') {
+			if (Object.keys(event).length !== 2) invalid();
+			const c = byDigest.get(hex(event.digest, 32));
+			if (!c || c.dropped || c.released) invalid();
+			c!.dropped = true;
+		} else invalid();
+	}
+	return out;
 }
 
 /** The canonical form of a `conversion-exits` input. */

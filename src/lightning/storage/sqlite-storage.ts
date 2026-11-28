@@ -29,11 +29,14 @@ import {
 import {
 	branchCommitmentType,
 	canonicalFinalConversionExits,
+	checkedFinalConversions,
 	conversionRecoveryView,
 	conversionViewContext,
 	verifyPlainBranchWitness,
 	type FinalConversionEvent,
+	type IAssetExitBranch,
 	type IFinalConversionExits,
+	type IFinalConversionState,
 	type IPlainExitBranch
 } from './final-conversion-exits';
 import {
@@ -57,7 +60,10 @@ import {
 	type IAssetConversionParent,
 	type IFinalChannelFunding
 } from './final-branch-readers';
-import type { IFinalCommitmentType } from '../channel/final-opening-commitment';
+import {
+	buildAssetSpliceCommitment,
+	type IFinalCommitmentType
+} from '../channel/final-opening-commitment';
 import { releasedAssetSplice } from './asset-splice-release-replay';
 import { AssetSpliceSignatureRound } from '../channel/asset-splice-signature-round';
 import type {
@@ -971,7 +977,15 @@ export class SqliteStorage implements IStorageBackend {
 				this.withdrawOpenConversionAttempts(reason),
 			conversionAttemptRows: (id) => this.conversionAttemptRows(id),
 			conversionAttemptOpen: (id) => this.conversionAttemptOpen(id),
-			openConversionAttempt: (id) => this.openConversionAttempt(id)
+			openConversionAttempt: (id) => this.openConversionAttempt(id),
+			conversionSigningAuthority: () => this.conversionSigningAuthority(),
+			currentLedgerCommitments: (id, height) => {
+				const current = this.channelTypeState(id)?.current;
+				return current
+					? this.currentLedgerCommitments(id, current, height)
+					: null;
+			},
+			conversionAssetParent: (id) => this.conversionAssetParent(id)
 		});
 	}
 
@@ -1164,7 +1178,13 @@ export class SqliteStorage implements IStorageBackend {
 								target.encryptionKey!,
 								target.walletIdentity!
 							);
-							SqliteStorage.refuseRecordedRepair(source, null, channelId);
+							SqliteStorage.refuseRecordedRepair(
+								source,
+								null,
+								channelId,
+								target.encryptionKey,
+								target.walletIdentity
+							);
 							const { row, index } = target.assetRepairSource(
 								source,
 								channelId
@@ -1225,7 +1245,13 @@ export class SqliteStorage implements IStorageBackend {
 			const authority = target.requireOpeningAuthority();
 			authority.assertDaemonEnrollment();
 			// Step 7 restores by type; a recorded channel is refused until then.
-			SqliteStorage.refuseRecordedRepair(target.db, authority, channelId);
+			SqliteStorage.refuseRecordedRepair(
+				target.db,
+				authority,
+				channelId,
+				target.encryptionKey,
+				target.walletIdentity
+			);
 			return target.db.transaction(() => repair(target, authority)).immediate();
 		} finally {
 			target.close();
@@ -2406,51 +2432,47 @@ export class SqliteStorage implements IStorageBackend {
 		).n;
 	}
 
-	/** The retained conversions, each with whether Step 4 released it; read only behind the row count. */
+	/**
+	 * The retained conversions, each with whether Step 4 released or dropped
+	 * it; read only behind the row count. The strict read, for the
+	 * conversion's own paths, throws on a malformed scope (#2151 Step 4b);
+	 * the tolerant read, for the exit and claim paths, then gives nothing.
+	 */
 	private finalConversions(
-		channelId: string
-	): (IFinalConversionExits & { released: boolean })[] {
+		channelId: string,
+		tolerant = false
+	): IFinalConversionState[] {
 		if (!this.finalBranchRows(channelId, 'conversion')) return [];
-		const events = this.finalJournal().read<FinalConversionEvent>(
-			'conversion',
-			channelId
-		).records;
-		const released = new Set(
-			events.flatMap((e) =>
-				e.kind === 'conversion-released' ? [e.digest] : []
-			)
-		);
-		return events.flatMap((e) =>
-			e.kind === 'conversion-exits'
-				? [
-						{
-							stateNumber: e.stateNumber,
-							digest: e.digest,
-							parent: e.parent,
-							candidate: e.candidate,
-							released: released.has(e.digest)
-						}
-				  ]
-				: []
-		);
+		try {
+			return checkedFinalConversions(
+				this.finalJournal().read<unknown>('conversion', channelId).records
+			);
+		} catch (error) {
+			if (tolerant) return [];
+			throw error;
+		}
 	}
+	/** The exits of a digest, dropped or not, from the tolerant read. */
 	private finalConversion(
 		channelId: string,
 		digest: string
 	): IFinalConversionExits | null {
-		const found = this.finalConversions(channelId).find(
+		const found = this.finalConversions(channelId, true).find(
 			(c) => c.digest === digest
 		);
 		if (!found) return null;
-		const { released: _released, ...exits } = found;
+		const { released: _released, dropped: _dropped, ...exits } = found;
 		return copyJson(exits);
 	}
-	/** Conversions whose candidate no record adopted. */
+	/** Conversions whose candidate no record adopted and no end dropped. */
 	private pendingFinalConversions(
-		channelId: string
-	): (IFinalConversionExits & { released: boolean })[] {
+		channelId: string,
+		tolerant = false
+	): IFinalConversionState[] {
 		// The row count first, so no other generation runs a query here.
-		const conversions = this.finalConversions(channelId);
+		const conversions = this.finalConversions(channelId, tolerant).filter(
+			(c) => !c.dropped
+		);
 		if (!conversions.length) return [];
 		const records = this.channelTypeState(channelId)?.records ?? [];
 		const adopted = new Set(
@@ -2562,18 +2584,11 @@ export class SqliteStorage implements IStorageBackend {
 			const { locked } = this.finalUpdateView(channelId)!.views[0].s;
 			balances = { local: BigInt(locked.local), remote: BigInt(locked.peer) };
 		} else {
-			const committed = assetSpliceUpdateHead(this, channelId).committed;
-			const adopted = this.loadAdoptedAssetSpliceReceipt(channelId);
-			const root =
-				adopted?.candidate.fundingRoot ?? session.assetEvidence?.fundingRoot;
-			const member = committed
-				? assetUpdateFundingMembers(this, channelId, committed).find(
-						(m) =>
-							m.fundingTxid === outpoint.txid &&
-							m.outputIndex === outpoint.outputIndex &&
-							m.fundingRoot === root
-				  )
-				: adopted?.candidate;
+			const { committed, root, member } = this.assetParentMember(
+				channelId,
+				outpoint,
+				session.assetEvidence?.fundingRoot
+			);
 			if (committed && !member) throw new Error(unready);
 			if (member)
 				balances = {
@@ -2603,6 +2618,164 @@ export class SqliteStorage implements IStorageBackend {
 			),
 			...asset
 		};
+	}
+
+	/**
+	 * An asset parent's member (#2151 Step 4b, W3): with a committed state,
+	 * only that state's member on the live funding under the parent's root;
+	 * with none, the adopted asset splice receipt's candidate, else nothing
+	 * (the opening's own evidence at 0).
+	 */
+	private assetParentMember(
+		channelId: string,
+		outpoint: { txid: string; outputIndex: number },
+		openingRoot: string | undefined
+	): {
+		committed: ReturnType<typeof assetSpliceUpdateHead>['committed'];
+		adopted: ReturnType<SqliteStorage['loadAdoptedAssetSpliceReceipt']>;
+		root: string | undefined;
+		member: Omit<IAssetExitBranch, 'type' | 'feeratePerKw'> | undefined;
+	} {
+		const committed = assetSpliceUpdateHead(this, channelId).committed;
+		const adopted = this.loadAdoptedAssetSpliceReceipt(channelId);
+		const root = adopted?.candidate.fundingRoot ?? openingRoot;
+		const member = committed
+			? assetUpdateFundingMembers(this, channelId, committed).find(
+					(m) =>
+						m.fundingTxid === outpoint.txid &&
+						m.outputIndex === outpoint.outputIndex &&
+						m.fundingRoot === root
+			  )
+			: adopted?.candidate;
+		return { committed, adopted, root, member };
+	}
+
+	/**
+	 * A conversion's asset parent branch at N on the live funding (#2151 Step
+	 * 4b, V3 with W3 and W4): the parent member at its committed feerate, or
+	 * at no committed state the adopted candidate or the opening's own
+	 * evidence at 0, at the session's commitment feerate. Null when a
+	 * committed state has no member on the live funding.
+	 */
+	private conversionAssetParent(channelId: string): IAssetExitBranch | null {
+		const opening = this.finalOpeningRecord(channelId);
+		const session = opening?.nonces.session;
+		const funding = opening && this.liveFinalFunding(channelId);
+		if (!opening || !session || !session.assetEvidence || !funding) return null;
+		const { committed, adopted, member } = this.assetParentMember(
+			channelId,
+			outpointOf(funding),
+			session.assetEvidence.fundingRoot
+		);
+		if (member)
+			return copyJson({
+				type: 'asset',
+				feeratePerKw: committed
+					? committed.feerate
+					: session.terms.commitmentFeeratePerKw,
+				...member
+			}) as IAssetExitBranch;
+		if (committed || adopted) return null;
+		return this.openingAssetBranch(opening);
+	}
+
+	/** An asset opening's own branch at state 0, from its evidence (W4). */
+	private openingAssetBranch(opening: IFinalOpeningRecord): IAssetExitBranch {
+		const c = opening.candidate;
+		const session = opening.nonces.session!;
+		const ev = session.assetEvidence!;
+		const terms = session.terms;
+		const funding: IFinalFundingReference = {
+			fundingTxHex: c.fundingTxHex,
+			fundingOutputIndex: c.fundingOutputIndex,
+			localFundingPubkey: c.localFundingPubkey,
+			remoteFundingPubkey: c.remoteFundingPubkey,
+			localFundingKeyIndex: session.channelKeyIndex
+		};
+		const balances = {
+			localBalanceMsat: BigInt(c.localContributionSats) * 1000n,
+			remoteBalanceMsat: BigInt(c.remoteContributionSats) * 1000n
+		};
+		const root = Buffer.from(ev.fundingRoot, 'hex');
+		const aux = (
+			l: { script: string; leafVersion?: number } | undefined
+		): { script: Buffer; leafVersion?: number } | undefined =>
+			l
+				? { script: Buffer.from(l.script, 'hex'), leafVersion: l.leafVersion }
+				: undefined;
+		const pointOf = (holder: 'local' | 'remote'): string =>
+			(holder === 'local' ? terms.localBasepoints : terms.remoteBasepoints)
+				.firstPerCommitmentPoint;
+		const recovery = (
+			holder: 'local' | 'remote'
+		): {
+			v: ReturnType<typeof buildAssetSpliceCommitment>;
+			recovery: IAssetExitBranch['localRecovery'];
+		} => {
+			const v = buildAssetSpliceCommitment(
+				c,
+				terms,
+				holder,
+				Buffer.from(pointOf(holder), 'hex'),
+				0n,
+				balances,
+				[],
+				funding,
+				root,
+				{
+					fundingRoot: root,
+					toLocal: aux(ev[holder].toLocal),
+					toRemote: aux(ev[holder].toRemote)
+				},
+				branchCommitmentType(ASSET_SPLICE_RECOVERY_TYPE_HEX, root)
+			);
+			return {
+				v,
+				recovery: {
+					point: pointOf(holder),
+					localBalanceMsat: String(balances.localBalanceMsat),
+					remoteBalanceMsat: String(balances.remoteBalanceMsat),
+					ownedOutputIndex:
+						(holder === 'local' ? v.outputMap.toLocal : v.outputMap.toRemote) ??
+						null,
+					toLocal: ev[holder].toLocal ? { ...ev[holder].toLocal! } : null,
+					toRemote: ev[holder].toRemote ? { ...ev[holder].toRemote! } : null,
+					htlcs: []
+				}
+			};
+		};
+		const local = recovery('local');
+		const remote = recovery('remote');
+		const exit = opening.nonces.signing?.exit as unknown;
+		return copyJson({
+			type: 'asset',
+			feeratePerKw: terms.commitmentFeeratePerKw,
+			minimumDepth: c.minimumDepth,
+			funding,
+			fundingTxid: Transaction.fromHex(c.fundingTxHex).getId(),
+			outputIndex: c.fundingOutputIndex,
+			fundingRoot: ev.fundingRoot,
+			fundingProofs: ev.fundingProofs,
+			localCommitment: Buffer.isBuffer(exit)
+				? exit.toString('hex')
+				: String(exit),
+			localProofs: ev.local.proofs,
+			remoteCommitment: remote.v.tx.toHex(),
+			remoteProofs: ev.remote.proofs,
+			localRecovery: local.recovery,
+			remoteRecovery: remote.recovery
+		}) as IAssetExitBranch;
+	}
+
+	/** The signing authority of a conversion round: the original generation 6 device, outside a transaction. */
+	private conversionSigningAuthority(): FinalOpeningAuthority {
+		if (!this.canConvertAssetChannels)
+			throw new Error(
+				'Asset conversion requires an original conversion wallet'
+			);
+		if (this.db.inTransaction)
+			throw new Error('Conversion exits require a top-level commit');
+		return this.requireOpeningAuthority();
 	}
 
 	/**
@@ -2701,7 +2874,9 @@ export class SqliteStorage implements IStorageBackend {
 					);
 			}
 		// Where a record's funding is a conversion's candidate, the record wins.
-		for (const c of this.finalConversions(channelId)) {
+		for (const c of this.finalConversions(channelId, true)) {
+			// A dropped candidate can never confirm (#2151 Step 4b).
+			if (c.dropped) continue;
 			const o = {
 				txid: c.candidate.fundingTxid,
 				outputIndex: c.candidate.outputIndex
@@ -3134,8 +3309,9 @@ export class SqliteStorage implements IStorageBackend {
 			throw new Error('Invalid conversion exits');
 		const retained = this.finalConversions(channelId);
 		const same = retained.find((c) => c.digest === canonical.digest);
+		if (same?.dropped) throw new Error('Conversion exits were dropped');
 		if (same) {
-			const { released: _released, ...prior } = same;
+			const { released: _released, dropped: _dropped, ...prior } = same;
 			if (isDeepStrictEqual(copyJson(prior), copyJson(canonical)))
 				return copyJson(canonical);
 			throw new Error('Conversion exits differ from the retained ones');
@@ -3262,6 +3438,7 @@ export class SqliteStorage implements IStorageBackend {
 			/^[0-9a-f]{64}$/.test(channelId) &&
 			this.finalConversions(channelId).find((c) => c.digest === digest);
 		if (!found) throw new Error('Conversion exits were not retained');
+		if (found.dropped) throw new Error('Conversion exits were dropped');
 		if (found.released) return;
 		this.appendFinalConversionEvent(channelId, {
 			kind: 'conversion-released',
@@ -3384,6 +3561,11 @@ export class SqliteStorage implements IStorageBackend {
 		const record = sequence >= 1 ? events[sequence - 1] : undefined;
 		if (record?.kind !== 'conversion-attempt' || record.attempt !== attempt)
 			throw new Error(CONVERSION_ATTEMPT_TEXTS.notRecorded);
+		// Every end drops the channel's retained candidates first (#2151 Step
+		// 4b): only for the scope's last record, or one whose withdrawal is
+		// the last row, so a stale sequence never drops a newer attempt's.
+		if (events.length === sequence || events.length === sequence + 1)
+			this.dropFinalConversions(channelId);
 		// The scope alternates, so a row after the record is its withdrawal.
 		if (events.length > sequence) return;
 		this.appendConversionAttemptEvent(journal, channelId, head, {
@@ -3391,6 +3573,24 @@ export class SqliteStorage implements IStorageBackend {
 			attempt,
 			reason
 		});
+	}
+
+	/**
+	 * Drop every retained, unreleased, undropped candidate of the channel
+	 * (#2151 Step 4b): read through the device-aware journal, refused whole
+	 * when any is released, and never repeated once a drop landed.
+	 */
+	private dropFinalConversions(channelId: string): void {
+		const conversions = checkedFinalConversions(
+			this.finalJournal().read<unknown>('conversion', channelId).records
+		).filter((c) => !c.dropped);
+		if (conversions.some((c) => c.released))
+			throw new Error('Released conversion exits cannot be dropped');
+		for (const c of conversions)
+			this.appendFinalConversionEvent(channelId, {
+				kind: 'conversion-dropped',
+				digest: c.digest
+			});
 	}
 
 	/**
@@ -3478,11 +3678,11 @@ export class SqliteStorage implements IStorageBackend {
 			if (!s || s.local.height !== height) return null;
 			return { local: s.local.tx, remote: s.remote.tx };
 		}
-		const member = assetUpdateHistory(this, channelId).states.get(
-			BigInt(height)
-		)?.members[0];
-		return member
-			? { local: member.localCommitment, remote: member.remoteCommitment }
+		const committed = assetSpliceUpdateHead(this, channelId).committed;
+		if ((committed?.height ?? '0') !== String(height)) return null;
+		const branch = this.conversionAssetParent(channelId);
+		return branch
+			? { local: branch.localCommitment, remote: branch.remoteCommitment }
 			: null;
 	}
 
@@ -3740,7 +3940,9 @@ export class SqliteStorage implements IStorageBackend {
 	private static refuseRecordedRepair(
 		db: Database.Database,
 		authority: FinalOpeningAuthority | null,
-		channelId: string
+		channelId: string,
+		encryptionKey?: Buffer,
+		walletIdentity?: string
 	): void {
 		const rows = db
 			.prepare(
@@ -3761,9 +3963,29 @@ export class SqliteStorage implements IStorageBackend {
 			)
 			.get(channelId) as { n: number } | undefined;
 		if (
-			conversions?.n ||
-			authority?.lifecycleEntry('conversion/' + channelId + '/1')
+			!conversions?.n &&
+			!authority?.lifecycleEntry('conversion/' + channelId + '/1')
 		)
+			return;
+		// A channel whose every retained candidate was dropped restores
+		// (#2151 Step 4b). Any failure of this read refuses.
+		let settled = false;
+		try {
+			if (encryptionKey && walletIdentity) {
+				const all = checkedFinalConversions(
+					new FinalDeviceJournal(
+						db,
+						encryptionKey,
+						walletIdentity,
+						authority
+					).read<unknown>('conversion', channelId).records
+				);
+				settled = all.length > 0 && all.every((c) => c.dropped && !c.released);
+			}
+		} catch {
+			settled = false;
+		}
+		if (!settled)
 			throw new Error(
 				'Restore of a channel with a pending type conversion is not supported yet'
 			);
@@ -4518,7 +4740,10 @@ export class SqliteStorage implements IStorageBackend {
 		}
 		// After its release, a pending conversion's candidate exit too, by its
 		// own type; the conversion scope is read only behind its row count.
-		for (const c of this.pendingFinalConversions(record.candidate.channelId))
+		for (const c of this.pendingFinalConversions(
+			record.candidate.channelId,
+			true
+		))
 			if (c.released) exits = [...exits, c.candidate.localCommitment];
 		return exits.map((hex) => {
 			const exit = Buffer.from(hex, 'hex');

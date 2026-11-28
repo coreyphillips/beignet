@@ -4527,16 +4527,24 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			return;
 		}
 		// The conversion phases (#2151) of subtype 98: terms and replies, and
-		// a layout or layout_ack under a live conversion's own attempt.
+		// a layout, layout_ack or signing frame (Step 4b) under a live
+		// conversion's own attempt.
 		if (
 			subtype === BeignetCustomSubtype.ASSET_SPLICE &&
 			raw.length >= 2 &&
 			(raw[1] === 7 ||
 				raw[1] === 8 ||
-				((raw[1] === 0 || raw[1] === 4) &&
-					!!this.assetConversion?.ownsFrame(peer, raw)))
+				(raw[1] <= 6 && !!this.assetConversion?.ownsFrame(peer, raw)))
 		) {
 			this.assetConversion?.custom(peer, raw);
+			return;
+		}
+		// A consent under a live conversion's own attempt (#2151 Step 4b).
+		if (
+			subtype === BeignetCustomSubtype.ASSET_SPLICE_CONSENT &&
+			!!this.assetConversion?.ownsConsent(peer, raw)
+		) {
+			this.assetConversion.consent(peer, raw);
 			return;
 		}
 		if (

@@ -108,9 +108,9 @@ function clean(p: IConversionPair): void {
 		h.propose = (): unknown => stubProposal(i);
 		h.describe = (ctx, _proposals, bitcoin): unknown =>
 			stubConversionDescription(ctx, h.termsFor(ctx), bitcoin);
-		h.prepare = (_ctx, _proposals, _bitcoin, layoutDigest): unknown => ({
-			digest: sha256(layoutDigest)
-		});
+		// Step 4b (V11): the stub's whole plan, so an attempt reaches the fence.
+		h.prepare = (ctx, proposals, bitcoin, layoutDigest): unknown =>
+			h.planFor(ctx, proposals, bitcoin, layoutDigest);
 		p.feerateEstimates[i] = async (): Promise<number> => 1000;
 	}
 	agree(p);
@@ -395,9 +395,33 @@ describe('Asset conversion quiet from layout_ack (#2151 step 4a, section 8 quiet
 							attemptRowCount(p.stores[m.from], p.id) - base[m.from]
 						);
 				});
+				// Step 4b: the conversion rows when each tx_abort left, and the
+				// drop before the withdrawal in the wallet's row order.
+				const conversionRows = (i: 0 | 1): number =>
+					(
+						(p.stores[i] as unknown as { db: Database.Database }).db
+							.prepare(
+								"SELECT COUNT(*) AS n FROM final_lifecycle_log WHERE scope = 'conversion' AND channel_id = ?"
+							)
+							.get(p.id) as { n: number }
+					).n;
+				const conversionBase = [conversionRows(0), conversionRows(1)];
+				const dropped: Record<string, number> = {};
+				p.link.taps.push((m: IWireMessage) => {
+					if (m.name === 'TX_ABORT')
+						dropped[m.from + ':' + m.name] =
+							conversionRows(m.from) - conversionBase[m.from];
+				});
 				const start = await run(p, I);
 				expect(start.error, 'start').to.equal(undefined);
 				expect(abandoned(p, 0), 'the fence').to.deep.equal([FENCE]);
+				expect(
+					dropped,
+					'conversion-exits and conversion-dropped before each tx_abort'
+				).to.deep.equal({
+					[`${I}:TX_ABORT`]: 2,
+					[`${A}:TX_ABORT`]: 2
+				});
 				expect(at, 'rows when each frame left').to.deep.equal({
 					[`${I}:asset_splice:4`]: [1],
 					[`${A}:asset_splice:4`]: [1],
@@ -684,9 +708,20 @@ describe('Asset conversion quiet from layout_ack (#2151 step 4a, section 8 quiet
 	});
 
 	describe('Two consecutive attempts with identical terms (test 4, M4 and A1)', () => {
-		it('records both in order, attempt, withdrawal, attempt, withdrawal, and quiet ends after each', async () => {
+		it('records both in order, attempt, withdrawal, attempt, withdrawal, and quiet ends after each, both reaching the 4b fence on one connection (W1)', async () => {
 			const p = await shared('plain');
 			const base = rowsOf(p);
+			const conversions = p.stores.map(
+				(st) =>
+					(
+						(st as unknown as { db: Database.Database }).db
+							.prepare(
+								"SELECT COUNT(*) AS n FROM final_lifecycle_log WHERE scope = 'conversion' AND channel_id = ?"
+							)
+							.get(p.id) as { n: number }
+					).n
+			);
+			const mark = p.link.sent.length;
 			for (const round of [1, 2]) {
 				await toQuiet(p, 0);
 				expect(quiet(p), 'quiet in attempt ' + round).to.deep.equal([
@@ -702,6 +737,23 @@ describe('Asset conversion quiet from layout_ack (#2151 step 4a, section 8 quiet
 					false
 				]);
 			}
+			// Step 4b (W1): both attempts signed and dropped on one connection.
+			expect(
+				p.link.sent.slice(mark).filter((m) => m.name === 'COMMITMENT_SIGNED')
+					.length,
+				'each side signed each candidate'
+			).to.equal(4);
+			for (const i of [0, 1] as const)
+				expect(
+					(
+						(p.stores[i] as unknown as { db: Database.Database }).db
+							.prepare(
+								"SELECT COUNT(*) AS n FROM final_lifecycle_log WHERE scope = 'conversion' AND channel_id = ?"
+							)
+							.get(p.id) as { n: number }
+					).n - conversions[i],
+					'side ' + i + ' exits and drop of each attempt'
+				).to.equal(4);
 			for (const i of [0, 1] as const) {
 				const events = eventsSince(p, i, base[i]);
 				expect(events.map((e) => e.kind)).to.deep.equal([
@@ -1326,9 +1378,12 @@ describe('Asset conversion quiet from layout_ack (#2151 step 4a, section 8 quiet
 
 	describe('Not counted elsewhere (test 13, section 2.7)', () => {
 		for (const kind of ['plain', 'asset'] as const)
-			it(`counts no branch row, refuses no restore and sees no splice after a record and a withdrawal (${kind})`, async () => {
+			it(`counts the retained and dropped rows, refuses no restore and sees no splice after a record and a withdrawal (${kind})`, async () => {
 				const p = await shared(kind);
 				const base = rowsOf(p);
+				const branchBase = p.stores.map((st) =>
+					finalBranchReaders(st)!.finalBranchRows(p.id)
+				);
 				const start = await run(p, 0);
 				expect(start.error).to.equal(undefined);
 				expect(abandoned(p, 0), 'the fence').to.deep.equal([FENCE]);
@@ -1337,20 +1392,33 @@ describe('Asset conversion quiet from layout_ack (#2151 step 4a, section 8 quiet
 					expect(attemptRowCount(store, p.id) - base[i], 'side ' + i).to.equal(
 						2
 					);
-					expect(finalBranchReaders(store)!.finalBranchRows(p.id)).to.equal(0);
+					// Step 4b (V11): a delta from the test's own base, of 2 rows:
+					// conversion-exits and conversion-dropped.
+					expect(
+						finalBranchReaders(store)!.finalBranchRows(p.id) - branchBase[i]
+					).to.equal(2);
+					// Step 4b (7.4): with the wallet's journal key and identity.
+					const keyed = store as unknown as {
+						encryptionKey?: Buffer;
+						walletIdentity?: string;
+					};
 					expect(() =>
 						(
 							SqliteStorage as unknown as {
 								refuseRecordedRepair(
 									db: Database.Database,
 									authority: FinalOpeningAuthority | null,
-									id: string
+									id: string,
+									key?: Buffer,
+									identity?: string
 								): void;
 							}
 						).refuseRecordedRepair(
 							(store as unknown as { db: Database.Database }).db,
 							deviceAuthority(store),
-							p.id
+							p.id,
+							keyed.encryptionKey,
+							keyed.walletIdentity
 						)
 					).to.not.throw();
 					const st = store as unknown as {

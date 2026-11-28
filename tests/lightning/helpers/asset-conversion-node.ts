@@ -19,17 +19,32 @@ import {
 } from './final-generation';
 
 /**
- * The six conversion members of a host (#2151 step 3a's three terms calls
- * and step 3b's three planner calls), which completeAssetConversionHost
- * requires beside its version and margin (step 3b contract, section 1).
+ * The six conversion members of step 3b: step 3a's three terms calls and
+ * step 3b's three planner calls.
  */
-export const CONVERSION_HOST_MEMBERS = [
+export const CONVERSION_3B_MEMBERS = [
 	'conversionTerms',
 	'verifyConversionTerms',
 	'abandonConversion',
 	'proposeConversion',
 	'describeConversion',
 	'prepareConversion'
+] as const;
+
+/** The three signing members of #2151 Step 4b (contract section 9.3). */
+export const CONVERSION_SIGNING_MEMBERS = [
+	'signConversionExits',
+	'verifyConversionExits',
+	'retainConversionExits'
+] as const;
+
+/**
+ * The nine conversion members of a host, which completeAssetConversionHost
+ * requires beside its version and margin since Step 4b (contract 9.5).
+ */
+export const CONVERSION_HOST_MEMBERS = [
+	...CONVERSION_3B_MEMBERS,
+	...CONVERSION_SIGNING_MEMBERS
 ] as const;
 
 /** Every key of the conversion surface: the six members, the version and the margin. */

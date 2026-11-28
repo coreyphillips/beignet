@@ -12,7 +12,6 @@
  * a failed test left behind.
  */
 import { expect } from 'chai';
-import { createHash } from 'crypto';
 import sinon from 'sinon';
 import { MessageType } from '../../src/lightning/message/types';
 import { scratch } from './helpers/channel-type-pairs';
@@ -49,7 +48,6 @@ const LATE_MS = 6_000;
 const PHASE_BOUND_MS = 15_000;
 const REF = Buffer.alloc(8, 0x4a);
 
-const sha256 = (b: Buffer): Buffer => createHash('sha256').update(b).digest();
 const fakeClock = (): sinon.SinonFakeTimers =>
 	sinon.useFakeTimers({
 		now: Date.now(),
@@ -120,9 +118,8 @@ function clean(p: IConversionPair): void {
 		h.propose = (): unknown => stubProposal(i);
 		h.describe = (ctx, _proposals, bitcoin): unknown =>
 			stubConversionDescription(ctx, h.termsFor(ctx), bitcoin);
-		h.prepare = (_ctx, _proposals, _bitcoin, layoutDigest): unknown => ({
-			digest: sha256(layoutDigest)
-		});
+		h.prepare = (ctx, proposals, bitcoin, layoutDigest): unknown =>
+			h.planFor(ctx, proposals, bitcoin, layoutDigest);
 		p.feerateEstimates[i] = async (): Promise<number> => 1000;
 	}
 }
@@ -196,8 +193,10 @@ describe('Asset conversion bounds that run at once (#2151 step 4a, section 8 dea
 						);
 					return;
 				case 'prepareConversion':
-					h.prepare = (_ctx, _proposals, _bitcoin, layoutDigest): unknown =>
-						lateAnswer(p, hang, () => ({ digest: sha256(layoutDigest) }));
+					h.prepare = (ctx, proposals, bitcoin, layoutDigest): unknown =>
+						lateAnswer(p, hang, () =>
+							h.planFor(ctx, proposals, bitcoin, layoutDigest)
+						);
 			}
 		};
 		const waits: Wait[] = [
