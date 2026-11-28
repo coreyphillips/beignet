@@ -12,8 +12,13 @@
  *   read, again with no live attempt.
  * The third group pins guards the site audit listed as green with no test
  * (G1 to G3, the sweep's outer wrap and the strict reader with planted rows).
- * The last pins the order of an end and its report when a send throws
+ * The fourth pins the order of an end and its report when a send throws
  * (amendments B4 and B5).
+ *
+ * Amendment v2.4 adds the recheck's proofs: the host hears each
+ * pre-restart attempt's end exactly once (D1, R1 and R3), a copy that
+ * cannot convert never runs the orphan rule (D2), and the four guards the
+ * v2.2 mutation table left green get a test each (K12, K13, K14 and K17).
  */
 import { expect } from 'chai';
 import { createHash } from 'crypto';
@@ -25,7 +30,7 @@ import { encodeTxAbortMessage } from '../../src/lightning/message/interactive-tx
 import { MessageType } from '../../src/lightning/message/types';
 import { checkedConversionAttempts } from '../../src/lightning/storage/final-conversion-attempt';
 import { FinalDeviceJournal } from '../../src/lightning/storage/final-device-journal';
-import type { SqliteStorage } from '../../src/lightning/storage/sqlite-storage';
+import { SqliteStorage } from '../../src/lightning/storage/sqlite-storage';
 import { plainTypePair, scratch } from './helpers/channel-type-pairs';
 import { deviceAuthority } from './helpers/channel-type-record';
 import {
@@ -50,11 +55,13 @@ import {
 	roleOf,
 	settleOnce,
 	startConversion,
+	stfu,
 	storeTerms,
 	stubConversionDescription,
 	stubProposal,
 	tick,
 	track,
+	txAbort,
 	updateRound,
 	type IConversionPair
 } from './helpers/conversion-managers';
@@ -70,6 +77,10 @@ const {
 	invalid: INVALID
 } = ATTEMPT_TEXTS;
 const LOCKED = 'database is locked';
+const IO = 'disk I/O error';
+/** startFinalSplice's refusal past the quiet gate, for a side with no peer. */
+const NO_SPLICE =
+	'Final splice requires live funding and negotiated quiescence and splicing';
 const EXPIRED = 'Asset conversion agreement has expired';
 
 const sha256 = (b: Buffer): Buffer => createHash('sha256').update(b).digest();
@@ -197,6 +208,108 @@ async function strand(p: IConversionPair): Promise<{
 	expect(listing.count(), 'the listing ran and failed').to.equal(1);
 	expect(held(p.managers[side], p.id), 'no live attempt').to.equal(false);
 	return { side, base, reports, told, ctx };
+}
+
+/**
+ * Make side i's scope reads through the device journal throw while `on()`
+ * holds, only for side i's database (`on` is asked only for those reads).
+ */
+function failReads(
+	p: IConversionPair,
+	i: 0 | 1,
+	on: () => boolean
+): { count: () => number } {
+	const db = (p.stores[i] as unknown as { db: Database.Database }).db;
+	const read = FinalDeviceJournal.prototype.read;
+	let failed = 0;
+	sinon.stub(FinalDeviceJournal.prototype, 'read').callsFake(function (
+		this: FinalDeviceJournal,
+		...args: unknown[]
+	) {
+		if (
+			args[0] === ATTEMPT_SCOPE &&
+			(this as unknown as { db: unknown }).db === db &&
+			on()
+		) {
+			failed++;
+			throw new Error(IO);
+		}
+		return (read as (...a: unknown[]) => unknown).apply(this, args);
+	} as typeof read);
+	return { count: () => failed };
+}
+
+/**
+ * Side i's next device commit of the scope lands and then throws (the
+ * wallet row is not written), and every scope read of side i fails until
+ * `stop()`: the row is on the device only. `stop()` restores every stub.
+ */
+function deviceOnlyNextWrite(
+	p: IConversionPair,
+	i: 0 | 1
+): { landed: () => boolean; stop: () => void } {
+	let failing = false;
+	let done = false;
+	const authority = deviceAuthority(p.stores[i]);
+	const commit = authority.commitLifecycleEntry.bind(authority);
+	sinon
+		.stub(authority, 'commitLifecycleEntry')
+		.callsFake((slot: string, value: string) => {
+			commit(slot, value);
+			if (slot.startsWith(ATTEMPT_SCOPE + '/') && !done) {
+				done = true;
+				failing = true;
+				throw new Error(IO);
+			}
+		});
+	failReads(p, i, () => failing);
+	return {
+		landed: () => done,
+		stop: (): void => {
+			failing = false;
+			sinon.restore();
+		}
+	};
+}
+
+/** Pause side i's prepareConversion until the returned release runs. */
+function gatePrepare(
+	p: IConversionPair,
+	i: 0 | 1
+): { reached: () => boolean; release: () => void } {
+	let reached = false;
+	let open!: () => void;
+	const gate = new Promise<void>((done) => (open = done));
+	const prepare = p.hosts[i].prepare as (...a: unknown[]) => unknown;
+	p.hosts[i].prepare = (...args: unknown[]): unknown => {
+		reached = true;
+		return gate.then(() => prepare(...args));
+	};
+	return { reached: () => reached, release: () => open() };
+}
+
+/**
+ * Attempt 1 of `side` writes its record to the device only (its wallet
+ * insert and every re-read fail), so it ends unrecorded as far as it knows.
+ * Returns the side's row count before it.
+ */
+async function deviceOnlyRecord(
+	p: IConversionPair,
+	side: 0 | 1
+): Promise<number> {
+	const base = rows(p, side);
+	const told = abandoned(p, side).length;
+	const write = deviceOnlyNextWrite(p, side);
+	await run(p, 0);
+	await p.settle();
+	write.stop();
+	expect(write.landed(), 'the device commit ran').to.equal(true);
+	expect(held(p.managers[side], p.id), 'attempt 1 is over').to.equal(false);
+	expect(abandoned(p, side).slice(told), 'its end').to.deep.equal([
+		NOT_RECORDED
+	]);
+	expect(rows(p, side) - base, 'not in the wallet').to.equal(0);
+	return base;
 }
 
 /** A valid attempt record for direct writes on `store`'s channel `id`. */
@@ -774,6 +887,284 @@ describe('Asset conversion orphans (#2151 step 4a, amendments B1 and B2)', funct
 				false
 			]);
 			expect(held(m, p.id)).to.equal(false);
+		});
+	});
+
+	describe('The host hears each pre-restart end once (amendment D1)', () => {
+		it('R1: tells the host the end of a record the sweep listed but could not read, once an orphan read learns its attempt', async () => {
+			const p = await fresh();
+			const side = p.opener;
+			const base = rows(p, side);
+			p.link.hold('asset_splice:4');
+			expect((await run(p, 0)).error, 'start').to.equal(undefined);
+			const verified = p.hosts[side].calls('verifyConversionTerms');
+			const ctx = verified[verified.length - 1].args[0];
+			const told = abandoned(p, side).length;
+			p.link.clearRules();
+			p.link.held.splice(0);
+			// The sweep's GROUP BY works; its first read of the scope throws.
+			let first = true;
+			const reads = failReads(p, side, () => {
+				const now = first;
+				first = false;
+				return now;
+			});
+			p.crash(side);
+			const reports = reportsOf(p.managers[side]);
+			await settleOnce();
+			sinon.restore();
+			expect(reads.count(), "the sweep's read failed").to.equal(1);
+			expect(reports, 'the sweep reports it').to.deep.equal([
+				[p.id, WITHDRAWAL_FAILED + IO]
+			]);
+			expect(rows(p, side) - base, 'still open').to.equal(1);
+			const m = p.managers[side];
+			expect(conversionQuiet(m, p.id), 'not quiet').to.equal(false);
+			expect(kindsSince(p, side, base)).to.deep.equal([
+				'conversion-attempt',
+				RESTART
+			]);
+			await settleOnce();
+			await settleOnce();
+			const calls = p.hosts[side].calls('abandonConversion').slice(told);
+			expect(
+				calls.map((c) => c.args),
+				'the host hears the end of the pre-crash attempt once'
+			).to.deep.equal([[ctx, RESTART]]);
+		});
+
+		it('R3: after a listing failure, a pulled-in record of an attempt this process ended tells the host only once', async () => {
+			const p = await fresh();
+			const { side, base, told } = await strand(p);
+			// The first quiet read meets the pre-crash orphan, tells the host and withdraws it.
+			expect(conversionQuiet(p.managers[side], p.id)).to.equal(false);
+			await settleOnce();
+			expect(abandoned(p, side).slice(told), 'the orphan').to.deep.equal([
+				RESTART
+			]);
+			await p.reconnect();
+			const base2 = base + 2;
+			expect(rows(p, side), 'withdrawn').to.equal(base2);
+			const write = deviceOnlyNextWrite(p, side);
+			await run(p, 0);
+			await p.settle();
+			write.stop();
+			await settleOnce();
+			expect(rows(p, side) - base2, 'attempt 2 not in the wallet').to.equal(0);
+			expect(
+				abandoned(p, side).slice(told),
+				'the orphan, then attempt 2'
+			).to.deep.equal([RESTART, NOT_RECORDED]);
+			await p.stores[side].backup(path.join(s.dir(), 'backup-r3.db'));
+			expect(rows(p, side) - base2, 'pulled in').to.equal(1);
+			expect(conversionQuiet(p.managers[side], p.id), 'not quiet').to.equal(
+				false
+			);
+			await settleOnce();
+			await settleOnce();
+			expect(
+				abandoned(p, side).slice(told),
+				'attempt 2 is told once'
+			).to.deep.equal([RESTART, NOT_RECORDED]);
+		});
+	});
+
+	describe('A copy that cannot convert (amendment D2)', () => {
+		it('D2: a generation 6 copy restored with an odd count reads not quiet, and its splice start neither reads the scope nor withdraws nor reports', async () => {
+			const t = plainTypePair(s);
+			const p = await conversionPair(s, 'plain', {
+				existing: {
+					id: t.id,
+					stores: t.stores,
+					roots: t.sides.map((side) => side.root),
+					nodeIds: [t.sides[0].binding.nodeId, t.sides[1].binding.nodeId]
+				}
+			});
+			clean(p);
+			const side = p.opener;
+			const base = rows(p, side);
+			p.link.hold('asset_splice:4');
+			expect((await run(p, 0)).error, 'start').to.equal(undefined);
+			expect(rows(p, side) - base, 'recorded').to.equal(1);
+			const file = path.join(s.dir(), 'copy.db');
+			await p.stores[side].backup(file);
+			const copy = SqliteStorage.openFinalWallet(file, t.sides[side].binding);
+			const original = p.stores[side];
+			s.closing(() => original.close());
+			expect(copy.supportsAssetConversion, 'generation 6').to.equal(true);
+			expect(copy.canConvertAssetChannels, 'not the original').to.equal(false);
+			expect(
+				attemptRowCount(copy, p.id) - base,
+				'restored with the record open'
+			).to.equal(1);
+			const scope = copy as unknown as Record<
+				| 'conversionAttemptRows'
+				| 'openConversionAttempt'
+				| 'withdrawConversionAttempt',
+				(...a: unknown[]) => unknown
+			>;
+			const spies = (
+				[
+					'conversionAttemptRows',
+					'openConversionAttempt',
+					'withdrawConversionAttempt'
+				] as const
+			).map((name) => sinon.spy(scope, name));
+			const mark = p.errors[side].length;
+			p.link.clearRules();
+			p.link.held.splice(0);
+			p.crash(side, { afterCrash: () => (p.stores[side] = copy) });
+			await settleOnce();
+			const m = p.managers[side];
+			let refused: string | undefined;
+			try {
+				m.startFinalSplice(p.channelId, {} as never);
+			} catch (e) {
+				refused = (e as Error).message;
+			}
+			expect(refused, 'past the quiet gate').to.equal(NO_SPLICE);
+			expect(conversionQuiet(m, p.id), 'not quiet').to.equal(false);
+			await settleOnce();
+			expect(
+				{
+					calls: spies.map((spy) => spy.callCount),
+					reports: p.errors[side]
+						.slice(mark)
+						.filter((e) => e.startsWith(WITHDRAWAL_FAILED))
+				},
+				'no COUNT, no read of the record, no withdrawal and no report'
+			).to.deep.equal({ calls: [0, 0, 0], reports: [] });
+			expect(attemptRowCount(copy, p.id) - base, 'still open').to.equal(1);
+		});
+	});
+
+	describe('Guards the v2.2 mutation table left green (K12, K13, K14 and K17)', () => {
+		it("K12 (O12): an orphan's report and host call wait for a microtask, never inside the quiet read", async () => {
+			const p = await fresh();
+			const { side, reports, told } = await strand(p);
+			const m = p.managers[side];
+			expect(reports, 'nothing yet').to.deep.equal([]);
+			expect(conversionQuiet(m, p.id)).to.equal(false);
+			const sync = {
+				reports: reports.length,
+				host: abandoned(p, side).length - told
+			};
+			await settleOnce();
+			expect(sync, 'nothing inside the read').to.deep.equal({
+				reports: 0,
+				host: 0
+			});
+			expect(reports, 'then the listing failure').to.deep.equal([
+				[p.id, WITHDRAWAL_FAILED + LOCKED]
+			]);
+			expect(abandoned(p, side).length - told, 'then the host').to.equal(1);
+		});
+
+		it('K13 (O13): an orphan on the device only, pulled in while the next attempt waits on prepare, is withdrawn at the record and that attempt reaches the fence', async () => {
+			const p = await fresh();
+			const side = p.opener;
+			const base = await deviceOnlyRecord(p, side);
+			const gate = gatePrepare(p, side);
+			const second = track(
+				startConversion(p.managers[0], p.channelId, { reference: REF })
+			);
+			await p.settle();
+			await second.done;
+			expect(second.error, 'second start').to.equal(undefined);
+			expect(gate.reached(), "the side's prepare waits").to.equal(true);
+			await p.stores[side].backup(path.join(s.dir(), 'backup-k13.db'));
+			expect(rows(p, side) - base, 'pulled in by the backup').to.equal(1);
+			gate.release();
+			await p.settle();
+			await settleOnce();
+			expect(kindsSince(p, side, base)).to.deep.equal([
+				'conversion-attempt',
+				RESTART,
+				'conversion-attempt',
+				FENCE
+			]);
+		});
+
+		it('K14 (O14): an orphan whose withdrawal is on the device only is resolved by the read that pulls it in, with no report', async () => {
+			const p = await fresh();
+			const side = p.opener;
+			const peer = (1 - side) as 0 | 1;
+			const base = rows(p, side);
+			p.link.hold('asset_splice:4');
+			expect((await run(p, 0)).error, 'start').to.equal(undefined);
+			const told = abandoned(p, side).length;
+			// The peer's tx_abort: the side's withdrawal lands on the device only.
+			const write = deviceOnlyNextWrite(p, side);
+			p.managers[side].handleMessage(
+				p.nodeIds[peer],
+				MessageType.TX_ABORT,
+				txAbort(p.channelId, 'The peer ends it')
+			);
+			write.stop();
+			expect(write.landed(), 'the device commit ran').to.equal(true);
+			expect(rows(p, side) - base, 'the wallet holds the record only').to.equal(
+				1
+			);
+			expect(abandoned(p, side).slice(told), 'ended').to.deep.equal([
+				'The peer ends it'
+			]);
+			const told2 = abandoned(p, side).length;
+			// Crash, and the rebuilt sweep cannot list: the record is an orphan.
+			const listing = failListing(p.stores[side]);
+			p.link.clearRules();
+			p.link.held.splice(0);
+			p.crash(side);
+			const reports = reportsOf(p.managers[side]);
+			await settleOnce();
+			listing.restore();
+			expect(listing.count(), 'the listing ran and failed').to.equal(1);
+			expect(rows(p, side) - base, 'still odd').to.equal(1);
+			expect(conversionQuiet(p.managers[side], p.id), 'not quiet').to.equal(
+				false
+			);
+			expect(rows(p, side) - base, 'the withdrawal pulled in').to.equal(2);
+			await settleOnce();
+			expect(reports, 'the listing failure only').to.deep.equal([
+				[p.id, WITHDRAWAL_FAILED + LOCKED]
+			]);
+			expect(abandoned(p, side).slice(told2), 'no host call').to.deep.equal([]);
+			expect(kindsSince(p, side, base)).to.deep.equal([
+				'conversion-attempt',
+				'The peer ends it'
+			]);
+		});
+
+		it("K17 (O17): a draining acceptor whose answer to the peer's tx_abort cannot be sent still ends at once", async () => {
+			const p = await fresh();
+			// Side 0 initiates; its STFU waits on the link, so side 1 stays accepted.
+			p.link.hold({ from: 0, name: 'STFU' });
+			expect((await run(p, 0)).error, 'start').to.equal(undefined);
+			const m1 = p.managers[1];
+			expect(attemptOf(m1, p.id)?.state, 'accepted').to.equal('accepted');
+			// stfu(0) before the acceptor's own: the acceptor fails into draining.
+			m1.handleMessage(
+				p.nodeIds[0],
+				MessageType.STFU,
+				stfu(p.channelId, false)
+			);
+			await settleOnce();
+			expect(attemptOf(m1, p.id)?.state, 'draining').to.equal('draining');
+			const undo = failAbortSends(p, 1);
+			try {
+				m1.handleMessage(
+					p.nodeIds[0],
+					MessageType.TX_ABORT,
+					txAbort(p.channelId, 'The initiator ends it')
+				);
+			} catch {
+				// The send's error may reach the caller; the end must not wait on it.
+			} finally {
+				undo();
+			}
+			expect(attemptOf(m1, p.id), 'ended at once').to.equal(undefined);
+			expect(held(m1, p.id)).to.equal(false);
+			p.link.clearRules();
+			p.link.held.splice(0);
 		});
 	});
 });
