@@ -99,7 +99,18 @@ describe('Asset conversion agreement to the fence (#2151 step 3a, test 5)', func
 
 				// The message order of section 6, with step 3b's layout and
 				// layout_ack before the fence. The two layout_acks may cross.
-				const all = conversionMessages(p, mark);
+				// Step 4b's signing messages between layout_ack and the fence are
+				// pinned by the exits file (A3); this test reads the rest.
+				const all = conversionMessages(p, mark).filter(
+					(m) =>
+						![
+							'asset_splice_consent',
+							'TX_ADD_INPUT',
+							'TX_ADD_OUTPUT',
+							'TX_COMPLETE',
+							'COMMITMENT_SIGNED'
+						].includes(m.name) && !/^asset_splice:[12356]$/.test(m.name)
+				);
 				const head = [
 					`${I}:conversion_terms`,
 					`${A}:conversion_reply`,
@@ -218,8 +229,10 @@ describe('Asset conversion agreement to the fence (#2151 step 3a, test 5)', func
 					expect(now.localBalanceMsat).to.equal(info[i].localBalanceMsat);
 					expect(now.remoteBalanceMsat).to.equal(info[i].remoteBalanceMsat);
 					expect(allocatedKeyIndex(p.stores[i])).to.equal(keys[i] + 1);
+					// Step 4b: and its conversion-exits and conversion-dropped rows
+					// in the conversion scope.
 					const changed = changedRows(rows[i], tableRows(p.stores[i]));
-					expect(changed, changed.join('\n')).to.have.length(4);
+					expect(changed, changed.join('\n')).to.have.length(6);
 					expect(
 						[
 							changed.filter((r) =>
@@ -231,10 +244,17 @@ describe('Asset conversion agreement to the fence (#2151 step 3a, test 5)', func
 										p.id +
 										'"'
 								)
+							).length,
+							changed.filter((r) =>
+								r.startsWith(
+									'+ final_lifecycle_log {"scope":"conversion","channel_id":"' +
+										p.id +
+										'"'
+								)
 							).length
 						],
 						changed.join('\n')
-					).to.deep.equal([2, 2]);
+					).to.deep.equal([2, 2, 2]);
 				}
 				expect(p.errors).to.deep.equal([[], []]);
 				await updateRound(p);

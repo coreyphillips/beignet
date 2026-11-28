@@ -125,9 +125,10 @@ function clean(p: IConversionPair): void {
 		h.propose = (): unknown => stubProposal(i);
 		h.describe = (ctx, _proposals, bitcoin): unknown =>
 			stubConversionDescription(ctx, h.termsFor(ctx), bitcoin);
-		h.prepare = (_ctx, _proposals, _bitcoin, layoutDigest): unknown => ({
-			digest: sha256(layoutDigest)
-		});
+		// Step 4b: the stub's whole plan, so the Memory only test reaches the
+		// 4b fence (contract section 13, "Memory only" rows).
+		h.prepare = (ctx, proposals, bitcoin, layoutDigest): unknown =>
+			h.planFor(ctx, proposals, bitcoin, layoutDigest);
 		p.feerateEstimates[i] = async (): Promise<number> => 1000;
 		margin(p, i, 0);
 	}
@@ -202,6 +203,14 @@ function holdCall(answer: (...args: unknown[]) => unknown): {
 	};
 }
 
+/** The plain messages Step 4b sends between layout_ack and the fence (exits file, A3). */
+const STEP_4B_WIRE = [
+	'TX_ADD_INPUT',
+	'TX_ADD_OUTPUT',
+	'TX_COMPLETE',
+	'COMMITMENT_SIGNED'
+];
+
 describe('Asset conversion to the fence after layout_ack (#2151 step 3b, section 8)', function () {
 	this.timeout(90000);
 	const s = scratch('conversion-layout-fence-');
@@ -230,11 +239,14 @@ describe('Asset conversion to the fence after layout_ack (#2151 step 3b, section
 				expect(start.error, 'start').to.equal(undefined);
 
 				// Section 3's wire order. The two layout_ack messages may cross.
+				// Step 4b's signing messages between layout_ack and the fence are
+				// pinned by the exits file (A3); this test reads the rest.
 				const wire = p.link.delivered
 					.slice(mark)
 					.filter(
 						(m) =>
-							m.type !== BEIGNET_CUSTOM_MESSAGE_TYPE ||
+							(m.type !== BEIGNET_CUSTOM_MESSAGE_TYPE &&
+								!STEP_4B_WIRE.includes(m.name)) ||
 							m.name.startsWith('conversion_') ||
 							isLayoutFrame(m)
 					);
@@ -384,8 +396,10 @@ describe('Asset conversion to the fence after layout_ack (#2151 step 3b, section
 					expect(now.localBalanceMsat).to.equal(info[i].localBalanceMsat);
 					expect(now.remoteBalanceMsat).to.equal(info[i].remoteBalanceMsat);
 					expect(allocatedKeyIndex(p.stores[i])).to.equal(keys[i] + 1);
+					// Step 4b: and its conversion-exits and conversion-dropped rows
+					// in the conversion scope.
 					const changed = changedRows(rows[i], tableRows(p.stores[i]));
-					expect(changed, changed.join('\n')).to.have.length(4);
+					expect(changed, changed.join('\n')).to.have.length(6);
 					expect(
 						[
 							changed.filter((r) =>
@@ -397,10 +411,17 @@ describe('Asset conversion to the fence after layout_ack (#2151 step 3b, section
 										p.id +
 										'"'
 								)
+							).length,
+							changed.filter((r) =>
+								r.startsWith(
+									'+ final_lifecycle_log {"scope":"conversion","channel_id":"' +
+										p.id +
+										'"'
+								)
 							).length
 						],
 						changed.join('\n')
-					).to.deep.equal([2, 2]);
+					).to.deep.equal([2, 2, 2]);
 				}
 				expect(p.errors).to.deep.equal([[], []]);
 				expect(p.unexpected).to.deep.equal([]);

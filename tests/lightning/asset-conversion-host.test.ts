@@ -5,6 +5,8 @@
  * what AUXILIARY_CHANNELS_API declares.
  */
 import { expect } from 'chai';
+import { readFileSync } from 'fs';
+import path from 'path';
 import * as lightningChannel from '../../src/lightning/channel';
 import { AUXILIARY_CHANNELS_API } from '../../src/lightning/channel/auxiliary-api';
 import { MAX_SPLICE_FEERATE_PERKW } from '../../src/lightning/channel/splice-weight';
@@ -12,8 +14,9 @@ import { Feature } from '../../src/lightning/features/flags';
 import { BEIGNET_CUSTOM_MESSAGE_TYPE } from '../../src/lightning/message/custom';
 import {
 	completeRecoveryHost,
-	CONVERSION_HOST_KEYS,
+	CONVERSION_3B_MEMBERS,
 	CONVERSION_HOST_MEMBERS,
+	CONVERSION_SIGNING_MEMBERS,
 	finalTestNode,
 	type IFinalTestNode
 } from './helpers/asset-conversion-node';
@@ -36,7 +39,7 @@ import {
 const NOT_OFFERED = 'Asset conversion is not offered by this node';
 const CONVERSION = Feature.OPTION_ASSET_CONVERSION;
 
-/** A host with exactly the conversion surface: six members, the version and a margin. */
+/** A host with exactly the conversion surface: nine members (Step 4b), the version and a margin. */
 function conversionHost(): Record<string, unknown> {
 	return {
 		assetConversionVersion: 1,
@@ -51,11 +54,11 @@ describe('completeAssetConversionHost (#2151 step 3b, section 1)', () => {
 	const complete = (host: unknown): boolean =>
 		completeAssetConversionHost()(host);
 
-	it('accepts a host with the six members, version 1 and a margin of 0', () => {
+	it('H1. accepts a host with the nine members, version 1 and a margin of 0', () => {
 		expect(complete(conversionHost())).to.equal(true);
 	});
 
-	it('accepts the complete recovery host of the tests', () => {
+	it('H5. accepts the complete recovery host of the tests (guard, green at base)', () => {
 		expect(complete(completeRecoveryHost())).to.equal(true);
 	});
 
@@ -64,13 +67,24 @@ describe('completeAssetConversionHost (#2151 step 3b, section 1)', () => {
 		expect(complete(null)).to.equal(false);
 	});
 
-	for (const name of CONVERSION_HOST_MEMBERS) {
+	for (const name of CONVERSION_3B_MEMBERS) {
 		it(`refuses a host without ${name}`, () => {
 			const host = conversionHost();
 			delete host[name];
 			expect(complete(host)).to.equal(false);
 		});
 		it(`refuses a host whose ${name} is not a function`, () => {
+			expect(complete({ ...conversionHost(), [name]: {} })).to.equal(false);
+		});
+	}
+
+	for (const name of CONVERSION_SIGNING_MEMBERS) {
+		it(`H2. refuses a host without ${name}`, () => {
+			const host = conversionHost();
+			delete host[name];
+			expect(complete(host)).to.equal(false);
+		});
+		it(`H2. refuses a host whose ${name} is not a function`, () => {
 			expect(complete({ ...conversionHost(), [name]: {} })).to.equal(false);
 		});
 	}
@@ -138,8 +152,17 @@ describe('Bit 463 on the complete conversion host (#2151 step 3b, section 1)', f
 		expect(bits()).to.deep.equal([false, true]);
 	});
 
-	for (const key of CONVERSION_HOST_KEYS)
+	for (const key of [
+		...CONVERSION_3B_MEMBERS,
+		'assetConversionVersion',
+		'conversionFeerateMarginPerKw'
+	])
 		it(`sets neither bit on a generation 6 node whose host lacks ${key}`, () => {
+			expect(bits(completeRecoveryHost([], key))).to.deep.equal([false, false]);
+		});
+
+	for (const key of CONVERSION_SIGNING_MEMBERS)
+		it(`H3. sets neither bit 463 nor 462 on a generation 6 node whose host lacks ${key}`, () => {
 			expect(bits(completeRecoveryHost([], key))).to.deep.equal([false, false]);
 		});
 
@@ -189,7 +212,41 @@ describe('The manager offers conversion only to a complete host (#2151 step 3b, 
 		});
 });
 
+describe('The manager offers conversion only to a host with the signing members (#2151 step 4b, H4)', function () {
+	this.timeout(90000);
+	const s = scratch('conversion-host-signing-');
+	after(() => s.release());
+
+	for (const name of CONVERSION_SIGNING_MEMBERS)
+		it(`H4. answers "${NOT_OFFERED}" with 3b's six members but no ${name}`, async () => {
+			const p = await conversionPair(s, 'plain');
+			delete (p.dualFunding[0] as unknown as Record<string, unknown>)[name];
+			await p.restart(0);
+			agreeOnTerms(p);
+			const start = track(
+				startConversion(p.managers[0], p.channelId, {
+					reference: Buffer.alloc(8, 1)
+				})
+			);
+			await start.done;
+			expect(start.error).to.equal(NOT_OFFERED);
+		});
+});
+
 describe('What the build declares (#2151 step 3b, section 1)', () => {
+	it('H6. keeps declared and assetConversionVersion as they were (guard, green at base)', () => {
+		expect([...AUXILIARY_CHANNELS_API.declared]).to.deep.equal([
+			'assetConversion:v1'
+		]);
+		expect(completeRecoveryHost().assetConversionVersion).to.equal(1);
+		expect(
+			completeAssetConversionHost()({
+				...conversionHost(),
+				assetConversionVersion: 2
+			})
+		).to.equal(false);
+	});
+
 	it('declares assetConversion:v1, frozen, under the amended rule', () => {
 		expect([...AUXILIARY_CHANNELS_API.declared]).to.deep.equal([
 			'assetConversion:v1'
@@ -238,5 +295,45 @@ describe('What the build declares (#2151 step 3b, section 1)', () => {
 			'assetSpliceRecovery:v1'
 		]);
 		expect(Object.isFrozen(AUXILIARY_CHANNELS_API.surfaces)).to.equal(true);
+	});
+});
+
+describe('The API snapshot names the Step 4b surface (#2151 step 4b, S1)', () => {
+	const snapshot = (name: string): string[] =>
+		readFileSync(
+			path.join(__dirname, '..', 'api-snapshot', name),
+			'utf8'
+		).split('\n');
+
+	it('S1. records the three host members, the three plan members, the new types and conversionRoots', () => {
+		const lightning = snapshot('beignet-lightning.txt');
+		const sqlite = snapshot('beignet-lightning-sqlite.txt');
+		const missing = (lines: string[], prefixes: string[]): string[] =>
+			prefixes.filter((prefix) => !lines.some((l) => l.startsWith(prefix)));
+		expect(
+			missing(lightning, [
+				'method channel.IAssetConversionHost.signConversionExits(',
+				'method channel.IAssetConversionHost.verifyConversionExits(',
+				'method channel.IAssetConversionHost.retainConversionExits(',
+				'method channel.IAuxiliaryDualFunding.signConversionExits?(',
+				'method channel.IAuxiliaryDualFunding.verifyConversionExits?(',
+				'method channel.IAuxiliaryDualFunding.retainConversionExits?(',
+				'method channel.IAssetConversionPlan.consent(',
+				'method channel.IAssetConversionPlan.authorize(',
+				'method channel.IAssetConversionPlan.finalize(',
+				'interface channel.IAssetConversionFunding',
+				'interface channel.IAssetConversionHostExitViews',
+				'interface channel.IAssetConversionExitEvidence',
+				'interface channel.IAssetConversionWithdrawal',
+				'interface channel.IAssetConversionWithdrawalReceipt',
+				'interface channel.IAssetConversionExitReceipt',
+				'type channel.IAssetConversionHostBranch = '
+			]),
+			'beignet-lightning.txt'
+		).to.deep.equal([]);
+		expect(
+			missing(sqlite, ['property IFinalSpliceTerms.conversionRoots?: ']),
+			'beignet-lightning-sqlite.txt'
+		).to.deep.equal([]);
 	});
 });

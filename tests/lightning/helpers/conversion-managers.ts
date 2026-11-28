@@ -62,6 +62,26 @@ import {
 } from './conversion-modules';
 import { CONVERSION_HOST_KEYS } from './asset-conversion-node';
 import { boundParticipant } from './final-opening-signing';
+import { buildSpliceTx } from '../../../src/lightning/channel/splice-tx';
+import { createTaprootFundingScript } from '../../../src/lightning/script/funding-taproot';
+import { buildAssetSpliceCommitment } from '../../../src/lightning/channel/final-opening-commitment';
+import type { IAssetOpenExit } from '../../../src/lightning/channel/asset-opening-provider';
+import { assetUpdateHistory } from '../../../src/lightning/storage/asset-update-history';
+import type { IAssetSpliceHolderRecovery } from '../../../src/lightning/storage/asset-splice-recovery';
+import {
+	branchCommitmentType,
+	type IFinalExitBranch
+} from '../../../src/lightning/storage/final-conversion-exits';
+import type {
+	ConversionExact,
+	IConversionExitEvidence,
+	IConversionExitReceipt,
+	IConversionFunding,
+	IConversionHostBranch,
+	IConversionHostExitViews,
+	IConversionSigningHost,
+	IConversionSigningPlan
+} from './conversion-modules';
 
 /** The height both managers run at once the pair is ready. */
 export const PAIR_HEIGHT = 600_000;
@@ -303,7 +323,15 @@ export type ConversionHostCallName =
 	| 'abandonConversion'
 	| 'proposeConversion'
 	| 'describeConversion'
-	| 'prepareConversion';
+	| 'prepareConversion'
+	// #2151 Step 4b (contract section 9.6): the plan's three members and
+	// the host's three signing members.
+	| 'consent'
+	| 'authorize'
+	| 'finalize'
+	| 'signConversionExits'
+	| 'verifyConversionExits'
+	| 'retainConversionExits';
 
 export interface IConversionHostCall {
 	side: 0 | 1;
@@ -353,15 +381,54 @@ export class ConversionHostStub {
 		bitcoin: IConversionBitcoin
 	) => unknown = (ctx, _proposals, bitcoin) =>
 		stubConversionDescription(ctx, this.termsFor(ctx), bitcoin);
-	/** Answers prepareConversion: by default sha256 of the layout digest. */
+	/**
+	 * Answers prepareConversion: by default `planFor`, the plan whose digest
+	 * is sha256 of the layout digest and whose three members (#2151 Step 4b)
+	 * answer through `consent`, `authorize` and `finalize` below.
+	 */
 	prepare: (
 		ctx: IAssetConversionContext,
 		proposals: ConversionPair<Buffer>,
 		bitcoin: IConversionBitcoin,
 		layoutDigest: Buffer
-	) => unknown = (_ctx, _proposals, _bitcoin, layoutDigest) => ({
-		digest: createHash('sha256').update(layoutDigest).digest()
-	});
+	) => unknown = (ctx, proposals, bitcoin, layoutDigest) =>
+		this.planFor(ctx, proposals, bitcoin, layoutDigest);
+	/** Answers the plan's consent(): by default 64 deterministic bytes. */
+	consent: (ctx: IAssetConversionContext) => unknown = (ctx) =>
+		stubConsent(ctx);
+	/** Answers the plan's authorize(consents): by default deterministic bytes. */
+	authorize: (
+		ctx: IAssetConversionContext,
+		consents: ConversionPair<Buffer>
+	) => unknown = (ctx, consents) => stubAuthorization(ctx, consents);
+	/** Answers the plan's finalize: by default `stubFinalize` over the facts the plan was made from. */
+	finalize: (
+		facts: IStubPlanFacts,
+		consents: ConversionPair<Buffer>,
+		authorizations: ConversionPair<Buffer>
+	) => unknown = (facts) => stubFinalize(facts);
+	/** Answers signConversionExits: by default `stubExitShare`. */
+	signExits: (
+		ctx: IAssetConversionContext,
+		views: IConversionHostExitViews
+	) => unknown = (ctx, views) => stubExitShare(ctx, views);
+	/** Answers verifyConversionExits: by default `stubExitEvidence`. */
+	verifyExits: (
+		ctx: IAssetConversionContext,
+		views: IConversionHostExitViews,
+		shares: ConversionPair<Buffer>
+	) => unknown = (ctx, views) => stubExitEvidence(this, ctx, views);
+	/** Answers retainConversionExits: by default `stubExitReceipt`. */
+	retainExits: (
+		ctx: IAssetConversionContext,
+		views: IConversionHostExitViews,
+		exact: ConversionExact
+	) => unknown = (ctx, views, exact) =>
+		stubExitReceipt(this, ctx, views, exact);
+	/** Side i's store, which the pair sets (the stub's receipt reads the opening from it). */
+	storeOf?: () => SqliteStorage;
+	/** The description this host's describeConversion returned, by the attempt. */
+	private readonly described = new Map<string, IConversionDescription>();
 	/** The terms this host was shown for each attempt (hex id). */
 	private readonly shown = new Map<string, IAssetConversionTerms>();
 
@@ -406,6 +473,60 @@ export class ConversionHostStub {
 		);
 	}
 
+	/** The store `storeOf` names; a stub outside a pair has none. */
+	store(): SqliteStorage {
+		if (!this.storeOf) throw new Error('The stub host has no store');
+		return this.storeOf();
+	}
+
+	/**
+	 * The plan the default `prepare` returns (#2151 Step 4b, section 9.6):
+	 * the 3b digest and the three members, each recorded in the log under
+	 * its own name and answered by `consent`, `authorize` or `finalize`.
+	 */
+	planFor(
+		ctx: IAssetConversionContext,
+		proposals: ConversionPair<Buffer>,
+		bitcoin: IConversionBitcoin,
+		layoutDigest: Buffer
+	): IConversionSigningPlan {
+		const key = Buffer.from(ctx.attempt).toString('hex');
+		const facts = (): IStubPlanFacts => ({
+			ctx,
+			proposals,
+			bitcoin,
+			layoutDigest: Buffer.from(layoutDigest),
+			description:
+				this.described.get(key) ??
+				stubConversionDescription(ctx, this.termsFor(ctx), bitcoin)
+		});
+		return {
+			digest: createHash('sha256').update(layoutDigest).digest(),
+			consent: () =>
+				this.record('consent', [], () =>
+					Promise.resolve().then(() => this.consent(ctx) as Buffer)
+				),
+			authorize: (consents: ConversionPair<Buffer>) =>
+				this.record('authorize', [consents], () =>
+					Promise.resolve().then(() => this.authorize(ctx, consents) as Buffer)
+				),
+			finalize: (
+				consents: ConversionPair<Buffer>,
+				authorizations: ConversionPair<Buffer>
+			) =>
+				this.record('finalize', [consents, authorizations], () =>
+					Promise.resolve().then(
+						() =>
+							this.finalize(
+								facts(),
+								consents,
+								authorizations
+							) as IConversionFunding
+					)
+				)
+		};
+	}
+
 	/**
 	 * The six conversion members (3a's three terms calls and 3b's three
 	 * planner calls), each recorded in the shared log.
@@ -414,7 +535,8 @@ export class ConversionHostStub {
 		IAuxiliaryDualFunding,
 		'conversionTerms' | 'verifyConversionTerms' | 'abandonConversion'
 	> &
-		IConversionHostPlanner {
+		IConversionHostPlanner &
+		IConversionSigningHost {
 		const show = (
 			ctx: IAssetConversionContext,
 			terms: IAssetConversionTerms
@@ -462,10 +584,15 @@ export class ConversionHostStub {
 				bitcoin: IConversionBitcoin
 			) =>
 				this.record('describeConversion', [ctx, proposals, bitcoin], () =>
-					Promise.resolve().then(
-						() =>
-							this.describe(ctx, proposals, bitcoin) as IConversionDescription
-					)
+					Promise.resolve()
+						.then(
+							() =>
+								this.describe(ctx, proposals, bitcoin) as IConversionDescription
+						)
+						.then((d) => {
+							this.described.set(Buffer.from(ctx.attempt).toString('hex'), d);
+							return d;
+						})
 				),
 			prepareConversion: (
 				ctx: IAssetConversionContext,
@@ -486,6 +613,34 @@ export class ConversionHostStub {
 									layoutDigest
 								) as IConversionPlan
 						)
+				),
+			signConversionExits: (
+				ctx: IAssetConversionContext,
+				views: IConversionHostExitViews
+			) =>
+				this.record('signConversionExits', [ctx, views], () =>
+					Promise.resolve().then(() => this.signExits(ctx, views) as Buffer)
+				),
+			verifyConversionExits: (
+				ctx: IAssetConversionContext,
+				views: IConversionHostExitViews,
+				shares: ConversionPair<Buffer>
+			) =>
+				this.record('verifyConversionExits', [ctx, views, shares], () =>
+					Promise.resolve().then(
+						() =>
+							this.verifyExits(ctx, views, shares) as IConversionExitEvidence
+					)
+				),
+			retainConversionExits: (
+				ctx: IAssetConversionContext,
+				views: IConversionHostExitViews,
+				exact: ConversionExact
+			) =>
+				this.record('retainConversionExits', [ctx, views, exact], () =>
+					Promise.resolve().then(
+						() => this.retainExits(ctx, views, exact) as IConversionExitReceipt
+					)
 				)
 		};
 	}
@@ -865,6 +1020,8 @@ export async function conversionPair(
 		new ConversionHostStub(0, hostLog),
 		new ConversionHostStub(1, hostLog)
 	];
+	// The stub's signing defaults read the opening from side i's current store.
+	hosts.forEach((h, i) => (h.storeOf = (): SqliteStorage => stores[i]));
 	const unexpected: string[] = [];
 	const inits: [FeatureFlags, FeatureFlags] = [
 		conversionInit(!options.without463?.[0]),
@@ -1318,6 +1475,18 @@ export function parentBalancesMsat(
 				local: BigInt(member.localRecovery.localBalanceMsat),
 				remote: BigInt(member.localRecovery.remoteBalanceMsat)
 			};
+		// #2151 Step 4b (W3): with no committed state, an adopted asset
+		// splice's candidate is the parent.
+		const adopted = store.loadAdoptedAssetSpliceReceipt(id) as unknown as {
+			candidate?: {
+				localRecovery: { localBalanceMsat: string; remoteBalanceMsat: string };
+			};
+		} | null;
+		if (!head.committed && adopted?.candidate)
+			return {
+				local: BigInt(adopted.candidate.localRecovery.localBalanceMsat),
+				remote: BigInt(adopted.candidate.localRecovery.remoteBalanceMsat)
+			};
 	}
 	const opening = store.loadFinalOpening(id)!;
 	return {
@@ -1755,9 +1924,12 @@ export function gateBarrier(p: IConversionPair, i: 0 | 1): () => void {
 	};
 }
 
-/** The fence's text (step 3b contract, section 6). */
+/**
+ * The fence's text (#2151 Step 4b contract, section 10.1): since Step 4b the
+ * initiator sends it after its own retainFinalConversionExits.
+ */
 export const FENCE =
-	'Asset conversion stops before its layout is signed in this build';
+	'Asset conversion stops before its funding is signed in this build';
 
 /** One update round on the parent, which must complete. */
 export async function updateRound(p: IConversionPair): Promise<void> {
@@ -2051,6 +2223,7 @@ export function expectFenceHostOrder(
 		'proposeConversion',
 		'describeConversion',
 		'prepareConversion',
+		...SIGNING_HOST_CALLS,
 		'abandonConversion'
 	]);
 	expect(names(A), 'acceptor host calls').to.deep.equal([
@@ -2058,6 +2231,7 @@ export function expectFenceHostOrder(
 		'proposeConversion',
 		'describeConversion',
 		'prepareConversion',
+		...SIGNING_HOST_CALLS,
 		'abandonConversion'
 	]);
 	const at = (side: 0 | 1, name: ConversionHostCallName): number =>
@@ -2079,4 +2253,560 @@ export function expectFenceHostOrder(
 	before([I, 'prepareConversion'], [A, 'abandonConversion']);
 	before([A, 'prepareConversion'], [A, 'abandonConversion']);
 	before([A, 'abandonConversion'], [I, 'abandonConversion']);
+	// Step 4b (section 1): each step needs the peer's object of the step before.
+	for (const [x, y] of [
+		[I, A],
+		[A, I]
+	] as const) {
+		before([x, 'consent'], [y, 'authorize']);
+		before([x, 'authorize'], [y, 'finalize']);
+		before([x, 'signConversionExits'], [y, 'verifyConversionExits']);
+		before([x, 'verifyConversionExits'], [y, 'retainConversionExits']);
+		before([x, 'retainConversionExits'], [A, 'abandonConversion']);
+	}
+}
+
+/** The six Step 4b host calls of one side, in their order (section 1). */
+export const SIGNING_HOST_CALLS = [
+	'consent',
+	'authorize',
+	'finalize',
+	'signConversionExits',
+	'verifyConversionExits',
+	'retainConversionExits'
+] as const;
+
+// ---------------------------------------------------------------------------
+// The stub signer (#2151 Step 4b contract, section 9.6)
+// ---------------------------------------------------------------------------
+
+type ExitHolder = 'local' | 'remote';
+type SpliceRole = 'initiator' | 'acceptor';
+
+const stubHash = (...parts: (Buffer | string)[]): Buffer =>
+	createHash('sha256')
+		.update(
+			Buffer.concat(
+				parts.map((v) => (typeof v === 'string' ? Buffer.from(v, 'utf8') : v))
+			)
+		)
+		.digest();
+const ownRole = (ctx: IAssetConversionContext): SpliceRole =>
+	ctx.isInitiator ? 'initiator' : 'acceptor';
+/** The splice role of the holder of a commitment, as side `ctx` names it. */
+const holderRole = (
+	ctx: IAssetConversionContext,
+	holder: ExitHolder
+): SpliceRole =>
+	(holder === 'local') === ctx.isInitiator ? 'initiator' : 'acceptor';
+
+/** What the plan's finalize is made from: the 3b facts and the description the host returned. */
+export interface IStubPlanFacts {
+	ctx: IAssetConversionContext;
+	proposals: ConversionPair<Buffer>;
+	bitcoin: IConversionBitcoin;
+	layoutDigest: Buffer;
+	description: IConversionDescription;
+}
+
+/** The plan's consent: 64 bytes from this side's role and the attempt. */
+export function stubConsent(ctx: IAssetConversionContext): Buffer {
+	return Buffer.concat([
+		stubHash('stub conversion consent 0 ', ownRole(ctx), ctx.attempt),
+		stubHash('stub conversion consent 1 ', ownRole(ctx), ctx.attempt)
+	]);
+}
+
+/** The plan's authorization: this side's role over both consents. */
+export function stubAuthorization(
+	ctx: IAssetConversionContext,
+	consents: ConversionPair<Buffer>
+): Buffer {
+	return Buffer.concat([
+		Buffer.from('stub conversion authorization ' + ownRole(ctx) + ' '),
+		stubHash(consents[0], consents[1])
+	]);
+}
+
+/** To an asset: the candidate's root, sha256('stub-conversion-root' || layoutDigest). */
+export function stubConversionRoot(layoutDigest: Buffer): Buffer {
+	return stubHash('stub-conversion-root', layoutDigest);
+}
+/** To an asset: the candidate's funding proofs. */
+export function stubFundingProofs(layoutDigest: Buffer): Buffer {
+	return Buffer.concat([
+		Buffer.from('stub conversion funding proofs '),
+		layoutDigest
+	]);
+}
+/** The proof digest, in both directions (decision 8). */
+export function stubProofDigest(
+	direction: 'to-asset' | 'to-plain',
+	layoutDigest: Buffer
+): Buffer {
+	return stubHash(
+		'stub conversion proof digest ' + direction + ' ',
+		layoutDigest
+	);
+}
+
+/** OP_1 <descriptorHash>, the script of every stub output but the funding one. */
+export function stubOutputScript(descriptorHash: Buffer): Buffer {
+	return Buffer.concat([Buffer.from([0x51, 0x20]), descriptorHash]);
+}
+
+/**
+ * The unsigned funding both hosts build (section 9.6 and V13 N7), with the
+ * engine's own splice builder: the description's inputs, the funding output
+ * paying the candidate keys under the stub root (to an asset) or no root
+ * (to bitcoin), and OP_1 <descriptorHash> for every other output, at
+ * `splice_init.locktime`.
+ */
+export function stubFinalize(facts: IStubPlanFacts): IConversionFunding {
+	const { ctx, bitcoin, description, layoutDigest } = facts;
+	const toAsset = ctx.direction === 'to-asset';
+	const root = toAsset ? stubConversionRoot(layoutDigest) : undefined;
+	const fundingScript = createTaprootFundingScript(
+		bitcoin.fundingKeys[0],
+		bitcoin.fundingKeys[1],
+		undefined,
+		root
+	).p2trOutput;
+	const tx = buildSpliceTx(
+		description.inputs.map((i) => ({
+			serialId: i.serialId,
+			prevTxid: Buffer.from(i.txid),
+			prevOutputIndex: i.vout,
+			sequence: i.sequence
+		})),
+		description.outputs.map((o) => ({
+			serialId: o.serialId,
+			script:
+				o.kind === 'funding'
+					? fundingScript
+					: stubOutputScript(o.descriptorHash),
+			valueSats: o.valueSats
+		})),
+		bitcoin.lockTime
+	);
+	return {
+		layoutDigest: Buffer.from(layoutDigest),
+		transaction: tx.toBuffer(),
+		proofDigest: stubProofDigest(ctx.direction, layoutDigest),
+		...(root && {
+			fundingRoot: root,
+			fundingProofs: stubFundingProofs(layoutDigest)
+		})
+	};
+}
+
+/** This side's exit share: its role over the final digest. */
+export function stubExitShare(
+	ctx: IAssetConversionContext,
+	views: IConversionHostExitViews
+): Buffer {
+	return Buffer.concat([
+		Buffer.from('stub conversion exit share ' + ownRole(ctx) + ' '),
+		Buffer.from(views.finalDigest)
+	]);
+}
+
+/** A deterministic leaf of the commitment `role` holds. */
+export function stubLeaf(
+	role: SpliceRole,
+	which: 'to_local' | 'to_remote'
+): { script: string; leafVersion: number } {
+	return {
+		script:
+			'6a20' +
+			stubHash('stub conversion leaf ', role, ' ', which).toString('hex'),
+		leafVersion: 0xc0
+	};
+}
+
+/** An asset branch's evidence for one holder, from its stored recovery and proofs. */
+export function branchEvidence(
+	branch: IFinalExitBranch,
+	holder: ExitHolder
+): IAssetOpenExit {
+	if (branch.type !== 'asset') throw new Error('fixture: not an asset branch');
+	const recovery =
+		holder === 'local' ? branch.localRecovery : branch.remoteRecovery;
+	return {
+		...(recovery.toLocal && { toLocal: { ...recovery.toLocal } }),
+		...(recovery.toRemote && { toRemote: { ...recovery.toRemote } }),
+		proofs: holder === 'local' ? branch.localProofs : branch.remoteProofs
+	};
+}
+
+/**
+ * The exit evidence (section 9.6): to an asset, the candidate's deterministic
+ * leaves and proofs by holder role; to bitcoin, the parent's enrolled proofs
+ * and leaves (`enrolledAssetParent`). A plain branch has null.
+ */
+export function stubExitEvidence(
+	stub: ConversionHostStub,
+	ctx: IAssetConversionContext,
+	views: IConversionHostExitViews
+): IConversionExitEvidence {
+	if (ctx.direction === 'to-asset') {
+		const holder = (h: ExitHolder): IAssetOpenExit => {
+			const role = holderRole(ctx, h);
+			return {
+				toLocal: stubLeaf(role, 'to_local'),
+				toRemote: stubLeaf(role, 'to_remote'),
+				proofs: stubHash(
+					'stub conversion exit proofs ',
+					role,
+					' ',
+					views.finalDigest
+				).toString('hex')
+			};
+		};
+		return {
+			parent: null,
+			candidate: { local: holder('local'), remote: holder('remote') }
+		};
+	}
+	const parent = enrolledAssetParent(
+		stub.store(),
+		ctx.channelId,
+		BigInt(ctx.parent.stateNumber)
+	);
+	return {
+		parent: {
+			local: branchEvidence(parent, 'local'),
+			remote: branchEvidence(parent, 'remote')
+		},
+		candidate: null
+	};
+}
+
+interface IOpeningRecordView {
+	candidate: Record<string, unknown> & {
+		fundingTxHex: string;
+		fundingOutputIndex: number;
+		localFundingPubkey: string;
+		remoteFundingPubkey: string;
+		minimumDepth: number;
+		localContributionSats: string | number | bigint;
+		remoteContributionSats: string | number | bigint;
+	};
+	nonces: {
+		session: {
+			channelKeyIndex: number;
+			terms: Record<string, unknown> & {
+				commitmentFeeratePerKw: number;
+				localBasepoints: { firstPerCommitmentPoint: string };
+				remoteBasepoints: { firstPerCommitmentPoint: string };
+			};
+			assetEvidence?: {
+				fundingRoot: string;
+				fundingProofs: string;
+				local: IAssetOpenExit;
+				remote: IAssetOpenExit;
+			};
+		};
+		signing: { exit: Buffer | string };
+	};
+}
+/** The store's private opening record. */
+export function openingRecordOf(
+	store: SqliteStorage,
+	id: string
+): IOpeningRecordView {
+	const record = (
+		store as unknown as { finalOpeningRecord(id: string): unknown }
+	).finalOpeningRecord(id) as IOpeningRecordView | null;
+	if (!record) throw new Error('fixture: no opening record');
+	return record;
+}
+
+const storedLeaf = (
+	l: IAssetOpenExit['toLocal']
+): { script: string; leafVersion?: number } | null => (l ? { ...l } : null);
+const auxLeaf = (
+	l: IAssetOpenExit['toLocal'] | null
+): { script: Buffer; leafVersion?: number } | undefined =>
+	l
+		? { script: Buffer.from(l.script, 'hex'), leafVersion: l.leafVersion }
+		: undefined;
+
+/**
+ * An asset opening's own branch at state 0 (W4, the shape of
+ * `review-v1-proofs/asset-parent-n0.test.ts`): the opening's funding, its
+ * evidence's root and proofs, its signed local exit and the remote view
+ * rebuilt at 0, at the session's commitment feerate.
+ */
+export function openingAssetBranch(
+	store: SqliteStorage,
+	id: string
+): IFinalExitBranch {
+	const record = openingRecordOf(store, id);
+	const c = record.candidate;
+	const session = record.nonces.session;
+	const ev = session.assetEvidence;
+	if (!ev) throw new Error('fixture: not an asset opening');
+	const terms = session.terms;
+	const funding = {
+		fundingTxHex: c.fundingTxHex,
+		fundingOutputIndex: c.fundingOutputIndex,
+		localFundingPubkey: c.localFundingPubkey,
+		remoteFundingPubkey: c.remoteFundingPubkey,
+		localFundingKeyIndex: session.channelKeyIndex
+	};
+	const balances = {
+		localBalanceMsat: BigInt(c.localContributionSats) * 1000n,
+		remoteBalanceMsat: BigInt(c.remoteContributionSats) * 1000n
+	};
+	const root = Buffer.from(ev.fundingRoot, 'hex');
+	const pointOf = (holder: ExitHolder): string =>
+		(holder === 'local' ? terms.localBasepoints : terms.remoteBasepoints)
+			.firstPerCommitmentPoint;
+	const view = (
+		holder: ExitHolder
+	): ReturnType<typeof buildAssetSpliceCommitment> =>
+		buildAssetSpliceCommitment(
+			c as never,
+			terms as never,
+			holder,
+			Buffer.from(pointOf(holder), 'hex'),
+			0n,
+			balances,
+			[],
+			funding,
+			root,
+			{
+				fundingRoot: root,
+				toLocal: auxLeaf(ev[holder].toLocal),
+				toRemote: auxLeaf(ev[holder].toRemote)
+			},
+			branchCommitmentType(ASSET_SPLICE_RECOVERY_TYPE_HEX, root)
+		);
+	const lv = view('local');
+	const rv = view('remote');
+	const recovery = (
+		holder: ExitHolder,
+		v: typeof lv
+	): IAssetSpliceHolderRecovery => ({
+		point: pointOf(holder),
+		localBalanceMsat: String(balances.localBalanceMsat),
+		remoteBalanceMsat: String(balances.remoteBalanceMsat),
+		ownedOutputIndex:
+			(holder === 'local' ? v.outputMap.toLocal : v.outputMap.toRemote) ?? null,
+		toLocal: storedLeaf(ev[holder].toLocal),
+		toRemote: storedLeaf(ev[holder].toRemote),
+		htlcs: []
+	});
+	const exit = record.nonces.signing.exit;
+	return {
+		type: 'asset',
+		feeratePerKw: terms.commitmentFeeratePerKw,
+		minimumDepth: c.minimumDepth,
+		funding,
+		fundingTxid: Transaction.fromHex(c.fundingTxHex).getId(),
+		outputIndex: c.fundingOutputIndex,
+		fundingRoot: ev.fundingRoot,
+		fundingProofs: ev.fundingProofs,
+		localCommitment: Buffer.isBuffer(exit)
+			? exit.toString('hex')
+			: String(exit),
+		localProofs: ev.local.proofs,
+		remoteCommitment: rv.tx.toHex(),
+		remoteProofs: ev.remote.proofs,
+		localRecovery: recovery('local', lv),
+		remoteRecovery: recovery('remote', rv)
+	} as unknown as IFinalExitBranch;
+}
+
+/**
+ * The asset parent branch at N the engine must build (4.3 with V3, W3 and
+ * W4): with a secured state at N, that state's member on the live funding;
+ * else the adopted asset splice receipt's candidate; else the opening's own
+ * evidence at 0. The feerate is the committed state's, else the session's.
+ */
+export function enrolledAssetParent(
+	store: SqliteStorage,
+	id: string,
+	stateNumber: bigint
+): IFinalExitBranch {
+	const current = store.loadFinalChannelType(id)!;
+	const state = assetUpdateHistory(store, id).states.get(stateNumber);
+	if (state) {
+		const member = state.members.find(
+			(m) =>
+				m.fundingTxid === current.funding.txid &&
+				m.outputIndex === current.funding.outputIndex
+		);
+		if (!member)
+			throw new Error(
+				'fixture: no member on the live funding at ' + stateNumber
+			);
+		return { type: 'asset', feeratePerKw: state.feerate, ...member };
+	}
+	const adopted = store.loadAdoptedAssetSpliceReceipt(id) as unknown as
+		| {
+				candidate: Omit<
+					Extract<IFinalExitBranch, { type: 'asset' }>,
+					'type' | 'feeratePerKw'
+				>;
+		  }
+		| null
+		| undefined;
+	if (adopted)
+		return {
+			type: 'asset',
+			feeratePerKw: openingRecordOf(store, id).nonces.session.terms
+				.commitmentFeeratePerKw,
+			...adopted.candidate
+		};
+	return openingAssetBranch(store, id);
+}
+
+/**
+ * The host's receipt (section 9.6): the engine's branches rebuilt from the
+ * views and the exact set (a plain branch from its holder views, an asset
+ * candidate through the engine's commitment builder with the evidence
+ * leaves, an asset parent as `enrolledAssetParent` with the exact
+ * commitments), and, to bitcoin on the buyer's side, one receipt per
+ * withdrawal this side owns.
+ */
+export function stubExitReceipt(
+	stub: ConversionHostStub,
+	ctx: IAssetConversionContext,
+	views: IConversionHostExitViews,
+	exact: ConversionExact
+): IConversionExitReceipt {
+	const store = stub.store();
+	const record = openingRecordOf(store, ctx.channelId);
+	const N = BigInt(ctx.parent.stateNumber);
+	const feerate = views.terms.commitmentFeeratePerKw;
+	const evidence = stubExitEvidence(stub, ctx, views);
+	const openingRoot = record.nonces.session.assetEvidence
+		? Buffer.from(record.nonces.session.assetEvidence.fundingRoot, 'hex')
+		: undefined;
+	const build = (name: 'parent' | 'candidate'): IFinalExitBranch => {
+		const b: IConversionHostBranch = views[name];
+		const commitments = {
+			localCommitment: exact[name].local.toHex(),
+			remoteCommitment: exact[name].remote.toHex()
+		};
+		if (b.type === 'asset' && name === 'parent')
+			return {
+				...enrolledAssetParent(store, ctx.channelId, N),
+				...commitments
+			};
+		const base = {
+			minimumDepth:
+				name === 'candidate'
+					? stub.termsFor(ctx).lockDepth
+					: record.candidate.minimumDepth,
+			funding: b.funding,
+			fundingTxid: Transaction.fromHex(b.funding.fundingTxHex).getId(),
+			outputIndex: b.funding.fundingOutputIndex
+		};
+		const balances = (
+			h: ExitHolder
+		): {
+			point: string;
+			localBalanceMsat: string;
+			remoteBalanceMsat: string;
+		} => ({
+			point: Buffer.from(b[h].point).toString('hex'),
+			localBalanceMsat: String(b[h].localBalanceMsat),
+			remoteBalanceMsat: String(b[h].remoteBalanceMsat)
+		});
+		if (b.type === 'plain')
+			return {
+				type: 'plain',
+				channelType: b.channelType,
+				...base,
+				...commitments,
+				localRecovery: {
+					...balances('local'),
+					feeratePerKw: feerate,
+					htlcs: []
+				},
+				remoteRecovery: {
+					...balances('remote'),
+					feeratePerKw: feerate,
+					htlcs: []
+				}
+			};
+		const leaves = evidence.candidate!;
+		const recovery = (h: ExitHolder): IAssetSpliceHolderRecovery => {
+			const v = buildAssetSpliceCommitment(
+				record.candidate as never,
+				views.terms,
+				h,
+				Buffer.from(b[h].point),
+				N,
+				{
+					localBalanceMsat: b[h].localBalanceMsat,
+					remoteBalanceMsat: b[h].remoteBalanceMsat
+				},
+				[],
+				b.funding,
+				openingRoot ?? Buffer.alloc(0),
+				{
+					fundingRoot: b.fundingRoot,
+					toLocal: auxLeaf(leaves[h].toLocal),
+					toRemote: auxLeaf(leaves[h].toRemote)
+				},
+				branchCommitmentType(ASSET_SPLICE_RECOVERY_TYPE_HEX, openingRoot)
+			);
+			return {
+				...balances(h),
+				ownedOutputIndex:
+					(h === 'local' ? v.outputMap.toLocal : v.outputMap.toRemote) ?? null,
+				toLocal: storedLeaf(leaves[h].toLocal),
+				toRemote: storedLeaf(leaves[h].toRemote),
+				htlcs: []
+			};
+		};
+		return {
+			type: 'asset',
+			feeratePerKw: feerate,
+			...base,
+			fundingRoot: Buffer.from(b.fundingRoot).toString('hex'),
+			fundingProofs: stubFundingProofs(views.layoutDigest).toString('hex'),
+			localCommitment: commitments.localCommitment,
+			localProofs: leaves.local.proofs,
+			remoteCommitment: commitments.remoteCommitment,
+			remoteProofs: leaves.remote.proofs,
+			localRecovery: recovery('local'),
+			remoteRecovery: recovery('remote')
+		} as unknown as IFinalExitBranch;
+	};
+	return {
+		channelId: ctx.channelId,
+		finalDigest: Buffer.from(views.finalDigest).toString('hex'),
+		stateNumber: ctx.parent.stateNumber,
+		parent: build('parent'),
+		candidate: build('candidate'),
+		withdrawals: (views.withdrawals ?? [])
+			.filter((w) => w.owner === 'local')
+			.map((w) => ({
+				outputIndex: w.outputIndex,
+				assetId: w.assetId,
+				units: w.units.toString(),
+				proof: stubWithdrawalProof(views.finalDigest, w.outputIndex, w.assetId)
+			}))
+	};
+}
+
+/** The stub's signed withdrawal transfer and proof for one output and issuance. */
+export function stubWithdrawalProof(
+	finalDigest: Buffer,
+	outputIndex: number,
+	assetId: string
+): string {
+	return stubHash(
+		'stub conversion withdrawal proof ',
+		String(outputIndex),
+		' ',
+		assetId,
+		' ',
+		finalDigest
+	).toString('hex');
 }

@@ -259,3 +259,131 @@ export function completeAssetConversionHost(): (host: unknown) => boolean {
 		'src/lightning/channel/asset-conversion-transport'
 	);
 }
+
+// ---------------------------------------------------------------------------
+// #2151 Step 4b: the signing surface. The new members and types do not exist
+// on the base, so they are mirrored here from the 4b contract (sections 9.1
+// to 9.3) over the base types they name, and the tests own them.
+// ---------------------------------------------------------------------------
+
+/** `IAssetConversionFunding` (4b section 9.1). */
+export interface IConversionFunding {
+	layoutDigest: Buffer;
+	transaction: Buffer;
+	/** 32 bytes, in both directions. */
+	proofDigest: Buffer;
+	/** To an asset only: 32 bytes. */
+	fundingRoot?: Buffer;
+	/** To an asset only: 1 byte to 4 MiB. */
+	fundingProofs?: Buffer;
+}
+
+/** `IAssetConversionPlan` with the 4b members (section 9.1). */
+export interface IConversionSigningPlan extends IConversionPlan {
+	consent(): Promise<Buffer>;
+	authorize(consents: ConversionPair<Buffer>): Promise<Buffer>;
+	finalize(
+		consents: ConversionPair<Buffer>,
+		authorizations: ConversionPair<Buffer>
+	): Promise<IConversionFunding>;
+}
+
+type HostHolder =
+	import('../../../src/lightning/channel/asset-splice-signature-round').IAssetSpliceHostHolder;
+type FundingReference =
+	import('../../../src/lightning/channel/final-splice-candidate').IFinalFundingReference;
+
+/** `IAssetConversionHostBranch` (section 9.2). */
+export type IConversionHostBranch =
+	| {
+			type: 'plain';
+			channelType: string;
+			funding: FundingReference;
+			local: HostHolder;
+			remote: HostHolder;
+	  }
+	| {
+			type: 'asset';
+			channelType: string;
+			funding: FundingReference;
+			fundingRoot: Buffer;
+			local: HostHolder;
+			remote: HostHolder;
+	  };
+
+/** `IAssetConversionWithdrawal` (section 9.2). */
+export interface IConversionWithdrawal {
+	assetId: string;
+	from: 'initiator' | 'acceptor';
+	outputSerial: bigint;
+	outputIndex: number;
+	units: bigint;
+	owner: 'local' | 'remote';
+}
+
+/** `IAssetConversionHostExitViews` (section 9.2). */
+export interface IConversionHostExitViews {
+	terms: import('../../../src/lightning/channel/final-opening-commitment').IFinalOpeningTerms;
+	originalInitiator: boolean;
+	finalDigest: Buffer;
+	layoutDigest: Buffer;
+	fundingFeeratePerkw: number;
+	paymentBasepoints: ConversionPair<Buffer>;
+	parent: IConversionHostBranch;
+	candidate: IConversionHostBranch;
+	withdrawals?: readonly IConversionWithdrawal[];
+}
+
+type OpenExit =
+	import('../../../src/lightning/channel/asset-opening-provider').IAssetOpenExit;
+
+/** `IAssetConversionExitEvidence` (section 9.2). */
+export interface IConversionExitEvidence {
+	parent: Record<'local' | 'remote', OpenExit> | null;
+	candidate: Record<'local' | 'remote', OpenExit> | null;
+}
+
+/** `IAssetConversionWithdrawalReceipt` (section 9.2). */
+export interface IConversionWithdrawalReceipt {
+	outputIndex: number;
+	assetId: string;
+	units: string;
+	proof: string;
+}
+
+type ExitBranch =
+	import('../../../src/lightning/storage/final-conversion-exits').IFinalExitBranch;
+
+/** `IAssetConversionExitReceipt` (section 9.2). */
+export interface IConversionExitReceipt {
+	channelId: string;
+	finalDigest: string;
+	stateNumber: string;
+	parent: ExitBranch;
+	candidate: ExitBranch;
+	withdrawals: readonly IConversionWithdrawalReceipt[];
+}
+
+/** SR:955-964's exact set (section 9.3). */
+export type ConversionExact = Record<
+	'parent' | 'candidate',
+	Record<'local' | 'remote', Transaction>
+>;
+
+/** The three host members of section 9.3. */
+export interface IConversionSigningHost {
+	signConversionExits(
+		ctx: IAssetConversionContext,
+		views: IConversionHostExitViews
+	): Promise<Buffer>;
+	verifyConversionExits(
+		ctx: IAssetConversionContext,
+		views: IConversionHostExitViews,
+		shares: ConversionPair<Buffer>
+	): Promise<IConversionExitEvidence>;
+	retainConversionExits(
+		ctx: IAssetConversionContext,
+		views: IConversionHostExitViews,
+		exact: ConversionExact
+	): Promise<IConversionExitReceipt>;
+}
