@@ -2252,7 +2252,9 @@ export function expectFenceHostOrder(
 	before([A, 'proposeConversion'], [A, 'describeConversion']);
 	before([I, 'prepareConversion'], [A, 'abandonConversion']);
 	before([A, 'prepareConversion'], [A, 'abandonConversion']);
-	before([A, 'abandonConversion'], [I, 'abandonConversion']);
+	// Z1: the initiator tells its host at its own fence, before the acceptor
+	// ends at that fence.
+	before([I, 'abandonConversion'], [A, 'abandonConversion']);
 	// Step 4b (section 1): each step needs the peer's object of the step before.
 	for (const [x, y] of [
 		[I, A],

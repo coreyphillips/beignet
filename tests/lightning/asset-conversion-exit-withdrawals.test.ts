@@ -22,6 +22,7 @@ import {
 	encodeTxCompleteMessage
 } from '../../src/lightning/message/interactive-tx';
 import { MessageType } from '../../src/lightning/message/types';
+import { decodeCommitmentSignedMessage } from '../../src/lightning/message/channel-commitment';
 import { FinalDeviceJournal } from '../../src/lightning/storage/final-device-journal';
 import { scratch } from './helpers/channel-type-pairs';
 import { deviceAuthority } from './helpers/channel-type-record';
@@ -173,9 +174,10 @@ describe('Every end of a signing attempt drops, then withdraws (#2151 step 4b, s
 					const at = await toPhase(p, phase, I);
 					p.disconnect();
 					await p.settle();
-					// The initiator is aborting at P7b, not ended: the disconnect
-					// ends both sides.
+					// The initiator is aborting at P7b: its host was told with the
+					// fence when the fence left (Z1); the disconnect ends the rest.
 					const told: [string, string] = [R.disconnected, R.disconnected];
+					if (phase === 'P7b') told[I] = FENCE;
 					for (const i of [0, 1] as const)
 						expectEnded(p, i, base, retainedAt(phase), told[i]);
 					const rows = allRows(p);
@@ -203,11 +205,9 @@ describe('Every end of a signing attempt drops, then withdraws (#2151 step 4b, s
 					expect(reconnected.callCount, 'before any reconnect').to.equal(0);
 					reconnected.restore();
 					await settleOnce();
-					// The initiator at P7b withdrew at its fence and was aborting,
-					// waiting for the echo, when it crashed: no end ran, and its
-					// rebuilt manager finds no open record to tell the host of.
-					const untold = phase === 'P7b' && i === 0;
-					const crashedReason = untold ? undefined : R.restart;
+					// The initiator at P7b withdrew at its fence and told its host
+					// then (Z1), before it crashed waiting for the echo.
+					const crashedReason = phase === 'P7b' && i === 0 ? FENCE : R.restart;
 					expect(
 						attemptEvents(p.stores[i], p.id)
 							.slice(base.attempts[i])
@@ -221,14 +221,7 @@ describe('Every end of a signing attempt drops, then withdraws (#2151 step 4b, s
 						retainedAt(phase) ? ['conversion-exits', 'conversion-dropped'] : []
 					);
 					await p.settle();
-					expectEnded(
-						p,
-						i,
-						base,
-						retainedAt(phase),
-						crashedReason,
-						untold ? 0 : 1
-					);
+					expectEnded(p, i, base, retainedAt(phase), crashedReason);
 					const rows = allRows(p);
 					await lateAnswers(p, at);
 					expect(
@@ -237,6 +230,31 @@ describe('Every end of a signing attempt drops, then withdraws (#2151 step 4b, s
 					).to.deep.equal(rows);
 					await expectParentWorks(p, parent);
 				});
+	});
+
+	describe('A crash in the echo window (Z1)', () => {
+		it("Z1. tells the initiator's host once, with the fence, when it crashes waiting for the fence's echo (P7b)", async () => {
+			const p = await fresh('plain');
+			const base = marks(p);
+			await toPhase(p, 'P7b', 0);
+			expect(
+				p.hosts[0].calls('retainConversionExits'),
+				'side 0 retained with its host'
+			).to.have.length(1);
+			expect(
+				conversionKinds(p.stores[0], p.id).slice(base.conversions[0]),
+				'side 0 dropped at its fence'
+			).to.deep.equal(['conversion-exits', 'conversion-dropped']);
+			p.crash(0);
+			await p.settle();
+			p.link.clearRules();
+			p.link.held.splice(0);
+			await p.reconnect();
+			await p.settle();
+			// 8.1 with Z1: the host that retained the candidate's exits is told
+			// once that the attempt ended, at the fence, before the crash.
+			expect(abandoned(p, 0), "side 0's host told once").to.deep.equal([FENCE]);
+		});
 	});
 
 	describe('The deadline (B3, B4)', () => {
@@ -997,12 +1015,35 @@ describe('Every end of a signing attempt drops, then withdraws (#2151 step 4b, s
 
 		it('B18. runs a second attempt with identical terms to the fence on the same connection after the fence (asset)', async () => {
 			const p = await shared('asset1');
+			let first: Buffer | undefined;
 			for (const round of [1, 2]) {
-				agreeOnTerms(p);
-				await track(
-					startConversion(p.managers[0], p.channelId, { reference: REF })
-				).done;
-				await p.settle();
+				if (round === 1) {
+					const mark = p.link.sent.length;
+					agreeOnTerms(p);
+					await track(
+						startConversion(p.managers[0], p.channelId, { reference: REF })
+					).done;
+					await p.settle();
+					const commit = p.link.sent
+						.slice(mark)
+						.find((m) => m.from === 1 && m.name === 'COMMITMENT_SIGNED');
+					first = decodeCommitmentSignedMessage(commit!.payload).fundingTxid;
+				} else {
+					// Z4: during the second attempt, a late commitment_signed naming
+					// the first attempt's candidate is skipped (W1), not an update.
+					const at = await toPhase(p, 'P1', 0);
+					p.managers[0].handleMessage(
+						p.nodeIds[1],
+						MessageType.COMMITMENT_SIGNED,
+						forgedCommitmentSigned(p.channelId, first!)
+					);
+					await p.settle();
+					expect(
+						abandoned(p, 0).slice(-1),
+						'not ended by the stale message'
+					).to.not.deep.equal([R.peerUpdated]);
+					await at.release();
+				}
 				expect(abandoned(p, 0).slice(-1), 'fence ' + round).to.deep.equal([
 					FENCE
 				]);
