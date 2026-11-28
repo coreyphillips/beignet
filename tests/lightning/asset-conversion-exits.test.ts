@@ -929,70 +929,78 @@ describe('Asset conversion signs both exits up to the 4b fence (#2151 step 4b, s
 		];
 		for (const [member, text, wrong] of MEMBERS)
 			for (const how of ['a throw', 'a wrong shape', 'no answer'] as const)
-				it(`A12. ends with "${text}" when side 0's ${member} gives ${how}, with no conversion-exits`, async () => {
-					const p = await shared('plain');
-					const base = marks(p);
-					const clock =
-						how === 'no answer'
-							? sinon.useFakeTimers({
-									now: Date.now(),
-									toFake: ['Date', 'setTimeout', 'clearTimeout']
-							  })
-							: undefined;
-					const answer = (): unknown => {
-						if (how === 'a throw') throw new Error('host refused');
-						if (how === 'a wrong shape') return wrong;
-						return never();
-					};
-					(p.hosts[0] as unknown as Record<Member, () => unknown>)[member] =
-						answer;
-					const mark = p.link.sent.length;
-					agreeOnTerms(p);
-					const start = track(
-						startConversion(p.managers[0], p.channelId, { reference: REF })
-					);
-					await p.settle();
-					if (clock) {
-						await tick(p, clock, HOST_BOUND_MS + 1000);
-						await tick(p, clock, HOST_BOUND_MS + 1000);
-						clock.restore();
-					}
-					await start.done;
-					expect(
-						p.hosts[0].calls(
-							member === 'signExits'
-								? 'signConversionExits'
-								: member === 'verifyExits'
-								? 'verifyConversionExits'
-								: member === 'retainExits'
-								? 'retainConversionExits'
-								: member
-						),
-						'the member was called'
-					).to.have.length(1);
-					expect(abortsFrom(p, 0, mark), 'on the wire').to.include(text);
-					expect(abandoned(p, 0), 'in abandon').to.deep.equal([text]);
-					for (const i of [0, 1] as const) {
-						// The declining side retains nothing. Its peer may have
-						// retained before the abort reached it (section 1, step 8),
-						// and then drops at the end (7.1).
-						expect(
-							conversionKinds(p.stores[i], p.id).slice(base.conversions[i]),
-							'side ' + i + ' no conversion-exits'
-						).to.deep.equal(
-							i !== 0 && p.hosts[i].calls('retainConversionExits').length
-								? ['conversion-exits', 'conversion-dropped']
-								: []
+				for (const side of [0, 1] as const)
+					it(`A12. ends with "${text}" when side ${side}'s ${member} gives ${how}, with no conversion-exits`, async () => {
+						const p = await shared('plain');
+						const base = marks(p);
+						const clock =
+							how === 'no answer'
+								? sinon.useFakeTimers({
+										now: Date.now(),
+										toFake: ['Date', 'setTimeout', 'clearTimeout']
+								  })
+								: undefined;
+						const answer = (): unknown => {
+							if (how === 'a throw') throw new Error('host refused');
+							if (how === 'a wrong shape') return wrong;
+							return never();
+						};
+						(p.hosts[side] as unknown as Record<Member, () => unknown>)[
+							member
+						] = answer;
+						const mark = p.link.sent.length;
+						agreeOnTerms(p);
+						const start = track(
+							startConversion(p.managers[0], p.channelId, { reference: REF })
 						);
+						await p.settle();
+						if (clock) {
+							await tick(p, clock, HOST_BOUND_MS + 1000);
+							await tick(p, clock, HOST_BOUND_MS + 1000);
+							clock.restore();
+						}
+						await start.done;
 						expect(
-							attemptEvents(p.stores[i], p.id)
-								.slice(base.attempts[i])
-								.map((e) => e.kind),
-							'side ' + i + ' withdrawn'
-						).to.deep.equal(['conversion-attempt', 'conversion-withdrawn']);
-					}
-					expect(quiet(p)).to.deep.equal([false, false]);
-				});
+							p.hosts[side].calls(
+								member === 'signExits'
+									? 'signConversionExits'
+									: member === 'verifyExits'
+									? 'verifyConversionExits'
+									: member === 'retainExits'
+									? 'retainConversionExits'
+									: member
+							),
+							'the member was called'
+						).to.have.length(1);
+						expect(abortsFrom(p, side, mark), 'on the wire').to.include(text);
+						expect(abandoned(p, side), 'in abandon').to.deep.equal([text]);
+						// The declining side retains nothing. Its peer retains exactly
+						// when the side failed after the peer accepted the side's
+						// commitment_signed: at its retain (section 1, step 8), then
+						// drops at the end (7.1).
+						const peerRetains = member === 'retainExits';
+						for (const i of [0, 1] as const) {
+							const retains = i !== side && peerRetains;
+							expect(
+								conversionKinds(p.stores[i], p.id).slice(base.conversions[i]),
+								'side ' + i + ' no conversion-exits'
+							).to.deep.equal(
+								retains ? ['conversion-exits', 'conversion-dropped'] : []
+							);
+							if (i !== side)
+								expect(
+									p.hosts[i].calls('retainConversionExits').length > 0,
+									'side ' + i + ' retain call'
+								).to.equal(retains);
+							expect(
+								attemptEvents(p.stores[i], p.id)
+									.slice(base.attempts[i])
+									.map((e) => e.kind),
+								'side ' + i + ' withdrawn'
+							).to.deep.equal(['conversion-attempt', 'conversion-withdrawn']);
+						}
+						expect(quiet(p)).to.deep.equal([false, false]);
+					});
 	});
 
 	describe("The plan's shape (A13)", () => {
@@ -1047,18 +1055,23 @@ describe('Asset conversion signs both exits up to the 4b fence (#2151 step 4b, s
 			expect(abortsFrom(p, side, mark).length, 'on the wire').to.be.greaterThan(
 				0
 			);
+			// The refusing side retains nothing. Its peer retains exactly when
+			// the side failed after the peer accepted its commitment_signed:
+			// at the receipt checks (section 1, step 8); it then drops (7.1).
+			const peerRetains = text === T.receipt || text === T.withdrawal;
 			for (const i of [0, 1] as const) {
-				// The refusing side retains nothing. Its peer may have retained
-				// before the abort reached it (section 1, step 8), and then
-				// drops at the end (7.1).
+				const retains = i !== side && peerRetains;
 				expect(
 					conversionKinds(p.stores[i], p.id).slice(base.conversions[i]),
 					'side ' + i + ' no conversion-exits'
 				).to.deep.equal(
-					i !== side && p.hosts[i].calls('retainConversionExits').length
-						? ['conversion-exits', 'conversion-dropped']
-						: []
+					retains ? ['conversion-exits', 'conversion-dropped'] : []
 				);
+				if (i !== side)
+					expect(
+						p.hosts[i].calls('retainConversionExits').length > 0,
+						'side ' + i + ' retain call'
+					).to.equal(retains);
 				expect(
 					attemptEvents(p.stores[i], p.id)
 						.slice(base.attempts[i])
@@ -1259,10 +1272,12 @@ describe('Asset conversion signs both exits up to the 4b fence (#2151 step 4b, s
 					conversionKinds(p.stores[i], p.id).slice(base.conversions[i]),
 					'side ' + i
 				).to.deep.equal(
-					i === 1 && p.hosts[1].calls('retainConversionExits').length
-						? ['conversion-exits', 'conversion-dropped']
-						: []
+					i === 1 ? ['conversion-exits', 'conversion-dropped'] : []
 				);
+			expect(
+				p.hosts[1].calls('retainConversionExits'),
+				'side 1 retain call'
+			).to.have.length(1);
 		});
 	});
 
@@ -2087,7 +2102,9 @@ describe('Asset conversion signs both exits up to the 4b fence (#2151 step 4b, s
 		async function guarded(
 			key: Key,
 			setup: (p: IConversionPair) => void,
-			side: 0 | 1 = 0
+			side: 0 | 1 = 0,
+			/** The side fails after the peer accepted its commitment_signed. */
+			peerRetains = false
 		): Promise<{
 			p: IConversionPair;
 			text: string;
@@ -2101,17 +2118,23 @@ describe('Asset conversion signs both exits up to the 4b fence (#2151 step 4b, s
 			await run(p, 0);
 			const told = abandoned(p, side);
 			expect(told, 'side ' + side + ' ended once').to.have.length(1);
-			// The failing side retains nothing. Its peer may have retained before
-			// the abort reached it (section 1, step 8), and then drops (7.1).
-			for (const i of [0, 1] as const)
+			// The failing side retains nothing. Its peer retains exactly when
+			// the side failed after the peer accepted its commitment_signed
+			// (section 1, step 8), and then drops (7.1).
+			for (const i of [0, 1] as const) {
+				const retains = i !== side && peerRetains;
 				expect(
 					conversionKinds(p.stores[i], p.id).slice(base.conversions[i]),
 					'side ' + i
 				).to.deep.equal(
-					i !== side && p.hosts[i].calls('retainConversionExits').length
-						? ['conversion-exits', 'conversion-dropped']
-						: []
+					retains ? ['conversion-exits', 'conversion-dropped'] : []
 				);
+				if (i !== side)
+					expect(
+						p.hosts[i].calls('retainConversionExits').length > 0,
+						'side ' + i + ' retain call'
+					).to.equal(retains);
+			}
 			return { p, text: told[0], mark, base };
 		}
 		const afterRecord = (
@@ -2174,6 +2197,40 @@ describe('Asset conversion signs both exits up to the 4b fence (#2151 step 4b, s
 					1
 				);
 			});
+
+		it(`Z5. refuses a consent naming the attempt in laid-out with "${T.premature}" (5.4)`, async () => {
+			const p = await shared('plain');
+			const mark = p.link.sent.length;
+			// A's layout_ack and the consent that follows it wait: I stays laid-out.
+			p.link.hold(
+				(m) =>
+					m.from === 1 &&
+					(m.name === 'asset_splice:4' || m.name === 'asset_splice_consent')
+			);
+			agreeOnTerms(p);
+			const start = track(
+				startConversion(p.managers[0], p.channelId, { reference: REF })
+			);
+			await p.settle();
+			expect(attemptOf(p.managers[0], p.id)?.state).to.equal('laid-out');
+			const [agreement] = frameDigests(p, 0, 'asset_splice:4', mark);
+			const attempt = Buffer.from(lastRecord(p.stores[0], p.id).attempt, 'hex');
+			p.managers[0].handleAssetOpenFrame(
+				p.nodeIds[1],
+				BeignetCustomSubtype.ASSET_SPLICE_CONSENT,
+				encodeAssetOpenConsent({
+					attempt,
+					digest: agreement,
+					signature: Buffer.alloc(64, 1)
+				})
+			);
+			await p.settle();
+			expect(abandoned(p, 0)).to.deep.equal([T.premature]);
+			p.link.clearRules();
+			p.link.held.splice(0);
+			await p.settle();
+			await start.done;
+		});
 
 		it(`A34. refuses a peer exit frame while consents are exchanged with "${T.premature}"`, async () => {
 			const p = await shared('plain');
@@ -2397,14 +2454,19 @@ describe('Asset conversion signs both exits up to the 4b fence (#2151 step 4b, s
 		];
 		for (const [what, change] of receiptCases)
 			it(`A37. refuses a receipt with ${what} with "${T.receipt}"`, async () => {
-				const { text } = await guarded('plain', (p) => {
-					const h = p.hosts[0];
-					h.retainExits = (ctx, views, exact): unknown => {
-						const r = stubExitReceipt(h, ctx, views, exact) as never;
-						change(r);
-						return r;
-					};
-				});
+				const { text } = await guarded(
+					'plain',
+					(p) => {
+						const h = p.hosts[0];
+						h.retainExits = (ctx, views, exact): unknown => {
+							const r = stubExitReceipt(h, ctx, views, exact) as never;
+							change(r);
+							return r;
+						};
+					},
+					0,
+					true
+				);
 				expect(text).to.equal(T.receipt);
 			});
 
@@ -2582,6 +2644,42 @@ describe('Asset conversion signs both exits up to the 4b fence (#2151 step 4b, s
 		});
 	});
 
+	describe('Z3. The echo bound before our commitment_signed', () => {
+		it('Z3. bounds the echo of a tx_abort sent before our commitment_signed left at 15 s (V2)', async () => {
+			const p = await shared('plain');
+			p.hosts[0].verifyExits = (): unknown => {
+				throw new Error('host refused');
+			};
+			p.link.drop({ from: 1, name: 'TX_ABORT' });
+			const mark = p.link.sent.length;
+			const clock = sinon.useFakeTimers({
+				now: Date.now(),
+				toFake: ['Date', 'setTimeout', 'clearTimeout']
+			});
+			try {
+				agreeOnTerms(p);
+				const start = track(
+					startConversion(p.managers[0], p.channelId, { reference: REF })
+				);
+				await p.settle();
+				expect(abortsFrom(p, 0, mark)).to.include(T.verify);
+				expect(
+					sentNames(p, 0, mark).filter((n) => n === 'COMMITMENT_SIGNED'),
+					'our commitment_signed never left'
+				).to.deep.equal([]);
+				await tick(p, clock, 14_000);
+				expect(p.recycled[0], 'no disconnect at 14 s').to.deep.equal([]);
+				await tick(p, clock, 2_000);
+				expect(p.recycled[0].length, 'a disconnect at 16 s').to.be.greaterThan(
+					0
+				);
+				await start.done;
+			} finally {
+				clock.restore();
+			}
+		});
+	});
+
 	describe('W2. The fence in one read with the commitment_signed', () => {
 		it("W2-burst. retains once per side when the initiator's commitment_signed and fence arrive in one turn, and the acceptor echoes after its conversion-exits", async () => {
 			const p = await shared('plain');
@@ -2626,6 +2724,47 @@ describe('Asset conversion signs both exits up to the 4b fence (#2151 step 4b, s
 				expectEnded(p, i, base, true, FENCE);
 			}
 			expect(exitsAtEcho, 'the echo after conversion-exits').to.equal(0);
+		});
+
+		it("W2-burst 2. queues the acceptor's tx_abort that arrives with its commitment_signed behind the initiator's retain, and ends both without a disconnect", async () => {
+			const p = await fresh('plain');
+			const base = marks(p);
+			const A = 1 as const;
+			// The acceptor's host refuses its retain after the acceptor's own
+			// commitment_signed left, so its tx_abort follows that message.
+			p.hosts[A].retainExits = (): unknown =>
+				Promise.reject(new Error('test: acceptor refuses its retain'));
+			const pair = (m: { from: number; name: string }): boolean =>
+				m.from === A &&
+				(m.name === 'COMMITMENT_SIGNED' || m.name === 'TX_ABORT');
+			p.link.hold(pair);
+			agreeOnTerms(p);
+			const start = track(
+				startConversion(p.managers[0], p.channelId, { reference: REF })
+			);
+			await p.settle();
+			expect(
+				p.link.held.map((m) => m.name),
+				'held in order'
+			).to.deep.equal(['COMMITMENT_SIGNED', 'TX_ABORT']);
+			p.link.clearRules();
+			p.link.burst(pair);
+			p.link.release();
+			await p.settle();
+			await start.done;
+			expect(abortsFrom(p, 0), "the initiator's fence").to.deep.equal([FENCE]);
+			expect(abandoned(p, 0), 'side 0').to.deep.equal([FENCE]);
+			expect(abandoned(p, 1), 'side 1').to.deep.equal([T.retain]);
+			expect(
+				conversionKinds(p.stores[0], p.id).slice(base.conversions[0]),
+				'the initiator retained, then dropped'
+			).to.deep.equal(['conversion-exits', 'conversion-dropped']);
+			expect(
+				conversionKinds(p.stores[1], p.id).slice(base.conversions[1]),
+				'the acceptor retained nothing'
+			).to.deep.equal([]);
+			expect(p.recycled[0], 'no disconnect').to.deep.equal([]);
+			expect(p.recycled[1], 'no disconnect').to.deep.equal([]);
 		});
 	});
 });

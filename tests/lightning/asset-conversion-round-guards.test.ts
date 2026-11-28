@@ -247,6 +247,47 @@ describe('Asset conversion round guards (#2151 step 4b, X5, X6 and X15)', functi
 		expect(handle(candidate), 'after a disconnect').to.equal(false);
 	});
 
+	it('Z2. refuses a store that cannot convert asset channels (2.6)', () => {
+		const store = p.stores[0];
+		Object.defineProperty(store, 'canConvertAssetChannels', {
+			configurable: true,
+			get: (): boolean => false
+		});
+		try {
+			expect(() => build(facts)).to.throw(
+				'Asset conversion requires an original conversion wallet'
+			);
+		} finally {
+			delete (store as unknown as Record<string, unknown>)
+				.canConvertAssetChannels;
+		}
+		expect(() => build(facts), 'restored').to.not.throw();
+	});
+
+	it('Z2. refuses a store inside a transaction (2.6)', () => {
+		let thrown: unknown;
+		walletDb(p.stores[0]).transaction(() => {
+			try {
+				build(facts);
+			} catch (error) {
+				thrown = error;
+			}
+		})();
+		expect((thrown as Error | undefined)?.message).to.equal(
+			'Conversion exits require a top-level commit'
+		);
+	});
+
+	it('Z2. refuses a store that is not the original device (2.6)', () => {
+		sinon
+			.stub(
+				p.stores[0] as unknown as { requireOpeningAuthority(): unknown },
+				'requireOpeningAuthority'
+			)
+			.throws(new Error('test: not the original device'));
+		expect(() => build(facts)).to.throw('test: not the original device');
+	});
+
 	it('2.1. refuses a consent whose digest is not the agreement', async () => {
 		// Last in this block: it ends the attempt the facts came from.
 		const a = attemptOf(p.managers[0], p.id) as unknown as { attempt: Buffer };
