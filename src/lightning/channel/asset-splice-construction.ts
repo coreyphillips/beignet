@@ -28,6 +28,7 @@ import type {
 	IFinalSpliceTerms
 } from './final-splice-candidate';
 import type { FinalSpliceEvent } from './final-splice-state';
+import type { IInteractiveTxInput } from '../interactive-tx/types';
 
 interface Frame {
 	type: M;
@@ -91,31 +92,48 @@ const nonceKeys = (n: Nonces): string[] =>
 		b.toString('hex')
 	);
 
-/** Validate and persist each BOLT construction frame before the caller sends or acts on it. */
-export class AssetSpliceConstruction {
+/** What a construction is checked against: the frozen transaction, its terms and the layout's inputs and outputs. */
+export interface ISpliceConstructionView {
+	channelId: Buffer;
+	attempt: Buffer;
+	/** Hex. */
+	finalDigest: string;
+	/** The frozen transaction, hex. */
+	transaction: string;
+	terms: IFinalSpliceTerms;
+	inputs: readonly IInteractiveTxInput[];
+	outputs: readonly { serialId: bigint; amountSats: bigint }[];
+}
+/** Where a construction keeps its frames: a journal head with its records, and an append after that head. */
+export interface ISpliceConstructionJournal {
+	read(): { records: readonly unknown[] };
+	append(head: { records: readonly unknown[] }, entry: Entry): void;
+}
+
+/** Validate and record each BOLT construction frame before the caller sends or acts on it. */
+export class SpliceConstructionCore {
 	private readonly id: Buffer;
-	private readonly idHex: string;
 	private readonly binding: Binding;
 	private readonly terms: IFinalSpliceTerms;
 	private readonly frozen: string;
 	private readonly localComplete: Buffer;
 	private readonly turns: IAssetConstructionTurn[];
+	private readonly journal: {
+		read(): { records: Entry[] };
+		append(head: { records: readonly unknown[] }, entry: Entry): void;
+	};
 	constructor(
-		layout: IAssetSpliceLayout,
-		verified: ReturnType<typeof verifyAssetSpliceCandidate>,
+		view: ISpliceConstructionView,
 		localComplete: Buffer,
-		private readonly store: SqliteStorage
+		journal: ISpliceConstructionJournal
 	) {
-		const view = assetSpliceConstructionView(layout, verified);
-		if (!store.canSpliceDualFundedAssets)
-			throw new Error('Asset splice construction requires the original device');
-		this.id = Buffer.from(layout.channelId);
-		this.idHex = this.id.toString('hex');
+		this.journal = journal as SpliceConstructionCore['journal'];
+		this.id = Buffer.from(view.channelId);
 		this.terms = view.terms;
 		this.frozen = view.transaction;
 		const tx = Transaction.fromHex(this.frozen);
 		this.binding = {
-			attempt: layout.attempt.toString('hex'),
+			attempt: view.attempt.toString('hex'),
 			finalDigest: view.finalDigest,
 			txid: tx.getId(),
 			initiator: view.terms.localIsSpliceInitiator
@@ -123,7 +141,7 @@ export class AssetSpliceConstruction {
 		this.localComplete = Buffer.from(localComplete);
 		complete(this.localComplete, this.id);
 		const sides: IAssetConstructionTurn[][] = [[], []];
-		for (const x of layout.inputs) {
+		for (const x of view.inputs) {
 			const side = Number(x.serialId & 1n);
 			sides[side].push({
 				initiator: side === 0,
@@ -138,7 +156,7 @@ export class AssetSpliceConstruction {
 				})
 			});
 		}
-		for (const [i, o] of layout.outputs.entries()) {
+		for (const [i, o] of view.outputs.entries()) {
 			const side = Number(o.serialId & 1n);
 			sides[side].push({
 				initiator: side === 0,
@@ -160,7 +178,7 @@ export class AssetSpliceConstruction {
 			throw new Error(
 				'Asset splice construction exceeds the BOLT payload limit'
 			);
-		const head = store.readAssetSpliceJournal<Entry>(this.idHex);
+		const head = this.journal.read();
 		const saved = head.records.find(
 			(r) =>
 				r.kind === 'construction-start' && r.attempt === this.binding.attempt
@@ -192,7 +210,7 @@ export class AssetSpliceConstruction {
 						'Asset splice nonce already belongs to another construction'
 					);
 			}
-			store.appendAssetSpliceEvent(this.idHex, head, {
+			this.journal.append(head, {
 				kind: 'construction-start',
 				...this.binding,
 				terms: {
@@ -206,7 +224,7 @@ export class AssetSpliceConstruction {
 		this.state();
 	}
 	private state() {
-		const head = this.store.readAssetSpliceJournal<Entry>(this.idHex);
+		const head = this.journal.read();
 		const frames: Wire[] = [];
 		const used = new Set(nonceKeys(complete(this.localComplete, this.id)));
 		let started = false;
@@ -295,13 +313,13 @@ export class AssetSpliceConstruction {
 		for (const k of keys) used.add(k);
 	}
 	private write(
-		s: ReturnType<AssetSpliceConstruction['state']>,
+		s: ReturnType<SpliceConstructionCore['state']>,
 		local: boolean,
 		type: M,
 		payload: Buffer
 	): void {
 		this.validate(s.frames.length, local, type, payload, s.used);
-		this.store.appendAssetSpliceEvent(this.idHex, s.head, {
+		this.journal.append(s.head, {
 			kind: 'construction-frame',
 			...this.binding,
 			local,
@@ -368,5 +386,41 @@ export class AssetSpliceConstruction {
 			local: complete(built.localComplete, this.id),
 			peer: complete(built.peerComplete, this.id)
 		};
+	}
+}
+
+/** The asset splice's construction: the core over the verified manifest, recorded in the `asset-splice` scope. */
+export class AssetSpliceConstruction extends SpliceConstructionCore {
+	constructor(
+		layout: IAssetSpliceLayout,
+		verified: ReturnType<typeof verifyAssetSpliceCandidate>,
+		localComplete: Buffer,
+		store: SqliteStorage
+	) {
+		const view = assetSpliceConstructionView(layout, verified);
+		if (!store.canSpliceDualFundedAssets)
+			throw new Error('Asset splice construction requires the original device');
+		const id = layout.channelId.toString('hex');
+		super(
+			{
+				channelId: layout.channelId,
+				attempt: layout.attempt,
+				finalDigest: view.finalDigest,
+				transaction: view.transaction,
+				terms: view.terms,
+				inputs: layout.inputs,
+				outputs: layout.outputs
+			},
+			localComplete,
+			{
+				read: () => store.readAssetSpliceJournal<Entry>(id),
+				append: (head, entry) =>
+					store.appendAssetSpliceEvent(
+						id,
+						head as ReturnType<typeof store.readAssetSpliceJournal>,
+						entry
+					)
+			}
+		);
 	}
 }

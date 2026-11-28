@@ -31,6 +31,12 @@ export interface IFinalFundingReference {
 export interface IFinalSpliceTerms {
 	/** Roots verified against the retained parent and the completed candidate asset proofs. */
 	assetFundingRoots?: { parent: Buffer; candidate: Buffer };
+	/**
+	 * A conversion's one asset root (#2151 Step 4b): the parent's when it
+	 * converts to bitcoin, the candidate's when it converts to an asset.
+	 * Never set with `assetFundingRoots`.
+	 */
+	conversionRoots?: { parent?: Buffer; candidate?: Buffer };
 	parent: Transaction;
 	parentIndex: number;
 	oldLocalKey: Buffer;
@@ -74,6 +80,7 @@ export function finalSpliceFeeError(
 	if (
 		!strict ||
 		t.assetFundingRoots !== undefined ||
+		t.conversionRoots !== undefined ||
 		t.localIsSpliceInitiator ||
 		!singleShared ||
 		t.localDelta !== 0n ||
@@ -141,6 +148,22 @@ export function buildFinalSpliceCandidate(
 			roots.candidate.length !== 32)
 	)
 		throw new Error('Asset splicing requires both verified funding roots');
+	const conversion = terms.conversionRoots;
+	const root32 = (v: unknown): boolean =>
+		v === undefined || (Buffer.isBuffer(v) && v.length === 32);
+	if (
+		conversion !== undefined &&
+		(roots !== undefined ||
+			!conversion ||
+			typeof conversion !== 'object' ||
+			(conversion.parent === undefined) ===
+				(conversion.candidate === undefined) ||
+			!root32(conversion.parent) ||
+			!root32(conversion.candidate))
+	)
+		throw new Error('Invalid final splice terms');
+	const parentRoot = roots?.parent ?? conversion?.parent;
+	const candidateRoot = roots?.candidate ?? conversion?.candidate;
 	const parentOutput = terms.parent.outs[terms.parentIndex];
 	if (
 		!parentOutput ||
@@ -148,7 +171,7 @@ export function buildFinalSpliceCandidate(
 			terms.oldLocalKey,
 			terms.oldPeerKey,
 			undefined,
-			roots?.parent
+			parentRoot
 		).p2trOutput.equals(parentOutput.script)
 	)
 		throw new Error('Shared input does not match the active funding keys');
@@ -156,7 +179,7 @@ export function buildFinalSpliceCandidate(
 		terms.newLocalKey,
 		terms.newPeerKey,
 		undefined,
-		roots?.candidate
+		candidateRoot
 	).p2trOutput;
 	const capacity =
 		BigInt(parentOutput.value) + terms.localDelta + terms.peerDelta;

@@ -10,6 +10,7 @@ unexported type EventMap<E> = { [K in keyof E]: (...args: any[]) => void; }
 unexported type FinalFundingWitnessSigner = (unsigned: bitcoinjs-lib#Transaction, indices: readonly number[], prevouts: Prevouts) => Buffer[][]
 unexported type FinalSplicePlan = Pick<IFinalSpliceIntent, 'localDelta' | 'feeBudget' | 'feerate' | 'locktime' | 'inputs' | 'outputs'>
 unexported type Holder = 'local' | 'remote'
+unexported type IAssetExitBranch = { type: 'asset'; feeratePerKw: number; } & IAssetSpliceExitBranch
 unexported interface IAssetOpenLayout
 property IAssetOpenLayout.acceptHash: Buffer
 property IAssetOpenLayout.acceptorProposalHash: Buffer
@@ -163,6 +164,7 @@ property IFinalCommitmentView.keys: channel.ICommitmentKeys
 property IFinalCommitmentView.outputMap: script.ICommitmentTxResult['outputMap']
 property IFinalCommitmentView.toSelfDelay: number
 property IFinalCommitmentView.tx: bitcoinjs-lib#Transaction
+unexported type IFinalExitBranch = IAssetExitBranch | IPlainExitBranch
 unexported interface IFinalFundingReference
 property IFinalFundingReference.fundingOutputIndex: number
 property IFinalFundingReference.fundingTxHex: string
@@ -271,6 +273,23 @@ unexported interface ILedgerTransitionResult<R extends ILedgerRecord>
 property ILedgerTransitionResult.actualState?: string
 property ILedgerTransitionResult.outcome: LedgerTransitionOutcome
 property ILedgerTransitionResult.record?: R
+unexported interface IPlainExitBranch
+property IPlainExitBranch.channelType: string
+property IPlainExitBranch.funding: IFinalFundingReference
+property IPlainExitBranch.fundingTxid: string
+property IPlainExitBranch.localCommitment: string
+property IPlainExitBranch.localRecovery: IPlainHolderRecovery
+property IPlainExitBranch.minimumDepth: number
+property IPlainExitBranch.outputIndex: number
+property IPlainExitBranch.remoteCommitment: string
+property IPlainExitBranch.remoteRecovery: IPlainHolderRecovery
+property IPlainExitBranch.type: 'plain'
+unexported interface IPlainHolderRecovery
+property IPlainHolderRecovery.feeratePerKw: number
+property IPlainHolderRecovery.htlcs: [ ]
+property IPlainHolderRecovery.localBalanceMsat: string
+property IPlainHolderRecovery.point: string
+property IPlainHolderRecovery.remoteBalanceMsat: string
 unexported interface IResolvedNodeDefaults
 property IResolvedNodeDefaults.announcedAddresses: gossip.INodeAddress[]
 property IResolvedNodeDefaults.autoRebalance: Readonly<Required<node.IAutoRebalanceConfig>>
@@ -2039,6 +2058,22 @@ property channel.IAssetConversionDescription.movements: readonly channel.IAssetC
 property channel.IAssetConversionDescription.outputs: channel.IAssetSpliceDescription['outputs']
 property channel.IAssetConversionDescription.parentUnits: readonly { assetId: string; initiator: bigint; acceptor: bigint; }[]
 property channel.IAssetConversionDescription.relativeSatoshis: readonly bigint[]
+interface channel.IAssetConversionExitEvidence
+property channel.IAssetConversionExitEvidence.candidate: Record<'local' | 'remote', channel.IAssetOpenExit> | null
+property channel.IAssetConversionExitEvidence.parent: Record<'local' | 'remote', channel.IAssetOpenExit> | null
+interface channel.IAssetConversionExitReceipt
+property channel.IAssetConversionExitReceipt.candidate: IFinalExitBranch
+property channel.IAssetConversionExitReceipt.channelId: string
+property channel.IAssetConversionExitReceipt.finalDigest: string
+property channel.IAssetConversionExitReceipt.parent: IFinalExitBranch
+property channel.IAssetConversionExitReceipt.stateNumber: string
+property channel.IAssetConversionExitReceipt.withdrawals: readonly channel.IAssetConversionWithdrawalReceipt[]
+interface channel.IAssetConversionFunding
+property channel.IAssetConversionFunding.fundingProofs?: Buffer
+property channel.IAssetConversionFunding.fundingRoot?: Buffer
+property channel.IAssetConversionFunding.layoutDigest: Buffer
+property channel.IAssetConversionFunding.proofDigest: Buffer
+property channel.IAssetConversionFunding.transaction: Buffer
 interface channel.IAssetConversionHost
 method channel.IAssetConversionHost.abandonConversion(ctx: channel.IAssetConversionContext, reason: string): void | Promise<void>
 property channel.IAssetConversionHost.assetConversionVersion: 1
@@ -2047,14 +2082,31 @@ method channel.IAssetConversionHost.conversionTerms(ctx: Omit<channel.IAssetConv
 method channel.IAssetConversionHost.describeConversion(ctx: channel.IAssetConversionContext, proposals: channel.AssetOpenPair<Buffer>, bitcoin: channel.IAssetConversionBitcoin): Promise<channel.IAssetConversionDescription>
 method channel.IAssetConversionHost.prepareConversion(ctx: channel.IAssetConversionContext, proposals: channel.AssetOpenPair<Buffer>, bitcoin: channel.IAssetConversionBitcoin, layoutDigest: Buffer): Promise<channel.IAssetConversionPlan>
 method channel.IAssetConversionHost.proposeConversion(ctx: channel.IAssetConversionContext, terms: channel.IAssetConversionTerms): Promise<Buffer>
+method channel.IAssetConversionHost.retainConversionExits(ctx: channel.IAssetConversionContext, views: channel.IAssetConversionHostExitViews, exact: Record<'parent' | 'candidate', Record<'local' | 'remote', bitcoinjs-lib#Transaction>>): Promise<channel.IAssetConversionExitReceipt>
+method channel.IAssetConversionHost.signConversionExits(ctx: channel.IAssetConversionContext, views: channel.IAssetConversionHostExitViews): Promise<Buffer>
+method channel.IAssetConversionHost.verifyConversionExits(ctx: channel.IAssetConversionContext, views: channel.IAssetConversionHostExitViews, shares: channel.AssetOpenPair<Buffer>): Promise<channel.IAssetConversionExitEvidence>
 method channel.IAssetConversionHost.verifyConversionTerms(ctx: channel.IAssetConversionContext, terms: channel.IAssetConversionTerms, digest: Buffer): Promise<boolean>
+type channel.IAssetConversionHostBranch = { type: 'plain'; channelType: string; funding: IFinalFundingReference; local: IAssetSpliceHostHolder; remote: IAssetSpliceHostHolder; } | { type: 'asset'; channelType: string; funding: IFinalFundingReference; fundingRoot: Buffer; local: IAssetSpliceHostHolder; remote: IAssetSpliceHostHolder; }
+interface channel.IAssetConversionHostExitViews
+property channel.IAssetConversionHostExitViews.candidate: channel.IAssetConversionHostBranch
+property channel.IAssetConversionHostExitViews.finalDigest: Buffer
+property channel.IAssetConversionHostExitViews.fundingFeeratePerkw: number
+property channel.IAssetConversionHostExitViews.layoutDigest: Buffer
+property channel.IAssetConversionHostExitViews.originalInitiator: boolean
+property channel.IAssetConversionHostExitViews.parent: channel.IAssetConversionHostBranch
+property channel.IAssetConversionHostExitViews.paymentBasepoints: channel.AssetOpenPair<Buffer>
+property channel.IAssetConversionHostExitViews.terms: IFinalOpeningTerms
+property channel.IAssetConversionHostExitViews.withdrawals?: readonly channel.IAssetConversionWithdrawal[]
 interface channel.IAssetConversionMovement
 property channel.IAssetConversionMovement.assetId: string
 property channel.IAssetConversionMovement.from: 'initiator' | 'acceptor'
 property channel.IAssetConversionMovement.outputSerial: bigint
 property channel.IAssetConversionMovement.units: bigint
 interface channel.IAssetConversionPlan
+method channel.IAssetConversionPlan.authorize(consents: channel.AssetOpenPair<Buffer>): Promise<Buffer>
+method channel.IAssetConversionPlan.consent(): Promise<Buffer>
 property channel.IAssetConversionPlan.digest: Buffer
+method channel.IAssetConversionPlan.finalize(consents: channel.AssetOpenPair<Buffer>, authorizations: channel.AssetOpenPair<Buffer>): Promise<channel.IAssetConversionFunding>
 interface channel.IAssetConversionTerms
 property channel.IAssetConversionTerms.agreement: { reference: string; expiresAt: number; }
 property channel.IAssetConversionTerms.candidate: { dustLimitSats: { opener: string; acceptor: string; }; maxAcceptedHtlcs: { opener: number; acceptor: number; }; }
@@ -2069,6 +2121,18 @@ property channel.IAssetConversionTerms.parent: { txid: string; outputIndex: numb
 property channel.IAssetConversionTerms.targetType: string
 property channel.IAssetConversionTerms.units: { holder: 'opener' | 'acceptor'; issuances: { assetId: string; amount: string; }[]; }
 property channel.IAssetConversionTerms.version: 1
+interface channel.IAssetConversionWithdrawal
+property channel.IAssetConversionWithdrawal.assetId: string
+property channel.IAssetConversionWithdrawal.from: 'initiator' | 'acceptor'
+property channel.IAssetConversionWithdrawal.outputIndex: number
+property channel.IAssetConversionWithdrawal.outputSerial: bigint
+property channel.IAssetConversionWithdrawal.owner: 'local' | 'remote'
+property channel.IAssetConversionWithdrawal.units: bigint
+interface channel.IAssetConversionWithdrawalReceipt
+property channel.IAssetConversionWithdrawalReceipt.assetId: string
+property channel.IAssetConversionWithdrawalReceipt.outputIndex: number
+property channel.IAssetConversionWithdrawalReceipt.proof: string
+property channel.IAssetConversionWithdrawalReceipt.units: string
 interface channel.IAssetFundingLineageEntry
 property channel.IAssetFundingLineageEntry.fundingOutputIndex: number
 property channel.IAssetFundingLineageEntry.fundingTxHex: string
@@ -2350,9 +2414,12 @@ method channel.IAuxiliaryDualFunding.proposeConversion?(ctx: channel.IAssetConve
 method channel.IAuxiliaryDualFunding.recoverHtlc?(ctx: channel.IAssetOpeningHtlcPayout): Promise<bitcoinjs-lib#Transaction | null>
 method channel.IAuxiliaryDualFunding.recoverOutput(ctx: channel.IAssetOpeningPayout): Promise<bitcoinjs-lib#Transaction | null>
 method channel.IAuxiliaryDualFunding.restoreOutputReceipt?(channelId: string, parentTxid: string, outputIndex: number, payout: bitcoinjs-lib#Transaction, receipt: Buffer): Promise<void>
+method channel.IAuxiliaryDualFunding.retainConversionExits?(ctx: channel.IAssetConversionContext, views: channel.IAssetConversionHostExitViews, exact: Record<'parent' | 'candidate', Record<'local' | 'remote', bitcoinjs-lib#Transaction>>): Promise<channel.IAssetConversionExitReceipt>
 method channel.IAuxiliaryDualFunding.retractFunding(candidate: IFinalOpeningCandidate): Promise<void>
+method channel.IAuxiliaryDualFunding.signConversionExits?(ctx: channel.IAssetConversionContext, views: channel.IAssetConversionHostExitViews): Promise<Buffer>
 method channel.IAuxiliaryDualFunding.signExits(ctx: channel.IAssetOpenExitContext): Promise<Buffer>
 method channel.IAuxiliaryDualFunding.signFunding(candidate: IFinalOpeningCandidate, fundingProofs: Buffer, tx: bitcoinjs-lib#Transaction, indices: readonly number[], prevouts: { scripts: Buffer[]; values: bigint[]; }): Promise<Buffer[][]>
+method channel.IAuxiliaryDualFunding.verifyConversionExits?(ctx: channel.IAssetConversionContext, views: channel.IAssetConversionHostExitViews, shares: channel.AssetOpenPair<Buffer>): Promise<channel.IAssetConversionExitEvidence>
 method channel.IAuxiliaryDualFunding.verifyConversionTerms?(ctx: channel.IAssetConversionContext, terms: channel.IAssetConversionTerms, digest: Buffer): Promise<boolean>
 method channel.IAuxiliaryDualFunding.verifyExits(ctx: channel.IAssetOpenExitContext, signatures: channel.AssetOpenPair<Buffer>): Promise<{ local: channel.IAssetOpenExit; remote: channel.IAssetOpenExit; }>
 property channel.IAuxiliaryDualFunding.version: 1

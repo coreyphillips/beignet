@@ -123,6 +123,17 @@ export interface IFinalBranchReaders {
 	conversionAttemptOpen(channelId: string): boolean;
 	/** The open record and its sequence, or null: an authenticated read, never on an update path. */
 	openConversionAttempt(channelId: string): IOpenConversionAttempt | null;
+	/** The signing authority of a conversion round: the original generation 6 device, outside a transaction (#2151 Step 4b). */
+	conversionSigningAuthority(): import('./final-opening-authority').FinalOpeningAuthority;
+	/** The current ledger's local and remote commitments at `height` on the live funding, or null. */
+	currentLedgerCommitments(
+		channelId: string,
+		height: number
+	): { local: string; remote: string } | null;
+	/** A conversion's asset parent branch at N on the live funding, or null. */
+	conversionAssetParent(
+		channelId: string
+	): import('./final-conversion-exits').IAssetExitBranch | null;
 }
 
 /**

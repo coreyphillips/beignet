@@ -455,6 +455,7 @@ property IFinalSpliceIntent.outputs: Array<{ value: string; script: string; }>
 property IFinalSpliceIntent.parent: IFinalFundingReference
 unexported interface IFinalSpliceTerms
 property IFinalSpliceTerms.assetFundingRoots?: { parent: Buffer; candidate: Buffer; }
+property IFinalSpliceTerms.conversionRoots?: { parent?: Buffer; candidate?: Buffer; }
 property IFinalSpliceTerms.dust: bigint
 property IFinalSpliceTerms.feerate: number
 property IFinalSpliceTerms.localDelta: bigint

@@ -40,6 +40,12 @@ import type {
 import { checkSerials } from './asset-splice-manifest';
 import { auxiliaryCarrierError } from './auxiliary-funding';
 import { validateFinalSpliceReserves } from './final-commitment-reserve';
+import {
+	buildFinalSpliceCandidate,
+	type IFinalSpliceCandidate,
+	type IFinalSpliceTerms
+} from './final-splice-candidate';
+import { ASSET_OPEN_OBJECT_LIMIT } from '../message/asset-open';
 
 type Pair<T> = AssetOpenPair<T>;
 type UnitsRow = { assetId: string; initiator: bigint; acceptor: bigint };
@@ -766,4 +772,191 @@ export function describedConversionLayout(
 			descriptorHash: Buffer.from(o.descriptorHash as Buffer)
 		}))
 	};
+}
+
+// ---- The frozen candidate (#2151 Step 4b) ----
+
+/** The text of every frozen candidate that the acknowledged layout does not describe. */
+export const FROZEN_CONVERSION_TEXT =
+	'Frozen asset conversion disagrees with the acknowledged layout';
+
+/** What the plan's finalize answered: the unsigned funding and its proofs' digests. */
+export interface IConversionFundingFacts {
+	layoutDigest: Buffer;
+	transaction: Buffer;
+	proofDigest: Buffer;
+	fundingRoot?: Buffer;
+	fundingProofs?: Buffer;
+}
+
+/** The frozen candidate both engines sign over, with its final digest. */
+export interface IVerifiedConversionCandidate {
+	terms: IFinalSpliceTerms;
+	candidate: IFinalSpliceCandidate;
+	layoutDigest: Buffer;
+	finalDigest: Buffer;
+	/** To an asset: the candidate's root and its funding proofs. */
+	fundingRoot?: Buffer;
+	fundingProofs?: Buffer;
+	proofDigest: Buffer;
+}
+
+/**
+ * sha256('beignet/asset-conversion/final/v1\0' || layoutDigest ||
+ * sha256(targetType) || candidate tx.getHash() || (fundingRoot or 32 zero
+ * bytes) || sha256(authorization[0]) || sha256(authorization[1]) ||
+ * proofDigest), the authorizations in initiator order.
+ */
+export function assetConversionFinalDigest(
+	layoutDigest: Buffer,
+	targetType: Buffer,
+	candidateHash: Buffer,
+	fundingRoot: Buffer | undefined,
+	authorizations: Pair<Buffer>,
+	proofDigest: Buffer
+): Buffer {
+	return sha256(
+		Buffer.concat([
+			Buffer.from('beignet/asset-conversion/final/v1\0', 'ascii'),
+			layoutDigest,
+			sha256(targetType),
+			candidateHash,
+			fundingRoot ?? Buffer.alloc(32),
+			sha256(authorizations[0]),
+			sha256(authorizations[1]),
+			proofDigest
+		])
+	);
+}
+
+/**
+ * sha256('beignet/asset-conversion/construction/v1\0' || finalDigest ||
+ * tx.getHash() || sha256(nonces[0]) || sha256(nonces[1])), the two last
+ * `tx_complete` payloads in initiator order.
+ */
+export function assetConversionCheckpointDigest(
+	finalDigest: Buffer,
+	txHash: Buffer,
+	nonces: Pair<Buffer>
+): Buffer {
+	return sha256(
+		Buffer.concat([
+			Buffer.from('beignet/asset-conversion/construction/v1\0', 'ascii'),
+			finalDigest,
+			txHash,
+			sha256(nonces[0]),
+			sha256(nonces[1])
+		])
+	);
+}
+
+const isBytes = (v: unknown, min: number, max: number): v is Buffer =>
+	Buffer.isBuffer(v) && v.length >= min && v.length <= max;
+
+/**
+ * The plan's frozen funding against the acknowledged layout (#2151 Step
+ * 4b, section 3.1): the layout and agreement digests, the transaction the
+ * splice builder gives from the layout's terms with the conversion's one
+ * root, its funding index and output amounts, and the proofs' shapes by
+ * direction. Any difference throws `FROZEN_CONVERSION_TEXT`.
+ */
+export function verifyConversionCandidate(
+	layout: IAssetConversionLayout,
+	acknowledged: { layoutDigest: Buffer; agreement: Buffer; planDigest: Buffer },
+	isInitiator: boolean,
+	frozen: Transaction,
+	funding: IConversionFundingFacts,
+	authorizations: Pair<Buffer>
+): IVerifiedConversionCandidate {
+	try {
+		const layoutDigest = assetConversionLayoutDigest(layout);
+		const toAsset = layout.direction === 'to-asset';
+		if (
+			!layoutDigest.equals(acknowledged.layoutDigest) ||
+			!assetConversionAgreementDigest(
+				layoutDigest,
+				acknowledged.planDigest
+			).equals(acknowledged.agreement) ||
+			!Buffer.isBuffer(funding.layoutDigest) ||
+			!layoutDigest.equals(funding.layoutDigest) ||
+			!Buffer.isBuffer(funding.transaction) ||
+			!frozen.toBuffer().equals(funding.transaction) ||
+			frozen.outs.length !== layout.outputs.length ||
+			!isBytes(funding.proofDigest, 32, 32) ||
+			(toAsset
+				? !isBytes(funding.fundingRoot, 32, 32) ||
+				  !isBytes(funding.fundingProofs, 1, ASSET_OPEN_OBJECT_LIMIT)
+				: funding.fundingRoot !== undefined ||
+				  funding.fundingProofs !== undefined ||
+				  !layout.parentRoot)
+		)
+			throw new Error(FROZEN_CONVERSION_TEXT);
+		const init = decodeSpliceMessage(layout.init);
+		const ack = decodeSpliceAckMessage(layout.ack);
+		const local = isInitiator ? init : ack;
+		const peer = isInitiator ? ack : init;
+		const [dust0, dust1] = layout.candidateDustSats;
+		let dust = dust0 > dust1 ? dust0 : dust1;
+		if (dust < DUST_LIMIT_SATS) dust = DUST_LIMIT_SATS;
+		const terms: IFinalSpliceTerms = {
+			parent: Transaction.fromBuffer(layout.parent.toBuffer()),
+			parentIndex: layout.parentIndex,
+			oldLocalKey: Buffer.from(layout.parentKeys[isInitiator ? 0 : 1]),
+			oldPeerKey: Buffer.from(layout.parentKeys[isInitiator ? 1 : 0]),
+			newLocalKey: Buffer.from(local.fundingPubkey),
+			newPeerKey: Buffer.from(peer.fundingPubkey),
+			localIsSpliceInitiator: isInitiator,
+			localDelta: local.relativeSatoshis,
+			peerDelta: peer.relativeSatoshis,
+			localFeeBudget: layout.feeBudgets[isInitiator ? 0 : 1],
+			feerate: layout.feeratePerKw,
+			dust,
+			locktime: init.locktime,
+			conversionRoots: toAsset
+				? { candidate: Buffer.from(funding.fundingRoot!) }
+				: { parent: Buffer.from(layout.parentRoot!) }
+		};
+		const candidate = buildFinalSpliceCandidate(
+			terms,
+			layout.inputs.map((i) => ({
+				...i,
+				prevTxid: Buffer.from(i.prevTxid),
+				prevTx: i.prevTx && Buffer.from(i.prevTx)
+			})),
+			layout.outputs.map((o, i) => ({
+				serialId: o.serialId,
+				amountSats: o.amountSats,
+				scriptPubkey: Buffer.from(frozen.outs[i].script)
+			}))
+		);
+		const fundingIndex = layout.outputs.findIndex((o) => o.role === 'funding');
+		if (
+			candidate.fundingIndex !== fundingIndex ||
+			layout.outputs.some(
+				(o, i) => BigInt(candidate.tx.outs[i].value) !== o.amountSats
+			) ||
+			!candidate.tx.toBuffer().equals(funding.transaction)
+		)
+			throw new Error(FROZEN_CONVERSION_TEXT);
+		return {
+			terms,
+			candidate,
+			layoutDigest,
+			finalDigest: assetConversionFinalDigest(
+				layoutDigest,
+				layout.targetType,
+				candidate.tx.getHash(),
+				toAsset ? funding.fundingRoot : undefined,
+				authorizations,
+				funding.proofDigest
+			),
+			...(toAsset && {
+				fundingRoot: Buffer.from(funding.fundingRoot!),
+				fundingProofs: Buffer.from(funding.fundingProofs!)
+			}),
+			proofDigest: Buffer.from(funding.proofDigest)
+		};
+	} catch {
+		throw new Error(FROZEN_CONVERSION_TEXT);
+	}
 }
