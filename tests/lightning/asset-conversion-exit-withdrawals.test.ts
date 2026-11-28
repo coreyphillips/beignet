@@ -75,8 +75,7 @@ import {
 	REUSED_TEXTS,
 	SIGNING_TEXTS,
 	toPhase,
-	walletDb,
-	type Phase
+	walletDb
 } from './helpers/conversion-signing';
 
 const R = REUSED_TEXTS;
@@ -128,16 +127,6 @@ const sentNames = (p: IConversionPair, from: 0 | 1, mark = 0): string[] =>
 const parentsOf = (p: IConversionPair): unknown[] =>
 	p.stores.map((st) => st.loadFinalChannelType(p.id));
 
-/** The end text each side's host was told at a phase where `ended` ended the attempt. */
-function reasons(phase: Phase, I: 0 | 1, text: string): [string, string] {
-	const A = (1 - I) as 0 | 1;
-	const out: [string, string] = [text, text];
-	// At P7b the initiator ended at its own fence before the event.
-	if (phase === 'P7b') out[I] = FENCE;
-	out[A] = text;
-	return out;
-}
-
 describe('Every end of a signing attempt drops, then withdraws (#2151 step 4b, section 13, the exit withdrawals file)', function () {
 	this.timeout(240000);
 	const s = scratch('conversion-exit-withdrawals-');
@@ -184,7 +173,9 @@ describe('Every end of a signing attempt drops, then withdraws (#2151 step 4b, s
 					const at = await toPhase(p, phase, I);
 					p.disconnect();
 					await p.settle();
-					const told = reasons(phase, I, R.disconnected);
+					// The initiator is aborting at P7b, not ended: the disconnect
+					// ends both sides.
+					const told: [string, string] = [R.disconnected, R.disconnected];
 					for (const i of [0, 1] as const)
 						expectEnded(p, i, base, retainedAt(phase), told[i]);
 					const rows = allRows(p);
@@ -212,8 +203,11 @@ describe('Every end of a signing attempt drops, then withdraws (#2151 step 4b, s
 					expect(reconnected.callCount, 'before any reconnect').to.equal(0);
 					reconnected.restore();
 					await settleOnce();
-					// The initiator at P7b ended at its fence before the crash.
-					const crashedReason = phase === 'P7b' && i === 0 ? FENCE : R.restart;
+					// The initiator at P7b withdrew at its fence and was aborting,
+					// waiting for the echo, when it crashed: no end ran, and its
+					// rebuilt manager finds no open record to tell the host of.
+					const untold = phase === 'P7b' && i === 0;
+					const crashedReason = untold ? undefined : R.restart;
 					expect(
 						attemptEvents(p.stores[i], p.id)
 							.slice(base.attempts[i])
@@ -227,7 +221,14 @@ describe('Every end of a signing attempt drops, then withdraws (#2151 step 4b, s
 						retainedAt(phase) ? ['conversion-exits', 'conversion-dropped'] : []
 					);
 					await p.settle();
-					expectEnded(p, i, base, retainedAt(phase), crashedReason);
+					expectEnded(
+						p,
+						i,
+						base,
+						retainedAt(phase),
+						crashedReason,
+						untold ? 0 : 1
+					);
 					const rows = allRows(p);
 					await lateAnswers(p, at);
 					expect(
@@ -290,7 +291,11 @@ describe('Every end of a signing attempt drops, then withdraws (#2151 step 4b, s
 			],
 			[
 				'exit share',
-				(m): boolean => m.from === 1 && m.name === 'asset_splice:3'
+				// Side 1's commitment_signed follows its exit share on an
+				// ordered connection, so it is held too.
+				(m): boolean =>
+					m.from === 1 &&
+					(m.name === 'asset_splice:3' || m.name === 'COMMITMENT_SIGNED')
 			],
 			[
 				'commitment_signed',
@@ -441,6 +446,9 @@ describe('Every end of a signing attempt drops, then withdraws (#2151 step 4b, s
 				expect(seen, 'rows when the update was delivered').to.deep.equal([
 					[2, retainedAt(phase) ? 2 : 0]
 				]);
+				// At P7a and P7b the side's tx_abort is answered only once the
+				// initiator's retain answers or its held fence arrives (W2).
+				if (phase === 'P7a' || phase === 'P7b') await at.release();
 				expectEnded(p, A, base, retainedAt(phase), R.peerUpdated);
 			});
 	});
@@ -453,8 +461,10 @@ describe('Every end of a signing attempt drops, then withdraws (#2151 step 4b, s
 				const p = await shared('plain');
 				const base = marks(p);
 				const at = await toPhase(p, phase, 0);
-				// The receiver: the initiator, except at P7b where only the acceptor is live.
-				const to = (phase === 'P7b' ? at.A : at.I) as 0 | 1;
+				// The receiver: the initiator, except at P7b where only the
+				// acceptor is live, and at P7a, where the initiator fences right
+				// after its retain (W2) and only the acceptor echoes.
+				const to = (phase === 'P7b' || phase === 'P7a' ? at.A : at.I) as 0 | 1;
 				const from = (1 - to) as 0 | 1;
 				if (phase === 'P7b') {
 					p.link.clearRules();
@@ -510,6 +520,9 @@ describe('Every end of a signing attempt drops, then withdraws (#2151 step 4b, s
 					p.managers[side].on('broadcast:tx', (tx: unknown) =>
 						broadcast.push(tx)
 					);
+					// The pair's config has no local basepoints: give the close a
+					// wallet script, as 4a's close test does.
+					p.managers[side].setMonitorDestinationScript(SCRIPT);
 					const mark = p.link.sent.length;
 					const r =
 						close === 'initiateShutdown'
@@ -523,6 +536,12 @@ describe('Every end of a signing attempt drops, then withdraws (#2151 step 4b, s
 						);
 					else
 						expect(broadcast, 'the close goes on').to.have.length.at.least(1);
+					// At P7b the acceptor's tx_abort ends at the initiator's held fence.
+					if (phase === 'P7b') {
+						p.link.clearRules();
+						p.link.release();
+						await p.settle();
+					}
 					expectEnded(p, side, base, retainedAt(phase), R.closed);
 				});
 
@@ -601,7 +620,10 @@ describe('Every end of a signing attempt drops, then withdraws (#2151 step 4b, s
 				'quiet reads false'
 			).to.equal(false);
 			await p.settle();
-			expectEnded(p, at.A, base, true);
+			// 4a's D1: the host hears of an orphan only for a record from before
+			// this process; this process's attempt is told by its end, which a
+			// silenced attempt never ran.
+			expectEnded(p, at.A, base, true, undefined, 0);
 		});
 
 		it('B11. takes a drop that landed only on the device through the reconcile and does not repeat it', async () => {
@@ -938,7 +960,8 @@ describe('Every end of a signing attempt drops, then withdraws (#2151 step 4b, s
 			expect(abandoned(p, 0), 'the first fence').to.deep.equal([FENCE]);
 			const mark = p.link.sent.length;
 			p.managers[0].startFinalSplice(p.channelId, {
-				localDelta: '-10000',
+				// Within the fee budget: with no output, the whole delta is fee.
+				localDelta: '-1000',
 				feeBudget: '2000',
 				feerate: 1000,
 				locktime: PAIR_HEIGHT,

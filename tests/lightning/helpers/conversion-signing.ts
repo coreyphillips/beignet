@@ -564,7 +564,8 @@ export function expectEnded(
 	i: 0 | 1,
 	base: { attempts: number[]; conversions: number[]; rowid: number[] },
 	retained: boolean,
-	reason?: string
+	reason?: string,
+	abandons = 1
 ): void {
 	const store = p.stores[i];
 	const kinds = attemptEvents(store, p.id)
@@ -590,7 +591,7 @@ export function expectEnded(
 		false
 	);
 	const told = abandoned(p, i);
-	expect(told, 'side ' + i + ' abandon once').to.have.length(1);
+	expect(told, 'side ' + i + ' abandon once').to.have.length(abandons);
 	if (reason !== undefined)
 		expect(told[0], 'side ' + i + ' reason').to.equal(reason);
 }
@@ -625,6 +626,10 @@ export async function expectParentWorks(
 	p: IConversionPair,
 	parent: unknown[]
 ): Promise<void> {
+	// What the old connection held is lost with it, and a phase's hold rule
+	// (a commitment_signed one, say) must not hold the parent's own update.
+	p.link.clearRules();
+	p.link.held.splice(0);
 	await p.reconnect();
 	for (const i of [0, 1] as const)
 		expect(p.stores[i].loadFinalChannelType(p.id), 'parent ' + i).to.deep.equal(

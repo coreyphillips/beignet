@@ -1252,11 +1252,17 @@ describe('Asset conversion signs both exits up to the 4b fence (#2151 step 4b, s
 			const told = abandoned(p, 0);
 			expect(told, 'side 0 ends').to.have.length(1);
 			expect(told[0]).to.not.equal(FENCE);
+			// Side 0 retains nothing. Side 1 took side 0's commitment_signed
+			// before the abort and retained (section 1, step 8), then drops.
 			for (const i of [0, 1] as const)
 				expect(
 					conversionKinds(p.stores[i], p.id).slice(base.conversions[i]),
 					'side ' + i
-				).to.deep.equal([]);
+				).to.deep.equal(
+					i === 1 && p.hosts[1].calls('retainConversionExits').length
+						? ['conversion-exits', 'conversion-dropped']
+						: []
+				);
 		});
 	});
 
@@ -1454,8 +1460,14 @@ describe('Asset conversion signs both exits up to the 4b fence (#2151 step 4b, s
 			expect(() =>
 				refuseRepair(walletDb(store), authority(store), p.id, store)
 			).to.not.throw();
-			const copy = (bytes: Buffer): Database.Database =>
-				new BetterSqlite(bytes);
+			// A serialized WAL database cannot be opened from memory: mark the
+			// copy's header as a rollback journal file (bytes 18 and 19).
+			const copy = (bytes: Buffer): Database.Database => {
+				const b = Buffer.from(bytes);
+				b[18] = 1;
+				b[19] = 1;
+				return new BetterSqlite(b);
+			};
 			expect(() =>
 				refuseRepair(copy(walletDb(store).serialize()), null, p.id, store)
 			).to.not.throw();
@@ -1748,6 +1760,8 @@ describe('Asset conversion signs both exits up to the 4b fence (#2151 step 4b, s
 					forgedCommitmentSigned(p.channelId, parentTxid)
 				);
 				await p.settle();
+				// At P7b the acceptor's tx_abort ends at the initiator's held fence.
+				if (phase === 'P7b') await at.release();
 				expect(abandoned(p, A), 'side ' + A).to.deep.equal([R.peerUpdated]);
 				expect(seen, 'rows at delivery').to.deep.equal([
 					[2, phase === 'P7b' ? 2 : 0]
@@ -1831,12 +1845,17 @@ describe('Asset conversion signs both exits up to the 4b fence (#2151 step 4b, s
 			i: 0 | 1
 		): Promise<Record<string, string>> => {
 			const m = p.managers[i];
+			// Only the original opener may change an asset parent's fee; the
+			// other side's fee change is refused by that rule first.
+			const opener = roleOf(p.stores[i], p.id) === 'opener';
 			return {
-				fee: await refusal(() =>
-					m.startAssetSpliceUpdate(p.channelId, [
-						{ kind: 'fee', feeratePerKw: 1500 }
-					])
-				),
+				...(opener && {
+					fee: await refusal(() =>
+						m.startAssetSpliceUpdate(p.channelId, [
+							{ kind: 'fee', feeratePerKw: 1500 }
+						])
+					)
+				}),
 				splice: await refusal(() =>
 					m.startAssetSplice(p.channelId, {
 						fundingFeeratePerkw: 1000,
@@ -2082,11 +2101,17 @@ describe('Asset conversion signs both exits up to the 4b fence (#2151 step 4b, s
 			await run(p, 0);
 			const told = abandoned(p, side);
 			expect(told, 'side ' + side + ' ended once').to.have.length(1);
+			// The failing side retains nothing. Its peer may have retained before
+			// the abort reached it (section 1, step 8), and then drops (7.1).
 			for (const i of [0, 1] as const)
 				expect(
 					conversionKinds(p.stores[i], p.id).slice(base.conversions[i]),
 					'side ' + i
-				).to.deep.equal([]);
+				).to.deep.equal(
+					i !== side && p.hosts[i].calls('retainConversionExits').length
+						? ['conversion-exits', 'conversion-dropped']
+						: []
+				);
 			return { p, text: told[0], mark, base };
 		}
 		const afterRecord = (
@@ -2111,12 +2136,17 @@ describe('Asset conversion signs both exits up to the 4b fence (#2151 step 4b, s
 			],
 			[
 				'the original device',
-				(p: IConversionPair): void =>
-					afterRecord(p, 0, () =>
+				// Installed as finalize is called: the device check serves the
+				// parent rechecks too, so an earlier stub ends before finalize.
+				(p: IConversionPair): void => {
+					const finalize = p.hosts[0].finalize;
+					p.hosts[0].finalize = (...args): unknown => {
 						sinon
 							.stub(p.stores[0], 'requireOpeningAuthority')
-							.throws(new Error('test: not the original device'))
-					)
+							.throws(new Error('test: not the original device'));
+						return finalize(...args);
+					};
+				}
 			],
 			[
 				'the current ledger',
