@@ -248,6 +248,8 @@ interface IAttempt {
 	peerCommit?: Buffer;
 	/** The retained candidate's final digest. */
 	retained?: string;
+	/** The host was told of the end (#2151 Step 4b, Z1): at the side's own tx_abort, or at the end. */
+	told?: boolean;
 	/** The scope sequence of the side's attempt record, once it is on disk (#2151 Step 4a). */
 	recorded?: number;
 	/** The record's withdrawal was tried: written, or its failure handled. */
@@ -2285,7 +2287,8 @@ export class AssetConversionTransport {
 	 * withdrawal is written first, so it precedes the tx_abort on the wire
 	 * (#2151 Step 4a, section 4.2). The attempt is aborting before the send
 	 * and before any report, so a listener that re-enters finds it so and
-	 * sends no second tx_abort.
+	 * sends no second tx_abort. The host is told with the same text, after
+	 * the withdrawal and before the tx_abort (#2151 Step 4b, Z1).
 	 */
 	private abort(a: IAttempt, text: string): void {
 		if (a.ended || a.state === 'aborting') return;
@@ -2304,6 +2307,9 @@ export class AssetConversionTransport {
 			a.ownCommitSent ? HOST_BOUND_MS + PHASE_BOUND_MS : PHASE_BOUND_MS
 		);
 		try {
+			// The host hears of the end once the withdrawal has landed and
+			// before the tx_abort leaves (Z1), with the text it carries.
+			this.tell(a, text);
 			this.sendAbort(a, text);
 		} finally {
 			if (failure) this.deps.report(a.id, failure);
@@ -2330,7 +2336,8 @@ export class AssetConversionTransport {
 	/**
 	 * Release the hold, forget the attempt, withdraw its record when neither
 	 * abort nor the peer's tx_abort did (a disconnect, a destroy or the
-	 * phase bound), then tell the host when it verified the terms.
+	 * phase bound), then tell the host when it verified the terms and was
+	 * not told at the side's own tx_abort (Z1).
 	 */
 	private end(a: IAttempt, text: string): void {
 		if (a.ended) return;
@@ -2348,18 +2355,23 @@ export class AssetConversionTransport {
 		const failure = this.withdraw(a, text);
 		if (a.initiator && a.state === 'announced' && !a.replied && a.attempt)
 			this.rememberWithdrawn(a.id, a.peer, a.attempt);
-		if (a.verified && a.ctx && this.host) {
-			const host = this.host,
-				ctx = this.ctxCopy(a);
-			void this.hostCall(() => host.abandonConversion(ctx, text)).then((r) => {
-				if (!r.ok && r.error !== undefined)
-					this.deps.report(
-						a.id,
-						'Asset conversion host abandon failed: ' + r.error
-					);
-			});
-		}
+		this.tell(a, text);
 		if (failure) this.deps.report(a.id, failure);
+	}
+
+	/** Tell the host once that an attempt it verified ended, with `text`; never awaited. */
+	private tell(a: IAttempt, text: string): void {
+		if (a.told || !a.verified || !a.ctx || !this.host) return;
+		a.told = true;
+		const host = this.host,
+			ctx = this.ctxCopy(a);
+		void this.hostCall(() => host.abandonConversion(ctx, text)).then((r) => {
+			if (!r.ok && r.error !== undefined)
+				this.deps.report(
+					a.id,
+					'Asset conversion host abandon failed: ' + r.error
+				);
+		});
 	}
 
 	private rememberWithdrawn(id: string, peer: string, attempt: Buffer): void {
