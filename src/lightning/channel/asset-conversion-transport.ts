@@ -2287,8 +2287,9 @@ export class AssetConversionTransport {
 	 * withdrawal is written first, so it precedes the tx_abort on the wire
 	 * (#2151 Step 4a, section 4.2). The attempt is aborting before the send
 	 * and before any report, so a listener that re-enters finds it so and
-	 * sends no second tx_abort. The host is told with the same text, after
-	 * the withdrawal and before the tx_abort (#2151 Step 4b, Z1).
+	 * sends no second tx_abort. The host is told with the same text once the
+	 * withdrawal has landed, in a microtask after the tx_abort left, so no
+	 * host code runs inside this path (#2151 Step 4b, Z1 and v2.5).
 	 */
 	private abort(a: IAttempt, text: string): void {
 		if (a.ended || a.state === 'aborting') return;
@@ -2307,11 +2308,13 @@ export class AssetConversionTransport {
 			a.ownCommitSent ? HOST_BOUND_MS + PHASE_BOUND_MS : PHASE_BOUND_MS
 		);
 		try {
-			// The host hears of the end once the withdrawal has landed and
-			// before the tx_abort leaves (Z1), with the text it carries.
-			this.tell(a, text);
 			this.sendAbort(a, text);
 		} finally {
+			// The host hears of the end once the withdrawal has landed (Z1),
+			// with the text the tx_abort carries. The call waits for a
+			// microtask, so a host that re-enters runs after this path and
+			// after the tx_abort; an end that comes first tells it instead.
+			queueMicrotask(() => this.tell(a, text));
 			if (failure) this.deps.report(a.id, failure);
 		}
 	}

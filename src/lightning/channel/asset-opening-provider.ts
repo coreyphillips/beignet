@@ -352,7 +352,7 @@ export interface IAssetConversionHost {
 		terms: IAssetConversionTerms,
 		digest: Buffer
 	): Promise<boolean>;
-	/** Called when an attempt this host verified ends, with the end's text. After a restart it may also be called for an attempt from before it, which this process never saw, and may then repeat a call made before the restart; it must be idempotent. It is final, even while a planner call is pending. Since Step 4b it also releases what the host retained for the attempt's candidate, its exits and, to bitcoin, the withdrawal receipts: the candidate was dropped and can never confirm, and a retain that finishes after this call is released too. The attempt id can repeat; the final digest names the candidate. */
+	/** Called once for an attempt this host verified, with the end's text: when the attempt ends, or, for an attempt that sends its own tx_abort, as soon as its withdrawal is on disk, with the tx_abort's text. The channel can then stay held for up to 30 seconds, until the peer echoes the tx_abort or its bound expires, so a new conversion or update of the channel may be refused with the in-progress text until then. After a restart it may also be called for an attempt from before it, which this process never saw, and may then repeat a call made before the restart; it must be idempotent. It is final, even while a planner call is pending. Since Step 4b it also releases what the host retained for the attempt's candidate, its exits and, to bitcoin, the withdrawal receipts: the candidate was dropped and can never confirm, and a retain that finishes after this call is released too. The attempt id can repeat; the final digest names the candidate. */
 	abandonConversion(
 		ctx: IAssetConversionContext,
 		reason: string
@@ -474,7 +474,7 @@ export interface IAuxiliaryDualFunding
 		terms: IAssetConversionTerms,
 		digest: Buffer
 	): Promise<boolean>;
-	/** Called when an attempt this host verified ends, with the end's text. After a restart it may also be called for an attempt from before it, which this process never saw, and may then repeat a call made before the restart; it must be idempotent. Since Step 4b it also releases what the host retained for the attempt's candidate, its exits and, to bitcoin, the withdrawal receipts: the candidate was dropped and can never confirm, and a retain that finishes after this call is released too. The attempt id can repeat; the final digest names the candidate. */
+	/** Called once for an attempt this host verified, with the end's text: when the attempt ends, or, for an attempt that sends its own tx_abort, as soon as its withdrawal is on disk, with the tx_abort's text. The channel can then stay held for up to 30 seconds, until the peer echoes the tx_abort or its bound expires, so a new conversion or update of the channel may be refused with the in-progress text until then. After a restart it may also be called for an attempt from before it, which this process never saw, and may then repeat a call made before the restart; it must be idempotent. Since Step 4b it also releases what the host retained for the attempt's candidate, its exits and, to bitcoin, the withdrawal receipts: the candidate was dropped and can never confirm, and a retain that finishes after this call is released too. The attempt id can repeat; the final digest names the candidate. */
 	abandonConversion?(
 		ctx: IAssetConversionContext,
 		reason: string
