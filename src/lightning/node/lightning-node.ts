@@ -16206,36 +16206,40 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			const stored = state.remoteConfig?.channelReserveSatoshis ?? 0n;
 			const local = channel.getBalances().localMsat / 1000n;
 			const commitmentCost = channel.spliceOutCommitmentCostSats();
-			// spliceOut prices the kept reserve at the POST-splice capacity, so
-			// the advertised maximum must be solved against that same predicate:
-			// pricing at the current capacity understates it whenever the stored
-			// reserve sits below the derived one (issue #423 review). The
-			// predicate is monotone in the amount (the derived reserve only
-			// shrinks as more is withdrawn, and never faster than the
-			// withdrawal grows), so binary search finds the boundary.
-			const admits = (amountSats: bigint): boolean => {
+			const reserveAt = (amountSats: bigint): bigint => {
 				const derived = channel.spliceReserveWeKeepSats(
 					state.fundingSatoshis - amountSats - feeSats
 				);
-				const reserve = derived > stored ? derived : stored;
-				return (
-					amountSats + feeSats <= local - reserve - commitmentCost &&
-					channel.spliceOutCommitmentRefusal(amountSats + feeSats) === null
-				);
+				return derived > stored ? derived : stored;
 			};
-			let lo = 0n;
-			let hi = local > feeSats ? local - feeSats : 0n;
-			if (!admits(0n)) hi = 0n;
-			while (lo < hi) {
-				const mid = (lo + hi + 1n) / 2n;
-				if (admits(mid)) lo = mid;
-				else hi = mid - 1n;
+			const fitsBalance = (amount: bigint) =>
+				amount + feeSats <= local - reserveAt(amount) - commitmentCost;
+			const fitsCommitments = (amount: bigint) =>
+				channel.spliceOutCommitmentRefusal(amount + feeSats) === null;
+			const largestPassing = (
+				hi: bigint,
+				fits: (amount: bigint) => boolean
+			) => {
+				let lo = 0n;
+				while (lo < hi) {
+					const mid = (lo + hi + 1n) / 2n;
+					if (fits(mid)) lo = mid;
+					else hi = mid - 1n;
+				}
+				return lo;
+			};
+			let max = 0n;
+			if (fitsBalance(0n) && fitsCommitments(0n)) {
+				// The reserve falls no faster than the withdrawal grows. Find its
+				// exact post-splice balance limit before building commitments.
+				max = largestPassing(local - feeSats, fitsBalance);
+				if (max > 0n && !fitsCommitments(max)) {
+					// Every smaller amount fits the balance. Search the original
+					// commitment check only when it sets a tighter limit.
+					max = largestPassing(max - 1n, fitsCommitments);
+				}
 			}
-			const max = lo;
-			const derivedAtMax = channel.spliceReserveWeKeepSats(
-				state.fundingSatoshis - max - feeSats
-			);
-			const reserve = derivedAtMax > stored ? derivedAtMax : stored;
+			const reserve = reserveAt(max);
 			const kept = reserve + commitmentCost;
 			const spendable = local > kept ? local - kept : 0n;
 			return {
