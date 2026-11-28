@@ -837,8 +837,15 @@ export class AssetConversionTransport {
 			} else this.peerAbort(a, payload);
 			return true;
 		}
-		if (type === M.COMMITMENT_SIGNED && SIGNING.has(a.state))
+		if (type === M.COMMITMENT_SIGNED && SIGNING.has(a.state)) {
 			a.peerCommitSeen = true;
+			// A second copy is judged at once (V5): an identical one is
+			// dropped, and one that differs is unexpected.
+			if (a.peerCommit) {
+				if (!a.peerCommit.equals(payload)) this.fail(a, UNEXPECTED);
+				return true;
+			}
+		}
 		if (
 			a.state === 'accepted' &&
 			type === M.STFU &&
@@ -1026,6 +1033,19 @@ export class AssetConversionTransport {
 	 */
 	custom(peer: string, raw: Buffer): void {
 		const owner = raw[1] <= 6 ? this.frameOwner(peer, raw) : undefined;
+		if (owner && raw[1] !== 0 && raw[1] !== 4) {
+			// A signing frame is judged when it arrives (#2151 Step 4b), not
+			// behind a host call the queue awaits; its step runs in the queue.
+			let fresh: boolean;
+			try {
+				fresh = owner.exchange!.receiveFrame(Buffer.from(raw));
+			} catch (error) {
+				this.fail(owner, message(error));
+				return;
+			}
+			if (fresh) this.enqueue(owner, () => this.advance(owner));
+			return;
+		}
 		if (owner) {
 			const frame = Buffer.from(raw);
 			this.enqueue(owner, () => this.receiveFrame(owner, frame));
@@ -1396,7 +1416,8 @@ export class AssetConversionTransport {
 	 * The peer's tx_abort, at once: in `aborting` or `draining` it ends the
 	 * attempt with the side's own text, and a `draining` side that has sent
 	 * no tx_abort answers it first; otherwise it is echoed with its data and
-	 * the attempt ends with its text. The attempt ends even when a send
+	 * the attempt ends with its canonical text (#2151 Step 4b). The attempt
+	 * ends even when a send
 	 * throws, and a failed withdrawal is reported after the end (amendment
 	 * B4).
 	 */
@@ -1426,7 +1447,8 @@ export class AssetConversionTransport {
 			);
 		} finally {
 			try {
-				this.end(a, data.toString('utf8'));
+				// The end repeats the canonical reason (#2151 Step 4b, B6).
+				this.end(a, canonicalConversionReason(data));
 			} finally {
 				if (failure) this.deps.report(a.id, failure);
 			}
@@ -1629,17 +1651,6 @@ export class AssetConversionTransport {
 
 	/** A layout or layout_ack frame the attempt owns, in its queue. */
 	private async receiveFrame(a: IAttempt, raw: Buffer): Promise<void> {
-		if (SIGNING.has(a.state) && raw[1] !== 0 && raw[1] !== 4) {
-			let fresh: boolean;
-			try {
-				fresh = a.exchange!.receiveFrame(raw);
-			} catch (error) {
-				this.fail(a, message(error));
-				return;
-			}
-			if (fresh) await this.advance(a);
-			return;
-		}
 		if (a.state !== 'init-sent' && a.state !== 'laid-out') return;
 		let bytes: Buffer | undefined;
 		try {

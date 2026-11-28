@@ -24,11 +24,13 @@ import {
 	conversionRecoveryView,
 	conversionViewContext,
 	type IAssetExitBranch,
+	type IConversionViewContext,
 	type IFinalConversionExits,
 	type IFinalExitBranch,
 	type IPlainExitBranch
 } from '../storage/final-conversion-exits';
 import type { FinalOpeningAuthority } from '../storage/final-opening-authority';
+import type { IAssetSpliceHolderRecovery } from '../storage/asset-splice-exit-proofs';
 import {
 	signFinalUpdate,
 	spliceCommitmentNonceContext,
@@ -65,6 +67,11 @@ import { finalSpliceSharedNonce } from './final-splice-funding';
 
 type Holder = 'local' | 'remote';
 type Branch = 'parent' | 'candidate';
+/** One holder's commitment view and the state it was built from. */
+interface IHolderView {
+	state: { point: Buffer; localBalanceMsat: bigint; remoteBalanceMsat: bigint };
+	v: IFinalCommitmentView;
+}
 
 export const CONVERSION_ROUND_TEXTS = {
 	sign: 'Asset conversion host could not sign the exits',
@@ -118,7 +125,9 @@ const isRecord = (v: unknown): v is Record<string, unknown> =>
 	!!v && typeof v === 'object' && !Array.isArray(v);
 const copyJson = <V>(v: V): V => JSON.parse(JSON.stringify(v)) as V;
 
-function leaf(v: IAssetOpenExit['toLocal']) {
+function leaf(
+	v: IAssetOpenExit['toLocal']
+): { script: Buffer; leafVersion?: number } | undefined {
 	if (!v) return undefined;
 	if (
 		!isRecord(v) ||
@@ -128,7 +137,9 @@ function leaf(v: IAssetOpenExit['toLocal']) {
 		throw new Error(T.evidence);
 	return { script: Buffer.from(v.script, 'hex'), leafVersion: v.leafVersion };
 }
-const storedLeaf = (v: IAssetOpenExit['toLocal']) => (v ? { ...v } : null);
+const storedLeaf = (
+	v: IAssetOpenExit['toLocal']
+): NonNullable<IAssetOpenExit['toLocal']> | null => (v ? { ...v } : null);
 
 export class ConversionSignatureRound {
 	private readonly id: string;
@@ -291,7 +302,7 @@ export class ConversionSignatureRound {
 		};
 	}
 
-	private get viewContext() {
+	private get viewContext(): IConversionViewContext {
 		return conversionViewContext(
 			this.opening,
 			this.session.terms,
@@ -300,7 +311,10 @@ export class ConversionSignatureRound {
 	}
 
 	/** A parent holder's view: a plain branch as retain rebuilds it, an asset one with the given leaves. */
-	private parentView(holder: Holder, exit?: IAssetOpenExit | null) {
+	private parentView(
+		holder: Holder,
+		exit?: IAssetOpenExit | null
+	): IHolderView {
 		const b = this.parentBranch;
 		const recovery = holder === 'local' ? b.localRecovery : b.remoteRecovery;
 		const state = {
@@ -341,7 +355,10 @@ export class ConversionSignatureRound {
 	}
 
 	/** A candidate holder's view in the target type (4.4), an asset one with the given leaves. */
-	private candidateView(holder: Holder, exit?: IAssetOpenExit | null) {
+	private candidateView(
+		holder: Holder,
+		exit?: IAssetOpenExit | null
+	): IHolderView {
 		const state = { point: this.points[holder], ...this.balances };
 		const v = this.toAsset
 			? buildAssetSpliceCommitment(
@@ -378,7 +395,7 @@ export class ConversionSignatureRound {
 	/** This side's last `tx_complete`: the candidate's commit nonces at N and N+1 and the shared input nonce. */
 	txComplete(): Buffer {
 		const height = Number(this.N);
-		const nonce = (n: number) =>
+		const nonce = (n: number): Buffer =>
 			Buffer.from(
 				updateVerificationNonce(
 					this.authority.nonceContext(this.nonceContext),
@@ -414,8 +431,8 @@ export class ConversionSignatureRound {
 			},
 			this.txComplete(),
 			{
-				read: () => ({ records: [...records] }),
-				append: (_head, entry) => {
+				read: (): { records: unknown[] } => ({ records: [...records] }),
+				append: (_head, entry): void => {
 					records.push(entry);
 				}
 			}
@@ -424,7 +441,7 @@ export class ConversionSignatureRound {
 	}
 
 	/** The completed construction, which must build the frozen candidate. */
-	agreement() {
+	agreement(): NonNullable<ReturnType<SpliceConstructionCore['agreement']>> {
 		const g = this.construction().agreement();
 		if (!g) throw new Error(T.construction);
 		if (
@@ -675,7 +692,13 @@ export class ConversionSignatureRound {
 			fundingTxid: this.f.verified.candidate.tx.getId(),
 			outputIndex: this.f.verified.candidate.fundingIndex
 		};
-		const balances = (holder: Holder) => ({
+		const balances = (
+			holder: Holder
+		): {
+			point: string;
+			localBalanceMsat: string;
+			remoteBalanceMsat: string;
+		} => ({
 			point: this.points[holder].toString('hex'),
 			localBalanceMsat: String(this.balances.localBalanceMsat),
 			remoteBalanceMsat: String(this.balances.remoteBalanceMsat)
@@ -701,7 +724,7 @@ export class ConversionSignatureRound {
 			};
 		else {
 			const e = leaves.candidate!;
-			const recovery = (holder: Holder) => {
+			const recovery = (holder: Holder): IAssetSpliceHolderRecovery => {
 				const v = this.candidateView(holder, e[holder]).v;
 				return {
 					...balances(holder),

@@ -2630,7 +2630,12 @@ export class SqliteStorage implements IStorageBackend {
 		channelId: string,
 		outpoint: { txid: string; outputIndex: number },
 		openingRoot: string | undefined
-	) {
+	): {
+		committed: ReturnType<typeof assetSpliceUpdateHead>['committed'];
+		adopted: ReturnType<SqliteStorage['loadAdoptedAssetSpliceReceipt']>;
+		root: string | undefined;
+		member: Omit<IAssetExitBranch, 'type' | 'feeratePerKw'> | undefined;
+	} {
 		const committed = assetSpliceUpdateHead(this, channelId).committed;
 		const adopted = this.loadAdoptedAssetSpliceReceipt(channelId);
 		const root = adopted?.candidate.fundingRoot ?? openingRoot;
@@ -2692,14 +2697,21 @@ export class SqliteStorage implements IStorageBackend {
 			remoteBalanceMsat: BigInt(c.remoteContributionSats) * 1000n
 		};
 		const root = Buffer.from(ev.fundingRoot, 'hex');
-		const aux = (l: { script: string; leafVersion?: number } | undefined) =>
+		const aux = (
+			l: { script: string; leafVersion?: number } | undefined
+		): { script: Buffer; leafVersion?: number } | undefined =>
 			l
 				? { script: Buffer.from(l.script, 'hex'), leafVersion: l.leafVersion }
 				: undefined;
 		const pointOf = (holder: 'local' | 'remote'): string =>
 			(holder === 'local' ? terms.localBasepoints : terms.remoteBasepoints)
 				.firstPerCommitmentPoint;
-		const recovery = (holder: 'local' | 'remote') => {
+		const recovery = (
+			holder: 'local' | 'remote'
+		): {
+			v: ReturnType<typeof buildAssetSpliceCommitment>;
+			recovery: IAssetExitBranch['localRecovery'];
+		} => {
 			const v = buildAssetSpliceCommitment(
 				c,
 				terms,
