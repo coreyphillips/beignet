@@ -255,6 +255,26 @@ describe('Every end of a signing attempt drops, then withdraws (#2151 step 4b, s
 			// once that the attempt ended, at the fence, before the crash.
 			expect(abandoned(p, 0), "side 0's host told once").to.deep.equal([FENCE]);
 		});
+
+		it("Z1. tells the initiator's host after its fence left, never inside the path that sends it (v2.5)", async () => {
+			const p = await fresh('plain');
+			// Read the host's call log the moment side 0's fence is put on the
+			// link, inside the path that sends it.
+			const toldAtFence: number[] = [];
+			p.link.taps.push((m) => {
+				if (m.from === 0 && m.name === 'TX_ABORT')
+					toldAtFence.push(p.hosts[0].calls('abandonConversion').length);
+			});
+			await toPhase(p, 'P7b', 0);
+			await p.settle();
+			expect(
+				toldAtFence,
+				"side 0's host is not yet called when its fence leaves"
+			).to.deep.equal([0]);
+			expect(abandoned(p, 0), 'then told once, with the fence').to.deep.equal([
+				FENCE
+			]);
+		});
 	});
 
 	describe('The deadline (B3, B4)', () => {

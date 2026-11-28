@@ -17,6 +17,7 @@ import {
 	abortText,
 	agreeOnTerms,
 	allocatedKeyIndex,
+	attemptOf,
 	conversionPair,
 	conversionTransportOf,
 	decodeSpliceInit,
@@ -480,6 +481,13 @@ describe('Disconnects and restarts in each state (#2151 step 3a, test 6)', funct
 			await run(p);
 			p.link.held.splice(0);
 			p.disconnect();
+			// The disconnect itself ends both sides, even where I's host was
+			// already told at its fence (Z1).
+			expect(
+				[attemptOf(p.managers[0], p.id), attemptOf(p.managers[1], p.id)],
+				'no attempt is live after the disconnect'
+			).to.deep.equal([undefined, undefined]);
+			expect(held(p.managers[0], p.id), 'I holds nothing').to.equal(false);
 			expect(abandoned(p, 0)).to.deep.equal([iEnd]);
 			expect(abandoned(p, 1)).to.deep.equal([peerEnd]);
 			p.link.clearRules();
